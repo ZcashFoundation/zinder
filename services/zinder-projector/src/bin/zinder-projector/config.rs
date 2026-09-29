@@ -29,6 +29,7 @@ const DEFAULT_RAW_BLOB_RETENTION: RawBlobRetention = RawBlobRetention::Transacti
 const DEFAULT_WALLET_PATH: &str = "/var/lib/zinder/wallet";
 const DEFAULT_OPS_LISTEN_ADDR: &str = "127.0.0.1:9110";
 const DEFAULT_REORG_WINDOW_BLOCKS: u32 = 100;
+const DEFAULT_FENCE_CONVERGENCE_TIMEOUT_SECONDS: u64 = 30;
 /// ADR-0035 permits at most two hours for wallet construction after canonical.
 ///
 /// The builder can heartbeat only at durable phase boundaries, so its lease
@@ -61,6 +62,7 @@ pub(crate) struct ProjectorConfig {
     pub(crate) reorg_window_blocks: u32,
     pub(crate) build_owner: [u8; 16],
     pub(crate) lease_duration: Duration,
+    pub(crate) fence_convergence_timeout: Duration,
     pub(crate) build: ProjectorBuildConfig,
     pub(crate) follow: ProjectorFollowConfig,
     pub(crate) ingest_control_addr: String,
@@ -153,8 +155,18 @@ pub(crate) enum ProjectorError {
     #[error("enabled projector owner control omitted its resolved bearer token")]
     ProjectorControlTokenMissing,
 
-    #[error("canonical control and secondary could not authenticate one exact writer fence")]
+    #[error("canonical secondary did not reach the writer fence before the convergence deadline")]
     CanonicalFenceDidNotConverge,
+
+    #[error(
+        "canonical secondary at event {secondary_event_sequence} diverged from writer fence at event {writer_event_sequence}"
+    )]
+    CanonicalFenceDiverged {
+        /// Event sequence of the projector's canonical secondary.
+        secondary_event_sequence: u64,
+        /// Event sequence reported by the canonical writer.
+        writer_event_sequence: u64,
+    },
 
     #[error("constructed wallet source differs from its fixed canonical construction fence")]
     WalletConstructionFenceMismatch,
@@ -279,6 +291,10 @@ fn projector_config_loader() -> Result<ConfigLoader, ConfigError> {
         .with_default("wallet.path", DEFAULT_WALLET_PATH)?
         .with_default("projector.reorg_window_blocks", DEFAULT_REORG_WINDOW_BLOCKS)?
         .with_default(
+            "projector.fence_convergence_timeout_seconds",
+            DEFAULT_FENCE_CONVERGENCE_TIMEOUT_SECONDS,
+        )?
+        .with_default(
             "projector.build.max_outpoint_sort_memory_bytes",
             DEFAULT_OUTPOINT_SORT_MEMORY_BYTES,
         )?
@@ -350,6 +366,7 @@ struct ProjectorSection {
     reorg_window_blocks: Option<u32>,
     build_owner_hex: Option<String>,
     lease_duration_seconds: Option<u64>,
+    fence_convergence_timeout_seconds: Option<u64>,
     build: ProjectorBuildSection,
     follow: ProjectorFollowSection,
 }
@@ -397,6 +414,10 @@ fn resolve_projector_config(raw: ProjectorRawConfig) -> Result<ProjectorConfig, 
         "projector.lease_duration_seconds",
         MINIMUM_LEASE_DURATION_SECONDS,
     )?;
+    let fence_convergence_timeout_seconds = require_nonzero_u64(
+        raw.projector.fence_convergence_timeout_seconds,
+        "projector.fence_convergence_timeout_seconds",
+    )?;
     let build = resolve_build_config(&raw.projector.build)?;
     let follow = resolve_follow_config(&raw.projector.follow)?;
     let node = NodeTarget::resolve(network, raw.node)?;
@@ -417,6 +438,7 @@ fn resolve_projector_config(raw: ProjectorRawConfig) -> Result<ProjectorConfig, 
         reorg_window_blocks,
         build_owner,
         lease_duration: Duration::from_secs(lease_duration_seconds),
+        fence_convergence_timeout: Duration::from_secs(fence_convergence_timeout_seconds),
         build,
         follow,
         ingest_control_addr: ingest_control.addr,
@@ -621,6 +643,7 @@ impl ProjectorConfigToml {
                 reorg_window_blocks: config.reorg_window_blocks,
                 build_owner_hex: encode_hex(config.build_owner),
                 lease_duration_seconds: config.lease_duration.as_secs(),
+                fence_convergence_timeout_seconds: config.fence_convergence_timeout.as_secs(),
                 build: ProjectorBuildToml::from(config.build),
                 follow: ProjectorFollowToml::from(config.follow),
             },
@@ -672,6 +695,7 @@ struct ProjectorToml {
     reorg_window_blocks: u32,
     build_owner_hex: String,
     lease_duration_seconds: u64,
+    fence_convergence_timeout_seconds: u64,
     build: ProjectorBuildToml,
     follow: ProjectorFollowToml,
 }

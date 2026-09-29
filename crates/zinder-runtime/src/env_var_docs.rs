@@ -980,6 +980,18 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       least 14400 so a durable construction phase cannot outlive its lease.",
     },
     EnvVarDoc {
+        name: "ZINDER_PROJECTOR__FENCE_CONVERGENCE_TIMEOUT_SECONDS",
+        toml_path: "projector.fence_convergence_timeout_seconds",
+        used_by: &["zinder-projector"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Deadline for the projector's canonical secondary to authenticate the \
+                      writer's exact fence. A secondary behind the writer is retried with \
+                      capped backoff and reported as syncing once the lag lasts longer than one \
+                      second; a same-sequence mismatch or a secondary ahead of the writer fails \
+                      immediately. Must be greater than zero. Defaults to 30.",
+    },
+    EnvVarDoc {
         name: "ZINDER_PROJECTOR__BUILD__MAX_OUTPOINT_SORT_MEMORY_BYTES",
         toml_path: "projector.build.max_outpoint_sort_memory_bytes",
         used_by: &["zinder-projector"],
