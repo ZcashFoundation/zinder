@@ -1,0 +1,6 @@
+kind: fixed
+body: The wallet projector no longer exits and crash-loops when the canonical writer commits while it is confirming the writer's position; it retries with backoff for up to projector.fence_convergence_timeout_seconds (default 30) and reports syncing if the lag lasts more than a second. A genuine mismatch between projector and writer still fails immediately.
+time: 2026-09-29T09:54:26Z
+custom:
+  Bump: patch
+  PR: "97"
