@@ -77,6 +77,10 @@ fn print_config_renders_the_complete_fail_closed_contract() -> eyre::Result<()> 
         "{stdout}"
     );
     assert!(
+        stdout.contains("fence_convergence_timeout_seconds = 30"),
+        "{stdout}"
+    );
+    assert!(
         stdout.contains("max_transition_logical_bytes = 536870912"),
         "{stdout}"
     );
@@ -234,6 +238,40 @@ fn print_config_rejects_an_implicit_construction_lease() -> eyre::Result<()> {
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
         stderr.contains("projector.lease_duration_seconds"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn print_config_rejects_a_zero_fence_convergence_timeout() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+
+    let output = projector_command()
+        .env("ZINDER_PROJECTOR__FENCE_CONVERGENCE_TIMEOUT_SECONDS", "0")
+        .args([
+            "--print-config",
+            "--network",
+            "zcash-regtest",
+            "--canonical-path",
+            path_str(&tempdir.path().join("canonical"))?,
+            "--canonical-secondary-path",
+            path_str(&tempdir.path().join("secondary"))?,
+            "--wallet-path",
+            path_str(&tempdir.path().join("wallet"))?,
+            "--node-json-rpc-addr",
+            "http://127.0.0.1:18232",
+            "--build-owner-hex",
+            "00112233445566778899aabbccddeeff",
+            "--lease-duration-seconds",
+            "14400",
+        ])
+        .output()?;
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("projector.fence_convergence_timeout_seconds must be greater than zero"),
         "{stderr}"
     );
     Ok(())

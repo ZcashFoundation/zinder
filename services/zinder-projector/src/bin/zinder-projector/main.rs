@@ -45,8 +45,9 @@ use zinder_projector::state_bundle::{
     prepare_state_bundle_capture,
 };
 
-const CANONICAL_FENCE_CONVERGENCE_ATTEMPTS: u8 = 5;
-const CANONICAL_FENCE_CONVERGENCE_DELAY: Duration = Duration::from_millis(50);
+const CANONICAL_FENCE_CONVERGENCE_INITIAL_DELAY: Duration = Duration::from_millis(50);
+const CANONICAL_FENCE_CONVERGENCE_SYNCING_AFTER: Duration = Duration::from_secs(1);
+const CANONICAL_FENCE_CONVERGENCE_MAX_DELAY: Duration = Duration::from_secs(1);
 /// Renew before a transient control-plane delay can let a live cursor expire.
 const FOLLOW_RETENTION_LEASE_RENEWAL_HEADROOM: Duration = Duration::from_mins(1);
 /// The writer deliberately limits each control RPC; the projector composes at
@@ -239,7 +240,17 @@ async fn run_owned_projector(
         config.projector_control.bearer_token.as_ref(),
     )
     .await?;
-    let canonical_ready = converge_on_writer_fence(&mut canonical, &mut canonical_control).await?;
+    let Some(canonical_ready) = converge_on_writer_fence(
+        &mut canonical,
+        &mut canonical_control,
+        readiness,
+        &cancel,
+        config.fence_convergence_timeout,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
     let expected_wallet_source = canonical_source_identity(&canonical_ready);
 
     if config.wallet_path.exists() {
@@ -537,8 +548,17 @@ async fn run_continuous_wallet_following(
             return Ok(());
         }
 
-        let canonical_ready =
-            converge_on_writer_fence(&mut canonical, &mut canonical_control).await?;
+        let Some(canonical_ready) = converge_on_writer_fence(
+            &mut canonical,
+            &mut canonical_control,
+            readiness,
+            &cancel,
+            config.fence_convergence_timeout,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
         let target_source = canonical_source_identity(&canonical_ready);
         let target_fence = canonical.event_fence();
         let wallet_source =
@@ -552,8 +572,17 @@ async fn run_continuous_wallet_following(
             )
             .await?;
             if renewed {
-                let post_renewal_canonical =
-                    converge_on_writer_fence(&mut canonical, &mut canonical_control).await?;
+                let Some(post_renewal_canonical) = converge_on_writer_fence(
+                    &mut canonical,
+                    &mut canonical_control,
+                    readiness,
+                    &cancel,
+                    config.fence_convergence_timeout,
+                )
+                .await?
+                else {
+                    return Ok(());
+                };
                 if wallet_source != canonical_source_identity(&post_renewal_canonical) {
                     continue;
                 }
@@ -887,8 +916,17 @@ async fn bootstrap_resumed_wallet_following(
         if cancel.is_cancelled() {
             return Ok(());
         }
-        let canonical_ready =
-            converge_on_writer_fence(&mut canonical, &mut canonical_control).await?;
+        let Some(canonical_ready) = converge_on_writer_fence(
+            &mut canonical,
+            &mut canonical_control,
+            readiness,
+            &cancel,
+            config.fence_convergence_timeout,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
         let target_source = canonical_source_identity(&canonical_ready);
         set_following_syncing(readiness, wallet_source, target_source);
         let retained_events = match fetch_retained_event_page_to_target(
@@ -938,8 +976,17 @@ async fn bootstrap_resumed_wallet_following(
         if cancel.is_cancelled() {
             return Ok(());
         }
-        let canonical_ready =
-            converge_on_writer_fence(&mut canonical, &mut canonical_control).await?;
+        let Some(canonical_ready) = converge_on_writer_fence(
+            &mut canonical,
+            &mut canonical_control,
+            readiness,
+            &cancel,
+            config.fence_convergence_timeout,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
         let target_source = canonical_source_identity(&canonical_ready);
         set_following_syncing(readiness, wallet_source, target_source);
         let retained_events = match fetch_retained_event_page_to_target(
@@ -1447,46 +1494,185 @@ fn require_pre_promotion_follower_admission(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WriterFenceRelation {
+    Matches,
+    SecondaryBehind,
+    Diverged {
+        secondary_event_sequence: u64,
+        writer_event_sequence: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FenceConvergence {
+    Converged,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FenceConvergencePolicy {
+    timeout: Duration,
+    syncing_after: Duration,
+    initial_delay: Duration,
+    max_delay: Duration,
+}
+
+impl FenceConvergencePolicy {
+    const fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            syncing_after: CANONICAL_FENCE_CONVERGENCE_SYNCING_AFTER,
+            initial_delay: CANONICAL_FENCE_CONVERGENCE_INITIAL_DELAY,
+            max_delay: CANONICAL_FENCE_CONVERGENCE_MAX_DELAY,
+        }
+    }
+}
+
+trait WriterFenceProbe {
+    fn catch_up(&mut self) -> Result<WalletCanonicalSourceIdentity, ProjectorError>;
+
+    async fn writer_status(
+        &mut self,
+    ) -> Result<zinder_proto::v1::ingest::CanonicalWriterStatusResponse, ProjectorError>;
+}
+
+struct LiveWriterFenceProbe<'a> {
+    canonical: &'a mut RocksDbCanonicalSecondary,
+    control: &'a mut CanonicalWriterControlClient,
+}
+
+impl WriterFenceProbe for LiveWriterFenceProbe<'_> {
+    fn catch_up(&mut self) -> Result<WalletCanonicalSourceIdentity, ProjectorError> {
+        self.canonical.try_catch_up()?;
+        Ok(canonical_source_identity(&self.canonical.ready_evidence()))
+    }
+
+    async fn writer_status(
+        &mut self,
+    ) -> Result<zinder_proto::v1::ingest::CanonicalWriterStatusResponse, ProjectorError> {
+        Ok(self.control.writer_status().await?)
+    }
+}
+
+/// Returns `None` when `cancel` fires before the fence converges.
 async fn converge_on_writer_fence(
     canonical: &mut RocksDbCanonicalSecondary,
     control: &mut CanonicalWriterControlClient,
-) -> Result<CanonicalStoreReadyEvidence, ProjectorError> {
-    for _attempt in 0..CANONICAL_FENCE_CONVERGENCE_ATTEMPTS {
-        canonical.try_catch_up()?;
-        let ready = canonical.ready_evidence();
-        let status = control.writer_status().await?;
-        if writer_status_matches(status, &ready, canonical.network()) {
-            return Ok(ready);
-        }
-        tokio::time::sleep(CANONICAL_FENCE_CONVERGENCE_DELAY).await;
-    }
-    Err(ProjectorError::CanonicalFenceDidNotConverge)
+    readiness: &Readiness,
+    cancel: &CancellationToken,
+    timeout: Duration,
+) -> Result<Option<CanonicalStoreReadyEvidence>, ProjectorError> {
+    let network = canonical.network();
+    let outcome = converge_probe_on_writer_fence(
+        &mut LiveWriterFenceProbe { canonical, control },
+        network,
+        readiness,
+        cancel,
+        FenceConvergencePolicy::with_timeout(timeout),
+    )
+    .await?;
+    Ok(match outcome {
+        FenceConvergence::Converged => Some(canonical.ready_evidence()),
+        FenceConvergence::Cancelled => None,
+    })
 }
 
-fn writer_status_matches(
-    status: zinder_proto::v1::ingest::CanonicalWriterStatusResponse,
-    ready: &CanonicalStoreReadyEvidence,
+/// Catches the secondary up until it authenticates the writer's exact fence.
+///
+/// The writer keeps committing while the projector converges, so a secondary
+/// behind the writer's event sequence is ordinary lag and is retried with
+/// capped exponential backoff until the policy deadline. Lag that outlasts
+/// `syncing_after` is reported as syncing; shorter races leave readiness
+/// untouched. Equal sequences must agree on every fence field, and a secondary
+/// ahead of the writer cannot be caught up; both are divergence and fail
+/// immediately.
+async fn converge_probe_on_writer_fence(
+    probe: &mut impl WriterFenceProbe,
     network: zinder_core::Network,
-) -> bool {
-    writer_status_matches_source(status, canonical_source_identity(ready), network)
+    readiness: &Readiness,
+    cancel: &CancellationToken,
+    policy: FenceConvergencePolicy,
+) -> Result<FenceConvergence, ProjectorError> {
+    let started = tokio::time::Instant::now();
+    let deadline = started + policy.timeout;
+    let mut delay = policy.initial_delay;
+    loop {
+        let source = probe.catch_up()?;
+        let status = probe.writer_status().await?;
+        let writer_tip_height = status.fence.as_ref().map(|fence| fence.visible_tip_height);
+        match classify_writer_fence(&status, source, network) {
+            WriterFenceRelation::Matches => return Ok(FenceConvergence::Converged),
+            WriterFenceRelation::Diverged {
+                secondary_event_sequence,
+                writer_event_sequence,
+            } => {
+                return Err(ProjectorError::CanonicalFenceDiverged {
+                    secondary_event_sequence,
+                    writer_event_sequence,
+                });
+            }
+            WriterFenceRelation::SecondaryBehind => {}
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(ProjectorError::CanonicalFenceDidNotConverge);
+        }
+        if now.duration_since(started) >= policy.syncing_after {
+            let secondary_height = source.source_position().tip.height.value();
+            readiness.set(ReadinessState::syncing(
+                writer_tip_height
+                    .and_then(|writer_height| writer_height.checked_sub(secondary_height))
+                    .map(u64::from),
+                Some(secondary_height),
+                writer_tip_height,
+            ));
+        }
+        tokio::select! {
+            () = cancel.cancelled() => return Ok(FenceConvergence::Cancelled),
+            () = tokio::time::sleep(delay.min(deadline.saturating_duration_since(now))) => {}
+        }
+        delay = delay.saturating_mul(2).min(policy.max_delay);
+    }
 }
 
-fn writer_status_matches_source(
-    status: zinder_proto::v1::ingest::CanonicalWriterStatusResponse,
+fn classify_writer_fence(
+    status: &zinder_proto::v1::ingest::CanonicalWriterStatusResponse,
     expected: WalletCanonicalSourceIdentity,
     network: zinder_core::Network,
-) -> bool {
-    let Some(fence) = status.fence else {
-        return false;
-    };
+) -> WriterFenceRelation {
     let source_position = expected.source_position();
-    status.network_name == encode_zinder_native_chain_name(network)
-        && fence.chain_epoch_id == source_position.chain_epoch_id.value()
-        && fence.event_sequence == source_position.event_sequence
-        && fence.visible_tip_height == source_position.tip.height.value()
-        && fence.visible_tip_hash == source_position.tip.hash.as_bytes()
-        && fence.visible_block_count == expected.source_sequence_digest().block_count()
-        && fence.canonical_sequence_digest == expected.source_sequence_digest().as_bytes()
+    let secondary_event_sequence = source_position.event_sequence;
+    let Some(fence) = status.fence.as_ref() else {
+        return WriterFenceRelation::Diverged {
+            secondary_event_sequence,
+            writer_event_sequence: 0,
+        };
+    };
+    let writer_event_sequence = fence.event_sequence;
+    let diverged = WriterFenceRelation::Diverged {
+        secondary_event_sequence,
+        writer_event_sequence,
+    };
+    if status.network_name != encode_zinder_native_chain_name(network) {
+        return diverged;
+    }
+    match secondary_event_sequence.cmp(&writer_event_sequence) {
+        std::cmp::Ordering::Less => WriterFenceRelation::SecondaryBehind,
+        std::cmp::Ordering::Greater => diverged,
+        std::cmp::Ordering::Equal => {
+            if fence.chain_epoch_id == source_position.chain_epoch_id.value()
+                && fence.visible_tip_height == source_position.tip.height.value()
+                && fence.visible_tip_hash == source_position.tip.hash.as_bytes()
+                && fence.visible_block_count == expected.source_sequence_digest().block_count()
+                && fence.canonical_sequence_digest == expected.source_sequence_digest().as_bytes()
+            {
+                WriterFenceRelation::Matches
+            } else {
+                diverged
+            }
+        }
+    }
 }
 
 fn canonical_source_identity(ready: &CanonicalStoreReadyEvidence) -> WalletCanonicalSourceIdentity {
@@ -1947,14 +2133,16 @@ mod tests {
     };
 
     use super::{
-        CanonicalBlockFactsSequenceDigest, CanonicalRetentionLease, NextWalletTransition,
-        ProjectorControlTasks, ProjectorError, ResumedFollowingRetentionPlan,
-        WalletCanonicalSourceIdentity, WalletProjectionSourcePosition,
-        classify_resumed_following_retention, encode_zinder_native_chain_name,
+        CanonicalBlockFactsSequenceDigest, CanonicalRetentionLease, FenceConvergence,
+        FenceConvergencePolicy, NextWalletTransition, ProjectorControlTasks, ProjectorError,
+        ResumedFollowingRetentionPlan, WalletCanonicalSourceIdentity,
+        WalletProjectionSourcePosition, WriterFenceProbe, WriterFenceRelation,
+        classify_resumed_following_retention, classify_writer_fence,
+        converge_probe_on_writer_fence, encode_zinder_native_chain_name,
         following_retention_lease_renewal_expiry, following_retention_lease_transition_expiry,
         lease_expiry, reconciliation_ranges, require_bounded_reconciliation_replay,
         require_built_wallet_source, require_pre_promotion_follower_admission,
-        require_retention_lease_anchor, settled_tip_for_transition, writer_status_matches_source,
+        require_retention_lease_anchor, settled_tip_for_transition,
     };
     use zinder_proto::v1::ingest::{CanonicalWriterFence, CanonicalWriterStatusResponse};
     use zinder_store::{
@@ -2217,11 +2405,224 @@ mod tests {
             fence.visible_block_count = 2;
         }
 
-        assert!(!writer_status_matches_source(
-            status,
-            expected,
+        assert_eq!(
+            classify_writer_fence(&status, expected, test_network()),
+            WriterFenceRelation::Diverged {
+                secondary_event_sequence: 1,
+                writer_event_sequence: 1,
+            }
+        );
+    }
+
+    struct ScriptedProbe {
+        secondary_sequence: u64,
+        writer_sequence: u64,
+        commits_remaining: Option<u32>,
+        catch_ups: u32,
+    }
+
+    impl ScriptedProbe {
+        fn new(commits_remaining: Option<u32>) -> Self {
+            Self {
+                secondary_sequence: 1,
+                writer_sequence: 1,
+                commits_remaining,
+                catch_ups: 0,
+            }
+        }
+    }
+
+    impl WriterFenceProbe for ScriptedProbe {
+        fn catch_up(&mut self) -> Result<WalletCanonicalSourceIdentity, ProjectorError> {
+            self.catch_ups += 1;
+            self.secondary_sequence = self.writer_sequence;
+            Ok(source_identity(self.secondary_sequence, 7))
+        }
+
+        async fn writer_status(&mut self) -> Result<CanonicalWriterStatusResponse, ProjectorError> {
+            match &mut self.commits_remaining {
+                Some(0) => {}
+                Some(remaining) => {
+                    *remaining -= 1;
+                    self.writer_sequence += 1;
+                }
+                None => self.writer_sequence += 1,
+            }
+            Ok(writer_status(source_identity(self.writer_sequence, 7)))
+        }
+    }
+
+    fn fast_policy(timeout: Duration) -> FenceConvergencePolicy {
+        FenceConvergencePolicy {
+            timeout,
+            syncing_after: Duration::from_hours(1),
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(4),
+        }
+    }
+
+    #[tokio::test]
+    async fn fence_convergence_survives_writer_commits_between_snapshot_and_status() {
+        let mut probe = ScriptedProbe::new(Some(6));
+        let readiness =
+            zinder_runtime::Readiness::new(zinder_runtime::ReadinessState::ready(Some(1)));
+
+        let outcome = converge_probe_on_writer_fence(
+            &mut probe,
             test_network(),
+            &readiness,
+            &CancellationToken::new(),
+            fast_policy(Duration::from_secs(5)),
+        )
+        .await;
+
+        assert!(matches!(outcome, Ok(FenceConvergence::Converged)));
+        assert_eq!(probe.catch_ups, 7);
+        assert!(readiness.report().is_ready);
+    }
+
+    #[tokio::test]
+    async fn fence_convergence_reports_syncing_once_lag_outlasts_the_grace_period() {
+        let mut probe = ScriptedProbe::new(Some(6));
+        let readiness =
+            zinder_runtime::Readiness::new(zinder_runtime::ReadinessState::ready(Some(1)));
+        let policy = FenceConvergencePolicy {
+            syncing_after: Duration::ZERO,
+            ..fast_policy(Duration::from_secs(5))
+        };
+
+        let outcome = converge_probe_on_writer_fence(
+            &mut probe,
+            test_network(),
+            &readiness,
+            &CancellationToken::new(),
+            policy,
+        )
+        .await;
+
+        assert!(matches!(outcome, Ok(FenceConvergence::Converged)));
+        let report = readiness.report();
+        assert!(!report.is_ready);
+        assert!(matches!(
+            report.cause,
+            zinder_runtime::ReadinessCause::Syncing {
+                lag_blocks: Some(0)
+            }
         ));
+        assert_eq!(report.current_height, Some(1));
+        assert_eq!(report.target_height, Some(1));
+    }
+
+    #[tokio::test]
+    async fn fence_convergence_returns_promptly_when_cancelled_during_lag() {
+        let mut probe = ScriptedProbe::new(None);
+        let readiness = zinder_runtime::Readiness::default();
+        let cancel = CancellationToken::new();
+        let policy = FenceConvergencePolicy {
+            initial_delay: Duration::from_mins(10),
+            max_delay: Duration::from_mins(10),
+            ..fast_policy(Duration::from_hours(1))
+        };
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            trigger.cancel();
+        });
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            converge_probe_on_writer_fence(&mut probe, test_network(), &readiness, &cancel, policy),
+        )
+        .await;
+
+        assert!(matches!(outcome, Ok(Ok(FenceConvergence::Cancelled))));
+    }
+
+    #[tokio::test]
+    async fn fence_convergence_fails_after_the_deadline_under_sustained_lag() {
+        let mut probe = ScriptedProbe::new(None);
+        let readiness = zinder_runtime::Readiness::default();
+
+        let outcome = converge_probe_on_writer_fence(
+            &mut probe,
+            test_network(),
+            &readiness,
+            &CancellationToken::new(),
+            fast_policy(Duration::from_millis(30)),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            Err(ProjectorError::CanonicalFenceDidNotConverge)
+        ));
+        assert!(probe.catch_ups > 1);
+    }
+
+    #[tokio::test]
+    async fn fence_convergence_fails_immediately_on_same_sequence_mismatch() {
+        struct SameSequenceMismatch;
+        impl WriterFenceProbe for SameSequenceMismatch {
+            fn catch_up(&mut self) -> Result<WalletCanonicalSourceIdentity, ProjectorError> {
+                Ok(source_identity(5, 1))
+            }
+            async fn writer_status(
+                &mut self,
+            ) -> Result<CanonicalWriterStatusResponse, ProjectorError> {
+                Ok(writer_status(source_identity(5, 2)))
+            }
+        }
+
+        let readiness = zinder_runtime::Readiness::default();
+        let outcome = converge_probe_on_writer_fence(
+            &mut SameSequenceMismatch,
+            test_network(),
+            &readiness,
+            &CancellationToken::new(),
+            fast_policy(Duration::from_mins(1)),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            Err(ProjectorError::CanonicalFenceDiverged {
+                secondary_event_sequence: 5,
+                writer_event_sequence: 5,
+            })
+        ));
+    }
+
+    #[test]
+    fn writer_fence_classification_separates_lag_from_divergence() {
+        let secondary = source_identity(5, 1);
+
+        assert_eq!(
+            super::classify_writer_fence(
+                &writer_status(source_identity(6, 2)),
+                secondary,
+                test_network()
+            ),
+            WriterFenceRelation::SecondaryBehind
+        );
+        assert_eq!(
+            super::classify_writer_fence(
+                &writer_status(source_identity(4, 1)),
+                secondary,
+                test_network()
+            ),
+            WriterFenceRelation::Diverged {
+                secondary_event_sequence: 5,
+                writer_event_sequence: 4,
+            }
+        );
+        assert_eq!(
+            super::classify_writer_fence(
+                &writer_status(source_identity(5, 1)),
+                secondary,
+                test_network()
+            ),
+            WriterFenceRelation::Matches
+        );
     }
 
     #[test]
