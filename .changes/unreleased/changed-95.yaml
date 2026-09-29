@@ -1,0 +1,6 @@
+kind: changed
+body: The README and docs now include a plain-English Testnet comparison of Zinder build times against lightwalletd-rs and Zaino.
+time: 2026-08-18T01:56:00Z
+custom:
+  Bump: patch
+  PR: "95"

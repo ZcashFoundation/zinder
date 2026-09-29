@@ -34,6 +34,21 @@ the detailed comparison.
 
 The deployment target is single-operator self-hosting backed by one Zebra node. Public endpoints sit behind operator-controlled TLS termination, authentication, rate limiting, and quota accounting.
 
+## How Zinder compared on Testnet
+
+On one Testnet machine, current Zinder was faster than lightwalletd-rs at
+one job: copy the chain and serve the small block summaries wallets use
+to catch up. Across 3 runs it took about 32% less time.
+
+When Zinder also built its full transparent wallet index, including
+address history, it was slower than lightwalletd-rs in the 1 run we
+measured, because that extra index is a second pass after the chain
+copy. Zinder finished that full-index job much faster than Zaino
+v0.7.0 in the same 1-run test. These are Testnet results on one
+machine. They are not Mainnet numbers, and they do not prove Zinder is
+ready for production. The numbers and limits are in
+[Testnet performance](docs/reference/testnet-performance.md).
+
 ## Quickstart
 
 The supported wallet-serving topology uses four independent release runtimes
@@ -113,6 +128,7 @@ lifecycle, see
 - [Service boundaries](docs/architecture/service-boundaries.md): the boundary contract Zinder is built against.
 - [Integration surfaces](docs/reference/integration-surfaces.md): how wallet, application, explorer, and operator clients connect to Zinder.
 - [Architecture index](docs/README.md): full documentation index.
+- [Testnet performance](docs/reference/testnet-performance.md): measured Testnet build times against lightwalletd-rs and Zaino.
 
 ## Architecture at a glance
 
