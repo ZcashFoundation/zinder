@@ -7,13 +7,11 @@ use std::{collections::BTreeMap, error::Error, path::Path, sync::Arc, time::Dura
 
 use async_trait::async_trait;
 use tempfile::TempDir;
+use zcash_primitives::transaction::{Authorized, Transaction as ZcashTransaction, TransactionData};
 use zebra_chain::{
-    amount::Amount,
-    block::{Block as ZebraBlock, Height as ZebraHeight},
-    parameters::NetworkUpgrade,
-    serialization::{ZcashDeserializeInto, ZcashSerialize},
-    transaction::{Hash as ZebraTransactionHash, LockTime, Transaction as ZebraTransaction},
-    transparent::{Input as ZebraInput, OutPoint as ZebraOutPoint, Output as ZebraOutput, Script},
+    block::Block as ZebraBlock,
+    serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
+    transaction::Transaction as ZebraTransaction,
 };
 use zinder_core::{
     BlockFinalNoteCommitmentRoots, BlockHash, BlockHeight, BlockHeightRange, BlockId,
@@ -34,7 +32,10 @@ use zinder_store::{
     CanonicalStoreWorkload, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
     RocksDbCanonicalStore, RocksDbResourceBudget,
 };
-use zinder_testkit::sample_regtest_upgrade_activations;
+use zinder_testkit::{
+    P2pkhSpendArgs, TransparentTestKey, ZIP317_FEE_ONE_IN_ONE_OUT_ZATS,
+    sample_regtest_upgrade_activations,
+};
 
 use super::fixture_block::{
     fixture_orchard_source_block, fixture_sapling_source_block, fixture_source_block,
@@ -48,7 +49,6 @@ const SAPLING_BLOCK_HEIGHT: u32 = 2;
 const SPENDING_BLOCK_HEIGHT: u32 = 3;
 const ORCHARD_BLOCK_HEIGHT: u32 = 4;
 const SPEND_OUTPUT_VALUE_ZAT: u64 = 12_345;
-const SPEND_OUTPUT_SCRIPT: [u8; 5] = [0x76, 0xa9, 0x14, 0x01, 0x02];
 const REORG_WINDOW_BLOCKS: u32 = 100;
 
 #[tokio::test]
@@ -638,45 +638,38 @@ fn creates_note_commitments(transaction: &ZebraTransaction) -> bool {
 fn without_transparent_inputs(
     transaction: &ZebraTransaction,
 ) -> Result<ZebraTransaction, Box<dyn Error>> {
-    if let ZebraTransaction::V4 {
-        outputs,
-        lock_time,
-        expiry_height,
-        joinsplit_data,
-        sapling_shielded_data,
-        ..
-    } = transaction
-    {
-        return Ok(ZebraTransaction::V4 {
-            inputs: Vec::new(),
-            outputs: outputs.clone(),
-            lock_time: *lock_time,
-            expiry_height: *expiry_height,
-            joinsplit_data: joinsplit_data.clone(),
-            sapling_shielded_data: sapling_shielded_data.clone(),
-        });
+    let mut bytes = Vec::new();
+    transaction.zcash_serialize(&mut bytes)?;
+    let transaction_data =
+        ZcashTransaction::read(bytes.as_slice(), transaction.consensus_branch_id())?.into_data();
+    if !matches!(
+        transaction_data.version(),
+        zcash_primitives::transaction::TxVersion::V4 | zcash_primitives::transaction::TxVersion::V5
+    ) {
+        return Err("fixture shielded transactions must be v4 or v5".into());
     }
-    if let ZebraTransaction::V5 {
-        network_upgrade,
-        lock_time,
-        expiry_height,
-        outputs,
-        sapling_shielded_data,
-        orchard_shielded_data,
-        ..
-    } = transaction
-    {
-        return Ok(ZebraTransaction::V5 {
-            network_upgrade: *network_upgrade,
-            lock_time: *lock_time,
-            expiry_height: *expiry_height,
-            inputs: Vec::new(),
-            outputs: outputs.clone(),
-            sapling_shielded_data: sapling_shielded_data.clone(),
-            orchard_shielded_data: orchard_shielded_data.clone(),
+
+    let transparent_bundle = transaction_data
+        .transparent_bundle()
+        .cloned()
+        .map(|mut bundle| {
+            bundle.vin.clear();
+            bundle
         });
-    }
-    Err("fixture shielded transactions must be v4 or v5".into())
+    let rebuilt = TransactionData::<Authorized>::from_parts(
+        transaction_data.version(),
+        transaction_data.consensus_branch_id(),
+        transaction_data.lock_time(),
+        transaction_data.expiry_height(),
+        transparent_bundle,
+        transaction_data.sprout_bundle().cloned(),
+        transaction_data.sapling_bundle().cloned(),
+        transaction_data.orchard_bundle().cloned(),
+    )
+    .freeze()?;
+    let mut rebuilt_bytes = Vec::new();
+    rebuilt.write(&mut rebuilt_bytes)?;
+    ZebraTransaction::zcash_deserialize(rebuilt_bytes.as_slice()).map_err(Into::into)
 }
 
 fn chained_source_block(
@@ -707,25 +700,17 @@ fn chained_source_block(
 fn spending_transaction(
     spent_outpoint: TransparentOutPoint,
 ) -> Result<ZebraTransaction, Box<dyn Error>> {
-    Ok(ZebraTransaction::V5 {
-        network_upgrade: NetworkUpgrade::Nu5,
-        lock_time: LockTime::unlocked(),
-        expiry_height: ZebraHeight(0),
-        inputs: vec![ZebraInput::PrevOut {
-            outpoint: ZebraOutPoint {
-                hash: ZebraTransactionHash(spent_outpoint.transaction_id.as_bytes()),
-                index: spent_outpoint.output_index,
-            },
-            unlock_script: Script::new(&[]),
-            sequence: u32::MAX,
-        }],
-        outputs: vec![ZebraOutput {
-            value: Amount::try_from(SPEND_OUTPUT_VALUE_ZAT)?,
-            lock_script: Script::new(&SPEND_OUTPUT_SCRIPT),
-        }],
-        sapling_shielded_data: None,
-        orchard_shielded_data: None,
-    })
+    let key = TransparentTestKey::from_seed(&[0x42; 32])?;
+    let recipient = key.scratch_recipient_address(1);
+    let coinbase_value_zats = SPEND_OUTPUT_VALUE_ZAT.saturating_add(ZIP317_FEE_ONE_IN_ONE_OUT_ZATS);
+    let bytes = key.build_p2pkh_spend(&P2pkhSpendArgs {
+        coinbase_txid_be: spent_outpoint.transaction_id.as_bytes(),
+        coinbase_vout: spent_outpoint.output_index,
+        coinbase_value_zats,
+        recipient: &recipient,
+        target_height: 120,
+    })?;
+    Ok(ZebraTransaction::zcash_deserialize(bytes.as_slice())?)
 }
 
 fn source_block_facts(source_block: &SourceBlock) -> Result<CanonicalBlockFacts, Box<dyn Error>> {

@@ -48,6 +48,7 @@ hex.workspace = true
 metrics-exporter-prometheus.workspace = true
 prost.workspace = true
 rust-rocksdb.workspace = true
+zcash_primitives.workspace = true
 secrecy.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

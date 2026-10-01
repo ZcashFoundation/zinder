@@ -90,10 +90,10 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 # release line selected by `zebra-chain`, and advance the entire stack
 # together so Cargo cannot resolve incompatible duplicate type families.
 zcash_address = { version = "0.13.0", default-features = false }
-zcash_primitives = { version = "0.29.0", default-features = false }
-zcash_protocol = { version = "0.10.1", default-features = false }
-zcash_transparent = { version = "0.9.0", default-features = false }
-zebra-chain = "11.2.0"
+zcash_primitives = { version = "0.30.1", default-features = false }
+zcash_protocol = { version = "0.10.6", default-features = false }
+zcash_transparent = { version = "0.10.0", default-features = false }
+zebra-chain = "13.0.1"
 zip32 = "0.2"
 zinder-core = { version = "0.9.0", path = "crates/zinder-core" }
 zinder-rocksdb-bulk-load = { path = "crates/zinder-rocksdb-bulk-load" }

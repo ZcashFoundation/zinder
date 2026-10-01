@@ -33,7 +33,7 @@ use rand::rngs::OsRng;
 use secp256k1::{PublicKey, Secp256k1};
 use thiserror::Error;
 use zcash_address::{ToAddress, ZcashAddress};
-use zcash_primitives::transaction::builder::{BuildConfig, Builder};
+use zcash_primitives::transaction::builder::{BuildConfig, Builder, BundlePadding};
 use zcash_protocol::{
     consensus::{BlockHeight, NetworkType},
     value::{BalanceError, Zatoshis},
@@ -273,7 +273,8 @@ impl TransparentTestKey {
                 sapling_anchor: None,
                 orchard_anchor: None,
                 ironwood_anchor: None,
-                orchard_pool_bundle_type: orchard::builder::BundleType::DEFAULT,
+                orchard_padding: BundlePadding::DEFAULT,
+                ironwood_padding: BundlePadding::DEFAULT,
             },
         );
         builder
