@@ -2044,6 +2044,48 @@ mod tests {
     }
 
     #[test]
+    fn exact_fee_counts_sprout_to_transparent_value_once() -> TestResult {
+        let height = BlockHeight::new(100);
+        let block_hash = block_hash(7);
+        let mut transaction = transaction(height, block_hash, 1);
+        transaction.transparent_outputs = vec![TransparentOutputFact::new(
+            0,
+            101_000_000,
+            b"script".to_vec(),
+            TransparentAddressScriptHash::from_bytes([10; 32]),
+        )];
+        let intrinsic_value_balances = HashMap::from([(
+            transaction.location.transaction_id,
+            TransactionIntrinsicValueBalances::new(101_010_000, 0, 0, 0),
+        )]);
+
+        assert_eq!(
+            exact_paid_fee(&transaction, None, Some(&intrinsic_value_balances))?,
+            Some(10_000)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_fee_cancels_transparent_sprout_deposit_value() -> TestResult {
+        let (transaction, transparent_spends) = transparent_transaction(101_010_000, 0);
+        let intrinsic_value_balances = HashMap::from([(
+            transaction.location.transaction_id,
+            TransactionIntrinsicValueBalances::new(-101_010_000, 0, 0, 0),
+        )]);
+
+        assert_eq!(
+            exact_paid_fee(
+                &transaction,
+                Some(&transparent_spends),
+                Some(&intrinsic_value_balances),
+            )?,
+            Some(0)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn missing_prevout_or_intrinsic_for_transparent_only_is_unavailable() -> TestResult {
         let (transaction, _transparent_spends) = transparent_transaction(50_000, 40_000);
         assert_eq!(

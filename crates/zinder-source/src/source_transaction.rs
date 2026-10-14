@@ -128,8 +128,8 @@ fn transaction_intrinsic_value_balances(
     transaction: &ZebraTransaction,
 ) -> Result<TransactionIntrinsicValueBalances, SourceError> {
     let sprout_zat = sum_sprout_joinsplit_balances_zat(
-        transaction.output_values_to_sprout().into_iter(),
         transaction.input_values_from_sprout().into_iter(),
+        transaction.output_values_to_sprout().into_iter(),
     )?;
     let sapling_zat = transaction
         .sapling_value_balance()
@@ -153,11 +153,11 @@ fn transaction_intrinsic_value_balances(
 }
 
 fn sum_sprout_joinsplit_balances_zat(
-    values_to_sprout_zat: impl Iterator<Item = i64>,
     values_from_sprout_zat: impl Iterator<Item = i64>,
+    values_to_sprout_zat: impl Iterator<Item = i64>,
 ) -> Result<i64, SourceError> {
-    let aggregate_zat = values_to_sprout_zat.map(i128::from).sum::<i128>()
-        - values_from_sprout_zat.map(i128::from).sum::<i128>();
+    let aggregate_zat = values_from_sprout_zat.map(i128::from).sum::<i128>()
+        - values_to_sprout_zat.map(i128::from).sum::<i128>();
     i64::try_from(aggregate_zat).map_err(|_| SourceError::RawTransactionParseFailed {
         reason: "aggregate Sprout value balance exceeds i64".to_owned(),
     })
@@ -594,10 +594,44 @@ mod tests {
     }
 
     #[test]
-    fn sprout_joinsplit_balances_preserve_zebra_sign() -> Result<(), SourceError> {
-        let balance = sum_sprout_joinsplit_balances_zat([5_i64].into_iter(), [12_i64].into_iter())?;
+    fn sprout_joinsplit_balances_use_transaction_sign() -> Result<(), SourceError> {
+        assert_eq!(
+            sum_sprout_joinsplit_balances_zat([5_i64].into_iter(), [].into_iter())?,
+            5
+        );
+        assert_eq!(
+            sum_sprout_joinsplit_balances_zat([].into_iter(), [12_i64].into_iter())?,
+            -12
+        );
+        assert_eq!(
+            sum_sprout_joinsplit_balances_zat([5_i64].into_iter(), [12_i64].into_iter())?,
+            -7
+        );
+        Ok(())
+    }
 
-        assert_eq!(balance, -7);
+    #[test]
+    fn sprout_input_value_is_added_to_canonical_transaction_facts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let raw = include_str!("../tests/fixtures/sprout-transparent-fee-transaction.hex");
+        let bytes = hex::decode(raw.trim())?;
+        let transaction: ZebraTransaction = bytes.zcash_deserialize_into()?;
+        let fact_set = parse_transaction_public_fact_set(
+            &bytes,
+            None,
+            &NetworkUpgradeActivations::empty(Network::ZcashTestnet),
+        )?;
+
+        assert_eq!(
+            transaction.tx_version(),
+            zebra_chain::transaction::TxVersion::Sprout(2)
+        );
+        assert_eq!(transaction.input_values_from_sprout(), [101_010_000]);
+        assert_eq!(transaction.output_values_to_sprout(), [0]);
+        assert_eq!(fact_set.intrinsic_value_balances.sprout_zat, 101_010_000);
+        assert_eq!(fact_set.transparent_inputs.len(), 0);
+        assert_eq!(fact_set.transparent_outputs.len(), 1);
+        assert_eq!(fact_set.transparent_outputs[0].value_zat, 101_000_000);
         Ok(())
     }
 }
