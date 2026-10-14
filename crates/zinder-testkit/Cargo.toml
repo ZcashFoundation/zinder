@@ -18,7 +18,7 @@ eyre.workspace = true
 incrementalmerkletree = { workspace = true, features = ["legacy-api"] }
 orchard.workspace = true
 parking_lot.workspace = true
-rand = "0.8"
+rand = "0.10"
 serde_json.workspace = true
 secp256k1 = { workspace = true, default-features = false, features = ["alloc"] }
 sapling.workspace = true

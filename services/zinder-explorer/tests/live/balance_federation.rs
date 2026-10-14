@@ -146,11 +146,12 @@ async fn catch_up_and_sample(
 
 fn sample_coinbase_script_hash(block: &SourceBlock) -> Result<TransparentAddressScriptHash> {
     let parsed: ZebraBlock = block.raw_block_bytes.as_slice().zcash_deserialize_into()?;
-    let output = parsed
+    let outputs = parsed
         .transactions
         .first()
         .ok_or_else(|| eyre!("tip block has no coinbase"))?
-        .outputs()
+        .outputs();
+    let output = outputs
         .iter()
         .find(|output| !output.lock_script.as_raw_bytes().is_empty())
         .ok_or_else(|| eyre!("tip coinbase has no transparent output"))?;

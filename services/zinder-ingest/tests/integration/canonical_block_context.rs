@@ -7,13 +7,16 @@ use std::{collections::BTreeMap, error::Error, path::Path, sync::Arc, time::Dura
 
 use async_trait::async_trait;
 use tempfile::TempDir;
+use zcash_primitives::transaction::{Authorized as AuthorizedTransaction, TransactionData};
+use zcash_protocol::{consensus::BlockHeight as ZcashBlockHeight, value::Zatoshis};
+use zcash_transparent::address::Script as TransparentScript;
+use zcash_transparent::bundle::{
+    Authorized as TransparentAuthorized, Bundle, OutPoint, TxIn, TxOut,
+};
 use zebra_chain::{
-    amount::Amount,
-    block::{Block as ZebraBlock, Height as ZebraHeight},
-    parameters::NetworkUpgrade,
+    block::Block as ZebraBlock,
     serialization::{ZcashDeserializeInto, ZcashSerialize},
-    transaction::{Hash as ZebraTransactionHash, LockTime, Transaction as ZebraTransaction},
-    transparent::{Input as ZebraInput, OutPoint as ZebraOutPoint, Output as ZebraOutput, Script},
+    transaction::Transaction as ZebraTransaction,
 };
 use zinder_core::{
     BlockFinalNoteCommitmentRoots, BlockHash, BlockHeight, BlockHeightRange, BlockId,
@@ -635,45 +638,33 @@ fn creates_note_commitments(transaction: &ZebraTransaction) -> bool {
 fn without_transparent_inputs(
     transaction: &ZebraTransaction,
 ) -> Result<ZebraTransaction, Box<dyn Error>> {
-    if let ZebraTransaction::V4 {
-        outputs,
-        lock_time,
-        expiry_height,
-        joinsplit_data,
-        sapling_shielded_data,
-        ..
-    } = transaction
-    {
-        return Ok(ZebraTransaction::V4 {
-            inputs: Vec::new(),
-            outputs: outputs.clone(),
-            lock_time: *lock_time,
-            expiry_height: *expiry_height,
-            joinsplit_data: joinsplit_data.clone(),
-            sapling_shielded_data: sapling_shielded_data.clone(),
-        });
+    match transaction.tx_version() {
+        zebra_chain::transaction::TxVersion::V4 | zebra_chain::transaction::TxVersion::V5 => {
+            let transparent_bundle = transaction.transparent_bundle().map(|bundle| Bundle {
+                vin: Vec::new(),
+                vout: bundle.vout.clone(),
+                authorization: bundle.authorization,
+            });
+            let transaction_data = TransactionData::<AuthorizedTransaction>::from_parts(
+                transaction.tx_version(),
+                transaction.consensus_branch_id(),
+                transaction.raw_lock_time(),
+                ZcashBlockHeight::from(transaction.expiry_height().map_or(0, |height| height.0)),
+                transparent_bundle,
+                transaction.sprout_bundle().cloned(),
+                transaction.sapling_bundle().cloned(),
+                transaction.orchard_bundle().cloned(),
+            );
+            let mut bytes = Vec::new();
+            transaction_data.freeze()?.write(&mut bytes)?;
+            Ok(bytes.as_slice().zcash_deserialize_into()?)
+        }
+        zebra_chain::transaction::TxVersion::Sprout(_)
+        | zebra_chain::transaction::TxVersion::V3
+        | zebra_chain::transaction::TxVersion::V6 => {
+            Err("fixture shielded transactions must be v4 or v5".into())
+        }
     }
-    if let ZebraTransaction::V5 {
-        network_upgrade,
-        lock_time,
-        expiry_height,
-        outputs,
-        sapling_shielded_data,
-        orchard_shielded_data,
-        ..
-    } = transaction
-    {
-        return Ok(ZebraTransaction::V5 {
-            network_upgrade: *network_upgrade,
-            lock_time: *lock_time,
-            expiry_height: *expiry_height,
-            inputs: Vec::new(),
-            outputs: outputs.clone(),
-            sapling_shielded_data: sapling_shielded_data.clone(),
-            orchard_shielded_data: orchard_shielded_data.clone(),
-        });
-    }
-    Err("fixture shielded transactions must be v4 or v5".into())
 }
 
 fn chained_source_block(
@@ -704,25 +695,37 @@ fn chained_source_block(
 fn spending_transaction(
     spent_outpoint: TransparentOutPoint,
 ) -> Result<ZebraTransaction, Box<dyn Error>> {
-    Ok(ZebraTransaction::V5 {
-        network_upgrade: NetworkUpgrade::Nu5,
-        lock_time: LockTime::unlocked(),
-        expiry_height: ZebraHeight(0),
-        inputs: vec![ZebraInput::PrevOut {
-            outpoint: ZebraOutPoint {
-                hash: ZebraTransactionHash(spent_outpoint.transaction_id.as_bytes()),
-                index: spent_outpoint.output_index,
-            },
-            unlock_script: Script::new(&[]),
-            sequence: u32::MAX,
-        }],
-        outputs: vec![ZebraOutput {
-            value: Amount::try_from(SPEND_OUTPUT_VALUE_ZAT)?,
-            lock_script: Script::new(&SPEND_OUTPUT_SCRIPT),
-        }],
-        sapling_shielded_data: None,
-        orchard_shielded_data: None,
-    })
+    let mut script_bytes = vec![u8::try_from(SPEND_OUTPUT_SCRIPT.len())?];
+    script_bytes.extend_from_slice(&SPEND_OUTPUT_SCRIPT);
+    let lock_script = TransparentScript::read(&mut script_bytes.as_slice())?;
+    let bundle = Bundle::<TransparentAuthorized> {
+        vin: vec![TxIn::from_parts(
+            OutPoint::new(
+                spent_outpoint.transaction_id.as_bytes(),
+                spent_outpoint.output_index,
+            ),
+            TransparentScript::default(),
+            u32::MAX,
+        )],
+        vout: vec![TxOut::new(
+            Zatoshis::from_u64(SPEND_OUTPUT_VALUE_ZAT)?,
+            lock_script,
+        )],
+        authorization: TransparentAuthorized,
+    };
+    let transaction = TransactionData::<AuthorizedTransaction>::from_parts(
+        zebra_chain::transaction::TxVersion::V5,
+        zcash_protocol::consensus::BranchId::Nu5,
+        0,
+        ZcashBlockHeight::from(0),
+        Some(bundle),
+        None,
+        None,
+        None,
+    );
+    let mut bytes = Vec::new();
+    transaction.freeze()?.write(&mut bytes)?;
+    Ok(bytes.as_slice().zcash_deserialize_into()?)
 }
 
 fn source_block_facts(source_block: &SourceBlock) -> Result<CanonicalBlockFacts, Box<dyn Error>> {

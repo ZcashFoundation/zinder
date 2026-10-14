@@ -50,23 +50,23 @@ hmac = "0.12.1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
-incrementalmerkletree = "0.8.2"
+incrementalmerkletree = "0.9"
 jsonrpsee = { version = "0.26.0", default-features = false, features = ["http-client", "server"] }
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 parking_lot = "0.12.5"
-orchard = { version = "0.15.4", default-features = false }
+orchard = { version = "0.16.0", default-features = false }
 prost = "0.14.4"
 prost-build = "0.14.4"
 prost-types = "0.14.4"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 rust-rocksdb = { version = "0.51.0", features = ["multi-threaded-cf"] }
 secrecy = "0.10.3"
-secp256k1 = { version = "0.29.1", default-features = false }
+secp256k1 = { version = "0.33.1", default-features = false }
 serde = "1.0.229"
 serde_json = "1.0.151"
 sha2 = "0.10.9"
-sapling = { package = "sapling-crypto", version = "0.7.0", default-features = false }
+sapling = { package = "sapling-crypto", version = "0.9.0", default-features = false }
 subtle = "2.6.1"
 tempfile = "3.27.0"
 thiserror = "2.0.19"
@@ -88,12 +88,13 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 # These protocol crates share concrete types with Zebra. Keep them on the
 # release line selected by `zebra-chain`, and advance the entire stack
 # together so Cargo cannot resolve incompatible duplicate type families.
-zcash_address = { version = "0.13.0", default-features = false }
-zcash_primitives = { version = "0.29.0", default-features = false }
-zcash_protocol = { version = "0.10.1", default-features = false }
-zcash_transparent = { version = "0.9.0", default-features = false }
-zebra-chain = "11.2.0"
-zip32 = "0.2"
+zcash_address = { version = "=0.14.0-pre.0", default-features = false }
+zcash_primitives = { version = "=0.31.0-pre.0", default-features = false }
+zcash_protocol = { version = "=0.11.0-pre.0", default-features = false }
+zcash_transparent = { version = "=0.11.0-pre.0", default-features = false }
+zcash_script = "0.6"
+zebra-chain = "=14.0.0"
+zip32 = "0.3"
 zinder-core = { version = "0.5.0-rc.8", path = "crates/zinder-core" }
 zinder-rocksdb-bulk-load = { path = "crates/zinder-rocksdb-bulk-load" }
 zinder-client = { version = "0.5.0-rc.8", path = "crates/zinder-client" }

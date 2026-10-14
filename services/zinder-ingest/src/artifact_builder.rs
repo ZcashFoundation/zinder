@@ -909,9 +909,9 @@ fn compact_transaction_with_transaction_id(
 
 fn compact_sapling_spends(transaction: &ZebraTransaction) -> Vec<CompactSaplingSpend> {
     transaction
-        .sapling_spends_per_anchor()
+        .sapling_spends()
         .map(|spend| CompactSaplingSpend {
-            nullifier: spend.nullifier.into(),
+            nullifier: spend.nullifier().0,
         })
         .collect()
 }
@@ -922,11 +922,10 @@ fn compact_sapling_outputs(
     transaction
         .sapling_outputs()
         .map(|output| {
-            let enc_ciphertext: [u8; 580] = output.enc_ciphertext.into();
             Ok(CompactSaplingOutput {
-                commitment: output.cm_u.to_bytes(),
-                ephemeral_key: output.ephemeral_key.into(),
-                ciphertext: compact_note_ciphertext_prefix(&enc_ciphertext)?,
+                commitment: output.cmu().to_bytes(),
+                ephemeral_key: output.ephemeral_key().0,
+                ciphertext: compact_note_ciphertext_prefix(output.enc_ciphertext())?,
             })
         })
         .collect()
@@ -938,12 +937,12 @@ fn compact_orchard_actions(
     transaction
         .orchard_actions()
         .map(|action| {
-            let enc_ciphertext: [u8; 580] = action.enc_ciphertext.into();
+            let encrypted_note = action.encrypted_note();
             Ok(CompactShieldedAction {
-                nullifier: action.nullifier.into(),
-                commitment: action.cm_x.into(),
-                ephemeral_key: action.ephemeral_key.into(),
-                ciphertext: compact_note_ciphertext_prefix(&enc_ciphertext)?,
+                nullifier: (*action.nullifier()).to_bytes(),
+                commitment: action.cmx().to_bytes(),
+                ephemeral_key: encrypted_note.epk_bytes,
+                ciphertext: compact_note_ciphertext_prefix(&encrypted_note.enc_ciphertext.0)?,
             })
         })
         .collect()
@@ -955,12 +954,12 @@ fn compact_ironwood_actions(
     transaction
         .ironwood_actions()
         .map(|action| {
-            let enc_ciphertext: [u8; 580] = action.enc_ciphertext.into();
+            let encrypted_note = action.encrypted_note();
             Ok(CompactShieldedAction {
-                nullifier: action.nullifier.into(),
-                commitment: action.cm_x.into(),
-                ephemeral_key: action.ephemeral_key.into(),
-                ciphertext: compact_note_ciphertext_prefix(&enc_ciphertext)?,
+                nullifier: (*action.nullifier()).to_bytes(),
+                commitment: action.cmx().to_bytes(),
+                ephemeral_key: encrypted_note.epk_bytes,
+                ciphertext: compact_note_ciphertext_prefix(&encrypted_note.enc_ciphertext.0)?,
             })
         })
         .collect()

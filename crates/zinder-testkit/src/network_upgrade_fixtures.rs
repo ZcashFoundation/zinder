@@ -12,7 +12,7 @@
 //! - [`sample_regtest_upgrade_activations`] returns a hand-built table that
 //!   matches ZFND's `z3` regtest sidecar defaults
 //!   (Overwinter..Canopy at 1, NU5 at 2, NU6 at 2, NU6.1 and NU6.2 at 3,
-//!   and NU6.3 at 603). Intended for in-process integration tests that
+//!   NU6.3 at 603, and NU7 at 604). Intended for in-process integration tests that
 //!   exercise `GetLightdInfo` or `MinedTransactionChainContext.consensus_branch_id` without a
 //!   live node. Live tests must discover the activations from the running node,
 //!   not hard-code them here.
@@ -37,7 +37,7 @@ use zinder_core::{
 ///
 /// Matches the activation heights of the captured ZFND `z3` regtest fixtures:
 /// Overwinter..Canopy at 1, NU5 and NU6 at 2, NU6.1 and NU6.2 at 3, and
-/// NU6.3 at 603. Intended for integration tests that exercise
+/// NU6.3 at 603 and NU7 at 604. Intended for integration tests that exercise
 /// `GetLightdInfo` or `MinedTransactionChainContext.consensus_branch_id` without a live node.
 /// Live tests must discover the activations from the running node, not
 /// hard-code them here.
@@ -100,6 +100,11 @@ pub fn sample_regtest_upgrade_activations() -> NetworkUpgradeActivations {
                 activation_height: CoreBlockHeight::new(603),
                 name: "NU6.3".to_owned(),
             },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x7719_0ad9),
+                activation_height: CoreBlockHeight::new(604),
+                name: "NU7".to_owned(),
+            },
         ],
     )
     .expect("hand-built regtest activations must have unique branch ids")
@@ -132,5 +137,6 @@ pub fn local_network_from_activations(activations: &NetworkUpgradeActivations) -
         nu6_1: lookup("NU6.1"),
         nu6_2: lookup("NU6.2"),
         nu6_3: lookup("NU6.3"),
+        nu7: lookup("NU7"),
     }
 }

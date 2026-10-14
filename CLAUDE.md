@@ -213,6 +213,6 @@ artifacts and add a generated message round-trip test in
 
 When a change alters a service boundary, public API, storage byte layout, protocol surface, or vocabulary, update the owning document in `docs/` in the same change. ADRs are written in present tense and describe the current decision; clarifications and rewordings are edited in place. Substantive design changes get a new ADR with the next contiguous number.
 
-## Ironwood Dependency Pins
+## Consensus Dependency Pins
 
-`zebra-chain` is pinned to `11.2.0`, which decodes Ironwood (NU6.3) version-6 transactions. Zinder uses the matching stable librustzcash stack (`zcash_address 0.13.0`, `zcash_protocol 0.10.1`, `zcash_primitives 0.29.0`, `zcash_transparent 0.9.0`, and `orchard 0.15.4`) so no duplicate librustzcash type exists at the `zebra-chain` boundary. There are no git dependencies; `cargo-deny` denies unknown git and registry sources.
+`zebra-chain` is pinned to `14.0.0`, which decodes NU7 transaction versions and shielded bundles. Zinder uses the matching pre-release librustzcash stack (`zcash_address 0.14.0-pre.0`, `zcash_protocol 0.11.0-pre.0`, `zcash_primitives 0.31.0-pre.0`, `zcash_transparent 0.11.0-pre.0`, and `orchard 0.16.0`) so no duplicate librustzcash type exists at the `zebra-chain` boundary. NU7's consensus branch ID is `0x77190AD9`; activation height remains discovered from the connected node. Keep this dependency cohort aligned with the Zebra release used by the deployment. There are no git dependencies; `cargo-deny` denies unknown git and registry sources.

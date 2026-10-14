@@ -25,7 +25,7 @@
 
 use crate::wire::decode_rpc_transaction_id_hex;
 use crate::{Network, TransparentAddressScriptHash};
-use zcash_address::unified::{Container as _, Receiver as UnifiedReceiver};
+use zcash_address::unified::{Container as _, Receiver as UnifiedReceiver, Uitem};
 use zcash_address::{
     ConversionError, ParseError as ZcashAddressParseError, ToAddress, TryFromAddress, ZcashAddress,
     unified::Address as UnifiedAddressData,
@@ -401,7 +401,10 @@ impl ClassifiedAddress {
                 let receivers = unified
                     .items_as_parsed()
                     .iter()
-                    .map(|receiver| classify_unified_receiver(net, receiver))
+                    .filter_map(|parsed_receiver| match parsed_receiver {
+                        Uitem::Data(receiver) => Some(classify_unified_receiver(net, receiver)),
+                        Uitem::Metadata(_) => None,
+                    })
                     .collect();
                 SearchClassification::UnifiedAddress(UnifiedAddressClassification {
                     canonical_form: ZcashAddress::from_unified(net, unified).to_string(),

@@ -31,6 +31,9 @@ toml.workspace = true
 tonic = { workspace = true, features = ["server", "transport"] }
 tracing.workspace = true
 zebra-chain.workspace = true
+zcash_primitives.workspace = true
+zcash_protocol.workspace = true
+zcash_transparent.workspace = true
 zinder-core.workspace = true
 zinder-materialized-views.workspace = true
 zinder-proto.workspace = true

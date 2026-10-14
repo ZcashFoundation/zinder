@@ -152,7 +152,8 @@ fn sample_first_coinbase_output(block: &SourceBlock) -> Result<SampledOutput> {
             block.height.value()
         )
     })?;
-    let coinbase_output = coinbase_tx.outputs().first().ok_or_else(|| {
+    let outputs = coinbase_tx.outputs();
+    let coinbase_output = outputs.first().ok_or_else(|| {
         eyre!(
             "coinbase at height {} has no transparent outputs",
             block.height.value()

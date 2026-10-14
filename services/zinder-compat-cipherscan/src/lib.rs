@@ -2947,8 +2947,8 @@ fn decode_cipherscan_coinbase_miner_fields(
         .map_err(|_| {
             CipherscanRestError::InvalidUpstreamField("location.mined.raw_transaction_bytes")
         })?;
-    let miner_data = transaction
-        .inputs()
+    let inputs = transaction.inputs();
+    let miner_data = inputs
         .iter()
         .find_map(transparent::Input::miner_data)
         .ok_or(CipherscanRestError::InvalidUpstreamField(
