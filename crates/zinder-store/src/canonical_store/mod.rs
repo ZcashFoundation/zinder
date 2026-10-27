@@ -87,6 +87,13 @@ pub const CANONICAL_STORE_SCHEMA_VERSION: u16 = 7;
 /// standard scan-recovery window regardless of canonical loader batch boundaries.
 pub const TREE_STATE_CHECKPOINT_STRIDE: u32 = 100;
 
+/// Default canonical reorg window in blocks.
+///
+/// Zebra and Zakura finalize a block only once their best non-finalized chain
+/// grows past 1000 blocks (`MAX_BLOCK_REORG_HEIGHT`), so this window covers
+/// every reorg either node can present.
+pub const DEFAULT_REORG_WINDOW_BLOCKS: u32 = 1_000;
+
 const REQUIRED_CANONICAL_NETWORK_UPGRADES: [&str; 5] =
     ["Overwinter", "Sapling", "Blossom", "Heartwood", "Canopy"];
 

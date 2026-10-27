@@ -100,7 +100,7 @@ services:
       - --max-response-bytes
       - ${ZINDER_NODE_MAX_RESPONSE_BYTES:-67108864}
       - --supported-reorg-depth
-      - ${ZINDER_SUPPORTED_REORG_DEPTH:-100}
+      - ${ZINDER_SUPPORTED_REORG_DEPTH:-1000}
       - --software-revision
       - ${ZINDER_STORAGE_LIFECYCLE_SOFTWARE_REVISION:?set the exact tested revision}
       - --trial-id

@@ -99,7 +99,10 @@ pub(super) fn load_query_config(
 ) -> Result<QueryConfig, QueryConfigError> {
     let raw_config: QueryRawConfig = ConfigLoader::new()
         .with_default("query.listen_addr", "127.0.0.1:9102")?
-        .with_default("query.reorg_window_blocks", 100_u32)?
+        .with_default(
+            "query.reorg_window_blocks",
+            zinder_store::DEFAULT_REORG_WINDOW_BLOCKS,
+        )?
         .with_ops_section(RuntimeService::Query)?
         .with_security_section()?
         .with_file(config_path)
