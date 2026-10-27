@@ -22,7 +22,7 @@ use zinder_proto::{
         wallet::{self, wallet_query_server},
     },
 };
-use zinder_runtime::{AuthenticatedChannel, connect_zinder_grpc};
+use zinder_runtime::{AuthenticatedChannel, Readiness, connect_zinder_grpc};
 
 use crate::record_proxy_outcome;
 use zinder_store::{
@@ -72,6 +72,7 @@ const TRANSACTION_NOT_FOUND_REASON: &str =
 pub struct WalletQueryGrpcAdapter<QueryApi> {
     query_api: QueryApi,
     server_info: wallet::WalletServerInfo,
+    traffic_readiness: Option<Readiness>,
 }
 
 impl<QueryApi: WalletQueryApi> WalletQueryGrpcAdapter<QueryApi> {
@@ -87,7 +88,21 @@ impl<QueryApi: WalletQueryApi> WalletQueryGrpcAdapter<QueryApi> {
         Self {
             query_api,
             server_info,
+            traffic_readiness: None,
         }
+    }
+
+    /// Shares the readiness behind the traffic gate with open chain-event
+    /// streams.
+    ///
+    /// The gate only rejects new requests. With this readiness, a stream that
+    /// is already open ends with the same typed `REORG_WINDOW_EXCEEDED`
+    /// status once the canonical writer parks, instead of idling on a chain
+    /// that no longer advances.
+    #[must_use]
+    pub fn with_traffic_readiness(mut self, readiness: Readiness) -> Self {
+        self.traffic_readiness = Some(readiness);
+        self
     }
 
     /// Wraps this adapter in the generated tonic server type.
@@ -482,9 +497,9 @@ where
             let (event_sender, event_receiver) = mpsc::channel(16);
             spawn_filtered_stream(
                 query_api,
-                resume.cursor,
-                resume.family,
+                resume,
                 address_filter,
+                self.traffic_readiness.clone(),
                 event_sender,
             );
 

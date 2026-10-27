@@ -79,6 +79,30 @@ A secondary that is already open refuses catch-up after a writer raise until
 it restarts with the raised window. A wallet secondary accepts a raised depth
 on catch-up and refuses a lower one.
 
+### Halt visibility
+
+A park remains possible, for example after the node is replaced or resynced,
+and wallets must not keep serving a branch that stopped advancing. The parked
+writer therefore keeps its control listener open and reports the halt through
+`IngestControl.WriterStatus.reorg_window_exceeded` (the existing
+`ReorgWindowExceededDetail`), without a chain view because it has no live
+fence. Native query maps that report to its own `reorg_window_exceeded`
+readiness cause, which takes precedence over the serving-pair failures the
+park causes.
+
+Wallet consumers receive the halt through the existing error vocabulary:
+
+- New requests fail with `REORG_WINDOW_EXCEEDED` (`FAILED_PRECONDITION`),
+  carrying `readiness_cause`, `replacement_depth_blocks`, and
+  `reorg_window_blocks` in `ErrorInfo` metadata.
+- Open `ChainEvents` streams end with the same status, because the traffic
+  gate only rejects new requests.
+- `zinder-client` decodes the status as `IndexerError::ReorgWindowExceeded`
+  with retry policy `OperatorActionRequired`.
+
+The proto change is additive on a private control message. The wallet surface
+gains no new message or field, so no contract revision changes.
+
 ## Alternatives
 
 **Backfill undo rows and settle at the new depth immediately.** Raising the
@@ -92,6 +116,11 @@ step.
 **Rebuild on every change.** This keeps the window as construction identity
 only, but costs a full construction of both stores and a serving outage for a
 change that needs no history rewrite.
+
+**A halt field on `ChainView`.** Every wallet response already carries
+`ChainView`, but the traffic gate refuses requests while the writer is parked,
+so a response field would only reach consumers if Zinder kept serving the
+frozen branch, which wallet-serving deliberately refuses.
 
 **A smaller default, such as the 300 blocks production Testnet moved to.** Any
 value below the node's bound still parks on reorgs the node can produce, and
@@ -114,3 +143,11 @@ operators would still need to raise it as observed reorgs grow.
   checkpoint captured before the raise, or a rebuild.
 - An operator who raises the window must restart every reader with the same
   window. A reader left on the old window fails closed.
+- Each live commit and each secondary catch-up re-authenticates the replay
+  tail from the settled checkpoint, and a deep replacement prepares its whole
+  replacement suffix in memory. Both scale with the window, so a 1000-block
+  window costs up to ten times the per-block work and replacement memory of a
+  100-block window. This cost has not been measured on Mainnet-sized blocks.
+- The lightwalletd compatibility runtime has no ingest-control health probe,
+  so it still reports a parked writer as a writer-status outage rather than
+  as `reorg_window_exceeded`.

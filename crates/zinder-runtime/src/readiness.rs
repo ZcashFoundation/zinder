@@ -580,15 +580,42 @@ impl Interceptor for TrafficReadinessInterceptor {
         if report.is_ready {
             Ok(request)
         } else {
-            let readiness_cause = report.cause.metric_label();
-            Err(status_with_reason_and_metadata(
-                ErrorReason::ServiceNotReady,
-                format!("service is not ready to accept new traffic: {readiness_cause}"),
-                ErrorDetails::new(),
-                HashMap::from([("readiness_cause".to_owned(), readiness_cause.to_owned())]),
-            ))
+            Err(not_ready_status(&report.cause))
         }
     }
+}
+
+/// Builds the status a gRPC surface returns while `cause` keeps its
+/// readiness gate closed.
+///
+/// `ErrorInfo.metadata["readiness_cause"]` always carries the stable
+/// readiness label. A canonical writer parked by `reorg_window_exceeded`
+/// maps to the typed `REORG_WINDOW_EXCEEDED` reason, with
+/// `replacement_depth_blocks` and `reorg_window_blocks` metadata, because
+/// retrying cannot succeed until an operator reconciles the store. Every
+/// other cause maps to `SERVICE_NOT_READY`.
+#[must_use]
+pub fn not_ready_status(cause: &ReadinessCause) -> Status {
+    let readiness_cause = cause.metric_label();
+    let mut metadata = HashMap::from([("readiness_cause".to_owned(), readiness_cause.to_owned())]);
+    if let ReadinessCause::ReorgWindowExceeded { depth, configured } = cause {
+        metadata.insert("replacement_depth_blocks".to_owned(), depth.to_string());
+        metadata.insert("reorg_window_blocks".to_owned(), configured.to_string());
+        return status_with_reason_and_metadata(
+            ErrorReason::ReorgWindowExceeded,
+            format!(
+                "the canonical writer is parked: a {depth}-block replacement exceeds its {configured}-block reorg window, and an operator must reconcile the canonical store"
+            ),
+            ErrorDetails::new(),
+            metadata,
+        );
+    }
+    status_with_reason_and_metadata(
+        ErrorReason::ServiceNotReady,
+        format!("service is not ready to accept new traffic: {readiness_cause}"),
+        ErrorDetails::new(),
+        metadata,
+    )
 }
 
 /// Mutable readiness state owned by the service's runtime task.
@@ -1019,6 +1046,35 @@ mod tests {
             .err()
             .ok_or("schema mismatch readiness must reject new traffic")?;
         assert_eq!(blocked.code(), tonic::Code::Unavailable);
+
+        readiness.set(ReadinessState::reorg_window_exceeded(
+            1_001,
+            1_000,
+            Some(100),
+        ));
+        let halted = interceptor
+            .call(Request::new(()))
+            .err()
+            .ok_or("a parked writer must reject new traffic")?;
+        assert_eq!(halted.code(), tonic::Code::FailedPrecondition);
+        let halted_error_details = halted.get_error_details();
+        let halted_error_info = halted_error_details
+            .error_info()
+            .ok_or("a halt rejection must carry ErrorInfo")?;
+        assert_eq!(
+            halted_error_info.reason,
+            ErrorReason::ReorgWindowExceeded.as_str_name()
+        );
+        for (key, expected) in [
+            ("readiness_cause", "reorg_window_exceeded"),
+            ("replacement_depth_blocks", "1001"),
+            ("reorg_window_blocks", "1000"),
+        ] {
+            assert_eq!(
+                halted_error_info.metadata.get(key).map(String::as_str),
+                Some(expected)
+            );
+        }
         Ok(())
     }
 

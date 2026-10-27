@@ -72,6 +72,13 @@ message WriterStatusResponse {
   // surfaces under `cause=upstream_not_ready`; readers parse one struct
   // for both surfaces. ADR-0015 §Upstream sync detection.
   optional zinder.v1.ops.UpstreamNotReadyDetail upstream_not_ready = 8;
+
+  // Set while the canonical writer is parked because a replacement crossed
+  // its reorg window. The writer no longer follows the node until an
+  // operator reconciles the store, so `chain_view` is absent: there is no
+  // live writer fence to report. Carries the same payload `ReadinessReport`
+  // surfaces under `cause=reorg_window_exceeded`. ADR-0041.
+  optional zinder.v1.ops.ReorgWindowExceededDetail reorg_window_exceeded = 9;
 }
 
 // Private point lookup for one transaction in the writer's live mempool

@@ -646,6 +646,7 @@ fn writer_status_response_round_trips_through_prost() -> eyre::Result<()> {
             upstream_health_source: "zebra_ready_endpoint".to_owned(),
             upstream_health_reason: "ok".to_owned(),
         }),
+        reorg_window_exceeded: None,
     };
     let decoded_response = round_trip(&response)?;
 
@@ -749,11 +750,44 @@ fn writer_phase_enum_round_trips_each_variant() -> eyre::Result<()> {
             phase: phase.into(),
             gap_blocks: None,
             upstream_not_ready: None,
+            reorg_window_exceeded: None,
         };
         let decoded = round_trip(&response)?;
         assert_eq!(decoded.phase(), phase, "phase round-trip failed: {phase:?}");
     }
 
+    Ok(())
+}
+
+#[test]
+fn parked_writer_status_round_trips_its_reorg_halt_without_a_chain_view() -> eyre::Result<()> {
+    let response = ingest::WriterStatusResponse {
+        chain_view: None,
+        network_name: "zcash-regtest".to_owned(),
+        phase: ingest::WriterPhase::FollowingTip.into(),
+        gap_blocks: None,
+        upstream_not_ready: None,
+        reorg_window_exceeded: Some(ops::ReorgWindowExceededDetail {
+            depth: 1_001,
+            configured: 1_000,
+        }),
+    };
+    let decoded = round_trip(&response)?;
+    assert_eq!(decoded.chain_view, None);
+    assert_eq!(
+        decoded.reorg_window_exceeded,
+        Some(ops::ReorgWindowExceededDetail {
+            depth: 1_001,
+            configured: 1_000,
+        })
+    );
+    // A reader built before the field decodes the same bytes and sees only
+    // the absent chain view.
+    let legacy = ingest::WriterStatusResponse {
+        reorg_window_exceeded: None,
+        ..decoded
+    };
+    assert_eq!(round_trip(&legacy)?.chain_view, None);
     Ok(())
 }
 

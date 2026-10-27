@@ -24,7 +24,8 @@ use zinder_proto::{
     wire::chain_epoch_from_message,
 };
 use zinder_runtime::{
-    AuthenticatedChannel, BearerToken, BearerTokenConnectError, RuntimeService, connect_zinder_grpc,
+    AuthenticatedChannel, BearerToken, BearerTokenConnectError, ReadinessCause, RuntimeService,
+    connect_zinder_grpc,
 };
 /// Bound applied to native wallet unary ingest-control calls and stream establishment.
 pub(crate) const WALLET_INGEST_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -171,6 +172,16 @@ fn validate_writer_status(
     writer_status: &zinder_proto::v1::ingest::WriterStatusResponse,
     expected_network: &str,
 ) -> Result<ChainEpoch, IngestControlHealthError> {
+    // A parked writer has no live fence, so its halt precedes fence checks.
+    if let Some(halt) = writer_status
+        .reorg_window_exceeded
+        .filter(|_| writer_status.network_name == expected_network)
+    {
+        return Err(IngestControlHealthError::WriterReorgWindowExceeded {
+            depth: halt.depth,
+            configured: halt.configured,
+        });
+    }
     let writer_epoch_message = writer_status
         .chain_view
         .as_ref()
@@ -249,6 +260,10 @@ pub(crate) enum IngestControlHealthError {
     WriterStatusInvalid,
     #[error("ingest-control WriterStatus reports that its upstream is not ready")]
     WriterUpstreamNotReady,
+    #[error(
+        "canonical writer is parked: a {depth}-block replacement exceeds its {configured}-block reorg window"
+    )]
+    WriterReorgWindowExceeded { depth: u64, configured: u64 },
     #[error("ingest-control MempoolSnapshot failed: {0}")]
     MempoolSnapshotRpc(tonic::Status),
     #[error("ingest-control MempoolSnapshot returned incoherent chain evidence")]
@@ -260,11 +275,33 @@ pub(crate) enum IngestControlHealthError {
 }
 
 impl IngestControlHealthError {
+    /// Returns the readiness cause this health failure projects onto the
+    /// wallet-serving gate. Only a parked writer's halt is a typed cause;
+    /// every other failure is a recoverable control-channel outage.
+    pub(crate) const fn readiness_cause(&self) -> ReadinessCause {
+        match self {
+            Self::WriterReorgWindowExceeded { depth, configured } => {
+                ReadinessCause::ReorgWindowExceeded {
+                    depth: *depth,
+                    configured: *configured,
+                }
+            }
+            Self::WriterStatusRpc(_)
+            | Self::WriterStatusInvalid
+            | Self::WriterUpstreamNotReady
+            | Self::MempoolSnapshotRpc(_)
+            | Self::MempoolSnapshotInvalid
+            | Self::MempoolSnapshotOlderThanWriter
+            | Self::MempoolSnapshotWriterFenceMismatch => ReadinessCause::IngestControlUnavailable,
+        }
+    }
+
     pub(crate) const fn class(&self) -> &'static str {
         match self {
             Self::WriterStatusRpc(_) => "writer_status_rpc",
             Self::WriterStatusInvalid => "writer_status_invalid",
             Self::WriterUpstreamNotReady => "writer_upstream_not_ready",
+            Self::WriterReorgWindowExceeded { .. } => "writer_reorg_window_exceeded",
             Self::MempoolSnapshotRpc(_) => "mempool_snapshot_rpc",
             Self::MempoolSnapshotInvalid => "mempool_snapshot_invalid",
             Self::MempoolSnapshotOlderThanWriter => "mempool_snapshot_older_than_writer",
@@ -411,6 +448,39 @@ mod tests {
     }
 
     #[test]
+    fn health_reports_a_parked_writer_as_a_typed_reorg_halt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut writer = writer_status(1, 1, "01");
+        writer.chain_view = None;
+        writer.reorg_window_exceeded = Some(zinder_proto::v1::ops::ReorgWindowExceededDetail {
+            depth: 1_001,
+            configured: 1_000,
+        });
+        let error = validate_health_observation(&writer, &snapshot(1, 1, "01"), NETWORK)
+            .err()
+            .ok_or("a parked writer must fail health")?;
+        assert!(matches!(
+            error.readiness_cause(),
+            zinder_runtime::ReadinessCause::ReorgWindowExceeded {
+                depth: 1_001,
+                configured: 1_000,
+            }
+        ));
+        assert_eq!(error.class(), "writer_reorg_window_exceeded");
+
+        writer.network_name = "zcash-testnet".to_owned();
+        assert!(matches!(
+            validate_health_observation(&writer, &snapshot(1, 1, "01"), NETWORK),
+            Err(IngestControlHealthError::WriterStatusInvalid)
+        ));
+        assert!(matches!(
+            IngestControlHealthError::WriterUpstreamNotReady.readiness_cause(),
+            zinder_runtime::ReadinessCause::IngestControlUnavailable
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn health_rejects_a_snapshot_older_than_writer_status() {
         let outcome =
             validate_health_observation(&writer_status(2, 2, "02"), &snapshot(1, 1, "01"), NETWORK);
@@ -520,6 +590,7 @@ mod tests {
             phase: WriterPhase::FollowingTip.into(),
             gap_blocks: Some(0),
             upstream_not_ready: None,
+            reorg_window_exceeded: None,
         }
     }
 

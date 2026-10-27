@@ -206,8 +206,9 @@ satisfy and the platform never stops restarting a crash loop.
 Liveness alone does not prove the topology advances, so the supervisor polls
 all three `/readyz` endpoints as well. A canonical writer that meets a reorg
 deeper than `ZINDER_INGEST__REORG_WINDOW_BLOCKS` drains its readiness and parks
-without exiting, and its readers keep publishing a self-consistent pair at the
-frozen height. Treating `reorg_window_exceeded` as terminal makes the container
+without exiting. Native query reads the halt from the writer, drains its own
+readiness with `reorg_window_exceeded`, and answers wallets with the typed
+`REORG_WINDOW_EXCEEDED` status. Treating `reorg_window_exceeded` as terminal makes the container
 restart, meet the same reorg, and restart again until an operator reconciles
 the canonical store. That crash loop is the intended outcome: the alternative
 is a `WalletQuery` surface answering from a chain that stopped advancing.
