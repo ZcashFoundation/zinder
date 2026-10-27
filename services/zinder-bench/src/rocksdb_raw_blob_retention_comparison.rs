@@ -32,7 +32,7 @@ const REPORT_CONTRACT_IDENTITY: &str = "rocksdb-raw-blob-retention-comparison";
 const REPORT_FORMAT_VERSION: u16 = 2;
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
-const DEFAULT_SUPPORTED_REORG_DEPTH: u32 = 100;
+const DEFAULT_SUPPORTED_REORG_DEPTH: u32 = zinder_store::DEFAULT_REORG_WINDOW_BLOCKS;
 
 /// CLI contract for one authenticated `transactions` versus `all` comparison.
 #[derive(Args)]
@@ -948,7 +948,10 @@ mod tests {
         let validated = cli.comparison.validate()?;
 
         assert_eq!(validated.request_timeout_seconds, 30);
-        assert_eq!(validated.supported_reorg_depth, 100);
+        assert_eq!(
+            validated.supported_reorg_depth,
+            zinder_store::DEFAULT_REORG_WINDOW_BLOCKS
+        );
         assert!(!validated.transactions_canonical_store.exists());
         assert!(!validated.transactions_secondary_root.exists());
         assert!(!validated.all_canonical_store.exists());
