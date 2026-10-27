@@ -360,6 +360,7 @@ impl PublicationContext {
             build_plan: self.build_plan.clone(),
             cursor_auth_key: self.cursor_auth_key,
             build_state: CanonicalStoreBuildState::Building,
+            activation_schedule_binding: None,
         }
     }
 
@@ -371,7 +372,7 @@ impl PublicationContext {
         let expectation =
             CanonicalStoreAdmissionExpectation::from_build_plan(&self.build_plan, self.workload);
         let (admitted_database_identity, admitted_control) =
-            admit_existing_store(&self.store_path, expectation)?;
+            admit_existing_store(&self.store_path, &expectation)?;
         if admitted_database_identity.as_slice() != built_database_identity
             || admitted_control != expected_control
         {
@@ -1153,7 +1154,7 @@ fn validate_reopened_identity_and_control(
         &expected_control.build_plan,
         expected_control.workload,
     );
-    let control = validate_open_store_control(db, store_path, expectation)?;
+    let control = validate_open_store_control(db, store_path, &expectation)?;
     if database_identity.as_slice() != expected_database_identity || &control != expected_control {
         return Err(CanonicalStoreError::publication(
             "database identity or BUILDING control changed during cold reopen",

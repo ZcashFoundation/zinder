@@ -17,7 +17,9 @@ physical layout is versioned by `CANONICAL_STORE_SCHEMA_VERSION`.
 
 The ready control record binds:
 
-- network and required network-upgrade activation fingerprint;
+- network and the construction network-upgrade activation fingerprint;
+- after the writer's first admission, the latest network-upgrade schedule
+  revision and its digest;
 - `CanonicalStoreWorkload`;
 - `CanonicalReorgPolicy`;
 - history bounds and predecessor checkpoint;
@@ -123,8 +125,11 @@ contract and [Service operations](service-operations.md) for metrics.
 
 Every opener validates exact identity and version before returning a role
 handle. A newer or older unsupported physical layout, wrong network, wrong
-workload, wrong activation fingerprint, changed reorg policy, or incompatible
-source identity fails without mutation.
+workload, wrong construction activation fingerprint, an activation table that
+differs from the admitted schedule at or below the visible tip, changed reorg
+policy, or incompatible source identity fails without mutation. Only the
+canonical writer journals a new schedule revision; it may change only
+activations above the visible tip.
 
 Version domains are independent. Canonical physical schema, canonical replay
 format, canonical digest, wallet physical schema, wallet value encoding,

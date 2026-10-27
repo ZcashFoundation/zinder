@@ -3,8 +3,7 @@ use zinder_core::{
     BlockHeight, BlockId, CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigest,
     CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
     ChainEpochId, CommitmentTreeAccumulator, CommitmentTreeCheckpoint, NetworkUpgradeActivations,
-    NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol, SubtreeRootArtifact,
-    TransactionLocation, UnixTimestampMillis,
+    ShieldedProtocol, SubtreeRootArtifact, TransactionLocation, UnixTimestampMillis,
 };
 
 use super::{
@@ -17,7 +16,7 @@ use super::{
         validate_live_block,
     },
     block_replay::{BLOCK_REPLAY_COLUMN_FAMILY, resume_persisted_sequence_checkpoint},
-    control::encode_ready_store_control,
+    control::encode_ready_store_control_with_schedule,
     publication::{
         column_family, encode_live_append_event, encode_live_chain_epoch, read_chain_epoch_tips,
         validate_live_append_publication, validate_ready_sequence_checkpoint, validate_settled_tip,
@@ -251,11 +250,7 @@ impl PreparedLiveAppendCommit {
         append: CanonicalLiveAppend,
         network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> Result<Self, CanonicalStoreError> {
-        if network_upgrade_activations.network() != store.network()
-            || network_upgrade_activations
-                .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1)
-                != store.network_upgrade_activations_fingerprint()
-        {
+        if !store.activation_table_is_admitted(network_upgrade_activations) {
             return Err(CanonicalStoreError::live_commit(
                 "live append activation table differs from the admitted store identity",
             ));
@@ -301,11 +296,12 @@ impl PreparedLiveAppendCommit {
             sequence_checkpoint,
             ..store.ready_evidence
         };
-        let encoded_control = encode_ready_store_control(
+        let encoded_control = encode_ready_store_control_with_schedule(
             store.workload,
             &store.build_plan,
             store.cursor_auth_key,
             &ready_evidence,
+            store.activation_schedule_binding(),
         )
         .map_err(|source| CanonicalStoreError::live_commit(source.to_string()))?;
         Ok(Self {

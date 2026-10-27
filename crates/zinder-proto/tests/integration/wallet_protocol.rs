@@ -698,6 +698,44 @@ fn checkpoint_build_plan_raw_blob_retention_round_trips_through_prost() -> eyre:
 }
 
 #[test]
+fn canonical_writer_status_admitted_schedule_round_trips_through_prost() -> eyre::Result<()> {
+    let activations = zinder_core::NetworkUpgradeActivations::new(
+        zinder_core::Network::ZcashTestnet,
+        vec![
+            zinder_core::NetworkUpgradeActivation {
+                branch_id: zinder_core::ConsensusBranchId::new(0x37a5_165b),
+                activation_height: zinder_core::BlockHeight::new(4_134_000),
+                name: "NU6.3".to_owned(),
+            },
+            zinder_core::NetworkUpgradeActivation {
+                branch_id: zinder_core::ConsensusBranchId::new(0x7719_0ad9),
+                activation_height: zinder_core::BlockHeight::new(4_465_026),
+                name: "NU7".to_owned(),
+            },
+        ],
+    )?;
+    let response = ingest::CanonicalWriterStatusResponse {
+        network_name: "zcash-testnet".to_owned(),
+        fence: None,
+        oldest_retained_event_sequence: 1,
+        network_upgrade_schedule: Some(
+            zinder_proto::wire::encode_canonical_network_upgrade_schedule(&activations, 2),
+        ),
+    };
+    let schedule = round_trip(&response)?
+        .network_upgrade_schedule
+        .ok_or_else(|| eyre!("network_upgrade_schedule missing"))?;
+    let (decoded, revision) = zinder_proto::wire::decode_canonical_network_upgrade_schedule(
+        schedule,
+        zinder_core::Network::ZcashTestnet,
+    )?;
+
+    assert_eq!(decoded, activations);
+    assert_eq!(revision, 2);
+    Ok(())
+}
+
+#[test]
 fn writer_phase_enum_round_trips_each_variant() -> eyre::Result<()> {
     for phase in [
         ingest::WriterPhase::Unspecified,

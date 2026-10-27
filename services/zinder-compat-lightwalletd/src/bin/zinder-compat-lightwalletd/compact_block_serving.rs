@@ -1437,6 +1437,12 @@ mod tests {
                 canonical_sequence_digest: fence.sequence_digest().as_bytes().to_vec(),
             }),
             oldest_retained_event_sequence: 1,
+            network_upgrade_schedule: store.network_upgrade_schedule().map(|schedule| {
+                zinder_proto::wire::encode_canonical_network_upgrade_schedule(
+                    schedule.activations(),
+                    schedule.revision(),
+                )
+            }),
         }
     }
 
@@ -1740,6 +1746,7 @@ mod tests {
                 ..CanonicalWriterFence::default()
             }),
             oldest_retained_event_sequence: 0,
+            network_upgrade_schedule: None,
         };
         assert_eq!(
             classify_writer_fence(&status(4), network, 4, true),

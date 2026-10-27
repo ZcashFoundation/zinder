@@ -405,6 +405,9 @@ jobs:
             --file crates/zinder-store/src/chain_store.rs \
             --file crates/zinder-store/src/chain_store/validation.rs \
             --file crates/zinder-store/src/format/stream_cursor.rs \
+            --file crates/zinder-store/src/canonical_store/rocksdb.rs \
+            --file crates/zinder-store/src/canonical_store/activation_schedule.rs \
+            --file crates/zinder-core/src/network_upgrade_activations.rs \
             --file crates/zinder-source/src/source_block.rs \
             --file services/zinder-ingest/src/artifact_builder.rs \
-            --re 'chain_event_history|finalized_only_commit_without_artifacts|validate_reorg_window_change|verify_auth_tag|from_raw_block_bytes|compact_sapling_outputs|compact_orchard_actions|compact_note_ciphertext_prefix'
+            --re 'chain_event_history|finalized_only_commit_without_artifacts|validate_reorg_window_change|verify_auth_tag|from_raw_block_bytes|compact_sapling_outputs|compact_orchard_actions|compact_note_ciphertext_prefix|matching_fingerprint_prefix_len|preserves_through|next_activation_schedule|validate_activation_expectation|read_bound'
