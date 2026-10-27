@@ -1,0 +1,6 @@
+kind: changed
+body: 'Existing canonical and wallet stores now start against a node that announces a future network upgrade, such as Zebra 7.0.0 adding NU7, without a rebuild. A node table that changes an upgrade the store has already passed is refused, and the store is left unchanged. The first start of this release writes schedule revision 1 to the canonical store even when the node''s table is unchanged, so earlier Zinder releases can no longer open that store; upgrade all Zinder services together and restart ingest before the readers. PLACEHOLDER: the pull request number below is 0; replace it, and rename this file to match, once the pull request exists.'
+time: 2026-10-27T15:19:26Z
+custom:
+  Bump: minor
+  PR: "0"
