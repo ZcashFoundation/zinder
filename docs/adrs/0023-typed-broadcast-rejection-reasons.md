@@ -179,4 +179,4 @@ already has queued; nothing about the legacy-wire shape changes.
 - `is_already_queued_message` (the queued-state detector).
 - `classify_rejection_reason` (the typed-reason classifier).
 
-See [Public interfaces §Domain types](../architecture/public-interfaces.md#domain-types).
+See [Public interfaces §Core vocabulary](../architecture/public-interfaces.md#core-vocabulary).

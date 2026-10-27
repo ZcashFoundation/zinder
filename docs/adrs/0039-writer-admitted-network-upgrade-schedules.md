@@ -86,6 +86,11 @@ observation:
 - The query serves the table admitted with the captured serving pair. Its
   pair publisher republishes when the writer reports a new revision at an
   unchanged fence.
+- `GetLightdInfo` derives `consensusBranchId`, `upgradeName`, `upgradeHeight`,
+  and `saplingActivationHeight` on each request from the admitted table and
+  the served tip: through `WalletQueryApi::network_upgrade_activations` in
+  wallet-serving mode, and from the served canonical reader in compact-block
+  mode. `LightwalletdGrpcAdapter` takes no activation table of its own.
 - The projector converges on the writer's fence and schedule revision, and
   binds the schedule identity into each format-3 state-bundle manifest.
 

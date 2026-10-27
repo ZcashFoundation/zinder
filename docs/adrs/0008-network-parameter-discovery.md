@@ -48,7 +48,7 @@ Production code does not consult `RegtestParameters::default()` or library-defau
 
 - **`zinder-ingest`** discovers the activations before canonical construction so transaction parsing and the immutable store identity use the node's exact table. Each later open admits the discovered table as a schedule revision. Wallet-serving coverage independently requires complete transparent history.
 - **`zinder-query`** holds `Arc<NetworkUpgradeActivations>` on `WalletServingQuery` as a required constructor parameter. `MinedTransactionChainContext.consensus_branch_id` reflects the active branch at the mined height in the schedule admitted with the captured serving pair. The production binary errors out at startup if `[node]` is not configured (the table cannot be discovered without an RPC endpoint).
-- **`zinder-compat-lightwalletd`** holds `Arc<NetworkUpgradeActivations>` on `LightwalletdGrpcAdapter` as a required constructor parameter. `GetLightdInfo` reads the table directly. Same startup-time failure if `[node]` is not configured.
+- **`zinder-compat-lightwalletd`** discovers the table at startup to open its serving readers. `GetLightdInfo` reads the writer-admitted table on each request, through `WalletQueryApi::network_upgrade_activations` in wallet-serving mode and from the served canonical reader in compact-block mode. Same startup-time failure if `[node]` is not configured.
 - **`zinder-client`** discovers the table through `RemoteChainIndex::network_upgrade_activations`, after preflighting the native server's identity, network, contract revision, and advertised capability.
 - **`zinder-testkit`** exposes `local_network_from_activations(&activations) -> LocalNetwork` for live tests; `TransparentTestKey::from_seed_with_local_network` accepts the result. `regtest_local_network()` is derived from `sample_regtest_upgrade_activations()` so the two regtest fixtures cannot drift.
 
@@ -70,7 +70,7 @@ A live test in `crates/zinder-source/tests/live/zebra_json_rpc.rs` calls `fetch_
 
 - Each process pays one `getblockchaininfo` round-trip at startup so consensus parsing and served upgrade metadata use the node's exact activation table.
 - The table is cached for process lifetime. If the operator reconfigures the node's activation heights mid-flight without restarting Zinder, the cache goes stale until restart. Documented in the runbook.
-- Tests that exercise `WalletQuery` or `LightwalletdGrpcAdapter` must pass an activations table. The testkit's `sample_regtest_upgrade_activations()` covers the common case; the cost is one extra line per test.
+- Tests that exercise `WalletQuery` must pass an activations table. The testkit's `sample_regtest_upgrade_activations()` covers the common case; the cost is one extra line per test.
 
 ## Vocabulary
 
@@ -81,4 +81,4 @@ A live test in `crates/zinder-source/tests/live/zebra_json_rpc.rs` calls `fetch_
 - `ZebraJsonRpcSource::discover_network_upgrade_activations(target)` (the shared startup wrapper that returns `Arc<NetworkUpgradeActivations>` and emits a structured discovery log).
 - `local_network_from_activations` (the testkit bridge to `zcash_protocol::LocalNetwork`).
 
-See [Public interfaces §Domain types](../architecture/public-interfaces.md#domain-types).
+See [Public interfaces §Core vocabulary](../architecture/public-interfaces.md#core-vocabulary).

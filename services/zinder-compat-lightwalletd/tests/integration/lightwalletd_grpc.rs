@@ -328,10 +328,7 @@ async fn get_block_range_streams_windows_wider_than_one_store_read() -> eyre::Re
         Arc::new(sample_regtest_upgrade_activations()),
     ))
     .with_synthetic_compact_blocks_to(visible_tip_height);
-    let adapter = LightwalletdGrpcAdapter::new(
-        recorder.clone(),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = LightwalletdGrpcAdapter::new(recorder.clone());
 
     let request = |start: u64, end: u64| lightwalletd::BlockRange {
         start: Some(lightwalletd::BlockId {
@@ -1014,10 +1011,7 @@ async fn get_transaction_by_hash_pins_every_read_to_one_epoch() -> eyre::Result<
         (),
         Arc::new(sample_regtest_upgrade_activations()),
     ));
-    let adapter = LightwalletdGrpcAdapter::new(
-        recorder.clone(),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let adapter = LightwalletdGrpcAdapter::new(recorder.clone());
 
     let transaction = adapter
         .get_transaction(Request::new(lightwalletd::TxFilter {
@@ -1556,10 +1550,11 @@ async fn get_address_utxos_applies_max_entries_across_address_set() -> eyre::Res
         },
     )?;
     let activations = Arc::new(sample_regtest_upgrade_activations());
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(store_fixture.chain_store().clone(), (), activations.clone()),
-        activations,
-    );
+    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
+        activations.clone(),
+    ));
 
     let request = lightwalletd::GetAddressUtxosArg {
         addresses: vec![address_a, address_b.clone()],
@@ -1686,14 +1681,11 @@ async fn send_transaction_forwards_accepted_to_zero_error_code() -> eyre::Result
     let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
     let transaction_id = TransactionId::from_bytes([0x42; 32]);
     let broadcaster = MockTransactionBroadcaster::accepted(transaction_id);
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            broadcaster,
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
+    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        broadcaster,
         Arc::new(sample_regtest_upgrade_activations()),
-    );
+    ));
 
     let response = adapter
         .send_transaction(Request::new(lightwalletd::RawTransaction {
@@ -1720,14 +1712,11 @@ async fn send_transaction_maps_invalid_encoding_to_minus_22() -> eyre::Result<()
             message: "TX decode failed".to_owned(),
         }),
     );
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            broadcaster,
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
+    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        broadcaster,
         Arc::new(sample_regtest_upgrade_activations()),
-    );
+    ));
 
     let response = adapter
         .send_transaction(Request::new(lightwalletd::RawTransaction {
@@ -1776,14 +1765,11 @@ async fn send_transaction_maps_duplicate_and_rejected_codes() -> eyre::Result<()
     for (broadcast_outcome, expected_code, expected_message) in cases {
         let store_fixture = acceptance_store_fixture(DEFAULT_TREE_STATE_PAYLOAD.to_vec())?;
         let broadcaster = MockTransactionBroadcaster::returning(broadcast_outcome);
-        let adapter = LightwalletdGrpcAdapter::new(
-            WalletQuery::new(
-                store_fixture.chain_store().clone(),
-                broadcaster,
-                Arc::new(sample_regtest_upgrade_activations()),
-            ),
+        let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
+            store_fixture.chain_store().clone(),
+            broadcaster,
             Arc::new(sample_regtest_upgrade_activations()),
-        );
+        ));
 
         let response = adapter
             .send_transaction(Request::new(lightwalletd::RawTransaction {
@@ -1810,14 +1796,11 @@ async fn send_transaction_forwards_node_error_code_when_present() -> eyre::Resul
             message: "missing-input".to_owned(),
         },
     ));
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            broadcaster,
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
+    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        broadcaster,
         Arc::new(sample_regtest_upgrade_activations()),
-    );
+    ));
 
     let response = adapter
         .send_transaction(Request::new(lightwalletd::RawTransaction {
@@ -1874,7 +1857,7 @@ async fn taddress_balance_projects_native_delta_for_generated_lightwalletd_clien
     );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server_addr = listener.local_addr()?;
-    let adapter = LightwalletdGrpcAdapter::new(query_api, activations).into_server();
+    let adapter = LightwalletdGrpcAdapter::new(query_api).into_server();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let server_handle = tokio::spawn(async move {
         Server::builder()
@@ -2556,14 +2539,11 @@ fn reorg_replacement_artifacts(parent_hash: BlockHash, height: BlockHeight) -> C
 fn acceptance_adapter(
     store_fixture: &StoreFixture,
 ) -> LightwalletdGrpcAdapter<WalletQuery<PrimaryChainStore>> {
-    LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
+    LightwalletdGrpcAdapter::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
         Arc::new(sample_regtest_upgrade_activations()),
-    )
+    ))
 }
 
 fn acceptance_store_fixture(tree_state_payload: Vec<u8>) -> eyre::Result<StoreFixture> {

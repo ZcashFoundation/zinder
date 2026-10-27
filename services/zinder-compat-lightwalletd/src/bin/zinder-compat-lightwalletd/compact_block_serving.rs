@@ -753,13 +753,18 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlockAdapter {
     ) -> Result<Response<lightwalletd::LightdInfo>, Status> {
         let reader = self.reader();
         let epoch = reader.chain_epoch().map_err(store_status)?;
-        if epoch.network != self.activations.network() {
+        // Before the writer's first admission, reader admission requires the
+        // startup table to equal the store's construction table.
+        let activations = reader
+            .network_upgrade_activations()
+            .unwrap_or(&self.activations);
+        if epoch.network != activations.network() {
             return Err(Status::failed_precondition(
                 "admitted network does not match node activations",
             ));
         }
         Ok(Response::new(lightd_info(
-            &self.activations,
+            activations,
             epoch.visible_tip_height.value(),
             false,
         )))
@@ -1762,18 +1767,42 @@ mod tests {
         Ok(())
     }
 
-    /// A publisher that started with the node's pre-upgrade table keeps
-    /// replacing generations after the writer admits an upgrade and the chain
-    /// crosses its activation height.
+    /// A runtime started on the pre-upgrade table keeps refreshing after the
+    /// chain crosses an activation the writer admitted later.
+    ///
+    /// `GetLightdInfo` then reports the admitted upgrade.
     #[tokio::test]
     #[allow(
         clippy::too_many_lines,
-        reason = "The scenario keeps startup, writer admission, crossing the activation, and refresh in one causal sequence."
+        reason = "The scenario keeps startup, writer admission, crossing the activation, refresh, and the served upgrade in one causal sequence."
     )]
     async fn publisher_keeps_refreshing_after_the_chain_crosses_a_later_admitted_activation()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
-        let activations = lifecycle_activations();
+        // Upgrades without a shielded pool are active at the baseline tip,
+        // so the fixture blocks need no commitment-tree frontiers.
+        let activations = NetworkUpgradeActivations::new(
+            Network::ZcashRegtest,
+            lifecycle_activations()
+                .activations()
+                .iter()
+                .cloned()
+                .map(|activation| {
+                    let activation_height = if matches!(
+                        activation.name.as_str(),
+                        "Overwinter" | "Blossom" | "Heartwood" | "Canopy"
+                    ) {
+                        BlockHeight::new(1)
+                    } else {
+                        activation.activation_height
+                    };
+                    NetworkUpgradeActivation {
+                        activation_height,
+                        ..activation
+                    }
+                })
+                .collect(),
+        )?;
         let (mut primary, blocks) =
             lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
         // The writer's first start admits the unchanged node table as
@@ -1812,12 +1841,19 @@ mod tests {
         };
         let (mut publisher, slot) =
             CompactBlockPublisher::bootstrap(config, serving_readiness, &endpoint, None).await?;
+        let adapter = CompactBlockAdapter::new(slot.clone(), Arc::new(activations.clone()));
+        let canopy = adapter
+            .get_lightd_info(Request::new(lightwalletd::Empty::default()))
+            .await?
+            .into_inner();
+        assert_eq!(canopy.upgrade_name, "Canopy");
 
         // The node is upgraded and only the writer restarts: it admits the
         // new table, which activates NU7 at the next block, as revision 2.
+        let nu7_branch_id = ConsensusBranchId::new(0x7719_0ad9);
         let mut entries = activations.activations().to_vec();
         entries.push(NetworkUpgradeActivation {
-            branch_id: ConsensusBranchId::new(0x7719_0ad9),
+            branch_id: nu7_branch_id,
             activation_height: BlockHeight::new(2),
             name: "NU7".to_owned(),
         });
@@ -1845,7 +1881,19 @@ mod tests {
         let replaced = slot.capture();
         assert_eq!(replaced.event_fence(), crossing_fence);
         assert_eq!(replaced.network_upgrade_activations(), Some(&upgraded));
+        let nu7 = adapter
+            .get_lightd_info(Request::new(lightwalletd::Empty::default()))
+            .await?
+            .into_inner();
+        assert_eq!(nu7.block_height, 2);
+        assert_eq!(
+            nu7.consensus_branch_id,
+            zinder_core::wire::encode_branch_id_hex(nu7_branch_id)
+        );
+        assert_eq!(nu7.upgrade_name, "NU7");
+        assert_eq!(nu7.upgrade_height, 2);
 
+        drop(adapter);
         drop(replaced);
         drop(publisher);
         drop(primary);
