@@ -154,26 +154,42 @@ identity mismatches require operator action.
 
 ### Reorg-window sizing
 
-The default 100-block reorg window is an operating baseline, not a consensus
-finality guarantee. Size the window above the longest plausible competing-branch
-duration for the deployed network, expressed in blocks, and include headroom for
-same-height mining races. Hashpower concentration increases this risk: a dominant
-miner can extend one branch while a minority branch remains visible long enough
-for the trailing settled-tip boundary to advance past their common parent.
+The default reorg window is 1000 blocks, the depth past which Zebra 7 and
+Zakura finalize blocks. Neither node can present a deeper reorg, so ingest
+parks with `reorg_window_exceeded` only on a change the node itself could not
+produce, such as a replaced or resynced node. The window is not a consensus
+finality guarantee.
 
-On 2026-07-20, a Zcash testnet mining race produced a 114-block reorg after the
-losing branch had remained visible for more than an hour; a 100-block window was
-insufficient, and operators increased the production testnet window to 300. Use
-that incident as sizing evidence for similarly concentrated test networks, not
-as a universal value. Larger windows retain more replaceable state and wallet
-undo data, so capacity planning must cover the selected headroom. Configure the
-same window for ingest, projector, native query, and compatibility admission.
+A smaller window parks on reorgs the node can produce. On 2026-07-20, a Zcash
+testnet mining race produced a 114-block reorg after the losing branch had
+remained visible for more than an hour, which exceeded the 100-block window
+then in use. Production testnet moved to 300 blocks, and the node's bound is
+higher still.
+
+The settled tip trails the visible tip by the window, so surfaces that report
+settlement or finality report it 1000 blocks behind the visible tip. Wallet
+undo rows scale with the window; construction accounts for them against
+`projector.build.max_accounted_reorg_undo_bytes`. Configure the same window for
+ingest, projector, native query, and compatibility admission.
+
+To raise the window on an existing deployment, restart the canonical writer
+with the larger window first, then restart the projector, native query, and
+compatibility with the same value. The writer records the raise in place and
+holds the settled tip until the visible tip is a full new window above it, so
+replaceable depth grows with new blocks rather than all at once. The projector
+raises the wallet's undo depth when it resumes. A reader still on the old
+window refuses to open or to catch up until it restarts with the new one.
+Earlier releases cannot open a raised store. If you might need to roll back
+to an earlier Zinder release, capture a state bundle or keep a certified
+side-by-side lane before raising. Lowering the window
+in place is refused; rebuild, or restore a state captured under the smaller
+window. See [ADR-0041](../adrs/0041-reorg-window-follows-the-node-bound.md).
 
 When a replacement exceeds the configured window, ingest drains readiness and
 parks for operator inspection until termination. Restarting does not make the
-settled store replaceable. Confirm the authoritative branch, choose an approved
-window from observed network behavior, and rebuild or restore a coherent state
-bundle under that policy before returning the service to traffic.
+settled store replaceable. Confirm the authoritative branch and the node's
+health, then rebuild or restore a coherent state bundle before returning the
+service to traffic.
 
 ## Memory and storage pressure
 

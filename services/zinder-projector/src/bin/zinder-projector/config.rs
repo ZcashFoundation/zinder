@@ -28,7 +28,7 @@ const DEFAULT_CANONICAL_SECONDARY_PATH: &str = "/var/lib/zinder/projector/canoni
 const DEFAULT_RAW_BLOB_RETENTION: RawBlobRetention = RawBlobRetention::Transactions;
 const DEFAULT_WALLET_PATH: &str = "/var/lib/zinder/wallet";
 const DEFAULT_OPS_LISTEN_ADDR: &str = "127.0.0.1:9110";
-const DEFAULT_REORG_WINDOW_BLOCKS: u32 = 100;
+const DEFAULT_REORG_WINDOW_BLOCKS: u32 = zinder_store::DEFAULT_REORG_WINDOW_BLOCKS;
 const DEFAULT_FENCE_CONVERGENCE_TIMEOUT_SECONDS: u64 = 30;
 /// ADR-0035 permits at most two hours for wallet construction after canonical.
 ///

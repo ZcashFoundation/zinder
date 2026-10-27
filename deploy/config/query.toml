@@ -29,7 +29,7 @@ bearer_token_path = "/var/run/zinder-control/ingest.token"
 
 [query]
 listen_addr = "127.0.0.1:9102"
-reorg_window_blocks = 100
+reorg_window_blocks = 1000
 pair_convergence_attempts = 12
 
 [ops]
