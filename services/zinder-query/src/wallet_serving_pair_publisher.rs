@@ -243,6 +243,14 @@ impl WalletServingReadiness {
         if state.is_shutting_down {
             projected.cause = ReadinessCause::ShuttingDown;
             projected.target_height = None;
+        } else if matches!(
+            state.ingest_control_cause,
+            ReadinessCause::ReorgWindowExceeded { .. }
+        ) {
+            // A parked writer is the root cause of any pair refresh failure
+            // that follows it, so its typed halt wins over them.
+            projected.cause = state.ingest_control_cause.clone();
+            projected.target_height = None;
         } else if !state.pair_state.cause.permits_traffic() {
             // The pair state is already the complete projection.
         } else if !state.node_source_cause.permits_traffic() {
@@ -298,7 +306,7 @@ pub fn spawn_wallet_ingest_control_readiness_probe(
                         );
                     }
                     last_health_was_available = Some(false);
-                    ReadinessCause::IngestControlUnavailable
+                    error.readiness_cause()
                 }
             };
             readiness.publish_ingest_control_cause(cause);
@@ -1661,6 +1669,74 @@ mod tests {
             error_info.reason,
             ErrorReason::ChainEpochPinUnavailable.as_str_name()
         );
+
+        cancel.cancel();
+        handle.await?;
+        ingest_fixture.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wallet_ingest_control_probe_projects_a_parked_writer_as_a_typed_halt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ingest_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+        let admitted_ingest_control =
+            AdmittedIngestControl::connect(ingest_fixture.endpoint(), None, Network::ZcashRegtest)
+                .await?;
+        let runtime = zinder_runtime::Readiness::default();
+        let readiness = WalletServingReadiness::awaiting_node_and_ingest_control(runtime.clone());
+        readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
+        readiness.publish_node_source_cause(zinder_runtime::ReadinessCause::Ready);
+        let cancel = CancellationToken::new();
+        let handle = spawn_wallet_ingest_control_readiness_probe(
+            admitted_ingest_control,
+            readiness.clone(),
+            Duration::from_millis(5),
+            cancel.clone(),
+        );
+        wait_for_readiness_cause(&runtime, |cause| {
+            matches!(cause, zinder_runtime::ReadinessCause::Ready)
+        })
+        .await?;
+
+        ingest_fixture.set_reorg_window_exceeded(Some(
+            zinder_proto::v1::ops::ReorgWindowExceededDetail {
+                depth: 1_001,
+                configured: 1_000,
+            },
+        ));
+        wait_for_readiness_cause(&runtime, |cause| {
+            matches!(
+                cause,
+                zinder_runtime::ReadinessCause::ReorgWindowExceeded {
+                    depth: 1_001,
+                    configured: 1_000,
+                }
+            )
+        })
+        .await?;
+        // The pair cannot refresh against a parked writer; the halt stays the
+        // projected cause instead of the refresh failure it explains.
+        readiness.publish_pair_state(zinder_runtime::ReadinessState::not_ready(
+            zinder_runtime::ReadinessCause::WriterStatusUnavailable,
+        ));
+        assert!(matches!(
+            runtime.report().cause,
+            zinder_runtime::ReadinessCause::ReorgWindowExceeded { .. }
+        ));
+        let mut traffic_gate = zinder_runtime::TrafficReadinessInterceptor::new(runtime.clone());
+        let halted = traffic_gate
+            .call(Request::new(()))
+            .err()
+            .ok_or("a parked writer must close the wallet traffic gate")?;
+        assert_eq!(halted.code(), Code::FailedPrecondition);
+
+        ingest_fixture.set_reorg_window_exceeded(None);
+        readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
+        wait_for_readiness_cause(&runtime, |cause| {
+            matches!(cause, zinder_runtime::ReadinessCause::Ready)
+        })
+        .await?;
 
         cancel.cancel();
         handle.await?;

@@ -150,11 +150,21 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
         &self,
         _request: Request<WriterStatusRequest>,
     ) -> Result<Response<WriterStatusResponse>, Status> {
-        let snapshot = self.current_chain_epoch().await?;
+        let readiness_report = self.readiness.report();
+        // A parked writer no longer owns a live fence, but readers still need
+        // its typed halt rather than an unavailable control channel.
+        let chain_epoch = if matches!(
+            readiness_report.cause,
+            ReadinessCause::ReorgWindowExceeded { .. }
+        ) {
+            None
+        } else {
+            Some(self.current_chain_epoch().await?.chain_epoch)
+        };
         Ok(Response::new(writer_status_response(
             self.network,
-            snapshot.chain_epoch,
-            &self.readiness.report(),
+            chain_epoch,
+            &readiness_report,
         )))
     }
 
@@ -494,26 +504,36 @@ fn chain_epoch_committed_message(
 
 fn writer_status_response(
     network: Network,
-    chain_epoch: ChainEpoch,
+    chain_epoch: Option<ChainEpoch>,
     readiness_report: &ReadinessReport,
 ) -> WriterStatusResponse {
     let upstream_tip = upstream_tip_from_readiness(readiness_report);
     let gap_blocks = upstream_tip
         .as_ref()
         .and_then(|upstream_tip| upstream_tip.committed_height)
-        .map(|upstream_height| {
+        .zip(chain_epoch)
+        .map(|(upstream_height, chain_epoch)| {
             upstream_height.saturating_sub(chain_epoch.visible_tip_height.value())
         });
-    let mut chain_view = chain_view_message(chain_epoch);
-    chain_view.upstream_tip = upstream_tip;
+    let chain_view = chain_epoch.map(|chain_epoch| {
+        let mut chain_view = chain_view_message(chain_epoch);
+        chain_view.upstream_tip = upstream_tip;
+        chain_view
+    });
     let upstream_not_ready =
         if let ReadinessCause::UpstreamNotReady(detail) = &readiness_report.cause {
             Some(ops::UpstreamNotReadyDetail::from(detail))
         } else {
             None
         };
+    let reorg_window_exceeded =
+        if let ReadinessCause::ReorgWindowExceeded { depth, configured } = readiness_report.cause {
+            Some(ops::ReorgWindowExceededDetail { depth, configured })
+        } else {
+            None
+        };
     WriterStatusResponse {
-        chain_view: Some(chain_view),
+        chain_view,
         network_name: encode_zinder_native_chain_name(network).to_owned(),
         phase: readiness_report
             .phase
@@ -521,6 +541,7 @@ fn writer_status_response(
             .into(),
         gap_blocks,
         upstream_not_ready,
+        reorg_window_exceeded,
     }
 }
 
@@ -1141,6 +1162,56 @@ mod tests {
         );
 
         fixture.shutdown().await
+    }
+
+    /// A parked writer has dropped its command queue, so `WriterStatus`
+    /// answers from readiness alone and carries the typed halt.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parked_writer_status_reports_the_reorg_halt_without_a_live_writer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (canonical, commands) = canonical_control_channel();
+        drop(commands);
+        let readiness = Readiness::new(
+            ReadinessState::reorg_window_exceeded(1_001, 1_000, Some(4_200))
+                .with_phase(IngestPhase::FollowingTip),
+        );
+        let source: Arc<dyn NodeSource> = Arc::new(ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashTestnet,
+            "http://127.0.0.1:1",
+            NodeAuth::None,
+            Duration::from_secs(1),
+        )?);
+        let adapter = CanonicalIngestControlGrpcAdapter::new(
+            zinder_core::Network::ZcashTestnet,
+            canonical,
+            LiveMempoolOwner::default(),
+            source,
+            readiness.clone(),
+        );
+
+        let response = IngestControl::writer_status(&adapter, Request::new(WriterStatusRequest {}))
+            .await?
+            .into_inner();
+        assert_eq!(response.phase(), WriterPhase::FollowingTip);
+        assert_eq!(response.chain_view, None);
+        assert_eq!(response.gap_blocks, None);
+        assert_eq!(response.upstream_not_ready, None);
+        assert_eq!(
+            response.reorg_window_exceeded,
+            Some(zinder_proto::v1::ops::ReorgWindowExceededDetail {
+                depth: 1_001,
+                configured: 1_000,
+            })
+        );
+
+        readiness.set(ReadinessState::ready(Some(4_200)));
+        let unavailable =
+            IngestControl::writer_status(&adapter, Request::new(WriterStatusRequest {}))
+                .await
+                .err()
+                .ok_or("a writer that is not parked must answer from its live fence")?;
+        assert_eq!(unavailable.code(), Code::Unavailable);
+        Ok(())
     }
 
     #[derive(Clone)]

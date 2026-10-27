@@ -47,6 +47,15 @@ pub struct WriterStatusResponse {
     /// for both surfaces. ADR-0015 §Upstream sync detection.
     #[prost(message, optional, tag = "8")]
     pub upstream_not_ready: ::core::option::Option<super::ops::UpstreamNotReadyDetail>,
+    /// Set while the canonical writer is parked because a replacement crossed
+    /// its reorg window. The writer no longer follows the node until an
+    /// operator reconciles the store, so `chain_view` is absent: there is no
+    /// live writer fence to report. Carries the same payload `ReadinessReport`
+    /// surfaces under `cause=reorg_window_exceeded`. ADR-0041.
+    #[prost(message, optional, tag = "9")]
+    pub reorg_window_exceeded: ::core::option::Option<
+        super::ops::ReorgWindowExceededDetail,
+    >,
 }
 /// Private point lookup for one transaction in the writer's live mempool
 /// index. Transaction ids use canonical RPC byte order.

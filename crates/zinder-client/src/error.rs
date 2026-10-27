@@ -69,6 +69,26 @@ pub enum IndexerError {
         recovery: ChainEventCursorRecovery,
     },
 
+    /// The indexer's canonical writer stopped following its node because a
+    /// replacement crossed the configured reorg window.
+    ///
+    /// The node can only present such a reorg after a failure such as a
+    /// replaced or resynced node, so the indexer cannot recover on its own.
+    /// Reads would come from a chain that no longer advances: treat the
+    /// indexer as halted, stop creating spends against it, and alert an
+    /// operator. Unary calls and open chain-event streams both end with this
+    /// error until the operator reconciles the indexer.
+    #[error(
+        "indexer halted: a replacement of {replacement_depth_blocks:?} blocks exceeds its reorg window of {reorg_window_blocks:?} blocks"
+    )]
+    ReorgWindowExceeded {
+        /// Blocks the refused replacement would have replaced, when the
+        /// server reports it.
+        replacement_depth_blocks: Option<u64>,
+        /// The indexer's reorg window in blocks, when the server reports it.
+        reorg_window_blocks: Option<u64>,
+    },
+
     /// Requested data is not indexed in the visible chain.
     #[error("{resource} was not found")]
     NotFound {
@@ -212,6 +232,19 @@ impl IndexerError {
             return Self::ChainEpochPinUnavailable;
         }
 
+        if matches!(&zinder_reason, ErrorReason::ReorgWindowExceeded) {
+            let metadata_blocks = |key: &str| {
+                details
+                    .error_info()
+                    .and_then(|error_info| error_info.metadata.get(key))
+                    .and_then(|blocks| blocks.parse().ok())
+            };
+            return Self::ReorgWindowExceeded {
+                replacement_depth_blocks: metadata_blocks("replacement_depth_blocks"),
+                reorg_window_blocks: metadata_blocks("reorg_window_blocks"),
+            };
+        }
+
         Self::RemoteFailure {
             retry_policy: retry_policy_for_remote(&zinder_reason, status.code()),
             reason: zinder_reason,
@@ -234,6 +267,7 @@ impl IndexerError {
         match self {
             Self::ChainEpochPinUnavailable => Some(ErrorReason::ChainEpochPinUnavailable),
             Self::ChainEventCursorExpired { .. } => Some(ErrorReason::ChainEventCursorExpired),
+            Self::ReorgWindowExceeded { .. } => Some(ErrorReason::ReorgWindowExceeded),
             Self::ArtifactUnavailable { .. } => Some(ErrorReason::ArtifactUnavailable),
             Self::RemoteFailure { reason, .. } => Some(reason.clone()),
             Self::NoVisibleChainEpoch
@@ -266,7 +300,8 @@ impl IndexerError {
             | Self::StorageUnavailable { .. }
             | Self::BlockingTaskFailed { .. } => RetryPolicy::RetryWithBackoff,
             Self::RemoteFailure { retry_policy, .. } => *retry_policy,
-            Self::FailedPrecondition { .. }
+            Self::ReorgWindowExceeded { .. }
+            | Self::FailedPrecondition { .. }
             | Self::DataLoss { .. }
             | Self::NetworkMismatch { .. } => RetryPolicy::OperatorActionRequired,
             Self::InvalidRequest { .. } | Self::MalformedResponse { .. } => {
@@ -391,6 +426,53 @@ mod tests {
         assert!(matches!(error, IndexerError::ChainEpochPinUnavailable));
         assert_eq!(error.reason(), Some(ErrorReason::ChainEpochPinUnavailable));
         assert_eq!(error.retry_policy(), RetryPolicy::RefreshChainEpoch);
+    }
+
+    #[test]
+    fn reorg_window_halt_decodes_as_a_typed_operator_action() {
+        let halted = tonic::Status::with_error_details(
+            Code::FailedPrecondition,
+            "the canonical writer is parked",
+            ErrorDetails::with_error_info(
+                ErrorReason::ReorgWindowExceeded.as_str(),
+                ZINDER_ERROR_DOMAIN,
+                [
+                    (
+                        "readiness_cause".to_owned(),
+                        "reorg_window_exceeded".to_owned(),
+                    ),
+                    ("replacement_depth_blocks".to_owned(), "1001".to_owned()),
+                    ("reorg_window_blocks".to_owned(), "1000".to_owned()),
+                ],
+            ),
+        );
+        let error = IndexerError::from_status(halted);
+        assert!(matches!(
+            error,
+            IndexerError::ReorgWindowExceeded {
+                replacement_depth_blocks: Some(1_001),
+                reorg_window_blocks: Some(1_000),
+            }
+        ));
+        assert_eq!(error.reason(), Some(ErrorReason::ReorgWindowExceeded));
+        assert_eq!(error.retry_policy(), RetryPolicy::OperatorActionRequired);
+
+        let without_detail = tonic::Status::with_error_details(
+            Code::FailedPrecondition,
+            "reorg window exceeded",
+            ErrorDetails::with_error_info(
+                ErrorReason::ReorgWindowExceeded.as_str(),
+                ZINDER_ERROR_DOMAIN,
+                [],
+            ),
+        );
+        assert!(matches!(
+            IndexerError::from_status(without_detail),
+            IndexerError::ReorgWindowExceeded {
+                replacement_depth_blocks: None,
+                reorg_window_blocks: None,
+            }
+        ));
     }
 
     #[test]

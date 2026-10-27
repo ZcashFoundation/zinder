@@ -236,7 +236,8 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         advertised_capabilities,
     )
     .await?;
-    let grpc_adapter = WalletQueryGrpcAdapter::new(query, endpoint_metadata);
+    let grpc_adapter = WalletQueryGrpcAdapter::new(query, endpoint_metadata)
+        .with_traffic_readiness(readiness.clone());
 
     let reflection_service = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET)

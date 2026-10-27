@@ -63,7 +63,7 @@ pub use ops_endpoint::{
 };
 pub use readiness::{
     IngestPhase, NodeUnavailableDetail, Readiness, ReadinessCause, ReadinessReport, ReadinessState,
-    TrafficReadinessInterceptor, UpstreamHealth, UpstreamNotReadyDetail,
+    TrafficReadinessInterceptor, UpstreamHealth, UpstreamNotReadyDetail, not_ready_status,
 };
 pub use rpc_metrics::{RpcMetricNames, RpcOutcome, describe_rpc_metrics, record_rpc_request};
 pub use sections::{

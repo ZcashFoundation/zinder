@@ -94,7 +94,11 @@ admission: they call `WriterStatus` and a bounded
 validate coherent network and tip evidence. A transition into failure emits
 one classified warning and drains readiness with
 `ingest_control_unavailable`; recovery emits one event and restores only the
-ingest-control input. The health probe intentionally shares the configured
+ingest-control input. A `WriterStatus` that reports a parked writer instead
+drains readiness with `reorg_window_exceeded`, which takes precedence over the
+serving-pair failures it causes. New native requests then fail with
+`REORG_WINDOW_EXCEEDED`, and open `ChainEvents` streams end with the same
+status. The health probe intentionally shares the configured
 serving-pair refresh cadence because both observe the same control plane.
 
 The node probe exercises `tip_id` and upstream synchronization health through
