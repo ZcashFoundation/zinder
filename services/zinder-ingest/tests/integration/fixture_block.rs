@@ -14,9 +14,9 @@ use zebra_chain::{
 use zinder_core::{
     BlockHash, BlockHeight, CanonicalBlockFactsDigestVersion,
     CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
-    CanonicalTransactionFacts, ConsensusBranchId, Network, TransactionFactsArtifact,
-    TransactionLocation, TransparentInputFact, decode_canonical_block_replay,
-    wire::encode_rpc_transaction_id_hex,
+    CanonicalTransactionFacts, ConsensusBranchId, Network, NetworkUpgradeActivation,
+    NetworkUpgradeActivations, TransactionFactsArtifact, TransactionLocation, TransparentInputFact,
+    decode_canonical_block_replay, wire::encode_rpc_transaction_id_hex,
 };
 use zinder_ingest::{
     BlockMismatchField, CanonicalBlockConstructionError, CommitmentTreeSizes,
@@ -350,6 +350,91 @@ fn historical_fixture_blocks_keep_known_facts_and_compact_block_bytes() -> Resul
                 "6d95a049efc9e3c0fc4ecea22b0f1dba46decaa3435c2a3134c86a3596fe0f93".to_owned(),
                 215,
                 "bdaaf9b9cacd89c2e92cab82c0cc4e6a698f20b03fa7f7c75d603b7fb47a64ee".to_owned(),
+            ),
+        ]
+    );
+
+    Ok(())
+}
+
+/// Known answers for Mainnet blocks with Sprout `JoinSplit`s and a Sapling spend,
+/// which the other captured fixtures do not contain.
+#[test]
+fn mainnet_sprout_and_sapling_spend_blocks_keep_known_facts_and_compact_block_bytes()
+-> Result<(), Box<dyn Error>> {
+    let activations = NetworkUpgradeActivations::new(
+        Network::ZcashMainnet,
+        vec![
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x5ba8_1b19),
+                activation_height: BlockHeight::new(347_500),
+                name: "Overwinter".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x76b8_09bb),
+                activation_height: BlockHeight::new(419_200),
+                name: "Sapling".to_owned(),
+            },
+        ],
+    )?;
+    let fixtures = [
+        include_str!("../fixtures/zcash-mainnet-sprout-block-396.json"),
+        include_str!("../fixtures/zcash-mainnet-sapling-spend-block-419202.json"),
+    ];
+    let mut observed = Vec::with_capacity(fixtures.len());
+    for fixture_json in fixtures {
+        let source_block = fixture_source_block_from(Network::ZcashMainnet, fixture_json)?;
+        let prepared = prepare_canonical_block(&source_block, &activations, RawBlobPolicy::All)?;
+        let block = position_canonical_block(prepared, &mut CommitmentTreeSizes::default())?;
+        assert_transaction_bytes_match_parsed_source(&source_block, &block)?;
+        assert_compact_transaction_ids_match_canonical_facts(&block)?;
+        let sprout_balances_zat: Vec<i64> = block
+            .facts
+            .transactions
+            .iter()
+            .filter(|transaction| transaction.public_facts.counts.sprout_joinsplit_count > 0)
+            .map(|transaction| transaction.intrinsic_value_balances.sprout_zat)
+            .collect();
+        let compact_sapling_spend_count: usize = block
+            .compact_block
+            .transactions()
+            .iter()
+            .map(|transaction| transaction.data.sapling_spends.len())
+            .sum();
+        let compact_block_bytes = encode_compact_block_artifact(&block.compact_block);
+        observed.push((
+            source_block.height.value(),
+            sprout_balances_zat,
+            compact_sapling_spend_count,
+            hex::encode(
+                block
+                    .facts
+                    .digest(CanonicalBlockFactsDigestVersion::CURRENT)
+                    .as_bytes(),
+            ),
+            compact_block_bytes.len(),
+            hex::encode(Sha256::digest(&compact_block_bytes)),
+        ));
+    }
+
+    assert_eq!(
+        observed,
+        [
+            (
+                396,
+                vec![-14_250_000],
+                0,
+                "3ebae4b98f78c45c590e2dfebd290b7a8fbce0e31506ddba04e262d202eea1a5".to_owned(),
+                333,
+                "df6d949c85cd7df946da4d4b0bf4c49ca43e2b531b25593097717d5f276cffa2".to_owned(),
+            ),
+            (
+                419_202,
+                vec![-165_594_882],
+                1,
+                "68b5228d0295c5c7c940a7e2bb213366f8e404edba10f46b3122177e7d801d3b".to_owned(),
+                2_476,
+                "074710a877e0bfc904cf0199b55fc4048873774537fb8ecbce384db75a03c9c6".to_owned(),
             ),
         ]
     );

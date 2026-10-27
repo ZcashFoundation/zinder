@@ -610,6 +610,58 @@ mod tests {
     }
 
     #[test]
+    fn sprout_joinsplit_balances_preserve_zebra_sign() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../services/zinder-ingest/tests/fixtures/zcash-mainnet-sprout-block-396.json"
+        ))?;
+        let raw_block = hex::decode(
+            fixture
+                .get("raw_block_hex")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("Mainnet block 396 fixture is missing raw_block_hex")?,
+        )?;
+        let block = ZebraBlock::zcash_deserialize(&mut Cursor::new(raw_block))?;
+        let joinsplit_transaction = block
+            .transactions
+            .get(1)
+            .ok_or("Mainnet block 396 has no JoinSplit transaction")?
+            .zcash_serialize_to_vec()?;
+        // A version-2 encoding ends with its JoinSplit descriptions (1,802 bytes
+        // each with PHGR proofs), the joinSplitPubKey, and the joinSplitSig.
+        let vpub_old_offset = joinsplit_transaction
+            .len()
+            .checked_sub(1_802 + 32 + 64)
+            .ok_or("JoinSplit transaction is shorter than one description")?;
+        let vpub_new_offset = vpub_old_offset + 8;
+        let activations = NetworkUpgradeActivations::empty(Network::ZcashMainnet);
+
+        let captured =
+            parse_transaction_public_fact_set(&joinsplit_transaction, None, &activations)?;
+        assert_eq!(captured.public_facts.counts.sprout_joinsplit_count, 1);
+        assert_eq!(captured.intrinsic_value_balances.sprout_zat, -14_250_000);
+        assert_eq!(
+            joinsplit_transaction[vpub_old_offset..vpub_new_offset],
+            14_250_000_u64.to_le_bytes()
+        );
+
+        for (vpub_old, vpub_new, expected_sprout_zat) in [(12_u64, 5_u64, -7_i64), (5, 12, 7)] {
+            let mut transaction_bytes = joinsplit_transaction.clone();
+            transaction_bytes[vpub_old_offset..vpub_new_offset]
+                .copy_from_slice(&vpub_old.to_le_bytes());
+            transaction_bytes[vpub_new_offset..vpub_new_offset + 8]
+                .copy_from_slice(&vpub_new.to_le_bytes());
+            let fact_set =
+                parse_transaction_public_fact_set(&transaction_bytes, None, &activations)?;
+
+            assert_eq!(
+                fact_set.intrinsic_value_balances.sprout_zat,
+                expected_sprout_zat
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn near_max_serialized_block_respects_zebra_byte_bound()
     -> Result<(), Box<dyn std::error::Error>> {
         let max_block_bytes = usize::try_from(zebra_chain::block::MAX_BLOCK_BYTES)?;
