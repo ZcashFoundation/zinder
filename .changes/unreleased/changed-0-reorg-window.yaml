@@ -1,0 +1,6 @@
+kind: changed
+body: 'The default reorg window for ingest, projector, native query, and lightwalletd compatibility is now 1000 blocks, the depth past which Zebra 7 and Zakura finalize blocks, so ingest no longer parks on a reorg the node itself can produce. The settled tip, and every finality status derived from it, now trails the visible tip by up to 1000 blocks. Deployments that rely on the default or on the shipped `deploy/config` files move to 1000 on upgrade; deployments that set `reorg_window_blocks` explicitly keep their value. Starting ingest with a larger window raises an existing canonical store in place, and the projector raises the wallet store when it resumes, so restart ingest first, then the projector, native query, and compatibility with the same value. Replaceable depth grows to the new window as blocks arrive. A smaller window is refused and still requires a rebuild, and earlier Zinder releases cannot open a raised store. Cipherscan `finality_status` now reports `Finalized` only for blocks at or below the settled tip instead of after 100 confirmations. PLACEHOLDER: the pull request number below is 0; replace it, and rename this file to match, once the pull request exists.'
+time: 2026-10-27T16:30:00Z
+custom:
+  Bump: minor
+  PR: "0"

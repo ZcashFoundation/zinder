@@ -1,0 +1,6 @@
+kind: added
+body: 'When ingest parks because a reorg exceeds its window, native query now refuses new wallet requests with `REORG_WINDOW_EXCEEDED`, carrying `replacement_depth_blocks` and `reorg_window_blocks` metadata, and ends open `ChainEvents` streams with the same status instead of leaving them idle on a chain that stopped advancing. `zinder-client` reports it as `IndexerError::ReorgWindowExceeded` with retry policy `OperatorActionRequired`. PLACEHOLDER: the pull request number below is 0; replace it, and rename this file to match, once the pull request exists.'
+time: 2026-10-27T16:30:00Z
+custom:
+  Bump: minor
+  PR: "0"
