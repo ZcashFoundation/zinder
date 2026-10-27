@@ -133,9 +133,8 @@ async fn current_android_sdk_rpc_contract_uses_admitted_production_pair() -> eyr
         source.clone(),
         activations.clone(),
     )?;
-    let adapter =
-        LightwalletdGrpcAdapter::from_admitted_compatibility_query(query, activations.clone())?
-            .with_mempool_surface(Arc::new(AndroidSdkMempoolSurface::new()?));
+    let adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(query)?
+        .with_mempool_surface(Arc::new(AndroidSdkMempoolSurface::new()?));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let (shutdown_sender, shutdown_receiver) = oneshot::channel::<()>();

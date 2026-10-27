@@ -32,14 +32,11 @@ use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
 #[tokio::test(flavor = "multi_thread")]
 async fn lightwalletd_get_mempool_tx_returns_unavailable_without_surface() -> eyre::Result<()> {
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
+    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
         Arc::new(sample_regtest_upgrade_activations()),
-    );
+    ));
     let outcome = adapter
         .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
             exclude_txid_suffixes: Vec::new(),
@@ -55,14 +52,11 @@ async fn lightwalletd_get_mempool_tx_returns_unavailable_without_surface() -> ey
 async fn lightwalletd_get_mempool_tx_rejects_oversized_excluded_txid_suffixes_before_surface_lookup()
 -> eyre::Result<()> {
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
+    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
         Arc::new(sample_regtest_upgrade_activations()),
-    );
+    ));
 
     let outcome = adapter
         .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
@@ -82,14 +76,11 @@ async fn lightwalletd_get_mempool_tx_rejects_oversized_excluded_txid_suffixes_be
 async fn lightwalletd_get_mempool_tx_rejects_too_many_excluded_txid_suffixes_before_surface_lookup()
 -> eyre::Result<()> {
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
+    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
         Arc::new(sample_regtest_upgrade_activations()),
-    );
+    ));
 
     let outcome = adapter
         .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
@@ -112,14 +103,11 @@ async fn lightwalletd_get_mempool_tx_rejects_too_many_excluded_txid_suffixes_bef
 async fn lightwalletd_get_mempool_tx_rejects_invalid_pool_type_before_surface_lookup()
 -> eyre::Result<()> {
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
+    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
         Arc::new(sample_regtest_upgrade_activations()),
-    );
+    ));
 
     let outcome = adapter
         .get_mempool_tx(Request::new(lightwalletd::GetMempoolTxRequest {
@@ -142,14 +130,11 @@ async fn lightwalletd_get_mempool_tx_filters_excluded_txid_suffixes() -> eyre::R
         synthetic_entry(0xAA, synthetic_chain_epoch())?,
         synthetic_entry(0xBB, synthetic_chain_epoch())?,
     ]);
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
+    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
         Arc::new(sample_regtest_upgrade_activations()),
-    )
+    ))
     .with_mempool_surface(Arc::new(surface));
 
     let suffix = vec![0xAA; 4];
@@ -179,14 +164,11 @@ async fn lightwalletd_get_mempool_tx_preserves_transactions_when_excluded_suffix
         synthetic_entry_with_transaction_id(second_transaction_id, synthetic_chain_epoch())?,
     ])
     .with_snapshot_page_size(1);
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
+    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
         Arc::new(sample_regtest_upgrade_activations()),
-    )
+    ))
     .with_mempool_surface(Arc::new(surface));
 
     let response = adapter
@@ -213,14 +195,11 @@ async fn lightwalletd_get_mempool_tx_uniquely_excludes_match_with_other_match_ou
         synthetic_entry_with_transaction_id(streamable_transaction_id, synthetic_chain_epoch())?,
         ironwood_only_entry_with_transaction_id(pruned_transaction_id, synthetic_chain_epoch())?,
     ]);
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
+    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
         Arc::new(sample_regtest_upgrade_activations()),
-    )
+    ))
     .with_mempool_surface(Arc::new(surface));
 
     let response = adapter
@@ -243,14 +222,11 @@ async fn lightwalletd_get_mempool_tx_drops_transactions_outside_requested_pool_t
         synthetic_entry(0xC1, synthetic_chain_epoch())?,
         transparent_only_entry(0xC2, synthetic_chain_epoch())?,
     ]);
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
+    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
         Arc::new(sample_regtest_upgrade_activations()),
-    )
+    ))
     .with_mempool_surface(Arc::new(surface));
 
     let response = adapter
@@ -286,14 +262,11 @@ async fn lightwalletd_get_mempool_tx_drops_ironwood_entries_outside_requested_po
         synthetic_entry(0xD1, synthetic_chain_epoch())?,
         ironwood_only_entry(0xD2, synthetic_chain_epoch())?,
     ]);
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
+    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
         Arc::new(sample_regtest_upgrade_activations()),
-    )
+    ))
     .with_mempool_surface(Arc::new(surface));
 
     let response = adapter
@@ -316,14 +289,11 @@ async fn lightwalletd_get_mempool_tx_reads_all_snapshot_pages() -> eyre::Result<
         synthetic_entry(0xB2, synthetic_chain_epoch())?,
     ])
     .with_snapshot_page_size(1);
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
+    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
         Arc::new(sample_regtest_upgrade_activations()),
-    )
+    ))
     .with_mempool_surface(Arc::new(surface));
 
     let response = adapter
@@ -344,14 +314,11 @@ async fn lightwalletd_get_mempool_stream_projects_added_envelopes_to_raw_transac
     let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
     let surface = ScriptedMempoolSurface::with_entries(Vec::new());
     let control = surface.event_control();
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
+    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
         Arc::new(sample_regtest_upgrade_activations()),
-    )
+    ))
     .with_mempool_surface(Arc::new(surface));
 
     let response = adapter
@@ -394,14 +361,11 @@ async fn lightwalletd_get_mempool_stream_starts_after_retained_tail() -> eyre::R
     control.append_retained_event(MempoolEvent::Added {
         entry: synthetic_entry(0x10, synthetic_chain_epoch())?,
     })?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
+    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
         Arc::new(sample_regtest_upgrade_activations()),
-    )
+    ))
     .with_mempool_surface(Arc::new(surface));
 
     let response = adapter
@@ -441,14 +405,11 @@ async fn lightwalletd_get_mempool_stream_streams_snapshot_contents_before_live_e
     control.append_retained_event(MempoolEvent::Added {
         entry: synthetic_entry(0x20, synthetic_chain_epoch())?,
     })?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
+    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
         Arc::new(sample_regtest_upgrade_activations()),
-    )
+    ))
     .with_mempool_surface(Arc::new(surface));
 
     let mut response_stream = adapter
@@ -814,14 +775,11 @@ async fn lightwalletd_get_mempool_stream_closes_on_tip_change() -> eyre::Result<
     let event_control = surface.event_control();
     let tip_change_watcher = ScriptedTipChangeWatcher::new();
     let tip_change_signal = tip_change_watcher.signal();
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
+    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
         Arc::new(sample_regtest_upgrade_activations()),
-    )
+    ))
     .with_mempool_surface(Arc::new(surface))
     .with_tip_change_watcher(Arc::new(tip_change_watcher));
 
@@ -859,14 +817,11 @@ async fn lightwalletd_get_mempool_stream_closes_when_tip_change_precedes_watcher
     let surface = ScriptedMempoolSurface::with_entries(Vec::new());
     let tip_change_watcher = ScriptedTipChangeWatcher::new();
     let tip_change_signal = tip_change_watcher.signal();
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
+    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
         Arc::new(sample_regtest_upgrade_activations()),
-    )
+    ))
     .with_mempool_surface(Arc::new(surface))
     .with_tip_change_watcher(Arc::new(tip_change_watcher));
 

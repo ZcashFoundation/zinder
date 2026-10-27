@@ -213,11 +213,7 @@ fn build_transparent_address_adapter(
         MockTransactionBroadcaster::broadcast_disabled(),
         Arc::clone(&fixture.activations),
     );
-    LightwalletdGrpcAdapter::from_admitted_compatibility_query(
-        query,
-        Arc::clone(&fixture.activations),
-    )
-    .map_err(Into::into)
+    LightwalletdGrpcAdapter::from_admitted_compatibility_query(query).map_err(Into::into)
 }
 
 fn address_history_filter(address: String) -> lightwalletd::TransparentAddressBlockFilter {

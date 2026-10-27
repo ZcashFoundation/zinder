@@ -138,16 +138,51 @@ impl WalletServingStoreFixture {
     ///
     /// Returns an error when the fixture has fewer than two blocks or either
     /// production store rejects the baseline or live append.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "The fixture keeps baseline publication, live append, wallet build, and immutable reader admission in production order."
-    )]
     pub fn from_chain_after_live_append(
         chain_fixture: &ChainFixture,
         network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> eyre::Result<Self> {
+        Self::build_after_live_append(chain_fixture, network_upgrade_activations, None)
+    }
+
+    /// Builds a READY live-append pair whose canonical writer admitted
+    /// `admitted_activations` over a store built with
+    /// `construction_activations`.
+    ///
+    /// Before the live append, the writer admits the construction table as
+    /// revision 1, as a writer's first start does, and then
+    /// `admitted_activations` as the next revision. The live block is
+    /// committed with the admitted table, and the canonical reader opens with
+    /// it, as a serving publisher does after following writer status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fixture has fewer than two blocks, the writer
+    /// refuses either schedule revision, or either production store rejects
+    /// the baseline or live append.
+    pub fn from_chain_after_admitted_live_append(
+        chain_fixture: &ChainFixture,
+        construction_activations: &NetworkUpgradeActivations,
+        admitted_activations: &NetworkUpgradeActivations,
+    ) -> eyre::Result<Self> {
+        Self::build_after_live_append(
+            chain_fixture,
+            construction_activations,
+            Some(admitted_activations),
+        )
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "The fixture keeps baseline publication, schedule admission, live append, wallet build, and immutable reader admission in production order."
+    )]
+    fn build_after_live_append(
+        chain_fixture: &ChainFixture,
+        construction_activations: &NetworkUpgradeActivations,
+        admitted_activations: Option<&NetworkUpgradeActivations>,
+    ) -> eyre::Result<Self> {
         ensure!(
-            chain_fixture.network() == network_upgrade_activations.network(),
+            chain_fixture.network() == construction_activations.network(),
             "chain fixture and network-upgrade activations must use the same network"
         );
         let live_tip = chain_fixture
@@ -172,7 +207,7 @@ impl WalletServingStoreFixture {
         let wallet_primary_path = temporary_directory.path().join("wallet-primary");
         let reorg_policy = CanonicalReorgPolicy::new(TEST_REORG_DEPTH)?;
         let build_plan = CanonicalStoreBuildPlan::complete(
-            network_upgrade_activations,
+            construction_activations,
             baseline_tip.block_time_seconds.saturating_sub(1),
             baseline_tip_id,
             raw_blob_retention,
@@ -203,7 +238,15 @@ impl WalletServingStoreFixture {
                 u64::from(baseline_tip.block_time_seconds).saturating_mul(1_000),
             ),
         ))?;
-        let canonical_primary = validated.publish_baseline(publication)?;
+        let mut canonical_primary = validated.publish_baseline(publication)?;
+        let live_activations = match admitted_activations {
+            Some(admitted_activations) => {
+                canonical_primary.admit_network_upgrade_schedule(construction_activations)?;
+                canonical_primary.admit_network_upgrade_schedule(admitted_activations)?;
+                admitted_activations
+            }
+            None => construction_activations,
+        };
         let expected_fence = canonical_primary.event_fence();
         let full_chain = chain_fixture.clone().with_canonical_genesis_parent();
         let live_block = canonical_build_blocks(&full_chain)?
@@ -219,7 +262,7 @@ impl WalletServingStoreFixture {
                     u64::from(live_tip.block_time_seconds).saturating_mul(1_000),
                 ),
             ),
-            network_upgrade_activations,
+            live_activations,
         )?;
 
         let wallet_outcome = build_wallet_from_canonical(
@@ -236,7 +279,7 @@ impl WalletServingStoreFixture {
         let canonical_reader = RocksDbCanonicalSecondary::open_ready(
             &canonical_primary_path,
             temporary_directory.path().join("canonical-secondary"),
-            network_upgrade_activations,
+            live_activations,
             CanonicalStoreWorkload::Wallet,
             raw_blob_retention,
             reorg_policy,
