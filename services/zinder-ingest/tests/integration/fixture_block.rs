@@ -6,6 +6,7 @@
 use std::error::Error;
 
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 use zebra_chain::{
     block::Block as ZebraBlock,
     serialization::{ZcashDeserializeInto, ZcashSerialize},
@@ -22,6 +23,7 @@ use zinder_ingest::{
 };
 use zinder_materialized_views::project_block_summary_record;
 use zinder_source::{SourceBlock, decode_rpc_block_hash};
+use zinder_store::encode_compact_block_artifact;
 use zinder_testkit::{
     FixtureTransactionRows, encode_fixture_block_replay_with_raw_block,
     sample_regtest_upgrade_activations,
@@ -265,6 +267,90 @@ fn ironwood_canonical_block_facts_digest_matches_known_answer() -> Result<(), Bo
                 .as_bytes()
         ),
         "86cb193efe15992d994f9813e061d8f3b247fd86980d50a2585ee1137a0d3f70"
+    );
+
+    Ok(())
+}
+
+/// Known answers for every captured historical block: the canonical facts
+/// digest and the SHA-256 of the stored compact-block encoding.
+#[test]
+fn historical_fixture_blocks_keep_known_facts_and_compact_block_bytes() -> Result<(), Box<dyn Error>>
+{
+    let fixtures = [
+        (
+            Network::ZcashRegtest,
+            include_str!("../fixtures/z3-regtest-block-1.json"),
+        ),
+        (
+            Network::ZcashRegtest,
+            include_str!("../fixtures/z3-regtest-ironwood-block-603.json"),
+        ),
+        (
+            Network::ZcashTestnet,
+            include_str!("../fixtures/zcash-testnet-sapling-block-1842432.json"),
+        ),
+        (
+            Network::ZcashTestnet,
+            include_str!("../fixtures/zcash-testnet-orchard-block-1842462.json"),
+        ),
+        (
+            Network::ZcashRegtest,
+            include_str!("../fixtures/zakura-regtest-ironwood-block-3.json"),
+        ),
+    ];
+    let mut observed = Vec::with_capacity(fixtures.len());
+    for (network, fixture_json) in fixtures {
+        let source_block = fixture_source_block_from(network, fixture_json)?;
+        let block = build_positioned_block_for_test(&source_block)?;
+        let compact_block_bytes = encode_compact_block_artifact(&block.compact_block);
+        observed.push((
+            source_block.height.value(),
+            hex::encode(
+                block
+                    .facts
+                    .digest(CanonicalBlockFactsDigestVersion::CURRENT)
+                    .as_bytes(),
+            ),
+            compact_block_bytes.len(),
+            hex::encode(Sha256::digest(&compact_block_bytes)),
+        ));
+    }
+
+    assert_eq!(
+        observed,
+        [
+            (
+                1,
+                "76474516b2f4184e9f434750ed6970ed8eac53e5fbb698e1959dcc6c33c5456f".to_owned(),
+                215,
+                "0bc6254121524d279308856f11d27f5e758b7786e405446108ef3004c262c740".to_owned(),
+            ),
+            (
+                603,
+                "86cb193efe15992d994f9813e061d8f3b247fd86980d50a2585ee1137a0d3f70".to_owned(),
+                613,
+                "fa06b824eeed703ed33a0e277fc2a352f2cb3d2804a8ed19c7997f7f0afc73cb".to_owned(),
+            ),
+            (
+                1_842_432,
+                "9b04c3c83f7a00b6abab9f25f64506e8b0b6e8f0d46d073824b461029fc050b3".to_owned(),
+                2_282,
+                "6b45d365d02561d69a8ab566fd8c34dbf27d4d0247d20a8be6cd9a233ee35408".to_owned(),
+            ),
+            (
+                1_842_462,
+                "867c271ea799a896212975f9b764898c8d00166df7f27f5ddba7743c77999be3".to_owned(),
+                748,
+                "48abd79ee8d53c7b9101d919d9d7ea0aad40dca27d996b90a1acb1beac8f3fae".to_owned(),
+            ),
+            (
+                3,
+                "6d95a049efc9e3c0fc4ecea22b0f1dba46decaa3435c2a3134c86a3596fe0f93".to_owned(),
+                215,
+                "bdaaf9b9cacd89c2e92cab82c0cc4e6a698f20b03fa7f7c75d603b7fb47a64ee".to_owned(),
+            ),
+        ]
     );
 
     Ok(())

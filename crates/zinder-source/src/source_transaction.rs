@@ -460,6 +460,7 @@ mod tests {
     use zinder_core::{
         AuthDigest, BlockHeight, Network, NetworkUpgradeActivations, TransactionId,
         TransactionIntrinsicValueBalances, TransactionVersion, Wtxid,
+        wire::{encode_rpc_auth_digest_hex, encode_rpc_transaction_id_hex},
     };
 
     use crate::SourceBlock;
@@ -493,6 +494,71 @@ mod tests {
             assert_transaction_identifiers_match_zebra(&transaction, &fact_set);
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn minimal_v1_through_v6_transactions_keep_known_identifiers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let activations = NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+        let mut observed = Vec::new();
+        for raw_transaction in minimal_transaction_encodings()? {
+            let facts = parse_transaction_public_facts(&raw_transaction, None, &activations)?;
+            observed.push((
+                facts.version,
+                hex::encode(&raw_transaction),
+                encode_rpc_transaction_id_hex(facts.transaction_id),
+                facts.auth_digest.map(encode_rpc_auth_digest_hex),
+            ));
+        }
+
+        assert_eq!(
+            observed,
+            [
+                (
+                    TransactionVersion::V1,
+                    "01000000000000000000".to_owned(),
+                    "d21633ba23f70118185227be58a63527675641ad37967e2aa461559f577aec43".to_owned(),
+                    None,
+                ),
+                (
+                    TransactionVersion::V2,
+                    "0200000000000000000000".to_owned(),
+                    "c7e8a6e4ebd4981c43ff919703d54e91b4b3cb2325caf102dfc384bcad455c6f".to_owned(),
+                    None,
+                ),
+                (
+                    TransactionVersion::V3,
+                    "030000807082c4030000000000000000000000".to_owned(),
+                    "dfc33e3e2fafbf9fc65284ce19e4f930b21da6d59a014d62a706e5530597aca6".to_owned(),
+                    None,
+                ),
+                (
+                    TransactionVersion::V4,
+                    "0400008085202f89000000000000000000000000000000000000000000".to_owned(),
+                    "e22daacccd32e2335184e5604d86742609cf4ee106884a0603dbedf736ddd782".to_owned(),
+                    None,
+                ),
+                (
+                    TransactionVersion::V5,
+                    "050000800a27a726b4d0d6c200000000000000000000000000".to_owned(),
+                    "8e6b6d721fc653ef162daa85b32bff85144b9245add517cf710d5155cf5876df".to_owned(),
+                    Some(
+                        "0f33c0dfa1558e86304f29c0fbe0d982eeb0e5f2435a7cb1da6c2fc7395c5a0a"
+                            .to_owned()
+                    ),
+                ),
+                (
+                    TransactionVersion::V6,
+                    "0600008098b684d85b16a5370000000000000000000000000000".to_owned(),
+                    "07920cf6e0b4e8fac9d15d33c2352a321172a9fa0293907d006b82d5d1d9c000".to_owned(),
+                    Some(
+                        "cbaf0aab342237179af081612fa1d4a079677000854a6ea8be6ac9481d383038"
+                            .to_owned()
+                    ),
+                ),
+            ]
+        );
         Ok(())
     }
 
