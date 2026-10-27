@@ -4,8 +4,8 @@ use eyre::{Context as _, ensure, eyre};
 use tempfile::TempDir;
 use zinder_core::{
     BlockHeight, BlockId, CanonicalBlockReplayEnvelope, ChainTipMetadata, CommitmentTreeCheckpoint,
-    CommitmentTreeFrontiers, NetworkUpgradeActivations, UnixTimestampMillis,
-    decode_canonical_block_replay,
+    CommitmentTreeFrontier, CommitmentTreeFrontiers, NetworkUpgradeActivations, ShieldedProtocol,
+    UnixTimestampMillis, decode_canonical_block_replay,
 };
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalLiveAppend, CanonicalReorgPolicy,
@@ -222,13 +222,14 @@ impl WalletServingStoreFixture {
         builder.bulk_load_blocks(
             canonical_build_blocks(&baseline_chain)?
                 .into_iter()
+                .map(|block| with_empty_active_frontiers(block, construction_activations))
                 .map(Ok::<_, std::convert::Infallible>),
         )?;
         builder.load_subtree_roots(std::iter::empty())?;
         let baseline_checkpoint = CommitmentTreeCheckpoint::new(
             baseline_tip_id,
             baseline_tip.block_time_seconds,
-            CommitmentTreeFrontiers::default(),
+            empty_active_frontiers(construction_activations, baseline_tip_id.height),
         );
         builder.confirm_source_tip_checkpoint(&baseline_checkpoint)?;
         let validated = builder.prepare_cold_certified_publication()?;
@@ -251,6 +252,7 @@ impl WalletServingStoreFixture {
         let full_chain = chain_fixture.clone().with_canonical_genesis_parent();
         let live_block = canonical_build_blocks(&full_chain)?
             .pop()
+            .map(|block| with_empty_active_frontiers(block, live_activations))
             .ok_or_else(|| eyre!("wallet-serving fixture requires a live block"))?;
         let (canonical_primary, _) = canonical_primary.commit_live_append(
             CanonicalLiveAppend::new(
@@ -348,6 +350,36 @@ fn canonical_build_blocks(chain_fixture: &ChainFixture) -> eyre::Result<Vec<Cano
     }
 
     Ok(build_blocks)
+}
+
+/// Live following derives each checkpoint's frontiers from its predecessor,
+/// so live-append fixtures carry the empty frontier of every shielded pool
+/// active at the checkpoint height.
+fn with_empty_active_frontiers(
+    mut block: CanonicalBuildBlock,
+    activations: &NetworkUpgradeActivations,
+) -> CanonicalBuildBlock {
+    if let Some(checkpoint) = block.tree_state_checkpoint.as_mut() {
+        checkpoint.frontiers = empty_active_frontiers(activations, checkpoint.block_id.height);
+    }
+    block
+}
+
+fn empty_active_frontiers(
+    activations: &NetworkUpgradeActivations,
+    height: BlockHeight,
+) -> CommitmentTreeFrontiers {
+    let active_frontier = |protocol: ShieldedProtocol| {
+        activations
+            .activation_height_by_name(protocol.activation_upgrade_name())
+            .is_some_and(|activation_height| activation_height <= height)
+            .then(|| CommitmentTreeFrontier::empty(protocol))
+    };
+    CommitmentTreeFrontiers::from_validated_parts(
+        active_frontier(ShieldedProtocol::Sapling),
+        active_frontier(ShieldedProtocol::Orchard),
+        active_frontier(ShieldedProtocol::Ironwood),
+    )
 }
 
 struct CanonicalBlockBuildInputs<'a> {

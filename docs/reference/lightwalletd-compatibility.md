@@ -41,14 +41,22 @@ and the exact wallet-serving pair provides the transparent reads; insufficient
 retention fails before the listener binds. Later pair lag or provider outage
 changes readiness without rewriting `GetLightdInfo`.
 
-`GetLightdInfo` derives `consensusBranchId`, `upgradeName`, and
-`upgradeHeight` from the network upgrade active at the served tip, and
-`saplingActivationHeight` from the same table, on every request. In both
-serving modes that table is the schedule the canonical writer admitted, so a
-running compatibility process reports a newly admitted upgrade, such as NU7,
-once its tip reaches the activation height. Before the writer's first
-admission, it is the table discovered from the node at startup, which reader
-admission requires to equal the store's construction table. See
+`GetLightdInfo` derives its upgrade fields from one activation table and the
+served tip on every request:
+
+- `consensusBranchId` is the branch of the upgrade active at the tip.
+- `upgradeName` and `upgradeHeight` describe the next pending upgrade, the
+  first one that activates above the tip. They are empty and 0 when no upgrade
+  is pending, as the lightwalletd protocol defines and lightwalletd reports.
+- `saplingActivationHeight` is the Sapling activation height.
+
+In both serving modes that table is the schedule the canonical writer
+admitted. A running compatibility process therefore reports a newly admitted
+upgrade, such as NU7, as pending while its tip is below the activation height,
+and as the active `consensusBranchId` once the tip reaches it. Before the
+writer's first admission, it is the table discovered from the node at
+startup, which reader admission requires to equal the store's construction
+table. See
 [ADR-0039](../adrs/0039-writer-admitted-network-upgrade-schedules.md).
 
 ## Runtime serving selection

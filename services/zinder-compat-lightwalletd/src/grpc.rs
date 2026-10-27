@@ -1548,15 +1548,20 @@ fn lightd_info(
     tip_height: BlockHeight,
     transparent_address_support: bool,
 ) -> lightwalletd::LightdInfo {
-    let current = activations.active_at(tip_height);
-    let consensus_branch_id = current.map_or_else(
+    let consensus_branch_id = activations.active_at(tip_height).map_or_else(
         || "00000000".to_owned(),
         |activation| encode_branch_id_hex(activation.branch_id),
     );
-    let upgrade_name = current
+    // The protocol defines `upgradeName` and `upgradeHeight` as the next
+    // pending upgrade, not the active one.
+    let next_pending = activations
+        .activations()
+        .iter()
+        .find(|activation| activation.activation_height > tip_height);
+    let upgrade_name = next_pending
         .map(|activation| activation.name.clone())
         .unwrap_or_default();
-    let upgrade_height = current.map_or(0, |activation| {
+    let upgrade_height = next_pending.map_or(0, |activation| {
         u64::from(activation.activation_height.value())
     });
     let sapling_activation_height = activations
@@ -1870,6 +1875,33 @@ mod tests {
             address_count: 1,
             chain_epoch: test_chain_epoch(),
         }
+    }
+
+    #[test]
+    fn lightd_info_reports_the_active_branch_and_the_next_pending_upgrade() {
+        let activations = zinder_testkit::sample_regtest_upgrade_activations();
+        let branch_hex = |name: &str| {
+            activations
+                .activations()
+                .iter()
+                .find(|activation| activation.name == name)
+                .map(|activation| encode_branch_id_hex(activation.branch_id))
+        };
+
+        let before_nu5 = lightd_info(&activations, BlockHeight::new(1), true);
+        assert_eq!(Some(before_nu5.consensus_branch_id), branch_hex("Canopy"));
+        assert_eq!(before_nu5.upgrade_name, "NU5");
+        assert_eq!(before_nu5.upgrade_height, 2);
+
+        let before_nu6_3 = lightd_info(&activations, BlockHeight::new(602), true);
+        assert_eq!(Some(before_nu6_3.consensus_branch_id), branch_hex("NU6.2"));
+        assert_eq!(before_nu6_3.upgrade_name, "NU6.3");
+        assert_eq!(before_nu6_3.upgrade_height, 603);
+
+        let none_pending = lightd_info(&activations, BlockHeight::new(603), true);
+        assert_eq!(Some(none_pending.consensus_branch_id), branch_hex("NU6.3"));
+        assert_eq!(none_pending.upgrade_name, "");
+        assert_eq!(none_pending.upgrade_height, 0);
     }
 
     #[test]

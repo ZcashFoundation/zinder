@@ -1223,13 +1223,18 @@ fn lightd_info(
     taddr_support: bool,
 ) -> lightwalletd::LightdInfo {
     let tip_height = BlockHeight::new(height);
-    let current = activations.active_at(tip_height);
-    let consensus_branch_id = current.map_or_else(
+    let consensus_branch_id = activations.active_at(tip_height).map_or_else(
         || "00000000".to_owned(),
         |activation| encode_branch_id_hex(activation.branch_id),
     );
-    let upgrade_name = current.map_or_else(String::new, |activation| activation.name.clone());
-    let upgrade_height = current.map_or(0, |activation| {
+    // The protocol defines `upgradeName` and `upgradeHeight` as the next
+    // pending upgrade, not the active one.
+    let next_pending = activations
+        .activations()
+        .iter()
+        .find(|activation| activation.activation_height > tip_height);
+    let upgrade_name = next_pending.map_or_else(String::new, |activation| activation.name.clone());
+    let upgrade_height = next_pending.map_or(0, |activation| {
         u64::from(activation.activation_height.value())
     });
     let sapling_activation_height = activations
@@ -1278,9 +1283,10 @@ mod tests {
     use zinder_core::{
         BlockHeight, BlockHeightRange, BlockId, CanonicalBlockFacts,
         CanonicalBlockFactsDigestVersion, CanonicalBlockReplayFormatVersion, ChainTipMetadata,
-        CommitmentTreeCheckpoint, CommitmentTreeFrontiers, ConsensusBranchId, Network,
-        NetworkUpgradeActivation, NetworkUpgradeActivations, SerializedBytesDigest,
-        UnixTimestampMillis, encode_canonical_block_replay,
+        CommitmentTreeCheckpoint, CommitmentTreeFrontier, CommitmentTreeFrontiers,
+        ConsensusBranchId, Network, NetworkUpgradeActivation, NetworkUpgradeActivations,
+        SerializedBytesDigest, ShieldedProtocol, UnixTimestampMillis,
+        encode_canonical_block_replay,
     };
     use zinder_proto::compat::lightwalletd::compact_tx_streamer_client::CompactTxStreamerClient;
     use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server};
@@ -1402,7 +1408,10 @@ mod tests {
         }
     }
 
-    fn lifecycle_build_block(block: &zinder_testkit::FixtureBlock) -> CanonicalBuildBlock {
+    fn lifecycle_build_block(
+        block: &zinder_testkit::FixtureBlock,
+        activations: &NetworkUpgradeActivations,
+    ) -> CanonicalBuildBlock {
         let facts = CanonicalBlockFacts {
             block_header: block.block_header_artifact(),
             serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(
@@ -1421,13 +1430,33 @@ mod tests {
             tree_state_checkpoint: Some(CommitmentTreeCheckpoint::new(
                 BlockId::new(block.height, block.hash),
                 block.block_time_seconds,
-                CommitmentTreeFrontiers::default(),
+                lifecycle_frontiers(activations, block.height),
             )),
             block_final_note_commitment_roots: None,
             transaction_blobs: Vec::new(),
             block_blob: None,
             facts,
         }
+    }
+
+    /// Live following derives each checkpoint's frontiers from its
+    /// predecessor, so every shielded pool active at `height` carries an
+    /// empty frontier.
+    fn lifecycle_frontiers(
+        activations: &NetworkUpgradeActivations,
+        height: BlockHeight,
+    ) -> CommitmentTreeFrontiers {
+        let active_frontier = |protocol: ShieldedProtocol| {
+            activations
+                .activation_height_by_name(protocol.activation_upgrade_name())
+                .is_some_and(|activation_height| activation_height <= height)
+                .then(|| CommitmentTreeFrontier::empty(protocol))
+        };
+        CommitmentTreeFrontiers::from_validated_parts(
+            active_frontier(ShieldedProtocol::Sapling),
+            active_frontier(ShieldedProtocol::Orchard),
+            active_frontier(ShieldedProtocol::Ironwood),
+        )
     }
 
     fn lifecycle_activations() -> NetworkUpgradeActivations {
@@ -1505,13 +1534,13 @@ mod tests {
             RocksDbResourceBudget::for_local_tests(),
         )?;
         builder.bulk_load_blocks(std::iter::once(Ok::<_, std::io::Error>(
-            lifecycle_build_block(&first),
+            lifecycle_build_block(&first, activations),
         )))?;
         builder.load_subtree_roots(std::iter::empty())?;
         builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
             BlockId::new(first.height, first.hash),
             first.block_time_seconds,
-            CommitmentTreeFrontiers::default(),
+            lifecycle_frontiers(activations, first.height),
         ))?;
         let validated = builder.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
@@ -1646,7 +1675,7 @@ mod tests {
         let (next_primary, _) = primary.commit_live_append(
             CanonicalLiveAppend::new(
                 expected_fence,
-                lifecycle_build_block(&second),
+                lifecycle_build_block(&second, &activations),
                 Vec::new(),
                 expected_fence.visible_tip(),
                 UnixTimestampMillis::new(2_000),
@@ -1671,7 +1700,7 @@ mod tests {
         let (next_primary, _) = primary.commit_live_append(
             CanonicalLiveAppend::new(
                 expected_fence,
-                lifecycle_build_block(&third),
+                lifecycle_build_block(&third, &activations),
                 Vec::new(),
                 expected_fence.visible_tip(),
                 UnixTimestampMillis::new(3_000),
@@ -1770,17 +1799,18 @@ mod tests {
     /// A runtime started on the pre-upgrade table keeps refreshing after the
     /// chain crosses an activation the writer admitted later.
     ///
-    /// `GetLightdInfo` then reports the admitted upgrade.
+    /// `GetLightdInfo` reports the admitted upgrade as pending below its
+    /// height and as the active branch from that height on.
     #[tokio::test]
     #[allow(
         clippy::too_many_lines,
-        reason = "The scenario keeps startup, writer admission, crossing the activation, refresh, and the served upgrade in one causal sequence."
+        reason = "The scenario keeps startup, writer admission, the pending and crossing refreshes, and the served upgrade in one causal sequence."
     )]
     async fn publisher_keeps_refreshing_after_the_chain_crosses_a_later_admitted_activation()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempfile::tempdir()?;
-        // Upgrades without a shielded pool are active at the baseline tip,
-        // so the fixture blocks need no commitment-tree frontiers.
+        // A pre-NU7 table whose upgrades are all active by height 2, so NU7 is
+        // the only upgrade that can be pending.
         let activations = NetworkUpgradeActivations::new(
             Network::ZcashRegtest,
             lifecycle_activations()
@@ -1790,11 +1820,11 @@ mod tests {
                 .map(|activation| {
                     let activation_height = if matches!(
                         activation.name.as_str(),
-                        "Overwinter" | "Blossom" | "Heartwood" | "Canopy"
+                        "Overwinter" | "Sapling" | "Blossom" | "Heartwood" | "Canopy"
                     ) {
                         BlockHeight::new(1)
                     } else {
-                        activation.activation_height
+                        BlockHeight::new(2)
                     };
                     NetworkUpgradeActivation {
                         activation_height,
@@ -1803,6 +1833,14 @@ mod tests {
                 })
                 .collect(),
         )?;
+        let branch_active_at = |height: u32| {
+            activations
+                .active_at(BlockHeight::new(height))
+                .map(|activation| zinder_core::wire::encode_branch_id_hex(activation.branch_id))
+                .ok_or("the startup table must have an active upgrade")
+        };
+        let canopy_branch_id = branch_active_at(1)?;
+        let nu6_3_branch_id = branch_active_at(2)?;
         let (mut primary, blocks) =
             lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
         // The writer's first start admits the unchanged node table as
@@ -1842,59 +1880,68 @@ mod tests {
         let (mut publisher, slot) =
             CompactBlockPublisher::bootstrap(config, serving_readiness, &endpoint, None).await?;
         let adapter = CompactBlockAdapter::new(slot.clone(), Arc::new(activations.clone()));
-        let canopy = adapter
+        let startup = adapter
             .get_lightd_info(Request::new(lightwalletd::Empty::default()))
             .await?
             .into_inner();
-        assert_eq!(canopy.upgrade_name, "Canopy");
+        assert_eq!(startup.consensus_branch_id, canopy_branch_id);
+        assert_eq!(startup.upgrade_name, "NU5");
+        assert_eq!(startup.upgrade_height, 2);
 
         // The node is upgraded and only the writer restarts: it admits the
-        // new table, which activates NU7 at the next block, as revision 2.
+        // new table, which activates NU7 at height 3, as revision 2.
         let nu7_branch_id = ConsensusBranchId::new(0x7719_0ad9);
         let mut entries = activations.activations().to_vec();
         entries.push(NetworkUpgradeActivation {
             branch_id: nu7_branch_id,
-            activation_height: BlockHeight::new(2),
+            activation_height: BlockHeight::new(3),
             name: "NU7".to_owned(),
         });
         let upgraded = NetworkUpgradeActivations::new(Network::ZcashRegtest, entries)?;
         primary.admit_network_upgrade_schedule(&upgraded)?;
-        let second = blocks
-            .get(1)
-            .cloned()
-            .ok_or("lifecycle fixture has no append block")?;
-        let expected_fence = primary.event_fence();
-        let (next_primary, crossing_fence) = primary.commit_live_append(
-            CanonicalLiveAppend::new(
-                expected_fence,
-                lifecycle_build_block(&second),
-                Vec::new(),
-                expected_fence.visible_tip(),
-                UnixTimestampMillis::new(2_000),
-            ),
-            &upgraded,
-        )?;
-        primary = next_primary;
-        control.set_writer_status(lifecycle_writer_status(&primary));
+        for block in blocks.iter().skip(1) {
+            let expected_fence = primary.event_fence();
+            let (next_primary, _) = primary.commit_live_append(
+                CanonicalLiveAppend::new(
+                    expected_fence,
+                    lifecycle_build_block(block, &upgraded),
+                    Vec::new(),
+                    expected_fence.visible_tip(),
+                    UnixTimestampMillis::new(u64::from(block.height.value()) * 1_000),
+                ),
+                &upgraded,
+            )?;
+            primary = next_primary;
+            control.set_writer_status(lifecycle_writer_status(&primary));
+            publisher.refresh().await;
+            let published_reader = slot.capture();
+            assert_eq!(published_reader.event_fence(), primary.event_fence());
+            assert_eq!(
+                published_reader.network_upgrade_activations(),
+                Some(&upgraded)
+            );
+            drop(published_reader);
 
-        publisher.refresh().await;
-        let replaced = slot.capture();
-        assert_eq!(replaced.event_fence(), crossing_fence);
-        assert_eq!(replaced.network_upgrade_activations(), Some(&upgraded));
-        let nu7 = adapter
-            .get_lightd_info(Request::new(lightwalletd::Empty::default()))
-            .await?
-            .into_inner();
-        assert_eq!(nu7.block_height, 2);
-        assert_eq!(
-            nu7.consensus_branch_id,
-            zinder_core::wire::encode_branch_id_hex(nu7_branch_id)
-        );
-        assert_eq!(nu7.upgrade_name, "NU7");
-        assert_eq!(nu7.upgrade_height, 2);
+            let info = adapter
+                .get_lightd_info(Request::new(lightwalletd::Empty::default()))
+                .await?
+                .into_inner();
+            assert_eq!(info.block_height, u64::from(block.height.value()));
+            if block.height < BlockHeight::new(3) {
+                assert_eq!(info.consensus_branch_id, nu6_3_branch_id);
+                assert_eq!(info.upgrade_name, "NU7");
+                assert_eq!(info.upgrade_height, 3);
+            } else {
+                assert_eq!(
+                    info.consensus_branch_id,
+                    zinder_core::wire::encode_branch_id_hex(nu7_branch_id)
+                );
+                assert_eq!(info.upgrade_name, "");
+                assert_eq!(info.upgrade_height, 0);
+            }
+        }
 
         drop(adapter);
-        drop(replaced);
         drop(publisher);
         drop(primary);
         let _ = shutdown_sender.send(());
