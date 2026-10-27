@@ -179,6 +179,12 @@ undo rows scale with the window; construction accounts for them against
 `projector.build.max_accounted_reorg_undo_bytes`. Configure the same window for
 ingest, projector, native query, and compatibility admission.
 
+Upgrading to a release whose default is 1000 blocks raises existing stores the
+first time ingest starts, when the deployment relies on the default, the shipped
+`deploy/config` files, or the wallet-serving image. That raise is irreversible
+in place, so capture a state bundle before starting the new release if you need
+a rollback path.
+
 To raise the window on an existing deployment, restart the canonical writer
 with the larger window first, then restart the projector, native query, and
 compatibility with the same value. The writer records the raise in place and

@@ -81,7 +81,7 @@ These are optional:
 | Variable | Effect |
 | --- | --- |
 | `ZINDER_NODE__INDEXER_GRPC_ADDR` | Enables the streaming mempool source and chain-tip wakeups, such as `http://zebra.railway.internal:8155`. |
-| `ZINDER_INGEST__REORG_WINDOW_BLOCKS` | Sets the canonical replacement depth, applied identically to the projector and the query surface. Defaults to 1000, Zebra's finalization depth. Raising it on an existing deployment raises the stores in place; lowering it requires a rebuild. |
+| `ZINDER_INGEST__REORG_WINDOW_BLOCKS` | Sets the canonical replacement depth, applied identically to the projector and the query surface. Defaults to 1000, Zebra's finalization depth. Raising it on an existing deployment, including by upgrading to this default, raises the stores in place and irreversibly; capture a state bundle first if you need a rollback path. Lowering it requires a rebuild. |
 | `RUST_LOG` | Log filter, such as `info,zinder=info`. |
 | `INGEST_CONTROL_BEARER_TOKEN` | Ingest-control bearer secret. Generated at boot when unset. |
 | `CHECKPOINT_BEARER_TOKEN` | Checkpoint bearer secret. Generated at boot when unset. |
