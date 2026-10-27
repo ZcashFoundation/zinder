@@ -649,6 +649,82 @@ async fn canonical_follower_refuses_a_fork_below_settlement_without_mutation()
     Ok(())
 }
 
+/// A writer parked on an over-window fork keeps serving its control plane
+/// from the frozen fence, and its halt survives other readiness writers until
+/// termination.
+#[tokio::test]
+async fn parked_follower_serves_its_frozen_fence_until_termination()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let original = parseable_multi_block_chain()?;
+    let source = RecordingParseableSource::new(
+        original.clone(),
+        checkpoints_for_parseable_chain(&original, &activations)?,
+        BlockHeight::new(4),
+    );
+    let temporary = tempdir()?;
+    let store = publish_parseable_store(
+        &source,
+        &original,
+        Arc::clone(&activations),
+        &temporary.path().join("canonical"),
+        2,
+        BlockHeight::new(2),
+    )
+    .await?;
+    let original_fence = store.event_fence();
+    let over_window = forked_parseable_chain(&original, 2, 4, 91)?;
+    source.replace_chain(
+        over_window.clone(),
+        checkpoints_for_parseable_chain(&over_window, &activations)?,
+        BlockHeight::new(4),
+    );
+    let readiness = Readiness::default();
+    let cancel = CancellationToken::new();
+    let (canonical, commands) = zinder_ingest::canonical_control_channel();
+    let follower = single_pass_follower(&source, &activations, &readiness, &cancel);
+    let observe_parked = async {
+        while !matches!(
+            readiness.report().cause,
+            ReadinessCause::ReorgWindowExceeded { .. }
+        ) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        readiness.set(zinder_runtime::ReadinessState::ready(Some(4)));
+        let snapshot = canonical.writer_status().await;
+        cancel.cancel();
+        snapshot
+    };
+    let (outcome, snapshot) = tokio::join!(
+        follow_canonical_tip_with_control(store, follower, commands),
+        observe_parked,
+    );
+
+    let frozen_fence = snapshot?
+        .fence
+        .ok_or("a parked writer must report its frozen fence")?;
+    assert_eq!(
+        frozen_fence.event_sequence,
+        original_fence.chain_event_sequence()
+    );
+    assert_eq!(
+        frozen_fence.visible_tip_height,
+        original_fence.visible_tip().height.value()
+    );
+    assert!(matches!(
+        readiness.report().cause,
+        ReadinessCause::ReorgWindowExceeded {
+            depth: 3,
+            configured: 2,
+        }
+    ));
+    assert!(matches!(
+        outcome,
+        Err(zinder_ingest::CanonicalFollowError::ReorgWindowExceeded(_))
+    ));
+    Ok(())
+}
+
 /// With a three-block window over tip 4 and settled tip 1, forks two and
 /// three blocks deep are replaced and a four-block fork parks the writer.
 #[tokio::test]

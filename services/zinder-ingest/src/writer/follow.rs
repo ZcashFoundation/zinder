@@ -438,7 +438,7 @@ where
                 continue;
             }
             Err(CanonicalFollowError::ReorgWindowExceeded(evidence)) => {
-                follower.readiness.set(
+                follower.readiness.park(
                     ReadinessState::reorg_window_exceeded(
                         u64::from(evidence.required_depth),
                         u64::from(evidence.configured_window_blocks),
@@ -446,6 +446,9 @@ where
                     )
                     .with_phase(IngestPhase::FollowingTip),
                 );
+                if let Some(control_commands) = control_commands.as_mut() {
+                    serve_parked_writer(&mut store, control_commands, follower.cancel).await;
+                }
                 return Err(CanonicalFollowError::ReorgWindowExceeded(evidence));
             }
             Err(CanonicalFollowError::Cancelled) => return Ok(store),
@@ -845,6 +848,38 @@ where
         )),
         observed_tip,
     })
+}
+
+/// Serves owner commands from a writer parked on a reorg deeper than its
+/// window until cancellation.
+///
+/// The writer no longer follows, but readers still need its frozen fence,
+/// retained events, retention leases, and owner checkpoints, and its control
+/// plane keeps reporting the typed halt. No command changes canonical rows.
+async fn serve_parked_writer(
+    store: &mut RocksDbCanonicalStore,
+    control_commands: &mut mpsc::Receiver<CanonicalControlCommand>,
+    cancel: &CancellationToken,
+) {
+    tracing::warn!(
+        target: "zinder::ingest",
+        event = "canonical_writer_parked",
+        visible_tip_height = store.event_fence().visible_tip().height.value(),
+        "canonical writer parked; serving its control plane until termination"
+    );
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            command = control_commands.recv() => {
+                let Some(command) = command else {
+                    cancel.cancelled().await;
+                    return;
+                };
+                apply_canonical_control_command(store, command);
+            }
+        }
+    }
 }
 
 fn next_append_settled_tip(

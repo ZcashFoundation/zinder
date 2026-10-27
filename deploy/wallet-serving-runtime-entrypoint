@@ -71,6 +71,8 @@ probe_exit_code=0
 probe_connect_seconds=""
 probe_failure_class=""
 probe_report=""
+probe_halted=0
+writer_halt_reported=0
 
 # curl writes the status code and connect time after the body; a newline
 # separates them because JSON escapes newlines inside strings.
@@ -274,7 +276,23 @@ probe_readiness() {
 # deadline and, once serving, the whole Railway healthcheck window.
 readiness_cause_is_terminal() {
   case "$1" in
-    schema_mismatch | node_capability_missing | reorg_window_exceeded)
+    schema_mismatch | node_capability_missing)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# A canonical writer parked on a reorg deeper than its window stays parked
+# until an operator reconciles it, but the topology is still doing its job:
+# ingest keeps its control listener, and query refuses wallets with the typed
+# REORG_WINDOW_EXCEEDED status. Restarting would only replace that refusal
+# with refused connections, so a halted plane counts as serving.
+readiness_cause_is_writer_halt() {
+  case "$1" in
+    reorg_window_exceeded)
       return 0
       ;;
     *)
@@ -314,6 +332,10 @@ await_readiness() {
     if [ "$probe_http_status" = "200" ]; then
       return 0
     fi
+    if readiness_cause_is_writer_halt "$probe_cause"; then
+      log "$role serves the canonical writer halt; continuing so wallets receive the typed refusal: $probe_report"
+      return 0
+    fi
 
     if readiness_cause_is_terminal "$probe_cause"; then
       fail "$role reports $probe_cause, which no amount of waiting clears: $probe_report"
@@ -332,14 +354,20 @@ await_readiness() {
   done
 }
 
-# Records the first plane that stops admitting traffic in `unready_plane` and
-# returns non-zero, so the caller can time how long the condition persists.
+# Returns zero while the plane admits traffic or serves the canonical writer
+# halt, and sets `probe_halted` for the latter. Returns non-zero for every
+# other unready cause, so the caller can time how long it persists.
 observe_plane_readiness() {
   role="$1"
   ops_addr="$2"
 
+  probe_halted=0
   probe_readiness "$ops_addr"
   if [ "$probe_http_status" = "200" ]; then
+    return 0
+  fi
+  if readiness_cause_is_writer_halt "$probe_cause"; then
+    probe_halted=1
     return 0
   fi
   if readiness_cause_is_terminal "$probe_cause"; then
@@ -481,10 +509,11 @@ query_flap_ready_since_epoch="$startup_completed_epoch"
 
 # A surviving subset of the topology answers requests it cannot satisfy, so one
 # exit terminates the container and the orchestrator restarts a clean set.
-# Liveness alone does not prove the topology advances: a canonical writer parked
-# on an oversized reorg keeps its process, its readers, and their published pair
-# perfectly self-consistent at a frozen height, so readiness carries the signal
-# that liveness cannot.
+# Liveness alone does not prove the topology advances, so readiness carries the
+# signal that liveness cannot. A canonical writer parked on an oversized reorg
+# is the exception: its planes report `reorg_window_exceeded`, query refuses
+# wallets with the typed status, and the container keeps that refusal up
+# instead of restarting into the same park.
 unready_since_epoch=0
 
 while true; do
@@ -496,23 +525,35 @@ while true; do
   # Every plane is probed every iteration regardless of its siblings, so a
   # plane's own flap history stays accurate even in polls where another plane
   # is also unready.
+  plane_halted=0
   ingest_ready=0
   if observe_plane_readiness zinder-ingest "$ingest_ops_addr"; then
     ingest_ready=1
   fi
   ingest_report="$probe_report"
+  plane_halted=$((plane_halted | probe_halted))
 
   projector_ready=0
   if observe_plane_readiness zinder-projector "$projector_ops_addr"; then
     projector_ready=1
   fi
   projector_report="$probe_report"
+  plane_halted=$((plane_halted | probe_halted))
 
   query_ready=0
   if observe_plane_readiness zinder-query "$query_ops_addr"; then
     query_ready=1
   fi
   query_report="$probe_report"
+  plane_halted=$((plane_halted | probe_halted))
+
+  if [ "$plane_halted" -eq 1 ] && [ "$writer_halt_reported" -eq 0 ]; then
+    log "the canonical writer is parked on a reorg deeper than its window; wallets receive REORG_WINDOW_EXCEEDED until an operator reconciles the canonical store: $ingest_report"
+    writer_halt_reported=1
+  elif [ "$plane_halted" -eq 0 ] && [ "$writer_halt_reported" -eq 1 ]; then
+    log "no plane reports the canonical writer halt any longer"
+    writer_halt_reported=0
+  fi
 
   # shellcheck disable=SC2046 # word-splitting the fixed-width numeric fields update_plane_recurrence prints is intentional; see its own comment.
   set -- $(update_plane_recurrence zinder-ingest "$ingest_ready" "$now_epoch" \

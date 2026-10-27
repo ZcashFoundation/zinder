@@ -49,9 +49,10 @@ pub struct WriterStatusResponse {
     pub upstream_not_ready: ::core::option::Option<super::ops::UpstreamNotReadyDetail>,
     /// Set while the canonical writer is parked because a replacement crossed
     /// its reorg window. The writer no longer follows the node until an
-    /// operator reconciles the store, so `chain_view` is absent: there is no
-    /// live writer fence to report. Carries the same payload `ReadinessReport`
-    /// surfaces under `cause=reorg_window_exceeded`. ADR-0041.
+    /// operator reconciles the store. `chain_view` carries the frozen writer
+    /// fence while the parked writer still answers and is absent otherwise.
+    /// Carries the same payload `ReadinessReport` surfaces under
+    /// `cause=reorg_window_exceeded`. ADR-0041.
     #[prost(message, optional, tag = "9")]
     pub reorg_window_exceeded: ::core::option::Option<
         super::ops::ReorgWindowExceededDetail,

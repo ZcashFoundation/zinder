@@ -607,7 +607,7 @@ where
         Err(zinder_ingest::CanonicalWriterError::Follow(
             zinder_ingest::CanonicalFollowError::ReorgWindowExceeded(evidence),
         )) => {
-            readiness.set(
+            readiness.park(
                 ReadinessState::reorg_window_exceeded(
                     u64::from(evidence.required_depth),
                     u64::from(evidence.configured_window_blocks),
