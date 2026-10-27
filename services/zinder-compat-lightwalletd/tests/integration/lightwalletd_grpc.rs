@@ -152,15 +152,10 @@ async fn lightwalletd_adapter_serves_read_sync_methods() -> eyre::Result<()> {
         !lightd_info.taddr_support,
         "the generic adapter must not advertise transparent-address support"
     );
-    assert!(
-        !lightd_info.upgrade_name.is_empty(),
-        "upgrade_name must be populated from NetworkUpgrade::current"
-    );
-    assert!(
-        lightd_info.upgrade_height > 0,
-        "upgrade_height must reflect the active upgrade activation; got {}",
-        lightd_info.upgrade_height
-    );
+    // upgradeName and upgradeHeight name the next pending upgrade: in the
+    // sample regtest table, NU5 activates at height 2.
+    assert_eq!(lightd_info.upgrade_name, "NU5");
+    assert_eq!(lightd_info.upgrade_height, 2);
 
     Ok(())
 }
