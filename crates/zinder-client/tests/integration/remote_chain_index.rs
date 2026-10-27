@@ -128,6 +128,7 @@ async fn parked_writer_halt_reaches_unary_reads_and_open_chain_event_streams() -
     readiness.set(zinder_runtime::ReadinessState::reorg_window_exceeded(
         1_001,
         1_000,
+        Some(1_000),
         Some(2),
     ));
     let stream_halt = loop {
@@ -150,6 +151,7 @@ async fn parked_writer_halt_reaches_unary_reads_and_open_chain_event_streams() -
                 IndexerError::ReorgWindowExceeded {
                     replacement_depth_blocks: Some(1_001),
                     reorg_window_blocks: Some(1_000),
+                    covered_depth_blocks: Some(1_000),
                 }
             ),
             "{halt:?}"

@@ -129,6 +129,11 @@ pub enum ReadinessCause {
         depth: u64,
         /// Configured reorg window in blocks.
         configured: u64,
+        /// Replaceable depth the window covered when the replacement was
+        /// refused. Below `configured` while a raised window is still growing
+        /// toward it; `None` when the reporter did not supply it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        covered: Option<u64>,
     },
     /// A `RocksDB` secondary reader is behind the primary beyond the configured threshold.
     ReplicaLagging {
@@ -634,20 +639,33 @@ impl Interceptor for TrafficReadinessInterceptor {
 /// `ErrorInfo.metadata["readiness_cause"]` always carries the stable
 /// readiness label. A canonical writer parked by `reorg_window_exceeded`
 /// maps to the typed `REORG_WINDOW_EXCEEDED` reason, with
-/// `replacement_depth_blocks` and `reorg_window_blocks` metadata, because
+/// `replacement_depth_blocks`, `reorg_window_blocks`, and, when known,
+/// `covered_depth_blocks` metadata, because
 /// retrying cannot succeed until an operator reconciles the store. Every
 /// other cause maps to `SERVICE_NOT_READY`.
 #[must_use]
 pub fn not_ready_status(cause: &ReadinessCause) -> Status {
     let readiness_cause = cause.metric_label();
     let mut metadata = HashMap::from([("readiness_cause".to_owned(), readiness_cause.to_owned())]);
-    if let ReadinessCause::ReorgWindowExceeded { depth, configured } = cause {
+    if let ReadinessCause::ReorgWindowExceeded {
+        depth,
+        configured,
+        covered,
+    } = cause
+    {
         metadata.insert("replacement_depth_blocks".to_owned(), depth.to_string());
         metadata.insert("reorg_window_blocks".to_owned(), configured.to_string());
+        let coverage = covered.map_or_else(
+            || format!("its {configured}-block reorg window"),
+            |covered| {
+                metadata.insert("covered_depth_blocks".to_owned(), covered.to_string());
+                format!("the {covered} blocks its {configured}-block reorg window covered")
+            },
+        );
         return status_with_reason_and_metadata(
             ErrorReason::ReorgWindowExceeded,
             format!(
-                "the canonical writer is parked: a {depth}-block replacement exceeds its {configured}-block reorg window, and an operator must reconcile the canonical store"
+                "the canonical writer is parked: a {depth}-block replacement exceeds {coverage}, and an operator must reconcile the canonical store"
             ),
             ErrorDetails::new(),
             metadata,
@@ -782,13 +800,22 @@ impl ReadinessState {
     /// `/readyz` response includes the chain height the operator should
     /// reconcile against.
     #[must_use]
+    ///
+    /// `covered` is the replaceable depth the window covered when the
+    /// replacement was refused, which is below `configured` while a raised
+    /// window is still growing toward it.
     pub const fn reorg_window_exceeded(
         depth: u64,
         configured: u64,
+        covered: Option<u64>,
         current_height: Option<u32>,
     ) -> Self {
         Self {
-            cause: ReadinessCause::ReorgWindowExceeded { depth, configured },
+            cause: ReadinessCause::ReorgWindowExceeded {
+                depth,
+                configured,
+                covered,
+            },
             current_height,
             target_height: None,
             phase: None,
@@ -940,14 +967,17 @@ impl From<&ReadinessCause> for Option<ops_proto::ReadinessCauseDetail> {
                     },
                 )
             }
-            ReadinessCause::ReorgWindowExceeded { depth, configured } => {
-                ops_proto::readiness_cause_detail::Payload::ReorgWindowExceeded(
-                    ops_proto::ReorgWindowExceededDetail {
-                        depth: *depth,
-                        configured: *configured,
-                    },
-                )
-            }
+            ReadinessCause::ReorgWindowExceeded {
+                depth,
+                configured,
+                covered,
+            } => ops_proto::readiness_cause_detail::Payload::ReorgWindowExceeded(
+                ops_proto::ReorgWindowExceededDetail {
+                    depth: *depth,
+                    configured: *configured,
+                    covered: *covered,
+                },
+            ),
             ReadinessCause::ReplicaLagging { lag_chain_epochs } => {
                 ops_proto::readiness_cause_detail::Payload::ReplicaLagging(
                     ops_proto::ReplicaLaggingDetail {
@@ -1094,6 +1124,7 @@ mod tests {
             1_001,
             1_000,
             Some(100),
+            Some(100),
         ));
         let halted = interceptor
             .call(Request::new(()))
@@ -1112,6 +1143,7 @@ mod tests {
             ("readiness_cause", "reorg_window_exceeded"),
             ("replacement_depth_blocks", "1001"),
             ("reorg_window_blocks", "1000"),
+            ("covered_depth_blocks", "100"),
         ] {
             assert_eq!(
                 halted_error_info.metadata.get(key).map(String::as_str),
@@ -1125,7 +1157,7 @@ mod tests {
     fn parked_readiness_keeps_its_halt_until_shutdown() {
         let readiness = Readiness::new(ReadinessState::ready(Some(10)));
         readiness.park(
-            ReadinessState::reorg_window_exceeded(1_001, 1_000, Some(10))
+            ReadinessState::reorg_window_exceeded(1_001, 1_000, Some(1_000), Some(10))
                 .with_phase(IngestPhase::FollowingTip),
         );
         readiness.set(ReadinessState::ready(Some(11)));
@@ -1146,6 +1178,7 @@ mod tests {
             ReadinessCause::ReorgWindowExceeded {
                 depth: 1_001,
                 configured: 1_000,
+                ..
             }
         ));
         assert_eq!(report.phase, Some(IngestPhase::FollowingTip));
@@ -1362,14 +1395,20 @@ mod tests {
 
     #[test]
     fn reorg_window_exceeded_carries_depth_and_configured() {
-        let readiness = Readiness::new(ReadinessState::reorg_window_exceeded(12, 10, Some(100)));
+        let readiness = Readiness::new(ReadinessState::reorg_window_exceeded(
+            12,
+            10,
+            Some(11),
+            Some(100),
+        ));
         let report = readiness.report();
         assert!(!report.is_ready);
         assert!(matches!(
             report.cause,
             ReadinessCause::ReorgWindowExceeded {
                 depth: 12,
-                configured: 10
+                configured: 10,
+                covered: Some(11),
             }
         ));
         assert_eq!(report.current_height, Some(100));
@@ -1424,6 +1463,7 @@ mod tests {
             ReadinessCause::ReorgWindowExceeded {
                 depth: 0,
                 configured: 0,
+                covered: None,
             },
             ReadinessCause::ReplicaLagging {
                 lag_chain_epochs: 0,
@@ -1519,6 +1559,7 @@ mod tests {
             ReadinessCause::ReorgWindowExceeded {
                 depth: 0,
                 configured: 0,
+                covered: None,
             },
             ReadinessCause::ReplicaLagging {
                 lag_chain_epochs: 0,
@@ -1553,6 +1594,7 @@ mod tests {
             cause: ReadinessCause::ReorgWindowExceeded {
                 depth: 12,
                 configured: 10,
+                covered: Some(10),
             },
             current_height: Some(100),
             target_height: None,
@@ -1586,6 +1628,7 @@ mod tests {
         };
         assert_eq!(payload.depth, 12);
         assert_eq!(payload.configured, 10);
+        assert_eq!(payload.covered, Some(10));
     }
 
     #[test]

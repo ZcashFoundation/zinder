@@ -115,6 +115,11 @@ message ReorgWindowExceededDetail {
   uint64 depth = 1;
   // Configured reorg window in blocks.
   uint64 configured = 2;
+  // Replaceable depth the window covered when the replacement was refused:
+  // the distance from the settled tip to the visible tip. It is below
+  // `configured` while a raised window is still growing toward it. Absent
+  // when the reporter predates this field.
+  optional uint64 covered = 3;
 }
 
 // Detail for READINESS_CAUSE_REPLICA_LAGGING.

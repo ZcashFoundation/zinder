@@ -770,6 +770,7 @@ fn parked_writer_status_round_trips_its_reorg_halt_without_a_chain_view() -> eyr
         reorg_window_exceeded: Some(ops::ReorgWindowExceededDetail {
             depth: 1_001,
             configured: 1_000,
+            covered: Some(1_000),
         }),
     };
     let decoded = round_trip(&response)?;
@@ -779,6 +780,7 @@ fn parked_writer_status_round_trips_its_reorg_halt_without_a_chain_view() -> eyr
         Some(ops::ReorgWindowExceededDetail {
             depth: 1_001,
             configured: 1_000,
+            covered: Some(1_000),
         })
     );
     // A reader built before the field decodes the same bytes and sees only

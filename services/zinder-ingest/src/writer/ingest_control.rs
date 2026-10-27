@@ -531,12 +531,20 @@ fn writer_status_response(
         } else {
             None
         };
-    let reorg_window_exceeded =
-        if let ReadinessCause::ReorgWindowExceeded { depth, configured } = readiness_report.cause {
-            Some(ops::ReorgWindowExceededDetail { depth, configured })
-        } else {
-            None
-        };
+    let reorg_window_exceeded = if let ReadinessCause::ReorgWindowExceeded {
+        depth,
+        configured,
+        covered,
+    } = readiness_report.cause
+    {
+        Some(ops::ReorgWindowExceededDetail {
+            depth,
+            configured,
+            covered,
+        })
+    } else {
+        None
+    };
     WriterStatusResponse {
         chain_view,
         network_name: encode_zinder_native_chain_name(network).to_owned(),
@@ -1177,7 +1185,7 @@ mod tests {
         let (canonical, commands) = canonical_control_channel();
         drop(commands);
         let readiness = Readiness::new(
-            ReadinessState::reorg_window_exceeded(1_001, 1_000, Some(4_200))
+            ReadinessState::reorg_window_exceeded(1_001, 1_000, Some(1_000), Some(4_200))
                 .with_phase(IngestPhase::FollowingTip),
         );
         let source: Arc<dyn NodeSource> = Arc::new(ZebraJsonRpcSource::new(
@@ -1206,6 +1214,7 @@ mod tests {
             Some(zinder_proto::v1::ops::ReorgWindowExceededDetail {
                 depth: 1_001,
                 configured: 1_000,
+                covered: Some(1_000),
             })
         );
 

@@ -611,6 +611,7 @@ where
                 ReadinessState::reorg_window_exceeded(
                     u64::from(evidence.required_depth),
                     u64::from(evidence.configured_window_blocks),
+                    Some(u64::from(evidence.covered_depth_blocks)),
                     Some(evidence.local_tip.height.value()),
                 )
                 .with_phase(zinder_runtime::IngestPhase::FollowingTip),
@@ -623,6 +624,7 @@ where
                 settled_tip_height = evidence.settled_tip.height.value(),
                 required_depth = evidence.required_depth,
                 configured_window_blocks = evidence.configured_window_blocks,
+                covered_depth_blocks = evidence.covered_depth_blocks,
                 "canonical writer parked with readiness drained for operator review"
             );
             termination.cancelled().await;
@@ -1478,6 +1480,7 @@ mod tests {
                     ),
                     required_depth: 3,
                     configured_window_blocks: 2,
+                    covered_depth_blocks: 2,
                 },
             )),
         ))
@@ -1533,6 +1536,7 @@ mod tests {
             zinder_runtime::ReadinessCause::ReorgWindowExceeded {
                 depth: 3,
                 configured: 2,
+                covered: Some(2),
             }
         ));
         assert_eq!(readiness_report.current_height, Some(4));

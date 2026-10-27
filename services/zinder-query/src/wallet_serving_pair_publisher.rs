@@ -1703,6 +1703,7 @@ mod tests {
             zinder_proto::v1::ops::ReorgWindowExceededDetail {
                 depth: 1_001,
                 configured: 1_000,
+                covered: Some(1_000),
             },
         ));
         wait_for_readiness_cause(&runtime, |cause| {
@@ -1711,6 +1712,7 @@ mod tests {
                 zinder_runtime::ReadinessCause::ReorgWindowExceeded {
                     depth: 1_001,
                     configured: 1_000,
+                    covered: Some(1_000),
                 }
             )
         })

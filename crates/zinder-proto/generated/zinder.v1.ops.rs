@@ -121,6 +121,12 @@ pub struct ReorgWindowExceededDetail {
     /// Configured reorg window in blocks.
     #[prost(uint64, tag = "2")]
     pub configured: u64,
+    /// Replaceable depth the window covered when the replacement was refused:
+    /// the distance from the settled tip to the visible tip. It is below
+    /// `configured` while a raised window is still growing toward it. Absent
+    /// when the reporter predates this field.
+    #[prost(uint64, optional, tag = "3")]
+    pub covered: ::core::option::Option<u64>,
 }
 /// Detail for READINESS_CAUSE_REPLICA_LAGGING.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
