@@ -154,11 +154,21 @@ operators would still need to raise it as observed reorgs grow.
   checkpoint captured before the raise, or a rebuild.
 - An operator who raises the window must restart every reader with the same
   window. A reader left on the old window fails closed.
-- Each live commit and each secondary catch-up re-authenticates the replay
-  tail from the settled checkpoint, and a deep replacement prepares its whole
-  replacement suffix in memory. Both scale with the window, so a 1000-block
-  window costs up to ten times the per-block work and replacement memory of a
-  100-block window. This cost has not been measured on Mainnet-sized blocks.
+- Every READY publication must still be explained by the replay rows from
+  the settled checkpoint through the visible tip, but re-deriving that suffix
+  on each transition would scale with the window. Open-time admission derives
+  it once; afterwards the writer authenticates only the rows each transition
+  wrote and a reader only the rows the intervening chain events changed, and
+  an idle reader catch-up reads none. Rows above the settled tip change only
+  through the writer's atomic, event-recorded transitions, so this accepts
+  exactly what a complete derivation accepts. The one difference is when an
+  out-of-band change to a row no transition touched is found: each holder
+  re-derives the whole suffix once its incrementally authenticated rows reach
+  one window, and the writer checks every row again when it settles, so such
+  a change is found within one window of blocks instead of at the next
+  transition.
+- A deep replacement prepares its whole replacement suffix in memory, which
+  scales with the window.
 - The lightwalletd compatibility runtime has no ingest-control health probe,
   so it still reports a parked writer as a writer-status outage rather than
   as `reorg_window_exceeded`.
