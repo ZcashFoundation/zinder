@@ -167,8 +167,13 @@ operators would still need to raise it as observed reorgs grow.
   one window, and the writer checks every row again when it settles, so such
   a change is found within one window of blocks instead of at the next
   transition.
-- A deep replacement prepares its whole replacement suffix in memory, which
-  scales with the window.
+- A deep replacement prepares its whole replacement suffix in memory before
+  its atomic commit, which scales with the window. `ingest.follow.max_replacement_bytes`
+  (2 GiB by default) bounds it; a replacement beyond the budget fails before
+  any write with the typed `ReplacementBytesExceeded`, and the operator raises
+  the budget to follow it. A dedicated budget is used because the
+  construction pipeline's preparation watermark admits a stream of blocks,
+  while a replacement must hold all of its blocks at once.
 - The lightwalletd compatibility runtime has no ingest-control health probe,
   so it still reports a parked writer as a writer-status outage rather than
   as `reorg_window_exceeded`.

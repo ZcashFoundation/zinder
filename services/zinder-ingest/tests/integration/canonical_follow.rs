@@ -303,6 +303,7 @@ async fn canonical_follower_settles_from_local_header_without_historical_source_
             event_retention_window: None,
             event_retention_check_interval: Duration::from_secs(1),
             mempool_ready_gate: None,
+            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
         },
         &readiness,
         &cancel,
@@ -373,6 +374,7 @@ async fn canonical_follower_cancellation_after_reorg_preparation_preserves_origi
             event_retention_window: None,
             event_retention_check_interval: Duration::from_secs(1),
             mempool_ready_gate: None,
+            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
         },
         &readiness,
         &cancel,
@@ -458,6 +460,7 @@ async fn canonical_follower_replaces_shallow_fork_reopens_and_continues_appendin
             event_retention_window: None,
             event_retention_check_interval: Duration::from_secs(1),
             mempool_ready_gate: None,
+            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
         },
         &readiness,
         &cancel,
@@ -531,6 +534,7 @@ async fn canonical_follower_replaces_shallow_fork_reopens_and_continues_appendin
             event_retention_window: None,
             event_retention_check_interval: Duration::from_secs(1),
             mempool_ready_gate: None,
+            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
         },
         &append_readiness,
         &append_cancel,
@@ -601,6 +605,7 @@ async fn canonical_follower_refuses_a_fork_below_settlement_without_mutation()
             event_retention_window: None,
             event_retention_check_interval: Duration::from_secs(1),
             mempool_ready_gate: None,
+            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
         },
         &readiness,
         &cancel,
@@ -865,6 +870,7 @@ async fn canonical_follower_follows_a_deeper_fork_after_an_in_place_window_raise
             event_retention_window: None,
             event_retention_check_interval: Duration::from_secs(1),
             mempool_ready_gate: None,
+            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
         },
         &readiness,
         &cancel,
@@ -980,6 +986,82 @@ async fn halt_during_a_raised_window_ramp_reports_the_covered_depth()
     Ok(())
 }
 
+/// A replacement whose prepared blocks exceed the configured budget fails
+/// with a typed error before any canonical write.
+#[tokio::test]
+async fn replacement_beyond_its_memory_budget_fails_closed_without_mutation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let original = parseable_multi_block_chain()?;
+    let source = RecordingParseableSource::new(
+        original.clone(),
+        checkpoints_for_parseable_chain(&original, &activations)?,
+        BlockHeight::new(4),
+    );
+    let temporary = tempdir()?;
+    let store = publish_parseable_store(
+        &source,
+        &original,
+        Arc::clone(&activations),
+        &temporary.path().join("canonical"),
+        3,
+        BlockHeight::new(1),
+    )
+    .await?;
+    let original_fence = store.event_fence();
+    let fork = forked_parseable_chain(&original, 3, 4, 101)?;
+    source.replace_chain(
+        fork.clone(),
+        checkpoints_for_parseable_chain(&fork, &activations)?,
+        BlockHeight::new(4),
+    );
+    let readiness = Readiness::default();
+    let cancel = CancellationToken::new();
+    let follower = CanonicalFollower::new(
+        &source,
+        Arc::clone(&activations),
+        CanonicalFollowConfig {
+            request_timeout: Duration::from_secs(5),
+            poll_interval: Duration::ZERO,
+            lag_threshold_blocks: 0,
+            target_height: None,
+            event_retention_window: None,
+            event_retention_check_interval: Duration::from_secs(1),
+            mempool_ready_gate: None,
+            max_replacement_bytes: NonZeroU64::MIN,
+        },
+        &readiness,
+        &cancel,
+    );
+    let error = follow_canonical_tip(store, follower)
+        .await
+        .err()
+        .ok_or("a replacement beyond its budget must fail")?;
+    assert!(
+        matches!(
+            error,
+            zinder_ingest::CanonicalFollowError::ReplacementBytesExceeded {
+                replacement_depth: 2,
+                prepared_blocks: 1,
+                max_replacement_bytes: 1,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    let reopened = zinder_store::RocksDbCanonicalStore::open_ready(
+        temporary.path().join("canonical"),
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        zinder_store::RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(3)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(reopened.event_fence(), original_fence);
+    assert_eq!(reopened.displaced_block_count()?, 0);
+    Ok(())
+}
+
 fn single_pass_follower<'a>(
     source: &'a RecordingParseableSource,
     activations: &Arc<NetworkUpgradeActivations>,
@@ -997,6 +1079,7 @@ fn single_pass_follower<'a>(
             event_retention_window: None,
             event_retention_check_interval: Duration::from_secs(1),
             mempool_ready_gate: None,
+            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
         },
         readiness,
         cancel,
@@ -1082,6 +1165,7 @@ async fn retention_steps_yield_to_canonical_source_observation()
                 event_retention_window: None,
                 event_retention_check_interval: Duration::from_secs(1),
                 mempool_ready_gate: None,
+                max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
             },
             &readiness,
             &cancel,
