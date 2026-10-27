@@ -27,8 +27,8 @@ use super::{
     },
     live_commit::{PreparedLiveBlockRows, event_fence_from_ready, next_live_fence},
     publication::{
-        column_family, encode_live_chain_epoch, encode_live_event,
-        validate_live_replacement_publication, validate_ready_sequence_checkpoint,
+        advance_ready_replay_tail, column_family, encode_live_chain_epoch, encode_live_event,
+        validate_live_replacement_publication,
     },
     rocksdb::{
         BLOCK_BLOB_COLUMN_FAMILY, BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
@@ -167,7 +167,7 @@ impl RocksDbCanonicalStore {
                 },
             )?;
         abort_at_live_replacement_failpoint("after_atomic_write");
-        prepared.validate_readback(&self).map_err(|source| {
+        prepared.validate_readback(&mut self).map_err(|source| {
             CanonicalStoreError::LiveCommitCompletedButUnverified {
                 path: self.bounded_open.db.path().to_path_buf(),
                 reason: source.to_string(),
@@ -358,7 +358,10 @@ impl PreparedLiveReplacement {
         })
     }
 
-    fn validate_readback(&self, store: &RocksDbCanonicalStore) -> Result<(), CanonicalStoreError> {
+    fn validate_readback(
+        &self,
+        store: &mut RocksDbCanonicalStore,
+    ) -> Result<(), CanonicalStoreError> {
         let replacement_keys = self
             .replacement_rows
             .iter()
@@ -415,10 +418,20 @@ impl PreparedLiveReplacement {
             self.reverted_range,
             self.committed_range,
         )?;
-        validate_ready_sequence_checkpoint(
+        let reorg_policy = store.reorg_policy();
+        let common_parent_height = self
+            .reverted_range
+            .start
+            .value()
+            .checked_sub(1)
+            .map(BlockHeight::new)
+            .ok_or_else(|| CanonicalStoreError::live_commit("replacement has no parent"))?;
+        advance_ready_replay_tail(
             &store.bounded_open.db,
-            store.reorg_policy(),
+            reorg_policy,
             &self.ready_evidence,
+            common_parent_height,
+            &mut store.replay_tail,
         )
     }
 }

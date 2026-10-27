@@ -19,6 +19,7 @@ mod live_replacement_tests;
 mod mempool_lifecycle;
 mod publication;
 mod reader;
+mod replay_tail;
 mod rocksdb;
 mod secondary;
 mod subtree_load;

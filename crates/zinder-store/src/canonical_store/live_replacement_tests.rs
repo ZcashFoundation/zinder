@@ -21,9 +21,9 @@ use super::{
     CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence,
     CanonicalEventHistoryRequest, CanonicalEventKind, CanonicalLiveAppend,
     CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,
-    CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload, ProjectionBuildLease,
-    ProjectionBuildLeaseId, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
-    RocksDbCanonicalStore,
+    CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreReadyEvidence,
+    CanonicalStoreWorkload, ProjectionBuildLease, ProjectionBuildLeaseId, RocksDbCanonicalBuilder,
+    RocksDbCanonicalSecondary, RocksDbCanonicalStore,
     displaced_archive::{
         encode_test_archive_state, encode_test_hash_pointer_rows, encode_test_order_key,
     },
@@ -1223,6 +1223,150 @@ fn secondary_refuses_a_writer_raise_until_it_reopens_with_the_raised_window()
     );
     let current = open_secondary("current", 3)?;
     assert_eq!(current.reorg_policy(), writer.reorg_policy());
+    Ok(())
+}
+
+#[test]
+fn incremental_replay_tails_match_a_complete_derivation_across_appends_and_replacements()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let window = 3;
+    let mut store = published_store(
+        &store_path,
+        window,
+        BlockHeight::new(4),
+        BlockHeight::new(2),
+    )?;
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let mut secondary = RocksDbCanonicalSecondary::open_ready(
+        &store_path,
+        temporary.path().join("secondary"),
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(window)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    let complete = |db: &DB, ready: CanonicalStoreReadyEvidence| {
+        super::replay_tail::AuthenticatedReplayTail::authenticate(
+            db,
+            ready.sequence_checkpoint,
+            ready.visible_tip.height,
+            window,
+        )
+        .map(|tail| tail.checkpoints())
+    };
+
+    let idle = secondary.try_catch_up()?;
+    assert_eq!(idle.before(), idle.after());
+
+    let fence = store.event_fence();
+    let (next, _) = store.commit_live_append(
+        CanonicalLiveAppend::new(
+            fence,
+            replacement_block(BlockHeight::new(5), [5; 32], [4; 32], 105)?,
+            Vec::new(),
+            BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
+            UnixTimestampMillis::new(1_750_000_000_002),
+        ),
+        &activations,
+    )?;
+    store = next;
+    let fence = store.event_fence();
+    let (next, _) = store.commit_live_replacement(
+        CanonicalLiveReplacement::new(
+            fence,
+            replacement_suffix(4, 5, [3; 32], 40)?,
+            UnixTimestampMillis::new(1_750_000_000_003),
+        ),
+        &activations,
+    )?;
+    store = next;
+    let fence = store.event_fence();
+    let (next, _) = store.commit_live_append(
+        CanonicalLiveAppend::new(
+            fence,
+            replacement_block(BlockHeight::new(6), [6; 32], [45; 32], 106)?,
+            Vec::new(),
+            BlockId::new(BlockHeight::new(3), BlockHash::from_bytes([3; 32])),
+            UnixTimestampMillis::new(1_750_000_000_004),
+        ),
+        &activations,
+    )?;
+    store = next;
+
+    let store_complete = complete(&store.bounded_open.db, store.ready_evidence())?;
+    assert_eq!(store.replay_tail.checkpoints(), store_complete);
+    secondary.try_catch_up()?;
+    assert_eq!(secondary.event_fence(), store.event_fence());
+    assert_eq!(secondary.replay_tail.checkpoints(), store_complete);
+    assert_eq!(
+        store_complete
+            .last()
+            .map(|checkpoint| checkpoint.through().height),
+        Some(BlockHeight::new(6))
+    );
+    Ok(())
+}
+
+#[test]
+fn writer_detects_an_unannounced_replay_row_change_before_it_settles()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let store = published_store(&store_path, 2, BlockHeight::new(4), BlockHeight::new(2))?;
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    // Rewrite the unsettled row at height 3 outside any transition, keeping
+    // its block identity so that only its facts differ.
+    let mut forged = canonical_block(BlockHeight::new(3), [3; 32], [2; 32], 99);
+    forged.facts.block_header = BlockHeaderArtifact::new(
+        BlockHeight::new(3),
+        BlockHash::from_bytes([3; 32]),
+        BlockHash::from_bytes([2; 32]),
+        [9; 32],
+        [4; 32],
+        3,
+        0x1d00_ffff,
+        [5; 32],
+        4,
+        128,
+    );
+    let forged_replay = encode_canonical_block_replay(
+        &forged.facts,
+        CanonicalBlockReplayFormatVersion::V1,
+        CanonicalBlockFactsDigestVersion::V1,
+    );
+    let replay_family = store
+        .bounded_open
+        .db
+        .cf_handle(super::block_replay::BLOCK_REPLAY_COLUMN_FAMILY)
+        .ok_or("replay family absent")?;
+    store.bounded_open.db.put_cf(
+        &replay_family,
+        zinder_core::wire::encode_height_key_ascending(BlockHeight::new(3)),
+        forged_replay.as_bytes(),
+    )?;
+    drop(replay_family);
+
+    let fence = store.event_fence();
+    let error = store
+        .commit_live_append(
+            CanonicalLiveAppend::new(
+                fence,
+                replacement_block(BlockHeight::new(5), [5; 32], [4; 32], 105)?,
+                Vec::new(),
+                BlockId::new(BlockHeight::new(3), BlockHash::from_bytes([3; 32])),
+                UnixTimestampMillis::new(1_750_000_000_002),
+            ),
+            &activations,
+        )
+        .err()
+        .ok_or("settling a row changed outside a transition must fail")?;
+    assert!(
+        error.to_string().contains("settled checkpoint") || error.to_string().contains("replay"),
+        "{error}"
+    );
     Ok(())
 }
 

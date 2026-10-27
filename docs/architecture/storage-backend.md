@@ -96,6 +96,17 @@ explicit and validated. A secondary:
 - does not treat an open database as evidence of exact-fence agreement; and
 - cannot be shared by two processes or two reader generations.
 
+Every READY publication must be explained by the persisted replay rows from the
+settled checkpoint through the visible tip. Opening a canonical primary or
+secondary derives that whole unsettled suffix once. Afterwards the writer
+authenticates only the rows each of its transitions wrote, and a secondary only
+the rows the chain events since its last catch-up changed; a catch-up whose
+READY evidence is unchanged reads no replay rows. Both re-derive the whole
+suffix once their incrementally authenticated rows reach one reorg window, and
+a secondary also does so when the intervening events are no longer retained or
+its incremental check fails. Per-transition cost therefore follows the rows a
+transition changes rather than the reorg window.
+
 `zinder-compat-lightwalletd` alternates secondary generations so it can catch up
 and validate a replacement pair before publishing it. In-flight requests keep
 their existing immutable pair.

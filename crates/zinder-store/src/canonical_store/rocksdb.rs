@@ -36,6 +36,7 @@ use super::{
         MempoolEventRetentionProgress, validate_mempool_lifecycle_admission,
     },
     publication::validate_ready_publication,
+    replay_tail::AuthenticatedReplayTail,
 };
 
 /// Cold-admitted identity and READY evidence for an owner-created canonical checkpoint.
@@ -205,15 +206,23 @@ pub struct RocksDbCanonicalStore {
     pub(super) activation_schedule: Option<CanonicalActivationSchedule>,
     /// Writer-admitted window above the construction policy, if any.
     pub(super) revised_reorg_policy: Option<super::CanonicalReorgPolicy>,
+    /// Unsettled replay rows this handle has authenticated, extended by each
+    /// committed transition.
+    pub(super) replay_tail: AuthenticatedReplayTail,
 }
 
 impl RocksDbCanonicalStore {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "publication hands over every authenticated part of the READY store it just verified"
+    )]
     pub(super) fn from_published(
         bounded_open: BoundedRocksDbOpen,
         workload: CanonicalStoreWorkload,
         build_plan: super::CanonicalStoreBuildPlan,
         cursor_auth_key: [u8; 32],
         ready_evidence: &CanonicalStoreReadyEvidence,
+        replay_tail: AuthenticatedReplayTail,
     ) -> Self {
         Self {
             bounded_open,
@@ -225,6 +234,7 @@ impl RocksDbCanonicalStore {
             mempool_retention_progress: Mutex::new(None),
             activation_schedule: None,
             revised_reorg_policy: None,
+            replay_tail,
         }
     }
 
@@ -602,7 +612,7 @@ impl RocksDbCanonicalStore {
             read_admitted_schedule(&bounded_open.db, &store_path, &opened_control)?;
         let reorg_policy = opened_control.effective_reorg_policy();
         let build_plan = opened_control.build_plan;
-        validate_ready_publication(
+        let replay_tail = validate_ready_publication(
             &bounded_open.db,
             &build_plan,
             reorg_policy,
@@ -618,6 +628,7 @@ impl RocksDbCanonicalStore {
             mempool_retention_progress: Mutex::new(None),
             activation_schedule,
             revised_reorg_policy: opened_control.revised_reorg_policy,
+            replay_tail,
         })
     }
 
