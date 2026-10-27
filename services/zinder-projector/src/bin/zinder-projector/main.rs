@@ -280,7 +280,8 @@ async fn run_owned_projector(
             config.network,
             config.wallet_rocksdb_budget,
         ) {
-            Ok(wallet) => {
+            Ok(mut wallet) => {
+                raise_wallet_reorg_depth(&mut wallet, canonical.reorg_policy())?;
                 let wallet_source =
                     WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
                 match admit_resumed_following(
@@ -1125,6 +1126,28 @@ fn set_following_syncing(
         Some(wallet_height),
         Some(target_height),
     ));
+}
+
+/// Binds a resumed wallet's undo depth to the canonical effective window,
+/// which canonical admission already matched against this projector's
+/// configured window.
+fn raise_wallet_reorg_depth(
+    wallet: &mut RocksDbWalletFollowingStore,
+    canonical_reorg_policy: CanonicalReorgPolicy,
+) -> Result<(), ProjectorError> {
+    let previous_depth = wallet.supported_reorg_depth();
+    let reorg_window_blocks = canonical_reorg_policy.reorg_window_blocks();
+    wallet.raise_supported_reorg_depth(reorg_window_blocks)?;
+    if previous_depth != reorg_window_blocks {
+        tracing::info!(
+            target: "zinder::projector",
+            event = "wallet_projection_reorg_depth_raised",
+            previous_supported_reorg_depth = previous_depth,
+            supported_reorg_depth = reorg_window_blocks,
+            "raised the wallet's supported reorg depth to the canonical window; retained undo rows grow with new blocks"
+        );
+    }
+    Ok(())
 }
 
 /// Executes one next retained-event transition.
