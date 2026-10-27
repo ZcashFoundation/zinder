@@ -16,7 +16,7 @@ use super::{
         validate_live_block,
     },
     block_replay::{BLOCK_REPLAY_COLUMN_FAMILY, resume_persisted_sequence_checkpoint},
-    control::encode_ready_store_control_with_schedule,
+    control::encode_ready_store_control_with_revisions,
     publication::{
         column_family, encode_live_append_event, encode_live_chain_epoch, read_chain_epoch_tips,
         validate_live_append_publication, validate_ready_sequence_checkpoint, validate_settled_tip,
@@ -192,12 +192,13 @@ impl RocksDbCanonicalStore {
                 },
             )?;
         abort_at_live_commit_failpoint("after_atomic_write");
-        validate_live_commit_readback(&self.bounded_open.db, &self.build_plan, &prepared).map_err(
-            |source| CanonicalStoreError::LiveCommitCompletedButUnverified {
-                path: self.bounded_open.db.path().to_path_buf(),
-                reason: source.to_string(),
-            },
-        )?;
+        validate_live_commit_readback(&self.bounded_open.db, self.reorg_policy(), &prepared)
+            .map_err(
+                |source| CanonicalStoreError::LiveCommitCompletedButUnverified {
+                    path: self.bounded_open.db.path().to_path_buf(),
+                    reason: source.to_string(),
+                },
+            )?;
         self.ready_evidence = prepared.ready_evidence;
         Ok((self, prepared.outcome))
     }
@@ -296,12 +297,12 @@ impl PreparedLiveAppendCommit {
             sequence_checkpoint,
             ..store.ready_evidence
         };
-        let encoded_control = encode_ready_store_control_with_schedule(
+        let encoded_control = encode_ready_store_control_with_revisions(
             store.workload,
             &store.build_plan,
             store.cursor_auth_key,
             &ready_evidence,
-            store.activation_schedule_binding(),
+            store.control_revisions(),
         )
         .map_err(|source| CanonicalStoreError::live_commit(source.to_string()))?;
         Ok(Self {
@@ -880,7 +881,7 @@ impl PreparedLiveRow {
 
 fn validate_live_commit_readback(
     db: &DB,
-    build_plan: &super::CanonicalStoreBuildPlan,
+    reorg_policy: super::CanonicalReorgPolicy,
     prepared: &PreparedLiveAppendCommit,
 ) -> Result<(), CanonicalStoreError> {
     prepared.block_rows.validate_readback(db)?;
@@ -917,7 +918,7 @@ fn validate_live_commit_readback(
         ));
     }
     validate_live_append_publication(db, &prepared.ready_evidence, prepared.previous_epoch_id)?;
-    validate_ready_sequence_checkpoint(db, build_plan, &prepared.ready_evidence)
+    validate_ready_sequence_checkpoint(db, reorg_policy, &prepared.ready_evidence)
 }
 
 #[cfg(test)]

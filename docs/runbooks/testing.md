@@ -737,9 +737,10 @@ cargo mutants --workspace --all-features \
   --file crates/zinder-store/src/chain_store/validation.rs \
   --file crates/zinder-store/src/canonical_store/rocksdb.rs \
   --file crates/zinder-store/src/canonical_store/activation_schedule.rs \
+  --file crates/zinder-store/src/canonical_store/control.rs \
   --file crates/zinder-core/src/network_upgrade_activations.rs \
   --file crates/zinder-source/src/source_block.rs \
-  --re 'chain_event_history|settled_tip_only_commit_without_artifacts|validate_reorg_window_change|from_raw_block_bytes|matching_fingerprint_prefix_len|preserves_through|next_activation_schedule|validate_activation_expectation|read_bound'
+  --re 'chain_event_history|settled_tip_only_commit_without_artifacts|validate_reorg_window_change|from_raw_block_bytes|matching_fingerprint_prefix_len|preserves_through|next_activation_schedule|validate_activation_expectation|read_bound|validate_open_store_control|raise_reorg_policy|decode_reorg_policy_trailer'
 ```
 
 These are slow (mutants often >30 min). Scheduled CI runs them weekly; locally,

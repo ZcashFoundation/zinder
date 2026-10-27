@@ -90,8 +90,12 @@ pub const TREE_STATE_CHECKPOINT_STRIDE: u32 = 100;
 const REQUIRED_CANONICAL_NETWORK_UPGRADES: [&str; 5] =
     ["Overwinter", "Sapling", "Blossom", "Heartwood", "Canopy"];
 
-/// Immutable replacement-depth identity for one canonical store.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Maximum canonical replacement depth for one canonical store.
+///
+/// The construction policy is immutable store identity. The canonical writer
+/// may later admit a larger window in place; it never lowers one. Ordering
+/// compares window depths.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CanonicalReorgPolicy {
     reorg_window_blocks: NonZeroU32,
 }
@@ -287,6 +291,16 @@ pub enum CanonicalStoreBuildPlanError {
     /// Canonical replacement must retain at least one displaced block.
     #[error("canonical build reorg window must be greater than zero")]
     ZeroReorgWindowBlocks,
+    /// A persisted reorg-policy revision must raise the construction window.
+    #[error(
+        "reorg policy revision {revised_window_blocks} does not raise the construction window {construction_window_blocks}"
+    )]
+    ReorgPolicyRevisionNotRaised {
+        /// Immutable construction window.
+        construction_window_blocks: u32,
+        /// Rejected revised window.
+        revised_window_blocks: u32,
+    },
     /// The node activation table cannot interpret the universal v3-v4 history baseline.
     #[error("canonical build activation table is missing required network upgrade {name}")]
     MissingRequiredNetworkUpgrade {

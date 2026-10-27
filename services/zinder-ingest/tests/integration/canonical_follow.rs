@@ -649,6 +649,211 @@ async fn canonical_follower_refuses_a_fork_below_settlement_without_mutation()
     Ok(())
 }
 
+/// With a three-block window over tip 4 and settled tip 1, forks two and
+/// three blocks deep are replaced and a four-block fork parks the writer.
+#[tokio::test]
+async fn canonical_follower_replaces_through_its_window_and_refuses_one_block_deeper()
+-> Result<(), Box<dyn std::error::Error>> {
+    const WINDOW: u32 = 3;
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let original = parseable_multi_block_chain()?;
+    for depth in [WINDOW - 1, WINDOW, WINDOW + 1] {
+        let source = RecordingParseableSource::new(
+            original.clone(),
+            checkpoints_for_parseable_chain(&original, &activations)?,
+            BlockHeight::new(4),
+        );
+        let temporary = tempdir()?;
+        let store = publish_parseable_store(
+            &source,
+            &original,
+            Arc::clone(&activations),
+            &temporary.path().join("canonical"),
+            WINDOW,
+            BlockHeight::new(1),
+        )
+        .await?;
+        let original_fence = store.event_fence();
+        let fork_height = 5 - depth;
+        let fork = forked_parseable_chain(
+            &original,
+            fork_height,
+            4,
+            70_u8.saturating_add(u8::try_from(depth)?),
+        )?;
+        source.replace_chain(
+            fork.clone(),
+            checkpoints_for_parseable_chain(&fork, &activations)?,
+            BlockHeight::new(4),
+        );
+        source.clear_calls();
+        let readiness = Readiness::default();
+        let cancel = CancellationToken::new();
+        source.cancel_after_tip_call(2, cancel.clone());
+        let outcome = follow_canonical_tip(
+            store,
+            single_pass_follower(&source, &activations, &readiness, &cancel),
+        )
+        .await;
+        if depth <= WINDOW {
+            let store = outcome?;
+            assert_eq!(store.event_fence().visible_tip(), block_id(&fork, 4)?);
+            assert_eq!(store.chain_epoch()?.settled_tip_height, BlockHeight::new(1));
+            assert_eq!(store.displaced_block_count()?, u64::from(depth));
+        } else {
+            let error = outcome
+                .err()
+                .ok_or("a fork deeper than the window must fail")?;
+            assert!(matches!(
+                error,
+                zinder_ingest::CanonicalFollowError::ReorgWindowExceeded(evidence)
+                    if evidence.required_depth == depth
+                        && evidence.configured_window_blocks == WINDOW
+                        && evidence.local_tip == original_fence.visible_tip()
+            ));
+            assert!(matches!(
+                readiness.report().cause,
+                ReadinessCause::ReorgWindowExceeded {
+                    depth: 4,
+                    configured: 3,
+                }
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A writer that reopens with a larger window holds its settled tip, so the
+/// replaceable suffix grows with new blocks and a fork deeper than the
+/// construction window is followed.
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one proof binds the in-place raise, the held settlement, and the deeper replacement"
+)]
+async fn canonical_follower_follows_a_deeper_fork_after_an_in_place_window_raise()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let original = parseable_multi_block_chain()?;
+    let source = RecordingParseableSource::new(
+        original.clone(),
+        checkpoints_for_parseable_chain(&original, &activations)?,
+        BlockHeight::new(4),
+    );
+    let temporary = tempdir()?;
+    let store_path = temporary.path().join("canonical");
+    drop(
+        publish_parseable_store(
+            &source,
+            &original,
+            Arc::clone(&activations),
+            &store_path,
+            2,
+            BlockHeight::new(2),
+        )
+        .await?,
+    );
+    let store = zinder_store::RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
+        &store_path,
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        zinder_store::RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(3)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(store.reorg_policy(), CanonicalReorgPolicy::new(3)?);
+    assert_eq!(
+        store.build_plan().reorg_policy(),
+        CanonicalReorgPolicy::new(2)?
+    );
+
+    let extended = forked_parseable_chain(&original, 5, 5, 0)?;
+    source.replace_chain(
+        extended.clone(),
+        checkpoints_for_parseable_chain(&extended, &activations)?,
+        BlockHeight::new(5),
+    );
+    let readiness = Readiness::default();
+    let cancel = CancellationToken::new();
+    let follower = CanonicalFollower::new(
+        &source,
+        Arc::clone(&activations),
+        CanonicalFollowConfig {
+            request_timeout: Duration::from_secs(5),
+            poll_interval: Duration::ZERO,
+            lag_threshold_blocks: 0,
+            target_height: Some(BlockHeight::new(5)),
+            event_retention_window: None,
+            event_retention_check_interval: Duration::from_secs(1),
+            mempool_ready_gate: None,
+        },
+        &readiness,
+        &cancel,
+    );
+    let store = follow_canonical_tip(store, follower).await?;
+    assert_eq!(store.event_fence().visible_tip(), block_id(&extended, 5)?);
+    // Under the construction window the settled tip would advance to 3.
+    assert_eq!(store.chain_epoch()?.settled_tip_height, BlockHeight::new(2));
+
+    let fork = forked_parseable_chain(&extended, 3, 5, 83)?;
+    source.replace_chain(
+        fork.clone(),
+        checkpoints_for_parseable_chain(&fork, &activations)?,
+        BlockHeight::new(5),
+    );
+    source.clear_calls();
+    let cancel = CancellationToken::new();
+    source.cancel_after_tip_call(2, cancel.clone());
+    let store = follow_canonical_tip(
+        store,
+        single_pass_follower(&source, &activations, &readiness, &cancel),
+    )
+    .await?;
+    assert_eq!(store.event_fence().visible_tip(), block_id(&fork, 5)?);
+    assert_eq!(store.chain_epoch()?.settled_tip_height, BlockHeight::new(2));
+    assert_eq!(store.displaced_block_count()?, 3);
+    drop(store);
+
+    let error = zinder_store::RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
+        &store_path,
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        zinder_store::RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(2)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )
+    .err()
+    .ok_or("lowering the raised window must be refused")?;
+    assert!(
+        error.to_string().contains("never lowered in place"),
+        "{error}"
+    );
+    Ok(())
+}
+
+fn single_pass_follower<'a>(
+    source: &'a RecordingParseableSource,
+    activations: &Arc<NetworkUpgradeActivations>,
+    readiness: &'a Readiness,
+    cancel: &'a CancellationToken,
+) -> CanonicalFollower<'a, RecordingParseableSource> {
+    CanonicalFollower::new(
+        source,
+        Arc::clone(activations),
+        CanonicalFollowConfig {
+            request_timeout: Duration::from_secs(5),
+            poll_interval: Duration::ZERO,
+            lag_threshold_blocks: 0,
+            target_height: None,
+            event_retention_window: None,
+            event_retention_check_interval: Duration::from_secs(1),
+            mempool_ready_gate: None,
+        },
+        readiness,
+        cancel,
+    )
+}
+
 #[tokio::test]
 #[expect(
     clippy::too_many_lines,
@@ -846,7 +1051,7 @@ fn forked_parseable_chain(
         .range(..BlockHeight::new(fork_height))
         .map(|(height, block)| (*height, block.clone()))
         .collect::<BTreeMap<_, _>>();
-    let mut parent_hash = if fork_height == 0 {
+    let mut parent_hash = if fork_height <= 1 {
         Network::ZcashRegtest.genesis_hash()
     } else {
         block_id(original, fork_height.saturating_sub(1))?.hash

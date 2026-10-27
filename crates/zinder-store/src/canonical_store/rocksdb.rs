@@ -25,8 +25,8 @@ use super::{
         validate_ready_construction_manifest,
     },
     control::{
-        ActivationScheduleBinding, DecodedStoreControl, decode_store_control,
-        encode_building_store_control, encode_ready_store_control_with_schedule,
+        ActivationScheduleBinding, ControlRevisions, DecodedStoreControl, decode_store_control,
+        encode_building_store_control, encode_ready_store_control_with_revisions,
     },
     event_lifecycle::{
         PROJECTION_BUILD_LEASE_GENERATION_KEY, RETENTION_FLOOR_KEY, is_projection_build_lease_key,
@@ -56,6 +56,9 @@ pub struct CanonicalOwnerCheckpointEvidence {
     pub ready_evidence: CanonicalStoreReadyEvidence,
     /// Writer-admitted schedule read from this physical checkpoint, if any.
     pub activation_schedule: Option<CanonicalActivationSchedule>,
+    /// Effective replacement depth read from this physical checkpoint: the
+    /// construction policy or a writer-admitted raise.
+    pub reorg_policy: super::CanonicalReorgPolicy,
 }
 
 /// Immutable context captured by the canonical owner when it creates a
@@ -71,6 +74,7 @@ pub struct CanonicalOwnerCheckpointAdmission {
     build_plan: super::CanonicalStoreBuildPlan,
     database_identity: Vec<u8>,
     activation_schedule: Option<CanonicalActivationSchedule>,
+    reorg_policy: super::CanonicalReorgPolicy,
 }
 
 pub(super) const STORE_CONTROL_KEY: &[u8] = b"store_control";
@@ -116,7 +120,18 @@ pub(super) struct CanonicalStoreAdmissionExpectation {
     allow_schedule_update: bool,
     workload: CanonicalStoreWorkload,
     raw_blob_retention: RawBlobRetention,
-    reorg_policy: super::CanonicalReorgPolicy,
+    reorg_policy: ReorgPolicyAdmission,
+}
+
+/// How admission compares a caller's window with the persisted effective one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReorgPolicyAdmission {
+    /// Readers, readback, and checkpoint admission require the exact
+    /// effective window.
+    Exact(super::CanonicalReorgPolicy),
+    /// The canonical writer admits an effective window at or below its own,
+    /// then records any raise. It never lowers one.
+    RaiseTo(super::CanonicalReorgPolicy),
 }
 
 impl CanonicalStoreAdmissionExpectation {
@@ -134,13 +149,16 @@ impl CanonicalStoreAdmissionExpectation {
             allow_schedule_update: false,
             workload,
             raw_blob_retention,
-            reorg_policy,
+            reorg_policy: ReorgPolicyAdmission::Exact(reorg_policy),
         }
     }
 
+    /// Expects the persisted construction identity with an exact effective
+    /// window, which equals the construction window until a writer raise.
     pub(super) fn from_build_plan(
         build_plan: &super::CanonicalStoreBuildPlan,
         workload: CanonicalStoreWorkload,
+        effective_reorg_policy: super::CanonicalReorgPolicy,
     ) -> Self {
         Self {
             network: build_plan.network(),
@@ -149,12 +167,19 @@ impl CanonicalStoreAdmissionExpectation {
             allow_schedule_update: false,
             workload,
             raw_blob_retention: build_plan.raw_blob_retention(),
-            reorg_policy: build_plan.reorg_policy(),
+            reorg_policy: ReorgPolicyAdmission::Exact(effective_reorg_policy),
         }
     }
 
     pub(super) fn allowing_schedule_update(mut self) -> Self {
         self.allow_schedule_update = true;
+        self
+    }
+
+    const fn allowing_reorg_policy_raise(mut self) -> Self {
+        if let ReorgPolicyAdmission::Exact(reorg_policy) = self.reorg_policy {
+            self.reorg_policy = ReorgPolicyAdmission::RaiseTo(reorg_policy);
+        }
         self
     }
 }
@@ -178,6 +203,8 @@ pub struct RocksDbCanonicalStore {
     /// Resumable process-local state for bounded mempool retention steps.
     pub(super) mempool_retention_progress: Mutex<Option<MempoolEventRetentionProgress>>,
     pub(super) activation_schedule: Option<CanonicalActivationSchedule>,
+    /// Writer-admitted window above the construction policy, if any.
+    pub(super) revised_reorg_policy: Option<super::CanonicalReorgPolicy>,
 }
 
 impl RocksDbCanonicalStore {
@@ -197,6 +224,7 @@ impl RocksDbCanonicalStore {
             lifecycle_lock: Arc::new(Mutex::new(())),
             mempool_retention_progress: Mutex::new(None),
             activation_schedule: None,
+            revised_reorg_policy: None,
         }
     }
 
@@ -229,8 +257,13 @@ impl RocksDbCanonicalStore {
         Self::open_ready_with_expectation(path, &expectation, resource_budget)
     }
 
-    /// Opens the primary and admits the node's current schedule as a
-    /// writer-owned future-only revision.
+    /// Opens the primary as the canonical writer, admits the node's current
+    /// schedule as a writer-owned future-only revision, and raises the
+    /// effective reorg window to `reorg_policy` when it is larger.
+    ///
+    /// A raise is a monotonic store revision: the settled tip does not move,
+    /// so the replaceable suffix grows to the new window as blocks arrive.
+    /// A smaller window than the persisted effective one is refused.
     #[allow(
         clippy::too_many_arguments,
         reason = "writer admission preserves the existing explicit immutable-store options"
@@ -240,20 +273,98 @@ impl RocksDbCanonicalStore {
         observed_activations: &NetworkUpgradeActivations,
         expected_workload: CanonicalStoreWorkload,
         expected_raw_blob_retention: RawBlobRetention,
-        expected_reorg_policy: super::CanonicalReorgPolicy,
+        reorg_policy: super::CanonicalReorgPolicy,
         resource_budget: RocksDbResourceBudget,
     ) -> Result<Self, CanonicalStoreError> {
         let expectation = CanonicalStoreAdmissionExpectation::from_activations(
             observed_activations,
             expected_workload,
             expected_raw_blob_retention,
-            expected_reorg_policy,
+            reorg_policy,
         )
-        .allowing_schedule_update();
+        .allowing_schedule_update()
+        .allowing_reorg_policy_raise();
         let mut store =
             Self::open_ready_with_expectation(path.as_ref(), &expectation, resource_budget)?;
         store.admit_network_upgrade_schedule(observed_activations)?;
+        store.raise_reorg_policy(reorg_policy)?;
         Ok(store)
+    }
+
+    /// Durably records `reorg_policy` as the effective window when it raises
+    /// the current one. Equal windows are a no-op and smaller ones are refused.
+    fn raise_reorg_policy(
+        &mut self,
+        reorg_policy: super::CanonicalReorgPolicy,
+    ) -> Result<(), CanonicalStoreError> {
+        let current = self.reorg_policy();
+        if reorg_policy == current {
+            return Ok(());
+        }
+        if reorg_policy < current {
+            return Err(reorg_policy_lowering_refused(
+                self.bounded_open.db.path(),
+                current,
+                reorg_policy,
+            ));
+        }
+        let revisions = ControlRevisions {
+            revised_reorg_policy: Some(reorg_policy),
+            ..self.control_revisions()
+        };
+        let encoded_control = encode_ready_store_control_with_revisions(
+            self.workload,
+            &self.build_plan,
+            self.cursor_auth_key,
+            &self.ready_evidence,
+            revisions,
+        )
+        .map_err(|source| {
+            CanonicalStoreError::admission(self.bounded_open.db.path(), source.to_string())
+        })?;
+        let mut options = WriteOptions::default();
+        options.disable_wal(false);
+        options.set_sync(true);
+        self.bounded_open
+            .db
+            .put_opt(STORE_CONTROL_KEY, encoded_control, &options)
+            .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                operation: "reorg policy revision",
+                source,
+            })?;
+        let decoded = validate_open_store_control(
+            &self.bounded_open.db,
+            self.bounded_open.db.path(),
+            &CanonicalStoreAdmissionExpectation::from_build_plan(
+                &self.build_plan,
+                self.workload,
+                reorg_policy,
+            ),
+        )?;
+        if decoded.revisions() != revisions {
+            return Err(CanonicalStoreError::admission(
+                self.bounded_open.db.path(),
+                "reorg policy revision readback differs from the admitted revision",
+            ));
+        }
+        tracing::info!(
+            target: "zinder::store",
+            event = "canonical_reorg_policy_raised",
+            previous_reorg_window_blocks = current.reorg_window_blocks(),
+            reorg_window_blocks = reorg_policy.reorg_window_blocks(),
+            settled_tip_height = self.ready_evidence.sequence_checkpoint.through().height.value(),
+            "raised the canonical reorg window; the settled tip holds until the visible tip is that deep"
+        );
+        self.revised_reorg_policy = Some(reorg_policy);
+        Ok(())
+    }
+
+    /// Returns every writer-admitted revision bound to store control.
+    pub(super) fn control_revisions(&self) -> ControlRevisions {
+        ControlRevisions {
+            activation_schedule_binding: self.activation_schedule_binding(),
+            revised_reorg_policy: self.revised_reorg_policy,
+        }
     }
 
     /// Returns the schedule revision admitted by the canonical writer, or
@@ -362,12 +473,15 @@ impl RocksDbCanonicalStore {
         schedule: &CanonicalActivationSchedule,
     ) -> Result<(), CanonicalStoreError> {
         let binding = schedule.binding();
-        let encoded_control = encode_ready_store_control_with_schedule(
+        let encoded_control = encode_ready_store_control_with_revisions(
             self.workload,
             &self.build_plan,
             self.cursor_auth_key,
             &self.ready_evidence,
-            Some(binding),
+            ControlRevisions {
+                activation_schedule_binding: Some(binding),
+                ..self.control_revisions()
+            },
         )
         .map_err(|source| {
             CanonicalStoreError::admission(self.bounded_open.db.path(), source.to_string())
@@ -392,7 +506,11 @@ impl RocksDbCanonicalStore {
         let decoded = validate_open_store_control(
             &self.bounded_open.db,
             self.bounded_open.db.path(),
-            &CanonicalStoreAdmissionExpectation::from_build_plan(&self.build_plan, self.workload),
+            &CanonicalStoreAdmissionExpectation::from_build_plan(
+                &self.build_plan,
+                self.workload,
+                self.reorg_policy(),
+            ),
         )?;
         let stored_schedule = decoded
             .activation_schedule_binding
@@ -480,21 +598,16 @@ impl RocksDbCanonicalStore {
                 "ready evidence changed during admission",
             ));
         }
+        let activation_schedule =
+            read_admitted_schedule(&bounded_open.db, &store_path, &opened_control)?;
+        let reorg_policy = opened_control.effective_reorg_policy();
         let build_plan = opened_control.build_plan;
-        let activation_schedule = opened_control
-            .activation_schedule_binding
-            .map(|binding| {
-                CanonicalActivationSchedule::read_bound(
-                    &bounded_open.db,
-                    &store_path,
-                    binding,
-                    build_plan
-                        .network_upgrade_activations_fingerprint()
-                        .as_bytes(),
-                )
-            })
-            .transpose()?;
-        validate_ready_publication(&bounded_open.db, &build_plan, &opened_ready_evidence)?;
+        validate_ready_publication(
+            &bounded_open.db,
+            &build_plan,
+            reorg_policy,
+            &opened_ready_evidence,
+        )?;
         Ok(Self {
             bounded_open,
             workload: expectation.workload,
@@ -504,6 +617,7 @@ impl RocksDbCanonicalStore {
             lifecycle_lock: Arc::new(Mutex::new(())),
             mempool_retention_progress: Mutex::new(None),
             activation_schedule,
+            revised_reorg_policy: opened_control.revised_reorg_policy,
         })
     }
 
@@ -578,6 +692,7 @@ impl RocksDbCanonicalStore {
             build_plan: self.build_plan.clone(),
             database_identity,
             activation_schedule: self.activation_schedule.clone(),
+            reorg_policy: self.reorg_policy(),
         })
     }
 
@@ -596,6 +711,7 @@ impl RocksDbCanonicalStore {
         let expectation = CanonicalStoreAdmissionExpectation::from_build_plan(
             &admission.build_plan,
             admission.workload,
+            admission.reorg_policy,
         );
         let cold_checkpoint =
             Self::open_ready_with_expectation(target, &expectation, admission_resource_budget)?;
@@ -627,6 +743,7 @@ impl RocksDbCanonicalStore {
             workload: cold_checkpoint.workload,
             build_plan: cold_checkpoint.build_plan.clone(),
             ready_evidence: cold_checkpoint.ready_evidence,
+            reorg_policy: cold_checkpoint.reorg_policy(),
             activation_schedule: cold_checkpoint.activation_schedule,
         })
     }
@@ -688,10 +805,12 @@ impl RocksDbCanonicalStore {
         self.build_plan.raw_blob_retention()
     }
 
-    /// Returns the immutable maximum supported canonical replacement depth.
+    /// Returns the effective maximum canonical replacement depth: the
+    /// construction policy, or the larger window a canonical writer admitted.
     #[must_use]
-    pub const fn reorg_policy(&self) -> super::CanonicalReorgPolicy {
-        self.build_plan.reorg_policy()
+    pub fn reorg_policy(&self) -> super::CanonicalReorgPolicy {
+        self.revised_reorg_policy
+            .unwrap_or_else(|| self.build_plan.reorg_policy())
     }
 
     /// Returns the durable boundary of intentionally retained history.
@@ -1000,17 +1119,64 @@ pub(super) fn validate_open_store_control(
             ),
         ));
     }
-    if persisted.build_plan.reorg_policy() != expectation.reorg_policy {
-        return Err(CanonicalStoreError::admission(
-            path,
-            format!(
-                "persisted reorg window {} does not equal requested reorg window {}",
-                persisted.build_plan.reorg_policy().reorg_window_blocks(),
-                expectation.reorg_policy.reorg_window_blocks()
-            ),
-        ));
+    let persisted_reorg_policy = persisted.effective_reorg_policy();
+    match expectation.reorg_policy {
+        ReorgPolicyAdmission::Exact(requested) if requested != persisted_reorg_policy => {
+            return Err(CanonicalStoreError::admission(
+                path,
+                format!(
+                    "persisted reorg window {} does not equal requested reorg window {}; configure the store's window, or restart the canonical writer with the larger window so it raises the store",
+                    persisted_reorg_policy.reorg_window_blocks(),
+                    requested.reorg_window_blocks()
+                ),
+            ));
+        }
+        ReorgPolicyAdmission::RaiseTo(requested) if requested < persisted_reorg_policy => {
+            return Err(reorg_policy_lowering_refused(
+                path,
+                persisted_reorg_policy,
+                requested,
+            ));
+        }
+        ReorgPolicyAdmission::Exact(_) | ReorgPolicyAdmission::RaiseTo(_) => {}
     }
     Ok(persisted)
+}
+
+fn read_admitted_schedule(
+    db: &DB,
+    path: &Path,
+    control: &DecodedStoreControl,
+) -> Result<Option<CanonicalActivationSchedule>, CanonicalStoreError> {
+    control
+        .activation_schedule_binding
+        .map(|binding| {
+            CanonicalActivationSchedule::read_bound(
+                db,
+                path,
+                binding,
+                control
+                    .build_plan
+                    .network_upgrade_activations_fingerprint()
+                    .as_bytes(),
+            )
+        })
+        .transpose()
+}
+
+fn reorg_policy_lowering_refused(
+    path: &Path,
+    persisted: super::CanonicalReorgPolicy,
+    requested: super::CanonicalReorgPolicy,
+) -> CanonicalStoreError {
+    CanonicalStoreError::admission(
+        path,
+        format!(
+            "requested reorg window {} is below the store's effective window {}; a window is never lowered in place, so rebuild the canonical store to lower it",
+            requested.reorg_window_blocks(),
+            persisted.reorg_window_blocks()
+        ),
+    )
 }
 
 /// Checks the caller's activation expectation against persisted identity.

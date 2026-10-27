@@ -74,6 +74,7 @@ pub struct RocksDbCanonicalSecondary {
     pub(super) ready_evidence: CanonicalStoreReadyEvidence,
     pub(super) cursor_auth_key: [u8; 32],
     pub(super) activation_schedule: Option<CanonicalActivationSchedule>,
+    reorg_policy: super::CanonicalReorgPolicy,
 }
 
 impl RocksDbCanonicalSecondary {
@@ -167,9 +168,11 @@ impl RocksDbCanonicalSecondary {
             opened_control.workload,
             &opened_control.build_plan,
         )?;
+        let reorg_policy = opened_control.effective_reorg_policy();
         validate_ready_publication(
             &bounded_open.db,
             &opened_control.build_plan,
+            reorg_policy,
             &ready_evidence,
         )?;
         let activation_schedule = opened_control
@@ -192,16 +195,19 @@ impl RocksDbCanonicalSecondary {
             // The reader's node table is checked only at open. Catch-ups
             // authenticate the schedule journal and follow each revision the
             // writer admits, so a long-running reader never pins its startup
-            // observation.
+            // observation. The reorg window stays exact: a writer raise
+            // after open fails catch-up until the reader restarts with it.
             expectation: CanonicalStoreAdmissionExpectation::from_build_plan(
                 &opened_control.build_plan,
                 expected_workload,
+                reorg_policy,
             ),
             workload: expected_workload,
             build_plan: opened_control.build_plan,
             ready_evidence,
             cursor_auth_key: opened_control.cursor_auth_key,
             activation_schedule,
+            reorg_policy,
         })
     }
 
@@ -267,7 +273,7 @@ impl RocksDbCanonicalSecondary {
         }
         validate_ready_sequence_checkpoint(
             &self.bounded_open.db,
-            &self.build_plan,
+            self.reorg_policy,
             &ready_evidence,
         )?;
         self.ready_evidence = ready_evidence;
@@ -308,6 +314,13 @@ impl RocksDbCanonicalSecondary {
     #[must_use]
     pub const fn workload(&self) -> CanonicalStoreWorkload {
         self.workload
+    }
+
+    /// Returns the effective maximum canonical replacement depth admitted at
+    /// open: the construction policy or a writer-admitted raise.
+    #[must_use]
+    pub const fn reorg_policy(&self) -> super::CanonicalReorgPolicy {
+        self.reorg_policy
     }
 
     /// Returns the immutable raw-blob retention authenticated at admission.
