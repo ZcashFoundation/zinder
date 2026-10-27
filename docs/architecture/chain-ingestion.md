@@ -28,7 +28,7 @@ control record. An incompatible non-empty path fails without mutation.
 The writer then admits the node's activation table. A table that adds or
 changes only activations above the visible tip is journaled as the next
 schedule revision; a change at or below the tip fails without mutation. See
-[ADR-0008](../adrs/0008-network-parameter-discovery.md#schedule-admission).
+[ADR-0039](../adrs/0039-writer-admitted-network-upgrade-schedules.md).
 
 ## Fresh construction
 
