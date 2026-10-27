@@ -28,7 +28,9 @@ use zinder_proto::v1::ingest::{
     CanonicalWriterStatusRequest, CanonicalWriterStatusResponse,
     canonical_control_client::CanonicalControlClient,
 };
-use zinder_proto::wire::encode_canonical_network_upgrade_schedule;
+use zinder_proto::wire::{
+    decode_canonical_network_upgrade_schedule, encode_canonical_network_upgrade_schedule,
+};
 use zinder_runtime::{
     AuthenticatedChannel, BearerToken, BearerTokenConnectError, NodeUnavailableDetail, Readiness,
     ReadinessCause, ReadinessState, UpstreamHealth, UpstreamNotReadyDetail, connect_zinder_grpc,
@@ -464,8 +466,9 @@ pub enum WalletServingPairError {
     /// The private canonical-control RPC failed.
     #[error("canonical writer-status RPC failed: {0}")]
     WriterStatusRpc(tonic::Status),
-    /// Writer status did not contain an exact, usable canonical fence.
-    #[error("canonical writer-status response did not contain a valid fence")]
+    /// Writer status did not contain an exact, usable canonical fence or
+    /// network-upgrade schedule.
+    #[error("canonical writer-status response did not contain a valid fence or schedule")]
     WriterStatusInvalid,
     /// Writer status disagreed with a same-epoch pair, indicating a fence or
     /// primary-path replacement inconsistency rather than normal lag.
@@ -537,6 +540,12 @@ pub struct WalletServingPairPublisher {
     attested_at: Instant,
     /// Writer lag observed at the last successful writer-status fetch.
     observed_lag_chain_epochs: u64,
+    /// Activation table each new canonical secondary generation opens with.
+    ///
+    /// It starts as the node's table and then follows the table the writer
+    /// reports, so a publisher started before a schedule admission keeps
+    /// opening generations after the chain crosses the admitted activation.
+    secondary_activations: Arc<NetworkUpgradeActivations>,
 }
 
 impl WalletServingPairPublisher {
@@ -575,6 +584,7 @@ impl WalletServingPairPublisher {
     ) -> Result<(Self, WalletServingPairSlot), WalletServingPairError> {
         let generations =
             std::array::from_fn(|generation| SecondaryGeneration::new(&config, generation));
+        let secondary_activations = Arc::clone(&config.network_upgrade_activations);
         let mut publisher = Self {
             config,
             writer_status,
@@ -585,6 +595,7 @@ impl WalletServingPairPublisher {
             retired_pair: None,
             attested_at: Instant::now(),
             observed_lag_chain_epochs: 0,
+            secondary_activations,
         };
         publisher.prepare_candidate(0).await?;
         publisher.converge_and_publish(0).await?;
@@ -654,6 +665,7 @@ impl WalletServingPairPublisher {
         if relation == ActiveWriterRelation::Exact {
             return Ok(());
         }
+        self.follow_writer_schedule(&writer_status)?;
 
         let generation = self.inactive_generation();
         if !self.prepare_candidate(generation).await? {
@@ -684,6 +696,26 @@ impl WalletServingPairPublisher {
             "status" => if teardown.is_ok() { "ok" } else { "error" }
         )
         .record(started_at.elapsed());
+    }
+
+    /// Adopts the writer-reported schedule for later secondary generations.
+    ///
+    /// Secondary admission compares the opening table with the admitted
+    /// schedule through the visible tip. The node table observed at startup
+    /// stops agreeing once the chain crosses an activation the writer admitted
+    /// afterwards, so later generations open with the writer's table instead.
+    fn follow_writer_schedule(
+        &mut self,
+        writer_status: &CanonicalWriterStatusResponse,
+    ) -> Result<(), WalletServingPairError> {
+        let Some(schedule) = writer_status.network_upgrade_schedule.clone() else {
+            return Ok(());
+        };
+        let (activations, _revision) =
+            decode_canonical_network_upgrade_schedule(schedule, self.config.network)
+                .map_err(|_| WalletServingPairError::WriterStatusInvalid)?;
+        self.secondary_activations = Arc::new(activations);
+        Ok(())
     }
 
     fn inactive_generation(&self) -> usize {
@@ -720,7 +752,7 @@ impl WalletServingPairPublisher {
         let wallet_primary_path = self.config.wallet_primary_path.clone();
         let wallet_generation_path = secondary_generation.wallet_generation_path.clone();
         let wallet_secondary_path = secondary_generation.wallet_secondary_path.clone();
-        let network_upgrade_activations = Arc::clone(&self.config.network_upgrade_activations);
+        let network_upgrade_activations = Arc::clone(&self.secondary_activations);
         let canonical_reorg_policy = self.config.canonical_reorg_policy;
         let expected_raw_blob_retention = self.config.expected_raw_blob_retention;
         let canonical_resource_budget = self.config.canonical_resource_budget;
@@ -2074,6 +2106,132 @@ mod tests {
 
         cancel.cancel();
         server_task.await??;
+        Ok(())
+    }
+
+    /// A publisher that started with the node's pre-upgrade table must keep
+    /// refreshing after ingest admits the upgrade and the chain crosses its
+    /// activation height.
+    #[tokio::test(flavor = "multi_thread")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the scenario keeps startup, writer admission, crossing the activation, and refresh in one causal sequence"
+    )]
+    async fn publisher_keeps_refreshing_after_the_chain_crosses_a_later_admitted_activation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let activations = lifecycle_upgrade_activations()?;
+        let canonical_primary_path = temporary.path().join("canonical-primary");
+        let wallet_primary_path = temporary.path().join("wallet-primary");
+        let mut canonical_primary =
+            build_lifecycle_canonical_primary(&canonical_primary_path, &activations)?;
+        let wallet_outcome = build_wallet_from_canonical(
+            &canonical_primary,
+            &wallet_primary_path,
+            RocksDbWalletBuildOptions {
+                supported_reorg_depth: 100,
+                ..RocksDbWalletBuildOptions::for_local_tests()
+            },
+        )?;
+        let initial_source = wallet_outcome.report.canonical_source_identity();
+        let mut wallet_primary = wallet_outcome.store;
+        // The writer's first start admits the unchanged node table as
+        // revision 1 before the query starts with that same table.
+        canonical_primary.admit_network_upgrade_schedule(&activations)?;
+        let control = MutableCanonicalControl::new(writer_status_for_store(&canonical_primary));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server_task = tokio::spawn({
+            let control = control.clone();
+            async move {
+                Server::builder()
+                    .add_service(CanonicalControlServer::new(control))
+                    .serve_with_incoming_shutdown(
+                        TcpListenerStream::new(listener),
+                        server_cancel.cancelled_owned(),
+                    )
+                    .await
+            }
+        });
+        let (mut publisher, slot) =
+            WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
+                wallet_serving_pair_config(
+                    canonical_primary_path.clone(),
+                    temporary.path().join("canonical-secondaries"),
+                    wallet_primary_path.clone(),
+                    temporary.path().join("wallet-secondaries"),
+                    Arc::new(activations.clone()),
+                )?,
+                WalletServingReadiness::without_node_source(zinder_runtime::Readiness::default()),
+                &endpoint,
+                None,
+            )
+            .await?;
+
+        // The node is upgraded and only the writer restarts: it admits the
+        // new table, which activates NU7 at the next block, as revision 2.
+        let mut entries = activations.activations().to_vec();
+        entries.push(NetworkUpgradeActivation {
+            branch_id: ConsensusBranchId::new(0x7719_0ad9),
+            activation_height: BlockHeight::new(2),
+            name: "NU7".to_owned(),
+        });
+        let upgraded = NetworkUpgradeActivations::new(Network::ZcashRegtest, entries)?;
+        canonical_primary.admit_network_upgrade_schedule(&upgraded)?;
+        let initial_fence = canonical_primary.event_fence();
+        let initial_settled_tip = initial_fence.visible_tip();
+        let (next_canonical_primary, crossing_fence) = canonical_primary.commit_live_append(
+            CanonicalLiveAppend::new(
+                initial_fence,
+                lifecycle_build_block(
+                    BlockHeight::new(2),
+                    BlockHash::from_bytes([0x22; 32]),
+                    initial_fence.visible_tip().hash,
+                ),
+                Vec::new(),
+                initial_settled_tip,
+                UnixTimestampMillis::new(1_750_000_000_001),
+            ),
+            &upgraded,
+        )?;
+        canonical_primary = next_canonical_primary;
+        let wallet_reconcile_secondary = RocksDbCanonicalSecondary::open_ready(
+            &canonical_primary_path,
+            temporary
+                .path()
+                .join("wallet-reconcile-canonical-secondary"),
+            &upgraded,
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(100)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let crossing_source = reconcile_wallet_primary(
+            &mut wallet_primary,
+            &wallet_reconcile_secondary,
+            initial_source,
+            crossing_fence,
+            initial_settled_tip,
+        )?;
+        drop(wallet_reconcile_secondary);
+        control.set_writer_status(writer_status_for_store(&canonical_primary));
+
+        publisher.refresh_once().await?;
+        let pair = slot.capture();
+        assert_eq!(pair.canonical_fence(), crossing_fence);
+        assert_eq!(pair.wallet_source(), crossing_source);
+        assert_eq!(
+            pair.canonical()
+                .network_upgrade_schedule()
+                .map(super::CanonicalActivationSchedule::activations),
+            Some(&upgraded)
+        );
+
+        cancel.cancel();
+        server_task.await??;
+        drop(wallet_primary);
         Ok(())
     }
 

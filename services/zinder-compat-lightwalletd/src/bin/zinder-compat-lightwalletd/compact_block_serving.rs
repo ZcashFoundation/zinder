@@ -23,6 +23,7 @@ use zinder_proto::{
         CanonicalWriterStatusRequest, CanonicalWriterStatusResponse,
         canonical_control_client::CanonicalControlClient,
     },
+    wire::decode_canonical_network_upgrade_schedule,
 };
 use zinder_query::{DEFAULT_MAX_COMPACT_BLOCK_RANGE, QueryError, status_from_query_error};
 use zinder_runtime::{
@@ -236,6 +237,10 @@ pub(crate) struct CompactBlockPublisher {
     active_generation: usize,
     retired: Option<Arc<RocksDbCanonicalSecondary>>,
     last_attested: tokio::time::Instant,
+    /// Activation table each new generation opens with: the node's table at
+    /// startup, then the table the writer reports, so generations keep
+    /// opening after the chain crosses an activation admitted later.
+    generation_activations: Arc<NetworkUpgradeActivations>,
 }
 
 impl CompactBlockPublisher {
@@ -248,7 +253,8 @@ impl CompactBlockPublisher {
         let mut writer_status = WriterStatus::connect(writer_status_endpoint, bearer_token)
             .await
             .map_err(|error| CompactBlockServingError::WriterStatus(error.message().to_owned()))?;
-        let candidate = open_generation(&config, 0).await?;
+        let generation_activations = Arc::clone(&config.activations);
+        let candidate = open_generation(&config, &generation_activations, 0).await?;
         let candidate = catch_up_generation(candidate).await?;
         let candidate = converge_candidate(&mut writer_status, &config, candidate)
             .await
@@ -266,6 +272,7 @@ impl CompactBlockPublisher {
             active_generation: 0,
             retired: None,
             last_attested: tokio::time::Instant::now(),
+            generation_activations,
         };
         Ok((publisher, slot))
     }
@@ -379,8 +386,26 @@ impl CompactBlockPublisher {
                 );
             }
         }
+        if let Some(schedule) = status.network_upgrade_schedule.clone() {
+            let Ok((activations, _revision)) =
+                decode_canonical_network_upgrade_schedule(schedule, self.config.network)
+            else {
+                self.record_failure(
+                    ReadinessCause::SchemaMismatch,
+                    active.event_fence().visible_tip().height.value(),
+                );
+                return;
+            };
+            self.generation_activations = Arc::new(activations);
+        }
         let candidate_generation = (self.active_generation + 1) % GENERATION_COUNT;
-        let Ok(candidate) = open_generation(&self.config, candidate_generation).await else {
+        let Ok(candidate) = open_generation(
+            &self.config,
+            &self.generation_activations,
+            candidate_generation,
+        )
+        .await
+        else {
             self.record_failure(
                 ReadinessCause::StorageUnavailable,
                 active.event_fence().visible_tip().height.value(),
@@ -492,11 +517,12 @@ fn transport_failure_cause(elapsed: Duration, ceiling: Duration) -> ReadinessCau
 
 async fn open_generation(
     config: &CompactBlockServingConfig,
+    activations: &Arc<NetworkUpgradeActivations>,
     generation: usize,
 ) -> Result<RocksDbCanonicalSecondary, CompactBlockServingError> {
     let primary = config.canonical_primary_path.clone();
     let secondary_root = config.canonical_secondary_root.clone();
-    let activations = Arc::clone(&config.activations);
+    let activations = Arc::clone(activations);
     let retention = config.raw_blob_retention;
     let reorg = config.reorg_policy;
     let budget = config.resource_budget;
@@ -1731,6 +1757,98 @@ mod tests {
         publisher_handle.await?;
         drop(replaced);
         drop(reused);
+        let _ = shutdown_sender.send(());
+        server.await??;
+        Ok(())
+    }
+
+    /// A publisher that started with the node's pre-upgrade table keeps
+    /// replacing generations after the writer admits an upgrade and the chain
+    /// crosses its activation height.
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "The scenario keeps startup, writer admission, crossing the activation, and refresh in one causal sequence."
+    )]
+    async fn publisher_keeps_refreshing_after_the_chain_crosses_a_later_admitted_activation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let activations = lifecycle_activations();
+        let (mut primary, blocks) =
+            lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
+        // The writer's first start admits the unchanged node table as
+        // revision 1 before the compatibility runtime starts with that table.
+        primary.admit_network_upgrade_schedule(&activations)?;
+        let control = MutableCanonicalControl::new(lifecycle_writer_status(&primary));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let server = tokio::spawn({
+            let control = control.clone();
+            async move {
+                Server::builder()
+                    .add_service(CanonicalControlServer::new(control))
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                        let _ = shutdown_receiver.await;
+                    })
+                    .await
+            }
+        });
+        let serving_readiness = CompactServingReadiness::new(Readiness::default());
+        serving_readiness.publish_node(ReadinessCause::Ready);
+        let config = CompactBlockServingConfig {
+            canonical_primary_path: temporary.path().join("canonical-primary"),
+            canonical_secondary_root: temporary.path().join("canonical-secondaries"),
+            network: Network::ZcashRegtest,
+            activations: Arc::new(activations.clone()),
+            raw_blob_retention: RawBlobRetention::Transactions,
+            reorg_policy: CanonicalReorgPolicy::new(100)?,
+            resource_budget: RocksDbResourceBudget::for_local_tests(),
+            catchup_interval: Duration::from_millis(1),
+            convergence_timeout: Duration::from_secs(2),
+            convergence_attempts: 4,
+            staleness_ceiling: Duration::from_mins(1),
+            lag_threshold: 4,
+        };
+        let (mut publisher, slot) =
+            CompactBlockPublisher::bootstrap(config, serving_readiness, &endpoint, None).await?;
+
+        // The node is upgraded and only the writer restarts: it admits the
+        // new table, which activates NU7 at the next block, as revision 2.
+        let mut entries = activations.activations().to_vec();
+        entries.push(NetworkUpgradeActivation {
+            branch_id: ConsensusBranchId::new(0x7719_0ad9),
+            activation_height: BlockHeight::new(2),
+            name: "NU7".to_owned(),
+        });
+        let upgraded = NetworkUpgradeActivations::new(Network::ZcashRegtest, entries)?;
+        primary.admit_network_upgrade_schedule(&upgraded)?;
+        let second = blocks
+            .get(1)
+            .cloned()
+            .ok_or("lifecycle fixture has no append block")?;
+        let expected_fence = primary.event_fence();
+        let (next_primary, crossing_fence) = primary.commit_live_append(
+            CanonicalLiveAppend::new(
+                expected_fence,
+                lifecycle_build_block(&second),
+                Vec::new(),
+                expected_fence.visible_tip(),
+                UnixTimestampMillis::new(2_000),
+            ),
+            &upgraded,
+        )?;
+        primary = next_primary;
+        control.set_writer_status(lifecycle_writer_status(&primary));
+
+        publisher.refresh().await;
+        let replaced = slot.capture();
+        assert_eq!(replaced.event_fence(), crossing_fence);
+        assert_eq!(replaced.network_upgrade_activations(), Some(&upgraded));
+
+        drop(replaced);
+        drop(publisher);
+        drop(primary);
         let _ = shutdown_sender.send(());
         server.await??;
         Ok(())
