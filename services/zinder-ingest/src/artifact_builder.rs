@@ -836,7 +836,7 @@ fn compact_orchard_actions(
                 nullifier: action.nullifier().to_bytes(),
                 commitment: action.cmx().to_bytes(),
                 ephemeral_key: encrypted_note.epk_bytes,
-                ciphertext: compact_note_ciphertext_prefix(&encrypted_note.enc_ciphertext)?,
+                ciphertext: compact_note_ciphertext_prefix(encrypted_note.enc_ciphertext.as_ref())?,
             })
         })
         .collect()
@@ -853,7 +853,7 @@ fn compact_ironwood_actions(
                 nullifier: action.nullifier().to_bytes(),
                 commitment: action.cmx().to_bytes(),
                 ephemeral_key: encrypted_note.epk_bytes,
-                ciphertext: compact_note_ciphertext_prefix(&encrypted_note.enc_ciphertext)?,
+                ciphertext: compact_note_ciphertext_prefix(encrypted_note.enc_ciphertext.as_ref())?,
             })
         })
         .collect()

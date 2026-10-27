@@ -14,8 +14,9 @@ use zebra_chain::{
 use zinder_core::{
     BlockHash, BlockHeight, CanonicalBlockFactsDigestVersion,
     CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
-    CanonicalTransactionFacts, Network, TransactionFactsArtifact, TransactionLocation,
-    TransparentInputFact, decode_canonical_block_replay,
+    CanonicalTransactionFacts, ConsensusBranchId, Network, TransactionFactsArtifact,
+    TransactionLocation, TransparentInputFact, decode_canonical_block_replay,
+    wire::encode_rpc_transaction_id_hex,
 };
 use zinder_ingest::{
     BlockMismatchField, CanonicalBlockConstructionError, CommitmentTreeSizes,
@@ -351,6 +352,53 @@ fn historical_fixture_blocks_keep_known_facts_and_compact_block_bytes() -> Resul
                 "bdaaf9b9cacd89c2e92cab82c0cc4e6a698f20b03fa7f7c75d603b7fb47a64ee".to_owned(),
             ),
         ]
+    );
+
+    Ok(())
+}
+
+#[test]
+fn nu7_activation_block_prepares_canonical_facts() -> Result<(), Box<dyn Error>> {
+    let fixture_json = include_str!("../fixtures/zakura-regtest-nu7-block-3.json");
+    let fixture: Value = serde_json::from_str(fixture_json)?;
+    let source_block = fixture_source_block_from(Network::ZcashRegtest, fixture_json)?;
+    let block = build_positioned_block_for_test(&source_block)?;
+    assert_transaction_bytes_match_parsed_source(&source_block, &block)?;
+    assert_compact_transaction_ids_match_canonical_facts(&block)?;
+
+    let [coinbase] = block.facts.transactions.as_slice() else {
+        return Err("NU7 activation fixture must contain only its coinbase".into());
+    };
+    assert_eq!(
+        encode_rpc_transaction_id_hex(coinbase.public_facts.transaction_id),
+        string_field(&fixture, "coinbase_txid")?
+    );
+    assert_eq!(
+        coinbase.public_facts.version,
+        zinder_core::TransactionVersion::V6
+    );
+    assert_eq!(
+        coinbase.public_facts.consensus_branch_id,
+        Some(ConsensusBranchId::new(0x7719_0ad9))
+    );
+
+    let compact_block_bytes = encode_compact_block_artifact(&block.compact_block);
+    assert_eq!(
+        (
+            hex::encode(
+                block
+                    .facts
+                    .digest(CanonicalBlockFactsDigestVersion::CURRENT)
+                    .as_bytes(),
+            ),
+            compact_block_bytes.len(),
+            hex::encode(Sha256::digest(&compact_block_bytes)),
+        ),
+        (
+            "3238484161539ded1f5cb8e6a3b330691d66ceaaebda5f2c19f771c57a854d75".to_owned(),
+            214,
+            "b1eb170b76cb3ce176d91844eef33ab5f942b36fdc02556367e20f0500aeb709".to_owned(),
+        )
     );
 
     Ok(())

@@ -29,8 +29,7 @@
 //! Mismatched activation heights produce an `incorrect consensus branch id`
 //! rejection from Zebra's mempool.
 
-use rand::rngs::OsRng;
-use secp256k1::{PublicKey, Secp256k1};
+use secp256k1::PublicKey;
 use thiserror::Error;
 use zcash_address::{ToAddress, ZcashAddress};
 use zcash_primitives::transaction::builder::{BuildConfig, Builder, BundlePadding};
@@ -163,8 +162,7 @@ impl TransparentTestKey {
         let secret_key = account_key
             .derive_external_secret_key(NonHardenedChildIndex::ZERO)
             .map_err(|error| TransparentSignerError::ExternalKey(error.to_string()))?;
-        let secp = Secp256k1::new();
-        let pubkey = PublicKey::from_secret_key(&secp, &secret_key);
+        let pubkey = PublicKey::from_secret_key(&secret_key);
         let address = TransparentAddress::from_pubkey(&pubkey);
         Ok(Self {
             account_key,
@@ -285,7 +283,7 @@ impl TransparentTestKey {
             .map_err(|error| TransparentSignerError::AddOutput(error.to_string()))?;
 
         let build_outcome = builder
-            .mock_build(&signing_set, &[], &[], OsRng)
+            .mock_build(&signing_set, &[], &[], rand::rng())
             .map_err(|error| TransparentSignerError::Build(error.to_string()))?;
 
         let mut bytes = Vec::new();

@@ -4,7 +4,7 @@ set -euo pipefail
 repository_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$repository_root"
 
-zebra_runtime_image='docker.io/zfnd/zebra:6.2.2@sha256:f464a4bf44c3402b2c9063c6df686b9177a4659ea61aecdc8aeb6947f2173197'
+zebra_runtime_image='docker.io/zfnd/zebra:7.0.0@sha256:a70d2be8ffef3a4b6e37355724e36a0e6c1838e46baa28bfb216739f00cf2d34'
 zebra_runtime_pin_files=(
   .github/workflows/live-tests.yml
   .github/workflows/parity-compat.yml
@@ -50,7 +50,8 @@ for package_name in \
   zcash_address \
   zcash_primitives \
   zcash_protocol \
-  zcash_transparent
+  zcash_transparent \
+  zip32
 do
   mapfile -t workspace_versions < <(
     resolved_versions "$package_name" "$workspace_tree"

@@ -10,10 +10,15 @@ use zinder_core::{
     BlockHeight, ConsensusBranchId, Network, NetworkUpgradeActivations, TransactionVersion,
     wire::{encode_rpc_auth_digest_hex, encode_rpc_transaction_id_hex},
 };
-use zinder_source::{SourceBlock, decode_rpc_block_hash, parse_transaction_public_fact_set};
+use zinder_source::{
+    SourceBlock, SourceError, decode_rpc_block_hash, parse_transaction_public_fact_set,
+};
 
 const NU6_3_BRANCH_ID: u32 = 0x37a5_165b;
 const NU7_BRANCH_ID: u32 = 0x7719_0ad9;
+const NU7_FIXTURE: &str = include_str!(
+    "../../../../services/zinder-ingest/tests/fixtures/zakura-regtest-nu7-block-3.json"
+);
 
 #[test]
 fn pre_nu7_coinbase_keeps_node_reported_identifiers() -> Result<()> {
@@ -26,14 +31,32 @@ fn pre_nu7_coinbase_keeps_node_reported_identifiers() -> Result<()> {
 }
 
 #[test]
-#[ignore = "published zebra-chain 13.0.1 and zcash_protocol 0.10.6 do not recognize assigned NU7 branch ID 0x77190ad9"]
 fn nu7_coinbase_keeps_node_reported_identifiers() -> Result<()> {
-    assert_captured_coinbase_facts(
-        include_str!(
-            "../../../../services/zinder-ingest/tests/fixtures/zakura-regtest-nu7-block-3.json"
-        ),
-        NU7_BRANCH_ID,
-    )
+    assert_captured_coinbase_facts(NU7_FIXTURE, NU7_BRANCH_ID)
+}
+
+#[test]
+fn unassigned_branch_ids_and_transaction_versions_fail_closed() -> Result<()> {
+    let fixture: Value = serde_json::from_str(NU7_FIXTURE)?;
+    let coinbase_bytes = captured_coinbase_bytes(&fixture)?;
+    // A v5+ transaction header is the version, version group ID, and
+    // consensus branch ID, each four bytes little-endian.
+    let mut retired_branch_id = coinbase_bytes.clone();
+    retired_branch_id[8..12].copy_from_slice(&0x7719_0ad8_u32.to_le_bytes());
+    let mut future_version = coinbase_bytes;
+    future_version[0..4].copy_from_slice(&0x8000_0007_u32.to_le_bytes());
+
+    for malformed_bytes in [retired_branch_id, future_version] {
+        assert!(matches!(
+            parse_transaction_public_fact_set(
+                &malformed_bytes,
+                None,
+                &NetworkUpgradeActivations::empty(Network::ZcashRegtest),
+            ),
+            Err(SourceError::RawTransactionParseFailed { .. })
+        ));
+    }
+    Ok(())
 }
 
 /// Decodes a captured single-coinbase block through the byte-oriented parser
@@ -49,7 +72,7 @@ fn assert_captured_coinbase_facts(fixture_json: &str, expected_branch_id: u32) -
     let height = BlockHeight::new(u32::try_from(height)?);
 
     let source_block =
-        SourceBlock::from_raw_block_bytes(Network::ZcashRegtest, height, raw_block_bytes.clone())?;
+        SourceBlock::from_raw_block_bytes(Network::ZcashRegtest, height, raw_block_bytes)?;
     assert_eq!(
         source_block.hash,
         decode_rpc_block_hash(string_field(&fixture, "hash")?)?
@@ -59,17 +82,8 @@ fn assert_captured_coinbase_facts(fixture_json: &str, expected_branch_id: u32) -
         decode_rpc_block_hash(string_field(&fixture, "previousblockhash")?)?
     );
 
-    let mut cursor = Cursor::new(raw_block_bytes.as_slice());
-    let block = Block::zcash_deserialize(&mut cursor)?;
-    eyre::ensure!(
-        usize::try_from(cursor.position())? == raw_block_bytes.len(),
-        "block parser did not consume the complete captured block",
-    );
-    let [coinbase] = block.transactions.as_slice() else {
-        return Err(eyre!("captured block must contain only its coinbase"));
-    };
     let fact_set = parse_transaction_public_fact_set(
-        &coinbase.zcash_serialize_to_vec()?,
+        &captured_coinbase_bytes(&fixture)?,
         None,
         &NetworkUpgradeActivations::empty(Network::ZcashRegtest),
     )?;
@@ -93,6 +107,20 @@ fn assert_captured_coinbase_facts(fixture_json: &str, expected_branch_id: u32) -
     assert!(fact_set.transparent_inputs.is_empty());
     assert_eq!(fact_set.transparent_outputs.len(), 1);
     Ok(())
+}
+
+fn captured_coinbase_bytes(fixture: &Value) -> Result<Vec<u8>> {
+    let raw_block_bytes = hex::decode(string_field(fixture, "raw_block_hex")?)?;
+    let mut cursor = Cursor::new(raw_block_bytes.as_slice());
+    let block = Block::zcash_deserialize(&mut cursor)?;
+    eyre::ensure!(
+        usize::try_from(cursor.position())? == raw_block_bytes.len(),
+        "block parser did not consume the complete captured block",
+    );
+    let [coinbase] = block.transactions.as_slice() else {
+        return Err(eyre!("captured block must contain only its coinbase"));
+    };
+    Ok(coinbase.zcash_serialize_to_vec()?)
 }
 
 fn string_field<'fixture>(fixture: &'fixture Value, field_name: &str) -> Result<&'fixture str> {

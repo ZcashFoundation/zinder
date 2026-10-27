@@ -22,7 +22,8 @@ use secrecy::ExposeSecret as _;
 use serde_json::Value;
 use tokio::process::Command;
 use tonic::transport::Endpoint;
-use zcash_address::ZcashAddress;
+use zcash_address::{ConversionError, TryFromAddress, ZcashAddress};
+use zcash_protocol::consensus::NetworkType;
 use zinder_core::{
     Network, TransactionId, UnixTimestampMillis,
     wire::{decode_rpc_transaction_id_hex, encode_rpc_transaction_id_hex},
@@ -326,11 +327,32 @@ fn zingolib_transparent_address(output: &str) -> Result<String> {
         .ok_or_else(|| eyre!("Zingolib t_addresses response did not contain encoded_address"))
 }
 
+struct DecodedTransparentAddress(TransparentAddress);
+
+impl TryFromAddress for DecodedTransparentAddress {
+    type Error = std::convert::Infallible;
+
+    fn try_from_transparent_p2pkh(
+        _net: NetworkType,
+        pubkey_hash: [u8; 20],
+    ) -> Result<Self, ConversionError<Self::Error>> {
+        Ok(Self(TransparentAddress::PublicKeyHash(pubkey_hash)))
+    }
+
+    fn try_from_transparent_p2sh(
+        _net: NetworkType,
+        script_hash: [u8; 20],
+    ) -> Result<Self, ConversionError<Self::Error>> {
+        Ok(Self(TransparentAddress::ScriptHash(script_hash)))
+    }
+}
+
 fn transparent_address_from_base58(encoded: &str) -> Result<TransparentAddress> {
-    ZcashAddress::try_from_encoded(encoded)
+    let DecodedTransparentAddress(address) = ZcashAddress::try_from_encoded(encoded)
         .map_err(|error| eyre!("Zingolib transparent address did not decode: {error}"))?
-        .convert::<TransparentAddress>()
-        .map_err(|error| eyre!("Zingolib address is not a transparent receiver: {error:?}"))
+        .convert::<DecodedTransparentAddress>()
+        .map_err(|error| eyre!("Zingolib address is not a transparent receiver: {error:?}"))?;
+    Ok(address)
 }
 
 fn zingolib_transaction_id(output: &str, command: &str) -> Result<zinder_core::TransactionId> {
