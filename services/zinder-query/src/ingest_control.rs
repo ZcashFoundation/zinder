@@ -180,6 +180,7 @@ fn validate_writer_status(
         return Err(IngestControlHealthError::WriterReorgWindowExceeded {
             depth: halt.depth,
             configured: halt.configured,
+            covered: halt.covered,
         });
     }
     let writer_epoch_message = writer_status
@@ -263,7 +264,11 @@ pub(crate) enum IngestControlHealthError {
     #[error(
         "canonical writer is parked: a {depth}-block replacement exceeds its {configured}-block reorg window"
     )]
-    WriterReorgWindowExceeded { depth: u64, configured: u64 },
+    WriterReorgWindowExceeded {
+        depth: u64,
+        configured: u64,
+        covered: Option<u64>,
+    },
     #[error("ingest-control MempoolSnapshot failed: {0}")]
     MempoolSnapshotRpc(tonic::Status),
     #[error("ingest-control MempoolSnapshot returned incoherent chain evidence")]
@@ -280,12 +285,15 @@ impl IngestControlHealthError {
     /// every other failure is a recoverable control-channel outage.
     pub(crate) const fn readiness_cause(&self) -> ReadinessCause {
         match self {
-            Self::WriterReorgWindowExceeded { depth, configured } => {
-                ReadinessCause::ReorgWindowExceeded {
-                    depth: *depth,
-                    configured: *configured,
-                }
-            }
+            Self::WriterReorgWindowExceeded {
+                depth,
+                configured,
+                covered,
+            } => ReadinessCause::ReorgWindowExceeded {
+                depth: *depth,
+                configured: *configured,
+                covered: *covered,
+            },
             Self::WriterStatusRpc(_)
             | Self::WriterStatusInvalid
             | Self::WriterUpstreamNotReady
@@ -455,6 +463,7 @@ mod tests {
         writer.reorg_window_exceeded = Some(zinder_proto::v1::ops::ReorgWindowExceededDetail {
             depth: 1_001,
             configured: 1_000,
+            covered: Some(1_000),
         });
         let error = validate_health_observation(&writer, &snapshot(1, 1, "01"), NETWORK)
             .err()
@@ -464,6 +473,7 @@ mod tests {
             zinder_runtime::ReadinessCause::ReorgWindowExceeded {
                 depth: 1_001,
                 configured: 1_000,
+                covered: Some(1_000),
             }
         ));
         assert_eq!(error.class(), "writer_reorg_window_exceeded");

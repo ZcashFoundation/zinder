@@ -619,6 +619,7 @@ async fn canonical_follower_refuses_a_fork_below_settlement_without_mutation()
         ReadinessCause::ReorgWindowExceeded {
             depth: 3,
             configured: 2,
+            covered: Some(2),
         }
     ));
     assert_eq!(
@@ -716,6 +717,7 @@ async fn parked_follower_serves_its_frozen_fence_until_termination()
         ReadinessCause::ReorgWindowExceeded {
             depth: 3,
             configured: 2,
+            covered: Some(2),
         }
     ));
     assert!(matches!(
@@ -792,6 +794,7 @@ async fn canonical_follower_replaces_through_its_window_and_refuses_one_block_de
                 ReadinessCause::ReorgWindowExceeded {
                     depth: 4,
                     configured: 3,
+                    covered: Some(3),
                 }
             ));
         }
@@ -904,6 +907,76 @@ async fn canonical_follower_follows_a_deeper_fork_after_an_in_place_window_raise
         error.to_string().contains("never lowered in place"),
         "{error}"
     );
+    Ok(())
+}
+
+/// Right after a raise, the replaceable depth is still the construction
+/// window, so a halt reports the depth the window covered rather than implying
+/// that the new window was exceeded.
+#[tokio::test]
+async fn halt_during_a_raised_window_ramp_reports_the_covered_depth()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let original = parseable_multi_block_chain()?;
+    let source = RecordingParseableSource::new(
+        original.clone(),
+        checkpoints_for_parseable_chain(&original, &activations)?,
+        BlockHeight::new(4),
+    );
+    let temporary = tempdir()?;
+    let store_path = temporary.path().join("canonical");
+    drop(
+        publish_parseable_store(
+            &source,
+            &original,
+            Arc::clone(&activations),
+            &store_path,
+            2,
+            BlockHeight::new(2),
+        )
+        .await?,
+    );
+    let store = zinder_store::RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
+        &store_path,
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        zinder_store::RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(3)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    let fork = forked_parseable_chain(&original, 2, 4, 97)?;
+    source.replace_chain(
+        fork.clone(),
+        checkpoints_for_parseable_chain(&fork, &activations)?,
+        BlockHeight::new(4),
+    );
+    source.clear_calls();
+    let readiness = Readiness::default();
+    let cancel = CancellationToken::new();
+    source.cancel_after_tip_call(2, cancel.clone());
+    let error = follow_canonical_tip(
+        store,
+        single_pass_follower(&source, &activations, &readiness, &cancel),
+    )
+    .await
+    .err()
+    .ok_or("a fork below the held settled tip must park")?;
+
+    assert!(matches!(
+        error,
+        zinder_ingest::CanonicalFollowError::ReorgWindowExceeded(evidence)
+            if evidence.required_depth == 3
+                && evidence.configured_window_blocks == 3
+                && evidence.covered_depth_blocks == 2
+    ));
+    assert!(matches!(
+        readiness.report().cause,
+        ReadinessCause::ReorgWindowExceeded {
+            depth: 3,
+            configured: 3,
+            covered: Some(2),
+        }
+    ));
     Ok(())
 }
 

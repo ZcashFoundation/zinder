@@ -79,7 +79,7 @@ pub enum IndexerError {
     /// operator. Unary calls and open chain-event streams both end with this
     /// error until the operator reconciles the indexer.
     #[error(
-        "indexer halted: a replacement of {replacement_depth_blocks:?} blocks exceeds its reorg window of {reorg_window_blocks:?} blocks"
+        "indexer halted: a replacement of {replacement_depth_blocks:?} blocks exceeds the {covered_depth_blocks:?} replaceable blocks of its {reorg_window_blocks:?}-block reorg window"
     )]
     ReorgWindowExceeded {
         /// Blocks the refused replacement would have replaced, when the
@@ -87,6 +87,10 @@ pub enum IndexerError {
         replacement_depth_blocks: Option<u64>,
         /// The indexer's reorg window in blocks, when the server reports it.
         reorg_window_blocks: Option<u64>,
+        /// Replaceable depth the window covered when the replacement was
+        /// refused, when the server reports it. It is below
+        /// `reorg_window_blocks` while a raised window is still growing.
+        covered_depth_blocks: Option<u64>,
     },
 
     /// Requested data is not indexed in the visible chain.
@@ -242,6 +246,7 @@ impl IndexerError {
             return Self::ReorgWindowExceeded {
                 replacement_depth_blocks: metadata_blocks("replacement_depth_blocks"),
                 reorg_window_blocks: metadata_blocks("reorg_window_blocks"),
+                covered_depth_blocks: metadata_blocks("covered_depth_blocks"),
             };
         }
 
@@ -443,6 +448,7 @@ mod tests {
                     ),
                     ("replacement_depth_blocks".to_owned(), "1001".to_owned()),
                     ("reorg_window_blocks".to_owned(), "1000".to_owned()),
+                    ("covered_depth_blocks".to_owned(), "1000".to_owned()),
                 ],
             ),
         );
@@ -452,6 +458,7 @@ mod tests {
             IndexerError::ReorgWindowExceeded {
                 replacement_depth_blocks: Some(1_001),
                 reorg_window_blocks: Some(1_000),
+                covered_depth_blocks: Some(1_000),
             }
         ));
         assert_eq!(error.reason(), Some(ErrorReason::ReorgWindowExceeded));
@@ -471,6 +478,7 @@ mod tests {
             IndexerError::ReorgWindowExceeded {
                 replacement_depth_blocks: None,
                 reorg_window_blocks: None,
+                covered_depth_blocks: None,
             }
         ));
     }

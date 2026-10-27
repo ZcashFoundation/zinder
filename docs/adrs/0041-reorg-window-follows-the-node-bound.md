@@ -101,8 +101,11 @@ connections, so its entrypoint ends the container only for causes such as
 Wallet consumers receive the halt through the existing error vocabulary:
 
 - New requests fail with `REORG_WINDOW_EXCEEDED` (`FAILED_PRECONDITION`),
-  carrying `readiness_cause`, `replacement_depth_blocks`, and
-  `reorg_window_blocks` in `ErrorInfo` metadata.
+  carrying `readiness_cause`, `replacement_depth_blocks`,
+  `reorg_window_blocks`, and `covered_depth_blocks` in `ErrorInfo` metadata.
+  The covered depth is the distance from the settled tip to the visible tip,
+  which is below the window while a raised window is still growing, so a halt
+  during that ramp does not read as a reorg deeper than the new window.
 - Open `ChainEvents` streams end with the same status, because the traffic
   gate only rejects new requests.
 - `zinder-client` decodes the status as `IndexerError::ReorgWindowExceeded`

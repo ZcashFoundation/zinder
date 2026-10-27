@@ -222,6 +222,10 @@ pub struct CanonicalReorgWindowExceeded {
     pub required_depth: u32,
     /// Persisted maximum replacement depth.
     pub configured_window_blocks: u32,
+    /// Replaceable depth the window covered: the distance from the settled
+    /// tip to the local tip. Below `configured_window_blocks` while a raised
+    /// window is still growing toward it.
+    pub covered_depth_blocks: u32,
 }
 
 /// Failure while following the clean canonical store.
@@ -442,6 +446,7 @@ where
                     ReadinessState::reorg_window_exceeded(
                         u64::from(evidence.required_depth),
                         u64::from(evidence.configured_window_blocks),
+                        Some(u64::from(evidence.covered_depth_blocks)),
                         Some(evidence.local_tip.height.value()),
                     )
                     .with_phase(IngestPhase::FollowingTip),
@@ -727,6 +732,7 @@ where
                 settled_tip,
                 required_depth: unsettled_depth.saturating_add(1),
                 configured_window_blocks,
+                covered_depth_blocks: unsettled_depth,
             },
         )));
     };

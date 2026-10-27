@@ -33,7 +33,7 @@ version and commit appear in the `zinder_build_info` metric and native
 | `upstream_not_ready` | Zebra is reachable but not sufficiently synchronized. |
 | `storage_unavailable` | Required local storage cannot be opened or read. |
 | `schema_mismatch` | Persisted identity or schema differs from the binary. |
-| `reorg_window_exceeded` | A replacement crosses the persisted reorg policy. |
+| `reorg_window_exceeded` | A replacement crosses the persisted reorg policy. The detail carries the replacement depth, the window, and the depth the window covered, which is smaller than the window while a raised window is still growing. |
 | `replica_lagging` | A RocksDB secondary exceeds the admitted epoch lag. |
 | `serving_pair_stale` | A wallet-serving reader cannot refresh its published pair, which is still within its staleness ceiling. |
 | `writer_status_unavailable` | A trusted reader cannot reach the writer control API. |
