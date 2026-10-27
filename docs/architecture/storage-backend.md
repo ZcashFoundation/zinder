@@ -178,6 +178,12 @@ checkpoint with bounded resources and compares its database identity and ready
 evidence with the source captured before checkpoint creation. Independently
 timed copies of primary directories are not a coherent restore contract.
 
+A checkpoint of a store whose writer raised its reorg window enforces the
+raised window. Owner-checkpoint evidence and state-bundle manifests record it
+as `effective_reorg_window_blocks` beside the construction window, and omit it
+for a store that still enforces its construction window. Restoring such a
+bundle requires configuring every runtime with the recorded window.
+
 ## PostgreSQL diagnostics
 
 `zinder-bench` contains PostgreSQL and RocksDB implementations of the canonical

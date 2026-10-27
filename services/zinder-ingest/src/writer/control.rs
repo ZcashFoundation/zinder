@@ -1210,6 +1210,9 @@ fn owner_checkpoint_response(
             .activation_schedule
             .as_ref()
             .map(network_upgrade_schedule_message),
+        effective_reorg_window_blocks: (evidence.reorg_policy
+            != evidence.build_plan.reorg_policy())
+        .then(|| evidence.reorg_policy.reorg_window_blocks()),
     }
 }
 
@@ -1800,6 +1803,7 @@ pub(crate) mod test_support {
                 .map(|checkpoint| checkpoint.retained_block_count),
             Some(1)
         );
+        assert_eq!(checkpoint.effective_reorg_window_blocks, None);
         let build_plan = checkpoint
             .build_plan
             .ok_or("checkpoint response omitted build-plan identity")?;
