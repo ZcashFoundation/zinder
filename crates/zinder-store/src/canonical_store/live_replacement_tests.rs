@@ -1178,9 +1178,15 @@ fn writer_raises_the_reorg_window_in_place_across_restart_and_never_lowers_it()
     )?;
     assert_eq!(store.displaced_block_count()?, 101);
     drop(store);
-    let reopened = open_store(&store_path, &activations, 1_000)?;
+    let mut reopened = open_store(&store_path, &activations, 1_000)?;
     assert_eq!(reopened.event_fence(), replaced);
     assert_eq!(reopened.reorg_policy(), raised);
+    let checkpoint = reopened.create_owner_checkpoint(
+        temporary.path().join("owner-checkpoint"),
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(checkpoint.reorg_policy, raised);
+    assert_eq!(checkpoint.build_plan.reorg_policy(), construction);
     Ok(())
 }
 

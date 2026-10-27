@@ -347,6 +347,11 @@ pub struct CreateCanonicalOwnerCheckpointResponse {
     pub network_upgrade_schedule: ::core::option::Option<
         CanonicalNetworkUpgradeSchedule,
     >,
+    /// Reorg window the checkpoint enforces when a canonical writer raised it
+    /// above `build_plan.reorg_window_blocks`. Absent when the checkpoint
+    /// enforces its construction window. ADR-0041.
+    #[prost(uint32, optional, tag = "10")]
+    pub effective_reorg_window_blocks: ::core::option::Option<u32>,
 }
 /// Re-admits an already-created canonical owner checkpoint at the fixed child
 /// of an opaque staging candidate. The canonical owner resolves the path below

@@ -289,6 +289,10 @@ message CreateCanonicalOwnerCheckpointResponse {
   bytes database_identity = 8;
   // Admitted activation schedule cold-read from the physical checkpoint.
   CanonicalNetworkUpgradeSchedule network_upgrade_schedule = 9;
+  // Reorg window the checkpoint enforces when a canonical writer raised it
+  // above `build_plan.reorg_window_blocks`. Absent when the checkpoint
+  // enforces its construction window. ADR-0041.
+  optional uint32 effective_reorg_window_blocks = 10;
 }
 
 // Re-admits an already-created canonical owner checkpoint at the fixed child
