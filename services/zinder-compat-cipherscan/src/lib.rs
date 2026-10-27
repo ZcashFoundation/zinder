@@ -999,10 +999,19 @@ impl CipherscanRestAdapter {
             })
             .await?
             .into_inner();
+        let settled_tip_height =
+            explorer_settled_tip(response.freshness.as_ref()).map(|settled_tip| settled_tip.height);
         response
             .points
             .into_iter()
-            .map(|point| CipherscanBlockListEntry::try_from_point(self.network, point))
+            .map(|point| {
+                CipherscanBlockListEntry::try_from_point(self.network, point).map(|entry| {
+                    CipherscanBlockListEntry {
+                        settled_tip_height,
+                        ..entry
+                    }
+                })
+            })
             .collect()
     }
 
@@ -6632,7 +6641,7 @@ async fn publish_chain_event(
         .into());
     }
 
-    let Some(summaries) = hydrate_realtime_committed_blocks(
+    let Some((summaries, settled_tip_height)) = hydrate_realtime_committed_blocks(
         adapter,
         committed.start_height,
         committed.end_height,
@@ -6650,7 +6659,7 @@ async fn publish_chain_event(
         );
         return Ok(());
     };
-    broadcast_realtime_blocks(realtime_sender, &summaries).await;
+    broadcast_realtime_blocks(realtime_sender, &summaries, settled_tip_height).await;
     publish_realtime_privacy_stats(adapter, realtime_sender).await;
 
     Ok(())
@@ -6662,7 +6671,7 @@ async fn hydrate_realtime_committed_blocks(
     end_height: u32,
     committed_epoch_id: u64,
     expected_tip_hash: &str,
-) -> Result<Option<Vec<explorer::BlockSummary>>, CipherscanRestError> {
+) -> Result<Option<RealtimeBlockSummaries>, CipherscanRestError> {
     for attempt in 0..REALTIME_HYDRATION_ATTEMPTS {
         let (current_tip, current_epoch_id) = adapter.fetch_visible_tip_block_context().await?;
         let current_epoch_id = current_epoch_id.ok_or(
@@ -6686,7 +6695,7 @@ async fn hydrate_realtime_committed_blocks(
         match fetch_realtime_block_summaries(adapter, start_height, end_height, current_epoch_id)
             .await
         {
-            Ok(Some(summaries)) => {
+            Ok(Some((summaries, settled_tip_height))) => {
                 let final_summary =
                     summaries
                         .last()
@@ -6696,7 +6705,7 @@ async fn hydrate_realtime_committed_blocks(
                 if final_summary.block_hash != expected_tip_hash {
                     return Ok(None);
                 }
-                return Ok(Some(summaries));
+                return Ok(Some((summaries, settled_tip_height)));
             }
             Ok(None) => {}
             Err(CipherscanRestError::Upstream(status))
@@ -6733,8 +6742,9 @@ async fn fetch_realtime_block_summaries(
     start_height: u32,
     end_height: u32,
     chain_epoch_id: u64,
-) -> Result<Option<Vec<explorer::BlockSummary>>, CipherscanRestError> {
+) -> Result<Option<RealtimeBlockSummaries>, CipherscanRestError> {
     let mut summaries = Vec::new();
+    let mut settled_tip_height;
     let mut chunk_start = start_height;
     loop {
         let chunk_end = end_height.min(
@@ -6751,6 +6761,8 @@ async fn fetch_realtime_block_summaries(
             })
             .await?
             .into_inner();
+        settled_tip_height =
+            explorer_settled_tip(response.freshness.as_ref()).map(|settled_tip| settled_tip.height);
         let expected_count = inclusive_height_count(chunk_start, chunk_end);
         if response.covered_block_count != expected_count
             || response.points.len() != usize::try_from(expected_count).unwrap_or(usize::MAX)
@@ -6780,15 +6792,24 @@ async fn fetch_realtime_block_summaries(
         chunk_start = chunk_end.saturating_add(1);
     }
 
-    Ok(Some(summaries))
+    Ok(Some((summaries, settled_tip_height)))
 }
+
+/// Block summaries hydrated at one pinned chain epoch, with that epoch's
+/// settled tip height when the explorer reports it.
+type RealtimeBlockSummaries = (Vec<explorer::BlockSummary>, Option<u32>);
 
 async fn broadcast_realtime_blocks(
     realtime_sender: &broadcast::Sender<CipherscanRealtimeDispatch>,
     summaries: &[explorer::BlockSummary],
+    settled_tip_height: Option<u32>,
 ) {
     for summary in summaries {
-        broadcast_realtime_payload(realtime_sender, "new_block", &block_row(summary));
+        broadcast_realtime_payload(
+            realtime_sender,
+            "new_block",
+            &block_row(summary, settled_tip_height),
+        );
         tokio::task::yield_now().await;
     }
 }
@@ -7486,6 +7507,7 @@ struct CipherscanBlockListEntry {
     summary: explorer::BlockSummary,
     difficulty: f64,
     miner_address: Option<String>,
+    settled_tip_height: Option<u32>,
 }
 
 struct NetworkActivityWindow {
@@ -7562,6 +7584,7 @@ impl CipherscanBlockListEntry {
             summary,
             difficulty: cipherscan_difficulty(network, point.bits)?,
             miner_address,
+            settled_tip_height: None,
         })
     }
 }
@@ -7584,12 +7607,15 @@ fn block_list_row(entry: &CipherscanBlockListEntry) -> Value {
         "miner_pool": Value::Null,
         "total_fees": fee_zat.to_string(),
         "coinbase_reward": summary.coinbase_reward_zat.to_string(),
-        "finality_status": cipherscan_block_finality_status(summary),
+        "finality_status": cipherscan_block_finality_status(
+            summary.block_height,
+            entry.settled_tip_height,
+        ),
         "is_canonical": summary.is_canonical,
     })
 }
 
-fn block_row(summary: &explorer::BlockSummary) -> Value {
+fn block_row(summary: &explorer::BlockSummary, settled_tip_height: Option<u32>) -> Value {
     let fee_zat = summary
         .paid_fees_collected_zat
         .unwrap_or(summary.fees_collected_zat);
@@ -7606,7 +7632,10 @@ fn block_row(summary: &explorer::BlockSummary) -> Value {
         "miner_pool": Value::Null,
         "total_fees": fee_zat.to_string(),
         "coinbase_reward": summary.coinbase_reward_zat.to_string(),
-        "finality_status": cipherscan_block_finality_status(summary),
+        "finality_status": cipherscan_block_finality_status(
+            summary.block_height,
+            settled_tip_height,
+        ),
         "is_canonical": summary.is_canonical,
     })
 }
@@ -14040,8 +14069,14 @@ fn cipherscan_hashrate_string(hashrate: f64) -> String {
     format!("{scaled:.2} {unit}")
 }
 
-fn cipherscan_block_finality_status(summary: &explorer::BlockSummary) -> &'static str {
-    if summary.confirmations >= 100 {
+/// Reports a block as finalized once it is at or below the indexer's settled
+/// tip, the depth past which the node can no longer replace it. An unknown
+/// settled tip never reports finality.
+fn cipherscan_block_finality_status(
+    block_height: u32,
+    settled_tip_height: Option<u32>,
+) -> &'static str {
+    if settled_tip_height.is_some_and(|settled_tip_height| block_height <= settled_tip_height) {
         "Finalized"
     } else {
         "NotYetFinalized"
@@ -15166,7 +15201,7 @@ mod tests {
         };
 
         let ((), heights) = tokio::join!(
-            broadcast_realtime_blocks(&realtime_sender, &summaries),
+            broadcast_realtime_blocks(&realtime_sender, &summaries, None),
             receive_blocks,
         );
         let heights = heights?;
@@ -17429,6 +17464,7 @@ mod tests {
             },
             difficulty,
             miner_address: None,
+            settled_tip_height: None,
         }
     }
 
@@ -17440,12 +17476,13 @@ mod tests {
             },
             difficulty,
             miner_address: None,
+            settled_tip_height: None,
         }
     }
 
     #[test]
     fn block_row_matches_cipherscan_list_field_types() {
-        let row = block_row(&explorer::BlockSummary {
+        let summary = explorer::BlockSummary {
             block_height: 42,
             block_hash: SAMPLE_BLOCK_HASH.to_owned(),
             block_time_unix_seconds: 1_700_000_000,
@@ -17454,10 +17491,11 @@ mod tests {
             paid_fees_collected_zat: Some(10_000),
             fees_collected_zat: 20_000,
             coinbase_reward_zat: 137_500_000,
-            confirmations: 100,
+            confirmations: 1_000,
             is_canonical: true,
             ..Default::default()
-        });
+        };
+        let row = block_row(&summary, Some(42));
 
         assert_eq!(row["height"], json!("42"));
         assert_eq!(row["timestamp"], json!("1700000000"));
@@ -17468,6 +17506,20 @@ mod tests {
         assert_eq!(row["miner_address"], Value::Null);
         assert_eq!(row["miner_pool"], Value::Null);
         assert_eq!(row["finality_status"], json!("Finalized"));
+        // Finality follows the settled tip, not a confirmation count.
+        for settled_tip_height in [Some(41), None] {
+            assert_eq!(
+                block_row(&summary, settled_tip_height)["finality_status"],
+                json!("NotYetFinalized")
+            );
+        }
+        let mut shallow = block_list_entry(42, 1.0);
+        shallow.summary.confirmations = 2;
+        shallow.settled_tip_height = Some(43);
+        assert_eq!(
+            block_list_row(&shallow)["finality_status"],
+            json!("Finalized")
+        );
     }
 
     #[test]
@@ -18672,6 +18724,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the fixture spells out three complete block-list entries"
+    )]
     fn mining_rewards_json_preserves_legacy_series_and_declares_semantics()
     -> Result<(), Box<dyn std::error::Error>> {
         let generated_at = OffsetDateTime::from_unix_timestamp(1_735_862_400)?;
@@ -18688,6 +18744,7 @@ mod tests {
                     },
                     difficulty: 1.0,
                     miner_address: None,
+                    settled_tip_height: None,
                 },
                 CipherscanBlockListEntry {
                     summary: explorer::BlockSummary {
@@ -18699,6 +18756,7 @@ mod tests {
                     },
                     difficulty: 1.0,
                     miner_address: None,
+                    settled_tip_height: None,
                 },
                 CipherscanBlockListEntry {
                     summary: explorer::BlockSummary {
@@ -18711,6 +18769,7 @@ mod tests {
                     },
                     difficulty: 1.0,
                     miner_address: None,
+                    settled_tip_height: None,
                 },
             ],
             requested_cutoff_unix_seconds: Some(1_735_689_600),
@@ -18788,6 +18847,7 @@ mod tests {
                 },
                 difficulty: 1.0,
                 miner_address: None,
+                settled_tip_height: None,
             },
             CipherscanBlockListEntry {
                 summary: explorer::BlockSummary {
@@ -18796,6 +18856,7 @@ mod tests {
                 },
                 difficulty: 1.0,
                 miner_address: None,
+                settled_tip_height: None,
             },
         ];
         let missing_height_page = vec![CipherscanBlockListEntry {
@@ -18805,6 +18866,7 @@ mod tests {
             },
             difficulty: 1.0,
             miner_address: None,
+            settled_tip_height: None,
         }];
 
         assert!(validate_mining_production_page(&complete_page, 10, 11).is_ok());
@@ -18821,6 +18883,7 @@ mod tests {
             },
             difficulty: 1.0,
             miner_address: None,
+            settled_tip_height: None,
         };
         let at_cutoff = CipherscanBlockListEntry {
             summary: explorer::BlockSummary {
@@ -18829,6 +18892,7 @@ mod tests {
             },
             difficulty: 1.0,
             miner_address: None,
+            settled_tip_height: None,
         };
         let at_end = CipherscanBlockListEntry {
             summary: explorer::BlockSummary {
@@ -18837,6 +18901,7 @@ mod tests {
             },
             difficulty: 1.0,
             miner_address: None,
+            settled_tip_height: None,
         };
 
         assert!(!mining_production_entry_is_in_period(
