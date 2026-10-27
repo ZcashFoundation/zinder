@@ -129,7 +129,10 @@ workload, wrong construction activation fingerprint, an activation table that
 differs from the admitted schedule at or below the visible tip, changed reorg
 policy, or incompatible source identity fails without mutation. Only the
 canonical writer journals a new schedule revision; it may change only
-activations above the visible tip.
+activations above the visible tip. A reader checks its node's table only when
+it first opens a secondary. Catch-ups and later reader generations follow the
+writer-admitted schedule; see
+[ADR-0039](../adrs/0039-writer-admitted-network-upgrade-schedules.md).
 
 Version domains are independent. Canonical physical schema, canonical replay
 format, canonical digest, wallet physical schema, wallet value encoding,

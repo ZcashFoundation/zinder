@@ -30,9 +30,17 @@ release notes of the Zinder release you are installing for that support.
    compatibility, and Explorer.
 2. Upgrade the node and wait until it serves RPC.
 3. Compare the node's `getblockchaininfo` `upgrades` with the table the store
-   was built with. The new release may append entries or change entries above
-   the store tip. Every earlier entry must keep the same branch ID, height,
-   name, and order.
+   uses. Every entry at or below the store tip must keep the same branch ID,
+   height, name, and order. What may change above the tip depends on whether
+   ingest has already admitted a schedule revision for this store:
+   - If this is the first start of a Zinder release with schedule admission,
+     the store has no revision yet. The node's table must begin with exactly
+     the table the store was built with, in the same order, and may only
+     append entries that activate above the store tip. An entry the store was
+     built with cannot move yet, even if it has not activated.
+   - Once ingest has recorded revision 1, the node's table may add, remove,
+     or change any entry that activates above the store tip, including
+     entries the store was built with.
 4. Start `zinder-ingest`. When it reopens the store, it admits the node's table
    and logs `canonical_ready_store_reopened` with
    `network_upgrade_schedule_revision`. The first admission records revision 1;
@@ -63,5 +71,5 @@ restart ingest first, then restart the reader.
 
 ## Related
 
-- [ADR-0008: network parameter discovery](../adrs/0008-network-parameter-discovery.md#schedule-admission)
+- [ADR-0039: writer-admitted network-upgrade schedules](../adrs/0039-writer-admitted-network-upgrade-schedules.md)
 - [Deploying on a VM](deploying-on-a-vm.md#restart-and-rollback)
