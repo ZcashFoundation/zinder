@@ -306,12 +306,16 @@ fn transaction_identifiers(
     transaction: &ZebraTransaction,
     raw_transaction_bytes: &[u8],
 ) -> Result<(TransactionId, Option<AuthDigest>, Option<Wtxid>), SourceError> {
-    match transaction {
-        _ if transaction.auth_digest().is_none() => {
-            Ok((TransactionId::from_bytes(transaction.hash().0), None, None))
+    let witnessed_version = match transaction.tx_version() {
+        LibrustzcashTransactionVersion::Sprout(_)
+        | LibrustzcashTransactionVersion::V3
+        | LibrustzcashTransactionVersion::V4 => {
+            return Ok((TransactionId::from_bytes(transaction.hash().0), None, None));
         }
-        _ => witnessed_transaction_identifiers(transaction, raw_transaction_bytes),
-    }
+        LibrustzcashTransactionVersion::V5 => LibrustzcashTransactionVersion::V5,
+        LibrustzcashTransactionVersion::V6 => LibrustzcashTransactionVersion::V6,
+    };
+    witnessed_transaction_identifiers(transaction, witnessed_version, raw_transaction_bytes)
 }
 
 /// Derives both witnessed digests from one librustzcash transaction parse.
@@ -322,6 +326,7 @@ fn transaction_identifiers(
 /// conversion once. Prefer a one-pass Zebra API when upstream exposes one.
 fn witnessed_transaction_identifiers(
     transaction: &ZebraTransaction,
+    expected_version: LibrustzcashTransactionVersion,
     raw_transaction_bytes: &[u8],
 ) -> Result<(TransactionId, Option<AuthDigest>, Option<Wtxid>), SourceError> {
     let branch_id = transaction
@@ -338,18 +343,6 @@ fn witnessed_transaction_identifiers(
                 reason: source.to_string(),
             },
         )?;
-    let expected_version = match transaction.tx_version() {
-        LibrustzcashTransactionVersion::V5 => LibrustzcashTransactionVersion::V5,
-        LibrustzcashTransactionVersion::V6 => LibrustzcashTransactionVersion::V6,
-        LibrustzcashTransactionVersion::Sprout(_)
-        | LibrustzcashTransactionVersion::V3
-        | LibrustzcashTransactionVersion::V4 => {
-            return Err(SourceError::RawTransactionParseFailed {
-                reason: "witnessed identifier extraction requires a V5 or V6 transaction"
-                    .to_owned(),
-            });
-        }
-    };
     if librustzcash_transaction.version() != expected_version {
         return Err(SourceError::RawTransactionParseFailed {
             reason: "parsed transaction version does not match the Zebra transaction".to_owned(),
