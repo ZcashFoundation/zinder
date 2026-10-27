@@ -392,12 +392,13 @@ mod tests {
         CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
         CanonicalBlockReplayEnvelope, CanonicalBlockReplayFormatVersion, CanonicalHistoryBounds,
         CanonicalTransactionFacts, ChainEpochId, ChainTipMetadata, CompactBlockArtifact,
-        CompactTransaction, CompactTransactionData, DisplacedBlockArchiveCoverage,
-        FinalNoteCommitmentRoot, LockTime, PrivacyShape, SerializedBytesDigest,
-        TransactionBlobArtifact, TransactionComponentCounts, TransactionId,
-        TransactionIntrinsicValueBalances, TransactionLocation, TransactionPublicFacts,
-        TransactionVersion, TransparentAddressScriptHash, TransparentOutputFact,
-        UnixTimestampMillis, UnsupportedSection, encode_canonical_block_replay,
+        CompactTransaction, CompactTransactionData, ConsensusBranchId,
+        DisplacedBlockArchiveCoverage, FinalNoteCommitmentRoot, LockTime, NetworkUpgradeActivation,
+        NetworkUpgradeActivations, PrivacyShape, SerializedBytesDigest, TransactionBlobArtifact,
+        TransactionComponentCounts, TransactionId, TransactionIntrinsicValueBalances,
+        TransactionLocation, TransactionPublicFacts, TransactionVersion,
+        TransparentAddressScriptHash, TransparentOutputFact, UnixTimestampMillis,
+        UnsupportedSection, encode_canonical_block_replay,
     };
 
     use super::*;
@@ -426,6 +427,10 @@ mod tests {
     const PUBLICATION_STORE_PATH_ENV: &str = "ZINDER_TEST_CANONICAL_PUBLICATION_STORE_PATH";
     const LIVE_COMMIT_FAILPOINT_ENV: &str = "ZINDER_TEST_CANONICAL_LIVE_COMMIT_FAILPOINT";
     const LIVE_COMMIT_STORE_PATH_ENV: &str = "ZINDER_TEST_CANONICAL_LIVE_COMMIT_STORE_PATH";
+    const ACTIVATION_SCHEDULE_FAILPOINT_ENV: &str =
+        "ZINDER_TEST_CANONICAL_ACTIVATION_SCHEDULE_FAILPOINT";
+    const ACTIVATION_SCHEDULE_STORE_PATH_ENV: &str =
+        "ZINDER_TEST_CANONICAL_ACTIVATION_SCHEDULE_STORE_PATH";
 
     #[test]
     fn builder_refuses_every_existing_path() -> Result<(), Box<dyn std::error::Error>> {
@@ -1345,6 +1350,250 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one durable store lifecycle verifies schedule admission across append, checkpoint, and secondary convergence"
+    )]
+    fn activation_schedule_admission_is_future_only_journaled_and_survives_append()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let validated =
+            complete_loaded_builder_with_reorg_window(&store_path, 100, BlockHeight::new(10))?
+                .prepare_cold_certified_publication()?;
+        let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            UnixTimestampMillis::new(1_750_000_000_000),
+        ))?;
+        let mut store = validated.publish_baseline(publication)?;
+        let baseline =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let mut unprovable_entries = baseline.activations().to_vec();
+        unprovable_entries[0].name = "Changed historical upgrade".to_owned();
+        let unprovable = NetworkUpgradeActivations::new(Network::ZcashTestnet, unprovable_entries)?;
+        let error = store
+            .admit_network_upgrade_schedule(&unprovable)
+            .err()
+            .ok_or("legacy schedule without a matching prefix proof must be rejected")?;
+        assert!(error.to_string().contains("exact prefix"));
+        assert_eq!(
+            store
+                .network_upgrade_schedule()
+                .map(crate::CanonicalActivationSchedule::revision),
+            None
+        );
+
+        let mut extended_entries = baseline.activations().to_vec();
+        extended_entries.push(NetworkUpgradeActivation {
+            branch_id: ConsensusBranchId::new(99),
+            activation_height: BlockHeight::new(11),
+            name: "Future".to_owned(),
+        });
+        extended_entries.push(NetworkUpgradeActivation {
+            branch_id: ConsensusBranchId::new(100),
+            activation_height: BlockHeight::new(12),
+            name: "Future after append".to_owned(),
+        });
+        let extended = NetworkUpgradeActivations::new(Network::ZcashTestnet, extended_entries)?;
+
+        store.admit_network_upgrade_schedule(&extended)?;
+        assert_eq!(
+            store
+                .network_upgrade_schedule()
+                .map(crate::CanonicalActivationSchedule::revision),
+            Some(1)
+        );
+        let mut secondary = RocksDbCanonicalSecondary::open_ready(
+            &store_path,
+            temporary.path().join("canonical-secondary"),
+            &baseline,
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(100)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(
+            secondary
+                .network_upgrade_schedule()
+                .map(crate::CanonicalActivationSchedule::revision),
+            Some(1)
+        );
+        assert_eq!(secondary.network_upgrade_activations(), Some(&extended));
+        let expected_fence = store.event_fence();
+        let mut block = canonical_build_block(BlockHeight::new(11), [11; 32], [10; 32]);
+        add_tree_state_checkpoint(&mut block)?;
+        let (store, _) = store.commit_live_append(
+            crate::CanonicalLiveAppend::new(
+                expected_fence,
+                block,
+                Vec::new(),
+                BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+                UnixTimestampMillis::new(1_750_000_001_000),
+            ),
+            &extended,
+        )?;
+        drop(store);
+
+        let mut store = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &extended,
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(100)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(
+            store
+                .network_upgrade_schedule()
+                .map(crate::CanonicalActivationSchedule::revision),
+            Some(1)
+        );
+        assert_eq!(store.network_upgrade_activations(), Some(&extended));
+        let mut changed_at_new_tip = extended.activations().to_vec();
+        let boundary_activation = changed_at_new_tip
+            .iter_mut()
+            .find(|activation| activation.branch_id == ConsensusBranchId::new(99))
+            .ok_or("height-eleven activation must remain in the schedule")?;
+        boundary_activation.name = "Changed after reaching activation height".to_owned();
+        let changed_at_new_tip =
+            NetworkUpgradeActivations::new(Network::ZcashTestnet, changed_at_new_tip)?;
+        let error = store
+            .admit_network_upgrade_schedule(&changed_at_new_tip)
+            .err()
+            .ok_or("a schedule change at the locked tip must be refused")?;
+        assert!(error.to_string().contains("at or below canonical tip"));
+        let checkpoint_path = temporary.path().join("canonical-checkpoint");
+        let checkpoint_admission = store.create_owner_checkpoint_physical(&checkpoint_path)?;
+        let checkpoint_evidence = RocksDbCanonicalStore::cold_admit_owner_checkpoint(
+            &checkpoint_path,
+            &checkpoint_admission,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let checkpoint_schedule = checkpoint_evidence
+            .activation_schedule
+            .as_ref()
+            .ok_or("cold checkpoint must expose its admitted schedule")?;
+        assert_eq!(checkpoint_schedule.revision(), 1);
+        assert_eq!(checkpoint_schedule.activations(), &extended);
+
+        let mut revised_entries = extended.activations().to_vec();
+        let revised_future = revised_entries
+            .iter_mut()
+            .find(|activation| activation.branch_id == ConsensusBranchId::new(100))
+            .ok_or("extended schedule should have a future activation")?;
+        revised_future.activation_height = BlockHeight::new(13);
+        revised_future.name = "Future revised".to_owned();
+        let revised = NetworkUpgradeActivations::new(Network::ZcashTestnet, revised_entries)?;
+        store.admit_network_upgrade_schedule(&revised)?;
+        assert_eq!(
+            store
+                .network_upgrade_schedule()
+                .map(crate::CanonicalActivationSchedule::revision),
+            Some(2)
+        );
+        secondary.try_catch_up()?;
+        assert_eq!(
+            secondary
+                .network_upgrade_schedule()
+                .map(crate::CanonicalActivationSchedule::revision),
+            Some(2)
+        );
+        assert_eq!(secondary.network_upgrade_activations(), Some(&revised));
+        let old_checkpoint_evidence = RocksDbCanonicalStore::cold_admit_owner_checkpoint(
+            &checkpoint_path,
+            &checkpoint_admission,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(
+            old_checkpoint_evidence
+                .activation_schedule
+                .as_ref()
+                .map(crate::CanonicalActivationSchedule::revision),
+            Some(1)
+        );
+
+        let mut historical_entries = revised.activations().to_vec();
+        historical_entries[0].name = "Changed history".to_owned();
+        let historical_edit =
+            NetworkUpgradeActivations::new(Network::ZcashTestnet, historical_entries)?;
+        let error = store
+            .admit_network_upgrade_schedule(&historical_edit)
+            .err()
+            .ok_or("historical activation edit must be rejected")?;
+        assert!(error.to_string().contains("at or below canonical tip"));
+        drop(store);
+
+        let reopened = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &revised,
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(100)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(
+            reopened
+                .network_upgrade_schedule()
+                .map(crate::CanonicalActivationSchedule::revision),
+            Some(2)
+        );
+        assert_eq!(reopened.network_upgrade_activations(), Some(&revised));
+        Ok(())
+    }
+
+    #[test]
+    fn activation_schedule_crash_recovers_before_or_after_atomic_record_and_control_write()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let baseline =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let mut extended_entries = baseline.activations().to_vec();
+        extended_entries.push(NetworkUpgradeActivation {
+            branch_id: ConsensusBranchId::new(99),
+            activation_height: BlockHeight::new(11),
+            name: "Future".to_owned(),
+        });
+        let extended = NetworkUpgradeActivations::new(Network::ZcashTestnet, extended_entries)?;
+        drop(published_loaded_store(&store_path, BlockHeight::new(2))?);
+
+        run_activation_schedule_crash_child(&store_path, "before_atomic_write")?;
+        let before = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &baseline,
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(100)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(
+            before
+                .network_upgrade_schedule()
+                .map(crate::CanonicalActivationSchedule::revision),
+            None
+        );
+        drop(before);
+
+        run_activation_schedule_crash_child(&store_path, "after_atomic_write")?;
+        let after = RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &baseline,
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(100)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(
+            after
+                .network_upgrade_schedule()
+                .map(crate::CanonicalActivationSchedule::revision),
+            Some(1)
+        );
+        assert_eq!(after.network_upgrade_activations(), Some(&extended));
+        Ok(())
+    }
+
+    #[test]
     fn settled_sequence_checkpoint_advances_with_window_two_and_resumes_after_reopen()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
@@ -1859,6 +2108,31 @@ mod tests {
             &activations,
         )?;
         Err("live-commit failpoint did not abort the child process".into())
+    }
+
+    #[test]
+    fn activation_schedule_crash_child_process() -> Result<(), Box<dyn std::error::Error>> {
+        let Some(store_path) = env::var_os(ACTIVATION_SCHEDULE_STORE_PATH_ENV) else {
+            return Ok(());
+        };
+        let baseline =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let mut entries = baseline.activations().to_vec();
+        entries.push(NetworkUpgradeActivation {
+            branch_id: ConsensusBranchId::new(99),
+            activation_height: BlockHeight::new(11),
+            name: "Future".to_owned(),
+        });
+        let extended = NetworkUpgradeActivations::new(Network::ZcashTestnet, entries)?;
+        let _store = RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
+            Path::new(&store_path),
+            &extended,
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(100)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        Err("activation-schedule failpoint did not abort the child process".into())
     }
 
     #[test]
@@ -2772,6 +3046,26 @@ mod tests {
             .status()?;
         if status.success() {
             return Err(format!("live-commit failpoint {failpoint} did not crash").into());
+        }
+        Ok(())
+    }
+
+    fn run_activation_schedule_crash_child(
+        store_path: &Path,
+        failpoint: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let status = Command::new(env::current_exe()?)
+            .arg("--exact")
+            .arg("canonical_store::builder::tests::activation_schedule_crash_child_process")
+            .arg("--nocapture")
+            .env(ACTIVATION_SCHEDULE_STORE_PATH_ENV, store_path)
+            .env(ACTIVATION_SCHEDULE_FAILPOINT_ENV, failpoint)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if status.success() {
+            return Err(format!("activation-schedule failpoint {failpoint} did not crash").into());
         }
         Ok(())
     }

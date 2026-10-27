@@ -1084,6 +1084,9 @@ fn writer_status_response(
         network_name: encode_zinder_native_chain_name(store.network()).to_owned(),
         fence: Some(writer_fence_message(store)),
         oldest_retained_event_sequence: retention_floor,
+        network_upgrade_schedule: store
+            .network_upgrade_schedule()
+            .map(network_upgrade_schedule_message),
     })
 }
 
@@ -1203,6 +1206,10 @@ fn owner_checkpoint_response(
         ready_evidence: Some(checkpoint_ready_evidence_message(&evidence.ready_evidence)),
         build_plan: Some(checkpoint_build_plan_message(&evidence.build_plan)),
         database_identity: evidence.database_identity.clone(),
+        network_upgrade_schedule: evidence
+            .activation_schedule
+            .as_ref()
+            .map(network_upgrade_schedule_message),
     }
 }
 
@@ -1478,6 +1485,15 @@ fn map_store_error(error: &CanonicalStoreError) -> Status {
         }
         _ => Status::internal("canonical writer operation failed"),
     }
+}
+
+fn network_upgrade_schedule_message(
+    schedule: &zinder_store::CanonicalActivationSchedule,
+) -> zinder_proto::v1::ingest::CanonicalNetworkUpgradeSchedule {
+    zinder_proto::wire::encode_canonical_network_upgrade_schedule(
+        schedule.activations(),
+        schedule.revision(),
+    )
 }
 
 #[cfg(test)]

@@ -6,9 +6,8 @@ use rust_rocksdb::{DB, WriteBatch, WriteOptions};
 use zinder_core::{
     BlockHeight, BlockHeightRange, BlockId, CanonicalBlockFactsDigestVersion,
     CanonicalBlockFactsSequenceDigestBuilder, ChainEpochId, CommitmentTreeAccumulator,
-    CommitmentTreeCheckpoint, CompactBlockArtifact, NetworkUpgradeActivations,
-    NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol, SubtreeRootArtifact,
-    SubtreeRootHash, UnixTimestampMillis,
+    CommitmentTreeCheckpoint, CompactBlockArtifact, NetworkUpgradeActivations, ShieldedProtocol,
+    SubtreeRootArtifact, SubtreeRootHash, UnixTimestampMillis,
     wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
 
@@ -22,7 +21,7 @@ use super::{
     block_replay::{
         BLOCK_REPLAY_COLUMN_FAMILY, read_persisted_replay, resume_persisted_sequence_checkpoint,
     },
-    control::encode_ready_store_control,
+    control::encode_ready_store_control_with_schedule,
     displaced_archive::{
         CanonicalDisplacedBlock, DisplacedArchiveEvent, PreparedDisplacedArchiveWrite,
     },
@@ -309,11 +308,12 @@ impl PreparedLiveReplacement {
             visible_logical_replay_bytes: visible_sequence.logical_replay_bytes(),
             ..store.ready_evidence
         };
-        let encoded_control = encode_ready_store_control(
+        let encoded_control = encode_ready_store_control_with_schedule(
             store.workload,
             &store.build_plan,
             store.cursor_auth_key,
             &ready_evidence,
+            store.activation_schedule_binding(),
         )
         .map_err(|source| CanonicalStoreError::live_commit(source.to_string()))?;
         let tip_metadata = last.block.tip_metadata;
@@ -427,10 +427,7 @@ fn validate_activation_identity(
     store: &RocksDbCanonicalStore,
     activations: &NetworkUpgradeActivations,
 ) -> Result<(), CanonicalStoreError> {
-    if activations.network() != store.network()
-        || activations.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1)
-            != store.network_upgrade_activations_fingerprint()
-    {
+    if !store.activation_table_is_admitted(activations) {
         return Err(CanonicalStoreError::live_commit(
             "live replacement activation table differs from the admitted store identity",
         ));

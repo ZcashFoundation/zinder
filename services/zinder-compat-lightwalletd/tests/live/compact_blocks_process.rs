@@ -1057,6 +1057,7 @@ fn writer_status_for_fence(
             canonical_sequence_digest: fence.sequence_digest().as_bytes().to_vec(),
         }),
         oldest_retained_event_sequence: 1,
+        network_upgrade_schedule: None,
     }
 }
 

@@ -14,15 +14,21 @@ load and validate configuration
   -> open a ready canonical store
      or recover a published staging store
      or construct and publish a fresh store
-  -> start continuous canonical following
+  -> admit the discovered activations as a schedule revision
+  -> start continuous canonical following with the admitted schedule
   -> serve authenticated control commands and mempool state
 ```
 
-Store identity, network, workload, activation fingerprint, raw-blob retention,
-reorg policy, construction build plan, and schema are validated before a ready
-store is admitted. The immutable construction manifest must describe the same
-typed workload and complete build plan as the store control record. An
-incompatible non-empty path fails without mutation.
+Store identity, network, workload, construction activation fingerprint,
+raw-blob retention, reorg policy, construction build plan, and schema are
+validated before a ready store is admitted. The immutable construction manifest
+must describe the same typed workload and complete build plan as the store
+control record. An incompatible non-empty path fails without mutation.
+
+The writer then admits the node's activation table. A table that adds or
+changes only activations above the visible tip is journaled as the next
+schedule revision; a change at or below the tip fails without mutation. See
+[ADR-0008](../adrs/0008-network-parameter-discovery.md#schedule-admission).
 
 ## Fresh construction
 

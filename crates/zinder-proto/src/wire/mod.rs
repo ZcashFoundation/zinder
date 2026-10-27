@@ -11,11 +11,16 @@
 //! twin: it owns the translations whose return type is one of the
 //! generated `zinder_proto::v1::*` enums.
 
+mod activation_schedule;
 mod privacy_shape;
 mod transparent_delta_kind;
 mod utxo_set_commitment;
 mod wallet;
 
+pub use activation_schedule::{
+    ActivationScheduleWireError, decode_canonical_network_upgrade_schedule,
+    encode_canonical_network_upgrade_schedule,
+};
 pub use privacy_shape::{decode_privacy_shape, encode_privacy_shape};
 pub use transparent_delta_kind::{
     TRANSPARENT_DELTA_KIND_RECEIVED_BYTE, TRANSPARENT_DELTA_KIND_SPENT_BYTE,

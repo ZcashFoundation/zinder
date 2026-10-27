@@ -170,7 +170,7 @@ or compatibility. Canonical checkpoint requests accept only an opaque candidate
 identifier beneath that root; the projector prepares the candidate directory,
 ingest creates the fixed `canonical.rocksdb` child through its owner queue, and
 cold admission runs off the writer queue. The current capture foundation can add
-the exact-fence wallet checkpoint and publish a format-2 `state-bundle.json`
+the exact-fence wallet checkpoint and publish a format-3 `state-bundle.json`
 manifest last. It can also create and byte-admit a fixed-layout sealed recovery
 directory whose outer manifest is published last and binds every payload file,
 both checkpoint identities, and the canonical construction-manifest sidecar.

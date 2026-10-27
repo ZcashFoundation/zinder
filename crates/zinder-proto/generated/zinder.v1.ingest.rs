@@ -75,7 +75,7 @@ pub struct CanonicalWriterFence {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CanonicalWriterStatusRequest {}
 /// Status used by projectors and secondary readers to authenticate their view.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CanonicalWriterStatusResponse {
     #[prost(string, tag = "1")]
     pub network_name: ::prost::alloc::string::String,
@@ -83,6 +83,38 @@ pub struct CanonicalWriterStatusResponse {
     pub fence: ::core::option::Option<CanonicalWriterFence>,
     #[prost(uint64, tag = "3")]
     pub oldest_retained_event_sequence: u64,
+    /// Activation schedule the writer admitted for this store. Absent only when
+    /// no writer of this release has opened the store. The immutable
+    /// construction fingerprint is reported separately in checkpoint evidence.
+    #[prost(message, optional, tag = "4")]
+    pub network_upgrade_schedule: ::core::option::Option<
+        CanonicalNetworkUpgradeSchedule,
+    >,
+}
+/// One node-advertised network-upgrade activation in an admitted schedule.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CanonicalNetworkUpgradeActivation {
+    #[prost(uint32, tag = "1")]
+    pub branch_id: u32,
+    #[prost(uint32, tag = "2")]
+    pub height: u32,
+    #[prost(string, tag = "3")]
+    pub name: ::prost::alloc::string::String,
+}
+/// Writer-admitted network-upgrade schedule bound to canonical store control.
+/// The revision increases each time the writer admits a changed table; the
+/// fingerprint is the V1 activation-table fingerprint of `activations`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CanonicalNetworkUpgradeSchedule {
+    #[prost(uint64, tag = "1")]
+    pub revision: u64,
+    #[prost(uint32, tag = "2")]
+    pub fingerprint_version: u32,
+    #[prost(bytes = "vec", tag = "3")]
+    pub fingerprint: ::prost::alloc::vec::Vec<u8>,
+    /// Ordered by activation height; same-height order is significant.
+    #[prost(message, repeated, tag = "4")]
+    pub activations: ::prost::alloc::vec::Vec<CanonicalNetworkUpgradeActivation>,
 }
 /// Inclusive block-height range carried by one canonical transition.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -279,7 +311,7 @@ pub struct CreateCanonicalOwnerCheckpointRequest {
 }
 /// Cold-admitted canonical identity and READY evidence for one checkpoint.
 /// `candidate_id` names the operator-selected staging entry; it is not a path.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateCanonicalOwnerCheckpointResponse {
     #[prost(string, tag = "1")]
     pub candidate_id: ::prost::alloc::string::String,
@@ -300,6 +332,11 @@ pub struct CreateCanonicalOwnerCheckpointResponse {
     /// re-admission; it is opaque and is not filesystem authority.
     #[prost(bytes = "vec", tag = "8")]
     pub database_identity: ::prost::alloc::vec::Vec<u8>,
+    /// Admitted activation schedule cold-read from the physical checkpoint.
+    #[prost(message, optional, tag = "9")]
+    pub network_upgrade_schedule: ::core::option::Option<
+        CanonicalNetworkUpgradeSchedule,
+    >,
 }
 /// Re-admits an already-created canonical owner checkpoint at the fixed child
 /// of an opaque staging candidate. The canonical owner resolves the path below

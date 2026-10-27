@@ -21,7 +21,7 @@ Hardcoded per-network singletons cannot cover the regtest and custom-testnet cas
 
 ## Decision
 
-Zinder treats the running upstream node as the source of truth for per-network consensus parameters on every supported network, including mainnet and testnet. The activations are parsed once at process startup from `getblockchaininfo.upgrades` and carried through the process lifetime as an immutable, shared `Arc<NetworkUpgradeActivations>`. Every consumer that needs consensus parameters accepts the table at construction time; no service degrades silently to `PRE_OVERWINTER_BRANCH_ID` when the discovery call fails.
+Zinder treats the running upstream node as the source of truth for per-network consensus parameters on every supported network, including mainnet and testnet. Each process parses the node's table once at startup from `getblockchaininfo.upgrades`. The canonical writer admits that table into the canonical store as a schedule revision; it may change only activations above the store's visible tip. Readers serve the writer-admitted table. Every consumer that needs consensus parameters accepts the table at construction time as an immutable, shared `Arc<NetworkUpgradeActivations>`; no service degrades silently to `PRE_OVERWINTER_BRANCH_ID` when the discovery call fails.
 
 ### The carrier type
 
@@ -40,17 +40,35 @@ The type exposes pure-data queries:
 
 1. `ZebraJsonRpcSource::fetch_network_upgrade_activations()` parses `getblockchaininfo.upgrades` and validates branch-id uniqueness. The map key (hex branch id) becomes `branch_id`; the value's `name` and `activationheight` become `name` and `activation_height`.
 2. `ZebraJsonRpcSource::discover_network_upgrade_activations(target)` wraps the fetch, emits a `network_upgrade_activations_discovered` structured log event keyed by service name, and returns `Arc<NetworkUpgradeActivations>`. The four service binaries call this one helper so the discovery event shape stays consistent across the workspace.
-3. Consumers receive `Arc<NetworkUpgradeActivations>` at construction and call methods on the owned type. No process ever consults `zcash_chain::Network::sapling_activation_height` or any other library-default constant.
+3. The canonical writer admits the discovered table when it opens the store (see [Schedule admission](#schedule-admission)). It follows the chain with the admitted table.
+4. Readers open their canonical secondary with their own discovered table, which must agree with the admitted schedule at or below the visible tip, and then serve the admitted table. A node may advertise a different future activation, but a reader never admits it.
+5. Consumers call methods on the owned type. No process ever consults `zcash_chain::Network::sapling_activation_height` or any other library-default constant.
 
 Production code does not consult `RegtestParameters::default()` or library-default activation singletons; consumers receive `Arc<NetworkUpgradeActivations>` and call methods on the owned type. The testkit's `regtest_local_network()` is derived from `sample_regtest_upgrade_activations()` so the in-process unit-test fixtures cannot drift from the discovery path; doc comments steer live tests toward `local_network_from_activations(&activations)` and `discover_network_upgrade_activations()`.
 
 ### Wiring contract per service
 
-- **`zinder-ingest`** discovers the activations before canonical construction so transaction parsing and the immutable store identity use the node's exact table. Wallet-serving coverage independently requires complete transparent history.
-- **`zinder-query`** holds `Arc<NetworkUpgradeActivations>` on `WalletServingQuery` as a required constructor parameter. `MinedTransactionChainContext.consensus_branch_id` always reflects the running node's active branch at the mined height. The production binary errors out at startup if `[node]` is not configured (the table cannot be discovered without an RPC endpoint).
+- **`zinder-ingest`** discovers the activations before canonical construction or restart. Fresh construction fingerprints that table into the build plan; every writer open then admits the table as a schedule revision before following. Wallet-serving coverage independently requires complete transparent history.
+- **`zinder-projector`** converges on the writer's fence and admitted schedule revision, and binds that schedule identity into each state-bundle manifest.
+- **`zinder-query`** holds `Arc<NetworkUpgradeActivations>` on `WalletServingQuery` as a required constructor parameter, but serves the schedule admitted with the captured serving pair. `MinedTransactionChainContext.consensus_branch_id` reflects that table at the mined height. The pair publisher republishes when the writer reports a new schedule revision, even if the fence has not moved. The production binary errors out at startup if `[node]` is not configured (the table cannot be discovered without an RPC endpoint).
 - **`zinder-compat-lightwalletd`** holds `Arc<NetworkUpgradeActivations>` on `LightwalletdGrpcAdapter` as a required constructor parameter. `GetLightdInfo` reads the table directly. Same startup-time failure if `[node]` is not configured.
 - **`zinder-client`** discovers the table through `RemoteChainIndex::network_upgrade_activations`, after preflighting the native server's identity, network, contract revision, and advertised capability.
 - **`zinder-testkit`** exposes `local_network_from_activations(&activations) -> LocalNetwork` for live tests; `TransparentTestKey::from_seed_with_local_network` accepts the result. `regtest_local_network()` is derived from `sample_regtest_upgrade_activations()` so the two regtest fixtures cannot drift.
+
+### Schedule admission
+
+The build plan's activation fingerprint is immutable construction identity. Schedule admission never rewrites it, canonical rows, the construction manifest, or wallet projection identity.
+
+The writer keeps a journal of `CanonicalActivationSchedule` revisions in the canonical store. Each revision records the complete admitted table, the visible tip it was admitted at, and a digest link to its predecessor. Store control binds the latest revision number and digest in a versioned trailer. Releases that predate schedule admission reject both the journal keys and the trailer, so an older binary refuses a store after its first admission.
+
+When the writer opens a store:
+
+- **No revision yet.** No writer of this release has opened the store. The writer accepts the node's table only if an exact ordered prefix of it reproduces the build plan's fingerprint on the same network, and every entry after that prefix activates above the visible tip. It records the complete table as revision 1. Any other table is refused with the store unchanged.
+- **Existing revision.** The node's table must equal the admitted table at or below the visible tip, including names and same-height order. An identical table adds no revision; a table that differs only above the tip becomes the next revision. A change at or below the tip is refused with the store unchanged.
+
+The revision record and store control are written in one synced batch, so a crash leaves either the previous or the new revision. Revisions are admitted only by the writer that owns the primary, against its visible tip at that moment.
+
+Readers never write a revision. Until the writer's first admission, a reader's table must reproduce the construction fingerprint exactly. `CanonicalControl.WriterStatus` and `CanonicalControl.CreateOwnerCheckpoint` responses carry the admitted table, revision, and V1 fingerprint.
 
 ### Regression test
 
@@ -60,7 +78,8 @@ A live test in `crates/zinder-source/tests/live/zebra_json_rpc.rs` calls `fetch_
 
 ### What this enables
 
-- Operators can iterate on regtest activation heights via their `zebrad.toml` without forking Zinder or coordinating a code change. Restart Zinder to pick up the new table.
+- A node release that announces a future network upgrade, such as Zebra 7.0.0 appending NU7 to the Zebra 6.2.2 table, does not require a canonical or wallet rebuild. Restart ingest so the writer admits the new table, then restart its readers.
+- Operators can revise regtest activation heights above the current tip via their `zebrad.toml` without forking Zinder. Changing an activation the store has already crossed fails closed.
 - `MinedTransactionChainContext.consensus_branch_id` is correct on every network for every supported upgrade automatically; no Zinder code-change tax per upgrade.
 - New consumers that need consensus parameters have one obvious answer: accept `Arc<NetworkUpgradeActivations>` in your constructor; the production binary already discovers and shares one.
 - Custom testnets become first-class: the table discovers itself from the node; nothing in Zinder hardcodes mainnet/testnet activation heights.
@@ -68,14 +87,11 @@ A live test in `crates/zinder-source/tests/live/zebra_json_rpc.rs` calls `fetch_
 
 ### What this costs
 
-- Each process pays one `getblockchaininfo` round-trip at startup so consensus parsing and served upgrade metadata use the node's exact activation table.
+- Each process pays one `getblockchaininfo` round-trip at startup. The writer then pays one synced write when the table changed.
 - The table is cached for process lifetime. If the operator reconfigures the node's activation heights mid-flight without restarting Zinder, the cache goes stale until restart. Documented in the runbook.
+- A reader whose node advertises a newer table than the store's construction baseline refuses to open until the writer has admitted a revision, so ingest must restart first.
+- The first admission makes the store unreadable by older Zinder releases. Downgrading requires a checkpoint taken before the upgrade.
 - Tests that exercise `WalletQuery` or `LightwalletdGrpcAdapter` must pass an activations table. The testkit's `sample_regtest_upgrade_activations()` covers the common case; the cost is one extra line per test.
-
-### Out of scope for this ADR
-
-- Sharing the discovered table via `IngestControl` from the writer to readers. Each process discovers the table from its configured node and owns its cached value for its lifetime.
-- Persisting the table in the on-disk store metadata. Discovery from the live node remains the source of truth; operators iterating on regtest must not be punished by a store-reset cost.
 
 ## Vocabulary
 
@@ -85,5 +101,10 @@ A live test in `crates/zinder-source/tests/live/zebra_json_rpc.rs` calls `fetch_
 - `ZebraJsonRpcSource::fetch_network_upgrade_activations` (the discovery function).
 - `ZebraJsonRpcSource::discover_network_upgrade_activations(target)` (the shared startup wrapper that returns `Arc<NetworkUpgradeActivations>` and emits a structured discovery log).
 - `local_network_from_activations` (the testkit bridge to `zcash_protocol::LocalNetwork`).
+- `CanonicalActivationSchedule` (one writer-admitted schedule revision in the canonical store).
 
 See [Public interfaces §Domain types](../architecture/public-interfaces.md#domain-types).
+
+## Revision history
+
+- 2026-10-27: The canonical writer admits the node's table as a schedule revision instead of requiring it to equal the construction fingerprint. Readers serve the admitted schedule, and writer status, owner checkpoints, and state bundles carry its identity.
