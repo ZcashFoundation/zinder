@@ -19,6 +19,9 @@ const NU7_BRANCH_ID: u32 = 0x7719_0ad9;
 const NU7_FIXTURE: &str = include_str!(
     "../../../../services/zinder-ingest/tests/fixtures/zakura-regtest-nu7-block-3.json"
 );
+const ZEBRA_7_NU7_FIXTURE: &str = include_str!(
+    "../../../../services/zinder-ingest/tests/fixtures/zebra-7.0.0-regtest-nu7-block-159.json"
+);
 
 #[test]
 fn pre_nu7_coinbase_keeps_node_reported_identifiers() -> Result<()> {
@@ -33,6 +36,63 @@ fn pre_nu7_coinbase_keeps_node_reported_identifiers() -> Result<()> {
 #[test]
 fn nu7_coinbase_keeps_node_reported_identifiers() -> Result<()> {
     assert_captured_coinbase_facts(NU7_FIXTURE, NU7_BRANCH_ID)
+}
+
+/// A post-NU7 Zebra 7.0.0 block with an Ironwood coinbase and a version-6
+/// transparent spend. Every transaction keeps the txid and authorization
+/// digest the capturing node reported.
+#[test]
+fn zebra_7_nu7_block_keeps_node_reported_identifiers() -> Result<()> {
+    let fixture: Value = serde_json::from_str(ZEBRA_7_NU7_FIXTURE)?;
+    let raw_block_bytes = hex::decode(string_field(&fixture, "raw_block_hex")?)?;
+    let height = fixture
+        .get("height")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| eyre!("fixture field height must be an integer"))?;
+    let source_block = SourceBlock::from_raw_block_bytes(
+        Network::ZcashRegtest,
+        BlockHeight::new(u32::try_from(height)?),
+        raw_block_bytes.clone(),
+    )?;
+    assert_eq!(
+        source_block.hash,
+        decode_rpc_block_hash(string_field(&fixture, "hash")?)?
+    );
+
+    let block = Block::zcash_deserialize(&mut Cursor::new(raw_block_bytes.as_slice()))?;
+    let expected_transactions = fixture
+        .get("transactions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| eyre!("fixture field transactions must be an array"))?;
+    assert_eq!(block.transactions.len(), expected_transactions.len());
+    for (index, (transaction, expected)) in block
+        .transactions
+        .iter()
+        .zip(expected_transactions)
+        .enumerate()
+    {
+        let fact_set = parse_transaction_public_fact_set(
+            &transaction.zcash_serialize_to_vec()?,
+            None,
+            &NetworkUpgradeActivations::empty(Network::ZcashRegtest),
+        )?;
+        let facts = fact_set.public_facts;
+        assert_eq!(
+            encode_rpc_transaction_id_hex(facts.transaction_id),
+            string_field(expected, "txid")?
+        );
+        assert_eq!(
+            facts.auth_digest.map(encode_rpc_auth_digest_hex).as_deref(),
+            Some(string_field(expected, "authdigest")?)
+        );
+        assert_eq!(facts.version, TransactionVersion::V6);
+        assert_eq!(
+            facts.consensus_branch_id,
+            Some(ConsensusBranchId::new(NU7_BRANCH_ID))
+        );
+        assert_eq!(facts.is_coinbase, index == 0);
+    }
+    Ok(())
 }
 
 #[test]

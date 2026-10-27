@@ -16,7 +16,8 @@ use zinder_core::{
     CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
     CanonicalTransactionFacts, ConsensusBranchId, Network, NetworkUpgradeActivation,
     NetworkUpgradeActivations, TransactionFactsArtifact, TransactionLocation, TransparentInputFact,
-    decode_canonical_block_replay, wire::encode_rpc_transaction_id_hex,
+    decode_canonical_block_replay,
+    wire::{encode_rpc_auth_digest_hex, encode_rpc_transaction_id_hex},
 };
 use zinder_ingest::{
     BlockMismatchField, CanonicalBlockConstructionError, CommitmentTreeSizes,
@@ -486,6 +487,123 @@ fn nu7_activation_block_prepares_canonical_facts() -> Result<(), Box<dyn Error>>
         )
     );
 
+    Ok(())
+}
+
+/// Zebra 7.0.0 Regtest schedule that produced the
+/// `zebra-7.0.0-regtest-nu7-block-159` fixture.
+fn zebra_7_regtest_activations() -> Result<NetworkUpgradeActivations, Box<dyn Error>> {
+    let upgrades = [
+        (0x5ba8_1b19, "Overwinter", 1),
+        (0x76b8_09bb, "Sapling", 1),
+        (0x2bb4_0e60, "Blossom", 1),
+        (0xf5b9_230b, "Heartwood", 1),
+        (0xe9ff_75a6, "Canopy", 1),
+        (0xc2d6_d0b4, "NU5", 2),
+        (0xc8e7_1055, "NU6", 3),
+        (0x4dec_4df0, "NU6.1", 4),
+        (0x5437_f330, "NU6.2", 5),
+        (0x37a5_165b, "NU6.3", 6),
+        (0x7719_0ad9, "NU7", 140),
+    ];
+    Ok(NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        upgrades
+            .into_iter()
+            .map(|(branch_id, name, height)| NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(branch_id),
+                activation_height: BlockHeight::new(height),
+                name: name.to_owned(),
+            })
+            .collect(),
+    )?)
+}
+
+#[test]
+fn zebra_7_nu7_block_prepares_canonical_facts() -> Result<(), Box<dyn Error>> {
+    let fixture_json = include_str!("../fixtures/zebra-7.0.0-regtest-nu7-block-159.json");
+    let fixture: Value = serde_json::from_str(fixture_json)?;
+    let source_block = fixture_source_block_from(Network::ZcashRegtest, fixture_json)?;
+    let activations = zebra_7_regtest_activations()?;
+
+    // Seed the running tree position with the node's sizes before this block:
+    // its reported sizes after the block, less the note commitments the block
+    // itself adds, counted by zebra-chain's parser.
+    let parsed_block: ZebraBlock = source_block
+        .raw_block_bytes
+        .as_slice()
+        .zcash_deserialize_into()?;
+    let added = |count: fn(&zebra_chain::transaction::Transaction) -> usize| {
+        parsed_block
+            .transactions
+            .iter()
+            .map(|transaction| count(transaction))
+            .sum::<usize>()
+    };
+    let node_size = |pool: &'static str| -> Result<u32, Box<dyn Error>> {
+        Ok(u32::try_from(
+            fixture
+                .get("trees")
+                .and_then(|trees| trees.get(pool))
+                .and_then(Value::as_u64)
+                .ok_or_else(|| format!("fixture tree size {pool} must be an integer"))?,
+        )?)
+    };
+    let node_sizes = (
+        node_size("sapling")?,
+        node_size("orchard")?,
+        node_size("ironwood")?,
+    );
+    let mut tree_sizes = CommitmentTreeSizes {
+        sapling: node_sizes.0 - u32::try_from(added(|tx| tx.sapling_note_commitments().count()))?,
+        orchard: node_sizes.1 - u32::try_from(added(|tx| tx.orchard_note_commitments().count()))?,
+        ironwood: node_sizes.2 - u32::try_from(added(|tx| tx.ironwood_note_commitments().count()))?,
+    };
+    let prepared = prepare_canonical_block(&source_block, &activations, RawBlobPolicy::All)?;
+    let block = position_canonical_block(prepared, &mut tree_sizes)?;
+    assert_transaction_bytes_match_parsed_source(&source_block, &block)?;
+    assert_compact_transaction_ids_match_canonical_facts(&block)?;
+
+    let expected_transactions = fixture
+        .get("transactions")
+        .and_then(Value::as_array)
+        .ok_or("fixture field transactions must be an array")?;
+    assert_eq!(block.facts.transactions.len(), expected_transactions.len());
+    for (transaction, expected) in block.facts.transactions.iter().zip(expected_transactions) {
+        let facts = &transaction.public_facts;
+        assert_eq!(
+            encode_rpc_transaction_id_hex(facts.transaction_id),
+            string_field(expected, "txid")?
+        );
+        assert_eq!(
+            facts.auth_digest.map(encode_rpc_auth_digest_hex).as_deref(),
+            Some(string_field(expected, "authdigest")?)
+        );
+        assert_eq!(facts.version, zinder_core::TransactionVersion::V6);
+        assert_eq!(
+            facts.consensus_branch_id,
+            Some(ConsensusBranchId::new(0x7719_0ad9))
+        );
+    }
+
+    let metadata = block.compact_block.chain_metadata();
+    assert_eq!(
+        (
+            metadata.sapling_commitment_tree_size,
+            metadata.orchard_commitment_tree_size,
+            metadata.ironwood_commitment_tree_size,
+        ),
+        node_sizes,
+        "compact metadata must match the node's tree sizes after the block"
+    );
+    let coinbase = block
+        .compact_block
+        .transactions()
+        .iter()
+        .find(|transaction| transaction.index == 0)
+        .ok_or("compact block must carry the shielded coinbase")?;
+    assert_eq!(coinbase.data.ironwood_actions.len(), 1);
+    assert!(coinbase.data.orchard_actions.is_empty());
     Ok(())
 }
 
