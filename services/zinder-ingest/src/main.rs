@@ -1021,6 +1021,7 @@ fn canonical_writer_config(
             request_timeout: command_config.runtime_config.node.request_timeout,
             poll_interval: command_config.runtime_config.follow.poll_interval,
             lag_threshold_blocks: command_config.runtime_config.follow.lag_threshold_blocks,
+            max_replacement_bytes: command_config.runtime_config.follow.max_replacement_bytes,
             target_height: command_config.runtime_config.run_overrides.target_height,
             event_retention_window: command_config.retention.chain_event_window(),
             event_retention_check_interval: command_config.retention.chain_event_check_interval(),

@@ -1186,6 +1186,17 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "Block lag at which tip-follow reports `cause=syncing`. Defaults to 1.",
     },
     EnvVarDoc {
+        name: "ZINDER_INGEST__FOLLOW__MAX_REPLACEMENT_BYTES",
+        toml_path: "ingest.follow.max_replacement_bytes",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Maximum bytes of prepared blocks one canonical replacement may hold before \
+                      its atomic commit. A deeper or heavier replacement fails with \
+                      `ReplacementBytesExceeded` before any write; raise the limit to follow \
+                      it. Defaults to 2147483648.",
+    },
+    EnvVarDoc {
         name: "ZINDER_INGEST__RUN_OVERRIDES__TARGET_HEIGHT",
         toml_path: "ingest.run_overrides.target_height",
         used_by: &["zinder-ingest"],

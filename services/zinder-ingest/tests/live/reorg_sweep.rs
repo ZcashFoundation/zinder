@@ -94,6 +94,7 @@ async fn canonical_writer_publishes_visible_reorg_for_invalidated_zebra_suffix()
             event_retention_window: None,
             event_retention_check_interval: Duration::from_secs(1),
             mempool_ready_gate: None,
+            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
         },
     };
     let (canonical, commands) = canonical_control_channel();

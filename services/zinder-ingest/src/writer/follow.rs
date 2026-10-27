@@ -1,6 +1,12 @@
 //! Continuous append-only following for the canonical store.
 
-use std::{collections::BTreeMap, future::Future, num::NonZeroU32, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    num::{NonZeroU32, NonZeroU64},
+    sync::Arc,
+    time::Duration,
+};
 
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -53,7 +59,19 @@ pub struct CanonicalFollowConfig {
     /// publish `Ready` only after the current source generation has completed
     /// its in-memory snapshot.
     pub mempool_ready_gate: Option<MempoolReadyGate>,
+    /// Maximum bytes of prepared replacement blocks held in memory while one
+    /// replacement is prepared. A replacement commits atomically, so its whole
+    /// suffix, up to one reorg window, is prepared before the write.
+    pub max_replacement_bytes: NonZeroU64,
 }
+
+/// Default for [`CanonicalFollowConfig::max_replacement_bytes`]: 2 GiB, room
+/// for a full reorg window of blocks well above the Mainnet average size.
+pub const DEFAULT_MAX_REPLACEMENT_BYTES: NonZeroU64 =
+    match NonZeroU64::new(2 * 1_024 * 1_024 * 1_024) {
+        Some(bytes) => bytes,
+        None => NonZeroU64::MIN,
+    };
 
 /// Source and operational state bound to one canonical follower lane.
 pub struct CanonicalFollower<'a, Source> {
@@ -294,6 +312,20 @@ pub enum CanonicalFollowError {
     /// The source fork has no common parent above the authenticated settlement boundary.
     #[error(transparent)]
     ReorgWindowExceeded(Box<CanonicalReorgWindowExceeded>),
+    /// Preparing one replacement exceeded its memory budget before commit.
+    #[error(
+        "preparing a {replacement_depth}-block replacement exceeded ingest.follow.max_replacement_bytes ({max_replacement_bytes} bytes) after {prepared_blocks} blocks and {prepared_bytes} bytes; raise it to follow this reorg"
+    )]
+    ReplacementBytesExceeded {
+        /// Blocks the replacement replaces or appends.
+        replacement_depth: u32,
+        /// Blocks prepared before the budget ran out.
+        prepared_blocks: u32,
+        /// Estimated bytes of the prepared blocks, including the refused one.
+        prepared_bytes: u64,
+        /// Configured budget.
+        max_replacement_bytes: u64,
+    },
     /// The retained canonical row needed to advance settlement is absent.
     #[error("canonical settled-tip header is absent at height {height:?}")]
     SettlementHeaderAbsent {
@@ -768,6 +800,11 @@ where
     let raw_blob_retention = store.raw_blob_retention();
     let mut previous_tip_metadata = predecessor_checkpoint.tip_metadata();
     let mut replacement_blocks = Vec::new();
+    let mut prepared_bytes = 0_u64;
+    let replacement_depth = replacement_tip_height
+        .value()
+        .saturating_sub(first_replacement_height.value())
+        .saturating_add(1);
     let mut height = Some(first_replacement_height);
     while let Some(current_height) = height.filter(|height| *height <= replacement_tip_height) {
         let source_block = if let Some(source_block) = source_blocks.remove(&current_height) {
@@ -826,6 +863,17 @@ where
             next_tip_metadata,
         )
         .await?;
+        prepared_bytes = prepared_bytes.saturating_add(prepared_replacement_bytes(&block));
+        if prepared_bytes > config.max_replacement_bytes.get() {
+            return Err(CanonicalFollowError::ReplacementBytesExceeded {
+                replacement_depth,
+                prepared_blocks: u32::try_from(replacement_blocks.len())
+                    .unwrap_or(u32::MAX)
+                    .saturating_add(1),
+                prepared_bytes,
+                max_replacement_bytes: config.max_replacement_bytes.get(),
+            });
+        }
         replacement_blocks.push(CanonicalReplacementBlock::new(block, subtree_roots));
         predecessor_checkpoint = source_checkpoint;
         previous_tip_metadata = next_tip_metadata;
@@ -854,6 +902,26 @@ where
         )),
         observed_tip,
     })
+}
+
+/// Estimates the bytes one prepared replacement block holds until commit: its
+/// replay envelope and the decoded facts it encodes, plus retained raw bytes.
+fn prepared_replacement_bytes(block: &CanonicalBuildBlock) -> u64 {
+    let replay_bytes = u64::try_from(block.replay_envelope.as_bytes().len()).unwrap_or(u64::MAX);
+    let raw_bytes = block
+        .transaction_blobs
+        .iter()
+        .map(|blob| blob.raw_transaction_bytes.len())
+        .chain(
+            block
+                .block_blob
+                .iter()
+                .map(|blob| blob.raw_block_bytes.len()),
+        )
+        .fold(0_u64, |total, bytes| {
+            total.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX))
+        });
+    replay_bytes.saturating_mul(2).saturating_add(raw_bytes)
 }
 
 /// Serves owner commands from a writer parked on a reorg deeper than its

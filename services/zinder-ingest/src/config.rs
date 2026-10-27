@@ -266,6 +266,10 @@ pub(crate) fn load_ingest_config(
             DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS,
         )?
         .with_default(
+            "ingest.follow.max_replacement_bytes",
+            zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES.get(),
+        )?
+        .with_default(
             "ingest.run_overrides.allow_reorg_window_settlement",
             DEFAULT_ALLOW_REORG_WINDOW_SETTLEMENT,
         )?
@@ -492,6 +496,7 @@ struct IngestConstructionSection {
 struct IngestFollowSection {
     poll_interval_ms: Option<u64>,
     lag_threshold_blocks: Option<u64>,
+    max_replacement_bytes: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -723,6 +728,13 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         config.ingest.follow.lag_threshold_blocks,
         "ingest.follow.lag_threshold_blocks",
     )?;
+    let max_replacement_bytes = NonZeroU64::new(require_field(
+        config.ingest.follow.max_replacement_bytes,
+        "ingest.follow.max_replacement_bytes",
+    )?)
+    .ok_or_else(|| {
+        ConfigError::invalid("ingest.follow.max_replacement_bytes must be greater than zero")
+    })?;
 
     let coverage = config.ingest.run_overrides.coverage.unwrap_or_default();
     let raw_blob_policy = resolve_raw_blob_policy(coverage, configured_raw_blob_policy)?;
@@ -816,6 +828,7 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         follow: CanonicalFollowSettings {
             poll_interval,
             lag_threshold_blocks,
+            max_replacement_bytes,
         },
         run_overrides,
     };
@@ -1016,6 +1029,7 @@ impl RedactedIngestConfigToml {
                 follow: IngestFollowToml {
                     poll_interval_ms: duration_as_millis_u64(runtime_config.follow.poll_interval),
                     lag_threshold_blocks: runtime_config.follow.lag_threshold_blocks,
+                    max_replacement_bytes: runtime_config.follow.max_replacement_bytes.get(),
                 },
                 run_overrides: IngestRunOverridesToml {
                     target_height: runtime_config
@@ -1117,6 +1131,7 @@ struct IngestConstructionToml {
 struct IngestFollowToml {
     poll_interval_ms: u64,
     lag_threshold_blocks: u64,
+    max_replacement_bytes: u64,
 }
 
 #[derive(Serialize)]
