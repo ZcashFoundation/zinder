@@ -83,12 +83,20 @@ on catch-up and refuses a lower one.
 
 A park remains possible, for example after the node is replaced or resynced,
 and wallets must not keep serving a branch that stopped advancing. The parked
-writer therefore keeps its control listener open and reports the halt through
+writer therefore stops following but keeps its store and control plane until
+termination. It serves its frozen fence, retained events, retention leases,
+and owner checkpoints, so the projector and query start and stay converged
+against it, and it reports the halt through
 `IngestControl.WriterStatus.reorg_window_exceeded` (the existing
-`ReorgWindowExceededDetail`), without a chain view because it has no live
-fence. Native query maps that report to its own `reorg_window_exceeded`
-readiness cause, which takes precedence over the serving-pair failures the
-park causes.
+`ReorgWindowExceededDetail`). The halt is a terminal readiness state that no
+other ingest worker can replace. Native query maps that report to its own
+`reorg_window_exceeded` readiness cause, which takes precedence over the
+serving-pair failures the park could cause.
+
+The supported single-host image keeps running in this state. Restarting would
+park the writer on the same reorg and replace the typed refusal with refused
+connections, so its entrypoint ends the container only for causes such as
+`schema_mismatch` and `node_capability_missing`.
 
 Wallet consumers receive the halt through the existing error vocabulary:
 

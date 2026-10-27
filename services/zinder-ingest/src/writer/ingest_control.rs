@@ -151,15 +151,20 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
         _request: Request<WriterStatusRequest>,
     ) -> Result<Response<WriterStatusResponse>, Status> {
         let readiness_report = self.readiness.report();
-        // A parked writer no longer owns a live fence, but readers still need
-        // its typed halt rather than an unavailable control channel.
-        let chain_epoch = if matches!(
-            readiness_report.cause,
-            ReadinessCause::ReorgWindowExceeded { .. }
-        ) {
-            None
-        } else {
-            Some(self.current_chain_epoch().await?.chain_epoch)
+        // A parked writer reports its frozen fence while it still answers;
+        // once its owner loop has stopped, readers still need the typed halt
+        // rather than an unavailable control channel.
+        let chain_epoch = match self.current_chain_epoch().await {
+            Ok(snapshot) => Some(snapshot.chain_epoch),
+            Err(_)
+                if matches!(
+                    readiness_report.cause,
+                    ReadinessCause::ReorgWindowExceeded { .. }
+                ) =>
+            {
+                None
+            }
+            Err(status) => return Err(status),
         };
         Ok(Response::new(writer_status_response(
             self.network,

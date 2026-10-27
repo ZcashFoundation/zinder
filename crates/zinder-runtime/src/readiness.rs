@@ -9,7 +9,14 @@
 //! type below converts to the proto message via [`Into`] for any gRPC
 //! consumer.
 
-use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -443,6 +450,7 @@ struct MaterializedViewWorkload {
 #[derive(Clone, Debug)]
 pub struct Readiness {
     inner: Arc<Mutex<ReadinessState>>,
+    parked: Arc<AtomicBool>,
     materialized_view_workload: Arc<Mutex<MaterializedViewWorkload>>,
 }
 
@@ -458,8 +466,30 @@ impl Readiness {
     pub fn new(state: ReadinessState) -> Self {
         Self {
             inner: Arc::new(Mutex::new(state)),
+            parked: Arc::new(AtomicBool::new(false)),
             materialized_view_workload: Arc::new(Mutex::new(MaterializedViewWorkload::default())),
         }
+    }
+
+    /// Sets a terminal state that later writers cannot replace until the
+    /// process restarts.
+    ///
+    /// A canonical writer parked on a reorg deeper than its window keeps
+    /// serving its control plane while other workers still run; none of them
+    /// may replace the halt with a recoverable cause. Only
+    /// [`ReadinessCause::ShuttingDown`] replaces a parked state.
+    pub fn park(&self, state: ReadinessState) {
+        // Raising the flag first means any writer that takes the lock after
+        // this point is rejected, and one that held it earlier is overwritten.
+        self.parked.store(true, Ordering::Release);
+        let mut guard = self.inner.lock();
+        let phase = state.phase.or(guard.phase);
+        *guard = state;
+        guard.phase = phase;
+    }
+
+    fn parked_rejects(&self, cause: &ReadinessCause) -> bool {
+        self.parked.load(Ordering::Acquire) && !matches!(cause, ReadinessCause::ShuttingDown)
     }
 
     /// Sets the closed materialized-view workload exposed by readiness and metrics.
@@ -486,8 +516,13 @@ impl Readiness {
     /// upstream target, so they retain the preceding target through the
     /// warning and its transition back to ready. An explicit
     /// [`ReadinessState::with_phase`] on `state` overrides the phase.
+    ///
+    /// A [parked](Self::park) state ignores every cause except shutdown.
     pub fn set(&self, state: ReadinessState) {
         let mut guard = self.inner.lock();
+        if self.parked_rejects(&state.cause) {
+            return;
+        }
         let mut state = state;
         let phase = state.phase.or(guard.phase);
         let warning_replaces_chain_state = state.cause.preserves_observed_target();
@@ -506,12 +541,17 @@ impl Readiness {
     /// (for example: setting a new `cause` while preserving the
     /// concurrently-updated `current_height` or `phase`). The lock is
     /// held for the duration of `update`, so concurrent readers and
-    /// writers see the pre- and post-state but never a torn read.
+    /// writers see the pre- and post-state but never a torn read. A
+    /// [parked](Self::park) state ignores updates.
     pub fn update<F>(&self, update: F)
     where
         F: FnOnce(&mut ReadinessState),
     {
-        update(&mut self.inner.lock());
+        let mut guard = self.inner.lock();
+        if self.parked.load(Ordering::Acquire) {
+            return;
+        }
+        update(&mut guard);
     }
 
     /// Sets the [`IngestPhase`] on the current state without disturbing
@@ -535,6 +575,9 @@ impl Readiness {
     /// concurrently-set ingest phase. Used by the upstream-health probe.
     pub fn set_upstream_not_ready(&self, detail: UpstreamNotReadyDetail) {
         let mut guard = self.inner.lock();
+        if self.parked.load(Ordering::Acquire) {
+            return;
+        }
         guard.cause = ReadinessCause::UpstreamNotReady(detail);
         guard.target_height = None;
     }
@@ -1076,6 +1119,42 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn parked_readiness_keeps_its_halt_until_shutdown() {
+        let readiness = Readiness::new(ReadinessState::ready(Some(10)));
+        readiness.park(
+            ReadinessState::reorg_window_exceeded(1_001, 1_000, Some(10))
+                .with_phase(IngestPhase::FollowingTip),
+        );
+        readiness.set(ReadinessState::ready(Some(11)));
+        readiness.set_upstream_not_ready(UpstreamNotReadyDetail {
+            upstream_committed_height: None,
+            upstream_estimated_height: None,
+            upstream_verification_progress: None,
+            upstream_health: UpstreamHealth {
+                source: "zebra_ready_endpoint",
+                reason: Cow::Borrowed("syncing"),
+            },
+        });
+        readiness.update(|state| state.cause = ReadinessCause::Ready);
+        let report = readiness.report();
+        assert!(!report.is_ready);
+        assert!(matches!(
+            report.cause,
+            ReadinessCause::ReorgWindowExceeded {
+                depth: 1_001,
+                configured: 1_000,
+            }
+        ));
+        assert_eq!(report.phase, Some(IngestPhase::FollowingTip));
+
+        readiness.set(ReadinessState::not_ready(ReadinessCause::ShuttingDown));
+        assert!(matches!(
+            readiness.report().cause,
+            ReadinessCause::ShuttingDown
+        ));
     }
 
     #[test]

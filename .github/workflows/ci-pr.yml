@@ -160,6 +160,9 @@ jobs:
       - name: Test deployment admission
         run: scripts/test-deployment-admission.sh
 
+      - name: Test wallet-serving entrypoint
+        run: scripts/test-wallet-serving-entrypoint.sh
+
       - name: Test release image publication
         run: scripts/test-release-image-publication.sh
 
