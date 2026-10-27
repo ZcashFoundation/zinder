@@ -133,9 +133,11 @@ impl RocksDbWalletSecondary {
         let control = decode_only_control(&self.store.bounded_open)?;
         let ready_evidence =
             ready_evidence_from_control(&control, &self.primary_path, self.expected_network)?;
-        if control.supported_reorg_depth != self.store.control.supported_reorg_depth {
+        // The projector raises the depth in place when the canonical window
+        // is raised; it never lowers it.
+        if control.supported_reorg_depth < self.store.control.supported_reorg_depth {
             return Err(RocksDbWalletError::AdmissionChanged {
-                reason: "wallet supported reorg depth changed during secondary catch-up",
+                reason: "wallet supported reorg depth regressed during secondary catch-up",
             });
         }
         let after = WalletCanonicalSourceIdentity::from_ready_evidence(&ready_evidence);

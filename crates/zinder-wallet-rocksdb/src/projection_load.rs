@@ -1019,6 +1019,83 @@ mod tests {
     }
 
     #[test]
+    fn retained_undo_accounting_bounds_a_thousand_block_unsettled_suffix()
+    -> Result<(), Box<dyn Error>> {
+        const DEPTH: u32 = 1_000;
+        // The projector's default `build.max_accounted_reorg_undo_bytes`.
+        const DEFAULT_UNDO_CAP_BYTES: u64 = 512 * 1024 * 1024;
+        // Created and spent outpoints per block in a transparent-heavy suffix.
+        const OUTPOINTS_PER_BLOCK: u32 = 64;
+        let settled_tip = BlockId::new(BlockHeight::new(10_000), BlockHash::from_bytes([1; 32]));
+        let digest = CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+            CanonicalBlockFactsSequenceDigestVersion::V1,
+            1,
+            [2; 32],
+        );
+        let fill = |undo: &mut RetainedUndo, block_count: u32| {
+            for offset in 1..=block_count {
+                let height = BlockHeight::new(settled_tip.height.value() + offset);
+                let hash = BlockHash::from_bytes([u8::try_from(offset % 251).unwrap_or(0); 32]);
+                undo.begin_block(BlockId::new(height, hash), hash, digest, digest)?;
+                for output_index in 0..OUTPOINTS_PER_BLOCK {
+                    let mut transaction_id = [0; 32];
+                    transaction_id[..4].copy_from_slice(&offset.to_be_bytes());
+                    undo.add_created_outpoint(WalletOutpointKey::new(TransparentOutPoint::new(
+                        TransactionId::from_bytes(transaction_id),
+                        output_index,
+                    )))?;
+                    transaction_id[4] = 1;
+                    undo.add_spent_outpoint(WalletOutpointKey::new(TransparentOutPoint::new(
+                        TransactionId::from_bytes(transaction_id),
+                        output_index,
+                    )))?;
+                }
+                undo.finish_block()?;
+            }
+            Ok::<_, RocksDbWalletError>(())
+        };
+        let per_block_bytes = u64::try_from(
+            size_of::<WalletReorgUndo>()
+                + 2 * usize::try_from(OUTPOINTS_PER_BLOCK)? * size_of::<WalletOutpointKey>(),
+        )?;
+        let suffix_bytes = u64::from(DEPTH) * per_block_bytes;
+
+        let mut undo = RetainedUndo::new(DEPTH, settled_tip, DEFAULT_UNDO_CAP_BYTES);
+        fill(&mut undo, DEPTH)?;
+        assert_eq!(undo.records.len(), usize::try_from(DEPTH)?);
+        assert_eq!(undo.accounted_bytes, suffix_bytes);
+        assert_eq!(undo.peak_accounted_bytes, suffix_bytes);
+        assert!(suffix_bytes < DEFAULT_UNDO_CAP_BYTES / 64);
+        let next_height = BlockHeight::new(settled_tip.height.value() + DEPTH + 1);
+        assert!(matches!(
+            undo.begin_block(
+                BlockId::new(next_height, BlockHash::from_bytes([0xfe; 32])),
+                BlockHash::from_bytes([0xfd; 32]),
+                digest,
+                digest,
+            ),
+            Err(RocksDbWalletError::WalletProjectionRebuildRequired { .. })
+        ));
+
+        // A cap below the complete suffix fails closed instead of growing.
+        let mut capped = RetainedUndo::new(DEPTH, settled_tip, suffix_bytes - 1);
+        let error = fill(&mut capped, DEPTH)
+            .err()
+            .ok_or("a suffix above the accounting cap must be refused")?;
+        assert!(
+            matches!(
+                error,
+                RocksDbWalletError::AccountedReorgUndoMemoryLimit {
+                    limit_bytes,
+                    required_bytes,
+                } if limit_bytes == suffix_bytes - 1 && required_bytes == suffix_bytes
+            ),
+            "{error:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn external_loader_accepts_an_authenticated_checkpoint_successor_as_its_first_block()
     -> Result<(), Box<dyn Error>> {
         let temporary = TempDir::new()?;

@@ -126,13 +126,23 @@ contract and [Service operations](service-operations.md) for metrics.
 Every opener validates exact identity and version before returning a role
 handle. A newer or older unsupported physical layout, wrong network, wrong
 workload, wrong construction activation fingerprint, an activation table that
-differs from the admitted schedule at or below the visible tip, changed reorg
-policy, or incompatible source identity fails without mutation. Only the
-canonical writer journals a new schedule revision; it may change only
-activations above the visible tip. A reader checks its node's table only when
-it first opens a secondary. Catch-ups and later reader generations follow the
-writer-admitted schedule; see
+differs from the admitted schedule at or below the visible tip, a reorg window
+other than the store's effective window, or incompatible source identity fails
+without mutation. Only the canonical writer journals a new schedule revision;
+it may change only activations above the visible tip. A reader checks its
+node's table only when it first opens a secondary. Catch-ups and later reader
+generations follow the writer-admitted schedule; see
 [ADR-0039](../adrs/0039-writer-admitted-network-upgrade-schedules.md).
+
+The effective reorg window is the construction window until the canonical
+writer opens the store with a larger one. The writer then appends a versioned
+reorg-policy trailer after the schedule trailer in READY control, in one synced
+write, and holds the settled tip so the replaceable suffix grows to the new
+window. A smaller window is refused. The projector raises the wallet's
+supported reorg depth to the canonical effective window when it resumes,
+without backfilling undo rows. Readers require the exact effective window, and
+releases before the trailer refuse a raised store. See
+[ADR-0041](../adrs/0041-reorg-window-follows-the-node-bound.md).
 
 Version domains are independent. Canonical physical schema, canonical replay
 format, canonical digest, wallet physical schema, wallet value encoding,

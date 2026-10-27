@@ -15,6 +15,7 @@ load and validate configuration
      or recover a published staging store
      or construct and publish a fresh store
   -> admit the discovered activations as a schedule revision
+  -> raise the store's reorg window to the configured window, if larger
   -> start continuous canonical following with the admitted schedule
   -> serve authenticated control commands and mempool state
 ```
@@ -29,6 +30,12 @@ The writer then admits the node's activation table. A table that adds or
 changes only activations above the visible tip is journaled as the next
 schedule revision; a change at or below the tip fails without mutation. See
 [ADR-0039](../adrs/0039-writer-admitted-network-upgrade-schedules.md).
+
+A configured reorg window larger than the store's effective window is recorded
+as a monotonic store revision. The settled tip holds until the visible tip is a
+full new window above it, so the replaceable suffix grows with new blocks. A
+smaller configured window fails without mutation. See
+[ADR-0041](../adrs/0041-reorg-window-follows-the-node-bound.md).
 
 ## Fresh construction
 
