@@ -361,6 +361,7 @@ impl PublicationContext {
             cursor_auth_key: self.cursor_auth_key,
             build_state: CanonicalStoreBuildState::Building,
             activation_schedule_binding: None,
+            revised_reorg_policy: None,
         }
     }
 
@@ -369,8 +370,11 @@ impl PublicationContext {
         built_database_identity: &[u8],
     ) -> Result<BoundedRocksDbOpen, CanonicalStoreError> {
         let expected_control = self.expected_building_control();
-        let expectation =
-            CanonicalStoreAdmissionExpectation::from_build_plan(&self.build_plan, self.workload);
+        let expectation = CanonicalStoreAdmissionExpectation::from_build_plan(
+            &self.build_plan,
+            self.workload,
+            self.build_plan.reorg_policy(),
+        );
         let (admitted_database_identity, admitted_control) =
             admit_existing_store(&self.store_path, &expectation)?;
         if admitted_database_identity.as_slice() != built_database_identity
@@ -709,13 +713,16 @@ impl ValidatedRocksDbCanonicalBuild {
     }
 }
 
+/// Validates one READY publication against its construction identity and the
+/// store's effective reorg window, which bounds every retained transition.
 pub(super) fn validate_ready_publication(
     db: &DB,
     build_plan: &super::CanonicalStoreBuildPlan,
+    reorg_policy: super::CanonicalReorgPolicy,
     ready_evidence: &CanonicalStoreReadyEvidence,
 ) -> Result<(), CanonicalStoreError> {
     validate_first_retained_block(db, ready_evidence.first_retained_block)?;
-    validate_ready_sequence_checkpoint(db, build_plan, ready_evidence)?;
+    validate_ready_sequence_checkpoint(db, reorg_policy, ready_evidence)?;
     let baseline_tip = build_plan.build_tip();
     let baseline_epoch = decode_chain_epoch(&read_family_row(
         db,
@@ -736,11 +743,11 @@ pub(super) fn validate_ready_publication(
             baseline_epoch,
         )?;
     } else {
-        validate_live_history(db, build_plan, ready_evidence, baseline_epoch)?;
+        validate_live_history(db, build_plan, reorg_policy, ready_evidence, baseline_epoch)?;
     }
     validate_permanent_reorg_archive(
         db,
-        build_plan.reorg_policy().reorg_window_blocks(),
+        reorg_policy.reorg_window_blocks(),
         ready_evidence.visible_event_sequence,
     )?;
     super::event_lifecycle::validate_projection_lifecycle_records(db, ready_evidence)
@@ -865,7 +872,7 @@ fn validate_first_retained_block(
 
 pub(super) fn validate_ready_sequence_checkpoint(
     db: &DB,
-    build_plan: &super::CanonicalStoreBuildPlan,
+    reorg_policy: super::CanonicalReorgPolicy,
     ready_evidence: &CanonicalStoreReadyEvidence,
 ) -> Result<(), CanonicalStoreError> {
     let visible_epoch = decode_chain_epoch(&read_family_row(
@@ -887,7 +894,7 @@ pub(super) fn validate_ready_sequence_checkpoint(
         .value()
         .checked_sub(checkpoint.through().height.value())
         .ok_or_else(|| CanonicalStoreError::publication("settled tip exceeds visible tip"))?;
-    let reorg_window = build_plan.reorg_policy().reorg_window_blocks();
+    let reorg_window = reorg_policy.reorg_window_blocks();
     if settled_lag > reorg_window {
         return Err(CanonicalStoreError::publication(format!(
             "visible epoch exceeds its {reorg_window}-block settlement window"
@@ -969,6 +976,7 @@ fn validate_baseline_publication(
 fn validate_live_history(
     db: &DB,
     build_plan: &super::CanonicalStoreBuildPlan,
+    reorg_policy: super::CanonicalReorgPolicy,
     ready_evidence: &CanonicalStoreReadyEvidence,
     baseline_epoch: DecodedChainEpoch,
 ) -> Result<(), CanonicalStoreError> {
@@ -1009,7 +1017,13 @@ fn validate_live_history(
             || chain_event.previous_epoch_id != previous_epoch_id.value()
             || chain_event.visible_tip != chain_epoch.visible_tip
             || chain_event.visible_block_count == 0
-            || !live_transition_is_valid(build_plan, previous_epoch, chain_epoch, chain_event)?
+            || !live_transition_is_valid(
+                build_plan,
+                reorg_policy,
+                previous_epoch,
+                chain_epoch,
+                chain_event,
+            )?
         {
             return Err(CanonicalStoreError::publication(
                 "READY live history contains an invalid version-1 transition",
@@ -1048,6 +1062,7 @@ fn validate_live_history(
 
 fn live_transition_is_valid(
     build_plan: &super::CanonicalStoreBuildPlan,
+    reorg_policy: super::CanonicalReorgPolicy,
     previous_epoch: DecodedChainEpoch,
     chain_epoch: DecodedChainEpoch,
     chain_event: DecodedChainEvent,
@@ -1090,8 +1105,8 @@ fn live_transition_is_valid(
         && committed.start == reverted.start
         && committed.end == chain_epoch.visible_tip.height
         && previous_epoch.settled_tip == chain_epoch.settled_tip
-        && displaced_count <= build_plan.reorg_policy().reorg_window_blocks()
-        && visible_lag <= build_plan.reorg_policy().reorg_window_blocks())
+        && displaced_count <= reorg_policy.reorg_window_blocks()
+        && visible_lag <= reorg_policy.reorg_window_blocks())
 }
 
 fn validate_epoch_record(
@@ -1153,6 +1168,7 @@ fn validate_reopened_identity_and_control(
     let expectation = CanonicalStoreAdmissionExpectation::from_build_plan(
         &expected_control.build_plan,
         expected_control.workload,
+        expected_control.effective_reorg_policy(),
     );
     let control = validate_open_store_control(db, store_path, &expectation)?;
     if database_identity.as_slice() != expected_database_identity || &control != expected_control {
@@ -1450,7 +1466,7 @@ fn validate_exact_publication_readback(
             "READY control does not contain the validated baseline evidence",
         ));
     }
-    validate_ready_publication(db, build_plan, ready_evidence)
+    validate_ready_publication(db, build_plan, build_plan.reorg_policy(), ready_evidence)
 }
 
 fn decode_chain_epoch(encoded: &[u8]) -> Result<DecodedChainEpoch, CanonicalStoreError> {

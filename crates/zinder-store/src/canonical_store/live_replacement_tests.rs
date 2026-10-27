@@ -1066,6 +1066,167 @@ fn projection_build_lease_capacity_is_bounded() -> Result<(), Box<dyn std::error
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one proof binds the in-place raise, restart admission, refused lowering, and a replacement deeper than the construction window"
+)]
+fn writer_raises_the_reorg_window_in_place_across_restart_and_never_lowers_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let construction = CanonicalReorgPolicy::new(100)?;
+    let raised = CanonicalReorgPolicy::new(1_000)?;
+    let settled_tip = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32]));
+    let store = published_store(&store_path, 100, BlockHeight::new(102), settled_tip.height)?;
+    let construction_fence = store.event_fence();
+    drop(store);
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+
+    let store = open_writer(&store_path, &activations, 1_000)?;
+    assert_eq!(store.reorg_policy(), raised);
+    assert_eq!(store.build_plan().reorg_policy(), construction);
+    assert_eq!(store.event_fence(), construction_fence);
+    // The settled tip holds, so the visible tip may now trail it by more
+    // blocks than the construction window allowed.
+    let (store, appended) = store.commit_live_append(
+        CanonicalLiveAppend::new(
+            construction_fence,
+            replacement_block(BlockHeight::new(103), [103; 32], [102; 32], 203)?,
+            Vec::new(),
+            settled_tip,
+            UnixTimestampMillis::new(1_750_000_000_002),
+        ),
+        &activations,
+    )?;
+    assert_eq!(store.chain_epoch()?.settled_tip_height, settled_tip.height);
+    drop(store);
+
+    let refusals = [
+        (
+            open_store(&store_path, &activations, 100).err(),
+            "does not equal requested reorg window",
+        ),
+        (
+            open_writer(&store_path, &activations, 100).err(),
+            "never lowered in place",
+        ),
+        (
+            open_writer(&store_path, &activations, 999).err(),
+            "never lowered in place",
+        ),
+        (
+            RocksDbCanonicalSecondary::open_ready(
+                &store_path,
+                temporary.path().join("stale-secondary"),
+                &activations,
+                CanonicalStoreWorkload::Wallet,
+                RawBlobRetention::Transactions,
+                construction,
+                RocksDbResourceBudget::for_local_tests(),
+            )
+            .err()
+            .map(Into::into),
+            "does not equal requested reorg window",
+        ),
+    ];
+    for (error, reason) in refusals {
+        let error = error.ok_or("an admission below the raised window must fail")?;
+        assert!(error.to_string().contains(reason), "{error}");
+    }
+    let secondary = RocksDbCanonicalSecondary::open_ready(
+        &store_path,
+        temporary.path().join("secondary"),
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
+        raised,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(secondary.reorg_policy(), raised);
+    assert_eq!(secondary.event_fence(), appended);
+    drop(secondary);
+
+    let store = open_writer(&store_path, &activations, 1_000)?;
+    assert_eq!(store.reorg_policy(), raised);
+    assert_eq!(store.event_fence(), appended);
+    // Replace 101 blocks above the held settled tip: one deeper than the
+    // construction window.
+    let mut parent_hash = settled_tip.hash.as_bytes();
+    let mut replacement = Vec::new();
+    for height in 3..=103_u32 {
+        let transaction_tag = u8::try_from(height - 3)?;
+        let mut block_hash = [transaction_tag; 32];
+        block_hash[0] = 0xee;
+        replacement.push(CanonicalReplacementBlock::new(
+            replacement_block(
+                BlockHeight::new(height),
+                block_hash,
+                parent_hash,
+                transaction_tag,
+            )?,
+            Vec::new(),
+        ));
+        parent_hash = block_hash;
+    }
+    let (store, replaced) = store.commit_live_replacement(
+        CanonicalLiveReplacement::new(
+            appended,
+            replacement,
+            UnixTimestampMillis::new(1_750_000_000_003),
+        ),
+        &activations,
+    )?;
+    assert_eq!(store.displaced_block_count()?, 101);
+    drop(store);
+    let reopened = open_store(&store_path, &activations, 1_000)?;
+    assert_eq!(reopened.event_fence(), replaced);
+    assert_eq!(reopened.reorg_policy(), raised);
+    Ok(())
+}
+
+#[test]
+fn secondary_refuses_a_writer_raise_until_it_reopens_with_the_raised_window()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    drop(published_store(
+        &store_path,
+        2,
+        BlockHeight::new(4),
+        BlockHeight::new(2),
+    )?);
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let open_secondary = |name: &str, window: u32| {
+        RocksDbCanonicalSecondary::open_ready(
+            &store_path,
+            temporary.path().join(name),
+            &activations,
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(window)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )
+        .map_err(Box::<dyn std::error::Error>::from)
+    };
+    let mut stale = open_secondary("stale", 2)?;
+    let writer = open_writer(&store_path, &activations, 3)?;
+    assert_eq!(writer.reorg_policy(), CanonicalReorgPolicy::new(3)?);
+    let error = stale
+        .try_catch_up()
+        .err()
+        .ok_or("catch-up across a writer raise must fail")?;
+    assert!(
+        error
+            .to_string()
+            .contains("persisted reorg window 3 does not equal requested reorg window 2"),
+        "{error}"
+    );
+    let current = open_secondary("current", 3)?;
+    assert_eq!(current.reorg_policy(), writer.reorg_policy());
+    Ok(())
+}
+
+#[test]
 fn replacement_rejects_settled_range_without_any_mutation() -> Result<(), Box<dyn std::error::Error>>
 {
     let temporary = TempDir::new()?;
@@ -1451,7 +1612,11 @@ fn published_store_with_retention(
         };
         let mut block = canonical_block(height, [hash_byte; 32], parent_hash, 100 + hash_byte);
         apply_raw_blob_retention(&mut block, raw_blob_retention, 100 + hash_byte);
-        if height == build_tip_height {
+        if height == build_tip_height
+            || height
+                .value()
+                .is_multiple_of(super::TREE_STATE_CHECKPOINT_STRIDE)
+        {
             add_checkpoint(&mut block)?;
         }
         blocks.push(Ok::<_, std::io::Error>(block));
@@ -1499,6 +1664,23 @@ fn open_store_with_retention(
         CanonicalReorgPolicy::new(reorg_window)?,
         RocksDbResourceBudget::for_local_tests(),
     )?)
+}
+
+fn open_writer(
+    path: &Path,
+    activations: &zinder_core::NetworkUpgradeActivations,
+    reorg_window: u32,
+) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+    Ok(
+        RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
+            path,
+            activations,
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(reorg_window)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?,
+    )
 }
 
 fn replacement_block(

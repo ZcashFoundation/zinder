@@ -21,7 +21,7 @@ use super::{
     block_replay::{
         BLOCK_REPLAY_COLUMN_FAMILY, read_persisted_replay, resume_persisted_sequence_checkpoint,
     },
-    control::encode_ready_store_control_with_schedule,
+    control::encode_ready_store_control_with_revisions,
     displaced_archive::{
         CanonicalDisplacedBlock, DisplacedArchiveEvent, PreparedDisplacedArchiveWrite,
     },
@@ -308,12 +308,12 @@ impl PreparedLiveReplacement {
             visible_logical_replay_bytes: visible_sequence.logical_replay_bytes(),
             ..store.ready_evidence
         };
-        let encoded_control = encode_ready_store_control_with_schedule(
+        let encoded_control = encode_ready_store_control_with_revisions(
             store.workload,
             &store.build_plan,
             store.cursor_auth_key,
             &ready_evidence,
-            store.activation_schedule_binding(),
+            store.control_revisions(),
         )
         .map_err(|source| CanonicalStoreError::live_commit(source.to_string()))?;
         let tip_metadata = last.block.tip_metadata;
@@ -417,7 +417,7 @@ impl PreparedLiveReplacement {
         )?;
         validate_ready_sequence_checkpoint(
             &store.bounded_open.db,
-            &store.build_plan,
+            store.reorg_policy(),
             &self.ready_evidence,
         )
     }
