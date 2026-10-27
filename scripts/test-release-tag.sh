@@ -14,7 +14,6 @@ workspace_version="$(
         | [
             .packages[]
             | select(.id as $id | $workspace_members | index($id))
-            | select((.manifest_path | contains("/vendor/")) | not)
             | .version
           ]
         | unique

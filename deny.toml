@@ -39,7 +39,12 @@ multiple-versions = "warn"
 wildcards = "allow"
 highlight = "all"
 allow = []
-deny = []
+deny = [
+    # zinder-bench drives PostgreSQL through tokio-postgres directly.
+    { crate = "sqlx", reason = "use tokio-postgres for the PostgreSQL driver" },
+    { crate = "sqlx-core", reason = "use tokio-postgres for the PostgreSQL driver" },
+    { crate = "sqlx-postgres", reason = "use tokio-postgres for the PostgreSQL driver" },
+]
 skip = []
 skip-tree = []
 

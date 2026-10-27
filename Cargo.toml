@@ -19,7 +19,6 @@ members = [
     "services/zinder-projector",
     "services/zinder-query",
     "tools/zinder-proto-codegen",
-    "vendor/postgres-protocol",
 ]
 resolver = "3"
 
@@ -112,13 +111,6 @@ zinder-store = { path = "crates/zinder-store" }
 zinder-testkit = { path = "crates/zinder-testkit" }
 zinder-wallet-projection = { path = "crates/zinder-wallet-projection" }
 zinder-wallet-rocksdb = { path = "crates/zinder-wallet-rocksdb" }
-
-[patch.crates-io]
-# `bip32 0.6.0-pre.1` pins prerelease RustCrypto 0.13 packages that Cargo
-# cannot resolve beside the stable 0.13 packages used by postgres-protocol.
-# This tested 0.6.12 compatibility fork retains the mature 0.10/0.12 crypto
-# line while preserving all upstream 0.6.12 protocol and security fixes.
-postgres-protocol = { path = "vendor/postgres-protocol" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
