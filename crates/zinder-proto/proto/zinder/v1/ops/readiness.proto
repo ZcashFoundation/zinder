@@ -59,6 +59,10 @@ enum ReadinessCause {
   // The authenticated ingest-control channel or one of its required live
   // health RPCs is temporarily unavailable.
   READINESS_CAUSE_INGEST_CONTROL_UNAVAILABLE = 18;
+  // The canonical writer has not confirmed its store's visible tip against
+  // its node since it opened the store, so its fence may sit on a branch the
+  // node abandoned. Wallet-serving readers refuse traffic until it does.
+  READINESS_CAUSE_CANONICAL_TIP_UNCONFIRMED = 19;
 }
 
 // Snapshot of the current readiness state surfaced to operators and orchestrators.

@@ -134,8 +134,8 @@ fence, and wallet digest.
 | --- | --- | --- |
 | ingest | `starting` or `syncing` | Canonical lag is within threshold and mempool snapshot is complete |
 | projector | `starting` or `syncing` | Wallet store is published and following the admitted canonical source |
-| native query | `starting`, `replica_lagging`, `writer_status_unavailable`, or `ingest_control_unavailable` | One exact canonical and wallet pair is published, the admitted node is healthy, and `WriterStatus` plus a bounded mempool snapshot succeed through the admitted ingest-control channel |
-| compatibility | `starting`, `replica_lagging`, or `writer_status_unavailable` | One exact canonical and wallet pair (or, for compact-block serving, one canonical reader) is published and the writer does not report a park |
+| native query | `starting`, `replica_lagging`, `writer_status_unavailable`, `ingest_control_unavailable`, or `canonical_tip_unconfirmed` | One exact canonical and wallet pair is published, the admitted node is healthy, and `WriterStatus` plus a bounded mempool snapshot succeed through the admitted ingest-control channel |
+| compatibility | `starting`, `replica_lagging`, `writer_status_unavailable`, or `canonical_tip_unconfirmed` | One exact canonical and wallet pair (or, for compact-block serving, one canonical reader) is published, and the writer has confirmed its tip against its node and does not report a park |
 
 After the first publication, a reader that loses writer status or falls behind
 reports `serving_pair_stale` and keeps answering from its published pair until
@@ -146,6 +146,14 @@ A parked canonical writer keeps answering writer status with its frozen fence
 and its halt. Native query and both compatibility serving modes then report
 `reorg_window_exceeded` and refuse wallet traffic with
 `REORG_WINDOW_EXCEEDED`, never `ready` on the frozen tip.
+
+After ingest restarts, native query and both compatibility serving modes
+report `canonical_tip_unconfirmed` until ingest's first source observation
+confirms the store's tip against the node, which normally takes one poll. If
+ingest cannot reach the node, they stay unready for as long as the outage
+lasts; restore the node rather than restarting the readers. A writer that
+finds a fork deeper than the window on that first observation parks, and the
+readers move straight to `reorg_window_exceeded`.
 
 `node_unavailable`, `upstream_not_ready`, and
 `ingest_control_unavailable` are recoverable dependency conditions. For native
