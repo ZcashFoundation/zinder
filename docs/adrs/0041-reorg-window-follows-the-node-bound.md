@@ -87,11 +87,28 @@ writer therefore stops following but keeps its store and control plane until
 termination. It serves its frozen fence, retained events, retention leases,
 and owner checkpoints, so the projector and query start and stay converged
 against it, and it reports the halt through
-`IngestControl.WriterStatus.reorg_window_exceeded` (the existing
+`IngestControl.WriterStatus.reorg_window_exceeded` and
+`CanonicalControl.WriterStatus.reorg_window_exceeded` (the existing
 `ReorgWindowExceededDetail`). The halt is a terminal readiness state that no
-other ingest worker can replace. Native query maps that report to its own
-`reorg_window_exceeded` readiness cause, which takes precedence over the
-serving-pair failures the park could cause.
+other ingest worker can replace.
+
+Every wallet-serving reader refuses traffic while the writer reports the halt:
+
+- The serving-pair publisher shared by native query and lightwalletd
+  compatibility wallet serving, and compatibility compact-block serving, read
+  `CanonicalControl.WriterStatus`. The frozen fence still attests their
+  published reader, so the halt on the same response is what keeps them from
+  reporting ready on a chain that stopped advancing. They project it as their
+  `reorg_window_exceeded` readiness cause at bootstrap and on every refresh,
+  and return to ready once the writer stops reporting it.
+- Native query also reads `IngestControl.WriterStatus` through its
+  ingest-control health probe, and that cause takes precedence over the
+  serving-pair failures the park could cause.
+
+Carrying the halt on canonical writer status covers both compatibility serving
+modes with one additive field, without giving compatibility the native
+ingest-control probe and the mempool and upstream-health gating that comes
+with it.
 
 The supported single-host image keeps running in this state. Restarting would
 park the writer on the same reorg and replace the typed refusal with refused
@@ -111,8 +128,10 @@ Wallet consumers receive the halt through the existing error vocabulary:
 - `zinder-client` decodes the status as `IndexerError::ReorgWindowExceeded`
   with retry policy `OperatorActionRequired`.
 
-The proto change is additive on a private control message. The wallet surface
-gains no new message or field, so no contract revision changes.
+The proto changes are additive fields on private control messages. The wallet
+surface gains no new message or field, so no contract revision changes. A
+reader from an earlier release ignores the canonical-status halt and keeps
+reporting ready on the frozen fence, so upgrade readers together with ingest.
 
 ## Alternatives
 
@@ -174,6 +193,3 @@ operators would still need to raise it as observed reorgs grow.
   the budget to follow it. A dedicated budget is used because the
   construction pipeline's preparation watermark admits a stream of blocks,
   while a replacement must hold all of its blocks at once.
-- The lightwalletd compatibility runtime has no ingest-control health probe,
-  so it still reports a parked writer as a writer-status outage rather than
-  as `reorg_window_exceeded`.

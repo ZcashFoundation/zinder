@@ -256,14 +256,17 @@ impl CompactBlockPublisher {
         let generation_activations = Arc::clone(&config.activations);
         let candidate = open_generation(&config, &generation_activations, 0).await?;
         let candidate = catch_up_generation(candidate).await?;
-        let candidate = converge_candidate(&mut writer_status, &config, candidate)
-            .await
-            .map_err(|error| CompactBlockServingError::Runtime(error.to_string()))?;
+        let (candidate, attesting_status) =
+            converge_candidate(&mut writer_status, &config, candidate)
+                .await
+                .map_err(|error| CompactBlockServingError::Runtime(error.to_string()))?;
         let reader = Arc::new(candidate);
         let slot = CompactBlockServingSlot::new(Arc::clone(&reader));
-        readiness.publish_storage(ReadinessState::ready(Some(
-            reader.event_fence().visible_tip().height.value(),
-        )));
+        let visible_height = reader.event_fence().visible_tip().height.value();
+        readiness.publish_storage(
+            parked_writer_readiness(&attesting_status, config.network, visible_height)
+                .unwrap_or_else(|| ReadinessState::ready(Some(visible_height))),
+        );
         let publisher = Self {
             config,
             writer_status,
@@ -321,6 +324,16 @@ impl CompactBlockPublisher {
                 return;
             }
         };
+        // A parked writer keeps attesting its frozen fence; the reader stays
+        // published but refuses traffic with the writer's typed halt.
+        if let Some(parked) = parked_writer_readiness(
+            &status,
+            self.config.network,
+            active.event_fence().visible_tip().height.value(),
+        ) {
+            self.readiness.publish_storage(parked);
+            return;
+        }
         let active_epoch = active.event_fence().chain_epoch_id().value();
         let relation = classify_writer_fence(
             &status,
@@ -422,7 +435,7 @@ impl CompactBlockPublisher {
         let candidate = match converge_candidate(&mut self.writer_status, &self.config, candidate)
             .await
         {
-            Ok(candidate) => candidate,
+            Ok((candidate, _attesting_status)) => candidate,
             Err(ConvergenceFailure::WriterStatusTransport(_)) => {
                 let cause = if self.last_attested.elapsed() < self.config.staleness_ceiling {
                     ReadinessCause::ServingPairStale {
@@ -587,11 +600,35 @@ fn attest(
     Ok(())
 }
 
+/// Returns the typed halt a parked writer reports on canonical writer status.
+///
+/// Only a halt from the configured network is honoured; any other status
+/// falls through to the usual fence classification.
+fn parked_writer_readiness(
+    status: &CanonicalWriterStatusResponse,
+    network: Network,
+    visible_height: u32,
+) -> Option<ReadinessState> {
+    let halt = status.reorg_window_exceeded?;
+    (status.network_name == zinder_core::wire::encode_zinder_native_chain_name(network)).then(
+        || {
+            ReadinessState::reorg_window_exceeded(
+                halt.depth,
+                halt.configured,
+                halt.covered,
+                Some(visible_height),
+            )
+        },
+    )
+}
+
+/// Converges `candidate` on the writer fence and returns it with the writer
+/// status that attested it.
 async fn converge_candidate(
     writer_status: &mut WriterStatus,
     config: &CompactBlockServingConfig,
     mut candidate: RocksDbCanonicalSecondary,
-) -> Result<RocksDbCanonicalSecondary, ConvergenceFailure> {
+) -> Result<(RocksDbCanonicalSecondary, CanonicalWriterStatusResponse), ConvergenceFailure> {
     let deadline = tokio::time::Instant::now() + config.convergence_timeout;
     let attempts = config.convergence_attempts.max(1);
     for attempt in 0..attempts {
@@ -602,7 +639,7 @@ async fn converge_candidate(
             ConvergenceFailure::WriterStatusTransport(error.message().to_owned())
         })?;
         if attest(&status, &candidate, config.network).is_ok() {
-            return Ok(candidate);
+            return Ok((candidate, status));
         }
         let relation = classify_writer_fence(
             &status,
@@ -1503,6 +1540,7 @@ mod tests {
                     schedule.revision(),
                 )
             }),
+            reorg_window_exceeded: None,
         }
     }
 
@@ -1796,6 +1834,88 @@ mod tests {
         Ok(())
     }
 
+    /// Compact serving refuses a parked writer with its halt.
+    ///
+    /// A parked writer keeps attesting its frozen fence, so the halt must come
+    /// from canonical writer status: at bootstrap, on every refresh, and until
+    /// the writer clears it.
+    #[tokio::test]
+    async fn publisher_refuses_a_parked_writer_with_the_typed_halt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let activations = lifecycle_activations();
+        let (primary, _blocks) =
+            lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
+        let halt = zinder_proto::v1::ops::ReorgWindowExceededDetail {
+            depth: 1_001,
+            configured: 1_000,
+            covered: Some(1_000),
+        };
+        let parked_status = CanonicalWriterStatusResponse {
+            reorg_window_exceeded: Some(halt),
+            ..lifecycle_writer_status(&primary)
+        };
+        let control = MutableCanonicalControl::new(parked_status.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let server = tokio::spawn({
+            let control = control.clone();
+            async move {
+                Server::builder()
+                    .add_service(CanonicalControlServer::new(control))
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                        let _ = shutdown_receiver.await;
+                    })
+                    .await
+            }
+        });
+
+        let readiness = Readiness::default();
+        let serving_readiness = CompactServingReadiness::new(readiness.clone());
+        serving_readiness.publish_node(ReadinessCause::Ready);
+        let config = CompactBlockServingConfig {
+            canonical_primary_path: temporary.path().join("canonical-primary"),
+            canonical_secondary_root: temporary.path().join("canonical-secondaries"),
+            network: Network::ZcashRegtest,
+            activations: Arc::new(activations.clone()),
+            raw_blob_retention: RawBlobRetention::Transactions,
+            reorg_policy: CanonicalReorgPolicy::new(100)?,
+            resource_budget: RocksDbResourceBudget::for_local_tests(),
+            catchup_interval: Duration::from_millis(1),
+            convergence_timeout: Duration::from_secs(2),
+            convergence_attempts: 4,
+            staleness_ceiling: Duration::from_mins(1),
+            lag_threshold: 0,
+        };
+        let (mut publisher, slot) =
+            CompactBlockPublisher::bootstrap(config, serving_readiness, &endpoint, None).await?;
+        let expected_halt = ReadinessCause::ReorgWindowExceeded {
+            depth: 1_001,
+            configured: 1_000,
+            covered: Some(1_000),
+        };
+        let bootstrapped = readiness.report();
+        assert!(!bootstrapped.is_ready);
+        assert_eq!(bootstrapped.cause, expected_halt);
+
+        control.set_writer_status(lifecycle_writer_status(&primary));
+        publisher.refresh().await;
+        assert!(readiness.report().is_ready);
+
+        control.set_writer_status(parked_status);
+        publisher.refresh().await;
+        let parked = readiness.report();
+        assert!(!parked.is_ready);
+        assert_eq!(parked.cause, expected_halt);
+
+        drop(slot);
+        drop(publisher);
+        let _ = shutdown_sender.send(());
+        server.await??;
+        Ok(())
+    }
+
     /// A runtime started on the pre-upgrade table keeps refreshing after the
     /// chain crosses an activation the writer admitted later.
     ///
@@ -1960,6 +2080,7 @@ mod tests {
             }),
             oldest_retained_event_sequence: 0,
             network_upgrade_schedule: None,
+            reorg_window_exceeded: None,
         };
         assert_eq!(
             classify_writer_fence(&status(4), network, 4, true),

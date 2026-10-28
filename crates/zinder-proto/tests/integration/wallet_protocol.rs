@@ -722,6 +722,7 @@ fn canonical_writer_status_admitted_schedule_round_trips_through_prost() -> eyre
         network_upgrade_schedule: Some(
             zinder_proto::wire::encode_canonical_network_upgrade_schedule(&activations, 2),
         ),
+        reorg_window_exceeded: None,
     };
     let schedule = round_trip(&response)?
         .network_upgrade_schedule
@@ -790,6 +791,35 @@ fn parked_writer_status_round_trips_its_reorg_halt_without_a_chain_view() -> eyr
         ..decoded
     };
     assert_eq!(round_trip(&legacy)?.chain_view, None);
+    Ok(())
+}
+
+#[test]
+fn parked_canonical_writer_status_round_trips_its_reorg_halt_with_the_frozen_fence()
+-> eyre::Result<()> {
+    let halt = ops::ReorgWindowExceededDetail {
+        depth: 1_001,
+        configured: 1_000,
+        covered: Some(1_000),
+    };
+    let response = ingest::CanonicalWriterStatusResponse {
+        network_name: "zcash-regtest".to_owned(),
+        fence: Some(ingest::CanonicalWriterFence {
+            chain_epoch_id: 7,
+            event_sequence: 7,
+            visible_tip_height: 2_000,
+            ..ingest::CanonicalWriterFence::default()
+        }),
+        oldest_retained_event_sequence: 1,
+        network_upgrade_schedule: None,
+        reorg_window_exceeded: Some(halt),
+    };
+    let decoded = round_trip(&response)?;
+    assert_eq!(decoded.reorg_window_exceeded, Some(halt));
+    assert_eq!(
+        decoded.fence.map(|fence| fence.visible_tip_height),
+        Some(2_000)
+    );
     Ok(())
 }
 

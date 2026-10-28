@@ -35,7 +35,8 @@ use crate::{
         canonical_build_block, compact_block_commitments, register_prohibited_read_metrics,
     },
     writer::control::{
-        CanonicalControlCommand, CanonicalControlScheduling, apply_canonical_control_command,
+        CanonicalControlCommand, CanonicalControlScheduling, ParkedWriterHalt,
+        apply_canonical_control_command, apply_parked_canonical_control_command,
     },
     writer::raw_blob_policy_for_retention,
 };
@@ -244,6 +245,29 @@ pub struct CanonicalReorgWindowExceeded {
     /// tip to the local tip. Below `configured_window_blocks` while a raised
     /// window is still growing toward it.
     pub covered_depth_blocks: u32,
+}
+
+impl CanonicalReorgWindowExceeded {
+    /// Returns the terminal readiness state of a writer parked by this
+    /// evidence.
+    #[must_use]
+    pub fn parked_readiness(&self) -> ReadinessState {
+        ReadinessState::reorg_window_exceeded(
+            u64::from(self.required_depth),
+            u64::from(self.configured_window_blocks),
+            Some(u64::from(self.covered_depth_blocks)),
+            Some(self.local_tip.height.value()),
+        )
+        .with_phase(IngestPhase::FollowingTip)
+    }
+
+    pub(crate) fn halt(&self) -> ParkedWriterHalt {
+        ParkedWriterHalt::new(
+            u64::from(self.required_depth),
+            u64::from(self.configured_window_blocks),
+            Some(u64::from(self.covered_depth_blocks)),
+        )
+    }
 }
 
 /// Failure while following the clean canonical store.
@@ -474,17 +498,15 @@ where
                 continue;
             }
             Err(CanonicalFollowError::ReorgWindowExceeded(evidence)) => {
-                follower.readiness.park(
-                    ReadinessState::reorg_window_exceeded(
-                        u64::from(evidence.required_depth),
-                        u64::from(evidence.configured_window_blocks),
-                        Some(u64::from(evidence.covered_depth_blocks)),
-                        Some(evidence.local_tip.height.value()),
-                    )
-                    .with_phase(IngestPhase::FollowingTip),
-                );
+                follower.readiness.park(evidence.parked_readiness());
                 if let Some(control_commands) = control_commands.as_mut() {
-                    serve_parked_writer(&mut store, control_commands, follower.cancel).await;
+                    serve_parked_writer(
+                        &mut store,
+                        control_commands,
+                        evidence.halt(),
+                        follower.cancel,
+                    )
+                    .await;
                 }
                 return Err(CanonicalFollowError::ReorgWindowExceeded(evidence));
             }
@@ -933,6 +955,7 @@ fn prepared_replacement_bytes(block: &CanonicalBuildBlock) -> u64 {
 async fn serve_parked_writer(
     store: &mut RocksDbCanonicalStore,
     control_commands: &mut mpsc::Receiver<CanonicalControlCommand>,
+    halt: ParkedWriterHalt,
     cancel: &CancellationToken,
 ) {
     tracing::warn!(
@@ -950,7 +973,7 @@ async fn serve_parked_writer(
                     cancel.cancelled().await;
                     return;
                 };
-                apply_canonical_control_command(store, command);
+                apply_parked_canonical_control_command(store, command, halt);
             }
         }
     }

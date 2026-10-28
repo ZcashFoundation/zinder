@@ -213,7 +213,8 @@ without exiting, reporting `reorg_window_exceeded`. It keeps serving its
 frozen fence to the projector and query. Native query reads the halt from the
 writer, drains its own readiness with `reorg_window_exceeded`, and refuses
 every wallet request and open `ChainEvents` stream with the typed
-`REORG_WINDOW_EXCEEDED` status. The container stays up in this state and logs
+`REORG_WINDOW_EXCEEDED` status. A lightwalletd compatibility runtime pointed
+at the same writer refuses wallet requests the same way. The container stays up in this state and logs
 the halt once: restarting would park the writer on the same reorg and replace
 the typed refusal with refused connections. With the default 1000-block window,
 the node itself cannot produce such a reorg, so look for a replaced, resynced,

@@ -670,7 +670,10 @@ impl WalletServingPairPublisher {
         let active_pair = serving_pair_slot.capture();
         let writer_status = self.writer_status.fetch().await?;
         let relation = self.update_active_readiness(&active_pair, &writer_status)?;
-        if relation == ActiveWriterRelation::Exact {
+        if matches!(
+            relation,
+            ActiveWriterRelation::Exact | ActiveWriterRelation::Parked
+        ) {
             return Ok(());
         }
         self.follow_writer_schedule(&writer_status)?;
@@ -818,7 +821,7 @@ impl WalletServingPairPublisher {
                             self.candidate_network_upgrade_schedule(generation)?,
                         )
                     {
-                        self.publish_candidate(generation).await?;
+                        self.publish_candidate(generation, &writer_status).await?;
                         return Ok(());
                     }
                     last_outcome = WalletServingConvergence::ReplicaBehind;
@@ -916,7 +919,11 @@ impl WalletServingPairPublisher {
         ))
     }
 
-    async fn publish_candidate(&mut self, generation: usize) -> Result<(), WalletServingPairError> {
+    async fn publish_candidate(
+        &mut self,
+        generation: usize,
+        writer_status: &CanonicalWriterStatusResponse,
+    ) -> Result<(), WalletServingPairError> {
         let state = std::mem::replace(
             &mut self.generations[generation].state,
             SecondaryGenerationState::Vacant,
@@ -946,8 +953,10 @@ impl WalletServingPairPublisher {
         self.attested_at = Instant::now();
         self.observed_lag_chain_epochs = 0;
         let visible_height = Some(pair.canonical_fence().visible_tip().height.value());
-        self.readiness
-            .publish_pair_state(ReadinessState::ready(visible_height));
+        self.readiness.publish_pair_state(
+            parked_writer_readiness(writer_status, self.config.network, visible_height)
+                .unwrap_or_else(|| ReadinessState::ready(visible_height)),
+        );
         metrics::counter!("zinder_wallet_serving_pair_publisher_publications_total").increment(1);
         tracing::info!(
             target: "zinder::wallet_serving",
@@ -978,6 +987,14 @@ impl WalletServingPairPublisher {
             return Err(WalletServingPairError::WriterFenceMismatch);
         }
         let visible_height = Some(active_source.source_position().tip.height.value());
+        // A parked writer keeps attesting its frozen fence; the pair stays
+        // published but refuses traffic with the writer's typed halt.
+        if let Some(parked) =
+            parked_writer_readiness(writer_status, self.config.network, visible_height)
+        {
+            self.readiness.publish_pair_state(parked);
+            return Ok(ActiveWriterRelation::Parked);
+        }
         // A writer restart can admit a new schedule revision without moving the
         // fence; the immutable active pair then refreshes like a lagging one.
         if writer_fence.chain_epoch_id == active_epoch
@@ -1069,6 +1086,29 @@ impl WalletServingPairPublisher {
 enum ActiveWriterRelation {
     Exact,
     Behind,
+    /// The writer is parked on a reorg deeper than its window. Its fence no
+    /// longer advances, so no replacement pair is prepared.
+    Parked,
+}
+
+/// Returns the typed halt a parked writer reports on canonical writer status.
+///
+/// Only a halt from the configured network is honoured; any other status
+/// falls through to the usual fence validation.
+fn parked_writer_readiness(
+    writer_status: &CanonicalWriterStatusResponse,
+    network: Network,
+    visible_height: Option<u32>,
+) -> Option<ReadinessState> {
+    let halt = writer_status.reorg_window_exceeded?;
+    (writer_status.network_name == encode_zinder_native_chain_name(network)).then(|| {
+        ReadinessState::reorg_window_exceeded(
+            halt.depth,
+            halt.configured,
+            halt.covered,
+            visible_height,
+        )
+    })
 }
 
 struct SecondaryGeneration {
@@ -2392,6 +2432,97 @@ mod tests {
         Ok(())
     }
 
+    /// The compatibility composition refuses a parked writer with its halt.
+    ///
+    /// A parked writer keeps attesting its frozen fence, and compatibility has
+    /// no ingest-control probe, so the halt must come from canonical writer
+    /// status: at bootstrap, on every refresh, and until the writer clears it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compatibility_pair_refuses_a_parked_writer_with_the_typed_halt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let activations = lifecycle_upgrade_activations()?;
+        let canonical_primary_path = temporary.path().join("canonical-primary");
+        let wallet_primary_path = temporary.path().join("wallet-primary");
+        let canonical_primary =
+            build_lifecycle_canonical_primary(&canonical_primary_path, &activations)?;
+        build_wallet_from_canonical(
+            &canonical_primary,
+            &wallet_primary_path,
+            RocksDbWalletBuildOptions {
+                supported_reorg_depth: 100,
+                ..RocksDbWalletBuildOptions::for_local_tests()
+            },
+        )?;
+        let halt = zinder_proto::v1::ops::ReorgWindowExceededDetail {
+            depth: 1_001,
+            configured: 1_000,
+            covered: Some(1_000),
+        };
+        let parked_status = CanonicalWriterStatusResponse {
+            reorg_window_exceeded: Some(halt),
+            ..writer_status_for_store(&canonical_primary)
+        };
+        let control = MutableCanonicalControl::new(parked_status.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server_task = tokio::spawn({
+            let control = control.clone();
+            async move {
+                Server::builder()
+                    .add_service(CanonicalControlServer::new(control))
+                    .serve_with_incoming_shutdown(
+                        TcpListenerStream::new(listener),
+                        server_cancel.cancelled_owned(),
+                    )
+                    .await
+            }
+        });
+
+        let readiness = zinder_runtime::Readiness::default();
+        let serving_readiness = WalletServingReadiness::awaiting_node_source(readiness.clone());
+        serving_readiness.publish_node_source_cause(zinder_runtime::ReadinessCause::Ready);
+        let (mut publisher, _slot) =
+            WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
+                wallet_serving_pair_config(
+                    canonical_primary_path.clone(),
+                    temporary.path().join("canonical-secondaries"),
+                    wallet_primary_path.clone(),
+                    temporary.path().join("wallet-secondaries"),
+                    Arc::new(activations.clone()),
+                )?,
+                serving_readiness,
+                &endpoint,
+                None,
+            )
+            .await?;
+        let expected_halt = zinder_runtime::ReadinessCause::ReorgWindowExceeded {
+            depth: 1_001,
+            configured: 1_000,
+            covered: Some(1_000),
+        };
+        let bootstrapped = readiness.report();
+        assert_eq!(bootstrapped.cause, expected_halt);
+        assert!(!bootstrapped.is_ready);
+        assert_eq!(bootstrapped.cause, expected_halt);
+
+        control.set_writer_status(writer_status_for_store(&canonical_primary));
+        publisher.refresh_once().await?;
+        assert!(readiness.report().is_ready);
+
+        control.set_writer_status(parked_status);
+        publisher.refresh_once().await?;
+        let parked = readiness.report();
+        assert!(!parked.is_ready);
+        assert_eq!(parked.cause, expected_halt);
+
+        cancel.cancel();
+        server_task.await??;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[expect(
         clippy::too_many_lines,
@@ -3080,6 +3211,7 @@ mod tests {
             }),
             oldest_retained_event_sequence: 1,
             network_upgrade_schedule: None,
+            reorg_window_exceeded: None,
         }
     }
 
@@ -3270,6 +3402,7 @@ mod tests {
             }),
             oldest_retained_event_sequence: 1,
             network_upgrade_schedule: None,
+            reorg_window_exceeded: None,
         }
     }
 

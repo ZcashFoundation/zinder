@@ -948,6 +948,17 @@ impl From<ReadinessCause> for ops_proto::ReadinessCause {
     }
 }
 
+impl From<ops_proto::ReorgWindowExceededDetail> for ReadinessCause {
+    /// Maps a parked writer's reported halt to the cause a reader projects.
+    fn from(detail: ops_proto::ReorgWindowExceededDetail) -> Self {
+        Self::ReorgWindowExceeded {
+            depth: detail.depth,
+            configured: detail.configured,
+            covered: detail.covered,
+        }
+    }
+}
+
 impl From<&ReadinessCause> for Option<ops_proto::ReadinessCauseDetail> {
     #[allow(
         clippy::too_many_lines,
