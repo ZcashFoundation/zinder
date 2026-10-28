@@ -58,6 +58,7 @@ enum ErrorReason {
   SCHEMA_MISMATCH = 17;
   SCHEMA_TOO_NEW = 18;
   REORG_WINDOW_EXCEEDED = 19;
+  // ABORTED family: retry at a fresh epoch.
   CHAIN_EPOCH_CONFLICT = 20;
   CHAIN_EPOCH_NETWORK_MISMATCH = 21;
 

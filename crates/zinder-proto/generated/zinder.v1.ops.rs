@@ -359,6 +359,7 @@ pub enum ErrorReason {
     SchemaMismatch = 17,
     SchemaTooNew = 18,
     ReorgWindowExceeded = 19,
+    /// ABORTED family: retry at a fresh epoch.
     ChainEpochConflict = 20,
     ChainEpochNetworkMismatch = 21,
     /// NOT_FOUND family.

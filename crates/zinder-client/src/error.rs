@@ -385,7 +385,6 @@ const fn retry_policy_for_remote(reason: &ErrorReason, code: Code) -> RetryPolic
         | ErrorReason::SchemaMismatch
         | ErrorReason::SchemaTooNew
         | ErrorReason::ReorgWindowExceeded
-        | ErrorReason::ChainEpochConflict
         | ErrorReason::ChainEpochNetworkMismatch
         | ErrorReason::CompactBlockPayloadMalformed
         | ErrorReason::ArtifactCorrupt
@@ -412,7 +411,8 @@ const fn retry_policy_for_remote(reason: &ErrorReason, code: Code) -> RetryPolic
         | ErrorReason::NoVisibleChainEpoch
         | ErrorReason::UpstreamUnreachable
         | ErrorReason::ServiceNotReady
-        | ErrorReason::TransactionNotFound => RetryPolicy::RetryWithBackoff,
+        | ErrorReason::TransactionNotFound
+        | ErrorReason::ChainEpochConflict => RetryPolicy::RetryWithBackoff,
         ErrorReason::Unknown(_) => retry_policy_for_status(code),
     }
 }
@@ -440,6 +440,20 @@ mod tests {
         assert!(matches!(error, IndexerError::ChainEpochPinUnavailable));
         assert_eq!(error.reason(), Some(ErrorReason::ChainEpochPinUnavailable));
         assert_eq!(error.retry_policy(), RetryPolicy::RefreshChainEpoch);
+    }
+
+    #[test]
+    fn chain_epoch_conflict_is_a_transient_retry() {
+        let status =
+            zinder_store::status_from_store_error(&zinder_store::StoreError::ChainEpochConflict {
+                current: zinder_core::ChainEpochId::new(5),
+                attempted: zinder_core::ChainEpochId::new(4),
+            });
+
+        assert_eq!(status.code(), Code::Aborted);
+        let error = IndexerError::from_status(status);
+        assert_eq!(error.reason(), Some(ErrorReason::ChainEpochConflict));
+        assert_eq!(error.retry_policy(), RetryPolicy::RetryWithBackoff);
     }
 
     #[test]

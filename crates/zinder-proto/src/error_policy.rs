@@ -96,7 +96,6 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
         | ErrorReason::SchemaMismatch
         | ErrorReason::SchemaTooNew
         | ErrorReason::ReorgWindowExceeded
-        | ErrorReason::ChainEpochConflict
         | ErrorReason::ChainEpochNetworkMismatch
         | ErrorReason::MaterializedViewUnavailable
         | ErrorReason::EndpointCapabilityUnavailable
@@ -134,6 +133,10 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
         }
 
         ErrorReason::ExplorerMethodDisabled => ReasonPolicy::new(Code::Unimplemented, NonRetryable),
+
+        // A reader moved off its pinned epoch, or two commits raced for the
+        // next epoch. Re-reading at a fresh epoch clears it.
+        ErrorReason::ChainEpochConflict => ReasonPolicy::new(Code::Aborted, RetryAfterBackoff),
     }
 }
 
