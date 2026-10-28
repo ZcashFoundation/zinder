@@ -1239,6 +1239,45 @@ impl RocksDbWalletFollowingStore {
         self.store.network()
     }
 
+    /// Returns the maximum rollback depth the retained undo rows support.
+    #[must_use]
+    pub const fn supported_reorg_depth(&self) -> u32 {
+        self.store.control.supported_reorg_depth
+    }
+
+    /// Durably raises the supported rollback depth to the canonical store's
+    /// effective reorg window.
+    ///
+    /// Undo rows always cover exactly the canonical unsettled suffix. A
+    /// canonical raise holds the settled tip, so retained rows grow with new
+    /// blocks and no row is backfilled. A smaller depth is refused because
+    /// pruned rows cannot be recovered without a rebuild; an equal depth is a
+    /// no-op.
+    pub fn raise_supported_reorg_depth(
+        &mut self,
+        supported_reorg_depth: u32,
+    ) -> Result<(), RocksDbWalletError> {
+        let current = self.store.control.supported_reorg_depth;
+        if supported_reorg_depth == current {
+            return Ok(());
+        }
+        if supported_reorg_depth < current {
+            return Err(RocksDbWalletError::WalletProjectionRebuildRequired {
+                reason: "configured reorg window is below the wallet's supported reorg depth; a depth is never lowered in place",
+            });
+        }
+        let mut next_control = self.store.control.clone();
+        next_control.supported_reorg_depth = supported_reorg_depth;
+        write_control_sync(&self.store.bounded_open, &next_control)?;
+        if decode_only_control(&self.store.bounded_open)? != next_control {
+            return Err(RocksDbWalletError::AdmissionChanged {
+                reason: "wallet supported reorg depth readback differs from the raised control",
+            });
+        }
+        self.store.control = next_control;
+        Ok(())
+    }
+
     /// Returns one retained undo record so a follower can verify its common ancestor.
     ///
     /// This narrow inspection surface exposes no query reads or arbitrary row

@@ -33,11 +33,12 @@ version and commit appear in the `zinder_build_info` metric and native
 | `upstream_not_ready` | Zebra is reachable but not sufficiently synchronized. |
 | `storage_unavailable` | Required local storage cannot be opened or read. |
 | `schema_mismatch` | Persisted identity or schema differs from the binary. |
-| `reorg_window_exceeded` | A replacement crosses the persisted reorg policy. |
+| `reorg_window_exceeded` | A replacement crosses the persisted reorg policy. The detail carries the replacement depth, the window, and the depth the window covered, which is smaller than the window while a raised window is still growing. |
 | `replica_lagging` | A RocksDB secondary exceeds the admitted epoch lag. |
 | `serving_pair_stale` | A wallet-serving reader cannot refresh its published pair, which is still within its staleness ceiling. |
 | `writer_status_unavailable` | A trusted reader cannot reach the writer control API. |
 | `ingest_control_unavailable` | Native wallet live-state health failed on the admitted ingest-control channel. |
+| `canonical_tip_unconfirmed` | The canonical writer has not confirmed its store's visible tip against its node since it opened the store, so wallet-serving readers do not serve its fence yet. |
 | `cursor_at_risk` | Canonical event retention is approaching an active cursor. |
 | `shutting_down` | New traffic has been drained for termination. |
 
@@ -94,8 +95,15 @@ admission: they call `WriterStatus` and a bounded
 validate coherent network and tip evidence. A transition into failure emits
 one classified warning and drains readiness with
 `ingest_control_unavailable`; recovery emits one event and restores only the
-ingest-control input. The health probe intentionally shares the configured
-serving-pair refresh cadence because both observe the same control plane.
+ingest-control input. A `WriterStatus` that reports a parked writer instead
+drains readiness with `reorg_window_exceeded`, which takes precedence over the
+serving-pair failures it causes. New native requests then fail with
+`REORG_WINDOW_EXCEEDED`, and open `ChainEvents` streams end with the same
+status. The serving-pair publisher reads the same halt from
+`CanonicalControl.WriterStatus`, which is how lightwalletd compatibility,
+which has no ingest-control probe, refuses traffic in both serving modes. The
+health probe intentionally shares the configured serving-pair refresh cadence
+because both observe the same control plane.
 
 The node probe exercises `tip_id` and upstream synchronization health through
 the same shared source handle installed in the query. It does not repeat
@@ -176,7 +184,9 @@ block-local boundary.
 ### Mempool owner
 
 - `zinder_mempool_lifecycle_state{status}` is a one-hot gauge over the closed
-  `hydrating`, `serving`, and `rebuild_required` states.
+  `hydrating`, `serving`, `rebuild_required`, and `halted` states. `halted`
+  means the canonical writer parked on a reorg deeper than its window and the
+  owner stopped following the node mempool until the process restarts.
 - `zinder_mempool_entries` reports the current process-local live entry count.
 - `zinder_mempool_source_errors_total{kind,failure_class}` and
   `zinder_mempool_hydration_failures_total{reason}` diagnose bounded source

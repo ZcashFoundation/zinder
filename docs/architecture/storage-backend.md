@@ -96,6 +96,17 @@ explicit and validated. A secondary:
 - does not treat an open database as evidence of exact-fence agreement; and
 - cannot be shared by two processes or two reader generations.
 
+Every READY publication must be explained by the persisted replay rows from the
+settled checkpoint through the visible tip. Opening a canonical primary or
+secondary derives that whole unsettled suffix once. Afterwards the writer
+authenticates only the rows each of its transitions wrote, and a secondary only
+the rows the chain events since its last catch-up changed; a catch-up whose
+READY evidence is unchanged reads no replay rows. Both re-derive the whole
+suffix once their incrementally authenticated rows reach one reorg window, and
+a secondary also does so when the intervening events are no longer retained or
+its incremental check fails. Per-transition cost therefore follows the rows a
+transition changes rather than the reorg window.
+
 `zinder-compat-lightwalletd` alternates secondary generations so it can catch up
 and validate a replacement pair before publishing it. In-flight requests keep
 their existing immutable pair.
@@ -126,13 +137,23 @@ contract and [Service operations](service-operations.md) for metrics.
 Every opener validates exact identity and version before returning a role
 handle. A newer or older unsupported physical layout, wrong network, wrong
 workload, wrong construction activation fingerprint, an activation table that
-differs from the admitted schedule at or below the visible tip, changed reorg
-policy, or incompatible source identity fails without mutation. Only the
-canonical writer journals a new schedule revision; it may change only
-activations above the visible tip. A reader checks its node's table only when
-it first opens a secondary. Catch-ups and later reader generations follow the
-writer-admitted schedule; see
+differs from the admitted schedule at or below the visible tip, a reorg window
+other than the store's effective window, or incompatible source identity fails
+without mutation. Only the canonical writer journals a new schedule revision;
+it may change only activations above the visible tip. A reader checks its
+node's table only when it first opens a secondary. Catch-ups and later reader
+generations follow the writer-admitted schedule; see
 [ADR-0039](../adrs/0039-writer-admitted-network-upgrade-schedules.md).
+
+The effective reorg window is the construction window until the canonical
+writer opens the store with a larger one. The writer then appends a versioned
+reorg-policy trailer after the schedule trailer in READY control, in one synced
+write, and holds the settled tip so the replaceable suffix grows to the new
+window. A smaller window is refused. The projector raises the wallet's
+supported reorg depth to the canonical effective window when it resumes,
+without backfilling undo rows. Readers require the exact effective window, and
+releases before the trailer refuse a raised store. See
+[ADR-0041](../adrs/0041-reorg-window-follows-the-node-bound.md).
 
 Version domains are independent. Canonical physical schema, canonical replay
 format, canonical digest, wallet physical schema, wallet value encoding,
@@ -156,6 +177,12 @@ Checkpoint preparation is owner-coordinated. Cold admission reopens the
 checkpoint with bounded resources and compares its database identity and ready
 evidence with the source captured before checkpoint creation. Independently
 timed copies of primary directories are not a coherent restore contract.
+
+A checkpoint of a store whose writer raised its reorg window enforces the
+raised window. Owner-checkpoint evidence and state-bundle manifests record it
+as `effective_reorg_window_blocks` beside the construction window, and omit it
+for a store that still enforces its construction window. Restoring such a
+bundle requires configuring every runtime with the recorded window.
 
 ## PostgreSQL diagnostics
 

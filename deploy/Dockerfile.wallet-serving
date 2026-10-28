@@ -83,6 +83,8 @@ COPY deploy/config/wallet-serving/query.toml /etc/zinder/query.toml
 
 COPY --chmod=0755 deploy/wallet-serving-runtime-entrypoint \
     /usr/local/bin/zinder-wallet-serving-runtime-entrypoint
+COPY --chmod=0755 deploy/wallet-serving-healthcheck \
+    /usr/local/bin/zinder-wallet-serving-healthcheck
 
 # Platform volume mounts replace the ownership baked into the image, and the
 # nofile limit is raised before any store opens. Start as root; the entrypoint
@@ -93,9 +95,11 @@ WORKDIR /var/lib/zinder
 EXPOSE 9102 9106
 
 # The start period covers the entrypoint's canonical, wallet, and serving
-# construction deadlines, which together run to five and a half hours.
+# construction deadlines, which together run to five and a half hours. A parked
+# canonical writer counts as healthy: query then refuses wallets with the typed
+# REORG_WINDOW_EXCEEDED halt, and the entrypoint keeps that refusal up.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=6h --retries=3 \
-    CMD curl -fsS http://localhost:9106/readyz || exit 1
+    CMD ["zinder-wallet-serving-healthcheck"]
 
 ENTRYPOINT ["zinder-wallet-serving-runtime-entrypoint"]
 

@@ -81,7 +81,7 @@ These are optional:
 | Variable | Effect |
 | --- | --- |
 | `ZINDER_NODE__INDEXER_GRPC_ADDR` | Enables the streaming mempool source and chain-tip wakeups, such as `http://zebra.railway.internal:8155`. |
-| `ZINDER_INGEST__REORG_WINDOW_BLOCKS` | Sets the canonical replacement depth, applied identically to the projector and the query surface. |
+| `ZINDER_INGEST__REORG_WINDOW_BLOCKS` | Sets the canonical replacement depth, applied identically to the projector and the query surface. Defaults to 1000, Zebra's finalization depth. Raising it on an existing deployment, including by upgrading to this default, raises the stores in place and irreversibly; capture a state bundle first if you need a rollback path. Lowering it requires a rebuild. |
 | `RUST_LOG` | Log filter, such as `info,zinder=info`. |
 | `INGEST_CONTROL_BEARER_TOKEN` | Ingest-control bearer secret. Generated at boot when unset. |
 | `CHECKPOINT_BEARER_TOKEN` | Checkpoint bearer secret. Generated at boot when unset. |
@@ -159,8 +159,11 @@ The volume is retained and the next attempt resumes from the durable fence
 rather than starting over.
 
 A cause that no amount of waiting clears (`schema_mismatch`,
-`node_capability_missing`, `reorg_window_exceeded`) ends the container as soon
-as a plane reports it, instead of consuming the phase deadline.
+`node_capability_missing`) ends the container as soon as a plane reports it,
+instead of consuming the phase deadline. A plane that reports
+`reorg_window_exceeded` ends its phase instead: the canonical writer is parked,
+and the remaining processes start so wallets receive the typed refusal
+described under [Failure handling](#failure-handling).
 
 Tell the three phases apart from the deploy logs:
 
@@ -198,19 +201,43 @@ proves a client can be answered.
 ## Failure handling
 
 The container terminates with a non-zero status when any of the three processes
-exits, when a plane reports a cause that requires an operator, or when a plane
-stops admitting traffic for an hour. The restart policy is `ALWAYS` with no
+exits, when a plane reports `schema_mismatch` or `node_capability_missing`, or
+when a plane stops admitting traffic for an hour. The restart policy is `ALWAYS` with no
 retry cap, so a surviving subset never keeps answering requests it cannot
 satisfy and the platform never stops restarting a crash loop.
 
 Liveness alone does not prove the topology advances, so the supervisor polls
 all three `/readyz` endpoints as well. A canonical writer that meets a reorg
-deeper than `ZINDER_INGEST__REORG_WINDOW_BLOCKS` drains its readiness and parks
-without exiting, and its readers keep publishing a self-consistent pair at the
-frozen height. Treating `reorg_window_exceeded` as terminal makes the container
-restart, meet the same reorg, and restart again until an operator reconciles
-the canonical store. That crash loop is the intended outcome: the alternative
-is a `WalletQuery` surface answering from a chain that stopped advancing.
+deeper than `ZINDER_INGEST__REORG_WINDOW_BLOCKS` stops following and parks
+without exiting, reporting `reorg_window_exceeded`. It keeps serving its
+frozen fence to the projector and query. Native query reads the halt from the
+writer, drains its own readiness with `reorg_window_exceeded`, and refuses
+every wallet request and open `ChainEvents` stream with the typed
+`REORG_WINDOW_EXCEEDED` status. A lightwalletd compatibility runtime pointed
+at the same writer refuses wallet requests the same way. The container stays up in this state and logs
+the halt once: restarting would park the writer on the same reorg and replace
+the typed refusal with refused connections. With the default 1000-block window,
+the node itself cannot produce such a reorg, so look for a replaced, resynced,
+or misbehaving node. Confirm the authoritative branch, then rebuild or restore a
+coherent state bundle before returning the service to traffic.
+
+Health checks follow the same rule. The image `HEALTHCHECK` runs
+`zinder-wallet-serving-healthcheck`, which passes when query `/readyz` answers
+200 or reports `reorg_window_exceeded`, so a Docker or Compose host that
+restarts unhealthy containers keeps the typed refusal up instead of restarting
+into the same park.
+
+Railway's deploy-time healthcheck is different: it requires `/readyz` to
+answer 200 within `healthcheckTimeout` (six hours) before a deployment counts
+as successful. Do not redeploy while the writer is parked except to ship the
+reconciliation, such as a restored state bundle or a rebuild. A redeploy
+restarts all three processes, ingest parks again on the same reorg, and query
+reports `reorg_window_exceeded`, so the new deployment never passes the
+healthcheck and Railway marks it failed when the timeout expires. Because the
+service owns a volume, Railway stops the running deployment before it starts
+the new one, so the redeploy also ends the deployment that was serving the
+typed refusal. A plain restart or a crash restart under the `ALWAYS` policy
+does not run the deploy-time healthcheck and comes back serving the halt.
 
 Upstream outages and sync lag drain readiness the same way but clear on their
 own, so they are tolerated for an hour before the container terminates.

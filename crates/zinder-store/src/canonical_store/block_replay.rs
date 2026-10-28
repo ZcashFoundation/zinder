@@ -443,46 +443,16 @@ pub(super) fn resume_persisted_sequence_checkpoint(
             "sequence checkpoint tail has {replay_block_count} blocks; maximum is {maximum_replay_blocks}"
         )));
     }
-    let mut digest_builder =
-        CanonicalBlockFactsSequenceDigestBuilder::resume_from_prefix(checkpoint.sequence_digest());
-    let mut retained_block_count = checkpoint.retained_block_count();
-    let mut logical_replay_bytes = checkpoint.logical_replay_bytes();
-    let mut previous_block = checkpoint.through();
-    let mut next_height = checkpoint.through().height.next();
-    while next_height.is_some_and(|height| height <= through) {
-        let height = next_height.ok_or_else(|| {
-            CanonicalStoreError::block_replay_sequence("sequence checkpoint height overflow")
-        })?;
-        let persisted = read_persisted_replay(db, height)?;
-        let facts = persisted.replay.facts();
-        if facts.block_header.parent_hash != previous_block.hash {
-            return Err(CanonicalStoreError::block_replay_sequence(format!(
-                "block {} does not extend the sequence checkpoint",
-                height.value()
-            )));
-        }
-        digest_builder
-            .try_append(persisted.replay.reference_digest())
-            .map_err(|source| CanonicalStoreError::block_replay_sequence(source.to_string()))?;
-        retained_block_count = retained_block_count.checked_add(1).ok_or_else(|| {
-            CanonicalStoreError::block_replay_sequence("checkpoint block count exceeds u64::MAX")
-        })?;
-        logical_replay_bytes = logical_replay_bytes
-            .checked_add(persisted.logical_replay_bytes)
-            .ok_or_else(|| {
-                CanonicalStoreError::block_replay_sequence(
-                    "checkpoint replay bytes exceed u64::MAX",
-                )
-            })?;
-        previous_block = BlockId::new(height, facts.block_header.block_hash);
-        next_height = height.next();
+    let mut resumed = checkpoint;
+    while let Some(height) = resumed
+        .through()
+        .height
+        .next()
+        .filter(|height| *height <= through)
+    {
+        resumed = super::replay_tail::authenticate_next_replay(db, resumed, height)?;
     }
-    Ok(CanonicalSequenceCheckpoint::from_admitted_parts(
-        previous_block,
-        retained_block_count,
-        digest_builder.finish(),
-        logical_replay_bytes,
-    ))
+    Ok(resumed)
 }
 
 pub(super) fn read_replay_facts_at(

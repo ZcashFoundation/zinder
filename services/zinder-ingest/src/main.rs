@@ -320,6 +320,9 @@ async fn run_ingest(
     let termination = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(termination.clone());
     let worker_cancel = termination.child_token();
+    // The control listener outlives the worker drain so a parked writer can
+    // still report its typed halt to readers until termination.
+    let control_server_cancel = termination.child_token();
     record_explorer_views_admitted(false);
     let materialized_view_plane =
         materialized_view_plane_spec(&command_config, Arc::clone(&network_upgrade_activations))?;
@@ -366,7 +369,10 @@ async fn run_ingest(
         &command_config,
         &source,
         &readiness,
-        &worker_cancel,
+        ControlTaskCancellation {
+            workers: &worker_cancel,
+            server: &control_server_cancel,
+        },
         &mut writer_config,
     );
     log_canonical_writer_start(&command_config, &writer_config);
@@ -384,14 +390,31 @@ async fn run_ingest(
         &mut canonical_control_tasks,
     ))
     .await;
+    let control_server = canonical_control_tasks
+        .server
+        .take()
+        .filter(|_| !canonical_control_tasks.server_completed);
     coordinate_canonical_writer_lifecycle(
         writer_result,
         &termination,
         &readiness,
         shutdown_ingest_worker_tasks(&worker_cancel, canonical_control_tasks, worker_tasks),
-        shutdown_ops_endpoint(ops_handle),
+        async move {
+            control_server_cancel.cancel();
+            await_canonical_control_server_shutdown(control_server).await;
+            shutdown_ops_endpoint(ops_handle).await
+        },
     )
     .await
+}
+
+/// Cancellation scopes for the canonical control tasks.
+#[derive(Clone, Copy)]
+struct ControlTaskCancellation<'a> {
+    /// Stops the mempool owner and retention workers with the other workers.
+    workers: &'a CancellationToken,
+    /// Stops the shared control listener after the ops endpoint's last use.
+    server: &'a CancellationToken,
 }
 
 type CanonicalControlServer = JoinHandle<Result<(), tonic::transport::Error>>;
@@ -408,7 +431,7 @@ fn spawn_canonical_control_tasks(
     command_config: &IngestCommandConfig,
     source: &ZebraJsonRpcSource,
     readiness: &Readiness,
-    cancel: &CancellationToken,
+    cancellation: ControlTaskCancellation<'_>,
     writer_config: &mut CanonicalWriterConfig,
 ) -> CanonicalControlTasks {
     if let Some(listen_addr) = command_config.ingest_control_listen_addr {
@@ -427,7 +450,7 @@ fn spawn_canonical_control_tasks(
             canonical_control_handle.clone(),
             mempool_owner.clone(),
             mempool_ready_signal,
-            cancel.clone(),
+            cancellation.workers.clone(),
         ));
         let mempool_retention = MempoolEventRetentionConfig::new(
             command_config.retention.mempool_mined_window(),
@@ -441,7 +464,7 @@ fn spawn_canonical_control_tasks(
                 budget: command_config.retention.mempool_step_budget(),
                 check_interval: command_config.retention.mempool_check_interval(),
             },
-            cancel.clone(),
+            cancellation.workers.clone(),
         ));
         let canonical_adapter = CanonicalControlGrpcAdapter::new(
             canonical_control_handle.clone(),
@@ -467,7 +490,7 @@ fn spawn_canonical_control_tasks(
             readiness.clone(),
         )
         .with_bearer_token(command_config.ingest_control_bearer_token.clone());
-        let server_cancel = cancel.clone();
+        let server_cancel = cancellation.server.clone();
         let canonical_control_server = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(canonical_adapter.into_server())
@@ -584,14 +607,7 @@ where
         Err(zinder_ingest::CanonicalWriterError::Follow(
             zinder_ingest::CanonicalFollowError::ReorgWindowExceeded(evidence),
         )) => {
-            readiness.set(
-                ReadinessState::reorg_window_exceeded(
-                    u64::from(evidence.required_depth),
-                    u64::from(evidence.configured_window_blocks),
-                    Some(evidence.local_tip.height.value()),
-                )
-                .with_phase(zinder_runtime::IngestPhase::FollowingTip),
-            );
+            readiness.park(evidence.parked_readiness());
             tracing::warn!(
                 target: "zinder::ingest",
                 event = "canonical_writer_reorg_window_exceeded",
@@ -600,6 +616,7 @@ where
                 settled_tip_height = evidence.settled_tip.height.value(),
                 required_depth = evidence.required_depth,
                 configured_window_blocks = evidence.configured_window_blocks,
+                covered_depth_blocks = evidence.covered_depth_blocks,
                 "canonical writer parked with readiness drained for operator review"
             );
             termination.cancelled().await;
@@ -640,9 +657,6 @@ async fn shutdown_ingest_worker_tasks(
     worker_tasks: IngestWorkerTaskHandles,
 ) {
     cancel.cancel();
-    if !control_tasks.server_completed {
-        await_canonical_control_server_shutdown(control_tasks.server.take()).await;
-    }
     if let Some(mempool_owner_task) = control_tasks.mempool_owner.take() {
         await_worker_task("mempool_owner", mempool_owner_task).await;
     }
@@ -999,6 +1013,7 @@ fn canonical_writer_config(
             request_timeout: command_config.runtime_config.node.request_timeout,
             poll_interval: command_config.runtime_config.follow.poll_interval,
             lag_threshold_blocks: command_config.runtime_config.follow.lag_threshold_blocks,
+            max_replacement_bytes: command_config.runtime_config.follow.max_replacement_bytes,
             target_height: command_config.runtime_config.run_overrides.target_height,
             event_retention_window: command_config.retention.chain_event_window(),
             event_retention_check_interval: command_config.retention.chain_event_check_interval(),
@@ -1458,6 +1473,7 @@ mod tests {
                     ),
                     required_depth: 3,
                     configured_window_blocks: 2,
+                    covered_depth_blocks: 2,
                 },
             )),
         ))
@@ -1513,6 +1529,7 @@ mod tests {
             zinder_runtime::ReadinessCause::ReorgWindowExceeded {
                 depth: 3,
                 configured: 2,
+                covered: Some(2),
             }
         ));
         assert_eq!(readiness_report.current_height, Some(4));

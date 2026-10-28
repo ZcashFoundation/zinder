@@ -1670,6 +1670,7 @@ impl IngestControl for StaticIngestControl {
             phase: WriterPhase::FollowingTip.into(),
             gap_blocks: Some(0),
             upstream_not_ready: None,
+            reorg_window_exceeded: None,
         }))
     }
 

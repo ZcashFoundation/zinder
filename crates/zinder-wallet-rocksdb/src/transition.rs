@@ -1885,96 +1885,15 @@ mod tests {
     fn checkpointed_history_follower_reconciles_then_rejects_a_pre_floor_spend()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
-        let activations = checkpointed_activations()?;
-        let canonical_path = temporary.path().join("canonical");
-        let predecessor = BlockId::new(BlockHeight::new(99), BlockHash::from_bytes([0x99; 32]));
-        let checkpoint_block =
-            BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([0xa0; 32]));
-        let plan = CanonicalStoreBuildPlan::checkpointed(
-            &activations,
-            CommitmentTreeCheckpoint::new(predecessor, 99, CommitmentTreeFrontiers::default()),
+        let CheckpointedWalletFixture {
+            activations,
+            canonical_path,
             checkpoint_block,
-            RawBlobRetention::Transactions,
-            CanonicalReorgPolicy::new(100)?,
-        )?;
-        let mut canonical_builder = RocksDbCanonicalBuilder::create_fresh(
-            &canonical_path,
-            CanonicalStoreWorkload::Wallet,
-            plan,
-            RocksDbResourceBudget::for_local_tests(),
-        )?;
-        canonical_builder.bulk_load_blocks([Ok::<_, std::io::Error>(checkpointed_build_block(
-            100, [0x99; 32], [0xa0; 32], true,
-        ))])?;
-        canonical_builder.load_subtree_roots(std::iter::empty())?;
-        canonical_builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
-            checkpoint_block,
-            100,
-            CommitmentTreeFrontiers::default(),
-        ))?;
-        let validated = canonical_builder.prepare_cold_certified_publication()?;
-        let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
-            checkpoint_block,
-            UnixTimestampMillis::new(1_750_000_100_000),
-        ))?;
-        let canonical_store = validated.publish_baseline(publication)?;
-        let initial_fence = canonical_store.event_fence();
-        assert_eq!(initial_fence.sequence_digest().block_count(), 1);
-        let initial_source = source_identity_from_fence(initial_fence);
-
-        let wallet_path = temporary.path().join("wallet");
-        let wallet_build_store = RocksDbWalletBuildStore::create_fresh(
-            &wallet_path,
-            Network::ZcashRegtest,
+            canonical_store,
+            initial_fence,
             initial_source,
-            1,
-            RocksDbResourceBudget::for_local_tests(),
-        )?;
-        let lease_request = WalletProjectionBuildLeaseRequest::new(
-            WalletProjectionBuildOwner::from_bytes([0x42; 16]),
-            initial_source,
-            WalletProjectionRetainedEventAnchor::new(initial_fence.chain_event_sequence()),
-            UnixTimestampMillis::new(u64::MAX),
-        );
-        let wallet_builder = RocksDbWalletBuilder::create_fresh(
-            wallet_build_store,
-            lease_request,
-            UnixTimestampMillis::new(0),
-        )?;
-        let projection_digest = WalletProjectionDigestBuilder::new();
-        let row_counts = projection_digest.row_counts();
-        let (projection_accumulator, projection_display_digest) =
-            projection_digest.finish_with_accumulator();
-        let ready_evidence = WalletProjectionReadyEvidence {
-            source_position: WalletProjectionSourcePosition::new(
-                initial_fence.chain_epoch_id(),
-                initial_fence.visible_tip(),
-                initial_fence.chain_event_sequence(),
-            ),
-            source_sequence_digest: initial_fence.sequence_digest(),
-            settled_tip: initial_fence.visible_tip(),
-            projection_digest: projection_display_digest,
-            projection_accumulator,
-            row_counts,
-            utxo_summary: WalletUtxoSetSummary {
-                utxo_count: 0,
-                total_value_zat: 0,
-                commitment: TransparentUtxoSetCommitment::empty(),
-            },
-        };
-        let wallet = wallet_builder
-            .reopen_for_validation()?
-            .validate_rows(
-                ready_evidence,
-                WalletColdValidationConfig {
-                    staging_path: temporary.path(),
-                    max_sort_memory_bytes_per_sorter: 16 * 1024 * 1024,
-                    max_temporary_file_bytes_per_sorter: 16 * 1024 * 1024,
-                    max_accounted_reorg_undo_bytes: 16 * 1024 * 1024,
-                },
-            )?
-            .publish_ready_at(UnixTimestampMillis::new(0))?;
-        drop(wallet);
+            wallet_path,
+        } = checkpointed_canonical_with_ready_wallet(&temporary, 1)?;
 
         let mut append_block = checkpointed_build_block(101, [0xa0; 32], [0xa1; 32], false);
         let mut append_accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
@@ -2126,6 +2045,262 @@ mod tests {
             "{outcome:?}"
         );
         Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one proof keeps the held settlement, the refused transition, the raise, and the restart together"
+    )]
+    fn raised_depth_retains_an_unsettled_suffix_deeper_than_the_original_depth()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let CheckpointedWalletFixture {
+            activations,
+            canonical_path,
+            checkpoint_block,
+            canonical_store,
+            initial_fence,
+            initial_source,
+            wallet_path,
+        } = checkpointed_canonical_with_ready_wallet(&temporary, 1)?;
+        let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
+            checkpoint_block.height,
+            &CommitmentTreeFrontiers::default(),
+            &activations,
+        )?;
+        // The canonical settled tip holds at the checkpoint while two blocks
+        // arrive, as it does after a canonical window raise.
+        let mut canonical_store = canonical_store;
+        let mut fence = initial_fence;
+        for (height, parent_hash, block_hash) in
+            [(101, [0xa0; 32], [0xa1; 32]), (102, [0xa1; 32], [0xa2; 32])]
+        {
+            let mut block = checkpointed_build_block(height, parent_hash, block_hash, false);
+            accumulator.append_block_commitments(BlockHeight::new(height), &[], &[], &[])?;
+            block.tip_metadata = accumulator.tip_metadata();
+            block.tree_state_checkpoint = Some(CommitmentTreeCheckpoint::new(
+                BlockId::new(BlockHeight::new(height), BlockHash::from_bytes(block_hash)),
+                height,
+                accumulator.validated_frontiers()?,
+            ));
+            (canonical_store, fence) = canonical_store.commit_live_append(
+                CanonicalLiveAppend::new(
+                    fence,
+                    block,
+                    Vec::new(),
+                    checkpoint_block,
+                    UnixTimestampMillis::new(1_750_000_100_000 + u64::from(height)),
+                ),
+                &activations,
+            )?;
+        }
+        drop(canonical_store);
+        let secondary = RocksDbCanonicalSecondary::open_ready(
+            &canonical_path,
+            temporary.path().join("canonical-secondary"),
+            &activations,
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(100)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let source_cursor = initial_source.source_position().event_cursor.as_bytes();
+        let events = secondary.canonical_event_history(CanonicalEventHistoryRequest::new(
+            Some(&source_cursor),
+            NonZeroU32::new(2).ok_or("event page limit must be nonzero")?,
+        ))?;
+        let [first, second] = events.as_slice() else {
+            return Err("expected two retained append events".into());
+        };
+        let mut following = RocksDbWalletStore::open_ready_for_following(
+            &wallet_path,
+            Network::ZcashRegtest,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(following.supported_reorg_depth(), 1);
+        let replay = |height| {
+            let range =
+                BlockHeightRange::inclusive(BlockHeight::new(height), BlockHeight::new(height));
+            secondary.scan_canonical_replay_range(range)
+        };
+        following.apply_canonical_event_range(
+            initial_source,
+            *first,
+            first.resulting_fence(),
+            checkpoint_block,
+            test_transition_logical_byte_limit(),
+            replay(101)?,
+        )?;
+        let after_first =
+            WalletCanonicalSourceIdentity::from_ready_evidence(following.ready_evidence());
+        let refused = following.apply_canonical_event_range(
+            after_first,
+            *second,
+            second.resulting_fence(),
+            checkpoint_block,
+            test_transition_logical_byte_limit(),
+            replay(102)?,
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(crate::RocksDbWalletError::WalletProjectionRebuildRequired { .. })
+            ),
+            "{refused:?}"
+        );
+
+        following.raise_supported_reorg_depth(2)?;
+        following.apply_canonical_event_range(
+            after_first,
+            *second,
+            second.resulting_fence(),
+            checkpoint_block,
+            test_transition_logical_byte_limit(),
+            replay(102)?,
+        )?;
+        assert_eq!(following.ready_evidence().row_counts.reorg_undo_count, 2);
+        assert_eq!(following.ready_evidence().settled_tip, checkpoint_block);
+        drop(following);
+
+        let mut reopened = RocksDbWalletStore::open_ready_for_following(
+            &wallet_path,
+            Network::ZcashRegtest,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(reopened.supported_reorg_depth(), 2);
+        let lowered = reopened.raise_supported_reorg_depth(1);
+        assert!(
+            matches!(
+                lowered,
+                Err(crate::RocksDbWalletError::WalletProjectionRebuildRequired { .. })
+            ),
+            "{lowered:?}"
+        );
+        assert_eq!(reopened.supported_reorg_depth(), 2);
+        Ok(())
+    }
+
+    struct CheckpointedWalletFixture {
+        activations: NetworkUpgradeActivations,
+        canonical_path: std::path::PathBuf,
+        checkpoint_block: BlockId,
+        canonical_store: zinder_store::RocksDbCanonicalStore,
+        initial_fence: zinder_store::CanonicalEventFence,
+        initial_source: WalletCanonicalSourceIdentity,
+        wallet_path: std::path::PathBuf,
+    }
+
+    /// Publishes a canonical store checkpointed at height 100 with a
+    /// 100-block window and a READY empty wallet at `supported_reorg_depth`.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixture keeps canonical publication and wallet promotion in one visible order"
+    )]
+    fn checkpointed_canonical_with_ready_wallet(
+        temporary: &TempDir,
+        supported_reorg_depth: u32,
+    ) -> Result<CheckpointedWalletFixture, Box<dyn std::error::Error>> {
+        let activations = checkpointed_activations()?;
+        let canonical_path = temporary.path().join("canonical");
+        let predecessor = BlockId::new(BlockHeight::new(99), BlockHash::from_bytes([0x99; 32]));
+        let checkpoint_block =
+            BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([0xa0; 32]));
+        let plan = CanonicalStoreBuildPlan::checkpointed(
+            &activations,
+            CommitmentTreeCheckpoint::new(predecessor, 99, CommitmentTreeFrontiers::default()),
+            checkpoint_block,
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(100)?,
+        )?;
+        let mut canonical_builder = RocksDbCanonicalBuilder::create_fresh(
+            &canonical_path,
+            CanonicalStoreWorkload::Wallet,
+            plan,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        canonical_builder.bulk_load_blocks([Ok::<_, std::io::Error>(checkpointed_build_block(
+            100, [0x99; 32], [0xa0; 32], true,
+        ))])?;
+        canonical_builder.load_subtree_roots(std::iter::empty())?;
+        canonical_builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
+            checkpoint_block,
+            100,
+            CommitmentTreeFrontiers::default(),
+        ))?;
+        let validated = canonical_builder.prepare_cold_certified_publication()?;
+        let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
+            checkpoint_block,
+            UnixTimestampMillis::new(1_750_000_100_000),
+        ))?;
+        let canonical_store = validated.publish_baseline(publication)?;
+        let initial_fence = canonical_store.event_fence();
+        assert_eq!(initial_fence.sequence_digest().block_count(), 1);
+        let initial_source = source_identity_from_fence(initial_fence);
+
+        let wallet_path = temporary.path().join("wallet");
+        let wallet_build_store = RocksDbWalletBuildStore::create_fresh(
+            &wallet_path,
+            Network::ZcashRegtest,
+            initial_source,
+            supported_reorg_depth,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let lease_request = WalletProjectionBuildLeaseRequest::new(
+            WalletProjectionBuildOwner::from_bytes([0x42; 16]),
+            initial_source,
+            WalletProjectionRetainedEventAnchor::new(initial_fence.chain_event_sequence()),
+            UnixTimestampMillis::new(u64::MAX),
+        );
+        let wallet_builder = RocksDbWalletBuilder::create_fresh(
+            wallet_build_store,
+            lease_request,
+            UnixTimestampMillis::new(0),
+        )?;
+        let projection_digest = WalletProjectionDigestBuilder::new();
+        let row_counts = projection_digest.row_counts();
+        let (projection_accumulator, projection_display_digest) =
+            projection_digest.finish_with_accumulator();
+        let ready_evidence = WalletProjectionReadyEvidence {
+            source_position: WalletProjectionSourcePosition::new(
+                initial_fence.chain_epoch_id(),
+                initial_fence.visible_tip(),
+                initial_fence.chain_event_sequence(),
+            ),
+            source_sequence_digest: initial_fence.sequence_digest(),
+            settled_tip: initial_fence.visible_tip(),
+            projection_digest: projection_display_digest,
+            projection_accumulator,
+            row_counts,
+            utxo_summary: WalletUtxoSetSummary {
+                utxo_count: 0,
+                total_value_zat: 0,
+                commitment: TransparentUtxoSetCommitment::empty(),
+            },
+        };
+        let wallet = wallet_builder
+            .reopen_for_validation()?
+            .validate_rows(
+                ready_evidence,
+                WalletColdValidationConfig {
+                    staging_path: temporary.path(),
+                    max_sort_memory_bytes_per_sorter: 16 * 1024 * 1024,
+                    max_temporary_file_bytes_per_sorter: 16 * 1024 * 1024,
+                    max_accounted_reorg_undo_bytes: 16 * 1024 * 1024,
+                },
+            )?
+            .publish_ready_at(UnixTimestampMillis::new(0))?;
+        drop(wallet);
+
+        Ok(CheckpointedWalletFixture {
+            activations,
+            canonical_path,
+            checkpoint_block,
+            canonical_store,
+            initial_fence,
+            initial_source,
+            wallet_path,
+        })
     }
 
     fn checkpointed_activations()

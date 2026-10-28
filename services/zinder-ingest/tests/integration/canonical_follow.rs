@@ -303,6 +303,7 @@ async fn canonical_follower_settles_from_local_header_without_historical_source_
             event_retention_window: None,
             event_retention_check_interval: Duration::from_secs(1),
             mempool_ready_gate: None,
+            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
         },
         &readiness,
         &cancel,
@@ -373,6 +374,7 @@ async fn canonical_follower_cancellation_after_reorg_preparation_preserves_origi
             event_retention_window: None,
             event_retention_check_interval: Duration::from_secs(1),
             mempool_ready_gate: None,
+            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
         },
         &readiness,
         &cancel,
@@ -458,6 +460,7 @@ async fn canonical_follower_replaces_shallow_fork_reopens_and_continues_appendin
             event_retention_window: None,
             event_retention_check_interval: Duration::from_secs(1),
             mempool_ready_gate: None,
+            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
         },
         &readiness,
         &cancel,
@@ -531,6 +534,7 @@ async fn canonical_follower_replaces_shallow_fork_reopens_and_continues_appendin
             event_retention_window: None,
             event_retention_check_interval: Duration::from_secs(1),
             mempool_ready_gate: None,
+            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
         },
         &append_readiness,
         &append_cancel,
@@ -601,6 +605,7 @@ async fn canonical_follower_refuses_a_fork_below_settlement_without_mutation()
             event_retention_window: None,
             event_retention_check_interval: Duration::from_secs(1),
             mempool_ready_gate: None,
+            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
         },
         &readiness,
         &cancel,
@@ -619,6 +624,7 @@ async fn canonical_follower_refuses_a_fork_below_settlement_without_mutation()
         ReadinessCause::ReorgWindowExceeded {
             depth: 3,
             configured: 2,
+            covered: Some(2),
         }
     ));
     assert_eq!(
@@ -647,6 +653,667 @@ async fn canonical_follower_refuses_a_fork_below_settlement_without_mutation()
         Some(original_four)
     );
     Ok(())
+}
+
+/// A writer parked on an over-window fork keeps serving its control plane
+/// from the frozen fence, and its halt survives other readiness writers until
+/// termination.
+#[tokio::test]
+async fn parked_follower_serves_its_frozen_fence_until_termination()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let original = parseable_multi_block_chain()?;
+    let source = RecordingParseableSource::new(
+        original.clone(),
+        checkpoints_for_parseable_chain(&original, &activations)?,
+        BlockHeight::new(4),
+    );
+    let temporary = tempdir()?;
+    let store = publish_parseable_store(
+        &source,
+        &original,
+        Arc::clone(&activations),
+        &temporary.path().join("canonical"),
+        2,
+        BlockHeight::new(2),
+    )
+    .await?;
+    let original_fence = store.event_fence();
+    let over_window = forked_parseable_chain(&original, 2, 4, 91)?;
+    source.replace_chain(
+        over_window.clone(),
+        checkpoints_for_parseable_chain(&over_window, &activations)?,
+        BlockHeight::new(4),
+    );
+    let readiness = Readiness::default();
+    let cancel = CancellationToken::new();
+    let (canonical, commands) = zinder_ingest::canonical_control_channel();
+    let follower = single_pass_follower(&source, &activations, &readiness, &cancel);
+    // Polled first, so its status request is queued before the reopened
+    // writer's first source observation.
+    let observe_parked = async {
+        let before_observation = canonical.writer_status().await;
+        while !matches!(
+            readiness.report().cause,
+            ReadinessCause::ReorgWindowExceeded { .. }
+        ) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        readiness.set(zinder_runtime::ReadinessState::ready(Some(4)));
+        let snapshot = canonical.writer_status().await;
+        cancel.cancel();
+        (before_observation, snapshot)
+    };
+    let ((before_observation, snapshot), outcome) = tokio::join!(
+        observe_parked,
+        follow_canonical_tip_with_control(store, follower, commands),
+    );
+
+    // The reopened writer never reports its persisted fence as confirmed:
+    // it goes from an unconfirmed tip straight to the halt.
+    let before_observation = before_observation?;
+    assert!(before_observation.tip_unconfirmed);
+    assert!(before_observation.reorg_window_exceeded.is_none());
+    let snapshot = snapshot?;
+    assert!(snapshot.tip_unconfirmed);
+    // Canonical-status readers attest the frozen fence, so the halt must ride
+    // on the same response or they would report ready on a stopped chain.
+    let halt = snapshot
+        .reorg_window_exceeded
+        .ok_or("a parked writer must report its halt with its writer status")?;
+    assert_eq!((halt.depth, halt.configured), (3, 2));
+    let frozen_fence = snapshot
+        .fence
+        .ok_or("a parked writer must report its frozen fence")?;
+    assert_eq!(
+        frozen_fence.event_sequence,
+        original_fence.chain_event_sequence()
+    );
+    assert_eq!(
+        frozen_fence.visible_tip_height,
+        original_fence.visible_tip().height.value()
+    );
+    assert!(matches!(
+        readiness.report().cause,
+        ReadinessCause::ReorgWindowExceeded {
+            depth: 3,
+            configured: 2,
+            covered: Some(2),
+        }
+    ));
+    assert!(matches!(
+        outcome,
+        Err(zinder_ingest::CanonicalFollowError::ReorgWindowExceeded(_))
+    ));
+    Ok(())
+}
+
+/// A reopened writer reports its persisted tip as unconfirmed until a source
+/// observation finds that tip on the node's branch, including while the
+/// source is unreachable, and only then as confirmed.
+#[tokio::test]
+async fn reopened_writer_reports_an_unconfirmed_tip_until_the_source_confirms_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let original = parseable_multi_block_chain()?;
+    let source = RecordingParseableSource::new(
+        original.clone(),
+        checkpoints_for_parseable_chain(&original, &activations)?,
+        BlockHeight::new(4),
+    );
+    let temporary = tempdir()?;
+    let store = publish_parseable_store(
+        &source,
+        &original,
+        Arc::clone(&activations),
+        &temporary.path().join("canonical"),
+        3,
+        BlockHeight::new(1),
+    )
+    .await?;
+    // The node is unreachable when the writer reopens: its tip has no block.
+    source.set_tip_height(BlockHeight::new(99));
+    let readiness = Readiness::default();
+    let cancel = CancellationToken::new();
+    let (canonical, commands) = zinder_ingest::canonical_control_channel();
+    let follower = single_pass_follower(&source, &activations, &readiness, &cancel);
+    let observe = async {
+        let before_observation = canonical.writer_status().await?;
+        while !matches!(readiness.report().cause, ReadinessCause::NodeUnavailable(_)) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let while_unreachable = canonical.writer_status().await?;
+        source.set_tip_height(BlockHeight::new(4));
+        while !readiness.report().is_ready {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let after_confirmation = canonical.writer_status().await?;
+        cancel.cancel();
+        Ok::<_, tonic::Status>((before_observation, while_unreachable, after_confirmation))
+    };
+    let (statuses, outcome) = tokio::join!(
+        observe,
+        follow_canonical_tip_with_control(store, follower, commands),
+    );
+    let (before_observation, while_unreachable, after_confirmation) = statuses?;
+    outcome?;
+
+    assert!(before_observation.tip_unconfirmed);
+    assert!(while_unreachable.tip_unconfirmed);
+    assert!(!after_confirmation.tip_unconfirmed);
+    assert_eq!(
+        before_observation.fence, after_confirmation.fence,
+        "the persisted fence alone must not confirm the tip"
+    );
+    Ok(())
+}
+
+/// A committed append confirms a reopened writer's tip: the appended block
+/// named the visible tip as its parent.
+#[tokio::test]
+async fn committed_append_confirms_a_reopened_writer_tip() -> Result<(), Box<dyn std::error::Error>>
+{
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let original = parseable_multi_block_chain()?;
+    let source = RecordingParseableSource::new(
+        original.clone(),
+        checkpoints_for_parseable_chain(&original, &activations)?,
+        BlockHeight::new(3),
+    );
+    let temporary = tempdir()?;
+    let built = original
+        .range(..=BlockHeight::new(3))
+        .map(|(height, block)| (*height, block.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let store = publish_parseable_store(
+        &source,
+        &built,
+        Arc::clone(&activations),
+        &temporary.path().join("canonical"),
+        3,
+        BlockHeight::new(1),
+    )
+    .await?;
+    source.set_tip_height(BlockHeight::new(4));
+    let (before, after) = statuses_around_first_commit(store, &source, &activations).await?;
+    assert!(before.tip_unconfirmed);
+    assert!(!after.tip_unconfirmed);
+    assert_eq!(after.fence.map(|fence| fence.visible_tip_height), Some(4));
+    Ok(())
+}
+
+/// A committed replacement confirms a reopened writer's tip: the store then
+/// carries the node's branch.
+#[tokio::test]
+async fn committed_replacement_confirms_a_reopened_writer_tip()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let original = parseable_multi_block_chain()?;
+    let source = RecordingParseableSource::new(
+        original.clone(),
+        checkpoints_for_parseable_chain(&original, &activations)?,
+        BlockHeight::new(4),
+    );
+    let temporary = tempdir()?;
+    let store = publish_parseable_store(
+        &source,
+        &original,
+        Arc::clone(&activations),
+        &temporary.path().join("canonical"),
+        3,
+        BlockHeight::new(1),
+    )
+    .await?;
+    let original_fence = store.event_fence();
+    let fork = forked_parseable_chain(&original, 3, 4, 107)?;
+    source.replace_chain(
+        fork.clone(),
+        checkpoints_for_parseable_chain(&fork, &activations)?,
+        BlockHeight::new(4),
+    );
+    let (before, after) = statuses_around_first_commit(store, &source, &activations).await?;
+    assert!(before.tip_unconfirmed);
+    assert!(!after.tip_unconfirmed);
+    assert_ne!(
+        after.fence.map(|fence| fence.event_sequence),
+        Some(original_fence.chain_event_sequence())
+    );
+    Ok(())
+}
+
+/// Returns the writer status before the reopened writer's first source
+/// observation and the one after its first commit.
+///
+/// The source becomes unreachable once that commit is done, so no at-tip
+/// observation can confirm the tip in its place.
+async fn statuses_around_first_commit(
+    store: zinder_store::RocksDbCanonicalStore,
+    source: &RecordingParseableSource,
+    activations: &Arc<NetworkUpgradeActivations>,
+) -> Result<
+    (
+        zinder_proto::v1::ingest::CanonicalWriterStatusResponse,
+        zinder_proto::v1::ingest::CanonicalWriterStatusResponse,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    source.clear_calls();
+    let (second_tip_call, resume_second_tip_call) = source.pause_tip_call(2);
+    let readiness = Readiness::default();
+    let cancel = CancellationToken::new();
+    let (canonical, commands) = zinder_ingest::canonical_control_channel();
+    let follower = single_pass_follower(source, activations, &readiness, &cancel);
+    // Polled first, so its first request is queued before the writer's first
+    // source observation.
+    let observe = async {
+        let before = canonical.writer_status().await?;
+        second_tip_call.notified().await;
+        source.set_tip_height(BlockHeight::new(99));
+        resume_second_tip_call.notify_one();
+        while !matches!(readiness.report().cause, ReadinessCause::NodeUnavailable(_)) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let after = canonical.writer_status().await?;
+        cancel.cancel();
+        Ok::<_, tonic::Status>((before, after))
+    };
+    let (statuses, outcome) = tokio::join!(
+        observe,
+        follow_canonical_tip_with_control(store, follower, commands),
+    );
+    outcome?;
+    Ok(statuses?)
+}
+
+/// With a three-block window over tip 4 and settled tip 1, forks two and
+/// three blocks deep are replaced and a four-block fork parks the writer.
+#[tokio::test]
+async fn canonical_follower_replaces_through_its_window_and_refuses_one_block_deeper()
+-> Result<(), Box<dyn std::error::Error>> {
+    const WINDOW: u32 = 3;
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let original = parseable_multi_block_chain()?;
+    for depth in [WINDOW - 1, WINDOW, WINDOW + 1] {
+        let source = RecordingParseableSource::new(
+            original.clone(),
+            checkpoints_for_parseable_chain(&original, &activations)?,
+            BlockHeight::new(4),
+        );
+        let temporary = tempdir()?;
+        let store = publish_parseable_store(
+            &source,
+            &original,
+            Arc::clone(&activations),
+            &temporary.path().join("canonical"),
+            WINDOW,
+            BlockHeight::new(1),
+        )
+        .await?;
+        let original_fence = store.event_fence();
+        let fork_height = 5 - depth;
+        let fork = forked_parseable_chain(
+            &original,
+            fork_height,
+            4,
+            70_u8.saturating_add(u8::try_from(depth)?),
+        )?;
+        source.replace_chain(
+            fork.clone(),
+            checkpoints_for_parseable_chain(&fork, &activations)?,
+            BlockHeight::new(4),
+        );
+        source.clear_calls();
+        let readiness = Readiness::default();
+        let cancel = CancellationToken::new();
+        source.cancel_after_tip_call(2, cancel.clone());
+        let outcome = follow_canonical_tip(
+            store,
+            single_pass_follower(&source, &activations, &readiness, &cancel),
+        )
+        .await;
+        if depth <= WINDOW {
+            let store = outcome?;
+            assert_eq!(store.event_fence().visible_tip(), block_id(&fork, 4)?);
+            assert_eq!(store.chain_epoch()?.settled_tip_height, BlockHeight::new(1));
+            assert_eq!(store.displaced_block_count()?, u64::from(depth));
+        } else {
+            let error = outcome
+                .err()
+                .ok_or("a fork deeper than the window must fail")?;
+            assert!(matches!(
+                error,
+                zinder_ingest::CanonicalFollowError::ReorgWindowExceeded(evidence)
+                    if evidence.required_depth == depth
+                        && evidence.configured_window_blocks == WINDOW
+                        && evidence.local_tip == original_fence.visible_tip()
+            ));
+            assert!(matches!(
+                readiness.report().cause,
+                ReadinessCause::ReorgWindowExceeded {
+                    depth: 4,
+                    configured: 3,
+                    covered: Some(3),
+                }
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A writer that reopens with a larger window holds its settled tip, so the
+/// replaceable suffix grows with new blocks and a fork deeper than the
+/// construction window is followed.
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one proof binds the in-place raise, the held settlement, and the deeper replacement"
+)]
+async fn canonical_follower_follows_a_deeper_fork_after_an_in_place_window_raise()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let original = parseable_multi_block_chain()?;
+    let source = RecordingParseableSource::new(
+        original.clone(),
+        checkpoints_for_parseable_chain(&original, &activations)?,
+        BlockHeight::new(4),
+    );
+    let temporary = tempdir()?;
+    let store_path = temporary.path().join("canonical");
+    drop(
+        publish_parseable_store(
+            &source,
+            &original,
+            Arc::clone(&activations),
+            &store_path,
+            2,
+            BlockHeight::new(2),
+        )
+        .await?,
+    );
+    let store = zinder_store::RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
+        &store_path,
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        zinder_store::RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(3)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(store.reorg_policy(), CanonicalReorgPolicy::new(3)?);
+    assert_eq!(
+        store.build_plan().reorg_policy(),
+        CanonicalReorgPolicy::new(2)?
+    );
+
+    let extended = forked_parseable_chain(&original, 5, 5, 0)?;
+    source.replace_chain(
+        extended.clone(),
+        checkpoints_for_parseable_chain(&extended, &activations)?,
+        BlockHeight::new(5),
+    );
+    let readiness = Readiness::default();
+    let cancel = CancellationToken::new();
+    let follower = CanonicalFollower::new(
+        &source,
+        Arc::clone(&activations),
+        CanonicalFollowConfig {
+            request_timeout: Duration::from_secs(5),
+            poll_interval: Duration::ZERO,
+            lag_threshold_blocks: 0,
+            target_height: Some(BlockHeight::new(5)),
+            event_retention_window: None,
+            event_retention_check_interval: Duration::from_secs(1),
+            mempool_ready_gate: None,
+            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+        },
+        &readiness,
+        &cancel,
+    );
+    let store = follow_canonical_tip(store, follower).await?;
+    assert_eq!(store.event_fence().visible_tip(), block_id(&extended, 5)?);
+    // Under the construction window the settled tip would advance to 3.
+    assert_eq!(store.chain_epoch()?.settled_tip_height, BlockHeight::new(2));
+
+    let fork = forked_parseable_chain(&extended, 3, 5, 83)?;
+    source.replace_chain(
+        fork.clone(),
+        checkpoints_for_parseable_chain(&fork, &activations)?,
+        BlockHeight::new(5),
+    );
+    source.clear_calls();
+    let cancel = CancellationToken::new();
+    source.cancel_after_tip_call(2, cancel.clone());
+    let store = follow_canonical_tip(
+        store,
+        single_pass_follower(&source, &activations, &readiness, &cancel),
+    )
+    .await?;
+    assert_eq!(store.event_fence().visible_tip(), block_id(&fork, 5)?);
+    assert_eq!(store.chain_epoch()?.settled_tip_height, BlockHeight::new(2));
+    assert_eq!(store.displaced_block_count()?, 3);
+    drop(store);
+
+    let error = zinder_store::RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
+        &store_path,
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        zinder_store::RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(2)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )
+    .err()
+    .ok_or("lowering the raised window must be refused")?;
+    assert!(
+        error.to_string().contains("never lowered in place"),
+        "{error}"
+    );
+    Ok(())
+}
+
+/// Right after a raise, the replaceable depth is still the construction
+/// window, so a halt reports the depth the window covered rather than implying
+/// that the new window was exceeded.
+#[tokio::test]
+async fn halt_during_a_raised_window_ramp_reports_the_covered_depth()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let original = parseable_multi_block_chain()?;
+    let source = RecordingParseableSource::new(
+        original.clone(),
+        checkpoints_for_parseable_chain(&original, &activations)?,
+        BlockHeight::new(4),
+    );
+    let temporary = tempdir()?;
+    let store_path = temporary.path().join("canonical");
+    drop(
+        publish_parseable_store(
+            &source,
+            &original,
+            Arc::clone(&activations),
+            &store_path,
+            2,
+            BlockHeight::new(2),
+        )
+        .await?,
+    );
+    let store = zinder_store::RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
+        &store_path,
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        zinder_store::RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(3)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    let fork = forked_parseable_chain(&original, 2, 4, 97)?;
+    source.replace_chain(
+        fork.clone(),
+        checkpoints_for_parseable_chain(&fork, &activations)?,
+        BlockHeight::new(4),
+    );
+    source.clear_calls();
+    let readiness = Readiness::default();
+    let cancel = CancellationToken::new();
+    source.cancel_after_tip_call(2, cancel.clone());
+    let error = follow_canonical_tip(
+        store,
+        single_pass_follower(&source, &activations, &readiness, &cancel),
+    )
+    .await
+    .err()
+    .ok_or("a fork below the held settled tip must park")?;
+
+    assert!(matches!(
+        error,
+        zinder_ingest::CanonicalFollowError::ReorgWindowExceeded(evidence)
+            if evidence.required_depth == 3
+                && evidence.configured_window_blocks == 3
+                && evidence.covered_depth_blocks == 2
+    ));
+    assert!(matches!(
+        readiness.report().cause,
+        ReadinessCause::ReorgWindowExceeded {
+            depth: 3,
+            configured: 3,
+            covered: Some(2),
+        }
+    ));
+    Ok(())
+}
+
+/// The replacement budget covers the source blocks fork discovery holds.
+///
+/// A replacement whose fetched blocks alone exceed it fails during discovery,
+/// before preparing any block, with a typed error and no canonical write.
+#[tokio::test]
+async fn replacement_beyond_its_memory_budget_fails_closed_without_mutation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let original = parseable_multi_block_chain()?;
+    let fork = forked_parseable_chain(&original, 3, 4, 101)?;
+    let error =
+        follow_fork_with_replacement_budget(&original, &fork, &activations, NonZeroU64::MIN)
+            .await?;
+    assert!(
+        matches!(
+            error,
+            zinder_ingest::CanonicalFollowError::ReplacementBytesExceeded {
+                prepared_blocks: 0,
+                max_replacement_bytes: 1,
+                held_bytes: 2..,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    Ok(())
+}
+
+/// A fork already known to start below settlement parks with
+/// `ReorgWindowExceeded` even when discovery exceeds the replacement budget,
+/// instead of exiting on the budget.
+#[tokio::test]
+async fn fork_below_settlement_parks_before_the_replacement_budget_applies()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let original = parseable_multi_block_chain()?;
+    let fork = forked_parseable_chain(&original, 1, 4, 103)?;
+    let error =
+        follow_fork_with_replacement_budget(&original, &fork, &activations, NonZeroU64::MIN)
+            .await?;
+    assert!(
+        matches!(
+            error,
+            zinder_ingest::CanonicalFollowError::ReorgWindowExceeded(ref evidence)
+                if evidence.configured_window_blocks == 3
+        ),
+        "{error}"
+    );
+    Ok(())
+}
+
+async fn follow_fork_with_replacement_budget(
+    original: &BTreeMap<BlockHeight, SourceBlock>,
+    fork: &BTreeMap<BlockHeight, SourceBlock>,
+    activations: &Arc<NetworkUpgradeActivations>,
+    max_replacement_bytes: NonZeroU64,
+) -> Result<zinder_ingest::CanonicalFollowError, Box<dyn std::error::Error>> {
+    let source = RecordingParseableSource::new(
+        original.clone(),
+        checkpoints_for_parseable_chain(original, activations)?,
+        BlockHeight::new(4),
+    );
+    let temporary = tempdir()?;
+    let store = publish_parseable_store(
+        &source,
+        original,
+        Arc::clone(activations),
+        &temporary.path().join("canonical"),
+        3,
+        BlockHeight::new(1),
+    )
+    .await?;
+    let original_fence = store.event_fence();
+    source.replace_chain(
+        fork.clone(),
+        checkpoints_for_parseable_chain(fork, activations)?,
+        BlockHeight::new(4),
+    );
+    let readiness = Readiness::default();
+    let cancel = CancellationToken::new();
+    let follower = CanonicalFollower::new(
+        &source,
+        Arc::clone(activations),
+        CanonicalFollowConfig {
+            request_timeout: Duration::from_secs(5),
+            poll_interval: Duration::ZERO,
+            lag_threshold_blocks: 0,
+            target_height: None,
+            event_retention_window: None,
+            event_retention_check_interval: Duration::from_secs(1),
+            mempool_ready_gate: None,
+            max_replacement_bytes,
+        },
+        &readiness,
+        &cancel,
+    );
+    let error = follow_canonical_tip(store, follower)
+        .await
+        .err()
+        .ok_or("a replacement beyond its budget must fail")?;
+    let reopened = zinder_store::RocksDbCanonicalStore::open_ready(
+        temporary.path().join("canonical"),
+        activations,
+        CanonicalStoreWorkload::Wallet,
+        zinder_store::RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(3)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(reopened.event_fence(), original_fence);
+    assert_eq!(reopened.displaced_block_count()?, 0);
+    Ok(error)
+}
+
+fn single_pass_follower<'a>(
+    source: &'a RecordingParseableSource,
+    activations: &Arc<NetworkUpgradeActivations>,
+    readiness: &'a Readiness,
+    cancel: &'a CancellationToken,
+) -> CanonicalFollower<'a, RecordingParseableSource> {
+    CanonicalFollower::new(
+        source,
+        Arc::clone(activations),
+        CanonicalFollowConfig {
+            request_timeout: Duration::from_secs(5),
+            poll_interval: Duration::ZERO,
+            lag_threshold_blocks: 0,
+            target_height: None,
+            event_retention_window: None,
+            event_retention_check_interval: Duration::from_secs(1),
+            mempool_ready_gate: None,
+            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+        },
+        readiness,
+        cancel,
+    )
 }
 
 #[tokio::test]
@@ -728,6 +1395,7 @@ async fn retention_steps_yield_to_canonical_source_observation()
                 event_retention_window: None,
                 event_retention_check_interval: Duration::from_secs(1),
                 mempool_ready_gate: None,
+                max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
             },
             &readiness,
             &cancel,
@@ -846,7 +1514,7 @@ fn forked_parseable_chain(
         .range(..BlockHeight::new(fork_height))
         .map(|(height, block)| (*height, block.clone()))
         .collect::<BTreeMap<_, _>>();
-    let mut parent_hash = if fork_height == 0 {
+    let mut parent_hash = if fork_height <= 1 {
         Network::ZcashRegtest.genesis_hash()
     } else {
         block_id(original, fork_height.saturating_sub(1))?.hash

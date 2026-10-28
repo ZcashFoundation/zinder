@@ -18,7 +18,8 @@ use std::num::NonZeroU32;
 use tokio::sync::mpsc;
 use zinder_core::{BlockHeight, Network, TransparentAddressScriptHash};
 use zinder_proto::v1::wallet;
-use zinder_store::{ChainEventStreamFamily, StreamCursorTokenV1, run_event_stream};
+use zinder_runtime::{Readiness, ReadinessCause, not_ready_status};
+use zinder_store::{ChainEventStreamResume, run_event_stream};
 
 use crate::{
     QueryError, TransparentAddressTxIdsInRangeRequest, WalletQueryApi,
@@ -71,22 +72,31 @@ pub(super) fn decode_address_filter(
 ///
 /// The cursor and family follow the same shape as the unfiltered stream;
 /// the only behavioral change is post-fetch envelope filtering.
+///
+/// When `traffic_readiness` reports a parked canonical writer, the next page
+/// read ends the stream with the typed halt status instead of polling a
+/// chain that no longer advances.
 pub(super) fn spawn_filtered_stream<Q>(
     query_api: Q,
-    from_cursor: Option<StreamCursorTokenV1>,
-    family: ChainEventStreamFamily,
+    resume: ChainEventStreamResume,
     address_filter: Vec<TransparentAddressScriptHash>,
+    traffic_readiness: Option<Readiness>,
     event_sender: mpsc::Sender<Result<wallet::ChainEventEnvelope, tonic::Status>>,
 ) where
     Q: WalletQueryApi + Clone + 'static,
 {
     let filter = std::sync::Arc::new(address_filter);
+    let family = resume.family;
     tokio::spawn(run_event_stream(
-        from_cursor,
+        resume.cursor,
         move |cursor| {
             let query_api = query_api.clone();
             let filter = filter.clone();
+            let writer_halt = traffic_readiness.as_ref().and_then(writer_halt_status);
             async move {
+                if let Some(status) = writer_halt {
+                    return Err(status);
+                }
                 let envelopes = chain_events_response(&query_api, cursor, family)
                     .await
                     .map_err(|error| crate::grpc::status_from_query_error(&error))?;
@@ -98,6 +108,12 @@ pub(super) fn spawn_filtered_stream<Q>(
         },
         event_sender,
     ));
+}
+
+fn writer_halt_status(readiness: &Readiness) -> Option<tonic::Status> {
+    readiness
+        .reorg_window_exceeded()
+        .map(|halt| not_ready_status(&ReadinessCause::from(halt)))
 }
 
 /// Filters `envelopes` against `filter`, preserving every reorg envelope

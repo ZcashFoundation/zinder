@@ -16,16 +16,23 @@
 //! source reconnect because a discarded in-memory index is not safe to serve
 //! until the replacement snapshot completes.
 //!
+//! The same pair carries the opposite signal when the canonical writer parks
+//! on a reorg deeper than its window: the follower halts the owner, which
+//! stops consuming the node mempool for the rest of the process.
+//!
 //! [`MempoolSourceEvent::InitialSnapshotComplete`]:
 //! zinder_source::MempoolSourceEvent::InitialSnapshotComplete
 
 use tokio::sync::watch;
 use zinder_core::BlockId;
 
+use crate::writer::control::ParkedWriterHalt;
+
 /// Read-side handle observed by the tip-follow state machine.
 #[derive(Clone, Debug)]
 pub struct MempoolReadyGate {
     certified_source_tip: watch::Receiver<Option<BlockId>>,
+    writer_halt: watch::Sender<Option<ParkedWriterHalt>>,
 }
 
 impl MempoolReadyGate {
@@ -58,6 +65,11 @@ impl MempoolReadyGate {
     pub(crate) async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
         self.certified_source_tip.changed().await
     }
+
+    /// Halts the live mempool owner because the canonical writer parked.
+    pub(crate) fn halt_owner(&self, halt: ParkedWriterHalt) {
+        let _ = self.writer_halt.send_replace(Some(halt));
+    }
 }
 
 /// Write-side handle owned by the live mempool owner's source loop. Cloning is
@@ -65,6 +77,7 @@ impl MempoolReadyGate {
 #[derive(Clone, Debug)]
 pub struct MempoolReadySignal {
     certified_source_tip: watch::Sender<Option<BlockId>>,
+    writer_halt: watch::Receiver<Option<ParkedWriterHalt>>,
 }
 
 impl MempoolReadySignal {
@@ -81,18 +94,37 @@ impl MempoolReadySignal {
     pub fn withdraw_certification(&self) {
         let _ = self.certified_source_tip.send_replace(None);
     }
+
+    /// Resolves once the canonical writer parks and halts the owner.
+    ///
+    /// Never resolves when the follower side is gone without a halt.
+    pub(crate) async fn writer_halted(&self) -> ParkedWriterHalt {
+        let mut writer_halt = self.writer_halt.clone();
+        let halt = writer_halt
+            .wait_for(Option::is_some)
+            .await
+            .ok()
+            .and_then(|halt| *halt);
+        match halt {
+            Some(halt) => halt,
+            None => std::future::pending().await,
+        }
+    }
 }
 
 /// Constructs a fresh, unhydrated gate plus its sender.
 #[must_use]
 pub fn mempool_ready_channel() -> (MempoolReadySignal, MempoolReadyGate) {
     let (tx, rx) = watch::channel(None);
+    let (halt_tx, halt_rx) = watch::channel(None);
     (
         MempoolReadySignal {
             certified_source_tip: tx,
+            writer_halt: halt_rx,
         },
         MempoolReadyGate {
             certified_source_tip: rx,
+            writer_halt: halt_tx,
         },
     )
 }
@@ -107,6 +139,7 @@ mod tests {
     use zinder_core::{BlockHash, BlockHeight, BlockId};
 
     use super::mempool_ready_channel;
+    use crate::writer::control::ParkedWriterHalt;
 
     fn source_tip(tag: u8) -> BlockId {
         BlockId::new(
@@ -145,6 +178,30 @@ mod tests {
         signal.certify_source_tip(certified_tip);
         signal.withdraw_certification();
         assert!(!gate.admits_canonical_tip(certified_tip));
+    }
+
+    #[tokio::test]
+    async fn halting_the_owner_resolves_its_writer_halt() {
+        let (signal, gate) = mempool_ready_channel();
+        let halt = ParkedWriterHalt::new(zinder_proto::v1::ops::ReorgWindowExceededDetail {
+            depth: 1_001,
+            configured: 1_000,
+            covered: Some(1_000),
+        });
+        gate.halt_owner(halt);
+        let observed =
+            tokio::time::timeout(std::time::Duration::from_secs(1), signal.writer_halted()).await;
+        assert_eq!(observed.ok(), Some(halt));
+    }
+
+    #[tokio::test]
+    async fn a_follower_gone_without_a_halt_never_halts_the_owner() {
+        let (signal, gate) = mempool_ready_channel();
+        drop(gate);
+        let observed =
+            tokio::time::timeout(std::time::Duration::from_millis(50), signal.writer_halted())
+                .await;
+        assert!(observed.is_err());
     }
 
     #[test]

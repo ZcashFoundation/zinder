@@ -23,7 +23,8 @@ use super::{
     event_lifecycle::{canonical_event_history_from_db, canonical_event_retention_floor_from_db},
     live_commit::event_fence_from_ready,
     mempool_lifecycle::validate_mempool_lifecycle_admission,
-    publication::{validate_ready_publication, validate_ready_sequence_checkpoint},
+    publication::{follow_ready_replay_tail, validate_ready_publication},
+    replay_tail::AuthenticatedReplayTail,
     rocksdb::{
         CANONICAL_DATA_COLUMN_FAMILIES, CanonicalStoreAdmissionExpectation,
         canonical_column_family_descriptors, canonical_store_path, validate_open_store_control,
@@ -74,6 +75,8 @@ pub struct RocksDbCanonicalSecondary {
     pub(super) ready_evidence: CanonicalStoreReadyEvidence,
     pub(super) cursor_auth_key: [u8; 32],
     pub(super) activation_schedule: Option<CanonicalActivationSchedule>,
+    reorg_policy: super::CanonicalReorgPolicy,
+    pub(super) replay_tail: AuthenticatedReplayTail,
 }
 
 impl RocksDbCanonicalSecondary {
@@ -167,9 +170,11 @@ impl RocksDbCanonicalSecondary {
             opened_control.workload,
             &opened_control.build_plan,
         )?;
-        validate_ready_publication(
+        let reorg_policy = opened_control.effective_reorg_policy();
+        let replay_tail = validate_ready_publication(
             &bounded_open.db,
             &opened_control.build_plan,
+            reorg_policy,
             &ready_evidence,
         )?;
         let activation_schedule = opened_control
@@ -192,26 +197,34 @@ impl RocksDbCanonicalSecondary {
             // The reader's node table is checked only at open. Catch-ups
             // authenticate the schedule journal and follow each revision the
             // writer admits, so a long-running reader never pins its startup
-            // observation.
+            // observation. The reorg window stays exact: a writer raise
+            // after open fails catch-up until the reader restarts with it.
             expectation: CanonicalStoreAdmissionExpectation::from_build_plan(
                 &opened_control.build_plan,
                 expected_workload,
+                reorg_policy,
             ),
             workload: expected_workload,
             build_plan: opened_control.build_plan,
             ready_evidence,
             cursor_auth_key: opened_control.cursor_auth_key,
             activation_schedule,
+            reorg_policy,
+            replay_tail,
         })
     }
 
     /// Catches up and authenticates the new visible replay tail.
     ///
-    /// The initial open has already cold-validated every canonical family. A
-    /// live catch-up therefore validates the exact control contract and resumes
-    /// the canonical sequence digest from the settled checkpoint across at most
-    /// the configured reorg window. It never repeats a full historical scan for
-    /// each writer transition.
+    /// The initial open has already cold-validated every canonical family and
+    /// derived the unsettled replay tail. A live catch-up validates the exact
+    /// control contract, returns early when the READY evidence is unchanged,
+    /// and otherwise re-derives only the replay rows the intervening chain
+    /// events changed. It falls back to re-deriving the whole unsettled suffix,
+    /// at most one reorg window, when those events are unavailable, when the
+    /// incremental check fails, and once per window of incrementally derived
+    /// rows. It never repeats a full historical scan for each writer
+    /// transition.
     pub fn try_catch_up(
         &mut self,
     ) -> Result<CanonicalSecondaryCatchupOutcome, CanonicalStoreError> {
@@ -265,11 +278,17 @@ impl RocksDbCanonicalSecondary {
                 "canonical READY publication changed without advancing its event sequence",
             ));
         }
-        validate_ready_sequence_checkpoint(
-            &self.bounded_open.db,
-            &self.build_plan,
-            &ready_evidence,
-        )?;
+        // Unchanged READY evidence is still explained by the tail this reader
+        // already authenticated; otherwise re-derive only what changed.
+        if ready_evidence != self.ready_evidence {
+            follow_ready_replay_tail(
+                &self.bounded_open.db,
+                self.reorg_policy,
+                &self.ready_evidence,
+                &ready_evidence,
+                &mut self.replay_tail,
+            )?;
+        }
         self.ready_evidence = ready_evidence;
         self.activation_schedule = opened_control
             .activation_schedule_binding
@@ -308,6 +327,13 @@ impl RocksDbCanonicalSecondary {
     #[must_use]
     pub const fn workload(&self) -> CanonicalStoreWorkload {
         self.workload
+    }
+
+    /// Returns the effective maximum canonical replacement depth admitted at
+    /// open: the construction policy or a writer-admitted raise.
+    #[must_use]
+    pub const fn reorg_policy(&self) -> super::CanonicalReorgPolicy {
+        self.reorg_policy
     }
 
     /// Returns the immutable raw-blob retention authenticated at admission.

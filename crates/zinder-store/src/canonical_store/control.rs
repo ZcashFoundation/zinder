@@ -19,6 +19,8 @@ const BUILDING_STATE: u8 = 1;
 const READY_STATE: u8 = 2;
 const ACTIVATION_SCHEDULE_TRAILER_MAGIC: &[u8] = b"ASCH";
 const ACTIVATION_SCHEDULE_TRAILER_VERSION: u16 = 1;
+const REORG_POLICY_TRAILER_MAGIC: &[u8] = b"RPOL";
+const REORG_POLICY_TRAILER_VERSION: u16 = 1;
 const COMPLETE_HISTORY: u8 = 0;
 const CHECKPOINTED_HISTORY: u8 = 1;
 const WALLET_WORKLOAD: u8 = 1;
@@ -54,6 +56,35 @@ pub(super) struct DecodedStoreControl {
     pub(super) cursor_auth_key: [u8; 32],
     pub(super) build_state: CanonicalStoreBuildState,
     pub(super) activation_schedule_binding: Option<ActivationScheduleBinding>,
+    pub(super) revised_reorg_policy: Option<super::CanonicalReorgPolicy>,
+}
+
+impl DecodedStoreControl {
+    /// Returns the writer-admitted replacement depth, falling back to the
+    /// immutable construction policy before the first raise.
+    pub(super) fn effective_reorg_policy(&self) -> super::CanonicalReorgPolicy {
+        self.revised_reorg_policy
+            .unwrap_or_else(|| self.build_plan.reorg_policy())
+    }
+
+    pub(super) const fn revisions(&self) -> ControlRevisions {
+        ControlRevisions {
+            activation_schedule_binding: self.activation_schedule_binding,
+            revised_reorg_policy: self.revised_reorg_policy,
+        }
+    }
+}
+
+/// Writer-admitted revisions appended to READY control after construction.
+///
+/// Construction identity stays immutable. Each revision is an optional,
+/// versioned trailer, so releases that predate it reject the control record.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct ControlRevisions {
+    pub(super) activation_schedule_binding: Option<ActivationScheduleBinding>,
+    /// Replacement depth raised above the construction policy. `None` until
+    /// the writer first admits a larger window.
+    pub(super) revised_reorg_policy: Option<super::CanonicalReorgPolicy>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,21 +110,21 @@ pub(super) fn encode_ready_store_control(
     cursor_auth_key: [u8; 32],
     ready_evidence: &CanonicalStoreReadyEvidence,
 ) -> Result<Vec<u8>, CanonicalStoreBuildPlanError> {
-    encode_ready_store_control_with_schedule(
+    encode_ready_store_control_with_revisions(
         workload,
         build_plan,
         cursor_auth_key,
         ready_evidence,
-        None,
+        ControlRevisions::default(),
     )
 }
 
-pub(super) fn encode_ready_store_control_with_schedule(
+pub(super) fn encode_ready_store_control_with_revisions(
     workload: CanonicalStoreWorkload,
     build_plan: &CanonicalStoreBuildPlan,
     cursor_auth_key: [u8; 32],
     ready_evidence: &CanonicalStoreReadyEvidence,
-    activation_schedule_binding: Option<ActivationScheduleBinding>,
+    revisions: ControlRevisions,
 ) -> Result<Vec<u8>, CanonicalStoreBuildPlanError> {
     let mut encoded = encode_store_control_prefix(workload, build_plan, cursor_auth_key)?;
     encoded.push(READY_STATE);
@@ -124,11 +155,22 @@ pub(super) fn encode_ready_store_control_with_schedule(
     encoded.extend_from_slice(&checkpoint.logical_replay_bytes().to_le_bytes());
     encoded.extend_from_slice(&ready_evidence.construction_manifest_version.to_le_bytes());
     encoded.extend_from_slice(&ready_evidence.construction_manifest_sha256);
-    if let Some(binding) = activation_schedule_binding {
+    if let Some(binding) = revisions.activation_schedule_binding {
         encoded.extend_from_slice(ACTIVATION_SCHEDULE_TRAILER_MAGIC);
         encoded.extend_from_slice(&ACTIVATION_SCHEDULE_TRAILER_VERSION.to_le_bytes());
         encoded.extend_from_slice(&binding.revision.to_le_bytes());
         encoded.extend_from_slice(&binding.digest);
+    }
+    if let Some(reorg_policy) = revisions.revised_reorg_policy {
+        if reorg_policy <= build_plan.reorg_policy() {
+            return Err(CanonicalStoreBuildPlanError::ReorgPolicyRevisionNotRaised {
+                construction_window_blocks: build_plan.reorg_policy().reorg_window_blocks(),
+                revised_window_blocks: reorg_policy.reorg_window_blocks(),
+            });
+        }
+        encoded.extend_from_slice(REORG_POLICY_TRAILER_MAGIC);
+        encoded.extend_from_slice(&REORG_POLICY_TRAILER_VERSION.to_le_bytes());
+        encoded.extend_from_slice(&reorg_policy.reorg_window_blocks().to_le_bytes());
     }
     Ok(encoded)
 }
@@ -300,45 +342,31 @@ pub(super) fn decode_store_control(
             ));
         }
     };
-    let activation_schedule_binding = if decoder.remaining() == 0 {
-        None
+    if decoder.remaining() != 0 && build_state == CanonicalStoreBuildState::Building {
+        return Err(CanonicalStoreError::admission(
+            path,
+            "BUILDING store control must not contain a revision trailer",
+        ));
+    }
+    let activation_schedule_binding = if decoder.next_is(ACTIVATION_SCHEDULE_TRAILER_MAGIC) {
+        Some(decode_activation_schedule_trailer(&mut decoder)?)
     } else {
-        if build_state == CanonicalStoreBuildState::Building {
-            return Err(CanonicalStoreError::admission(
-                path,
-                "BUILDING store control must not contain an activation-schedule trailer",
-            ));
-        }
-        if decoder.read_bytes(
-            ACTIVATION_SCHEDULE_TRAILER_MAGIC.len(),
-            "schedule trailer identity",
-        )? != ACTIVATION_SCHEDULE_TRAILER_MAGIC
-        {
-            return Err(CanonicalStoreError::admission(
-                path,
-                "store control contains an unknown trailing extension",
-            ));
-        }
-        let version = decoder.read_u16("activation schedule trailer version")?;
-        if version != ACTIVATION_SCHEDULE_TRAILER_VERSION {
-            return Err(CanonicalStoreError::admission(
-                path,
-                format!("unsupported activation schedule trailer version {version}"),
-            ));
-        }
-        let revision = decoder.read_u64("activation schedule revision")?;
-        if revision == 0 {
-            return Err(CanonicalStoreError::admission(
-                path,
-                "activation schedule revision must be nonzero",
-            ));
-        }
-        Some(ActivationScheduleBinding {
-            revision,
-            digest: decoder.read_array("activation schedule digest")?,
-        })
+        None
     };
-    decoder.reject_trailing_bytes()?;
+    let revised_reorg_policy = if decoder.next_is(REORG_POLICY_TRAILER_MAGIC) {
+        Some(decode_reorg_policy_trailer(
+            &mut decoder,
+            build_plan.reorg_policy(),
+        )?)
+    } else {
+        None
+    };
+    if decoder.remaining() != 0 {
+        return Err(CanonicalStoreError::admission(
+            path,
+            "store control contains an unknown trailing extension",
+        ));
+    }
     Ok(DecodedStoreControl {
         network,
         workload,
@@ -346,7 +374,67 @@ pub(super) fn decode_store_control(
         cursor_auth_key,
         build_state,
         activation_schedule_binding,
+        revised_reorg_policy,
     })
+}
+
+fn decode_activation_schedule_trailer(
+    decoder: &mut Decoder<'_>,
+) -> Result<ActivationScheduleBinding, CanonicalStoreError> {
+    decoder.read_bytes(
+        ACTIVATION_SCHEDULE_TRAILER_MAGIC.len(),
+        "schedule trailer identity",
+    )?;
+    let version = decoder.read_u16("activation schedule trailer version")?;
+    if version != ACTIVATION_SCHEDULE_TRAILER_VERSION {
+        return Err(CanonicalStoreError::admission(
+            decoder.path,
+            format!("unsupported activation schedule trailer version {version}"),
+        ));
+    }
+    let revision = decoder.read_u64("activation schedule revision")?;
+    if revision == 0 {
+        return Err(CanonicalStoreError::admission(
+            decoder.path,
+            "activation schedule revision must be nonzero",
+        ));
+    }
+    Ok(ActivationScheduleBinding {
+        revision,
+        digest: decoder.read_array("activation schedule digest")?,
+    })
+}
+
+fn decode_reorg_policy_trailer(
+    decoder: &mut Decoder<'_>,
+    construction_policy: super::CanonicalReorgPolicy,
+) -> Result<super::CanonicalReorgPolicy, CanonicalStoreError> {
+    decoder.read_bytes(
+        REORG_POLICY_TRAILER_MAGIC.len(),
+        "reorg policy trailer identity",
+    )?;
+    let version = decoder.read_u16("reorg policy trailer version")?;
+    if version != REORG_POLICY_TRAILER_VERSION {
+        return Err(CanonicalStoreError::admission(
+            decoder.path,
+            format!("unsupported reorg policy trailer version {version}"),
+        ));
+    }
+    let revised_window_blocks = decoder.read_u32("revised reorg window blocks")?;
+    let revised = super::CanonicalReorgPolicy::new(revised_window_blocks)
+        .map_err(|source| CanonicalStoreError::admission(decoder.path, source.to_string()))?;
+    // A revision only ever raises the window, and an unraised policy has no
+    // trailer, so every effective window has exactly one encoding.
+    if revised <= construction_policy {
+        return Err(CanonicalStoreError::admission(
+            decoder.path,
+            format!(
+                "reorg policy revision {revised_window_blocks} does not raise the construction window {}",
+                construction_policy.reorg_window_blocks()
+            ),
+        ));
+    }
+    Ok(revised)
 }
 
 fn decode_raw_blob_retention(
@@ -476,6 +564,12 @@ struct Decoder<'encoded> {
 impl<'encoded> Decoder<'encoded> {
     fn remaining(&self) -> usize {
         self.encoded.len().saturating_sub(self.position)
+    }
+
+    fn next_is(&self, magic: &[u8]) -> bool {
+        self.encoded
+            .get(self.position..)
+            .is_some_and(|rest| rest.starts_with(magic))
     }
 
     const fn new(path: &'encoded std::path::Path, encoded: &'encoded [u8]) -> Self {
@@ -685,19 +779,6 @@ impl<'encoded> Decoder<'encoded> {
         self.position = end;
         Ok(bytes)
     }
-
-    fn reject_trailing_bytes(&self) -> Result<(), CanonicalStoreError> {
-        if self.position != self.encoded.len() {
-            return Err(CanonicalStoreError::admission(
-                self.path,
-                format!(
-                    "store control contains {} trailing bytes",
-                    self.encoded.len().saturating_sub(self.position)
-                ),
-            ));
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -737,6 +818,7 @@ mod tests {
                         cursor_auth_key: CURSOR_AUTH_KEY,
                         build_state: CanonicalStoreBuildState::Building,
                         activation_schedule_binding: None,
+                        revised_reorg_policy: None,
                     }
                 );
                 assert_eq!(
@@ -880,12 +962,15 @@ mod tests {
             revision: 3,
             digest: [0x7a; 32],
         };
-        let encoded = encode_ready_store_control_with_schedule(
+        let encoded = encode_ready_store_control_with_revisions(
             expected.workload,
             &expected.build_plan,
             expected.cursor_auth_key,
             &ready,
-            Some(binding),
+            ControlRevisions {
+                activation_schedule_binding: Some(binding),
+                revised_reorg_policy: None,
+            },
         )?;
         assert_eq!(
             decode_store_control(Path::new("canonical"), &encoded)?.activation_schedule_binding,
@@ -921,6 +1006,95 @@ mod tests {
                 .to_string()
                 .contains("unsupported activation schedule trailer version")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn ready_control_binds_a_monotonic_reorg_policy_revision_trailer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let expected = expected_ready_control();
+        let CanonicalStoreBuildState::Ready(ready) = expected.build_state else {
+            return Err("expected READY test control".into());
+        };
+        let construction = expected.build_plan.reorg_policy();
+        let raised = CanonicalReorgPolicy::new(1_000)?;
+        let schedule = ActivationScheduleBinding {
+            revision: 2,
+            digest: [0x5c; 32],
+        };
+        let encode = |revisions| {
+            encode_ready_store_control_with_revisions(
+                expected.workload,
+                &expected.build_plan,
+                expected.cursor_auth_key,
+                &ready,
+                revisions,
+            )
+        };
+        let scheduled = encode(ControlRevisions {
+            activation_schedule_binding: Some(schedule),
+            revised_reorg_policy: None,
+        })?;
+        let revised = ControlRevisions {
+            activation_schedule_binding: Some(schedule),
+            revised_reorg_policy: Some(raised),
+        };
+        let encoded = encode(revised)?;
+        let decoded = decode_store_control(Path::new("canonical"), &encoded)?;
+        assert_eq!(decoded.revisions(), revised);
+        assert_eq!(decoded.build_plan.reorg_policy(), construction);
+        assert_eq!(decoded.effective_reorg_policy(), raised);
+
+        // Schedule-admission releases read exactly one schedule trailer and
+        // then reject trailing bytes; earlier releases reject any trailer.
+        // Both therefore refuse a store whose window was raised.
+        let mut expected_tail = REORG_POLICY_TRAILER_MAGIC.to_vec();
+        expected_tail.extend_from_slice(&REORG_POLICY_TRAILER_VERSION.to_le_bytes());
+        expected_tail.extend_from_slice(&1_000_u32.to_le_bytes());
+        assert_eq!(
+            encoded.strip_prefix(scheduled.as_slice()),
+            Some(expected_tail.as_slice())
+        );
+
+        let without_schedule = encode(ControlRevisions {
+            activation_schedule_binding: None,
+            revised_reorg_policy: Some(raised),
+        })?;
+        assert_eq!(
+            decode_store_control(Path::new("canonical"), &without_schedule)?
+                .effective_reorg_policy(),
+            raised
+        );
+
+        assert!(matches!(
+            encode(ControlRevisions {
+                activation_schedule_binding: None,
+                revised_reorg_policy: Some(construction),
+            }),
+            Err(CanonicalStoreBuildPlanError::ReorgPolicyRevisionNotRaised { .. })
+        ));
+        let mut not_raised = scheduled.clone();
+        not_raised.extend_from_slice(REORG_POLICY_TRAILER_MAGIC);
+        not_raised.extend_from_slice(&REORG_POLICY_TRAILER_VERSION.to_le_bytes());
+        not_raised.extend_from_slice(&construction.reorg_window_blocks().to_le_bytes());
+        let mut schedule_after_policy = without_schedule;
+        schedule_after_policy.extend_from_slice(&scheduled[scheduled.len() - 42..]);
+        let mut unsupported_version = encoded;
+        let version_offset = unsupported_version.len() - 6;
+        unsupported_version[version_offset] = 2;
+        for (malformed, reason) in [
+            (not_raised, "does not raise the construction window"),
+            (schedule_after_policy, "unknown trailing extension"),
+            (
+                unsupported_version,
+                "unsupported reorg policy trailer version 2",
+            ),
+        ] {
+            let error = decode_store_control(Path::new("canonical"), &malformed)
+                .err()
+                .ok_or("malformed reorg policy trailer must be rejected")?;
+            assert!(error.to_string().contains(reason), "{error}");
+        }
         Ok(())
     }
 
@@ -1019,7 +1193,7 @@ mod tests {
                 encoded.push(0);
                 (
                     encoded,
-                    "BUILDING store control must not contain an activation-schedule trailer",
+                    "BUILDING store control must not contain a revision trailer",
                 )
             },
         ];
@@ -1138,6 +1312,7 @@ mod tests {
             build_plan: complete_build_plan(Network::ZcashTestnet),
             cursor_auth_key: CURSOR_AUTH_KEY,
             activation_schedule_binding: None,
+            revised_reorg_policy: None,
             build_state: CanonicalStoreBuildState::Ready(CanonicalStoreReadyEvidence {
                 first_retained_block: BlockId::new(
                     BlockHeight::new(1),

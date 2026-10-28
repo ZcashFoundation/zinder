@@ -54,6 +54,7 @@ tonic-prost.workspace = true
 zebra-chain.workspace = true
 zinder-compat-lightwalletd.workspace = true
 zinder-query.workspace = true
+zinder-runtime.workspace = true
 zinder-source.workspace = true
 zinder-store.workspace = true
 zinder-testkit.workspace = true

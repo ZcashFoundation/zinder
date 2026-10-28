@@ -281,6 +281,9 @@ pub struct CanonicalFollowSettings {
     /// Threshold below which the loop reports `cause=ready` instead of
     /// `cause=syncing` while in [`IngestPhase::FollowingTip`].
     pub lag_threshold_blocks: u64,
+    /// Maximum bytes of prepared blocks one replacement may hold before its
+    /// atomic commit.
+    pub max_replacement_bytes: std::num::NonZeroU64,
 }
 
 /// Resolved `[ingest.run_overrides]` configuration.

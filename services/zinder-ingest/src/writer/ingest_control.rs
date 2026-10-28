@@ -150,11 +150,26 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
         &self,
         _request: Request<WriterStatusRequest>,
     ) -> Result<Response<WriterStatusResponse>, Status> {
-        let snapshot = self.current_chain_epoch().await?;
+        let readiness_report = self.readiness.report();
+        // A parked writer reports its frozen fence while it still answers;
+        // once its owner loop has stopped, readers still need the typed halt
+        // rather than an unavailable control channel.
+        let chain_epoch = match self.current_chain_epoch().await {
+            Ok(snapshot) => Some(snapshot.chain_epoch),
+            Err(_)
+                if matches!(
+                    readiness_report.cause,
+                    ReadinessCause::ReorgWindowExceeded { .. }
+                ) =>
+            {
+                None
+            }
+            Err(status) => return Err(status),
+        };
         Ok(Response::new(writer_status_response(
             self.network,
-            snapshot.chain_epoch,
-            &self.readiness.report(),
+            chain_epoch,
+            &readiness_report,
         )))
     }
 
@@ -494,18 +509,22 @@ fn chain_epoch_committed_message(
 
 fn writer_status_response(
     network: Network,
-    chain_epoch: ChainEpoch,
+    chain_epoch: Option<ChainEpoch>,
     readiness_report: &ReadinessReport,
 ) -> WriterStatusResponse {
     let upstream_tip = upstream_tip_from_readiness(readiness_report);
     let gap_blocks = upstream_tip
         .as_ref()
         .and_then(|upstream_tip| upstream_tip.committed_height)
-        .map(|upstream_height| {
+        .zip(chain_epoch)
+        .map(|(upstream_height, chain_epoch)| {
             upstream_height.saturating_sub(chain_epoch.visible_tip_height.value())
         });
-    let mut chain_view = chain_view_message(chain_epoch);
-    chain_view.upstream_tip = upstream_tip;
+    let chain_view = chain_epoch.map(|chain_epoch| {
+        let mut chain_view = chain_view_message(chain_epoch);
+        chain_view.upstream_tip = upstream_tip;
+        chain_view
+    });
     let upstream_not_ready =
         if let ReadinessCause::UpstreamNotReady(detail) = &readiness_report.cause {
             Some(ops::UpstreamNotReadyDetail::from(detail))
@@ -513,7 +532,7 @@ fn writer_status_response(
             None
         };
     WriterStatusResponse {
-        chain_view: Some(chain_view),
+        chain_view,
         network_name: encode_zinder_native_chain_name(network).to_owned(),
         phase: readiness_report
             .phase
@@ -521,6 +540,7 @@ fn writer_status_response(
             .into(),
         gap_blocks,
         upstream_not_ready,
+        reorg_window_exceeded: readiness_report.cause.reorg_window_exceeded_detail(),
     }
 }
 
@@ -681,12 +701,145 @@ mod tests {
     use crate::{
         CanonicalCheckpointStagingRoot, CanonicalControlGrpcAdapter, LiveMempoolOwner,
         writer::control::{
-            apply_canonical_control_command, canonical_control_channel,
+            ParkedWriterHalt, apply_canonical_control_command,
+            apply_parked_canonical_control_command, canonical_control_channel,
             test_support::published_fixture_store,
         },
     };
 
     use super::{CanonicalIngestControlGrpcAdapter, canonical_event_message};
+
+    fn assert_reorg_halt(status: &tonic::Status) {
+        use tonic_types::StatusExt as _;
+        assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+        assert_eq!(
+            status
+                .get_error_details()
+                .error_info()
+                .map(|error_info| error_info.reason.clone()),
+            Some(
+                zinder_proto::v1::ops::ErrorReason::ReorgWindowExceeded
+                    .as_str_name()
+                    .to_owned()
+            ),
+            "{status:?}"
+        );
+    }
+
+    /// A park ends open mempool event streams and refuses every mempool read
+    /// and write with the typed halt, while canonical writer status carries
+    /// the halt beside the frozen fence.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the open stream, new reads, owner-bypassing writes, and writer status form one parked-writer contract"
+    )]
+    async fn parked_writer_ends_mempool_streams_and_refuses_mempool_work()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut fixture = shared_control_fixture().await?;
+        let mut events = fixture
+            .ingest_client
+            .mempool_events(authenticated(MempoolEventsRequest {
+                start: Some(event_stream_start_message(
+                    &EventStreamStartPosition::EarliestRetained,
+                )),
+            }))
+            .await?
+            .into_inner();
+        let first = tokio::time::timeout(Duration::from_secs(1), events.next())
+            .await?
+            .ok_or("mempool event stream ended before its retained event")??;
+        assert_eq!(first.event_sequence, 1);
+
+        let halt = ParkedWriterHalt::new(zinder_proto::v1::ops::ReorgWindowExceededDetail {
+            depth: 1_001,
+            configured: 1_000,
+            covered: Some(1_000),
+        });
+        *fixture.parked.lock() = Some(halt);
+        fixture.mempool.halt(halt).await;
+
+        let ended = tokio::time::timeout(Duration::from_secs(2), events.next())
+            .await?
+            .ok_or("an open mempool event stream must end with the halt, not close")?;
+        let Err(status) = ended else {
+            return Err("an open mempool event stream must end with the halt".into());
+        };
+        assert_reorg_halt(&status);
+
+        let refused_stream = fixture
+            .ingest_client
+            .mempool_events(authenticated(MempoolEventsRequest {
+                start: Some(event_stream_start_message(
+                    &EventStreamStartPosition::EarliestRetained,
+                )),
+            }))
+            .await;
+        let Err(status) = refused_stream else {
+            return Err("a new mempool event stream must be refused".into());
+        };
+        assert_reorg_halt(&status);
+        let Err(status) = fixture
+            .ingest_client
+            .mempool_snapshot(authenticated(MempoolSnapshotRequest {
+                max_entries: 1,
+                from_cursor: Vec::new(),
+            }))
+            .await
+        else {
+            return Err("a mempool snapshot must be refused".into());
+        };
+        assert_reorg_halt(&status);
+
+        // The parked writer records no mempool event even from a caller that
+        // bypasses the halted owner.
+        let chain_epoch = fixture.canonical.chain_epoch().await?.chain_epoch;
+        let Err(status) = fixture
+            .canonical
+            .append_mempool_event(
+                MempoolEvent::Added {
+                    entry: fixture_mempool_entry_with_id(0xE5, chain_epoch)?,
+                },
+                UnixTimestampMillis::new(1_750_000_000_400),
+            )
+            .await
+        else {
+            return Err("a parked writer must refuse mempool appends".into());
+        };
+        assert_reorg_halt(&status);
+        let Err(status) = fixture
+            .canonical
+            .prune_mempool_events(
+                UnixTimestampMillis::new(1_750_000_000_500),
+                MempoolEventRetentionConfig::new(Some(Duration::from_millis(1)), None),
+                zinder_store::MempoolEventRetentionStepBudget::new(
+                    std::num::NonZeroU32::new(8).ok_or("retention event budget must be nonzero")?,
+                    std::num::NonZeroU64::new(1_000_000)
+                        .ok_or("retention byte budget must be nonzero")?,
+                ),
+            )
+            .await
+        else {
+            return Err("a parked writer must refuse mempool pruning".into());
+        };
+        assert_reorg_halt(&status);
+
+        let writer_status = fixture
+            .canonical_client
+            .writer_status(authenticated(CanonicalWriterStatusRequest {}))
+            .await?
+            .into_inner();
+        assert!(writer_status.fence.is_some());
+        assert_eq!(
+            writer_status
+                .reorg_window_exceeded
+                .map(|detail| (detail.depth, detail.configured)),
+            Some((1_001, 1_000))
+        );
+
+        drop(events);
+        fixture.shutdown().await
+    }
 
     #[test]
     fn tip_reorg_wire_event_names_the_exact_previous_epoch()
@@ -1143,6 +1296,57 @@ mod tests {
         fixture.shutdown().await
     }
 
+    /// A parked writer has dropped its command queue, so `WriterStatus`
+    /// answers from readiness alone and carries the typed halt.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parked_writer_status_reports_the_reorg_halt_without_a_live_writer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (canonical, commands) = canonical_control_channel();
+        drop(commands);
+        let readiness = Readiness::new(
+            ReadinessState::reorg_window_exceeded(1_001, 1_000, Some(1_000), Some(4_200))
+                .with_phase(IngestPhase::FollowingTip),
+        );
+        let source: Arc<dyn NodeSource> = Arc::new(ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashTestnet,
+            "http://127.0.0.1:1",
+            NodeAuth::None,
+            Duration::from_secs(1),
+        )?);
+        let adapter = CanonicalIngestControlGrpcAdapter::new(
+            zinder_core::Network::ZcashTestnet,
+            canonical,
+            LiveMempoolOwner::default(),
+            source,
+            readiness.clone(),
+        );
+
+        let response = IngestControl::writer_status(&adapter, Request::new(WriterStatusRequest {}))
+            .await?
+            .into_inner();
+        assert_eq!(response.phase(), WriterPhase::FollowingTip);
+        assert_eq!(response.chain_view, None);
+        assert_eq!(response.gap_blocks, None);
+        assert_eq!(response.upstream_not_ready, None);
+        assert_eq!(
+            response.reorg_window_exceeded,
+            Some(zinder_proto::v1::ops::ReorgWindowExceededDetail {
+                depth: 1_001,
+                configured: 1_000,
+                covered: Some(1_000),
+            })
+        );
+
+        readiness.set(ReadinessState::ready(Some(4_200)));
+        let unavailable =
+            IngestControl::writer_status(&adapter, Request::new(WriterStatusRequest {}))
+                .await
+                .err()
+                .ok_or("a writer that is not parked must answer from its live fence")?;
+        assert_eq!(unavailable.code(), Code::Unavailable);
+        Ok(())
+    }
+
     #[derive(Clone)]
     struct StaticValuePoolSource {
         capabilities: NodeCapabilities,
@@ -1191,6 +1395,8 @@ mod tests {
         ingest_client: IngestControlClient<tonic::transport::Channel>,
         canonical: crate::CanonicalControlHandle,
         mempool: LiveMempoolOwner,
+        /// Switches the fixture's owner loop to the parked writer's dispatch.
+        parked: Arc<parking_lot::Mutex<Option<ParkedWriterHalt>>>,
         cancel: CancellationToken,
         server_task: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
         command_task: tokio::task::JoinHandle<()>,
@@ -1209,17 +1415,34 @@ mod tests {
         }
     }
 
+    /// Serves owner commands like the follower, switching to the parked
+    /// writer's dispatch once `parked` holds a halt.
+    fn spawn_fixture_owner_loop(
+        mut store: zinder_store::RocksDbCanonicalStore,
+        mut commands: tokio::sync::mpsc::Receiver<crate::writer::control::CanonicalControlCommand>,
+        parked: Arc<parking_lot::Mutex<Option<ParkedWriterHalt>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                let halt = *parked.lock();
+                match halt {
+                    Some(halt) => apply_parked_canonical_control_command(&mut store, command, halt),
+                    None => {
+                        let _scheduling = apply_canonical_control_command(&mut store, command);
+                    }
+                }
+            }
+        })
+    }
+
     async fn shared_control_fixture() -> Result<SharedControlFixture, Box<dyn std::error::Error>> {
         let temporary = tempfile::TempDir::new()?;
         let checkpoint_staging_root = temporary.path().join("checkpoint-staging");
         fs::create_dir(&checkpoint_staging_root)?;
-        let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
-        let (canonical, mut commands) = canonical_control_channel();
-        let command_task = tokio::spawn(async move {
-            while let Some(command) = commands.recv().await {
-                apply_canonical_control_command(&mut store, command);
-            }
-        });
+        let store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let (canonical, commands) = canonical_control_channel();
+        let parked = Arc::new(parking_lot::Mutex::new(None));
+        let command_task = spawn_fixture_owner_loop(store, commands, Arc::clone(&parked));
 
         let owner = LiveMempoolOwner::default();
         let chain_epoch = canonical.chain_epoch().await?.chain_epoch;
@@ -1282,6 +1505,7 @@ mod tests {
             ingest_client,
             canonical,
             mempool: owner,
+            parked,
             cancel,
             server_task,
             command_task,

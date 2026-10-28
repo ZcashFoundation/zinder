@@ -89,6 +89,13 @@ Transparent-outpoint reads remain omitted until their concrete serving-pair
 resolvers are implemented. Method presence is not a deployment support claim;
 consumers must preflight exact capability strings.
 
+When the canonical writer parks because a replacement crossed its reorg
+window, new reads and open chain-event streams return
+`IndexerError::ReorgWindowExceeded`, with the replacement depth and window when
+the server reports them. Its retry policy is `OperatorActionRequired`: the
+indexer serves a chain that no longer advances, so a wallet should stop
+creating spends against it until an operator reconciles the indexer.
+
 Capture calls `current_epoch` once. A remote serving pair that has advanced
 returns `IndexerError::ChainEpochPinUnavailable`; its
 retry policy is `RefreshChainEpoch`. The released wallet-serving runtime keeps

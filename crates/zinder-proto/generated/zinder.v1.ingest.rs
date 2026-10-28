@@ -47,6 +47,16 @@ pub struct WriterStatusResponse {
     /// for both surfaces. ADR-0015 §Upstream sync detection.
     #[prost(message, optional, tag = "8")]
     pub upstream_not_ready: ::core::option::Option<super::ops::UpstreamNotReadyDetail>,
+    /// Set while the canonical writer is parked because a replacement crossed
+    /// its reorg window. The writer no longer follows the node until an
+    /// operator reconciles the store. `chain_view` carries the frozen writer
+    /// fence while the parked writer still answers and is absent otherwise.
+    /// Carries the same payload `ReadinessReport` surfaces under
+    /// `cause=reorg_window_exceeded`. ADR-0041.
+    #[prost(message, optional, tag = "9")]
+    pub reorg_window_exceeded: ::core::option::Option<
+        super::ops::ReorgWindowExceededDetail,
+    >,
 }
 /// Private point lookup for one transaction in the writer's live mempool
 /// index. Transaction ids use canonical RPC byte order.
@@ -90,6 +100,25 @@ pub struct CanonicalWriterStatusResponse {
     pub network_upgrade_schedule: ::core::option::Option<
         CanonicalNetworkUpgradeSchedule,
     >,
+    /// Set while the canonical writer is parked because a replacement crossed
+    /// its reorg window. `fence` is then the frozen fence the parked writer
+    /// still serves, so readers stay converged, but they must refuse wallet
+    /// traffic with the typed halt instead of reporting ready. Absent from
+    /// writers that predate this field. ADR-0041.
+    #[prost(message, optional, tag = "5")]
+    pub reorg_window_exceeded: ::core::option::Option<
+        super::ops::ReorgWindowExceededDetail,
+    >,
+    /// Set while the canonical writer has not confirmed its store's visible tip
+    /// against its node since it opened the store: until a source observation
+    /// finds that tip on the node's branch, or the writer commits past it. A
+    /// parked writer also sets it. `fence` is then the persisted fence, which
+    /// may sit on a branch the node abandoned while the writer was down, so
+    /// wallet-serving readers must not report ready on it. The projector may
+    /// keep converging on it. Writers that predate this field never set it, and
+    /// readers then attest the fence as before. ADR-0041.
+    #[prost(bool, tag = "6")]
+    pub tip_unconfirmed: bool,
 }
 /// One node-advertised network-upgrade activation in an admitted schedule.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -337,6 +366,11 @@ pub struct CreateCanonicalOwnerCheckpointResponse {
     pub network_upgrade_schedule: ::core::option::Option<
         CanonicalNetworkUpgradeSchedule,
     >,
+    /// Reorg window the checkpoint enforces when a canonical writer raised it
+    /// above `build_plan.reorg_window_blocks`. Absent when the checkpoint
+    /// enforces its construction window. ADR-0041.
+    #[prost(uint32, optional, tag = "10")]
+    pub effective_reorg_window_blocks: ::core::option::Option<u32>,
 }
 /// Re-admits an already-created canonical owner checkpoint at the fixed child
 /// of an opaque staging candidate. The canonical owner resolves the path below

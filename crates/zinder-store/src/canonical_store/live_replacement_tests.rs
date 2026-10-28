@@ -21,9 +21,9 @@ use super::{
     CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence,
     CanonicalEventHistoryRequest, CanonicalEventKind, CanonicalLiveAppend,
     CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,
-    CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload, ProjectionBuildLease,
-    ProjectionBuildLeaseId, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
-    RocksDbCanonicalStore,
+    CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreReadyEvidence,
+    CanonicalStoreWorkload, ProjectionBuildLease, ProjectionBuildLeaseId, RocksDbCanonicalBuilder,
+    RocksDbCanonicalSecondary, RocksDbCanonicalStore,
     displaced_archive::{
         encode_test_archive_state, encode_test_hash_pointer_rows, encode_test_order_key,
     },
@@ -1066,6 +1066,385 @@ fn projection_build_lease_capacity_is_bounded() -> Result<(), Box<dyn std::error
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one proof binds the in-place raise, restart admission, refused lowering, and a replacement deeper than the construction window"
+)]
+fn writer_raises_the_reorg_window_in_place_across_restart_and_never_lowers_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let construction = CanonicalReorgPolicy::new(100)?;
+    let raised = CanonicalReorgPolicy::new(1_000)?;
+    let settled_tip = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32]));
+    let store = published_store(&store_path, 100, BlockHeight::new(102), settled_tip.height)?;
+    let construction_fence = store.event_fence();
+    drop(store);
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+
+    let store = open_writer(&store_path, &activations, 1_000)?;
+    assert_eq!(store.reorg_policy(), raised);
+    assert_eq!(store.build_plan().reorg_policy(), construction);
+    assert_eq!(store.event_fence(), construction_fence);
+    // The settled tip holds, so the visible tip may now trail it by more
+    // blocks than the construction window allowed.
+    let (store, appended) = store.commit_live_append(
+        CanonicalLiveAppend::new(
+            construction_fence,
+            replacement_block(BlockHeight::new(103), [103; 32], [102; 32], 203)?,
+            Vec::new(),
+            settled_tip,
+            UnixTimestampMillis::new(1_750_000_000_002),
+        ),
+        &activations,
+    )?;
+    assert_eq!(store.chain_epoch()?.settled_tip_height, settled_tip.height);
+    drop(store);
+
+    let refusals = [
+        (
+            open_store(&store_path, &activations, 100).err(),
+            "does not equal requested reorg window",
+        ),
+        (
+            open_writer(&store_path, &activations, 100).err(),
+            "never lowered in place",
+        ),
+        (
+            open_writer(&store_path, &activations, 999).err(),
+            "never lowered in place",
+        ),
+        (
+            RocksDbCanonicalSecondary::open_ready(
+                &store_path,
+                temporary.path().join("stale-secondary"),
+                &activations,
+                CanonicalStoreWorkload::Wallet,
+                RawBlobRetention::Transactions,
+                construction,
+                RocksDbResourceBudget::for_local_tests(),
+            )
+            .err()
+            .map(Into::into),
+            "does not equal requested reorg window",
+        ),
+    ];
+    for (error, reason) in refusals {
+        let error = error.ok_or("an admission below the raised window must fail")?;
+        assert!(error.to_string().contains(reason), "{error}");
+    }
+    let secondary = RocksDbCanonicalSecondary::open_ready(
+        &store_path,
+        temporary.path().join("secondary"),
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
+        raised,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(secondary.reorg_policy(), raised);
+    assert_eq!(secondary.event_fence(), appended);
+    drop(secondary);
+
+    let store = open_writer(&store_path, &activations, 1_000)?;
+    assert_eq!(store.reorg_policy(), raised);
+    assert_eq!(store.event_fence(), appended);
+    // Replace 101 blocks above the held settled tip: one deeper than the
+    // construction window.
+    let mut parent_hash = settled_tip.hash.as_bytes();
+    let mut replacement = Vec::new();
+    for height in 3..=103_u32 {
+        let transaction_tag = u8::try_from(height - 3)?;
+        let mut block_hash = [transaction_tag; 32];
+        block_hash[0] = 0xee;
+        replacement.push(CanonicalReplacementBlock::new(
+            replacement_block(
+                BlockHeight::new(height),
+                block_hash,
+                parent_hash,
+                transaction_tag,
+            )?,
+            Vec::new(),
+        ));
+        parent_hash = block_hash;
+    }
+    let (store, replaced) = store.commit_live_replacement(
+        CanonicalLiveReplacement::new(
+            appended,
+            replacement,
+            UnixTimestampMillis::new(1_750_000_000_003),
+        ),
+        &activations,
+    )?;
+    assert_eq!(store.displaced_block_count()?, 101);
+    drop(store);
+    let mut reopened = open_store(&store_path, &activations, 1_000)?;
+    assert_eq!(reopened.event_fence(), replaced);
+    assert_eq!(reopened.reorg_policy(), raised);
+    let checkpoint = reopened.create_owner_checkpoint(
+        temporary.path().join("owner-checkpoint"),
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(checkpoint.reorg_policy, raised);
+    assert_eq!(checkpoint.build_plan.reorg_policy(), construction);
+    Ok(())
+}
+
+#[test]
+fn secondary_refuses_a_writer_raise_until_it_reopens_with_the_raised_window()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    drop(published_store(
+        &store_path,
+        2,
+        BlockHeight::new(4),
+        BlockHeight::new(2),
+    )?);
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let open_secondary = |name: &str, window: u32| {
+        RocksDbCanonicalSecondary::open_ready(
+            &store_path,
+            temporary.path().join(name),
+            &activations,
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(window)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )
+        .map_err(Box::<dyn std::error::Error>::from)
+    };
+    let mut stale = open_secondary("stale", 2)?;
+    let writer = open_writer(&store_path, &activations, 3)?;
+    assert_eq!(writer.reorg_policy(), CanonicalReorgPolicy::new(3)?);
+    let error = stale
+        .try_catch_up()
+        .err()
+        .ok_or("catch-up across a writer raise must fail")?;
+    assert!(
+        error
+            .to_string()
+            .contains("persisted reorg window 3 does not equal requested reorg window 2"),
+        "{error}"
+    );
+    let current = open_secondary("current", 3)?;
+    assert_eq!(current.reorg_policy(), writer.reorg_policy());
+    Ok(())
+}
+
+#[test]
+fn incremental_replay_tails_match_a_complete_derivation_across_appends_and_replacements()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let window = 3;
+    let mut store = published_store(
+        &store_path,
+        window,
+        BlockHeight::new(4),
+        BlockHeight::new(2),
+    )?;
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let mut secondary = RocksDbCanonicalSecondary::open_ready(
+        &store_path,
+        temporary.path().join("secondary"),
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(window)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    let complete = |db: &DB, ready: CanonicalStoreReadyEvidence| {
+        super::replay_tail::AuthenticatedReplayTail::authenticate(
+            db,
+            ready.sequence_checkpoint,
+            ready.visible_tip.height,
+            window,
+        )
+        .map(|tail| tail.checkpoints())
+    };
+
+    let idle = secondary.try_catch_up()?;
+    assert_eq!(idle.before(), idle.after());
+
+    let fence = store.event_fence();
+    let (next, _) = store.commit_live_append(
+        CanonicalLiveAppend::new(
+            fence,
+            replacement_block(BlockHeight::new(5), [5; 32], [4; 32], 105)?,
+            Vec::new(),
+            BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
+            UnixTimestampMillis::new(1_750_000_000_002),
+        ),
+        &activations,
+    )?;
+    store = next;
+    let fence = store.event_fence();
+    let (next, _) = store.commit_live_replacement(
+        CanonicalLiveReplacement::new(
+            fence,
+            replacement_suffix(4, 5, [3; 32], 40)?,
+            UnixTimestampMillis::new(1_750_000_000_003),
+        ),
+        &activations,
+    )?;
+    store = next;
+    let fence = store.event_fence();
+    let (next, _) = store.commit_live_append(
+        CanonicalLiveAppend::new(
+            fence,
+            replacement_block(BlockHeight::new(6), [6; 32], [45; 32], 106)?,
+            Vec::new(),
+            BlockId::new(BlockHeight::new(3), BlockHash::from_bytes([3; 32])),
+            UnixTimestampMillis::new(1_750_000_000_004),
+        ),
+        &activations,
+    )?;
+    store = next;
+
+    let store_complete = complete(&store.bounded_open.db, store.ready_evidence())?;
+    assert_eq!(store.replay_tail.checkpoints(), store_complete);
+    secondary.try_catch_up()?;
+    assert_eq!(secondary.event_fence(), store.event_fence());
+    assert_eq!(secondary.replay_tail.checkpoints(), store_complete);
+    assert_eq!(
+        store_complete
+            .last()
+            .map(|checkpoint| checkpoint.through().height),
+        Some(BlockHeight::new(6))
+    );
+    Ok(())
+}
+
+#[test]
+fn secondary_lagging_beyond_one_window_matches_a_complete_derivation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let window = 3;
+    let mut store = published_store(
+        &store_path,
+        window,
+        BlockHeight::new(4),
+        BlockHeight::new(2),
+    )?;
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let mut secondary = RocksDbCanonicalSecondary::open_ready(
+        &store_path,
+        temporary.path().join("secondary"),
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(window)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+
+    // The visible tip advances by more than one window while the secondary
+    // is idle, so it re-derives its whole unsettled suffix.
+    for height in 5_u8..=8 {
+        let settled = height - 3;
+        let fence = store.event_fence();
+        let (next, _) = store.commit_live_append(
+            CanonicalLiveAppend::new(
+                fence,
+                replacement_block(
+                    BlockHeight::new(u32::from(height)),
+                    [height; 32],
+                    [height - 1; 32],
+                    100 + height,
+                )?,
+                Vec::new(),
+                BlockId::new(
+                    BlockHeight::new(u32::from(settled)),
+                    BlockHash::from_bytes([settled; 32]),
+                ),
+                UnixTimestampMillis::new(1_750_000_000_000 + u64::from(height)),
+            ),
+            &activations,
+        )?;
+        store = next;
+    }
+
+    secondary.try_catch_up()?;
+    assert_eq!(secondary.event_fence(), store.event_fence());
+    let complete = super::replay_tail::AuthenticatedReplayTail::authenticate(
+        &store.bounded_open.db,
+        store.ready_evidence().sequence_checkpoint,
+        store.ready_evidence().visible_tip.height,
+        window,
+    )?
+    .checkpoints();
+    assert_eq!(secondary.replay_tail.checkpoints(), complete);
+    assert_eq!(
+        complete
+            .last()
+            .map(|checkpoint| checkpoint.through().height),
+        Some(BlockHeight::new(8))
+    );
+    Ok(())
+}
+
+#[test]
+fn writer_detects_an_unannounced_replay_row_change_before_it_settles()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let store = published_store(&store_path, 2, BlockHeight::new(4), BlockHeight::new(2))?;
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    // Rewrite the unsettled row at height 3 outside any transition, keeping
+    // its block identity so that only its facts differ.
+    let mut forged = canonical_block(BlockHeight::new(3), [3; 32], [2; 32], 99);
+    forged.facts.block_header = BlockHeaderArtifact::new(
+        BlockHeight::new(3),
+        BlockHash::from_bytes([3; 32]),
+        BlockHash::from_bytes([2; 32]),
+        [9; 32],
+        [4; 32],
+        3,
+        0x1d00_ffff,
+        [5; 32],
+        4,
+        128,
+    );
+    let forged_replay = encode_canonical_block_replay(
+        &forged.facts,
+        CanonicalBlockReplayFormatVersion::V1,
+        CanonicalBlockFactsDigestVersion::V1,
+    );
+    let replay_family = store
+        .bounded_open
+        .db
+        .cf_handle(super::block_replay::BLOCK_REPLAY_COLUMN_FAMILY)
+        .ok_or("replay family absent")?;
+    store.bounded_open.db.put_cf(
+        &replay_family,
+        zinder_core::wire::encode_height_key_ascending(BlockHeight::new(3)),
+        forged_replay.as_bytes(),
+    )?;
+    drop(replay_family);
+
+    let fence = store.event_fence();
+    let error = store
+        .commit_live_append(
+            CanonicalLiveAppend::new(
+                fence,
+                replacement_block(BlockHeight::new(5), [5; 32], [4; 32], 105)?,
+                Vec::new(),
+                BlockId::new(BlockHeight::new(3), BlockHash::from_bytes([3; 32])),
+                UnixTimestampMillis::new(1_750_000_000_002),
+            ),
+            &activations,
+        )
+        .err()
+        .ok_or("settling a row changed outside a transition must fail")?;
+    assert!(
+        error.to_string().contains("settled checkpoint") || error.to_string().contains("replay"),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[test]
 fn replacement_rejects_settled_range_without_any_mutation() -> Result<(), Box<dyn std::error::Error>>
 {
     let temporary = TempDir::new()?;
@@ -1451,7 +1830,11 @@ fn published_store_with_retention(
         };
         let mut block = canonical_block(height, [hash_byte; 32], parent_hash, 100 + hash_byte);
         apply_raw_blob_retention(&mut block, raw_blob_retention, 100 + hash_byte);
-        if height == build_tip_height {
+        if height == build_tip_height
+            || height
+                .value()
+                .is_multiple_of(super::TREE_STATE_CHECKPOINT_STRIDE)
+        {
             add_checkpoint(&mut block)?;
         }
         blocks.push(Ok::<_, std::io::Error>(block));
@@ -1499,6 +1882,23 @@ fn open_store_with_retention(
         CanonicalReorgPolicy::new(reorg_window)?,
         RocksDbResourceBudget::for_local_tests(),
     )?)
+}
+
+fn open_writer(
+    path: &Path,
+    activations: &zinder_core::NetworkUpgradeActivations,
+    reorg_window: u32,
+) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+    Ok(
+        RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
+            path,
+            activations,
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(reorg_window)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?,
+    )
 }
 
 fn replacement_block(

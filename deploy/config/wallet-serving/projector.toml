@@ -21,7 +21,7 @@ max_open_files = 128
 path = "/var/lib/zinder/wallet"
 
 [projector]
-reorg_window_blocks = 100
+reorg_window_blocks = 1000
 lease_duration_seconds = 14400
 
 # Fresh wallet construction sorts in memory until these ceilings, then spills

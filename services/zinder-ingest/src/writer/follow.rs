@@ -1,6 +1,12 @@
 //! Continuous append-only following for the canonical store.
 
-use std::{collections::BTreeMap, future::Future, num::NonZeroU32, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    num::{NonZeroU32, NonZeroU64},
+    sync::Arc,
+    time::Duration,
+};
 
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -10,6 +16,7 @@ use zinder_core::{
     CommitmentTreeAccumulatorError, CommitmentTreeCheckpoint, NetworkUpgradeActivations,
     ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, UnixTimestampMillis,
 };
+use zinder_proto::v1::ops::ReorgWindowExceededDetail;
 use zinder_runtime::{IngestPhase, Readiness, ReadinessCause, ReadinessState};
 use zinder_source::{NodeSource, SourceBlock, SourceError};
 use zinder_store::{
@@ -29,7 +36,8 @@ use crate::{
         canonical_build_block, compact_block_commitments, register_prohibited_read_metrics,
     },
     writer::control::{
-        CanonicalControlCommand, CanonicalControlScheduling, apply_canonical_control_command,
+        CanonicalControlCommand, CanonicalControlScheduling, ParkedWriterHalt, TipConfirmation,
+        apply_following_canonical_control_command, apply_parked_canonical_control_command,
     },
     writer::raw_blob_policy_for_retention,
 };
@@ -53,7 +61,19 @@ pub struct CanonicalFollowConfig {
     /// publish `Ready` only after the current source generation has completed
     /// its in-memory snapshot.
     pub mempool_ready_gate: Option<MempoolReadyGate>,
+    /// Maximum bytes of prepared replacement blocks held in memory while one
+    /// replacement is prepared. A replacement commits atomically, so its whole
+    /// suffix, up to one reorg window, is prepared before the write.
+    pub max_replacement_bytes: NonZeroU64,
 }
+
+/// Default for [`CanonicalFollowConfig::max_replacement_bytes`]: 2 GiB, room
+/// for a full reorg window of blocks well above the Mainnet average size.
+pub const DEFAULT_MAX_REPLACEMENT_BYTES: NonZeroU64 =
+    match NonZeroU64::new(2 * 1_024 * 1_024 * 1_024) {
+        Some(bytes) => bytes,
+        None => NonZeroU64::MIN,
+    };
 
 /// Source and operational state bound to one canonical follower lane.
 pub struct CanonicalFollower<'a, Source> {
@@ -222,6 +242,35 @@ pub struct CanonicalReorgWindowExceeded {
     pub required_depth: u32,
     /// Persisted maximum replacement depth.
     pub configured_window_blocks: u32,
+    /// Replaceable depth the window covered: the distance from the settled
+    /// tip to the local tip. Below `configured_window_blocks` while a raised
+    /// window is still growing toward it.
+    pub covered_depth_blocks: u32,
+}
+
+impl CanonicalReorgWindowExceeded {
+    /// Returns the terminal readiness state of a writer parked by this
+    /// evidence.
+    #[must_use]
+    pub fn parked_readiness(&self) -> ReadinessState {
+        ReadinessState {
+            current_height: Some(self.local_tip.height.value()),
+            ..ReadinessState::not_ready(self.detail().into())
+        }
+        .with_phase(IngestPhase::FollowingTip)
+    }
+
+    pub(crate) fn halt(&self) -> ParkedWriterHalt {
+        ParkedWriterHalt::new(self.detail())
+    }
+
+    fn detail(&self) -> ReorgWindowExceededDetail {
+        ReorgWindowExceededDetail {
+            depth: u64::from(self.required_depth),
+            configured: u64::from(self.configured_window_blocks),
+            covered: Some(u64::from(self.covered_depth_blocks)),
+        }
+    }
 }
 
 /// Failure while following the clean canonical store.
@@ -290,6 +339,26 @@ pub enum CanonicalFollowError {
     /// The source fork has no common parent above the authenticated settlement boundary.
     #[error(transparent)]
     ReorgWindowExceeded(Box<CanonicalReorgWindowExceeded>),
+    /// One replacement exceeded its memory budget before commit.
+    ///
+    /// The budget covers the source blocks fork discovery fetched and has not
+    /// yet prepared, plus the prepared blocks, so it fails during discovery
+    /// when the fetched blocks alone exceed it.
+    #[error(
+        "a {replacement_depth}-block replacement exceeded ingest.follow.max_replacement_bytes ({max_replacement_bytes} bytes) holding {held_bytes} bytes after preparing {prepared_blocks} blocks; raise it to follow this reorg"
+    )]
+    ReplacementBytesExceeded {
+        /// Blocks the replacement replaces or appends. During fork discovery
+        /// it is the number of blocks discovered so far, a lower bound.
+        replacement_depth: u32,
+        /// Blocks prepared before the budget ran out; zero during discovery.
+        prepared_blocks: u32,
+        /// Estimated bytes held when the budget ran out: fetched source blocks
+        /// not yet prepared plus prepared blocks, including the refused one.
+        held_bytes: u64,
+        /// Configured budget.
+        max_replacement_bytes: u64,
+    },
     /// The retained canonical row needed to advance settlement is absent.
     #[error("canonical settled-tip header is absent at height {height:?}")]
     SettlementHeaderAbsent {
@@ -359,11 +428,15 @@ where
     let mut source_outage = None;
     let mut next_event_retention_check = std::time::Instant::now();
     let mut mempool_hydration_changes = follower.config.mempool_ready_gate.clone();
+    // The opened store's visible tip may sit on a branch the node abandoned
+    // while this writer was down. Readers learn that it is confirmed only
+    // from a source observation, never from the persisted fence itself.
+    let mut tip_confirmation = TipConfirmation::Unconfirmed;
 
     loop {
         if let Some(control_commands) = control_commands.as_mut() {
             while let Ok(command) = control_commands.try_recv() {
-                if apply_canonical_control_command(&mut store, command)
+                if apply_following_canonical_control_command(&mut store, command, tip_confirmation)
                     == CanonicalControlScheduling::YieldToCanonical
                 {
                     break;
@@ -438,14 +511,19 @@ where
                 continue;
             }
             Err(CanonicalFollowError::ReorgWindowExceeded(evidence)) => {
-                follower.readiness.set(
-                    ReadinessState::reorg_window_exceeded(
-                        u64::from(evidence.required_depth),
-                        u64::from(evidence.configured_window_blocks),
-                        Some(evidence.local_tip.height.value()),
+                follower.readiness.park(evidence.parked_readiness());
+                if let Some(mempool_ready_gate) = follower.config.mempool_ready_gate.as_ref() {
+                    mempool_ready_gate.halt_owner(evidence.halt());
+                }
+                if let Some(control_commands) = control_commands.as_mut() {
+                    serve_parked_writer(
+                        &mut store,
+                        control_commands,
+                        evidence.halt(),
+                        follower.cancel,
                     )
-                    .with_phase(IngestPhase::FollowingTip),
-                );
+                    .await;
+                }
                 return Err(CanonicalFollowError::ReorgWindowExceeded(evidence));
             }
             Err(CanonicalFollowError::Cancelled) => return Ok(store),
@@ -461,6 +539,9 @@ where
 
         match prepared {
             FollowIteration::AtTip { observed_tip } => {
+                if observed_tip == store.event_fence().visible_tip() {
+                    tip_confirmation = TipConfirmation::Confirmed;
+                }
                 record_fence_metrics(&store, observed_tip);
                 set_follow_readiness(
                     follower.readiness,
@@ -484,7 +565,11 @@ where
                         }
                         command = control_receiver.recv() => {
                             command.is_none_or(|command| {
-                                apply_canonical_control_command(&mut store, command);
+                                apply_following_canonical_control_command(
+                                    &mut store,
+                                    command,
+                                    tip_confirmation,
+                                );
                                 false
                             })
                         }
@@ -513,13 +598,17 @@ where
                 append,
                 observed_tip,
             } => {
+                // The appended block's parent was the visible tip, so the
+                // committed store extends the node's branch.
                 store = follower.commit_append(store, *append, observed_tip)?;
+                tip_confirmation = TipConfirmation::Confirmed;
             }
             FollowIteration::Replacement {
                 replacement,
                 observed_tip,
             } => {
                 store = follower.commit_replacement(store, *replacement, observed_tip)?;
+                tip_confirmation = TipConfirmation::Confirmed;
             }
         }
     }
@@ -672,9 +761,12 @@ where
     let settled_tip = anchor.settled_tip();
     let configured_window_blocks = store.reorg_policy().reorg_window_blocks();
     let search_start = local_tip.height.min(observed_tip.height);
-    let mut source_blocks = prefetched_source_block
-        .map(|block| BTreeMap::from([(block.height, block)]))
-        .unwrap_or_default();
+    let mut memory = ReplacementMemory::new(config.max_replacement_bytes);
+    let mut source_blocks = BTreeMap::new();
+    if let Some(block) = prefetched_source_block {
+        memory.retain_source(&block);
+        source_blocks.insert(block.height, block);
+    }
     let mut search_height = Some(search_start);
     let mut common_parent = None;
     let discovery_started = std::time::Instant::now();
@@ -703,7 +795,38 @@ where
         {
             common_parent = Some(settled_tip);
         }
-        source_blocks.insert(height, source_block);
+        // The common parent itself is never replaced, so it is not retained;
+        // a first replacement block directly above the settled tip is.
+        if common_parent.is_none_or(|parent| parent.height != height) {
+            memory.retain_source(&source_block);
+            if let Some(replaced) = source_blocks.insert(height, source_block) {
+                memory.release(source_block_bytes(&replaced));
+            }
+        }
+        if memory.exceeded() {
+            // A fork already known to start below settlement parks, as it
+            // would once discovery finished, instead of exiting on the budget.
+            if common_parent.is_none()
+                && source_forks_below_settlement(
+                    source,
+                    config.request_timeout,
+                    cancel,
+                    settled_tip,
+                    &source_blocks,
+                )
+                .await?
+            {
+                return Err(reorg_window_exceeded(
+                    local_tip,
+                    observed_tip,
+                    settled_tip,
+                    configured_window_blocks,
+                ));
+            }
+            return Err(
+                memory.exceeded_error(u32::try_from(source_blocks.len()).unwrap_or(u32::MAX), 0)
+            );
+        }
         if common_parent.is_some() {
             break;
         }
@@ -713,19 +836,12 @@ where
         .record(discovery_started.elapsed().as_secs_f64());
 
     let Some(common_parent) = common_parent else {
-        let unsettled_depth = local_tip
-            .height
-            .value()
-            .saturating_sub(settled_tip.height.value());
-        return Err(CanonicalFollowError::ReorgWindowExceeded(Box::new(
-            CanonicalReorgWindowExceeded {
-                local_tip,
-                source_tip: observed_tip,
-                settled_tip,
-                required_depth: unsettled_depth.saturating_add(1),
-                configured_window_blocks,
-            },
-        )));
+        return Err(reorg_window_exceeded(
+            local_tip,
+            observed_tip,
+            settled_tip,
+            configured_window_blocks,
+        ));
     };
     let Some(first_replacement_height) = common_parent.height.next() else {
         return Err(CanonicalFollowError::ReorgRequired {
@@ -759,9 +875,14 @@ where
     let raw_blob_retention = store.raw_blob_retention();
     let mut previous_tip_metadata = predecessor_checkpoint.tip_metadata();
     let mut replacement_blocks = Vec::new();
+    let replacement_depth = replacement_tip_height
+        .value()
+        .saturating_sub(first_replacement_height.value())
+        .saturating_add(1);
     let mut height = Some(first_replacement_height);
     while let Some(current_height) = height.filter(|height| *height <= replacement_tip_height) {
         let source_block = if let Some(source_block) = source_blocks.remove(&current_height) {
+            memory.release(source_block_bytes(&source_block));
             source_block
         } else {
             metrics::counter!("zinder_ingest_canonical_replacement_source_block_reads_total")
@@ -817,6 +938,15 @@ where
             next_tip_metadata,
         )
         .await?;
+        memory.hold(prepared_replacement_bytes(&block));
+        if memory.exceeded() {
+            return Err(memory.exceeded_error(
+                replacement_depth,
+                u32::try_from(replacement_blocks.len())
+                    .unwrap_or(u32::MAX)
+                    .saturating_add(1),
+            ));
+        }
         replacement_blocks.push(CanonicalReplacementBlock::new(block, subtree_roots));
         predecessor_checkpoint = source_checkpoint;
         previous_tip_metadata = next_tip_metadata;
@@ -845,6 +975,176 @@ where
         )),
         observed_tip,
     })
+}
+
+/// Refuses a fork whose common parent lies at or below the settled tip.
+fn reorg_window_exceeded(
+    local_tip: BlockId,
+    source_tip: BlockId,
+    settled_tip: BlockId,
+    configured_window_blocks: u32,
+) -> CanonicalFollowError {
+    let unsettled_depth = local_tip
+        .height
+        .value()
+        .saturating_sub(settled_tip.height.value());
+    CanonicalFollowError::ReorgWindowExceeded(Box::new(CanonicalReorgWindowExceeded {
+        local_tip,
+        source_tip,
+        settled_tip,
+        required_depth: unsettled_depth.saturating_add(1),
+        configured_window_blocks,
+        covered_depth_blocks: unsettled_depth,
+    }))
+}
+
+/// Returns whether the source branch leaves the settled tip, which places the
+/// fork below settlement whatever discovery would find above it.
+///
+/// Reads the source block directly above the settled tip, from the blocks
+/// discovery already holds when it reached that height.
+async fn source_forks_below_settlement<Source>(
+    source: &Source,
+    request_timeout: Duration,
+    cancel: &CancellationToken,
+    settled_tip: BlockId,
+    source_blocks: &BTreeMap<BlockHeight, SourceBlock>,
+) -> Result<bool, CanonicalFollowError>
+where
+    Source: NodeSource,
+{
+    let Some(above_settled) = settled_tip.height.next() else {
+        return Ok(false);
+    };
+    let parent_hash = if let Some(block) = source_blocks.get(&above_settled) {
+        block.parent_hash
+    } else {
+        metrics::counter!("zinder_ingest_canonical_fork_discovery_block_reads_total").increment(1);
+        source_request(
+            request_timeout,
+            cancel,
+            source.fetch_block_at(above_settled),
+        )
+        .await?
+        .parent_hash
+    };
+    Ok(parent_hash != settled_tip.hash)
+}
+
+/// Estimated bytes one replacement holds before its atomic commit, against
+/// `ingest.follow.max_replacement_bytes`.
+///
+/// Fork discovery fetches the replacement suffix newest first, before the
+/// common parent is known, and keeps those blocks for preparation, so they
+/// count until a prepared block replaces them.
+#[derive(Debug)]
+struct ReplacementMemory {
+    held_bytes: u64,
+    max_bytes: u64,
+}
+
+impl ReplacementMemory {
+    const fn new(max_bytes: NonZeroU64) -> Self {
+        Self {
+            held_bytes: 0,
+            max_bytes: max_bytes.get(),
+        }
+    }
+
+    /// Counts one fetched source block.
+    fn retain_source(&mut self, block: &SourceBlock) {
+        self.hold(source_block_bytes(block));
+    }
+
+    const fn hold(&mut self, bytes: u64) {
+        self.held_bytes = self.held_bytes.saturating_add(bytes);
+    }
+
+    const fn release(&mut self, bytes: u64) {
+        self.held_bytes = self.held_bytes.saturating_sub(bytes);
+    }
+
+    const fn held_bytes(&self) -> u64 {
+        self.held_bytes
+    }
+
+    const fn exceeded(&self) -> bool {
+        self.held_bytes > self.max_bytes
+    }
+
+    /// Returns the refusal of a `replacement_depth`-block replacement whose
+    /// held bytes exceeded the budget after preparing `prepared_blocks`.
+    const fn exceeded_error(
+        &self,
+        replacement_depth: u32,
+        prepared_blocks: u32,
+    ) -> CanonicalFollowError {
+        CanonicalFollowError::ReplacementBytesExceeded {
+            replacement_depth,
+            prepared_blocks,
+            held_bytes: self.held_bytes(),
+            max_replacement_bytes: self.max_bytes,
+        }
+    }
+}
+
+/// Estimates the bytes one fetched source block holds: its raw serialized
+/// block, which preparation decodes.
+fn source_block_bytes(block: &SourceBlock) -> u64 {
+    u64::try_from(block.raw_block_bytes.len()).unwrap_or(u64::MAX)
+}
+
+/// Estimates the bytes one prepared replacement block holds until commit: its
+/// replay envelope and the decoded facts it encodes, plus retained raw bytes.
+fn prepared_replacement_bytes(block: &CanonicalBuildBlock) -> u64 {
+    let replay_bytes = u64::try_from(block.replay_envelope.as_bytes().len()).unwrap_or(u64::MAX);
+    let raw_bytes = block
+        .transaction_blobs
+        .iter()
+        .map(|blob| blob.raw_transaction_bytes.len())
+        .chain(
+            block
+                .block_blob
+                .iter()
+                .map(|blob| blob.raw_block_bytes.len()),
+        )
+        .fold(0_u64, |total, bytes| {
+            total.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX))
+        });
+    replay_bytes.saturating_mul(2).saturating_add(raw_bytes)
+}
+
+/// Serves owner commands from a writer parked on a reorg deeper than its
+/// window until cancellation.
+///
+/// The writer no longer follows, but readers still need its frozen fence,
+/// retained events, retention leases, and owner checkpoints, and its control
+/// plane keeps reporting the typed halt. No command changes canonical rows.
+async fn serve_parked_writer(
+    store: &mut RocksDbCanonicalStore,
+    control_commands: &mut mpsc::Receiver<CanonicalControlCommand>,
+    halt: ParkedWriterHalt,
+    cancel: &CancellationToken,
+) {
+    tracing::warn!(
+        target: "zinder::ingest",
+        event = "canonical_writer_parked",
+        visible_tip_height = store.event_fence().visible_tip().height.value(),
+        "canonical writer parked; serving its control plane until termination"
+    );
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            command = control_commands.recv() => {
+                let Some(command) = command else {
+                    cancel.cancelled().await;
+                    return;
+                };
+                apply_parked_canonical_control_command(store, command, halt);
+            }
+        }
+    }
 }
 
 fn next_append_settled_tip(
@@ -1181,12 +1481,29 @@ mod tests {
     };
 
     use super::{
-        await_follow_preparation_or_mempool_change, gate_canonical_readiness_on_mempool_hydration,
-        live_subtree_root_ranges, next_settled_height, publish_follow_readiness,
-        wait_for_mempool_hydration_change, withdraw_follow_readiness_for_mempool_hydration,
+        ReplacementMemory, await_follow_preparation_or_mempool_change,
+        gate_canonical_readiness_on_mempool_hydration, live_subtree_root_ranges,
+        next_settled_height, publish_follow_readiness, wait_for_mempool_hydration_change,
+        withdraw_follow_readiness_for_mempool_hydration,
     };
     use crate::mempool_ready_channel;
     use zinder_runtime::{IngestPhase, Readiness, ReadinessCause, ReadinessState};
+
+    #[test]
+    fn replacement_memory_counts_fetched_blocks_until_prepared() -> Result<(), &'static str> {
+        let mut memory =
+            ReplacementMemory::new(std::num::NonZeroU64::new(100).ok_or("budget is nonzero")?);
+        memory.hold(60);
+        memory.hold(40);
+        assert!(!memory.exceeded());
+        // Preparing the first fetched block releases its source bytes and
+        // holds its prepared estimate instead.
+        memory.release(60);
+        memory.hold(61);
+        assert_eq!(memory.held_bytes(), 101);
+        assert!(memory.exceeded());
+        Ok(())
+    }
 
     #[test]
     fn ready_follow_observation_keeps_an_active_cursor_at_risk_warning() {

@@ -48,7 +48,7 @@ use zinder_wallet_rocksdb::{
 
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
-const DEFAULT_SUPPORTED_REORG_DEPTH: u32 = 100;
+const DEFAULT_SUPPORTED_REORG_DEPTH: u32 = zinder_store::DEFAULT_REORG_WINDOW_BLOCKS;
 
 // These ceilings intentionally describe the measured production build, not a
 // hidden unbounded allocation. Sorters use their limits independently and the
