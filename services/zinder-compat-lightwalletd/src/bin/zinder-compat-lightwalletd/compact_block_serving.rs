@@ -1579,6 +1579,7 @@ mod tests {
                 )
             }),
             reorg_window_exceeded: None,
+            tip_unconfirmed: false,
         }
     }
 
@@ -2230,6 +2231,7 @@ mod tests {
             oldest_retained_event_sequence: 0,
             network_upgrade_schedule: None,
             reorg_window_exceeded: None,
+            tip_unconfirmed: false,
         };
         assert_eq!(
             classify_writer_fence(&status(4), network, 4, true),

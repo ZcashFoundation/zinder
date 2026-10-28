@@ -723,6 +723,7 @@ fn canonical_writer_status_admitted_schedule_round_trips_through_prost() -> eyre
             zinder_proto::wire::encode_canonical_network_upgrade_schedule(&activations, 2),
         ),
         reorg_window_exceeded: None,
+        tip_unconfirmed: false,
     };
     let schedule = round_trip(&response)?
         .network_upgrade_schedule
@@ -813,13 +814,42 @@ fn parked_canonical_writer_status_round_trips_its_reorg_halt_with_the_frozen_fen
         oldest_retained_event_sequence: 1,
         network_upgrade_schedule: None,
         reorg_window_exceeded: Some(halt),
+        tip_unconfirmed: true,
     };
     let decoded = round_trip(&response)?;
     assert_eq!(decoded.reorg_window_exceeded, Some(halt));
+    assert!(decoded.tip_unconfirmed);
     assert_eq!(
         decoded.fence.map(|fence| fence.visible_tip_height),
         Some(2_000)
     );
+    Ok(())
+}
+
+#[test]
+fn canonical_writer_status_round_trips_an_unconfirmed_tip() -> eyre::Result<()> {
+    let response = ingest::CanonicalWriterStatusResponse {
+        network_name: "zcash-regtest".to_owned(),
+        fence: Some(ingest::CanonicalWriterFence {
+            chain_epoch_id: 7,
+            visible_tip_height: 2_000,
+            ..ingest::CanonicalWriterFence::default()
+        }),
+        oldest_retained_event_sequence: 1,
+        network_upgrade_schedule: None,
+        reorg_window_exceeded: None,
+        tip_unconfirmed: true,
+    };
+    let decoded = round_trip(&response)?;
+    assert!(decoded.tip_unconfirmed);
+    assert_eq!(decoded.reorg_window_exceeded, None);
+    // A writer that predates the field encodes nothing, which decodes as a
+    // confirmed tip.
+    let legacy = ingest::CanonicalWriterStatusResponse {
+        tip_unconfirmed: false,
+        ..decoded
+    };
+    assert!(!round_trip(&legacy)?.tip_unconfirmed);
     Ok(())
 }
 

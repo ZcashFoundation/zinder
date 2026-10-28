@@ -35,8 +35,8 @@ use crate::{
         canonical_build_block, compact_block_commitments, register_prohibited_read_metrics,
     },
     writer::control::{
-        CanonicalControlCommand, CanonicalControlScheduling, ParkedWriterHalt,
-        apply_canonical_control_command, apply_parked_canonical_control_command,
+        CanonicalControlCommand, CanonicalControlScheduling, ParkedWriterHalt, TipConfirmation,
+        apply_following_canonical_control_command, apply_parked_canonical_control_command,
     },
     writer::raw_blob_policy_for_retention,
 };
@@ -425,11 +425,15 @@ where
     let mut source_outage = None;
     let mut next_event_retention_check = std::time::Instant::now();
     let mut mempool_hydration_changes = follower.config.mempool_ready_gate.clone();
+    // The opened store's visible tip may sit on a branch the node abandoned
+    // while this writer was down. Readers learn that it is confirmed only
+    // from a source observation, never from the persisted fence itself.
+    let mut tip_confirmation = TipConfirmation::Unconfirmed;
 
     loop {
         if let Some(control_commands) = control_commands.as_mut() {
             while let Ok(command) = control_commands.try_recv() {
-                if apply_canonical_control_command(&mut store, command)
+                if apply_following_canonical_control_command(&mut store, command, tip_confirmation)
                     == CanonicalControlScheduling::YieldToCanonical
                 {
                     break;
@@ -532,6 +536,9 @@ where
 
         match prepared {
             FollowIteration::AtTip { observed_tip } => {
+                if observed_tip == store.event_fence().visible_tip() {
+                    tip_confirmation = TipConfirmation::Confirmed;
+                }
                 record_fence_metrics(&store, observed_tip);
                 set_follow_readiness(
                     follower.readiness,
@@ -555,7 +562,11 @@ where
                         }
                         command = control_receiver.recv() => {
                             command.is_none_or(|command| {
-                                apply_canonical_control_command(&mut store, command);
+                                apply_following_canonical_control_command(
+                                    &mut store,
+                                    command,
+                                    tip_confirmation,
+                                );
                                 false
                             })
                         }
@@ -584,13 +595,17 @@ where
                 append,
                 observed_tip,
             } => {
+                // The appended block's parent was the visible tip, so the
+                // committed store extends the node's branch.
                 store = follower.commit_append(store, *append, observed_tip)?;
+                tip_confirmation = TipConfirmation::Confirmed;
             }
             FollowIteration::Replacement {
                 replacement,
                 observed_tip,
             } => {
                 store = follower.commit_replacement(store, *replacement, observed_tip)?;
+                tip_confirmation = TipConfirmation::Confirmed;
             }
         }
     }
