@@ -13,6 +13,7 @@
 
 mod activation_schedule;
 mod privacy_shape;
+mod reorg_window_exceeded;
 mod transparent_delta_kind;
 mod utxo_set_commitment;
 mod wallet;
@@ -22,6 +23,10 @@ pub use activation_schedule::{
     encode_canonical_network_upgrade_schedule,
 };
 pub use privacy_shape::{decode_privacy_shape, encode_privacy_shape};
+pub use reorg_window_exceeded::{
+    ReorgWindowExceededMetadata, decode_reorg_window_exceeded_metadata,
+    encode_reorg_window_exceeded_metadata,
+};
 pub use transparent_delta_kind::{
     TRANSPARENT_DELTA_KIND_RECEIVED_BYTE, TRANSPARENT_DELTA_KIND_SPENT_BYTE,
     UnknownTransparentDeltaKindByte, decode_transparent_delta_kind,
