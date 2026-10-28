@@ -544,8 +544,14 @@ pub struct WalletServingPairPublisher {
     /// requires its lease to have drained, which cannot happen while this
     /// reference is alive.
     retired_pair: Option<Arc<WalletServingReadPair>>,
-    /// Instant of the last writer attestation of the published pair.
-    attested_at: Instant,
+    /// Instant of the last attestation of the published pair by a following
+    /// writer. `None` while the writer is parked, so a frozen pair never earns
+    /// a staleness allowance that would admit traffic.
+    attested_at: Option<Instant>,
+    /// Halt the writer last reported. Refresh failures republish it until a
+    /// valid writer status without the halt clears it, so a writer-status
+    /// outage cannot reopen traffic on a frozen pair.
+    parked: Option<ReadinessState>,
     /// Writer lag observed at the last successful writer-status fetch.
     observed_lag_chain_epochs: u64,
     /// Activation table each new canonical secondary generation opens with.
@@ -601,7 +607,8 @@ impl WalletServingPairPublisher {
             generations,
             published_generation: None,
             retired_pair: None,
-            attested_at: Instant::now(),
+            attested_at: None,
+            parked: None,
             observed_lag_chain_epochs: 0,
             secondary_activations,
         };
@@ -950,11 +957,13 @@ impl WalletServingPairPublisher {
             lease: GenerationLease::new(&pair),
         };
         self.published_generation = Some(generation);
-        self.attested_at = Instant::now();
         self.observed_lag_chain_epochs = 0;
         let visible_height = Some(pair.canonical_fence().visible_tip().height.value());
+        self.parked = parked_writer_readiness(writer_status, self.config.network, visible_height);
+        self.attested_at = self.parked.is_none().then(Instant::now);
         self.readiness.publish_pair_state(
-            parked_writer_readiness(writer_status, self.config.network, visible_height)
+            self.parked
+                .clone()
                 .unwrap_or_else(|| ReadinessState::ready(visible_height)),
         );
         metrics::counter!("zinder_wallet_serving_pair_publisher_publications_total").increment(1);
@@ -989,9 +998,9 @@ impl WalletServingPairPublisher {
         let visible_height = Some(active_source.source_position().tip.height.value());
         // A parked writer keeps attesting its frozen fence; the pair stays
         // published but refuses traffic with the writer's typed halt.
-        if let Some(parked) =
-            parked_writer_readiness(writer_status, self.config.network, visible_height)
-        {
+        self.parked = parked_writer_readiness(writer_status, self.config.network, visible_height);
+        if let Some(parked) = self.parked.clone() {
+            self.attested_at = None;
             self.readiness.publish_pair_state(parked);
             return Ok(ActiveWriterRelation::Parked);
         }
@@ -1007,7 +1016,7 @@ impl WalletServingPairPublisher {
                 return Err(WalletServingPairError::WriterFenceMismatch);
             }
             record_replica_lag(0);
-            self.attested_at = Instant::now();
+            self.attested_at = Some(Instant::now());
             self.observed_lag_chain_epochs = 0;
             self.readiness
                 .publish_pair_state(ReadinessState::ready(visible_height));
@@ -1037,7 +1046,7 @@ impl WalletServingPairPublisher {
     /// `None` once the ceiling passes, so the caller falls back to the
     /// fail-closed cause and the service stops admitting traffic.
     fn stale_serving_pair_readiness(&self, visible_height: Option<u32>) -> Option<ReadinessState> {
-        let staleness = self.attested_at.elapsed();
+        let staleness = self.attested_at?.elapsed();
         (staleness < self.config.serving_pair_staleness_ceiling).then(|| {
             ReadinessState::serving_pair_stale(
                 self.observed_lag_chain_epochs,
@@ -1059,8 +1068,11 @@ impl WalletServingPairPublisher {
         let admitted_while_stale = refresh_failure_retains_attested_pair(error)
             .then(|| self.stale_serving_pair_readiness(visible_height))
             .flatten();
+        // A writer last seen parked keeps its halt through any later failure;
+        // only a valid status without the halt clears it.
+        let failure_state = self.parked.clone().or(admitted_while_stale);
         self.readiness
-            .publish_pair_state(admitted_while_stale.unwrap_or_else(|| {
+            .publish_pair_state(failure_state.unwrap_or_else(|| {
                 refresh_failure_not_ready_cause(error).map_or_else(
                     || {
                         ReadinessState::replica_lagging(
@@ -2438,6 +2450,10 @@ mod tests {
     /// no ingest-control probe, so the halt must come from canonical writer
     /// status: at bootstrap, on every refresh, and until the writer clears it.
     #[tokio::test(flavor = "multi_thread")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "bootstrap, recovery, a second park, and the following outage form one causal halt sequence"
+    )]
     async fn compatibility_pair_refuses_a_parked_writer_with_the_typed_halt()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
@@ -2518,8 +2534,19 @@ mod tests {
         assert!(!parked.is_ready);
         assert_eq!(parked.cause, expected_halt);
 
+        // A writer-status outage after the halt must keep refusing traffic,
+        // never reopen it as a stale pair within the staleness ceiling.
         cancel.cancel();
         server_task.await??;
+        let outage = publisher
+            .refresh_once()
+            .await
+            .err()
+            .ok_or("refresh must fail once the writer status endpoint is gone")?;
+        publisher.record_refresh_failure(&outage);
+        let after_outage = readiness.report();
+        assert!(!after_outage.is_ready);
+        assert_eq!(after_outage.cause, expected_halt);
         Ok(())
     }
 

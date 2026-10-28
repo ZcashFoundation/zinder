@@ -120,8 +120,11 @@ Every wallet-serving reader refuses traffic while the writer reports the halt:
   `CanonicalControl.WriterStatus`. The frozen fence still attests their
   published reader, so the halt on the same response is what keeps them from
   reporting ready on a chain that stopped advancing. They project it as their
-  `reorg_window_exceeded` readiness cause at bootstrap and on every refresh,
-  and return to ready once the writer stops reporting it.
+  `reorg_window_exceeded` readiness cause at bootstrap and on every refresh.
+  The halt is sticky: a writer-status failure after it republishes the halt
+  instead of the traffic-admitting `serving_pair_stale`, and a reader that
+  only a parked writer attested earns no staleness allowance. Only a valid
+  writer status without the halt returns them to ready.
 - Native query also reads `IngestControl.WriterStatus` through its
   ingest-control health probe, and that cause takes precedence over the
   serving-pair failures the park could cause.
@@ -178,6 +181,15 @@ value below the node's bound still parks on reorgs the node can produce, and
 operators would still need to raise it as observed reorgs grow.
 
 ## Consequences
+
+- The halt lives in the parked process, not in the store. A restarted writer
+  answers writer status without it until its first follow iteration
+  rediscovers the reorg and parks again, typically after one window of block
+  reads. During that window lightwalletd compatibility can report ready on
+  the abandoned branch. Native query stays unready, because its
+  ingest-control probe needs a mempool snapshot that cannot certify against a
+  node on another branch. The same window existed when a parked writer
+  exited and restarted.
 
 - The settled tip trails the visible tip by up to 1000 blocks. Surfaces that
   report finality from the settled tip report it later than before.

@@ -236,7 +236,13 @@ pub(crate) struct CompactBlockPublisher {
     slot: CompactBlockServingSlot,
     active_generation: usize,
     retired: Option<Arc<RocksDbCanonicalSecondary>>,
-    last_attested: tokio::time::Instant,
+    /// Last attestation of the active reader by a following writer. `None`
+    /// while the writer is parked, so a frozen reader never earns a staleness
+    /// allowance that would admit traffic.
+    last_attested: Option<tokio::time::Instant>,
+    /// Halt the writer last reported. Writer-status failures republish it
+    /// until a valid status without the halt clears it.
+    parked: Option<ReadinessState>,
     /// Activation table each new generation opens with: the node's table at
     /// startup, then the table the writer reports, so generations keep
     /// opening after the chain crosses an activation admitted later.
@@ -263,8 +269,10 @@ impl CompactBlockPublisher {
         let reader = Arc::new(candidate);
         let slot = CompactBlockServingSlot::new(Arc::clone(&reader));
         let visible_height = reader.event_fence().visible_tip().height.value();
+        let parked = parked_writer_readiness(&attesting_status, config.network, visible_height);
         readiness.publish_storage(
-            parked_writer_readiness(&attesting_status, config.network, visible_height)
+            parked
+                .clone()
                 .unwrap_or_else(|| ReadinessState::ready(Some(visible_height))),
         );
         let publisher = Self {
@@ -274,7 +282,8 @@ impl CompactBlockPublisher {
             slot: slot.clone(),
             active_generation: 0,
             retired: None,
-            last_attested: tokio::time::Instant::now(),
+            last_attested: parked.is_none().then(tokio::time::Instant::now),
+            parked,
             generation_activations,
         };
         Ok((publisher, slot))
@@ -320,17 +329,27 @@ impl CompactBlockPublisher {
         let status = match self.writer_status.fetch().await {
             Ok(status) => status,
             Err(_error) => {
-                self.record_transport_failure(active.event_fence().visible_tip().height.value());
+                // A writer last seen parked keeps its halt through an outage;
+                // only a valid status without the halt clears it.
+                if let Some(parked) = self.parked.clone() {
+                    self.readiness.publish_storage(parked);
+                } else {
+                    self.record_transport_failure(
+                        active.event_fence().visible_tip().height.value(),
+                    );
+                }
                 return;
             }
         };
         // A parked writer keeps attesting its frozen fence; the reader stays
         // published but refuses traffic with the writer's typed halt.
-        if let Some(parked) = parked_writer_readiness(
+        self.parked = parked_writer_readiness(
             &status,
             self.config.network,
             active.event_fence().visible_tip().height.value(),
-        ) {
+        );
+        if let Some(parked) = self.parked.clone() {
+            self.last_attested = None;
             self.readiness.publish_storage(parked);
             return;
         }
@@ -352,7 +371,7 @@ impl CompactBlockPublisher {
             return;
         }
         if relation == WriterFenceRelation::Exact {
-            self.last_attested = tokio::time::Instant::now();
+            self.last_attested = Some(tokio::time::Instant::now());
             self.readiness.publish_storage(ReadinessState::ready(Some(
                 active.event_fence().visible_tip().height.value(),
             )));
@@ -370,20 +389,20 @@ impl CompactBlockPublisher {
                     Some(active.event_fence().visible_tip().height.value()),
                     Some(fence.visible_tip_height),
                 ));
-        } else if self.last_attested.elapsed() >= self.config.staleness_ceiling {
+        } else if let Some(staleness) = self.stale_allowance() {
+            self.readiness
+                .publish_storage(ReadinessState::serving_pair_stale(
+                    lag,
+                    staleness.as_secs(),
+                    Some(active.event_fence().visible_tip().height.value()),
+                ));
+        } else {
             self.record_failure(
                 ReadinessCause::ReplicaLagging {
                     lag_chain_epochs: lag,
                 },
                 active.event_fence().visible_tip().height.value(),
             );
-        } else {
-            self.readiness
-                .publish_storage(ReadinessState::serving_pair_stale(
-                    lag,
-                    self.last_attested.elapsed().as_secs(),
-                    Some(active.event_fence().visible_tip().height.value()),
-                ));
         }
         if let Some(retired) = self.retired.take() {
             if Arc::strong_count(&retired) > 1 {
@@ -437,28 +456,26 @@ impl CompactBlockPublisher {
         {
             Ok((candidate, _attesting_status)) => candidate,
             Err(ConvergenceFailure::WriterStatusTransport(_)) => {
-                let cause = if self.last_attested.elapsed() < self.config.staleness_ceiling {
-                    ReadinessCause::ServingPairStale {
+                let cause = self.stale_allowance().map_or(
+                    ReadinessCause::WriterStatusUnavailable,
+                    |staleness| ReadinessCause::ServingPairStale {
                         lag_chain_epochs: lag,
-                        staleness_seconds: self.last_attested.elapsed().as_secs(),
-                    }
-                } else {
-                    ReadinessCause::WriterStatusUnavailable
-                };
+                        staleness_seconds: staleness.as_secs(),
+                    },
+                );
                 self.record_failure(cause, active.event_fence().visible_tip().height.value());
                 return;
             }
             Err(ConvergenceFailure::WriterAhead) => {
-                let cause = if self.last_attested.elapsed() < self.config.staleness_ceiling {
-                    ReadinessCause::ServingPairStale {
-                        lag_chain_epochs: lag,
-                        staleness_seconds: self.last_attested.elapsed().as_secs(),
-                    }
-                } else {
+                let cause = self.stale_allowance().map_or(
                     ReadinessCause::ReplicaLagging {
                         lag_chain_epochs: lag,
-                    }
-                };
+                    },
+                    |staleness| ReadinessCause::ServingPairStale {
+                        lag_chain_epochs: lag,
+                        staleness_seconds: staleness.as_secs(),
+                    },
+                );
                 self.record_failure(cause, active.event_fence().visible_tip().height.value());
                 return;
             }
@@ -482,7 +499,7 @@ impl CompactBlockPublisher {
         let reader = Arc::new(candidate);
         self.retired = Some(self.slot.publish(Arc::clone(&reader)));
         self.active_generation = candidate_generation;
-        self.last_attested = tokio::time::Instant::now();
+        self.last_attested = Some(tokio::time::Instant::now());
         self.readiness.publish_storage(ReadinessState::ready(Some(
             reader.event_fence().visible_tip().height.value(),
         )));
@@ -510,22 +527,26 @@ impl CompactBlockPublisher {
     }
 
     fn record_transport_failure(&self, height: u32) {
-        self.record_failure(
-            transport_failure_cause(self.last_attested.elapsed(), self.config.staleness_ceiling),
-            height,
-        );
+        self.record_failure(transport_failure_cause(self.stale_allowance()), height);
+    }
+
+    /// Time since the last attestation by a following writer while it is still
+    /// within the staleness ceiling; `None` once the ceiling passes or while
+    /// no following writer has attested the active reader.
+    fn stale_allowance(&self) -> Option<Duration> {
+        self.last_attested
+            .map(|attested| attested.elapsed())
+            .filter(|staleness| *staleness < self.config.staleness_ceiling)
     }
 }
 
-fn transport_failure_cause(elapsed: Duration, ceiling: Duration) -> ReadinessCause {
-    if elapsed < ceiling {
+fn transport_failure_cause(stale_allowance: Option<Duration>) -> ReadinessCause {
+    stale_allowance.map_or(ReadinessCause::WriterStatusUnavailable, |staleness| {
         ReadinessCause::ServingPairStale {
             lag_chain_epochs: 0,
-            staleness_seconds: elapsed.as_secs(),
+            staleness_seconds: staleness.as_secs(),
         }
-    } else {
-        ReadinessCause::WriterStatusUnavailable
-    }
+    })
 }
 
 async fn open_generation(
@@ -1909,6 +1930,14 @@ mod tests {
         assert!(!parked.is_ready);
         assert_eq!(parked.cause, expected_halt);
 
+        // A writer-status outage after the halt must keep refusing traffic,
+        // never reopen it as a stale reader within the staleness ceiling.
+        control.set_available(false);
+        publisher.refresh().await;
+        let after_outage = readiness.report();
+        assert!(!after_outage.is_ready);
+        assert_eq!(after_outage.cause, expected_halt);
+
         drop(slot);
         drop(publisher);
         let _ = shutdown_sender.send(());
@@ -2119,14 +2148,14 @@ mod tests {
     #[test]
     fn transport_outage_uses_stale_grace_then_fails_closed() {
         assert_eq!(
-            transport_failure_cause(Duration::from_secs(2), Duration::from_secs(5)),
+            transport_failure_cause(Some(Duration::from_secs(2))),
             ReadinessCause::ServingPairStale {
                 lag_chain_epochs: 0,
                 staleness_seconds: 2,
             }
         );
         assert_eq!(
-            transport_failure_cause(Duration::from_secs(5), Duration::from_secs(5)),
+            transport_failure_cause(None),
             ReadinessCause::WriterStatusUnavailable
         );
     }
