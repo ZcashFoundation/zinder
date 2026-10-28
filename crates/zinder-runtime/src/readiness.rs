@@ -481,13 +481,18 @@ impl Readiness {
     ///
     /// A canonical writer parked on a reorg deeper than its window keeps
     /// serving its control plane while other workers still run; none of them
-    /// may replace the halt with a recoverable cause. Only
-    /// [`ReadinessCause::ShuttingDown`] replaces a parked state.
+    /// may replace the halt with a recoverable cause, and the ingest phase it
+    /// was parked in stays fixed. Only [`ReadinessCause::ShuttingDown`]
+    /// replaces a parked state, and a shutdown already in progress keeps its
+    /// cause: the process is draining and the halt would be stale.
     pub fn park(&self, state: ReadinessState) {
         // Raising the flag first means any writer that takes the lock after
         // this point is rejected, and one that held it earlier is overwritten.
         self.parked.store(true, Ordering::Release);
         let mut guard = self.inner.lock();
+        if matches!(guard.cause, ReadinessCause::ShuttingDown) {
+            return;
+        }
         let phase = state.phase.or(guard.phase);
         *guard = state;
         guard.phase = phase;
@@ -562,8 +567,16 @@ impl Readiness {
     /// Sets the [`IngestPhase`] on the current state without disturbing
     /// any other field. Used by the phase-driven ingest loop's per-iteration
     /// classifier stamp.
+    ///
+    /// A [parked](Self::park) state keeps the phase it was parked in, so a
+    /// worker still classifying phases cannot report catch-up progress for a
+    /// writer that no longer follows.
     pub fn set_phase(&self, phase: IngestPhase) {
-        self.inner.lock().phase = Some(phase);
+        let mut guard = self.inner.lock();
+        if self.parked.load(Ordering::Acquire) {
+            return;
+        }
+        guard.phase = Some(phase);
     }
 
     /// Returns the current [`IngestPhase`] without cloning the readiness cause.
@@ -1165,6 +1178,25 @@ mod tests {
     }
 
     #[test]
+    fn parking_during_shutdown_keeps_the_shutdown_cause() {
+        let readiness = Readiness::new(ReadinessState::ready(Some(10)));
+        readiness.set(ReadinessState::not_ready(ReadinessCause::ShuttingDown));
+        readiness.park(
+            ReadinessState::reorg_window_exceeded(1_001, 1_000, Some(1_000), Some(10))
+                .with_phase(IngestPhase::FollowingTip),
+        );
+        assert!(matches!(
+            readiness.report().cause,
+            ReadinessCause::ShuttingDown
+        ));
+        readiness.set(ReadinessState::ready(Some(11)));
+        assert!(matches!(
+            readiness.report().cause,
+            ReadinessCause::ShuttingDown
+        ));
+    }
+
+    #[test]
     fn parked_readiness_keeps_its_halt_until_shutdown() {
         let readiness = Readiness::new(ReadinessState::ready(Some(10)));
         readiness.park(
@@ -1182,6 +1214,7 @@ mod tests {
             },
         });
         readiness.update(|state| state.cause = ReadinessCause::Ready);
+        readiness.set_phase(IngestPhase::BulkCatchup);
         let report = readiness.report();
         assert!(!report.is_ready);
         assert!(matches!(
