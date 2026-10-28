@@ -322,34 +322,11 @@ impl RocksDbCanonicalStore {
             revised_reorg_policy: Some(reorg_policy),
             ..self.control_revisions()
         };
-        let encoded_control = encode_ready_store_control_with_revisions(
-            self.workload,
-            &self.build_plan,
-            self.cursor_auth_key,
-            &self.ready_evidence,
+        let decoded = self.write_control_revisions(
+            WriteBatch::default(),
             revisions,
-        )
-        .map_err(|source| {
-            CanonicalStoreError::admission(self.bounded_open.db.path(), source.to_string())
-        })?;
-        let mut options = WriteOptions::default();
-        options.disable_wal(false);
-        options.set_sync(true);
-        self.bounded_open
-            .db
-            .put_opt(STORE_CONTROL_KEY, encoded_control, &options)
-            .map_err(|source| CanonicalStoreError::RocksDbOperation {
-                operation: "reorg policy revision",
-                source,
-            })?;
-        let decoded = validate_open_store_control(
-            &self.bounded_open.db,
-            self.bounded_open.db.path(),
-            &CanonicalStoreAdmissionExpectation::from_build_plan(
-                &self.build_plan,
-                self.workload,
-                reorg_policy,
-            ),
+            reorg_policy,
+            "reorg policy revision",
         )?;
         if decoded.revisions() != revisions {
             return Err(CanonicalStoreError::admission(
@@ -482,60 +459,22 @@ impl RocksDbCanonicalStore {
         &mut self,
         schedule: &CanonicalActivationSchedule,
     ) -> Result<(), CanonicalStoreError> {
-        let binding = schedule.binding();
-        let encoded_control = encode_ready_store_control_with_revisions(
-            self.workload,
-            &self.build_plan,
-            self.cursor_auth_key,
-            &self.ready_evidence,
-            ControlRevisions {
-                activation_schedule_binding: Some(binding),
-                ..self.control_revisions()
-            },
-        )
-        .map_err(|source| {
-            CanonicalStoreError::admission(self.bounded_open.db.path(), source.to_string())
-        })?;
         let mut batch = WriteBatch::default();
         schedule.put_into(&mut batch).map_err(|reason| {
             CanonicalStoreError::admission(self.bounded_open.db.path(), reason)
         })?;
-        batch.put(STORE_CONTROL_KEY, encoded_control);
-        let mut options = WriteOptions::default();
-        options.disable_wal(false);
-        options.set_sync(true);
-        abort_at_activation_schedule_failpoint("before_atomic_write");
-        self.bounded_open
-            .db
-            .write_opt(&batch, &options)
-            .map_err(|source| CanonicalStoreError::RocksDbOperation {
-                operation: "activation schedule admission",
-                source,
-            })?;
-        abort_at_activation_schedule_failpoint("after_atomic_write");
-        let decoded = validate_open_store_control(
-            &self.bounded_open.db,
-            self.bounded_open.db.path(),
-            &CanonicalStoreAdmissionExpectation::from_build_plan(
-                &self.build_plan,
-                self.workload,
-                self.reorg_policy(),
-            ),
+        let decoded = self.write_control_revisions(
+            batch,
+            ControlRevisions {
+                activation_schedule_binding: Some(schedule.binding()),
+                ..self.control_revisions()
+            },
+            self.reorg_policy(),
+            "activation schedule admission",
         )?;
-        let stored_schedule = decoded
-            .activation_schedule_binding
-            .map(|stored_binding| {
-                CanonicalActivationSchedule::read_bound(
-                    &self.bounded_open.db,
-                    self.bounded_open.db.path(),
-                    stored_binding,
-                    self.build_plan
-                        .network_upgrade_activations_fingerprint()
-                        .as_bytes(),
-                )
-            })
-            .transpose()?
-            .ok_or_else(|| {
+        let stored_schedule =
+            read_admitted_schedule(&self.bounded_open.db, self.bounded_open.db.path(), &decoded)?
+                .ok_or_else(|| {
                 CanonicalStoreError::admission(
                     self.bounded_open.db.path(),
                     "activation schedule control trailer was not persisted",
@@ -549,6 +488,46 @@ impl RocksDbCanonicalStore {
         }
         self.activation_schedule = Some(stored_schedule);
         Ok(())
+    }
+
+    /// Durably writes `batch` with the store control that binds `revisions`,
+    /// then returns that control as validated on readback under
+    /// `reorg_policy`. Each caller compares the readback with what it admitted.
+    fn write_control_revisions(
+        &self,
+        mut batch: WriteBatch,
+        revisions: ControlRevisions,
+        reorg_policy: super::CanonicalReorgPolicy,
+        operation: &'static str,
+    ) -> Result<DecodedStoreControl, CanonicalStoreError> {
+        let path = self.bounded_open.db.path();
+        let encoded_control = encode_ready_store_control_with_revisions(
+            self.workload,
+            &self.build_plan,
+            self.cursor_auth_key,
+            &self.ready_evidence,
+            revisions,
+        )
+        .map_err(|source| CanonicalStoreError::admission(path, source.to_string()))?;
+        batch.put(STORE_CONTROL_KEY, encoded_control);
+        let mut options = WriteOptions::default();
+        options.disable_wal(false);
+        options.set_sync(true);
+        abort_at_activation_schedule_failpoint("before_atomic_write");
+        self.bounded_open
+            .db
+            .write_opt(&batch, &options)
+            .map_err(|source| CanonicalStoreError::RocksDbOperation { operation, source })?;
+        abort_at_activation_schedule_failpoint("after_atomic_write");
+        validate_open_store_control(
+            &self.bounded_open.db,
+            path,
+            &CanonicalStoreAdmissionExpectation::from_build_plan(
+                &self.build_plan,
+                self.workload,
+                reorg_policy,
+            ),
+        )
     }
 
     fn open_ready_with_expectation(
@@ -1078,15 +1057,7 @@ pub(super) fn validate_open_store_control(
     let persisted_activations_fingerprint = persisted
         .build_plan
         .network_upgrade_activations_fingerprint();
-    let admitted_schedule = match persisted.activation_schedule_binding {
-        Some(binding) => Some(CanonicalActivationSchedule::read_bound(
-            db,
-            path,
-            binding,
-            persisted_activations_fingerprint.as_bytes(),
-        )?),
-        None => None,
-    };
+    let admitted_schedule = read_admitted_schedule(db, path, &persisted)?;
     let visible_tip = match persisted.build_state {
         CanonicalStoreBuildState::Ready(ready) => Some(ready.visible_tip.height),
         CanonicalStoreBuildState::Building => None,
