@@ -1843,6 +1843,114 @@ mod tests {
         Ok(())
     }
 
+    /// Compact serving refuses a writer that has not confirmed its tip since
+    /// it reopened.
+    ///
+    /// It stays unready with `canonical_tip_unconfirmed`, never
+    /// `serving_pair_stale`, through a writer-status outage, keeps a
+    /// remembered halt while the flag is set, and turns ready only once a
+    /// status carries neither.
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "bootstrap, outage, recovery, a park, and the restarted writer form one causal sequence"
+    )]
+    async fn publisher_refuses_a_writer_with_an_unconfirmed_tip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let activations = lifecycle_activations();
+        let (primary, _blocks) =
+            lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
+        let unconfirmed_status = CanonicalWriterStatusResponse {
+            tip_unconfirmed: true,
+            ..lifecycle_writer_status(&primary)
+        };
+        let control = MutableCanonicalControl::new(unconfirmed_status.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let server = tokio::spawn({
+            let control = control.clone();
+            async move {
+                Server::builder()
+                    .add_service(CanonicalControlServer::new(control))
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                        let _ = shutdown_receiver.await;
+                    })
+                    .await
+            }
+        });
+        let readiness = Readiness::default();
+        let serving_readiness = CompactServingReadiness::new(readiness.clone());
+        serving_readiness.publish_node(ReadinessCause::Ready);
+        let config = CompactBlockServingConfig {
+            canonical_primary_path: temporary.path().join("canonical-primary"),
+            canonical_secondary_root: temporary.path().join("canonical-secondaries"),
+            network: Network::ZcashRegtest,
+            activations: Arc::new(activations.clone()),
+            raw_blob_retention: RawBlobRetention::Transactions,
+            reorg_policy: CanonicalReorgPolicy::new(100)?,
+            resource_budget: RocksDbResourceBudget::for_local_tests(),
+            catchup_interval: Duration::from_millis(1),
+            convergence_timeout: Duration::from_secs(2),
+            convergence_attempts: 4,
+            staleness_ceiling: Duration::from_mins(1),
+            lag_threshold: 0,
+        };
+        let (mut publisher, slot) =
+            CompactBlockPublisher::bootstrap(config, serving_readiness, &endpoint, None).await?;
+        assert_eq!(
+            readiness.report().cause,
+            ReadinessCause::CanonicalTipUnconfirmed
+        );
+        assert!(!readiness.report().is_ready);
+
+        control.set_available(false);
+        publisher.refresh().await;
+        let during_outage = readiness.report();
+        assert!(!during_outage.is_ready);
+        assert_ne!(during_outage.cause.metric_label(), "serving_pair_stale");
+
+        control.set_available(true);
+        publisher.refresh().await;
+        assert_eq!(
+            readiness.report().cause,
+            ReadinessCause::CanonicalTipUnconfirmed
+        );
+
+        control.set_writer_status(lifecycle_writer_status(&primary));
+        publisher.refresh().await;
+        assert!(readiness.report().is_ready);
+
+        // A park, then a restarted writer that has not yet rediscovered it,
+        // keeps the remembered halt instead of the unconfirmed cause.
+        control.set_writer_status(CanonicalWriterStatusResponse {
+            reorg_window_exceeded: Some(zinder_proto::v1::ops::ReorgWindowExceededDetail {
+                depth: 1_001,
+                configured: 1_000,
+                covered: Some(1_000),
+            }),
+            tip_unconfirmed: true,
+            ..lifecycle_writer_status(&primary)
+        });
+        publisher.refresh().await;
+        control.set_writer_status(unconfirmed_status);
+        publisher.refresh().await;
+        assert!(matches!(
+            readiness.report().cause,
+            ReadinessCause::ReorgWindowExceeded { .. }
+        ));
+        control.set_writer_status(lifecycle_writer_status(&primary));
+        publisher.refresh().await;
+        assert!(readiness.report().is_ready);
+
+        drop(slot);
+        drop(publisher);
+        let _ = shutdown_sender.send(());
+        server.await??;
+        Ok(())
+    }
+
     /// Compact serving refuses a parked writer with its halt.
     ///
     /// A parked writer keeps attesting its frozen fence, so the halt must come
