@@ -223,6 +223,14 @@ operators would still need to raise it as observed reorgs grow.
   `canonical_tip_unconfirmed` until the writer's first source observation
   confirms its tip, usually one poll after it opens the store. While the node
   is unreachable, they stay unready.
+- The flag protects readers only once they reach the restarted writer. A
+  reader whose last status before the restart was a confirmed exact
+  attestation keeps that attestation while every writer-status call fails,
+  for example before the control server binds or while calls time out
+  because the follow loop serves commands only between iterations and fork
+  discovery is running. It then reports `serving_pair_stale` and admits
+  traffic until the staleness ceiling (300 seconds by default) after its last
+  pre-restart attestation, the same grace it gives any writer outage.
 
 - The settled tip trails the visible tip by up to 1000 blocks. Surfaces that
   report finality from the settled tip report it later than before.
