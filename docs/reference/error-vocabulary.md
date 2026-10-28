@@ -76,7 +76,7 @@ The request shape is valid but the deployment is in a state that cannot serve it
 | `CHAIN_EPOCH_PIN_UNAVAILABLE` | Pinned chain epoch is no longer retained | `subject=chain_epoch:<id>` |
 | `SCHEMA_MISMATCH` | Persistent store schema is incompatible with the running binary | — |
 | `SCHEMA_TOO_NEW` | Store was opened by a newer Zinder; rolling back is unsafe | — |
-| `REORG_WINDOW_EXCEEDED` | A reorg crossed the configured reorg window and the canonical writer is parked until an operator reconciles it. Native query and lightwalletd compatibility return it on new requests, and native query also as the final item of open `ChainEvents` streams | `readiness_cause=reorg_window_exceeded, replacement_depth_blocks=<blocks>, reorg_window_blocks=<blocks>, covered_depth_blocks=<blocks>` |
+| `REORG_WINDOW_EXCEEDED` | A reorg crossed the configured reorg window and the canonical writer is parked until an operator reconciles it. Native query and lightwalletd compatibility return it on new requests, and native query also as the final item of open `ChainEvents` and `MempoolEvents` streams | `readiness_cause=reorg_window_exceeded, replacement_depth_blocks=<blocks>, reorg_window_blocks=<blocks>, covered_depth_blocks=<blocks>` |
 | `CHAIN_EPOCH_CONFLICT` | Detected chain-epoch contention between writer and reader | — |
 | `CHAIN_EPOCH_NETWORK_MISMATCH` | Store opened against the wrong `network` | — |
 | `MATERIALIZED_VIEW_UNAVAILABLE` | A required wallet projection or explorer materialized view is not configured for this deployment | `type=MATERIALIZED_VIEW_UNAVAILABLE, subject=<capability>` |

@@ -499,6 +499,9 @@ where
             }
             Err(CanonicalFollowError::ReorgWindowExceeded(evidence)) => {
                 follower.readiness.park(evidence.parked_readiness());
+                if let Some(mempool_ready_gate) = follower.config.mempool_ready_gate.as_ref() {
+                    mempool_ready_gate.halt_owner(evidence.halt());
+                }
                 if let Some(control_commands) = control_commands.as_mut() {
                     serve_parked_writer(
                         &mut store,
