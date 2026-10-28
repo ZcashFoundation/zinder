@@ -76,8 +76,7 @@ fn typed_detail_for(error: &QueryError) -> ErrorDetails {
         | QueryError::MaterializedViewUnavailable { .. }
         | QueryError::EndpointCapabilityUnavailable { .. }
         | QueryError::ChainEventCursorExpired { .. }
-        | QueryError::ChainEpochPinUnavailable { .. }
-        | QueryError::CanonicalHistoryUnavailable { .. } => precondition_failure_details(error),
+        | QueryError::ChainEpochPinUnavailable { .. } => precondition_failure_details(error),
         QueryError::ArtifactUnavailable { family, key } => ErrorDetails::with_resource_info(
             family.wire_label(),
             key.to_string(),
