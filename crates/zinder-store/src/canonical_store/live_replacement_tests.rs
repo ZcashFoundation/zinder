@@ -1317,6 +1317,74 @@ fn incremental_replay_tails_match_a_complete_derivation_across_appends_and_repla
 }
 
 #[test]
+fn secondary_lagging_beyond_one_window_matches_a_complete_derivation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let window = 3;
+    let mut store = published_store(
+        &store_path,
+        window,
+        BlockHeight::new(4),
+        BlockHeight::new(2),
+    )?;
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let mut secondary = RocksDbCanonicalSecondary::open_ready(
+        &store_path,
+        temporary.path().join("secondary"),
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(window)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+
+    // The visible tip advances by more than one window while the secondary
+    // is idle, so it re-derives its whole unsettled suffix.
+    for height in 5_u8..=8 {
+        let settled = height - 3;
+        let fence = store.event_fence();
+        let (next, _) = store.commit_live_append(
+            CanonicalLiveAppend::new(
+                fence,
+                replacement_block(
+                    BlockHeight::new(u32::from(height)),
+                    [height; 32],
+                    [height - 1; 32],
+                    100 + height,
+                )?,
+                Vec::new(),
+                BlockId::new(
+                    BlockHeight::new(u32::from(settled)),
+                    BlockHash::from_bytes([settled; 32]),
+                ),
+                UnixTimestampMillis::new(1_750_000_000_000 + u64::from(height)),
+            ),
+            &activations,
+        )?;
+        store = next;
+    }
+
+    secondary.try_catch_up()?;
+    assert_eq!(secondary.event_fence(), store.event_fence());
+    let complete = super::replay_tail::AuthenticatedReplayTail::authenticate(
+        &store.bounded_open.db,
+        store.ready_evidence().sequence_checkpoint,
+        store.ready_evidence().visible_tip.height,
+        window,
+    )?
+    .checkpoints();
+    assert_eq!(secondary.replay_tail.checkpoints(), complete);
+    assert_eq!(
+        complete
+            .last()
+            .map(|checkpoint| checkpoint.through().height),
+        Some(BlockHeight::new(8))
+    );
+    Ok(())
+}
+
+#[test]
 fn writer_detects_an_unannounced_replay_row_change_before_it_settles()
 -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;

@@ -936,7 +936,12 @@ pub(super) fn follow_ready_replay_tail(
     ready_evidence: &CanonicalStoreReadyEvidence,
     replay_tail: &mut AuthenticatedReplayTail,
 ) -> Result<(), CanonicalStoreError> {
-    if let Some(retained_height) = lowest_retained_height_since(db, previous, ready_evidence)? {
+    if let Some(retained_height) = lowest_retained_height_since(
+        db,
+        reorg_policy.reorg_window_blocks(),
+        previous,
+        ready_evidence,
+    )? {
         let mut followed = replay_tail.clone();
         if advance_ready_replay_tail(
             db,
@@ -957,11 +962,24 @@ pub(super) fn follow_ready_replay_tail(
 
 /// Returns the highest height every chain event after `previous` left
 /// unchanged, or `None` when an intervening event is unavailable.
+///
+/// The incremental path re-derives at least every block the visible tip
+/// advanced, so it cannot succeed once the tip advanced by more than one
+/// reorg window; that case returns `None` before reading the events between.
 fn lowest_retained_height_since(
     db: &DB,
+    reorg_window_blocks: u32,
     previous: &CanonicalStoreReadyEvidence,
     ready_evidence: &CanonicalStoreReadyEvidence,
 ) -> Result<Option<BlockHeight>, CanonicalStoreError> {
+    let tip_advance = ready_evidence
+        .visible_tip
+        .height
+        .value()
+        .saturating_sub(previous.visible_tip.height.value());
+    if tip_advance > reorg_window_blocks {
+        return Ok(None);
+    }
     let first_sequence = previous.visible_event_sequence.saturating_add(1);
     let retention_floor = super::event_lifecycle::canonical_event_retention_floor_from_db(
         db,
