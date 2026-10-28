@@ -94,13 +94,22 @@ impl TransactionAbsence {
     /// status, including every other `NOT_FOUND`. Returns an error when the
     /// status claims the reason but its metadata is missing or malformed.
     pub fn from_status(status: &Status) -> Result<Option<Self>, TransactionLookupMetadataError> {
-        let Some(metadata) = zinder_metadata_for(status, ErrorReason::TransactionNotFound) else {
+        Self::from_error_details(status.code(), &status.get_error_details())
+    }
+
+    /// Decodes a `TRANSACTION_NOT_FOUND` status from its already-decoded
+    /// `code` and `details`, for callers that also inspect the details.
+    ///
+    /// Behaves as [`Self::from_status`].
+    pub fn from_error_details(
+        code: Code,
+        details: &ErrorDetails,
+    ) -> Result<Option<Self>, TransactionLookupMetadataError> {
+        let Some(metadata) = zinder_metadata_for(details, ErrorReason::TransactionNotFound) else {
             return Ok(None);
         };
-        if status.code() != Code::NotFound {
-            return Err(TransactionLookupMetadataError::UnexpectedCode {
-                code: status.code(),
-            });
+        if code != Code::NotFound {
+            return Err(TransactionLookupMetadataError::UnexpectedCode { code });
         }
         let chain_epoch_id = parse_metadata(&metadata, TRANSACTION_ABSENCE_CHAIN_EPOCH_ID_KEY)?;
         let first_covered_height =
@@ -143,8 +152,10 @@ pub fn canonical_history_unavailable_status(
 pub fn canonical_history_first_available_height(
     status: &Status,
 ) -> Result<Option<BlockHeight>, TransactionLookupMetadataError> {
-    let Some(metadata) = zinder_metadata_for(status, ErrorReason::CanonicalHistoryUnavailable)
-    else {
+    let Some(metadata) = zinder_metadata_for(
+        &status.get_error_details(),
+        ErrorReason::CanonicalHistoryUnavailable,
+    ) else {
         return Ok(None);
     };
     parse_metadata(&metadata, CANONICAL_HISTORY_FIRST_AVAILABLE_HEIGHT_KEY)
@@ -175,9 +186,11 @@ pub enum TransactionLookupMetadataError {
     },
 }
 
-fn zinder_metadata_for(status: &Status, reason: ErrorReason) -> Option<HashMap<String, String>> {
-    status
-        .get_error_details()
+fn zinder_metadata_for(
+    details: &ErrorDetails,
+    reason: ErrorReason,
+) -> Option<HashMap<String, String>> {
+    details
         .error_info()
         .filter(|error_info| {
             error_info.domain == ZINDER_ERROR_DOMAIN && error_info.reason == reason.as_str_name()

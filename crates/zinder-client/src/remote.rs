@@ -12,7 +12,7 @@ use tonic::{
     Request,
     transport::{Channel, Endpoint},
 };
-use tonic_types::StatusExt as _;
+use tonic_types::{ErrorDetails, StatusExt as _};
 use tracing::warn;
 use zinder_core::wire::{
     decode_rpc_block_hash_hex, decode_rpc_merkle_root_hex, decode_rpc_transaction_id_hex,
@@ -186,11 +186,12 @@ impl RemoteChainIndex {
         status: tonic::Status,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TxStatus, IndexerError> {
-        match TransactionAbsence::from_status(&status) {
+        let details = status.get_error_details();
+        match TransactionAbsence::from_error_details(status.code(), &details) {
             Ok(Some(absence)) => {
                 verify_transaction_absence(absence, at_epoch_id).map(|()| TxStatus::NotFound)
             }
-            Ok(None) if is_unverified_transaction_absence(&status) => {
+            Ok(None) if is_unverified_transaction_absence(status.code(), &details) => {
                 Err(IndexerError::TransactionAbsenceUnverified {
                     message: status.message().to_owned(),
                 })
@@ -2386,11 +2387,10 @@ fn verify_transaction_absence(
 /// Returns whether `status` is a `NOT_FOUND` that a server below contract
 /// revision 6 used for every transaction miss, which cannot be told apart
 /// from a storage or history failure.
-fn is_unverified_transaction_absence(status: &tonic::Status) -> bool {
-    if status.code() != tonic::Code::NotFound {
+fn is_unverified_transaction_absence(code: tonic::Code, details: &ErrorDetails) -> bool {
+    if code != tonic::Code::NotFound {
         return false;
     }
-    let details = status.get_error_details();
     details
         .error_info()
         .filter(|error_info| error_info.domain == ZINDER_ERROR_DOMAIN)
@@ -2759,7 +2759,6 @@ mod tests {
     use super::*;
     use crate::{ErrorReason, IndexerError};
     use tonic::{Code, Status};
-    use tonic_types::ErrorDetails;
 
     const EXPECTED_NETWORK: Network = Network::ZcashRegtest;
     const MISMATCHED_NETWORK: Network = Network::ZcashMainnet;
