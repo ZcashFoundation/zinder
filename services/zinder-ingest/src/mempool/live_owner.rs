@@ -62,8 +62,8 @@ struct StagedMempoolGeneration {
     index: MempoolIndex,
     terminal_events: HashMap<TransactionId, (MempoolEvent, UnixTimestampMillis)>,
     next_synthetic_sequence: u64,
-    /// Blocks staged `Mined` transitions reported. One that is not in the
-    /// snapshot's chain means the source already moved past the snapshot tip.
+    /// Blocks staged `Mined` transitions reported. Any block but the
+    /// snapshot's tip means the source's chain moved away from that tip.
     mined_blocks: HashSet<BlockId>,
 }
 
@@ -83,11 +83,11 @@ impl StagedMempoolGeneration {
         }
     }
 
-    fn mined_block_beyond(&self, source_tip: BlockId) -> Option<BlockId> {
+    fn mined_block_off_tip(&self, source_tip: BlockId) -> Option<BlockId> {
         self.mined_blocks
             .iter()
             .copied()
-            .find(|mined_block| is_beyond_source_tip(*mined_block, source_tip))
+            .find(|mined_block| is_off_source_tip(*mined_block, source_tip))
     }
 
     fn next_position(
@@ -120,17 +120,17 @@ pub(crate) enum SourceTransitionOutcome {
     },
 }
 
-/// Returns whether a mined block can be outside the chain ending at
-/// `source_tip`: above it, or at its height on another branch.
+/// Returns whether a mined block is anything other than the source tip block.
 ///
-/// A block below the tip on the tip's own branch is already in the canonical
-/// chain at that tip. A block below the tip on another branch implies a reorg
-/// to a branch no higher than the tip, which this check cannot see without a
-/// canonical lookup; the tip notification for that reorg still ends the
-/// generation.
-fn is_beyond_source_tip(mined_block: BlockId, source_tip: BlockId) -> bool {
-    mined_block.height > source_tip.height
-        || (mined_block.height == source_tip.height && mined_block.hash != source_tip.hash)
+/// A generation opens a fresh change stream at its tip, so its only expected
+/// `Mined` changes are for the tip block itself. A block above the tip, or at
+/// its height on another branch, means the tip moved before its notification
+/// arrived. A block below the tip means a reorg to a branch no higher than the
+/// tip, whose transactions the tip's canonical chain may lack. Either way the
+/// transaction could be missing from both views, so only the tip block is
+/// applied as a removal.
+fn is_off_source_tip(mined_block: BlockId, source_tip: BlockId) -> bool {
+    mined_block != source_tip
 }
 
 /// Returns the block a `Mined` transition reports.
@@ -399,10 +399,12 @@ impl LiveMempoolOwner {
     ///
     /// A serving generation answers "not in the mempool" for its source tip.
     /// Zebra's mempool changes and tip notifications have no shared order, so
-    /// a `Mined` transition for a block outside the tip's chain (above it, or
-    /// at its height on another branch) can arrive before the tip change. Removing the transaction then would leave it in neither the
-    /// canonical chain at the tip nor the mempool, so the transition ends the
-    /// generation instead, exactly as a tip change does.
+    /// a `Mined` transition for a block other than the tip (the next block, or
+    /// a block on a reorged branch) can arrive before the tip change. Removing
+    /// the transaction then could leave it in neither the canonical chain at
+    /// the tip nor the mempool, so such a transition ends the generation
+    /// instead, exactly as a tip change does. Only a `Mined` transition for
+    /// the tip block itself removes the entry.
     pub(crate) async fn apply_event(
         &self,
         canonical: &CanonicalControlHandle,
@@ -417,7 +419,7 @@ impl LiveMempoolOwner {
                 .map(SourceTransitionOutcome::Indexed),
             MempoolOwnerStatus::Serving { source_tip, .. } => {
                 if let Some(observed_source_tip) = mined_block(&event)
-                    .filter(|mined_block| is_beyond_source_tip(*mined_block, source_tip))
+                    .filter(|mined_block| is_off_source_tip(*mined_block, source_tip))
                 {
                     self.begin_hydration_locked();
                     return Ok(SourceTransitionOutcome::GenerationOutran {
@@ -651,15 +653,15 @@ impl LiveMempoolOwner {
                 "mempool source emitted an unexpected snapshot-complete marker",
             ));
         }
-        // A staged `Mined` transition above the snapshot's tip means the
-        // snapshot no longer describes that tip; certifying it would hide the
-        // transaction from both the canonical chain and the mempool.
-        let mined_block_beyond = self
+        // A staged `Mined` transition for any block but the snapshot's tip
+        // means the snapshot no longer describes that tip; certifying it could
+        // hide the transaction from both the canonical chain and the mempool.
+        let mined_block_off_tip = self
             .staged_generation
             .lock()
             .as_ref()
-            .and_then(|staged_generation| staged_generation.mined_block_beyond(source_tip));
-        if let Some(observed_source_tip) = mined_block_beyond {
+            .and_then(|staged_generation| staged_generation.mined_block_off_tip(source_tip));
+        if let Some(observed_source_tip) = mined_block_off_tip {
             self.begin_hydration_locked();
             return Ok(SnapshotCertification::GenerationOutran {
                 generation_source_tip: source_tip,
@@ -2071,6 +2073,81 @@ mod tests {
             );
             harness.shutdown().await;
         }
+        Ok(())
+    }
+
+    /// A reorg to a branch no higher than the tip can report a `Mined` change
+    /// for a block below the tip that the tip's canonical chain lacks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mined_transition_below_the_serving_tip_on_a_reorged_branch_ends_the_generation()
+    -> Result<(), Box<dyn Error>> {
+        let source_tip = fixture_tip(2);
+        let reorged_block = zinder_core::BlockId::new(
+            zinder_core::BlockHeight::new(1),
+            zinder_core::BlockHash::from_bytes([0xEE; 32]),
+        );
+        let mut harness = ServingOwnerHarness::start(source_tip).await?;
+        let transaction_id = harness.serve_one_entry(0xCA).await?;
+
+        harness.source_control.push_mined(
+            transaction_id,
+            reorged_block.height,
+            reorged_block.hash,
+        )?;
+        let outcome = harness.finish().await?;
+
+        assert_eq!(outcome, MempoolOwnerLoopOutcome::Rehydrate);
+        assert!(!harness.owner.is_serving());
+        let chain_epoch = harness.chain_epoch().await?;
+        let point_read = harness.owner.entry_for(chain_epoch, transaction_id).await;
+        assert_eq!(
+            point_read.err().map(|status| status.code()),
+            Some(Code::Unavailable),
+            "a reorged-branch Mined change must not leave a coherent mempool miss"
+        );
+        assert_eq!(durable_event_count(&harness.canonical).await?, 1);
+        harness.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mined_transition_below_the_snapshot_tip_blocks_certification()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let MutableEpochCanonicalControl {
+            canonical,
+            canonical_epoch,
+            command_task,
+        } = mutable_epoch_canonical_control(store)?;
+        let (source, source_control) = MockMempoolSource::streaming();
+        let event_stream = source.events().await?;
+        let owner = LiveMempoolOwner::default();
+        let (ready_signal, ready_gate) = mempool_ready_channel();
+        let cancel = CancellationToken::new();
+        let source_tip = fixture_tip(2);
+        set_canonical_visible_tip(&canonical_epoch, source_tip);
+        let entry = source_entry(0xCB)?;
+        let transaction_id = entry.transaction_id;
+        source_control.push_added(entry)?;
+        source_control.push_mined(
+            transaction_id,
+            zinder_core::BlockHeight::new(1),
+            zinder_core::BlockHash::from_bytes([0xEE; 32]),
+        )?;
+        source_control.complete_initial_snapshot(source_tip)?;
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(500),
+            consume_source_events(event_stream, &canonical, &owner, &ready_signal, &cancel),
+        )
+        .await?;
+
+        assert_eq!(outcome, MempoolOwnerLoopOutcome::Rehydrate);
+        assert!(!owner.is_serving());
+        assert_eq!(ready_gate.certified_source_tip(), None);
+        command_task.abort();
+        let _join_result = command_task.await;
         Ok(())
     }
 
