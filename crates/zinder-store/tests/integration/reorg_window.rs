@@ -668,6 +668,22 @@ fn transaction_lookup_ignores_reverted_branch_artifacts() -> eyre::Result<()> {
         replacement_reader.transaction_facts_by_id(transaction_id)?,
         None
     );
+    // Complete history makes the reorged-out transaction a proven absence at
+    // the replacement epoch, while the initial epoch still holds it.
+    assert_eq!(
+        replacement_reader.transaction_facts_or_proven_absence(transaction_id)?,
+        None
+    );
+    assert!(
+        initial_reader
+            .transaction_facts_or_proven_absence(transaction_id)?
+            .is_some()
+    );
+    assert_eq!(
+        replacement_reader
+            .transaction_facts_or_proven_absence(TransactionId::from_bytes([0x44; 32]))?,
+        None
+    );
 
     Ok(())
 }
