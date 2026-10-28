@@ -2029,6 +2029,8 @@ mod tests {
         Ok(())
     }
 
+    /// A `Mined` change outside the serving tip's chain ends the generation.
+    ///
     /// Zebra's mempool changes and tip notifications have no shared order, so
     /// a `Mined` change for the next block can reach a serving generation
     /// before its tip change. Removing the transaction then would leave it in
@@ -2055,10 +2057,8 @@ mod tests {
             assert_eq!(outcome, MempoolOwnerLoopOutcome::Rehydrate);
             assert!(!harness.owner.is_serving());
             assert_eq!(harness.ready_gate.certified_source_tip(), None);
-            let point_read = harness
-                .owner
-                .entry_for(harness.chain_epoch().await?, transaction_id)
-                .await;
+            let chain_epoch = harness.chain_epoch().await?;
+            let point_read = harness.owner.entry_for(chain_epoch, transaction_id).await;
             assert_eq!(
                 point_read.err().map(|status| status.code()),
                 Some(Code::Unavailable),
@@ -2087,10 +2087,11 @@ mod tests {
         wait_until(|| !owner.index.is_in_mempool(transaction_id)).await?;
 
         assert!(harness.owner.is_serving());
+        let chain_epoch = harness.chain_epoch().await?;
         assert!(
             harness
                 .owner
-                .entry_for(harness.chain_epoch().await?, transaction_id)
+                .entry_for(chain_epoch, transaction_id)
                 .await?
                 .is_none()
         );
@@ -2196,7 +2197,7 @@ mod tests {
         }
 
         async fn serve_one_entry(
-            &mut self,
+            &self,
             transaction_tag: u8,
         ) -> Result<TransactionId, Box<dyn Error>> {
             let entry = source_entry(transaction_tag)?;
@@ -2204,9 +2205,10 @@ mod tests {
             self.source_control.push_added(entry)?;
             let owner = self.owner.clone();
             wait_until(|| owner.index.is_in_mempool(transaction_id)).await?;
+            let chain_epoch = self.chain_epoch().await?;
             assert!(
                 self.owner
-                    .entry_for(self.chain_epoch().await?, transaction_id)
+                    .entry_for(chain_epoch, transaction_id)
                     .await?
                     .is_some()
             );

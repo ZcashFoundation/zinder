@@ -1260,12 +1260,26 @@ mod tests {
 
         // The query plane reads the same epoch id and still must not answer an
         // absence.
+        let query_status = unpinned_query_lookup(&fixture, chain_epoch.id, transaction_id).await?;
+        assert_eq!(query_status.code(), Code::Unavailable);
+        assert_eq!(TransactionAbsence::from_status(&query_status)?, None);
+        fixture.shutdown().await
+    }
+
+    /// Looks a transaction up, unpinned, through a query adapter whose
+    /// canonical epoch id is `chain_epoch_id` and whose mempool view is the
+    /// fixture's ingest control, returning the failure status.
+    async fn unpinned_query_lookup(
+        fixture: &SharedControlFixture,
+        chain_epoch_id: ChainEpochId,
+        transaction_id: TransactionId,
+    ) -> Result<tonic::Status, Box<dyn std::error::Error>> {
         let query_store = StoreFixture::with_chain_committed(
             &ChainFixture::new(zinder_core::Network::ZcashRegtest).extend_blocks(1),
-            chain_epoch.id,
+            chain_epoch_id,
         )?;
         let (proxy_endpoint, proxy_cancel, proxy_task) =
-            spawn_unauthenticated_ingest_control(&fixture).await?;
+            spawn_unauthenticated_ingest_control(fixture).await?;
         let query_adapter = WalletQueryGrpcAdapter::with_ingest_control_proxy(
             WalletQuery::new(
                 query_store.chain_store().clone(),
@@ -1275,22 +1289,19 @@ mod tests {
             WalletEndpointMetadata::default(),
             proxy_endpoint,
         );
-        let query_status = WalletQueryService::transaction(
+        let lookup = WalletQueryService::transaction(
             &query_adapter,
             Request::new(TransactionRequest {
                 transaction_id: encode_rpc_transaction_id_hex(transaction_id),
                 at_epoch_id: None,
             }),
         )
-        .await
-        .err()
-        .ok_or("the query adapter must not locate an outrun transaction")?;
-        assert_eq!(query_status.code(), Code::Unavailable);
-        assert_eq!(TransactionAbsence::from_status(&query_status)?, None);
-
+        .await;
         proxy_cancel.cancel();
         proxy_task.await??;
-        fixture.shutdown().await
+        lookup
+            .err()
+            .ok_or_else(|| "the query adapter must not locate an outrun transaction".into())
     }
 
     async fn spawn_unauthenticated_ingest_control(

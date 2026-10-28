@@ -123,9 +123,10 @@ async fn compact_block_range_is_capped_before_any_canonical_read() -> eyre::Resu
     Ok(())
 }
 
+/// A serving lookup refuses to call a miss below a history floor an absence.
+///
 /// Wallet-serving admission requires complete history, so a serving pair never
-/// starts after a checkpoint in production. The serving lookup still refuses
-/// to call a miss an absence when its canonical reader reports a floor.
+/// starts after a checkpoint in production; the check is defense in depth.
 #[tokio::test]
 async fn serving_transaction_miss_below_a_history_floor_is_not_an_absence() -> eyre::Result<()> {
     let activations = Arc::new(sample_regtest_upgrade_activations());
