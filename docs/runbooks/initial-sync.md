@@ -135,12 +135,17 @@ fence, and wallet digest.
 | ingest | `starting` or `syncing` | Canonical lag is within threshold and mempool snapshot is complete |
 | projector | `starting` or `syncing` | Wallet store is published and following the admitted canonical source |
 | native query | `starting`, `replica_lagging`, `writer_status_unavailable`, or `ingest_control_unavailable` | One exact canonical and wallet pair is published, the admitted node is healthy, and `WriterStatus` plus a bounded mempool snapshot succeed through the admitted ingest-control channel |
-| compatibility | `starting`, `replica_lagging`, or `writer_status_unavailable` | One exact canonical and wallet pair is published |
+| compatibility | `starting`, `replica_lagging`, or `writer_status_unavailable` | One exact canonical and wallet pair (or, for compact-block serving, one canonical reader) is published and the writer does not report a park |
 
 After the first publication, a reader that loses writer status or falls behind
 reports `serving_pair_stale` and keeps answering from its published pair until
 the staleness ceiling passes; only then does it fall back to
 `writer_status_unavailable` or `replica_lagging` and stop admitting traffic.
+
+A parked canonical writer keeps answering writer status with its frozen fence
+and its halt. Native query and both compatibility serving modes then report
+`reorg_window_exceeded` and refuse wallet traffic with
+`REORG_WINDOW_EXCEEDED`, never `ready` on the frozen tip.
 
 `node_unavailable`, `upstream_not_ready`, and
 `ingest_control_unavailable` are recoverable dependency conditions. For native

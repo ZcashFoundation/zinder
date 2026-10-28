@@ -32,6 +32,7 @@ use zinder_proto::v1::ingest::{
     ReleaseCanonicalProjectionBuildLeaseResponse, RenewCanonicalProjectionBuildLeaseRequest,
     canonical_control_server::{CanonicalControl, CanonicalControlServer},
 };
+use zinder_proto::v1::ops;
 use zinder_runtime::{BearerToken, BearerTokenServerInterceptor};
 use zinder_store::{
     CanonicalEventCursor, CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalEventKind,
@@ -748,6 +749,66 @@ pub(crate) fn apply_canonical_control_command(
     scheduling
 }
 
+/// Typed halt a canonical writer parked on a reorg deeper than its window
+/// reports through its control plane until termination.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ParkedWriterHalt {
+    detail: ops::ReorgWindowExceededDetail,
+}
+
+impl ParkedWriterHalt {
+    pub(crate) const fn new(depth: u64, configured: u64, covered: Option<u64>) -> Self {
+        Self {
+            detail: ops::ReorgWindowExceededDetail {
+                depth,
+                configured,
+                covered,
+            },
+        }
+    }
+}
+
+/// Services one command for a writer parked on a reorg deeper than its window.
+///
+/// Readers still need the frozen fence, retained events, retention leases, and
+/// owner checkpoints, so those commands are served as before. `WriterStatus`
+/// additionally carries the halt so canonical-status readers refuse traffic
+/// instead of reporting ready on the frozen fence.
+pub(crate) fn apply_parked_canonical_control_command(
+    store: &mut RocksDbCanonicalStore,
+    command: CanonicalControlCommand,
+    halt: ParkedWriterHalt,
+) {
+    match command {
+        CanonicalControlCommand::WriterStatus { reply } => {
+            send_control_response(
+                reply,
+                writer_status_response(store).map(|mut status| {
+                    status.reorg_window_exceeded = Some(halt.detail);
+                    status
+                }),
+            );
+        }
+        command @ (CanonicalControlCommand::ChainEpoch { .. }
+        | CanonicalControlCommand::IngestEventPage { .. }
+        | CanonicalControlCommand::AppendMempoolEvent { .. }
+        | CanonicalControlCommand::AppendMempoolEvents { .. }
+        | CanonicalControlCommand::MempoolEventPage { .. }
+        | CanonicalControlCommand::ResolveMempoolEventStart { .. }
+        | CanonicalControlCommand::BeginMempoolSnapshot { .. }
+        | CanonicalControlCommand::EncodeMempoolSnapshotNextCursor { .. }
+        | CanonicalControlCommand::PruneMempoolEvents { .. }
+        | CanonicalControlCommand::EventPage { .. }
+        | CanonicalControlCommand::CreateOwnerCheckpoint { .. }
+        | CanonicalControlCommand::OwnerCheckpointReadmission { .. }
+        | CanonicalControlCommand::AcquireLease { .. }
+        | CanonicalControlCommand::RenewLease { .. }
+        | CanonicalControlCommand::ReleaseLease { .. }) => {
+            let _scheduling = apply_canonical_control_command(store, command);
+        }
+    }
+}
+
 fn read_ingest_event_page(
     store: &RocksDbCanonicalStore,
     from_cursor: Option<&[u8]>,
@@ -1087,6 +1148,7 @@ fn writer_status_response(
         network_upgrade_schedule: store
             .network_upgrade_schedule()
             .map(network_upgrade_schedule_message),
+        reorg_window_exceeded: None,
     })
 }
 

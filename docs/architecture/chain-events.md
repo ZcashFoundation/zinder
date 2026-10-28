@@ -63,7 +63,7 @@ Do not publish source observations as `ChainEvent`. Do not publish `ChainEvent` 
 
 The replacement range must start at the first height where the old visible branch and the new selected branch differ. It must not replace data at or below the settled tip. If the replacement starts below the supported window or below the settled-tip boundary, `zinder-ingest` returns `ReorgWindowExceeded`, fails readiness with `reorg_window_exceeded`, and requires operator action.
 
-A parked writer keeps its control listener open and reports the halt through `IngestControl.WriterStatus.reorg_window_exceeded`. Native query then refuses new requests with `REORG_WINDOW_EXCEEDED` and ends every open `WalletQuery.ChainEvents` stream with the same status, so a consumer sees a typed halt instead of a stream that stops advancing. The default window matches the node's finalization bound, so a park signals a change the node itself could not produce. See [ADR-0041](../adrs/0041-reorg-window-follows-the-node-bound.md).
+A parked writer keeps its control listener open and reports the halt through `IngestControl.WriterStatus.reorg_window_exceeded` and `CanonicalControl.WriterStatus.reorg_window_exceeded`. Native query and lightwalletd compatibility then refuse new requests with `REORG_WINDOW_EXCEEDED`, and native query ends every open `WalletQuery.ChainEvents` stream with the same status, so a consumer sees a typed halt instead of a stream that stops advancing. The default window matches the node's finalization bound, so a park signals a change the node itself could not produce. See [ADR-0041](../adrs/0041-reorg-window-follows-the-node-bound.md).
 
 Reject the name `ReorgTooDeep`. It describes a symptom. `ReorgWindowExceeded` names the configured boundary that was violated.
 

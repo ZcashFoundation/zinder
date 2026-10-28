@@ -706,7 +706,14 @@ async fn parked_follower_serves_its_frozen_fence_until_termination()
         observe_parked,
     );
 
-    let frozen_fence = snapshot?
+    let snapshot = snapshot?;
+    // Canonical-status readers attest the frozen fence, so the halt must ride
+    // on the same response or they would report ready on a stopped chain.
+    let halt = snapshot
+        .reorg_window_exceeded
+        .ok_or("a parked writer must report its halt with its writer status")?;
+    assert_eq!((halt.depth, halt.configured), (3, 2));
+    let frozen_fence = snapshot
         .fence
         .ok_or("a parked writer must report its frozen fence")?;
     assert_eq!(

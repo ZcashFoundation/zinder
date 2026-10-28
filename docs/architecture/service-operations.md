@@ -98,8 +98,11 @@ ingest-control input. A `WriterStatus` that reports a parked writer instead
 drains readiness with `reorg_window_exceeded`, which takes precedence over the
 serving-pair failures it causes. New native requests then fail with
 `REORG_WINDOW_EXCEEDED`, and open `ChainEvents` streams end with the same
-status. The health probe intentionally shares the configured
-serving-pair refresh cadence because both observe the same control plane.
+status. The serving-pair publisher reads the same halt from
+`CanonicalControl.WriterStatus`, which is how lightwalletd compatibility,
+which has no ingest-control probe, refuses traffic in both serving modes. The
+health probe intentionally shares the configured serving-pair refresh cadence
+because both observe the same control plane.
 
 The node probe exercises `tip_id` and upstream synchronization health through
 the same shared source handle installed in the query. It does not repeat

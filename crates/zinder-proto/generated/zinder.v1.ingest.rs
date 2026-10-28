@@ -100,6 +100,15 @@ pub struct CanonicalWriterStatusResponse {
     pub network_upgrade_schedule: ::core::option::Option<
         CanonicalNetworkUpgradeSchedule,
     >,
+    /// Set while the canonical writer is parked because a replacement crossed
+    /// its reorg window. `fence` is then the frozen fence the parked writer
+    /// still serves, so readers stay converged, but they must refuse wallet
+    /// traffic with the typed halt instead of reporting ready. Absent from
+    /// writers that predate this field. ADR-0041.
+    #[prost(message, optional, tag = "5")]
+    pub reorg_window_exceeded: ::core::option::Option<
+        super::ops::ReorgWindowExceededDetail,
+    >,
 }
 /// One node-advertised network-upgrade activation in an admitted schedule.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

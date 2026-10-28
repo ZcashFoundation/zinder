@@ -607,15 +607,7 @@ where
         Err(zinder_ingest::CanonicalWriterError::Follow(
             zinder_ingest::CanonicalFollowError::ReorgWindowExceeded(evidence),
         )) => {
-            readiness.park(
-                ReadinessState::reorg_window_exceeded(
-                    u64::from(evidence.required_depth),
-                    u64::from(evidence.configured_window_blocks),
-                    Some(u64::from(evidence.covered_depth_blocks)),
-                    Some(evidence.local_tip.height.value()),
-                )
-                .with_phase(zinder_runtime::IngestPhase::FollowingTip),
-            );
+            readiness.park(evidence.parked_readiness());
             tracing::warn!(
                 target: "zinder::ingest",
                 event = "canonical_writer_reorg_window_exceeded",
