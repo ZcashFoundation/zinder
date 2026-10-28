@@ -12,11 +12,18 @@
 //! generated `zinder_proto::v1::*` enums.
 
 mod privacy_shape;
+mod transaction_lookup;
 mod transparent_delta_kind;
 mod utxo_set_commitment;
 mod wallet;
 
 pub use privacy_shape::{decode_privacy_shape, encode_privacy_shape};
+pub use transaction_lookup::{
+    CANONICAL_HISTORY_FIRST_AVAILABLE_HEIGHT_KEY, TRANSACTION_ABSENCE_CHAIN_EPOCH_ID_KEY,
+    TRANSACTION_ABSENCE_COVERS_MEMPOOL_KEY, TRANSACTION_ABSENCE_FIRST_COVERED_HEIGHT_KEY,
+    TRANSACTION_ABSENCE_VISIBLE_TIP_HEIGHT_KEY, TransactionAbsence, TransactionLookupMetadataError,
+    canonical_history_first_available_height, canonical_history_unavailable_status,
+};
 pub use transparent_delta_kind::{
     TRANSPARENT_DELTA_KIND_RECEIVED_BYTE, TRANSPARENT_DELTA_KIND_SPENT_BYTE,
     UnknownTransparentDeltaKindByte, decode_transparent_delta_kind,

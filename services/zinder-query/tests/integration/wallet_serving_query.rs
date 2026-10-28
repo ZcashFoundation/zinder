@@ -9,9 +9,10 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use zinder_core::{
-    BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, ChainEpoch,
-    ChainEpochId, CommitmentTreeCheckpoint, CompactBlockArtifact, Network, SubtreeRootArtifact,
-    SubtreeRootRange, TransactionBlobArtifact, TransactionId, TransactionLocation,
+    BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
+    CanonicalHistoryBounds, ChainEpoch, ChainEpochId, CommitmentTreeCheckpoint,
+    CompactBlockArtifact, Network, SubtreeRootArtifact, SubtreeRootRange, TransactionBlobArtifact,
+    TransactionId, TransactionLocation,
 };
 use zinder_query::{
     CanonicalReader, QueryError, WalletProjectionReader, WalletQueryApi, WalletServingPairSlot,
@@ -41,6 +42,7 @@ async fn wallet_serving_reads_leave_the_reactor_free() -> eyre::Result<()> {
             Arc::new(GatedCanonicalReader {
                 canonical_reader,
                 reactor_gate: Arc::clone(&reactor_gate),
+                reported_history_bounds: None,
             }) as Arc<dyn CanonicalReader>,
             Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
         )?)),
@@ -121,6 +123,53 @@ async fn compact_block_range_is_capped_before_any_canonical_read() -> eyre::Resu
     Ok(())
 }
 
+/// A serving lookup refuses to call a miss below a history floor an absence.
+///
+/// Wallet-serving admission requires complete history, so a serving pair never
+/// starts after a checkpoint in production; the check is defense in depth.
+#[tokio::test]
+async fn serving_transaction_miss_below_a_history_floor_is_not_an_absence() -> eyre::Result<()> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let mut store_fixture = WalletServingStoreFixture::from_chain(
+        &ChainFixture::new(Network::ZcashRegtest).extend_blocks(2),
+        activations.as_ref(),
+    )?;
+    let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
+    let checkpointed = CanonicalHistoryBounds::checkpointed(BlockId::new(
+        BlockHeight::new(1),
+        BlockHash::from_bytes([1; 32]),
+    ))?;
+    let query = WalletServingQuery::from_serving_pair_slot(
+        WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
+            Arc::new(GatedCanonicalReader {
+                canonical_reader,
+                reactor_gate: Arc::new(ReactorGate::default()),
+                reported_history_bounds: Some(checkpointed),
+            }) as Arc<dyn CanonicalReader>,
+            Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
+        )?)),
+        (),
+        Arc::clone(&activations),
+    );
+    let chain_epoch_id = query.visible_tip_block(None).await?.chain_epoch.id;
+
+    for at_epoch_id in [None, Some(chain_epoch_id)] {
+        let outcome = query
+            .transaction(TransactionId::from_bytes([0x5c; 32]), at_epoch_id)
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                Err(QueryError::CanonicalHistoryUnavailable {
+                    first_available_height
+                }) if first_available_height == BlockHeight::new(2)
+            ),
+            "expected the serving history floor, got {outcome:?}"
+        );
+    }
+    Ok(())
+}
+
 /// One-shot rendezvous proving a canonical read released the reactor.
 ///
 /// The gate is armed after pair admission so the validation read that
@@ -151,9 +200,12 @@ impl ReactorGate {
 }
 
 /// Canonical reader whose epoch read blocks until the reactor makes progress.
+///
+/// `reported_history_bounds` overrides the store's retained history range.
 struct GatedCanonicalReader {
     canonical_reader: zinder_store::RocksDbCanonicalSecondary,
     reactor_gate: Arc<ReactorGate>,
+    reported_history_bounds: Option<CanonicalHistoryBounds>,
 }
 
 impl CanonicalReader for GatedCanonicalReader {
@@ -163,6 +215,11 @@ impl CanonicalReader for GatedCanonicalReader {
 
     fn network(&self) -> Network {
         self.canonical_reader.network()
+    }
+
+    fn history_bounds(&self) -> CanonicalHistoryBounds {
+        self.reported_history_bounds
+            .unwrap_or_else(|| self.canonical_reader.history_bounds())
     }
 
     fn event_fence(&self) -> CanonicalEventFence {

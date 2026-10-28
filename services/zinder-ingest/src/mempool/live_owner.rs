@@ -6,7 +6,7 @@
 //! canonical control channel.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     num::NonZeroU64,
     sync::Arc,
     time::{Duration, Instant},
@@ -62,6 +62,9 @@ struct StagedMempoolGeneration {
     index: MempoolIndex,
     terminal_events: HashMap<TransactionId, (MempoolEvent, UnixTimestampMillis)>,
     next_synthetic_sequence: u64,
+    /// Blocks staged `Mined` transitions reported. Any block but the
+    /// snapshot's tip means the source's chain moved away from that tip.
+    mined_blocks: HashSet<BlockId>,
 }
 
 impl StagedMempoolGeneration {
@@ -70,7 +73,21 @@ impl StagedMempoolGeneration {
             index: MempoolIndex::new(),
             terminal_events: HashMap::new(),
             next_synthetic_sequence: 0,
+            mined_blocks: HashSet::new(),
         }
+    }
+
+    fn record_mined_block(&mut self, event: &MempoolEvent) {
+        if let Some(mined_block) = mined_block(event) {
+            self.mined_blocks.insert(mined_block);
+        }
+    }
+
+    fn mined_block_off_tip(&self, source_tip: BlockId) -> Option<BlockId> {
+        self.mined_blocks
+            .iter()
+            .copied()
+            .find(|mined_block| *mined_block != source_tip)
     }
 
     fn next_position(
@@ -86,6 +103,36 @@ impl StagedMempoolGeneration {
             transaction_id,
         })
     }
+}
+
+/// A serving generation or staged snapshot that a `Mined` transition outran.
+///
+/// A generation opens a fresh change stream at its tip, so its only expected
+/// `Mined` changes are for the tip block itself. A block above the tip, or at
+/// its height on another branch, means the tip moved before its notification
+/// arrived. A block below the tip means a reorg to a branch no higher than the
+/// tip, whose transactions the tip's canonical chain may lack. Either way the
+/// transaction could be missing from both views, so the generation ends
+/// instead of applying the removal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GenerationOutran {
+    /// Tip the ended generation was certified against.
+    generation_source_tip: BlockId,
+    /// Block the transition reported.
+    observed_source_tip: BlockId,
+}
+
+/// Returns the block a `Mined` transition reports.
+fn mined_block(event: &MempoolEvent) -> Option<BlockId> {
+    if let MempoolEvent::Mined {
+        mined_height,
+        block_hash,
+        ..
+    } = event
+    {
+        return Some(BlockId::new(*mined_height, *block_hash));
+    }
+    None
 }
 
 /// Snapshot page read under the same gate as durable event append and index mutation.
@@ -338,19 +385,41 @@ impl LiveMempoolOwner {
     /// A generation never publishes partial snapshot observations to the
     /// durable log. Its marker first reconciles the staged state with the
     /// last durable/live state while reads remain unavailable.
+    ///
+    /// A serving generation answers "not in the mempool" for its source tip.
+    /// Zebra's mempool changes and tip notifications have no shared order, so
+    /// a `Mined` transition for a block other than the tip (the next block, or
+    /// a block on a reorged branch) can arrive before the tip change. Removing
+    /// the transaction then could leave it in neither the canonical chain at
+    /// the tip nor the mempool, so such a transition ends the generation
+    /// instead, exactly as a tip change does. Only a `Mined` transition for
+    /// the tip block itself removes the entry.
     pub(crate) async fn apply_event(
         &self,
         canonical: &CanonicalControlHandle,
         event: MempoolEvent,
         observed_at: UnixTimestampMillis,
-    ) -> Result<MempoolApplyOutcome, Status> {
+    ) -> Result<Option<GenerationOutran>, Status> {
         let _mutation_guard = self.mutation_gate.lock().await;
         let state = *self.status.read();
         match state {
-            MempoolOwnerStatus::Hydrating => self.stage_event_locked(event, observed_at),
-            MempoolOwnerStatus::Serving { .. } => {
+            MempoolOwnerStatus::Hydrating => {
+                self.stage_event_locked(event, observed_at)?;
+                Ok(None)
+            }
+            MempoolOwnerStatus::Serving { source_tip, .. } => {
+                if let Some(observed_source_tip) =
+                    mined_block(&event).filter(|mined_block| *mined_block != source_tip)
+                {
+                    self.begin_hydration_locked();
+                    return Ok(Some(GenerationOutran {
+                        generation_source_tip: source_tip,
+                        observed_source_tip,
+                    }));
+                }
                 self.append_and_apply_locked(canonical, event, observed_at)
-                    .await
+                    .await?;
+                Ok(None)
             }
             MempoolOwnerStatus::RebuildRequired => Err(Status::unavailable(
                 "live mempool index is rebuilding after a durable transition mismatch",
@@ -493,6 +562,7 @@ impl LiveMempoolOwner {
                 staged_generation.terminal_events.remove(&transaction_id);
             }
             MempoolEvent::Invalidated { .. } | MempoolEvent::Mined { .. } => {
+                staged_generation.record_mined_block(&event);
                 staged_generation
                     .terminal_events
                     .insert(transaction_id, (event.clone(), observed_at));
@@ -552,12 +622,17 @@ impl LiveMempoolOwner {
 
     async fn begin_hydration(&self) {
         let _mutation_guard = self.mutation_gate.lock().await;
+        self.begin_hydration_locked();
+    }
+
+    fn begin_hydration_locked(&self) {
         *self.staged_generation.lock() = Some(StagedMempoolGeneration::new());
         self.set_status(MempoolOwnerStatus::Hydrating);
     }
 
     /// Reconciles a complete source snapshot once its tip matches canonical
     /// ingest, or keeps the snapshot private while canonical ingest catches up.
+    /// A snapshot a staged `Mined` transition outran ends without certifying.
     pub(crate) async fn try_complete_hydration(
         &self,
         canonical: &CanonicalControlHandle,
@@ -568,6 +643,21 @@ impl LiveMempoolOwner {
             return Err(Status::failed_precondition(
                 "mempool source emitted an unexpected snapshot-complete marker",
             ));
+        }
+        // A staged `Mined` transition for any block but the snapshot's tip
+        // means the snapshot no longer describes that tip; certifying it could
+        // hide the transaction from both the canonical chain and the mempool.
+        let mined_block_off_tip = self
+            .staged_generation
+            .lock()
+            .as_ref()
+            .and_then(|staged_generation| staged_generation.mined_block_off_tip(source_tip));
+        if let Some(observed_source_tip) = mined_block_off_tip {
+            self.begin_hydration_locked();
+            return Ok(SnapshotCertification::GenerationOutran(GenerationOutran {
+                generation_source_tip: source_tip,
+                observed_source_tip,
+            }));
         }
         let chain_epoch = canonical.chain_epoch().await?.chain_epoch;
         let visible_tip =
@@ -810,6 +900,9 @@ pub(crate) enum SnapshotCertification {
     PendingCanonicalTip,
     /// The snapshot was reconciled and can serve against its exact source tip.
     Certified,
+    /// A staged transition reported a block other than the snapshot's tip, so
+    /// the generation ended without certifying.
+    GenerationOutran(GenerationOutran),
 }
 
 async fn restore_durable_mempool_index(
@@ -912,6 +1005,9 @@ async fn consume_source_events(
                         pending_source_tip = None;
                         continue;
                     }
+                    Ok(SnapshotCertification::GenerationOutran(outran)) => {
+                        return rehydrate_after_outran(owner, mempool_ready_signal, outran).await;
+                    }
                     Err(status) => return rejected_snapshot_outcome(&status),
                 }
             }
@@ -958,15 +1054,20 @@ async fn handle_source_event(
             *pending_source_tip = Some(source_tip);
             None
         }
-        Ok(source_event) => apply_source_event(
+        Ok(source_event) => match apply_source_event(
             context.owner,
             context.canonical,
             context.cancel,
             source_event,
         )
         .await
-        .err()
-        .map(|status| rejected_source_event_outcome(&status)),
+        {
+            Ok(None) => None,
+            Ok(Some(outran)) => Some(
+                rehydrate_after_outran(context.owner, context.mempool_ready_signal, outran).await,
+            ),
+            Err(status) => Some(rejected_source_event_outcome(&status)),
+        },
         Err(error) => Some(source_item_error_outcome(&error)),
     }
 }
@@ -987,6 +1088,7 @@ async fn certify_source_snapshot(
                 "complete mempool snapshot remains private until canonical ingest catches up"
             );
         }
+        SnapshotCertification::GenerationOutran(_) => {}
         SnapshotCertification::Certified => {
             mempool_ready_signal.certify_source_tip(source_tip);
             tracing::info!(
@@ -1069,6 +1171,21 @@ async fn rehydrate_after_source_tip_change(
     );
 }
 
+async fn rehydrate_after_outran(
+    owner: &LiveMempoolOwner,
+    mempool_ready_signal: &MempoolReadySignal,
+    outran: GenerationOutran,
+) -> MempoolOwnerLoopOutcome {
+    rehydrate_after_source_tip_change(
+        owner,
+        mempool_ready_signal,
+        outran.generation_source_tip,
+        outran.observed_source_tip,
+    )
+    .await;
+    MempoolOwnerLoopOutcome::Rehydrate
+}
+
 async fn withdraw_and_wait_for_mempool_rebuild(
     owner: &LiveMempoolOwner,
     mempool_ready_signal: &MempoolReadySignal,
@@ -1147,7 +1264,7 @@ async fn apply_source_event(
     canonical: &CanonicalControlHandle,
     cancel: &CancellationToken,
     source_event: MempoolSourceEvent,
-) -> Result<(), Status> {
+) -> Result<Option<GenerationOutran>, Status> {
     let observed_at = match &source_event {
         MempoolSourceEvent::Added(entry) => entry.observed_at_unix_millis,
         MempoolSourceEvent::Invalidated { .. } | MempoolSourceEvent::Mined { .. } => {
@@ -1190,8 +1307,7 @@ async fn apply_source_event(
             ));
         }
     };
-    let _outcome = owner.apply_event(canonical, event, observed_at).await?;
-    Ok(())
+    owner.apply_event(canonical, event, observed_at).await
 }
 
 async fn wait_for_canonical_epoch(
@@ -1894,6 +2010,228 @@ mod tests {
         command_task.abort();
         let _join_result = command_task.await;
         Ok(())
+    }
+
+    /// A `Mined` change for any block but the serving tip ends the generation.
+    ///
+    /// Zebra's mempool changes and tip notifications have no shared order, so
+    /// a `Mined` change for the next block can reach a serving generation
+    /// before its tip change. A competing block at the tip height, or a block
+    /// below the tip after a reorg to a branch no higher than the tip, can
+    /// likewise be missing from the tip's canonical chain. Removing the
+    /// transaction then would leave it in neither the canonical chain at the
+    /// generation tip nor the mempool.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mined_transition_off_the_serving_tip_ends_the_generation() -> Result<(), Box<dyn Error>>
+    {
+        let source_tip = fixture_tip(2);
+        for off_tip in off_tip_blocks() {
+            let mut harness = ServingOwnerHarness::start(source_tip).await?;
+            let transaction_id = harness.serve_one_entry(0xC7).await?;
+
+            harness
+                .source_control
+                .push_mined(transaction_id, off_tip.height, off_tip.hash)?;
+            let outcome = harness.finish().await?;
+
+            assert_eq!(outcome, MempoolOwnerLoopOutcome::Rehydrate);
+            assert!(!harness.owner.is_serving());
+            assert_eq!(harness.ready_gate.certified_source_tip(), None);
+            let chain_epoch = harness.chain_epoch().await?;
+            let point_read = harness.owner.entry_for(chain_epoch, transaction_id).await;
+            assert_eq!(
+                point_read.err().map(|status| status.code()),
+                Some(Code::Unavailable),
+                "a generation outrun by {off_tip:?} must not answer a mempool miss"
+            );
+            assert_eq!(
+                durable_event_count(&harness.canonical).await?,
+                1,
+                "the outrunning Mined change must not become durable history"
+            );
+            harness.shutdown().await;
+        }
+        Ok(())
+    }
+
+    /// A staged `Mined` change for any block but the snapshot tip ends the
+    /// generation instead of certifying it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mined_transition_off_the_snapshot_tip_blocks_certification()
+    -> Result<(), Box<dyn Error>> {
+        let source_tip = fixture_tip(2);
+        for off_tip in off_tip_blocks() {
+            let temporary = tempfile::TempDir::new()?;
+            let store = published_fixture_store(&temporary.path().join("canonical"))?;
+            let MutableEpochCanonicalControl {
+                canonical,
+                canonical_epoch,
+                command_task,
+            } = mutable_epoch_canonical_control(store)?;
+            let (source, source_control) = MockMempoolSource::streaming();
+            let event_stream = source.events().await?;
+            let owner = LiveMempoolOwner::default();
+            let (ready_signal, ready_gate) = mempool_ready_channel();
+            let cancel = CancellationToken::new();
+            set_canonical_visible_tip(&canonical_epoch, source_tip);
+            let entry = source_entry(0xC9)?;
+            let transaction_id = entry.transaction_id;
+            source_control.push_added(entry)?;
+            source_control.push_mined(transaction_id, off_tip.height, off_tip.hash)?;
+            source_control.complete_initial_snapshot(source_tip)?;
+
+            let outcome = tokio::time::timeout(
+                Duration::from_millis(500),
+                consume_source_events(event_stream, &canonical, &owner, &ready_signal, &cancel),
+            )
+            .await?;
+
+            assert_eq!(outcome, MempoolOwnerLoopOutcome::Rehydrate, "{off_tip:?}");
+            assert!(!owner.is_serving(), "{off_tip:?}");
+            assert_eq!(ready_gate.certified_source_tip(), None, "{off_tip:?}");
+            assert_eq!(durable_event_count(&canonical).await?, 0, "{off_tip:?}");
+            command_task.abort();
+            let _join_result = command_task.await;
+        }
+        Ok(())
+    }
+
+    /// Blocks a `Mined` change can report that are not `fixture_tip(2)`: the
+    /// next block, a competing block at the tip height, and a block below it.
+    fn off_tip_blocks() -> [zinder_core::BlockId; 3] {
+        let other_hash = zinder_core::BlockHash::from_bytes([0xEE; 32]);
+        [3, 2, 1].map(|height| {
+            zinder_core::BlockId::new(zinder_core::BlockHeight::new(height), other_hash)
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mined_transition_at_the_serving_tip_removes_the_entry() -> Result<(), Box<dyn Error>> {
+        let source_tip = fixture_tip(2);
+        let mut harness = ServingOwnerHarness::start(source_tip).await?;
+        let transaction_id = harness.serve_one_entry(0xC8).await?;
+
+        harness
+            .source_control
+            .push_mined(transaction_id, source_tip.height, source_tip.hash)?;
+        let owner = harness.owner.clone();
+        wait_until(|| !owner.index.is_in_mempool(transaction_id)).await?;
+
+        assert!(harness.owner.is_serving());
+        let chain_epoch = harness.chain_epoch().await?;
+        assert!(
+            harness
+                .owner
+                .entry_for(chain_epoch, transaction_id)
+                .await?
+                .is_none()
+        );
+        assert_eq!(
+            harness.finish_by_cancel().await?,
+            MempoolOwnerLoopOutcome::Shutdown
+        );
+        harness.shutdown().await;
+        Ok(())
+    }
+
+    /// Owner loop serving one certified generation over a mock source.
+    struct ServingOwnerHarness {
+        _temporary: tempfile::TempDir,
+        canonical: CanonicalControlHandle,
+        command_task: tokio::task::JoinHandle<()>,
+        source_control: MockMempoolSourceControl,
+        owner: LiveMempoolOwner,
+        ready_gate: MempoolReadyGate,
+        cancel: CancellationToken,
+        owner_task: Option<tokio::task::JoinHandle<MempoolOwnerLoopOutcome>>,
+    }
+
+    impl ServingOwnerHarness {
+        async fn start(source_tip: zinder_core::BlockId) -> Result<Self, Box<dyn Error>> {
+            let temporary = tempfile::TempDir::new()?;
+            let store = published_fixture_store(&temporary.path().join("canonical"))?;
+            let MutableEpochCanonicalControl {
+                canonical,
+                canonical_epoch,
+                command_task,
+            } = mutable_epoch_canonical_control(store)?;
+            set_canonical_visible_tip(&canonical_epoch, source_tip);
+            let (source, source_control) = MockMempoolSource::streaming();
+            let event_stream = source.events().await?;
+            let owner = LiveMempoolOwner::default();
+            let (ready_signal, ready_gate) = mempool_ready_channel();
+            let cancel = CancellationToken::new();
+            let task_canonical = canonical.clone();
+            let task_owner = owner.clone();
+            let task_cancel = cancel.clone();
+            let owner_task = tokio::spawn(async move {
+                consume_source_events(
+                    event_stream,
+                    &task_canonical,
+                    &task_owner,
+                    &ready_signal,
+                    &task_cancel,
+                )
+                .await
+            });
+            source_control.complete_initial_snapshot(source_tip)?;
+            wait_for_serving(&owner, true).await?;
+            Ok(Self {
+                _temporary: temporary,
+                canonical,
+                command_task,
+                source_control,
+                owner,
+                ready_gate,
+                cancel,
+                owner_task: Some(owner_task),
+            })
+        }
+
+        async fn serve_one_entry(
+            &self,
+            transaction_tag: u8,
+        ) -> Result<TransactionId, Box<dyn Error>> {
+            let entry = source_entry(transaction_tag)?;
+            let transaction_id = entry.transaction_id;
+            self.source_control.push_added(entry)?;
+            let owner = self.owner.clone();
+            wait_until(|| owner.index.is_in_mempool(transaction_id)).await?;
+            let chain_epoch = self.chain_epoch().await?;
+            assert!(
+                self.owner
+                    .entry_for(chain_epoch, transaction_id)
+                    .await?
+                    .is_some()
+            );
+            Ok(transaction_id)
+        }
+
+        async fn chain_epoch(&self) -> Result<ChainEpoch, Box<dyn Error>> {
+            Ok(self.canonical.chain_epoch().await?.chain_epoch)
+        }
+
+        async fn finish(&mut self) -> Result<MempoolOwnerLoopOutcome, Box<dyn Error>> {
+            let owner_task = self
+                .owner_task
+                .take()
+                .ok_or("owner loop already finished")?;
+            Ok(tokio::time::timeout(Duration::from_millis(500), owner_task).await??)
+        }
+
+        async fn finish_by_cancel(&mut self) -> Result<MempoolOwnerLoopOutcome, Box<dyn Error>> {
+            self.cancel.cancel();
+            self.finish().await
+        }
+
+        async fn shutdown(self) {
+            self.cancel.cancel();
+            if let Some(owner_task) = self.owner_task {
+                let _join_result = owner_task.await;
+            }
+            self.command_task.abort();
+            let _join_result = self.command_task.await;
+        }
     }
 
     async fn assert_partial_snapshot_is_private(

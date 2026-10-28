@@ -5,28 +5,31 @@ use std::{collections::HashMap, num::NonZeroU32, pin::Pin, time::Instant};
 use tokio::sync::mpsc;
 use tokio_stream::{self as stream, Stream, StreamExt as _, wrappers::ReceiverStream};
 use tonic::{Code, Request, Response, Status};
+use tonic_types::ErrorDetails;
 use zinder_core::wire::{
     decode_rpc_block_hash_hex, decode_rpc_transaction_id_hex, decode_zinder_native_chain_name,
     encode_rpc_transaction_id_hex,
 };
 use zinder_core::{
-    BlockHeight, BlockHeightRange, BlockSelector, ChainEpochId,
+    BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch, ChainEpochId,
     MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, Network, RawTransactionBytes, ShieldedProtocol,
     SubtreeRootIndex, SubtreeRootRange, TransactionId, TransparentOutPoint,
 };
 use zinder_proto::{
-    capabilities, status_for_reason,
+    capabilities, status_for_reason, status_with_reason,
     v1::{
         ingest::{MempoolTransactionRequest, ingest_control_client::IngestControlClient},
         ops::ErrorReason,
         wallet::{self, wallet_query_server},
     },
+    wire::TransactionAbsence,
 };
 use zinder_runtime::{AuthenticatedChannel, connect_zinder_grpc};
 
 use crate::record_proxy_outcome;
 use zinder_store::{
-    StreamCursorTokenV1, chain_event_stream_family_from_request, event_stream_start_from_request,
+    ArtifactFamily, StreamCursorTokenV1, chain_event_stream_family_from_request,
+    event_stream_start_from_request,
 };
 
 type AuthenticatedIngestControlClient = IngestControlClient<AuthenticatedChannel>;
@@ -39,9 +42,10 @@ use crate::{
 
 use super::chain_events::{decode_address_filter, spawn_filtered_stream};
 use super::native::{
-    WalletEndpointMetadata, address_lookup_to_script_hash, block_header_by_selector_response,
-    block_id_by_selector_response, broadcast_transaction_response, build_chain_view_message,
-    build_compact_block_message, build_full_block_message, build_transparent_address_tx_ids_chunk,
+    TransactionStatusLookup, WalletEndpointMetadata, address_lookup_to_script_hash,
+    block_header_by_selector_response, block_id_by_selector_response,
+    broadcast_transaction_response, build_chain_view_message, build_compact_block_message,
+    build_full_block_message, build_transparent_address_tx_ids_chunk,
     build_transparent_address_tx_ids_header, build_transparent_unspent_output_message,
     build_transparent_unspent_outputs_header, build_wallet_server_info,
     chain_value_pools_at_tip_response, compact_block_response, full_block_response,
@@ -61,8 +65,67 @@ type TransparentAddressTxIdsStream = WalletGrpcStream<wallet::TransparentAddress
 type CompactBlocksInRangeStream = WalletGrpcStream<wallet::CompactBlocksInRangeChunk>;
 type FullBlocksInRangeStream = WalletGrpcStream<wallet::FullBlocksInRangeChunk>;
 
-const TRANSACTION_NOT_FOUND_REASON: &str =
-    "transaction is not visible in the canonical chain or live mempool";
+const TRANSACTION_NOT_FOUND_IN_CHAIN: &str =
+    "transaction is not in the canonical chain of the requested epoch";
+const TRANSACTION_NOT_FOUND_IN_CHAIN_OR_MEMPOOL: &str =
+    "transaction is not in the canonical chain or the live mempool";
+
+/// Completes an unpinned transaction lookup whose canonical read missed at
+/// `chain_epoch` by consulting the writer's live mempool.
+///
+/// The answer is an absence only when the mempool view proves the miss at the
+/// same epoch. A mempool view at a different epoch may have dropped the
+/// transaction into a block this replica has not caught up to, so that case
+/// fails with `CHAIN_EPOCH_MISSING` for the writer's epoch and the caller
+/// retries. A writer that answers a miss without the typed absence keeps the
+/// legacy ambiguous `ARTIFACT_UNAVAILABLE` shape, never an absence.
+async fn mempool_transaction_after_canonical_miss(
+    mut client: AuthenticatedIngestControlClient,
+    transaction_id: TransactionId,
+    chain_epoch: ChainEpoch,
+) -> Result<wallet::TransactionStatusResponse, Status> {
+    let started_at = Instant::now();
+    let proxy_outcome = client
+        .mempool_transaction(wallet_ingest_control_request(MempoolTransactionRequest {
+            transaction_id: encode_rpc_transaction_id_hex(transaction_id),
+        }))
+        .await;
+    record_proxy_outcome("mempool_transaction", started_at, &proxy_outcome);
+
+    let status = match proxy_outcome {
+        Ok(response) => return Ok(response.into_inner()),
+        Err(status) => status,
+    };
+    match TransactionAbsence::from_status(&status) {
+        Ok(Some(mempool_absence)) if mempool_absence.chain_epoch_id == chain_epoch.id => {
+            Err(TransactionAbsence::at_epoch(chain_epoch, true)
+                .into_status(TRANSACTION_NOT_FOUND_IN_CHAIN_OR_MEMPOOL))
+        }
+        Ok(Some(mempool_absence)) => Err(status_with_reason(
+            ErrorReason::ChainEpochMissing,
+            format!(
+                "the live mempool answered at chain epoch {} but this replica read chain epoch {}; retry",
+                mempool_absence.chain_epoch_id.value(),
+                chain_epoch.id.value()
+            ),
+            ErrorDetails::with_resource_info(
+                ArtifactFamily::ChainEpoch.wire_label(),
+                format!("chain_epoch:{}", mempool_absence.chain_epoch_id.value()),
+                "zinder-query",
+                "the writer's mempool epoch is not visible to this replica",
+            ),
+        )),
+        Ok(None) if status.code() == Code::NotFound => Err(status_for_reason(
+            ErrorReason::ArtifactUnavailable,
+            "the live mempool answered without a typed absence; transaction absence cannot be proven",
+        )),
+        Ok(None) => Err(status),
+        Err(metadata_error) => Err(status_for_reason(
+            ErrorReason::ArtifactCorrupt,
+            format!("the live mempool returned a malformed transaction absence: {metadata_error}"),
+        )),
+    }
+}
 
 /// gRPC adapter for a [`WalletQueryApi`] implementation.
 ///
@@ -288,44 +351,32 @@ where
         let request = request.into_inner();
         let transaction_id = transaction_id_from_request(&request.transaction_id)?;
         let at_epoch_id = chain_epoch_id_from_request(request.at_epoch_id);
-        let canonical_response = transaction_response(&self.query_api, transaction_id, at_epoch_id)
+        let canonical_lookup = transaction_response(&self.query_api, transaction_id, at_epoch_id)
             .await
             .map_err(|error| status_from_query_error(&error))?;
 
-        if let Some(response) = canonical_response {
-            return Ok(Response::new(response));
-        }
+        let chain_epoch = match canonical_lookup {
+            TransactionStatusLookup::Located(response) => return Ok(Response::new(*response)),
+            TransactionStatusLookup::Absent { chain_epoch } => chain_epoch,
+        };
         if at_epoch_id.is_some() {
-            return Err(status_for_reason(
-                ErrorReason::ArtifactUnavailable,
-                TRANSACTION_NOT_FOUND_REASON,
-            ));
+            // A pinned lookup is a canonical read; it never consults the
+            // mempool, and its absence says so.
+            return Err(TransactionAbsence::at_epoch(chain_epoch, false)
+                .into_status(TRANSACTION_NOT_FOUND_IN_CHAIN));
         }
 
-        let Some(mut client) =
+        let Some(client) =
             IngestControlClientAccess::ingest_control_client(&self.query_api).await?
         else {
             return Err(status_for_reason(
-                ErrorReason::ArtifactUnavailable,
-                TRANSACTION_NOT_FOUND_REASON,
+                ErrorReason::DependencyNotConfigured,
+                "the live mempool view is not configured, so transaction absence cannot be proven",
             ));
         };
-        let started_at = Instant::now();
-        let proxy_outcome = client
-            .mempool_transaction(wallet_ingest_control_request(MempoolTransactionRequest {
-                transaction_id: encode_rpc_transaction_id_hex(transaction_id),
-            }))
-            .await;
-        record_proxy_outcome("mempool_transaction", started_at, &proxy_outcome);
-
-        match proxy_outcome {
-            Ok(response) => Ok(Response::new(response.into_inner())),
-            Err(status) if status.code() == Code::NotFound => Err(status_for_reason(
-                ErrorReason::ArtifactUnavailable,
-                TRANSACTION_NOT_FOUND_REASON,
-            )),
-            Err(status) => Err(status),
-        }
+        mempool_transaction_after_canonical_miss(client, transaction_id, chain_epoch)
+            .await
+            .map(Response::new)
     }
 
     async fn compact_blocks_in_range(

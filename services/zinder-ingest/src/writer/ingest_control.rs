@@ -27,6 +27,7 @@ use zinder_proto::{
         },
         ops, wallet,
     },
+    wire::TransactionAbsence,
 };
 use zinder_runtime::{
     BearerToken, BearerTokenServerInterceptor, Readiness, ReadinessCause, ReadinessReport,
@@ -236,7 +237,8 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
             .entry_for(snapshot.chain_epoch, transaction_id)
             .await?
             .ok_or_else(|| {
-                Status::not_found("transaction is not visible in the live mempool index")
+                TransactionAbsence::at_epoch(snapshot.chain_epoch, true)
+                    .into_status("transaction is not visible in the live mempool index")
             })?;
         Ok(Response::new(wallet::TransactionStatusResponse {
             chain_view: Some(chain_view_message(snapshot.chain_epoch)),
@@ -678,6 +680,13 @@ mod tests {
         MempoolEventRetentionConfig, RocksDbResourceBudget, event_stream_start_message,
     };
 
+    use zinder_proto::v1::wallet::{
+        TransactionRequest, wallet_query_server::WalletQuery as WalletQueryService,
+    };
+    use zinder_proto::wire::TransactionAbsence;
+    use zinder_query::{WalletEndpointMetadata, WalletQuery, WalletQueryGrpcAdapter};
+    use zinder_testkit::{ChainFixture, StoreFixture, sample_regtest_upgrade_activations};
+
     use crate::{
         CanonicalCheckpointStagingRoot, CanonicalControlGrpcAdapter, LiveMempoolOwner,
         writer::control::{
@@ -950,8 +959,8 @@ mod tests {
                 &fixture.canonical,
                 MempoolEvent::Mined {
                     transaction_id: TransactionId::from_bytes([0xA1; 32]),
-                    mined_height: BlockHeight::new(41),
-                    block_hash: BlockHash::from_bytes([0xA1; 32]),
+                    mined_height: chain_epoch.visible_tip_height,
+                    block_hash: chain_epoch.visible_tip_hash,
                 },
                 observed_at,
             )
@@ -973,8 +982,8 @@ mod tests {
                 &fixture.canonical,
                 MempoolEvent::Mined {
                     transaction_id: entry.transaction_id(),
-                    mined_height: BlockHeight::new(42),
-                    block_hash: BlockHash::from_bytes([0xE5; 32]),
+                    mined_height: chain_epoch.visible_tip_height,
+                    block_hash: chain_epoch.visible_tip_hash,
                 },
                 observed_at,
             )
@@ -1183,6 +1192,155 @@ mod tests {
         async fn fetch_chain_value_pools_at_tip(&self) -> Result<ChainValuePools, SourceError> {
             Ok(self.value_pools.clone())
         }
+    }
+
+    /// End-to-end regression: a `Mined` change for the next block that reaches
+    /// the owner before the tip change must not turn into a proven absence
+    /// through `MempoolTransaction` and the query adapter.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mined_change_beyond_the_tip_is_never_a_proven_absence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut fixture = shared_control_fixture().await?;
+        let chain_epoch = fixture.canonical.chain_epoch().await?.chain_epoch;
+
+        // A miss in a coherent generation is a typed absence at the writer epoch.
+        let coherent_miss = fixture
+            .ingest_client
+            .mempool_transaction(authenticated(MempoolTransactionRequest {
+                transaction_id: encode_rpc_transaction_id_hex(TransactionId::from_bytes(
+                    [0xF5; 32],
+                )),
+            }))
+            .await
+            .err()
+            .ok_or("an unknown transaction must miss the live mempool")?;
+        assert_eq!(
+            TransactionAbsence::from_status(&coherent_miss)?,
+            Some(TransactionAbsence::at_epoch(chain_epoch, true))
+        );
+
+        let entry = fixture_mempool_entry_with_id(0xF6, chain_epoch)?;
+        let transaction_id = entry.transaction_id();
+        fixture
+            .mempool
+            .apply_event(
+                &fixture.canonical,
+                MempoolEvent::Added { entry },
+                UnixTimestampMillis::new(1_750_000_000_500),
+            )
+            .await?;
+        let next_height = BlockHeight::new(chain_epoch.visible_tip_height.value() + 1);
+        let outcome = fixture
+            .mempool
+            .apply_event(
+                &fixture.canonical,
+                MempoolEvent::Mined {
+                    transaction_id,
+                    mined_height: next_height,
+                    block_hash: BlockHash::from_bytes([0xF7; 32]),
+                },
+                UnixTimestampMillis::new(1_750_000_000_600),
+            )
+            .await?;
+        assert!(
+            outcome.is_some(),
+            "a Mined change beyond the tip ends the generation"
+        );
+
+        let writer_miss = fixture
+            .ingest_client
+            .mempool_transaction(authenticated(MempoolTransactionRequest {
+                transaction_id: encode_rpc_transaction_id_hex(transaction_id),
+            }))
+            .await
+            .err()
+            .ok_or("an outrun generation must not answer from the live mempool")?;
+        assert_eq!(writer_miss.code(), Code::Unavailable);
+        assert_eq!(TransactionAbsence::from_status(&writer_miss)?, None);
+
+        // The query plane reads the same epoch id and still must not answer an
+        // absence.
+        let query_status = unpinned_query_lookup(&fixture, chain_epoch.id, transaction_id).await?;
+        assert_eq!(query_status.code(), Code::Unavailable);
+        assert_eq!(TransactionAbsence::from_status(&query_status)?, None);
+        fixture.shutdown().await
+    }
+
+    /// Looks a transaction up, unpinned, through a query adapter whose
+    /// canonical epoch id is `chain_epoch_id` and whose mempool view is the
+    /// fixture's ingest control, returning the failure status.
+    async fn unpinned_query_lookup(
+        fixture: &SharedControlFixture,
+        chain_epoch_id: ChainEpochId,
+        transaction_id: TransactionId,
+    ) -> Result<tonic::Status, Box<dyn std::error::Error>> {
+        let query_store = StoreFixture::with_chain_committed(
+            &ChainFixture::new(zinder_core::Network::ZcashRegtest).extend_blocks(1),
+            chain_epoch_id,
+        )?;
+        let (proxy_endpoint, proxy_cancel, proxy_task) =
+            spawn_unauthenticated_ingest_control(fixture).await?;
+        let query_adapter = WalletQueryGrpcAdapter::with_ingest_control_proxy(
+            WalletQuery::new(
+                query_store.chain_store().clone(),
+                (),
+                Arc::new(sample_regtest_upgrade_activations()),
+            ),
+            WalletEndpointMetadata::default(),
+            proxy_endpoint,
+        );
+        let lookup = WalletQueryService::transaction(
+            &query_adapter,
+            Request::new(TransactionRequest {
+                transaction_id: encode_rpc_transaction_id_hex(transaction_id),
+                at_epoch_id: None,
+            }),
+        )
+        .await;
+        proxy_cancel.cancel();
+        proxy_task.await??;
+        lookup
+            .err()
+            .ok_or_else(|| "the query adapter must not locate an outrun transaction".into())
+    }
+
+    async fn spawn_unauthenticated_ingest_control(
+        fixture: &SharedControlFixture,
+    ) -> Result<
+        (
+            String,
+            CancellationToken,
+            tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let node_source: Arc<dyn NodeSource> = Arc::new(ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashTestnet,
+            "http://127.0.0.1:1",
+            NodeAuth::None,
+            Duration::from_secs(1),
+        )?);
+        let ingest_adapter = CanonicalIngestControlGrpcAdapter::new(
+            zinder_core::Network::ZcashTestnet,
+            fixture.canonical.clone(),
+            fixture.mempool.clone(),
+            node_source,
+            Readiness::new(ReadinessState::ready(Some(1))),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let listen_addr = listener.local_addr()?;
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server_task = tokio::spawn(async move {
+            Server::builder()
+                .add_service(ingest_adapter.into_server())
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(listener),
+                    server_cancel.cancelled_owned(),
+                )
+                .await
+        });
+        Ok((format!("http://{listen_addr}"), cancel, server_task))
     }
 
     struct SharedControlFixture {

@@ -1104,6 +1104,72 @@ fn checkpoint_commit_establishes_artifact_lower_bound() -> eyre::Result<()> {
 }
 
 #[test]
+fn checkpointed_history_refuses_to_prove_transaction_absence() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;
+    let checkpoint_epoch = ChainEpoch {
+        id: ChainEpochId::new(1),
+        network: Network::ZcashRegtest,
+        visible_tip_height: BlockHeight::new(1),
+        visible_tip_hash: block_hash(1),
+        settled_tip_height: BlockHeight::new(1),
+        settled_tip_hash: block_hash(1),
+        artifact_schema_version: zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION,
+        tip_metadata: ChainTipMetadata::empty(),
+        created_at: UnixTimestampMillis::new(1),
+    };
+    store.commit_artifactless_checkpoint(checkpoint_epoch)?;
+    let (chain_epoch, block, compact_block) = synthetic_epoch(2, 2);
+    let retained_transaction_id = TransactionId::from_bytes([0x22; 32]);
+    let (transaction_index, transaction_location, transaction_facts, _) =
+        super::synthetic_transaction_rows(
+            retained_transaction_id,
+            BlockHeight::new(2),
+            block.block_hash,
+            0,
+            b"retained-transaction",
+        );
+    super::commit_synthetic_chain_epoch(
+        &store,
+        super::synthetic_chain_epoch_artifacts(chain_epoch, vec![block], vec![compact_block])
+            .with_block_transaction_index(vec![transaction_index])
+            .with_transaction_locations(vec![transaction_location])
+            .with_transaction_facts(vec![transaction_facts.clone()])
+            .with_transaction_intrinsic_value_balances(vec![
+                TransactionIntrinsicValueBalancesArtifact::new(
+                    transaction_location,
+                    TransactionIntrinsicValueBalances::default(),
+                ),
+            ]),
+    )?;
+    let reader = store.current_chain_epoch_reader()?;
+
+    // A transaction mined at a retained height is still found.
+    assert_eq!(
+        reader.transaction_facts_or_proven_absence(retained_transaction_id)?,
+        Some(transaction_facts)
+    );
+    // A miss may be a transaction mined at or below the checkpoint, so the
+    // store refuses to call it absent and names its history floor.
+    let missing_transaction_id = TransactionId::from_bytes([0x33; 32]);
+    assert_eq!(
+        reader.transaction_facts_by_id(missing_transaction_id)?,
+        None
+    );
+    assert!(matches!(
+        reader.transaction_facts_or_proven_absence(missing_transaction_id),
+        Err(StoreError::CanonicalHistoryUnavailable {
+            first_available_height,
+            checkpoint,
+            ..
+        }) if first_available_height == BlockHeight::new(2)
+            && checkpoint == BlockId::new(BlockHeight::new(1), block_hash(1))
+    ));
+
+    Ok(())
+}
+
+#[test]
 fn many_epoch_reads_do_not_depend_on_dense_artifact_rewrites() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let store = PrimaryChainStore::open(tempdir.path(), ChainStoreOptions::for_local_tests())?;

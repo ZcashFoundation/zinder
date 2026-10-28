@@ -40,6 +40,7 @@ use zinder_proto::v1::{
     ops,
     wallet::{self, wallet_query_server::WalletQuery as WalletQueryService},
 };
+use zinder_proto::wire::TransactionAbsence;
 use zinder_query::{
     AdmittedIngestControl, IngestControlAdmissionError, WalletEndpointMetadata, WalletQuery,
     WalletQueryApi, WalletQueryGrpcAdapter, WalletQueryOptions, WalletServingPairSlot,
@@ -432,35 +433,159 @@ async fn native_grpc_service_maps_missing_artifacts_to_not_found() -> eyre::Resu
 }
 
 #[tokio::test]
-async fn native_grpc_service_returns_not_found_when_transaction_missing() -> eyre::Result<()> {
+async fn transaction_absence_without_a_mempool_view_is_only_proven_when_pinned() -> eyre::Result<()>
+{
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
     commit_wallet_artifacts(&store)?;
+    let chain_epoch_id = store
+        .current_chain_epoch()?
+        .ok_or_else(|| eyre!("wallet artifacts committed no epoch"))?
+        .id;
     let requested_transaction_id = TransactionId::from_bytes([0x45; 32]);
     let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
-    let status = match WalletQueryService::transaction(
+    // Without a live mempool view an unpinned miss cannot be an absence.
+    let unpinned = transaction_status(&grpc_adapter, requested_transaction_id, None).await?;
+    assert_eq!(unpinned.code(), Code::FailedPrecondition);
+    assert_eq!(
+        error_reason(&unpinned),
+        Some(ops::ErrorReason::DependencyNotConfigured)
+    );
+    assert_eq!(TransactionAbsence::from_status(&unpinned)?, None);
+
+    // A pinned lookup never consults the mempool, so it proves a canonical
+    // absence at that epoch and says the mempool was not searched.
+    let pinned = transaction_status(
         &grpc_adapter,
+        requested_transaction_id,
+        Some(chain_epoch_id),
+    )
+    .await?;
+    let absence = TransactionAbsence::from_status(&pinned)?
+        .ok_or_else(|| eyre!("pinned canonical miss was not a typed absence: {pinned:?}"))?;
+    assert_eq!(pinned.code(), Code::NotFound);
+    assert_eq!(absence.chain_epoch_id, chain_epoch_id);
+    assert!(!absence.covers_mempool);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn transaction_absence_requires_a_mempool_miss_at_the_same_epoch() -> eyre::Result<()> {
+    let ingest_control = StaticIngestControl::new();
+    let mempool_miss = ingest_control.clone();
+    let (adapter, _store_fixture, cancel, server_task) =
+        native_serving_adapter_with_ingest_control(ingest_control).await?;
+    let chain_epoch = visible_chain_epoch(&adapter).await?;
+    let missing_transaction_id = TransactionId::from_bytes([0x46; 32]);
+
+    // A mempool miss at the replica's epoch completes a proven absence.
+    mempool_miss.set_mempool_transaction_miss(
+        TransactionAbsence::at_epoch(chain_epoch, true).into_status("not in the test mempool"),
+    );
+    let proven = transaction_status(&adapter, missing_transaction_id, None).await?;
+    assert_eq!(
+        TransactionAbsence::from_status(&proven)?,
+        Some(TransactionAbsence::at_epoch(chain_epoch, true))
+    );
+
+    // A writer at another epoch, ahead because this replica lags or behind
+    // because the writer restarted, describes a different chain than the
+    // canonical read. The transaction may have moved between the two views, so
+    // the lookup fails and names the writer's epoch.
+    for writer_epoch_id in [chain_epoch.id.value() + 1, chain_epoch.id.value() - 1] {
+        let writer_epoch = ChainEpoch {
+            id: ChainEpochId::new(writer_epoch_id),
+            ..chain_epoch
+        };
+        mempool_miss.set_mempool_transaction_miss(
+            TransactionAbsence::at_epoch(writer_epoch, true).into_status("not in the test mempool"),
+        );
+        let mismatched = transaction_status(&adapter, missing_transaction_id, None).await?;
+        assert_eq!(mismatched.code(), Code::NotFound);
+        assert_eq!(
+            error_reason(&mismatched),
+            Some(ops::ErrorReason::ChainEpochMissing)
+        );
+        assert_eq!(
+            mismatched
+                .get_error_details()
+                .resource_info()
+                .map(|resource| resource.resource_name.clone()),
+            Some(format!("chain_epoch:{writer_epoch_id}"))
+        );
+        assert_eq!(TransactionAbsence::from_status(&mismatched)?, None);
+    }
+
+    // A writer that answers without the typed absence keeps the ambiguous
+    // legacy shape rather than becoming an absence.
+    mempool_miss.set_mempool_transaction_miss(Status::not_found("legacy mempool miss"));
+    let legacy = transaction_status(&adapter, missing_transaction_id, None).await?;
+    assert_eq!(legacy.code(), Code::NotFound);
+    assert_eq!(
+        error_reason(&legacy),
+        Some(ops::ErrorReason::ArtifactUnavailable)
+    );
+    assert!(legacy.get_error_details().resource_info().is_none());
+
+    // An unavailable mempool view is an error, never an absence.
+    mempool_miss.set_mempool_transaction_miss(Status::unavailable("mempool is hydrating"));
+    let unavailable = transaction_status(&adapter, missing_transaction_id, None).await?;
+    assert_eq!(unavailable.code(), Code::Unavailable);
+    assert_eq!(TransactionAbsence::from_status(&unavailable)?, None);
+
+    cancel.cancel();
+    server_task.await??;
+    Ok(())
+}
+
+async fn transaction_status<Q>(
+    adapter: &WalletQueryGrpcAdapter<Q>,
+    transaction_id: TransactionId,
+    at_epoch_id: Option<ChainEpochId>,
+) -> eyre::Result<Status>
+where
+    WalletQueryGrpcAdapter<Q>: WalletQueryService,
+{
+    match WalletQueryService::transaction(
+        adapter,
         Request::new(wallet::TransactionRequest {
-            transaction_id: encode_rpc_transaction_id_hex(requested_transaction_id),
-            at_epoch_id: None,
+            transaction_id: encode_rpc_transaction_id_hex(transaction_id),
+            at_epoch_id: at_epoch_id.map(ChainEpochId::value),
         }),
     )
     .await
     {
-        Ok(response) => return Err(eyre!("expected transaction error, got {response:?}")),
-        Err(status) => status,
-    };
+        Ok(response) => Err(eyre!(
+            "expected a transaction status error, got {response:?}"
+        )),
+        Err(status) => Ok(status),
+    }
+}
 
-    assert_eq!(status.code(), Code::NotFound);
-    assert!(
-        status.message().contains("not visible"),
-        "expected wire message to describe visibility, got {:?}",
-        status.message()
-    );
+async fn visible_chain_epoch<Q>(adapter: &WalletQueryGrpcAdapter<Q>) -> eyre::Result<ChainEpoch>
+where
+    WalletQueryGrpcAdapter<Q>: WalletQueryService,
+{
+    let chain_epoch = WalletQueryService::visible_tip_block(
+        adapter,
+        Request::new(wallet::VisibleTipBlockRequest { at_epoch_id: None }),
+    )
+    .await?
+    .into_inner()
+    .chain_view
+    .and_then(|chain_view| chain_view.chain_epoch)
+    .ok_or_else(|| eyre!("visible tip response omitted its chain epoch"))?;
+    Ok(zinder_proto::wire::chain_epoch_from_message(chain_epoch)?)
+}
 
-    Ok(())
+fn error_reason(status: &Status) -> Option<ops::ErrorReason> {
+    status
+        .get_error_details()
+        .error_info()
+        .and_then(|error_info| ops::ErrorReason::from_str_name(&error_info.reason))
 }
 
 #[tokio::test]
@@ -961,6 +1086,10 @@ async fn assert_native_retention_case(raw_blob_retention: RawBlobRetention) -> e
         ));
     };
     assert_eq!(pinned_status.code(), Code::NotFound);
+    let pinned_absence = TransactionAbsence::from_status(&pinned_status)?
+        .ok_or_else(|| eyre!("pinned canonical miss was not a typed absence"))?;
+    assert_eq!(pinned_absence.chain_epoch_id.value(), canonical_epoch_id);
+    assert!(!pinned_absence.covers_mempool);
     assert_eq!(
         ingest_control_observer.mempool_transaction_call_count(),
         1,
@@ -1509,6 +1638,7 @@ struct StaticIngestControl {
     transaction: Option<wallet::TransactionStatusResponse>,
     mempool_snapshot_status: Option<Status>,
     mempool_transaction_calls: Arc<AtomicUsize>,
+    mempool_transaction_miss: Arc<parking_lot::Mutex<Option<Status>>>,
     mempool_events_establishment_stalled: bool,
     outputs_by_address: Option<wallet::TransparentMempoolOutputsByAddressResponse>,
     spends_by_outpoint: Option<wallet::TransparentMempoolSpendsByOutpointResponse>,
@@ -1541,6 +1671,7 @@ impl StaticIngestControl {
             transaction: None,
             mempool_snapshot_status: None,
             mempool_transaction_calls: Arc::new(AtomicUsize::new(0)),
+            mempool_transaction_miss: Arc::new(parking_lot::Mutex::new(None)),
             mempool_events_establishment_stalled: false,
             outputs_by_address: None,
             spends_by_outpoint: None,
@@ -1558,6 +1689,11 @@ impl StaticIngestControl {
     fn with_mempool_snapshot_status(mut self, status: Status) -> Self {
         self.mempool_snapshot_status = Some(status);
         self
+    }
+
+    /// Replaces the status every later mempool miss returns.
+    fn set_mempool_transaction_miss(&self, status: Status) {
+        *self.mempool_transaction_miss.lock() = Some(status);
     }
 
     fn mempool_transaction_call_count(&self) -> usize {
@@ -1711,10 +1847,14 @@ impl IngestControl for StaticIngestControl {
     ) -> Result<Response<wallet::TransactionStatusResponse>, Status> {
         self.mempool_transaction_calls
             .fetch_add(1, Ordering::SeqCst);
-        self.transaction
+        if let Some(transaction) = self.transaction.clone() {
+            return Ok(Response::new(transaction));
+        }
+        Err(self
+            .mempool_transaction_miss
+            .lock()
             .clone()
-            .map(Response::new)
-            .ok_or_else(|| Status::not_found("transaction is not in the test mempool"))
+            .unwrap_or_else(|| Status::not_found("transaction is not in the test mempool")))
     }
 
     async fn mempool_events(

@@ -58,6 +58,7 @@ enum ErrorReason {
   SCHEMA_MISMATCH = 17;
   SCHEMA_TOO_NEW = 18;
   REORG_WINDOW_EXCEEDED = 19;
+  // ABORTED family: retry at a fresh epoch.
   CHAIN_EPOCH_CONFLICT = 20;
   CHAIN_EPOCH_NETWORK_MISMATCH = 21;
 
@@ -112,4 +113,20 @@ enum ErrorReason {
   // any structured cause detail.
   SERVICE_NOT_READY = 50;
 
+  // NOT_FOUND family.
+  // Proven absence answered by `WalletQuery.Transaction`: the transaction is
+  // in neither the canonical chain of the answering epoch nor, for a lookup
+  // without `at_epoch_id`, the writer's live mempool at that same epoch, and
+  // the store retains complete canonical history. ErrorInfo metadata carries
+  // `chain_epoch_id`, `first_covered_height`, `visible_tip_height`, and
+  // `covers_mempool`. No other failure carries this reason; every other
+  // NOT_FOUND on that method is a failure, not an absence.
+  TRANSACTION_NOT_FOUND = 51;
+
+  // FAILED_PRECONDITION family.
+  // The store's retained canonical history starts after a checkpoint, so a
+  // lookup that must cover earlier heights cannot be answered. ErrorInfo
+  // metadata carries `first_available_height`. Waiting never clears it;
+  // query a store with complete history.
+  CANONICAL_HISTORY_UNAVAILABLE = 52;
 }

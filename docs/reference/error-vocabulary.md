@@ -77,13 +77,13 @@ The request shape is valid but the deployment is in a state that cannot serve it
 | `SCHEMA_MISMATCH` | Persistent store schema is incompatible with the running binary | — |
 | `SCHEMA_TOO_NEW` | Store was opened by a newer Zinder; rolling back is unsafe | — |
 | `REORG_WINDOW_EXCEEDED` | A reorg crossed the configured reorg window; operator must reconcile | — |
-| `CHAIN_EPOCH_CONFLICT` | Detected chain-epoch contention between writer and reader | — |
 | `CHAIN_EPOCH_NETWORK_MISMATCH` | Store opened against the wrong `network` | — |
 | `MATERIALIZED_VIEW_UNAVAILABLE` | A required wallet projection or explorer materialized view is not configured for this deployment | `type=MATERIALIZED_VIEW_UNAVAILABLE, subject=<capability>` |
 | `ENDPOINT_CAPABILITY_UNAVAILABLE` | The admitted wallet endpoint does not expose the capability required by this operation | `type=ENDPOINT_CAPABILITY_UNAVAILABLE, subject=<capability>` |
-| `DEPENDENCY_NOT_CONFIGURED` | A federated dependency the explorer request needs (the canonical store, a materialized view, or a wallet-query endpoint) is not wired on this deployment | — |
+| `DEPENDENCY_NOT_CONFIGURED` | A federated dependency the request needs (for the explorer, the canonical store, a materialized view, or a wallet-query endpoint; for an unpinned `WalletQuery.Transaction` miss, the live mempool view) is not wired on this deployment | — |
 | `NODE_CAPABILITY_MISSING` | The upstream Zcash node does not advertise a capability the request requires; the operator must reconfigure the node | — |
 | `EXPLORER_PRECONDITION_UNSATISFIED` | An explorer read cannot serve the requested transaction state | — |
+| `CANONICAL_HISTORY_UNAVAILABLE` | The store's retained canonical history starts after a checkpoint, so a transaction lookup cannot prove an absence; query a store with complete history | `ErrorInfo.metadata["first_available_height"]` |
 
 ### `NOT_FOUND` family
 
@@ -92,8 +92,19 @@ The requested resource is not available in the visible query state. Retry dispos
 | Reason | What it means | Example metadata |
 | --- | --- | --- |
 | `ARTIFACT_UNAVAILABLE` | A specific artifact is missing from the named family at the visible epoch (also raised by explorer reads for a not-yet-materialized materialized-view row) | `resource_type=<family>, resource_name=<key>` |
-| `CHAIN_EPOCH_MISSING` | Chain epoch is not retained (often: pruned) | `resource_type=chain_epoch, resource_name=chain_epoch:<id>` |
+| `CHAIN_EPOCH_MISSING` | Chain epoch is not retained (often: pruned), or, on an unpinned `WalletQuery.Transaction` miss, the writer's mempool answered at an epoch this replica has not read yet | `resource_type=chain_epoch, resource_name=chain_epoch:<id>` |
 | `BLOCK_NOT_IN_BEST_CHAIN` | No block matching the requested selector is visible in the best chain; unknown and reorged-out selectors share this reason | — |
+| `TRANSACTION_NOT_FOUND` | Proven absence from `WalletQuery.Transaction`: the transaction is in neither the answering epoch's canonical chain nor, for an unpinned lookup, the writer's live mempool at that same epoch, and the store retains complete history. It is an answer rather than a failure; no other failure carries it | `ErrorInfo.metadata["chain_epoch_id"]`, `["first_covered_height"]` (always `1`), `["visible_tip_height"]`, `["covers_mempool"]` (`true` or `false`) |
+
+`WalletQuery.Transaction` reports an absence only through `TRANSACTION_NOT_FOUND`. Any other `NOT_FOUND` reason on that method, including `ARTIFACT_UNAVAILABLE`, `CHAIN_EPOCH_MISSING`, and `BLOCK_NOT_IN_BEST_CHAIN`, is a failure and says nothing about whether the transaction exists. Servers below contract revision 6 answered absences with `ARTIFACT_UNAVAILABLE` and no `ResourceInfo`, the same shape as several storage failures, so that shape is ambiguous.
+
+### `ABORTED` family
+
+A concurrent change invalidated the read or write. Retry disposition: **RetryAfterBackoff**; re-read at a fresh epoch.
+
+| Reason | What it means |
+| --- | --- |
+| `CHAIN_EPOCH_CONFLICT` | Chain-epoch contention: a secondary reader's catchup moved it off the epoch it was reading, or a commit raced for the next epoch |
 
 ### `DATA_LOSS` family
 

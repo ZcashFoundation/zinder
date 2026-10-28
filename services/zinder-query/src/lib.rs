@@ -12,7 +12,7 @@ use thiserror::Error;
 use tokio::sync::{OnceCell, mpsc};
 use zinder_core::{
     BlockBlobArtifact, BlockHeader, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
-    ChainEpoch, ChainEpochId, ChainValuePoolsAtTip, CompactBlockArtifact,
+    CanonicalHistoryBounds, ChainEpoch, ChainEpochId, ChainValuePoolsAtTip, CompactBlockArtifact,
     MAX_RAW_TRANSACTION_BYTES, MAX_SUBTREE_ROOTS_PER_REQUEST, MinedTransaction,
     MinedTransactionChainContext, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
     SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange, TransactionBlobArtifact,
@@ -49,18 +49,18 @@ mod wallet_serving_pair_publisher;
 mod wallet_serving_query;
 
 pub use grpc::{
-    WalletEndpointMetadata, WalletQueryGrpcAdapter, address_lookup_to_script_hash,
-    block_header_by_selector_response, block_id_by_selector_response,
-    broadcast_transaction_response, build_transparent_address_tx_ids_chunk,
-    build_transparent_address_tx_ids_header, build_transparent_unspent_output_message,
-    build_transparent_unspent_outputs_header, build_wallet_server_info, chain_events_response,
-    chain_value_pools_at_tip_response, compact_block_response, full_block_response,
-    latest_tree_state_checkpoint_response, network_upgrade_activations_response,
-    status_from_query_error, subtree_roots_response, transaction_response,
-    transparent_address_tx_ids_response, transparent_address_unspent_outputs_response,
-    transparent_outputs_by_outpoint_response, transparent_spends_by_outpoint_response,
-    transparent_unspent_outputs_by_outpoint_response, tree_state_at_response,
-    visible_tip_block_response,
+    TransactionStatusLookup, WalletEndpointMetadata, WalletQueryGrpcAdapter,
+    address_lookup_to_script_hash, block_header_by_selector_response,
+    block_id_by_selector_response, broadcast_transaction_response,
+    build_transparent_address_tx_ids_chunk, build_transparent_address_tx_ids_header,
+    build_transparent_unspent_output_message, build_transparent_unspent_outputs_header,
+    build_wallet_server_info, chain_events_response, chain_value_pools_at_tip_response,
+    compact_block_response, full_block_response, latest_tree_state_checkpoint_response,
+    network_upgrade_activations_response, status_from_query_error, subtree_roots_response,
+    transaction_response, transparent_address_tx_ids_response,
+    transparent_address_unspent_outputs_response, transparent_outputs_by_outpoint_response,
+    transparent_spends_by_outpoint_response, transparent_unspent_outputs_by_outpoint_response,
+    tree_state_at_response, visible_tip_block_response,
 };
 pub use ingest_control::{AdmittedIngestControl, IngestControlAdmissionError};
 pub use native_wallet_endpoint_capabilities::{
@@ -174,11 +174,14 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     /// Reads typed transaction status by transaction id.
     ///
     /// Returns [`TxStatus::Mined`] for mined transactions, with epoch-bound
-    /// [`MinedTransactionChainContext`] enrichment, [`TxStatus::NotFound`] when the
-    /// transaction is not visible in the canonical chain, and
-    /// [`QueryError`] for storage/upstream failures. An `at_epoch_id` pin is
-    /// a canonical-chain read and never consults live mempool state;
-    /// mempool fall-through is the caller's responsibility on this trait.
+    /// [`MinedTransactionChainContext`] enrichment, and [`TxStatus::NotFound`]
+    /// only for a proven absence from the canonical chain of the returned
+    /// epoch. A store whose history starts after a checkpoint cannot prove an
+    /// absence and returns [`QueryError::CanonicalHistoryUnavailable`] on a
+    /// miss; storage faults, a missing epoch, and a pin this store cannot
+    /// serve are other [`QueryError`] values. This method never consults live
+    /// mempool state; mempool fall-through is the caller's responsibility on
+    /// this trait.
     async fn transaction(
         &self,
         transaction_id: TransactionId,
@@ -676,7 +679,10 @@ where
         let query_outcome = join_blocking(tokio::task::spawn_blocking(move || {
             let reader = open_chain_epoch_reader(&read_api, at_epoch_id)?;
             let chain_epoch = reader.chain_epoch();
-            let Some(artifact) = reader.transaction_facts_by_id(transaction_id)? else {
+            let Some(artifact) = reader
+                .transaction_facts_or_proven_absence(transaction_id)
+                .map_err(transaction_lookup_store_error)?
+            else {
                 return Ok(TransactionStatus {
                     chain_epoch,
                     status: TxStatus::NotFound,
@@ -1953,6 +1959,7 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         }
         Some(QueryError::InvalidAddress { .. }) => "invalid_address",
         Some(QueryError::ChainEpochPinUnavailable { .. }) => "chain_epoch_pin_unavailable",
+        Some(QueryError::CanonicalHistoryUnavailable { .. }) => "canonical_history_unavailable",
         Some(QueryError::UnsupportedChainEvent { .. }) => "unsupported_chain_event",
         Some(QueryError::UnsupportedBlockSelector { .. }) => "unsupported_block_selector",
         Some(QueryError::UnsupportedTransactionStatus { .. }) => "unsupported_transaction_status",
@@ -2394,6 +2401,16 @@ pub enum QueryError {
         chain_epoch_id: ChainEpochId,
     },
 
+    /// The store's retained canonical history starts after a checkpoint, so a
+    /// transaction lookup that missed cannot prove the transaction absent.
+    #[error(
+        "canonical history starts at height {first_available_height:?}; transaction absence cannot be proven"
+    )]
+    CanonicalHistoryUnavailable {
+        /// First height the store retains.
+        first_available_height: BlockHeight,
+    },
+
     /// Store returned a chain-event variant unsupported by the native protocol.
     #[error("unsupported chain event: {event}")]
     UnsupportedChainEvent {
@@ -2515,6 +2532,7 @@ impl zinder_proto::BoundaryError for QueryError {
             }
             Self::ChainEventCursorExpired { .. } => ErrorReason::ChainEventCursorExpired,
             Self::ChainEpochPinUnavailable { .. } => ErrorReason::ChainEpochPinUnavailable,
+            Self::CanonicalHistoryUnavailable { .. } => ErrorReason::CanonicalHistoryUnavailable,
             Self::ArtifactUnavailable { .. } => ErrorReason::ArtifactUnavailable,
             Self::CompactBlockPayloadMalformed { .. } => ErrorReason::CompactBlockPayloadMalformed,
             Self::ArtifactCorrupt { .. } => ErrorReason::ArtifactCorrupt,
@@ -2534,6 +2552,35 @@ impl zinder_proto::BoundaryError for QueryError {
             | Self::CanonicalStore(_)
             | Self::WalletStore(_) => ErrorReason::StorageUnavailable,
         }
+    }
+}
+
+/// Requires complete canonical history before a transaction lookup miss can
+/// be reported as an absence.
+pub(crate) fn require_complete_transaction_history(
+    history_bounds: CanonicalHistoryBounds,
+) -> Result<(), QueryError> {
+    if history_bounds.intentionally_excludes(BlockHeight::new(1)) {
+        return Err(QueryError::CanonicalHistoryUnavailable {
+            first_available_height: history_bounds.first_available_height(),
+        });
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "Only the history floor changes category on a transaction lookup; every other storage failure keeps the shared mapping."
+)]
+fn transaction_lookup_store_error(error: StoreError) -> QueryError {
+    match error {
+        StoreError::CanonicalHistoryUnavailable {
+            first_available_height,
+            ..
+        } => QueryError::CanonicalHistoryUnavailable {
+            first_available_height,
+        },
+        _ => QueryError::Store(error),
     }
 }
 
@@ -2708,6 +2755,9 @@ mod error_reason_tests {
                 event_sequence: 1,
                 oldest_retained_sequence: 2,
             },
+            QueryError::CanonicalHistoryUnavailable {
+                first_available_height: BlockHeight::new(101),
+            },
             QueryError::ChainEpochPinUnavailable {
                 chain_epoch_id: ChainEpochId::new(1),
             },
@@ -2755,6 +2805,30 @@ mod error_reason_tests {
                 "QueryError variant {error:?} mapped to ERROR_REASON_UNSPECIFIED"
             );
         }
+    }
+
+    #[test]
+    fn transaction_absence_requires_complete_history() -> Result<(), Box<dyn std::error::Error>> {
+        assert!(require_complete_transaction_history(CanonicalHistoryBounds::complete()).is_ok());
+        let checkpointed = CanonicalHistoryBounds::checkpointed(BlockId::new(
+            BlockHeight::new(100),
+            zinder_core::BlockHash::from_bytes([1; 32]),
+        ))?;
+        assert!(matches!(
+            require_complete_transaction_history(checkpointed),
+            Err(QueryError::CanonicalHistoryUnavailable {
+                first_available_height
+            }) if first_available_height == BlockHeight::new(101)
+        ));
+        let status = crate::status_from_query_error(&QueryError::CanonicalHistoryUnavailable {
+            first_available_height: BlockHeight::new(101),
+        });
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            zinder_proto::wire::canonical_history_first_available_height(&status)?,
+            Some(BlockHeight::new(101))
+        );
+        Ok(())
     }
 
     #[test]

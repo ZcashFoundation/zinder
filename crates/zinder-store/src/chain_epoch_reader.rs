@@ -295,6 +295,33 @@ impl<'store> ChainEpochReader<'store> {
         read_transaction_facts_artifact(&self.read_view, self.chain_epoch, transaction_id)
     }
 
+    /// Reads transaction facts by id, answering `None` only for a proven
+    /// absence.
+    ///
+    /// `Ok(None)` means the transaction is absent from this epoch's canonical
+    /// chain: the store retains complete canonical history, so every height
+    /// the transaction could be mined at was searched. When the store's
+    /// history starts after a checkpoint, a miss returns
+    /// [`StoreError::CanonicalHistoryUnavailable`] instead, because the
+    /// transaction may be mined at a height the store does not retain. A
+    /// secondary reader that moves off this epoch during the read returns
+    /// [`StoreError::ChainEpochConflict`], and storage faults keep their own
+    /// errors.
+    pub fn transaction_facts_or_proven_absence(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<TransactionFactsArtifact>, StoreError> {
+        let transaction_facts = self.read_at_pinned_secondary_epoch(|| {
+            read_transaction_facts_artifact(&self.read_view, self.chain_epoch, transaction_id)
+        })?;
+        if transaction_facts.is_none() {
+            // Complete history starts at height 1; genesis carries no
+            // spendable transaction a caller can look up.
+            self.ensure_history_height_available(BlockHeight::new(1))?;
+        }
+        Ok(transaction_facts)
+    }
+
     /// Reads transaction facts for many ids in one batched store read.
     pub fn transaction_facts_by_ids(
         &self,

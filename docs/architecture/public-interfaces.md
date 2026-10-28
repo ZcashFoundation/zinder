@@ -161,6 +161,12 @@ metadata only after successful store admission. The prior unshipped
   preflights has a client-owned `Capability` variant, so consumers do not
   import protocol constants or copy wire strings. Generated protobuf types are
   not public SDK vocabulary.
+- `ChainIndex::transaction_by_id` returns `TxStatus::NotFound` only for a
+  proven absence that answers the request: pinned to the requested epoch, or
+  covering the live mempool when unpinned. Ambiguous server answers become
+  `IndexerError::TransactionAbsenceUnverified`, and a store history floor
+  becomes `IndexerError::CanonicalHistoryUnavailable`; see
+  [Wallet data plane §Transaction absence](wallet-data-plane.md#transaction-absence).
 - Public traits describe consumer capabilities. Concrete RocksDB types remain
   at composition roots and storage adapters.
 
@@ -179,6 +185,8 @@ Important current reasons include:
 | `SCHEMA_MISMATCH` | Persisted store contract differs from the running binary |
 | `REORG_WINDOW_EXCEEDED` | Replacement crosses the configured reorg policy |
 | `BLOCK_NOT_IN_BEST_CHAIN` | Requested block is not visible in the admitted epoch |
+| `TRANSACTION_NOT_FOUND` | Proven transaction absence; the only `NOT_FOUND` reason that is an answer rather than a failure |
+| `CANONICAL_HISTORY_UNAVAILABLE` | Store history starts after a checkpoint, so a transaction absence cannot be proven |
 | `MATERIALIZED_VIEW_UNAVAILABLE` | Required materialized view is not configured or admitted |
 | `ENDPOINT_CAPABILITY_UNAVAILABLE` | The admitted endpoint does not structurally implement the requested operation |
 | `DEPENDENCY_NOT_CONFIGURED` | A required federated dependency is absent |

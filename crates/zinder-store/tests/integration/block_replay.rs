@@ -24,6 +24,7 @@ use zinder_store::{
 
 const BLOCK_REPLAY_COLUMN_FAMILY: &str = "block_replay";
 const REORG_WINDOW_COLUMN_FAMILY: &str = "reorg_window";
+const TRANSACTION_FACTS_COLUMN_FAMILY: &str = "transaction_facts";
 const BLOCK_HEADER_VISIBILITY_KEY_KIND: u8 = 33;
 
 #[test]
@@ -560,6 +561,56 @@ fn valid_length_visibility_pointer_to_displaced_replay_fails_closed() -> eyre::R
         }
     ));
 
+    Ok(())
+}
+
+#[test]
+fn missing_transaction_facts_row_is_a_storage_fault_not_an_absence() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let path = tempdir.path().join("canonical");
+    let options = ChainStoreOptions {
+        raw_blob_retention: zinder_store::RawBlobRetention::All,
+        ..ChainStoreOptions::for_local_tests()
+    };
+    {
+        let store = PrimaryChainStore::open(&path, options)?;
+        store.commit_chain_epoch(single_transaction_artifacts())?;
+    }
+    delete_first_row(&path, TRANSACTION_FACTS_COLUMN_FAMILY)?;
+
+    let store = PrimaryChainStore::open(&path, options)?;
+    let lookup = store
+        .current_chain_epoch_reader()?
+        .transaction_facts_or_proven_absence(TransactionId::from_bytes([7; 32]));
+
+    assert!(
+        matches!(
+            lookup,
+            Err(StoreError::ArtifactMissing {
+                family: ArtifactFamily::TransactionFacts,
+                ..
+            })
+        ),
+        "a visible transaction whose facts row is gone must fail, got {lookup:?}"
+    );
+    Ok(())
+}
+
+fn delete_first_row(path: &Path, column_family_name: &str) -> eyre::Result<()> {
+    let column_families = DB::list_cf(&Options::default(), path)?;
+    let database = DB::open_cf(&Options::default(), path, column_families)?;
+    let column_family = database
+        .cf_handle(column_family_name)
+        .ok_or_else(|| eyre!("missing {column_family_name} column family"))?;
+    let mut iterator = database.raw_iterator_cf(&column_family);
+    iterator.seek_to_first();
+    let key = iterator
+        .key()
+        .ok_or_else(|| eyre!("missing {column_family_name} row"))?
+        .to_vec();
+    drop(iterator);
+    database.delete_cf(&column_family, key)?;
+    database.flush_cf(&column_family)?;
     Ok(())
 }
 

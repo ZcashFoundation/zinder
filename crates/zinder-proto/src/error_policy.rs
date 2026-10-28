@@ -96,19 +96,20 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
         | ErrorReason::SchemaMismatch
         | ErrorReason::SchemaTooNew
         | ErrorReason::ReorgWindowExceeded
-        | ErrorReason::ChainEpochConflict
         | ErrorReason::ChainEpochNetworkMismatch
         | ErrorReason::MaterializedViewUnavailable
         | ErrorReason::EndpointCapabilityUnavailable
         | ErrorReason::DependencyNotConfigured
         | ErrorReason::NodeCapabilityMissing
-        | ErrorReason::ExplorerPreconditionUnsatisfied => {
+        | ErrorReason::ExplorerPreconditionUnsatisfied
+        | ErrorReason::CanonicalHistoryUnavailable => {
             ReasonPolicy::new(Code::FailedPrecondition, NonRetryable)
         }
 
         ErrorReason::ArtifactUnavailable
         | ErrorReason::ChainEpochMissing
-        | ErrorReason::BlockNotInBestChain => ReasonPolicy::new(Code::NotFound, RetryAfterBackoff),
+        | ErrorReason::BlockNotInBestChain
+        | ErrorReason::TransactionNotFound => ReasonPolicy::new(Code::NotFound, RetryAfterBackoff),
 
         ErrorReason::CompactBlockPayloadMalformed | ErrorReason::ArtifactCorrupt => {
             ReasonPolicy::new(Code::DataLoss, NonRetryable)
@@ -132,6 +133,10 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
         }
 
         ErrorReason::ExplorerMethodDisabled => ReasonPolicy::new(Code::Unimplemented, NonRetryable),
+
+        // A reader moved off its pinned epoch, or two commits raced for the
+        // next epoch. Re-reading at a fresh epoch clears it.
+        ErrorReason::ChainEpochConflict => ReasonPolicy::new(Code::Aborted, RetryAfterBackoff),
     }
 }
 

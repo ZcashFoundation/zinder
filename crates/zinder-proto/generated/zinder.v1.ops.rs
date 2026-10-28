@@ -359,6 +359,7 @@ pub enum ErrorReason {
     SchemaMismatch = 17,
     SchemaTooNew = 18,
     ReorgWindowExceeded = 19,
+    /// ABORTED family: retry at a fresh epoch.
     ChainEpochConflict = 20,
     ChainEpochNetworkMismatch = 21,
     /// NOT_FOUND family.
@@ -402,6 +403,21 @@ pub enum ErrorReason {
     /// metadata carries the stable `readiness_cause` label; `/readyz` carries
     /// any structured cause detail.
     ServiceNotReady = 50,
+    /// NOT_FOUND family.
+    /// Proven absence answered by `WalletQuery.Transaction`: the transaction is
+    /// in neither the canonical chain of the answering epoch nor, for a lookup
+    /// without `at_epoch_id`, the writer's live mempool at that same epoch, and
+    /// the store retains complete canonical history. ErrorInfo metadata carries
+    /// `chain_epoch_id`, `first_covered_height`, `visible_tip_height`, and
+    /// `covers_mempool`. No other failure carries this reason; every other
+    /// NOT_FOUND on that method is a failure, not an absence.
+    TransactionNotFound = 51,
+    /// FAILED_PRECONDITION family.
+    /// The store's retained canonical history starts after a checkpoint, so a
+    /// lookup that must cover earlier heights cannot be answered. ErrorInfo
+    /// metadata carries `first_available_height`. Waiting never clears it;
+    /// query a store with complete history.
+    CanonicalHistoryUnavailable = 52,
 }
 impl ErrorReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -460,6 +476,8 @@ impl ErrorReason {
             Self::DependencyNotConfigured => "DEPENDENCY_NOT_CONFIGURED",
             Self::UpstreamUnreachable => "UPSTREAM_UNREACHABLE",
             Self::ServiceNotReady => "SERVICE_NOT_READY",
+            Self::TransactionNotFound => "TRANSACTION_NOT_FOUND",
+            Self::CanonicalHistoryUnavailable => "CANONICAL_HISTORY_UNAVAILABLE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -521,6 +539,8 @@ impl ErrorReason {
             "DEPENDENCY_NOT_CONFIGURED" => Some(Self::DependencyNotConfigured),
             "UPSTREAM_UNREACHABLE" => Some(Self::UpstreamUnreachable),
             "SERVICE_NOT_READY" => Some(Self::ServiceNotReady),
+            "TRANSACTION_NOT_FOUND" => Some(Self::TransactionNotFound),
+            "CANONICAL_HISTORY_UNAVAILABLE" => Some(Self::CanonicalHistoryUnavailable),
             _ => None,
         }
     }

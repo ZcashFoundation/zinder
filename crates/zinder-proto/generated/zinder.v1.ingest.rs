@@ -1803,7 +1803,10 @@ pub mod ingest_control_client {
         /// Returns one transaction from the writer's live mempool index. The
         /// response uses the public wallet transaction-status shape so
         /// `WalletQuery.Transaction` can preserve one location contract across
-        /// canonical and transient state without scanning a snapshot.
+        /// canonical and transient state without scanning a snapshot. A miss is
+        /// NOT_FOUND with reason TRANSACTION_NOT_FOUND whose `chain_epoch_id`
+        /// metadata names the writer epoch the mempool view was coherent with, so
+        /// the query plane can pair it with a canonical miss at that same epoch.
         pub async fn mempool_transaction(
             &mut self,
             request: impl tonic::IntoRequest<super::MempoolTransactionRequest>,
@@ -2074,7 +2077,10 @@ pub mod ingest_control_server {
         /// Returns one transaction from the writer's live mempool index. The
         /// response uses the public wallet transaction-status shape so
         /// `WalletQuery.Transaction` can preserve one location contract across
-        /// canonical and transient state without scanning a snapshot.
+        /// canonical and transient state without scanning a snapshot. A miss is
+        /// NOT_FOUND with reason TRANSACTION_NOT_FOUND whose `chain_epoch_id`
+        /// metadata names the writer epoch the mempool view was coherent with, so
+        /// the query plane can pair it with a canonical miss at that same epoch.
         async fn mempool_transaction(
             &self,
             request: tonic::Request<super::MempoolTransactionRequest>,
