@@ -788,14 +788,8 @@ pub(crate) struct ParkedWriterHalt {
 }
 
 impl ParkedWriterHalt {
-    pub(crate) const fn new(depth: u64, configured: u64, covered: Option<u64>) -> Self {
-        Self {
-            detail: ops::ReorgWindowExceededDetail {
-                depth,
-                configured,
-                covered,
-            },
-        }
+    pub(crate) const fn new(detail: ops::ReorgWindowExceededDetail) -> Self {
+        Self { detail }
     }
 
     /// Returns the status a refused command or ended stream carries: the same

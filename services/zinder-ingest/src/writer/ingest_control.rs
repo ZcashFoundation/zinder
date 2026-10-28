@@ -531,20 +531,6 @@ fn writer_status_response(
         } else {
             None
         };
-    let reorg_window_exceeded = if let ReadinessCause::ReorgWindowExceeded {
-        depth,
-        configured,
-        covered,
-    } = readiness_report.cause
-    {
-        Some(ops::ReorgWindowExceededDetail {
-            depth,
-            configured,
-            covered,
-        })
-    } else {
-        None
-    };
     WriterStatusResponse {
         chain_view,
         network_name: encode_zinder_native_chain_name(network).to_owned(),
@@ -554,7 +540,7 @@ fn writer_status_response(
             .into(),
         gap_blocks,
         upstream_not_ready,
-        reorg_window_exceeded,
+        reorg_window_exceeded: readiness_report.cause.reorg_window_exceeded_detail(),
     }
 }
 
@@ -765,7 +751,11 @@ mod tests {
             .ok_or("mempool event stream ended before its retained event")??;
         assert_eq!(first.event_sequence, 1);
 
-        let halt = ParkedWriterHalt::new(1_001, 1_000, Some(1_000));
+        let halt = ParkedWriterHalt::new(zinder_proto::v1::ops::ReorgWindowExceededDetail {
+            depth: 1_001,
+            configured: 1_000,
+            covered: Some(1_000),
+        });
         *fixture.parked.lock() = Some(halt);
         fixture.mempool.halt(halt).await;
 

@@ -16,6 +16,7 @@ use zinder_core::{
     CommitmentTreeAccumulatorError, CommitmentTreeCheckpoint, NetworkUpgradeActivations,
     ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, UnixTimestampMillis,
 };
+use zinder_proto::v1::ops::ReorgWindowExceededDetail;
 use zinder_runtime::{IngestPhase, Readiness, ReadinessCause, ReadinessState};
 use zinder_source::{NodeSource, SourceBlock, SourceError};
 use zinder_store::{
@@ -252,21 +253,23 @@ impl CanonicalReorgWindowExceeded {
     /// evidence.
     #[must_use]
     pub fn parked_readiness(&self) -> ReadinessState {
-        ReadinessState::reorg_window_exceeded(
-            u64::from(self.required_depth),
-            u64::from(self.configured_window_blocks),
-            Some(u64::from(self.covered_depth_blocks)),
-            Some(self.local_tip.height.value()),
-        )
+        ReadinessState {
+            current_height: Some(self.local_tip.height.value()),
+            ..ReadinessState::not_ready(self.detail().into())
+        }
         .with_phase(IngestPhase::FollowingTip)
     }
 
     pub(crate) fn halt(&self) -> ParkedWriterHalt {
-        ParkedWriterHalt::new(
-            u64::from(self.required_depth),
-            u64::from(self.configured_window_blocks),
-            Some(u64::from(self.covered_depth_blocks)),
-        )
+        ParkedWriterHalt::new(self.detail())
+    }
+
+    fn detail(&self) -> ReorgWindowExceededDetail {
+        ReorgWindowExceededDetail {
+            depth: u64::from(self.required_depth),
+            configured: u64::from(self.configured_window_blocks),
+            covered: Some(u64::from(self.covered_depth_blocks)),
+        }
     }
 }
 
