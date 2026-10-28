@@ -600,6 +600,16 @@ impl Readiness {
         self.inner.lock().state.phase
     }
 
+    /// Returns the halt of a writer parked by a reorg deeper than its window,
+    /// or `None` for any other cause.
+    ///
+    /// Cheaper than [`Self::report`] for hot readers that only check for the
+    /// halt, such as open streams that poll it per page.
+    #[must_use]
+    pub fn reorg_window_exceeded(&self) -> Option<ops_proto::ReorgWindowExceededDetail> {
+        self.inner.lock().state.cause.reorg_window_exceeded_detail()
+    }
+
     /// Replaces the cause with [`ReadinessCause::UpstreamNotReady`] while
     /// preserving the writer's last visible `current_height` and any
     /// concurrently-set ingest phase. Used by the upstream-health probe.
@@ -1490,6 +1500,16 @@ mod tests {
             }
         ));
         assert_eq!(report.current_height, Some(100));
+        assert_eq!(
+            readiness.reorg_window_exceeded(),
+            Some(ops_proto::ReorgWindowExceededDetail {
+                depth: 12,
+                configured: 10,
+                covered: Some(11),
+            })
+        );
+        readiness.set(ReadinessState::ready(Some(100)));
+        assert_eq!(readiness.reorg_window_exceeded(), None);
     }
 
     #[test]

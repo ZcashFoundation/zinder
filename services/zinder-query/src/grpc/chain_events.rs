@@ -111,8 +111,9 @@ pub(super) fn spawn_filtered_stream<Q>(
 }
 
 fn writer_halt_status(readiness: &Readiness) -> Option<tonic::Status> {
-    let cause = readiness.report().cause;
-    matches!(cause, ReadinessCause::ReorgWindowExceeded { .. }).then(|| not_ready_status(&cause))
+    readiness
+        .reorg_window_exceeded()
+        .map(|halt| not_ready_status(&ReadinessCause::from(halt)))
 }
 
 /// Filters `envelopes` against `filter`, preserving every reorg envelope
