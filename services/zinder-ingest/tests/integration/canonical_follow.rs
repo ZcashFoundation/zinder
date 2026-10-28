@@ -808,6 +808,123 @@ async fn reopened_writer_reports_an_unconfirmed_tip_until_the_source_confirms_it
     Ok(())
 }
 
+/// A committed append confirms a reopened writer's tip: the appended block
+/// named the visible tip as its parent.
+#[tokio::test]
+async fn committed_append_confirms_a_reopened_writer_tip() -> Result<(), Box<dyn std::error::Error>>
+{
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let original = parseable_multi_block_chain()?;
+    let source = RecordingParseableSource::new(
+        original.clone(),
+        checkpoints_for_parseable_chain(&original, &activations)?,
+        BlockHeight::new(3),
+    );
+    let temporary = tempdir()?;
+    let built = original
+        .range(..=BlockHeight::new(3))
+        .map(|(height, block)| (*height, block.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let store = publish_parseable_store(
+        &source,
+        &built,
+        Arc::clone(&activations),
+        &temporary.path().join("canonical"),
+        3,
+        BlockHeight::new(1),
+    )
+    .await?;
+    source.set_tip_height(BlockHeight::new(4));
+    let (before, after) = statuses_around_first_commit(store, &source, &activations).await?;
+    assert!(before.tip_unconfirmed);
+    assert!(!after.tip_unconfirmed);
+    assert_eq!(after.fence.map(|fence| fence.visible_tip_height), Some(4));
+    Ok(())
+}
+
+/// A committed replacement confirms a reopened writer's tip: the store then
+/// carries the node's branch.
+#[tokio::test]
+async fn committed_replacement_confirms_a_reopened_writer_tip()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let original = parseable_multi_block_chain()?;
+    let source = RecordingParseableSource::new(
+        original.clone(),
+        checkpoints_for_parseable_chain(&original, &activations)?,
+        BlockHeight::new(4),
+    );
+    let temporary = tempdir()?;
+    let store = publish_parseable_store(
+        &source,
+        &original,
+        Arc::clone(&activations),
+        &temporary.path().join("canonical"),
+        3,
+        BlockHeight::new(1),
+    )
+    .await?;
+    let original_fence = store.event_fence();
+    let fork = forked_parseable_chain(&original, 3, 4, 107)?;
+    source.replace_chain(
+        fork.clone(),
+        checkpoints_for_parseable_chain(&fork, &activations)?,
+        BlockHeight::new(4),
+    );
+    let (before, after) = statuses_around_first_commit(store, &source, &activations).await?;
+    assert!(before.tip_unconfirmed);
+    assert!(!after.tip_unconfirmed);
+    assert_ne!(
+        after.fence.map(|fence| fence.event_sequence),
+        Some(original_fence.chain_event_sequence())
+    );
+    Ok(())
+}
+
+/// Returns the writer status before the reopened writer's first source
+/// observation and the one after its first commit.
+///
+/// The source becomes unreachable once that commit is done, so no at-tip
+/// observation can confirm the tip in its place.
+async fn statuses_around_first_commit(
+    store: zinder_store::RocksDbCanonicalStore,
+    source: &RecordingParseableSource,
+    activations: &Arc<NetworkUpgradeActivations>,
+) -> Result<
+    (
+        zinder_proto::v1::ingest::CanonicalWriterStatusResponse,
+        zinder_proto::v1::ingest::CanonicalWriterStatusResponse,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    source.clear_calls();
+    let (second_tip_call, resume_second_tip_call) = source.pause_tip_call(2);
+    let readiness = Readiness::default();
+    let cancel = CancellationToken::new();
+    let (canonical, commands) = zinder_ingest::canonical_control_channel();
+    let follower = single_pass_follower(source, activations, &readiness, &cancel);
+    // Polled first, so its first request is queued before the writer's first
+    // source observation.
+    let observe = async {
+        let before = canonical.writer_status().await?;
+        second_tip_call.notified().await;
+        source.set_tip_height(BlockHeight::new(99));
+        resume_second_tip_call.notify_one();
+        while !matches!(readiness.report().cause, ReadinessCause::NodeUnavailable(_)) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let after = canonical.writer_status().await?;
+        cancel.cancel();
+        Ok::<_, tonic::Status>((before, after))
+    };
+    let (statuses, outcome) = tokio::join!(
+        observe,
+        follow_canonical_tip_with_control(store, follower, commands),
+    );
+    outcome?;
+    Ok(statuses?)
+}
+
 /// With a three-block window over tip 4 and settled tip 1, forks two and
 /// three blocks deep are replaced and a four-block fork parks the writer.
 #[tokio::test]
