@@ -38,6 +38,7 @@ version and commit appear in the `zinder_build_info` metric and native
 | `serving_pair_stale` | A wallet-serving reader cannot refresh its published pair, which is still within its staleness ceiling. |
 | `writer_status_unavailable` | A trusted reader cannot reach the writer control API. |
 | `ingest_control_unavailable` | Native wallet live-state health failed on the admitted ingest-control channel. |
+| `canonical_tip_unconfirmed` | The canonical writer has not confirmed its store's visible tip against its node since it opened the store, so wallet-serving readers do not serve its fence yet. |
 | `cursor_at_risk` | Canonical event retention is approaching an active cursor. |
 | `shutting_down` | New traffic has been drained for termination. |
 

@@ -159,6 +159,11 @@ pub enum ReadinessCause {
     /// The authenticated ingest-control channel or one of its required live
     /// health RPCs is temporarily unavailable.
     IngestControlUnavailable,
+    /// The canonical writer has not confirmed its store's visible tip against
+    /// its node since it opened the store, so its fence may sit on a branch
+    /// the node abandoned. Clears once the writer observes that tip on the
+    /// node's branch or commits past it.
+    CanonicalTipUnconfirmed,
     /// Retained event history is approaching the configured cursor-expiry window.
     CursorAtRisk {
         /// Age of the oldest retained event, rounded down to whole hours.
@@ -329,6 +334,7 @@ impl ReadinessCause {
         "serving_pair_stale",
         "writer_status_unavailable",
         "ingest_control_unavailable",
+        "canonical_tip_unconfirmed",
         "cursor_at_risk",
         "shutting_down",
         "upstream_not_ready",
@@ -350,6 +356,7 @@ impl ReadinessCause {
             Self::ServingPairStale { .. } => "serving_pair_stale",
             Self::WriterStatusUnavailable => "writer_status_unavailable",
             Self::IngestControlUnavailable => "ingest_control_unavailable",
+            Self::CanonicalTipUnconfirmed => "canonical_tip_unconfirmed",
             Self::CursorAtRisk { .. } => "cursor_at_risk",
             Self::ShuttingDown => "shutting_down",
             Self::UpstreamNotReady(_) => "upstream_not_ready",
@@ -378,6 +385,7 @@ impl ReadinessCause {
             | Self::ServingPairStale { .. }
             | Self::WriterStatusUnavailable
             | Self::IngestControlUnavailable
+            | Self::CanonicalTipUnconfirmed
             | Self::CursorAtRisk { .. }
             | Self::ShuttingDown
             | Self::UpstreamNotReady(_) => None,
@@ -948,6 +956,7 @@ impl From<&ReadinessCause> for ops_proto::ReadinessCause {
             ReadinessCause::ServingPairStale { .. } => Self::ServingPairStale,
             ReadinessCause::WriterStatusUnavailable => Self::WriterStatusUnavailable,
             ReadinessCause::IngestControlUnavailable => Self::IngestControlUnavailable,
+            ReadinessCause::CanonicalTipUnconfirmed => Self::CanonicalTipUnconfirmed,
             ReadinessCause::CursorAtRisk { .. } => Self::CursorAtRisk,
             ReadinessCause::ShuttingDown => Self::ShuttingDown,
             ReadinessCause::UpstreamNotReady(_) => Self::UpstreamNotReady,
@@ -1048,6 +1057,7 @@ impl From<&ReadinessCause> for Option<ops_proto::ReadinessCauseDetail> {
             | ReadinessCause::SchemaMismatch
             | ReadinessCause::WriterStatusUnavailable
             | ReadinessCause::IngestControlUnavailable
+            | ReadinessCause::CanonicalTipUnconfirmed
             | ReadinessCause::ShuttingDown => return None,
         };
         Some(ops_proto::ReadinessCauseDetail {
@@ -1518,6 +1528,7 @@ mod tests {
             },
             ReadinessCause::WriterStatusUnavailable,
             ReadinessCause::IngestControlUnavailable,
+            ReadinessCause::CanonicalTipUnconfirmed,
             ReadinessCause::CursorAtRisk {
                 oldest_retained_age_hours: 0,
                 retention_hours: 0,
@@ -1569,6 +1580,9 @@ mod tests {
             ReadinessCause::IngestControlUnavailable => {
                 ops_proto::ReadinessCause::IngestControlUnavailable
             }
+            ReadinessCause::CanonicalTipUnconfirmed => {
+                ops_proto::ReadinessCause::CanonicalTipUnconfirmed
+            }
             ReadinessCause::CursorAtRisk { .. } => ops_proto::ReadinessCause::CursorAtRisk,
             ReadinessCause::ShuttingDown => ops_proto::ReadinessCause::ShuttingDown,
             ReadinessCause::UpstreamNotReady(_) => ops_proto::ReadinessCause::UpstreamNotReady,
@@ -1614,6 +1628,7 @@ mod tests {
             },
             ReadinessCause::WriterStatusUnavailable,
             ReadinessCause::IngestControlUnavailable,
+            ReadinessCause::CanonicalTipUnconfirmed,
             ReadinessCause::CursorAtRisk {
                 oldest_retained_age_hours: 0,
                 retention_hours: 0,

@@ -2496,6 +2496,7 @@ mod tests {
         commits_remaining: Option<u32>,
         catch_ups: u32,
         schedule_lag_catch_ups: u32,
+        tip_unconfirmed: bool,
     }
 
     impl ScriptedProbe {
@@ -2506,6 +2507,7 @@ mod tests {
                 commits_remaining,
                 catch_ups: 0,
                 schedule_lag_catch_ups: 0,
+                tip_unconfirmed: false,
             }
         }
     }
@@ -2530,7 +2532,10 @@ mod tests {
                 }
                 None => self.writer_sequence += 1,
             }
-            Ok(writer_status(source_identity(self.writer_sequence, 7)))
+            Ok(CanonicalWriterStatusResponse {
+                tip_unconfirmed: self.tip_unconfirmed,
+                ..writer_status(source_identity(self.writer_sequence, 7))
+            })
         }
     }
 
@@ -2560,6 +2565,29 @@ mod tests {
 
         assert!(matches!(outcome, Ok(FenceConvergence::Converged)));
         assert_eq!(probe.catch_ups, 7);
+        assert!(readiness.report().is_ready);
+    }
+
+    /// The projector converges on, and stays ready against, a writer that has
+    /// not confirmed its tip since it reopened; only wallet-serving readers
+    /// refuse that fence.
+    #[tokio::test]
+    async fn fence_convergence_ignores_an_unconfirmed_writer_tip() {
+        let mut probe = ScriptedProbe::new(Some(0));
+        probe.tip_unconfirmed = true;
+        let readiness =
+            zinder_runtime::Readiness::new(zinder_runtime::ReadinessState::ready(Some(1)));
+
+        let outcome = converge_probe_on_writer_fence(
+            &mut probe,
+            test_network(),
+            &readiness,
+            &CancellationToken::new(),
+            fast_policy(Duration::from_secs(5)),
+        )
+        .await;
+
+        assert!(matches!(outcome, Ok(FenceConvergence::Converged)));
         assert!(readiness.report().is_ready);
     }
 

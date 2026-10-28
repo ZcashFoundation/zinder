@@ -134,6 +134,39 @@ modes with one additive field, without giving compatibility the native
 ingest-control probe and the mempool and upstream-health gating that comes
 with it.
 
+### Unconfirmed tip after a restart
+
+The halt lives in the parked process, not in the store. A restarted writer
+cannot report it until its first follow iteration rediscovers the reorg, and
+until then its persisted fence may sit on a branch the node abandoned. The
+writer therefore sets `CanonicalControl.WriterStatus.tip_unconfirmed` from the
+moment it opens the store until an observation proves the visible tip is on
+the node's branch:
+
+- an at-tip observation whose source tip is exactly the store's visible tip,
+  same height and hash, or
+- a committed append, whose source block named the visible tip as its parent,
+  or a committed replacement, which leaves the store on the node's branch.
+
+Serving the persisted fence never clears it, so a status read before any
+source observation cannot vouch for the fence. A parked writer also sets it.
+If the first observation finds a fork deeper than the window, the writer
+parks and the halt takes over without the flag ever clearing.
+
+The serving-pair publisher and compact-block serving report the
+`canonical_tip_unconfirmed` readiness cause while the flag is set, grant no
+`serving_pair_stale` allowance from such a status, and keep a remembered halt
+instead of replacing it with the weaker cause, because a writer restarted
+after a park reports the halt again only once it rediscovers the reorg. Native
+query honours the flag through the same publisher; its ingest-control probe is
+unchanged. The projector ignores the flag and keeps converging on the fence.
+
+The unready time is bounded only by the writer's first successful source
+observation. A writer that cannot reach its node after a restart keeps the
+flag set, so wallet-serving readers stay unready for as long as the node is
+unreachable. That is intended: Zinder fails closed rather than serve a fence
+nobody has confirmed.
+
 The supported single-host image keeps running in this state. Restarting would
 park the writer on the same reorg and replace the typed refusal with refused
 connections, so its entrypoint ends the container only for causes such as
@@ -152,10 +185,14 @@ Wallet consumers receive the halt through the existing error vocabulary:
 - `zinder-client` decodes the status as `IndexerError::ReorgWindowExceeded`
   with retry policy `OperatorActionRequired`.
 
-The proto changes are additive fields on private control messages. The wallet
-surface gains no new message or field, so no contract revision changes. A
-reader from an earlier release ignores the canonical-status halt and keeps
-reporting ready on the frozen fence, so upgrade readers together with ingest.
+The proto changes are additive: `reorg_window_exceeded` (field 5) and
+`tip_unconfirmed` (field 6) on `CanonicalWriterStatusResponse`, and the
+`READINESS_CAUSE_CANONICAL_TIP_UNCONFIRMED` value. The wallet surface gains no
+new message or field, so no contract revision changes. Version skew follows
+from both fields being absent on older writers and ignored by older readers:
+a reader from an earlier release reports ready on a parked or unconfirmed
+writer, and a reader of this release against an earlier writer sees neither
+field and attests the fence as before. Upgrade readers together with ingest.
 
 ## Alternatives
 
@@ -182,14 +219,10 @@ operators would still need to raise it as observed reorgs grow.
 
 ## Consequences
 
-- The halt lives in the parked process, not in the store. A restarted writer
-  answers writer status without it until its first follow iteration
-  rediscovers the reorg and parks again, typically after one window of block
-  reads. During that window lightwalletd compatibility can report ready on
-  the abandoned branch. Native query stays unready, because its
-  ingest-control probe needs a mempool snapshot that cannot certify against a
-  node on another branch. The same window existed when a parked writer
-  exited and restarted.
+- Every writer restart leaves wallet-serving readers unready with
+  `canonical_tip_unconfirmed` until the writer's first source observation
+  confirms its tip, usually one poll after it opens the store. While the node
+  is unreachable, they stay unready.
 
 - The settled tip trails the visible tip by up to 1000 blocks. Surfaces that
   report finality from the settled tip report it later than before.

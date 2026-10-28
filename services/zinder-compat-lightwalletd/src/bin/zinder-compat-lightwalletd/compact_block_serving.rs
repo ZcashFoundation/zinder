@@ -236,12 +236,14 @@ pub(crate) struct CompactBlockPublisher {
     slot: CompactBlockServingSlot,
     active_generation: usize,
     retired: Option<Arc<RocksDbCanonicalSecondary>>,
-    /// Last attestation of the active reader by a following writer. `None`
-    /// while the writer is parked, so a frozen reader never earns a staleness
-    /// allowance that would admit traffic.
+    /// Last attestation of the active reader by a following writer with a
+    /// confirmed tip. `None` while the writer is parked or has not confirmed
+    /// its tip, so such a reader never earns a staleness allowance that would
+    /// admit traffic.
     last_attested: Option<tokio::time::Instant>,
-    /// Halt the writer last reported. Writer-status failures republish it
-    /// until a valid status without the halt clears it.
+    /// Halt the writer last reported. Writer-status failures and statuses
+    /// with an unconfirmed tip republish it until a valid status with neither
+    /// clears it.
     parked: Option<ReadinessState>,
     /// Activation table each new generation opens with: the node's table at
     /// startup, then the table the writer reports, so generations keep
@@ -269,11 +271,16 @@ impl CompactBlockPublisher {
         let reader = Arc::new(candidate);
         let slot = CompactBlockServingSlot::new(Arc::clone(&reader));
         let visible_height = reader.event_fence().visible_tip().height.value();
-        let parked = parked_writer_readiness(&attesting_status, config.network, visible_height);
+        let mut parked = None;
+        let refusal = writer_status_refusal(
+            &attesting_status,
+            config.network,
+            visible_height,
+            &mut parked,
+        );
+        let last_attested = refusal.is_none().then(tokio::time::Instant::now);
         readiness.publish_storage(
-            parked
-                .clone()
-                .unwrap_or_else(|| ReadinessState::ready(Some(visible_height))),
+            refusal.unwrap_or_else(|| ReadinessState::ready(Some(visible_height))),
         );
         let publisher = Self {
             config,
@@ -282,7 +289,7 @@ impl CompactBlockPublisher {
             slot: slot.clone(),
             active_generation: 0,
             retired: None,
-            last_attested: parked.is_none().then(tokio::time::Instant::now),
+            last_attested,
             parked,
             generation_activations,
         };
@@ -343,14 +350,14 @@ impl CompactBlockPublisher {
         };
         // A parked writer keeps attesting its frozen fence; the reader stays
         // published but refuses traffic with the writer's typed halt.
-        self.parked = parked_writer_readiness(
+        if let Some(refusal) = writer_status_refusal(
             &status,
             self.config.network,
             active.event_fence().visible_tip().height.value(),
-        );
-        if let Some(parked) = self.parked.clone() {
+            &mut self.parked,
+        ) {
             self.last_attested = None;
-            self.readiness.publish_storage(parked);
+            self.readiness.publish_storage(refusal);
             return;
         }
         let active_epoch = active.event_fence().chain_epoch_id().value();
@@ -502,13 +509,15 @@ impl CompactBlockPublisher {
         // The writer can park between the first fetch and the one that
         // attested the candidate; the attesting status decides, as at bootstrap.
         let visible_height = reader.event_fence().visible_tip().height.value();
-        self.parked =
-            parked_writer_readiness(&attesting_status, self.config.network, visible_height);
-        self.last_attested = self.parked.is_none().then(tokio::time::Instant::now);
+        let refusal = writer_status_refusal(
+            &attesting_status,
+            self.config.network,
+            visible_height,
+            &mut self.parked,
+        );
+        self.last_attested = refusal.is_none().then(tokio::time::Instant::now);
         self.readiness.publish_storage(
-            self.parked
-                .clone()
-                .unwrap_or_else(|| ReadinessState::ready(Some(visible_height))),
+            refusal.unwrap_or_else(|| ReadinessState::ready(Some(visible_height))),
         );
     }
 
@@ -648,6 +657,37 @@ fn parked_writer_readiness(
             )
         },
     )
+}
+
+/// Returns the not-ready state a writer status imposes on the reader, and
+/// keeps `remembered_halt` current.
+///
+/// A halt is remembered until a valid status carries neither the halt nor an
+/// unconfirmed tip. A status with an unconfirmed tip keeps any remembered
+/// halt, because a writer that restarts after a park reports the halt again
+/// only once it rediscovers the reorg.
+fn writer_status_refusal(
+    status: &CanonicalWriterStatusResponse,
+    network: Network,
+    visible_height: u32,
+    remembered_halt: &mut Option<ReadinessState>,
+) -> Option<ReadinessState> {
+    if let Some(halt) = parked_writer_readiness(status, network, visible_height) {
+        *remembered_halt = Some(halt.clone());
+        return Some(halt);
+    }
+    if status.tip_unconfirmed
+        && status.network_name == zinder_core::wire::encode_zinder_native_chain_name(network)
+    {
+        return Some(remembered_halt.clone().unwrap_or(ReadinessState {
+            cause: ReadinessCause::CanonicalTipUnconfirmed,
+            current_height: Some(visible_height),
+            target_height: None,
+            phase: None,
+        }));
+    }
+    *remembered_halt = None;
+    None
 }
 
 /// Converges `candidate` on the writer fence and returns it with the writer
@@ -1868,6 +1908,114 @@ mod tests {
         publisher_handle.await?;
         drop(replaced);
         drop(reused);
+        let _ = shutdown_sender.send(());
+        server.await??;
+        Ok(())
+    }
+
+    /// Compact serving refuses a writer that has not confirmed its tip since
+    /// it reopened.
+    ///
+    /// It stays unready with `canonical_tip_unconfirmed`, never
+    /// `serving_pair_stale`, through a writer-status outage, keeps a
+    /// remembered halt while the flag is set, and turns ready only once a
+    /// status carries neither.
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "bootstrap, outage, recovery, a park, and the restarted writer form one causal sequence"
+    )]
+    async fn publisher_refuses_a_writer_with_an_unconfirmed_tip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let activations = lifecycle_activations();
+        let (primary, _blocks) =
+            lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
+        let unconfirmed_status = CanonicalWriterStatusResponse {
+            tip_unconfirmed: true,
+            ..lifecycle_writer_status(&primary)
+        };
+        let control = MutableCanonicalControl::new(unconfirmed_status.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let server = tokio::spawn({
+            let control = control.clone();
+            async move {
+                Server::builder()
+                    .add_service(CanonicalControlServer::new(control))
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                        let _ = shutdown_receiver.await;
+                    })
+                    .await
+            }
+        });
+        let readiness = Readiness::default();
+        let serving_readiness = CompactServingReadiness::new(readiness.clone());
+        serving_readiness.publish_node(ReadinessCause::Ready);
+        let config = CompactBlockServingConfig {
+            canonical_primary_path: temporary.path().join("canonical-primary"),
+            canonical_secondary_root: temporary.path().join("canonical-secondaries"),
+            network: Network::ZcashRegtest,
+            activations: Arc::new(activations.clone()),
+            raw_blob_retention: RawBlobRetention::Transactions,
+            reorg_policy: CanonicalReorgPolicy::new(100)?,
+            resource_budget: RocksDbResourceBudget::for_local_tests(),
+            catchup_interval: Duration::from_millis(1),
+            convergence_timeout: Duration::from_secs(2),
+            convergence_attempts: 4,
+            staleness_ceiling: Duration::from_mins(1),
+            lag_threshold: 0,
+        };
+        let (mut publisher, slot) =
+            CompactBlockPublisher::bootstrap(config, serving_readiness, &endpoint, None).await?;
+        assert_eq!(
+            readiness.report().cause,
+            ReadinessCause::CanonicalTipUnconfirmed
+        );
+        assert!(!readiness.report().is_ready);
+
+        control.set_available(false);
+        publisher.refresh().await;
+        let during_outage = readiness.report();
+        assert!(!during_outage.is_ready);
+        assert_ne!(during_outage.cause.metric_label(), "serving_pair_stale");
+
+        control.set_available(true);
+        publisher.refresh().await;
+        assert_eq!(
+            readiness.report().cause,
+            ReadinessCause::CanonicalTipUnconfirmed
+        );
+
+        control.set_writer_status(lifecycle_writer_status(&primary));
+        publisher.refresh().await;
+        assert!(readiness.report().is_ready);
+
+        // A park, then a restarted writer that has not yet rediscovered it,
+        // keeps the remembered halt instead of the unconfirmed cause.
+        control.set_writer_status(CanonicalWriterStatusResponse {
+            reorg_window_exceeded: Some(zinder_proto::v1::ops::ReorgWindowExceededDetail {
+                depth: 1_001,
+                configured: 1_000,
+                covered: Some(1_000),
+            }),
+            tip_unconfirmed: true,
+            ..lifecycle_writer_status(&primary)
+        });
+        publisher.refresh().await;
+        control.set_writer_status(unconfirmed_status);
+        publisher.refresh().await;
+        assert!(matches!(
+            readiness.report().cause,
+            ReadinessCause::ReorgWindowExceeded { .. }
+        ));
+        control.set_writer_status(lifecycle_writer_status(&primary));
+        publisher.refresh().await;
+        assert!(readiness.report().is_ready);
+
+        drop(slot);
+        drop(publisher);
         let _ = shutdown_sender.send(());
         server.await??;
         Ok(())

@@ -268,6 +268,10 @@ pub enum ReadinessCause {
     /// The authenticated ingest-control channel or one of its required live
     /// health RPCs is temporarily unavailable.
     IngestControlUnavailable = 18,
+    /// The canonical writer has not confirmed its store's visible tip against
+    /// its node since it opened the store, so its fence may sit on a branch the
+    /// node abandoned. Wallet-serving readers refuse traffic until it does.
+    CanonicalTipUnconfirmed = 19,
 }
 impl ReadinessCause {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -294,6 +298,7 @@ impl ReadinessCause {
             Self::IngestControlUnavailable => {
                 "READINESS_CAUSE_INGEST_CONTROL_UNAVAILABLE"
             }
+            Self::CanonicalTipUnconfirmed => "READINESS_CAUSE_CANONICAL_TIP_UNCONFIRMED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -320,6 +325,9 @@ impl ReadinessCause {
             "READINESS_CAUSE_SERVING_PAIR_STALE" => Some(Self::ServingPairStale),
             "READINESS_CAUSE_INGEST_CONTROL_UNAVAILABLE" => {
                 Some(Self::IngestControlUnavailable)
+            }
+            "READINESS_CAUSE_CANONICAL_TIP_UNCONFIRMED" => {
+                Some(Self::CanonicalTipUnconfirmed)
             }
             _ => None,
         }

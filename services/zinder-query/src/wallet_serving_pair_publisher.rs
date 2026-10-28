@@ -545,12 +545,14 @@ pub struct WalletServingPairPublisher {
     /// reference is alive.
     retired_pair: Option<Arc<WalletServingReadPair>>,
     /// Instant of the last attestation of the published pair by a following
-    /// writer. `None` while the writer is parked, so a frozen pair never earns
-    /// a staleness allowance that would admit traffic.
+    /// writer with a confirmed tip. `None` while the writer is parked or has
+    /// not confirmed its tip, so such a pair never earns a staleness allowance
+    /// that would admit traffic.
     attested_at: Option<Instant>,
-    /// Halt the writer last reported. Refresh failures republish it until a
-    /// valid writer status without the halt clears it, so a writer-status
-    /// outage cannot reopen traffic on a frozen pair.
+    /// Halt the writer last reported. Refresh failures and statuses with an
+    /// unconfirmed tip republish it until a valid writer status with neither
+    /// clears it, so a writer-status outage or a writer restart cannot reopen
+    /// traffic on a frozen pair.
     parked: Option<ReadinessState>,
     /// Writer lag observed at the last successful writer-status fetch.
     observed_lag_chain_epochs: u64,
@@ -679,7 +681,7 @@ impl WalletServingPairPublisher {
         let relation = self.update_active_readiness(&active_pair, &writer_status)?;
         if matches!(
             relation,
-            ActiveWriterRelation::Exact | ActiveWriterRelation::Parked
+            ActiveWriterRelation::Exact | ActiveWriterRelation::Refusing
         ) {
             return Ok(());
         }
@@ -959,13 +961,15 @@ impl WalletServingPairPublisher {
         self.published_generation = Some(generation);
         self.observed_lag_chain_epochs = 0;
         let visible_height = Some(pair.canonical_fence().visible_tip().height.value());
-        self.parked = parked_writer_readiness(writer_status, self.config.network, visible_height);
-        self.attested_at = self.parked.is_none().then(Instant::now);
-        self.readiness.publish_pair_state(
-            self.parked
-                .clone()
-                .unwrap_or_else(|| ReadinessState::ready(visible_height)),
+        let refusal = writer_status_refusal(
+            writer_status,
+            self.config.network,
+            visible_height,
+            &mut self.parked,
         );
+        self.attested_at = refusal.is_none().then(Instant::now);
+        self.readiness
+            .publish_pair_state(refusal.unwrap_or_else(|| ReadinessState::ready(visible_height)));
         metrics::counter!("zinder_wallet_serving_pair_publisher_publications_total").increment(1);
         tracing::info!(
             target: "zinder::wallet_serving",
@@ -996,13 +1000,18 @@ impl WalletServingPairPublisher {
             return Err(WalletServingPairError::WriterFenceMismatch);
         }
         let visible_height = Some(active_source.source_position().tip.height.value());
-        // A parked writer keeps attesting its frozen fence; the pair stays
-        // published but refuses traffic with the writer's typed halt.
-        self.parked = parked_writer_readiness(writer_status, self.config.network, visible_height);
-        if let Some(parked) = self.parked.clone() {
+        // A parked writer, or one that has not confirmed its tip since it
+        // reopened, still attests its fence; the pair stays published but
+        // refuses traffic, and no replacement pair is prepared.
+        if let Some(refusal) = writer_status_refusal(
+            writer_status,
+            self.config.network,
+            visible_height,
+            &mut self.parked,
+        ) {
             self.attested_at = None;
-            self.readiness.publish_pair_state(parked);
-            return Ok(ActiveWriterRelation::Parked);
+            self.readiness.publish_pair_state(refusal);
+            return Ok(ActiveWriterRelation::Refusing);
         }
         // A writer restart can admit a new schedule revision without moving the
         // fence; the immutable active pair then refreshes like a lagging one.
@@ -1098,9 +1107,39 @@ impl WalletServingPairPublisher {
 enum ActiveWriterRelation {
     Exact,
     Behind,
-    /// The writer is parked on a reorg deeper than its window. Its fence no
-    /// longer advances, so no replacement pair is prepared.
-    Parked,
+    /// The writer is parked on a reorg deeper than its window, or has not
+    /// confirmed its tip since it reopened. Its fence does not advance in
+    /// either state, so no replacement pair is prepared.
+    Refusing,
+}
+
+/// Returns the not-ready state a writer status imposes on its readers, and
+/// keeps `remembered_halt` current.
+///
+/// A halt is remembered until a valid status carries neither the halt nor an
+/// unconfirmed tip. A status with an unconfirmed tip keeps any remembered
+/// halt, because a writer that restarts after a park reports the halt again
+/// only once it rediscovers the reorg.
+fn writer_status_refusal(
+    writer_status: &CanonicalWriterStatusResponse,
+    network: Network,
+    visible_height: Option<u32>,
+    remembered_halt: &mut Option<ReadinessState>,
+) -> Option<ReadinessState> {
+    if let Some(halt) = parked_writer_readiness(writer_status, network, visible_height) {
+        *remembered_halt = Some(halt.clone());
+        return Some(halt);
+    }
+    if writer_status.tip_unconfirmed
+        && writer_status.network_name == encode_zinder_native_chain_name(network)
+    {
+        return Some(remembered_halt.clone().unwrap_or_else(|| ReadinessState {
+            current_height: visible_height,
+            ..ReadinessState::not_ready(ReadinessCause::CanonicalTipUnconfirmed)
+        }));
+    }
+    *remembered_halt = None;
+    None
 }
 
 /// Returns the typed halt a parked writer reports on canonical writer status.
@@ -2444,6 +2483,123 @@ mod tests {
         Ok(())
     }
 
+    /// The compatibility composition refuses a writer that has not confirmed
+    /// its tip since it reopened.
+    ///
+    /// It stays unready with `canonical_tip_unconfirmed`, never
+    /// `serving_pair_stale`, through a writer-status outage, keeps a
+    /// remembered halt while the flag is set, and turns ready only once a
+    /// status carries neither.
+    #[tokio::test(flavor = "multi_thread")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "bootstrap, outage, recovery, a park, and the restarted writer form one causal sequence"
+    )]
+    async fn compatibility_pair_refuses_a_writer_with_an_unconfirmed_tip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let activations = lifecycle_upgrade_activations()?;
+        let canonical_primary_path = temporary.path().join("canonical-primary");
+        let wallet_primary_path = temporary.path().join("wallet-primary");
+        let canonical_primary =
+            build_lifecycle_canonical_primary(&canonical_primary_path, &activations)?;
+        build_wallet_from_canonical(
+            &canonical_primary,
+            &wallet_primary_path,
+            RocksDbWalletBuildOptions {
+                supported_reorg_depth: 100,
+                ..RocksDbWalletBuildOptions::for_local_tests()
+            },
+        )?;
+        let unconfirmed_status = CanonicalWriterStatusResponse {
+            tip_unconfirmed: true,
+            ..writer_status_for_store(&canonical_primary)
+        };
+        let control = MutableCanonicalControl::new(unconfirmed_status.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server_task = tokio::spawn({
+            let control = control.clone();
+            async move {
+                Server::builder()
+                    .add_service(CanonicalControlServer::new(control))
+                    .serve_with_incoming_shutdown(
+                        TcpListenerStream::new(listener),
+                        server_cancel.cancelled_owned(),
+                    )
+                    .await
+            }
+        });
+        let readiness = zinder_runtime::Readiness::default();
+        let serving_readiness = WalletServingReadiness::awaiting_node_source(readiness.clone());
+        serving_readiness.publish_node_source_cause(zinder_runtime::ReadinessCause::Ready);
+        let (mut publisher, _slot) =
+            WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
+                wallet_serving_pair_config(
+                    canonical_primary_path.clone(),
+                    temporary.path().join("canonical-secondaries"),
+                    wallet_primary_path.clone(),
+                    temporary.path().join("wallet-secondaries"),
+                    Arc::new(activations.clone()),
+                )?,
+                serving_readiness,
+                &endpoint,
+                None,
+            )
+            .await?;
+        let unconfirmed = zinder_runtime::ReadinessCause::CanonicalTipUnconfirmed;
+        assert_eq!(readiness.report().cause, unconfirmed);
+        assert!(!readiness.report().is_ready);
+
+        control.set_available(false);
+        let outage = publisher
+            .refresh_once()
+            .await
+            .err()
+            .ok_or("refresh must fail during a writer-status outage")?;
+        publisher.record_refresh_failure(&outage);
+        let during_outage = readiness.report();
+        assert!(!during_outage.is_ready);
+        assert_ne!(during_outage.cause.metric_label(), "serving_pair_stale");
+
+        control.set_available(true);
+        publisher.refresh_once().await?;
+        assert_eq!(readiness.report().cause, unconfirmed);
+
+        control.set_writer_status(writer_status_for_store(&canonical_primary));
+        publisher.refresh_once().await?;
+        assert!(readiness.report().is_ready);
+
+        // A park, then a restarted writer that has not yet rediscovered it,
+        // keeps the remembered halt instead of the unconfirmed cause.
+        let halt = zinder_proto::v1::ops::ReorgWindowExceededDetail {
+            depth: 1_001,
+            configured: 1_000,
+            covered: Some(1_000),
+        };
+        control.set_writer_status(CanonicalWriterStatusResponse {
+            reorg_window_exceeded: Some(halt),
+            tip_unconfirmed: true,
+            ..writer_status_for_store(&canonical_primary)
+        });
+        publisher.refresh_once().await?;
+        control.set_writer_status(unconfirmed_status);
+        publisher.refresh_once().await?;
+        assert!(matches!(
+            readiness.report().cause,
+            zinder_runtime::ReadinessCause::ReorgWindowExceeded { .. }
+        ));
+        control.set_writer_status(writer_status_for_store(&canonical_primary));
+        publisher.refresh_once().await?;
+        assert!(readiness.report().is_ready);
+
+        cancel.cancel();
+        server_task.await??;
+        Ok(())
+    }
+
     /// The compatibility composition refuses a parked writer with its halt.
     ///
     /// A parked writer keeps attesting its frozen fence, and compatibility has
@@ -3475,17 +3631,24 @@ mod tests {
     #[derive(Clone)]
     struct MutableCanonicalControl {
         writer_status: Arc<Mutex<CanonicalWriterStatusResponse>>,
+        available: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl MutableCanonicalControl {
         fn new(writer_status: CanonicalWriterStatusResponse) -> Self {
             Self {
                 writer_status: Arc::new(Mutex::new(writer_status)),
+                available: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             }
         }
 
         fn set_writer_status(&self, writer_status: CanonicalWriterStatusResponse) {
             *self.writer_status.lock() = writer_status;
+        }
+
+        fn set_available(&self, available: bool) {
+            self.available
+                .store(available, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -3495,6 +3658,9 @@ mod tests {
             &self,
             _request: Request<CanonicalWriterStatusRequest>,
         ) -> Result<Response<CanonicalWriterStatusResponse>, Status> {
+            if !self.available.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(Status::unavailable("fixture writer status outage"));
+            }
             Ok(Response::new(self.writer_status.lock().clone()))
         }
 
