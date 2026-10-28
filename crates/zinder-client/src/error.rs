@@ -6,6 +6,8 @@ use tonic::Code;
 #[cfg(feature = "remote")]
 use tonic_types::StatusExt;
 use zinder_core::Network;
+#[cfg(feature = "remote")]
+use zinder_proto::wire::decode_reorg_window_exceeded_metadata;
 
 use crate::ErrorReason;
 
@@ -268,16 +270,14 @@ impl IndexerError {
         }
 
         if matches!(&zinder_reason, ErrorReason::ReorgWindowExceeded) {
-            let metadata_blocks = |key: &str| {
-                details
-                    .error_info()
-                    .and_then(|error_info| error_info.metadata.get(key))
-                    .and_then(|blocks| blocks.parse().ok())
-            };
+            let halt = details
+                .error_info()
+                .map(|error_info| decode_reorg_window_exceeded_metadata(&error_info.metadata))
+                .unwrap_or_default();
             return Self::ReorgWindowExceeded {
-                replacement_depth_blocks: metadata_blocks("replacement_depth_blocks"),
-                reorg_window_blocks: metadata_blocks("reorg_window_blocks"),
-                covered_depth_blocks: metadata_blocks("covered_depth_blocks"),
+                replacement_depth_blocks: halt.replacement_depth_blocks,
+                reorg_window_blocks: halt.reorg_window_blocks,
+                covered_depth_blocks: halt.covered_depth_blocks,
             };
         }
 

@@ -21,6 +21,7 @@ use zinder_proto::{
         ingest as ingest_proto,
         ops::{self as ops_proto, ErrorReason},
     },
+    wire::encode_reorg_window_exceeded_metadata,
 };
 
 /// Current phase of the phase-driven ingest loop ([ADR-0015]).
@@ -669,20 +670,18 @@ impl Interceptor for TrafficReadinessInterceptor {
 pub fn not_ready_status(cause: &ReadinessCause) -> Status {
     let readiness_cause = cause.metric_label();
     let mut metadata = HashMap::from([("readiness_cause".to_owned(), readiness_cause.to_owned())]);
-    if let ReadinessCause::ReorgWindowExceeded {
-        depth,
-        configured,
-        covered,
-    } = cause
+    if let Some(
+        halt @ ops_proto::ReorgWindowExceededDetail {
+            depth,
+            configured,
+            covered,
+        },
+    ) = cause.reorg_window_exceeded_detail()
     {
-        metadata.insert("replacement_depth_blocks".to_owned(), depth.to_string());
-        metadata.insert("reorg_window_blocks".to_owned(), configured.to_string());
+        metadata.extend(encode_reorg_window_exceeded_metadata(halt));
         let coverage = covered.map_or_else(
             || format!("its {configured}-block reorg window"),
-            |covered| {
-                metadata.insert("covered_depth_blocks".to_owned(), covered.to_string());
-                format!("the {covered} blocks its {configured}-block reorg window covered")
-            },
+            |covered| format!("the {covered} blocks its {configured}-block reorg window covered"),
         );
         return status_with_reason_and_metadata(
             ErrorReason::ReorgWindowExceeded,
