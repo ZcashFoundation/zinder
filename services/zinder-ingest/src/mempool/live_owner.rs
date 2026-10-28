@@ -119,16 +119,21 @@ enum MempoolOwnerStatus {
 }
 
 impl MempoolOwnerStatus {
-    fn unavailable(self) -> Status {
+    /// Returns the source tip and certification time of a serving index, or
+    /// the status a request that needs one is refused with.
+    fn serving_anchor(self) -> Result<(BlockId, UnixTimestampMillis), Status> {
         match self {
-            Self::Serving { .. } => Status::internal("a serving mempool index is available"),
-            Self::Hydrating => {
-                Status::unavailable("live mempool index is hydrating from an upstream snapshot")
-            }
-            Self::RebuildRequired => Status::unavailable(
+            Self::Serving {
+                source_tip,
+                snapshot_certified_at,
+            } => Ok((source_tip, snapshot_certified_at)),
+            Self::Hydrating => Err(Status::unavailable(
+                "live mempool index is hydrating from an upstream snapshot",
+            )),
+            Self::RebuildRequired => Err(Status::unavailable(
                 "live mempool index is rebuilding after a durable transition mismatch",
-            ),
-            Self::Halted(halt) => halt.status(),
+            )),
+            Self::Halted(halt) => Err(halt.status()),
         }
     }
 }
@@ -183,12 +188,7 @@ impl LiveMempoolOwner {
     /// Returns a durable/index consistency error while a source reseed is required.
     pub(crate) fn require_serving(&self) -> Result<(), Status> {
         let status = *self.status.read();
-        match status {
-            MempoolOwnerStatus::Serving { .. } => Ok(()),
-            MempoolOwnerStatus::Hydrating
-            | MempoolOwnerStatus::RebuildRequired
-            | MempoolOwnerStatus::Halted(_) => Err(status.unavailable()),
-        }
+        status.serving_anchor().map(|_| ())
     }
 
     /// Refuses with the writer's typed halt once the owner is halted.
@@ -211,25 +211,16 @@ impl LiveMempoolOwner {
         chain_epoch: ChainEpoch,
     ) -> Result<(BlockId, UnixTimestampMillis), Status> {
         let status = *self.status.read();
-        match status {
-            MempoolOwnerStatus::Serving {
-                source_tip,
-                snapshot_certified_at,
-            } => {
-                let visible_tip =
-                    BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash);
-                if source_tip != visible_tip {
-                    return Err(status_for_reason(
-                        ErrorReason::ChainEpochPinUnavailable,
-                        "live mempool index is not coherent with the requested chain epoch",
-                    ));
-                }
-                Ok((source_tip, snapshot_certified_at))
-            }
-            MempoolOwnerStatus::Hydrating
-            | MempoolOwnerStatus::RebuildRequired
-            | MempoolOwnerStatus::Halted(_) => Err(status.unavailable()),
+        let (source_tip, snapshot_certified_at) = status.serving_anchor()?;
+        let visible_tip =
+            BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash);
+        if source_tip != visible_tip {
+            return Err(status_for_reason(
+                ErrorReason::ChainEpochPinUnavailable,
+                "live mempool index is not coherent with the requested chain epoch",
+            ));
         }
+        Ok((source_tip, snapshot_certified_at))
     }
 
     /// Returns the live entry for a transaction when it is currently visible.
@@ -377,16 +368,12 @@ impl LiveMempoolOwner {
     ) -> Result<MempoolApplyOutcome, Status> {
         let _mutation_guard = self.mutation_gate.lock().await;
         let state = *self.status.read();
-        match state {
-            MempoolOwnerStatus::Hydrating => self.stage_event_locked(event, observed_at),
-            MempoolOwnerStatus::Serving { .. } => {
-                self.append_and_apply_locked(canonical, event, observed_at)
-                    .await
-            }
-            MempoolOwnerStatus::RebuildRequired | MempoolOwnerStatus::Halted(_) => {
-                Err(state.unavailable())
-            }
+        if state == MempoolOwnerStatus::Hydrating {
+            return self.stage_event_locked(event, observed_at);
         }
+        state.serving_anchor()?;
+        self.append_and_apply_locked(canonical, event, observed_at)
+            .await
     }
 
     async fn append_and_apply_locked(
