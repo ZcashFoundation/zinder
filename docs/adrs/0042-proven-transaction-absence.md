@@ -58,21 +58,30 @@ The server issues the absence only when all of these hold:
    fails with `DEPENDENCY_NOT_CONFIGURED`; an unavailable one keeps its
    `UNAVAILABLE` status.
 
-   A mempool generation answers for exactly one source tip. Zebra's mempool
-   changes and tip notifications are separate streams with no shared order,
-   so a `Mined` change for a block outside that tip's chain (above it, or at
-   its height on another branch) can arrive before the tip change. The owner
-   then ends the generation without applying the change, exactly as a tip
-   change does, and a snapshot whose staged changes include such a block is
-   not certified. Point reads stay `UNAVAILABLE` until the next generation is
-   certified, so the transaction is never missing from both views.
+   A mempool generation answers for exactly one source tip, and it opens a
+   fresh change stream at that tip, so its only expected `Mined` changes are
+   for the tip block itself. Zebra's mempool changes and tip notifications are
+   separate streams with no shared order, so a `Mined` change for any other
+   block can arrive before the tip change: the next block, the tip height on
+   another branch, or a lower block on a branch a reorg made best. The owner
+   applies only a `Mined` change for the tip block as a removal. Any other
+   `Mined` change ends the generation without being applied, exactly as a tip
+   change does, and a snapshot whose staged changes include one is not
+   certified. Point reads stay `UNAVAILABLE` until the next generation is
+   certified.
 
    An `Invalidated` change still removes the entry within the generation. The
-   node reports it only for a transaction that its best chain does not
-   contain, so the transaction is not mined. Removals the node makes because
-   of a newer block, such as an expiry or a conflicting spend, can make an
-   unpinned absence reflect the mempool slightly after the epoch's tip; such a
-   transaction can no longer be mined on that chain.
+   source reports it when the node evicts the transaction, and also when the
+   node announced the transaction as mined but a follow-up lookup found it
+   back in the mempool (after a reorg) or not found (if that lookup lags).
+   Removals the node makes because of a newer block, such as an expiry or a
+   conflicting spend, also land in the generation before its tip change.
+
+   The mempool half of an unpinned absence is therefore best effort around
+   reorgs and block boundaries: in those windows it can claim a mempool miss
+   for a transaction that is still pending, was just mined, or was just
+   evicted by a newer block. The canonical half is exact. A payment decision
+   must use a pinned lookup, which never consults the mempool.
 
 A lookup with `at_epoch_id` answers from that epoch or fails with
 `CHAIN_EPOCH_PIN_UNAVAILABLE`. It never consults the mempool, and its absence

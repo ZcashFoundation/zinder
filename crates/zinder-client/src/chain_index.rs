@@ -1142,8 +1142,12 @@ pub trait ChainIndex: Send + Sync + 'static {
     ///
     /// `TxStatus::NotFound` carries no epoch. After an unpinned lookup the
     /// caller cannot tell which epoch, and so which heights, the absence
-    /// covers, so a decision that depends on the transaction never being
-    /// mined, such as releasing a payment, must use a pinned lookup: take a
+    /// covers, and the mempool half of an unpinned absence is best effort
+    /// around reorgs and block boundaries: it can report a miss for a
+    /// transaction that is still pending or was just mined. A decision that
+    /// depends on the transaction never being mined, such as releasing a
+    /// payment, must therefore use a pinned lookup, which never consults the
+    /// mempool: take a
     /// [`ChainSnapshot`](crate::ChainSnapshot) whose epoch's visible tip
     /// covers the height being judged and look the transaction up through it.
     /// A pinned lookup never reports [`TxStatus::InMempool`]; make an
