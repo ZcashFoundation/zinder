@@ -3014,6 +3014,7 @@ mod tests {
             oldest_retained_event_sequence: 1,
             network_upgrade_schedule: None,
             reorg_window_exceeded: None,
+            tip_unconfirmed: false,
         }
     }
 

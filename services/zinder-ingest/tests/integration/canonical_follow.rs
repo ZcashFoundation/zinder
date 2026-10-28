@@ -689,7 +689,10 @@ async fn parked_follower_serves_its_frozen_fence_until_termination()
     let cancel = CancellationToken::new();
     let (canonical, commands) = zinder_ingest::canonical_control_channel();
     let follower = single_pass_follower(&source, &activations, &readiness, &cancel);
+    // Polled first, so its status request is queued before the reopened
+    // writer's first source observation.
     let observe_parked = async {
+        let before_observation = canonical.writer_status().await;
         while !matches!(
             readiness.report().cause,
             ReadinessCause::ReorgWindowExceeded { .. }
@@ -699,14 +702,20 @@ async fn parked_follower_serves_its_frozen_fence_until_termination()
         readiness.set(zinder_runtime::ReadinessState::ready(Some(4)));
         let snapshot = canonical.writer_status().await;
         cancel.cancel();
-        snapshot
+        (before_observation, snapshot)
     };
-    let (outcome, snapshot) = tokio::join!(
-        follow_canonical_tip_with_control(store, follower, commands),
+    let ((before_observation, snapshot), outcome) = tokio::join!(
         observe_parked,
+        follow_canonical_tip_with_control(store, follower, commands),
     );
 
+    // The reopened writer never reports its persisted fence as confirmed:
+    // it goes from an unconfirmed tip straight to the halt.
+    let before_observation = before_observation?;
+    assert!(before_observation.tip_unconfirmed);
+    assert!(before_observation.reorg_window_exceeded.is_none());
     let snapshot = snapshot?;
+    assert!(snapshot.tip_unconfirmed);
     // Canonical-status readers attest the frozen fence, so the halt must ride
     // on the same response or they would report ready on a stopped chain.
     let halt = snapshot
@@ -736,6 +745,66 @@ async fn parked_follower_serves_its_frozen_fence_until_termination()
         outcome,
         Err(zinder_ingest::CanonicalFollowError::ReorgWindowExceeded(_))
     ));
+    Ok(())
+}
+
+/// A reopened writer reports its persisted tip as unconfirmed until a source
+/// observation finds that tip on the node's branch, including while the
+/// source is unreachable, and only then as confirmed.
+#[tokio::test]
+async fn reopened_writer_reports_an_unconfirmed_tip_until_the_source_confirms_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let original = parseable_multi_block_chain()?;
+    let source = RecordingParseableSource::new(
+        original.clone(),
+        checkpoints_for_parseable_chain(&original, &activations)?,
+        BlockHeight::new(4),
+    );
+    let temporary = tempdir()?;
+    let store = publish_parseable_store(
+        &source,
+        &original,
+        Arc::clone(&activations),
+        &temporary.path().join("canonical"),
+        3,
+        BlockHeight::new(1),
+    )
+    .await?;
+    // The node is unreachable when the writer reopens: its tip has no block.
+    source.set_tip_height(BlockHeight::new(99));
+    let readiness = Readiness::default();
+    let cancel = CancellationToken::new();
+    let (canonical, commands) = zinder_ingest::canonical_control_channel();
+    let follower = single_pass_follower(&source, &activations, &readiness, &cancel);
+    let observe = async {
+        let before_observation = canonical.writer_status().await?;
+        while !matches!(readiness.report().cause, ReadinessCause::NodeUnavailable(_)) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let while_unreachable = canonical.writer_status().await?;
+        source.set_tip_height(BlockHeight::new(4));
+        while !readiness.report().is_ready {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let after_confirmation = canonical.writer_status().await?;
+        cancel.cancel();
+        Ok::<_, tonic::Status>((before_observation, while_unreachable, after_confirmation))
+    };
+    let (statuses, outcome) = tokio::join!(
+        observe,
+        follow_canonical_tip_with_control(store, follower, commands),
+    );
+    let (before_observation, while_unreachable, after_confirmation) = statuses?;
+    outcome?;
+
+    assert!(before_observation.tip_unconfirmed);
+    assert!(while_unreachable.tip_unconfirmed);
+    assert!(!after_confirmation.tip_unconfirmed);
+    assert_eq!(
+        before_observation.fence, after_confirmation.fence,
+        "the persisted fence alone must not confirm the tip"
+    );
     Ok(())
 }
 

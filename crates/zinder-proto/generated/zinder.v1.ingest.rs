@@ -109,6 +109,16 @@ pub struct CanonicalWriterStatusResponse {
     pub reorg_window_exceeded: ::core::option::Option<
         super::ops::ReorgWindowExceededDetail,
     >,
+    /// Set while the canonical writer has not confirmed its store's visible tip
+    /// against its node since it opened the store: until a source observation
+    /// finds that tip on the node's branch, or the writer commits past it. A
+    /// parked writer also sets it. `fence` is then the persisted fence, which
+    /// may sit on a branch the node abandoned while the writer was down, so
+    /// wallet-serving readers must not report ready on it. The projector may
+    /// keep converging on it. Writers that predate this field never set it, and
+    /// readers then attest the fence as before. ADR-0041.
+    #[prost(bool, tag = "6")]
+    pub tip_unconfirmed: bool,
 }
 /// One node-advertised network-upgrade activation in an admitted schedule.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

@@ -638,14 +638,39 @@ pub enum CanonicalControlCommand {
     },
 }
 
+/// Services one command with the primary store of an owner that has
+/// confirmed its visible tip against its node.
+pub(crate) fn apply_canonical_control_command(
+    store: &mut RocksDbCanonicalStore,
+    command: CanonicalControlCommand,
+) -> CanonicalControlScheduling {
+    apply_following_canonical_control_command(store, command, TipConfirmation::Confirmed)
+}
+
+/// Whether the follower has confirmed its store's visible tip against its
+/// node since it opened the store.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TipConfirmation {
+    /// No source observation has yet found the visible tip on the node's
+    /// branch, and nothing was committed past it.
+    Unconfirmed,
+    /// The visible tip was found on the node's branch or committed past.
+    Confirmed,
+}
+
 /// Services one command with the follower's current primary store.
+///
+/// `WriterStatus` reports `tip_unconfirmed` until the follower confirms its
+/// visible tip, so wallet-serving readers do not attest a persisted fence the
+/// node may have abandoned while the writer was down.
 #[allow(
     clippy::too_many_lines,
     reason = "the exhaustive owner-command dispatch keeps every primary mutation on one auditable queue"
 )]
-pub(crate) fn apply_canonical_control_command(
+pub(crate) fn apply_following_canonical_control_command(
     store: &mut RocksDbCanonicalStore,
     command: CanonicalControlCommand,
+    tip_confirmation: TipConfirmation,
 ) -> CanonicalControlScheduling {
     let scheduling = if matches!(&command, CanonicalControlCommand::PruneMempoolEvents { .. }) {
         CanonicalControlScheduling::YieldToCanonical
@@ -654,7 +679,13 @@ pub(crate) fn apply_canonical_control_command(
     };
     match command {
         CanonicalControlCommand::WriterStatus { reply } => {
-            send_control_response(reply, writer_status_response(store));
+            send_control_response(
+                reply,
+                writer_status_response(store).map(|mut status| {
+                    status.tip_unconfirmed = tip_confirmation == TipConfirmation::Unconfirmed;
+                    status
+                }),
+            );
         }
         CanonicalControlCommand::ChainEpoch { reply } => {
             send_control_response(reply, chain_epoch_response(store));
@@ -796,6 +827,7 @@ pub(crate) fn apply_parked_canonical_control_command(
                 reply,
                 writer_status_response(store).map(|mut status| {
                     status.reorg_window_exceeded = Some(halt.detail);
+                    status.tip_unconfirmed = true;
                     status
                 }),
             );
@@ -1172,6 +1204,7 @@ fn writer_status_response(
             .network_upgrade_schedule()
             .map(network_upgrade_schedule_message),
         reorg_window_exceeded: None,
+        tip_unconfirmed: false,
     })
 }
 
