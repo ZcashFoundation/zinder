@@ -4,8 +4,8 @@ use eyre::{Context as _, ensure, eyre};
 use tempfile::TempDir;
 use zinder_core::{
     BlockHeight, BlockId, CanonicalBlockReplayEnvelope, ChainTipMetadata, CommitmentTreeCheckpoint,
-    CommitmentTreeFrontiers, NetworkUpgradeActivations, UnixTimestampMillis,
-    decode_canonical_block_replay,
+    CommitmentTreeFrontier, CommitmentTreeFrontiers, NetworkUpgradeActivations, ShieldedProtocol,
+    UnixTimestampMillis, decode_canonical_block_replay,
 };
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalLiveAppend, CanonicalReorgPolicy,
@@ -138,16 +138,51 @@ impl WalletServingStoreFixture {
     ///
     /// Returns an error when the fixture has fewer than two blocks or either
     /// production store rejects the baseline or live append.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "The fixture keeps baseline publication, live append, wallet build, and immutable reader admission in production order."
-    )]
     pub fn from_chain_after_live_append(
         chain_fixture: &ChainFixture,
         network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> eyre::Result<Self> {
+        Self::build_after_live_append(chain_fixture, network_upgrade_activations, None)
+    }
+
+    /// Builds a READY live-append pair whose canonical writer admitted
+    /// `admitted_activations` over a store built with
+    /// `construction_activations`.
+    ///
+    /// Before the live append, the writer admits the construction table as
+    /// revision 1, as a writer's first start does, and then
+    /// `admitted_activations` as the next revision. The live block is
+    /// committed with the admitted table, and the canonical reader opens with
+    /// it, as a serving publisher does after following writer status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fixture has fewer than two blocks, the writer
+    /// refuses either schedule revision, or either production store rejects
+    /// the baseline or live append.
+    pub fn from_chain_after_admitted_live_append(
+        chain_fixture: &ChainFixture,
+        construction_activations: &NetworkUpgradeActivations,
+        admitted_activations: &NetworkUpgradeActivations,
+    ) -> eyre::Result<Self> {
+        Self::build_after_live_append(
+            chain_fixture,
+            construction_activations,
+            Some(admitted_activations),
+        )
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "The fixture keeps baseline publication, schedule admission, live append, wallet build, and immutable reader admission in production order."
+    )]
+    fn build_after_live_append(
+        chain_fixture: &ChainFixture,
+        construction_activations: &NetworkUpgradeActivations,
+        admitted_activations: Option<&NetworkUpgradeActivations>,
+    ) -> eyre::Result<Self> {
         ensure!(
-            chain_fixture.network() == network_upgrade_activations.network(),
+            chain_fixture.network() == construction_activations.network(),
             "chain fixture and network-upgrade activations must use the same network"
         );
         let live_tip = chain_fixture
@@ -172,7 +207,7 @@ impl WalletServingStoreFixture {
         let wallet_primary_path = temporary_directory.path().join("wallet-primary");
         let reorg_policy = CanonicalReorgPolicy::new(TEST_REORG_DEPTH)?;
         let build_plan = CanonicalStoreBuildPlan::complete(
-            network_upgrade_activations,
+            construction_activations,
             baseline_tip.block_time_seconds.saturating_sub(1),
             baseline_tip_id,
             raw_blob_retention,
@@ -187,13 +222,14 @@ impl WalletServingStoreFixture {
         builder.bulk_load_blocks(
             canonical_build_blocks(&baseline_chain)?
                 .into_iter()
+                .map(|block| with_empty_active_frontiers(block, construction_activations))
                 .map(Ok::<_, std::convert::Infallible>),
         )?;
         builder.load_subtree_roots(std::iter::empty())?;
         let baseline_checkpoint = CommitmentTreeCheckpoint::new(
             baseline_tip_id,
             baseline_tip.block_time_seconds,
-            CommitmentTreeFrontiers::default(),
+            empty_active_frontiers(construction_activations, baseline_tip_id.height),
         );
         builder.confirm_source_tip_checkpoint(&baseline_checkpoint)?;
         let validated = builder.prepare_cold_certified_publication()?;
@@ -203,11 +239,20 @@ impl WalletServingStoreFixture {
                 u64::from(baseline_tip.block_time_seconds).saturating_mul(1_000),
             ),
         ))?;
-        let canonical_primary = validated.publish_baseline(publication)?;
+        let mut canonical_primary = validated.publish_baseline(publication)?;
+        let live_activations = match admitted_activations {
+            Some(admitted_activations) => {
+                canonical_primary.admit_network_upgrade_schedule(construction_activations)?;
+                canonical_primary.admit_network_upgrade_schedule(admitted_activations)?;
+                admitted_activations
+            }
+            None => construction_activations,
+        };
         let expected_fence = canonical_primary.event_fence();
         let full_chain = chain_fixture.clone().with_canonical_genesis_parent();
         let live_block = canonical_build_blocks(&full_chain)?
             .pop()
+            .map(|block| with_empty_active_frontiers(block, live_activations))
             .ok_or_else(|| eyre!("wallet-serving fixture requires a live block"))?;
         let (canonical_primary, _) = canonical_primary.commit_live_append(
             CanonicalLiveAppend::new(
@@ -219,7 +264,7 @@ impl WalletServingStoreFixture {
                     u64::from(live_tip.block_time_seconds).saturating_mul(1_000),
                 ),
             ),
-            network_upgrade_activations,
+            live_activations,
         )?;
 
         let wallet_outcome = build_wallet_from_canonical(
@@ -236,7 +281,7 @@ impl WalletServingStoreFixture {
         let canonical_reader = RocksDbCanonicalSecondary::open_ready(
             &canonical_primary_path,
             temporary_directory.path().join("canonical-secondary"),
-            network_upgrade_activations,
+            live_activations,
             CanonicalStoreWorkload::Wallet,
             raw_blob_retention,
             reorg_policy,
@@ -305,6 +350,36 @@ fn canonical_build_blocks(chain_fixture: &ChainFixture) -> eyre::Result<Vec<Cano
     }
 
     Ok(build_blocks)
+}
+
+/// Live following derives each checkpoint's frontiers from its predecessor,
+/// so live-append fixtures carry the empty frontier of every shielded pool
+/// active at the checkpoint height.
+fn with_empty_active_frontiers(
+    mut block: CanonicalBuildBlock,
+    activations: &NetworkUpgradeActivations,
+) -> CanonicalBuildBlock {
+    if let Some(checkpoint) = block.tree_state_checkpoint.as_mut() {
+        checkpoint.frontiers = empty_active_frontiers(activations, checkpoint.block_id.height);
+    }
+    block
+}
+
+fn empty_active_frontiers(
+    activations: &NetworkUpgradeActivations,
+    height: BlockHeight,
+) -> CommitmentTreeFrontiers {
+    let active_frontier = |protocol: ShieldedProtocol| {
+        activations
+            .activation_height_by_name(protocol.activation_upgrade_name())
+            .is_some_and(|activation_height| activation_height <= height)
+            .then(|| CommitmentTreeFrontier::empty(protocol))
+    };
+    CommitmentTreeFrontiers::from_validated_parts(
+        active_frontier(ShieldedProtocol::Sapling),
+        active_frontier(ShieldedProtocol::Orchard),
+        active_frontier(ShieldedProtocol::Ironwood),
+    )
 }
 
 struct CanonicalBlockBuildInputs<'a> {

@@ -40,7 +40,7 @@ use zinder_wallet_rocksdb::{
 /// Exact bundle identity admitted by this release.
 pub const STATE_BUNDLE_IDENTITY: &str = "state-bundle";
 /// Exact state-bundle manifest format admitted by this release.
-pub const STATE_BUNDLE_FORMAT_VERSION: u16 = 2;
+pub const STATE_BUNDLE_FORMAT_VERSION: u16 = 3;
 /// Only certified physical topology represented by a state bundle.
 pub const STATE_BUNDLE_TOPOLOGY: &str = "rocksdb-single-host";
 /// Fixed canonical checkpoint directory within a bundle.
@@ -181,6 +181,8 @@ pub struct StateBundleFence {
     visible_tip: BlockManifest,
     settled_tip: BlockManifest,
     sequence_digest: SequenceDigestManifest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    network_upgrade_schedule: Option<NetworkUpgradeScheduleManifest>,
 }
 
 impl StateBundleFence {
@@ -200,6 +202,57 @@ impl StateBundleFence {
     #[must_use]
     pub const fn visible_tip_height(&self) -> u32 {
         self.visible_tip.height
+    }
+
+    /// Writer-admitted network-upgrade schedule identity at this fence.
+    ///
+    /// Legacy format-2 bundles predate this identity and return `None`.
+    #[must_use]
+    pub const fn network_upgrade_schedule(&self) -> Option<&NetworkUpgradeScheduleManifest> {
+        self.network_upgrade_schedule.as_ref()
+    }
+}
+
+/// Writer-admitted schedule revision and table fingerprint at capture time.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkUpgradeScheduleManifest {
+    revision: u64,
+    fingerprint_version: u16,
+    fingerprint: String,
+}
+
+impl NetworkUpgradeScheduleManifest {
+    /// Monotonic writer-owned schedule revision at capture time.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// V1 table fingerprint as lower-case hexadecimal.
+    #[must_use]
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    fn from_admitted(schedule: &AdmittedScheduleIdentity) -> Self {
+        Self {
+            revision: schedule.revision,
+            fingerprint_version: 1,
+            fingerprint: hex::encode(schedule.fingerprint),
+        }
+    }
+
+    fn validate(&self) -> Result<(), StateBundleError> {
+        require_manifest_value(
+            self.revision > 0,
+            "activation schedule revision must be nonzero",
+        )?;
+        require_manifest_value(
+            self.fingerprint_version == 1,
+            "activation schedule fingerprint version must be 1",
+        )?;
+        validate_lower_hex_32(&self.fingerprint, "activation schedule fingerprint")
     }
 }
 
@@ -373,9 +426,16 @@ impl StateBundleManifest {
             self.identity == STATE_BUNDLE_IDENTITY,
             "identity must be exactly state-bundle",
         )?;
+        let supported_format = matches!(
+            (
+                self.format_version,
+                self.fence.network_upgrade_schedule.is_some()
+            ),
+            (2, false) | (STATE_BUNDLE_FORMAT_VERSION, true)
+        );
         require_manifest_value(
-            self.format_version == STATE_BUNDLE_FORMAT_VERSION,
-            "format version must be exactly 1",
+            supported_format,
+            "format version and activation-schedule evidence are incompatible; format 2 omits schedule identity and format 3 requires it",
         )?;
         require_manifest_value(
             self.topology == STATE_BUNDLE_TOPOLOGY,
@@ -511,7 +571,7 @@ pub enum StateBundleError {
         reason: String,
     },
     /// A manifest was not valid exact JSON.
-    #[error("state-bundle manifest {path} is not valid format-2 JSON: {source}")]
+    #[error("state-bundle manifest {path} is not valid format-2 or format-3 JSON: {source}")]
     ManifestDecode {
         /// Manifest path.
         path: PathBuf,
@@ -562,6 +622,7 @@ struct CanonicalAdmission {
     network: Network,
     workload: CanonicalStoreWorkload,
     build_plan: CanonicalBuildPlanAdmission,
+    admitted_schedule: AdmittedScheduleIdentity,
     first_retained_block: BlockId,
     visible_tip: BlockId,
     visible_epoch: u64,
@@ -575,6 +636,12 @@ struct CanonicalAdmission {
     settled_retained_block_count: u64,
     settled_sequence_digest: CanonicalBlockFactsSequenceDigest,
     settled_logical_replay_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AdmittedScheduleIdentity {
+    revision: u64,
+    fingerprint: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -610,6 +677,7 @@ struct DecodedCanonicalCheckpointResponse {
     schema_version: u16,
     network: Network,
     build_plan: zinder_proto::v1::ingest::CanonicalOwnerCheckpointBuildPlanEvidence,
+    network_upgrade_schedule: zinder_proto::v1::ingest::CanonicalNetworkUpgradeSchedule,
     ready: zinder_proto::v1::ingest::CanonicalOwnerCheckpointReadyEvidence,
 }
 
@@ -665,8 +733,17 @@ impl TryFrom<CreateCanonicalOwnerCheckpointResponse> for CanonicalCheckpointAdmi
             schema_version,
             network,
             build_plan,
+            network_upgrade_schedule,
             ready,
         } = decode_checkpoint_response(response)?;
+        let (activations, revision) =
+            zinder_proto::wire::decode_canonical_network_upgrade_schedule(
+                network_upgrade_schedule,
+                network,
+            )
+            .map_err(|error| StateBundleError::manifest_contract(error.to_string()))?;
+        let schedule_fingerprint =
+            activations.fingerprint(zinder_core::NetworkUpgradeActivationsFingerprintVersion::V1);
         let ready = decode_ready_evidence(ready)?;
         let build_plan = decode_build_plan(
             build_plan,
@@ -681,6 +758,10 @@ impl TryFrom<CreateCanonicalOwnerCheckpointResponse> for CanonicalCheckpointAdmi
             network,
             &ready,
             build_plan,
+            AdmittedScheduleIdentity {
+                revision,
+                fingerprint: schedule_fingerprint.as_bytes(),
+            },
         );
         Ok(Self {
             candidate_id,
@@ -731,6 +812,11 @@ fn decode_checkpoint_response(
             "canonical checkpoint response omitted cold READY evidence",
         )
     })?;
+    let network_upgrade_schedule = response.network_upgrade_schedule.ok_or_else(|| {
+        StateBundleError::manifest_contract(
+            "canonical checkpoint response omitted admitted activation schedule evidence",
+        )
+    })?;
     Ok(DecodedCanonicalCheckpointResponse {
         candidate_id: response.candidate_id,
         database_identity: response.database_identity,
@@ -738,6 +824,7 @@ fn decode_checkpoint_response(
         schema_version,
         network,
         build_plan,
+        network_upgrade_schedule,
         ready,
     })
 }
@@ -880,6 +967,7 @@ fn assemble_canonical_admission(
     network: Network,
     ready: &DecodedCanonicalReadyEvidence,
     build_plan: CanonicalBuildPlanAdmission,
+    admitted_schedule: AdmittedScheduleIdentity,
 ) -> CanonicalAdmission {
     CanonicalAdmission {
         database_identity_sha256: sha256_hex(database_identity),
@@ -890,6 +978,7 @@ fn assemble_canonical_admission(
         network,
         workload: CanonicalStoreWorkload::Wallet,
         build_plan,
+        admitted_schedule,
         first_retained_block: ready.first_retained_block,
         visible_tip: ready.visible_tip,
         visible_epoch: ready.visible_epoch,
@@ -1032,6 +1121,9 @@ impl StateBundleFence {
             visible_tip: BlockManifest::from_block(canonical.visible_tip),
             settled_tip: BlockManifest::from_block(canonical.settled_tip),
             sequence_digest: SequenceDigestManifest::from_digest(canonical.visible_sequence_digest),
+            network_upgrade_schedule: Some(NetworkUpgradeScheduleManifest::from_admitted(
+                &canonical.admitted_schedule,
+            )),
         }
     }
 
@@ -1047,7 +1139,11 @@ impl StateBundleFence {
             self.settled_tip.height <= self.visible_tip.height,
             "fence settled tip must not exceed visible tip",
         )?;
-        self.sequence_digest.validate("fence sequence digest")
+        self.sequence_digest.validate("fence sequence digest")?;
+        if let Some(schedule) = &self.network_upgrade_schedule {
+            schedule.validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -2018,7 +2114,7 @@ mod tests {
     use tempfile::TempDir;
     use zinder_core::{
         BlockHash, BlockHeight, BlockId, CanonicalBlockFactsSequenceDigest,
-        CanonicalBlockFactsSequenceDigestVersion, ChainEpochId, Network,
+        CanonicalBlockFactsSequenceDigestVersion, ChainEpochId, Network, NetworkUpgradeActivations,
     };
     use zinder_proto::v1::ingest::{
         CanonicalCheckpointBlockId, CanonicalCheckpointFrontier,
@@ -2081,6 +2177,30 @@ mod tests {
     }
 
     #[test]
+    fn legacy_format_two_manifest_without_schedule_identity_remains_readable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = StateBundleManifest::from_admitted(
+            "bundle-a",
+            &sample_canonical_admission(7),
+            &sample_wallet_admission(7)?,
+        )?;
+        let mut legacy = serde_json::to_value(manifest)?;
+        legacy["format_version"] = Value::from(2);
+        legacy
+            .as_object_mut()
+            .and_then(|object| object.get_mut("fence"))
+            .and_then(Value::as_object_mut)
+            .ok_or("manifest fence must be an object")?
+            .remove("network_upgrade_schedule");
+
+        let decoded: StateBundleManifest = serde_json::from_value(legacy)?;
+        decoded.validate(Network::ZcashRegtest)?;
+        assert_eq!(decoded.format_version(), 2);
+        assert!(decoded.fence().network_upgrade_schedule().is_none());
+        Ok(())
+    }
+
+    #[test]
     fn manifest_admission_rejects_identity_version_topology_schema_network_and_fence_corruption()
     -> Result<(), Box<dyn std::error::Error>> {
         let manifest = StateBundleManifest::from_admitted(
@@ -2093,9 +2213,10 @@ mod tests {
             CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION
                 .checked_add(1)
                 .ok_or("construction manifest test version overflow")?;
-        let mutations: [(&str, Value); 17] = [
+        let mutations: [(&str, Value); 20] = [
             ("/identity", Value::String("state_bundle".to_owned())),
             ("/format_version", Value::from(1)),
+            ("/format_version", Value::from(2)),
             ("/topology", Value::String("mixed-runtime".to_owned())),
             ("/candidate_id", Value::String("../outside".to_owned())),
             ("/network", Value::String("mainnet".to_owned())),
@@ -2134,6 +2255,11 @@ mod tests {
                 Value::String("not-a-sha256".to_owned()),
             ),
             ("/wallet_checkpoint/chain_epoch_id", Value::from(8)),
+            ("/fence/network_upgrade_schedule/revision", Value::from(0)),
+            (
+                "/fence/network_upgrade_schedule/fingerprint",
+                Value::String("not-a-sha256".to_owned()),
+            ),
             (
                 "/wallet_checkpoint/source_sequence_digest/sha256",
                 Value::String(hex::encode([0x99; 32])),
@@ -2241,6 +2367,29 @@ mod tests {
         let mut missing_database_identity = response.clone();
         missing_database_identity.database_identity.clear();
         assert!(CanonicalCheckpointAdmissionEvidence::try_from(missing_database_identity).is_err());
+
+        let mut missing_schedule = response.clone();
+        missing_schedule.network_upgrade_schedule = None;
+        assert!(CanonicalCheckpointAdmissionEvidence::try_from(missing_schedule).is_err());
+
+        let mut zero_schedule_revision = response.clone();
+        if let Some(schedule) = zero_schedule_revision.network_upgrade_schedule.as_mut() {
+            schedule.revision = 0;
+        }
+        assert!(CanonicalCheckpointAdmissionEvidence::try_from(zero_schedule_revision).is_err());
+
+        let mut mismatched_schedule_fingerprint = response.clone();
+        if let Some(schedule) = mismatched_schedule_fingerprint
+            .network_upgrade_schedule
+            .as_mut()
+            && let Some(first) = schedule.fingerprint.first_mut()
+        {
+            *first ^= 1;
+        }
+        assert!(
+            CanonicalCheckpointAdmissionEvidence::try_from(mismatched_schedule_fingerprint)
+                .is_err()
+        );
     }
 
     fn assert_checkpoint_response_rejects_invalid_build_plan(
@@ -2433,6 +2582,9 @@ mod tests {
         let visible_tip = block(sequence);
         let settled_tip = block(sequence.saturating_sub(1));
         let digest = sequence_digest(sequence, 0x44);
+        let activations = NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+        let activation_fingerprint =
+            activations.fingerprint(zinder_core::NetworkUpgradeActivationsFingerprintVersion::V1);
         CanonicalAdmission {
             database_identity_sha256: sha256_hex(b"sample-canonical-database-identity"),
             construction_manifest_version: CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION,
@@ -2443,7 +2595,7 @@ mod tests {
             workload: CanonicalStoreWorkload::Wallet,
             build_plan: CanonicalBuildPlanAdmission {
                 activation_fingerprint_version: 1,
-                activation_fingerprint: [0xaa; 32],
+                activation_fingerprint: activation_fingerprint.as_bytes(),
                 raw_blob_retention: RawBlobRetention::Transactions,
                 reorg_window_blocks: 100,
                 history_preceding_checkpoint: None,
@@ -2458,6 +2610,10 @@ mod tests {
                     ironwood_frontier: None,
                 },
                 build_tip: visible_tip,
+            },
+            admitted_schedule: AdmittedScheduleIdentity {
+                revision: 1,
+                fingerprint: activation_fingerprint.as_bytes(),
             },
             first_retained_block: block(1),
             visible_tip,
@@ -2484,6 +2640,12 @@ mod tests {
             schema_version: u32::from(canonical.schema_version),
             workload: canonical.workload.as_str().to_owned(),
             network_name: network_name(canonical.network).to_owned(),
+            network_upgrade_schedule: Some(
+                zinder_proto::wire::encode_canonical_network_upgrade_schedule(
+                    &NetworkUpgradeActivations::empty(canonical.network),
+                    canonical.admitted_schedule.revision,
+                ),
+            ),
             ready_evidence: Some(CanonicalOwnerCheckpointReadyEvidence {
                 first_retained_block: Some(checkpoint_block(canonical.first_retained_block)),
                 visible_fence: Some(CanonicalWriterFence {

@@ -24,10 +24,11 @@ const EXPECTED_SERVICE: &str = "cash.z.wallet.sdk.rpc.CompactTxStreamer";
 async fn server_reflection_lists_compact_tx_streamer_service() -> Result<()> {
     let store_fixture = StoreFixture::open()?;
     let activations = Arc::new(sample_regtest_upgrade_activations());
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(store_fixture.chain_store().clone(), (), activations.clone()),
-        activations,
-    )
+    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
+        activations.clone(),
+    ))
     .into_server();
     let reflection_service = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET)

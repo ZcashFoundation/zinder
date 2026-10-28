@@ -14,9 +14,10 @@ use zebra_chain::{
 use zinder_compat_lightwalletd::{LightwalletdAdmissionError, LightwalletdGrpcAdapter};
 use zinder_core::{
     BlockBlobArtifact, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
-    CommitmentTreeCheckpoint, CompactBlockArtifact, Network, SubtreeRootArtifact, SubtreeRootRange,
+    CommitmentTreeCheckpoint, CompactBlockArtifact, ConsensusBranchId, Network,
+    NetworkUpgradeActivation, NetworkUpgradeActivations, SubtreeRootArtifact, SubtreeRootRange,
     TransactionBlobArtifact, TransactionId, TransactionLocation, TransparentAddressScriptHash,
-    TransparentOutPoint, TransparentUnspentOutput,
+    TransparentOutPoint, TransparentUnspentOutput, wire::encode_branch_id_hex,
 };
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
@@ -197,6 +198,60 @@ async fn production_pair_serves_transparent_utxo_contract_and_support_signal() -
     Ok(())
 }
 
+/// A runtime that discovered the pre-NU7 node table serves the writer-admitted
+/// NU7 schedule: NU7 is the next pending upgrade below its activation height
+/// and the active branch from that height on.
+#[tokio::test]
+async fn lightd_info_reports_the_writer_admitted_upgrade_across_its_activation() -> eyre::Result<()>
+{
+    let startup_activations = Arc::new(pre_nu7_activations()?);
+    let nu7_branch_id = ConsensusBranchId::new(0x7719_0ad9);
+    let nu7_height = BlockHeight::new(4);
+    let mut admitted_entries = startup_activations.activations().to_vec();
+    admitted_entries.push(NetworkUpgradeActivation {
+        branch_id: nu7_branch_id,
+        activation_height: nu7_height,
+        name: "NU7".to_owned(),
+    });
+    let admitted_activations =
+        NetworkUpgradeActivations::new(Network::ZcashRegtest, admitted_entries)?;
+    let nu6_3_branch_id = startup_activations
+        .active_at(BlockHeight::new(3))
+        .map(|activation| encode_branch_id_hex(activation.branch_id))
+        .ok_or_else(|| eyre::eyre!("the pre-NU7 table must have an upgrade active at height 3"))?;
+
+    for tip in [3, 4] {
+        let chain = ChainFixture::new(Network::ZcashRegtest)
+            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .extend_blocks(tip);
+        let mut store_fixture = WalletServingStoreFixture::from_chain_after_admitted_live_append(
+            &chain,
+            &startup_activations,
+            &admitted_activations,
+        )?;
+        let adapter =
+            build_wallet_serving_adapter(&mut store_fixture, Arc::clone(&startup_activations))?;
+        let info = adapter
+            .get_lightd_info(Request::new(lightwalletd::Empty {}))
+            .await?
+            .into_inner();
+        assert_eq!(info.block_height, u64::from(tip));
+        if BlockHeight::new(tip) < nu7_height {
+            assert_eq!(info.consensus_branch_id, nu6_3_branch_id);
+            assert_eq!(info.upgrade_name, "NU7");
+            assert_eq!(info.upgrade_height, u64::from(nu7_height.value()));
+        } else {
+            assert_eq!(
+                info.consensus_branch_id,
+                encode_branch_id_hex(nu7_branch_id)
+            );
+            assert_eq!(info.upgrade_name, "");
+            assert_eq!(info.upgrade_height, 0);
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn admitted_transparent_support_stays_immutable_through_readiness_recovery()
 -> eyre::Result<()> {
@@ -285,7 +340,7 @@ async fn unretained_transactions_reject_compatibility_before_listener_binding() 
     let address = reservation.local_addr()?;
     drop(reservation);
 
-    let admission = LightwalletdGrpcAdapter::from_admitted_compatibility_query(query, activations);
+    let admission = LightwalletdGrpcAdapter::from_admitted_compatibility_query(query);
     assert!(matches!(
         admission,
         Err(
@@ -572,10 +627,34 @@ fn build_wallet_serving_adapter_from_readers(
     let query = WalletServingQuery::from_serving_pair_slot(
         serving_pair_slot,
         MockTransactionBroadcaster::broadcast_disabled(),
-        activations.clone(),
+        activations,
     );
-    LightwalletdGrpcAdapter::from_admitted_compatibility_query(query, activations)
-        .map_err(Into::into)
+    LightwalletdGrpcAdapter::from_admitted_compatibility_query(query).map_err(Into::into)
+}
+
+/// The regtest table a pre-NU7 node advertises, with NU6.3 moved to height 3
+/// so the fixture chain reaches it and no upgrade remains pending.
+fn pre_nu7_activations() -> eyre::Result<NetworkUpgradeActivations> {
+    let activations = sample_regtest_upgrade_activations()
+        .activations()
+        .iter()
+        .cloned()
+        .map(|activation| {
+            let activation_height = if activation.name == "NU6.3" {
+                BlockHeight::new(3)
+            } else {
+                activation.activation_height
+            };
+            NetworkUpgradeActivation {
+                activation_height,
+                ..activation
+            }
+        })
+        .collect();
+    Ok(NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        activations,
+    )?)
 }
 
 fn transparent_address(byte: u8) -> ZebraTransparentAddress {
@@ -641,6 +720,10 @@ struct MissingTransactionBlobCanonicalReader {
 }
 
 impl CanonicalReader for MissingTransactionBlobCanonicalReader {
+    fn network_upgrade_schedule(&self) -> Option<&zinder_store::CanonicalActivationSchedule> {
+        self.canonical_reader.network_upgrade_schedule()
+    }
+
     fn raw_blob_retention(&self) -> RawBlobRetention {
         self.canonical_reader.raw_blob_retention()
     }

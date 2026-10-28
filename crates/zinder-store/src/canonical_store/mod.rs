@@ -4,6 +4,7 @@
 //! canonical data plane. It deliberately exposes no generic database adapter
 //! and no compatibility decoder for earlier Zinder stores.
 
+mod activation_schedule;
 mod block_load;
 mod block_replay;
 mod builder;
@@ -38,6 +39,7 @@ use zinder_core::{
 
 use crate::RawBlobRetention;
 
+pub use activation_schedule::CanonicalActivationSchedule;
 pub use block_load::{CanonicalBlockLoadEvidence, CanonicalBuildBlock};
 pub use block_replay::{
     CanonicalReplayRangeScan, CanonicalReplayScan, MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS,

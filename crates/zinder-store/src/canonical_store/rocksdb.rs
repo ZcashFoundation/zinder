@@ -18,12 +18,16 @@ use crate::{
 use super::{
     CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreBuildState,
     CanonicalStoreError, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
+    activation_schedule::CanonicalActivationSchedule,
     block_replay::{BLOCK_REPLAY_COLUMN_FAMILY, CanonicalReplayScan},
     construction_manifest::{
         copy_construction_manifest, read_construction_manifest_binding,
         validate_ready_construction_manifest,
     },
-    control::{DecodedStoreControl, decode_store_control, encode_building_store_control},
+    control::{
+        ActivationScheduleBinding, DecodedStoreControl, decode_store_control,
+        encode_building_store_control, encode_ready_store_control_with_schedule,
+    },
     event_lifecycle::{
         PROJECTION_BUILD_LEASE_GENERATION_KEY, RETENTION_FLOOR_KEY, is_projection_build_lease_key,
     },
@@ -50,6 +54,8 @@ pub struct CanonicalOwnerCheckpointEvidence {
     pub build_plan: super::CanonicalStoreBuildPlan,
     /// Persisted READY evidence read from the cold-opened checkpoint.
     pub ready_evidence: CanonicalStoreReadyEvidence,
+    /// Writer-admitted schedule read from this physical checkpoint, if any.
+    pub activation_schedule: Option<CanonicalActivationSchedule>,
 }
 
 /// Immutable context captured by the canonical owner when it creates a
@@ -64,6 +70,7 @@ pub struct CanonicalOwnerCheckpointAdmission {
     workload: CanonicalStoreWorkload,
     build_plan: super::CanonicalStoreBuildPlan,
     database_identity: Vec<u8>,
+    activation_schedule: Option<CanonicalActivationSchedule>,
 }
 
 pub(super) const STORE_CONTROL_KEY: &[u8] = b"store_control";
@@ -101,10 +108,12 @@ pub(super) const CANONICAL_DATA_COLUMN_FAMILIES: [&str; 15] = [
     TRANSACTION_BLOB_COLUMN_FAMILY,
 ];
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct CanonicalStoreAdmissionExpectation {
     network: Network,
     activations_fingerprint: NetworkUpgradeActivationsFingerprint,
+    expected_activations: Option<NetworkUpgradeActivations>,
+    allow_schedule_update: bool,
     workload: CanonicalStoreWorkload,
     raw_blob_retention: RawBlobRetention,
     reorg_policy: super::CanonicalReorgPolicy,
@@ -121,6 +130,8 @@ impl CanonicalStoreAdmissionExpectation {
             network: activations.network(),
             activations_fingerprint: activations
                 .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
+            expected_activations: Some(activations.clone()),
+            allow_schedule_update: false,
             workload,
             raw_blob_retention,
             reorg_policy,
@@ -134,10 +145,17 @@ impl CanonicalStoreAdmissionExpectation {
         Self {
             network: build_plan.network(),
             activations_fingerprint: build_plan.network_upgrade_activations_fingerprint(),
+            expected_activations: None,
+            allow_schedule_update: false,
             workload,
             raw_blob_retention: build_plan.raw_blob_retention(),
             reorg_policy: build_plan.reorg_policy(),
         }
+    }
+
+    pub(super) fn allowing_schedule_update(mut self) -> Self {
+        self.allow_schedule_update = true;
+        self
     }
 }
 
@@ -159,6 +177,7 @@ pub struct RocksDbCanonicalStore {
     pub(super) lifecycle_lock: Arc<Mutex<()>>,
     /// Resumable process-local state for bounded mempool retention steps.
     pub(super) mempool_retention_progress: Mutex<Option<MempoolEventRetentionProgress>>,
+    pub(super) activation_schedule: Option<CanonicalActivationSchedule>,
 }
 
 impl RocksDbCanonicalStore {
@@ -177,16 +196,17 @@ impl RocksDbCanonicalStore {
             ready_evidence: *ready_evidence,
             lifecycle_lock: Arc::new(Mutex::new(())),
             mempool_retention_progress: Mutex::new(None),
+            activation_schedule: None,
         }
     }
 
     /// Opens an existing READY canonical store after exact admission.
     ///
     /// Admission validates the complete column-family set, singleton control
-    /// key, identity, schema, exact network-upgrade activation table, workload,
-    /// raw-blob retention, canonical reorg policy, source range, construction
-    /// manifest identity, and readiness evidence before opening a writer that
-    /// cannot create data families.
+    /// key, identity, schema, exact baseline or admitted network-upgrade table,
+    /// workload, raw-blob retention, canonical reorg policy, source range,
+    /// construction manifest identity, and readiness evidence before opening a
+    /// writer that cannot create data families.
     #[allow(
         clippy::too_many_arguments,
         reason = "primary admission keeps the filesystem identity and every immutable canonical contract explicit"
@@ -206,12 +226,206 @@ impl RocksDbCanonicalStore {
             expected_raw_blob_retention,
             expected_reorg_policy,
         );
-        Self::open_ready_with_expectation(path, expectation, resource_budget)
+        Self::open_ready_with_expectation(path, &expectation, resource_budget)
+    }
+
+    /// Opens the primary and admits the node's current schedule as a
+    /// writer-owned future-only revision.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "writer admission preserves the existing explicit immutable-store options"
+    )]
+    pub fn open_ready_with_network_upgrade_schedule(
+        path: impl AsRef<Path>,
+        observed_activations: &NetworkUpgradeActivations,
+        expected_workload: CanonicalStoreWorkload,
+        expected_raw_blob_retention: RawBlobRetention,
+        expected_reorg_policy: super::CanonicalReorgPolicy,
+        resource_budget: RocksDbResourceBudget,
+    ) -> Result<Self, CanonicalStoreError> {
+        let expectation = CanonicalStoreAdmissionExpectation::from_activations(
+            observed_activations,
+            expected_workload,
+            expected_raw_blob_retention,
+            expected_reorg_policy,
+        )
+        .allowing_schedule_update();
+        let mut store =
+            Self::open_ready_with_expectation(path.as_ref(), &expectation, resource_budget)?;
+        store.admit_network_upgrade_schedule(observed_activations)?;
+        Ok(store)
+    }
+
+    /// Returns the schedule revision admitted by the canonical writer, or
+    /// `None` for a store that no writer of this release has opened yet.
+    #[must_use]
+    pub const fn network_upgrade_schedule(&self) -> Option<&CanonicalActivationSchedule> {
+        self.activation_schedule.as_ref()
+    }
+
+    /// Returns the complete activation table admitted by the canonical writer.
+    #[must_use]
+    pub const fn network_upgrade_activations(&self) -> Option<&NetworkUpgradeActivations> {
+        match self.activation_schedule.as_ref() {
+            Some(schedule) => Some(schedule.activations()),
+            None => None,
+        }
+    }
+
+    /// Admits a future-only activation-table revision and durably binds it to
+    /// store control in one synced write batch.
+    pub fn admit_network_upgrade_schedule(
+        &mut self,
+        observed_activations: &NetworkUpgradeActivations,
+    ) -> Result<(), CanonicalStoreError> {
+        if observed_activations.network() != self.network() {
+            return Err(CanonicalStoreError::admission(
+                self.bounded_open.db.path(),
+                "activation schedule network differs from the canonical store network",
+            ));
+        }
+        if let Some(schedule) = self.next_activation_schedule(observed_activations)? {
+            self.persist_activation_schedule(&schedule)?;
+        }
+        Ok(())
+    }
+
+    fn next_activation_schedule(
+        &self,
+        observed_activations: &NetworkUpgradeActivations,
+    ) -> Result<Option<CanonicalActivationSchedule>, CanonicalStoreError> {
+        let visible_tip = self.ready_evidence.visible_tip;
+        let schedule = if let Some(previous) = &self.activation_schedule {
+            if !observed_activations.preserves_through(previous.activations(), visible_tip.height) {
+                return Err(CanonicalStoreError::admission(
+                    self.bounded_open.db.path(),
+                    format!(
+                        "node activation table differs from admitted schedule revision {} at or below canonical tip {}; refusing admission",
+                        previous.revision(),
+                        visible_tip.height.value(),
+                    ),
+                ));
+            }
+            if observed_activations == previous.activations() {
+                return Ok(None);
+            }
+            CanonicalActivationSchedule::successor(
+                previous,
+                visible_tip,
+                observed_activations.clone(),
+            )
+            .map_err(|reason| CanonicalStoreError::admission(self.bounded_open.db.path(), reason))?
+        } else {
+            let baseline = self.build_plan.network_upgrade_activations_fingerprint();
+            let prefix_len = observed_activations
+                .matching_fingerprint_prefix_len(baseline)
+                .ok_or_else(|| {
+                    CanonicalStoreError::admission(
+                        self.bounded_open.db.path(),
+                        "node activation table does not extend the table this store was built with as an exact prefix; restore the original activations on the node and restart the writer",
+                    )
+                })?;
+            let prior = NetworkUpgradeActivations::new(
+                self.network(),
+                observed_activations.activations()[..prefix_len].to_vec(),
+            )
+            .map_err(|error| {
+                CanonicalStoreError::admission(self.bounded_open.db.path(), error.to_string())
+            })?;
+            if !observed_activations.preserves_through(&prior, visible_tip.height) {
+                return Err(CanonicalStoreError::admission(
+                    self.bounded_open.db.path(),
+                    format!(
+                        "node activation table adds an activation at or below canonical tip {}; refusing admission",
+                        visible_tip.height.value(),
+                    ),
+                ));
+            }
+            CanonicalActivationSchedule::initial(
+                observed_activations.clone(),
+                baseline.as_bytes(),
+                u32::try_from(prefix_len).map_err(|_| {
+                    CanonicalStoreError::admission(
+                        self.bounded_open.db.path(),
+                        "construction activation prefix length exceeds u32",
+                    )
+                })?,
+                visible_tip,
+            )
+            .map_err(|reason| CanonicalStoreError::admission(self.bounded_open.db.path(), reason))?
+        };
+        Ok(Some(schedule))
+    }
+
+    fn persist_activation_schedule(
+        &mut self,
+        schedule: &CanonicalActivationSchedule,
+    ) -> Result<(), CanonicalStoreError> {
+        let binding = schedule.binding();
+        let encoded_control = encode_ready_store_control_with_schedule(
+            self.workload,
+            &self.build_plan,
+            self.cursor_auth_key,
+            &self.ready_evidence,
+            Some(binding),
+        )
+        .map_err(|source| {
+            CanonicalStoreError::admission(self.bounded_open.db.path(), source.to_string())
+        })?;
+        let mut batch = WriteBatch::default();
+        schedule.put_into(&mut batch).map_err(|reason| {
+            CanonicalStoreError::admission(self.bounded_open.db.path(), reason)
+        })?;
+        batch.put(STORE_CONTROL_KEY, encoded_control);
+        let mut options = WriteOptions::default();
+        options.disable_wal(false);
+        options.set_sync(true);
+        abort_at_activation_schedule_failpoint("before_atomic_write");
+        self.bounded_open
+            .db
+            .write_opt(&batch, &options)
+            .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                operation: "activation schedule admission",
+                source,
+            })?;
+        abort_at_activation_schedule_failpoint("after_atomic_write");
+        let decoded = validate_open_store_control(
+            &self.bounded_open.db,
+            self.bounded_open.db.path(),
+            &CanonicalStoreAdmissionExpectation::from_build_plan(&self.build_plan, self.workload),
+        )?;
+        let stored_schedule = decoded
+            .activation_schedule_binding
+            .map(|stored_binding| {
+                CanonicalActivationSchedule::read_bound(
+                    &self.bounded_open.db,
+                    self.bounded_open.db.path(),
+                    stored_binding,
+                    self.build_plan
+                        .network_upgrade_activations_fingerprint()
+                        .as_bytes(),
+                )
+            })
+            .transpose()?
+            .ok_or_else(|| {
+                CanonicalStoreError::admission(
+                    self.bounded_open.db.path(),
+                    "activation schedule control trailer was not persisted",
+                )
+            })?;
+        if stored_schedule != *schedule {
+            return Err(CanonicalStoreError::admission(
+                self.bounded_open.db.path(),
+                "activation schedule readback differs from the admitted revision",
+            ));
+        }
+        self.activation_schedule = Some(stored_schedule);
+        Ok(())
     }
 
     fn open_ready_with_expectation(
         path: &Path,
-        expectation: CanonicalStoreAdmissionExpectation,
+        expectation: &CanonicalStoreAdmissionExpectation,
         resource_budget: RocksDbResourceBudget,
     ) -> Result<Self, CanonicalStoreError> {
         validate_resource_budget(resource_budget)?;
@@ -267,6 +481,19 @@ impl RocksDbCanonicalStore {
             ));
         }
         let build_plan = opened_control.build_plan;
+        let activation_schedule = opened_control
+            .activation_schedule_binding
+            .map(|binding| {
+                CanonicalActivationSchedule::read_bound(
+                    &bounded_open.db,
+                    &store_path,
+                    binding,
+                    build_plan
+                        .network_upgrade_activations_fingerprint()
+                        .as_bytes(),
+                )
+            })
+            .transpose()?;
         validate_ready_publication(&bounded_open.db, &build_plan, &opened_ready_evidence)?;
         Ok(Self {
             bounded_open,
@@ -276,6 +503,7 @@ impl RocksDbCanonicalStore {
             ready_evidence: opened_ready_evidence,
             lifecycle_lock: Arc::new(Mutex::new(())),
             mempool_retention_progress: Mutex::new(None),
+            activation_schedule,
         })
     }
 
@@ -349,6 +577,7 @@ impl RocksDbCanonicalStore {
             workload: self.workload,
             build_plan: self.build_plan.clone(),
             database_identity,
+            activation_schedule: self.activation_schedule.clone(),
         })
     }
 
@@ -369,7 +598,7 @@ impl RocksDbCanonicalStore {
             admission.workload,
         );
         let cold_checkpoint =
-            Self::open_ready_with_expectation(target, expectation, admission_resource_budget)?;
+            Self::open_ready_with_expectation(target, &expectation, admission_resource_budget)?;
         let cold_database_identity =
             cold_checkpoint
                 .bounded_open
@@ -385,6 +614,12 @@ impl RocksDbCanonicalStore {
                 "checkpoint database identity differs from the physical owner checkpoint",
             ));
         }
+        if cold_checkpoint.activation_schedule != admission.activation_schedule {
+            return Err(CanonicalStoreError::admission(
+                target,
+                "checkpoint activation schedule differs from the owner-captured schedule",
+            ));
+        }
         Ok(CanonicalOwnerCheckpointEvidence {
             database_identity: cold_database_identity,
             store_identity: CANONICAL_STORE_IDENTITY,
@@ -392,6 +627,7 @@ impl RocksDbCanonicalStore {
             workload: cold_checkpoint.workload,
             build_plan: cold_checkpoint.build_plan.clone(),
             ready_evidence: cold_checkpoint.ready_evidence,
+            activation_schedule: cold_checkpoint.activation_schedule,
         })
     }
 
@@ -416,6 +652,28 @@ impl RocksDbCanonicalStore {
         &self,
     ) -> NetworkUpgradeActivationsFingerprint {
         self.build_plan.network_upgrade_activations_fingerprint()
+    }
+
+    pub(super) fn activation_table_is_admitted(
+        &self,
+        activations: &NetworkUpgradeActivations,
+    ) -> bool {
+        if activations.network() != self.network() {
+            return false;
+        }
+        self.activation_schedule.as_ref().map_or_else(
+            || {
+                activations.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1)
+                    == self.network_upgrade_activations_fingerprint()
+            },
+            |schedule| activations == schedule.activations(),
+        )
+    }
+
+    pub(super) fn activation_schedule_binding(&self) -> Option<ActivationScheduleBinding> {
+        self.activation_schedule
+            .as_ref()
+            .map(CanonicalActivationSchedule::binding)
     }
 
     /// Returns the immutable canonical workload persisted by the store.
@@ -475,6 +733,18 @@ impl RocksDbCanonicalStore {
         self.bounded_open.io_mode
     }
 }
+
+#[cfg(test)]
+fn abort_at_activation_schedule_failpoint(expected: &str) {
+    if std::env::var("ZINDER_TEST_CANONICAL_ACTIVATION_SCHEDULE_FAILPOINT").as_deref()
+        == Ok(expected)
+    {
+        std::process::abort();
+    }
+}
+
+#[cfg(not(test))]
+const fn abort_at_activation_schedule_failpoint(_expected: &str) {}
 
 fn require_absent_checkpoint_target(path: &Path) -> Result<(), CanonicalStoreError> {
     match fs::symlink_metadata(path) {
@@ -583,7 +853,7 @@ pub(super) fn initialize_store_identity(
 
 pub(super) fn admit_existing_store(
     path: &Path,
-    expectation: CanonicalStoreAdmissionExpectation,
+    expectation: &CanonicalStoreAdmissionExpectation,
 ) -> Result<(Vec<u8>, DecodedStoreControl), CanonicalStoreError> {
     let column_families = DB::list_cf(&Options::default(), path).map_err(|source| {
         CanonicalStoreError::admission(path, format!("column-family discovery failed: {source}"))
@@ -627,12 +897,17 @@ fn validate_exact_column_families(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one default-family admission pass binds control and every schedule-journal key"
+)]
 pub(super) fn validate_open_store_control(
     db: &DB,
     path: &Path,
-    expectation: CanonicalStoreAdmissionExpectation,
+    expectation: &CanonicalStoreAdmissionExpectation,
 ) -> Result<DecodedStoreControl, CanonicalStoreError> {
     let mut control = None;
+    let mut schedule_keys = Vec::new();
     for row in db.iterator(IteratorMode::Start) {
         let (key, encoded_control) = row.map_err(|source| {
             CanonicalStoreError::admission(
@@ -646,6 +921,9 @@ pub(super) fn validate_open_store_control(
             | PROJECTION_BUILD_LEASE_GENERATION_KEY
             | MEMPOOL_EVENT_SEQUENCE_KEY
             | MEMPOOL_EVENT_RETENTION_FLOOR_KEY => {}
+            key if key.starts_with(super::activation_schedule::ACTIVATION_SCHEDULE_KEY_PREFIX) => {
+                schedule_keys.push(key.to_vec());
+            }
             lease_key if is_projection_build_lease_key(lease_key) => {}
             unknown => {
                 return Err(CanonicalStoreError::admission(
@@ -670,10 +948,36 @@ pub(super) fn validate_open_store_control(
     let persisted_activations_fingerprint = persisted
         .build_plan
         .network_upgrade_activations_fingerprint();
-    if persisted_activations_fingerprint != expectation.activations_fingerprint {
+    let admitted_schedule = match persisted.activation_schedule_binding {
+        Some(binding) => Some(CanonicalActivationSchedule::read_bound(
+            db,
+            path,
+            binding,
+            persisted_activations_fingerprint.as_bytes(),
+        )?),
+        None => None,
+    };
+    let visible_tip = match persisted.build_state {
+        CanonicalStoreBuildState::Ready(ready) => Some(ready.visible_tip.height),
+        CanonicalStoreBuildState::Building => None,
+    };
+    validate_activation_expectation(
+        expectation,
+        persisted_activations_fingerprint,
+        admitted_schedule.as_ref(),
+        visible_tip,
+    )
+    .map_err(|reason| CanonicalStoreError::admission(path, reason))?;
+    let expected_schedule_key_count = match persisted.activation_schedule_binding {
+        Some(binding) => usize::try_from(binding.revision).map_err(|_| {
+            CanonicalStoreError::admission(path, "activation schedule revision exceeds memory size")
+        })?,
+        None => 0,
+    };
+    if schedule_keys.len() != expected_schedule_key_count {
         return Err(CanonicalStoreError::admission(
             path,
-            "persisted network upgrade activations do not equal the requested activation table",
+            "activation schedule journal keys do not exactly match store control",
         ));
     }
     if persisted.workload != expectation.workload {
@@ -707,6 +1011,48 @@ pub(super) fn validate_open_store_control(
         ));
     }
     Ok(persisted)
+}
+
+/// Checks the caller's activation expectation against persisted identity.
+///
+/// Construction and exact re-admission compare the immutable construction
+/// fingerprint. A writer opening for schedule admission defers to
+/// [`RocksDbCanonicalStore::admit_network_upgrade_schedule`]. A reader with a
+/// node-observed table is admitted only when the writer has already admitted
+/// a schedule that agrees with that table through the visible tip; before the
+/// first admission, the reader's table must equal the construction baseline.
+fn validate_activation_expectation(
+    expectation: &CanonicalStoreAdmissionExpectation,
+    persisted_fingerprint: NetworkUpgradeActivationsFingerprint,
+    admitted_schedule: Option<&CanonicalActivationSchedule>,
+    visible_tip: Option<zinder_core::BlockHeight>,
+) -> Result<(), &'static str> {
+    let exact_baseline = || {
+        if persisted_fingerprint == expectation.activations_fingerprint {
+            Ok(())
+        } else {
+            Err(
+                "persisted network upgrade activations do not equal the requested activation table; restart the canonical writer so it admits the node's schedule",
+            )
+        }
+    };
+    let Some(observed) = expectation.expected_activations.as_ref() else {
+        return exact_baseline();
+    };
+    match (admitted_schedule, visible_tip) {
+        (_, Some(_)) if expectation.allow_schedule_update => Ok(()),
+        (Some(admitted), Some(visible_tip)) => {
+            if observed.preserves_through(admitted.activations(), visible_tip) {
+                Ok(())
+            } else {
+                Err(
+                    "node network upgrade activations differ from the writer-admitted schedule at or below the visible tip",
+                )
+            }
+        }
+        (None, _) => exact_baseline(),
+        (Some(_), None) => Err("BUILDING store control must not bind an activation schedule"),
+    }
 }
 
 #[cfg(test)]

@@ -863,6 +863,7 @@ pub(super) fn validate_projection_lifecycle_records(
             | PROJECTION_BUILD_LEASE_GENERATION_KEY
             | MEMPOOL_EVENT_SEQUENCE_KEY
             | MEMPOOL_EVENT_RETENTION_FLOOR_KEY => {}
+            key if key.starts_with(super::activation_schedule::ACTIVATION_SCHEDULE_KEY_PREFIX) => {}
             lease_key if is_projection_build_lease_key(lease_key) => {
                 let lease_id = projection_build_lease_id_from_key(&key)?;
                 let lease = decode_projection_build_lease(lease_id, &encoded)?;

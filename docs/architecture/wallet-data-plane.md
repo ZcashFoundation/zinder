@@ -211,18 +211,22 @@ block_time)` is the **only** public constructor in `zinder-core`. Callers
 cannot construct `MinedTransactionChainContext` without the response's `ChainEpoch` in scope,
 so the racy `tip_height - block_height` confirmations computation is
 prevented by construction. `consensus_branch_id` is resolved from the
-process-startup `Arc<NetworkUpgradeActivations>` discovered via
-`ZebraJsonRpcSource::discover_network_upgrade_activations()`: callers invoke
-`activations.consensus_branch_id_at(height)`, which returns
-`PRE_OVERWINTER_BRANCH_ID` for heights below the earliest activation. The
-service binary refuses to start when `[node]` is not configured, so the
-field always reflects a real node-discovered table at request time; see
-[ADR-0008](../adrs/0008-network-parameter-discovery.md). `block_time` is
-read from the stored `BlockHeaderArtifact` and falls back to `0` only when the
-typed header row is unavailable.
+network-upgrade schedule the canonical writer admitted, as captured with the
+serving pair: callers invoke `activations.consensus_branch_id_at(height)`,
+which returns `PRE_OVERWINTER_BRANCH_ID` for heights below the earliest
+activation. Before the writer's first admission, the pair carries no schedule
+and the query uses the table it discovered at startup through
+`ZebraJsonRpcSource::discover_network_upgrade_activations()`; reader admission
+requires that table to equal the store's construction table. The service
+binary refuses to start when `[node]` is not configured, so the field always
+reflects a real node-discovered table; see
+[ADR-0008](../adrs/0008-network-parameter-discovery.md) and
+[ADR-0039](../adrs/0039-writer-admitted-network-upgrade-schedules.md).
+`block_time` is read from the stored `BlockHeaderArtifact` and falls back to
+`0` only when the typed header row is unavailable.
 
-`WalletQuery.NetworkUpgradeActivations` exposes that same immutable,
-node-discovered schedule to native wallet backends under capability
+`WalletQuery.NetworkUpgradeActivations` exposes that same writer-admitted
+schedule to native wallet backends under capability
 `wallet.read.network_upgrade_activations_v1`. Each row carries the consensus
 branch id, node-reported name, and activation height. Wallets compare it with
 their configured consensus parameters before opening or migrating wallet state;

@@ -157,6 +157,10 @@ struct GatedCanonicalReader {
 }
 
 impl CanonicalReader for GatedCanonicalReader {
+    fn network_upgrade_schedule(&self) -> Option<&zinder_store::CanonicalActivationSchedule> {
+        self.canonical_reader.network_upgrade_schedule()
+    }
+
     fn raw_blob_retention(&self) -> RawBlobRetention {
         self.canonical_reader.raw_blob_retention()
     }

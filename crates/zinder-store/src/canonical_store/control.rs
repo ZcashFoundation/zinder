@@ -17,6 +17,8 @@ use crate::RawBlobRetention;
 
 const BUILDING_STATE: u8 = 1;
 const READY_STATE: u8 = 2;
+const ACTIVATION_SCHEDULE_TRAILER_MAGIC: &[u8] = b"ASCH";
+const ACTIVATION_SCHEDULE_TRAILER_VERSION: u16 = 1;
 const COMPLETE_HISTORY: u8 = 0;
 const CHECKPOINTED_HISTORY: u8 = 1;
 const WALLET_WORKLOAD: u8 = 1;
@@ -51,6 +53,13 @@ pub(super) struct DecodedStoreControl {
     pub(super) build_plan: CanonicalStoreBuildPlan,
     pub(super) cursor_auth_key: [u8; 32],
     pub(super) build_state: CanonicalStoreBuildState,
+    pub(super) activation_schedule_binding: Option<ActivationScheduleBinding>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ActivationScheduleBinding {
+    pub(super) revision: u64,
+    pub(super) digest: [u8; 32],
 }
 
 pub(super) fn encode_building_store_control(
@@ -69,6 +78,22 @@ pub(super) fn encode_ready_store_control(
     build_plan: &CanonicalStoreBuildPlan,
     cursor_auth_key: [u8; 32],
     ready_evidence: &CanonicalStoreReadyEvidence,
+) -> Result<Vec<u8>, CanonicalStoreBuildPlanError> {
+    encode_ready_store_control_with_schedule(
+        workload,
+        build_plan,
+        cursor_auth_key,
+        ready_evidence,
+        None,
+    )
+}
+
+pub(super) fn encode_ready_store_control_with_schedule(
+    workload: CanonicalStoreWorkload,
+    build_plan: &CanonicalStoreBuildPlan,
+    cursor_auth_key: [u8; 32],
+    ready_evidence: &CanonicalStoreReadyEvidence,
+    activation_schedule_binding: Option<ActivationScheduleBinding>,
 ) -> Result<Vec<u8>, CanonicalStoreBuildPlanError> {
     let mut encoded = encode_store_control_prefix(workload, build_plan, cursor_auth_key)?;
     encoded.push(READY_STATE);
@@ -99,6 +124,12 @@ pub(super) fn encode_ready_store_control(
     encoded.extend_from_slice(&checkpoint.logical_replay_bytes().to_le_bytes());
     encoded.extend_from_slice(&ready_evidence.construction_manifest_version.to_le_bytes());
     encoded.extend_from_slice(&ready_evidence.construction_manifest_sha256);
+    if let Some(binding) = activation_schedule_binding {
+        encoded.extend_from_slice(ACTIVATION_SCHEDULE_TRAILER_MAGIC);
+        encoded.extend_from_slice(&ACTIVATION_SCHEDULE_TRAILER_VERSION.to_le_bytes());
+        encoded.extend_from_slice(&binding.revision.to_le_bytes());
+        encoded.extend_from_slice(&binding.digest);
+    }
     Ok(encoded)
 }
 
@@ -189,6 +220,10 @@ fn encode_predecessor_frontiers(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "decodes the ordered, versioned control contract without partial admission"
+)]
 pub(super) fn decode_store_control(
     path: &std::path::Path,
     encoded: &[u8],
@@ -265,6 +300,44 @@ pub(super) fn decode_store_control(
             ));
         }
     };
+    let activation_schedule_binding = if decoder.remaining() == 0 {
+        None
+    } else {
+        if build_state == CanonicalStoreBuildState::Building {
+            return Err(CanonicalStoreError::admission(
+                path,
+                "BUILDING store control must not contain an activation-schedule trailer",
+            ));
+        }
+        if decoder.read_bytes(
+            ACTIVATION_SCHEDULE_TRAILER_MAGIC.len(),
+            "schedule trailer identity",
+        )? != ACTIVATION_SCHEDULE_TRAILER_MAGIC
+        {
+            return Err(CanonicalStoreError::admission(
+                path,
+                "store control contains an unknown trailing extension",
+            ));
+        }
+        let version = decoder.read_u16("activation schedule trailer version")?;
+        if version != ACTIVATION_SCHEDULE_TRAILER_VERSION {
+            return Err(CanonicalStoreError::admission(
+                path,
+                format!("unsupported activation schedule trailer version {version}"),
+            ));
+        }
+        let revision = decoder.read_u64("activation schedule revision")?;
+        if revision == 0 {
+            return Err(CanonicalStoreError::admission(
+                path,
+                "activation schedule revision must be nonzero",
+            ));
+        }
+        Some(ActivationScheduleBinding {
+            revision,
+            digest: decoder.read_array("activation schedule digest")?,
+        })
+    };
     decoder.reject_trailing_bytes()?;
     Ok(DecodedStoreControl {
         network,
@@ -272,6 +345,7 @@ pub(super) fn decode_store_control(
         build_plan,
         cursor_auth_key,
         build_state,
+        activation_schedule_binding,
     })
 }
 
@@ -400,6 +474,10 @@ struct Decoder<'encoded> {
 }
 
 impl<'encoded> Decoder<'encoded> {
+    fn remaining(&self) -> usize {
+        self.encoded.len().saturating_sub(self.position)
+    }
+
     const fn new(path: &'encoded std::path::Path, encoded: &'encoded [u8]) -> Self {
         Self {
             path,
@@ -658,6 +736,7 @@ mod tests {
                         build_plan,
                         cursor_auth_key: CURSOR_AUTH_KEY,
                         build_state: CanonicalStoreBuildState::Building,
+                        activation_schedule_binding: None,
                     }
                 );
                 assert_eq!(
@@ -791,6 +870,61 @@ mod tests {
     }
 
     #[test]
+    fn ready_control_binds_an_additive_versioned_activation_schedule_trailer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let expected = expected_ready_control();
+        let CanonicalStoreBuildState::Ready(ready) = expected.build_state else {
+            return Err("expected READY test control".into());
+        };
+        let binding = ActivationScheduleBinding {
+            revision: 3,
+            digest: [0x7a; 32],
+        };
+        let encoded = encode_ready_store_control_with_schedule(
+            expected.workload,
+            &expected.build_plan,
+            expected.cursor_auth_key,
+            &ready,
+            Some(binding),
+        )?;
+        assert_eq!(
+            decode_store_control(Path::new("canonical"), &encoded)?.activation_schedule_binding,
+            Some(binding)
+        );
+        // Releases before schedule admission decode exactly the legacy READY
+        // encoding and reject any trailing byte, so they also refuse this
+        // control.
+        let legacy = encode_ready_store_control(
+            expected.workload,
+            &expected.build_plan,
+            expected.cursor_auth_key,
+            &ready,
+        )?;
+        assert!(encoded.len() > legacy.len() && encoded.starts_with(&legacy));
+        let mut unknown_extension = legacy;
+        unknown_extension.extend_from_slice(b"NEXT");
+        assert!(
+            decode_store_control(Path::new("canonical"), &unknown_extension)
+                .err()
+                .ok_or("an unknown READY extension must be rejected")?
+                .to_string()
+                .contains("unknown trailing extension")
+        );
+        let mut unsupported_version = encoded;
+        let version_offset = unsupported_version.len() - 42;
+        unsupported_version[version_offset] = b'X';
+        let error = decode_store_control(Path::new("canonical"), &unsupported_version)
+            .err()
+            .ok_or("unknown trailer should be rejected")?;
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported activation schedule trailer version")
+        );
+        Ok(())
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "the table enumerates each current control field that must fail closed"
@@ -883,7 +1017,10 @@ mod tests {
             {
                 let mut encoded = base;
                 encoded.push(0);
-                (encoded, "trailing bytes")
+                (
+                    encoded,
+                    "BUILDING store control must not contain an activation-schedule trailer",
+                )
             },
         ];
 
@@ -1000,6 +1137,7 @@ mod tests {
             workload: CanonicalStoreWorkload::Explorer,
             build_plan: complete_build_plan(Network::ZcashTestnet),
             cursor_auth_key: CURSOR_AUTH_KEY,
+            activation_schedule_binding: None,
             build_state: CanonicalStoreBuildState::Ready(CanonicalStoreReadyEvidence {
                 first_retained_block: BlockId::new(
                     BlockHeight::new(1),

@@ -133,9 +133,8 @@ async fn current_android_sdk_rpc_contract_uses_admitted_production_pair() -> eyr
         source.clone(),
         activations.clone(),
     )?;
-    let adapter =
-        LightwalletdGrpcAdapter::from_admitted_compatibility_query(query, activations.clone())?
-            .with_mempool_surface(Arc::new(AndroidSdkMempoolSurface::new()?));
+    let adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(query)?
+        .with_mempool_surface(Arc::new(AndroidSdkMempoolSurface::new()?));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let (shutdown_sender, shutdown_receiver) = oneshot::channel::<()>();
@@ -201,10 +200,15 @@ async fn current_android_sdk_rpc_contract_uses_admitted_production_pair() -> eyr
         lightd_info.consensus_branch_id,
         encode_branch_id_hex(active_upgrade.branch_id)
     );
-    assert_eq!(lightd_info.upgrade_name, active_upgrade.name);
+    let next_pending_upgrade = activations
+        .activations()
+        .iter()
+        .find(|activation| activation.activation_height > BLOCK_HEIGHT)
+        .ok_or_else(|| eyre::eyre!("the SDK contract fixture must have a pending upgrade"))?;
+    assert_eq!(lightd_info.upgrade_name, next_pending_upgrade.name);
     assert_eq!(
         lightd_info.upgrade_height,
-        u64::from(active_upgrade.activation_height.value())
+        u64::from(next_pending_upgrade.activation_height.value())
     );
 
     let send_response = client

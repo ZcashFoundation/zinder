@@ -264,29 +264,37 @@ impl NetworkUpgradeActivations {
         &self,
         version: NetworkUpgradeActivationsFingerprintVersion,
     ) -> NetworkUpgradeActivationsFingerprint {
-        let mut hasher = Sha256::new();
-        hasher.update(ACTIVATION_FINGERPRINT_DOMAIN);
-        hasher.update(version.value().to_le_bytes());
-        hasher.update(self.network.id().to_le_bytes());
-        hasher.update(
-            u64::try_from(self.activations.len())
-                .unwrap_or(u64::MAX)
-                .to_le_bytes(),
-        );
-        for activation in &self.activations {
-            hasher.update(activation.branch_id.value().to_le_bytes());
-            hasher.update(activation.activation_height.value().to_le_bytes());
-            hasher.update(
-                u64::try_from(activation.name.len())
-                    .unwrap_or(u64::MAX)
-                    .to_le_bytes(),
-            );
-            hasher.update(activation.name.as_bytes());
-        }
-        NetworkUpgradeActivationsFingerprint {
-            version,
-            bytes: hasher.finalize().into(),
-        }
+        fingerprint_activation_entries(self.network, &self.activations, version)
+    }
+
+    /// Returns the length of the leading entries whose fingerprint equals
+    /// `fingerprint`, when this table extends that complete earlier table.
+    ///
+    /// A match proves an exact ordered prefix on the same network, not merely
+    /// matching consensus behavior at selected heights, so it never admits an
+    /// edit, removal, or reordering of an earlier entry.
+    #[must_use]
+    pub fn matching_fingerprint_prefix_len(
+        &self,
+        fingerprint: NetworkUpgradeActivationsFingerprint,
+    ) -> Option<usize> {
+        (0..=self.activations.len()).find(|&prefix_len| {
+            fingerprint_activation_entries(
+                self.network,
+                &self.activations[..prefix_len],
+                fingerprint.version(),
+            ) == fingerprint
+        })
+    }
+
+    /// Returns whether both tables describe the same network and carry
+    /// identical entries at or below `height`, including the order of entries
+    /// that share an activation height.
+    #[must_use]
+    pub fn preserves_through(&self, previous: &Self, height: BlockHeight) -> bool {
+        self.network == previous.network
+            && activations_through(&self.activations, height)
+                .eq(activations_through(&previous.activations, height))
     }
 
     /// Returns the activation active at `height`: the entry with the largest
@@ -338,6 +346,45 @@ impl NetworkUpgradeActivations {
             .iter()
             .find(|activation| activation.name.eq_ignore_ascii_case(name))
             .map(|activation| activation.activation_height)
+    }
+}
+
+fn activations_through(
+    activations: &[NetworkUpgradeActivation],
+    height: BlockHeight,
+) -> impl Iterator<Item = &NetworkUpgradeActivation> {
+    activations
+        .iter()
+        .take_while(move |activation| activation.activation_height <= height)
+}
+
+fn fingerprint_activation_entries(
+    network: Network,
+    activations: &[NetworkUpgradeActivation],
+    version: NetworkUpgradeActivationsFingerprintVersion,
+) -> NetworkUpgradeActivationsFingerprint {
+    let mut hasher = Sha256::new();
+    hasher.update(ACTIVATION_FINGERPRINT_DOMAIN);
+    hasher.update(version.value().to_le_bytes());
+    hasher.update(network.id().to_le_bytes());
+    hasher.update(
+        u64::try_from(activations.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    for activation in activations {
+        hasher.update(activation.branch_id.value().to_le_bytes());
+        hasher.update(activation.activation_height.value().to_le_bytes());
+        hasher.update(
+            u64::try_from(activation.name.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        hasher.update(activation.name.as_bytes());
+    }
+    NetworkUpgradeActivationsFingerprint {
+        version,
+        bytes: hasher.finalize().into(),
     }
 }
 
@@ -504,6 +551,115 @@ mod tests {
     }
 
     #[test]
+    fn matching_fingerprint_prefix_proves_the_complete_earlier_table() -> TestResult {
+        let earlier = NetworkUpgradeActivations::new(
+            Network::ZcashRegtest,
+            vec![activation(1, 1, "Sapling"), activation(2, 2, "NU5")],
+        )?;
+        let extended = NetworkUpgradeActivations::new(
+            Network::ZcashRegtest,
+            vec![
+                activation(1, 1, "Sapling"),
+                activation(2, 2, "NU5"),
+                activation(3, 3, "NU6"),
+            ],
+        )?;
+        let fingerprint = earlier.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1);
+        assert_eq!(
+            extended.matching_fingerprint_prefix_len(fingerprint),
+            Some(2)
+        );
+        assert_eq!(
+            earlier.matching_fingerprint_prefix_len(fingerprint),
+            Some(2)
+        );
+        assert_eq!(
+            NetworkUpgradeActivations::new(Network::ZcashTestnet, extended.activations().to_vec())?
+                .matching_fingerprint_prefix_len(fingerprint),
+            None
+        );
+        let renamed = NetworkUpgradeActivations::new(
+            Network::ZcashRegtest,
+            vec![
+                activation(1, 1, "Sapling"),
+                activation(2, 2, "nu5"),
+                activation(3, 3, "NU6"),
+            ],
+        )?;
+        assert_eq!(renamed.matching_fingerprint_prefix_len(fingerprint), None);
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_through_compares_same_height_order_and_rejects_historical_edits() -> TestResult {
+        let previous = NetworkUpgradeActivations::new(
+            Network::ZcashRegtest,
+            vec![activation(1, 1, "Sapling"), activation(2, 1, "NU5")],
+        )?;
+        let future_extension = NetworkUpgradeActivations::new(
+            Network::ZcashRegtest,
+            vec![
+                activation(1, 1, "Sapling"),
+                activation(2, 1, "NU5"),
+                activation(3, 8, "NU6"),
+            ],
+        )?;
+        let reordered = NetworkUpgradeActivations::new(
+            Network::ZcashRegtest,
+            vec![activation(2, 1, "NU5"), activation(1, 1, "Sapling")],
+        )?;
+        let other_network =
+            NetworkUpgradeActivations::new(Network::ZcashTestnet, previous.activations().to_vec())?;
+        assert!(future_extension.preserves_through(&previous, BlockHeight::new(7)));
+        assert!(!future_extension.preserves_through(&previous, BlockHeight::new(8)));
+        assert!(!reordered.preserves_through(&previous, BlockHeight::new(1)));
+        assert!(reordered.preserves_through(&previous, BlockHeight::new(0)));
+        assert!(!other_network.preserves_through(&previous, BlockHeight::new(0)));
+        Ok(())
+    }
+
+    #[test]
+    fn zebra_seven_tables_extend_zebra_six_tables_on_mainnet_and_testnet() -> TestResult {
+        for (network, nu7_height) in [
+            (Network::ZcashMainnet, ZEBRA_7_MAINNET_NU7_HEIGHT),
+            (Network::ZcashTestnet, ZEBRA_7_TESTNET_NU7_HEIGHT),
+        ] {
+            let zebra_six = zebra_table(network, false)?;
+            let zebra_seven = zebra_table(network, true)?;
+            let baseline = zebra_six.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1);
+            assert_eq!(
+                zebra_seven.matching_fingerprint_prefix_len(baseline),
+                Some(zebra_six.activations().len())
+            );
+            assert_eq!(
+                zebra_seven.activation_height_by_branch_id(ConsensusBranchId::new(NU7_BRANCH_ID)),
+                Some(BlockHeight::new(nu7_height))
+            );
+            let last_pre_nu7 = BlockHeight::new(nu7_height - 1);
+            assert!(zebra_seven.preserves_through(&zebra_six, last_pre_nu7));
+            assert!(!zebra_seven.preserves_through(&zebra_six, BlockHeight::new(nu7_height)));
+
+            let mut reordered = zebra_seven.activations().to_vec();
+            reordered.swap(0, 1);
+            reordered[0].activation_height = reordered[1].activation_height;
+            let reordered = NetworkUpgradeActivations::new(network, reordered)?;
+            assert_eq!(reordered.matching_fingerprint_prefix_len(baseline), None);
+
+            let mut moved_history = zebra_seven.activations().to_vec();
+            if let Some(nu6_3) = moved_history.iter_mut().find(|entry| entry.name == "NU6.3") {
+                nu6_3.activation_height = BlockHeight::new(nu6_3.activation_height.value() + 1);
+            }
+            let moved_history = NetworkUpgradeActivations::new(network, moved_history)?;
+            assert_eq!(
+                moved_history.matching_fingerprint_prefix_len(baseline),
+                None
+            );
+            assert!(!moved_history.preserves_through(&zebra_six, last_pre_nu7));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn activation_fingerprint_canonicalizes_distinct_height_input_order() -> TestResult {
         let sorted = NetworkUpgradeActivations::new(
             Network::ZcashRegtest,
@@ -591,6 +747,56 @@ mod tests {
             NetworkUpgradeActivations::empty(Network::ZcashTestnet)
                 .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1)
         );
+    }
+
+    const NU7_BRANCH_ID: u32 = 0x7719_0ad9;
+    const ZEBRA_7_MAINNET_NU7_HEIGHT: u32 = 3_543_405;
+    const ZEBRA_7_TESTNET_NU7_HEIGHT: u32 = 4_465_026;
+
+    /// `getblockchaininfo.upgrades` as Zebra 6.2.2 advertises it, optionally
+    /// followed by the NU7 row Zebra 7.0.0 appends.
+    fn zebra_table(
+        network: Network,
+        with_nu7: bool,
+    ) -> Result<NetworkUpgradeActivations, NetworkUpgradeActivationsError> {
+        let (heights, nu7_height): ([u32; 10], u32) = if network == Network::ZcashMainnet {
+            (
+                [
+                    347_500, 419_200, 653_600, 903_000, 1_046_400, 1_687_104, 2_726_400, 3_146_400,
+                    3_364_600, 3_428_143,
+                ],
+                ZEBRA_7_MAINNET_NU7_HEIGHT,
+            )
+        } else {
+            (
+                [
+                    207_500, 280_000, 584_000, 903_800, 1_028_500, 1_842_420, 2_976_000, 3_536_500,
+                    4_052_000, 4_134_000,
+                ],
+                ZEBRA_7_TESTNET_NU7_HEIGHT,
+            )
+        };
+        let upgrades = [
+            (0x5ba8_1b19, "Overwinter"),
+            (0x76b8_09bb, "Sapling"),
+            (0x2bb4_0e60, "Blossom"),
+            (0xf5b9_230b, "Heartwood"),
+            (0xe9ff_75a6, "Canopy"),
+            (0xc2d6_d0b4, "NU5"),
+            (0xc8e7_1055, "NU6"),
+            (0x4dec_4df0, "NU6.1"),
+            (0x5437_f330, "NU6.2"),
+            (0x37a5_165b, "NU6.3"),
+        ];
+        let mut entries: Vec<_> = upgrades
+            .into_iter()
+            .zip(heights)
+            .map(|((branch_id, name), height)| activation(branch_id, height, name))
+            .collect();
+        if with_nu7 {
+            entries.push(activation(NU7_BRANCH_ID, nu7_height, "NU7"));
+        }
+        NetworkUpgradeActivations::new(network, entries)
     }
 
     fn activation(branch_id: u32, height: u32, name: &str) -> NetworkUpgradeActivation {

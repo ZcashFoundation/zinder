@@ -16,6 +16,7 @@ and wire contracts that actually carry versions.
 | `NodeSource` | Typed upstream observations and block acquisition |
 | `ChainEpoch` | One immutable visible best-chain state |
 | `CanonicalEventFence` | Authenticated chain epoch, event sequence, visible tip, and sequence digest |
+| `CanonicalActivationSchedule` | One writer-admitted network-upgrade schedule revision: the complete activation table, its revision, and its admission tip |
 | `CanonicalBlockFacts` | Complete block-local semantic input for replay and materialized-view construction |
 | `CanonicalBlockReplay` | Reversible storage envelope for canonical block facts |
 | `CanonicalReader` | Immutable canonical side of an admitted serving pair |
