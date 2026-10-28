@@ -9,6 +9,32 @@ use zinder_core::Network;
 
 use crate::ErrorReason;
 
+/// Renders [`IndexerError::ReorgWindowExceeded`] from whichever details the
+/// server reported; servers that predate a field omit it.
+fn reorg_window_exceeded_message(
+    replacement_depth_blocks: Option<u64>,
+    reorg_window_blocks: Option<u64>,
+    covered_depth_blocks: Option<u64>,
+) -> String {
+    let replacement = replacement_depth_blocks.map_or_else(
+        || "a replacement".to_owned(),
+        |depth| format!("a replacement of {depth} blocks"),
+    );
+    let window = reorg_window_blocks.map_or_else(
+        || "its reorg window".to_owned(),
+        |window| format!("its {window}-block reorg window"),
+    );
+    // The covered depth only adds information while a raised window is still
+    // growing toward its configured size.
+    let bound = match covered_depth_blocks {
+        Some(covered) if Some(covered) != reorg_window_blocks => {
+            format!("the {covered} replaceable blocks of {window}")
+        }
+        Some(_) | None => window,
+    };
+    format!("indexer halted: {replacement} exceeds {bound}")
+}
+
 /// Domain Zinder services set on every `google.rpc.ErrorInfo`.
 ///
 /// Matches the error vocabulary reference; duplicated here so the client does
@@ -76,10 +102,15 @@ pub enum IndexerError {
     /// replaced or resynced node, so the indexer cannot recover on its own.
     /// Reads would come from a chain that no longer advances: treat the
     /// indexer as halted, stop creating spends against it, and alert an
-    /// operator. Unary calls and open chain-event streams both end with this
-    /// error until the operator reconciles the indexer.
+    /// operator. Unary calls and open chain-event and mempool-event streams
+    /// end with this error until the operator reconciles the indexer.
     #[error(
-        "indexer halted: a replacement of {replacement_depth_blocks:?} blocks exceeds the {covered_depth_blocks:?} replaceable blocks of its {reorg_window_blocks:?}-block reorg window"
+        "{}",
+        reorg_window_exceeded_message(
+            *.replacement_depth_blocks,
+            *.reorg_window_blocks,
+            *.covered_depth_blocks
+        )
     )]
     ReorgWindowExceeded {
         /// Blocks the refused replacement would have replaced, when the
@@ -431,6 +462,40 @@ mod tests {
         assert!(matches!(error, IndexerError::ChainEpochPinUnavailable));
         assert_eq!(error.reason(), Some(ErrorReason::ChainEpochPinUnavailable));
         assert_eq!(error.retry_policy(), RetryPolicy::RefreshChainEpoch);
+    }
+
+    #[test]
+    fn reorg_window_halt_renders_only_the_details_the_server_reported() {
+        let halt = |replacement_depth_blocks, reorg_window_blocks, covered_depth_blocks| {
+            IndexerError::ReorgWindowExceeded {
+                replacement_depth_blocks,
+                reorg_window_blocks,
+                covered_depth_blocks,
+            }
+            .to_string()
+        };
+        assert_eq!(
+            halt(Some(1_001), Some(1_000), Some(1_000)),
+            "indexer halted: a replacement of 1001 blocks exceeds its 1000-block reorg window"
+        );
+        assert_eq!(
+            halt(Some(400), Some(1_000), Some(300)),
+            "indexer halted: a replacement of 400 blocks exceeds the 300 replaceable blocks of its 1000-block reorg window"
+        );
+        assert_eq!(
+            halt(Some(1_001), Some(1_000), None),
+            "indexer halted: a replacement of 1001 blocks exceeds its 1000-block reorg window"
+        );
+        assert_eq!(
+            halt(None, None, None),
+            "indexer halted: a replacement exceeds its reorg window"
+        );
+        for rendered in [halt(None, Some(1_000), None), halt(Some(5), None, Some(3))] {
+            assert!(
+                !rendered.contains("None") && !rendered.contains("Some("),
+                "{rendered}"
+            );
+        }
     }
 
     #[test]
