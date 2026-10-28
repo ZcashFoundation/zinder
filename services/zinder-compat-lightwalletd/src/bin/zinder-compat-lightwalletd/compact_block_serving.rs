@@ -451,58 +451,65 @@ impl CompactBlockPublisher {
             );
             return;
         };
-        let candidate = match converge_candidate(&mut self.writer_status, &self.config, candidate)
-            .await
-        {
-            Ok((candidate, _attesting_status)) => candidate,
-            Err(ConvergenceFailure::WriterStatusTransport(_)) => {
-                let cause = self.stale_allowance().map_or(
-                    ReadinessCause::WriterStatusUnavailable,
-                    |staleness| ReadinessCause::ServingPairStale {
-                        lag_chain_epochs: lag,
-                        staleness_seconds: staleness.as_secs(),
-                    },
-                );
-                self.record_failure(cause, active.event_fence().visible_tip().height.value());
-                return;
-            }
-            Err(ConvergenceFailure::WriterAhead) => {
-                let cause = self.stale_allowance().map_or(
-                    ReadinessCause::ReplicaLagging {
-                        lag_chain_epochs: lag,
-                    },
-                    |staleness| ReadinessCause::ServingPairStale {
-                        lag_chain_epochs: lag,
-                        staleness_seconds: staleness.as_secs(),
-                    },
-                );
-                self.record_failure(cause, active.event_fence().visible_tip().height.value());
-                return;
-            }
-            Err(
-                ConvergenceFailure::WriterBehindOrInvalid | ConvergenceFailure::SameEpochMismatch,
-            ) => {
-                self.record_failure(
-                    ReadinessCause::SchemaMismatch,
-                    active.event_fence().visible_tip().height.value(),
-                );
-                return;
-            }
-            Err(ConvergenceFailure::Storage(_)) => {
-                self.record_failure(
-                    ReadinessCause::StorageUnavailable,
-                    active.event_fence().visible_tip().height.value(),
-                );
-                return;
-            }
-        };
+        let (candidate, attesting_status) =
+            match converge_candidate(&mut self.writer_status, &self.config, candidate).await {
+                Ok(converged) => converged,
+                Err(ConvergenceFailure::WriterStatusTransport(_)) => {
+                    let cause = self.stale_allowance().map_or(
+                        ReadinessCause::WriterStatusUnavailable,
+                        |staleness| ReadinessCause::ServingPairStale {
+                            lag_chain_epochs: lag,
+                            staleness_seconds: staleness.as_secs(),
+                        },
+                    );
+                    self.record_failure(cause, active.event_fence().visible_tip().height.value());
+                    return;
+                }
+                Err(ConvergenceFailure::WriterAhead) => {
+                    let cause = self.stale_allowance().map_or(
+                        ReadinessCause::ReplicaLagging {
+                            lag_chain_epochs: lag,
+                        },
+                        |staleness| ReadinessCause::ServingPairStale {
+                            lag_chain_epochs: lag,
+                            staleness_seconds: staleness.as_secs(),
+                        },
+                    );
+                    self.record_failure(cause, active.event_fence().visible_tip().height.value());
+                    return;
+                }
+                Err(
+                    ConvergenceFailure::WriterBehindOrInvalid
+                    | ConvergenceFailure::SameEpochMismatch,
+                ) => {
+                    self.record_failure(
+                        ReadinessCause::SchemaMismatch,
+                        active.event_fence().visible_tip().height.value(),
+                    );
+                    return;
+                }
+                Err(ConvergenceFailure::Storage(_)) => {
+                    self.record_failure(
+                        ReadinessCause::StorageUnavailable,
+                        active.event_fence().visible_tip().height.value(),
+                    );
+                    return;
+                }
+            };
         let reader = Arc::new(candidate);
         self.retired = Some(self.slot.publish(Arc::clone(&reader)));
         self.active_generation = candidate_generation;
-        self.last_attested = Some(tokio::time::Instant::now());
-        self.readiness.publish_storage(ReadinessState::ready(Some(
-            reader.event_fence().visible_tip().height.value(),
-        )));
+        // The writer can park between the first fetch and the one that
+        // attested the candidate; the attesting status decides, as at bootstrap.
+        let visible_height = reader.event_fence().visible_tip().height.value();
+        self.parked =
+            parked_writer_readiness(&attesting_status, self.config.network, visible_height);
+        self.last_attested = self.parked.is_none().then(tokio::time::Instant::now);
+        self.readiness.publish_storage(
+            self.parked
+                .clone()
+                .unwrap_or_else(|| ReadinessState::ready(Some(visible_height))),
+        );
     }
 
     fn record_failure(&self, cause: ReadinessCause, height: u32) {
@@ -1375,6 +1382,8 @@ mod tests {
     #[derive(Clone)]
     struct MutableCanonicalControl {
         writer_status: Arc<Mutex<CanonicalWriterStatusResponse>>,
+        /// Answers served once each, in order, before `writer_status`.
+        queued_statuses: Arc<Mutex<std::collections::VecDeque<CanonicalWriterStatusResponse>>>,
         available: Arc<std::sync::atomic::AtomicBool>,
     }
 
@@ -1382,8 +1391,13 @@ mod tests {
         fn new(writer_status: CanonicalWriterStatusResponse) -> Self {
             Self {
                 writer_status: Arc::new(Mutex::new(writer_status)),
+                queued_statuses: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 available: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             }
+        }
+
+        fn queue_writer_status(&self, writer_status: CanonicalWriterStatusResponse) {
+            self.queued_statuses.lock().push_back(writer_status);
         }
 
         fn set_writer_status(&self, writer_status: CanonicalWriterStatusResponse) {
@@ -1405,7 +1419,10 @@ mod tests {
             if !self.available.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(tonic::Status::unavailable("fixture writer status outage"));
             }
-            Ok(tonic::Response::new(self.writer_status.lock().clone()))
+            let queued = self.queued_statuses.lock().pop_front();
+            Ok(tonic::Response::new(
+                queued.unwrap_or_else(|| self.writer_status.lock().clone()),
+            ))
         }
 
         async fn event_page(
@@ -1932,6 +1949,109 @@ mod tests {
 
         // A writer-status outage after the halt must keep refusing traffic,
         // never reopen it as a stale reader within the staleness ceiling.
+        control.set_available(false);
+        publisher.refresh().await;
+        let after_outage = readiness.report();
+        assert!(!after_outage.is_ready);
+        assert_eq!(after_outage.cause, expected_halt);
+
+        drop(slot);
+        drop(publisher);
+        let _ = shutdown_sender.send(());
+        server.await??;
+        Ok(())
+    }
+
+    /// A writer that parks between a refresh's first status and the status
+    /// that attests the rotated reader must leave the reader refusing with
+    /// the halt, also through a later writer-status outage.
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "bootstrap, the append, the park between two statuses, and the outage form one causal sequence"
+    )]
+    async fn rotation_attested_by_a_parked_writer_refuses_with_the_halt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let activations = lifecycle_activations();
+        let (primary, blocks) =
+            lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
+        let control = MutableCanonicalControl::new(lifecycle_writer_status(&primary));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let server = tokio::spawn({
+            let control = control.clone();
+            async move {
+                Server::builder()
+                    .add_service(CanonicalControlServer::new(control))
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                        let _ = shutdown_receiver.await;
+                    })
+                    .await
+            }
+        });
+        let readiness = Readiness::default();
+        let serving_readiness = CompactServingReadiness::new(readiness.clone());
+        serving_readiness.publish_node(ReadinessCause::Ready);
+        let config = CompactBlockServingConfig {
+            canonical_primary_path: temporary.path().join("canonical-primary"),
+            canonical_secondary_root: temporary.path().join("canonical-secondaries"),
+            network: Network::ZcashRegtest,
+            activations: Arc::new(activations.clone()),
+            raw_blob_retention: RawBlobRetention::Transactions,
+            reorg_policy: CanonicalReorgPolicy::new(100)?,
+            resource_budget: RocksDbResourceBudget::for_local_tests(),
+            catchup_interval: Duration::from_millis(1),
+            convergence_timeout: Duration::from_secs(2),
+            convergence_attempts: 4,
+            staleness_ceiling: Duration::from_mins(1),
+            lag_threshold: 0,
+        };
+        let (mut publisher, slot) =
+            CompactBlockPublisher::bootstrap(config, serving_readiness, &endpoint, None).await?;
+        assert!(readiness.report().is_ready);
+
+        let second = blocks
+            .get(1)
+            .cloned()
+            .ok_or("lifecycle fixture has no append block")?;
+        let expected_fence = primary.event_fence();
+        let (primary, _) = primary.commit_live_append(
+            CanonicalLiveAppend::new(
+                expected_fence,
+                lifecycle_build_block(&second, &activations),
+                Vec::new(),
+                expected_fence.visible_tip(),
+                UnixTimestampMillis::new(2_000),
+            ),
+            &activations,
+        )?;
+        // The refresh's first status is still following; the writer parks
+        // before the status that attests the rotated reader.
+        control.queue_writer_status(lifecycle_writer_status(&primary));
+        control.set_writer_status(CanonicalWriterStatusResponse {
+            reorg_window_exceeded: Some(zinder_proto::v1::ops::ReorgWindowExceededDetail {
+                depth: 1_001,
+                configured: 1_000,
+                covered: Some(1_000),
+            }),
+            ..lifecycle_writer_status(&primary)
+        });
+        publisher.refresh().await;
+        assert_eq!(
+            slot.capture().event_fence().visible_tip().height,
+            BlockHeight::new(2)
+        );
+        let expected_halt = ReadinessCause::ReorgWindowExceeded {
+            depth: 1_001,
+            configured: 1_000,
+            covered: Some(1_000),
+        };
+        let rotated = readiness.report();
+        assert!(!rotated.is_ready);
+        assert_eq!(rotated.cause, expected_halt);
+
         control.set_available(false);
         publisher.refresh().await;
         let after_outage = readiness.report();
