@@ -171,12 +171,17 @@ remained visible for more than an hour, which exceeded the 100-block window
 then in use. Production testnet moved to 300 blocks, and the node's bound is
 higher still.
 
-A replacement commits atomically, so ingest prepares its whole suffix, up to
-one window of blocks, in memory first. `ingest.follow.max_replacement_bytes`
-(2 GiB by default) bounds that memory. A replacement that would exceed it fails
-before any write with `ReplacementBytesExceeded`, naming the depth and bytes it
-reached; ingest exits and retries the same replacement on restart. Raise the
-limit, within the container's memory, to follow it.
+A replacement commits atomically, so ingest holds its whole suffix, up to one
+window of blocks, in memory first: the raw blocks fork discovery fetched, then
+their prepared form. `ingest.follow.max_replacement_bytes` (2 GiB by default)
+bounds the estimated sum of both, so set it within the container's memory with
+headroom for the one block being decoded. A replacement that would exceed it
+fails before any write with `ReplacementBytesExceeded`, naming the depth, the
+blocks prepared (zero when discovery alone exceeded it), and the bytes held.
+This is not a park: ingest exits, and under the wallet-serving image's
+`ALWAYS` restart policy the container restarts, discovers the same fork, and
+fails again, with wallets seeing an unavailable service instead of
+`REORG_WINDOW_EXCEEDED`. Raise the limit to follow the reorg.
 
 The settled tip trails the visible tip by the window, so surfaces that report
 settlement or finality report it 1000 blocks behind the visible tip. Wallet

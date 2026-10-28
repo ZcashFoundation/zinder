@@ -336,17 +336,23 @@ pub enum CanonicalFollowError {
     /// The source fork has no common parent above the authenticated settlement boundary.
     #[error(transparent)]
     ReorgWindowExceeded(Box<CanonicalReorgWindowExceeded>),
-    /// Preparing one replacement exceeded its memory budget before commit.
+    /// One replacement exceeded its memory budget before commit.
+    ///
+    /// The budget covers the source blocks fork discovery fetched and has not
+    /// yet prepared, plus the prepared blocks, so it fails during discovery
+    /// when the fetched blocks alone exceed it.
     #[error(
-        "preparing a {replacement_depth}-block replacement exceeded ingest.follow.max_replacement_bytes ({max_replacement_bytes} bytes) after {prepared_blocks} blocks and {prepared_bytes} bytes; raise it to follow this reorg"
+        "a {replacement_depth}-block replacement exceeded ingest.follow.max_replacement_bytes ({max_replacement_bytes} bytes) holding {held_bytes} bytes after preparing {prepared_blocks} blocks; raise it to follow this reorg"
     )]
     ReplacementBytesExceeded {
-        /// Blocks the replacement replaces or appends.
+        /// Blocks the replacement replaces or appends. During fork discovery
+        /// it is the number of blocks discovered so far, a lower bound.
         replacement_depth: u32,
-        /// Blocks prepared before the budget ran out.
+        /// Blocks prepared before the budget ran out; zero during discovery.
         prepared_blocks: u32,
-        /// Estimated bytes of the prepared blocks, including the refused one.
-        prepared_bytes: u64,
+        /// Estimated bytes held when the budget ran out: fetched source blocks
+        /// not yet prepared plus prepared blocks, including the refused one.
+        held_bytes: u64,
         /// Configured budget.
         max_replacement_bytes: u64,
     },
@@ -737,9 +743,12 @@ where
     let settled_tip = anchor.settled_tip();
     let configured_window_blocks = store.reorg_policy().reorg_window_blocks();
     let search_start = local_tip.height.min(observed_tip.height);
-    let mut source_blocks = prefetched_source_block
-        .map(|block| BTreeMap::from([(block.height, block)]))
-        .unwrap_or_default();
+    let mut memory = ReplacementMemory::new(config.max_replacement_bytes);
+    let mut source_blocks = BTreeMap::new();
+    if let Some(block) = prefetched_source_block {
+        memory.retain_source(&block);
+        source_blocks.insert(block.height, block);
+    }
     let mut search_height = Some(search_start);
     let mut common_parent = None;
     let discovery_started = std::time::Instant::now();
@@ -768,8 +777,26 @@ where
         {
             common_parent = Some(settled_tip);
         }
-        source_blocks.insert(height, source_block);
-        if common_parent.is_some() {
+        let block_bytes = memory.retain_source(&source_block);
+        if let Some(replaced) = source_blocks.insert(height, source_block) {
+            memory.release(source_block_bytes(&replaced));
+        }
+        if memory.exceeded() {
+            return Err(CanonicalFollowError::ReplacementBytesExceeded {
+                replacement_depth: u32::try_from(source_blocks.len()).unwrap_or(u32::MAX),
+                prepared_blocks: 0,
+                held_bytes: memory.held_bytes(),
+                max_replacement_bytes: config.max_replacement_bytes.get(),
+            });
+        }
+        if let Some(common_parent) = common_parent {
+            if common_parent.height == height {
+                // The common parent itself is never replaced, so it stops
+                // counting; a first replacement block above the settled tip
+                // is kept.
+                source_blocks.remove(&height);
+                memory.release(block_bytes);
+            }
             break;
         }
         search_height = height.value().checked_sub(1).map(BlockHeight::new);
@@ -825,7 +852,6 @@ where
     let raw_blob_retention = store.raw_blob_retention();
     let mut previous_tip_metadata = predecessor_checkpoint.tip_metadata();
     let mut replacement_blocks = Vec::new();
-    let mut prepared_bytes = 0_u64;
     let replacement_depth = replacement_tip_height
         .value()
         .saturating_sub(first_replacement_height.value())
@@ -833,6 +859,7 @@ where
     let mut height = Some(first_replacement_height);
     while let Some(current_height) = height.filter(|height| *height <= replacement_tip_height) {
         let source_block = if let Some(source_block) = source_blocks.remove(&current_height) {
+            memory.release(source_block_bytes(&source_block));
             source_block
         } else {
             metrics::counter!("zinder_ingest_canonical_replacement_source_block_reads_total")
@@ -888,14 +915,14 @@ where
             next_tip_metadata,
         )
         .await?;
-        prepared_bytes = prepared_bytes.saturating_add(prepared_replacement_bytes(&block));
-        if prepared_bytes > config.max_replacement_bytes.get() {
+        memory.hold(prepared_replacement_bytes(&block));
+        if memory.exceeded() {
             return Err(CanonicalFollowError::ReplacementBytesExceeded {
                 replacement_depth,
                 prepared_blocks: u32::try_from(replacement_blocks.len())
                     .unwrap_or(u32::MAX)
                     .saturating_add(1),
-                prepared_bytes,
+                held_bytes: memory.held_bytes(),
                 max_replacement_bytes: config.max_replacement_bytes.get(),
             });
         }
@@ -927,6 +954,56 @@ where
         )),
         observed_tip,
     })
+}
+
+/// Estimated bytes one replacement holds before its atomic commit, against
+/// `ingest.follow.max_replacement_bytes`.
+///
+/// Fork discovery fetches the replacement suffix newest first, before the
+/// common parent is known, and keeps those blocks for preparation, so they
+/// count until a prepared block replaces them.
+#[derive(Debug)]
+struct ReplacementMemory {
+    held_bytes: u64,
+    max_bytes: u64,
+}
+
+impl ReplacementMemory {
+    const fn new(max_bytes: NonZeroU64) -> Self {
+        Self {
+            held_bytes: 0,
+            max_bytes: max_bytes.get(),
+        }
+    }
+
+    /// Counts one fetched source block and returns its estimated bytes.
+    fn retain_source(&mut self, block: &SourceBlock) -> u64 {
+        let bytes = source_block_bytes(block);
+        self.hold(bytes);
+        bytes
+    }
+
+    const fn hold(&mut self, bytes: u64) {
+        self.held_bytes = self.held_bytes.saturating_add(bytes);
+    }
+
+    const fn release(&mut self, bytes: u64) {
+        self.held_bytes = self.held_bytes.saturating_sub(bytes);
+    }
+
+    const fn held_bytes(&self) -> u64 {
+        self.held_bytes
+    }
+
+    const fn exceeded(&self) -> bool {
+        self.held_bytes > self.max_bytes
+    }
+}
+
+/// Estimates the bytes one fetched source block holds: its raw serialized
+/// block, which preparation decodes.
+fn source_block_bytes(block: &SourceBlock) -> u64 {
+    u64::try_from(block.raw_block_bytes.len()).unwrap_or(u64::MAX)
 }
 
 /// Estimates the bytes one prepared replacement block holds until commit: its
@@ -1316,12 +1393,29 @@ mod tests {
     };
 
     use super::{
-        await_follow_preparation_or_mempool_change, gate_canonical_readiness_on_mempool_hydration,
-        live_subtree_root_ranges, next_settled_height, publish_follow_readiness,
-        wait_for_mempool_hydration_change, withdraw_follow_readiness_for_mempool_hydration,
+        ReplacementMemory, await_follow_preparation_or_mempool_change,
+        gate_canonical_readiness_on_mempool_hydration, live_subtree_root_ranges,
+        next_settled_height, publish_follow_readiness, wait_for_mempool_hydration_change,
+        withdraw_follow_readiness_for_mempool_hydration,
     };
     use crate::mempool_ready_channel;
     use zinder_runtime::{IngestPhase, Readiness, ReadinessCause, ReadinessState};
+
+    #[test]
+    fn replacement_memory_counts_fetched_blocks_until_prepared() -> Result<(), &'static str> {
+        let mut memory =
+            ReplacementMemory::new(std::num::NonZeroU64::new(100).ok_or("budget is nonzero")?);
+        memory.hold(60);
+        memory.hold(40);
+        assert!(!memory.exceeded());
+        // Preparing the first fetched block releases its source bytes and
+        // holds its prepared estimate instead.
+        memory.release(60);
+        memory.hold(61);
+        assert_eq!(memory.held_bytes(), 101);
+        assert!(memory.exceeded());
+        Ok(())
+    }
 
     #[test]
     fn ready_follow_observation_keeps_an_active_cursor_at_risk_warning() {
