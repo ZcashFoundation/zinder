@@ -221,6 +221,24 @@ the node itself cannot produce such a reorg, so look for a replaced, resynced,
 or misbehaving node. Confirm the authoritative branch, then rebuild or restore a
 coherent state bundle before returning the service to traffic.
 
+Health checks follow the same rule. The image `HEALTHCHECK` runs
+`zinder-wallet-serving-healthcheck`, which passes when query `/readyz` answers
+200 or reports `reorg_window_exceeded`, so a Docker or Compose host that
+restarts unhealthy containers keeps the typed refusal up instead of restarting
+into the same park.
+
+Railway's deploy-time healthcheck is different: it requires `/readyz` to
+answer 200 within `healthcheckTimeout` (six hours) before a deployment counts
+as successful. Do not redeploy while the writer is parked except to ship the
+reconciliation, such as a restored state bundle or a rebuild. A redeploy
+restarts all three processes, ingest parks again on the same reorg, and query
+reports `reorg_window_exceeded`, so the new deployment never passes the
+healthcheck and Railway marks it failed when the timeout expires. Because the
+service owns a volume, Railway stops the running deployment before it starts
+the new one, so the redeploy also ends the deployment that was serving the
+typed refusal. A plain restart or a crash restart under the `ALWAYS` policy
+does not run the deploy-time healthcheck and comes back serving the halt.
+
 Upstream outages and sync lag drain readiness the same way but clear on their
 own, so they are tolerated for an hour before the container terminates.
 
