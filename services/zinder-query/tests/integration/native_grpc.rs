@@ -491,22 +491,33 @@ async fn transaction_absence_requires_a_mempool_miss_at_the_same_epoch() -> eyre
         Some(TransactionAbsence::at_epoch(chain_epoch, true))
     );
 
-    // A writer one epoch ahead may have mined the transaction into a block this
-    // replica has not caught up to, so the lookup fails instead.
-    let writer_ahead = ChainEpoch {
-        id: ChainEpochId::new(chain_epoch.id.value() + 1),
-        ..chain_epoch
-    };
-    mempool_miss.set_mempool_transaction_miss(
-        TransactionAbsence::at_epoch(writer_ahead, true).into_status("not in the test mempool"),
-    );
-    let lagging = transaction_status(&adapter, missing_transaction_id, None).await?;
-    assert_eq!(lagging.code(), Code::NotFound);
-    assert_eq!(
-        error_reason(&lagging),
-        Some(ops::ErrorReason::ChainEpochMissing)
-    );
-    assert_eq!(TransactionAbsence::from_status(&lagging)?, None);
+    // A writer at another epoch, ahead because this replica lags or behind
+    // because the writer restarted, describes a different chain than the
+    // canonical read. The transaction may have moved between the two views, so
+    // the lookup fails and names the writer's epoch.
+    for writer_epoch_id in [chain_epoch.id.value() + 1, chain_epoch.id.value() - 1] {
+        let writer_epoch = ChainEpoch {
+            id: ChainEpochId::new(writer_epoch_id),
+            ..chain_epoch
+        };
+        mempool_miss.set_mempool_transaction_miss(
+            TransactionAbsence::at_epoch(writer_epoch, true).into_status("not in the test mempool"),
+        );
+        let mismatched = transaction_status(&adapter, missing_transaction_id, None).await?;
+        assert_eq!(mismatched.code(), Code::NotFound);
+        assert_eq!(
+            error_reason(&mismatched),
+            Some(ops::ErrorReason::ChainEpochMissing)
+        );
+        assert_eq!(
+            mismatched
+                .get_error_details()
+                .resource_info()
+                .map(|resource| resource.resource_name.clone()),
+            Some(format!("chain_epoch:{writer_epoch_id}"))
+        );
+        assert_eq!(TransactionAbsence::from_status(&mismatched)?, None);
+    }
 
     // A writer that answers without the typed absence keeps the ambiguous
     // legacy shape rather than becoming an absence.
