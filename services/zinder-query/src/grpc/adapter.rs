@@ -356,7 +356,7 @@ where
             .map_err(|error| status_from_query_error(&error))?;
 
         let chain_epoch = match canonical_lookup {
-            TransactionStatusLookup::Located(response) => return Ok(Response::new(response)),
+            TransactionStatusLookup::Located(response) => return Ok(Response::new(*response)),
             TransactionStatusLookup::Absent { chain_epoch } => chain_epoch,
         };
         if at_epoch_id.is_some() {

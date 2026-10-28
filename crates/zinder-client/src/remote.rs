@@ -2391,16 +2391,13 @@ fn is_unverified_transaction_absence(status: &tonic::Status) -> bool {
         return false;
     }
     let details = status.get_error_details();
-    match details
+    details
         .error_info()
         .filter(|error_info| error_info.domain == ZINDER_ERROR_DOMAIN)
-    {
-        None => true,
-        Some(error_info) => {
+        .is_none_or(|error_info| {
             error_info.reason == crate::ErrorReason::ArtifactUnavailable.as_str()
                 && details.resource_info().is_none()
-        }
-    }
+        })
 }
 
 #[allow(

@@ -282,7 +282,7 @@ pub async fn block_header_by_selector_response<Q: WalletQueryApi + ?Sized>(
 #[derive(Clone, Debug, PartialEq)]
 pub enum TransactionStatusLookup {
     /// The transaction has a typed location the wire oneof can carry.
-    Located(wallet::TransactionStatusResponse),
+    Located(Box<wallet::TransactionStatusResponse>),
     /// The transaction is absent from the canonical chain of `chain_epoch`,
     /// whose retained history is complete.
     Absent {
@@ -676,14 +676,14 @@ fn build_transaction_status_response(
             });
         }
     };
-    Ok(TransactionStatusLookup::Located(
+    Ok(TransactionStatusLookup::Located(Box::new(
         wallet::TransactionStatusResponse {
             chain_view: Some(build_chain_view_message(chain_epoch)),
             location: Some(wallet::TransactionLocation {
                 location: Some(location),
             }),
         },
-    ))
+    )))
 }
 
 fn build_mined_transaction_chain_context_message(
