@@ -1,0 +1,35 @@
+#!/bin/sh
+
+# Container healthcheck for the single-host wallet-serving image.
+#
+# Healthy means the native query surface answers wallets usefully: it is ready,
+# or it refuses every request with the typed REORG_WINDOW_EXCEEDED halt because
+# the canonical writer is parked. The entrypoint deliberately keeps a parked
+# topology up, so an orchestrator that restarts unhealthy containers must not
+# replace that typed refusal with refused connections.
+
+set -u
+
+query_ops_addr="${1:-127.0.0.1:9106}"
+
+readiness_body="$(
+  curl -s --connect-timeout 2 --max-time 4 \
+    -w '\n%{http_code}' \
+    "http://$query_ops_addr/readyz"
+)" || exit 1
+
+http_status="${readiness_body##*
+}"
+
+if [ "$http_status" = "200" ]; then
+  exit 0
+fi
+
+case "$readiness_body" in
+  *'"reorg_window_exceeded"'*)
+    exit 0
+    ;;
+  *)
+    exit 1
+    ;;
+esac

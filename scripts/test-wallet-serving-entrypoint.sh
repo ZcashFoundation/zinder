@@ -135,4 +135,35 @@ await_readiness zinder-ingest 127.0.0.1:9105 60 \
 [ -z "$fail_message" ] || test_failure "startup failed on a parked writer: $fail_message"
 [ "$sleep_count" -eq 0 ] || test_failure "startup waited on a parked writer"
 
+# The container healthcheck runs as its own process, so it is exercised with a
+# stub curl on PATH that serves the fixture status and body.
+healthcheck="$repository_root/deploy/wallet-serving-healthcheck"
+stub_bin="$(mktemp -d)"
+trap 'rm -rf "$stub_bin"' EXIT
+cat >"$stub_bin/curl" <<'STUB'
+#!/bin/sh
+[ "${HEALTHCHECK_STUB_UNREACHABLE:-0}" -eq 0 ] || exit 7
+printf '%s\n%s' "$HEALTHCHECK_STUB_BODY" "$HEALTHCHECK_STUB_STATUS"
+STUB
+chmod +x "$stub_bin/curl"
+
+run_healthcheck() {
+  HEALTHCHECK_STUB_STATUS="$1" HEALTHCHECK_STUB_BODY="$2" \
+    HEALTHCHECK_STUB_UNREACHABLE="${3:-0}" PATH="$stub_bin:$PATH" sh "$healthcheck"
+}
+
+run_healthcheck 200 "$ready_body" \
+  || test_failure "the healthcheck must pass a ready query plane"
+run_healthcheck 503 "$halted_body" \
+  || test_failure "the healthcheck must pass a query plane serving the writer halt"
+if run_healthcheck 503 "$syncing_body"; then
+  test_failure "the healthcheck must fail a syncing query plane"
+fi
+if run_healthcheck 503 "$schema_body"; then
+  test_failure "the healthcheck must fail a schema mismatch"
+fi
+if run_healthcheck 200 "$ready_body" 1; then
+  test_failure "the healthcheck must fail an unreachable query plane"
+fi
+
 printf 'wallet-serving entrypoint tests passed\n'
