@@ -84,6 +84,7 @@ The request shape is valid but the deployment is in a state that cannot serve it
 | `DEPENDENCY_NOT_CONFIGURED` | A federated dependency the explorer request needs (the canonical store, a materialized view, or a wallet-query endpoint) is not wired on this deployment | — |
 | `NODE_CAPABILITY_MISSING` | The upstream Zcash node does not advertise a capability the request requires; the operator must reconfigure the node | — |
 | `EXPLORER_PRECONDITION_UNSATISFIED` | An explorer read cannot serve the requested transaction state | — |
+| `CANONICAL_HISTORY_UNAVAILABLE` | The store's retained canonical history starts after a checkpoint, so a transaction lookup cannot prove an absence; query a store with complete history | `ErrorInfo.metadata["first_available_height"]` |
 
 ### `NOT_FOUND` family
 
@@ -94,6 +95,9 @@ The requested resource is not available in the visible query state. Retry dispos
 | `ARTIFACT_UNAVAILABLE` | A specific artifact is missing from the named family at the visible epoch (also raised by explorer reads for a not-yet-materialized materialized-view row) | `resource_type=<family>, resource_name=<key>` |
 | `CHAIN_EPOCH_MISSING` | Chain epoch is not retained (often: pruned) | `resource_type=chain_epoch, resource_name=chain_epoch:<id>` |
 | `BLOCK_NOT_IN_BEST_CHAIN` | No block matching the requested selector is visible in the best chain; unknown and reorged-out selectors share this reason | — |
+| `TRANSACTION_NOT_FOUND` | Proven absence from `WalletQuery.Transaction`: the transaction is in neither the answering epoch's canonical chain nor, for an unpinned lookup, the writer's live mempool at that same epoch, and the store retains complete history. It is an answer rather than a failure; no other failure carries it | `ErrorInfo.metadata["chain_epoch_id"]`, `["visible_tip_height"]`, `["covers_mempool"]` (`true` or `false`) |
+
+`WalletQuery.Transaction` reports an absence only through `TRANSACTION_NOT_FOUND`. Any other `NOT_FOUND` reason on that method, including `ARTIFACT_UNAVAILABLE`, `CHAIN_EPOCH_MISSING`, and `BLOCK_NOT_IN_BEST_CHAIN`, is a failure and says nothing about whether the transaction exists. Servers below contract revision 6 answered absences with `ARTIFACT_UNAVAILABLE` and no `ResourceInfo`, the same shape as several storage failures, so that shape is ambiguous.
 
 ### `DATA_LOSS` family
 

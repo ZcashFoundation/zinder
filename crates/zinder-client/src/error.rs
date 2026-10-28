@@ -350,6 +350,7 @@ const fn retry_policy_for_remote(reason: &ErrorReason, code: Code) -> RetryPolic
         | ErrorReason::ExplorerPreconditionUnsatisfied
         | ErrorReason::ExplorerMethodDisabled
         | ErrorReason::DependencyNotConfigured
+        | ErrorReason::CanonicalHistoryUnavailable
         | ErrorReason::Unspecified => RetryPolicy::OperatorActionRequired,
         ErrorReason::ArtifactUnavailable
         | ErrorReason::ChainEpochMissing
@@ -363,7 +364,8 @@ const fn retry_policy_for_remote(reason: &ErrorReason, code: Code) -> RetryPolic
         | ErrorReason::UnsupportedWalletEncoding
         | ErrorReason::NoVisibleChainEpoch
         | ErrorReason::UpstreamUnreachable
-        | ErrorReason::ServiceNotReady => RetryPolicy::RetryWithBackoff,
+        | ErrorReason::ServiceNotReady
+        | ErrorReason::TransactionNotFound => RetryPolicy::RetryWithBackoff,
         ErrorReason::Unknown(_) => retry_policy_for_status(code),
     }
 }

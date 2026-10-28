@@ -1169,3 +1169,44 @@ where
     let encoded_message = message.encode_to_vec();
     MessageType::decode(encoded_message.as_slice())
 }
+
+#[test]
+fn transaction_lookup_reasons_round_trip_by_name_and_scalar() -> eyre::Result<()> {
+    for (reason, name, scalar) in [
+        (ops::ErrorReason::TransactionNotFound, "TRANSACTION_NOT_FOUND", 51),
+        (
+            ops::ErrorReason::CanonicalHistoryUnavailable,
+            "CANONICAL_HISTORY_UNAVAILABLE",
+            52,
+        ),
+    ] {
+        assert_eq!(reason.as_str_name(), name);
+        assert_eq!(ops::ErrorReason::from_str_name(name), Some(reason));
+        assert_eq!(ops::ErrorReason::try_from(scalar)?, reason);
+    }
+    Ok(())
+}
+
+#[test]
+fn transaction_absence_survives_status_detail_bytes() -> eyre::Result<()> {
+    use zinder_core::{BlockHeight, ChainEpochId};
+    use zinder_proto::wire::TransactionAbsence;
+
+    let absence = TransactionAbsence {
+        chain_epoch_id: ChainEpochId::new(7),
+        visible_tip_height: BlockHeight::new(42),
+        covers_mempool: false,
+    };
+    let status = absence.into_status("transaction not found");
+    // Rebuild the status from its encoded `google.rpc.Status` detail bytes, as
+    // a remote peer receives it.
+    let received = tonic::Status::with_details(
+        status.code(),
+        status.message().to_owned(),
+        status.details().to_vec().into(),
+    );
+
+    assert_eq!(received.code(), tonic::Code::NotFound);
+    assert_eq!(TransactionAbsence::from_status(&received)?, Some(absence));
+    Ok(())
+}

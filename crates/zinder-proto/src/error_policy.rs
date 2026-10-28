@@ -102,13 +102,15 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
         | ErrorReason::EndpointCapabilityUnavailable
         | ErrorReason::DependencyNotConfigured
         | ErrorReason::NodeCapabilityMissing
-        | ErrorReason::ExplorerPreconditionUnsatisfied => {
+        | ErrorReason::ExplorerPreconditionUnsatisfied
+        | ErrorReason::CanonicalHistoryUnavailable => {
             ReasonPolicy::new(Code::FailedPrecondition, NonRetryable)
         }
 
         ErrorReason::ArtifactUnavailable
         | ErrorReason::ChainEpochMissing
-        | ErrorReason::BlockNotInBestChain => ReasonPolicy::new(Code::NotFound, RetryAfterBackoff),
+        | ErrorReason::BlockNotInBestChain
+        | ErrorReason::TransactionNotFound => ReasonPolicy::new(Code::NotFound, RetryAfterBackoff),
 
         ErrorReason::CompactBlockPayloadMalformed | ErrorReason::ArtifactCorrupt => {
             ReasonPolicy::new(Code::DataLoss, NonRetryable)

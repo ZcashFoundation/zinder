@@ -2265,9 +2265,15 @@ pub mod wallet_query_client {
                 );
             self.inner.server_streaming(req, path, codec).await
         }
-        /// Return the typed status of one transaction by transaction id. NotFound
-        /// maps to gRPC NOT_FOUND; mempool and mined states are typed in the
-        /// response location oneof.
+        /// Return the typed status of one transaction by transaction id. Mempool
+        /// and mined states are typed in the response location oneof. A proven
+        /// absence is gRPC NOT_FOUND with ErrorInfo reason TRANSACTION_NOT_FOUND,
+        /// whose metadata names the epoch it covers. With `at_epoch_id` the answer
+        /// covers that epoch's canonical chain only; without it, the visible
+        /// epoch's canonical chain and the writer's live mempool at that same
+        /// epoch. Every other NOT_FOUND reason is a failure, not an absence. A
+        /// store whose history starts after a checkpoint returns
+        /// CANONICAL_HISTORY_UNAVAILABLE instead of an absence.
         pub async fn transaction(
             &mut self,
             request: impl tonic::IntoRequest<super::TransactionRequest>,
@@ -3011,9 +3017,15 @@ pub mod wallet_query_server {
             tonic::Response<Self::FullBlocksInRangeStream>,
             tonic::Status,
         >;
-        /// Return the typed status of one transaction by transaction id. NotFound
-        /// maps to gRPC NOT_FOUND; mempool and mined states are typed in the
-        /// response location oneof.
+        /// Return the typed status of one transaction by transaction id. Mempool
+        /// and mined states are typed in the response location oneof. A proven
+        /// absence is gRPC NOT_FOUND with ErrorInfo reason TRANSACTION_NOT_FOUND,
+        /// whose metadata names the epoch it covers. With `at_epoch_id` the answer
+        /// covers that epoch's canonical chain only; without it, the visible
+        /// epoch's canonical chain and the writer's live mempool at that same
+        /// epoch. Every other NOT_FOUND reason is a failure, not an absence. A
+        /// store whose history starts after a checkpoint returns
+        /// CANONICAL_HISTORY_UNAVAILABLE instead of an absence.
         async fn transaction(
             &self,
             request: tonic::Request<super::TransactionRequest>,
