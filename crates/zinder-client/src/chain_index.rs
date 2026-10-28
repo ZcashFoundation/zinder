@@ -1140,9 +1140,14 @@ pub trait ChainIndex: Send + Sync + 'static {
     ///   [`IndexerError::NotFound`] for a block outside the best chain, and
     ///   [`IndexerError::RemoteFailure`].
     ///
-    /// To judge a transaction against a height, take a
+    /// `TxStatus::NotFound` carries no epoch. After an unpinned lookup the
+    /// caller cannot tell which epoch, and so which heights, the absence
+    /// covers, so a decision that depends on the transaction never being
+    /// mined, such as releasing a payment, must use a pinned lookup: take a
     /// [`ChainSnapshot`](crate::ChainSnapshot) whose epoch's visible tip
-    /// covers that height and look the transaction up through it.
+    /// covers the height being judged and look the transaction up through it.
+    /// A pinned lookup never reports [`TxStatus::InMempool`]; make an
+    /// unpinned lookup as well when the pending state matters.
     ///
     /// # Examples
     ///
