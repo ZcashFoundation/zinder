@@ -33,7 +33,7 @@ use zinder_proto::v1::ingest::{
     canonical_control_server::{CanonicalControl, CanonicalControlServer},
 };
 use zinder_proto::v1::ops;
-use zinder_runtime::{BearerToken, BearerTokenServerInterceptor};
+use zinder_runtime::{BearerToken, BearerTokenServerInterceptor, ReadinessCause, not_ready_status};
 use zinder_store::{
     CanonicalEventCursor, CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalEventKind,
     CanonicalMempoolSnapshotStart, CanonicalOwnerCheckpointAdmission,
@@ -766,6 +766,12 @@ impl ParkedWriterHalt {
             },
         }
     }
+
+    /// Returns the status a refused command or ended stream carries: the same
+    /// typed `REORG_WINDOW_EXCEEDED` refusal readers return to wallets.
+    pub(crate) fn status(self) -> Status {
+        not_ready_status(&ReadinessCause::from(self.detail))
+    }
 }
 
 /// Services one command for a writer parked on a reorg deeper than its window.
@@ -774,6 +780,11 @@ impl ParkedWriterHalt {
 /// owner checkpoints, so those commands are served as before. `WriterStatus`
 /// additionally carries the halt so canonical-status readers refuse traffic
 /// instead of reporting ready on the frozen fence.
+///
+/// Every mempool command is refused with the halt: the mempool of a node on
+/// another branch cannot be reconciled with the frozen fence, so the parked
+/// writer neither records nor prunes mempool events, and open mempool event
+/// streams end with the typed status on their next page.
 pub(crate) fn apply_parked_canonical_control_command(
     store: &mut RocksDbCanonicalStore,
     command: CanonicalControlCommand,
@@ -789,15 +800,27 @@ pub(crate) fn apply_parked_canonical_control_command(
                 }),
             );
         }
+        CanonicalControlCommand::AppendMempoolEvent { reply, .. } => {
+            send_control_response(reply, Err(halt.status()));
+        }
+        CanonicalControlCommand::AppendMempoolEvents { reply, .. }
+        | CanonicalControlCommand::MempoolEventPage { reply, .. } => {
+            send_control_response(reply, Err(halt.status()));
+        }
+        CanonicalControlCommand::ResolveMempoolEventStart { reply, .. } => {
+            send_control_response(reply, Err(halt.status()));
+        }
+        CanonicalControlCommand::BeginMempoolSnapshot { reply, .. } => {
+            send_control_response(reply, Err(halt.status()));
+        }
+        CanonicalControlCommand::EncodeMempoolSnapshotNextCursor { reply, .. } => {
+            send_control_response(reply, Err(halt.status()));
+        }
+        CanonicalControlCommand::PruneMempoolEvents { reply, .. } => {
+            send_control_response(reply, Err(halt.status()));
+        }
         command @ (CanonicalControlCommand::ChainEpoch { .. }
         | CanonicalControlCommand::IngestEventPage { .. }
-        | CanonicalControlCommand::AppendMempoolEvent { .. }
-        | CanonicalControlCommand::AppendMempoolEvents { .. }
-        | CanonicalControlCommand::MempoolEventPage { .. }
-        | CanonicalControlCommand::ResolveMempoolEventStart { .. }
-        | CanonicalControlCommand::BeginMempoolSnapshot { .. }
-        | CanonicalControlCommand::EncodeMempoolSnapshotNextCursor { .. }
-        | CanonicalControlCommand::PruneMempoolEvents { .. }
         | CanonicalControlCommand::EventPage { .. }
         | CanonicalControlCommand::CreateOwnerCheckpoint { .. }
         | CanonicalControlCommand::OwnerCheckpointReadmission { .. }

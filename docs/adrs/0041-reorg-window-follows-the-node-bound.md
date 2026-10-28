@@ -92,6 +92,27 @@ against it, and it reports the halt through
 `ReorgWindowExceededDetail`). The halt is a terminal readiness state that no
 other ingest worker can replace.
 
+A parked writer changes no canonical row and writes the store only for
+projection-build retention leases: `AcquireProjectionBuildLease` and
+`RenewProjectionBuildLease` write a lease row (acquisition also advances the
+lease generation counter and deletes expired leases), and
+`ReleaseProjectionBuildLease` deletes one. Owner checkpoint
+creation writes a RocksDB checkpoint to its staging target, outside the
+store's rows. Canonical event retention runs only in the follow loop, so it
+stops at the park.
+
+The mempool stops with the writer. The node's mempool is built on a branch
+the frozen fence does not contain, so the park halts the live mempool owner
+for the rest of the process: it stops reading the node mempool and withdraws
+its in-memory index, and mempool retention stops. The owner task stays alive,
+so the ingest supervisor does not read the halt as an unexpected exit. The
+parked writer refuses every mempool command, so it records and prunes no
+mempool event. Every ingest-control mempool read (snapshot, transaction, and
+transparent lookups) refuses with the typed `REORG_WINDOW_EXCEEDED` status,
+and an open `MempoolEvents` stream ends with it on its next page. Native
+query proxies those streams, so its open `MempoolEvents` streams end with the
+same status.
+
 Every wallet-serving reader refuses traffic while the writer reports the halt:
 
 - The serving-pair publisher shared by native query and lightwalletd
@@ -123,8 +144,8 @@ Wallet consumers receive the halt through the existing error vocabulary:
   The covered depth is the distance from the settled tip to the visible tip,
   which is below the window while a raised window is still growing, so a halt
   during that ramp does not read as a reorg deeper than the new window.
-- Open `ChainEvents` streams end with the same status, because the traffic
-  gate only rejects new requests.
+- Open `ChainEvents` and `MempoolEvents` streams end with the same status,
+  because the traffic gate only rejects new requests.
 - `zinder-client` decodes the status as `IndexerError::ReorgWindowExceeded`
   with retry policy `OperatorActionRequired`.
 

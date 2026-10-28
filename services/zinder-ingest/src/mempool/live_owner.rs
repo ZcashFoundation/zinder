@@ -37,7 +37,7 @@ use zinder_store::{
 };
 
 use crate::source_recovery::default_recovery_backoff;
-use crate::writer::control::CanonicalControlHandle;
+use crate::writer::control::{CanonicalControlHandle, ParkedWriterHalt};
 
 use super::{
     MempoolApplyOutcome, MempoolEntryBuildError, MempoolIndex, MempoolIndexPreflight,
@@ -48,7 +48,8 @@ const MEMPOOL_EVENT_PAGE_SIZE: u32 = 64;
 const MEMPOOL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 const MEMPOOL_CANONICAL_TIP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS: usize = 256;
-const MEMPOOL_LIFECYCLE_STATUS_LABELS: &[&str] = &["hydrating", "serving", "rebuild_required"];
+const MEMPOOL_LIFECYCLE_STATUS_LABELS: &[&str] =
+    &["hydrating", "serving", "rebuild_required", "halted"];
 /// Default raw transaction payload budget for one durable reconciliation append.
 pub const DEFAULT_RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES: u64 = 16_000_000;
 
@@ -111,6 +112,25 @@ enum MempoolOwnerStatus {
     },
     /// A defensive post-append divergence was detected and the index must be reseeded.
     RebuildRequired,
+    /// The canonical writer parked on a reorg deeper than its window. The
+    /// owner no longer follows the node mempool, and every read and stream
+    /// refuses with the writer's typed halt until the process restarts.
+    Halted(ParkedWriterHalt),
+}
+
+impl MempoolOwnerStatus {
+    fn unavailable(self) -> Status {
+        match self {
+            Self::Serving { .. } => Status::internal("a serving mempool index is available"),
+            Self::Hydrating => {
+                Status::unavailable("live mempool index is hydrating from an upstream snapshot")
+            }
+            Self::RebuildRequired => Status::unavailable(
+                "live mempool index is rebuilding after a durable transition mismatch",
+            ),
+            Self::Halted(halt) => halt.status(),
+        }
+    }
 }
 
 /// Process-local live index with a serialized durable-log handoff.
@@ -165,13 +185,25 @@ impl LiveMempoolOwner {
         let status = *self.status.read();
         match status {
             MempoolOwnerStatus::Serving { .. } => Ok(()),
-            MempoolOwnerStatus::Hydrating => Err(Status::unavailable(
-                "live mempool index is hydrating from an upstream snapshot",
-            )),
-            MempoolOwnerStatus::RebuildRequired => Err(Status::unavailable(
-                "live mempool index is rebuilding after a durable transition mismatch",
-            )),
+            MempoolOwnerStatus::Hydrating
+            | MempoolOwnerStatus::RebuildRequired
+            | MempoolOwnerStatus::Halted(_) => Err(status.unavailable()),
         }
+    }
+
+    /// Refuses with the writer's typed halt once the owner is halted.
+    fn require_not_halted(&self) -> Result<(), Status> {
+        let status = *self.status.read();
+        match status {
+            MempoolOwnerStatus::Halted(halt) => Err(halt.status()),
+            MempoolOwnerStatus::Hydrating
+            | MempoolOwnerStatus::Serving { .. }
+            | MempoolOwnerStatus::RebuildRequired => Ok(()),
+        }
+    }
+
+    fn is_halted(&self) -> bool {
+        matches!(*self.status.read(), MempoolOwnerStatus::Halted(_))
     }
 
     fn coherent_serving_state_for(
@@ -194,12 +226,9 @@ impl LiveMempoolOwner {
                 }
                 Ok((source_tip, snapshot_certified_at))
             }
-            MempoolOwnerStatus::Hydrating => Err(Status::unavailable(
-                "live mempool index is hydrating from an upstream snapshot",
-            )),
-            MempoolOwnerStatus::RebuildRequired => Err(Status::unavailable(
-                "live mempool index is rebuilding after a durable transition mismatch",
-            )),
+            MempoolOwnerStatus::Hydrating
+            | MempoolOwnerStatus::RebuildRequired
+            | MempoolOwnerStatus::Halted(_) => Err(status.unavailable()),
         }
     }
 
@@ -306,6 +335,7 @@ impl LiveMempoolOwner {
         start: EventStreamStartPosition,
     ) -> Result<Option<StreamCursorTokenV1>, Status> {
         let _mutation_guard = self.mutation_gate.lock().await;
+        self.require_not_halted()?;
         canonical.resolve_mempool_event_start(start).await
     }
 
@@ -316,6 +346,7 @@ impl LiveMempoolOwner {
         after_cursor: Option<StreamCursorTokenV1>,
     ) -> Result<Vec<wallet::MempoolEventEnvelope>, Status> {
         let _mutation_guard = self.mutation_gate.lock().await;
+        self.require_not_halted()?;
         canonical
             .mempool_event_page(
                 after_cursor.map(|cursor| cursor.as_bytes().to_vec()),
@@ -352,9 +383,9 @@ impl LiveMempoolOwner {
                 self.append_and_apply_locked(canonical, event, observed_at)
                     .await
             }
-            MempoolOwnerStatus::RebuildRequired => Err(Status::unavailable(
-                "live mempool index is rebuilding after a durable transition mismatch",
-            )),
+            MempoolOwnerStatus::RebuildRequired | MempoolOwnerStatus::Halted(_) => {
+                Err(state.unavailable())
+            }
         }
     }
 
@@ -538,7 +569,18 @@ impl LiveMempoolOwner {
         budget: MempoolEventRetentionStepBudget,
     ) -> Result<MempoolEventRetentionStepOutcome, Status> {
         let _mutation_guard = self.mutation_gate.lock().await;
+        self.require_not_halted()?;
         canonical.prune_mempool_events(now, retention, budget).await
+    }
+
+    /// Withdraws the live index for the rest of the process because the
+    /// canonical writer parked.
+    pub(crate) async fn halt(&self, halt: ParkedWriterHalt) {
+        let _mutation_guard = self.mutation_gate.lock().await;
+        self.staged_generation.lock().take();
+        self.set_status(MempoolOwnerStatus::Halted(halt));
+        self.index.reset();
+        record_mempool_size_gauge(&self.index);
     }
 
     fn mark_rebuild_required(&self) {
@@ -546,7 +588,13 @@ impl LiveMempoolOwner {
     }
 
     fn set_status(&self, status: MempoolOwnerStatus) {
-        *self.status.write() = status;
+        let mut current = self.status.write();
+        // A halt is terminal for the process; nothing may resume serving.
+        if matches!(*current, MempoolOwnerStatus::Halted(_)) {
+            return;
+        }
+        *current = status;
+        drop(current);
         record_mempool_lifecycle_status(status);
     }
 
@@ -771,20 +819,45 @@ pub async fn run_live_mempool_owner(
     mempool_ready_signal: MempoolReadySignal,
     cancel: CancellationToken,
 ) {
-    if !restore_durable_mempool_index(&owner, &canonical, &mempool_ready_signal, &cancel).await {
+    let halt = tokio::select! {
+        () = follow_mempool_source(source, &canonical, &owner, &mempool_ready_signal, &cancel) => {
+            return;
+        }
+        halt = mempool_ready_signal.writer_halted() => halt,
+    };
+    // Dropping the source loop releases the owner gate; a command it left
+    // queued reaches the parked writer, which refuses every mempool command.
+    owner.halt(halt).await;
+    mempool_ready_signal.withdraw_certification();
+    tracing::warn!(
+        target: "zinder::ingest",
+        event = "mempool_owner_halted",
+        "canonical writer parked; live mempool owner stopped following the node mempool"
+    );
+    // The task stays alive so its supervisor does not mistake the halt for
+    // an unexpected exit and replace the typed halt with a restart.
+    cancel.cancelled().await;
+}
+
+async fn follow_mempool_source(
+    source: Arc<dyn MempoolSource>,
+    canonical: &CanonicalControlHandle,
+    owner: &LiveMempoolOwner,
+    mempool_ready_signal: &MempoolReadySignal,
+    cancel: &CancellationToken,
+) {
+    if !restore_durable_mempool_index(owner, canonical, mempool_ready_signal, cancel).await {
         return;
     }
     loop {
-        match run_source_generation(&source, &canonical, &owner, &mempool_ready_signal, &cancel)
-            .await
-        {
+        match run_source_generation(&source, canonical, owner, mempool_ready_signal, cancel).await {
             MempoolOwnerLoopOutcome::Shutdown => return,
             MempoolOwnerLoopOutcome::Rehydrate => {}
             MempoolOwnerLoopOutcome::Rebuild { reconnect_backoff } => {
                 if !withdraw_and_wait_for_mempool_rebuild(
-                    &owner,
-                    &mempool_ready_signal,
-                    &cancel,
+                    owner,
+                    mempool_ready_signal,
+                    cancel,
                     reconnect_backoff,
                 )
                 .await
@@ -1122,6 +1195,12 @@ pub async fn run_mempool_retention(
                 () = tokio::time::sleep(settings.check_interval) => {}
             }
         }
+        if owner.is_halted() {
+            // A parked writer refuses mempool pruning; retention resumes only
+            // in a new process.
+            cancel.cancelled().await;
+            return;
+        }
         let now = UnixTimestampMillis::now();
         let started_at = Instant::now();
         let retention_outcome = owner
@@ -1306,6 +1385,7 @@ fn record_mempool_lifecycle_status(status: MempoolOwnerStatus) {
         MempoolOwnerStatus::Hydrating => "hydrating",
         MempoolOwnerStatus::Serving { .. } => "serving",
         MempoolOwnerStatus::RebuildRequired => "rebuild_required",
+        MempoolOwnerStatus::Halted(_) => "halted",
     };
     for status_label in MEMPOOL_LIFECYCLE_STATUS_LABELS {
         let sample = f64::from(u8::from(*status_label == active_status));
@@ -1407,7 +1487,7 @@ mod tests {
         MempoolReadyGate, mempool_ready_channel,
         writer::control::{
             CanonicalControlCommand, CanonicalControlHandle, CanonicalWriterSnapshot,
-            apply_canonical_control_command, canonical_control_channel,
+            ParkedWriterHalt, apply_canonical_control_command, canonical_control_channel,
             test_support::published_fixture_store,
         },
     };
@@ -1458,6 +1538,7 @@ mod tests {
             "zinder_mempool_lifecycle_state{status=\"hydrating\"} 0",
             "zinder_mempool_lifecycle_state{status=\"serving\"} 1",
             "zinder_mempool_lifecycle_state{status=\"rebuild_required\"} 0",
+            "zinder_mempool_lifecycle_state{status=\"halted\"} 0",
             "zinder_mempool_events_pruned_total{kind=\"added\"} 1",
             "zinder_mempool_events_pruned_total{kind=\"mined\"} 2",
             "zinder_mempool_events_pruned_total{kind=\"invalidated\"} 3",
@@ -1798,6 +1879,69 @@ mod tests {
                 .await?
                 .is_empty(),
             "tip-change control markers and abandoned staging must not become durable events"
+        );
+
+        cancel.cancel();
+        owner_task.await?;
+        command_task.abort();
+        let _join_result = command_task.await;
+        Ok(())
+    }
+
+    /// A park halts a serving owner for the rest of the process: it stops
+    /// following the node mempool, refuses reads with the typed halt, records
+    /// no further events, and keeps its task alive until shutdown.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn writer_park_halts_the_owner_until_shutdown() -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let MutableEpochCanonicalControl {
+            canonical,
+            canonical_epoch: _,
+            command_task,
+        } = mutable_epoch_canonical_control(store)?;
+        let (source, source_control) = MockMempoolSource::streaming();
+        let owner = LiveMempoolOwner::default();
+        let (ready_signal, ready_gate) = mempool_ready_channel();
+        let cancel = CancellationToken::new();
+        let owner_task = tokio::spawn(run_live_mempool_owner(
+            Arc::new(source),
+            canonical.clone(),
+            owner.clone(),
+            ready_signal,
+            cancel.clone(),
+        ));
+        wait_for_source_open(&source_control, 1).await?;
+        source_control.complete_initial_snapshot(fixture_source_tip())?;
+        wait_for_serving(&owner, true).await?;
+
+        let halt = ParkedWriterHalt::new(1_001, 1_000, Some(1_000));
+        ready_gate.halt_owner(halt);
+        wait_until(|| owner.is_halted()).await?;
+        assert_eq!(ready_gate.certified_source_tip(), None);
+        let durable_events = durable_event_count(&canonical).await?;
+
+        let Err(status) = owner.require_serving() else {
+            return Err("a halted owner must refuse reads".into());
+        };
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert_eq!(
+            status
+                .get_error_details()
+                .error_info()
+                .map(|error_info| error_info.reason.clone()),
+            Some(ErrorReason::ReorgWindowExceeded.as_str_name().to_owned())
+        );
+        // The source is no longer consumed, so a later observation neither
+        // reopens it nor becomes durable.
+        let _ignored_after_halt = source_control.push_added(source_entry(0xB7)?);
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert_eq!(source_control.open_count(), 1);
+        assert_eq!(durable_event_count(&canonical).await?, durable_events);
+        assert!(owner.is_halted());
+        assert!(
+            !owner_task.is_finished(),
+            "a halted owner must stay alive so its supervisor keeps the typed halt"
         );
 
         cancel.cancel();

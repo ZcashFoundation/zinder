@@ -183,7 +183,9 @@ block-local boundary.
 ### Mempool owner
 
 - `zinder_mempool_lifecycle_state{status}` is a one-hot gauge over the closed
-  `hydrating`, `serving`, and `rebuild_required` states.
+  `hydrating`, `serving`, `rebuild_required`, and `halted` states. `halted`
+  means the canonical writer parked on a reorg deeper than its window and the
+  owner stopped following the node mempool until the process restarts.
 - `zinder_mempool_entries` reports the current process-local live entry count.
 - `zinder_mempool_source_errors_total{kind,failure_class}` and
   `zinder_mempool_hydration_failures_total{reason}` diagnose bounded source
