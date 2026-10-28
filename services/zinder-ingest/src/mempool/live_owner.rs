@@ -1915,7 +1915,11 @@ mod tests {
         source_control.complete_initial_snapshot(fixture_source_tip())?;
         wait_for_serving(&owner, true).await?;
 
-        let halt = ParkedWriterHalt::new(1_001, 1_000, Some(1_000));
+        let halt = ParkedWriterHalt::new(zinder_proto::v1::ops::ReorgWindowExceededDetail {
+            depth: 1_001,
+            configured: 1_000,
+            covered: Some(1_000),
+        });
         ready_gate.halt_owner(halt);
         wait_until(|| owner.is_halted()).await?;
         assert_eq!(ready_gate.certified_source_tip(), None);

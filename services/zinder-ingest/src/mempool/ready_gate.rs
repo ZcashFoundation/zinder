@@ -183,7 +183,11 @@ mod tests {
     #[tokio::test]
     async fn halting_the_owner_resolves_its_writer_halt() {
         let (signal, gate) = mempool_ready_channel();
-        let halt = ParkedWriterHalt::new(1_001, 1_000, Some(1_000));
+        let halt = ParkedWriterHalt::new(zinder_proto::v1::ops::ReorgWindowExceededDetail {
+            depth: 1_001,
+            configured: 1_000,
+            covered: Some(1_000),
+        });
         gate.halt_owner(halt);
         let observed =
             tokio::time::timeout(std::time::Duration::from_secs(1), signal.writer_halted()).await;

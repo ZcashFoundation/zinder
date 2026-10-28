@@ -982,6 +982,30 @@ impl From<ops_proto::ReorgWindowExceededDetail> for ReadinessCause {
     }
 }
 
+impl ReadinessCause {
+    /// Returns the halt a parked writer reports for this cause, or `None`
+    /// for every cause other than [`ReadinessCause::ReorgWindowExceeded`].
+    #[must_use]
+    pub const fn reorg_window_exceeded_detail(
+        &self,
+    ) -> Option<ops_proto::ReorgWindowExceededDetail> {
+        if let Self::ReorgWindowExceeded {
+            depth,
+            configured,
+            covered,
+        } = *self
+        {
+            Some(ops_proto::ReorgWindowExceededDetail {
+                depth,
+                configured,
+                covered,
+            })
+        } else {
+            None
+        }
+    }
+}
+
 impl From<&ReadinessCause> for Option<ops_proto::ReadinessCauseDetail> {
     #[allow(
         clippy::too_many_lines,

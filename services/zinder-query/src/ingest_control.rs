@@ -20,7 +20,10 @@ use zinder_proto::{
     v1::ingest::{
         ServerInfoRequest, WriterStatusRequest, ingest_control_client::IngestControlClient,
     },
-    v1::{ops::ErrorReason, wallet},
+    v1::{
+        ops::{ErrorReason, ReorgWindowExceededDetail},
+        wallet,
+    },
     wire::chain_epoch_from_message,
 };
 use zinder_runtime::{
@@ -177,11 +180,7 @@ fn validate_writer_status(
         .reorg_window_exceeded
         .filter(|_| writer_status.network_name == expected_network)
     {
-        return Err(IngestControlHealthError::WriterReorgWindowExceeded {
-            depth: halt.depth,
-            configured: halt.configured,
-            covered: halt.covered,
-        });
+        return Err(IngestControlHealthError::WriterReorgWindowExceeded(halt));
     }
     let writer_epoch_message = writer_status
         .chain_view
@@ -262,13 +261,11 @@ pub(crate) enum IngestControlHealthError {
     #[error("ingest-control WriterStatus reports that its upstream is not ready")]
     WriterUpstreamNotReady,
     #[error(
-        "canonical writer is parked: a {depth}-block replacement exceeds its {configured}-block reorg window"
+        "canonical writer is parked: a {}-block replacement exceeds its {}-block reorg window",
+        .0.depth,
+        .0.configured
     )]
-    WriterReorgWindowExceeded {
-        depth: u64,
-        configured: u64,
-        covered: Option<u64>,
-    },
+    WriterReorgWindowExceeded(ReorgWindowExceededDetail),
     #[error("ingest-control MempoolSnapshot failed: {0}")]
     MempoolSnapshotRpc(tonic::Status),
     #[error("ingest-control MempoolSnapshot returned incoherent chain evidence")]
@@ -283,17 +280,9 @@ impl IngestControlHealthError {
     /// Returns the readiness cause this health failure projects onto the
     /// wallet-serving gate. Only a parked writer's halt is a typed cause;
     /// every other failure is a recoverable control-channel outage.
-    pub(crate) const fn readiness_cause(&self) -> ReadinessCause {
+    pub(crate) fn readiness_cause(&self) -> ReadinessCause {
         match self {
-            Self::WriterReorgWindowExceeded {
-                depth,
-                configured,
-                covered,
-            } => ReadinessCause::ReorgWindowExceeded {
-                depth: *depth,
-                configured: *configured,
-                covered: *covered,
-            },
+            Self::WriterReorgWindowExceeded(halt) => ReadinessCause::from(*halt),
             Self::WriterStatusRpc(_)
             | Self::WriterStatusInvalid
             | Self::WriterUpstreamNotReady
@@ -309,7 +298,7 @@ impl IngestControlHealthError {
             Self::WriterStatusRpc(_) => "writer_status_rpc",
             Self::WriterStatusInvalid => "writer_status_invalid",
             Self::WriterUpstreamNotReady => "writer_upstream_not_ready",
-            Self::WriterReorgWindowExceeded { .. } => "writer_reorg_window_exceeded",
+            Self::WriterReorgWindowExceeded(_) => "writer_reorg_window_exceeded",
             Self::MempoolSnapshotRpc(_) => "mempool_snapshot_rpc",
             Self::MempoolSnapshotInvalid => "mempool_snapshot_invalid",
             Self::MempoolSnapshotOlderThanWriter => "mempool_snapshot_older_than_writer",
