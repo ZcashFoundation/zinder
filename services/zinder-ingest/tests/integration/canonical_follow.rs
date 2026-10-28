@@ -993,40 +993,66 @@ async fn halt_during_a_raised_window_ramp_reports_the_covered_depth()
     Ok(())
 }
 
-/// A replacement whose prepared blocks exceed the configured budget fails
-/// with a typed error before any canonical write.
+/// The replacement budget covers the source blocks fork discovery holds.
+///
+/// A replacement whose fetched blocks alone exceed it fails during discovery,
+/// before preparing any block, with a typed error and no canonical write.
 #[tokio::test]
 async fn replacement_beyond_its_memory_budget_fails_closed_without_mutation()
 -> Result<(), Box<dyn std::error::Error>> {
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let original = parseable_multi_block_chain()?;
+    let fork = forked_parseable_chain(&original, 3, 4, 101)?;
+    let error =
+        follow_fork_with_replacement_budget(&original, &fork, &activations, NonZeroU64::MIN)
+            .await?;
+    assert!(
+        matches!(
+            error,
+            zinder_ingest::CanonicalFollowError::ReplacementBytesExceeded {
+                prepared_blocks: 0,
+                max_replacement_bytes: 1,
+                held_bytes: 2..,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    Ok(())
+}
+
+async fn follow_fork_with_replacement_budget(
+    original: &BTreeMap<BlockHeight, SourceBlock>,
+    fork: &BTreeMap<BlockHeight, SourceBlock>,
+    activations: &Arc<NetworkUpgradeActivations>,
+    max_replacement_bytes: NonZeroU64,
+) -> Result<zinder_ingest::CanonicalFollowError, Box<dyn std::error::Error>> {
     let source = RecordingParseableSource::new(
         original.clone(),
-        checkpoints_for_parseable_chain(&original, &activations)?,
+        checkpoints_for_parseable_chain(original, activations)?,
         BlockHeight::new(4),
     );
     let temporary = tempdir()?;
     let store = publish_parseable_store(
         &source,
-        &original,
-        Arc::clone(&activations),
+        original,
+        Arc::clone(activations),
         &temporary.path().join("canonical"),
         3,
         BlockHeight::new(1),
     )
     .await?;
     let original_fence = store.event_fence();
-    let fork = forked_parseable_chain(&original, 3, 4, 101)?;
     source.replace_chain(
         fork.clone(),
-        checkpoints_for_parseable_chain(&fork, &activations)?,
+        checkpoints_for_parseable_chain(fork, activations)?,
         BlockHeight::new(4),
     );
     let readiness = Readiness::default();
     let cancel = CancellationToken::new();
     let follower = CanonicalFollower::new(
         &source,
-        Arc::clone(&activations),
+        Arc::clone(activations),
         CanonicalFollowConfig {
             request_timeout: Duration::from_secs(5),
             poll_interval: Duration::ZERO,
@@ -1035,7 +1061,7 @@ async fn replacement_beyond_its_memory_budget_fails_closed_without_mutation()
             event_retention_window: None,
             event_retention_check_interval: Duration::from_secs(1),
             mempool_ready_gate: None,
-            max_replacement_bytes: NonZeroU64::MIN,
+            max_replacement_bytes,
         },
         &readiness,
         &cancel,
@@ -1044,21 +1070,9 @@ async fn replacement_beyond_its_memory_budget_fails_closed_without_mutation()
         .await
         .err()
         .ok_or("a replacement beyond its budget must fail")?;
-    assert!(
-        matches!(
-            error,
-            zinder_ingest::CanonicalFollowError::ReplacementBytesExceeded {
-                replacement_depth: 2,
-                prepared_blocks: 1,
-                max_replacement_bytes: 1,
-                ..
-            }
-        ),
-        "{error}"
-    );
     let reopened = zinder_store::RocksDbCanonicalStore::open_ready(
         temporary.path().join("canonical"),
-        &activations,
+        activations,
         CanonicalStoreWorkload::Wallet,
         zinder_store::RawBlobRetention::Transactions,
         CanonicalReorgPolicy::new(3)?,
@@ -1066,7 +1080,7 @@ async fn replacement_beyond_its_memory_budget_fails_closed_without_mutation()
     )?;
     assert_eq!(reopened.event_fence(), original_fence);
     assert_eq!(reopened.displaced_block_count()?, 0);
-    Ok(())
+    Ok(error)
 }
 
 fn single_pass_follower<'a>(

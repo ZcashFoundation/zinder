@@ -1191,8 +1191,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Maximum bytes of prepared blocks one canonical replacement may hold before \
-                      its atomic commit. A deeper or heavier replacement fails with \
+        description: "Maximum estimated bytes one canonical replacement may hold before its \
+                      atomic commit: fetched source blocks not yet prepared plus prepared \
+                      blocks. A deeper or heavier replacement fails with \
                       `ReplacementBytesExceeded` before any write; raise the limit to follow \
                       it. Defaults to 2147483648.",
     },

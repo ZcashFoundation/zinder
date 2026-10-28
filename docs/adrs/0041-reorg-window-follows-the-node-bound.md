@@ -207,10 +207,20 @@ operators would still need to raise it as observed reorgs grow.
   one window, and the writer checks every row again when it settles, so such
   a change is found within one window of blocks instead of at the next
   transition.
-- A deep replacement prepares its whole replacement suffix in memory before
-  its atomic commit, which scales with the window. `ingest.follow.max_replacement_bytes`
-  (2 GiB by default) bounds it; a replacement beyond the budget fails before
-  any write with the typed `ReplacementBytesExceeded`, and the operator raises
-  the budget to follow it. A dedicated budget is used because the
+- A deep replacement holds its whole replacement suffix in memory before its
+  atomic commit, which scales with the window. Fork discovery fetches the
+  suffix newest first, before the common parent is known, and keeps those
+  raw blocks for preparation; preparation then replaces each with its
+  prepared form. `ingest.follow.max_replacement_bytes` (2 GiB by default)
+  bounds the estimated sum of both: the raw bytes of fetched blocks not yet
+  prepared plus each prepared block's replay envelope, counted twice for its
+  decoded facts, and retained raw bytes. The common parent stops counting once
+  found. Transient decoding of the one block in preparation is not counted. A
+  replacement beyond the budget fails with the typed
+  `ReplacementBytesExceeded` before any write, during discovery if the
+  fetched blocks alone exceed it. The error ends the canonical writer, so
+  ingest exits instead of parking: a supervisor that restarts it retries the
+  same discovery and fails the same way until the operator raises the budget
+  or the node abandons the branch. A dedicated budget is used because the
   construction pipeline's preparation watermark admits a stream of blocks,
   while a replacement must hold all of its blocks at once.
