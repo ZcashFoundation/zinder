@@ -5,7 +5,7 @@ use thiserror::Error;
 use tonic::Code;
 #[cfg(feature = "remote")]
 use tonic_types::StatusExt;
-use zinder_core::Network;
+use zinder_core::{BlockHeight, Network};
 
 use crate::ErrorReason;
 
@@ -67,6 +67,35 @@ pub enum IndexerError {
     ChainEventCursorExpired {
         /// Safe non-operator recovery action.
         recovery: ChainEventCursorRecovery,
+    },
+
+    /// The indexer's retained canonical history starts after a checkpoint,
+    /// so it cannot prove that a transaction is absent.
+    ///
+    /// Waiting does not clear it: the transaction may be mined at a height
+    /// below `first_available_height`, which this indexer never stored. Query
+    /// an indexer that retains complete history before judging the
+    /// transaction.
+    #[error(
+        "indexer history starts at height {}; transaction absence cannot be proven",
+        first_available_height.value()
+    )]
+    CanonicalHistoryUnavailable {
+        /// First height the indexer retains.
+        first_available_height: BlockHeight,
+    },
+
+    /// The server answered a transaction lookup with `NOT_FOUND` but without
+    /// the typed absence signal, so the answer may be a storage or history
+    /// failure rather than an absence.
+    ///
+    /// Servers below native contract revision 6 answer this way for every
+    /// miss. Treat the transaction's status as unknown until the indexer is
+    /// upgraded.
+    #[error("transaction absence is unverified: {message}")]
+    TransactionAbsenceUnverified {
+        /// Human-readable gRPC status message.
+        message: String,
     },
 
     /// Requested data is not indexed in the visible chain.
@@ -212,6 +241,18 @@ impl IndexerError {
             return Self::ChainEpochPinUnavailable;
         }
 
+        if matches!(&zinder_reason, ErrorReason::CanonicalHistoryUnavailable) {
+            return match zinder_proto::wire::canonical_history_first_available_height(&status) {
+                Ok(Some(first_available_height)) => Self::CanonicalHistoryUnavailable {
+                    first_available_height,
+                },
+                Ok(None) | Err(_) => Self::malformed(
+                    "error_info.metadata.first_available_height",
+                    "CANONICAL_HISTORY_UNAVAILABLE omitted a valid history floor",
+                ),
+            };
+        }
+
         Self::RemoteFailure {
             retry_policy: retry_policy_for_remote(&zinder_reason, status.code()),
             reason: zinder_reason,
@@ -235,9 +276,13 @@ impl IndexerError {
             Self::ChainEpochPinUnavailable => Some(ErrorReason::ChainEpochPinUnavailable),
             Self::ChainEventCursorExpired { .. } => Some(ErrorReason::ChainEventCursorExpired),
             Self::ArtifactUnavailable { .. } => Some(ErrorReason::ArtifactUnavailable),
+            Self::CanonicalHistoryUnavailable { .. } => {
+                Some(ErrorReason::CanonicalHistoryUnavailable)
+            }
             Self::RemoteFailure { reason, .. } => Some(reason.clone()),
             Self::NoVisibleChainEpoch
             | Self::NotFound { .. }
+            | Self::TransactionAbsenceUnverified { .. }
             | Self::InvalidRequest { .. }
             | Self::FailedPrecondition { .. }
             | Self::DataLoss { .. }
@@ -266,7 +311,9 @@ impl IndexerError {
             | Self::StorageUnavailable { .. }
             | Self::BlockingTaskFailed { .. } => RetryPolicy::RetryWithBackoff,
             Self::RemoteFailure { retry_policy, .. } => *retry_policy,
-            Self::FailedPrecondition { .. }
+            Self::CanonicalHistoryUnavailable { .. }
+            | Self::TransactionAbsenceUnverified { .. }
+            | Self::FailedPrecondition { .. }
             | Self::DataLoss { .. }
             | Self::NetworkMismatch { .. } => RetryPolicy::OperatorActionRequired,
             Self::InvalidRequest { .. } | Self::MalformedResponse { .. } => {

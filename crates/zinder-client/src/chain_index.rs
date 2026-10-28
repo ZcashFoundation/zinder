@@ -540,6 +540,11 @@ impl<'a, I: ChainIndex + ?Sized> ChainSnapshot<'a, I> {
     }
 
     /// Looks up a canonical transaction without consulting live mempool state.
+    ///
+    /// [`TxStatus::NotFound`] means the transaction is absent from the
+    /// captured epoch's canonical chain, from height 1 through its visible
+    /// tip. See [`ChainIndex::transaction_by_id`] for the errors that are
+    /// never reported as an absence.
     pub async fn transaction_by_id(
         &self,
         transaction_id: TransactionId,
@@ -1114,9 +1119,30 @@ pub trait ChainIndex: Send + Sync + 'static {
 
     /// Looks up a transaction by id.
     ///
-    /// `None` for `at_epoch_id` consults the live mempool when the canonical
-    /// chain has no record. `Some(id)` pins the read to that epoch and
-    /// never consults mempool state.
+    /// `Some(id)` pins the read to that epoch's canonical chain and never
+    /// consults mempool state. `None` reads the visible epoch's canonical
+    /// chain and, on a miss, the writer's live mempool at that same epoch.
+    ///
+    /// [`TxStatus::NotFound`] is a proven absence: the server searched the
+    /// canonical chain of the answering epoch from height 1 through its
+    /// visible tip (and, without a pin, the live mempool at that epoch) and
+    /// found nothing. A pinned absence is checked against the pin. Every
+    /// other outcome is an error, never `NotFound`:
+    ///
+    /// - [`IndexerError::CanonicalHistoryUnavailable`]: the indexer's history
+    ///   starts after a checkpoint, so it cannot prove an absence.
+    /// - [`IndexerError::TransactionAbsenceUnverified`]: the server predates
+    ///   the typed absence signal and its `NOT_FOUND` is ambiguous.
+    /// - [`IndexerError::ChainEpochPinUnavailable`]: the pinned epoch is not
+    ///   served.
+    /// - Storage, missing-epoch, and dependency failures keep their own typed
+    ///   variants, including [`IndexerError::ArtifactUnavailable`],
+    ///   [`IndexerError::NotFound`] for a block outside the best chain, and
+    ///   [`IndexerError::RemoteFailure`].
+    ///
+    /// To judge a transaction against a height, take a
+    /// [`ChainSnapshot`](crate::ChainSnapshot) whose epoch's visible tip
+    /// covers that height and look the transaction up through it.
     ///
     /// # Examples
     ///

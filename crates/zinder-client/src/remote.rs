@@ -35,7 +35,7 @@ use zinder_core::{
 };
 use zinder_proto::v1::wallet::{self, wallet_query_client::WalletQueryClient};
 use zinder_proto::wire::{
-    WalletWireDecodeError, chain_epoch_from_message,
+    TransactionAbsence, WalletWireDecodeError, chain_epoch_from_message,
     compact_block_from_message as compact_block_from_wire_message,
     decode_transparent_utxo_set_commitment, mempool_entry_from_message, outpoint_message,
     transparent_mempool_output_from_message as transparent_mempool_output_from_message_shared,
@@ -177,6 +177,30 @@ impl RemoteChainIndex {
             self.rebuild_channel();
         }
         err
+    }
+
+    /// Maps a failed transaction lookup to [`TxStatus::NotFound`] only for the
+    /// typed `TRANSACTION_NOT_FOUND` absence signal.
+    fn tx_status_from_lookup_failure(
+        &self,
+        status: tonic::Status,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TxStatus, IndexerError> {
+        match TransactionAbsence::from_status(&status) {
+            Ok(Some(absence)) => {
+                verify_transaction_absence(absence, at_epoch_id).map(|()| TxStatus::NotFound)
+            }
+            Ok(None) if is_unverified_transaction_absence(&status) => {
+                Err(IndexerError::TransactionAbsenceUnverified {
+                    message: status.message().to_owned(),
+                })
+            }
+            Ok(None) => Err(self.map_status(status)),
+            Err(metadata_error) => Err(IndexerError::malformed(
+                "error_info.metadata",
+                metadata_error.to_string(),
+            )),
+        }
     }
 
     fn rebuild_channel(&self) {
@@ -661,10 +685,7 @@ impl ChainIndex for RemoteChainIndex {
             .await
         {
             Ok(response) => response.into_inner(),
-            Err(status) if status.code() == tonic::Code::NotFound => {
-                return Ok(TxStatus::NotFound);
-            }
-            Err(status) => return Err(self.map_status(status)),
+            Err(status) => return self.tx_status_from_lookup_failure(status, at_epoch_id),
         };
         tx_status_from_message(self.network, transaction_id, at_epoch_id, response)
     }
@@ -2331,6 +2352,55 @@ fn block_selector_to_message(
     Ok(wallet::BlockSelector {
         selector: Some(inner),
     })
+}
+
+/// Checks that a typed absence answers the lookup the caller made.
+///
+/// A pinned lookup must be answered at the pinned epoch; an unpinned lookup
+/// must also have searched the live mempool; and the covered range must start
+/// at height 1, so a store with a later history floor never yields an absence.
+fn verify_transaction_absence(
+    absence: TransactionAbsence,
+    at_epoch_id: Option<ChainEpochId>,
+) -> Result<(), IndexerError> {
+    if absence.first_covered_height > BlockHeight::new(1) {
+        return Err(IndexerError::CanonicalHistoryUnavailable {
+            first_available_height: absence.first_covered_height,
+        });
+    }
+    match at_epoch_id {
+        Some(pinned_epoch_id) if absence.chain_epoch_id != pinned_epoch_id => {
+            Err(IndexerError::malformed(
+                "error_info.metadata.chain_epoch_id",
+                "absence epoch does not match requested epoch pin",
+            ))
+        }
+        None if !absence.covers_mempool => Err(IndexerError::malformed(
+            "error_info.metadata.covers_mempool",
+            "an unpinned absence must cover the live mempool",
+        )),
+        Some(_) | None => Ok(()),
+    }
+}
+
+/// Returns whether `status` is a `NOT_FOUND` that a server below contract
+/// revision 6 used for every transaction miss, which cannot be told apart
+/// from a storage or history failure.
+fn is_unverified_transaction_absence(status: &tonic::Status) -> bool {
+    if status.code() != tonic::Code::NotFound {
+        return false;
+    }
+    let details = status.get_error_details();
+    match details
+        .error_info()
+        .filter(|error_info| error_info.domain == ZINDER_ERROR_DOMAIN)
+    {
+        None => true,
+        Some(error_info) => {
+            error_info.reason == crate::ErrorReason::ArtifactUnavailable.as_str()
+                && details.resource_info().is_none()
+        }
+    }
 }
 
 #[allow(
