@@ -9,16 +9,9 @@
 //! type below converts to the proto message via [`Into`] for any gRPC
 //! consumer.
 
-use std::{
-    borrow::Cow,
-    collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-};
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use serde::Serialize;
 use tonic::{Request, Status, service::Interceptor};
 use tonic_types::ErrorDetails;
@@ -458,12 +451,19 @@ struct MaterializedViewWorkload {
     identities: Vec<String>,
 }
 
+/// Readiness state and whether it is [parked](Readiness::park), guarded by
+/// one lock so a park and a concurrent write cannot interleave.
+#[derive(Debug)]
+struct GuardedReadiness {
+    state: ReadinessState,
+    parked: bool,
+}
+
 /// Internal readiness state guarded by an `Arc<Mutex<_>>` so HTTP handlers
 /// and runtime tasks can update and observe the same value.
 #[derive(Clone, Debug)]
 pub struct Readiness {
-    inner: Arc<Mutex<ReadinessState>>,
-    parked: Arc<AtomicBool>,
+    inner: Arc<Mutex<GuardedReadiness>>,
     materialized_view_workload: Arc<Mutex<MaterializedViewWorkload>>,
 }
 
@@ -478,8 +478,10 @@ impl Readiness {
     #[must_use]
     pub fn new(state: ReadinessState) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(state)),
-            parked: Arc::new(AtomicBool::new(false)),
+            inner: Arc::new(Mutex::new(GuardedReadiness {
+                state,
+                parked: false,
+            })),
             materialized_view_workload: Arc::new(Mutex::new(MaterializedViewWorkload::default())),
         }
     }
@@ -494,20 +496,24 @@ impl Readiness {
     /// replaces a parked state, and a shutdown already in progress keeps its
     /// cause: the process is draining and the halt would be stale.
     pub fn park(&self, state: ReadinessState) {
-        // Raising the flag first means any writer that takes the lock after
-        // this point is rejected, and one that held it earlier is overwritten.
-        self.parked.store(true, Ordering::Release);
+        // Writers that took the lock earlier are overwritten here, and every
+        // writer that takes it later sees the flag.
         let mut guard = self.inner.lock();
-        if matches!(guard.cause, ReadinessCause::ShuttingDown) {
+        guard.parked = true;
+        if matches!(guard.state.cause, ReadinessCause::ShuttingDown) {
             return;
         }
-        let phase = state.phase.or(guard.phase);
-        *guard = state;
-        guard.phase = phase;
+        let phase = state.phase.or(guard.state.phase);
+        guard.state = state;
+        guard.state.phase = phase;
     }
 
-    fn parked_rejects(&self, cause: &ReadinessCause) -> bool {
-        self.parked.load(Ordering::Acquire) && !matches!(cause, ReadinessCause::ShuttingDown)
+    /// Locks the state for a write, or returns `None` when a
+    /// [parked](Self::park) state rejects it. Only a shutdown write passes a
+    /// park.
+    fn lock_unless_parked(&self, shutting_down: bool) -> Option<MutexGuard<'_, GuardedReadiness>> {
+        let guard = self.inner.lock();
+        (!guard.parked || shutting_down).then_some(guard)
     }
 
     /// Sets the closed materialized-view workload exposed by readiness and metrics.
@@ -537,20 +543,21 @@ impl Readiness {
     ///
     /// A [parked](Self::park) state ignores every cause except shutdown.
     pub fn set(&self, state: ReadinessState) {
-        let mut guard = self.inner.lock();
-        if self.parked_rejects(&state.cause) {
+        let shutting_down = matches!(state.cause, ReadinessCause::ShuttingDown);
+        let Some(mut guard) = self.lock_unless_parked(shutting_down) else {
             return;
-        }
+        };
+        let current = &mut guard.state;
         let mut state = state;
-        let phase = state.phase.or(guard.phase);
+        let phase = state.phase.or(current.phase);
         let warning_replaces_chain_state = state.cause.preserves_observed_target();
         let warning_cleared_to_ready = matches!(&state.cause, ReadinessCause::Ready)
-            && guard.cause.preserves_observed_target();
+            && current.cause.preserves_observed_target();
         if warning_replaces_chain_state || warning_cleared_to_ready {
-            state.target_height = guard.target_height;
+            state.target_height = current.target_height;
         }
-        *guard = state;
-        guard.phase = phase;
+        *current = state;
+        current.phase = phase;
     }
 
     /// Atomically mutates the current readiness state.
@@ -565,11 +572,9 @@ impl Readiness {
     where
         F: FnOnce(&mut ReadinessState),
     {
-        let mut guard = self.inner.lock();
-        if self.parked.load(Ordering::Acquire) {
-            return;
+        if let Some(mut guard) = self.lock_unless_parked(false) {
+            update(&mut guard.state);
         }
-        update(&mut guard);
     }
 
     /// Sets the [`IngestPhase`] on the current state without disturbing
@@ -580,11 +585,9 @@ impl Readiness {
     /// worker still classifying phases cannot report catch-up progress for a
     /// writer that no longer follows.
     pub fn set_phase(&self, phase: IngestPhase) {
-        let mut guard = self.inner.lock();
-        if self.parked.load(Ordering::Acquire) {
-            return;
+        if let Some(mut guard) = self.lock_unless_parked(false) {
+            guard.state.phase = Some(phase);
         }
-        guard.phase = Some(phase);
     }
 
     /// Returns the current [`IngestPhase`] without cloning the readiness cause.
@@ -593,25 +596,23 @@ impl Readiness {
     /// such as the materialized-view replay phase gate that samples it per replayed event.
     #[must_use]
     pub fn phase(&self) -> Option<IngestPhase> {
-        self.inner.lock().phase
+        self.inner.lock().state.phase
     }
 
     /// Replaces the cause with [`ReadinessCause::UpstreamNotReady`] while
     /// preserving the writer's last visible `current_height` and any
     /// concurrently-set ingest phase. Used by the upstream-health probe.
     pub fn set_upstream_not_ready(&self, detail: UpstreamNotReadyDetail) {
-        let mut guard = self.inner.lock();
-        if self.parked.load(Ordering::Acquire) {
-            return;
+        if let Some(mut guard) = self.lock_unless_parked(false) {
+            guard.state.cause = ReadinessCause::UpstreamNotReady(detail);
+            guard.state.target_height = None;
         }
-        guard.cause = ReadinessCause::UpstreamNotReady(detail);
-        guard.target_height = None;
     }
 
     /// Reports the current readiness as a serializable snapshot.
     #[must_use]
     pub fn report(&self) -> ReadinessReport {
-        let state = self.inner.lock().clone();
+        let state = self.inner.lock().state.clone();
         let materialized_view_workload = self.materialized_view_workload.lock().clone();
         ReadinessReport {
             is_ready: state.cause.permits_traffic(),
