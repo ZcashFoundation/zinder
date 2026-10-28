@@ -777,11 +777,34 @@ where
         {
             common_parent = Some(settled_tip);
         }
-        let block_bytes = memory.retain_source(&source_block);
-        if let Some(replaced) = source_blocks.insert(height, source_block) {
-            memory.release(source_block_bytes(&replaced));
+        // The common parent itself is never replaced, so it is not retained;
+        // a first replacement block directly above the settled tip is.
+        if common_parent.is_none_or(|parent| parent.height != height) {
+            memory.retain_source(&source_block);
+            if let Some(replaced) = source_blocks.insert(height, source_block) {
+                memory.release(source_block_bytes(&replaced));
+            }
         }
         if memory.exceeded() {
+            // A fork already known to start below settlement parks, as it
+            // would once discovery finished, instead of exiting on the budget.
+            if common_parent.is_none()
+                && source_forks_below_settlement(
+                    source,
+                    config.request_timeout,
+                    cancel,
+                    settled_tip,
+                    &source_blocks,
+                )
+                .await?
+            {
+                return Err(reorg_window_exceeded(
+                    local_tip,
+                    observed_tip,
+                    settled_tip,
+                    configured_window_blocks,
+                ));
+            }
             return Err(CanonicalFollowError::ReplacementBytesExceeded {
                 replacement_depth: u32::try_from(source_blocks.len()).unwrap_or(u32::MAX),
                 prepared_blocks: 0,
@@ -789,14 +812,7 @@ where
                 max_replacement_bytes: config.max_replacement_bytes.get(),
             });
         }
-        if let Some(common_parent) = common_parent {
-            if common_parent.height == height {
-                // The common parent itself is never replaced, so it stops
-                // counting; a first replacement block above the settled tip
-                // is kept.
-                source_blocks.remove(&height);
-                memory.release(block_bytes);
-            }
+        if common_parent.is_some() {
             break;
         }
         search_height = height.value().checked_sub(1).map(BlockHeight::new);
@@ -805,20 +821,12 @@ where
         .record(discovery_started.elapsed().as_secs_f64());
 
     let Some(common_parent) = common_parent else {
-        let unsettled_depth = local_tip
-            .height
-            .value()
-            .saturating_sub(settled_tip.height.value());
-        return Err(CanonicalFollowError::ReorgWindowExceeded(Box::new(
-            CanonicalReorgWindowExceeded {
-                local_tip,
-                source_tip: observed_tip,
-                settled_tip,
-                required_depth: unsettled_depth.saturating_add(1),
-                configured_window_blocks,
-                covered_depth_blocks: unsettled_depth,
-            },
-        )));
+        return Err(reorg_window_exceeded(
+            local_tip,
+            observed_tip,
+            settled_tip,
+            configured_window_blocks,
+        ));
     };
     let Some(first_replacement_height) = common_parent.height.next() else {
         return Err(CanonicalFollowError::ReorgRequired {
@@ -954,6 +962,60 @@ where
         )),
         observed_tip,
     })
+}
+
+/// Refuses a fork whose common parent lies at or below the settled tip.
+fn reorg_window_exceeded(
+    local_tip: BlockId,
+    source_tip: BlockId,
+    settled_tip: BlockId,
+    configured_window_blocks: u32,
+) -> CanonicalFollowError {
+    let unsettled_depth = local_tip
+        .height
+        .value()
+        .saturating_sub(settled_tip.height.value());
+    CanonicalFollowError::ReorgWindowExceeded(Box::new(CanonicalReorgWindowExceeded {
+        local_tip,
+        source_tip,
+        settled_tip,
+        required_depth: unsettled_depth.saturating_add(1),
+        configured_window_blocks,
+        covered_depth_blocks: unsettled_depth,
+    }))
+}
+
+/// Returns whether the source branch leaves the settled tip, which places the
+/// fork below settlement whatever discovery would find above it.
+///
+/// Reads the source block directly above the settled tip, from the blocks
+/// discovery already holds when it reached that height.
+async fn source_forks_below_settlement<Source>(
+    source: &Source,
+    request_timeout: Duration,
+    cancel: &CancellationToken,
+    settled_tip: BlockId,
+    source_blocks: &BTreeMap<BlockHeight, SourceBlock>,
+) -> Result<bool, CanonicalFollowError>
+where
+    Source: NodeSource,
+{
+    let Some(above_settled) = settled_tip.height.next() else {
+        return Ok(false);
+    };
+    let parent_hash = if let Some(block) = source_blocks.get(&above_settled) {
+        block.parent_hash
+    } else {
+        metrics::counter!("zinder_ingest_canonical_fork_discovery_block_reads_total").increment(1);
+        source_request(
+            request_timeout,
+            cancel,
+            source.fetch_block_at(above_settled),
+        )
+        .await?
+        .parent_hash
+    };
+    Ok(parent_hash != settled_tip.hash)
 }
 
 /// Estimated bytes one replacement holds before its atomic commit, against

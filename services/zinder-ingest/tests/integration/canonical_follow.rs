@@ -1021,6 +1021,29 @@ async fn replacement_beyond_its_memory_budget_fails_closed_without_mutation()
     Ok(())
 }
 
+/// A fork already known to start below settlement parks with
+/// `ReorgWindowExceeded` even when discovery exceeds the replacement budget,
+/// instead of exiting on the budget.
+#[tokio::test]
+async fn fork_below_settlement_parks_before_the_replacement_budget_applies()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let original = parseable_multi_block_chain()?;
+    let fork = forked_parseable_chain(&original, 1, 4, 103)?;
+    let error =
+        follow_fork_with_replacement_budget(&original, &fork, &activations, NonZeroU64::MIN)
+            .await?;
+    assert!(
+        matches!(
+            error,
+            zinder_ingest::CanonicalFollowError::ReorgWindowExceeded(ref evidence)
+                if evidence.configured_window_blocks == 3
+        ),
+        "{error}"
+    );
+    Ok(())
+}
+
 async fn follow_fork_with_replacement_budget(
     original: &BTreeMap<BlockHeight, SourceBlock>,
     fork: &BTreeMap<BlockHeight, SourceBlock>,
