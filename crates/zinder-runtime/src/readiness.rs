@@ -9,12 +9,14 @@
 //! type below converts to the proto message via [`Into`] for any gRPC
 //! consumer.
 
-use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Duration};
 
 use parking_lot::{Mutex, MutexGuard};
 use serde::Serialize;
+use tokio::time::Instant;
 use tonic::{Request, Status, service::Interceptor};
 use tonic_types::ErrorDetails;
+use zinder_core::{Network, wire::encode_zinder_native_chain_name};
 use zinder_proto::{
     status_with_reason_and_metadata,
     v1::{
@@ -708,6 +710,110 @@ pub fn not_ready_status(cause: &ReadinessCause) -> Status {
         ErrorDetails::new(),
         metadata,
     )
+}
+
+/// The canonical writer-status rules a reader applies before it admits
+/// traffic on a reader generation the writer attested.
+///
+/// A writer parked on a reorg deeper than its window, and a writer that has
+/// not confirmed its tip since it reopened, both keep attesting their frozen
+/// fence, so their status refuses traffic instead. A halt is remembered until
+/// a valid status carries neither the halt nor an unconfirmed tip: a writer
+/// that restarts after a park reports the halt again only once it rediscovers
+/// the reorg, and a writer-status outage must not reopen traffic. Only a
+/// following writer with a confirmed tip earns the staleness allowance that
+/// keeps a lagging reader admitting traffic.
+#[derive(Debug)]
+pub struct WriterAttestation {
+    network: Network,
+    staleness_ceiling: Duration,
+    attested_at: Option<Instant>,
+    remembered_halt: Option<ReadinessState>,
+}
+
+impl WriterAttestation {
+    /// Creates the rules for a reader of `network` that may serve a lagging
+    /// reader for `staleness_ceiling` after the writer last attested it.
+    #[must_use]
+    pub const fn new(network: Network, staleness_ceiling: Duration) -> Self {
+        Self {
+            network,
+            staleness_ceiling,
+            attested_at: None,
+            remembered_halt: None,
+        }
+    }
+
+    /// Returns the not-ready state `status` imposes on a reader whose visible
+    /// tip is at `visible_height`, or `None` when the writer follows with a
+    /// confirmed tip.
+    ///
+    /// A refusal withdraws the staleness allowance. A halt or unconfirmed tip
+    /// reported for another network is not honoured; such a status clears the
+    /// remembered halt and falls through to the caller's fence validation.
+    pub fn observe(
+        &mut self,
+        status: &ingest_proto::CanonicalWriterStatusResponse,
+        visible_height: Option<u32>,
+    ) -> Option<ReadinessState> {
+        let refusal = self.refusal(status, visible_height);
+        if refusal.is_some() {
+            self.attested_at = None;
+        }
+        refusal
+    }
+
+    fn refusal(
+        &mut self,
+        status: &ingest_proto::CanonicalWriterStatusResponse,
+        visible_height: Option<u32>,
+    ) -> Option<ReadinessState> {
+        let refusing = |cause| ReadinessState {
+            current_height: visible_height,
+            ..ReadinessState::not_ready(cause)
+        };
+        if status.network_name != encode_zinder_native_chain_name(self.network) {
+            self.remembered_halt = None;
+            return None;
+        }
+        if let Some(halt) = status.reorg_window_exceeded {
+            let halt = refusing(ReadinessCause::from(halt));
+            self.remembered_halt = Some(halt.clone());
+            return Some(halt);
+        }
+        if status.tip_unconfirmed {
+            return Some(
+                self.remembered_halt
+                    .clone()
+                    .unwrap_or_else(|| refusing(ReadinessCause::CanonicalTipUnconfirmed)),
+            );
+        }
+        self.remembered_halt = None;
+        None
+    }
+
+    /// Records that a following writer with a confirmed tip attested the
+    /// reader now.
+    pub fn attest(&mut self) {
+        self.attested_at = Some(Instant::now());
+    }
+
+    /// Returns the halt the writer last reported, which a reader keeps
+    /// publishing through writer-status failures.
+    #[must_use]
+    pub fn remembered_halt(&self) -> Option<ReadinessState> {
+        self.remembered_halt.clone()
+    }
+
+    /// Returns the time since the last attestation while it is below the
+    /// staleness ceiling; `None` once the ceiling passes or while no following
+    /// writer with a confirmed tip has attested the reader.
+    #[must_use]
+    pub fn stale_allowance(&self) -> Option<Duration> {
+        self.attested_at
+            .map(|attested_at| attested_at.elapsed())
+            .filter(|staleness| *staleness < self.staleness_ceiling)
+    }
 }
 
 /// Mutable readiness state owned by the service's runtime task.
@@ -1852,5 +1958,114 @@ mod tests {
         let readiness = Readiness::default();
         readiness.set(ReadinessState::ready(Some(3)));
         assert_eq!(readiness.report().phase, None);
+    }
+
+    const ATTESTED_NETWORK: Network = Network::ZcashRegtest;
+
+    fn following_writer_status() -> ingest_proto::CanonicalWriterStatusResponse {
+        ingest_proto::CanonicalWriterStatusResponse {
+            network_name: encode_zinder_native_chain_name(ATTESTED_NETWORK).to_owned(),
+            ..ingest_proto::CanonicalWriterStatusResponse::default()
+        }
+    }
+
+    fn unconfirmed_writer_status() -> ingest_proto::CanonicalWriterStatusResponse {
+        ingest_proto::CanonicalWriterStatusResponse {
+            tip_unconfirmed: true,
+            ..following_writer_status()
+        }
+    }
+
+    fn parked_writer_status() -> ingest_proto::CanonicalWriterStatusResponse {
+        ingest_proto::CanonicalWriterStatusResponse {
+            reorg_window_exceeded: Some(ops_proto::ReorgWindowExceededDetail {
+                depth: 1_001,
+                configured: 1_000,
+                covered: Some(1_000),
+            }),
+            tip_unconfirmed: true,
+            ..following_writer_status()
+        }
+    }
+
+    #[test]
+    fn writer_with_an_unconfirmed_tip_refuses_without_a_staleness_allowance() {
+        let mut attestation = WriterAttestation::new(ATTESTED_NETWORK, Duration::from_mins(1));
+        assert_eq!(
+            attestation.observe(&following_writer_status(), Some(7)),
+            None
+        );
+        attestation.attest();
+        assert!(attestation.stale_allowance().is_some());
+
+        let refusal = attestation.observe(&unconfirmed_writer_status(), Some(7));
+        assert_eq!(
+            refusal,
+            Some(ReadinessState {
+                current_height: Some(7),
+                ..ReadinessState::not_ready(ReadinessCause::CanonicalTipUnconfirmed)
+            })
+        );
+        assert_eq!(attestation.stale_allowance(), None);
+        assert_eq!(attestation.remembered_halt(), None);
+
+        assert_eq!(
+            attestation.observe(&following_writer_status(), Some(7)),
+            None
+        );
+        attestation.attest();
+        assert!(attestation.stale_allowance().is_some());
+    }
+
+    #[test]
+    fn writer_halt_is_remembered_through_a_restart_and_status_failures() {
+        let mut attestation = WriterAttestation::new(ATTESTED_NETWORK, Duration::from_mins(1));
+        attestation.attest();
+        let halt = ReadinessState::reorg_window_exceeded(1_001, 1_000, Some(1_000), Some(7));
+        assert_eq!(
+            attestation.observe(&parked_writer_status(), Some(7)),
+            Some(halt.clone())
+        );
+        assert_eq!(attestation.stale_allowance(), None);
+        assert_eq!(attestation.remembered_halt(), Some(halt.clone()));
+
+        // A restarted writer that has not yet rediscovered the reorg keeps
+        // the remembered halt instead of the unconfirmed cause.
+        assert_eq!(
+            attestation.observe(&unconfirmed_writer_status(), Some(8)),
+            Some(halt.clone())
+        );
+        assert_eq!(attestation.remembered_halt(), Some(halt));
+
+        assert_eq!(
+            attestation.observe(&following_writer_status(), Some(8)),
+            None
+        );
+        assert_eq!(attestation.remembered_halt(), None);
+        assert_eq!(attestation.stale_allowance(), None);
+    }
+
+    #[test]
+    fn writer_status_for_another_network_is_not_a_refusal() {
+        let mut attestation = WriterAttestation::new(ATTESTED_NETWORK, Duration::from_mins(1));
+        assert!(
+            attestation
+                .observe(&parked_writer_status(), Some(7))
+                .is_some()
+        );
+        let other_network = ingest_proto::CanonicalWriterStatusResponse {
+            network_name: encode_zinder_native_chain_name(Network::ZcashTestnet).to_owned(),
+            ..parked_writer_status()
+        };
+        assert_eq!(attestation.observe(&other_network, Some(7)), None);
+        assert_eq!(attestation.remembered_halt(), None);
+    }
+
+    #[test]
+    fn staleness_allowance_ends_at_the_ceiling() {
+        let mut attestation = WriterAttestation::new(ATTESTED_NETWORK, Duration::ZERO);
+        assert_eq!(attestation.stale_allowance(), None);
+        attestation.attest();
+        assert_eq!(attestation.stale_allowance(), None);
     }
 }
