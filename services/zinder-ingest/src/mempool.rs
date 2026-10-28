@@ -11,8 +11,6 @@ mod ready_gate;
 pub use entry::{MempoolEntryBuildError, build_mempool_entry};
 pub(crate) use index::MempoolIndexPreflight;
 pub use index::{MempoolApplyOutcome, MempoolIndex, MempoolSnapshotPage};
-#[cfg(test)]
-pub(crate) use live_owner::SourceTransitionOutcome;
 pub use live_owner::{
     DEFAULT_RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES, LiveMempoolOwner,
     MempoolRetentionSettings, run_live_mempool_owner, run_mempool_retention,

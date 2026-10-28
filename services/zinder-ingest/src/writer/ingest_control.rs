@@ -1242,10 +1242,10 @@ mod tests {
                 UnixTimestampMillis::new(1_750_000_000_600),
             )
             .await?;
-        assert!(matches!(
-            outcome,
-            crate::mempool::SourceTransitionOutcome::GenerationOutran { .. }
-        ));
+        assert!(
+            outcome.is_some(),
+            "a Mined change beyond the tip ends the generation"
+        );
 
         let writer_miss = fixture
             .ingest_client
