@@ -4,9 +4,10 @@ use std::{fmt, io, num::NonZeroU16, sync::Arc};
 
 use thiserror::Error;
 use zinder_core::{
-    BlockBlobArtifact, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId, ChainEpoch,
-    CommitmentTreeCheckpoint, CompactBlockArtifact, Network, SubtreeRootArtifact, SubtreeRootRange,
-    TransactionBlobArtifact, TransactionId, TransactionLocation, TransparentAddressScriptHash,
+    BlockBlobArtifact, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
+    CanonicalHistoryBounds, ChainEpoch, CommitmentTreeCheckpoint, CompactBlockArtifact, Network,
+    SubtreeRootArtifact, SubtreeRootRange, TransactionBlobArtifact, TransactionId,
+    TransactionLocation, TransparentAddressScriptHash,
 };
 use zinder_store::{
     BlockHashLookup, CanonicalEventFence, CanonicalStoreError, ChainEventEnvelope,
@@ -34,6 +35,9 @@ pub trait CanonicalReader: Send + Sync + 'static {
 
     /// Returns the immutable network admitted by this canonical reader.
     fn network(&self) -> Network;
+
+    /// Returns the immutable retained canonical history range.
+    fn history_bounds(&self) -> CanonicalHistoryBounds;
 
     /// Returns the exact admitted canonical event fence.
     fn event_fence(&self) -> CanonicalEventFence;
@@ -220,6 +224,10 @@ macro_rules! impl_canonical_read {
 
             fn network(&self) -> Network {
                 self.network()
+            }
+
+            fn history_bounds(&self) -> CanonicalHistoryBounds {
+                self.history_bounds()
             }
 
             fn event_fence(&self) -> CanonicalEventFence {

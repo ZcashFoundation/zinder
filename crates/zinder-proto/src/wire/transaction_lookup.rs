@@ -20,6 +20,8 @@ use crate::v1::ops::ErrorReason;
 pub const TRANSACTION_ABSENCE_CHAIN_EPOCH_ID_KEY: &str = "chain_epoch_id";
 /// `TRANSACTION_NOT_FOUND` metadata key naming that epoch's visible tip height.
 pub const TRANSACTION_ABSENCE_VISIBLE_TIP_HEIGHT_KEY: &str = "visible_tip_height";
+/// `TRANSACTION_NOT_FOUND` metadata key naming the first height the search covered.
+pub const TRANSACTION_ABSENCE_FIRST_COVERED_HEIGHT_KEY: &str = "first_covered_height";
 /// `TRANSACTION_NOT_FOUND` metadata key stating whether the live mempool was searched.
 pub const TRANSACTION_ABSENCE_COVERS_MEMPOOL_KEY: &str = "covers_mempool";
 /// `CANONICAL_HISTORY_UNAVAILABLE` metadata key naming the first retained height.
@@ -27,14 +29,17 @@ pub const CANONICAL_HISTORY_FIRST_AVAILABLE_HEIGHT_KEY: &str = "first_available_
 
 /// Proven transaction absence carried by a `TRANSACTION_NOT_FOUND` status.
 ///
-/// The transaction is absent from the canonical chain of `chain_epoch_id`,
-/// whose retained history is complete through `visible_tip_height`. When
+/// The transaction is absent from the canonical chain of `chain_epoch_id`
+/// over heights `first_covered_height..=visible_tip_height`. When
 /// `covers_mempool` is true, the writer's live mempool, coherent with the
 /// same epoch, did not hold it either.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransactionAbsence {
     /// Chain epoch whose canonical chain was searched.
     pub chain_epoch_id: ChainEpochId,
+    /// First height the canonical search covered. Zinder issues an absence
+    /// only over complete history, so this is height 1.
+    pub first_covered_height: BlockHeight,
     /// Visible tip height of that epoch; the searched canonical range ends here.
     pub visible_tip_height: BlockHeight,
     /// Whether the writer's live mempool at the same epoch was searched too.
@@ -42,11 +47,13 @@ pub struct TransactionAbsence {
 }
 
 impl TransactionAbsence {
-    /// Builds the absence verdict for `chain_epoch`.
+    /// Builds the absence verdict for `chain_epoch`, searched over complete
+    /// canonical history.
     #[must_use]
     pub const fn at_epoch(chain_epoch: ChainEpoch, covers_mempool: bool) -> Self {
         Self {
             chain_epoch_id: chain_epoch.id,
+            first_covered_height: BlockHeight::new(1),
             visible_tip_height: chain_epoch.visible_tip_height,
             covers_mempool,
         }
@@ -64,6 +71,10 @@ impl TransactionAbsence {
                 (
                     TRANSACTION_ABSENCE_CHAIN_EPOCH_ID_KEY.to_owned(),
                     self.chain_epoch_id.value().to_string(),
+                ),
+                (
+                    TRANSACTION_ABSENCE_FIRST_COVERED_HEIGHT_KEY.to_owned(),
+                    self.first_covered_height.value().to_string(),
                 ),
                 (
                     TRANSACTION_ABSENCE_VISIBLE_TIP_HEIGHT_KEY.to_owned(),
@@ -92,11 +103,14 @@ impl TransactionAbsence {
             });
         }
         let chain_epoch_id = parse_metadata(&metadata, TRANSACTION_ABSENCE_CHAIN_EPOCH_ID_KEY)?;
+        let first_covered_height =
+            parse_metadata(&metadata, TRANSACTION_ABSENCE_FIRST_COVERED_HEIGHT_KEY)?;
         let visible_tip_height =
             parse_metadata(&metadata, TRANSACTION_ABSENCE_VISIBLE_TIP_HEIGHT_KEY)?;
         let covers_mempool = parse_metadata(&metadata, TRANSACTION_ABSENCE_COVERS_MEMPOOL_KEY)?;
         Ok(Some(Self {
             chain_epoch_id: ChainEpochId::new(chain_epoch_id),
+            first_covered_height: BlockHeight::new(first_covered_height),
             visible_tip_height: BlockHeight::new(visible_tip_height),
             covers_mempool,
         }))

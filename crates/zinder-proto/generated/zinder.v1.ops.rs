@@ -407,9 +407,9 @@ pub enum ErrorReason {
     /// in neither the canonical chain of the answering epoch nor, for a lookup
     /// without `at_epoch_id`, the writer's live mempool at that same epoch, and
     /// the store retains complete canonical history. ErrorInfo metadata carries
-    /// `chain_epoch_id`, `visible_tip_height`, and `covers_mempool`. No other
-    /// failure carries this reason; every other NOT_FOUND on that method is a
-    /// failure, not an absence.
+    /// `chain_epoch_id`, `first_covered_height`, `visible_tip_height`, and
+    /// `covers_mempool`. No other failure carries this reason; every other
+    /// NOT_FOUND on that method is a failure, not an absence.
     TransactionNotFound = 51,
     /// FAILED_PRECONDITION family.
     /// The store's retained canonical history starts after a checkpoint, so a

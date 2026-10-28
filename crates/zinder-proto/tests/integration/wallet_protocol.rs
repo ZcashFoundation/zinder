@@ -1173,7 +1173,11 @@ where
 #[test]
 fn transaction_lookup_reasons_round_trip_by_name_and_scalar() -> eyre::Result<()> {
     for (reason, name, scalar) in [
-        (ops::ErrorReason::TransactionNotFound, "TRANSACTION_NOT_FOUND", 51),
+        (
+            ops::ErrorReason::TransactionNotFound,
+            "TRANSACTION_NOT_FOUND",
+            51,
+        ),
         (
             ops::ErrorReason::CanonicalHistoryUnavailable,
             "CANONICAL_HISTORY_UNAVAILABLE",
@@ -1194,6 +1198,7 @@ fn transaction_absence_survives_status_detail_bytes() -> eyre::Result<()> {
 
     let absence = TransactionAbsence {
         chain_epoch_id: ChainEpochId::new(7),
+        first_covered_height: BlockHeight::new(1),
         visible_tip_height: BlockHeight::new(42),
         covers_mempool: false,
     };

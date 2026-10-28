@@ -278,20 +278,31 @@ pub async fn block_header_by_selector_response<Q: WalletQueryApi + ?Sized>(
         .map(|response| build_block_header_response(&response))
 }
 
-/// Reads the typed transaction status at `transaction_id` and encodes
-/// the native wallet response.
+/// Native answer to a canonical transaction-status lookup.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TransactionStatusLookup {
+    /// The transaction has a typed location the wire oneof can carry.
+    Located(wallet::TransactionStatusResponse),
+    /// The transaction is absent from the canonical chain of `chain_epoch`,
+    /// whose retained history is complete.
+    Absent {
+        /// Epoch whose canonical chain was searched.
+        chain_epoch: ChainEpoch,
+    },
+}
+
+/// Reads the typed transaction status at `transaction_id` from the canonical
+/// chain and encodes the native wallet response.
 ///
-/// Returns `Ok(None)` when the canonical chain and the live mempool both
-/// have no record of the transaction. The wire contract maps that case to
-/// gRPC `NOT_FOUND` at the adapter layer, where the original transaction
-/// id is in scope for the error message; the encoder never has to
-/// fabricate a transaction id for a status that does not appear on the
-/// wire oneof.
+/// [`TransactionStatusLookup::Absent`] is a proven canonical absence at the
+/// returned epoch. The adapter decides whether to consult the live mempool
+/// and encodes the absence as a `TRANSACTION_NOT_FOUND` status, because the
+/// wire oneof carries only located transactions.
 pub async fn transaction_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
     transaction_id: TransactionId,
     at_epoch_id: Option<ChainEpochId>,
-) -> Result<Option<wallet::TransactionStatusResponse>, QueryError> {
+) -> Result<TransactionStatusLookup, QueryError> {
     let status = query_api.transaction(transaction_id, at_epoch_id).await?;
     build_transaction_status_response(status)
 }
@@ -643,7 +654,7 @@ fn build_full_block_response(full_block: FullBlock) -> wallet::FullBlockResponse
 )]
 fn build_transaction_status_response(
     status: TransactionStatus,
-) -> Result<Option<wallet::TransactionStatusResponse>, QueryError> {
+) -> Result<TransactionStatusLookup, QueryError> {
     let chain_epoch = status.chain_epoch;
     let location = match status.status {
         TxStatus::Mined(mined) => {
@@ -658,19 +669,21 @@ fn build_transaction_status_response(
         TxStatus::InMempool(entry) => {
             wallet::transaction_location::Location::InMempool(mempool_entry_message(&entry))
         }
-        TxStatus::NotFound => return Ok(None),
+        TxStatus::NotFound => return Ok(TransactionStatusLookup::Absent { chain_epoch }),
         _ => {
             return Err(QueryError::UnsupportedTransactionStatus {
                 reason: "transaction status variant has no wire representation",
             });
         }
     };
-    Ok(Some(wallet::TransactionStatusResponse {
-        chain_view: Some(build_chain_view_message(chain_epoch)),
-        location: Some(wallet::TransactionLocation {
-            location: Some(location),
-        }),
-    }))
+    Ok(TransactionStatusLookup::Located(
+        wallet::TransactionStatusResponse {
+            chain_view: Some(build_chain_view_message(chain_epoch)),
+            location: Some(wallet::TransactionLocation {
+                location: Some(location),
+            }),
+        },
+    ))
 }
 
 fn build_mined_transaction_chain_context_message(

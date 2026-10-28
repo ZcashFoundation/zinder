@@ -165,6 +165,10 @@ impl CanonicalReader for GatedCanonicalReader {
         self.canonical_reader.network()
     }
 
+    fn history_bounds(&self) -> zinder_core::CanonicalHistoryBounds {
+        self.canonical_reader.history_bounds()
+    }
+
     fn event_fence(&self) -> CanonicalEventFence {
         self.canonical_reader.event_fence()
     }

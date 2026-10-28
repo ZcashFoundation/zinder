@@ -240,3 +240,125 @@ async fn transaction_reports_unavailable_for_unknown_id() -> eyre::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn transaction_miss_below_checkpoint_reports_history_unavailable() -> eyre::Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let store = store_fixture.chain_store().clone();
+    let checkpoint_height = BlockHeight::new(1_000);
+    let checkpoint_hash = block_hash_from_seed(1_000);
+    store.commit_artifactless_checkpoint(ChainEpoch {
+        id: ChainEpochId::new(1),
+        network: Network::ZcashRegtest,
+        visible_tip_height: checkpoint_height,
+        visible_tip_hash: checkpoint_hash,
+        settled_tip_height: checkpoint_height,
+        settled_tip_hash: checkpoint_hash,
+        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
+        tip_metadata: ChainTipMetadata::new(130_002, 39_758, 0),
+        created_at: UnixTimestampMillis::new(1_774_668_000_000),
+    })?;
+
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
+    for at_epoch_id in [None, Some(ChainEpochId::new(1))] {
+        // The transaction may be mined at or below the checkpoint, which the
+        // store does not retain, so a miss is not an absence.
+        let outcome = wallet_query
+            .transaction(TransactionId::from_bytes([0xCD; 32]), at_epoch_id)
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                Err(QueryError::CanonicalHistoryUnavailable {
+                    first_available_height
+                }) if first_available_height == BlockHeight::new(1_001)
+            ),
+            "expected the history floor, got {outcome:?}"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn transaction_absence_at_a_pinned_epoch_names_that_epoch_tip() -> eyre::Result<()> {
+    let store_fixture = StoreFixture::open()?;
+    let store = store_fixture.chain_store().clone();
+    let (first_epoch, first_block, first_compact_block) = synthetic_chain_epoch(1, 1);
+    let first_replay = encode_fixture_block_replay(&first_block, &[]);
+    store.commit_chain_epoch(ChainEpochArtifacts::new(
+        first_epoch,
+        vec![first_block],
+        vec![first_replay],
+        vec![first_compact_block],
+    ))?;
+
+    let (second_epoch, second_block, second_compact_block) = synthetic_chain_epoch(2, 2);
+    let transaction_id = TransactionId::from_bytes([0xAB; 32]);
+    let transaction_rows = FixtureTransactionRows::from_raw_transaction(
+        transaction_id,
+        second_block.height,
+        second_block.block_hash,
+        0,
+        b"raw-transaction-bytes".to_vec(),
+    );
+    let replay_transaction_rows = FixtureTransactionRows {
+        blob: None,
+        ..transaction_rows.clone()
+    };
+    let second_replay = encode_fixture_block_replay(
+        &second_block,
+        std::slice::from_ref(&replay_transaction_rows),
+    );
+    let intrinsic_value_balances = transaction_rows
+        .intrinsic_value_balances_artifact()
+        .into_iter()
+        .collect();
+    store.commit_chain_epoch(
+        ChainEpochArtifacts::new(
+            second_epoch,
+            vec![second_block],
+            vec![second_replay],
+            vec![second_compact_block],
+        )
+        .with_block_transaction_index(vec![transaction_rows.block_transaction_index])
+        .with_transaction_locations(vec![transaction_rows.location])
+        .with_transaction_facts(vec![transaction_rows.facts])
+        .with_transaction_intrinsic_value_balances(intrinsic_value_balances),
+    )?;
+
+    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
+    // A replica pinned below the mining height answers an absence, but the
+    // absence names an epoch whose tip is below the mining height, so the
+    // caller can tell it does not cover that height.
+    let lagging = wallet_query
+        .transaction(transaction_id, Some(first_epoch.id))
+        .await?;
+    assert!(matches!(lagging.status, TxStatus::NotFound));
+    assert_eq!(lagging.chain_epoch, first_epoch);
+    assert!(lagging.chain_epoch.visible_tip_height < BlockHeight::new(2));
+
+    let covering = wallet_query
+        .transaction(transaction_id, Some(second_epoch.id))
+        .await?;
+    let TxStatus::Mined(mined) = covering.status else {
+        return Err(eyre!(
+            "expected mined status at the covering epoch, got {covering:?}"
+        ));
+    };
+    assert_eq!(covering.chain_epoch, second_epoch);
+    assert_eq!(mined.location.block_height, BlockHeight::new(2));
+
+    let unknown_pin = wallet_query
+        .transaction(transaction_id, Some(ChainEpochId::new(99)))
+        .await;
+    assert!(
+        matches!(
+            unknown_pin,
+            Err(QueryError::ChainEpochPinUnavailable { .. })
+        ),
+        "an epoch the store does not hold must fail, got {unknown_pin:?}"
+    );
+
+    Ok(())
+}

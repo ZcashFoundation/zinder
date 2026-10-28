@@ -828,6 +828,7 @@ where
             // families in one canonical batch. Under that admitted contract,
             // absence is a real miss.
             let Some(location) = pair.canonical().transaction_location(transaction_id)? else {
+                crate::require_complete_transaction_history(pair.canonical().history_bounds())?;
                 return Ok(TransactionStatus {
                     chain_epoch,
                     status: TxStatus::NotFound,

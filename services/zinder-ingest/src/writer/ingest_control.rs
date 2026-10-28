@@ -27,6 +27,7 @@ use zinder_proto::{
         },
         ops, wallet,
     },
+    wire::TransactionAbsence,
 };
 use zinder_runtime::{
     BearerToken, BearerTokenServerInterceptor, Readiness, ReadinessCause, ReadinessReport,
@@ -236,7 +237,8 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
             .entry_for(snapshot.chain_epoch, transaction_id)
             .await?
             .ok_or_else(|| {
-                Status::not_found("transaction is not visible in the live mempool index")
+                TransactionAbsence::at_epoch(snapshot.chain_epoch, true)
+                    .into_status("transaction is not visible in the live mempool index")
             })?;
         Ok(Response::new(wallet::TransactionStatusResponse {
             chain_view: Some(chain_view_message(snapshot.chain_epoch)),

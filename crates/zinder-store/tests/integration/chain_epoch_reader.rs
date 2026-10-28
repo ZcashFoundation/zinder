@@ -1152,7 +1152,10 @@ fn checkpointed_history_refuses_to_prove_transaction_absence() -> eyre::Result<(
     // A miss may be a transaction mined at or below the checkpoint, so the
     // store refuses to call it absent and names its history floor.
     let missing_transaction_id = TransactionId::from_bytes([0x33; 32]);
-    assert_eq!(reader.transaction_facts_by_id(missing_transaction_id)?, None);
+    assert_eq!(
+        reader.transaction_facts_by_id(missing_transaction_id)?,
+        None
+    );
     assert!(matches!(
         reader.transaction_facts_or_proven_absence(missing_transaction_id),
         Err(StoreError::CanonicalHistoryUnavailable {
