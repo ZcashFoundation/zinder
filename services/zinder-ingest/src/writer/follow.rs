@@ -823,12 +823,9 @@ where
                     configured_window_blocks,
                 ));
             }
-            return Err(CanonicalFollowError::ReplacementBytesExceeded {
-                replacement_depth: u32::try_from(source_blocks.len()).unwrap_or(u32::MAX),
-                prepared_blocks: 0,
-                held_bytes: memory.held_bytes(),
-                max_replacement_bytes: config.max_replacement_bytes.get(),
-            });
+            return Err(
+                memory.exceeded_error(u32::try_from(source_blocks.len()).unwrap_or(u32::MAX), 0)
+            );
         }
         if common_parent.is_some() {
             break;
@@ -943,14 +940,12 @@ where
         .await?;
         memory.hold(prepared_replacement_bytes(&block));
         if memory.exceeded() {
-            return Err(CanonicalFollowError::ReplacementBytesExceeded {
+            return Err(memory.exceeded_error(
                 replacement_depth,
-                prepared_blocks: u32::try_from(replacement_blocks.len())
+                u32::try_from(replacement_blocks.len())
                     .unwrap_or(u32::MAX)
                     .saturating_add(1),
-                held_bytes: memory.held_bytes(),
-                max_replacement_bytes: config.max_replacement_bytes.get(),
-            });
+            ));
         }
         replacement_blocks.push(CanonicalReplacementBlock::new(block, subtree_roots));
         predecessor_checkpoint = source_checkpoint;
@@ -1056,11 +1051,9 @@ impl ReplacementMemory {
         }
     }
 
-    /// Counts one fetched source block and returns its estimated bytes.
-    fn retain_source(&mut self, block: &SourceBlock) -> u64 {
-        let bytes = source_block_bytes(block);
-        self.hold(bytes);
-        bytes
+    /// Counts one fetched source block.
+    fn retain_source(&mut self, block: &SourceBlock) {
+        self.hold(source_block_bytes(block));
     }
 
     const fn hold(&mut self, bytes: u64) {
@@ -1077,6 +1070,21 @@ impl ReplacementMemory {
 
     const fn exceeded(&self) -> bool {
         self.held_bytes > self.max_bytes
+    }
+
+    /// Returns the refusal of a `replacement_depth`-block replacement whose
+    /// held bytes exceeded the budget after preparing `prepared_blocks`.
+    const fn exceeded_error(
+        &self,
+        replacement_depth: u32,
+        prepared_blocks: u32,
+    ) -> CanonicalFollowError {
+        CanonicalFollowError::ReplacementBytesExceeded {
+            replacement_depth,
+            prepared_blocks,
+            held_bytes: self.held_bytes(),
+            max_replacement_bytes: self.max_bytes,
+        }
     }
 }
 
