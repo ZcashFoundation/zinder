@@ -367,7 +367,6 @@ pub(super) fn decode_store_control(
             "store control contains an unknown trailing extension",
         ));
     }
-    decoder.reject_trailing_bytes()?;
     Ok(DecodedStoreControl {
         network,
         workload,
@@ -779,19 +778,6 @@ impl<'encoded> Decoder<'encoded> {
         })?;
         self.position = end;
         Ok(bytes)
-    }
-
-    fn reject_trailing_bytes(&self) -> Result<(), CanonicalStoreError> {
-        if self.position != self.encoded.len() {
-            return Err(CanonicalStoreError::admission(
-                self.path,
-                format!(
-                    "store control contains {} trailing bytes",
-                    self.encoded.len().saturating_sub(self.position)
-                ),
-            ));
-        }
-        Ok(())
     }
 }
 
