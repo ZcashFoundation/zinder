@@ -261,6 +261,11 @@ server returns gRPC `NOT_FOUND` with reason `TRANSACTION_NOT_FOUND` when:
 - for a lookup without `at_epoch_id`, the writer's live mempool, at the same
   epoch id, has no record either.
 
+The writer's mempool view answers for exactly one source tip. A `Mined` change
+for a block outside that tip's chain ends the mempool generation instead of
+removing the entry, so point reads fail with `UNAVAILABLE` until the next
+generation is certified.
+
 `ErrorInfo.metadata` carries `chain_epoch_id`, `first_covered_height` (always
 `1`), `visible_tip_height`, and `covers_mempool`. A caller learns the covered
 range from the absence itself; a store that cannot cover height 1 never issues

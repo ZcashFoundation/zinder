@@ -58,6 +58,22 @@ The server issues the absence only when all of these hold:
    fails with `DEPENDENCY_NOT_CONFIGURED`; an unavailable one keeps its
    `UNAVAILABLE` status.
 
+   A mempool generation answers for exactly one source tip. Zebra's mempool
+   changes and tip notifications are separate streams with no shared order,
+   so a `Mined` change for a block outside that tip's chain (above it, or at
+   its height on another branch) can arrive before the tip change. The owner
+   then ends the generation without applying the change, exactly as a tip
+   change does, and a snapshot whose staged changes include such a block is
+   not certified. Point reads stay `UNAVAILABLE` until the next generation is
+   certified, so the transaction is never missing from both views.
+
+   An `Invalidated` change still removes the entry within the generation. The
+   node reports it only for a transaction that its best chain does not
+   contain, so the transaction is not mined. Removals the node makes because
+   of a newer block, such as an expiry or a conflicting spend, can make an
+   unpinned absence reflect the mempool slightly after the epoch's tip; such a
+   transaction can no longer be mined on that chain.
+
 A lookup with `at_epoch_id` answers from that epoch or fails with
 `CHAIN_EPOCH_PIN_UNAVAILABLE`. It never consults the mempool, and its absence
 states `covers_mempool = false`.
@@ -89,6 +105,9 @@ Introducing this contract raised `zinder_proto::CONTRACT_REVISION` to 6.
   `ChainSnapshot` whose epoch's visible tip covers that height and looking the
   transaction up through it. The snapshot pins the lookup, so `NotFound` means
   absent from that epoch's canonical chain from height 1 through its tip.
+- The Rust client's `TxStatus::NotFound` carries no epoch. For an unpinned
+  lookup the caller cannot tell which epoch, and so which heights, the absence
+  covers, so a payment decision must use the pinned snapshot lookup.
 - A caller that also needs the mempool answer makes an unpinned lookup or
   calls `is_in_mempool`. A pinned lookup never reports `InMempool`.
 - Checkpoint-bootstrapped stores never answer a transaction absence. Wallet
