@@ -177,7 +177,8 @@ their prepared form. `ingest.follow.max_replacement_bytes` (2 GiB by default)
 bounds the estimated sum of both, so set it within the container's memory with
 headroom for the one block being decoded. A replacement that would exceed it
 fails before any write with `ReplacementBytesExceeded`, naming the depth, the
-blocks prepared (zero when discovery alone exceeded it), and the bytes held.
+blocks prepared (zero when discovery alone exceeded it), and the bytes held. A fork deeper than the window still parks with
+`reorg_window_exceeded` even when discovery exhausts the budget.
 This is not a park: ingest exits, and under the wallet-serving image's
 `ALWAYS` restart policy the container restarts, discovers the same fork, and
 fails again, with wallets seeing an unavailable service instead of

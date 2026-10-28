@@ -230,7 +230,10 @@ operators would still need to raise it as observed reorgs grow.
   found. Transient decoding of the one block in preparation is not counted. A
   replacement beyond the budget fails with the typed
   `ReplacementBytesExceeded` before any write, during discovery if the
-  fetched blocks alone exceed it. The error ends the canonical writer, so
+  fetched blocks alone exceed it. A fork deeper than the window still parks:
+  when discovery exhausts the budget, ingest reads the source block above
+  the settled tip, and if the source branch leaves the settled tip it reports
+  `ReorgWindowExceeded` instead. The error ends the canonical writer, so
   ingest exits instead of parking: a supervisor that restarts it retries the
   same discovery and fails the same way until the operator raises the budget
   or the node abandons the branch. A dedicated budget is used because the
