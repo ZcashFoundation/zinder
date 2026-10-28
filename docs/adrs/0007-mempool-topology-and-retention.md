@@ -188,6 +188,8 @@ pub enum TxStatus {
 
 The `MempoolEntry` carries the hydrated transaction, the chain epoch at first observation, the transparent overlay, and the precomputed compact-tx bytes. The typed enum is the contract; `transaction_by_id` reports mempool presence by returning `InMempool`, not by an error string consumers parse. Typed transaction status is a product-correctness requirement.
 
+`NotFound` is a proven absence. An unpinned lookup pairs a canonical miss with a mempool miss at the same epoch id, and the writer's `MempoolTransaction` miss names that epoch; [ADR-0042](0042-proven-transaction-absence.md) owns the absence contract.
+
 ## Consequences
 
 ### Operational
