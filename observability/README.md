@@ -177,7 +177,7 @@ wallet request to duplicate that proof.
 | --- | --- | --- |
 | `ZINDER_OBSERVABILITY_NETWORK` | `zcash-regtest` | Network written to service configs. |
 | `ZINDER_OBSERVABILITY_BULK_CATCHUP_BLOCKS` | `50` | Blocks ingested after the checkpoint. |
-| `ZINDER_OBSERVABILITY_GENERATE_BLOCKS` | `0` | Explicitly requested regtest blocks to mine after the ingest loop reaches the `TipFollow` phase. |
+| `ZINDER_OBSERVABILITY_GENERATE_BLOCKS` | `0` | Explicitly requested regtest blocks to mine after the canonical writer reaches the `FollowingTip` phase. |
 | `ZINDER_OBSERVABILITY_CERTIFY_TOPOLOGY` | `0` | Set `1` on the `run` command to enable regtest-only lag, restart, and reorg certification. |
 | `ZINDER_OBSERVABILITY_COMPAT_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS` | `4` | Compatibility readiness threshold written to the generated config. |
 | `ZINDER_OBSERVABILITY_CERTIFICATION_LAG_BLOCKS` | Threshold plus `1` | Blocks mined while the projector is suspended; this must exceed the compatibility lag threshold. |
@@ -208,21 +208,19 @@ The smoke should produce samples for:
 - `zinder_readiness_state`
 - `zinder_readiness_sync_lag_blocks`
 - `zinder_readiness_replica_lag_chain_epochs`
-- `zinder_ingest_commit_duration_seconds_count`
-- `zinder_ingest_writer_chain_epoch_id`
+- `zinder_ingest_canonical_live_appends_total`
+- `zinder_ingest_canonical_chain_epoch`
 - `zinder_ingest_writer_status_request_total`
 - `zinder_compat_lightwalletd_wallet_serving_pair_publisher_publications_total`
 - `zinder_compat_lightwalletd_wallet_serving_pair_publisher_convergence_total`
 - `zinder_compat_lightwalletd_wallet_serving_pair_publisher_teardown_duration_seconds`
 - `zinder_compat_lightwalletd_wallet_serving_pair_publisher_replica_lag_chain_epochs`
 - `zinder_compat_lightwalletd_writer_status_total`
-- `zinder_store_read_duration_seconds_count`
-- `zinder_store_visibility_seek_total`
 - `zinder_store_rocksdb_property`
 
 When block generation remains at its default of `0`, the ingest process still
 runs and node-poll metrics remain visible, but the live
-`zinder_ingest_commit_duration_seconds_count` sample may stay absent until a new
+`zinder_ingest_canonical_live_appends_total` sample may stay absent until a new
 block arrives.
 
 Restore is deliberately not exercised: no coherent canonical-plus-wallet
@@ -242,7 +240,6 @@ local rules cover:
 - secondary replica lag
 - node RPC errors
 - wallet-query p95 above 250ms
-- store-read p95 above 50ms
 - RocksDB pending compaction bytes above 256MiB
 - more than four RocksDB compactions running for 15 minutes
 
