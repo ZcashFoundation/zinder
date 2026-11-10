@@ -419,9 +419,8 @@ async fn serving_pair_address_indexes_are_epoch_bound_ascending_and_cursor_resum
 async fn remote_chain_event_stream_rejects_duplicate_sequence_from_the_wire() -> eyre::Result<()> {
     let chain_epoch = ChainFixture::new(Network::ZcashRegtest)
         .extend_blocks(2)
-        .chain_epoch_artifacts(zinder_client::ChainEpochId::new(1))
-        .ok_or_else(|| eyre!("chain fixture must be non-empty"))?
-        .chain_epoch;
+        .chain_epoch(zinder_client::ChainEpochId::new(1))
+        .ok_or_else(|| eyre!("chain fixture must be non-empty"))?;
     let event = wallet::ChainEventEnvelope {
         cursor: vec![1],
         event_sequence: 1,
@@ -466,9 +465,8 @@ async fn remote_chain_event_stream_rejects_a_nonadjacent_repeated_cursor_from_th
 -> eyre::Result<()> {
     let chain_epoch = ChainFixture::new(Network::ZcashRegtest)
         .extend_blocks(2)
-        .chain_epoch_artifacts(zinder_client::ChainEpochId::new(1))
-        .ok_or_else(|| eyre!("chain fixture must be non-empty"))?
-        .chain_epoch;
+        .chain_epoch(zinder_client::ChainEpochId::new(1))
+        .ok_or_else(|| eyre!("chain fixture must be non-empty"))?;
     let mut first = chain_event_message(chain_epoch, 1, vec![1]);
     let second = chain_event_message(chain_epoch, 2, vec![2]);
     let mut repeated = chain_event_message(chain_epoch, 3, vec![1]);

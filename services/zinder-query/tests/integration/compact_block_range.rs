@@ -10,9 +10,9 @@ use eyre::eyre;
 use prost::Message;
 use zinder_core::wire::{encode_rpc_block_hash_hex, encode_zinder_native_chain_name};
 use zinder_core::{
-    BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch, ChainEpochId, ChainTipMetadata,
-    CompactBlockArtifact, CompactChainMetadata, MAX_SUBTREE_ROOTS_PER_REQUEST, Network,
-    ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange,
+    BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch, ChainEpochId,
+    CompactBlockArtifact, MAX_SUBTREE_ROOTS_PER_REQUEST, Network, ShieldedProtocol,
+    SubtreeRootIndex, SubtreeRootRange,
 };
 use zinder_proto::v1::wallet;
 use zinder_query::{
@@ -21,15 +21,11 @@ use zinder_query::{
     subtree_roots_response, tree_state_at_response, visible_tip_block_response,
 };
 use zinder_source::{SourceError, SourceTreeState};
-use zinder_store::{ChainEpochArtifacts, RawBlobRetention};
-use zinder_testkit::{
-    ChainFixture, StoreFixture, WalletServingStoreFixture, encode_fixture_block_replay,
-    sample_regtest_upgrade_activations,
-};
+use zinder_store::RawBlobRetention;
+use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
 
 use crate::common::{
     ProbedNode, probed_serving_query_over, serving_query_after_live_append, serving_query_over,
-    synthetic_chain_epoch,
 };
 
 /// Tree-state payload the release store derives from a checkpoint whose
@@ -434,38 +430,6 @@ async fn subtree_roots_response_returns_valid_empty_range() -> eyre::Result<()> 
 
     assert_eq!(decoded_response.start_index, 0);
     assert!(decoded_response.subtree_roots.is_empty());
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn chain_epoch_rejects_tip_metadata_that_disagrees_with_compact_block() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (mut chain_epoch, block, _compact_block) = synthetic_chain_epoch(1, 1);
-    chain_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0, 0);
-    let compact_block = CompactBlockArtifact::empty(
-        BlockId::new(block.height, block.block_hash),
-        block.parent_hash,
-        u32::try_from(block.block_time).unwrap_or_default(),
-        CompactChainMetadata {
-            sapling_commitment_tree_size: 0,
-            orchard_commitment_tree_size: 0,
-            ironwood_commitment_tree_size: 0,
-        },
-    );
-    let replay = encode_fixture_block_replay(&block, &[]);
-
-    let error = match store.commit_chain_epoch(ChainEpochArtifacts::new(
-        chain_epoch,
-        vec![block],
-        vec![replay],
-        vec![compact_block],
-    )) {
-        Ok(outcome) => return Err(eyre!("expected metadata rejection, got {outcome:?}")),
-        Err(error) => error,
-    };
-    assert!(error.to_string().contains("visible-tip compact metadata"));
 
     Ok(())
 }

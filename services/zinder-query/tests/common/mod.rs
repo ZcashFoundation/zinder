@@ -16,10 +16,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use zinder_core::{
-    BlockHash, BlockHeaderArtifact, BlockHeight, BlockId, ChainEpoch, ChainEpochId,
-    ChainTipMetadata, CompactBlockArtifact, CompactChainMetadata, Network, UnixTimestampMillis,
-};
+use zinder_core::{BlockHeight, BlockId, Network};
 
 use async_trait::async_trait;
 use zinder_core::{RawTransactionBytes, TransactionBroadcastOutcome};
@@ -30,7 +27,6 @@ use zinder_source::{
     NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError, SourceTreeState,
     TransactionBroadcaster, TreeStateUpstream,
 };
-use zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION;
 use zinder_testkit::{
     ChainFixture, IngestControlFixture, MockTransactionBroadcaster, WalletServingStoreFixture,
     sample_regtest_upgrade_activations,
@@ -219,67 +215,4 @@ impl TransactionBroadcaster for ProbedNode {
             .broadcast_transaction(raw_transaction)
             .await
     }
-}
-
-/// Builds a block hash whose 32 bytes repeat `seed` as four big-endian u32 chunks.
-#[must_use]
-pub fn block_hash_from_seed(seed: u32) -> BlockHash {
-    let mut bytes = [0; 32];
-    for chunk in bytes.chunks_exact_mut(4) {
-        chunk.copy_from_slice(&seed.to_be_bytes());
-    }
-    BlockHash::from_bytes(bytes)
-}
-
-/// Returns the deterministic raw block bytes used by synthetic query fixtures.
-#[must_use]
-pub fn synthetic_raw_block_bytes(height: u32) -> Vec<u8> {
-    format!("raw-block-{height}").into_bytes()
-}
-
-/// Creates a synthetic single-block chain epoch with deterministic identifiers.
-#[must_use]
-pub fn synthetic_chain_epoch(
-    chain_epoch_id: u64,
-    height: u32,
-) -> (ChainEpoch, BlockHeaderArtifact, CompactBlockArtifact) {
-    let source_hash = block_hash_from_seed(height);
-    let parent_hash = block_hash_from_seed(height.saturating_sub(1));
-    let block_height = BlockHeight::new(height);
-
-    (
-        ChainEpoch {
-            id: ChainEpochId::new(chain_epoch_id),
-            network: Network::ZcashRegtest,
-            visible_tip_height: block_height,
-            visible_tip_hash: source_hash,
-            settled_tip_height: block_height,
-            settled_tip_hash: source_hash,
-            artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
-            tip_metadata: ChainTipMetadata::empty(),
-            created_at: UnixTimestampMillis::new(1_774_668_300_000 + u64::from(height)),
-        },
-        BlockHeaderArtifact::new(
-            block_height,
-            source_hash,
-            parent_hash,
-            [0; 32],
-            [0; 32],
-            0,
-            0,
-            [0; 32],
-            0,
-            u64::try_from(synthetic_raw_block_bytes(height).len()).unwrap_or(u64::MAX),
-        ),
-        CompactBlockArtifact::empty(
-            BlockId::new(block_height, source_hash),
-            parent_hash,
-            0,
-            CompactChainMetadata {
-                sapling_commitment_tree_size: 0,
-                orchard_commitment_tree_size: 0,
-                ironwood_commitment_tree_size: 0,
-            },
-        ),
-    )
 }

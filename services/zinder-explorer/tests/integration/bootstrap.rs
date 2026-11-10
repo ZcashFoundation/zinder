@@ -6,7 +6,7 @@
 //! Smoke test that boots an `ExplorerQueryGrpcAdapter` against an in-process
 //! tonic server and verifies `ServerInfo` returns the expected capability set.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use eyre::{Result, eyre};
@@ -16,8 +16,9 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Endpoint};
 use zinder_core::{
-    BlockHeight, BlockHeightRange, BlockId, ChainEpochId, Network, TransparentAddressScriptHash,
-    explorer_reasons::WALLET_QUERY_CAPABILITY_NOT_SUPPORTED, wire::encode_rpc_block_hash_hex,
+    BlockHeight, BlockHeightRange, BlockId, ChainEpoch, ChainEpochId, Network,
+    TransparentAddressScriptHash, explorer_reasons::WALLET_QUERY_CAPABILITY_NOT_SUPPORTED,
+    wire::encode_rpc_block_hash_hex,
 };
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
 use zinder_materialized_views::{
@@ -49,10 +50,10 @@ use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceError,
     UPSTREAM_HEALTH_SOURCE_ZEBRA_READY_ENDPOINT, UpstreamHealthSnapshot,
 };
-use zinder_store::{ChainEpochArtifacts, ReorgWindowChange};
+use zinder_store::{CanonicalEventCursor, ChainEpochCommitted, ChainEvent, ChainRangeReverted};
 use zinder_testkit::{
-    ChainFixture, IngestControlFixture, StoreFixture, WalletServingStoreFixture,
-    encode_fixture_block_replay, sample_regtest_upgrade_activations,
+    ChainFixture, IngestControlFixture, WalletServingStoreFixture,
+    sample_regtest_upgrade_activations,
 };
 
 type ServerHandle = tokio::task::JoinHandle<Result<(), tonic::transport::Error>>;
@@ -472,11 +473,9 @@ async fn explorer_query_freshness_carries_upstream_observation_after_probe_fires
 
 #[tokio::test]
 async fn explorer_query_serves_recorded_chain_reorg_history() -> Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    seed_recorded_chain_reorg(&store_fixture)?;
-
+    let canonical_directory = tempfile::tempdir()?;
     let seeded_materialized_view_store =
-        seeded_reorg_history_materialized_view_store(&store_fixture)?;
+        seeded_reorg_history_materialized_view_store(canonical_directory.path())?;
     let (mut client, explorer_handle) = spawn_explorer_query_server_with_materialized_view_store(
         seeded_materialized_view_store.secondary_store,
     )
@@ -491,7 +490,16 @@ async fn explorer_query_serves_recorded_chain_reorg_history() -> Result<()> {
     Ok(())
 }
 
-fn seed_recorded_chain_reorg(store_fixture: &StoreFixture) -> Result<()> {
+/// One retained canonical transition, as the materialized-view tailer dispatches it.
+struct RecordedChainEvent {
+    event_sequence: u64,
+    chain_epoch: ChainEpoch,
+    chain_event: ChainEvent,
+}
+
+/// Returns the transitions a canonical writer retains when it commits heights
+/// 1..=2 above a settled height 1 and then replaces height 2.
+fn recorded_chain_reorg_events() -> Result<[RecordedChainEvent; 2]> {
     let initial_chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
     let settled_block = initial_chain
         .block_at(BlockHeight::new(1))
@@ -501,57 +509,55 @@ fn seed_recorded_chain_reorg(store_fixture: &StoreFixture) -> Result<()> {
         .ok_or_else(|| eyre!("initial fixture missing chain epoch"))?;
     initial_epoch.settled_tip_height = settled_block.height;
     initial_epoch.settled_tip_hash = settled_block.hash;
-    let initial_block_headers = initial_chain.block_header_artifacts();
-    let initial_block_replay_envelopes = initial_block_headers
-        .iter()
-        .map(|block_header| encode_fixture_block_replay(block_header, &[]))
-        .collect();
-    store_fixture.chain_store().commit_chain_epoch(
-        ChainEpochArtifacts::new(
-            initial_epoch,
-            initial_block_headers,
-            initial_block_replay_envelopes,
-            initial_chain.compact_block_artifacts(),
-        )
-        .with_reorg_window_change(ReorgWindowChange::Extend {
-            block_range: BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2)),
-        }),
-    )?;
 
     let replacement_chain = initial_chain.fork_at(BlockHeight::new(2))?.extend_blocks(1);
-    let replacement_block = replacement_chain
-        .block_at(BlockHeight::new(2))
-        .ok_or_else(|| eyre!("replacement fixture missing height 2"))?;
     let mut replacement_epoch = replacement_chain
         .chain_epoch(ChainEpochId::new(2))
         .ok_or_else(|| eyre!("replacement fixture missing chain epoch"))?;
     replacement_epoch.settled_tip_height = settled_block.height;
     replacement_epoch.settled_tip_hash = settled_block.hash;
-    let replacement_block_header = replacement_block.block_header_artifact();
-    let replacement_replay = encode_fixture_block_replay(&replacement_block_header, &[]);
-    store_fixture.chain_store().commit_chain_epoch(
-        ChainEpochArtifacts::new(
-            replacement_epoch,
-            vec![replacement_block_header],
-            vec![replacement_replay],
-            vec![replacement_block.compact_block_artifact()],
-        )
-        .with_reorg_window_change(ReorgWindowChange::Replace {
-            from_height: BlockHeight::new(2),
-        }),
-    )?;
-    Ok(())
+
+    let replaced_range = BlockHeightRange::inclusive(BlockHeight::new(2), BlockHeight::new(2));
+    Ok([
+        RecordedChainEvent {
+            event_sequence: 1,
+            chain_epoch: initial_epoch,
+            chain_event: ChainEvent::ChainCommitted {
+                committed: ChainEpochCommitted {
+                    chain_epoch: initial_epoch,
+                    block_range: BlockHeightRange::inclusive(
+                        BlockHeight::new(1),
+                        BlockHeight::new(2),
+                    ),
+                },
+            },
+        },
+        RecordedChainEvent {
+            event_sequence: 2,
+            chain_epoch: replacement_epoch,
+            chain_event: ChainEvent::ChainReorged {
+                reverted: ChainRangeReverted {
+                    chain_epoch: initial_epoch,
+                    block_range: replaced_range,
+                },
+                committed: ChainEpochCommitted {
+                    chain_epoch: replacement_epoch,
+                    block_range: replaced_range,
+                },
+            },
+        },
+    ])
 }
 
 fn seeded_reorg_history_materialized_view_store(
-    store_fixture: &StoreFixture,
+    canonical_path: &Path,
 ) -> Result<SeededMaterializedViewStore> {
     let primary_materialized_view_store = zinder_ingest::open_primary_materialized_view_store(
-        store_fixture.tempdir_path(),
+        canonical_path,
         zinder_materialized_views::MaterializedViewPreset::Explorer,
         zinder_store::RocksDbResourceBudget::for_local_tests(),
     )?;
-    record_reorg_incidents(store_fixture, &primary_materialized_view_store)?;
+    record_reorg_incidents(&primary_materialized_view_store)?;
     let reorg_cursor = primary_materialized_view_store
         .get_chain_event_cursor(REORG_INCIDENTS_CONSUMER_NAME)?
         .ok_or_else(|| eyre!("reorg incidents cursor missing after materialized-view replay"))?;
@@ -559,7 +565,7 @@ fn seeded_reorg_history_materialized_view_store(
 
     let materialized_view_secondary_tempdir = tempfile::tempdir()?;
     let materialized_view_store = MaterializedViewStore::open_secondary(
-        MaterializedViewStore::path_for_canonical(store_fixture.tempdir_path()),
+        MaterializedViewStore::path_for_canonical(canonical_path),
         materialized_view_secondary_tempdir.path(),
         MaterializedViewStoreOptions {
             sync_writes: false,
@@ -800,15 +806,11 @@ fn seeded_block_summary_materialized_view_store_with_transaction_ids(
     })
 }
 
-/// Replays the fixture's retained chain events into the reorg-incident log.
-fn record_reorg_incidents(
-    store_fixture: &StoreFixture,
-    materialized_view_store: &MaterializedViewStore,
-) -> Result<()> {
+/// Replays the recorded canonical transitions into the reorg-incident log.
+fn record_reorg_incidents(materialized_view_store: &MaterializedViewStore) -> Result<()> {
     let blocks = std::collections::HashMap::new();
-    for envelope in store_fixture.chain_store().chain_event_history(
-        zinder_store::ChainEventHistoryRequest::with_default_limit(None),
-    )? {
+    for recorded in recorded_chain_reorg_events()? {
+        let chain_cursor = CanonicalEventCursor::at(recorded.event_sequence)?.as_bytes();
         let mut reorg_incidents = zinder_materialized_views::ReorgIncidentsConsumer::new();
         let mut block_consumers: [&mut dyn zinder_materialized_views::BlockKeyedConsumer; 0] = [];
         let mut event_consumers: [&mut dyn zinder_materialized_views::MaterializedViewConsumer; 1] =
@@ -819,11 +821,11 @@ fn record_reorg_incidents(
                 event_consumers: &mut event_consumers,
             },
             zinder_materialized_views::ChainEventDispatchInputs {
-                chain_epoch: envelope.chain_epoch,
-                chain_event: &envelope.event,
-                chain_cursor: envelope.cursor.as_bytes(),
-                event_sequence: envelope.event_sequence,
-                settled_tip_height: envelope.settled_tip_height,
+                chain_epoch: recorded.chain_epoch,
+                chain_event: &recorded.chain_event,
+                chain_cursor: &chain_cursor,
+                event_sequence: recorded.event_sequence,
+                settled_tip_height: recorded.chain_epoch.settled_tip_height,
             },
             &blocks,
             true,

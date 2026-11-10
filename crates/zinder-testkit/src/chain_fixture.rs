@@ -18,18 +18,15 @@ use zinder_core::{
     CanonicalBlockReplayEnvelope, CanonicalBlockReplayFormatVersion, CanonicalTransactionFacts,
     ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact, CompactChainMetadata,
     CompactTransaction, CompactTransactionData, CompactTransparentInput, CompactTransparentOutput,
-    LockTime, Network, PrivacyShape, SerializedBytesDigest, ShieldedProtocol, SubtreeRootArtifact,
-    SubtreeRootHash, SubtreeRootIndex, TransactionBlobArtifact, TransactionComponentCounts,
-    TransactionFactsArtifact, TransactionId, TransactionIntrinsicValueBalances,
-    TransactionIntrinsicValueBalancesArtifact, TransactionLocation, TransactionPublicFacts,
-    TransactionVersion, TransparentInputFact, TransparentOutPoint, TransparentOutputArtifact,
-    TransparentOutputFact, TransparentSpendFact, TransparentUnspentOutput, TreeStateArtifact,
-    UnixTimestampMillis, UnsupportedSection, encode_canonical_block_replay,
+    LockTime, Network, PrivacyShape, SerializedBytesDigest, TransactionBlobArtifact,
+    TransactionComponentCounts, TransactionFactsArtifact, TransactionId,
+    TransactionIntrinsicValueBalances, TransactionLocation, TransactionPublicFacts,
+    TransactionVersion, TransparentInputFact, TransparentOutputArtifact, TransparentOutputFact,
+    TransparentSpendFact, TransparentUnspentOutput, TreeStateArtifact, UnixTimestampMillis,
+    UnsupportedSection, encode_canonical_block_replay,
 };
 use zinder_source::{SourceBlock, SourceBlockHeader};
-use zinder_store::{
-    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, RawBlobRetention, ReorgWindowChange,
-};
+use zinder_store::{CURRENT_ARTIFACT_SCHEMA_VERSION, RawBlobRetention};
 
 const FIXTURE_GENESIS_TIMESTAMP_SECONDS: u32 = 1_774_668_400;
 const FIXTURE_HASH_HEIGHT_MIX: u32 = 0x9e37_79b9;
@@ -211,39 +208,6 @@ impl FixtureTransactionRows {
     ) -> Self {
         self.intrinsic_value_balances = Some(intrinsic_value_balances);
         self
-    }
-
-    /// Returns the canonical intrinsic-balance artifact for these rows.
-    #[must_use]
-    pub fn intrinsic_value_balances_artifact(
-        &self,
-    ) -> Option<TransactionIntrinsicValueBalancesArtifact> {
-        self.intrinsic_value_balances
-            .map(|intrinsic_value_balances| {
-                TransactionIntrinsicValueBalancesArtifact::new(
-                    self.location,
-                    intrinsic_value_balances,
-                )
-            })
-    }
-
-    /// Expands the transaction's ordered transparent outputs into outpoint-keyed rows.
-    #[must_use]
-    pub fn transparent_output_artifacts(&self) -> Vec<TransparentOutputArtifact> {
-        self.facts
-            .transparent_outputs
-            .iter()
-            .map(|output| {
-                TransparentOutputArtifact::new(
-                    TransparentOutPoint::new(self.location.transaction_id, output.output_index),
-                    output.value_zat,
-                    output.script_pub_key.clone(),
-                    output.address_script_hash,
-                    self.location.block_height,
-                    self.location.block_hash,
-                )
-            })
-            .collect()
     }
 
     fn attach_transparent_input(&mut self, input: TransparentInputFact) {
@@ -460,7 +424,6 @@ pub struct ChainFixture {
     blocks: Vec<FixtureBlock>,
     compact_block_overrides: Vec<CompactBlockArtifact>,
     tip_metadata_override: Option<ChainTipMetadata>,
-    sapling_subtree_roots: Vec<SubtreeRootArtifact>,
     transaction_rows: Vec<FixtureTransactionRows>,
     transparent_outputs_by_outpoint: Vec<TransparentOutputArtifact>,
     transparent_spend_facts: Vec<TransparentSpendFact>,
@@ -477,7 +440,6 @@ impl ChainFixture {
             blocks: Vec::new(),
             compact_block_overrides: Vec::new(),
             tip_metadata_override: None,
-            sapling_subtree_roots: Vec::new(),
             transaction_rows: Vec::new(),
             transparent_outputs_by_outpoint: Vec::new(),
             transparent_spend_facts: Vec::new(),
@@ -569,7 +531,6 @@ impl ChainFixture {
                 .cloned()
                 .collect(),
             tip_metadata_override: None,
-            sapling_subtree_roots: Vec::new(),
             transaction_rows: Vec::new(),
             transparent_outputs_by_outpoint: Vec::new(),
             transparent_spend_facts: Vec::new(),
@@ -630,18 +591,6 @@ impl ChainFixture {
                 break;
             }
         }
-        self
-    }
-
-    /// Adds a Sapling subtree-root artifact to this fixture.
-    ///
-    /// Subtree roots are emitted by [`ChainFixture::chain_epoch_artifacts`]
-    /// alongside the synthetic Sapling root produced by
-    /// [`ChainFixture::synthetic_sapling_subtree_root`] when the chain is
-    /// non-empty.
-    #[must_use]
-    pub fn with_sapling_subtree_root(mut self, subtree_root: SubtreeRootArtifact) -> Self {
-        self.sapling_subtree_roots.push(subtree_root);
         self
     }
 
@@ -740,15 +689,6 @@ impl ChainFixture {
             .collect()
     }
 
-    /// Returns every block as a [`BlockBlobArtifact`] in ascending height order.
-    #[must_use]
-    pub fn block_blob_artifacts(&self) -> Vec<BlockBlobArtifact> {
-        self.blocks
-            .iter()
-            .map(FixtureBlock::block_blob_artifact)
-            .collect()
-    }
-
     /// Returns complete semantic replay envelopes for every block in ascending
     /// height order.
     #[must_use]
@@ -786,8 +726,7 @@ impl ChainFixture {
     /// Returns the complete ordered transaction rows used by canonical replay.
     ///
     /// Explicit transaction rows are merged with transparent output and spend
-    /// facts so production-store fixtures consume the same semantic source as
-    /// [`Self::chain_epoch_artifacts`].
+    /// facts so replay envelopes and compact blocks share one semantic source.
     #[must_use]
     pub(crate) fn canonical_transaction_rows(&self) -> Vec<FixtureTransactionRows> {
         build_fixture_transaction_rows(
@@ -865,31 +804,6 @@ impl ChainFixture {
             .collect()
     }
 
-    /// Returns the fixture tip as a tree-state checkpoint artifact.
-    #[must_use]
-    pub fn tree_state_checkpoint_artifacts(&self) -> Vec<TreeStateArtifact> {
-        self.blocks
-            .last()
-            .map(FixtureBlock::tree_state_checkpoint_artifact)
-            .into_iter()
-            .collect()
-    }
-
-    /// Returns one synthetic Sapling subtree-root artifact rooted at the
-    /// fixture tip, or `None` for an empty fixture. Useful as a placeholder
-    /// for tests that exercise the subtree-root read path.
-    #[must_use]
-    pub fn synthetic_sapling_subtree_root(&self) -> Option<SubtreeRootArtifact> {
-        let tip_block = self.blocks.last()?;
-        Some(SubtreeRootArtifact::new(
-            ShieldedProtocol::Sapling,
-            SubtreeRootIndex::new(0),
-            SubtreeRootHash::from_bytes([0x07; 32]),
-            tip_block.height,
-            tip_block.hash,
-        ))
-    }
-
     /// Builds the [`ChainEpoch`] descriptor that names this fixture as a
     /// canonical commit input.
     ///
@@ -911,99 +825,6 @@ impl ChainFixture {
                 .unwrap_or_else(ChainTipMetadata::empty),
             created_at: UnixTimestampMillis::new(FIXTURE_CHAIN_EPOCH_CREATED_AT_MILLIS),
         })
-    }
-
-    /// Builds a [`ChainEpochArtifacts`] commit value covering every block in
-    /// this fixture.
-    ///
-    /// Returns `None` for an empty fixture.
-    #[must_use]
-    pub fn chain_epoch_artifacts(&self, epoch_id: ChainEpochId) -> Option<ChainEpochArtifacts> {
-        let chain_epoch = self.chain_epoch(epoch_id)?;
-        let block_artifacts = self.block_header_artifacts();
-        let transaction_rows = self.canonical_transaction_rows();
-        let block_replay_envelopes = self.block_replay_envelopes_for(&transaction_rows);
-        let block_blob_artifacts = if self.raw_blob_retention.retains_block_blobs() {
-            self.block_blob_artifacts()
-        } else {
-            Vec::new()
-        };
-        let compact_block_artifacts = self.compact_block_artifacts();
-        let tree_state_checkpoint_artifacts = self.tree_state_checkpoint_artifacts();
-        let subtree_root_artifacts = self.subtree_root_artifacts();
-
-        let block_range = zinder_core::BlockHeightRange::inclusive(
-            BlockHeight::new(1),
-            chain_epoch.visible_tip_height,
-        );
-
-        let mut chain_epoch_artifacts = ChainEpochArtifacts::new(
-            chain_epoch,
-            block_artifacts,
-            block_replay_envelopes,
-            compact_block_artifacts,
-        )
-        .with_block_blobs(block_blob_artifacts)
-        .with_tree_states(tree_state_checkpoint_artifacts)
-        .with_subtree_roots(subtree_root_artifacts)
-        .with_reorg_window_change(ReorgWindowChange::Extend { block_range });
-        if !transaction_rows.is_empty() {
-            let mut block_transaction_index = Vec::with_capacity(transaction_rows.len());
-            let mut transaction_locations = Vec::with_capacity(transaction_rows.len());
-            let mut transaction_facts = Vec::with_capacity(transaction_rows.len());
-            let mut transaction_intrinsic_value_balances = Vec::new();
-            let mut transaction_blobs = Vec::new();
-            let mut transparent_outputs_by_outpoint = Vec::new();
-            for transaction_rows in &transaction_rows {
-                block_transaction_index.push(transaction_rows.block_transaction_index);
-                transaction_locations.push(transaction_rows.location);
-                transaction_facts.push(transaction_rows.facts.clone());
-                transparent_outputs_by_outpoint
-                    .extend(transaction_rows.transparent_output_artifacts());
-                if let Some(intrinsic_value_balances) =
-                    transaction_rows.intrinsic_value_balances_artifact()
-                {
-                    transaction_intrinsic_value_balances.push(intrinsic_value_balances);
-                }
-                if self.raw_blob_retention.retains_transaction_blobs()
-                    && let Some(blob) = &transaction_rows.blob
-                {
-                    transaction_blobs.push(blob.clone());
-                }
-            }
-            chain_epoch_artifacts =
-                chain_epoch_artifacts.with_block_transaction_index(block_transaction_index);
-            chain_epoch_artifacts =
-                chain_epoch_artifacts.with_transaction_locations(transaction_locations);
-            chain_epoch_artifacts = chain_epoch_artifacts.with_transaction_facts(transaction_facts);
-            chain_epoch_artifacts = chain_epoch_artifacts
-                .with_transaction_intrinsic_value_balances(transaction_intrinsic_value_balances);
-            chain_epoch_artifacts = chain_epoch_artifacts.with_transaction_blobs(transaction_blobs);
-            chain_epoch_artifacts = chain_epoch_artifacts
-                .with_transparent_outputs_by_outpoint(transparent_outputs_by_outpoint);
-        }
-        if !self.transparent_spend_facts.is_empty() {
-            chain_epoch_artifacts = chain_epoch_artifacts
-                .with_transparent_spend_facts(self.transparent_spend_facts.clone());
-        }
-        Some(chain_epoch_artifacts)
-    }
-
-    /// Returns the subtree-root artifacts associated with this fixture in
-    /// commit-ready order.
-    ///
-    /// Defaults to one synthetic Sapling root rooted at the tip when the
-    /// fixture is non-empty and no explicit roots have been added. Calling
-    /// [`ChainFixture::with_sapling_subtree_root`] replaces the synthetic
-    /// default with the explicit set.
-    #[must_use]
-    pub fn subtree_root_artifacts(&self) -> Vec<SubtreeRootArtifact> {
-        if !self.sapling_subtree_roots.is_empty() {
-            return self.sapling_subtree_roots.clone();
-        }
-        self.synthetic_sapling_subtree_root()
-            .map(|subtree_root| vec![subtree_root])
-            .unwrap_or_default()
     }
 }
 
@@ -1128,28 +949,17 @@ mod tests {
     }
 
     #[test]
-    fn chain_epoch_artifacts_cover_every_block_and_tip_checkpoint() -> Result<(), Box<dyn Error>> {
+    fn fixture_artifacts_cover_every_block_and_tip_epoch() -> Result<(), Box<dyn Error>> {
         let fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(4);
-        let chain_epoch_artifacts = fixture
-            .chain_epoch_artifacts(ChainEpochId::new(7))
-            .ok_or("chain epoch artifacts should be available for a 4-block fixture")?;
+        let chain_epoch = fixture
+            .chain_epoch(ChainEpochId::new(7))
+            .ok_or("chain epoch should be available for a 4-block fixture")?;
 
-        assert_eq!(chain_epoch_artifacts.block_headers.len(), 4);
-        assert_eq!(chain_epoch_artifacts.block_replay_envelopes.len(), 4);
-        assert_eq!(chain_epoch_artifacts.compact_blocks.len(), 4);
-        assert_eq!(chain_epoch_artifacts.tree_states.len(), 1);
-        assert_eq!(
-            chain_epoch_artifacts.tree_states[0].height,
-            BlockHeight::new(4)
-        );
-        assert_eq!(
-            chain_epoch_artifacts.chain_epoch.visible_tip_height.value(),
-            4
-        );
-        assert_eq!(
-            chain_epoch_artifacts.chain_epoch.network,
-            Network::ZcashRegtest
-        );
+        assert_eq!(fixture.block_header_artifacts().len(), 4);
+        assert_eq!(fixture.block_replay_envelopes().len(), 4);
+        assert_eq!(fixture.compact_block_artifacts().len(), 4);
+        assert_eq!(chain_epoch.visible_tip_height.value(), 4);
+        assert_eq!(chain_epoch.network, Network::ZcashRegtest);
 
         Ok(())
     }
@@ -1185,12 +995,9 @@ mod tests {
             .with_transaction_rows(second_transaction)
             .with_transaction_rows(first_transaction);
 
-        let artifacts = fixture
-            .chain_epoch_artifacts(ChainEpochId::new(1))
-            .ok_or("fixture must build a chain epoch")?;
+        let replay_envelopes = fixture.block_replay_envelopes();
         let replay = decode_canonical_block_replay(
-            artifacts
-                .block_replay_envelopes
+            replay_envelopes
                 .first()
                 .ok_or("replay envelopes must contain block 1")?
                 .as_bytes(),
@@ -1209,14 +1016,14 @@ mod tests {
             replay.facts().transactions[1].intrinsic_value_balances,
             intrinsic_value_balances
         );
-        assert_eq!(artifacts.transaction_intrinsic_value_balances.len(), 2);
-        assert_eq!(artifacts.transaction_blobs.len(), 2);
+        let transaction_blobs = fixture
+            .canonical_transaction_rows()
+            .into_iter()
+            .filter_map(|transaction_rows| transaction_rows.blob)
+            .collect::<Vec<_>>();
+        assert_eq!(transaction_blobs.len(), 2);
         assert_eq!(
-            artifacts.block_blobs[0].raw_block_bytes,
-            block.raw_block_bytes
-        );
-        assert_eq!(
-            artifacts.transaction_blobs[1].raw_transaction_bytes,
+            transaction_blobs[1].raw_transaction_bytes,
             b"retained-transaction"
         );
 
