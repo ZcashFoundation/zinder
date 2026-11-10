@@ -5,11 +5,14 @@
 
 use eyre::eyre;
 use zinder_core::{BlockHeight, Network, TransactionId, TxStatus};
-use zinder_query::{QueryError, WalletQueryApi};
-use zinder_store::RawBlobRetention;
-use zinder_testkit::{ChainFixture, FixtureTransactionRows};
+use zinder_query::{ArtifactKey, QueryError, WalletQueryApi};
+use zinder_store::{ArtifactFamily, RawBlobRetention};
+use zinder_testkit::{
+    CanonicalBaseline, CanonicalWriterFixture, ChainFixture, FixtureTransactionRows,
+    sample_regtest_upgrade_activations,
+};
 
-use crate::common::serving_query_over;
+use crate::common::{serving_query_from, serving_query_over};
 
 const RAW_TRANSACTION_BYTES: &[u8] = b"raw-transaction-bytes";
 
@@ -77,6 +80,52 @@ async fn compact_block_at_reports_unavailable_for_missing_height() -> eyre::Resu
     assert!(
         matches!(error, QueryError::ArtifactUnavailable { .. }),
         "unexpected missing-height error: {error:?}"
+    );
+
+    Ok(())
+}
+
+/// A checkpointed store retains blocks only above its history floor.
+#[tokio::test]
+async fn compact_block_at_reports_unavailable_below_checkpoint() -> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+    let floor_height = BlockHeight::new(2);
+    let first_retained_block = chain
+        .block_at(BlockHeight::new(3))
+        .cloned()
+        .ok_or_else(|| eyre!("fixture must contain height 3"))?;
+    let writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain).with_history_floor(floor_height),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let (wallet_query, _store_fixture) = serving_query_from(writer.into_serving_store_fixture()?)?;
+
+    for height in [BlockHeight::new(1), floor_height] {
+        let error = match wallet_query.compact_block_at(height, None).await {
+            Ok(response) => {
+                return Err(eyre!(
+                    "expected unavailable below the floor at {height:?}, got {response:?}"
+                ));
+            }
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                QueryError::ArtifactUnavailable {
+                    family: ArtifactFamily::CompactBlock,
+                    key: ArtifactKey::BlockHeight(missing),
+                } if missing == height
+            ),
+            "unexpected below-floor error at {height:?}: {error:?}"
+        );
+    }
+    let retained = wallet_query
+        .compact_block_at(first_retained_block.height, None)
+        .await?;
+    assert_eq!(
+        retained.compact_block.block_hash(),
+        first_retained_block.hash
     );
 
     Ok(())

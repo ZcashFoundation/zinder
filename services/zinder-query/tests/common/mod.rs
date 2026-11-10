@@ -56,12 +56,21 @@ pub fn serving_pair_slot(
 pub fn serving_query_over(
     chain: &ChainFixture,
 ) -> eyre::Result<(WalletServingQuery<()>, WalletServingStoreFixture)> {
-    let activations = Arc::new(sample_regtest_upgrade_activations());
-    let mut store_fixture = WalletServingStoreFixture::from_chain(chain, &activations)?;
+    serving_query_from(WalletServingStoreFixture::from_chain(
+        chain,
+        &sample_regtest_upgrade_activations(),
+    )?)
+}
+
+/// Builds the release serving query, without a node source, over the
+/// readers of `store_fixture`.
+pub fn serving_query_from(
+    mut store_fixture: WalletServingStoreFixture,
+) -> eyre::Result<(WalletServingQuery<()>, WalletServingStoreFixture)> {
     let query = WalletServingQuery::from_serving_pair_slot(
         serving_pair_slot(&mut store_fixture)?,
         (),
-        activations,
+        Arc::new(sample_regtest_upgrade_activations()),
     );
     Ok((query, store_fixture))
 }
@@ -79,14 +88,24 @@ pub type NativeServingQueryFixture = (
 pub async fn native_serving_query_over(
     chain: &ChainFixture,
 ) -> eyre::Result<NativeServingQueryFixture> {
-    let activations = Arc::new(sample_regtest_upgrade_activations());
-    let mut store_fixture = WalletServingStoreFixture::from_chain(chain, &activations)?;
+    native_serving_query_from(WalletServingStoreFixture::from_chain(
+        chain,
+        &sample_regtest_upgrade_activations(),
+    )?)
+    .await
+}
+
+/// Builds the native release query over the readers of `store_fixture`,
+/// admitted against the standard in-process ingest-control fixture.
+pub async fn native_serving_query_from(
+    mut store_fixture: WalletServingStoreFixture,
+) -> eyre::Result<NativeServingQueryFixture> {
     let (ingest_control, ingest_control_fixture) = admitted_ingest_control_fixture().await?;
     let query = WalletServingQuery::from_admitted_native_serving_pair(
         serving_pair_slot(&mut store_fixture)?,
         (),
         ingest_control,
-        activations,
+        Arc::new(sample_regtest_upgrade_activations()),
     );
     Ok((query, store_fixture, ingest_control_fixture))
 }

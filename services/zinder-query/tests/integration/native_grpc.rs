@@ -17,7 +17,7 @@ use tonic::{Code, Request, Response, Status, transport::Server};
 use tonic_types::StatusExt;
 use zinder_core::wire::{encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex};
 use zinder_core::{
-    ChainEpoch, ChainEpochId, MAX_SUBTREE_ROOTS_PER_REQUEST, Network, TransactionId,
+    BlockHeight, ChainEpoch, ChainEpochId, MAX_SUBTREE_ROOTS_PER_REQUEST, Network, TransactionId,
     TransparentAddressScriptHash, TransparentOutPoint, TransparentUnspentOutput,
 };
 use zinder_proto::capabilities::{
@@ -44,18 +44,19 @@ use zinder_query::{
     WalletServingQuery, WalletServingReadPair,
 };
 use zinder_store::{
-    EventStreamStartPosition, RawBlobRetention, chain_view_message, event_stream_start_message,
+    EventStreamStartPosition, RawBlobRetention, StreamCursorTokenV1, chain_view_message,
+    event_stream_start_message,
 };
 use zinder_testkit::{
-    ChainFixture, FixtureTransactionRows, MockTransactionBroadcaster, WalletServingStoreFixture,
-    sample_regtest_upgrade_activations,
+    CanonicalBaseline, CanonicalWriterFixture, ChainFixture, FixtureTransactionRows,
+    MockTransactionBroadcaster, WalletServingStoreFixture, sample_regtest_upgrade_activations,
 };
 
 /// Operational upper bound used to prove that ingest-control establishment is finite without
 /// exposing the implementation timeout as public API.
 const TEST_ADVANCE_PAST_INGEST_CONTROL_REQUEST_BOUND: Duration = Duration::from_mins(1);
 
-use crate::common::native_serving_query_over;
+use crate::common::{native_serving_query_from, native_serving_query_over};
 
 #[tokio::test]
 async fn ingest_control_admission_accepts_exact_runtime_identity_and_capabilities()
@@ -466,6 +467,90 @@ async fn native_grpc_service_streams_chain_events_from_the_store() -> eyre::Resu
     assert!(!first_event.cursor.is_empty());
 
     Ok(())
+}
+
+/// A cursor whose next event was pruned from the canonical store expires.
+///
+/// The cursor is taken from a serving pair before the writer prunes; a pair
+/// admitted after the prune reports it expired with the new retention floor.
+#[tokio::test]
+async fn native_grpc_service_expires_pruned_chain_event_cursors() -> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+    let mut writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain).through(BlockHeight::new(1)),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    writer.append_live_block(&chain)?;
+    writer.append_live_block(&chain)?;
+    let (before_prune, _before_prune_store, _before_prune_ingest_control) =
+        native_serving_query_from(writer.serving_store_fixture()?).await?;
+    let first_cursor = earliest_chain_event_cursor(&WalletQueryGrpcAdapter::new(
+        before_prune,
+        WalletEndpointMetadata::default(),
+    ))
+    .await?;
+
+    let retention = writer.prune_canonical_events_before(3)?;
+    assert_eq!(retention.oldest_retained_sequence, 3);
+    let (after_prune, _after_prune_store, _after_prune_ingest_control) =
+        native_serving_query_from(writer.serving_store_fixture()?).await?;
+    let grpc_adapter = WalletQueryGrpcAdapter::new(after_prune, WalletEndpointMetadata::default());
+    let request = Request::new(wallet::ChainEventsRequest {
+        start: Some(event_stream_start_message(
+            &EventStreamStartPosition::AfterCursor(StreamCursorTokenV1::from_bytes(first_cursor)),
+        )),
+        family: wallet::ChainEventStreamFamily::Visible as i32,
+        address_filter: Vec::new(),
+    });
+    let status = match WalletQueryService::chain_events(&grpc_adapter, request).await {
+        Err(status) => status,
+        Ok(response) => match response.into_inner().next().await {
+            Some(Err(status)) => status,
+            Some(Ok(event)) => return Err(eyre!("expected cursor expiry, got event {event:?}")),
+            None => return Err(eyre!("chain-events stream closed before cursor error")),
+        },
+    };
+    let details = status.get_error_details();
+    let violation = details
+        .precondition_failure()
+        .and_then(|failure| failure.violations.first())
+        .cloned();
+
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert!(
+        matches!(
+            &violation,
+            Some(violation)
+                if violation.r#type == "CHAIN_EVENT_CURSOR_EXPIRED"
+                    && violation.subject == "chain_event:1"
+                    && violation.description.contains('3')
+        ),
+        "unexpected cursor-expiry violation: {violation:?}"
+    );
+
+    Ok(())
+}
+
+/// Returns the cursor of the first event retained by the adapter's store.
+async fn earliest_chain_event_cursor(grpc_adapter: &NativeServingAdapter) -> eyre::Result<Vec<u8>> {
+    let mut event_stream = WalletQueryService::chain_events(
+        grpc_adapter,
+        Request::new(wallet::ChainEventsRequest {
+            start: Some(event_stream_start_message(
+                &EventStreamStartPosition::EarliestRetained,
+            )),
+            family: wallet::ChainEventStreamFamily::Visible as i32,
+            address_filter: Vec::new(),
+        }),
+    )
+    .await?
+    .into_inner();
+    let first_event = event_stream
+        .next()
+        .await
+        .ok_or_else(|| eyre!("chain-events stream closed before the first event"))??;
+    assert_eq!(first_event.event_sequence, 1);
+    Ok(first_event.cursor)
 }
 
 #[tokio::test]
