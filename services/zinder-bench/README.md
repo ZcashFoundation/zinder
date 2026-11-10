@@ -1,19 +1,17 @@
 # zinder-bench
 
 Fixed-range capture and storage benchmark harness for measuring Zinder against
-identical source bytes. It drives canonical-store range replay
-and two backend-neutral canonical-replay round trips: one sorted external SST
-ingestion for `RocksDB` and binary `COPY` with deferred index construction for
-PostgreSQL.
+identical source bytes. It replays captured fixtures into a fresh production
+canonical `RocksDB` store and drives two backend-neutral canonical-replay round
+trips: one sorted external SST ingestion for `RocksDB` and binary `COPY` with
+deferred index construction for PostgreSQL.
 
-The captured fixture is the common input for all three arms. Canonical-store
-range replay also requires a matching starting canonical store supplied by the
-operator. Canonical storage arms create fresh candidate storage and compare every
+The captured fixture is the common input for every fixture-driven command.
+Canonical storage arms create fresh candidate storage and compare every
 persisted semantic replay envelope against the fixture's ordered digest oracle.
 
 `zinder-bench` is a standalone binary. It links `zinder-ingest` and drives its
-real bulk-catchup pipeline (block prepare, reassembly, commit); it never ships
-inside a production image.
+real canonical construction pipeline; it never ships inside a production image.
 
 Use the [storage benchmark environment](../../deploy/storage-benchmark.md) for
 the resource-bounded Docker Compose topology and repeatable storage-candidate
@@ -126,50 +124,6 @@ load, publication, cold reopen, and full-scan certification. They are not
 isolated ingest timings, and the report records the fixed arm execution order
 so cache effects remain visible.
 
-## 2. Snapshot the starting store
-
-The replay needs a canonical store already populated up to `from_height - 1`, so
-the ordered prevout resolver can resolve spends of outputs created before the
-captured range against the cold store. The operator supplies this clone; the
-harness does not snapshot a live store for you.
-
-For an unthresholded exploratory run, copy a stopped store directory while
-excluding its materialized view subdirectory:
-
-```bash
-rsync -a --exclude '/materialized-views/' /var/lib/zinder/ ./fixtures/store-149999/
-```
-
-For a threshold-bearing run, stop the canonical writer and clone its primary
-store while no Zinder process has it open:
-
-```bash
-systemctl stop zinder
-rsync -a /var/lib/zinder/canonical/ ./fixtures/store-149999/
-systemctl start zinder
-```
-
-This stopped-store copy is a benchmark fixture, not a production recovery
-artifact. Production recovery remains blocked until the canonical writer and
-wallet projector can publish and verify one coherent, schema-admitted checkpoint
-bundle. The clone's canonical tip must equal `from_height - 1`. Replay writes
-into the clone, so use one throwaway copy per run (or per configuration in a
-sweep).
-
-Threshold-bearing non-genesis ranges require a benchmark-only
-`zinder-benchmark-starting-store.json` beside the cloned canonical store. The
-harness hashes it before opening the store and verifies its network,
-`ChainEpochId`, tip height, tip hash, and artifact schema against the opened
-canonical store. This manifest is recorded after making the stopped-store copy;
-it is not a recovery manifest. A thresholded fixture beginning at height 1
-instead requires a genuinely empty store and does not require a manifest. The
-report distinguishes `empty`, `checkpoint`, and `unverified-clone` starting
-states, so a missing manifest cannot masquerade as verified benchmark
-provenance. The manifest proves the clone's logical starting position; it does
-not prove byte-identical SST layout or compaction state. Formal sweeps must
-create every throwaway arm from the same stopped-store directory.
-Unthresholded manual clones may omit the manifest.
-
 When the harness runs inside Docker Desktop, place RocksDB stores on named
 Linux volumes rather than host bind mounts. The macOS virtiofs path can report
 direct-I/O support while producing padded SST file sizes that fail RocksDB
@@ -177,109 +131,7 @@ manifest validation on reopen. Bind mounts remain appropriate for immutable
 fixture inputs and JSON reports; the writable canonical and materialized-view stores
 must use the container VM's ext4-backed named volumes.
 
-## 3. Run canonical-store range replay
-
-```bash
-zinder-bench canonical-store-range-replay \
-  --fixture ./fixtures/mainnet-150k-200k \
-  --store ./fixtures/store-149999 \
-  --block-prepare-concurrency 16 \
-  --software-revision "$(git rev-parse HEAD)" \
-  --trial-id trial-01 \
-  --fixture-cache-policy warm \
-  --runner-id linux-amd64-c8-m16-nvme-01 \
-  --cpu-limit-cores 8 \
-  --memory-limit-bytes 17179869184 \
-  --storage-class local-nvme \
-  --image-reference "zinder-bench@sha256:<64-hex-digest>" \
-  --report ./report-c16.json
-```
-
-Sweep the knobs the backlog calls out by varying flags across otherwise
-identical runs (each against a fresh store clone):
-
-- `--block-prepare-concurrency 4|8|12|24` for the prepare-concurrency sweep.
-- `--max-response-bytes <N>` for the hard source-response limit.
-- `--source-segment-max-blocks <N>` and
-  `--source-segment-target-response-bytes <N>` for the adaptive segment
-  planner's starting ceiling and response-size target.
-- `--source-fetch-max-in-flight-requests <N>` for the source request-count
-  ceiling.
-- `--source-fetch-max-in-flight-bytes <N>` to override the aggregate byte
-  watermark for concurrent source-segment responses. For example, compare the
-  live 10 GB runtime-derived baseline of `156249984` bytes with `402653184`
-  bytes.
-- `--block-prepare-memory-watermark-bytes <N>` for the downstream canonical
-  preparation watermark.
-- `--source-segment-delay-millis <N>` to add the same delay to every fixture
-  segment response, which makes transport-latency A/B runs repeatable without
-  changing the captured bytes.
-- `--block-cache-bytes <N>` for the canonical block-cache-size sweep.
-
-The source-planner controls exercise the source lane shared by production bulk
-catchup and canonical construction. This command
-still commits into `PrimaryChainStore`, so its results isolate source planning,
-admission, and downstream supply; they do not certify canonical construction
-or the complete service composition. End-to-end canonical-construction evidence
-requires a separate checkpointed fixture replay with the authenticated
-predecessor tree checkpoint needed by the canonical builder.
-
-The command validates the effective limits as one set before replay. It rejects
-a segment response target above the hard response limit and a source byte
-watermark below that limit.
-
-The source-planner arm reproduces the canary's effective limits with these
-flags. This example is the zero-delay baseline; set the final flag to the
-measured delay for the latency arm:
-
-```bash
-zinder-bench canonical-store-range-replay \
-  --fixture ./fixtures/mainnet-dense-range \
-  --store ./fixtures/store-before-dense-range \
-  --block-prepare-concurrency 10 \
-  --max-response-bytes 67108864 \
-  --source-segment-max-blocks 64 \
-  --source-segment-target-response-bytes 33554432 \
-  --source-fetch-max-in-flight-requests 12 \
-  --source-fetch-max-in-flight-bytes 156249984 \
-  --block-prepare-memory-watermark-bytes 156249984 \
-  --source-segment-delay-millis 0
-```
-
-`--software-revision` identifies the source revision. `--image-reference` must
-be either a `sha256:<64-hex>` container image ID or a digest-pinned image
-reference containing `@sha256:<64-hex>`; mutable tags are rejected.
-`--runner-id` is only a stable operator label. The report separately records
-`--cpu-limit-cores`, `--memory-limit-bytes`, and `--storage-class`, plus the
-effective writer schema, full RocksDB budget, and durability posture. Every
-threshold-bearing run requires all of this provenance and an installed metrics
-recorder. Exploratory unthresholded runs may omit it.
-
-The only acceptance boundary this command currently drives is canonical
-fixture replay: the timed call replays exactly the captured range into the
-supplied canonical store. It does not open, build, validate, or promote a
-fresh database, so it is not a fresh canonical construction lifecycle. Opt in
-with the paired flags:
-
-- `--canonical-fixture-replay-target-secs`;
-- `--canonical-fixture-replay-hard-limit-secs`.
-
-The target must be positive and no greater than the hard limit. The
-report validates final height, fixture-order tip hash, committed block count,
-and required telemetry before evaluating time. Production snapshot restore,
-canonical-replay-storage canonical construction, materialized view construction, following, and
-wallet readiness gain report fields only when their real drivers own those
-full boundaries.
-
-The harness writes the JSON report before enforcing acceptance, but creates the
-path exclusively and refuses to replace existing evidence. A completion,
-telemetry, or hard-limit failure then makes the command exit non-zero. A
-target-only miss remains successful so operators can compare performance inside
-the accepted hard boundary. Choose a new report path for every run.
-
-Omit `--report` to print the JSON to stdout (progress logs go to stderr).
-
-## 4. Measure a complete RocksDB storage lifecycle
+## 2. Measure a complete RocksDB storage lifecycle
 
 `rocksdb-storage-lifecycle` builds fresh canonical and wallet stores from an existing
 Zebra. It freezes one source tip, retains every non-genesis canonical block,
@@ -309,8 +161,8 @@ zinder-bench rocksdb-storage-lifecycle \
 The closed lifecycle derives its source and block-preparation limits from the
 declared CPU and memory envelope plus `--max-response-bytes`; it does not accept
 independent pipeline tuning flags. The report validator recomputes those limits
-before accepting evidence. Diagnostic parameter sweeps belong to the captured
-fixture replay command.
+before accepting evidence. Diagnostic parameter sweeps belong to
+`rocksdb-canonical-fixture-replay`.
 
 The report exposes two independent acceptance measurements:
 
@@ -329,7 +181,7 @@ phase durations, row and digest evidence, external-sort evidence, physical
 bytes, and peak process RSS. It certifies storage readiness only; it does not
 claim query compatibility, service startup, live following, or reorg execution.
 
-## 5. Compare canonical-replay storage engines
+## 3. Compare canonical-replay storage engines
 
 The canonical-replay-storage commands parse the same fixture into the same complete
 `CanonicalBlockFacts` values. Each engine writes the same independently
@@ -432,21 +284,19 @@ component diagnostics in the external resource artifacts.
   `benchmark-report`; missing or earlier identities are rejected.
 - `report_format_version`: machine-readable report contract version. The
   closed measurement contract described here is version 3.
-- `measurement_kind`: `canonical-store-range-replay`,
-  `rocksdb-canonical-fixture-replay`, `canonical-replay-storage`, or a
-  storage-lifecycle report. The tagged shape prevents block-local replay evidence from
-  acquiring placeholder lifecycle or canonical-store range-replay telemetry fields.
+- `measurement_kind`: `rocksdb-canonical-fixture-replay`,
+  `canonical-replay-storage`, or `rocksdb-storage-lifecycle`. The tagged shape
+  prevents block-local replay evidence from acquiring placeholder lifecycle or
+  canonical-construction fields.
 - `provenance`: benchmark version, software revision, immutable image identity,
   build target OS/architecture, structured runner identity and resources, plus
   `run.trial_id`, `run.fixture_cache_policy`, and binary-generated start and
   completion Unix-millisecond timestamps.
-- `storage_candidate`: identifies `rocksdb-canonical-store-range-replay`,
-  `rocksdb-canonical-replay-storage`, or `postgres-canonical-replay-storage`, including the logical model
-  and the `rocksdb-single-host` or `postgres-scale-out` topology represented by
-  that arm. This is candidate identity, not topology certification.
-- `acceptance.canonical_fixture_replay`: `fixture-range` wall time and optional
-  target/hard-limit evaluation. It is the only current acceptance boundary.
-  There are no placeholder production lifecycle fields.
+- `storage_candidate`: identifies `rocksdb-canonical-fixture-replay`,
+  `rocksdb-storage-lifecycle`, `rocksdb-canonical-replay-storage`, or
+  `postgres-canonical-replay-storage`, including the logical model and the
+  `rocksdb-single-host` or `postgres-scale-out` topology represented by that
+  arm. This is candidate identity, not topology certification.
 - `fixture.contract_identity`, `fixture.fixture_format_version`,
   `fixture.canonical_artifact_schema_version`,
   `fixture.canonical_block_facts_digest_evidence`, `fixture.tip_hash_hex`, and
@@ -456,16 +306,12 @@ component diagnostics in the external resource artifacts.
   exact identity `canonical-fixture`; earlier numeric versions are refused.
 - `fixture.workload_density`: the immutable workload totals and per-block
   maxima copied from the captured fixture manifest.
-- `replay.wall_clock_seconds`, `replay.blocks_committed`,
-  `replay.blocks_per_second`: throughput over the range.
-- `replay.max_response_bytes`, `replay.source_segment_max_blocks`,
-  `replay.source_segment_target_response_bytes`,
-  `replay.source_fetch_max_in_flight_requests`,
-  `replay.source_fetch_max_in_flight_bytes`,
-  `replay.block_prepare_memory_watermark_bytes`, and
-  `replay.source_segment_delay_millis`: the exact source-planner, admission,
-  preparation, and deterministic delay settings used by the run.
-- `replay.source_fetch_attribution`: completed segment requests, request and
+- Canonical-fixture `total_seconds` and `blocks_per_second`: the complete
+  measured lifecycle and its end-to-end loaded-block rate.
+- Canonical-fixture `resource_limits`: the CPU and memory envelope, the exact
+  source-planner, admission, preparation, and deterministic delay settings, and
+  the canonical `RocksDB` budget used by the run.
+- Canonical-fixture `source_fetch_attribution`: completed segment requests, request and
   payload rates over replay wall time, cumulative concurrent request-task
   seconds, adaptive restart counts, and speculative discard totals. Total
   connected blocks and response payload bytes include completed responses that
@@ -482,34 +328,12 @@ component diagnostics in the external resource artifacts.
   `trusted-fresh-writer` or `cold-certification`. `publication_family_scans`
   must be empty for the trusted fresh-writer path and must contain successful
   cache-bypassing scans grouped by column family for cold certification.
-- `replay.starting_canonical_state`: the opened store's `chain_epoch_id`, tip
-  height, RPC-order tip hash, artifact schema version, checkpoint-manifest
-  SHA-256, and `empty`, `checkpoint`, or `unverified-clone` provenance kind.
-  The manifest digest identifies the manifest, not physical SST or compaction
-  layout.
-- `replay.tip_height_after`, `replay.tip_hash_after_hex`: final fixture range
-  position. The hash uses the same internal-byte-order hex as
-  `fixture.tip_hash_hex`; thresholded acceptance requires both to match.
-- `replay.canonical_writer`: actual canonical store/artifact schema versions,
-  sync-write and WAL/fsync durability mode, and the complete effective RocksDB
-  resource budget, including the default cache size when no override is given.
-- `replay.epochs_committed`: committed chain epochs, or `null` when its metric
-  family was not covered.
-- `replay.commit_fallback_reads`: commit-fallback read calls, or `null` without
-  explicit store-read telemetry coverage. Thresholded acceptance requires both
-  telemetry values.
-- `replay.peak_rss`: peak resident bytes (Linux `/proc/self/status` `VmHWM`;
-  reported as unavailable off Linux).
-- `store_reads`: per-caller canonical-store read call counts and cumulative
-  histogram seconds, keyed by caller (`block_prefetch`, `commit_fallback`,
-  `materialized_view_hydration`, `retention_sweep`, `query`), table, and operation.
-- `multi_get`: per-caller requested and resolved key totals.
+- `benchmark_client_peak_rss`: peak resident bytes (Linux
+  `/proc/self/status` `VmHWM`; reported as unavailable off Linux).
 - `stage_durations`: cumulative task seconds and call counts for block-prepare
   stages (`canonical_block_prepare`, `transparent_prevout_resolve`) and
   canonical-construction stages (`block_parse`, `identity_validation`, `compact_artifacts`,
   `transaction_facts`, `block_header_artifact`, `block_blob`, and `block_replay`).
-- `rocksdb_tickers`: exported `RocksDB` statistics tickers (bloom, block cache,
-  bytes read/written, stall micros, compaction bytes) per store role.
 - `round_trip`: block-local replay wall time plus shared initialization, preparation,
   persistence, index-construction, storage-optimization, validation,
   publication, fresh-reader-validation, and storage-measurement phase times. Any
@@ -545,18 +369,11 @@ roots, and complete report-window coverage for every component.
   Zebra response generation, network jitter, or JSON and hexadecimal decoding.
   Fixture replay parses only the block header before handing the payload to
   canonical preparation, matching the production batch-source boundary.
-  Everything downstream runs the production bulk-catchup pipeline against
-  `PrimaryChainStore`; canonical construction shares the source planner but not
-  this command's canonical storage boundary.
+  Everything downstream runs the production canonical construction pipeline.
 - Each shielded protocol's complete subtree-root prefix through the fixed tip is
   captured from index zero. Every root carries the exact block identity that
   completed it; identities inside the fixture range are checked against the
   captured block bytes before replay.
-- Sparse tree-state checkpoints are not captured; the fixture source does not
-  advertise the tree-state capability, so the pipeline skips them. They are not
-  on the transparent hot path the backlog targets.
-- The bulk-catchup configuration uses production-representative defaults from
-  `zinder_ingest::bench_support`; only the swept knobs vary between runs.
 - Canonical replay storage runs use the production block parser and complete
   `CanonicalBlockFacts` semantic replay format, but their physical schemas are
   diagnostic vertical slices rather than production canonical stores.

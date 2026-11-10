@@ -1,4 +1,4 @@
-# Resource-bounded storage environment for canonical-store range replay and canonical-replay-storage measurements.
+# Resource-bounded storage environment for canonical-replay-storage measurements.
 #
 # This file stays separate from deploy/docker-compose.yml. The application
 # deployment owns long-running Zinder services; this topology owns disposable
@@ -6,69 +6,6 @@
 name: ${ZINDER_BENCH_PROJECT_NAME:-zinder-storage-benchmark}
 
 services:
-  rocksdb-canonical-store-range-replay:
-    image: ${ZINDER_BENCH_IMAGE:?set ZINDER_BENCH_IMAGE to an immutable image ID or digest-pinned reference}
-    profiles: [oracle, comparison]
-    restart: "no"
-    init: true
-    cgroup: private
-    cpus: ${ZINDER_BENCH_ROCKSDB_RANGE_REPLAY_CPUS:-8.0}
-    mem_limit: ${ZINDER_BENCH_ROCKSDB_RANGE_REPLAY_MEMORY_LIMIT_BYTES:-17179869184}
-    networks: [storage-benchmark]
-    ulimits:
-      nofile:
-        soft: 1048576
-        hard: 1048576
-    volumes:
-      - type: bind
-        source: ${ZINDER_BENCH_FIXTURE_PATH:-../fixtures/mainnet-150k-200k}
-        target: /benchmark/fixture
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${ZINDER_BENCH_START_STORE_PATH:-../fixtures/store-149999}
-        target: /benchmark/start-store
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${ZINDER_BENCH_RESULTS_PATH:-../benchmark-results}
-        target: /benchmark/results
-        bind:
-          create_host_path: false
-      - type: volume
-        source: rocksdb-canonical-store-range-replay-store
-        target: /var/lib/zinder/benchmark-store
-        volume:
-          nocopy: true
-    command:
-      - canonical-store-range-replay
-      - --fixture
-      - /benchmark/fixture
-      - --store
-      - /var/lib/zinder/benchmark-store
-      - --block-prepare-concurrency
-      - ${ZINDER_BENCH_BLOCK_PREPARE_CONCURRENCY:-16}
-      - --software-revision
-      - ${ZINDER_BENCH_SOFTWARE_REVISION:?set ZINDER_BENCH_SOFTWARE_REVISION to the exact tested revision}
-      - --trial-id
-      - ${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}
-      - --fixture-cache-policy
-      - ${ZINDER_BENCH_FIXTURE_CACHE_POLICY:?set ZINDER_BENCH_FIXTURE_CACHE_POLICY to warm or cold}
-      - --runner-id
-      - ${ZINDER_BENCH_RUNNER_ID:?set ZINDER_BENCH_RUNNER_ID to the immutable hardware, storage, and resource profile identity}
-      - --cpu-limit-cores
-      - ${ZINDER_BENCH_ROCKSDB_RANGE_REPLAY_CPUS:-8.0}
-      - --memory-limit-bytes
-      - ${ZINDER_BENCH_ROCKSDB_RANGE_REPLAY_MEMORY_LIMIT_BYTES:-17179869184}
-      - --storage-class
-      - ${ZINDER_BENCH_STORAGE_CLASS:?set ZINDER_BENCH_STORAGE_CLASS to the measured volume and host storage class}
-      - --image-reference
-      - ${ZINDER_BENCH_IMAGE}
-      - --report
-      - /benchmark/results/rocksdb-canonical-store-range-replay-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID:?set ZINDER_BENCH_TRIAL_ID to the unique campaign trial label}.json
-
   rocksdb-canonical-replay-storage:
     image: ${ZINDER_BENCH_IMAGE:?set ZINDER_BENCH_IMAGE to an immutable image ID or digest-pinned reference}
     profiles: [rocksdb, comparison]
@@ -321,6 +258,5 @@ networks:
   postgres-host-access:
 
 volumes:
-  rocksdb-canonical-store-range-replay-store:
   rocksdb-canonical-replay-storage-store:
   postgres-data:

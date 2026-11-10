@@ -150,17 +150,17 @@ Perf tests should capture at least these output metrics per corpus range:
 
 ## Benchmark Method
 
-Use `zinder-bench` fixed-range replay over captured ranges from the benchmark
-corpus. The current path prepares canonical records through
-`prepare_canonical_block`, persists them under the selected raw-blob policy,
-and reports source, preparation, commit, storage, and resource measurements.
-Historical one-off timings do not belong in this architecture contract because
-they bind the result to an obsolete implementation and one machine.
+Use `zinder-bench rocksdb-canonical-fixture-replay` over captured ranges from
+the benchmark corpus. It loads the authenticated fixture through the production
+canonical construction pipeline into a fresh canonical `RocksDB` store and
+reports source, preparation, storage, and resource measurements. Historical
+one-off timings do not belong in this architecture contract because they bind
+the result to an obsolete implementation and one machine.
 
-Compare the same fixture digest, store state, retention policy, resource
-limits, and preparation concurrency. Use `stage_durations`,
-`replay.blocks_per_second`, `commit_fallback_reads`, logical and physical byte
-counts, and peak resident memory to locate a regression. Include the heavy
+Compare the same fixture digest, retention policy, resource limits, and
+preparation concurrency. Use `stage_durations`, `blocks_per_second`,
+`source_fetch_attribution`, logical and physical byte counts, and peak resident
+memory to locate a regression. Include the heavy
 Orchard, heavy Sapling, transparent-input, activation-boundary, and end-side
 ranges so one workload shape cannot hide a regression in another.
 

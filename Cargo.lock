@@ -5679,7 +5679,6 @@ dependencies = [
  "futures-util",
  "hex",
  "jsonrpsee",
- "metrics",
  "metrics-exporter-prometheus",
  "parking_lot",
  "prost",

@@ -70,13 +70,6 @@ pub enum BenchError {
         /// Engine-specific failure description without credentials.
         reason: String,
     },
-    /// The bulk-catchup pipeline returned an error during replay.
-    #[error("ingest error: {source}")]
-    Ingest {
-        /// Underlying ingest failure.
-        #[source]
-        source: zinder_ingest::IngestError,
-    },
     /// A canonical-store operation failed.
     #[error("store error: {source}")]
     Store {
@@ -123,12 +116,6 @@ pub enum BenchError {
     #[error("materialized-view build incomplete: {reason}")]
     MaterializedViewBuildIncomplete {
         /// Consumer cursor mismatch that prevents a completed build claim.
-        reason: String,
-    },
-    /// The starting checkpoint manifest was missing, malformed, or inconsistent.
-    #[error("starting checkpoint manifest error: {reason}")]
-    StartingCheckpointManifest {
-        /// Manifest requirement or logical-position mismatch.
         reason: String,
     },
     /// The Prometheus recorder could not be installed.
@@ -180,12 +167,6 @@ impl From<zinder_ingest::CanonicalBlockConstructionError> for BenchError {
         Self::CanonicalBlockConstruction {
             source: Box::new(source),
         }
-    }
-}
-
-impl From<zinder_ingest::IngestError> for BenchError {
-    fn from(source: zinder_ingest::IngestError) -> Self {
-        Self::Ingest { source }
     }
 }
 
@@ -316,14 +297,6 @@ impl BenchError {
     #[must_use]
     pub fn materialized_view_build_incomplete(reason: impl Into<String>) -> Self {
         Self::MaterializedViewBuildIncomplete {
-            reason: reason.into(),
-        }
-    }
-
-    /// Builds a starting-checkpoint manifest error.
-    #[must_use]
-    pub fn starting_checkpoint_manifest(reason: impl Into<String>) -> Self {
-        Self::StartingCheckpointManifest {
             reason: reason.into(),
         }
     }

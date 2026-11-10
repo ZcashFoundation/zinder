@@ -182,7 +182,6 @@ jobs:
               --env-file deploy/.env.storage-benchmark.example \
               -f deploy/docker-compose.storage-benchmark.yml \
               --profile comparison \
-              --profile oracle \
               --profile postgres \
               --profile rocksdb \
               config >/dev/null
