@@ -10,56 +10,68 @@ use zinder_core::{
     UnixTimestampMillis,
 };
 use zinder_query::{QueryError, WalletQuery, WalletQueryApi};
-use zinder_store::{
-    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainStoreOptions, RawBlobRetention,
-};
+use zinder_store::{CURRENT_ARTIFACT_SCHEMA_VERSION, RawBlobRetention};
 use zinder_testkit::{
-    FixtureTransactionRows, StoreFixture, encode_fixture_block_replay,
-    sample_regtest_upgrade_activations,
+    ChainFixture, FixtureTransactionRows, StoreFixture, sample_regtest_upgrade_activations,
 };
 
-use crate::common::{block_hash_from_seed, synthetic_chain_epoch};
+use crate::common::{block_hash_from_seed, serving_query_over};
+
+const RAW_TRANSACTION_BYTES: &[u8] = b"raw-transaction-bytes";
+
+fn chain_with_transaction(
+    raw_blob_retention: RawBlobRetention,
+    transaction_id: TransactionId,
+) -> eyre::Result<ChainFixture> {
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(raw_blob_retention)
+        .extend_blocks(1);
+    let block = chain
+        .block_at(BlockHeight::new(1))
+        .cloned()
+        .ok_or_else(|| eyre!("fixture must contain height 1"))?;
+    Ok(
+        chain.with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
+            transaction_id,
+            block.height,
+            block.hash,
+            0,
+            RAW_TRANSACTION_BYTES.to_vec(),
+        )),
+    )
+}
 
 #[tokio::test]
 async fn compact_block_at_returns_indexed_block() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
-    let replay = encode_fixture_block_replay(&block, &[]);
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let block = chain
+        .block_at(BlockHeight::new(1))
+        .cloned()
+        .ok_or_else(|| eyre!("fixture must contain height 1"))?;
+    let (wallet_query, _store_fixture) = serving_query_over(&chain)?;
+    let chain_epoch = wallet_query.visible_tip_block(None).await?.chain_epoch;
 
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        chain_epoch,
-        vec![block],
-        vec![replay],
-        vec![compact_block.clone()],
-    ))?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = wallet_query
         .compact_block_at(BlockHeight::new(1), None)
         .await?;
 
     assert_eq!(response.chain_epoch, chain_epoch);
-    assert_eq!(response.compact_block, compact_block);
+    assert_eq!(response.compact_block.height(), block.height);
+    assert_eq!(response.compact_block.block_hash(), block.hash);
+    assert_eq!(
+        response.compact_block.previous_block_hash(),
+        Network::ZcashRegtest.genesis_hash()
+    );
+    assert_eq!(response.compact_block.time(), block.block_time_seconds);
 
     Ok(())
 }
 
 #[tokio::test]
 async fn compact_block_at_reports_unavailable_for_missing_height() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
-    let replay = encode_fixture_block_replay(&block, &[]);
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let (wallet_query, _store_fixture) = serving_query_over(&chain)?;
 
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        chain_epoch,
-        vec![block],
-        vec![replay],
-        vec![compact_block],
-    ))?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let error = match wallet_query
         .compact_block_at(BlockHeight::new(99), None)
         .await
@@ -68,7 +80,10 @@ async fn compact_block_at_reports_unavailable_for_missing_height() -> eyre::Resu
         Err(error) => error,
     };
 
-    assert!(matches!(error, QueryError::ArtifactUnavailable { .. }));
+    assert!(
+        matches!(error, QueryError::ArtifactUnavailable { .. }),
+        "unexpected missing-height error: {error:?}"
+    );
 
     Ok(())
 }
@@ -106,56 +121,28 @@ async fn compact_block_at_reports_unavailable_below_checkpoint() -> eyre::Result
 
 #[tokio::test]
 async fn transaction_returns_indexed_transaction() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open_with_options(ChainStoreOptions {
-        raw_blob_retention: RawBlobRetention::Transactions,
-        ..ChainStoreOptions::for_local_tests()
-    })?;
-    let store = store_fixture.chain_store().clone();
-    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
     let transaction_id = TransactionId::from_bytes([0xAB; 32]);
-    let transaction_rows = FixtureTransactionRows::from_raw_transaction(
-        transaction_id,
-        block.height,
-        block.block_hash,
-        0,
-        b"raw-transaction-bytes".to_vec(),
-    );
-    let transaction_location = transaction_rows.location;
-    let transaction_intrinsic_value_balances = transaction_rows
-        .intrinsic_value_balances_artifact()
-        .into_iter()
-        .collect();
-    let replay = encode_fixture_block_replay(&block, std::slice::from_ref(&transaction_rows));
+    let chain = chain_with_transaction(RawBlobRetention::Transactions, transaction_id)?;
+    let block = chain
+        .block_at(BlockHeight::new(1))
+        .cloned()
+        .ok_or_else(|| eyre!("fixture must contain height 1"))?;
+    let (wallet_query, _store_fixture) = serving_query_over(&chain)?;
+    let chain_epoch = wallet_query.visible_tip_block(None).await?.chain_epoch;
 
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![replay], vec![compact_block])
-            .with_block_transaction_index(vec![transaction_rows.block_transaction_index])
-            .with_transaction_locations(vec![transaction_rows.location])
-            .with_transaction_facts(vec![transaction_rows.facts])
-            .with_transaction_intrinsic_value_balances(transaction_intrinsic_value_balances)
-            .with_transaction_blobs(transaction_rows.blob.into_iter().collect()),
-    )?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = wallet_query.transaction(transaction_id, None).await?;
 
     assert_eq!(response.chain_epoch, chain_epoch);
     let TxStatus::Mined(mined) = response.status else {
         return Err(eyre!("expected mined transaction status, got {response:?}"));
     };
-    assert_eq!(
-        mined.location.transaction_id,
-        transaction_location.transaction_id
-    );
-    assert_eq!(
-        mined.location.block_height,
-        transaction_location.block_height
-    );
-    assert_eq!(mined.location.block_hash, transaction_location.block_hash);
+    assert_eq!(mined.location.transaction_id, transaction_id);
+    assert_eq!(mined.location.block_height, block.height);
+    assert_eq!(mined.location.block_hash, block.hash);
     assert_eq!(mined.location.tx_index_in_block, 0);
     assert_eq!(
         mined.raw_transaction_bytes,
-        Some(b"raw-transaction-bytes".to_vec()),
+        Some(RAW_TRANSACTION_BYTES.to_vec()),
         "the mined arm must carry the serialized transaction bytes alongside the location",
     );
     assert!(
@@ -168,42 +155,16 @@ async fn transaction_returns_indexed_transaction() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn transaction_omits_bytes_when_blob_is_not_retained() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
     let transaction_id = TransactionId::from_bytes([0xAB; 32]);
-    let transaction_rows = FixtureTransactionRows::from_raw_transaction(
-        transaction_id,
-        block.height,
-        block.block_hash,
-        0,
-        b"raw-transaction-bytes".to_vec(),
-    );
-    let replay_transaction_rows = FixtureTransactionRows {
-        blob: None,
-        ..transaction_rows.clone()
-    };
-    let replay =
-        encode_fixture_block_replay(&block, std::slice::from_ref(&replay_transaction_rows));
-    let transaction_intrinsic_value_balances = transaction_rows
-        .intrinsic_value_balances_artifact()
-        .into_iter()
-        .collect();
+    let chain = chain_with_transaction(RawBlobRetention::None, transaction_id)?;
+    let (wallet_query, _store_fixture) = serving_query_over(&chain)?;
 
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![replay], vec![compact_block])
-            .with_block_transaction_index(vec![transaction_rows.block_transaction_index])
-            .with_transaction_locations(vec![transaction_rows.location])
-            .with_transaction_facts(vec![transaction_rows.facts])
-            .with_transaction_intrinsic_value_balances(transaction_intrinsic_value_balances),
-    )?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = wallet_query.transaction(transaction_id, None).await?;
 
     let TxStatus::Mined(mined) = response.status else {
         return Err(eyre!("expected mined transaction status, got {response:?}"));
     };
+    assert_eq!(mined.location.transaction_id, transaction_id);
     assert!(
         mined.raw_transaction_bytes.is_none(),
         "raw bytes are absent when the deployment does not retain transaction blobs",
@@ -214,19 +175,10 @@ async fn transaction_omits_bytes_when_blob_is_not_retained() -> eyre::Result<()>
 
 #[tokio::test]
 async fn transaction_reports_unavailable_for_unknown_id() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
-    let replay = encode_fixture_block_replay(&block, &[]);
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let (wallet_query, _store_fixture) = serving_query_over(&chain)?;
+    let chain_epoch = wallet_query.visible_tip_block(None).await?.chain_epoch;
 
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        chain_epoch,
-        vec![block],
-        vec![replay],
-        vec![compact_block],
-    ))?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = wallet_query
         .transaction(TransactionId::from_bytes([0xCD; 32]), None)
         .await?;

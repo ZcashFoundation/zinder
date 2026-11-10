@@ -3,8 +3,6 @@
     reason = "Integration test names describe the gRPC reflection contract under test."
 )]
 
-use std::sync::Arc;
-
 use eyre::{Result, eyre};
 use tokio::net::TcpListener;
 use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
@@ -13,20 +11,20 @@ use tonic_reflection::pb::v1::{
     ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
     server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
 };
+use zinder_core::Network;
 use zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET;
-use zinder_query::{WalletEndpointMetadata, WalletQuery, WalletQueryGrpcAdapter};
-use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
+use zinder_query::{WalletEndpointMetadata, WalletQueryGrpcAdapter};
+use zinder_testkit::ChainFixture;
+
+use crate::common::native_serving_query_over;
 
 const EXPECTED_SERVICE: &str = "zinder.v1.wallet.WalletQuery";
 
 #[tokio::test]
 async fn server_reflection_lists_wallet_query_service() -> Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let wallet_query = WalletQuery::new(
-        store_fixture.chain_store().clone(),
-        (),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let (wallet_query, _store_fixture, _ingest_control_fixture) =
+        native_serving_query_over(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(1))
+            .await?;
     let adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
     let reflection_service = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(ZINDER_V1_FILE_DESCRIPTOR_SET)
