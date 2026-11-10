@@ -38,9 +38,9 @@ separate source call, `fetch_tree_state_for_block(block_id)`, and JSON-RPC
 adapters reject a tree-state response whose height or hash does not match the
 requested block.
 
-Fresh canonical construction and bulk catchup both consume one
-`CanonicalPipelineLimits` value. The runtime resolves it from the container
-memory budget, logical CPU count, and `node.max_response_bytes`:
+Fresh canonical construction consumes one `CanonicalPipelineLimits` value.
+The runtime resolves it from the container memory budget, logical CPU count,
+and `node.max_response_bytes`:
 
 - `source_segment_max_blocks = 64`
 - `source_segment_target_response_bytes = min(node.max_response_bytes, 33554432)`
@@ -48,12 +48,6 @@ memory budget, logical CPU count, and `node.max_response_bytes`:
 - `source_fetch_max_in_flight_bytes = max(node.max_response_bytes, clamp(memory / 64, 128 MiB, 384 MiB))`
 - `block_prepare_concurrency = min(available_parallelism, 16)`
 - `block_prepare_memory_watermark_bytes = clamp(memory / 64, 128 MiB, 512 MiB)`
-- `commit_reassembly_max_queued_artifact_bytes = 536870912`
-- `canonical_batch_max_blocks = 1000`
-- `canonical_batch_max_artifact_bytes = 536870912`
-- `canonical_batch_max_estimated_write_bytes = 536870912`
-- `canonical_batch_min_blocks_before_estimated_write_close = 100`
-- `flush_interval_epochs = 5`
 
 The segment sizer uses observed response bytes per block, p95 density, overshoot
 memory after split attempts, and network-upgrade resets. The JSON-RPC response
@@ -85,17 +79,10 @@ temporarily take the watermark over its admission limit; no more work is
 admitted until retained bytes fall below the limit. Config validation still
 requires enough room for the initial maximum-sized probe.
 
-The durable writer remains serial, but subtree-root attachment, checkpoint
-tree-state fetch, canonical commit, and flush run as one in-flight commit
-future while source fetch and block prepare continue filling the next batch.
-`commit_reassembly_max_queued_artifact_bytes` bounds that next batch so commit
-overlap cannot become unbounded memory growth.
-
-Canonical storage writes tree state only at committed canonical epoch tips.
-Tip-follow writes one checkpoint per live committed tip. Bulk catchup fetches
-one checkpoint tree state for the batch tip before commit. Missing tree-state
-source capability does not block canonical catchup, but the wallet tree-state
-capabilities are unavailable until checkpoint rows exist.
+Canonical storage writes tree state only at checkpoints, not at every block.
+Missing tree-state source capability does not block canonical construction,
+but the wallet tree-state capabilities are unavailable until checkpoint rows
+exist.
 
 The native wallet API exposes checkpoint-oriented reads:
 
@@ -119,8 +106,7 @@ density without requiring per-height code patches.
 Native clients read latest or checkpoint tree state. The native API does not
 serve arbitrary per-height tree state.
 
-The canonical ingest vocabulary is `CanonicalBatch`, `CanonicalBatchBudget`,
-`CanonicalBatchCost`, `CanonicalBatchCloseTrigger`, and
+The canonical construction vocabulary is `CanonicalPipelineLimits` and
 `block_prepare_concurrency`. `materialized_view_replay_*` names are reserved for the async
 materialized-view replay plane.
 
@@ -135,8 +121,7 @@ The queue-cap defaults now derive from the container memory budget at
 startup. `services/zinder-ingest/src/memory_pressure.rs` exposes
 `container_memory_budget_bytes()`, which returns `memory.high` (preferred)
 or `memory.max` from cgroup v2. `CanonicalPipelineLimits` owns the source and
-prepare policy; runtime configuration retains the commit-reassembly and
-canonical-write bounds. Each resource-aware bound uses
+prepare policy. Each resource-aware bound uses
 `container_budget / 64`, clamped to `[128 MiB, original fallback]`. On a
 10 GiB container the source and prepare watermarks are both 160 MiB. On a
 24 GiB container they are 384 MiB; on dev hosts without cgroup the fallback

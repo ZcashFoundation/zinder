@@ -1,12 +1,11 @@
-//! Ingestion artifact builders and bulk catchup operations for Zinder.
+//! Canonical writer, artifact builders, and ingest-side workers for Zinder.
 //!
 //! This crate owns deterministic conversion from upstream node source values into
-//! canonical artifacts. Node I/O belongs to `zinder-source`; durable writes
-//! belong to `zinder-store`.
+//! canonical artifacts and the writer that constructs and follows the canonical
+//! store. Node I/O belongs to `zinder-source`; durable writes belong to
+//! `zinder-store`.
 
 mod artifact_builder;
-pub mod bench_support;
-mod bulk_catchup;
 mod canonical_block_context;
 mod chain_ingest;
 mod conventional_fee_distribution_backfill;
@@ -16,7 +15,6 @@ mod mempool;
 mod phase;
 mod runtime_config;
 mod source_recovery;
-mod tip_follow;
 mod transaction_component_backfill;
 mod upstream_health_probe;
 mod writer;
@@ -26,15 +24,8 @@ pub use artifact_builder::{
     PositionedCanonicalBlock, PreparedCanonicalBlock, RawBlobPolicy, RetainedRawBlobs,
     position_canonical_block, prepare_canonical_block,
 };
-pub use bulk_catchup::{
-    BulkCatchupRunConfig, run_bulk_catchup, run_bulk_catchup_until_complete,
-    run_bulk_catchup_with_store,
-};
 pub use canonical_block_context::{CanonicalBlockContextReader, require_genesis_complete_history};
-pub use chain_ingest::{
-    DEFAULT_CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES,
-    DEFAULT_CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE, IngestError, NodeSourceKind,
-};
+pub use chain_ingest::{IngestError, NodeSourceKind};
 pub use conventional_fee_distribution_backfill::{
     ConventionalFeeDistributionBackfillConfig, ConventionalFeeDistributionBackfillContext,
     spawn_conventional_fee_distribution_backfill_task,
@@ -53,15 +44,12 @@ pub use mempool::{
     MempoolReadySignal, MempoolRetentionSettings, MempoolSnapshotPage, build_mempool_entry,
     mempool_ready_channel, run_live_mempool_owner, run_mempool_retention,
 };
-pub use phase::{classify_phase, current_chain_height};
+pub use phase::classify_phase;
 pub use runtime_config::{
     CanonicalConstructionSettings, CanonicalFollowSettings, CanonicalRunOverrides,
-    HistoricalWorkGate, IngestRuntimeConfig, MaterializedViewReplayConfig,
-    MaterializedViewReplayPolicy, MempoolIngestSettings, PhaseClassificationConfig,
-};
-pub use tip_follow::{
-    DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, TipFollowConfig, open_tip_follow_store, tip_follow,
-    tip_follow_with_primary_store,
+    DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, HistoricalWorkGate, IngestRuntimeConfig,
+    MaterializedViewReplayConfig, MaterializedViewReplayPolicy, MempoolIngestSettings,
+    PhaseClassificationConfig,
 };
 pub use transaction_component_backfill::{
     TransactionComponentBackfillConfig, TransactionComponentBackfillContext,

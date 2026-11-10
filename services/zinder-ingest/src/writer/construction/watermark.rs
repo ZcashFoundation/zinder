@@ -7,12 +7,9 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
 };
 
 use parking_lot::Mutex;
-
-use crate::chain_ingest::{IngestError, ingest_error_class};
 
 #[derive(Clone, Debug)]
 pub(crate) struct ByteWatermark {
@@ -181,21 +178,6 @@ impl Drop for ByteReservation {
     fn drop(&mut self) {
         self.release();
     }
-}
-
-pub(crate) fn record_stage_duration(
-    stage: &'static str,
-    started_at: Instant,
-    stage_error: Option<&IngestError>,
-) {
-    let status = if stage_error.is_some() { "error" } else { "ok" };
-    metrics::histogram!(
-        "zinder_ingest_bulk_pipeline_stage_duration_seconds",
-        "stage" => stage,
-        "status" => status,
-        "error_class" => ingest_error_class(stage_error)
-    )
-    .record(started_at.elapsed());
 }
 
 pub(crate) fn record_queue_depth(stage: &'static str, depth: usize) {

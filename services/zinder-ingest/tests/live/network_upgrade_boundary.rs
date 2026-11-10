@@ -7,16 +7,17 @@
 //! upgrade table. The window is `(h-1, h, h+1)` where `h` is the highest
 //! activation height that is reachable from the current chain tip.
 //!
-//! On regtest with ZFND's `z3` default sidecar, the latest activation is NU6
-//! at height 2: the test bulk-catches-up heights 1..3 and asserts the consensus
-//! branch id at height 1 (Canopy) differs from the branch id at height 2
-//! (NU6) and that both match what
+//! When the regtest node advertises an activation above height 1, the test
+//! constructs and publishes a production canonical store from genesis through
+//! the block after that activation, serves the projected pair, and asserts the
+//! consensus branch id below the activation differs from the branch id at it,
+//! and that every sampled height matches what
 //! [`zinder_core::NetworkUpgradeActivations::consensus_branch_id_at`]
-//! reports for each height.
+//! reports. A regtest node that activates every upgrade at height 1 has no
+//! boundary to cross, so the test returns early.
 //!
-//! On testnet/mainnet, the most production-relevant activation is NU6.1.
-//! The test resolves its height from the running node and bulk-catches-up a
-//! three-block window around it.
+//! The serving pair requires genesis-complete history, which only fits test
+//! budgets on regtest.
 //!
 //! Reference: `docs/adrs/0008-network-parameter-discovery.md`.
 //!
@@ -27,50 +28,35 @@
     reason = "Live test names describe the behavior under test."
 )]
 
-use std::{num::NonZeroU32, sync::Arc};
+use std::sync::Arc;
 
 use eyre::{Result, eyre};
-use tempfile::tempdir;
 use zinder_core::{
     BlockHeight, ConsensusBranchId, MinedTransaction, Network, NetworkUpgradeActivations, TxStatus,
 };
-use zinder_ingest::run_bulk_catchup;
-use zinder_query::{TransactionStatus, WalletQuery, WalletQueryApi};
-use zinder_store::PrimaryChainStore;
+use zinder_query::{TransactionStatus, WalletQueryApi, WalletServingQuery};
 use zinder_testkit::live::{init, require_live_for};
 
 use crate::common::{
-    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_bulk_catchup_run_config,
-    regtest_generate_blocks, zebra_source_from_bulk_catchup,
+    coinbase_transaction_id, fetch_live_network_upgrade_activations, fetch_live_tip_height,
+    live_serving_pair, regtest_generate_blocks,
 };
-
-/// Hard cap on the boundary-window bulk catchup size on testnet/mainnet.
-///
-/// The window itself is three blocks; anchoring the bulk catchup on a
-/// checkpoint just below the window keeps the run under a few seconds
-/// even when the activation is millions of blocks back from the tip.
-const NEAR_BOUNDARY_DEPTH_BLOCKS: u32 = 16;
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 #[allow(
     clippy::too_many_lines,
-    reason = "Boundary-crossing live test keeps env resolution, schedule discovery, run_bulk_catchup, and three-height assertions in one auditable path."
+    reason = "Boundary-crossing live test keeps env resolution, schedule discovery, construction, and three-height assertions in one auditable path."
 )]
 async fn mined_consensus_branch_id_advances_across_latest_activation_height() -> Result<()> {
     let _guard = init();
-    let Some(env) = require_live_for(&[
-        Network::ZcashRegtest,
-        Network::ZcashTestnet,
-        Network::ZcashMainnet,
-    ])?
-    else {
+    let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
         return Ok(());
     };
 
     // Make sure regtest has at least one block above the activation window.
     let tip_before = fetch_live_tip_height(&env).await?;
-    if env.network() == Network::ZcashRegtest && tip_before.value() < 4 {
+    if tip_before.value() < 4 {
         regtest_generate_blocks(&env, 4_u32.saturating_sub(tip_before.value())).await?;
     }
     let tip_height = fetch_live_tip_height(&env).await?;
@@ -79,7 +65,7 @@ async fn mined_consensus_branch_id_advances_across_latest_activation_height() ->
 
     // Default regtest activates every upgrade at height 1, so there is no
     // mid-chain boundary to cross; the assertion only applies where the node
-    // advertises an activation above genesis (testnet, mainnet).
+    // advertises an activation above height 1.
     let Some(activation_height) = latest_reachable_activation_height(&activations, tip_height)
     else {
         return Ok(());
@@ -87,44 +73,9 @@ async fn mined_consensus_branch_id_advances_across_latest_activation_height() ->
     let window_start = BlockHeight::new(activation_height.value().saturating_sub(1));
     let window_end = BlockHeight::new(activation_height.value().saturating_add(1));
 
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("zinder-store");
-
-    // On chains where the activation is far above genesis (testnet/mainnet)
-    // anchor the bulk catchup at a checkpoint just below the window. On regtest
-    // the window can be 1..3 and a checkpoint is structurally unavailable.
-    let use_checkpoint = window_start.value() > NEAR_BOUNDARY_DEPTH_BLOCKS + 1;
-    let (from_height, checkpoint_height) = if use_checkpoint {
-        let checkpoint = BlockHeight::new(window_start.value() - 1);
-        (window_start, Some(checkpoint))
-    } else {
-        (BlockHeight::new(1), None)
-    };
-
-    let mut bulk_catchup_config = live_bulk_catchup_run_config(
-        &env,
-        &storage_path,
-        from_height,
-        window_end,
-        NonZeroU32::new(100).ok_or_else(|| eyre!("invalid bulk-catchup batch size"))?,
-        false,
-        Arc::clone(&activations),
-    );
-    let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
-    if let Some(checkpoint_height) = checkpoint_height {
-        bulk_catchup_config.checkpoint = Some(
-            source
-                .fetch_chain_checkpoint(checkpoint_height, &activations)
-                .await?,
-        );
-    }
-    run_bulk_catchup(&bulk_catchup_config, &source)
-        .await?
-        .ok_or_else(|| eyre!("expected committed bulk-catchup outcome"))?;
-
-    let store =
-        PrimaryChainStore::open(&storage_path, bulk_catchup_config.canonical_store_options())?;
-    let wallet_query = WalletQuery::new(store, (), activations.clone());
+    let live = live_serving_pair(&env, &activations, window_end).await?;
+    let wallet_query =
+        WalletServingQuery::from_serving_pair_slot(live.slot, (), Arc::clone(&activations));
 
     let pre_activation_branch_id = read_coinbase_consensus_branch_id(&wallet_query, window_start)
         .await
@@ -183,12 +134,13 @@ async fn mined_consensus_branch_id_advances_across_latest_activation_height() ->
         "no further activation should occur within the window; \
          activation={activation_branch_id:?}, post={post_activation_branch_id:?}"
     );
+    drop(live.store_fixture);
     Ok(())
 }
 
 /// Highest `activation_height` strictly greater than 1 (so a meaningful
 /// transition exists below it) that the chain tip has already crossed
-/// (so bulk catchup can sample heights below, at, and above it).
+/// (so construction can sample heights below, at, and above it).
 fn latest_reachable_activation_height(
     activations: &NetworkUpgradeActivations,
     tip_height: BlockHeight,
@@ -207,10 +159,7 @@ async fn read_coinbase_consensus_branch_id<QueryApi: WalletQueryApi>(
     wallet_query: &QueryApi,
     block_height: BlockHeight,
 ) -> Result<ConsensusBranchId> {
-    let coinbase_transaction = wallet_query
-        .transaction_at_block_index(block_height, 0, None)
-        .await?;
-    let coinbase_transaction_id = coinbase_transaction.transaction.transaction_id;
+    let coinbase_transaction_id = coinbase_transaction_id(wallet_query, block_height).await?;
     let status = wallet_query
         .transaction(coinbase_transaction_id, None)
         .await?;

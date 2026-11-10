@@ -6,12 +6,6 @@
 use std::{error::Error, fs, path::Path};
 
 use tempfile::tempdir;
-use zinder_core::{
-    CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
-    ChainEpochId, Network, decode_canonical_block_replay,
-};
-use zinder_store::{ChainStoreOptions, PrimaryChainStore};
-use zinder_testkit::ChainFixture;
 
 use crate::common::zinder_ingest_command;
 
@@ -165,17 +159,12 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(stdout.contains("[ingest.phase_classification]"));
     assert!(stdout.contains("catchup_threshold_blocks ="));
     assert!(stdout.contains("[ingest.construction]"));
-    assert!(stdout.contains("canonical_batch_max_blocks = 1000"));
-    assert!(stdout.contains("canonical_batch_max_artifact_bytes = 536870912"));
-    assert!(stdout.contains("canonical_batch_max_estimated_write_bytes = 536870912"));
-    assert!(stdout.contains("canonical_batch_min_blocks_before_estimated_write_close = 100"));
     assert!(stdout.contains("source_segment_max_blocks = 64"));
     assert!(stdout.contains("source_segment_target_response_bytes = 33554432"));
     assert!(stdout.contains("source_fetch_max_in_flight_requests = 12"));
     assert!(stdout.contains("source_fetch_max_in_flight_bytes = 402653184"));
     assert!(stdout.contains("block_prepare_concurrency ="));
     assert!(stdout.contains("block_prepare_memory_watermark_bytes = 536870912"));
-    assert!(stdout.contains("commit_reassembly_max_queued_artifact_bytes = 536870912"));
     assert!(stdout.contains("[ingest.mempool]"));
     assert!(stdout.contains("max_transaction_count = 8000"));
     assert!(stdout.contains("max_total_raw_transaction_bytes = 80000000"));
@@ -184,7 +173,6 @@ fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     assert!(stdout.contains("poll_interval_ms = 1000"));
     assert!(stdout.contains("lag_threshold_blocks ="));
     assert!(stdout.contains("[ingest.run_overrides]"));
-    assert!(stdout.contains("allow_reorg_window_settlement = false"));
     assert!(stdout.contains("coverage = \"explicit\""));
 
     Ok(())
@@ -309,115 +297,143 @@ fn print_config_allows_disabled_ingest_control_for_one_shot_runs() -> Result<(),
     Ok(())
 }
 
+/// Settings that tuned the removed batch-commit catch-up path, as
+/// `(TOML section, field, environment variable)`.
+const REMOVED_INGEST_SETTINGS: &[(&str, &str, &str)] = &[
+    (
+        "ingest.construction",
+        "canonical_batch_max_blocks",
+        "ZINDER_INGEST__CONSTRUCTION__CANONICAL_BATCH_MAX_BLOCKS",
+    ),
+    (
+        "ingest.construction",
+        "canonical_batch_max_artifact_bytes",
+        "ZINDER_INGEST__CONSTRUCTION__CANONICAL_BATCH_MAX_ARTIFACT_BYTES",
+    ),
+    (
+        "ingest.construction",
+        "canonical_batch_max_estimated_write_bytes",
+        "ZINDER_INGEST__CONSTRUCTION__CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES",
+    ),
+    (
+        "ingest.construction",
+        "canonical_batch_min_blocks_before_estimated_write_close",
+        "ZINDER_INGEST__CONSTRUCTION__CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE",
+    ),
+    (
+        "ingest.construction",
+        "commit_reassembly_max_queued_artifact_bytes",
+        "ZINDER_INGEST__CONSTRUCTION__COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES",
+    ),
+    (
+        "ingest.construction",
+        "flush_interval_epochs",
+        "ZINDER_INGEST__CONSTRUCTION__FLUSH_INTERVAL_EPOCHS",
+    ),
+    (
+        "ingest.run_overrides",
+        "allow_reorg_window_settlement",
+        "ZINDER_INGEST__RUN_OVERRIDES__ALLOW_REORG_WINDOW_SETTLEMENT",
+    ),
+    (
+        "storage",
+        "secondary_path",
+        "ZINDER_STORAGE__SECONDARY_PATH",
+    ),
+];
+
+fn removed_setting_toml_value(field: &str) -> &'static str {
+    match field {
+        "allow_reorg_window_settlement" => "true",
+        "secondary_path" => "\"/var/lib/zinder/ingest-secondary\"",
+        _ => "1",
+    }
+}
+
 #[test]
-fn canonical_replay_verification_print_config_loads_secondary_path() -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("verification-print-config-store");
-    let secondary_path = tempdir.path().join("verification-print-config-secondary");
-    let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(
-        &config_path,
-        canonical_replay_verification_config_toml(&storage_path, &secondary_path)?,
-    )?;
-
-    let output = zinder_ingest_command()
-        .args([
-            "--print-config",
-            "--config",
-            path_str(&config_path)?,
-            "verify-canonical-replay",
-        ])
-        .output()?;
-
-    assert!(output.status.success(), "{output:?}");
-    let stdout = String::from_utf8(output.stdout)?;
-    assert!(stdout.contains(&format!("path = \"{}\"", path_str(&storage_path)?)));
-    assert!(stdout.contains(&format!(
-        "secondary_path = \"{}\"",
-        path_str(&secondary_path)?
-    )));
-    assert!(!stdout.contains("raw_blob_policy"));
-
+fn removed_ingest_settings_are_rejected_from_config_files() -> Result<(), Box<dyn Error>> {
+    for (section, field, _) in REMOVED_INGEST_SETTINGS {
+        let value = removed_setting_toml_value(field);
+        assert_ingest_cli_rejects(
+            |root| {
+                let base = ingest_config_toml(&root.join("removed-setting-store"))?;
+                Ok(if *section == "storage" {
+                    base.replacen("[storage]\n", &format!("[storage]\n{field} = {value}\n"), 1)
+                } else {
+                    format!("{base}\n[{section}]\n{field} = {value}\n")
+                })
+            },
+            &[],
+            &[],
+            &format!("unknown field `{field}`"),
+        )?;
+    }
     Ok(())
 }
 
 #[test]
-fn canonical_replay_verification_scans_multiple_bounded_batches() -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("verification-source-store");
-    let secondary_path = tempdir.path().join("verification-secondary");
-    let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(257);
-    let artifacts = chain_fixture
-        .chain_epoch_artifacts(ChainEpochId::new(1))
-        .ok_or("chain fixture unexpectedly empty")?;
-    let expected_chain_epoch = artifacts.chain_epoch;
-    let mut expected_digest_builder = CanonicalBlockFactsSequenceDigestBuilder::new(
-        CanonicalBlockFactsSequenceDigestVersion::CURRENT,
-    );
-    for replay_envelope in &artifacts.block_replay_envelopes {
-        expected_digest_builder.try_append(
-            decode_canonical_block_replay(replay_envelope.as_bytes())?.reference_digest(),
+fn removed_ingest_settings_are_rejected_from_the_environment() -> Result<(), Box<dyn Error>> {
+    for (_, field, environment_variable) in REMOVED_INGEST_SETTINGS {
+        let value = if *field == "secondary_path" {
+            "/var/lib/zinder/ingest-secondary"
+        } else {
+            removed_setting_toml_value(field)
+        };
+        assert_ingest_cli_rejects(
+            |root| ingest_config_toml(&root.join("removed-setting-environment-store")),
+            &[],
+            &[(environment_variable, value)],
+            &format!("unknown field `{field}`"),
         )?;
     }
-    let expected_digest = expected_digest_builder.finish();
-    let primary = PrimaryChainStore::open(
-        &storage_path,
-        ChainStoreOptions::for_network(Network::ZcashRegtest),
-    )?;
-    primary.commit_chain_epoch(artifacts)?;
+    Ok(())
+}
 
+#[test]
+fn removed_ingest_flags_are_rejected() -> Result<(), Box<dyn Error>> {
+    for (flag, flag_value) in [
+        ("--canonical-batch-max-blocks", Some("1")),
+        ("--canonical-batch-max-artifact-bytes", Some("1")),
+        ("--canonical-batch-max-estimated-write-bytes", Some("1")),
+        (
+            "--canonical-batch-min-blocks-before-estimated-write-close",
+            Some("1"),
+        ),
+        ("--allow-reorg-window-settlement", None),
+    ] {
+        let arguments: Vec<&str> = std::iter::once(flag).chain(flag_value).collect();
+        assert_ingest_cli_rejects(
+            |root| ingest_config_toml(&root.join("removed-flag-store")),
+            &arguments,
+            &[],
+            &format!("unexpected argument '{flag}'"),
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn verify_canonical_replay_subcommand_is_rejected() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
     let output = zinder_ingest_command()
         .args([
             "verify-canonical-replay",
             "--network",
             "zcash-regtest",
             "--storage-path",
-            path_str(&storage_path)?,
+            path_str(&tempdir.path().join("store"))?,
             "--secondary-path",
-            path_str(&secondary_path)?,
+            path_str(&tempdir.path().join("secondary"))?,
         ])
         .output()?;
 
-    assert!(output.status.success(), "{output:?}");
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(
-        report["verification_scope"],
-        "replay_envelope_and_canonical_header_parity"
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("unrecognized subcommand 'verify-canonical-replay'"),
+        "{stderr}"
     );
-    assert_eq!(report["network"], "zcash-regtest");
-    assert_eq!(report["chain_epoch_id"], expected_chain_epoch.id.value());
-    assert_eq!(report["from_height"], 1);
-    assert_eq!(report["to_height"], 257);
-    assert_eq!(report["block_count"], 257);
-    assert_eq!(report["sequence_digest_version"], 1);
-    assert_eq!(
-        report["sequence_digest_sha256"],
-        hex::encode(expected_digest.as_bytes())
-    );
-    assert!(secondary_path.exists());
-
-    Ok(())
-}
-
-#[test]
-fn print_config_shows_explicit_reorg_window_settlement_override() -> Result<(), Box<dyn Error>> {
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("allow-reorg-window-settlement-store");
-    let config_path = tempdir.path().join("zinder-ingest.toml");
-    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
-
-    let output = zinder_ingest_command()
-        .args([
-            "--print-config",
-            "--config",
-            path_str(&config_path)?,
-            "--allow-reorg-window-settlement",
-        ])
-        .output()?;
-
-    assert!(output.status.success(), "{output:?}");
-    let stdout = String::from_utf8(output.stdout)?;
-    assert!(stdout.contains("allow_reorg_window_settlement = true"));
+    assert!(!tempdir.path().join("secondary").exists());
 
     Ok(())
 }
@@ -596,20 +612,6 @@ fn wallet_serving_rejects_explicit_checkpoint_height() -> Result<(), Box<dyn Err
 }
 
 #[test]
-fn wallet_serving_rejects_reorg_window_settlement_override() -> Result<(), Box<dyn Error>> {
-    assert_ingest_cli_rejects(
-        |root| {
-            wallet_serving_ingest_config_toml(
-                &root.join("wallet-serving-reorg-window-settlement-store"),
-            )
-        },
-        &["--allow-reorg-window-settlement"],
-        &[],
-        "ingest.run_overrides.coverage = \"wallet-serving\" cannot be combined with",
-    )
-}
-
-#[test]
 fn max_response_bytes_can_be_overridden_from_cli() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("max-response-store");
@@ -686,42 +688,6 @@ fn print_config_redacts_inline_cookie_supplied_through_environment() -> Result<(
     assert!(!stdout.contains("inline-cookie-secret"));
 
     Ok(())
-}
-
-#[test]
-fn zero_commit_batch_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
-    assert_ingest_cli_rejects(
-        |root| ingest_config_toml(&root.join("zero-commit-store")),
-        &["--canonical-batch-max-blocks", "0"],
-        &[],
-        "ingest.construction.canonical_batch_max_blocks must be greater than zero",
-    )
-}
-
-#[test]
-fn zero_estimated_write_batch_budget_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
-    assert_ingest_cli_rejects(
-        |root| ingest_config_toml(&root.join("zero-estimated-write-budget-store")),
-        &["--canonical-batch-max-estimated-write-bytes", "0"],
-        &[],
-        "ingest.construction.canonical_batch_max_estimated_write_bytes must be greater than zero",
-    )
-}
-
-#[test]
-fn estimated_write_close_floor_above_block_cap_fails_before_storage_creation()
--> Result<(), Box<dyn Error>> {
-    assert_ingest_cli_rejects(
-        |root| ingest_config_toml(&root.join("estimated-write-floor-above-block-cap-store")),
-        &[
-            "--canonical-batch-max-blocks",
-            "10",
-            "--canonical-batch-min-blocks-before-estimated-write-close",
-            "11",
-        ],
-        &[],
-        "ingest.construction.canonical_batch_min_blocks_before_estimated_write_close must be less than or equal to ingest.construction.canonical_batch_max_blocks",
-    )
 }
 
 #[test]
@@ -1045,23 +1011,6 @@ listen_addr = "127.0.0.1:9100"
 "#,
         path_str(cookie_path)?,
         path_str(storage_path)?,
-    ))
-}
-
-fn canonical_replay_verification_config_toml(
-    storage_path: &Path,
-    secondary_path: &Path,
-) -> Result<String, Box<dyn Error>> {
-    Ok(format!(
-        r#"[network]
-name = "zcash-regtest"
-
-[storage]
-path = "{}"
-secondary_path = "{}"
-"#,
-        path_str(storage_path)?,
-        path_str(secondary_path)?
     ))
 }
 

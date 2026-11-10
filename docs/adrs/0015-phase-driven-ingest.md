@@ -33,10 +33,9 @@ for a coherent replacement observation. Phase changes are bidirectional, so a
 writer can return to `BulkCatchup` after downtime without a process restart or
 operator action.
 
-Bulk catch-up fetches bounded source segments, prepares blocks concurrently,
-and publishes authenticated canonical batches without crossing the configured
-reorg window unless `ingest.run_overrides.allow_reorg_window_settlement` explicitly
-permits it. Following-tip mode observes one coherent source update at a time and
+Construction fetches bounded source segments, prepares blocks concurrently,
+and publishes an authenticated baseline whose settled tip stays
+`ingest.reorg_window_blocks` below the construction tip. Following-tip mode observes one coherent source update at a time and
 publishes either an append or a replacement. Both paths use the same canonical
 store, error classification, readiness state, and recovery policy.
 

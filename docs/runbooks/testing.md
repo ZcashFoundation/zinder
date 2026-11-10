@@ -261,11 +261,9 @@ Expected outcome on a healthy regtest with the indexer gRPC port set: all
 regtest-targeted tests pass in ~30 s. A full regtest `ci-live` invocation also
 contains hosted-network checks that deliberately refuse to run on regtest:
 the mainnet-only tests
-(`fetch_chain_checkpoint_returns_advancing_tree_sizes_on_mainnet`,
-`tip_id_advances_above_one_million`,
-`bulk_catchup_last_1000_blocks_from_checkpoint`) and the testnet-or-mainnet tests
-(`cli_constructs_complete_wallet_serving_history_from_config`,
-`checkpoint_bounded_read_endpoint_latency_baseline`).
+(`fetch_chain_checkpoint_returns_advancing_tree_sizes_on_mainnet` and
+`tip_id_advances_above_one_million`) and the testnet-or-mainnet test
+`cli_constructs_complete_wallet_serving_history_from_config`.
 
 Without `ZINDER_NODE__INDEXER_GRPC_ADDR`, the two Zebra Indexer mempool-source
 tests skip: `zebra_indexer_mempool_source_opens_stream_against_running_indexer`
@@ -292,7 +290,7 @@ through `-E 'test(<name>)'` as above.
 
 The `node-mutating` test group in `.config/nextest.toml` serializes any test
 that mutates regtest state (broadcast cycles, indexer-restart, deep-chain
-bulk-catchup runs). Run them in isolation if you want to debug — parallel execution
+construction runs). Run them in isolation if you want to debug — parallel execution
 will fight for the same node.
 
 ## T3: Live testnet (Zebra cookie auth)
@@ -464,11 +462,9 @@ ZINDER_TEST_LIVE=1 \
   cargo nextest run --profile=ci-live --run-ignored=all
 ```
 
-Currently-mainnet-only tests are:
-`fetch_chain_checkpoint_returns_advancing_tree_sizes_on_mainnet`,
-`tip_id_advances_above_one_million`,
-`bulk_catchup_last_1000_blocks_from_checkpoint`, plus the transparent-address
-balance read-only confirmations under `services/zinder-explorer/tests/live/`.
+Currently-mainnet-only tests are
+`fetch_chain_checkpoint_returns_advancing_tree_sizes_on_mainnet` and
+`tip_id_advances_above_one_million`.
 
 ## T3: Parity against a reference lightwalletd
 
@@ -544,11 +540,10 @@ ZINDER_TEST_LIVE=1 \
     -E 'test(/^live::network_upgrade_boundary::/)' --run-ignored=all
 ```
 
-The same invocation works for testnet (`ZINDER_NETWORK=zcash-testnet`,
-target activation = NU6.1 at height 3,536,500) and mainnet
-(`ZINDER_NETWORK=zcash-mainnet`, target activation = NU6.1 at height
-3,146,400). On testnet/mainnet the test anchors a checkpoint just below
-the activation so the bulk catchup window stays at three blocks.
+Both tests build the production canonical store and wallet projection from
+genesis, so they run on regtest only. The boundary test returns early when
+the regtest node activates every upgrade at height 1, because there is no
+boundary to cross.
 
 File:
 [`services/zinder-ingest/tests/live/network_upgrade_boundary.rs`](../../services/zinder-ingest/tests/live/network_upgrade_boundary.rs).

@@ -1,6 +1,6 @@
 //! Loop-recovery decisions for long-running writer subsystems.
 //!
-//! Every Zinder writer subsystem (tip-follow, bulk catchup, live mempool owner,
+//! Every Zinder writer subsystem (canonical follower, live mempool owner,
 //! chain-tip notification subscriber) runs an indefinite loop that
 //! observes upstream node state. When an iteration fails, the loop must
 //! decide whether to drain readiness and continue, or exit so the operator
@@ -17,9 +17,9 @@
 //!   exhaustion** ([`IngestError::SourceRetryBudgetExceeded`],
 //!   [`IngestError::SourceRetryDeadlineExceeded`]) are recoverable; the
 //!   loop resets and re-observes the upstream view.
-//! - **Storage failures**, **reorg-window violations**, and **internal
-//!   logic errors** (`EmptyCanonicalBatch`, etc.) are fatal: data integrity
-//!   is at stake, or the failure indicates a Zinder bug. The loop exits
+//! - **Storage failures** and **internal logic errors** (for example
+//!   `BlockingTaskFailed`) are fatal: data integrity is at stake, or the
+//!   failure indicates a Zinder bug. The loop exits
 //!   so the supervising runtime can decide whether to restart, replay, or
 //!   require manual reset.
 //!
@@ -150,8 +150,8 @@ pub(crate) const fn default_recovery_backoff() -> SourceRecoveryBackoff {
 /// Returns the recovery decision for `error`.
 ///
 /// Source-shaped errors are always recoverable; the class drives the
-/// readiness payload and backoff selection. Storage and reorg-window
-/// failures, plus internal logic errors, exit the loop.
+/// readiness payload and backoff selection. Storage failures and internal
+/// logic errors exit the loop.
 pub(crate) fn decide_recovery(
     error: &IngestError,
     backoff: SourceRecoveryBackoff,
@@ -181,23 +181,7 @@ pub(crate) fn decide_recovery(
         | IngestError::TransparentPrevoutUnresolved { .. }
         | IngestError::CommitmentTreeCheckpointMissing { .. }
         | IngestError::CommitmentTreeState { .. }
-        | IngestError::ReorgWindowExceeded { .. }
-        | IngestError::CanonicalWriterReorgWindowMismatch { .. }
         | IngestError::UnknownNodeSource { .. }
-        | IngestError::SubtreeRootsUnavailable { .. }
-        | IngestError::SubtreeRootCompletingBlockMissing { .. }
-        | IngestError::TransparentOutputOutputMissing { .. }
-        | IngestError::UnsupportedShieldedProtocol { .. }
-        | IngestError::EmptyCanonicalBatch
-        | IngestError::BulkCatchupProducedNoCommit
-        | IngestError::BulkCatchupInsideReorgWindowRequiresOverride { .. }
-        | IngestError::BulkCatchupRequiresContiguousTipMetadata { .. }
-        | IngestError::BulkCatchupCheckpointMisaligned { .. }
-        | IngestError::TipFollowObservedTipBehindStore { .. }
-        | IngestError::TipFollowCommonAncestorMissing { .. }
-        | IngestError::TipFollowParentMetadataUnavailable { .. }
-        | IngestError::SystemTimeBeforeUnixEpoch { .. }
-        | IngestError::TimestampTooLarge
         | IngestError::CanonicalBlockConstruction(_)
         | IngestError::BlockingTaskFailed { .. }
         | IngestError::SourceSegmentFetchTaskStopped { .. }
@@ -314,13 +298,11 @@ mod tests {
     #[test]
     fn store_failures_exit_the_loop() {
         // We cannot easily construct a real StoreError without a live
-        // store, so we exercise reorg-window-exceeded (the other
-        // documented exit path) instead. Storage failures take the same
-        // branch by structural exhaustion.
-        let error = IngestError::ReorgWindowExceeded {
-            from_height: BlockHeight::new(100),
-            replacement_depth: 200,
-            configured_window_blocks: 100,
+        // store, so we exercise a missing commitment-tree checkpoint (a
+        // storage-integrity exit path) instead. Storage failures take the
+        // same branch by structural exhaustion.
+        let error = IngestError::CommitmentTreeCheckpointMissing {
+            height: BlockHeight::new(100),
         };
         assert_eq!(
             decide_recovery(&error, SourceRecoveryBackoff::FAST_FOR_TESTS),
@@ -369,6 +351,34 @@ mod tests {
         let reason = sanitize_reason(&error);
         assert!(matches!(reason, Cow::Owned(_)));
         assert!(reason.contains("connection refused"));
+    }
+
+    #[test]
+    fn source_failure_class_labels_match_runbook_table() {
+        // Pin the labels the runbook table promises operators. Renaming any of
+        // these requires updating dashboards and alert rules in lock-step.
+        assert_eq!(
+            SourceFailureClass::NodeUnreachable.label(),
+            "node_unreachable"
+        );
+        assert_eq!(
+            SourceFailureClass::UpstreamViewChanged.label(),
+            "upstream_view_changed"
+        );
+        assert_eq!(
+            SourceFailureClass::StreamDisconnected.label(),
+            "stream_disconnected"
+        );
+        assert_eq!(
+            SourceFailureClass::ProtocolMismatch.label(),
+            "protocol_mismatch"
+        );
+        assert_eq!(
+            SourceFailureClass::CapabilityMissing.label(),
+            "capability_missing"
+        );
+        assert_eq!(SourceFailureClass::Malformed.label(), "malformed");
+        assert_eq!(SourceFailureClass::Configuration.label(), "configuration");
     }
 
     #[test]

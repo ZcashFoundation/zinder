@@ -57,7 +57,7 @@ const BLOCK_PREPARE_CONCURRENCY_CEILING: u32 = 16;
 
 /// Shared source-fetch and block-preparation limits for canonical ingestion.
 ///
-/// Fresh store construction and incremental bulk catchup both consume this
+/// Fresh store construction and the construction benchmarks consume this
 /// value so runtime resource resolution cannot silently produce two pipeline
 /// shapes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

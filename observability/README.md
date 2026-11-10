@@ -177,7 +177,6 @@ wallet request to duplicate that proof.
 | --- | --- | --- |
 | `ZINDER_OBSERVABILITY_NETWORK` | `zcash-regtest` | Network written to service configs. |
 | `ZINDER_OBSERVABILITY_BULK_CATCHUP_BLOCKS` | `50` | Blocks ingested after the checkpoint. |
-| `ZINDER_OBSERVABILITY_CANONICAL_BATCH_MAX_BLOCKS` | `25` | Maximum blocks per canonical bulk-catchup batch. |
 | `ZINDER_OBSERVABILITY_GENERATE_BLOCKS` | `0` | Explicitly requested regtest blocks to mine after the ingest loop reaches the `TipFollow` phase. |
 | `ZINDER_OBSERVABILITY_CERTIFY_TOPOLOGY` | `0` | Set `1` on the `run` command to enable regtest-only lag, restart, and reorg certification. |
 | `ZINDER_OBSERVABILITY_COMPAT_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS` | `4` | Compatibility readiness threshold written to the generated config. |

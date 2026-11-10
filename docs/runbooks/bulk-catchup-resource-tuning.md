@@ -37,9 +37,6 @@ queue admission:
 - `block_prepare_concurrency` bounds CPU preparation slots, while
   `block_prepare_memory_watermark_bytes` admits their estimated and measured
   resident data.
-- `commit_reassembly_max_queued_artifact_bytes` bounds completed artifacts
-  waiting for ordered commit.
-- `canonical_batch_max_*` fields bound one canonical commit batch.
 
 The byte watermarks use container-aware defaults when a cgroup v2 memory limit
 is available. Explicit TOML or `ZINDER_INGEST__CONSTRUCTION__*` overrides win,

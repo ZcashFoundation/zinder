@@ -16,13 +16,17 @@ use std::{
 };
 
 use tokio_util::sync::CancellationToken;
-use zinder_core::{BlockHeight, CommitmentTreeCheckpoint};
+use zinder_core::BlockHeight;
 use zinder_runtime::{IngestPhase, Readiness};
 use zinder_source::{MempoolSourceAdmissionLimits, NodeTarget};
 
 use crate::{CanonicalPipelineLimits, NodeSourceKind, RawBlobPolicy};
 
 const BACKGROUND_WORK_PHASE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Default lag threshold (in blocks) below which the canonical follower
+/// reports `Ready`.
+pub const DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS: u64 = 1;
 
 /// Process-local admission gate for rebuildable historical work.
 ///
@@ -119,12 +123,12 @@ pub struct IngestRuntimeConfig {
     pub materialized_view_rocksdb_budget: zinder_store::RocksDbResourceBudget,
     /// Optional raw-byte blob write policy for canonical ingest.
     pub raw_blob_policy: RawBlobPolicy,
-    /// Reorg-window invariant. Bulk catch-up never advances the settled tip inside
-    /// this window unless `run_overrides.allow_reorg_window_settlement` is true.
+    /// Number of near-tip blocks the canonical store keeps replaceable by a
+    /// reorg.
     pub reorg_window_blocks: u32,
     /// Phase-classifier knobs (`[ingest.phase_classification]`).
     pub phase_classification: PhaseClassificationConfig,
-    /// Pipelined-fetch and commit knobs (`[ingest.construction]`).
+    /// Source-fetch and block-preparation knobs (`[ingest.construction]`).
     pub construction: CanonicalConstructionSettings,
     /// Live mempool admission and durable reconciliation limits (`[ingest.mempool]`).
     pub mempool: MempoolIngestSettings,
@@ -145,25 +149,11 @@ pub struct MempoolIngestSettings {
     pub reconciliation_batch_target_raw_transaction_bytes: NonZeroU64,
 }
 
-impl IngestRuntimeConfig {
-    /// Returns the canonical writer options shared by run, probe, and both ingest phases.
-    #[must_use]
-    pub fn canonical_store_options(&self) -> zinder_store::ChainStoreOptions {
-        crate::chain_ingest::canonical_writer_store_options(
-            self.node.network,
-            self.reorg_window_blocks,
-            self.canonical_rocksdb_budget,
-            self.raw_blob_policy,
-        )
-    }
-}
-
 /// Resolved `[ingest.phase_classification]` configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PhaseClassificationConfig {
-    /// Boundary between `BulkCatchup` and `FollowingTip`. Defaults to
-    /// `reorg_window_blocks` so bulk catch-up's `AdvanceSettledTipTo`
-    /// horizon never crosses the reorg cliff.
+    /// Gap at which `zinder-ingest probe` reports `BulkCatchup` instead of
+    /// `FollowingTip`. Defaults to `reorg_window_blocks`.
     pub catchup_threshold_blocks: u32,
 }
 
@@ -173,10 +163,9 @@ pub struct MaterializedViewReplayConfig {
     /// Maximum block contexts hydrated and dispatched in one materialized-view replay
     /// write.
     ///
-    /// This bound is independent of `ingest.construction.canonical_batch_max_blocks`
-    /// because replay may resume from retained chain events after the writer
-    /// has already committed them. Keeping replay memory bounded here prevents
-    /// a large retained event from becoming one unbounded in-memory hydration.
+    /// Replay may resume from retained chain events after the writer has
+    /// already committed them. Keeping replay memory bounded here prevents a
+    /// large retained event from becoming one unbounded in-memory hydration.
     pub replay_batch_blocks: NonZeroU32,
     /// Replay pressure policy for the async materialized-view tailer.
     ///
@@ -248,28 +237,8 @@ impl MaterializedViewReplayPolicy {
 /// Resolved `[ingest.construction]` configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CanonicalConstructionSettings {
-    /// Maximum number of blocks committed in one bulk-catchup batch.
-    pub canonical_batch_max_blocks: NonZeroU32,
-    /// Maximum canonical artifact bytes accumulated before closing a batch.
-    pub canonical_batch_max_artifact_bytes: NonZeroU64,
-    /// Maximum estimated canonical write bytes accumulated before closing a batch.
-    pub canonical_batch_max_estimated_write_bytes: NonZeroU64,
-    /// Minimum batch size before estimated write bytes can close the batch.
-    pub canonical_batch_min_blocks_before_estimated_write_close: NonZeroU32,
     /// Shared source-fetch and block-preparation limits.
     pub pipeline_limits: CanonicalPipelineLimits,
-    /// Maximum settled-tip artifact bytes allowed to queue while the previous
-    /// canonical batch is attaching metadata, committing, or flushing.
-    pub commit_reassembly_max_queued_artifact_bytes: NonZeroU64,
-    /// Force a `RocksDB` flush every N committed epochs.
-    ///
-    /// Caps the live WAL by writer cadence rather than `RocksDB`'s WAL-size
-    /// safety trigger. With the default `canonical_batch_max_blocks = 1000` and
-    /// `flush_interval_epochs = 5`, the writer truncates the WAL after
-    /// every 5,000 committed blocks, bounding crash-recovery RAM
-    /// proportionally. See
-    /// [the resource-tuning runbook](../../../docs/runbooks/bulk-catchup-resource-tuning.md).
-    pub flush_interval_epochs: NonZeroU32,
 }
 
 /// Resolved `[ingest.follow]` configuration.
@@ -289,24 +258,16 @@ pub struct CanonicalFollowSettings {
 /// Resolved `[ingest.run_overrides]` configuration.
 ///
 /// Optional knobs that scope or bound a single ingest run. Operators
-/// rarely set these; they exist for forked-store recovery and the
-/// historical wallet-serving bootstrap.
+/// rarely set these; they exist for bounded runs and the historical
+/// wallet-serving bootstrap.
 #[derive(Clone, Debug, Default)]
 pub struct CanonicalRunOverrides {
     /// Stop committing after reaching this height. `None` means run
     /// indefinitely.
     pub target_height: Option<BlockHeight>,
-    /// Seed an empty store from this height when set. The ingest loop
-    /// looks the corresponding checkpoint up against the upstream node
-    /// before entering the first phase.
+    /// Construct an empty store from the upstream node's checkpoint at this
+    /// height when set.
     pub checkpoint_height: Option<BlockHeight>,
-    /// Allow bulk-catchup batches to advance the settled tip inside the upstream
-    /// node's reorg window. Disposable-store recovery only.
-    pub allow_reorg_window_settlement: bool,
-    /// Optional starting checkpoint resolved against the upstream node
-    /// before the loop starts. Populated by the binary entrypoint after
-    /// the `checkpoint_height` lookup completes.
-    pub checkpoint: Option<CommitmentTreeCheckpoint>,
 }
 
 /// Waits until canonical ingest and materialized-view replay release the storage budget

@@ -535,10 +535,6 @@ impl SourceBlockChunk {
         self.blocks.pop_front()
     }
 
-    pub(crate) fn push_front(&mut self, block: SourceBlock) {
-        self.blocks.push_front(block);
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
         self.blocks.is_empty()
     }

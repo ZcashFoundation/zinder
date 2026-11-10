@@ -48,7 +48,7 @@ Serving coverage fails closed:
 
 - `wallet-serving` rejects explicit `from_height` and `checkpoint_height` overrides.
 - An existing or staged READY store is rejected when its immutable retained-history floor is later than the floor required by the current invocation. Following cannot repair omitted history; operators must rebuild the canonical and wallet stores.
-- `wallet-serving` rejects `allow_reorg_window_settlement`; a serving store must stop bulk catchup outside the configured reorg window and let `tip-follow` ingest the replaceable suffix.
+- A serving store settles only outside the configured reorg window: construction publishes its settled tip `ingest.reorg_window_blocks` below the construction tip, and the canonical follower ingests the replaceable suffix.
 - Missing artifacts remain `ArtifactUnavailable`. Query services do not synthesize responses from upstream nodes, with one bounded exception: `tree_state_at(height)` fills from the configured upstream node on a cache-miss (see the tree-state-at-height carve-out under Tradeoffs).
 - Readiness does not claim production traffic is safe before secondary catchup and writer-status validation have established the reader's state.
 
