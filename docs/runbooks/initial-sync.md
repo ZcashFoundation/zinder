@@ -132,7 +132,7 @@ fence, and wallet digest.
 
 | Runtime | Normal initial state | Ready boundary |
 | --- | --- | --- |
-| ingest | `starting` or `syncing` | Canonical lag is within threshold and mempool snapshot is complete |
+| ingest | `starting`, `syncing`, or `upstream_not_ready` | Canonical lag is within threshold, mempool snapshot is complete, and a configured `[node.health]` probe reports Zebra ready |
 | projector | `starting` or `syncing` | Wallet store is published and following the admitted canonical source |
 | native query | `starting`, `replica_lagging`, `writer_status_unavailable`, `ingest_control_unavailable`, or `canonical_tip_unconfirmed` | One exact canonical and wallet pair is published, the admitted node is healthy, and `WriterStatus` plus a bounded mempool snapshot succeed through the admitted ingest-control channel |
 | compatibility | `starting`, `replica_lagging`, `writer_status_unavailable`, or `canonical_tip_unconfirmed` | One exact canonical and wallet pair (or, for compact-block serving, one canonical reader) is published, and the writer has confirmed its tip against its node and does not report a park |

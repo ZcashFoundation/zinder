@@ -42,7 +42,7 @@ use zinder_materialized_views::{
     ValuePoolFlowHistoryConsumer,
 };
 use zinder_proto::v1::wallet::{MaterializedViewHealth, MaterializedViewStatus};
-use zinder_runtime::{IngestPhase, Readiness, ReadinessCause};
+use zinder_runtime::{ComposedReadiness, IngestPhase, Readiness, ReadinessCause};
 use zinder_store::{
     CanonicalEventCursor, CanonicalEventHistoryRequest, CanonicalEventKind, CanonicalRetainedEvent,
     CanonicalStoreError, ChainEpochCommitted, ChainEvent, ChainRangeReverted,
@@ -1295,7 +1295,7 @@ async fn run_materialized_view_tailer(
 
     let mut budget = MaterializedViewReplayBudget::with_phase_gate_and_cancel(
         tailer.config,
-        historical_work_gate.readiness(),
+        historical_work_gate.readiness().runtime_readiness(),
         cancel.clone(),
     );
     let mut cursor_risk = CursorRiskWatch::new(&tailer, historical_work_gate.readiness());
@@ -1367,9 +1367,12 @@ const SECONDS_PER_HOUR: u64 = 3_600;
 ///
 /// The persisted cursor names a retained canonical transition. Once it stops
 /// advancing, the writer's retention sweep walks toward it, so a long stall is
-/// the operator's lead time before the plane needs a rebuild.
+/// the operator's lead time before the plane needs a rebuild. The warning
+/// lives on the writer's admission state, which the follow loop keeps under a
+/// lag-derived `Ready`; a refusing input such as the upstream probe still
+/// supplies the projected cause while it fails.
 struct CursorRiskWatch {
-    readiness: Readiness,
+    readiness: ComposedReadiness,
     retention_hours: u64,
     warning_after: Duration,
     last_event_sequence: Option<u64>,
@@ -1378,7 +1381,7 @@ struct CursorRiskWatch {
 }
 
 impl CursorRiskWatch {
-    fn new(tailer: &MaterializedViewTailer, readiness: Readiness) -> Option<Self> {
+    fn new(tailer: &MaterializedViewTailer, readiness: ComposedReadiness) -> Option<Self> {
         let retention = tailer.chain_event_retention_window?;
         Some(Self {
             readiness,
@@ -1409,7 +1412,7 @@ impl CursorRiskWatch {
 
     fn raise(&mut self, stalled_hours: u64) {
         let retention_hours = self.retention_hours;
-        self.readiness.update(|state| {
+        self.readiness.update_admission(|state| {
             if matches!(state.cause, ReadinessCause::Ready) {
                 state.cause = ReadinessCause::CursorAtRisk {
                     oldest_retained_age_hours: stalled_hours,
@@ -1431,7 +1434,7 @@ impl CursorRiskWatch {
     }
 
     fn clear(&mut self) {
-        self.readiness.update(|state| {
+        self.readiness.update_admission(|state| {
             if matches!(state.cause, ReadinessCause::CursorAtRisk { .. }) {
                 state.cause = ReadinessCause::Ready;
             }
@@ -1968,7 +1971,7 @@ mod tests {
         }
     }
 
-    fn cursor_risk_watch(readiness: Readiness) -> CursorRiskWatch {
+    fn cursor_risk_watch(readiness: ComposedReadiness) -> CursorRiskWatch {
         CursorRiskWatch {
             readiness,
             retention_hours: 168,
@@ -1982,8 +1985,9 @@ mod tests {
     #[test]
     fn a_stalled_cursor_warns_only_while_the_runtime_is_otherwise_ready() {
         let readiness = Readiness::default();
-        let mut watch = cursor_risk_watch(readiness.clone());
-        readiness.set(zinder_runtime::ReadinessState::syncing(
+        let composed = ComposedReadiness::new(readiness.clone(), &[]);
+        let mut watch = cursor_risk_watch(composed.clone());
+        composed.publish_admission(zinder_runtime::ReadinessState::syncing(
             Some(10),
             Some(90),
             Some(100),
@@ -1996,7 +2000,7 @@ mod tests {
             ReadinessCause::Syncing { .. }
         ));
 
-        readiness.set(zinder_runtime::ReadinessState::ready(Some(100)));
+        composed.publish_admission(zinder_runtime::ReadinessState::ready(Some(100)));
         watch.raise(25);
 
         assert!(matches!(
@@ -2011,8 +2015,9 @@ mod tests {
     #[test]
     fn an_advancing_cursor_clears_the_warning_without_touching_other_causes() {
         let readiness = Readiness::default();
-        let mut watch = cursor_risk_watch(readiness.clone());
-        readiness.set(zinder_runtime::ReadinessState::cursor_at_risk(
+        let composed = ComposedReadiness::new(readiness.clone(), &[]);
+        let mut watch = cursor_risk_watch(composed.clone());
+        composed.publish_admission(zinder_runtime::ReadinessState::cursor_at_risk(
             25,
             168,
             Some(100),
@@ -2022,7 +2027,7 @@ mod tests {
 
         assert!(matches!(readiness.report().cause, ReadinessCause::Ready));
 
-        readiness.set(zinder_runtime::ReadinessState::syncing(
+        composed.publish_admission(zinder_runtime::ReadinessState::syncing(
             Some(10),
             Some(90),
             Some(100),

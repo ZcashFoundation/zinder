@@ -28,9 +28,9 @@ use zinder_ingest::{
 };
 use zinder_materialized_views::{MaterializedViewPreset, MaterializedViewStore};
 use zinder_runtime::{
-    OpsEndpointHandle, OpsServerError, Readiness, ReadinessState, RuntimeService, StartupPhase,
-    cancel_on_terminating_signal, host_cpu_meets_compiled_baseline, install_tracing_subscriber,
-    spawn_ops_endpoint_for,
+    ComposedReadiness, OpsEndpointHandle, OpsServerError, Readiness, ReadinessState,
+    RuntimeService, StartupPhase, cancel_on_terminating_signal, host_cpu_meets_compiled_baseline,
+    install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 use zinder_source::{
     JsonRpcMempoolSource, JsonRpcMempoolSourceOptions, MempoolSource, NodeCapabilities,
@@ -249,6 +249,7 @@ async fn run_ingest(
     let mut command_config = config::load_ingest_config(config_path, overrides)?;
     load_config_phase.complete();
     let readiness = Readiness::default();
+    let writer_readiness = ComposedReadiness::new(readiness.clone(), &[]);
     let start_api_phase = StartupPhase::StartApi.start();
     let ops_handle = spawn_ops_endpoint_for(
         RuntimeService::Ingest,
@@ -269,7 +270,7 @@ async fn run_ingest(
     )?;
     connect_node_phase.complete();
     let check_schema_phase = StartupPhase::CheckSchema.start();
-    ensure_node_capabilities(&source, &readiness).await?;
+    ensure_node_capabilities(&source, &writer_readiness).await?;
     let network_upgrade_activations = source
         .discover_network_upgrade_activations("zinder-ingest")
         .await
@@ -281,6 +282,10 @@ async fn run_ingest(
     recover_state_phase.complete();
     let termination = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(termination.clone());
+    tokio::spawn(drain_readiness_on_termination(
+        termination.clone(),
+        writer_readiness.clone(),
+    ));
     let worker_cancel = termination.child_token();
     // The control listener outlives the worker drain so a parked writer can
     // still report its typed halt to readers until termination.
@@ -299,7 +304,7 @@ async fn run_ingest(
         upstream_health_probe: spawn_upstream_health_probe_for(
             &command_config.runtime_config.node,
             &source,
-            readiness.clone(),
+            writer_readiness.clone(),
             worker_cancel.clone(),
         ),
         memory_metrics: spawn_runtime_memory_metrics_task(
@@ -309,7 +314,7 @@ async fn run_ingest(
         materialized_view_plane: tokio::spawn(run_materialized_view_plane(
             materialized_view_plane,
             readiness.clone(),
-            HistoricalWorkGate::new(readiness.clone()),
+            HistoricalWorkGate::new(writer_readiness.clone()),
             worker_cancel.clone(),
         )),
         replay_budget_metrics: command_config.explorer_views.then(|| {
@@ -342,7 +347,7 @@ async fn run_ingest(
         &source,
         network_upgrade_activations,
         writer_config,
-        &readiness,
+        &writer_readiness,
         &worker_cancel,
         canonical_control_tasks.commands.take(),
     );
@@ -359,7 +364,7 @@ async fn run_ingest(
     coordinate_canonical_writer_lifecycle(
         writer_result,
         &termination,
-        &readiness,
+        &writer_readiness,
         shutdown_ingest_worker_tasks(&worker_cancel, canonical_control_tasks, worker_tasks),
         async move {
             control_server_cancel.cancel();
@@ -556,7 +561,7 @@ async fn await_mempool_retention_exit(
 async fn coordinate_canonical_writer_lifecycle<DrainWorkers, ShutdownOps>(
     writer_result: Result<(), zinder_ingest::CanonicalWriterError>,
     termination: &CancellationToken,
-    readiness: &Readiness,
+    readiness: &ComposedReadiness,
     drain_workers: DrainWorkers,
     shutdown_ops: ShutdownOps,
 ) -> Result<(), IngestConfigError>
@@ -569,7 +574,7 @@ where
         Err(zinder_ingest::CanonicalWriterError::Follow(
             zinder_ingest::CanonicalFollowError::ReorgWindowExceeded(evidence),
         )) => {
-            readiness.park(evidence.parked_readiness());
+            readiness.park_admission(evidence.parked_readiness());
             tracing::warn!(
                 target: "zinder::ingest",
                 event = "canonical_writer_reorg_window_exceeded",
@@ -603,6 +608,16 @@ where
             }
         }
     }
+}
+
+/// Lowers readiness to `shutting_down` as soon as termination is requested,
+/// before the writer and its workers drain.
+async fn drain_readiness_on_termination(
+    termination: CancellationToken,
+    readiness: ComposedReadiness,
+) {
+    termination.cancelled().await;
+    readiness.publish_shutting_down();
 }
 
 /// Background tasks the ingest runtime drains before the ops endpoint closes.
@@ -1027,7 +1042,7 @@ fn resolve_wallet_serving_modifiers(command_config: &mut IngestCommandConfig) {
 
 async fn ensure_node_capabilities(
     source: &ZebraJsonRpcSource,
-    readiness: &Readiness,
+    readiness: &ComposedReadiness,
 ) -> Result<NodeCapabilities, IngestConfigError> {
     let probed_capabilities = match source.probe_capabilities().await {
         Ok(capabilities) => capabilities,
@@ -1036,7 +1051,7 @@ async fn ensure_node_capabilities(
                 probe_error.upstream_classification().label(),
                 probe_error.to_string(),
             );
-            readiness.set(ReadinessState::node_unavailable_with_detail(detail, None));
+            readiness.publish_admission(ReadinessState::node_unavailable_with_detail(detail, None));
             tracing::warn!(
                 target: "zinder::ingest",
                 event = "node_capability_probe_failed",
@@ -1069,7 +1084,7 @@ async fn ensure_node_capabilities(
 
     if let Err(error) = require_ingest_node_capabilities(probed_capabilities) {
         if let zinder_source::SourceError::NodeCapabilityMissing { capability } = &error {
-            readiness.set(ReadinessState::node_capability_missing(capability.name()));
+            readiness.publish_admission(ReadinessState::node_capability_missing(capability.name()));
             tracing::error!(
                 target: "zinder::ingest",
                 event = "node_capability_missing",
@@ -1162,7 +1177,7 @@ fn build_live_mempool_source(
 fn spawn_upstream_health_probe_for(
     node_target: &NodeTarget,
     json_rpc_source: &ZebraJsonRpcSource,
-    readiness: Readiness,
+    readiness: ComposedReadiness,
     cancel: CancellationToken,
 ) -> Option<JoinHandle<()>> {
     let health_config = node_target.health.as_ref()?;
@@ -1281,10 +1296,31 @@ mod tests {
 
     use super::{
         CanonicalControlTasks, MaterializedViewPlaneSpec, NodeCapabilities, NodeCapability,
-        ZebraJsonRpcSource, coordinate_canonical_writer_lifecycle, explorer_view_preset,
-        explorer_views_start_backfills, materialized_view_secondary_path,
+        ZebraJsonRpcSource, coordinate_canonical_writer_lifecycle, drain_readiness_on_termination,
+        explorer_view_preset, explorer_views_start_backfills, materialized_view_secondary_path,
         require_ingest_node_capabilities, run_materialized_view_plane, supervise_canonical_writer,
     };
+
+    fn writer_readiness() -> (zinder_runtime::Readiness, zinder_runtime::ComposedReadiness) {
+        let readiness = zinder_runtime::Readiness::default();
+        let composed = zinder_runtime::ComposedReadiness::new(readiness.clone(), &[]);
+        (readiness, composed)
+    }
+
+    #[tokio::test]
+    async fn termination_drains_readiness_before_the_writer_stops() {
+        let (readiness, composed) = writer_readiness();
+        composed.publish_admission(zinder_runtime::ReadinessState::ready(Some(7)));
+        let termination = CancellationToken::new();
+        termination.cancel();
+
+        drain_readiness_on_termination(termination, composed.clone()).await;
+        composed.publish_admission(zinder_runtime::ReadinessState::ready(Some(8)));
+
+        let report = readiness.report();
+        assert_eq!(report.cause, zinder_runtime::ReadinessCause::ShuttingDown);
+        assert!(!report.is_ready);
+    }
 
     #[test]
     fn explorer_views_task_composition_matches_admission() {
@@ -1307,7 +1343,7 @@ mod tests {
         fs::create_dir_all(&materialized_view_path)?;
         let sentinel_path = materialized_view_path.join("disabled-sentinel");
         fs::write(&sentinel_path, b"leave this store untouched")?;
-        let readiness = zinder_runtime::Readiness::default();
+        let (readiness, composed) = writer_readiness();
         let spec = MaterializedViewPlaneSpec {
             explorer_views: false,
             secondary_path: materialized_view_secondary_path(&storage_path),
@@ -1327,7 +1363,7 @@ mod tests {
         run_materialized_view_plane(
             spec,
             readiness.clone(),
-            zinder_ingest::HistoricalWorkGate::new(readiness.clone()),
+            zinder_ingest::HistoricalWorkGate::new(composed),
             CancellationToken::new(),
         )
         .await;
@@ -1373,15 +1409,15 @@ mod tests {
     #[tokio::test]
     async fn writer_reorg_window_exceeded_drains_workers_then_parks_ops_until_termination()
     -> Result<(), Box<dyn std::error::Error>> {
-        let readiness = zinder_runtime::Readiness::default();
+        let (readiness, composed) = writer_readiness();
         let termination = tokio_util::sync::CancellationToken::new();
         let workers_drained = Arc::new(AtomicBool::new(false));
         let ops_shutdown = Arc::new(AtomicBool::new(false));
         let drain_workers = {
             let workers_drained = Arc::clone(&workers_drained);
-            let readiness = readiness.clone();
+            let composed = composed.clone();
             async move {
-                readiness.set(zinder_runtime::ReadinessState::starting());
+                composed.publish_admission(zinder_runtime::ReadinessState::starting());
                 workers_drained.store(true, Ordering::SeqCst);
             }
         };
@@ -1396,7 +1432,7 @@ mod tests {
         let mut lifecycle = Box::pin(coordinate_canonical_writer_lifecycle(
             writer_result,
             &termination,
-            &readiness,
+            &composed,
             drain_workers,
             shutdown_ops,
         ));
@@ -1445,7 +1481,7 @@ mod tests {
     #[tokio::test]
     async fn non_reorg_writer_error_drains_workers_shuts_ops_and_returns_without_termination()
     -> Result<(), Box<dyn std::error::Error>> {
-        let readiness = zinder_runtime::Readiness::default();
+        let (_readiness, composed) = writer_readiness();
         let termination = tokio_util::sync::CancellationToken::new();
         let workers_drained = Arc::new(AtomicBool::new(false));
         let ops_shutdown = Arc::new(AtomicBool::new(false));
@@ -1471,7 +1507,7 @@ mod tests {
             coordinate_canonical_writer_lifecycle(
                 writer_result,
                 &termination,
-                &readiness,
+                &composed,
                 drain_workers,
                 shutdown_ops,
             ),
@@ -1497,7 +1533,7 @@ mod tests {
     #[tokio::test]
     async fn successful_writer_propagates_ops_shutdown_failure()
     -> Result<(), Box<dyn std::error::Error>> {
-        let readiness = zinder_runtime::Readiness::default();
+        let (_readiness, composed) = writer_readiness();
         let termination = CancellationToken::new();
         let shutdown_ops = async {
             Err(zinder_runtime::OpsServerError::Transport {
@@ -1508,7 +1544,7 @@ mod tests {
         let error = coordinate_canonical_writer_lifecycle(
             Ok(()),
             &termination,
-            &readiness,
+            &composed,
             async {},
             shutdown_ops,
         )

@@ -25,7 +25,7 @@ use zinder_materialized_views::{
     MaterializedViewStoreOptions, REORG_INCIDENTS_CONSUMER_NAME, decode_stored_record,
 };
 use zinder_proto::v1::wallet::{MaterializedViewHealth, MaterializedViewStatus};
-use zinder_runtime::{IngestPhase, Readiness};
+use zinder_runtime::{ComposedReadiness, IngestPhase, Readiness};
 use zinder_source::{
     NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceChainSegment,
     SourceChainSegmentLimits, SourceError, SourceSubtreeRoots,
@@ -159,8 +159,8 @@ async fn the_tailer_publishes_a_live_status_and_opens_the_historical_work_gate()
     let mut harness = CanonicalHarness::baseline().await?;
     harness.follow_to_tip().await?;
     let (_directory, view) = view_store()?;
-    let readiness = Readiness::default();
-    readiness.set_phase(IngestPhase::FollowingTip);
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    readiness.update_admission(|admission| admission.phase = Some(IngestPhase::FollowingTip));
     let gate = zinder_ingest::HistoricalWorkGate::new(readiness);
     let cancel = CancellationToken::new();
 
@@ -328,7 +328,7 @@ impl CanonicalHarness {
             .store
             .take()
             .ok_or("the canonical store must be open")?;
-        let readiness = Readiness::default();
+        let readiness = ComposedReadiness::new(Readiness::default(), &[]);
         let cancel = CancellationToken::new();
         let follower = CanonicalFollower::new(
             &self.source,

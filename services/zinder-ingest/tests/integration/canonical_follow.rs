@@ -27,7 +27,7 @@ use zinder_ingest::{
     RawBlobPolicy, follow_canonical_tip, follow_canonical_tip_with_control, load_fresh_canonical,
     prepare_canonical_block,
 };
-use zinder_runtime::{Readiness, ReadinessCause};
+use zinder_runtime::{ComposedReadiness, Readiness, ReadinessCause};
 use zinder_source::{
     NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceChainSegment,
     SourceChainSegmentLimits, SourceError, SourceSubtreeRoots,
@@ -290,7 +290,7 @@ async fn canonical_follower_settles_from_local_header_without_historical_source_
     source.set_tip_height(BlockHeight::new(4));
     source.clear_calls();
 
-    let readiness = Readiness::default();
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let cancel = CancellationToken::new();
     let follower = CanonicalFollower::new(
         &source,
@@ -360,7 +360,7 @@ async fn canonical_follower_cancellation_after_reorg_preparation_preserves_origi
         BlockHeight::new(4),
     );
     source.clear_calls();
-    let readiness = Readiness::default();
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let cancel = CancellationToken::new();
     source.cancel_after_checkpoint(BlockHeight::new(4), cancel.clone());
     let follower = CanonicalFollower::new(
@@ -446,7 +446,7 @@ async fn canonical_follower_replaces_shallow_fork_reopens_and_continues_appendin
         BlockHeight::new(4),
     );
     source.clear_calls();
-    let readiness = Readiness::default();
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let cancel = CancellationToken::new();
     source.cancel_after_tip_call(2, cancel.clone());
     let follower = CanonicalFollower::new(
@@ -522,7 +522,7 @@ async fn canonical_follower_replaces_shallow_fork_reopens_and_continues_appendin
     source.set_tip_height(BlockHeight::new(5));
     source.clear_calls();
     let append_cancel = CancellationToken::new();
-    let append_readiness = Readiness::default();
+    let append_readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let follower = CanonicalFollower::new(
         &source,
         activations,
@@ -592,7 +592,7 @@ async fn canonical_follower_refuses_a_fork_below_settlement_without_mutation()
         BlockHeight::new(4),
     );
     source.clear_calls();
-    let readiness = Readiness::default();
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let cancel = CancellationToken::new();
     let follower = CanonicalFollower::new(
         &source,
@@ -620,7 +620,7 @@ async fn canonical_follower_refuses_a_fork_below_settlement_without_mutation()
             if evidence.required_depth == 3 && evidence.configured_window_blocks == 2
     ));
     assert!(matches!(
-        readiness.report().cause,
+        readiness.runtime_readiness().report().cause,
         ReadinessCause::ReorgWindowExceeded {
             depth: 3,
             configured: 2,
@@ -685,7 +685,7 @@ async fn parked_follower_serves_its_frozen_fence_until_termination()
         checkpoints_for_parseable_chain(&over_window, &activations)?,
         BlockHeight::new(4),
     );
-    let readiness = Readiness::default();
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let cancel = CancellationToken::new();
     let (canonical, commands) = zinder_ingest::canonical_control_channel();
     let follower = single_pass_follower(&source, &activations, &readiness, &cancel);
@@ -694,12 +694,12 @@ async fn parked_follower_serves_its_frozen_fence_until_termination()
     let observe_parked = async {
         let before_observation = canonical.writer_status().await;
         while !matches!(
-            readiness.report().cause,
+            readiness.runtime_readiness().report().cause,
             ReadinessCause::ReorgWindowExceeded { .. }
         ) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        readiness.set(zinder_runtime::ReadinessState::ready(Some(4)));
+        readiness.publish_admission(zinder_runtime::ReadinessState::ready(Some(4)));
         let snapshot = canonical.writer_status().await;
         cancel.cancel();
         (before_observation, snapshot)
@@ -734,7 +734,7 @@ async fn parked_follower_serves_its_frozen_fence_until_termination()
         original_fence.visible_tip().height.value()
     );
     assert!(matches!(
-        readiness.report().cause,
+        readiness.runtime_readiness().report().cause,
         ReadinessCause::ReorgWindowExceeded {
             depth: 3,
             configured: 2,
@@ -773,18 +773,21 @@ async fn reopened_writer_reports_an_unconfirmed_tip_until_the_source_confirms_it
     .await?;
     // The node is unreachable when the writer reopens: its tip has no block.
     source.set_tip_height(BlockHeight::new(99));
-    let readiness = Readiness::default();
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let cancel = CancellationToken::new();
     let (canonical, commands) = zinder_ingest::canonical_control_channel();
     let follower = single_pass_follower(&source, &activations, &readiness, &cancel);
     let observe = async {
         let before_observation = canonical.writer_status().await?;
-        while !matches!(readiness.report().cause, ReadinessCause::NodeUnavailable(_)) {
+        while !matches!(
+            readiness.runtime_readiness().report().cause,
+            ReadinessCause::NodeUnavailable(_)
+        ) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let while_unreachable = canonical.writer_status().await?;
         source.set_tip_height(BlockHeight::new(4));
-        while !readiness.report().is_ready {
+        while !readiness.runtime_readiness().report().is_ready {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let after_confirmation = canonical.writer_status().await?;
@@ -837,19 +840,19 @@ async fn node_behind_the_settled_tip_on_the_canonical_branch_waits_instead_of_pa
         .await?;
         let original_fence = store.event_fence();
         source.set_tip_height(behind_tip);
-        let readiness = Readiness::default();
+        let readiness = ComposedReadiness::new(Readiness::default(), &[]);
         let cancel = CancellationToken::new();
         let (canonical, commands) = zinder_ingest::canonical_control_channel();
         let follower = single_pass_follower(&source, &activations, &readiness, &cancel);
         let observe = async {
             while !matches!(
-                readiness.report().cause,
+                readiness.runtime_readiness().report().cause,
                 ReadinessCause::NodeUnavailable(ref detail)
                     if detail.failure_class == "upstream_view_changed"
                         && detail.last_reason.contains("at or below the settled tip")
             ) {
                 if matches!(
-                    readiness.report().cause,
+                    readiness.runtime_readiness().report().cause,
                     ReadinessCause::ReorgWindowExceeded { .. }
                 ) {
                     cancel.cancel();
@@ -861,7 +864,7 @@ async fn node_behind_the_settled_tip_on_the_canonical_branch_waits_instead_of_pa
             }
             let while_behind = canonical.writer_status().await?;
             source.set_tip_height(BlockHeight::new(4));
-            while !readiness.report().is_ready {
+            while !readiness.runtime_readiness().report().is_ready {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             let after_catch_up = canonical.writer_status().await?;
@@ -912,7 +915,7 @@ async fn node_behind_the_settled_tip_on_a_conflicting_branch_parks()
         checkpoints_for_parseable_chain(&conflicting, &activations)?,
         BlockHeight::new(2),
     );
-    let readiness = Readiness::default();
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let cancel = CancellationToken::new();
     let follower = single_pass_follower(&source, &activations, &readiness, &cancel);
     let error = follow_canonical_tip(store, follower)
@@ -926,7 +929,7 @@ async fn node_behind_the_settled_tip_on_a_conflicting_branch_parks()
                 && evidence.source_tip.height == BlockHeight::new(2)
     ));
     assert!(matches!(
-        readiness.report().cause,
+        readiness.runtime_readiness().report().cause,
         ReadinessCause::ReorgWindowExceeded { depth: 3, .. }
     ));
     Ok(())
@@ -1023,7 +1026,7 @@ async fn statuses_around_first_commit(
 > {
     source.clear_calls();
     let (second_tip_call, resume_second_tip_call) = source.pause_tip_call(2);
-    let readiness = Readiness::default();
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let cancel = CancellationToken::new();
     let (canonical, commands) = zinder_ingest::canonical_control_channel();
     let follower = single_pass_follower(source, activations, &readiness, &cancel);
@@ -1034,7 +1037,10 @@ async fn statuses_around_first_commit(
         second_tip_call.notified().await;
         source.set_tip_height(BlockHeight::new(99));
         resume_second_tip_call.notify_one();
-        while !matches!(readiness.report().cause, ReadinessCause::NodeUnavailable(_)) {
+        while !matches!(
+            readiness.runtime_readiness().report().cause,
+            ReadinessCause::NodeUnavailable(_)
+        ) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let after = canonical.writer_status().await?;
@@ -1087,7 +1093,7 @@ async fn canonical_follower_replaces_through_its_window_and_refuses_one_block_de
             BlockHeight::new(4),
         );
         source.clear_calls();
-        let readiness = Readiness::default();
+        let readiness = ComposedReadiness::new(Readiness::default(), &[]);
         let cancel = CancellationToken::new();
         source.cancel_after_tip_call(2, cancel.clone());
         let outcome = follow_canonical_tip(
@@ -1112,7 +1118,7 @@ async fn canonical_follower_replaces_through_its_window_and_refuses_one_block_de
                         && evidence.local_tip == original_fence.visible_tip()
             ));
             assert!(matches!(
-                readiness.report().cause,
+                readiness.runtime_readiness().report().cause,
                 ReadinessCause::ReorgWindowExceeded {
                     depth: 4,
                     configured: 3,
@@ -1174,7 +1180,7 @@ async fn canonical_follower_follows_a_deeper_fork_after_an_in_place_window_raise
         checkpoints_for_parseable_chain(&extended, &activations)?,
         BlockHeight::new(5),
     );
-    let readiness = Readiness::default();
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let cancel = CancellationToken::new();
     let follower = CanonicalFollower::new(
         &source,
@@ -1274,7 +1280,7 @@ async fn halt_during_a_raised_window_ramp_reports_the_covered_depth()
         BlockHeight::new(4),
     );
     source.clear_calls();
-    let readiness = Readiness::default();
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let cancel = CancellationToken::new();
     source.cancel_after_tip_call(2, cancel.clone());
     let error = follow_canonical_tip(
@@ -1293,7 +1299,7 @@ async fn halt_during_a_raised_window_ramp_reports_the_covered_depth()
                 && evidence.covered_depth_blocks == 2
     ));
     assert!(matches!(
-        readiness.report().cause,
+        readiness.runtime_readiness().report().cause,
         ReadinessCause::ReorgWindowExceeded {
             depth: 3,
             configured: 3,
@@ -1381,7 +1387,7 @@ async fn follow_fork_with_replacement_budget(
         checkpoints_for_parseable_chain(fork, activations)?,
         BlockHeight::new(4),
     );
-    let readiness = Readiness::default();
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let cancel = CancellationToken::new();
     let follower = CanonicalFollower::new(
         &source,
@@ -1419,7 +1425,7 @@ async fn follow_fork_with_replacement_budget(
 fn single_pass_follower<'a>(
     source: &'a RecordingParseableSource,
     activations: &Arc<NetworkUpgradeActivations>,
-    readiness: &'a Readiness,
+    readiness: &'a ComposedReadiness,
     cancel: &'a CancellationToken,
 ) -> CanonicalFollower<'a, RecordingParseableSource> {
     CanonicalFollower::new(
@@ -1507,7 +1513,7 @@ async fn retention_steps_yield_to_canonical_source_observation()
     let (first_tip_entered, resume_first_tip) = source.pause_tip_call(1);
     let follower_source = source.clone();
     let follower_task = tokio::spawn(async move {
-        let readiness = Readiness::default();
+        let readiness = ComposedReadiness::new(Readiness::default(), &[]);
         let follower = CanonicalFollower::new(
             &follower_source,
             activations,
@@ -1571,7 +1577,7 @@ async fn canonical_follower_reports_source_outage_and_resumes_after_recovery()
     // The node advertises a tip whose block it cannot serve yet.
     source.set_tip_height(BlockHeight::new(3));
 
-    let readiness = Readiness::default();
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let cancel = CancellationToken::new();
     let follower_source = source.clone();
     let follower_readiness = readiness.clone();
@@ -1597,7 +1603,9 @@ async fn canonical_follower_reports_source_outage_and_resumes_after_recovery()
 
     let outage = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let ReadinessCause::NodeUnavailable(detail) = readiness.report().cause {
+            if let ReadinessCause::NodeUnavailable(detail) =
+                readiness.runtime_readiness().report().cause
+            {
                 return detail;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1616,7 +1624,7 @@ async fn canonical_follower_reports_source_outage_and_resumes_after_recovery()
     let store = tokio::time::timeout(Duration::from_secs(5), follower_task).await???;
     assert_eq!(store.event_fence().visible_tip(), block_id(&blocks, 3)?);
     assert!(!matches!(
-        readiness.report().cause,
+        readiness.runtime_readiness().report().cause,
         ReadinessCause::NodeUnavailable(_)
     ));
     Ok(())

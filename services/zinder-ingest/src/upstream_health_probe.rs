@@ -3,10 +3,15 @@
 //!
 //! Spawned once at writer startup per [ADR-0015 §Upstream sync detection].
 //! The task is independent of the ingest loop: probe failures never cancel
-//! the loop and never propagate beyond a warning log. The probe writes
-//! only the [`zinder_runtime::ReadinessCause::UpstreamNotReady`] cause;
-//! healthy snapshots leave readiness untouched so the loop's normal
-//! `Ready`/`Syncing` writes carry the operator-visible status.
+//! the loop and never propagate beyond a warning log. The probe owns the
+//! [`ReadinessInput::NodeSource`] input of the writer's
+//! [`ComposedReadiness`]: a non-ready snapshot publishes
+//! [`ReadinessCause::UpstreamNotReady`] and a healthy snapshot publishes
+//! [`ReadinessCause::Ready`]. The follow loop owns the admission state, so its
+//! lag-derived writes cannot clear the probe's observation.
+//!
+//! A failed probe keeps the last observation, because an unreachable or
+//! malformed health response is not evidence that the upstream is ready.
 //!
 //! [ADR-0015 §Upstream sync detection]:
 //!     ../../../docs/adrs/0015-phase-driven-ingest.md#upstream-sync-detection
@@ -15,21 +20,22 @@ use std::{sync::Arc, time::Duration};
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use zinder_runtime::{Readiness, UpstreamHealth, UpstreamNotReadyDetail};
+use zinder_runtime::{
+    ComposedReadiness, ReadinessCause, ReadinessInput, UpstreamHealth, UpstreamNotReadyDetail,
+};
 use zinder_source::{NodeSource, UpstreamHealthSnapshot};
 
 /// Spawns the upstream-health probe task.
 ///
 /// The task ticks every `poll_interval`, calls
-/// [`NodeSource::poll_upstream_health`] on `source`, and writes
-/// [`zinder_runtime::ReadinessCause::UpstreamNotReady`] on the shared
-/// [`Readiness`] when the snapshot is not ready. Healthy snapshots and
-/// probe errors are no-ops (logged at debug/warn respectively); the
-/// ingest loop continues to own every other readiness cause.
+/// [`NodeSource::poll_upstream_health`] on `source`, and publishes the
+/// snapshot as the [`ReadinessInput::NodeSource`] input of `readiness`.
+/// Probe errors keep the last published observation and log a warning; the
+/// ingest loop continues to own the admission state.
 #[must_use = "drop the handle to detach the task or await it for symmetric shutdown"]
 pub fn spawn_upstream_health_probe_task<Source>(
     source: Arc<Source>,
-    readiness: Readiness,
+    readiness: ComposedReadiness,
     poll_interval: Duration,
     cancel: CancellationToken,
 ) -> JoinHandle<()>
@@ -48,7 +54,7 @@ where
     })
 }
 
-async fn run_upstream_health_probe_once<Source>(source: &Source, readiness: &Readiness)
+async fn run_upstream_health_probe_once<Source>(source: &Source, readiness: &ComposedReadiness)
 where
     Source: NodeSource,
 {
@@ -59,18 +65,19 @@ where
                 target: "zinder::ingest",
                 event = "upstream_health_probe_failed",
                 error = %error,
-                "upstream health probe failed; leaving readiness untouched"
+                "upstream health probe failed; keeping the last upstream observation"
             );
         }
     }
 }
 
-fn apply_upstream_health_snapshot(snapshot: UpstreamHealthSnapshot, readiness: &Readiness) {
-    if snapshot.ready_for_queries {
-        return;
-    }
-    let detail = upstream_not_ready_detail_from_snapshot(snapshot);
-    readiness.set_upstream_not_ready(detail);
+fn apply_upstream_health_snapshot(snapshot: UpstreamHealthSnapshot, readiness: &ComposedReadiness) {
+    let cause = if snapshot.ready_for_queries {
+        ReadinessCause::Ready
+    } else {
+        ReadinessCause::UpstreamNotReady(upstream_not_ready_detail_from_snapshot(snapshot))
+    };
+    readiness.publish_input(ReadinessInput::NodeSource, cause);
 }
 
 fn upstream_not_ready_detail_from_snapshot(
@@ -95,38 +102,59 @@ mod tests {
     )]
 
     use super::*;
-    use zinder_runtime::{ReadinessCause, ReadinessState};
+    use zinder_runtime::{Readiness, ReadinessState};
     use zinder_source::UPSTREAM_HEALTH_SOURCE_ZEBRA_READY_ENDPOINT;
 
-    #[test]
-    fn healthy_snapshot_leaves_readiness_untouched() {
-        let readiness = Readiness::default();
-        readiness.set(ReadinessState::ready(Some(42)));
-        let snapshot = UpstreamHealthSnapshot::ready(
+    fn ready_snapshot() -> UpstreamHealthSnapshot {
+        UpstreamHealthSnapshot::ready(
             UPSTREAM_HEALTH_SOURCE_ZEBRA_READY_ENDPOINT,
             Some(42),
             Some(42),
             Some(1.0),
-        );
-        apply_upstream_health_snapshot(snapshot, &readiness);
-        let report = readiness.report();
-        assert!(matches!(report.cause, ReadinessCause::Ready));
-        assert_eq!(report.current_height, Some(42));
+        )
     }
 
-    #[test]
-    fn unhealthy_snapshot_sets_upstream_not_ready_with_current_height_preserved()
-    -> Result<(), &'static str> {
-        let readiness = Readiness::default();
-        readiness.set(ReadinessState::ready(Some(17)));
-        let snapshot = UpstreamHealthSnapshot::not_ready(
+    fn syncing_snapshot() -> UpstreamHealthSnapshot {
+        UpstreamHealthSnapshot::not_ready(
             UPSTREAM_HEALTH_SOURCE_ZEBRA_READY_ENDPOINT,
             "syncing",
             Some(15),
             Some(100),
             Some(0.5),
-        );
-        apply_upstream_health_snapshot(snapshot, &readiness);
+        )
+    }
+
+    fn composed_with_admission(admission: ReadinessState) -> (Readiness, ComposedReadiness) {
+        let readiness = Readiness::default();
+        let composed = ComposedReadiness::new(readiness.clone(), &[]);
+        composed.publish_admission(admission);
+        (readiness, composed)
+    }
+
+    #[test]
+    fn healthy_snapshot_clears_only_the_probe_observation() {
+        let (readiness, composed) = composed_with_admission(ReadinessState::ready(Some(42)));
+        apply_upstream_health_snapshot(syncing_snapshot(), &composed);
+        assert!(!readiness.report().is_ready);
+
+        apply_upstream_health_snapshot(ready_snapshot(), &composed);
+        let report = readiness.report();
+        assert!(matches!(report.cause, ReadinessCause::Ready));
+        assert_eq!(report.current_height, Some(42));
+
+        composed.publish_admission(ReadinessState::syncing(Some(5), Some(37), Some(42)));
+        apply_upstream_health_snapshot(ready_snapshot(), &composed);
+        assert!(matches!(
+            readiness.report().cause,
+            ReadinessCause::Syncing { .. }
+        ));
+    }
+
+    #[test]
+    fn unhealthy_snapshot_sets_upstream_not_ready_with_current_height_preserved()
+    -> Result<(), &'static str> {
+        let (readiness, composed) = composed_with_admission(ReadinessState::ready(Some(17)));
+        apply_upstream_health_snapshot(syncing_snapshot(), &composed);
         let report = readiness.report();
         let ReadinessCause::UpstreamNotReady(detail) = report.cause else {
             return Err("expected UpstreamNotReady cause");

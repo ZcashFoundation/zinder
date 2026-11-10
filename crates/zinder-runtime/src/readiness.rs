@@ -549,17 +549,7 @@ impl Readiness {
         let Some(mut guard) = self.lock_unless_parked(shutting_down) else {
             return;
         };
-        let current = &mut guard.state;
-        let mut state = state;
-        let phase = state.phase.or(current.phase);
-        let warning_replaces_chain_state = state.cause.preserves_observed_target();
-        let warning_cleared_to_ready = matches!(&state.cause, ReadinessCause::Ready)
-            && current.cause.preserves_observed_target();
-        if warning_replaces_chain_state || warning_cleared_to_ready {
-            state.target_height = current.target_height;
-        }
-        *current = state;
-        current.phase = phase;
+        guard.state = state.replacing(&guard.state);
     }
 
     /// Atomically mutates the current readiness state.
@@ -609,16 +599,6 @@ impl Readiness {
     #[must_use]
     pub fn reorg_window_exceeded(&self) -> Option<ops_proto::ReorgWindowExceededDetail> {
         self.inner.lock().state.cause.reorg_window_exceeded_detail()
-    }
-
-    /// Replaces the cause with [`ReadinessCause::UpstreamNotReady`] while
-    /// preserving the writer's last visible `current_height` and any
-    /// concurrently-set ingest phase. Used by the upstream-health probe.
-    pub fn set_upstream_not_ready(&self, detail: UpstreamNotReadyDetail) {
-        if let Some(mut guard) = self.lock_unless_parked(false) {
-            guard.state.cause = ReadinessCause::UpstreamNotReady(detail);
-            guard.state.target_height = None;
-        }
     }
 
     /// Reports the current readiness as a serializable snapshot.
@@ -942,6 +922,21 @@ impl ReadinessState {
         }
     }
 
+    /// Returns `self` as the replacement of `previous`, keeping the
+    /// last-stamped phase when `self` carries none and the observed target
+    /// across a warning that does not observe one. [`Readiness::set`] applies
+    /// this rule.
+    pub(crate) fn replacing(mut self, previous: &Self) -> Self {
+        let warning_replaces_chain_state = self.cause.preserves_observed_target();
+        let warning_cleared_to_ready = matches!(&self.cause, ReadinessCause::Ready)
+            && previous.cause.preserves_observed_target();
+        if warning_replaces_chain_state || warning_cleared_to_ready {
+            self.target_height = previous.target_height;
+        }
+        self.phase = self.phase.or(previous.phase);
+        self
+    }
+
     /// Returns a copy of `self` tagged with the supplied ingest loop
     /// phase. Ingest binaries chain this onto every state transition;
     /// reader binaries never call it.
@@ -1249,15 +1244,17 @@ mod tests {
                 .with_phase(IngestPhase::FollowingTip),
         );
         readiness.set(ReadinessState::ready(Some(11)));
-        readiness.set_upstream_not_ready(UpstreamNotReadyDetail {
-            upstream_committed_height: None,
-            upstream_estimated_height: None,
-            upstream_verification_progress: None,
-            upstream_health: UpstreamHealth {
-                source: "zebra_ready_endpoint",
-                reason: Cow::Borrowed("syncing"),
+        readiness.set(ReadinessState::not_ready(ReadinessCause::UpstreamNotReady(
+            UpstreamNotReadyDetail {
+                upstream_committed_height: None,
+                upstream_estimated_height: None,
+                upstream_verification_progress: None,
+                upstream_health: UpstreamHealth {
+                    source: "zebra_ready_endpoint",
+                    reason: Cow::Borrowed("syncing"),
+                },
             },
-        });
+        )));
         readiness.update(|state| state.cause = ReadinessCause::Ready);
         readiness.set_phase(IngestPhase::BulkCatchup);
         let report = readiness.report();

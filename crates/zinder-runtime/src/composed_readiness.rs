@@ -1,7 +1,8 @@
 //! Conjunctive composition of independently owned readiness inputs.
 //!
-//! A runtime whose readiness depends on more than one owner (a storage or
-//! serving-pair admission plus probes of its dependencies) publishes each
+//! A runtime whose readiness depends on more than one owner (a storage,
+//! serving-pair, or canonical-writer admission plus probes of its
+//! dependencies) publishes each
 //! owner's observation as a separate input here. One pure precedence function
 //! projects the inputs onto the runtime's [`Readiness`], so no writer can erase
 //! another writer's failure. Each runtime still decides which cause each of its
@@ -31,9 +32,10 @@ pub enum ReadinessInput {
 /// Readiness owner that projects an admission state and named inputs onto one
 /// [`Readiness`] handle.
 ///
-/// The admission state is the runtime's storage or serving-pair readiness and
-/// carries the reported heights. Precedence is fixed: shutdown first, then an
-/// input reporting a canonical writer's `reorg_window_exceeded` halt, then a
+/// The admission state is the runtime's storage, serving-pair, or
+/// canonical-writer readiness and carries the reported heights. Precedence is
+/// fixed: shutdown first, then an input reporting a canonical writer's
+/// `reorg_window_exceeded` halt, then a
 /// refusing admission state, then refusing inputs in [`ReadinessInput`]
 /// declaration order. Otherwise the admission state, including a warning that
 /// still admits traffic, is the projection.
@@ -46,6 +48,7 @@ pub struct ComposedReadiness {
 #[derive(Clone, Debug)]
 struct Composition {
     is_shutting_down: bool,
+    is_parked: bool,
     admission: ReadinessState,
     inputs: BTreeMap<ReadinessInput, ReadinessCause>,
 }
@@ -61,6 +64,7 @@ impl ComposedReadiness {
             runtime,
             composition: Arc::new(Mutex::new(Composition {
                 is_shutting_down: false,
+                is_parked: false,
                 admission: ReadinessState::starting(),
                 inputs: required_inputs
                     .iter()
@@ -78,9 +82,52 @@ impl ComposedReadiness {
         self.runtime.clone()
     }
 
-    /// Replaces the admission state.
+    /// Replaces the admission state with the rule [`Readiness::set`] applies.
+    ///
+    /// The admission keeps its last ingest phase when `admission` carries
+    /// none, and keeps its observed target across a warning that does not
+    /// observe one.
+    ///
+    /// A [parked](Self::park_admission) admission ignores the write.
     pub fn publish_admission(&self, admission: ReadinessState) {
-        self.publish_with(|composition| composition.admission = admission);
+        self.publish_with(|composition| {
+            if !composition.is_parked {
+                composition.admission = admission.replacing(&composition.admission);
+            }
+        });
+    }
+
+    /// Replaces the admission state with a terminal state that later admission
+    /// writes cannot replace until the process restarts.
+    ///
+    /// A canonical writer parked on a reorg deeper than its window keeps
+    /// serving its control plane while other workers still run; none of them
+    /// may replace the halt with a recoverable cause, and the ingest phase it
+    /// was parked in stays fixed. Inputs keep recording their causes, but the
+    /// parked admission refuses traffic and so supplies the projection. Only
+    /// shutdown replaces it, and a shutdown already in progress keeps its cause.
+    pub fn park_admission(&self, admission: ReadinessState) {
+        self.publish_with(|composition| {
+            let phase = admission.phase.or(composition.admission.phase);
+            composition.admission = admission;
+            composition.admission.phase = phase;
+            composition.is_parked = true;
+        });
+    }
+
+    /// Atomically mutates the admission state.
+    ///
+    /// Use when an admission write depends on fields it does not change, such
+    /// as a traffic-admitting warning that a second admission owner raises
+    /// and the primary owner must keep.
+    ///
+    /// A [parked](Self::park_admission) admission ignores the update.
+    pub fn update_admission(&self, update: impl FnOnce(&mut ReadinessState)) {
+        self.publish_with(|composition| {
+            if !composition.is_parked {
+                update(&mut composition.admission);
+            }
+        });
     }
 
     /// Replaces one input's latest cause.
@@ -102,7 +149,9 @@ impl ComposedReadiness {
     fn publish_with(&self, update: impl FnOnce(&mut Composition)) {
         let mut composition = self.composition.lock();
         update(&mut composition);
-        self.runtime.set(project(&composition));
+        let projected = project(&composition);
+        self.runtime
+            .update(|runtime_state| *runtime_state = projected);
     }
 }
 
@@ -283,6 +332,7 @@ mod tests {
             admission.cause = admission_cause;
             let composition = Composition {
                 is_shutting_down,
+                is_parked: false,
                 admission,
                 inputs: inputs.into_iter().collect(),
             };
@@ -295,6 +345,7 @@ mod tests {
         let ready_admission = ReadinessState::ready_with_target(Some(10), Some(12));
         let mut composition = Composition {
             is_shutting_down: false,
+            is_parked: false,
             admission: ready_admission.clone(),
             inputs: BTreeMap::from([(ReadinessInput::NodeSource, ReadinessCause::Ready)]),
         };
@@ -341,6 +392,86 @@ mod tests {
         composed.publish_shutting_down();
         composed.publish_admission(ReadinessState::ready(Some(6)));
         composed.publish_input(ReadinessInput::NodeSource, ReadinessCause::Ready);
+        assert_eq!(runtime.report().cause, ReadinessCause::ShuttingDown);
+    }
+
+    #[test]
+    fn admission_writes_keep_phase_and_warning_target_through_input_overrides() {
+        let runtime = Readiness::default();
+        let composed = ComposedReadiness::new(runtime.clone(), &[]);
+        composed.publish_admission(
+            ReadinessState::ready_with_target(Some(90), Some(100))
+                .with_phase(crate::IngestPhase::FollowingTip),
+        );
+        composed.update_admission(|admission| {
+            admission.cause = ReadinessCause::CursorAtRisk {
+                oldest_retained_age_hours: 25,
+                retention_hours: 168,
+            };
+        });
+        composed.publish_input(ReadinessInput::NodeSource, node_unavailable());
+        assert_eq!(runtime.report().target_height, None);
+
+        composed.publish_input(ReadinessInput::NodeSource, ReadinessCause::Ready);
+        let report = runtime.report();
+        assert!(matches!(report.cause, ReadinessCause::CursorAtRisk { .. }));
+        assert_eq!(report.target_height, Some(100));
+        assert_eq!(report.phase, Some(crate::IngestPhase::FollowingTip));
+
+        composed.publish_admission(ReadinessState::syncing(Some(3), Some(97), Some(100)));
+        let report = runtime.report();
+        assert!(matches!(report.cause, ReadinessCause::Syncing { .. }));
+        assert_eq!(report.phase, Some(crate::IngestPhase::FollowingTip));
+    }
+
+    #[test]
+    fn parked_admission_keeps_its_halt_and_phase_until_shutdown() {
+        let runtime = Readiness::default();
+        let composed = ComposedReadiness::new(runtime.clone(), &[]);
+        composed.publish_admission(ReadinessState::ready(Some(10)));
+        composed.park_admission(
+            ReadinessState::reorg_window_exceeded(1_001, 1_000, Some(1_000), Some(10))
+                .with_phase(crate::IngestPhase::FollowingTip),
+        );
+
+        composed.publish_admission(ReadinessState::ready(Some(11)));
+        composed.update_admission(|admission| {
+            admission.cause = ReadinessCause::Ready;
+            admission.phase = Some(crate::IngestPhase::BulkCatchup);
+        });
+        composed.publish_input(ReadinessInput::NodeSource, node_unavailable());
+        composed.publish_input(ReadinessInput::NodeSource, ReadinessCause::Ready);
+        let report = runtime.report();
+        assert!(!report.is_ready);
+        assert!(matches!(
+            report.cause,
+            ReadinessCause::ReorgWindowExceeded {
+                depth: 1_001,
+                configured: 1_000,
+                ..
+            }
+        ));
+        assert_eq!(report.current_height, Some(10));
+        assert_eq!(report.phase, Some(crate::IngestPhase::FollowingTip));
+
+        composed.publish_shutting_down();
+        assert_eq!(runtime.report().cause, ReadinessCause::ShuttingDown);
+    }
+
+    #[test]
+    fn parking_during_shutdown_keeps_the_shutdown_cause() {
+        let runtime = Readiness::default();
+        let composed = ComposedReadiness::new(runtime.clone(), &[]);
+        composed.publish_admission(ReadinessState::ready(Some(10)));
+        composed.publish_shutting_down();
+        composed.park_admission(ReadinessState::reorg_window_exceeded(
+            1_001,
+            1_000,
+            Some(1_000),
+            Some(10),
+        ));
+        assert_eq!(runtime.report().cause, ReadinessCause::ShuttingDown);
+        composed.publish_admission(ReadinessState::ready(Some(11)));
         assert_eq!(runtime.report().cause, ReadinessCause::ShuttingDown);
     }
 

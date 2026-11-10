@@ -11,7 +11,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{BlockHeight, BlockId, NetworkUpgradeActivations, UnixTimestampMillis};
-use zinder_runtime::{IngestPhase, Readiness, ReadinessState};
+use zinder_runtime::{ComposedReadiness, IngestPhase, ReadinessState};
 use zinder_source::{NodeSource, SourceError};
 use zinder_store::{
     CanonicalActivationSchedule, CanonicalBaselinePublication, CanonicalReorgPolicy,
@@ -129,11 +129,16 @@ pub enum CanonicalWriterError {
 }
 
 /// Opens or freshly constructs the canonical store, then follows Zebra.
+///
+/// The writer publishes its construction and follow observations as the
+/// admission state of `readiness`. Other readiness owners, such as the
+/// upstream health probe, publish separate inputs that these writes cannot
+/// clear.
 pub async fn run_canonical_writer<Source>(
     source: &Source,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     config: CanonicalWriterConfig,
-    readiness: &Readiness,
+    readiness: &ComposedReadiness,
     cancel: &CancellationToken,
 ) -> Result<RocksDbCanonicalStore, CanonicalWriterError>
 where
@@ -160,7 +165,7 @@ pub async fn run_canonical_writer_with_control<Source>(
     source: &Source,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     config: CanonicalWriterConfig,
-    readiness: &Readiness,
+    readiness: &ComposedReadiness,
     cancel: &CancellationToken,
     control_commands: Option<mpsc::Receiver<CanonicalControlCommand>>,
 ) -> Result<RocksDbCanonicalStore, CanonicalWriterError>
@@ -205,7 +210,7 @@ async fn open_or_construct_canonical_store<Source>(
     source: &Source,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     config: &CanonicalWriterConfig,
-    readiness: &Readiness,
+    readiness: &ComposedReadiness,
 ) -> Result<RocksDbCanonicalStore, CanonicalWriterError>
 where
     Source: NodeSource + Clone,
@@ -372,16 +377,18 @@ async fn construct_fresh_store<Source>(
     source: &Source,
     network_upgrade_activations: &NetworkUpgradeActivations,
     config: &CanonicalWriterConfig,
-    readiness: &Readiness,
+    readiness: &ComposedReadiness,
     staging_path: &std::path::Path,
 ) -> Result<RocksDbCanonicalStore, CanonicalWriterError>
 where
     Source: NodeSource + Clone,
 {
-    readiness.set(ReadinessState::syncing(None, None, None).with_phase(IngestPhase::BulkCatchup));
+    readiness.publish_admission(
+        ReadinessState::syncing(None, None, None).with_phase(IngestPhase::BulkCatchup),
+    );
     let (build_plan, settled_tip, observed_tip) =
         resolve_construction_range(source, network_upgrade_activations, config).await?;
-    readiness.set(
+    readiness.publish_admission(
         ReadinessState::syncing(
             Some(u64::from(observed_tip.height.value().saturating_sub(
                 build_plan.history_bounds().first_available_height().value(),

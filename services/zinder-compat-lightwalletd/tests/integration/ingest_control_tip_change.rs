@@ -22,7 +22,7 @@ use zinder_ingest::{
     run_canonical_writer_with_control,
 };
 use zinder_proto::v1::ingest::{WriterStatusRequest, ingest_control_client::IngestControlClient};
-use zinder_runtime::Readiness;
+use zinder_runtime::{ComposedReadiness, Readiness};
 use zinder_source::{
     NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceChainSegment,
     SourceChainSegmentLimits, SourceError, SourceSubtreeRoots,
@@ -55,7 +55,7 @@ async fn production_tip_change_publisher_observes_a_post_wait_canonical_event() 
             source: source.clone(),
             activations: activations.clone(),
             storage_path: temporary.path().join("canonical"),
-            readiness: readiness.clone(),
+            readiness: ComposedReadiness::new(readiness.clone(), &[]),
             cancel: cancel.clone(),
             commands,
         }
@@ -140,7 +140,7 @@ struct CanonicalWriterTask {
     source: MutableTipSource,
     activations: Arc<NetworkUpgradeActivations>,
     storage_path: std::path::PathBuf,
-    readiness: Readiness,
+    readiness: ComposedReadiness,
     cancel: CancellationToken,
     commands: tokio::sync::mpsc::Receiver<zinder_ingest::CanonicalControlCommand>,
 }

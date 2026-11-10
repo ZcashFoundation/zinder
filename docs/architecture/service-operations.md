@@ -72,9 +72,9 @@ runtime whose readiness depends on more than one owner composes them through
 The admission state supplies the reported heights. When shutdown or an input
 supplies the cause, the reported target height is cleared. Every owner
 replaces only its own input, so no owner can clear another owner's failure.
-Native wallet query, lightwalletd compatibility, and Explorer use this
-composition. Projector keeps one owner of its readiness state. Ingest does not
-use the composition and has two writers of one state, described below.
+Ingest, native wallet query, lightwalletd compatibility, and Explorer use this
+composition. Projector and Cipherscan compatibility each keep one owner of
+their readiness state.
 
 ### Canonical fence attestation
 
@@ -133,17 +133,30 @@ Ingest is ready when its canonical fence is within the configured source lag
 and the current mempool source generation has published a complete snapshot
 certified at that exact canonical tip.
 Fresh construction, source recovery, schema admission, and reorg refusal keep
-it unready. The canonical follower writes the process-readiness state; the
-mempool owner communicates only through its hydration prerequisite, so source
-and retention tasks cannot overwrite a canonical failure.
+it unready.
 
-When `[node.health].addr` is configured, the upstream health probe is a second
-writer of the same state. It sets `upstream_not_ready` when Zebra reports that
-it is not ready for queries and leaves the state untouched otherwise. The
-follower's next readiness write replaces the probe's cause, so a lag-derived
-`ready` overwrites `upstream_not_ready`. Until the probe becomes a separate
-composed input, its `upstream_not_ready` lasts only until the follower's next
-iteration and is not a reliable drain signal.
+The canonical writer owns the admission state. Store construction, the
+canonical follower, and the reorg-window park publish it; the mempool owner
+communicates only through its hydration prerequisite, so source and retention
+tasks cannot overwrite a canonical failure. The park is terminal: it fixes the
+`reorg_window_exceeded` admission state and its ingest phase, later admission
+writes are ignored, inputs keep recording but cannot replace the halt, and only
+shutdown replaces it. The materialized-view tailer raises
+and clears the `cursor_at_risk` warning on the same admission state, and a
+lag-derived `ready` from the follower keeps an active warning while advancing
+the reported heights.
+
+When `[node.health].addr` is configured, the upstream health probe owns the
+node-source input. Each successful probe publishes `upstream_not_ready` while
+Zebra reports that it is not ready for queries and `ready` otherwise. A failed
+probe keeps the last observation. The follower cannot clear the probe's
+`upstream_not_ready`, so ingest stays unready until the probe observes a ready
+Zebra. A refusing admission state, such as `syncing` or `node_unavailable`,
+still takes precedence over the probe. Without a health endpoint, ingest has no
+node-source input.
+
+Ingest reports `shutting_down` as soon as termination is requested, before the
+writer and its workers drain.
 
 The private control server, live mempool owner, and mempool retention task are
 supervised with the writer; an unexpected exit from any of them terminates the
