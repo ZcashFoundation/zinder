@@ -155,6 +155,13 @@ lasts; restore the node rather than restarting the readers. A writer that
 finds a fork deeper than the window on that first observation parks, and the
 readers move straight to `reorg_window_exceeded`.
 
+A node restart can move the node's tip back below ingest's settled tip, for
+example when Zebra cannot restore its unfinalized blocks and restarts from its
+finalized tip. When that tip is a block ingest already holds, ingest reports
+`node_unavailable` with class `upstream_view_changed` and waits for the node to
+re-verify past its tip; it parks only when the node's tip is on another
+branch.
+
 `node_unavailable`, `upstream_not_ready`, and
 `ingest_control_unavailable` are recoverable dependency conditions. For native
 query, inspect the classified `ingest_control_health_unavailable` warning and

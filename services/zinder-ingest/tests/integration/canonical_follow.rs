@@ -808,6 +808,130 @@ async fn reopened_writer_reports_an_unconfirmed_tip_until_the_source_confirms_it
     Ok(())
 }
 
+/// A node tip at or below the settled tip on the writer's own branch is behind,
+/// not forked.
+///
+/// This is a node restart that lost its unfinalized blocks: the writer waits
+/// unready and unconfirmed, without parking or mutating, and resumes once the
+/// node catches up.
+#[tokio::test]
+async fn node_behind_the_settled_tip_on_the_canonical_branch_waits_instead_of_parking()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let original = parseable_multi_block_chain()?;
+    for behind_tip in [BlockHeight::new(2), BlockHeight::new(1)] {
+        let source = RecordingParseableSource::new(
+            original.clone(),
+            checkpoints_for_parseable_chain(&original, &activations)?,
+            BlockHeight::new(4),
+        );
+        let temporary = tempdir()?;
+        let store = publish_parseable_store(
+            &source,
+            &original,
+            Arc::clone(&activations),
+            &temporary.path().join("canonical"),
+            2,
+            BlockHeight::new(2),
+        )
+        .await?;
+        let original_fence = store.event_fence();
+        source.set_tip_height(behind_tip);
+        let readiness = Readiness::default();
+        let cancel = CancellationToken::new();
+        let (canonical, commands) = zinder_ingest::canonical_control_channel();
+        let follower = single_pass_follower(&source, &activations, &readiness, &cancel);
+        let observe = async {
+            while !matches!(
+                readiness.report().cause,
+                ReadinessCause::NodeUnavailable(ref detail)
+                    if detail.failure_class == "upstream_view_changed"
+                        && detail.last_reason.contains("at or below the settled tip")
+            ) {
+                if matches!(
+                    readiness.report().cause,
+                    ReadinessCause::ReorgWindowExceeded { .. }
+                ) {
+                    cancel.cancel();
+                    return Err(tonic::Status::failed_precondition(
+                        "a node behind on the canonical branch must not park the writer",
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let while_behind = canonical.writer_status().await?;
+            source.set_tip_height(BlockHeight::new(4));
+            while !readiness.report().is_ready {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let after_catch_up = canonical.writer_status().await?;
+            cancel.cancel();
+            Ok::<_, tonic::Status>((while_behind, after_catch_up))
+        };
+        let (statuses, outcome) = tokio::join!(
+            observe,
+            follow_canonical_tip_with_control(store, follower, commands),
+        );
+        let (while_behind, after_catch_up) = statuses?;
+        let store = outcome?;
+
+        assert!(while_behind.tip_unconfirmed);
+        assert!(while_behind.reorg_window_exceeded.is_none());
+        assert!(!after_catch_up.tip_unconfirmed);
+        assert_eq!(store.event_fence(), original_fence);
+        assert_eq!(store.displaced_block_count()?, 0);
+    }
+    Ok(())
+}
+
+/// A node tip at the settled height on another branch is a fork below
+/// settlement, so the writer parks on it as on any deeper fork.
+#[tokio::test]
+async fn node_behind_the_settled_tip_on_a_conflicting_branch_parks()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let original = parseable_multi_block_chain()?;
+    let source = RecordingParseableSource::new(
+        original.clone(),
+        checkpoints_for_parseable_chain(&original, &activations)?,
+        BlockHeight::new(4),
+    );
+    let temporary = tempdir()?;
+    let store = publish_parseable_store(
+        &source,
+        &original,
+        Arc::clone(&activations),
+        &temporary.path().join("canonical"),
+        2,
+        BlockHeight::new(2),
+    )
+    .await?;
+    let conflicting = forked_parseable_chain(&original, 2, 2, 53)?;
+    source.replace_chain(
+        conflicting.clone(),
+        checkpoints_for_parseable_chain(&conflicting, &activations)?,
+        BlockHeight::new(2),
+    );
+    let readiness = Readiness::default();
+    let cancel = CancellationToken::new();
+    let follower = single_pass_follower(&source, &activations, &readiness, &cancel);
+    let error = follow_canonical_tip(store, follower)
+        .await
+        .err()
+        .ok_or("a conflicting node tip below settlement must park")?;
+    assert!(matches!(
+        error,
+        zinder_ingest::CanonicalFollowError::ReorgWindowExceeded(evidence)
+            if evidence.required_depth == 3
+                && evidence.source_tip.height == BlockHeight::new(2)
+    ));
+    assert!(matches!(
+        readiness.report().cause,
+        ReadinessCause::ReorgWindowExceeded { depth: 3, .. }
+    ));
+    Ok(())
+}
+
 /// A committed append confirms a reopened writer's tip: the appended block
 /// named the visible tip as its parent.
 #[tokio::test]

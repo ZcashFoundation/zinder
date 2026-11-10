@@ -79,6 +79,25 @@ A secondary that is already open refuses catch-up after a writer raise until
 it restarts with the raised window. A wallet secondary accepts a raised depth
 on catch-up and refuses a lower one.
 
+### A node behind the settled tip
+
+A node's tip can fall below Zinder's settled tip without a reorg. Zebra
+restores its unfinalized blocks from a backup on restart, and when that backup
+is missing or unreadable its tip falls back to its finalized tip, which a
+window equal to the node's bound places at or near Zinder's settled tip. Its
+best chain is then a prefix of Zinder's, so following it needs no
+replacement.
+
+The writer therefore parks only on evidence of a fork. When the source tip is
+at or below the settled tip and its hash equals the retained canonical header
+at that height, the writer treats the node as behind: it reports
+`node_unavailable` with class `upstream_view_changed`, keeps its fence and its
+unconfirmed tip, and observes the node again after the recovery backoff. This
+is the same wait the writer takes for a node tip between the settled and the
+visible tip whose block matches the local chain. A source tip that differs
+from the local header at its height, or that lies below the retained headers,
+still parks, because Zinder cannot prove it is a prefix.
+
 ### Halt visibility
 
 A park remains possible, for example after the node is replaced or resynced,
