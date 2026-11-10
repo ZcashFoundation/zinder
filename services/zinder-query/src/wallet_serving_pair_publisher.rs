@@ -2707,6 +2707,88 @@ mod tests {
         Ok(())
     }
 
+    /// A parked writer's halt outranks a fence mismatch on refresh: the halt is
+    /// the cause an operator must resolve, and the pair keeps refusing traffic
+    /// with it instead of failing the refresh as a divergence.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refresh_reports_a_parked_writer_halt_before_a_fence_mismatch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let activations = lifecycle_upgrade_activations()?;
+        let canonical_primary_path = temporary.path().join("canonical-primary");
+        let wallet_primary_path = temporary.path().join("wallet-primary");
+        let canonical_primary =
+            build_lifecycle_canonical_primary(&canonical_primary_path, &activations)?;
+        build_wallet_from_canonical(
+            &canonical_primary,
+            &wallet_primary_path,
+            RocksDbWalletBuildOptions {
+                supported_reorg_depth: 100,
+                ..RocksDbWalletBuildOptions::for_local_tests()
+            },
+        )?;
+        let mut parked_mismatched_status = CanonicalWriterStatusResponse {
+            reorg_window_exceeded: Some(zinder_proto::v1::ops::ReorgWindowExceededDetail {
+                depth: 1_001,
+                configured: 1_000,
+                covered: Some(1_000),
+            }),
+            ..writer_status_for_store(&canonical_primary)
+        };
+        let mismatched_fence = parked_mismatched_status
+            .fence
+            .as_mut()
+            .ok_or("writer status fixture must carry a fence")?;
+        mismatched_fence.visible_block_count =
+            mismatched_fence.visible_block_count.saturating_add(1);
+        let control = MutableCanonicalControl::new(writer_status_for_store(&canonical_primary));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server_task = tokio::spawn({
+            let control = control.clone();
+            async move {
+                Server::builder()
+                    .add_service(CanonicalControlServer::new(control))
+                    .serve_with_incoming_shutdown(
+                        TcpListenerStream::new(listener),
+                        server_cancel.cancelled_owned(),
+                    )
+                    .await
+            }
+        });
+        let readiness = zinder_runtime::Readiness::default();
+        let (mut publisher, _slot) =
+            WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
+                wallet_serving_pair_config(
+                    canonical_primary_path,
+                    temporary.path().join("canonical-secondaries"),
+                    wallet_primary_path,
+                    temporary.path().join("wallet-secondaries"),
+                    Arc::new(activations),
+                )?,
+                WalletServingReadiness::without_node_source(readiness.clone()),
+                &endpoint,
+                None,
+            )
+            .await?;
+        assert!(readiness.report().is_ready);
+
+        control.set_writer_status(parked_mismatched_status);
+        publisher.refresh_once().await?;
+        let parked = readiness.report();
+        assert!(!parked.is_ready);
+        assert!(matches!(
+            parked.cause,
+            zinder_runtime::ReadinessCause::ReorgWindowExceeded { depth: 1_001, .. }
+        ));
+
+        cancel.cancel();
+        server_task.await??;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn bootstrap_fails_closed_on_a_same_sequence_writer_fence_mismatch()
     -> Result<(), Box<dyn std::error::Error>> {

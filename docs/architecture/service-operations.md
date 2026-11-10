@@ -98,6 +98,12 @@ neither the halt nor `tip_unconfirmed`; `tip_unconfirmed` alone refuses
 traffic with `canonical_tip_unconfirmed`; and only a following writer with a
 confirmed tip earns the staleness allowance that admits a lagging reader.
 
+On refresh, a status from another network or without a fence fails as
+divergence first. A parked writer's halt is checked next, so a halt reported
+with a mismatched fence keeps the published pair refusing traffic with
+`reorg_window_exceeded` rather than failing the refresh as a fence mismatch:
+the halt is the cause an operator must resolve.
+
 The attestation reads only the writer-status response. It never handles the
 canonical checkpoint capability, which stays with the projector's checkpoint
 client.
