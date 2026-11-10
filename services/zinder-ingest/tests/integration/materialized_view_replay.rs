@@ -38,7 +38,7 @@ use zinder_store::{
     CanonicalStoreWorkload, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
     RocksDbCanonicalStore, RocksDbResourceBudget,
 };
-use zinder_testkit::sample_regtest_upgrade_activations;
+use zinder_testkit::{LogCapture, sample_regtest_upgrade_activations};
 
 use super::fixture_block::fixture_source_block;
 
@@ -50,6 +50,7 @@ const BASELINE_TIP_HEIGHT: u32 = 2;
 const CHAIN_TIP_HEIGHT: u32 = 4;
 const REPLACEMENT_TIP_HEIGHT: u32 = 5;
 const REORG_WINDOW_BLOCKS: u32 = 2;
+const UNCURSORED_HEAD_REPLACED_EVENT: &str = "materialized_view_replay_uncursored_head_replaced";
 
 #[tokio::test]
 async fn a_fresh_view_store_rebuilds_the_rows_event_replay_would_have_written()
@@ -147,6 +148,7 @@ async fn a_rebuild_resumed_after_a_reorg_reverts_the_rows_it_wrote_from_the_repl
     let view = open_view_store(directory.path())?;
 
     harness.replace_tip().await?;
+    let capture = LogCapture::install_for_target("zinder::ingest");
     harness.tailer(&view).catch_up()?;
 
     let (_rebuilt_directory, rebuilt) = view_store()?;
@@ -154,6 +156,47 @@ async fn a_rebuild_resumed_after_a_reorg_reverts_the_rows_it_wrote_from_the_repl
     assert_eq!(
         block_summary_hashes(&view, REPLACEMENT_TIP_HEIGHT)?,
         harness.canonical_hashes(REPLACEMENT_TIP_HEIGHT)
+    );
+    assert_eq!(chain_event_cursors(&view)?, chain_event_cursors(&rebuilt)?);
+    assert!(
+        capture.any(|event| event.field("event") == Some(UNCURSORED_HEAD_REPLACED_EVENT)),
+        "a resumed rebuild whose newest block was replaced must revert the reorg window"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_rebuild_resumed_on_an_unchanged_chain_keeps_the_rows_it_already_wrote()
+-> Result<(), Box<dyn Error>> {
+    let mut harness = CanonicalHarness::baseline().await?;
+    let (directory, view) = view_store()?;
+    harness.tailer(&view).catch_up()?;
+    drop(view);
+    delete_chain_event_cursors(
+        directory.path(),
+        MaterializedViewStore::bundled_chain_event_consumer_names()
+            .iter()
+            .copied(),
+    )?;
+    let view = open_view_store(directory.path())?;
+
+    harness.follow_to_tip().await?;
+    let capture = LogCapture::install_for_target("zinder::ingest");
+    harness.tailer(&view).catch_up()?;
+
+    let (_rebuilt_directory, rebuilt) = view_store()?;
+    harness.tailer(&rebuilt).catch_up()?;
+    assert!(
+        !capture.any(|event| event.field("event") == Some(UNCURSORED_HEAD_REPLACED_EVENT)),
+        "a resumed rebuild whose newest block is still canonical must not revert any height"
+    );
+    assert_eq!(
+        block_summary_hashes(&view, CHAIN_TIP_HEIGHT)?,
+        harness.canonical_hashes(CHAIN_TIP_HEIGHT)
+    );
+    assert_eq!(
+        block_summary_hashes(&view, CHAIN_TIP_HEIGHT)?,
+        block_summary_hashes(&rebuilt, CHAIN_TIP_HEIGHT)?
     );
     assert_eq!(chain_event_cursors(&view)?, chain_event_cursors(&rebuilt)?);
     Ok(())
