@@ -889,7 +889,8 @@ Already covered by
 `services/zinder-compat-lightwalletd/tests/integration/lightwalletd_scan_contract.rs`
 in the default validation gate. It:
 
-1. Stands up `LightwalletdGrpcAdapter` over a populated `PrimaryChainStore`.
+1. Stands up `LightwalletdGrpcAdapter` over a populated production canonical
+   and wallet serving pair.
 2. Connects through the generated `CompactTxStreamerClient` to exercise the
    protocol transport directly.
 3. Calls `GetBlockRange`, decodes every compact block, asserts `vtx`/`txid`

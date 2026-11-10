@@ -9,15 +9,16 @@
 //! Zinder without sending viewing keys or spending keys to Zinder. The
 //! test exercises the wire contract that wallets actually consume:
 //!
-//! 1. Stand up the `LightwalletdGrpcAdapter` over a populated `PrimaryChainStore`.
+//! 1. Stand up the `LightwalletdGrpcAdapter` over a populated production
+//!    canonical and wallet serving pair.
 //! 2. Connect through the generated `CompactTxStreamerClient` to exercise the
 //!    protocol transport directly.
 //! 3. Call `GetBlockRange` and decode every compact block.
 //! 4. Assert each block carries:
 //!    - a populated `vtx` list whose `txid` entries match transaction
 //!      artifacts retrievable by id from the store, and
-//!    - chain metadata reflecting the committed Sapling and Orchard
-//!      commitment-tree sizes.
+//!    - chain metadata. The production store fixture publishes empty
+//!      commitment trees, so every advertised tree size is zero.
 //! 5. Assert no viewing keys, spending keys, seed phrases, or other key
 //!    material appear in any client→server payload.
 //!
@@ -33,35 +34,27 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, transport::Server};
 use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_core::{
-    BlockHeight, BlockId, ChainEpochId, ChainTipMetadata, CompactBlockArtifact,
-    CompactChainMetadata, CompactSaplingOutput, CompactTransaction, CompactTransactionData,
-    Network, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
-    TransactionComponentCounts, TransactionId,
+    BlockHeight, BlockId, CompactBlockArtifact, CompactChainMetadata, CompactSaplingOutput,
+    CompactTransaction, CompactTransactionData, Network, TransactionComponentCounts, TransactionId,
 };
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
 };
-use zinder_query::WalletQuery;
+use zinder_query::{WalletServingPairSlot, WalletServingQuery, WalletServingReadPair};
 use zinder_store::RawBlobRetention;
 use zinder_testkit::{
-    ChainFixture, FixtureBlock, FixtureTransactionRows, StoreFixture,
+    ChainFixture, FixtureBlock, FixtureTransactionRows, WalletServingStoreFixture,
     sample_regtest_upgrade_activations,
 };
 
 const LIGHTWALLETD_SCAN_BLOCK_COUNT: u32 = 10;
-const LIGHTWALLETD_SCAN_SAPLING_TREE_SIZE: u32 = LIGHTWALLETD_SCAN_BLOCK_COUNT;
 
 #[tokio::test]
 async fn lightwalletd_compatible_client_scans_range_without_sending_keys() -> eyre::Result<()> {
     let store_fixture = lightwalletd_scan_store_fixture()?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server_addr = listener.local_addr()?;
-    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
-        store_fixture.chain_store().clone(),
-        (),
-        Arc::new(sample_regtest_upgrade_activations()),
-    ))
-    .into_server();
+    let adapter = LightwalletdGrpcAdapter::new(store_fixture.query()).into_server();
     let server_handle = tokio::spawn(async move {
         Server::builder()
             .add_service(adapter)
@@ -121,12 +114,7 @@ async fn lightwalletd_subtree_roots_request_carries_no_key_material() -> eyre::R
     let store_fixture = lightwalletd_scan_store_fixture()?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server_addr = listener.local_addr()?;
-    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
-        store_fixture.chain_store().clone(),
-        (),
-        Arc::new(sample_regtest_upgrade_activations()),
-    ))
-    .into_server();
+    let adapter = LightwalletdGrpcAdapter::new(store_fixture.query()).into_server();
     let server_handle = tokio::spawn(async move {
         Server::builder()
             .add_service(adapter)
@@ -154,17 +142,23 @@ async fn lightwalletd_subtree_roots_request_carries_no_key_material() -> eyre::R
     Ok(())
 }
 
-fn lightwalletd_scan_store_fixture() -> eyre::Result<StoreFixture> {
-    let base_fixture = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
-        .extend_blocks(LIGHTWALLETD_SCAN_BLOCK_COUNT)
-        .with_tip_metadata_override(ChainTipMetadata::new(
-            LIGHTWALLETD_SCAN_SAPLING_TREE_SIZE,
-            0,
-            0,
-        ));
+/// Production serving pair for the scan contract and the store fixture that
+/// owns its paths.
+struct ScanStore {
+    query: WalletServingQuery<()>,
+    _store_fixture: WalletServingStoreFixture,
+}
 
-    let mut chain_fixture = base_fixture;
+impl ScanStore {
+    fn query(&self) -> WalletServingQuery<()> {
+        self.query.clone()
+    }
+}
+
+fn lightwalletd_scan_store_fixture() -> eyre::Result<ScanStore> {
+    let mut chain_fixture = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(LIGHTWALLETD_SCAN_BLOCK_COUNT);
     for height_value in 1..=LIGHTWALLETD_SCAN_BLOCK_COUNT {
         let height = BlockHeight::new(height_value);
         let block = chain_fixture
@@ -182,34 +176,38 @@ fn lightwalletd_scan_store_fixture() -> eyre::Result<StoreFixture> {
             sapling_output_count: 1,
             ..TransactionComponentCounts::EMPTY
         };
-        let compact_block = lightwalletd_scan_compact_block(&block);
+        let compact_block = lightwalletd_scan_compact_block(&block)?;
         chain_fixture = chain_fixture
             .with_compact_block_artifact(compact_block)
             .with_transaction_rows(transaction_rows);
     }
 
-    let completing_block = chain_fixture
-        .block_at(BlockHeight::new(1))
-        .ok_or_else(|| eyre!("fixture block missing at height 1"))?
-        .clone();
-    chain_fixture = chain_fixture.with_sapling_subtree_root(SubtreeRootArtifact::new(
-        ShieldedProtocol::Sapling,
-        SubtreeRootIndex::new(0),
-        SubtreeRootHash::from_bytes([0x70; 32]),
-        completing_block.height,
-        completing_block.hash,
-    ));
-
-    Ok(StoreFixture::with_chain_committed(
-        &chain_fixture,
-        ChainEpochId::new(1),
-    )?)
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain_fixture, &activations)?;
+    let (canonical, wallet) = store_fixture.take_readers()?;
+    let query = WalletServingQuery::from_serving_pair_slot(
+        WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
+            Arc::new(canonical),
+            Arc::new(wallet),
+        )?)),
+        (),
+        activations,
+    );
+    Ok(ScanStore {
+        query,
+        _store_fixture: store_fixture,
+    })
 }
 
-fn lightwalletd_scan_compact_block(block: &FixtureBlock) -> CompactBlockArtifact {
-    CompactBlockArtifact::new(
+fn lightwalletd_scan_compact_block(block: &FixtureBlock) -> eyre::Result<CompactBlockArtifact> {
+    let parent_hash = if block.height == BlockHeight::new(1) {
+        Network::ZcashRegtest.genesis_hash()
+    } else {
+        block.parent_hash
+    };
+    Ok(CompactBlockArtifact::new(
         BlockId::new(block.height, block.hash),
-        block.parent_hash,
+        parent_hash,
         block.block_time_seconds,
         vec![CompactTransaction {
             index: 0,
@@ -226,12 +224,11 @@ fn lightwalletd_scan_compact_block(block: &FixtureBlock) -> CompactBlockArtifact
             },
         }],
         CompactChainMetadata {
-            sapling_commitment_tree_size: block.height.value(),
+            sapling_commitment_tree_size: 0,
             orchard_commitment_tree_size: 0,
             ironwood_commitment_tree_size: 0,
         },
-    )
-    .unwrap_or_else(|_| std::process::abort())
+    )?)
 }
 
 fn lightwalletd_scan_txid_bytes(height_value: u32) -> [u8; 32] {
@@ -284,10 +281,8 @@ fn assert_compact_block_carries_chain_metadata(
     let chain_metadata = compact_block.chain_metadata.as_ref().ok_or_else(|| {
         eyre!("compact block must carry chain_metadata for tree-state advertisement")
     })?;
-    assert_eq!(
-        chain_metadata.sapling_commitment_tree_size,
-        u32::try_from(compact_block.height)?
-    );
+    assert_eq!(chain_metadata.sapling_commitment_tree_size, 0);
+    assert_eq!(chain_metadata.orchard_commitment_tree_size, 0);
     Ok(())
 }
 
