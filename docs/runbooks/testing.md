@@ -566,20 +566,25 @@ boundary.
 
 ### Primary and secondary coverage
 
-Three integration tests under
-[`crates/zinder-store/tests/integration/primary_secondary.rs`](../../crates/zinder-store/tests/integration/primary_secondary.rs)
-run with every `cargo nextest run --profile=ci`:
+The canonical-store unit tests in
+[`crates/zinder-store/src/canonical_store/secondary_tests.rs`](../../crates/zinder-store/src/canonical_store/secondary_tests.rs)
+run with every `cargo nextest run --profile=ci` against the production
+`RocksDbCanonicalStore` and `RocksDbCanonicalSecondary`:
 
-- `second_primary_open_returns_primary_already_open` — proves a second
-  writer cannot silently take over an already-open primary store; the
-  RocksDB lock surfaces as `StoreError::PrimaryAlreadyOpen`.
-- `secondary_continues_serving_after_primary_drops` — opens a primary,
-  commits two epochs, drops the primary handle, then asserts a fresh
-  secondary opened against the same path serves the last-committed
-  epoch without the primary coming back up. The restart stage of the same test
-  asserts a restarted primary resumes from the durable state.
-- `secondary_catches_up_after_primary_commits` — the live-writer
-  catchup baseline; pre-existing.
+- `second_ready_primary_open_is_refused_while_the_first_owns_the_store`:
+  a second writer cannot take over an open primary. The RocksDB lock
+  surfaces as a refused `open ready` operation, and the store reopens at the
+  same fence once the first owner drops.
+- `secondary_and_reopened_primary_serve_the_last_durable_fence_after_the_primary_drops`:
+  publishes a baseline, appends a live block, and drops the primary handle.
+  A fresh secondary serves the last durable fence without the primary, and a
+  restarted primary resumes from the same fence.
+- `secondary_observes_a_live_append_only_after_explicit_catch_up`: a
+  secondary keeps its admitted fence until `try_catch_up` reports the
+  advance to the primary's new fence.
+- `secondary_admission_rejects_another_network_activation_table` and
+  `secondary_admission_reports_and_requires_the_persisted_raw_blob_retention`:
+  secondary admission is exact for the network and raw-blob retention.
 
 ### Manual reproduction: kill -9 mid-commit
 

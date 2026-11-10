@@ -12,16 +12,22 @@ mod construction_manifest;
 mod control;
 mod displaced_archive;
 mod event_lifecycle;
+#[cfg(test)]
+mod event_lifecycle_tests;
 mod live_commit;
 mod live_replacement;
 #[cfg(test)]
 mod live_replacement_tests;
 mod mempool_lifecycle;
+#[cfg(test)]
+mod mempool_lifecycle_tests;
 mod publication;
 mod reader;
 mod replay_tail;
 mod rocksdb;
 mod secondary;
+#[cfg(test)]
+mod secondary_tests;
 mod subtree_load;
 mod wallet_events;
 
