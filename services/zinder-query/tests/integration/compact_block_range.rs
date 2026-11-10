@@ -12,25 +12,24 @@ use zinder_core::wire::{encode_rpc_block_hash_hex, encode_zinder_native_chain_na
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch, ChainEpochId, ChainTipMetadata,
     CompactBlockArtifact, CompactChainMetadata, MAX_SUBTREE_ROOTS_PER_REQUEST, Network,
-    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
+    ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange,
 };
 use zinder_proto::v1::wallet;
 use zinder_query::{
-    ArtifactKey, DEFAULT_MAX_COMPACT_BLOCK_RANGE, QueryError, WalletQuery, WalletQueryApi,
-    WalletQueryOptions, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
-    latest_tree_state_checkpoint_response, subtree_roots_response, tree_state_at_response,
-    visible_tip_block_response,
+    DEFAULT_MAX_COMPACT_BLOCK_RANGE, QueryError, WalletQueryApi, WalletServingPairSlot,
+    WalletServingQuery, WalletServingReadPair, latest_tree_state_checkpoint_response,
+    subtree_roots_response, tree_state_at_response, visible_tip_block_response,
 };
 use zinder_source::{SourceError, SourceTreeState};
-use zinder_store::{ArtifactFamily, ChainEpochArtifacts, RawBlobRetention};
+use zinder_store::{ChainEpochArtifacts, RawBlobRetention};
 use zinder_testkit::{
     ChainFixture, StoreFixture, WalletServingStoreFixture, encode_fixture_block_replay,
     sample_regtest_upgrade_activations,
 };
 
 use crate::common::{
-    ProbedNode, chain_epoch_artifacts_with_sapling_outputs, probed_serving_query_over,
-    serving_query_after_live_append, serving_query_over, synthetic_chain_epoch,
+    ProbedNode, probed_serving_query_over, serving_query_after_live_append, serving_query_over,
+    synthetic_chain_epoch,
 };
 
 /// Tree-state payload the release store derives from a checkpoint whose
@@ -371,38 +370,6 @@ async fn sparse_tree_state_uses_canonical_identity_and_time_with_frontier_only_p
 }
 
 #[tokio::test]
-async fn generic_query_rejects_oversized_subtree_root_range_before_storage() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let wallet_query = WalletQuery::new(
-        store_fixture.chain_store().clone(),
-        (),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
-    let requested = MAX_SUBTREE_ROOTS_PER_REQUEST.saturating_add(1);
-    let max_entries = NonZeroU32::new(requested).ok_or_else(|| eyre!("invalid max entries"))?;
-
-    let query_outcome = wallet_query
-        .subtree_roots(
-            SubtreeRootRange::new(
-                ShieldedProtocol::Sapling,
-                SubtreeRootIndex::new(0),
-                max_entries,
-            ),
-            None,
-        )
-        .await;
-
-    assert!(matches!(
-        query_outcome,
-        Err(QueryError::SubtreeRootRangeTooLarge {
-            requested: actual,
-            maximum,
-        }) if actual == requested && maximum == MAX_SUBTREE_ROOTS_PER_REQUEST
-    ));
-    Ok(())
-}
-
-#[tokio::test]
 async fn serving_query_rejects_oversized_subtree_root_range() -> eyre::Result<()> {
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let chain = ChainFixture::new(Network::ZcashRegtest)
@@ -472,115 +439,6 @@ async fn subtree_roots_response_returns_valid_empty_range() -> eyre::Result<()> 
 }
 
 #[tokio::test]
-async fn subtree_roots_response_reports_unavailable_when_completed_root_is_missing()
--> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (mut chain_epoch, block, _compact_block) = synthetic_chain_epoch(1, 1);
-    chain_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0, 0);
-    store.commit_chain_epoch(chain_epoch_artifacts_with_sapling_outputs(
-        chain_epoch,
-        block,
-        65_536,
-    )?)?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let error = match subtree_roots_response(
-        &wallet_query,
-        SubtreeRootRange::new(
-            ShieldedProtocol::Sapling,
-            SubtreeRootIndex::new(0),
-            NonZeroU32::new(1).ok_or_else(|| eyre!("invalid max entries"))?,
-        ),
-        None,
-    )
-    .await
-    {
-        Ok(response) => return Err(eyre!("expected unavailable roots, got {response:?}")),
-        Err(error) => error,
-    };
-
-    assert!(matches!(
-        error,
-        QueryError::ArtifactUnavailable {
-            family: ArtifactFamily::SubtreeRoot,
-            key: ArtifactKey::SubtreeRootIndex {
-                protocol: ShieldedProtocol::Sapling,
-                index
-            }
-        } if index == SubtreeRootIndex::new(0)
-    ));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn subtree_roots_response_uses_native_wallet_proto_shape() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (mut chain_epoch, block, _compact_block) = synthetic_chain_epoch(1, 1);
-    chain_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0, 0);
-    let subtree_root = SubtreeRootArtifact::new(
-        ShieldedProtocol::Sapling,
-        SubtreeRootIndex::new(0),
-        SubtreeRootHash::from_bytes([0x71; 32]),
-        block.height,
-        block.block_hash,
-    );
-    store.commit_chain_epoch(
-        chain_epoch_artifacts_with_sapling_outputs(chain_epoch, block, 65_536)?
-            .with_subtree_roots(vec![subtree_root.clone()]),
-    )?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let response = subtree_roots_response(
-        &wallet_query,
-        SubtreeRootRange::new(
-            ShieldedProtocol::Sapling,
-            SubtreeRootIndex::new(0),
-            NonZeroU32::new(1).ok_or_else(|| eyre!("invalid max entries"))?,
-        ),
-        None,
-    )
-    .await?;
-    let encoded_response = response.encode_to_vec();
-    let decoded_response = wallet::SubtreeRootsResponse::decode(encoded_response.as_slice())?;
-    let response_chain_epoch = decoded_response
-        .chain_view
-        .as_ref()
-        .and_then(|chain_view| chain_view.chain_epoch.as_ref())
-        .ok_or_else(|| eyre!("missing response chain epoch"))?;
-    let response_subtree_root = decoded_response
-        .subtree_roots
-        .first()
-        .ok_or_else(|| eyre!("missing response subtree root"))?;
-
-    assert_eq!(response_chain_epoch.chain_epoch_id, chain_epoch.id.value());
-    assert_eq!(
-        decoded_response.shielded_protocol,
-        wallet::ShieldedProtocol::Sapling as i32
-    );
-    assert_eq!(
-        decoded_response.start_index,
-        subtree_root.subtree_index.value()
-    );
-    assert_eq!(
-        response_subtree_root.root_hash,
-        subtree_root.root_hash.as_bytes()
-    );
-    assert_eq!(
-        response_subtree_root.completing_block_hash,
-        encode_rpc_block_hash_hex(subtree_root.completing_block_hash)
-    );
-    assert_eq!(
-        response_subtree_root.completing_block_height,
-        subtree_root.completing_block_height.value()
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn chain_epoch_rejects_tip_metadata_that_disagrees_with_compact_block() -> eyre::Result<()> {
     let store_fixture = StoreFixture::open()?;
     let store = store_fixture.chain_store().clone();
@@ -613,85 +471,9 @@ async fn chain_epoch_rejects_tip_metadata_that_disagrees_with_compact_block() ->
 }
 
 #[tokio::test]
-async fn compact_block_range_reports_unavailable_artifact_without_node_repair() -> eyre::Result<()>
-{
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
-    let replay = encode_fixture_block_replay(&block, &[]);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        chain_epoch,
-        vec![block],
-        vec![replay],
-        vec![compact_block],
-    ))?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let error = match wallet_query
-        .compact_blocks_in_range(
-            BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2)),
-            None,
-        )
-        .await
-    {
-        Ok(compact_block_range) => {
-            return Err(eyre!(
-                "expected unavailable artifact, got {compact_block_range:?}"
-            ));
-        }
-        Err(error) => error,
-    };
-
-    assert!(matches!(
-        error,
-        QueryError::ArtifactUnavailable {
-            family: ArtifactFamily::CompactBlock,
-            key: ArtifactKey::BlockHeight(height)
-        } if height == BlockHeight::new(2)
-    ));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn tree_state_checkpoint_response_reports_unavailable_artifact_without_node_repair()
--> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
-    let replay = encode_fixture_block_replay(&block, &[]);
-
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        chain_epoch,
-        vec![block],
-        vec![replay],
-        vec![compact_block],
-    ))?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let error = match tree_state_at_response(&wallet_query, BlockHeight::new(1), None).await {
-        Ok(tree_state) => {
-            return Err(eyre!("expected unavailable artifact, got {tree_state:?}"));
-        }
-        Err(error) => error,
-    };
-
-    assert!(matches!(
-        error,
-        QueryError::ArtifactUnavailable {
-            family: ArtifactFamily::TreeState,
-            key: ArtifactKey::BlockHeight(height)
-        } if height == BlockHeight::new(1)
-    ));
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn compact_block_range_rejects_inverted_height_range() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let (wallet_query, _store_fixture) = crate::common::serving_query_over(&chain)?;
 
     let error = match wallet_query
         .compact_blocks_in_range(
@@ -707,41 +489,6 @@ async fn compact_block_range_rejects_inverted_height_range() -> eyre::Result<()>
     };
 
     assert!(matches!(error, QueryError::InvalidBlockRange { .. }));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn compact_block_range_rejects_ranges_above_configured_limit() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let wallet_query = WalletQuery::with_options(
-        store,
-        (),
-        Arc::new(sample_regtest_upgrade_activations()),
-        WalletQueryOptions {
-            max_compact_block_range: NonZeroU32::new(1)
-                .ok_or_else(|| eyre!("invalid range limit"))?,
-            ..WalletQueryOptions::default()
-        },
-    );
-
-    let error = match wallet_query
-        .compact_blocks_in_range(
-            BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2)),
-            None,
-        )
-        .await
-    {
-        Ok(compact_block_range) => {
-            return Err(eyre!(
-                "expected range limit error, got {compact_block_range:?}"
-            ));
-        }
-        Err(error) => error,
-    };
-
-    assert!(matches!(error, QueryError::BlockRangeTooLarge { .. }));
 
     Ok(())
 }

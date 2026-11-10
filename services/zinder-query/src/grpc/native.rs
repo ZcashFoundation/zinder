@@ -93,7 +93,7 @@ pub struct WalletEndpointMetadata {
     pub service_version: String,
     /// Git commit embedded by the build.
     pub build_git_commit: String,
-    /// Canonical artifact schema version reported by `PrimaryChainStore`.
+    /// Canonical artifact schema version this build serves.
     pub schema_version: u32,
     /// Configured reorg window depth in blocks.
     pub reorg_window_blocks: u32,

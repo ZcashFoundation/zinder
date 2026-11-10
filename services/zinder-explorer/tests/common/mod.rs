@@ -20,41 +20,25 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use zinder_core::{
-    BlockHeight, BlockId, Network, NetworkUpgradeActivations, UnixTimestampMillis,
+    BlockHeight, BlockId, NetworkUpgradeActivations, UnixTimestampMillis,
     wire::encode_zinder_native_chain_name,
 };
 use zinder_ingest::{CanonicalConstructionConfig, load_fresh_canonical};
 use zinder_query::{
-    AdmittedIngestControl, WalletEndpointMetadata, WalletQuery, WalletQueryGrpcAdapter,
-    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    AdmittedIngestControl, WalletEndpointMetadata, WalletQueryGrpcAdapter, WalletServingPairSlot,
+    WalletServingQuery, WalletServingReadPair,
 };
 use zinder_source::{NodeSource, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan,
-    CanonicalStoreWorkload, PrimaryChainStore, RawBlobRetention, RocksDbCanonicalBuilder,
-    RocksDbResourceBudget,
+    CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder, RocksDbResourceBudget,
 };
 use zinder_testkit::{IngestControlFixture, WalletServingStoreFixture, live::LiveTestEnv};
 
 /// Reorg window for canonical stores built from a live node in tests.
 const LIVE_CANONICAL_REORG_WINDOW_BLOCKS: u32 = 100;
 
-/// Probes the upstream node tip via a fresh source.
-pub(crate) async fn fetch_live_tip_height(env: &LiveTestEnv) -> Result<BlockHeight> {
-    let probe_source = ZebraJsonRpcSource::with_options(
-        env.target.network,
-        &env.target.json_rpc_addr,
-        env.target.node_auth.clone(),
-        ZebraJsonRpcSourceOptions {
-            request_timeout: env.target.request_timeout,
-            max_response_bytes: env.target.max_response_bytes,
-            broadcast_timeout: None,
-        },
-    )?;
-    Ok(NodeSource::tip_id(&probe_source).await?.height)
-}
-
-/// Fetches the node-advertised upgrade table for live bulk-catchup derivation.
+/// Fetches the node-advertised upgrade table used to build the live serving pair.
 pub(crate) async fn fetch_live_network_upgrade_activations(
     env: &LiveTestEnv,
 ) -> Result<Arc<NetworkUpgradeActivations>> {
@@ -199,45 +183,6 @@ async fn build_live_serving_pair(
         Arc::new(wallet_reader),
     )?));
     Ok((store_fixture, slot, tip_height))
-}
-
-/// Per-test knobs for the in-process `WalletQuery` gRPC fixture.
-pub(crate) struct WalletQueryServerOptions {
-    /// Overrides the advertised `ServerInfo` chain name.
-    pub(crate) network: Option<Network>,
-    /// Routes ingest-owned reads through an in-process `IngestControl` server.
-    pub(crate) ingest_control_endpoint: Option<String>,
-}
-
-/// Serves `WalletQuery` over gRPC on an ephemeral loopback port.
-pub(crate) async fn serve_wallet_query_grpc(
-    wallet_query: WalletQuery<PrimaryChainStore>,
-    options: WalletQueryServerOptions,
-) -> Result<(SocketAddr, JoinHandle<Result<(), tonic::transport::Error>>)> {
-    let server_info = options
-        .network
-        .map_or_else(WalletEndpointMetadata::default, |network| {
-            WalletEndpointMetadata {
-                network: encode_zinder_native_chain_name(network).to_owned(),
-                ..WalletEndpointMetadata::default()
-            }
-        });
-    let adapter = match options.ingest_control_endpoint {
-        Some(endpoint) => {
-            WalletQueryGrpcAdapter::with_ingest_control_proxy(wallet_query, server_info, endpoint)
-        }
-        None => WalletQueryGrpcAdapter::new(wallet_query, server_info),
-    };
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let handle = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(adapter.into_server())
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-    });
-    await_grpc_endpoint(addr).await?;
-    Ok((addr, handle))
 }
 
 /// Waits until `addr` accepts connections.

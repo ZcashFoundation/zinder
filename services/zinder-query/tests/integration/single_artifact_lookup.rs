@@ -4,18 +4,12 @@
 )]
 
 use eyre::eyre;
-use std::sync::Arc;
-use zinder_core::{
-    BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata, Network, TransactionId, TxStatus,
-    UnixTimestampMillis,
-};
-use zinder_query::{QueryError, WalletQuery, WalletQueryApi};
-use zinder_store::{CURRENT_ARTIFACT_SCHEMA_VERSION, RawBlobRetention};
-use zinder_testkit::{
-    ChainFixture, FixtureTransactionRows, StoreFixture, sample_regtest_upgrade_activations,
-};
+use zinder_core::{BlockHeight, Network, TransactionId, TxStatus};
+use zinder_query::{QueryError, WalletQueryApi};
+use zinder_store::RawBlobRetention;
+use zinder_testkit::{ChainFixture, FixtureTransactionRows};
 
-use crate::common::{block_hash_from_seed, serving_query_over};
+use crate::common::serving_query_over;
 
 const RAW_TRANSACTION_BYTES: &[u8] = b"raw-transaction-bytes";
 
@@ -84,37 +78,6 @@ async fn compact_block_at_reports_unavailable_for_missing_height() -> eyre::Resu
         matches!(error, QueryError::ArtifactUnavailable { .. }),
         "unexpected missing-height error: {error:?}"
     );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn compact_block_at_reports_unavailable_below_checkpoint() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let checkpoint_height = BlockHeight::new(1_000);
-    let checkpoint_hash = block_hash_from_seed(1_000);
-    let checkpoint_epoch = ChainEpoch {
-        id: ChainEpochId::new(1),
-        network: Network::ZcashRegtest,
-        visible_tip_height: checkpoint_height,
-        visible_tip_hash: checkpoint_hash,
-        settled_tip_height: checkpoint_height,
-        settled_tip_hash: checkpoint_hash,
-        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
-        tip_metadata: ChainTipMetadata::new(130_002, 39_758, 0),
-        created_at: UnixTimestampMillis::new(1_774_668_000_000),
-    };
-
-    store.commit_artifactless_checkpoint(checkpoint_epoch)?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let error = match wallet_query.compact_block_at(checkpoint_height, None).await {
-        Ok(response) => return Err(eyre!("expected unavailable, got {response:?}")),
-        Err(error) => error,
-    };
-
-    assert!(matches!(error, QueryError::ArtifactUnavailable { .. }));
 
     Ok(())
 }

@@ -17,10 +17,8 @@ use tonic::{Code, Request, Response, Status, transport::Server};
 use tonic_types::StatusExt;
 use zinder_core::wire::{encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex};
 use zinder_core::{
-    ChainEpoch, ChainEpochId, ChainTipMetadata, MAX_SUBTREE_ROOTS_PER_REQUEST, Network,
-    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, TransactionId,
-    TransparentAddressScriptHash, TransparentOutPoint, TransparentUnspentOutput, TreeStateArtifact,
-    UnixTimestampMillis,
+    ChainEpoch, ChainEpochId, MAX_SUBTREE_ROOTS_PER_REQUEST, Network, TransactionId,
+    TransparentAddressScriptHash, TransparentOutPoint, TransparentUnspentOutput,
 };
 use zinder_proto::capabilities::{
     INGEST_CONTROL_MEMPOOL_EVENTS_V2, INGEST_CONTROL_MEMPOOL_SNAPSHOT_V3,
@@ -42,25 +40,22 @@ use zinder_proto::v1::{
 };
 use zinder_query::{
     AdmittedIngestControl, DEFAULT_MAX_COMPACT_BLOCK_RANGE, IngestControlAdmissionError,
-    WalletEndpointMetadata, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter,
-    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    WalletEndpointMetadata, WalletQueryApi, WalletQueryGrpcAdapter, WalletServingPairSlot,
+    WalletServingQuery, WalletServingReadPair,
 };
 use zinder_store::{
-    ChainEpochArtifacts, EventStreamStartPosition, PrimaryChainStore, RawBlobRetention,
-    StreamCursorTokenV1, chain_view_message, event_stream_start_message,
+    EventStreamStartPosition, RawBlobRetention, chain_view_message, event_stream_start_message,
 };
 use zinder_testkit::{
-    ChainFixture, FixtureTransactionRows, MockTransactionBroadcaster, StoreFixture,
-    WalletServingStoreFixture, encode_fixture_block_replay, sample_regtest_upgrade_activations,
+    ChainFixture, FixtureTransactionRows, MockTransactionBroadcaster, WalletServingStoreFixture,
+    sample_regtest_upgrade_activations,
 };
 
 /// Operational upper bound used to prove that ingest-control establishment is finite without
 /// exposing the implementation timeout as public API.
 const TEST_ADVANCE_PAST_INGEST_CONTROL_REQUEST_BOUND: Duration = Duration::from_mins(1);
 
-use crate::common::{
-    chain_epoch_artifacts_with_sapling_outputs, native_serving_query_over, synthetic_chain_epoch,
-};
+use crate::common::native_serving_query_over;
 
 #[tokio::test]
 async fn ingest_control_admission_accepts_exact_runtime_identity_and_capabilities()
@@ -493,123 +488,6 @@ async fn native_grpc_service_rejects_unset_event_stream_start() -> eyre::Result<
         };
         assert_eq!(status.code(), Code::InvalidArgument);
     }
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn native_grpc_service_live_tail_delivers_only_post_subscribe_events() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    commit_wallet_artifacts(&store)?;
-    let wallet_query = WalletQuery::new(
-        store.clone(),
-        (),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
-
-    let mut event_stream = WalletQueryService::chain_events(
-        &grpc_adapter,
-        Request::new(wallet::ChainEventsRequest {
-            start: Some(event_stream_start_message(
-                &EventStreamStartPosition::LiveTail,
-            )),
-            family: wallet::ChainEventStreamFamily::Visible as i32,
-            address_filter: Vec::new(),
-        }),
-    )
-    .await?
-    .into_inner();
-
-    let (mut second_epoch, second_block, _second_compact_block) = synthetic_chain_epoch(2, 2);
-    second_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0, 0);
-    let second_compact_block = zinder_core::CompactBlockArtifact::empty(
-        zinder_core::BlockId::new(second_block.height, second_block.block_hash),
-        second_block.parent_hash,
-        u32::try_from(second_block.block_time)
-            .map_err(|_| eyre!("fixture block time is not representable as u32"))?,
-        zinder_core::CompactChainMetadata {
-            sapling_commitment_tree_size: 65_536,
-            orchard_commitment_tree_size: 0,
-            ironwood_commitment_tree_size: 0,
-        },
-    );
-    let second_replay = encode_fixture_block_replay(&second_block, &[]);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        second_epoch,
-        vec![second_block],
-        vec![second_replay],
-        vec![second_compact_block],
-    ))?;
-
-    let first_event = tokio::time::timeout(std::time::Duration::from_secs(5), event_stream.next())
-        .await?
-        .ok_or_else(|| eyre!("chain-events stream closed before the post-subscribe event"))??;
-    assert_eq!(first_event.event_sequence, 2);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn native_grpc_service_expires_pruned_chain_event_cursors() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let mut first_cursor = Vec::new();
-
-    for height in 1..=3 {
-        let (chain_epoch, block, compact_block) = synthetic_chain_epoch(u64::from(height), height);
-        let replay = encode_fixture_block_replay(&block, &[]);
-        let commit = store.commit_chain_epoch(ChainEpochArtifacts::new(
-            chain_epoch,
-            vec![block],
-            vec![replay],
-            vec![compact_block],
-        ))?;
-        if height == 1 {
-            first_cursor = commit.event_envelope.cursor.as_bytes().to_vec();
-        }
-    }
-    store.prune_chain_events_before(UnixTimestampMillis::new(1_774_668_300_003))?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
-    let mut event_stream = WalletQueryService::chain_events(
-        &grpc_adapter,
-        Request::new(wallet::ChainEventsRequest {
-            start: Some(event_stream_start_message(
-                &EventStreamStartPosition::AfterCursor(StreamCursorTokenV1::from_bytes(
-                    first_cursor,
-                )),
-            )),
-            family: wallet::ChainEventStreamFamily::Visible as i32,
-            address_filter: Vec::new(),
-        }),
-    )
-    .await?
-    .into_inner();
-    let status = match event_stream
-        .next()
-        .await
-        .ok_or_else(|| eyre!("chain-events stream closed before cursor error"))?
-    {
-        Ok(event) => return Err(eyre!("expected cursor expiry, got event {event:?}")),
-        Err(status) => status,
-    };
-    let details = status.get_error_details();
-    let violation = details
-        .precondition_failure()
-        .and_then(|failure| failure.violations.first())
-        .cloned();
-
-    assert_eq!(status.code(), Code::FailedPrecondition);
-    assert!(matches!(
-        violation,
-        Some(violation)
-            if violation.r#type == "CHAIN_EVENT_CURSOR_EXPIRED"
-                && violation.subject == "chain_event:1"
-                && violation.description.contains('3')
-    ));
 
     Ok(())
 }
@@ -1285,31 +1163,6 @@ struct WalletGrpcResponses {
     latest_tree_state_checkpoint: wallet::TreeStateResponse,
     subtree_roots: wallet::SubtreeRootsResponse,
     network_upgrade_activations: wallet::NetworkUpgradeActivationsResponse,
-}
-
-fn commit_wallet_artifacts(store: &PrimaryChainStore) -> eyre::Result<()> {
-    let (mut chain_epoch, block, _compact_block) = synthetic_chain_epoch(1, 1);
-    chain_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0, 0);
-    let artifacts = chain_epoch_artifacts_with_sapling_outputs(chain_epoch, block.clone(), 65_536)?;
-    let tree_state = TreeStateArtifact::new(
-        block.height,
-        block.block_hash,
-        u32::try_from(block.block_time)?,
-        b"tree-state-1".to_vec(),
-    );
-    let subtree_root = SubtreeRootArtifact::new(
-        ShieldedProtocol::Sapling,
-        SubtreeRootIndex::new(0),
-        SubtreeRootHash::from_bytes([0x71; 32]),
-        block.height,
-        block.block_hash,
-    );
-    store.commit_chain_epoch(
-        artifacts
-            .with_tree_states(vec![tree_state])
-            .with_subtree_roots(vec![subtree_root]),
-    )?;
-    Ok(())
 }
 
 async fn read_wallet_grpc_responses(

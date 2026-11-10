@@ -64,9 +64,8 @@ The fold has real per-output CPU cost. The original implementation exposed an
 operator boolean that independently enabled
 `wallet.read.transparent_utxo_set_commitment_v1`; no current production
 composition or named consumer owned that switch. ADR-0038 removes the boolean.
-The temporary generic query always omits the capability and field, and the
-release serving-pair query does not implement the summary. Removal of the
-unowned generic surface is tracked in
+The serving-pair query does not implement the summary. Removal of the unowned
+protocol surface is tracked in
 [issue #63](https://github.com/gustavovalverde/zinder/issues/63). Retaining or
 reintroducing the commitment requires a concrete production consumer,
 authenticated admission evidence, and an enforced resource budget; a manual

@@ -16,16 +16,13 @@ use zinder_proto::{
     v1::wallet,
 };
 use zinder_query::{
-    ArtifactKey, DEFAULT_MAX_FULL_BLOCK_RANGE, FullBlockStream, QueryError, WalletQuery,
-    WalletQueryApi, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    DEFAULT_MAX_FULL_BLOCK_RANGE, FullBlockStream, QueryError, WalletQueryApi,
+    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
-use zinder_store::{ArtifactFamily, ChainEpochArtifacts, RawBlobRetention};
-use zinder_testkit::{
-    ChainFixture, StoreFixture, WalletServingStoreFixture, encode_fixture_block_replay,
-    sample_regtest_upgrade_activations,
-};
+use zinder_store::RawBlobRetention;
+use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
 
-use crate::common::{serving_query_after_live_append, serving_query_over, synthetic_chain_epoch};
+use crate::common::{serving_query_after_live_append, serving_query_over};
 
 /// Drains a full-block stream into its pinned epoch, the blobs delivered in
 /// order, and the single terminal error if the stream ended with one.
@@ -111,81 +108,6 @@ async fn full_block_range_streams_blocks_in_order() -> eyre::Result<()> {
     assert_eq!(chain_epoch, current_epoch);
     assert_eq!(blobs, expected_block_blobs(&chain));
     assert!(terminal_error.is_none(), "clean range must not error");
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn full_block_at_unretained_height_returns_artifact_unavailable() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
-    let replay = encode_fixture_block_replay(&block, &[]);
-
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        chain_epoch,
-        vec![block],
-        vec![replay],
-        vec![compact_block],
-    ))?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let outcome = wallet_query.full_block_at(BlockHeight::new(1), None).await;
-
-    assert!(
-        matches!(
-            outcome,
-            Err(QueryError::ArtifactUnavailable {
-                family: ArtifactFamily::BlockBlob,
-                key: ArtifactKey::BlockHeight(height),
-            }) if height == BlockHeight::new(1)
-        ),
-        "unretained block blob must degrade to ArtifactUnavailable, got {outcome:?}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn full_block_range_without_blob_retention_errors_at_first_height() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-
-    for height in 1..=5u32 {
-        let (chain_epoch, block, compact_block) = synthetic_chain_epoch(u64::from(height), height);
-        let replay = encode_fixture_block_replay(&block, &[]);
-        store.commit_chain_epoch(ChainEpochArtifacts::new(
-            chain_epoch,
-            vec![block],
-            vec![replay],
-            vec![compact_block],
-        ))?;
-    }
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let stream = wallet_query
-        .full_blocks_in_range(
-            BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(5)),
-            None,
-        )
-        .await?;
-    let (_chain_epoch, blobs, terminal_error) = drain_full_block_stream(stream).await;
-
-    assert_eq!(
-        blobs,
-        Vec::<BlockBlobArtifact>::new(),
-        "a store without block retention must not deliver raw blocks"
-    );
-    assert!(
-        matches!(
-            terminal_error,
-            Some(QueryError::ArtifactUnavailable {
-                family: ArtifactFamily::BlockBlob,
-                key: ArtifactKey::BlockHeight(height),
-            }) if height == BlockHeight::new(1)
-        ),
-        "the first unretained height must terminate the stream, got {terminal_error:?}"
-    );
 
     Ok(())
 }

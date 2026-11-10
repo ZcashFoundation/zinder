@@ -115,10 +115,6 @@ The concrete bindings are:
   query, gRPC handlers, pair publisher, and readiness probe clones of the same
   authenticated channel. `WalletQueryGrpcAdapter` owns no provider
   configuration or connection state.
-- `WalletQueryGrpcAdapter::with_ingest_control_proxy` remains only as a
-  temporary generic-query test seam. No release composition calls it. It is
-  deleted with the generic primary-store query after the deferred consumers
-  and tests move to admitted composition; it is not a native release binding.
 - `spawn_ingest_control_tip_change_publisher` runs in the compat process and replays the retained `IngestControl.VisibleChainEvents` window before following live events. `MempoolSnapshotResponse.chain_view.chain_epoch.chain_epoch_id` fences the snapshot page, and `TipChangeWatcher::await_tip_change_after` resolves immediately when it has already retained a newer chain-event sequence. Epoch ids and chain-event sequences share one monotonic identity space. `LightwalletdGrpcAdapter` races that signal against the mempool stream and closes the gRPC stream on each best-block change. Replaying retained chain events prevents a writer or network interruption from hiding a change. This restores the lightwalletd Go contract that Zodl's `sync` loop relies on without making the compat process open its own upstream node connection.
 
 ### Retention is two-tier with separately tunable windows

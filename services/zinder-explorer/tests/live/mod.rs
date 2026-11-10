@@ -7,4 +7,3 @@
 
 mod mempool_federation;
 mod search_federation;
-mod value_pool_summary_federation;
