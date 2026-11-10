@@ -1273,7 +1273,7 @@ mod tests {
 
     use super::{
         CompactBlockAdapter, CompactBlockPublisher, CompactBlockServingConfig,
-        CompactBlockServingSlot, CompactServingReadiness, PoolSelection,
+        CompactBlockServingError, CompactBlockServingSlot, CompactServingReadiness, PoolSelection,
         compact_block_to_lightwalletd, range_chunks, transport_failure_cause,
     };
     use compact_tx_streamer_server::CompactTxStreamer;
@@ -1678,10 +1678,18 @@ mod tests {
         )
         .await;
 
-        assert!(outcome.is_err());
-        drop(outcome);
+        let bootstrap_error = outcome.err();
         let _ = shutdown_sender.send(());
         server.await??;
+        let Some(CompactBlockServingError::Runtime(message)) = bootstrap_error else {
+            return Err(
+                format!("expected a runtime bootstrap error, got {bootstrap_error:?}").into(),
+            );
+        };
+        assert!(
+            message.contains("writer fence diverged from the candidate secondary"),
+            "bootstrap failed for a reason other than fence divergence: {message}"
+        );
         Ok(())
     }
 
