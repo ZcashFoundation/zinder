@@ -291,21 +291,34 @@ the snake-case name of the `QueryError` variant, such as
 Each `WalletServingQuery` request records exactly one sample when it returns.
 The sample's duration covers argument validation, the storage read, and any
 upstream node call, such as the tree-state fill or transaction broadcast. A
-request rejected by validation is still recorded with its error class. A
-streaming read records when the stream is established. Later sub-reads of the
-stream do not record. One protocol request can produce several samples when
-it composes several domain reads. For example, a compatibility request that
-pins the visible tip first records a `visible_tip_block` sample.
+request rejected by validation is still recorded with its error class. A read
+the serving pair cannot answer still records, with an error class such as
+`endpoint_capability_unavailable` or `materialized_view_unavailable`, and so
+does `network_upgrade_activations`, which reads no storage. A streaming read
+records when the stream is established. Later sub-reads of the stream do not
+record. One protocol request can produce several samples when it composes
+several domain reads. For example, a compatibility request that pins the
+visible tip first records a `visible_tip_block` sample.
+
+The chain-event reads are the exception. `chain_events` page reads and
+`resolve_chain_events_start` serve a stream that the adapter records, so they
+record nothing themselves. The stream counts once and idle polling does not
+inflate the request rate.
 
 The native gRPC adapter records the operations it owns under the same metric
-names, with the `tonic::Code` name as `error_class`. These operations are
-`chain_events` stream establishment and the ingest-control proxies:
-`mempool_transaction`, `mempool_snapshot`, `mempool_events`,
-`transparent_mempool_outputs_by_address`,
-`transparent_mempool_spends_by_outpoint`, and
-`transparent_mempool_outputs_by_outpoint`. The query does not record the
-chain-event page reads behind an adapter stream, so the stream counts once and
-idle polling does not inflate the request rate.
+names, with the `tonic::Code` name as `error_class`:
+
+- `chain_events` stream establishment.
+- The ingest-control proxies `mempool_transaction`, `mempool_snapshot`,
+  `mempool_events`, `transparent_mempool_outputs_by_address`,
+  `transparent_mempool_spends_by_outpoint`, and
+  `transparent_mempool_outputs_by_outpoint`.
+
+The release native endpoint does not advertise
+`wallet.address.transparent_balance_v1`. It rejects transparent balance
+requests at the capability check with `FAILED_PRECONDITION`, which records no
+sample. A direct `WalletServingQuery` balance read, such as the lightwalletd
+compatibility balance request, records under `transparent_address_balance`.
 
 The `ZinderWalletQueryP95High` alert and the overview dashboard read these
 series.

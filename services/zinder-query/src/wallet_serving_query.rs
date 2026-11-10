@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashSet,
+    future::ready,
     num::{NonZeroU16, NonZeroU32},
     sync::Arc,
 };
@@ -665,11 +666,14 @@ where
     }
 
     async fn network_upgrade_activations(&self) -> Result<NetworkUpgradeActivations, QueryError> {
-        Ok(admitted_activations(&self.capture_pair(), &self.network_upgrade_activations).clone())
+        let activations =
+            admitted_activations(&self.capture_pair(), &self.network_upgrade_activations).clone();
+        serving_read::record("network_upgrade_activations", None, ready(Ok(activations))).await
     }
 
     async fn chain_value_pools_at_tip(&self) -> Result<ChainValuePoolsAtTip, QueryError> {
-        Err(unavailable(WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1))
+        let unserved = Err(unavailable(WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1));
+        serving_read::record("chain_value_pools_at_tip", None, ready(unserved)).await
     }
 
     async fn visible_tip_block(
@@ -764,7 +768,8 @@ where
         block_range: zinder_core::BlockHeightRange,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockRange, QueryError> {
-        serving_read::record_compact_block_range(block_range.into_iter().len(), async {
+        let requested_blocks = Some(block_range.into_iter().len());
+        serving_read::record("compact_blocks_in_range", requested_blocks, async {
             validate_block_range(block_range, DEFAULT_MAX_COMPACT_BLOCK_RANGE)?;
             let pair = self.capture_pair();
             serving_read::off_reactor(pair, move |pair| {
@@ -809,7 +814,7 @@ where
         block_range: BlockHeightRange,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<FullBlockStream, QueryError> {
-        serving_read::record("full_blocks_in_range", async {
+        serving_read::record("full_blocks_in_range", None, async {
             validate_block_range(block_range, DEFAULT_MAX_FULL_BLOCK_RANGE)?;
             let pair = self.capture_pair();
             let (pair, chain_epoch) = serving_read::off_reactor(pair, move |pair| {
@@ -886,9 +891,10 @@ where
         _tx_index: u64,
         _at_epoch_id: Option<ChainEpochId>,
     ) -> Result<Transaction, QueryError> {
-        Err(QueryError::MaterializedViewUnavailable {
+        let unserved = Err(QueryError::MaterializedViewUnavailable {
             capability: WALLET_READ_TRANSACTION_BY_ID_V2,
-        })
+        });
+        serving_read::record("transaction_at_block_index", None, ready(unserved)).await
     }
 
     async fn raw_transaction(
@@ -926,7 +932,8 @@ where
         _outpoints: Vec<zinder_core::TransparentOutPoint>,
         _at_epoch_id: Option<ChainEpochId>,
     ) -> Result<zinder_core::TransparentOutputsByOutpointResponse, QueryError> {
-        Err(unavailable(WALLET_READ_TRANSPARENT_OUTPUTS_V1))
+        let unserved = Err(unavailable(WALLET_READ_TRANSPARENT_OUTPUTS_V1));
+        serving_read::record("transparent_outputs_by_outpoint", None, ready(unserved)).await
     }
 
     async fn transparent_spends_by_outpoint(
@@ -934,7 +941,8 @@ where
         _outpoints: Vec<zinder_core::TransparentOutPoint>,
         _at_epoch_id: Option<ChainEpochId>,
     ) -> Result<zinder_core::TransparentSpendsByOutpointResponse, QueryError> {
-        Err(unavailable(WALLET_READ_TRANSPARENT_SPENDS_V1))
+        let unserved = Err(unavailable(WALLET_READ_TRANSPARENT_SPENDS_V1));
+        serving_read::record("transparent_spends_by_outpoint", None, ready(unserved)).await
     }
 
     async fn transparent_unspent_outputs_by_outpoint(
@@ -942,7 +950,13 @@ where
         _outpoints: Vec<zinder_core::TransparentOutPoint>,
         _at_epoch_id: Option<ChainEpochId>,
     ) -> Result<zinder_core::TransparentUnspentOutputsByOutpointResponse, QueryError> {
-        Err(unavailable(WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1))
+        let unserved = Err(unavailable(WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1));
+        serving_read::record(
+            "transparent_unspent_outputs_by_outpoint",
+            None,
+            ready(unserved),
+        )
+        .await
     }
 
     async fn transparent_address_unspent_outputs(
@@ -989,7 +1003,7 @@ where
         &self,
         request: TransparentAddressTxIdsInRangeRequest,
     ) -> Result<TransparentAddressTxIds, QueryError> {
-        serving_read::record("transparent_address_tx_ids_in_range", async {
+        serving_read::record("transparent_address_tx_ids_in_range", None, async {
             if request.descending {
                 return Err(QueryError::MaterializedViewUnavailable {
                     capability: "descending canonical transparent history",
@@ -1046,7 +1060,7 @@ where
         addresses: Vec<TransparentAddressScriptHash>,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressBalance, QueryError> {
-        serving_read::record("transparent_address_balance", async {
+        serving_read::record("transparent_address_balance", None, async {
             let requested_address_count = addresses.len();
             let address_count = u32::try_from(requested_address_count).ok().filter(|count| {
                 (1..=crate::MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES).contains(count)
@@ -1082,7 +1096,8 @@ where
         &self,
         _at_epoch_id: Option<ChainEpochId>,
     ) -> Result<zinder_core::TransparentUtxoSetSummary, QueryError> {
-        Err(unavailable(WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1))
+        let unserved = Err(unavailable(WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1));
+        serving_read::record("transparent_utxo_set_summary", None, ready(unserved)).await
     }
 
     async fn tree_state_at(
@@ -1090,7 +1105,7 @@ where
         height: BlockHeight,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError> {
-        serving_read::record("tree_state_at", async {
+        serving_read::record("tree_state_at", None, async {
             if !self
                 .native_endpoint_capabilities
                 .contains(WALLET_READ_TREE_STATE_AT_HEIGHT_V2)
@@ -1187,7 +1202,7 @@ where
         subtree_root_range: zinder_core::SubtreeRootRange,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<SubtreeRoots, QueryError> {
-        serving_read::record("subtree_roots_in_range", async {
+        serving_read::record("subtree_roots_in_range", None, async {
             validate_subtree_root_range(subtree_root_range)?;
             let pair = self.capture_pair();
             serving_read::off_reactor(pair, move |pair| {
@@ -1239,7 +1254,7 @@ where
         family: ChainEventStreamFamily,
     ) -> Result<ChainEvents, QueryError> {
         // The protocol adapter records the chain-event stream; each page read
-        // here is one poll of that stream.
+        // here is one poll of that stream, so it records nothing itself.
         let pair = self.capture_pair();
         serving_read::off_reactor(pair, move |pair| {
             let event_envelopes = pair
@@ -1260,6 +1275,8 @@ where
         start: EventStreamStartPosition,
         requested_family: ChainEventStreamFamily,
     ) -> Result<ChainEventStreamResume, QueryError> {
+        // Resolving the start is part of establishing the adapter-recorded
+        // chain-event stream.
         let pair = self.capture_pair();
         serving_read::off_reactor(pair, move |pair| {
             pair.canonical()
@@ -1273,7 +1290,7 @@ where
         &self,
         raw_transaction: RawTransactionBytes,
     ) -> Result<zinder_core::TransactionBroadcastOutcome, QueryError> {
-        serving_read::record("broadcast_transaction", async {
+        serving_read::record("broadcast_transaction", None, async {
             if !self
                 .native_endpoint_capabilities
                 .contains(WALLET_BROADCAST_TRANSACTION_V1)
