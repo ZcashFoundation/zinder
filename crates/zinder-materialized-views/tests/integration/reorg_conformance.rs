@@ -16,7 +16,7 @@ use std::{
 
 use proptest::{
     strategy::{Just, Strategy},
-    test_runner::{Config, TestCaseError, TestRunner},
+    test_runner::{Config, TestCaseError, TestRng, TestRunner},
 };
 use tempfile::TempDir;
 use zinder_core::{
@@ -118,13 +118,17 @@ fn chain_shapes() -> impl Strategy<Value = ChainShape> {
         )
 }
 
+/// Samples a fixed, seeded set of shapes so every run checks the same cases
+/// and a failure reproduces without a persisted seed.
 #[test]
 fn every_bundled_consumer_is_reorg_path_independent() -> TestResult {
-    let mut runner = TestRunner::new(Config {
+    let config = Config {
         cases: 24,
         failure_persistence: None,
         ..Config::default()
-    });
+    };
+    let rng = TestRng::deterministic_rng(config.rng_algorithm);
+    let mut runner = TestRunner::new_with_rng(config, rng);
     runner
         .run(&chain_shapes(), |shape| {
             assert_path_independent(shape).map_err(|error| TestCaseError::fail(error.to_string()))

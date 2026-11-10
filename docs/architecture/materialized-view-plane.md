@@ -133,14 +133,18 @@ declares the schema, product role, preset membership, and
 | `ChainEventBlocks`, join `CanonicalBackfill` | The live tail from the shared replay cursor | Canonical backfill plus chain events |
 | `ChainEventBlocks`, join `CanonicalSnapshot` | Chain events once its snapshot is active | Canonical snapshot plus chain events |
 | `ChainEventEnvelope` | Every retained chain event, envelope only | Canonical chain events |
-| `MempoolEvents` | Writer-owned mempool events | Mempool events |
+| `MempoolEvents` | Mempool events, once a host drives them | Mempool events |
 | `CanonicalBackfillOnly` | No events | Canonical backfill |
 
 The store derives its preset schema lists and chain-event cursor lists from
-the registry. The replay host constructs each selected consumer from its entry
-for every dispatch and derives its cursor-agreement and backfill-owned sets
-from the join kind. Neither side keeps its own consumer list, so a registered
-consumer cannot be left out of dispatch.
+the registry. The ingest replay host constructs each selected chain-event
+consumer from its entry and derives its cursor-agreement and backfill-owned
+sets from the join kind. Neither side keeps its own consumer list, so a
+registered chain-event consumer cannot be left out of chain-event dispatch.
+No bundled runtime drives `MempoolEvents` consumers yet.
+`mempool_event_counts` is registered and included in the Explorer preset, but
+nothing calls `MaterializedViewStore::write_mempool_event`, so its column
+family receives no rows.
 
 ## Store contract
 

@@ -143,7 +143,7 @@ says how the replay host constructs and drives the consumer:
 - `ChainEventBlocks` with a `ChainEventBlockJoin` of `Replay`,
   `CanonicalBackfill`, or `CanonicalSnapshot` (activation-gated);
 - `ChainEventEnvelope` for consumers that read only the event envelope;
-- `MempoolEvents`; or
+- `MempoolEvents`, which no bundled runtime drives yet; or
 - `CanonicalBackfillOnly` for consumers that never receive events.
 
 The recovery source is derived from the dispatch rather than declared
