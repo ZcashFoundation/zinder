@@ -16,7 +16,7 @@ use crate::{
 use super::{
     CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalRetainedEvent,
     CanonicalSequenceCheckpoint, CanonicalStoreBuildState, CanonicalStoreError,
-    CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
+    CanonicalStoreReadyEvidence, CanonicalStoreWorkload, CanonicalSubtreeRootLoadCoverage,
     activation_schedule::CanonicalActivationSchedule,
     block_replay::{CanonicalReplayRangeScan, CanonicalReplayScan, read_replay_facts_at},
     construction_manifest::validate_ready_construction_manifest,
@@ -73,6 +73,7 @@ pub struct RocksDbCanonicalSecondary {
     workload: CanonicalStoreWorkload,
     pub(super) build_plan: super::CanonicalStoreBuildPlan,
     pub(super) ready_evidence: CanonicalStoreReadyEvidence,
+    pub(super) subtree_root_coverage: CanonicalSubtreeRootLoadCoverage,
     pub(super) cursor_auth_key: [u8; 32],
     pub(super) activation_schedule: Option<CanonicalActivationSchedule>,
     reorg_policy: super::CanonicalReorgPolicy,
@@ -164,7 +165,7 @@ impl RocksDbCanonicalSecondary {
         let CanonicalStoreBuildState::Ready(ready_evidence) = opened_control.build_state else {
             return Err(CanonicalStoreError::StoreNotReady { path: primary_path });
         };
-        validate_ready_construction_manifest(
+        let subtree_root_coverage = validate_ready_construction_manifest(
             &primary_path,
             &ready_evidence,
             opened_control.workload,
@@ -207,6 +208,7 @@ impl RocksDbCanonicalSecondary {
             workload: expected_workload,
             build_plan: opened_control.build_plan,
             ready_evidence,
+            subtree_root_coverage,
             cursor_auth_key: opened_control.cursor_auth_key,
             activation_schedule,
             reorg_policy,

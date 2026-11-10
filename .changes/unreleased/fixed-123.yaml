@@ -1,5 +1,5 @@
 kind: fixed
-body: 'Subtree-root reads on a checkpointed store now return `NOT_FOUND` with reason `ARTIFACT_UNAVAILABLE` for a root below the retained history, instead of `UNAVAILABLE`. A missing root inside retained coverage still reports a storage error.'
+body: 'Subtree-root reads on a checkpointed store now return `NOT_FOUND` with reason `ARTIFACT_UNAVAILABLE` for a root that completed below the retained history and was never loaded, instead of `UNAVAILABLE`. A missing root the store loaded, including any root of a store built with the complete subtree-root prefix, still reports a storage error.'
 time: 2026-11-10T21:41:42Z
 custom:
   Bump: patch

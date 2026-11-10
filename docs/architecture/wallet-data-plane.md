@@ -141,7 +141,9 @@ subtree count return an empty response. A store holds every root its retained
 blocks complete. A checkpointed store whose construction loaded retained-range
 coverage has no row for a root its history predecessor had already completed,
 and a read of that root returns `ArtifactUnavailable` for the subtree-root
-family and index (`NOT_FOUND`). Any other absent completed root is a canonical
+family and index (`NOT_FOUND`). A store whose construction loaded the complete
+prefix holds every completed root from index zero. Any other absent completed
+root, including any absent root in a complete-prefix store, is a canonical
 integrity failure.
 
 ## Block Identity and Hash-Keyed Reads

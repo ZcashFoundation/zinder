@@ -185,6 +185,10 @@ impl CanonicalConstructionManifestDraft {
         })
     }
 
+    pub(super) const fn subtree_root_coverage(&self) -> CanonicalSubtreeRootLoadCoverage {
+        self.subtree_evidence.coverage
+    }
+
     pub(super) fn persist(
         self,
         store_path: &Path,
@@ -210,7 +214,7 @@ pub(super) fn validate_ready_construction_manifest(
     ready: &CanonicalStoreReadyEvidence,
     workload: CanonicalStoreWorkload,
     build_plan: &CanonicalStoreBuildPlan,
-) -> Result<(), CanonicalStoreError> {
+) -> Result<CanonicalSubtreeRootLoadCoverage, CanonicalStoreError> {
     let (manifest, bytes) = read_construction_manifest(store_path)?;
     let binding = CanonicalConstructionManifestBinding {
         version: manifest.format_version,
@@ -225,7 +229,7 @@ pub(super) fn validate_ready_construction_manifest(
         ));
     }
     validate_manifest_control_identity(store_path, &manifest, workload, build_plan)?;
-    Ok(())
+    Ok(manifest.subtree_evidence.coverage)
 }
 
 fn read_construction_manifest(

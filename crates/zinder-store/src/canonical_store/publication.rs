@@ -375,7 +375,7 @@ impl PublicationContext {
             self.workload,
             self.build_plan.reorg_policy(),
         );
-        let (admitted_database_identity, admitted_control) =
+        let (admitted_database_identity, admitted_control, _) =
             admit_existing_store(&self.store_path, &expectation)?;
         if admitted_database_identity.as_slice() != built_database_identity
             || admitted_control != expected_control
@@ -623,6 +623,10 @@ impl ValidatedRocksDbCanonicalBuild {
     }
 
     /// Atomically publishes epoch 1, event 1, and READY with a synced WAL write.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "baseline publication binds the manifest, epoch, event, and READY control in one synced write"
+    )]
     pub fn publish_baseline(
         self,
         prepared: PreparedCanonicalBaselinePublication,
@@ -635,6 +639,7 @@ impl ValidatedRocksDbCanonicalBuild {
             ));
         }
 
+        let subtree_root_coverage = self.construction_manifest.subtree_root_coverage();
         let unbound_ready_evidence = CanonicalStoreReadyEvidence {
             sequence_checkpoint: prepared.sequence_checkpoint,
             ..self.ready_evidence
@@ -709,6 +714,7 @@ impl ValidatedRocksDbCanonicalBuild {
             self.build_plan,
             self.cursor_auth_key,
             &ready_evidence,
+            subtree_root_coverage,
             replay_tail,
         ))
     }

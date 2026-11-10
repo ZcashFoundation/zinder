@@ -26,7 +26,9 @@ use super::{
         TRANSACTION_BLOB_COLUMN_FAMILY, TRANSACTION_LOCATION_COLUMN_FAMILY,
         TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
     },
-    subtree_load::{decode_subtree_root, encode_subtree_root_key},
+    subtree_load::{
+        CanonicalSubtreeRootLoadCoverage, decode_subtree_root, encode_subtree_root_key,
+    },
 };
 
 const CHAIN_EPOCH_VALUE_BYTES: usize = 93;
@@ -39,6 +41,7 @@ trait CanonicalServingRead {
     fn serving_network(&self) -> Network;
     fn serving_build_plan(&self) -> &super::CanonicalStoreBuildPlan;
     fn serving_ready_evidence(&self) -> super::CanonicalStoreReadyEvidence;
+    fn serving_subtree_root_coverage(&self) -> CanonicalSubtreeRootLoadCoverage;
 }
 
 impl CanonicalServingRead for RocksDbCanonicalStore {
@@ -57,6 +60,10 @@ impl CanonicalServingRead for RocksDbCanonicalStore {
     fn serving_ready_evidence(&self) -> super::CanonicalStoreReadyEvidence {
         self.ready_evidence()
     }
+
+    fn serving_subtree_root_coverage(&self) -> CanonicalSubtreeRootLoadCoverage {
+        self.subtree_root_coverage
+    }
 }
 
 impl CanonicalServingRead for RocksDbCanonicalSecondary {
@@ -74,6 +81,10 @@ impl CanonicalServingRead for RocksDbCanonicalSecondary {
 
     fn serving_ready_evidence(&self) -> super::CanonicalStoreReadyEvidence {
         self.ready_evidence()
+    }
+
+    fn serving_subtree_root_coverage(&self) -> CanonicalSubtreeRootLoadCoverage {
+        self.subtree_root_coverage
     }
 }
 
@@ -181,10 +192,11 @@ macro_rules! impl_canonical_typed_reads {
 
             /// Reads the contiguous subtree-root rows requested by `range`.
             ///
-            /// An absent root that the history predecessor's trees already
-            /// completed fails with
-            /// [`CanonicalStoreError::SubtreeRootUnavailable`]; any other
-            /// absent root is a publication refusal.
+            /// In a store loaded with retained-range coverage, an absent root
+            /// that the history predecessor's trees already completed fails
+            /// with [`CanonicalStoreError::SubtreeRootUnavailable`]. Any other
+            /// absent root, including every root of a complete-prefix store,
+            /// is a publication refusal.
             pub fn subtree_roots(
                 &self,
                 range: SubtreeRootRange,
@@ -559,13 +571,17 @@ fn read_subtree_roots(
     range: SubtreeRootRange,
 ) -> Result<Vec<SubtreeRootArtifact>, CanonicalStoreError> {
     let family = column_family(&store.serving_open().db, SUBTREE_ROOT_COLUMN_FAMILY)?;
-    // Every build loads at least the roots its retained blocks complete, so
-    // only an index the predecessor's trees already completed may be absent.
-    let retained_coverage_start = store
-        .serving_build_plan()
-        .history_predecessor()
-        .tip_metadata()
-        .completed_subtree_count(range.protocol);
+    // A complete-prefix load holds every advertised root. A retained-range
+    // load holds the roots its retained blocks complete, so only an index the
+    // predecessor's trees already completed may be absent.
+    let coverage_start = match store.serving_subtree_root_coverage() {
+        CanonicalSubtreeRootLoadCoverage::CompletePrefix => 0,
+        CanonicalSubtreeRootLoadCoverage::RetainedRange => store
+            .serving_build_plan()
+            .history_predecessor()
+            .tip_metadata()
+            .completed_subtree_count(range.protocol),
+    };
     range
         .into_iter()
         .map(|subtree_index| {
@@ -586,7 +602,7 @@ fn read_subtree_roots(
                     source,
                 })?
                 .ok_or_else(|| {
-                    if subtree_index.value() < retained_coverage_start {
+                    if subtree_index.value() < coverage_start {
                         CanonicalStoreError::SubtreeRootUnavailable {
                             protocol: range.protocol,
                             subtree_index,

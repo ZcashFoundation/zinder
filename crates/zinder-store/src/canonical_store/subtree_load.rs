@@ -781,7 +781,8 @@ mod tests {
         CommitmentTreeCheckpoint, CommitmentTreeFrontier, CommitmentTreeFrontiers,
         CompactBlockArtifact, CompactChainMetadata, FinalNoteCommitmentRoot, Network,
         SUBTREE_LEAF_COUNT, SerializedBytesDigest, ShieldedProtocol, SubtreeRootArtifact,
-        SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, encode_canonical_block_replay,
+        SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, UnixTimestampMillis,
+        encode_canonical_block_replay,
     };
 
     use super::{
@@ -789,8 +790,9 @@ mod tests {
         encode_subtree_root_value, required_subtree_root_ranges,
     };
     use crate::{
-        CanonicalBuildBlock, CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreError,
-        CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder, RocksDbResourceBudget,
+        CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalReorgPolicy,
+        CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload, RawBlobRetention,
+        RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
     };
 
     const PREDECESSOR: BlockId =
@@ -934,6 +936,89 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn complete_prefix_store_reports_missing_pre_floor_root_as_storage_damage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let completed_sapling = completed_sapling_tip_frontiers()?;
+        let mut builder = loaded_checkpointed_builder_from(
+            temporary.path().join("canonical"),
+            completed_sapling.clone(),
+            completed_sapling.clone(),
+            completed_sapling.clone(),
+        )?;
+        let pre_floor_root = complete_prefix_root(ShieldedProtocol::Sapling, 0, 0x51, PREDECESSOR);
+        let evidence = builder.load_complete_subtree_root_prefix([pre_floor_root.clone()])?;
+        assert_eq!(
+            evidence.coverage,
+            CanonicalSubtreeRootLoadCoverage::CompletePrefix
+        );
+        builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
+            BUILD_TIP,
+            BUILD_TIP.height.value(),
+            completed_sapling,
+        ))?;
+        let validated = builder.prepare_cold_certified_publication()?;
+        let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
+            BUILD_TIP,
+            UnixTimestampMillis::new(1_750_000_000_001),
+        ))?;
+        let store = validated.publish_baseline(publication)?;
+        let range = SubtreeRootRange::new(
+            ShieldedProtocol::Sapling,
+            SubtreeRootIndex::new(0),
+            NonZeroU32::new(1).ok_or("subtree range must be nonzero")?,
+        );
+        assert_eq!(
+            store.subtree_roots(range)?,
+            std::slice::from_ref(&pre_floor_root)
+        );
+
+        {
+            let family = store
+                .bounded_open
+                .db
+                .cf_handle(super::SUBTREE_ROOT_COLUMN_FAMILY)
+                .ok_or("subtree-root family must exist")?;
+            store
+                .bounded_open
+                .db
+                .delete_cf(&family, encode_subtree_root_key(&pre_floor_root))?;
+        }
+
+        let error = store
+            .subtree_roots(range)
+            .err()
+            .ok_or("a covered pre-floor root gap must fail closed")?;
+        assert!(
+            matches!(error, CanonicalStoreError::PublicationRefused { .. }),
+            "unexpected missing-root error: {error:?}"
+        );
+
+        store.bounded_open.db.flush_wal(true)?;
+        drop(store);
+        let reopened = RocksDbCanonicalStore::open_ready(
+            temporary.path().join("canonical"),
+            &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(100)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let reopened_error = reopened
+            .subtree_roots(range)
+            .err()
+            .ok_or("a reopened covered pre-floor root gap must fail closed")?;
+        assert!(
+            matches!(
+                reopened_error,
+                CanonicalStoreError::PublicationRefused { .. }
+            ),
+            "unexpected reopened missing-root error: {reopened_error:?}"
+        );
+        Ok(())
+    }
+
     fn loaded_builder_with_complete_prefix_requirements(
         path: impl AsRef<Path>,
     ) -> Result<RocksDbCanonicalBuilder, Box<dyn std::error::Error>> {
@@ -976,12 +1061,31 @@ mod tests {
     ) -> Result<RocksDbCanonicalBuilder, Box<dyn std::error::Error>> {
         let activations =
             crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        loaded_checkpointed_builder_from(
+            path,
+            crate::canonical_store::test_checkpoint_frontiers(&activations, PREDECESSOR.height),
+            crate::canonical_store::test_checkpoint_frontiers(&activations, FIRST_RETAINED.height),
+            tip_frontiers,
+        )
+    }
+
+    /// Loads two retained blocks above a predecessor whose trees are
+    /// `predecessor_frontiers`; the first retained block holds
+    /// `first_retained_frontiers`.
+    fn loaded_checkpointed_builder_from(
+        path: impl AsRef<Path>,
+        predecessor_frontiers: CommitmentTreeFrontiers,
+        first_retained_frontiers: CommitmentTreeFrontiers,
+        tip_frontiers: CommitmentTreeFrontiers,
+    ) -> Result<RocksDbCanonicalBuilder, Box<dyn std::error::Error>> {
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
         let build_plan = CanonicalStoreBuildPlan::checkpointed(
             &activations,
             CommitmentTreeCheckpoint::new(
                 PREDECESSOR,
                 PREDECESSOR.height.value(),
-                crate::canonical_store::test_checkpoint_frontiers(&activations, PREDECESSOR.height),
+                predecessor_frontiers,
             ),
             BUILD_TIP,
             RawBlobRetention::Transactions,
@@ -993,12 +1097,15 @@ mod tests {
             build_plan,
             RocksDbResourceBudget::for_local_tests(),
         )?;
-        let mut first =
-            complete_prefix_test_block(FIRST_RETAINED, PREDECESSOR.hash, ChainTipMetadata::empty());
+        let mut first = complete_prefix_test_block(
+            FIRST_RETAINED,
+            PREDECESSOR.hash,
+            first_retained_frontiers.tip_metadata(),
+        );
         first.tree_state_checkpoint = Some(CommitmentTreeCheckpoint::new(
             FIRST_RETAINED,
             FIRST_RETAINED.height.value(),
-            crate::canonical_store::test_checkpoint_frontiers(&activations, FIRST_RETAINED.height),
+            first_retained_frontiers,
         ));
         let tip_metadata = tip_frontiers.tip_metadata();
         let mut tip = complete_prefix_test_block(BUILD_TIP, FIRST_RETAINED.hash, tip_metadata);
