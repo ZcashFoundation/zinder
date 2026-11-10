@@ -1,8 +1,8 @@
 //! `ExplorerQuery.UtxoSetSummary` handler.
 //!
-//! Composes directly from `WalletQuery.TransparentUtxoSetSummary`. The wallet
-//! method runs the request-time scan over the canonical current-UTXO
-//! projection; the explorer handler only adds the standard freshness envelope.
+//! Composes directly from `WalletQuery.TransparentUtxoSetSummary` and forwards
+//! the wallet endpoint's refusal unchanged; the explorer handler only adds the
+//! standard freshness envelope.
 
 use tonic::{Request, Response, Status};
 use zinder_proto::capabilities::EXPLORER_UTXO_SET_SUMMARY_V1;

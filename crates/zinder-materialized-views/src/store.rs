@@ -1319,12 +1319,9 @@ impl MaterializedViewStore {
 
     /// Flushes the write-ahead log to disk so every prior write is durable.
     ///
-    /// The materialized-view store opens with `sync_writes: false`, so writes land in the
-    /// unsynced WAL. Before the canonical retention release floor vouches that
-    /// materialized-view rows up to a height are durable, the writer fsyncs the WAL so
-    /// a host crash cannot leave the floor (and the canonical deletes it
-    /// authorizes) ahead of the materialized-view rows they depend on. No-op on a
-    /// secondary, which owns no WAL of its own.
+    /// The materialized-view store opens with `sync_writes: false` by default,
+    /// so writes land in the unsynced WAL. No-op on a secondary, which owns no
+    /// WAL of its own.
     pub fn flush_wal_to_disk(&self) -> Result<(), MaterializedViewStoreError> {
         if self.is_secondary {
             return Ok(());

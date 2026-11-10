@@ -1,23 +1,17 @@
 //! `TransparentOutpointSpend` materialized-view consumer.
 //!
-//! Materializes durable spender identity keyed by spent outpoint. The canonical
-//! store retains transparent spend facts only inside the reorg window and its
-//! retention release floor; below that floor the settled-tip sweep deletes them.
-//! This consumer records the spender of every settled outpoint so
-//! `WalletQuery.TransparentSpendsByOutpoint` can resolve a spend long after the
-//! canonical fact is swept, which wallet offline-recovery depends on.
+//! Materializes durable spender identity keyed by spent outpoint. Canonical
+//! storage keeps block-local facts only and has no spend-keyed family, so this
+//! consumer is the reverse-spend index that resolves an outpoint to the
+//! transaction that spent it, however long ago.
 //!
-//! Authority split: spentness is decided by the canonical
-//! `TransparentUnspentOutputsByOutpoint` (durable, LtHash16-committed). This
-//! projection answers only *who* spent an outpoint, never *whether* it is
-//! spent. A missing row means "no spender recorded", never "unspent".
+//! Authority split: spentness is decided by the wallet projection's
+//! unspent-output rows (`LtHash16`-committed). This projection answers only
+//! *who* spent an outpoint, never *whether* it is spent. A missing row means
+//! "no spender recorded", never "unspent".
 //!
 //! The consumer derives spender identity from the child transaction's intrinsic
-//! input and mined location, not from the parent output or the short-lived
-//! canonical spend-fact row. This keeps checkpoint-crossing spends observable
-//! and supplies durable transaction facts for a fresh-store schema rebuild. The
-//! retention sweep still releases canonical spend facts only after this
-//! projection durably materializes the corresponding height.
+//! input and mined location, not from the parent output.
 
 use std::collections::HashMap;
 
@@ -57,7 +51,8 @@ pub const TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME: MaterializedViewConsumerName
 
 /// On-disk schema declaration for the transparent-outpoint-spend consumer.
 ///
-/// Moving this version is expensive: see the module-level schema-cost note.
+/// Moving this version requires a fresh materialized-view store replayed from
+/// genesis-complete canonical history.
 pub const TRANSPARENT_OUTPOINT_SPEND_SCHEMA: MaterializedViewConsumerSchema =
     MaterializedViewConsumerSchema::new(
         TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
@@ -172,7 +167,7 @@ impl BlockKeyedConsumer for TransparentOutpointSpendConsumer {
     ) -> Result<(), MaterializedViewConsumerError> {
         // Spender identity is intrinsic to the child transaction input and its
         // mined location. Parent-output hydration supplies value and script
-        // facts to other consumers, but must not gate this retention authority.
+        // facts to other consumers and is not an input to these rows.
         let rows = collect_spend_rows(block);
         let spend_cf = ctx
             .store

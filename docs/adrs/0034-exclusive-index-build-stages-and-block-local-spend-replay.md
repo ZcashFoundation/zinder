@@ -4,7 +4,7 @@
 | ----- | ----- |
 | Status | Accepted |
 | Product | Zinder |
-| Domain | Initial sync scheduling, materialized-view replay, canonical retention, RocksDB resource ownership |
+| Domain | Initial sync scheduling, materialized-view replay, RocksDB resource ownership |
 | Related | [ADR-0015](0015-phase-driven-ingest.md), [ADR-0017](0017-materialized-view-consumer-and-key-codec.md), [ADR-0020](0020-bounded-rocksdb-resource-budget.md), [ADR-0029](0029-durable-transparent-outpoint-spend-projection.md) |
 
 ## Context
@@ -13,9 +13,9 @@ Mainnet canary measurements showed that canonical bulk catchup completed quickly
 
 At the same time, historical backfills began as soon as canonical entered `FollowingTip`. They serialized their materialized-view writes through the same process lock and generated their own compaction work while readiness-critical replay was still millions of blocks behind. RocksDB reported substantial compaction amplification and write stalls despite low process memory pressure.
 
-The canonical settled-tip sweep also deleted the point rows used by replay after the durable spend projection advanced. That made a later materialized-view rebuild depend on source rows that canonical retention had already destroyed.
+A materialized-view rebuild must not depend on canonical rows that can disappear. Canonical storage keeps block-local facts only, each block's replay row and the transaction-location index, and deletes no best-chain block facts. It has no spend-keyed family, so replay must derive spend facts from those rows.
 
-Canary traces exposed two further canonical-path delays. A 500,000-outpoint transparent-retention chunk ran synchronously before every settled-tip commit and took minutes, repeatedly pushing canonical lag above the bulk threshold. Tip-follow then waited for a separate one-minute watcher to notice that threshold. Separately, the adaptive source controller was hard-capped at 16 blocks even while measured responses averaged far below its byte target; the fixed control's proven 64-block ceiling sustained higher throughput without splits.
+Canary traces also showed the adaptive source controller hard-capped at 16 blocks even while measured responses averaged far below its byte target; the fixed control's proven 64-block ceiling sustained higher throughput without splits.
 
 ## Decision
 
@@ -29,37 +29,34 @@ Startup observes and publishes the canonical phase before it admits synchronous 
 
 This is an internal scheduling contract, not public readiness state. `HistoricalWorkGate` combines the canonical phase with the materialized-view tailer's caught-up signal. Metrics expose the two inputs and the resulting gate state.
 
-The canonical block-local spend index records every non-coinbase transparent input observed in the block plus the complete ordered `TransparentSpendFact` values whose parent outputs canonical ingest could resolve. Keeping both sets makes checkpoint-parent misses explicit instead of making them indistinguishable from a truncated record. Per-outpoint rows remain the serving and reorg-repair projection and may still be removed by settled-tip retention; the block-local replay record is retained.
+Materialized-view replay derives transparent spend facts from block-local canonical rows. For each hydrated height range it reads the blocks' replay rows and resolves every non-coinbase input's previous output: first from outputs produced inside the range, then through the transaction-location index and the producing block's replay row, with reads grouped by producing height. An input whose previous output cannot be resolved is a replay error, not an unresolved fact. Building or recovering a materialized-view store requires canonical history that is complete from height 1, so every previous output is retained.
 
-Settled materialized-view replay reads one block-local record per block and verifies that the recorded input set and producing block identity exactly match the canonical transactions. Resolved facts must be a unique subset of those inputs; unresolved inputs are legitimate when their parents predate a configured checkpoint. Any other mismatch is corruption and stops replay. Unsettled reorg replay continues to use epoch-visible point rows; its sorted keys use RocksDB's batched multi-get path.
+Replay dispatch is serial and ordered: each page of a transition is hydrated, then applied together with its cursor advance in one atomic materialized-view write before the next page is read. The batch size follows the memory budget state, shrinking under memory pressure and pausing at the pause threshold.
 
-Replay keeps one fully prepared batch ahead of ordered dispatch. Preparation includes canonical hydration and context construction, so reads for batch N+1 overlap the atomic consumer write for batch N. Admission remains subject to the existing memory state and variable-projection-row bound, and cursor advancement remains serial.
-
-Canonical commits perform no transparent-retention work. A live append or replacement writes only its own block-local rows, epoch, event, and control record, so settled-tip commits stay independent of historical backlog. Following never returns to construction; after a burst it appends one block per commit and reports `syncing` while lag exceeds `ingest.follow.lag_threshold_blocks`.
+A canonical live append or replacement writes only its own block-local rows, epoch, event, and control record, so settled-tip commits stay independent of historical backlog. Following never returns to construction; after a burst it appends one block per commit and reports `syncing` while lag exceeds `ingest.follow.lag_threshold_blocks`.
 
 The default source-segment hard ceiling is 64 blocks, matching the measured fixed control. The response-byte target, p95 density estimate, network-upgrade reset, and split feedback remain the actual dense-era safeguards, so the controller may shrink below 64 but can now exploit lighter eras.
 
-Canonical and materialized-view secondary catchup retry a narrowly classified missing-`.sst` I/O race up to three total attempts while holding their catchup barrier. This covers a primary compaction replacing a file between manifest replay and the next secondary read or schema validation; schema mismatches, corruption, and other I/O failures still surface immediately.
+Materialized-view secondary catchup retries a narrowly classified missing-`.sst` I/O race up to three total attempts while holding its catchup barrier. This covers a primary compaction replacing a file between manifest replay and the next secondary read or schema validation; schema mismatches, corruption, and other I/O failures still surface immediately.
 
 The materialized-view writer defaults reserve a 512 MiB aggregate memtable budget, four 16 MiB buffers per hot column family, a 256 MiB WAL ceiling, and a 256 MiB block cache. The shared write-buffer manager remains the hard memory bound. Existing RocksDB ticker and property metrics measure compaction bytes, stalls, cache use, WAL size, and memtable use.
 
-This layout has no in-place migration. A mismatched store may lack facts needed to construct the block-local records, so primary open fails with `SchemaMismatch`. Deployment requires fresh canonical and materialized-view volumes rebuilt from genesis.
+Neither canonical nor materialized-view layouts migrate in place. A store whose persisted schema differs from the binary's fails admission, and a deployment that changes either schema rebuilds that store from genesis.
 
 ## Consequences
 
 - End-to-end readiness work no longer competes with optional historical backfills.
-- Canonical chain advancement no longer performs historical retention reads or million-row delete batches.
+- A canonical commit writes only the appended or replaced blocks' rows, so its cost does not grow with historical backlog.
 - Light eras can use the fixed control's proven 64-block request ceiling; dense eras remain byte-adaptive.
 - Transient materialized-view secondary compaction races recover inside one catchup operation without masking persistent failures.
-- Transparent-input density increases sequential block-local payload size, not random lookup count.
-- A materialized-view rebuild remains possible after canonical point-row retention.
-- Prepared replay is bounded to the current batch plus one admitted following batch, and writes remain ordered.
+- Transparent-input density increases replay point reads: one transaction-location read per distinct parent transaction produced before the hydrated range, and one replay-row read per distinct producing height. In transparent-dense history this is the random-read cost described in the context, so replay drain time there remains a known risk.
+- A materialized-view rebuild needs only genesis-complete canonical history, which canonical storage never deletes. A canonical store bootstrapped from a checkpoint cannot host materialized views.
+- Replay writes remain ordered, with one page in flight at a time.
 - The larger materialized-view write envelope trades bounded resident memory for fewer flushes and write stalls; operators validate it through existing memory and RocksDB metrics.
 - Incompatible volumes cannot be reused by this binary. Rollback to a different layout likewise requires the matching checkpoint or a separate volume.
 
 ## Rejected alternatives
 
 - Raising replay block count does not remove the per-outpoint random-read cost and violates the variable-row memory bound in dense history.
-- Increasing point-read concurrency further multiplies random I/O and leaves retained-data rebuilds impossible.
+- Increasing point-read concurrency further multiplies random I/O.
 - Starting backfills at `FollowingTip` treats canonical freshness as materialized-view readiness and repeats the measured compaction contention.
-- Lazily synthesizing version-2 block records from version-1 indexes is unsafe because retention may already have deleted some or all referenced facts.
