@@ -582,6 +582,28 @@ run with every `cargo nextest run --profile=ci` against the production
   `secondary_admission_reports_and_requires_the_persisted_raw_blob_retention`:
   secondary admission is exact for the network and raw-blob retention.
 
+### Serving-pair fixtures
+
+Query, compatibility, client, and explorer tests serve their chains from
+`zinder_testkit::WalletServingStoreFixture`. It publishes through the
+production canonical writer and wallet projection, then admits immutable
+secondaries, so every row a test reads passed writer validation.
+
+`zinder_testkit::CanonicalWriterFixture` drives the same writer for history a
+single baseline cannot express:
+
+- checkpointed history above a floor, with `CanonicalBaseline::with_history_floor`;
+- an unsettled suffix, with `CanonicalBaseline::with_settled_tip`, that
+  `replace_live_blocks` reorgs;
+- live appends, canonical event pruning, and completed subtree roots; and
+- serving pairs taken before and after a transition.
+
+Commitment trees follow each compact block's chain metadata. A live block must
+carry the note commitments that reach its declared tree sizes, because the
+store re-derives them. A cold baseline can declare trees too large to build in
+a test, such as a completed 2^16-leaf subtree, with
+`ChainFixture::with_commitment_tree_frontiers_at`.
+
 ### Process-crash coverage
 
 Process-crash tests run with every `cargo nextest run --profile=ci`. They kill
