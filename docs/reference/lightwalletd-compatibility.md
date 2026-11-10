@@ -93,8 +93,14 @@ missing inside retained history is store damage and returns `UNAVAILABLE`.
 
 Canonical history never retains height 0. A complete build takes the network's
 genesis block as its authenticated predecessor and retains blocks from height
-1, so no compact block exists at height 0, and a block or range read that
-requests it returns `NOT_FOUND`.
+1, so no compact block exists at height 0, and a `GetBlockRange` read that
+touches height 0 returns `NOT_FOUND`.
+
+Unary block lookups validate the selector before reading. Height 0 with a
+32-byte hash is a hash lookup. Height 0 with an empty hash is an unspecified
+identifier, so `GetBlock` returns `INVALID_ARGUMENT` for it in both serving
+modes, not `NOT_FOUND`. `GetBlockNullifiers` applies the same rule where it is
+served.
 
 ## Certification work
 
