@@ -171,7 +171,7 @@ pub use consumer::{
     apply_chain_reorged_in_memory,
 };
 pub use consumer_catalog::{
-    CanonicalRetentionAuthority, MaterializedViewConsumerDefinition, MaterializedViewConsumerRole,
+    MaterializedViewConsumerDefinition, MaterializedViewConsumerRole,
     MaterializedViewPresetMembership, MaterializedViewRecoverySource,
     bundled_materialized_view_consumer_definitions,
 };
