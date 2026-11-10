@@ -1,8 +1,62 @@
 //! Post-commit chain event payload values.
 
+use std::num::NonZeroU32;
+
 use zinder_core::{BlockHeight, BlockHeightRange, ChainEpoch};
 
-use crate::{CanonicalEventKind, CanonicalRetainedEvent, CanonicalStoreError, StreamCursorTokenV1};
+use crate::{
+    CanonicalEventKind, CanonicalRetainedEvent, CanonicalStoreError, ChainEventStreamFamily,
+    StreamCursorTokenV1,
+};
+
+/// Default maximum chain events returned by one history read.
+pub const DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
+
+/// Bounded chain-event history read request.
+#[derive(Clone, Copy, Debug)]
+pub struct ChainEventHistoryRequest<'cursor> {
+    /// Cursor to resume strictly after, or `None` to read from retained history start.
+    pub from_cursor: Option<&'cursor StreamCursorTokenV1>,
+    /// Chain-event stream family to read when `from_cursor` is absent.
+    ///
+    /// When `from_cursor` is present, the cursor's encoded family is
+    /// authoritative so reconnecting clients do not need to remember a
+    /// parallel option.
+    pub family: ChainEventStreamFamily,
+    /// Maximum number of events returned in this page.
+    pub max_events: NonZeroU32,
+}
+
+impl<'cursor> ChainEventHistoryRequest<'cursor> {
+    /// Creates a bounded chain-event history read request.
+    #[must_use]
+    pub const fn new(
+        from_cursor: Option<&'cursor StreamCursorTokenV1>,
+        max_events: NonZeroU32,
+    ) -> Self {
+        Self::new_for_family(from_cursor, ChainEventStreamFamily::Visible, max_events)
+    }
+
+    /// Creates a bounded chain-event history read request for `family`.
+    #[must_use]
+    pub const fn new_for_family(
+        from_cursor: Option<&'cursor StreamCursorTokenV1>,
+        family: ChainEventStreamFamily,
+        max_events: NonZeroU32,
+    ) -> Self {
+        Self {
+            from_cursor,
+            family,
+            max_events,
+        }
+    }
+
+    /// Creates a chain-event history read request with the default page size.
+    #[must_use]
+    pub const fn with_default_limit(from_cursor: Option<&'cursor StreamCursorTokenV1>) -> Self {
+        Self::new(from_cursor, DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS)
+    }
+}
 
 /// Result returned after a chain epoch commit becomes durable and visible.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -180,5 +234,20 @@ impl ChainEpochCommitted {
             chain_epoch,
             block_range,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_history_request_reads_visible_family_in_bounded_pages() {
+        let request = ChainEventHistoryRequest::with_default_limit(None);
+
+        assert!(request.from_cursor.is_none());
+        assert_eq!(request.family, ChainEventStreamFamily::Visible);
+        assert_eq!(request.max_events.get(), 1_000);
+        assert_eq!(DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS.get(), 1_000);
     }
 }

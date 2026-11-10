@@ -30,12 +30,12 @@ use std::{io, num::NonZeroU32, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::{
-    BlockHeight, BlockId, CanonicalBlockFactsDigestVersion, CanonicalBlockFactsSequenceDigest,
-    CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockReplayFormatVersion, ChainEpochId,
-    CommitmentTreeCheckpoint, CommitmentTreeFrontiers,
-    MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES, NetworkUpgradeActivations,
-    NetworkUpgradeActivationsFingerprint, NetworkUpgradeActivationsFingerprintVersion,
-    ShieldedProtocol,
+    ArtifactSchemaVersion, BlockHeight, BlockId, CanonicalBlockFactsDigestVersion,
+    CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestVersion,
+    CanonicalBlockReplayFormatVersion, ChainEpochId, CommitmentTreeCheckpoint,
+    CommitmentTreeFrontiers, MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES,
+    NetworkUpgradeActivations, NetworkUpgradeActivationsFingerprint,
+    NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol,
 };
 
 use crate::RawBlobRetention;
@@ -49,6 +49,7 @@ pub use builder::RocksDbCanonicalBuilder;
 pub use construction_manifest::{
     CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION, CanonicalConstructionManifestBinding,
 };
+pub use displaced_archive::{DisplacedBlockCursor, DisplacedBlockPage};
 pub use event_lifecycle::{
     CanonicalEventCursor, CanonicalEventHistoryRequest, CanonicalEventKind,
     CanonicalEventRetentionReport, CanonicalRetainedEvent, ProjectionBuildAnchor,
@@ -82,6 +83,14 @@ pub const CANONICAL_STORE_IDENTITY: &str = "canonical";
 /// Earlier stores are refused and rebuilt; there is no compatibility decoder
 /// or migration path.
 pub const CANONICAL_STORE_SCHEMA_VERSION: u16 = 7;
+/// Durable artifact schema version written by this binary.
+///
+/// The current artifact contract includes structured compact blocks and shared
+/// structured scan data for mined and mempool transactions, in addition to
+/// complete semantic replay envelopes and projection facts.
+/// Hash-shaped protobuf fields use RPC byte order as defined by
+/// [ADR-0024](../../../docs/adrs/0024-wire-format-rpc-byte-order.md).
+pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(20);
 /// Global block-height cadence for typed commitment-tree checkpoints.
 ///
 /// A checkpoint at least every 100 blocks keeps wallet rewind anchors within the
@@ -1013,6 +1022,11 @@ pub(crate) fn test_checkpoint_frontiers(
 mod tests {
     use super::*;
     use zinder_core::{BlockHash, CommitmentTreeFrontier, Network};
+
+    #[test]
+    fn reported_artifact_schema_version_is_stable() {
+        assert_eq!(CURRENT_ARTIFACT_SCHEMA_VERSION.value(), 20);
+    }
 
     #[test]
     fn complete_build_plan_preserves_genesis_anchor_and_tip()

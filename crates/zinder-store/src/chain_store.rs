@@ -16,14 +16,14 @@ use std::{
 
 use parking_lot::RwLock;
 use zinder_core::{
-    ArtifactSchemaVersion, BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash,
-    BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId, BlockTransactionIndexArtifact,
-    BlockValuePoolBalances, CanonicalHistoryBounds, ChainEpoch, ChainEpochId, CompactBlockArtifact,
-    DisplacedBlock, DisplacedBlockArchiveCoverage, Network, SubtreeRootArtifact,
-    TransactionBlobArtifact, TransactionFactsArtifact, TransactionId,
-    TransactionIntrinsicValueBalancesArtifact, TransactionLocation, TransparentAddressScriptHash,
-    TransparentOutPoint, TransparentOutputArtifact, TransparentSpendFact, TransparentUnspentOutput,
-    TreeStateArtifact, UnixTimestampMillis,
+    BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact, BlockHeight,
+    BlockHeightRange, BlockId, BlockTransactionIndexArtifact, BlockValuePoolBalances,
+    CanonicalHistoryBounds, ChainEpoch, ChainEpochId, CompactBlockArtifact, DisplacedBlock,
+    DisplacedBlockArchiveCoverage, Network, SubtreeRootArtifact, TransactionBlobArtifact,
+    TransactionFactsArtifact, TransactionId, TransactionIntrinsicValueBalancesArtifact,
+    TransactionLocation, TransparentAddressScriptHash, TransparentOutPoint,
+    TransparentOutputArtifact, TransparentSpendFact, TransparentUnspentOutput, TreeStateArtifact,
+    UnixTimestampMillis,
 };
 
 use crate::displaced_block::{
@@ -32,11 +32,12 @@ use crate::displaced_block::{
     read_displaced_blocks_for_event, read_newest_displaced_blocks,
 };
 use crate::{
-    ArtifactFamily, ChainEpochArtifacts, ChainEpochCommitOutcome, ChainEpochCommitted,
-    ChainEpochReader, ChainEvent, ChainEventEnvelope, ChainEventStreamResume, ChainRangeReverted,
-    EventStreamStartPosition, MempoolEvent, MempoolEventEnvelope, MempoolEventHistoryRequest,
-    MempoolEventPosition, MempoolEventRetentionConfig, MempoolEventRetentionReport,
-    RawBlobRetention, ReorgWindowChange, RocksDbResourceBudget, StoreError, StreamCursorTokenV1,
+    ArtifactFamily, CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainEpochCommitOutcome,
+    ChainEpochCommitted, ChainEpochReader, ChainEvent, ChainEventEnvelope,
+    ChainEventHistoryRequest, ChainEventStreamResume, ChainRangeReverted, EventStreamStartPosition,
+    MempoolEvent, MempoolEventEnvelope, MempoolEventHistoryRequest, MempoolEventPosition,
+    MempoolEventRetentionConfig, MempoolEventRetentionReport, RawBlobRetention, ReorgWindowChange,
+    RocksDbResourceBudget, StoreError, StreamCursorTokenV1,
     block_artifact::read_block_header_artifact,
     block_hash_index::block_hash_index_put,
     block_value_pool_balances::read_block_value_pool_balances,
@@ -161,14 +162,6 @@ impl ChainStoreOptions {
 /// mempool transparent indexes from that data. Stores written with any earlier
 /// schema are refused at open and must be rebuilt from the source chain.
 pub const CURRENT_STORE_SCHEMA_VERSION: u16 = 16;
-/// Durable artifact schema version written by this binary.
-///
-/// The current artifact contract includes structured compact blocks and shared
-/// structured scan data for mined and mempool transactions, in addition to
-/// complete semantic replay envelopes and projection facts.
-/// Hash-shaped protobuf fields use RPC byte order as defined by
-/// [ADR-0024](../../../docs/adrs/0024-wire-format-rpc-byte-order.md).
-pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(20);
 /// Oldest durable artifact schema version this binary can read.
 ///
 /// Version 20 is the only accepted schema and requires the structured compact
@@ -176,8 +169,6 @@ pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchem
 pub const MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION: u16 = 20;
 /// Highest durable artifact schema version this binary can read.
 pub const MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION: u16 = CURRENT_ARTIFACT_SCHEMA_VERSION.value();
-/// Default maximum chain events returned by one history read.
-pub const DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
 
 /// Maximum final-root artifacts accepted by one historical enrichment write.
 pub const MAX_FINAL_NOTE_COMMITMENT_ROOT_ENRICHMENT_BATCH: usize = 10_000;
@@ -262,52 +253,6 @@ pub struct AddressOutputIndexPage {
     /// Resume cursor when the page reached `max_entries`. `None` when the
     /// scan was fully drained.
     pub next_cursor: Option<StreamCursorTokenV1>,
-}
-
-/// Bounded chain-event history read request.
-#[derive(Clone, Copy, Debug)]
-pub struct ChainEventHistoryRequest<'cursor> {
-    /// Cursor to resume strictly after, or `None` to read from retained history start.
-    pub from_cursor: Option<&'cursor StreamCursorTokenV1>,
-    /// Chain-event stream family to read when `from_cursor` is absent.
-    ///
-    /// When `from_cursor` is present, the cursor's encoded family is
-    /// authoritative so reconnecting clients do not need to remember a
-    /// parallel option.
-    pub family: ChainEventStreamFamily,
-    /// Maximum number of events returned in this page.
-    pub max_events: NonZeroU32,
-}
-
-impl<'cursor> ChainEventHistoryRequest<'cursor> {
-    /// Creates a bounded chain-event history read request.
-    #[must_use]
-    pub const fn new(
-        from_cursor: Option<&'cursor StreamCursorTokenV1>,
-        max_events: NonZeroU32,
-    ) -> Self {
-        Self::new_for_family(from_cursor, ChainEventStreamFamily::Visible, max_events)
-    }
-
-    /// Creates a bounded chain-event history read request for `family`.
-    #[must_use]
-    pub const fn new_for_family(
-        from_cursor: Option<&'cursor StreamCursorTokenV1>,
-        family: ChainEventStreamFamily,
-        max_events: NonZeroU32,
-    ) -> Self {
-        Self {
-            from_cursor,
-            family,
-            max_events,
-        }
-    }
-
-    /// Creates a chain-event history read request with the default page size.
-    #[must_use]
-    pub const fn with_default_limit(from_cursor: Option<&'cursor StreamCursorTokenV1>) -> Self {
-        Self::new(from_cursor, DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS)
-    }
 }
 
 /// Outcome returned after a `RocksDB` secondary catchup attempt.

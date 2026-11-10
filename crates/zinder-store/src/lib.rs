@@ -43,10 +43,10 @@ pub use block_replay::{BlockReplayBatchRequest, BlockReplayStore, MAX_BLOCK_REPL
 pub use block_value_pool_balances::BlockValuePoolBalancesStore;
 pub use canonical_store::{
     CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION, CANONICAL_STORE_IDENTITY,
-    CANONICAL_STORE_SCHEMA_VERSION, CanonicalActivationSchedule, CanonicalAppendAnchor,
-    CanonicalBaselinePublication, CanonicalBlockLoadEvidence, CanonicalBuildBlock,
-    CanonicalBuildSubtreeRoot, CanonicalConstructionManifestBinding, CanonicalEventCursor,
-    CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalEventKind,
+    CANONICAL_STORE_SCHEMA_VERSION, CURRENT_ARTIFACT_SCHEMA_VERSION, CanonicalActivationSchedule,
+    CanonicalAppendAnchor, CanonicalBaselinePublication, CanonicalBlockLoadEvidence,
+    CanonicalBuildBlock, CanonicalBuildSubtreeRoot, CanonicalConstructionManifestBinding,
+    CanonicalEventCursor, CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalEventKind,
     CanonicalEventRetentionReport, CanonicalLiveAppend, CanonicalLiveReplacement,
     CanonicalMempoolSnapshotStart, CanonicalOwnerCheckpointAdmission,
     CanonicalOwnerCheckpointEvidence, CanonicalReorgPolicy, CanonicalReplacementBlock,
@@ -55,30 +55,29 @@ pub use canonical_store::{
     CanonicalStoreBuildPlan, CanonicalStoreBuildPlanError, CanonicalStoreBuildState,
     CanonicalStoreError, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
     CanonicalSubtreeRootLoadCoverage, CanonicalSubtreeRootLoadEvidence,
-    DEFAULT_REORG_WINDOW_BLOCKS, MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS,
-    PreparedCanonicalBaselinePublication, ProjectionBuildAnchor, ProjectionBuildLease,
-    ProjectionBuildLeaseId, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
-    RocksDbCanonicalStore, TREE_STATE_CHECKPOINT_STRIDE, ValidatedRocksDbCanonicalBuild,
+    DEFAULT_REORG_WINDOW_BLOCKS, DisplacedBlockCursor, DisplacedBlockPage,
+    MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS, PreparedCanonicalBaselinePublication,
+    ProjectionBuildAnchor, ProjectionBuildLease, ProjectionBuildLeaseId, RocksDbCanonicalBuilder,
+    RocksDbCanonicalSecondary, RocksDbCanonicalStore, TREE_STATE_CHECKPOINT_STRIDE,
+    ValidatedRocksDbCanonicalBuild,
 };
 pub use chain_epoch::{ChainEpochArtifacts, ReorgWindowChange};
 pub use chain_epoch_reader::ChainEpochReader;
 pub use chain_event::{
     ChainEpochCommitOutcome, ChainEpochCommitted, ChainEvent, ChainEventEnvelope,
-    ChainRangeReverted,
+    ChainEventHistoryRequest, ChainRangeReverted, DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS,
 };
 pub use chain_store::{
     AddressOutputIndexPage, AddressOutputIndexPageRequest, BlockValuePoolBalanceEnrichmentOutcome,
-    CURRENT_ARTIFACT_SCHEMA_VERSION, CURRENT_STORE_SCHEMA_VERSION, ChainEpochReadApi,
-    ChainEventHistoryRequest, ChainEventRetentionReport, ChainStoreOptions,
-    DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, FinalNoteCommitmentRootEnrichmentOutcome,
-    MAX_BLOCK_VALUE_POOL_BALANCE_ENRICHMENT_BATCH, MAX_FINAL_NOTE_COMMITMENT_ROOT_ENRICHMENT_BATCH,
-    MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
+    CURRENT_STORE_SCHEMA_VERSION, ChainEpochReadApi, ChainEventRetentionReport, ChainStoreOptions,
+    FinalNoteCommitmentRootEnrichmentOutcome, MAX_BLOCK_VALUE_POOL_BALANCE_ENRICHMENT_BATCH,
+    MAX_FINAL_NOTE_COMMITMENT_ROOT_ENRICHMENT_BATCH, MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
     MAX_TRANSACTION_INTRINSIC_VALUE_BALANCE_ENRICHMENT_BATCH,
     MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION, PrimaryChainStore, SecondaryCatchupOutcome,
     SecondaryChainStore, TransactionIntrinsicValueBalanceEnrichmentOutcome,
     TransparentRetentionSweepOutcome,
 };
-pub use displaced_block::{DisplacedBlockCursor, DisplacedBlockPage, DisplacedBlockStore};
+pub use displaced_block::DisplacedBlockStore;
 pub use event_stream::{
     ChainEventStreamResume, EventEnvelope, EventStreamStartPosition, run_event_stream,
 };

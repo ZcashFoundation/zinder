@@ -10,7 +10,7 @@ use zinder_core::{
 };
 
 use crate::{
-    ArtifactFamily, ReorgWindowChange, StoreError,
+    ArtifactFamily, DisplacedBlockCursor, DisplacedBlockPage, ReorgWindowChange, StoreError,
     block_artifact::{
         read_block_blob_artifact, read_block_header_artifact,
         read_block_transaction_index_artifacts_at_height,
@@ -58,67 +58,6 @@ pub trait DisplacedBlockStore {
     fn displaced_block_archive_coverage(
         &self,
     ) -> Result<Option<DisplacedBlockArchiveCoverage>, StoreError>;
-}
-
-/// Opaque stable position in newest-first displaced-block history.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DisplacedBlockCursor {
-    event_sequence: u64,
-    height: zinder_core::BlockHeight,
-    block_hash: BlockHash,
-}
-
-impl DisplacedBlockCursor {
-    /// Reconstructs a cursor from a native RPC position.
-    #[must_use]
-    pub const fn from_position(
-        event_sequence: u64,
-        height: zinder_core::BlockHeight,
-        block_hash: BlockHash,
-    ) -> Self {
-        Self {
-            event_sequence,
-            height,
-            block_hash,
-        }
-    }
-
-    /// Returns the displacement event sequence represented by this cursor.
-    #[must_use]
-    pub const fn event_sequence(self) -> u64 {
-        self.event_sequence
-    }
-
-    /// Returns the displaced block height represented by this cursor.
-    #[must_use]
-    pub const fn height(self) -> zinder_core::BlockHeight {
-        self.height
-    }
-
-    /// Returns the displaced block hash represented by this cursor.
-    #[must_use]
-    pub const fn block_hash(self) -> BlockHash {
-        self.block_hash
-    }
-
-    const fn from_block(block: &DisplacedBlock) -> Self {
-        Self::from_position(
-            block.displacement_event_sequence,
-            block.header.height,
-            block.block_hash,
-        )
-    }
-}
-
-/// Bounded newest-first displaced-block history page.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DisplacedBlockPage {
-    /// Archived blocks in descending `(event sequence, height)` order.
-    pub blocks: Vec<DisplacedBlock>,
-    /// Whether at least one older archive row remains.
-    pub has_more: bool,
-    /// Cursor for requesting rows strictly older than this page.
-    pub next_cursor: Option<DisplacedBlockCursor>,
 }
 
 pub(crate) fn build_displaced_block_archive_puts_for_change(
@@ -356,14 +295,14 @@ pub(crate) fn read_displaced_block_page(
 ) -> Result<DisplacedBlockPage, StoreError> {
     if let Some(cursor) = after {
         let cursor_key =
-            StoreKey::displaced_block_by_order(network, cursor.event_sequence, cursor.height);
+            StoreKey::displaced_block_by_order(network, cursor.event_sequence(), cursor.height());
         let linked = inner
             .get(StorageTable::DisplacedBlock, &cursor_key)?
             .map(|record_bytes| decode_displaced_block(&cursor_key, &record_bytes))
             .transpose()?;
         if linked
             .as_ref()
-            .is_none_or(|block| block.block_hash != cursor.block_hash)
+            .is_none_or(|block| block.block_hash != cursor.block_hash())
         {
             return Err(StoreError::DisplacedBlockCursorInvalid);
         }
@@ -384,7 +323,7 @@ pub(crate) fn read_displaced_block_page(
         Some(cursor) => inner.scan_prefix_reverse_before(
             StorageTable::DisplacedBlock,
             &prefix,
-            &StoreKey::displaced_block_by_order(network, cursor.event_sequence, cursor.height),
+            &StoreKey::displaced_block_by_order(network, cursor.event_sequence(), cursor.height()),
             &mut visit,
         )?,
         None => inner.scan_prefix_reverse(StorageTable::DisplacedBlock, &prefix, &mut visit)?,
@@ -392,7 +331,15 @@ pub(crate) fn read_displaced_block_page(
     let has_more = blocks.len() > max_blocks;
     blocks.truncate(max_blocks);
     let next_cursor = has_more
-        .then(|| blocks.last().map(DisplacedBlockCursor::from_block))
+        .then(|| {
+            blocks.last().map(|block| {
+                DisplacedBlockCursor::from_position(
+                    block.displacement_event_sequence,
+                    block.header.height,
+                    block.block_hash,
+                )
+            })
+        })
         .flatten();
     Ok(DisplacedBlockPage {
         blocks,

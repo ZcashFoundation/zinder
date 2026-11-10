@@ -11,8 +11,6 @@ use zinder_core::{
     decode_canonical_block_replay, encode_canonical_block_replay,
 };
 
-use crate::{DisplacedBlockCursor, DisplacedBlockPage};
-
 use super::{
     CanonicalStoreError,
     publication::column_family,
@@ -280,6 +278,59 @@ fn validate_displaced_write_block(
         ));
     }
     Ok(())
+}
+
+/// Opaque stable position in newest-first displaced-block history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DisplacedBlockCursor {
+    event_sequence: u64,
+    height: zinder_core::BlockHeight,
+    block_hash: BlockHash,
+}
+
+impl DisplacedBlockCursor {
+    /// Reconstructs a cursor from a native RPC position.
+    #[must_use]
+    pub const fn from_position(
+        event_sequence: u64,
+        height: zinder_core::BlockHeight,
+        block_hash: BlockHash,
+    ) -> Self {
+        Self {
+            event_sequence,
+            height,
+            block_hash,
+        }
+    }
+
+    /// Returns the displacement event sequence represented by this cursor.
+    #[must_use]
+    pub const fn event_sequence(self) -> u64 {
+        self.event_sequence
+    }
+
+    /// Returns the displaced block height represented by this cursor.
+    #[must_use]
+    pub const fn height(self) -> zinder_core::BlockHeight {
+        self.height
+    }
+
+    /// Returns the displaced block hash represented by this cursor.
+    #[must_use]
+    pub const fn block_hash(self) -> BlockHash {
+        self.block_hash
+    }
+}
+
+/// Bounded newest-first displaced-block history page.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisplacedBlockPage {
+    /// Archived blocks in descending `(event sequence, height)` order.
+    pub blocks: Vec<DisplacedBlock>,
+    /// Whether at least one older archive row remains.
+    pub has_more: bool,
+    /// Cursor for requesting rows strictly older than this page.
+    pub next_cursor: Option<DisplacedBlockCursor>,
 }
 
 impl RocksDbCanonicalStore {

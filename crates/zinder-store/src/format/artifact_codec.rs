@@ -5,30 +5,34 @@ use std::collections::HashSet;
 use bytes::Bytes;
 use prost::Message;
 use zinder_core::{
-    ArtifactSchemaVersion, AuthDigest, BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash,
-    BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId, BlockTransactionIndexArtifact,
-    BlockValuePoolBalances, ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact,
-    CompactChainMetadata, CompactSaplingOutput, CompactSaplingSpend, CompactShieldedAction,
-    CompactTransaction, CompactTransactionData, CompactTransparentInput, CompactTransparentOutput,
+    AuthDigest, BlockBlobArtifact, BlockFinalNoteCommitmentRoots, BlockHash, BlockHeaderArtifact,
+    BlockHeight, BlockHeightRange, BlockId, BlockTransactionIndexArtifact, BlockValuePoolBalances,
+    ChainEpoch, ChainEpochId, CompactBlockArtifact, CompactChainMetadata, CompactTransaction,
     ConsensusBranchId, DisplacedBlock, DisplacedBlockArchiveCoverage, DisplacedBlockCoinbaseOutput,
-    FinalNoteCommitmentRoot, LockTime, MempoolEntry, MempoolEvictionReason, Network, PrivacyShape,
-    RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
-    TransactionBlobArtifact, TransactionComponentCounts, TransactionFactsArtifact, TransactionId,
-    TransactionIntrinsicValueBalances, TransactionIntrinsicValueBalancesArtifact,
-    TransactionLocation, TransactionPublicFacts, TransactionVersion, TransparentAddressScriptHash,
-    TransparentInputFact, TransparentOutPoint, TransparentOutputArtifact, TransparentOutputFact,
-    TransparentSpendFact, TransparentUnspentOutput, TreeStateArtifact, UnixTimestampMillis,
-    UnsupportedSection, ValuePoolBalance, Wtxid,
+    FinalNoteCommitmentRoot, LockTime, PrivacyShape, ShieldedProtocol, SubtreeRootArtifact,
+    SubtreeRootHash, SubtreeRootIndex, TransactionBlobArtifact, TransactionComponentCounts,
+    TransactionFactsArtifact, TransactionId, TransactionIntrinsicValueBalances,
+    TransactionIntrinsicValueBalancesArtifact, TransactionLocation, TransactionPublicFacts,
+    TransactionVersion, TransparentAddressScriptHash, TransparentInputFact, TransparentOutPoint,
+    TransparentOutputArtifact, TransparentOutputFact, TransparentSpendFact,
+    TransparentUnspentOutput, TreeStateArtifact, UnixTimestampMillis, UnsupportedSection,
+    ValuePoolBalance, Wtxid,
 };
 
 use crate::{
     ArtifactFamily, ChainEpochCommitted, ChainEvent, ChainEventEnvelope, ChainRangeReverted,
-    MempoolEvent, MempoolEventEnvelope, MempoolEventPosition, StoreError, StreamCursorTokenV1,
+    StoreError, StreamCursorTokenV1,
 };
 
 use super::{
     ArtifactEnvelopeError, ArtifactEnvelopeHeaderV1, ChainEventCursorAnchor, ChainEventLocator,
     ChainEventStreamFamily, PayloadFormat, StoreKey,
+    mempool_event_codec::{
+        ChainEpochRecord, CompactTransactionDataRecord, chain_epoch_record,
+        compact_transaction_data_record, decode_block_hash, decode_chain_epoch_record,
+        decode_compact_fixed, decode_compact_transaction_data_record,
+        decode_transaction_id_for_family,
+    },
 };
 
 pub(crate) fn encode_chain_epoch(chain_epoch: &ChainEpoch) -> Vec<u8> {
@@ -120,374 +124,6 @@ pub(crate) fn decode_chain_event_envelope(
         BlockHeight::new(record.settled_tip_height),
         event,
     ))
-}
-
-pub(crate) fn encode_mempool_event_envelope(
-    event_envelope: &MempoolEventEnvelope,
-) -> Result<Vec<u8>, StoreError> {
-    Ok(MempoolEventEnvelopeRecord {
-        event_sequence: event_envelope.event_sequence,
-        source_observed_unix_millis: event_envelope.source_observed_unix_millis,
-        event: Some(mempool_event_record(&event_envelope.event)?),
-    }
-    .encode_to_vec())
-}
-
-pub(crate) fn decode_mempool_event_envelope(
-    key: &StoreKey,
-    record_bytes: &[u8],
-    network: Network,
-    cursor_auth_key: [u8; 32],
-) -> Result<MempoolEventEnvelope, StoreError> {
-    let record = MempoolEventEnvelopeRecord::decode(record_bytes).map_err(|_| {
-        StoreError::ArtifactCorrupt {
-            family: ArtifactFamily::MempoolEvent,
-            key: key.clone().into(),
-            reason: "mempool event envelope record is not valid protobuf",
-        }
-    })?;
-    let event_record = record.event.ok_or(StoreError::ArtifactCorrupt {
-        family: ArtifactFamily::MempoolEvent,
-        key: key.clone().into(),
-        reason: "mempool event envelope is missing event",
-    })?;
-    let event = decode_mempool_event_record(key, event_record)?;
-    let cursor = StreamCursorTokenV1::mempool_event(
-        network,
-        record.event_sequence,
-        event.transaction_id(),
-        cursor_auth_key,
-    )
-    .map_err(|_| StoreError::ArtifactCorrupt {
-        family: ArtifactFamily::MempoolEvent,
-        key: key.clone().into(),
-        reason: "mempool event cursor could not be reconstructed",
-    })?;
-
-    Ok(MempoolEventEnvelope {
-        cursor,
-        event_sequence: record.event_sequence,
-        source_observed_unix_millis: record.source_observed_unix_millis,
-        event,
-    })
-}
-
-pub(crate) fn decode_mempool_event_observed_at(
-    key: &StoreKey,
-    record_bytes: &[u8],
-) -> Result<UnixTimestampMillis, StoreError> {
-    let record = MempoolEventEnvelopeRecord::decode(record_bytes).map_err(|_| {
-        StoreError::ArtifactCorrupt {
-            family: ArtifactFamily::MempoolEvent,
-            key: key.clone().into(),
-            reason: "mempool event envelope record is not valid protobuf",
-        }
-    })?;
-    Ok(UnixTimestampMillis::new(record.source_observed_unix_millis))
-}
-
-/// Decodes only the `(event_sequence, transaction_id)` position of a
-/// persisted mempool event, skipping payload hydration.
-pub(crate) fn decode_mempool_event_position(
-    key: &StoreKey,
-    record_bytes: &[u8],
-) -> Result<MempoolEventPosition, StoreError> {
-    let record = MempoolEventEnvelopeRecord::decode(record_bytes).map_err(|_| {
-        StoreError::ArtifactCorrupt {
-            family: ArtifactFamily::MempoolEvent,
-            key: key.clone().into(),
-            reason: "mempool event envelope record is not valid protobuf",
-        }
-    })?;
-    let event_record = record.event.ok_or(StoreError::ArtifactCorrupt {
-        family: ArtifactFamily::MempoolEvent,
-        key: key.clone().into(),
-        reason: "mempool event envelope is missing event",
-    })?;
-    let kind = MempoolEventKind::from_kind(event_record.event_kind).ok_or(
-        StoreError::ArtifactCorrupt {
-            family: ArtifactFamily::MempoolEvent,
-            key: key.clone().into(),
-            reason: "mempool event kind is unknown",
-        },
-    )?;
-    let transaction_id_bytes = match kind {
-        MempoolEventKind::Added => event_record
-            .added
-            .as_ref()
-            .map(|entry| entry.transaction_id.as_slice()),
-        MempoolEventKind::Invalidated => event_record
-            .invalidated
-            .as_ref()
-            .map(|invalidated| invalidated.transaction_id.as_slice()),
-        MempoolEventKind::Mined => event_record
-            .mined
-            .as_ref()
-            .map(|mined| mined.transaction_id.as_slice()),
-    }
-    .ok_or(StoreError::ArtifactCorrupt {
-        family: ArtifactFamily::MempoolEvent,
-        key: key.clone().into(),
-        reason: "mempool event is missing its payload",
-    })?;
-
-    Ok(MempoolEventPosition {
-        event_sequence: record.event_sequence,
-        transaction_id: decode_transaction_id_for_family(
-            ArtifactFamily::MempoolEvent,
-            key,
-            transaction_id_bytes,
-        )?,
-    })
-}
-
-pub(crate) fn decode_mempool_event_kind(
-    key: &StoreKey,
-    record_bytes: &[u8],
-) -> Result<MempoolEventKind, StoreError> {
-    let record = MempoolEventEnvelopeRecord::decode(record_bytes).map_err(|_| {
-        StoreError::ArtifactCorrupt {
-            family: ArtifactFamily::MempoolEvent,
-            key: key.clone().into(),
-            reason: "mempool event envelope record is not valid protobuf",
-        }
-    })?;
-    let event_record = record.event.ok_or(StoreError::ArtifactCorrupt {
-        family: ArtifactFamily::MempoolEvent,
-        key: key.clone().into(),
-        reason: "mempool event envelope is missing event",
-    })?;
-    MempoolEventKind::from_kind(event_record.event_kind).ok_or(StoreError::ArtifactCorrupt {
-        family: ArtifactFamily::MempoolEvent,
-        key: key.clone().into(),
-        reason: "mempool event kind is unknown",
-    })
-}
-
-/// Coarse classification of a persisted mempool event used by retention.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MempoolEventKind {
-    Added,
-    Invalidated,
-    Mined,
-}
-
-impl MempoolEventKind {
-    const fn from_kind(kind: u32) -> Option<Self> {
-        match kind {
-            MEMPOOL_EVENT_KIND_ADDED => Some(Self::Added),
-            MEMPOOL_EVENT_KIND_INVALIDATED => Some(Self::Invalidated),
-            MEMPOOL_EVENT_KIND_MINED => Some(Self::Mined),
-            _ => None,
-        }
-    }
-}
-
-fn mempool_event_record(event: &MempoolEvent) -> Result<MempoolEventRecord, StoreError> {
-    Ok(match event {
-        MempoolEvent::Added { entry } => MempoolEventRecord {
-            event_kind: MEMPOOL_EVENT_KIND_ADDED,
-            added: Some(mempool_entry_record(entry)),
-            invalidated: None,
-            mined: None,
-        },
-        MempoolEvent::Invalidated {
-            transaction_id,
-            reason,
-        } => MempoolEventRecord {
-            event_kind: MEMPOOL_EVENT_KIND_INVALIDATED,
-            added: None,
-            invalidated: Some(MempoolInvalidatedRecord {
-                transaction_id: transaction_id.as_bytes().to_vec(),
-                reason_id: mempool_eviction_reason_id(*reason)?,
-            }),
-            mined: None,
-        },
-        MempoolEvent::Mined {
-            transaction_id,
-            mined_height,
-            block_hash,
-        } => MempoolEventRecord {
-            event_kind: MEMPOOL_EVENT_KIND_MINED,
-            added: None,
-            invalidated: None,
-            mined: Some(MempoolMinedRecord {
-                transaction_id: transaction_id.as_bytes().to_vec(),
-                mined_height: mined_height.value(),
-                block_hash: block_hash.as_bytes().to_vec(),
-            }),
-        },
-        // The Rust enum is `#[non_exhaustive]`; future variants force a
-        // build error in this match because the encoder is not behind
-        // `unreachable_patterns`.
-    })
-}
-
-fn decode_mempool_event_record(
-    key: &StoreKey,
-    record: MempoolEventRecord,
-) -> Result<MempoolEvent, StoreError> {
-    match MempoolEventKind::from_kind(record.event_kind).ok_or(StoreError::ArtifactCorrupt {
-        family: ArtifactFamily::MempoolEvent,
-        key: key.clone().into(),
-        reason: "mempool event kind is unknown",
-    })? {
-        MempoolEventKind::Added => {
-            let entry_record = record.added.ok_or(StoreError::ArtifactCorrupt {
-                family: ArtifactFamily::MempoolEvent,
-                key: key.clone().into(),
-                reason: "added mempool event is missing entry",
-            })?;
-            let entry = decode_mempool_entry_record(key, entry_record)?;
-            Ok(MempoolEvent::Added { entry })
-        }
-        MempoolEventKind::Invalidated => {
-            let invalidated = record.invalidated.ok_or(StoreError::ArtifactCorrupt {
-                family: ArtifactFamily::MempoolEvent,
-                key: key.clone().into(),
-                reason: "invalidated mempool event is missing payload",
-            })?;
-            Ok(MempoolEvent::Invalidated {
-                transaction_id: decode_transaction_id_for_family(
-                    ArtifactFamily::MempoolEvent,
-                    key,
-                    &invalidated.transaction_id,
-                )?,
-                reason: mempool_eviction_reason_from_id(invalidated.reason_id).ok_or(
-                    StoreError::ArtifactCorrupt {
-                        family: ArtifactFamily::MempoolEvent,
-                        key: key.clone().into(),
-                        reason: "mempool eviction reason id is unknown",
-                    },
-                )?,
-            })
-        }
-        MempoolEventKind::Mined => {
-            let mined = record.mined.ok_or(StoreError::ArtifactCorrupt {
-                family: ArtifactFamily::MempoolEvent,
-                key: key.clone().into(),
-                reason: "mined mempool event is missing payload",
-            })?;
-            Ok(MempoolEvent::Mined {
-                transaction_id: decode_transaction_id_for_family(
-                    ArtifactFamily::MempoolEvent,
-                    key,
-                    &mined.transaction_id,
-                )?,
-                mined_height: BlockHeight::new(mined.mined_height),
-                block_hash: decode_block_hash(
-                    ArtifactFamily::MempoolEvent,
-                    key,
-                    &mined.block_hash,
-                )?,
-            })
-        }
-    }
-}
-
-fn mempool_entry_record(entry: &MempoolEntry) -> MempoolEntryRecord {
-    MempoolEntryRecord {
-        transaction_id: entry.transaction_id().as_bytes().to_vec(),
-        auth_digest: entry
-            .auth_digest()
-            .map_or_else(Vec::new, |digest| digest.as_bytes().to_vec()),
-        raw_transaction_bytes: entry.raw_transaction_bytes().as_slice().to_vec(),
-        compact_transaction_data: Some(compact_transaction_data_record(
-            entry.compact_transaction_data(),
-        )),
-        first_seen_unix_millis: entry.first_seen_unix_millis().value(),
-        first_seen_chain_epoch: Some(chain_epoch_record(&entry.first_seen_chain_epoch())),
-    }
-}
-
-fn decode_mempool_entry_record(
-    key: &StoreKey,
-    record: MempoolEntryRecord,
-) -> Result<MempoolEntry, StoreError> {
-    let chain_epoch_record = record
-        .first_seen_chain_epoch
-        .ok_or(StoreError::ArtifactCorrupt {
-            family: ArtifactFamily::MempoolEvent,
-            key: key.clone().into(),
-            reason: "mempool entry record is missing first-seen chain epoch",
-        })?;
-    let auth_digest = if record.auth_digest.is_empty() {
-        None
-    } else {
-        let auth_digest_bytes =
-            <[u8; 32]>::try_from(record.auth_digest.as_slice()).map_err(|_| {
-                StoreError::ArtifactCorrupt {
-                    family: ArtifactFamily::MempoolEvent,
-                    key: key.clone().into(),
-                    reason: "auth digest must be 32 bytes",
-                }
-            })?;
-        Some(AuthDigest::from_bytes(auth_digest_bytes))
-    };
-
-    let transaction_id = decode_transaction_id_for_family(
-        ArtifactFamily::MempoolEvent,
-        key,
-        &record.transaction_id,
-    )?;
-    let compact_transaction_data = decode_compact_transaction_data_record(
-        ArtifactFamily::MempoolEvent,
-        key,
-        record
-            .compact_transaction_data
-            .ok_or(StoreError::ArtifactCorrupt {
-                family: ArtifactFamily::MempoolEvent,
-                key: key.clone().into(),
-                reason: "mempool entry record is missing compact transaction data",
-            })?,
-    )?;
-    MempoolEntry::new(
-        transaction_id,
-        auth_digest,
-        RawTransactionBytes::new(record.raw_transaction_bytes),
-        compact_transaction_data,
-        zinder_core::MempoolObservation {
-            first_seen_unix_millis: UnixTimestampMillis::new(record.first_seen_unix_millis),
-            first_seen_chain_epoch: decode_chain_epoch_record(
-                ArtifactFamily::MempoolEvent,
-                key,
-                &chain_epoch_record,
-            )?,
-        },
-    )
-    .map_err(|_| StoreError::ArtifactCorrupt {
-        family: ArtifactFamily::MempoolEvent,
-        key: key.clone().into(),
-        reason: "mempool entry transparent output count exceeds u32::MAX",
-    })
-}
-
-#[allow(
-    unreachable_patterns,
-    reason = "MempoolEvictionReason is non-exhaustive; persistence must reject future variants until the durable contract assigns them an id."
-)]
-fn mempool_eviction_reason_id(reason: MempoolEvictionReason) -> Result<u32, StoreError> {
-    match reason {
-        MempoolEvictionReason::Conflict => Ok(1),
-        MempoolEvictionReason::Expired => Ok(2),
-        MempoolEvictionReason::LowFee => Ok(3),
-        MempoolEvictionReason::NodeRejected => Ok(4),
-        MempoolEvictionReason::Unknown => Ok(5),
-        _ => Err(StoreError::InvalidChainEpochArtifacts {
-            reason: "mempool eviction reason is unsupported by the durable event contract",
-        }),
-    }
-}
-
-const fn mempool_eviction_reason_from_id(reason_id: u32) -> Option<MempoolEvictionReason> {
-    match reason_id {
-        1 => Some(MempoolEvictionReason::Conflict),
-        2 => Some(MempoolEvictionReason::Expired),
-        3 => Some(MempoolEvictionReason::LowFee),
-        4 => Some(MempoolEvictionReason::NodeRejected),
-        5 => Some(MempoolEvictionReason::Unknown),
-        _ => None,
-    }
 }
 
 pub(crate) fn encode_block_header_artifact(
@@ -789,65 +425,6 @@ fn compact_transaction_record(transaction: &CompactTransaction) -> CompactTransa
     }
 }
 
-fn compact_transaction_data_record(
-    scan_data: &CompactTransactionData,
-) -> CompactTransactionDataRecord {
-    CompactTransactionDataRecord {
-        fee_zat: scan_data.fee_zat,
-        sapling_spends: scan_data
-            .sapling_spends
-            .iter()
-            .map(|spend| CompactSaplingSpendRecord {
-                nullifier: spend.nullifier.to_vec(),
-            })
-            .collect(),
-        sapling_outputs: scan_data
-            .sapling_outputs
-            .iter()
-            .map(|output| CompactSaplingOutputRecord {
-                commitment: output.commitment.to_vec(),
-                ephemeral_key: output.ephemeral_key.to_vec(),
-                ciphertext: output.ciphertext.to_vec(),
-            })
-            .collect(),
-        orchard_actions: scan_data
-            .orchard_actions
-            .iter()
-            .map(compact_shielded_action_record)
-            .collect(),
-        ironwood_actions: scan_data
-            .ironwood_actions
-            .iter()
-            .map(compact_shielded_action_record)
-            .collect(),
-        transparent_inputs: scan_data
-            .transparent_inputs
-            .iter()
-            .map(|input| CompactTransparentInputRecord {
-                previous_transaction_id: input.previous_transaction_id.as_bytes().to_vec(),
-                previous_output_index: input.previous_output_index,
-            })
-            .collect(),
-        transparent_outputs: scan_data
-            .transparent_outputs
-            .iter()
-            .map(|output| CompactTransparentOutputRecord {
-                value_zat: output.value_zat,
-                script_pub_key: output.script_pub_key.clone(),
-            })
-            .collect(),
-    }
-}
-
-fn compact_shielded_action_record(action: &CompactShieldedAction) -> CompactShieldedActionRecord {
-    CompactShieldedActionRecord {
-        nullifier: action.nullifier.to_vec(),
-        commitment: action.commitment.to_vec(),
-        ephemeral_key: action.ephemeral_key.to_vec(),
-        ciphertext: action.ciphertext.to_vec(),
-    }
-}
-
 fn decode_compact_transaction_record(
     key: &StoreKey,
     record: CompactTransactionRecord,
@@ -869,132 +446,6 @@ fn decode_compact_transaction_record(
                 reason: "compact transaction record is missing scan data",
             })?,
         )?,
-    })
-}
-
-fn decode_compact_transaction_data_record(
-    family: ArtifactFamily,
-    key: &StoreKey,
-    record: CompactTransactionDataRecord,
-) -> Result<CompactTransactionData, StoreError> {
-    Ok(CompactTransactionData {
-        fee_zat: record.fee_zat,
-        sapling_spends: record
-            .sapling_spends
-            .into_iter()
-            .map(|spend| {
-                Ok(CompactSaplingSpend {
-                    nullifier: decode_compact_fixed(
-                        family,
-                        key,
-                        spend.nullifier,
-                        "compact Sapling nullifier must be 32 bytes",
-                    )?,
-                })
-            })
-            .collect::<Result<Vec<_>, StoreError>>()?,
-        sapling_outputs: record
-            .sapling_outputs
-            .into_iter()
-            .map(|output| {
-                Ok(CompactSaplingOutput {
-                    commitment: decode_compact_fixed(
-                        family,
-                        key,
-                        output.commitment,
-                        "compact Sapling commitment must be 32 bytes",
-                    )?,
-                    ephemeral_key: decode_compact_fixed(
-                        family,
-                        key,
-                        output.ephemeral_key,
-                        "compact Sapling ephemeral key must be 32 bytes",
-                    )?,
-                    ciphertext: decode_compact_fixed(
-                        family,
-                        key,
-                        output.ciphertext,
-                        "compact Sapling ciphertext must be 52 bytes",
-                    )?,
-                })
-            })
-            .collect::<Result<Vec<_>, StoreError>>()?,
-        orchard_actions: decode_compact_actions(family, key, record.orchard_actions)?,
-        ironwood_actions: decode_compact_actions(family, key, record.ironwood_actions)?,
-        transparent_inputs: record
-            .transparent_inputs
-            .into_iter()
-            .map(|input| {
-                Ok(CompactTransparentInput {
-                    previous_transaction_id: TransactionId::from_bytes(decode_compact_fixed(
-                        family,
-                        key,
-                        input.previous_transaction_id,
-                        "compact transparent previous transaction id must be 32 bytes",
-                    )?),
-                    previous_output_index: input.previous_output_index,
-                })
-            })
-            .collect::<Result<Vec<_>, StoreError>>()?,
-        transparent_outputs: record
-            .transparent_outputs
-            .into_iter()
-            .map(|output| CompactTransparentOutput {
-                value_zat: output.value_zat,
-                script_pub_key: output.script_pub_key,
-            })
-            .collect(),
-    })
-}
-
-fn decode_compact_actions(
-    family: ArtifactFamily,
-    key: &StoreKey,
-    records: Vec<CompactShieldedActionRecord>,
-) -> Result<Vec<CompactShieldedAction>, StoreError> {
-    records
-        .into_iter()
-        .map(|action| {
-            Ok(CompactShieldedAction {
-                nullifier: decode_compact_fixed(
-                    family,
-                    key,
-                    action.nullifier,
-                    "compact action nullifier must be 32 bytes",
-                )?,
-                commitment: decode_compact_fixed(
-                    family,
-                    key,
-                    action.commitment,
-                    "compact action commitment must be 32 bytes",
-                )?,
-                ephemeral_key: decode_compact_fixed(
-                    family,
-                    key,
-                    action.ephemeral_key,
-                    "compact action ephemeral key must be 32 bytes",
-                )?,
-                ciphertext: decode_compact_fixed(
-                    family,
-                    key,
-                    action.ciphertext,
-                    "compact action ciphertext must be 52 bytes",
-                )?,
-            })
-        })
-        .collect()
-}
-
-fn decode_compact_fixed<const N: usize>(
-    family: ArtifactFamily,
-    key: &StoreKey,
-    bytes: Vec<u8>,
-    reason: &'static str,
-) -> Result<[u8; N], StoreError> {
-    bytes.try_into().map_err(|_| StoreError::ArtifactCorrupt {
-        family,
-        key: key.clone().into(),
-        reason,
     })
 }
 
@@ -2313,58 +1764,6 @@ fn decode_optional_wtxid(key: &StoreKey, wtxid_bytes: &[u8]) -> Result<Option<Wt
     Ok(Some(Wtxid::from_bytes(bytes)))
 }
 
-fn chain_epoch_record(chain_epoch: &ChainEpoch) -> ChainEpochRecord {
-    ChainEpochRecord {
-        chain_epoch: chain_epoch.id.value(),
-        network_id: chain_epoch.network.id(),
-        tip_height: chain_epoch.visible_tip_height.value(),
-        tip_hash: chain_epoch.visible_tip_hash.as_bytes().to_vec(),
-        settled_tip_height: chain_epoch.settled_tip_height.value(),
-        settled_tip_hash: chain_epoch.settled_tip_hash.as_bytes().to_vec(),
-        artifact_schema_version: u32::from(chain_epoch.artifact_schema_version.value()),
-        sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,
-        orchard_commitment_tree_size: chain_epoch.tip_metadata.orchard_commitment_tree_size,
-        ironwood_commitment_tree_size: chain_epoch.tip_metadata.ironwood_commitment_tree_size,
-        created_at_millis: chain_epoch.created_at.value(),
-    }
-}
-
-fn decode_chain_epoch_record(
-    family: ArtifactFamily,
-    key: &StoreKey,
-    record: &ChainEpochRecord,
-) -> Result<ChainEpoch, StoreError> {
-    let network = Network::from_id(record.network_id).ok_or(StoreError::ArtifactCorrupt {
-        family,
-        key: key.clone().into(),
-        reason: "chain epoch record has an unknown network id",
-    })?;
-
-    Ok(ChainEpoch {
-        id: ChainEpochId::new(record.chain_epoch),
-        network,
-        visible_tip_height: BlockHeight::new(record.tip_height),
-        visible_tip_hash: decode_block_hash(family, key, &record.tip_hash)?,
-        settled_tip_height: BlockHeight::new(record.settled_tip_height),
-        settled_tip_hash: decode_block_hash(family, key, &record.settled_tip_hash)?,
-        artifact_schema_version: ArtifactSchemaVersion::new(
-            u16::try_from(record.artifact_schema_version).map_err(|_| {
-                StoreError::ArtifactCorrupt {
-                    family,
-                    key: key.clone().into(),
-                    reason: "artifact schema version does not fit u16",
-                }
-            })?,
-        ),
-        tip_metadata: ChainTipMetadata::new(
-            record.sapling_commitment_tree_size,
-            record.orchard_commitment_tree_size,
-            record.ironwood_commitment_tree_size,
-        ),
-        created_at: UnixTimestampMillis::new(record.created_at_millis),
-    })
-}
-
 fn chain_event_record(event: &ChainEvent) -> ChainEventRecord {
     match event {
         ChainEvent::ChainCommitted { committed } => ChainEventRecord {
@@ -2587,20 +1986,6 @@ fn decode_artifact_payload<'a>(
     )
 }
 
-fn decode_block_hash(
-    family: ArtifactFamily,
-    key: &StoreKey,
-    hash_bytes: &[u8],
-) -> Result<BlockHash, StoreError> {
-    let hash_bytes = <[u8; 32]>::try_from(hash_bytes).map_err(|_| StoreError::ArtifactCorrupt {
-        family,
-        key: key.clone().into(),
-        reason: "block hash must be 32 bytes",
-    })?;
-
-    Ok(BlockHash::from_bytes(hash_bytes))
-}
-
 fn decode_fixed_32(
     family: ArtifactFamily,
     key: &StoreKey,
@@ -2612,21 +1997,6 @@ fn decode_fixed_32(
         key: key.clone().into(),
         reason: field_name,
     })
-}
-
-fn decode_transaction_id_for_family(
-    family: ArtifactFamily,
-    key: &StoreKey,
-    transaction_id_bytes: &[u8],
-) -> Result<TransactionId, StoreError> {
-    let transaction_id_bytes =
-        <[u8; 32]>::try_from(transaction_id_bytes).map_err(|_| StoreError::ArtifactCorrupt {
-            family,
-            key: key.clone().into(),
-            reason: "transaction id must be 32 bytes",
-        })?;
-
-    Ok(TransactionId::from_bytes(transaction_id_bytes))
 }
 
 fn decode_transparent_address_script_hash(
@@ -2672,32 +2042,6 @@ fn decode_optional_final_note_commitment_root(
             .map(FinalNoteCommitmentRoot::from_bytes)
         })
         .transpose()
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct ChainEpochRecord {
-    #[prost(uint64, tag = "1")]
-    chain_epoch: u64,
-    #[prost(uint32, tag = "2")]
-    network_id: u32,
-    #[prost(uint32, tag = "3")]
-    tip_height: u32,
-    #[prost(bytes, tag = "4")]
-    tip_hash: Vec<u8>,
-    #[prost(uint32, tag = "5")]
-    settled_tip_height: u32,
-    #[prost(bytes, tag = "6")]
-    settled_tip_hash: Vec<u8>,
-    #[prost(uint32, tag = "7")]
-    artifact_schema_version: u32,
-    #[prost(uint64, tag = "8")]
-    created_at_millis: u64,
-    #[prost(uint32, tag = "9")]
-    sapling_commitment_tree_size: u32,
-    #[prost(uint32, tag = "10")]
-    orchard_commitment_tree_size: u32,
-    #[prost(uint32, tag = "11")]
-    ironwood_commitment_tree_size: u32,
 }
 
 const CHAIN_EVENT_KIND_COMMITTED: u32 = 1;
@@ -2823,68 +2167,6 @@ struct CompactTransactionRecord {
     transaction_id: Vec<u8>,
     #[prost(message, optional, tag = "3")]
     data: Option<CompactTransactionDataRecord>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct CompactTransactionDataRecord {
-    #[prost(uint64, optional, tag = "1")]
-    fee_zat: Option<u64>,
-    #[prost(message, repeated, tag = "2")]
-    sapling_spends: Vec<CompactSaplingSpendRecord>,
-    #[prost(message, repeated, tag = "3")]
-    sapling_outputs: Vec<CompactSaplingOutputRecord>,
-    #[prost(message, repeated, tag = "4")]
-    orchard_actions: Vec<CompactShieldedActionRecord>,
-    #[prost(message, repeated, tag = "5")]
-    ironwood_actions: Vec<CompactShieldedActionRecord>,
-    #[prost(message, repeated, tag = "6")]
-    transparent_inputs: Vec<CompactTransparentInputRecord>,
-    #[prost(message, repeated, tag = "7")]
-    transparent_outputs: Vec<CompactTransparentOutputRecord>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct CompactSaplingSpendRecord {
-    #[prost(bytes, tag = "1")]
-    nullifier: Vec<u8>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct CompactSaplingOutputRecord {
-    #[prost(bytes, tag = "1")]
-    commitment: Vec<u8>,
-    #[prost(bytes, tag = "2")]
-    ephemeral_key: Vec<u8>,
-    #[prost(bytes, tag = "3")]
-    ciphertext: Vec<u8>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct CompactShieldedActionRecord {
-    #[prost(bytes, tag = "1")]
-    nullifier: Vec<u8>,
-    #[prost(bytes, tag = "2")]
-    commitment: Vec<u8>,
-    #[prost(bytes, tag = "3")]
-    ephemeral_key: Vec<u8>,
-    #[prost(bytes, tag = "4")]
-    ciphertext: Vec<u8>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct CompactTransparentInputRecord {
-    #[prost(bytes, tag = "1")]
-    previous_transaction_id: Vec<u8>,
-    #[prost(uint32, tag = "2")]
-    previous_output_index: u32,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct CompactTransparentOutputRecord {
-    #[prost(uint64, tag = "1")]
-    value_zat: u64,
-    #[prost(bytes, tag = "2")]
-    script_pub_key: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -3275,68 +2557,10 @@ struct TransparentOutPointRecord {
     output_index: u32,
 }
 
-const MEMPOOL_EVENT_KIND_ADDED: u32 = 1;
-const MEMPOOL_EVENT_KIND_INVALIDATED: u32 = 2;
-const MEMPOOL_EVENT_KIND_MINED: u32 = 3;
-
-#[derive(Clone, PartialEq, Message)]
-struct MempoolEventEnvelopeRecord {
-    #[prost(uint64, tag = "1")]
-    event_sequence: u64,
-    #[prost(uint64, tag = "2")]
-    source_observed_unix_millis: u64,
-    #[prost(message, optional, tag = "3")]
-    event: Option<MempoolEventRecord>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct MempoolEventRecord {
-    #[prost(uint32, tag = "1")]
-    event_kind: u32,
-    #[prost(message, optional, tag = "2")]
-    added: Option<MempoolEntryRecord>,
-    #[prost(message, optional, tag = "3")]
-    invalidated: Option<MempoolInvalidatedRecord>,
-    #[prost(message, optional, tag = "4")]
-    mined: Option<MempoolMinedRecord>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct MempoolEntryRecord {
-    #[prost(bytes, tag = "1")]
-    transaction_id: Vec<u8>,
-    #[prost(bytes, tag = "2")]
-    auth_digest: Vec<u8>,
-    #[prost(bytes, tag = "3")]
-    raw_transaction_bytes: Vec<u8>,
-    #[prost(message, optional, tag = "4")]
-    compact_transaction_data: Option<CompactTransactionDataRecord>,
-    #[prost(uint64, tag = "5")]
-    first_seen_unix_millis: u64,
-    #[prost(message, optional, tag = "6")]
-    first_seen_chain_epoch: Option<ChainEpochRecord>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct MempoolInvalidatedRecord {
-    #[prost(bytes, tag = "1")]
-    transaction_id: Vec<u8>,
-    #[prost(uint32, tag = "2")]
-    reason_id: u32,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct MempoolMinedRecord {
-    #[prost(bytes, tag = "1")]
-    transaction_id: Vec<u8>,
-    #[prost(uint32, tag = "2")]
-    mined_height: u32,
-    #[prost(bytes, tag = "3")]
-    block_hash: Vec<u8>,
-}
-
 #[cfg(test)]
 mod tests {
+    use zinder_core::Network;
+
     use super::*;
 
     #[test]
