@@ -28,13 +28,13 @@ use zinder_ingest::{
 };
 use zinder_materialized_views::{MaterializedViewPreset, MaterializedViewStore};
 use zinder_runtime::{
-    ComposedReadiness, OpsEndpointHandle, OpsServerError, Readiness, ReadinessState,
-    RuntimeService, StartupPhase, cancel_on_terminating_signal, host_cpu_meets_compiled_baseline,
-    install_tracing_subscriber, spawn_ops_endpoint_for,
+    ComposedReadiness, OpsEndpointHandle, OpsServerError, Readiness, ReadinessInput,
+    ReadinessState, RuntimeService, StartupPhase, cancel_on_terminating_signal,
+    host_cpu_meets_compiled_baseline, install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 use zinder_source::{
     JsonRpcMempoolSource, JsonRpcMempoolSourceOptions, MempoolSource, NodeCapabilities,
-    NodeCapability, NodeSource, NodeTarget, ZebraIndexerMempoolSource,
+    NodeCapability, NodeHealthConfig, NodeSource, NodeTarget, ZebraIndexerMempoolSource,
     ZebraIndexerMempoolSourceOptions, ZebraIndexerSourceTarget, ZebraJsonRpcSource,
     ZebraJsonRpcSourceOptions,
 };
@@ -249,7 +249,12 @@ async fn run_ingest(
     let mut command_config = config::load_ingest_config(config_path, overrides)?;
     load_config_phase.complete();
     let readiness = Readiness::default();
-    let writer_readiness = ComposedReadiness::new(readiness.clone(), &[]);
+    let termination = CancellationToken::new();
+    let writer_readiness = writer_readiness_for(
+        readiness.clone(),
+        command_config.runtime_config.node.health.as_ref(),
+        &termination,
+    );
     let start_api_phase = StartupPhase::StartApi.start();
     let ops_handle = spawn_ops_endpoint_for(
         RuntimeService::Ingest,
@@ -280,12 +285,7 @@ async fn run_ingest(
     let recover_state_phase = StartupPhase::RecoverState.start();
     resolve_wallet_serving_modifiers(&mut command_config);
     recover_state_phase.complete();
-    let termination = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(termination.clone());
-    tokio::spawn(drain_readiness_on_termination(
-        termination.clone(),
-        writer_readiness.clone(),
-    ));
     let worker_cancel = termination.child_token();
     // The control listener outlives the worker drain so a parked writer can
     // still report its typed halt to readers until termination.
@@ -335,7 +335,7 @@ async fn run_ingest(
     let mut canonical_control_tasks = spawn_canonical_control_tasks(
         &command_config,
         &source,
-        &readiness,
+        &writer_readiness,
         ControlTaskCancellation {
             workers: &worker_cancel,
             server: &control_server_cancel,
@@ -397,7 +397,7 @@ struct CanonicalControlTasks {
 fn spawn_canonical_control_tasks(
     command_config: &IngestCommandConfig,
     source: &ZebraJsonRpcSource,
-    readiness: &Readiness,
+    writer_readiness: &ComposedReadiness,
     cancellation: ControlTaskCancellation<'_>,
     writer_config: &mut CanonicalWriterConfig,
 ) -> CanonicalControlTasks {
@@ -454,7 +454,7 @@ fn spawn_canonical_control_tasks(
             canonical_control_handle,
             mempool_owner,
             node_source,
-            readiness.clone(),
+            writer_readiness.clone(),
         )
         .with_bearer_token(command_config.ingest_control_bearer_token.clone());
         let server_cancel = cancellation.server.clone();
@@ -608,6 +608,29 @@ where
             }
         }
     }
+}
+
+/// Composes the writer's readiness and drains it to `shutting_down` as soon as
+/// `termination` is requested.
+///
+/// A configured `[node.health]` probe gates readiness from startup, so ingest
+/// stays `starting` until the probe's first successful observation.
+fn writer_readiness_for(
+    readiness: Readiness,
+    upstream_health: Option<&NodeHealthConfig>,
+    termination: &CancellationToken,
+) -> ComposedReadiness {
+    let required_inputs: &[ReadinessInput] = if upstream_health.is_some() {
+        &[ReadinessInput::NodeSource]
+    } else {
+        &[]
+    };
+    let writer_readiness = ComposedReadiness::new(readiness, required_inputs);
+    tokio::spawn(drain_readiness_on_termination(
+        termination.clone(),
+        writer_readiness.clone(),
+    ));
+    writer_readiness
 }
 
 /// Lowers readiness to `shutting_down` as soon as termination is requested,
@@ -1288,6 +1311,7 @@ mod tests {
             Arc,
             atomic::{AtomicBool, Ordering},
         },
+        time::Duration,
     };
 
     use tempfile::tempdir;
@@ -1296,9 +1320,10 @@ mod tests {
 
     use super::{
         CanonicalControlTasks, MaterializedViewPlaneSpec, NodeCapabilities, NodeCapability,
-        ZebraJsonRpcSource, coordinate_canonical_writer_lifecycle, drain_readiness_on_termination,
-        explorer_view_preset, explorer_views_start_backfills, materialized_view_secondary_path,
+        ZebraJsonRpcSource, coordinate_canonical_writer_lifecycle, explorer_view_preset,
+        explorer_views_start_backfills, materialized_view_secondary_path,
         require_ingest_node_capabilities, run_materialized_view_plane, supervise_canonical_writer,
+        writer_readiness_for,
     };
 
     fn writer_readiness() -> (zinder_runtime::Readiness, zinder_runtime::ComposedReadiness) {
@@ -1308,18 +1333,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn termination_drains_readiness_before_the_writer_stops() {
-        let (readiness, composed) = writer_readiness();
-        composed.publish_admission(zinder_runtime::ReadinessState::ready(Some(7)));
+    async fn termination_drains_readiness_before_the_writer_stops()
+    -> Result<(), tokio::time::error::Elapsed> {
+        let readiness = zinder_runtime::Readiness::default();
         let termination = CancellationToken::new();
-        termination.cancel();
+        let composed = writer_readiness_for(readiness.clone(), None, &termination);
+        composed.publish_admission(zinder_runtime::ReadinessState::ready(Some(7)));
+        assert!(readiness.report().is_ready);
 
-        drain_readiness_on_termination(termination, composed.clone()).await;
+        termination.cancel();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while readiness.report().cause != zinder_runtime::ReadinessCause::ShuttingDown {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
         composed.publish_admission(zinder_runtime::ReadinessState::ready(Some(8)));
 
         let report = readiness.report();
         assert_eq!(report.cause, zinder_runtime::ReadinessCause::ShuttingDown);
         assert!(!report.is_ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn configured_upstream_health_gates_readiness_until_the_first_probe() {
+        let health = zinder_source::NodeHealthConfig::new(
+            "http://127.0.0.1:1/ready".to_owned(),
+            Duration::from_secs(1),
+            0.999,
+            10,
+        );
+        let readiness = zinder_runtime::Readiness::default();
+        let termination = CancellationToken::new();
+        let composed = writer_readiness_for(readiness.clone(), Some(&health), &termination);
+        composed.publish_admission(zinder_runtime::ReadinessState::ready(Some(7)));
+        assert_eq!(
+            readiness.report().cause,
+            zinder_runtime::ReadinessCause::Starting
+        );
+        composed.publish_input(
+            zinder_runtime::ReadinessInput::NodeSource,
+            zinder_runtime::ReadinessCause::Ready,
+        );
+        assert!(readiness.report().is_ready);
+
+        let readiness = zinder_runtime::Readiness::default();
+        let composed = writer_readiness_for(readiness.clone(), None, &termination);
+        composed.publish_admission(zinder_runtime::ReadinessState::ready(Some(7)));
+        assert!(readiness.report().is_ready);
     }
 
     #[test]

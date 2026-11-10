@@ -64,7 +64,8 @@ runtime whose readiness depends on more than one owner composes them through
 1. `shutting_down` once shutdown has started, irreversibly;
 2. an input that reports a parked canonical writer's `reorg_window_exceeded`
    halt, which is the root cause of the admission failures that follow it;
-3. the admission state (storage or serving pair) when it refuses traffic;
+3. the admission state (storage, serving pair, or canonical writer) when it
+   refuses traffic;
 4. the first refusing named input, in the order node source, ingest control,
    materialized-view catch-up;
 5. otherwise the admission state, including a warning that admits traffic.
@@ -147,13 +148,18 @@ lag-derived `ready` from the follower keeps an active warning while advancing
 the reported heights.
 
 When `[node.health].addr` is configured, the upstream health probe owns the
-node-source input. Each successful probe publishes `upstream_not_ready` while
-Zebra reports that it is not ready for queries and `ready` otherwise. A failed
-probe keeps the last observation. The follower cannot clear the probe's
+node-source input, and ingest stays `starting` until the probe's first
+successful observation. Each successful probe publishes `upstream_not_ready`
+while Zebra reports that it is not ready for queries and `ready` otherwise. A
+failed probe keeps the last observation. The follower cannot clear the probe's
 `upstream_not_ready`, so ingest stays unready until the probe observes a ready
-Zebra. A refusing admission state, such as `syncing` or `node_unavailable`,
-still takes precedence over the probe. Without a health endpoint, ingest has no
-node-source input.
+Zebra. Without a health endpoint, ingest has no node-source input.
+
+On `/readyz`, a refusing admission state, such as `syncing` or
+`node_unavailable`, takes precedence over the probe. `IngestControl.WriterStatus`
+reports the probe's latest observation independently of the admission state:
+`upstream_not_ready` and Zebra's heights in `upstream_tip` stay set throughout
+fresh construction or source recovery while the probe reports Zebra not ready.
 
 Ingest reports `shutting_down` as soon as termination is requested, before the
 writer and its workers drain.

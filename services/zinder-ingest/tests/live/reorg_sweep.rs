@@ -99,7 +99,8 @@ async fn canonical_writer_publishes_visible_reorg_for_invalidated_zebra_suffix()
     };
     let (canonical, commands) = canonical_control_channel();
     let writer_cancel = cancel.clone();
-    let writer_readiness = ComposedReadiness::new(readiness.clone(), &[]);
+    let writer_readiness = ComposedReadiness::new(readiness, &[]);
+    let control_readiness = writer_readiness.clone();
     let writer_activations = Arc::clone(&activations);
     let writer_source = source.clone();
     let writer = tokio::spawn(async move {
@@ -125,7 +126,7 @@ async fn canonical_writer_publishes_visible_reorg_for_invalidated_zebra_suffix()
         canonical,
         LiveMempoolOwner::default(),
         node_source,
-        readiness,
+        control_readiness,
     );
     let server = tokio::spawn(async move {
         Server::builder()

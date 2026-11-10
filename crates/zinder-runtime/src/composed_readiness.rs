@@ -130,6 +130,18 @@ impl ComposedReadiness {
         });
     }
 
+    /// Returns one input's latest published cause, whether or not it currently
+    /// supplies the projected cause.
+    ///
+    /// A refusing admission state or shutdown hides every input from
+    /// [`Self::runtime_readiness`]; this accessor still reports the input, so a
+    /// status surface can expose a dependency observation independently of
+    /// the admission state.
+    #[must_use]
+    pub fn input_cause(&self, input: ReadinessInput) -> Option<ReadinessCause> {
+        self.composition.lock().inputs.get(&input).cloned()
+    }
+
     /// Replaces one input's latest cause.
     pub fn publish_input(&self, input: ReadinessInput, cause: ReadinessCause) {
         self.publish_with(|composition| {
@@ -393,6 +405,28 @@ mod tests {
         composed.publish_admission(ReadinessState::ready(Some(6)));
         composed.publish_input(ReadinessInput::NodeSource, ReadinessCause::Ready);
         assert_eq!(runtime.report().cause, ReadinessCause::ShuttingDown);
+    }
+
+    #[test]
+    fn input_cause_reports_an_input_hidden_by_a_refusing_admission() {
+        let runtime = Readiness::default();
+        let composed = ComposedReadiness::new(runtime.clone(), &[ReadinessInput::IngestControl]);
+        assert_eq!(
+            composed.input_cause(ReadinessInput::IngestControl),
+            Some(ReadinessCause::Starting)
+        );
+        assert_eq!(composed.input_cause(ReadinessInput::NodeSource), None);
+
+        composed.publish_admission(ReadinessState::syncing(Some(2), Some(10), Some(12)));
+        composed.publish_input(ReadinessInput::NodeSource, node_unavailable());
+        assert!(matches!(
+            runtime.report().cause,
+            ReadinessCause::Syncing { .. }
+        ));
+        assert_eq!(
+            composed.input_cause(ReadinessInput::NodeSource),
+            Some(node_unavailable())
+        );
     }
 
     #[test]

@@ -29,7 +29,8 @@ use zinder_proto::{
     },
 };
 use zinder_runtime::{
-    BearerToken, BearerTokenServerInterceptor, Readiness, ReadinessCause, ReadinessReport,
+    BearerToken, BearerTokenServerInterceptor, ComposedReadiness, ReadinessCause, ReadinessInput,
+    ReadinessReport, UpstreamNotReadyDetail,
 };
 use zinder_source::{NodeCapability, NodeSource, SourceError};
 use zinder_store::{
@@ -64,19 +65,25 @@ pub struct CanonicalIngestControlGrpcAdapter {
     mempool: LiveMempoolOwner,
     node_source: Arc<dyn NodeSource>,
     bearer_token: Option<BearerToken>,
-    readiness: Readiness,
+    readiness: ComposedReadiness,
 }
 
 impl CanonicalIngestControlGrpcAdapter {
     /// Binds one canonical writer command channel, one live mempool owner,
-    /// and the source handle already owned by the ingest runtime.
+    /// the source handle already owned by the ingest runtime, and the
+    /// writer's readiness composition.
+    ///
+    /// `WriterStatus` reports the phase and heights from the projected
+    /// readiness, and upstream health from the
+    /// [`ReadinessInput::NodeSource`] input even while a refusing admission
+    /// state, such as `syncing`, supplies the projected cause.
     #[must_use]
     pub fn new(
         network: Network,
         canonical: CanonicalControlHandle,
         mempool: LiveMempoolOwner,
         node_source: Arc<dyn NodeSource>,
-        readiness: Readiness,
+        readiness: ComposedReadiness,
     ) -> Self {
         Self {
             network,
@@ -150,7 +157,8 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
         &self,
         _request: Request<WriterStatusRequest>,
     ) -> Result<Response<WriterStatusResponse>, Status> {
-        let readiness_report = self.readiness.report();
+        let readiness_report = self.readiness.runtime_readiness().report();
+        let node_source_observation = self.readiness.input_cause(ReadinessInput::NodeSource);
         // A parked writer reports its frozen fence while it still answers;
         // once its owner loop has stopped, readers still need the typed halt
         // rather than an unavailable control channel.
@@ -170,6 +178,7 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
             self.network,
             chain_epoch,
             &readiness_report,
+            node_source_observation.as_ref(),
         )))
     }
 
@@ -511,8 +520,19 @@ fn writer_status_response(
     network: Network,
     chain_epoch: Option<ChainEpoch>,
     readiness_report: &ReadinessReport,
+    node_source_observation: Option<&ReadinessCause>,
 ) -> WriterStatusResponse {
-    let upstream_tip = upstream_tip_from_readiness(readiness_report);
+    let upstream_not_ready = [node_source_observation, Some(&readiness_report.cause)]
+        .into_iter()
+        .flatten()
+        .find_map(|cause| {
+            if let ReadinessCause::UpstreamNotReady(detail) = cause {
+                Some(detail)
+            } else {
+                None
+            }
+        });
+    let upstream_tip = upstream_tip_from_readiness(readiness_report, upstream_not_ready);
     let gap_blocks = upstream_tip
         .as_ref()
         .and_then(|upstream_tip| upstream_tip.committed_height)
@@ -525,12 +545,6 @@ fn writer_status_response(
         chain_view.upstream_tip = upstream_tip;
         chain_view
     });
-    let upstream_not_ready =
-        if let ReadinessCause::UpstreamNotReady(detail) = &readiness_report.cause {
-            Some(ops::UpstreamNotReadyDetail::from(detail))
-        } else {
-            None
-        };
     WriterStatusResponse {
         chain_view,
         network_name: encode_zinder_native_chain_name(network).to_owned(),
@@ -539,26 +553,33 @@ fn writer_status_response(
             .map_or(WriterPhase::Unspecified, WriterPhase::from)
             .into(),
         gap_blocks,
-        upstream_not_ready,
+        upstream_not_ready: upstream_not_ready.map(ops::UpstreamNotReadyDetail::from),
         reorg_window_exceeded: readiness_report.cause.reorg_window_exceeded_detail(),
     }
 }
 
-fn upstream_tip_from_readiness(readiness_report: &ReadinessReport) -> Option<wallet::UpstreamTip> {
-    if let ReadinessCause::UpstreamNotReady(detail) = &readiness_report.cause {
-        (detail.upstream_committed_height.is_some() || detail.upstream_estimated_height.is_some())
+fn upstream_tip_from_readiness(
+    readiness_report: &ReadinessReport,
+    upstream_not_ready: Option<&UpstreamNotReadyDetail>,
+) -> Option<wallet::UpstreamTip> {
+    upstream_not_ready.map_or_else(
+        || {
+            readiness_report
+                .target_height
+                .map(|committed_height| wallet::UpstreamTip {
+                    committed_height: Some(committed_height),
+                    estimated_height: None,
+                })
+        },
+        |detail| {
+            (detail.upstream_committed_height.is_some()
+                || detail.upstream_estimated_height.is_some())
             .then_some(wallet::UpstreamTip {
                 committed_height: detail.upstream_committed_height,
                 estimated_height: detail.upstream_estimated_height,
             })
-    } else {
-        readiness_report
-            .target_height
-            .map(|committed_height| wallet::UpstreamTip {
-                committed_height: Some(committed_height),
-                estimated_height: None,
-            })
-    }
+        },
+    )
 }
 
 fn chain_value_pools_response(
@@ -688,7 +709,10 @@ mod tests {
             },
         },
     };
-    use zinder_runtime::{BearerToken, IngestPhase, Readiness, ReadinessState};
+    use zinder_runtime::{
+        BearerToken, ComposedReadiness, IngestPhase, Readiness, ReadinessCause, ReadinessInput,
+        ReadinessState, UpstreamHealth, UpstreamNotReadyDetail,
+    };
     use zinder_source::{
         NodeAuth, NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError,
         SourceSubtreeRoots, ZebraJsonRpcSource,
@@ -1216,7 +1240,7 @@ mod tests {
             fixture.canonical.clone(),
             fixture.mempool.clone(),
             Arc::new(source),
-            Readiness::default(),
+            ComposedReadiness::new(Readiness::default(), &[]),
         );
 
         let server_info = IngestControl::server_info(&adapter, Request::new(ServerInfoRequest {}))
@@ -1262,7 +1286,8 @@ mod tests {
         let chain_epoch = fixture.canonical.chain_epoch().await?.chain_epoch;
         let visible_height = chain_epoch.visible_tip_height.value();
         let upstream_height = visible_height.saturating_add(2);
-        let readiness = Readiness::new(
+        let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+        readiness.publish_admission(
             ReadinessState::syncing(Some(2), Some(visible_height), Some(upstream_height))
                 .with_phase(IngestPhase::BulkCatchup),
         );
@@ -1303,7 +1328,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let (canonical, commands) = canonical_control_channel();
         drop(commands);
-        let readiness = Readiness::new(
+        let readiness = Readiness::default();
+        let composed = ComposedReadiness::new(readiness.clone(), &[]);
+        composed.publish_admission(
             ReadinessState::reorg_window_exceeded(1_001, 1_000, Some(1_000), Some(4_200))
                 .with_phase(IngestPhase::FollowingTip),
         );
@@ -1318,7 +1345,7 @@ mod tests {
             canonical,
             LiveMempoolOwner::default(),
             source,
-            readiness.clone(),
+            composed.clone(),
         );
 
         let response = IngestControl::writer_status(&adapter, Request::new(WriterStatusRequest {}))
@@ -1337,7 +1364,7 @@ mod tests {
             })
         );
 
-        readiness.set(ReadinessState::ready(Some(4_200)));
+        composed.publish_admission(ReadinessState::ready(Some(4_200)));
         let unavailable =
             IngestControl::writer_status(&adapter, Request::new(WriterStatusRequest {}))
                 .await
@@ -1345,6 +1372,79 @@ mod tests {
                 .ok_or("a writer that is not parked must answer from its live fence")?;
         assert_eq!(unavailable.code(), Code::Unavailable);
         Ok(())
+    }
+
+    /// A refusing admission state hides the probe from `/readyz`, but writer
+    /// status still reports the probe's upstream-health observation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn writer_status_reports_upstream_not_ready_while_admission_is_syncing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = shared_control_fixture().await?;
+        let visible_height = fixture
+            .canonical
+            .chain_epoch()
+            .await?
+            .chain_epoch
+            .visible_tip_height
+            .value();
+        let readiness = Readiness::default();
+        let composed = ComposedReadiness::new(readiness.clone(), &[]);
+        composed.publish_admission(
+            ReadinessState::syncing(Some(1), Some(visible_height), None)
+                .with_phase(IngestPhase::BulkCatchup),
+        );
+        composed.publish_input(
+            ReadinessInput::NodeSource,
+            ReadinessCause::UpstreamNotReady(UpstreamNotReadyDetail {
+                upstream_committed_height: Some(visible_height.saturating_add(5)),
+                upstream_estimated_height: Some(visible_height.saturating_add(900)),
+                upstream_verification_progress: Some(0.4),
+                upstream_health: UpstreamHealth {
+                    source: "zebra_ready_endpoint",
+                    reason: std::borrow::Cow::Borrowed("syncing"),
+                },
+            }),
+        );
+        assert!(matches!(
+            readiness.report().cause,
+            ReadinessCause::Syncing { .. }
+        ));
+        let source: Arc<dyn NodeSource> = Arc::new(ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashTestnet,
+            "http://127.0.0.1:1",
+            NodeAuth::None,
+            Duration::from_secs(1),
+        )?);
+        let adapter = CanonicalIngestControlGrpcAdapter::new(
+            zinder_core::Network::ZcashTestnet,
+            fixture.canonical.clone(),
+            fixture.mempool.clone(),
+            source,
+            composed,
+        );
+
+        let response = IngestControl::writer_status(&adapter, Request::new(WriterStatusRequest {}))
+            .await?
+            .into_inner();
+        assert_eq!(
+            response
+                .upstream_not_ready
+                .as_ref()
+                .and_then(|detail| detail.upstream_committed_height),
+            Some(visible_height.saturating_add(5)),
+            "writer status omitted the probe's upstream_not_ready observation"
+        );
+        assert_eq!(response.phase(), WriterPhase::BulkCatchup);
+        assert_eq!(response.gap_blocks, Some(5));
+        assert_eq!(
+            response
+                .chain_view
+                .and_then(|view| view.upstream_tip)
+                .and_then(|tip| tip.estimated_height),
+            Some(visible_height.saturating_add(900))
+        );
+
+        fixture.shutdown().await
     }
 
     #[derive(Clone)]
@@ -1466,7 +1566,8 @@ mod tests {
             NodeAuth::None,
             Duration::from_secs(1),
         )?);
-        let readiness = Readiness::new(ReadinessState::ready(Some(1)));
+        let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+        readiness.publish_admission(ReadinessState::ready(Some(1)));
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let listen_addr = listener.local_addr()?;
         let cancel = CancellationToken::new();

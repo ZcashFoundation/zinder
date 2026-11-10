@@ -48,14 +48,14 @@ async fn production_tip_change_publisher_observes_a_post_wait_canonical_event() 
     let source = MutableTipSource::new(blocks, checkpoints, BlockHeight::new(2));
     let temporary = tempfile::tempdir()?;
     let cancel = CancellationToken::new();
-    let readiness = Readiness::default();
+    let writer_readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let (canonical, commands) = canonical_control_channel();
     let writer = tokio::spawn(
         CanonicalWriterTask {
             source: source.clone(),
             activations: activations.clone(),
             storage_path: temporary.path().join("canonical"),
-            readiness: ComposedReadiness::new(readiness.clone(), &[]),
+            readiness: writer_readiness.clone(),
             cancel: cancel.clone(),
             commands,
         }
@@ -86,7 +86,7 @@ async fn production_tip_change_publisher_observes_a_post_wait_canonical_event() 
         canonical.clone(),
         LiveMempoolOwner::default(),
         Arc::new(source.clone()),
-        readiness,
+        writer_readiness,
     );
     let server_cancel = cancel.clone();
     let server = tokio::spawn(async move {
