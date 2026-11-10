@@ -34,23 +34,37 @@ use zinder_proto::capabilities::{
 };
 use zinder_proto::v1::wallet;
 use zinder_query::{
-    AdmittedIngestControl, WalletEndpointMetadata, WalletQuery, WalletQueryApi,
-    WalletQueryGrpcAdapter, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    AdmittedIngestControl, WalletEndpointMetadata, WalletQueryApi, WalletQueryGrpcAdapter,
+    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_testkit::{
-    ChainFixture, IngestControlFixture, MockTransactionBroadcaster, StoreFixture,
-    WalletServingStoreFixture, sample_regtest_upgrade_activations,
+    ChainFixture, IngestControlFixture, MockTransactionBroadcaster, WalletServingStoreFixture,
+    sample_regtest_upgrade_activations,
 };
 
 #[tokio::test]
 async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::Result<()> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
-    let store_fixture =
-        StoreFixture::with_chain_committed(&chain_fixture, zinder_client::ChainEpochId::new(1))?;
-    let wallet_query = WalletQuery::new(
-        store_fixture.chain_store().clone(),
+    let mut store_fixture =
+        WalletServingStoreFixture::from_chain(&chain_fixture, activations.as_ref())?;
+    let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
+    let serving_pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(canonical_reader),
+        Arc::new(wallet_reader),
+    )?);
+    let ingest_control_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+    let admitted_ingest_control = AdmittedIngestControl::connect(
+        ingest_control_fixture.endpoint(),
+        None,
+        Network::ZcashRegtest,
+    )
+    .await?;
+    let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
+        WalletServingPairSlot::new(serving_pair),
         MockTransactionBroadcaster::broadcast_disabled(),
-        Arc::new(sample_regtest_upgrade_activations()),
+        admitted_ingest_control,
+        activations,
     );
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
     let endpoint = spawn_wallet_query(grpc_adapter).await?;
@@ -102,13 +116,27 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
 /// chain-event stream.
 #[tokio::test]
 async fn parked_writer_halt_reaches_unary_reads_and_open_chain_event_streams() -> eyre::Result<()> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
-    let store_fixture =
-        StoreFixture::with_chain_committed(&chain_fixture, zinder_client::ChainEpochId::new(1))?;
-    let wallet_query = WalletQuery::new(
-        store_fixture.chain_store().clone(),
+    let mut store_fixture =
+        WalletServingStoreFixture::from_chain(&chain_fixture, activations.as_ref())?;
+    let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
+    let serving_pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(canonical_reader),
+        Arc::new(wallet_reader),
+    )?);
+    let ingest_control_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+    let admitted_ingest_control = AdmittedIngestControl::connect(
+        ingest_control_fixture.endpoint(),
+        None,
+        Network::ZcashRegtest,
+    )
+    .await?;
+    let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
+        WalletServingPairSlot::new(serving_pair),
         MockTransactionBroadcaster::broadcast_disabled(),
-        Arc::new(sample_regtest_upgrade_activations()),
+        admitted_ingest_control,
+        activations,
     );
     let readiness = zinder_runtime::Readiness::new(zinder_runtime::ReadinessState::ready(Some(2)));
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default())
