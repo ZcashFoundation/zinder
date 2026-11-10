@@ -68,7 +68,7 @@ Use these terms consistently:
 - `scan range start`: the start of a scanner-selected range.
 - `tree-state anchor`: the block height whose tree state initializes a scan, commonly `scan_range_start - 1` or `birthday - 1`.
 - `artifact coverage floor`: the earliest height or index available for an artifact family.
-- `serving store`: a store built with `wallet-serving` coverage and caught up by `tip-follow`.
+- `serving store`: a store built by fresh canonical construction with `wallet-serving` coverage and kept current by the canonical follower.
 
 Do not use `birthday` as shorthand for every historical tree-state lookup. Many tree-state requests are scan anchors, not wallet birthdays.
 
@@ -85,12 +85,12 @@ Positive:
 Negative:
 
 - Initial serving stores are larger and slower to build than recent-checkpoint fixtures.
-- Local test workflows use explicit disposable stores or tip-follow rather than near-tip settled-tip bulk catchup.
+- Local test workflows use explicit disposable stores or the canonical follower rather than a near-tip fresh canonical construction.
 - Full prevention of excessive transparent-UTXO materialization across many addresses requires a deeper multi-address store API; the aggregate response budget bounds the read until that lands.
 
 Tradeoffs:
 
-The bulk-catchup floor is intentionally conservative. A future profile can narrow coverage once the product has real demand for bounded historical ranges, but the first stable profile optimizes for correct wallet behavior and low operator ambiguity.
+The fresh-construction coverage floor is intentionally conservative. A future profile can narrow coverage once the product has real demand for bounded historical ranges, but the first stable profile optimizes for correct wallet behavior and low operator ambiguity.
 
 Upstream-node fallback is rejected. It would blur the source of truth, make readiness lie, and turn query services into partial node proxies. Repair tools may use upstream nodes to rebuild canonical artifacts, but public query methods read stored artifacts only.
 
