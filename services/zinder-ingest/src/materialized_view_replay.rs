@@ -33,15 +33,17 @@ use zinder_materialized_views::{
     MaterializedViewDispatch, MaterializedViewPreset, MaterializedViewState, MaterializedViewStore,
     MaterializedViewStoreOptions, MaterializedViewWriteMeasurement,
     PAID_FEE_DISTRIBUTION_CONSUMER_NAME, TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME,
-    TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY, TransactionComponentSummaryConsumer,
-    VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME, bundled_materialized_view_consumer_definitions,
+    TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
+    TransactionComponentSummaryConsumer, VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME,
+    bundled_materialized_view_consumer_definitions,
 };
 use zinder_proto::v1::wallet::{MaterializedViewHealth, MaterializedViewStatus};
 use zinder_runtime::{ComposedReadiness, IngestPhase, Readiness, ReadinessCause};
 use zinder_store::{
-    CanonicalEventCursor, CanonicalEventHistoryRequest, CanonicalEventKind, CanonicalRetainedEvent,
-    CanonicalStoreError, ChainEpochCommitted, ChainEvent, ChainRangeReverted,
-    MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS, RocksDbCanonicalSecondary, RocksDbResourceBudget,
+    BlockHashLookup, CanonicalEventCursor, CanonicalEventHistoryRequest, CanonicalEventKind,
+    CanonicalRetainedEvent, CanonicalStoreError, ChainEpochCommitted, ChainEvent,
+    ChainRangeReverted, MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS, RocksDbCanonicalSecondary,
+    RocksDbResourceBudget,
 };
 
 use crate::{
@@ -759,11 +761,54 @@ impl MaterializedViewTailer {
         canonical: &RocksDbCanonicalSecondary,
         pass: &mut ReplayPass,
     ) -> Result<(), IngestError> {
-        match persisted_chain_event_cursor(&self.materialized_view_store)? {
-            Some(cursor) => self.replay_retained_events(canonical, pass, cursor)?,
-            None => require_genesis_complete_history(canonical)?,
+        if let Some(cursor) = persisted_chain_event_cursor(&self.materialized_view_store)? {
+            self.replay_retained_events(canonical, pass, cursor)?;
+            return self.rebuild_unmaterialized_heights(canonical, pass);
         }
-        self.rebuild_unmaterialized_heights(canonical, pass)
+        require_genesis_complete_history(canonical)?;
+        match self.materialized_height()? {
+            Some(durable_height)
+                if !self.materialized_tip_is_canonical(canonical, durable_height)? =>
+            {
+                let reverted = self.reorg_window_below(canonical, durable_height);
+                tracing::warn!(
+                    target: "zinder::ingest",
+                    event = "materialized_view_replay_uncursored_head_replaced",
+                    durable_height = durable_height.value(),
+                    revert_from_height = reverted.start.value(),
+                    "materialized-view rows have no unanimous consumer cursor and their newest block is no longer canonical; reverting the reorg window and rebuilding from canonical heights"
+                );
+                self.rebuild_over_reorg_window(canonical, pass, reverted)
+            }
+            Some(_) | None => self.rebuild_unmaterialized_heights(canonical, pass),
+        }
+    }
+
+    /// Returns whether the newest block the view checkpointed is still canonical.
+    ///
+    /// Without a unanimous cursor, retained events cannot show whether a reorg
+    /// replaced heights the view already holds, as when a rebuild stops between
+    /// pages and the chain reorgs before it resumes. Every page checkpoints the
+    /// hash of its last block, and blocks commit to their parents, so a
+    /// canonical checkpoint proves every row at or below it is canonical too.
+    fn materialized_tip_is_canonical(
+        &self,
+        canonical: &RocksDbCanonicalSecondary,
+        durable_height: BlockHeight,
+    ) -> Result<bool, IngestError> {
+        let Some(state) = self
+            .materialized_view_store
+            .consumer_state(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)?
+        else {
+            return Ok(false);
+        };
+        if durable_height > state.tip_height {
+            return Ok(false);
+        }
+        Ok(matches!(
+            canonical.block_hash_lookup(state.tip_hash)?,
+            BlockHashLookup::Resolved(block_id) if block_id.height == state.tip_height
+        ))
     }
 
     fn replay_retained_events(
@@ -875,12 +920,6 @@ impl MaterializedViewTailer {
     }
 
     /// Recovers a consumer cursor that names history the canonical store pruned.
-    ///
-    /// The view is durable through some height D. When the view applied D the
-    /// canonical settled tip was at least D minus the reorg window, so no
-    /// canonical replacement can have reached deeper than that. Reverting the
-    /// window below D and rebuilding the remainder from canonical heights
-    /// converges on the same rows an uninterrupted event replay would write.
     fn recover_expired_cursor(
         &self,
         canonical: &RocksDbCanonicalSecondary,
@@ -891,7 +930,29 @@ impl MaterializedViewTailer {
         let Some(durable_height) = self.materialized_height()? else {
             return Ok(());
         };
-        let chain_epoch = canonical.chain_epoch()?;
+        let reverted = self.reorg_window_below(canonical, durable_height);
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "materialized_view_replay_cursor_expired",
+            persisted_event_sequence = expired.event_sequence,
+            oldest_retained_event_sequence = expired.oldest_retained_sequence,
+            durable_height = durable_height.value(),
+            revert_from_height = reverted.start.value(),
+            "materialized-view consumer cursor is older than retained canonical events; reverting the reorg window and rebuilding from canonical heights"
+        );
+        self.rebuild_over_reorg_window(canonical, pass, reverted)
+    }
+
+    /// Returns the heights at or below `durable_height` a canonical replacement
+    /// could have reached since the view wrote them.
+    ///
+    /// When the view applied height D the canonical settled tip was at least D
+    /// minus the reorg window, so no replacement can reach deeper than that.
+    fn reorg_window_below(
+        &self,
+        canonical: &RocksDbCanonicalSecondary,
+        durable_height: BlockHeight,
+    ) -> BlockHeightRange {
         let revert_from = BlockHeight::new(
             durable_height
                 .value()
@@ -899,15 +960,21 @@ impl MaterializedViewTailer {
                 .saturating_add(1)
                 .max(canonical.history_bounds().first_available_height().value()),
         );
-        tracing::warn!(
-            target: "zinder::ingest",
-            event = "materialized_view_replay_cursor_expired",
-            persisted_event_sequence = expired.event_sequence,
-            oldest_retained_event_sequence = expired.oldest_retained_sequence,
-            durable_height = durable_height.value(),
-            revert_from_height = revert_from.value(),
-            "materialized-view consumer cursor is older than retained canonical events; reverting the reorg window and rebuilding from canonical heights"
-        );
+        BlockHeightRange::inclusive(revert_from, durable_height)
+    }
+
+    /// Reverts `reverted`, then rebuilds from its start through the visible tip.
+    ///
+    /// Reverting the reorg window below the durable height and rebuilding the
+    /// remainder from canonical heights converges on the same rows an
+    /// uninterrupted event replay would write.
+    fn rebuild_over_reorg_window(
+        &self,
+        canonical: &RocksDbCanonicalSecondary,
+        pass: &mut ReplayPass,
+        reverted: BlockHeightRange,
+    ) -> Result<(), IngestError> {
+        let chain_epoch = canonical.chain_epoch()?;
         self.dispatch_committed_range(
             canonical,
             pass,
@@ -915,12 +982,12 @@ impl MaterializedViewTailer {
                 chain_epoch,
                 cursor: fence_cursor(canonical)?,
                 committed_range: BlockHeightRange::inclusive(
-                    revert_from,
+                    reverted.start,
                     chain_epoch.visible_tip_height,
                 ),
                 reverted: Some(ChainRangeReverted {
                     chain_epoch,
-                    block_range: BlockHeightRange::inclusive(revert_from, durable_height),
+                    block_range: reverted,
                 }),
             },
         )

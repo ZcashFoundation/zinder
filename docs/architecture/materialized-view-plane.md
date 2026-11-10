@@ -172,6 +172,16 @@ blocks named by each event, and calls
 point covered by the consumer's declared recovery source, not automatically
 from the oldest retained event.
 
+Block-keyed consumers resume from their shared chain-event cursor. When that
+cursor is expired, or when the consumers do not all hold one, retained events
+cannot show whether a reorg replaced rows the view already holds. The host then
+rebuilds from canonical heights instead. Before it rebuilds, it reverts the
+reorg window below the view's newest materialized height. For a missing cursor
+it skips that revert only when the block the view last checkpointed is still
+canonical, because every row below a canonical block is canonical too. The view
+wrote a height only while the settled tip was within one reorg window of it, so
+no replacement reaches below that window.
+
 Consumers that make completeness claims persist `MaterializedViewState`
 beside their rows. It records the canonical epoch, materialized-view tip, revision,
 and optional contiguous `MaterializedViewCoverage`. Cursor position alone is

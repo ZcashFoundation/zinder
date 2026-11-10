@@ -22,7 +22,8 @@ use zinder_ingest::{
 };
 use zinder_materialized_views::{
     BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer, ChainEventBlockJoin,
-    MaterializedViewDispatch, MaterializedViewStore, MaterializedViewStoreOptions,
+    MaterializedViewConsumerName, MaterializedViewDispatch, MaterializedViewStore,
+    MaterializedViewStoreOptions, MaterializedViewStoreTable, RECENT_TRANSACTIONS_CONSUMER_NAME,
     REORG_INCIDENTS_CONSUMER_NAME, bundled_materialized_view_consumer_definitions,
     decode_stored_record,
 };
@@ -105,6 +106,56 @@ async fn a_reorg_transition_reverts_and_reapplies_the_replaced_height() -> Resul
             .is_some(),
         "the reorg incident log must advance through the replacement transition"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_view_missing_one_consumer_cursor_reverts_the_rows_a_reorg_replaced()
+-> Result<(), Box<dyn Error>> {
+    let mut harness = CanonicalHarness::baseline().await?;
+    harness.follow_to_tip().await?;
+    let (directory, view) = view_store()?;
+    harness.tailer(&view).catch_up()?;
+    drop(view);
+    delete_chain_event_cursors(directory.path(), [RECENT_TRANSACTIONS_CONSUMER_NAME])?;
+    let view = open_view_store(directory.path())?;
+
+    harness.replace_tip().await?;
+    harness.tailer(&view).catch_up()?;
+
+    assert_eq!(
+        block_summary_hashes(&view, REPLACEMENT_TIP_HEIGHT)?,
+        harness.canonical_hashes(REPLACEMENT_TIP_HEIGHT)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_rebuild_resumed_after_a_reorg_reverts_the_rows_it_wrote_from_the_replaced_chain()
+-> Result<(), Box<dyn Error>> {
+    let mut harness = CanonicalHarness::baseline().await?;
+    harness.follow_to_tip().await?;
+    let (directory, view) = view_store()?;
+    harness.tailer(&view).catch_up()?;
+    drop(view);
+    delete_chain_event_cursors(
+        directory.path(),
+        MaterializedViewStore::bundled_chain_event_consumer_names()
+            .iter()
+            .copied(),
+    )?;
+    let view = open_view_store(directory.path())?;
+
+    harness.replace_tip().await?;
+    harness.tailer(&view).catch_up()?;
+
+    let (_rebuilt_directory, rebuilt) = view_store()?;
+    harness.tailer(&rebuilt).catch_up()?;
+    assert_eq!(
+        block_summary_hashes(&view, REPLACEMENT_TIP_HEIGHT)?,
+        harness.canonical_hashes(REPLACEMENT_TIP_HEIGHT)
+    );
+    assert_eq!(chain_event_cursors(&view)?, chain_event_cursors(&rebuilt)?);
     Ok(())
 }
 
@@ -229,15 +280,37 @@ async fn the_tailer_publishes_a_live_status_and_opens_the_historical_work_gate()
 
 fn view_store() -> Result<(TempDir, MaterializedViewStore), Box<dyn Error>> {
     let directory = TempDir::new()?;
-    let store = MaterializedViewStore::open(
-        directory.path(),
+    let store = open_view_store(directory.path())?;
+    Ok((directory, store))
+}
+
+fn open_view_store(path: &Path) -> Result<MaterializedViewStore, Box<dyn Error>> {
+    Ok(MaterializedViewStore::open(
+        path,
         MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: MaterializedViewStore::bundled_consumers(),
             rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
         },
-    )?;
-    Ok((directory, store))
+    )?)
+}
+
+/// Removes chain-event cursors from a closed view store, leaving the rows they
+/// describe in place, as a rebuild interrupted between pages leaves the store.
+fn delete_chain_event_cursors(
+    path: &Path,
+    consumers: impl IntoIterator<Item = MaterializedViewConsumerName>,
+) -> Result<(), Box<dyn Error>> {
+    let options = rust_rocksdb::Options::default();
+    let column_families = rust_rocksdb::DB::list_cf(&options, path)?;
+    let db = rust_rocksdb::DB::open_cf(&options, path, &column_families)?;
+    let cursors = db
+        .cf_handle(MaterializedViewStoreTable::ChainEventCursor.column_family_name())
+        .ok_or("a view store must own the chain-event cursor column family")?;
+    for consumer in consumers {
+        db.delete_cf(&cursors, consumer.as_str().as_bytes())?;
+    }
+    Ok(())
 }
 
 fn block_summary_hashes(
