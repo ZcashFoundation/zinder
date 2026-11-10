@@ -158,8 +158,15 @@ Zebra. Without a health endpoint, ingest has no node-source input.
 On `/readyz`, a refusing admission state, such as `syncing` or
 `node_unavailable`, takes precedence over the probe. `IngestControl.WriterStatus`
 reports the probe's latest observation independently of the admission state:
-`upstream_not_ready` and Zebra's heights in `upstream_tip` stay set throughout
-fresh construction or source recovery while the probe reports Zebra not ready.
+`upstream_not_ready` and Zebra's heights stay set throughout fresh construction
+or source recovery while the probe reports Zebra not ready.
+
+During fresh construction, the writer has no published chain epoch and does not
+service its command queue, so `WriterStatus` answers from readiness alone. It
+reports the `bulk_catchup` phase and `upstream_not_ready` without `chain_view`
+or `gap_blocks`, and Zebra's heights appear only in `upstream_not_ready`.
+Native query treats a missing `chain_view` as an invalid writer status, so it
+stays unready until the writer publishes its first epoch.
 
 Ingest reports `shutting_down` as soon as termination is requested, before the
 writer and its workers drain.

@@ -29,8 +29,8 @@ use zinder_proto::{
     },
 };
 use zinder_runtime::{
-    BearerToken, BearerTokenServerInterceptor, ComposedReadiness, ReadinessCause, ReadinessInput,
-    ReadinessReport, UpstreamNotReadyDetail,
+    BearerToken, BearerTokenServerInterceptor, ComposedReadiness, IngestPhase, ReadinessCause,
+    ReadinessInput, ReadinessReport, UpstreamNotReadyDetail,
 };
 use zinder_source::{NodeCapability, NodeSource, SourceError};
 use zinder_store::{
@@ -76,7 +76,8 @@ impl CanonicalIngestControlGrpcAdapter {
     /// `WriterStatus` reports the phase and heights from the projected
     /// readiness, and upstream health from the
     /// [`ReadinessInput::NodeSource`] input even while a refusing admission
-    /// state, such as `syncing`, supplies the projected cause.
+    /// state, such as `syncing`, supplies the projected cause. During fresh
+    /// construction it answers from readiness alone, without a chain view.
     #[must_use]
     pub fn new(
         network: Network,
@@ -159,6 +160,16 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
     ) -> Result<Response<WriterStatusResponse>, Status> {
         let readiness_report = self.readiness.runtime_readiness().report();
         let node_source_observation = self.readiness.input_cause(ReadinessInput::NodeSource);
+        // Fresh construction has no published epoch, and the writer services
+        // its command queue only once it follows a published store.
+        if readiness_report.phase == Some(IngestPhase::BulkCatchup) {
+            return Ok(Response::new(writer_status_response(
+                self.network,
+                None,
+                &readiness_report,
+                node_source_observation.as_ref(),
+            )));
+        }
         // A parked writer reports its frozen fence while it still answers;
         // once its owner loop has stopped, readers still need the typed halt
         // rather than an unavailable control channel.
@@ -1289,7 +1300,7 @@ mod tests {
         let readiness = ComposedReadiness::new(Readiness::default(), &[]);
         readiness.publish_admission(
             ReadinessState::syncing(Some(2), Some(visible_height), Some(upstream_height))
-                .with_phase(IngestPhase::BulkCatchup),
+                .with_phase(IngestPhase::FollowingTip),
         );
         let source: Arc<dyn NodeSource> = Arc::new(ZebraJsonRpcSource::new(
             zinder_core::Network::ZcashTestnet,
@@ -1308,7 +1319,7 @@ mod tests {
         let response = IngestControl::writer_status(&adapter, Request::new(WriterStatusRequest {}))
             .await?
             .into_inner();
-        assert_eq!(response.phase(), WriterPhase::BulkCatchup);
+        assert_eq!(response.phase(), WriterPhase::FollowingTip);
         assert_eq!(response.gap_blocks, Some(2));
         assert_eq!(
             response
@@ -1391,7 +1402,7 @@ mod tests {
         let composed = ComposedReadiness::new(readiness.clone(), &[]);
         composed.publish_admission(
             ReadinessState::syncing(Some(1), Some(visible_height), None)
-                .with_phase(IngestPhase::BulkCatchup),
+                .with_phase(IngestPhase::FollowingTip),
         );
         composed.publish_input(
             ReadinessInput::NodeSource,
@@ -1434,7 +1445,7 @@ mod tests {
             Some(visible_height.saturating_add(5)),
             "writer status omitted the probe's upstream_not_ready observation"
         );
-        assert_eq!(response.phase(), WriterPhase::BulkCatchup);
+        assert_eq!(response.phase(), WriterPhase::FollowingTip);
         assert_eq!(response.gap_blocks, Some(5));
         assert_eq!(
             response
@@ -1445,6 +1456,63 @@ mod tests {
         );
 
         fixture.shutdown().await
+    }
+
+    /// Fresh construction has no published epoch and does not service the
+    /// command queue, so `WriterStatus` answers promptly from readiness with
+    /// the phase and the probe's observation and without a chain view.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn writer_status_answers_from_readiness_during_fresh_construction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (canonical, _unserviced_commands) = canonical_control_channel();
+        let composed = ComposedReadiness::new(Readiness::default(), &[]);
+        composed.publish_admission(
+            ReadinessState::syncing(Some(4_000), None, Some(4_000))
+                .with_phase(IngestPhase::BulkCatchup),
+        );
+        composed.publish_input(
+            ReadinessInput::NodeSource,
+            ReadinessCause::UpstreamNotReady(UpstreamNotReadyDetail {
+                upstream_committed_height: Some(4_000),
+                upstream_estimated_height: Some(9_000),
+                upstream_verification_progress: Some(0.4),
+                upstream_health: UpstreamHealth {
+                    source: "zebra_ready_endpoint",
+                    reason: std::borrow::Cow::Borrowed("syncing"),
+                },
+            }),
+        );
+        let source: Arc<dyn NodeSource> = Arc::new(ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashTestnet,
+            "http://127.0.0.1:1",
+            NodeAuth::None,
+            Duration::from_secs(1),
+        )?);
+        let adapter = CanonicalIngestControlGrpcAdapter::new(
+            zinder_core::Network::ZcashTestnet,
+            canonical,
+            LiveMempoolOwner::default(),
+            source,
+            composed,
+        );
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            IngestControl::writer_status(&adapter, Request::new(WriterStatusRequest {})),
+        )
+        .await
+        .map_err(|_| "writer status waited on the unserviced construction queue")??
+        .into_inner();
+        assert_eq!(response.phase(), WriterPhase::BulkCatchup);
+        assert_eq!(response.chain_view, None);
+        assert_eq!(response.gap_blocks, None);
+        assert_eq!(
+            response.upstream_not_ready.and_then(|detail| detail
+                .upstream_estimated_height
+                .zip(detail.upstream_committed_height)),
+            Some((9_000, 4_000))
+        );
+        Ok(())
     }
 
     #[derive(Clone)]
