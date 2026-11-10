@@ -9,6 +9,7 @@ use std::{
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
+use tracing::Instrument as _;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
     CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestVersion, ChainEpoch,
@@ -43,7 +44,7 @@ use crate::{
     SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
     TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
     TransparentAddressUnspentOutputsRequest, TreeState, UpstreamNodeCapabilities, VisibleTipBlock,
-    WalletQueryApi, WalletServingPairSlot, WalletServingReadPair, join_blocking,
+    WalletQueryApi, WalletServingPairSlot, WalletServingReadPair, serving_read,
     validate_block_range, validate_subtree_root_range,
 };
 
@@ -676,14 +677,14 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<VisibleTipBlock, QueryError> {
         let pair = self.capture_pair();
-        join_blocking(tokio::task::spawn_blocking(move || {
+        serving_read::run("visible_tip_block", pair, move |pair| {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
             Ok(VisibleTipBlock {
                 height: chain_epoch.visible_tip_height,
                 block_hash: chain_epoch.visible_tip_hash,
                 chain_epoch,
             })
-        }))
+        })
         .await
     }
 
@@ -692,14 +693,14 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<SettledTipBlock, QueryError> {
         let pair = self.capture_pair();
-        join_blocking(tokio::task::spawn_blocking(move || {
+        serving_read::run("settled_tip_block", pair, move |pair| {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
             Ok(SettledTipBlock {
                 height: chain_epoch.settled_tip_height,
                 block_hash: chain_epoch.settled_tip_hash,
                 chain_epoch,
             })
-        }))
+        })
         .await
     }
 
@@ -709,10 +710,10 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockIdAtEpoch, QueryError> {
         let pair = self.capture_pair();
-        join_blocking(tokio::task::spawn_blocking(move || {
+        serving_read::run("block_id_by_selector", pair, move |pair| {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
             Self::resolve_block_id_by_selector(&pair, selector, chain_epoch)
-        }))
+        })
         .await
     }
 
@@ -722,7 +723,7 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockHeaderAtEpoch, QueryError> {
         let pair = self.capture_pair();
-        join_blocking(tokio::task::spawn_blocking(move || {
+        serving_read::run("block_header_by_selector", pair, move |pair| {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
             let resolved = Self::resolve_block_id_by_selector(&pair, selector, chain_epoch)?;
             let block_header = pair
@@ -734,7 +735,7 @@ where
                 chain_epoch,
                 block_header,
             })
-        }))
+        })
         .await
     }
 
@@ -744,7 +745,7 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlock, QueryError> {
         let pair = self.capture_pair();
-        join_blocking(tokio::task::spawn_blocking(move || {
+        serving_read::run("compact_block_at", pair, move |pair| {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
             let compact_block = pair
                 .canonical()
@@ -754,7 +755,7 @@ where
                 chain_epoch,
                 compact_block,
             })
-        }))
+        })
         .await
     }
 
@@ -763,17 +764,20 @@ where
         block_range: zinder_core::BlockHeightRange,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockRange, QueryError> {
-        validate_block_range(block_range, DEFAULT_MAX_COMPACT_BLOCK_RANGE)?;
-        let pair = self.capture_pair();
-        join_blocking(tokio::task::spawn_blocking(move || {
-            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-            let compact_blocks = pair.canonical().compact_blocks_in_range(block_range)?;
-            Ok(CompactBlockRange {
-                chain_epoch,
-                block_range,
-                compact_blocks,
+        serving_read::record_compact_block_range(block_range.into_iter().len(), async {
+            validate_block_range(block_range, DEFAULT_MAX_COMPACT_BLOCK_RANGE)?;
+            let pair = self.capture_pair();
+            serving_read::off_reactor(pair, move |pair| {
+                let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                let compact_blocks = pair.canonical().compact_blocks_in_range(block_range)?;
+                Ok(CompactBlockRange {
+                    chain_epoch,
+                    block_range,
+                    compact_blocks,
+                })
             })
-        }))
+            .await
+        })
         .await
     }
 
@@ -783,7 +787,7 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<FullBlock, QueryError> {
         let pair = self.capture_pair();
-        join_blocking(tokio::task::spawn_blocking(move || {
+        serving_read::run("full_block_at", pair, move |pair| {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
             if !pair.canonical().raw_blob_retention().retains_block_blobs() {
                 return Err(unavailable(WALLET_READ_FULL_BLOCK_AT_V1));
@@ -796,7 +800,7 @@ where
                 chain_epoch,
                 block_blob,
             })
-        }))
+        })
         .await
     }
 
@@ -805,26 +809,27 @@ where
         block_range: BlockHeightRange,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<FullBlockStream, QueryError> {
-        validate_block_range(block_range, DEFAULT_MAX_FULL_BLOCK_RANGE)?;
-        let pair = self.capture_pair();
-        let (pair, chain_epoch) = join_blocking(tokio::task::spawn_blocking(move || {
-            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-            if !pair.canonical().raw_blob_retention().retains_block_blobs() {
-                return Err(unavailable(WALLET_READ_FULL_BLOCK_RANGE_V1));
-            }
-            Ok((pair, chain_epoch))
-        }))
-        .await?;
-        let (blocks, receiver) = mpsc::channel(FULL_BLOCK_STREAM_CHANNEL_CAPACITY);
-        tokio::spawn(drive_serving_pair_full_block_range(
-            pair,
-            block_range,
-            blocks,
-        ));
-        Ok(FullBlockStream {
-            chain_epoch,
-            blocks: receiver,
+        serving_read::record("full_blocks_in_range", async {
+            validate_block_range(block_range, DEFAULT_MAX_FULL_BLOCK_RANGE)?;
+            let pair = self.capture_pair();
+            let (pair, chain_epoch) = serving_read::off_reactor(pair, move |pair| {
+                let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                if !pair.canonical().raw_blob_retention().retains_block_blobs() {
+                    return Err(unavailable(WALLET_READ_FULL_BLOCK_RANGE_V1));
+                }
+                Ok((pair, chain_epoch))
+            })
+            .await?;
+            let (blocks, receiver) = mpsc::channel(FULL_BLOCK_STREAM_CHANNEL_CAPACITY);
+            tokio::spawn(
+                drive_serving_pair_full_block_range(pair, block_range, blocks).in_current_span(),
+            );
+            Ok(FullBlockStream {
+                chain_epoch,
+                blocks: receiver,
+            })
         })
+        .await
     }
 
     async fn transaction(
@@ -834,7 +839,7 @@ where
     ) -> Result<TransactionStatus, QueryError> {
         let pair = self.capture_pair();
         let discovered_activations = Arc::clone(&self.network_upgrade_activations);
-        join_blocking(tokio::task::spawn_blocking(move || {
+        serving_read::run("transaction_by_id", pair, move |pair| {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
             let network_upgrade_activations = admitted_activations(&pair, &discovered_activations);
             // READY admission requires transaction-location coverage to equal
@@ -871,7 +876,7 @@ where
                     raw_transaction_bytes,
                 )),
             })
-        }))
+        })
         .await
     }
 
@@ -892,7 +897,7 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<RawTransaction, QueryError> {
         let pair = self.capture_pair();
-        join_blocking(tokio::task::spawn_blocking(move || {
+        serving_read::run("raw_transaction", pair, move |pair| {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
             let location = pair
                 .canonical()
@@ -912,7 +917,7 @@ where
                 chain_epoch,
                 transaction,
             })
-        }))
+        })
         .await
     }
 
@@ -946,7 +951,7 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
         let pair = self.capture_pair();
-        join_blocking(tokio::task::spawn_blocking(move || {
+        serving_read::run("transparent_address_unspent_outputs", pair, move |pair| {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
             let mut outputs = Vec::new();
             let mut after: Option<WalletAddressUnspentOutputKey> = None;
@@ -976,7 +981,7 @@ where
                 chain_epoch,
                 outputs,
             })
-        }))
+        })
         .await
     }
 
@@ -984,52 +989,55 @@ where
         &self,
         request: TransparentAddressTxIdsInRangeRequest,
     ) -> Result<TransparentAddressTxIds, QueryError> {
-        if request.descending {
-            return Err(QueryError::MaterializedViewUnavailable {
-                capability: "descending canonical transparent history",
-            });
-        }
-        let pair = self.capture_pair();
-        join_blocking(tokio::task::spawn_blocking(move || {
-            let chain_epoch = Self::chain_epoch(&pair, None)?;
-            let after = request
-                .from_cursor
-                .as_ref()
-                .map(|cursor| TransparentHistoryCursor::resume(cursor, pair.wallet_source()))
-                .transpose()?;
-            if let Some(after) = after {
-                validate_transparent_history_cursor_key(after, &request)?;
+        serving_read::record("transparent_address_tx_ids_in_range", async {
+            if request.descending {
+                return Err(QueryError::MaterializedViewUnavailable {
+                    capability: "descending canonical transparent history",
+                });
             }
-            let page_size =
-                NonZeroU16::new(u16::try_from(request.max_entries.get()).unwrap_or(u16::MAX))
-                    .unwrap_or(NonZeroU16::MAX);
-            let page = pair.wallet().address_transaction_history_range_page(
-                request.address_script_hash,
-                BlockHeightRange::inclusive(request.start_height, request.end_height),
-                after,
-                page_size,
-            )?;
-            let artifacts = page
-                .transactions
-                .into_iter()
-                .map(|row| {
-                    TransparentAddressTxIndexArtifact::new(
-                        request.address_script_hash,
-                        row.key.block_height(),
-                        row.key.tx_index_in_block(),
-                        row.transaction_id,
-                        row.block_hash,
-                    )
+            let pair = self.capture_pair();
+            serving_read::off_reactor(pair, move |pair| {
+                let chain_epoch = Self::chain_epoch(&pair, None)?;
+                let after = request
+                    .from_cursor
+                    .as_ref()
+                    .map(|cursor| TransparentHistoryCursor::resume(cursor, pair.wallet_source()))
+                    .transpose()?;
+                if let Some(after) = after {
+                    validate_transparent_history_cursor_key(after, &request)?;
+                }
+                let page_size =
+                    NonZeroU16::new(u16::try_from(request.max_entries.get()).unwrap_or(u16::MAX))
+                        .unwrap_or(NonZeroU16::MAX);
+                let page = pair.wallet().address_transaction_history_range_page(
+                    request.address_script_hash,
+                    BlockHeightRange::inclusive(request.start_height, request.end_height),
+                    after,
+                    page_size,
+                )?;
+                let artifacts = page
+                    .transactions
+                    .into_iter()
+                    .map(|row| {
+                        TransparentAddressTxIndexArtifact::new(
+                            request.address_script_hash,
+                            row.key.block_height(),
+                            row.key.tx_index_in_block(),
+                            row.transaction_id,
+                            row.block_hash,
+                        )
+                    })
+                    .collect();
+                Ok(TransparentAddressTxIds {
+                    chain_epoch,
+                    artifacts,
+                    next_cursor: page
+                        .next_page_after
+                        .map(|key| TransparentHistoryCursor::issue(pair.wallet_source(), key)),
                 })
-                .collect();
-            Ok(TransparentAddressTxIds {
-                chain_epoch,
-                artifacts,
-                next_cursor: page
-                    .next_page_after
-                    .map(|key| TransparentHistoryCursor::issue(pair.wallet_source(), key)),
             })
-        }))
+            .await
+        })
         .await
     }
 
@@ -1038,32 +1046,35 @@ where
         addresses: Vec<TransparentAddressScriptHash>,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressBalance, QueryError> {
-        let requested_address_count = addresses.len();
-        let address_count = u32::try_from(requested_address_count)
-            .ok()
-            .filter(|count| (1..=crate::MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES).contains(count));
-        if address_count.is_none() {
-            return Err(QueryError::TransparentBalanceAddressCountExceeded {
-                requested: requested_address_count,
-                maximum: crate::MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
+        serving_read::record("transparent_address_balance", async {
+            let requested_address_count = addresses.len();
+            let address_count = u32::try_from(requested_address_count).ok().filter(|count| {
+                (1..=crate::MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES).contains(count)
             });
-        }
-        let pair = self.capture_pair();
-        join_blocking(tokio::task::spawn_blocking(move || {
-            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-            let addresses: HashSet<_> = addresses.into_iter().collect();
-            let mut confirmed_zat = 0_u64;
-            for address in &addresses {
-                confirmed_zat =
-                    confirmed_zat.saturating_add(pair.wallet().address_balance(*address)?);
+            if address_count.is_none() {
+                return Err(QueryError::TransparentBalanceAddressCountExceeded {
+                    requested: requested_address_count,
+                    maximum: crate::MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
+                });
             }
-            Ok(TransparentAddressBalance {
-                confirmed_zat,
-                unconfirmed_delta_zat: 0,
-                address_count: u32::try_from(addresses.len()).unwrap_or(u32::MAX),
-                chain_epoch,
+            let pair = self.capture_pair();
+            serving_read::off_reactor(pair, move |pair| {
+                let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                let addresses: HashSet<_> = addresses.into_iter().collect();
+                let mut confirmed_zat = 0_u64;
+                for address in &addresses {
+                    confirmed_zat =
+                        confirmed_zat.saturating_add(pair.wallet().address_balance(*address)?);
+                }
+                Ok(TransparentAddressBalance {
+                    confirmed_zat,
+                    unconfirmed_delta_zat: 0,
+                    address_count: u32::try_from(addresses.len()).unwrap_or(u32::MAX),
+                    chain_epoch,
+                })
             })
-        }))
+            .await
+        })
         .await
     }
 
@@ -1079,75 +1090,78 @@ where
         height: BlockHeight,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError> {
-        if !self
-            .native_endpoint_capabilities
-            .contains(WALLET_READ_TREE_STATE_AT_HEIGHT_V2)
-        {
-            return Err(unavailable(WALLET_READ_TREE_STATE_AT_HEIGHT_V2));
-        }
-        let pair = self.capture_pair();
-        let resolved = join_blocking(tokio::task::spawn_blocking(move || {
-            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-            let checkpoint = pair
-                .canonical()
-                .tree_state_checkpoint_at_or_before(height)?;
-            if let Some(checkpoint) =
-                checkpoint.filter(|checkpoint| checkpoint.block_id.height == height)
+        serving_read::record("tree_state_at", async {
+            if !self
+                .native_endpoint_capabilities
+                .contains(WALLET_READ_TREE_STATE_AT_HEIGHT_V2)
             {
-                return tree_state_from_checkpoint(chain_epoch, &checkpoint)
-                    .map(ResolvedTreeState::Checkpoint);
+                return Err(unavailable(WALLET_READ_TREE_STATE_AT_HEIGHT_V2));
             }
-            let block_header = pair
-                .canonical()
-                .block_header_at(height)?
-                .ok_or(QueryError::BlockNotInBestChain)?;
-            let block_time_seconds = u32::try_from(block_header.block_time).map_err(|_| {
-                QueryError::ArtifactCorrupt {
-                    family: ArtifactFamily::BlockHeader,
-                    reason: "canonical block time is outside the u32 range".to_owned(),
+            let pair = self.capture_pair();
+            let resolved = serving_read::off_reactor(pair, move |pair| {
+                let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                let checkpoint = pair
+                    .canonical()
+                    .tree_state_checkpoint_at_or_before(height)?;
+                if let Some(checkpoint) =
+                    checkpoint.filter(|checkpoint| checkpoint.block_id.height == height)
+                {
+                    return tree_state_from_checkpoint(chain_epoch, &checkpoint)
+                        .map(ResolvedTreeState::Checkpoint);
                 }
-            })?;
-            Ok(ResolvedTreeState::UpstreamFill {
-                chain_epoch,
-                block_id: BlockId::new(height, block_header.block_hash),
-                block_time_seconds,
+                let block_header = pair
+                    .canonical()
+                    .block_header_at(height)?
+                    .ok_or(QueryError::BlockNotInBestChain)?;
+                let block_time_seconds = u32::try_from(block_header.block_time).map_err(|_| {
+                    QueryError::ArtifactCorrupt {
+                        family: ArtifactFamily::BlockHeader,
+                        reason: "canonical block time is outside the u32 range".to_owned(),
+                    }
+                })?;
+                Ok(ResolvedTreeState::UpstreamFill {
+                    chain_epoch,
+                    block_id: BlockId::new(height, block_header.block_hash),
+                    block_time_seconds,
+                })
             })
-        }))
-        .await?;
-        let (chain_epoch, block_id, block_time_seconds) = match resolved {
-            ResolvedTreeState::Checkpoint(tree_state) => return Ok(tree_state),
-            ResolvedTreeState::UpstreamFill {
+            .await?;
+            let (chain_epoch, block_id, block_time_seconds) = match resolved {
+                ResolvedTreeState::Checkpoint(tree_state) => return Ok(tree_state),
+                ResolvedTreeState::UpstreamFill {
+                    chain_epoch,
+                    block_id,
+                    block_time_seconds,
+                } => (chain_epoch, block_id, block_time_seconds),
+            };
+            let upstream = self
+                .tree_state_upstream
+                .as_ref()
+                .ok_or_else(|| artifact_unavailable(ArtifactFamily::TreeState, height))?;
+            let source = upstream.fetch_tree_state_for_block(block_id).await?;
+            if source.block_id != block_id {
+                return Err(QueryError::Node(
+                    zinder_source::SourceError::SourceProtocolMismatch {
+                        reason: "tree-state source identity does not match the canonical block",
+                    },
+                ));
+            }
+            if source.block_time_seconds != block_time_seconds {
+                return Err(QueryError::Node(
+                    zinder_source::SourceError::SourceProtocolMismatch {
+                        reason: "tree-state source time does not match the canonical block",
+                    },
+                ));
+            }
+            Ok(TreeState {
                 chain_epoch,
-                block_id,
+                height,
+                block_hash: block_id.hash,
                 block_time_seconds,
-            } => (chain_epoch, block_id, block_time_seconds),
-        };
-        let upstream = self
-            .tree_state_upstream
-            .as_ref()
-            .ok_or_else(|| artifact_unavailable(ArtifactFamily::TreeState, height))?;
-        let source = upstream.fetch_tree_state_for_block(block_id).await?;
-        if source.block_id != block_id {
-            return Err(QueryError::Node(
-                zinder_source::SourceError::SourceProtocolMismatch {
-                    reason: "tree-state source identity does not match the canonical block",
-                },
-            ));
-        }
-        if source.block_time_seconds != block_time_seconds {
-            return Err(QueryError::Node(
-                zinder_source::SourceError::SourceProtocolMismatch {
-                    reason: "tree-state source time does not match the canonical block",
-                },
-            ));
-        }
-        Ok(TreeState {
-            chain_epoch,
-            height,
-            block_hash: block_id.hash,
-            block_time_seconds,
-            payload_bytes: source.payload_bytes,
+                payload_bytes: source.payload_bytes,
+            })
         })
+        .await
     }
 
     async fn latest_tree_state_checkpoint(
@@ -1155,7 +1169,7 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError> {
         let pair = self.capture_pair();
-        join_blocking(tokio::task::spawn_blocking(move || {
+        serving_read::run("latest_tree_state_checkpoint", pair, move |pair| {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
             let checkpoint = pair
                 .canonical()
@@ -1164,7 +1178,7 @@ where
                     artifact_unavailable(ArtifactFamily::TreeState, chain_epoch.visible_tip_height)
                 })?;
             tree_state_from_checkpoint(chain_epoch, &checkpoint)
-        }))
+        })
         .await
     }
 
@@ -1173,46 +1187,49 @@ where
         subtree_root_range: zinder_core::SubtreeRootRange,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<SubtreeRoots, QueryError> {
-        validate_subtree_root_range(subtree_root_range)?;
-        let pair = self.capture_pair();
-        join_blocking(tokio::task::spawn_blocking(move || {
-            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-            let completed_subtree_count = chain_epoch
-                .tip_metadata
-                .completed_subtree_count(subtree_root_range.protocol);
-            if subtree_root_range.start_index.value() >= completed_subtree_count {
-                return Ok(SubtreeRoots {
+        serving_read::record("subtree_roots_in_range", async {
+            validate_subtree_root_range(subtree_root_range)?;
+            let pair = self.capture_pair();
+            serving_read::off_reactor(pair, move |pair| {
+                let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                let completed_subtree_count = chain_epoch
+                    .tip_metadata
+                    .completed_subtree_count(subtree_root_range.protocol);
+                if subtree_root_range.start_index.value() >= completed_subtree_count {
+                    return Ok(SubtreeRoots {
+                        chain_epoch,
+                        protocol: subtree_root_range.protocol,
+                        start_index: subtree_root_range.start_index,
+                        subtree_roots: Vec::new(),
+                    });
+                }
+                let available_entries = completed_subtree_count
+                    .saturating_sub(subtree_root_range.start_index.value())
+                    .min(subtree_root_range.max_entries.get());
+                let available_entries = NonZeroU32::new(available_entries).ok_or_else(|| {
+                    QueryError::ArtifactUnavailable {
+                        family: ArtifactFamily::SubtreeRoot,
+                        key: ArtifactKey::SubtreeRootIndex {
+                            protocol: subtree_root_range.protocol,
+                            index: subtree_root_range.start_index,
+                        },
+                    }
+                })?;
+                let available_range = zinder_core::SubtreeRootRange::new(
+                    subtree_root_range.protocol,
+                    subtree_root_range.start_index,
+                    available_entries,
+                );
+                let subtree_roots = pair.canonical().subtree_roots(available_range)?;
+                Ok(SubtreeRoots {
                     chain_epoch,
                     protocol: subtree_root_range.protocol,
                     start_index: subtree_root_range.start_index,
-                    subtree_roots: Vec::new(),
-                });
-            }
-            let available_entries = completed_subtree_count
-                .saturating_sub(subtree_root_range.start_index.value())
-                .min(subtree_root_range.max_entries.get());
-            let available_entries = NonZeroU32::new(available_entries).ok_or_else(|| {
-                QueryError::ArtifactUnavailable {
-                    family: ArtifactFamily::SubtreeRoot,
-                    key: ArtifactKey::SubtreeRootIndex {
-                        protocol: subtree_root_range.protocol,
-                        index: subtree_root_range.start_index,
-                    },
-                }
-            })?;
-            let available_range = zinder_core::SubtreeRootRange::new(
-                subtree_root_range.protocol,
-                subtree_root_range.start_index,
-                available_entries,
-            );
-            let subtree_roots = pair.canonical().subtree_roots(available_range)?;
-            Ok(SubtreeRoots {
-                chain_epoch,
-                protocol: subtree_root_range.protocol,
-                start_index: subtree_root_range.start_index,
-                subtree_roots,
+                    subtree_roots,
+                })
             })
-        }))
+            .await
+        })
         .await
     }
 
@@ -1221,8 +1238,10 @@ where
         from_cursor: Option<StreamCursorTokenV1>,
         family: ChainEventStreamFamily,
     ) -> Result<ChainEvents, QueryError> {
+        // The protocol adapter records the chain-event stream; each page read
+        // here is one poll of that stream.
         let pair = self.capture_pair();
-        join_blocking(tokio::task::spawn_blocking(move || {
+        serving_read::off_reactor(pair, move |pair| {
             let event_envelopes = pair
                 .canonical()
                 .wallet_chain_event_history(ChainEventHistoryRequest::new_for_family(
@@ -1232,7 +1251,7 @@ where
                 ))
                 .map_err(map_canonical_chain_event_error)?;
             Ok(ChainEvents { event_envelopes })
-        }))
+        })
         .await
     }
 
@@ -1242,11 +1261,11 @@ where
         requested_family: ChainEventStreamFamily,
     ) -> Result<ChainEventStreamResume, QueryError> {
         let pair = self.capture_pair();
-        join_blocking(tokio::task::spawn_blocking(move || {
+        serving_read::off_reactor(pair, move |pair| {
             pair.canonical()
                 .resolve_wallet_chain_event_stream_start(&start, requested_family)
                 .map_err(map_canonical_chain_event_error)
-        }))
+        })
         .await
     }
 
@@ -1254,23 +1273,26 @@ where
         &self,
         raw_transaction: RawTransactionBytes,
     ) -> Result<zinder_core::TransactionBroadcastOutcome, QueryError> {
-        if !self
-            .native_endpoint_capabilities
-            .contains(WALLET_BROADCAST_TRANSACTION_V1)
-        {
-            return Err(unavailable(WALLET_BROADCAST_TRANSACTION_V1));
-        }
-        let _pair = self.capture_pair();
-        if raw_transaction.len() > zinder_core::MAX_RAW_TRANSACTION_BYTES {
-            return Err(QueryError::BroadcastTransactionTooLarge {
-                actual: raw_transaction.len(),
-                maximum: zinder_core::MAX_RAW_TRANSACTION_BYTES,
-            });
-        }
-        self.broadcaster
-            .broadcast_transaction(raw_transaction)
-            .await
-            .map_err(QueryError::Node)
+        serving_read::record("broadcast_transaction", async {
+            if !self
+                .native_endpoint_capabilities
+                .contains(WALLET_BROADCAST_TRANSACTION_V1)
+            {
+                return Err(unavailable(WALLET_BROADCAST_TRANSACTION_V1));
+            }
+            let _pair = self.capture_pair();
+            if raw_transaction.len() > zinder_core::MAX_RAW_TRANSACTION_BYTES {
+                return Err(QueryError::BroadcastTransactionTooLarge {
+                    actual: raw_transaction.len(),
+                    maximum: zinder_core::MAX_RAW_TRANSACTION_BYTES,
+                });
+            }
+            self.broadcaster
+                .broadcast_transaction(raw_transaction)
+                .await
+                .map_err(QueryError::Node)
+        })
+        .await
     }
 }
 
@@ -1292,25 +1314,14 @@ async fn drive_serving_pair_full_block_range(
             BlockHeight::new(sub_read_start),
             BlockHeight::new(sub_read_end),
         );
-        let pair_for_read = Arc::clone(&pair);
-        let block_blobs = match tokio::task::spawn_blocking(move || {
-            pair_for_read.canonical().block_blobs_in_range(sub_range)
+        let sub_read = serving_read::off_reactor(Arc::clone(&pair), move |pair| {
+            Ok(pair.canonical().block_blobs_in_range(sub_range)?)
         })
-        .await
-        {
-            Ok(Ok(block_blobs)) => block_blobs,
-            Ok(Err(error)) => {
-                let _ = block_sender
-                    .send(Err(QueryError::CanonicalStore(error)))
-                    .await;
-                return;
-            }
+        .await;
+        let block_blobs = match sub_read {
+            Ok(block_blobs) => block_blobs,
             Err(error) => {
-                let _ = block_sender
-                    .send(Err(QueryError::BlockingTaskFailed {
-                        reason: error.to_string(),
-                    }))
-                    .await;
+                let _ = block_sender.send(Err(error)).await;
                 return;
             }
         };

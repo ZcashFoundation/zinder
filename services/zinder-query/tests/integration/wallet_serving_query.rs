@@ -8,6 +8,7 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use parking_lot::Mutex;
+use tracing::Instrument as _;
 use zinder_core::{
     BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, ChainEpoch,
     ChainEpochId, CommitmentTreeCheckpoint, CompactBlockArtifact, Network, SubtreeRootArtifact,
@@ -41,6 +42,7 @@ async fn wallet_serving_reads_leave_the_reactor_free() -> eyre::Result<()> {
             Arc::new(GatedCanonicalReader {
                 canonical_reader,
                 reactor_gate: Arc::clone(&reactor_gate),
+                read_span_probe: Arc::default(),
             }) as Arc<dyn CanonicalReader>,
             Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
         )?)),
@@ -63,6 +65,38 @@ async fn wallet_serving_reads_leave_the_reactor_free() -> eyre::Result<()> {
         reactor_gate.observed_reactor_progress(),
         "the canonical read held the reactor for its whole duration"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn wallet_serving_reads_run_inside_the_request_span() -> eyre::Result<()> {
+    tracing::subscriber::set_global_default(tracing_subscriber::registry())?;
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let mut store_fixture = WalletServingStoreFixture::from_chain(
+        &ChainFixture::new(Network::ZcashRegtest).extend_blocks(2),
+        activations.as_ref(),
+    )?;
+    let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
+    let read_span_probe = Arc::new(ReadSpanProbe::default());
+    let query = WalletServingQuery::from_serving_pair_slot(
+        WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
+            Arc::new(GatedCanonicalReader {
+                canonical_reader,
+                reactor_gate: Arc::default(),
+                read_span_probe: Arc::clone(&read_span_probe),
+            }) as Arc<dyn CanonicalReader>,
+            Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
+        )?)),
+        (),
+        Arc::clone(&activations),
+    );
+
+    query
+        .visible_tip_block(None)
+        .instrument(tracing::info_span!("wallet_request"))
+        .await?;
+
+    assert_eq!(read_span_probe.last_read_span(), Some("wallet_request"));
     Ok(())
 }
 
@@ -150,10 +184,29 @@ impl ReactorGate {
     }
 }
 
+/// Span that was current on the thread running the latest canonical epoch read.
+#[derive(Default)]
+struct ReadSpanProbe {
+    last_read_span: Mutex<Option<&'static str>>,
+}
+
+impl ReadSpanProbe {
+    fn observe(&self) {
+        *self.last_read_span.lock() = tracing::Span::current()
+            .metadata()
+            .map(tracing::Metadata::name);
+    }
+
+    fn last_read_span(&self) -> Option<&'static str> {
+        *self.last_read_span.lock()
+    }
+}
+
 /// Canonical reader whose epoch read blocks until the reactor makes progress.
 struct GatedCanonicalReader {
     canonical_reader: zinder_store::RocksDbCanonicalSecondary,
     reactor_gate: Arc<ReactorGate>,
+    read_span_probe: Arc<ReadSpanProbe>,
 }
 
 impl CanonicalReader for GatedCanonicalReader {
@@ -175,6 +228,7 @@ impl CanonicalReader for GatedCanonicalReader {
 
     fn chain_epoch(&self) -> Result<ChainEpoch, CanonicalStoreError> {
         self.reactor_gate.wait_for_reactor_progress();
+        self.read_span_probe.observe();
         self.canonical_reader.chain_epoch()
     }
 

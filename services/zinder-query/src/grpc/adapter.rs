@@ -743,10 +743,7 @@ where
         request: Request<wallet::TransparentAddressBalanceRequest>,
     ) -> Result<Response<wallet::TransparentAddressBalanceResponse>, Status> {
         self.require_endpoint_capability(capabilities::WALLET_ADDRESS_TRANSPARENT_BALANCE_V1)?;
-        let started_at = Instant::now();
-        let outcome = self.compute_transparent_address_balance(request).await;
-        record_proxy_outcome("transparent_address_balance", started_at, &outcome);
-        outcome
+        self.compute_transparent_address_balance(request).await
     }
 
     async fn transparent_utxo_set_summary(

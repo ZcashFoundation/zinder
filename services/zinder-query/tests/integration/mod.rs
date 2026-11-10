@@ -3,6 +3,7 @@ mod compact_block_range;
 mod full_block_range;
 mod native_grpc;
 mod node_backed_capabilities;
+mod query_request_metrics;
 mod reflection;
 mod single_artifact_lookup;
 mod stream_cancellation;
