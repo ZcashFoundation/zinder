@@ -290,6 +290,8 @@ impl CanonicalWriterFixture {
     ///
     /// `replacement_chain` must share the block below `first_replaced_height`
     /// with the store, as a fork built with [`ChainFixture::fork_at`] does.
+    /// Every displaced block must start with a coinbase, such as
+    /// [`FixtureTransactionRows::coinbase`], because the store archives it.
     ///
     /// # Errors
     ///

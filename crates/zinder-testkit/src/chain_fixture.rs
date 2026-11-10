@@ -180,6 +180,28 @@ impl FixtureTransactionRows {
         }
     }
 
+    /// Builds canonical rows for a synthetic coinbase at block index 0.
+    ///
+    /// A live replacement archives every block it displaces, and the archive
+    /// requires the displaced block's first transaction to be its only coinbase.
+    #[must_use]
+    pub fn coinbase(
+        transaction_id: TransactionId,
+        block_height: BlockHeight,
+        block_hash: BlockHash,
+        raw_transaction_bytes: impl Into<Vec<u8>>,
+    ) -> Self {
+        let mut rows = Self::from_raw_transaction(
+            transaction_id,
+            block_height,
+            block_hash,
+            0,
+            raw_transaction_bytes,
+        );
+        rows.facts.public_facts.is_coinbase = true;
+        rows
+    }
+
     /// Builds canonical rows for a transaction whose raw bytes are unavailable.
     #[must_use]
     pub fn from_public_facts(

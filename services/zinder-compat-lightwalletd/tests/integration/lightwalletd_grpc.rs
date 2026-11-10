@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::{Code, Request, transport::Server};
+use tonic::{Code, Request, Status, transport::Server};
 use zebra_chain::{
     parameters::NetworkKind as ZebraNetworkKind, transparent::Address as ZebraTransparentAddress,
 };
@@ -17,14 +17,16 @@ use zinder_compat_lightwalletd::LightwalletdGrpcAdapter;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, BlockSelector, BroadcastDuplicate,
     BroadcastInvalidEncoding, BroadcastRejected, BroadcastRejectionReason, BroadcastUnknown,
-    ChainEpochId, CompactBlockArtifact, CompactChainMetadata, CompactSaplingOutput,
-    CompactSaplingSpend, CompactShieldedAction, CompactTransaction, CompactTransactionData,
-    Network, NetworkUpgradeActivations, RawTransactionBytes, SubtreeRootRange,
+    ChainEpochId, CommitmentTreeFrontiers, CompactBlockArtifact, CompactChainMetadata,
+    CompactSaplingOutput, CompactSaplingSpend, CompactShieldedAction, CompactTransaction,
+    CompactTransactionData, Network, NetworkUpgradeActivations, RawTransactionBytes,
+    SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
     TransactionBroadcastOutcome, TransactionComponentCounts, TransactionId, TransactionLocation,
     TransparentAddressBalance, TransparentAddressScriptHash, TransparentOutPoint,
     TransparentOutputsByOutpointResponse, TransparentSpendFact,
     TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
     TransparentUnspentOutputsByOutpointResponse, TransparentUtxoSetSummary,
+    wire::encode_internal_block_hash,
 };
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
@@ -44,12 +46,14 @@ use zinder_source::{
     TransactionBroadcaster, TreeStateUpstream,
 };
 use zinder_store::{
-    ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition, RawBlobRetention,
-    StreamCursorTokenV1,
+    CanonicalBuildSubtreeRoot, ChainEventStreamFamily, ChainEventStreamResume,
+    EventStreamStartPosition, RawBlobRetention, StreamCursorTokenV1,
 };
 use zinder_testkit::{
-    ChainFixture, FixtureTransactionRows, MockTransactionBroadcaster, WalletServingStoreFixture,
-    sample_regtest_upgrade_activations, synthetic_transaction_public_facts,
+    CanonicalBaseline, CanonicalWriterFixture, ChainFixture, FIXTURE_NOTE_COMMITMENT, FixtureBlock,
+    FixtureTransactionRows, MockTransactionBroadcaster, WalletServingStoreFixture,
+    completed_subtree_frontier, one_leaf_frontier, sample_regtest_upgrade_activations,
+    synthetic_transaction_public_facts,
 };
 
 const ACCEPTANCE_BLOCK_HEIGHT: BlockHeight = BlockHeight::new(1);
@@ -1807,6 +1811,485 @@ fn transaction_rows_without_blob(
     )
 }
 
+// Release history that one complete baseline cannot express: completed
+// subtrees, checkpointed history floors, and blocks a live replacement
+// displaced. Each store is built through the production canonical writer.
+
+const FLOOR_HEIGHT: BlockHeight = BlockHeight::new(1);
+const FIRST_RETAINED_HEIGHT: BlockHeight = BlockHeight::new(2);
+
+#[tokio::test]
+async fn get_subtree_roots_serves_non_empty_orchard_and_ironwood() -> eyre::Result<()> {
+    let activations = sample_regtest_upgrade_activations();
+    let completing_height = activations
+        .activation_height_by_name(ShieldedProtocol::Ironwood.activation_upgrade_name())
+        .ok_or_else(|| eyre!("regtest activations must activate Ironwood"))?;
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(completing_height.value());
+    let completing_block = fixture_block(&chain, completing_height)?;
+    let chain = chain
+        .with_compact_block_artifact(CompactBlockArtifact::empty(
+            BlockId::new(completing_block.height, completing_block.hash),
+            completing_block.parent_hash,
+            completing_block.block_time_seconds,
+            CompactChainMetadata {
+                sapling_commitment_tree_size: SUBTREE_LEAF_COUNT,
+                orchard_commitment_tree_size: SUBTREE_LEAF_COUNT,
+                ironwood_commitment_tree_size: SUBTREE_LEAF_COUNT,
+            },
+        ))
+        .with_commitment_tree_frontiers_at(
+            completing_height,
+            CommitmentTreeFrontiers::from_validated_parts(
+                Some(completed_subtree_frontier(ShieldedProtocol::Sapling)?),
+                Some(completed_subtree_frontier(ShieldedProtocol::Orchard)?),
+                Some(completed_subtree_frontier(ShieldedProtocol::Ironwood)?),
+            ),
+        );
+    let mut baseline = CanonicalBaseline::new(&chain);
+    for (protocol, root_byte) in [
+        (ShieldedProtocol::Sapling, 0x17),
+        (ShieldedProtocol::Orchard, 0x18),
+        (ShieldedProtocol::Ironwood, 0x19),
+    ] {
+        baseline = baseline.with_subtree_root(CanonicalBuildSubtreeRoot {
+            protocol,
+            subtree_index: SubtreeRootIndex::new(0),
+            root_hash: SubtreeRootHash::from_bytes([root_byte; 32]),
+            completing_block_height: completing_height,
+        });
+    }
+    let store =
+        acceptance_store_from_writer(CanonicalWriterFixture::publish(&baseline, &activations)?)?;
+    let adapter = acceptance_adapter(&store);
+
+    for (protocol, root_byte) in [
+        (lightwalletd::ShieldedProtocol::Orchard, 0x18),
+        (lightwalletd::ShieldedProtocol::Ironwood, 0x19),
+    ] {
+        let roots = collect_stream(
+            adapter
+                .get_subtree_roots(Request::new(lightwalletd::GetSubtreeRootsArg {
+                    start_index: 0,
+                    shielded_protocol: protocol as i32,
+                    max_entries: 1,
+                }))
+                .await?
+                .into_inner(),
+        )
+        .await?;
+
+        assert_eq!(roots.len(), 1, "{protocol:?} must serve its completed root");
+        let root = roots
+            .first()
+            .ok_or_else(|| eyre!("{protocol:?} root missing"))?;
+        assert_eq!(root.root_hash, vec![root_byte; 32]);
+        assert_eq!(
+            root.completing_block_hash,
+            encode_internal_block_hash(completing_block.hash).to_vec()
+        );
+        assert_eq!(
+            root.completing_block_height,
+            u64::from(completing_height.value())
+        );
+    }
+
+    Ok(())
+}
+
+/// A checkpointed store holds nothing at or below its history floor except
+/// the floor's authenticated tree state.
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the retained-history floor contract is a cross-RPC lightwalletd compatibility claim"
+)]
+async fn retained_history_floor_unavailable_artifacts_return_not_found() -> eyre::Result<()> {
+    let store = acceptance_store_from_writer(floor_with_completed_subtree_writer()?)?;
+    let adapter = acceptance_adapter(&store);
+    let floor = || lightwalletd::BlockId {
+        height: u64::from(FLOOR_HEIGHT.value()),
+        hash: Vec::new(),
+    };
+    let floor_range = || lightwalletd::BlockRange {
+        start: Some(floor()),
+        end: Some(floor()),
+        pool_types: Vec::new(),
+    };
+
+    let mut observed = Vec::new();
+    observed.push((
+        "GetBlock",
+        adapter.get_block(Request::new(floor())).await.err(),
+    ));
+    observed.push((
+        "GetBlockNullifiers",
+        adapter
+            .get_block_nullifiers(Request::new(floor()))
+            .await
+            .err(),
+    ));
+    observed.push((
+        "GetBlockRange",
+        first_stream_status(adapter.get_block_range(Request::new(floor_range())).await).await,
+    ));
+    observed.push((
+        "GetBlockRangeNullifiers",
+        first_stream_status(
+            adapter
+                .get_block_range_nullifiers(Request::new(floor_range()))
+                .await,
+        )
+        .await,
+    ));
+    observed.push((
+        "GetSubtreeRoots",
+        first_stream_status(
+            adapter
+                .get_subtree_roots(Request::new(lightwalletd::GetSubtreeRootsArg {
+                    start_index: 0,
+                    shielded_protocol: lightwalletd::ShieldedProtocol::Sapling as i32,
+                    max_entries: 1,
+                }))
+                .await,
+        )
+        .await,
+    ));
+    let mismatches = observed
+        .into_iter()
+        .filter_map(|(method, status)| match status {
+            Some(status) if status.code() == Code::NotFound => None,
+            Some(status) => Some(format!(
+                "{method}: expected NotFound, observed {:?} \"{}\"",
+                status.code(),
+                status.message()
+            )),
+            None => Some(format!("{method}: expected NotFound, observed a response")),
+        })
+        .collect::<Vec<_>>();
+    if !mismatches.is_empty() {
+        return Err(eyre!(mismatches.join("\n")));
+    }
+
+    let floor_tree_state = adapter
+        .get_tree_state(Request::new(floor()))
+        .await?
+        .into_inner();
+    assert_eq!(floor_tree_state.height, u64::from(FLOOR_HEIGHT.value()));
+    assert_eq!(
+        floor_tree_state.sapling_tree,
+        hex::encode(completed_subtree_frontier(ShieldedProtocol::Sapling)?.final_state_bytes())
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn compact_block_methods_serve_first_block_above_retained_history_floor() -> eyre::Result<()>
+{
+    let (writer, chain) = first_block_above_floor_writer()?;
+    let store = acceptance_store_from_writer(writer)?;
+    let adapter = acceptance_adapter(&store);
+    let retained_block = fixture_block(&chain, FIRST_RETAINED_HEIGHT)?;
+    let retained_height = u64::from(FIRST_RETAINED_HEIGHT.value());
+    let retained_id = || lightwalletd::BlockId {
+        height: retained_height,
+        hash: Vec::new(),
+    };
+
+    let block = adapter
+        .get_block(Request::new(retained_id()))
+        .await?
+        .into_inner();
+    let ranged_blocks = collect_stream(
+        adapter
+            .get_block_range(Request::new(lightwalletd::BlockRange {
+                start: Some(retained_id()),
+                end: Some(retained_id()),
+                pool_types: Vec::new(),
+            }))
+            .await?
+            .into_inner(),
+    )
+    .await?;
+
+    assert_eq!(block.height, retained_height);
+    assert_eq!(
+        block.hash,
+        encode_internal_block_hash(retained_block.hash).to_vec()
+    );
+    assert_eq!(
+        block.prev_hash,
+        encode_internal_block_hash(retained_block.parent_hash).to_vec()
+    );
+    assert_eq!(
+        block.chain_metadata,
+        Some(lightwalletd::ChainMetadata {
+            sapling_commitment_tree_size: 1,
+            orchard_commitment_tree_size: 1,
+            ironwood_commitment_tree_size: 0,
+        })
+    );
+    let transaction = block
+        .vtx
+        .first()
+        .ok_or_else(|| eyre!("retained block must carry its shielded transaction"))?;
+    assert_eq!(
+        transaction
+            .outputs
+            .iter()
+            .map(|output| output.cmu.clone())
+            .collect::<Vec<_>>(),
+        vec![FIXTURE_NOTE_COMMITMENT.to_vec()]
+    );
+    assert_eq!(
+        transaction
+            .actions
+            .iter()
+            .map(|action| action.cmx.clone())
+            .collect::<Vec<_>>(),
+        vec![FIXTURE_NOTE_COMMITMENT.to_vec()]
+    );
+    assert_eq!(ranged_blocks, vec![block]);
+
+    Ok(())
+}
+
+/// Tree states are derived from the typed frontiers the writer accumulated
+/// from the retained block's note commitments.
+#[tokio::test]
+async fn tree_state_methods_serve_first_checkpoint_above_retained_history_floor() -> eyre::Result<()>
+{
+    let (writer, _chain) = first_block_above_floor_writer()?;
+    let store = acceptance_store_from_writer(writer)?;
+    let adapter = acceptance_adapter(&store);
+    let retained_height = u64::from(FIRST_RETAINED_HEIGHT.value());
+
+    let tree_state = adapter
+        .get_tree_state(Request::new(lightwalletd::BlockId {
+            height: retained_height,
+            hash: Vec::new(),
+        }))
+        .await?
+        .into_inner();
+    let latest_tree_state = adapter
+        .get_latest_tree_state(Request::new(lightwalletd::Empty {}))
+        .await?
+        .into_inner();
+
+    assert_eq!(tree_state.height, retained_height);
+    assert_eq!(
+        tree_state.sapling_tree,
+        hex::encode(one_leaf_frontier(ShieldedProtocol::Sapling)?.final_state_bytes())
+    );
+    assert_eq!(
+        tree_state.orchard_tree,
+        hex::encode(one_leaf_frontier(ShieldedProtocol::Orchard)?.final_state_bytes())
+    );
+    assert_eq!(tree_state.ironwood_tree, "");
+    assert_eq!(latest_tree_state, tree_state);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_transaction_returns_not_found_after_reorg_invalidates_transaction() -> eyre::Result<()>
+{
+    let transaction_id = TransactionId::from_bytes([0x33; 32]);
+    let reorged_height = BlockHeight::new(2);
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(2);
+    let reorged_block = fixture_block(&chain, reorged_height)?;
+    let chain = chain
+        .with_transaction_rows(FixtureTransactionRows::coinbase(
+            TransactionId::from_bytes([0x32; 32]),
+            reorged_block.height,
+            reorged_block.hash,
+            b"raw-reorged-coinbase".to_vec(),
+        ))
+        .with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
+            transaction_id,
+            reorged_block.height,
+            reorged_block.hash,
+            1,
+            b"raw-reorged-transaction".to_vec(),
+        ));
+    let replacement_chain = chain.fork_at(reorged_height)?.extend_blocks(1);
+    let replacement_block = fixture_block(&replacement_chain, reorged_height)?;
+    let mut writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain).with_settled_tip(BlockHeight::new(1)),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let transaction_filter = || lightwalletd::TxFilter {
+        block: None,
+        index: 0,
+        hash: transaction_id.as_bytes().to_vec(),
+    };
+
+    let before_reorg = AcceptanceStore::from_store_fixture(
+        writer.serving_store_fixture()?,
+        CompatNode::read_only(writer.canonical_primary()?.event_fence().visible_tip())?,
+    )?;
+    let served = acceptance_adapter(&before_reorg)
+        .get_transaction(Request::new(transaction_filter()))
+        .await?
+        .into_inner();
+    assert_eq!(served.height, u64::from(reorged_height.value()));
+    assert_eq!(served.data, b"raw-reorged-transaction".to_vec());
+
+    writer.replace_live_blocks(&replacement_chain, reorged_height)?;
+    let after_reorg = acceptance_store_from_writer(writer)?;
+    let adapter = acceptance_adapter(&after_reorg);
+    let status = match adapter
+        .get_transaction(Request::new(transaction_filter()))
+        .await
+    {
+        Ok(response) => {
+            return Err(eyre!(
+                "expected reorged transaction to disappear, got {response:?}"
+            ));
+        }
+        Err(status) => status,
+    };
+    let replacement = adapter
+        .get_block(Request::new(lightwalletd::BlockId {
+            height: u64::from(reorged_height.value()),
+            hash: Vec::new(),
+        }))
+        .await?
+        .into_inner();
+
+    assert_eq!(status.code(), Code::NotFound);
+    assert_eq!(
+        replacement.hash,
+        encode_internal_block_hash(replacement_block.hash).to_vec()
+    );
+
+    Ok(())
+}
+
+/// Checkpointed history whose floor already completed one Sapling subtree,
+/// with one retained block that adds no note commitments.
+fn floor_with_completed_subtree_writer() -> eyre::Result<CanonicalWriterFixture> {
+    let completed_tree = CompactChainMetadata {
+        sapling_commitment_tree_size: SUBTREE_LEAF_COUNT,
+        orchard_commitment_tree_size: 0,
+        ironwood_commitment_tree_size: 0,
+    };
+    let mut chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    for block in chain.blocks().to_vec() {
+        chain = chain.with_compact_block_artifact(CompactBlockArtifact::empty(
+            BlockId::new(block.height, block.hash),
+            canonical_parent_hash(&block),
+            block.block_time_seconds,
+            completed_tree,
+        ));
+    }
+    let chain = chain.with_commitment_tree_frontiers_at(
+        FLOOR_HEIGHT,
+        CommitmentTreeFrontiers::from_validated_parts(
+            Some(completed_subtree_frontier(ShieldedProtocol::Sapling)?),
+            None,
+            None,
+        ),
+    );
+    CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain).with_history_floor(FLOOR_HEIGHT),
+        &sample_regtest_upgrade_activations(),
+    )
+}
+
+/// Checkpointed history whose first retained block appends one Sapling and
+/// one Orchard note commitment to empty trees.
+fn first_block_above_floor_writer() -> eyre::Result<(CanonicalWriterFixture, ChainFixture)> {
+    let transaction_id = TransactionId::from_bytes([0x52; 32]);
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let retained_block = fixture_block(&chain, FIRST_RETAINED_HEIGHT)?;
+    let mut transaction_rows = FixtureTransactionRows::from_raw_transaction(
+        transaction_id,
+        retained_block.height,
+        retained_block.hash,
+        0,
+        b"retained-shielded-transaction".to_vec(),
+    );
+    transaction_rows.facts.public_facts.counts = TransactionComponentCounts {
+        sapling_output_count: 1,
+        orchard_action_count: 1,
+        ..TransactionComponentCounts::EMPTY
+    };
+    let compact_block = CompactBlockArtifact::new(
+        BlockId::new(retained_block.height, retained_block.hash),
+        retained_block.parent_hash,
+        retained_block.block_time_seconds,
+        vec![CompactTransaction {
+            index: 0,
+            transaction_id,
+            data: CompactTransactionData {
+                sapling_outputs: vec![CompactSaplingOutput {
+                    commitment: FIXTURE_NOTE_COMMITMENT,
+                    ephemeral_key: [0x22; 32],
+                    ciphertext: [0x33; 52],
+                }],
+                orchard_actions: vec![CompactShieldedAction {
+                    nullifier: [0x44; 32],
+                    commitment: FIXTURE_NOTE_COMMITMENT,
+                    ephemeral_key: [0x55; 32],
+                    ciphertext: [0x66; 52],
+                }],
+                ..CompactTransactionData::default()
+            },
+        }],
+        CompactChainMetadata {
+            sapling_commitment_tree_size: 1,
+            orchard_commitment_tree_size: 1,
+            ironwood_commitment_tree_size: 0,
+        },
+    )?;
+    let chain = chain
+        .with_transaction_rows(transaction_rows)
+        .with_compact_block_artifact(compact_block);
+    let writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain).with_history_floor(FLOOR_HEIGHT),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    Ok((writer, chain))
+}
+
+fn fixture_block(chain: &ChainFixture, height: BlockHeight) -> eyre::Result<FixtureBlock> {
+    chain
+        .block_at(height)
+        .cloned()
+        .ok_or_else(|| eyre!("fixture must contain height {}", height.value()))
+}
+
+/// The parent the canonical store records for `block`: the network's genesis
+/// block below height 1.
+fn canonical_parent_hash(block: &FixtureBlock) -> zinder_core::BlockHash {
+    if block.height == BlockHeight::new(1) {
+        Network::ZcashRegtest.genesis_hash()
+    } else {
+        block.parent_hash
+    }
+}
+
+/// Returns the status a streaming call reports, at the call or in its stream.
+async fn first_stream_status<T, Stream>(
+    outcome: Result<tonic::Response<Stream>, Status>,
+) -> Option<Status>
+where
+    Stream: tokio_stream::Stream<Item = Result<T, Status>> + Unpin,
+{
+    match outcome {
+        Err(status) => Some(status),
+        Ok(response) => collect_stream(response.into_inner()).await.err(),
+    }
+}
+/// Serves the writer's final fence through the compatibility composition.
+fn acceptance_store_from_writer(writer: CanonicalWriterFixture) -> eyre::Result<AcceptanceStore> {
+    let node = CompatNode::read_only(writer.canonical_primary()?.event_fence().visible_tip())?;
+    AcceptanceStore::from_store_fixture(writer.into_serving_store_fixture()?, node)
+}
+
 /// Exact production serving pair queried through a probed node double.
 struct AcceptanceStore {
     query: WalletServingQuery<CompatNode>,
@@ -1815,8 +2298,17 @@ struct AcceptanceStore {
 
 impl AcceptanceStore {
     fn from_chain(chain: &ChainFixture, node: CompatNode) -> eyre::Result<Self> {
+        Self::from_store_fixture(
+            WalletServingStoreFixture::from_chain(chain, &sample_regtest_upgrade_activations())?,
+            node,
+        )
+    }
+
+    fn from_store_fixture(
+        mut store_fixture: WalletServingStoreFixture,
+        node: CompatNode,
+    ) -> eyre::Result<Self> {
         let activations = Arc::new(sample_regtest_upgrade_activations());
-        let mut store_fixture = WalletServingStoreFixture::from_chain(chain, &activations)?;
         let (canonical, wallet) = store_fixture.take_readers()?;
         let query = WalletServingQuery::from_probed_node_source(
             WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(

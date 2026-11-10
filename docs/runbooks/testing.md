@@ -998,7 +998,8 @@ in the default validation gate. It:
 2. Connects through the generated `CompactTxStreamerClient` to exercise the
    protocol transport directly.
 3. Calls `GetBlockRange`, decodes every compact block, asserts `vtx`/`txid`
-   alignment with stored transaction artifacts.
+   alignment with stored transaction artifacts, and asserts the advertised
+   Sapling tree size grows with each block's note commitment.
 4. Asserts no key material appears in any client→server payload.
 
 This is a deterministic generic lightwalletd scan contract, not current SDK or

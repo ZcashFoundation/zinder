@@ -91,6 +91,11 @@ or a height below the retained floor, returns `NOT_FOUND`. Neither case returns
 `UNAVAILABLE`, which reports a storage or dependency outage. A compact block
 missing inside retained history is store damage and returns `UNAVAILABLE`.
 
+Canonical history never retains height 0. A complete build takes the network's
+genesis block as its authenticated predecessor and retains blocks from height
+1, so no compact block exists at height 0, and a block or range read that
+requests it returns `NOT_FOUND`.
+
 ## Certification work
 
 1. Keep the protocol pin and generated-client coverage green. Updating the
