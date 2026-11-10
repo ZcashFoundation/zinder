@@ -4,7 +4,7 @@
 //! the restricted protocol adapter. No compact-only topology type crosses the
 //! binary boundary.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
@@ -20,16 +20,18 @@ use zinder_core::{
 use zinder_proto::{
     compat::lightwalletd::{self, compact_tx_streamer_server},
     v1::ingest::{
-        CanonicalWriterStatusRequest, CanonicalWriterStatusResponse,
+        CanonicalWriterFence, CanonicalWriterStatusRequest, CanonicalWriterStatusResponse,
         canonical_control_client::CanonicalControlClient,
     },
     wire::decode_canonical_network_upgrade_schedule,
 };
 use zinder_query::{DEFAULT_MAX_COMPACT_BLOCK_RANGE, QueryError, status_from_query_error};
 use zinder_runtime::{
-    AuthenticatedChannel, BearerToken, ConfigError, NodeUnavailableDetail, Readiness,
-    ReadinessCause, ReadinessState, UpstreamHealth, UpstreamNotReadyDetail, WriterAttestation,
-    connect_zinder_grpc,
+    AuthenticatedChannel, BearerToken, CanonicalFenceConvergence, CanonicalFenceConvergenceError,
+    CanonicalFenceConvergencePolicy, CanonicalFenceProbe, CanonicalFenceRelation, ConfigError,
+    NodeUnavailableDetail, Readiness, ReadinessCause, ReadinessState, UpstreamHealth,
+    UpstreamNotReadyDetail, WriterAttestation, classify_canonical_writer_fence,
+    connect_zinder_grpc, converge_on_canonical_writer_fence, expected_writer_fence,
 };
 use zinder_source::{NodeCapability, NodeSource};
 use zinder_store::{
@@ -43,6 +45,7 @@ type GrpcStream<T> = std::pin::Pin<
 
 const GENERATION_COUNT: usize = 2;
 const RANGE_CHANNEL_CAPACITY: usize = 8;
+const CONVERGENCE_RETRY_DELAY_CAP: Duration = Duration::from_millis(100);
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CompactBlockServingError {
@@ -60,42 +63,10 @@ enum ConvergenceFailure {
     WriterStatusTransport(String),
     #[error("writer is ahead of the candidate secondary")]
     WriterAhead,
-    #[error("writer status is behind or invalid for the candidate secondary")]
-    WriterBehindOrInvalid,
-    #[error("writer fence disagrees with a same-epoch candidate")]
-    SameEpochMismatch,
+    #[error("writer fence diverged from the candidate secondary")]
+    WriterFenceDiverged,
     #[error("candidate storage failed: {0}")]
     Storage(CompactBlockServingError),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WriterFenceRelation {
-    Exact,
-    Ahead(u64),
-    BehindOrInvalid,
-    SameEpochMismatch,
-}
-
-fn classify_writer_fence(
-    status: &CanonicalWriterStatusResponse,
-    expected_network: Network,
-    active_epoch: u64,
-    same_epoch_exact: bool,
-) -> WriterFenceRelation {
-    if status.network_name != zinder_core::wire::encode_zinder_native_chain_name(expected_network) {
-        return WriterFenceRelation::BehindOrInvalid;
-    }
-    let Some(fence) = status.fence.as_ref() else {
-        return WriterFenceRelation::BehindOrInvalid;
-    };
-    match fence.chain_epoch_id.cmp(&active_epoch) {
-        std::cmp::Ordering::Less => WriterFenceRelation::BehindOrInvalid,
-        std::cmp::Ordering::Equal if same_epoch_exact => WriterFenceRelation::Exact,
-        std::cmp::Ordering::Equal => WriterFenceRelation::SameEpochMismatch,
-        std::cmp::Ordering::Greater => {
-            WriterFenceRelation::Ahead(fence.chain_epoch_id - active_epoch)
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -350,41 +321,33 @@ impl CompactBlockPublisher {
             self.readiness.publish_storage(refusal);
             return;
         }
-        let active_epoch = active.event_fence().chain_epoch_id().value();
-        let relation = classify_writer_fence(
+        let behind = match classify_canonical_writer_fence(
             &status,
             self.config.network,
-            active_epoch,
-            attest(&status, active.as_ref(), self.config.network).is_ok(),
-        );
-        if matches!(
-            relation,
-            WriterFenceRelation::BehindOrInvalid | WriterFenceRelation::SameEpochMismatch
+            &expected_writer_fence(active.event_fence()),
         ) {
-            self.record_failure(
-                ReadinessCause::SchemaMismatch,
-                active.event_fence().visible_tip().height.value(),
-            );
-            return;
-        }
-        if relation == WriterFenceRelation::Exact {
-            self.writer_attestation.attest();
-            self.readiness.publish_storage(ReadinessState::ready(Some(
-                active.event_fence().visible_tip().height.value(),
-            )));
-            return;
-        }
-        let WriterFenceRelation::Ahead(lag) = relation else {
-            return;
+            CanonicalFenceRelation::Diverged(_) => {
+                self.record_failure(
+                    ReadinessCause::SchemaMismatch,
+                    active.event_fence().visible_tip().height.value(),
+                );
+                return;
+            }
+            CanonicalFenceRelation::Matches => {
+                self.writer_attestation.attest();
+                self.readiness.publish_storage(ReadinessState::ready(Some(
+                    active.event_fence().visible_tip().height.value(),
+                )));
+                return;
+            }
+            CanonicalFenceRelation::SecondaryBehind(behind) => behind,
         };
-        let Some(fence) = status.fence.as_ref() else {
-            return;
-        };
+        let lag = behind.lag_chain_epochs;
         if lag <= self.config.lag_threshold {
             self.readiness
                 .publish_storage(ReadinessState::ready_with_target(
                     Some(active.event_fence().visible_tip().height.value()),
-                    Some(fence.visible_tip_height),
+                    Some(behind.writer_visible_tip_height),
                 ));
         } else if let Some(staleness) = self.writer_attestation.stale_allowance() {
             self.readiness
@@ -475,10 +438,7 @@ impl CompactBlockPublisher {
                     self.record_failure(cause, active.event_fence().visible_tip().height.value());
                     return;
                 }
-                Err(
-                    ConvergenceFailure::WriterBehindOrInvalid
-                    | ConvergenceFailure::SameEpochMismatch,
-                ) => {
+                Err(ConvergenceFailure::WriterFenceDiverged) => {
                     self.record_failure(
                         ReadinessCause::SchemaMismatch,
                         active.event_fence().visible_tip().height.value(),
@@ -597,27 +557,36 @@ async fn catch_up_generation(
     )
 }
 
-fn attest(
-    status: &CanonicalWriterStatusResponse,
-    reader: &RocksDbCanonicalSecondary,
-    network: Network,
-) -> Result<(), Status> {
-    let Some(fence) = status.fence.as_ref() else {
-        return Err(Status::failed_precondition("writer status has no fence"));
-    };
-    let local = reader.event_fence();
-    if status.network_name != zinder_core::wire::encode_zinder_native_chain_name(network)
-        || fence.chain_epoch_id != local.chain_epoch_id().value()
-        || fence.event_sequence != local.chain_event_sequence()
-        || fence.visible_tip_height != local.visible_tip().height.value()
-        || fence.visible_tip_hash != local.visible_tip().hash.as_bytes()
-        || fence.canonical_sequence_digest != local.sequence_digest().as_bytes()
-    {
-        return Err(Status::failed_precondition(
-            "writer status does not attest the compact-block reader",
-        ));
+struct CandidateFenceProbe<'a> {
+    writer_status: &'a mut WriterStatus,
+    candidate: Option<RocksDbCanonicalSecondary>,
+}
+
+impl CanonicalFenceProbe for CandidateFenceProbe<'_> {
+    type Error = ConvergenceFailure;
+
+    async fn catch_up(&mut self) -> Result<Option<CanonicalWriterFence>, ConvergenceFailure> {
+        let candidate = self.candidate.take().ok_or_else(candidate_unavailable)?;
+        let candidate = catch_up_generation(candidate)
+            .await
+            .map_err(ConvergenceFailure::Storage)?;
+        let fence = expected_writer_fence(candidate.event_fence());
+        self.candidate = Some(candidate);
+        Ok(Some(fence))
     }
-    Ok(())
+
+    async fn writer_status(&mut self) -> Result<CanonicalWriterStatusResponse, ConvergenceFailure> {
+        self.writer_status
+            .fetch()
+            .await
+            .map_err(|error| ConvergenceFailure::WriterStatusTransport(error.message().to_owned()))
+    }
+}
+
+fn candidate_unavailable() -> ConvergenceFailure {
+    ConvergenceFailure::Storage(CompactBlockServingError::Runtime(
+        "compact-block candidate is unavailable".to_owned(),
+    ))
 }
 
 /// Converges `candidate` on the writer fence and returns it with the writer
@@ -625,39 +594,39 @@ fn attest(
 async fn converge_candidate(
     writer_status: &mut WriterStatus,
     config: &CompactBlockServingConfig,
-    mut candidate: RocksDbCanonicalSecondary,
+    candidate: RocksDbCanonicalSecondary,
 ) -> Result<(RocksDbCanonicalSecondary, CanonicalWriterStatusResponse), ConvergenceFailure> {
-    let deadline = tokio::time::Instant::now() + config.convergence_timeout;
-    let attempts = config.convergence_attempts.max(1);
-    for attempt in 0..attempts {
-        candidate = catch_up_generation(candidate)
-            .await
-            .map_err(ConvergenceFailure::Storage)?;
-        let status = writer_status.fetch().await.map_err(|error| {
-            ConvergenceFailure::WriterStatusTransport(error.message().to_owned())
-        })?;
-        if attest(&status, &candidate, config.network).is_ok() {
-            return Ok((candidate, status));
+    let mut probe = CandidateFenceProbe {
+        writer_status,
+        candidate: Some(candidate),
+    };
+    let retry_delay = config.catchup_interval.min(CONVERGENCE_RETRY_DELAY_CAP);
+    let outcome = converge_on_canonical_writer_fence(
+        &mut probe,
+        config.network,
+        CanonicalFenceConvergencePolicy {
+            timeout: config.convergence_timeout,
+            max_attempts: NonZeroU32::new(u32::from(config.convergence_attempts.max(1))),
+            initial_delay: retry_delay,
+            max_delay: retry_delay,
+        },
+        &CancellationToken::new(),
+    )
+    .await;
+    match outcome {
+        Ok(CanonicalFenceConvergence::Converged(attesting_status)) => probe
+            .candidate
+            .map(|candidate| (candidate, *attesting_status))
+            .ok_or_else(candidate_unavailable),
+        Ok(CanonicalFenceConvergence::Cancelled)
+        | Err(CanonicalFenceConvergenceError::DidNotConverge) => {
+            Err(ConvergenceFailure::WriterAhead)
         }
-        let relation = classify_writer_fence(
-            &status,
-            config.network,
-            candidate.event_fence().chain_epoch_id().value(),
-            false,
-        );
-        if !matches!(relation, WriterFenceRelation::Ahead(_)) {
-            return Err(match relation {
-                WriterFenceRelation::SameEpochMismatch => ConvergenceFailure::SameEpochMismatch,
-                WriterFenceRelation::BehindOrInvalid => ConvergenceFailure::WriterBehindOrInvalid,
-                WriterFenceRelation::Exact | WriterFenceRelation::Ahead(_) => unreachable!(),
-            });
+        Err(CanonicalFenceConvergenceError::Probe(failure)) => Err(failure),
+        Err(CanonicalFenceConvergenceError::Diverged(_)) => {
+            Err(ConvergenceFailure::WriterFenceDiverged)
         }
-        if attempt + 1 == attempts || tokio::time::Instant::now() >= deadline {
-            break;
-        }
-        tokio::time::sleep(config.catchup_interval.min(Duration::from_millis(100))).await;
     }
-    Err(ConvergenceFailure::WriterAhead)
 }
 
 #[derive(Clone)]
@@ -1304,9 +1273,8 @@ mod tests {
 
     use super::{
         CompactBlockAdapter, CompactBlockPublisher, CompactBlockServingConfig,
-        CompactBlockServingSlot, CompactServingReadiness, PoolSelection, WriterFenceRelation,
-        classify_writer_fence, compact_block_to_lightwalletd, range_chunks,
-        transport_failure_cause,
+        CompactBlockServingSlot, CompactServingReadiness, PoolSelection,
+        compact_block_to_lightwalletd, range_chunks, transport_failure_cause,
     };
     use compact_tx_streamer_server::CompactTxStreamer;
     use parking_lot::Mutex;
@@ -1660,6 +1628,61 @@ mod tests {
         assert_eq!(runtime.report().cause, ReadinessCause::ShuttingDown);
         readiness.publish_node(ReadinessCause::Ready);
         assert_eq!(runtime.report().cause, ReadinessCause::ShuttingDown);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rejects_a_writer_fence_with_a_different_visible_block_count()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let activations = lifecycle_activations();
+        let (primary, _) =
+            lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
+        let mut writer_status = lifecycle_writer_status(&primary);
+        let fence = writer_status
+            .fence
+            .as_mut()
+            .ok_or("lifecycle writer status has no fence")?;
+        fence.visible_block_count = fence.visible_block_count.saturating_add(1);
+        let control = MutableCanonicalControl::new(writer_status);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(CanonicalControlServer::new(control))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    let _ = shutdown_receiver.await;
+                })
+                .await
+        });
+        let config = CompactBlockServingConfig {
+            canonical_primary_path: temporary.path().join("canonical-primary"),
+            canonical_secondary_root: temporary.path().join("canonical-secondaries"),
+            network: Network::ZcashRegtest,
+            activations: Arc::new(activations),
+            raw_blob_retention: RawBlobRetention::Transactions,
+            reorg_policy: CanonicalReorgPolicy::new(100)?,
+            resource_budget: RocksDbResourceBudget::for_local_tests(),
+            catchup_interval: Duration::from_millis(1),
+            convergence_timeout: Duration::from_secs(2),
+            convergence_attempts: 4,
+            staleness_ceiling: Duration::from_millis(50),
+            lag_threshold: 0,
+        };
+
+        let outcome = CompactBlockPublisher::bootstrap(
+            config,
+            CompactServingReadiness::new(Readiness::default()),
+            &endpoint,
+            None,
+        )
+        .await;
+
+        assert!(outcome.is_err());
+        drop(outcome);
+        let _ = shutdown_sender.send(());
+        server.await??;
+        Ok(())
     }
 
     #[tokio::test]
@@ -2295,54 +2318,6 @@ mod tests {
         let _ = shutdown_sender.send(());
         server.await??;
         Ok(())
-    }
-
-    #[test]
-    fn writer_fence_classification_distinguishes_exact_ahead_and_invalid() {
-        let network = zinder_core::Network::ZcashRegtest;
-        let status = |epoch| CanonicalWriterStatusResponse {
-            network_name: zinder_core::wire::encode_zinder_native_chain_name(network).to_owned(),
-            fence: Some(CanonicalWriterFence {
-                chain_epoch_id: epoch,
-                ..CanonicalWriterFence::default()
-            }),
-            oldest_retained_event_sequence: 0,
-            network_upgrade_schedule: None,
-            reorg_window_exceeded: None,
-            tip_unconfirmed: false,
-        };
-        assert_eq!(
-            classify_writer_fence(&status(4), network, 4, true),
-            WriterFenceRelation::Exact
-        );
-        assert_eq!(
-            classify_writer_fence(&status(5), network, 4, false),
-            WriterFenceRelation::Ahead(1)
-        );
-        assert_eq!(
-            classify_writer_fence(&status(4), network, 4, false),
-            WriterFenceRelation::SameEpochMismatch
-        );
-        assert_eq!(
-            classify_writer_fence(&status(3), network, 4, false),
-            WriterFenceRelation::BehindOrInvalid
-        );
-        let wrong_network = CanonicalWriterStatusResponse {
-            network_name: "mainnet".to_owned(),
-            ..status(4)
-        };
-        assert_eq!(
-            classify_writer_fence(&wrong_network, network, 4, true),
-            WriterFenceRelation::BehindOrInvalid
-        );
-        let missing_fence = CanonicalWriterStatusResponse {
-            fence: None,
-            ..status(4)
-        };
-        assert_eq!(
-            classify_writer_fence(&missing_fence, network, 4, true),
-            WriterFenceRelation::BehindOrInvalid
-        );
     }
 
     #[test]
