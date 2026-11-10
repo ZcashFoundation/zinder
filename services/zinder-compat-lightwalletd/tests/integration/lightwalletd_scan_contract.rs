@@ -56,14 +56,11 @@ async fn lightwalletd_compatible_client_scans_range_without_sending_keys() -> ey
     let store_fixture = lightwalletd_scan_store_fixture()?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server_addr = listener.local_addr()?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
+    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
         Arc::new(sample_regtest_upgrade_activations()),
-    )
+    ))
     .into_server();
     let server_handle = tokio::spawn(async move {
         Server::builder()
@@ -124,14 +121,11 @@ async fn lightwalletd_subtree_roots_request_carries_no_key_material() -> eyre::R
     let store_fixture = lightwalletd_scan_store_fixture()?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server_addr = listener.local_addr()?;
-    let adapter = LightwalletdGrpcAdapter::new(
-        WalletQuery::new(
-            store_fixture.chain_store().clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        ),
+    let adapter = LightwalletdGrpcAdapter::new(WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        (),
         Arc::new(sample_regtest_upgrade_activations()),
-    )
+    ))
     .into_server();
     let server_handle = tokio::spawn(async move {
         Server::builder()

@@ -45,6 +45,7 @@ Extension guides:
 ## Runbooks
 
 - [Initial sync](runbooks/initial-sync.md)
+- [Upgrading the node without rebuilding history](runbooks/upgrading-the-node.md)
 - [Bulk-catchup resource tuning](runbooks/bulk-catchup-resource-tuning.md)
 - [Deploying on a VM](runbooks/deploying-on-a-vm.md)
 - [Deploying on Railway](runbooks/deploying-on-railway.md)

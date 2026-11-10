@@ -1553,6 +1553,13 @@ impl FenceConvergencePolicy {
 trait WriterFenceProbe {
     fn catch_up(&mut self) -> Result<WalletCanonicalSourceIdentity, ProjectorError>;
 
+    /// Returns whether the caught-up secondary carries exactly the schedule
+    /// revision the writer reports.
+    fn matches_writer_schedule(
+        &self,
+        status: &zinder_proto::v1::ingest::CanonicalWriterStatusResponse,
+    ) -> bool;
+
     async fn writer_status(
         &mut self,
     ) -> Result<zinder_proto::v1::ingest::CanonicalWriterStatusResponse, ProjectorError>;
@@ -1567,6 +1574,19 @@ impl WriterFenceProbe for LiveWriterFenceProbe<'_> {
     fn catch_up(&mut self) -> Result<WalletCanonicalSourceIdentity, ProjectorError> {
         self.canonical.try_catch_up()?;
         Ok(canonical_source_identity(&self.canonical.ready_evidence()))
+    }
+
+    fn matches_writer_schedule(
+        &self,
+        status: &zinder_proto::v1::ingest::CanonicalWriterStatusResponse,
+    ) -> bool {
+        status.network_upgrade_schedule
+            == self.canonical.network_upgrade_schedule().map(|schedule| {
+                zinder_proto::wire::encode_canonical_network_upgrade_schedule(
+                    schedule.activations(),
+                    schedule.revision(),
+                )
+            })
     }
 
     async fn writer_status(
@@ -1599,7 +1619,8 @@ async fn converge_on_writer_fence(
     })
 }
 
-/// Catches the secondary up until it authenticates the writer's exact fence.
+/// Catches the secondary up until it authenticates the writer's exact fence
+/// and admitted network-upgrade schedule revision.
 ///
 /// The writer keeps committing while the projector converges, so a secondary
 /// behind the writer's event sequence is ordinary lag and is retried with
@@ -1623,7 +1644,9 @@ async fn converge_probe_on_writer_fence(
         let status = probe.writer_status().await?;
         let writer_tip_height = status.fence.as_ref().map(|fence| fence.visible_tip_height);
         match classify_writer_fence(&status, source, network) {
-            WriterFenceRelation::Matches => return Ok(FenceConvergence::Converged),
+            WriterFenceRelation::Matches if probe.matches_writer_schedule(&status) => {
+                return Ok(FenceConvergence::Converged);
+            }
             WriterFenceRelation::Diverged {
                 secondary_event_sequence,
                 writer_event_sequence,
@@ -1633,7 +1656,9 @@ async fn converge_probe_on_writer_fence(
                     writer_event_sequence,
                 });
             }
-            WriterFenceRelation::SecondaryBehind => {}
+            // A schedule revision admitted without a fence change is caught
+            // up exactly like fence lag.
+            WriterFenceRelation::Matches | WriterFenceRelation::SecondaryBehind => {}
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
@@ -2447,6 +2472,7 @@ mod tests {
         writer_sequence: u64,
         commits_remaining: Option<u32>,
         catch_ups: u32,
+        schedule_lag_catch_ups: u32,
     }
 
     impl ScriptedProbe {
@@ -2456,6 +2482,7 @@ mod tests {
                 writer_sequence: 1,
                 commits_remaining,
                 catch_ups: 0,
+                schedule_lag_catch_ups: 0,
             }
         }
     }
@@ -2465,6 +2492,10 @@ mod tests {
             self.catch_ups += 1;
             self.secondary_sequence = self.writer_sequence;
             Ok(source_identity(self.secondary_sequence, 7))
+        }
+
+        fn matches_writer_schedule(&self, _status: &CanonicalWriterStatusResponse) -> bool {
+            self.catch_ups > self.schedule_lag_catch_ups
         }
 
         async fn writer_status(&mut self) -> Result<CanonicalWriterStatusResponse, ProjectorError> {
@@ -2507,6 +2538,41 @@ mod tests {
         assert!(matches!(outcome, Ok(FenceConvergence::Converged)));
         assert_eq!(probe.catch_ups, 7);
         assert!(readiness.report().is_ready);
+    }
+
+    #[tokio::test]
+    async fn fence_convergence_waits_for_the_writer_admitted_schedule_revision() {
+        let mut probe = ScriptedProbe::new(Some(0));
+        probe.schedule_lag_catch_ups = 3;
+        let readiness = zinder_runtime::Readiness::default();
+
+        let outcome = converge_probe_on_writer_fence(
+            &mut probe,
+            test_network(),
+            &readiness,
+            &CancellationToken::new(),
+            fast_policy(Duration::from_secs(5)),
+        )
+        .await;
+
+        assert!(matches!(outcome, Ok(FenceConvergence::Converged)));
+        assert_eq!(probe.catch_ups, 4);
+
+        let mut never_admitted = ScriptedProbe::new(Some(0));
+        never_admitted.schedule_lag_catch_ups = u32::MAX;
+        let outcome = converge_probe_on_writer_fence(
+            &mut never_admitted,
+            test_network(),
+            &readiness,
+            &CancellationToken::new(),
+            fast_policy(Duration::from_millis(30)),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            Err(ProjectorError::CanonicalFenceDidNotConverge)
+        ));
     }
 
     #[tokio::test]
@@ -2593,6 +2659,9 @@ mod tests {
         impl WriterFenceProbe for SameSequenceMismatch {
             fn catch_up(&mut self) -> Result<WalletCanonicalSourceIdentity, ProjectorError> {
                 Ok(source_identity(5, 1))
+            }
+            fn matches_writer_schedule(&self, _status: &CanonicalWriterStatusResponse) -> bool {
+                true
             }
             async fn writer_status(
                 &mut self,
@@ -2920,6 +2989,7 @@ mod tests {
                 canonical_sequence_digest: identity.source_sequence_digest().as_bytes().to_vec(),
             }),
             oldest_retained_event_sequence: 1,
+            network_upgrade_schedule: None,
         }
     }
 

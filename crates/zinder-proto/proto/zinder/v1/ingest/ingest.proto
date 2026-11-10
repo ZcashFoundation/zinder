@@ -98,6 +98,28 @@ message CanonicalWriterStatusResponse {
   string network_name = 1;
   CanonicalWriterFence fence = 2;
   uint64 oldest_retained_event_sequence = 3;
+  // Activation schedule the writer admitted for this store. Absent only when
+  // no writer of this release has opened the store. The immutable
+  // construction fingerprint is reported separately in checkpoint evidence.
+  CanonicalNetworkUpgradeSchedule network_upgrade_schedule = 4;
+}
+
+// One node-advertised network-upgrade activation in an admitted schedule.
+message CanonicalNetworkUpgradeActivation {
+  uint32 branch_id = 1;
+  uint32 height = 2;
+  string name = 3;
+}
+
+// Writer-admitted network-upgrade schedule bound to canonical store control.
+// The revision increases each time the writer admits a changed table; the
+// fingerprint is the V1 activation-table fingerprint of `activations`.
+message CanonicalNetworkUpgradeSchedule {
+  uint64 revision = 1;
+  uint32 fingerprint_version = 2;
+  bytes fingerprint = 3;
+  // Ordered by activation height; same-height order is significant.
+  repeated CanonicalNetworkUpgradeActivation activations = 4;
 }
 
 // Inclusive block-height range carried by one canonical transition.
@@ -257,6 +279,8 @@ message CreateCanonicalOwnerCheckpointResponse {
   // Consumers bind it into their manifest and use it for exact path
   // re-admission; it is opaque and is not filesystem authority.
   bytes database_identity = 8;
+  // Admitted activation schedule cold-read from the physical checkpoint.
+  CanonicalNetworkUpgradeSchedule network_upgrade_schedule = 9;
 }
 
 // Re-admits an already-created canonical owner checkpoint at the fixed child

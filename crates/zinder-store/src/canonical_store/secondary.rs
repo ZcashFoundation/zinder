@@ -17,6 +17,7 @@ use super::{
     CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalRetainedEvent,
     CanonicalSequenceCheckpoint, CanonicalStoreBuildState, CanonicalStoreError,
     CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
+    activation_schedule::CanonicalActivationSchedule,
     block_replay::{CanonicalReplayRangeScan, CanonicalReplayScan, read_replay_facts_at},
     construction_manifest::validate_ready_construction_manifest,
     event_lifecycle::{canonical_event_history_from_db, canonical_event_retention_floor_from_db},
@@ -72,9 +73,27 @@ pub struct RocksDbCanonicalSecondary {
     pub(super) build_plan: super::CanonicalStoreBuildPlan,
     pub(super) ready_evidence: CanonicalStoreReadyEvidence,
     pub(super) cursor_auth_key: [u8; 32],
+    pub(super) activation_schedule: Option<CanonicalActivationSchedule>,
 }
 
 impl RocksDbCanonicalSecondary {
+    /// Returns the writer-admitted schedule revision observed at the last
+    /// catch-up, or `None` before the writer's first admission.
+    #[must_use]
+    pub const fn network_upgrade_schedule(&self) -> Option<&CanonicalActivationSchedule> {
+        self.activation_schedule.as_ref()
+    }
+
+    /// Returns the complete writer-admitted activation table observed at the
+    /// last catch-up.
+    #[must_use]
+    pub const fn network_upgrade_activations(&self) -> Option<&NetworkUpgradeActivations> {
+        match self.activation_schedule.as_ref() {
+            Some(schedule) => Some(schedule.activations()),
+            None => None,
+        }
+    }
+
     /// Opens one exactly admitted secondary and catches it up to the primary's current state.
     ///
     /// The expected raw-blob retention is an immutable store identity, not a
@@ -82,6 +101,10 @@ impl RocksDbCanonicalSecondary {
     #[allow(
         clippy::too_many_arguments,
         reason = "secondary admission keeps both filesystem identities and every immutable canonical contract explicit"
+    )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "initial secondary admission binds control, schedule, manifest, and READY publication"
     )]
     pub fn open_ready(
         primary_path: impl AsRef<Path>,
@@ -129,7 +152,7 @@ impl RocksDbCanonicalSecondary {
             })?;
         require_exact_secondary_column_families(&bounded_open, &primary_path)?;
         let opened_control =
-            validate_open_store_control(&bounded_open.db, &primary_path, expectation)?;
+            validate_open_store_control(&bounded_open.db, &primary_path, &expectation)?;
         validate_mempool_lifecycle_admission(
             &bounded_open.db,
             opened_control.network,
@@ -149,14 +172,36 @@ impl RocksDbCanonicalSecondary {
             &opened_control.build_plan,
             &ready_evidence,
         )?;
+        let activation_schedule = opened_control
+            .activation_schedule_binding
+            .map(|binding| {
+                CanonicalActivationSchedule::read_bound(
+                    &bounded_open.db,
+                    &primary_path,
+                    binding,
+                    opened_control
+                        .build_plan
+                        .network_upgrade_activations_fingerprint()
+                        .as_bytes(),
+                )
+            })
+            .transpose()?;
         Ok(Self {
             bounded_open,
             primary_path,
-            expectation,
+            // The reader's node table is checked only at open. Catch-ups
+            // authenticate the schedule journal and follow each revision the
+            // writer admits, so a long-running reader never pins its startup
+            // observation.
+            expectation: CanonicalStoreAdmissionExpectation::from_build_plan(
+                &opened_control.build_plan,
+                expected_workload,
+            ),
             workload: expected_workload,
             build_plan: opened_control.build_plan,
             ready_evidence,
             cursor_auth_key: opened_control.cursor_auth_key,
+            activation_schedule,
         })
     }
 
@@ -182,7 +227,7 @@ impl RocksDbCanonicalSecondary {
         let opened_control = validate_open_store_control(
             &self.bounded_open.db,
             &self.primary_path,
-            self.expectation,
+            &self.expectation,
         )?;
         validate_mempool_lifecycle_admission(
             &self.bounded_open.db,
@@ -226,6 +271,19 @@ impl RocksDbCanonicalSecondary {
             &ready_evidence,
         )?;
         self.ready_evidence = ready_evidence;
+        self.activation_schedule = opened_control
+            .activation_schedule_binding
+            .map(|binding| {
+                CanonicalActivationSchedule::read_bound(
+                    &self.bounded_open.db,
+                    &self.primary_path,
+                    binding,
+                    self.build_plan
+                        .network_upgrade_activations_fingerprint()
+                        .as_bytes(),
+                )
+            })
+            .transpose()?;
         Ok(CanonicalSecondaryCatchupOutcome {
             before,
             after: self.event_fence(),

@@ -9,8 +9,8 @@ use zinder_core::{
     TransactionBlobArtifact, TransactionId, TransactionLocation, TransparentAddressScriptHash,
 };
 use zinder_store::{
-    BlockHashLookup, CanonicalEventFence, CanonicalStoreError, ChainEventEnvelope,
-    ChainEventHistoryRequest, ChainEventStreamFamily, ChainEventStreamResume,
+    BlockHashLookup, CanonicalActivationSchedule, CanonicalEventFence, CanonicalStoreError,
+    ChainEventEnvelope, ChainEventHistoryRequest, ChainEventStreamFamily, ChainEventStreamResume,
     EventStreamStartPosition, RawBlobRetention, RocksDbCanonicalSecondary,
 };
 use zinder_wallet_projection::{
@@ -29,6 +29,10 @@ use crate::QueryError;
 /// Implementations must never catch up or otherwise mutate their observed
 /// fence while a caller holds the same instance in a [`WalletServingReadPair`].
 pub trait CanonicalReader: Send + Sync + 'static {
+    /// Returns the writer-admitted network-upgrade schedule observed with
+    /// this fence, or `None` before the writer's first admission.
+    fn network_upgrade_schedule(&self) -> Option<&CanonicalActivationSchedule>;
+
     /// Returns the persisted raw-blob retention authenticated at admission.
     fn raw_blob_retention(&self) -> RawBlobRetention;
 
@@ -214,6 +218,10 @@ pub enum WalletServingAdmissionError {
 macro_rules! impl_canonical_read {
     ($store:ty) => {
         impl CanonicalReader for $store {
+            fn network_upgrade_schedule(&self) -> Option<&CanonicalActivationSchedule> {
+                self.network_upgrade_schedule()
+            }
+
             fn raw_blob_retention(&self) -> RawBlobRetention {
                 self.raw_blob_retention()
             }

@@ -13,11 +13,12 @@
 //!   endpoint pointed at the same Zebra, e.g. `http://127.0.0.1:9088`.
 //!
 //! Operator-divergent fields (build metadata, version strings, donation
-//! address, Zinder-additive upgrade fields) are explicitly allow-listed so
-//! the parity assertion focuses on the wire shape both shims must agree on:
-//! `chainName`, `consensusBranchId`, `saplingActivationHeight`, latest block
-//! height and hash, single-block identity, compact-block-range membership for
-//! a fixed span, nullifier redaction, transaction round-trip by hash,
+//! address) are explicitly allow-listed so the parity assertion focuses on
+//! the wire shape both shims must agree on: `chainName`, `consensusBranchId`,
+//! `saplingActivationHeight`, the next pending `upgradeName` and
+//! `upgradeHeight`, latest block height and hash, single-block identity,
+//! compact-block-range membership for a fixed span, nullifier redaction,
+//! transaction round-trip by hash,
 //! block/index-without-txid error parity, future-height status-code parity for
 //! single-block compact block methods, invalid transaction broadcast rejection,
 //! transparent address history, UTXOs, multi-address reads, and empty-address
@@ -85,6 +86,14 @@ async fn lightd_info_advertises_matching_chain_metadata() -> Result<()> {
     assert_eq!(
         zinder_info.consensus_branch_id, reference_info.consensus_branch_id,
         "consensusBranchId must agree",
+    );
+    assert_eq!(
+        zinder_info.upgrade_name, reference_info.upgrade_name,
+        "upgradeName must name the same next pending upgrade",
+    );
+    assert_eq!(
+        zinder_info.upgrade_height, reference_info.upgrade_height,
+        "upgradeHeight must name the same next pending activation height",
     );
     assert!(
         zinder_info.taddr_support,

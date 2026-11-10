@@ -26,8 +26,9 @@ use zinder_proto::capabilities::{
 };
 use zinder_source::{NodeCapability, NodeSource, TransactionBroadcaster, TreeStateUpstream};
 use zinder_store::{
-    ArtifactFamily, BlockHashLookup, ChainEventHistoryRequest, ChainEventStreamFamily,
-    ChainEventStreamResume, EventStreamStartPosition, RawBlobRetention, StreamCursorTokenV1,
+    ArtifactFamily, BlockHashLookup, CanonicalActivationSchedule, ChainEventHistoryRequest,
+    ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition, RawBlobRetention,
+    StreamCursorTokenV1,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
@@ -159,6 +160,20 @@ fn cursor_bytes<const N: usize>(
         .get(range)
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or_else(invalid_transparent_history_cursor)
+}
+
+/// Returns the activation table admitted with `pair`'s canonical fence.
+///
+/// Reader admission accepts a store without a writer-admitted schedule only
+/// when the discovered table equals the construction baseline, so the
+/// discovered table is exact in that case.
+fn admitted_activations<'pair>(
+    pair: &'pair WalletServingReadPair,
+    discovered: &'pair NetworkUpgradeActivations,
+) -> &'pair NetworkUpgradeActivations {
+    pair.canonical()
+        .network_upgrade_schedule()
+        .map_or(discovered, CanonicalActivationSchedule::activations)
 }
 
 fn invalid_transparent_history_cursor() -> QueryError {
@@ -649,7 +664,7 @@ where
     }
 
     async fn network_upgrade_activations(&self) -> Result<NetworkUpgradeActivations, QueryError> {
-        Ok((*self.network_upgrade_activations).clone())
+        Ok(admitted_activations(&self.capture_pair(), &self.network_upgrade_activations).clone())
     }
 
     async fn chain_value_pools_at_tip(&self) -> Result<ChainValuePoolsAtTip, QueryError> {
@@ -818,9 +833,10 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransactionStatus, QueryError> {
         let pair = self.capture_pair();
-        let network_upgrade_activations = Arc::clone(&self.network_upgrade_activations);
+        let discovered_activations = Arc::clone(&self.network_upgrade_activations);
         join_blocking(tokio::task::spawn_blocking(move || {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+            let network_upgrade_activations = admitted_activations(&pair, &discovered_activations);
             // READY admission requires transaction-location coverage to equal
             // the authenticated source count for every retention mode. Blob
             // coverage equals that count only under Transactions/All and is

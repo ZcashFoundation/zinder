@@ -280,9 +280,11 @@ An independently timed copy of the canonical and wallet directories is not a
 coherent backup. Physical checkpoint success also does not prove query serving,
 continuous following, reorg recovery, or client compatibility.
 
-State-bundle manifest format 2 carries the checkpoint build plan's exact
-raw-blob retention. Missing or unknown retention values fail admission instead
-of being inferred from workload or available rows.
+State-bundle manifest format 3 carries the checkpoint build plan's exact
+raw-blob retention and the canonical writer's admitted network-upgrade schedule
+revision and fingerprint. Missing or unknown retention values fail admission
+instead of being inferred from workload or available rows. Format 2 manifests,
+which predate schedule admission, remain readable.
 
 ## Deployment support
 
