@@ -25,8 +25,7 @@ use super::{
         validate_source_tip_checkpoint,
     },
     block_replay::{
-        PersistedBlockReplayValidation, resume_persisted_sequence_checkpoint,
-        validate_persisted_block_replays_with_checkpoints,
+        PersistedBlockReplayValidation, validate_persisted_block_replays_with_checkpoints,
     },
     construction_manifest::{
         CanonicalConstructionFamilyEvidence, CanonicalConstructionManifestDraft,
@@ -34,6 +33,7 @@ use super::{
     },
     control::{DecodedStoreControl, decode_store_control, encode_ready_store_control},
     displaced_archive::validate_permanent_reorg_archive,
+    replay_tail::AuthenticatedReplayTail,
     rocksdb::{
         BLOCK_BLOB_COLUMN_FAMILY, BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
         BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, CANONICAL_DATA_COLUMN_FAMILIES,
@@ -361,6 +361,7 @@ impl PublicationContext {
             cursor_auth_key: self.cursor_auth_key,
             build_state: CanonicalStoreBuildState::Building,
             activation_schedule_binding: None,
+            revised_reorg_policy: None,
         }
     }
 
@@ -369,8 +370,11 @@ impl PublicationContext {
         built_database_identity: &[u8],
     ) -> Result<BoundedRocksDbOpen, CanonicalStoreError> {
         let expected_control = self.expected_building_control();
-        let expectation =
-            CanonicalStoreAdmissionExpectation::from_build_plan(&self.build_plan, self.workload);
+        let expectation = CanonicalStoreAdmissionExpectation::from_build_plan(
+            &self.build_plan,
+            self.workload,
+            self.build_plan.reorg_policy(),
+        );
         let (admitted_database_identity, admitted_control) =
             admit_existing_store(&self.store_path, &expectation)?;
         if admitted_database_identity.as_slice() != built_database_identity
@@ -685,7 +689,7 @@ impl ValidatedRocksDbCanonicalBuild {
                 },
             )?;
         abort_at_publication_failpoint("after_atomic_write");
-        validate_exact_publication_readback(
+        let replay_tail = validate_exact_publication_readback(
             &self.bounded_open.db,
             &self.build_plan,
             &ready_evidence,
@@ -705,17 +709,24 @@ impl ValidatedRocksDbCanonicalBuild {
             self.build_plan,
             self.cursor_auth_key,
             &ready_evidence,
+            replay_tail,
         ))
     }
 }
 
+/// Validates one READY publication against its construction identity and the
+/// store's effective reorg window, which bounds every retained transition.
+///
+/// Returns the unsettled replay tail it authenticated, which later
+/// transitions extend incrementally.
 pub(super) fn validate_ready_publication(
     db: &DB,
     build_plan: &super::CanonicalStoreBuildPlan,
+    reorg_policy: super::CanonicalReorgPolicy,
     ready_evidence: &CanonicalStoreReadyEvidence,
-) -> Result<(), CanonicalStoreError> {
+) -> Result<AuthenticatedReplayTail, CanonicalStoreError> {
     validate_first_retained_block(db, ready_evidence.first_retained_block)?;
-    validate_ready_sequence_checkpoint(db, build_plan, ready_evidence)?;
+    let replay_tail = authenticate_ready_replay_tail(db, reorg_policy, ready_evidence)?;
     let baseline_tip = build_plan.build_tip();
     let baseline_epoch = decode_chain_epoch(&read_family_row(
         db,
@@ -736,14 +747,15 @@ pub(super) fn validate_ready_publication(
             baseline_epoch,
         )?;
     } else {
-        validate_live_history(db, build_plan, ready_evidence, baseline_epoch)?;
+        validate_live_history(db, build_plan, reorg_policy, ready_evidence, baseline_epoch)?;
     }
     validate_permanent_reorg_archive(
         db,
-        build_plan.reorg_policy().reorg_window_blocks(),
+        reorg_policy.reorg_window_blocks(),
         ready_evidence.visible_event_sequence,
     )?;
-    super::event_lifecycle::validate_projection_lifecycle_records(db, ready_evidence)
+    super::event_lifecycle::validate_projection_lifecycle_records(db, ready_evidence)?;
+    Ok(replay_tail)
 }
 
 pub(super) fn validate_live_append_publication(
@@ -863,9 +875,147 @@ fn validate_first_retained_block(
     Ok(())
 }
 
-pub(super) fn validate_ready_sequence_checkpoint(
+/// Re-derives the whole unsettled replay tail from the persisted settled
+/// checkpoint and checks it against READY evidence.
+pub(super) fn authenticate_ready_replay_tail(
     db: &DB,
-    build_plan: &super::CanonicalStoreBuildPlan,
+    reorg_policy: super::CanonicalReorgPolicy,
+    ready_evidence: &CanonicalStoreReadyEvidence,
+) -> Result<AuthenticatedReplayTail, CanonicalStoreError> {
+    validate_ready_settlement_window(db, reorg_policy, ready_evidence)?;
+    let replay_tail = AuthenticatedReplayTail::authenticate(
+        db,
+        ready_evidence.sequence_checkpoint,
+        ready_evidence.visible_tip.height,
+        reorg_policy.reorg_window_blocks(),
+    )?;
+    validate_replay_tail_matches_ready(&replay_tail, ready_evidence)?;
+    Ok(replay_tail)
+}
+
+/// Brings `replay_tail` to the READY evidence a transition just published,
+/// re-deriving only the rows above `retained_height`.
+///
+/// Once the incrementally derived rows reach one reorg window, the whole
+/// unsettled suffix is re-derived instead, so an out-of-band change to a row
+/// no transition touched is still found within one window of blocks.
+pub(super) fn advance_ready_replay_tail(
+    db: &DB,
+    reorg_policy: super::CanonicalReorgPolicy,
+    ready_evidence: &CanonicalStoreReadyEvidence,
+    retained_height: BlockHeight,
+    replay_tail: &mut AuthenticatedReplayTail,
+) -> Result<(), CanonicalStoreError> {
+    let window = reorg_policy.reorg_window_blocks();
+    if replay_tail.full_authentication_due(window) {
+        *replay_tail = authenticate_ready_replay_tail(db, reorg_policy, ready_evidence)?;
+        return Ok(());
+    }
+    validate_ready_settlement_window(db, reorg_policy, ready_evidence)?;
+    replay_tail.reauthenticate_above(
+        db,
+        retained_height,
+        ready_evidence.visible_tip.height,
+        window,
+    )?;
+    replay_tail.settle(ready_evidence.sequence_checkpoint)?;
+    validate_replay_tail_matches_ready(replay_tail, ready_evidence)
+}
+
+/// Brings a reader's `replay_tail` from `previous` to `ready_evidence`,
+/// re-deriving only the rows the retained chain events between them changed.
+///
+/// A reader that cannot read every intervening event, for example because
+/// retention pruned them while it lagged, or whose incremental check fails,
+/// re-derives the whole unsettled suffix, so it accepts exactly the READY
+/// evidence a complete derivation accepts.
+pub(super) fn follow_ready_replay_tail(
+    db: &DB,
+    reorg_policy: super::CanonicalReorgPolicy,
+    previous: &CanonicalStoreReadyEvidence,
+    ready_evidence: &CanonicalStoreReadyEvidence,
+    replay_tail: &mut AuthenticatedReplayTail,
+) -> Result<(), CanonicalStoreError> {
+    if let Some(retained_height) = lowest_retained_height_since(
+        db,
+        reorg_policy.reorg_window_blocks(),
+        previous,
+        ready_evidence,
+    )? {
+        let mut followed = replay_tail.clone();
+        if advance_ready_replay_tail(
+            db,
+            reorg_policy,
+            ready_evidence,
+            retained_height,
+            &mut followed,
+        )
+        .is_ok()
+        {
+            *replay_tail = followed;
+            return Ok(());
+        }
+    }
+    *replay_tail = authenticate_ready_replay_tail(db, reorg_policy, ready_evidence)?;
+    Ok(())
+}
+
+/// Returns the highest height every chain event after `previous` left
+/// unchanged, or `None` when an intervening event is unavailable.
+///
+/// The incremental path re-derives at least every block the visible tip
+/// advanced, so it cannot succeed once the tip advanced by more than one
+/// reorg window; that case returns `None` before reading the events between.
+fn lowest_retained_height_since(
+    db: &DB,
+    reorg_window_blocks: u32,
+    previous: &CanonicalStoreReadyEvidence,
+    ready_evidence: &CanonicalStoreReadyEvidence,
+) -> Result<Option<BlockHeight>, CanonicalStoreError> {
+    let tip_advance = ready_evidence
+        .visible_tip
+        .height
+        .value()
+        .saturating_sub(previous.visible_tip.height.value());
+    if tip_advance > reorg_window_blocks {
+        return Ok(None);
+    }
+    let first_sequence = previous.visible_event_sequence.saturating_add(1);
+    let retention_floor = super::event_lifecycle::canonical_event_retention_floor_from_db(
+        db,
+        ready_evidence.visible_event_sequence,
+    )?;
+    if first_sequence < retention_floor {
+        return Ok(None);
+    }
+    let mut retained_height = previous.visible_tip.height;
+    for sequence in first_sequence..=ready_evidence.visible_event_sequence {
+        let Ok(encoded) = read_family_row(db, CHAIN_EVENT_COLUMN_FAMILY, &sequence.to_be_bytes())
+        else {
+            return Ok(None);
+        };
+        let Ok(event) = decode_chain_event(&encoded) else {
+            return Ok(None);
+        };
+        if event.resulting_epoch_id.value() != sequence {
+            return Ok(None);
+        }
+        let first_changed = event
+            .reverted_range
+            .map_or(event.committed_range.start, |reverted| {
+                reverted.start.min(event.committed_range.start)
+            });
+        let Some(unchanged_through) = first_changed.value().checked_sub(1) else {
+            return Ok(None);
+        };
+        retained_height = retained_height.min(BlockHeight::new(unchanged_through));
+    }
+    Ok(Some(retained_height))
+}
+
+fn validate_ready_settlement_window(
+    db: &DB,
+    reorg_policy: super::CanonicalReorgPolicy,
     ready_evidence: &CanonicalStoreReadyEvidence,
 ) -> Result<(), CanonicalStoreError> {
     let visible_epoch = decode_chain_epoch(&read_family_row(
@@ -887,18 +1037,19 @@ pub(super) fn validate_ready_sequence_checkpoint(
         .value()
         .checked_sub(checkpoint.through().height.value())
         .ok_or_else(|| CanonicalStoreError::publication("settled tip exceeds visible tip"))?;
-    let reorg_window = build_plan.reorg_policy().reorg_window_blocks();
+    let reorg_window = reorg_policy.reorg_window_blocks();
     if settled_lag > reorg_window {
         return Err(CanonicalStoreError::publication(format!(
             "visible epoch exceeds its {reorg_window}-block settlement window"
         )));
     }
-    let resumed = resume_persisted_sequence_checkpoint(
-        db,
-        checkpoint,
-        ready_evidence.visible_tip.height,
-        reorg_window,
-    )?;
+    Ok(())
+}
+
+fn validate_replay_tail_matches_ready(
+    replay_tail: &AuthenticatedReplayTail,
+    ready_evidence: &CanonicalStoreReadyEvidence,
+) -> Result<(), CanonicalStoreError> {
     let expected_visible = CanonicalSequenceCheckpoint::from_admitted_parts(
         ready_evidence.visible_tip,
         ready_evidence.visible_block_count,
@@ -909,7 +1060,9 @@ pub(super) fn validate_ready_sequence_checkpoint(
         ),
         ready_evidence.visible_logical_replay_bytes,
     );
-    if resumed != expected_visible {
+    if replay_tail.settled() != ready_evidence.sequence_checkpoint
+        || replay_tail.tip() != expected_visible
+    {
         return Err(CanonicalStoreError::publication(
             "READY sequence checkpoint does not authenticate the visible replay tail",
         ));
@@ -969,6 +1122,7 @@ fn validate_baseline_publication(
 fn validate_live_history(
     db: &DB,
     build_plan: &super::CanonicalStoreBuildPlan,
+    reorg_policy: super::CanonicalReorgPolicy,
     ready_evidence: &CanonicalStoreReadyEvidence,
     baseline_epoch: DecodedChainEpoch,
 ) -> Result<(), CanonicalStoreError> {
@@ -1009,7 +1163,13 @@ fn validate_live_history(
             || chain_event.previous_epoch_id != previous_epoch_id.value()
             || chain_event.visible_tip != chain_epoch.visible_tip
             || chain_event.visible_block_count == 0
-            || !live_transition_is_valid(build_plan, previous_epoch, chain_epoch, chain_event)?
+            || !live_transition_is_valid(
+                build_plan,
+                reorg_policy,
+                previous_epoch,
+                chain_epoch,
+                chain_event,
+            )?
         {
             return Err(CanonicalStoreError::publication(
                 "READY live history contains an invalid version-1 transition",
@@ -1048,6 +1208,7 @@ fn validate_live_history(
 
 fn live_transition_is_valid(
     build_plan: &super::CanonicalStoreBuildPlan,
+    reorg_policy: super::CanonicalReorgPolicy,
     previous_epoch: DecodedChainEpoch,
     chain_epoch: DecodedChainEpoch,
     chain_event: DecodedChainEvent,
@@ -1090,8 +1251,8 @@ fn live_transition_is_valid(
         && committed.start == reverted.start
         && committed.end == chain_epoch.visible_tip.height
         && previous_epoch.settled_tip == chain_epoch.settled_tip
-        && displaced_count <= build_plan.reorg_policy().reorg_window_blocks()
-        && visible_lag <= build_plan.reorg_policy().reorg_window_blocks())
+        && displaced_count <= reorg_policy.reorg_window_blocks()
+        && visible_lag <= reorg_policy.reorg_window_blocks())
 }
 
 fn validate_epoch_record(
@@ -1153,6 +1314,7 @@ fn validate_reopened_identity_and_control(
     let expectation = CanonicalStoreAdmissionExpectation::from_build_plan(
         &expected_control.build_plan,
         expected_control.workload,
+        expected_control.effective_reorg_policy(),
     );
     let control = validate_open_store_control(db, store_path, &expectation)?;
     if database_identity.as_slice() != expected_database_identity || &control != expected_control {
@@ -1415,7 +1577,7 @@ fn validate_exact_publication_readback(
     build_plan: &super::CanonicalStoreBuildPlan,
     ready_evidence: &CanonicalStoreReadyEvidence,
     expected: &EncodedBaselinePublication,
-) -> Result<(), CanonicalStoreError> {
+) -> Result<AuthenticatedReplayTail, CanonicalStoreError> {
     let epoch_family = column_family(db, CHAIN_EPOCH_COLUMN_FAMILY)?;
     let event_family = column_family(db, CHAIN_EVENT_COLUMN_FAMILY)?;
     let epoch = db
@@ -1450,7 +1612,7 @@ fn validate_exact_publication_readback(
             "READY control does not contain the validated baseline evidence",
         ));
     }
-    validate_ready_publication(db, build_plan, ready_evidence)
+    validate_ready_publication(db, build_plan, build_plan.reorg_policy(), ready_evidence)
 }
 
 fn decode_chain_epoch(encoded: &[u8]) -> Result<DecodedChainEpoch, CanonicalStoreError> {

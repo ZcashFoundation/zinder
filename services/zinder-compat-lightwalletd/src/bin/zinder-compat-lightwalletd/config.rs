@@ -136,7 +136,10 @@ pub(crate) fn load_lightwalletd_config(
 ) -> Result<LightwalletdConfig, LightwalletdConfigError> {
     let raw_config: LightwalletdRawConfig = ConfigLoader::new()
         .with_default("compat.listen_addr", "127.0.0.1:9067")?
-        .with_default("compat.reorg_window_blocks", 100_u32)?
+        .with_default(
+            "compat.reorg_window_blocks",
+            zinder_store::DEFAULT_REORG_WINDOW_BLOCKS,
+        )?
         .with_ops_section(RuntimeService::CompatLightwalletd)?
         .with_security_section()?
         .with_file(config_path)

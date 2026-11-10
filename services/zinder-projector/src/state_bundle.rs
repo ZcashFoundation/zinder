@@ -622,6 +622,7 @@ struct CanonicalAdmission {
     network: Network,
     workload: CanonicalStoreWorkload,
     build_plan: CanonicalBuildPlanAdmission,
+    effective_reorg_window_blocks: Option<u32>,
     admitted_schedule: AdmittedScheduleIdentity,
     first_retained_block: BlockId,
     visible_tip: BlockId,
@@ -677,6 +678,7 @@ struct DecodedCanonicalCheckpointResponse {
     schema_version: u16,
     network: Network,
     build_plan: zinder_proto::v1::ingest::CanonicalOwnerCheckpointBuildPlanEvidence,
+    effective_reorg_window_blocks: Option<u32>,
     network_upgrade_schedule: zinder_proto::v1::ingest::CanonicalNetworkUpgradeSchedule,
     ready: zinder_proto::v1::ingest::CanonicalOwnerCheckpointReadyEvidence,
 }
@@ -733,6 +735,7 @@ impl TryFrom<CreateCanonicalOwnerCheckpointResponse> for CanonicalCheckpointAdmi
             schema_version,
             network,
             build_plan,
+            effective_reorg_window_blocks,
             network_upgrade_schedule,
             ready,
         } = decode_checkpoint_response(response)?;
@@ -751,18 +754,21 @@ impl TryFrom<CreateCanonicalOwnerCheckpointResponse> for CanonicalCheckpointAdmi
             ready.first_retained_block,
             ready.visible_tip,
         )?;
-        let admission = assemble_canonical_admission(
-            &database_identity,
-            store_identity,
-            schema_version,
-            network,
-            &ready,
-            build_plan,
-            AdmittedScheduleIdentity {
-                revision,
-                fingerprint: schedule_fingerprint.as_bytes(),
-            },
-        );
+        let admission = CanonicalAdmission {
+            effective_reorg_window_blocks,
+            ..assemble_canonical_admission(
+                &database_identity,
+                store_identity,
+                schema_version,
+                network,
+                &ready,
+                build_plan,
+                AdmittedScheduleIdentity {
+                    revision,
+                    fingerprint: schedule_fingerprint.as_bytes(),
+                },
+            )
+        };
         Ok(Self {
             candidate_id,
             database_identity,
@@ -817,6 +823,12 @@ fn decode_checkpoint_response(
             "canonical checkpoint response omitted admitted activation schedule evidence",
         )
     })?;
+    require_manifest_value(
+        response
+            .effective_reorg_window_blocks
+            .is_none_or(|effective| effective > build_plan.reorg_window_blocks),
+        "canonical checkpoint effective reorg window must raise its construction window",
+    )?;
     Ok(DecodedCanonicalCheckpointResponse {
         candidate_id: response.candidate_id,
         database_identity: response.database_identity,
@@ -824,6 +836,7 @@ fn decode_checkpoint_response(
         schema_version,
         network,
         build_plan,
+        effective_reorg_window_blocks: response.effective_reorg_window_blocks,
         network_upgrade_schedule,
         ready,
     })
@@ -978,6 +991,7 @@ fn assemble_canonical_admission(
         network,
         workload: CanonicalStoreWorkload::Wallet,
         build_plan,
+        effective_reorg_window_blocks: None,
         admitted_schedule,
         first_retained_block: ready.first_retained_block,
         visible_tip: ready.visible_tip,
@@ -1159,6 +1173,11 @@ struct CanonicalCheckpointManifest {
     workload: String,
     cold_admitted: bool,
     build_plan: CanonicalBuildPlanManifest,
+    /// Reorg window the checkpoint enforces when a canonical writer raised it
+    /// above `build_plan.reorg_window_blocks`; absent at the construction
+    /// window, so bundles of unraised stores keep their earlier shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effective_reorg_window_blocks: Option<u32>,
     first_retained_block: BlockManifest,
     visible_block_count: u64,
     block_digest_version: u16,
@@ -1181,6 +1200,7 @@ impl CanonicalCheckpointManifest {
             workload: canonical.workload.as_str().to_owned(),
             cold_admitted: true,
             build_plan: CanonicalBuildPlanManifest::from_admitted(&canonical.build_plan),
+            effective_reorg_window_blocks: canonical.effective_reorg_window_blocks,
             first_retained_block: BlockManifest::from_block(canonical.first_retained_block),
             visible_block_count: canonical.visible_block_count,
             block_digest_version: canonical.block_digest_version,
@@ -1235,6 +1255,11 @@ impl CanonicalCheckpointManifest {
             .validate("canonical first-retained-block hash")?;
         self.build_plan
             .validate(network, &self.first_retained_block, &fence.visible_tip)?;
+        require_manifest_value(
+            self.effective_reorg_window_blocks
+                .is_none_or(|effective| effective > self.build_plan.reorg_window_blocks),
+            "canonical effective reorg window must raise its construction window",
+        )?;
         require_manifest_value(
             self.visible_block_count == fence.sequence_digest.block_count,
             "canonical visible block count does not match the shared sequence digest",
@@ -2201,6 +2226,50 @@ mod tests {
     }
 
     #[test]
+    fn raised_reorg_window_is_recorded_only_when_it_differs_from_construction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut raised = sample_canonical_control_response(7);
+        raised.effective_reorg_window_blocks = Some(1_000);
+        let admitted = CanonicalCheckpointAdmissionEvidence::try_from(raised.clone())?;
+        assert_eq!(
+            admitted.admission.effective_reorg_window_blocks,
+            Some(1_000)
+        );
+        let manifest = StateBundleManifest::from_admitted(
+            "bundle-a",
+            &admitted.admission,
+            &sample_wallet_admission(7)?,
+        )?;
+        let encoded = serde_json::to_value(&manifest)?;
+        assert_eq!(
+            encoded["canonical_checkpoint"]["effective_reorg_window_blocks"],
+            Value::from(1_000)
+        );
+        let decoded: StateBundleManifest = serde_json::from_value(encoded)?;
+        decoded.validate(Network::ZcashRegtest)?;
+        assert_eq!(decoded, manifest);
+
+        // An unraised checkpoint keeps the earlier manifest shape.
+        let unraised = StateBundleManifest::from_admitted(
+            "bundle-a",
+            &sample_canonical_admission(7),
+            &sample_wallet_admission(7)?,
+        )?;
+        assert!(
+            serde_json::to_value(&unraised)?["canonical_checkpoint"]
+                .get("effective_reorg_window_blocks")
+                .is_none()
+        );
+
+        for not_raised in [100, 99] {
+            let mut lowered = raised.clone();
+            lowered.effective_reorg_window_blocks = Some(not_raised);
+            assert!(CanonicalCheckpointAdmissionEvidence::try_from(lowered).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn manifest_admission_rejects_identity_version_topology_schema_network_and_fence_corruption()
     -> Result<(), Box<dyn std::error::Error>> {
         let manifest = StateBundleManifest::from_admitted(
@@ -2593,6 +2662,7 @@ mod tests {
             schema_version: CANONICAL_STORE_SCHEMA_VERSION,
             network: Network::ZcashRegtest,
             workload: CanonicalStoreWorkload::Wallet,
+            effective_reorg_window_blocks: None,
             build_plan: CanonicalBuildPlanAdmission {
                 activation_fingerprint_version: 1,
                 activation_fingerprint: activation_fingerprint.as_bytes(),
@@ -2640,6 +2710,7 @@ mod tests {
             schema_version: u32::from(canonical.schema_version),
             workload: canonical.workload.as_str().to_owned(),
             network_name: network_name(canonical.network).to_owned(),
+            effective_reorg_window_blocks: None,
             network_upgrade_schedule: Some(
                 zinder_proto::wire::encode_canonical_network_upgrade_schedule(
                     &NetworkUpgradeActivations::empty(canonical.network),

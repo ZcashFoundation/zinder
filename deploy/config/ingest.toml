@@ -21,7 +21,7 @@ raw_blob_policy = "transactions"
 [ingest]
 source = "zebra-json-rpc"
 explorer_views = false
-reorg_window_blocks = 100
+reorg_window_blocks = 1000
 
 [ingest.run_overrides]
 coverage = "wallet-serving"

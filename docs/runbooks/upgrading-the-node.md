@@ -20,6 +20,10 @@ release notes of the Zinder release you are installing for that support.
   bundle or keep a certified side-by-side lane first. Earlier releases refuse
   the upgraded store with an `unexpected default-column-family key` admission
   error.
+- A release whose default reorg window is 1000 blocks also raises existing
+  stores on first start unless `reorg_window_blocks` is set explicitly. The
+  raise cannot be undone in place either; see
+  [Reorg-window sizing](initial-sync.md#reorg-window-sizing).
 - Check that the store's visible tip is below the new upgrade's activation
   height. The writer refuses a new activation at or below the tip, because
   blocks already stored were interpreted without it.

@@ -23,9 +23,9 @@ use tonic::{
 };
 use zinder_client::{
     BlockHeight, BlockHeightRange, Capability, CapabilityDescriptor, ChainEvent, ChainIndex,
-    ConsensusBranchId, EndpointBackedIndex, EventStreamStart, Network, NetworkUpgradeActivation,
-    OwnedChainSnapshot, RemoteChainIndex, RemoteOpenOptions, TransactionId,
-    TransparentAddressScriptHash, TransparentAddressTxIdsQuery, TransparentOutPoint,
+    ConsensusBranchId, EndpointBackedIndex, EventStreamStart, IndexerError, Network,
+    NetworkUpgradeActivation, OwnedChainSnapshot, RemoteChainIndex, RemoteOpenOptions, RetryPolicy,
+    TransactionId, TransparentAddressScriptHash, TransparentAddressTxIdsQuery, TransparentOutPoint,
     TransparentUnspentOutput,
 };
 use zinder_proto::capabilities::{
@@ -94,6 +94,70 @@ async fn remote_chain_index_round_trips_chain_index_calls_over_grpc() -> eyre::R
     ));
     assert!(!first_event.cursor.as_bytes().is_empty());
 
+    Ok(())
+}
+
+/// A canonical writer parked by a reorg deeper than its window reaches the
+/// client as one typed error on new reads and on an already open
+/// chain-event stream.
+#[tokio::test]
+async fn parked_writer_halt_reaches_unary_reads_and_open_chain_event_streams() -> eyre::Result<()> {
+    let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let store_fixture =
+        StoreFixture::with_chain_committed(&chain_fixture, zinder_client::ChainEpochId::new(1))?;
+    let wallet_query = WalletQuery::new(
+        store_fixture.chain_store().clone(),
+        MockTransactionBroadcaster::broadcast_disabled(),
+        Arc::new(sample_regtest_upgrade_activations()),
+    );
+    let readiness = zinder_runtime::Readiness::new(zinder_runtime::ReadinessState::ready(Some(2)));
+    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default())
+        .with_traffic_readiness(readiness.clone());
+    let endpoint = spawn_gated_wallet_query(grpc_adapter, readiness.clone()).await?;
+    let chain_index = RemoteChainIndex::connect(RemoteOpenOptions {
+        endpoint,
+        network: Network::ZcashRegtest,
+    })?;
+    let mut events = chain_index
+        .chain_events(EventStreamStart::EarliestRetained)
+        .await?;
+    tokio::time::timeout(Duration::from_secs(2), events.next())
+        .await?
+        .ok_or_else(|| eyre!("chain-events stream closed before first event"))??;
+
+    readiness.set(zinder_runtime::ReadinessState::reorg_window_exceeded(
+        1_001,
+        1_000,
+        Some(1_000),
+        Some(2),
+    ));
+    let stream_halt = loop {
+        match tokio::time::timeout(Duration::from_secs(2), events.next()).await? {
+            Some(Ok(_)) => {}
+            Some(Err(error)) => break error,
+            None => return Err(eyre!("chain-events stream ended without a typed halt")),
+        }
+    };
+    let unary_halt = chain_index
+        .current_epoch()
+        .await
+        .err()
+        .ok_or_else(|| eyre!("a parked writer must refuse new reads"))?;
+
+    for halt in [&stream_halt, &unary_halt] {
+        assert!(
+            matches!(
+                halt,
+                IndexerError::ReorgWindowExceeded {
+                    replacement_depth_blocks: Some(1_001),
+                    reorg_window_blocks: Some(1_000),
+                    covered_depth_blocks: Some(1_000),
+                }
+            ),
+            "{halt:?}"
+        );
+        assert_eq!(halt.retry_policy(), RetryPolicy::OperatorActionRequired);
+    }
     Ok(())
 }
 
@@ -514,6 +578,31 @@ async fn spawn_malformed_chain_event_service(
             .serve_with_incoming(incoming)
             .await;
     });
+    Ok(format!("http://{addr}"))
+}
+
+async fn spawn_gated_wallet_query<QueryApi>(
+    grpc_adapter: WalletQueryGrpcAdapter<QueryApi>,
+    readiness: zinder_runtime::Readiness,
+) -> eyre::Result<String>
+where
+    QueryApi: WalletQueryApi,
+    WalletQueryGrpcAdapter<QueryApi>: zinder_proto::v1::wallet::wallet_query_server::WalletQuery,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let incoming = TcpListenerStream::new(listener);
+    let gated = tonic::service::interceptor::InterceptedService::new(
+        grpc_adapter.into_server(),
+        zinder_runtime::TrafficReadinessInterceptor::new(readiness),
+    );
+    tokio::spawn(async move {
+        let _server_result = Server::builder()
+            .add_service(gated)
+            .serve_with_incoming(incoming)
+            .await;
+    });
+
     Ok(format!("http://{addr}"))
 }
 

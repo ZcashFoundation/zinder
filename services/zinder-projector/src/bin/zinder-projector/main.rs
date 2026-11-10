@@ -280,7 +280,8 @@ async fn run_owned_projector(
             config.network,
             config.wallet_rocksdb_budget,
         ) {
-            Ok(wallet) => {
+            Ok(mut wallet) => {
+                raise_wallet_reorg_depth(&mut wallet, canonical.reorg_policy())?;
                 let wallet_source =
                     WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
                 match admit_resumed_following(
@@ -1125,6 +1126,28 @@ fn set_following_syncing(
         Some(wallet_height),
         Some(target_height),
     ));
+}
+
+/// Binds a resumed wallet's undo depth to the canonical effective window,
+/// which canonical admission already matched against this projector's
+/// configured window.
+fn raise_wallet_reorg_depth(
+    wallet: &mut RocksDbWalletFollowingStore,
+    canonical_reorg_policy: CanonicalReorgPolicy,
+) -> Result<(), ProjectorError> {
+    let previous_depth = wallet.supported_reorg_depth();
+    let reorg_window_blocks = canonical_reorg_policy.reorg_window_blocks();
+    wallet.raise_supported_reorg_depth(reorg_window_blocks)?;
+    if previous_depth != reorg_window_blocks {
+        tracing::info!(
+            target: "zinder::projector",
+            event = "wallet_projection_reorg_depth_raised",
+            previous_supported_reorg_depth = previous_depth,
+            supported_reorg_depth = reorg_window_blocks,
+            "raised the wallet's supported reorg depth to the canonical window; retained undo rows grow with new blocks"
+        );
+    }
+    Ok(())
 }
 
 /// Executes one next retained-event transition.
@@ -2473,6 +2496,7 @@ mod tests {
         commits_remaining: Option<u32>,
         catch_ups: u32,
         schedule_lag_catch_ups: u32,
+        tip_unconfirmed: bool,
     }
 
     impl ScriptedProbe {
@@ -2483,6 +2507,7 @@ mod tests {
                 commits_remaining,
                 catch_ups: 0,
                 schedule_lag_catch_ups: 0,
+                tip_unconfirmed: false,
             }
         }
     }
@@ -2507,7 +2532,10 @@ mod tests {
                 }
                 None => self.writer_sequence += 1,
             }
-            Ok(writer_status(source_identity(self.writer_sequence, 7)))
+            Ok(CanonicalWriterStatusResponse {
+                tip_unconfirmed: self.tip_unconfirmed,
+                ..writer_status(source_identity(self.writer_sequence, 7))
+            })
         }
     }
 
@@ -2537,6 +2565,29 @@ mod tests {
 
         assert!(matches!(outcome, Ok(FenceConvergence::Converged)));
         assert_eq!(probe.catch_ups, 7);
+        assert!(readiness.report().is_ready);
+    }
+
+    /// The projector converges on, and stays ready against, a writer that has
+    /// not confirmed its tip since it reopened; only wallet-serving readers
+    /// refuse that fence.
+    #[tokio::test]
+    async fn fence_convergence_ignores_an_unconfirmed_writer_tip() {
+        let mut probe = ScriptedProbe::new(Some(0));
+        probe.tip_unconfirmed = true;
+        let readiness =
+            zinder_runtime::Readiness::new(zinder_runtime::ReadinessState::ready(Some(1)));
+
+        let outcome = converge_probe_on_writer_fence(
+            &mut probe,
+            test_network(),
+            &readiness,
+            &CancellationToken::new(),
+            fast_policy(Duration::from_secs(5)),
+        )
+        .await;
+
+        assert!(matches!(outcome, Ok(FenceConvergence::Converged)));
         assert!(readiness.report().is_ready);
     }
 
@@ -2990,6 +3041,8 @@ mod tests {
             }),
             oldest_retained_event_sequence: 1,
             network_upgrade_schedule: None,
+            reorg_window_exceeded: None,
+            tip_unconfirmed: false,
         }
     }
 

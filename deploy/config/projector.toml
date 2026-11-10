@@ -22,7 +22,7 @@ raw_blob_policy = "transactions"
 path = "/var/lib/zinder/wallet"
 
 [projector]
-reorg_window_blocks = 100
+reorg_window_blocks = 1000
 lease_duration_seconds = 14400
 
 [ingest_control]

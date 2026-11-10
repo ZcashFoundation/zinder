@@ -753,7 +753,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Exact canonical replacement-depth identity expected by native query. Must \
-                      be greater than zero and match the canonical writer. Defaults to 100.",
+                      be greater than zero and match the canonical writer. Defaults to 1000.",
     },
     EnvVarDoc {
         name: "ZINDER_QUERY__PAIR_CONVERGENCE_ATTEMPTS",
@@ -790,7 +790,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Exact canonical replacement-depth identity expected by compatibility. Must \
-                      be greater than zero and match the canonical writer. Defaults to 100.",
+                      be greater than zero and match the canonical writer. Defaults to 1000.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__PAIR_CONVERGENCE_ATTEMPTS",
@@ -919,7 +919,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Chain-truth invariant: how deep the live reorg window extends. Bounds \
                       settlement, classifier default, and replacement traversal. Must be \
-                      greater than zero. Defaults to 100.",
+                      greater than zero. Defaults to 1000, Zebra's finalization depth. A larger \
+                      value raises an existing store's window in place; a smaller one is \
+                      refused.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__MEMPOOL__MAX_TRANSACTION_COUNT",
@@ -959,7 +961,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Wallet undo suffix depth and expected canonical replacement policy. Must \
-                      match the canonical writer. Defaults to 100.",
+                      match the canonical writer. Defaults to 1000.",
     },
     EnvVarDoc {
         name: "ZINDER_PROJECTOR__BUILD_OWNER_HEX",
@@ -1182,6 +1184,18 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Block lag at which tip-follow reports `cause=syncing`. Defaults to 1.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_INGEST__FOLLOW__MAX_REPLACEMENT_BYTES",
+        toml_path: "ingest.follow.max_replacement_bytes",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Maximum estimated bytes one canonical replacement may hold before its \
+                      atomic commit: fetched source blocks not yet prepared plus prepared \
+                      blocks. A deeper or heavier replacement fails with \
+                      `ReplacementBytesExceeded` before any write; raise the limit to follow \
+                      it. Defaults to 2147483648.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__RUN_OVERRIDES__TARGET_HEIGHT",

@@ -16,11 +16,13 @@ use super::{
         validate_live_block,
     },
     block_replay::{BLOCK_REPLAY_COLUMN_FAMILY, resume_persisted_sequence_checkpoint},
-    control::encode_ready_store_control_with_schedule,
+    control::encode_ready_store_control_with_revisions,
     publication::{
-        column_family, encode_live_append_event, encode_live_chain_epoch, read_chain_epoch_tips,
-        validate_live_append_publication, validate_ready_sequence_checkpoint, validate_settled_tip,
+        advance_ready_replay_tail, column_family, encode_live_append_event,
+        encode_live_chain_epoch, read_chain_epoch_tips, validate_live_append_publication,
+        validate_settled_tip,
     },
+    replay_tail::AuthenticatedReplayTail,
     rocksdb::{
         BLOCK_BLOB_COLUMN_FAMILY, BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
         BLOCK_HASH_INDEX_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY, CHAIN_EPOCH_COLUMN_FAMILY,
@@ -192,7 +194,14 @@ impl RocksDbCanonicalStore {
                 },
             )?;
         abort_at_live_commit_failpoint("after_atomic_write");
-        validate_live_commit_readback(&self.bounded_open.db, &self.build_plan, &prepared).map_err(
+        let reorg_policy = self.reorg_policy();
+        validate_live_commit_readback(
+            &self.bounded_open.db,
+            reorg_policy,
+            &mut self.replay_tail,
+            &prepared,
+        )
+        .map_err(
             |source| CanonicalStoreError::LiveCommitCompletedButUnverified {
                 path: self.bounded_open.db.path().to_path_buf(),
                 reason: source.to_string(),
@@ -296,12 +305,12 @@ impl PreparedLiveAppendCommit {
             sequence_checkpoint,
             ..store.ready_evidence
         };
-        let encoded_control = encode_ready_store_control_with_schedule(
+        let encoded_control = encode_ready_store_control_with_revisions(
             store.workload,
             &store.build_plan,
             store.cursor_auth_key,
             &ready_evidence,
-            store.activation_schedule_binding(),
+            store.control_revisions(),
         )
         .map_err(|source| CanonicalStoreError::live_commit(source.to_string()))?;
         Ok(Self {
@@ -880,7 +889,8 @@ impl PreparedLiveRow {
 
 fn validate_live_commit_readback(
     db: &DB,
-    build_plan: &super::CanonicalStoreBuildPlan,
+    reorg_policy: super::CanonicalReorgPolicy,
+    replay_tail: &mut AuthenticatedReplayTail,
     prepared: &PreparedLiveAppendCommit,
 ) -> Result<(), CanonicalStoreError> {
     prepared.block_rows.validate_readback(db)?;
@@ -917,7 +927,21 @@ fn validate_live_commit_readback(
         ));
     }
     validate_live_append_publication(db, &prepared.ready_evidence, prepared.previous_epoch_id)?;
-    validate_ready_sequence_checkpoint(db, build_plan, &prepared.ready_evidence)
+    let previous_visible_height = prepared
+        .ready_evidence
+        .visible_tip
+        .height
+        .value()
+        .checked_sub(1)
+        .map(BlockHeight::new)
+        .ok_or_else(|| CanonicalStoreError::live_commit("live append height has no parent"))?;
+    advance_ready_replay_tail(
+        db,
+        reorg_policy,
+        &prepared.ready_evidence,
+        previous_visible_height,
+        replay_tail,
+    )
 }
 
 #[cfg(test)]

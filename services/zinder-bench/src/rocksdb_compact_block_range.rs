@@ -17,7 +17,7 @@ use zinder_store::{
 };
 
 const RANGE_BLOCK_COUNTS: [u32; 3] = [128, 512, 1_024];
-const DEFAULT_SUPPORTED_REORG_DEPTH: u32 = 100;
+const DEFAULT_SUPPORTED_REORG_DEPTH: u32 = zinder_store::DEFAULT_REORG_WINDOW_BLOCKS;
 const OUTPUT_DIGEST_DOMAIN: &[u8] = b"zinder-bench-compact-block-range-output-v2\0";
 
 /// CLI contract for measuring compact-block range reads from one READY store.

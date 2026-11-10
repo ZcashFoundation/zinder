@@ -134,13 +134,26 @@ fence, and wallet digest.
 | --- | --- | --- |
 | ingest | `starting` or `syncing` | Canonical lag is within threshold and mempool snapshot is complete |
 | projector | `starting` or `syncing` | Wallet store is published and following the admitted canonical source |
-| native query | `starting`, `replica_lagging`, `writer_status_unavailable`, or `ingest_control_unavailable` | One exact canonical and wallet pair is published, the admitted node is healthy, and `WriterStatus` plus a bounded mempool snapshot succeed through the admitted ingest-control channel |
-| compatibility | `starting`, `replica_lagging`, or `writer_status_unavailable` | One exact canonical and wallet pair is published |
+| native query | `starting`, `replica_lagging`, `writer_status_unavailable`, `ingest_control_unavailable`, or `canonical_tip_unconfirmed` | One exact canonical and wallet pair is published, the admitted node is healthy, and `WriterStatus` plus a bounded mempool snapshot succeed through the admitted ingest-control channel |
+| compatibility | `starting`, `replica_lagging`, `writer_status_unavailable`, or `canonical_tip_unconfirmed` | One exact canonical and wallet pair (or, for compact-block serving, one canonical reader) is published, and the writer has confirmed its tip against its node and does not report a park |
 
 After the first publication, a reader that loses writer status or falls behind
 reports `serving_pair_stale` and keeps answering from its published pair until
 the staleness ceiling passes; only then does it fall back to
 `writer_status_unavailable` or `replica_lagging` and stop admitting traffic.
+
+A parked canonical writer keeps answering writer status with its frozen fence
+and its halt. Native query and both compatibility serving modes then report
+`reorg_window_exceeded` and refuse wallet traffic with
+`REORG_WINDOW_EXCEEDED`, never `ready` on the frozen tip.
+
+After ingest restarts, native query and both compatibility serving modes
+report `canonical_tip_unconfirmed` until ingest's first source observation
+confirms the store's tip against the node, which normally takes one poll. If
+ingest cannot reach the node, they stay unready for as long as the outage
+lasts; restore the node rather than restarting the readers. A writer that
+finds a fork deeper than the window on that first observation parks, and the
+readers move straight to `reorg_window_exceeded`.
 
 `node_unavailable`, `upstream_not_ready`, and
 `ingest_control_unavailable` are recoverable dependency conditions. For native
@@ -154,26 +167,61 @@ identity mismatches require operator action.
 
 ### Reorg-window sizing
 
-The default 100-block reorg window is an operating baseline, not a consensus
-finality guarantee. Size the window above the longest plausible competing-branch
-duration for the deployed network, expressed in blocks, and include headroom for
-same-height mining races. Hashpower concentration increases this risk: a dominant
-miner can extend one branch while a minority branch remains visible long enough
-for the trailing settled-tip boundary to advance past their common parent.
+The default reorg window is 1000 blocks, the depth past which Zebra 7 and
+Zakura finalize blocks. Neither node can present a deeper reorg, so ingest
+parks with `reorg_window_exceeded` only on a change the node itself could not
+produce, such as a replaced or resynced node. The window is not a consensus
+finality guarantee.
 
-On 2026-07-20, a Zcash testnet mining race produced a 114-block reorg after the
-losing branch had remained visible for more than an hour; a 100-block window was
-insufficient, and operators increased the production testnet window to 300. Use
-that incident as sizing evidence for similarly concentrated test networks, not
-as a universal value. Larger windows retain more replaceable state and wallet
-undo data, so capacity planning must cover the selected headroom. Configure the
-same window for ingest, projector, native query, and compatibility admission.
+A smaller window parks on reorgs the node can produce. On 2026-07-20, a Zcash
+testnet mining race produced a 114-block reorg after the losing branch had
+remained visible for more than an hour, which exceeded the 100-block window
+then in use. Production testnet moved to 300 blocks, and the node's bound is
+higher still.
+
+A replacement commits atomically, so ingest holds its whole suffix, up to one
+window of blocks, in memory first: the raw blocks fork discovery fetched, then
+their prepared form. `ingest.follow.max_replacement_bytes` (2 GiB by default)
+bounds the estimated sum of both, so set it within the container's memory with
+headroom for the one block being decoded. A replacement that would exceed it
+fails before any write with `ReplacementBytesExceeded`, naming the depth, the
+blocks prepared (zero when discovery alone exceeded it), and the bytes held. A fork deeper than the window still parks with
+`reorg_window_exceeded` even when discovery exhausts the budget.
+This is not a park: ingest exits, and under the wallet-serving image's
+`ALWAYS` restart policy the container restarts, discovers the same fork, and
+fails again, with wallets seeing an unavailable service instead of
+`REORG_WINDOW_EXCEEDED`. Raise the limit to follow the reorg.
+
+The settled tip trails the visible tip by the window, so surfaces that report
+settlement or finality report it 1000 blocks behind the visible tip. Wallet
+undo rows scale with the window; construction accounts for them against
+`projector.build.max_accounted_reorg_undo_bytes`. Configure the same window for
+ingest, projector, native query, and compatibility admission.
+
+Upgrading to a release whose default is 1000 blocks raises existing stores the
+first time ingest starts, when the deployment relies on the default, the shipped
+`deploy/config` files, or the wallet-serving image. That raise is irreversible
+in place, so capture a state bundle before starting the new release if you need
+a rollback path.
+
+To raise the window on an existing deployment, restart the canonical writer
+with the larger window first, then restart the projector, native query, and
+compatibility with the same value. The writer records the raise in place and
+holds the settled tip until the visible tip is a full new window above it, so
+replaceable depth grows with new blocks rather than all at once. The projector
+raises the wallet's undo depth when it resumes. A reader still on the old
+window refuses to open or to catch up until it restarts with the new one.
+Earlier releases cannot open a raised store. If you might need to roll back
+to an earlier Zinder release, capture a state bundle or keep a certified
+side-by-side lane before raising. Lowering the window
+in place is refused; rebuild, or restore a state captured under the smaller
+window. See [ADR-0041](../adrs/0041-reorg-window-follows-the-node-bound.md).
 
 When a replacement exceeds the configured window, ingest drains readiness and
 parks for operator inspection until termination. Restarting does not make the
-settled store replaceable. Confirm the authoritative branch, choose an approved
-window from observed network behavior, and rebuild or restore a coherent state
-bundle under that policy before returning the service to traffic.
+settled store replaceable. Confirm the authoritative branch and the node's
+health, then rebuild or restore a coherent state bundle before returning the
+service to traffic.
 
 ## Memory and storage pressure
 

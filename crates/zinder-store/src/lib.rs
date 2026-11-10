@@ -55,10 +55,10 @@ pub use canonical_store::{
     CanonicalStoreBuildPlan, CanonicalStoreBuildPlanError, CanonicalStoreBuildState,
     CanonicalStoreError, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
     CanonicalSubtreeRootLoadCoverage, CanonicalSubtreeRootLoadEvidence,
-    MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS, PreparedCanonicalBaselinePublication,
-    ProjectionBuildAnchor, ProjectionBuildLease, ProjectionBuildLeaseId, RocksDbCanonicalBuilder,
-    RocksDbCanonicalSecondary, RocksDbCanonicalStore, TREE_STATE_CHECKPOINT_STRIDE,
-    ValidatedRocksDbCanonicalBuild,
+    DEFAULT_REORG_WINDOW_BLOCKS, MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS,
+    PreparedCanonicalBaselinePublication, ProjectionBuildAnchor, ProjectionBuildLease,
+    ProjectionBuildLeaseId, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
+    RocksDbCanonicalStore, TREE_STATE_CHECKPOINT_STRIDE, ValidatedRocksDbCanonicalBuild,
 };
 pub use chain_epoch::{ChainEpochArtifacts, ReorgWindowChange};
 pub use chain_epoch_reader::ChainEpochReader;

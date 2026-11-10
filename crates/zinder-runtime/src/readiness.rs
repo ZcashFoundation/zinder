@@ -9,18 +9,21 @@
 //! type below converts to the proto message via [`Into`] for any gRPC
 //! consumer.
 
-use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Duration};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use serde::Serialize;
+use tokio::time::Instant;
 use tonic::{Request, Status, service::Interceptor};
 use tonic_types::ErrorDetails;
+use zinder_core::{Network, wire::encode_zinder_native_chain_name};
 use zinder_proto::{
     status_with_reason_and_metadata,
     v1::{
         ingest as ingest_proto,
         ops::{self as ops_proto, ErrorReason},
     },
+    wire::encode_reorg_window_exceeded_metadata,
 };
 
 /// Current phase of the phase-driven ingest loop ([ADR-0015]).
@@ -122,6 +125,11 @@ pub enum ReadinessCause {
         depth: u64,
         /// Configured reorg window in blocks.
         configured: u64,
+        /// Replaceable depth the window covered when the replacement was
+        /// refused. Below `configured` while a raised window is still growing
+        /// toward it; `None` when the reporter did not supply it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        covered: Option<u64>,
     },
     /// A `RocksDB` secondary reader is behind the primary beyond the configured threshold.
     ReplicaLagging {
@@ -147,6 +155,11 @@ pub enum ReadinessCause {
     /// The authenticated ingest-control channel or one of its required live
     /// health RPCs is temporarily unavailable.
     IngestControlUnavailable,
+    /// The canonical writer has not confirmed its store's visible tip against
+    /// its node since it opened the store, so its fence may sit on a branch
+    /// the node abandoned. Clears once the writer observes that tip on the
+    /// node's branch or commits past it.
+    CanonicalTipUnconfirmed,
     /// Retained event history is approaching the configured cursor-expiry window.
     CursorAtRisk {
         /// Age of the oldest retained event, rounded down to whole hours.
@@ -317,6 +330,7 @@ impl ReadinessCause {
         "serving_pair_stale",
         "writer_status_unavailable",
         "ingest_control_unavailable",
+        "canonical_tip_unconfirmed",
         "cursor_at_risk",
         "shutting_down",
         "upstream_not_ready",
@@ -338,6 +352,7 @@ impl ReadinessCause {
             Self::ServingPairStale { .. } => "serving_pair_stale",
             Self::WriterStatusUnavailable => "writer_status_unavailable",
             Self::IngestControlUnavailable => "ingest_control_unavailable",
+            Self::CanonicalTipUnconfirmed => "canonical_tip_unconfirmed",
             Self::CursorAtRisk { .. } => "cursor_at_risk",
             Self::ShuttingDown => "shutting_down",
             Self::UpstreamNotReady(_) => "upstream_not_ready",
@@ -366,6 +381,7 @@ impl ReadinessCause {
             | Self::ServingPairStale { .. }
             | Self::WriterStatusUnavailable
             | Self::IngestControlUnavailable
+            | Self::CanonicalTipUnconfirmed
             | Self::CursorAtRisk { .. }
             | Self::ShuttingDown
             | Self::UpstreamNotReady(_) => None,
@@ -438,11 +454,19 @@ struct MaterializedViewWorkload {
     identities: Vec<String>,
 }
 
+/// Readiness state and whether it is [parked](Readiness::park), guarded by
+/// one lock so a park and a concurrent write cannot interleave.
+#[derive(Debug)]
+struct GuardedReadiness {
+    state: ReadinessState,
+    parked: bool,
+}
+
 /// Internal readiness state guarded by an `Arc<Mutex<_>>` so HTTP handlers
 /// and runtime tasks can update and observe the same value.
 #[derive(Clone, Debug)]
 pub struct Readiness {
-    inner: Arc<Mutex<ReadinessState>>,
+    inner: Arc<Mutex<GuardedReadiness>>,
     materialized_view_workload: Arc<Mutex<MaterializedViewWorkload>>,
 }
 
@@ -457,9 +481,42 @@ impl Readiness {
     #[must_use]
     pub fn new(state: ReadinessState) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(state)),
+            inner: Arc::new(Mutex::new(GuardedReadiness {
+                state,
+                parked: false,
+            })),
             materialized_view_workload: Arc::new(Mutex::new(MaterializedViewWorkload::default())),
         }
+    }
+
+    /// Sets a terminal state that later writers cannot replace until the
+    /// process restarts.
+    ///
+    /// A canonical writer parked on a reorg deeper than its window keeps
+    /// serving its control plane while other workers still run; none of them
+    /// may replace the halt with a recoverable cause, and the ingest phase it
+    /// was parked in stays fixed. Only [`ReadinessCause::ShuttingDown`]
+    /// replaces a parked state, and a shutdown already in progress keeps its
+    /// cause: the process is draining and the halt would be stale.
+    pub fn park(&self, state: ReadinessState) {
+        // Writers that took the lock earlier are overwritten here, and every
+        // writer that takes it later sees the flag.
+        let mut guard = self.inner.lock();
+        guard.parked = true;
+        if matches!(guard.state.cause, ReadinessCause::ShuttingDown) {
+            return;
+        }
+        let phase = state.phase.or(guard.state.phase);
+        guard.state = state;
+        guard.state.phase = phase;
+    }
+
+    /// Locks the state for a write, or returns `None` when a
+    /// [parked](Self::park) state rejects it. Only a shutdown write passes a
+    /// park.
+    fn lock_unless_parked(&self, shutting_down: bool) -> Option<MutexGuard<'_, GuardedReadiness>> {
+        let guard = self.inner.lock();
+        (!guard.parked || shutting_down).then_some(guard)
     }
 
     /// Sets the closed materialized-view workload exposed by readiness and metrics.
@@ -486,18 +543,24 @@ impl Readiness {
     /// upstream target, so they retain the preceding target through the
     /// warning and its transition back to ready. An explicit
     /// [`ReadinessState::with_phase`] on `state` overrides the phase.
+    ///
+    /// A [parked](Self::park) state ignores every cause except shutdown.
     pub fn set(&self, state: ReadinessState) {
-        let mut guard = self.inner.lock();
+        let shutting_down = matches!(state.cause, ReadinessCause::ShuttingDown);
+        let Some(mut guard) = self.lock_unless_parked(shutting_down) else {
+            return;
+        };
+        let current = &mut guard.state;
         let mut state = state;
-        let phase = state.phase.or(guard.phase);
+        let phase = state.phase.or(current.phase);
         let warning_replaces_chain_state = state.cause.preserves_observed_target();
         let warning_cleared_to_ready = matches!(&state.cause, ReadinessCause::Ready)
-            && guard.cause.preserves_observed_target();
+            && current.cause.preserves_observed_target();
         if warning_replaces_chain_state || warning_cleared_to_ready {
-            state.target_height = guard.target_height;
+            state.target_height = current.target_height;
         }
-        *guard = state;
-        guard.phase = phase;
+        *current = state;
+        current.phase = phase;
     }
 
     /// Atomically mutates the current readiness state.
@@ -506,19 +569,28 @@ impl Readiness {
     /// (for example: setting a new `cause` while preserving the
     /// concurrently-updated `current_height` or `phase`). The lock is
     /// held for the duration of `update`, so concurrent readers and
-    /// writers see the pre- and post-state but never a torn read.
+    /// writers see the pre- and post-state but never a torn read. A
+    /// [parked](Self::park) state ignores updates.
     pub fn update<F>(&self, update: F)
     where
         F: FnOnce(&mut ReadinessState),
     {
-        update(&mut self.inner.lock());
+        if let Some(mut guard) = self.lock_unless_parked(false) {
+            update(&mut guard.state);
+        }
     }
 
     /// Sets the [`IngestPhase`] on the current state without disturbing
     /// any other field. Used by the phase-driven ingest loop's per-iteration
     /// classifier stamp.
+    ///
+    /// A [parked](Self::park) state keeps the phase it was parked in, so a
+    /// worker still classifying phases cannot report catch-up progress for a
+    /// writer that no longer follows.
     pub fn set_phase(&self, phase: IngestPhase) {
-        self.inner.lock().phase = Some(phase);
+        if let Some(mut guard) = self.lock_unless_parked(false) {
+            guard.state.phase = Some(phase);
+        }
     }
 
     /// Returns the current [`IngestPhase`] without cloning the readiness cause.
@@ -527,22 +599,33 @@ impl Readiness {
     /// such as the materialized-view replay phase gate that samples it per replayed event.
     #[must_use]
     pub fn phase(&self) -> Option<IngestPhase> {
-        self.inner.lock().phase
+        self.inner.lock().state.phase
+    }
+
+    /// Returns the halt of a writer parked by a reorg deeper than its window,
+    /// or `None` for any other cause.
+    ///
+    /// Cheaper than [`Self::report`] for hot readers that only check for the
+    /// halt, such as open streams that poll it per page.
+    #[must_use]
+    pub fn reorg_window_exceeded(&self) -> Option<ops_proto::ReorgWindowExceededDetail> {
+        self.inner.lock().state.cause.reorg_window_exceeded_detail()
     }
 
     /// Replaces the cause with [`ReadinessCause::UpstreamNotReady`] while
     /// preserving the writer's last visible `current_height` and any
     /// concurrently-set ingest phase. Used by the upstream-health probe.
     pub fn set_upstream_not_ready(&self, detail: UpstreamNotReadyDetail) {
-        let mut guard = self.inner.lock();
-        guard.cause = ReadinessCause::UpstreamNotReady(detail);
-        guard.target_height = None;
+        if let Some(mut guard) = self.lock_unless_parked(false) {
+            guard.state.cause = ReadinessCause::UpstreamNotReady(detail);
+            guard.state.target_height = None;
+        }
     }
 
     /// Reports the current readiness as a serializable snapshot.
     #[must_use]
     pub fn report(&self) -> ReadinessReport {
-        let state = self.inner.lock().clone();
+        let state = self.inner.lock().state.clone();
         let materialized_view_workload = self.materialized_view_workload.lock().clone();
         ReadinessReport {
             is_ready: state.cause.permits_traffic(),
@@ -580,14 +663,156 @@ impl Interceptor for TrafficReadinessInterceptor {
         if report.is_ready {
             Ok(request)
         } else {
-            let readiness_cause = report.cause.metric_label();
-            Err(status_with_reason_and_metadata(
-                ErrorReason::ServiceNotReady,
-                format!("service is not ready to accept new traffic: {readiness_cause}"),
-                ErrorDetails::new(),
-                HashMap::from([("readiness_cause".to_owned(), readiness_cause.to_owned())]),
-            ))
+            Err(not_ready_status(&report.cause))
         }
+    }
+}
+
+/// Builds the status a gRPC surface returns while `cause` keeps its
+/// readiness gate closed.
+///
+/// `ErrorInfo.metadata["readiness_cause"]` always carries the stable
+/// readiness label. A canonical writer parked by `reorg_window_exceeded`
+/// maps to the typed `REORG_WINDOW_EXCEEDED` reason, with
+/// `replacement_depth_blocks`, `reorg_window_blocks`, and, when known,
+/// `covered_depth_blocks` metadata, because
+/// retrying cannot succeed until an operator reconciles the store. Every
+/// other cause maps to `SERVICE_NOT_READY`.
+#[must_use]
+pub fn not_ready_status(cause: &ReadinessCause) -> Status {
+    let readiness_cause = cause.metric_label();
+    let mut metadata = HashMap::from([("readiness_cause".to_owned(), readiness_cause.to_owned())]);
+    if let Some(
+        halt @ ops_proto::ReorgWindowExceededDetail {
+            depth,
+            configured,
+            covered,
+        },
+    ) = cause.reorg_window_exceeded_detail()
+    {
+        metadata.extend(encode_reorg_window_exceeded_metadata(halt));
+        let coverage = covered.map_or_else(
+            || format!("its {configured}-block reorg window"),
+            |covered| format!("the {covered} blocks its {configured}-block reorg window covered"),
+        );
+        return status_with_reason_and_metadata(
+            ErrorReason::ReorgWindowExceeded,
+            format!(
+                "the canonical writer is parked: a {depth}-block replacement exceeds {coverage}, and an operator must reconcile the canonical store"
+            ),
+            ErrorDetails::new(),
+            metadata,
+        );
+    }
+    status_with_reason_and_metadata(
+        ErrorReason::ServiceNotReady,
+        format!("service is not ready to accept new traffic: {readiness_cause}"),
+        ErrorDetails::new(),
+        metadata,
+    )
+}
+
+/// The canonical writer-status rules a reader applies before it admits
+/// traffic on a reader generation the writer attested.
+///
+/// A writer parked on a reorg deeper than its window, and a writer that has
+/// not confirmed its tip since it reopened, both keep attesting their frozen
+/// fence, so their status refuses traffic instead. A halt is remembered until
+/// a valid status carries neither the halt nor an unconfirmed tip: a writer
+/// that restarts after a park reports the halt again only once it rediscovers
+/// the reorg, and a writer-status outage must not reopen traffic. Only a
+/// following writer with a confirmed tip earns the staleness allowance that
+/// keeps a lagging reader admitting traffic.
+#[derive(Debug)]
+pub struct WriterAttestation {
+    network: Network,
+    staleness_ceiling: Duration,
+    attested_at: Option<Instant>,
+    remembered_halt: Option<ReadinessState>,
+}
+
+impl WriterAttestation {
+    /// Creates the rules for a reader of `network` that may serve a lagging
+    /// reader for `staleness_ceiling` after the writer last attested it.
+    #[must_use]
+    pub const fn new(network: Network, staleness_ceiling: Duration) -> Self {
+        Self {
+            network,
+            staleness_ceiling,
+            attested_at: None,
+            remembered_halt: None,
+        }
+    }
+
+    /// Returns the not-ready state `status` imposes on a reader whose visible
+    /// tip is at `visible_height`, or `None` when the writer follows with a
+    /// confirmed tip.
+    ///
+    /// A refusal withdraws the staleness allowance. A halt or unconfirmed tip
+    /// reported for another network is not honoured; such a status clears the
+    /// remembered halt and falls through to the caller's fence validation.
+    pub fn observe(
+        &mut self,
+        status: &ingest_proto::CanonicalWriterStatusResponse,
+        visible_height: Option<u32>,
+    ) -> Option<ReadinessState> {
+        let refusal = self.refusal(status, visible_height);
+        if refusal.is_some() {
+            self.attested_at = None;
+        }
+        refusal
+    }
+
+    fn refusal(
+        &mut self,
+        status: &ingest_proto::CanonicalWriterStatusResponse,
+        visible_height: Option<u32>,
+    ) -> Option<ReadinessState> {
+        let refusing = |cause| ReadinessState {
+            current_height: visible_height,
+            ..ReadinessState::not_ready(cause)
+        };
+        if status.network_name != encode_zinder_native_chain_name(self.network) {
+            self.remembered_halt = None;
+            return None;
+        }
+        if let Some(halt) = status.reorg_window_exceeded {
+            let halt = refusing(ReadinessCause::from(halt));
+            self.remembered_halt = Some(halt.clone());
+            return Some(halt);
+        }
+        if status.tip_unconfirmed {
+            return Some(
+                self.remembered_halt
+                    .clone()
+                    .unwrap_or_else(|| refusing(ReadinessCause::CanonicalTipUnconfirmed)),
+            );
+        }
+        self.remembered_halt = None;
+        None
+    }
+
+    /// Records that a following writer with a confirmed tip attested the
+    /// reader now.
+    pub fn attest(&mut self) {
+        self.attested_at = Some(Instant::now());
+    }
+
+    /// Returns the halt the writer last reported, which a reader keeps
+    /// publishing through writer-status failures.
+    #[must_use]
+    pub fn remembered_halt(&self) -> Option<ReadinessState> {
+        self.remembered_halt.clone()
+    }
+
+    /// Returns the time since the last attestation while it is below the
+    /// staleness ceiling; `None` once the ceiling passes or while no following
+    /// writer with a confirmed tip has attested the reader.
+    #[must_use]
+    pub fn stale_allowance(&self) -> Option<Duration> {
+        self.attested_at
+            .map(|attested_at| attested_at.elapsed())
+            .filter(|staleness| *staleness < self.staleness_ceiling)
     }
 }
 
@@ -712,13 +937,22 @@ impl ReadinessState {
     /// `/readyz` response includes the chain height the operator should
     /// reconcile against.
     #[must_use]
+    ///
+    /// `covered` is the replaceable depth the window covered when the
+    /// replacement was refused, which is below `configured` while a raised
+    /// window is still growing toward it.
     pub const fn reorg_window_exceeded(
         depth: u64,
         configured: u64,
+        covered: Option<u64>,
         current_height: Option<u32>,
     ) -> Self {
         Self {
-            cause: ReadinessCause::ReorgWindowExceeded { depth, configured },
+            cause: ReadinessCause::ReorgWindowExceeded {
+                depth,
+                configured,
+                covered,
+            },
             current_height,
             target_height: None,
             phase: None,
@@ -838,6 +1072,7 @@ impl From<&ReadinessCause> for ops_proto::ReadinessCause {
             ReadinessCause::ServingPairStale { .. } => Self::ServingPairStale,
             ReadinessCause::WriterStatusUnavailable => Self::WriterStatusUnavailable,
             ReadinessCause::IngestControlUnavailable => Self::IngestControlUnavailable,
+            ReadinessCause::CanonicalTipUnconfirmed => Self::CanonicalTipUnconfirmed,
             ReadinessCause::CursorAtRisk { .. } => Self::CursorAtRisk,
             ReadinessCause::ShuttingDown => Self::ShuttingDown,
             ReadinessCause::UpstreamNotReady(_) => Self::UpstreamNotReady,
@@ -848,6 +1083,41 @@ impl From<&ReadinessCause> for ops_proto::ReadinessCause {
 impl From<ReadinessCause> for ops_proto::ReadinessCause {
     fn from(cause: ReadinessCause) -> Self {
         Self::from(&cause)
+    }
+}
+
+impl From<ops_proto::ReorgWindowExceededDetail> for ReadinessCause {
+    /// Maps a parked writer's reported halt to the cause a reader projects.
+    fn from(detail: ops_proto::ReorgWindowExceededDetail) -> Self {
+        Self::ReorgWindowExceeded {
+            depth: detail.depth,
+            configured: detail.configured,
+            covered: detail.covered,
+        }
+    }
+}
+
+impl ReadinessCause {
+    /// Returns the halt a parked writer reports for this cause, or `None`
+    /// for every cause other than [`ReadinessCause::ReorgWindowExceeded`].
+    #[must_use]
+    pub const fn reorg_window_exceeded_detail(
+        &self,
+    ) -> Option<ops_proto::ReorgWindowExceededDetail> {
+        if let Self::ReorgWindowExceeded {
+            depth,
+            configured,
+            covered,
+        } = *self
+        {
+            Some(ops_proto::ReorgWindowExceededDetail {
+                depth,
+                configured,
+                covered,
+            })
+        } else {
+            None
+        }
     }
 }
 
@@ -870,14 +1140,17 @@ impl From<&ReadinessCause> for Option<ops_proto::ReadinessCauseDetail> {
                     },
                 )
             }
-            ReadinessCause::ReorgWindowExceeded { depth, configured } => {
-                ops_proto::readiness_cause_detail::Payload::ReorgWindowExceeded(
-                    ops_proto::ReorgWindowExceededDetail {
-                        depth: *depth,
-                        configured: *configured,
-                    },
-                )
-            }
+            ReadinessCause::ReorgWindowExceeded {
+                depth,
+                configured,
+                covered,
+            } => ops_proto::readiness_cause_detail::Payload::ReorgWindowExceeded(
+                ops_proto::ReorgWindowExceededDetail {
+                    depth: *depth,
+                    configured: *configured,
+                    covered: *covered,
+                },
+            ),
             ReadinessCause::ReplicaLagging { lag_chain_epochs } => {
                 ops_proto::readiness_cause_detail::Payload::ReplicaLagging(
                     ops_proto::ReplicaLaggingDetail {
@@ -924,6 +1197,7 @@ impl From<&ReadinessCause> for Option<ops_proto::ReadinessCauseDetail> {
             | ReadinessCause::SchemaMismatch
             | ReadinessCause::WriterStatusUnavailable
             | ReadinessCause::IngestControlUnavailable
+            | ReadinessCause::CanonicalTipUnconfirmed
             | ReadinessCause::ShuttingDown => return None,
         };
         Some(ops_proto::ReadinessCauseDetail {
@@ -1019,7 +1293,95 @@ mod tests {
             .err()
             .ok_or("schema mismatch readiness must reject new traffic")?;
         assert_eq!(blocked.code(), tonic::Code::Unavailable);
+
+        readiness.set(ReadinessState::reorg_window_exceeded(
+            1_001,
+            1_000,
+            Some(100),
+            Some(100),
+        ));
+        let halted = interceptor
+            .call(Request::new(()))
+            .err()
+            .ok_or("a parked writer must reject new traffic")?;
+        assert_eq!(halted.code(), tonic::Code::FailedPrecondition);
+        let halted_error_details = halted.get_error_details();
+        let halted_error_info = halted_error_details
+            .error_info()
+            .ok_or("a halt rejection must carry ErrorInfo")?;
+        assert_eq!(
+            halted_error_info.reason,
+            ErrorReason::ReorgWindowExceeded.as_str_name()
+        );
+        for (key, expected) in [
+            ("readiness_cause", "reorg_window_exceeded"),
+            ("replacement_depth_blocks", "1001"),
+            ("reorg_window_blocks", "1000"),
+            ("covered_depth_blocks", "100"),
+        ] {
+            assert_eq!(
+                halted_error_info.metadata.get(key).map(String::as_str),
+                Some(expected)
+            );
+        }
         Ok(())
+    }
+
+    #[test]
+    fn parking_during_shutdown_keeps_the_shutdown_cause() {
+        let readiness = Readiness::new(ReadinessState::ready(Some(10)));
+        readiness.set(ReadinessState::not_ready(ReadinessCause::ShuttingDown));
+        readiness.park(
+            ReadinessState::reorg_window_exceeded(1_001, 1_000, Some(1_000), Some(10))
+                .with_phase(IngestPhase::FollowingTip),
+        );
+        assert!(matches!(
+            readiness.report().cause,
+            ReadinessCause::ShuttingDown
+        ));
+        readiness.set(ReadinessState::ready(Some(11)));
+        assert!(matches!(
+            readiness.report().cause,
+            ReadinessCause::ShuttingDown
+        ));
+    }
+
+    #[test]
+    fn parked_readiness_keeps_its_halt_until_shutdown() {
+        let readiness = Readiness::new(ReadinessState::ready(Some(10)));
+        readiness.park(
+            ReadinessState::reorg_window_exceeded(1_001, 1_000, Some(1_000), Some(10))
+                .with_phase(IngestPhase::FollowingTip),
+        );
+        readiness.set(ReadinessState::ready(Some(11)));
+        readiness.set_upstream_not_ready(UpstreamNotReadyDetail {
+            upstream_committed_height: None,
+            upstream_estimated_height: None,
+            upstream_verification_progress: None,
+            upstream_health: UpstreamHealth {
+                source: "zebra_ready_endpoint",
+                reason: Cow::Borrowed("syncing"),
+            },
+        });
+        readiness.update(|state| state.cause = ReadinessCause::Ready);
+        readiness.set_phase(IngestPhase::BulkCatchup);
+        let report = readiness.report();
+        assert!(!report.is_ready);
+        assert!(matches!(
+            report.cause,
+            ReadinessCause::ReorgWindowExceeded {
+                depth: 1_001,
+                configured: 1_000,
+                ..
+            }
+        ));
+        assert_eq!(report.phase, Some(IngestPhase::FollowingTip));
+
+        readiness.set(ReadinessState::not_ready(ReadinessCause::ShuttingDown));
+        assert!(matches!(
+            readiness.report().cause,
+            ReadinessCause::ShuttingDown
+        ));
     }
 
     #[test]
@@ -1227,17 +1589,33 @@ mod tests {
 
     #[test]
     fn reorg_window_exceeded_carries_depth_and_configured() {
-        let readiness = Readiness::new(ReadinessState::reorg_window_exceeded(12, 10, Some(100)));
+        let readiness = Readiness::new(ReadinessState::reorg_window_exceeded(
+            12,
+            10,
+            Some(11),
+            Some(100),
+        ));
         let report = readiness.report();
         assert!(!report.is_ready);
         assert!(matches!(
             report.cause,
             ReadinessCause::ReorgWindowExceeded {
                 depth: 12,
-                configured: 10
+                configured: 10,
+                covered: Some(11),
             }
         ));
         assert_eq!(report.current_height, Some(100));
+        assert_eq!(
+            readiness.reorg_window_exceeded(),
+            Some(ops_proto::ReorgWindowExceededDetail {
+                depth: 12,
+                configured: 10,
+                covered: Some(11),
+            })
+        );
+        readiness.set(ReadinessState::ready(Some(100)));
+        assert_eq!(readiness.reorg_window_exceeded(), None);
     }
 
     #[test]
@@ -1289,6 +1667,7 @@ mod tests {
             ReadinessCause::ReorgWindowExceeded {
                 depth: 0,
                 configured: 0,
+                covered: None,
             },
             ReadinessCause::ReplicaLagging {
                 lag_chain_epochs: 0,
@@ -1299,6 +1678,7 @@ mod tests {
             },
             ReadinessCause::WriterStatusUnavailable,
             ReadinessCause::IngestControlUnavailable,
+            ReadinessCause::CanonicalTipUnconfirmed,
             ReadinessCause::CursorAtRisk {
                 oldest_retained_age_hours: 0,
                 retention_hours: 0,
@@ -1350,6 +1730,9 @@ mod tests {
             ReadinessCause::IngestControlUnavailable => {
                 ops_proto::ReadinessCause::IngestControlUnavailable
             }
+            ReadinessCause::CanonicalTipUnconfirmed => {
+                ops_proto::ReadinessCause::CanonicalTipUnconfirmed
+            }
             ReadinessCause::CursorAtRisk { .. } => ops_proto::ReadinessCause::CursorAtRisk,
             ReadinessCause::ShuttingDown => ops_proto::ReadinessCause::ShuttingDown,
             ReadinessCause::UpstreamNotReady(_) => ops_proto::ReadinessCause::UpstreamNotReady,
@@ -1384,6 +1767,7 @@ mod tests {
             ReadinessCause::ReorgWindowExceeded {
                 depth: 0,
                 configured: 0,
+                covered: None,
             },
             ReadinessCause::ReplicaLagging {
                 lag_chain_epochs: 0,
@@ -1394,6 +1778,7 @@ mod tests {
             },
             ReadinessCause::WriterStatusUnavailable,
             ReadinessCause::IngestControlUnavailable,
+            ReadinessCause::CanonicalTipUnconfirmed,
             ReadinessCause::CursorAtRisk {
                 oldest_retained_age_hours: 0,
                 retention_hours: 0,
@@ -1418,6 +1803,7 @@ mod tests {
             cause: ReadinessCause::ReorgWindowExceeded {
                 depth: 12,
                 configured: 10,
+                covered: Some(10),
             },
             current_height: Some(100),
             target_height: None,
@@ -1451,6 +1837,7 @@ mod tests {
         };
         assert_eq!(payload.depth, 12);
         assert_eq!(payload.configured, 10);
+        assert_eq!(payload.covered, Some(10));
     }
 
     #[test]
@@ -1571,5 +1958,114 @@ mod tests {
         let readiness = Readiness::default();
         readiness.set(ReadinessState::ready(Some(3)));
         assert_eq!(readiness.report().phase, None);
+    }
+
+    const ATTESTED_NETWORK: Network = Network::ZcashRegtest;
+
+    fn following_writer_status() -> ingest_proto::CanonicalWriterStatusResponse {
+        ingest_proto::CanonicalWriterStatusResponse {
+            network_name: encode_zinder_native_chain_name(ATTESTED_NETWORK).to_owned(),
+            ..ingest_proto::CanonicalWriterStatusResponse::default()
+        }
+    }
+
+    fn unconfirmed_writer_status() -> ingest_proto::CanonicalWriterStatusResponse {
+        ingest_proto::CanonicalWriterStatusResponse {
+            tip_unconfirmed: true,
+            ..following_writer_status()
+        }
+    }
+
+    fn parked_writer_status() -> ingest_proto::CanonicalWriterStatusResponse {
+        ingest_proto::CanonicalWriterStatusResponse {
+            reorg_window_exceeded: Some(ops_proto::ReorgWindowExceededDetail {
+                depth: 1_001,
+                configured: 1_000,
+                covered: Some(1_000),
+            }),
+            tip_unconfirmed: true,
+            ..following_writer_status()
+        }
+    }
+
+    #[test]
+    fn writer_with_an_unconfirmed_tip_refuses_without_a_staleness_allowance() {
+        let mut attestation = WriterAttestation::new(ATTESTED_NETWORK, Duration::from_mins(1));
+        assert_eq!(
+            attestation.observe(&following_writer_status(), Some(7)),
+            None
+        );
+        attestation.attest();
+        assert!(attestation.stale_allowance().is_some());
+
+        let refusal = attestation.observe(&unconfirmed_writer_status(), Some(7));
+        assert_eq!(
+            refusal,
+            Some(ReadinessState {
+                current_height: Some(7),
+                ..ReadinessState::not_ready(ReadinessCause::CanonicalTipUnconfirmed)
+            })
+        );
+        assert_eq!(attestation.stale_allowance(), None);
+        assert_eq!(attestation.remembered_halt(), None);
+
+        assert_eq!(
+            attestation.observe(&following_writer_status(), Some(7)),
+            None
+        );
+        attestation.attest();
+        assert!(attestation.stale_allowance().is_some());
+    }
+
+    #[test]
+    fn writer_halt_is_remembered_through_a_restart_and_status_failures() {
+        let mut attestation = WriterAttestation::new(ATTESTED_NETWORK, Duration::from_mins(1));
+        attestation.attest();
+        let halt = ReadinessState::reorg_window_exceeded(1_001, 1_000, Some(1_000), Some(7));
+        assert_eq!(
+            attestation.observe(&parked_writer_status(), Some(7)),
+            Some(halt.clone())
+        );
+        assert_eq!(attestation.stale_allowance(), None);
+        assert_eq!(attestation.remembered_halt(), Some(halt.clone()));
+
+        // A restarted writer that has not yet rediscovered the reorg keeps
+        // the remembered halt instead of the unconfirmed cause.
+        assert_eq!(
+            attestation.observe(&unconfirmed_writer_status(), Some(8)),
+            Some(halt.clone())
+        );
+        assert_eq!(attestation.remembered_halt(), Some(halt));
+
+        assert_eq!(
+            attestation.observe(&following_writer_status(), Some(8)),
+            None
+        );
+        assert_eq!(attestation.remembered_halt(), None);
+        assert_eq!(attestation.stale_allowance(), None);
+    }
+
+    #[test]
+    fn writer_status_for_another_network_is_not_a_refusal() {
+        let mut attestation = WriterAttestation::new(ATTESTED_NETWORK, Duration::from_mins(1));
+        assert!(
+            attestation
+                .observe(&parked_writer_status(), Some(7))
+                .is_some()
+        );
+        let other_network = ingest_proto::CanonicalWriterStatusResponse {
+            network_name: encode_zinder_native_chain_name(Network::ZcashTestnet).to_owned(),
+            ..parked_writer_status()
+        };
+        assert_eq!(attestation.observe(&other_network, Some(7)), None);
+        assert_eq!(attestation.remembered_halt(), None);
+    }
+
+    #[test]
+    fn staleness_allowance_ends_at_the_ceiling() {
+        let mut attestation = WriterAttestation::new(ATTESTED_NETWORK, Duration::ZERO);
+        assert_eq!(attestation.stale_allowance(), None);
+        attestation.attest();
+        assert_eq!(attestation.stale_allowance(), None);
     }
 }

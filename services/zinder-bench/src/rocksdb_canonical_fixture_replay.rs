@@ -36,7 +36,7 @@ use zinder_store::{CanonicalStoreReadyEvidence, RawBlobRetention, RocksDbResourc
 
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
-const DEFAULT_SUPPORTED_REORG_DEPTH: u32 = 100;
+const DEFAULT_SUPPORTED_REORG_DEPTH: u32 = zinder_store::DEFAULT_REORG_WINDOW_BLOCKS;
 const DEFAULT_INDEXER_GET_BLOCK_MAX_IN_FLIGHT_REQUESTS: u32 = 12;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -620,7 +620,10 @@ mod tests {
         let validated = cli.replay.validate()?;
 
         assert_eq!(validated.request_timeout.as_secs(), 30);
-        assert_eq!(validated.supported_reorg_depth, 100);
+        assert_eq!(
+            validated.supported_reorg_depth,
+            zinder_store::DEFAULT_REORG_WINDOW_BLOCKS
+        );
         assert_eq!(
             validated.pipeline_limits.max_response_bytes.get(),
             64 * 1024 * 1024
