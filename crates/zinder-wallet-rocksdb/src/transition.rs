@@ -1828,6 +1828,9 @@ mod tests {
         path::Path,
     };
 
+    #[cfg(unix)]
+    use std::num::NonZeroU16;
+
     use tempfile::TempDir;
     use zinder_core::{
         BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
@@ -1843,6 +1846,8 @@ mod tests {
         TransparentUtxoSetCommitment, UnixTimestampMillis, UnsupportedSection,
         encode_canonical_block_replay,
     };
+    #[cfg(unix)]
+    use zinder_core::{TransparentAddressScriptHash, TransparentOutputFact};
     use zinder_store::{
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence,
         CanonicalEventHistoryRequest, CanonicalLiveAppend, CanonicalReorgPolicy,
@@ -1850,6 +1855,8 @@ mod tests {
         RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
     };
     use zinder_testkit::process_crash;
+    #[cfg(unix)]
+    use zinder_wallet_projection::WalletOutpointKey;
     use zinder_wallet_projection::{
         WalletCanonicalSourceIdentity, WalletProjectionBuildLeaseRequest,
         WalletProjectionBuildOwner, WalletProjectionContractError, WalletProjectionDigestBuilder,
@@ -2177,9 +2184,15 @@ mod tests {
     }
 
     #[cfg(unix)]
+    const CRASH_OUTPUT_VALUE_ZAT: u64 = 7;
+
+    #[cfg(unix)]
     #[test]
     fn wallet_transition_reopens_at_one_complete_publication_across_process_abort()
     -> Result<(), Box<dyn std::error::Error>> {
+        let address = TransparentAddressScriptHash::from_bytes([0xc7; 32]);
+        let crash_transaction_id = TransactionId::from_bytes([0xc8; 32]);
+        let created_outpoint = TransparentOutPoint::new(crash_transaction_id, 0);
         for crash_point in ["before_atomic_write", "after_atomic_write"] {
             let temporary = TempDir::new()?;
             let published = publish_checkpointed_wallet(temporary.path())?;
@@ -2190,7 +2203,10 @@ mod tests {
                 101,
                 [0xa0; 32],
                 [0xa1; 32],
-                Vec::new(),
+                vec![coinbase_output_transaction(
+                    crash_transaction_id,
+                    TransparentOutputFact::new(0, CRASH_OUTPUT_VALUE_ZAT, [0xc9], address),
+                )],
             )?;
             let (canonical_store, append_fence) = published.canonical_store.commit_live_append(
                 CanonicalLiveAppend::new(
@@ -2210,30 +2226,98 @@ mod tests {
                 &format!("wallet_projection.transition.{crash_point}"),
             )?;
 
-            let mut reopened = RocksDbWalletStore::open_ready_for_following(
-                temporary.path().join("wallet"),
-                Network::ZcashRegtest,
-                RocksDbResourceBudget::for_local_tests(),
-            )?;
-            let expected_fence = if crash_point == "before_atomic_write" {
-                initial_fence
-            } else {
+            let committed = crash_point == "after_atomic_write";
+            let expected_fence = if committed {
                 append_fence
+            } else {
+                initial_fence
             };
-            let evidence = reopened.ready_evidence();
-            assert_eq!(evidence.source_position.tip, expected_fence.visible_tip());
-            assert_eq!(
-                evidence.source_sequence_digest,
-                expected_fence.sequence_digest()
-            );
-            if crash_point == "before_atomic_write" {
+            assert_crash_transition_rows(
+                temporary.path(),
+                expected_fence,
+                address,
+                created_outpoint,
+                committed,
+            )?;
+            if !committed {
+                let mut reopened = RocksDbWalletStore::open_ready_for_following(
+                    temporary.path().join("wallet"),
+                    Network::ZcashRegtest,
+                    RocksDbResourceBudget::for_local_tests(),
+                )?;
                 let secondary = open_checkpointed_secondary(temporary.path(), "resume-secondary")?;
                 apply_next_retained_event(&secondary, &mut reopened)?;
-                assert_eq!(
-                    reopened.ready_evidence().source_position.tip,
-                    append_fence.visible_tip()
-                );
+                drop(reopened);
+                assert_crash_transition_rows(
+                    temporary.path(),
+                    append_fence,
+                    address,
+                    created_outpoint,
+                    true,
+                )?;
             }
+        }
+        Ok(())
+    }
+
+    /// Reopens the wallet at `expected_fence` and asserts that every row family
+    /// the crash transition writes holds its rows exactly when `committed`.
+    #[cfg(unix)]
+    fn assert_crash_transition_rows(
+        root: &Path,
+        expected_fence: CanonicalEventFence,
+        address: TransparentAddressScriptHash,
+        created_outpoint: TransparentOutPoint,
+        committed: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let following = RocksDbWalletStore::open_ready_for_following(
+            root.join("wallet"),
+            Network::ZcashRegtest,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let evidence = following.ready_evidence();
+        assert_eq!(evidence.source_position.tip, expected_fence.visible_tip());
+        assert_eq!(
+            evidence.source_sequence_digest,
+            expected_fence.sequence_digest()
+        );
+        let source = WalletCanonicalSourceIdentity::from_ready_evidence(evidence);
+        let wallet = following.into_ready_store(source)?;
+
+        let unspent = wallet.find_unspent_output(created_outpoint)?;
+        assert_eq!(unspent.is_some(), committed);
+        if let Some(output) = &unspent {
+            assert_eq!(output.address_script_hash, address);
+            assert_eq!(output.value_zat, CRASH_OUTPUT_VALUE_ZAT);
+            assert_eq!(output.created_at.block.height, BlockHeight::new(101));
+        }
+        let address_unspent =
+            wallet.address_unspent_outputs_page(address, None, NonZeroU16::MIN)?;
+        assert_eq!(
+            address_unspent.outputs,
+            unspent.into_iter().collect::<Vec<_>>()
+        );
+        let history = wallet.address_transaction_history_page(address, None, NonZeroU16::MIN)?;
+        assert_eq!(history.transactions.len(), usize::from(committed));
+        assert_eq!(
+            wallet.address_balance(address)?,
+            if committed { CRASH_OUTPUT_VALUE_ZAT } else { 0 }
+        );
+        assert_eq!(wallet.utxo_summary().utxo_count, u64::from(committed));
+
+        let undo = wallet.find_reorg_undo(BlockHeight::new(101))?;
+        assert_eq!(undo.is_some(), committed);
+        if let Some(undo) = undo {
+            assert_eq!(
+                undo.created_outpoints,
+                vec![WalletOutpointKey::new(created_outpoint)]
+            );
+            assert!(undo.spent_outpoints.is_empty());
+            assert_eq!(undo.address_transaction_keys.len(), 1);
+            assert_eq!(
+                undo.source_sequence_digest_after,
+                expected_fence.sequence_digest()
+            );
         }
         Ok(())
     }
@@ -2481,6 +2565,28 @@ mod tests {
             privacy_shape: PrivacyShape::Unclassified,
             is_coinbase: false,
             unsupported_sections: vec![UnsupportedSection::FutureVersionHeader],
+        }
+    }
+
+    #[cfg(unix)]
+    fn coinbase_output_transaction(
+        transaction_id: TransactionId,
+        output: TransparentOutputFact,
+    ) -> CanonicalTransactionFacts {
+        let mut public_facts = transparent_spend_public_facts(transaction_id);
+        public_facts.version = TransactionVersion::V4;
+        public_facts.is_coinbase = true;
+        public_facts.unsupported_sections = Vec::new();
+        public_facts.counts.transparent_output_count = 1;
+        CanonicalTransactionFacts {
+            public_facts,
+            serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(&[0x66]),
+            intrinsic_value_balances: TransactionIntrinsicValueBalances::default(),
+            transparent_inputs: vec![TransparentInputFact::new(
+                0,
+                TransparentOutPoint::COINBASE_SENTINEL,
+            )],
+            transparent_outputs: vec![output],
         }
     }
 
