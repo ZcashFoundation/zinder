@@ -8,8 +8,9 @@ use tokio_util::sync::CancellationToken;
 use zinder_compat_cipherscan::CipherscanRestAdapter;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_runtime::{
-    Readiness, ReadinessState, RuntimeService, StartupPhase, cancel_on_terminating_signal,
-    connect_zinder_grpc, install_tracing_subscriber, spawn_ops_endpoint_for,
+    Readiness, ReadinessCause, ReadinessState, RuntimeService, StartupPhase,
+    cancel_on_terminating_signal, connect_zinder_grpc, install_tracing_subscriber,
+    spawn_ops_endpoint_for,
 };
 
 mod config;
@@ -166,7 +167,7 @@ async fn run_cipherscan_adapter(cli: Cli) -> Result<(), CipherscanConfigError> {
     );
 
     let serve_result = axum::serve(listener, app)
-        .with_graceful_shutdown(cancel.cancelled_owned())
+        .with_graceful_shutdown(drain_readiness_on_cancel(cancel.clone(), readiness))
         .await;
     adapter.shutdown_realtime().await;
 
@@ -197,6 +198,11 @@ async fn run_cipherscan_adapter(cli: Cli) -> Result<(), CipherscanConfigError> {
     }
 }
 
+async fn drain_readiness_on_cancel(cancel: CancellationToken, readiness: Readiness) {
+    cancel.cancelled().await;
+    readiness.set(ReadinessState::not_ready(ReadinessCause::ShuttingDown));
+}
+
 fn emit_runtime_error(error: &CipherscanConfigError) -> ExitCode {
     tracing::error!(
         target: "zinder::compat::cipherscan",
@@ -219,5 +225,26 @@ impl From<Cli> for CipherscanConfigOverrides {
             historical_price_endpoint_template: cli.historical_price_endpoint_template,
             bearer_token_path: cli.bearer_token_path,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio_util::sync::CancellationToken;
+    use zinder_runtime::{Readiness, ReadinessCause, ReadinessState};
+
+    use super::drain_readiness_on_cancel;
+
+    #[tokio::test]
+    async fn cancellation_drains_readiness_before_server_shutdown() {
+        let readiness = Readiness::new(ReadinessState::ready(None));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        drain_readiness_on_cancel(cancel, readiness.clone()).await;
+
+        let report = readiness.report();
+        assert_eq!(report.cause, ReadinessCause::ShuttingDown);
+        assert!(!report.is_ready);
     }
 }

@@ -253,7 +253,9 @@ its gRPC server drains.
 
 `zinder-compat-cipherscan` owns no storage and no secondary. It connects to its
 Explorer and wallet query endpoints before it reports ready, and a failed
-connection fails startup. After that, readiness stays `ready` until shutdown.
+connection fails startup. After that, readiness stays `ready` until
+termination is requested, when it reports `shutting_down` before the REST
+server drains.
 Each upstream runtime reports its own outage through its own `/readyz`, and an
 adapter request that reaches an unavailable upstream returns HTTP 503 with
 `upstream_unavailable`. Reflecting
