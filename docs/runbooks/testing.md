@@ -602,7 +602,16 @@ Commitment trees follow each compact block's chain metadata. A live block must
 carry the note commitments that reach its declared tree sizes, because the
 store re-derives them. A cold baseline can declare trees too large to build in
 a test, such as a completed 2^16-leaf subtree, with
-`ChainFixture::with_commitment_tree_frontiers_at`.
+`ChainFixture::with_commitment_tree_frontiers_at`. A block that a replacement
+displaces must start with a coinbase, such as
+`FixtureTransactionRows::coinbase`, because the store archives it.
+
+Two history shapes have no fixture because no production store holds them: a
+height-0 block, which canonical history never retains (see
+[Lightwalletd compatibility §Block range status codes](../reference/lightwalletd-compatibility.md#block-range-status-codes)),
+and an epoch without a tree-state checkpoint, since every build retains a
+block above its floor and checkpoints its tip (see
+[Wallet data plane](../architecture/wallet-data-plane.md)).
 
 ### Process-crash coverage
 
