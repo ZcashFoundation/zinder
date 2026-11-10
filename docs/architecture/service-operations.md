@@ -57,6 +57,24 @@ secrets.
 
 ## Runtime-specific readiness
 
+Each runtime decides which cause each of its readiness owners reports. A
+runtime whose readiness depends on more than one owner composes them through
+`zinder_runtime::ComposedReadiness`, which applies one fixed precedence:
+
+1. `shutting_down` once shutdown has started, irreversibly;
+2. an input that reports a parked canonical writer's `reorg_window_exceeded`
+   halt, which is the root cause of the admission failures that follow it;
+3. the admission state (storage or serving pair) when it refuses traffic;
+4. the first refusing named input, in the order node source, ingest control,
+   materialized-view catch-up;
+5. otherwise the admission state, including a warning that admits traffic.
+
+The admission state supplies the reported heights. When shutdown or an input
+supplies the cause, the reported target height is cleared. Every owner
+replaces only its own input, so no owner can clear another owner's failure.
+Native wallet query, lightwalletd compatibility, and Explorer use this
+composition. Ingest and projector each keep one owner of their readiness state.
+
 ### Canonical fence attestation
 
 Projector, native wallet query, and lightwalletd compatibility each read
@@ -196,6 +214,34 @@ chain view the system of record no longer attests.
 The ceiling governs admission on its own. `storage.secondary_replica_lag_threshold_chain_epochs`
 decides when lag stops being routine and becomes a reported warning, not how
 long a warned reader may keep answering.
+
+### Explorer
+
+Explorer is ready after its API has started and, when a materialized-view store
+is open, while the latest catch-up of its materialized-view secondary
+succeeded. The secondary catches up once per second and starts in `starting`
+until the first catch-up succeeds. A failed catch-up keeps serving the last
+caught-up view but refuses readiness with `schema_mismatch` when the primary's
+store format, consumer schemas, or column-family identity no longer match the
+binary, and with `storage_unavailable` for any other failure. The next
+successful catch-up restores readiness. The store already retries the known
+transient missing-file race with primary compaction before it reports a
+failure. Because a successful catch-up brings the secondary to the primary's
+latest durable state, the secondary's lag behind its primary is bounded by
+the catch-up interval while catch-up succeeds. How far the materialized views
+trail the chain is reported per response in `ExplorerFreshness`, not through
+readiness. Without a materialized-view store, Explorer has no catch-up input.
+
+### Cipherscan compatibility
+
+`zinder-compat-cipherscan` owns no storage and no secondary. It connects to its
+Explorer and wallet query endpoints before it reports ready, and a failed
+connection fails startup. After that, readiness stays `ready` until shutdown.
+Each upstream runtime reports its own outage through its own `/readyz`, and an
+adapter request that reaches an unavailable upstream returns HTTP 503 with
+`upstream_unavailable`. Reflecting
+upstream readiness in the adapter would drain every adapter instance whenever
+one upstream runtime is briefly unready, without making any request succeed.
 
 ## Startup and shutdown
 

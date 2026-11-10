@@ -12,9 +12,9 @@ use zinder_explorer::{
     MaterializedViewStoreError, MaterializedViewStoreOptions, describe_request_metrics,
 };
 use zinder_runtime::{
-    OpsEndpointHandle, Readiness, ReadinessState, RuntimeService, StartupPhase,
-    cancel_on_terminating_signal, host_cpu_meets_compiled_baseline, install_tracing_subscriber,
-    spawn_ops_endpoint_for,
+    ComposedReadiness, OpsEndpointHandle, Readiness, ReadinessCause, ReadinessInput,
+    ReadinessState, RuntimeService, StartupPhase, cancel_on_terminating_signal,
+    host_cpu_meets_compiled_baseline, install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 use zinder_source::{NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 
@@ -141,6 +141,12 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
         }
     };
     report_materialized_view_workload(&readiness, materialized_view_store.as_ref());
+    let required_inputs: &[ReadinessInput] = if materialized_view_store.is_some() {
+        &[ReadinessInput::MaterializedViewCatchup]
+    } else {
+        &[]
+    };
+    let composed_readiness = ComposedReadiness::new(readiness.clone(), required_inputs);
 
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
@@ -149,7 +155,12 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
         materialized_view_store
             .clone()
             .map(|materialized_view_store| {
-                spawn_materialized_view_catchup_task(materialized_view_store, cancel.clone())
+                spawn_materialized_view_catchup_task(
+                    move || materialized_view_store.try_catch_up(),
+                    composed_readiness.clone(),
+                    MATERIALIZED_VIEW_CATCHUP_INTERVAL,
+                    cancel.clone(),
+                )
             });
     let grpc_adapter = build_grpc_adapter(&explorer_config, materialized_view_store).await;
     let upstream_observation_handle =
@@ -169,7 +180,7 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
 
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
-    readiness.set(ReadinessState::ready(None));
+    composed_readiness.publish_admission(ReadinessState::ready(None));
 
     tracing::info!(
         target: "zinder::explorer",
@@ -373,28 +384,54 @@ fn open_materialized_view_store(
     }
 }
 
-fn spawn_materialized_view_catchup_task(
-    store: MaterializedViewStore,
+fn spawn_materialized_view_catchup_task<CatchUp>(
+    catch_up: CatchUp,
+    readiness: ComposedReadiness,
+    interval: Duration,
     cancel: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
+) -> JoinHandle<()>
+where
+    CatchUp: Fn() -> Result<(), MaterializedViewStoreError> + Send + 'static,
+{
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(MATERIALIZED_VIEW_CATCHUP_INTERVAL);
+        let mut interval = tokio::time::interval(interval);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    if let Err(error) = store.try_catch_up() {
-                        tracing::warn!(
-                            target: "zinder::explorer",
-                            event = "materialized_view_secondary_catchup_failed",
-                            error = %error,
-                            "materialized-view store secondary catchup failed"
-                        );
-                    }
+                    let cause = match catch_up() {
+                        Ok(()) => ReadinessCause::Ready,
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "zinder::explorer",
+                                event = "materialized_view_secondary_catchup_failed",
+                                error = %error,
+                                "materialized-view store secondary catchup failed"
+                            );
+                            materialized_view_catchup_failure_cause(&error)
+                        }
+                    };
+                    readiness.publish_input(ReadinessInput::MaterializedViewCatchup, cause);
                 }
                 () = cancel.cancelled() => break,
             }
         }
     })
+}
+
+const fn materialized_view_catchup_failure_cause(
+    error: &MaterializedViewStoreError,
+) -> ReadinessCause {
+    if matches!(
+        error,
+        MaterializedViewStoreError::SchemaMismatch { .. }
+            | MaterializedViewStoreError::ConsumerSchemaMismatch { .. }
+            | MaterializedViewStoreError::ConsumerNotDeclared { .. }
+            | MaterializedViewStoreError::ColumnFamilyIdentityMismatch { .. }
+    ) {
+        ReadinessCause::SchemaMismatch
+    } else {
+        ReadinessCause::StorageUnavailable
+    }
 }
 
 /// Fetches the node-advertised network-upgrade activation table.
@@ -480,5 +517,106 @@ impl From<Cli> for ExplorerConfigOverrides {
             bearer_token_path: cli.bearer_token_path,
             wallet_query_endpoint: cli.wallet_query_endpoint,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
+
+    use tokio_util::sync::CancellationToken;
+    use zinder_explorer::MaterializedViewStoreError;
+    use zinder_runtime::{
+        ComposedReadiness, Readiness, ReadinessCause, ReadinessInput, ReadinessState,
+    };
+
+    use super::spawn_materialized_view_catchup_task;
+
+    async fn wait_for_cause(readiness: &Readiness, expected: &ReadinessCause) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while readiness.report().cause != *expected && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_catchup_failure_lowers_readiness_with_typed_cause()
+    -> Result<(), tokio::task::JoinError> {
+        let readiness = Readiness::default();
+        let composed = ComposedReadiness::new(
+            readiness.clone(),
+            &[ReadinessInput::MaterializedViewCatchup],
+        );
+        composed.publish_admission(ReadinessState::ready(None));
+        let schema_mismatch = Arc::new(AtomicBool::new(true));
+        let cancel = CancellationToken::new();
+        let handle = spawn_materialized_view_catchup_task(
+            {
+                let schema_mismatch = Arc::clone(&schema_mismatch);
+                move || {
+                    if schema_mismatch.load(Ordering::SeqCst) {
+                        Err(MaterializedViewStoreError::SchemaMismatch {
+                            persisted: 1,
+                            running: 2,
+                        })
+                    } else {
+                        Err(MaterializedViewStoreError::ConsumerManifest {
+                            operation: "read",
+                            reason: "unreadable manifest".to_owned(),
+                        })
+                    }
+                }
+            },
+            composed.clone(),
+            Duration::from_millis(1),
+            cancel.clone(),
+        );
+
+        wait_for_cause(&readiness, &ReadinessCause::SchemaMismatch).await;
+        let schema_cause = readiness.report().cause;
+        schema_mismatch.store(false, Ordering::SeqCst);
+        wait_for_cause(&readiness, &ReadinessCause::StorageUnavailable).await;
+        let storage_cause = readiness.report().cause;
+        cancel.cancel();
+        handle.await?;
+
+        assert_eq!(schema_cause, ReadinessCause::SchemaMismatch);
+        assert_eq!(storage_cause, ReadinessCause::StorageUnavailable);
+        assert!(!readiness.report().is_ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn successful_catchup_restores_readiness() -> Result<(), tokio::task::JoinError> {
+        let readiness = Readiness::default();
+        let composed = ComposedReadiness::new(
+            readiness.clone(),
+            &[ReadinessInput::MaterializedViewCatchup],
+        );
+        composed.publish_admission(ReadinessState::ready(None));
+        composed.publish_input(
+            ReadinessInput::MaterializedViewCatchup,
+            ReadinessCause::StorageUnavailable,
+        );
+        let cancel = CancellationToken::new();
+        let handle = spawn_materialized_view_catchup_task(
+            || Ok(()),
+            composed,
+            Duration::from_millis(1),
+            cancel.clone(),
+        );
+
+        wait_for_cause(&readiness, &ReadinessCause::Ready).await;
+        cancel.cancel();
+        handle.await?;
+
+        assert!(readiness.report().is_ready);
+        Ok(())
     }
 }

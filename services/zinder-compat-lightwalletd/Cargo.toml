@@ -19,7 +19,6 @@ config.workspace = true
 hex.workspace = true
 prost.workspace = true
 metrics.workspace = true
-parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
