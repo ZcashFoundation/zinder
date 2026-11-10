@@ -1,6 +1,0 @@
-kind: changed
-body: The README warns that Zinder is alpha and that native WalletQuery, lightwalletd compatibility, storage layouts, and deployment topology can still change.
-time: 2026-08-19T21:26:00Z
-custom:
-  Bump: patch
-  PR: "96"
