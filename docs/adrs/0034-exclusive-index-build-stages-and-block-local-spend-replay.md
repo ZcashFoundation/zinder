@@ -21,9 +21,9 @@ Canary traces exposed two further canonical-path delays. A 500,000-outpoint tran
 
 Initial indexing has three exclusive storage-budget owners, in priority order:
 
-1. Canonical bulk catchup runs while the ingest phase is `BulkCatchup`; materialized-view replay and rebuildable historical work are paused.
+1. Canonical construction runs while the ingest phase is `BulkCatchup`; materialized-view replay and rebuildable historical work are paused.
 2. Materialized-view replay runs after canonical enters `FollowingTip` and until the materialized transparent-spend projection shared by every supported preset covers the canonical visible tip; historical backfills and verifiers remain closed.
-3. Historical backfills, verifiers, and transparent-retention maintenance may start bounded batches only while canonical is following tip and materialized-view replay is caught up. If replay falls behind again, the gate closes before another historical batch begins.
+3. Historical backfills and verifiers may start bounded batches only while canonical is following tip and materialized-view replay is caught up. If replay falls behind again, the gate closes before another historical batch begins.
 
 Startup observes and publishes the canonical phase before it admits synchronous materialized-view handoff work. Only a positively classified `FollowingTip` phase may replay; `BulkCatchup`, `AwaitingUpstream`, a failed tip observation, and the unclassified state fail closed. A restart during initial sync therefore resumes canonical work without first spending the bounded startup replay window on materialized-view debt.
 
@@ -35,7 +35,7 @@ Settled materialized-view replay reads one block-local record per block and veri
 
 Replay keeps one fully prepared batch ahead of ordered dispatch. Preparation includes canonical hydration and context construction, so reads for batch N+1 overlap the atomic consumer write for batch N. Admission remains subject to the existing memory state and variable-projection-row bound, and cursor advancement remains serial.
 
-Transparent retention is removed from `commit_chain_epoch`. A separate worker reads the retained block-local spend record once per height, writes no chain event, and advances its cursor in passes capped at 1,000 heights or 10,000 outpoints by default. Settled-tip commits therefore stay independent of historical backlog. Tip-follow reuses its existing upstream-tip observation to return to the phase classifier immediately when lag exceeds the bulk threshold; there is no independent minute-scale watcher.
+Canonical commits perform no transparent-retention work. A live append or replacement writes only its own block-local rows, epoch, event, and control record, so settled-tip commits stay independent of historical backlog. Following never returns to construction; after a burst it appends one block per commit and reports `syncing` while lag exceeds `ingest.follow.lag_threshold_blocks`.
 
 The default source-segment hard ceiling is 64 blocks, matching the measured fixed control. The response-byte target, p95 density estimate, network-upgrade reset, and split feedback remain the actual dense-era safeguards, so the controller may shrink below 64 but can now exploit lighter eras.
 
@@ -49,7 +49,6 @@ This layout has no in-place migration. A mismatched store may lack facts needed 
 
 - End-to-end readiness work no longer competes with optional historical backfills.
 - Canonical chain advancement no longer performs historical retention reads or million-row delete batches.
-- Upstream bursts switch from serial tip-follow to bulk catchup after the current iteration instead of after a minute-scale poll.
 - Light eras can use the fixed control's proven 64-block request ceiling; dense eras remain byte-adaptive.
 - Transient materialized-view secondary compaction races recover inside one catchup operation without masking persistent failures.
 - Transparent-input density increases sequential block-local payload size, not random lookup count.

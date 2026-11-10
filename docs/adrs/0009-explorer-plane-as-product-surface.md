@@ -90,7 +90,7 @@ The `domain.noun.capability_v{N}` shape is identical to the wallet plane's `wall
 
 ### Explorer source boundary
 
-The explorer plane consumes canonical artifacts (via `ChainEpochReadApi` colocated reads or `WalletQuery` over gRPC) and replayable event streams. It may use `zinder-source` to parse transaction bytes and to poll an optional upstream-health observation for its freshness envelope. Those uses do not supply authoritative chain facts, change a response's pinned chain view, or provide a fallback when canonical data is unavailable.
+The explorer plane consumes canonical artifacts through `WalletQuery` over gRPC and through materialized views that ingest derives from retained canonical events. It may use `zinder-source` to parse transaction bytes and to poll an optional upstream-health observation for its freshness envelope. Those uses do not supply authoritative chain facts, change a response's pinned chain view, or provide a fallback when canonical data is unavailable.
 
 An explorer view that needs a new authoritative chain fact extends the source and canonical boundaries first, then consumes the resulting canonical artifact or event. `zinder-explorer` must not become a parallel chain follower or substitute direct node reads for a missing canonical fact. This preserves canonical state as the authority and keeps rebuildable views reproducible from retained canonical inputs.
 

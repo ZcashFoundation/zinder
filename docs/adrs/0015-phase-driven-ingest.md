@@ -12,32 +12,45 @@ append and replacement handling with low observation latency. Requiring an
 operator or deployment system to select one workload creates two startup
 contracts and permits a cold store to run the near-tip path indefinitely.
 
-The writer already owns the information needed to choose correctly: the local
-canonical tip, the upstream tip, the reorg window, and upstream health. The
-choice therefore belongs inside `zinder-ingest`, not in service wrappers or
-deployment scripts.
+The writer already owns the information needed to choose correctly: whether a
+published canonical store exists, its authenticated fence, the upstream tip, and
+upstream health. The choice therefore belongs inside `zinder-ingest`, not in
+service wrappers or deployment scripts.
 
 ## Decision
 
-`zinder-ingest` runs one long-lived canonical writer and classifies work on each
-iteration with `classify_phase`:
+`zinder-ingest` runs one long-lived canonical writer and selects its workload
+from the canonical store lifecycle at startup:
+
+- A ready store at `storage.path` is reopened and followed.
+- A published store left in the writer-owned staging path is installed at
+  `storage.path`, reopened, and followed.
+- Otherwise the writer constructs a fresh store, publishes it, and then follows
+  it.
+
+Construction reports the `BulkCatchup` phase. Following reports `FollowingTip`.
+After downtime, the writer reopens its published store and follows from the
+persisted fence, so no restart, phase switch, or operator action is needed to
+catch up. Following readiness reports `syncing` while canonical lag exceeds
+`ingest.follow.lag_threshold_blocks`.
+
+Construction fetches bounded source segments, prepares blocks concurrently,
+and publishes an authenticated baseline whose settled tip stays
+`ingest.reorg_window_blocks` below the construction tip. Following observes one
+coherent source update at a time and publishes either an append or a
+replacement. Both paths use the same canonical store, error classification,
+readiness state, and recovery policy.
+
+`classify_phase` applies the gap rules only for the diagnostic
+`zinder-ingest probe` command:
 
 - `AwaitingUpstream` when the upstream tip is height zero.
 - `BulkCatchup` when the upstream-to-store gap is greater than
   `ingest.phase_classification.catchup_threshold_blocks`.
 - `FollowingTip` otherwise.
 
-An empty store is treated as height zero. A store ahead of the observed upstream
-tip saturates the gap to zero and enters `FollowingTip`, where the writer waits
-for a coherent replacement observation. Phase changes are bidirectional, so a
-writer can return to `BulkCatchup` after downtime without a process restart or
-operator action.
-
-Construction fetches bounded source segments, prepares blocks concurrently,
-and publishes an authenticated baseline whose settled tip stays
-`ingest.reorg_window_blocks` below the construction tip. Following-tip mode observes one coherent source update at a time and
-publishes either an append or a replacement. Both paths use the same canonical
-store, error classification, readiness state, and recovery policy.
+The probe treats an empty store as height zero, and a store ahead of the
+observed upstream tip saturates the gap to zero.
 
 The writer exposes the phase independently from readiness cause. A process can,
 for example, be in `following_tip` while reporting `node_unavailable`; clients
@@ -46,7 +59,7 @@ reports phase, source position, gap, and upstream-health observations.
 
 The configuration is grouped by responsibility:
 
-- `[ingest.phase_classification]` owns the gap boundary.
+- `[ingest.phase_classification]` owns the probe's gap boundary.
 - `[ingest.construction]` owns historical construction limits.
 - `[ingest.follow]` owns near-tip polling and lag limits.
 - `[ingest.run_overrides]` owns bounded one-run overrides.
@@ -55,7 +68,7 @@ The configuration is grouped by responsibility:
 
 The writer opens the primary canonical store once. The mempool owner, retention
 worker, and control service share the same process lifetime and do not restart
-when the ingest phase changes.
+when construction hands off to following.
 
 ### Upstream sync detection
 

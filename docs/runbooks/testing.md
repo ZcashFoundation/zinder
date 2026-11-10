@@ -205,8 +205,9 @@ If either probe fails, fix the sidecar before running tests. Don't use a
 
 ### Cleanup between runs
 
-A persisted store from a previous run that bumped `STORE_SCHEMA_VERSION`
-fails to reopen with `SchemaMismatch`. Clear the scratch directories before
+A persisted store from a previous run that bumped
+`CANONICAL_STORE_SCHEMA_VERSION`, or a wallet or materialized-view layout
+version, fails admission on reopen. Clear the scratch directories before
 reusing them across schema-changing commits:
 
 ```bash
@@ -583,13 +584,14 @@ run with every `cargo nextest run --profile=ci` against the production
 
 ### Manual reproduction: kill -9 mid-commit
 
-Use this when changing storage commit paths or the
-`PrimaryChainStore::commit_chain_epoch` body. The automated test cannot
+Use this when changing storage commit paths, such as
+`RocksDbCanonicalStore::commit_live_append` or
+`RocksDbCanonicalStore::commit_live_replacement`. The automated test cannot
 exercise unclean shutdown mid-batch because dropping the handle in
 process closes RocksDB cleanly.
 
 ```bash
-# Terminal 1: start the phase-driven ingest loop against z3 regtest.
+# Terminal 1: start the canonical writer against z3 regtest.
 mkdir -p .tmp
 rm -rf .tmp/regtest.zinder-store
 cargo run --release --bin zinder-ingest -- \
@@ -601,13 +603,13 @@ sleep 5
 kill -9 "$INGEST_PID"
 wait "$INGEST_PID" 2>/dev/null || true
 
-# Reopen and assert state is consistent. The status command opens the
+# Reopen and assert state is consistent. The probe command opens the
 # canonical store through its normal fail-closed admission path.
 cargo run --release --bin zinder-ingest -- \
-  --config .tmp/regtest.ingest.toml status
+  --config .tmp/regtest.ingest.toml probe
 ```
 
-Expected: status reports a durable store tip and exits successfully. RocksDB's
+Expected: probe reports a durable `store_tip` and exits successfully. RocksDB's
 WAL replay restores any committed batch on reopen; partial commits are visible
 only after their write batch is durably persisted, so the reopened tip is
 always at or below the last batch the writer signaled durable.
@@ -618,16 +620,18 @@ always at or below the last batch the writer signaled durable.
 cargo run --release --bin zinder-ingest -- \
   --config .tmp/regtest.ingest.toml &
 sleep 2
-# This second invocation must fail with PrimaryAlreadyOpen (LOCK file in
-# .tmp/regtest.zinder-store/LOCK). If it succeeds, the fencing contract
-# is broken.
+# This second invocation must fail to open the primary because the first
+# process holds .tmp/regtest.zinder-store/LOCK. If it succeeds, the fencing
+# contract is broken.
 cargo run --release --bin zinder-ingest -- \
   --config .tmp/regtest.ingest.toml
 ```
 
-Expected: the second `zinder-ingest` process exits non-zero with an
-error message naming the LOCK path. The first process continues
-uninterrupted.
+Expected: the second `zinder-ingest` process logs `ingest_run_failed` and
+exits non-zero. Its underlying `CanonicalStoreError::RocksDbOperation` for
+`open ready` carries RocksDB's LOCK error, as
+`second_ready_primary_open_is_refused_while_the_first_owns_the_store` pins.
+The first process continues uninterrupted.
 
 ## Concurrent readers and stream cancellation
 
@@ -1145,7 +1149,7 @@ For ordinary code changes, use the shorter pre-flight checklist below.
       Zebra health endpoint each fail closed and recover independently.
 - [ ] Mainnet read-only targeted tests are green when the release makes a mainnet
       readiness claim.
-- [ ] Full wallet-serving bulk-catchup and tip-follow phase evidence exists for the target
+- [ ] Full wallet-serving construction and following phase evidence exists for the target
       network, including store floor, tip height, `/readyz`, and reader secondary
       state.
 - [ ] Zodl or Android SDK bootstrap, restore/resync, transparent output, send,

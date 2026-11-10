@@ -29,7 +29,7 @@ The decisions that govern this plane:
 libraries. It:
 
 - **Consumes** the explorer materialized-view store through a process-owned RocksDB secondary when available, plus `WalletQuery` over gRPC for federated read paths.
-- **Owns** no primary RocksDB. `storage.path` identifies the canonical root whose `materialized-views` subdirectory ingest owns, while `storage.secondary_path/materialized-views` holds the explorer's secondary metadata. The deployed binary does not open the canonical store.
+- **Owns** no primary RocksDB. `storage.path` identifies the canonical root whose `materialized-views` subdirectory ingest owns, while `storage.secondary_path/materialized-views` holds the explorer's secondary metadata. The explorer does not open the canonical store.
 - **Produces** the `ExplorerQuery` gRPC service.
 - **Does not** open any primary store, custody wallet secrets, or serve wallet balance RPCs. It may parse transaction bytes through `zinder-source` and attach an optional cached upstream-health observation to freshness; neither is an authoritative chain-fact read.
 

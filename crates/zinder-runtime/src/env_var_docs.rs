@@ -117,8 +117,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Optional Zebra indexer gRPC endpoint enabling the streaming mempool source \
-                      and chain-tip wakeups. Falls back to JSON-RPC polling when unset or empty.",
+        description: "Optional Zebra indexer gRPC endpoint enabling the streaming mempool source. \
+                      Falls back to JSON-RPC mempool polling when unset or empty.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__AUTH__METHOD",
@@ -1053,7 +1053,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Gap (in blocks) above which `zinder-ingest probe` reports `BulkCatchup` \
-                      instead of `TipFollow`. Defaults to `ingest.reorg_window_blocks`. See \
+                      instead of `FollowingTip`. Defaults to `ingest.reorg_window_blocks`. See \
                       [ADR-0015](../adrs/0015-phase-driven-ingest.md).",
     },
     EnvVarDoc {

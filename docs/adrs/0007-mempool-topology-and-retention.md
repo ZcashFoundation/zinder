@@ -170,7 +170,7 @@ raises `zinder_proto::CONTRACT_REVISION` to 4; native clients that expose this
 field require revision 4 so they cannot interpret the earlier mutation-age
 implementation as generation freshness.
 
-Cursor expiration on read is a hard stop, not a warning. A consumer whose `from_cursor` is below `oldest_retained_mempool_event_sequence` receives `MempoolEventCursorExpired` carrying the current floor, mapped to gRPC `FailedPrecondition` with a `PreconditionFailure` detail. The consumer must resnapshot, not retry the same cursor.
+Cursor expiration on read is a hard stop, not a warning. A consumer whose `from_cursor` is below the oldest retained mempool event sequence receives `MempoolEventCursorExpired` carrying that floor as `oldest_retained_sequence`, mapped to gRPC `FailedPrecondition` with a `PreconditionFailure` detail. The consumer must resnapshot, not retry the same cursor.
 
 ### `TxStatus::InMempool` carries the hydrated entry
 

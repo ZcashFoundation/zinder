@@ -387,9 +387,8 @@ pub enum SourceError {
     /// Upstream chain-tip notification stream is unavailable.
     ///
     /// Returned when the gRPC `ChainTipChange` subscription cannot be
-    /// established or terminates with a transport error. The ingest
-    /// tip-follow loop treats this as a signal to keep polling and
-    /// re-subscribe in the background.
+    /// established or terminates with a transport error. A consumer treats
+    /// this as a signal to keep polling and re-subscribe in the background.
     #[error("upstream chain-tip notification stream is unavailable: {reason}")]
     ChainTipStreamUnavailable {
         /// Stream or transport failure reason.

@@ -69,9 +69,9 @@ wallet-store implementation, replication contract, or supported deployment.
 
 ## Optional explorer boundary
 
-`zinder-explorer` owns `ExplorerQuery` translation and reads the
-artifact-oriented canonical store plus the materialized-view store as
-secondaries. `zinder-materialized-views` owns explorer projection consumers and
+`zinder-explorer` owns `ExplorerQuery` translation. It reads the
+materialized-view store as a secondary and composes selected `WalletQuery`
+calls over gRPC; it does not open the canonical store. `zinder-materialized-views` owns explorer projection consumers and
 their schemas. Explorer state is never a prerequisite for canonical writes or
 wallet projection correctness.
 

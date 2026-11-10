@@ -49,7 +49,7 @@ pub(crate) enum SourceRecoveryDecision {
     Recover {
         /// Operator-actionable narrative for the readiness payload. The
         /// caller is responsible for combining this with the current
-        /// outage window (see [`SourceOutageTracker`]).
+        /// outage window (see [`detail_for_ongoing_outage`]).
         failure_class: SourceFailureClass,
         /// Sanitized failure reason. Bounded in length by
         /// [`READINESS_REASON_MAX_BYTES`].

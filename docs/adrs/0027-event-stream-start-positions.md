@@ -25,9 +25,9 @@ Both changes revise the semantics of existing RPCs in place rather than adding n
 - **`earliest_retained`.** Replay from the retention floor. This is the bootstrap path for a fresh consumer.
 - **`live_tail`.** Deliver only events applied after the subscription.
 
-An unset oneof is `INVALID_ARGUMENT`. There is no implicit default: the consumer states its intent or the request is rejected. Paging reads (`chain_event_history`, transparent-history streams, snapshot pages) keep their `from_cursor` field; the oneof belongs to subscriptions only.
+An unset oneof is `INVALID_ARGUMENT`. There is no implicit default: the consumer states its intent or the request is rejected. Paging reads (`canonical_event_history`, `wallet_chain_event_history`, transparent-history streams, snapshot pages) keep their `from_cursor` field; the oneof belongs to subscriptions only.
 
-The store owns start-position resolution: `EventStreamStartPosition` is the typed mirror of the oneof, and both store roles plus `ChainEpochReadApi` expose resolve methods that turn a start position into the resume cursor the page loop reads strictly after (`ChainEventStreamResume` for the chain family). `zinder-query` resolves starts for its local-serve path through `WalletQueryApi::resolve_chain_events_start` and passes proxied requests through unchanged.
+The store owns start-position resolution: `EventStreamStartPosition` is the typed mirror of the oneof. `RocksDbCanonicalSecondary::resolve_wallet_chain_event_stream_start`, exposed to the query layer through `CanonicalReader`, and `RocksDbCanonicalStore::resolve_mempool_event_stream_start` turn a start position into the resume position the page loop reads strictly after (`ChainEventStreamResume` for the chain family). `zinder-query` resolves starts for its local-serve path through `WalletQueryApi::resolve_chain_events_start` and passes proxied requests through unchanged.
 
 ### Family resolution
 

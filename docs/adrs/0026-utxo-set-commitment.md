@@ -56,7 +56,7 @@ The comparison rule lives in the client library (`TransparentUtxoSetSummaryView:
 
 ### Maintenance: request-time fold, no schema change
 
-The accumulator is folded inside the existing `read_transparent_utxo_set_aggregate` scan, beside the two `u64` totals, one element per surviving settled-tip row. There is no persistent accumulator, no new column family, and no `STORE_SCHEMA_VERSION`/`MATERIALIZED_VIEW_STORE_FORMAT_VERSION` bump. A persistent incremental accumulator was rejected: it would require writes from the read-only secondary (forbidden by [ADR-0003]) and would add trust-sensitive delta sites at every spend and reorg.
+The accumulator is folded at request time inside the settled-tip UTXO aggregate scan, beside the two `u64` totals, one element per surviving settled-tip row. There is no persistent accumulator, no new column family, and no `CANONICAL_STORE_SCHEMA_VERSION` or `MATERIALIZED_VIEW_STORE_FORMAT_VERSION` bump. A persistent incremental accumulator was rejected: it would require writes from the read-only secondary (forbidden by [ADR-0003]) and would add trust-sensitive delta sites at every spend and reorg.
 
 ### Capability gating
 

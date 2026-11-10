@@ -330,8 +330,7 @@ component diagnostics in the external resource artifacts.
   cache-bypassing scans grouped by column family for cold certification.
 - `benchmark_client_peak_rss`: peak resident bytes (Linux
   `/proc/self/status` `VmHWM`; reported as unavailable off Linux).
-- `stage_durations`: cumulative task seconds and call counts for block-prepare
-  stages (`canonical_block_prepare`, `transparent_prevout_resolve`) and
+- `stage_durations`: cumulative task seconds and call counts for
   canonical-construction stages (`block_parse`, `identity_validation`, `compact_artifacts`,
   `transaction_facts`, `block_header_artifact`, `block_blob`, and `block_replay`).
 - `round_trip`: block-local replay wall time plus shared initialization, preparation,

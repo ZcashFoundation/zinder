@@ -97,7 +97,7 @@ dial at their use sites.
 This evidence admits native transaction lookup, mempool snapshot and events,
 and transparent mempool outputs-by-address and spends-by-outpoint.
 Transaction-byte support additionally requires authenticated transaction-blob
-retention. Transparent live balance remains omitted: its legacy handler
+retention. Transparent live balance remains omitted: its gRPC handler
 performs multiple canonical and live calls without one authenticated mempool
 generation, so the two admitted primitives are not sufficient evidence for the
 composite claim. Transparent mempool outputs-by-outpoint also remains omitted

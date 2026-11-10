@@ -25,7 +25,7 @@ admission, validates store identity and schema after catch-up, and never mutates
 the primary. Service-to-service notifications may trigger catch-up, but the
 notification is not the data plane and does not replace persisted evidence.
 
-The release canonical store exposes role-specific handles:
+The canonical store exposes role-specific handles:
 
 - `RocksDbCanonicalStore` owns construction, publication, following, reorgs,
   retained events, and leases.
@@ -33,10 +33,6 @@ The release canonical store exposes role-specific handles:
   catch-up.
 - `CanonicalReader` is the query-layer contract consumed inside an admitted
   `WalletServingReadPair`.
-
-The artifact-oriented store follows the same ownership rule through
-`PrimaryChainStore`, `SecondaryChainStore`, and `ChainEpochReader` for optional
-explorer and materialized-view components.
 
 Readers fail closed when the requested epoch or fence is unavailable, store
 identity differs, schema is unsupported, or a secondary cannot converge within

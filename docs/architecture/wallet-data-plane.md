@@ -56,7 +56,7 @@ Required privacy rules:
 
 ## Compact Blocks
 
-The compact block builder belongs to ingestion. The wallet data plane serves compact block artifacts through `ChainEpochReadApi` or through a query-owned store fed by canonical artifacts.
+The compact block builder belongs to ingestion. The wallet data plane serves compact block artifacts through the fence-bound `CanonicalReader` of an admitted `WalletServingReadPair`, or through the compact-serving canonical secondary in `zinder-compat-lightwalletd`.
 
 Compact blocks are stored as the structured, consumer-neutral
 `CompactBlockArtifact` defined by `zinder-core`. Native WalletQuery response
@@ -568,7 +568,7 @@ The lightwalletd compat shim answers `GetTaddressBalance` and `GetTaddressBalanc
 
 The `ChainIndex` Rust API retains
 `transparent_address_balance(addresses) -> TransparentAddressBalance` for the
-protocol surface and legacy tests. `RemoteChainIndex` requires
+protocol surface and its contract tests. `RemoteChainIndex` requires
 `wallet.address.transparent_balance_v1` before invoking it, so the current
 release endpoint rejects the operation during capability preflight. A future
 release implementation requires coherent snapshot evidence at admission.

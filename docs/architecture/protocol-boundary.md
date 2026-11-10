@@ -31,8 +31,9 @@ Storage encodings belong to [Storage backend](storage-backend.md).
 | Lightwalletd compatibility API | `zinder_proto::compat::lightwalletd` | `zinder-compat-lightwalletd` | Published compatibility service |
 | Zebra indexer client contract | `zinder_proto::external::zebra` | `zinder-source` | Client-only upstream protocol |
 
-`ChainEpochReadApi` is a Rust storage trait, not a gRPC service. It provides the
-epoch-bound read boundary used by `zinder-query` and store implementations.
+`CanonicalReader` is a Rust storage trait, not a gRPC service. It is the
+fence-bound canonical read boundary that `zinder-query` consumes inside an
+admitted `WalletServingReadPair`; `RocksDbCanonicalSecondary` implements it.
 
 ## Ownership rules
 

@@ -2,10 +2,10 @@
 //!
 //! Subscribes to Zebra's `Indexer.ChainTipChange` stream (available when
 //! Zebra is built with `--features indexer`) and forwards each notification
-//! as a typed [`ChainTipNotification`]. The subscriber is consumed by the
-//! ingest tip-follow loop as a push-based wake-up signal that replaces the
-//! `poll_interval_ms` cadence with near-zero-latency reactions to new
-//! tip blocks.
+//! as a typed [`ChainTipNotification`]. A follower can consume the subscriber
+//! as a push-based wake-up signal that replaces the `poll_interval_ms` cadence
+//! with near-zero-latency reactions to new tip blocks. The canonical writer
+//! in `zinder-ingest` does not subscribe; it polls the source tip.
 //!
 //! The adapter does *not* hydrate the block bytes from the stream. Block
 //! fetching stays on the existing JSON-RPC path because the per-block
@@ -18,8 +18,8 @@
 //! Zebra terminates the stream with `UNAVAILABLE` when the broadcast
 //! channel lags or the node restarts. The consumer re-subscribes and keeps
 //! JSON-RPC polling active while the stream is down. The adapter does not
-//! buffer notifications across reconnects; the tip-follow loop's
-//! poll-interval safety net ensures any missed tips are caught up via JSON-RPC.
+//! buffer notifications across reconnects; a consumer keeps a poll-interval
+//! safety net so any missed tips are caught up via JSON-RPC.
 
 use std::time::Duration;
 
@@ -47,8 +47,8 @@ pub struct ChainTipNotification {
 ///
 /// The stream may yield transient errors (network blips, broadcast lag).
 /// Consumers should treat each error as a signal to fall back to the
-/// polling path on the next iteration; the tip-follow loop's existing
-/// poll-interval safety net covers that case.
+/// polling path on the next iteration; their poll-interval safety net covers
+/// that case.
 pub type ChainTipNotificationStream = BoxStream<'static, Result<ChainTipNotification, SourceError>>;
 
 /// Source that opens Zebra chain-tip notification streams.

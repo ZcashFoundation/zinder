@@ -26,7 +26,7 @@ use zinder_proto::{
     wire::encode_reorg_window_exceeded_metadata,
 };
 
-/// Current phase of the phase-driven ingest loop ([ADR-0015]).
+/// Current phase of the canonical writer ([ADR-0015]).
 ///
 /// `phase` is orthogonal to [`ReadinessCause`]: an ingest writer in
 /// [`IngestPhase::BulkCatchup`] may report `cause=syncing` (normal) or
@@ -43,17 +43,19 @@ use zinder_proto::{
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum IngestPhase {
-    /// Upstream tip is below the catch-up floor (regtest near genesis or
-    /// freshly initialized nodes). The loop polls on the upstream-health
-    /// interval and emits `cause=upstream_not_ready` until enough chain
-    /// exists to commit.
+    /// Upstream tip is at height zero (regtest near genesis or a freshly
+    /// initialized node), so there is no committable chain yet. Only the
+    /// `zinder-ingest probe` classifier reports this phase.
     AwaitingUpstream,
-    /// Gap to the upstream tip is above `ingest.phase_classification.catchup_threshold_blocks`.
-    /// The bulk-catchup driver runs pipelined block fetches and commits
-    /// batches with `AdvanceSettledTipTo`.
+    /// The writer is constructing a fresh canonical store: pipelined source
+    /// fetches and parallel block preparation load an inactive builder that
+    /// publishes one authenticated baseline. `zinder-ingest probe` reports
+    /// this phase when the gap exceeds
+    /// `ingest.phase_classification.catchup_threshold_blocks`.
     BulkCatchup,
-    /// Gap is within the catch-up threshold. The serial tip-follow driver
-    /// commits one block per poll cycle.
+    /// The writer follows a published canonical store, committing one append
+    /// or replacement per coherent source observation. `zinder-ingest probe`
+    /// reports this phase when the gap is within the catch-up threshold.
     FollowingTip,
 }
 
@@ -103,7 +105,7 @@ pub enum ReadinessCause {
     Ready,
     /// Upstream node source is unavailable.
     ///
-    /// Long-running writer loops (tip-follow, bulk catchup, mempool
+    /// Long-running writer loops (canonical following, construction, mempool
     /// orchestrator) drain readiness here when an upstream source error
     /// classifies as recoverable. The payload carries the operator
     /// narrative the runbook expects: which class of upstream failure,
@@ -531,15 +533,14 @@ impl Readiness {
         };
     }
 
-    /// Replaces the readiness cause and heights, preserving the ingest loop
-    /// phase and the last observed target across orthogonal warning states.
+    /// Replaces the readiness cause and heights, preserving the writer phase
+    /// and the last observed target across orthogonal warning states.
     ///
-    /// `phase` is orthogonal to [`ReadinessCause`] and owned by the ingest
-    /// classifier via [`Self::set_phase`]; cause writers (bulk-catchup batch
-    /// boundary, upstream-outage backoff, retention warnings) build a fresh
-    /// [`ReadinessState`] with no phase, so retaining the last-stamped phase
-    /// keeps `/readyz` and the materialized-view replay phase gate stable between
-    /// classifier stamps. Retention and mempool warnings do not observe an
+    /// `phase` is orthogonal to [`ReadinessCause`] and owned by the canonical
+    /// writer via [`Self::set_phase`]; cause writers (upstream-outage backoff,
+    /// retention warnings) build a fresh [`ReadinessState`] with no phase, so
+    /// retaining the last-stamped phase keeps `/readyz` and the
+    /// materialized-view replay phase gate stable between writer phase stamps. Retention and mempool warnings do not observe an
     /// upstream target, so they retain the preceding target through the
     /// warning and its transition back to ready. An explicit
     /// [`ReadinessState::with_phase`] on `state` overrides the phase.

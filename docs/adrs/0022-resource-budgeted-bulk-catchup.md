@@ -19,16 +19,14 @@ checkpoint tree state.
 
 ## Decision
 
-Bulk catchup is a resource-budgeted staged pipeline:
+Fresh canonical construction is a resource-budgeted staged pipeline:
 
 ```text
-SourceFetchStage
-  -> CanonicalBlockPrepareStage
-  -> CanonicalPrevoutResolveStage
-  -> CanonicalPositionStage
-  -> SubtreeRootAttachmentStage
-  -> CanonicalCommitStage
-  -> CanonicalFlushStage
+source fetch of bounded connected segments
+  -> parallel canonical block preparation
+  -> ordered commitment-tree positioning and family load into the inactive builder
+  -> exact subtree-root load
+  -> validation and baseline publication
 ```
 
 The source boundary is `SourceChainSegmentLimits { cursor,
@@ -51,23 +49,18 @@ and `node.max_response_bytes`:
 
 The segment sizer uses observed response bytes per block, p95 density, overshoot
 memory after split attempts, and network-upgrade resets. The JSON-RPC response
-default is 64 MiB, so the default segment target is 32 MiB. Source fetch and
-block prepare may complete out of order, but ordered reassembly is the only
-place that releases blocks to the prevout and serial positioning boundaries.
-Block prepare derives canonical artifacts. The ordered prevout resolver uses
-same-window outputs and a recent-output cache before issuing one deduplicated
-multi-get for the window's remaining cold outpoints; canonical commit still
-performs the authoritative fallback lookup. The cache shares
-`block_prepare_memory_watermark_bytes`, so cache entries yield to new
-prepare work instead of creating another independent memory ceiling. Prepare
-workers reserve a conservative peak estimate before parsing and retain the
-larger of that peak or measured completed residency through ordered prevout
-resolution. The reservation then resizes to resident commit-preparation data
-and remains attached until commit reassembly takes ownership.
-This is admission control rather than a hard allocator cap: one oversized block
-or a measured resize can exceed the watermark, after which new work pauses until
-the reservation falls below the configured limit. Completed out-of-order source
-segments keep their measured-byte reservation until emitted.
+default is 64 MiB, so the default segment target is 32 MiB. Source fetch may
+complete out of order, but blocks leave source reassembly in height order.
+Block preparation parses each block once and derives block-local canonical
+facts without historical prevout or wallet reads. Preparation runs in parallel
+and yields results in height order, so commitment-tree positioning and the
+builder load stay serial. Each block reserves a conservative estimate derived
+from its raw size against `block_prepare_memory_watermark_bytes` before parsing
+and keeps that reservation until its ordered store write completes. A block
+whose estimate exceeds the whole watermark reserves the entire watermark, so
+outstanding reservations never exceed it. This is admission control over
+estimates, not an allocator cap. Completed out-of-order source segments keep
+their measured-byte reservation until emitted.
 The first density probe reserves `node.max_response_bytes`. Later requests
 reserve the larger of the response target or 1.5 times the density prediction,
 capped at `node.max_response_bytes`, then resize to the measured response after
@@ -110,10 +103,12 @@ The canonical construction vocabulary is `CanonicalPipelineLimits` and
 `block_prepare_concurrency`. `materialized_view_replay_*` names are reserved for the async
 materialized-view replay plane.
 
-Bulk-catchup observability uses stage labels from this ADR:
-`source_fetch`, `canonical_block_prepare`, `canonical_prevout_resolve`, `canonical_position`,
-`subtree_root_attachment`, `checkpoint_tree_state`, `commit_reassembly`,
-`canonical_commit`, and `canonical_flush`.
+Construction observability labels source-lane queue, reorder-buffer, and
+watermark metrics with `stage="source_fetch"`. Per-block construction work is
+reported by `zinder_ingest_canonical_block_construction_stage_duration_seconds`
+with the `block_parse`, `identity_validation`, `compact_artifacts`,
+`transaction_facts`, `block_header_artifact`, `block_blob`, and `block_replay`
+stages.
 
 ## Container-aware default queue caps
 
