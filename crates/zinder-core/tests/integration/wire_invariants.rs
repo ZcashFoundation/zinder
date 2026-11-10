@@ -32,9 +32,7 @@ const BRANCH_ID_FORMAT_ALLOWLIST: &[&str] = &[WIRE_BRANCH_ID_PATH];
 const TXID_BLOCK_HASH_AS_BYTES_ALLOWLIST: &[&str] = &[
     WIRE_TRANSACTION_ID_PATH,
     WIRE_BLOCK_HASH_PATH,
-    "crates/zinder-store/src/format/artifact_codec.rs",
     "crates/zinder-store/src/format/mempool_event_codec.rs",
-    "crates/zinder-store/src/format/store_key.rs",
     "crates/zinder-store/src/format/stream_cursor.rs",
     "crates/zinder-store/src/address_output.rs",
 ];

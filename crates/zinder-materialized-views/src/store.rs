@@ -1,6 +1,6 @@
 //! `RocksDB` wrapper for the materialized-view plane.
 //!
-//! `MaterializedViewStore` is intentionally separate from `zinder_store::PrimaryChainStore`:
+//! `MaterializedViewStore` is intentionally separate from `zinder_store::RocksDbCanonicalStore`:
 //! it lives in its own filesystem path, has its own column families, and uses
 //! its own schema version. The two stores never share keys.
 //!

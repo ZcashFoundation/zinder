@@ -3,20 +3,10 @@
 //! `zinder-store` exposes domain-shaped commit and read APIs while keeping
 //! `RocksDB` handles, column families, and write batches private to the adapter.
 
-mod address_output_index;
-mod artifact_visibility;
-mod block_artifact;
 mod block_hash_index;
-mod block_replay;
-mod block_value_pool_balances;
 mod canonical_store;
-mod chain_epoch;
-mod chain_epoch_reader;
 mod chain_event;
-mod chain_store;
-mod displaced_block;
 mod event_stream;
-mod final_note_commitment_roots;
 mod format;
 mod grpc_status;
 mod kv;
@@ -26,21 +16,8 @@ mod proto_codec;
 mod raw_blob_retention;
 mod rocksdb_resource_budget;
 mod store_error;
-mod subtree_root;
-mod transaction_artifact;
-mod transparent_output;
-mod transparent_spend_fact;
-mod tree_state;
 
-pub use address_output_index::{
-    AddressOutputIndexStore, TransparentAddressBalanceSnapshot, TransparentAddressBalanceSummary,
-};
-pub use block_artifact::{
-    BlockBlobStore, BlockHeaderStore, BlockTransactionIndexStore, CompactBlockStore,
-};
 pub use block_hash_index::BlockHashLookup;
-pub use block_replay::{BlockReplayBatchRequest, BlockReplayStore, MAX_BLOCK_REPLAY_BATCH_BLOCKS};
-pub use block_value_pool_balances::BlockValuePoolBalancesStore;
 pub use canonical_store::{
     CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION, CANONICAL_STORE_IDENTITY,
     CANONICAL_STORE_SCHEMA_VERSION, CURRENT_ARTIFACT_SCHEMA_VERSION, CanonicalActivationSchedule,
@@ -61,27 +38,13 @@ pub use canonical_store::{
     RocksDbCanonicalSecondary, RocksDbCanonicalStore, TREE_STATE_CHECKPOINT_STRIDE,
     ValidatedRocksDbCanonicalBuild,
 };
-pub use chain_epoch::{ChainEpochArtifacts, ReorgWindowChange};
-pub use chain_epoch_reader::ChainEpochReader;
 pub use chain_event::{
-    ChainEpochCommitOutcome, ChainEpochCommitted, ChainEvent, ChainEventEnvelope,
-    ChainEventHistoryRequest, ChainRangeReverted, DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS,
+    ChainEpochCommitted, ChainEvent, ChainEventEnvelope, ChainEventHistoryRequest,
+    ChainRangeReverted, DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS,
 };
-pub use chain_store::{
-    AddressOutputIndexPage, AddressOutputIndexPageRequest, BlockValuePoolBalanceEnrichmentOutcome,
-    CURRENT_STORE_SCHEMA_VERSION, ChainEpochReadApi, ChainEventRetentionReport, ChainStoreOptions,
-    FinalNoteCommitmentRootEnrichmentOutcome, MAX_BLOCK_VALUE_POOL_BALANCE_ENRICHMENT_BATCH,
-    MAX_FINAL_NOTE_COMMITMENT_ROOT_ENRICHMENT_BATCH, MAX_SUPPORTED_ARTIFACT_SCHEMA_VERSION,
-    MAX_TRANSACTION_INTRINSIC_VALUE_BALANCE_ENRICHMENT_BATCH,
-    MIN_SUPPORTED_ARTIFACT_SCHEMA_VERSION, PrimaryChainStore, SecondaryCatchupOutcome,
-    SecondaryChainStore, TransactionIntrinsicValueBalanceEnrichmentOutcome,
-    TransparentRetentionSweepOutcome,
-};
-pub use displaced_block::DisplacedBlockStore;
 pub use event_stream::{
     ChainEventStreamResume, EventEnvelope, EventStreamStartPosition, run_event_stream,
 };
-pub use final_note_commitment_roots::FinalNoteCommitmentRootsStore;
 pub use format::{
     AddressOutputCursorPayload, ChainEventStreamFamily, MempoolEventCursorPayload,
     STREAM_CURSOR_TOKEN_V1_LEN, SnapshotPageCursorAnchor, SnapshotPageCursorPayload,
@@ -93,8 +56,8 @@ pub use grpc_status::{
 };
 pub use kv::{
     BoundedRocksDbOpen, ResourceGaugeThrottle, RocksDbIoMode, RocksDbOpenRole,
-    RocksDbResourceGaugeInputs, StoreReadCaller, StoreRole, build_block_based_table_factory,
-    open_bounded_rocksdb, record_rocksdb_resource_gauges,
+    RocksDbResourceGaugeInputs, StoreRole, build_block_based_table_factory, open_bounded_rocksdb,
+    record_rocksdb_resource_gauges,
 };
 pub use mempool_event::{MempoolEvent, MempoolEventEnvelope, MempoolEventPosition};
 pub use mempool_event_store::{
@@ -117,10 +80,3 @@ pub use proto_codec::{
 pub use raw_blob_retention::RawBlobRetention;
 pub use rocksdb_resource_budget::{RocksDbResourceBudget, RocksDbStatisticsLevel};
 pub use store_error::{ArtifactFamily, StorageErrorKind, StorageKey, StoreError};
-pub use subtree_root::SubtreeRootStore;
-pub use transaction_artifact::{
-    TransactionBlobStore, TransactionFactsStore, TransactionIntrinsicValueBalancesStore,
-    TransactionLocationStore,
-};
-pub use transparent_spend_fact::TransparentSpendReplayBlock;
-pub use tree_state::TreeStateStore;

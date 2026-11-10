@@ -169,7 +169,7 @@ mod tests {
         fn boxed() -> Box<dyn std::error::Error + Send + Sync> {
             Box::new(io::Error::other("probe"))
         }
-        let sample_key = || StorageKey::from(crate::format::StoreKey::store_metadata());
+        let sample_key = || StorageKey::from(crate::format::StoreKey::mempool_event(1));
         let variants = vec![
             StoreError::StorageUnavailable {
                 kind: StorageErrorKind::RocksDb,

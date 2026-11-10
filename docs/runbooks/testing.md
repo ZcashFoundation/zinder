@@ -727,20 +727,21 @@ txid) and `deep_chain` (high-volume canonical construction).
 
 ### Heavy probes (trust-sensitive code only)
 
-Run on demand for changes to storage commit paths, parser code, or anything
-under `chain_store::validation`:
+Run on demand for changes to storage commit paths, parser code, or the
+canonical store's live commit, live replacement, and event lifecycle:
 
 ```bash
 cargo llvm-cov --workspace --all-features --no-report
 cargo mutants --workspace --all-features \
-  --file crates/zinder-store/src/chain_store.rs \
-  --file crates/zinder-store/src/chain_store/validation.rs \
+  --file crates/zinder-store/src/canonical_store/live_commit.rs \
+  --file crates/zinder-store/src/canonical_store/live_replacement.rs \
+  --file crates/zinder-store/src/canonical_store/event_lifecycle.rs \
   --file crates/zinder-store/src/canonical_store/rocksdb.rs \
   --file crates/zinder-store/src/canonical_store/activation_schedule.rs \
   --file crates/zinder-store/src/canonical_store/control.rs \
   --file crates/zinder-core/src/network_upgrade_activations.rs \
   --file crates/zinder-source/src/source_block.rs \
-  --re 'chain_event_history|settled_tip_only_commit_without_artifacts|validate_reorg_window_change|from_raw_block_bytes|matching_fingerprint_prefix_len|preserves_through|next_activation_schedule|validate_activation_expectation|read_bound|validate_open_store_control|raise_reorg_policy|decode_reorg_policy_trailer'
+  --re 'canonical_event_history|validate_live_settled_tip|validate_live_block_extension|validate_replacement_blocks|from_raw_block_bytes|matching_fingerprint_prefix_len|preserves_through|next_activation_schedule|validate_activation_expectation|read_bound|validate_open_store_control|raise_reorg_policy|decode_reorg_policy_trailer'
 ```
 
 These are slow (mutants often >30 min). Scheduled CI runs them weekly; locally,
@@ -1190,8 +1191,8 @@ For ordinary code changes, use the shorter pre-flight checklist below.
       capability. Run compatibility parity separately when the change also
       affects the lightwalletd adapter or shared behavior it exposes.
 - [ ] If the change altered storage byte layout: `cargo mutants` against
-      `chain_store.rs` and `chain_store/validation.rs` is a healthy plus
-      coverage run via `cargo llvm-cov`.
+      `canonical_store/{live_commit,live_replacement,event_lifecycle}.rs` is a
+      healthy plus coverage run via `cargo llvm-cov`.
 - [ ] If the change altered readiness, metrics, backup, restart, or deployment
       configuration: run the relevant observability or deployment row from the
       ecosystem validation queue.

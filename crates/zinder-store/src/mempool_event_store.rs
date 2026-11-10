@@ -1,14 +1,14 @@
 //! Public read/write contracts for the persistent mempool event log.
 //!
-//! Mempool events live in their own [`StorageTable::MempoolEvent`] column
-//! family with an independent monotonic sequence and retention floor. The
-//! store-side write API ([`PrimaryChainStore::append_mempool_event`]) and
-//! read API ([`PrimaryChainStore::mempool_event_history`],
-//! [`SecondaryChainStore::mempool_event_history`]) mirror the chain-event
-//! shape so consumers compose mempool reads with the same cursor-resume
-//! pattern they already use for chain events.
+//! Mempool events live in their own `mempool_event` column family of the
+//! canonical store, with an independent monotonic sequence and retention
+//! floor. The write API ([`RocksDbCanonicalStore::append_mempool_event`]) and
+//! read API ([`RocksDbCanonicalStore::mempool_event_history`]) mirror the
+//! chain-event shape so consumers compose mempool reads with the same
+//! cursor-resume pattern they already use for chain events.
 //!
-//! [`StorageTable::MempoolEvent`]: crate::kv::StorageTable::MempoolEvent
+//! [`RocksDbCanonicalStore::append_mempool_event`]: crate::RocksDbCanonicalStore::append_mempool_event
+//! [`RocksDbCanonicalStore::mempool_event_history`]: crate::RocksDbCanonicalStore::mempool_event_history
 
 use std::{
     num::{NonZeroU32, NonZeroU64},

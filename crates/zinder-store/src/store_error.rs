@@ -1,11 +1,6 @@
 //! Storage error vocabulary.
 
-use std::{
-    error::Error,
-    fmt,
-    num::NonZeroU32,
-    path::{Path, PathBuf},
-};
+use std::{error::Error, fmt, num::NonZeroU32, path::PathBuf};
 
 use thiserror::Error;
 
@@ -444,42 +439,4 @@ pub enum StoreError {
         /// Unsupported feature name.
         feature: &'static str,
     },
-}
-
-impl StoreError {
-    pub(crate) fn storage_unavailable(source: impl Error + Send + Sync + 'static) -> Self {
-        Self::StorageUnavailable {
-            kind: StorageErrorKind::RocksDb,
-            source: Box::new(source),
-        }
-    }
-
-    pub(crate) fn primary_open_failed(
-        path: &Path,
-        source: impl Error + Send + Sync + 'static,
-    ) -> Self {
-        if source.to_string().to_ascii_lowercase().contains("lock") {
-            return Self::PrimaryAlreadyOpen {
-                lock_path: path.join("LOCK"),
-            };
-        }
-
-        Self::storage_unavailable(source)
-    }
-
-    pub(crate) fn secondary_catchup_failed(source: impl Error + Send + Sync + 'static) -> Self {
-        Self::SecondaryCatchupFailed {
-            source: Box::new(source),
-        }
-    }
-
-    pub(crate) fn checkpoint_unavailable(
-        path: &Path,
-        source: impl Error + Send + Sync + 'static,
-    ) -> Self {
-        Self::CheckpointUnavailable {
-            path: path.to_path_buf(),
-            source: Box::new(source),
-        }
-    }
 }

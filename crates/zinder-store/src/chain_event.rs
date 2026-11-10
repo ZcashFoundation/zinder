@@ -58,31 +58,6 @@ impl<'cursor> ChainEventHistoryRequest<'cursor> {
     }
 }
 
-/// Result returned after a chain epoch commit becomes durable and visible.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ChainEpochCommitOutcome {
-    /// Chain epoch committed by the storage operation.
-    pub chain_epoch: ChainEpoch,
-    /// Inclusive block range included in the commit.
-    pub block_range: BlockHeightRange,
-    /// Post-commit event produced by the durable transition.
-    pub event: ChainEvent,
-    /// Cursor-bound event persisted for resumable consumers.
-    pub event_envelope: ChainEventEnvelope,
-}
-
-impl ChainEpochCommitOutcome {
-    pub(crate) fn new(committed: ChainEpochCommitted, event_envelope: ChainEventEnvelope) -> Self {
-        let event = event_envelope.event.clone();
-        Self {
-            chain_epoch: committed.chain_epoch,
-            block_range: committed.block_range,
-            event,
-            event_envelope,
-        }
-    }
-}
-
 /// Cursor-bound chain event returned to resumable consumers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChainEventEnvelope {
