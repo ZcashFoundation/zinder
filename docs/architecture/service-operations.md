@@ -73,7 +73,8 @@ The admission state supplies the reported heights. When shutdown or an input
 supplies the cause, the reported target height is cleared. Every owner
 replaces only its own input, so no owner can clear another owner's failure.
 Native wallet query, lightwalletd compatibility, and Explorer use this
-composition. Ingest and projector each keep one owner of their readiness state.
+composition. Projector keeps one owner of its readiness state. Ingest does not
+use the composition and has two writers of one state, described below.
 
 ### Canonical fence attestation
 
@@ -132,11 +133,21 @@ Ingest is ready when its canonical fence is within the configured source lag
 and the current mempool source generation has published a complete snapshot
 certified at that exact canonical tip.
 Fresh construction, source recovery, schema admission, and reorg refusal keep
-it unready. The canonical follower owns the one process-readiness state; the
+it unready. The canonical follower writes the process-readiness state; the
 mempool owner communicates only through its hydration prerequisite, so source
-and retention tasks cannot overwrite a canonical failure. The private control
-server, live mempool owner, and mempool retention task are supervised with the
-writer; an unexpected exit from any of them terminates the runtime.
+and retention tasks cannot overwrite a canonical failure.
+
+When `[node.health].addr` is configured, the upstream health probe is a second
+writer of the same state. It sets `upstream_not_ready` when Zebra reports that
+it is not ready for queries and leaves the state untouched otherwise. The
+follower's next readiness write replaces the probe's cause, so a lag-derived
+`ready` overwrites `upstream_not_ready`. Until the probe becomes a separate
+composed input, its `upstream_not_ready` lasts only until the follower's next
+iteration and is not a reliable drain signal.
+
+The private control server, live mempool owner, and mempool retention task are
+supervised with the writer; an unexpected exit from any of them terminates the
+runtime.
 
 ### Projector
 
@@ -220,17 +231,23 @@ long a warned reader may keep answering.
 Explorer is ready after its API has started and, when a materialized-view store
 is open, while the latest catch-up of its materialized-view secondary
 succeeded. The secondary catches up once per second and starts in `starting`
-until the first catch-up succeeds. A failed catch-up keeps serving the last
-caught-up view but refuses readiness with `schema_mismatch` when the primary's
-store format, consumer schemas, or column-family identity no longer match the
-binary, and with `storage_unavailable` for any other failure. The next
-successful catch-up restores readiness. The store already retries the known
-transient missing-file race with primary compaction before it reports a
-failure. Because a successful catch-up brings the secondary to the primary's
-latest durable state, the secondary's lag behind its primary is bounded by
-the catch-up interval while catch-up succeeds. How far the materialized views
+until the first catch-up succeeds. A failed catch-up refuses readiness with
+`schema_mismatch` when the primary's store format, consumer schemas, or
+column-family identity no longer match the binary, and with
+`storage_unavailable` for any other failure. Validation runs after the
+secondary has already advanced, so after a `schema_mismatch` the served view
+may no longer match the binary. Explorer keeps answering gRPC in either case;
+only `/readyz` refuses traffic. The next successful catch-up restores
+readiness. The store already retries the known transient missing-file race
+with primary compaction before it reports a failure.
+
+Because a successful catch-up brings the secondary to the primary's latest
+durable state, the secondary's lag behind its primary is bounded by the
+catch-up interval while catch-up succeeds. How far the materialized views
 trail the chain is reported per response in `ExplorerFreshness`, not through
 readiness. Without a materialized-view store, Explorer has no catch-up input.
+Explorer reports `shutting_down` as soon as termination is requested, before
+its gRPC server drains.
 
 ### Cipherscan compatibility
 

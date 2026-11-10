@@ -193,7 +193,10 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
 
     let server_result = tonic::transport::Server::builder()
         .add_service(grpc_adapter.into_server())
-        .serve_with_shutdown(explorer_config.listen_addr, cancel.cancelled_owned())
+        .serve_with_shutdown(
+            explorer_config.listen_addr,
+            drain_readiness_on_cancel(cancel.clone(), composed_readiness),
+        )
         .await;
 
     tracing::info!(
@@ -223,6 +226,11 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
         }
         Ok(()) => background_shutdown_result.map_err(ExplorerConfigError::from),
     }
+}
+
+async fn drain_readiness_on_cancel(cancel: CancellationToken, readiness: ComposedReadiness) {
+    cancel.cancelled().await;
+    readiness.publish_shutting_down();
 }
 
 fn report_materialized_view_workload(
@@ -536,7 +544,7 @@ mod tests {
         ComposedReadiness, Readiness, ReadinessCause, ReadinessInput, ReadinessState,
     };
 
-    use super::spawn_materialized_view_catchup_task;
+    use super::{drain_readiness_on_cancel, spawn_materialized_view_catchup_task};
 
     async fn wait_for_cause(readiness: &Readiness, expected: &ReadinessCause) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -618,5 +626,19 @@ mod tests {
 
         assert!(readiness.report().is_ready);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_drains_readiness_before_server_shutdown() {
+        let readiness = Readiness::default();
+        let composed = ComposedReadiness::new(readiness.clone(), &[]);
+        composed.publish_admission(ReadinessState::ready(None));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        drain_readiness_on_cancel(cancel, composed).await;
+
+        assert_eq!(readiness.report().cause, ReadinessCause::ShuttingDown);
+        assert!(!readiness.report().is_ready);
     }
 }
