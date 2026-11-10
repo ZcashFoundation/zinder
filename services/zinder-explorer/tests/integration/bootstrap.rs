@@ -6,7 +6,7 @@
 //! Smoke test that boots an `ExplorerQueryGrpcAdapter` against an in-process
 //! tonic server and verifies `ServerInfo` returns the expected capability set.
 
-use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
+use std::{net::SocketAddr, num::NonZeroU32, path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use eyre::{Result, eyre};
@@ -16,9 +16,8 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Endpoint};
 use zinder_core::{
-    BlockHeight, BlockHeightRange, BlockId, ChainEpoch, ChainEpochId, Network,
-    TransparentAddressScriptHash, explorer_reasons::WALLET_QUERY_CAPABILITY_NOT_SUPPORTED,
-    wire::encode_rpc_block_hash_hex,
+    BlockHeight, BlockId, ChainEpoch, Network, TransactionId, TransparentAddressScriptHash,
+    explorer_reasons::WALLET_QUERY_CAPABILITY_NOT_SUPPORTED, wire::encode_rpc_block_hash_hex,
 };
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
 use zinder_materialized_views::{
@@ -50,10 +49,12 @@ use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceError,
     UPSTREAM_HEALTH_SOURCE_ZEBRA_READY_ENDPOINT, UpstreamHealthSnapshot,
 };
-use zinder_store::{CanonicalEventCursor, ChainEpochCommitted, ChainEvent, ChainRangeReverted};
+use zinder_store::{
+    CanonicalEventCursor, CanonicalEventHistoryRequest, CanonicalEventKind, ChainEvent,
+};
 use zinder_testkit::{
-    ChainFixture, IngestControlFixture, WalletServingStoreFixture,
-    sample_regtest_upgrade_activations,
+    CanonicalBaseline, CanonicalWriterFixture, ChainFixture, FixtureTransactionRows,
+    IngestControlFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations,
 };
 
 type ServerHandle = tokio::task::JoinHandle<Result<(), tonic::transport::Error>>;
@@ -492,61 +493,56 @@ async fn explorer_query_serves_recorded_chain_reorg_history() -> Result<()> {
 
 /// One retained canonical transition, as the materialized-view tailer dispatches it.
 struct RecordedChainEvent {
-    event_sequence: u64,
-    chain_epoch: ChainEpoch,
-    chain_event: ChainEvent,
+    cursor: CanonicalEventCursor,
+    resulting_epoch: ChainEpoch,
+    event: ChainEvent,
 }
 
-/// Returns the transitions a canonical writer retains when it commits heights
-/// 1..=2 above a settled height 1 and then replaces height 2.
-fn recorded_chain_reorg_events() -> Result<[RecordedChainEvent; 2]> {
+/// Commits heights 1..=2 above a settled height 1 through the production
+/// canonical writer, replaces height 2, and returns every retained transition
+/// converted as the materialized-view tailer converts it.
+fn recorded_chain_reorg_events() -> Result<Vec<RecordedChainEvent>> {
+    let displaced_height = BlockHeight::new(2);
     let initial_chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
-    let settled_block = initial_chain
-        .block_at(BlockHeight::new(1))
-        .ok_or_else(|| eyre!("initial fixture missing height 1"))?;
-    let mut initial_epoch = initial_chain
-        .chain_epoch(ChainEpochId::new(1))
-        .ok_or_else(|| eyre!("initial fixture missing chain epoch"))?;
-    initial_epoch.settled_tip_height = settled_block.height;
-    initial_epoch.settled_tip_hash = settled_block.hash;
+    let displaced_block = initial_chain
+        .block_at(displaced_height)
+        .cloned()
+        .ok_or_else(|| eyre!("initial fixture missing height 2"))?;
+    let initial_chain = initial_chain.with_transaction_rows(FixtureTransactionRows::coinbase(
+        TransactionId::from_bytes([0x21; 32]),
+        displaced_block.height,
+        displaced_block.hash,
+        b"displaced-coinbase".to_vec(),
+    ));
+    let replacement_chain = initial_chain.fork_at(displaced_height)?.extend_blocks(1);
+    let mut writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&initial_chain).with_settled_tip(BlockHeight::new(1)),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    writer.replace_live_blocks(&replacement_chain, displaced_height)?;
 
-    let replacement_chain = initial_chain.fork_at(BlockHeight::new(2))?.extend_blocks(1);
-    let mut replacement_epoch = replacement_chain
-        .chain_epoch(ChainEpochId::new(2))
-        .ok_or_else(|| eyre!("replacement fixture missing chain epoch"))?;
-    replacement_epoch.settled_tip_height = settled_block.height;
-    replacement_epoch.settled_tip_hash = settled_block.hash;
-
-    let replaced_range = BlockHeightRange::inclusive(BlockHeight::new(2), BlockHeight::new(2));
-    Ok([
-        RecordedChainEvent {
-            event_sequence: 1,
-            chain_epoch: initial_epoch,
-            chain_event: ChainEvent::ChainCommitted {
-                committed: ChainEpochCommitted {
-                    chain_epoch: initial_epoch,
-                    block_range: BlockHeightRange::inclusive(
-                        BlockHeight::new(1),
-                        BlockHeight::new(2),
-                    ),
-                },
-            },
-        },
-        RecordedChainEvent {
-            event_sequence: 2,
-            chain_epoch: replacement_epoch,
-            chain_event: ChainEvent::ChainReorged {
-                reverted: ChainRangeReverted {
-                    chain_epoch: initial_epoch,
-                    block_range: replaced_range,
-                },
-                committed: ChainEpochCommitted {
-                    chain_epoch: replacement_epoch,
-                    block_range: replaced_range,
-                },
-            },
-        },
-    ])
+    let canonical = writer.canonical_primary()?;
+    let page_limit =
+        NonZeroU32::new(16).ok_or_else(|| eyre!("event history page limit must be non-zero"))?;
+    canonical
+        .canonical_event_history(CanonicalEventHistoryRequest::new(None, page_limit))?
+        .into_iter()
+        .map(|retained| {
+            let chain_epoch = canonical.chain_epoch_at(retained.resulting_epoch_id())?;
+            let reverted_epoch = match retained.kind() {
+                CanonicalEventKind::Committed => None,
+                CanonicalEventKind::Reorged => retained
+                    .previous_epoch_id()
+                    .map(|epoch_id| canonical.chain_epoch_at(epoch_id))
+                    .transpose()?,
+            };
+            Ok(RecordedChainEvent {
+                cursor: retained.cursor(),
+                resulting_epoch: chain_epoch,
+                event: ChainEvent::from_canonical_retained(retained, chain_epoch, reverted_epoch)?,
+            })
+        })
+        .collect()
 }
 
 fn seeded_reorg_history_materialized_view_store(
@@ -810,7 +806,7 @@ fn seeded_block_summary_materialized_view_store_with_transaction_ids(
 fn record_reorg_incidents(materialized_view_store: &MaterializedViewStore) -> Result<()> {
     let blocks = std::collections::HashMap::new();
     for recorded in recorded_chain_reorg_events()? {
-        let chain_cursor = CanonicalEventCursor::at(recorded.event_sequence)?.as_bytes();
+        let chain_cursor = recorded.cursor.as_bytes();
         let mut reorg_incidents = zinder_materialized_views::ReorgIncidentsConsumer::new();
         let mut block_consumers: [&mut dyn zinder_materialized_views::BlockKeyedConsumer; 0] = [];
         let mut event_consumers: [&mut dyn zinder_materialized_views::MaterializedViewConsumer; 1] =
@@ -821,11 +817,11 @@ fn record_reorg_incidents(materialized_view_store: &MaterializedViewStore) -> Re
                 event_consumers: &mut event_consumers,
             },
             zinder_materialized_views::ChainEventDispatchInputs {
-                chain_epoch: recorded.chain_epoch,
-                chain_event: &recorded.chain_event,
+                chain_epoch: recorded.resulting_epoch,
+                chain_event: &recorded.event,
                 chain_cursor: &chain_cursor,
-                event_sequence: recorded.event_sequence,
-                settled_tip_height: recorded.chain_epoch.settled_tip_height,
+                event_sequence: recorded.cursor.event_sequence(),
+                settled_tip_height: recorded.resulting_epoch.settled_tip_height,
             },
             &blocks,
             true,
