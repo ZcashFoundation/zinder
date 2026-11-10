@@ -970,8 +970,11 @@ pub enum QueryError {
     },
 
     /// Canonical store returned a storage or admission failure.
+    ///
+    /// Converting a [`zinder_store::CanonicalStoreError`] with `From` routes an
+    /// absent height-keyed row to [`QueryError::ArtifactUnavailable`] instead.
     #[error(transparent)]
-    CanonicalStore(#[from] zinder_store::CanonicalStoreError),
+    CanonicalStore(zinder_store::CanonicalStoreError),
 
     /// Wallet store returned a storage or admission failure.
     #[error(transparent)]
@@ -980,6 +983,24 @@ pub enum QueryError {
     /// Upstream node operation failed.
     #[error(transparent)]
     Node(#[from] SourceError),
+}
+
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "CanonicalStoreError is non-exhaustive; every other store failure keeps its typed source"
+)]
+impl From<zinder_store::CanonicalStoreError> for QueryError {
+    fn from(error: zinder_store::CanonicalStoreError) -> Self {
+        match error {
+            zinder_store::CanonicalStoreError::ArtifactUnavailable { family, height } => {
+                Self::ArtifactUnavailable {
+                    family,
+                    key: ArtifactKey::BlockHeight(height),
+                }
+            }
+            other => Self::CanonicalStore(other),
+        }
+    }
 }
 
 impl zinder_proto::BoundaryError for QueryError {

@@ -951,7 +951,7 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlockAdapter {
 }
 
 fn store_status(error: CanonicalStoreError) -> Status {
-    status_from_query_error(&QueryError::CanonicalStore(error))
+    status_from_query_error(&QueryError::from(error))
 }
 
 #[allow(
@@ -2327,6 +2327,77 @@ mod tests {
         drop(pinned);
         assert_eq!(Arc::strong_count(&retired), 1);
         Ok(())
+    }
+
+    /// Compact-block serving keeps the lightwalletd range status contract:
+    /// `OUT_OF_RANGE` above the visible tip and `NOT_FOUND` for an unretained
+    /// start, never a retryable `UNAVAILABLE` storage outage.
+    #[tokio::test]
+    async fn get_block_range_outside_retained_history_keeps_lightwalletd_codes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let chain =
+            zinder_testkit::ChainFixture::new(zinder_core::Network::ZcashRegtest).extend_blocks(3);
+        let activations = Arc::new(zinder_testkit::sample_regtest_upgrade_activations());
+        let mut fixture =
+            zinder_testkit::WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
+        let (canonical, wallet) = fixture.take_readers()?;
+        drop(wallet);
+        let adapter = CompactBlockAdapter::new(
+            CompactBlockServingSlot::new(Arc::new(canonical)),
+            activations,
+        );
+
+        let cases = [
+            ("start above visible tip", 4_u64, 5_u64, Code::OutOfRange),
+            ("start at unretained height 0", 0, 1, Code::NotFound),
+            ("only unretained height 0", 0, 0, Code::NotFound),
+            ("descending to unretained height 0", 1, 0, Code::NotFound),
+        ];
+        let mut mismatches = Vec::new();
+        for (label, start_height, end_height, expected_code) in cases {
+            let range = lightwalletd::BlockRange {
+                start: Some(lightwalletd::BlockId {
+                    height: start_height,
+                    hash: Vec::new(),
+                }),
+                end: Some(lightwalletd::BlockId {
+                    height: end_height,
+                    hash: Vec::new(),
+                }),
+                pool_types: Vec::new(),
+            };
+            let observed = match adapter.get_block_range(Request::new(range)).await {
+                Err(status) => Some(status),
+                Ok(response) => {
+                    let mut stream = response.into_inner();
+                    let mut first_error = None;
+                    while let Some(message) = stream.next().await {
+                        if let Err(status) = message {
+                            first_error = Some(status);
+                            break;
+                        }
+                    }
+                    first_error
+                }
+            };
+            match observed {
+                Some(status) if status.code() == expected_code => {}
+                Some(status) => mismatches.push(format!(
+                    "{label} ({start_height}..={end_height}): expected {expected_code:?}, observed {:?} \"{}\"",
+                    status.code(),
+                    status.message(),
+                )),
+                None => mismatches.push(format!(
+                    "{label} ({start_height}..={end_height}): expected {expected_code:?}, observed a complete stream"
+                )),
+            }
+        }
+
+        if mismatches.is_empty() {
+            Ok(())
+        } else {
+            Err(mismatches.join("\n").into())
+        }
     }
 
     #[tokio::test]

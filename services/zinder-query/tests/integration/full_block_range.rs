@@ -16,10 +16,10 @@ use zinder_proto::{
     v1::wallet,
 };
 use zinder_query::{
-    DEFAULT_MAX_FULL_BLOCK_RANGE, FullBlockStream, QueryError, WalletQueryApi,
+    ArtifactKey, DEFAULT_MAX_FULL_BLOCK_RANGE, FullBlockStream, QueryError, WalletQueryApi,
     WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
-use zinder_store::RawBlobRetention;
+use zinder_store::{ArtifactFamily, RawBlobRetention};
 use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
 
 use crate::common::{serving_query_after_live_append, serving_query_over};
@@ -282,6 +282,57 @@ async fn serving_pair_with_all_retention_advertises_and_serves_full_blocks() -> 
     );
     assert!(terminal_error.is_none());
     Ok(())
+}
+
+/// Absent full-block range heights end the stream with a typed coverage miss.
+///
+/// Above the visible tip and below the retained floor, the stream reports
+/// `ArtifactUnavailable` for the first absent height, matching the compact
+/// range read on the same serving pair.
+#[tokio::test]
+async fn serving_pair_full_block_range_outside_retained_history_is_artifact_unavailable()
+-> eyre::Result<()> {
+    let chain = all_retention_chain(3);
+    let (query, _store_fixture) = serving_query_over(&chain)?;
+
+    let cases = [
+        ("start above visible tip", 4_u32, 5_u32, 4_u32, 0_usize),
+        ("start at unretained height 0", 0, 1, 0, 0),
+        ("only unretained height 0", 0, 0, 0, 0),
+        ("end above visible tip", 3, 4, 4, 1),
+    ];
+    let mut mismatches = Vec::new();
+    for (label, start_height, end_height, missing_height, delivered) in cases {
+        let stream = query
+            .full_blocks_in_range(
+                BlockHeightRange::inclusive(
+                    BlockHeight::new(start_height),
+                    BlockHeight::new(end_height),
+                ),
+                None,
+            )
+            .await?;
+        let (_, blobs, terminal_error) = drain_full_block_stream(stream).await;
+        let error_matches = matches!(
+            &terminal_error,
+            Some(QueryError::ArtifactUnavailable {
+                family: ArtifactFamily::BlockBlob,
+                key: ArtifactKey::BlockHeight(height),
+            }) if *height == BlockHeight::new(missing_height)
+        );
+        if !error_matches || blobs.len() != delivered {
+            mismatches.push(format!(
+                "{label} ({start_height}..={end_height}): expected {delivered} blobs then ArtifactUnavailable(block_blob, {missing_height}), observed {} blobs then {terminal_error:?}",
+                blobs.len(),
+            ));
+        }
+    }
+
+    if mismatches.is_empty() {
+        Ok(())
+    } else {
+        Err(eyre!(mismatches.join("\n")))
+    }
 }
 
 #[tokio::test]

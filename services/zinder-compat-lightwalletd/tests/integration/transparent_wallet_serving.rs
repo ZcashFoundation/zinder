@@ -605,6 +605,68 @@ async fn production_history_maps_a_missing_canonical_blob_to_not_found() -> eyre
     Ok(())
 }
 
+/// Out-of-history block ranges keep the lightwalletd status contract.
+///
+/// A release wallet-serving pair retains compact blocks from height 1 through
+/// its visible tip. Ranges outside that window must keep the lightwalletd
+/// status contract: `OUT_OF_RANGE` above the tip and `NOT_FOUND` for an
+/// unretained start, never a retryable `UNAVAILABLE` storage outage.
+#[tokio::test]
+async fn production_pair_get_block_range_outside_retained_history_keeps_lightwalletd_codes()
+-> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(3);
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
+    let adapter = build_wallet_serving_adapter(&mut store_fixture, activations)?;
+
+    let cases = [
+        ("start above visible tip", 4_u64, 5_u64, Code::OutOfRange),
+        ("start at unretained height 0", 0, 1, Code::NotFound),
+        ("only unretained height 0", 0, 0, Code::NotFound),
+    ];
+    let mut mismatches = Vec::new();
+    for (label, start_height, end_height, expected_code) in cases {
+        let observed = first_block_range_status(&adapter, start_height, end_height).await?;
+        if observed.code() != expected_code {
+            mismatches.push(format!(
+                "{label} ({start_height}..={end_height}): expected {expected_code:?}, observed {:?} \"{}\"",
+                observed.code(),
+                observed.message(),
+            ));
+        }
+    }
+
+    if mismatches.is_empty() {
+        Ok(())
+    } else {
+        Err(eyre::eyre!(mismatches.join("\n")))
+    }
+}
+
+async fn first_block_range_status(
+    adapter: &WalletServingAdapter,
+    start_height: u64,
+    end_height: u64,
+) -> eyre::Result<tonic::Status> {
+    let request = lightwalletd::BlockRange {
+        start: Some(lightwalletd::BlockId {
+            height: start_height,
+            hash: Vec::new(),
+        }),
+        end: Some(lightwalletd::BlockId {
+            height: end_height,
+            hash: Vec::new(),
+        }),
+        pool_types: Vec::new(),
+    };
+    match adapter.get_block_range(Request::new(request)).await {
+        Err(status) => Ok(status),
+        Ok(response) => first_stream_error(response.into_inner()).await,
+    }
+}
+
 fn build_wallet_serving_adapter(
     store_fixture: &mut WalletServingStoreFixture,
     activations: Arc<zinder_core::NetworkUpgradeActivations>,

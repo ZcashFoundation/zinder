@@ -143,6 +143,11 @@ macro_rules! impl_canonical_typed_reads {
             }
 
             /// Reads an inclusive compact-block range in ascending height order.
+            ///
+            /// A requested height below the first retained block or above the
+            /// visible tip fails with [`CanonicalStoreError::ArtifactUnavailable`]
+            /// naming that height. A missing row inside that span is store
+            /// damage and fails as [`CanonicalStoreError::PublicationRefused`].
             pub fn compact_blocks_in_range(
                 &self,
                 range: zinder_core::BlockHeightRange,
@@ -284,21 +289,27 @@ fn read_compact_blocks_in_range(
     store: &impl CanonicalServingRead,
     range: zinder_core::BlockHeightRange,
 ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
+    let ready_evidence = store.serving_ready_evidence();
+    let retained_span = BlockHeightRange::inclusive(
+        ready_evidence.first_retained_block.height,
+        ready_evidence.visible_tip.height,
+    );
     let mut blocks = Vec::new();
     let mut heights = Vec::with_capacity(COMPACT_BLOCK_MULTI_GET_BATCH_SIZE);
     for height in range {
         heights.push(height);
         if heights.len() == COMPACT_BLOCK_MULTI_GET_BATCH_SIZE {
-            append_compact_block_batch(store, &heights, &mut blocks)?;
+            append_compact_block_batch(store, retained_span, &heights, &mut blocks)?;
             heights.clear();
         }
     }
-    append_compact_block_batch(store, &heights, &mut blocks)?;
+    append_compact_block_batch(store, retained_span, &heights, &mut blocks)?;
     Ok(blocks)
 }
 
 fn append_compact_block_batch(
     store: &impl CanonicalServingRead,
+    retained_span: BlockHeightRange,
     heights: &[BlockHeight],
     blocks: &mut Vec<CompactBlockArtifact>,
 ) -> Result<(), CanonicalStoreError> {
@@ -331,12 +342,7 @@ fn append_compact_block_batch(
                 operation: "compact block read",
                 source,
             })?
-            .ok_or_else(|| {
-                CanonicalStoreError::publication(format!(
-                    "compact block at height {} is absent",
-                    height.value()
-                ))
-            })?;
+            .ok_or_else(|| absent_compact_block(retained_span, height))?;
         let encoded_header = header_row
             .map_err(|source| CanonicalStoreError::RocksDbOperation {
                 operation: "block header read",
@@ -359,6 +365,27 @@ fn append_compact_block_batch(
         blocks.push(compact_block);
     }
     Ok(())
+}
+
+/// Classifies a missing compact-block row by the retained span it falls in.
+///
+/// Outside the span the store never held the height. Inside it, publication
+/// and live commits write a row for every height, so absence is store damage.
+fn absent_compact_block(
+    retained_span: BlockHeightRange,
+    height: BlockHeight,
+) -> CanonicalStoreError {
+    if height < retained_span.start || height > retained_span.end {
+        CanonicalStoreError::ArtifactUnavailable {
+            family: crate::ArtifactFamily::CompactBlock,
+            height,
+        }
+    } else {
+        CanonicalStoreError::publication(format!(
+            "compact block at height {} is absent",
+            height.value()
+        ))
+    }
 }
 
 fn read_transaction_location(

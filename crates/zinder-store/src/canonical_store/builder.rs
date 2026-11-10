@@ -806,13 +806,7 @@ mod tests {
     #[test]
     fn compact_block_range_refuses_missing_interior_payload_or_header()
     -> Result<(), Box<dyn std::error::Error>> {
-        for (family_name, expected_error) in [
-            (
-                COMPACT_BLOCK_COLUMN_FAMILY,
-                "compact block at height 2 is absent",
-            ),
-            (BLOCK_HEADER_COLUMN_FAMILY, "compact block header is absent"),
-        ] {
+        for family_name in [COMPACT_BLOCK_COLUMN_FAMILY, BLOCK_HEADER_COLUMN_FAMILY] {
             let temporary = TempDir::new()?;
             let store_path = temporary.path().join("canonical");
             let store = published_loaded_store(&store_path, BlockHeight::new(3))?;
@@ -842,9 +836,48 @@ mod tests {
                 .compact_blocks_in_range(range)
                 .err()
                 .ok_or("an interior compact-block gap must fail closed")?;
+            let expected_reason = if family_name == COMPACT_BLOCK_COLUMN_FAMILY {
+                "compact block at height 2 is absent"
+            } else {
+                "compact block header is absent"
+            };
             assert!(
-                error.to_string().contains(expected_error),
-                "unexpected missing-row error: {error}"
+                matches!(
+                    &error,
+                    CanonicalStoreError::PublicationRefused { reason }
+                        if reason.contains(expected_reason)
+                ),
+                "a missing row inside retained history must stay an integrity failure: {error:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn compact_block_range_outside_stored_history_is_an_unavailable_artifact()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let store = published_loaded_store(&store_path, BlockHeight::new(3))?;
+
+        for (start, end, first_absent) in [(4, 5, 4), (0, 1, 0), (0, 0, 0), (3, 4, 4)] {
+            let range = zinder_core::BlockHeightRange::inclusive(
+                BlockHeight::new(start),
+                BlockHeight::new(end),
+            );
+            let error = store
+                .compact_blocks_in_range(range)
+                .err()
+                .ok_or("a range outside stored history must fail")?;
+            assert!(
+                matches!(
+                    error,
+                    CanonicalStoreError::ArtifactUnavailable {
+                        family: crate::ArtifactFamily::CompactBlock,
+                        height,
+                    } if height == BlockHeight::new(first_absent)
+                ),
+                "range {start}..={end}: unexpected error {error:?}"
             );
         }
         Ok(())

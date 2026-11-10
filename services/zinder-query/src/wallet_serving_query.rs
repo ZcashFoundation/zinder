@@ -1409,7 +1409,7 @@ fn map_canonical_chain_event_error(error: zinder_store::CanonicalStoreError) -> 
                 reason: "cursor version is unsupported",
             }
         }
-        other => QueryError::CanonicalStore(other),
+        other => QueryError::from(other),
     }
 }
 

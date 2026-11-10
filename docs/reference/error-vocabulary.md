@@ -91,7 +91,7 @@ The requested resource is not available in the visible query state. Retry dispos
 
 | Reason | What it means | Example metadata |
 | --- | --- | --- |
-| `ARTIFACT_UNAVAILABLE` | A specific artifact is missing from the named family at the visible epoch (also raised by explorer reads for a not-yet-materialized materialized-view row) | `resource_type=<family>, resource_name=<key>` |
+| `ARTIFACT_UNAVAILABLE` | A specific artifact is missing from the named family at the visible epoch. A block-range read names the first requested height above the visible tip or below the retained floor. Explorer reads also raise it for a not-yet-materialized materialized-view row | `resource_type=<family>, resource_name=<key>` |
 | `CHAIN_EPOCH_MISSING` | Chain epoch is not retained (often: pruned) | `resource_type=chain_epoch, resource_name=chain_epoch:<id>` |
 | `BLOCK_NOT_IN_BEST_CHAIN` | No block matching the requested selector is visible in the best chain; unknown and reorged-out selectors share this reason | — |
 

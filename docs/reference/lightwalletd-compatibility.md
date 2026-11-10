@@ -82,6 +82,15 @@ methods, transparent-address methods, transaction submission, and ping.
 `taddrSupport = false`; node discovery and liveness are still required for
 that identity response.
 
+## Block range status codes
+
+`GetBlockRange` keeps the lightwalletd status contract in both serving modes.
+A range whose higher bound is above the visible tip returns `OUT_OF_RANGE`. A
+range that touches a height the serving store does not hold, such as height 0
+or a height below the retained floor, returns `NOT_FOUND`. Neither case returns
+`UNAVAILABLE`, which reports a storage or dependency outage. A compact block
+missing inside retained history is store damage and returns `UNAVAILABLE`.
+
 ## Certification work
 
 1. Keep the protocol pin and generated-client coverage green. Updating the

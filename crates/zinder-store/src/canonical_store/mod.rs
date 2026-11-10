@@ -718,6 +718,23 @@ pub enum CanonicalStoreError {
         reason: String,
     },
 
+    /// A height-keyed artifact has no row in this store.
+    ///
+    /// The compact-block range read raises this for a requested height above
+    /// the visible tip or below the first retained block. A missing row inside
+    /// that span is store damage and raises [`Self::PublicationRefused`].
+    #[error(
+        "canonical {} artifact at height {} is unavailable",
+        .family.wire_label(),
+        .height.value()
+    )]
+    ArtifactUnavailable {
+        /// Artifact family that has no row at `height`.
+        family: crate::ArtifactFamily,
+        /// First requested height whose row is absent.
+        height: BlockHeight,
+    },
+
     /// A fresh canonical build is incomplete or changed during cold validation.
     #[error("canonical publication refused: {reason}")]
     PublicationRefused {
