@@ -1543,6 +1543,85 @@ async fn retention_steps_yield_to_canonical_source_observation()
     Ok(())
 }
 
+/// A source-shaped failure keeps the follower alive with a typed
+/// `node_unavailable` readiness detail, and the follower resumes appending
+/// once the upstream view recovers.
+#[tokio::test]
+async fn canonical_follower_reports_source_outage_and_resumes_after_recovery()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let blocks = parseable_multi_block_chain()?;
+    let checkpoints = checkpoints_for_parseable_chain(&blocks, &activations)?;
+    let published: BTreeMap<_, _> = blocks
+        .range(..=BlockHeight::new(2))
+        .map(|(height, block)| (*height, block.clone()))
+        .collect();
+    let source =
+        RecordingParseableSource::new(published.clone(), checkpoints.clone(), BlockHeight::new(2));
+    let temporary = tempdir()?;
+    let store = publish_parseable_store(
+        &source,
+        &published,
+        Arc::clone(&activations),
+        &temporary.path().join("canonical"),
+        2,
+        BlockHeight::new(1),
+    )
+    .await?;
+    // The node advertises a tip whose block it cannot serve yet.
+    source.set_tip_height(BlockHeight::new(3));
+
+    let readiness = Readiness::default();
+    let cancel = CancellationToken::new();
+    let follower_source = source.clone();
+    let follower_readiness = readiness.clone();
+    let follower_task = tokio::spawn(async move {
+        let follower = CanonicalFollower::new(
+            &follower_source,
+            activations,
+            CanonicalFollowConfig {
+                request_timeout: Duration::from_secs(5),
+                poll_interval: Duration::ZERO,
+                lag_threshold_blocks: 0,
+                target_height: Some(BlockHeight::new(3)),
+                event_retention_window: None,
+                event_retention_check_interval: Duration::from_secs(1),
+                mempool_ready_gate: None,
+                max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+            },
+            &follower_readiness,
+            &cancel,
+        );
+        follow_canonical_tip(store, follower).await
+    });
+
+    let outage = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let ReadinessCause::NodeUnavailable(detail) = readiness.report().cause {
+                return detail;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    assert_eq!(outage.failure_class, "upstream_view_changed");
+    assert!(
+        outage.last_reason.contains("no block at this height"),
+        "{}",
+        outage.last_reason
+    );
+    assert!(!follower_task.is_finished());
+
+    source.replace_chain(blocks.clone(), checkpoints, BlockHeight::new(3));
+    let store = tokio::time::timeout(Duration::from_secs(5), follower_task).await???;
+    assert_eq!(store.event_fence().visible_tip(), block_id(&blocks, 3)?);
+    assert!(!matches!(
+        readiness.report().cause,
+        ReadinessCause::NodeUnavailable(_)
+    ));
+    Ok(())
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "the test builder keeps source, fixture identity, activation identity, path, window, and settlement explicit"
