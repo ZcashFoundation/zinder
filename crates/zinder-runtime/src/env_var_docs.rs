@@ -41,10 +41,7 @@ pub struct EnvVarDoc {
     /// mapping from the env-var name back to its config struct's field path.
     pub toml_path: &'static str,
     /// Which Zinder binaries consume this variable. Used for the "Used by"
-    /// column so operators can scan the table for one runtime at a time. An
-    /// entry may carry a parenthesized qualifier after the binary name, such
-    /// as `zinder-ingest (verify-canonical-replay only)`; use
-    /// [`EnvVarDoc::is_used_by`] to match on the binary name alone.
+    /// column so operators can scan the table for one runtime at a time.
     pub used_by: &'static [&'static str],
     /// Whether the field is required, optional, or required-when-conditioned
     /// (string descriptors keep the column compact).
@@ -57,16 +54,10 @@ pub struct EnvVarDoc {
 }
 
 impl EnvVarDoc {
-    /// Returns whether `binary` consumes this variable, ignoring any
-    /// parenthesized qualifier on the [`EnvVarDoc::used_by`] entry.
+    /// Returns whether `binary` consumes this variable.
     #[must_use]
     pub fn is_used_by(&self, binary: &str) -> bool {
-        self.used_by.iter().any(|entry| {
-            entry
-                .split_once(" (")
-                .map_or(*entry, |(binary_name, _)| binary_name)
-                == binary
-        })
+        self.used_by.contains(&binary)
     }
 }
 
@@ -1559,15 +1550,6 @@ mod tests {
                 "ZINDER_COMPAT__PAIR_CONVERGENCE_ATTEMPTS",
             ]
         );
-    }
-
-    #[test]
-    fn used_by_match_ignores_parenthesized_qualifier() {
-        let secondary_path = ENVIRONMENT_VARIABLES
-            .iter()
-            .find(|env_var| env_var.name == "ZINDER_STORAGE__SECONDARY_PATH");
-        assert!(secondary_path.is_some_and(|env_var| env_var.is_used_by("zinder-ingest")));
-        assert!(secondary_path.is_some_and(|env_var| !env_var.is_used_by("zinder-projector")));
     }
 
     #[test]
