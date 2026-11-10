@@ -21,7 +21,7 @@
 //!
 //! A row lists a binary when the binary reads the variable into its
 //! configuration. A description says when a listed binary does not apply the
-//! value, as for RocksDB background job caps on secondary opens.
+//! value, as for `RocksDB` background job caps on secondary opens.
 //!
 //! Neither check validates descriptions, defaults, requirement, sensitivity,
 //! or whether a binary acts on a variable it accepts. Adding a config field
