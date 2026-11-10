@@ -68,10 +68,10 @@ features on those strings rather than parsing a Zinder version.
 
 ## Native explorer API
 
-`ExplorerQuery` serves explorer, dashboard, and analytics shapes. The deployed
-runtime composes a process-owned materialized-view secondary with selected
-`WalletQuery` calls. Library compositions may also provide a canonical
-secondary for capabilities whose policies require retained canonical facts.
+`ExplorerQuery` serves explorer, dashboard, and analytics shapes. The runtime
+composes a process-owned materialized-view secondary with selected
+`WalletQuery` calls. It does not read the canonical store, so it never
+advertises a capability whose policy requires retained canonical facts.
 Every response carries `ExplorerFreshness`, and optional fields use typed
 unavailability reasons. The checked-in
 `deploy/docker-compose.explorer.yml` overlay runs the explorer beside the

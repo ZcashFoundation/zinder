@@ -30,7 +30,7 @@
 //! and using *its* txids to drive deletes would delete the WRONG txids.
 //! The persisted index captures what was actually written at apply time.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use prost::Message as _;
 use zinder_core::wire::{encode_height_key_ascending, encode_internal_transaction_id};
@@ -41,7 +41,6 @@ use zinder_core::{
 use zinder_proto::v1::explorer::{
     PrevoutResolutionStatus, TransactionFeesRecord, TransparentInputValueRecord,
 };
-use zinder_store::{ChainEpochReader, StoreError};
 
 use crate::consumer::{
     BlockCommitContext, BlockKeyedConsumer, MaterializedViewConsumerCtx,
@@ -143,113 +142,6 @@ impl TransactionFeesConsumer {
         }
         Ok(out)
     }
-
-    /// Resolves fee records from retained canonical transaction facts.
-    ///
-    /// This is the non-destructive fallback for a missing or partial materialized-view
-    /// row. Parent transaction facts retain the output value, script hash, and
-    /// mining location needed to reconstruct each spend even after the
-    /// short-lived transparent-output and transparent-spend projections have
-    /// crossed their retention floor.
-    pub fn resolve_fee_records_from_canonical_facts(
-        reader: &ChainEpochReader<'_>,
-        transactions: &[TransactionFactsArtifact],
-    ) -> Result<HashMap<TransactionId, TransactionFeesRecord>, StoreError> {
-        let parent_transaction_ids: HashSet<TransactionId> = transactions
-            .iter()
-            .flat_map(|transaction| transaction.transparent_inputs.iter())
-            .filter(|input| !input.spent_outpoint.is_coinbase_sentinel())
-            .map(|input| input.spent_outpoint.transaction_id)
-            .collect();
-        let parent_transaction_ids: Vec<TransactionId> =
-            parent_transaction_ids.into_iter().collect();
-        let parent_transactions = reader.transaction_facts_by_ids(&parent_transaction_ids)?;
-        Ok(build_fee_records_from_parent_transactions(
-            transactions,
-            &parent_transactions,
-        ))
-    }
-
-    /// Recovers one fee record from parent transaction facts already loaded by
-    /// the caller.
-    ///
-    /// Explorer transaction detail uses this form so the same epoch-pinned
-    /// parent rows can populate both the fee calculation and the public
-    /// transparent prevout response without a second canonical read.
-    #[must_use]
-    pub fn recover_fee_record_from_parent_facts(
-        transaction: &TransactionFactsArtifact,
-        parent_transactions: &HashMap<TransactionId, Option<TransactionFactsArtifact>>,
-    ) -> Option<TransactionFeesRecord> {
-        build_fee_records_from_parent_transactions(
-            std::slice::from_ref(transaction),
-            parent_transactions,
-        )
-        .remove(&transaction.location.transaction_id)
-    }
-
-    /// Merges a projected record with a canonical-fact recovery record.
-    ///
-    /// Values are matched by transparent input index. A resolved value from
-    /// either source wins over absence, so a partial fallback never discards a
-    /// value the materialized view retained. The paid fee is recomputed only when the
-    /// merged input set is complete and the transaction is transparent-only.
-    #[must_use]
-    pub fn merge_fee_records(
-        transaction: &TransactionFactsArtifact,
-        projected: Option<&TransactionFeesRecord>,
-        recovered: &TransactionFeesRecord,
-    ) -> TransactionFeesRecord {
-        let projected_values: HashMap<u32, u64> = projected
-            .into_iter()
-            .flat_map(|record| record.transparent_inputs.iter())
-            .filter_map(|input| {
-                input
-                    .value_zat
-                    .map(|value_zat| (input.input_index, value_zat))
-            })
-            .collect();
-        let recovered_values: HashMap<u32, u64> = recovered
-            .transparent_inputs
-            .iter()
-            .filter_map(|input| {
-                input
-                    .value_zat
-                    .map(|value_zat| (input.input_index, value_zat))
-            })
-            .collect();
-        let transparent_inputs: Vec<TransparentInputValueRecord> = transaction
-            .transparent_inputs
-            .iter()
-            .map(|input| TransparentInputValueRecord {
-                input_index: input.input_index,
-                value_zat: recovered_values
-                    .get(&input.input_index)
-                    .or_else(|| projected_values.get(&input.input_index))
-                    .copied(),
-            })
-            .collect();
-        let all_inputs_resolved = transparent_inputs
-            .iter()
-            .all(|input| input.value_zat.is_some());
-        let paid_fee_zat = if all_inputs_resolved
-            && transaction.public_facts.privacy_shape == PrivacyShape::TransparentOnly
-        {
-            paid_fee_from_input_details(transaction, &transparent_inputs)
-        } else {
-            None
-        };
-        TransactionFeesRecord {
-            paid_fee_zat,
-            prevout_resolution_status: if all_inputs_resolved {
-                PrevoutResolutionStatus::Resolved as i32
-            } else {
-                PrevoutResolutionStatus::Partial as i32
-            },
-            transparent_inputs,
-            logical_actions: transaction.public_facts.counts.logical_actions(),
-        }
-    }
 }
 
 fn record_with_provable_paid_fee(
@@ -260,56 +152,6 @@ fn record_with_provable_paid_fee(
         record.paid_fee_zat = None;
     }
     record
-}
-
-fn build_fee_records_from_parent_transactions(
-    transactions: &[TransactionFactsArtifact],
-    parent_transactions: &HashMap<TransactionId, Option<TransactionFactsArtifact>>,
-) -> HashMap<TransactionId, TransactionFeesRecord> {
-    let mut transparent_spends = HashMap::new();
-    for transaction in transactions {
-        for input in &transaction.transparent_inputs {
-            let Some(parent) = parent_transactions
-                .get(&input.spent_outpoint.transaction_id)
-                .and_then(Option::as_ref)
-            else {
-                continue;
-            };
-            let Some(output) = parent
-                .transparent_outputs
-                .iter()
-                .find(|output| output.output_index == input.spent_outpoint.output_index)
-            else {
-                continue;
-            };
-            transparent_spends.insert(
-                input.spent_outpoint,
-                TransparentSpendFact::new(
-                    input.spent_outpoint,
-                    input.input_index,
-                    transaction.location.transaction_id,
-                    transaction.location.tx_index_in_block,
-                    transaction.location.block_height,
-                    transaction.location.block_hash,
-                    output.value_zat,
-                    output.address_script_hash,
-                    parent.location.block_height,
-                    parent.location.block_hash,
-                ),
-            );
-        }
-    }
-
-    transactions
-        .iter()
-        .filter(|transaction| !transaction.public_facts.is_coinbase)
-        .map(|transaction| {
-            (
-                transaction.location.transaction_id,
-                build_fee_record(transaction, Some(&transparent_spends)),
-            )
-        })
-        .collect()
 }
 
 impl BlockKeyedConsumer for TransactionFeesConsumer {
@@ -499,10 +341,7 @@ mod tests {
         PrevoutResolutionStatus, TransactionFeesRecord, TransparentInputValueRecord,
     };
 
-    use super::{
-        TransactionFeesConsumer, build_fee_record, build_fee_records_from_parent_transactions,
-        record_with_provable_paid_fee,
-    };
+    use super::{build_fee_record, record_with_provable_paid_fee};
 
     const TRANSPARENT_INPUT_VALUE_ZAT: u64 = 50_000;
     const TRANSPARENT_OUTPUT_VALUE_ZAT: u64 = 40_000;
@@ -680,138 +519,5 @@ mod tests {
         let record = record_with_provable_paid_fee(stored_record, PrivacyShape::TransparentOnly);
 
         assert_eq!(record.paid_fee_zat, Some(10_000));
-    }
-
-    #[test]
-    fn retained_parent_facts_reconstruct_resolved_transparent_fee() {
-        let counts = TransactionComponentCounts {
-            transparent_input_count: 1,
-            transparent_output_count: 1,
-            ..TransactionComponentCounts::EMPTY
-        };
-        let (transaction, _transparent_spends) =
-            transaction_with_resolved_transparent_input(counts, Some(TRANSPARENT_OUTPUT_VALUE_ZAT));
-        let spent_outpoint = transaction.transparent_inputs[0].spent_outpoint;
-        let parent = parent_transaction_for_outpoint(spent_outpoint, TRANSPARENT_INPUT_VALUE_ZAT);
-        let parent_transactions = HashMap::from([(spent_outpoint.transaction_id, Some(parent))]);
-
-        let records = build_fee_records_from_parent_transactions(
-            std::slice::from_ref(&transaction),
-            &parent_transactions,
-        );
-        let record = &records[&transaction.location.transaction_id];
-
-        assert_eq!(record.paid_fee_zat, Some(10_000));
-        assert_eq!(
-            record.prevout_resolution_status,
-            PrevoutResolutionStatus::Resolved as i32
-        );
-        assert_eq!(record.transparent_inputs[0].value_zat, Some(50_000));
-    }
-
-    #[test]
-    fn missing_parent_fact_keeps_fee_partial_and_absent() {
-        let counts = TransactionComponentCounts {
-            transparent_input_count: 1,
-            transparent_output_count: 1,
-            ..TransactionComponentCounts::EMPTY
-        };
-        let (transaction, _transparent_spends) =
-            transaction_with_resolved_transparent_input(counts, Some(TRANSPARENT_OUTPUT_VALUE_ZAT));
-
-        let records = build_fee_records_from_parent_transactions(
-            std::slice::from_ref(&transaction),
-            &HashMap::new(),
-        );
-        let record = &records[&transaction.location.transaction_id];
-
-        assert_eq!(record.paid_fee_zat, None);
-        assert_eq!(
-            record.prevout_resolution_status,
-            PrevoutResolutionStatus::Partial as i32
-        );
-        assert_eq!(record.transparent_inputs[0].value_zat, None);
-    }
-
-    #[test]
-    fn merging_recovery_keeps_value_resolved_only_in_materialized_view() {
-        let counts = TransactionComponentCounts {
-            transparent_input_count: 1,
-            transparent_output_count: 1,
-            ..TransactionComponentCounts::EMPTY
-        };
-        let (transaction, _transparent_spends) =
-            transaction_with_resolved_transparent_input(counts, Some(TRANSPARENT_OUTPUT_VALUE_ZAT));
-        let projected = TransactionFeesRecord {
-            paid_fee_zat: None,
-            prevout_resolution_status: PrevoutResolutionStatus::Partial as i32,
-            transparent_inputs: vec![TransparentInputValueRecord {
-                input_index: 0,
-                value_zat: Some(TRANSPARENT_INPUT_VALUE_ZAT),
-            }],
-            logical_actions: 1,
-        };
-        let recovered = TransactionFeesRecord {
-            paid_fee_zat: None,
-            prevout_resolution_status: PrevoutResolutionStatus::Partial as i32,
-            transparent_inputs: vec![TransparentInputValueRecord {
-                input_index: 0,
-                value_zat: None,
-            }],
-            logical_actions: 1,
-        };
-
-        let merged =
-            TransactionFeesConsumer::merge_fee_records(&transaction, Some(&projected), &recovered);
-
-        assert_eq!(merged.transparent_inputs[0].value_zat, Some(50_000));
-        assert_eq!(
-            merged.prevout_resolution_status,
-            PrevoutResolutionStatus::Resolved as i32
-        );
-        assert_eq!(merged.paid_fee_zat, Some(10_000));
-    }
-
-    fn parent_transaction_for_outpoint(
-        outpoint: TransparentOutPoint,
-        value_zat: u64,
-    ) -> TransactionFactsArtifact {
-        TransactionFactsArtifact::new(
-            TransactionLocation::new(
-                outpoint.transaction_id,
-                BlockHeight::new(50),
-                BlockHash::from_bytes([6; 32]),
-                1,
-            ),
-            TransactionPublicFacts {
-                transaction_id: outpoint.transaction_id,
-                auth_digest: None,
-                wtxid: None,
-                version: TransactionVersion::V5,
-                consensus_branch_id: None,
-                lock_time: LockTime::Unlocked,
-                expiry_height: None,
-                size_bytes: 0,
-                counts: TransactionComponentCounts {
-                    transparent_output_count: 1,
-                    ..TransactionComponentCounts::EMPTY
-                },
-                orchard_value_balance_zat: None,
-                orchard_anchor: None,
-                ironwood_value_balance_zat: None,
-                privacy_shape: PrivacyShape::TransparentOnly,
-                is_coinbase: false,
-                unsupported_sections: Vec::new(),
-            },
-        )
-        .with_transparent_facts(
-            Vec::new(),
-            vec![TransparentOutputFact::new(
-                outpoint.output_index,
-                value_zat,
-                b"parent-script".to_vec(),
-                TransparentAddressScriptHash::from_bytes([5; 32]),
-            )],
-        )
     }
 }

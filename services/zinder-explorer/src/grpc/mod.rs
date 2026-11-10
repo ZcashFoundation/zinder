@@ -4,19 +4,15 @@ mod adapter;
 mod block_activity;
 mod block_view;
 mod chain_reorg_history;
-mod commitment_root_search;
 mod conventional_fee_distribution;
-mod displaced_block;
 mod error;
 mod fee_summary;
 mod freshness;
-mod intrinsic_value_balances;
 mod mempool;
 mod mempool_event_counts;
 mod migration;
 mod network_upgrade_status;
 mod overview_snapshot;
-mod paid_fee_distribution;
 mod recent_transactions;
 mod search;
 mod transaction_component_summary;
@@ -32,19 +28,6 @@ mod value_pool_flow;
 mod value_pool_summary;
 
 pub use adapter::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings, describe_request_metrics};
-
-fn require_matching_chain_epoch(
-    expected: zinder_core::ChainEpoch,
-    actual: zinder_core::ChainEpoch,
-) -> Result<(), tonic::Status> {
-    if actual != expected {
-        return Err(error::ExplorerError::internal(format!(
-            "WalletQuery chain epoch identity mismatch: expected {expected:?}, received {actual:?}",
-        ))
-        .into());
-    }
-    Ok(())
-}
 
 /// Clamps a caller-requested page size to a default and a hard cap.
 ///

@@ -6,7 +6,7 @@
 //! the per-tx `transaction_fees` rows in a single `multi_get` so the page
 //! cost is one prefix scan plus one batched lookup.
 
-use std::{collections::HashMap, pin::Pin};
+use std::pin::Pin;
 
 use prost::Message as _;
 use tokio_stream::Stream;
@@ -16,12 +16,10 @@ use zinder_core::{PrivacyShape, TransactionId};
 use zinder_proto::capabilities::EXPLORER_TRANSACTION_RECENT_V1;
 use zinder_proto::v1::explorer::{
     RecentTransactionEntry, RecentTransactionsChunk, RecentTransactionsRequest,
-    TransactionFeesRecord,
 };
 use zinder_proto::v1::wallet::{VisibleTipBlockRequest, wallet_query_client::WalletQueryClient};
 use zinder_proto::wire::decode_privacy_shape;
 use zinder_runtime::AuthenticatedChannel;
-use zinder_store::{SecondaryChainStore, chain_epoch_from_message, status_from_store_error};
 
 use super::clamp_max_entries;
 use super::error::ExplorerError;
@@ -52,7 +50,6 @@ pub(crate) type RecentTransactionsStream =
 )]
 pub(crate) async fn query_recent_transactions(
     materialized_view_store: &MaterializedViewStore,
-    chain_store: Option<&SecondaryChainStore>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     upstream_observation_cache: &UpstreamObservationCache,
     request: Request<RecentTransactionsRequest>,
@@ -117,12 +114,7 @@ pub(crate) async fn query_recent_transactions(
         .ok_or_else(|| {
             ExplorerError::internal("VisibleTipBlockResponse.chain_view.chain_epoch missing")
         })?;
-    join_paid_fees(
-        materialized_view_store,
-        chain_store,
-        &chain_epoch,
-        &mut entries,
-    )?;
+    join_paid_fees(materialized_view_store, &mut entries)?;
     let cursor = last_key.map_or_else(Vec::new, |key| key.to_vec());
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
@@ -151,8 +143,6 @@ pub(crate) async fn query_recent_transactions(
 /// per ADR-0018.
 fn join_paid_fees(
     materialized_view_store: &MaterializedViewStore,
-    chain_store: Option<&SecondaryChainStore>,
-    chain_epoch: &zinder_proto::v1::wallet::ChainEpoch,
     entries: &mut [RecentTransactionEntry],
 ) -> Result<(), Status> {
     let lookup_targets: Vec<(TransactionId, PrivacyShape)> = entries
@@ -181,71 +171,6 @@ fn join_paid_fees(
         };
         if let Some(record) = records.get(&transaction_id) {
             entry.paid_fee_zat = record.paid_fee_zat;
-        }
-    }
-    resolve_missing_transparent_fees(chain_store, chain_epoch, &records, entries)?;
-    Ok(())
-}
-
-fn resolve_missing_transparent_fees(
-    chain_store: Option<&SecondaryChainStore>,
-    chain_epoch: &zinder_proto::v1::wallet::ChainEpoch,
-    projected_records: &HashMap<TransactionId, TransactionFeesRecord>,
-    entries: &mut [RecentTransactionEntry],
-) -> Result<(), Status> {
-    let unresolved_ids: Vec<TransactionId> = entries
-        .iter()
-        .filter(|entry| {
-            !entry.is_coinbase
-                && entry.paid_fee_zat.is_none()
-                && decode_privacy_shape(entry.privacy_shape) == Some(PrivacyShape::TransparentOnly)
-        })
-        .map(|entry| decode_rpc_transaction_id_hex(&entry.transaction_id))
-        .collect::<Result<_, _>>()
-        .map_err(|error| ExplorerError::internal(error.to_string()))?;
-    if unresolved_ids.is_empty() {
-        return Ok(());
-    }
-    let Some(store) = chain_store else {
-        return Ok(());
-    };
-
-    store
-        .try_catch_up()
-        .map_err(|error| status_from_store_error(&error))?;
-    let core_epoch = chain_epoch_from_message(chain_epoch.clone())
-        .map_err(|error| ExplorerError::internal(error.to_string()))?;
-    let reader = store
-        .chain_epoch_reader_at(core_epoch.id)
-        .map_err(|error| status_from_store_error(&error))?;
-    let transactions = reader
-        .transaction_facts_by_ids(&unresolved_ids)
-        .map_err(|error| status_from_store_error(&error))?
-        .into_values()
-        .flatten()
-        .collect::<Vec<_>>();
-    let resolved =
-        TransactionFeesConsumer::resolve_fee_records_from_canonical_facts(&reader, &transactions)
-            .map_err(|error| status_from_store_error(&error))?;
-    let transactions_by_id: HashMap<TransactionId, _> = transactions
-        .iter()
-        .map(|transaction| (transaction.location.transaction_id, transaction))
-        .collect();
-    for entry in entries {
-        if entry.paid_fee_zat.is_some() {
-            continue;
-        }
-        let Ok(transaction_id) = decode_rpc_transaction_id_hex(&entry.transaction_id) else {
-            continue;
-        };
-        let transaction = transactions_by_id.get(&transaction_id).copied();
-        if let (Some(transaction), Some(recovered)) = (transaction, resolved.get(&transaction_id)) {
-            entry.paid_fee_zat = TransactionFeesConsumer::merge_fee_records(
-                transaction,
-                projected_records.get(&transaction_id),
-                recovered,
-            )
-            .paid_fee_zat;
         }
     }
     Ok(())

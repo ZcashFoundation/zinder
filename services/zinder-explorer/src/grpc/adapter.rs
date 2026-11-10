@@ -23,9 +23,8 @@ use zinder_core::{Network, NetworkUpgradeActivations, wire::encode_zinder_native
 use zinder_proto::capabilities::{
     CapabilitySurface, EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1,
     EXPLORER_CONVENTIONAL_FEE_DISTRIBUTION_V1, EXPLORER_PAID_FEE_DISTRIBUTION_V1,
-    EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1,
-    EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2, EXPLORER_TRANSPARENT_ADDRESS_RANKING_V1,
-    ExplorerReadiness, capabilities_for_surface,
+    EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2,
+    EXPLORER_TRANSPARENT_ADDRESS_RANKING_V1, ExplorerReadiness, capabilities_for_surface,
 };
 use zinder_proto::v1::{
     explorer::{
@@ -75,17 +74,10 @@ const EXPLORER_RPC_METRICS: RpcMetricNames = RpcMetricNames::for_service(
     "zinder_explorer_request_total",
 );
 
-/// First canonical artifact schema that contains transaction-intrinsic balances.
-const MINIMUM_INTRINSIC_VALUE_BALANCE_HISTORY_SCHEMA_VERSION: u16 = 15;
 use super::block_activity::query_block_activity_distribution;
-use super::block_view::{
-    query_block_detail, query_block_production_in_time_range, query_block_production_series,
-    query_block_summaries_in_range, query_block_transactions,
-};
+use super::block_view::{query_block_detail, query_block_summaries_in_range};
 use super::chain_reorg_history::query_chain_reorg_history;
-use super::commitment_root_search::query_commitment_root_search;
 use super::conventional_fee_distribution::query_conventional_fee_distribution;
-use super::displaced_block::{query_displaced_block_detail, query_displaced_block_history};
 use super::error::ExplorerError;
 use super::fee_summary::query_fee_summary;
 use super::freshness::{
@@ -99,7 +91,6 @@ use super::migration::{
 };
 use super::network_upgrade_status::query_network_upgrade_status;
 use super::overview_snapshot::query_overview_snapshot;
-use super::paid_fee_distribution::query_paid_fee_distribution;
 use super::recent_transactions::{RecentTransactionsStream, query_recent_transactions};
 use super::search::query_search;
 use super::transaction_component_summary::query_transaction_component_summary;
@@ -123,7 +114,6 @@ use super::value_pool_flow::{
 };
 use super::value_pool_summary::query_value_pool_summary;
 use zinder_materialized_views::{MaterializedViewPreset, MaterializedViewStore};
-use zinder_store::SecondaryChainStore;
 
 /// Settings the binary populates before constructing the adapter.
 #[derive(Clone, Copy, Debug)]
@@ -152,7 +142,6 @@ pub struct ExplorerQueryGrpcAdapter {
     wallet_query_endpoint: Option<String>,
     wallet_query_bearer_token: Option<BearerToken>,
     bearer_token: Option<BearerToken>,
-    canonical_store: Option<SecondaryChainStore>,
     materialized_view_store: Option<MaterializedViewStore>,
     materialized_view_preset: Option<MaterializedViewPreset>,
     transaction_history_materialized_view_reader:
@@ -172,7 +161,6 @@ impl ExplorerQueryGrpcAdapter {
             wallet_query_endpoint: None,
             wallet_query_bearer_token: None,
             bearer_token: None,
-            canonical_store: None,
             materialized_view_store: None,
             materialized_view_preset: None,
             transaction_history_materialized_view_reader: None,
@@ -194,15 +182,6 @@ impl ExplorerQueryGrpcAdapter {
             TransactionHistoryMaterializedViewReader::new(store.clone()),
         ));
         self.materialized_view_store = Some(store);
-        self
-    }
-
-    /// Wires the canonical secondary store so explorer handlers can read typed
-    /// block and transaction facts without requesting raw blobs from the
-    /// wallet plane.
-    #[must_use]
-    pub fn with_canonical_store(mut self, store: SecondaryChainStore) -> Self {
-        self.canonical_store = Some(store);
         self
     }
 
@@ -305,28 +284,17 @@ impl ExplorerQueryGrpcAdapter {
             .transaction_history_materialized_view_reader
             .as_ref()
             .and_then(|reader| reader.readiness().ok());
-        let canonical_transaction_history_position =
-            self.canonical_store.as_ref().and_then(|store| {
-                store.try_catch_up().ok()?;
-                let chain_epoch = store.current_chain_epoch().ok().flatten()?;
-                Some((
-                    chain_epoch.id,
-                    chain_epoch.visible_tip_height,
-                    chain_epoch.visible_tip_hash,
-                ))
-            });
 
         ExplorerReadiness {
             wallet_query_online,
-            canonical_store_online: self.canonical_store.is_some(),
+            canonical_store_online: false,
             materialized_view_store_online: self.materialized_view_preset
                 == Some(MaterializedViewPreset::Explorer),
             prevout_resolution_online: self.prevout_resolution_online && wallet_query_online,
             transaction_history_available: transaction_history_readiness
                 .is_some_and(TransactionHistoryMaterializedViewReadiness::is_available),
-            transaction_history_complete: transaction_history_readiness.is_some_and(|readiness| {
-                readiness.is_complete_at(canonical_transaction_history_position)
-            }),
+            // Complete history must match a canonical tip, which the explorer cannot read.
+            transaction_history_complete: false,
         }
     }
 
@@ -354,23 +322,9 @@ impl ExplorerQueryGrpcAdapter {
                     .flatten()
                     .is_some()
             });
-        let paid_fee_distribution_covered =
-            self.materialized_view_store.as_ref().is_some_and(|store| {
-                zinder_materialized_views::PaidFeeDistributionConsumer::coverage(store)
-                    .ok()
-                    .flatten()
-                    .is_some()
-            });
         let block_production_time_covered = block_production_time_materialized_view_available(
             self.materialized_view_store.as_ref(),
         );
-        let transaction_intrinsic_value_balances_available =
-            self.canonical_store.as_ref().is_some_and(|store| {
-                store.try_catch_up().is_ok()
-                    && store.current_chain_epoch().is_ok_and(|chain_epoch| {
-                        chain_epoch.is_some_and(intrinsic_value_balance_schema_supported)
-                    })
-            });
         capabilities_for_surface(CapabilitySurface::Explorer)
             .filter(|spec| spec.policy.explorer_satisfied(readiness))
             .filter(|spec| {
@@ -384,17 +338,12 @@ impl ExplorerQueryGrpcAdapter {
                 spec.string != EXPLORER_CONVENTIONAL_FEE_DISTRIBUTION_V1
                     || conventional_fee_distribution_covered
             })
-            .filter(|spec| {
-                spec.string != EXPLORER_PAID_FEE_DISTRIBUTION_V1
-                    || (paid_fee_distribution_covered && readiness.canonical_store_online)
-            })
+            // PaidFeeDistribution bounds its answer by canonical history, which the
+            // explorer cannot read, so its handler always fails.
+            .filter(|spec| spec.string != EXPLORER_PAID_FEE_DISTRIBUTION_V1)
             .filter(|spec| {
                 spec.string != EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1
                     || block_production_time_covered
-            })
-            .filter(|spec| {
-                spec.string != EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1
-                    || transaction_intrinsic_value_balances_available
             })
             .map(|spec| spec.string)
             .collect()
@@ -423,11 +372,6 @@ fn block_production_time_materialized_view_available(
             coverage.complete_from_height.value() <= 1
                 && coverage.complete_through_height >= materialized_view_state.tip_height
         })
-}
-
-fn intrinsic_value_balance_schema_supported(chain_epoch: zinder_core::ChainEpoch) -> bool {
-    chain_epoch.artifact_schema_version.value()
-        >= MINIMUM_INTRINSIC_VALUE_BALANCE_HISTORY_SCHEMA_VERSION
 }
 
 /// Pair of operation labels used by every `ExplorerQuery` handler.
@@ -517,9 +461,7 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
             query_transaction_detail(
                 &mut client,
                 TransactionDetailContext {
-                    chain_store: self.canonical_store.as_ref(),
                     materialized_view_store: self.materialized_view_store.as_ref(),
-                    network: self.settings.network,
                     network_upgrade_activations: &self.network_upgrade_activations,
                     upstream_observation_cache: &self.upstream_observation_cache,
                 },
@@ -559,50 +501,32 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
 
     async fn block_production_series(
         &self,
-        request: Request<BlockProductionSeriesRequest>,
+        _request: Request<BlockProductionSeriesRequest>,
     ) -> Result<Response<BlockProductionSeriesResponse>, Status> {
         const OP: OperationNames = OperationNames {
             method: "BlockProductionSeries",
             metric: "block_production_series",
         };
         let started = Instant::now();
-        let outcome = async {
-            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
-            let canonical_store = self.require_canonical_store(OP.method)?;
-            query_block_production_series(
-                materialized_view_store,
-                canonical_store,
-                &self.upstream_observation_cache,
-                request,
-            )
-            .await
-        }
-        .await;
+        let outcome = self
+            .require_materialized_view_store(OP.method)
+            .and_then(|_| Err(canonical_store_unavailable(OP.method)));
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
         outcome
     }
 
     async fn block_production_in_time_range(
         &self,
-        request: Request<BlockProductionInTimeRangeRequest>,
+        _request: Request<BlockProductionInTimeRangeRequest>,
     ) -> Result<Response<BlockProductionInTimeRangeResponse>, Status> {
         const OP: OperationNames = OperationNames {
             method: "BlockProductionInTimeRange",
             metric: "block_production_in_time_range",
         };
         let started = Instant::now();
-        let outcome = async {
-            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
-            let canonical_store = self.require_canonical_store(OP.method)?;
-            query_block_production_in_time_range(
-                materialized_view_store,
-                canonical_store,
-                &self.upstream_observation_cache,
-                request,
-            )
-            .await
-        }
-        .await;
+        let outcome = self
+            .require_materialized_view_store(OP.method)
+            .and_then(|_| Err(canonical_store_unavailable(OP.method)));
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
         outcome
     }
@@ -709,27 +633,16 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
 
     async fn block_transactions(
         &self,
-        request: Request<BlockDetailRequest>,
+        _request: Request<BlockDetailRequest>,
     ) -> Result<Response<BlockTransactionsResponse>, Status> {
         const OP: OperationNames = OperationNames {
             method: "BlockTransactions",
             metric: "block_transactions",
         };
         let started = Instant::now();
-        let outcome = async {
-            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
-            let canonical_store = self.require_canonical_store(OP.method)?;
-            let mut client = self.wallet_client(OP.method).await?;
-            query_block_transactions(
-                canonical_store,
-                materialized_view_store,
-                &mut client,
-                &self.upstream_observation_cache,
-                request,
-            )
-            .await
-        }
-        .await;
+        let outcome = self
+            .require_materialized_view_store(OP.method)
+            .and_then(|_| Err(canonical_store_unavailable(OP.method)));
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
         outcome
     }
@@ -761,26 +674,16 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
 
     async fn commitment_root_search(
         &self,
-        request: Request<CommitmentRootSearchRequest>,
+        _request: Request<CommitmentRootSearchRequest>,
     ) -> Result<Response<CommitmentRootSearchResponse>, Status> {
         const OP: OperationNames = OperationNames {
             method: "CommitmentRootSearch",
             metric: "commitment_root_search",
         };
         let started = Instant::now();
-        let outcome = async {
-            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
-            let canonical_store = self.require_canonical_store(OP.method)?;
-            query_commitment_root_search(
-                materialized_view_store,
-                canonical_store,
-                &self.network_upgrade_activations,
-                &self.upstream_observation_cache,
-                request,
-            )
-            .await
-        }
-        .await;
+        let outcome = self
+            .require_materialized_view_store(OP.method)
+            .and_then(|_| Err(canonical_store_unavailable(OP.method)));
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
         outcome
     }
@@ -880,7 +783,6 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
             query_transparent_address_activity(
                 TransparentAddressActivityContext {
                     materialized_view_store,
-                    canonical_store: self.canonical_store.as_ref(),
                     network: self.settings.network,
                     upstream_observation_cache: &self.upstream_observation_cache,
                 },
@@ -977,27 +879,16 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
 
     async fn paid_fee_distribution(
         &self,
-        request: Request<PaidFeeDistributionRequest>,
+        _request: Request<PaidFeeDistributionRequest>,
     ) -> Result<Response<PaidFeeDistributionResponse>, Status> {
         const OP: OperationNames = OperationNames {
             method: "PaidFeeDistribution",
             metric: "paid_fee_distribution",
         };
         let started = Instant::now();
-        let outcome = async {
-            let materialized_view_store = self.require_materialized_view_store(OP.method)?;
-            let canonical_store = self.require_canonical_store(OP.method)?;
-            let mut client = self.wallet_client(OP.method).await?;
-            query_paid_fee_distribution(
-                materialized_view_store,
-                canonical_store,
-                &mut client,
-                &self.upstream_observation_cache,
-                request,
-            )
-            .await
-        }
-        .await;
+        let outcome = self
+            .require_materialized_view_store(OP.method)
+            .and_then(|_| Err(canonical_store_unavailable(OP.method)));
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
         outcome
     }
@@ -1255,42 +1146,28 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
 
     async fn displaced_block_history(
         &self,
-        request: Request<DisplacedBlockHistoryRequest>,
+        _request: Request<DisplacedBlockHistoryRequest>,
     ) -> Result<Response<DisplacedBlockHistoryResponse>, Status> {
         const OP: OperationNames = OperationNames {
             method: "DisplacedBlockHistory",
             metric: "displaced_block_history",
         };
         let started = Instant::now();
-        let outcome = async {
-            let canonical_store = self.require_canonical_store(OP.method)?;
-            query_displaced_block_history(
-                canonical_store,
-                &self.upstream_observation_cache,
-                request,
-            )
-            .await
-        }
-        .await;
+        let outcome = Err(canonical_store_unavailable(OP.method));
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
         outcome
     }
 
     async fn displaced_block_detail(
         &self,
-        request: Request<DisplacedBlockDetailRequest>,
+        _request: Request<DisplacedBlockDetailRequest>,
     ) -> Result<Response<DisplacedBlockDetailResponse>, Status> {
         const OP: OperationNames = OperationNames {
             method: "DisplacedBlockDetail",
             metric: "displaced_block_detail",
         };
         let started = Instant::now();
-        let outcome = async {
-            let canonical_store = self.require_canonical_store(OP.method)?;
-            query_displaced_block_detail(canonical_store, &self.upstream_observation_cache, request)
-                .await
-        }
-        .await;
+        let outcome = Err(canonical_store_unavailable(OP.method));
         record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
         outcome
     }
@@ -1346,7 +1223,6 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
                 TransactionHistoryContext {
                     materialized_view_reader: Arc::clone(materialized_view_reader),
                     materialized_view_store: self.materialized_view_store.as_ref(),
-                    chain_store: self.canonical_store.as_ref(),
                     upstream_observation_cache: &self.upstream_observation_cache,
                 },
                 &mut client,
@@ -1375,7 +1251,6 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
             let mut client = self.wallet_client(OP.method).await?;
             query_recent_transactions(
                 materialized_view_store,
-                self.canonical_store.as_ref(),
                 &mut client,
                 &self.upstream_observation_cache,
                 request,
@@ -1522,18 +1397,6 @@ impl ExplorerQueryGrpcAdapter {
         Ok(materialized_view_store)
     }
 
-    fn require_canonical_store(
-        &self,
-        method: &'static str,
-    ) -> Result<&SecondaryChainStore, Status> {
-        self.canonical_store.as_ref().ok_or_else(|| {
-            ExplorerError::dependency_not_configured(format!(
-                "{method} requires the canonical store; configure --storage-path"
-            ))
-            .into()
-        })
-    }
-
     fn require_wallet_endpoint(&self, method: &'static str) -> Result<&str, Status> {
         self.wallet_query_endpoint.as_deref().ok_or_else(|| {
             ExplorerError::dependency_not_configured(format!(
@@ -1566,6 +1429,17 @@ impl ExplorerQueryGrpcAdapter {
             .await?;
         Ok(WalletQueryClient::new(channel.clone()))
     }
+}
+
+/// Fails a method that reads canonical-store facts.
+///
+/// The explorer has no canonical-store read path, so these methods are never
+/// advertised and fail as an unconfigured dependency on every deployment.
+fn canonical_store_unavailable(method: &'static str) -> Status {
+    ExplorerError::dependency_not_configured(format!(
+        "{method} requires canonical-store reads, which zinder-explorer does not provide"
+    ))
+    .into()
 }
 
 #[allow(
@@ -1633,20 +1507,141 @@ mod tests {
     )]
 
     use tempfile::{TempDir, tempdir};
-    use zinder_core::{ArtifactSchemaVersion, BlockHash, BlockHeight, ChainEpochId, Network};
+    use tonic_types::StatusExt as _;
+    use zinder_core::{BlockHash, BlockHeight, ChainEpochId};
     use zinder_materialized_views::{
         CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA, MaterializedViewCoverage, MaterializedViewPreset,
         MaterializedViewState, MaterializedViewStoreOptions, PAID_FEE_DISTRIBUTION_SCHEMA,
         TRANSACTION_HISTORY_CONSUMER_NAME,
     };
     use zinder_proto::capabilities::{
-        EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_TRANSACTION_DETAIL_V4, EXPLORER_TRANSACTION_HISTORY_V1,
-        EXPLORER_TRANSACTION_HISTORY_V2,
+        EXPLORER_BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_V1, EXPLORER_BLOCK_PRODUCTION_SERIES_V2,
+        EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_BLOCK_TRANSACTIONS_V2,
+        EXPLORER_CHAIN_DISPLACED_BLOCK_DETAIL_V1, EXPLORER_CHAIN_DISPLACED_BLOCK_HISTORY_V1,
+        EXPLORER_COMMITMENT_ROOT_DISPLACED_MATCHES_V1, EXPLORER_COMMITMENT_ROOT_SEARCH_V1,
+        EXPLORER_TRANSACTION_DETAIL_V4, EXPLORER_TRANSACTION_HISTORY_V1,
+        EXPLORER_TRANSACTION_HISTORY_V2, EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1,
     };
-    use zinder_store::{ChainStoreOptions, RocksDbResourceBudget, SecondaryChainStore};
-    use zinder_testkit::{ChainFixture, StoreFixture};
+    use zinder_proto::v1::ops::ErrorReason;
+    use zinder_store::RocksDbResourceBudget;
 
     use super::*;
+
+    /// Methods that read canonical-store facts the explorer runtime does not serve.
+    async fn canonical_fact_method_outcomes(
+        adapter: &ExplorerQueryGrpcAdapter,
+    ) -> Vec<(&'static str, Option<Status>)> {
+        vec![
+            (
+                "BlockProductionSeries",
+                adapter
+                    .block_production_series(Request::new(BlockProductionSeriesRequest::default()))
+                    .await
+                    .err(),
+            ),
+            (
+                "BlockProductionInTimeRange",
+                adapter
+                    .block_production_in_time_range(Request::new(
+                        BlockProductionInTimeRangeRequest::default(),
+                    ))
+                    .await
+                    .err(),
+            ),
+            (
+                "BlockTransactions",
+                adapter
+                    .block_transactions(Request::new(BlockDetailRequest::default()))
+                    .await
+                    .err(),
+            ),
+            (
+                "CommitmentRootSearch",
+                adapter
+                    .commitment_root_search(Request::new(CommitmentRootSearchRequest::default()))
+                    .await
+                    .err(),
+            ),
+            (
+                "PaidFeeDistribution",
+                adapter
+                    .paid_fee_distribution(Request::new(PaidFeeDistributionRequest::default()))
+                    .await
+                    .err(),
+            ),
+            (
+                "DisplacedBlockHistory",
+                adapter
+                    .displaced_block_history(Request::new(DisplacedBlockHistoryRequest::default()))
+                    .await
+                    .err(),
+            ),
+            (
+                "DisplacedBlockDetail",
+                adapter
+                    .displaced_block_detail(Request::new(DisplacedBlockDetailRequest::default()))
+                    .await
+                    .err(),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn canonical_fact_methods_fail_as_unconfigured_and_stay_unadvertised()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tempdir = tempdir()?;
+        let materialized_view_store = MaterializedViewStore::open_with_materialized_view_preset(
+            tempdir.path(),
+            MaterializedViewPreset::Explorer,
+            MaterializedViewStoreOptions {
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                ..MaterializedViewStoreOptions::default()
+            },
+        )?;
+        let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings::default())
+            .with_materialized_view_store(materialized_view_store)
+            .with_wallet_query_endpoint(String::from("http://127.0.0.1:1"));
+
+        for (method, outcome) in canonical_fact_method_outcomes(&adapter).await {
+            let status = outcome.ok_or_else(|| format!("{method} unexpectedly succeeded"))?;
+            assert_eq!(status.code(), Code::FailedPrecondition, "{method}");
+            let reason = status
+                .get_error_details()
+                .error_info()
+                .map(|error_info| error_info.reason.clone());
+            assert_eq!(
+                reason.as_deref(),
+                Some(ErrorReason::DependencyNotConfigured.as_str_name()),
+                "{method}"
+            );
+            assert!(status.message().starts_with(method), "{}", status.message());
+            assert!(
+                !status.message().contains("--storage-path"),
+                "{method} suggests a flag that cannot satisfy it: {}",
+                status.message()
+            );
+        }
+
+        let capabilities = adapter.advertised_capabilities();
+        for capability in [
+            EXPLORER_BLOCK_PRODUCTION_SERIES_V2,
+            EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1,
+            EXPLORER_BLOCK_TRANSACTIONS_V2,
+            EXPLORER_BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_V1,
+            EXPLORER_COMMITMENT_ROOT_SEARCH_V1,
+            EXPLORER_COMMITMENT_ROOT_DISPLACED_MATCHES_V1,
+            EXPLORER_PAID_FEE_DISTRIBUTION_V1,
+            EXPLORER_CHAIN_DISPLACED_BLOCK_HISTORY_V1,
+            EXPLORER_CHAIN_DISPLACED_BLOCK_DETAIL_V1,
+            EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1,
+        ] {
+            assert!(
+                !capabilities.contains(&capability),
+                "{capability} is advertised without a canonical read path"
+            );
+        }
+        Ok(())
+    }
 
     fn adapter_with_transaction_history_state(
         state: Option<MaterializedViewState>,
@@ -1707,72 +1702,19 @@ mod tests {
             adapter_with_transaction_history_state(Some(partial_state), true)?;
         assert_transaction_history_capabilities(&adapter, true, false);
 
-        let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(20);
-        let store_fixture =
-            StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
-        let chain_epoch = *store_fixture
-            .committed_chain_epoch()
-            .ok_or("fixture chain epoch missing")?;
-        let canonical_store = SecondaryChainStore::open(
-            store_fixture.tempdir_path(),
-            store_fixture
-                .tempdir_path()
-                .join("transaction-history-capability-secondary"),
-            ChainStoreOptions::for_local_tests(),
-        )?;
-        canonical_store.try_catch_up()?;
+        // Full coverage alone does not prove completeness: the explorer has no
+        // canonical tip to match the materialized-view position against.
         let complete_state = MaterializedViewState {
-            chain_epoch_id: chain_epoch.id,
-            tip_height: chain_epoch.visible_tip_height,
-            tip_hash: chain_epoch.visible_tip_hash,
             revision: 2,
             coverage: Some(MaterializedViewCoverage {
                 complete_from_height: BlockHeight::new(1),
-                complete_through_height: chain_epoch.visible_tip_height,
-                complete_through_hash: chain_epoch.visible_tip_hash,
+                complete_through_height: partial_state.tip_height,
+                complete_through_hash: partial_state.tip_hash,
             }),
+            ..partial_state
         };
         let (_tempdir, adapter) =
             adapter_with_transaction_history_state(Some(complete_state), true)?;
-        let adapter = adapter.with_canonical_store(canonical_store.clone());
-        assert_transaction_history_capabilities(&adapter, true, true);
-
-        let checkpoint_state = MaterializedViewState {
-            revision: 3,
-            coverage: Some(MaterializedViewCoverage {
-                complete_from_height: BlockHeight::new(8),
-                complete_through_height: chain_epoch.visible_tip_height,
-                complete_through_hash: chain_epoch.visible_tip_hash,
-            }),
-            ..complete_state
-        };
-        let (_tempdir, adapter) =
-            adapter_with_transaction_history_state(Some(checkpoint_state), true)?;
-        let adapter = adapter.with_canonical_store(canonical_store.clone());
-        assert_transaction_history_capabilities(&adapter, true, false);
-
-        let mismatched_state = MaterializedViewState {
-            tip_hash: BlockHash::from_bytes([0x21; 32]),
-            ..complete_state
-        };
-        let (_tempdir, adapter) =
-            adapter_with_transaction_history_state(Some(mismatched_state), true)?;
-        let adapter = adapter.with_canonical_store(canonical_store.clone());
-        assert_transaction_history_capabilities(&adapter, true, false);
-
-        let stale_state = MaterializedViewState {
-            chain_epoch_id: ChainEpochId::new(6),
-            tip_height: BlockHeight::new(19),
-            tip_hash: BlockHash::from_bytes([0x19; 32]),
-            revision: 3,
-            coverage: Some(MaterializedViewCoverage {
-                complete_from_height: BlockHeight::new(1),
-                complete_through_height: BlockHeight::new(19),
-                complete_through_hash: BlockHash::from_bytes([0x19; 32]),
-            }),
-        };
-        let (_tempdir, adapter) = adapter_with_transaction_history_state(Some(stale_state), true)?;
-        let adapter = adapter.with_canonical_store(canonical_store);
         assert_transaction_history_capabilities(&adapter, true, false);
 
         let (_tempdir, adapter) =
@@ -1918,58 +1860,6 @@ mod tests {
                 .advertised_capabilities()
                 .contains(&EXPLORER_PAID_FEE_DISTRIBUTION_V1)
         );
-        Ok(())
-    }
-
-    #[test]
-    fn intrinsic_value_balance_capability_requires_a_supported_canonical_schema()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
-        let store_fixture =
-            StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
-        let canonical_store = SecondaryChainStore::open(
-            store_fixture.tempdir_path(),
-            store_fixture
-                .tempdir_path()
-                .join("intrinsic-balance-capability-secondary"),
-            ChainStoreOptions::for_local_tests(),
-        )?;
-        canonical_store.try_catch_up()?;
-        let tempdir = tempdir()?;
-        let materialized_view_store = MaterializedViewStore::open(
-            tempdir.path(),
-            MaterializedViewStoreOptions {
-                consumers: MaterializedViewStore::bundled_consumers(),
-                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
-                sync_writes: false,
-            },
-        )?;
-        let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings::default())
-            .with_materialized_view_store(materialized_view_store)
-            .with_canonical_store(canonical_store);
-
-        assert!(
-            !adapter
-                .advertised_capabilities()
-                .contains(&EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1)
-        );
-
-        let adapter = adapter.with_wallet_query_endpoint(String::from("http://127.0.0.1:1"));
-        assert!(
-            adapter
-                .advertised_capabilities()
-                .contains(&EXPLORER_TRANSACTION_INTRINSIC_VALUE_BALANCES_V1)
-        );
-
-        let mut chain_epoch = chain_fixture
-            .chain_epoch(ChainEpochId::new(1))
-            .ok_or("fixture chain epoch missing")?;
-        chain_epoch.artifact_schema_version = ArtifactSchemaVersion::new(13);
-        assert!(!intrinsic_value_balance_schema_supported(chain_epoch));
-        chain_epoch.artifact_schema_version = ArtifactSchemaVersion::new(14);
-        assert!(!intrinsic_value_balance_schema_supported(chain_epoch));
-        chain_epoch.artifact_schema_version = ArtifactSchemaVersion::new(15);
-        assert!(intrinsic_value_balance_schema_supported(chain_epoch));
         Ok(())
     }
 }

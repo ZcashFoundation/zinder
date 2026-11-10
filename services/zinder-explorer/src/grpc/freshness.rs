@@ -20,7 +20,6 @@ use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use zinder_materialized_views::{
     BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME, MaterializedViewStore,
-    MaterializedViewStoreReadSnapshot,
 };
 
 use super::error::ExplorerError;
@@ -123,18 +122,6 @@ pub(crate) fn read_indexed_tip(
     decode_indexed_tip(&payload).map(Some)
 }
 
-fn read_indexed_tip_snapshot(
-    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
-) -> Result<Option<IndexedTip>, Status> {
-    let Some((_, payload)) = snapshot
-        .last_consumer_entry(BLOCK_SUMMARY_COLUMN_FAMILY)
-        .map_err(|error| ExplorerError::internal(error.to_string()))?
-    else {
-        return Ok(None);
-    };
-    decode_indexed_tip(&payload).map(Some)
-}
-
 fn decode_indexed_tip(payload: &[u8]) -> Result<IndexedTip, Status> {
     let summary = BlockSummaryRecord::decode(payload)
         .map_err(|error| {
@@ -178,24 +165,6 @@ pub(crate) fn build_explorer_freshness(
         ),
         None => (None, None),
     };
-    Ok(explorer_freshness(
-        indexed_tip,
-        materialized_views,
-        capability_version,
-        chain_epoch,
-        snapshot_age_millis,
-    ))
-}
-
-/// Builds freshness from the same materialized-view snapshot as the response rows.
-pub(crate) fn build_explorer_freshness_from_snapshot(
-    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
-    capability_version: &str,
-    chain_epoch: Option<wallet::ChainEpoch>,
-    snapshot_age_millis: u64,
-) -> Result<ExplorerFreshness, Status> {
-    let indexed_tip = read_indexed_tip_snapshot(snapshot)?;
-    let materialized_views = read_materialized_view_status_snapshot(snapshot)?;
     Ok(explorer_freshness(
         indexed_tip,
         materialized_views,
@@ -258,18 +227,6 @@ pub(crate) fn read_materialized_view_status(
         return Ok(None);
     };
     let Some(bytes) = store
-        .get_materialized_view_status()
-        .map_err(|error| ExplorerError::internal(error.to_string()))?
-    else {
-        return Ok(None);
-    };
-    decode_materialized_view_status(&bytes).map(Some)
-}
-
-fn read_materialized_view_status_snapshot(
-    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
-) -> Result<Option<MaterializedViewStatus>, Status> {
-    let Some(bytes) = snapshot
         .get_materialized_view_status()
         .map_err(|error| ExplorerError::internal(error.to_string()))?
     else {
