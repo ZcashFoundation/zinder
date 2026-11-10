@@ -27,19 +27,14 @@ use tokio_util::sync::CancellationToken;
 use zinder_core::{BlockHeight, BlockHeightRange, ChainEpoch, NetworkUpgradeActivations};
 use zinder_materialized_views::{
     BLOCK_PRODUCTION_TIME_CONSUMER_NAME, BLOCK_SUMMARY_COLUMN_FAMILY, BlockCommitContext,
-    BlockProductionTimeConsumer, BlockSummaryConsumer, COMMITMENT_ROOT_SEARCH_CONSUMER_NAME,
-    CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME, ChainEventDispatchInputs,
-    CommitmentRootSearchConsumer, ConventionalFeeDistributionConsumer, IronwoodMigrationConsumer,
-    MaterializedViewConsumerName, MaterializedViewPreset, MaterializedViewState,
-    MaterializedViewStore, MaterializedViewStoreOptions, MaterializedViewWriteMeasurement,
-    PAID_FEE_DISTRIBUTION_CONSUMER_NAME, PaidFeeDistributionConsumer, RecentTransactionsConsumer,
-    ReorgIncidentsConsumer, TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME,
-    TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
-    TransactionComponentSummaryConsumer, TransactionFeesConsumer, TransactionHistoryConsumer,
-    TransparentAddressActivityConsumer, TransparentAddressDeltasConsumer,
-    TransparentAddressRankingConsumer, TransparentAddressTransactionHistoryConsumer,
-    TransparentOutpointSpendConsumer, VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME,
-    ValuePoolFlowHistoryConsumer,
+    BlockKeyedConsumer, BlockProductionTimeConsumer, CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME,
+    ChainEventBlockJoin, ChainEventDispatchConsumers, ChainEventDispatchInputs,
+    ConventionalFeeDistributionConsumer, MaterializedViewConsumer, MaterializedViewConsumerName,
+    MaterializedViewDispatch, MaterializedViewPreset, MaterializedViewState, MaterializedViewStore,
+    MaterializedViewStoreOptions, MaterializedViewWriteMeasurement,
+    PAID_FEE_DISTRIBUTION_CONSUMER_NAME, TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME,
+    TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY, TransactionComponentSummaryConsumer,
+    VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME, bundled_materialized_view_consumer_definitions,
 };
 use zinder_proto::v1::wallet::{MaterializedViewHealth, MaterializedViewStatus};
 use zinder_runtime::{ComposedReadiness, IngestPhase, Readiness, ReadinessCause};
@@ -335,14 +330,79 @@ pub fn open_primary_materialized_view_store(
     )
 }
 
-const BACKFILL_OWNED_BLOCK_CONSUMERS: [MaterializedViewConsumerName; 6] = [
-    BLOCK_PRODUCTION_TIME_CONSUMER_NAME,
-    COMMITMENT_ROOT_SEARCH_CONSUMER_NAME,
-    CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME,
-    PAID_FEE_DISTRIBUTION_CONSUMER_NAME,
-    TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME,
-    VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME,
-];
+/// One block-keyed chain-event consumer selected by the materialized-view store.
+#[derive(Clone, Copy)]
+struct SelectedBlockConsumer {
+    name: MaterializedViewConsumerName,
+    join: ChainEventBlockJoin,
+    construct: fn() -> Box<dyn BlockKeyedConsumer>,
+}
+
+impl SelectedBlockConsumer {
+    /// Returns whether the consumer's cursor defines the shared replay boundary
+    /// that backfill-owned consumers join at startup.
+    const fn defines_replay_boundary(self) -> bool {
+        match self.join {
+            ChainEventBlockJoin::Replay => true,
+            ChainEventBlockJoin::CanonicalBackfill
+            | ChainEventBlockJoin::CanonicalSnapshot { .. } => false,
+        }
+    }
+
+    const fn is_backfill_owned(self) -> bool {
+        match self.join {
+            ChainEventBlockJoin::CanonicalBackfill => true,
+            ChainEventBlockJoin::Replay | ChainEventBlockJoin::CanonicalSnapshot { .. } => false,
+        }
+    }
+
+    fn receives_chain_events(
+        self,
+        materialized_view_store: &MaterializedViewStore,
+    ) -> Result<bool, IngestError> {
+        match self.join {
+            ChainEventBlockJoin::Replay | ChainEventBlockJoin::CanonicalBackfill => Ok(true),
+            ChainEventBlockJoin::CanonicalSnapshot { is_active } => {
+                Ok(is_active(materialized_view_store)?)
+            }
+        }
+    }
+}
+
+fn selected_block_consumers(
+    materialized_view_store: &MaterializedViewStore,
+) -> impl Iterator<Item = SelectedBlockConsumer> + '_ {
+    bundled_materialized_view_consumer_definitions()
+        .iter()
+        .filter(|definition| materialized_view_store.has_consumer(definition.schema.name))
+        .filter_map(|definition| match definition.dispatch {
+            MaterializedViewDispatch::ChainEventBlocks { join, construct } => {
+                Some(SelectedBlockConsumer {
+                    name: definition.schema.name,
+                    join,
+                    construct,
+                })
+            }
+            MaterializedViewDispatch::ChainEventEnvelope { .. }
+            | MaterializedViewDispatch::MempoolEvents { .. }
+            | MaterializedViewDispatch::CanonicalBackfillOnly => None,
+        })
+}
+
+fn selected_event_only_consumers(
+    materialized_view_store: &MaterializedViewStore,
+) -> Vec<Box<dyn MaterializedViewConsumer>> {
+    bundled_materialized_view_consumer_definitions()
+        .iter()
+        .filter(|definition| materialized_view_store.has_consumer(definition.schema.name))
+        .filter_map(|definition| match definition.dispatch {
+            MaterializedViewDispatch::ChainEventEnvelope { construct } => Some(construct()),
+            MaterializedViewDispatch::ChainEventBlocks { .. }
+            | MaterializedViewDispatch::MempoolEvents { .. }
+            | MaterializedViewDispatch::CanonicalBackfillOnly => None,
+        })
+        .collect()
+}
 
 /// Seeds missing event cursors for consumers with dedicated historical backfills.
 ///
@@ -588,14 +648,10 @@ pub(crate) fn unanimous_existing_block_consumer_cursor(
     materialized_view_store: &MaterializedViewStore,
 ) -> Result<Option<Vec<u8>>, IngestError> {
     let mut agreed_cursor: Option<Vec<u8>> = None;
-    for consumer_name in materialized_view_store
-        .chain_event_consumer_names()
-        .filter(|name| {
-            !BACKFILL_OWNED_BLOCK_CONSUMERS.contains(name)
-                && *name != TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME
-        })
+    for consumer in selected_block_consumers(materialized_view_store)
+        .filter(|consumer| consumer.defines_replay_boundary())
     {
-        let Some(candidate) = materialized_view_store.get_chain_event_cursor(consumer_name)? else {
+        let Some(candidate) = materialized_view_store.get_chain_event_cursor(consumer.name)? else {
             return Ok(None);
         };
         if agreed_cursor
@@ -617,9 +673,9 @@ fn missing_backfill_consumer_cursors(
     cursor: &[u8],
 ) -> Result<Vec<MaterializedViewConsumerName>, IngestError> {
     let mut missing_consumers = Vec::new();
-    for consumer_name in BACKFILL_OWNED_BLOCK_CONSUMERS
-        .into_iter()
-        .filter(|consumer_name| materialized_view_store.has_consumer(*consumer_name))
+    for consumer_name in selected_block_consumers(materialized_view_store)
+        .filter(|consumer| consumer.is_backfill_owned())
+        .map(|consumer| consumer.name)
     {
         match materialized_view_store.get_chain_event_cursor(consumer_name)? {
             Some(existing) if existing != cursor => {
@@ -1587,47 +1643,15 @@ pub(crate) fn dispatch_chain_event(
     advance_cursor: bool,
 ) -> Result<(), IngestError> {
     let _write_guard = materialized_view_write_guard();
-    let mut block_production_time = BlockProductionTimeConsumer::new();
-    let mut block_summary = BlockSummaryConsumer::new();
-    let mut ironwood_migration = IronwoodMigrationConsumer::new();
-    let mut commitment_root_search = CommitmentRootSearchConsumer::new();
-    let mut conventional_fee_distribution = ConventionalFeeDistributionConsumer::new();
-    let mut paid_fee_distribution = PaidFeeDistributionConsumer::new();
-    let mut transaction_fees = TransactionFeesConsumer::new();
-    let mut recent_transactions = RecentTransactionsConsumer::new();
-    let mut transaction_history = TransactionHistoryConsumer::new();
-    let mut transaction_component_summary = TransactionComponentSummaryConsumer::new();
-    let mut transparent_activity = TransparentAddressActivityConsumer::new();
-    let mut transparent_deltas = TransparentAddressDeltasConsumer::new();
-    let mut transparent_ranking = TransparentAddressRankingConsumer::new();
-    let mut transparent_transaction_history = TransparentAddressTransactionHistoryConsumer::new();
-    let mut transparent_outpoint_spend = TransparentOutpointSpendConsumer::new();
-    let mut value_pool_flow_history = ValuePoolFlowHistoryConsumer::new();
-    let all_consumers: [&mut dyn zinder_materialized_views::BlockKeyedConsumer; 15] = [
-        &mut block_production_time,
-        &mut block_summary,
-        &mut ironwood_migration,
-        &mut commitment_root_search,
-        &mut conventional_fee_distribution,
-        &mut paid_fee_distribution,
-        &mut transaction_fees,
-        &mut recent_transactions,
-        &mut transaction_history,
-        &mut transaction_component_summary,
-        &mut transparent_activity,
-        &mut transparent_deltas,
-        &mut transparent_transaction_history,
-        &mut transparent_outpoint_spend,
-        &mut value_pool_flow_history,
-    ];
-    let mut consumers: Vec<&mut dyn zinder_materialized_views::BlockKeyedConsumer> = all_consumers
-        .into_iter()
-        .filter(|consumer| materialized_view_store.has_consumer(consumer.name()))
-        .collect();
-    if materialized_view_store.has_consumer(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)
-        && TransparentAddressRankingConsumer::active_metadata(materialized_view_store)?.is_some()
-    {
-        consumers.push(&mut transparent_ranking);
+    let mut constructed = Vec::new();
+    for selected in selected_block_consumers(materialized_view_store) {
+        if selected.receives_chain_events(materialized_view_store)? {
+            constructed.push((selected.construct)());
+        }
+    }
+    let mut consumers: Vec<&mut dyn BlockKeyedConsumer> = Vec::with_capacity(constructed.len());
+    for consumer in &mut constructed {
+        consumers.push(consumer.as_mut());
     }
     let measurements = materialized_view_store
         .write_chain_event_chunk(consumers.as_mut_slice(), inputs, blocks, advance_cursor)
@@ -1644,20 +1668,21 @@ fn dispatch_event_only_chain_event(
     materialized_view_store: &MaterializedViewStore,
     inputs: ChainEventDispatchInputs<'_>,
 ) -> Result<(), IngestError> {
-    if !materialized_view_store
-        .has_consumer(zinder_materialized_views::REORG_INCIDENTS_CONSUMER_NAME)
-    {
+    let mut constructed = selected_event_only_consumers(materialized_view_store);
+    if constructed.is_empty() {
         return Ok(());
     }
     let _write_guard = materialized_view_write_guard();
-    let mut reorg_incidents = ReorgIncidentsConsumer::new();
-    let mut block_consumers: [&mut dyn zinder_materialized_views::BlockKeyedConsumer; 0] = [];
-    let mut event_consumers: [&mut dyn zinder_materialized_views::MaterializedViewConsumer; 1] =
-        [&mut reorg_incidents];
+    let mut block_consumers: [&mut dyn BlockKeyedConsumer; 0] = [];
+    let mut event_consumers: Vec<&mut dyn MaterializedViewConsumer> =
+        Vec::with_capacity(constructed.len());
+    for consumer in &mut constructed {
+        event_consumers.push(consumer.as_mut());
+    }
     let blocks = HashMap::<BlockHeight, Arc<BlockCommitContext>>::new();
     let measurements = materialized_view_store
         .write_chain_event_chunk_with_event_consumers(
-            zinder_materialized_views::ChainEventDispatchConsumers {
+            ChainEventDispatchConsumers {
                 block_consumers: &mut block_consumers,
                 event_consumers: &mut event_consumers,
             },
@@ -1702,13 +1727,11 @@ fn persisted_chain_event_cursor(
     materialized_view_store: &MaterializedViewStore,
 ) -> Result<Option<CanonicalEventCursor>, IngestError> {
     let mut cursor: Option<Vec<u8>> = None;
-    let ranking_is_active = materialized_view_store
-        .has_consumer(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)
-        && TransparentAddressRankingConsumer::active_metadata(materialized_view_store)?.is_some();
-    for consumer_name in materialized_view_store
-        .chain_event_consumer_names()
-        .filter(|name| ranking_is_active || *name != TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)
-    {
+    for selected in selected_block_consumers(materialized_view_store) {
+        if !selected.receives_chain_events(materialized_view_store)? {
+            continue;
+        }
+        let consumer_name = selected.name;
         // A consumer without a cursor is fresh or was reset by a scoped schema
         // rebuild; the plane then rebuilds from canonical heights while the
         // others re-apply the same deterministic rows idempotently.

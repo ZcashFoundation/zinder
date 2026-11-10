@@ -36,52 +36,6 @@ use zinder_store::{
 };
 
 use crate::{
-    consumer::block_production_time::{
-        BLOCK_PRODUCTION_TIME_CONSUMER_NAME, BLOCK_PRODUCTION_TIME_SCHEMA,
-    },
-    consumer::block_summary::{BLOCK_SUMMARY_CONSUMER_NAME, BLOCK_SUMMARY_SCHEMA},
-    consumer::commitment_root_search::{
-        COMMITMENT_ROOT_SEARCH_CONSUMER_NAME, COMMITMENT_ROOT_SEARCH_SCHEMA,
-    },
-    consumer::conventional_fee_distribution::{
-        CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME, CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA,
-    },
-    consumer::ironwood_migration::{IRONWOOD_MIGRATION_CONSUMER_NAME, IRONWOOD_MIGRATION_SCHEMA},
-    consumer::mempool_event_counts::MEMPOOL_EVENT_COUNTS_SCHEMA,
-    consumer::paid_fee_distribution::{
-        PAID_FEE_DISTRIBUTION_CONSUMER_NAME, PAID_FEE_DISTRIBUTION_SCHEMA,
-    },
-    consumer::recent_transactions::{
-        RECENT_TRANSACTIONS_CONSUMER_NAME, RECENT_TRANSACTIONS_SCHEMA,
-    },
-    consumer::reorg_incidents::{REORG_INCIDENTS_CONSUMER_NAME, REORG_INCIDENTS_SCHEMA},
-    consumer::transaction_component_summary::{
-        TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME, TRANSACTION_COMPONENT_SUMMARY_SCHEMA,
-    },
-    consumer::transaction_fees::{TRANSACTION_FEES_CONSUMER_NAME, TRANSACTION_FEES_SCHEMA},
-    consumer::transaction_history::{
-        TRANSACTION_HISTORY_CONSUMER_NAME, TRANSACTION_HISTORY_SCHEMA,
-    },
-    consumer::transparent_address_activity::{
-        TRANSPARENT_ADDRESS_ACTIVITY_CONSUMER_NAME, TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA,
-    },
-    consumer::transparent_address_deltas::{
-        TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME, TRANSPARENT_ADDRESS_DELTAS_SCHEMA,
-    },
-    consumer::transparent_address_ranking::{
-        TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME, TRANSPARENT_ADDRESS_RANKING_SCHEMA,
-    },
-    consumer::transparent_address_transaction_history::{
-        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
-        TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_SCHEMA,
-    },
-    consumer::transparent_outpoint_spend::{
-        TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_SCHEMA,
-    },
-    consumer::value_pool_balance_history::VALUE_POOL_BALANCE_HISTORY_SCHEMA,
-    consumer::value_pool_flow_history::{
-        VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME, VALUE_POOL_FLOW_HISTORY_SCHEMA,
-    },
     consumer::{
         BlockCommitContext, BlockKeyedConsumer, ChainCommittedEvent, ChainReorgedEvent,
         CommittedRange, MaterializedViewBlockCheckpoint, MaterializedViewConsumer,
@@ -89,6 +43,7 @@ use crate::{
         MaterializedViewMempoolConsumer, RevertedRange, apply_chain_committed_in_memory,
         apply_chain_reorged_in_memory,
     },
+    consumer_registry::RegistrySelection,
     error::{MaterializedViewError, MaterializedViewStoreColumnFamily, MaterializedViewStoreError},
 };
 
@@ -199,51 +154,19 @@ impl WriteBatchSize {
 }
 const ROCKSDB_DEFAULT_COLUMN_FAMILY: &str = "default";
 
-const BUNDLED_CONSUMERS: &[MaterializedViewConsumerSchema] = &[
-    BLOCK_PRODUCTION_TIME_SCHEMA,
-    BLOCK_SUMMARY_SCHEMA,
-    IRONWOOD_MIGRATION_SCHEMA,
-    COMMITMENT_ROOT_SEARCH_SCHEMA,
-    CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA,
-    MEMPOOL_EVENT_COUNTS_SCHEMA,
-    PAID_FEE_DISTRIBUTION_SCHEMA,
-    RECENT_TRANSACTIONS_SCHEMA,
-    TRANSACTION_HISTORY_SCHEMA,
-    REORG_INCIDENTS_SCHEMA,
-    TRANSACTION_FEES_SCHEMA,
-    TRANSACTION_COMPONENT_SUMMARY_SCHEMA,
-    TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA,
-    TRANSPARENT_ADDRESS_DELTAS_SCHEMA,
-    TRANSPARENT_ADDRESS_RANKING_SCHEMA,
-    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_SCHEMA,
-    TRANSPARENT_OUTPOINT_SPEND_SCHEMA,
-    VALUE_POOL_BALANCE_HISTORY_SCHEMA,
-    VALUE_POOL_FLOW_HISTORY_SCHEMA,
-];
-const WALLET_PROJECTION_CONSUMERS: &[MaterializedViewConsumerSchema] = &[
-    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_SCHEMA,
-    TRANSPARENT_OUTPOINT_SPEND_SCHEMA,
-];
-const BUNDLED_CHAIN_EVENT_CONSUMER_NAMES: &[MaterializedViewConsumerName] = &[
-    BLOCK_PRODUCTION_TIME_CONSUMER_NAME,
-    BLOCK_SUMMARY_CONSUMER_NAME,
-    IRONWOOD_MIGRATION_CONSUMER_NAME,
-    COMMITMENT_ROOT_SEARCH_CONSUMER_NAME,
-    CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME,
-    PAID_FEE_DISTRIBUTION_CONSUMER_NAME,
-    RECENT_TRANSACTIONS_CONSUMER_NAME,
-    TRANSACTION_FEES_CONSUMER_NAME,
-    TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME,
-    TRANSACTION_HISTORY_CONSUMER_NAME,
-    TRANSPARENT_ADDRESS_ACTIVITY_CONSUMER_NAME,
-    TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME,
-    TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME,
-    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
-    TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
-    VALUE_POOL_FLOW_HISTORY_CONSUMER_NAME,
-];
-const BUNDLED_EVENT_ONLY_CHAIN_EVENT_CONSUMER_NAMES: &[MaterializedViewConsumerName] =
-    &[REORG_INCIDENTS_CONSUMER_NAME];
+const BUNDLED_CONSUMER_COUNT: usize = RegistrySelection::Explorer.count();
+const BUNDLED_CONSUMERS: [MaterializedViewConsumerSchema; BUNDLED_CONSUMER_COUNT] =
+    RegistrySelection::Explorer.schemas();
+const WALLET_PROJECTION_CONSUMER_COUNT: usize = RegistrySelection::Wallet.count();
+const WALLET_PROJECTION_CONSUMERS: [MaterializedViewConsumerSchema;
+    WALLET_PROJECTION_CONSUMER_COUNT] = RegistrySelection::Wallet.schemas();
+const BUNDLED_CHAIN_EVENT_CONSUMER_COUNT: usize = RegistrySelection::ChainEventBlocks.count();
+const BUNDLED_CHAIN_EVENT_CONSUMER_NAMES: [MaterializedViewConsumerName;
+    BUNDLED_CHAIN_EVENT_CONSUMER_COUNT] = RegistrySelection::ChainEventBlocks.names();
+const BUNDLED_EVENT_ONLY_CHAIN_EVENT_CONSUMER_COUNT: usize =
+    RegistrySelection::ChainEventEnvelope.count();
+const BUNDLED_EVENT_ONLY_CHAIN_EVENT_CONSUMER_NAMES: [MaterializedViewConsumerName;
+    BUNDLED_EVENT_ONLY_CHAIN_EVENT_CONSUMER_COUNT] = RegistrySelection::ChainEventEnvelope.names();
 
 /// Closed product workload that selects durable materialized view identities.
 ///
@@ -276,8 +199,8 @@ impl MaterializedViewPreset {
     #[must_use]
     pub const fn consumer_schemas(self) -> &'static [MaterializedViewConsumerSchema] {
         match self {
-            Self::Wallet => WALLET_PROJECTION_CONSUMERS,
-            Self::Explorer => BUNDLED_CONSUMERS,
+            Self::Wallet => &WALLET_PROJECTION_CONSUMERS,
+            Self::Explorer => &BUNDLED_CONSUMERS,
         }
     }
 }
@@ -980,13 +903,13 @@ impl MaterializedViewStore {
     /// families in one call.
     #[must_use]
     pub const fn bundled_consumers() -> &'static [MaterializedViewConsumerSchema] {
-        BUNDLED_CONSUMERS
+        &BUNDLED_CONSUMERS
     }
 
     /// Returns the bundled chain-event consumer cursor names.
     #[must_use]
     pub const fn bundled_chain_event_consumer_names() -> &'static [MaterializedViewConsumerName] {
-        BUNDLED_CHAIN_EVENT_CONSUMER_NAMES
+        &BUNDLED_CHAIN_EVENT_CONSUMER_NAMES
     }
 
     /// Returns bundled chain-event consumer cursor names that read only the
@@ -994,7 +917,7 @@ impl MaterializedViewStore {
     #[must_use]
     pub const fn bundled_event_only_chain_event_consumer_names()
     -> &'static [MaterializedViewConsumerName] {
-        BUNDLED_EVENT_ONLY_CHAIN_EVENT_CONSUMER_NAMES
+        &BUNDLED_EVENT_ONLY_CHAIN_EVENT_CONSUMER_NAMES
     }
 
     /// Returns whether this store declared the durable consumer identity at
@@ -3093,6 +3016,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::{PAID_FEE_DISTRIBUTION_SCHEMA, REORG_INCIDENTS_CONSUMER_NAME};
 
     const TEST_CONSUMER: MaterializedViewConsumerName =
         MaterializedViewConsumerName::from_static("test_consumer");

@@ -24,6 +24,7 @@ zinder-store.workspace = true
 
 [dev-dependencies]
 eyre.workspace = true
+proptest.workspace = true
 tempfile.workspace = true
 
 [lints]

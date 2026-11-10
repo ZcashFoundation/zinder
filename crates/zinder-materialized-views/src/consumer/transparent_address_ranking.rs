@@ -734,7 +734,10 @@ impl BlockKeyedConsumer for TransparentAddressRankingConsumer {
                 },
             ));
         }
-        let deltas = aggregate_block_deltas(block, spends.as_deref())?;
+        let mut deltas = aggregate_block_deltas(block, spends.as_deref())?
+            .into_iter()
+            .collect::<Vec<_>>();
+        deltas.sort_unstable_by_key(|(address_script_hash, _delta)| address_script_hash.as_bytes());
         let mut before_images = Vec::with_capacity(deltas.len());
         for (address_script_hash, delta) in deltas {
             let before =
@@ -755,7 +758,14 @@ impl BlockKeyedConsumer for TransparentAddressRankingConsumer {
                 },
             )?;
         }
-        let metadata_before = self.current_metadata(ctx.store)?;
+        // Top-balance sums are recomputed by `finish_batch` after every
+        // batch, so a pre-image carries none; a mid-batch value would make the
+        // journal depend on how blocks were grouped into batches.
+        let metadata_before = TransparentAddressRankingMetadata {
+            top_10_balance_zat: 0,
+            top_100_balance_zat: 0,
+            ..self.current_metadata(ctx.store)?
+        };
         let journal = UndoJournal {
             generation: metadata.generation,
             block_hash: block.block_hash,

@@ -59,6 +59,7 @@ orchard = { version = "0.15.4", default-features = false }
 prost = "0.14.4"
 prost-build = "0.14.4"
 prost-types = "0.14.4"
+proptest = { version = "1.6.0", default-features = false, features = ["std"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 rust-rocksdb = { version = "0.51.0", features = ["multi-threaded-cf"] }
 secrecy = "0.10.3"

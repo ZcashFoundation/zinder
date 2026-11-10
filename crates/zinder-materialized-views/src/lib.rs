@@ -11,6 +11,9 @@
 //! - [`BlockKeyedConsumer`] is the per-block convention every production
 //!   chain-events consumer follows; the in-process dispatch helpers walk the
 //!   height range from each event and dispatch per-height work.
+//! - [`bundled_materialized_view_consumer_definitions`] is the closed registry
+//!   of bundled consumers. Store presets, chain-event cursor lists, and the
+//!   replay host's dispatch sets derive from it.
 //! - [`MaterializedViewStore`] is the `RocksDB` wrapper consumers write through. It
 //!   shares its option layering with `zinder_store`'s canonical store so the
 //!   bulk-catchup-OOM bound from [ADR-0020] applies to both planes.
@@ -20,7 +23,7 @@
 //! and codec convention.
 
 pub mod consumer;
-mod consumer_catalog;
+mod consumer_registry;
 pub mod error;
 pub mod store;
 pub mod value_pool_change;
@@ -170,10 +173,10 @@ pub use consumer::{
     TransactionIntrinsicValueBalanceFacts, TransparentSpendFacts, apply_chain_committed_in_memory,
     apply_chain_reorged_in_memory,
 };
-pub use consumer_catalog::{
-    MaterializedViewConsumerDefinition, MaterializedViewConsumerRole,
-    MaterializedViewPresetMembership, MaterializedViewRecoverySource,
-    bundled_materialized_view_consumer_definitions,
+pub use consumer_registry::{
+    ChainEventBlockJoin, MaterializedViewActivationProbe, MaterializedViewConsumerDefinition,
+    MaterializedViewConsumerRole, MaterializedViewDispatch, MaterializedViewPresetMembership,
+    MaterializedViewRecoverySource, bundled_materialized_view_consumer_definitions,
 };
 pub use error::{
     MaterializedViewError, MaterializedViewStoreColumnFamily, MaterializedViewStoreError,

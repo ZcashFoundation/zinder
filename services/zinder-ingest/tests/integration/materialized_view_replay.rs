@@ -21,8 +21,10 @@ use zinder_ingest::{
     load_fresh_canonical, spawn_materialized_view_tailer_task,
 };
 use zinder_materialized_views::{
-    BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer, MaterializedViewStore,
-    MaterializedViewStoreOptions, REORG_INCIDENTS_CONSUMER_NAME, decode_stored_record,
+    BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer, ChainEventBlockJoin,
+    MaterializedViewDispatch, MaterializedViewStore, MaterializedViewStoreOptions,
+    REORG_INCIDENTS_CONSUMER_NAME, bundled_materialized_view_consumer_definitions,
+    decode_stored_record,
 };
 use zinder_proto::v1::wallet::{MaterializedViewHealth, MaterializedViewStatus};
 use zinder_runtime::{ComposedReadiness, IngestPhase, Readiness};
@@ -103,6 +105,44 @@ async fn a_reorg_transition_reverts_and_reapplies_the_replaced_height() -> Resul
             .is_some(),
         "the reorg incident log must advance through the replacement transition"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn catching_up_a_fresh_store_advances_every_dispatched_consumer_to_the_newest_event()
+-> Result<(), Box<dyn Error>> {
+    let mut harness = CanonicalHarness::baseline().await?;
+    harness.follow_to_tip().await?;
+    let (_directory, view) = view_store()?;
+    harness.tailer(&view).catch_up()?;
+
+    let newest_event_cursor = view
+        .get_chain_event_cursor(REORG_INCIDENTS_CONSUMER_NAME)?
+        .ok_or("the event-only consumer must observe every retained event")?;
+    for definition in bundled_materialized_view_consumer_definitions() {
+        let expected_cursor = match definition.dispatch {
+            MaterializedViewDispatch::ChainEventBlocks {
+                join: ChainEventBlockJoin::Replay | ChainEventBlockJoin::CanonicalBackfill,
+                ..
+            }
+            | MaterializedViewDispatch::ChainEventEnvelope { .. } => {
+                Some(newest_event_cursor.as_slice())
+            }
+            MaterializedViewDispatch::ChainEventBlocks {
+                join: ChainEventBlockJoin::CanonicalSnapshot { .. },
+                ..
+            }
+            | MaterializedViewDispatch::MempoolEvents { .. }
+            | MaterializedViewDispatch::CanonicalBackfillOnly => None,
+        };
+        assert_eq!(
+            view.get_chain_event_cursor(definition.schema.name)?
+                .as_deref(),
+            expected_cursor,
+            "{} must be dispatched exactly through the events its registry entry declares",
+            definition.schema.name.as_str()
+        );
+    }
     Ok(())
 }
 
