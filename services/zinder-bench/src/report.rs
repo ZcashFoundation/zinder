@@ -77,10 +77,6 @@ const BULK_PIPELINE_WATERMARK_BLOCKED_TOTAL: &str =
     "zinder_ingest_bulk_pipeline_watermark_blocked_total";
 const HEAD_OF_LINE_WAIT_SUM: &str = "zinder_ingest_bulk_pipeline_head_of_line_wait_seconds_sum";
 const HEAD_OF_LINE_WAIT_COUNT: &str = "zinder_ingest_bulk_pipeline_head_of_line_wait_seconds_count";
-const BLOCK_PREPARE_STAGE_DURATION_COUNT: &str =
-    "zinder_ingest_block_prepare_stage_duration_seconds_count";
-const BLOCK_PREPARE_STAGE_DURATION_SUM: &str =
-    "zinder_ingest_block_prepare_stage_duration_seconds_sum";
 const CANONICAL_BLOCK_CONSTRUCTION_STAGE_DURATION_COUNT: &str =
     "zinder_ingest_canonical_block_construction_stage_duration_seconds_count";
 const CANONICAL_BLOCK_CONSTRUCTION_STAGE_DURATION_SUM: &str =
@@ -2219,18 +2215,11 @@ fn aggregate_head_of_line_wait(samples: &[MetricSample]) -> Vec<StageWaitStat> {
 }
 
 fn aggregate_stage_durations(samples: &[MetricSample]) -> Vec<StageDurationStat> {
-    let metric_families = [
-        (
-            "block_prepare",
-            BLOCK_PREPARE_STAGE_DURATION_COUNT,
-            BLOCK_PREPARE_STAGE_DURATION_SUM,
-        ),
-        (
-            "canonical_block_construction",
-            CANONICAL_BLOCK_CONSTRUCTION_STAGE_DURATION_COUNT,
-            CANONICAL_BLOCK_CONSTRUCTION_STAGE_DURATION_SUM,
-        ),
-    ];
+    let metric_families = [(
+        "canonical_block_construction",
+        CANONICAL_BLOCK_CONSTRUCTION_STAGE_DURATION_COUNT,
+        CANONICAL_BLOCK_CONSTRUCTION_STAGE_DURATION_SUM,
+    )];
     let mut counts: BTreeMap<(String, String, String), u64> = BTreeMap::new();
     let mut seconds: BTreeMap<(String, String, String), f64> = BTreeMap::new();
     for sample in samples {
