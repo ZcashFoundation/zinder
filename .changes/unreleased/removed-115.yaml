@@ -1,0 +1,6 @@
+kind: removed
+body: 'Ingest no longer accepts the configuration keys of its removed batch catch-up and tip-follow paths. Remove `ingest.construction.canonical_batch_max_blocks`, `canonical_batch_max_artifact_bytes`, `canonical_batch_max_estimated_write_bytes`, `canonical_batch_min_blocks_before_estimated_write_close`, `commit_reassembly_max_queued_artifact_bytes`, `flush_interval_epochs`, `ingest.run_overrides.allow_reorg_window_settlement`, and the ingest `storage.secondary_path` key, along with their `ZINDER_INGEST__*` environment variables, before upgrading: ingest refuses to start while any of them is set. The `zinder-ingest verify-canonical-replay` subcommand is removed; it could not open a canonical store written by the release ingest path. The storage benchmark drops its canonical-store range replay scenario and Compose profile, and the `ZinderStoreReadP95High` alert and its dashboard panel are removed because no release runtime emits the store read metrics they watched. Explorer methods that need canonical storage keep returning `FAILED_PRECONDITION` with `DEPENDENCY_NOT_CONFIGURED`, as they did before; the Cipherscan compatibility matrix now marks the routes that depend on them.'
+time: 2026-11-10T21:41:42Z
+custom:
+  Bump: minor
+  PR: "115"
