@@ -11,7 +11,7 @@
 
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::Mutex;
 use serde::Serialize;
 use tonic::{Request, Status, service::Interceptor};
 use tonic_types::ErrorDetails;
@@ -454,19 +454,11 @@ struct MaterializedViewWorkload {
     identities: Vec<String>,
 }
 
-/// Readiness state and whether it is [parked](Readiness::park), guarded by
-/// one lock so a park and a concurrent write cannot interleave.
-#[derive(Debug)]
-struct GuardedReadiness {
-    state: ReadinessState,
-    parked: bool,
-}
-
 /// Internal readiness state guarded by an `Arc<Mutex<_>>` so HTTP handlers
 /// and runtime tasks can update and observe the same value.
 #[derive(Clone, Debug)]
 pub struct Readiness {
-    inner: Arc<Mutex<GuardedReadiness>>,
+    inner: Arc<Mutex<ReadinessState>>,
     materialized_view_workload: Arc<Mutex<MaterializedViewWorkload>>,
 }
 
@@ -481,42 +473,9 @@ impl Readiness {
     #[must_use]
     pub fn new(state: ReadinessState) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(GuardedReadiness {
-                state,
-                parked: false,
-            })),
+            inner: Arc::new(Mutex::new(state)),
             materialized_view_workload: Arc::new(Mutex::new(MaterializedViewWorkload::default())),
         }
-    }
-
-    /// Sets a terminal state that later writers cannot replace until the
-    /// process restarts.
-    ///
-    /// A canonical writer parked on a reorg deeper than its window keeps
-    /// serving its control plane while other workers still run; none of them
-    /// may replace the halt with a recoverable cause, and the ingest phase it
-    /// was parked in stays fixed. Only [`ReadinessCause::ShuttingDown`]
-    /// replaces a parked state, and a shutdown already in progress keeps its
-    /// cause: the process is draining and the halt would be stale.
-    pub fn park(&self, state: ReadinessState) {
-        // Writers that took the lock earlier are overwritten here, and every
-        // writer that takes it later sees the flag.
-        let mut guard = self.inner.lock();
-        guard.parked = true;
-        if matches!(guard.state.cause, ReadinessCause::ShuttingDown) {
-            return;
-        }
-        let phase = state.phase.or(guard.state.phase);
-        guard.state = state;
-        guard.state.phase = phase;
-    }
-
-    /// Locks the state for a write, or returns `None` when a
-    /// [parked](Self::park) state rejects it. Only a shutdown write passes a
-    /// park.
-    fn lock_unless_parked(&self, shutting_down: bool) -> Option<MutexGuard<'_, GuardedReadiness>> {
-        let guard = self.inner.lock();
-        (!guard.parked || shutting_down).then_some(guard)
     }
 
     /// Sets the closed materialized-view workload exposed by readiness and metrics.
@@ -542,14 +501,9 @@ impl Readiness {
     /// upstream target, so they retain the preceding target through the
     /// warning and its transition back to ready. An explicit
     /// [`ReadinessState::with_phase`] on `state` overrides the phase.
-    ///
-    /// A [parked](Self::park) state ignores every cause except shutdown.
     pub fn set(&self, state: ReadinessState) {
-        let shutting_down = matches!(state.cause, ReadinessCause::ShuttingDown);
-        let Some(mut guard) = self.lock_unless_parked(shutting_down) else {
-            return;
-        };
-        guard.state = state.replacing(&guard.state);
+        let mut guard = self.inner.lock();
+        *guard = state.replacing(&guard);
     }
 
     /// Atomically mutates the current readiness state.
@@ -558,28 +512,19 @@ impl Readiness {
     /// (for example: setting a new `cause` while preserving the
     /// concurrently-updated `current_height` or `phase`). The lock is
     /// held for the duration of `update`, so concurrent readers and
-    /// writers see the pre- and post-state but never a torn read. A
-    /// [parked](Self::park) state ignores updates.
+    /// writers see the pre- and post-state but never a torn read.
     pub fn update<F>(&self, update: F)
     where
         F: FnOnce(&mut ReadinessState),
     {
-        if let Some(mut guard) = self.lock_unless_parked(false) {
-            update(&mut guard.state);
-        }
+        update(&mut self.inner.lock());
     }
 
     /// Sets the [`IngestPhase`] on the current state without disturbing
     /// any other field. Used by the phase-driven ingest loop's per-iteration
     /// classifier stamp.
-    ///
-    /// A [parked](Self::park) state keeps the phase it was parked in, so a
-    /// worker still classifying phases cannot report catch-up progress for a
-    /// writer that no longer follows.
     pub fn set_phase(&self, phase: IngestPhase) {
-        if let Some(mut guard) = self.lock_unless_parked(false) {
-            guard.state.phase = Some(phase);
-        }
+        self.inner.lock().phase = Some(phase);
     }
 
     /// Returns the current [`IngestPhase`] without cloning the readiness cause.
@@ -588,7 +533,7 @@ impl Readiness {
     /// such as the materialized-view replay phase gate that samples it per replayed event.
     #[must_use]
     pub fn phase(&self) -> Option<IngestPhase> {
-        self.inner.lock().state.phase
+        self.inner.lock().phase
     }
 
     /// Returns the halt of a writer parked by a reorg deeper than its window,
@@ -598,13 +543,13 @@ impl Readiness {
     /// halt, such as open streams that poll it per page.
     #[must_use]
     pub fn reorg_window_exceeded(&self) -> Option<ops_proto::ReorgWindowExceededDetail> {
-        self.inner.lock().state.cause.reorg_window_exceeded_detail()
+        self.inner.lock().cause.reorg_window_exceeded_detail()
     }
 
     /// Reports the current readiness as a serializable snapshot.
     #[must_use]
     pub fn report(&self) -> ReadinessReport {
-        let state = self.inner.lock().state.clone();
+        let state = self.inner.lock().clone();
         let materialized_view_workload = self.materialized_view_workload.lock().clone();
         ReadinessReport {
             is_ready: state.cause.permits_traffic(),
@@ -1215,65 +1160,6 @@ mod tests {
             );
         }
         Ok(())
-    }
-
-    #[test]
-    fn parking_during_shutdown_keeps_the_shutdown_cause() {
-        let readiness = Readiness::new(ReadinessState::ready(Some(10)));
-        readiness.set(ReadinessState::not_ready(ReadinessCause::ShuttingDown));
-        readiness.park(
-            ReadinessState::reorg_window_exceeded(1_001, 1_000, Some(1_000), Some(10))
-                .with_phase(IngestPhase::FollowingTip),
-        );
-        assert!(matches!(
-            readiness.report().cause,
-            ReadinessCause::ShuttingDown
-        ));
-        readiness.set(ReadinessState::ready(Some(11)));
-        assert!(matches!(
-            readiness.report().cause,
-            ReadinessCause::ShuttingDown
-        ));
-    }
-
-    #[test]
-    fn parked_readiness_keeps_its_halt_until_shutdown() {
-        let readiness = Readiness::new(ReadinessState::ready(Some(10)));
-        readiness.park(
-            ReadinessState::reorg_window_exceeded(1_001, 1_000, Some(1_000), Some(10))
-                .with_phase(IngestPhase::FollowingTip),
-        );
-        readiness.set(ReadinessState::ready(Some(11)));
-        readiness.set(ReadinessState::not_ready(ReadinessCause::UpstreamNotReady(
-            UpstreamNotReadyDetail {
-                upstream_committed_height: None,
-                upstream_estimated_height: None,
-                upstream_verification_progress: None,
-                upstream_health: UpstreamHealth {
-                    source: "zebra_ready_endpoint",
-                    reason: Cow::Borrowed("syncing"),
-                },
-            },
-        )));
-        readiness.update(|state| state.cause = ReadinessCause::Ready);
-        readiness.set_phase(IngestPhase::BulkCatchup);
-        let report = readiness.report();
-        assert!(!report.is_ready);
-        assert!(matches!(
-            report.cause,
-            ReadinessCause::ReorgWindowExceeded {
-                depth: 1_001,
-                configured: 1_000,
-                ..
-            }
-        ));
-        assert_eq!(report.phase, Some(IngestPhase::FollowingTip));
-
-        readiness.set(ReadinessState::not_ready(ReadinessCause::ShuttingDown));
-        assert!(matches!(
-            readiness.report().cause,
-            ReadinessCause::ShuttingDown
-        ));
     }
 
     #[test]
