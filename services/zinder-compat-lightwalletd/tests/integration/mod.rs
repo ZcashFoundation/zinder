@@ -1,5 +1,6 @@
 mod android_sdk_rpc_contract;
 mod cli;
+mod env_var_contract;
 mod ingest_control_tip_change;
 mod lightwalletd_grpc;
 mod lightwalletd_scan_contract;

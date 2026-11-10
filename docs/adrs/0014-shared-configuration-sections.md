@@ -47,8 +47,13 @@ Shared names keep the same meaning across services:
 `--print-config` renders the resolved service configuration using the same
 serialization contract as the loader. Secret values and raw authorization
 material are replaced by explicit redaction markers. Unknown fields are
-rejected, invalid cross-field combinations fail before storage opens, and a
-service does not accept configuration for a role it does not own.
+rejected and invalid cross-field combinations fail before storage opens. A
+service does not accept a section for a role it does not own, but a shared
+section type accepts every field of its role pair: for example, `[node]`
+accepts the ingest-only `indexer_grpc_addr` in every binary, and
+`[ingest_control]` accepts both the writer fields and the reader fields. A
+binary ignores the fields it does not consume, and the environment-variable
+reference names only the binaries that consume each variable.
 
 ## Consequences
 
@@ -59,3 +64,10 @@ service does not accept configuration for a role it does not own.
   that service's config module.
 - Configuration changes must update `--print-config`, environment-variable
   documentation, examples, tests, and the public vocabulary in the same change.
+
+## Revision history
+
+- Shared section types are documented as accepting fields that individual
+  binaries ignore, and the environment-variable reference is checked against
+  each binary's loader in both directions by the `env_var_contract`
+  integration tests.
