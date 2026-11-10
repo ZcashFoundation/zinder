@@ -852,7 +852,7 @@ async fn capture_state_bundle(
         .create_owner_checkpoint(
             candidate_id,
             paths.staging_root_binding().to_vec(),
-            canonical_writer_fence_message(expected_fence),
+            expected_writer_fence(expected_fence),
         )
         .await
         .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
@@ -893,12 +893,6 @@ async fn capture_state_bundle(
         chain_event_sequence: manifest.fence().chain_event_sequence(),
         visible_tip_height: manifest.fence().visible_tip_height(),
     })
-}
-
-fn canonical_writer_fence_message(
-    fence: CanonicalEventFence,
-) -> zinder_proto::v1::ingest::CanonicalWriterFence {
-    expected_writer_fence(fence)
 }
 
 fn state_bundle_status(error: &zinder_projector::state_bundle::StateBundleError) -> tonic::Status {

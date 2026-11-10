@@ -21,8 +21,8 @@
 //!   [`converge_on_canonical_writer_fence`], [`WriterAttestation`]), shared
 //!   by every runtime that reads a canonical `RocksDB` secondary.
 //!
-//! It deliberately defines no domain types; it composes those owned by
-//! `zinder-core`, `zinder-proto`, and `zinder-store`.
+//! It deliberately defines no storage or protocol types of its own; it
+//! composes those owned by `zinder-core`, `zinder-proto`, and `zinder-store`.
 
 mod auth;
 mod bind_guard;
