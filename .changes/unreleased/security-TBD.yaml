@@ -1,6 +1,0 @@
-kind: security
-body: Dependencies now resolve to patched rustls, rustls-webpki, webpki-root-certs, tokio, libz-sys, zstd-sys, and pulldown-cmark releases that fix the RustSec advisories published since the last dependency refresh.
-time: 2026-11-10T12:00:00Z
-custom:
-  Bump: patch
-  PR: "TBD"
