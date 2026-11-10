@@ -1,6 +1,0 @@
-kind: security
-body: HTTP/2 serving now uses a patched h2 crate so empty DATA frames cannot grow unbounded in memory.
-time: 2026-08-19T21:32:00Z
-custom:
-  Bump: patch
-  PR: "96"

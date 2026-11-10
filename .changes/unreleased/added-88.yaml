@@ -1,6 +1,0 @@
-kind: added
-body: Configure optional Explorer indexing and canonical compact-block compatibility at runtime without rebuilding the image; Explorer views default off and wallet serving remains independent.
-time: 2026-08-15T15:17:55Z
-custom:
-  Bump: minor
-  PR: "88"
