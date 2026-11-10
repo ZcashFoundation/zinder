@@ -180,6 +180,11 @@ macro_rules! impl_canonical_typed_reads {
             }
 
             /// Reads the contiguous subtree-root rows requested by `range`.
+            ///
+            /// An absent root that the history predecessor's trees already
+            /// completed fails with
+            /// [`CanonicalStoreError::SubtreeRootUnavailable`]; any other
+            /// absent root is a publication refusal.
             pub fn subtree_roots(
                 &self,
                 range: SubtreeRootRange,
@@ -554,6 +559,13 @@ fn read_subtree_roots(
     range: SubtreeRootRange,
 ) -> Result<Vec<SubtreeRootArtifact>, CanonicalStoreError> {
     let family = column_family(&store.serving_open().db, SUBTREE_ROOT_COLUMN_FAMILY)?;
+    // Every build loads at least the roots its retained blocks complete, so
+    // only an index the predecessor's trees already completed may be absent.
+    let retained_coverage_start = store
+        .serving_build_plan()
+        .history_predecessor()
+        .tip_metadata()
+        .completed_subtree_count(range.protocol);
     range
         .into_iter()
         .map(|subtree_index| {
@@ -574,11 +586,18 @@ fn read_subtree_roots(
                     source,
                 })?
                 .ok_or_else(|| {
-                    CanonicalStoreError::publication(format!(
-                        "advertised {:?} subtree root {} is absent",
-                        range.protocol,
-                        subtree_index.value()
-                    ))
+                    if subtree_index.value() < retained_coverage_start {
+                        CanonicalStoreError::SubtreeRootUnavailable {
+                            protocol: range.protocol,
+                            subtree_index,
+                        }
+                    } else {
+                        CanonicalStoreError::publication(format!(
+                            "advertised {:?} subtree root {} is absent",
+                            range.protocol,
+                            subtree_index.value()
+                        ))
+                    }
                 })?;
             decode_subtree_root(&key, &encoded)
         })

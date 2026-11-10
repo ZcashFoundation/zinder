@@ -972,7 +972,8 @@ pub enum QueryError {
     /// Canonical store returned a storage or admission failure.
     ///
     /// Converting a [`zinder_store::CanonicalStoreError`] with `From` routes an
-    /// absent height-keyed row to [`QueryError::ArtifactUnavailable`] instead.
+    /// absent height-keyed row or an uncovered subtree root to
+    /// [`QueryError::ArtifactUnavailable`] instead.
     #[error(transparent)]
     CanonicalStore(zinder_store::CanonicalStoreError),
 
@@ -998,6 +999,16 @@ impl From<zinder_store::CanonicalStoreError> for QueryError {
                     key: ArtifactKey::BlockHeight(height),
                 }
             }
+            zinder_store::CanonicalStoreError::SubtreeRootUnavailable {
+                protocol,
+                subtree_index,
+            } => Self::ArtifactUnavailable {
+                family: ArtifactFamily::SubtreeRoot,
+                key: ArtifactKey::SubtreeRootIndex {
+                    protocol,
+                    index: subtree_index,
+                },
+            },
             other => Self::CanonicalStore(other),
         }
     }

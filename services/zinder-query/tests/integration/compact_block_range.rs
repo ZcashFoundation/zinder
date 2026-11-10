@@ -506,6 +506,59 @@ async fn subtree_roots_response_uses_native_wallet_proto_shape() -> eyre::Result
     Ok(())
 }
 
+/// A checkpointed store retains only the roots its retained blocks complete.
+///
+/// The floor's trees already hold a completed Sapling subtree, so the epoch
+/// advertises root 0 while the store never loaded it.
+#[tokio::test]
+async fn subtree_roots_response_reports_unavailable_when_completed_root_is_missing()
+-> eyre::Result<()> {
+    let chain = completed_sapling_subtree_chain(2)?;
+    let writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain).with_history_floor(BlockHeight::new(1)),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let (wallet_query, _store_fixture) = serving_query_from(writer.into_serving_store_fixture()?)?;
+    let chain_epoch = wallet_query.visible_tip_block(None).await?.chain_epoch;
+    assert_eq!(
+        chain_epoch
+            .tip_metadata
+            .completed_subtree_count(ShieldedProtocol::Sapling),
+        1
+    );
+
+    let error = match subtree_roots_response(
+        &wallet_query,
+        SubtreeRootRange::new(
+            ShieldedProtocol::Sapling,
+            SubtreeRootIndex::new(0),
+            NonZeroU32::new(1).ok_or_else(|| eyre!("invalid max entries"))?,
+        ),
+        None,
+    )
+    .await
+    {
+        Ok(response) => return Err(eyre!("expected unavailable roots, got {response:?}")),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(
+            error,
+            QueryError::ArtifactUnavailable {
+                family: ArtifactFamily::SubtreeRoot,
+                key: ArtifactKey::SubtreeRootIndex {
+                    protocol: ShieldedProtocol::Sapling,
+                    index
+                }
+            } if index == SubtreeRootIndex::new(0)
+        ),
+        "unexpected missing-root error: {error:?}"
+    );
+
+    Ok(())
+}
+
 /// Builds a chain whose first block completes the first Sapling subtree and
 /// whose later blocks, up to `block_count`, add no note commitments.
 fn completed_sapling_subtree_chain(block_count: u32) -> eyre::Result<ChainFixture> {

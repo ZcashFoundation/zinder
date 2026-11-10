@@ -126,9 +126,13 @@ range from a not-yet-available upstream node subtree index.
 The native query path makes that distinction without upstream node repair or
 query-time compact-block decoding: it reads `ChainTipMetadata` from the same
 `ChainEpoch` to decide whether a subtree index can exist, then reads stored
-`SubtreeRootArtifact` values for completed roots. Missing completed roots
-return a typed unavailable error; ranges beyond the completed subtree count
-return an empty response.
+`SubtreeRootArtifact` values for completed roots. Ranges beyond the completed
+subtree count return an empty response. A store holds every root its retained
+blocks complete. A checkpointed store whose construction loaded retained-range
+coverage has no row for a root its history predecessor had already completed,
+and a read of that root returns `ArtifactUnavailable` for the subtree-root
+family and index (`NOT_FOUND`). Any other absent completed root is a canonical
+integrity failure.
 
 ## Block Identity and Hash-Keyed Reads
 
