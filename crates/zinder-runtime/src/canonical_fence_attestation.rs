@@ -152,6 +152,9 @@ pub trait CanonicalFenceProbe {
     ) -> impl Future<Output = Result<Option<CanonicalWriterFence>, Self::Error>> + Send;
 
     /// Reads `CanonicalControl.WriterStatus` from the canonical writer.
+    ///
+    /// The returned future is dropped unfinished when the convergence
+    /// deadline or cancellation fires, so it must be cancel-safe.
     fn writer_status(
         &mut self,
     ) -> impl Future<Output = Result<CanonicalWriterStatusResponse, Self::Error>> + Send;
@@ -206,6 +209,11 @@ pub enum CanonicalFenceConvergenceError<ProbeError> {
 /// bound. A matching fence whose network-upgrade schedule revision the probe
 /// has not caught up to is retried the same way. Divergence fails on the
 /// round that observes it.
+///
+/// Each writer-status read races the deadline and `cancel`: a read still
+/// pending when either fires is dropped, so a stalled writer cannot hold the
+/// loop past its bounds. A local catch-up always runs to completion, because
+/// a probe may move its secondary into that work.
 pub async fn converge_on_canonical_writer_fence<Probe>(
     probe: &mut Probe,
     network: Network,
@@ -226,10 +234,16 @@ where
             .await
             .map_err(CanonicalFenceConvergenceError::Probe)?;
         if let Some(local) = local {
-            let status = probe
-                .writer_status()
-                .await
-                .map_err(CanonicalFenceConvergenceError::Probe)?;
+            let status = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Ok(CanonicalFenceConvergence::Cancelled),
+                () = tokio::time::sleep_until(deadline) => {
+                    return Err(CanonicalFenceConvergenceError::DidNotConverge);
+                }
+                status = probe.writer_status() => {
+                    status.map_err(CanonicalFenceConvergenceError::Probe)?
+                }
+            };
             match classify_canonical_writer_fence(&status, network, &local) {
                 CanonicalFenceRelation::Matches if probe.attests_writer_schedule(&status) => {
                     return Ok(CanonicalFenceConvergence::Converged(Box::new(status)));
@@ -515,6 +529,21 @@ mod tests {
         }
     }
 
+    /// Probe whose writer-status read never resolves.
+    struct StalledStatusProbe;
+
+    impl CanonicalFenceProbe for StalledStatusProbe {
+        type Error = ProbeFailure;
+
+        async fn catch_up(&mut self) -> Result<Option<CanonicalWriterFence>, ProbeFailure> {
+            Ok(Some(fence(5, 1)))
+        }
+
+        async fn writer_status(&mut self) -> Result<CanonicalWriterStatusResponse, ProbeFailure> {
+            std::future::pending().await
+        }
+    }
+
     #[test]
     fn exact_fence_matches() {
         assert_eq!(
@@ -650,6 +679,51 @@ mod tests {
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
             converge_on_canonical_writer_fence(&mut probe, NETWORK, policy, &cancel),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            Ok(Ok(CanonicalFenceConvergence::Cancelled))
+        ));
+    }
+
+    #[tokio::test]
+    async fn stalled_writer_status_fails_at_the_deadline() {
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            converge_on_canonical_writer_fence(
+                &mut StalledStatusProbe,
+                NETWORK,
+                fast_policy(Duration::from_millis(30)),
+                &CancellationToken::new(),
+            ),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            Ok(Err(CanonicalFenceConvergenceError::DidNotConverge))
+        ));
+    }
+
+    #[tokio::test]
+    async fn stalled_writer_status_returns_promptly_when_cancelled() {
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            trigger.cancel();
+        });
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            converge_on_canonical_writer_fence(
+                &mut StalledStatusProbe,
+                NETWORK,
+                fast_policy(Duration::from_hours(1)),
+                &cancel,
+            ),
         )
         .await;
 
