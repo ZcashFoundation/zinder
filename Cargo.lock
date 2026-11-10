@@ -5912,6 +5912,7 @@ dependencies = [
  "zinder-core",
  "zinder-proto",
  "zinder-store",
+ "zinder-testkit",
 ]
 
 [[package]]
@@ -6112,6 +6113,7 @@ dependencies = [
  "zinder-core",
  "zinder-proto",
  "zinder-rocksdb-bulk-load",
+ "zinder-testkit",
 ]
 
 [[package]]
@@ -6171,6 +6173,7 @@ dependencies = [
  "zinder-proto",
  "zinder-rocksdb-bulk-load",
  "zinder-store",
+ "zinder-testkit",
  "zinder-wallet-projection",
 ]
 

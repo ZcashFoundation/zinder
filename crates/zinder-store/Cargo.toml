@@ -37,6 +37,7 @@ metrics-exporter-prometheus.workspace = true
 sapling.workspace = true
 tempfile.workspace = true
 zcash_primitives.workspace = true
+zinder-testkit.workspace = true
 
 [lints]
 workspace = true

@@ -1,9 +1,4 @@
-use std::{
-    env,
-    num::NonZeroU32,
-    path::Path,
-    process::{Command, Stdio},
-};
+use std::{num::NonZeroU32, path::Path};
 
 use rust_rocksdb::DB;
 use tempfile::TempDir;
@@ -37,8 +32,8 @@ use crate::{
     format::{ChainEventCursorAnchor, ChainEventLocator},
 };
 
-const REPLACEMENT_FAILPOINT_ENV: &str = "ZINDER_TEST_CANONICAL_LIVE_REPLACEMENT_FAILPOINT";
-const REPLACEMENT_STORE_PATH_ENV: &str = "ZINDER_TEST_CANONICAL_LIVE_REPLACEMENT_STORE_PATH";
+const REPLACEMENT_CRASH_CHILD: &str =
+    "canonical_store::live_replacement_tests::replacement_crash_child_process";
 
 #[test]
 #[expect(
@@ -1518,15 +1513,19 @@ fn replacement_rejects_a_stale_fence_without_archive_writes()
 #[test]
 fn replacement_batch_is_either_pre_update_or_post_update_across_process_abort()
 -> Result<(), Box<dyn std::error::Error>> {
-    for failpoint in ["before_atomic_write", "after_atomic_write"] {
+    for crash_point in ["before_atomic_write", "after_atomic_write"] {
         let temporary = TempDir::new()?;
         let store_path = temporary.path().join("canonical");
         let store = published_store(&store_path, 2, BlockHeight::new(4), BlockHeight::new(2))?;
         drop(store);
-        run_replacement_crash_child(&store_path, failpoint)?;
+        zinder_testkit::process_crash::run_crash_child(
+            REPLACEMENT_CRASH_CHILD,
+            &store_path,
+            &format!("canonical.live_replacement.{crash_point}"),
+        )?;
         let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
         let reopened = open_store(&store_path, &activations, 2)?;
-        match failpoint {
+        match crash_point {
             "before_atomic_write" => {
                 assert_eq!(
                     reopened.event_fence().chain_epoch_id(),
@@ -1554,7 +1553,7 @@ fn replacement_batch_is_either_pre_update_or_post_update_across_process_abort()
                 );
                 assert_eq!(reopened.block_header_at(BlockHeight::new(4))?, None);
             }
-            _ => return Err("unexpected replacement failpoint".into()),
+            _ => return Err("unexpected replacement crash point".into()),
         }
     }
     Ok(())
@@ -1708,11 +1707,11 @@ fn retained_canonical_events_convert_into_dispatchable_chain_events()
 
 #[test]
 fn replacement_crash_child_process() -> Result<(), Box<dyn std::error::Error>> {
-    let Ok(store_path) = env::var(REPLACEMENT_STORE_PATH_ENV) else {
+    let Some(child) = zinder_testkit::process_crash::crash_child() else {
         return Ok(());
     };
     let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
-    let store = open_store(Path::new(&store_path), &activations, 2)?;
+    let store = open_store(child.store_path(), &activations, 2)?;
     let fence = store.event_fence();
     let replacement = replacement_block(BlockHeight::new(3), [33; 32], [2; 32], 203)?;
     let _ = store.commit_live_replacement(
@@ -1723,27 +1722,7 @@ fn replacement_crash_child_process() -> Result<(), Box<dyn std::error::Error>> {
         ),
         &activations,
     )?;
-    Err("replacement crash failpoint did not abort".into())
-}
-
-fn run_replacement_crash_child(
-    store_path: &Path,
-    failpoint: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let status = Command::new(env::current_exe()?)
-        .arg("--exact")
-        .arg("canonical_store::live_replacement_tests::replacement_crash_child_process")
-        .arg("--nocapture")
-        .env(REPLACEMENT_STORE_PATH_ENV, store_path)
-        .env(REPLACEMENT_FAILPOINT_ENV, failpoint)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    if status.success() {
-        return Err(format!("replacement failpoint {failpoint} did not crash").into());
-    }
-    Ok(())
+    Err("replacement crash point did not abort".into())
 }
 
 fn replaced_store(path: &Path) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {

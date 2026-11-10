@@ -156,7 +156,7 @@ impl RocksDbCanonicalStore {
         let mut write_options = WriteOptions::default();
         write_options.disable_wal(false);
         write_options.set_sync(true);
-        abort_at_live_replacement_failpoint("before_atomic_write");
+        super::crash_point("canonical.live_replacement.before_atomic_write");
         self.bounded_open
             .db
             .write_opt(&batch, &write_options)
@@ -166,7 +166,7 @@ impl RocksDbCanonicalStore {
                     source,
                 },
             )?;
-        abort_at_live_replacement_failpoint("after_atomic_write");
+        super::crash_point("canonical.live_replacement.after_atomic_write");
         prepared.validate_readback(&mut self).map_err(|source| {
             CanonicalStoreError::LiveCommitCompletedButUnverified {
                 path: self.bounded_open.db.path().to_path_buf(),
@@ -870,14 +870,3 @@ fn inclusive_count(range: BlockHeightRange) -> Result<u32, CanonicalStoreError> 
         .and_then(|difference| difference.checked_add(1))
         .ok_or_else(|| CanonicalStoreError::live_commit("canonical replacement range is empty"))
 }
-
-#[cfg(test)]
-fn abort_at_live_replacement_failpoint(expected: &str) {
-    if std::env::var("ZINDER_TEST_CANONICAL_LIVE_REPLACEMENT_FAILPOINT").as_deref() == Ok(expected)
-    {
-        std::process::abort();
-    }
-}
-
-#[cfg(not(test))]
-const fn abort_at_live_replacement_failpoint(_expected: &str) {}

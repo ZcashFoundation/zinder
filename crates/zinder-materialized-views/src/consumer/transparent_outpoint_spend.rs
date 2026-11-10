@@ -373,6 +373,7 @@ mod tests {
     )]
 
     use std::collections::HashMap;
+    use std::path::Path;
     use std::sync::Arc;
 
     use rust_rocksdb::WriteBatch;
@@ -385,6 +386,7 @@ mod tests {
         TransparentOutPoint, TransparentSpendFact, UnixTimestampMillis,
     };
     use zinder_store::{ChainEpochCommitted, ChainEvent, RocksDbResourceBudget};
+    use zinder_testkit::process_crash;
 
     use super::{
         TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
@@ -396,7 +398,9 @@ mod tests {
     use crate::consumer::{
         BlockKeyedConsumer, MaterializedViewBlockCheckpoint, MaterializedViewConsumerCtx,
     };
-    use crate::store::{MaterializedViewStore, MaterializedViewStoreOptions};
+    use crate::store::{
+        ChainEventDispatchInputs, MaterializedViewStore, MaterializedViewStoreOptions,
+    };
 
     const SPENT_ADDRESS: TransparentAddressScriptHash =
         TransparentAddressScriptHash::from_bytes([7; 32]);
@@ -520,15 +524,21 @@ mod tests {
     -> Result<(tempfile::TempDir, MaterializedViewStore), Box<dyn std::error::Error + Send + Sync>>
     {
         let tempdir = tempdir()?;
-        let store = MaterializedViewStore::open(
-            tempdir.path(),
+        let store = open_store_at(tempdir.path())?;
+        Ok((tempdir, store))
+    }
+
+    fn open_store_at(
+        path: &Path,
+    ) -> Result<MaterializedViewStore, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(MaterializedViewStore::open(
+            path,
             MaterializedViewStoreOptions {
                 consumers: &[TRANSPARENT_OUTPOINT_SPEND_SCHEMA],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 sync_writes: false,
             },
-        )?;
-        Ok((tempdir, store))
+        )?)
     }
 
     fn apply_block(
@@ -736,6 +746,107 @@ mod tests {
             )?,
             Some(SPEND_HEIGHT)
         );
+        Ok(())
+    }
+
+    const FINAL_CHUNK_CRASH_CHILD: &str =
+        "consumer::transparent_outpoint_spend::tests::final_chain_event_chunk_crash_child";
+    const INTERMEDIATE_CHUNK_CRASH_CHILD: &str =
+        "consumer::transparent_outpoint_spend::tests::intermediate_chain_event_chunk_crash_child";
+    const CRASH_EVENT_CURSOR: &[u8] = b"canonical-event-cursor-2";
+
+    fn write_spend_event_chunk(
+        store: &MaterializedViewStore,
+        advance_cursor: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let tip = BlockHeight::new(106);
+        let epoch = chain_epoch(2, tip, block_hash(6));
+        let event = ChainEvent::ChainCommitted {
+            committed: ChainEpochCommitted {
+                chain_epoch: epoch,
+                block_range: BlockHeightRange::inclusive(SPEND_HEIGHT, tip),
+            },
+        };
+        let blocks = HashMap::from([
+            (SPEND_HEIGHT, Arc::new(spend_block())),
+            (tip, Arc::new(coinbase_block())),
+        ]);
+        let mut consumer = TransparentOutpointSpendConsumer::new();
+        store.write_chain_event_chunk(
+            &mut [&mut consumer],
+            ChainEventDispatchInputs {
+                chain_epoch: epoch,
+                chain_event: &event,
+                chain_cursor: CRASH_EVENT_CURSOR,
+                event_sequence: 2,
+                settled_tip_height: BlockHeight::new(1),
+            },
+            &blocks,
+            advance_cursor,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn final_chain_event_chunk_crash_child() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    {
+        let Some(child) = process_crash::crash_child() else {
+            return Ok(());
+        };
+        write_spend_event_chunk(&open_store_at(child.store_path())?, true)?;
+        Err("final chain-event chunk returned without reaching its crash point".into())
+    }
+
+    #[test]
+    fn intermediate_chain_event_chunk_crash_child()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let Some(child) = process_crash::crash_child() else {
+            return Ok(());
+        };
+        write_spend_event_chunk(&open_store_at(child.store_path())?, false)?;
+        Err("intermediate chain-event chunk returned without reaching its crash point".into())
+    }
+
+    #[test]
+    fn chain_event_chunk_reopens_at_one_complete_batch_across_process_abort()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temporary = tempdir()?;
+        for (child_test, crash_point, rows_durable, cursor_durable) in [
+            (FINAL_CHUNK_CRASH_CHILD, "before_write", false, false),
+            (FINAL_CHUNK_CRASH_CHILD, "after_write", true, true),
+            (INTERMEDIATE_CHUNK_CRASH_CHILD, "after_write", true, false),
+        ] {
+            let store_path = temporary
+                .path()
+                .join(format!("{crash_point}-{cursor_durable}"));
+            process_crash::run_crash_child(
+                child_test,
+                &store_path,
+                &format!("materialized_view.chain_event_chunk.{crash_point}"),
+            )?;
+
+            let reopened = open_store_at(&store_path)?;
+            let spends = TransparentOutpointSpendConsumer::read_spends_by_outpoints(
+                &reopened,
+                &[received_outpoint()],
+            )?;
+            let state = reopened.consumer_state(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)?;
+            assert_eq!(spends.contains_key(&received_outpoint()), rows_durable);
+            assert_eq!(
+                reopened.last_materialized_height_ascending(
+                    TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY
+                )?,
+                rows_durable.then_some(BlockHeight::new(106))
+            );
+            assert_eq!(
+                state.map(|state| state.tip_height),
+                rows_durable.then_some(BlockHeight::new(106))
+            );
+            assert_eq!(
+                reopened.get_chain_event_cursor(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)?,
+                cursor_durable.then(|| CRASH_EVENT_CURSOR.to_vec())
+            );
+        }
         Ok(())
     }
 }

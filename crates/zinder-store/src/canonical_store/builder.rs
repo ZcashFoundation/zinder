@@ -376,12 +376,7 @@ impl Drop for FreshCanonicalBlockStaging {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        env,
-        num::NonZeroU32,
-        path::Path,
-        process::{Command, Stdio},
-    };
+    use std::{num::NonZeroU32, path::Path};
 
     use metrics_exporter_prometheus::PrometheusBuilder;
     use rust_rocksdb::DB;
@@ -400,6 +395,7 @@ mod tests {
         TransparentAddressScriptHash, TransparentOutputFact, UnixTimestampMillis,
         UnsupportedSection, encode_canonical_block_replay,
     };
+    use zinder_testkit::process_crash;
 
     use super::*;
     use crate::canonical_store::{
@@ -423,14 +419,12 @@ mod tests {
         RocksDbCanonicalSecondary, RocksDbCanonicalStore,
     };
 
-    const PUBLICATION_FAILPOINT_ENV: &str = "ZINDER_TEST_CANONICAL_PUBLICATION_FAILPOINT";
-    const PUBLICATION_STORE_PATH_ENV: &str = "ZINDER_TEST_CANONICAL_PUBLICATION_STORE_PATH";
-    const LIVE_COMMIT_FAILPOINT_ENV: &str = "ZINDER_TEST_CANONICAL_LIVE_COMMIT_FAILPOINT";
-    const LIVE_COMMIT_STORE_PATH_ENV: &str = "ZINDER_TEST_CANONICAL_LIVE_COMMIT_STORE_PATH";
-    const ACTIVATION_SCHEDULE_FAILPOINT_ENV: &str =
-        "ZINDER_TEST_CANONICAL_ACTIVATION_SCHEDULE_FAILPOINT";
-    const ACTIVATION_SCHEDULE_STORE_PATH_ENV: &str =
-        "ZINDER_TEST_CANONICAL_ACTIVATION_SCHEDULE_STORE_PATH";
+    const PUBLICATION_CRASH_CHILD: &str =
+        "canonical_store::builder::tests::publication_crash_child_process";
+    const LIVE_COMMIT_CRASH_CHILD: &str =
+        "canonical_store::builder::tests::live_commit_crash_child_process";
+    const ACTIVATION_SCHEDULE_CRASH_CHILD: &str =
+        "canonical_store::builder::tests::activation_schedule_crash_child_process";
 
     #[test]
     fn builder_refuses_every_existing_path() -> Result<(), Box<dyn std::error::Error>> {
@@ -1557,7 +1551,11 @@ mod tests {
         let extended = NetworkUpgradeActivations::new(Network::ZcashTestnet, extended_entries)?;
         drop(published_loaded_store(&store_path, BlockHeight::new(2))?);
 
-        run_activation_schedule_crash_child(&store_path, "before_atomic_write")?;
+        process_crash::run_crash_child(
+            ACTIVATION_SCHEDULE_CRASH_CHILD,
+            &store_path,
+            "canonical.control_revision.before_atomic_write",
+        )?;
         let before = RocksDbCanonicalStore::open_ready(
             &store_path,
             &baseline,
@@ -1574,7 +1572,11 @@ mod tests {
         );
         drop(before);
 
-        run_activation_schedule_crash_child(&store_path, "after_atomic_write")?;
+        process_crash::run_crash_child(
+            ACTIVATION_SCHEDULE_CRASH_CHILD,
+            &store_path,
+            "canonical.control_revision.after_atomic_write",
+        )?;
         let after = RocksDbCanonicalStore::open_ready(
             &store_path,
             &baseline,
@@ -2081,10 +2083,10 @@ mod tests {
 
     #[test]
     fn live_commit_crash_child_process() -> Result<(), Box<dyn std::error::Error>> {
-        let Some(store_path) = env::var_os(LIVE_COMMIT_STORE_PATH_ENV) else {
+        let Some(child) = process_crash::crash_child() else {
             return Ok(());
         };
-        let store_path = Path::new(&store_path);
+        let store_path = child.store_path();
         let validated =
             complete_loaded_builder(store_path)?.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
@@ -2112,7 +2114,7 @@ mod tests {
 
     #[test]
     fn activation_schedule_crash_child_process() -> Result<(), Box<dyn std::error::Error>> {
-        let Some(store_path) = env::var_os(ACTIVATION_SCHEDULE_STORE_PATH_ENV) else {
+        let Some(child) = process_crash::crash_child() else {
             return Ok(());
         };
         let baseline =
@@ -2125,14 +2127,14 @@ mod tests {
         });
         let extended = NetworkUpgradeActivations::new(Network::ZcashTestnet, entries)?;
         let _store = RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
-            Path::new(&store_path),
+            child.store_path(),
             &extended,
             CanonicalStoreWorkload::Wallet,
             RawBlobRetention::Transactions,
             CanonicalReorgPolicy::new(100)?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
-        Err("activation-schedule failpoint did not abort the child process".into())
+        Err("activation-schedule crash point did not abort the child process".into())
     }
 
     #[test]
@@ -2142,7 +2144,11 @@ mod tests {
         let activations =
             crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
         let before_path = temporary.path().join("before-atomic-write");
-        run_live_commit_crash_child(&before_path, "before_atomic_write")?;
+        process_crash::run_crash_child(
+            LIVE_COMMIT_CRASH_CHILD,
+            &before_path,
+            "canonical.live_commit.before_atomic_write",
+        )?;
         let before = RocksDbCanonicalStore::open_ready(
             &before_path,
             &activations,
@@ -2155,7 +2161,11 @@ mod tests {
         drop(before);
 
         let after_path = temporary.path().join("after-atomic-write");
-        run_live_commit_crash_child(&after_path, "after_atomic_write")?;
+        process_crash::run_crash_child(
+            LIVE_COMMIT_CRASH_CHILD,
+            &after_path,
+            "canonical.live_commit.after_atomic_write",
+        )?;
         let after = RocksDbCanonicalStore::open_ready(
             &after_path,
             &activations,
@@ -2215,10 +2225,10 @@ mod tests {
     }
     #[test]
     fn publication_crash_child_process() -> Result<(), Box<dyn std::error::Error>> {
-        let Some(store_path) = env::var_os(PUBLICATION_STORE_PATH_ENV) else {
+        let Some(child) = process_crash::crash_child() else {
             return Ok(());
         };
-        let store_path = Path::new(&store_path);
+        let store_path = child.store_path();
         let validated =
             complete_loaded_builder(store_path)?.prepare_cold_certified_publication()?;
         let publication = validated.prepare_baseline(crate::CanonicalBaselinePublication::new(
@@ -2233,17 +2243,21 @@ mod tests {
     fn publication_crashes_preserve_the_atomic_build_state()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
-        for failpoint in [
+        for crash_point in [
             "after_flush",
             "after_builder_drop",
             "after_cold_validation",
             "after_construction_manifest",
             "before_atomic_write",
         ] {
-            let store_path = temporary.path().join(failpoint);
-            run_publication_crash_child(&store_path, failpoint)?;
+            let store_path = temporary.path().join(crash_point);
+            process_crash::run_crash_child(
+                PUBLICATION_CRASH_CHILD,
+                &store_path,
+                &format!("canonical.publication.{crash_point}"),
+            )?;
             assert_building_without_baseline(&store_path)?;
-            if failpoint == "after_construction_manifest"
+            if crash_point == "after_construction_manifest"
                 && !store_path
                     .join(CANONICAL_CONSTRUCTION_MANIFEST_FILE_NAME)
                     .is_file()
@@ -2253,7 +2267,11 @@ mod tests {
         }
 
         let committed_path = temporary.path().join("after_atomic_write");
-        run_publication_crash_child(&committed_path, "after_atomic_write")?;
+        process_crash::run_crash_child(
+            PUBLICATION_CRASH_CHILD,
+            &committed_path,
+            "canonical.publication.after_atomic_write",
+        )?;
         let reopened = RocksDbCanonicalStore::open_ready(
             &committed_path,
             &crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?,
@@ -3008,66 +3026,6 @@ mod tests {
             crate::canonical_store::test_checkpoint_frontiers(&activations, build_tip_height),
         ))?;
         Ok(store)
-    }
-
-    fn run_publication_crash_child(
-        store_path: &Path,
-        failpoint: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let status = Command::new(env::current_exe()?)
-            .arg("--exact")
-            .arg("canonical_store::builder::tests::publication_crash_child_process")
-            .arg("--nocapture")
-            .env(PUBLICATION_STORE_PATH_ENV, store_path)
-            .env(PUBLICATION_FAILPOINT_ENV, failpoint)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if status.success() {
-            return Err(format!("publication failpoint {failpoint} did not crash").into());
-        }
-        Ok(())
-    }
-
-    fn run_live_commit_crash_child(
-        store_path: &Path,
-        failpoint: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let status = Command::new(env::current_exe()?)
-            .arg("--exact")
-            .arg("canonical_store::builder::tests::live_commit_crash_child_process")
-            .arg("--nocapture")
-            .env(LIVE_COMMIT_STORE_PATH_ENV, store_path)
-            .env(LIVE_COMMIT_FAILPOINT_ENV, failpoint)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if status.success() {
-            return Err(format!("live-commit failpoint {failpoint} did not crash").into());
-        }
-        Ok(())
-    }
-
-    fn run_activation_schedule_crash_child(
-        store_path: &Path,
-        failpoint: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let status = Command::new(env::current_exe()?)
-            .arg("--exact")
-            .arg("canonical_store::builder::tests::activation_schedule_crash_child_process")
-            .arg("--nocapture")
-            .env(ACTIVATION_SCHEDULE_STORE_PATH_ENV, store_path)
-            .env(ACTIVATION_SCHEDULE_FAILPOINT_ENV, failpoint)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if status.success() {
-            return Err(format!("activation-schedule failpoint {failpoint} did not crash").into());
-        }
-        Ok(())
     }
 
     fn assert_building_without_baseline(

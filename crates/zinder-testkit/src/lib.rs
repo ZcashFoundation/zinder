@@ -12,6 +12,8 @@
 //!   height, plus fork helpers for reorg shape construction.
 //! - [`WalletServingStoreFixture`] builds the production canonical and wallet
 //!   stores, then opens immutable secondaries at one admitted serving fence.
+//! - [`process_crash`] runs a child test that aborts at an armed crash point,
+//!   so a parent test can reopen the store and assert crash recovery.
 //! - [`MockTransactionBroadcaster`] implements
 //!   [`zinder_source::TransactionBroadcaster`] with configurable per-call
 //!   outcomes and a recording mode that captures calls for later inspection.
@@ -42,6 +44,7 @@ pub mod materialized_view_fixture;
 pub mod mock_mempool_source;
 pub mod mock_transaction_broadcaster;
 pub mod network_upgrade_fixtures;
+pub mod process_crash;
 pub mod transparent_signer;
 pub mod wallet_serving_store_fixture;
 
