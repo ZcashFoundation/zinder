@@ -1,0 +1,6 @@
+kind: fixed
+body: Ingest now waits for a node whose tip falls to or below the settled tip on the same branch, as after a Zebra restart, instead of parking with reorg_window_exceeded.
+time: 2026-11-10T13:07:21Z
+custom:
+  Bump: patch
+  PR: "110"

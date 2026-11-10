@@ -760,6 +760,14 @@ where
     let local_tip = anchor.event_fence().visible_tip();
     let settled_tip = anchor.settled_tip();
     let configured_window_blocks = store.reorg_policy().reorg_window_blocks();
+    if observed_tip.height <= settled_tip.height && is_local_canonical_block(store, observed_tip)? {
+        return Err(CanonicalFollowError::Source(
+            SourceError::BlockReorgDuringFetch {
+                height: observed_tip.height,
+                reason: "source tip is a canonical block at or below the settled tip",
+            },
+        ));
+    }
     let search_start = local_tip.height.min(observed_tip.height);
     let mut memory = ReplacementMemory::new(config.max_replacement_bytes);
     let mut source_blocks = BTreeMap::new();
@@ -996,6 +1004,21 @@ fn reorg_window_exceeded(
         configured_window_blocks,
         covered_depth_blocks: unsettled_depth,
     }))
+}
+
+/// Returns whether `block` is the retained canonical block at its height.
+///
+/// A source tip that is one is a prefix of the local chain, as when a
+/// restarted node has not yet re-verified its unfinalized blocks, so following
+/// it needs no replacement. A tip below the retained headers cannot be proved
+/// one and is treated as a fork.
+fn is_local_canonical_block(
+    store: &RocksDbCanonicalStore,
+    block: BlockId,
+) -> Result<bool, CanonicalFollowError> {
+    Ok(store
+        .block_header_at(block.height)?
+        .is_some_and(|header| header.block_hash == block.hash))
 }
 
 /// Returns whether the source branch leaves the settled tip, which places the
