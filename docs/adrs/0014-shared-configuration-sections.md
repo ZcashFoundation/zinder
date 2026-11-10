@@ -50,10 +50,12 @@ material are replaced by explicit redaction markers. Unknown fields are
 rejected and invalid cross-field combinations fail before storage opens. A
 service does not accept a section for a role it does not own, but a shared
 section type accepts every field of its role pair: for example, `[node]`
-accepts the ingest-only `indexer_grpc_addr` in every binary, and
-`[ingest_control]` accepts both the writer fields and the reader fields. A
-binary ignores the fields it does not consume, and the environment-variable
-reference names only the binaries that consume each variable.
+accepts the ingest-only `indexer_grpc_addr` in every binary that reads
+`[node]`, and `[ingest_control]` accepts both the writer fields and the reader
+fields. A binary ignores the fields it does not consume. The environment-variable
+reference names the binaries that read a variable into their configuration, and
+a description states when a listed binary does not apply it, such as RocksDB
+background job caps on secondary opens.
 
 ## Consequences
 
@@ -64,10 +66,3 @@ reference names only the binaries that consume each variable.
   that service's config module.
 - Configuration changes must update `--print-config`, environment-variable
   documentation, examples, tests, and the public vocabulary in the same change.
-
-## Revision history
-
-- Shared section types are documented as accepting fields that individual
-  binaries ignore, and the environment-variable reference is checked against
-  each binary's loader in both directions by the `env_var_contract`
-  integration tests.

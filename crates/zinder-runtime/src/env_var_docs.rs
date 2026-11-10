@@ -19,6 +19,10 @@
 //!   row naming the binary, except keys the test lists as accepted only
 //!   because the section type is shared.
 //!
+//! A row lists a binary when the binary reads the variable into its
+//! configuration. A description says when a listed binary does not apply the
+//! value, as for RocksDB background job caps on secondary opens.
+//!
 //! Neither check validates descriptions, defaults, requirement, sensitivity,
 //! or whether a binary acts on a variable it accepts. Adding a config field
 //! means adding a row here and regenerating the doc block.
@@ -906,7 +910,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
     EnvVarDoc {
         name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_BACKGROUND_JOBS",
         toml_path: "storage.materialized_views.rocksdb.max_background_jobs",
-        used_by: &["zinder-ingest"],
+        used_by: &["zinder-ingest", "zinder-explorer"],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Materialized-view store primary-writer RocksDB background job cap shared by \

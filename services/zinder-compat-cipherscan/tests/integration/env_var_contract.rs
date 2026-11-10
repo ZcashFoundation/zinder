@@ -35,3 +35,13 @@ fn a_variable_outside_the_loader_schema_is_rejected() {
         "the loader must reject a section it does not define"
     );
 }
+
+#[test]
+fn a_variable_nested_below_a_leaf_field_is_rejected() {
+    let outcome =
+        probe().check_documented_variables_are_accepted(["ZINDER_OPS__LISTEN_ADDR__PORT"]);
+    assert!(
+        outcome.is_err(),
+        "the loader must reject a key nested below a leaf field"
+    );
+}

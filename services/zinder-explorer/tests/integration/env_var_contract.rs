@@ -7,12 +7,11 @@ use zinder_testkit::EnvVarContractProbe;
 const BINARY: &str = "zinder-explorer";
 
 // `[storage]` and `[node]` are shared section types; the explorer fixes its
-// catchup cadence, never gates startup on catchup, applies no background-job
-// cap to a secondary open, and does not read the indexer stream.
+// catchup cadence, never gates startup on catchup, and does not read the
+// indexer stream.
 const ACCEPTED_BUT_UNCONSUMED: &[&str] = &[
     "ZINDER_NODE__INDEXER_GRPC_ADDR",
     "ZINDER_STORAGE__INITIAL_CATCHUP_TIMEOUT_MS",
-    "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_BACKGROUND_JOBS",
     "ZINDER_STORAGE__SECONDARY_CATCHUP_INTERVAL_MS",
     "ZINDER_STORAGE__SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS",
 ];

@@ -9,11 +9,13 @@
 //!
 //! Two directions are checked:
 //!
-//! - [`EnvVarContractProbe::check_documented_variables_are_accepted`] sets each
-//!   documented variable and fails when the loader reports an unknown key.
-//! - [`EnvVarContractProbe::check_accepted_variables_are_documented`] asks the
-//!   loader which keys it accepts, by provoking its unknown-field error at
-//!   every section, and fails on any accepted key without a documented name.
+//! - [`EnvVarContractProbe::check_documented_variables_are_accepted`] fails on
+//!   any documented variable that is not a key the loader accepts.
+//! - [`EnvVarContractProbe::check_accepted_variables_are_documented`] fails on
+//!   any accepted key without a documented name.
+//!
+//! The accepted keys come from the loader itself: the probe provokes its
+//! unknown-field error at every section and reads the expected-field list.
 
 use std::{collections::BTreeSet, path::PathBuf, process::Command};
 
@@ -23,7 +25,6 @@ const ENV_PREFIX: &str = "ZINDER_";
 const PROBE_SECTION: &str = "CONTRACT_PROBE";
 const PROBE_LEAF: &str = "UNUSED";
 const PROBE_KEY: &str = "contract_probe";
-const REJECTION_MARKERS: [&str; 2] = ["unknown field", "rejected environment variable"];
 
 /// Runs one service binary's `--print-config` as a configuration-loader probe.
 #[derive(Clone, Debug)]
@@ -40,29 +41,25 @@ impl EnvVarContractProbe {
         }
     }
 
-    /// Fails when the loader rejects any of `documented_names` as an unknown
-    /// configuration key.
+    /// Fails when any of `documented_names` is not a configuration key the
+    /// loader accepts.
     pub fn check_documented_variables_are_accepted<'a>(
         &self,
         documented_names: impl IntoIterator<Item = &'a str>,
     ) -> Result<()> {
-        let mut rejections = Vec::new();
-        for name in documented_names {
-            let stderr = self.run_with_env(&[(name, "1")])?;
-            if REJECTION_MARKERS
-                .iter()
-                .any(|marker| stderr.contains(marker))
-            {
-                rejections.push(format!("{name}: {}", stderr.trim()));
-            }
-        }
-        if rejections.is_empty() {
+        let accepted = self.accepted_variables()?;
+        let rejected = documented_names
+            .into_iter()
+            .filter(|name| !accepted.contains(*name))
+            .collect::<Vec<_>>();
+        if rejected.is_empty() {
             return Ok(());
         }
         bail!(
-            "{} documents variables its loader rejects; fix the row or its `used_by` list:\n{}",
+            "{} documents variables its loader does not accept; fix the row or its `used_by` \
+             list: {}",
             self.executable_name(),
-            rejections.join("\n"),
+            rejected.join(", "),
         );
     }
 
@@ -79,8 +76,7 @@ impl EnvVarContractProbe {
         accepted_but_unconsumed: &[&str],
     ) -> Result<()> {
         let documented = documented_names.into_iter().collect::<BTreeSet<&str>>();
-        let mut accepted = BTreeSet::new();
-        self.collect_accepted_variables(&[], &mut accepted)?;
+        let accepted = self.accepted_variables()?;
 
         let mut problems = Vec::new();
         for name in &accepted {
@@ -111,6 +107,12 @@ impl EnvVarContractProbe {
             self.executable_name(),
             problems.join("\n"),
         );
+    }
+
+    fn accepted_variables(&self) -> Result<BTreeSet<String>> {
+        let mut accepted = BTreeSet::new();
+        self.collect_accepted_variables(&[], &mut accepted)?;
+        Ok(accepted)
     }
 
     fn collect_accepted_variables(

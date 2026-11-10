@@ -206,7 +206,7 @@ Release configuration is grouped by owner:
   `[ingest.follow]`, `[ingest.run_overrides]`, `[retention]`, and
   `[ingest_control]` configure the canonical writer;
 - `[storage]`, `[projector]`, `[ingest_control]`, and `[projector_control]`
-  configure the wallet projector; and
+  configure the wallet projector;
 - `[storage]`, `[wallet]`, `[compat]`, and `[ingest_control]` configure the
   lightwalletd adapter;
 - `[storage]`, `[wallet]`, `[query]`, and `[ingest_control]` configure the
@@ -240,8 +240,10 @@ service's `env_var_contract` integration tests run that binary's real
 configuration loader against it: every variable whose "Used by" column names the
 binary must be accepted, and every key the loader accepts must have a row naming
 the binary unless the binary accepts it only because it shares a section type
-and ignores it. The tests do not check descriptions, defaults, requirement, or
-whether a binary acts on a variable.
+and never reads it. A listed binary may still not apply a value, as for RocksDB
+background job caps on secondary opens; the description says so. The tests do
+not check descriptions, defaults, requirement, or whether a binary acts on a
+variable.
 
 <!-- env-var-table:public-interfaces:start -->
 | Variable | Used by | Requirement | TOML field | Description |
@@ -309,7 +311,7 @@ whether a binary acts on a variable.
 | `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_OPEN_FILES` | zinder-ingest, zinder-explorer | Optional | `storage.materialized_views.rocksdb.max_open_files` | Materialized-view store RocksDB open SST file cap. Defaults to 512 for writers and 64 for readers. |
 | `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__WRITE_BUFFER_BYTES` | zinder-ingest, zinder-explorer | Optional | `storage.materialized_views.rocksdb.write_buffer_bytes` | Materialized-view store per-column-family RocksDB write buffer size. Defaults to 16777216 for writers and 4194304 for readers. |
 | `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_WRITE_BUFFER_COUNT` | zinder-ingest, zinder-explorer | Optional | `storage.materialized_views.rocksdb.max_write_buffer_count` | Materialized-view store per-column-family mutable plus immutable RocksDB write buffer count. Defaults to 4 for writers and 2 for readers. |
-| `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_BACKGROUND_JOBS` | zinder-ingest | Optional | `storage.materialized_views.rocksdb.max_background_jobs` | Materialized-view store primary-writer RocksDB background job cap shared by flush and compaction work. Defaults to 2 and is not applied to secondary opens, including `zinder-explorer`. |
+| `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_BACKGROUND_JOBS` | zinder-ingest, zinder-explorer | Optional | `storage.materialized_views.rocksdb.max_background_jobs` | Materialized-view store primary-writer RocksDB background job cap shared by flush and compaction work. Defaults to 2 and is not applied to secondary opens, including `zinder-explorer`. |
 | `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MEMTABLE_BUDGET_BYTES` | zinder-ingest, zinder-explorer | Optional | `storage.materialized_views.rocksdb.memtable_budget_bytes` | Materialized-view store total RocksDB memtable budget across column families. Defaults to 536870912 for writers and 16777216 for readers. |
 | `ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__STATISTICS_LEVEL` | zinder-ingest, zinder-explorer | Optional | `storage.materialized_views.rocksdb.statistics_level` | Materialized-view store RocksDB statistics collection gate: `off`, `tickers`, or `full`. Defaults to `tickers`. |
 | `ZINDER_INGEST__SOURCE` | zinder-ingest | Required | `ingest.source` | Source-adapter selector. Lives on `[ingest]` (not `[node]`) because the choice is a writer-private implementation decision: `[node]` describes the upstream node itself, `[ingest].source` describes which adapter ingest uses to talk to it. See [ADR-0016](../adrs/0016-source-segment-fetching.md). |
