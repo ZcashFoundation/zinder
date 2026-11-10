@@ -2158,6 +2158,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     const TRANSITION_CRASH_CHILD: &str = "transition::tests::wallet_transition_crash_child";
 
     #[test]
@@ -2175,6 +2176,7 @@ mod tests {
         Err("wallet transition returned without reaching its crash point".into())
     }
 
+    #[cfg(unix)]
     #[test]
     fn wallet_transition_reopens_at_one_complete_publication_across_process_abort()
     -> Result<(), Box<dyn std::error::Error>> {

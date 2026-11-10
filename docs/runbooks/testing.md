@@ -605,6 +605,11 @@ supplies both halves:
    instead of passing as a crash.
 4. The parent reopens the store and asserts the recovered state.
 
+`run_crash_child` exists only on Unix, the only platform Zinder builds, tests,
+and releases, because `SIGABRT` is what separates an abort from an ordinary
+failure. Mark every parent test, and any helper only a parent uses,
+`#[cfg(unix)]`.
+
 Crash points are one-line calls in production source. Each crate that owns a
 crash point declares a `crash_point` name that resolves to the harness only in
 its unit-test build:

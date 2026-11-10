@@ -22,6 +22,14 @@
 //! crash_point("canonical.live_commit.before_atomic_write");
 //! ```
 //!
+//! # Platform support
+//!
+//! [`run_crash_child`] and [`ProcessCrashError`] exist only on Unix, where an
+//! abort is distinguishable from an ordinary failure by its `SIGABRT` signal.
+//! Zinder builds, tests, and releases only Unix targets. Parent crash tests
+//! carry `#[cfg(unix)]`; [`crash_point`] and [`crash_child`] stay available on
+//! every target so production call sites and child tests compile unchanged.
+//!
 //! # Limitation
 //!
 //! `std::process::abort` ends the process but leaves the operating system
@@ -30,10 +38,11 @@
 //! committed batches; they cannot detect a missing fsync. Power-loss
 //! durability needs a fault-injecting filesystem or a host-level test.
 
+#[cfg(unix)]
+use std::process::{Command, ExitStatus, Stdio};
 use std::{
     env,
     path::{Path, PathBuf},
-    process::{Command, ExitStatus, Stdio},
 };
 
 const CRASH_POINT_ENV: &str = "ZINDER_TEST_CRASH_POINT";
@@ -89,6 +98,7 @@ pub fn crash_child() -> Option<CrashChild> {
 /// `child_test` is the exact libtest name of the child, for example
 /// `canonical_store::builder::tests::publication_crash_child_process`.
 /// Returns `Ok` only when the child process aborted.
+#[cfg(unix)]
 pub fn run_crash_child(
     child_test: &str,
     store_path: &Path,
@@ -126,11 +136,7 @@ fn process_aborted(status: ExitStatus) -> bool {
     status.signal() == Some(SIGABRT)
 }
 
-#[cfg(not(unix))]
-fn process_aborted(status: ExitStatus) -> bool {
-    !status.success()
-}
-
+#[cfg(unix)]
 fn output_tail(bytes: &[u8]) -> String {
     const TAIL_BYTES: usize = 2048;
     let start = bytes.len().saturating_sub(TAIL_BYTES);
@@ -138,6 +144,7 @@ fn output_tail(bytes: &[u8]) -> String {
 }
 
 /// Failure to run a crash child to its abort.
+#[cfg(unix)]
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ProcessCrashError {
@@ -166,7 +173,7 @@ pub enum ProcessCrashError {
     },
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use tempfile::TempDir;
 

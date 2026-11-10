@@ -32,6 +32,7 @@ use crate::{
     format::{ChainEventCursorAnchor, ChainEventLocator},
 };
 
+#[cfg(unix)]
 const REPLACEMENT_CRASH_CHILD: &str =
     "canonical_store::live_replacement_tests::replacement_crash_child_process";
 
@@ -1510,6 +1511,7 @@ fn replacement_rejects_a_stale_fence_without_archive_writes()
     Ok(())
 }
 
+#[cfg(unix)]
 #[test]
 fn replacement_batch_is_either_pre_update_or_post_update_across_process_abort()
 -> Result<(), Box<dyn std::error::Error>> {

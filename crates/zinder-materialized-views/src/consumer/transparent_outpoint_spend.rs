@@ -749,8 +749,10 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     const FINAL_CHUNK_CRASH_CHILD: &str =
         "consumer::transparent_outpoint_spend::tests::final_chain_event_chunk_crash_child";
+    #[cfg(unix)]
     const INTERMEDIATE_CHUNK_CRASH_CHILD: &str =
         "consumer::transparent_outpoint_spend::tests::intermediate_chain_event_chunk_crash_child";
     const CRASH_EVENT_CURSOR: &[u8] = b"canonical-event-cursor-2";
@@ -807,6 +809,7 @@ mod tests {
         Err("intermediate chain-event chunk returned without reaching its crash point".into())
     }
 
+    #[cfg(unix)]
     #[test]
     fn chain_event_chunk_reopens_at_one_complete_batch_across_process_abort()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

@@ -401,7 +401,6 @@ mod tests {
     use crate::canonical_store::{
         block_load::{canonical_block_families_are_empty, validate_compact_block_payload},
         block_replay::{BLOCK_REPLAY_COLUMN_FAMILY, validate_persisted_block_replays},
-        construction_manifest::CANONICAL_CONSTRUCTION_MANIFEST_FILE_NAME,
         control::{decode_store_control, encode_ready_store_control},
         displaced_archive::{
             encode_test_archive_record, encode_test_archive_state, encode_test_event_context,
@@ -419,10 +418,13 @@ mod tests {
         RocksDbCanonicalSecondary, RocksDbCanonicalStore,
     };
 
+    #[cfg(unix)]
     const PUBLICATION_CRASH_CHILD: &str =
         "canonical_store::builder::tests::publication_crash_child_process";
+    #[cfg(unix)]
     const LIVE_COMMIT_CRASH_CHILD: &str =
         "canonical_store::builder::tests::live_commit_crash_child_process";
+    #[cfg(unix)]
     const ACTIVATION_SCHEDULE_CRASH_CHILD: &str =
         "canonical_store::builder::tests::activation_schedule_crash_child_process";
 
@@ -1535,6 +1537,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn activation_schedule_crash_recovers_before_or_after_atomic_record_and_control_write()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2137,6 +2140,7 @@ mod tests {
         Err("activation-schedule crash point did not abort the child process".into())
     }
 
+    #[cfg(unix)]
     #[test]
     fn live_commit_crashes_reopen_at_one_complete_atomic_fence()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2239,6 +2243,7 @@ mod tests {
         Err("publication failpoint did not abort the child process".into())
     }
 
+    #[cfg(unix)]
     #[test]
     fn publication_crashes_preserve_the_atomic_build_state()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2259,7 +2264,7 @@ mod tests {
             assert_building_without_baseline(&store_path)?;
             if crash_point == "after_construction_manifest"
                 && !store_path
-                    .join(CANONICAL_CONSTRUCTION_MANIFEST_FILE_NAME)
+                    .join(crate::canonical_store::construction_manifest::CANONICAL_CONSTRUCTION_MANIFEST_FILE_NAME)
                     .is_file()
             {
                 return Err("sidecar must be durable before the READY transition".into());
@@ -3028,6 +3033,7 @@ mod tests {
         Ok(store)
     }
 
+    #[cfg(unix)]
     fn assert_building_without_baseline(
         store_path: &Path,
     ) -> Result<(), Box<dyn std::error::Error>> {
