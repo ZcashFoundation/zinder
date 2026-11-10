@@ -728,7 +728,7 @@ These numbers are not asserted by the test; treat the printed values as
 operator-facing telemetry. Compare across changes to spot regressions in
 the read path. The baseline does not exercise `transaction()` — that path
 goes through `mempool_broadcast_cycle` (broadcast then look up the mined
-txid) and `deep_chain` (high-volume bulk catchup).
+txid) and `deep_chain` (high-volume canonical construction).
 
 ### Heavy probes (trust-sensitive code only)
 

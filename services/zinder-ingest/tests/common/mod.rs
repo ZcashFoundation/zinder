@@ -28,19 +28,26 @@ use zinder_core::{
     BlockHeight, BlockHeightRange, Network, RawTransactionBytes, ShieldedProtocol,
     SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome,
 };
+use zinder_core::{BlockId, UnixTimestampMillis};
 use zinder_ingest::{
     BulkCatchupRunConfig, CanonicalPipelineLimits, DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS,
     NodeSourceKind, TipFollowConfig,
 };
+use zinder_ingest::{CanonicalConstructionConfig, load_fresh_canonical};
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
 use zinder_query::{
     WalletEndpointMetadata, WalletQuery, WalletQueryApi, WalletQueryGrpcAdapter,
     latest_tree_state_checkpoint_response, subtree_roots_response, tree_state_at_response,
     visible_tip_block_response,
 };
+use zinder_query::{WalletServingPairSlot, WalletServingReadPair};
 use zinder_source::{NodeSource, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
-use zinder_store::PrimaryChainStore;
-use zinder_testkit::live::LiveTestEnv;
+use zinder_store::{
+    CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan,
+    CanonicalStoreWorkload, PrimaryChainStore, RawBlobRetention, RocksDbCanonicalBuilder,
+    RocksDbResourceBudget,
+};
+use zinder_testkit::{WalletServingStoreFixture, live::LiveTestEnv};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SubtreeRootStartIndices {
@@ -335,6 +342,103 @@ pub(crate) fn zebra_source_for_live_env(env: &LiveTestEnv) -> Result<ZebraJsonRp
             broadcast_timeout: None,
         },
     )?)
+}
+
+/// Reorg window for canonical stores built from a live node in tests.
+const LIVE_CANONICAL_REORG_WINDOW_BLOCKS: u32 = 100;
+
+/// Production serving pair built from a live node, with the probed source
+/// that built it.
+pub(crate) struct LiveServingPair {
+    /// Exact admitted canonical and wallet secondaries.
+    pub(crate) slot: WalletServingPairSlot,
+    /// Probed node source for node-backed query methods.
+    pub(crate) source: ZebraJsonRpcSource,
+    /// Owner of the store directories; dropping it removes them.
+    pub(crate) store_fixture: WalletServingStoreFixture,
+}
+
+/// Builds a READY production canonical store holding the live chain from
+/// genesis through `build_tip_height`, projects its wallet store, and admits
+/// one serving pair.
+///
+/// Construction runs the same fresh-load and baseline publication path the
+/// canonical writer uses, retaining transaction bytes and settling the build
+/// tip. History is genesis-complete because the wallet projection must
+/// resolve every transparent input's predecessor output; a checkpoint-bounded
+/// window fails that check as soon as it spends an older output.
+pub(crate) async fn live_serving_pair(
+    env: &LiveTestEnv,
+    activations: &Arc<NetworkUpgradeActivations>,
+    build_tip_height: BlockHeight,
+) -> Result<LiveServingPair> {
+    let source = zebra_source_for_live_env(env)?;
+    source.probe_capabilities().await?;
+    let build_tip_block = source.fetch_block_at(build_tip_height).await?;
+    let build_tip = BlockId::new(build_tip_block.height, build_tip_block.hash);
+    let reorg_policy = CanonicalReorgPolicy::new(LIVE_CANONICAL_REORG_WINDOW_BLOCKS)?;
+    let genesis_block = source.fetch_block_at(BlockHeight::new(0)).await?;
+    let build_plan = CanonicalStoreBuildPlan::complete(
+        activations,
+        genesis_block.block_time_seconds,
+        build_tip,
+        RawBlobRetention::Transactions,
+        reorg_policy,
+    )?;
+    let temporary_directory = tempfile::tempdir()?;
+    let canonical_primary_path = temporary_directory.path().join("canonical-primary");
+    let builder = RocksDbCanonicalBuilder::create_fresh(
+        &canonical_primary_path,
+        CanonicalStoreWorkload::Wallet,
+        build_plan,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    let construction = CanonicalConstructionConfig::for_local_tests(
+        env.target.request_timeout,
+        Arc::clone(activations),
+    );
+    let loaded = load_fresh_canonical(builder, &source, &construction).await?;
+    let validated = loaded.builder.prepare_cold_certified_publication()?;
+    let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
+        build_tip,
+        UnixTimestampMillis::now(),
+    ))?;
+    let canonical_primary = validated.publish_baseline(publication)?;
+    let mut store_fixture = WalletServingStoreFixture::from_published_canonical(
+        temporary_directory,
+        &canonical_primary_path,
+        canonical_primary,
+        activations,
+    )?;
+    let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
+    let slot = WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
+        Arc::new(canonical_reader),
+        Arc::new(wallet_reader),
+    )?));
+    Ok(LiveServingPair {
+        slot,
+        source,
+        store_fixture,
+    })
+}
+
+/// Returns the coinbase transaction id at `height`.
+///
+/// The coinbase is the block's first transaction, and its compact form always
+/// carries the coinbase's outputs, so the compact block's first entry at
+/// index 0 identifies it without a block-index transaction lookup.
+pub(crate) async fn coinbase_transaction_id(
+    query: &impl WalletQueryApi,
+    height: BlockHeight,
+) -> Result<zinder_core::TransactionId> {
+    let block = query.compact_block_at(height, None).await?;
+    block
+        .compact_block
+        .transactions()
+        .first()
+        .filter(|transaction| transaction.index == 0)
+        .map(|transaction| transaction.transaction_id)
+        .ok_or_else(|| eyre!("compact block at height {} has no coinbase", height.value()))
 }
 
 /// Calls Zebra's `getblockhash` JSON-RPC and returns the canonical block
