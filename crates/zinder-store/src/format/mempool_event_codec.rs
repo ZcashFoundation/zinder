@@ -39,7 +39,7 @@ pub(crate) fn decode_mempool_event_envelope(
             reason: "mempool event envelope record is not valid protobuf",
         }
     })?;
-    let event_record = record.event.ok_or(StoreError::ArtifactCorrupt {
+    let event_record = record.event.ok_or_else(|| StoreError::ArtifactCorrupt {
         family: ArtifactFamily::MempoolEvent,
         key: key.clone().into(),
         reason: "mempool event envelope is missing event",
@@ -128,13 +128,15 @@ fn decode_mempool_event_record(
     key: &StoreKey,
     record: MempoolEventRecord,
 ) -> Result<MempoolEvent, StoreError> {
-    match MempoolEventKind::from_kind(record.event_kind).ok_or(StoreError::ArtifactCorrupt {
-        family: ArtifactFamily::MempoolEvent,
-        key: key.clone().into(),
-        reason: "mempool event kind is unknown",
+    match MempoolEventKind::from_kind(record.event_kind).ok_or_else(|| {
+        StoreError::ArtifactCorrupt {
+            family: ArtifactFamily::MempoolEvent,
+            key: key.clone().into(),
+            reason: "mempool event kind is unknown",
+        }
     })? {
         MempoolEventKind::Added => {
-            let entry_record = record.added.ok_or(StoreError::ArtifactCorrupt {
+            let entry_record = record.added.ok_or_else(|| StoreError::ArtifactCorrupt {
                 family: ArtifactFamily::MempoolEvent,
                 key: key.clone().into(),
                 reason: "added mempool event is missing entry",
@@ -143,19 +145,21 @@ fn decode_mempool_event_record(
             Ok(MempoolEvent::Added { entry })
         }
         MempoolEventKind::Invalidated => {
-            let invalidated = record.invalidated.ok_or(StoreError::ArtifactCorrupt {
-                family: ArtifactFamily::MempoolEvent,
-                key: key.clone().into(),
-                reason: "invalidated mempool event is missing payload",
-            })?;
+            let invalidated = record
+                .invalidated
+                .ok_or_else(|| StoreError::ArtifactCorrupt {
+                    family: ArtifactFamily::MempoolEvent,
+                    key: key.clone().into(),
+                    reason: "invalidated mempool event is missing payload",
+                })?;
             Ok(MempoolEvent::Invalidated {
                 transaction_id: decode_transaction_id_for_family(
                     ArtifactFamily::MempoolEvent,
                     key,
                     &invalidated.transaction_id,
                 )?,
-                reason: mempool_eviction_reason_from_id(invalidated.reason_id).ok_or(
-                    StoreError::ArtifactCorrupt {
+                reason: mempool_eviction_reason_from_id(invalidated.reason_id).ok_or_else(
+                    || StoreError::ArtifactCorrupt {
                         family: ArtifactFamily::MempoolEvent,
                         key: key.clone().into(),
                         reason: "mempool eviction reason id is unknown",
@@ -164,7 +168,7 @@ fn decode_mempool_event_record(
             })
         }
         MempoolEventKind::Mined => {
-            let mined = record.mined.ok_or(StoreError::ArtifactCorrupt {
+            let mined = record.mined.ok_or_else(|| StoreError::ArtifactCorrupt {
                 family: ArtifactFamily::MempoolEvent,
                 key: key.clone().into(),
                 reason: "mined mempool event is missing payload",
@@ -205,13 +209,14 @@ fn decode_mempool_entry_record(
     key: &StoreKey,
     record: MempoolEntryRecord,
 ) -> Result<MempoolEntry, StoreError> {
-    let chain_epoch_record = record
-        .first_seen_chain_epoch
-        .ok_or(StoreError::ArtifactCorrupt {
-            family: ArtifactFamily::MempoolEvent,
-            key: key.clone().into(),
-            reason: "mempool entry record is missing first-seen chain epoch",
-        })?;
+    let chain_epoch_record =
+        record
+            .first_seen_chain_epoch
+            .ok_or_else(|| StoreError::ArtifactCorrupt {
+                family: ArtifactFamily::MempoolEvent,
+                key: key.clone().into(),
+                reason: "mempool entry record is missing first-seen chain epoch",
+            })?;
     let auth_digest = if record.auth_digest.is_empty() {
         None
     } else {
@@ -236,7 +241,7 @@ fn decode_mempool_entry_record(
         key,
         record
             .compact_transaction_data
-            .ok_or(StoreError::ArtifactCorrupt {
+            .ok_or_else(|| StoreError::ArtifactCorrupt {
                 family: ArtifactFamily::MempoolEvent,
                 key: key.clone().into(),
                 reason: "mempool entry record is missing compact transaction data",
@@ -497,11 +502,12 @@ pub(super) fn decode_chain_epoch_record(
     key: &StoreKey,
     record: &ChainEpochRecord,
 ) -> Result<ChainEpoch, StoreError> {
-    let network = Network::from_id(record.network_id).ok_or(StoreError::ArtifactCorrupt {
-        family,
-        key: key.clone().into(),
-        reason: "chain epoch record has an unknown network id",
-    })?;
+    let network =
+        Network::from_id(record.network_id).ok_or_else(|| StoreError::ArtifactCorrupt {
+            family,
+            key: key.clone().into(),
+            reason: "chain epoch record has an unknown network id",
+        })?;
 
     Ok(ChainEpoch {
         id: ChainEpochId::new(record.chain_epoch),

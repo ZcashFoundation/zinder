@@ -79,4 +79,4 @@ pub use proto_codec::{
 };
 pub use raw_blob_retention::RawBlobRetention;
 pub use rocksdb_resource_budget::{RocksDbResourceBudget, RocksDbStatisticsLevel};
-pub use store_error::{ArtifactFamily, StorageErrorKind, StorageKey, StoreError};
+pub use store_error::{ArtifactFamily, StorageKey, StoreError};

@@ -1080,7 +1080,7 @@ mod error_reason_tests {
             QueryError::BlockingTaskFailed {
                 reason: "probe".to_owned(),
             },
-            QueryError::Store(StoreError::NoVisibleChainEpoch),
+            QueryError::Store(StoreError::InvalidChainEpochArtifacts { reason: "probe" }),
             QueryError::MaterializedViewStore(
                 zinder_materialized_views::MaterializedViewStoreError::InvalidOptions {
                     reason: "probe",
