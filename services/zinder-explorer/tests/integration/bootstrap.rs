@@ -47,7 +47,10 @@ use zinder_proto::v1::explorer::{
 };
 use zinder_proto::v1::wallet::{AddressLookup, address_lookup::Selector as AddressSelector};
 use zinder_proto::wire::{TRANSPARENT_DELTA_KIND_RECEIVED_BYTE, TRANSPARENT_DELTA_KIND_SPENT_BYTE};
-use zinder_query::{WalletEndpointMetadata, WalletQuery, WalletQueryGrpcAdapter};
+use zinder_query::{
+    AdmittedIngestControl, WalletEndpointMetadata, WalletQuery, WalletQueryGrpcAdapter,
+    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+};
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceError,
     UPSTREAM_HEALTH_SOURCE_ZEBRA_READY_ENDPOINT, UpstreamHealthSnapshot,
@@ -56,8 +59,9 @@ use zinder_store::{
     ChainEpochArtifacts, ChainStoreOptions, ReorgWindowChange, SecondaryChainStore,
 };
 use zinder_testkit::{
-    ChainFixture, FixtureTransactionRows, StoreFixture, encode_fixture_block_replay,
-    sample_regtest_upgrade_activations, synthetic_transaction_public_facts,
+    ChainFixture, FixtureTransactionRows, IngestControlFixture, StoreFixture,
+    WalletServingStoreFixture, encode_fixture_block_replay, sample_regtest_upgrade_activations,
+    synthetic_transaction_public_facts,
 };
 
 type ServerHandle = tokio::task::JoinHandle<Result<(), tonic::transport::Error>>;
@@ -291,7 +295,7 @@ async fn explorer_query_serves_block_production_series_with_explicit_coverage() 
     );
     let chain_fixture = base_fixture.with_transaction_rows(coinbase_rows);
     let (store_fixture, wallet_addr, wallet_handle) =
-        spawn_wallet_query_server(&chain_fixture).await?;
+        spawn_legacy_wallet_query_server(&chain_fixture).await?;
     let canonical_store = SecondaryChainStore::open(
         store_fixture.tempdir_path(),
         store_fixture
@@ -495,7 +499,7 @@ async fn transaction_detail_batches_spent_output_lookup_beyond_wallet_request_li
 {
     let (chain_fixture, transaction_ids) = many_output_spend_chain_fixture()?;
     let (wallet_store_fixture, wallet_addr, wallet_handle) =
-        spawn_wallet_query_server(&chain_fixture).await?;
+        spawn_legacy_wallet_query_server(&chain_fixture).await?;
     let canonical_store = SecondaryChainStore::open(
         wallet_store_fixture.tempdir_path(),
         wallet_store_fixture
@@ -717,7 +721,7 @@ async fn block_transactions_test_fixture() -> Result<BlockTransactionsTestFixtur
     let (chain_fixture, transaction_id_strings, missing_transaction_id) =
         block_transactions_chain_fixture()?;
     let (_wallet_store_fixture, wallet_addr, wallet_handle) =
-        spawn_wallet_query_server(&chain_fixture).await?;
+        spawn_legacy_wallet_query_server(&chain_fixture).await?;
     let (canonical_store_fixture, canonical_store) =
         canonical_store_without_transaction_facts(&chain_fixture, missing_transaction_id)?;
     let seeded_materialized_view_store =
@@ -1094,7 +1098,7 @@ async fn explorer_query_serves_overview_snapshot_with_seeded_materialized_view_s
         first.tip_block_time_unix_seconds,
         first.recent_blocks[0].block_time_unix_seconds
     );
-    assert_overview_wallet_fields_unavailable(&first)?;
+    assert_overview_wallet_fields_from_production_endpoint(&first)?;
 
     // Coherence guarantee: a second call against the same upstream tip
     // returns the same snapshot identity (tip_hash). The bundle never
@@ -1447,7 +1451,60 @@ impl NodeSource for StubUpstreamSource {
     }
 }
 
+/// Production wallet endpoint the explorer federates to, and the fixtures
+/// that must outlive it.
+struct WalletEndpointFixture {
+    _store_fixture: WalletServingStoreFixture,
+    _ingest_control_fixture: IngestControlFixture,
+}
+
+/// Serves the native `WalletQuery` endpoint over the production canonical and
+/// wallet secondaries built from `chain_fixture`.
 async fn spawn_wallet_query_server(
+    chain_fixture: &ChainFixture,
+) -> Result<(WalletEndpointFixture, SocketAddr, ServerHandle)> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let mut store_fixture = WalletServingStoreFixture::from_chain(chain_fixture, &activations)?;
+    let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
+    let ingest_control_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+    let ingest_control = AdmittedIngestControl::connect(
+        ingest_control_fixture.endpoint(),
+        None,
+        Network::ZcashRegtest,
+    )
+    .await?;
+    let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
+        WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
+            Arc::new(canonical_reader),
+            Arc::new(wallet_reader),
+        )?)),
+        (),
+        ingest_control,
+        activations,
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
+    let handle = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(adapter.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+    });
+    let _channel = await_with_retry(addr).await?;
+    Ok((
+        WalletEndpointFixture {
+            _store_fixture: store_fixture,
+            _ingest_control_fixture: ingest_control_fixture,
+        },
+        addr,
+        handle,
+    ))
+}
+
+/// Serves `WalletQuery` over the legacy chain store, for the tests that also
+/// open that store as the explorer's canonical binding.
+async fn spawn_legacy_wallet_query_server(
     chain_fixture: &ChainFixture,
 ) -> Result<(StoreFixture, SocketAddr, ServerHandle)> {
     let store_fixture = StoreFixture::with_chain_committed(chain_fixture, ChainEpochId::new(1))?;
@@ -1652,29 +1709,35 @@ fn assert_advertises_capability(capabilities: &[String], capability: &str) {
     );
 }
 
-fn assert_overview_wallet_fields_unavailable(response: &OverviewSnapshotResponse) -> Result<()> {
-    assert!(response.mempool.is_none());
+/// The production wallet endpoint serves an empty mempool snapshot through
+/// its admitted ingest control but does not serve chain value pools, so only
+/// the value pools are reported unavailable.
+fn assert_overview_wallet_fields_from_production_endpoint(
+    response: &OverviewSnapshotResponse,
+) -> Result<()> {
+    assert!(
+        response.mempool.is_some(),
+        "the production wallet endpoint serves a mempool snapshot"
+    );
     assert!(response.value_pools.is_empty());
     let freshness = response
         .freshness
         .as_ref()
         .ok_or_else(|| eyre!("overview response missing freshness"))?;
-    assert_eq!(freshness.unavailable.len(), 2);
-    for field_path in ["mempool", "value_pools"] {
-        let unavailable_field = freshness
-            .unavailable
-            .iter()
-            .find(|unavailable| unavailable.field_path == field_path)
-            .ok_or_else(|| eyre!("overview freshness missing unavailable field {field_path}"))?;
-        assert_eq!(
-            unavailable_field.reason,
-            UnavailableReason::UnavailableUpstreamNotSupported as i32
-        );
-        assert_eq!(
-            unavailable_field.human_reason,
-            WALLET_QUERY_CAPABILITY_NOT_SUPPORTED
-        );
-    }
+    assert_eq!(freshness.unavailable.len(), 1);
+    let unavailable_field = freshness
+        .unavailable
+        .iter()
+        .find(|unavailable| unavailable.field_path == "value_pools")
+        .ok_or_else(|| eyre!("overview freshness missing unavailable field value_pools"))?;
+    assert_eq!(
+        unavailable_field.reason,
+        UnavailableReason::UnavailableUpstreamNotSupported as i32
+    );
+    assert_eq!(
+        unavailable_field.human_reason,
+        WALLET_QUERY_CAPABILITY_NOT_SUPPORTED
+    );
     Ok(())
 }
 
