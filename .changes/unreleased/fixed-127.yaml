@@ -1,0 +1,6 @@
+kind: fixed
+body: The wallet-serving image builds from a clean checkout again. `.dockerignore` excluded `deploy/wallet-serving-healthcheck`, which `deploy/Dockerfile.wallet-serving` copies, so builds such as Railway deploys of the wallet-serving service failed before any container started.
+time: 2026-11-11T21:30:00Z
+custom:
+  Bump: patch
+  PR: "127"
