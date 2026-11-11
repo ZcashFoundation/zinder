@@ -50,7 +50,7 @@ for dockerfile in deploy/Dockerfile deploy/Dockerfile.*; do
     if docker build --quiet --file "$probe" . > /dev/null; then
         echo "ok: ${dockerfile} (${#sources[@]} context sources)"
     else
-        echo "error: ${dockerfile} copies a path that .dockerignore excludes" >&2
+        echo "error: ${dockerfile} copies a path that is missing or excluded by .dockerignore" >&2
         status=1
     fi
 done
