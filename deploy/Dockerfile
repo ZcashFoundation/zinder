@@ -8,6 +8,8 @@
 #     docker build -f deploy/Dockerfile --target zinder-projector -t zinder-projector .
 #     docker build -f deploy/Dockerfile --target zinder-query -t zinder-query .
 #     docker build -f deploy/Dockerfile --target zinder-compat-lightwalletd -t zinder-compat-lightwalletd .
+#     docker build -f deploy/Dockerfile --target zinder-canonical-runtime -t zinder-canonical-runtime .
+#     docker build -f deploy/Dockerfile --target zinder-wallet-serving -t zinder-wallet-serving .
 #     docker build -f deploy/Dockerfile --target zinder-explorer -t zinder-explorer .
 #     docker build -f deploy/Dockerfile --target zinder-bench -t zinder-bench .
 #     docker build -f deploy/Dockerfile --target zinder-ingest-live-tests -t zinder-ingest-live-tests .
@@ -185,6 +187,61 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -fsS http://localhost:9107/readyz || exit 1
 
 ENTRYPOINT ["zinder-compat-lightwalletd"]
+
+# Single-volume host images. Platforms that attach one volume to one container
+# mount it root-owned, so these targets start as root and their entrypoints
+# drop every runtime process to zinder.
+
+# Ingest-only diagnostic or canary runtime. It projects no wallet state and
+# serves no client protocol.
+FROM zinder-ingest AS zinder-canonical-runtime
+
+COPY --chmod=0755 deploy/canonical-runtime-entrypoint \
+    /usr/local/bin/zinder-canonical-runtime-entrypoint
+
+ENV ZINDER_OPS__LISTEN_ADDR=[::]:9105
+ENV ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true
+
+USER root:root
+
+ENTRYPOINT ["zinder-canonical-runtime-entrypoint"]
+
+# Native WalletQuery runtime: the canonical writer, the wallet writer, and the
+# query reader run as three supervised processes against the one volume
+# mounted at /var/lib/zinder, because the readers open secondaries over paths
+# the writers own. It does not serve the lightwalletd compatibility protocol.
+# Hosts with shared volumes across containers use deploy/docker-compose.yml.
+FROM zinder-runtime-base AS zinder-wallet-serving
+
+COPY --from=zinder-binaries /zinder-binaries/zinder-ingest /usr/local/bin/zinder-ingest
+COPY --from=zinder-binaries /zinder-binaries/zinder-projector /usr/local/bin/zinder-projector
+COPY --from=zinder-binaries /zinder-binaries/zinder-query /usr/local/bin/zinder-query
+
+COPY deploy/config/wallet-serving/ingest.toml /etc/zinder/ingest.toml
+COPY deploy/config/wallet-serving/projector.toml /etc/zinder/projector.toml
+COPY deploy/config/wallet-serving/query.toml /etc/zinder/query.toml
+
+COPY --chmod=0755 deploy/wallet-serving-runtime-entrypoint \
+    /usr/local/bin/zinder-wallet-serving-runtime-entrypoint
+COPY --chmod=0755 deploy/wallet-serving-healthcheck \
+    /usr/local/bin/zinder-wallet-serving-healthcheck
+
+# Platform volume mounts replace the ownership baked into the image, and the
+# nofile limit is raised before any store opens. Start as root; the entrypoint
+# drops every runtime process to zinder.
+USER root:root
+WORKDIR /var/lib/zinder
+
+EXPOSE 9102 9106
+
+# The start period covers the entrypoint's canonical, wallet, and serving
+# construction deadlines, which together run to five and a half hours. A parked
+# canonical writer counts as healthy: query then refuses wallets with the typed
+# REORG_WINDOW_EXCEEDED halt, and the entrypoint keeps that refusal up.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=6h --retries=3 \
+    CMD ["zinder-wallet-serving-healthcheck"]
+
+ENTRYPOINT ["zinder-wallet-serving-runtime-entrypoint"]
 
 FROM zinder-runtime-base AS zinder-explorer
 

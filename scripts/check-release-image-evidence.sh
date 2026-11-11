@@ -44,15 +44,28 @@ digest_pattern='^sha256:[0-9a-f]{64}$'
 [[ "$root_digest" =~ $digest_pattern && "$amd64_digest" =~ $digest_pattern && "$arm64_digest" =~ $digest_pattern ]] || usage
 service_name="${image##*/}"
 repository_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
-release_package_dependencies='[]'
-if [[ "$service_name" == "zinder-compat-lightwalletd" ]]; then
-  grep -Fqx 'zinder-query.workspace = true' \
-    "$repository_root/services/zinder-compat-lightwalletd/Cargo.toml" || {
-      echo >&2 "compatibility image evidence requires the declared zinder-query dependency"
-      exit 1
-    }
-  release_package_dependencies='["zinder-query"]'
-fi
+# The runtime packages an image must report, and the only ones it may report.
+# A single-volume host image is named for its topology, not for a binary, so
+# its set is the executables deploy/Dockerfile copies into that target.
+case "$service_name" in
+  zinder-compat-lightwalletd)
+    grep -Fqx 'zinder-query.workspace = true' \
+      "$repository_root/services/zinder-compat-lightwalletd/Cargo.toml" || {
+        echo >&2 "compatibility image evidence requires the declared zinder-query dependency"
+        exit 1
+      }
+    image_runtime_packages='["zinder-compat-lightwalletd", "zinder-query"]'
+    ;;
+  zinder-canonical-runtime)
+    image_runtime_packages='["zinder-ingest"]'
+    ;;
+  zinder-wallet-serving)
+    image_runtime_packages='["zinder-ingest", "zinder-projector", "zinder-query"]'
+    ;;
+  *)
+    image_runtime_packages="$(jq -c -n --arg service "$service_name" '[$service]')"
+    ;;
+esac
 rocksdb_version="$(awk '
   $0 == "name = \"rust-librocksdb-sys\"" { found = 1; next }
   found && /^version = / { gsub(/^version = "|"$/, ""); print; exit }
@@ -94,9 +107,8 @@ check_child_sbom() {
     --arg commit "$commit" \
     --arg architecture "$architecture" \
     --arg digest "$digest" \
-    --arg service "$service_name" \
     --arg rocksdb_version "$rocksdb_version" \
-    --argjson release_package_dependencies "$release_package_dependencies" '
+    --argjson image_runtime_packages "$image_runtime_packages" '
       . as $document
       | .spdxVersion == "SPDX-2.3"
       and any(.packages[]?;
@@ -109,20 +121,13 @@ check_child_sbom() {
       and any(.. | strings; . == $commit)
       and any(.. | strings; . == $tag)
       and any(.. | strings; . == $architecture)
-      and any(.packages[]?;
-        .name == $service
-        and any(.externalRefs[]?;
-          .referenceType == "purl"
-          and (.referenceLocator | startswith("pkg:cargo/" + $service + "@"))
-        )
-      )
-      and all($release_package_dependencies[];
-        . as $dependency
+      and all($image_runtime_packages[];
+        . as $runtime_package
         | any($document.packages[]?;
-          .name == $dependency
+          .name == $runtime_package
           and any(.externalRefs[]?;
             .referenceType == "purl"
-            and (.referenceLocator | startswith("pkg:cargo/" + $dependency + "@"))
+            and (.referenceLocator | startswith("pkg:cargo/" + $runtime_package + "@"))
           )
         )
       )
@@ -145,7 +150,7 @@ check_child_sbom() {
         (.name as $name
           | (
             ["zinder-ingest", "zinder-projector", "zinder-query", "zinder-compat-lightwalletd"]
-            - ([$service] + $release_package_dependencies)
+            - $image_runtime_packages
           )
           | index($name)) == null
       )

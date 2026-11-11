@@ -20,6 +20,7 @@ concurrency:
 env:
   BUF_VERSION: "1.68.2"
   RELEASE_IMAGES_FILE: deploy/release-images.json
+  RELEASE_SINGLE_VOLUME_IMAGES_FILE: deploy/release-single-volume-images.json
 
 jobs:
   validate:
@@ -118,7 +119,7 @@ jobs:
 
       - name: Resolve release images
         id: images
-        run: printf 'release_images=%s\n' "$(jq -c '.' "$RELEASE_IMAGES_FILE")" >> "$GITHUB_OUTPUT"
+        run: printf 'release_images=%s\n' "$(jq -c -s 'add' "$RELEASE_IMAGES_FILE" "$RELEASE_SINGLE_VOLUME_IMAGES_FILE")" >> "$GITHUB_OUTPUT"
 
   authorize-release:
     name: authorize release publication

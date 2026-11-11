@@ -1,7 +1,8 @@
 # Releasing Zinder
 
 Zinder releases one lockstep product version across every first-party crate and
-service. A tagged release publishes 4 multi-architecture runtime images, the
+service. A tagged release publishes 4 multi-architecture runtime images, 2
+multi-architecture single-volume host images, the
 native protocol source and descriptor, generated OpenAPI documents, and one
 GitHub Release. It also publishes deterministic GNU/Linux binary bundles for
 x86-64-v3 and AArch64 and the Rust SDK formed by `zinder-core`, `zinder-proto`,
@@ -9,9 +10,13 @@ and `zinder-client` to crates.io in dependency order. The optional explorer and
 Cipherscan services, benchmark executable, code-generation tools, and internal
 Rust crates are not release artifacts.
 
-`deploy/release-images.json` is the authoritative published image set. The PR
-smoke build and tagged release both consume the exact catalog value validated
-by their admission job.
+`deploy/release-images.json` is the authoritative runtime image and binary
+set. `deploy/release-single-volume-images.json` lists the two single-volume
+host images, `zinder-canonical-runtime` and `zinder-wallet-serving`, which
+package those runtime binaries with an entrypoint and are published as images
+only. Every image is a target of `deploy/Dockerfile`. The PR smoke build and
+tagged release both consume the exact catalog values validated by their
+admission job.
 
 ## Release identity
 
@@ -142,7 +147,7 @@ After approval, the workflow performs these operations in order:
    source provenance.
 4. Compile a fresh registry-only consumer against the exact published
    `zinder-client` version after sparse-index propagation.
-5. Build the 4 runtime images natively for Linux amd64 and arm64 with BuildKit
+5. Build the 4 runtime images and 2 single-volume host images natively for Linux amd64 and arm64 with BuildKit
    max-mode provenance and SBOMs.
 6. Publish exact `vX.Y.Z` and `sha-<commit>` manifests, attest each child SBOM
    and the root provenance, sign only the root digest, and verify the exact
@@ -151,7 +156,7 @@ After approval, the workflow performs these operations in order:
    keyless-sign that checksum file into `SHA256SUMS.sigstore.json`.
 8. Publish the draft GitHub Release, then verify its immutable release
    attestation and every asset.
-9. For a stable release, promote the 4 `latest` tags only after immutable
+9. For a stable release, promote the 6 `latest` tags only after immutable
    release verification succeeds.
 
 Stable and prerelease tags publish the same three-crate SDK catalog.
@@ -261,7 +266,9 @@ for image in \
   zinder-ingest \
   zinder-projector \
   zinder-query \
-  zinder-compat-lightwalletd
+  zinder-compat-lightwalletd \
+  zinder-canonical-runtime \
+  zinder-wallet-serving
 do
   docker buildx imagetools inspect \
     "ghcr.io/gustavovalverde/${image}:v0.5.0"
@@ -329,14 +336,17 @@ publication path from the new tag.
 
 Image SBOM evidence may contain another runtime-named Rust package only when
 the owning service declares it as a production dependency. In particular,
-`zinder-compat-lightwalletd` includes and must report `zinder-query`; all other
-sibling runtime packages remain rejected. If image evidence fails, regenerate
+`zinder-compat-lightwalletd` includes and must report `zinder-query`. A
+single-volume host image must report exactly the executables its target
+copies: `zinder-canonical-runtime` reports `zinder-ingest`, and
+`zinder-wallet-serving` reports `zinder-ingest`, `zinder-projector`, and
+`zinder-query`. All other sibling runtime packages remain rejected. If image evidence fails, regenerate
 the SBOM from the exact child digest and compare its runtime-named packages
 with the owning service manifest before changing the policy. Do not remove a
 declared dependency from the evidence or broaden the allowed package set.
 
 If only the final stable promotion fails, rerun the failed
-`promote stable image tags` job. It verifies all 4 exact manifests before moving
+`promote stable image tags` job. It verifies all 6 exact manifests before moving
 any `latest` tag. Do not move a release tag or rebuild it from another commit.
 
 Application rollback remains constrained by storage compatibility. Follow the

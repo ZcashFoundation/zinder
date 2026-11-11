@@ -13,11 +13,13 @@ on:
       - "crates/**"
       - "services/**"
       - "deploy/Dockerfile"
-      - "deploy/Dockerfile.railway-nocache"
-      - "deploy/Dockerfile.wallet-serving"
       - "deploy/docker-compose.yml"
       - "deploy/release-images.json"
-      - "railway.toml"
+      - "deploy/release-single-volume-images.json"
+      - "deploy/canonical-runtime-entrypoint"
+      - "deploy/wallet-serving-runtime-entrypoint"
+      - "deploy/wallet-serving-healthcheck"
+      - "deploy/config/wallet-serving/**"
       - "scripts/validate-deployment-admission.sh"
       - "scripts/test-deployment-admission.sh"
       - "buf.yaml"
@@ -98,3 +100,25 @@ jobs:
               --format 'image={{.Id}} size_bytes={{.Size}}'
             docker run --rm --entrypoint="$image_name" "${image_name}:${PR_TAG}" --help
           done <<< "$image_names"
+
+          # Single-volume host images wrap the runtime binaries in an
+          # entrypoint script, so the smoke runs the ingest binary they carry
+          # and confirms the configured entrypoint is installed.
+          single_volume_image_names="$(jq -r '.[]' deploy/release-single-volume-images.json)"
+          while IFS= read -r image_name; do
+            docker buildx build \
+              --file deploy/Dockerfile \
+              --target "$image_name" \
+              --platform "$PLATFORM_REF" \
+              --build-arg "ZINDER_BUILD_GIT_COMMIT=${SMOKE_BUILD_GIT_COMMIT}" \
+              --load \
+              --tag "${image_name}:${PR_TAG}" \
+              --cache-from "type=gha,scope=${CACHE_SCOPE}" \
+              .
+
+            docker image inspect "${image_name}:${PR_TAG}" \
+              --format 'image={{.Id}} size_bytes={{.Size}}'
+            docker run --rm --entrypoint=zinder-ingest "${image_name}:${PR_TAG}" --help
+            image_entrypoint="$(docker image inspect "${image_name}:${PR_TAG}" --format '{{index .Config.Entrypoint 0}}')"
+            docker run --rm --entrypoint=sh "${image_name}:${PR_TAG}" -c 'test -x "$(command -v "$1")"' sh "$image_entrypoint"
+          done <<< "$single_volume_image_names"

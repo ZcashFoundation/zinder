@@ -8,27 +8,43 @@ Use [Deploying on a VM](deploying-on-a-vm.md) for the complete topology, or
 [Wallet-serving deployment (single-volume hosts)](deploying-wallet-serving.md)
 for the native `WalletQuery` service.
 
-## Target admission
+## Image
 
-The Railway build requires:
+Create the Railway service from a Docker image source and name a released
+image by its exact tag:
 
 ```text
-RAILWAY_DOCKER_TARGET_STAGE=zinder-canonical-runtime
+ghcr.io/zcashfoundation/zinder-canonical-runtime:vX.Y.Z
 ```
 
-Verify the repository guard before deploying:
+The package is public, so the service needs no registry credentials. Railway
+pulls the image; it does not build Zinder. To deploy another release, change
+the tag on the service.
+
+The image is the `zinder-canonical-runtime` target of `deploy/Dockerfile`. It
+is admitted only as a canary or diagnostic deployment:
 
 ```bash
 bash scripts/validate-deployment-admission.sh \
   --deployment-class canary \
   --target zinder-canonical-runtime
-bash scripts/validate-deployment-admission.sh --verify-railway-default
 ```
 
-The target starts `zinder-ingest` through
+The image starts `zinder-ingest` through
 `deploy/canonical-runtime-entrypoint`, drops privileges to the `zinder` user,
 and exposes the operational endpoint. It does not run projector, compatibility,
 native query, explorer, or coherent restore services.
+
+Railway cannot build this image from the repository. It builds the last stage
+of a Dockerfile and has no target selection, and the last stage of
+`deploy/Dockerfile` is a different target. To run an unreleased commit, build
+the target yourself, push it to a registry the service can read, and point the
+service at that image:
+
+```bash
+docker build -f deploy/Dockerfile --target zinder-canonical-runtime \
+    -t <registry>/zinder-canonical-runtime:<commit> .
+```
 
 ## Configuration
 

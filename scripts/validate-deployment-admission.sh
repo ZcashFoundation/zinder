@@ -5,11 +5,9 @@ usage() {
   cat >&2 <<'EOF'
 Usage:
   validate-deployment-admission.sh --deployment-class CLASS --target TARGET
-  validate-deployment-admission.sh --deployment-class CLASS --railway-default
-  validate-deployment-admission.sh --release-workflow PATH [--release-images-catalog PATH]
-  validate-deployment-admission.sh --build-images-workflow PATH [--release-images-catalog PATH]
+  validate-deployment-admission.sh --release-workflow PATH [--release-images-catalog PATH] [--single-volume-images-catalog PATH]
+  validate-deployment-admission.sh --build-images-workflow PATH [--release-images-catalog PATH] [--single-volume-images-catalog PATH]
   validate-deployment-admission.sh --prometheus-config PATH
-  validate-deployment-admission.sh --verify-railway-default
   validate-deployment-admission.sh --compose-contract RESOLVED_COMPOSE_JSON
 
 CLASS is one of production, canary, or diagnostic.
@@ -20,13 +18,12 @@ EOF
 repository_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 deployment_class=""
 target=""
-railway_default=false
 release_workflow=""
 build_images_workflow=""
 release_images_catalog="$repository_root/deploy/release-images.json"
+single_volume_images_catalog="$repository_root/deploy/release-single-volume-images.json"
 release_images_catalog_explicit=false
 prometheus_config=""
-verify_railway_default=false
 compose_contract=""
 
 while [[ $# -gt 0 ]]; do
@@ -40,10 +37,6 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || usage
       target="$2"
       shift 2
-      ;;
-    --railway-default)
-      railway_default=true
-      shift
       ;;
     --release-workflow)
       [[ $# -ge 2 ]] || usage
@@ -61,14 +54,16 @@ while [[ $# -gt 0 ]]; do
       release_images_catalog_explicit=true
       shift 2
       ;;
+    --single-volume-images-catalog)
+      [[ $# -ge 2 ]] || usage
+      single_volume_images_catalog="$2"
+      release_images_catalog_explicit=true
+      shift 2
+      ;;
     --prometheus-config)
       [[ $# -ge 2 ]] || usage
       prometheus_config="$2"
       shift 2
-      ;;
-    --verify-railway-default)
-      verify_railway_default=true
-      shift
       ;;
     --compose-contract)
       [[ $# -ge 2 ]] || usage
@@ -113,8 +108,41 @@ EOF
   fi
 }
 
+# Single-volume host images are published beside the runtime catalog but are
+# not binaries and not the certified complete topology, so they stay in their
+# own catalog and every name must be a build target in deploy/Dockerfile.
+validate_single_volume_images_catalog() {
+  [[ -r "$single_volume_images_catalog" ]] || {
+    echo "release admission rejected: cannot read single-volume image catalog $single_volume_images_catalog" >&2
+    exit 1
+  }
+
+  required_single_volume_images="$({
+    printf '%s\n' zinder-canonical-runtime zinder-wallet-serving
+  } | sort)"
+  configured_single_volume_images="$(
+    jq -r 'if type == "array" and all(.[]; type == "string") then .[] else error("not a string array") end' \
+      "$single_volume_images_catalog" 2>/dev/null | sort
+  )"
+  if [[ "$configured_single_volume_images" != "$required_single_volume_images" ]]; then
+    cat >&2 <<'EOF'
+release admission rejected: the single-volume image catalog must contain
+exactly the canonical-runtime canary and the wallet-serving image.
+EOF
+    exit 1
+  fi
+
+  local image_name
+  while IFS= read -r image_name; do
+    grep -Eq "^FROM [a-z0-9-]+ AS ${image_name}\$" "$repository_root/deploy/Dockerfile" || {
+      echo "release admission rejected: deploy/Dockerfile has no ${image_name} target" >&2
+      exit 1
+    }
+  done <<< "$configured_single_volume_images"
+}
+
 if [[ -n "$compose_contract" ]]; then
-  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$release_workflow" && -z "$build_images_workflow" && "$release_images_catalog_explicit" = false && -z "$prometheus_config" && "$verify_railway_default" = false ]] || usage
+  [[ -z "$deployment_class" && -z "$target" && -z "$release_workflow" && -z "$build_images_workflow" && "$release_images_catalog_explicit" = false && -z "$prometheus_config" ]] || usage
   [[ -r "$compose_contract" ]] || {
     echo "release admission rejected: cannot read resolved Compose contract $compose_contract" >&2
     exit 1
@@ -299,52 +327,15 @@ EOF
   exit 0
 fi
 
-resolve_railway_default_target() {
-  local railway_config="$repository_root/railway.toml"
-  local railway_dockerfile
-
-  railway_dockerfile="$(sed -n 's/^dockerfilePath = "\([^"]*\)"$/\1/p' "$railway_config")"
-  [[ -n "$railway_dockerfile" ]] || {
-    echo "release admission rejected: railway.toml has no Dockerfile path" >&2
-    return 1
-  }
-
-  sed -n 's/^ARG RAILWAY_DOCKER_TARGET_STAGE=\([A-Za-z0-9_-]*\)$/\1/p' \
-    "$repository_root/$railway_dockerfile"
-}
-
-if [[ "$verify_railway_default" = true ]]; then
-  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$release_workflow" && -z "$build_images_workflow" && "$release_images_catalog_explicit" = false && -z "$prometheus_config" && -z "$compose_contract" ]] || usage
-
-  target="$(resolve_railway_default_target)"
-  [[ "$target" = "zinder-admission-required" ]] || {
-    echo "release admission rejected: Railway default target must be zinder-admission-required, got ${target:-unset}" >&2
-    exit 1
-  }
-  railway_dockerfile="$(sed -n 's/^dockerfilePath = "\([^"]*\)"$/\1/p' "$repository_root/railway.toml")"
-  grep -Fqx 'FROM zinder-canonical-runtime AS zinder-railway-runtime' \
-    "$repository_root/$railway_dockerfile" || {
-    echo "release admission rejected: Railway final stage is not fixed to zinder-canonical-runtime" >&2
-    exit 1
-  }
-  # The literal shell expression is the admission contract being inspected.
-  # shellcheck disable=SC2016
-  grep -Fq 'test "${RAILWAY_DOCKER_TARGET_STAGE}" = "zinder-canonical-runtime"' \
-    "$repository_root/$railway_dockerfile" || {
-    echo "release admission rejected: Railway target argument is not guarded in the image build" >&2
-    exit 1
-  }
-  exit 0
-fi
-
 if [[ -n "$build_images_workflow" ]]; then
-  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$release_workflow" && -z "$prometheus_config" && "$verify_railway_default" = false && -z "$compose_contract" ]] || usage
+  [[ -z "$deployment_class" && -z "$target" && -z "$release_workflow" && -z "$prometheus_config" && -z "$compose_contract" ]] || usage
   [[ -r "$build_images_workflow" ]] || {
     echo "release admission rejected: cannot read build image workflow $build_images_workflow" >&2
     exit 1
   }
 
   validate_release_images_catalog
+  validate_single_volume_images_catalog
   required_build_platforms="$({
     printf '%s\n' linux/amd64 linux/arm64
   } | sort)"
@@ -366,11 +357,14 @@ if [[ -n "$build_images_workflow" ]]; then
     || ! grep -Fq -- '--build-arg "ZINDER_BUILD_GIT_COMMIT=${SMOKE_BUILD_GIT_COMMIT}"' \
       "$build_images_workflow" \
     || ! grep -Fq 'docker run --rm --entrypoint="$image_name" "${image_name}:${PR_TAG}" --help' \
+      "$build_images_workflow" \
+    || ! grep -Fq "jq -r '.[]' deploy/release-single-volume-images.json" "$build_images_workflow" \
+    || ! grep -Fq 'docker run --rm --entrypoint=zinder-ingest "${image_name}:${PR_TAG}" --help' \
       "$build_images_workflow"; then
     cat >&2 <<'EOF'
 release admission rejected: the pull-request image workflow must build and run
-the --help smoke for the validated release image catalog on native amd64 and
-arm64 runners.
+the --help smoke for the validated release and single-volume image catalogs on
+native amd64 and arm64 runners.
 EOF
     exit 1
   fi
@@ -378,7 +372,7 @@ EOF
 fi
 
 if [[ -n "$prometheus_config" ]]; then
-  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$release_workflow" && -z "$build_images_workflow" && "$release_images_catalog_explicit" = false && "$verify_railway_default" = false && -z "$compose_contract" ]] || usage
+  [[ -z "$deployment_class" && -z "$target" && -z "$release_workflow" && -z "$build_images_workflow" && "$release_images_catalog_explicit" = false && -z "$compose_contract" ]] || usage
   [[ -r "$prometheus_config" ]] || {
     echo "release admission rejected: cannot read Prometheus config $prometheus_config" >&2
     exit 1
@@ -405,12 +399,13 @@ EOF
 fi
 
 if [[ -n "$release_workflow" ]]; then
-  [[ -z "$deployment_class" && -z "$target" && "$railway_default" = false && -z "$build_images_workflow" && -z "$prometheus_config" && "$verify_railway_default" = false && -z "$compose_contract" ]] || usage
+  [[ -z "$deployment_class" && -z "$target" && -z "$build_images_workflow" && -z "$prometheus_config" && -z "$compose_contract" ]] || usage
   [[ -r "$release_workflow" ]] || {
     echo "release admission rejected: cannot read release workflow $release_workflow" >&2
     exit 1
   }
   validate_release_images_catalog
+  validate_single_volume_images_catalog
 
   if grep -Fq 'workflow_dispatch:' "$release_workflow"; then
     cat >&2 <<'EOF'
@@ -609,8 +604,7 @@ EOF
   if grep -Fq 'zinder-single-container' "$release_workflow"; then
     cat >&2 <<'EOF'
 release admission rejected: the image workflow would publish the mixed
-zinder-single-container bundle. The Railway image set contains only the
-ingest-only diagnostic or canary runtime.
+zinder-single-container bundle, which is not a release image.
 EOF
     exit 1
   fi
@@ -627,7 +621,8 @@ EOF
   # shellcheck disable=SC2016
   if ! grep -Fq 'release_images: ${{ steps.images.outputs.release_images }}' \
     "$release_workflow" \
-    || ! grep -Fq "jq -c '.' \"\$RELEASE_IMAGES_FILE\"" "$release_workflow" \
+    || ! grep -Fq "jq -c -s 'add' \"\$RELEASE_IMAGES_FILE\" \"\$RELEASE_SINGLE_VOLUME_IMAGES_FILE\"" "$release_workflow" \
+    || ! grep -Fq 'RELEASE_SINGLE_VOLUME_IMAGES_FILE: deploy/release-single-volume-images.json' "$release_workflow" \
     || ! grep -Fq 'RELEASE_IMAGES_JSON: ${{ needs.validate.outputs.release_images }}' \
       "$release_workflow" \
     || ! grep -Fq "jq -r '.[]' <<< \"\$RELEASE_IMAGES_JSON\"" "$release_workflow" \
@@ -859,16 +854,6 @@ case "$deployment_class" in
   *) usage ;;
 esac
 
-if [[ "$railway_default" = true ]]; then
-  [[ -z "$target" ]] || usage
-
-  target="$(resolve_railway_default_target)"
-  [[ -n "$target" ]] || {
-    echo "release admission rejected: Railway Dockerfile has no default target stage" >&2
-    exit 1
-  }
-fi
-
 [[ -n "$target" ]] || usage
 
 case "$deployment_class:$target" in
@@ -888,14 +873,6 @@ EOF
 release admission rejected: zinder-canonical-runtime is an ingest-only
 diagnostic canary. It does not provide the complete topology or a
 public compatibility route.
-EOF
-    exit 1
-    ;;
-  *:zinder-admission-required)
-    cat >&2 <<'EOF'
-release admission rejected: Railway requires an explicit admitted deployment
-class and target. Only the zinder-canonical-runtime diagnostic/canary target
-is admitted.
 EOF
     exit 1
     ;;
