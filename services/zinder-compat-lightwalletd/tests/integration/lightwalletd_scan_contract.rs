@@ -17,8 +17,9 @@
 //! 4. Assert each block carries:
 //!    - a populated `vtx` list whose `txid` entries match transaction
 //!      artifacts retrievable by id from the store, and
-//!    - chain metadata. The production store fixture publishes empty
-//!      commitment trees, so every advertised tree size is zero.
+//!    - chain metadata reflecting the committed Sapling and Orchard
+//!      commitment-tree sizes. Each block appends one Sapling note
+//!      commitment, so the Sapling tree size equals the block height.
 //! 5. Assert no viewing keys, spending keys, seed phrases, or other key
 //!    material appear in any client→server payload.
 //!
@@ -224,7 +225,7 @@ fn lightwalletd_scan_compact_block(block: &FixtureBlock) -> eyre::Result<Compact
             },
         }],
         CompactChainMetadata {
-            sapling_commitment_tree_size: 0,
+            sapling_commitment_tree_size: block.height.value(),
             orchard_commitment_tree_size: 0,
             ironwood_commitment_tree_size: 0,
         },
@@ -281,7 +282,10 @@ fn assert_compact_block_carries_chain_metadata(
     let chain_metadata = compact_block.chain_metadata.as_ref().ok_or_else(|| {
         eyre!("compact block must carry chain_metadata for tree-state advertisement")
     })?;
-    assert_eq!(chain_metadata.sapling_commitment_tree_size, 0);
+    assert_eq!(
+        chain_metadata.sapling_commitment_tree_size,
+        u32::try_from(compact_block.height)?
+    );
     assert_eq!(chain_metadata.orchard_commitment_tree_size, 0);
     Ok(())
 }

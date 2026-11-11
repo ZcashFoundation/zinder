@@ -106,16 +106,26 @@ missing-capability precondition. A missing blob inside an `All` store is an
 fetch history from the upstream node. Changing a non-empty store to `All`
 requires a rebuilt store and blue-green cutover.
 
-Tree-state storage preserves upstream node JSON at canonical checkpoints and the
-latest committed tip. The native read surface is
+Tree-state storage keeps typed commitment-tree checkpoints: the validated
+frontier of each shielded pool at every 100-block cadence height, at the latest
+committed tip, and, for checkpointed history, at the history predecessor. Reads
+derive the tree-state payload, one `commitments.finalState` per pool, from
+those frontiers; the store does not keep an upstream node's JSON. A
+checkpointed store therefore serves its floor's tree state although it retains
+no block at the floor. Every store serves a latest tree state, because every
+build retains at least one block and checkpoints its tip.
+
+The native read surface is
 `tree_state_at(height, at_epoch_id)` and `latest_tree_state_checkpoint(at_epoch_id)`.
 `tree_state_at` serves the tree state at exactly `height`: a stored checkpoint
 when one exists there, otherwise a cache-fill from the configured upstream node
 (mirroring lightwalletd's `GetTreeState`), so the returned height always equals
 the requested height. The fill is the one query path permitted to contact an
-upstream node, gated on an explicitly supplied source (see ADR-0005). Without a
-source the read serves only stored checkpoint heights and returns
-`ArtifactUnavailable` for the gaps. Lightwalletd compatibility returns a
+upstream node, gated on an explicitly supplied source (see ADR-0005). An
+endpoint advertises `wallet.read.tree_state_at_height_v2` only after probing a
+node that supports tree-state fills. Without one, `tree_state_at` fails with
+that missing-capability precondition, and `latest_tree_state_checkpoint` still
+serves the stored tip checkpoint. Lightwalletd compatibility returns a
 `TreeState` response for `GetLatestTreeState`; `GetTreeState(BlockID)` is a clean
 passthrough to `tree_state_at` and serves any height the upstream can answer.
 
@@ -126,9 +136,15 @@ range from a not-yet-available upstream node subtree index.
 The native query path makes that distinction without upstream node repair or
 query-time compact-block decoding: it reads `ChainTipMetadata` from the same
 `ChainEpoch` to decide whether a subtree index can exist, then reads stored
-`SubtreeRootArtifact` values for completed roots. Missing completed roots
-return a typed unavailable error; ranges beyond the completed subtree count
-return an empty response.
+`SubtreeRootArtifact` values for completed roots. Ranges beyond the completed
+subtree count return an empty response. A store holds every root its retained
+blocks complete. A checkpointed store whose construction loaded retained-range
+coverage has no row for a root its history predecessor had already completed,
+and a read of that root returns `ArtifactUnavailable` for the subtree-root
+family and index (`NOT_FOUND`). A store whose construction loaded the complete
+prefix holds every completed root from index zero. Any other absent completed
+root, including any absent root in a complete-prefix store, is a canonical
+integrity failure.
 
 ## Block Identity and Hash-Keyed Reads
 

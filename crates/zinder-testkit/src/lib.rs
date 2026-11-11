@@ -10,6 +10,9 @@
 //! - [`ChainFixture`] is a deterministic in-memory chain. It exposes block,
 //!   compact-block, source-block, tree-state, and chain-epoch values keyed by
 //!   height, plus fork helpers for reorg shape construction.
+//! - [`CanonicalWriterFixture`] publishes a [`ChainFixture`] through the
+//!   production canonical writer as complete or checkpointed history, then
+//!   appends, replaces, and prunes on the admitted primary.
 //! - [`WalletServingStoreFixture`] builds the production canonical and wallet
 //!   stores, then opens immutable secondaries at one admitted serving fence.
 //! - [`process_crash`] runs a child test that aborts at an armed crash point,
@@ -34,6 +37,7 @@
 //! workspace gate (`cargo deny check`) enforces no production crate links
 //! against this one.
 
+pub mod canonical_writer_fixture;
 pub mod chain_fixture;
 pub mod commitment_tree_fixtures;
 pub mod env_var_contract;
@@ -49,12 +53,16 @@ pub mod process_crash;
 pub mod transparent_signer;
 pub mod wallet_serving_store_fixture;
 
+pub use canonical_writer_fixture::{CanonicalBaseline, CanonicalWriterFixture};
 pub use chain_fixture::{
     ChainFixture, FixtureBlock, FixtureTransactionRows, build_fixture_transaction_rows,
     encode_fixture_block_replay, encode_fixture_block_replay_with_raw_block,
     synthetic_transaction_public_facts,
 };
-pub use commitment_tree_fixtures::{completed_sapling_subtree_frontier, one_leaf_sapling_frontier};
+pub use commitment_tree_fixtures::{
+    FIXTURE_NOTE_COMMITMENT, completed_sapling_subtree_frontier, completed_subtree_frontier,
+    one_leaf_frontier, one_leaf_sapling_frontier,
+};
 pub use env_var_contract::EnvVarContractProbe;
 pub use ingest_control_fixture::{IngestControlFixture, IngestControlFixtureService};
 pub use json_rpc_test_server::{

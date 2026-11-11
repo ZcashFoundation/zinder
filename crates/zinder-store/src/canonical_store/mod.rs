@@ -735,6 +735,22 @@ pub enum CanonicalStoreError {
         height: BlockHeight,
     },
 
+    /// A completed subtree root lies outside this store's subtree-root coverage.
+    ///
+    /// A store loaded with retained-range coverage holds only the roots its
+    /// retained blocks complete. A root that the history predecessor's trees
+    /// already completed has no row unless the build loaded a complete prefix.
+    #[error(
+        "canonical {protocol:?} subtree root {} precedes retained subtree-root coverage",
+        .subtree_index.value()
+    )]
+    SubtreeRootUnavailable {
+        /// Shielded protocol of the requested root.
+        protocol: ShieldedProtocol,
+        /// First requested index whose row is absent.
+        subtree_index: zinder_core::SubtreeRootIndex,
+    },
+
     /// A fresh canonical build is incomplete or changed during cold validation.
     #[error("canonical publication refused: {reason}")]
     PublicationRefused {

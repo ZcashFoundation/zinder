@@ -18,6 +18,7 @@ use crate::{
 use super::{
     CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreBuildState,
     CanonicalStoreError, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
+    CanonicalSubtreeRootLoadCoverage,
     activation_schedule::CanonicalActivationSchedule,
     block_replay::{BLOCK_REPLAY_COLUMN_FAMILY, CanonicalReplayScan},
     construction_manifest::{
@@ -195,6 +196,7 @@ pub struct RocksDbCanonicalStore {
     pub(super) build_plan: super::CanonicalStoreBuildPlan,
     pub(super) cursor_auth_key: [u8; 32],
     pub(super) ready_evidence: CanonicalStoreReadyEvidence,
+    pub(super) subtree_root_coverage: CanonicalSubtreeRootLoadCoverage,
     /// Serializes retained-event, projection-lease, and mempool-log lifecycle changes.
     ///
     /// The primary handle owns every canonical mutation. Keeping this lock on
@@ -222,6 +224,7 @@ impl RocksDbCanonicalStore {
         build_plan: super::CanonicalStoreBuildPlan,
         cursor_auth_key: [u8; 32],
         ready_evidence: &CanonicalStoreReadyEvidence,
+        subtree_root_coverage: CanonicalSubtreeRootLoadCoverage,
         replay_tail: AuthenticatedReplayTail,
     ) -> Self {
         Self {
@@ -230,6 +233,7 @@ impl RocksDbCanonicalStore {
             build_plan,
             cursor_auth_key,
             ready_evidence: *ready_evidence,
+            subtree_root_coverage,
             lifecycle_lock: Arc::new(Mutex::new(())),
             mempool_retention_progress: Mutex::new(None),
             activation_schedule: None,
@@ -537,9 +541,10 @@ impl RocksDbCanonicalStore {
     ) -> Result<Self, CanonicalStoreError> {
         validate_resource_budget(resource_budget)?;
         let store_path = canonical_store_path(path)?;
-        let (admitted_database_identity, admitted_control) =
+        let (admitted_database_identity, admitted_control, admitted_subtree_root_coverage) =
             admit_existing_store(&store_path, expectation)?;
-        let CanonicalStoreBuildState::Ready(admitted_ready_evidence) = admitted_control.build_state
+        let (CanonicalStoreBuildState::Ready(admitted_ready_evidence), Some(subtree_root_coverage)) =
+            (admitted_control.build_state, admitted_subtree_root_coverage)
         else {
             return Err(CanonicalStoreError::StoreNotReady { path: store_path });
         };
@@ -603,6 +608,7 @@ impl RocksDbCanonicalStore {
             build_plan,
             cursor_auth_key: opened_control.cursor_auth_key,
             ready_evidence: opened_ready_evidence,
+            subtree_root_coverage,
             lifecycle_lock: Arc::new(Mutex::new(())),
             mempool_retention_progress: Mutex::new(None),
             activation_schedule,
@@ -951,7 +957,14 @@ pub(super) fn initialize_store_identity(
 pub(super) fn admit_existing_store(
     path: &Path,
     expectation: &CanonicalStoreAdmissionExpectation,
-) -> Result<(Vec<u8>, DecodedStoreControl), CanonicalStoreError> {
+) -> Result<
+    (
+        Vec<u8>,
+        DecodedStoreControl,
+        Option<CanonicalSubtreeRootLoadCoverage>,
+    ),
+    CanonicalStoreError,
+> {
     let column_families = DB::list_cf(&Options::default(), path).map_err(|source| {
         CanonicalStoreError::admission(path, format!("column-family discovery failed: {source}"))
     })?;
@@ -961,14 +974,20 @@ pub(super) fn admit_existing_store(
             CanonicalStoreError::admission(path, format!("read-only open failed: {source}"))
         })?;
     let control = validate_open_store_control(&db, path, expectation)?;
-    if let CanonicalStoreBuildState::Ready(ready) = control.build_state {
-        validate_ready_construction_manifest(path, &ready, control.workload, &control.build_plan)?;
-    }
+    let subtree_root_coverage = match control.build_state {
+        CanonicalStoreBuildState::Ready(ready) => Some(validate_ready_construction_manifest(
+            path,
+            &ready,
+            control.workload,
+            &control.build_plan,
+        )?),
+        CanonicalStoreBuildState::Building => None,
+    };
     validate_mempool_lifecycle_admission(&db, control.network, control.cursor_auth_key)?;
     let database_identity = db.get_db_identity().map_err(|source| {
         CanonicalStoreError::admission(path, format!("database identity read failed: {source}"))
     })?;
-    Ok((database_identity, control))
+    Ok((database_identity, control, subtree_root_coverage))
 }
 
 fn validate_exact_column_families(

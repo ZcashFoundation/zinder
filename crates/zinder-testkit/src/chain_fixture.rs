@@ -16,10 +16,10 @@ use zinder_core::{
     BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockHeight, BlockId,
     BlockTransactionIndexArtifact, CanonicalBlockFacts, CanonicalBlockFactsDigestVersion,
     CanonicalBlockReplayEnvelope, CanonicalBlockReplayFormatVersion, CanonicalTransactionFacts,
-    ChainEpoch, ChainEpochId, ChainTipMetadata, CompactBlockArtifact, CompactChainMetadata,
-    CompactTransaction, CompactTransactionData, CompactTransparentInput, CompactTransparentOutput,
-    LockTime, Network, PrivacyShape, SerializedBytesDigest, TransactionBlobArtifact,
-    TransactionComponentCounts, TransactionFactsArtifact, TransactionId,
+    ChainEpoch, ChainEpochId, ChainTipMetadata, CommitmentTreeFrontiers, CompactBlockArtifact,
+    CompactChainMetadata, CompactTransaction, CompactTransactionData, CompactTransparentInput,
+    CompactTransparentOutput, LockTime, Network, PrivacyShape, SerializedBytesDigest,
+    TransactionBlobArtifact, TransactionComponentCounts, TransactionFactsArtifact, TransactionId,
     TransactionIntrinsicValueBalances, TransactionLocation, TransactionPublicFacts,
     TransactionVersion, TransparentInputFact, TransparentOutputArtifact, TransparentOutputFact,
     TransparentSpendFact, TransparentUnspentOutput, TreeStateArtifact, UnixTimestampMillis,
@@ -178,6 +178,28 @@ impl FixtureTransactionRows {
             )),
             intrinsic_value_balances: Some(TransactionIntrinsicValueBalances::default()),
         }
+    }
+
+    /// Builds canonical rows for a synthetic coinbase at block index 0.
+    ///
+    /// A live replacement archives every block it displaces, and the archive
+    /// requires the displaced block's first transaction to be its only coinbase.
+    #[must_use]
+    pub fn coinbase(
+        transaction_id: TransactionId,
+        block_height: BlockHeight,
+        block_hash: BlockHash,
+        raw_transaction_bytes: impl Into<Vec<u8>>,
+    ) -> Self {
+        let mut rows = Self::from_raw_transaction(
+            transaction_id,
+            block_height,
+            block_hash,
+            0,
+            raw_transaction_bytes,
+        );
+        rows.facts.public_facts.is_coinbase = true;
+        rows
     }
 
     /// Builds canonical rows for a transaction whose raw bytes are unavailable.
@@ -423,6 +445,7 @@ pub struct ChainFixture {
     branch_salt: u32,
     blocks: Vec<FixtureBlock>,
     compact_block_overrides: Vec<CompactBlockArtifact>,
+    commitment_tree_frontier_overrides: Vec<(BlockHeight, CommitmentTreeFrontiers)>,
     tip_metadata_override: Option<ChainTipMetadata>,
     transaction_rows: Vec<FixtureTransactionRows>,
     transparent_outputs_by_outpoint: Vec<TransparentOutputArtifact>,
@@ -439,6 +462,7 @@ impl ChainFixture {
             branch_salt: 0,
             blocks: Vec::new(),
             compact_block_overrides: Vec::new(),
+            commitment_tree_frontier_overrides: Vec::new(),
             tip_metadata_override: None,
             transaction_rows: Vec::new(),
             transparent_outputs_by_outpoint: Vec::new(),
@@ -530,6 +554,12 @@ impl ChainFixture {
                 .filter(|block| block.height() < divergence_height)
                 .cloned()
                 .collect(),
+            commitment_tree_frontier_overrides: self
+                .commitment_tree_frontier_overrides
+                .iter()
+                .filter(|(height, _)| *height < divergence_height)
+                .cloned()
+                .collect(),
             tip_metadata_override: None,
             transaction_rows: Vec::new(),
             transparent_outputs_by_outpoint: Vec::new(),
@@ -573,6 +603,37 @@ impl ChainFixture {
             .retain(|existing| existing.height() != compact_block.height());
         self.compact_block_overrides.push(compact_block);
         self
+    }
+
+    /// Declares the commitment trees after the block at `height` directly.
+    ///
+    /// Production-store fixtures otherwise derive each block's trees by
+    /// appending the note commitments of its compact block. Use this for tree
+    /// sizes too large to accumulate in a test, such as a completed 2^16-leaf
+    /// subtree. The declared sizes must equal the compact block's chain
+    /// metadata, and later blocks accumulate on top of these frontiers.
+    #[must_use]
+    pub fn with_commitment_tree_frontiers_at(
+        mut self,
+        height: BlockHeight,
+        frontiers: CommitmentTreeFrontiers,
+    ) -> Self {
+        self.commitment_tree_frontier_overrides
+            .retain(|(existing_height, _)| *existing_height != height);
+        self.commitment_tree_frontier_overrides
+            .push((height, frontiers));
+        self
+    }
+
+    /// Returns the commitment trees declared after the block at `height`.
+    pub(crate) fn commitment_tree_frontiers_at(
+        &self,
+        height: BlockHeight,
+    ) -> Option<&CommitmentTreeFrontiers> {
+        self.commitment_tree_frontier_overrides
+            .iter()
+            .find(|(declared_height, _)| *declared_height == height)
+            .map(|(_, frontiers)| frontiers)
     }
 
     /// Replaces the tree-state checkpoint payload bytes attached to the block at `height`.

@@ -1,110 +1,54 @@
 //! Production-store fixtures for the immutable wallet-serving boundary.
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
-use eyre::{Context as _, ensure, eyre};
+use eyre::{ensure, eyre};
 use tempfile::TempDir;
-use zinder_core::{
-    BlockHeight, BlockId, CanonicalBlockReplayEnvelope, ChainTipMetadata, CommitmentTreeCheckpoint,
-    CommitmentTreeFrontier, CommitmentTreeFrontiers, NetworkUpgradeActivations, ShieldedProtocol,
-    UnixTimestampMillis, decode_canonical_block_replay,
-};
+use zinder_core::{BlockHeight, NetworkUpgradeActivations};
 use zinder_store::{
-    CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalLiveAppend, CanonicalReorgPolicy,
-    CanonicalStoreBuildPlan, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder,
-    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
-    TREE_STATE_CHECKPOINT_STRIDE,
+    CanonicalReorgPolicy, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalSecondary,
+    RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 use zinder_wallet_rocksdb::{
     RocksDbWalletBuildOptions, RocksDbWalletSecondary, build_wallet_from_canonical,
 };
 
-use crate::{ChainFixture, FixtureBlock, FixtureTransactionRows};
-
-const TEST_REORG_DEPTH: u32 = 100;
+use crate::{CanonicalBaseline, CanonicalWriterFixture, ChainFixture};
 
 /// Tempdir-backed production canonical and wallet secondaries at one READY fence.
 ///
 /// This fixture deliberately builds both primaries through their production
 /// publication paths before opening read-only secondaries. Tests can therefore
 /// certify a `WalletServingReadPair` without substituting an
-/// in-memory reader or a retired materialized-view adapter.
+/// in-memory reader or a retired materialized-view adapter. Use
+/// [`CanonicalWriterFixture`] for history that is checkpointed, followed,
+/// reorged, or pruned before it is served.
 pub struct WalletServingStoreFixture {
     canonical_reader: Option<RocksDbCanonicalSecondary>,
     wallet_reader: Option<RocksDbWalletSecondary>,
-    _temporary_directory: TempDir,
+    _temporary_directory: Arc<TempDir>,
 }
 
 impl WalletServingStoreFixture {
     /// Builds READY primaries from `chain_fixture` and opens immutable secondaries.
     ///
+    /// Checkpoints omit the frontier of every pool whose tree is still empty,
+    /// so an empty-tree checkpoint serves an empty tree-state payload.
+    ///
     /// # Errors
     ///
     /// Returns an error when the fixture is empty, omits a transaction blob,
-    /// carries non-empty commitment-tree positions without matching frontiers,
-    /// or fails either production store's validation and publication contract.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "The fixture keeps canonical publication, wallet projection, and secondary admission in their production order."
-    )]
+    /// declares commitment-tree sizes its compact blocks cannot reach, or
+    /// fails either production store's validation and publication contract.
     pub fn from_chain(
         chain_fixture: &ChainFixture,
         network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> eyre::Result<Self> {
-        ensure!(
-            chain_fixture.network() == network_upgrade_activations.network(),
-            "chain fixture and network-upgrade activations must use the same network"
-        );
-        let canonical_chain_fixture = chain_fixture.clone().with_canonical_genesis_parent();
-        let raw_blob_retention = canonical_chain_fixture.raw_blob_retention();
-        let tip_block = canonical_chain_fixture
-            .blocks()
-            .last()
-            .ok_or_else(|| eyre!("wallet-serving fixture requires at least one block"))?;
-        let tip = BlockId::new(tip_block.height, tip_block.hash);
-        let temporary_directory =
-            TempDir::new().wrap_err("create wallet-serving fixture directory")?;
-        let canonical_primary_path = temporary_directory.path().join("canonical-primary");
-        let reorg_policy = CanonicalReorgPolicy::new(TEST_REORG_DEPTH)?;
-        let build_plan = CanonicalStoreBuildPlan::complete(
+        CanonicalWriterFixture::publish(
+            &CanonicalBaseline::new(chain_fixture).omitting_empty_frontiers(),
             network_upgrade_activations,
-            tip_block.block_time_seconds.saturating_sub(1),
-            tip,
-            raw_blob_retention,
-            reorg_policy,
-        )?;
-        let mut builder = RocksDbCanonicalBuilder::create_fresh(
-            &canonical_primary_path,
-            CanonicalStoreWorkload::Wallet,
-            build_plan,
-            RocksDbResourceBudget::for_local_tests(),
-        )?;
-        let canonical_blocks = canonical_build_blocks(&canonical_chain_fixture)?;
-        builder.bulk_load_blocks(
-            canonical_blocks
-                .into_iter()
-                .map(Ok::<_, std::convert::Infallible>),
-        )?;
-        builder.load_subtree_roots(std::iter::empty())?;
-        let tip_checkpoint = CommitmentTreeCheckpoint::new(
-            tip,
-            tip_block.block_time_seconds,
-            CommitmentTreeFrontiers::default(),
-        );
-        builder.confirm_source_tip_checkpoint(&tip_checkpoint)?;
-        let validated = builder.prepare_cold_certified_publication()?;
-        let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
-            tip,
-            UnixTimestampMillis::new(u64::from(tip_block.block_time_seconds).saturating_mul(1_000)),
-        ))?;
-        let canonical_primary = validated.publish_baseline(publication)?;
-
-        Self::from_published_canonical(
-            temporary_directory,
-            &canonical_primary_path,
-            canonical_primary,
-            network_upgrade_activations,
-        )
+        )?
+        .into_serving_store_fixture()
     }
 
     /// Builds a READY pair whose final block was published through the live
@@ -148,106 +92,29 @@ impl WalletServingStoreFixture {
         )
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "The fixture keeps baseline publication, schedule admission, live append, wallet build, and immutable reader admission in production order."
-    )]
     fn build_after_live_append(
         chain_fixture: &ChainFixture,
         construction_activations: &NetworkUpgradeActivations,
         admitted_activations: Option<&NetworkUpgradeActivations>,
     ) -> eyre::Result<Self> {
-        ensure!(
-            chain_fixture.network() == construction_activations.network(),
-            "chain fixture and network-upgrade activations must use the same network"
-        );
-        let live_tip = chain_fixture
-            .blocks()
-            .last()
-            .ok_or_else(|| eyre!("wallet-serving fixture requires at least two blocks"))?;
-        let baseline_fixture = chain_fixture.fork_at(live_tip.height)?;
-        ensure!(
-            !baseline_fixture.blocks().is_empty(),
-            "wallet-serving live-append fixture requires at least two blocks"
-        );
-        let baseline_chain = baseline_fixture.with_canonical_genesis_parent();
-        let raw_blob_retention = baseline_chain.raw_blob_retention();
-        let baseline_tip = baseline_chain
-            .blocks()
-            .last()
-            .ok_or_else(|| eyre!("wallet-serving fixture requires a baseline block"))?;
-        let baseline_tip_id = BlockId::new(baseline_tip.height, baseline_tip.hash);
-        let temporary_directory =
-            TempDir::new().wrap_err("create wallet-serving fixture directory")?;
-        let canonical_primary_path = temporary_directory.path().join("canonical-primary");
-        let reorg_policy = CanonicalReorgPolicy::new(TEST_REORG_DEPTH)?;
-        let build_plan = CanonicalStoreBuildPlan::complete(
+        let baseline_tip = chain_fixture
+            .tip_height()
+            .and_then(|live_tip| live_tip.value().checked_sub(1))
+            .filter(|baseline_tip| *baseline_tip > 0)
+            .map(BlockHeight::new)
+            .ok_or_else(|| {
+                eyre!("wallet-serving live-append fixture requires at least two blocks")
+            })?;
+        let mut writer = CanonicalWriterFixture::publish(
+            &CanonicalBaseline::new(chain_fixture).through(baseline_tip),
             construction_activations,
-            baseline_tip.block_time_seconds.saturating_sub(1),
-            baseline_tip_id,
-            raw_blob_retention,
-            reorg_policy,
         )?;
-        let mut builder = RocksDbCanonicalBuilder::create_fresh(
-            &canonical_primary_path,
-            CanonicalStoreWorkload::Wallet,
-            build_plan,
-            RocksDbResourceBudget::for_local_tests(),
-        )?;
-        builder.bulk_load_blocks(
-            canonical_build_blocks(&baseline_chain)?
-                .into_iter()
-                .map(|block| with_empty_active_frontiers(block, construction_activations))
-                .map(Ok::<_, std::convert::Infallible>),
-        )?;
-        builder.load_subtree_roots(std::iter::empty())?;
-        let baseline_checkpoint = CommitmentTreeCheckpoint::new(
-            baseline_tip_id,
-            baseline_tip.block_time_seconds,
-            empty_active_frontiers(construction_activations, baseline_tip_id.height),
-        );
-        builder.confirm_source_tip_checkpoint(&baseline_checkpoint)?;
-        let validated = builder.prepare_cold_certified_publication()?;
-        let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
-            baseline_tip_id,
-            UnixTimestampMillis::new(
-                u64::from(baseline_tip.block_time_seconds).saturating_mul(1_000),
-            ),
-        ))?;
-        let mut canonical_primary = validated.publish_baseline(publication)?;
-        let live_activations = match admitted_activations {
-            Some(admitted_activations) => {
-                canonical_primary.admit_network_upgrade_schedule(construction_activations)?;
-                canonical_primary.admit_network_upgrade_schedule(admitted_activations)?;
-                admitted_activations
-            }
-            None => construction_activations,
-        };
-        let expected_fence = canonical_primary.event_fence();
-        let full_chain = chain_fixture.clone().with_canonical_genesis_parent();
-        let live_block = canonical_build_blocks(&full_chain)?
-            .pop()
-            .map(|block| with_empty_active_frontiers(block, live_activations))
-            .ok_or_else(|| eyre!("wallet-serving fixture requires a live block"))?;
-        let (canonical_primary, _) = canonical_primary.commit_live_append(
-            CanonicalLiveAppend::new(
-                expected_fence,
-                live_block,
-                Vec::new(),
-                expected_fence.visible_tip(),
-                UnixTimestampMillis::new(
-                    u64::from(live_tip.block_time_seconds).saturating_mul(1_000),
-                ),
-            ),
-            live_activations,
-        )?;
-
-        Self::from_published_canonical(
-            temporary_directory,
-            &canonical_primary_path,
-            canonical_primary,
-            live_activations,
-        )
+        if let Some(admitted_activations) = admitted_activations {
+            writer.admit_network_upgrade_schedule(construction_activations)?;
+            writer.admit_network_upgrade_schedule(admitted_activations)?;
+        }
+        writer.append_live_block(chain_fixture)?;
+        writer.into_serving_store_fixture()
     }
 
     /// Projects the wallet store from an already-published canonical primary,
@@ -270,34 +137,78 @@ impl WalletServingStoreFixture {
         canonical_primary: RocksDbCanonicalStore,
         network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> eyre::Result<Self> {
-        let wallet_primary_path = temporary_directory.path().join("wallet-primary");
-        let raw_blob_retention = canonical_primary.raw_blob_retention();
-        let reorg_policy = canonical_primary.reorg_policy();
-        let network = canonical_primary.network();
-        let wallet_outcome = build_wallet_from_canonical(
-            &canonical_primary,
-            &wallet_primary_path,
-            RocksDbWalletBuildOptions {
-                supported_reorg_depth: reorg_policy.reorg_window_blocks(),
-                ..RocksDbWalletBuildOptions::for_local_tests()
-            },
-        )?;
-        drop(wallet_outcome.store);
-        drop(canonical_primary);
+        Self::admit_closing_primary(
+            Arc::new(temporary_directory),
+            canonical_primary_path,
+            canonical_primary,
+            network_upgrade_activations,
+        )
+    }
 
+    /// Projects the wallet store, closes `canonical_primary`, then admits
+    /// readers named without a generation suffix.
+    pub(crate) fn admit_closing_primary(
+        temporary_directory: Arc<TempDir>,
+        canonical_primary_path: &Path,
+        canonical_primary: RocksDbCanonicalStore,
+        network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> eyre::Result<Self> {
+        let reader_paths = ReaderPaths::new(temporary_directory.path(), "");
+        let identity = build_wallet_primary(&canonical_primary, &reader_paths)?;
+        drop(canonical_primary);
+        Self::open_readers(
+            temporary_directory,
+            canonical_primary_path,
+            &reader_paths,
+            identity,
+            network_upgrade_activations,
+        )
+    }
+
+    /// Projects the wallet store and admits readers while `canonical_primary`
+    /// stays open, naming every path after `generation`.
+    pub(crate) fn admit_beside_open_primary(
+        temporary_directory: Arc<TempDir>,
+        generation: u32,
+        canonical_primary_path: &Path,
+        canonical_primary: &RocksDbCanonicalStore,
+        network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> eyre::Result<Self> {
+        let reader_paths = ReaderPaths::new(temporary_directory.path(), &format!("-{generation}"));
+        let identity = build_wallet_primary(canonical_primary, &reader_paths)?;
+        Self::open_readers(
+            temporary_directory,
+            canonical_primary_path,
+            &reader_paths,
+            identity,
+            network_upgrade_activations,
+        )
+    }
+
+    fn open_readers(
+        temporary_directory: Arc<TempDir>,
+        canonical_primary_path: &Path,
+        reader_paths: &ReaderPaths,
+        identity: CanonicalServingIdentity,
+        network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> eyre::Result<Self> {
+        ensure!(
+            identity.network == network_upgrade_activations.network(),
+            "canonical primary and network-upgrade activations must use the same network"
+        );
         let canonical_reader = RocksDbCanonicalSecondary::open_ready(
             canonical_primary_path,
-            temporary_directory.path().join("canonical-secondary"),
+            &reader_paths.canonical_secondary,
             network_upgrade_activations,
             CanonicalStoreWorkload::Wallet,
-            raw_blob_retention,
-            reorg_policy,
+            identity.raw_blob_retention,
+            identity.reorg_policy,
             RocksDbResourceBudget::for_local_tests(),
         )?;
         let wallet_reader = RocksDbWalletSecondary::open_ready(
-            &wallet_primary_path,
-            temporary_directory.path().join("wallet-secondary"),
-            network,
+            &reader_paths.wallet_primary,
+            &reader_paths.wallet_secondary,
+            identity.network,
             RocksDbResourceBudget::for_local_tests(),
         )?;
 
@@ -328,146 +239,49 @@ impl WalletServingStoreFixture {
     }
 }
 
-fn canonical_build_blocks(chain_fixture: &ChainFixture) -> eyre::Result<Vec<CanonicalBuildBlock>> {
-    let transaction_rows = chain_fixture.canonical_transaction_rows();
-    let replay_envelopes = chain_fixture.block_replay_envelopes();
-    let compact_blocks = chain_fixture.compact_block_artifacts();
-    let tip_height = chain_fixture
-        .tip_height()
-        .ok_or_else(|| eyre!("wallet-serving fixture requires a tip"))?;
-    let build_inputs = CanonicalBlockBuildInputs {
-        transaction_rows: &transaction_rows,
-        tip_height,
-        raw_blob_retention: chain_fixture.raw_blob_retention(),
-    };
-    let mut build_blocks = Vec::with_capacity(chain_fixture.block_count());
+/// Wallet primary and reader paths for one admission.
+struct ReaderPaths {
+    wallet_primary: std::path::PathBuf,
+    canonical_secondary: std::path::PathBuf,
+    wallet_secondary: std::path::PathBuf,
+}
 
-    for ((fixture_block, replay_envelope), compact_block) in chain_fixture
-        .blocks()
-        .iter()
-        .zip(replay_envelopes)
-        .zip(compact_blocks)
-    {
-        build_blocks.push(canonical_build_block(
-            fixture_block,
-            replay_envelope,
-            compact_block,
-            &build_inputs,
-        )?);
+impl ReaderPaths {
+    fn new(root: &Path, suffix: &str) -> Self {
+        Self {
+            wallet_primary: root.join(format!("wallet-primary{suffix}")),
+            canonical_secondary: root.join(format!("canonical-secondary{suffix}")),
+            wallet_secondary: root.join(format!("wallet-secondary{suffix}")),
+        }
     }
-
-    Ok(build_blocks)
 }
 
-/// Live following derives each checkpoint's frontiers from its predecessor,
-/// so live-append fixtures carry the empty frontier of every shielded pool
-/// active at the checkpoint height.
-fn with_empty_active_frontiers(
-    mut block: CanonicalBuildBlock,
-    activations: &NetworkUpgradeActivations,
-) -> CanonicalBuildBlock {
-    if let Some(checkpoint) = block.tree_state_checkpoint.as_mut() {
-        checkpoint.frontiers = empty_active_frontiers(activations, checkpoint.block_id.height);
-    }
-    block
-}
-
-fn empty_active_frontiers(
-    activations: &NetworkUpgradeActivations,
-    height: BlockHeight,
-) -> CommitmentTreeFrontiers {
-    let active_frontier = |protocol: ShieldedProtocol| {
-        activations
-            .activation_height_by_name(protocol.activation_upgrade_name())
-            .is_some_and(|activation_height| activation_height <= height)
-            .then(|| CommitmentTreeFrontier::empty(protocol))
-    };
-    CommitmentTreeFrontiers::from_validated_parts(
-        active_frontier(ShieldedProtocol::Sapling),
-        active_frontier(ShieldedProtocol::Orchard),
-        active_frontier(ShieldedProtocol::Ironwood),
-    )
-}
-
-struct CanonicalBlockBuildInputs<'a> {
-    transaction_rows: &'a [FixtureTransactionRows],
-    tip_height: BlockHeight,
+/// Immutable canonical identity a reader must be admitted against.
+#[derive(Clone, Copy)]
+struct CanonicalServingIdentity {
+    network: zinder_core::Network,
     raw_blob_retention: RawBlobRetention,
+    reorg_policy: CanonicalReorgPolicy,
 }
 
-fn canonical_build_block(
-    fixture_block: &FixtureBlock,
-    replay_envelope: CanonicalBlockReplayEnvelope,
-    compact_block: zinder_core::CompactBlockArtifact,
-    build_inputs: &CanonicalBlockBuildInputs<'_>,
-) -> eyre::Result<CanonicalBuildBlock> {
-    let facts = decode_canonical_block_replay(replay_envelope.as_bytes())
-        .wrap_err_with(|| {
-            format!(
-                "decode canonical fixture replay at height {}",
-                fixture_block.height.value()
-            )
-        })?
-        .into_facts();
-    let metadata = compact_block.chain_metadata();
-    let tip_metadata = ChainTipMetadata::new(
-        metadata.sapling_commitment_tree_size,
-        metadata.orchard_commitment_tree_size,
-        metadata.ironwood_commitment_tree_size,
-    );
-    ensure!(
-        tip_metadata == ChainTipMetadata::empty(),
-        "wallet-serving fixture currently requires empty commitment-tree frontiers"
-    );
-
-    let mut block_transaction_rows = build_inputs
-        .transaction_rows
-        .iter()
-        .filter(|rows| {
-            rows.location.block_height == fixture_block.height
-                && rows.location.block_hash == fixture_block.hash
-        })
-        .collect::<Vec<_>>();
-    block_transaction_rows.sort_by_key(|rows| rows.location.tx_index_in_block);
-    let transaction_blobs = if build_inputs.raw_blob_retention.retains_transaction_blobs() {
-        block_transaction_rows
-            .into_iter()
-            .map(|rows| {
-                rows.blob.clone().ok_or_else(|| {
-                    eyre!(
-                        "production canonical fixture transaction {:?} has no raw blob",
-                        rows.location.transaction_id
-                    )
-                })
-            })
-            .collect::<eyre::Result<Vec<_>>>()?
-    } else {
-        Vec::new()
-    };
-    let checkpoint_required = fixture_block.height == build_inputs.tip_height
-        || fixture_block
-            .height
-            .value()
-            .is_multiple_of(TREE_STATE_CHECKPOINT_STRIDE);
-    let tree_state_checkpoint = checkpoint_required.then(|| {
-        CommitmentTreeCheckpoint::new(
-            BlockId::new(fixture_block.height, fixture_block.hash),
-            fixture_block.block_time_seconds,
-            CommitmentTreeFrontiers::default(),
-        )
-    });
-
-    Ok(CanonicalBuildBlock {
-        facts,
-        replay_envelope,
-        compact_block,
-        tip_metadata,
-        tree_state_checkpoint,
-        block_final_note_commitment_roots: None,
-        transaction_blobs,
-        block_blob: build_inputs
-            .raw_blob_retention
-            .retains_block_blobs()
-            .then(|| fixture_block.block_blob_artifact()),
+/// Builds and closes the wallet primary at the canonical primary's fence.
+fn build_wallet_primary(
+    canonical_primary: &RocksDbCanonicalStore,
+    reader_paths: &ReaderPaths,
+) -> eyre::Result<CanonicalServingIdentity> {
+    let reorg_policy = canonical_primary.reorg_policy();
+    let wallet_outcome = build_wallet_from_canonical(
+        canonical_primary,
+        &reader_paths.wallet_primary,
+        RocksDbWalletBuildOptions {
+            supported_reorg_depth: reorg_policy.reorg_window_blocks(),
+            ..RocksDbWalletBuildOptions::for_local_tests()
+        },
+    )?;
+    drop(wallet_outcome.store);
+    Ok(CanonicalServingIdentity {
+        network: canonical_primary.network(),
+        raw_blob_retention: canonical_primary.raw_blob_retention(),
+        reorg_policy,
     })
 }

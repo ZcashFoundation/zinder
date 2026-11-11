@@ -11,7 +11,8 @@ use prost::Message;
 use zinder_core::wire::{encode_rpc_block_hash_hex, encode_zinder_native_chain_name};
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch, ChainEpochId,
-    CompactBlockArtifact, MAX_SUBTREE_ROOTS_PER_REQUEST, Network, ShieldedProtocol,
+    CommitmentTreeFrontiers, CompactBlockArtifact, CompactChainMetadata,
+    MAX_SUBTREE_ROOTS_PER_REQUEST, Network, SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootHash,
     SubtreeRootIndex, SubtreeRootRange,
 };
 use zinder_proto::v1::wallet;
@@ -22,11 +23,15 @@ use zinder_query::{
     visible_tip_block_response,
 };
 use zinder_source::{SourceError, SourceTreeState};
-use zinder_store::{ArtifactFamily, RawBlobRetention};
-use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
+use zinder_store::{ArtifactFamily, CanonicalBuildSubtreeRoot, RawBlobRetention};
+use zinder_testkit::{
+    CanonicalBaseline, CanonicalWriterFixture, ChainFixture, WalletServingStoreFixture,
+    completed_subtree_frontier, sample_regtest_upgrade_activations,
+};
 
 use crate::common::{
-    ProbedNode, probed_serving_query_over, serving_query_after_live_append, serving_query_over,
+    ProbedNode, probed_serving_query_over, serving_query_after_live_append, serving_query_from,
+    serving_query_over,
 };
 
 /// Tree-state payload the release store derives from a checkpoint whose
@@ -433,6 +438,157 @@ async fn subtree_roots_response_returns_valid_empty_range() -> eyre::Result<()> 
     assert!(decoded_response.subtree_roots.is_empty());
 
     Ok(())
+}
+
+#[tokio::test]
+async fn subtree_roots_response_uses_native_wallet_proto_shape() -> eyre::Result<()> {
+    let chain = completed_sapling_subtree_chain(1)?;
+    let completing_block = chain
+        .block_at(BlockHeight::new(1))
+        .cloned()
+        .ok_or_else(|| eyre!("fixture must contain height 1"))?;
+    let root_hash = SubtreeRootHash::from_bytes([0x71; 32]);
+    let writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain).with_subtree_root(CanonicalBuildSubtreeRoot {
+            protocol: ShieldedProtocol::Sapling,
+            subtree_index: SubtreeRootIndex::new(0),
+            root_hash,
+            completing_block_height: completing_block.height,
+        }),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let (wallet_query, _store_fixture) = serving_query_from(writer.into_serving_store_fixture()?)?;
+    let chain_epoch = wallet_query.visible_tip_block(None).await?.chain_epoch;
+
+    let response = subtree_roots_response(
+        &wallet_query,
+        SubtreeRootRange::new(
+            ShieldedProtocol::Sapling,
+            SubtreeRootIndex::new(0),
+            NonZeroU32::new(1).ok_or_else(|| eyre!("invalid max entries"))?,
+        ),
+        None,
+    )
+    .await?;
+    let encoded_response = response.encode_to_vec();
+    let decoded_response = wallet::SubtreeRootsResponse::decode(encoded_response.as_slice())?;
+    let response_chain_epoch = decoded_response
+        .chain_view
+        .as_ref()
+        .and_then(|chain_view| chain_view.chain_epoch.as_ref())
+        .ok_or_else(|| eyre!("missing response chain epoch"))?;
+    let response_subtree_root = decoded_response
+        .subtree_roots
+        .first()
+        .ok_or_else(|| eyre!("missing response subtree root"))?;
+
+    assert_eq!(
+        chain_epoch.tip_metadata.sapling_commitment_tree_size,
+        SUBTREE_LEAF_COUNT
+    );
+    assert_eq!(response_chain_epoch.chain_epoch_id, chain_epoch.id.value());
+    assert_eq!(
+        decoded_response.shielded_protocol,
+        wallet::ShieldedProtocol::Sapling as i32
+    );
+    assert_eq!(decoded_response.start_index, 0);
+    assert_eq!(decoded_response.subtree_roots.len(), 1);
+    assert_eq!(response_subtree_root.root_hash, root_hash.as_bytes());
+    assert_eq!(
+        response_subtree_root.completing_block_hash,
+        encode_rpc_block_hash_hex(completing_block.hash)
+    );
+    assert_eq!(
+        response_subtree_root.completing_block_height,
+        completing_block.height.value()
+    );
+
+    Ok(())
+}
+
+/// A checkpointed store retains only the roots its retained blocks complete.
+///
+/// The floor's trees already hold a completed Sapling subtree, so the epoch
+/// advertises root 0 while the store never loaded it.
+#[tokio::test]
+async fn subtree_roots_response_reports_unavailable_when_completed_root_is_missing()
+-> eyre::Result<()> {
+    let chain = completed_sapling_subtree_chain(2)?;
+    let writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain).with_history_floor(BlockHeight::new(1)),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let (wallet_query, _store_fixture) = serving_query_from(writer.into_serving_store_fixture()?)?;
+    let chain_epoch = wallet_query.visible_tip_block(None).await?.chain_epoch;
+    assert_eq!(
+        chain_epoch
+            .tip_metadata
+            .completed_subtree_count(ShieldedProtocol::Sapling),
+        1
+    );
+
+    let error = match subtree_roots_response(
+        &wallet_query,
+        SubtreeRootRange::new(
+            ShieldedProtocol::Sapling,
+            SubtreeRootIndex::new(0),
+            NonZeroU32::new(1).ok_or_else(|| eyre!("invalid max entries"))?,
+        ),
+        None,
+    )
+    .await
+    {
+        Ok(response) => return Err(eyre!("expected unavailable roots, got {response:?}")),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(
+            error,
+            QueryError::ArtifactUnavailable {
+                family: ArtifactFamily::SubtreeRoot,
+                key: ArtifactKey::SubtreeRootIndex {
+                    protocol: ShieldedProtocol::Sapling,
+                    index
+                }
+            } if index == SubtreeRootIndex::new(0)
+        ),
+        "unexpected missing-root error: {error:?}"
+    );
+
+    Ok(())
+}
+
+/// Builds a chain whose first block completes the first Sapling subtree and
+/// whose later blocks, up to `block_count`, add no note commitments.
+fn completed_sapling_subtree_chain(block_count: u32) -> eyre::Result<ChainFixture> {
+    let mut chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(block_count);
+    let completed_tree = CompactChainMetadata {
+        sapling_commitment_tree_size: SUBTREE_LEAF_COUNT,
+        orchard_commitment_tree_size: 0,
+        ironwood_commitment_tree_size: 0,
+    };
+    for block in chain.blocks().to_vec() {
+        let parent_hash = if block.height == BlockHeight::new(1) {
+            Network::ZcashRegtest.genesis_hash()
+        } else {
+            block.parent_hash
+        };
+        chain = chain.with_compact_block_artifact(CompactBlockArtifact::empty(
+            BlockId::new(block.height, block.hash),
+            parent_hash,
+            block.block_time_seconds,
+            completed_tree,
+        ));
+    }
+    Ok(chain.with_commitment_tree_frontiers_at(
+        BlockHeight::new(1),
+        CommitmentTreeFrontiers::from_validated_parts(
+            Some(completed_subtree_frontier(ShieldedProtocol::Sapling)?),
+            None,
+            None,
+        ),
+    ))
 }
 
 #[tokio::test]
