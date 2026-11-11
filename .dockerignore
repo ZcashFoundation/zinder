@@ -42,6 +42,7 @@ deploy/
 !deploy/capture-container-resource-evidence.sh
 !deploy/canonical-runtime-entrypoint
 !deploy/wallet-serving-runtime-entrypoint
+!deploy/wallet-serving-healthcheck
 !deploy/config/wallet-serving/
 !deploy/config/wallet-serving/**
 

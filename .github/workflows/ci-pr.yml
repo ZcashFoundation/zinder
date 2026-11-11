@@ -163,6 +163,9 @@ jobs:
       - name: Test wallet-serving entrypoint
         run: scripts/test-wallet-serving-entrypoint.sh
 
+      - name: Check Docker build contexts
+        run: scripts/check-docker-build-context.sh
+
       - name: Test release image publication
         run: scripts/test-release-image-publication.sh
 
