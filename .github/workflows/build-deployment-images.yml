@@ -1,0 +1,67 @@
+name: build-deployment-images
+
+# Build the self-built deployment Dockerfiles the way their hosts do: the final
+# stage, from the repository-root context, with the admitted target named. Each
+# file compiles its own binaries, so the paths are limited to what only these
+# builds consume; build-images.yml covers the shared Rust sources through
+# deploy/Dockerfile.
+
+on:
+  pull_request:
+    paths:
+      - ".dockerignore"
+      - "rust-toolchain.toml"
+      - "deploy/Dockerfile.railway-nocache"
+      - "deploy/Dockerfile.wallet-serving"
+      - "deploy/canonical-runtime-entrypoint"
+      - "deploy/wallet-serving-runtime-entrypoint"
+      - "deploy/wallet-serving-healthcheck"
+      - "deploy/config/wallet-serving/**"
+      - ".github/workflows/build-deployment-images.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build deployment image (${{ matrix.image.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - name: wallet-serving
+            dockerfile: deploy/Dockerfile.wallet-serving
+            admitted_target: zinder-wallet-serving-runtime
+          - name: railway-canonical
+            dockerfile: deploy/Dockerfile.railway-nocache
+            admitted_target: zinder-canonical-runtime
+    env:
+      IMAGE_TAG: zinder-${{ matrix.image.name }}:pr-${{ github.event.pull_request.number || 'manual' }}
+      DOCKERFILE: ${{ matrix.image.dockerfile }}
+      ADMITTED_TARGET: ${{ matrix.image.admitted_target }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build and smoke test image
+        run: |
+          set -euo pipefail
+
+          docker buildx build \
+            --file "$DOCKERFILE" \
+            --build-arg "RAILWAY_DOCKER_TARGET_STAGE=${ADMITTED_TARGET}" \
+            --load \
+            --tag "$IMAGE_TAG" \
+            .
+
+          docker image inspect "$IMAGE_TAG" \
+            --format 'image={{.Id}} size_bytes={{.Size}}'
+          docker run --rm --entrypoint=zinder-ingest "$IMAGE_TAG" --help

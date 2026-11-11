@@ -2,9 +2,8 @@ name: build-images
 
 # Build every deploy/Dockerfile runtime image on PRs that could affect Rust
 # binaries, Docker contexts, or the image workflow. The wallet-serving and
-# Railway Dockerfiles are not built here: each needs its own Rust compile, so
-# scripts/check-docker-build-context.sh in ci-pr.yml covers only their build
-# context. Tagged releases push through release.yml.
+# Railway Dockerfiles build in build-deployment-images.yml. Tagged releases
+# push through release.yml.
 
 on:
   pull_request:
