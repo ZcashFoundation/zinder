@@ -72,7 +72,6 @@ private network; substitute your host's):
 | `ZINDER_NODE__AUTH__METHOD` | `cookie` |
 | `ZINDER_NODE__AUTH__COOKIE` | the inline `user:password` cookie string |
 | `ZINDER_PROJECTOR__BUILD_OWNER_HEX` | a stable 32-character hexadecimal value |
-| `ZINDER_INGEST__EXPLORER_VIEWS` | `false` |
 
 These are optional:
 

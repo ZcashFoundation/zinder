@@ -53,6 +53,19 @@ endpoint and authentication, canonical path, wallet workload, wallet-serving
 coverage, transaction retention, reorg policy, operations listener, and private
 control listener through `ZINDER_*` variables.
 
+Set these in the service settings:
+
+| Setting | Value |
+| --- | --- |
+| Healthcheck path | `/healthz` |
+| Healthcheck timeout | `300` seconds |
+| Restart policy | On failure, 10 retries |
+
+Also set the service variables `PORT=9105`, the ingest operational endpoint
+that Railway healthchecks, and `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30`.
+Railway's default drain window gives the canonical writer no time to flush
+RocksDB on redeploy or stop.
+
 `/healthz` proves process liveness. `/readyz` proves only the canonical writer
 and mempool contract. It does not prove wallet projection, wallet-serving admission,
 public TLS, coherent recovery, or client compatibility.

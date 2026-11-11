@@ -117,14 +117,8 @@ validate_single_volume_images_catalog() {
     exit 1
   }
 
-  required_single_volume_images="$({
-    printf '%s\n' zinder-canonical-runtime zinder-wallet-serving
-  } | sort)"
-  configured_single_volume_images="$(
-    jq -r 'if type == "array" and all(.[]; type == "string") then .[] else error("not a string array") end' \
-      "$single_volume_images_catalog" 2>/dev/null | sort
-  )"
-  if [[ "$configured_single_volume_images" != "$required_single_volume_images" ]]; then
+  if ! jq -e 'type == "array" and (sort == ["zinder-canonical-runtime", "zinder-wallet-serving"])' \
+    "$single_volume_images_catalog" > /dev/null 2>&1; then
     cat >&2 <<'EOF'
 release admission rejected: the single-volume image catalog must contain
 exactly the canonical-runtime canary and the wallet-serving image.
@@ -138,7 +132,7 @@ EOF
       echo "release admission rejected: deploy/Dockerfile has no ${image_name} target" >&2
       exit 1
     }
-  done <<< "$configured_single_volume_images"
+  done < <(jq -r '.[]' "$single_volume_images_catalog")
 }
 
 if [[ -n "$compose_contract" ]]; then

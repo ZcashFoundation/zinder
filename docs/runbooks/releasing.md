@@ -275,6 +275,12 @@ do
 done
 ```
 
+The first release that publishes a new image name creates its GHCR package as
+private. An organization admin must set the package visibility to public once.
+After `docker logout ghcr.io`, an anonymous
+`docker pull ghcr.io/gustavovalverde/zinder-wallet-serving:v0.5.0` of the exact
+tag confirms it.
+
 The GitHub Release must contain `zinder.v1.descriptor.bin`, the versioned
 `zinder-api-docs` archive, both versioned GNU/Linux binary archives, their 2
 SPDX 2.3 JSON SBOMs, `SHA256SUMS`, and `SHA256SUMS.sigstore.json`. The API

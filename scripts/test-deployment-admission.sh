@@ -731,6 +731,14 @@ expect_rejected \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
   --single-volume-images-catalog "$explorer_single_volume_catalog"
 
+newline_single_volume_catalog="$temporary_directory/single-volume-with-newline.json"
+printf '%s\n' '["zinder-canonical-runtime\nzinder-wallet-serving"]' \
+  > "$newline_single_volume_catalog"
+expect_rejected \
+  "a single-volume image catalog with one newline-joined image name" \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --single-volume-images-catalog "$newline_single_volume_catalog"
+
 runtime_only_release_workflow="$temporary_directory/runtime-only-release.yml"
 # The literal shell variables are the fixture replacement targets.
 # shellcheck disable=SC2016
