@@ -32,6 +32,7 @@ use zinder_store::{
 mod grpc;
 mod ingest_control;
 mod native_wallet_endpoint_capabilities;
+mod serving_read;
 mod wallet_serving_pair;
 mod wallet_serving_pair_publisher;
 mod wallet_serving_query;
@@ -399,6 +400,78 @@ pub fn describe_request_metrics() {
         "Number of blocks returned by a single CompactBlockRange response, labelled \
          by status. Used to monitor request fan-out and page sizing."
     );
+}
+
+pub(crate) fn record_wallet_query_outcome<Response>(
+    operation: &'static str,
+    started_at: Instant,
+    query_outcome: &Result<Response, QueryError>,
+    block_count: Option<usize>,
+) {
+    let outcome = outcome_from_query_result(query_outcome);
+    zinder_runtime::record_rpc_request(QUERY_RPC_METRICS, operation, started_at.elapsed(), outcome);
+
+    if let Some(block_count) = block_count {
+        metrics::histogram!(
+            "zinder_query_compact_block_range_block_count",
+            "status" => outcome.status_label()
+        )
+        .record(usize_to_u32_saturating(block_count));
+    }
+}
+
+fn outcome_from_query_result<Response>(
+    query_outcome: &Result<Response, QueryError>,
+) -> zinder_runtime::RpcOutcome {
+    match query_outcome {
+        Ok(_) => zinder_runtime::RpcOutcome::Ok,
+        Err(error) => zinder_runtime::RpcOutcome::Error {
+            class: query_error_class(Some(error)),
+        },
+    }
+}
+
+fn query_error_class(error: Option<&QueryError>) -> &'static str {
+    match error {
+        None => "none",
+        Some(QueryError::InvalidBlockRange { .. }) => "invalid_block_range",
+        Some(QueryError::BlockRangeTooLarge { .. }) => "block_range_too_large",
+        Some(QueryError::SubtreeRootRangeTooLarge { .. }) => "subtree_root_range_too_large",
+        Some(QueryError::TransparentBalanceAddressCountExceeded { .. }) => {
+            "transparent_balance_address_count_exceeded"
+        }
+        Some(QueryError::ArtifactUnavailable { .. }) => "artifact_unavailable",
+        Some(QueryError::CompactBlockPayloadMalformed { .. }) => "compact_block_payload_malformed",
+        Some(QueryError::UnsupportedShieldedProtocol { .. }) => "unsupported_shielded_protocol",
+        Some(QueryError::ChainEventCursorInvalid { .. }) => "chain_event_cursor_invalid",
+        Some(QueryError::ChainEventCursorExpired { .. }) => "chain_event_cursor_expired",
+        Some(QueryError::TransparentHistoryCursorInvalid { .. }) => {
+            "transparent_history_cursor_invalid"
+        }
+        Some(QueryError::InvalidAddress { .. }) => "invalid_address",
+        Some(QueryError::ChainEpochPinUnavailable { .. }) => "chain_epoch_pin_unavailable",
+        Some(QueryError::UnsupportedChainEvent { .. }) => "unsupported_chain_event",
+        Some(QueryError::UnsupportedBlockSelector { .. }) => "unsupported_block_selector",
+        Some(QueryError::UnsupportedTransactionStatus { .. }) => "unsupported_transaction_status",
+        Some(QueryError::UnsupportedWalletEncoding { .. }) => "unsupported_wallet_encoding",
+        Some(QueryError::TransactionBroadcastDisabled) => "transaction_broadcast_disabled",
+        Some(QueryError::BroadcastTransactionTooLarge { .. }) => "broadcast_transaction_too_large",
+        Some(QueryError::MaterializedViewUnavailable { .. }) => "materialized_view_unavailable",
+        Some(QueryError::EndpointCapabilityUnavailable { .. }) => "endpoint_capability_unavailable",
+        Some(QueryError::BlockingTaskFailed { .. }) => "blocking_task_failed",
+        Some(QueryError::ArtifactCorrupt { .. }) => "artifact_corrupt",
+        Some(QueryError::BlockNotInBestChain) => "block_not_in_best_chain",
+        Some(QueryError::Store(_)) => "store",
+        Some(QueryError::MaterializedViewStore(_)) => "materialized_view_store",
+        Some(QueryError::WalletProjectionRead { .. }) => "wallet_projection_read",
+        Some(QueryError::CanonicalStore(_)) => "canonical_store",
+        Some(QueryError::WalletStore(_)) => "wallet_store",
+        Some(QueryError::Node(_)) => "node",
+    }
+}
+
+fn usize_to_u32_saturating(amount: usize) -> u32 {
+    u32::try_from(amount).map_or(u32::MAX, |converted| converted)
 }
 
 /// Records duration + outcome for a `WalletQuery` RPC that the gRPC adapter

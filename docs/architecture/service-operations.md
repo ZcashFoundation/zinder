@@ -270,6 +270,59 @@ wallet source position, projection lag, transition bytes, digest validation,
 and checkpoint operations. Store metrics use explicit canonical or wallet role
 labels.
 
+### Wallet query requests
+
+`zinder-query` and `zinder-compat-lightwalletd` both serve wallet reads through
+`WalletServingQuery`, and both export one request series for them:
+
+- `zinder_query_request_total{operation,status,error_class}` counts requests.
+- `zinder_query_request_duration_seconds{operation,status,error_class}` is a
+  histogram of request latency.
+- `zinder_query_compact_block_range_block_count{status}` samples the block
+  count each `compact_blocks_in_range` request asked for.
+
+`status` is `ok` or `error`. `error_class` is `none` on success. On error it is
+the snake-case name of the `QueryError` variant, such as
+`block_range_too_large`, `artifact_unavailable`, or `chain_epoch_pin_unavailable`.
+`operation` is the domain read, such as `visible_tip_block`,
+`compact_blocks_in_range`, `transaction_by_id`, `tree_state_at`, or
+`subtree_roots_in_range`.
+
+Each `WalletServingQuery` request records exactly one sample when it returns.
+The sample's duration covers argument validation, the storage read, and any
+upstream node call, such as the tree-state fill or transaction broadcast. A
+request rejected by validation is still recorded with its error class. A read
+the serving pair cannot answer still records, with an error class such as
+`endpoint_capability_unavailable` or `materialized_view_unavailable`, and so
+does `network_upgrade_activations`, which reads no storage. A streaming read
+records when the stream is established. Later sub-reads of the stream do not
+record. One protocol request can produce several samples when it composes
+several domain reads. For example, a compatibility request that pins the
+visible tip first records a `visible_tip_block` sample.
+
+The chain-event reads are the exception. `chain_events` page reads and
+`resolve_chain_events_start` serve a stream that the adapter records, so they
+record nothing themselves. The stream counts once and idle polling does not
+inflate the request rate.
+
+The native gRPC adapter records the operations it owns under the same metric
+names, with the `tonic::Code` name as `error_class`:
+
+- `chain_events` stream establishment.
+- The ingest-control proxies `mempool_transaction`, `mempool_snapshot`,
+  `mempool_events`, `transparent_mempool_outputs_by_address`,
+  `transparent_mempool_spends_by_outpoint`, and
+  `transparent_mempool_outputs_by_outpoint`.
+
+The release native endpoint does not advertise
+`wallet.address.transparent_balance_v1`. It rejects transparent balance
+requests at the capability check with `FAILED_PRECONDITION`, which records no
+sample. A direct `WalletServingQuery` balance read, such as the lightwalletd
+compatibility balance request, records under `transparent_address_balance`.
+
+The `ZinderWalletQueryP95High` alert and the overview dashboard read these
+series.
+
 ### Compatibility reader
 
 Compatibility metrics report writer-status availability, catch-up duration,
