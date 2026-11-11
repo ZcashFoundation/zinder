@@ -39,18 +39,16 @@ use zinder_source::{
     ZebraJsonRpcSourceOptions,
 };
 use zinder_store::{
-    CanonicalReorgPolicy, CanonicalStoreWorkload, ChainStoreOptions, MempoolEventRetentionConfig,
-    RocksDbCanonicalSecondary, RocksDbResourceBudget, SecondaryChainStore,
+    CanonicalReorgPolicy, CanonicalStoreWorkload, MempoolEventRetentionConfig,
+    RocksDbCanonicalSecondary, RocksDbResourceBudget,
 };
 
 use crate::config::{
-    CanonicalReplayVerificationConfigOverrides, IngestCommandConfig, IngestConfigError,
-    IngestConfigOverrides, IngestCoverage,
+    IngestCommandConfig, IngestConfigError, IngestConfigOverrides, IngestCoverage,
 };
 
 mod cli;
 mod config;
-mod replay_verification;
 
 const REQUIRED_INGEST_NODE_CAPABILITIES: &[NodeCapability] = &[
     NodeCapability::JsonRpc,
@@ -115,25 +113,10 @@ struct Cli {
     /// Number of near-tip blocks that may be replaced by a reorg.
     #[arg(long = "reorg-window-blocks", global = true)]
     reorg_window_blocks: Option<u32>,
-    /// Phase-classifier boundary; gaps above this trigger `BulkCatchup`.
+    /// Gap at which `probe` reports `BulkCatchup` instead of `FollowingTip`.
     #[arg(long = "catchup-threshold-blocks", global = true)]
     catchup_threshold_blocks: Option<u32>,
-    /// Maximum number of blocks committed in one bulk-catchup batch.
-    #[arg(long = "canonical-batch-max-blocks", global = true)]
-    canonical_batch_max_blocks: Option<u32>,
-    /// Maximum canonical artifact bytes accumulated before closing a batch.
-    #[arg(long = "canonical-batch-max-artifact-bytes", global = true)]
-    canonical_batch_max_artifact_bytes: Option<u64>,
-    /// Maximum estimated canonical write bytes accumulated before closing a batch.
-    #[arg(long = "canonical-batch-max-estimated-write-bytes", global = true)]
-    canonical_batch_max_estimated_write_bytes: Option<u64>,
-    /// Minimum blocks before estimated write bytes can close a batch.
-    #[arg(
-        long = "canonical-batch-min-blocks-before-estimated-write-close",
-        global = true
-    )]
-    canonical_batch_min_blocks_before_estimated_write_close: Option<u32>,
-    /// Maximum connected blocks requested from the source in one bulk-catchup segment.
+    /// Maximum connected blocks requested from the source in one construction segment.
     #[arg(long = "source-segment-max-blocks", global = true)]
     source_segment_max_blocks: Option<u32>,
     /// Target response bytes for adaptive source segment sizing.
@@ -151,22 +134,17 @@ struct Cli {
     /// Delay between upstream node tip polls, in milliseconds.
     #[arg(long = "poll-interval-ms", global = true)]
     poll_interval_ms: Option<u64>,
-    /// Lag threshold (in blocks) below which tip-follow reports `Ready`.
+    /// Lag threshold (in blocks) below which the canonical follower reports `Ready`.
     #[arg(long = "lag-threshold-blocks", global = true)]
     lag_threshold_blocks: Option<u64>,
     /// Stop committing after reaching this height.
     #[arg(long = "target-height", global = true)]
     target_height: Option<u32>,
-    /// Bootstrap an empty store from the upstream node's chain state at
-    /// this height (the ingest loop begins at `checkpoint_height + 1`).
+    /// Construct an empty store from the upstream node's chain state at
+    /// this height (construction begins at `checkpoint_height + 1`).
     #[arg(long = "checkpoint-height", global = true)]
     checkpoint_height: Option<u32>,
-    /// Allow bulk-catchup batches to advance the settled tip inside the upstream
-    /// node's reorg window. Disposable-store recovery only.
-    #[arg(long = "allow-reorg-window-settlement", action = clap::ArgAction::SetTrue, global = true)]
-    allow_reorg_window_settlement: bool,
-    /// Derive the bulk-catchup floor needed by native wallets from
-    /// node-advertised activation heights.
+    /// Construct the complete history native wallets need.
     #[arg(long = "wallet-serving", action = clap::ArgAction::SetTrue, global = true)]
     wallet_serving: bool,
     /// Private ingest-control gRPC listen address.
@@ -186,22 +164,6 @@ enum Command {
     /// upstream-health snapshot, then exit. Diagnostic only; does not ingest
     /// or commit chain data.
     Probe,
-    /// Check replay-envelope integrity and canonical-header parity through a
-    /// reader-local `RocksDB` secondary.
-    VerifyCanonicalReplay(CanonicalReplayVerificationArgs),
-}
-
-#[derive(Parser)]
-struct CanonicalReplayVerificationArgs {
-    /// Network name, such as zcash-regtest.
-    #[arg(long)]
-    network: Option<String>,
-    /// Canonical Zinder store path opened as the secondary's primary source.
-    #[arg(long = "storage-path")]
-    storage_path: Option<PathBuf>,
-    /// Reader-local metadata path for this verification run.
-    #[arg(long = "secondary-path")]
-    secondary_path: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -214,7 +176,7 @@ async fn main() -> ExitCode {
     }
 
     if cli.print_config {
-        return run_print_config(cli);
+        return run_print_config(&cli);
     }
 
     Box::pin(run_runtime(cli)).await
@@ -1053,15 +1015,6 @@ fn resolve_wallet_serving_modifiers(command_config: &mut IngestCommandConfig) {
     command_config.runtime_config.run_overrides = CanonicalRunOverrides {
         target_height: command_config.runtime_config.run_overrides.target_height,
         checkpoint_height: Some(checkpoint_height),
-        allow_reorg_window_settlement: command_config
-            .runtime_config
-            .run_overrides
-            .allow_reorg_window_settlement,
-        checkpoint: command_config
-            .runtime_config
-            .run_overrides
-            .checkpoint
-            .clone(),
     };
     tracing::info!(
         target: "zinder::ingest",
@@ -1233,16 +1186,9 @@ fn spawn_upstream_health_probe_for(
     clippy::print_stdout,
     reason = "--print-config is a structured TOML data dump, not a log event"
 )]
-fn run_print_config(cli: Cli) -> ExitCode {
-    let ops_listen_addr_override = cli.ops_listen_addr;
-    let overrides = ingest_overrides_with_ops(&cli, ops_listen_addr_override);
-    let config_path = cli.config_path.clone();
-    let render_result = match cli.command {
-        None | Some(Command::Probe) => print_ingest_config(config_path, overrides),
-        Some(Command::VerifyCanonicalReplay(args)) => {
-            print_canonical_replay_verification_config(config_path, args)
-        }
-    };
+fn run_print_config(cli: &Cli) -> ExitCode {
+    let overrides = ingest_overrides_with_ops(cli, cli.ops_listen_addr);
+    let render_result = print_ingest_config(cli.config_path.clone(), overrides);
 
     match render_result {
         Ok(rendered_toml) => {
@@ -1259,9 +1205,6 @@ async fn run_runtime(cli: Cli) -> ExitCode {
     let config_path = cli.config_path.clone();
     let runtime_result = match cli.command {
         Some(Command::Probe) => run_probe(config_path, overrides).await,
-        Some(Command::VerifyCanonicalReplay(args)) => {
-            run_canonical_replay_verification(config_path, args)
-        }
         None => Box::pin(run_ingest(config_path, overrides)).await,
     };
 
@@ -1297,11 +1240,6 @@ fn ingest_overrides_with_ops(
         max_response_bytes: cli.max_response_bytes,
         reorg_window_blocks: cli.reorg_window_blocks,
         catchup_threshold_blocks: cli.catchup_threshold_blocks,
-        canonical_batch_max_blocks: cli.canonical_batch_max_blocks,
-        canonical_batch_max_artifact_bytes: cli.canonical_batch_max_artifact_bytes,
-        canonical_batch_max_estimated_write_bytes: cli.canonical_batch_max_estimated_write_bytes,
-        canonical_batch_min_blocks_before_estimated_write_close: cli
-            .canonical_batch_min_blocks_before_estimated_write_close,
         source_segment_max_blocks: cli.source_segment_max_blocks,
         source_segment_target_response_bytes: cli.source_segment_target_response_bytes,
         source_fetch_max_in_flight_requests: cli.source_fetch_max_in_flight_requests,
@@ -1311,7 +1249,6 @@ fn ingest_overrides_with_ops(
         lag_threshold_blocks: cli.lag_threshold_blocks,
         target_height: cli.target_height,
         checkpoint_height: cli.checkpoint_height,
-        allow_reorg_window_settlement: cli.allow_reorg_window_settlement.then_some(true),
         wallet_serving: cli.wallet_serving.then_some(true),
         ingest_control_listen_addr: cli.ingest_control_listen_addr,
         ingest_control_bearer_token_path: cli.ingest_control_token_path.clone(),
@@ -1320,58 +1257,12 @@ fn ingest_overrides_with_ops(
     }
 }
 
-#[allow(
-    clippy::print_stdout,
-    reason = "canonical replay verification emits one machine-readable operator report"
-)]
-fn run_canonical_replay_verification(
-    config_path: Option<PathBuf>,
-    args: CanonicalReplayVerificationArgs,
-) -> Result<(), IngestConfigError> {
-    let command_config =
-        config::load_canonical_replay_verification_config(config_path, args.into())?;
-    let secondary_store = SecondaryChainStore::open(
-        &command_config.storage_path,
-        &command_config.secondary_path,
-        ChainStoreOptions {
-            rocksdb_resource_budget: command_config.canonical_rocksdb_budget,
-            ..ChainStoreOptions::for_network(command_config.network)
-        },
-    )
-    .map_err(IngestError::from)?;
-    secondary_store.try_catch_up().map_err(IngestError::from)?;
-    let report = replay_verification::verify_canonical_replay_store(&secondary_store)?;
-    let report_json = report.to_json()?;
-    println!("{report_json}");
-
-    Ok(())
-}
-
 fn print_ingest_config(
     config_path: Option<PathBuf>,
     overrides: IngestConfigOverrides,
 ) -> Result<String, IngestConfigError> {
     let command_config = config::load_ingest_config(config_path, overrides)?;
     config::redacted_ingest_config_toml(&command_config)
-}
-
-fn print_canonical_replay_verification_config(
-    config_path: Option<PathBuf>,
-    args: CanonicalReplayVerificationArgs,
-) -> Result<String, IngestConfigError> {
-    let command_config =
-        config::load_canonical_replay_verification_config(config_path, args.into())?;
-    config::redacted_canonical_replay_verification_config_toml(&command_config)
-}
-
-impl From<CanonicalReplayVerificationArgs> for CanonicalReplayVerificationConfigOverrides {
-    fn from(args: CanonicalReplayVerificationArgs) -> Self {
-        Self {
-            network: args.network,
-            storage_path: args.storage_path,
-            secondary_path: args.secondary_path,
-        }
-    }
 }
 
 #[cfg(test)]

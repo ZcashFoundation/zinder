@@ -117,8 +117,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Optional Zebra indexer gRPC endpoint enabling the streaming mempool source \
-                      and chain-tip wakeups. Falls back to JSON-RPC polling when unset or empty.",
+        description: "Optional Zebra indexer gRPC endpoint enabling the streaming mempool source. \
+                      Falls back to JSON-RPC mempool polling when unset or empty.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__AUTH__METHOD",
@@ -445,7 +445,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         name: "ZINDER_STORAGE__SECONDARY_PATH",
         toml_path: "storage.secondary_path",
         used_by: &[
-            "zinder-ingest (verify-canonical-replay only)",
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
@@ -1053,45 +1052,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Gap (in blocks) at which the phase-driven ingest loop transitions between \
-                      `BulkCatchup` and `TipFollow`. Defaults to `ingest.reorg_window_blocks`. \
-                      See [ADR-0015](../adrs/0015-phase-driven-ingest.md).",
-    },
-    EnvVarDoc {
-        name: "ZINDER_INGEST__CONSTRUCTION__CANONICAL_BATCH_MAX_BLOCKS",
-        toml_path: "ingest.construction.canonical_batch_max_blocks",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Block count per bulk-catchup commit batch. Defaults to 1000.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_INGEST__CONSTRUCTION__CANONICAL_BATCH_MAX_ARTIFACT_BYTES",
-        toml_path: "ingest.construction.canonical_batch_max_artifact_bytes",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Canonical artifact bytes accumulated before closing a bulk-catchup batch. \
-                      Defaults to 536870912.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_INGEST__CONSTRUCTION__CANONICAL_BATCH_MAX_ESTIMATED_WRITE_BYTES",
-        toml_path: "ingest.construction.canonical_batch_max_estimated_write_bytes",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Estimated canonical write bytes accumulated before closing a \
-                      bulk-catchup batch. Defaults to 536870912.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_INGEST__CONSTRUCTION__CANONICAL_BATCH_MIN_BLOCKS_BEFORE_ESTIMATED_WRITE_CLOSE",
-        toml_path: "ingest.construction.canonical_batch_min_blocks_before_estimated_write_close",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Minimum blocks accumulated before estimated write bytes can close a \
-                      bulk-catchup batch. Single oversized blocks can still close immediately. \
-                      Defaults to 100.",
+        description: "Gap (in blocks) above which `zinder-ingest probe` reports `BulkCatchup` \
+                      instead of `FollowingTip`. Defaults to `ingest.reorg_window_blocks`. See \
+                      [ADR-0015](../adrs/0015-phase-driven-ingest.md).",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__CONSTRUCTION__SOURCE_SEGMENT_MAX_BLOCKS",
@@ -1150,31 +1113,12 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       `clamp(container_memory / 64, 134217728, 536870912)`.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__CONSTRUCTION__COMMIT_REASSEMBLY_MAX_QUEUED_ARTIFACT_BYTES",
-        toml_path: "ingest.construction.commit_reassembly_max_queued_artifact_bytes",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Maximum settled-tip artifact bytes that can accumulate while the previous \
-                      bulk-catchup batch is attaching metadata, committing, or flushing. \
-                      Defaults to 536870912.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_INGEST__CONSTRUCTION__FLUSH_INTERVAL_EPOCHS",
-        toml_path: "ingest.construction.flush_interval_epochs",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Bulk-catchup RocksDB flush cadence in committed epochs. Must be greater \
-                      than zero. Defaults to 5.",
-    },
-    EnvVarDoc {
         name: "ZINDER_INGEST__FOLLOW__POLL_INTERVAL_MS",
         toml_path: "ingest.follow.poll_interval_ms",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Tip-follow poll cadence in milliseconds. Must be greater than zero. \
+        description: "Canonical follower poll cadence in milliseconds. Must be greater than zero. \
                       Defaults to 1000.",
     },
     EnvVarDoc {
@@ -1183,7 +1127,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Block lag at which tip-follow reports `cause=syncing`. Defaults to 1.",
+        description: "Block lag at which the canonical follower reports `cause=syncing`. \
+                      Defaults to 1.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__FOLLOW__MAX_REPLACEMENT_BYTES",
@@ -1212,17 +1157,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Pre-seed an empty store from an upstream-supplied checkpoint at this \
+        description: "Construct an empty store from an upstream-supplied checkpoint at this \
                       height.",
-    },
-    EnvVarDoc {
-        name: "ZINDER_INGEST__RUN_OVERRIDES__ALLOW_REORG_WINDOW_SETTLEMENT",
-        toml_path: "ingest.run_overrides.allow_reorg_window_settlement",
-        used_by: &["zinder-ingest"],
-        requirement: Requirement::Optional,
-        sensitive: false,
-        description: "Disposable-store override: lets bulk-catchup advance the settled tip inside \
-                      the reorg window. Invalid combined with `coverage = \"wallet-serving\"`.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__RUN_OVERRIDES__COVERAGE",

@@ -3,7 +3,7 @@
 //! Stores hydrated [`MempoolEntry`] records and the secondary indexes
 //! needed by the wallet data plane: transparent outputs by address and
 //! transparent spends by outpoint. Mempool state is non-canonical and is
-//! never written through `commit_ingest_batch`; the ingest layer holds it
+//! never written by a canonical block commit; the ingest layer holds it
 //! exclusively and exposes read methods to the colocated `IngestControl`
 //! gRPC handlers.
 //!

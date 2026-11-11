@@ -17,7 +17,7 @@ provide operators with the actionable reason and recovery cadence.
 
 ## Decision
 
-1. **Ingest owns recovery lifecycle.** `services/zinder-ingest/src/source_recovery.rs::decide_recovery(&IngestError, SourceRecoveryBackoff) -> SourceRecoveryDecision` returns `Recover { failure_class, last_reason, backoff }` or `Exit`; bulk-catchup and following paths apply that decision.
+1. **Ingest owns recovery lifecycle.** `services/zinder-ingest/src/source_recovery.rs::decide_recovery(&IngestError, SourceRecoveryBackoff) -> SourceRecoveryDecision` returns `Recover { failure_class, last_reason, backoff }` or `Exit`; the canonical follower applies that decision.
 2. **Source errors are loop-recoverable.** Every `SourceError` variant returns `Recover`. Storage failures, reorg-window violations, and internal integrity errors return `Exit`.
 3. **Unknown upstream responses recover by source identity.** Adapters preserve an actionable `SourceError` and classify it rather than treating an unrecognized upstream response as a fatal loop decision.
 4. **Source errors describe observations.** `SourceFailureClass` (`NodeUnreachable`, `UpstreamViewChanged`, `StreamDisconnected`, `CapabilityMissing`, `ProtocolMismatch`, `Malformed`, `Configuration`) is the operator-facing label returned by `SourceError::upstream_classification()`.
@@ -34,4 +34,4 @@ provide operators with the actionable reason and recovery cadence.
 
 - `docs/architecture/node-source-boundary.md` — Capability Model section: `SourceFailureClass` taxonomy and the operator-action table (`failure_class` → action).
 - `docs/architecture/service-operations.md` — Health and Readiness section: the `NodeUnavailableDetail` payload contract.
-- `docs/architecture/chain-ingestion.md` — Bulk catchup and tip following: loop-owned recovery posture.
+- `docs/architecture/chain-ingestion.md` — Continuous following: loop-owned recovery posture.

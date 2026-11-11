@@ -11,7 +11,7 @@ reads and secondary behavior.
 
 ## Canonical RocksDB
 
-The release canonical store is implemented by `RocksDbCanonicalStore` and
+The canonical store is implemented by `RocksDbCanonicalStore` and
 `RocksDbCanonicalSecondary`. Its persisted identity is `canonical`, and its
 physical layout is versioned by `CANONICAL_STORE_SCHEMA_VERSION`.
 
@@ -76,12 +76,12 @@ new source position. Ready readers never repair or advance the store.
 ## Materialized-view RocksDB
 
 `MaterializedViewStore` is stored under the `materialized-views` subdirectory of
-the artifact-oriented canonical path. Its shared container is versioned by
+the configured canonical `storage.path`. Its shared container is versioned by
 `MATERIALIZED_VIEW_STORE_FORMAT_VERSION`; each consumer separately versions its
 owned row contract through `MaterializedViewConsumerSchema`.
 
 Consumer rows, cursors, materialized-view state, coverage, and schema metadata remain
-separate from both release canonical and wallet storage. See
+separate from both canonical and wallet storage. See
 [Materialized-view plane](materialized-view-plane.md).
 
 ## Primary and secondary roles
@@ -110,11 +110,6 @@ transition changes rather than the reorg window.
 `zinder-compat-lightwalletd` alternates secondary generations so it can catch up
 and validate a replacement pair before publishing it. In-flight requests keep
 their existing immutable pair.
-
-The artifact-oriented `PrimaryChainStore`, `SecondaryChainStore`, and
-`ChainEpochReader` remain the canonical contract used by optional explorer and
-materialized-view components. They follow the same one-primary and epoch-bound
-read rules but are not the release wallet-serving store.
 
 ## Resource bounds
 

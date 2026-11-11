@@ -27,8 +27,8 @@ For the event model: source observations are not committed chain events. Ingest 
 
 `zinder-ingest` consumes source events through one deterministic state machine; the pipeline and substep decomposition are in [Chain ingestion §Operation Shape](chain-ingestion.md#operation-shape). The contract this document owns:
 
-- The event is persisted in the same `commit_chain_epoch` `WriteBatch` that advances the visible epoch pointer. Publication and commit are atomic.
-- The state machine produces three outputs: a `ChainEpochArtifacts` value passed to `commit_chain_epoch`, a durable epoch pointer after the batch succeeds, and a `ChainEvent` published only after the epoch is durable.
+- The event is persisted in the same synced `WriteBatch` that writes the block rows, the next `ChainEpoch`, and the ready control record. Baseline publication, `RocksDbCanonicalStore::commit_live_append`, and `RocksDbCanonicalStore::commit_live_replacement` each commit one such batch. Publication and commit are atomic.
+- Each commit returns the next `CanonicalEventFence` only after readback authenticates the batch. A `ChainEvent` is published only after that fence is durable.
 
 ## Canonical Event Boundary
 
@@ -46,30 +46,29 @@ pub enum ChainEvent {
 }
 ```
 
-Use `ChainReorged` when one durable transition both invalidates a visible range within the reorg window and commits the replacement range. Use `ChainCommitted` for a pure append or settled-tip advance. A `ChainCommitted` event whose `committed.block_range.start > committed.block_range.end` advances epoch metadata without publishing block artifacts; materialized-view consumers should advance their cursor and apply no block contexts. Zinder does not expose an explicit rollback transition without a replacement range.
+Use `ChainReorged` when one durable transition both invalidates a visible range within the reorg window and commits the replacement range. Use `ChainCommitted` for the construction baseline and for an append, which may also advance the settled tip. Every committed range is non-empty. Zinder does not expose an explicit rollback transition without a replacement range.
 
-Do not publish source observations as `ChainEvent`. Do not publish `ChainEvent` before `commit_chain_epoch` succeeds.
+Do not publish source observations as `ChainEvent`. Do not publish `ChainEvent` before its commit succeeds and readback authenticates the new fence.
 
 ## Reorg Replacement Contract
 
-`ChainEpochArtifacts.reorg_window_change` carries the storage mutation that makes the event true:
+Each canonical store operation makes exactly one kind of event true:
 
-| Chain transition | `ReorgWindowChange` | Published event |
-| ---------------- | ------------------- | --------------- |
-| Append inside the current best chain | `Extend { blocks }` | `ChainCommitted` |
-| Reorg inside the configured window | `Replace { from_height }` | `ChainReorged` |
-| Settled tip advances | `AdvanceSettledTipTo { height }` | `ChainCommitted` |
-| No reorg-window mutation | `Unchanged` | `ChainCommitted` only when artifacts changed |
+| Chain transition | Store operation | Published event |
+| ---------------- | --------------- | --------------- |
+| Fresh construction publishes its baseline | `CanonicalBaselinePublication` | `ChainCommitted` for the retained range |
+| Append of the next connected block | `CanonicalLiveAppend` through `commit_live_append` | `ChainCommitted` for that one block |
+| Reorg inside the configured window | `CanonicalLiveReplacement` through `commit_live_replacement` | `ChainReorged` |
 
-The replacement range must start at the first height where the old visible branch and the new selected branch differ. It must not replace data at or below the settled tip. If the replacement starts below the supported window or below the settled-tip boundary, `zinder-ingest` returns `ReorgWindowExceeded`, fails readiness with `reorg_window_exceeded`, and requires operator action. A node tip that is itself a retained canonical block, even at or below the settled tip, is a node that fell behind on the same branch rather than a replacement: ingest reports `node_unavailable` and waits for the node to catch up.
+A replacement reverts the unsettled suffix from the first height where the old visible branch and the new selected branch differ through the previous visible tip, and commits the new branch from that same height. It must not replace data at or below the settled tip, and it displaces at most the `reorg_window_blocks` that `CanonicalReorgPolicy` persists. If the common parent lies at or below the settled tip, `zinder-ingest` returns `ReorgWindowExceeded`, fails readiness with `reorg_window_exceeded`, and requires operator action. A node tip that is itself a retained canonical block, even at or below the settled tip, is a node that fell behind on the same branch rather than a replacement: ingest reports `node_unavailable` and waits for the node to catch up.
 
 A parked writer keeps its control listener open and reports the halt through `IngestControl.WriterStatus.reorg_window_exceeded` and `CanonicalControl.WriterStatus.reorg_window_exceeded`. Native query and lightwalletd compatibility then refuse new requests with `REORG_WINDOW_EXCEEDED`, and native query ends every open `WalletQuery.ChainEvents` and `WalletQuery.MempoolEvents` stream with the same status, so a consumer sees a typed halt instead of a stream that stops advancing. The default window matches the node's finalization bound, so a park signals a change the node itself could not produce. See [ADR-0041](../adrs/0041-reorg-window-follows-the-node-bound.md).
 
 Reject the name `ReorgTooDeep`. It describes a symptom. `ReorgWindowExceeded` names the configured boundary that was violated.
 
-The phase-driven ingest loop's `TipFollow` phase is the only producer of
-`ReorgWindowChange::Replace`; the `BulkCatchup` phase only appends and settles
-already-stable ranges outside the reorg window.
+Only continuous following produces `ChainReorged`. Construction publishes one
+baseline whose settled tip stays `ingest.reorg_window_blocks` below the
+construction tip.
 
 ## Wire Event Envelope
 
@@ -103,13 +102,14 @@ The cursor body is not decorative state. `event_sequence` is the resume key, and
 
 ## Resume Semantics
 
-Library-hosted derived consumers resume through
-`chain_event_history(ChainEventHistoryRequest { from_cursor, max_events })`
-during startup repair. The replay host reads the lowest durable materialized-view cursor,
-replays retained events after that cursor, and dispatches each event through
+The ingest-hosted materialized-view tailer resumes through
+`RocksDbCanonicalSecondary::canonical_event_history(CanonicalEventHistoryRequest { from_cursor, max_events })`.
+It reads the lowest durable materialized-view cursor, replays retained events
+after that cursor, hydrates each transition's committed block contexts, and
+dispatches them through
 `zinder_materialized_views::MaterializedViewStore::write_chain_event`. The materialized-view store persists each
-cursor advance atomically with consumer writes. Fresh consumers whose persisted
-cursor sits below the retention floor rebuild from canonical artifacts before
+cursor advance atomically with consumer writes. Consumers whose persisted
+cursor sits below the retention floor rebuild from canonical heights before
 resuming retained-event replay.
 
 Wallet consumers resume through `WalletQuery.ChainEvents` per [Wallet data plane §Chain-Event Subscription](wallet-data-plane.md#chain-event-subscription). The wire request expresses the start as the required `EventStreamStart` oneof (`after_cursor` | `earliest_retained` | `live_tail`, [ADR-0027](../adrs/0027-event-stream-start-positions.md)); the rules below govern the resolved resume position and are the same for both consumer paths.
@@ -135,7 +135,7 @@ Rules:
 
 Only the active `ChainEvents` family codes are defined here.
 
-Do not use `epoch_history(from)` as the durable API name. It hides reorgs. Use `chain_event_history` or an explicitly equivalent gRPC name because consumers are replaying events, not only listing epochs.
+Do not use `epoch_history(from)` as the durable API name. It hides reorgs. Use `canonical_event_history`, `wallet_chain_event_history`, or an explicitly equivalent gRPC name because consumers are replaying events, not only listing epochs.
 
 Chain-event rows store event data and deterministic cursor inputs, not opaque
 cursor bytes. The cursor is reconstructed when the envelope is returned, so the
@@ -153,10 +153,10 @@ Use these errors at the event and source boundaries:
 | `SourceProtocolMismatch` | `NodeSource` | The source response does not match the expected network or protocol version |
 | `BlockUnavailable` | `NodeSource` | A block needed for ancestor reconstruction cannot be fetched |
 | `ReorgWindowExceeded` | ingest and API | The selected branch requires replacing data outside the supported window |
-| `EventCursorExpired` | `ChainEpochReadApi` | The event cursor is older than retained event history |
-| `EventCursorInvalid` | `ChainEpochReadApi` | The cursor fails authentication, network, store, or stream-family validation |
+| `EventCursorExpired` | `RocksDbCanonicalSecondary` and `CanonicalReader` | The event cursor is older than retained event history |
+| `EventCursorInvalid` | `RocksDbCanonicalSecondary` and `CanonicalReader` | The cursor fails authentication, network, store, or stream-family validation |
 
-Internal storage errors still map to API errors at service boundaries: `ChainEpochMissing` maps to `EpochNotFound`, and `ArtifactMissing` maps to `ArtifactUnavailable`.
+Canonical storage errors map to API errors at service boundaries. A requested `at_epoch_id` that is not the serving pair's admitted chain epoch maps to `CHAIN_EPOCH_PIN_UNAVAILABLE`. A block-keyed artifact that the admitted epoch does not hold maps to `ARTIFACT_UNAVAILABLE`, with the artifact family label in `ResourceInfo`.
 
 ## Retention And Backpressure
 
@@ -165,7 +165,7 @@ Internal storage errors still map to API errors at service boundaries: `ChainEpo
 Event streams must be bounded:
 
 - `ChainEventEnvelope` streams apply backpressure to `zinder-query` and `zinder-explorer`.
-- A slow consumer must not block `commit_chain_epoch`.
+- A slow consumer must not block a canonical commit.
 - If a consumer exceeds retention, the system returns `EventCursorExpired` and requires replay from checkpoint or canonical artifacts.
 
 Chain-event retention is governed by [Chain events §Retention And Backpressure](chain-events.md#retention-and-backpressure). The default policy is time-windowed, operator-tunable through `[retention] chain_event_retention_hours` (default 168). A background pruning task in `zinder-ingest` deletes events whose `created_at` falls below the cutoff; pruning preserves `event_sequence` monotonicity by leaving gaps rather than rewriting the sequence space. The `oldest_retained_sequence` is surfaced through the `cursor_at_risk` readiness cause when the retention window approaches exhaustion under load. Operators tune retention based on consumer characteristics; setting `chain_event_retention_hours = 0` disables pruning and is reserved for local development.
@@ -182,7 +182,7 @@ Implementation modules are named after the boundary they own:
 - `chain_reorg`
 - `event_cursor`
 
-`event_stream` is the single home for the resumable subscription driver. One generic `run_event_stream`, parameterized by the `EventEnvelope` cursor-extraction trait, serves every cursor-bound family (chain events and mempool events); families differ only in the page-reader they pass in. The store-side resume resolution shares one `resolve_event_history_start_sequence` skeleton across families, with a family-specific position-check hook that owns cursor authentication, sequence-bound validation, and any fork or expiry handling.
+`event_stream` is the single home for the resumable subscription driver. One generic `run_event_stream`, parameterized by the `EventEnvelope` cursor-extraction trait, serves every cursor-bound family (chain events and mempool events); families differ only in the page-reader they pass in. Store-side resume resolution is family-specific: `RocksDbCanonicalSecondary::resolve_wallet_chain_event_stream_start` resolves chain-event starts and `RocksDbCanonicalStore::resolve_mempool_event_stream_start` resolves mempool-event starts. Each owns cursor authentication, sequence-bound validation, and any fork or expiry handling for its family.
 
 Avoid `event_service`, `reorg_manager`, `notification_handler`, `source_processor`, `stream_utils`, and public `push` modules. Those names hide ownership and do not tell a reader which boundary they are reading.
 

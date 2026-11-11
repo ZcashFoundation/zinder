@@ -6,70 +6,38 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use eyre::eyre;
 use prost::Message;
 use zinder_core::wire::{encode_rpc_block_hash_hex, encode_zinder_native_chain_name};
 use zinder_core::{
-    BlockHeight, BlockHeightRange, BlockId, ChainEpoch, ChainTipMetadata, CompactBlockArtifact,
-    CompactChainMetadata, MAX_SUBTREE_ROOTS_PER_REQUEST, Network, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, TreeStateArtifact,
+    BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch, ChainEpochId,
+    CompactBlockArtifact, MAX_SUBTREE_ROOTS_PER_REQUEST, Network, ShieldedProtocol,
+    SubtreeRootIndex, SubtreeRootRange,
 };
 use zinder_proto::v1::wallet;
 use zinder_query::{
-    ArtifactKey, DEFAULT_MAX_COMPACT_BLOCK_RANGE, QueryError, WalletQuery, WalletQueryApi,
-    WalletQueryOptions, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
-    latest_tree_state_checkpoint_response, subtree_roots_response, tree_state_at_response,
-    visible_tip_block_response,
+    DEFAULT_MAX_COMPACT_BLOCK_RANGE, QueryError, WalletQueryApi, WalletServingPairSlot,
+    WalletServingQuery, WalletServingReadPair, latest_tree_state_checkpoint_response,
+    subtree_roots_response, tree_state_at_response, visible_tip_block_response,
 };
-use zinder_source::{SourceError, SourceTreeState, TreeStateUpstream};
-use zinder_store::{ArtifactFamily, ChainEpochArtifacts, RawBlobRetention};
-use zinder_testkit::{
-    ChainFixture, StoreFixture, WalletServingStoreFixture, encode_fixture_block_replay,
-    sample_regtest_upgrade_activations,
-};
+use zinder_source::{SourceError, SourceTreeState};
+use zinder_store::RawBlobRetention;
+use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
 
 use crate::common::{
-    chain_epoch_artifacts_with_sapling_outputs, compact_block_with_tree_sizes,
-    synthetic_chain_epoch,
+    ProbedNode, probed_serving_query_over, serving_query_after_live_append, serving_query_over,
 };
 
-#[derive(Clone)]
-struct FixedTreeStateUpstream(SourceTreeState);
-
-#[async_trait]
-impl TreeStateUpstream for FixedTreeStateUpstream {
-    async fn fetch_tree_state_for_block(
-        &self,
-        _block_id: BlockId,
-    ) -> Result<SourceTreeState, SourceError> {
-        Ok(self.0.clone())
-    }
-}
+/// Tree-state payload the release store derives from a checkpoint whose
+/// commitment-tree frontiers are all empty.
+const EMPTY_FRONTIER_TREE_STATE_PAYLOAD: &[u8] = b"{}";
 
 #[tokio::test]
 async fn compact_block_range_reads_from_one_chain_epoch() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (first_epoch, first_block, first_compact_block) = synthetic_chain_epoch(1, 1);
-    let (second_epoch, second_block, second_compact_block) = synthetic_chain_epoch(2, 2);
-    let first_replay = encode_fixture_block_replay(&first_block, &[]);
-    let second_replay = encode_fixture_block_replay(&second_block, &[]);
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let (wallet_query, _store_fixture) = serving_query_after_live_append(&chain)?;
+    let current_epoch = wallet_query.visible_tip_block(None).await?.chain_epoch;
 
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        first_epoch,
-        vec![first_block],
-        vec![first_replay],
-        vec![first_compact_block.clone()],
-    ))?;
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        second_epoch,
-        vec![second_block],
-        vec![second_replay],
-        vec![second_compact_block.clone()],
-    ))?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let compact_block_range = wallet_query
         .compact_blocks_in_range(
             BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2)),
@@ -77,10 +45,11 @@ async fn compact_block_range_reads_from_one_chain_epoch() -> eyre::Result<()> {
         )
         .await?;
 
-    assert_eq!(compact_block_range.chain_epoch, second_epoch);
+    assert_eq!(current_epoch.id, ChainEpochId::new(2));
+    assert_eq!(compact_block_range.chain_epoch, current_epoch);
     assert_eq!(
-        compact_block_range.compact_blocks,
-        vec![first_compact_block, second_compact_block]
+        compact_block_identities(&compact_block_range.compact_blocks),
+        fixture_block_identities(&chain)
     );
 
     Ok(())
@@ -88,80 +57,68 @@ async fn compact_block_range_reads_from_one_chain_epoch() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn compact_block_range_serves_visible_blocks_above_settled_tip() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (first_epoch, first_block, first_compact_block) = synthetic_chain_epoch(1, 1);
-    let (mut second_epoch, second_block, second_compact_block) = synthetic_chain_epoch(2, 2);
-    second_epoch.settled_tip_height = first_epoch.visible_tip_height;
-    second_epoch.settled_tip_hash = first_epoch.visible_tip_hash;
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let (wallet_query, _store_fixture) = serving_query_after_live_append(&chain)?;
+    let current_epoch = wallet_query.visible_tip_block(None).await?.chain_epoch;
+    assert_eq!(current_epoch.settled_tip_height, BlockHeight::new(1));
+    assert_eq!(current_epoch.visible_tip_height, BlockHeight::new(2));
 
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        first_epoch,
-        vec![first_block.clone()],
-        vec![encode_fixture_block_replay(&first_block, &[])],
-        vec![first_compact_block],
-    ))?;
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        second_epoch,
-        vec![second_block.clone()],
-        vec![encode_fixture_block_replay(&second_block, &[])],
-        vec![second_compact_block.clone()],
-    ))?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = wallet_query
         .compact_blocks_in_range(
             BlockHeightRange::inclusive(BlockHeight::new(2), BlockHeight::new(2)),
-            Some(second_epoch.id),
+            Some(current_epoch.id),
         )
         .await?;
 
-    assert_eq!(response.chain_epoch, second_epoch);
-    assert_eq!(response.compact_blocks, vec![second_compact_block]);
+    assert_eq!(response.chain_epoch, current_epoch);
+    assert_eq!(
+        compact_block_identities(&response.compact_blocks),
+        fixture_block_identities(&chain)[1..]
+    );
     Ok(())
 }
 
 #[tokio::test]
 async fn tree_state_at_serves_visible_height_above_settled_tip_under_epoch_pin() -> eyre::Result<()>
 {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (first_epoch, first_block, first_compact_block) = synthetic_chain_epoch(1, 1);
-    let (mut second_epoch, second_block, second_compact_block) = synthetic_chain_epoch(2, 2);
-    second_epoch.settled_tip_height = first_epoch.visible_tip_height;
-    second_epoch.settled_tip_hash = first_epoch.visible_tip_hash;
-
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        first_epoch,
-        vec![first_block.clone()],
-        vec![encode_fixture_block_replay(&first_block, &[])],
-        vec![first_compact_block],
-    ))?;
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        second_epoch,
-        vec![second_block.clone()],
-        vec![encode_fixture_block_replay(&second_block, &[])],
-        vec![second_compact_block],
-    ))?;
-
-    let block_id = BlockId::new(second_block.height, second_block.block_hash);
-    let payload = br#"{"orchard":{"commitments":{"finalState":"aa"}}}"#.to_vec();
-    let upstream = FixedTreeStateUpstream(SourceTreeState::new(
-        block_id,
-        u32::try_from(second_block.block_time)?,
-        payload.clone(),
-    ));
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
-        .with_tree_state_upstream(Arc::new(upstream));
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let tip = chain
+        .block_at(BlockHeight::new(2))
+        .ok_or_else(|| eyre!("fixture must contain height 2"))?;
+    let tip_id = BlockId::new(tip.height, tip.hash);
+    let node = ProbedNode::with_tree_state(
+        tip_id,
+        SourceTreeState::new(tip_id, tip.block_time_seconds, b"{}".to_vec()),
+    )?;
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let mut store_fixture =
+        WalletServingStoreFixture::from_chain_after_live_append(&chain, &activations)?;
+    let wallet_query = WalletServingQuery::from_probed_node_source(
+        crate::common::serving_pair_slot(&mut store_fixture)?,
+        node.clone(),
+        activations,
+    )?;
+    let current_epoch = wallet_query.visible_tip_block(None).await?.chain_epoch;
+    assert!(current_epoch.settled_tip_height < tip.height);
 
     let response = wallet_query
-        .tree_state_at(second_block.height, Some(second_epoch.id))
+        .tree_state_at(tip.height, Some(current_epoch.id))
         .await?;
 
-    assert_eq!(response.chain_epoch, second_epoch);
-    assert_eq!(response.height, second_block.height);
-    assert_eq!(response.block_hash, second_block.block_hash);
-    assert_eq!(response.payload_bytes, payload);
+    assert_eq!(response.chain_epoch, current_epoch);
+    assert_eq!(response.height, tip.height);
+    assert_eq!(response.block_hash, tip.hash);
+    assert_eq!(response.block_time_seconds, tip.block_time_seconds);
+    let payload: serde_json::Value = serde_json::from_slice(&response.payload_bytes)?;
+    assert!(
+        payload.get("sapling").is_some(),
+        "the live-appended checkpoint must carry the active Sapling frontier, got {payload}"
+    );
+    assert_eq!(
+        node.tree_state_fetch_count(),
+        0,
+        "a canonical tip checkpoint must not consult the node"
+    );
     Ok(())
 }
 
@@ -171,31 +128,22 @@ async fn tree_state_at_serves_visible_height_above_settled_tip_under_epoch_pin()
     reason = "the test keeps the complete native compact-block wire shape in one assertion scope"
 )]
 async fn compact_block_range_chunk_uses_native_wallet_proto_shape() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
-    let replay = encode_fixture_block_replay(&block, &[]);
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let (wallet_query, _store_fixture) = serving_query_over(&chain)?;
 
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        chain_epoch,
-        vec![block],
-        vec![replay],
-        vec![compact_block.clone()],
-    ))?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let compact_block_range = wallet_query
         .compact_blocks_in_range(
             BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(1)),
             None,
         )
         .await?;
-    let response_compact_block = compact_block_range
+    let chain_epoch = compact_block_range.chain_epoch;
+    let compact_block = compact_block_range
         .compact_blocks
         .into_iter()
         .next()
         .ok_or_else(|| eyre!("missing compact block"))?;
-    let chunk = compact_block_range_chunk(compact_block_range.chain_epoch, &response_compact_block);
+    let chunk = compact_block_range_chunk(chain_epoch, &compact_block);
     let encoded_chunk = chunk.encode_to_vec();
     let decoded_chunk = wallet::CompactBlocksInRangeChunk::decode(encoded_chunk.as_slice())?;
     let response_chain_epoch = decoded_chunk
@@ -249,25 +197,20 @@ async fn compact_block_range_chunk_uses_native_wallet_proto_shape() -> eyre::Res
         response_compact_block,
         &zinder_proto::wire::compact_block_message(&compact_block)
     );
+    assert_eq!(
+        compact_block_identities(&[compact_block]),
+        fixture_block_identities(&chain)
+    );
 
     Ok(())
 }
 
 #[tokio::test]
 async fn visible_tip_block_response_uses_native_wallet_proto_shape() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
-    let replay = encode_fixture_block_replay(&block, &[]);
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let (wallet_query, _store_fixture) = serving_query_over(&chain)?;
+    let chain_epoch = wallet_query.visible_tip_block(None).await?.chain_epoch;
 
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        chain_epoch,
-        vec![block],
-        vec![replay],
-        vec![compact_block],
-    ))?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = visible_tip_block_response(&wallet_query, None).await?;
     let encoded_response = response.encode_to_vec();
     let decoded_response = wallet::VisibleTipBlockResponse::decode(encoded_response.as_slice())?;
@@ -290,29 +233,25 @@ async fn visible_tip_block_response_uses_native_wallet_proto_shape() -> eyre::Re
         visible_tip_block.block_hash,
         encode_rpc_block_hash_hex(chain_epoch.visible_tip_hash)
     );
+    assert_eq!(chain.tip_hash(), Some(chain_epoch.visible_tip_hash));
 
     Ok(())
 }
 
 #[tokio::test]
 async fn tree_state_checkpoint_response_uses_native_wallet_proto_shape() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
-    let tree_state = TreeStateArtifact::new(
-        BlockHeight::new(1),
-        chain_epoch.visible_tip_hash,
-        u32::try_from(block.block_time)?,
-        b"tree-state-1".to_vec(),
-    );
-    let replay = encode_fixture_block_replay(&block, &[]);
-
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![replay], vec![compact_block])
-            .with_tree_states(vec![tree_state.clone()]),
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let tip = chain
+        .block_at(BlockHeight::new(1))
+        .ok_or_else(|| eyre!("fixture must contain height 1"))?;
+    let tip_id = BlockId::new(tip.height, tip.hash);
+    let node = ProbedNode::with_tree_state(
+        tip_id,
+        SourceTreeState::new(tip_id, tip.block_time_seconds, b"node".to_vec()),
     )?;
+    let (wallet_query, _store_fixture) = probed_serving_query_over(&chain, node.clone())?;
+    let chain_epoch = wallet_query.visible_tip_block(None).await?.chain_epoch;
 
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = tree_state_at_response(&wallet_query, BlockHeight::new(1), None).await?;
     let encoded_response = response.encode_to_vec();
     let decoded_response = wallet::TreeStateResponse::decode(encoded_response.as_slice())?;
@@ -323,45 +262,41 @@ async fn tree_state_checkpoint_response_uses_native_wallet_proto_shape() -> eyre
         .ok_or_else(|| eyre!("missing response chain epoch"))?;
 
     assert_eq!(response_chain_epoch.chain_epoch_id, chain_epoch.id.value());
-    assert_eq!(decoded_response.height, tree_state.height.value());
+    assert_eq!(decoded_response.height, tip.height.value());
     assert_eq!(
         decoded_response.block_hash,
-        encode_rpc_block_hash_hex(tree_state.block_hash)
+        encode_rpc_block_hash_hex(tip.hash)
     );
-    assert_eq!(decoded_response.payload_bytes, tree_state.payload_bytes);
+    assert_eq!(
+        decoded_response.payload_bytes,
+        EMPTY_FRONTIER_TREE_STATE_PAYLOAD
+    );
+    assert_eq!(node.tree_state_fetch_count(), 0);
 
     Ok(())
 }
 
 #[tokio::test]
 async fn latest_tree_state_checkpoint_response_uses_tip_tree_state() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
-    let tree_state = TreeStateArtifact::new(
-        BlockHeight::new(1),
-        chain_epoch.visible_tip_hash,
-        u32::try_from(block.block_time)?,
-        b"tree-state-1".to_vec(),
-    );
-    let replay = encode_fixture_block_replay(&block, &[]);
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let (wallet_query, _store_fixture) = serving_query_over(&chain)?;
+    let tip = chain
+        .block_at(BlockHeight::new(2))
+        .ok_or_else(|| eyre!("fixture must contain height 2"))?;
 
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![replay], vec![compact_block])
-            .with_tree_states(vec![tree_state.clone()]),
-    )?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = latest_tree_state_checkpoint_response(&wallet_query, None).await?;
     let encoded_response = response.encode_to_vec();
     let decoded_response = wallet::TreeStateResponse::decode(encoded_response.as_slice())?;
 
-    assert_eq!(decoded_response.height, tree_state.height.value());
+    assert_eq!(decoded_response.height, tip.height.value());
     assert_eq!(
         decoded_response.block_hash,
-        encode_rpc_block_hash_hex(tree_state.block_hash)
+        encode_rpc_block_hash_hex(tip.hash)
     );
-    assert_eq!(decoded_response.payload_bytes, tree_state.payload_bytes);
+    assert_eq!(
+        decoded_response.payload_bytes,
+        EMPTY_FRONTIER_TREE_STATE_PAYLOAD
+    );
 
     Ok(())
 }
@@ -369,25 +304,20 @@ async fn latest_tree_state_checkpoint_response_uses_tip_tree_state() -> eyre::Re
 #[tokio::test]
 async fn sparse_tree_state_rejects_upstream_time_that_disagrees_with_canonical_header()
 -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
-    let block_id = BlockId::new(block.height, block.block_hash);
-    let canonical_block_time = u32::try_from(block.block_time)?;
-    let replay = encode_fixture_block_replay(&block, &[]);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        chain_epoch,
-        vec![block],
-        vec![replay],
-        vec![compact_block],
-    ))?;
-    let upstream = FixedTreeStateUpstream(SourceTreeState::new(
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let sparse = chain
+        .block_at(BlockHeight::new(1))
+        .ok_or_else(|| eyre!("fixture must contain height 1"))?;
+    let block_id = BlockId::new(sparse.height, sparse.hash);
+    let node = ProbedNode::with_tree_state(
         block_id,
-        canonical_block_time.saturating_add(1),
-        br#"{"sapling":{"commitments":{"finalState":"aa"}}}"#.to_vec(),
-    ));
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
-        .with_tree_state_upstream(Arc::new(upstream));
+        SourceTreeState::new(
+            block_id,
+            sparse.block_time_seconds.saturating_add(1),
+            br#"{"sapling":{"commitments":{"finalState":"aa"}}}"#.to_vec(),
+        ),
+    )?;
+    let (wallet_query, _store_fixture) = probed_serving_query_over(&chain, node.clone())?;
 
     let error = match wallet_query.tree_state_at(block_id.height, None).await {
         Ok(tree_state) => {
@@ -404,6 +334,7 @@ async fn sparse_tree_state_rejects_upstream_time_that_disagrees_with_canonical_h
             reason: "tree-state source time does not match the canonical block"
         })
     ));
+    assert_eq!(node.tree_state_fetch_count(), 1);
 
     Ok(())
 }
@@ -411,66 +342,26 @@ async fn sparse_tree_state_rejects_upstream_time_that_disagrees_with_canonical_h
 #[tokio::test]
 async fn sparse_tree_state_uses_canonical_identity_and_time_with_frontier_only_payload()
 -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
-    let block_id = BlockId::new(block.height, block.block_hash);
-    let canonical_block_time = u32::try_from(block.block_time)?;
-    let replay = encode_fixture_block_replay(&block, &[]);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        chain_epoch,
-        vec![block],
-        vec![replay],
-        vec![compact_block],
-    ))?;
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let sparse = chain
+        .block_at(BlockHeight::new(1))
+        .ok_or_else(|| eyre!("fixture must contain height 1"))?;
+    let block_id = BlockId::new(sparse.height, sparse.hash);
     let payload = br#"{"sapling":{"commitments":{"finalState":"aa"}}}"#.to_vec();
-    let upstream = FixedTreeStateUpstream(SourceTreeState::new(
+    let node = ProbedNode::with_tree_state(
         block_id,
-        canonical_block_time,
-        payload.clone(),
-    ));
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()))
-        .with_tree_state_upstream(Arc::new(upstream));
+        SourceTreeState::new(block_id, sparse.block_time_seconds, payload.clone()),
+    )?;
+    let (wallet_query, _store_fixture) = probed_serving_query_over(&chain, node.clone())?;
 
     let tree_state = wallet_query.tree_state_at(block_id.height, None).await?;
 
     assert_eq!(tree_state.height, block_id.height);
     assert_eq!(tree_state.block_hash, block_id.hash);
-    assert_eq!(tree_state.block_time_seconds, canonical_block_time);
+    assert_eq!(tree_state.block_time_seconds, sparse.block_time_seconds);
     assert_eq!(tree_state.payload_bytes, payload);
+    assert_eq!(node.tree_state_fetch_count(), 1);
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn generic_query_rejects_oversized_subtree_root_range_before_storage() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let wallet_query = WalletQuery::new(
-        store_fixture.chain_store().clone(),
-        (),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
-    let requested = MAX_SUBTREE_ROOTS_PER_REQUEST.saturating_add(1);
-    let max_entries = NonZeroU32::new(requested).ok_or_else(|| eyre!("invalid max entries"))?;
-
-    let query_outcome = wallet_query
-        .subtree_roots(
-            SubtreeRootRange::new(
-                ShieldedProtocol::Sapling,
-                SubtreeRootIndex::new(0),
-                max_entries,
-            ),
-            None,
-        )
-        .await;
-
-    assert!(matches!(
-        query_outcome,
-        Err(QueryError::SubtreeRootRangeTooLarge {
-            requested: actual,
-            maximum,
-        }) if actual == requested && maximum == MAX_SUBTREE_ROOTS_PER_REQUEST
-    ));
     Ok(())
 }
 
@@ -520,20 +411,9 @@ async fn serving_query_rejects_oversized_subtree_root_range() -> eyre::Result<()
 
 #[tokio::test]
 async fn subtree_roots_response_returns_valid_empty_range() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (chain_epoch, block, _compact_block) = synthetic_chain_epoch(1, 1);
-    let compact_block = compact_block_with_tree_sizes(block.height, block.block_hash, 0, 0);
-    let replay = encode_fixture_block_replay(&block, &[]);
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let (wallet_query, _store_fixture) = serving_query_over(&chain)?;
 
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        chain_epoch,
-        vec![block],
-        vec![replay],
-        vec![compact_block],
-    ))?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let response = subtree_roots_response(
         &wallet_query,
         SubtreeRootRange::new(
@@ -555,226 +435,9 @@ async fn subtree_roots_response_returns_valid_empty_range() -> eyre::Result<()> 
 }
 
 #[tokio::test]
-async fn subtree_roots_response_reports_unavailable_when_completed_root_is_missing()
--> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (mut chain_epoch, block, _compact_block) = synthetic_chain_epoch(1, 1);
-    chain_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0, 0);
-    store.commit_chain_epoch(chain_epoch_artifacts_with_sapling_outputs(
-        chain_epoch,
-        block,
-        65_536,
-    )?)?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let error = match subtree_roots_response(
-        &wallet_query,
-        SubtreeRootRange::new(
-            ShieldedProtocol::Sapling,
-            SubtreeRootIndex::new(0),
-            NonZeroU32::new(1).ok_or_else(|| eyre!("invalid max entries"))?,
-        ),
-        None,
-    )
-    .await
-    {
-        Ok(response) => return Err(eyre!("expected unavailable roots, got {response:?}")),
-        Err(error) => error,
-    };
-
-    assert!(matches!(
-        error,
-        QueryError::ArtifactUnavailable {
-            family: ArtifactFamily::SubtreeRoot,
-            key: ArtifactKey::SubtreeRootIndex {
-                protocol: ShieldedProtocol::Sapling,
-                index
-            }
-        } if index == SubtreeRootIndex::new(0)
-    ));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn subtree_roots_response_uses_native_wallet_proto_shape() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (mut chain_epoch, block, _compact_block) = synthetic_chain_epoch(1, 1);
-    chain_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0, 0);
-    let subtree_root = SubtreeRootArtifact::new(
-        ShieldedProtocol::Sapling,
-        SubtreeRootIndex::new(0),
-        SubtreeRootHash::from_bytes([0x71; 32]),
-        block.height,
-        block.block_hash,
-    );
-    store.commit_chain_epoch(
-        chain_epoch_artifacts_with_sapling_outputs(chain_epoch, block, 65_536)?
-            .with_subtree_roots(vec![subtree_root.clone()]),
-    )?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let response = subtree_roots_response(
-        &wallet_query,
-        SubtreeRootRange::new(
-            ShieldedProtocol::Sapling,
-            SubtreeRootIndex::new(0),
-            NonZeroU32::new(1).ok_or_else(|| eyre!("invalid max entries"))?,
-        ),
-        None,
-    )
-    .await?;
-    let encoded_response = response.encode_to_vec();
-    let decoded_response = wallet::SubtreeRootsResponse::decode(encoded_response.as_slice())?;
-    let response_chain_epoch = decoded_response
-        .chain_view
-        .as_ref()
-        .and_then(|chain_view| chain_view.chain_epoch.as_ref())
-        .ok_or_else(|| eyre!("missing response chain epoch"))?;
-    let response_subtree_root = decoded_response
-        .subtree_roots
-        .first()
-        .ok_or_else(|| eyre!("missing response subtree root"))?;
-
-    assert_eq!(response_chain_epoch.chain_epoch_id, chain_epoch.id.value());
-    assert_eq!(
-        decoded_response.shielded_protocol,
-        wallet::ShieldedProtocol::Sapling as i32
-    );
-    assert_eq!(
-        decoded_response.start_index,
-        subtree_root.subtree_index.value()
-    );
-    assert_eq!(
-        response_subtree_root.root_hash,
-        subtree_root.root_hash.as_bytes()
-    );
-    assert_eq!(
-        response_subtree_root.completing_block_hash,
-        encode_rpc_block_hash_hex(subtree_root.completing_block_hash)
-    );
-    assert_eq!(
-        response_subtree_root.completing_block_height,
-        subtree_root.completing_block_height.value()
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn chain_epoch_rejects_tip_metadata_that_disagrees_with_compact_block() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (mut chain_epoch, block, _compact_block) = synthetic_chain_epoch(1, 1);
-    chain_epoch.tip_metadata = ChainTipMetadata::new(65_536, 0, 0);
-    let compact_block = CompactBlockArtifact::empty(
-        BlockId::new(block.height, block.block_hash),
-        block.parent_hash,
-        u32::try_from(block.block_time).unwrap_or_default(),
-        CompactChainMetadata {
-            sapling_commitment_tree_size: 0,
-            orchard_commitment_tree_size: 0,
-            ironwood_commitment_tree_size: 0,
-        },
-    );
-    let replay = encode_fixture_block_replay(&block, &[]);
-
-    let error = match store.commit_chain_epoch(ChainEpochArtifacts::new(
-        chain_epoch,
-        vec![block],
-        vec![replay],
-        vec![compact_block],
-    )) {
-        Ok(outcome) => return Err(eyre!("expected metadata rejection, got {outcome:?}")),
-        Err(error) => error,
-    };
-    assert!(error.to_string().contains("visible-tip compact metadata"));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn compact_block_range_reports_unavailable_artifact_without_node_repair() -> eyre::Result<()>
-{
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
-    let replay = encode_fixture_block_replay(&block, &[]);
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        chain_epoch,
-        vec![block],
-        vec![replay],
-        vec![compact_block],
-    ))?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let error = match wallet_query
-        .compact_blocks_in_range(
-            BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2)),
-            None,
-        )
-        .await
-    {
-        Ok(compact_block_range) => {
-            return Err(eyre!(
-                "expected unavailable artifact, got {compact_block_range:?}"
-            ));
-        }
-        Err(error) => error,
-    };
-
-    assert!(matches!(
-        error,
-        QueryError::ArtifactUnavailable {
-            family: ArtifactFamily::CompactBlock,
-            key: ArtifactKey::BlockHeight(height)
-        } if height == BlockHeight::new(2)
-    ));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn tree_state_checkpoint_response_reports_unavailable_artifact_without_node_repair()
--> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
-    let replay = encode_fixture_block_replay(&block, &[]);
-
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        chain_epoch,
-        vec![block],
-        vec![replay],
-        vec![compact_block],
-    ))?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let error = match tree_state_at_response(&wallet_query, BlockHeight::new(1), None).await {
-        Ok(tree_state) => {
-            return Err(eyre!("expected unavailable artifact, got {tree_state:?}"));
-        }
-        Err(error) => error,
-    };
-
-    assert!(matches!(
-        error,
-        QueryError::ArtifactUnavailable {
-            family: ArtifactFamily::TreeState,
-            key: ArtifactKey::BlockHeight(height)
-        } if height == BlockHeight::new(1)
-    ));
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn compact_block_range_rejects_inverted_height_range() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let (wallet_query, _store_fixture) = crate::common::serving_query_over(&chain)?;
 
     let error = match wallet_query
         .compact_blocks_in_range(
@@ -790,41 +453,6 @@ async fn compact_block_range_rejects_inverted_height_range() -> eyre::Result<()>
     };
 
     assert!(matches!(error, QueryError::InvalidBlockRange { .. }));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn compact_block_range_rejects_ranges_above_configured_limit() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let wallet_query = WalletQuery::with_options(
-        store,
-        (),
-        Arc::new(sample_regtest_upgrade_activations()),
-        WalletQueryOptions {
-            max_compact_block_range: NonZeroU32::new(1)
-                .ok_or_else(|| eyre!("invalid range limit"))?,
-            ..WalletQueryOptions::default()
-        },
-    );
-
-    let error = match wallet_query
-        .compact_blocks_in_range(
-            BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2)),
-            None,
-        )
-        .await
-    {
-        Ok(compact_block_range) => {
-            return Err(eyre!(
-                "expected range limit error, got {compact_block_range:?}"
-            ));
-        }
-        Err(error) => error,
-    };
-
-    assert!(matches!(error, QueryError::BlockRangeTooLarge { .. }));
 
     Ok(())
 }
@@ -902,4 +530,21 @@ fn compact_block_range_chunk(
         }),
         compact_block: Some(zinder_proto::wire::compact_block_message(compact_block)),
     }
+}
+
+fn compact_block_identities(
+    compact_blocks: &[CompactBlockArtifact],
+) -> Vec<(BlockHeight, BlockHash)> {
+    compact_blocks
+        .iter()
+        .map(|compact_block| (compact_block.height(), compact_block.block_hash()))
+        .collect()
+}
+
+fn fixture_block_identities(chain: &ChainFixture) -> Vec<(BlockHeight, BlockHash)> {
+    chain
+        .blocks()
+        .iter()
+        .map(|block| (block.height, block.hash))
+        .collect()
 }

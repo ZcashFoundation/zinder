@@ -13,9 +13,9 @@ Start with the process exit and the metrics immediately before it:
 - Exit code 137 or a cgroup OOM event means the process exceeded the container
   memory boundary. Confirm with the platform event stream rather than inferring
   from a missing application error.
-- `zinder_ingest_bulk_pipeline_queue_bytes{stage}` and
-  `zinder_ingest_bulk_pipeline_reorder_buffer_bytes{stage}` identify source,
-  preparation, and reassembly backlog.
+- `zinder_ingest_bulk_pipeline_queue_bytes{stage="source_fetch"}` and
+  `zinder_ingest_bulk_pipeline_reorder_buffer_bytes{stage="source_fetch"}`
+  identify in-flight source responses and out-of-order segment backlog.
 - `zinder_store_block_cache_usage_bytes`, `zinder_store_wal_bytes`, and
   `zinder_store_rocksdb_property` separate cache pressure, WAL growth,
   memtables, compaction debt, and write stalls.
@@ -35,11 +35,8 @@ queue admission:
   `source_fetch_max_in_flight_bytes` bound active source requests and completed
   response backlog.
 - `block_prepare_concurrency` bounds CPU preparation slots, while
-  `block_prepare_memory_watermark_bytes` admits their estimated and measured
-  resident data.
-- `commit_reassembly_max_queued_artifact_bytes` bounds completed artifacts
-  waiting for ordered commit.
-- `canonical_batch_max_*` fields bound one canonical commit batch.
+  `block_prepare_memory_watermark_bytes` admits each block's estimated resident
+  data until its ordered store write completes.
 
 The byte watermarks use container-aware defaults when a cgroup v2 memory limit
 is available. Explicit TOML or `ZINDER_INGEST__CONSTRUCTION__*` overrides win,
@@ -48,7 +45,7 @@ the source watermark at least as large as `node.max_response_bytes`; startup
 rejects a configuration that cannot admit its first source request.
 
 For memory pressure, first lower `block_prepare_concurrency`, then lower the
-stage watermark that metrics identify. Raising concurrency without raising the
+source or prepare watermark that metrics identify. Raising concurrency without raising the
 corresponding byte budget increases contention and does not create additional
 admission capacity.
 

@@ -48,7 +48,7 @@ Serving coverage fails closed:
 
 - `wallet-serving` rejects explicit `from_height` and `checkpoint_height` overrides.
 - An existing or staged READY store is rejected when its immutable retained-history floor is later than the floor required by the current invocation. Following cannot repair omitted history; operators must rebuild the canonical and wallet stores.
-- `wallet-serving` rejects `allow_reorg_window_settlement`; a serving store must stop bulk catchup outside the configured reorg window and let `tip-follow` ingest the replaceable suffix.
+- A serving store settles only outside the configured reorg window: construction publishes its settled tip `ingest.reorg_window_blocks` below the construction tip, and the canonical follower ingests the replaceable suffix.
 - Missing artifacts remain `ArtifactUnavailable`. Query services do not synthesize responses from upstream nodes, with one bounded exception: `tree_state_at(height)` fills from the configured upstream node on a cache-miss (see the tree-state-at-height carve-out under Tradeoffs).
 - Readiness does not claim production traffic is safe before secondary catchup and writer-status validation have established the reader's state.
 
@@ -68,7 +68,7 @@ Use these terms consistently:
 - `scan range start`: the start of a scanner-selected range.
 - `tree-state anchor`: the block height whose tree state initializes a scan, commonly `scan_range_start - 1` or `birthday - 1`.
 - `artifact coverage floor`: the earliest height or index available for an artifact family.
-- `serving store`: a store built with `wallet-serving` coverage and caught up by `tip-follow`.
+- `serving store`: a store built by fresh canonical construction with `wallet-serving` coverage and kept current by the canonical follower.
 
 Do not use `birthday` as shorthand for every historical tree-state lookup. Many tree-state requests are scan anchors, not wallet birthdays.
 
@@ -85,12 +85,12 @@ Positive:
 Negative:
 
 - Initial serving stores are larger and slower to build than recent-checkpoint fixtures.
-- Local test workflows use explicit disposable stores or tip-follow rather than near-tip settled-tip bulk catchup.
+- Local test workflows use explicit disposable stores or the canonical follower rather than a near-tip fresh canonical construction.
 - Full prevention of excessive transparent-UTXO materialization across many addresses requires a deeper multi-address store API; the aggregate response budget bounds the read until that lands.
 
 Tradeoffs:
 
-The bulk-catchup floor is intentionally conservative. A future profile can narrow coverage once the product has real demand for bounded historical ranges, but the first stable profile optimizes for correct wallet behavior and low operator ambiguity.
+The fresh-construction coverage floor is intentionally conservative. A future profile can narrow coverage once the product has real demand for bounded historical ranges, but the first stable profile optimizes for correct wallet behavior and low operator ambiguity.
 
 Upstream-node fallback is rejected. It would blur the source of truth, make readiness lie, and turn query services into partial node proxies. Repair tools may use upstream nodes to rebuild canonical artifacts, but public query methods read stored artifacts only.
 

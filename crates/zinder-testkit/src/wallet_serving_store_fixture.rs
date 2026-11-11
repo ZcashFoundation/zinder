@@ -1,5 +1,7 @@
 //! Production-store fixtures for the immutable wallet-serving boundary.
 
+use std::path::Path;
+
 use eyre::{Context as _, ensure, eyre};
 use tempfile::TempDir;
 use zinder_core::{
@@ -10,7 +12,8 @@ use zinder_core::{
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalLiveAppend, CanonicalReorgPolicy,
     CanonicalStoreBuildPlan, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder,
-    RocksDbCanonicalSecondary, RocksDbResourceBudget, TREE_STATE_CHECKPOINT_STRIDE,
+    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
+    TREE_STATE_CHECKPOINT_STRIDE,
 };
 use zinder_wallet_rocksdb::{
     RocksDbWalletBuildOptions, RocksDbWalletSecondary, build_wallet_from_canonical,
@@ -62,7 +65,6 @@ impl WalletServingStoreFixture {
         let temporary_directory =
             TempDir::new().wrap_err("create wallet-serving fixture directory")?;
         let canonical_primary_path = temporary_directory.path().join("canonical-primary");
-        let wallet_primary_path = temporary_directory.path().join("wallet-primary");
         let reorg_policy = CanonicalReorgPolicy::new(TEST_REORG_DEPTH)?;
         let build_plan = CanonicalStoreBuildPlan::complete(
             network_upgrade_activations,
@@ -97,38 +99,12 @@ impl WalletServingStoreFixture {
         ))?;
         let canonical_primary = validated.publish_baseline(publication)?;
 
-        let wallet_outcome = build_wallet_from_canonical(
-            &canonical_primary,
-            &wallet_primary_path,
-            RocksDbWalletBuildOptions {
-                supported_reorg_depth: TEST_REORG_DEPTH,
-                ..RocksDbWalletBuildOptions::for_local_tests()
-            },
-        )?;
-        drop(wallet_outcome.store);
-        drop(canonical_primary);
-
-        let canonical_reader = RocksDbCanonicalSecondary::open_ready(
+        Self::from_published_canonical(
+            temporary_directory,
             &canonical_primary_path,
-            temporary_directory.path().join("canonical-secondary"),
+            canonical_primary,
             network_upgrade_activations,
-            CanonicalStoreWorkload::Wallet,
-            raw_blob_retention,
-            reorg_policy,
-            RocksDbResourceBudget::for_local_tests(),
-        )?;
-        let wallet_reader = RocksDbWalletSecondary::open_ready(
-            &wallet_primary_path,
-            temporary_directory.path().join("wallet-secondary"),
-            chain_fixture.network(),
-            RocksDbResourceBudget::for_local_tests(),
-        )?;
-
-        Ok(Self {
-            canonical_reader: Some(canonical_reader),
-            wallet_reader: Some(wallet_reader),
-            _temporary_directory: temporary_directory,
-        })
+        )
     }
 
     /// Builds a READY pair whose final block was published through the live
@@ -204,7 +180,6 @@ impl WalletServingStoreFixture {
         let temporary_directory =
             TempDir::new().wrap_err("create wallet-serving fixture directory")?;
         let canonical_primary_path = temporary_directory.path().join("canonical-primary");
-        let wallet_primary_path = temporary_directory.path().join("wallet-primary");
         let reorg_policy = CanonicalReorgPolicy::new(TEST_REORG_DEPTH)?;
         let build_plan = CanonicalStoreBuildPlan::complete(
             construction_activations,
@@ -267,11 +242,43 @@ impl WalletServingStoreFixture {
             live_activations,
         )?;
 
+        Self::from_published_canonical(
+            temporary_directory,
+            &canonical_primary_path,
+            canonical_primary,
+            live_activations,
+        )
+    }
+
+    /// Projects the wallet store from an already-published canonical primary,
+    /// then opens immutable secondaries for both stores.
+    ///
+    /// `canonical_primary` must be the READY wallet-workload store at
+    /// `canonical_primary_path`, inside `temporary_directory`. The fixture
+    /// takes ownership of the directory, builds the wallet primary beside the
+    /// canonical one, and drops both primaries before admitting readers. Use
+    /// this to serve a canonical store built by production construction, such
+    /// as one loaded from a live node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the wallet projection, either secondary
+    /// admission, or the canonical primary's contract fails.
+    pub fn from_published_canonical(
+        temporary_directory: TempDir,
+        canonical_primary_path: &Path,
+        canonical_primary: RocksDbCanonicalStore,
+        network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> eyre::Result<Self> {
+        let wallet_primary_path = temporary_directory.path().join("wallet-primary");
+        let raw_blob_retention = canonical_primary.raw_blob_retention();
+        let reorg_policy = canonical_primary.reorg_policy();
+        let network = canonical_primary.network();
         let wallet_outcome = build_wallet_from_canonical(
             &canonical_primary,
             &wallet_primary_path,
             RocksDbWalletBuildOptions {
-                supported_reorg_depth: TEST_REORG_DEPTH,
+                supported_reorg_depth: reorg_policy.reorg_window_blocks(),
                 ..RocksDbWalletBuildOptions::for_local_tests()
             },
         )?;
@@ -279,9 +286,9 @@ impl WalletServingStoreFixture {
         drop(canonical_primary);
 
         let canonical_reader = RocksDbCanonicalSecondary::open_ready(
-            &canonical_primary_path,
+            canonical_primary_path,
             temporary_directory.path().join("canonical-secondary"),
-            live_activations,
+            network_upgrade_activations,
             CanonicalStoreWorkload::Wallet,
             raw_blob_retention,
             reorg_policy,
@@ -290,7 +297,7 @@ impl WalletServingStoreFixture {
         let wallet_reader = RocksDbWalletSecondary::open_ready(
             &wallet_primary_path,
             temporary_directory.path().join("wallet-secondary"),
-            chain_fixture.network(),
+            network,
             RocksDbResourceBudget::for_local_tests(),
         )?;
 

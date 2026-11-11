@@ -177,7 +177,7 @@ discovery.
 The native endpoint therefore advertises transaction lookup, mempool snapshot
 and events, transparent mempool outputs-by-address and
 spends-by-outpoint from that concrete composition. It omits
-`wallet.address.transparent_balance_v1`: the legacy composite performs multiple
+`wallet.address.transparent_balance_v1`: the gRPC composite performs multiple
 canonical and live calls without one authenticated mempool snapshot, so
 provider presence alone is not sufficient admission evidence. Transaction-byte
 support additionally requires authenticated transaction-blob retention.

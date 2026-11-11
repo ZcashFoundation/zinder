@@ -205,8 +205,9 @@ If either probe fails, fix the sidecar before running tests. Don't use a
 
 ### Cleanup between runs
 
-A persisted store from a previous run that bumped `STORE_SCHEMA_VERSION`
-fails to reopen with `SchemaMismatch`. Clear the scratch directories before
+A persisted store from a previous run that bumped
+`CANONICAL_STORE_SCHEMA_VERSION`, or a wallet or materialized-view layout
+version, fails admission on reopen. Clear the scratch directories before
 reusing them across schema-changing commits:
 
 ```bash
@@ -261,11 +262,9 @@ Expected outcome on a healthy regtest with the indexer gRPC port set: all
 regtest-targeted tests pass in ~30 s. A full regtest `ci-live` invocation also
 contains hosted-network checks that deliberately refuse to run on regtest:
 the mainnet-only tests
-(`fetch_chain_checkpoint_returns_advancing_tree_sizes_on_mainnet`,
-`tip_id_advances_above_one_million`,
-`bulk_catchup_last_1000_blocks_from_checkpoint`) and the testnet-or-mainnet tests
-(`cli_constructs_complete_wallet_serving_history_from_config`,
-`checkpoint_bounded_read_endpoint_latency_baseline`).
+(`fetch_chain_checkpoint_returns_advancing_tree_sizes_on_mainnet` and
+`tip_id_advances_above_one_million`) and the testnet-or-mainnet test
+`cli_constructs_complete_wallet_serving_history_from_config`.
 
 Without `ZINDER_NODE__INDEXER_GRPC_ADDR`, the two Zebra Indexer mempool-source
 tests skip: `zebra_indexer_mempool_source_opens_stream_against_running_indexer`
@@ -292,7 +291,7 @@ through `-E 'test(<name>)'` as above.
 
 The `node-mutating` test group in `.config/nextest.toml` serializes any test
 that mutates regtest state (broadcast cycles, indexer-restart, deep-chain
-bulk-catchup runs). Run them in isolation if you want to debug — parallel execution
+construction runs). Run them in isolation if you want to debug — parallel execution
 will fight for the same node.
 
 ## T3: Live testnet (Zebra cookie auth)
@@ -464,11 +463,9 @@ ZINDER_TEST_LIVE=1 \
   cargo nextest run --profile=ci-live --run-ignored=all
 ```
 
-Currently-mainnet-only tests are:
-`fetch_chain_checkpoint_returns_advancing_tree_sizes_on_mainnet`,
-`tip_id_advances_above_one_million`,
-`bulk_catchup_last_1000_blocks_from_checkpoint`, plus the transparent-address
-balance read-only confirmations under `services/zinder-explorer/tests/live/`.
+Currently-mainnet-only tests are
+`fetch_chain_checkpoint_returns_advancing_tree_sizes_on_mainnet` and
+`tip_id_advances_above_one_million`.
 
 ## T3: Parity against a reference lightwalletd
 
@@ -544,11 +541,10 @@ ZINDER_TEST_LIVE=1 \
     -E 'test(/^live::network_upgrade_boundary::/)' --run-ignored=all
 ```
 
-The same invocation works for testnet (`ZINDER_NETWORK=zcash-testnet`,
-target activation = NU6.1 at height 3,536,500) and mainnet
-(`ZINDER_NETWORK=zcash-mainnet`, target activation = NU6.1 at height
-3,146,400). On testnet/mainnet the test anchors a checkpoint just below
-the activation so the bulk catchup window stays at three blocks.
+Both tests build the production canonical store and wallet projection from
+genesis, so they run on regtest only. The boundary test returns early when
+the regtest node activates every upgrade at height 1, because there is no
+boundary to cross.
 
 File:
 [`services/zinder-ingest/tests/live/network_upgrade_boundary.rs`](../../services/zinder-ingest/tests/live/network_upgrade_boundary.rs).
@@ -566,30 +562,36 @@ boundary.
 
 ### Primary and secondary coverage
 
-Three integration tests under
-[`crates/zinder-store/tests/integration/primary_secondary.rs`](../../crates/zinder-store/tests/integration/primary_secondary.rs)
-run with every `cargo nextest run --profile=ci`:
+The canonical-store unit tests in
+[`crates/zinder-store/src/canonical_store/secondary_tests.rs`](../../crates/zinder-store/src/canonical_store/secondary_tests.rs)
+run with every `cargo nextest run --profile=ci` against the production
+`RocksDbCanonicalStore` and `RocksDbCanonicalSecondary`:
 
-- `second_primary_open_returns_primary_already_open` — proves a second
-  writer cannot silently take over an already-open primary store; the
-  RocksDB lock surfaces as `StoreError::PrimaryAlreadyOpen`.
-- `secondary_continues_serving_after_primary_drops` — opens a primary,
-  commits two epochs, drops the primary handle, then asserts a fresh
-  secondary opened against the same path serves the last-committed
-  epoch without the primary coming back up. The restart stage of the same test
-  asserts a restarted primary resumes from the durable state.
-- `secondary_catches_up_after_primary_commits` — the live-writer
-  catchup baseline; pre-existing.
+- `second_ready_primary_open_is_refused_while_the_first_owns_the_store`:
+  a second writer cannot take over an open primary. The RocksDB lock
+  surfaces as a refused `open ready` operation, and the store reopens at the
+  same fence once the first owner drops.
+- `secondary_and_reopened_primary_serve_the_last_durable_fence_after_the_primary_drops`:
+  publishes a baseline, appends a live block, and drops the primary handle.
+  A fresh secondary serves the last durable fence without the primary, and a
+  restarted primary resumes from the same fence.
+- `secondary_observes_a_live_append_only_after_explicit_catch_up`: a
+  secondary keeps its admitted fence until `try_catch_up` reports the
+  advance to the primary's new fence.
+- `secondary_admission_rejects_another_network_activation_table` and
+  `secondary_admission_reports_and_requires_the_persisted_raw_blob_retention`:
+  secondary admission is exact for the network and raw-blob retention.
 
 ### Manual reproduction: kill -9 mid-commit
 
-Use this when changing storage commit paths or the
-`PrimaryChainStore::commit_chain_epoch` body. The automated test cannot
+Use this when changing storage commit paths, such as
+`RocksDbCanonicalStore::commit_live_append` or
+`RocksDbCanonicalStore::commit_live_replacement`. The automated test cannot
 exercise unclean shutdown mid-batch because dropping the handle in
 process closes RocksDB cleanly.
 
 ```bash
-# Terminal 1: start the phase-driven ingest loop against z3 regtest.
+# Terminal 1: start the canonical writer against z3 regtest.
 mkdir -p .tmp
 rm -rf .tmp/regtest.zinder-store
 cargo run --release --bin zinder-ingest -- \
@@ -601,13 +603,13 @@ sleep 5
 kill -9 "$INGEST_PID"
 wait "$INGEST_PID" 2>/dev/null || true
 
-# Reopen and assert state is consistent. The status command opens the
+# Reopen and assert state is consistent. The probe command opens the
 # canonical store through its normal fail-closed admission path.
 cargo run --release --bin zinder-ingest -- \
-  --config .tmp/regtest.ingest.toml status
+  --config .tmp/regtest.ingest.toml probe
 ```
 
-Expected: status reports a durable store tip and exits successfully. RocksDB's
+Expected: probe reports a durable `store_tip` and exits successfully. RocksDB's
 WAL replay restores any committed batch on reopen; partial commits are visible
 only after their write batch is durably persisted, so the reopened tip is
 always at or below the last batch the writer signaled durable.
@@ -618,16 +620,18 @@ always at or below the last batch the writer signaled durable.
 cargo run --release --bin zinder-ingest -- \
   --config .tmp/regtest.ingest.toml &
 sleep 2
-# This second invocation must fail with PrimaryAlreadyOpen (LOCK file in
-# .tmp/regtest.zinder-store/LOCK). If it succeeds, the fencing contract
-# is broken.
+# This second invocation must fail to open the primary because the first
+# process holds .tmp/regtest.zinder-store/LOCK. If it succeeds, the fencing
+# contract is broken.
 cargo run --release --bin zinder-ingest -- \
   --config .tmp/regtest.ingest.toml
 ```
 
-Expected: the second `zinder-ingest` process exits non-zero with an
-error message naming the LOCK path. The first process continues
-uninterrupted.
+Expected: the second `zinder-ingest` process logs `ingest_run_failed` and
+exits non-zero. Its underlying `CanonicalStoreError::RocksDbOperation` for
+`open ready` carries RocksDB's LOCK error, as
+`second_ready_primary_open_is_refused_while_the_first_owns_the_store` pins.
+The first process continues uninterrupted.
 
 ## Concurrent readers and stream cancellation
 
@@ -723,24 +727,25 @@ These numbers are not asserted by the test; treat the printed values as
 operator-facing telemetry. Compare across changes to spot regressions in
 the read path. The baseline does not exercise `transaction()` — that path
 goes through `mempool_broadcast_cycle` (broadcast then look up the mined
-txid) and `deep_chain` (high-volume bulk catchup).
+txid) and `deep_chain` (high-volume canonical construction).
 
 ### Heavy probes (trust-sensitive code only)
 
-Run on demand for changes to storage commit paths, parser code, or anything
-under `chain_store::validation`:
+Run on demand for changes to storage commit paths, parser code, or the
+canonical store's live commit, live replacement, and event lifecycle:
 
 ```bash
 cargo llvm-cov --workspace --all-features --no-report
 cargo mutants --workspace --all-features \
-  --file crates/zinder-store/src/chain_store.rs \
-  --file crates/zinder-store/src/chain_store/validation.rs \
+  --file crates/zinder-store/src/canonical_store/live_commit.rs \
+  --file crates/zinder-store/src/canonical_store/live_replacement.rs \
+  --file crates/zinder-store/src/canonical_store/event_lifecycle.rs \
   --file crates/zinder-store/src/canonical_store/rocksdb.rs \
   --file crates/zinder-store/src/canonical_store/activation_schedule.rs \
   --file crates/zinder-store/src/canonical_store/control.rs \
   --file crates/zinder-core/src/network_upgrade_activations.rs \
   --file crates/zinder-source/src/source_block.rs \
-  --re 'chain_event_history|settled_tip_only_commit_without_artifacts|validate_reorg_window_change|from_raw_block_bytes|matching_fingerprint_prefix_len|preserves_through|next_activation_schedule|validate_activation_expectation|read_bound|validate_open_store_control|raise_reorg_policy|decode_reorg_policy_trailer'
+  --re 'canonical_event_history|validate_live_settled_tip|validate_live_block_extension|validate_replacement_blocks|from_raw_block_bytes|matching_fingerprint_prefix_len|preserves_through|next_activation_schedule|validate_activation_expectation|read_bound|validate_open_store_control|raise_reorg_policy|decode_reorg_policy_trailer'
 ```
 
 These are slow (mutants often >30 min). Scheduled CI runs them weekly; locally,
@@ -884,7 +889,8 @@ Already covered by
 `services/zinder-compat-lightwalletd/tests/integration/lightwalletd_scan_contract.rs`
 in the default validation gate. It:
 
-1. Stands up `LightwalletdGrpcAdapter` over a populated `PrimaryChainStore`.
+1. Stands up `LightwalletdGrpcAdapter` over a populated production canonical
+   and wallet serving pair.
 2. Connects through the generated `CompactTxStreamerClient` to exercise the
    protocol transport directly.
 3. Calls `GetBlockRange`, decodes every compact block, asserts `vtx`/`txid`
@@ -1143,7 +1149,7 @@ For ordinary code changes, use the shorter pre-flight checklist below.
       Zebra health endpoint each fail closed and recover independently.
 - [ ] Mainnet read-only targeted tests are green when the release makes a mainnet
       readiness claim.
-- [ ] Full wallet-serving bulk-catchup and tip-follow phase evidence exists for the target
+- [ ] Full wallet-serving construction and following phase evidence exists for the target
       network, including store floor, tip height, `/readyz`, and reader secondary
       state.
 - [ ] Zodl or Android SDK bootstrap, restore/resync, transparent output, send,
@@ -1189,8 +1195,8 @@ For ordinary code changes, use the shorter pre-flight checklist below.
       capability. Run compatibility parity separately when the change also
       affects the lightwalletd adapter or shared behavior it exposes.
 - [ ] If the change altered storage byte layout: `cargo mutants` against
-      `chain_store.rs` and `chain_store/validation.rs` is a healthy plus
-      coverage run via `cargo llvm-cov`.
+      `canonical_store/{live_commit,live_replacement,event_lifecycle}.rs` is a
+      healthy plus coverage run via `cargo llvm-cov`.
 - [ ] If the change altered readiness, metrics, backup, restart, or deployment
       configuration: run the relevant observability or deployment row from the
       ecosystem validation queue.

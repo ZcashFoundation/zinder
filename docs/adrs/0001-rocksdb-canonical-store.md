@@ -13,7 +13,7 @@
 
 The workload is not generic. It is append-heavy, range-read-heavy for wallet sync, and reorg-aware at the chain tip. It must support atomic per-`ChainEpoch` commits across multiple logical tables, explicit migrations, crash recovery, and a projected 100-200 GB storage footprint.
 
-Service architecture matters too. `zinder-ingest` is the only canonical writer. Read replicas reach canonical state through `ChainEpochReadApi`, not by holding their own write handle. Production recovery, checkpointing, and operational tooling matter more than native multi-process write sharing.
+Service architecture matters too. `zinder-ingest` is the only canonical writer. Read replicas reach canonical state through `RocksDbCanonicalSecondary` and the `CanonicalReader` contract, not by holding their own write handle. Production recovery, checkpointing, and operational tooling matter more than native multi-process write sharing.
 
 The candidates evaluated were RocksDB through `rust-rocksdb`, `fjall`, `redb`, and LMDB through `heed`.
 

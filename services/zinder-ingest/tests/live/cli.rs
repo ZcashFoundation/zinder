@@ -3,7 +3,7 @@
     reason = "Live test names describe the behavior under test."
 )]
 
-use std::{fs, num::NonZeroU32, path::Path, sync::Arc};
+use std::{fs, path::Path};
 
 use eyre::{Result, eyre};
 use tempfile::tempdir;
@@ -18,8 +18,7 @@ use zinder_testkit::live::{init, require_live, require_live_for};
 use crate::common::{
     BoundedIngestConfigToml, WalletServingIngestConfigToml, basic_auth_credentials,
     bounded_ingest_config_toml, fetch_live_network_upgrade_activations,
-    live_bulk_catchup_run_config, wallet_serving_ingest_config_toml,
-    zebra_source_from_bulk_catchup, zinder_ingest_command,
+    wallet_serving_ingest_config_toml, zebra_source_for_live_env, zinder_ingest_command,
 };
 
 const WALLET_SERVING_BOUNDED_DEPTH_BLOCKS: u32 = 150;
@@ -52,7 +51,6 @@ async fn cli_constructs_bounded_canonical_store_from_config() -> Result<()> {
             storage_path: &storage_path,
             target_height: target_height.value(),
             request_timeout_secs: env.target.request_timeout.as_secs(),
-            allow_reorg_window_settlement: true,
         })?,
     )?;
 
@@ -77,7 +75,12 @@ async fn cli_constructs_bounded_canonical_store_from_config() -> Result<()> {
         "{stderr}"
     );
 
-    let store = open_wallet_canonical_store(&storage_path, &activations)?;
+    // The bounded config leaves `storage.raw_blob_policy` at its default.
+    let store = open_wallet_canonical_store(
+        &storage_path,
+        &activations,
+        zinder_store::RawBlobRetention::None,
+    )?;
     let compact_block = store
         .compact_block_at(target_height)?
         .ok_or_else(|| eyre!("missing tip compact block"))?;
@@ -106,16 +109,7 @@ async fn cli_constructs_complete_wallet_serving_history_from_config() -> Result<
     let storage_path = tempdir.path().join("zinder-store");
     let config_path = tempdir.path().join("zinder-ingest.toml");
     let activations = fetch_live_network_upgrade_activations(&env).await?;
-    let probe_config = live_bulk_catchup_run_config(
-        &env,
-        &storage_path,
-        BlockHeight::new(1),
-        BlockHeight::new(1),
-        NonZeroU32::new(1).ok_or_else(|| eyre!("invalid probe batch size"))?,
-        true,
-        Arc::clone(&activations),
-    );
-    let source = zebra_source_from_bulk_catchup(&probe_config)?;
+    let source = zebra_source_for_live_env(&env)?;
     let first_retained_height = BlockHeight::new(1);
     let checkpoint_height = BlockHeight::new(0);
     let to_height = BlockHeight::new(WALLET_SERVING_BOUNDED_DEPTH_BLOCKS);
@@ -173,7 +167,11 @@ async fn cli_constructs_complete_wallet_serving_history_from_config() -> Result<
         "{stderr}"
     );
 
-    let store = open_wallet_canonical_store(&storage_path, &activations)?;
+    let store = open_wallet_canonical_store(
+        &storage_path,
+        &activations,
+        zinder_store::RawBlobRetention::Transactions,
+    )?;
     assert_eq!(store.network(), env.network());
     assert_eq!(store.workload(), CanonicalStoreWorkload::Wallet);
     assert_eq!(store.event_fence().visible_tip().height, to_height);
@@ -209,12 +207,13 @@ async fn cli_constructs_complete_wallet_serving_history_from_config() -> Result<
 fn open_wallet_canonical_store(
     storage_path: &Path,
     activations: &NetworkUpgradeActivations,
+    raw_blob_retention: zinder_store::RawBlobRetention,
 ) -> Result<RocksDbCanonicalStore> {
     Ok(RocksDbCanonicalStore::open_ready(
         storage_path,
         activations,
         CanonicalStoreWorkload::Wallet,
-        zinder_store::RawBlobRetention::Transactions,
+        raw_blob_retention,
         CanonicalReorgPolicy::new(100)?,
         RocksDbResourceBudget::canonical_writer_defaults(),
     )?)

@@ -30,17 +30,19 @@ message WriterStatusRequest {}
 enum WriterPhase {
   // Default scalar so unset fields do not silently match a real phase.
   WRITER_PHASE_UNSPECIFIED = 0;
-  // Upstream tip is below the catch-up floor (regtest near genesis or
-  // freshly initialized nodes). The loop polls on the upstream-health
-  // interval and emits `cause=upstream_not_ready` until enough chain
-  // exists to commit.
+  // Upstream tip is at height zero (regtest near genesis or a freshly
+  // initialized node), so there is no committable chain yet. Only the
+  // `zinder-ingest probe` classifier reports this phase.
   WRITER_PHASE_AWAITING_UPSTREAM = 1;
-  // Gap to the upstream tip is above `ingest.phase_classification.catchup_threshold_blocks`.
-  // The bulk-catchup driver runs pipelined block fetches, commits batches,
-  // and advances the settled tip under the configured reorg-window policy.
+  // The writer is constructing a fresh canonical store: pipelined source
+  // fetches and parallel block preparation load an inactive builder that
+  // publishes one authenticated baseline. `zinder-ingest probe` reports this
+  // phase when the gap exceeds
+  // `ingest.phase_classification.catchup_threshold_blocks`.
   WRITER_PHASE_BULK_CATCHUP = 2;
-  // Gap is within the catch-up threshold. The serial tip-follow driver
-  // commits one block per poll cycle.
+  // The writer follows a published canonical store, committing one append or
+  // replacement per coherent source observation. `zinder-ingest probe`
+  // reports this phase when the gap is within the catch-up threshold.
   WRITER_PHASE_FOLLOWING_TIP = 3;
 
 }

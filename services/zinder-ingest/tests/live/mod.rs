@@ -1,4 +1,3 @@
-mod bulk_catchup;
 mod canonical_construction;
 mod cli;
 mod deep_chain;
@@ -8,6 +7,4 @@ mod mempool_pipeline;
 mod mined_consensus_branch_id_parity;
 mod network_upgrade_boundary;
 mod reorg_sweep;
-mod tip_follow;
 mod transparent_address_unspent_outputs;
-mod transparent_outputs_by_outpoint;

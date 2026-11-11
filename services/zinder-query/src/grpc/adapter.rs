@@ -22,7 +22,7 @@ use zinder_proto::{
         wallet::{self, wallet_query_server},
     },
 };
-use zinder_runtime::{AuthenticatedChannel, Readiness, connect_zinder_grpc};
+use zinder_runtime::{AuthenticatedChannel, Readiness};
 
 use crate::record_proxy_outcome;
 use zinder_store::{
@@ -32,8 +32,8 @@ use zinder_store::{
 type AuthenticatedIngestControlClient = IngestControlClient<AuthenticatedChannel>;
 
 use crate::{
-    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest, WalletQuery,
-    WalletQueryApi, WalletServingQuery,
+    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest, WalletQueryApi,
+    WalletServingQuery,
     ingest_control::{WALLET_INGEST_CONTROL_REQUEST_TIMEOUT, wallet_ingest_control_request},
 };
 
@@ -130,56 +130,11 @@ impl<QueryApi: WalletQueryApi> WalletQueryGrpcAdapter<QueryApi> {
     }
 }
 
-impl<ReadApi, Broadcaster> WalletQueryGrpcAdapter<WalletQuery<ReadApi, Broadcaster>>
-where
-    WalletQuery<ReadApi, Broadcaster>: WalletQueryApi,
-{
-    /// Connects the temporary generic primary-store composition to its
-    /// ingest-control endpoint.
-    ///
-    /// Release runtimes must admit `AdmittedIngestControl` before constructing
-    /// `WalletServingQuery`; this compatibility constructor is not a release
-    /// composition path.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn with_ingest_control_proxy(
-        mut query_api: WalletQuery<ReadApi, Broadcaster>,
-        metadata: WalletEndpointMetadata,
-        legacy_ingest_control_proxy_endpoint: String,
-    ) -> Self {
-        query_api.legacy_ingest_control_proxy_endpoint = Some(legacy_ingest_control_proxy_endpoint);
-        Self::new(query_api, metadata)
-    }
-}
-
 #[tonic::async_trait]
 trait IngestControlClientAccess {
     async fn ingest_control_client(
         &self,
     ) -> Result<Option<AuthenticatedIngestControlClient>, Status>;
-}
-
-#[tonic::async_trait]
-impl<ReadApi, Broadcaster> IngestControlClientAccess for WalletQuery<ReadApi, Broadcaster>
-where
-    Self: WalletQueryApi,
-{
-    async fn ingest_control_client(
-        &self,
-    ) -> Result<Option<AuthenticatedIngestControlClient>, Status> {
-        let Some(endpoint) = self.legacy_ingest_control_proxy_endpoint.clone() else {
-            return Ok(None);
-        };
-        let channel = self
-            .legacy_ingest_control_channel
-            .get_or_try_init(|| async move {
-                connect_zinder_grpc(&endpoint, None)
-                    .await
-                    .map_err(|error| Status::unavailable(error.to_string()))
-            })
-            .await?;
-        Ok(Some(IngestControlClient::new(channel.clone())))
-    }
 }
 
 #[tonic::async_trait]
@@ -901,8 +856,7 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
     /// The confirmed total, address cap, and chain-epoch pin are owned by
     /// [`WalletQueryApi::transparent_address_balance`]. The signed
     /// `unconfirmed_delta_zat` overlay is composed here from the live mempool
-    /// surfaces reached through the temporary generic query's legacy
-    /// ingest-control seam.
+    /// surfaces reached through the query's ingest-control client.
     async fn compute_transparent_address_balance(
         &self,
         request: Request<wallet::TransparentAddressBalanceRequest>,
@@ -945,10 +899,10 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
     ///
     /// Adds pending inflows (mempool outputs paid to the addresses) and
     /// subtracts pending outflows (mempool spends of the addresses' confirmed
-    /// unspent set), both read from the live mempool index. This composite
-    /// remains only for the temporary generic primary-store seam: the release
-    /// native endpoint omits transparent balance until P2b can supply one
-    /// coherent canonical-and-mempool snapshot.
+    /// unspent set), both read from the live mempool index. The release native
+    /// endpoint does not advertise transparent balance, because the confirmed
+    /// total and this overlay are not read from one coherent
+    /// canonical-and-mempool snapshot.
     async fn mempool_balance_overlay(
         &self,
         script_hashes: &[zinder_core::TransparentAddressScriptHash],

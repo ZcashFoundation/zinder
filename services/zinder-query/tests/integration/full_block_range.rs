@@ -16,16 +16,13 @@ use zinder_proto::{
     v1::wallet,
 };
 use zinder_query::{
-    ArtifactKey, DEFAULT_MAX_FULL_BLOCK_RANGE, FullBlockStream, QueryError, WalletQuery,
-    WalletQueryApi, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    DEFAULT_MAX_FULL_BLOCK_RANGE, FullBlockStream, QueryError, WalletQueryApi,
+    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
-use zinder_store::{ArtifactFamily, ChainEpochArtifacts, ChainStoreOptions, RawBlobRetention};
-use zinder_testkit::{
-    ChainFixture, StoreFixture, WalletServingStoreFixture, encode_fixture_block_replay,
-    encode_fixture_block_replay_with_raw_block, sample_regtest_upgrade_activations,
-};
+use zinder_store::RawBlobRetention;
+use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
 
-use crate::common::{block_hash_from_seed, synthetic_chain_epoch, synthetic_raw_block_bytes};
+use crate::common::{serving_query_after_live_append, serving_query_over};
 
 /// Drains a full-block stream into its pinned epoch, the blobs delivered in
 /// order, and the single terminal error if the stream ended with one.
@@ -47,83 +44,58 @@ async fn drain_full_block_stream(
     (chain_epoch, blobs, terminal_error)
 }
 
-fn block_blob_for(height: u32) -> BlockBlobArtifact {
-    BlockBlobArtifact::new(
-        BlockHeight::new(height),
-        block_hash_from_seed(height),
-        block_hash_from_seed(height.saturating_sub(1)),
-        synthetic_raw_block_bytes(height),
-    )
+fn all_retention_chain(block_count: u32) -> ChainFixture {
+    ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::All)
+        .extend_blocks(block_count)
 }
 
-fn open_block_blob_store() -> eyre::Result<StoreFixture> {
-    Ok(StoreFixture::open_with_options(ChainStoreOptions {
-        raw_blob_retention: RawBlobRetention::All,
-        ..ChainStoreOptions::for_local_tests()
-    })?)
+/// Block blobs the production fixture publishes for `chain`, whose first
+/// block is re-parented onto the network genesis hash.
+fn expected_block_blobs(chain: &ChainFixture) -> Vec<BlockBlobArtifact> {
+    chain
+        .blocks()
+        .iter()
+        .enumerate()
+        .map(|(index, block)| {
+            let blob = block.block_blob_artifact();
+            let parent_hash = if index == 0 {
+                Network::ZcashRegtest.genesis_hash()
+            } else {
+                blob.parent_hash
+            };
+            BlockBlobArtifact::new(
+                blob.height,
+                blob.block_hash,
+                parent_hash,
+                blob.raw_block_bytes,
+            )
+        })
+        .collect()
 }
 
 #[tokio::test]
 async fn full_block_at_returns_serialized_bytes_height_and_hash() -> eyre::Result<()> {
-    let store_fixture = open_block_blob_store()?;
-    let store = store_fixture.chain_store().clone();
-    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
-    let block_blob = block_blob_for(1);
-    let replay =
-        encode_fixture_block_replay_with_raw_block(&block, &block_blob.raw_block_bytes, &[]);
+    let chain = all_retention_chain(1);
+    let (wallet_query, _store_fixture) = serving_query_over(&chain)?;
+    let chain_epoch = wallet_query.visible_tip_block(None).await?.chain_epoch;
 
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![replay], vec![compact_block])
-            .with_block_blobs(vec![block_blob.clone()]),
-    )?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let full_block = wallet_query
         .full_block_at(BlockHeight::new(1), None)
         .await?;
 
     assert_eq!(full_block.chain_epoch, chain_epoch);
-    assert_eq!(full_block.block_blob, block_blob);
+    assert_eq!(full_block.block_blob, expected_block_blobs(&chain)[0]);
 
     Ok(())
 }
 
 #[tokio::test]
 async fn full_block_range_streams_blocks_in_order() -> eyre::Result<()> {
-    let store_fixture = open_block_blob_store()?;
-    let store = store_fixture.chain_store().clone();
-    let (first_epoch, first_block, first_compact_block) = synthetic_chain_epoch(1, 1);
-    let (second_epoch, second_block, second_compact_block) = synthetic_chain_epoch(2, 2);
-    let first_blob = block_blob_for(1);
-    let second_blob = block_blob_for(2);
-    let first_replay =
-        encode_fixture_block_replay_with_raw_block(&first_block, &first_blob.raw_block_bytes, &[]);
-    let second_replay = encode_fixture_block_replay_with_raw_block(
-        &second_block,
-        &second_blob.raw_block_bytes,
-        &[],
-    );
+    let chain = all_retention_chain(2);
+    let (wallet_query, _store_fixture) = serving_query_after_live_append(&chain)?;
+    let current_epoch = wallet_query.visible_tip_block(None).await?.chain_epoch;
 
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
-            first_epoch,
-            vec![first_block],
-            vec![first_replay],
-            vec![first_compact_block],
-        )
-        .with_block_blobs(vec![first_blob.clone()]),
-    )?;
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
-            second_epoch,
-            vec![second_block],
-            vec![second_replay],
-            vec![second_compact_block],
-        )
-        .with_block_blobs(vec![second_blob.clone()]),
-    )?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let stream = wallet_query
         .full_blocks_in_range(
             BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2)),
@@ -132,103 +104,24 @@ async fn full_block_range_streams_blocks_in_order() -> eyre::Result<()> {
         .await?;
     let (chain_epoch, blobs, terminal_error) = drain_full_block_stream(stream).await;
 
-    assert_eq!(chain_epoch, second_epoch);
-    assert_eq!(blobs, vec![first_blob, second_blob]);
+    assert_eq!(current_epoch.id, ChainEpochId::new(2));
+    assert_eq!(chain_epoch, current_epoch);
+    assert_eq!(blobs, expected_block_blobs(&chain));
     assert!(terminal_error.is_none(), "clean range must not error");
 
     Ok(())
 }
 
 #[tokio::test]
-async fn full_block_at_unretained_height_returns_artifact_unavailable() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
-    let replay = encode_fixture_block_replay(&block, &[]);
-
-    store.commit_chain_epoch(ChainEpochArtifacts::new(
-        chain_epoch,
-        vec![block],
-        vec![replay],
-        vec![compact_block],
-    ))?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let outcome = wallet_query.full_block_at(BlockHeight::new(1), None).await;
-
-    assert!(
-        matches!(
-            outcome,
-            Err(QueryError::ArtifactUnavailable {
-                family: ArtifactFamily::BlockBlob,
-                key: ArtifactKey::BlockHeight(height),
-            }) if height == BlockHeight::new(1)
-        ),
-        "unretained block blob must degrade to ArtifactUnavailable, got {outcome:?}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn full_block_range_without_blob_retention_errors_at_first_height() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    let store = store_fixture.chain_store().clone();
-
-    for height in 1..=5u32 {
-        let (chain_epoch, block, compact_block) = synthetic_chain_epoch(u64::from(height), height);
-        let replay = encode_fixture_block_replay(&block, &[]);
-        store.commit_chain_epoch(ChainEpochArtifacts::new(
-            chain_epoch,
-            vec![block],
-            vec![replay],
-            vec![compact_block],
-        ))?;
-    }
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
-    let stream = wallet_query
-        .full_blocks_in_range(
-            BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(5)),
-            None,
-        )
-        .await?;
-    let (_chain_epoch, blobs, terminal_error) = drain_full_block_stream(stream).await;
-
-    assert_eq!(
-        blobs,
-        Vec::<BlockBlobArtifact>::new(),
-        "a store without block retention must not deliver raw blocks"
-    );
-    assert!(
-        matches!(
-            terminal_error,
-            Some(QueryError::ArtifactUnavailable {
-                family: ArtifactFamily::BlockBlob,
-                key: ArtifactKey::BlockHeight(height),
-            }) if height == BlockHeight::new(1)
-        ),
-        "the first unretained height must terminate the stream, got {terminal_error:?}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn full_block_range_chunk_uses_native_wallet_proto_shape() -> eyre::Result<()> {
-    let store_fixture = open_block_blob_store()?;
-    let store = store_fixture.chain_store().clone();
-    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
-    let block_blob = block_blob_for(1);
-    let replay =
-        encode_fixture_block_replay_with_raw_block(&block, &block_blob.raw_block_bytes, &[]);
+    let chain = all_retention_chain(1);
+    let (wallet_query, _store_fixture) = serving_query_over(&chain)?;
+    let chain_epoch = wallet_query.visible_tip_block(None).await?.chain_epoch;
+    let block_blob = expected_block_blobs(&chain)
+        .into_iter()
+        .next()
+        .ok_or_else(|| eyre!("missing fixture block blob"))?;
 
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![replay], vec![compact_block])
-            .with_block_blobs(vec![block_blob.clone()]),
-    )?;
-
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
     let stream = wallet_query
         .full_blocks_in_range(
             BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(1)),
@@ -285,15 +178,8 @@ async fn full_block_range_chunk_uses_native_wallet_proto_shape() -> eyre::Result
 #[tokio::test]
 async fn full_block_range_streams_one_thousand_blocks_under_one_epoch() -> eyre::Result<()> {
     let block_count = DEFAULT_MAX_FULL_BLOCK_RANGE.get();
-    let chain_fixture = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::All)
-        .extend_blocks(block_count);
-    let store_fixture = StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
-    let wallet_query = WalletQuery::new(
-        store_fixture.chain_store().clone(),
-        (),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let chain = all_retention_chain(block_count);
+    let (wallet_query, _store_fixture) = serving_query_over(&chain)?;
 
     let stream = wallet_query
         .full_blocks_in_range(
@@ -319,19 +205,10 @@ async fn full_block_range_streams_one_thousand_blocks_under_one_epoch() -> eyre:
 
 #[tokio::test]
 async fn full_block_range_above_cap_is_rejected() -> eyre::Result<()> {
-    let store_fixture = open_block_blob_store()?;
-    let store = store_fixture.chain_store().clone();
-    let (chain_epoch, block, compact_block) = synthetic_chain_epoch(1, 1);
-    let block_blob = block_blob_for(1);
-    let replay =
-        encode_fixture_block_replay_with_raw_block(&block, &block_blob.raw_block_bytes, &[]);
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(chain_epoch, vec![block], vec![replay], vec![compact_block])
-            .with_block_blobs(vec![block_blob]),
-    )?;
-
+    let chain = all_retention_chain(1);
+    let (wallet_query, _store_fixture) = serving_query_over(&chain)?;
     let over_cap = DEFAULT_MAX_FULL_BLOCK_RANGE.get().saturating_add(1);
-    let wallet_query = WalletQuery::new(store, (), Arc::new(sample_regtest_upgrade_activations()));
+
     let outcome = wallet_query
         .full_blocks_in_range(
             BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(over_cap)),

@@ -14,7 +14,6 @@ use std::{
 use tempfile::tempdir;
 use tokio::process::Command as TokioCommand;
 use tonic::transport::{Channel, Endpoint};
-use zinder_core::Network;
 use zinder_proto::{
     capabilities::{
         EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_TRANSACTION_DETAIL_V4,
@@ -22,7 +21,6 @@ use zinder_proto::{
     },
     v1::explorer::{ServerInfoRequest, explorer_query_client::ExplorerQueryClient},
 };
-use zinder_testkit::StoreFixture;
 
 #[test]
 fn print_config_accepts_explorer_bearer_token_path() -> eyre::Result<()> {
@@ -106,14 +104,17 @@ fn invalid_explorer_bearer_token_path_is_rejected() -> eyre::Result<()> {
 #[tokio::test]
 async fn runtime_starts_without_materialized_view_store_and_omits_materialized_view_capabilities()
 -> eyre::Result<()> {
-    let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
+    // The explorer never opens a canonical primary; `storage.path` only locates
+    // the materialized-view primary, which this empty directory lacks.
     let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("store");
+    fs::create_dir(&storage_path)?;
     let secondary_path = tempdir.path().join("explorer-secondary");
     let config_path = tempdir.path().join("zinder-explorer.toml");
     let listen_addr = unused_loopback_addr()?;
     fs::write(
         &config_path,
-        explorer_config_toml(store_fixture.tempdir_path(), &secondary_path, listen_addr)?,
+        explorer_config_toml(&storage_path, &secondary_path, listen_addr)?,
     )?;
 
     let mut child = zinder_explorer_tokio_command()

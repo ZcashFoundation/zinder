@@ -808,10 +808,10 @@ fn subtree_roots_from_records(
 /// A [`NodeSource`] that serves a captured fixed-range fixture.
 ///
 /// Blocks are read from segment files one at a time, so replaying a large
-/// range keeps only the requested block resident. The source advertises the
-/// capabilities the bulk-catchup pipeline needs (best-chain blocks, tip
-/// identity, subtree roots) and omits tree-state so sparse checkpoints are
-/// skipped; the transparent hot path the benchmark measures does not use them.
+/// range keeps only the requested block resident. The source advertises
+/// best-chain blocks, tip identity, and subtree roots. It omits tree-state:
+/// canonical fixture replay takes its authenticated tree checkpoints from the
+/// replay plan instead.
 #[derive(Clone)]
 pub struct FixtureNodeSource {
     network: Network,

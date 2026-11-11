@@ -55,11 +55,11 @@ publication remain ordered.
 
 `CanonicalConstructionSettings` and `CanonicalPipelineLimits` bound:
 
-- blocks, artifact bytes, and estimated write bytes per batch;
 - source segment size and target response bytes;
 - concurrent source requests and reserved response bytes;
 - block-preparation concurrency; and
-- queued artifact bytes while a prior batch is committed or flushed.
+- the memory reserved by blocks admitted to preparation until their ordered
+  store write completes.
 
 Construction loads an inactive `RocksDbCanonicalBuilder`, validates continuity,
 manifest identity, per-block replay envelopes, and the ordered facts digest,
@@ -145,9 +145,10 @@ The release writer uses these sections:
 - `[retention]` controls canonical and mempool event windows; and
 - `[ingest_control]` configures the private authenticated control listener.
 
-`ingest.phase_classification` remains available to the diagnostic `probe`
-command and the artifact-oriented ingestion library. It does not choose between
-two release binaries or require an operator handoff.
+`ingest.phase_classification` is read only by the diagnostic `probe` command.
+The writer selects construction or following from the store lifecycle described
+in [Runtime sequence](#runtime-sequence), not from a gap threshold, so no
+setting chooses between two binaries or requires an operator handoff.
 
 ## Invariants
 

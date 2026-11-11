@@ -1,7 +1,7 @@
 //! Deterministic chain, store, and node fixtures for Zinder tests.
 //!
 //! `zinder-testkit` is the single source of truth for synthetic chain shapes,
-//! tempdir-backed [`PrimaryChainStore`] instances, and trait fakes used across the
+//! tempdir-backed production store pairs, and trait fakes used across the
 //! workspace. Tests should reach for these helpers instead of duplicating
 //! `synthetic_store()`, `FakeBroadcaster`, or `TestNodeSource` patterns.
 //!
@@ -10,8 +10,6 @@
 //! - [`ChainFixture`] is a deterministic in-memory chain. It exposes block,
 //!   compact-block, source-block, tree-state, and chain-epoch values keyed by
 //!   height, plus fork helpers for reorg shape construction.
-//! - [`StoreFixture`] is a tempdir-backed [`PrimaryChainStore`] with a builder that
-//!   commits a [`ChainFixture`] before handing the store to tests.
 //! - [`WalletServingStoreFixture`] builds the production canonical and wallet
 //!   stores, then opens immutable secondaries at one admitted serving fence.
 //! - [`MockTransactionBroadcaster`] implements
@@ -33,8 +31,6 @@
 //! the dev-dep-only rule is what keeps them out of release binaries. The CI
 //! workspace gate (`cargo deny check`) enforces no production crate links
 //! against this one.
-//!
-//! [`PrimaryChainStore`]: zinder_store::PrimaryChainStore
 
 pub mod chain_fixture;
 pub mod commitment_tree_fixtures;
@@ -46,7 +42,6 @@ pub mod materialized_view_fixture;
 pub mod mock_mempool_source;
 pub mod mock_transaction_broadcaster;
 pub mod network_upgrade_fixtures;
-pub mod store_fixture;
 pub mod transparent_signer;
 pub mod wallet_serving_store_fixture;
 
@@ -72,7 +67,6 @@ pub use mock_transaction_broadcaster::MockTransactionBroadcaster;
 pub use network_upgrade_fixtures::{
     local_network_from_activations, sample_regtest_upgrade_activations,
 };
-pub use store_fixture::StoreFixture;
 pub use transparent_signer::{
     LocalNetwork, P2pkhSpendArgs, TRANSPARENT_BROADCAST_TEST_SEED, TransparentAddress,
     TransparentSignerError, TransparentTestKey, ZIP317_FEE_ONE_IN_ONE_OUT_ZATS,

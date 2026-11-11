@@ -13,8 +13,8 @@ use zebra_chain::{
 use zinder_core::{
     BlockHash, BlockHeight, CanonicalBlockFactsDigestVersion,
     CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
-    CanonicalTransactionFacts, ChainEpoch, ChainEpochId, ChainTipMetadata, Network,
-    TransactionFactsArtifact, TransactionLocation, TransparentInputFact, UnixTimestampMillis,
+    CanonicalTransactionFacts, Network, TransactionFactsArtifact, TransactionLocation,
+    TransparentInputFact, decode_canonical_block_replay,
 };
 use zinder_ingest::{
     BlockMismatchField, CanonicalBlockConstructionError, CommitmentTreeSizes,
@@ -22,11 +22,8 @@ use zinder_ingest::{
 };
 use zinder_materialized_views::project_block_summary_record;
 use zinder_source::{SourceBlock, decode_rpc_block_hash};
-use zinder_store::{
-    CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainStoreOptions, RawBlobRetention,
-};
 use zinder_testkit::{
-    FixtureTransactionRows, StoreFixture, encode_fixture_block_replay_with_raw_block,
+    FixtureTransactionRows, encode_fixture_block_replay_with_raw_block,
     sample_regtest_upgrade_activations,
 };
 
@@ -146,84 +143,11 @@ fn fixture_block_builds_canonical_facts() -> Result<(), Box<dyn Error>> {
         "76a914b75028cd1ea0ca554fd5e7c8cc7ad70a89b8dd4f88ac"
     );
 
-    let store_fixture = StoreFixture::open_with_options(ChainStoreOptions {
-        raw_blob_retention: RawBlobRetention::All,
-        ..ChainStoreOptions::for_local_tests()
-    })?;
-    let store = store_fixture.chain_store().clone();
-    let chain_epoch = ChainEpoch {
-        id: ChainEpochId::new(1),
-        network: Network::ZcashRegtest,
-        visible_tip_height: source_block.height,
-        visible_tip_hash: source_block.hash,
-        settled_tip_height: source_block.height,
-        settled_tip_hash: source_block.hash,
-        artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
-        tip_metadata: ChainTipMetadata::empty(),
-        created_at: UnixTimestampMillis::new(1_774_669_000_000),
-    };
-
-    store.commit_chain_epoch(
-        ChainEpochArtifacts::new(
-            chain_epoch,
-            vec![block_header_artifact.clone()],
-            vec![replay_envelope],
-            vec![compact_block_artifact.clone()],
-        )
-        .with_block_blobs(vec![block_blob_artifact.clone()])
-        .with_block_transaction_index(
-            transaction_rows
-                .iter()
-                .map(|rows| rows.block_transaction_index)
-                .collect(),
-        )
-        .with_transaction_locations(transaction_rows.iter().map(|rows| rows.location).collect())
-        .with_transaction_facts(
-            transaction_rows
-                .iter()
-                .map(|rows| rows.facts.clone())
-                .collect(),
-        )
-        .with_transaction_intrinsic_value_balances(
-            transaction_rows
-                .iter()
-                .filter_map(FixtureTransactionRows::intrinsic_value_balances_artifact)
-                .collect(),
-        )
-        .with_transaction_blobs(
-            transaction_rows
-                .iter()
-                .filter_map(|rows| rows.blob.clone())
-                .collect(),
-        )
-        .with_transparent_outputs_by_outpoint(
-            transaction_rows
-                .iter()
-                .flat_map(FixtureTransactionRows::transparent_output_artifacts)
-                .collect(),
-        ),
-    )?;
-
-    let reader = store.current_chain_epoch_reader()?;
+    let decoded_replay = decode_canonical_block_replay(replay_envelope.as_bytes())?;
     assert_eq!(
-        reader.block_header_at(source_block.height)?,
-        Some(block_header_artifact)
-    );
-    assert_eq!(
-        reader.block_blob_at(source_block.height)?,
-        Some(block_blob_artifact)
-    );
-    assert_eq!(
-        reader.compact_block_at(source_block.height)?,
-        Some(compact_block_artifact)
-    );
-    let persisted_replay = reader
-        .block_replay_at(source_block.height)?
-        .ok_or("persisted canonical replay envelope is missing")?;
-    assert_eq!(
-        project_block_summary_record(persisted_replay.facts()),
+        project_block_summary_record(decoded_replay.facts()),
         expected_block_summary,
-        "persisted replay must reproduce the BlockSummary materialized view without hydration"
+        "the replay envelope must reproduce the BlockSummary materialized view without hydration"
     );
 
     Ok(())

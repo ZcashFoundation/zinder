@@ -6,7 +6,7 @@
 //! Smoke test that boots an `ExplorerQueryGrpcAdapter` against an in-process
 //! tonic server and verifies `ServerInfo` returns the expected capability set.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use eyre::{Result, eyre};
@@ -16,12 +16,9 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Endpoint};
 use zinder_core::{
-    BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpochId,
-    MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, Network, TransactionId, TransactionLocation,
-    TransparentAddressScriptHash, TransparentInputFact, TransparentOutPoint, TransparentOutputFact,
-    TransparentSpendFact,
-    explorer_reasons::WALLET_QUERY_CAPABILITY_NOT_SUPPORTED,
-    wire::{encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex},
+    BlockHeight, BlockHeightRange, BlockId, ChainEpoch, ChainEpochId, Network,
+    TransparentAddressScriptHash, explorer_reasons::WALLET_QUERY_CAPABILITY_NOT_SUPPORTED,
+    wire::encode_rpc_block_hash_hex,
 };
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
 use zinder_materialized_views::{
@@ -31,33 +28,32 @@ use zinder_materialized_views::{
     TransparentAddressDeltasConsumer,
 };
 use zinder_proto::capabilities::{
-    EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1, EXPLORER_BLOCK_PRODUCTION_SERIES_V2,
-    EXPLORER_BLOCK_SUMMARY_V1, EXPLORER_BLOCK_TRANSACTIONS_V2, EXPLORER_CHAIN_REORG_HISTORY_V1,
-    EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_SERVER_INFO_V1, EXPLORER_TRANSACTION_DETAIL_V4,
-    EXPLORER_TRANSACTION_FEES_V1, EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1,
+    EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1, EXPLORER_BLOCK_SUMMARY_V1,
+    EXPLORER_CHAIN_REORG_HISTORY_V1, EXPLORER_OVERVIEW_SNAPSHOT_V1, EXPLORER_SERVER_INFO_V1,
+    EXPLORER_TRANSACTION_DETAIL_V4, EXPLORER_TRANSACTION_FEES_V1,
+    EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1,
 };
 use zinder_proto::v1::explorer::{
-    BlockActivityDistributionRequest, BlockDetailRequest, BlockProductionSeriesRequest,
-    BlockSummariesInRangeRequest, BlockSummary, BlockSummaryRecord, BlockTransactionsResponse,
-    ChainReorgHistoryRequest, OverviewSnapshotRequest, OverviewSnapshotResponse,
-    PrevoutResolutionStatus, ServerInfoRequest, TransactionDetailRequest,
-    TransactionDetailResponse, TransparentAddressDeltasRecord, TransparentAddressDeltasRequest,
-    TransparentDeltaKind, UnavailableReason, block_detail_request,
-    explorer_query_client::ExplorerQueryClient,
+    BlockActivityDistributionRequest, BlockSummariesInRangeRequest, BlockSummary,
+    BlockSummaryRecord, ChainReorgHistoryRequest, OverviewSnapshotRequest,
+    OverviewSnapshotResponse, ServerInfoRequest, TransactionDetailRequest,
+    TransparentAddressDeltasRecord, TransparentAddressDeltasRequest, TransparentDeltaKind,
+    UnavailableReason, explorer_query_client::ExplorerQueryClient,
 };
 use zinder_proto::v1::wallet::{AddressLookup, address_lookup::Selector as AddressSelector};
 use zinder_proto::wire::{TRANSPARENT_DELTA_KIND_RECEIVED_BYTE, TRANSPARENT_DELTA_KIND_SPENT_BYTE};
-use zinder_query::{WalletEndpointMetadata, WalletQuery, WalletQueryGrpcAdapter};
+use zinder_query::{
+    AdmittedIngestControl, WalletEndpointMetadata, WalletQueryGrpcAdapter, WalletServingPairSlot,
+    WalletServingQuery, WalletServingReadPair,
+};
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceError,
     UPSTREAM_HEALTH_SOURCE_ZEBRA_READY_ENDPOINT, UpstreamHealthSnapshot,
 };
-use zinder_store::{
-    ChainEpochArtifacts, ChainStoreOptions, ReorgWindowChange, SecondaryChainStore,
-};
+use zinder_store::{CanonicalEventCursor, ChainEpochCommitted, ChainEvent, ChainRangeReverted};
 use zinder_testkit::{
-    ChainFixture, FixtureTransactionRows, StoreFixture, encode_fixture_block_replay,
-    sample_regtest_upgrade_activations, synthetic_transaction_public_facts,
+    ChainFixture, IngestControlFixture, WalletServingStoreFixture,
+    sample_regtest_upgrade_activations,
 };
 
 type ServerHandle = tokio::task::JoinHandle<Result<(), tonic::transport::Error>>;
@@ -257,122 +253,6 @@ async fn explorer_query_serves_block_summary_from_secondary_materialized_view_st
 }
 
 #[tokio::test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "scenario seeds a coinbase-bearing fixture, spawns wallet and explorer servers, and asserts every block-production and coinbase field in one request; splitting it obscures the end-to-end flow"
-)]
-async fn explorer_query_serves_block_production_series_with_explicit_coverage() -> Result<()> {
-    let base_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
-    let fixture_block = base_fixture
-        .block_at(BlockHeight::new(1))
-        .ok_or_else(|| eyre!("fixture block missing"))?;
-    let coinbase_transaction_id = TransactionId::from_bytes([0xCB; 32]);
-    let coinbase_location = TransactionLocation::new(
-        coinbase_transaction_id,
-        fixture_block.height,
-        fixture_block.hash,
-        0,
-    );
-    let mut coinbase_facts = synthetic_transaction_public_facts(coinbase_transaction_id, 64);
-    coinbase_facts.is_coinbase = true;
-    coinbase_facts.counts.transparent_input_count = 1;
-    coinbase_facts.counts.transparent_output_count = 1;
-    let mut coinbase_rows =
-        FixtureTransactionRows::from_public_facts(coinbase_location, coinbase_facts);
-    let script_pub_key = vec![0x51];
-    coinbase_rows.facts = coinbase_rows.facts.with_transparent_facts(
-        Vec::new(),
-        vec![TransparentOutputFact::new(
-            0,
-            137_500_000,
-            script_pub_key.clone(),
-            TransparentAddressScriptHash::of_script_pub_key(&script_pub_key),
-        )],
-    );
-    let chain_fixture = base_fixture.with_transaction_rows(coinbase_rows);
-    let (store_fixture, wallet_addr, wallet_handle) =
-        spawn_wallet_query_server(&chain_fixture).await?;
-    let canonical_store = SecondaryChainStore::open(
-        store_fixture.tempdir_path(),
-        store_fixture
-            .tempdir_path()
-            .join("block-production-canonical-secondary"),
-        ChainStoreOptions::for_local_tests(),
-    )?;
-    canonical_store.try_catch_up()?;
-    let seeded_materialized_view_store =
-        seeded_block_summary_materialized_view_store_with_transaction_ids(
-            &chain_fixture,
-            &[encode_rpc_transaction_id_hex(coinbase_transaction_id)],
-        )?;
-    let (mut client, explorer_handle) = spawn_explorer_query_server_with_canonical_store(
-        seeded_materialized_view_store.secondary_store,
-        canonical_store,
-        wallet_addr,
-    )
-    .await?;
-
-    let common = client
-        .server_info(ServerInfoRequest {})
-        .await?
-        .into_inner()
-        .info
-        .and_then(|info| info.common)
-        .ok_or_else(|| eyre!("explorer info missing common ops.ServerInfo"))?;
-    assert_advertises_capability(&common.capabilities, EXPLORER_BLOCK_PRODUCTION_SERIES_V2);
-
-    let response = client
-        .block_production_series(BlockProductionSeriesRequest {
-            start_height: 0,
-            end_height: 1,
-            at_epoch_id: None,
-        })
-        .await?
-        .into_inner();
-    assert_eq!(response.start_height, 0);
-    assert_eq!(response.end_height, 1);
-    assert_eq!(response.covered_block_count, 1);
-    assert_eq!(response.missing_block_count, 1);
-    assert_eq!(response.points.len(), 1);
-    assert_eq!(response.points[0].bits, 0);
-    let summary = response.points[0]
-        .summary
-        .as_ref()
-        .ok_or_else(|| eyre!("block production point missing summary"))?;
-    assert_eq!(summary.block_height, 1);
-    assert_eq!(summary.confirmations, 1);
-    let coinbase = response.points[0]
-        .coinbase
-        .as_ref()
-        .ok_or_else(|| eyre!("block production point missing coinbase"))?;
-    assert_eq!(
-        coinbase.transaction_id,
-        encode_rpc_transaction_id_hex(coinbase_transaction_id)
-    );
-    assert_eq!(coinbase.transparent_outputs.len(), 1);
-    assert_eq!(coinbase.transparent_outputs[0].value_zat, 137_500_000);
-    assert_eq!(
-        coinbase.transparent_outputs[0].script_pub_key,
-        script_pub_key
-    );
-    let freshness = response
-        .freshness
-        .as_ref()
-        .ok_or_else(|| eyre!("block production response missing freshness"))?;
-    assert_eq!(
-        freshness.capability_version,
-        EXPLORER_BLOCK_PRODUCTION_SERIES_V2
-    );
-    assert_eq!(freshness_visible_tip(freshness)?.height, 1);
-
-    explorer_handle.abort();
-    let _ = explorer_handle.await;
-    wallet_handle.abort();
-    let _ = wallet_handle.await;
-    Ok(())
-}
-
-#[tokio::test]
 async fn explorer_query_aggregates_block_activity_with_explicit_coverage() -> Result<()> {
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
     let (_store_fixture, wallet_addr, wallet_handle) =
@@ -418,622 +298,6 @@ async fn explorer_query_aggregates_block_activity_with_explicit_coverage() -> Re
     let _ = explorer_handle.await;
     wallet_handle.abort();
     let _ = wallet_handle.await;
-    Ok(())
-}
-
-/// Block transaction rows retain canonical order when facts are unavailable.
-///
-/// The materialized block record supplies each id and index without fabricating
-/// an all-zero transaction for an absent canonical facts artifact.
-#[tokio::test]
-async fn explorer_query_serves_canonical_block_transactions_with_partial_fact_retention()
--> Result<()> {
-    let mut fixture = block_transactions_test_fixture().await?;
-
-    let explorer_info = fixture
-        .client
-        .server_info(ServerInfoRequest {})
-        .await?
-        .into_inner()
-        .info
-        .ok_or_else(|| eyre!("server info missing info envelope"))?;
-    let common = explorer_info
-        .common
-        .as_ref()
-        .ok_or_else(|| eyre!("explorer info missing common ops.ServerInfo"))?;
-    assert_advertises_capability(&common.capabilities, EXPLORER_BLOCK_TRANSACTIONS_V2);
-
-    let response = fixture
-        .client
-        .block_transactions(BlockDetailRequest {
-            at_epoch_id: Some(1),
-            selector: Some(block_detail_request::Selector::BlockHeight(1)),
-        })
-        .await?
-        .into_inner();
-    assert_block_transactions_response(&response, &fixture.transaction_id_strings)?;
-
-    fixture.explorer_handle.abort();
-    let _ = fixture.explorer_handle.await;
-    fixture.wallet_handle.abort();
-    let _ = fixture.wallet_handle.await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn explorer_query_transaction_detail_preserves_canonical_transparent_rows() -> Result<()> {
-    let mut fixture = block_transactions_test_fixture().await?;
-    let first = fixture
-        .client
-        .transaction_detail(TransactionDetailRequest {
-            transaction_id: fixture.transaction_id_strings[0].clone(),
-            at_epoch_id: Some(1),
-        })
-        .await?
-        .into_inner();
-    assert_transaction_detail_output_spends(&first, &fixture.transaction_id_strings)?;
-
-    let second = fixture
-        .client
-        .transaction_detail(TransactionDetailRequest {
-            transaction_id: fixture.transaction_id_strings[1].clone(),
-            at_epoch_id: Some(1),
-        })
-        .await?
-        .into_inner();
-    assert_transaction_detail_inputs(&second, &fixture.transaction_id_strings)?;
-
-    fixture.explorer_handle.abort();
-    let _ = fixture.explorer_handle.await;
-    fixture.wallet_handle.abort();
-    let _ = fixture.wallet_handle.await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn transaction_detail_batches_spent_output_lookup_beyond_wallet_request_limit() -> Result<()>
-{
-    let (chain_fixture, transaction_ids) = many_output_spend_chain_fixture()?;
-    let (wallet_store_fixture, wallet_addr, wallet_handle) =
-        spawn_wallet_query_server(&chain_fixture).await?;
-    let canonical_store = SecondaryChainStore::open(
-        wallet_store_fixture.tempdir_path(),
-        wallet_store_fixture
-            .tempdir_path()
-            .join("many-output-canonical-secondary"),
-        ChainStoreOptions::for_local_tests(),
-    )?;
-    canonical_store.try_catch_up()?;
-    let seeded_materialized_view_store =
-        seeded_block_summary_materialized_view_store_with_transaction_ids(
-            &chain_fixture,
-            &transaction_ids,
-        )?;
-    let (mut client, explorer_handle) = spawn_explorer_query_server_with_canonical_store(
-        seeded_materialized_view_store.secondary_store,
-        canonical_store,
-        wallet_addr,
-    )
-    .await?;
-
-    let detail = client
-        .transaction_detail(TransactionDetailRequest {
-            transaction_id: transaction_ids[0].clone(),
-            at_epoch_id: Some(1),
-        })
-        .await?
-        .into_inner();
-
-    assert_eq!(
-        detail.transparent_outputs.len(),
-        MAX_TRANSPARENT_OUTPUTS_PER_REQUEST + 1
-    );
-    assert!(detail.transparent_outputs[0].spent_by.is_none());
-    let final_output = detail
-        .transparent_outputs
-        .last()
-        .ok_or_else(|| eyre!("transaction detail missing final transparent output"))?;
-    assert_eq!(
-        usize::try_from(final_output.output_index)?,
-        MAX_TRANSPARENT_OUTPUTS_PER_REQUEST
-    );
-    assert_eq!(
-        final_output
-            .spent_by
-            .as_ref()
-            .ok_or_else(|| eyre!("final transparent output missing canonical spender"))?
-            .spending_transaction_id,
-        transaction_ids[1]
-    );
-
-    explorer_handle.abort();
-    let _ = explorer_handle.await;
-    wallet_handle.abort();
-    let _ = wallet_handle.await;
-    Ok(())
-}
-
-fn many_output_spend_chain_fixture() -> Result<(ChainFixture, Vec<String>)> {
-    let base_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
-    let block = base_fixture
-        .block_at(BlockHeight::new(1))
-        .ok_or_else(|| eyre!("fixture block missing"))?;
-    let creating_transaction_id = TransactionId::from_bytes([0xD1; 32]);
-    let spending_transaction_id = TransactionId::from_bytes([0xD2; 32]);
-    let output_count = MAX_TRANSPARENT_OUTPUTS_PER_REQUEST + 1;
-    let outputs = (0..output_count)
-        .map(|output_index| {
-            Ok(transparent_output_fact(
-                u32::try_from(output_index)?,
-                u64::try_from(output_index)? + 1,
-                vec![0x51],
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut creating_facts = synthetic_transaction_public_facts(creating_transaction_id, 120);
-    creating_facts.is_coinbase = true;
-    creating_facts.counts.transparent_input_count = 1;
-    creating_facts.counts.transparent_output_count = u32::try_from(output_count)?;
-    let creating_transaction = FixtureTransactionRows::from_public_facts(
-        TransactionLocation::new(creating_transaction_id, block.height, block.hash, 0),
-        creating_facts,
-    );
-    let creating_transaction = FixtureTransactionRows {
-        facts: creating_transaction
-            .facts
-            .with_transparent_facts(Vec::new(), outputs),
-        ..creating_transaction
-    };
-    let spent_outpoint = TransparentOutPoint::new(
-        creating_transaction_id,
-        u32::try_from(MAX_TRANSPARENT_OUTPUTS_PER_REQUEST)?,
-    );
-    let mut spending_facts = synthetic_transaction_public_facts(spending_transaction_id, 80);
-    spending_facts.counts.transparent_input_count = 1;
-    let spending_transaction = FixtureTransactionRows::from_public_facts(
-        TransactionLocation::new(spending_transaction_id, block.height, block.hash, 1),
-        spending_facts,
-    );
-    let spending_transaction = FixtureTransactionRows {
-        facts: spending_transaction.facts.with_transparent_facts(
-            vec![TransparentInputFact::new(0, spent_outpoint)],
-            Vec::new(),
-        ),
-        ..spending_transaction
-    };
-    let final_output_value = u64::try_from(output_count)?;
-    let spend = TransparentSpendFact::new(
-        spent_outpoint,
-        0,
-        spending_transaction_id,
-        1,
-        block.height,
-        block.hash,
-        final_output_value,
-        TransparentAddressScriptHash::of_script_pub_key(&[0x51]),
-        block.height,
-        block.hash,
-    );
-    let chain_fixture = base_fixture
-        .with_transaction_rows(creating_transaction)
-        .with_transaction_rows(spending_transaction)
-        .with_transparent_spend_fact(spend);
-    Ok((
-        chain_fixture,
-        vec![
-            encode_rpc_transaction_id_hex(creating_transaction_id),
-            encode_rpc_transaction_id_hex(spending_transaction_id),
-        ],
-    ))
-}
-
-fn assert_transaction_detail_output_spends(
-    detail: &TransactionDetailResponse,
-    transaction_ids: &[String],
-) -> Result<()> {
-    assert_eq!(detail.transparent_inputs.len(), 0);
-    assert_eq!(detail.transparent_outputs.len(), 2);
-    assert_eq!(detail.transparent_outputs[0].output_index, 0);
-    let first_output = detail.transparent_outputs[0]
-        .output
-        .as_ref()
-        .ok_or_else(|| eyre!("transaction detail missing first transparent output"))?;
-    assert_eq!(first_output.value_zat, 21_000);
-    assert_eq!(first_output.script_pub_key, [0x51]);
-    let first_spend = detail.transparent_outputs[0]
-        .spent_by
-        .as_ref()
-        .ok_or_else(|| eyre!("transaction detail missing first output spender"))?;
-    assert_eq!(first_spend.spending_transaction_id, transaction_ids[1]);
-    assert_eq!(first_spend.input_index, 1);
-    let first_spending_block = first_spend
-        .spending_block
-        .as_ref()
-        .ok_or_else(|| eyre!("transaction detail output spender missing block"))?;
-    assert_eq!(first_spending_block.height, 1);
-    assert_eq!(detail.transparent_outputs[1].output_index, 1);
-    let second_output = detail.transparent_outputs[1]
-        .output
-        .as_ref()
-        .ok_or_else(|| eyre!("transaction detail missing second transparent output"))?;
-    assert_eq!(second_output.value_zat, 34_000);
-    assert_eq!(second_output.script_pub_key, [0x52]);
-    assert!(detail.transparent_outputs[1].spent_by.is_none());
-    Ok(())
-}
-
-fn assert_transaction_detail_inputs(
-    detail: &TransactionDetailResponse,
-    transaction_ids: &[String],
-) -> Result<()> {
-    assert_eq!(detail.transparent_outputs.len(), 0);
-    assert_eq!(detail.transparent_inputs.len(), 2);
-    let transparent_input = &detail.transparent_inputs[0];
-    let spent_outpoint = transparent_input
-        .spent_outpoint
-        .as_ref()
-        .ok_or_else(|| eyre!("transaction detail input missing spent outpoint"))?;
-    assert_eq!(
-        spent_outpoint.transaction_id,
-        encode_rpc_transaction_id_hex(TransactionId::from_bytes([0xA1; 32]))
-    );
-    assert_eq!(spent_outpoint.output_index, 4);
-    assert_eq!(
-        detail.prevout_resolution_status,
-        PrevoutResolutionStatus::Resolved as i32
-    );
-    assert_eq!(transparent_input.input_index, 0);
-    assert_eq!(transparent_input.value_zat, Some(60_000));
-    assert_eq!(
-        transparent_input.script_pub_key.as_deref(),
-        Some([0x53].as_slice())
-    );
-    let same_block_input = &detail.transparent_inputs[1];
-    let same_block_outpoint = same_block_input
-        .spent_outpoint
-        .as_ref()
-        .ok_or_else(|| eyre!("transaction detail same-block input missing spent outpoint"))?;
-    assert_eq!(same_block_input.input_index, 1);
-    assert_eq!(same_block_outpoint.transaction_id, transaction_ids[0]);
-    assert_eq!(same_block_outpoint.output_index, 0);
-    assert_eq!(same_block_input.value_zat, Some(21_000));
-    assert_eq!(
-        same_block_input.script_pub_key.as_deref(),
-        Some([0x51].as_slice())
-    );
-
-    Ok(())
-}
-
-struct BlockTransactionsTestFixture {
-    _canonical_store_fixture: StoreFixture,
-    client: ExplorerQueryClient<Channel>,
-    explorer_handle: ServerHandle,
-    transaction_id_strings: Vec<String>,
-    wallet_handle: ServerHandle,
-}
-
-async fn block_transactions_test_fixture() -> Result<BlockTransactionsTestFixture> {
-    let (chain_fixture, transaction_id_strings, missing_transaction_id) =
-        block_transactions_chain_fixture()?;
-    let (_wallet_store_fixture, wallet_addr, wallet_handle) =
-        spawn_wallet_query_server(&chain_fixture).await?;
-    let (canonical_store_fixture, canonical_store) =
-        canonical_store_without_transaction_facts(&chain_fixture, missing_transaction_id)?;
-    let seeded_materialized_view_store =
-        seeded_block_summary_materialized_view_store_with_transaction_ids(
-            &chain_fixture,
-            &transaction_id_strings,
-        )?;
-    let (client, explorer_handle) = spawn_explorer_query_server_with_canonical_store(
-        seeded_materialized_view_store.secondary_store,
-        canonical_store,
-        wallet_addr,
-    )
-    .await?;
-    Ok(BlockTransactionsTestFixture {
-        _canonical_store_fixture: canonical_store_fixture,
-        client,
-        explorer_handle,
-        transaction_id_strings,
-        wallet_handle,
-    })
-}
-
-fn block_transactions_chain_fixture() -> Result<(ChainFixture, Vec<String>, TransactionId)> {
-    let base_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
-    let block = base_fixture
-        .block_at(BlockHeight::new(1))
-        .ok_or_else(|| eyre!("fixture block missing"))?;
-    let transaction_ids = block_transaction_ids();
-    let transaction_id_strings = transaction_ids
-        .iter()
-        .copied()
-        .map(encode_rpc_transaction_id_hex)
-        .collect();
-    let [first, second, unavailable] =
-        block_transaction_fixture_rows(block.height, block.hash, transaction_ids);
-    let spent_script_hash = TransparentAddressScriptHash::of_script_pub_key(&[0x51]);
-    let same_block_spend = TransparentSpendFact::new(
-        TransparentOutPoint::new(transaction_ids[0], 0),
-        1,
-        transaction_ids[1],
-        1,
-        block.height,
-        block.hash,
-        21_000,
-        spent_script_hash,
-        block.height,
-        block.hash,
-    );
-    let chain_fixture = base_fixture
-        .with_transaction_rows(first)
-        .with_transaction_rows(second)
-        .with_transaction_rows(unavailable)
-        .with_transparent_spend_fact(same_block_spend);
-    Ok((chain_fixture, transaction_id_strings, transaction_ids[2]))
-}
-
-fn block_transaction_ids() -> [TransactionId; 3] {
-    [
-        TransactionId::from_bytes([0x01; 32]),
-        TransactionId::from_bytes([0x02; 32]),
-        TransactionId::from_bytes([0x03; 32]),
-    ]
-}
-
-fn block_transaction_fixture_rows(
-    block_height: BlockHeight,
-    block_hash: BlockHash,
-    transaction_ids: [TransactionId; 3],
-) -> [FixtureTransactionRows; 3] {
-    [
-        coinbase_transaction_row(block_height, block_hash, transaction_ids[0]),
-        transparent_spend_transaction_row(
-            block_height,
-            block_hash,
-            transaction_ids[0],
-            transaction_ids[1],
-        ),
-        FixtureTransactionRows::from_public_facts(
-            TransactionLocation::new(transaction_ids[2], block_height, block_hash, 2),
-            synthetic_transaction_public_facts(transaction_ids[2], 64),
-        ),
-    ]
-}
-
-fn coinbase_transaction_row(
-    block_height: BlockHeight,
-    block_hash: BlockHash,
-    transaction_id: TransactionId,
-) -> FixtureTransactionRows {
-    let first_script_pub_key = vec![0x51];
-    let second_script_pub_key = vec![0x52];
-    let mut public_facts = synthetic_transaction_public_facts(transaction_id, 120);
-    public_facts.is_coinbase = true;
-    public_facts.counts.transparent_input_count = 1;
-    public_facts.counts.transparent_output_count = 2;
-    let transaction = FixtureTransactionRows::from_public_facts(
-        TransactionLocation::new(transaction_id, block_height, block_hash, 0),
-        public_facts,
-    );
-    FixtureTransactionRows {
-        facts: transaction.facts.with_transparent_facts(
-            Vec::new(),
-            vec![
-                transparent_output_fact(0, 21_000, first_script_pub_key),
-                transparent_output_fact(1, 34_000, second_script_pub_key),
-            ],
-        ),
-        ..transaction
-    }
-}
-
-fn transparent_output_fact(
-    output_index: u32,
-    value_zat: u64,
-    script_pub_key: Vec<u8>,
-) -> TransparentOutputFact {
-    let script_hash = TransparentAddressScriptHash::of_script_pub_key(&script_pub_key);
-    TransparentOutputFact::new(output_index, value_zat, script_pub_key, script_hash)
-}
-
-fn transparent_spend_transaction_row(
-    block_height: BlockHeight,
-    block_hash: BlockHash,
-    spent_transaction_id: TransactionId,
-    transaction_id: TransactionId,
-) -> FixtureTransactionRows {
-    let mut public_facts = synthetic_transaction_public_facts(transaction_id, 80);
-    public_facts.counts.transparent_input_count = 2;
-    let transaction = FixtureTransactionRows::from_public_facts(
-        TransactionLocation::new(transaction_id, block_height, block_hash, 1),
-        public_facts,
-    );
-    FixtureTransactionRows {
-        facts: transaction.facts.with_transparent_facts(
-            vec![
-                TransparentInputFact::new(
-                    0,
-                    TransparentOutPoint::new(TransactionId::from_bytes([0xA1; 32]), 4),
-                ),
-                TransparentInputFact::new(1, TransparentOutPoint::new(spent_transaction_id, 0)),
-            ],
-            Vec::new(),
-        ),
-        ..transaction
-    }
-}
-
-fn historical_parent_transaction_row(
-    block_height: BlockHeight,
-    block_hash: BlockHash,
-) -> FixtureTransactionRows {
-    let transaction_id = TransactionId::from_bytes([0xA1; 32]);
-    let location = TransactionLocation::new(transaction_id, block_height, block_hash, 2);
-    let mut public_facts = synthetic_transaction_public_facts(transaction_id, 64);
-    public_facts.counts.transparent_output_count = 5;
-    let transaction = FixtureTransactionRows::from_public_facts(location, public_facts);
-    FixtureTransactionRows {
-        facts: transaction.facts.with_transparent_facts(
-            Vec::new(),
-            vec![
-                transparent_output_fact(0, 1, vec![0x50]),
-                transparent_output_fact(1, 2, vec![0x51]),
-                transparent_output_fact(2, 3, vec![0x52]),
-                transparent_output_fact(3, 4, vec![0x54]),
-                transparent_output_fact(4, 60_000, vec![0x53]),
-            ],
-        ),
-        ..transaction
-    }
-}
-
-fn canonical_store_without_transaction_facts(
-    chain_fixture: &ChainFixture,
-    missing_transaction_id: TransactionId,
-) -> Result<(StoreFixture, SecondaryChainStore)> {
-    let mut artifacts = chain_fixture
-        .chain_epoch_artifacts(ChainEpochId::new(1))
-        .ok_or_else(|| eyre!("fixture chain epoch artifacts missing"))?;
-    let block = chain_fixture
-        .block_at(BlockHeight::new(1))
-        .ok_or_else(|| eyre!("fixture block missing"))?;
-    let mut retained_transaction_rows =
-        block_transaction_fixture_rows(block.height, block.hash, block_transaction_ids())
-            .into_iter()
-            .filter(|transaction_rows| {
-                transaction_rows.location.transaction_id != missing_transaction_id
-            })
-            .collect::<Vec<_>>();
-    retained_transaction_rows.push(historical_parent_transaction_row(block.height, block.hash));
-    artifacts.compact_blocks = retained_transaction_rows
-        .iter()
-        .cloned()
-        .fold(
-            ChainFixture::new(chain_fixture.network()).extend_blocks(1),
-            ChainFixture::with_transaction_rows,
-        )
-        .compact_block_artifacts();
-    artifacts.block_replay_envelopes = vec![encode_fixture_block_replay(
-        &block.block_header_artifact(),
-        &retained_transaction_rows,
-    )];
-    artifacts.block_transaction_index = retained_transaction_rows
-        .iter()
-        .map(|transaction_rows| transaction_rows.block_transaction_index)
-        .collect();
-    artifacts.transaction_locations = retained_transaction_rows
-        .iter()
-        .map(|transaction_rows| transaction_rows.location)
-        .collect();
-    artifacts.transaction_facts = retained_transaction_rows
-        .iter()
-        .map(|transaction_rows| transaction_rows.facts.clone())
-        .collect();
-    artifacts.transaction_intrinsic_value_balances = retained_transaction_rows
-        .iter()
-        .filter_map(FixtureTransactionRows::intrinsic_value_balances_artifact)
-        .collect();
-    artifacts.transaction_blobs = retained_transaction_rows
-        .iter()
-        .filter_map(|transaction_rows| transaction_rows.blob.clone())
-        .collect();
-    artifacts.transparent_outputs_by_outpoint = retained_transaction_rows
-        .iter()
-        .flat_map(FixtureTransactionRows::transparent_output_artifacts)
-        .collect();
-    let store_fixture = StoreFixture::open()?;
-    store_fixture.chain_store().commit_chain_epoch(artifacts)?;
-    let secondary_store = SecondaryChainStore::open(
-        store_fixture.tempdir_path(),
-        store_fixture.tempdir_path().join("canonical-secondary"),
-        ChainStoreOptions::for_local_tests(),
-    )?;
-    secondary_store.try_catch_up()?;
-    Ok((store_fixture, secondary_store))
-}
-
-fn assert_block_transactions_response(
-    response: &BlockTransactionsResponse,
-    transaction_id_strings: &[String],
-) -> Result<()> {
-    let freshness = response
-        .freshness
-        .as_ref()
-        .ok_or_else(|| eyre!("block transactions response missing freshness"))?;
-    assert_eq!(freshness.capability_version, EXPLORER_BLOCK_TRANSACTIONS_V2);
-    assert_eq!(freshness_visible_tip(freshness)?.height, 1);
-    assert_eq!(response.transactions.len(), 3);
-    assert_eq!(
-        response
-            .transactions
-            .iter()
-            .map(|transaction| transaction.transaction_id.as_str())
-            .collect::<Vec<_>>(),
-        transaction_id_strings
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-    );
-    assert_eq!(
-        response
-            .transactions
-            .iter()
-            .map(|transaction| transaction.transaction_index)
-            .collect::<Vec<_>>(),
-        vec![0, 1, 2],
-    );
-
-    let first_row = &response.transactions[0];
-    assert!(
-        first_row
-            .public_facts
-            .as_ref()
-            .is_some_and(|facts| facts.is_coinbase)
-    );
-    assert_eq!(
-        first_row
-            .transparent_outputs
-            .iter()
-            .map(|output| (output.value_zat, output.script_pub_key.as_slice()))
-            .collect::<Vec<_>>(),
-        vec![(21_000, &[0x51][..]), (34_000, &[0x52][..])],
-    );
-    assert!(first_row.transparent_inputs.is_empty());
-
-    let second_row = &response.transactions[1];
-    assert_eq!(second_row.transparent_inputs.len(), 2);
-    let historical_parent = second_row.transparent_inputs[0]
-        .spent_outpoint
-        .as_ref()
-        .ok_or_else(|| eyre!("block transaction input missing historical outpoint"))?;
-    assert_eq!(
-        historical_parent.transaction_id,
-        encode_rpc_transaction_id_hex(TransactionId::from_bytes([0xA1; 32]))
-    );
-    assert_eq!(historical_parent.output_index, 4);
-    assert_eq!(second_row.transparent_inputs[0].value_zat, Some(60_000));
-    assert_eq!(
-        second_row.transparent_inputs[0].script_pub_key.as_deref(),
-        Some([0x53].as_slice())
-    );
-    let same_block_parent = second_row.transparent_inputs[1]
-        .spent_outpoint
-        .as_ref()
-        .ok_or_else(|| eyre!("block transaction input missing same-block outpoint"))?;
-    assert_eq!(same_block_parent.transaction_id, transaction_id_strings[0]);
-    assert_eq!(same_block_parent.output_index, 0);
-    assert_eq!(second_row.transparent_inputs[1].value_zat, Some(21_000));
-    assert_eq!(
-        second_row.transparent_inputs[1].script_pub_key.as_deref(),
-        Some([0x51].as_slice())
-    );
-
-    let unavailable_row = &response.transactions[2];
-    assert!(unavailable_row.public_facts.is_none());
-    assert!(unavailable_row.transparent_outputs.is_empty());
-    assert!(unavailable_row.transparent_inputs.is_empty());
     Ok(())
 }
 
@@ -1094,7 +358,7 @@ async fn explorer_query_serves_overview_snapshot_with_seeded_materialized_view_s
         first.tip_block_time_unix_seconds,
         first.recent_blocks[0].block_time_unix_seconds
     );
-    assert_overview_wallet_fields_unavailable(&first)?;
+    assert_overview_wallet_fields_from_production_endpoint(&first)?;
 
     // Coherence guarantee: a second call against the same upstream tip
     // returns the same snapshot identity (tip_hash). The bundle never
@@ -1209,11 +473,9 @@ async fn explorer_query_freshness_carries_upstream_observation_after_probe_fires
 
 #[tokio::test]
 async fn explorer_query_serves_recorded_chain_reorg_history() -> Result<()> {
-    let store_fixture = StoreFixture::open()?;
-    seed_recorded_chain_reorg(&store_fixture)?;
-
+    let canonical_directory = tempfile::tempdir()?;
     let seeded_materialized_view_store =
-        seeded_reorg_history_materialized_view_store(&store_fixture)?;
+        seeded_reorg_history_materialized_view_store(canonical_directory.path())?;
     let (mut client, explorer_handle) = spawn_explorer_query_server_with_materialized_view_store(
         seeded_materialized_view_store.secondary_store,
     )
@@ -1228,7 +490,16 @@ async fn explorer_query_serves_recorded_chain_reorg_history() -> Result<()> {
     Ok(())
 }
 
-fn seed_recorded_chain_reorg(store_fixture: &StoreFixture) -> Result<()> {
+/// One retained canonical transition, as the materialized-view tailer dispatches it.
+struct RecordedChainEvent {
+    event_sequence: u64,
+    chain_epoch: ChainEpoch,
+    chain_event: ChainEvent,
+}
+
+/// Returns the transitions a canonical writer retains when it commits heights
+/// 1..=2 above a settled height 1 and then replaces height 2.
+fn recorded_chain_reorg_events() -> Result<[RecordedChainEvent; 2]> {
     let initial_chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
     let settled_block = initial_chain
         .block_at(BlockHeight::new(1))
@@ -1238,57 +509,55 @@ fn seed_recorded_chain_reorg(store_fixture: &StoreFixture) -> Result<()> {
         .ok_or_else(|| eyre!("initial fixture missing chain epoch"))?;
     initial_epoch.settled_tip_height = settled_block.height;
     initial_epoch.settled_tip_hash = settled_block.hash;
-    let initial_block_headers = initial_chain.block_header_artifacts();
-    let initial_block_replay_envelopes = initial_block_headers
-        .iter()
-        .map(|block_header| encode_fixture_block_replay(block_header, &[]))
-        .collect();
-    store_fixture.chain_store().commit_chain_epoch(
-        ChainEpochArtifacts::new(
-            initial_epoch,
-            initial_block_headers,
-            initial_block_replay_envelopes,
-            initial_chain.compact_block_artifacts(),
-        )
-        .with_reorg_window_change(ReorgWindowChange::Extend {
-            block_range: BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(2)),
-        }),
-    )?;
 
     let replacement_chain = initial_chain.fork_at(BlockHeight::new(2))?.extend_blocks(1);
-    let replacement_block = replacement_chain
-        .block_at(BlockHeight::new(2))
-        .ok_or_else(|| eyre!("replacement fixture missing height 2"))?;
     let mut replacement_epoch = replacement_chain
         .chain_epoch(ChainEpochId::new(2))
         .ok_or_else(|| eyre!("replacement fixture missing chain epoch"))?;
     replacement_epoch.settled_tip_height = settled_block.height;
     replacement_epoch.settled_tip_hash = settled_block.hash;
-    let replacement_block_header = replacement_block.block_header_artifact();
-    let replacement_replay = encode_fixture_block_replay(&replacement_block_header, &[]);
-    store_fixture.chain_store().commit_chain_epoch(
-        ChainEpochArtifacts::new(
-            replacement_epoch,
-            vec![replacement_block_header],
-            vec![replacement_replay],
-            vec![replacement_block.compact_block_artifact()],
-        )
-        .with_reorg_window_change(ReorgWindowChange::Replace {
-            from_height: BlockHeight::new(2),
-        }),
-    )?;
-    Ok(())
+
+    let replaced_range = BlockHeightRange::inclusive(BlockHeight::new(2), BlockHeight::new(2));
+    Ok([
+        RecordedChainEvent {
+            event_sequence: 1,
+            chain_epoch: initial_epoch,
+            chain_event: ChainEvent::ChainCommitted {
+                committed: ChainEpochCommitted {
+                    chain_epoch: initial_epoch,
+                    block_range: BlockHeightRange::inclusive(
+                        BlockHeight::new(1),
+                        BlockHeight::new(2),
+                    ),
+                },
+            },
+        },
+        RecordedChainEvent {
+            event_sequence: 2,
+            chain_epoch: replacement_epoch,
+            chain_event: ChainEvent::ChainReorged {
+                reverted: ChainRangeReverted {
+                    chain_epoch: initial_epoch,
+                    block_range: replaced_range,
+                },
+                committed: ChainEpochCommitted {
+                    chain_epoch: replacement_epoch,
+                    block_range: replaced_range,
+                },
+            },
+        },
+    ])
 }
 
 fn seeded_reorg_history_materialized_view_store(
-    store_fixture: &StoreFixture,
+    canonical_path: &Path,
 ) -> Result<SeededMaterializedViewStore> {
     let primary_materialized_view_store = zinder_ingest::open_primary_materialized_view_store(
-        store_fixture.tempdir_path(),
+        canonical_path,
         zinder_materialized_views::MaterializedViewPreset::Explorer,
         zinder_store::RocksDbResourceBudget::for_local_tests(),
     )?;
-    record_reorg_incidents(store_fixture, &primary_materialized_view_store)?;
+    record_reorg_incidents(&primary_materialized_view_store)?;
     let reorg_cursor = primary_materialized_view_store
         .get_chain_event_cursor(REORG_INCIDENTS_CONSUMER_NAME)?
         .ok_or_else(|| eyre!("reorg incidents cursor missing after materialized-view replay"))?;
@@ -1296,7 +565,7 @@ fn seeded_reorg_history_materialized_view_store(
 
     let materialized_view_secondary_tempdir = tempfile::tempdir()?;
     let materialized_view_store = MaterializedViewStore::open_secondary(
-        MaterializedViewStore::path_for_canonical(store_fixture.tempdir_path()),
+        MaterializedViewStore::path_for_canonical(canonical_path),
         materialized_view_secondary_tempdir.path(),
         MaterializedViewStoreOptions {
             sync_writes: false,
@@ -1447,14 +716,36 @@ impl NodeSource for StubUpstreamSource {
     }
 }
 
+/// Production wallet endpoint the explorer federates to, and the fixtures
+/// that must outlive it.
+struct WalletEndpointFixture {
+    _store_fixture: WalletServingStoreFixture,
+    _ingest_control_fixture: IngestControlFixture,
+}
+
+/// Serves the native `WalletQuery` endpoint over the production canonical and
+/// wallet secondaries built from `chain_fixture`.
 async fn spawn_wallet_query_server(
     chain_fixture: &ChainFixture,
-) -> Result<(StoreFixture, SocketAddr, ServerHandle)> {
-    let store_fixture = StoreFixture::with_chain_committed(chain_fixture, ChainEpochId::new(1))?;
-    let wallet_query = WalletQuery::new(
-        store_fixture.chain_store().clone(),
+) -> Result<(WalletEndpointFixture, SocketAddr, ServerHandle)> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let mut store_fixture = WalletServingStoreFixture::from_chain(chain_fixture, &activations)?;
+    let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
+    let ingest_control_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+    let ingest_control = AdmittedIngestControl::connect(
+        ingest_control_fixture.endpoint(),
+        None,
+        Network::ZcashRegtest,
+    )
+    .await?;
+    let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
+        WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
+            Arc::new(canonical_reader),
+            Arc::new(wallet_reader),
+        )?)),
         (),
-        Arc::new(sample_regtest_upgrade_activations()),
+        ingest_control,
+        activations,
     );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -1466,7 +757,14 @@ async fn spawn_wallet_query_server(
             .await
     });
     let _channel = await_with_retry(addr).await?;
-    Ok((store_fixture, addr, handle))
+    Ok((
+        WalletEndpointFixture {
+            _store_fixture: store_fixture,
+            _ingest_control_fixture: ingest_control_fixture,
+        },
+        addr,
+        handle,
+    ))
 }
 
 fn seeded_block_summary_materialized_view_store(
@@ -1508,15 +806,11 @@ fn seeded_block_summary_materialized_view_store_with_transaction_ids(
     })
 }
 
-/// Replays the fixture's retained chain events into the reorg-incident log.
-fn record_reorg_incidents(
-    store_fixture: &StoreFixture,
-    materialized_view_store: &MaterializedViewStore,
-) -> Result<()> {
+/// Replays the recorded canonical transitions into the reorg-incident log.
+fn record_reorg_incidents(materialized_view_store: &MaterializedViewStore) -> Result<()> {
     let blocks = std::collections::HashMap::new();
-    for envelope in store_fixture.chain_store().chain_event_history(
-        zinder_store::ChainEventHistoryRequest::with_default_limit(None),
-    )? {
+    for recorded in recorded_chain_reorg_events()? {
+        let chain_cursor = CanonicalEventCursor::at(recorded.event_sequence)?.as_bytes();
         let mut reorg_incidents = zinder_materialized_views::ReorgIncidentsConsumer::new();
         let mut block_consumers: [&mut dyn zinder_materialized_views::BlockKeyedConsumer; 0] = [];
         let mut event_consumers: [&mut dyn zinder_materialized_views::MaterializedViewConsumer; 1] =
@@ -1527,11 +821,11 @@ fn record_reorg_incidents(
                 event_consumers: &mut event_consumers,
             },
             zinder_materialized_views::ChainEventDispatchInputs {
-                chain_epoch: envelope.chain_epoch,
-                chain_event: &envelope.event,
-                chain_cursor: envelope.cursor.as_bytes(),
-                event_sequence: envelope.event_sequence,
-                settled_tip_height: envelope.settled_tip_height,
+                chain_epoch: recorded.chain_epoch,
+                chain_event: &recorded.chain_event,
+                chain_cursor: &chain_cursor,
+                event_sequence: recorded.event_sequence,
+                settled_tip_height: recorded.chain_epoch.settled_tip_height,
             },
             &blocks,
             true,
@@ -1601,29 +895,6 @@ async fn spawn_explorer_query_server(
     Ok((ExplorerQueryClient::new(channel), handle))
 }
 
-async fn spawn_explorer_query_server_with_canonical_store(
-    materialized_view_store: MaterializedViewStore,
-    canonical_store: SecondaryChainStore,
-    wallet_addr: SocketAddr,
-) -> Result<(ExplorerQueryClient<Channel>, ServerHandle)> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings {
-        network: Network::ZcashRegtest,
-    })
-    .with_materialized_view_store(materialized_view_store)
-    .with_canonical_store(canonical_store)
-    .with_wallet_query_endpoint(format!("http://{wallet_addr}"));
-    let handle = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(adapter.into_server())
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-    });
-    let channel = await_with_retry(addr).await?;
-    Ok((ExplorerQueryClient::new(channel), handle))
-}
-
 async fn spawn_explorer_query_server_with_materialized_view_store(
     materialized_view_store: MaterializedViewStore,
 ) -> Result<(ExplorerQueryClient<Channel>, ServerHandle)> {
@@ -1652,29 +923,35 @@ fn assert_advertises_capability(capabilities: &[String], capability: &str) {
     );
 }
 
-fn assert_overview_wallet_fields_unavailable(response: &OverviewSnapshotResponse) -> Result<()> {
-    assert!(response.mempool.is_none());
+/// The production wallet endpoint serves an empty mempool snapshot through
+/// its admitted ingest control but does not serve chain value pools, so only
+/// the value pools are reported unavailable.
+fn assert_overview_wallet_fields_from_production_endpoint(
+    response: &OverviewSnapshotResponse,
+) -> Result<()> {
+    assert!(
+        response.mempool.is_some(),
+        "the production wallet endpoint serves a mempool snapshot"
+    );
     assert!(response.value_pools.is_empty());
     let freshness = response
         .freshness
         .as_ref()
         .ok_or_else(|| eyre!("overview response missing freshness"))?;
-    assert_eq!(freshness.unavailable.len(), 2);
-    for field_path in ["mempool", "value_pools"] {
-        let unavailable_field = freshness
-            .unavailable
-            .iter()
-            .find(|unavailable| unavailable.field_path == field_path)
-            .ok_or_else(|| eyre!("overview freshness missing unavailable field {field_path}"))?;
-        assert_eq!(
-            unavailable_field.reason,
-            UnavailableReason::UnavailableUpstreamNotSupported as i32
-        );
-        assert_eq!(
-            unavailable_field.human_reason,
-            WALLET_QUERY_CAPABILITY_NOT_SUPPORTED
-        );
-    }
+    assert_eq!(freshness.unavailable.len(), 1);
+    let unavailable_field = freshness
+        .unavailable
+        .iter()
+        .find(|unavailable| unavailable.field_path == "value_pools")
+        .ok_or_else(|| eyre!("overview freshness missing unavailable field value_pools"))?;
+    assert_eq!(
+        unavailable_field.reason,
+        UnavailableReason::UnavailableUpstreamNotSupported as i32
+    );
+    assert_eq!(
+        unavailable_field.human_reason,
+        WALLET_QUERY_CAPABILITY_NOT_SUPPORTED
+    );
     Ok(())
 }
 

@@ -1,7 +1,7 @@
 //! Fixed-range storage benchmark harness for Zinder.
 //!
-//! This crate captures immutable source fixtures, drives canonical-store range
-//! replay through bulk catchup, and compares concrete `RocksDB` and `PostgreSQL`
+//! This crate captures immutable source fixtures, replays them into the
+//! production canonical store, and compares concrete `RocksDB` and `PostgreSQL`
 //! round trips over the same backend-neutral canonical block facts. Each
 //! measurement owns an explicit report shape so a block-local replay diagnostic cannot
 //! claim a production canonical or projection lifecycle.
@@ -17,7 +17,6 @@ pub mod error;
 pub mod fixture;
 pub mod metrics_scrape;
 pub mod recorder;
-pub mod replay;
 pub mod report;
 pub mod rss;
 

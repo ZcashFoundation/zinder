@@ -369,7 +369,7 @@
             "axisBorderShow": false,
             "axisCenteredZero": false,
             "axisColorMode": "text",
-            "axisLabel": "seconds",
+            "axisLabel": "blocks",
             "axisPlacement": "auto",
             "barAlignment": 0,
             "drawStyle": "line",
@@ -407,7 +407,7 @@
               }
             ]
           },
-          "unit": "s"
+          "unit": "none"
         },
         "overrides": []
       },
@@ -439,13 +439,13 @@
             "uid": "zinder-prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (service, operation, table, le) (rate(zinder_store_read_duration_seconds_bucket[5m])))",
-          "legendFormat": "p95 {{service}} {{operation}} {{table}}",
+          "expr": "zinder_ingest_canonical_lag_blocks",
+          "legendFormat": "{{service}} canonical lag",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Store Read P95",
+      "title": "Canonical Lag",
       "type": "timeseries"
     },
     {
@@ -462,7 +462,7 @@
             "axisBorderShow": false,
             "axisCenteredZero": false,
             "axisColorMode": "text",
-            "axisLabel": "seeks / second",
+            "axisLabel": "commits / second",
             "axisPlacement": "auto",
             "barAlignment": 0,
             "drawStyle": "line",
@@ -531,13 +531,24 @@
             "uid": "zinder-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (service, artifact_family) (rate(zinder_store_visibility_seek_total[$__rate_interval]))",
-          "legendFormat": "{{service}} {{artifact_family}}",
+          "expr": "sum by (service) (rate(zinder_ingest_canonical_live_appends_total[$__rate_interval]))",
+          "legendFormat": "{{service}} appends",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "zinder-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (service) (rate(zinder_ingest_canonical_live_replacements_total[$__rate_interval]))",
+          "legendFormat": "{{service}} replacements",
+          "range": true,
+          "refId": "B"
         }
       ],
-      "title": "Visibility Index Seeks",
+      "title": "Canonical Commit Rate",
       "type": "timeseries"
     },
     {
@@ -959,7 +970,7 @@
             "uid": "zinder-prometheus"
           },
           "editorMode": "code",
-          "expr": "zinder_ingest_writer_chain_epoch_id",
+          "expr": "zinder_ingest_canonical_chain_epoch",
           "legendFormat": "{{service}} writer {{network}}",
           "range": true,
           "refId": "A"

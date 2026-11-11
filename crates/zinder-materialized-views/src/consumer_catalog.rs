@@ -14,7 +14,7 @@ use crate::{
 /// Product responsibility assigned to one consumer identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaterializedViewConsumerRole {
-    /// Required to preserve wallet correctness after canonical retention.
+    /// Required for wallet spend-resolution correctness.
     WalletCorrectness,
     /// Required by the supported wallet-serving read contract.
     WalletServing,
@@ -37,15 +37,6 @@ pub enum MaterializedViewRecoverySource {
     MempoolEvents,
 }
 
-/// Canonical data this consumer may authorize Zinder to discard.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CanonicalRetentionAuthority {
-    /// Consumer has no authority over canonical retention.
-    None,
-    /// Durable progress may release canonical transparent spend facts.
-    TransparentSpendFacts,
-}
-
 /// Product presets that include one consumer identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaterializedViewPresetMembership {
@@ -66,8 +57,6 @@ pub struct MaterializedViewConsumerDefinition {
     pub recovery_source: MaterializedViewRecoverySource,
     /// Presets that select the consumer.
     pub preset_membership: MaterializedViewPresetMembership,
-    /// Canonical retention authority, if any.
-    pub retention_authority: CanonicalRetentionAuthority,
 }
 
 impl MaterializedViewConsumerDefinition {
@@ -95,7 +84,6 @@ const fn optional(
         role: MaterializedViewConsumerRole::OptionalProductView,
         recovery_source,
         preset_membership: MaterializedViewPresetMembership::ExplorerOnly,
-        retention_authority: CanonicalRetentionAuthority::None,
     }
 }
 
@@ -165,14 +153,12 @@ const BUNDLED_MATERIALIZED_VIEW_CONSUMER_DEFINITIONS: &[MaterializedViewConsumer
         role: MaterializedViewConsumerRole::WalletServing,
         recovery_source: MaterializedViewRecoverySource::CanonicalChainEvents,
         preset_membership: MaterializedViewPresetMembership::WalletAndExplorer,
-        retention_authority: CanonicalRetentionAuthority::None,
     },
     MaterializedViewConsumerDefinition {
         schema: TRANSPARENT_OUTPOINT_SPEND_SCHEMA,
         role: MaterializedViewConsumerRole::WalletCorrectness,
         recovery_source: MaterializedViewRecoverySource::CanonicalChainEvents,
         preset_membership: MaterializedViewPresetMembership::WalletAndExplorer,
-        retention_authority: CanonicalRetentionAuthority::TransparentSpendFacts,
     },
     optional(
         VALUE_POOL_BALANCE_HISTORY_SCHEMA,

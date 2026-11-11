@@ -1,8 +1,8 @@
 # Storage benchmark environment
 
-`docker-compose.storage-benchmark.yml` runs canonical-store range replay
-and 2 canonical-replay-storage storage candidates from one immutable `zinder-bench` image and
-one captured fixture. The RocksDB and PostgreSQL canonical-replay-storage arms persist the
+`docker-compose.storage-benchmark.yml` runs 2 canonical-replay-storage storage
+candidates from one immutable `zinder-bench` image and one captured fixture.
+The RocksDB and PostgreSQL canonical-replay-storage arms persist the
 same versioned `CanonicalBlockFacts` semantic replay envelope, read every row
 back, reconstruct the full aggregate, recompute the independent ordered
 sequence digest, and publish a completion marker only after that validation
@@ -12,8 +12,7 @@ The canonical-replay-storage reports prove only this persisted canonical replay 
 certify fresh canonical construction, compact-block or tree-position material,
 `ChainEpoch` or `ChainEvent` publication, reorg and settlement behavior, restore
 and following, wallet projection construction, query readiness, or the complete
-production lifecycle. Canonical-store range replay remains a separate diagnostic
-baseline, not a third interchangeable canonical-replay-storage engine.
+production lifecycle.
 
 This Compose file is disposable benchmark infrastructure. The application
 deployment remains in `docker-compose.yml`, and neither deployment topology
@@ -27,10 +26,9 @@ services compete for host resources and cannot produce fair throughput data.
 
 | Profile | Services | Measured boundary | Aggregate budget |
 | --- | --- | --- | --- |
-| `oracle` | `rocksdb-canonical-store-range-replay` | Production canonical-store replay from a checkpoint | 8 CPUs, 16 GiB |
 | `rocksdb` | `rocksdb-canonical-replay-storage` | RocksDB replay-record write, read-back digest, and completion marker | 8 CPUs, 16 GiB |
 | `postgres` | `postgres-canonical-replay-storage`, `postgres-database` | PostgreSQL replay-record write, read-back digest, and completion row | 8 CPUs, 16 GiB |
-| `comparison` | All 4 services | Cross-service integration only | Shared host resources |
+| `comparison` | All 3 services | Cross-service integration only | Shared host resources |
 
 The PostgreSQL arm divides its default budget between the benchmark client (2
 CPUs and 8 GiB) and database (6 CPUs and 8 GiB). Its report records the full
@@ -38,11 +36,10 @@ CPUs and 8 GiB) and database (6 CPUs and 8 GiB). Its report records the full
 identities. The CLI rejects partial evidence or component limits whose exact
 sum differs from the reported aggregate.
 
-The fixture, starting checkpoint, and reports use host bind mounts. Both
-RocksDB candidates and PostgreSQL `PGDATA` use separate named volumes so each
-candidate owns isolated Linux filesystem state. The fixture is the sole
-read-only input for the canonical-replay-storage services; the starting checkpoint belongs
-exclusively to canonical-store range replay.
+The fixture and reports use host bind mounts. The RocksDB candidate and
+PostgreSQL `PGDATA` use separate named volumes so each candidate owns isolated
+Linux filesystem state. The fixture is the sole read-only input for the
+canonical-replay-storage services.
 
 PostgreSQL keeps logged tables, `fsync`, full-page writes, and synchronous
 commit enabled. Only disposable operating-system temporary files use `tmpfs`.
@@ -55,8 +52,8 @@ shared-memory, and temporary-filesystem evidence that is outside the SQL report.
 ## Prepare the environment
 
 Run commands from the repository root. Copy the example environment file,
-point it at an immutable fixture and matching starting checkpoint, and choose a
-fresh result directory for each evidence set:
+point it at an immutable fixture, and choose a fresh result directory for each
+evidence set:
 
 ```bash
 cp deploy/.env.storage-benchmark.example /tmp/zinder-storage-benchmark.env
@@ -64,8 +61,7 @@ mkdir -p benchmark-results
 ```
 
 The result directory must be writable by UID 1000, which runs the benchmark
-image. The starting checkpoint tip must be exactly one block below the
-fixture's first height.
+image.
 
 Formal runs require an immutable image identity and structured provenance.
 Start from a committed, clean worktree, build the benchmark target, and append
@@ -141,76 +137,7 @@ docker compose \
   config --profiles
 ```
 
-The expected profiles are `comparison`, `oracle`, `postgres`, and `rocksdb`.
-
-## Run canonical-store range replay
-
-Every oracle replay mutates its checkpoint clone. Remove prior benchmark
-volumes, copy the read-only checkpoint into the oracle volume, and remove any
-projection state carried by the checkpoint:
-
-```bash
-docker compose \
-  --env-file /tmp/zinder-storage-benchmark.env \
-  -f deploy/docker-compose.storage-benchmark.yml \
-  --profile comparison down --volumes --remove-orphans
-
-docker compose \
-  --env-file /tmp/zinder-storage-benchmark.env \
-  -f deploy/docker-compose.storage-benchmark.yml \
-  --profile oracle run --rm --no-deps \
-  --user 0:0 --entrypoint /bin/sh rocksdb-canonical-store-range-replay -ceu '
-    test -n "$(ls -A /benchmark/start-store)"
-    test -z "$(ls -A /var/lib/zinder/benchmark-store)"
-    cp -a /benchmark/start-store/. /var/lib/zinder/benchmark-store/
-    rm -rf /var/lib/zinder/benchmark-store/materialized-views
-    chown -R 1000:1000 /var/lib/zinder/benchmark-store
-  '
-
-docker compose \
-  --env-file /tmp/zinder-storage-benchmark.env \
-  -f deploy/docker-compose.storage-benchmark.yml \
-  --profile oracle run --rm --no-deps rocksdb-canonical-store-range-replay
-```
-
-The report is written as
-`rocksdb-canonical-store-range-replay-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}.json`. The
-command creates reports exclusively, so a repeated path fails instead of
-overwriting evidence. Reseed the volume and select a fresh result directory
-before every replay.
-
-To enforce a target and hard limit for this exact fixture and checkpoint,
-export the paired thresholds, reseed the volume, and override the command:
-
-```bash
-set -a
-. /tmp/zinder-storage-benchmark.env
-set +a
-: "${ZINDER_BENCH_FIXTURE_REPLAY_TARGET_SECS:?set the fixture target}"
-: "${ZINDER_BENCH_FIXTURE_REPLAY_HARD_LIMIT_SECS:?set the fixture hard limit}"
-
-docker compose \
-  --env-file /tmp/zinder-storage-benchmark.env \
-  -f deploy/docker-compose.storage-benchmark.yml \
-  --profile oracle run --rm --no-deps rocksdb-canonical-store-range-replay \
-  canonical-store-range-replay \
-  --fixture /benchmark/fixture \
-  --store /var/lib/zinder/benchmark-store \
-  --block-prepare-concurrency "$ZINDER_BENCH_BLOCK_PREPARE_CONCURRENCY" \
-  --software-revision "$ZINDER_BENCH_SOFTWARE_REVISION" \
-  --runner-id "$ZINDER_BENCH_RUNNER_ID" \
-  --cpu-limit-cores "$ZINDER_BENCH_ROCKSDB_RANGE_REPLAY_CPUS" \
-  --memory-limit-bytes "$ZINDER_BENCH_ROCKSDB_RANGE_REPLAY_MEMORY_LIMIT_BYTES" \
-  --storage-class "$ZINDER_BENCH_STORAGE_CLASS" \
-  --image-reference "$ZINDER_BENCH_IMAGE" \
-  --canonical-fixture-replay-target-secs "$ZINDER_BENCH_FIXTURE_REPLAY_TARGET_SECS" \
-  --canonical-fixture-replay-hard-limit-secs "$ZINDER_BENCH_FIXTURE_REPLAY_HARD_LIMIT_SECS" \
-  --report "/benchmark/results/rocksdb-canonical-store-range-replay-${ZINDER_BENCH_SOFTWARE_REVISION}-${ZINDER_BENCH_TRIAL_ID}-acceptance.json"
-```
-
-These thresholds apply only to captured-range replay from the supplied
-checkpoint. They do not establish the fresh construction, restore, following,
-or wallet-readiness objectives from ADR-0035.
+The expected profiles are `comparison`, `postgres`, and `rocksdb`.
 
 ## Run the RocksDB canonical-replay-storage arm
 

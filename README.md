@@ -197,10 +197,11 @@ Heavier probes for trust-sensitive storage or parser changes:
 ```bash
 cargo llvm-cov --workspace --all-features --no-report
 cargo mutants --workspace --all-features \
-  --file crates/zinder-store/src/chain_store.rs \
-  --file crates/zinder-store/src/chain_store/validation.rs \
+  --file crates/zinder-store/src/canonical_store/live_commit.rs \
+  --file crates/zinder-store/src/canonical_store/live_replacement.rs \
+  --file crates/zinder-store/src/canonical_store/event_lifecycle.rs \
   --file crates/zinder-source/src/source_block.rs \
-  --re 'chain_event_history|settled_tip_only_commit_without_artifacts|validate_reorg_window_change|from_raw_block_bytes'
+  --re 'canonical_event_history|validate_live_settled_tip|validate_live_block_extension|validate_replacement_blocks|from_raw_block_bytes'
 ```
 
 T3 live tests use the same env-var schema as production binaries and are double-gated by `#[ignore = LIVE_TEST_IGNORE_REASON]` plus a runtime `require_live()` check. Mainnet is rejected unless tests opt in by name. To run T3 against a local Zebra:

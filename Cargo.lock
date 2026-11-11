@@ -5679,7 +5679,6 @@ dependencies = [
  "futures-util",
  "hex",
  "jsonrpsee",
- "metrics",
  "metrics-exporter-prometheus",
  "parking_lot",
  "prost",
@@ -6088,8 +6087,6 @@ name = "zinder-store"
 version = "0.7.0"
 dependencies = [
  "base64 0.23.0",
- "bytes",
- "eyre",
  "getrandom 0.4.3",
  "hmac 0.12.1",
  "incrementalmerkletree",

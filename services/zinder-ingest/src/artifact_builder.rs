@@ -11,15 +11,14 @@ use zebra_chain::{
     transparent::Input as ZebraTransparentInput,
 };
 use zinder_core::{
-    BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockId, BlockTransactionIndexArtifact,
-    CanonicalBlockFacts, CanonicalBlockFactsDigestVersion, CanonicalBlockReplayEnvelope,
+    BlockBlobArtifact, BlockHash, BlockHeaderArtifact, BlockId, CanonicalBlockFacts,
+    CanonicalBlockFactsDigestVersion, CanonicalBlockReplayEnvelope,
     CanonicalBlockReplayFormatVersion, CanonicalTransactionFacts, ChainTipMetadata,
     CompactBlockArtifact, CompactChainMetadata, CompactSaplingOutput, CompactSaplingSpend,
     CompactShieldedAction, CompactTransaction, CompactTransactionData, CompactTransparentInput,
     CompactTransparentOutput, NetworkUpgradeActivations, SerializedBytesDigest, ShieldedProtocol,
-    TransactionBlobArtifact, TransactionFactsArtifact, TransactionId,
-    TransactionIntrinsicValueBalancesArtifact, TransactionLocation, TransparentOutPoint,
-    TransparentOutputArtifact, encode_canonical_block_replay, wire::encode_rpc_block_hash_hex,
+    TransactionBlobArtifact, TransactionId, TransactionLocation, encode_canonical_block_replay,
+    wire::encode_rpc_block_hash_hex,
 };
 use zinder_source::{SourceBlock, transaction_public_fact_set_from_parsed};
 use zinder_store::RawBlobRetention;
@@ -479,114 +478,9 @@ pub fn position_canonical_block(
     })
 }
 
-/// Physical rows required by the current `RocksDB` writer.
-///
-/// These redundant index shapes are deliberately private to the canonical
-/// writer boundary and are not part of the backend-neutral fact contract.
-pub(crate) struct CanonicalStoreBlockArtifacts {
-    pub(crate) block_header: BlockHeaderArtifact,
-    pub(crate) block_blob: Option<BlockBlobArtifact>,
-    pub(crate) block_transaction_index: Vec<BlockTransactionIndexArtifact>,
-    pub(crate) transaction_locations: Vec<TransactionLocation>,
-    pub(crate) transaction_facts: Vec<TransactionFactsArtifact>,
-    pub(crate) transaction_intrinsic_value_balances: Vec<TransactionIntrinsicValueBalancesArtifact>,
-    pub(crate) transaction_blobs: Vec<TransactionBlobArtifact>,
-    pub(crate) transparent_outputs_by_outpoint: Vec<TransparentOutputArtifact>,
-}
-
-/// Expands the minimal fact envelope into the redundant rows the current
-/// `RocksDB` schema still commits.
-pub(crate) fn expand_canonical_store_block_artifacts(
-    facts: CanonicalBlockFacts,
-    retained_raw_blobs: RetainedRawBlobs,
-) -> Result<CanonicalStoreBlockArtifacts, CanonicalBlockConstructionError> {
-    let transparent_outputs_by_outpoint = canonical_transparent_outputs_by_outpoint(&facts);
-    let CanonicalBlockFacts {
-        block_header,
-        transactions,
-        ..
-    } = facts;
-    let block_height = block_header.height;
-    let block_hash = block_header.block_hash;
-    let RetainedRawBlobs {
-        block_blob,
-        transaction_blobs,
-    } = retained_raw_blobs;
-    let mut block_transaction_index = Vec::with_capacity(transactions.len());
-    let mut transaction_locations = Vec::with_capacity(transactions.len());
-    let mut transaction_facts = Vec::with_capacity(transactions.len());
-    let mut transaction_intrinsic_value_balances = Vec::with_capacity(transactions.len());
-
-    for (tx_index_in_block, transaction) in transactions.into_iter().enumerate() {
-        let tx_index_in_block = u32::try_from(tx_index_in_block)
-            .map_err(|_| CanonicalBlockConstructionError::TransactionIndexOverflow)?;
-        let CanonicalTransactionFacts {
-            public_facts,
-            intrinsic_value_balances,
-            transparent_inputs,
-            transparent_outputs,
-            ..
-        } = transaction;
-        let transaction_id = public_facts.transaction_id;
-        let location =
-            TransactionLocation::new(transaction_id, block_height, block_hash, tx_index_in_block);
-        block_transaction_index.push(BlockTransactionIndexArtifact::new(
-            block_height,
-            tx_index_in_block,
-            transaction_id,
-            block_hash,
-        ));
-        transaction_locations.push(location);
-        transaction_facts.push(
-            TransactionFactsArtifact::new(location, public_facts)
-                .with_transparent_facts(transparent_inputs, transparent_outputs),
-        );
-        transaction_intrinsic_value_balances.push(TransactionIntrinsicValueBalancesArtifact::new(
-            location,
-            intrinsic_value_balances,
-        ));
-    }
-
-    Ok(CanonicalStoreBlockArtifacts {
-        block_header,
-        block_blob,
-        block_transaction_index,
-        transaction_locations,
-        transaction_facts,
-        transaction_intrinsic_value_balances,
-        transaction_blobs,
-        transparent_outputs_by_outpoint,
-    })
-}
-
 struct PreparedCanonicalTransactions {
     facts: Vec<CanonicalTransactionFacts>,
     transaction_blobs: Vec<TransactionBlobArtifact>,
-}
-
-/// Expands block-local transparent outputs into canonical outpoint rows.
-pub(crate) fn canonical_transparent_outputs_by_outpoint(
-    facts: &CanonicalBlockFacts,
-) -> Vec<TransparentOutputArtifact> {
-    let block_height = facts.block_header.height;
-    let block_hash = facts.block_header.block_hash;
-    facts
-        .transactions
-        .iter()
-        .flat_map(|transaction| {
-            let transaction_id = transaction.public_facts.transaction_id;
-            transaction.transparent_outputs.iter().map(move |output| {
-                TransparentOutputArtifact::new(
-                    TransparentOutPoint::new(transaction_id, output.output_index),
-                    output.value_zat,
-                    output.script_pub_key.clone(),
-                    output.address_script_hash,
-                    block_height,
-                    block_hash,
-                )
-            })
-        })
-        .collect()
 }
 
 fn prepare_canonical_transactions_from_parsed(
@@ -1023,123 +917,16 @@ mod tests {
 
     use serde_json::Value;
     use zinder_core::{
-        BlockHeight, ChainEpoch, ChainEpochId, CompactShieldedAction, CompactTransactionData,
-        Network, TransactionId, UnixTimestampMillis,
+        BlockHeight, CompactShieldedAction, CompactTransactionData, Network, TransactionId,
     };
     use zinder_source::SourceBlock;
-    use zinder_store::{
-        CURRENT_ARTIFACT_SCHEMA_VERSION, ChainEpochArtifacts, ChainStoreOptions, RawBlobRetention,
-    };
-    use zinder_testkit::{StoreFixture, sample_regtest_upgrade_activations};
+    use zinder_testkit::sample_regtest_upgrade_activations;
 
     use super::{
         COMPACT_NOTE_CIPHERTEXT_PREFIX_LEN, CanonicalBlockConstructionError, CommitmentTreeSizes,
         CompactTransaction, RawBlobPolicy, ShieldedProtocol, compact_note_ciphertext_prefix,
-        compact_transaction_has_payload, expand_canonical_store_block_artifacts,
-        position_canonical_block, prepare_canonical_block,
+        compact_transaction_has_payload, prepare_canonical_block,
     };
-
-    #[test]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the boundary test keeps real-fixture expansion, commit, and row reads together"
-    )]
-    fn canonical_store_expansion_round_trips_real_fixture_rows() -> Result<(), Box<dyn Error>> {
-        let source_block = regtest_fixture_block()?;
-        let prepared = prepare_canonical_block(
-            &source_block,
-            &sample_regtest_upgrade_activations(),
-            RawBlobPolicy::All,
-        )?;
-        let mut tree_sizes = CommitmentTreeSizes::default();
-        let positioned = position_canonical_block(prepared, &mut tree_sizes)?;
-        let compact_block = positioned.compact_block;
-        let replay_envelope = positioned.replay_envelope;
-        let tip_metadata = positioned.tip_metadata;
-        let canonical_store_artifacts = expand_canonical_store_block_artifacts(
-            positioned.facts,
-            positioned.retained_raw_blobs,
-        )?;
-        let location = *canonical_store_artifacts
-            .transaction_locations
-            .first()
-            .ok_or("fixture transaction location is missing")?;
-        let transaction_facts = canonical_store_artifacts
-            .transaction_facts
-            .first()
-            .cloned()
-            .ok_or("fixture transaction facts are missing")?;
-        let transaction_blob = canonical_store_artifacts
-            .transaction_blobs
-            .first()
-            .cloned()
-            .ok_or("fixture transaction blob is missing")?;
-        let transparent_output = canonical_store_artifacts
-            .transparent_outputs_by_outpoint
-            .first()
-            .cloned()
-            .ok_or("fixture transparent output is missing")?;
-        let fixture = StoreFixture::open_with_options(ChainStoreOptions {
-            raw_blob_retention: RawBlobRetention::All,
-            ..ChainStoreOptions::for_local_tests()
-        })?;
-        let chain_epoch = ChainEpoch {
-            id: ChainEpochId::new(1),
-            network: Network::ZcashRegtest,
-            visible_tip_height: source_block.height,
-            visible_tip_hash: source_block.hash,
-            settled_tip_height: source_block.height,
-            settled_tip_hash: source_block.hash,
-            artifact_schema_version: CURRENT_ARTIFACT_SCHEMA_VERSION,
-            tip_metadata,
-            created_at: UnixTimestampMillis::new(1_774_669_000_000),
-        };
-        let block_blobs = canonical_store_artifacts.block_blob.into_iter().collect();
-        fixture.chain_store().commit_chain_epoch(
-            ChainEpochArtifacts::new(
-                chain_epoch,
-                vec![canonical_store_artifacts.block_header],
-                vec![replay_envelope],
-                vec![compact_block],
-            )
-            .with_block_blobs(block_blobs)
-            .with_block_transaction_index(canonical_store_artifacts.block_transaction_index)
-            .with_transaction_locations(canonical_store_artifacts.transaction_locations)
-            .with_transaction_facts(canonical_store_artifacts.transaction_facts)
-            .with_transaction_intrinsic_value_balances(
-                canonical_store_artifacts.transaction_intrinsic_value_balances,
-            )
-            .with_transaction_blobs(canonical_store_artifacts.transaction_blobs)
-            .with_transparent_outputs_by_outpoint(
-                canonical_store_artifacts.transparent_outputs_by_outpoint,
-            ),
-        )?;
-
-        let reader = fixture.chain_store().current_chain_epoch_reader()?;
-        assert_eq!(
-            reader.transaction_id_at_block_index(source_block.height, 0)?,
-            Some(location.transaction_id)
-        );
-        assert_eq!(
-            reader.transaction_location_by_id(location.transaction_id)?,
-            Some(location)
-        );
-        assert_eq!(
-            reader.transaction_facts_by_id(location.transaction_id)?,
-            Some(transaction_facts)
-        );
-        assert_eq!(
-            reader.transaction_blob_by_id(location.transaction_id)?,
-            Some(transaction_blob)
-        );
-        assert_eq!(
-            reader
-                .transparent_outputs_by_outpoints(&[transparent_output.outpoint])?
-                .get(&transparent_output.outpoint),
-            Some(&transparent_output)
-        );
-        Ok(())
-    }
 
     #[test]
     fn canonical_replay_is_invariant_across_raw_blob_policies() -> Result<(), Box<dyn Error>> {

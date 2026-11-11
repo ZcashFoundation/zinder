@@ -162,12 +162,11 @@ be rebuilt independently.
 
 The deployed `zinder-explorer` runtime reads materialized views through a
 process-owned secondary and federates wallet-owned facts through `WalletQuery`;
-it does not open the canonical store. Library compositions may additionally
-provide a canonical secondary for capabilities that explicitly require
-retained canonical artifacts. The explorer schema must not duplicate wallet
-ownership. The optional Compose overlay provides the materialized-view plus
-wallet composition for Zexplorer without adding the explorer to the published
-four-image release catalog.
+it does not open the canonical store. It therefore never advertises a
+capability that requires retained canonical artifacts. The explorer schema must
+not duplicate wallet ownership. The optional Compose overlay provides the
+materialized-view plus wallet composition for Zexplorer without adding the
+explorer to the published four-image release catalog.
 
 See [Materialized-view plane](materialized-view-plane.md) and
 [Explorer plane](explorer-plane.md) for those contracts.

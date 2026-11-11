@@ -110,14 +110,13 @@ persisted, not advertised unconditionally:
   `wallet.read.transaction_bytes_v1` when the store retains transaction
   blobs (ingest `raw_blob_policy` in `{transactions, all}`).
 
-The signal travels in a `StorageControl` `raw_blob_policy` singleton
-(key byte 16, one-byte value: `0 = none`, `1 = transactions`,
-`2 = all`). An empty primary may replace the signal before its first canonical
-commit. After that commit, the value is the store's immutable historical
-coverage contract: opening the primary with another policy fails with
-`RawBlobRetentionMismatch` and requires a rebuild. Readers use only the
-persisted value. A non-empty store with no signal is corrupt and
-fails closed; it is never treated as `none`.
+The signal is the `RawBlobRetention` value (`none`, `transactions`, or `all`)
+that `CanonicalStoreBuildPlan` fixes before construction loads any data and
+that the ready control record binds. It is the store's immutable historical
+coverage contract: opening the store with another retention fails admission
+and requires a rebuild. Readers use only the persisted value, and a control
+record with an unknown retention value fails admission instead of being
+treated as `none`.
 
 ## Materialized-view capabilities require materialized-view evidence
 

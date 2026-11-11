@@ -1782,7 +1782,7 @@ fn replace_archive_row(
     Ok(previous)
 }
 
-fn published_store(
+pub(super) fn published_store(
     path: &Path,
     reorg_window: u32,
     build_tip_height: BlockHeight,
@@ -1797,7 +1797,7 @@ fn published_store(
     )
 }
 
-fn published_store_with_retention(
+pub(super) fn published_store_with_retention(
     path: &Path,
     reorg_window: u32,
     build_tip_height: BlockHeight,
@@ -1855,7 +1855,7 @@ fn published_store_with_retention(
     Ok(validated.publish_baseline(publication)?)
 }
 
-fn open_store(
+pub(super) fn open_store(
     path: &Path,
     activations: &zinder_core::NetworkUpgradeActivations,
     reorg_window: u32,
@@ -1868,7 +1868,7 @@ fn open_store(
     )
 }
 
-fn open_store_with_retention(
+pub(super) fn open_store_with_retention(
     path: &Path,
     activations: &zinder_core::NetworkUpgradeActivations,
     reorg_window: u32,
@@ -1901,7 +1901,7 @@ fn open_writer(
     )
 }
 
-fn replacement_block(
+pub(super) fn replacement_block(
     height: BlockHeight,
     block_hash: [u8; 32],
     parent_hash: [u8; 32],
@@ -1916,7 +1916,7 @@ fn replacement_block(
     )
 }
 
-fn replacement_block_with_retention(
+pub(super) fn replacement_block_with_retention(
     height: BlockHeight,
     block_hash: [u8; 32],
     parent_hash: [u8; 32],

@@ -30,10 +30,7 @@ states this decision removes.
 
 Zinder has one production native wallet-query composition. It reads through an
 admitted `WalletServingReadPair`; every request captures one immutable pair at
-an exact canonical fence. The older generic primary-store query is non-release
-test scaffolding tracked for deletion in
-[issue #63](https://github.com/gustavovalverde/zinder/issues/63), not a second
-production composition root.
+an exact canonical fence.
 
 The admitted query privately owns one immutable
 `NativeWalletEndpointCapabilities` value. That value is derived once, after
@@ -100,7 +97,7 @@ dial at their use sites.
 This evidence admits native transaction lookup, mempool snapshot and events,
 and transparent mempool outputs-by-address and spends-by-outpoint.
 Transaction-byte support additionally requires authenticated transaction-blob
-retention. Transparent live balance remains omitted: its legacy handler
+retention. Transparent live balance remains omitted: its gRPC handler
 performs multiple canonical and live calls without one authenticated mempool
 generation, so the two admitted primitives are not sufficient evidence for the
 composite claim. Transparent mempool outputs-by-outpoint also remains omitted

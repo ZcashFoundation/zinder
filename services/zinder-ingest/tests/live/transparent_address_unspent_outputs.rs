@@ -5,7 +5,10 @@
 
 //! Live regtest assertion that the typed
 //! `WalletQueryApi::transparent_address_unspent_outputs` surfaces UTXOs
-//! paid to the seed-derived test address after a fresh bulk catchup.
+//! paid to the seed-derived test address.
+//!
+//! The production canonical store and wallet projection are built from
+//! genesis before the query runs.
 //!
 //! # Operator precondition
 //!
@@ -13,23 +16,19 @@
 //! [`TRANSPARENT_BROADCAST_TEST_SEED`] (see `live::mempool_broadcast_cycle`).
 //! The exact address is logged by the test on startup.
 
-use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use eyre::{Result, eyre};
 use sha2::{Digest, Sha256};
-use tempfile::tempdir;
 use zinder_core::TransparentAddressScriptHash;
 use zinder_core::{BlockHeight, Network};
-use zinder_ingest::run_bulk_catchup;
-use zinder_query::{TransparentAddressUnspentOutputsRequest, WalletQuery, WalletQueryApi};
-use zinder_store::PrimaryChainStore;
+use zinder_query::{TransparentAddressUnspentOutputsRequest, WalletQueryApi, WalletServingQuery};
 use zinder_testkit::live::{init, require_live_for};
 use zinder_testkit::{TRANSPARENT_BROADCAST_TEST_SEED, TransparentTestKey};
 
 use crate::common::{
-    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_bulk_catchup_run_config,
-    regtest_generate_blocks, zebra_source_from_bulk_catchup,
+    fetch_live_network_upgrade_activations, fetch_live_tip_height, live_serving_pair,
+    regtest_generate_blocks,
 };
 
 #[tokio::test(flavor = "multi_thread")]
@@ -50,33 +49,17 @@ async fn transparent_address_unspent_outputs_surface_through_typed_wallet_query(
     );
 
     // Mine enough blocks that the seed-derived address has at least one
-    // confirmed coinbase before bulk catchup.
+    // confirmed coinbase before construction.
     let tip_before = fetch_live_tip_height(&env).await?;
     if tip_before.value() == 0 {
         regtest_generate_blocks(&env, 1).await?;
     }
     let tip_height = fetch_live_tip_height(&env).await?;
 
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("zinder-store");
     let activations = fetch_live_network_upgrade_activations(&env).await?;
-    let bulk_catchup_config = live_bulk_catchup_run_config(
-        &env,
-        &storage_path,
-        BlockHeight::new(1),
-        tip_height,
-        NonZeroU32::new(1000).ok_or_else(|| eyre!("invalid test batch size"))?,
-        true,
-        Arc::clone(&activations),
-    );
-    let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
-    run_bulk_catchup(&bulk_catchup_config, &source)
-        .await?
-        .ok_or_else(|| eyre!("expected committed bulk-catchup outcome"))?;
-
-    let store =
-        PrimaryChainStore::open(&storage_path, bulk_catchup_config.canonical_store_options())?;
-    let wallet_query = WalletQuery::new(store, (), activations);
+    let live = live_serving_pair(&env, &activations, tip_height).await?;
+    let wallet_query =
+        WalletServingQuery::from_serving_pair_slot(live.slot, (), Arc::clone(&activations));
     let mut hasher = Sha256::new();
     hasher.update(test_key.address_script_bytes());
     let address_script_hash = TransparentAddressScriptHash::from_bytes(hasher.finalize().into());
@@ -97,5 +80,6 @@ async fn transparent_address_unspent_outputs_surface_through_typed_wallet_query(
     for utxo in &response.outputs {
         assert_eq!(utxo.address_script_hash, address_script_hash);
     }
+    drop(live.store_fixture);
     Ok(())
 }

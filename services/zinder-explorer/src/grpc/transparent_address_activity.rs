@@ -7,18 +7,13 @@
 //! serves pages in that order; clients that want oldest-first reverse
 //! client-side.
 
-use std::collections::{HashMap, HashSet};
-
 use prost::Message as _;
 use tonic::{Request, Response, Status};
 use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_core::wire::{
-    decode_address_script_hash, decode_height_key_descending, decode_rpc_transaction_id_hex,
-    encode_address_script_hash,
+    decode_address_script_hash, decode_height_key_descending, encode_address_script_hash,
 };
-use zinder_core::{
-    ChainEpochId, Network, TransactionFactsArtifact, TransactionId, TransparentAddressScriptHash,
-};
+use zinder_core::{Network, TransparentAddressScriptHash};
 use zinder_proto::capabilities::EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2;
 use zinder_proto::v1::explorer::{
     TransparentAddressActivityEntry, TransparentAddressActivityRecord,
@@ -30,17 +25,12 @@ use zinder_proto::v1::wallet::{
     wallet_query_client::WalletQueryClient,
 };
 use zinder_runtime::AuthenticatedChannel;
-use zinder_store::{
-    SecondaryChainStore, chain_epoch_from_message, chain_epoch_message, status_from_store_error,
-};
 
+use super::clamp_max_entries;
 use super::error::ExplorerError;
 use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
-use super::transaction_detail::encode_component_counts;
-use super::transparent_input::parent_transaction_ids;
-use super::{clamp_max_entries, require_matching_chain_epoch};
 use zinder_materialized_views::{
     MaterializedViewStore, TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY,
     TRANSPARENT_ADDRESS_ACTIVITY_KEY_LEN, TransparentAddressRankingConsumer,
@@ -63,7 +53,6 @@ const HEIGHT_KEY_END: usize = HEIGHT_KEY_OFFSET + 4;
 /// Executes one `ExplorerQuery.TransparentAddressActivity` request.
 pub(crate) struct TransparentAddressActivityContext<'store> {
     pub(crate) materialized_view_store: &'store MaterializedViewStore,
-    pub(crate) canonical_store: Option<&'store SecondaryChainStore>,
     pub(crate) network: Network,
     pub(crate) upstream_observation_cache: &'store UpstreamObservationCache,
 }
@@ -75,7 +64,6 @@ pub(crate) async fn query_transparent_address_activity(
 ) -> Result<Response<TransparentAddressActivityResponse>, Status> {
     let TransparentAddressActivityContext {
         materialized_view_store,
-        canonical_store,
         network,
         upstream_observation_cache,
     } = context;
@@ -98,7 +86,7 @@ pub(crate) async fn query_transparent_address_activity(
         DEFAULT_TRANSPARENT_ADDRESS_ACTIVITY_ENTRIES,
         MAX_TRANSPARENT_ADDRESS_ACTIVITY_ENTRIES_PER_REQUEST,
     );
-    let (mut entries, next_cursor) = scan_address_activity(
+    let (entries, next_cursor) = scan_address_activity(
         materialized_view_store,
         &ActivityScanParameters {
             script_hash: resolved_address.script_hash,
@@ -109,8 +97,7 @@ pub(crate) async fn query_transparent_address_activity(
             from_cursor: inner.from_cursor.as_slice(),
         },
     )?;
-    let chain_epoch =
-        resolve_activity_chain_epoch(canonical_store, wallet_client, inner.at_epoch_id).await?;
+    let chain_epoch = resolve_activity_chain_epoch(wallet_client, inner.at_epoch_id).await?;
     validate_ranking_metadata_at_chain_epoch(active_metadata, &chain_epoch)?;
     let summary = read_address_summary_at_metadata(
         materialized_view_store,
@@ -118,12 +105,6 @@ pub(crate) async fn query_transparent_address_activity(
         &resolved_address,
     )?;
     let coverage = encode_ranking_coverage(active_metadata.coverage);
-    enrich_activity_entries(
-        canonical_store,
-        &chain_epoch,
-        resolved_address.script_hash,
-        &mut entries,
-    )?;
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
@@ -144,25 +125,9 @@ pub(crate) async fn query_transparent_address_activity(
 }
 
 async fn resolve_activity_chain_epoch(
-    canonical_store: Option<&SecondaryChainStore>,
     wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
     at_epoch_id: Option<u64>,
 ) -> Result<wallet::ChainEpoch, Status> {
-    if let Some(canonical_store) = canonical_store {
-        canonical_store
-            .try_catch_up()
-            .map_err(|error| status_from_store_error(&error))?;
-        let reader = match at_epoch_id {
-            Some(chain_epoch_id) => canonical_store
-                .chain_epoch_reader_at(ChainEpochId::new(chain_epoch_id))
-                .map_err(|error| status_from_store_error(&error))?,
-            None => canonical_store
-                .current_chain_epoch_reader()
-                .map_err(|error| status_from_store_error(&error))?,
-        };
-        return Ok(chain_epoch_message(reader.chain_epoch()));
-    }
-
     wallet_client
         .visible_tip_block(Request::new(VisibleTipBlockRequest { at_epoch_id }))
         .await?
@@ -345,173 +310,6 @@ fn activity_entry_from_record(
         other_output_script_pub_keys: Vec::new(),
         input_facts_complete: false,
     }
-}
-
-fn enrich_activity_entries(
-    canonical_store: Option<&SecondaryChainStore>,
-    chain_epoch: &wallet::ChainEpoch,
-    requested_script_hash: TransparentAddressScriptHash,
-    entries: &mut [TransparentAddressActivityEntry],
-) -> Result<(), Status> {
-    let Some(canonical_store) = canonical_store else {
-        return Ok(());
-    };
-    canonical_store
-        .try_catch_up()
-        .map_err(|error| status_from_store_error(&error))?;
-    let core_epoch = chain_epoch_from_message(chain_epoch.clone())
-        .map_err(|error| ExplorerError::internal(error.to_string()))?;
-    let reader = canonical_store
-        .chain_epoch_reader_at(core_epoch.id)
-        .map_err(|error| status_from_store_error(&error))?;
-    require_matching_chain_epoch(core_epoch, reader.chain_epoch())?;
-
-    let transaction_ids = entries
-        .iter()
-        .map(|entry| {
-            decode_rpc_transaction_id_hex(&entry.transaction_id)
-                .map_err(|error| ExplorerError::internal(error.to_string()).into())
-        })
-        .collect::<Result<Vec<_>, Status>>()?;
-    let transactions = reader
-        .transaction_facts_by_ids(&transaction_ids)
-        .map_err(|error| status_from_store_error(&error))?;
-    let parent_ids = parent_transaction_ids(transactions.values().flatten());
-    let parent_transactions = reader
-        .transaction_facts_by_ids(&parent_ids)
-        .map_err(|error| status_from_store_error(&error))?;
-
-    for (entry, transaction_id) in entries.iter_mut().zip(transaction_ids) {
-        let Some(transaction) = transactions.get(&transaction_id).and_then(Option::as_ref) else {
-            continue;
-        };
-        validate_transaction_identity(transaction_id, transaction)?;
-        let facts =
-            address_transaction_facts(transaction, &parent_transactions, requested_script_hash)?;
-        entry.transaction_index = Some(transaction.location.tx_index_in_block);
-        entry.size_bytes = Some(transaction.public_facts.size_bytes);
-        entry.component_counts = Some(encode_component_counts(transaction.public_facts.counts));
-        entry.input_value_zat = facts.input_value_zat;
-        entry.output_value_zat = Some(facts.output_value_zat);
-        if let Some(net_value_zat) =
-            complete_address_net_value(facts.input_value_zat, facts.output_value_zat)?
-        {
-            entry.net_value_zat = Some(net_value_zat);
-        }
-        entry.other_input_script_pub_keys = facts.other_input_script_pub_keys;
-        entry.other_output_script_pub_keys = facts.other_output_script_pub_keys;
-        entry.input_facts_complete = facts.input_facts_complete;
-    }
-    Ok(())
-}
-
-struct AddressTransactionFacts {
-    input_value_zat: Option<u64>,
-    output_value_zat: u64,
-    other_input_script_pub_keys: Vec<Vec<u8>>,
-    other_output_script_pub_keys: Vec<Vec<u8>>,
-    input_facts_complete: bool,
-}
-
-fn address_transaction_facts(
-    transaction: &TransactionFactsArtifact,
-    parent_transactions: &HashMap<TransactionId, Option<TransactionFactsArtifact>>,
-    requested_script_hash: TransparentAddressScriptHash,
-) -> Result<AddressTransactionFacts, Status> {
-    let mut output_value_zat = 0_u64;
-    let mut other_output_script_pub_keys = Vec::new();
-    let mut seen_output_scripts = HashSet::new();
-    for output in &transaction.transparent_outputs {
-        if output.address_script_hash == requested_script_hash {
-            output_value_zat = output_value_zat
-                .checked_add(output.value_zat)
-                .ok_or_else(|| {
-                    ExplorerError::internal("transparent output value sum overflowed")
-                })?;
-        } else if seen_output_scripts.insert(output.script_pub_key.clone()) {
-            other_output_script_pub_keys.push(output.script_pub_key.clone());
-        }
-    }
-
-    if transaction.public_facts.is_coinbase {
-        return Ok(AddressTransactionFacts {
-            input_value_zat: Some(0),
-            output_value_zat,
-            other_input_script_pub_keys: Vec::new(),
-            other_output_script_pub_keys,
-            input_facts_complete: true,
-        });
-    }
-
-    let mut input_value_zat = 0_u64;
-    let mut input_facts_complete = true;
-    let mut other_input_script_pub_keys = Vec::new();
-    let mut seen_input_scripts = HashSet::new();
-    for input in transaction
-        .transparent_inputs
-        .iter()
-        .filter(|input| !input.spent_outpoint.is_coinbase_sentinel())
-    {
-        let parent = parent_transactions
-            .get(&input.spent_outpoint.transaction_id)
-            .and_then(Option::as_ref);
-        let Some(parent) = parent else {
-            input_facts_complete = false;
-            continue;
-        };
-        validate_transaction_identity(input.spent_outpoint.transaction_id, parent)?;
-        let prevout = parent
-            .transparent_outputs
-            .iter()
-            .find(|output| output.output_index == input.spent_outpoint.output_index);
-        let Some(prevout) = prevout else {
-            input_facts_complete = false;
-            continue;
-        };
-        if prevout.address_script_hash == requested_script_hash {
-            input_value_zat = input_value_zat
-                .checked_add(prevout.value_zat)
-                .ok_or_else(|| ExplorerError::internal("transparent input value sum overflowed"))?;
-        } else if seen_input_scripts.insert(prevout.script_pub_key.clone()) {
-            other_input_script_pub_keys.push(prevout.script_pub_key.clone());
-        }
-    }
-
-    Ok(AddressTransactionFacts {
-        input_value_zat: input_facts_complete.then_some(input_value_zat),
-        output_value_zat,
-        other_input_script_pub_keys,
-        other_output_script_pub_keys,
-        input_facts_complete,
-    })
-}
-
-fn complete_address_net_value(
-    input_value_zat: Option<u64>,
-    output_value_zat: u64,
-) -> Result<Option<i64>, Status> {
-    let Some(input_value_zat) = input_value_zat else {
-        return Ok(None);
-    };
-    let net_value_zat = i128::from(output_value_zat) - i128::from(input_value_zat);
-    i64::try_from(net_value_zat).map(Some).map_err(|_| {
-        ExplorerError::internal("transparent address net value does not fit in sint64").into()
-    })
-}
-
-fn validate_transaction_identity(
-    expected_transaction_id: TransactionId,
-    transaction: &TransactionFactsArtifact,
-) -> Result<(), Status> {
-    if transaction.location.transaction_id != expected_transaction_id
-        || transaction.public_facts.transaction_id != expected_transaction_id
-    {
-        return Err(ExplorerError::internal(
-            "canonical transaction facts do not match the requested transaction id",
-        )
-        .into());
-    }
-    Ok(())
 }
 
 fn encode_address_summary(
@@ -708,11 +506,7 @@ mod tests {
     use prost::Message as _;
     use tempfile::tempdir;
     use tonic::Code;
-    use zinder_core::{
-        BlockHash, BlockHeight, LockTime, PrivacyShape, TransactionComponentCounts as CoreCounts,
-        TransactionId, TransactionLocation, TransactionPublicFacts, TransactionVersion,
-        TransparentInputFact, TransparentOutPoint, TransparentOutputFact,
-    };
+    use zinder_core::BlockHeight;
     use zinder_materialized_views::{
         MaterializedViewStoreOptions, TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA,
         TransparentAddressActivityConsumer,
@@ -852,129 +646,6 @@ mod tests {
         assert_eq!(summary.total_received_zat, Some(1_200));
     }
 
-    #[test]
-    fn transaction_facts_sum_requested_values_and_deduplicate_other_scripts() -> TestResult {
-        let requested_script = vec![0x51];
-        let other_script = vec![0x52];
-        let requested_hash = TransparentAddressScriptHash::of_script_pub_key(&requested_script);
-        let other_hash = TransparentAddressScriptHash::of_script_pub_key(&other_script);
-        let requested_parent_id = transaction_id(1);
-        let other_parent_id = transaction_id(2);
-        let requested_parent = transaction_artifact(
-            requested_parent_id,
-            true,
-            Vec::new(),
-            vec![output(0, 400, requested_script.clone(), requested_hash)],
-        );
-        let other_parent = transaction_artifact(
-            other_parent_id,
-            true,
-            Vec::new(),
-            vec![output(0, 500, other_script.clone(), other_hash)],
-        );
-        let transaction = transaction_artifact(
-            transaction_id(3),
-            false,
-            vec![
-                TransparentInputFact::new(0, TransparentOutPoint::new(requested_parent_id, 0)),
-                TransparentInputFact::new(1, TransparentOutPoint::new(other_parent_id, 0)),
-                TransparentInputFact::new(2, TransparentOutPoint::new(other_parent_id, 0)),
-            ],
-            vec![
-                output(0, 700, requested_script, requested_hash),
-                output(1, 100, other_script.clone(), other_hash),
-                output(2, 200, other_script.clone(), other_hash),
-            ],
-        );
-        let parents = HashMap::from([
-            (requested_parent_id, Some(requested_parent)),
-            (other_parent_id, Some(other_parent)),
-        ]);
-
-        let facts = address_transaction_facts(&transaction, &parents, requested_hash)?;
-
-        assert_eq!(facts.input_value_zat, Some(400));
-        assert_eq!(facts.output_value_zat, 700);
-        assert_eq!(
-            facts.other_input_script_pub_keys,
-            vec![other_script.clone()]
-        );
-        assert_eq!(facts.other_output_script_pub_keys, vec![other_script]);
-        assert!(facts.input_facts_complete);
-        Ok(())
-    }
-
-    #[test]
-    fn unresolved_parent_suppresses_partial_input_value() -> TestResult {
-        let requested_script = vec![0x51];
-        let requested_hash = TransparentAddressScriptHash::of_script_pub_key(&requested_script);
-        let resolved_parent_id = transaction_id(1);
-        let missing_parent_id = transaction_id(2);
-        let transaction = transaction_artifact(
-            transaction_id(3),
-            false,
-            vec![
-                TransparentInputFact::new(0, TransparentOutPoint::new(resolved_parent_id, 0)),
-                TransparentInputFact::new(1, TransparentOutPoint::new(missing_parent_id, 0)),
-            ],
-            Vec::new(),
-        );
-        let parents = HashMap::from([
-            (
-                resolved_parent_id,
-                Some(transaction_artifact(
-                    resolved_parent_id,
-                    true,
-                    Vec::new(),
-                    vec![output(0, 400, requested_script, requested_hash)],
-                )),
-            ),
-            (missing_parent_id, None),
-        ]);
-
-        let facts = address_transaction_facts(&transaction, &parents, requested_hash)?;
-
-        assert_eq!(facts.input_value_zat, None);
-        assert!(!facts.input_facts_complete);
-        Ok(())
-    }
-
-    #[test]
-    fn coinbase_has_complete_empty_input_facts() -> TestResult {
-        let requested_hash = TransparentAddressScriptHash::from_bytes([0x11; 32]);
-        let transaction = transaction_artifact(
-            transaction_id(3),
-            true,
-            vec![TransparentInputFact::new(
-                0,
-                TransparentOutPoint::COINBASE_SENTINEL,
-            )],
-            Vec::new(),
-        );
-
-        let facts = address_transaction_facts(&transaction, &HashMap::new(), requested_hash)?;
-
-        assert_eq!(facts.input_value_zat, Some(0));
-        assert!(facts.input_facts_complete);
-        assert!(facts.other_input_script_pub_keys.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn complete_canonical_values_recover_a_missing_activity_net_value() -> TestResult {
-        assert_eq!(
-            complete_address_net_value(Some(0), 987_500_260)?,
-            Some(987_500_260)
-        );
-        assert_eq!(complete_address_net_value(Some(100), 40)?, Some(-60));
-        assert_eq!(complete_address_net_value(None, 40)?, None);
-        Ok(())
-    }
-
-    fn transaction_id(seed: u8) -> TransactionId {
-        TransactionId::from_bytes([seed; 32])
-    }
-
     fn ranking_metadata(height: u32) -> TransparentAddressRankingMetadata {
         TransparentAddressRankingMetadata {
             generation: 9,
@@ -991,48 +662,5 @@ mod tests {
                 lifetime_statistics_complete: true,
             },
         }
-    }
-
-    fn output(
-        output_index: u32,
-        value_zat: u64,
-        script_pub_key: Vec<u8>,
-        address_script_hash: TransparentAddressScriptHash,
-    ) -> TransparentOutputFact {
-        TransparentOutputFact::new(output_index, value_zat, script_pub_key, address_script_hash)
-    }
-
-    fn transaction_artifact(
-        transaction_id: TransactionId,
-        is_coinbase: bool,
-        transparent_inputs: Vec<TransparentInputFact>,
-        transparent_outputs: Vec<TransparentOutputFact>,
-    ) -> TransactionFactsArtifact {
-        TransactionFactsArtifact::new(
-            TransactionLocation::new(
-                transaction_id,
-                BlockHeight::new(100),
-                BlockHash::from_bytes([0xAA; 32]),
-                3,
-            ),
-            TransactionPublicFacts {
-                transaction_id,
-                auth_digest: None,
-                wtxid: None,
-                version: TransactionVersion::V5,
-                consensus_branch_id: None,
-                lock_time: LockTime::Unlocked,
-                expiry_height: None,
-                size_bytes: 512,
-                counts: CoreCounts::EMPTY,
-                privacy_shape: PrivacyShape::Unclassified,
-                is_coinbase,
-                orchard_value_balance_zat: None,
-                orchard_anchor: None,
-                ironwood_value_balance_zat: None,
-                unsupported_sections: Vec::new(),
-            },
-        )
-        .with_transparent_facts(transparent_inputs, transparent_outputs)
     }
 }

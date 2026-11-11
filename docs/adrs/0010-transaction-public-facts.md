@@ -13,16 +13,20 @@ Zinder needs one transaction parser output that produces the public facts
 required by wallet status, explorer transaction detail, fee projection,
 privacy-shape classification, and transparent-address activity.
 
-The canonical store materializes parsed transaction facts during ingest and
-stores them in the canonical `transaction_facts` table.
+The canonical store materializes parsed transaction facts during ingest as
+`CanonicalTransactionFacts` inside each block's `CanonicalBlockFacts`, persisted
+in the canonical `block_replay` family.
 
 ## Current Decision
 
 `TransactionPublicFacts` remains the shared parsed shape. It is constructed from
 source transaction bytes by `zinder-source`, then committed as part of
-`TransactionFactsArtifact` alongside `TransactionLocation`.
+`CanonicalTransactionFacts`. The same commit writes each transaction's
+`TransactionLocation` to the `transaction_location` family.
 
-Read paths consume `transaction_facts` and `transaction_location` directly.
+Materialized-view replay hydrates `TransactionFactsArtifact` values from the
+`block_replay` facts, and wallet reads resolve transactions through
+`transaction_location`.
 Raw transaction bytes live only in the optional `transaction_blob` table when
 the deployment opts into raw blobs.
 

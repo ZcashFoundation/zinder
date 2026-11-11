@@ -43,7 +43,7 @@ The commitment binds the raw `scriptPubKey` length-prefixed, not the SHA-256 pro
 
 ### Full-set membership
 
-The commitment folds every output the current-UTXO projection holds at the settled tip, including `OP_RETURN` and non-standard scripts, matching `utxo_count` and `total_value_zat` exactly. It applies no `IsUnspendable` filter. A zcashd-comparable membership rule would be a future `UtxoSetCommitmentScheme` value, never a reinterpretation of `LtHash16`.
+The commitment folds every output the wallet projection's unspent-output rows hold at its source position, including `OP_RETURN` and non-standard scripts, matching `utxo_count` and `total_value_zat` exactly. It applies no `IsUnspendable` filter. A zcashd-comparable membership rule would be a future `UtxoSetCommitmentScheme` value, never a reinterpretation of `LtHash16`.
 
 ### Self-describing scheme and comparison rules
 
@@ -54,9 +54,9 @@ The wire message carries the scheme as an enum (`UtxoSetCommitmentScheme { UNSPE
 
 The comparison rule lives in the client library (`TransparentUtxoSetSummaryView::comparable_with`), so consumers cannot accidentally compare across schemes.
 
-### Maintenance: request-time fold, no schema change
+### Maintenance: wallet-projection accumulator
 
-The accumulator is folded inside the existing `read_transparent_utxo_set_aggregate` scan, beside the two `u64` totals, one element per surviving settled-tip row. There is no persistent accumulator, no new column family, and no `STORE_SCHEMA_VERSION`/`MATERIALIZED_VIEW_STORE_FORMAT_VERSION` bump. A persistent incremental accumulator was rejected: it would require writes from the read-only secondary (forbidden by [ADR-0003]) and would add trust-sensitive delta sites at every spend and reorg.
+Canonical storage holds no UTXO rows and computes no aggregate. The wallet RocksDB projection maintains the summary, `utxo_count`, `total_value_zat`, and the `LtHash16` accumulator, as part of its ready evidence. Each wallet transition inserts every created unspent output and subtracts every spent or reverted one in the same atomic write that changes the unspent-output rows, so the delta sites are the projection's own row writes. Only the wallet primary writes the accumulator; read-only secondaries never do ([ADR-0003]). Cold validation recomputes the summary by scanning every unspent-output row and refuses admission when the count, total, or accumulator differs from the persisted evidence.
 
 ### Capability gating
 
@@ -64,9 +64,8 @@ The fold has real per-output CPU cost. The original implementation exposed an
 operator boolean that independently enabled
 `wallet.read.transparent_utxo_set_commitment_v1`; no current production
 composition or named consumer owned that switch. ADR-0038 removes the boolean.
-The temporary generic query always omits the capability and field, and the
-release serving-pair query does not implement the summary. Removal of the
-unowned generic surface is tracked in
+The serving-pair query does not implement the summary. Removal of the unowned
+protocol surface is tracked in
 [issue #63](https://github.com/gustavovalverde/zinder/issues/63). Retaining or
 reintroducing the commitment requires a concrete production consumer,
 authenticated admission evidence, and an enforced resource budget; a manual
@@ -74,7 +73,7 @@ support flag is not valid evidence.
 
 ## Consequences
 
-A consumer can verify two Zinder deployments hold the same transparent unspent set at one settled tip by comparing 32-byte display digests, and can recompute the commitment from a UTXO dump without Zinder-specific plumbing. The cost is one BLAKE2X expansion per unspent output per summary call on deployments that opt in; deployments that do not pay nothing and omit the field.
+A consumer can verify two Zinder deployments hold the same transparent unspent set at one chain epoch by comparing 32-byte display digests, and can recompute the commitment from a UTXO dump without Zinder-specific plumbing. The cost is one BLAKE2X expansion per output a wallet transition creates, spends, or reverts, plus one per unspent output during cold validation.
 
 The 2048-byte accumulator (not the 32-byte digest) is the canonical commitment carried on the wire, so two accumulators can be summed or differenced off-Zinder to reason about set deltas. A future zcashd-comparable membership rule or a wider lane width lands as a new scheme value, leaving `LtHash16` stable.
 

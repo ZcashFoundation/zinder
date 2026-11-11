@@ -67,15 +67,6 @@ groups:
           summary: "Zinder wallet query p95 is high"
           description: "{{ $labels.service }} {{ $labels.operation }} p95 is above 250ms."
 
-      - alert: ZinderStoreReadP95High
-        expr: histogram_quantile(0.95, sum by (service, table, operation, le) (rate(zinder_store_read_duration_seconds_bucket[5m]))) > 0.05
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Zinder store read p95 is high"
-          description: "{{ $labels.service }} {{ $labels.table }}/{{ $labels.operation }} p95 is above 50ms."
-
       - alert: ZinderRocksDbCompactionPressure
         expr: max by (service, cf) (zinder_store_rocksdb_property{property="rocksdb.estimate-pending-compaction-bytes"}) > 268435456
         for: 5m

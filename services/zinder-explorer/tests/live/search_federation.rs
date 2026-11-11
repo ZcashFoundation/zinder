@@ -5,13 +5,10 @@
 //! candidates, and the privacy refusal arms for shielded inputs. The
 //! classifier in `zinder-core` is exercised by unit tests; this file
 //! covers the federated handler in `services/zinder-explorer/src/grpc/search.rs`.
-
-use std::num::NonZeroU32;
-use std::sync::Arc;
+//! The wallet endpoint is the production serving pair built from genesis,
+//! which only fits test budgets on regtest.
 
 use eyre::{Result, eyre};
-use tempfile::{TempDir, tempdir};
-use tokio::task::JoinHandle;
 use tonic::Request;
 use zebra_chain::block::Block as ZebraBlock;
 use zebra_chain::serialization::ZcashDeserializeInto as _;
@@ -20,24 +17,15 @@ use zinder_core::wire::{
 };
 use zinder_core::{BlockHash, BlockHeight, Network, TransactionId};
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
-use zinder_ingest::run_bulk_catchup;
 use zinder_proto::capabilities::EXPLORER_SEARCH_V1;
 use zinder_proto::v1::explorer::{
     NotPubliclyIndexableReason, SearchRequest, SearchResponse,
     explorer_query_server::ExplorerQuery as ExplorerQueryService, search_candidate,
 };
-use zinder_query::WalletQuery;
-use zinder_source::{NodeSource as _, SourceBlock};
-use zinder_store::PrimaryChainStore;
+use zinder_source::{NodeSource as _, SourceBlock, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
-use zinder_testkit::sample_regtest_upgrade_activations;
 
-use crate::common::{
-    WalletQueryServerOptions, fetch_live_network_upgrade_activations, fetch_live_tip_height,
-    live_bulk_catchup_run_config, serve_wallet_query_grpc, zebra_source_from_bulk_catchup,
-};
-
-const BACKFILL_DEPTH_BLOCKS: u32 = 50;
+use crate::common::{LiveWalletEndpoint, serve_live_wallet_endpoint};
 const REGTEST_TRANSPARENT_ADDRESS: &str = "tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx";
 const MAINNET_TRANSPARENT_ADDRESS: &str = "t1Hsc1LR8yKnbbe3twRp88p6vFfC5t7DLbs";
 const MAINNET_SAPLING_ADDRESS: &str =
@@ -48,12 +36,7 @@ const VIEWING_KEY_LIKE_PREFIX: &str = "uivk1examplenotarealkeyjustaprefix";
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn search_classifies_block_height_transaction_id_and_addresses() -> Result<()> {
     let _guard = init();
-    let Some(env) = require_live_for(&[
-        Network::ZcashRegtest,
-        Network::ZcashTestnet,
-        Network::ZcashMainnet,
-    ])?
-    else {
+    let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
         return Ok(());
     };
     let mut fixture = SearchFixture::open(&env).await?;
@@ -208,12 +191,7 @@ fn response_routes_to_public_history_arm(response: &SearchResponse) -> bool {
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn search_refuses_shielded_address_and_viewing_key_without_canonical_form() -> Result<()> {
     let _guard = init();
-    let Some(env) = require_live_for(&[
-        Network::ZcashRegtest,
-        Network::ZcashTestnet,
-        Network::ZcashMainnet,
-    ])?
-    else {
+    let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
         return Ok(());
     };
     let mut fixture = SearchFixture::open(&env).await?;
@@ -288,32 +266,17 @@ struct SearchFixture {
     sample_block_hash: BlockHash,
     sample_coinbase_id: TransactionId,
     explorer_adapter: ExplorerQueryGrpcAdapter,
-    wallet_server_handle: JoinHandle<Result<(), tonic::transport::Error>>,
-    _store_tempdir: TempDir,
+    wallet_endpoint: LiveWalletEndpoint,
 }
 
 impl SearchFixture {
     async fn open(env: &LiveTestEnv) -> Result<Self> {
         let network = env.network();
-        let (store_tempdir, store, sample) = bulk_catchup_and_sample_tip(env).await?;
-        let wallet_query = WalletQuery::new(
-            store.clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        );
-        let (wallet_grpc_addr, wallet_server_handle) = serve_wallet_query_grpc(
-            wallet_query,
-            WalletQueryServerOptions {
-                network: None,
-                ingest_control_endpoint: None,
-            },
-        )
-        .await?;
-        let wallet_endpoint = format!("http://{wallet_grpc_addr}");
-
+        let wallet_endpoint = serve_live_wallet_endpoint(env).await?;
+        let sample = sample_block_at(env, wallet_endpoint.tip_height).await?;
         let explorer_adapter =
             ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings { network })
-                .with_wallet_query_endpoint(wallet_endpoint);
+                .with_wallet_query_endpoint(format!("http://{}", wallet_endpoint.addr));
 
         Ok(Self {
             network,
@@ -321,8 +284,7 @@ impl SearchFixture {
             sample_block_hash: sample.block_hash,
             sample_coinbase_id: sample.coinbase_transaction_id,
             explorer_adapter,
-            wallet_server_handle,
-            _store_tempdir: store_tempdir,
+            wallet_endpoint,
         })
     }
 
@@ -339,8 +301,8 @@ impl SearchFixture {
     }
 
     async fn shutdown(&mut self) {
-        self.wallet_server_handle.abort();
-        let _ = (&mut self.wallet_server_handle).await;
+        self.wallet_endpoint.server.abort();
+        let _ = (&mut self.wallet_endpoint.server).await;
     }
 }
 
@@ -367,47 +329,18 @@ struct SampleBlock {
     coinbase_transaction_id: TransactionId,
 }
 
-async fn bulk_catchup_and_sample_tip(
-    env: &LiveTestEnv,
-) -> Result<(TempDir, PrimaryChainStore, SampleBlock)> {
-    let tip_height = fetch_live_tip_height(env).await?;
-    if tip_height.value() <= BACKFILL_DEPTH_BLOCKS {
-        return Err(eyre!(
-            "tip height {} is at or below the minimum {BACKFILL_DEPTH_BLOCKS}",
-            tip_height.value(),
-        ));
-    }
-    let checkpoint_height = BlockHeight::new(tip_height.value() - BACKFILL_DEPTH_BLOCKS - 1);
-    let from_height = BlockHeight::new(checkpoint_height.value() + 1);
-
-    let tempdir = tempdir()?;
-    let storage_path = tempdir.path().join("zinder-store");
-    let activations = fetch_live_network_upgrade_activations(env).await?;
-    let mut bulk_catchup_config = live_bulk_catchup_run_config(
-        env,
-        &storage_path,
-        from_height,
-        tip_height,
-        NonZeroU32::new(1000).ok_or_else(|| eyre!("invalid test batch size"))?,
-        true,
-        activations,
-    );
-    let source = zebra_source_from_bulk_catchup(&bulk_catchup_config)?;
-    let checkpoint = source
-        .fetch_chain_checkpoint(
-            checkpoint_height,
-            &bulk_catchup_config.network_upgrade_activations,
-        )
-        .await?;
-    bulk_catchup_config.checkpoint = Some(checkpoint);
-    run_bulk_catchup(&bulk_catchup_config, &source)
-        .await?
-        .ok_or_else(|| eyre!("expected committed bulk-catchup outcome"))?;
-    let tip_source_block = source.fetch_block_at(tip_height).await?;
-    let sample = sample_tip(&tip_source_block)?;
-    let store =
-        PrimaryChainStore::open(&storage_path, bulk_catchup_config.canonical_store_options())?;
-    Ok((tempdir, store, sample))
+async fn sample_block_at(env: &LiveTestEnv, height: BlockHeight) -> Result<SampleBlock> {
+    let source = ZebraJsonRpcSource::with_options(
+        env.target.network,
+        &env.target.json_rpc_addr,
+        env.target.node_auth.clone(),
+        ZebraJsonRpcSourceOptions {
+            request_timeout: env.target.request_timeout,
+            max_response_bytes: env.target.max_response_bytes,
+            broadcast_timeout: None,
+        },
+    )?;
+    sample_tip(&source.fetch_block_at(height).await?)
 }
 
 fn sample_tip(block: &SourceBlock) -> Result<SampleBlock> {

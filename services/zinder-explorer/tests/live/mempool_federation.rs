@@ -2,16 +2,12 @@
 //!
 //! Both handlers compose `WalletQuery.MempoolSnapshot` at request time
 //! and parse every entry via `zinder_source::parse_transaction_public_fact_set`.
-//! The tests stand up the wallet plane in process, drive a known
-//! mempool state via the upstream node (or accept an empty mempool on
-//! testnet/mainnet), and assert the wire shape, freshness envelope, and
-//! pagination contract.
-
-use std::sync::Arc;
+//! The tests stand up the production wallet endpoint in process over a
+//! regtest canonical store built from genesis, with mempool reads routed to an
+//! empty ingest-control fixture, and assert the wire shape, freshness envelope,
+//! and pagination contract.
 
 use eyre::{Result, eyre};
-use tempfile::TempDir;
-use tokio::task::JoinHandle;
 use tonic::Request;
 use zinder_core::Network;
 use zinder_core::wire::encode_zinder_native_chain_name;
@@ -24,25 +20,15 @@ use zinder_proto::v1::explorer::{
     MempoolSnapshotResponse, MempoolSummaryRequest, MempoolSummaryResponse,
     explorer_query_server::ExplorerQuery as ExplorerQueryService,
 };
-use zinder_query::WalletQuery;
 use zinder_testkit::live::{LiveTestEnv, init, require_live_for};
-use zinder_testkit::sample_regtest_upgrade_activations;
 
-use crate::common::{
-    WalletQueryServerOptions, bulk_catchup_store, serve_test_ingest_control,
-    serve_wallet_query_grpc,
-};
+use crate::common::{LiveWalletEndpoint, serve_live_wallet_endpoint};
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn mempool_views_return_freshness_envelope() -> Result<()> {
     let _guard = init();
-    let Some(env) = require_live_for(&[
-        Network::ZcashRegtest,
-        Network::ZcashTestnet,
-        Network::ZcashMainnet,
-    ])?
-    else {
+    let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
         return Ok(());
     };
     let mut fixture = MempoolFixture::open(&env).await?;
@@ -71,12 +57,7 @@ async fn mempool_views_return_freshness_envelope() -> Result<()> {
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn mempool_activity_pagination_emits_unique_entries() -> Result<()> {
     let _guard = init();
-    let Some(env) = require_live_for(&[
-        Network::ZcashRegtest,
-        Network::ZcashTestnet,
-        Network::ZcashMainnet,
-    ])?
-    else {
+    let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
         return Ok(());
     };
     let mut fixture = MempoolFixture::open(&env).await?;
@@ -113,41 +94,21 @@ async fn mempool_activity_pagination_emits_unique_entries() -> Result<()> {
 struct MempoolFixture {
     network: Network,
     explorer_adapter: ExplorerQueryGrpcAdapter,
-    wallet_server_handle: JoinHandle<Result<(), tonic::transport::Error>>,
-    ingest_control_handle: JoinHandle<Result<(), tonic::transport::Error>>,
-    _store_tempdir: TempDir,
+    wallet_endpoint: LiveWalletEndpoint,
 }
 
 impl MempoolFixture {
     async fn open(env: &LiveTestEnv) -> Result<Self> {
         let network = env.network();
-        let (store_tempdir, store, _) = bulk_catchup_store(env).await?;
-        let wallet_query = WalletQuery::new(
-            store.clone(),
-            (),
-            Arc::new(sample_regtest_upgrade_activations()),
-        );
-        let (ingest_control_addr, ingest_control_handle) = serve_test_ingest_control(None).await?;
-        let (wallet_grpc_addr, wallet_server_handle) = serve_wallet_query_grpc(
-            wallet_query,
-            WalletQueryServerOptions {
-                network: None,
-                ingest_control_endpoint: Some(format!("http://{ingest_control_addr}")),
-            },
-        )
-        .await?;
-        let wallet_endpoint = format!("http://{wallet_grpc_addr}");
-
+        let wallet_endpoint = serve_live_wallet_endpoint(env).await?;
         let explorer_adapter =
             ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings { network })
-                .with_wallet_query_endpoint(wallet_endpoint);
+                .with_wallet_query_endpoint(format!("http://{}", wallet_endpoint.addr));
 
         Ok(Self {
             network,
             explorer_adapter,
-            wallet_server_handle,
-            ingest_control_handle,
-            _store_tempdir: store_tempdir,
+            wallet_endpoint,
         })
     }
 
@@ -196,10 +157,8 @@ impl MempoolFixture {
     }
 
     async fn shutdown(&mut self) {
-        self.wallet_server_handle.abort();
-        self.ingest_control_handle.abort();
-        let _ = (&mut self.wallet_server_handle).await;
-        let _ = (&mut self.ingest_control_handle).await;
+        self.wallet_endpoint.server.abort();
+        let _ = (&mut self.wallet_endpoint.server).await;
     }
 }
 

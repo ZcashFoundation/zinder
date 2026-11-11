@@ -5,8 +5,6 @@
 //! are intentionally crate-private to the binary: the library boundary should
 //! not leak CLI parsing concerns.
 
-use std::num::NonZeroU32;
-
 use zinder_ingest::{IngestError, NodeSourceKind};
 use zinder_runtime::ConfigError;
 
@@ -20,17 +18,6 @@ pub(crate) fn parse_node_source(node_source: &str) -> Result<NodeSourceKind, Ing
     }
 }
 
-/// Parses the maximum commit batch size.
-pub(crate) fn parse_canonical_batch_max_blocks(
-    canonical_batch_max_blocks: u32,
-) -> Result<NonZeroU32, ConfigError> {
-    NonZeroU32::new(canonical_batch_max_blocks).ok_or_else(|| {
-        ConfigError::invalid(
-            "ingest.construction.canonical_batch_max_blocks must be greater than zero",
-        )
-    })
-}
-
 /// Parses the maximum replaceable reorg-window size.
 pub(crate) fn parse_reorg_window_blocks(reorg_window_blocks: u32) -> Result<u32, ConfigError> {
     if reorg_window_blocks == 0 {
@@ -42,7 +29,7 @@ pub(crate) fn parse_reorg_window_blocks(reorg_window_blocks: u32) -> Result<u32,
     Ok(reorg_window_blocks)
 }
 
-/// Parses the tip-follow poll interval in milliseconds.
+/// Parses the canonical follower poll interval in milliseconds.
 pub(crate) fn parse_poll_interval_ms(
     poll_interval_ms: u64,
 ) -> Result<std::time::Duration, ConfigError> {

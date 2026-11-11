@@ -15,15 +15,15 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use zinder_core::{BlockHeight, BlockHeightRange, ChainEpochId, Network};
+use zinder_core::{BlockHeight, BlockHeightRange, Network};
 use zinder_query::{
-    FULL_BLOCK_STREAM_CHANNEL_CAPACITY, WalletQuery, WalletQueryApi, WalletServingPairSlot,
-    WalletServingQuery, WalletServingReadPair,
+    FULL_BLOCK_STREAM_CHANNEL_CAPACITY, WalletQueryApi, WalletServingPairSlot, WalletServingQuery,
+    WalletServingReadPair,
 };
 use zinder_store::RawBlobRetention;
-use zinder_testkit::{
-    ChainFixture, StoreFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations,
-};
+use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
+
+use crate::common::serving_query_over;
 
 const PERF_SMOKE_BLOCK_COUNT: u32 = 1_000;
 const PERF_SMOKE_RANGE_BUDGET: Duration = Duration::from_secs(2);
@@ -39,12 +39,7 @@ const FULL_BLOCK_STREAM_MAX_BUFFERED_CHUNKS: usize = 16;
 async fn compact_block_range_one_thousand_blocks_stays_under_budget() -> eyre::Result<()> {
     let chain_fixture =
         ChainFixture::new(Network::ZcashRegtest).extend_blocks(PERF_SMOKE_BLOCK_COUNT);
-    let store_fixture = StoreFixture::with_chain_committed(&chain_fixture, ChainEpochId::new(1))?;
-    let wallet_query = WalletQuery::new(
-        store_fixture.chain_store().clone(),
-        (),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let (wallet_query, _store_fixture) = serving_query_over(&chain_fixture)?;
 
     let start = Instant::now();
     let response = wallet_query
@@ -127,12 +122,8 @@ async fn full_block_range_one_thousand_blocks_stays_under_budget() -> eyre::Resu
 
 #[tokio::test(flavor = "multi_thread")]
 async fn visible_tip_block_stays_under_budget() -> eyre::Result<()> {
-    let store_fixture = StoreFixture::with_single_block(Network::ZcashRegtest)?;
-    let wallet_query = WalletQuery::new(
-        store_fixture.chain_store().clone(),
-        (),
-        Arc::new(sample_regtest_upgrade_activations()),
-    );
+    let (wallet_query, _store_fixture) =
+        serving_query_over(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(1))?;
 
     let start = Instant::now();
     let response = wallet_query.visible_tip_block(None).await?;

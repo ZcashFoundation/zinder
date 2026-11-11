@@ -35,8 +35,9 @@ write buffers. Those controls are still required, but they are incomplete:
 
 ## Decision
 
-Both RocksDB users in the workspace route through one bounded open path in
-`zinder-store`: the canonical store (`RocksChainStore`) and the materialized-view store
+Every RocksDB user in the workspace routes through one bounded open path in
+`zinder-store`: the canonical store (`RocksDbCanonicalStore` and
+`RocksDbCanonicalSecondary`), the wallet store, and the materialized-view store
 (`MaterializedViewStore`). The helper owns the block cache, write-buffer manager, direct
 I/O resolution, and open retry policy.
 

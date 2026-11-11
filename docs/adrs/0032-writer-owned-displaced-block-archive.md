@@ -13,7 +13,7 @@ After a replacement commits, the canonical store cannot reconstruct the displace
 
 ## Decision
 
-The canonical writer captures displaced header facts, ordered transaction ids, transparent coinbase payout scripts and values, optional already-retained raw bytes, and available final roots in the same write batch that accepts `ReorgWindowChange::Replace`. Block hash is identity; event sequence and former height define observation order. A durable activation record defines the archive's coverage boundary.
+The canonical writer captures displaced header facts, ordered transaction ids, transparent coinbase payout scripts and values, optional already-retained raw bytes, and available final roots in the same write batch that commits the `CanonicalLiveReplacement`. Block hash is identity; event sequence and former height define observation order. A durable activation record defines the archive's coverage boundary.
 
 Archive retention is permanent in this release. There is no pruning or retention option. Public methods expose the activation boundary and never claim to reconstruct earlier displaced branches. Product labels, miner branding, external reports, and compatibility terminology remain outside the native artifact.
 
