@@ -31,6 +31,13 @@ junit = { path = "target/nextest/junit.xml" }
 filter = "test(publication_crashes_preserve_the_atomic_build_state)"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
+[[profile.default.overrides]]
+# Each of the 24 seeded cases opens four RocksDB stores with every bundled
+# consumer's column families and applies two reorgs. The fixed case set takes
+# 13-20s on a 4-vCPU runner, which crosses the 20s default kill window.
+filter = "test(every_bundled_consumer_is_reorg_path_independent)"
+slow-timeout = { period = "60s", terminate-after = 2 }
+
 [profile.ci-perf]
 default-filter = "test(/^perf::/)"
 slow-timeout = { period = "5m", terminate-after = 1 }

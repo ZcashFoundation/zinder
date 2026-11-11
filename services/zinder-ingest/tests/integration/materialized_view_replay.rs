@@ -21,8 +21,11 @@ use zinder_ingest::{
     load_fresh_canonical, spawn_materialized_view_tailer_task,
 };
 use zinder_materialized_views::{
-    BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer, MaterializedViewStore,
-    MaterializedViewStoreOptions, REORG_INCIDENTS_CONSUMER_NAME, decode_stored_record,
+    BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer, ChainEventBlockJoin,
+    MaterializedViewConsumerName, MaterializedViewDispatch, MaterializedViewStore,
+    MaterializedViewStoreOptions, MaterializedViewStoreTable, RECENT_TRANSACTIONS_CONSUMER_NAME,
+    REORG_INCIDENTS_CONSUMER_NAME, bundled_materialized_view_consumer_definitions,
+    decode_stored_record,
 };
 use zinder_proto::v1::wallet::{MaterializedViewHealth, MaterializedViewStatus};
 use zinder_runtime::{ComposedReadiness, IngestPhase, Readiness};
@@ -35,7 +38,7 @@ use zinder_store::{
     CanonicalStoreWorkload, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
     RocksDbCanonicalStore, RocksDbResourceBudget,
 };
-use zinder_testkit::sample_regtest_upgrade_activations;
+use zinder_testkit::{LogCapture, sample_regtest_upgrade_activations};
 
 use super::fixture_block::fixture_source_block;
 
@@ -47,6 +50,7 @@ const BASELINE_TIP_HEIGHT: u32 = 2;
 const CHAIN_TIP_HEIGHT: u32 = 4;
 const REPLACEMENT_TIP_HEIGHT: u32 = 5;
 const REORG_WINDOW_BLOCKS: u32 = 2;
+const UNCURSORED_HEAD_REPLACED_EVENT: &str = "materialized_view_replay_uncursored_head_replaced";
 
 #[tokio::test]
 async fn a_fresh_view_store_rebuilds_the_rows_event_replay_would_have_written()
@@ -103,6 +107,136 @@ async fn a_reorg_transition_reverts_and_reapplies_the_replaced_height() -> Resul
             .is_some(),
         "the reorg incident log must advance through the replacement transition"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_view_missing_one_consumer_cursor_reverts_the_rows_a_reorg_replaced()
+-> Result<(), Box<dyn Error>> {
+    let mut harness = CanonicalHarness::baseline().await?;
+    harness.follow_to_tip().await?;
+    let (directory, view) = view_store()?;
+    harness.tailer(&view).catch_up()?;
+    drop(view);
+    delete_chain_event_cursors(directory.path(), [RECENT_TRANSACTIONS_CONSUMER_NAME])?;
+    let view = open_view_store(directory.path())?;
+
+    harness.replace_tip().await?;
+    harness.tailer(&view).catch_up()?;
+
+    assert_eq!(
+        block_summary_hashes(&view, REPLACEMENT_TIP_HEIGHT)?,
+        harness.canonical_hashes(REPLACEMENT_TIP_HEIGHT)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_rebuild_resumed_after_a_reorg_reverts_the_rows_it_wrote_from_the_replaced_chain()
+-> Result<(), Box<dyn Error>> {
+    let mut harness = CanonicalHarness::baseline().await?;
+    harness.follow_to_tip().await?;
+    let (directory, view) = view_store()?;
+    harness.tailer(&view).catch_up()?;
+    drop(view);
+    delete_chain_event_cursors(
+        directory.path(),
+        MaterializedViewStore::bundled_chain_event_consumer_names()
+            .iter()
+            .copied(),
+    )?;
+    let view = open_view_store(directory.path())?;
+
+    harness.replace_tip().await?;
+    let capture = LogCapture::install_for_target("zinder::ingest");
+    harness.tailer(&view).catch_up()?;
+
+    let (_rebuilt_directory, rebuilt) = view_store()?;
+    harness.tailer(&rebuilt).catch_up()?;
+    assert_eq!(
+        block_summary_hashes(&view, REPLACEMENT_TIP_HEIGHT)?,
+        harness.canonical_hashes(REPLACEMENT_TIP_HEIGHT)
+    );
+    assert_eq!(chain_event_cursors(&view)?, chain_event_cursors(&rebuilt)?);
+    assert!(
+        capture.any(|event| event.field("event") == Some(UNCURSORED_HEAD_REPLACED_EVENT)),
+        "a resumed rebuild whose newest block was replaced must revert the reorg window"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_rebuild_resumed_on_an_unchanged_chain_keeps_the_rows_it_already_wrote()
+-> Result<(), Box<dyn Error>> {
+    let mut harness = CanonicalHarness::baseline().await?;
+    let (directory, view) = view_store()?;
+    harness.tailer(&view).catch_up()?;
+    drop(view);
+    delete_chain_event_cursors(
+        directory.path(),
+        MaterializedViewStore::bundled_chain_event_consumer_names()
+            .iter()
+            .copied(),
+    )?;
+    let view = open_view_store(directory.path())?;
+
+    harness.follow_to_tip().await?;
+    let capture = LogCapture::install_for_target("zinder::ingest");
+    harness.tailer(&view).catch_up()?;
+
+    let (_rebuilt_directory, rebuilt) = view_store()?;
+    harness.tailer(&rebuilt).catch_up()?;
+    assert!(
+        !capture.any(|event| event.field("event") == Some(UNCURSORED_HEAD_REPLACED_EVENT)),
+        "a resumed rebuild whose newest block is still canonical must not revert any height"
+    );
+    assert_eq!(
+        block_summary_hashes(&view, CHAIN_TIP_HEIGHT)?,
+        harness.canonical_hashes(CHAIN_TIP_HEIGHT)
+    );
+    assert_eq!(
+        block_summary_hashes(&view, CHAIN_TIP_HEIGHT)?,
+        block_summary_hashes(&rebuilt, CHAIN_TIP_HEIGHT)?
+    );
+    assert_eq!(chain_event_cursors(&view)?, chain_event_cursors(&rebuilt)?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn catching_up_a_fresh_store_advances_every_dispatched_consumer_to_the_newest_event()
+-> Result<(), Box<dyn Error>> {
+    let mut harness = CanonicalHarness::baseline().await?;
+    harness.follow_to_tip().await?;
+    let (_directory, view) = view_store()?;
+    harness.tailer(&view).catch_up()?;
+
+    let newest_event_cursor = view
+        .get_chain_event_cursor(REORG_INCIDENTS_CONSUMER_NAME)?
+        .ok_or("the event-only consumer must observe every retained event")?;
+    for definition in bundled_materialized_view_consumer_definitions() {
+        let expected_cursor = match definition.dispatch {
+            MaterializedViewDispatch::ChainEventBlocks {
+                join: ChainEventBlockJoin::Replay | ChainEventBlockJoin::CanonicalBackfill,
+                ..
+            }
+            | MaterializedViewDispatch::ChainEventEnvelope { .. } => {
+                Some(newest_event_cursor.as_slice())
+            }
+            MaterializedViewDispatch::ChainEventBlocks {
+                join: ChainEventBlockJoin::CanonicalSnapshot { .. },
+                ..
+            }
+            | MaterializedViewDispatch::MempoolEvents { .. }
+            | MaterializedViewDispatch::CanonicalBackfillOnly => None,
+        };
+        assert_eq!(
+            view.get_chain_event_cursor(definition.schema.name)?
+                .as_deref(),
+            expected_cursor,
+            "{} must be dispatched exactly through the events its registry entry declares",
+            definition.schema.name.as_str()
+        );
+    }
     Ok(())
 }
 
@@ -189,15 +323,37 @@ async fn the_tailer_publishes_a_live_status_and_opens_the_historical_work_gate()
 
 fn view_store() -> Result<(TempDir, MaterializedViewStore), Box<dyn Error>> {
     let directory = TempDir::new()?;
-    let store = MaterializedViewStore::open(
-        directory.path(),
+    let store = open_view_store(directory.path())?;
+    Ok((directory, store))
+}
+
+fn open_view_store(path: &Path) -> Result<MaterializedViewStore, Box<dyn Error>> {
+    Ok(MaterializedViewStore::open(
+        path,
         MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: MaterializedViewStore::bundled_consumers(),
             rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
         },
-    )?;
-    Ok((directory, store))
+    )?)
+}
+
+/// Removes chain-event cursors from a closed view store, leaving the rows they
+/// describe in place, as a rebuild interrupted between pages leaves the store.
+fn delete_chain_event_cursors(
+    path: &Path,
+    consumers: impl IntoIterator<Item = MaterializedViewConsumerName>,
+) -> Result<(), Box<dyn Error>> {
+    let options = rust_rocksdb::Options::default();
+    let column_families = rust_rocksdb::DB::list_cf(&options, path)?;
+    let db = rust_rocksdb::DB::open_cf(&options, path, &column_families)?;
+    let cursors = db
+        .cf_handle(MaterializedViewStoreTable::ChainEventCursor.column_family_name())
+        .ok_or("a view store must own the chain-event cursor column family")?;
+    for consumer in consumers {
+        db.delete_cf(&cursors, consumer.as_str().as_bytes())?;
+    }
+    Ok(())
 }
 
 fn block_summary_hashes(

@@ -46,18 +46,30 @@ bytes, or resolve transparent outputs over gRPC.
 `MaterializedViewConsumer` is the SDK-facing trait the materialized-view tailer calls; it has
 `apply_chain_committed` and `apply_chain_reorged`.
 
-`BlockKeyedConsumer` is the convention every production consumer implements:
+`BlockKeyedConsumer` is the convention every production block consumer
+implements. It has three required methods:
 
 - `name(&self) -> MaterializedViewConsumerName`
 - `apply_block(&mut self, &BlockCommitContext, &mut MaterializedViewConsumerCtx<'_>)`
 - `revert_block(&mut self, BlockHeight, &mut MaterializedViewConsumerCtx<'_>)`
 
-A blanket `impl<C: BlockKeyedConsumer> MaterializedViewConsumer for C` provides
-the range loop on top: `apply_chain_committed` walks
-`start_height..=end_height`, pulls each `BlockCommitContext` from the
-tailer-provided in-memory map, and calls `apply_block`;
-`apply_chain_reorged` walks the reverted range calling `revert_block` then
-walks the replacement range calling `apply_block`.
+It also has three methods with no-op defaults, which consumers override when
+they keep batch-local or event-aware state:
+
+- `begin_batch` resets a batch-local overlay before the first block of a batch.
+- `finish_batch` stages shared aggregate rows after every block in the batch.
+- `stage_chain_event_checkpoint` stages coverage or read fences that need the
+  chain event, in the same batch as the rows.
+
+The store's chain-event dispatch supplies the range loop through
+`apply_chain_committed_in_memory` and `apply_chain_reorged_in_memory`:
+a committed range walks `start_height..=end_height`, pulls each
+`BlockCommitContext` from the host-provided in-memory map, and calls
+`apply_block`; a reorg walks the reverted range calling `revert_block` and then
+walks the replacement range calling `apply_block`. One dispatch calls
+`begin_batch`, the range loop, `finish_batch`, and
+`stage_chain_event_checkpoint` for each consumer, then stages every cursor in
+the same write batch.
 
 Test-only consumers that don't fit the per-block shape implement
 `MaterializedViewConsumer` directly without paying the per-block scaffolding tax.
@@ -117,11 +129,29 @@ decoding bytes inline in a handler.
 
 ### Per-consumer schema versioning
 
-Registration is one declaration per consumer: `MaterializedViewConsumerSchema` binds a
-consumer's stable `MaterializedViewConsumerName` to a `schema_version` and the column
-families it owns. Requiring the version at construction makes it impossible to
-register a column family without one. The bundled consumers ship as
-`MaterializedViewStore::bundled_consumers()`; every consumer starts at version 1.
+`MaterializedViewConsumerSchema` binds a consumer's stable
+`MaterializedViewConsumerName` to a `schema_version` and the column families it
+owns. Requiring the version at construction makes it impossible to register a
+column family without one. Every consumer starts at version 1.
+
+Registration of a bundled consumer is one `MaterializedViewConsumerDefinition`
+entry in the closed registry returned by
+`bundled_materialized_view_consumer_definitions()`. The entry declares the
+schema, product role, preset membership, and a `MaterializedViewDispatch` that
+says how the replay host constructs and drives the consumer:
+
+- `ChainEventBlocks` with a `ChainEventBlockJoin` of `Replay`,
+  `CanonicalBackfill`, or `CanonicalSnapshot` (activation-gated);
+- `ChainEventEnvelope` for consumers that read only the event envelope;
+- `MempoolEvents`, which no bundled runtime drives yet; or
+- `CanonicalBackfillOnly` for consumers that never receive events.
+
+The recovery source is derived from the dispatch rather than declared
+separately. `MaterializedViewStore::bundled_consumers()`, the preset schema
+lists, the chain-event and event-only cursor lists, and the replay host's
+dispatch, cursor-agreement, and backfill-owned cursor sets all derive from
+the registry. Both enums are closed, so the replay host's exhaustive matches stop
+compiling when a dispatch shape is added without handling it.
 
 The persisted per-consumer manifest, exact-version admission policy, and
 container-format version are defined in
@@ -133,7 +163,7 @@ Every chain-events consumer implements `revert_block(height, ctx)`. The
 shape of the implementation depends on the key layout:
 
 - **Per-height ascending key** (`BlockSummary`): one `delete_cf` per
-  height. The blanket `apply_chain_reorged` walks the reverted range
+  height. `apply_chain_reorged_in_memory` walks the reverted range
   and calls `revert_block` per height.
 - **Per-block-position descending composite**
   (`TransactionHistoryConsumer`): one `delete_range_cf` per height over
@@ -155,11 +185,22 @@ the wallet would return the new block, not the one whose rows we
 actually wrote. The persisted index captures what was actually
 materialized at apply time.
 
+Revert is held to path independence rather than to restoring an earlier
+snapshot: after applying `A[1..n]` and reorging `A[k..n]` onto `B[k..m]`, every
+column family a consumer declares must hold the same bytes as a fresh store
+that applied `B[1..m]`, however the blocks were grouped into batches. The
+reorg conformance test in `zinder-materialized-views` runs every registry
+entry through that check, and back onto `A`, with a declared list of
+path-dependent column families and the reason for each. Index payloads and undo
+journals therefore encode their entries in a deterministic order and never
+carry values that depend on batch grouping.
+
 ## Consequences
 
-- A new consumer that fits the per-block shape implements
-  `BlockKeyedConsumer` (three methods) plus a key codec and an error
-  enum. The trait blanket gives it the range-loop scaffolding for free.
+- A new consumer that fits the per-block shape implements the three
+  required `BlockKeyedConsumer` methods plus a key codec and an error enum,
+  and adds one registry entry. The store's dispatch gives it the range-loop
+  scaffolding, and the replay host picks it up from the registry.
 - A new wire-key shape requires one primitive in
   `crates/zinder-core/src/wire/`. Subsequent consumers reuse it.
 - `wire_invariants.rs` extends with bans for inline
@@ -171,3 +212,10 @@ materialized at apply time.
 - Composite-key consumers that don't have a height prefix accept the
   index-CF overhead (a few dozen bytes per row at apply time) in
   exchange for correct, single-batch rewinds.
+
+## Revision history
+
+- 2026-11-10: Registration moved to the closed bundled-consumer registry, which
+  also declares dispatch. The trait description now lists all six
+  `BlockKeyedConsumer` methods and the store dispatch functions that supply the
+  range loop. Revert is specified as reorg path independence.

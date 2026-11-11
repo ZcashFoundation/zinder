@@ -5903,6 +5903,7 @@ dependencies = [
  "eyre",
  "metrics",
  "parking_lot",
+ "proptest",
  "prost",
  "rust-rocksdb",
  "tempfile",

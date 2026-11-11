@@ -125,7 +125,10 @@ impl BlockKeyedConsumer for TransparentAddressActivityConsumer {
         ctx: &mut MaterializedViewConsumerCtx<'_>,
     ) -> Result<(), MaterializedViewConsumerError> {
         let transparent_spends = block.transparent_spends();
-        let rows = aggregate_address_rows(block, transparent_spends.as_deref());
+        let mut rows = aggregate_address_rows(block, transparent_spends.as_deref())
+            .into_iter()
+            .collect::<Vec<_>>();
+        rows.sort_unstable_by_key(|((address, position), _record)| (address.as_bytes(), *position));
         let primary_cf = ctx
             .store
             .consumer_column_family(TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY)?;
