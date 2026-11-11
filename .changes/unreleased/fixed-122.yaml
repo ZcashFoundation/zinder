@@ -1,0 +1,6 @@
+kind: fixed
+body: 'Native `CompactBlocksInRange` and lightwalletd `GetBlockRange` now return `NOT_FOUND` with reason `ARTIFACT_UNAVAILABLE` for a range that reaches outside stored history, such as height 0 or a height below the retained floor, instead of `UNAVAILABLE`. A missing row inside retained history still reports a storage error, and `GetBlockRange` above the visible tip still returns `OUT_OF_RANGE`.'
+time: 2026-11-10T21:41:42Z
+custom:
+  Bump: patch
+  PR: "122"

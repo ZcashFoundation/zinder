@@ -16,12 +16,13 @@ use zinder_core::{
 };
 use zinder_proto::v1::wallet;
 use zinder_query::{
-    DEFAULT_MAX_COMPACT_BLOCK_RANGE, QueryError, WalletQueryApi, WalletServingPairSlot,
-    WalletServingQuery, WalletServingReadPair, latest_tree_state_checkpoint_response,
-    subtree_roots_response, tree_state_at_response, visible_tip_block_response,
+    ArtifactKey, DEFAULT_MAX_COMPACT_BLOCK_RANGE, QueryError, WalletQueryApi,
+    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    latest_tree_state_checkpoint_response, subtree_roots_response, tree_state_at_response,
+    visible_tip_block_response,
 };
 use zinder_source::{SourceError, SourceTreeState};
-use zinder_store::RawBlobRetention;
+use zinder_store::{ArtifactFamily, RawBlobRetention};
 use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
 
 use crate::common::{
@@ -497,6 +498,106 @@ async fn serving_pair_compact_range_enforces_the_release_limit_before_storage() 
         }) if actual == requested_count && maximum == maximum_count
     ));
     Ok(())
+}
+
+/// Absent serving-pair range heights are typed coverage misses.
+///
+/// The release serving pair retains compact blocks from height 1 through its
+/// visible tip. A range touching an absent height is `ArtifactUnavailable`
+/// (gRPC `NOT_FOUND`), as the single-block read on the same pair reports, not a
+/// `STORAGE_UNAVAILABLE` outage.
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "One fixture drives every out-of-history case through both the query and gRPC boundaries."
+)]
+async fn serving_pair_compact_range_outside_retained_history_is_artifact_unavailable()
+-> eyre::Result<()> {
+    use tonic_types::StatusExt as _;
+    use zinder_proto::v1::wallet::wallet_query_server::WalletQuery as WalletQueryService;
+
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(3);
+    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+    let (canonical, wallet) = store_fixture.take_readers()?;
+    let pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(canonical),
+        Arc::new(wallet),
+    )?);
+    let (ingest_control, _ingest_control_fixture) =
+        crate::common::admitted_ingest_control_fixture().await?;
+    let query = WalletServingQuery::from_admitted_native_serving_pair(
+        WalletServingPairSlot::new(pair),
+        (),
+        ingest_control,
+        activations,
+    );
+    let adapter = zinder_query::WalletQueryGrpcAdapter::new(
+        query.clone(),
+        zinder_query::WalletEndpointMetadata::default(),
+    );
+
+    let cases = [
+        ("start above visible tip", 4_u32, 5_u32, 4_u32),
+        ("start at unretained height 0", 0, 1, 0),
+        ("only unretained height 0", 0, 0, 0),
+    ];
+    let mut mismatches = Vec::new();
+    for (label, start_height, end_height, missing_height) in cases {
+        let block_range = BlockHeightRange::inclusive(
+            BlockHeight::new(start_height),
+            BlockHeight::new(end_height),
+        );
+        let query_outcome = query.compact_blocks_in_range(block_range, None).await;
+        let query_matches = matches!(
+            &query_outcome,
+            Err(QueryError::ArtifactUnavailable {
+                family: ArtifactFamily::CompactBlock,
+                key: ArtifactKey::BlockHeight(height),
+            }) if *height == BlockHeight::new(missing_height)
+        );
+        if !query_matches {
+            mismatches.push(format!(
+                "{label} ({start_height}..={end_height}) query: expected ArtifactUnavailable(compact_block, {missing_height}), observed {:?}",
+                query_outcome.as_ref().map(|range| range.compact_blocks.len()),
+            ));
+        }
+
+        let Err(status) = WalletQueryService::compact_blocks_in_range(
+            &adapter,
+            tonic::Request::new(wallet::CompactBlocksInRangeRequest {
+                start_height,
+                end_height,
+                at_epoch_id: None,
+            }),
+        )
+        .await
+        else {
+            mismatches.push(format!(
+                "{label} ({start_height}..={end_height}) gRPC: expected NOT_FOUND, observed an open stream"
+            ));
+            continue;
+        };
+        let reason = status
+            .get_details_error_info()
+            .map(|error_info| error_info.reason)
+            .unwrap_or_default();
+        if status.code() != tonic::Code::NotFound || reason != "ARTIFACT_UNAVAILABLE" {
+            mismatches.push(format!(
+                "{label} ({start_height}..={end_height}) gRPC: expected NotFound/ARTIFACT_UNAVAILABLE, observed {:?}/{reason} \"{}\"",
+                status.code(),
+                status.message(),
+            ));
+        }
+    }
+
+    if mismatches.is_empty() {
+        Ok(())
+    } else {
+        Err(eyre!(mismatches.join("\n")))
+    }
 }
 
 fn compact_block_range_chunk(
