@@ -135,14 +135,21 @@ timestamp_rfc3339() {
   date -u '+%Y-%m-%dT%H:%M:%SZ'
 }
 
+# Truncate a padded %N in the shell: some date implementations drop the leading
+# zeros of the nanoseconds before applying a %3N precision.
 timestamp_unix_millis() {
-  millisecond_timestamp="$(date -u '+%s%3N' 2>/dev/null || true)"
-  case "$millisecond_timestamp" in
-    '' | *[!0-9]*)
+  clock_reading="$(date -u '+%s %N' 2>/dev/null || true)"
+  clock_seconds="${clock_reading% *}"
+  clock_nanoseconds="${clock_reading#* }"
+  case "$clock_seconds:$clock_nanoseconds" in
+    *[!0-9:]* | :*)
       printf '%s000\n' "$(date -u '+%s')"
       ;;
+    *:[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])
+      printf '%s%.3s\n' "$clock_seconds" "$clock_nanoseconds"
+      ;;
     *)
-      printf '%s\n' "$millisecond_timestamp"
+      printf '%s000\n' "$(date -u '+%s')"
       ;;
   esac
 }

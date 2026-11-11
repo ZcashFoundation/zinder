@@ -45,9 +45,15 @@ ZINDER_BENCH_RESOURCE_CGROUP_PATH="$fake_cgroup_path" \
 ZINDER_BENCH_RESOURCE_CGROUP_MEMBERSHIP_PATH="$fake_cgroup_membership_path" \
 ZINDER_BENCH_RESOURCE_REQUIRE_PRIVATE_CGROUP_NAMESPACE="true" \
   "$observer" /bin/sh -c '
-    child_started_at_unix_millis="$(date -u "+%s%3N" 2>/dev/null || true)"
-    case "$child_started_at_unix_millis" in
-      "" | *[!0-9]*) child_started_at_unix_millis="$(date -u "+%s")000" ;;
+    clock_reading="$(date -u "+%s %N" 2>/dev/null || true)"
+    clock_seconds="${clock_reading% *}"
+    clock_nanoseconds="${clock_reading#* }"
+    case "$clock_seconds:$clock_nanoseconds" in
+      *[!0-9:]* | :*) child_started_at_unix_millis="$(date -u "+%s")000" ;;
+      *:[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])
+        child_started_at_unix_millis="$(printf "%s%.3s" "$clock_seconds" "$clock_nanoseconds")"
+        ;;
+      *) child_started_at_unix_millis="$(date -u "+%s")000" ;;
     esac
     printf "%s\n" "$child_started_at_unix_millis" >"$TEST_CHILD_STARTED_AT_PATH"
     printf "4096\n" >"$TEST_CGROUP_PATH/memory.current"
