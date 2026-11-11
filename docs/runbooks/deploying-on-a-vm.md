@@ -71,6 +71,10 @@ sudo install -m 0755 \
   /usr/local/bin/
 ```
 
+Releases before `v0.8.0` were published from `gustavovalverde/zinder`. To
+verify one of them, use that repository in the Cosign certificate identity
+and the `ghcr.io/gustavovalverde/` image namespace.
+
 Use `aarch64-unknown-linux-gnu` on AArch64. Inspect `BUILD-INFO.json`, the
 internal `SHA256SUMS`, and the accompanying SPDX SBOM before installation. The
 4 executables still require separate service configuration, storage paths,
