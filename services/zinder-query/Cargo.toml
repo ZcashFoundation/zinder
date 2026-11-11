@@ -18,7 +18,6 @@ clap = { workspace = true, features = ["derive"] }
 config.workspace = true
 hex.workspace = true
 metrics.workspace = true
-parking_lot.workspace = true
 prost.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -52,6 +51,7 @@ workspace = true
 async-trait.workspace = true
 eyre.workspace = true
 metrics-exporter-prometheus.workspace = true
+parking_lot.workspace = true
 prost.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

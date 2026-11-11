@@ -57,6 +57,26 @@ secrets.
 
 ## Runtime-specific readiness
 
+Each runtime decides which cause each of its readiness owners reports. A
+runtime whose readiness depends on more than one owner composes them through
+`zinder_runtime::ComposedReadiness`, which applies one fixed precedence:
+
+1. `shutting_down` once shutdown has started, irreversibly;
+2. an input that reports a parked canonical writer's `reorg_window_exceeded`
+   halt, which is the root cause of the admission failures that follow it;
+3. the admission state (storage, serving pair, or canonical writer) when it
+   refuses traffic;
+4. the first refusing named input, in the order node source, ingest control,
+   materialized-view catch-up;
+5. otherwise the admission state, including a warning that admits traffic.
+
+The admission state supplies the reported heights. When shutdown or an input
+supplies the cause, the reported target height is cleared. Every owner
+replaces only its own input, so no owner can clear another owner's failure.
+Ingest, native wallet query, lightwalletd compatibility, and Explorer use this
+composition. Projector and Cipherscan compatibility each keep one owner of
+their readiness state.
+
 ### Canonical fence attestation
 
 Projector, native wallet query, and lightwalletd compatibility each read
@@ -114,11 +134,46 @@ Ingest is ready when its canonical fence is within the configured source lag
 and the current mempool source generation has published a complete snapshot
 certified at that exact canonical tip.
 Fresh construction, source recovery, schema admission, and reorg refusal keep
-it unready. The canonical follower owns the one process-readiness state; the
-mempool owner communicates only through its hydration prerequisite, so source
-and retention tasks cannot overwrite a canonical failure. The private control
-server, live mempool owner, and mempool retention task are supervised with the
-writer; an unexpected exit from any of them terminates the runtime.
+it unready.
+
+The canonical writer owns the admission state. Store construction, the
+canonical follower, and the reorg-window park publish it; the mempool owner
+communicates only through its hydration prerequisite, so source and retention
+tasks cannot overwrite a canonical failure. The park is terminal: it fixes the
+`reorg_window_exceeded` admission state and its ingest phase, later admission
+writes are ignored, inputs keep recording but cannot replace the halt, and only
+shutdown replaces it. The materialized-view tailer raises
+and clears the `cursor_at_risk` warning on the same admission state, and a
+lag-derived `ready` from the follower keeps an active warning while advancing
+the reported heights.
+
+When `[node.health].addr` is configured, the upstream health probe owns the
+node-source input, and ingest stays `starting` until the probe's first
+successful observation. Each successful probe publishes `upstream_not_ready`
+while Zebra reports that it is not ready for queries and `ready` otherwise. A
+failed probe keeps the last observation. The follower cannot clear the probe's
+`upstream_not_ready`, so ingest stays unready until the probe observes a ready
+Zebra. Without a health endpoint, ingest has no node-source input.
+
+On `/readyz`, a refusing admission state, such as `syncing` or
+`node_unavailable`, takes precedence over the probe. `IngestControl.WriterStatus`
+reports the probe's latest observation independently of the admission state:
+`upstream_not_ready` and Zebra's heights stay set throughout fresh construction
+or source recovery while the probe reports Zebra not ready.
+
+During fresh construction, the writer has no published chain epoch and does not
+service its command queue, so `WriterStatus` answers from readiness alone. It
+reports the `bulk_catchup` phase and `upstream_not_ready` without `chain_view`
+or `gap_blocks`, and Zebra's heights appear only in `upstream_not_ready`.
+Native query treats a missing `chain_view` as an invalid writer status, so it
+stays unready until the writer publishes its first epoch.
+
+Ingest reports `shutting_down` as soon as termination is requested, before the
+writer and its workers drain.
+
+The private control server, live mempool owner, and mempool retention task are
+supervised with the writer; an unexpected exit from any of them terminates the
+runtime.
 
 ### Projector
 
@@ -196,6 +251,42 @@ chain view the system of record no longer attests.
 The ceiling governs admission on its own. `storage.secondary_replica_lag_threshold_chain_epochs`
 decides when lag stops being routine and becomes a reported warning, not how
 long a warned reader may keep answering.
+
+### Explorer
+
+Explorer is ready after its API has started and, when a materialized-view store
+is open, while the latest catch-up of its materialized-view secondary
+succeeded. The secondary catches up once per second and starts in `starting`
+until the first catch-up succeeds. A failed catch-up refuses readiness with
+`schema_mismatch` when the primary's store format, consumer schemas, or
+column-family identity no longer match the binary, and with
+`storage_unavailable` for any other failure. Validation runs after the
+secondary has already advanced, so after a `schema_mismatch` the served view
+may no longer match the binary. Explorer keeps answering gRPC in either case;
+only `/readyz` refuses traffic. The next successful catch-up restores
+readiness. The store already retries the known transient missing-file race
+with primary compaction before it reports a failure.
+
+Because a successful catch-up brings the secondary to the primary's latest
+durable state, the secondary's lag behind its primary is bounded by the
+catch-up interval while catch-up succeeds. How far the materialized views
+trail the chain is reported per response in `ExplorerFreshness`, not through
+readiness. Without a materialized-view store, Explorer has no catch-up input.
+Explorer reports `shutting_down` as soon as termination is requested, before
+its gRPC server drains.
+
+### Cipherscan compatibility
+
+`zinder-compat-cipherscan` owns no storage and no secondary. It connects to its
+Explorer and wallet query endpoints before it reports ready, and a failed
+connection fails startup. After that, readiness stays `ready` until
+termination is requested, when it reports `shutting_down` before the REST
+server drains.
+Each upstream runtime reports its own outage through its own `/readyz`, and an
+adapter request that reaches an unavailable upstream returns HTTP 503 with
+`upstream_unavailable`. Reflecting
+upstream readiness in the adapter would drain every adapter instance whenever
+one upstream runtime is briefly unready, without making any request succeed.
 
 ## Startup and shutdown
 

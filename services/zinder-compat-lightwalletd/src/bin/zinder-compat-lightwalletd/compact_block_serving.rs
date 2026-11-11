@@ -7,7 +7,6 @@
 use std::{num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
-use parking_lot::Mutex;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tokio_util::sync::CancellationToken;
@@ -28,10 +27,11 @@ use zinder_proto::{
 use zinder_query::{DEFAULT_MAX_COMPACT_BLOCK_RANGE, QueryError, status_from_query_error};
 use zinder_runtime::{
     AuthenticatedChannel, BearerToken, CanonicalFenceConvergence, CanonicalFenceConvergenceError,
-    CanonicalFenceConvergencePolicy, CanonicalFenceProbe, CanonicalFenceRelation, ConfigError,
-    NodeUnavailableDetail, Readiness, ReadinessCause, ReadinessState, UpstreamHealth,
-    UpstreamNotReadyDetail, WriterAttestation, classify_canonical_writer_fence,
-    connect_zinder_grpc, converge_on_canonical_writer_fence, expected_writer_fence,
+    CanonicalFenceConvergencePolicy, CanonicalFenceProbe, CanonicalFenceRelation,
+    ComposedReadiness, ConfigError, NodeUnavailableDetail, Readiness, ReadinessCause,
+    ReadinessInput, ReadinessState, UpstreamHealth, UpstreamNotReadyDetail, WriterAttestation,
+    classify_canonical_writer_fence, connect_zinder_grpc, converge_on_canonical_writer_fence,
+    expected_writer_fence,
 };
 use zinder_source::{NodeCapability, NodeSource};
 use zinder_store::{
@@ -71,73 +71,31 @@ enum ConvergenceFailure {
 
 #[derive(Clone)]
 pub(crate) struct CompactServingReadiness {
-    runtime: Readiness,
-    state: Arc<Mutex<CompactServingReadinessState>>,
-}
-
-#[derive(Clone)]
-struct CompactServingReadinessState {
-    storage: ReadinessState,
-    node: ReadinessCause,
-    shutting_down: bool,
+    composed: ComposedReadiness,
 }
 
 impl CompactServingReadiness {
     pub(crate) fn new(runtime: Readiness) -> Self {
-        let readiness = Self {
-            runtime,
-            state: Arc::new(Mutex::new(CompactServingReadinessState {
-                storage: ReadinessState::starting(),
-                node: ReadinessCause::Starting,
-                shutting_down: false,
-            })),
-        };
-        readiness.project();
-        readiness
+        Self {
+            composed: ComposedReadiness::new(runtime, &[ReadinessInput::NodeSource]),
+        }
     }
 
     pub(crate) fn runtime(&self) -> Readiness {
-        self.runtime.clone()
+        self.composed.runtime_readiness()
     }
 
     pub(crate) fn publish_storage(&self, storage: ReadinessState) {
-        let mut state = self.state.lock();
-        state.storage = storage;
-        self.project_locked(&state);
-        drop(state);
+        self.composed.publish_admission(storage);
     }
 
     pub(crate) fn publish_node(&self, node: ReadinessCause) {
-        let mut state = self.state.lock();
-        state.node = node;
-        self.project_locked(&state);
-        drop(state);
+        self.composed
+            .publish_input(ReadinessInput::NodeSource, node);
     }
 
     pub(crate) fn publish_shutting_down(&self) {
-        let mut state = self.state.lock();
-        state.shutting_down = true;
-        self.project_locked(&state);
-        drop(state);
-    }
-
-    fn project(&self) {
-        let state = self.state.lock();
-        self.project_locked(&state);
-    }
-
-    fn project_locked(&self, state: &CompactServingReadinessState) {
-        let mut projected = state.storage.clone();
-        if state.shutting_down {
-            projected.cause = ReadinessCause::ShuttingDown;
-            projected.target_height = None;
-        } else if !state.storage.cause.permits_traffic() {
-            // Storage admission is authoritative until a valid snapshot exists.
-        } else if !state.node.permits_traffic() {
-            projected.cause = state.node.clone();
-            projected.target_height = None;
-        }
-        self.runtime.set(projected);
+        self.composed.publish_shutting_down();
     }
 }
 

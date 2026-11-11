@@ -17,7 +17,7 @@ use std::{
 
 use tokio_util::sync::CancellationToken;
 use zinder_core::BlockHeight;
-use zinder_runtime::{IngestPhase, Readiness};
+use zinder_runtime::{ComposedReadiness, IngestPhase};
 use zinder_source::{MempoolSourceAdmissionLimits, NodeTarget};
 
 use crate::{CanonicalPipelineLimits, NodeSourceKind, RawBlobPolicy};
@@ -33,18 +33,18 @@ pub const DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS: u64 = 1;
 /// Canonical bulk catch-up owns the storage budget first. Once canonical is
 /// following tip, materialized-view replay owns it until every canonical block is
 /// materialized. Historical backfills and verifiers may run only after both
-/// conditions hold. Keeping this state out of [`Readiness`] avoids exposing an
+/// conditions hold. Keeping this state out of readiness avoids exposing an
 /// internal scheduler concern as part of the service's public health contract.
 #[derive(Clone, Debug)]
 pub struct HistoricalWorkGate {
-    readiness: Readiness,
+    readiness: ComposedReadiness,
     materialized_views_caught_up: Arc<AtomicBool>,
 }
 
 impl HistoricalWorkGate {
     /// Creates a closed historical-work gate tied to canonical phase state.
     #[must_use]
-    pub fn new(readiness: Readiness) -> Self {
+    pub fn new(readiness: ComposedReadiness) -> Self {
         metrics::gauge!("zinder_ingest_historical_work_gate_open").set(0.0);
         metrics::gauge!("zinder_materialized_view_replay_caught_up").set(0.0);
         Self {
@@ -53,10 +53,10 @@ impl HistoricalWorkGate {
         }
     }
 
-    /// Returns the shared canonical readiness handle used by materialized-view replay's
-    /// bulk-catchup phase gate.
+    /// Returns the writer's readiness composition, whose projected phase drives
+    /// materialized-view replay's bulk-catchup phase gate.
     #[must_use]
-    pub fn readiness(&self) -> Readiness {
+    pub fn readiness(&self) -> ComposedReadiness {
         self.readiness.clone()
     }
 
@@ -93,8 +93,10 @@ impl HistoricalWorkGate {
     /// Returns whether historical work currently owns any storage budget.
     #[must_use]
     pub fn is_open(&self) -> bool {
-        matches!(self.readiness.phase(), Some(IngestPhase::FollowingTip))
-            && self.materialized_views_caught_up.load(Ordering::Acquire)
+        matches!(
+            self.readiness.runtime_readiness().phase(),
+            Some(IngestPhase::FollowingTip)
+        ) && self.materialized_views_caught_up.load(Ordering::Acquire)
     }
 
     fn record_open_metric(&self) {
@@ -303,11 +305,15 @@ pub(crate) async fn sleep_or_cancel(duration: Duration, cancel: &CancellationTok
 mod tests {
     use super::*;
 
+    fn composed_in_phase(phase: IngestPhase) -> ComposedReadiness {
+        let composed = ComposedReadiness::new(zinder_runtime::Readiness::default(), &[]);
+        composed.update_admission(|admission| admission.phase = Some(phase));
+        composed
+    }
+
     #[tokio::test]
     async fn background_work_gate_requires_materialized_views_to_cover_tip() {
-        let readiness = Readiness::default();
-        readiness.set_phase(IngestPhase::FollowingTip);
-        let gate = HistoricalWorkGate::new(readiness);
+        let gate = HistoricalWorkGate::new(composed_in_phase(IngestPhase::FollowingTip));
         let cancel = CancellationToken::new();
         let gate_for_waiter = gate.clone();
         let cancel_for_waiter = cancel.clone();
@@ -325,8 +331,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_work_gate_resumes_after_bulk_catchup_and_materialized_view_catchup() {
-        let readiness = Readiness::default();
-        readiness.set_phase(IngestPhase::BulkCatchup);
+        let readiness = composed_in_phase(IngestPhase::BulkCatchup);
         let gate = HistoricalWorkGate::new(readiness.clone());
         gate.set_materialized_views_caught_up(true);
         let cancel = CancellationToken::new();
@@ -339,16 +344,14 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!waiter.is_finished());
 
-        readiness.set_phase(IngestPhase::FollowingTip);
+        readiness.update_admission(|admission| admission.phase = Some(IngestPhase::FollowingTip));
         let outcome = tokio::time::timeout(Duration::from_secs(2), waiter).await;
         assert!(matches!(outcome, Ok(Ok(false))));
     }
 
     #[tokio::test]
     async fn background_work_gate_exits_when_cancelled_before_tip_follow() {
-        let readiness = Readiness::default();
-        readiness.set_phase(IngestPhase::BulkCatchup);
-        let gate = HistoricalWorkGate::new(readiness);
+        let gate = HistoricalWorkGate::new(composed_in_phase(IngestPhase::BulkCatchup));
         let cancel = CancellationToken::new();
         cancel.cancel();
 

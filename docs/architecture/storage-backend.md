@@ -92,7 +92,9 @@ explicit and validated. A secondary:
 
 - never writes the primary;
 - revalidates identity and schema after catch-up;
-- reports lag and catch-up failure to readiness;
+- reports catch-up failure to readiness, and lag where the runtime defines a
+  lag threshold, with the per-runtime causes in
+  [Service operations](service-operations.md#runtime-specific-readiness);
 - does not treat an open database as evidence of exact-fence agreement; and
 - cannot be shared by two processes or two reader generations.
 

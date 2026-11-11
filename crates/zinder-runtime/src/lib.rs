@@ -3,7 +3,8 @@
 //! This crate owns:
 //!
 //! - The typed [`Readiness`] state machine and [`ReadinessCause`]
-//!   values defined in `docs/architecture/service-operations.md`.
+//!   values defined in `docs/architecture/service-operations.md`, plus the
+//!   [`ComposedReadiness`] precedence shared by multi-input runtimes.
 //! - The `/healthz`, `/readyz`, and `/metrics` HTTP endpoints
 //!   ([`spawn_ops_endpoint`], [`serve_ops_endpoint`]).
 //! - The shared configuration error type, fluent layered loader, and shared
@@ -27,6 +28,7 @@
 mod auth;
 mod bind_guard;
 mod canonical_fence_attestation;
+mod composed_readiness;
 mod config;
 mod env_diagnostics;
 mod env_var_docs;
@@ -52,6 +54,7 @@ pub use canonical_fence_attestation::{
     WriterAttestation, classify_canonical_writer_fence, converge_on_canonical_writer_fence,
     expected_writer_fence, writer_attests_network_upgrade_schedule,
 };
+pub use composed_readiness::{ComposedReadiness, ReadinessInput};
 pub use config::{
     ConfigError, ConfigLoader, NetworkSection, NetworkToml, NodeAuthToml, NodeHealthToml, NodeToml,
     ZinderEnvironmentSource, duration_as_millis_u64, load_bearer_token, parse_socket_addr,

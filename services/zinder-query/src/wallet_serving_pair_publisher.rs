@@ -19,7 +19,6 @@ use crate::{
     WalletServingReadPair, ingest_control::wallet_ingest_control_request,
 };
 use arc_swap::ArcSwap;
-use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::{task::JoinHandle, time::Instant};
 use tokio_util::sync::CancellationToken;
@@ -34,10 +33,11 @@ use zinder_proto::{
 use zinder_runtime::{
     AuthenticatedChannel, BearerToken, BearerTokenConnectError, CanonicalFenceConvergence,
     CanonicalFenceConvergenceError, CanonicalFenceConvergencePolicy, CanonicalFenceDivergence,
-    CanonicalFenceLag, CanonicalFenceProbe, CanonicalFenceRelation, NodeUnavailableDetail,
-    Readiness, ReadinessCause, ReadinessState, UpstreamHealth, UpstreamNotReadyDetail,
-    WriterAttestation, classify_canonical_writer_fence, connect_zinder_grpc,
-    converge_on_canonical_writer_fence, writer_attests_network_upgrade_schedule,
+    CanonicalFenceLag, CanonicalFenceProbe, CanonicalFenceRelation, ComposedReadiness,
+    NodeUnavailableDetail, Readiness, ReadinessCause, ReadinessInput, ReadinessState,
+    UpstreamHealth, UpstreamNotReadyDetail, WriterAttestation, classify_canonical_writer_fence,
+    connect_zinder_grpc, converge_on_canonical_writer_fence,
+    writer_attests_network_upgrade_schedule,
 };
 use zinder_source::{NodeCapability, NodeSource, SourceError, UpstreamHealthSnapshot};
 use zinder_store::{
@@ -135,28 +135,22 @@ impl WalletServingPairSlot {
 /// Conjunctive readiness owner for one wallet-serving runtime.
 ///
 /// Pair lifecycle, node-source health, and ingest-control health publish
-/// independent inputs here. The existing runtime [`Readiness`] remains the
-/// single operations and gRPC projection, but no input writer can erase
-/// another input's failure.
+/// independent inputs to one [`ComposedReadiness`]. The existing runtime
+/// [`Readiness`] remains the single operations and gRPC projection, but no
+/// input writer can erase another input's failure.
 #[derive(Clone, Debug)]
 pub struct WalletServingReadiness {
-    runtime: Readiness,
-    state: Arc<Mutex<WalletServingReadinessState>>,
-}
-
-#[derive(Clone, Debug)]
-struct WalletServingReadinessState {
-    pair_state: ReadinessState,
-    node_source_cause: ReadinessCause,
-    ingest_control_cause: ReadinessCause,
-    is_shutting_down: bool,
+    composed: ComposedReadiness,
 }
 
 impl WalletServingReadiness {
     /// Starts with the serving pair, node source, and ingest control unadmitted.
     #[must_use]
     pub fn awaiting_node_and_ingest_control(runtime: Readiness) -> Self {
-        Self::new(runtime, ReadinessCause::Starting, ReadinessCause::Starting)
+        Self::new(
+            runtime,
+            &[ReadinessInput::NodeSource, ReadinessInput::IngestControl],
+        )
     }
 
     /// Starts with both the serving pair and required node source unadmitted.
@@ -166,105 +160,44 @@ impl WalletServingReadiness {
     /// [`Self::awaiting_node_and_ingest_control`].
     #[must_use]
     pub fn awaiting_node_source(runtime: Readiness) -> Self {
-        Self::new(runtime, ReadinessCause::Starting, ReadinessCause::Ready)
+        Self::new(runtime, &[ReadinessInput::NodeSource])
     }
 
     /// Starts a storage-only composition whose node contribution is already satisfied.
     #[must_use]
     pub fn without_node_source(runtime: Readiness) -> Self {
-        Self::new(runtime, ReadinessCause::Ready, ReadinessCause::Ready)
+        Self::new(runtime, &[])
     }
 
-    fn new(
-        runtime: Readiness,
-        node_source_cause: ReadinessCause,
-        ingest_control_cause: ReadinessCause,
-    ) -> Self {
-        let readiness = Self {
-            runtime,
-            state: Arc::new(Mutex::new(WalletServingReadinessState {
-                pair_state: ReadinessState::starting(),
-                node_source_cause,
-                ingest_control_cause,
-                is_shutting_down: false,
-            })),
-        };
-        readiness.publish_projection();
-        readiness
+    fn new(runtime: Readiness, required_inputs: &[ReadinessInput]) -> Self {
+        Self {
+            composed: ComposedReadiness::new(runtime, required_inputs),
+        }
     }
 
     /// Returns the projected readiness handle used by operations and gRPC traffic gates.
     #[must_use]
     pub fn runtime_readiness(&self) -> Readiness {
-        self.runtime.clone()
+        self.composed.runtime_readiness()
     }
 
     /// Irreversibly drains readiness before graceful task and server shutdown.
     pub fn publish_shutting_down(&self) {
-        self.publish_state_update(|state| {
-            state.is_shutting_down = true;
-        });
+        self.composed.publish_shutting_down();
     }
 
     fn publish_pair_state(&self, pair_state: ReadinessState) {
-        self.publish_state_update(|state| {
-            state.pair_state = pair_state;
-        });
+        self.composed.publish_admission(pair_state);
     }
 
     fn publish_node_source_cause(&self, node_source_cause: ReadinessCause) {
-        self.publish_state_update(|state| {
-            state.node_source_cause = node_source_cause;
-        });
+        self.composed
+            .publish_input(ReadinessInput::NodeSource, node_source_cause);
     }
 
     fn publish_ingest_control_cause(&self, ingest_control_cause: ReadinessCause) {
-        self.publish_state_update(|state| {
-            state.ingest_control_cause = ingest_control_cause;
-        });
-    }
-
-    fn publish_projection(&self) {
-        self.publish_state_update(|_| {});
-    }
-
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "the readiness-state lock must cover runtime publication so a stale projection cannot overtake a concurrent failure"
-    )]
-    fn publish_state_update(&self, update: impl FnOnce(&mut WalletServingReadinessState)) {
-        let mut state = self.state.lock();
-        update(&mut state);
-        let projected = Self::projected_readiness(&state);
-        // Keep the projection write in the same critical section as its input
-        // mutation. Otherwise a delayed recovery projection can overtake a
-        // newer failure from another readiness input and reopen traffic.
-        self.runtime.set(projected);
-    }
-
-    fn projected_readiness(state: &WalletServingReadinessState) -> ReadinessState {
-        let mut projected = state.pair_state.clone();
-        if state.is_shutting_down {
-            projected.cause = ReadinessCause::ShuttingDown;
-            projected.target_height = None;
-        } else if matches!(
-            state.ingest_control_cause,
-            ReadinessCause::ReorgWindowExceeded { .. }
-        ) {
-            // A parked writer is the root cause of any pair refresh failure
-            // that follows it, so its typed halt wins over them.
-            projected.cause = state.ingest_control_cause.clone();
-            projected.target_height = None;
-        } else if !state.pair_state.cause.permits_traffic() {
-            // The pair state is already the complete projection.
-        } else if !state.node_source_cause.permits_traffic() {
-            projected.cause = state.node_source_cause.clone();
-            projected.target_height = None;
-        } else if !state.ingest_control_cause.permits_traffic() {
-            projected.cause = state.ingest_control_cause.clone();
-            projected.target_height = None;
-        }
-        projected
+        self.composed
+            .publish_input(ReadinessInput::IngestControl, ingest_control_cause);
     }
 }
 

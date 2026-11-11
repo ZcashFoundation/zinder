@@ -375,11 +375,14 @@ secondary_path = "/var/lib/zinder/explorer-secondary"
 listen_addr = "127.0.0.1:9068"
 bearer_token_path = "/run/secrets/zinder-explorer-token"
 wallet_query_endpoint = "https://zinder.example:9102"   # optional zinder-query gRPC endpoint
-
-[explorer.freshness]
-max_lag_blocks = 16              # response carries UNAVAILABLE_STALE beyond this
-warn_lag_blocks = 4              # readiness cause flips at this threshold
 ```
+
+`/readyz` refuses traffic while the latest materialized-view secondary
+catch-up failed: `schema_mismatch` when the primary's store or consumer
+identity no longer matches the binary, `storage_unavailable` otherwise. The
+next successful catch-up restores readiness. Index lag behind the chain is a
+per-response property carried in `ExplorerFreshness`, not a readiness cause.
+See [Service operations](service-operations.md#explorer).
 
 When `explorer.bearer_token_path` is set, the `ExplorerQuery` gRPC endpoint enforces the same shared-secret bearer-token interceptor as `IngestControl` per [ADR-0006](../adrs/0006-ingest-control-transport-security.md). The explorer's `wallet_query_endpoint` config points to an optional `zinder-query` endpoint for its wallet-composed reads (transaction detail, block views, search, mempool activity, and value pools).
 

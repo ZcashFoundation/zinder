@@ -17,7 +17,7 @@ use zinder_core::{
     ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, UnixTimestampMillis,
 };
 use zinder_proto::v1::ops::ReorgWindowExceededDetail;
-use zinder_runtime::{IngestPhase, Readiness, ReadinessCause, ReadinessState};
+use zinder_runtime::{ComposedReadiness, IngestPhase, ReadinessCause, ReadinessState};
 use zinder_source::{NodeSource, SourceBlock, SourceError};
 use zinder_store::{
     CanonicalAppendAnchor, CanonicalBuildBlock, CanonicalBuildSubtreeRoot, CanonicalLiveAppend,
@@ -80,7 +80,7 @@ pub struct CanonicalFollower<'a, Source> {
     source: &'a Source,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     config: CanonicalFollowConfig,
-    readiness: &'a Readiness,
+    readiness: &'a ComposedReadiness,
     cancel: &'a CancellationToken,
 }
 
@@ -94,7 +94,7 @@ where
         source: &'a Source,
         network_upgrade_activations: Arc<NetworkUpgradeActivations>,
         config: CanonicalFollowConfig,
-        readiness: &'a Readiness,
+        readiness: &'a ComposedReadiness,
         cancel: &'a CancellationToken,
     ) -> Self {
         Self {
@@ -137,7 +137,7 @@ where
             *current_detail = detail.clone();
         }
         self.readiness
-            .set(ReadinessState::node_unavailable_with_detail(
+            .publish_admission(ReadinessState::node_unavailable_with_detail(
                 detail,
                 Some(visible_height.value()),
             ));
@@ -424,7 +424,9 @@ where
     Source: NodeSource,
 {
     register_prohibited_read_metrics();
-    follower.readiness.set_phase(IngestPhase::FollowingTip);
+    follower
+        .readiness
+        .update_admission(|admission| admission.phase = Some(IngestPhase::FollowingTip));
     let mut source_outage = None;
     let mut next_event_retention_check = std::time::Instant::now();
     let mut mempool_hydration_changes = follower.config.mempool_ready_gate.clone();
@@ -511,7 +513,9 @@ where
                 continue;
             }
             Err(CanonicalFollowError::ReorgWindowExceeded(evidence)) => {
-                follower.readiness.park(evidence.parked_readiness());
+                follower
+                    .readiness
+                    .park_admission(evidence.parked_readiness());
                 if let Some(mempool_ready_gate) = follower.config.mempool_ready_gate.as_ref() {
                     mempool_ready_gate.halt_owner(evidence.halt());
                 }
@@ -1346,7 +1350,7 @@ async fn await_follow_preparation_or_mempool_change<T>(
     preparation: impl Future<Output = T>,
     mempool_hydration_changes: &mut Option<MempoolReadyGate>,
     mempool_ready_gate: Option<&MempoolReadyGate>,
-    readiness: &Readiness,
+    readiness: &ComposedReadiness,
     canonical_tip: BlockId,
 ) -> Option<T> {
     tokio::select! {
@@ -1368,7 +1372,7 @@ async fn await_follow_preparation_or_mempool_change<T>(
 fn apply_mempool_hydration_change(
     hydration_changed: bool,
     mempool_hydration_changes: &mut Option<MempoolReadyGate>,
-    readiness: &Readiness,
+    readiness: &ComposedReadiness,
     mempool_ready_gate: Option<&MempoolReadyGate>,
     canonical_tip: BlockId,
 ) {
@@ -1379,7 +1383,7 @@ fn apply_mempool_hydration_change(
 }
 
 fn set_follow_readiness(
-    readiness: &Readiness,
+    readiness: &ComposedReadiness,
     store: &RocksDbCanonicalStore,
     observed_tip: BlockId,
     lag_threshold_blocks: u64,
@@ -1418,13 +1422,16 @@ fn set_follow_readiness(
     publish_follow_readiness(readiness, state.with_phase(IngestPhase::FollowingTip));
 }
 
-/// Publishes one follow observation without clearing an orthogonal warning.
+/// Publishes one follow observation as the writer's admission state without
+/// clearing an orthogonal warning.
 ///
-/// The materialized-view tailer owns [`ReadinessCause::CursorAtRisk`], which
-/// still permits traffic. A lag-derived `Ready` advances the observed heights
-/// underneath it instead of replacing it.
-fn publish_follow_readiness(readiness: &Readiness, state: ReadinessState) {
-    readiness.update(|current_state| {
+/// The materialized-view tailer raises [`ReadinessCause::CursorAtRisk`] on the
+/// same admission state, and the warning still permits traffic. A lag-derived
+/// `Ready` advances the observed heights underneath it instead of replacing
+/// it. Other readiness owners, such as the upstream health probe, publish
+/// separate inputs that this write cannot clear.
+fn publish_follow_readiness(readiness: &ComposedReadiness, state: ReadinessState) {
+    readiness.update_admission(|current_state| {
         let warning_owns_cause = matches!(state.cause, ReadinessCause::Ready)
             && matches!(current_state.cause, ReadinessCause::CursorAtRisk { .. });
         if warning_owns_cause {
@@ -1452,7 +1459,7 @@ fn gate_canonical_readiness_on_mempool_hydration(
 }
 
 fn withdraw_follow_readiness_for_mempool_hydration(
-    readiness: &Readiness,
+    readiness: &ComposedReadiness,
     canonical_tip: BlockId,
     mempool_ready_gate: Option<&MempoolReadyGate>,
 ) {
@@ -1460,7 +1467,7 @@ fn withdraw_follow_readiness_for_mempool_hydration(
         return;
     }
 
-    readiness.update(|state| {
+    readiness.update_admission(|state| {
         if state.cause.permits_traffic() {
             state.cause = ReadinessCause::Syncing { lag_blocks: None };
         }
@@ -1510,7 +1517,30 @@ mod tests {
         withdraw_follow_readiness_for_mempool_hydration,
     };
     use crate::mempool_ready_channel;
-    use zinder_runtime::{IngestPhase, Readiness, ReadinessCause, ReadinessState};
+    use zinder_runtime::{
+        ComposedReadiness, IngestPhase, Readiness, ReadinessCause, ReadinessInput, ReadinessState,
+        UpstreamHealth, UpstreamNotReadyDetail,
+    };
+
+    /// Returns the runtime handle and the writer composition seeded with `admission`.
+    fn writer_readiness(admission: ReadinessState) -> (Readiness, ComposedReadiness) {
+        let readiness = Readiness::default();
+        let composed = ComposedReadiness::new(readiness.clone(), &[]);
+        composed.publish_admission(admission);
+        (readiness, composed)
+    }
+
+    fn upstream_syncing() -> ReadinessCause {
+        ReadinessCause::UpstreamNotReady(UpstreamNotReadyDetail {
+            upstream_committed_height: Some(100),
+            upstream_estimated_height: Some(4_000_000),
+            upstream_verification_progress: Some(0.1),
+            upstream_health: UpstreamHealth {
+                source: "zebra_ready_endpoint",
+                reason: std::borrow::Cow::Borrowed("syncing"),
+            },
+        })
+    }
 
     #[test]
     fn replacement_memory_counts_fetched_blocks_until_prepared() -> Result<(), &'static str> {
@@ -1530,11 +1560,11 @@ mod tests {
 
     #[test]
     fn ready_follow_observation_keeps_an_active_cursor_at_risk_warning() {
-        let readiness = Readiness::default();
-        readiness.set(ReadinessState::cursor_at_risk(25, 168, Some(90)));
+        let (readiness, composed) =
+            writer_readiness(ReadinessState::cursor_at_risk(25, 168, Some(90)));
 
         publish_follow_readiness(
-            &readiness,
+            &composed,
             ReadinessState::ready_with_target(Some(100), Some(100))
                 .with_phase(IngestPhase::FollowingTip),
         );
@@ -1553,12 +1583,56 @@ mod tests {
     }
 
     #[test]
-    fn lagging_follow_observation_replaces_a_cursor_at_risk_warning() {
-        let readiness = Readiness::default();
-        readiness.set(ReadinessState::cursor_at_risk(25, 168, Some(90)));
+    fn lag_derived_ready_keeps_probe_upstream_not_ready() {
+        let (readiness, composed) =
+            writer_readiness(ReadinessState::ready_with_target(Some(100), Some(100)));
+        composed.publish_input(ReadinessInput::NodeSource, upstream_syncing());
+        assert!(!readiness.report().is_ready);
 
         publish_follow_readiness(
-            &readiness,
+            &composed,
+            ReadinessState::ready_with_target(Some(101), Some(101))
+                .with_phase(IngestPhase::FollowingTip),
+        );
+
+        let report = readiness.report();
+        assert_eq!(report.cause.metric_label(), "upstream_not_ready");
+        assert!(!report.is_ready);
+        assert_eq!(report.current_height, Some(101));
+
+        composed.publish_input(ReadinessInput::NodeSource, ReadinessCause::Ready);
+        let report = readiness.report();
+        assert!(report.is_ready);
+        assert_eq!(report.target_height, Some(101));
+    }
+
+    #[test]
+    fn cursor_at_risk_warning_returns_after_the_probe_recovers() {
+        let (readiness, composed) =
+            writer_readiness(ReadinessState::cursor_at_risk(25, 168, Some(90)));
+        composed.publish_input(ReadinessInput::NodeSource, upstream_syncing());
+        publish_follow_readiness(
+            &composed,
+            ReadinessState::ready_with_target(Some(100), Some(100))
+                .with_phase(IngestPhase::FollowingTip),
+        );
+        assert_eq!(readiness.report().cause, upstream_syncing());
+
+        composed.publish_input(ReadinessInput::NodeSource, ReadinessCause::Ready);
+
+        let report = readiness.report();
+        assert!(matches!(report.cause, ReadinessCause::CursorAtRisk { .. }));
+        assert_eq!(report.current_height, Some(100));
+        assert_eq!(report.target_height, Some(100));
+    }
+
+    #[test]
+    fn lagging_follow_observation_replaces_a_cursor_at_risk_warning() {
+        let (readiness, composed) =
+            writer_readiness(ReadinessState::cursor_at_risk(25, 168, Some(90)));
+
+        publish_follow_readiness(
+            &composed,
             ReadinessState::syncing(Some(10), Some(90), Some(100))
                 .with_phase(IngestPhase::FollowingTip),
         );
@@ -1658,7 +1732,7 @@ mod tests {
         let canonical_tip = block_id(100, 1);
         signal.certify_source_tip(canonical_tip);
         assert!(wait_for_mempool_hydration_change(&mut hydration_changes).await);
-        let readiness = Readiness::new(
+        let (readiness, composed) = writer_readiness(
             ReadinessState::ready_with_target(Some(100), Some(100))
                 .with_phase(IngestPhase::FollowingTip),
         );
@@ -1669,7 +1743,7 @@ mod tests {
                 preparation_receiver,
                 &mut hydration_changes,
                 Some(&gate),
-                &readiness,
+                &composed,
                 canonical_tip,
             ),
             async {
@@ -1697,7 +1771,7 @@ mod tests {
             std::future::ready(()),
             &mut hydration_changes,
             Some(&gate),
-            &readiness,
+            &composed,
             canonical_tip,
         )
         .await;
@@ -1715,7 +1789,7 @@ mod tests {
             std::future::ready(()),
             &mut hydration_changes,
             Some(&gate),
-            &readiness,
+            &composed,
             canonical_tip,
         )
         .await;
@@ -1727,10 +1801,10 @@ mod tests {
         let (_signal, gate) = mempool_ready_channel();
         let canonical_syncing = ReadinessState::syncing(Some(3), Some(100), Some(103))
             .with_phase(IngestPhase::FollowingTip);
-        let readiness = Readiness::new(canonical_syncing.clone());
+        let (readiness, composed) = writer_readiness(canonical_syncing.clone());
         let canonical_tip = block_id(100, 1);
 
-        withdraw_follow_readiness_for_mempool_hydration(&readiness, canonical_tip, Some(&gate));
+        withdraw_follow_readiness_for_mempool_hydration(&composed, canonical_tip, Some(&gate));
 
         let report = readiness.report();
         assert_eq!(report.cause, canonical_syncing.cause);
