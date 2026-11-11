@@ -218,7 +218,7 @@ After all three `0.5.0-rc.1` versions resolve from crates.io, revoke the
 bootstrap token and configure the same GitHub trusted publisher in the
 crates.io settings for `zinder-core`, `zinder-proto`, and `zinder-client`:
 
-- owner: `gustavovalverde`
+- owner: `ZcashFoundation`
 - repository: `zinder`
 - workflow: `release.yml`
 - environment: `release`
@@ -260,7 +260,7 @@ sha256sum --check SHA256SUMS
 cosign verify-blob \
   --bundle SHA256SUMS.sigstore.json \
   --certificate-identity \
-    'https://github.com/gustavovalverde/zinder/.github/workflows/release.yml@refs/tags/v0.5.0' \
+    'https://github.com/ZcashFoundation/zinder/.github/workflows/release.yml@refs/tags/v0.5.0' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
 
@@ -279,7 +279,7 @@ for image in \
   zinder-wallet-serving
 do
   docker buildx imagetools inspect \
-    "ghcr.io/gustavovalverde/${image}:v0.5.0"
+    "ghcr.io/zcashfoundation/${image}:v0.5.0"
 done
 ```
 

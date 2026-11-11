@@ -49,20 +49,20 @@ both the tag and filename:
 release=vX.Y.Z
 platform=x86_64-v3-unknown-linux-gnu
 gh release download "$release" \
-  --repo gustavovalverde/zinder \
+  --repo ZcashFoundation/zinder \
   --pattern "zinder-${release#v}-${platform}.tar.gz" \
   --pattern "zinder-${release#v}-${platform}.spdx.json" \
   --pattern SHA256SUMS \
   --pattern SHA256SUMS.sigstore.json
 sha256sum --check SHA256SUMS
-gh release verify "$release" --repo gustavovalverde/zinder
+gh release verify "$release" --repo ZcashFoundation/zinder
 gh release verify-asset "$release" \
   "zinder-${release#v}-${platform}.tar.gz" \
-  --repo gustavovalverde/zinder
+  --repo ZcashFoundation/zinder
 cosign verify-blob \
   --bundle SHA256SUMS.sigstore.json \
   --certificate-identity \
-    "https://github.com/gustavovalverde/zinder/.github/workflows/release.yml@refs/tags/${release}" \
+    "https://github.com/ZcashFoundation/zinder/.github/workflows/release.yml@refs/tags/${release}" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
 tar -xzf "zinder-${release#v}-${platform}.tar.gz"
@@ -82,7 +82,7 @@ downloading the bundle does not create a mixed single-process deployment.
 Clone and pin the intended release:
 
 ```bash
-sudo git clone https://github.com/gustavovalverde/zinder.git /opt/zinder
+sudo git clone https://github.com/ZcashFoundation/zinder.git /opt/zinder
 sudo git -C /opt/zinder checkout vX.Y.Z
 sudo install -d -o root -g root -m 0755 /etc/zinder
 sudo cp /opt/zinder/deploy/.env.mainnet /etc/zinder/env

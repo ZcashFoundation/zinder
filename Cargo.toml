@@ -28,7 +28,7 @@ version = "0.9.0"
 edition = "2024"
 license = "MIT"
 publish = false
-repository = "https://github.com/gustavovalverde/zinder"
+repository = "https://github.com/ZcashFoundation/zinder"
 rust-version = "1.95"
 
 [workspace.dependencies]

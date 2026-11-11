@@ -35,5 +35,5 @@ Zinder keeps account state, trial decryption, keys, signing, proving, and
 wallet recovery policy in the consumer. The SDK supplies chain artifacts,
 epoch and reorg semantics, event cursors, transaction status, and broadcast.
 
-See the repository's [server-side wallet pattern](https://github.com/gustavovalverde/zinder/blob/main/docs/reference/server-side-wallet-pattern.md)
+See the repository's [server-side wallet pattern](https://github.com/ZcashFoundation/zinder/blob/main/docs/reference/server-side-wallet-pattern.md)
 for the full integration sequence and librustzcash ownership boundary.
