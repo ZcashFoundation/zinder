@@ -582,13 +582,95 @@ run with every `cargo nextest run --profile=ci` against the production
   `secondary_admission_reports_and_requires_the_persisted_raw_blob_retention`:
   secondary admission is exact for the network and raw-blob retention.
 
+### Process-crash coverage
+
+Process-crash tests run with every `cargo nextest run --profile=ci`. They kill
+a real writer at a named point inside a commit and prove the reopened store
+holds exactly one complete batch: the state before the batch or the state
+after it.
+
+Each test runs in two processes from the same test binary.
+[`zinder_testkit::process_crash`](../../crates/zinder-testkit/src/process_crash.rs)
+supplies both halves:
+
+1. The parent test calls `run_crash_child` with the child test's exact name,
+   a store path, and one crash point. The harness re-runs the current test
+   binary with only that child selected and the point armed through
+   `ZINDER_TEST_CRASH_POINT`.
+2. The child test calls `crash_child()`, drives the write path, and aborts
+   when it reaches the armed `crash_point`. Run directly, `crash_child()`
+   returns `None` and the child passes as a no-op.
+3. The harness accepts only a child killed by `SIGABRT`. A child that exits
+   with an error, or a child name that matches no test, fails the parent
+   instead of passing as a crash.
+4. The parent reopens the store and asserts the recovered state.
+
+`run_crash_child` exists only on Unix, the only platform Zinder builds, tests,
+and releases, because `SIGABRT` is what separates an abort from an ordinary
+failure. Mark every parent test, and any helper only a parent uses,
+`#[cfg(unix)]`.
+
+Crash points are one-line calls in production source. Each crate that owns a
+crash point declares a `crash_point` name that resolves to the harness only in
+its unit-test build:
+
+```rust
+#[cfg(test)]
+use zinder_testkit::process_crash::crash_point;
+
+#[cfg(not(test))]
+const fn crash_point(_name: &str) {}
+
+// At the write site:
+crash_point("canonical.live_commit.before_atomic_write");
+```
+
+Every other build calls the empty function instead, so no integration-test or
+release binary can abort at a crash point. `zinder-testkit` remains a
+dev-dependency of each owning crate, which keeps it out of release dependency
+graphs.
+
+| Store | Write path | Crash points | Parent test |
+| ----- | ---------- | ------------ | ----------- |
+| Canonical | Baseline publication | `canonical.publication.` `after_flush`, `after_builder_drop`, `after_cold_validation`, `after_construction_manifest`, `before_atomic_write`, `after_atomic_write` | `publication_crashes_preserve_the_atomic_build_state` |
+| Canonical | Live append | `canonical.live_commit.` `before_atomic_write`, `after_atomic_write` | `live_commit_crashes_reopen_at_one_complete_atomic_fence` |
+| Canonical | Live replacement | `canonical.live_replacement.` `before_atomic_write`, `after_atomic_write` | `replacement_batch_is_either_pre_update_or_post_update_across_process_abort` |
+| Canonical | Store-control revision (activation-schedule admission and reorg-window raise) | `canonical.control_revision.` `before_atomic_write`, `after_atomic_write` | `activation_schedule_crash_recovers_before_or_after_atomic_record_and_control_write` |
+| Materialized views | Final and intermediate chain-event chunk | `materialized_view.chain_event_chunk.` `before_write`, `after_write` | `chain_event_chunk_reopens_at_one_complete_batch_across_process_abort` |
+| Wallet projection | Canonical-event transition | `wallet_projection.transition.` `before_atomic_write`, `after_atomic_write` | `wallet_transition_reopens_at_one_complete_publication_across_process_abort` |
+
+To cover a new write path, add crash points before and after its single
+atomic write, add a child test that returns an error if it gets past them, and
+name the parent test `<behavior>_across_process_abort`. The
+`.config/nextest.toml` crash-test override matches that suffix and gives the
+test a 60-second timeout window, because each abort can take seconds on a host
+that collects core dumps.
+
+#### Power-loss limitation
+
+`std::process::abort` ends the process but leaves the operating-system page
+cache intact. A write that reached the page cache without an fsync survives
+the abort, so a missing fsync passes every process-crash test. For example,
+the materialized-view chain-event chunk write is unsynced, yet
+`chain_event_chunk_reopens_at_one_complete_batch_across_process_abort` passes
+the same assertions a synced write would.
+
+These tests therefore prove atomicity and recovery to a complete batch. They
+do not prove durability across power loss or a kernel crash, and no CI tier
+does. That durability rests on review of the synchronous write points: the
+canonical publication, live append, live replacement, and lifecycle batches,
+and every wallet-projection transition, write with `set_sync(true)`. The
+materialized-view store writes unsynced and recovers a lost batch by replay
+([ADR-0029](../adrs/0029-durable-transparent-outpoint-spend-projection.md#recovery)).
+Exercising power loss needs a fault-injecting filesystem or a hard reset of a
+virtual machine.
+
 ### Manual reproduction: kill -9 mid-commit
 
-Use this when changing storage commit paths, such as
-`RocksDbCanonicalStore::commit_live_append` or
-`RocksDbCanonicalStore::commit_live_replacement`. The automated test cannot
-exercise unclean shutdown mid-batch because dropping the handle in
-process closes RocksDB cleanly.
+Use this when changing storage commit paths. It kills a real `zinder-ingest`
+process at an arbitrary moment, which complements the fixed crash points
+above. Like those tests, `kill -9` keeps the page cache, so it does not
+simulate power loss.
 
 ```bash
 # Terminal 1: start the canonical writer against z3 regtest.

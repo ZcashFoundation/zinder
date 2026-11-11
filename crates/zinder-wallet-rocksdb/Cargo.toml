@@ -23,6 +23,7 @@ zinder-wallet-projection.workspace = true
 prost.workspace = true
 tempfile.workspace = true
 zinder-proto.workspace = true
+zinder-testkit.workspace = true
 
 [lints]
 workspace = true

@@ -39,6 +39,12 @@ use crate::store::{
 };
 use crate::{RocksDbWalletError, RocksDbWalletStore};
 
+#[cfg(test)]
+use zinder_testkit::process_crash::crash_point;
+
+#[cfg(not(test))]
+const fn crash_point(_name: &str) {}
+
 /// Largest permitted in-process logical-byte plan for one wallet transition.
 ///
 /// Each caller must select a smaller nonzero ceiling. The planner accounts
@@ -351,12 +357,14 @@ impl RocksDbWalletStore {
         );
         let mut write_options = WriteOptions::default();
         write_options.set_sync(true);
+        crash_point("wallet_projection.transition.before_atomic_write");
         self.bounded_open
             .db
             .write_opt(&batch, &write_options)
             .map_err(|source| {
                 RocksDbWalletError::rocksdb("atomic wallet projection transition", source)
             })?;
+        crash_point("wallet_projection.transition.after_atomic_write");
 
         self.control = next_control;
         self.ready_evidence = ready_evidence;
@@ -1815,7 +1823,13 @@ impl<'store> WalletTransitionPlanner<'store> {
 
 #[cfg(test)]
 mod tests {
-    use std::num::{NonZeroU32, NonZeroU64};
+    use std::{
+        num::{NonZeroU32, NonZeroU64},
+        path::Path,
+    };
+
+    #[cfg(unix)]
+    use std::num::NonZeroU16;
 
     use tempfile::TempDir;
     use zinder_core::{
@@ -1832,12 +1846,17 @@ mod tests {
         TransparentUtxoSetCommitment, UnixTimestampMillis, UnsupportedSection,
         encode_canonical_block_replay,
     };
+    #[cfg(unix)]
+    use zinder_core::{TransparentAddressScriptHash, TransparentOutputFact};
     use zinder_store::{
-        CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventHistoryRequest,
-        CanonicalLiveAppend, CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreWorkload,
-        RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
-        RocksDbResourceBudget,
+        CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence,
+        CanonicalEventHistoryRequest, CanonicalLiveAppend, CanonicalReorgPolicy,
+        CanonicalStoreBuildPlan, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder,
+        RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
     };
+    use zinder_testkit::process_crash;
+    #[cfg(unix)]
+    use zinder_wallet_projection::WalletOutpointKey;
     use zinder_wallet_projection::{
         WalletCanonicalSourceIdentity, WalletProjectionBuildLeaseRequest,
         WalletProjectionBuildOwner, WalletProjectionContractError, WalletProjectionDigestBuilder,
@@ -1847,7 +1866,7 @@ mod tests {
 
     use super::{extend_source_sequence_digest, source_identity_from_fence};
     use crate::{
-        RocksDbWalletBuildStore, RocksDbWalletStore,
+        RocksDbWalletBuildStore, RocksDbWalletFollowingStore, RocksDbWalletStore,
         store::{RocksDbWalletBuilder, WalletColdValidationConfig},
     };
 
@@ -1885,37 +1904,22 @@ mod tests {
     fn checkpointed_history_follower_reconciles_then_rejects_a_pre_floor_spend()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
-        let CheckpointedWalletFixture {
+        let PublishedCheckpointedWallet {
             activations,
-            canonical_path,
-            checkpoint_block,
             canonical_store,
             initial_fence,
-            initial_source,
-            wallet_path,
-        } = checkpointed_canonical_with_ready_wallet(&temporary, 1)?;
-
-        let mut append_block = checkpointed_build_block(101, [0xa0; 32], [0xa1; 32], false);
-        let mut append_accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
-            checkpoint_block.height,
-            &CommitmentTreeFrontiers::default(),
-            &activations,
-        )?;
-        append_accumulator.append_block_commitments(
-            append_block.facts.block_header.height,
-            &[],
-            &[],
-            &[],
-        )?;
-        append_block.tip_metadata = append_accumulator.tip_metadata();
-        append_block.tree_state_checkpoint = Some(CommitmentTreeCheckpoint::new(
-            BlockId::new(
-                append_block.facts.block_header.height,
-                append_block.facts.block_header.block_hash,
-            ),
+        } = publish_checkpointed_wallet(temporary.path())?;
+        let canonical_path = temporary.path().join("canonical");
+        let wallet_path = temporary.path().join("wallet");
+        let initial_source = source_identity_from_fence(initial_fence);
+        let mut append_accumulator = checkpoint_accumulator(&activations, initial_fence)?;
+        let append_block = checkpointed_append_block(
+            &mut append_accumulator,
             101,
-            append_accumulator.validated_frontiers()?,
-        ));
+            [0xa0; 32],
+            [0xa1; 32],
+            Vec::new(),
+        )?;
 
         let (canonical_store, append_fence) = canonical_store.commit_live_append(
             CanonicalLiveAppend::new(
@@ -1983,28 +1987,13 @@ mod tests {
             transparent_inputs: vec![TransparentInputFact::new(0, precheckpoint_outpoint)],
             transparent_outputs: Vec::new(),
         };
-        let mut missing_predecessor_block = checkpointed_build_block_with_transactions(
+        let missing_predecessor_block = checkpointed_append_block(
+            &mut append_accumulator,
             102,
             [0xa1; 32],
             [0xa2; 32],
-            false,
             vec![spending_transaction],
-        );
-        append_accumulator.append_block_commitments(
-            missing_predecessor_block.facts.block_header.height,
-            &[],
-            &[],
-            &[],
         )?;
-        missing_predecessor_block.tip_metadata = append_accumulator.tip_metadata();
-        missing_predecessor_block.tree_state_checkpoint = Some(CommitmentTreeCheckpoint::new(
-            BlockId::new(
-                missing_predecessor_block.facts.block_header.height,
-                missing_predecessor_block.facts.block_header.block_hash,
-            ),
-            102,
-            append_accumulator.validated_frontiers()?,
-        ));
         let (_canonical_store, missing_predecessor_fence) = canonical_store.commit_live_append(
             CanonicalLiveAppend::new(
                 append_fence,
@@ -2055,20 +2044,16 @@ mod tests {
     fn raised_depth_retains_an_unsettled_suffix_deeper_than_the_original_depth()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
-        let CheckpointedWalletFixture {
+        let PublishedCheckpointedWallet {
             activations,
-            canonical_path,
-            checkpoint_block,
             canonical_store,
             initial_fence,
-            initial_source,
-            wallet_path,
-        } = checkpointed_canonical_with_ready_wallet(&temporary, 1)?;
-        let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
-            checkpoint_block.height,
-            &CommitmentTreeFrontiers::default(),
-            &activations,
-        )?;
+        } = publish_checkpointed_wallet(temporary.path())?;
+        let canonical_path = temporary.path().join("canonical");
+        let wallet_path = temporary.path().join("wallet");
+        let initial_source = source_identity_from_fence(initial_fence);
+        let checkpoint_block = initial_fence.visible_tip();
+        let mut accumulator = checkpoint_accumulator(&activations, initial_fence)?;
         // The canonical settled tip holds at the checkpoint while two blocks
         // arrive, as it does after a canonical window raise.
         let mut canonical_store = canonical_store;
@@ -2076,14 +2061,13 @@ mod tests {
         for (height, parent_hash, block_hash) in
             [(101, [0xa0; 32], [0xa1; 32]), (102, [0xa1; 32], [0xa2; 32])]
         {
-            let mut block = checkpointed_build_block(height, parent_hash, block_hash, false);
-            accumulator.append_block_commitments(BlockHeight::new(height), &[], &[], &[])?;
-            block.tip_metadata = accumulator.tip_metadata();
-            block.tree_state_checkpoint = Some(CommitmentTreeCheckpoint::new(
-                BlockId::new(BlockHeight::new(height), BlockHash::from_bytes(block_hash)),
+            let block = checkpointed_append_block(
+                &mut accumulator,
                 height,
-                accumulator.validated_frontiers()?,
-            ));
+                parent_hash,
+                block_hash,
+                Vec::new(),
+            )?;
             (canonical_store, fence) = canonical_store.commit_live_append(
                 CanonicalLiveAppend::new(
                     fence,
@@ -2181,28 +2165,213 @@ mod tests {
         Ok(())
     }
 
-    struct CheckpointedWalletFixture {
-        activations: NetworkUpgradeActivations,
-        canonical_path: std::path::PathBuf,
-        checkpoint_block: BlockId,
-        canonical_store: zinder_store::RocksDbCanonicalStore,
-        initial_fence: zinder_store::CanonicalEventFence,
-        initial_source: WalletCanonicalSourceIdentity,
-        wallet_path: std::path::PathBuf,
+    #[cfg(unix)]
+    const TRANSITION_CRASH_CHILD: &str = "transition::tests::wallet_transition_crash_child";
+
+    #[test]
+    fn wallet_transition_crash_child() -> Result<(), Box<dyn std::error::Error>> {
+        let Some(child) = process_crash::crash_child() else {
+            return Ok(());
+        };
+        let secondary = open_checkpointed_secondary(child.store_path(), "canonical-secondary")?;
+        let mut following = RocksDbWalletStore::open_ready_for_following(
+            child.store_path().join("wallet"),
+            Network::ZcashRegtest,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        apply_next_retained_event(&secondary, &mut following)?;
+        Err("wallet transition returned without reaching its crash point".into())
     }
 
-    /// Publishes a canonical store checkpointed at height 100 with a
-    /// 100-block window and a READY empty wallet at `supported_reorg_depth`.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the fixture keeps canonical publication and wallet promotion in one visible order"
-    )]
-    fn checkpointed_canonical_with_ready_wallet(
-        temporary: &TempDir,
-        supported_reorg_depth: u32,
-    ) -> Result<CheckpointedWalletFixture, Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    const CRASH_OUTPUT_VALUE_ZAT: u64 = 7;
+
+    #[cfg(unix)]
+    #[test]
+    fn wallet_transition_reopens_at_one_complete_publication_across_process_abort()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let address = TransparentAddressScriptHash::from_bytes([0xc7; 32]);
+        let crash_transaction_id = TransactionId::from_bytes([0xc8; 32]);
+        let created_outpoint = TransparentOutPoint::new(crash_transaction_id, 0);
+        for crash_point in ["before_atomic_write", "after_atomic_write"] {
+            let temporary = TempDir::new()?;
+            let published = publish_checkpointed_wallet(temporary.path())?;
+            let initial_fence = published.initial_fence;
+            let mut accumulator = checkpoint_accumulator(&published.activations, initial_fence)?;
+            let append_block = checkpointed_append_block(
+                &mut accumulator,
+                101,
+                [0xa0; 32],
+                [0xa1; 32],
+                vec![coinbase_output_transaction(
+                    crash_transaction_id,
+                    TransparentOutputFact::new(0, CRASH_OUTPUT_VALUE_ZAT, [0xc9], address),
+                )],
+            )?;
+            let (canonical_store, append_fence) = published.canonical_store.commit_live_append(
+                CanonicalLiveAppend::new(
+                    initial_fence,
+                    append_block,
+                    Vec::new(),
+                    initial_fence.visible_tip(),
+                    UnixTimestampMillis::new(1_750_000_100_001),
+                ),
+                &published.activations,
+            )?;
+            drop(canonical_store);
+
+            process_crash::run_crash_child(
+                TRANSITION_CRASH_CHILD,
+                temporary.path(),
+                &format!("wallet_projection.transition.{crash_point}"),
+            )?;
+
+            let committed = crash_point == "after_atomic_write";
+            let expected_fence = if committed {
+                append_fence
+            } else {
+                initial_fence
+            };
+            assert_crash_transition_rows(
+                temporary.path(),
+                expected_fence,
+                address,
+                created_outpoint,
+                committed,
+            )?;
+            if !committed {
+                let mut reopened = RocksDbWalletStore::open_ready_for_following(
+                    temporary.path().join("wallet"),
+                    Network::ZcashRegtest,
+                    RocksDbResourceBudget::for_local_tests(),
+                )?;
+                let secondary = open_checkpointed_secondary(temporary.path(), "resume-secondary")?;
+                apply_next_retained_event(&secondary, &mut reopened)?;
+                drop(reopened);
+                assert_crash_transition_rows(
+                    temporary.path(),
+                    append_fence,
+                    address,
+                    created_outpoint,
+                    true,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reopens the wallet at `expected_fence` and asserts that every row family
+    /// the crash transition writes holds its rows exactly when `committed`.
+    #[cfg(unix)]
+    fn assert_crash_transition_rows(
+        root: &Path,
+        expected_fence: CanonicalEventFence,
+        address: TransparentAddressScriptHash,
+        created_outpoint: TransparentOutPoint,
+        committed: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let following = RocksDbWalletStore::open_ready_for_following(
+            root.join("wallet"),
+            Network::ZcashRegtest,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let evidence = following.ready_evidence();
+        assert_eq!(evidence.source_position.tip, expected_fence.visible_tip());
+        assert_eq!(
+            evidence.source_sequence_digest,
+            expected_fence.sequence_digest()
+        );
+        let source = WalletCanonicalSourceIdentity::from_ready_evidence(evidence);
+        let wallet = following.into_ready_store(source)?;
+
+        let unspent = wallet.find_unspent_output(created_outpoint)?;
+        assert_eq!(unspent.is_some(), committed);
+        if let Some(output) = &unspent {
+            assert_eq!(output.address_script_hash, address);
+            assert_eq!(output.value_zat, CRASH_OUTPUT_VALUE_ZAT);
+            assert_eq!(output.created_at.block.height, BlockHeight::new(101));
+        }
+        let address_unspent =
+            wallet.address_unspent_outputs_page(address, None, NonZeroU16::MIN)?;
+        assert_eq!(
+            address_unspent.outputs,
+            unspent.into_iter().collect::<Vec<_>>()
+        );
+        let history = wallet.address_transaction_history_page(address, None, NonZeroU16::MIN)?;
+        assert_eq!(history.transactions.len(), usize::from(committed));
+        assert_eq!(
+            wallet.address_balance(address)?,
+            if committed { CRASH_OUTPUT_VALUE_ZAT } else { 0 }
+        );
+        assert_eq!(wallet.utxo_summary().utxo_count, u64::from(committed));
+
+        let undo = wallet.find_reorg_undo(BlockHeight::new(101))?;
+        assert_eq!(undo.is_some(), committed);
+        if let Some(undo) = undo {
+            assert_eq!(
+                undo.created_outpoints,
+                vec![WalletOutpointKey::new(created_outpoint)]
+            );
+            assert!(undo.spent_outpoints.is_empty());
+            assert_eq!(undo.address_transaction_keys.len(), 1);
+            assert_eq!(
+                undo.source_sequence_digest_after,
+                expected_fence.sequence_digest()
+            );
+        }
+        Ok(())
+    }
+
+    fn apply_next_retained_event(
+        secondary: &RocksDbCanonicalSecondary,
+        following: &mut RocksDbWalletFollowingStore,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let source = WalletCanonicalSourceIdentity::from_ready_evidence(following.ready_evidence());
+        let cursor = source.source_position().event_cursor.as_bytes();
+        let retained_events = secondary.canonical_event_history(
+            CanonicalEventHistoryRequest::new(Some(&cursor), NonZeroU32::MIN),
+        )?;
+        let event = *retained_events
+            .first()
+            .ok_or("no retained canonical event follows the wallet cursor")?;
+        following.apply_canonical_event_range(
+            source,
+            event,
+            event.resulting_fence(),
+            source.settled_tip(),
+            test_transition_logical_byte_limit(),
+            secondary.scan_canonical_replay_range(event.committed_range())?,
+        )?;
+        Ok(())
+    }
+
+    fn open_checkpointed_secondary(
+        root: &Path,
+        secondary_directory: &str,
+    ) -> Result<RocksDbCanonicalSecondary, Box<dyn std::error::Error>> {
+        Ok(RocksDbCanonicalSecondary::open_ready(
+            root.join("canonical"),
+            root.join(secondary_directory),
+            &checkpointed_activations()?,
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(100)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?)
+    }
+
+    struct PublishedCheckpointedWallet {
+        activations: NetworkUpgradeActivations,
+        canonical_store: RocksDbCanonicalStore,
+        initial_fence: CanonicalEventFence,
+    }
+
+    /// Publishes a canonical store checkpointed at height 100 under
+    /// `root/canonical` and an empty READY wallet under `root/wallet`.
+    fn publish_checkpointed_wallet(
+        root: &Path,
+    ) -> Result<PublishedCheckpointedWallet, Box<dyn std::error::Error>> {
         let activations = checkpointed_activations()?;
-        let canonical_path = temporary.path().join("canonical");
         let predecessor = BlockId::new(BlockHeight::new(99), BlockHash::from_bytes([0x99; 32]));
         let checkpoint_block =
             BlockId::new(BlockHeight::new(100), BlockHash::from_bytes([0xa0; 32]));
@@ -2214,7 +2383,7 @@ mod tests {
             CanonicalReorgPolicy::new(100)?,
         )?;
         let mut canonical_builder = RocksDbCanonicalBuilder::create_fresh(
-            &canonical_path,
+            root.join("canonical"),
             CanonicalStoreWorkload::Wallet,
             plan,
             RocksDbResourceBudget::for_local_tests(),
@@ -2236,14 +2405,24 @@ mod tests {
         let canonical_store = validated.publish_baseline(publication)?;
         let initial_fence = canonical_store.event_fence();
         assert_eq!(initial_fence.sequence_digest().block_count(), 1);
-        let initial_source = source_identity_from_fence(initial_fence);
+        publish_empty_wallet(root, initial_fence)?;
+        Ok(PublishedCheckpointedWallet {
+            activations,
+            canonical_store,
+            initial_fence,
+        })
+    }
 
-        let wallet_path = temporary.path().join("wallet");
+    fn publish_empty_wallet(
+        root: &Path,
+        initial_fence: CanonicalEventFence,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let initial_source = source_identity_from_fence(initial_fence);
         let wallet_build_store = RocksDbWalletBuildStore::create_fresh(
-            &wallet_path,
+            root.join("wallet"),
             Network::ZcashRegtest,
             initial_source,
-            supported_reorg_depth,
+            1,
             RocksDbResourceBudget::for_local_tests(),
         )?;
         let lease_request = WalletProjectionBuildLeaseRequest::new(
@@ -2278,29 +2457,59 @@ mod tests {
                 commitment: TransparentUtxoSetCommitment::empty(),
             },
         };
-        let wallet = wallet_builder
+        wallet_builder
             .reopen_for_validation()?
             .validate_rows(
                 ready_evidence,
                 WalletColdValidationConfig {
-                    staging_path: temporary.path(),
+                    staging_path: root,
                     max_sort_memory_bytes_per_sorter: 16 * 1024 * 1024,
                     max_temporary_file_bytes_per_sorter: 16 * 1024 * 1024,
                     max_accounted_reorg_undo_bytes: 16 * 1024 * 1024,
                 },
             )?
             .publish_ready_at(UnixTimestampMillis::new(0))?;
-        drop(wallet);
+        Ok(())
+    }
 
-        Ok(CheckpointedWalletFixture {
+    fn checkpoint_accumulator(
+        activations: &NetworkUpgradeActivations,
+        checkpoint_fence: CanonicalEventFence,
+    ) -> Result<CommitmentTreeAccumulator, Box<dyn std::error::Error>> {
+        Ok(CommitmentTreeAccumulator::from_validated_frontiers(
+            checkpoint_fence.visible_tip().height,
+            &CommitmentTreeFrontiers::default(),
             activations,
-            canonical_path,
-            checkpoint_block,
-            canonical_store,
-            initial_fence,
-            initial_source,
-            wallet_path,
-        })
+        )?)
+    }
+
+    /// Builds the next live block above the checkpoint, advancing `accumulator`.
+    fn checkpointed_append_block(
+        accumulator: &mut CommitmentTreeAccumulator,
+        height: u32,
+        parent_hash: [u8; 32],
+        block_hash: [u8; 32],
+        transactions: Vec<CanonicalTransactionFacts>,
+    ) -> Result<CanonicalBuildBlock, Box<dyn std::error::Error>> {
+        let mut block = checkpointed_build_block_with_transactions(
+            height,
+            parent_hash,
+            block_hash,
+            false,
+            transactions,
+        );
+        let block_id = BlockId::new(
+            block.facts.block_header.height,
+            block.facts.block_header.block_hash,
+        );
+        accumulator.append_block_commitments(block_id.height, &[], &[], &[])?;
+        block.tip_metadata = accumulator.tip_metadata();
+        block.tree_state_checkpoint = Some(CommitmentTreeCheckpoint::new(
+            block_id,
+            height,
+            accumulator.validated_frontiers()?,
+        ));
+        Ok(block)
     }
 
     fn checkpointed_activations()
@@ -2356,6 +2565,28 @@ mod tests {
             privacy_shape: PrivacyShape::Unclassified,
             is_coinbase: false,
             unsupported_sections: vec![UnsupportedSection::FutureVersionHeader],
+        }
+    }
+
+    #[cfg(unix)]
+    fn coinbase_output_transaction(
+        transaction_id: TransactionId,
+        output: TransparentOutputFact,
+    ) -> CanonicalTransactionFacts {
+        let mut public_facts = transparent_spend_public_facts(transaction_id);
+        public_facts.version = TransactionVersion::V4;
+        public_facts.is_coinbase = true;
+        public_facts.unsupported_sections = Vec::new();
+        public_facts.counts.transparent_output_count = 1;
+        CanonicalTransactionFacts {
+            public_facts,
+            serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(&[0x66]),
+            intrinsic_value_balances: TransactionIntrinsicValueBalances::default(),
+            transparent_inputs: vec![TransparentInputFact::new(
+                0,
+                TransparentOutPoint::COINBASE_SENTINEL,
+            )],
+            transparent_outputs: vec![output],
         }
     }
 

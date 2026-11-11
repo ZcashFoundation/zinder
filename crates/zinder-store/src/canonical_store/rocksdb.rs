@@ -513,12 +513,12 @@ impl RocksDbCanonicalStore {
         let mut options = WriteOptions::default();
         options.disable_wal(false);
         options.set_sync(true);
-        abort_at_activation_schedule_failpoint("before_atomic_write");
+        super::crash_point("canonical.control_revision.before_atomic_write");
         self.bounded_open
             .db
             .write_opt(&batch, &options)
             .map_err(|source| CanonicalStoreError::RocksDbOperation { operation, source })?;
-        abort_at_activation_schedule_failpoint("after_atomic_write");
+        super::crash_point("canonical.control_revision.after_atomic_write");
         validate_open_store_control(
             &self.bounded_open.db,
             path,
@@ -842,18 +842,6 @@ impl RocksDbCanonicalStore {
         self.bounded_open.io_mode
     }
 }
-
-#[cfg(test)]
-fn abort_at_activation_schedule_failpoint(expected: &str) {
-    if std::env::var("ZINDER_TEST_CANONICAL_ACTIVATION_SCHEDULE_FAILPOINT").as_deref()
-        == Ok(expected)
-    {
-        std::process::abort();
-    }
-}
-
-#[cfg(not(test))]
-const fn abort_at_activation_schedule_failpoint(_expected: &str) {}
 
 fn require_absent_checkpoint_target(path: &Path) -> Result<(), CanonicalStoreError> {
     match fs::symlink_metadata(path) {

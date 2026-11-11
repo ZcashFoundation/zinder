@@ -26,6 +26,7 @@ zinder-store.workspace = true
 eyre.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
+zinder-testkit.workspace = true
 
 [lints]
 workspace = true

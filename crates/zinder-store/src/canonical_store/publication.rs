@@ -139,9 +139,9 @@ impl RocksDbCanonicalBuilder {
                 source,
             }
         })?;
-        abort_at_publication_failpoint("after_flush");
+        super::crash_point("canonical.publication.after_flush");
         drop(self);
-        abort_at_publication_failpoint("after_builder_drop");
+        super::crash_point("canonical.publication.after_builder_drop");
         context.prepare_trusted_fresh_reopen(&built_database_identity)
     }
 
@@ -157,9 +157,9 @@ impl RocksDbCanonicalBuilder {
                 source,
             }
         })?;
-        abort_at_publication_failpoint("after_flush");
+        super::crash_point("canonical.publication.after_flush");
         drop(self);
-        abort_at_publication_failpoint("after_builder_drop");
+        super::crash_point("canonical.publication.after_builder_drop");
         context.validate_cold_reopen(&built_database_identity)
     }
 }
@@ -273,7 +273,7 @@ impl PublicationContext {
             logical_replay_bytes,
             &retained_sequence_checkpoints,
         )?;
-        abort_at_publication_failpoint("after_cold_validation");
+        super::crash_point("canonical.publication.after_cold_validation");
         Ok(ValidatedRocksDbCanonicalBuild {
             bounded_open,
             workload: self.workload,
@@ -340,7 +340,7 @@ impl PublicationContext {
             },
         )?;
         let ready_evidence = ready_evidence_from_cold_replay(&cold_validation.replay)?;
-        abort_at_publication_failpoint("after_cold_validation");
+        super::crash_point("canonical.publication.after_cold_validation");
         Ok(ValidatedRocksDbCanonicalBuild {
             bounded_open,
             workload: self.workload,
@@ -645,7 +645,7 @@ impl ValidatedRocksDbCanonicalBuild {
         // A crash here leaves a durable, immutable sidecar beside a BUILDING
         // store. The READY control record is still absent, so admission fails
         // closed and the whole fresh build must be discarded before retrying.
-        abort_at_publication_failpoint("after_construction_manifest");
+        super::crash_point("canonical.publication.after_construction_manifest");
         let ready_evidence = CanonicalStoreReadyEvidence {
             construction_manifest_version: binding.version,
             construction_manifest_sha256: binding.sha256,
@@ -678,7 +678,7 @@ impl ValidatedRocksDbCanonicalBuild {
         let mut write_options = WriteOptions::default();
         write_options.disable_wal(false);
         write_options.set_sync(true);
-        abort_at_publication_failpoint("before_atomic_write");
+        super::crash_point("canonical.publication.before_atomic_write");
         self.bounded_open
             .db
             .write_opt(&batch, &write_options)
@@ -688,7 +688,7 @@ impl ValidatedRocksDbCanonicalBuild {
                     source,
                 },
             )?;
-        abort_at_publication_failpoint("after_atomic_write");
+        super::crash_point("canonical.publication.after_atomic_write");
         let replay_tail = validate_exact_publication_readback(
             &self.bounded_open.db,
             &self.build_plan,
@@ -1911,16 +1911,6 @@ pub(super) struct DecodedChainEvent {
     pub(super) visible_block_count: u64,
     pub(super) visible_sequence_digest: [u8; 32],
 }
-
-#[cfg(test)]
-fn abort_at_publication_failpoint(expected: &str) {
-    if std::env::var("ZINDER_TEST_CANONICAL_PUBLICATION_FAILPOINT").as_deref() == Ok(expected) {
-        std::process::abort();
-    }
-}
-
-#[cfg(not(test))]
-const fn abort_at_publication_failpoint(_expected: &str) {}
 
 #[cfg(test)]
 mod tests {

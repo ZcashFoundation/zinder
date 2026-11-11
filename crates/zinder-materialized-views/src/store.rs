@@ -47,6 +47,12 @@ use crate::{
     error::{MaterializedViewError, MaterializedViewStoreColumnFamily, MaterializedViewStoreError},
 };
 
+#[cfg(test)]
+use zinder_testkit::process_crash::crash_point;
+
+#[cfg(not(test))]
+const fn crash_point(_name: &str) {}
+
 /// Conventional subdirectory of the canonical store path where the
 /// materialized-view `RocksDB` instance lives.
 ///
@@ -1476,7 +1482,9 @@ impl MaterializedViewStore {
                 );
             }
         }
+        crash_point("materialized_view.chain_event_chunk.before_write");
         self.write_batch(&batch)?;
+        crash_point("materialized_view.chain_event_chunk.after_write");
         record_materialized_view_write_measurements(&measurements);
         Ok(measurements)
     }

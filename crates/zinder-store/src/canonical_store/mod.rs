@@ -46,6 +46,12 @@ use zinder_core::{
 
 use crate::RawBlobRetention;
 
+#[cfg(test)]
+use zinder_testkit::process_crash::crash_point;
+
+#[cfg(not(test))]
+const fn crash_point(_name: &str) {}
+
 pub use activation_schedule::CanonicalActivationSchedule;
 pub use block_load::{CanonicalBlockLoadEvidence, CanonicalBuildBlock};
 pub use block_replay::{

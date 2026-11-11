@@ -183,7 +183,7 @@ impl RocksDbCanonicalStore {
         let mut write_options = WriteOptions::default();
         write_options.disable_wal(false);
         write_options.set_sync(true);
-        abort_at_live_commit_failpoint("before_atomic_write");
+        super::crash_point("canonical.live_commit.before_atomic_write");
         self.bounded_open
             .db
             .write_opt(&batch, &write_options)
@@ -193,7 +193,7 @@ impl RocksDbCanonicalStore {
                     source,
                 },
             )?;
-        abort_at_live_commit_failpoint("after_atomic_write");
+        super::crash_point("canonical.live_commit.after_atomic_write");
         let reorg_policy = self.reorg_policy();
         validate_live_commit_readback(
             &self.bounded_open.db,
@@ -943,16 +943,6 @@ fn validate_live_commit_readback(
         replay_tail,
     )
 }
-
-#[cfg(test)]
-fn abort_at_live_commit_failpoint(expected: &str) {
-    if std::env::var("ZINDER_TEST_CANONICAL_LIVE_COMMIT_FAILPOINT").as_deref() == Ok(expected) {
-        std::process::abort();
-    }
-}
-
-#[cfg(not(test))]
-const fn abort_at_live_commit_failpoint(_expected: &str) {}
 
 #[cfg(test)]
 mod tests {

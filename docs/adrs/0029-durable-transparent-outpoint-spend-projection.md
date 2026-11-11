@@ -59,6 +59,13 @@ so a fresh materialized-view store replays every spend from genesis. A consumer
 schema change requires such a fresh store
 ([ADR-0028](0028-materialized-view-schema-versioning.md)).
 
+The materialized-view store writes unsynced. A batch lost in a host crash loses
+its chain-event cursor in the same batch, so the replay host re-derives those
+rows from retained canonical events or, once the cursor falls behind the event
+retention floor, from canonical block history. Canonical storage never deletes
+data on the strength of materialized-view rows, so no write-ahead-log barrier
+orders the two stores.
+
 ### Serving
 
 `ExplorerQuery.TransactionDetail` reads the projection from one

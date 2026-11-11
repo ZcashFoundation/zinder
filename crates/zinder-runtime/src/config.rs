@@ -6,7 +6,7 @@
 //!
 //! Live tests reuse the production env-var schema directly; the
 //! `ZINDER_TEST_LIVE` gate (and other `ZINDER_TEST_*` knobs like
-//! `ZINDER_STORE_CRASH_*`) are stripped here so test-only acknowledgements
+//! `ZINDER_TEST_CRASH_POINT`) are stripped here so test-only acknowledgements
 //! cannot leak into a production binary's config.
 //!
 //! Secret hygiene is handled at emit time rather than at load time. Secrets
