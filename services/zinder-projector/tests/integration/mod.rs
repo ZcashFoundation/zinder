@@ -4,3 +4,4 @@
 )]
 
 mod cli;
+mod env_var_contract;

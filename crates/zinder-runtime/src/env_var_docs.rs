@@ -1,20 +1,31 @@
-//! Operator-facing environment-variable contract for Zinder service binaries.
+//! Operator-facing environment-variable reference for Zinder service binaries.
 //!
 //! The `ZINDER_*` env-var schema is part of Zinder's public interface (see
-//! [Public interfaces §Environment variable mapping]). This module is the
-//! single source of truth for the operator-facing surface: the entries in
-//! [`ENVIRONMENT_VARIABLES`] feed both the rendered Markdown table embedded
-//! in `docs/architecture/public-interfaces.md` and the CI drift test that
-//! catches doc/source skew.
+//! [Public interfaces §Environment variable mapping]). The entries in
+//! [`ENVIRONMENT_VARIABLES`] are the hand-maintained description of that
+//! surface and feed the Markdown table embedded in
+//! `docs/architecture/public-interfaces.md`.
 //!
 //! [`render_environment_variable_table`] returns the Markdown the doc block
-//! must contain. Tests assert exact equality; the doc-mirror integration
-//! test prints the expected rendering on failure so the operator can
-//! copy-paste the canonical output back into the doc.
+//! must contain. The doc-mirror integration test in this crate asserts exact
+//! equality and prints the regeneration command on failure.
 //!
-//! Adding a new env-var to a service config is a two-line change here plus
-//! the corresponding field on the relevant config struct. The mirror test
-//! makes drift in either direction a build failure.
+//! Two kinds of drift are caught, in different places:
+//!
+//! - Doc against table: the doc-mirror test above.
+//! - Table against loaders: each service's `env_var_contract` integration
+//!   test runs the binary's real configuration loader. Every row naming the
+//!   binary must be accepted, and every key the loader accepts must have a
+//!   row naming the binary, except keys the test lists as accepted only
+//!   because the section type is shared.
+//!
+//! A row lists a binary when the binary reads the variable into its
+//! configuration. A description says when a listed binary does not apply the
+//! value, as for `RocksDB` background job caps on secondary opens.
+//!
+//! Neither check validates descriptions, defaults, requirement, sensitivity,
+//! or whether a binary acts on a variable it accepts. Adding a config field
+//! means adding a row here and regenerating the doc block.
 //!
 //! [Public interfaces §Environment variable mapping]:
 //!     ../../docs/architecture/public-interfaces.md#environment-variable-mapping
@@ -40,6 +51,14 @@ pub struct EnvVarDoc {
     pub sensitive: bool,
     /// One-line operator-facing description.
     pub description: &'static str,
+}
+
+impl EnvVarDoc {
+    /// Returns whether `binary` consumes this variable.
+    #[must_use]
+    pub fn is_used_by(&self, binary: &str) -> bool {
+        self.used_by.contains(&binary)
+    }
 }
 
 /// Whether an env var is required, optional, or conditional.
@@ -72,7 +91,9 @@ impl Requirement {
 /// `<!-- env-var-table:public-interfaces:start -->` and corresponding `:end`
 /// markers; the doc-mirror test in
 /// `crates/zinder-runtime/tests/integration/env_var_docs.rs` fails when the
-/// rendered table and the doc block diverge.
+/// rendered table and the doc block diverge. Each service's
+/// `tests/integration/env_var_contract.rs` checks the rows against that
+/// binary's loader.
 ///
 /// `ZINDER_TEST_*` variables are intentionally absent: they are stripped at
 /// the runtime config loader so production binaries never observe them.
@@ -88,6 +109,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
+            "zinder-compat-cipherscan",
         ],
         requirement: Requirement::Required,
         sensitive: false,
@@ -242,12 +264,13 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-ingest",
             "zinder-query",
             "zinder-compat-lightwalletd",
+            "zinder-explorer",
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "URL of the upstream's HTTP `/ready` endpoint. When set, ingest and the \
-                      wallet-serving readers poll it as the primary upstream-sync signal; when \
-                      unset, they fall back \
+        description: "URL of the upstream's HTTP `/ready` endpoint. When set, ingest, the \
+                      wallet-serving readers, and `zinder-explorer` poll it as the primary \
+                      upstream-sync signal; when unset, they fall back \
                       to `getblockchaininfo.verificationprogress`/`estimatedheight`. See \
                       [ADR-0015](../adrs/0015-phase-driven-ingest.md).",
     },
@@ -275,6 +298,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-ingest",
             "zinder-query",
             "zinder-compat-lightwalletd",
+            "zinder-explorer",
         ],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -289,6 +313,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-ingest",
             "zinder-query",
             "zinder-compat-lightwalletd",
+            "zinder-explorer",
         ],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -304,13 +329,14 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
+            "zinder-compat-cipherscan",
         ],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Listen address for the operational HTTP endpoint \
                       (`/healthz`, `/readyz`, `/metrics`). Defaults to a per-service \
                       loopback address (`127.0.0.1:9105` ingest, `9110` projector, `9106` query, \
-                      `9107` compat, `9069` explorer). Set to an empty string to \
+                      `9107` compat, `9069` explorer, `9108` cipherscan). Set to an empty string to \
                       disable the endpoint entirely.",
     },
     EnvVarDoc {
@@ -322,6 +348,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
+            "zinder-compat-cipherscan",
         ],
         requirement: Requirement::Optional,
         sensitive: false,
@@ -457,16 +484,41 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
     EnvVarDoc {
         name: "ZINDER_STORAGE__INITIAL_CATCHUP_TIMEOUT_MS",
         toml_path: "storage.initial_catchup_timeout_ms",
-        used_by: &[
-            "zinder-query",
-            "zinder-compat-lightwalletd",
-            "zinder-explorer",
-        ],
+        used_by: &["zinder-query", "zinder-compat-lightwalletd"],
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Maximum startup RocksDB secondary catchup duration before a reader starts \
                       with the opened secondary and lets /readyz report replica lag. Defaults to \
                       30000.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__SECONDARY_CATCHUP_INTERVAL_MS",
+        toml_path: "storage.secondary_catchup_interval_ms",
+        used_by: &["zinder-query", "zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Cadence of RocksDB secondary catchup ticks in milliseconds. Defaults to \
+                      1000. Must be greater than zero.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS",
+        toml_path: "storage.secondary_replica_lag_threshold_chain_epochs",
+        used_by: &["zinder-query", "zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Chain epochs the secondary may trail the primary before `/readyz` reports \
+                      replica lag. Defaults to 4.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__SERVING_PAIR_STALENESS_CEILING_MS",
+        toml_path: "storage.serving_pair_staleness_ceiling_ms",
+        used_by: &["zinder-query", "zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Longest a wallet-serving pair keeps admitting traffic, in milliseconds, \
+                      after the last writer attestation. Past it the cause of the failed \
+                      refresh replaces `serving_pair_stale` and traffic stops. Defaults to \
+                      300000. Must be greater than zero.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__CANONICAL_PATH",
@@ -845,6 +897,16 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Materialized-view store per-column-family mutable plus immutable RocksDB write \
                       buffer count. Defaults to 4 for writers and 2 for readers.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_BACKGROUND_JOBS",
+        toml_path: "storage.materialized_views.rocksdb.max_background_jobs",
+        used_by: &["zinder-ingest", "zinder-explorer"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Materialized-view store primary-writer RocksDB background job cap shared by \
+                      flush and compaction work. Defaults to 2 and is not applied to secondary \
+                      opens, including `zinder-explorer`.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MEMTABLE_BUDGET_BYTES",
@@ -1269,6 +1331,61 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       (transaction detail, block views, search, mempool activity). Empty/unset \
                       disables the explorer capabilities that compose canonical wallet reads.",
     },
+    EnvVarDoc {
+        name: "ZINDER_CIPHERSCAN__LISTEN_ADDR",
+        toml_path: "cipherscan.listen_addr",
+        used_by: &["zinder-compat-cipherscan"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Listen address for the Cipherscan-compatible REST endpoint. Defaults to \
+                      127.0.0.1:9070. A public or unspecified address needs \
+                      `ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_CIPHERSCAN__EXPLORER_QUERY_ENDPOINT",
+        toml_path: "cipherscan.explorer_query_endpoint",
+        used_by: &["zinder-compat-cipherscan"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "ExplorerQuery gRPC endpoint the adapter reads explorer views from. \
+                      Defaults to http://127.0.0.1:9068.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_CIPHERSCAN__WALLET_QUERY_ENDPOINT",
+        toml_path: "cipherscan.wallet_query_endpoint",
+        used_by: &["zinder-compat-cipherscan"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "WalletQuery gRPC endpoint the adapter reads chain and transaction data \
+                      from. Defaults to http://127.0.0.1:9102.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_CIPHERSCAN__CURRENT_PRICE_ENDPOINT",
+        toml_path: "cipherscan.current_price_endpoint",
+        used_by: &["zinder-compat-cipherscan"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "HTTP or HTTPS URL of the external market-price provider queried for the \
+                      current ZEC price. Defaults to the CoinGecko simple-price URL.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_CIPHERSCAN__HISTORICAL_PRICE_ENDPOINT_TEMPLATE",
+        toml_path: "cipherscan.historical_price_endpoint_template",
+        used_by: &["zinder-compat-cipherscan"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "URL template for historical market-price lookups; `{date}` is replaced \
+                      with the requested date. Defaults to the CoinGecko history URL.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_CIPHERSCAN__BEARER_TOKEN_PATH",
+        toml_path: "cipherscan.bearer_token_path",
+        used_by: &["zinder-compat-cipherscan"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Path to the shared-secret bearer token the adapter presents to both the \
+                      ExplorerQuery and WalletQuery endpoints (ADR-0006). Unset sends no token.",
+    },
 ];
 
 /// Renders [`ENVIRONMENT_VARIABLES`] as a GitHub-flavored Markdown table.
@@ -1348,7 +1465,7 @@ mod tests {
             .filter(|env_var| env_var.name.ends_with("__ROCKSDB__MAX_BACKGROUND_JOBS"))
             .collect::<Vec<_>>();
 
-        assert_eq!(background_job_variables.len(), 2);
+        assert_eq!(background_job_variables.len(), 3);
         for env_var in background_job_variables {
             assert!(env_var.description.contains("primary-writer"));
             assert!(

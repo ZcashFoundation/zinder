@@ -5743,6 +5743,7 @@ dependencies = [
  "axum",
  "clap",
  "config",
+ "eyre",
  "hex",
  "reqwest",
  "serde",
@@ -5762,6 +5763,7 @@ dependencies = [
  "zinder-proto",
  "zinder-runtime",
  "zinder-source",
+ "zinder-testkit",
 ]
 
 [[package]]

@@ -35,7 +35,9 @@ zinder-runtime.workspace = true
 zinder-source.workspace = true
 
 [dev-dependencies]
+eyre.workspace = true
 tower.workspace = true
+zinder-testkit.workspace = true
 
 [[bin]]
 name = "zinder-compat-cipherscan"
