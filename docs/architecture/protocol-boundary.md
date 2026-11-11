@@ -93,6 +93,13 @@ These endpoints are private operational contracts. They use the shared
 transport policy and fail closed when authentication or transport requirements
 are not met. See [ADR-0006](../adrs/0006-ingest-control-transport-security.md).
 
+`CanonicalControl.WriterStatus` carries the writer's visible fence as one
+`CanonicalWriterFence` message. The writer encodes it with
+`zinder_proto::wire::canonical_writer_fence_message`. Secondary readers encode
+their own fence with the same function and compare the two field for field, as
+described in
+[Service operations](service-operations.md#canonical-fence-attestation).
+
 ## Lightwalletd compatibility
 
 The vendored `CompactTxStreamer` schema is an external contract. Its source pin

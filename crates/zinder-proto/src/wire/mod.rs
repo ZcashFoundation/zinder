@@ -12,6 +12,7 @@
 //! generated `zinder_proto::v1::*` enums.
 
 mod activation_schedule;
+mod canonical_writer_fence;
 mod privacy_shape;
 mod reorg_window_exceeded;
 mod transparent_delta_kind;
@@ -22,6 +23,7 @@ pub use activation_schedule::{
     ActivationScheduleWireError, decode_canonical_network_upgrade_schedule,
     encode_canonical_network_upgrade_schedule,
 };
+pub use canonical_writer_fence::canonical_writer_fence_message;
 pub use privacy_shape::{decode_privacy_shape, encode_privacy_shape};
 pub use reorg_window_exceeded::{
     ReorgWindowExceededMetadata, decode_reorg_window_exceeded_metadata,

@@ -1477,14 +1477,12 @@ fn writer_fence_message(store: &RocksDbCanonicalStore) -> CanonicalWriterFence {
 }
 
 fn writer_fence_from_store_fence(fence: zinder_store::CanonicalEventFence) -> CanonicalWriterFence {
-    CanonicalWriterFence {
-        chain_epoch_id: fence.chain_epoch_id().value(),
-        event_sequence: fence.chain_event_sequence(),
-        visible_tip_height: fence.visible_tip().height.value(),
-        visible_tip_hash: fence.visible_tip().hash.as_bytes().to_vec(),
-        canonical_sequence_digest: fence.sequence_digest().as_bytes().to_vec(),
-        visible_block_count: fence.sequence_digest().block_count(),
-    }
+    zinder_proto::wire::canonical_writer_fence_message(
+        fence.chain_epoch_id(),
+        fence.chain_event_sequence(),
+        fence.visible_tip(),
+        fence.sequence_digest(),
+    )
 }
 
 fn retained_event_message(event: zinder_store::CanonicalRetainedEvent) -> CanonicalRetainedEvent {

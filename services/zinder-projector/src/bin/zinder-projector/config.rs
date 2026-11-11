@@ -158,15 +158,8 @@ pub(crate) enum ProjectorError {
     #[error("canonical secondary did not reach the writer fence before the convergence deadline")]
     CanonicalFenceDidNotConverge,
 
-    #[error(
-        "canonical secondary at event {secondary_event_sequence} diverged from writer fence at event {writer_event_sequence}"
-    )]
-    CanonicalFenceDiverged {
-        /// Event sequence of the projector's canonical secondary.
-        secondary_event_sequence: u64,
-        /// Event sequence reported by the canonical writer.
-        writer_event_sequence: u64,
-    },
+    #[error(transparent)]
+    CanonicalFenceDiverged(zinder_runtime::CanonicalFenceDivergence),
 
     #[error("constructed wallet source differs from its fixed canonical construction fence")]
     WalletConstructionFenceMismatch,

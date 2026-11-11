@@ -1,3 +1,4 @@
+mod canonical_writer_fence;
 mod capability_descriptor_drift;
 mod capability_docs;
 mod capability_registry;

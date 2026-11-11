@@ -16,11 +16,17 @@
 //!   [`cancel_on_terminating_signal`] and [`install_tracing_subscriber`].
 //! - The process-wide Prometheus metrics recorder
 //!   ([`install_metrics_recorder`], [`install_metrics_recorder_for_service`]).
+//! - Canonical secondary attestation against `CanonicalControl.WriterStatus`
+//!   ([`classify_canonical_writer_fence`],
+//!   [`converge_on_canonical_writer_fence`], [`WriterAttestation`]), shared
+//!   by every runtime that reads a canonical `RocksDB` secondary.
 //!
-//! It deliberately exposes no domain types.
+//! It deliberately defines no storage or protocol types of its own; it
+//! composes those owned by `zinder-core`, `zinder-proto`, and `zinder-store`.
 
 mod auth;
 mod bind_guard;
+mod canonical_fence_attestation;
 mod config;
 mod env_diagnostics;
 mod env_var_docs;
@@ -39,6 +45,12 @@ pub use auth::{
 };
 pub use bind_guard::{
     BindAddressClass, classify_bind_address, guard_optional_serving_bind, guard_serving_bind,
+};
+pub use canonical_fence_attestation::{
+    CanonicalFenceConvergence, CanonicalFenceConvergenceError, CanonicalFenceConvergencePolicy,
+    CanonicalFenceDivergence, CanonicalFenceLag, CanonicalFenceProbe, CanonicalFenceRelation,
+    WriterAttestation, classify_canonical_writer_fence, converge_on_canonical_writer_fence,
+    expected_writer_fence, writer_attests_network_upgrade_schedule,
 };
 pub use config::{
     ConfigError, ConfigLoader, NetworkSection, NetworkToml, NodeAuthToml, NodeHealthToml, NodeToml,
@@ -63,8 +75,7 @@ pub use ops_endpoint::{
 };
 pub use readiness::{
     IngestPhase, NodeUnavailableDetail, Readiness, ReadinessCause, ReadinessReport, ReadinessState,
-    TrafficReadinessInterceptor, UpstreamHealth, UpstreamNotReadyDetail, WriterAttestation,
-    not_ready_status,
+    TrafficReadinessInterceptor, UpstreamHealth, UpstreamNotReadyDetail, not_ready_status,
 };
 pub use rpc_metrics::{RpcMetricNames, RpcOutcome, describe_rpc_metrics, record_rpc_request};
 pub use sections::{

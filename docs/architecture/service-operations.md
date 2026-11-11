@@ -57,6 +57,57 @@ secrets.
 
 ## Runtime-specific readiness
 
+### Canonical fence attestation
+
+Projector, native wallet query, and lightwalletd compatibility each read
+canonical storage through a process-owned RocksDB secondary. Before one of them
+uses that view, `CanonicalControl.WriterStatus` must attest it. All three use
+the same comparison and catch-up loop from `zinder-runtime`:
+
+- The view matches only when the writer reports the reader's network and every
+  fence field is equal: chain epoch, event sequence, visible tip height, visible
+  tip hash, visible block count, and canonical sequence digest.
+- The secondary is behind when the writer is strictly ahead in both event
+  sequence and chain epoch. The writer answers status reads in order with its
+  commits, so this is ordinary replication lag. The loop catches up again with
+  capped backoff until the runtime's deadline or attempt bound expires.
+- Any other difference is divergence: a missing fence, another network, a
+  secondary ahead of the writer, or a fence at the same event sequence that
+  differs in any field. Divergence fails on the round that observes it.
+
+Projector and native wallet query also require the secondary to carry the
+network-upgrade schedule revision the writer reports. A writer can admit a
+revision without moving its fence, so a matching fence with an older revision
+is retried like lag. Compatibility accepts the matching fence and opens its
+next generation with the schedule the writer reports.
+
+The runtimes differ in their bounds. Projector retries until
+`projector.fence_convergence_timeout_seconds`, starting at 50 ms and doubling
+to 1 s, and reports `syncing` once lag lasts longer than one second. Query and
+compatibility stop at their configured pair-convergence attempts or timeout,
+whichever comes first, and wait the smaller of the catch-up interval and
+100 ms between attempts.
+
+A parked writer and a writer that has not confirmed its tip since it reopened
+keep attesting their frozen fence, so convergence still succeeds. The
+projector keeps following that fence. Native wallet query and compatibility
+pass every attesting status through the shared `WriterAttestation` rules: a
+`reorg_window_exceeded` halt refuses traffic with `reorg_window_exceeded` and
+is remembered through writer-status outages until a valid status carries
+neither the halt nor `tip_unconfirmed`; `tip_unconfirmed` alone refuses
+traffic with `canonical_tip_unconfirmed`; and only a following writer with a
+confirmed tip earns the staleness allowance that admits a lagging reader.
+
+On refresh, a status from another network or without a fence fails as
+divergence first. A parked writer's halt is checked next, so a halt reported
+with a mismatched fence keeps the published pair refusing traffic with
+`reorg_window_exceeded` rather than failing the refresh as a fence mismatch:
+the halt is the cause an operator must resolve.
+
+The attestation reads only the writer-status response. It never handles the
+canonical checkpoint capability, which stays with the projector's checkpoint
+client.
+
 ### Ingest
 
 Ingest is ready when its canonical fence is within the configured source lag

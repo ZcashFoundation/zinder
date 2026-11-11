@@ -21,7 +21,8 @@ composition do not publish or start them.
 
 The services may share domain types from `zinder-core`, protocol definitions
 from `zinder-proto`, storage contracts from the owning storage crates, runtime
-configuration and operations support from `zinder-runtime`, and fixtures from
+configuration, operations support, and canonical secondary attestation against
+`CanonicalControl.WriterStatus` from `zinder-runtime`, and fixtures from
 `zinder-testkit`.
 
 They do not share mutable in-memory chain state or a writable RocksDB handle.

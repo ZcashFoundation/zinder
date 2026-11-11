@@ -19,11 +19,14 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, CanonicalBlockFactsSequenceDigest,
-    CanonicalBlockFactsSequenceDigestVersion, MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES,
-    Network,
+    CanonicalBlockFactsSequenceDigestVersion, ChainEpochId,
+    MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES, Network,
     wire::{decode_zinder_native_chain_name, encode_zinder_native_chain_name},
 };
-use zinder_proto::v1::ingest::{CanonicalWriterFence, CreateCanonicalOwnerCheckpointResponse};
+use zinder_proto::{
+    v1::ingest::{CanonicalWriterFence, CreateCanonicalOwnerCheckpointResponse},
+    wire::canonical_writer_fence_message,
+};
 use zinder_store::{
     CANONICAL_CONSTRUCTION_MANIFEST_FORMAT_VERSION, CANONICAL_STORE_IDENTITY,
     CANONICAL_STORE_SCHEMA_VERSION, CanonicalStoreWorkload, RawBlobRetention,
@@ -150,14 +153,12 @@ impl CanonicalCheckpointAdmissionEvidence {
     /// Exact visible canonical fence returned by the cold-admitted checkpoint.
     #[must_use]
     pub fn visible_fence(&self) -> CanonicalWriterFence {
-        CanonicalWriterFence {
-            chain_epoch_id: self.admission.visible_epoch,
-            event_sequence: self.admission.visible_event_sequence,
-            visible_tip_height: self.admission.visible_tip.height.value(),
-            visible_tip_hash: self.admission.visible_tip.hash.as_bytes().to_vec(),
-            canonical_sequence_digest: self.admission.visible_sequence_digest.as_bytes().to_vec(),
-            visible_block_count: self.admission.visible_block_count,
-        }
+        canonical_writer_fence_message(
+            ChainEpochId::new(self.admission.visible_epoch),
+            self.admission.visible_event_sequence,
+            self.admission.visible_tip,
+            self.admission.visible_sequence_digest,
+        )
     }
 
     /// Rejects a cold re-admission that differs from the original owner
@@ -2411,6 +2412,13 @@ mod tests {
         let admitted = CanonicalCheckpointAdmissionEvidence::try_from(response.clone())?;
         assert_eq!(admitted.candidate_id(), "bundle-a");
         assert_eq!(admitted.admission, sample_canonical_admission(7));
+        assert_eq!(
+            Some(admitted.visible_fence()),
+            response
+                .ready_evidence
+                .as_ref()
+                .and_then(|ready| ready.visible_fence.clone())
+        );
 
         assert_checkpoint_response_rejects_invalid_identity(&response);
         assert_checkpoint_response_rejects_invalid_build_plan(&response)?;
