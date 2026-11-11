@@ -1,6 +1,0 @@
-kind: fixed
-body: 'Explorer `/readyz` now reports `schema_mismatch` or `storage_unavailable` while its materialized-view catch-up fails, instead of staying ready. Ingest now stays `upstream_not_ready` until its Zebra health probe recovers; the follow loop no longer clears that cause, and `WriterStatus` reports the probe observation during construction and source recovery. When `[node.health]` is configured, ingest reports `starting` until the first successful probe instead of `ready`. Ingest, Explorer, and the Cipherscan adapter now report `shutting_down` as soon as termination is requested.'
-time: 2026-11-10T21:41:42Z
-custom:
-  Bump: patch
-  PR: "118"

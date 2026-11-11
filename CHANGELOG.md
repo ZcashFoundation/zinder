@@ -8,6 +8,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.8.0] - 2026-11-11
+
+### Removed
+
+- Ingest no longer accepts the configuration keys of its removed batch catch-up and tip-follow paths. Remove `ingest.construction.canonical_batch_max_blocks`, `canonical_batch_max_artifact_bytes`, `canonical_batch_max_estimated_write_bytes`, `canonical_batch_min_blocks_before_estimated_write_close`, `commit_reassembly_max_queued_artifact_bytes`, `flush_interval_epochs`, `ingest.run_overrides.allow_reorg_window_settlement`, and the ingest `storage.secondary_path` key, along with their `ZINDER_INGEST__*` environment variables, before upgrading: ingest refuses to start while any of them is set. The `zinder-ingest verify-canonical-replay` subcommand is removed; it could not open a canonical store written by the release ingest path. The storage benchmark drops its canonical-store range replay scenario and Compose profile, and the `ZinderStoreReadP95High` alert and its dashboard panel are removed because no release runtime emits the store read metrics they watched. Explorer methods that need canonical storage keep returning `FAILED_PRECONDITION` with `DEPENDENCY_NOT_CONFIGURED`, as they did before; the Cipherscan compatibility matrix now marks the routes that depend on them. ([#115](https://github.com/gustavovalverde/zinder/pull/115))
+
+### Fixed
+
+- Lightwalletd compatibility now refuses to start when its canonical secondary disagrees with the ingest writer fence on the visible block count, which it previously accepted. Native query now fails closed on a writer fence that diverges from its secondary instead of retrying it as replica lag until its attempts run out. Projector, native query, and lightwalletd compatibility now apply the same fence rules. ([#116](https://github.com/gustavovalverde/zinder/pull/116))
+- Wallet reads served by `zinder-query` and `zinder-compat-lightwalletd` now record `zinder_query_request_*` metrics. Before, only operations proxied through the native adapter produced samples, so the `ZinderWalletQueryP95High` alert and the overview dashboard missed most wallet traffic. Expect new samples for every wallet read, including reads the serving store cannot answer. ([#117](https://github.com/gustavovalverde/zinder/pull/117))
+- Explorer `/readyz` now reports `schema_mismatch` or `storage_unavailable` while its materialized-view catch-up fails, instead of staying ready. Ingest now stays `upstream_not_ready` until its Zebra health probe recovers; the follow loop no longer clears that cause, and `WriterStatus` reports the probe observation during construction and source recovery. When `[node.health]` is configured, ingest reports `starting` until the first successful probe instead of `ready`. Ingest, Explorer, and the Cipherscan adapter now report `shutting_down` as soon as termination is requested. ([#118](https://github.com/gustavovalverde/zinder/pull/118))
+- A materialized-view rebuild that resumes without chain-event cursors after a reorg now reverts rows from the replaced chain before rebuilding, instead of keeping them. The transparent address activity index and the address ranking undo journals now write the same bytes regardless of hash-map order or batch size, so replaying the same chain produces identical materialized-view stores. ([#119](https://github.com/gustavovalverde/zinder/pull/119))
+- Native `CompactBlocksInRange` and lightwalletd `GetBlockRange` now return `NOT_FOUND` with reason `ARTIFACT_UNAVAILABLE` for a range that reaches outside stored history, such as height 0 or a height below the retained floor, instead of `UNAVAILABLE`. A missing row inside retained history still reports a storage error, and `GetBlockRange` above the visible tip still returns `OUT_OF_RANGE`. ([#122](https://github.com/gustavovalverde/zinder/pull/122))
+- Subtree-root reads on a checkpointed store now return `NOT_FOUND` with reason `ARTIFACT_UNAVAILABLE` for a root that completed below the retained history and was never loaded, instead of `UNAVAILABLE`. A missing root the store loaded, including any root of a store built with the complete subtree-root prefix, still reports a storage error. ([#123](https://github.com/gustavovalverde/zinder/pull/123))
+
+
 ## [0.7.0] - 2026-11-10
 
 ### Added
