@@ -24,7 +24,7 @@ tonic.workspace = true
 tonic-prost.workspace = true
 tonic-types.workspace = true
 thiserror.workspace = true
-zinder-core = { version = "0.7.0", path = "../zinder-core", default-features = false }
+zinder-core = { version = "0.8.0", path = "../zinder-core", default-features = false }
 
 [package.metadata.cargo-machete]
 # The checked-in generated modules reference these crates directly.

@@ -1,6 +1,0 @@
-kind: fixed
-body: 'Lightwalletd compatibility now refuses to start when its canonical secondary disagrees with the ingest writer fence on the visible block count, which it previously accepted. Native query now fails closed on a writer fence that diverges from its secondary instead of retrying it as replica lag until its attempts run out. Projector, native query, and lightwalletd compatibility now apply the same fence rules.'
-time: 2026-11-10T21:41:42Z
-custom:
-  Bump: patch
-  PR: "116"

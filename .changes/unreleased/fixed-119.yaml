@@ -1,6 +1,0 @@
-kind: fixed
-body: 'A materialized-view rebuild that resumes without chain-event cursors after a reorg now reverts rows from the replaced chain before rebuilding, instead of keeping them. The transparent address activity index and the address ranking undo journals now write the same bytes regardless of hash-map order or batch size, so replaying the same chain produces identical materialized-view stores.'
-time: 2026-11-10T21:41:42Z
-custom:
-  Bump: patch
-  PR: "119"

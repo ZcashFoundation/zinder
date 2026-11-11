@@ -1,6 +1,0 @@
-kind: fixed
-body: 'Wallet reads served by `zinder-query` and `zinder-compat-lightwalletd` now record `zinder_query_request_*` metrics. Before, only operations proxied through the native adapter produced samples, so the `ZinderWalletQueryP95High` alert and the overview dashboard missed most wallet traffic. Expect new samples for every wallet read, including reads the serving store cannot answer.'
-time: 2026-11-10T21:41:42Z
-custom:
-  Bump: patch
-  PR: "117"
