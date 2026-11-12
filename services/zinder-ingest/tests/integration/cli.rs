@@ -141,6 +141,131 @@ fn print_config_accepts_zebra_cookie_auth() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn print_config_shows_indexer_tls_paths_from_the_environment() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("indexer-tls-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
+    let output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .env("ZINDER_NODE__INDEXER_GRPC_ADDR", "https://zakura:8230")
+        .env(
+            "ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH",
+            "/run/secrets/indexer-ca.pem",
+        )
+        .env(
+            "ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH",
+            "/run/secrets/indexer-client.pem",
+        )
+        .env(
+            "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH",
+            "/run/secrets/indexer-client.key",
+        )
+        .env("ZINDER_NODE__INDEXER_TLS__SERVER_NAME", "zakura.internal")
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("indexer_grpc_addr = \"https://zakura:8230\""));
+    assert!(stdout.contains("[node.indexer_tls]"));
+    assert!(stdout.contains("ca_cert_path = \"/run/secrets/indexer-ca.pem\""));
+    assert!(stdout.contains("client_cert_path = \"/run/secrets/indexer-client.pem\""));
+    assert!(stdout.contains("client_key_path = \"/run/secrets/indexer-client.key\""));
+    assert!(stdout.contains("server_name = \"zakura.internal\""));
+
+    Ok(())
+}
+
+#[test]
+fn print_config_rejects_indexer_tls_for_a_plaintext_indexer() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("plaintext-indexer-tls-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
+    let output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .env("ZINDER_NODE__INDEXER_GRPC_ADDR", "http://zakura:8230")
+        .env(
+            "ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH",
+            "/run/secrets/indexer-ca.pem",
+        )
+        .output()?;
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("node.indexer_tls requires an https:// node.indexer_grpc_addr"),
+        "{stderr}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn indexer_tls_pem_variable_names_the_images_that_accept_it() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("indexer-tls-pem-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
+    let output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .env(
+            "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM",
+            "-----BEGIN PRIVATE KEY-----\nkey-material-sentinel\n-----END PRIVATE KEY-----\n",
+        )
+        .output()?;
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("zinder-canonical-runtime"), "{stderr}");
+    assert!(stderr.contains("zinder-wallet-serving"), "{stderr}");
+    assert!(
+        stderr.contains("ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("key-material-sentinel"), "{stderr}");
+
+    Ok(())
+}
+
+#[test]
+fn startup_fails_before_connecting_when_the_indexer_ca_file_is_missing()
+-> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("missing-indexer-ca-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    let missing_ca_path = tempdir.path().join("missing-indexer-ca.pem");
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
+    let output = zinder_ingest_command()
+        .args(["--config", path_str(&config_path)?])
+        .env("ZINDER_OPS__LISTEN_ADDR", "")
+        .env("ZINDER_NODE__INDEXER_GRPC_ADDR", "https://127.0.0.1:1")
+        .env(
+            "ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH",
+            path_str(&missing_ca_path)?,
+        )
+        .output()?;
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("indexer TLS CA certificate file"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(path_str(&missing_ca_path)?), "{stderr}");
+    assert!(
+        !storage_path.exists(),
+        "startup opened storage before failing"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn print_config_renders_ingest_sub_sections() -> Result<(), Box<dyn Error>> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("ingest-print-store");

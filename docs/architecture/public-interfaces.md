@@ -222,8 +222,8 @@ validated before storage opens or listeners bind.
 
 Release configuration is grouped by owner:
 
-- `[network]`, `[node]`, `[node.auth]`, `[ops]`, and `[security]` are shared
-  sections;
+- `[network]`, `[node]`, `[node.auth]`, `[node.indexer_tls]`, `[ops]`, and
+  `[security]` are shared sections;
 - `[storage]`, `[ingest]`, `[ingest.construction]`, `[ingest.mempool]`,
   `[ingest.follow]`, `[ingest.run_overrides]`, `[retention]`, and
   `[ingest_control]` configure the canonical writer;
@@ -272,7 +272,11 @@ variable.
 | -------- | ------- | ----------- | ---------- | ----------- |
 | `ZINDER_NETWORK__NAME` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer, zinder-compat-cipherscan | Required | `network.name` | Network identifier: `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`. Note: live-test gating reads the bare `ZINDER_NETWORK` env var directly and never reaches the config loader, so test runbooks still quote that form. |
 | `ZINDER_NODE__JSON_RPC_ADDR` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Required | `node.json_rpc_addr` | Upstream Zebra JSON-RPC URL the service connects to. Optional for `zinder-explorer`: without it the upstream-observation probe stays off and `ExplorerFreshness.chain_view.upstream_tip` is always unset. |
-| `ZINDER_NODE__INDEXER_GRPC_ADDR` | zinder-ingest | Optional | `node.indexer_grpc_addr` | Optional Zebra indexer gRPC endpoint enabling the streaming mempool source. Falls back to JSON-RPC mempool polling when unset or empty. |
+| `ZINDER_NODE__INDEXER_GRPC_ADDR` | zinder-ingest | Optional | `node.indexer_grpc_addr` | Optional Zebra indexer gRPC endpoint enabling the streaming mempool source. Falls back to JSON-RPC mempool polling when unset or empty. An `https://` URL negotiates TLS, configured by the `ZINDER_NODE__INDEXER_TLS__*` variables; without them the node is verified against the system roots. |
+| `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH` | zinder-ingest | Optional | `node.indexer_tls.ca_cert_path` | PEM CA bundle that verifies the indexer's server certificate instead of the system roots. Requires an `https://` `ZINDER_NODE__INDEXER_GRPC_ADDR`. Read at startup and whenever an indexer stream reconnects. |
+| `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH` | zinder-ingest | When `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH is set` | `node.indexer_tls.client_cert_path` | PEM client certificate chain presented to an indexer that requires mutual TLS. Set together with `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH`. |
+| `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH` | zinder-ingest | When `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH is set` | `node.indexer_tls.client_key_path` | Path to the PEM private key for the indexer client certificate. The path is shown in `--print-config`; the key is read only when a channel is built. The `*_PEM` variables that the single-volume image entrypoints convert into these files are refused by the binaries. |
+| `ZINDER_NODE__INDEXER_TLS__SERVER_NAME` | zinder-ingest | Optional | `node.indexer_tls.server_name` | Name verified against the indexer's certificate when it differs from the host in `ZINDER_NODE__INDEXER_GRPC_ADDR`. |
 | `ZINDER_NODE__AUTH__METHOD` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.auth.method` | Upstream-node auth shape: `basic`, `cookie`, or unset for no auth. |
 | `ZINDER_NODE__AUTH__USERNAME` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `ZINDER_NODE__AUTH__METHOD=basic` | `node.auth.username` | Basic-auth username. Paired with `ZINDER_NODE__AUTH__PASSWORD`. |
 | `ZINDER_NODE__AUTH__PASSWORD` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `ZINDER_NODE__AUTH__METHOD=basic` | `node.auth.password` | Basic-auth password. Redacted in `--print-config` and structured logs. (sensitive; redacted) |
