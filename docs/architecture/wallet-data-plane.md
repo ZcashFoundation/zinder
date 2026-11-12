@@ -618,8 +618,15 @@ the pair's epoch. A pin naming any other epoch fails with
 wallet read does; the query never combines families from two epochs. The
 projector moves an output into the spent family in the transition that mines
 its spend and moves it back only when a reorg reverts that block, so an
-outpoint is in at most one family. The projection holds complete transparent
-history from height 1, which makes `not_found` a proven absence.
+outpoint is in at most one family.
+
+The projection covers exactly the canonical history the pair retains, so
+`not_found` is a proven absence only on a store whose history starts at height
+1, as a wallet-serving store's does. On a store whose history starts after a
+checkpoint, a request that misses any outpoint fails with
+`FAILED_PRECONDITION` and `CANONICAL_HISTORY_UNAVAILABLE`, carrying
+`metadata["first_available_height"]`, as a transaction lookup does. A request
+whose outpoints are all found still answers there.
 
 A request with no outpoints or more than 1,024 fails with `INVALID_ARGUMENT`
 and `TRANSPARENT_OUTPOINT_COUNT_OUT_OF_RANGE` before any storage read.

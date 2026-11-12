@@ -1320,7 +1320,8 @@ message TransparentOutpointSpendStatusEntry {
     // A mined transaction spends the output.
     TransparentOutpointSpentBy spent_by = 3;
 
-    // No mined transaction created an output at this outpoint.
+    // No mined transaction created an output at this outpoint, proven from
+    // height 1 through the epoch's visible tip.
     TransparentOutpointNotFound not_found = 4;
   }
 }
@@ -1530,8 +1531,10 @@ service WalletQuery {
       returns (stream TransparentAddressTxIdsChunk);
 
   // Return whether each transparent outpoint is unspent, spent (with the
-  // spending transaction, input index, and block), or unknown, all read at
-  // one chain epoch. Capability:
+  // spending transaction, input index, and block), or not found, all read at
+  // one chain epoch. A store whose history starts after a checkpoint cannot
+  // prove an outpoint absent, so a request that misses one fails with
+  // `FAILED_PRECONDITION` and `CANONICAL_HISTORY_UNAVAILABLE`. Capability:
   // `wallet.read.transparent_outpoint_spend_status_v1`.
   rpc TransparentOutpointSpendStatus(TransparentOutpointSpendStatusRequest)
       returns (TransparentOutpointSpendStatusResponse);

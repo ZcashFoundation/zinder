@@ -209,6 +209,10 @@ pub const MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST: usize = 1_024;
 /// The status covers mined transactions only, from height 1 through the
 /// epoch's visible tip. A spend that is still in the mempool leaves the output
 /// [`Self::Unspent`].
+///
+/// The three variants partition every outpoint, so the enum is exhaustive and
+/// a caller's `match` must handle each one. An indexer that cannot prove an
+/// absence returns an error instead of a status.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransparentOutpointSpendStatus {
     /// A mined transaction created the output, and no mined transaction

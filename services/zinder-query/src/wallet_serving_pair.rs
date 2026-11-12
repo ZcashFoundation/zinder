@@ -4,10 +4,10 @@ use std::{fmt, io, num::NonZeroU16, sync::Arc};
 
 use thiserror::Error;
 use zinder_core::{
-    BlockBlobArtifact, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId, ChainEpoch,
-    CommitmentTreeCheckpoint, CompactBlockArtifact, Network, SubtreeRootArtifact, SubtreeRootRange,
-    TransactionBlobArtifact, TransactionId, TransactionLocation, TransparentAddressScriptHash,
-    TransparentOutPoint,
+    BlockBlobArtifact, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
+    CanonicalHistoryBounds, ChainEpoch, CommitmentTreeCheckpoint, CompactBlockArtifact, Network,
+    SubtreeRootArtifact, SubtreeRootRange, TransactionBlobArtifact, TransactionId,
+    TransactionLocation, TransparentAddressScriptHash, TransparentOutPoint,
 };
 use zinder_store::{
     BlockHashLookup, CanonicalActivationSchedule, CanonicalEventFence, CanonicalStoreError,
@@ -43,6 +43,9 @@ pub trait CanonicalReader: Send + Sync + 'static {
 
     /// Returns the exact admitted canonical event fence.
     fn event_fence(&self) -> CanonicalEventFence;
+
+    /// Returns the intentionally retained canonical history range.
+    fn history_bounds(&self) -> CanonicalHistoryBounds;
 
     /// Reads the visible chain epoch at the admitted fence.
     fn chain_epoch(&self) -> Result<ChainEpoch, CanonicalStoreError>;
@@ -256,6 +259,10 @@ macro_rules! impl_canonical_read {
 
             fn event_fence(&self) -> CanonicalEventFence {
                 self.event_fence()
+            }
+
+            fn history_bounds(&self) -> CanonicalHistoryBounds {
+                self.history_bounds()
             }
 
             fn chain_epoch(&self) -> Result<ChainEpoch, CanonicalStoreError> {

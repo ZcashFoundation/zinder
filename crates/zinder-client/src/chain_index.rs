@@ -589,10 +589,16 @@ impl<'a, I: ChainIndex + ?Sized> ChainSnapshot<'a, I> {
     /// into requests of at most
     /// [`MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST`](zinder_core::MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST)
     /// outpoints, all pinned to this snapshot's epoch, and an empty slice
-    /// returns no statuses without a network call. When the server no longer
-    /// serves the captured epoch, the call fails with
-    /// [`IndexerError::ChainEpochPinUnavailable`]; capture a new snapshot and
-    /// ask again.
+    /// returns no statuses without a network call.
+    ///
+    /// [`TransparentOutpointSpendStatus::NotFound`] is a proven absence from
+    /// height 1 through the visible tip. Other outcomes are errors:
+    ///
+    /// - [`IndexerError::ChainEpochPinUnavailable`]: the server no longer
+    ///   serves the captured epoch. Capture a new snapshot and ask again.
+    /// - [`IndexerError::CanonicalHistoryUnavailable`]: the indexer's history
+    ///   starts after a checkpoint and a requested outpoint is not in it, so
+    ///   the indexer cannot prove the outpoint absent.
     ///
     /// # Examples
     ///
@@ -830,6 +836,13 @@ impl<I: ChainIndex + ?Sized> OwnedChainSnapshot<I> {
 /// to the visible chain epoch at call time; `Some(id)` pins the read to that
 /// epoch. Address history uses the field as an expected response epoch and
 /// fails when the mandatory stream header names another epoch.
+///
+/// A batch read that reports its epoch, such as
+/// [`ChainIndex::transparent_outpoint_spend_status`], needs at least one
+/// item and fails with [`IndexerError::InvalidRequest`] on an empty batch.
+/// Code that forwards caller slices should use the [`ChainSnapshot`] form,
+/// which already holds its epoch and answers an empty batch with an empty
+/// result.
 ///
 /// All trait methods take and return `zinder-core` types; generated
 /// `zinder_proto::*` types appear only in adapter modules, never on this
@@ -1251,7 +1264,9 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// [`MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST`](zinder_core::MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST)
     /// and pin every later request to the first response's epoch. An empty
     /// slice fails with [`IndexerError::InvalidRequest`], because the
-    /// response must name the epoch it was read at.
+    /// response must name the epoch it was read at; the snapshot form returns
+    /// an empty result at its epoch instead. The other errors match the
+    /// snapshot form.
     ///
     /// # Examples
     ///

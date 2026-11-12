@@ -170,7 +170,9 @@ endpoints carry no materialized-view identity.
   `TransparentOutpointSpendStatuses`: the `ChainEpoch` it read and one
   `TransparentOutpointSpendStatus` per requested outpoint, in request order.
   Each status is `Unspent`, `SpentBy { transaction_id, input_index, block }`,
-  or `NotFound`. The client splits slices longer than
+  or `NotFound`. `NotFound` is a proven absence; an indexer whose history
+  starts after a checkpoint answers a miss with
+  `IndexerError::CanonicalHistoryUnavailable` instead. The client splits slices longer than
   `MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST` (1,024) into requests pinned to one
   epoch, so callers never meet the wire cap; see
   [Wallet data plane §Transparent Outpoint Spend Status](wallet-data-plane.md#transparent-outpoint-spend-status).
@@ -199,7 +201,7 @@ Important current reasons include:
 | `REORG_WINDOW_EXCEEDED` | Replacement crosses the configured reorg policy |
 | `BLOCK_NOT_IN_BEST_CHAIN` | Requested block is not visible in the admitted epoch |
 | `TRANSACTION_NOT_FOUND` | Proven transaction absence; the only `NOT_FOUND` reason that is an answer rather than a failure |
-| `CANONICAL_HISTORY_UNAVAILABLE` | Store history starts after a checkpoint, so a transaction absence cannot be proven |
+| `CANONICAL_HISTORY_UNAVAILABLE` | Store history starts after a checkpoint, so a transaction or transparent outpoint absence cannot be proven |
 | `MATERIALIZED_VIEW_UNAVAILABLE` | Required materialized view is not configured or admitted |
 | `ENDPOINT_CAPABILITY_UNAVAILABLE` | The admitted endpoint does not structurally implement the requested operation |
 | `DEPENDENCY_NOT_CONFIGURED` | A required federated dependency is absent |

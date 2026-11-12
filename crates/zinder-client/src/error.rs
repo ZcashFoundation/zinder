@@ -127,14 +127,15 @@ pub enum IndexerError {
     },
 
     /// The indexer's retained canonical history starts after a checkpoint,
-    /// so it cannot prove that a transaction is absent.
+    /// so it cannot prove that a transaction or transparent outpoint is
+    /// absent.
     ///
-    /// Waiting does not clear it: the transaction may be mined at a height
-    /// below `first_available_height`, which this indexer never stored. Query
-    /// an indexer that retains complete history before judging the
-    /// transaction.
+    /// Waiting does not clear it: the transaction, or the transaction that
+    /// created the outpoint, may be mined at a height below
+    /// `first_available_height`, which this indexer never stored. Query an
+    /// indexer that retains complete history before judging it.
     #[error(
-        "indexer history starts at height {}; transaction absence cannot be proven",
+        "indexer history starts at height {}; absence cannot be proven",
         first_available_height.value()
     )]
     CanonicalHistoryUnavailable {

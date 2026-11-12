@@ -33,8 +33,8 @@ use crate::common::{native_serving_query_over, serving_query_from, serving_query
 
 const SCRIPT_PUB_KEY: &[u8] = &[0x51];
 
-/// Outputs created in block 1 and the block-2 transaction that spends two of
-/// them, at input indexes 0 and 1.
+/// Outputs created in one block and the next block's transaction that spends
+/// two of them, at input indexes 0 and 1.
 struct SpendChain {
     chain: ChainFixture,
     unspent: TransparentOutPoint,
@@ -46,15 +46,22 @@ struct SpendChain {
 }
 
 fn spend_chain() -> eyre::Result<SpendChain> {
-    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    spend_chain_created_at(BlockHeight::new(1))
+}
+
+fn spend_chain_created_at(creation_height: BlockHeight) -> eyre::Result<SpendChain> {
+    let spend_height = creation_height
+        .next()
+        .ok_or_else(|| eyre!("the creation height must have a successor"))?;
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(spend_height.value());
     let block_one = chain
-        .block_at(BlockHeight::new(1))
+        .block_at(creation_height)
         .cloned()
-        .ok_or_else(|| eyre!("fixture must contain height 1"))?;
+        .ok_or_else(|| eyre!("fixture must contain the creation height"))?;
     let block_two = chain
-        .block_at(BlockHeight::new(2))
+        .block_at(spend_height)
         .cloned()
-        .ok_or_else(|| eyre!("fixture must contain height 2"))?;
+        .ok_or_else(|| eyre!("fixture must contain the spend height"))?;
     let address = TransparentAddressScriptHash::of_script_pub_key(SCRIPT_PUB_KEY);
     let creator = TransactionId::from_bytes([0x10; 32]);
     let spender = TransactionId::from_bytes([0x20; 32]);
@@ -280,6 +287,54 @@ async fn reorg_that_drops_the_spending_block_reports_the_outputs_again_unspent()
         stale_pin,
         Err(QueryError::ChainEpochPinUnavailable { .. })
     ));
+    Ok(())
+}
+
+/// A store whose history starts after a checkpoint confirms the outputs it
+/// retains but cannot prove that an outpoint was never created.
+#[tokio::test]
+async fn miss_on_checkpointed_history_reports_history_unavailable() -> eyre::Result<()> {
+    let first_retained_height = BlockHeight::new(2);
+    let spend_chain = spend_chain_created_at(first_retained_height)?;
+    let writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&spend_chain.chain).with_history_floor(BlockHeight::new(1)),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let (wallet_query, _store_fixture) = serving_query_from(writer.into_serving_store_fixture()?)?;
+    let visible_epoch = wallet_query.visible_tip_block(None).await?.chain_epoch;
+    let never_created = TransparentOutPoint::new(TransactionId::from_bytes([0x99; 32]), 0);
+
+    for at_epoch_id in [None, Some(visible_epoch.id)] {
+        let retained = wallet_query
+            .transparent_outpoint_spend_status(
+                vec![spend_chain.unspent, spend_chain.spent_by_input_zero],
+                at_epoch_id,
+            )
+            .await?;
+        assert_eq!(
+            retained.statuses,
+            vec![
+                TransparentOutpointSpendStatus::Unspent,
+                spent_by(&spend_chain, 0),
+            ]
+        );
+
+        let outcome = wallet_query
+            .transparent_outpoint_spend_status(
+                vec![spend_chain.unspent, never_created],
+                at_epoch_id,
+            )
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                Err(QueryError::CanonicalHistoryUnavailable {
+                    first_available_height
+                }) if first_available_height == first_retained_height
+            ),
+            "expected the history floor for pin {at_epoch_id:?}, got {outcome:?}"
+        );
+    }
     Ok(())
 }
 

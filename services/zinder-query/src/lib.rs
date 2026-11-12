@@ -217,7 +217,9 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     /// Rejects an empty list and any list above
     /// [`zinder_core::MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST`] with
     /// [`QueryError::TransparentOutpointCountOutOfRange`] before reading
-    /// storage.
+    /// storage. `NotFound` is a proven absence from height 1 through the
+    /// visible tip; a store whose history starts after a checkpoint answers a
+    /// miss with [`QueryError::CanonicalHistoryUnavailable`] instead.
     async fn transparent_outpoint_spend_status(
         &self,
         outpoints: Vec<TransparentOutPoint>,
@@ -872,9 +874,10 @@ pub enum QueryError {
     },
 
     /// The store's retained canonical history starts after a checkpoint, so a
-    /// transaction lookup that missed cannot prove the transaction absent.
+    /// transaction or transparent outpoint lookup that missed cannot prove
+    /// its subject absent.
     #[error(
-        "canonical history starts at height {}; transaction absence cannot be proven",
+        "canonical history starts at height {}; absence cannot be proven",
         .first_available_height.value()
     )]
     CanonicalHistoryUnavailable {

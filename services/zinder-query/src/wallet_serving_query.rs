@@ -13,12 +13,12 @@ use tokio::sync::mpsc;
 use tracing::Instrument as _;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
-    CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestVersion, ChainEpoch,
-    ChainEpochId, ChainValuePoolsAtTip, MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST, MinedTransaction,
-    MinedTransactionChainContext, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
-    TransactionId, TransparentAddressBalance, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentOutpointSpendStatus,
-    TransparentUnspentOutput, TxStatus,
+    CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestVersion,
+    CanonicalHistoryBounds, ChainEpoch, ChainEpochId, ChainValuePoolsAtTip,
+    MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST, MinedTransaction, MinedTransactionChainContext,
+    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, TransactionId,
+    TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    TransparentOutPoint, TransparentOutpointSpendStatus, TransparentUnspentOutput, TxStatus,
 };
 use zinder_proto::capabilities::{
     WALLET_BROADCAST_TRANSACTION_V1, WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
@@ -1039,9 +1039,10 @@ where
                 // canonical epoch, so both output families answer at that
                 // epoch; a pin naming another epoch fails here instead.
                 let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                let history_bounds = pair.canonical().history_bounds();
                 let statuses = outpoints
                     .into_iter()
-                    .map(|outpoint| outpoint_spend_status(pair.wallet(), outpoint))
+                    .map(|outpoint| outpoint_spend_status(pair.wallet(), history_bounds, outpoint))
                     .collect::<Result<_, _>>()?;
                 Ok(TransparentOutpointSpendStatuses {
                     chain_epoch,
@@ -1378,21 +1379,30 @@ async fn forward_serving_pair_full_block_sub_range(
 /// The projection moves an output from the unspent family to the spent family
 /// in the transition that mines its spend, and back only when a reorg reverts
 /// that spend, so an outpoint is never in both families.
+///
+/// The projection covers exactly the canonical history the pair retains, so a
+/// miss proves absence only when that history starts at height 1.
 fn outpoint_spend_status(
     wallet: &dyn WalletProjectionReader,
+    history_bounds: CanonicalHistoryBounds,
     outpoint: TransparentOutPoint,
 ) -> Result<TransparentOutpointSpendStatus, QueryError> {
     if wallet.find_unspent_output(outpoint)?.is_some() {
         return Ok(TransparentOutpointSpendStatus::Unspent);
     }
-    Ok(wallet.find_spent_output(outpoint)?.map_or(
-        TransparentOutpointSpendStatus::NotFound,
-        |spent| TransparentOutpointSpendStatus::SpentBy {
+    if let Some(spent) = wallet.find_spent_output(outpoint)? {
+        return Ok(TransparentOutpointSpendStatus::SpentBy {
             transaction_id: spent.spent_at.transaction_id,
             input_index: spent.input_index,
             block: spent.spent_at.block,
-        },
-    ))
+        });
+    }
+    if history_bounds.intentionally_excludes(BlockHeight::new(1)) {
+        return Err(QueryError::CanonicalHistoryUnavailable {
+            first_available_height: history_bounds.first_available_height(),
+        });
+    }
+    Ok(TransparentOutpointSpendStatus::NotFound)
 }
 
 fn unavailable(capability: &'static str) -> QueryError {

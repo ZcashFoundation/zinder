@@ -85,7 +85,7 @@ The request shape is valid but the deployment is in a state that cannot serve it
 | `DEPENDENCY_NOT_CONFIGURED` | A federated dependency the explorer request needs (the canonical store, a materialized view, or a wallet-query endpoint) is not wired on this deployment | — |
 | `NODE_CAPABILITY_MISSING` | The upstream Zcash node does not advertise a capability the request requires; the operator must reconfigure the node | — |
 | `EXPLORER_PRECONDITION_UNSATISFIED` | An explorer read cannot serve the requested transaction state | — |
-| `CANONICAL_HISTORY_UNAVAILABLE` | The store's retained canonical history starts after a checkpoint, so a transaction lookup that missed cannot prove an absence; query a store with complete history. An unpinned lookup returns it only after the live mempool also missed, so a pending transaction is still reported | `ErrorInfo.metadata["first_available_height"]` |
+| `CANONICAL_HISTORY_UNAVAILABLE` | The store's retained canonical history starts after a checkpoint, so a transaction lookup or a `TransparentOutpointSpendStatus` request that missed cannot prove an absence; query a store with complete history. An unpinned transaction lookup returns it only after the live mempool also missed, so a pending transaction is still reported | `ErrorInfo.metadata["first_available_height"]` |
 
 ### `NOT_FOUND` family
 

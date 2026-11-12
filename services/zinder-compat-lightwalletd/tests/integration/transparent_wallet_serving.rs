@@ -799,6 +799,10 @@ impl CanonicalReader for MissingTransactionBlobCanonicalReader {
         self.canonical_reader.event_fence()
     }
 
+    fn history_bounds(&self) -> zinder_core::CanonicalHistoryBounds {
+        self.canonical_reader.history_bounds()
+    }
+
     fn chain_epoch(&self) -> Result<zinder_core::ChainEpoch, CanonicalStoreError> {
         self.canonical_reader.chain_epoch()
     }

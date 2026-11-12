@@ -1392,7 +1392,8 @@ pub mod transparent_outpoint_spend_status_entry {
         /// A mined transaction spends the output.
         #[prost(message, tag = "3")]
         SpentBy(super::TransparentOutpointSpentBy),
-        /// No mined transaction created an output at this outpoint.
+        /// No mined transaction created an output at this outpoint, proven from
+        /// height 1 through the epoch's visible tip.
         #[prost(message, tag = "4")]
         NotFound(super::TransparentOutpointNotFound),
     }
@@ -2357,8 +2358,10 @@ pub mod wallet_query_client {
             self.inner.server_streaming(req, path, codec).await
         }
         /// Return whether each transparent outpoint is unspent, spent (with the
-        /// spending transaction, input index, and block), or unknown, all read at
-        /// one chain epoch. Capability:
+        /// spending transaction, input index, and block), or not found, all read at
+        /// one chain epoch. A store whose history starts after a checkpoint cannot
+        /// prove an outpoint absent, so a request that misses one fails with
+        /// `FAILED_PRECONDITION` and `CANONICAL_HISTORY_UNAVAILABLE`. Capability:
         /// `wallet.read.transparent_outpoint_spend_status_v1`.
         pub async fn transparent_outpoint_spend_status(
             &mut self,
@@ -2703,8 +2706,10 @@ pub mod wallet_query_server {
             tonic::Status,
         >;
         /// Return whether each transparent outpoint is unspent, spent (with the
-        /// spending transaction, input index, and block), or unknown, all read at
-        /// one chain epoch. Capability:
+        /// spending transaction, input index, and block), or not found, all read at
+        /// one chain epoch. A store whose history starts after a checkpoint cannot
+        /// prove an outpoint absent, so a request that misses one fails with
+        /// `FAILED_PRECONDITION` and `CANONICAL_HISTORY_UNAVAILABLE`. Capability:
         /// `wallet.read.transparent_outpoint_spend_status_v1`.
         async fn transparent_outpoint_spend_status(
             &self,

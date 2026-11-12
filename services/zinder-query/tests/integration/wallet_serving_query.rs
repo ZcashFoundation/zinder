@@ -226,6 +226,10 @@ impl CanonicalReader for GatedCanonicalReader {
         self.canonical_reader.event_fence()
     }
 
+    fn history_bounds(&self) -> zinder_core::CanonicalHistoryBounds {
+        self.canonical_reader.history_bounds()
+    }
+
     fn chain_epoch(&self) -> Result<ChainEpoch, CanonicalStoreError> {
         self.reactor_gate.wait_for_reactor_progress();
         self.read_span_probe.observe();

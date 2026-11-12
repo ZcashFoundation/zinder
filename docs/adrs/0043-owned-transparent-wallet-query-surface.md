@@ -90,6 +90,12 @@ spent output without its spender, a state Zallet's contract still models as
 `SpentSpenderUnknown` for other backends. Wallet serving therefore needs no
 Explorer view and no new storage.
 
+The projection covers exactly the canonical history the pair retains, so
+`not_found` is a proven absence only on a store whose history starts at height
+1. On a store whose history starts after a checkpoint, a request that misses
+any outpoint fails with `CANONICAL_HISTORY_UNAVAILABLE`, as a transaction
+lookup does under [ADR-0042](0042-proven-transaction-absence.md).
+
 One batch method replaces the two removed outpoint methods. Zallet's earlier
 backend probed the unspent set for each outpoint and, on a miss, looked up
 the spender, which cost two round trips and two capabilities for one
