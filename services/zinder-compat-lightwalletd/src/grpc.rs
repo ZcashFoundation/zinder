@@ -1221,7 +1221,14 @@ fn prune_compact_block(
     compact_block
 }
 
-fn compact_transaction_has_payload(transaction: &lightwalletd::CompactTx) -> bool {
+/// Returns whether a pruned compact transaction still carries wallet-relevant
+/// data.
+///
+/// Both serving planes drop transactions that this rejects, as lightwalletd
+/// does, and keep the original `CompactTx.index` of the transactions that
+/// remain.
+#[must_use]
+pub fn compact_transaction_has_payload(transaction: &lightwalletd::CompactTx) -> bool {
     !transaction.spends.is_empty()
         || !transaction.outputs.is_empty()
         || !transaction.actions.is_empty()

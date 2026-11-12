@@ -11,6 +11,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
+use zinder_compat_lightwalletd::compact_transaction_has_payload;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, CompactBlockArtifact, CompactTransaction,
     CompactTransactionData, Network, NetworkUpgradeActivations,
@@ -1072,6 +1073,10 @@ fn prune_pool_types(
             transaction.vout.clear();
         }
     }
+    // lightwalletd omits a transaction left with no payload, such as a
+    // transparent-only coinbase under the default shielded selection. The
+    // remaining transactions keep their original block positions.
+    block.vtx.retain(compact_transaction_has_payload);
     block
 }
 
@@ -1572,6 +1577,91 @@ mod tests {
             return;
         };
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    fn transparent_only_transaction(index: u64) -> lightwalletd::CompactTx {
+        lightwalletd::CompactTx {
+            index,
+            vin: vec![lightwalletd::CompactTxIn {
+                prevout_txid: vec![0; 32],
+                prevout_index: u32::MAX,
+            }],
+            vout: vec![lightwalletd::TxOut {
+                value: 625_000_000,
+                script_pub_key: vec![0x76, 0xa9],
+            }],
+            ..lightwalletd::CompactTx::default()
+        }
+    }
+
+    fn sapling_transaction(index: u64) -> lightwalletd::CompactTx {
+        lightwalletd::CompactTx {
+            index,
+            spends: vec![lightwalletd::CompactSaplingSpend { nf: vec![7; 32] }],
+            ..lightwalletd::CompactTx::default()
+        }
+    }
+
+    fn block_with_transactions(vtx: Vec<lightwalletd::CompactTx>) -> lightwalletd::CompactBlock {
+        lightwalletd::CompactBlock {
+            height: 139,
+            vtx,
+            ..lightwalletd::CompactBlock::default()
+        }
+    }
+
+    #[test]
+    fn default_selection_drops_transparent_only_transactions_and_keeps_indexes() {
+        let block = block_with_transactions(vec![
+            transparent_only_transaction(0),
+            sapling_transaction(1),
+            transparent_only_transaction(2),
+            sapling_transaction(3),
+        ]);
+
+        let pruned = super::prune_pool_types(
+            block,
+            PoolSelection {
+                sapling: true,
+                orchard: true,
+                ironwood: true,
+                transparent: false,
+            },
+        );
+
+        let indexes: Vec<u64> = pruned
+            .vtx
+            .iter()
+            .map(|transaction| transaction.index)
+            .collect();
+        assert_eq!(indexes, vec![1, 3]);
+    }
+
+    #[test]
+    fn transparent_selection_keeps_transparent_only_transactions() {
+        let block = block_with_transactions(vec![
+            transparent_only_transaction(0),
+            sapling_transaction(1),
+        ]);
+
+        let pruned = super::prune_pool_types(
+            block,
+            PoolSelection {
+                sapling: false,
+                orchard: false,
+                ironwood: false,
+                transparent: true,
+            },
+        );
+
+        let indexes: Vec<u64> = pruned
+            .vtx
+            .iter()
+            .map(|transaction| transaction.index)
+            .collect();
+        assert_eq!(indexes, vec![0]);
+        assert!(pruned.vtx[0].spends.is_empty());
+        assert!(!pruned.vtx[0].vout.is_empty());
     }
 
     #[test]
@@ -2397,6 +2487,284 @@ mod tests {
             Ok(())
         } else {
             Err(mismatches.join("\n").into())
+        }
+    }
+
+    const RANGE_PARITY_TIP: u32 = 4;
+
+    fn range_parity_transaction_id(height: u32, index: u64) -> zinder_core::TransactionId {
+        let mut bytes = [0_u8; 32];
+        bytes[0] = u8::try_from(height).unwrap_or(u8::MAX);
+        bytes[1] = u8::try_from(index).unwrap_or(u8::MAX);
+        zinder_core::TransactionId::from_bytes(bytes)
+    }
+
+    fn range_parity_transparent_only(height: u32, index: u64) -> zinder_core::CompactTransaction {
+        zinder_core::CompactTransaction {
+            index,
+            transaction_id: range_parity_transaction_id(height, index),
+            data: zinder_core::CompactTransactionData {
+                transparent_outputs: vec![zinder_core::CompactTransparentOutput {
+                    value_zat: 625_000_000,
+                    script_pub_key: vec![0x76, 0xa9],
+                }],
+                ..zinder_core::CompactTransactionData::default()
+            },
+        }
+    }
+
+    fn range_parity_sapling(height: u32, index: u64) -> zinder_core::CompactTransaction {
+        zinder_core::CompactTransaction {
+            index,
+            transaction_id: range_parity_transaction_id(height, index),
+            data: zinder_core::CompactTransactionData {
+                sapling_spends: vec![zinder_core::CompactSaplingSpend {
+                    nullifier: [u8::try_from(index).unwrap_or(u8::MAX); 32],
+                }],
+                ..zinder_core::CompactTransactionData::default()
+            },
+        }
+    }
+
+    /// Builds a four-block regtest chain mixing transparent-only and shielded
+    /// transactions.
+    ///
+    /// The default shielded selection empties the transparent-only ones, so
+    /// the served range exercises transaction omission and position
+    /// preservation.
+    fn range_parity_adapter() -> Result<CompactBlockAdapter, Box<dyn std::error::Error>> {
+        let mut chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
+            .extend_blocks(RANGE_PARITY_TIP);
+        let transactions_by_height = [
+            vec![
+                range_parity_transparent_only(1, 0),
+                range_parity_sapling(1, 1),
+            ],
+            vec![range_parity_transparent_only(2, 0)],
+            vec![
+                range_parity_transparent_only(3, 0),
+                range_parity_sapling(3, 1),
+                range_parity_transparent_only(3, 2),
+                range_parity_sapling(3, 3),
+            ],
+            Vec::new(),
+        ];
+        for (offset, transactions) in transactions_by_height.into_iter().enumerate() {
+            let height = BlockHeight::new(1 + u32::try_from(offset)?);
+            let block = chain
+                .block_at(height)
+                .ok_or("fixture block missing")?
+                .clone();
+            let parent_hash = if height == BlockHeight::new(1) {
+                Network::ZcashRegtest.genesis_hash()
+            } else {
+                block.parent_hash
+            };
+            for transaction in &transactions {
+                let tx_index = u32::try_from(transaction.index)?;
+                let mut rows = zinder_testkit::FixtureTransactionRows::from_raw_transaction(
+                    transaction.transaction_id,
+                    block.height,
+                    block.hash,
+                    tx_index,
+                    format!("range-parity-{}-{tx_index}", block.height.value()).into_bytes(),
+                );
+                rows.facts.public_facts.counts = zinder_core::TransactionComponentCounts {
+                    sapling_spend_count: u32::try_from(transaction.data.sapling_spends.len())?,
+                    transparent_output_count: u32::try_from(
+                        transaction.data.transparent_outputs.len(),
+                    )?,
+                    ..zinder_core::TransactionComponentCounts::EMPTY
+                };
+                chain = chain.with_transaction_rows(rows);
+            }
+            chain = chain.with_compact_block_artifact(zinder_core::CompactBlockArtifact::new(
+                BlockId::new(block.height, block.hash),
+                parent_hash,
+                block.block_time_seconds,
+                transactions,
+                zinder_core::CompactChainMetadata {
+                    sapling_commitment_tree_size: 0,
+                    orchard_commitment_tree_size: 0,
+                    ironwood_commitment_tree_size: 0,
+                },
+            )?);
+        }
+        let activations = Arc::new(zinder_testkit::sample_regtest_upgrade_activations());
+        let mut fixture =
+            zinder_testkit::WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
+        let (canonical, wallet) = fixture.take_readers()?;
+        drop(wallet);
+        Ok(CompactBlockAdapter::new(
+            CompactBlockServingSlot::new(Arc::new(canonical)),
+            activations,
+        ))
+    }
+
+    async fn range_parity_blocks(
+        adapter: &CompactBlockAdapter,
+        start_height: u64,
+        end_height: u64,
+        pool_types: Vec<i32>,
+    ) -> Result<Vec<lightwalletd::CompactBlock>, Box<dyn std::error::Error>> {
+        let mut stream = adapter
+            .get_block_range(Request::new(lightwalletd::BlockRange {
+                start: Some(lightwalletd::BlockId {
+                    height: start_height,
+                    hash: Vec::new(),
+                }),
+                end: Some(lightwalletd::BlockId {
+                    height: end_height,
+                    hash: Vec::new(),
+                }),
+                pool_types,
+            }))
+            .await?
+            .into_inner();
+        let mut blocks = Vec::new();
+        while let Some(block) = stream.next().await {
+            blocks.push(block?);
+        }
+        Ok(blocks)
+    }
+
+    /// SHA-256 over the length-delimited protobuf encoding of each streamed
+    /// block, in stream order.
+    fn range_parity_digest(blocks: &[lightwalletd::CompactBlock]) -> String {
+        use sha2::Digest;
+
+        let mut hasher = sha2::Sha256::new();
+        for block in blocks {
+            hasher.update(block.encode_length_delimited_to_vec());
+        }
+        hex::encode(hasher.finalize())
+    }
+
+    fn transaction_indexes(block: &lightwalletd::CompactBlock) -> Vec<u64> {
+        block
+            .vtx
+            .iter()
+            .map(|transaction| transaction.index)
+            .collect()
+    }
+
+    /// `GetBlockRange` omits a transaction left without data by the requested
+    /// pools, as lightwalletd does, and keeps the others at their block
+    /// positions.
+    #[tokio::test]
+    async fn get_block_range_omits_empty_transactions_and_keeps_positions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let adapter = range_parity_adapter()?;
+
+        let shielded = range_parity_blocks(&adapter, 1, 4, Vec::new()).await?;
+        let shielded_indexes: Vec<Vec<u64>> = shielded.iter().map(transaction_indexes).collect();
+        assert_eq!(
+            shielded_indexes,
+            vec![vec![1], vec![], vec![1, 3], vec![]],
+            "default selection must drop transparent-only transactions",
+        );
+
+        let transparent = range_parity_blocks(
+            &adapter,
+            1,
+            4,
+            vec![lightwalletd::PoolType::Transparent as i32],
+        )
+        .await?;
+        let transparent_indexes: Vec<Vec<u64>> =
+            transparent.iter().map(transaction_indexes).collect();
+        assert_eq!(
+            transparent_indexes,
+            vec![vec![0], vec![0], vec![0, 2], vec![]],
+            "transparent selection must drop shielded-only transactions",
+        );
+        assert!(transparent.iter().all(|block| {
+            block
+                .vtx
+                .iter()
+                .all(|transaction| transaction.spends.is_empty() && !transaction.vout.is_empty())
+        }));
+        Ok(())
+    }
+
+    /// Pins the served fixture-range bytes so a serialization drift in
+    /// compact-blocks mode fails in CI. `GetBlock` keeps returning the stored
+    /// block unpruned.
+    #[tokio::test]
+    async fn fixture_range_digests_are_pinned() -> Result<(), Box<dyn std::error::Error>> {
+        let adapter = range_parity_adapter()?;
+
+        let ascending = range_parity_blocks(&adapter, 1, 4, Vec::new()).await?;
+        let descending = range_parity_blocks(&adapter, 4, 1, Vec::new()).await?;
+        let transparent = range_parity_blocks(
+            &adapter,
+            1,
+            4,
+            vec![lightwalletd::PoolType::Transparent as i32],
+        )
+        .await?;
+        let block = adapter
+            .get_block(Request::new(lightwalletd::BlockId {
+                height: 3,
+                hash: Vec::new(),
+            }))
+            .await?
+            .into_inner();
+
+        let mut reversed = descending.clone();
+        reversed.reverse();
+        assert_eq!(reversed, ascending, "descending must mirror ascending");
+
+        let observed = [
+            (
+                "GetBlockRange(1..=4) default pools",
+                range_parity_digest(&ascending),
+            ),
+            (
+                "GetBlockRange(4..=1) default pools",
+                range_parity_digest(&descending),
+            ),
+            (
+                "GetBlockRange(1..=4) transparent pool",
+                range_parity_digest(&transparent),
+            ),
+            (
+                "GetBlock(3)",
+                range_parity_digest(std::slice::from_ref(&block)),
+            ),
+        ];
+        let expected = [
+            (
+                "GetBlockRange(1..=4) default pools",
+                "514021d48b7907175a55f0893f937bfe86c8ee7938ded04ac634cd642cc625a0",
+            ),
+            (
+                "GetBlockRange(4..=1) default pools",
+                "cf28adb7cc30d9367fb72dfee527becab3721e5dd3df791edad289be258d24f6",
+            ),
+            (
+                "GetBlockRange(1..=4) transparent pool",
+                "aab7e6c1a14da6921f1cbdc6d2f7cfc5bdc0ef8b5ba25096c50224abd37cfbf6",
+            ),
+            (
+                "GetBlock(3)",
+                "05cf31daef177eb97af4ed6286fea37f325e4b0cbecc6378da5685ebed092b8d",
+            ),
+        ];
+        let drifted: Vec<String> = observed
+            .iter()
+            .zip(expected)
+            .filter(|((_, observed_digest), (_, expected_digest))| {
+                observed_digest != expected_digest
+            })
+            .map(|((label, observed_digest), (_, expected_digest))| {
+                format!("{label}: expected {expected_digest}, observed {observed_digest}")
+            })
+            .collect();
+        if drifted.is_empty() {
+            Ok(())
+        } else {
+            Err(drifted.join("\n").into())
         }
     }
 
