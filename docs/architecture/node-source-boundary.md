@@ -83,7 +83,7 @@ environment variables therefore include:
 ```text
 ZINDER_INGEST__SOURCE=zebra-json-rpc
 ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:8232
-ZINDER_NODE__INDEXER_GRPC_ADDR=http://127.0.0.1:8234
+ZINDER_NODE__INDEXER_GRPC_ADDR=http://127.0.0.1:8230
 ZINDER_NODE__AUTH__METHOD=cookie
 ZINDER_NODE__AUTH__PATH=/var/lib/zebra/.cookie
 ```
