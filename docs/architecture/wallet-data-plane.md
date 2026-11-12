@@ -440,7 +440,7 @@ projection serves the complete ascending set from the same immutable
 `WalletServingReadPair` as the canonical epoch header. The current query
 materializes that complete set before gRPC emission; end-to-end incremental
 delivery remains tracked in
-[#62](https://github.com/gustavovalverde/zinder/issues/62). Compatibility
+[#62](https://github.com/ZcashFoundation/zinder/issues/62). Compatibility
 runtimes own their separate lightwalletd admission and resource bounds.
 
 `TransparentAddressTxIdsInRange` streams `TransparentAddressTxIdsChunk`
