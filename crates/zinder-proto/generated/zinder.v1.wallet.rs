@@ -607,15 +607,30 @@ pub struct TransactionStatusResponse {
     #[prost(message, optional, tag = "2")]
     pub location: ::core::option::Option<TransactionLocation>,
 }
-/// Streamed compact block range chunk bound to one chain epoch.
+/// One message in the \[`CompactBlocksInRange`\] server stream.
+///
+/// The server sends exactly one `header` message first, then one `item`
+/// message per block in ascending height order, from `start_height` through
+/// `end_height`. The header carries the single chain epoch that answers the
+/// whole range; items carry no per-block epoch. A consumer reads the epoch once
+/// and binds every later block to it.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CompactBlocksInRangeChunk {
-    /// Cross-plane chain-state envelope for this chunk (ADR-0011, field tag 1).
-    #[prost(message, optional, tag = "1")]
-    pub chain_view: ::core::option::Option<ChainView>,
-    /// Compact block at the next requested height.
-    #[prost(message, optional, tag = "2")]
-    pub compact_block: ::core::option::Option<CompactBlock>,
+    #[prost(oneof = "compact_blocks_in_range_chunk::Body", tags = "1, 2")]
+    pub body: ::core::option::Option<compact_blocks_in_range_chunk::Body>,
+}
+/// Nested message and enum types in `CompactBlocksInRangeChunk`.
+pub mod compact_blocks_in_range_chunk {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Body {
+        /// Leading header carrying the chain epoch that answers the entire range
+        /// (ADR-0011). Sent once, before any item.
+        #[prost(message, tag = "1")]
+        Header(super::ChainView),
+        /// Compact block at the next requested height. Sent after the header.
+        #[prost(message, tag = "2")]
+        Item(super::CompactBlock),
+    }
 }
 /// Tree-state request for one exact block height.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -2200,7 +2215,8 @@ pub mod wallet_query_client {
                 .insert(GrpcMethod::new("zinder.v1.wallet.WalletQuery", "CompactBlock"));
             self.inner.unary(req, path, codec).await
         }
-        /// Stream compact blocks for an inclusive height range.
+        /// Stream compact blocks for an inclusive height range: one leading
+        /// `ChainView` header, then one compact block per height.
         pub async fn compact_blocks_in_range(
             &mut self,
             request: impl tonic::IntoRequest<super::CompactBlocksInRangeRequest>,
@@ -3006,7 +3022,8 @@ pub mod wallet_query_server {
             >
             + std::marker::Send
             + 'static;
-        /// Stream compact blocks for an inclusive height range.
+        /// Stream compact blocks for an inclusive height range: one leading
+        /// `ChainView` header, then one compact block per height.
         async fn compact_blocks_in_range(
             &self,
             request: tonic::Request<super::CompactBlocksInRangeRequest>,

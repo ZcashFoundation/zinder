@@ -271,14 +271,10 @@ async fn native_grpc_service_returns_wallet_reads_from_stored_artifacts() -> eyr
         1
     );
     assert_eq!(
-        grpc_responses
-            .compact_block_range
-            .first()
-            .ok_or_else(|| eyre!("missing compact block"))?
-            .compact_block
-            .as_ref()
-            .ok_or_else(|| eyre!("missing compact block"))?,
-        &zinder_proto::wire::compact_block_message(&expected_compact_block.compact_block)
+        grpc_responses.compact_block_range,
+        vec![zinder_proto::wire::compact_block_message(
+            &expected_compact_block.compact_block
+        )]
     );
     assert_eq!(grpc_responses.latest_tree_state_checkpoint.height, 1);
     assert_eq!(
@@ -1412,7 +1408,8 @@ async fn native_grpc_service_uses_query_owned_capabilities() -> eyre::Result<()>
 
 struct WalletGrpcResponses {
     visible_tip_block: wallet::VisibleTipBlockResponse,
-    compact_block_range: Vec<wallet::CompactBlocksInRangeChunk>,
+    compact_block_range_header: wallet::ChainView,
+    compact_block_range: Vec<wallet::CompactBlock>,
     latest_tree_state_checkpoint: wallet::TreeStateResponse,
     subtree_roots: wallet::SubtreeRootsResponse,
     network_upgrade_activations: wallet::NetworkUpgradeActivationsResponse,
@@ -1437,10 +1434,29 @@ async fn read_wallet_grpc_responses(
     )
     .await?
     .into_inner();
+    let mut compact_block_range_header = None;
     let mut compact_block_range = Vec::new();
     while let Some(compact_block_chunk) = compact_block_stream.next().await {
-        compact_block_range.push(compact_block_chunk?);
+        match (
+            compact_block_chunk?.body,
+            compact_block_range_header.is_some(),
+        ) {
+            (Some(wallet::compact_blocks_in_range_chunk::Body::Header(header)), false) => {
+                compact_block_range_header = Some(header);
+            }
+            (Some(wallet::compact_blocks_in_range_chunk::Body::Item(compact_block)), true) => {
+                compact_block_range.push(compact_block);
+            }
+            (body, _) => {
+                return Err(tonic::Status::internal(format!(
+                    "compact block range chunk out of order: {body:?}"
+                )));
+            }
+        }
     }
+    let compact_block_range_header = compact_block_range_header.ok_or_else(|| {
+        tonic::Status::internal("compact block range ended without its chain-view header")
+    })?;
     let latest_tree_state_checkpoint = WalletQueryService::latest_tree_state_checkpoint(
         grpc_adapter,
         Request::new(wallet::LatestTreeStateCheckpointRequest { at_epoch_id: None }),
@@ -1467,6 +1483,7 @@ async fn read_wallet_grpc_responses(
 
     Ok(WalletGrpcResponses {
         visible_tip_block,
+        compact_block_range_header,
         compact_block_range,
         latest_tree_state_checkpoint,
         subtree_roots,
@@ -1479,9 +1496,10 @@ fn assert_wallet_grpc_response_epochs(responses: &WalletGrpcResponses, chain_epo
         response_chain_epoch_id(&responses.visible_tip_block),
         chain_epoch_id
     );
-    for compact_block_chunk in &responses.compact_block_range {
-        assert_eq!(response_chain_epoch_id(compact_block_chunk), chain_epoch_id);
-    }
+    assert_eq!(
+        response_chain_epoch_id(&responses.compact_block_range_header),
+        chain_epoch_id
+    );
     assert_eq!(
         response_chain_epoch_id(&responses.latest_tree_state_checkpoint),
         chain_epoch_id
@@ -1504,11 +1522,9 @@ impl HasChainEpoch for wallet::VisibleTipBlockResponse {
     }
 }
 
-impl HasChainEpoch for wallet::CompactBlocksInRangeChunk {
+impl HasChainEpoch for wallet::ChainView {
     fn chain_epoch(&self) -> Option<&wallet::ChainEpoch> {
-        self.chain_view
-            .as_ref()
-            .and_then(|chain_view| chain_view.chain_epoch.as_ref())
+        self.chain_epoch.as_ref()
     }
 }
 

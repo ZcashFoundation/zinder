@@ -476,6 +476,27 @@ impl<'a, I: ChainIndex + ?Sized> ChainSnapshot<'a, I> {
     }
 
     /// Streams compact blocks from the captured canonical epoch.
+    ///
+    /// This is the wallet range-sync call: the blocks share the snapshot's
+    /// epoch with every other read on it. Stream errors follow
+    /// [`ChainIndex::compact_blocks_in_range`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{BlockHeight, BlockHeightRange, ChainIndex, IndexerError};
+    /// use tokio_stream::StreamExt as _;
+    ///
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let snapshot = client.snapshot().await?;
+    /// let range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(100));
+    /// let mut blocks = snapshot.compact_blocks_in_range(range).await?;
+    /// while let Some(block) = blocks.next().await {
+    ///     let block = block?;
+    ///     # let _ = block;
+    /// }
+    /// # Ok(()) }
+    /// ```
     pub async fn compact_blocks_in_range(
         &self,
         block_range: BlockHeightRange,
@@ -704,6 +725,8 @@ impl<I: ChainIndex + ?Sized> OwnedChainSnapshot<I> {
     }
 
     /// Streams compact blocks from the captured canonical epoch.
+    ///
+    /// Stream errors follow [`ChainIndex::compact_blocks_in_range`].
     pub async fn compact_blocks_in_range(
         &self,
         block_range: BlockHeightRange,
@@ -990,14 +1013,36 @@ pub trait ChainIndex: Send + Sync + 'static {
 
     /// Streams compact block artifacts for an inclusive range.
     ///
+    /// Every block comes from one chain epoch: `at_epoch_id` when present,
+    /// otherwise the epoch visible when the request is answered. Blocks
+    /// arrive in ascending height order, and a stream that yields no error
+    /// covers every requested height. A remote stream that violates this
+    /// contract, including a missing, late, or repeated chain-view header,
+    /// ends with [`IndexerError::MalformedResponse`]. The stream ends after
+    /// its first error.
+    ///
+    /// Wallets that combine the blocks with tree states or other reads
+    /// should stream through a [`ChainSnapshot`] so every read shares the
+    /// same epoch.
+    ///
     /// # Examples
     ///
     /// ```no_run
     /// # use zinder_client::{BlockHeight, BlockHeightRange, ChainIndex, IndexerError};
+    /// use tokio_stream::StreamExt as _;
+    ///
     /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let range = BlockHeightRange::inclusive(BlockHeight::new(0), BlockHeight::new(0));
-    /// let stream = client.compact_blocks_in_range(range, None).await?;
-    /// # let _ = stream; Ok(()) }
+    /// let chain_epoch = client.current_epoch().await?;
+    /// let range = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(100));
+    /// let mut blocks = client
+    ///     .compact_blocks_in_range(range, Some(chain_epoch.id))
+    ///     .await?;
+    /// while let Some(block) = blocks.next().await {
+    ///     let block = block?;
+    ///     // Scan `block` for wallet-relevant notes.
+    ///     # let _ = block;
+    /// }
+    /// # Ok(()) }
     /// ```
     async fn compact_blocks_in_range(
         &self,

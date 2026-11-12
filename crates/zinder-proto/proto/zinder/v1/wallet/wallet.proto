@@ -571,13 +571,22 @@ message TransactionStatusResponse {
   TransactionLocation location = 2;
 }
 
-// Streamed compact block range chunk bound to one chain epoch.
+// One message in the [`CompactBlocksInRange`] server stream.
+//
+// The server sends exactly one `header` message first, then one `item`
+// message per block in ascending height order, from `start_height` through
+// `end_height`. The header carries the single chain epoch that answers the
+// whole range; items carry no per-block epoch. A consumer reads the epoch once
+// and binds every later block to it.
 message CompactBlocksInRangeChunk {
-  // Cross-plane chain-state envelope for this chunk (ADR-0011, field tag 1).
-  ChainView chain_view = 1;
+  oneof body {
+    // Leading header carrying the chain epoch that answers the entire range
+    // (ADR-0011). Sent once, before any item.
+    ChainView header = 1;
 
-  // Compact block at the next requested height.
-  CompactBlock compact_block = 2;
+    // Compact block at the next requested height. Sent after the header.
+    CompactBlock item = 2;
+  }
 }
 
 // Tree-state request for one exact block height.
@@ -1672,7 +1681,8 @@ service WalletQuery {
   // Return one compact block at a given height.
   rpc CompactBlock(CompactBlockRequest) returns (CompactBlockResponse);
 
-  // Stream compact blocks for an inclusive height range.
+  // Stream compact blocks for an inclusive height range: one leading
+  // `ChainView` header, then one compact block per height.
   rpc CompactBlocksInRange(CompactBlocksInRangeRequest) returns (stream CompactBlocksInRangeChunk);
 
   // Return one full serialized block at a given height. Served from the

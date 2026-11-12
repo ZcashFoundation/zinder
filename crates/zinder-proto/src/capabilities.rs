@@ -30,6 +30,9 @@ pub const WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1: &str = "wallet.read.block_hea
 /// Capability advertised for `WalletQuery.CompactBlock`.
 pub const WALLET_READ_COMPACT_BLOCK_AT_V2: &str = "wallet.read.compact_block_at_v2";
 /// Capability advertised for `WalletQuery.CompactBlocksInRange`.
+///
+/// Since contract revision 7, the stream sends one leading `ChainView` header
+/// and then one bare compact block per requested height.
 pub const WALLET_READ_COMPACT_BLOCK_RANGE_V2: &str = "wallet.read.compact_block_range_v2";
 /// Field capability gating native `ironwood_actions` and
 /// `ironwood_commitment_tree_size` structured compact-block fields.

@@ -26,7 +26,7 @@ use zinder_proto::wire::{
 use zinder_source::transparent_address_matches_network;
 
 use crate::{
-    BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, FullBlock,
+    BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, CompactBlockRange, FullBlock,
     NativeWalletEndpointCapabilities, QueryError, SettledTipBlock, SubtreeRoots, TransactionStatus,
     TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
     TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest, TreeState,
@@ -507,6 +507,28 @@ pub fn build_transparent_address_tx_ids_chunk(
             },
         )),
     }
+}
+
+/// Encodes a compact block range as its `CompactBlocksInRange` stream: one
+/// leading `ChainView` header for the range's chain epoch, then one item per
+/// compact block in ascending height order.
+pub fn compact_blocks_in_range_chunks(
+    compact_block_range: CompactBlockRange,
+) -> impl Iterator<Item = wallet::CompactBlocksInRangeChunk> + Send + 'static {
+    let header = wallet::CompactBlocksInRangeChunk {
+        body: Some(wallet::compact_blocks_in_range_chunk::Body::Header(
+            build_chain_view_message(compact_block_range.chain_epoch),
+        )),
+    };
+    let items = compact_block_range
+        .compact_blocks
+        .into_iter()
+        .map(|compact_block| wallet::CompactBlocksInRangeChunk {
+            body: Some(wallet::compact_blocks_in_range_chunk::Body::Item(
+                build_compact_block_message(&compact_block),
+            )),
+        });
+    std::iter::once(header).chain(items)
 }
 
 /// Builds the leading header chunk carrying the chain epoch pinned for the

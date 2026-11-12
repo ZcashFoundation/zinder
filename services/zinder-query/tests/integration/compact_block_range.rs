@@ -10,17 +10,16 @@ use eyre::eyre;
 use prost::Message;
 use zinder_core::wire::{encode_rpc_block_hash_hex, encode_zinder_native_chain_name};
 use zinder_core::{
-    BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch, ChainEpochId,
-    CommitmentTreeFrontiers, CompactBlockArtifact, CompactChainMetadata,
-    MAX_SUBTREE_ROOTS_PER_REQUEST, Network, SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootHash,
-    SubtreeRootIndex, SubtreeRootRange,
+    BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpochId, CommitmentTreeFrontiers,
+    CompactBlockArtifact, CompactChainMetadata, MAX_SUBTREE_ROOTS_PER_REQUEST, Network,
+    SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
 };
 use zinder_proto::v1::wallet;
 use zinder_query::{
     ArtifactKey, DEFAULT_MAX_COMPACT_BLOCK_RANGE, QueryError, WalletQueryApi,
     WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
-    latest_tree_state_checkpoint_response, subtree_roots_response, tree_state_at_response,
-    visible_tip_block_response,
+    compact_blocks_in_range_chunks, latest_tree_state_checkpoint_response, subtree_roots_response,
+    tree_state_at_response, visible_tip_block_response,
 };
 use zinder_source::{SourceError, SourceTreeState};
 use zinder_store::{ArtifactFamily, CanonicalBuildSubtreeRoot, RawBlobRetention};
@@ -133,7 +132,7 @@ async fn tree_state_at_serves_visible_height_above_settled_tip_under_epoch_pin()
     clippy::too_many_lines,
     reason = "the test keeps the complete native compact-block wire shape in one assertion scope"
 )]
-async fn compact_block_range_chunk_uses_native_wallet_proto_shape() -> eyre::Result<()> {
+async fn compact_block_range_stream_sends_one_header_then_blocks() -> eyre::Result<()> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
     let (wallet_query, _store_fixture) = serving_query_over(&chain)?;
 
@@ -146,29 +145,39 @@ async fn compact_block_range_chunk_uses_native_wallet_proto_shape() -> eyre::Res
     let chain_epoch = compact_block_range.chain_epoch;
     let compact_block = compact_block_range
         .compact_blocks
-        .into_iter()
-        .next()
+        .first()
+        .cloned()
         .ok_or_else(|| eyre!("missing compact block"))?;
-    let chunk = compact_block_range_chunk(chain_epoch, &compact_block);
-    let encoded_chunk = chunk.encode_to_vec();
-    let decoded_chunk = wallet::CompactBlocksInRangeChunk::decode(encoded_chunk.as_slice())?;
-    let response_chain_epoch = decoded_chunk
-        .chain_view
+    let decoded_chunks = compact_blocks_in_range_chunks(compact_block_range)
+        .map(|chunk| wallet::CompactBlocksInRangeChunk::decode(chunk.encode_to_vec().as_slice()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let [header_chunk, item_chunk] = decoded_chunks.as_slice() else {
+        return Err(eyre!(
+            "expected one header and one block chunk, got {} chunks",
+            decoded_chunks.len()
+        ));
+    };
+    let Some(wallet::compact_blocks_in_range_chunk::Body::Header(header)) = &header_chunk.body
+    else {
+        return Err(eyre!("first chunk is not the chain-view header"));
+    };
+    let Some(wallet::compact_blocks_in_range_chunk::Body::Item(response_compact_block)) =
+        &item_chunk.body
+    else {
+        return Err(eyre!("second chunk is not a compact block"));
+    };
+    let response_chain_epoch = header
+        .chain_epoch
         .as_ref()
-        .and_then(|chain_view| chain_view.chain_epoch.as_ref())
-        .ok_or_else(|| eyre!("missing chunk chain epoch"))?;
+        .ok_or_else(|| eyre!("missing header chain epoch"))?;
     let response_visible_tip = response_chain_epoch
         .visible_tip
         .as_ref()
-        .ok_or_else(|| eyre!("missing chunk visible tip"))?;
+        .ok_or_else(|| eyre!("missing header visible tip"))?;
     let response_settled_tip = response_chain_epoch
         .settled_tip
         .as_ref()
-        .ok_or_else(|| eyre!("missing chunk settled tip"))?;
-    let response_compact_block = decoded_chunk
-        .compact_block
-        .as_ref()
-        .ok_or_else(|| eyre!("missing chunk compact block"))?;
+        .ok_or_else(|| eyre!("missing header settled tip"))?;
 
     assert_eq!(response_chain_epoch.chain_epoch_id, chain_epoch.id.value());
     assert_eq!(
@@ -753,39 +762,6 @@ async fn serving_pair_compact_range_outside_retained_history_is_artifact_unavail
         Ok(())
     } else {
         Err(eyre!(mismatches.join("\n")))
-    }
-}
-
-fn compact_block_range_chunk(
-    chain_epoch: ChainEpoch,
-    compact_block: &CompactBlockArtifact,
-) -> wallet::CompactBlocksInRangeChunk {
-    wallet::CompactBlocksInRangeChunk {
-        chain_view: Some(wallet::ChainView {
-            chain_epoch: Some(wallet::ChainEpoch {
-                chain_epoch_id: chain_epoch.id.value(),
-                network_name: encode_zinder_native_chain_name(chain_epoch.network).to_owned(),
-                artifact_schema_version: u32::from(chain_epoch.artifact_schema_version.value()),
-                created_at_millis: chain_epoch.created_at.value(),
-                visible_tip: Some(wallet::BlockTip {
-                    height: chain_epoch.visible_tip_height.value(),
-                    hash: encode_rpc_block_hash_hex(chain_epoch.visible_tip_hash),
-                }),
-                settled_tip: Some(wallet::BlockTip {
-                    height: chain_epoch.settled_tip_height.value(),
-                    hash: encode_rpc_block_hash_hex(chain_epoch.settled_tip_hash),
-                }),
-                sapling_commitment_tree_size: chain_epoch.tip_metadata.sapling_commitment_tree_size,
-                orchard_commitment_tree_size: chain_epoch.tip_metadata.orchard_commitment_tree_size,
-                ironwood_commitment_tree_size: chain_epoch
-                    .tip_metadata
-                    .ironwood_commitment_tree_size,
-            }),
-            indexed_tip: None,
-            upstream_tip: None,
-            materialized_views: None,
-        }),
-        compact_block: Some(zinder_proto::wire::compact_block_message(compact_block)),
     }
 }
 

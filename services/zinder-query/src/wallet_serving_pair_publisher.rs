@@ -2979,19 +2979,27 @@ mod tests {
             })
             .await?
             .into_inner();
+        let header = compact_blocks
+            .next()
+            .await
+            .ok_or("native compact range must open with its chain-view header")??;
         let compact_block = compact_blocks
             .next()
             .await
             .ok_or("native compact range must return the visible block")??;
         assert!(compact_blocks.next().await.is_none());
-        assert_eq!(
-            compact_block
-                .chain_view
-                .as_ref()
-                .and_then(|view| view.chain_epoch.as_ref())
-                .map(|epoch| epoch.chain_epoch_id),
-            Some(visible_tip.chain_epoch.id.value())
-        );
+        assert!(matches!(
+            header.body,
+            Some(wallet::compact_blocks_in_range_chunk::Body::Header(wallet::ChainView {
+                chain_epoch: Some(ref epoch),
+                ..
+            })) if epoch.chain_epoch_id == visible_tip.chain_epoch.id.value()
+        ));
+        assert!(matches!(
+            compact_block.body,
+            Some(wallet::compact_blocks_in_range_chunk::Body::Item(ref block))
+                if block.height == visible_tip.height.value()
+        ));
         let settled_response = wallet_client
             .settled_tip_block(wallet::SettledTipBlockRequest { at_epoch_id: None })
             .await?

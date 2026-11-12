@@ -72,9 +72,45 @@ This avoids two problems:
 
 If a requested compact block is outside the store's retained history, `zinder-query` returns `ArtifactUnavailable` for the compact-block family and the first absent height. A range read that reaches above the visible tip or below the retained floor therefore reports the same `NOT_FOUND` outcome as the single-block read. A compact block missing inside retained history is store damage: the range read fails closed as a canonical storage error (`UNAVAILABLE` with `STORAGE_UNAVAILABLE`) so operators see the integrity failure. `zinder-query` does not fetch the block from the upstream node and build a one-off response.
 
-The native wallet protocol slices expose latest block metadata, compact block ranges, checkpoint tree-state reads, latest checkpoint tree-state reads, subtree roots, lightd-compatible network metadata, and the chain-event subscription described below as generated `zinder_proto::v1::wallet` responses. Each response carries the cross-plane `ChainView` at field tag 1; wallet responses fill `chain_view.chain_epoch` with the epoch used to answer the read and leave the materialized-view axes unset (see [ADR-0011](../adrs/0011-explorer-freshness-envelope.md)). Native gRPC streams compact block ranges as `CompactBlocksInRangeChunk` messages so range size is bounded by request limits and not by a single gRPC response message. `WalletQueryGrpcAdapter` serves the generated native `WalletQuery` tonic service over `WalletQueryApi` through `grpc/native.rs` response builders and preserves the same epoch binding, unavailable-artifact, and range limit behavior.
+The native wallet protocol slices expose latest block metadata, compact block ranges, checkpoint tree-state reads, latest checkpoint tree-state reads, subtree roots, lightd-compatible network metadata, and the chain-event subscription described below as generated `zinder_proto::v1::wallet` responses. Each unary response carries the cross-plane `ChainView` at field tag 1; wallet responses fill `chain_view.chain_epoch` with the epoch used to answer the read and leave the materialized-view axes unset (see [ADR-0011](../adrs/0011-explorer-freshness-envelope.md)). Native gRPC streams compact block ranges as `CompactBlocksInRangeChunk` messages so range size is bounded by request limits and not by a single gRPC response message. `WalletQueryGrpcAdapter` serves the generated native `WalletQuery` tonic service over `WalletQueryApi` through `grpc/native.rs` response builders and preserves the same epoch binding, unavailable-artifact, and range limit behavior.
 
 A request pins a chain snapshot with `optional uint64 at_epoch_id`: absent resolves to the visible epoch at request time; present resolves the canonical epoch by id. The store keys the epoch by id, so a pinned read either resolves it or returns `CHAIN_EPOCH_PIN_UNAVAILABLE` when the id is no longer retained. `ChainEpoch` is a response-only descriptor nested in `ChainView`; the request never echoes the epoch body.
+
+### Compact block range stream
+
+`CompactBlocksInRange` uses the one-shot header shape of the transparent
+address streams:
+
+1. The server sends one leading `ChainView` header (`chunk.body.header`). Its
+   `chain_epoch` is the single epoch that answers the whole range.
+2. The server then sends one `CompactBlock` per requested height, in ascending
+   order (`chunk.body.item`). Blocks carry no per-block epoch.
+
+`zinder-client` decodes this stream behind `ChainIndex::compact_blocks_in_range`
+and `ChainSnapshot::compact_blocks_in_range`, which yield `CompactBlockArtifact`
+values. The stream fails with `IndexerError::MalformedResponse` and then ends
+when the server does any of the following:
+
+- sends a block before the header;
+- sends a second header;
+- ends the stream without a header;
+- sends a header for a different network than the client's, or whose epoch
+  differs from the request's `at_epoch_id`;
+- skips, repeats, or exceeds a requested height, or stops before the last one;
+- sends a block above the header epoch's visible tip.
+
+Contract revision 7 introduced this shape. In revision 6 and earlier, every
+chunk repeated the full `ChainView` beside its block. `zinder-client` requires
+revision 7, so it rejects an older server at preflight instead of misreading
+its stream. The removed fields map directly to the new ones:
+
+| Revision 6 field | Revision 7 replacement |
+| --- | --- |
+| `CompactBlocksInRangeChunk.chain_view`, repeated on every chunk | `CompactBlocksInRangeChunk.body.header`, sent once before any block |
+| `CompactBlocksInRangeChunk.compact_block` | `CompactBlocksInRangeChunk.body.item` |
+
+The field tags stay 1 and 2, and the capability string stays
+`wallet.read.compact_block_range_v2`.
 
 ## Full Blocks
 
