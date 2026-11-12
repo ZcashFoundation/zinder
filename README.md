@@ -59,7 +59,9 @@ GitHub Release binds all downloadable assets. See the
 installation and runtime ownership requirements.
 
 Bring up a Zebra node through the [Z3 platform stack](https://github.com/ZcashFoundation/z3),
-then start Zinder from this checkout:
+then start Zinder from this checkout. The env file names the node's Docker
+network, cookie volume, and endpoints; `deploy/.env.zakura-*` files do the same
+for a Zakura node.
 
 ```bash
 # In the Z3 checkout.

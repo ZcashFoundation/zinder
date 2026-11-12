@@ -6,14 +6,18 @@
 # zinder-compat-lightwalletd serves the compatibility protocol. All readers
 # share ingest's network namespace so the authenticated control plane remains
 # loopback-only.
-name: zinder-${Z3_NETWORK_LOWER:-mainnet}
+#
+# The node is external to this project. Select it with one of the env files in
+# this directory: each names the node's Docker network, its cookie volume, and
+# its JSON-RPC and optional indexer endpoints. No node address has a default.
+name: zinder-${ZINDER_DEPLOY_NETWORK:?set ZINDER_DEPLOY_NETWORK to mainnet, testnet, or regtest}
 
 networks:
-  z3:
+  node:
     external: true
-    name: z3-${Z3_NETWORK_LOWER:-mainnet}
+    name: ${ZINDER_SOURCE_NETWORK_NAME:?set the node's external Docker network name}
   observability:
-    name: ${ZINDER_OBSERVABILITY_NETWORK_NAME:-zinder-${Z3_NETWORK_LOWER:-mainnet}-observability}
+    name: ${ZINDER_OBSERVABILITY_NETWORK_NAME:-zinder-${ZINDER_DEPLOY_NETWORK}-observability}
 
 services:
   state-init:
@@ -55,24 +59,26 @@ services:
       state-init:
         condition: service_completed_successfully
     networks:
-      z3:
+      node:
         aliases:
-          - zinder-${Z3_NETWORK_LOWER:-mainnet}-ingest
-          - zinder-${Z3_NETWORK_LOWER:-mainnet}-query
-          - zinder-${Z3_NETWORK_LOWER:-mainnet}-explorer
+          - zinder-${ZINDER_DEPLOY_NETWORK}-ingest
+          - zinder-${ZINDER_DEPLOY_NETWORK}-query
+          - zinder-${ZINDER_DEPLOY_NETWORK}-explorer
       observability:
     volumes:
       - data:/var/lib/zinder
       - checkpoint-staging:/var/lib/zinder/checkpoints
       - ./config/ingest.toml:/etc/zinder/config.toml:ro
-      - z3-cookie:/var/run/auth:ro
+      - node-cookie:/var/run/auth:ro
       - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/ingest.token:/var/run/zinder-control/ingest.token:ro
       - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/checkpoint.token:/var/run/zinder-checkpoint/checkpoint.token:ro
     command: ["--config", "/etc/zinder/config.toml"]
     environment:
-      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-mainnet}
-      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://zebra:8232}
-      ZINDER_NODE__INDEXER_GRPC_ADDR: ${ZINDER_NODE__INDEXER_GRPC_ADDR-http://zebra:8230}
+      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:?set the Zinder network name}
+      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:?set the node JSON-RPC URL}
+      # Empty selects JSON-RPC mempool polling. Env files set the indexer URL
+      # only when the node exposes its indexer gRPC listener to this network.
+      ZINDER_NODE__INDEXER_GRPC_ADDR: ${ZINDER_NODE__INDEXER_GRPC_ADDR-}
       ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
       # Namespace-wide binds are explicit deployment opt-ins. Host publication
       # below remains loopback-only, while Prometheus reaches ops internally.
@@ -110,13 +116,13 @@ services:
       - data:/var/lib/zinder
       - checkpoint-staging:/var/lib/zinder/checkpoints
       - ./config/projector.toml:/etc/zinder/config.toml:ro
-      - z3-cookie:/var/run/auth:ro
+      - node-cookie:/var/run/auth:ro
       - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/ingest.token:/var/run/zinder-control/ingest.token:ro
       - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/checkpoint.token:/var/run/zinder-checkpoint/checkpoint.token:ro
     command: ["--config", "/etc/zinder/config.toml"]
     environment:
-      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-mainnet}
-      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://zebra:8232}
+      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:?set the Zinder network name}
+      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:?set the node JSON-RPC URL}
       ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
       ZINDER_PROJECTOR__BUILD_OWNER_HEX: ${ZINDER_PROJECTOR_BUILD_OWNER_HEX:?set a stable 32-character hexadecimal projector owner}
       ZINDER_OPS__LISTEN_ADDR: "[::]:9110"
@@ -146,12 +152,12 @@ services:
     volumes:
       - data:/var/lib/zinder
       - ./config/query.toml:/etc/zinder/config.toml:ro
-      - z3-cookie:/var/run/auth:ro
+      - node-cookie:/var/run/auth:ro
       - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/ingest.token:/var/run/zinder-control/ingest.token:ro
     command: ["--config", "/etc/zinder/config.toml"]
     environment:
-      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-mainnet}
-      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://zebra:8232}
+      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:?set the Zinder network name}
+      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:?set the node JSON-RPC URL}
       ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
       ZINDER_QUERY__LISTEN_ADDR: "[::]:9102"
       ZINDER_OPS__LISTEN_ADDR: "[::]:9106"
@@ -180,12 +186,12 @@ services:
     volumes:
       - data:/var/lib/zinder
       - ./config/compat-lightwalletd.toml:/etc/zinder/config.toml:ro
-      - z3-cookie:/var/run/auth:ro
+      - node-cookie:/var/run/auth:ro
       - ${ZINDER_CONTROL_SECRETS_DIR:?set a directory containing ingest.token and checkpoint.token}/ingest.token:/var/run/zinder-control/ingest.token:ro
     command: ["--config", "/etc/zinder/config.toml"]
     environment:
-      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-mainnet}
-      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://zebra:8232}
+      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:?set the Zinder network name}
+      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:?set the node JSON-RPC URL}
       ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
       ZINDER_COMPAT__LISTEN_ADDR: "[::]:9067"
       ZINDER_OPS__LISTEN_ADDR: "[::]:9107"
@@ -246,13 +252,13 @@ services:
 
 volumes:
   data:
-    name: ${ZINDER_SINGLE_HOST_DATA_VOLUME_NAME:-zinder-${Z3_NETWORK_LOWER:-mainnet}-data}
+    name: ${ZINDER_SINGLE_HOST_DATA_VOLUME_NAME:-zinder-${ZINDER_DEPLOY_NETWORK}-data}
   checkpoint-staging:
-    name: ${ZINDER_CHECKPOINT_STAGING_VOLUME_NAME:-zinder-${Z3_NETWORK_LOWER:-mainnet}-checkpoints}
+    name: ${ZINDER_CHECKPOINT_STAGING_VOLUME_NAME:-zinder-${ZINDER_DEPLOY_NETWORK}-checkpoints}
   prometheus:
-    name: ${ZINDER_PROMETHEUS_VOLUME_NAME:-zinder-${Z3_NETWORK_LOWER:-mainnet}-prometheus}
+    name: ${ZINDER_PROMETHEUS_VOLUME_NAME:-zinder-${ZINDER_DEPLOY_NETWORK}-prometheus}
   grafana:
-    name: ${ZINDER_GRAFANA_VOLUME_NAME:-zinder-${Z3_NETWORK_LOWER:-mainnet}-grafana}
-  z3-cookie:
+    name: ${ZINDER_GRAFANA_VOLUME_NAME:-zinder-${ZINDER_DEPLOY_NETWORK}-grafana}
+  node-cookie:
     external: true
-    name: z3-${Z3_NETWORK_LOWER:-mainnet}-cookie
+    name: ${ZINDER_SOURCE_COOKIE_VOLUME_NAME:?set the node's external cookie volume name}

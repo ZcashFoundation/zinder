@@ -4,7 +4,8 @@
 name = "zcash-mainnet"
 
 [node]
-json_rpc_addr = "http://zebra:8232"
+# The node JSON-RPC endpoint comes from ZINDER_NODE__JSON_RPC_ADDR, which the
+# selected deploy env file sets.
 request_timeout_secs = 30
 
 [node.auth]

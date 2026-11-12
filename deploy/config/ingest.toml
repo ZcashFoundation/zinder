@@ -5,8 +5,8 @@
 name = "zcash-mainnet"
 
 [node]
-json_rpc_addr = "http://zebra:8232"
-indexer_grpc_addr = "http://zebra:8230"
+# The node endpoints come from ZINDER_NODE__JSON_RPC_ADDR and
+# ZINDER_NODE__INDEXER_GRPC_ADDR, which the selected deploy env file sets.
 request_timeout_secs = 30
 max_response_bytes = 67108864
 

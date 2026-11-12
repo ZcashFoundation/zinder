@@ -21,8 +21,11 @@ gates have current evidence. See
 
 - A Linux host with Docker Engine 24 or newer and Docker Compose v2.
 - A pinned Zinder release checkout at `/opt/zinder`.
-- A running [Z3](https://github.com/ZcashFoundation/z3) stack on the same
-  Docker host. Zinder attaches to its network and cookie volume.
+- A Zebra or Zakura node on the same Docker host. Zinder attaches to the
+  node's external Docker network and reads the node's RPC cookie from a
+  dedicated named volume. A [Z3](https://github.com/ZcashFoundation/z3) stack
+  provides both for Zebra. For Zakura, see
+  [Attach a Zakura node](#attach-a-zakura-node).
 - Storage sized for canonical data, the wallet projection, a coherent
   checkpoint, compaction/restore workspace, and chain-growth reserve.
 - An HTTP/2-capable reverse proxy for TLS, authentication, rate limits, and
@@ -92,9 +95,59 @@ sudo install -d -o root -g root -m 0755 /etc/zinder
 sudo cp /opt/zinder/deploy/.env.mainnet /etc/zinder/env
 ```
 
-Use `.env.testnet` or `.env.regtest` for another network. Each file contains
-a stable, non-secret `ZINDER_PROJECTOR_BUILD_OWNER_HEX`; assign a different
-32-character hexadecimal value to every side-by-side projector lane.
+Pick the env file for your node and network:
+
+| Node | Mainnet | Testnet | Regtest |
+| --- | --- | --- | --- |
+| Zebra through Z3 | `.env.mainnet` | `.env.testnet` | `.env.regtest` |
+| Zakura | `.env.zakura-mainnet` | `.env.zakura-testnet` | not provided |
+
+The Compose file has no node address or network default. The env file
+supplies every node-specific value:
+
+| Variable | Meaning |
+| --- | --- |
+| `ZINDER_DEPLOY_NETWORK` | `mainnet`, `testnet`, or `regtest`. It names the Compose project, the Zinder volumes, and the network aliases. |
+| `ZINDER_SOURCE_NETWORK_NAME` | The node's external Docker network. |
+| `ZINDER_SOURCE_COOKIE_VOLUME_NAME` | The external volume that holds the node's `.cookie`. |
+| `ZINDER_NODE__JSON_RPC_ADDR` | The node's JSON-RPC URL on that network. |
+| `ZINDER_NODE__INDEXER_GRPC_ADDR` | The node's indexer gRPC URL. Empty selects JSON-RPC mempool polling. |
+
+Compose refuses to start when `ZINDER_NETWORK__NAME` or any of the first four
+is unset. The Zebra and Zakura files for one network share
+`ZINDER_DEPLOY_NETWORK`, the host ports, and the projector owner, so they
+describe the same deployment. Switching the file switches the node and keeps
+the existing stores.
+
+Every checked-in file leaves `ZINDER_NODE__INDEXER_GRPC_ADDR` empty, so ingest
+polls the node's mempool over JSON-RPC. To stream mempool events from a Z3
+Zebra node instead, set `ZEBRA_RPC__INDEXER_LISTEN_ADDR=0.0.0.0:8155` in the
+Z3 `.env` file, restart Z3, and set
+`ZINDER_NODE__INDEXER_GRPC_ADDR=http://zebra:8155` in `/etc/zinder/env`.
+
+Each file contains a stable, non-secret `ZINDER_PROJECTOR_BUILD_OWNER_HEX`;
+assign a different 32-character hexadecimal value to every side-by-side
+projector lane.
+
+### Upgrade an existing env file
+
+Earlier releases derived the project, network, and cookie volume names from
+`Z3_NETWORK_LOWER` and defaulted the node endpoints to `zebra`. Compose now
+ignores `Z3_NETWORK_LOWER` and requires the new variables. Before you start
+an upgraded checkout, edit `/etc/zinder/env`:
+
+1. Replace `Z3_NETWORK_LOWER=<network>` with `ZINDER_DEPLOY_NETWORK=<network>`.
+   Keep the same value: it keeps the `zinder-<network>` project and volume
+   names, so the existing stores stay attached.
+2. Add `ZINDER_SOURCE_NETWORK_NAME=z3-<network>` and
+   `ZINDER_SOURCE_COOKIE_VOLUME_NAME=z3-<network>-cookie`.
+3. Check that `ZINDER_NETWORK__NAME` and `ZINDER_NODE__JSON_RPC_ADDR` are set.
+4. Set `ZINDER_NODE__INDEXER_GRPC_ADDR` to an empty value unless the node
+   serves its indexer listener on the Docker network. The earlier
+   `http://zebra:8155` value works only after the Z3 opt-in above.
+
+Comparing the file with the current `deploy/.env.<network>` shows any other
+missing value.
 
 Create the root-owned file-backed control-secret directory before validating
 Compose. The ordinary ingest token is mounted into all four runtimes; the
@@ -141,6 +194,42 @@ in Docker's `starting` state for the documented three-hour canonical and
 two-hour wallet-build hard gates instead of being reported unhealthy after one
 minute. Query and compatibility receive five-minute startup grace periods.
 
+### Attach a Zakura node
+
+Zakura's own Compose file does not share a network or a cookie volume with
+other projects. Start the node with these settings:
+
+- `ZAKURA_RPC__LISTEN_ADDR=0.0.0.0:8232` on Mainnet, or `0.0.0.0:18232` on
+  Testnet.
+- An external Docker network shared with Zinder, on which the node is
+  reachable as `zakura`. Name it in `ZINDER_SOURCE_NETWORK_NAME`.
+- `ZAKURA_RPC__COOKIE_DIR=/var/run/auth`, backed by a dedicated named volume.
+  Name it in `ZINDER_SOURCE_COOKIE_VOLUME_NAME`. Stock Zakura keeps the cookie
+  in its chain-state volume, which Zinder must not mount.
+- An explicit `network.zakura.listen_addr`
+  (`ZAKURA_NETWORK__ZAKURA__LISTEN_ADDR`). When it is unset, Zakura's QUIC
+  peer listener binds `0.0.0.0:8234`.
+
+Zakura refuses to start a plaintext indexer gRPC listener on a non-loopback
+address. The Zakura env files therefore leave
+`ZINDER_NODE__INDEXER_GRPC_ADDR` empty, and ingest polls the mempool.
+
+Zebra and Zakura write the cookie as UID 10001 with mode 0600, and replace it
+on every start. The Zinder runtimes run as UID 1000 and cannot read it. Run
+the cookie-permissions project beside the node with the same env file:
+
+```bash
+docker compose --env-file /etc/zinder/env \
+  -f deploy/node-cookie-permissions.yml up -d
+```
+
+It runs as UID 10001 with no capabilities and no network. Every 5 seconds it
+sets the cookie's mode to 0644 in place; it never copies the cookie. It is a
+separate Compose project, so the Zinder systemd unit does not stop it. After a
+node restart, ingest can find the cookie unreadable for up to one poll
+interval. Ingest reports the node as unavailable and retries. Z3 already runs
+an equivalent service, so Z3 deployments do not need this project.
+
 ### Attach an explorer consumer
 
 When the same host serves Zexplorer or another named `ExplorerQuery` consumer,
@@ -157,8 +246,8 @@ The overlay builds `zinder-explorer`, opens a process-owned materialized-view
 secondary, and federates `WalletQuery` over the shared loopback namespace. The
 runtime does not open a canonical secondary. It publishes gRPC and ops
 endpoints on host loopback using `ZINDER_EXPLORER_HOST_PORT` and
-`ZINDER_EXPLORER_OPS_HOST_PORT`. Inside the Z3 network, consumers use the stable
-`zinder-${Z3_NETWORK_LOWER}-explorer:9068` alias.
+`ZINDER_EXPLORER_OPS_HOST_PORT`. Inside the node network, consumers use the
+stable `zinder-${ZINDER_DEPLOY_NETWORK}-explorer:9068` alias.
 
 Create two file-backed control secrets outside the shared data volume: the
 ordinary `ingest.token`, mounted into all four runtimes, and the separate
