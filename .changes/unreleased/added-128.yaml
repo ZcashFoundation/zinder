@@ -1,6 +1,0 @@
-kind: added
-body: Each release now publishes two more multi-architecture images for hosts that attach one volume to one container. `ghcr.io/zcashfoundation/zinder-wallet-serving` runs ingest, projector, and native query as supervised processes and omits lightwalletd compatibility. `ghcr.io/zcashfoundation/zinder-canonical-runtime` is the ingest-only diagnostic or canary runtime. Both carry the same provenance, SBOM, and signature evidence as the four runtime images, and neither is the complete supported topology.
-time: 2026-11-11T23:00:00Z
-custom:
-  Bump: minor
-  PR: "128"
