@@ -247,43 +247,45 @@ Sigstore bundle support, then confirm the Release and each exact image before
 changing a deployment:
 
 ```console
-git switch --detach v0.8.0
-gh release view v0.8.0
-gh release verify v0.8.0
+git switch --detach v0.9.0
+gh release view v0.9.0
+gh release verify v0.9.0
 
-gh release download v0.8.0 \
-  --pattern 'zinder-0.8.0-*-unknown-linux-gnu.tar.gz' \
-  --pattern 'zinder-0.8.0-*-unknown-linux-gnu.spdx.json' \
+gh release download v0.9.0 \
+  --pattern 'zinder-0.9.0-*-unknown-linux-gnu.tar.gz' \
+  --pattern 'zinder-0.9.0-*-unknown-linux-gnu.spdx.json' \
   --pattern SHA256SUMS \
   --pattern SHA256SUMS.sigstore.json
 sha256sum --check SHA256SUMS
 cosign verify-blob \
   --bundle SHA256SUMS.sigstore.json \
   --certificate-identity \
-    'https://github.com/ZcashFoundation/zinder/.github/workflows/release.yml@refs/tags/v0.8.0' \
+    'https://github.com/ZcashFoundation/zinder/.github/workflows/release.yml@refs/tags/v0.9.0' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
 
 for package_name in zinder-core zinder-proto zinder-client; do
-  cargo info "${package_name}@0.8.0"
+  cargo info "${package_name}@0.9.0"
 done
 
-scripts/verify-published-sdk.sh 0.8.0
+scripts/verify-published-sdk.sh 0.9.0
 
 for image in \
   zinder-ingest \
   zinder-projector \
   zinder-query \
-  zinder-compat-lightwalletd
+  zinder-compat-lightwalletd \
+  zinder-canonical-runtime \
+  zinder-wallet-serving
 do
   docker buildx imagetools inspect \
-    "ghcr.io/zcashfoundation/${image}:v0.8.0"
+    "ghcr.io/zcashfoundation/${image}:v0.9.0"
 done
 ```
 
-The `v0.8.0` example loops over the 4 runtime images. Releases from `v0.9.0-rc.1`
-onward also publish `zinder-canonical-runtime` and `zinder-wallet-serving`;
-add them to the loop when verifying one of those releases.
+The `v0.9.0` example loops over the 6 runtime images. Releases before
+`v0.9.0-rc.1` publish only the first 4; drop `zinder-canonical-runtime` and
+`zinder-wallet-serving` from the loop when verifying one of those releases.
 
 The first release that publishes a new image name creates its GHCR package as
 private. An organization admin must set the package visibility to public once.
