@@ -1,0 +1,6 @@
+kind: changed
+body: Wallet build cold validation reads the flushed store back once per family and compares it with the construction digest instead of re-sorting the address families, which shortens large builds. The wallet build report replaces the two cold-validation sort durations with per-family scan durations, and the storage benchmark report format moves to version 4.
+time: 2026-11-12T14:30:25.312032334Z
+custom:
+    Bump: minor
+    PR: "138"
