@@ -355,6 +355,46 @@ fn broadcast_transaction_response_round_trips_through_prost() -> eyre::Result<()
 }
 
 #[test]
+fn broadcast_rejection_reasons_keep_their_wire_numbers() {
+    assert_eq!(wallet::BroadcastRejectionReason::Unknown as i32, 5);
+    assert_eq!(
+        wallet::BroadcastRejectionReason::UnsupportedTransactionVersion as i32,
+        6
+    );
+    assert_eq!(
+        wallet::BroadcastRejectionReason::ExceedsBlockActionLimit as i32,
+        7
+    );
+}
+
+#[test]
+fn broadcast_transaction_response_carries_nu7_rejection_reasons() -> eyre::Result<()> {
+    for kind in [
+        wallet::BroadcastRejectionReason::UnsupportedTransactionVersion,
+        wallet::BroadcastRejectionReason::ExceedsBlockActionLimit,
+    ] {
+        let response = wallet::BroadcastTransactionResponse {
+            outcome: Some(wallet::broadcast_transaction_response::Outcome::Rejected(
+                wallet::BroadcastRejected {
+                    error_code: Some(-25),
+                    message: "rejected".to_owned(),
+                    kind: kind as i32,
+                },
+            )),
+        };
+        let decoded_response = round_trip(&response)?;
+
+        assert!(matches!(
+            decoded_response.outcome,
+            Some(wallet::broadcast_transaction_response::Outcome::Rejected(rejected))
+                if rejected.kind == kind as i32
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
 fn broadcast_transaction_response_carries_queued_outcome() -> eyre::Result<()> {
     let response = wallet::BroadcastTransactionResponse {
         outcome: Some(wallet::broadcast_transaction_response::Outcome::Queued(

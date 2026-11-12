@@ -178,6 +178,15 @@ pub enum BroadcastRejectionReason {
     BadConsensusBranch,
     /// Mempool is at capacity and refused the transaction.
     MempoolFull,
+    /// Transaction version is not supported by the network upgrade that
+    /// applies to the next block (for example v4 from NU7 under ZIP 2003, or
+    /// v5 before NU5). The transaction must be rebuilt; re-signing cannot fix
+    /// it.
+    UnsupportedTransactionVersion,
+    /// Transaction alone exceeds a ZIP 218 per-block shielded action limit,
+    /// so no block can include it. The payment must be split across
+    /// transactions.
+    ExceedsBlockActionLimit,
 }
 
 /// Queued transaction broadcast details.

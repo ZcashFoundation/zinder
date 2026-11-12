@@ -13,8 +13,9 @@ use async_trait::async_trait;
 use tonic::{Code, Request};
 use tonic_types::StatusExt;
 use zinder_core::{
-    BlockHash, BlockHeight, BlockId, BroadcastAccepted, ChainValuePool, ChainValuePools, Network,
-    RawTransactionBytes, TransactionBroadcastOutcome, TransactionId,
+    BlockHash, BlockHeight, BlockId, BroadcastAccepted, BroadcastRejected,
+    BroadcastRejectionReason, ChainValuePool, ChainValuePools, Network, RawTransactionBytes,
+    TransactionBroadcastOutcome, TransactionId,
 };
 use zinder_proto::capabilities::{
     WALLET_BROADCAST_TRANSACTION_V1, WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
@@ -319,6 +320,65 @@ async fn probed_tree_and_broadcast_capabilities_are_advertised_and_invokable() -
     ));
     assert_eq!(tree_state_fetch_count.load(Ordering::SeqCst), 1);
     assert_eq!(broadcast_count.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_broadcast_carries_nu7_rejection_reasons_on_the_wire() -> eyre::Result<()> {
+    let cases = [
+        (
+            BroadcastRejectionReason::UnsupportedTransactionVersion,
+            wallet::BroadcastRejectionReason::UnsupportedTransactionVersion,
+            "transaction version 4 not supported by the network upgrade Nu7",
+        ),
+        (
+            BroadcastRejectionReason::ExceedsBlockActionLimit,
+            wallet::BroadcastRejectionReason::ExceedsBlockActionLimit,
+            "mempool transaction has 331 Orchard actions, exceeding the next block's ZIP 218 limit of 330",
+        ),
+    ];
+
+    for (kind, expected_wire_kind, message) in cases {
+        let source = ProbedValuePoolSource {
+            capabilities: NodeCapabilities::new([
+                NodeCapability::OpenRpcDiscovery,
+                NodeCapability::TipId,
+                NodeCapability::TransactionBroadcast,
+            ])?,
+            value_pools: ChainValuePools::new(
+                BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([0x11; 32])),
+                Vec::new(),
+            ),
+            fetch_count: Arc::new(AtomicUsize::new(0)),
+            tree_state_fetch_count: Arc::new(AtomicUsize::new(0)),
+            broadcast_count: Arc::new(AtomicUsize::new(0)),
+            tree_state: None,
+            broadcast_outcome: Some(TransactionBroadcastOutcome::Rejected(BroadcastRejected {
+                kind,
+                error_code: Some(-25),
+                message: message.to_owned(),
+            })),
+        };
+        let (query, _store_fixture, _ingest_control_fixture) = serving_query(source).await?;
+        let adapter = WalletQueryGrpcAdapter::new(query, WalletEndpointMetadata::default());
+
+        let broadcast = WalletQueryService::broadcast_transaction(
+            &adapter,
+            Request::new(wallet::BroadcastTransactionRequest {
+                raw_transaction: vec![1],
+            }),
+        )
+        .await?
+        .into_inner();
+
+        assert!(matches!(
+            broadcast.outcome,
+            Some(wallet::broadcast_transaction_response::Outcome::Rejected(rejected))
+                if rejected.kind == expected_wire_kind as i32
+                    && rejected.error_code == Some(-25)
+                    && rejected.message == message
+        ));
+    }
     Ok(())
 }
 

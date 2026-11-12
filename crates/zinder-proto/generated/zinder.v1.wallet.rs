@@ -1815,6 +1815,15 @@ pub enum BroadcastRejectionReason {
     MempoolFull = 4,
     /// Node returned a rejection that did not match any known reason.
     Unknown = 5,
+    /// The transaction version is not supported by the network upgrade that
+    /// applies to the next block (for example v4 from NU7 under ZIP 2003, or v5
+    /// before NU5). Rebuild the transaction for the current network upgrade;
+    /// re-signing the same transaction cannot fix it.
+    UnsupportedTransactionVersion = 6,
+    /// The transaction alone exceeds a ZIP 218 per-block shielded action limit,
+    /// so no block can include it. Split the payment across several
+    /// transactions.
+    ExceedsBlockActionLimit = 7,
 }
 impl BroadcastRejectionReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1829,6 +1838,12 @@ impl BroadcastRejectionReason {
             Self::BadConsensusBranch => "BROADCAST_REJECTION_REASON_BAD_CONSENSUS_BRANCH",
             Self::MempoolFull => "BROADCAST_REJECTION_REASON_MEMPOOL_FULL",
             Self::Unknown => "BROADCAST_REJECTION_REASON_UNKNOWN",
+            Self::UnsupportedTransactionVersion => {
+                "BROADCAST_REJECTION_REASON_UNSUPPORTED_TRANSACTION_VERSION"
+            }
+            Self::ExceedsBlockActionLimit => {
+                "BROADCAST_REJECTION_REASON_EXCEEDS_BLOCK_ACTION_LIMIT"
+            }
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1844,6 +1859,12 @@ impl BroadcastRejectionReason {
             }
             "BROADCAST_REJECTION_REASON_MEMPOOL_FULL" => Some(Self::MempoolFull),
             "BROADCAST_REJECTION_REASON_UNKNOWN" => Some(Self::Unknown),
+            "BROADCAST_REJECTION_REASON_UNSUPPORTED_TRANSACTION_VERSION" => {
+                Some(Self::UnsupportedTransactionVersion)
+            }
+            "BROADCAST_REJECTION_REASON_EXCEEDS_BLOCK_ACTION_LIMIT" => {
+                Some(Self::ExceedsBlockActionLimit)
+            }
             _ => None,
         }
     }

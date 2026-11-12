@@ -71,6 +71,16 @@ async fn broadcast_transaction_preserves_rejection_classes() -> eyre::Result<()>
             message: "transaction signature is invalid".to_owned(),
         }),
         TransactionBroadcastOutcome::Rejected(BroadcastRejected {
+            kind: BroadcastRejectionReason::UnsupportedTransactionVersion,
+            error_code: Some(-25),
+            message: "transaction version 4 not supported by the network upgrade Nu7".to_owned(),
+        }),
+        TransactionBroadcastOutcome::Rejected(BroadcastRejected {
+            kind: BroadcastRejectionReason::ExceedsBlockActionLimit,
+            error_code: Some(-25),
+            message: "mempool transaction has 331 Orchard actions, exceeding the next block's ZIP 218 limit of 330".to_owned(),
+        }),
+        TransactionBroadcastOutcome::Rejected(BroadcastRejected {
             kind: BroadcastRejectionReason::Unknown,
             error_code: Some(-25),
             message: "bad-txns-invalid".to_owned(),
