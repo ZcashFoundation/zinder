@@ -80,6 +80,10 @@ pub(crate) struct RocksDbWalletRebuildReport {
     row_load_seconds: f64,
     flush_and_cold_reopen_seconds: f64,
     cold_validation_seconds: f64,
+    cold_validation_primary_output_scan_seconds: f64,
+    cold_validation_address_index_and_balance_readback_seconds: f64,
+    cold_validation_address_transaction_readback_seconds: f64,
+    cold_validation_reorg_undo_readback_seconds: f64,
     ready_publication_seconds: f64,
     total_seconds: f64,
 }
@@ -133,11 +137,18 @@ pub(crate) async fn run_rocksdb_wallet_rebuild(
             supported_reorg_depth: args.supported_reorg_depth,
         },
     )?;
-    let report = outcome.report;
+    Ok(rebuild_report(&canonical_ready, &outcome.report))
+}
+
+fn rebuild_report(
+    canonical_ready: &zinder_store::CanonicalStoreReadyEvidence,
+    report: &zinder_wallet_rocksdb::RocksDbWalletBuildReport,
+) -> RocksDbWalletRebuildReport {
     let wallet_source = report.source_position;
     let durations = report.phase_durations;
+    let validation_phases = durations.cold_validation_phases;
 
-    Ok(RocksDbWalletRebuildReport {
+    RocksDbWalletRebuildReport {
         canonical_tip_height: canonical_ready.visible_tip.height.value(),
         canonical_epoch: canonical_ready.visible_epoch.value(),
         canonical_event_sequence: canonical_ready.visible_event_sequence,
@@ -157,9 +168,21 @@ pub(crate) async fn run_rocksdb_wallet_rebuild(
         row_load_seconds: durations.row_load.as_secs_f64(),
         flush_and_cold_reopen_seconds: durations.flush_and_cold_reopen.as_secs_f64(),
         cold_validation_seconds: durations.cold_validation.as_secs_f64(),
+        cold_validation_primary_output_scan_seconds: validation_phases
+            .primary_output_scan
+            .as_secs_f64(),
+        cold_validation_address_index_and_balance_readback_seconds: validation_phases
+            .address_index_and_balance_readback
+            .as_secs_f64(),
+        cold_validation_address_transaction_readback_seconds: validation_phases
+            .address_transaction_readback
+            .as_secs_f64(),
+        cold_validation_reorg_undo_readback_seconds: validation_phases
+            .reorg_undo_readback
+            .as_secs_f64(),
         ready_publication_seconds: durations.ready_publication.as_secs_f64(),
         total_seconds: durations.total.as_secs_f64(),
-    })
+    }
 }
 
 fn parse_raw_blob_retention(encoded: &str) -> Result<RawBlobRetention, String> {

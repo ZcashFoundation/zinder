@@ -13,7 +13,8 @@ mod transition;
 pub use build::{
     RocksDbWalletBuildOptions, RocksDbWalletBuildOutcome, RocksDbWalletBuildReport,
     WalletBuildLeaseHeartbeat, WalletBuildLeasePhase, WalletBuildPhaseDurations,
-    WalletProjectionBuildLeaseExecution, WalletProjectionReplaySource, build_wallet_from_canonical,
+    WalletColdValidationPhaseDurations, WalletProjectionBuildLeaseExecution,
+    WalletProjectionReplaySource, build_wallet_from_canonical,
     build_wallet_from_canonical_with_lease, build_wallet_from_canonical_with_lease_and_heartbeat,
     validate_wallet_projection_pre_promotion_fence,
 };

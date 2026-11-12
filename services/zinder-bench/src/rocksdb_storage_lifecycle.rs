@@ -656,12 +656,6 @@ fn wallet_ready_summary(
             outpoint_sort: variable_value_sort_evidence(report.outpoint_sort),
             address_index_sort: variable_value_sort_evidence(report.address_index_sort),
             address_transaction_sort: variable_value_sort_evidence(report.address_transaction_sort),
-            cold_validation_address_index_sort: variable_value_sort_evidence(
-                report.cold_validation_address_index_sort,
-            ),
-            cold_validation_address_transaction_sort: variable_value_sort_evidence(
-                report.cold_validation_address_transaction_sort,
-            ),
             peak_accounted_reorg_undo_bytes: report.peak_accounted_reorg_undo_bytes,
             max_accounted_reorg_undo_bytes: report.max_accounted_reorg_undo_bytes,
             cold_validation_peak_accounted_reorg_undo_bytes: report
@@ -682,6 +676,7 @@ fn wallet_ready_summary(
 
 fn wallet_phase_durations(report: &RocksDbWalletBuildReport) -> WalletStoragePhaseDurations {
     let durations = report.phase_durations;
+    let validation_phases = durations.cold_validation_phases;
     WalletStoragePhaseDurations {
         store_initialization_seconds: durations.store_initialization.as_secs_f64(),
         canonical_scan_seconds: durations.canonical_scan.as_secs_f64(),
@@ -692,6 +687,18 @@ fn wallet_phase_durations(report: &RocksDbWalletBuildReport) -> WalletStoragePha
         row_load_seconds: durations.row_load.as_secs_f64(),
         flush_and_cold_reopen_seconds: durations.flush_and_cold_reopen.as_secs_f64(),
         cold_validation_seconds: durations.cold_validation.as_secs_f64(),
+        cold_validation_primary_output_scan_seconds: validation_phases
+            .primary_output_scan
+            .as_secs_f64(),
+        cold_validation_address_index_and_balance_readback_seconds: validation_phases
+            .address_index_and_balance_readback
+            .as_secs_f64(),
+        cold_validation_address_transaction_readback_seconds: validation_phases
+            .address_transaction_readback
+            .as_secs_f64(),
+        cold_validation_reorg_undo_readback_seconds: validation_phases
+            .reorg_undo_readback
+            .as_secs_f64(),
         ready_publication_seconds: durations.ready_publication.as_secs_f64(),
         total_seconds: durations.total.as_secs_f64(),
     }

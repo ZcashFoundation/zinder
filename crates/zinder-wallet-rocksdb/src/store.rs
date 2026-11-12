@@ -7,10 +7,9 @@ use std::{
     num::{NonZeroU16, NonZeroU64},
     path::Path,
     sync::Arc,
+    time::{Duration, Instant},
 };
-use zinder_rocksdb_bulk_load::{
-    SortedVariableValues, VariableValueSortEvidence, VariableValueSorter,
-};
+use zinder_rocksdb_bulk_load::{SortedVariableValues, VariableValueSorter};
 
 use rust_rocksdb::{
     BoundColumnFamily, Cache, ColumnFamilyDescriptor, DBCompressionType,
@@ -38,7 +37,8 @@ use zinder_wallet_projection::{
 };
 
 use crate::{
-    RocksDbWalletError, WalletBuildLeaseHeartbeat, projection_load::PreparedWalletProjectionLoad,
+    RocksDbWalletError, WalletBuildLeaseHeartbeat, WalletColdValidationPhaseDurations,
+    projection_load::PreparedWalletProjectionLoad,
 };
 
 /// Exact clean wallet-store schema supported by this adapter.
@@ -171,23 +171,28 @@ pub(crate) struct ValidatedRocksDbWalletBuild {
     validation_evidence: WalletColdValidationEvidence,
 }
 
-/// Explicit bounded resources for one independent cold semantic validation.
+/// Explicit bounded resources for one cold digest and row-count readback.
 #[derive(Clone, Copy)]
-pub(crate) struct WalletColdValidationConfig<'staging> {
+pub(crate) struct WalletColdValidationConfig {
+    pub(crate) max_accounted_reorg_undo_bytes: u64,
+}
+
+/// Explicit bounded resources for one independent cold semantic re-derivation.
+#[derive(Clone, Copy)]
+pub(crate) struct WalletSemanticValidationConfig<'staging> {
     pub(crate) staging_path: &'staging Path,
     pub(crate) max_sort_memory_bytes_per_sorter: u64,
     pub(crate) max_temporary_file_bytes_per_sorter: u64,
     pub(crate) max_accounted_reorg_undo_bytes: u64,
 }
 
-/// Bounded work evidence from independent cold cross-family validation.
+/// Bounded work evidence from cold digest and row-count readback.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct WalletColdValidationEvidence {
-    pub(crate) address_index_sort: VariableValueSortEvidence,
-    pub(crate) address_transaction_sort: VariableValueSortEvidence,
     pub(crate) peak_accounted_reorg_undo_bytes: u64,
     pub(crate) max_accounted_reorg_undo_bytes: u64,
     pub(crate) random_read_count: u64,
+    pub(crate) phase_durations: WalletColdValidationPhaseDurations,
 }
 
 /// One admitted READY wallet `RocksDB` store.
@@ -582,11 +587,18 @@ impl RocksDbWalletBuilder {
 }
 
 impl ColdRocksDbWalletBuild {
-    /// Validates every logical row and binds the only publishable READY evidence.
+    /// Reads every durable row back against the construction evidence and binds
+    /// the only publishable READY evidence.
+    ///
+    /// The readback recomputes the order-independent accumulator and the six
+    /// family row counts from the reopened store and requires them to equal the
+    /// values emitted while the SST files were written. It also re-checks every
+    /// invariant that a streaming scan can establish without sorting a family a
+    /// second time.
     pub(crate) fn validate_rows(
         self,
         ready_evidence: WalletProjectionReadyEvidence,
-        config: WalletColdValidationConfig<'_>,
+        config: WalletColdValidationConfig,
     ) -> Result<ValidatedRocksDbWalletBuild, RocksDbWalletError> {
         let WalletProjectionBuildState::Building(plan) = &self.control.build_state else {
             return Err(RocksDbWalletError::AdmissionChanged {
@@ -598,7 +610,7 @@ impl ColdRocksDbWalletBuild {
                 reason: "READY source position differs from the BUILDING target",
             });
         }
-        let validation_evidence = validate_ready_rows(
+        let validation_evidence = validate_ready_rows_by_readback(
             &self.bounded_open,
             self.control.network,
             &ready_evidence,
@@ -1094,11 +1106,11 @@ impl RocksDbWalletFollowingStore {
             })?;
         let expected_control = cold_checkpoint.store.control.clone();
         let ready_evidence = cold_checkpoint.store.ready_evidence().clone();
-        validate_ready_rows(
+        validate_ready_rows_by_semantic_rederivation(
             &cold_checkpoint.store.bounded_open,
             expected_network,
             &ready_evidence,
-            WalletColdValidationConfig {
+            WalletSemanticValidationConfig {
                 staging_path: config.staging_path,
                 max_sort_memory_bytes_per_sorter: config.max_sort_memory_bytes_per_sorter,
                 max_temporary_file_bytes_per_sorter: config.max_temporary_file_bytes_per_sorter,
@@ -1888,31 +1900,206 @@ fn remember_undo_block(
     Ok(())
 }
 
-fn validate_ready_rows(
-    bounded_open: &BoundedRocksDbOpen,
-    network: Network,
-    evidence: &WalletProjectionReadyEvidence,
-    config: WalletColdValidationConfig<'_>,
-) -> Result<WalletColdValidationEvidence, RocksDbWalletError> {
-    let counts = evidence.row_counts;
+fn require_address_index_covers_unspent_outputs(
+    counts: &zinder_wallet_projection::WalletProjectionFamilyRowCounts,
+) -> Result<(), RocksDbWalletError> {
     if counts.transparent_unspent_output_count != counts.transparent_unspent_output_by_address_count
     {
         return Err(RocksDbWalletError::AdmissionChanged {
             reason: "address unspent index does not exactly cover every primary unspent output",
         });
     }
-    let mut address_index_sorter = VariableValueSorter::<ADDRESS_UNSPENT_KEY_BYTES>::new(
-        config.staging_path,
-        "wallet-cold-validation-address-index",
-        config.max_sort_memory_bytes_per_sorter,
-        config.max_temporary_file_bytes_per_sorter,
+    Ok(())
+}
+
+fn require_ready_evidence_matches_rows(
+    digest: WalletProjectionDigestBuilder,
+    evidence: &WalletProjectionReadyEvidence,
+    utxo_summary: &WalletUtxoSetSummary,
+) -> Result<(), RocksDbWalletError> {
+    let observed_row_counts = digest.row_counts();
+    let observed_accumulator = digest.accumulator().clone();
+    let observed_digest = digest.finish();
+    if observed_row_counts != evidence.row_counts
+        || observed_digest != evidence.projection_digest
+        || observed_accumulator != evidence.projection_accumulator
+        || *utxo_summary != evidence.utxo_summary
+    {
+        return Err(RocksDbWalletError::AdmissionChanged {
+            reason: "READY evidence differs from cold wallet rows",
+        });
+    }
+    Ok(())
+}
+
+/// Reads the reopened BUILDING store back against the construction evidence.
+///
+/// Every family is scanned once in stored key order. The primary output
+/// families, the address-ordered families, and the address-transaction family
+/// are scanned on separate threads, each accumulating its own rows, and the
+/// order-independent partial accumulators are then combined. The scan recomputes the
+/// accumulator and the six row counts and compares them with the values
+/// emitted while the SST files were written, so a row that was lost, altered,
+/// duplicated, or added between SST writing and publication changes the
+/// accumulator. The address-ordered families are not re-derived through a
+/// second external sort. Cross-family consistency of the construction itself is
+/// established by the construction tests and the serial oracle, and by the
+/// semantic re-derivation that recovery admission still runs.
+fn validate_ready_rows_by_readback(
+    bounded_open: &BoundedRocksDbOpen,
+    network: Network,
+    evidence: &WalletProjectionReadyEvidence,
+    config: WalletColdValidationConfig,
+) -> Result<WalletColdValidationEvidence, RocksDbWalletError> {
+    let counts = evidence.row_counts;
+    require_address_index_covers_unspent_outputs(&counts)?;
+    let mut expected_undo = ExpectedReorgUndoSuffix::new(
+        evidence.settled_tip,
+        counts.reorg_undo_count,
+        config.max_accounted_reorg_undo_bytes,
     )?;
-    let mut address_transaction_sorter = VariableValueSorter::<ADDRESS_TRANSACTION_KEY_BYTES>::new(
-        config.staging_path,
-        "wallet-cold-validation-address-transactions",
-        config.max_sort_memory_bytes_per_sorter,
-        config.max_temporary_file_bytes_per_sorter,
+    let ConcurrentFamilyReadback {
+        mut digest,
+        utxo_summary,
+        primary_output_scan,
+        address_index_and_balance_readback,
+        address_transaction_readback,
+    } = read_back_large_families(bounded_open, network, &counts, &mut expected_undo)?;
+
+    let phase_started = Instant::now();
+    validate_reorg_undo_rows(
+        bounded_open,
+        &mut digest,
+        counts.reorg_undo_count,
+        evidence.source_position.tip,
+        evidence.settled_tip,
+        evidence.source_sequence_digest,
+        &expected_undo.undo_by_height,
     )?;
+    let reorg_undo_readback = phase_started.elapsed();
+
+    require_ready_evidence_matches_rows(digest, evidence, &utxo_summary)?;
+    Ok(WalletColdValidationEvidence {
+        peak_accounted_reorg_undo_bytes: expected_undo.memory.peak,
+        max_accounted_reorg_undo_bytes: config.max_accounted_reorg_undo_bytes,
+        random_read_count: 0,
+        phase_durations: WalletColdValidationPhaseDurations {
+            primary_output_scan,
+            address_index_and_balance_readback,
+            address_transaction_readback,
+            reorg_undo_readback,
+        },
+    })
+}
+
+/// Combined result of the concurrent primary, address-index, and
+/// address-transaction family scans.
+struct ConcurrentFamilyReadback {
+    digest: WalletProjectionDigestBuilder,
+    utxo_summary: WalletUtxoSetSummary,
+    primary_output_scan: Duration,
+    address_index_and_balance_readback: Duration,
+    address_transaction_readback: Duration,
+}
+
+/// Scans the three large families on separate threads and combines their
+/// order-independent partial accumulators.
+///
+/// The retained reorg-undo suffix is validated afterwards because it depends
+/// on the effects observed by the primary output scan.
+fn read_back_large_families(
+    bounded_open: &BoundedRocksDbOpen,
+    network: Network,
+    counts: &zinder_wallet_projection::WalletProjectionFamilyRowCounts,
+    expected_undo: &mut ExpectedReorgUndoSuffix,
+) -> Result<ConcurrentFamilyReadback, RocksDbWalletError> {
+    let (primary, address_index, address_transactions) = std::thread::scope(|scope| {
+        let address_index_worker = scope.spawn(|| {
+            let started = Instant::now();
+            let mut family_digest = WalletProjectionDigestBuilder::new();
+            let balance_total_zat =
+                read_back_address_index_and_balance_rows(bounded_open, &mut family_digest, counts)?;
+            Ok::<_, RocksDbWalletError>((family_digest, balance_total_zat, started.elapsed()))
+        });
+        let address_transaction_worker = scope.spawn(|| {
+            let started = Instant::now();
+            let mut family_digest = WalletProjectionDigestBuilder::new();
+            read_back_address_transaction_rows(
+                bounded_open,
+                &mut family_digest,
+                counts.transparent_address_transaction_count,
+            )?;
+            Ok::<_, RocksDbWalletError>((family_digest, started.elapsed()))
+        });
+        let started = Instant::now();
+        let mut family_digest = WalletProjectionDigestBuilder::new();
+        let primary = validate_primary_output_rows(
+            bounded_open,
+            network,
+            &mut family_digest,
+            None,
+            expected_undo,
+            counts,
+        )
+        .map(|utxo_summary| (family_digest, utxo_summary, started.elapsed()));
+        (
+            primary,
+            address_index_worker
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            address_transaction_worker
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+        )
+    });
+    let (mut digest, utxo_summary, primary_output_scan) = primary?;
+    let (address_index_digest, indexed_balance_zat, address_index_and_balance_readback) =
+        address_index?;
+    let (address_transaction_digest, address_transaction_readback) = address_transactions?;
+    if indexed_balance_zat != utxo_summary.total_value_zat {
+        return Err(RocksDbWalletError::AdmissionChanged {
+            reason: "address balance rows differ from indexed unspent-output sums",
+        });
+    }
+    digest.combine(&address_index_digest)?;
+    digest.combine(&address_transaction_digest)?;
+    Ok(ConcurrentFamilyReadback {
+        digest,
+        utxo_summary,
+        primary_output_scan,
+        address_index_and_balance_readback,
+        address_transaction_readback,
+    })
+}
+
+/// Re-derives the address-ordered families from the primary output rows through
+/// bounded external sorts and compares them with the stored rows.
+///
+/// Recovery admission uses this stricter scan because a restored checkpoint
+/// carries its READY evidence in the same untrusted store, so the evidence
+/// cannot vouch for the rows.
+fn validate_ready_rows_by_semantic_rederivation(
+    bounded_open: &BoundedRocksDbOpen,
+    network: Network,
+    evidence: &WalletProjectionReadyEvidence,
+    config: WalletSemanticValidationConfig<'_>,
+) -> Result<(), RocksDbWalletError> {
+    let counts = evidence.row_counts;
+    require_address_index_covers_unspent_outputs(&counts)?;
+    let mut sorters = AddressDerivationSorters {
+        index: VariableValueSorter::<ADDRESS_UNSPENT_KEY_BYTES>::new(
+            config.staging_path,
+            "wallet-cold-validation-address-index",
+            config.max_sort_memory_bytes_per_sorter,
+            config.max_temporary_file_bytes_per_sorter,
+        )?,
+        transaction: VariableValueSorter::<ADDRESS_TRANSACTION_KEY_BYTES>::new(
+            config.staging_path,
+            "wallet-cold-validation-address-transactions",
+            config.max_sort_memory_bytes_per_sorter,
+            config.max_temporary_file_bytes_per_sorter,
+        )?,
+    };
     let mut expected_undo = ExpectedReorgUndoSuffix::new(
         evidence.settled_tip,
         counts.reorg_undo_count,
@@ -1923,13 +2110,15 @@ fn validate_ready_rows(
         bounded_open,
         network,
         &mut digest,
-        &mut address_index_sorter,
-        &mut address_transaction_sorter,
+        Some(&mut sorters),
         &mut expected_undo,
         &counts,
     )?;
+    let AddressDerivationSorters {
+        index: address_index_sorter,
+        transaction: address_transaction_sorter,
+    } = sorters;
     let mut sorted_address_index = address_index_sorter.finish()?;
-    let address_index_sort = sorted_address_index.evidence();
     validate_address_index_and_balance_rows(
         bounded_open,
         &mut digest,
@@ -1937,7 +2126,6 @@ fn validate_ready_rows(
         &counts,
     )?;
     let mut sorted_address_transactions = address_transaction_sorter.finish()?;
-    let address_transaction_sort = sorted_address_transactions.evidence();
     validate_address_transaction_rows(
         bounded_open,
         &mut digest,
@@ -1953,25 +2141,128 @@ fn validate_ready_rows(
         evidence.source_sequence_digest,
         &expected_undo.undo_by_height,
     )?;
-    let observed_row_counts = digest.row_counts();
-    let observed_accumulator = digest.accumulator().clone();
-    let observed_digest = digest.finish();
-    if observed_row_counts != evidence.row_counts
-        || observed_digest != evidence.projection_digest
-        || observed_accumulator != evidence.projection_accumulator
-        || utxo_summary != evidence.utxo_summary
-    {
+    require_ready_evidence_matches_rows(digest, evidence, &utxo_summary)
+}
+
+/// Streams the stored address-unspent and address-balance families in key
+/// order, appends them to the digest, and returns the total of the balance rows.
+fn read_back_address_index_and_balance_rows(
+    bounded_open: &BoundedRocksDbOpen,
+    digest: &mut WalletProjectionDigestBuilder,
+    counts: &zinder_wallet_projection::WalletProjectionFamilyRowCounts,
+) -> Result<u64, RocksDbWalletError> {
+    let address_family = column_family(
+        bounded_open,
+        TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
+    )?;
+    let mut address_count = 0u64;
+    for row in bounded_open.db.iterator_cf_opt(
+        &address_family,
+        validation_read_options(),
+        IteratorMode::Start,
+    ) {
+        let (key_bytes, value_bytes) = row.map_err(|source| {
+            RocksDbWalletError::rocksdb("address unspent readback scan", source)
+        })?;
+        WalletAddressUnspentOutputKey::decode(&key_bytes)?;
+        if !value_bytes.is_empty() {
+            return Err(RocksDbWalletError::AdmissionChanged {
+                reason: "address unspent index does not exactly cover every primary unspent output",
+            });
+        }
+        digest.append_row(
+            WalletProjectionRowFamily::TransparentUnspentOutputByAddress,
+            &key_bytes,
+            &value_bytes,
+        )?;
+        address_count =
+            increment_validation_count(address_count, "address unspent row count overflow")?;
+    }
+    if address_count != counts.transparent_unspent_output_by_address_count {
         return Err(RocksDbWalletError::AdmissionChanged {
-            reason: "READY evidence differs from cold wallet rows",
+            reason: "address unspent index does not exactly cover every primary unspent output",
         });
     }
-    Ok(WalletColdValidationEvidence {
-        address_index_sort,
-        address_transaction_sort,
-        peak_accounted_reorg_undo_bytes: expected_undo.memory.peak,
-        max_accounted_reorg_undo_bytes: config.max_accounted_reorg_undo_bytes,
-        random_read_count: 0,
-    })
+
+    let balance_family = column_family(bounded_open, TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY)?;
+    let mut balance_count = 0u64;
+    let mut balance_total_zat = 0u64;
+    for row in bounded_open.db.iterator_cf_opt(
+        &balance_family,
+        validation_read_options(),
+        IteratorMode::Start,
+    ) {
+        let (key_bytes, value_bytes) = row.map_err(|source| {
+            RocksDbWalletError::rocksdb("address balance readback scan", source)
+        })?;
+        let balance = WalletAddressBalance::decode(&key_bytes, &value_bytes)?;
+        if balance.balance_zat == 0 {
+            return Err(RocksDbWalletError::AdmissionChanged {
+                reason: "address balance rows do not exactly cover positive indexed addresses",
+            });
+        }
+        balance_total_zat = balance_total_zat.checked_add(balance.balance_zat).ok_or(
+            RocksDbWalletError::AdmissionChanged {
+                reason: "address balance total overflow",
+            },
+        )?;
+        digest.append_row(
+            WalletProjectionRowFamily::TransparentAddressBalance,
+            &key_bytes,
+            &value_bytes,
+        )?;
+        balance_count =
+            increment_validation_count(balance_count, "address balance row count overflow")?;
+    }
+    if balance_count != counts.transparent_address_balance_count {
+        return Err(RocksDbWalletError::AdmissionChanged {
+            reason: "address balance rows do not exactly cover positive indexed addresses",
+        });
+    }
+    Ok(balance_total_zat)
+}
+
+/// Streams the stored address-transaction family in key order and appends it
+/// to the digest.
+fn read_back_address_transaction_rows(
+    bounded_open: &BoundedRocksDbOpen,
+    digest: &mut WalletProjectionDigestBuilder,
+    expected_count: u64,
+) -> Result<(), RocksDbWalletError> {
+    let family = column_family(bounded_open, TRANSPARENT_ADDRESS_TRANSACTION_COLUMN_FAMILY)?;
+    let mut count = 0u64;
+    for row in
+        bounded_open
+            .db
+            .iterator_cf_opt(&family, validation_read_options(), IteratorMode::Start)
+    {
+        let (key_bytes, value_bytes) = row.map_err(|source| {
+            RocksDbWalletError::rocksdb("address transaction readback scan", source)
+        })?;
+        WalletAddressTransaction::decode_value(
+            WalletAddressTransactionKey::decode(&key_bytes)?,
+            &value_bytes,
+        )?;
+        digest.append_row(
+            WalletProjectionRowFamily::TransparentAddressTransaction,
+            &key_bytes,
+            &value_bytes,
+        )?;
+        count = increment_validation_count(count, "address transaction row count overflow")?;
+    }
+    if count != expected_count {
+        return Err(RocksDbWalletError::AdmissionChanged {
+            reason: "address transaction rows do not exactly cover output create/spend effects",
+        });
+    }
+    Ok(())
+}
+
+/// External sorters that collect the address-ordered rows implied by the
+/// primary output families during semantic re-derivation.
+struct AddressDerivationSorters {
+    index: VariableValueSorter<ADDRESS_UNSPENT_KEY_BYTES>,
+    transaction: VariableValueSorter<ADDRESS_TRANSACTION_KEY_BYTES>,
 }
 
 #[allow(
@@ -1983,8 +2274,7 @@ fn validate_primary_output_rows(
     bounded_open: &BoundedRocksDbOpen,
     network: Network,
     digest: &mut WalletProjectionDigestBuilder,
-    address_index_sorter: &mut VariableValueSorter<ADDRESS_UNSPENT_KEY_BYTES>,
-    address_transaction_sorter: &mut VariableValueSorter<ADDRESS_TRANSACTION_KEY_BYTES>,
+    mut address_sorters: Option<&mut AddressDerivationSorters>,
     expected_undo: &mut ExpectedReorgUndoSuffix,
     counts: &zinder_wallet_projection::WalletProjectionFamilyRowCounts,
 ) -> Result<WalletUtxoSetSummary, RocksDbWalletError> {
@@ -2035,9 +2325,15 @@ fn validate_primary_output_rows(
             let key = WalletOutpointKey::decode(&key_bytes)?;
             let output = WalletUnspentOutput::decode_value(key, &value_bytes)?;
             let address_key = WalletAddressUnspentOutputKey::new(&output);
-            address_index_sorter.push(*address_key.as_bytes(), &output.value_zat.to_be_bytes())?;
+            if let Some(sorters) = address_sorters.as_deref_mut() {
+                sorters
+                    .index
+                    .push(*address_key.as_bytes(), &output.value_zat.to_be_bytes())?;
+            }
             stage_expected_address_transaction(
-                address_transaction_sorter,
+                address_sorters
+                    .as_deref_mut()
+                    .map(|sorters| &mut sorters.transaction),
                 expected_undo,
                 output.address_script_hash,
                 output.created_at,
@@ -2074,13 +2370,17 @@ fn validate_primary_output_rows(
             let spent = WalletSpentOutput::decode_value(key, &value_bytes)?;
             validate_spent_position(&spent)?;
             stage_expected_address_transaction(
-                address_transaction_sorter,
+                address_sorters
+                    .as_deref_mut()
+                    .map(|sorters| &mut sorters.transaction),
                 expected_undo,
                 spent.output.address_script_hash,
                 spent.output.created_at,
             )?;
             stage_expected_address_transaction(
-                address_transaction_sorter,
+                address_sorters
+                    .as_deref_mut()
+                    .map(|sorters| &mut sorters.transaction),
                 expected_undo,
                 spent.output.address_script_hash,
                 spent.spent_at,
@@ -2116,7 +2416,7 @@ fn validate_primary_output_rows(
 }
 
 fn stage_expected_address_transaction(
-    sorter: &mut VariableValueSorter<ADDRESS_TRANSACTION_KEY_BYTES>,
+    sorter: Option<&mut VariableValueSorter<ADDRESS_TRANSACTION_KEY_BYTES>>,
     expected_undo: &mut ExpectedReorgUndoSuffix,
     address_script_hash: TransparentAddressScriptHash,
     position: zinder_wallet_projection::WalletTransactionPosition,
@@ -2128,7 +2428,9 @@ fn stage_expected_address_transaction(
     );
     let transaction =
         WalletAddressTransaction::new(key, position.transaction_id, position.block.hash);
-    sorter.push(*key.as_bytes(), &transaction.encode_value())?;
+    if let Some(sorter) = sorter {
+        sorter.push(*key.as_bytes(), &transaction.encode_value())?;
+    }
     expected_undo.observe_address_transaction(key, position.block)
 }
 
@@ -2530,8 +2832,14 @@ mod tests {
     const TEST_VALIDATION_TEMPORARY_FILE_BYTES: u64 = 256 * 1024 * 1024;
     const TEST_VALIDATION_REORG_UNDO_BYTES: u64 = 16 * 1024 * 1024;
 
-    fn validation_config(staging_path: &Path) -> WalletColdValidationConfig<'_> {
+    const fn validation_config() -> WalletColdValidationConfig {
         WalletColdValidationConfig {
+            max_accounted_reorg_undo_bytes: TEST_VALIDATION_REORG_UNDO_BYTES,
+        }
+    }
+
+    fn semantic_validation_config(staging_path: &Path) -> WalletSemanticValidationConfig<'_> {
+        WalletSemanticValidationConfig {
             staging_path,
             max_sort_memory_bytes_per_sorter: TEST_VALIDATION_SORT_MEMORY_BYTES,
             max_temporary_file_bytes_per_sorter: TEST_VALIDATION_TEMPORARY_FILE_BYTES,
@@ -2929,6 +3237,17 @@ mod tests {
     }
 
     impl SemanticTamper {
+        /// Tampering that only changes an address-ordered family so that it
+        /// disagrees with the primary output rows while its rows, counts, and
+        /// the READY digest stay mutually consistent. Digest readback cannot
+        /// see this; semantic re-derivation can.
+        const fn is_visible_only_to_semantic_rederivation(self) -> bool {
+            matches!(
+                self,
+                Self::OrphanAddressIndex | Self::MissingAddressTransaction
+            )
+        }
+
         const fn expected_reason(self) -> &'static str {
             match self {
                 Self::OrphanAddressIndex | Self::MissingAddressIndex => {
@@ -3121,8 +3440,18 @@ mod tests {
         Ok(())
     }
 
+    fn admission_reason<Admitted>(
+        result: Result<Admitted, RocksDbWalletError>,
+    ) -> Result<&'static str, Box<dyn std::error::Error>> {
+        match result {
+            Ok(_) => Err("tampered wallet store was admitted".into()),
+            Err(RocksDbWalletError::AdmissionChanged { reason }) => Ok(reason),
+            Err(error) => Err(std::io::Error::other(error.to_string()).into()),
+        }
+    }
+
     #[test]
-    fn cold_validation_rejects_cross_family_tampering_with_matching_digest()
+    fn cold_semantic_rederivation_rejects_cross_family_tampering_with_matching_digest()
     -> Result<(), Box<dyn std::error::Error>> {
         for (index, tamper) in [
             SemanticTamper::OrphanAddressIndex,
@@ -3166,16 +3495,378 @@ mod tests {
                 RocksDbResourceBudget::for_local_tests(),
             )?;
             load_semantic_validation_fixture(&builder, &prepared)?;
-            let result = builder
-                .reopen_for_validation()?
-                .validate_rows(evidence, validation_config(temporary.path()));
-            let Err(error) = result else {
-                return Err("semantically tampered wallet store was admitted".into());
-            };
-            let RocksDbWalletError::AdmissionChanged { reason } = error else {
-                return Err(std::io::Error::other(error.to_string()).into());
-            };
-            assert_eq!(reason, tamper.expected_reason());
+            let cold = builder.reopen_for_validation()?;
+
+            let semantic = validate_ready_rows_by_semantic_rederivation(
+                &cold.bounded_open,
+                network,
+                &evidence,
+                semantic_validation_config(temporary.path()),
+            );
+            assert_eq!(admission_reason(semantic)?, tamper.expected_reason());
+
+            let readback = validate_ready_rows_by_readback(
+                &cold.bounded_open,
+                network,
+                &evidence,
+                validation_config(),
+            );
+            if tamper.is_visible_only_to_semantic_rederivation() {
+                readback?;
+            } else {
+                assert_eq!(admission_reason(readback)?, tamper.expected_reason());
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixture keeps every derived family and the READY evidence visibly consistent"
+    )]
+    /// Builds a store with several addresses, shared transactions, and a mix of
+    /// unspent and spent outputs, plus the exact READY evidence of its rows.
+    fn multi_address_fixture(
+        retain_tip_undo: bool,
+    ) -> Result<
+        (SemanticValidationFixture, WalletProjectionReadyEvidence),
+        Box<dyn std::error::Error>,
+    > {
+        let tip = source_position().tip;
+        let mut unspent_outputs = Vec::new();
+        let mut spent_outputs = Vec::new();
+        let mut address_transactions = Vec::new();
+        let mut balance_by_address = BTreeMap::<[u8; 32], u64>::new();
+        let mut commitment = TransparentUtxoSetCommitment::empty();
+        let mut total_value_zat = 0u64;
+        for index in 0u8..40 {
+            let transaction_id = TransactionId::from_bytes([index + 1; 32]);
+            let address_byte = index % 5 + 1;
+            let address = TransparentAddressScriptHash::from_bytes([address_byte; 32]);
+            let created_at = WalletTransactionPosition::new(transaction_id, u32::from(index), tip);
+            let output_count = if index % 4 == 0 { 2 } else { 1 };
+            for output_index in 0..output_count {
+                let output = WalletUnspentOutput::new(
+                    TransparentOutPoint::new(transaction_id, output_index),
+                    address,
+                    1_000 + u64::from(index) + u64::from(output_index),
+                    [0x51],
+                    created_at,
+                )?;
+                let outpoint_key = WalletOutpointKey::new(output.outpoint);
+                if index % 3 == 0 && output_index == 0 {
+                    let spent = WalletSpentOutput::new(
+                        output.clone(),
+                        WalletTransactionPosition::new(
+                            TransactionId::from_bytes([index + 100; 32]),
+                            u32::from(index) + 100,
+                            tip,
+                        ),
+                        0,
+                    );
+                    address_transactions
+                        .extend(expected_address_transactions(&output, Some(&spent)));
+                    spent_outputs.push((outpoint_key, spent));
+                } else {
+                    address_transactions.extend(expected_address_transactions(&output, None));
+                    commitment.insert(&UtxoSetCommitmentElement {
+                        network_id: Network::ZcashRegtest.id(),
+                        outpoint: output.outpoint,
+                        value_zat: output.value_zat,
+                        script_pub_key: &output.script_pub_key,
+                        block_height: output.created_at.block.height,
+                    });
+                    total_value_zat += output.value_zat;
+                    *balance_by_address.entry([address_byte; 32]).or_default() += output.value_zat;
+                    unspent_outputs.push((outpoint_key, output));
+                }
+            }
+        }
+        unspent_outputs.sort_unstable_by_key(|(key, _)| *key);
+        spent_outputs.sort_unstable_by_key(|(key, _)| *key);
+        address_transactions.sort_unstable_by_key(|transaction| transaction.key);
+        address_transactions.dedup_by_key(|transaction| transaction.key);
+        let mut unspent_output_by_address = unspent_outputs
+            .iter()
+            .map(|(_, output)| WalletAddressUnspentOutputKey::new(output))
+            .collect::<Vec<_>>();
+        unspent_output_by_address.sort_unstable_by_key(|key| *key.as_bytes());
+        let address_balances = balance_by_address
+            .into_iter()
+            .map(|(address, balance_zat)| WalletAddressBalance {
+                address_script_hash: TransparentAddressScriptHash::from_bytes(address),
+                balance_zat,
+            })
+            .collect::<Vec<_>>();
+        let mut evidence = WalletProjectionReadyEvidence {
+            source_position: source_position(),
+            source_sequence_digest: source_identity().source_sequence_digest(),
+            settled_tip: source_position().tip,
+            projection_digest: WalletProjectionDigest::from_bytes([0; 32]),
+            projection_accumulator: zinder_wallet_projection::WalletProjectionAccumulator::empty(),
+            row_counts: WalletProjectionFamilyRowCounts::default(),
+            utxo_summary: WalletUtxoSetSummary {
+                utxo_count: u64::try_from(unspent_outputs.len())?,
+                total_value_zat,
+                commitment,
+            },
+        };
+        let mut reorg_undo = Vec::new();
+        if retain_tip_undo {
+            let mut undo = valid_reorg_undo(tip);
+            undo.created_outpoints = unspent_outputs
+                .iter()
+                .map(|(key, _)| *key)
+                .chain(spent_outputs.iter().map(|(key, _)| *key))
+                .collect();
+            undo.created_outpoints.sort_unstable();
+            undo.address_transaction_keys = address_transactions
+                .iter()
+                .map(|transaction| transaction.key)
+                .collect();
+            reorg_undo.push(undo);
+            evidence.settled_tip = settled_tip();
+        }
+        let mut fixture = SemanticValidationFixture {
+            supported_reorg_depth: u32::from(retain_tip_undo),
+            unspent_outputs,
+            unspent_output_by_address,
+            spent_outputs,
+            address_transactions,
+            address_balances,
+            reorg_undo,
+            row_counts: WalletProjectionFamilyRowCounts::default(),
+            projection_digest: WalletProjectionDigest::from_bytes([0; 32]),
+        };
+        refresh_prepared_evidence(&mut fixture, &mut evidence)?;
+        Ok((fixture, evidence))
+    }
+
+    fn cold_store_for(
+        path: impl AsRef<Path>,
+        fixture: &SemanticValidationFixture,
+    ) -> Result<RocksDbWalletBuilder, Box<dyn std::error::Error>> {
+        let builder = fresh_builder(
+            path,
+            Network::ZcashRegtest,
+            source_position(),
+            fixture.supported_reorg_depth,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        load_semantic_validation_fixture(&builder, fixture)?;
+        Ok(builder)
+    }
+
+    #[test]
+    fn cold_readback_and_semantic_rederivation_agree_on_valid_stores()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let network = Network::ZcashRegtest;
+        let unspent = sample_output(0x22, 12_345)?;
+        let spent = WalletSpentOutput::new(
+            sample_output(0x33, 45_678)?,
+            WalletTransactionPosition::new(
+                TransactionId::from_bytes([0x44; 32]),
+                1,
+                source_position().tip,
+            ),
+            0,
+        );
+        let balance = WalletAddressBalance {
+            address_script_hash: unspent.address_script_hash,
+            balance_zat: unspent.value_zat,
+        };
+        let small = (
+            semantic_validation_fixture(network, &unspent, &spent, balance)?,
+            ready_evidence(network, &unspent, &spent, balance)?,
+        );
+        let zero_value = (
+            zero_value_semantic_validation_fixture(network, &sample_output(0x22, 0)?)?,
+            zero_value_ready_evidence(network, &sample_output(0x22, 0)?)?,
+        );
+        for (index, (fixture, evidence)) in [
+            small,
+            zero_value,
+            multi_address_fixture(false)?,
+            multi_address_fixture(true)?,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let temporary = TempDir::new()?;
+            let builder =
+                cold_store_for(temporary.path().join(format!("wallet-{index}")), &fixture)?;
+            let cold = builder.reopen_for_validation()?;
+
+            validate_ready_rows_by_semantic_rederivation(
+                &cold.bounded_open,
+                network,
+                &evidence,
+                semantic_validation_config(temporary.path()),
+            )?;
+            let readback = validate_ready_rows_by_readback(
+                &cold.bounded_open,
+                network,
+                &evidence,
+                validation_config(),
+            )?;
+            assert_eq!(readback.random_read_count, 0);
+            assert_eq!(
+                readback.peak_accounted_reorg_undo_bytes > 0,
+                !fixture.reorg_undo.is_empty()
+            );
+            let validated = cold.validate_rows(evidence.clone(), validation_config())?;
+            if fixture.reorg_undo.is_empty() {
+                let published = validated.publish_ready_at(UnixTimestampMillis::new(1))?;
+                assert_eq!(published.ready_evidence(), &evidence);
+            }
+        }
+        Ok(())
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum StoredRowCorruption {
+        DeleteFirst,
+        FlipLastValueByte,
+        InsertOrphanAddressIndex,
+    }
+
+    fn corrupt_stored_family(
+        builder: &RocksDbWalletBuilder,
+        family_name: &'static str,
+        corruption: StoredRowCorruption,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let family = column_family(&builder.bounded_open, family_name)?;
+        let db = &builder.bounded_open.db;
+        if matches!(corruption, StoredRowCorruption::InsertOrphanAddressIndex) {
+            let orphan = WalletAddressUnspentOutputKey::new(&sample_output(0x99, 1)?);
+            db.put_cf(&family, orphan.as_bytes(), [])?;
+            return Ok(());
+        }
+        let (key, value) = db
+            .iterator_cf(&family, IteratorMode::Start)
+            .next()
+            .ok_or("corrupted family has no rows")??;
+        match corruption {
+            StoredRowCorruption::DeleteFirst => db.delete_cf(&family, &key)?,
+            StoredRowCorruption::FlipLastValueByte => {
+                let mut corrupted = value.to_vec();
+                *corrupted.last_mut().ok_or("corrupted row has no value")? ^= 1;
+                db.put_cf(&family, &key, corrupted)?;
+            }
+            StoredRowCorruption::InsertOrphanAddressIndex => {}
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the corruption table pairs each family mutation with its exact rejection reason"
+    )]
+    fn cold_readback_rejects_rows_corrupted_after_construction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const INDEX_COVERAGE: &str =
+            "address unspent index does not exactly cover every primary unspent output";
+        const BALANCE_SUMS: &str = "address balance rows differ from indexed unspent-output sums";
+        const BALANCE_COVERAGE: &str =
+            "address balance rows do not exactly cover positive indexed addresses";
+        const TRANSACTION_COVERAGE: &str =
+            "address transaction rows do not exactly cover output create/spend effects";
+        const DIGEST_MISMATCH: &str = "READY evidence differs from cold wallet rows";
+
+        let network = Network::ZcashRegtest;
+        let cases: [(&'static str, StoredRowCorruption, Option<&'static str>); 11] = [
+            (
+                TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY,
+                StoredRowCorruption::DeleteFirst,
+                Some("unspent row count differs from READY evidence"),
+            ),
+            (
+                TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY,
+                StoredRowCorruption::FlipLastValueByte,
+                None,
+            ),
+            (
+                TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY,
+                StoredRowCorruption::DeleteFirst,
+                Some("spent row count differs from READY evidence"),
+            ),
+            (
+                TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY,
+                StoredRowCorruption::FlipLastValueByte,
+                None,
+            ),
+            (
+                TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
+                StoredRowCorruption::DeleteFirst,
+                Some(INDEX_COVERAGE),
+            ),
+            (
+                TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
+                StoredRowCorruption::InsertOrphanAddressIndex,
+                Some(INDEX_COVERAGE),
+            ),
+            (
+                TRANSPARENT_ADDRESS_TRANSACTION_COLUMN_FAMILY,
+                StoredRowCorruption::DeleteFirst,
+                Some(TRANSACTION_COVERAGE),
+            ),
+            (
+                TRANSPARENT_ADDRESS_TRANSACTION_COLUMN_FAMILY,
+                StoredRowCorruption::FlipLastValueByte,
+                Some(DIGEST_MISMATCH),
+            ),
+            (
+                TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY,
+                StoredRowCorruption::DeleteFirst,
+                Some(BALANCE_COVERAGE),
+            ),
+            (
+                TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY,
+                StoredRowCorruption::FlipLastValueByte,
+                Some(BALANCE_SUMS),
+            ),
+            (
+                REORG_UNDO_COLUMN_FAMILY,
+                StoredRowCorruption::FlipLastValueByte,
+                None,
+            ),
+        ];
+        for (index, (family_name, corruption, expected_reason)) in cases.into_iter().enumerate() {
+            let temporary = TempDir::new()?;
+            let (fixture, evidence) = multi_address_fixture(true)?;
+            let builder =
+                cold_store_for(temporary.path().join(format!("wallet-{index}")), &fixture)?;
+            corrupt_stored_family(&builder, family_name, corruption)?;
+            let cold = builder.reopen_for_validation()?;
+
+            let readback = validate_ready_rows_by_readback(
+                &cold.bounded_open,
+                network,
+                &evidence,
+                validation_config(),
+            );
+            let semantic = validate_ready_rows_by_semantic_rederivation(
+                &cold.bounded_open,
+                network,
+                &evidence,
+                semantic_validation_config(temporary.path()),
+            );
+            assert!(
+                semantic.is_err(),
+                "semantic re-derivation admitted {family_name} {corruption:?}"
+            );
+            match expected_reason {
+                Some(reason) => assert_eq!(
+                    admission_reason(readback)?,
+                    reason,
+                    "{family_name} {corruption:?}"
+                ),
+                None => assert!(
+                    readback.is_err(),
+                    "digest readback admitted {family_name} {corruption:?}"
+                ),
+            }
         }
         Ok(())
     }
@@ -3258,7 +3949,7 @@ mod tests {
         )?;
         load_semantic_validation_fixture(&builder, &prepared)?;
 
-        let mut config = validation_config(temporary.path());
+        let mut config = validation_config();
         config.max_accounted_reorg_undo_bytes = 0;
         assert!(matches!(
             builder
@@ -3301,7 +3992,7 @@ mod tests {
         let evidence = ready_evidence(network, &unspent, &spent, balance)?;
         let store = builder
             .reopen_for_validation()?
-            .validate_rows(evidence.clone(), validation_config(temporary.path()))?
+            .validate_rows(evidence.clone(), validation_config())?
             .publish_ready_at(UnixTimestampMillis::new(1))?;
 
         assert_eq!(store.ready_evidence(), &evidence);
@@ -3362,7 +4053,7 @@ mod tests {
         drop(
             builder
                 .reopen_for_validation()?
-                .validate_rows(ready, validation_config(temporary.path()))?
+                .validate_rows(ready, validation_config())?
                 .publish_ready_at(UnixTimestampMillis::new(1))?,
         );
         let mut owner = RocksDbWalletStore::open_ready_for_following(
@@ -3462,7 +4153,7 @@ mod tests {
         drop(
             builder
                 .reopen_for_validation()?
-                .validate_rows(evidence.clone(), validation_config(temporary.path()))?
+                .validate_rows(evidence.clone(), validation_config())?
                 .publish_ready_at(UnixTimestampMillis::new(1))?,
         );
         let stale_position = WalletCanonicalSourceIdentity::new(
@@ -3522,7 +4213,7 @@ mod tests {
         let evidence = zero_value_ready_evidence(network, &unspent)?;
         let store = builder
             .reopen_for_validation()?
-            .validate_rows(evidence.clone(), validation_config(temporary.path()))?
+            .validate_rows(evidence.clone(), validation_config())?
             .publish_ready_at(UnixTimestampMillis::new(1))?;
 
         assert_eq!(store.find_unspent_output(unspent.outpoint)?, Some(unspent));

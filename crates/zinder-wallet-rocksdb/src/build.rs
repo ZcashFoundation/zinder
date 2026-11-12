@@ -248,6 +248,24 @@ impl RocksDbWalletBuildOptions {
     }
 }
 
+/// Wall-clock duration of each family scan inside cold validation.
+///
+/// Cold validation reads every durable row once, in stored key order. The
+/// primary output, address-index, and address-transaction scans run
+/// concurrently, so these durations overlap: each is the wall time of its own
+/// scan and none exceeds [`WalletBuildPhaseDurations::cold_validation`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WalletColdValidationPhaseDurations {
+    /// Merged scan of the unspent and spent primary output families.
+    pub primary_output_scan: Duration,
+    /// Scan of the address-unspent index and address-balance families.
+    pub address_index_and_balance_readback: Duration,
+    /// Scan of the address-transaction family.
+    pub address_transaction_readback: Duration,
+    /// Scan of the retained reorg-undo suffix.
+    pub reorg_undo_readback: Duration,
+}
+
 /// Wall-clock duration of each observable fresh-build phase.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WalletBuildPhaseDurations {
@@ -267,8 +285,10 @@ pub struct WalletBuildPhaseDurations {
     pub row_load: Duration,
     /// Blocking flush, close, and cold BUILDING reopen.
     pub flush_and_cold_reopen: Duration,
-    /// Full semantic readback against the candidate READY evidence.
+    /// Digest and row-count readback against the candidate READY evidence.
     pub cold_validation: Duration,
+    /// Breakdown of `cold_validation` by scanned row family.
+    pub cold_validation_phases: WalletColdValidationPhaseDurations,
     /// Synchronous READY control publication and readback.
     pub ready_publication: Duration,
     /// Complete call duration.
@@ -312,10 +332,6 @@ pub struct RocksDbWalletBuildReport {
     pub peak_accounted_reorg_undo_bytes: u64,
     /// Caller-supplied retained reorg-undo ceiling.
     pub max_accounted_reorg_undo_bytes: u64,
-    /// Exact bounded-work evidence for the cold-validation address-index sorter.
-    pub cold_validation_address_index_sort: VariableValueSortEvidence,
-    /// Exact bounded-work evidence for the cold-validation address-history sorter.
-    pub cold_validation_address_transaction_sort: VariableValueSortEvidence,
     /// Highest accounted cold-validation reorg-undo suffix footprint.
     pub cold_validation_peak_accounted_reorg_undo_bytes: u64,
     /// Caller-supplied cold-validation reorg-undo suffix ceiling.
@@ -326,7 +342,7 @@ pub struct RocksDbWalletBuildReport {
     pub sst_file_bytes: u64,
     /// Number of generated SST files ingested into the BUILDING store.
     pub sst_file_count: u64,
-    /// Random point reads performed by cold cross-family validation.
+    /// Random point reads performed by cold validation.
     pub cold_validation_random_read_count: u64,
     /// Phase-level wall-clock timings.
     pub phase_durations: WalletBuildPhaseDurations,
@@ -636,10 +652,6 @@ where
         let mut validated = cold_build.validate_rows(
             ready_evidence,
             WalletColdValidationConfig {
-                staging_path: staging.path(),
-                max_sort_memory_bytes_per_sorter: options
-                    .max_secondary_sort_memory_bytes_per_sorter,
-                max_temporary_file_bytes_per_sorter: options.max_temporary_file_bytes_per_sorter,
                 max_accounted_reorg_undo_bytes: options.max_accounted_reorg_undo_bytes,
             },
         )?;
@@ -687,8 +699,6 @@ where
             address_transaction_sort,
             peak_accounted_reorg_undo_bytes: counters.peak_accounted_reorg_undo_bytes,
             max_accounted_reorg_undo_bytes: counters.max_accounted_reorg_undo_bytes,
-            cold_validation_address_index_sort: validation_evidence.address_index_sort,
-            cold_validation_address_transaction_sort: validation_evidence.address_transaction_sort,
             cold_validation_peak_accounted_reorg_undo_bytes: validation_evidence
                 .peak_accounted_reorg_undo_bytes,
             cold_validation_max_accounted_reorg_undo_bytes: validation_evidence
@@ -707,6 +717,7 @@ where
                 row_load,
                 flush_and_cold_reopen,
                 cold_validation,
+                cold_validation_phases: validation_evidence.phase_durations,
                 ready_publication,
                 total,
             },

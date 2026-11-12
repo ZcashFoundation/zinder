@@ -177,6 +177,10 @@ jq -e \
   def wallet_phase_durations:
     exact_keys([
       "canonical_scan_seconds",
+      "cold_validation_address_index_and_balance_readback_seconds",
+      "cold_validation_address_transaction_readback_seconds",
+      "cold_validation_primary_output_scan_seconds",
+      "cold_validation_reorg_undo_readback_seconds",
       "cold_validation_seconds",
       "flush_and_cold_reopen_seconds",
       "logical_evidence_seconds",
@@ -200,7 +204,15 @@ jq -e \
       + .flush_and_cold_reopen_seconds
       + .cold_validation_seconds
       + .ready_publication_seconds
-    );
+    )
+    and (.cold_validation_seconds as $cold_validation
+      | [
+          .cold_validation_primary_output_scan_seconds,
+          .cold_validation_address_index_and_balance_readback_seconds,
+          .cold_validation_address_transaction_readback_seconds,
+          .cold_validation_reorg_undo_readback_seconds
+        ]
+      | all(. <= $cold_validation));
   def report_phase_durations:
     exact_keys([
       "canonical_cold_reopen_seconds",
@@ -250,7 +262,7 @@ jq -e \
       "wallet_storage_ready"
     ])
     and .contract_identity == "benchmark-report"
-    and .report_format_version == 3
+    and .report_format_version == 4
     and .measurement_kind == "rocksdb-storage-lifecycle"
     and (.storage_candidate
       | exact_keys([
@@ -496,8 +508,6 @@ jq -e \
         | exact_keys([
             "address_index_sort",
             "address_transaction_sort",
-            "cold_validation_address_index_sort",
-            "cold_validation_address_transaction_sort",
             "cold_validation_max_accounted_reorg_undo_bytes",
             "cold_validation_peak_accounted_reorg_undo_bytes",
             "cold_validation_random_read_count",
@@ -523,26 +533,12 @@ jq -e \
               $report.resource_limits.wallet_max_secondary_sort_memory_bytes_per_sorter;
               $report.resource_limits.wallet_max_temporary_file_bytes_per_sorter
             ))
-        and (.cold_validation_address_index_sort
-          | sort_evidence(
-              $report.resource_limits.wallet_max_secondary_sort_memory_bytes_per_sorter;
-              $report.resource_limits.wallet_max_temporary_file_bytes_per_sorter
-            ))
-        and (.cold_validation_address_transaction_sort
-          | sort_evidence(
-              $report.resource_limits.wallet_max_secondary_sort_memory_bytes_per_sorter;
-              $report.resource_limits.wallet_max_temporary_file_bytes_per_sorter
-            ))
         and .outpoint_sort.record_count
           == ($report.wallet_storage_ready.row_counts.transparent_unspent_output_count
             + (2 * $report.wallet_storage_ready.row_counts.transparent_spent_output_count))
         and .address_index_sort.record_count
           == $report.wallet_storage_ready.row_counts.transparent_unspent_output_count
-        and .cold_validation_address_index_sort.record_count
-          == .address_index_sort.record_count
         and .address_transaction_sort.record_count == .outpoint_sort.record_count
-        and .cold_validation_address_transaction_sort.record_count
-          == .address_transaction_sort.record_count
         and .max_accounted_reorg_undo_bytes
           == $report.resource_limits.wallet_max_accounted_reorg_undo_bytes
         and (.peak_accounted_reorg_undo_bytes | nonnegative_integer)

@@ -2462,9 +2462,6 @@ mod tests {
             .validate_rows(
                 ready_evidence,
                 WalletColdValidationConfig {
-                    staging_path: root,
-                    max_sort_memory_bytes_per_sorter: 16 * 1024 * 1024,
-                    max_temporary_file_bytes_per_sorter: 16 * 1024 * 1024,
                     max_accounted_reorg_undo_bytes: 16 * 1024 * 1024,
                 },
             )?

@@ -36,8 +36,8 @@ use zinder_wallet_rocksdb::{
     RocksDbWalletBuildOptions, RocksDbWalletBuildOutcome, RocksDbWalletBuildStore,
     RocksDbWalletError, RocksDbWalletFollowingStore, RocksDbWalletStore,
     WALLET_ROCKSDB_SCHEMA_VERSION, WalletBuildLeaseHeartbeat, WalletBuildLeasePhase,
-    WalletProjectionBuildLeaseExecution, build_wallet_from_canonical,
-    build_wallet_from_canonical_with_lease_and_heartbeat,
+    WalletProjectionBuildLeaseExecution, WalletRecoveryAdmissionConfig,
+    build_wallet_from_canonical, build_wallet_from_canonical_with_lease_and_heartbeat,
     validate_wallet_projection_pre_promotion_fence,
 };
 
@@ -505,6 +505,49 @@ fn fixed_tip_build_matches_exact_version_one_wallet_contract()
         reopened.ready_evidence().source_sequence_digest,
         expected_source.source_sequence_digest()
     );
+    Ok(())
+}
+
+#[test]
+fn built_wallet_passes_independent_semantic_rederivation_after_digest_readback()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let fixture = wallet_baseline_fixture();
+    let canonical_store = build_ready_canonical_store(&temporary, &fixture)?;
+    let wallet_path = temporary.path().join("wallet");
+    let outcome = build_wallet_from_canonical(
+        &canonical_store,
+        &wallet_path,
+        RocksDbWalletBuildOptions {
+            max_secondary_sort_memory_bytes_per_sorter: 128,
+            supported_reorg_depth: 2,
+            ..RocksDbWalletBuildOptions::for_local_tests()
+        },
+    )?;
+    let built_evidence = outcome.store.ready_evidence().clone();
+    drop(outcome.store);
+
+    let mut owner = RocksDbWalletStore::open_ready_for_following(
+        &wallet_path,
+        Network::ZcashRegtest,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    let checkpoint_path = temporary.path().join("wallet-checkpoint");
+    owner.create_owner_checkpoint(&checkpoint_path, RocksDbResourceBudget::for_local_tests())?;
+    drop(owner);
+
+    let admitted = RocksDbWalletFollowingStore::cold_admit_recovery_checkpoint(
+        &checkpoint_path,
+        Network::ZcashRegtest,
+        WalletRecoveryAdmissionConfig {
+            resource_budget: RocksDbResourceBudget::for_local_tests(),
+            staging_path: temporary.path(),
+            max_sort_memory_bytes_per_sorter: 128,
+            max_temporary_file_bytes_per_sorter: 256 * 1024 * 1024,
+            max_accounted_reorg_undo_bytes: 16 * 1024 * 1024,
+        },
+    )?;
+    assert_eq!(admitted.ready_evidence, built_evidence);
     Ok(())
 }
 
@@ -1369,20 +1412,6 @@ fn assert_report(outcome: &RocksDbWalletBuildOutcome) {
     assert!(outcome.report.logical_row_bytes > 0);
     assert!(outcome.report.sst_file_count > 0);
     assert!(outcome.report.sst_file_bytes > 0);
-    assert!(
-        outcome
-            .report
-            .cold_validation_address_index_sort
-            .initial_run_count
-            > 1
-    );
-    assert!(
-        outcome
-            .report
-            .cold_validation_address_transaction_sort
-            .initial_run_count
-            > 1
-    );
     assert_eq!(
         outcome
             .report
@@ -1399,6 +1428,15 @@ fn assert_report(outcome: &RocksDbWalletBuildOutcome) {
     );
     assert_eq!(outcome.report.cold_validation_random_read_count, 0);
     let phases = outcome.report.phase_durations;
+    let validation_phases = phases.cold_validation_phases;
+    for scan in [
+        validation_phases.primary_output_scan,
+        validation_phases.address_index_and_balance_readback,
+        validation_phases.address_transaction_readback,
+        validation_phases.reorg_undo_readback,
+    ] {
+        assert!(scan <= phases.cold_validation);
+    }
     let measured_phase_total = phases.store_initialization
         + phases.canonical_scan
         + phases.outpoint_sort

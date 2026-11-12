@@ -107,7 +107,7 @@ write_report() {
     ($candidate == "rocksdb-canonical-replay-storage") as $is_rocksdb
     | {
         contract_identity: "benchmark-report",
-        report_format_version: 3,
+        report_format_version: 4,
         measurement_kind: "canonical-replay-storage",
         provenance: {
           benchmark_version: "0.1.0",
@@ -503,7 +503,7 @@ expect_failure "paired trial mismatch" "$trial_mismatch_campaign"
 
 wrong_version_campaign="$scratch_directory/wrong-version"
 cp -R "$valid_campaign" "$wrong_version_campaign"
-mutate_report "$wrong_version_campaign/rocksdb-canonical-replay-storage-trial-02.json" '.report_format_version = 4'
+mutate_report "$wrong_version_campaign/rocksdb-canonical-replay-storage-trial-02.json" '.report_format_version = 5'
 expect_failure "wrong report version" "$wrong_version_campaign"
 
 missing_report_identity_campaign="$scratch_directory/missing-report-identity"

@@ -62,7 +62,10 @@ The report and independent container-resource evidence are written under
 `.tmp/rocksdb-storage-lifecycle-evidence` by default. The report separates
 source discovery, canonical source loading, canonical cold validation and
 publication, wallet scanning and external sorting, wallet SST ingestion, wallet
-cold validation and publication, and final independent cold admission. The
+cold validation and publication, and final independent cold admission. Wallet
+cold validation is a digest and row-count readback of the durable rows against
+the construction evidence, and the report records the wall time of each family
+scan (the scans overlap, so each is bounded by the cold-validation total). The
 resource observer records exact cgroup peak memory and sampled peak disk usage
 for the complete process.
 
@@ -120,21 +123,21 @@ docker volume rm \
 The runner invokes
 `scripts/validate-rocksdb-storage-lifecycle-report.sh` after the container
 exits. The validator is independent of the Rust report validator and pins the
-closed report-format-version-3 JSON shape. It rejects evidence unless all of these conditions
+closed report-format-version-4 JSON shape. It rejects evidence unless all of these conditions
 hold:
 
 - canonical physical schema 5, wallet-store and wallet-projection physical
   schema 1, wallet value encoding 2, and replay, block digest, sequence digest,
   and resource-evidence versions 1 are exact; the benchmark report contract is
-  version 3;
+  version 4;
 - canonical `READY` covers the contiguous height-1-through-fixed-tip range,
   authenticates the source checkpoint, and survives a cold reopen;
 - wallet `READY` has the same epoch, event, tip, sequence digest, block count,
   and transaction count, and both stores pass the final cold fence admission;
 - durable wallet counts, projection digest, UTXO commitment, and retained undo
   depth are internally consistent;
-- all five build and cold-validation sorters remain within their declared
-  memory and temporary-file ceilings, both reorg suffixes remain within their
+- all three build sorters remain within their declared memory and
+  temporary-file ceilings, both reorg suffixes remain within their
   memory ceiling, and historical prevout and cold-validation random reads are
   zero;
 - every monotonic phase duration and acceptance boundary is non-negative and
