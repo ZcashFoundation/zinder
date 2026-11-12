@@ -122,6 +122,37 @@ process retries or exits.
 credentials. Invalid combinations are rejected before connection. Secrets are
 redacted from resolved configuration and logs.
 
+## Indexer transport security
+
+The indexer URL scheme selects the transport. `http://` opens plaintext HTTP/2,
+which suits a loopback indexer listener. `https://` negotiates TLS, which a
+node needs when its indexer listens on a network address. Zakura refuses a
+non-loopback indexer listener without mutual TLS.
+
+`[node.indexer_tls]` configures an `https://` indexer:
+
+```text
+ZINDER_NODE__INDEXER_GRPC_ADDR=https://zakura.internal:8230
+ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH=/run/secrets/indexer-ca.pem
+ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH=/run/secrets/indexer-client.pem
+ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH=/run/secrets/indexer-client.key
+```
+
+Without `ca_cert_path`, the node's certificate is verified against the system
+roots. The client certificate and key are optional, and they must be set
+together. `server_name` overrides the name verified against the node's
+certificate. Configuration loading rejects the section for an `http://`
+indexer URL or when no indexer URL is set.
+
+`ZebraIndexerSourceTarget::from_node_target` carries the URL and these settings
+to the indexer sources. The transport reads the PEM files whenever it builds a
+channel, so a streaming source uses rotated files on its next reconnect.
+`zinder-ingest` validates the files at startup and exits with a configuration
+error when one is missing or holds no certificate or key. Binaries accept the
+material only as file paths; see
+[ADR-0019](../adrs/0019-transport-policy-ownership.md#credential-delivery) for
+delivery on platforms that provide secrets only as environment variables.
+
 When `[node.health].addr` is configured, `ZebraJsonRpcSource` polls Zebra's
 readiness endpoint using the configured cadence and thresholds. Without that
 explicit endpoint, source status comes from the JSON-RPC observations available
