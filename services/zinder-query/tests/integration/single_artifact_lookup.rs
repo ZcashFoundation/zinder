@@ -204,3 +204,57 @@ async fn transaction_reports_unavailable_for_unknown_id() -> eyre::Result<()> {
 
     Ok(())
 }
+
+/// A checkpointed store cannot prove a transaction absent, because the
+/// transaction may be mined at or below its history floor.
+#[tokio::test]
+async fn transaction_miss_below_checkpoint_reports_history_unavailable() -> eyre::Result<()> {
+    let floor_height = BlockHeight::new(2);
+    let retained_transaction_id = TransactionId::from_bytes([0xAB; 32]);
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+    let retained_block = chain
+        .block_at(BlockHeight::new(3))
+        .cloned()
+        .ok_or_else(|| eyre!("fixture must contain height 3"))?;
+    let chain = chain.with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
+        retained_transaction_id,
+        retained_block.height,
+        retained_block.hash,
+        0,
+        RAW_TRANSACTION_BYTES.to_vec(),
+    ));
+    let writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain).with_history_floor(floor_height),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let (wallet_query, _store_fixture) = serving_query_from(writer.into_serving_store_fixture()?)?;
+    let chain_epoch = wallet_query.visible_tip_block(None).await?.chain_epoch;
+
+    for at_epoch_id in [None, Some(chain_epoch.id)] {
+        // A transaction mined above the floor is still located.
+        let retained = wallet_query
+            .transaction(retained_transaction_id, at_epoch_id)
+            .await?;
+        let TxStatus::Mined(mined) = retained.status else {
+            return Err(eyre!(
+                "expected mined status above the floor, got {retained:?}"
+            ));
+        };
+        assert_eq!(mined.location.block_height, retained_block.height);
+
+        let outcome = wallet_query
+            .transaction(TransactionId::from_bytes([0xCD; 32]), at_epoch_id)
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                Err(QueryError::CanonicalHistoryUnavailable {
+                    first_available_height
+                }) if first_available_height == BlockHeight::new(3)
+            ),
+            "expected the history floor for pin {at_epoch_id:?}, got {outcome:?}"
+        );
+    }
+
+    Ok(())
+}

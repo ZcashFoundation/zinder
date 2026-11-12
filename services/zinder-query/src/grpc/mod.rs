@@ -7,6 +7,7 @@ mod native;
 use tonic::Status;
 use tonic_types::{ErrorDetails, FieldViolation, PreconditionViolation};
 use zinder_proto::capabilities::WALLET_BROADCAST_TRANSACTION_V1;
+use zinder_proto::wire::canonical_history_unavailable_status;
 use zinder_proto::{BoundaryError, status_with_reason};
 use zinder_store::status_from_store_error;
 
@@ -14,17 +15,17 @@ use crate::QueryError;
 
 pub use adapter::WalletQueryGrpcAdapter;
 pub use native::{
-    WalletEndpointMetadata, address_lookup_to_script_hash, block_header_by_selector_response,
-    block_id_by_selector_response, broadcast_transaction_response,
-    build_transparent_address_tx_ids_chunk, build_transparent_address_tx_ids_header,
-    build_transparent_unspent_output_message, build_transparent_unspent_outputs_header,
-    build_wallet_server_info, chain_events_response, chain_value_pools_at_tip_response,
-    compact_block_response, full_block_response, latest_tree_state_checkpoint_response,
-    network_upgrade_activations_response, subtree_roots_response, transaction_response,
-    transparent_address_tx_ids_response, transparent_address_unspent_outputs_response,
-    transparent_outputs_by_outpoint_response, transparent_spends_by_outpoint_response,
-    transparent_unspent_outputs_by_outpoint_response, tree_state_at_response,
-    visible_tip_block_response,
+    TransactionStatusLookup, WalletEndpointMetadata, address_lookup_to_script_hash,
+    block_header_by_selector_response, block_id_by_selector_response,
+    broadcast_transaction_response, build_transparent_address_tx_ids_chunk,
+    build_transparent_address_tx_ids_header, build_transparent_unspent_output_message,
+    build_transparent_unspent_outputs_header, build_wallet_server_info, chain_events_response,
+    chain_value_pools_at_tip_response, compact_block_response, full_block_response,
+    latest_tree_state_checkpoint_response, network_upgrade_activations_response,
+    subtree_roots_response, transaction_response, transparent_address_tx_ids_response,
+    transparent_address_unspent_outputs_response, transparent_outputs_by_outpoint_response,
+    transparent_spends_by_outpoint_response, transparent_unspent_outputs_by_outpoint_response,
+    tree_state_at_response, visible_tip_block_response,
 };
 
 /// Maps a [`QueryError`] to a tonic [`Status`] using the canonical mapping
@@ -39,6 +40,16 @@ pub use native::{
 pub fn status_from_query_error(error: &QueryError) -> Status {
     if let QueryError::Store(store_error) = error {
         return status_from_store_error(store_error);
+    }
+    if let QueryError::CanonicalHistoryUnavailable {
+        first_available_height,
+    } = error
+    {
+        return canonical_history_unavailable_status(
+            *first_available_height,
+            error.to_string(),
+            precondition_failure_details(error),
+        );
     }
     status_with_reason(
         error.error_reason(),
@@ -180,6 +191,13 @@ fn precondition_failure_details(error: &QueryError) -> ErrorDetails {
                 "requested chain epoch is not retained",
             )
         }
+        QueryError::CanonicalHistoryUnavailable {
+            first_available_height,
+        } => ErrorDetails::with_precondition_failure_violation(
+            "CANONICAL_HISTORY_UNAVAILABLE",
+            format!("canonical_history:{}", first_available_height.value()),
+            "the store retains canonical history only from this height",
+        ),
         _ => ErrorDetails::new(),
     }
 }

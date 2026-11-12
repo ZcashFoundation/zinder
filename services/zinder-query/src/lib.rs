@@ -38,18 +38,18 @@ mod wallet_serving_pair_publisher;
 mod wallet_serving_query;
 
 pub use grpc::{
-    WalletEndpointMetadata, WalletQueryGrpcAdapter, address_lookup_to_script_hash,
-    block_header_by_selector_response, block_id_by_selector_response,
-    broadcast_transaction_response, build_transparent_address_tx_ids_chunk,
-    build_transparent_address_tx_ids_header, build_transparent_unspent_output_message,
-    build_transparent_unspent_outputs_header, build_wallet_server_info, chain_events_response,
-    chain_value_pools_at_tip_response, compact_block_response, full_block_response,
-    latest_tree_state_checkpoint_response, network_upgrade_activations_response,
-    status_from_query_error, subtree_roots_response, transaction_response,
-    transparent_address_tx_ids_response, transparent_address_unspent_outputs_response,
-    transparent_outputs_by_outpoint_response, transparent_spends_by_outpoint_response,
-    transparent_unspent_outputs_by_outpoint_response, tree_state_at_response,
-    visible_tip_block_response,
+    TransactionStatusLookup, WalletEndpointMetadata, WalletQueryGrpcAdapter,
+    address_lookup_to_script_hash, block_header_by_selector_response,
+    block_id_by_selector_response, broadcast_transaction_response,
+    build_transparent_address_tx_ids_chunk, build_transparent_address_tx_ids_header,
+    build_transparent_unspent_output_message, build_transparent_unspent_outputs_header,
+    build_wallet_server_info, chain_events_response, chain_value_pools_at_tip_response,
+    compact_block_response, full_block_response, latest_tree_state_checkpoint_response,
+    network_upgrade_activations_response, status_from_query_error, subtree_roots_response,
+    transaction_response, transparent_address_tx_ids_response,
+    transparent_address_unspent_outputs_response, transparent_outputs_by_outpoint_response,
+    transparent_spends_by_outpoint_response, transparent_unspent_outputs_by_outpoint_response,
+    tree_state_at_response, visible_tip_block_response,
 };
 pub use ingest_control::{AdmittedIngestControl, IngestControlAdmissionError};
 pub use native_wallet_endpoint_capabilities::{
@@ -163,10 +163,13 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     /// Reads typed transaction status by transaction id.
     ///
     /// Returns [`TxStatus::Mined`] for mined transactions, with epoch-bound
-    /// [`zinder_core::MinedTransactionChainContext`] enrichment, [`TxStatus::NotFound`] when the
-    /// transaction is not visible in the canonical chain, and
-    /// [`QueryError`] for storage/upstream failures. An `at_epoch_id` pin is
-    /// a canonical-chain read and never consults live mempool state;
+    /// [`zinder_core::MinedTransactionChainContext`] enrichment, and
+    /// [`TxStatus::NotFound`] only for a proven absence from the canonical
+    /// chain of the returned epoch. A store whose history starts after a
+    /// checkpoint cannot prove an absence and returns
+    /// [`QueryError::CanonicalHistoryUnavailable`] on a miss; storage faults,
+    /// a missing epoch, and a pin this store cannot serve are other
+    /// [`QueryError`] values. This method never consults live mempool state;
     /// mempool fall-through is the caller's responsibility on this trait.
     async fn transaction(
         &self,
@@ -450,6 +453,7 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         }
         Some(QueryError::InvalidAddress { .. }) => "invalid_address",
         Some(QueryError::ChainEpochPinUnavailable { .. }) => "chain_epoch_pin_unavailable",
+        Some(QueryError::CanonicalHistoryUnavailable { .. }) => "canonical_history_unavailable",
         Some(QueryError::UnsupportedChainEvent { .. }) => "unsupported_chain_event",
         Some(QueryError::UnsupportedBlockSelector { .. }) => "unsupported_block_selector",
         Some(QueryError::UnsupportedTransactionStatus { .. }) => "unsupported_transaction_status",
@@ -891,6 +895,17 @@ pub enum QueryError {
         chain_epoch_id: ChainEpochId,
     },
 
+    /// The store's retained canonical history starts after a checkpoint, so a
+    /// transaction lookup that missed cannot prove the transaction absent.
+    #[error(
+        "canonical history starts at height {}; transaction absence cannot be proven",
+        .first_available_height.value()
+    )]
+    CanonicalHistoryUnavailable {
+        /// First height the store retains.
+        first_available_height: BlockHeight,
+    },
+
     /// Store returned a chain-event variant unsupported by the native protocol.
     #[error("unsupported chain event: {event}")]
     UnsupportedChainEvent {
@@ -973,7 +988,8 @@ pub enum QueryError {
     ///
     /// Converting a [`zinder_store::CanonicalStoreError`] with `From` routes an
     /// absent height-keyed row or an uncovered subtree root to
-    /// [`QueryError::ArtifactUnavailable`] instead.
+    /// [`QueryError::ArtifactUnavailable`], and a transaction miss below the
+    /// history floor to [`QueryError::CanonicalHistoryUnavailable`], instead.
     #[error(transparent)]
     CanonicalStore(zinder_store::CanonicalStoreError),
 
@@ -1008,6 +1024,11 @@ impl From<zinder_store::CanonicalStoreError> for QueryError {
                     protocol,
                     index: subtree_index,
                 },
+            },
+            zinder_store::CanonicalStoreError::CanonicalHistoryUnavailable {
+                first_available_height,
+            } => Self::CanonicalHistoryUnavailable {
+                first_available_height,
             },
             other => Self::CanonicalStore(other),
         }
@@ -1044,6 +1065,7 @@ impl zinder_proto::BoundaryError for QueryError {
             }
             Self::ChainEventCursorExpired { .. } => ErrorReason::ChainEventCursorExpired,
             Self::ChainEpochPinUnavailable { .. } => ErrorReason::ChainEpochPinUnavailable,
+            Self::CanonicalHistoryUnavailable { .. } => ErrorReason::CanonicalHistoryUnavailable,
             Self::ArtifactUnavailable { .. } => ErrorReason::ArtifactUnavailable,
             Self::CompactBlockPayloadMalformed { .. } => ErrorReason::CompactBlockPayloadMalformed,
             Self::ArtifactCorrupt { .. } => ErrorReason::ArtifactCorrupt,
@@ -1165,6 +1187,9 @@ mod error_reason_tests {
             QueryError::ChainEpochPinUnavailable {
                 chain_epoch_id: ChainEpochId::new(1),
             },
+            QueryError::CanonicalHistoryUnavailable {
+                first_available_height: BlockHeight::new(101),
+            },
             QueryError::UnsupportedChainEvent { event: "probe" },
             QueryError::UnsupportedBlockSelector { reason: "probe" },
             QueryError::UnsupportedTransactionStatus { reason: "probe" },
@@ -1198,6 +1223,29 @@ mod error_reason_tests {
                 reason: "probe".to_owned(),
             }),
         ]
+    }
+
+    #[test]
+    fn history_floor_miss_carries_the_first_retained_height_on_the_wire()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let error = QueryError::from(
+            zinder_store::CanonicalStoreError::CanonicalHistoryUnavailable {
+                first_available_height: BlockHeight::new(101),
+            },
+        );
+        assert!(matches!(
+            error,
+            QueryError::CanonicalHistoryUnavailable {
+                first_available_height
+            } if first_available_height == BlockHeight::new(101)
+        ));
+        let status = crate::status_from_query_error(&error);
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            zinder_proto::wire::canonical_history_first_available_height(&status)?,
+            Some(BlockHeight::new(101))
+        );
+        Ok(())
     }
 
     #[test]

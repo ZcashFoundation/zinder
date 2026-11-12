@@ -851,9 +851,13 @@ where
             // the authenticated source count for every retention mode. Blob
             // coverage equals that count only under Transactions/All and is
             // zero under None; live append and replacement update the retained
-            // families in one canonical batch. Under that admitted contract,
-            // absence is a real miss.
-            let Some(location) = pair.canonical().transaction_location(transaction_id)? else {
+            // families in one canonical batch. Under that admitted contract, a
+            // miss over complete history is a proven absence; the store refuses
+            // a miss below its history floor.
+            let Some(location) = pair
+                .canonical()
+                .transaction_location_or_proven_absence(transaction_id)?
+            else {
                 return Ok(TransactionStatus {
                     chain_epoch,
                     status: TxStatus::NotFound,
