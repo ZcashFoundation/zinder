@@ -109,13 +109,49 @@ required` in its pull request template.
 
 ## Publish a release
 
-After the release-preparation change merges, wait for required checks to pass,
-then create an annotated tag at that commit:
+After the release-preparation change merges, wait for required checks to pass.
+Zinder certifies both Zebra 7.0.0 and Zakura 1.8.6, so a failure against
+either node blocks the release. Before tagging, confirm on the
+release-preparation commit:
+
+- [ ] The `live-tests` workflow's `live regtest (zebra)` and
+      `live regtest (zakura)` jobs are green.
+- [ ] The `parity-compat` workflow's `parity diff (regtest, zebra)` and
+      `parity diff (regtest, zakura)` jobs are green.
+
+Both workflows run nightly and on pull requests that touch node-facing code,
+so they may not have run on that commit. A manual run starts on a branch or
+tag, not on a commit, so start both while `main` still points at the
+release-preparation commit:
 
 ```console
 git switch main
 git pull --ff-only
-git tag -a v0.5.0 -m "v0.5.0"
+release_commit="$(git rev-parse HEAD)"
+git log -1 --oneline "$release_commit"
+gh workflow run live-tests.yml --ref main -f network=zcash-regtest
+gh workflow run parity-compat.yml --ref main
+```
+
+Confirm that the log line shows the release-preparation commit. Then select
+the manual runs of that commit by its hash, not by recency, and wait for each
+one. `gh run watch --exit-status` exits non-zero when any job in the run fails:
+
+```console
+gh run list --workflow live-tests.yml --commit "$release_commit" --event workflow_dispatch --json databaseId,status,conclusion
+gh run list --workflow parity-compat.yml --commit "$release_commit" --event workflow_dispatch --json databaseId,status,conclusion
+gh run watch <databaseId> --exit-status
+```
+
+If `main` moved before the runs started, they test the newer commit, and the
+lists stay empty. In that case, push the tag below first, start both
+workflows with `--ref` set to the tag, and approve the `release` environment
+only after all four jobs pass on the tag's commit.
+
+Then create an annotated tag at that commit:
+
+```console
+git tag -a v0.5.0 -m "v0.5.0" "$release_commit"
 git push origin v0.5.0
 ```
 

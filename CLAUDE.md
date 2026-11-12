@@ -108,6 +108,10 @@ ZINDER_TEST_LIVE=1 \
 
 Without `ZINDER_NODE__INDEXER_GRPC_ADDR`, the `zebra_indexer_mempool_*` tests skip.
 
+The same schema runs the suite against Zakura. Start Zebra or Zakura on the CI
+Regtest schedule as in the Testing Runbook's
+[Regtest through NU7](docs/runbooks/testing.md#regtest-through-nu7) section.
+
 Testnet (Z3 stack with cookie auth):
 
 ```bash
@@ -220,4 +224,4 @@ When a change alters a service boundary, public API, storage byte layout, protoc
 
 ## Consensus Dependency Pins
 
-`zebra-chain` is pinned to `15.0.0`, the release Zebra 7.0.0 uses, with the matching published librustzcash stack (`zcash_address 0.14.0`, `zcash_protocol 0.11.0`, `zcash_primitives 0.31.0`, `zcash_transparent 0.11.0`, `orchard 0.16.0`, `sapling-crypto 0.9.0`, `incrementalmerkletree 0.9.0`, `zip32 0.3.0`, and `secp256k1 0.33.1`) so no duplicate librustzcash type exists at the `zebra-chain` boundary. This cohort decodes version-6 transactions under both Ironwood (NU6.3) and NU7, whose assigned consensus branch ID is `0x77190ad9`. `scripts/check-zcash-upstream-alignment.sh` fails when any of these crates resolves to a version other than the one `zebra-chain` uses, or when the certified Zebra runtime image differs from `zfnd/zebra:7.0.0` at its pinned digest. Advance the whole cohort and the runtime pin together. There are no git dependencies; `cargo-deny` denies unknown git and registry sources.
+`zebra-chain` is pinned to `15.0.0`, the release Zebra 7.0.0 uses, with the matching published librustzcash stack (`zcash_address 0.14.0`, `zcash_protocol 0.11.0`, `zcash_primitives 0.31.0`, `zcash_transparent 0.11.0`, `orchard 0.16.0`, `sapling-crypto 0.9.0`, `incrementalmerkletree 0.9.0`, `zip32 0.3.0`, and `secp256k1 0.33.1`) so no duplicate librustzcash type exists at the `zebra-chain` boundary. This cohort decodes version-6 transactions under Ironwood (NU6.3, consensus branch ID `0x37a5165b`) and NU7 (consensus branch ID `0x77190ad9`). Zinder certifies two node runtimes, which the live and parity lanes run side by side: Zebra 7.0.0 (`docker.io/zfnd/zebra:7.0.0@sha256:a70d2be8ffef3a4b6e37355724e36a0e6c1838e46baa28bfb216739f00cf2d34`) and Zakura 1.8.6 (`docker.io/zakuracore/zakura:1.8.6@sha256:e514c89b751b685686690098928507aaa994311e6b90c79373c55b0afaa45d50`). `scripts/check-zcash-upstream-alignment.sh` fails when any of these crates resolves to a version other than the one `zebra-chain` uses, or when either runtime image differs from its pinned digest anywhere the lanes or their docs name it. Advance the crate cohort and both runtime pins together, and keep both lanes green. There are no git dependencies; `cargo-deny` denies unknown git and registry sources.
