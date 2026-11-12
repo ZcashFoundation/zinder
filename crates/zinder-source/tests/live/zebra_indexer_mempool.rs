@@ -88,8 +88,8 @@ fn build_indexer_mempool_source(
 ///
 /// **Destructive**: this test restarts the Zebra container named by
 /// `ZINDER_TEST_INDEXER_CONTAINER_NAME` (default `z3_regtest_sidecar_zebra`).
-/// It is gated behind the `node-mutating` nextest group so it never races
-/// other live tests against the same container.
+/// The `node-mutating` nextest group only serializes it against other group
+/// members, so CI runs it in its own invocation after the rest of the live suite.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
 async fn streaming_source_recovers_after_zebra_indexer_restart() -> Result<()> {

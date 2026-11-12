@@ -113,15 +113,32 @@ jobs:
           ZINDER_NODE__AUTH__METHOD: ${{ secrets.NODE_REGTEST_AUTH_METHOD || 'basic' }}
           ZINDER_NODE__AUTH__USERNAME: ${{ secrets.NODE_REGTEST_AUTH_USERNAME || 'zebra' }}
           ZINDER_NODE__AUTH__PASSWORD: ${{ secrets.NODE_REGTEST_AUTH_PASSWORD || 'zebra' }}
-          ZINDER_TEST_INDEXER_CONTAINER_NAME: zebra-regtest
-        # Run every live test except mainnet-only ones and the activation test
-        # above. Regtest is the only network where deep_chain and latency fit
+        # Run every live test except mainnet-only ones, the activation test
+        # above, and the Zebra restart test below. Regtest is the only network where deep_chain and latency fit
         # in CI budgets without checkpoint backfill. Mainnet-only tests are
         # excluded by explicit behavior name because live test names avoid
         # network labels unless the behavior itself is network-specific.
         run: |
           cargo nextest run --workspace --profile=ci-live --run-ignored=all \
-            -E 'test(/^live::/) and not test(/^live::nu7_activation::/) and not test(mainnet) and not test(backfills_last_1000_blocks_from_checkpoint)'
+            -E 'test(/^live::/) and not test(/^live::nu7_activation::/) and not test(mainnet) and not test(backfills_last_1000_blocks_from_checkpoint) and not test(streaming_source_recovers_after_zebra_indexer_restart)'
+
+      - name: Run the Zebra restart test against regtest
+        env:
+          ZINDER_TEST_LIVE: "1"
+          ZINDER_NETWORK: zcash-regtest
+          ZINDER_NODE__JSON_RPC_ADDR: ${{ secrets.NODE_REGTEST_JSON_RPC_ADDR || 'http://127.0.0.1:39232' }}
+          ZINDER_NODE__INDEXER_GRPC_ADDR: http://127.0.0.1:39155
+          ZINDER_NODE__AUTH__METHOD: ${{ secrets.NODE_REGTEST_AUTH_METHOD || 'basic' }}
+          ZINDER_NODE__AUTH__USERNAME: ${{ secrets.NODE_REGTEST_AUTH_USERNAME || 'zebra' }}
+          ZINDER_NODE__AUTH__PASSWORD: ${{ secrets.NODE_REGTEST_AUTH_PASSWORD || 'zebra' }}
+          ZINDER_TEST_INDEXER_CONTAINER_NAME: zebra-regtest
+        # This test restarts the Zebra container, so it runs alone after every
+        # other live test has finished. A nextest group only serializes its own
+        # members, and JSON-RPC tests outside the group would otherwise see the
+        # node disappear mid-request.
+        run: |
+          cargo nextest run --workspace --profile=ci-live --run-ignored=all \
+            -E 'test(streaming_source_recovers_after_zebra_indexer_restart)'
 
       - name: Dump Zebra logs on failure
         if: failure()

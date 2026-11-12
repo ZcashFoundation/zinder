@@ -386,6 +386,10 @@ and `streaming_source_recovers_after_zebra_indexer_restart`. The restart test
 runs `docker restart` on the container named by
 `ZINDER_TEST_INDEXER_CONTAINER_NAME` (default `z3_regtest_sidecar_zebra`) and
 waits for Docker to report it healthy, so that container needs a health check.
+The group only serializes its own members, so JSON-RPC tests outside it can
+see the node vanish mid-request. Run the restart test in its own invocation
+after the rest of the suite, as the live workflow does, or exclude it with
+`and not test(streaming_source_recovers_after_zebra_indexer_restart)`.
 
 Other tests return early, and nextest reports them as passed, unless their own
 endpoints are set:
