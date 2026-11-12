@@ -565,7 +565,8 @@ ascending, page-bounded wallet-projection read. Its opaque cursor carries the
 exact `WalletCanonicalSourceIdentity` that issued the page, so pair replacement
 fails with `FAILED_PRECONDITION`. History is ascending only: the request has no
 direction field, and field 6, which once carried a newest-first flag, is
-reserved. Only the terminal chunk carries a non-empty resume cursor.
+reserved. Newest-first address history is `ExplorerQuery.TransparentAddressActivity`.
+Only the terminal chunk carries a non-empty resume cursor.
 
 The compatibility adapter implements `GetTaddressTxids` and
 `GetTaddressTransactions` through `WalletServingQuery`. That path reads
@@ -666,7 +667,10 @@ This live snapshot is a prerequisite fact, not a value-pool history or value-flo
 
 ## Transparent Address Balance
 
-The native endpoint does not serve a transparent balance. The lightwalletd
+The native endpoint does not serve a transparent balance. Native wallets sum
+the `TransparentAddressUnspentOutputs` they already read to spend, and
+integrators that need balance, received, and sent totals use
+`ExplorerQuery.TransparentAddressActivity.summary`. The lightwalletd
 compatibility runtime answers `GetTaddressBalance` and
 `GetTaddressBalanceStream` from the in-process
 `WalletQueryApi::transparent_address_balance` domain method. That method sums

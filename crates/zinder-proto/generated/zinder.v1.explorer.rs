@@ -1267,9 +1267,10 @@ pub struct MempoolActivityResponse {
 /// `ExplorerQuery.TransparentAddressActivity` request.
 ///
 /// Returns confirmed transparent-address activity from the materialized view.
-/// Mempool activity for a transparent address is served
-/// separately through `MempoolActivity` so each surface has one source
-/// of truth.
+/// ExplorerQuery has no per-address mempool read: `MempoolActivity` entries
+/// carry no outputs or scripts. Pending activity for an address comes from
+/// filtering `WalletQuery.MempoolSnapshot` and `MempoolEvents` entries on their
+/// `transparent_outputs` and `transparent_spends`.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressActivityRequest {
     /// Selector for the transparent address being queried.
@@ -1421,8 +1422,10 @@ pub struct TransparentAddressActivityResponse {
 /// over an inclusive height range, ordered ascending. One entry per received
 /// output and per resolved spend, so the series is strictly finer than
 /// `TransparentAddressActivity`, which folds the same events into one net row
-/// per transaction. The mempool view is served separately through
-/// `MempoolActivity`.
+/// per transaction. Pending deltas for an address come from filtering
+/// `WalletQuery.MempoolSnapshot` and `MempoolEvents` entries on their
+/// `transparent_outputs` and `transparent_spends`; ExplorerQuery has no
+/// per-address mempool read.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressDeltasRequest {
     /// Selector for the transparent address being queried.
@@ -4304,9 +4307,10 @@ pub mod explorer_query_client {
             self.inner.unary(req, path, codec).await
         }
         /// Returns the confirmed transparent-address activity feed materialized
-        /// by `TransparentAddressActivityConsumer`. The mempool view for an
-        /// address is served separately through `MempoolActivity` so each
-        /// surface has one source of truth. Capability:
+        /// by `TransparentAddressActivityConsumer`, newest first. ExplorerQuery has
+        /// no per-address mempool read; pending activity comes from filtering
+        /// `WalletQuery.MempoolSnapshot` and `MempoolEvents` entries on their
+        /// `transparent_outputs` and `transparent_spends`. Capability:
         /// `explorer.transparent_address.activity_v2`.
         pub async fn transparent_address_activity(
             &mut self,
@@ -5213,9 +5217,10 @@ pub mod explorer_query_server {
             tonic::Status,
         >;
         /// Returns the confirmed transparent-address activity feed materialized
-        /// by `TransparentAddressActivityConsumer`. The mempool view for an
-        /// address is served separately through `MempoolActivity` so each
-        /// surface has one source of truth. Capability:
+        /// by `TransparentAddressActivityConsumer`, newest first. ExplorerQuery has
+        /// no per-address mempool read; pending activity comes from filtering
+        /// `WalletQuery.MempoolSnapshot` and `MempoolEvents` entries on their
+        /// `transparent_outputs` and `transparent_spends`. Capability:
         /// `explorer.transparent_address.activity_v2`.
         async fn transparent_address_activity(
             &self,

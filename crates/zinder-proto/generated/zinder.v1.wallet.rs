@@ -1457,6 +1457,9 @@ pub struct ChainValuePoolsAtTipResponse {
     pub source_tip: ::core::option::Option<BlockTip>,
 }
 /// Transparent-address tx-history range request, server-streamed.
+///
+/// History is ascending only. Newest-first address history is
+/// `ExplorerQuery.TransparentAddressActivity`.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressTxIdsInRangeRequest {
     /// Selector for the transparent address being queried.
@@ -2318,7 +2321,8 @@ pub mod wallet_query_client {
             self.inner.server_streaming(req, path, codec).await
         }
         /// Stream the transparent-address tx-history index for an inclusive
-        /// height range, in ascending mined order.
+        /// height range, in ascending mined order. Newest-first address history
+        /// is `ExplorerQuery.TransparentAddressActivity`.
         pub async fn transparent_address_tx_ids_in_range(
             &mut self,
             request: impl tonic::IntoRequest<
@@ -2689,7 +2693,8 @@ pub mod wallet_query_server {
             + std::marker::Send
             + 'static;
         /// Stream the transparent-address tx-history index for an inclusive
-        /// height range, in ascending mined order.
+        /// height range, in ascending mined order. Newest-first address history
+        /// is `ExplorerQuery.TransparentAddressActivity`.
         async fn transparent_address_tx_ids_in_range(
             &self,
             request: tonic::Request<super::TransparentAddressTxIdsInRangeRequest>,

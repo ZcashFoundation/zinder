@@ -1382,6 +1382,9 @@ message ChainValuePoolsAtTipResponse {
 }
 
 // Transparent-address tx-history range request, server-streamed.
+//
+// History is ascending only. Newest-first address history is
+// `ExplorerQuery.TransparentAddressActivity`.
 message TransparentAddressTxIdsInRangeRequest {
   // Selector for the transparent address being queried.
   AddressLookup address = 1;
@@ -1402,7 +1405,8 @@ message TransparentAddressTxIdsInRangeRequest {
   bytes from_cursor = 5;
 
   // Removed newest-first iteration flag. No supported consumer requested it
-  // and no release server served it; history is ascending only.
+  // and no release server served it; history is ascending only. Use
+  // `ExplorerQuery.TransparentAddressActivity` for newest-first history.
   reserved 6;
   reserved "descending";
 }
@@ -1520,7 +1524,8 @@ service WalletQuery {
       returns (stream TransparentUnspentOutputsChunk);
 
   // Stream the transparent-address tx-history index for an inclusive
-  // height range, in ascending mined order.
+  // height range, in ascending mined order. Newest-first address history
+  // is `ExplorerQuery.TransparentAddressActivity`.
   rpc TransparentAddressTxIdsInRange(TransparentAddressTxIdsInRangeRequest)
       returns (stream TransparentAddressTxIdsChunk);
 
