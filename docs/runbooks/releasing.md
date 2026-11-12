@@ -136,20 +136,30 @@ observed state in the job summary. These credential-free jobs must succeed
 before the protected `release` environment authorizes all trusted publication
 and attestation work.
 
+A release asks for one approval. The `authorize release publication` job is
+the only job in the reviewed `release` environment, and every credentialed job
+depends on it. Crate publication runs in the `crates-io` environment, which has
+no reviewers and accepts only `v*` tags; it exists so the crates.io trusted
+publishers can name it. Rerunning only the failed jobs after approval does not
+ask again.
+
 After approval, the workflow performs these operations in order:
 
-1. Build each GNU/Linux binary platform twice, confirm identical binary and
-   archive hashes, and validate the catalog, embedded commit, ELF machine,
-   dynamic libraries, symbol ceilings, and clean Debian runtime probes.
-2. Generate one SPDX 2.3 SBOM from each auditable archive and attest both SLSA
-   provenance and the SBOM.
-3. Authenticate to crates.io through GitHub OIDC, then let Cargo Release
+1. Build each GNU/Linux binary platform in 2 independent uncached jobs that run
+   side by side. The primary job validates the catalog, embedded commit, ELF
+   machine, dynamic libraries, symbol ceilings, and clean Debian runtime
+   probes, and generates one SPDX 2.3 SBOM from the auditable archive.
+2. In the primary job, build the 4 runtime images and 2 single-volume host
+   images natively for Linux amd64 and arm64 from the same binary stage with
+   BuildKit max-mode provenance and SBOMs, confirm each image carries the
+   archived binaries byte for byte, and push the untagged platform digests.
+3. Confirm the 2 builds produced identical binary and archive hashes, then
+   attest both SLSA provenance and the SBOM for each archive.
+4. Authenticate to crates.io through GitHub OIDC, then let Cargo Release
    publish only missing SDK crates in Cargo's dependency order and verify their
    source provenance.
-4. Compile a fresh registry-only consumer against the exact published
+5. Compile a fresh registry-only consumer against the exact published
    `zinder-client` version after sparse-index propagation.
-5. Build the 4 runtime images and 2 single-volume host images natively for Linux amd64 and arm64 with BuildKit
-   max-mode provenance and SBOMs.
 6. Publish exact `vX.Y.Z` and `sha-<commit>` manifests, attest each child SBOM
    and the root provenance, sign only the root digest, and verify the exact
    two-platform topology and producer identity.
@@ -214,7 +224,12 @@ crates.io settings for `zinder-core`, `zinder-proto`, and `zinder-client`:
 - owner: `gustavovalverde`
 - repository: `zinder`
 - workflow: `release.yml`
-- environment: `release`
+- environment: `crates-io`
+
+The `crates-io` GitHub environment must exist with no required reviewers and a
+deployment policy that admits only `v*` tags. A crate whose trusted publisher
+still names the `release` environment fails at `Authenticate to crates.io`;
+correct the publisher and rerun the failed job.
 
 The workflow uses `rust-lang/crates-io-auth-action` to exchange GitHub's OIDC
 identity for a short-lived crates.io token. Do not add a repository or
@@ -320,8 +335,9 @@ and `publish` phases: the existing product tag, artifact-rich GitHub Release,
 and `latest` image promotion remain owned by the Zinder workflow.
 
 The workflow creates the public GitHub Release only after all exact image tags
-and trust evidence exist. A failure before publication may leave untagged
-platform digests or an editable draft Release; rerunning the failed workflow
+and trust evidence exist. Every binary and image build finishes before crate
+publication, so a build failure leaves crates.io untouched. A failure before
+publication may leave untagged platform digests or an editable draft Release; rerunning the failed workflow
 jobs is safe because the workflow replaces draft assets and recreates exact
 tags from the same validated commit. A published immutable Release causes
 validation to fail closed rather than modify public assets.
