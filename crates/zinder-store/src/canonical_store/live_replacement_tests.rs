@@ -476,6 +476,35 @@ fn no_blob_retention_preserves_transaction_locations_across_the_complete_store_l
 }
 
 #[test]
+fn complete_history_proves_displaced_and_unknown_transactions_absent()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store = replaced_store(&temporary.path().join("canonical"))?;
+    let retained_location = transaction_location(BlockHeight::new(1), [1; 32], 101);
+    let replacement_location = transaction_location(BlockHeight::new(3), [33; 32], 203);
+
+    assert_eq!(
+        store.transaction_location_or_proven_absence(retained_location.transaction_id)?,
+        Some(retained_location)
+    );
+    assert_eq!(
+        store.transaction_location_or_proven_absence(replacement_location.transaction_id)?,
+        Some(replacement_location)
+    );
+    // The store retains every height from 1, so a transaction the replacement
+    // displaced, and one that was never mined, are proven absent.
+    for absent_transaction_tag in [103, 104, 0x44] {
+        assert_eq!(
+            store.transaction_location_or_proven_absence(TransactionId::from_bytes(
+                [absent_transaction_tag; 32]
+            ))?,
+            None
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn repeatedly_displaced_block_hash_reopens_and_resolves_its_newest_occurrence()
 -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;
