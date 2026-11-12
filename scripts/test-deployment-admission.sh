@@ -378,7 +378,7 @@ sed '/^[[:space:]]*- collect-binary-assets$/d' \
   "$repository_root/.github/workflows/release.yml" \
   > "$late_binary_assets_workflow"
 expect_rejected \
-  "a release workflow authenticating before binary assets succeed" \
+  "a release workflow assembling assets before binary archives succeed" \
   --release-workflow "$late_binary_assets_workflow"
 
 early_latest_workflow="$temporary_directory/early-latest-release.yml"
@@ -394,14 +394,21 @@ expect_rejected \
 unprotected_release_workflow="$temporary_directory/unprotected-release.yml"
 awk '
   /^  publish-sdk-crates:/ { in_publication = 1 }
-  in_publication && /^    environment: crates-io$/ { next }
-  in_publication && /^  merge:/ { in_publication = 0 }
+  in_publication && /^    environment: release$/ { next }
+  in_publication && /^  build:/ { in_publication = 0 }
   { print }
 ' "$repository_root/.github/workflows/release.yml" \
   > "$unprotected_release_workflow"
-expect_rejected \
-  "a release workflow that publishes crates outside the crates-io environment" \
-  --release-workflow "$unprotected_release_workflow"
+unprotected_release_error="$temporary_directory/unprotected-release-error.txt"
+if bash "$validator" \
+  --release-workflow "$unprotected_release_workflow" \
+  > /dev/null 2> "$unprotected_release_error"; then
+  fail "a release workflow that publishes without environment approval was admitted"
+fi
+grep -Fq \
+  'release admission rejected: SDK publication must follow validated package' \
+  "$unprotected_release_error" \
+  || fail "the unprotected release workflow was rejected for an unrelated reason"
 
 bypassed_authorization_workflow="$temporary_directory/bypassed-authorization-release.yml"
 sed '/^[[:space:]]*- publish-sdk-crates$/d' \
@@ -411,20 +418,8 @@ expect_rejected \
   "a release workflow whose first registry writer bypasses approval" \
   --release-workflow "$bypassed_authorization_workflow"
 
-unauthorized_crate_publication_workflow="$temporary_directory/unauthorized-crate-publication-release.yml"
-awk '
-  /^  publish-sdk-crates:/ { in_publication = 1 }
-  in_publication && /^      - authorize-release$/ { next }
-  in_publication && /^  merge:/ { in_publication = 0 }
-  { print }
-' "$repository_root/.github/workflows/release.yml" \
-  > "$unauthorized_crate_publication_workflow"
-expect_rejected \
-  "a release workflow that publishes crates without release authorization" \
-  --release-workflow "$unauthorized_crate_publication_workflow"
-
 twice_reviewed_workflow="$temporary_directory/twice-reviewed-release.yml"
-sed 's/^    environment: crates-io$/    environment: release/' \
+sed '/^  build:/a\    environment: release' \
   "$repository_root/.github/workflows/release.yml" \
   > "$twice_reviewed_workflow"
 expect_rejected \
@@ -571,23 +566,6 @@ sed '/^[[:space:]]*- build$/d' \
 expect_rejected \
   "a release workflow whose manifest publisher bypasses digest builds" \
   --release-workflow "$bypassed_manifest_dependency_workflow"
-
-unprotected_authorization_workflow="$temporary_directory/unprotected-authorization-release.yml"
-sed '/^  authorize-release:/,/^  build:/ {
-  /^    environment: release$/d
-}' \
-  "$repository_root/.github/workflows/release.yml" \
-  > "$unprotected_authorization_workflow"
-unprotected_authorization_error="$temporary_directory/unprotected-authorization-error.txt"
-if bash "$validator" \
-  --release-workflow "$unprotected_authorization_workflow" \
-  > /dev/null 2> "$unprotected_authorization_error"; then
-  fail "a release workflow without protected pre-OIDC authorization was admitted"
-fi
-grep -Fq \
-  'release admission rejected: the protected release authorization must follow' \
-  "$unprotected_authorization_error" \
-  || fail "the unprotected authorization workflow was rejected for an unrelated reason"
 
 early_oidc_workflow="$temporary_directory/early-oidc-release.yml"
 sed '/^  sdk-packages:/a\    permissions:\n      id-token: write' \

@@ -1,9 +1,8 @@
 name: release
 
 # A release tag names the product version already present in Cargo metadata.
-# The release environment review gates the first credentialed job. Crate
-# publication runs behind that approval in the reviewer-less crates-io
-# environment that the crates.io trusted publishers name. Exact image tags and
+# One review of the release environment gates crate publication, the first
+# credentialed job; every later job depends on it. Exact image tags and
 # API assets are prepared before the GitHub Release is published, and stable
 # `latest` image tags move only after every required artifact succeeds.
 
@@ -123,8 +122,130 @@ jobs:
         id: images
         run: printf 'release_images=%s\n' "$(jq -c -s 'add' "$RELEASE_IMAGES_FILE" "$RELEASE_SINGLE_VOLUME_IMAGES_FILE")" >> "$GITHUB_OUTPUT"
 
-  authorize-release:
-    name: authorize release publication
+  api-docs:
+    name: build API release artifacts
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout validated commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Install Buf
+        uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
+        with:
+          version: ${{ env.BUF_VERSION }}
+          github_token: ${{ github.token }}
+
+      - name: Generate and verify API artifacts
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          bash scripts/generate-api-artifacts.sh
+
+          mkdir -p dist/release
+          cp -R dist/openapi dist/release/openapi
+          cp -R dist/proto dist/release/proto
+          cp dist/zinder.v1.descriptor.bin dist/release/zinder.v1.descriptor.bin
+          bash scripts/check-native-proto-closure.sh dist/release
+          tar \
+            -C dist/release \
+            -czf "dist/zinder-api-docs-${RELEASE_TAG}.tar.gz" \
+            openapi \
+            proto \
+            zinder.v1.descriptor.bin
+
+      - name: Upload API artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-api-docs
+          path: |
+            dist/zinder.v1.descriptor.bin
+            dist/zinder-api-docs-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  sdk-packages:
+    name: verify public SDK packages
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout validated commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@f133eefe930d61f0d9371efd474daf0125ed3dd1 # 1.95.0
+        with:
+          toolchain: 1.95.0
+
+      - name: Verify public SDK packages
+        id: package-readiness
+        continue-on-error: true
+        env:
+          PROTOC: /does/not/exist
+        run: scripts/verify-sdk-packages.sh
+
+      - name: Check desired SDK release state
+        id: cargo-release
+        continue-on-error: true
+        uses: ZcashFoundation/cargo-release@34a37595755444456ce0e2d2b1258d9a29c14fac
+        with:
+          phase: check
+          base-sha: ${{ needs.validate.outputs.base_commit }}
+          target-sha: ${{ needs.validate.outputs.commit }}
+          github-token: ${{ github.token }}
+        env:
+          CARGO_INCREMENTAL: "0"
+          PROTOC: /does/not/exist
+
+      - name: Summarize SDK release readiness
+        if: always()
+        env:
+          CARGO_RELEASE_RESULT: ${{ steps.cargo-release.outcome }}
+          PACKAGE_RESULT: ${{ steps.package-readiness.outcome }}
+          PLAN: ${{ steps.cargo-release.outputs.plan }}
+          REPORT: ${{ steps.cargo-release.outputs.report }}
+        run: |
+          {
+            echo "## SDK release readiness"
+            echo "| Validation | Result |"
+            echo "| --- | --- |"
+            echo "| Hermetic packages | \`${PACKAGE_RESULT}\` |"
+            echo "| Cargo Release | \`${CARGO_RELEASE_RESULT}\` |"
+            if [[ -n "${PLAN}" ]]; then
+              echo "### Plan"
+              echo '```json'
+              jq . <<< "${PLAN}"
+              echo '```'
+            fi
+            if [[ -n "${REPORT}" ]]; then
+              echo "### Observed state"
+              echo '```json'
+              jq . <<< "${REPORT}"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Require successful SDK release readiness
+        if: always()
+        env:
+          CARGO_RELEASE_RESULT: ${{ steps.cargo-release.outcome }}
+          PACKAGE_RESULT: ${{ steps.package-readiness.outcome }}
+        run: |
+          if [[ "$PACKAGE_RESULT" != success || "$CARGO_RELEASE_RESULT" != success ]]; then
+            echo "::error::Review each failed SDK readiness step and the job summary."
+            exit 1
+          fi
+
+  publish-sdk-crates:
+    name: publish public SDK crates
     needs:
       - validate
       - api-docs
@@ -132,16 +253,48 @@ jobs:
     environment: release
     permissions:
       contents: read
+      id-token: write
     runs-on: ubuntu-latest
     steps:
-      - name: Record release authorization
-        run: echo "release publication authorized for ${{ github.ref_name }}"
+      - name: Checkout validated commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@f133eefe930d61f0d9371efd474daf0125ed3dd1 # 1.95.0
+        with:
+          toolchain: 1.95.0
+
+      - name: Authenticate to crates.io
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish and verify missing SDK crates
+        uses: ZcashFoundation/cargo-release@34a37595755444456ce0e2d2b1258d9a29c14fac
+        with:
+          phase: publish
+          base-sha: ${{ needs.validate.outputs.base_commit }}
+          target-sha: ${{ needs.validate.outputs.commit }}
+          github-token: ${{ github.token }}
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+          PROTOC: /does/not/exist
+
+      - name: Verify the published SDK from crates.io
+        timeout-minutes: 30
+        env:
+          SDK_VERSION: ${{ needs.validate.outputs.version }}
+        run: scripts/verify-published-sdk.sh "$SDK_VERSION"
 
   build:
     name: build release binaries and image digests (${{ matrix.platform.name }})
     needs:
       - validate
-      - authorize-release
+      - publish-sdk-crates
     permissions:
       contents: read
       packages: write
@@ -349,7 +502,7 @@ jobs:
     name: reproduce release binaries (${{ matrix.platform.name }})
     needs:
       - validate
-      - authorize-release
+      - publish-sdk-crates
     permissions:
       contents: read
     runs-on: ${{ matrix.platform.runner }}
@@ -529,182 +682,12 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  api-docs:
-    name: build API release artifacts
-    needs: validate
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout validated commit
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ needs.validate.outputs.commit }}
-
-      - name: Install Buf
-        uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
-        with:
-          version: ${{ env.BUF_VERSION }}
-          github_token: ${{ github.token }}
-
-      - name: Generate and verify API artifacts
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-
-          bash scripts/generate-api-artifacts.sh
-
-          mkdir -p dist/release
-          cp -R dist/openapi dist/release/openapi
-          cp -R dist/proto dist/release/proto
-          cp dist/zinder.v1.descriptor.bin dist/release/zinder.v1.descriptor.bin
-          bash scripts/check-native-proto-closure.sh dist/release
-          tar \
-            -C dist/release \
-            -czf "dist/zinder-api-docs-${RELEASE_TAG}.tar.gz" \
-            openapi \
-            proto \
-            zinder.v1.descriptor.bin
-
-      - name: Upload API artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-api-docs
-          path: |
-            dist/zinder.v1.descriptor.bin
-            dist/zinder-api-docs-*.tar.gz
-          if-no-files-found: error
-          retention-days: 7
-
-  sdk-packages:
-    name: verify public SDK packages
-    needs: validate
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout validated commit
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          ref: ${{ needs.validate.outputs.commit }}
-
-      - name: Install Rust 1.95
-        uses: dtolnay/rust-toolchain@f133eefe930d61f0d9371efd474daf0125ed3dd1 # 1.95.0
-        with:
-          toolchain: 1.95.0
-
-      - name: Verify public SDK packages
-        id: package-readiness
-        continue-on-error: true
-        env:
-          PROTOC: /does/not/exist
-        run: scripts/verify-sdk-packages.sh
-
-      - name: Check desired SDK release state
-        id: cargo-release
-        continue-on-error: true
-        uses: ZcashFoundation/cargo-release@34a37595755444456ce0e2d2b1258d9a29c14fac
-        with:
-          phase: check
-          base-sha: ${{ needs.validate.outputs.base_commit }}
-          target-sha: ${{ needs.validate.outputs.commit }}
-          github-token: ${{ github.token }}
-        env:
-          CARGO_INCREMENTAL: "0"
-          PROTOC: /does/not/exist
-
-      - name: Summarize SDK release readiness
-        if: always()
-        env:
-          CARGO_RELEASE_RESULT: ${{ steps.cargo-release.outcome }}
-          PACKAGE_RESULT: ${{ steps.package-readiness.outcome }}
-          PLAN: ${{ steps.cargo-release.outputs.plan }}
-          REPORT: ${{ steps.cargo-release.outputs.report }}
-        run: |
-          {
-            echo "## SDK release readiness"
-            echo "| Validation | Result |"
-            echo "| --- | --- |"
-            echo "| Hermetic packages | \`${PACKAGE_RESULT}\` |"
-            echo "| Cargo Release | \`${CARGO_RELEASE_RESULT}\` |"
-            if [[ -n "${PLAN}" ]]; then
-              echo "### Plan"
-              echo '```json'
-              jq . <<< "${PLAN}"
-              echo '```'
-            fi
-            if [[ -n "${REPORT}" ]]; then
-              echo "### Observed state"
-              echo '```json'
-              jq . <<< "${REPORT}"
-              echo '```'
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Require successful SDK release readiness
-        if: always()
-        env:
-          CARGO_RELEASE_RESULT: ${{ steps.cargo-release.outcome }}
-          PACKAGE_RESULT: ${{ steps.package-readiness.outcome }}
-        run: |
-          if [[ "$PACKAGE_RESULT" != success || "$CARGO_RELEASE_RESULT" != success ]]; then
-            echo "::error::Review each failed SDK readiness step and the job summary."
-            exit 1
-          fi
-
-  publish-sdk-crates:
-    name: publish public SDK crates
-    needs:
-      - validate
-      - authorize-release
-      - api-docs
-      - collect-binary-assets
-      - sdk-packages
-    environment: crates-io
-    permissions:
-      contents: read
-      id-token: write
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout validated commit
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          ref: ${{ needs.validate.outputs.commit }}
-
-      - name: Install Rust 1.95
-        uses: dtolnay/rust-toolchain@f133eefe930d61f0d9371efd474daf0125ed3dd1 # 1.95.0
-        with:
-          toolchain: 1.95.0
-
-      - name: Authenticate to crates.io
-        id: crates-io-auth
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
-
-      - name: Publish and verify missing SDK crates
-        uses: ZcashFoundation/cargo-release@34a37595755444456ce0e2d2b1258d9a29c14fac
-        with:
-          phase: publish
-          base-sha: ${{ needs.validate.outputs.base_commit }}
-          target-sha: ${{ needs.validate.outputs.commit }}
-          github-token: ${{ github.token }}
-        env:
-          CARGO_INCREMENTAL: "0"
-          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
-          PROTOC: /does/not/exist
-
-      - name: Verify the published SDK from crates.io
-        timeout-minutes: 30
-        env:
-          SDK_VERSION: ${{ needs.validate.outputs.version }}
-        run: scripts/verify-published-sdk.sh "$SDK_VERSION"
-
   merge:
     name: attest and publish exact ${{ matrix.image }} manifest
     needs:
       - validate
       - build
-      - publish-sdk-crates
+      - binary-archives
     permissions:
       attestations: write
       contents: read

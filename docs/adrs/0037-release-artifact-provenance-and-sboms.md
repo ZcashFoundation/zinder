@@ -19,10 +19,8 @@ statically linked native libraries.
 
 The tagged release workflow requires a protected `release` environment. API
 and SDK candidates complete before environment approval; no job receives an
-OIDC token before that approval. That environment is the only reviewed gate:
-crates.io publication runs in the reviewer-less, tag-restricted `crates-io`
-environment and depends on the approved job. All trusted operations use the
-tag-target commit and the tag-only workflow identity. The repository is configured for
+OIDC token before that approval. All trusted operations use the tag-target
+commit and the tag-only workflow identity. The repository is configured for
 immutable GitHub Releases, and post-publication verification fails closed if
 the resulting Release is not immutable.
 

@@ -513,8 +513,7 @@ EOF
     || ! grep -Eq '^[[:space:]]+- validate$' <<< "$crate_publication_job" \
     || ! grep -Eq '^[[:space:]]+- api-docs$' <<< "$crate_publication_job" \
     || ! grep -Eq '^[[:space:]]+- sdk-packages$' <<< "$crate_publication_job" \
-    || ! grep -Eq '^[[:space:]]+- authorize-release$' <<< "$crate_publication_job" \
-    || ! grep -Fq 'environment: crates-io' <<< "$crate_publication_job" \
+    || ! grep -Fq 'environment: release' <<< "$crate_publication_job" \
     || ! grep -Fq 'contents: read' <<< "$crate_publication_job" \
     || ! grep -Fq 'id-token: write' <<< "$crate_publication_job" \
     || ! grep -Fq 'fetch-depth: 0' <<< "$crate_publication_job" \
@@ -547,11 +546,10 @@ EOF
     || grep -Eq 'phase: (all|finalize)' <<< "$crate_publication_job" \
     || grep -Fq 'actions/download-artifact' <<< "$crate_publication_job"; then
     cat >&2 <<'EOF'
-release admission rejected: SDK publication must follow release authorization
-and the validated package and API jobs, run in the crates-io environment,
-delegate resumable publication to the pinned Cargo Release action, expose the
-OIDC token only to that publication step, and compile a fresh registry-only
-consumer before image publication.
+release admission rejected: SDK publication must follow validated package and
+API jobs, delegate resumable publication to the pinned Cargo Release action,
+expose the OIDC token only to that publication step, and compile a fresh
+registry-only consumer before image publication.
 EOF
     exit 1
   fi
@@ -565,8 +563,8 @@ EOF
     exit 1
   fi
 
-  publishing_jobs=(build merge assemble-and-sign prepare-release publish-release verify-release promote-latest)
-  required_predecessors=(authorize-release publish-sdk-crates merge assemble-and-sign prepare-release publish-release verify-release)
+  publishing_jobs=(build reproduce merge assemble-and-sign prepare-release publish-release verify-release promote-latest)
+  required_predecessors=(publish-sdk-crates publish-sdk-crates binary-archives merge assemble-and-sign prepare-release publish-release verify-release)
   for index in "${!publishing_jobs[@]}"; do
     publishing_job="${publishing_jobs[$index]}"
     required_predecessor="${required_predecessors[$index]}"
@@ -707,13 +705,6 @@ EOF
       in_job { print }
     ' "$release_workflow"
   )"
-  authorization_job="$(
-    awk '
-      $0 == "  authorize-release:" { in_job = 1; next }
-      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
-      in_job { print }
-    ' "$release_workflow"
-  )"
   assemble_release_job="$(
     awk '
       $0 == "  assemble-and-sign:" { in_job = 1; next }
@@ -753,7 +744,6 @@ EOF
   # shellcheck disable=SC2016
   if [[ -z "$build_job" || -z "$reproduction_job" ]] \
     || [[ -z "$binary_archive_job" || -z "$collected_binary_job" ]] \
-    || ! grep -Eq '^[[:space:]]+- authorize-release$' <<< "$reproduction_job" \
     || [[ "$(grep -Fc -- '--no-cache' <<< "$build_job")" -ne 1 ]] \
     || [[ "$(grep -Fc -- '--no-cache' <<< "$reproduction_job")" -ne 1 ]] \
     || [[ "$(grep -Fc -- '--target release-binaries' <<< "$build_job")" -ne 1 ]] \
@@ -789,7 +779,6 @@ EOF
     || ! grep -Eq '^[[:space:]]+- build$' <<< "$merge_job" \
     || ! grep -Eq '^[[:space:]]+- binary-archives$' <<< "$collected_binary_job" \
     || ! grep -Fq 'spdx.json' <<< "$collected_binary_job" \
-    || ! grep -Eq '^[[:space:]]+- collect-binary-assets$' <<< "$crate_publication_job" \
     || ! grep -Eq '^[[:space:]]+- collect-binary-assets$' <<< "$assemble_release_job" \
     || ! grep -Fq 'name: release-binary-assets' <<< "$assemble_release_job" \
     || ! grep -Eq '^[[:space:]]+- assemble-and-sign$' <<< "$prepare_release_job" \
@@ -803,35 +792,20 @@ EOF
     cat >&2 <<'EOF'
 release admission rejected: release binaries must build in 2 independent
 uncached jobs for both GNU platforms and compare identical, images must reuse
-the archived binaries, exact SBOMs must be generated and attested before
-crates.io authentication, and the archives must be assembled into the final
-draft GitHub Release assets.
+the archived binaries, exact SBOMs must be generated and attested, and the
+archives must be assembled into the final draft GitHub Release assets.
 EOF
     exit 1
   fi
 
-  workflow_before_authorization="$(sed '/^  authorize-release:/,$d' "$release_workflow")"
-  api_docs_job="$(
-    awk '
-      $0 == "  api-docs:" { in_job = 1; next }
-      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
-      in_job { print }
-    ' "$release_workflow"
-  )"
-  if [[ -z "$authorization_job" ]] \
-    || ! grep -Fq 'environment: release' <<< "$authorization_job" \
-    || [[ "$(grep -Ec '^    environment:' "$release_workflow")" -ne 2 ]] \
-    || [[ "$(grep -Fc 'environment: release' "$release_workflow")" -ne 1 ]] \
-    || ! grep -Eq '^[[:space:]]+- validate$' <<< "$authorization_job" \
-    || ! grep -Eq '^[[:space:]]+- api-docs$' <<< "$authorization_job" \
-    || ! grep -Eq '^[[:space:]]+- sdk-packages$' <<< "$authorization_job" \
-    || grep -Fq 'id-token: write' <<< "$authorization_job" \
-    || grep -Fq 'id-token: write' <<< "$api_docs_job" \
-    || grep -Fq 'id-token: write' <<< "$workflow_before_authorization"; then
+  workflow_before_approval="$(sed '/^  publish-sdk-crates:/,$d' "$release_workflow")"
+  if [[ "$(grep -Ec '^    environment:' "$release_workflow")" -ne 1 ]] \
+    || grep -Eq '(id-token|packages|attestations|contents): write' \
+      <<< "$workflow_before_approval"; then
     cat >&2 <<'EOF'
-release admission rejected: the protected release authorization must follow
-pre-auth validation, be the only reviewed environment gate, and no earlier job
-may receive an OIDC token.
+release admission rejected: the protected release environment must gate crate
+publication as the only reviewed job, and no earlier job may receive a write
+permission or an OIDC token.
 EOF
     exit 1
   fi
