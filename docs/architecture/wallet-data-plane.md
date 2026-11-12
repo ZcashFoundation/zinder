@@ -654,6 +654,18 @@ release implementation requires coherent snapshot evidence at admission.
 
 Rust integrations can call the remote-first `zinder-client` surface per [Public interfaces §Rust API Shape](public-interfaces.md#rust-api-shape). The `ChainIndex` trait exposes immutable network metadata and canonical reads with typed Rust values (`BlockHeight`, `ChainEpoch`, `TxStatus`, and `IndexerError`); `RemoteChainIndex` also implements `EndpointBackedIndex` for broadcast, subscriptions, and live state. Zinder's serving runtimes compose service-internal reads through `WalletServingQuery` and an admitted `WalletServingReadPair`, while consumers with dependency or toolchain conflicts can generate stubs from the native `WalletQuery` protocol instead of linking the SDK.
 
+### Event stream progression
+
+`RemoteChainIndex::chain_events_for_family` and `RemoteChainIndex::mempool_events` apply the same progression checks to the stream they return, so a remote cannot make a consumer apply duplicated or reordered state changes. Each stream keeps its own state, and the chain and mempool sequence spaces never mix.
+
+- Every envelope must carry a non-empty cursor and an `event_sequence` greater than zero.
+- `event_sequence` must strictly increase. Gaps are valid because retention pruning leaves them; a repeated or decreasing value fails the stream.
+- A cursor may not repeat anywhere in the stream, not only on adjacent events.
+- The client retains accepted cursors to detect repeats, bounded to 65,536 cursors and 8 MiB of cursor bytes per stream. Reaching either bound fails the stream with `MalformedResponse` before the next event is accepted. The consumer reconnects with `EventStreamStart::AfterCursor` from the last accepted cursor, which starts with fresh progression state.
+- A failing event is never yielded. `MalformedResponse` names the offending field (`event_sequence` and `cursor` for chain events, `mempool_event_envelope.event_sequence` and `mempool_event_envelope.cursor` for mempool events).
+
+These checks are client-side only. Server-side cursor validation, snapshot-to-stream handoff through `events_resume_cursor`, and resume semantics are unchanged. Mempool resume is at-least-once, so a resumed stream restarts progression state and can re-deliver events after the resume cursor.
+
 The `ChainIndex` trait does not duplicate the `WalletQueryApi` Rust trait inside `services/zinder-query`. They serve different boundaries: `WalletQueryApi` is the gRPC server's internal trait; `ChainIndex` is the public Rust API for consumers. Both share types from `zinder-core`. A compatibility test asserts that every advertised `ServerCapabilities` capability string has a corresponding `ChainIndex` method.
 
 ## Transaction Broadcast

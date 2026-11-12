@@ -1431,6 +1431,12 @@ pub trait EndpointBackedIndex: ChainIndex {
 
     /// Streams visible-family chain events.
     ///
+    /// The stream fails with [`IndexerError::MalformedResponse`] instead of
+    /// yielding an event whose `event_sequence` does not strictly increase or
+    /// whose cursor repeats one already delivered on the stream. Cursor
+    /// retention for that check is bounded, and exhausting it fails the stream
+    /// the same way; reconnect from the last accepted cursor to continue.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -1526,6 +1532,12 @@ pub trait EndpointBackedIndex: ChainIndex {
     ) -> Result<MempoolSnapshotView, IndexerError>;
 
     /// Streams replayable mempool events.
+    ///
+    /// The stream fails with [`IndexerError::MalformedResponse`] instead of
+    /// yielding an event whose `event_sequence` does not strictly increase or
+    /// whose cursor repeats one already delivered on the stream. Cursor
+    /// retention for that check is bounded, and exhausting it fails the stream
+    /// the same way; reconnect from the last accepted cursor to continue.
     ///
     /// # Examples
     ///
