@@ -1,0 +1,6 @@
+kind: changed
+body: 'Native `WalletQuery.CompactBlocksInRange` now sends the chain view once, as the first stream message, followed by bare compact blocks, instead of repeating the full chain view on every block. `CompactBlocksInRangeChunk` is now a `oneof body` with `header` and `item`. `zinder-client` keeps the same `compact_blocks_in_range` API and rejects a stream whose header is missing, repeated, or out of order with `MalformedResponse`. Upgrade notes: the native contract revision is now 7. Native query and ingest must run the same revision, so upgrade `zinder-ingest` and `zinder-query` together: `zinder-query` admits only an ingest at its own revision and fails at startup against a revision 6 `zinder-ingest`. This `zinder-client` requires servers at revision 7 or later, so upgrade the servers before clients. Raw gRPC consumers must read the leading header and take blocks from `body.item`.'
+time: 2026-11-12T12:00:00Z
+custom:
+  Bump: minor
+  PR: "142"
