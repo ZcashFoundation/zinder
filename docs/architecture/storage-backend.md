@@ -70,7 +70,31 @@ history, unspent outputs, spent outputs, balances, UTXO summaries, and bounded
 reorg undo. They are query state, not canonical truth.
 
 An inactive build is published only after its source identity and digest are
-validated. Following applies one canonical event transition atomically with the
+validated. Construction sorts the address-ordered families once while it writes
+their SST files and emits the order-independent projection accumulator and the
+six family row counts from those rows. Cold validation then reopens the flushed
+store and reads every family back once in stored key order. It recomputes the
+accumulator and row counts from the durable rows and requires both to equal the
+construction evidence, so a row that was lost, altered, duplicated, or added
+between SST writing and publication refuses promotion. The same scan decodes
+every row, refuses an outpoint present in both output families, refuses a spent
+output that does not follow its creation position, requires the balance rows to
+sum to the unspent total, and reconstructs the retained reorg-undo suffix. The
+primary output, address-index, and address-transaction scans run concurrently
+and their partial accumulators are combined, which is valid because the
+accumulator is order independent. The readback does not sort the address
+families a second time, and the build report records the wall time of each
+family scan.
+
+The readback authenticates that the durable rows are the rows construction
+produced. It does not re-derive the address-ordered families from the primary
+output rows. Recovery admission of a restored checkpoint keeps that stricter
+check: its READY evidence is stored beside the rows and cannot vouch for them,
+so `cold_admit_recovery_checkpoint` rebuilds the expected address-index and
+address-transaction rows through bounded external sorts and compares them with
+the stored rows.
+
+Following applies one canonical event transition atomically with the
 new source position. Ready readers never repair or advance the store.
 
 ## Materialized-view RocksDB

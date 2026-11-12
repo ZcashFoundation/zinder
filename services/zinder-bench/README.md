@@ -283,7 +283,7 @@ component diagnostics in the external resource artifacts.
 - `contract_identity`: exact benchmark report contract identity. The current identity is
   `benchmark-report`; missing or earlier identities are rejected.
 - `report_format_version`: machine-readable report contract version. The
-  closed measurement contract described here is version 3.
+  closed measurement contract described here is version 4.
 - `measurement_kind`: `rocksdb-canonical-fixture-replay`,
   `canonical-replay-storage`, or `rocksdb-storage-lifecycle`. The tagged shape
   prevents block-local replay evidence from acquiring placeholder lifecycle or

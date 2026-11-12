@@ -110,6 +110,17 @@ impl WalletProjectionAccumulator {
         WalletProjectionDigest::from_bytes(digest)
     }
 
+    fn add_accumulator(&mut self, other: &Self) {
+        for lane_index in 0..ACCUMULATOR_LANE_COUNT {
+            let byte_index = lane_index * 2;
+            let accumulated = u16::from_le_bytes([self.0[byte_index], self.0[byte_index + 1]]);
+            let other_lane = u16::from_le_bytes([other.0[byte_index], other.0[byte_index + 1]]);
+            let combined = accumulated.wrapping_add(other_lane).to_le_bytes();
+            self.0[byte_index] = combined[0];
+            self.0[byte_index + 1] = combined[1];
+        }
+    }
+
     fn combine_preimage(&mut self, preimage: &[u8], combine: fn(u16, u16) -> u16) {
         let expansion = blake2x_expand(preimage);
         for lane_index in 0..ACCUMULATOR_LANE_COUNT {
@@ -196,6 +207,44 @@ impl WalletProjectionDigestBuilder {
         Ok(())
     }
 
+    /// Folds the rows accumulated by `other` into this builder.
+    ///
+    /// The accumulator is order independent, so independent readers may each
+    /// accumulate a disjoint subset of the durable rows and combine the results
+    /// without changing the final accumulator or counts. A row counter overflow
+    /// is rejected before either the lanes or the counts change.
+    pub fn combine(&mut self, other: &Self) -> Result<(), WalletProjectionContractError> {
+        let combined_counts = WalletProjectionFamilyRowCounts {
+            transparent_unspent_output_count: combine_count(
+                self.row_counts.transparent_unspent_output_count,
+                other.row_counts.transparent_unspent_output_count,
+            )?,
+            transparent_unspent_output_by_address_count: combine_count(
+                self.row_counts.transparent_unspent_output_by_address_count,
+                other.row_counts.transparent_unspent_output_by_address_count,
+            )?,
+            transparent_spent_output_count: combine_count(
+                self.row_counts.transparent_spent_output_count,
+                other.row_counts.transparent_spent_output_count,
+            )?,
+            transparent_address_transaction_count: combine_count(
+                self.row_counts.transparent_address_transaction_count,
+                other.row_counts.transparent_address_transaction_count,
+            )?,
+            transparent_address_balance_count: combine_count(
+                self.row_counts.transparent_address_balance_count,
+                other.row_counts.transparent_address_balance_count,
+            )?,
+            reorg_undo_count: combine_count(
+                self.row_counts.reorg_undo_count,
+                other.row_counts.reorg_undo_count,
+            )?,
+        };
+        self.accumulator.add_accumulator(&other.accumulator);
+        self.row_counts = combined_counts;
+        Ok(())
+    }
+
     /// Returns the row counts observed by all six family accumulators.
     #[must_use]
     pub const fn row_counts(&self) -> WalletProjectionFamilyRowCounts {
@@ -262,6 +311,11 @@ impl WalletProjectionDigestBuilder {
             WalletProjectionRowFamily::ReorgUndo => self.row_counts.reorg_undo_count,
         }
     }
+}
+
+fn combine_count(left: u64, right: u64) -> Result<u64, WalletProjectionContractError> {
+    left.checked_add(right)
+        .ok_or(WalletProjectionContractError::ProjectionDigestRowCountOverflow)
 }
 
 impl Default for WalletProjectionDigestBuilder {
@@ -403,6 +457,81 @@ mod tests {
 
         assert_eq!(forward.row_counts(), reverse.row_counts());
         assert_eq!(forward.finish(), reverse.finish());
+    }
+
+    #[test]
+    fn combined_partial_builders_equal_one_sequential_builder() {
+        let rows: [(WalletProjectionRowFamily, &[u8], &[u8]); 4] = [
+            (
+                WalletProjectionRowFamily::TransparentUnspentOutput,
+                b"a",
+                b"one",
+            ),
+            (
+                WalletProjectionRowFamily::TransparentAddressTransaction,
+                b"b",
+                b"two",
+            ),
+            (
+                WalletProjectionRowFamily::TransparentAddressBalance,
+                b"c",
+                b"three",
+            ),
+            (WalletProjectionRowFamily::ReorgUndo, b"d", b"four"),
+        ];
+        let mut sequential = WalletProjectionDigestBuilder::new();
+        let mut first = WalletProjectionDigestBuilder::new();
+        let mut second = WalletProjectionDigestBuilder::new();
+        for (index, (family, key, value)) in rows.into_iter().enumerate() {
+            sequential
+                .append_row(family, key, value)
+                .unwrap_or_else(|error| unreachable!("valid sequential row: {error}"));
+            let partial = if index % 2 == 0 {
+                &mut first
+            } else {
+                &mut second
+            };
+            partial
+                .append_row(family, key, value)
+                .unwrap_or_else(|error| unreachable!("valid partial row: {error}"));
+        }
+
+        first
+            .combine(&second)
+            .unwrap_or_else(|error| unreachable!("disjoint partial counts fit: {error}"));
+
+        assert_eq!(first.row_counts(), sequential.row_counts());
+        assert_eq!(first.accumulator(), sequential.accumulator());
+    }
+
+    #[test]
+    fn combine_rejects_row_count_overflow_without_changing_the_builder() {
+        let saturated = WalletProjectionFamilyRowCounts {
+            reorg_undo_count: u64::MAX,
+            ..WalletProjectionFamilyRowCounts::default()
+        };
+        let mut target = WalletProjectionDigestBuilder::from_parts(
+            WalletProjectionAccumulator::empty(),
+            saturated,
+        );
+        let mut other = WalletProjectionDigestBuilder::new();
+        other
+            .append_row(
+                WalletProjectionRowFamily::TransparentUnspentOutput,
+                b"a",
+                b"one",
+            )
+            .unwrap_or_else(|error| unreachable!("valid row: {error}"));
+        other
+            .append_row(WalletProjectionRowFamily::ReorgUndo, b"b", b"two")
+            .unwrap_or_else(|error| unreachable!("valid undo row: {error}"));
+
+        assert!(matches!(
+            target.combine(&other),
+            Err(WalletProjectionContractError::ProjectionDigestRowCountOverflow)
+        ));
+        assert_eq!(target.row_counts(), saturated);
+        assert_eq!(target.accumulator(), &WalletProjectionAccumulator::empty());
     }
 
     #[test]

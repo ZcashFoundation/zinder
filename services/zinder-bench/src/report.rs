@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// Machine-readable report schema version.
-pub const REPORT_FORMAT_VERSION: u32 = 3;
+pub const REPORT_FORMAT_VERSION: u32 = 4;
 /// Stable identity stamped into every benchmark report.
 pub const REPORT_CONTRACT_IDENTITY: &str = "benchmark-report";
 /// CPU envelope used to derive canonical fixture replay defaults.
@@ -1123,10 +1123,6 @@ pub struct WalletStorageConstructionEvidence {
     pub address_index_sort: WalletVariableValueSortEvidence,
     /// Address history rows sorted by address and canonical position.
     pub address_transaction_sort: WalletVariableValueSortEvidence,
-    /// Expected address-index rows externally sorted during cold validation.
-    pub cold_validation_address_index_sort: WalletVariableValueSortEvidence,
-    /// Expected address-history rows externally sorted during cold validation.
-    pub cold_validation_address_transaction_sort: WalletVariableValueSortEvidence,
     /// Peak accounted memory retained for bounded reorg undo rows.
     pub peak_accounted_reorg_undo_bytes: u64,
     /// Caller-supplied reorg undo memory ceiling.
@@ -1164,8 +1160,16 @@ pub struct WalletStoragePhaseDurations {
     pub row_load_seconds: f64,
     /// Flush, close, and BUILDING cold reopen.
     pub flush_and_cold_reopen_seconds: f64,
-    /// Full cold semantic validation.
+    /// Cold digest and row-count readback of every wallet family.
     pub cold_validation_seconds: f64,
+    /// Merged scan of the unspent and spent primary output families.
+    pub cold_validation_primary_output_scan_seconds: f64,
+    /// Scan of the address-unspent index and address-balance families.
+    pub cold_validation_address_index_and_balance_readback_seconds: f64,
+    /// Scan of the address-transaction family.
+    pub cold_validation_address_transaction_readback_seconds: f64,
+    /// Scan of the retained reorg-undo suffix.
+    pub cold_validation_reorg_undo_readback_seconds: f64,
     /// Synchronous READY publication.
     pub ready_publication_seconds: f64,
     /// Complete wallet build duration.
@@ -1713,18 +1717,6 @@ impl RocksDbStorageLifecycleReport {
             (
                 "address-transaction build",
                 wallet.construction.address_transaction_sort,
-                self.resource_limits
-                    .wallet_max_secondary_sort_memory_bytes_per_sorter,
-            ),
-            (
-                "address-index cold validation",
-                wallet.construction.cold_validation_address_index_sort,
-                self.resource_limits
-                    .wallet_max_secondary_sort_memory_bytes_per_sorter,
-            ),
-            (
-                "address-transaction cold validation",
-                wallet.construction.cold_validation_address_transaction_sort,
                 self.resource_limits
                     .wallet_max_secondary_sort_memory_bytes_per_sorter,
             ),
