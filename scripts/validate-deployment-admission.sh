@@ -563,8 +563,8 @@ EOF
     exit 1
   fi
 
-  publishing_jobs=(build merge assemble-and-sign prepare-release publish-release verify-release promote-latest)
-  required_predecessors=(publish-sdk-crates build merge assemble-and-sign prepare-release publish-release verify-release)
+  publishing_jobs=(build reproduce merge assemble-and-sign prepare-release publish-release verify-release promote-latest)
+  required_predecessors=(publish-sdk-crates publish-sdk-crates binary-archives merge assemble-and-sign prepare-release publish-release verify-release)
   for index in "${!publishing_jobs[@]}"; do
     publishing_job="${publishing_jobs[$index]}"
     required_predecessor="${required_predecessors[$index]}"
@@ -663,6 +663,20 @@ EOF
     exit 1
   fi
 
+  build_job="$(
+    awk '
+      $0 == "  build:" { in_job = 1; next }
+      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
+      in_job { print }
+    ' "$release_workflow"
+  )"
+  reproduction_job="$(
+    awk '
+      $0 == "  reproduce:" { in_job = 1; next }
+      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
+      in_job { print }
+    ' "$release_workflow"
+  )"
   binary_archive_job="$(
     awk '
       $0 == "  binary-archives:" { in_job = 1; next }
@@ -687,13 +701,6 @@ EOF
   publish_release_job="$(
     awk '
       $0 == "  publish-release:" { in_job = 1; next }
-      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
-      in_job { print }
-    ' "$release_workflow"
-  )"
-  authorization_job="$(
-    awk '
-      $0 == "  authorize-release:" { in_job = 1; next }
       in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
       in_job { print }
     ' "$release_workflow"
@@ -733,21 +740,45 @@ EOF
       in_call && /--commit / { exit }
     ' <<< "$merge_job"
   )"
-  if [[ -z "$binary_archive_job" || -z "$collected_binary_job" ]] \
-    || ! grep -Eq '^[[:space:]]+- validate$' <<< "$binary_archive_job" \
-    || ! grep -Eq '^[[:space:]]+- authorize-release$' <<< "$binary_archive_job" \
-    || ! grep -Fq 'for build_number in 1 2' <<< "$binary_archive_job" \
-    || ! grep -Fq -- '--no-cache' <<< "$binary_archive_job" \
-    || ! grep -Fq -- '--target release-binaries' <<< "$binary_archive_job" \
-    || ! grep -Fq 'scripts/check-release-binary-archive.sh' <<< "$binary_archive_job" \
-    || ! grep -Fq 'x86_64-v3-unknown-linux-gnu' <<< "$binary_archive_job" \
-    || ! grep -Fq 'aarch64-unknown-linux-gnu' <<< "$binary_archive_job" \
-    || ! grep -Fq 'scripts/generate-release-sbom.sh' <<< "$binary_archive_job" \
-    || ! grep -Fq 'scripts/check-release-sbom.sh' <<< "$binary_archive_job" \
+  # These literals are workflow expressions and shell variables being inspected.
+  # shellcheck disable=SC2016
+  if [[ -z "$build_job" || -z "$reproduction_job" ]] \
+    || [[ -z "$binary_archive_job" || -z "$collected_binary_job" ]] \
+    || [[ "$(grep -Fc -- '--no-cache' <<< "$build_job")" -ne 1 ]] \
+    || [[ "$(grep -Fc -- '--no-cache' <<< "$reproduction_job")" -ne 1 ]] \
+    || [[ "$(grep -Fc -- '--target release-binaries' <<< "$build_job")" -ne 1 ]] \
+    || ! grep -Fq -- '--target release-binaries' <<< "$reproduction_job" \
+    || ! grep -Fq 'RELEASE_CACHE_SCOPE: release-${{ needs.validate.outputs.commit }}-${{ matrix.platform.rust }}-1' \
+      <<< "$build_job" \
+    || ! grep -Fq 'RELEASE_CACHE_SCOPE=release-${RELEASE_COMMIT}-${RUST_TARGET}-2' \
+      <<< "$reproduction_job" \
+    || [[ "$(grep -Fc -- '--build-arg "RELEASE_CACHE_SCOPE=${RELEASE_CACHE_SCOPE}"' <<< "$build_job")" -ne 2 ]] \
+    || [[ "$(grep -Fc -- '--build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}"' <<< "$build_job")" -ne 2 ]] \
+    || [[ "$(grep -Fc -- '--build-arg "ZINDER_BUILD_GIT_COMMIT=${RELEASE_COMMIT}"' <<< "$build_job")" -ne 2 ]] \
+    || ! grep -Fq 'cmp -- "${binary_root}/${binary_name}" "$image_binary"' <<< "$build_job" \
+    || grep -Eq -- '--cache-(from|to)' "$release_workflow" \
+    || grep -Fq 'dist/' <<< "$build_job" \
+    || grep -Fq 'id-token: write' <<< "$build_job" \
+    || grep -Fq 'packages: write' <<< "$reproduction_job" \
+    || grep -Fq 'id-token: write' <<< "$reproduction_job" \
+    || ! grep -Fq 'scripts/check-release-binary-archive.sh' <<< "$build_job" \
+    || ! grep -Fq 'scripts/check-release-binary-archive.sh' <<< "$reproduction_job" \
+    || ! grep -Fq 'x86_64-v3-unknown-linux-gnu' <<< "$build_job" \
+    || ! grep -Fq 'aarch64-unknown-linux-gnu' <<< "$build_job" \
+    || ! grep -Fq 'x86_64-v3-unknown-linux-gnu' <<< "$reproduction_job" \
+    || ! grep -Fq 'aarch64-unknown-linux-gnu' <<< "$reproduction_job" \
+    || ! grep -Fq 'scripts/generate-release-sbom.sh' <<< "$build_job" \
+    || ! grep -Fq 'scripts/check-release-sbom.sh' <<< "$build_job" \
+    || ! grep -Eq '^[[:space:]]+- build$' <<< "$binary_archive_job" \
+    || ! grep -Eq '^[[:space:]]+- reproduce$' <<< "$binary_archive_job" \
+    || ! grep -Fq 'diff -u dist/build/binaries.sha256 dist/reproduction/binaries.sha256' \
+      <<< "$binary_archive_job" \
+    || ! grep -Fq 'cmp -- "dist/build/${archive_name}" "dist/reproduction/${archive_name}"' \
+      <<< "$binary_archive_job" \
     || [[ "$(grep -Fc 'uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0' <<< "$binary_archive_job")" -ne 2 ]] \
+    || ! grep -Eq '^[[:space:]]+- build$' <<< "$merge_job" \
     || ! grep -Eq '^[[:space:]]+- binary-archives$' <<< "$collected_binary_job" \
     || ! grep -Fq 'spdx.json' <<< "$collected_binary_job" \
-    || ! grep -Eq '^[[:space:]]+- collect-binary-assets$' <<< "$crate_publication_job" \
     || ! grep -Eq '^[[:space:]]+- collect-binary-assets$' <<< "$assemble_release_job" \
     || ! grep -Fq 'name: release-binary-assets' <<< "$assemble_release_job" \
     || ! grep -Eq '^[[:space:]]+- assemble-and-sign$' <<< "$prepare_release_job" \
@@ -759,32 +790,22 @@ EOF
     || ! grep -Fq 'persist-credentials: false' <<< "$prepare_release_job" \
     || ! grep -Fq 'name: release-assets-final' <<< "$prepare_release_job"; then
     cat >&2 <<'EOF'
-release admission rejected: release binaries must build twice for both GNU
-platforms, generate and attest exact SBOMs before crates.io authentication,
-and be assembled into the final draft GitHub Release assets.
+release admission rejected: release binaries must build in 2 independent
+uncached jobs for both GNU platforms and compare identical, images must reuse
+the archived binaries, exact SBOMs must be generated and attested, and the
+archives must be assembled into the final draft GitHub Release assets.
 EOF
     exit 1
   fi
 
-  workflow_before_authorization="$(sed '/^  authorize-release:/,$d' "$release_workflow")"
-  api_docs_job="$(
-    awk '
-      $0 == "  api-docs:" { in_job = 1; next }
-      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
-      in_job { print }
-    ' "$release_workflow"
-  )"
-  if [[ -z "$authorization_job" ]] \
-    || ! grep -Fq 'environment: release' <<< "$authorization_job" \
-    || ! grep -Eq '^[[:space:]]+- validate$' <<< "$authorization_job" \
-    || ! grep -Eq '^[[:space:]]+- api-docs$' <<< "$authorization_job" \
-    || ! grep -Eq '^[[:space:]]+- sdk-packages$' <<< "$authorization_job" \
-    || grep -Fq 'id-token: write' <<< "$authorization_job" \
-    || grep -Fq 'id-token: write' <<< "$api_docs_job" \
-    || grep -Fq 'id-token: write' <<< "$workflow_before_authorization"; then
+  workflow_before_approval="$(sed '/^  publish-sdk-crates:/,$d' "$release_workflow")"
+  if [[ "$(grep -Ec '^    environment:' "$release_workflow")" -ne 1 ]] \
+    || grep -Eq '(id-token|packages|attestations|contents): write' \
+      <<< "$workflow_before_approval"; then
     cat >&2 <<'EOF'
-release admission rejected: the protected release authorization must follow
-pre-auth validation and no earlier job may receive an OIDC token.
+release admission rejected: the protected release environment must gate crate
+publication as the only reviewed job, and no earlier job may receive a write
+permission or an OIDC token.
 EOF
     exit 1
   fi

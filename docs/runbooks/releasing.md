@@ -136,20 +136,27 @@ observed state in the job summary. These credential-free jobs must succeed
 before the protected `release` environment authorizes all trusted publication
 and attestation work.
 
+A release asks for one approval. `publish public SDK crates` is the only job
+in the protected `release` environment, and every later job depends on it.
+Rerunning only the failed jobs after approval does not ask again.
+
 After approval, the workflow performs these operations in order:
 
-1. Build each GNU/Linux binary platform twice, confirm identical binary and
-   archive hashes, and validate the catalog, embedded commit, ELF machine,
-   dynamic libraries, symbol ceilings, and clean Debian runtime probes.
-2. Generate one SPDX 2.3 SBOM from each auditable archive and attest both SLSA
-   provenance and the SBOM.
-3. Authenticate to crates.io through GitHub OIDC, then let Cargo Release
+1. Authenticate to crates.io through GitHub OIDC, then let Cargo Release
    publish only missing SDK crates in Cargo's dependency order and verify their
    source provenance.
-4. Compile a fresh registry-only consumer against the exact published
+2. Compile a fresh registry-only consumer against the exact published
    `zinder-client` version after sparse-index propagation.
-5. Build the 4 runtime images and 2 single-volume host images natively for Linux amd64 and arm64 with BuildKit
-   max-mode provenance and SBOMs.
+3. Build each GNU/Linux binary platform in 2 independent uncached jobs that run
+   side by side. The primary job validates the catalog, embedded commit, ELF
+   machine, dynamic libraries, symbol ceilings, and clean Debian runtime
+   probes, and generates one SPDX 2.3 SBOM from the auditable archive.
+4. In the primary job, build the 4 runtime images and 2 single-volume host
+   images natively for Linux amd64 and arm64 from the same binary stage with
+   BuildKit max-mode provenance and SBOMs, and confirm each image carries the
+   archived binaries byte for byte.
+5. Confirm the 2 builds produced identical binary and archive hashes, then
+   attest both SLSA provenance and the SBOM for each archive.
 6. Publish exact `vX.Y.Z` and `sha-<commit>` manifests, attest each child SBOM
    and the root provenance, sign only the root digest, and verify the exact
    two-platform topology and producer identity.
@@ -318,6 +325,11 @@ package build scripts.
 Cargo Release's reconciliation model. Zinder invokes only the action's `check`
 and `publish` phases: the existing product tag, artifact-rich GitHub Release,
 and `latest` image promotion remain owned by the Zinder workflow.
+
+Crates are published before the binaries and images are built. If a later job
+fails, rerun the failed jobs: published crates are verified and skipped. If the
+tagged commit cannot build at all, the published crate versions stay, and the
+fix ships as the next version.
 
 The workflow creates the public GitHub Release only after all exact image tags
 and trust evidence exist. A failure before publication may leave untagged

@@ -366,7 +366,7 @@ expect_rejected \
   --release-workflow "$manual_release_workflow"
 
 single_binary_build_workflow="$temporary_directory/single-binary-build-release.yml"
-sed 's/for build_number in 1 2/for build_number in 1/' \
+sed '/^[[:space:]]*- reproduce$/d' \
   "$repository_root/.github/workflows/release.yml" \
   > "$single_binary_build_workflow"
 expect_rejected \
@@ -378,7 +378,7 @@ sed '/^[[:space:]]*- collect-binary-assets$/d' \
   "$repository_root/.github/workflows/release.yml" \
   > "$late_binary_assets_workflow"
 expect_rejected \
-  "a release workflow authenticating before binary assets succeed" \
+  "a release workflow assembling assets before binary archives succeed" \
   --release-workflow "$late_binary_assets_workflow"
 
 early_latest_workflow="$temporary_directory/early-latest-release.yml"
@@ -399,9 +399,16 @@ awk '
   { print }
 ' "$repository_root/.github/workflows/release.yml" \
   > "$unprotected_release_workflow"
-expect_rejected \
-  "a release workflow that pushes digests before environment approval" \
-  --release-workflow "$unprotected_release_workflow"
+unprotected_release_error="$temporary_directory/unprotected-release-error.txt"
+if bash "$validator" \
+  --release-workflow "$unprotected_release_workflow" \
+  > /dev/null 2> "$unprotected_release_error"; then
+  fail "a release workflow that publishes without environment approval was admitted"
+fi
+grep -Fq \
+  'release admission rejected: SDK publication must follow validated package' \
+  "$unprotected_release_error" \
+  || fail "the unprotected release workflow was rejected for an unrelated reason"
 
 bypassed_authorization_workflow="$temporary_directory/bypassed-authorization-release.yml"
 sed '/^[[:space:]]*- publish-sdk-crates$/d' \
@@ -410,6 +417,42 @@ sed '/^[[:space:]]*- publish-sdk-crates$/d' \
 expect_rejected \
   "a release workflow whose first registry writer bypasses approval" \
   --release-workflow "$bypassed_authorization_workflow"
+
+twice_reviewed_workflow="$temporary_directory/twice-reviewed-release.yml"
+sed '/^  build:/a\    environment: release' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$twice_reviewed_workflow"
+expect_rejected \
+  "a release workflow that asks for a second environment review" \
+  --release-workflow "$twice_reviewed_workflow"
+
+unverified_image_binaries_workflow="$temporary_directory/unverified-image-binaries-release.yml"
+# The literal shell variables are the fixture removal target.
+# shellcheck disable=SC2016
+sed '/cmp -- "\${binary_root}\/\${binary_name}" "\$image_binary"/d' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$unverified_image_binaries_workflow"
+expect_rejected \
+  "a release workflow whose images are not checked against the archived binaries" \
+  --release-workflow "$unverified_image_binaries_workflow"
+
+context_writing_build_workflow="$temporary_directory/context-writing-build-release.yml"
+# The literal shell variable is the unsafe fixture replacement target.
+# shellcheck disable=SC2016
+sed 's#candidate_root="${RUNNER_TEMP}/release-candidate"#candidate_root="dist/release-candidate"#' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$context_writing_build_workflow"
+expect_rejected \
+  "a release workflow whose primary build writes into the image build context" \
+  --release-workflow "$context_writing_build_workflow"
+
+recompiled_image_workflow="$temporary_directory/recompiled-image-release.yml"
+sed '/^  build:/,/^  reproduce:/ s/RELEASE_CACHE_SCOPE: release-\(.*\)-1$/RELEASE_CACHE_SCOPE: release-\1-3/' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$recompiled_image_workflow"
+expect_rejected \
+  "a release workflow whose primary build leaves its pinned cache scope" \
+  --release-workflow "$recompiled_image_workflow"
 
 parallel_publication_workflow="$temporary_directory/parallel-publication-release.yml"
 sed 's/group: release-publication/group: release-${{ github.ref }}/' \
@@ -523,23 +566,6 @@ sed '/^[[:space:]]*- build$/d' \
 expect_rejected \
   "a release workflow whose manifest publisher bypasses digest builds" \
   --release-workflow "$bypassed_manifest_dependency_workflow"
-
-unprotected_authorization_workflow="$temporary_directory/unprotected-authorization-release.yml"
-sed '/^  authorize-release:/,/^  binary-archives:/ {
-  /^    environment: release$/d
-}' \
-  "$repository_root/.github/workflows/release.yml" \
-  > "$unprotected_authorization_workflow"
-unprotected_authorization_error="$temporary_directory/unprotected-authorization-error.txt"
-if bash "$validator" \
-  --release-workflow "$unprotected_authorization_workflow" \
-  > /dev/null 2> "$unprotected_authorization_error"; then
-  fail "a release workflow without protected pre-OIDC authorization was admitted"
-fi
-grep -Fq \
-  'release admission rejected: the protected release authorization must follow' \
-  "$unprotected_authorization_error" \
-  || fail "the unprotected authorization workflow was rejected for an unrelated reason"
 
 early_oidc_workflow="$temporary_directory/early-oidc-release.yml"
 sed '/^  sdk-packages:/a\    permissions:\n      id-token: write' \
