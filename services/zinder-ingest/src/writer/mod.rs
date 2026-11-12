@@ -653,7 +653,7 @@ mod tests {
         let mut entries = baseline.activations().to_vec();
         entries.push(NetworkUpgradeActivation {
             branch_id: ConsensusBranchId::new(0x1234_5678),
-            activation_height: BlockHeight::new(604),
+            activation_height: BlockHeight::new(704),
             name: "Future writer test activation".to_owned(),
         });
         let extended = NetworkUpgradeActivations::new(Network::ZcashRegtest, entries)?;
