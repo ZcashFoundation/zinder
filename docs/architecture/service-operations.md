@@ -494,9 +494,13 @@ which predate schedule admission, remain readable.
 ## Deployment support
 
 The complete supported composition is the same-host RocksDB deployment in
-`deploy/docker-compose.yml` and `deploy/systemd/`. The published release-image
-catalog is limited to ingest, projector, native query, and lightwalletd
-compatibility. `deploy/Dockerfile.wallet-serving` is a self-built native-only
-target for hosts that attach one volume to one container; it is not a published
-release image and omits lightwalletd compatibility. Explorer, Cipherscan, and
+`deploy/docker-compose.yml` and `deploy/systemd/`. The runtime release-image
+catalog, `deploy/release-images.json`, is limited to ingest, projector, native
+query, and lightwalletd compatibility. A release also publishes the two
+single-volume host images in `deploy/release-single-volume-images.json` for
+hosts that attach one volume to one container: `zinder-wallet-serving`, which
+is native-only and omits lightwalletd compatibility, and
+`zinder-canonical-runtime`, an ingest-only diagnostic or canary runtime.
+Neither is the complete supported composition. Every image is a target of the
+single `deploy/Dockerfile`. Explorer, Cipherscan, and
 PostgreSQL are not release classes.

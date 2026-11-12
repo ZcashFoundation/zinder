@@ -27,21 +27,16 @@ plans/
 observability/
 
 # Dockerfiles and deploy assets do not need to ship inside images, with the
-# exception of runtime entrypoints, the single-container image's s6-overlay
-# service definitions, and reference config. The Dockerfiles copy these files
-# into runtime images, and the build fails when they are excluded.
+# exception of the runtime entrypoints, the healthcheck, and the baked config
+# that deploy/Dockerfile copies into runtime images. The build fails when a
+# copied file is excluded, and build-images.yml builds every such target.
 **/Dockerfile
 **/Dockerfile.*
 deploy/
-!deploy/single-container/services/
-!deploy/single-container/services/**
-!deploy/single-container/config.example.ingest.toml
-!deploy/single-container/config.example.query.toml
-!deploy/single-container/config.example.explorer.toml
-!deploy/single-container/nginx.conf
 !deploy/capture-container-resource-evidence.sh
 !deploy/canonical-runtime-entrypoint
 !deploy/wallet-serving-runtime-entrypoint
+!deploy/wallet-serving-healthcheck
 !deploy/config/wallet-serving/
 !deploy/config/wallet-serving/**
 

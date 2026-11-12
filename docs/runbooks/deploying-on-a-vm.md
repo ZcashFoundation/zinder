@@ -6,8 +6,10 @@ topology. Four independent processes share one host filesystem:
 projection, and `zinder-query` plus `zinder-compat-lightwalletd` independently
 serve immutable canonical and wallet secondary pairs. The optional explorer
 overlay builds a local `zinder-explorer` image for named explorer consumers;
-it is not part of the published release-image catalog. Mixed single-container
-images are not release paths.
+it is not part of the published release-image catalog. The single-volume host
+images that a release also publishes are separate deployment shapes, described
+in [Wallet-serving deployment (single-volume hosts)](deploying-wallet-serving.md),
+and are not this topology.
 
 A successful deployment is a canary until the release's mainnet construction,
 wallet-build, coherent-restore, capacity, replacement, and independent-client

@@ -29,13 +29,9 @@ bash "$validator" \
   --target zinder-canonical-runtime
 
 expect_rejected \
-  "the default Railway target" \
+  "the native-only wallet-serving target as production" \
   --deployment-class production \
-  --railway-default
-expect_rejected \
-  "an implicit Railway canary target" \
-  --deployment-class canary \
-  --railway-default
+  --target zinder-wallet-serving
 expect_rejected \
   "the mixed single-container target" \
   --deployment-class production \
@@ -715,26 +711,50 @@ expect_rejected \
   "a deploy Prometheus config mislabeling the native query target" \
   --prometheus-config "$mislabeled_query_prometheus"
 
-bash "$validator" --verify-railway-default
+single_volume_images_catalog="$repository_root/deploy/release-single-volume-images.json"
+while IFS= read -r omitted_image; do
+  omitted_single_volume_catalog="$temporary_directory/single-volume-without-${omitted_image}.json"
+  jq --arg omitted_image "$omitted_image" \
+    'map(select(. != $omitted_image))' \
+    "$single_volume_images_catalog" > "$omitted_single_volume_catalog"
+  expect_rejected \
+    "a single-volume image catalog omitting $omitted_image" \
+    --release-workflow "$repository_root/.github/workflows/release.yml" \
+    --single-volume-images-catalog "$omitted_single_volume_catalog"
+done < <(jq -r '.[]' "$single_volume_images_catalog")
 
-guardless_dockerfile="$temporary_directory/Dockerfile.railway-nocache"
-cp "$repository_root/deploy/Dockerfile.railway-nocache" "$guardless_dockerfile"
-# The literal Docker ARG expression is the unsafe fixture replacement target.
+explorer_single_volume_catalog="$temporary_directory/single-volume-with-explorer.json"
+jq '. + ["zinder-explorer"]' \
+  "$single_volume_images_catalog" > "$explorer_single_volume_catalog"
+expect_rejected \
+  "a single-volume image catalog containing the optional explorer" \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --single-volume-images-catalog "$explorer_single_volume_catalog"
+
+newline_single_volume_catalog="$temporary_directory/single-volume-with-newline.json"
+printf '%s\n' '["zinder-canonical-runtime\nzinder-wallet-serving"]' \
+  > "$newline_single_volume_catalog"
+expect_rejected \
+  "a single-volume image catalog with one newline-joined image name" \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --single-volume-images-catalog "$newline_single_volume_catalog"
+
+runtime_only_release_workflow="$temporary_directory/runtime-only-release.yml"
+# The literal shell variables are the fixture replacement targets.
 # shellcheck disable=SC2016
-sed -i.bak \
-  's/FROM zinder-canonical-runtime AS zinder-railway-runtime/FROM ${RAILWAY_DOCKER_TARGET_STAGE} AS zinder-railway-runtime/' \
-  "$guardless_dockerfile"
-rm "$guardless_dockerfile.bak"
-guardless_root="$temporary_directory/guardless-root"
-mkdir -p "$guardless_root/deploy" "$guardless_root/scripts"
-cp "$repository_root/railway.toml" "$guardless_root/railway.toml"
-cp "$guardless_dockerfile" "$guardless_root/deploy/Dockerfile.railway-nocache"
-cp "$validator" "$guardless_root/scripts/validate-deployment-admission.sh"
-if (
-  cd "$guardless_root"
-  bash ./scripts/validate-deployment-admission.sh --verify-railway-default >/dev/null 2>&1
-); then
-  fail "a Railway Dockerfile with a dynamic final stage was admitted"
-fi
+sed 's/jq -c -s '"'"'add'"'"' "\$RELEASE_IMAGES_FILE" "\$RELEASE_SINGLE_VOLUME_IMAGES_FILE"/jq -c . "$RELEASE_IMAGES_FILE"/' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$runtime_only_release_workflow"
+expect_rejected \
+  "a release workflow that does not publish the single-volume images" \
+  --release-workflow "$runtime_only_release_workflow"
+
+single_volumeless_build_workflow="$temporary_directory/single-volumeless-build-images.yml"
+sed '/release-single-volume-images.json)"$/d' \
+  "$repository_root/.github/workflows/build-images.yml" \
+  > "$single_volumeless_build_workflow"
+expect_rejected \
+  "a pull-request image workflow that skips the single-volume images" \
+  --build-images-workflow "$single_volumeless_build_workflow"
 
 echo "deployment admission tests passed"

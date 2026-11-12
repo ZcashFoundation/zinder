@@ -8,27 +8,43 @@ Use [Deploying on a VM](deploying-on-a-vm.md) for the complete topology, or
 [Wallet-serving deployment (single-volume hosts)](deploying-wallet-serving.md)
 for the native `WalletQuery` service.
 
-## Target admission
+## Image
 
-The Railway build requires:
+Create the Railway service from a Docker image source and name a released
+image by its exact tag:
 
 ```text
-RAILWAY_DOCKER_TARGET_STAGE=zinder-canonical-runtime
+ghcr.io/zcashfoundation/zinder-canonical-runtime:vX.Y.Z
 ```
 
-Verify the repository guard before deploying:
+The package is public, so the service needs no registry credentials. Railway
+pulls the image; it does not build Zinder. To deploy another release, change
+the tag on the service.
+
+The image is the `zinder-canonical-runtime` target of `deploy/Dockerfile`. It
+is admitted only as a canary or diagnostic deployment:
 
 ```bash
 bash scripts/validate-deployment-admission.sh \
   --deployment-class canary \
   --target zinder-canonical-runtime
-bash scripts/validate-deployment-admission.sh --verify-railway-default
 ```
 
-The target starts `zinder-ingest` through
+The image starts `zinder-ingest` through
 `deploy/canonical-runtime-entrypoint`, drops privileges to the `zinder` user,
 and exposes the operational endpoint. It does not run projector, compatibility,
 native query, explorer, or coherent restore services.
+
+Railway cannot build this image from the repository. It builds the last stage
+of a Dockerfile and has no target selection, and the last stage of
+`deploy/Dockerfile` is a different target. To run an unreleased commit, build
+the target yourself, push it to a registry the service can read, and point the
+service at that image:
+
+```bash
+docker build -f deploy/Dockerfile --target zinder-canonical-runtime \
+    -t <registry>/zinder-canonical-runtime:<commit> .
+```
 
 ## Configuration
 
@@ -36,6 +52,19 @@ Attach one persistent volume at `/var/lib/zinder`. Configure the network, Zebra
 endpoint and authentication, canonical path, wallet workload, wallet-serving
 coverage, transaction retention, reorg policy, operations listener, and private
 control listener through `ZINDER_*` variables.
+
+Set these in the service settings:
+
+| Setting | Value |
+| --- | --- |
+| Healthcheck path | `/healthz` |
+| Healthcheck timeout | `300` seconds |
+| Restart policy | On failure, 10 retries |
+
+Also set the service variables `PORT=9105`, the ingest operational endpoint
+that Railway healthchecks, and `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30`.
+Railway's default drain window gives the canonical writer no time to flush
+RocksDB on redeploy or stop.
 
 `/healthz` proves process liveness. `/readyz` proves only the canonical writer
 and mempool contract. It does not prove wallet projection, wallet-serving admission,

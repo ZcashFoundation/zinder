@@ -1,0 +1,6 @@
+kind: removed
+body: '`deploy/Dockerfile.wallet-serving`, `deploy/Dockerfile.railway-nocache`, `railway.toml`, `deploy/railway.canonical-runtime.toml`, and `deploy/railway.wallet-serving-runtime.toml` are removed, along with the `RAILWAY_DOCKER_TARGET_STAGE` build argument. Pull the published `zinder-wallet-serving` or `zinder-canonical-runtime` image instead, or build the target of that name from `deploy/Dockerfile`. Railway services must switch from a repository build to a Docker image source, then set the healthcheck path, healthcheck timeout, restart policy, and drain window in the service settings as the deployment runbooks describe.'
+time: 2026-11-11T23:00:01Z
+custom:
+  Bump: minor
+  PR: "128"

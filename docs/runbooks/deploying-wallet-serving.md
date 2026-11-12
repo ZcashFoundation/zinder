@@ -21,25 +21,24 @@ the certified complete release topology. Use
 [Railway canonical-writer validation](deploying-on-railway.md) for isolated
 canonical evidence.
 
-## Building the image
+## Getting the image
 
-Hosts with stage selection build the runtime stage directly:
-
-```bash
-docker build -f deploy/Dockerfile.wallet-serving \
-    --target zinder-wallet-serving-runtime .
-```
-
-Hosts that always build a file's final stage land on an admission guard
-instead and must present the target as a build argument:
+Each release publishes the image for Linux amd64 and arm64:
 
 ```text
-RAILWAY_DOCKER_TARGET_STAGE=zinder-wallet-serving-runtime
+ghcr.io/zcashfoundation/zinder-wallet-serving:vX.Y.Z
 ```
 
-On Railway, `deploy/railway.wallet-serving-runtime.toml` builds
-`deploy/Dockerfile.wallet-serving`; see [Deploy on Railway](#deploy-on-railway)
-for how the service selects it. The closed default target fails the build.
+Pin the exact release tag or its digest. The package is public, so pulling
+needs no registry credentials.
+
+The image is the `zinder-wallet-serving` target of `deploy/Dockerfile`. Build
+it from source when you need an unreleased commit:
+
+```bash
+docker build -f deploy/Dockerfile --target zinder-wallet-serving \
+    -t zinder-wallet-serving:local .
+```
 
 ## Service configuration
 
@@ -67,14 +66,12 @@ private network; substitute your host's):
 
 | Variable | Value |
 | --- | --- |
-| `RAILWAY_DOCKER_TARGET_STAGE` | `zinder-wallet-serving-runtime` |
 | `PORT` | `9106` |
 | `ZINDER_NETWORK__NAME` | `zcash-testnet` or `zcash-mainnet` |
 | `ZINDER_NODE__JSON_RPC_ADDR` | `http://zebra.railway.internal:18232` |
 | `ZINDER_NODE__AUTH__METHOD` | `cookie` |
 | `ZINDER_NODE__AUTH__COOKIE` | the inline `user:password` cookie string |
 | `ZINDER_PROJECTOR__BUILD_OWNER_HEX` | a stable 32-character hexadecimal value |
-| `ZINDER_INGEST__EXPLORER_VIEWS` | `false` |
 
 These are optional:
 
@@ -106,28 +103,32 @@ operational endpoint of the query process.
 
 ## Deploy on Railway
 
-Railway reads `railway.toml` at the repository root unless the service names
-another file. That default builds the ingest-only canary image, so set the
-config-as-code path once on the service settings page:
+Create the service from a Docker image source and name the released image by
+its exact tag, such as
+`ghcr.io/zcashfoundation/zinder-wallet-serving:vX.Y.Z`. Railway pulls the
+image; it does not build Zinder. To deploy another release, change the tag on
+the service.
 
-```text
-/deploy/railway.wallet-serving-runtime.toml
-```
+Set these in the service settings:
 
-The same setting is `railwayConfigFile` on the service API. Until it is set,
-every deploy of this service builds `deploy/Dockerfile.railway-nocache` and
-fails its target-admission guard.
+| Setting | Value |
+| --- | --- |
+| Healthcheck path | `/readyz` |
+| Healthcheck timeout | `21600` seconds |
+| Restart policy | Always |
 
-Then deploy the exact reviewed revision and name it in the message:
+The healthcheck window covers the canonical and wallet construction gates,
+because the container is only useful once the native query surface serves.
 
-```bash
-railway up \
-  --service zinder-wallet-serving \
-  --environment production \
-  --detach \
-  --json \
-  --message "<subject> (<commit>)"
-```
+Also set the `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30` service variable. The
+entrypoint gives the three RocksDB openers twenty seconds to flush, so a
+shorter drain window lets the platform kill them mid-write.
+
+Railway cannot build this image from the repository. It builds the last stage
+of a Dockerfile and has no target selection, and the last stage of
+`deploy/Dockerfile` is a different target. To run an unreleased commit, build
+the target as shown under [Getting the image](#getting-the-image), push it to a
+registry the service can read, and point the service at that image.
 
 ## Ports
 
@@ -228,7 +229,7 @@ restarts unhealthy containers keeps the typed refusal up instead of restarting
 into the same park.
 
 Railway's deploy-time healthcheck is different: it requires `/readyz` to
-answer 200 within `healthcheckTimeout` (six hours) before a deployment counts
+answer 200 within the healthcheck timeout (six hours) before a deployment counts
 as successful. Do not redeploy while the writer is parked except to ship the
 reconciliation, such as a restored state bundle or a rebuild. A redeploy
 restarts all three processes, ingest parks again on the same reorg, and query

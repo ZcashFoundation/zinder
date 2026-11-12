@@ -43,8 +43,8 @@ on one host filesystem: `zinder-ingest` owns canonical storage,
 compatibility protocols over immutable exact-fence pairs. A separate
 [single-volume container target](docs/runbooks/deploying-wallet-serving.md)
 runs ingest, projector, and native query as supervised processes when a host
-can attach one volume to only one container; that target omits
-`zinder-compat-lightwalletd` and is not a published release image. Explorer
+can attach one volume to only one container; that image omits
+`zinder-compat-lightwalletd` and is published beside the four runtime images. Explorer
 images are also outside the release catalog.
 
 Tagged releases also provide checksum-bound GNU/Linux bundles containing these

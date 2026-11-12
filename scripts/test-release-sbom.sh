@@ -271,6 +271,80 @@ expect_rejected "a compatibility image SBOM containing an undeclared service pac
     --amd64-digest "$amd64_digest" --arm64-digest "$arm64_digest" \
     --amd64-sbom "$compat_foreign_service_sbom" --arm64-sbom "$compat_arm64_sbom"
 
+cargo_package() {
+  jq -c -n --arg name "$1" '{
+    SPDXID: ("SPDXRef-Package-" + $name),
+    name: $name,
+    versionInfo: "0.0.0",
+    downloadLocation: "NOASSERTION",
+    filesAnalyzed: false,
+    externalRefs: [{
+      referenceCategory: "PACKAGE-MANAGER",
+      referenceType: "purl",
+      referenceLocator: ("pkg:cargo/" + $name + "@0.0.0")
+    }]
+  }'
+}
+
+check_single_volume_image_evidence() {
+  local single_volume_image="$1"
+  local single_volume_amd64_sbom="$2"
+  local single_volume_arm64_sbom="$3"
+  "$repository_root/scripts/check-release-image-evidence.sh" "$manifest" \
+    --image "$single_volume_image" --tag "$image_tag" --commit "$commit" --root-digest "$root_digest" \
+    --amd64-digest "$amd64_digest" --arm64-digest "$arm64_digest" \
+    --amd64-sbom "$single_volume_amd64_sbom" --arm64-sbom "$single_volume_arm64_sbom"
+}
+
+wallet_serving_image=ghcr.io/example/zinder-wallet-serving
+wallet_serving_fixture="$scratch/wallet-serving-syft-fixture.json"
+jq --argjson ingest "$(cargo_package zinder-ingest)" \
+  --argjson projector "$(cargo_package zinder-projector)" \
+  '.packages += [$ingest, $projector]' "$fixture" > "$wallet_serving_fixture"
+canonical_runtime_image=ghcr.io/example/zinder-canonical-runtime
+canonical_runtime_fixture="$scratch/canonical-runtime-syft-fixture.json"
+jq --argjson ingest "$(cargo_package zinder-ingest)" \
+  'del(.packages[] | select(.name == "zinder-query")) | .packages += [$ingest]' \
+  "$fixture" > "$canonical_runtime_fixture"
+for architecture in amd64 arm64; do
+  digest_variable="${architecture}_digest"
+  ZINDER_SYFT="$fake_syft" ZINDER_SYFT_FIXTURE="$wallet_serving_fixture" \
+    "$repository_root/scripts/generate-release-sbom.sh" \
+      --image "$wallet_serving_image" --tag "$image_tag" --commit "$commit" \
+      --architecture "$architecture" --digest "${!digest_variable}" \
+      --output "$scratch/wallet-serving-${architecture}.spdx.json"
+  ZINDER_SYFT="$fake_syft" ZINDER_SYFT_FIXTURE="$canonical_runtime_fixture" \
+    "$repository_root/scripts/generate-release-sbom.sh" \
+      --image "$canonical_runtime_image" --tag "$image_tag" --commit "$commit" \
+      --architecture "$architecture" --digest "${!digest_variable}" \
+      --output "$scratch/canonical-runtime-${architecture}.spdx.json"
+done
+check_single_volume_image_evidence "$wallet_serving_image" \
+  "$scratch/wallet-serving-amd64.spdx.json" "$scratch/wallet-serving-arm64.spdx.json"
+check_single_volume_image_evidence "$canonical_runtime_image" \
+  "$scratch/canonical-runtime-amd64.spdx.json" "$scratch/canonical-runtime-arm64.spdx.json"
+
+wallet_serving_missing_projector_sbom="$scratch/wallet-serving-missing-projector.spdx.json"
+jq 'del(.packages[] | select(.name == "zinder-projector"))' \
+  "$scratch/wallet-serving-amd64.spdx.json" > "$wallet_serving_missing_projector_sbom"
+expect_rejected "a wallet-serving image SBOM without the projector executable package" \
+  check_single_volume_image_evidence "$wallet_serving_image" \
+    "$wallet_serving_missing_projector_sbom" "$scratch/wallet-serving-arm64.spdx.json"
+
+wallet_serving_compat_sbom="$scratch/wallet-serving-compat.spdx.json"
+jq --argjson compat "$(cargo_package zinder-compat-lightwalletd)" '.packages += [$compat]' \
+  "$scratch/wallet-serving-amd64.spdx.json" > "$wallet_serving_compat_sbom"
+expect_rejected "a wallet-serving image SBOM containing the compatibility executable package" \
+  check_single_volume_image_evidence "$wallet_serving_image" \
+    "$wallet_serving_compat_sbom" "$scratch/wallet-serving-arm64.spdx.json"
+
+canonical_runtime_query_sbom="$scratch/canonical-runtime-query.spdx.json"
+jq --argjson query "$(cargo_package zinder-query)" '.packages += [$query]' \
+  "$scratch/canonical-runtime-amd64.spdx.json" > "$canonical_runtime_query_sbom"
+expect_rejected "a canonical-runtime image SBOM containing a reader executable package" \
+  check_single_volume_image_evidence "$canonical_runtime_image" \
+    "$canonical_runtime_query_sbom" "$scratch/canonical-runtime-arm64.spdx.json"
+
 three_platform_manifest="$scratch/three-platforms.json"
 jq '.manifests += [.manifests[0] | .platform.architecture = "s390x"]' \
   "$manifest" > "$three_platform_manifest"
