@@ -384,8 +384,11 @@ where
             .await
             .map_err(|error| status_from_query_error(&error))?;
         let at_epoch_id = visible_tip_block.chain_epoch.id;
-        let typed_request =
-            transparent_address_tx_history_request(filter, visible_tip_block.chain_epoch.network)?;
+        let typed_request = transparent_address_tx_history_request(
+            filter,
+            visible_tip_block.chain_epoch.network,
+            visible_tip_block.height,
+        )?;
         let history = transparent_address_tx_history(&self.query_api, typed_request).await?;
         let mut raw_transactions = Vec::with_capacity(history.len());
 
@@ -1399,9 +1402,15 @@ fn shielded_protocol_from_request(protocol: i32) -> Result<ShieldedProtocol, Sta
     }
 }
 
+/// Builds the native history request for a lightwalletd address filter.
+///
+/// The range resolves as lightwalletd resolves it on Zebra: an absent or zero
+/// `range.end` means the visible tip, and both bounds are clamped to the
+/// visible tip, so an end above the tip, even above `u32`, reads to the tip.
 fn transparent_address_tx_history_request(
     filter: &lightwalletd::TransparentAddressBlockFilter,
     network: Network,
+    visible_tip_height: BlockHeight,
 ) -> Result<TransparentAddressTxIdsInRangeRequest, Status> {
     let address_text = filter.address.as_str();
     let zebra_address: ZebraTransparentAddress = address_text.parse().map_err(|source| {
@@ -1427,12 +1436,11 @@ fn transparent_address_tx_history_request(
         .start
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("range.start is required"))?;
-    let end_block = range
-        .end
-        .as_ref()
-        .ok_or_else(|| Status::invalid_argument("range.end is required"))?;
-    let start_height = block_height_from_id(start_block)?;
-    let end_height = block_height_from_id(end_block)?;
+    let start_height = height_clamped_to_tip(start_block.height, visible_tip_height);
+    let end_height = match range.end.as_ref().map(|end_block| end_block.height) {
+        None | Some(0) => visible_tip_height,
+        Some(end_height) => height_clamped_to_tip(end_height, visible_tip_height),
+    };
     if start_height > end_height {
         return Err(Status::invalid_argument(
             "range.start.height must not exceed range.end.height",
@@ -1444,6 +1452,12 @@ fn transparent_address_tx_history_request(
         end_height,
         max_entries: NonZeroU32::MIN.saturating_add(999),
         from_cursor: None,
+    })
+}
+
+fn height_clamped_to_tip(height: u64, visible_tip_height: BlockHeight) -> BlockHeight {
+    u32::try_from(height).map_or(visible_tip_height, |height| {
+        BlockHeight::new(height).min(visible_tip_height)
     })
 }
 

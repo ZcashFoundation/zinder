@@ -1258,6 +1258,133 @@ async fn taddress_balance_matches_reference_for_unused_address() -> Result<()> {
     Ok(())
 }
 
+/// Open-ended and oversized history ranges read to the tip, like lightwalletd.
+///
+/// lightwalletd reads an absent or zero `range.end` as the tip, and Zebra
+/// clamps an end above its tip. lightwalletd rejects a span wider than
+/// 10,000,000 blocks, such as the `end = u64::MAX` that `WebZjs` sends, where
+/// Zinder clamps it to the tip.
+#[tokio::test]
+#[ignore = "live parity test; see CLAUDE.md §Live Node Tests"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Each open-ended range shape is compared against the same shared-tip baseline in one flow."
+)]
+async fn taddress_history_with_open_or_oversized_end_matches_reference_for_miner_address()
+-> Result<()> {
+    let _guard = init();
+    let Some(_env) = require_live()? else {
+        return Ok(());
+    };
+    let Some((mut zinder, mut reference)) = open_parity_clients().await? else {
+        return Ok(());
+    };
+    let address = parity_transparent_address()?;
+    let tip_height = common_latest_height(&mut zinder, &mut reference).await?;
+    let reference_tip = reference.get_latest_block(ChainSpec {}).await?.into_inner();
+    if reference_tip.height != tip_height {
+        return Err(eyre!(
+            "open-ended history parity needs one shared tip: zinder={tip_height} reference={}",
+            reference_tip.height,
+        ));
+    }
+    let request = |end_height: Option<u64>| lightwalletd::TransparentAddressBlockFilter {
+        address: address.clone(),
+        range: Some(BlockRange {
+            start: Some(BlockId {
+                height: 1,
+                hash: Vec::new(),
+            }),
+            end: end_height.map(|height| BlockId {
+                height,
+                hash: Vec::new(),
+            }),
+            pool_types: Vec::new(),
+        }),
+    };
+    let tip_bounded = normalize_raw_transactions(
+        &drain_raw_transactions(
+            zinder
+                .get_taddress_txids(request(Some(tip_height)))
+                .await?
+                .into_inner(),
+        )
+        .await?,
+    );
+    assert!(
+        !tip_bounded.is_empty(),
+        "miner address {address} should have transparent history after regtest mining",
+    );
+
+    for end_height in [None, Some(0), Some(tip_height.saturating_add(1_000))] {
+        let zinder_txids = drain_raw_transactions(
+            zinder
+                .get_taddress_txids(request(end_height))
+                .await?
+                .into_inner(),
+        )
+        .await?;
+        let reference_txids = drain_raw_transactions(
+            reference
+                .get_taddress_txids(request(end_height))
+                .await?
+                .into_inner(),
+        )
+        .await?;
+        let zinder_transactions = drain_raw_transactions(
+            zinder
+                .get_taddress_transactions(request(end_height))
+                .await?
+                .into_inner(),
+        )
+        .await?;
+        let reference_transactions = drain_raw_transactions(
+            reference
+                .get_taddress_transactions(request(end_height))
+                .await?
+                .into_inner(),
+        )
+        .await?;
+
+        assert_eq!(
+            normalize_raw_transactions(&zinder_txids),
+            normalize_raw_transactions(&reference_txids),
+            "GetTaddressTxids diverges for end {end_height:?}",
+        );
+        assert_eq!(
+            normalize_raw_transactions(&zinder_transactions),
+            normalize_raw_transactions(&reference_transactions),
+            "GetTaddressTransactions diverges for end {end_height:?}",
+        );
+        assert_eq!(
+            normalize_raw_transactions(&zinder_txids),
+            tip_bounded,
+            "end {end_height:?} must read to the tip",
+        );
+    }
+
+    let zinder_unbounded = drain_raw_transactions(
+        zinder
+            .get_taddress_txids(request(Some(u64::MAX)))
+            .await?
+            .into_inner(),
+    )
+    .await?;
+    assert_eq!(normalize_raw_transactions(&zinder_unbounded), tip_bounded);
+    let reference_status = stream_error_status(
+        reference.get_taddress_txids(request(Some(u64::MAX))).await,
+        "reference GetTaddressTxids",
+        "end = u64::MAX",
+    )
+    .await?;
+    assert_eq!(
+        reference_status.code(),
+        Code::InvalidArgument,
+        "the pinned reference rejects a span above 10,000,000 blocks: {reference_status:?}",
+    );
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "live parity test; see CLAUDE.md §Live Node Tests"]
 async fn taddress_history_matches_reference_for_miner_address() -> Result<()> {

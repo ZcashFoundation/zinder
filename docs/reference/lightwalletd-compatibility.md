@@ -218,6 +218,33 @@ query, and lightwalletd maps the unrecognized error to status `OK`, so the
 client receives an empty UTXO list (`frontend/service.go:931-939`). Zinder
 reports the failure instead of that empty success.
 
+## Transparent address history
+
+`GetTaddressTxids` and `GetTaddressTransactions` resolve `range` the way
+lightwalletd resolves it on Zebra, so a request that works there works here:
+
+- `range` and `range.start` are required; a missing one is
+  `INVALID_ARGUMENT`.
+- An absent `range.end`, or an end of 0, means the visible tip. lightwalletd
+  defaults both to the chain tip (lightwalletd `e7436d2`,
+  `frontend/service.go:128-137`).
+- Both bounds are clamped to the visible tip, as Zebra's `getaddresstxids`
+  clamps them (Zebra 7.0.0, `zebra-rpc/src/methods.rs:5163-5187`). An end
+  above the tip reads to the tip, and a start above the tip reads the tip
+  block. A start of 0 reads from genesis.
+- An explicit end below the start is `INVALID_ARGUMENT`.
+
+One case differs on purpose. lightwalletd rejects a span wider than
+10,000,000 blocks with `INVALID_ARGUMENT` (`frontend/service.go:98` and
+`:138-142`), which protects zcashd from an unbounded index scan. Zinder clamps
+the end to the visible tip before reading, so the read is already bounded, and
+it serves such a request to the tip. WebZjs birthday detection sends
+`end = u64::MAX` (WebZjs `a50df94`,
+`crates/webzjs-wallet/src/bindgen/wallet.rs:638-641`), and the Swift and
+Android SDK Tor paths send no end at all (zcash-swift-wallet-sdk `ebd0add`,
+`rust/src/tor.rs:274`; zcash-android-wallet-sdk `a95780a`,
+`backend-lib/src/main/rust/tor.rs:246`).
+
 ## Certification work
 
 1. Keep the protocol pin and generated-client coverage green. Updating the

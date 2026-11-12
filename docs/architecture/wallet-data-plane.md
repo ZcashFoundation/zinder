@@ -578,6 +578,8 @@ depend on the optional materialized-view store. Its ascending page cursor binds
 the wallet row key to the exact `WalletCanonicalSourceIdentity` that issued the
 page. If the publisher installs another serving pair between pages, resumption
 fails with `FAILED_PRECONDITION` instead of combining rows from two sources.
+An absent, zero, or above-tip `range.end` reads to the visible tip; see
+[Transparent address history](../reference/lightwalletd-compatibility.md#transparent-address-history).
 
 The full projection path is the canonical worked example in
 [Extending artifacts §A worked example: transparent address transaction history](extending-artifacts.md#a-worked-example-transparent-address-transaction-history).

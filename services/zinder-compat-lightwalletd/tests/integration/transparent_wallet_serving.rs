@@ -441,6 +441,112 @@ async fn production_pair_drains_both_transparent_history_rpcs_across_native_page
     Ok(())
 }
 
+/// Open-ended and oversized history ranges read to the tip, like lightwalletd.
+///
+/// lightwalletd defaults an absent or zero `range.end` to the chain tip
+/// (lightwalletd `e7436d2`, `frontend/service.go:128-137`), and Zebra clamps
+/// both bounds of `getaddresstxids` to its tip (Zebra 7.0.0,
+/// `zebra-rpc/src/methods.rs:5163-5187`). The Swift and Android SDK Tor paths
+/// send `end = None` (zcash-swift-wallet-sdk `ebd0add`, `rust/src/tor.rs:274`;
+/// zcash-android-wallet-sdk `a95780a`, `backend-lib/src/main/rust/tor.rs:246`),
+/// and `WebZjs` birthday detection sends `end = u64::MAX` (`WebZjs` `a50df94`,
+/// `crates/webzjs-wallet/src/bindgen/wallet.rs:638-641`).
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "One fixture keeps every open-ended range shape compared against the same tip-bounded rows."
+)]
+async fn taddress_history_resolves_open_and_oversized_ends_at_the_tip_like_lightwalletd()
+-> eyre::Result<()> {
+    let address = transparent_address(0x36);
+    let address_text = address.to_string();
+    let script = address.script().as_raw_bytes().to_vec();
+    let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script);
+    let mut chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(2);
+    for height in [1_u32, 2] {
+        let block = chain
+            .block_at(BlockHeight::new(height))
+            .ok_or_else(|| eyre::eyre!("history fixture must include block {height}"))?
+            .clone();
+        let transaction_id = history_transaction_id(height);
+        chain = chain
+            .with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
+                transaction_id,
+                block.height,
+                block.hash,
+                0,
+                history_transaction_bytes(height),
+            ))
+            .with_address_output_index(TransparentUnspentOutput::new(
+                address_script_hash,
+                script.clone(),
+                TransparentOutPoint::new(transaction_id, 0),
+                1,
+                block.height,
+                block.hash,
+            ));
+    }
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
+    let adapter = build_wallet_serving_adapter(&mut store_fixture, activations)?;
+    let both_blocks = vec![
+        (1, history_transaction_bytes(1)),
+        (2, history_transaction_bytes(2)),
+    ];
+    let tip_block_only = vec![(2, history_transaction_bytes(2))];
+
+    let cases = [
+        ("end at the tip", 1, Some(2), &both_blocks),
+        ("absent end", 1, None, &both_blocks),
+        ("zero end", 1, Some(0), &both_blocks),
+        ("end above the tip", 1, Some(1_000), &both_blocks),
+        ("end above u32", 1, Some(u64::MAX), &both_blocks),
+        ("genesis start", 0, None, &both_blocks),
+        ("start above the tip", 1_000, None, &tip_block_only),
+    ];
+    for (shape, start_height, end_height, expected) in cases {
+        let filter = history_filter_with_end(address_text.clone(), start_height, end_height);
+        let deprecated = collect_stream(
+            adapter
+                .get_taddress_txids(Request::new(filter.clone()))
+                .await?
+                .into_inner(),
+        )
+        .await?;
+        let current = collect_stream(
+            adapter
+                .get_taddress_transactions(Request::new(filter))
+                .await?
+                .into_inner(),
+        )
+        .await?;
+        let deprecated: Vec<_> = deprecated
+            .into_iter()
+            .map(|transaction| (transaction.height, transaction.data))
+            .collect();
+        let current: Vec<_> = current
+            .into_iter()
+            .map(|transaction| (transaction.height, transaction.data))
+            .collect();
+        assert_eq!(&deprecated, expected, "GetTaddressTxids with {shape}");
+        assert_eq!(&current, expected, "GetTaddressTransactions with {shape}");
+    }
+
+    let inverted = adapter
+        .get_taddress_txids(Request::new(history_filter_with_end(
+            address_text,
+            2,
+            Some(1),
+        )))
+        .await
+        .err()
+        .ok_or_else(|| eyre::eyre!("an explicit end below the start must be rejected"))?;
+    assert_eq!(inverted.code(), Code::InvalidArgument);
+    Ok(())
+}
+
 /// `maxEntries = 0` returns every UTXO, like lightwalletd.
 ///
 /// lightwalletd treats `maxEntries = 0` as "every UTXO" and stops only at a
@@ -900,6 +1006,27 @@ fn transparent_history_filter(
             }),
             end: Some(lightwalletd::BlockId {
                 height: end_height,
+                hash: Vec::new(),
+            }),
+            pool_types: Vec::new(),
+        }),
+    }
+}
+
+fn history_filter_with_end(
+    address: String,
+    start_height: u64,
+    end_height: Option<u64>,
+) -> lightwalletd::TransparentAddressBlockFilter {
+    lightwalletd::TransparentAddressBlockFilter {
+        address,
+        range: Some(lightwalletd::BlockRange {
+            start: Some(lightwalletd::BlockId {
+                height: start_height,
+                hash: Vec::new(),
+            }),
+            end: end_height.map(|height| lightwalletd::BlockId {
+                height,
                 hash: Vec::new(),
             }),
             pool_types: Vec::new(),
