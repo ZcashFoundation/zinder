@@ -43,16 +43,16 @@ use super::chain_events::{decode_address_filter, spawn_filtered_stream};
 use super::native::{
     TransactionStatusLookup, WalletEndpointMetadata, address_lookup_to_script_hash,
     block_header_by_selector_response, block_id_by_selector_response,
-    broadcast_transaction_response, build_chain_view_message, build_compact_block_message,
-    build_full_block_message, build_transparent_address_tx_ids_chunk,
-    build_transparent_address_tx_ids_header, build_transparent_unspent_output_message,
-    build_transparent_unspent_outputs_header, build_wallet_server_info,
-    chain_value_pools_at_tip_response, compact_block_response, full_block_response,
-    latest_tree_state_checkpoint_response, network_upgrade_activations_response,
-    settled_tip_block_response, subtree_roots_response, transaction_response,
-    transparent_address_unspent_outputs_response, transparent_outputs_by_outpoint_response,
-    transparent_spends_by_outpoint_response, transparent_unspent_outputs_by_outpoint_response,
-    transparent_utxo_set_summary_response, tree_state_at_response, visible_tip_block_response,
+    broadcast_transaction_response, build_chain_view_message, build_full_block_message,
+    build_transparent_address_tx_ids_chunk, build_transparent_address_tx_ids_header,
+    build_transparent_unspent_output_message, build_transparent_unspent_outputs_header,
+    build_wallet_server_info, chain_value_pools_at_tip_response, compact_block_response,
+    compact_blocks_in_range_chunks, full_block_response, latest_tree_state_checkpoint_response,
+    network_upgrade_activations_response, settled_tip_block_response, subtree_roots_response,
+    transaction_response, transparent_address_unspent_outputs_response,
+    transparent_outputs_by_outpoint_response, transparent_spends_by_outpoint_response,
+    transparent_unspent_outputs_by_outpoint_response, transparent_utxo_set_summary_response,
+    tree_state_at_response, visible_tip_block_response,
 };
 use super::status_from_query_error;
 
@@ -397,24 +397,14 @@ where
         );
         let at_epoch = chain_epoch_id_from_request(request.at_epoch_id);
 
-        let compact_blocks_in_range = self
+        let compact_block_range = self
             .query_api
             .compact_blocks_in_range(block_range, at_epoch)
             .await
             .map_err(|error| status_from_query_error(&error))?;
-        let chain_view = build_chain_view_message(compact_blocks_in_range.chain_epoch);
-        let compact_block_chunks =
-            compact_blocks_in_range
-                .compact_blocks
-                .into_iter()
-                .map(move |compact_block| {
-                    Ok(wallet::CompactBlocksInRangeChunk {
-                        chain_view: Some(chain_view.clone()),
-                        compact_block: Some(build_compact_block_message(&compact_block)),
-                    })
-                });
+        let chunks = compact_blocks_in_range_chunks(compact_block_range).map(Ok);
 
-        Ok(Response::new(Box::pin(stream::iter(compact_block_chunks))))
+        Ok(Response::new(Box::pin(stream::iter(chunks))))
     }
 
     async fn full_blocks_in_range(

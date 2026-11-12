@@ -44,12 +44,13 @@ pub use grpc::{
     build_transparent_address_tx_ids_chunk, build_transparent_address_tx_ids_header,
     build_transparent_unspent_output_message, build_transparent_unspent_outputs_header,
     build_wallet_server_info, chain_events_response, chain_value_pools_at_tip_response,
-    compact_block_response, full_block_response, latest_tree_state_checkpoint_response,
-    network_upgrade_activations_response, status_from_query_error, subtree_roots_response,
-    transaction_response, transparent_address_tx_ids_response,
-    transparent_address_unspent_outputs_response, transparent_outputs_by_outpoint_response,
-    transparent_spends_by_outpoint_response, transparent_unspent_outputs_by_outpoint_response,
-    tree_state_at_response, visible_tip_block_response,
+    compact_block_response, compact_blocks_in_range_chunks, full_block_response,
+    latest_tree_state_checkpoint_response, network_upgrade_activations_response,
+    status_from_query_error, subtree_roots_response, transaction_response,
+    transparent_address_tx_ids_response, transparent_address_unspent_outputs_response,
+    transparent_outputs_by_outpoint_response, transparent_spends_by_outpoint_response,
+    transparent_unspent_outputs_by_outpoint_response, tree_state_at_response,
+    visible_tip_block_response,
 };
 pub use ingest_control::{AdmittedIngestControl, IngestControlAdmissionError};
 pub use native_wallet_endpoint_capabilities::{

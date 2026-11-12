@@ -71,8 +71,11 @@ async fn dropping_compact_block_range_stream_does_not_break_subsequent_requests(
         .await
         .ok_or_else(|| eyre!("server closed compact-block-range stream without any chunk"))??;
     assert!(
-        first_chunk.compact_block.is_some(),
-        "first stream's first chunk must carry a compact block"
+        matches!(
+            first_chunk.body,
+            Some(wallet::compact_blocks_in_range_chunk::Body::Header(_))
+        ),
+        "first stream's first chunk must be its chain-view header"
     );
 
     // Drop the stream mid-flight. The server must observe the cancellation
@@ -87,17 +90,22 @@ async fn dropping_compact_block_range_stream_does_not_break_subsequent_requests(
         })
         .await?
         .into_inner();
-    let mut second_chunk_count: u32 = 0;
+    let mut second_header_count: u32 = 0;
+    let mut second_block_count: u32 = 0;
     while let Some(chunk) = second_stream.next().await {
-        let chunk = chunk?;
-        assert!(
-            chunk.compact_block.is_some(),
-            "second-stream chunk must carry a compact block"
-        );
-        second_chunk_count = second_chunk_count.saturating_add(1);
+        match chunk?.body {
+            Some(wallet::compact_blocks_in_range_chunk::Body::Header(_)) => {
+                second_header_count = second_header_count.saturating_add(1);
+            }
+            Some(wallet::compact_blocks_in_range_chunk::Body::Item(_)) => {
+                second_block_count = second_block_count.saturating_add(1);
+            }
+            None => return Err(eyre!("second-stream chunk carried no body")),
+        }
     }
+    assert_eq!(second_header_count, 1, "the stream sends one header");
     assert_eq!(
-        second_chunk_count, COMMITTED_BLOCK_COUNT,
+        second_block_count, COMMITTED_BLOCK_COUNT,
         "post-cancellation request must drain the full committed range"
     );
     Ok(())
@@ -172,8 +180,12 @@ async fn parallel_compact_block_range_readers_all_drain_to_completion() -> Resul
                     .into_inner();
                 let mut received: u32 = 0;
                 while let Some(chunk) = stream.next().await {
-                    let _chunk = chunk?;
-                    received = received.saturating_add(1);
+                    if matches!(
+                        chunk?.body,
+                        Some(wallet::compact_blocks_in_range_chunk::Body::Item(_))
+                    ) {
+                        received = received.saturating_add(1);
+                    }
                 }
                 Ok::<u32, eyre::Report>(received)
             })

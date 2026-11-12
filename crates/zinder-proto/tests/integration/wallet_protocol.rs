@@ -584,6 +584,58 @@ fn chain_event_envelope_round_trips_through_prost() -> eyre::Result<()> {
 }
 
 #[test]
+fn compact_blocks_in_range_chunk_header_round_trips_through_prost() -> eyre::Result<()> {
+    let header = wallet::CompactBlocksInRangeChunk {
+        body: Some(wallet::compact_blocks_in_range_chunk::Body::Header(
+            synthetic_chain_view(),
+        )),
+    };
+    let decoded = round_trip(&header)?;
+
+    assert_eq!(decoded, header);
+    Ok(())
+}
+
+#[test]
+fn compact_blocks_in_range_chunk_item_round_trips_through_prost() -> eyre::Result<()> {
+    let item = wallet::CompactBlocksInRangeChunk {
+        body: Some(wallet::compact_blocks_in_range_chunk::Body::Item(
+            wallet::CompactBlock {
+                height: 42,
+                block_hash: "33".repeat(32),
+                previous_block_hash: "22".repeat(32),
+                time: 1_774_670_000,
+                transactions: Vec::new(),
+                chain_metadata: Some(wallet::CompactChainMetadata {
+                    sapling_commitment_tree_size: 10,
+                    orchard_commitment_tree_size: 11,
+                    ironwood_commitment_tree_size: 12,
+                }),
+            },
+        )),
+    };
+    let decoded = round_trip(&item)?;
+
+    assert_eq!(decoded, item);
+    Ok(())
+}
+
+#[test]
+fn compact_blocks_in_range_item_chunk_carries_no_chain_view() {
+    let item = wallet::CompactBlocksInRangeChunk {
+        body: Some(wallet::compact_blocks_in_range_chunk::Body::Item(
+            wallet::CompactBlock::default(),
+        )),
+    };
+
+    assert_eq!(
+        item.encode_to_vec(),
+        vec![0x12, 0x00],
+        "an item chunk encodes only field 2, with no chain-view envelope"
+    );
+}
+
+#[test]
 fn transparent_unspent_outputs_chunk_header_round_trips_through_prost() -> eyre::Result<()> {
     let header = wallet::TransparentUnspentOutputsChunk {
         body: Some(wallet::transparent_unspent_outputs_chunk::Body::Header(

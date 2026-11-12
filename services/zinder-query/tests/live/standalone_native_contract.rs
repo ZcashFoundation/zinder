@@ -188,18 +188,27 @@ async fn verify_compact_tip(
         })
         .await?
         .into_inner();
-    let compact_tip_chunk = compact_tip_stream
+    let header_chunk = compact_tip_stream
+        .next()
+        .await
+        .ok_or_else(|| eyre!("one-block compact range closed without a header"))??;
+    let Some(wallet::compact_blocks_in_range_chunk::Body::Header(header)) = header_chunk.body
+    else {
+        return Err(eyre!(
+            "one-block compact range must open with its chain-view header"
+        ));
+    };
+    assert_chain_view_epoch(Some(&header), current_epoch_id, expected_network)?;
+    let block_chunk = compact_tip_stream
         .next()
         .await
         .ok_or_else(|| eyre!("one-block compact range closed without a block"))??;
-    assert_chain_view_epoch(
-        compact_tip_chunk.chain_view.as_ref(),
-        current_epoch_id,
-        expected_network,
-    )?;
-    let compact_tip = compact_tip_chunk
-        .compact_block
-        .ok_or_else(|| eyre!("one-block compact range chunk omitted its block"))?;
+    let Some(wallet::compact_blocks_in_range_chunk::Body::Item(compact_tip)) = block_chunk.body
+    else {
+        return Err(eyre!(
+            "one-block compact range must follow its header with a block"
+        ));
+    };
     assert_eq!(compact_tip.height, settled_tip.height);
     assert_eq!(compact_tip.block_hash, settled_tip.block_hash);
     assert_eq!(compact_tip.block_hash.len(), 64);

@@ -115,7 +115,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE: Duration = Duration::from_mins(1);
 
 /// Oldest native wallet contract revision this client can safely consume.
-pub const MIN_SUPPORTED_CONTRACT_REVISION: u32 = 5;
+///
+/// Revision 7 sends the `CompactBlocksInRange` chain view once as a leading
+/// stream header instead of on every block.
+pub const MIN_SUPPORTED_CONTRACT_REVISION: u32 = 7;
 
 impl RemoteChainIndex {
     /// Builds a remote-chain-index handle pointed at a `WalletQuery` endpoint.
@@ -398,80 +401,14 @@ impl ChainIndex for RemoteChainIndex {
             .await
             .map_err(|status| self.map_status(status))?;
         let recovery = self.clone();
-        let expected_network = self.network;
-        let mut streamed_epoch = None;
-        let next_height = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::from(
-            block_range.start.value(),
-        )));
-        let next_height_while_decoding = std::sync::Arc::clone(&next_height);
-        let stream = response.into_inner().map(move |chunk_result| {
-            let chunk = chunk_result.map_err(|status| recovery.map_status(status))?;
-            let chain_epoch = chain_epoch_from_chain_view_with_pin(
-                expected_network,
-                at_epoch_id,
-                chunk.chain_view,
-            )?;
-            match streamed_epoch {
-                None => streamed_epoch = Some(chain_epoch),
-                Some(epoch) if epoch == chain_epoch => {}
-                Some(_) => {
-                    return Err(IndexerError::malformed(
-                        "chain_view.chain_epoch.chain_epoch_id",
-                        "compact block stream changed chain epoch",
-                    ));
-                }
-            }
-            let artifact =
-                compact_block_from_message(chunk.compact_block.ok_or_else(|| {
-                    IndexerError::malformed("compact_block", "field is missing")
-                })?)?;
-            if artifact.height() > chain_epoch.visible_tip_height {
-                return Err(IndexerError::malformed(
-                    "compact_block.height",
-                    "compact block exceeds chain-view visible tip",
-                ));
-            }
-            let expected_value =
-                next_height_while_decoding.load(std::sync::atomic::Ordering::Acquire);
-            let expected = u32::try_from(expected_value)
-                .map(BlockHeight::new)
-                .map_err(|_| {
-                    IndexerError::malformed(
-                        "compact_block.height",
-                        "compact block stream exceeded requested end height",
-                    )
-                })?;
-            if artifact.height() != expected {
-                return Err(IndexerError::malformed(
-                    "compact_block.height",
-                    format!(
-                        "expected streamed height {}, observed {}",
-                        expected.value(),
-                        artifact.height().value()
-                    ),
-                ));
-            }
-            let following_height = if expected == block_range.end {
-                u64::from(u32::MAX) + 1
-            } else {
-                u64::from(expected.value()) + 1
-            };
-            next_height_while_decoding
-                .store(following_height, std::sync::atomic::Ordering::Release);
-            Ok(artifact)
-        });
-        let terminal = futures_util::StreamExt::filter_map(
-            futures_util::stream::once(async move {
-                incomplete_compact_block_stream_error(
-                    next_height.load(std::sync::atomic::Ordering::Acquire),
-                    block_range.end,
-                )
-                .map(Err)
-            }),
-            |terminal_result| async move { terminal_result },
-        );
-
-        Ok(Box::pin(futures_util::StreamExt::chain(stream, terminal)))
+        let wire_stream =
+            tokio_stream::StreamExt::map(response.into_inner(), move |chunk_result| {
+                chunk_result.map_err(|status| recovery.map_status(status))
+            });
+        Ok(compact_block_range_stream(
+            Box::pin(wire_stream),
+            CompactBlockRangeStreamState::new(self.network, at_epoch_id, block_range),
+        ))
     }
 
     async fn full_block_at(
@@ -923,21 +860,6 @@ fn missing_transparent_history_header_error(
         IndexerError::malformed(
             "transparent_address_tx_ids.header",
             "stream ended before the required chain-view header",
-        )
-    })
-}
-
-fn incomplete_compact_block_stream_error(
-    next_height: u64,
-    end_height: BlockHeight,
-) -> Option<IndexerError> {
-    u32::try_from(next_height).is_ok().then(|| {
-        IndexerError::malformed(
-            "compact_block.height",
-            format!(
-                "compact block stream ended before requested height {}; next expected height was {next_height}",
-                end_height.value()
-            ),
         )
     })
 }
@@ -1911,6 +1833,153 @@ fn transparent_unspent_output_stream_item(
             }))
         }
     }
+}
+
+/// Decoding state for one `CompactBlocksInRange` stream.
+///
+/// The leading header binds the stream to one chain epoch, so it must arrive
+/// exactly once and before any block. Each later block must be the next
+/// requested height and must not exceed the header epoch's visible tip.
+struct CompactBlockRangeStreamState {
+    expected_network: Network,
+    expected_epoch_id: Option<ChainEpochId>,
+    block_range: BlockHeightRange,
+    chain_epoch: Option<ChainEpoch>,
+    next_height: Option<BlockHeight>,
+}
+
+impl CompactBlockRangeStreamState {
+    const fn new(
+        expected_network: Network,
+        expected_epoch_id: Option<ChainEpochId>,
+        block_range: BlockHeightRange,
+    ) -> Self {
+        Self {
+            expected_network,
+            expected_epoch_id,
+            block_range,
+            chain_epoch: None,
+            next_height: Some(block_range.start),
+        }
+    }
+
+    /// Decodes one chunk. A header yields no block (`Ok(None)`).
+    fn accept(
+        &mut self,
+        chunk: wallet::CompactBlocksInRangeChunk,
+    ) -> Result<Option<CompactBlockArtifact>, IndexerError> {
+        match chunk.body.ok_or_else(|| {
+            IndexerError::malformed("compact_blocks_in_range_chunk.body", "field is missing")
+        })? {
+            wallet::compact_blocks_in_range_chunk::Body::Header(chain_view) => {
+                if self.chain_epoch.is_some() {
+                    return Err(IndexerError::malformed(
+                        "compact_blocks_in_range.header",
+                        "stream sent more than one chain-view header",
+                    ));
+                }
+                self.chain_epoch = Some(chain_epoch_from_chain_view_with_pin(
+                    self.expected_network,
+                    self.expected_epoch_id,
+                    Some(chain_view),
+                )?);
+                Ok(None)
+            }
+            wallet::compact_blocks_in_range_chunk::Body::Item(compact_block) => {
+                let chain_epoch = self.chain_epoch.ok_or_else(|| {
+                    IndexerError::malformed(
+                        "compact_blocks_in_range.item",
+                        "stream sent a compact block before its chain-view header",
+                    )
+                })?;
+                let artifact = compact_block_from_message(compact_block)?;
+                self.accept_block_height(chain_epoch, artifact.height())?;
+                Ok(Some(artifact))
+            }
+        }
+    }
+
+    fn accept_block_height(
+        &mut self,
+        chain_epoch: ChainEpoch,
+        height: BlockHeight,
+    ) -> Result<(), IndexerError> {
+        if height > chain_epoch.visible_tip_height {
+            return Err(IndexerError::malformed(
+                "compact_block.height",
+                "compact block exceeds chain-view visible tip",
+            ));
+        }
+        let expected = self.next_height.ok_or_else(|| {
+            IndexerError::malformed(
+                "compact_block.height",
+                "compact block stream exceeded requested end height",
+            )
+        })?;
+        if height != expected {
+            return Err(IndexerError::malformed(
+                "compact_block.height",
+                format!(
+                    "expected streamed height {}, observed {}",
+                    expected.value(),
+                    height.value()
+                ),
+            ));
+        }
+        self.next_height = if expected < self.block_range.end {
+            expected.value().checked_add(1).map(BlockHeight::new)
+        } else {
+            None
+        };
+        Ok(())
+    }
+
+    /// Returns the error a cleanly ended stream deserves, if any.
+    fn end_of_stream_error(&self) -> Option<IndexerError> {
+        if self.chain_epoch.is_none() {
+            return Some(IndexerError::malformed(
+                "compact_blocks_in_range.header",
+                "stream ended before the required chain-view header",
+            ));
+        }
+        self.next_height.map(|next_height| {
+            IndexerError::malformed(
+                "compact_block.height",
+                format!(
+                    "compact block stream ended before requested height {}; next expected height was {}",
+                    self.block_range.end.value(),
+                    next_height.value()
+                ),
+            )
+        })
+    }
+}
+
+/// Decodes a `CompactBlocksInRange` wire stream into compact blocks.
+///
+/// The stream ends after its first error, so a transport or protocol failure
+/// is reported once and never followed by a completeness error.
+fn compact_block_range_stream(
+    wire_stream: IndexStream<wallet::CompactBlocksInRangeChunk>,
+    state: CompactBlockRangeStreamState,
+) -> IndexStream<CompactBlockArtifact> {
+    Box::pin(futures_util::stream::unfold(
+        Some((wire_stream, state)),
+        |stream_state| async move {
+            let (mut wire_stream, mut state) = stream_state?;
+            loop {
+                let Some(chunk_result) = futures_util::StreamExt::next(&mut wire_stream).await
+                else {
+                    return state.end_of_stream_error().map(|error| (Err(error), None));
+                };
+                match chunk_result.and_then(|chunk| state.accept(chunk)) {
+                    Ok(None) => {}
+                    Ok(Some(artifact)) => return Some((Ok(artifact), Some((wire_stream, state)))),
+                    Err(error) => return Some((Err(error), None)),
+                }
+            }
+        },
+    ))
 }
 
 /// Records the pinned chain epoch from a stream's leading header.
@@ -3084,13 +3153,13 @@ mod tests {
     }
 
     #[test]
-    fn contract_revision_five_is_the_minimum() {
+    fn contract_revision_seven_is_the_minimum() {
         assert!(matches!(
-            ensure_supported_contract_revision(4),
+            ensure_supported_contract_revision(6),
             Err(IndexerError::FailedPrecondition { .. })
         ));
-        assert!(ensure_supported_contract_revision(5).is_ok());
-        assert!(ensure_supported_contract_revision(6).is_ok());
+        assert!(ensure_supported_contract_revision(7).is_ok());
+        assert!(ensure_supported_contract_revision(8).is_ok());
     }
 
     #[test]
@@ -3723,24 +3792,251 @@ mod tests {
         assert!(missing_transparent_unspent_header_error(true).is_none());
     }
 
-    #[test]
-    fn compact_stream_rejects_empty_and_truncated_success() {
-        assert!(
-            incomplete_compact_block_stream_error(10, BlockHeight::new(12)).is_some(),
-            "an empty stream still owes its first requested height"
+    fn compact_block_range_header() -> wallet::CompactBlocksInRangeChunk {
+        wallet::CompactBlocksInRangeChunk {
+            body: Some(wallet::compact_blocks_in_range_chunk::Body::Header(
+                synthetic_chain_view(EXPECTED_NETWORK),
+            )),
+        }
+    }
+
+    fn compact_block_range_item(height: u32) -> wallet::CompactBlocksInRangeChunk {
+        wallet::CompactBlocksInRangeChunk {
+            body: Some(wallet::compact_blocks_in_range_chunk::Body::Item(
+                wallet::CompactBlock {
+                    height,
+                    block_hash: format!("{:02x}", height % 256).repeat(32),
+                    previous_block_hash: "00".repeat(32),
+                    time: 1_774_670_000,
+                    transactions: Vec::new(),
+                    chain_metadata: Some(wallet::CompactChainMetadata::default()),
+                },
+            )),
+        }
+    }
+
+    /// Decodes `chunks` as a `CompactBlocksInRange` stream for heights 40
+    /// through 41 under the synthetic epoch, returning each yielded height or
+    /// error.
+    async fn decode_compact_block_range(
+        chunks: Vec<Result<wallet::CompactBlocksInRangeChunk, IndexerError>>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Vec<Result<BlockHeight, IndexerError>> {
+        decode_compact_block_range_over(
+            BlockHeightRange::inclusive(BlockHeight::new(40), BlockHeight::new(41)),
+            chunks,
+            at_epoch_id,
+        )
+        .await
+    }
+
+    async fn decode_compact_block_range_over(
+        block_range: BlockHeightRange,
+        chunks: Vec<Result<wallet::CompactBlocksInRangeChunk, IndexerError>>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Vec<Result<BlockHeight, IndexerError>> {
+        let compact_blocks = compact_block_range_stream(
+            Box::pin(futures_util::stream::iter(chunks)),
+            CompactBlockRangeStreamState::new(EXPECTED_NETWORK, at_epoch_id, block_range),
         );
-        assert!(
-            incomplete_compact_block_stream_error(12, BlockHeight::new(12)).is_some(),
-            "a truncated stream still owes its final requested height"
+        futures_util::StreamExt::collect::<Vec<_>>(compact_blocks)
+            .await
+            .into_iter()
+            .map(|decoded| decoded.map(|artifact| artifact.height()))
+            .collect()
+    }
+
+    fn is_malformed(decoded: &Result<BlockHeight, IndexerError>, expected_field: &str) -> bool {
+        matches!(
+            decoded,
+            Err(IndexerError::MalformedResponse { field, .. }) if *field == expected_field
+        )
+    }
+
+    #[tokio::test]
+    async fn compact_block_range_yields_blocks_after_one_header() {
+        let decoded = decode_compact_block_range(
+            vec![
+                Ok(compact_block_range_header()),
+                Ok(compact_block_range_item(40)),
+                Ok(compact_block_range_item(41)),
+            ],
+            Some(ChainEpochId::new(7)),
+        )
+        .await;
+
+        assert!(matches!(
+            decoded.as_slice(),
+            [Ok(first), Ok(second)]
+                if *first == BlockHeight::new(40) && *second == BlockHeight::new(41)
+        ));
+    }
+
+    #[tokio::test]
+    async fn compact_block_range_rejects_a_block_before_the_header() {
+        let decoded = decode_compact_block_range(
+            vec![
+                Ok(compact_block_range_item(40)),
+                Ok(compact_block_range_header()),
+                Ok(compact_block_range_item(41)),
+            ],
+            None,
+        )
+        .await;
+
+        assert_eq!(decoded.len(), 1, "the stream ends at its first error");
+        assert!(is_malformed(&decoded[0], "compact_blocks_in_range.item"));
+    }
+
+    #[tokio::test]
+    async fn compact_block_range_rejects_a_second_header() {
+        let decoded = decode_compact_block_range(
+            vec![
+                Ok(compact_block_range_header()),
+                Ok(compact_block_range_item(40)),
+                Ok(compact_block_range_header()),
+                Ok(compact_block_range_item(41)),
+            ],
+            None,
+        )
+        .await;
+
+        assert_eq!(decoded.len(), 2, "the stream ends at its first error");
+        assert!(matches!(decoded[0], Ok(height) if height == BlockHeight::new(40)));
+        assert!(is_malformed(&decoded[1], "compact_blocks_in_range.header"));
+    }
+
+    #[tokio::test]
+    async fn compact_block_range_rejects_a_stream_without_a_header() {
+        let decoded = decode_compact_block_range(Vec::new(), None).await;
+
+        assert_eq!(decoded.len(), 1);
+        assert!(is_malformed(&decoded[0], "compact_blocks_in_range.header"));
+    }
+
+    #[tokio::test]
+    async fn compact_block_range_rejects_a_chunk_without_a_body() {
+        let decoded = decode_compact_block_range(
+            vec![Ok(wallet::CompactBlocksInRangeChunk { body: None })],
+            None,
+        )
+        .await;
+
+        assert_eq!(decoded.len(), 1);
+        assert!(is_malformed(
+            &decoded[0],
+            "compact_blocks_in_range_chunk.body"
+        ));
+    }
+
+    #[tokio::test]
+    async fn compact_block_range_rejects_a_header_from_another_epoch() {
+        let decoded = decode_compact_block_range(
+            vec![
+                Ok(compact_block_range_header()),
+                Ok(compact_block_range_item(40)),
+            ],
+            Some(ChainEpochId::new(8)),
+        )
+        .await;
+
+        assert_eq!(decoded.len(), 1);
+        assert!(is_malformed(
+            &decoded[0],
+            "chain_view.chain_epoch.chain_epoch_id"
+        ));
+    }
+
+    #[tokio::test]
+    async fn compact_block_range_rejects_empty_and_truncated_success() {
+        let header_only =
+            decode_compact_block_range(vec![Ok(compact_block_range_header())], None).await;
+        let truncated = decode_compact_block_range(
+            vec![
+                Ok(compact_block_range_header()),
+                Ok(compact_block_range_item(40)),
+            ],
+            None,
+        )
+        .await;
+
+        assert_eq!(header_only.len(), 1, "a header alone still owes height 40");
+        assert!(is_malformed(&header_only[0], "compact_block.height"));
+        assert_eq!(
+            truncated.len(),
+            2,
+            "a truncated stream still owes height 41"
         );
-        assert!(
-            incomplete_compact_block_stream_error(
-                u64::from(u32::MAX) + 1,
-                BlockHeight::new(u32::MAX),
-            )
-            .is_none(),
-            "the terminal sentinel must represent the complete full-domain range"
+        assert!(is_malformed(&truncated[1], "compact_block.height"));
+    }
+
+    #[tokio::test]
+    async fn compact_block_range_rejects_gaps_overruns_and_blocks_above_the_visible_tip() {
+        let gap = decode_compact_block_range(
+            vec![
+                Ok(compact_block_range_header()),
+                Ok(compact_block_range_item(41)),
+            ],
+            None,
+        )
+        .await;
+        let overrun = decode_compact_block_range(
+            vec![
+                Ok(compact_block_range_header()),
+                Ok(compact_block_range_item(40)),
+                Ok(compact_block_range_item(41)),
+                Ok(compact_block_range_item(42)),
+            ],
+            None,
+        )
+        .await;
+        // Height 43 is the next contiguous height in the request but lies
+        // above the synthetic visible tip of 42, so only the tip guard rejects it.
+        let above_tip = decode_compact_block_range_over(
+            BlockHeightRange::inclusive(BlockHeight::new(42), BlockHeight::new(43)),
+            vec![
+                Ok(compact_block_range_header()),
+                Ok(compact_block_range_item(42)),
+                Ok(compact_block_range_item(43)),
+            ],
+            None,
+        )
+        .await;
+
+        assert!(is_malformed(&gap[0], "compact_block.height"));
+        assert_eq!(overrun.len(), 3);
+        assert!(is_malformed(&overrun[2], "compact_block.height"));
+        assert_eq!(above_tip.len(), 2);
+        assert!(matches!(above_tip[0], Ok(height) if height == BlockHeight::new(42)));
+        assert!(matches!(
+            &above_tip[1],
+            Err(IndexerError::MalformedResponse { field: "compact_block.height", reason })
+                if reason.contains("visible tip")
+        ));
+    }
+
+    #[tokio::test]
+    async fn compact_block_range_reports_a_transport_error_once() {
+        let decoded = decode_compact_block_range(
+            vec![
+                Ok(compact_block_range_header()),
+                Err(IndexerError::ServiceUnavailable {
+                    reason: "connection reset".to_owned(),
+                }),
+            ],
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            decoded.len(),
+            1,
+            "a transport error is not followed by a completeness error"
         );
+        assert!(matches!(
+            decoded[0],
+            Err(IndexerError::ServiceUnavailable { .. })
+        ));
     }
 
     #[test]
