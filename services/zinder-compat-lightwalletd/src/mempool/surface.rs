@@ -21,7 +21,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 use tokio_stream::Stream;
-use zinder_core::{ChainEpochId, MempoolEntry};
+use zinder_core::{ChainEpochId, MempoolEntry, TransactionId};
 use zinder_store::{MempoolEventEnvelope, StreamCursorTokenV1};
 
 /// Stream of mempool event envelopes returned by [`MempoolSurface::mempool_events`].
@@ -85,6 +85,13 @@ pub trait MempoolSurface: Send + Sync + 'static {
         &self,
         from_cursor: Option<StreamCursorTokenV1>,
     ) -> Result<MempoolEventEnvelopeStream, MempoolSurfaceError>;
+
+    /// Returns the live mempool entry for `transaction_id`, or `None` when
+    /// the mempool does not hold it.
+    async fn mempool_transaction(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<MempoolEntry>, MempoolSurfaceError>;
 }
 
 /// Convenience wrapper for a shared [`MempoolSurface`] handle.

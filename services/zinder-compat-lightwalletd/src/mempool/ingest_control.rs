@@ -33,9 +33,15 @@ use async_trait::async_trait;
 use tokio::sync::{OnceCell, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tonic::Request;
-use zinder_core::{BlockHeight, BlockId, ChainEpochId};
-use zinder_proto::v1::{ingest::ingest_control_client::IngestControlClient, wallet};
+use tonic::{Code, Request};
+use zinder_core::{
+    BlockHeight, BlockId, ChainEpochId, MempoolEntry, TransactionId,
+    wire::encode_rpc_transaction_id_hex,
+};
+use zinder_proto::v1::{
+    ingest::{MempoolTransactionRequest, ingest_control_client::IngestControlClient},
+    wallet,
+};
 use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_zinder_grpc};
 use zinder_store::{
     EventStreamStartPosition, StreamCursorTokenV1, event_stream_start_message,
@@ -242,6 +248,47 @@ impl MempoolSurface for IngestControlMempoolSurface {
             }
         });
         Ok(Box::pin(ReceiverStream::new(output_receiver)))
+    }
+
+    async fn mempool_transaction(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<MempoolEntry>, MempoolSurfaceError> {
+        let mut client = self.ingest_control_client().await?;
+        let response = match client
+            .mempool_transaction(MempoolTransactionRequest {
+                transaction_id: encode_rpc_transaction_id_hex(transaction_id),
+            })
+            .await
+        {
+            Ok(response) => response.into_inner(),
+            Err(status) if status.code() == Code::NotFound => return Ok(None),
+            Err(status) => {
+                return Err(MempoolSurfaceError::Unavailable {
+                    reason: format!("ingest-control mempool_transaction failed: {status}"),
+                });
+            }
+        };
+        let Some(wallet::transaction_location::Location::InMempool(entry)) =
+            response.location.and_then(|location| location.location)
+        else {
+            return Err(MempoolSurfaceError::Unavailable {
+                reason: "ingest-control mempool_transaction did not return a mempool entry"
+                    .to_owned(),
+            });
+        };
+        let entry = mempool_entry_from_message(entry).map_err(|error| {
+            MempoolSurfaceError::Unavailable {
+                reason: error.to_string(),
+            }
+        })?;
+        if entry.transaction_id() != transaction_id {
+            return Err(MempoolSurfaceError::Unavailable {
+                reason: "ingest-control mempool_transaction returned another transaction"
+                    .to_owned(),
+            });
+        }
+        Ok(Some(entry))
     }
 }
 

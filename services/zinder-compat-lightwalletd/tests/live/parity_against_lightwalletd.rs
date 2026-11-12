@@ -47,7 +47,8 @@ use zebra_chain::{
     parameters::NetworkKind as ZebraNetworkKind, transparent::Address as ZebraTransparentAddress,
 };
 use zinder_core::{
-    Network, TransactionId, UnixTimestampMillis, wire::decode_rpc_transaction_id_hex,
+    Network, TransactionId, UnixTimestampMillis,
+    wire::{decode_rpc_transaction_id_hex, encode_internal_transaction_id},
 };
 use zinder_proto::compat::lightwalletd::{
     self, BlockId, BlockRange, ChainSpec, Empty, TxFilter,
@@ -484,6 +485,14 @@ async fn accepted_send_transaction_surfaces_in_non_empty_mempool_methods() -> Re
         reference_raw.height, 0,
         "reference mempool RawTransaction height"
     );
+
+    assert_pending_transaction_matches_reference(
+        &mut zinder,
+        &mut reference,
+        broadcast_txid,
+        &raw_transaction,
+    )
+    .await?;
 
     let zinder_compact =
         wait_for_compact_mempool_transaction(&mut zinder, broadcast_txid, "Zinder").await?;
@@ -1842,6 +1851,37 @@ async fn select_spendable_lightwalletd_utxo(
     Err(eyre!(
         "no mature spendable UTXO for parity address {address}; the parity fixture must premine at least 125 blocks to the address printed by `cargo run -p zinder-testkit --example print_broadcast_test_address`"
     ))
+}
+
+/// Both servers answer `GetTransaction` for a pending transaction with its
+/// bytes at height 0, the protocol's "in the mempool" sentinel.
+async fn assert_pending_transaction_matches_reference(
+    zinder: &mut CompactTxStreamerClient<tonic::transport::Channel>,
+    reference: &mut CompactTxStreamerClient<tonic::transport::Channel>,
+    transaction_id: TransactionId,
+    raw_transaction: &[u8],
+) -> Result<()> {
+    let pending_filter = || TxFilter {
+        block: None,
+        index: 0,
+        hash: encode_internal_transaction_id(transaction_id).to_vec(),
+    };
+    let zinder_pending = zinder.get_transaction(pending_filter()).await?.into_inner();
+    let reference_pending = reference
+        .get_transaction(pending_filter())
+        .await?
+        .into_inner();
+    assert_eq!(
+        zinder_pending.height, 0,
+        "Zinder pending GetTransaction height"
+    );
+    assert_eq!(
+        reference_pending.height, 0,
+        "reference pending GetTransaction height"
+    );
+    assert_eq!(zinder_pending.data, raw_transaction);
+    assert_eq!(zinder_pending.data, reference_pending.data);
+    Ok(())
 }
 
 async fn wait_for_mempool_stream_snapshot_transaction(

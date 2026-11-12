@@ -190,6 +190,45 @@ identifier, so `GetBlock` returns `INVALID_ARGUMENT` for it in both serving
 modes, not `NOT_FOUND`. `GetBlockNullifiers` applies the same rule where it is
 served.
 
+## Transaction lookup
+
+`GetTransaction` returns a pending transaction the way lightwalletd does.
+lightwalletd calls Zebra's `getrawtransaction`, which checks the mempool first
+and omits `height` for a mempool transaction (Zebra 7.0.0,
+`zebra-rpc/src/methods.rs:2114-2144` and
+`zebra-rpc/src/methods/types/transaction.rs:313-317`), so lightwalletd answers
+with the raw bytes at height 0 (lightwalletd `e7436d2`,
+`frontend/service.go:474-485` and `common/common.go:765-779`). The protocol
+defines height 0 as "in the mempool".
+
+Zinder reads the canonical chain at the request's epoch first. When that read
+misses, it asks the writer's live mempool through
+`IngestControl.MempoolTransaction`:
+
+- A pending transaction is returned with its raw bytes at height 0.
+- A transaction in neither is `NOT_FOUND`, as in lightwalletd. On a store
+  whose history starts at a checkpoint, the miss is
+  `CANONICAL_HISTORY_UNAVAILABLE` instead
+  ([ADR-0042](../adrs/0042-proven-transaction-absence.md)).
+- A failed mempool read returns its own status, such as `UNAVAILABLE`, rather
+  than `NOT_FOUND`, because the transaction may be pending.
+- The wallet-serving binary always connects the mempool surface to the
+  writer's `IngestControl` endpoint. A `LightwalletdGrpcAdapter` built in Rust
+  without `with_mempool_surface` cannot see pending transactions and answers
+  `NOT_FOUND` for them.
+
+Wallet SDKs depend on the distinction. The Swift SDK treats height 0 as
+unmined and `NOT_FOUND` as an unknown transaction id
+(zcash-swift-wallet-sdk `ebd0add`,
+`Sources/ZcashLightClientKit/Modules/Service/GRPC/LightWalletGRPCService.swift:282-297`),
+and the Android SDK marks a transaction it cannot fetch as `TxidNotRecognized`
+(zcash-android-wallet-sdk `a95780a`, `CompactBlockProcessor.kt:2404-2430`).
+A just-broadcast transaction therefore reads as pending, not unknown.
+
+The two reads are not one snapshot. A transaction mined between them can read
+as `NOT_FOUND` until this replica applies the block; the next lookup returns
+it mined.
+
 ## Transparent address UTXOs
 
 `GetAddressUtxos` and `GetAddressUtxosStream` follow lightwalletd's

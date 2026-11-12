@@ -133,10 +133,11 @@ Introducing this contract raised `zinder_proto::CONTRACT_REVISION` to 6.
 - Checkpoint-bootstrapped stores never answer a transaction absence. On such
   a store, every pinned miss, and every unpinned miss that the mempool also
   misses, is `CANONICAL_HISTORY_UNAVAILABLE`. The lightwalletd compatibility
-  `GetTransaction` call reads a pinned epoch, so it answers every miss on such
-  a store that way instead of `NOT_FOUND`. An unpinned lookup still reports a
-  pending transaction as `in_mempool`, so `is_in_mempool` returns `true` for
-  it; for a transaction that is neither pending nor mined above the floor,
+  `GetTransaction` call reads a pinned epoch and then the live mempool, so on
+  such a store it returns a pending transaction at height 0 and answers every
+  other miss with `CANONICAL_HISTORY_UNAVAILABLE` instead of `NOT_FOUND`. An
+  unpinned lookup still reports a pending transaction as `in_mempool`, so
+  `is_in_mempool` returns `true` for it; for a transaction that is neither pending nor mined above the floor,
   `is_in_mempool` fails with `CanonicalHistoryUnavailable` instead of
   returning `false`. The wallet-serving coverage profile builds complete
   history, so supported wallet-serving deployments are unaffected.

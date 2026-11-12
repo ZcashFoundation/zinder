@@ -15,7 +15,7 @@ use zinder_core::{
     BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastUnknown, ChainEpochId,
     CompactBlockArtifact, CompactTransaction, CompactTransactionData, Network,
     NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex,
-    SubtreeRootRange, TransactionBroadcastOutcome, TransactionLocation,
+    SubtreeRootRange, TransactionBroadcastOutcome, TransactionId, TransactionLocation,
     TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TxStatus,
     wire::{
         decode_internal_transaction_id, encode_bip70_chain_name, encode_branch_id_hex,
@@ -28,9 +28,10 @@ use zinder_proto::compat::lightwalletd::{
 };
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
-    DEFAULT_MAX_COMPACT_BLOCK_RANGE, SubtreeRoots, TransparentAddressTxIdsInRangeRequest,
-    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest, TreeState,
-    WalletQueryApi, WalletServingQuery, address_lookup_to_script_hash, status_from_query_error,
+    DEFAULT_MAX_COMPACT_BLOCK_RANGE, QueryError, SubtreeRoots,
+    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
+    TransparentAddressUnspentOutputsRequest, TreeState, WalletQueryApi, WalletServingQuery,
+    address_lookup_to_script_hash, status_from_query_error,
 };
 use zinder_source::transparent_address_matches_network;
 use zinder_store::{MempoolEvent, RawBlobRetention};
@@ -374,6 +375,29 @@ where
         Ok(replies)
     }
 
+    /// Answers a `GetTransaction` whose canonical read missed from the live
+    /// mempool, as lightwalletd does through Zebra's `getrawtransaction`.
+    ///
+    /// A pending transaction is returned at height 0, the protocol's
+    /// "in the mempool" sentinel. A mempool miss, or a deployment without a
+    /// mempool surface, keeps `canonical_miss`. A mempool failure is
+    /// returned instead, because the transaction may be pending.
+    async fn pending_transaction(
+        &self,
+        transaction_id: TransactionId,
+        canonical_miss: Status,
+    ) -> Result<lightwalletd::RawTransaction, Status> {
+        let Some(mempool_surface) = self.mempool_surface.as_ref() else {
+            return Err(canonical_miss);
+        };
+        mempool_surface
+            .mempool_transaction(transaction_id)
+            .await
+            .map_err(status_from_mempool_surface_error)?
+            .map(|entry| mempool_raw_transaction(&entry))
+            .ok_or(canonical_miss)
+    }
+
     async fn transparent_address_raw_transactions(
         &self,
         filter: &lightwalletd::TransparentAddressBlockFilter,
@@ -564,16 +588,41 @@ where
         }
         let transaction_id = decode_internal_transaction_id(&filter.hash)
             .map_err(|error| wire_decode_error_to_status(&error))?;
-        let response = self
+        let lookup = self
             .query_api
             .transaction(transaction_id, Some(at_epoch_id))
-            .await
-            .map_err(|error| status_from_query_error(&error))?;
-        let location = mined_location_from_status(response.status)?;
+            .await;
+        #[allow(
+            clippy::wildcard_enum_match_arm,
+            reason = "TxStatus is #[non_exhaustive]; a status added later is not mined, so it falls back to the mempool like NotFound."
+        )]
+        let canonical_miss = match lookup {
+            Ok(response) => match response.status {
+                TxStatus::Mined(mined) => {
+                    return Ok(Response::new(
+                        raw_transaction_from_location(&self.query_api, at_epoch_id, mined.location)
+                            .await?,
+                    ));
+                }
+                TxStatus::InMempool(entry) => {
+                    return Ok(Response::new(mempool_raw_transaction(&entry)));
+                }
+                TxStatus::NotFound => {
+                    Status::not_found("transaction is not mined in the canonical chain")
+                }
+                _ => Status::not_found(
+                    "transaction status is not representable on the lightwalletd wire",
+                ),
+            },
+            Err(error @ QueryError::CanonicalHistoryUnavailable { .. }) => {
+                status_from_query_error(&error)
+            }
+            Err(error) => return Err(status_from_query_error(&error)),
+        };
 
-        Ok(Response::new(
-            raw_transaction_from_location(&self.query_api, at_epoch_id, location).await?,
-        ))
+        self.pending_transaction(transaction_id, canonical_miss)
+            .await
+            .map(Response::new)
     }
 
     async fn send_transaction(

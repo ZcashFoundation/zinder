@@ -13,21 +13,26 @@ use tokio::sync::mpsc;
 use tokio_stream::{Stream, StreamExt as _, wrappers::UnboundedReceiverStream};
 use tonic::{Code, Request};
 use zinder_compat_lightwalletd::{
-    LightwalletdGrpcAdapter, MempoolEventEnvelopeStream, MempoolSnapshotPage, MempoolSurface,
-    MempoolSurfaceError, TipChangeWatcher, TipChangeWatcherError,
+    IngestControlMempoolSurface, LightwalletdGrpcAdapter, MempoolEventEnvelopeStream,
+    MempoolSnapshotPage, MempoolSurface, MempoolSurfaceError, TipChangeWatcher,
+    TipChangeWatcherError,
 };
 use zinder_core::{
     AuthDigest, BlockHash, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
     CompactSaplingOutput, CompactSaplingSpend, CompactShieldedAction, CompactTransactionData,
     CompactTransparentInput, CompactTransparentOutput, MempoolEntry, MempoolEvictionReason,
     MempoolObservation, Network, RawTransactionBytes, TransactionId, UnixTimestampMillis,
+    wire::encode_internal_transaction_id,
 };
 use zinder_proto::compat::lightwalletd::{self, compact_tx_streamer_server::CompactTxStreamer};
 use zinder_query::{WalletServingPairSlot, WalletServingQuery, WalletServingReadPair};
 use zinder_store::{
     CURRENT_ARTIFACT_SCHEMA_VERSION, MempoolEvent, MempoolEventEnvelope, StreamCursorTokenV1,
 };
-use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
+use zinder_testkit::{
+    ChainFixture, IngestControlFixture, WalletServingStoreFixture,
+    sample_regtest_upgrade_activations,
+};
 
 /// Builds the release serving query over one published block. The mempool
 /// surface under test is injected separately, so the chain content is fixed.
@@ -418,6 +423,122 @@ async fn lightwalletd_get_mempool_stream_streams_snapshot_contents_before_live_e
         "retained events behind the anchor must not replay; got {no_more:?}"
     );
     Ok(())
+}
+
+/// `GetTransaction` returns a pending transaction at height 0, like lightwalletd.
+///
+/// lightwalletd answers `GetTransaction` through Zebra's `getrawtransaction`,
+/// which checks the mempool first (Zebra 7.0.0,
+/// `zebra-rpc/src/methods.rs:2114-2144`) and omits `height` for a mempool
+/// transaction, so lightwalletd returns it at height 0 (lightwalletd
+/// `e7436d2`, `frontend/service.go:474-485` and `common/common.go:765-779`).
+/// The Swift SDK treats height 0 as unmined and `NOT_FOUND` as an unknown txid
+/// (zcash-swift-wallet-sdk `ebd0add`,
+/// `Sources/ZcashLightClientKit/Modules/Service/GRPC/LightWalletGRPCService.swift:282-297`).
+#[tokio::test(flavor = "multi_thread")]
+async fn lightwalletd_get_transaction_returns_a_mempool_transaction_at_height_zero()
+-> eyre::Result<()> {
+    let (wallet_query, _store_fixture) = single_block_serving_query()?;
+    let pending_entry = synthetic_entry(0x5a, synthetic_chain_epoch())?;
+    let adapter = LightwalletdGrpcAdapter::new(wallet_query).with_mempool_surface(Arc::new(
+        ScriptedMempoolSurface::with_entries(vec![pending_entry.clone()]),
+    ));
+
+    let pending = adapter
+        .get_transaction(Request::new(transaction_filter(
+            pending_entry.transaction_id(),
+        )))
+        .await?
+        .into_inner();
+    assert_eq!(pending.height, 0);
+    assert_eq!(
+        pending.data,
+        pending_entry.raw_transaction_bytes().as_slice()
+    );
+
+    let unknown = adapter
+        .get_transaction(Request::new(transaction_filter(TransactionId::from_bytes(
+            [0x5b; 32],
+        ))))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("a transaction outside the chain and the mempool must miss"))?;
+    assert_eq!(unknown.code(), Code::NotFound);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lightwalletd_get_transaction_reports_not_found_without_a_mempool_surface()
+-> eyre::Result<()> {
+    let (wallet_query, _store_fixture) = single_block_serving_query()?;
+    let adapter = LightwalletdGrpcAdapter::new(wallet_query);
+
+    let outcome = adapter
+        .get_transaction(Request::new(transaction_filter(TransactionId::from_bytes(
+            [0x5a; 32],
+        ))))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("without a mempool surface an unmined transaction must miss"))?;
+    assert_eq!(outcome.code(), Code::NotFound);
+    Ok(())
+}
+
+/// The production surface reads the writer's `IngestControl.MempoolTransaction`.
+/// A failed mempool read is not an absence, so it is not reported as
+/// `NOT_FOUND`.
+#[tokio::test(flavor = "multi_thread")]
+async fn lightwalletd_get_transaction_reads_pending_transactions_through_ingest_control()
+-> eyre::Result<()> {
+    let (wallet_query, _store_fixture) = single_block_serving_query()?;
+    let ingest_control = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+    let pending_entry = synthetic_entry(0x5c, synthetic_chain_epoch())?;
+    ingest_control.set_mempool_entries(std::slice::from_ref(&pending_entry));
+    let adapter = LightwalletdGrpcAdapter::new(wallet_query).with_mempool_surface(Arc::new(
+        IngestControlMempoolSurface::new(ingest_control.endpoint().to_owned()),
+    ));
+
+    let pending = adapter
+        .get_transaction(Request::new(transaction_filter(
+            pending_entry.transaction_id(),
+        )))
+        .await?
+        .into_inner();
+    assert_eq!(pending.height, 0);
+    assert_eq!(
+        pending.data,
+        pending_entry.raw_transaction_bytes().as_slice()
+    );
+
+    let unknown = adapter
+        .get_transaction(Request::new(transaction_filter(TransactionId::from_bytes(
+            [0x5d; 32],
+        ))))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("a transaction outside the chain and the mempool must miss"))?;
+    assert_eq!(unknown.code(), Code::NotFound);
+
+    ingest_control.set_mempool_transaction_error(Some(tonic::Status::unavailable(
+        "writer mempool is restarting",
+    )));
+    let failed = adapter
+        .get_transaction(Request::new(transaction_filter(TransactionId::from_bytes(
+            [0x5d; 32],
+        ))))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("a failed mempool read must fail the lookup"))?;
+    assert_eq!(failed.code(), Code::Unavailable);
+    ingest_control.shutdown().await
+}
+
+fn transaction_filter(transaction_id: TransactionId) -> lightwalletd::TxFilter {
+    lightwalletd::TxFilter {
+        block: None,
+        index: 0,
+        hash: encode_internal_transaction_id(transaction_id).to_vec(),
+    }
 }
 
 fn synthetic_chain_epoch() -> ChainEpoch {
@@ -929,6 +1050,18 @@ impl MempoolSurface for ScriptedMempoolSurface {
             >,
         > = Box::pin(UnboundedReceiverStream::new(event_receiver));
         Ok(stream)
+    }
+
+    async fn mempool_transaction(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<MempoolEntry>, MempoolSurfaceError> {
+        Ok(self
+            .entries
+            .lock()
+            .iter()
+            .find(|entry| entry.transaction_id() == transaction_id)
+            .cloned())
     }
 }
 
