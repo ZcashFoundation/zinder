@@ -113,6 +113,45 @@ async fn absence_that_does_not_answer_the_request_is_rejected() -> eyre::Result<
         ),
         "{partial_outcome:?}"
     );
+
+    // A range starting at genesis claims a block Zinder never indexes.
+    let from_genesis = TransactionAbsence {
+        first_covered_height: BlockHeight::new(0),
+        ..absence
+    };
+    let from_genesis_outcome = lookup(
+        from_genesis.into_status("absent"),
+        Some(ChainEpochId::new(7)),
+    )
+    .await?;
+    assert!(
+        matches!(
+            from_genesis_outcome,
+            Err(IndexerError::MalformedResponse {
+                field: "error_info.metadata.first_covered_height",
+                ..
+            })
+        ),
+        "{from_genesis_outcome:?}"
+    );
+
+    // A reversed range covers no indexed height, so it proves nothing.
+    let reversed = TransactionAbsence {
+        visible_tip_height: BlockHeight::new(0),
+        ..absence
+    };
+    let reversed_outcome =
+        lookup(reversed.into_status("absent"), Some(ChainEpochId::new(7))).await?;
+    assert!(
+        matches!(
+            reversed_outcome,
+            Err(IndexerError::MalformedResponse {
+                field: "error_info.metadata.visible_tip_height",
+                ..
+            })
+        ),
+        "{reversed_outcome:?}"
+    );
     Ok(())
 }
 

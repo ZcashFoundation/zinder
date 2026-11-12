@@ -103,11 +103,15 @@ way.
 
 `zinder-client` returns `TxStatus::NotFound` only for this signal, and only
 after checking that the absence answers the request: the epoch matches a pin,
-an unpinned absence covers the mempool, and the covered range starts at height
-1. Other outcomes are typed errors:
+an unpinned absence covers the mempool, and the covered range is exactly
+`1..=visible_tip_height` with a visible tip of at least 1. Other outcomes are
+typed errors:
 
 - `IndexerError::CanonicalHistoryUnavailable` carries the first retained
-  height.
+  height, for a covered range that starts above height 1.
+- `IndexerError::MalformedResponse` rejects a covered range that starts at
+  height 0 or ends below its start, because it covers no indexed height and
+  cannot prove an absence. A server never issues either.
 - `IndexerError::TransactionAbsenceUnverified` covers a `NOT_FOUND` without the
   typed signal: no Zinder `ErrorInfo`, or `ARTIFACT_UNAVAILABLE` without
   `ResourceInfo`. Servers below contract revision 6 answer every miss this way.

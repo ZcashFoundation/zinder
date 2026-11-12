@@ -2363,16 +2363,31 @@ fn block_selector_to_message(
 /// Checks that a typed absence answers the lookup the caller made.
 ///
 /// A pinned lookup must be answered at the pinned epoch; an unpinned lookup
-/// must also have searched the live mempool; and the covered range must start
-/// at height 1, so a store with a later history floor never yields an absence.
+/// must also have searched the live mempool; and the covered range must be
+/// exactly `1..=visible_tip_height` with a tip of at least 1. A store with a
+/// later history floor never yields an absence, and a range that covers no
+/// indexed height cannot prove one.
 fn verify_transaction_absence(
     absence: TransactionAbsence,
     at_epoch_id: Option<ChainEpochId>,
 ) -> Result<(), IndexerError> {
-    if absence.first_covered_height > BlockHeight::new(1) {
+    let first_indexed_height = BlockHeight::new(1);
+    if absence.first_covered_height > first_indexed_height {
         return Err(IndexerError::CanonicalHistoryUnavailable {
             first_available_height: absence.first_covered_height,
         });
+    }
+    if absence.first_covered_height < first_indexed_height {
+        return Err(IndexerError::malformed(
+            "error_info.metadata.first_covered_height",
+            "an absence must start at height 1 because the genesis block is never indexed",
+        ));
+    }
+    if absence.visible_tip_height < absence.first_covered_height {
+        return Err(IndexerError::malformed(
+            "error_info.metadata.visible_tip_height",
+            "an absence must cover at least one indexed height",
+        ));
     }
     match at_epoch_id {
         Some(pinned_epoch_id) if absence.chain_epoch_id != pinned_epoch_id => {
