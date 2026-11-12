@@ -1910,8 +1910,13 @@ mod tests {
         assert_eq!(before_nu6_3.upgrade_name, "NU6.3");
         assert_eq!(before_nu6_3.upgrade_height, 603);
 
-        let none_pending = lightd_info(&activations, BlockHeight::new(603), true);
-        assert_eq!(Some(none_pending.consensus_branch_id), branch_hex("NU6.3"));
+        let before_nu7 = lightd_info(&activations, BlockHeight::new(603), true);
+        assert_eq!(Some(before_nu7.consensus_branch_id), branch_hex("NU6.3"));
+        assert_eq!(before_nu7.upgrade_name, "NU7");
+        assert_eq!(before_nu7.upgrade_height, 703);
+
+        let none_pending = lightd_info(&activations, BlockHeight::new(703), true);
+        assert_eq!(Some(none_pending.consensus_branch_id), branch_hex("NU7"));
         assert_eq!(none_pending.upgrade_name, "");
         assert_eq!(none_pending.upgrade_height, 0);
     }

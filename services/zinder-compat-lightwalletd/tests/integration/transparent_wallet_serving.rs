@@ -700,6 +700,7 @@ fn pre_nu7_activations() -> eyre::Result<NetworkUpgradeActivations> {
     let activations = sample_regtest_upgrade_activations()
         .activations()
         .iter()
+        .filter(|activation| activation.name != "NU7")
         .cloned()
         .map(|activation| {
             let activation_height = if activation.name == "NU6.3" {

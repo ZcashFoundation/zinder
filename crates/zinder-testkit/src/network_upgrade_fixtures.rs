@@ -12,7 +12,7 @@
 //! - [`sample_regtest_upgrade_activations`] returns a hand-built table that
 //!   matches ZFND's `z3` regtest sidecar defaults
 //!   (Overwinter..Canopy at 1, NU5 at 2, NU6 at 2, NU6.1 and NU6.2 at 3,
-//!   and NU6.3 at 603). Intended for in-process integration tests that
+//!   NU6.3 at 603, and NU7 at 703). Intended for in-process integration tests that
 //!   exercise `GetLightdInfo` or `MinedTransactionChainContext.consensus_branch_id` without a
 //!   live node. Live tests must discover the activations from the running node,
 //!   not hard-code them here.
@@ -37,7 +37,9 @@ use zinder_core::{
 ///
 /// Matches the activation heights of the captured ZFND `z3` regtest fixtures:
 /// Overwinter..Canopy at 1, NU5 and NU6 at 2, NU6.1 and NU6.2 at 3, and
-/// NU6.3 at 603. Intended for integration tests that exercise
+/// NU6.3 at 603. NU7 activates at 703, above every captured fixture height, so
+/// the table carries the complete Zebra 7 upgrade sequence without changing
+/// the branch of any captured block. Intended for integration tests that exercise
 /// `GetLightdInfo` or `MinedTransactionChainContext.consensus_branch_id` without a live node.
 /// Live tests must discover the activations from the running node, not
 /// hard-code them here.
@@ -99,6 +101,11 @@ pub fn sample_regtest_upgrade_activations() -> NetworkUpgradeActivations {
                 branch_id: ConsensusBranchId::new(0x37a5_165b),
                 activation_height: CoreBlockHeight::new(603),
                 name: "NU6.3".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x7719_0ad9),
+                activation_height: CoreBlockHeight::new(703),
+                name: "NU7".to_owned(),
             },
         ],
     )
