@@ -233,9 +233,15 @@ async fn pin_to_an_epoch_the_pair_does_not_serve_is_refused() -> eyre::Result<()
     Ok(())
 }
 
+/// A pair rebuilt after a reorg reports the dropped spend's outputs as unspent.
+///
+/// The fixture projects the wallet afresh over the replaced canonical store,
+/// and the pre-reorg pin is refused. The projector's live reversal of the same
+/// output families is covered by
+/// `incremental_cancellation_and_collapsed_reconciliation_match_a_cold_wallet_projection`
+/// in `zinder-wallet-rocksdb`.
 #[tokio::test]
-async fn reorg_that_drops_the_spending_block_reports_the_outputs_again_unspent() -> eyre::Result<()>
-{
+async fn pair_rebuilt_after_a_reorg_reports_the_dropped_spend_as_unspent() -> eyre::Result<()> {
     let spend_chain = spend_chain()?;
     let fork_height = BlockHeight::new(2);
     let replacement_chain = spend_chain.chain.fork_at(fork_height)?.extend_blocks(1);
