@@ -120,6 +120,10 @@ async fn capability_probe_discovers_zebra_methods() -> Result<()> {
     assert!(probed.supports(NodeCapability::TreeState));
     assert!(probed.supports(NodeCapability::SubtreeRoots));
     assert!(probed.supports(NodeCapability::TransactionBroadcast));
+    assert!(
+        probed.supports(NodeCapability::HistoricalBlockBodies),
+        "the live node must report archive storage (`pruned: false`)"
+    );
 
     Ok(())
 }

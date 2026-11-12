@@ -1259,4 +1259,32 @@ mod error_reason_tests {
             );
         }
     }
+
+    #[test]
+    fn permanent_historical_node_refusals_map_to_node_capability_missing() {
+        for source_error in [
+            SourceError::HistoricalTreeStateUnavailable {
+                height: BlockHeight::new(1_000_000),
+                reason: "probe".to_owned(),
+            },
+            SourceError::HistoricalSubtreeRootsUnavailable {
+                protocol: ShieldedProtocol::Sapling,
+                start_index: zinder_core::SubtreeRootIndex::new(0),
+                reason: "probe".to_owned(),
+            },
+        ] {
+            let error = QueryError::Node(source_error);
+            assert_eq!(error.error_reason(), ErrorReason::NodeCapabilityMissing);
+            assert_eq!(
+                crate::status_from_query_error(&error).code(),
+                tonic::Code::FailedPrecondition
+            );
+        }
+
+        let transient = QueryError::Node(SourceError::BlockUnavailable {
+            height: BlockHeight::new(1),
+            reason: "probe".to_owned(),
+        });
+        assert_eq!(transient.error_reason(), ErrorReason::NodeUnavailable);
+    }
 }

@@ -11,7 +11,8 @@ Use empty target paths or a certified coherent restore bundle.
 
 ## Prerequisites
 
-- A Zebra node on the selected network with required JSON-RPC capabilities.
+- A Zebra or Zakura archive node on the selected network with required
+  JSON-RPC capabilities. See [Archive node required for ingest](#archive-node-required-for-ingest).
 - Enough local storage for canonical data, wallet state, staging, compaction,
   checkpoints, and growth reserve.
 - Stable canonical and wallet primary paths on one host filesystem.
@@ -76,6 +77,30 @@ If the process stops during construction, restart it with the same
 configuration. A published staging store is installed and reopened. An
 unpublished staging store is removed and reconstructed. Do not manually move
 or edit the staging directory while the owner is running.
+
+### Archive node required for ingest
+
+Ingest reads every historical block body, so it requires a node that stores
+all of them. At startup it reads `pruned` from `getblockchaininfo` and refuses
+a node that reports `pruned: true` or omits the field. Readiness reports
+`node_capability_missing` for capability `historical_block_bodies`, ingest
+logs that the node reports pruned storage, and the process exits before it
+touches the store.
+
+The check applies on every start, including a restart of an already-built
+store, even though following only needs recent blocks. Point ingest at an
+archive node; native query and lightwalletd compatibility may keep using a
+pruned node.
+
+A Zakura node built by verified-commitment-trees fast sync is an archive node
+for block bodies but never wrote per-height commitment trees or subtree roots
+below its last checkpoint. That band exists only on Mainnet. A checkpoint,
+construction subtree range, or query tree-state read inside the band fails
+with failure class `capability_missing`. Ingest reports `node_unavailable` with
+that class and retries on its 10-second operator-action backoff; the read will
+not succeed against the same node. Native query returns the non-retryable
+`NODE_CAPABILITY_MISSING`. Use a node synchronized without fast sync, or one
+that serves the band from its historical frontier artifact.
 
 ## Wallet construction
 

@@ -81,6 +81,7 @@ fn default_zebra_capabilities() -> NodeCapabilities {
         NodeCapability::TransactionBroadcast,
         NodeCapability::ChainValuePools,
         NodeCapability::BlockValuePoolBalances,
+        NodeCapability::HistoricalBlockBodies,
     ])
 }
 
@@ -242,7 +243,9 @@ impl ZebraJsonRpcSource {
     /// # Errors
     ///
     /// Returns [`SourceError::BlockUnavailable`] when the node does not
-    /// have the requested height (e.g. because it is still syncing) and
+    /// have the requested height (e.g. because it is still syncing),
+    /// [`SourceError::HistoricalTreeStateUnavailable`] when the node
+    /// permanently lacks the tree state at that height, and
     /// [`SourceError::SourceProtocolMismatch`] when the response identity is
     /// malformed or does not match `height`. Capability discovery
     /// ([`ZebraJsonRpcSource::probe_capabilities`]) does not gate this call.
@@ -264,16 +267,11 @@ impl ZebraJsonRpcSource {
                 reason: "checkpoint activation table is missing Sapling",
             });
         }
-        let block_unavailable = |error: JsonRpcCallError| SourceError::BlockUnavailable {
-            height,
-            reason: error.message,
-        };
-
         let tree_state: ZebraGetTreestate = self
             .call_typed(
                 "z_gettreestate",
                 positional_params([Value::from(height.value().to_string())])?,
-                block_unavailable,
+                |error| tree_state_call_error(height, error),
             )
             .await?;
         if tree_state.height != height.value() {
@@ -389,6 +387,11 @@ impl ZebraJsonRpcSource {
     /// advertises plus [`NodeCapability::JsonRpc`] and
     /// [`NodeCapability::OpenRpcDiscovery`].
     ///
+    /// When the node advertises `getblockchaininfo`, the probe also reads its
+    /// `pruned` field and grants [`NodeCapability::HistoricalBlockBodies`]
+    /// only when the node reports `pruned: false`. A failed call or a missing
+    /// field withholds the capability.
+    ///
     /// Missing discovery fails closed because assuming a method set would let
     /// startup accept a node that cannot satisfy the source contract.
     pub async fn probe_capabilities(&self) -> Result<NodeCapabilities, SourceError> {
@@ -399,7 +402,11 @@ impl ZebraJsonRpcSource {
                 }
             })
             .await?;
-        let json_rpc_capabilities = parse_openrpc_capabilities(&openrpc_response);
+        let method_names = openrpc_method_names(&openrpc_response);
+        let stores_historical_block_bodies = method_names.contains(&"getblockchaininfo")
+            && self.reports_archive_block_storage().await;
+        let json_rpc_capabilities =
+            parse_openrpc_capabilities(&method_names, stores_historical_block_bodies);
 
         let probed_capabilities =
             with_readiness_probe_capability(json_rpc_capabilities, self.health_config.is_some());
@@ -851,11 +858,7 @@ impl ZebraJsonRpcSource {
                     Value::from(start_index.value()),
                     Value::from(max_entries.get()),
                 ])?,
-                |error| SourceError::SubtreeRootsUnavailable {
-                    protocol,
-                    start_index,
-                    reason: error.message,
-                },
+                |error| subtree_roots_call_error(protocol, start_index, error),
             )
             .await?;
 
@@ -1004,10 +1007,7 @@ impl NodeSource for ZebraJsonRpcSource {
             .call_typed::<Value>(
                 "z_gettreestate",
                 positional_params([Value::from(block_id.height.value().to_string())])?,
-                |error| SourceError::BlockUnavailable {
-                    height: block_id.height,
-                    reason: error.message,
-                },
+                |error| tree_state_call_error(block_id.height, error),
             )
             .await?;
         let final_note_commitment_roots =
@@ -1116,10 +1116,7 @@ impl NodeSource for ZebraJsonRpcSource {
                     Value::from(encode_rpc_block_hash(block_id.hash)),
                     Value::from(1),
                 ])?,
-                |error| SourceError::BlockUnavailable {
-                    height: block_id.height,
-                    reason: error.message,
-                },
+                |error| tree_state_call_error(block_id.height, error),
             )
             .await?;
         let response_hash = block_response
@@ -1208,6 +1205,33 @@ impl NodeSource for ZebraJsonRpcSource {
 }
 
 impl ZebraJsonRpcSource {
+    /// Returns whether `getblockchaininfo` reports `pruned: false`.
+    ///
+    /// Fails closed: a failed call or a response without `pruned` counts as
+    /// pruned. Query and compatibility runtimes share this probe and accept
+    /// pruned nodes, so the outcome is logged at debug level only.
+    async fn reports_archive_block_storage(&self) -> bool {
+        let storage_mode = self
+            .call_typed::<ZebraGetBlockchainInfoStorage>(
+                "getblockchaininfo",
+                ArrayParams::new(),
+                map_node_unavailable,
+            )
+            .await;
+        match storage_mode {
+            Ok(storage_mode) => !storage_mode.pruned,
+            Err(error) => {
+                tracing::debug!(
+                    target: "zinder::source",
+                    event = "node_storage_mode_unreported",
+                    %error,
+                    "getblockchaininfo did not report the node storage mode"
+                );
+                false
+            }
+        }
+    }
+
     async fn poll_upstream_health_from_blockchain_info(
         &self,
     ) -> Result<UpstreamHealthSnapshot, SourceError> {
@@ -1341,6 +1365,53 @@ impl TreeStateUpstream for ZebraJsonRpcSource {
 fn map_node_unavailable(error: JsonRpcCallError) -> SourceError {
     SourceError::NodeUnavailable {
         reason: error.message,
+    }
+}
+
+/// Zakura's permanent refusal of a per-height tree its fast sync skipped
+/// (`zakura_state::HistoricalTreeUnavailable`).
+const FAST_SYNCED_TREE_STATE_REFUSAL: &str = "is unavailable: this node was fast-synced";
+
+/// Zakura's permanent refusal of a subtree its fast sync skipped.
+///
+/// This is `HistoricalSubtreeUnavailableReason::NotStored`. The
+/// `Indeterminate` reason is deliberately not matched: it can resolve once
+/// sync passes the last checkpoint.
+const FAST_SYNCED_SUBTREE_REFUSAL: &str = "continuing synchronization will not restore it";
+
+/// Maps a call error from a height-keyed read that needs per-height
+/// commitment trees.
+fn tree_state_call_error(height: BlockHeight, error: JsonRpcCallError) -> SourceError {
+    if error.message.contains(FAST_SYNCED_TREE_STATE_REFUSAL) {
+        SourceError::HistoricalTreeStateUnavailable {
+            height,
+            reason: error.message,
+        }
+    } else {
+        SourceError::BlockUnavailable {
+            height,
+            reason: error.message,
+        }
+    }
+}
+
+fn subtree_roots_call_error(
+    protocol: ShieldedProtocol,
+    start_index: SubtreeRootIndex,
+    error: JsonRpcCallError,
+) -> SourceError {
+    if error.message.contains(FAST_SYNCED_SUBTREE_REFUSAL) {
+        SourceError::HistoricalSubtreeRootsUnavailable {
+            protocol,
+            start_index,
+            reason: error.message,
+        }
+    } else {
+        SourceError::SubtreeRootsUnavailable {
+            protocol,
+            start_index,
+            reason: error.message,
+        }
     }
 }
 
@@ -1548,6 +1619,12 @@ fn source_error_class(error: Option<&SourceError>) -> &'static str {
         Some(SourceError::BlockUnavailable { .. }) => "block_unavailable",
         Some(SourceError::BlockReorgDuringFetch { .. }) => "block_reorg_during_fetch",
         Some(SourceError::SubtreeRootsUnavailable { .. }) => "subtree_roots_unavailable",
+        Some(SourceError::HistoricalTreeStateUnavailable { .. }) => {
+            "historical_tree_state_unavailable"
+        }
+        Some(SourceError::HistoricalSubtreeRootsUnavailable { .. }) => {
+            "historical_subtree_roots_unavailable"
+        }
         Some(SourceError::SourceProtocolMismatch { .. }) => "source_protocol_mismatch",
         Some(SourceError::SourcePayloadEncodingFailed { .. }) => "source_payload_encoding_failed",
         Some(SourceError::NodeCapabilityMissing { .. }) => "node_capability_missing",
@@ -1598,16 +1675,20 @@ fn client_error_class(error: Option<&ClientError>) -> &'static str {
     }
 }
 
-/// Parses an `OpenRPC` `rpc.discover` response into a
-/// [`NodeCapabilities`] set.
+/// Builds the probed [`NodeCapabilities`] set from the method names an
+/// `OpenRPC` `rpc.discover` response advertises.
 ///
 /// The probe always grants [`NodeCapability::JsonRpc`] and
 /// [`NodeCapability::OpenRpcDiscovery`] on success; remaining variants
 /// are granted when the corresponding RPC methods appear in the response.
-fn parse_openrpc_capabilities(openrpc_response: &Value) -> NodeCapabilities {
+/// [`NodeCapability::HistoricalBlockBodies`] is granted only when the node
+/// reported archive storage.
+fn parse_openrpc_capabilities(
+    method_names: &[&str],
+    stores_historical_block_bodies: bool,
+) -> NodeCapabilities {
     let mut probed_capabilities = vec![NodeCapability::JsonRpc, NodeCapability::OpenRpcDiscovery];
 
-    let method_names = openrpc_method_names(openrpc_response);
     if method_names.contains(&"getblock") {
         probed_capabilities.push(NodeCapability::BestChainBlocks);
         probed_capabilities.push(NodeCapability::BlockValuePoolBalances);
@@ -1629,6 +1710,9 @@ fn parse_openrpc_capabilities(openrpc_response: &Value) -> NodeCapabilities {
     }
     if method_names.contains(&"getblockchaininfo") {
         probed_capabilities.push(NodeCapability::ChainValuePools);
+    }
+    if stores_historical_block_bodies {
+        probed_capabilities.push(NodeCapability::HistoricalBlockBodies);
     }
 
     NodeCapabilities::from_trusted(probed_capabilities)
@@ -2274,6 +2358,14 @@ struct ZebraGetBlockchainInfoValuePools {
     best_block_hash: String,
     #[serde(rename = "valuePools", default)]
     value_pools: Vec<ZebraValuePoolEntry>,
+}
+
+/// Storage mode reported by `getblockchaininfo`. Both Zebra and Zakura always
+/// serialize `pruned`, so it is required: a response without it is treated as
+/// an unreported storage mode.
+#[derive(Deserialize)]
+struct ZebraGetBlockchainInfoStorage {
+    pruned: bool,
 }
 
 #[derive(Deserialize)]

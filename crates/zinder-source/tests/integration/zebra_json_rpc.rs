@@ -1178,6 +1178,226 @@ async fn probe_capabilities_keeps_only_advertised_capabilities_on_success() -> e
     Ok(())
 }
 
+fn discover_reply_with_getblockchaininfo() -> RpcReply {
+    RpcReply::result(json!({
+        "openrpc": "1.3.2",
+        "methods": [
+            {"name": "getblock"},
+            {"name": "getbestblockheightandhash"},
+            {"name": "z_gettreestate"},
+            {"name": "z_getsubtreesbyindex"},
+            {"name": "getblockchaininfo"},
+            {"name": "rpc.discover"},
+        ],
+    }))
+}
+
+async fn probe_with_blockchain_info_reply(
+    blockchain_info: RpcReply,
+) -> eyre::Result<zinder_source::NodeCapabilities> {
+    let server = JsonRpcTestServer::start([
+        method("rpc.discover").reply(discover_reply_with_getblockchaininfo()),
+        method("getblockchaininfo").reply(blockchain_info),
+    ])?;
+    let source = regtest_source(&server)?;
+    Ok(source.probe_capabilities().await?)
+}
+
+#[tokio::test]
+async fn probe_capabilities_grants_historical_block_bodies_for_archive_node() -> eyre::Result<()> {
+    let probed =
+        probe_with_blockchain_info_reply(RpcReply::result(json!({"blocks": 10, "pruned": false})))
+            .await?;
+
+    assert!(probed.supports(NodeCapability::HistoricalBlockBodies));
+    assert!(probed.supports(NodeCapability::ChainValuePools));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn probe_capabilities_withholds_historical_block_bodies_for_pruned_node() -> eyre::Result<()>
+{
+    let probed = probe_with_blockchain_info_reply(RpcReply::result(json!({
+        "blocks": 20_000,
+        "pruned": true,
+        "pruneheight": 10_000,
+    })))
+    .await?;
+
+    assert!(!probed.supports(NodeCapability::HistoricalBlockBodies));
+    assert!(probed.supports(NodeCapability::TreeState));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn probe_capabilities_withholds_historical_block_bodies_without_pruned_field()
+-> eyre::Result<()> {
+    let probed = probe_with_blockchain_info_reply(RpcReply::result(json!({"blocks": 10}))).await?;
+
+    assert!(!probed.supports(NodeCapability::HistoricalBlockBodies));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn probe_capabilities_withholds_historical_block_bodies_when_storage_call_fails()
+-> eyre::Result<()> {
+    let probed =
+        probe_with_blockchain_info_reply(RpcReply::error_with_code(-28, "node warming up")).await?;
+
+    assert!(!probed.supports(NodeCapability::HistoricalBlockBodies));
+    assert!(probed.supports(NodeCapability::TipId));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn probe_capabilities_skips_storage_call_when_getblockchaininfo_is_not_advertised()
+-> eyre::Result<()> {
+    let server = JsonRpcTestServer::start([
+        method("rpc.discover").reply(RpcReply::result(json!({
+            "openrpc": "1.3.2",
+            "methods": [
+                {"name": "getblock"},
+                {"name": "getbestblockheightandhash"},
+                {"name": "rpc.discover"},
+            ],
+        }))),
+        method("getblockchaininfo").reply(RpcReply::result(json!({"pruned": false}))),
+    ])?;
+    let source = regtest_source(&server)?;
+
+    let probed = source.probe_capabilities().await?;
+
+    assert!(!probed.supports(NodeCapability::HistoricalBlockBodies));
+    assert!(server.requests_for("getblockchaininfo")?.is_empty());
+
+    Ok(())
+}
+
+/// `zakura_state::HistoricalTreeUnavailable` as Zakura v1.8.6 renders it.
+const ZAKURA_FAST_SYNCED_TREE_STATE_MESSAGE: &str = "historical note commitment tree at Height(1000000) is unavailable: this node was fast-synced with verified commitment trees, so per-height trees below the last checkpoint Height(3418406) were never written";
+
+/// `zakura_state::HistoricalSubtreeUnavailable` with the `NotStored` reason.
+const ZAKURA_SUBTREE_NOT_STORED_MESSAGE: &str = "historical sapling note commitment subtree NoteCommitmentSubtreeIndex(0) is unavailable at last checkpoint Height(3418406): this node did not record the subtree and continuing synchronization will not restore it; use another node";
+
+/// `zakura_state::HistoricalSubtreeUnavailable` with the `Indeterminate` reason.
+const ZAKURA_SUBTREE_INDETERMINATE_MESSAGE: &str = "historical sapling note commitment subtree NoteCommitmentSubtreeIndex(0) is unavailable at last checkpoint Height(3418406): this node has not reached the last checkpoint, so it cannot yet tell whether the subtree was skipped; subtrees completed below the last checkpoint are never recorded";
+
+#[tokio::test]
+async fn fast_synced_tree_state_refusal_is_a_missing_capability() -> eyre::Result<()> {
+    let server = JsonRpcTestServer::start([method("z_gettreestate").reply(
+        RpcReply::error_with_code(-1, ZAKURA_FAST_SYNCED_TREE_STATE_MESSAGE),
+    )])?;
+    let source = regtest_source(&server)?;
+    let block_id = BlockId::new(BlockHeight::new(1_000_000), BlockHash::from_bytes([1; 32]));
+
+    let error = match source.fetch_tree_state_for_block(block_id).await {
+        Ok(tree_state) => return Err(eyre!("expected tree-state error, got {tree_state:?}")),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        SourceError::HistoricalTreeStateUnavailable { height, .. }
+            if height == BlockHeight::new(1_000_000)
+    ));
+    assert_eq!(
+        error.upstream_classification(),
+        zinder_source::SourceFailureClass::CapabilityMissing,
+    );
+    assert!(error.is_node_capability_missing());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fast_synced_checkpoint_refusal_is_a_missing_capability() -> eyre::Result<()> {
+    let server = JsonRpcTestServer::start([method("z_gettreestate").reply(
+        RpcReply::error_with_code(-1, ZAKURA_FAST_SYNCED_TREE_STATE_MESSAGE),
+    )])?;
+    let source = regtest_source(&server)?;
+
+    let error = match source
+        .fetch_chain_checkpoint(BlockHeight::new(100), &checkpoint_activations(1, 1)?)
+        .await
+    {
+        Ok(checkpoint) => return Err(eyre!("expected checkpoint error, got {checkpoint:?}")),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        SourceError::HistoricalTreeStateUnavailable { height, .. }
+            if height == BlockHeight::new(100)
+    ));
+    assert!(error.is_node_capability_missing());
+
+    Ok(())
+}
+
+async fn subtree_roots_error(message: &str) -> eyre::Result<SourceError> {
+    let server = JsonRpcTestServer::start([
+        method("z_getsubtreesbyindex").reply(RpcReply::error_with_code(-1, message))
+    ])?;
+    let source = regtest_source(&server)?;
+
+    match source
+        .fetch_subtree_roots(
+            ShieldedProtocol::Sapling,
+            SubtreeRootIndex::new(0),
+            std::num::NonZeroU32::new(1).ok_or_else(|| eyre!("invalid max entries"))?,
+        )
+        .await
+    {
+        Ok(subtree_roots) => Err(eyre!("expected subtree roots error, got {subtree_roots:?}")),
+        Err(error) => Ok(error),
+    }
+}
+
+#[tokio::test]
+async fn not_stored_subtree_refusal_is_a_missing_capability() -> eyre::Result<()> {
+    let error = subtree_roots_error(ZAKURA_SUBTREE_NOT_STORED_MESSAGE).await?;
+
+    assert!(matches!(
+        error,
+        SourceError::HistoricalSubtreeRootsUnavailable {
+            protocol: ShieldedProtocol::Sapling,
+            start_index,
+            ..
+        } if start_index == SubtreeRootIndex::new(0)
+    ));
+    assert_eq!(
+        error.upstream_classification(),
+        zinder_source::SourceFailureClass::CapabilityMissing,
+    );
+    assert!(error.is_node_capability_missing());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn indeterminate_subtree_refusal_stays_a_changed_upstream_view() -> eyre::Result<()> {
+    let error = subtree_roots_error(ZAKURA_SUBTREE_INDETERMINATE_MESSAGE).await?;
+
+    assert!(matches!(
+        error,
+        SourceError::SubtreeRootsUnavailable {
+            protocol: ShieldedProtocol::Sapling,
+            ..
+        }
+    ));
+    assert_eq!(
+        error.upstream_classification(),
+        zinder_source::SourceFailureClass::UpstreamViewChanged,
+    );
+    assert!(!error.is_node_capability_missing());
+
+    Ok(())
+}
+
 const CHECKPOINT_BLOCK_HASH_HEX: &str =
     "010101010101010101010101010101010101010101010101010101010101010f";
 const ONE_LEAF_SAPLING_FINAL_STATE_HEX: &str = "010100000000000000000000000000000000000000000000000000000000000000001f00000000000000000000000000000000000000000000000000000000000000";

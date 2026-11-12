@@ -94,11 +94,39 @@ names are:
 - `openrpc_discovery`
 - `chain_value_pools`
 - `block_value_pool_balances`
+- `historical_block_bodies`
 
-The Zebra JSON-RPC source probes `rpc.discover` and validates the methods needed
-by canonical ingest before mutation begins. Optional methods add capabilities
-without changing the required canonical contract. Missing or contradictory
-capabilities produce typed failures rather than version-based guesses.
+The Zebra JSON-RPC source derives capabilities from two observations. Methods
+advertised by `rpc.discover` grant the method-backed capabilities. When the
+node advertises `getblockchaininfo`, the probe also reads its `pruned` field
+and grants `historical_block_bodies` only for `pruned: false`. A failed call or
+a response without `pruned` withholds the capability, so an unreported storage
+mode fails closed. Zebra always reports `pruned: false`; Zakura reports `true`
+in pruned storage mode.
+
+Ingest validates the capabilities it needs before mutation begins and requires
+`historical_block_bodies`, so it refuses a pruned node at startup with readiness
+cause `node_capability_missing`. Query and lightwalletd compatibility do not
+fetch historical block bodies and accept a pruned node. Optional methods add
+capabilities without changing the required canonical contract. Missing or
+contradictory capabilities produce typed failures rather than version-based
+guesses.
+
+Some nodes refuse historical commitment-tree reads permanently. A Zakura node
+built by verified-commitment-trees fast sync never writes per-height trees or
+subtree roots below its last checkpoint. The source maps those refusals to
+dedicated errors classed `capability_missing`:
+
+| Error | Raised for |
+| --- | --- |
+| `HistoricalTreeStateUnavailable` | `z_gettreestate` or verbose `getblock` at a height whose tree the node never wrote |
+| `HistoricalSubtreeRootsUnavailable` | `z_getsubtreesbyindex` for subtrees the node never recorded and will not restore |
+
+A subtree refusal that may resolve once the node passes its last checkpoint
+stays `SubtreeRootsUnavailable`, classed `upstream_view_changed`. The match is
+on the node's error text, so a reworded refusal falls back to the transient
+classes rather than to a wrong answer. Query reports both permanent errors as
+the non-retryable `NODE_CAPABILITY_MISSING`.
 
 Source errors describe the upstream observation. `SourceFailureClass` groups
 them for writer recovery and readiness:
