@@ -25,6 +25,7 @@ jsonrpsee.workspace = true
 metrics.workspace = true
 parking_lot.workspace = true
 prost.workspace = true
+rustls-pki-types.workspace = true
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -43,6 +44,8 @@ zinder-proto.workspace = true
 eyre.workspace = true
 incrementalmerkletree = { workspace = true, features = ["legacy-api"] }
 orchard = { workspace = true, default-features = false }
+rcgen.workspace = true
+rustls.workspace = true
 sapling.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "time"] }
