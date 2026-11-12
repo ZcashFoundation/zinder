@@ -82,6 +82,23 @@ methods, transparent-address methods, transaction submission, and ping.
 `taddrSupport = false`; node discovery and liveness are still required for
 that identity response.
 
+## Block range transaction contents
+
+`GetBlockRange` applies the requested pool types to every compact transaction
+and then omits any transaction left with no spends, outputs, actions, inputs,
+or outputs, as lightwalletd does. A transparent-only coinbase is therefore
+absent under the default shielded selection and present when the request names
+the transparent pool. Transactions that remain keep their block position in
+`CompactTx.index`, so a gap in the indexes marks an omitted transaction. Wallet
+and compact-blocks serving apply the same payload rule. In compact-blocks
+serving, `GetBlock` returns the stored compact block without pool pruning and
+is unchanged by this rule.
+
+The fixture-backed range tests pin a SHA-256 digest of the length-delimited
+stream for ascending, descending, and transparent-pool ranges, plus the
+`GetBlock` bytes. A deliberate serialization change updates those digests in
+the same change.
+
 ## Block range status codes
 
 `GetBlockRange` keeps the lightwalletd status contract in both serving modes.
