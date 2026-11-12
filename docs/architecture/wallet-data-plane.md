@@ -584,11 +584,17 @@ The full projection path is the canonical worked example in
 
 `WalletQuery.TransparentOutpointSpendStatus` answers, for each requested
 transparent outpoint, whether a mined transaction spends it. A wallet uses it
-to resolve the spend of an output it already tracks without scanning the
-output's address history, which also keeps the wallet's addresses private.
-Zallet's `spend-index` chain contract (`ChainView::outpoint_spend_status`) and
-librustzcash's `TransactionDataRequest::GetSpendingTx` are the consumers; see
+to resolve the spends of outputs it already tracks in one request per batch,
+without downloading each output's address history. Zallet's `spend-index`
+chain contract (`ChainView::outpoint_spend_status`) and librustzcash's
+`TransactionDataRequest::GetSpendingTx` are the consumers; see
 [ADR-0043](../adrs/0043-owned-transparent-wallet-query-surface.md).
+
+The request reveals which outpoints the wallet tracks. The wallet projection
+stores each output with its address, so the server also learns the address
+that owns every found outpoint. That is the same set of addresses an
+address-history scan reveals, plus the exact outputs, so the method is not a
+privacy improvement over the scan.
 
 The request carries 1 to 1,024 outpoints and the standard
 `optional uint64 at_epoch_id`. The response carries the `ChainView` it was

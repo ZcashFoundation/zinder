@@ -103,9 +103,12 @@ question.
 The batch request carries 1 to 1,024 outpoints and returns one entry per
 outpoint in request order, each `unspent`, `spent_by`, or `not_found`.
 `zinder-client` splits longer slices at one pinned epoch, so callers never
-meet the cap. A per-outpoint lookup also keeps the wallet's addresses private,
-which the address-scan fallback in Zallet's current Zinder backend does not
-(`a28790a` `backends/zinder/src/chain.rs:609`).
+meet the cap. Compared with the address-scan fallback in Zallet's current
+Zinder backend (`a28790a` `backends/zinder/src/chain.rs:609`), the batch
+lookup saves round trips and the download of each address's history. It does
+not improve privacy. The wallet projection stores each output with its
+address, so the request reveals the addresses the scan reveals, plus the
+exact outputs the wallet tracks.
 
 The `transparent_outpoint_spend` materialized-view consumer stays the Explorer
 source for `TransactionDetail.spent_by`. Its only reader is
@@ -216,13 +219,17 @@ and the shape the method would take.
   a registry row, a serving reader, positive and negative contract tests, and
   an update to this ownership table. [Add-back triggers](#add-back-triggers)
   names the consumers expected to justify the removed reads.
-- Zallet's current Zinder backend builds against this release after two
-  edits in `backends/zinder/src/chain.rs` at `a28790a`: delete
-  `descending: false` at line 764 and the `assert!(!query.descending)` at line
-  2610. It then bumps `zinder-client` and `zinder-core` from `=0.6.0`
-  (`backends/zinder/Cargo.toml:51,56`). A Zallet Zinder backend with
-  `spend-index` enabled can call `ChainSnapshot::transparent_outpoint_spend_status`
-  and drop its address-scan fallback.
+- Zallet's current Zinder backend at `a28790a` uses one removed item: the
+  `descending` history flag, set at `backends/zinder/src/chain.rs:764` and
+  asserted at line 2610. Every other `zinder_client` and `zinder_core` item
+  it imports still exists, and it does not implement `ChainIndex`, so the new
+  required trait method does not affect it. This check covers imports and API
+  surface only; Zallet was not compiled against this release. Its upgrade from
+  `=0.6.0` (`backends/zinder/Cargo.toml:51,56`) also crosses every other
+  breaking change since 0.6.0, which it must adopt separately. A
+  Zallet Zinder backend with `spend-index` enabled can call
+  `ChainSnapshot::transparent_outpoint_spend_status` and drop its
+  address-scan fallback.
 
 ## Rejected alternatives
 
