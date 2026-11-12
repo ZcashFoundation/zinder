@@ -1275,6 +1275,7 @@ wallet.events.mempool_v2
 wallet.read.chain_value_pools_at_tip_v1
 wallet.address.transparent_unspent_outputs_v1
 wallet.address.transparent_history_v1
+wallet.read.transparent_outpoint_spend_status_v1
 explorer.server_info_v1
 explorer.transaction.detail_v4
 explorer.block.summary_v1

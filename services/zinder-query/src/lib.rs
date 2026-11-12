@@ -17,7 +17,7 @@ use zinder_core::{
     ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange,
     TransactionBlobArtifact, TransactionBroadcastOutcome, TransactionId, TransactionLocation,
     TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TransparentUnspentOutput, TxStatus,
+    TransparentOutPoint, TransparentOutpointSpendStatus, TransparentUnspentOutput, TxStatus,
 };
 use zinder_proto::capabilities::WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1;
 use zinder_source::SourceError;
@@ -46,7 +46,7 @@ pub use grpc::{
     latest_tree_state_checkpoint_response, network_upgrade_activations_response,
     status_from_query_error, subtree_roots_response, transaction_response,
     transparent_address_tx_ids_response, transparent_address_unspent_outputs_response,
-    tree_state_at_response, visible_tip_block_response,
+    transparent_outpoint_spend_status_response, tree_state_at_response, visible_tip_block_response,
 };
 pub use ingest_control::{AdmittedIngestControl, IngestControlAdmissionError};
 pub use native_wallet_endpoint_capabilities::{
@@ -207,6 +207,22 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         &self,
         request: TransparentAddressTxIdsInRangeRequest,
     ) -> Result<TransparentAddressTxIds, QueryError>;
+
+    /// Classifies each transparent outpoint as unspent, spent by a mined
+    /// input, or not found, reading every outpoint at one chain epoch.
+    ///
+    /// The returned statuses follow `outpoints` in order and length,
+    /// including duplicates. The read covers mined transactions only.
+    ///
+    /// Rejects an empty list and any list above
+    /// [`zinder_core::MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST`] with
+    /// [`QueryError::TransparentOutpointCountOutOfRange`] before reading
+    /// storage.
+    async fn transparent_outpoint_spend_status(
+        &self,
+        outpoints: Vec<TransparentOutPoint>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentOutpointSpendStatuses, QueryError>;
 
     /// Sums the canonical confirmed balance across one or more transparent
     /// addresses at a single pinned chain epoch.
@@ -381,6 +397,9 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         Some(QueryError::SubtreeRootRangeTooLarge { .. }) => "subtree_root_range_too_large",
         Some(QueryError::TransparentBalanceAddressCountExceeded { .. }) => {
             "transparent_balance_address_count_exceeded"
+        }
+        Some(QueryError::TransparentOutpointCountOutOfRange { .. }) => {
+            "transparent_outpoint_count_out_of_range"
         }
         Some(QueryError::ArtifactUnavailable { .. }) => "artifact_unavailable",
         Some(QueryError::CompactBlockPayloadMalformed { .. }) => "compact_block_payload_malformed",
@@ -606,6 +625,15 @@ pub struct TransparentAddressUnspentOutputs {
     pub outputs: Vec<TransparentUnspentOutput>,
 }
 
+/// Spend status of a batch of transparent outpoints, read at one chain epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransparentOutpointSpendStatuses {
+    /// Chain epoch every status was read at.
+    pub chain_epoch: ChainEpoch,
+    /// One status per requested outpoint, in request order.
+    pub statuses: Vec<TransparentOutpointSpendStatus>,
+}
+
 /// Transparent-address tx-history range request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransparentAddressTxIdsInRangeRequest {
@@ -752,6 +780,18 @@ pub enum QueryError {
         requested: usize,
         /// Maximum allowed address count.
         maximum: u32,
+    },
+
+    /// Outpoint spend-status request named no outpoints or more than the
+    /// per-request cap.
+    #[error(
+        "transparent outpoint count is out of range: requested {requested}, allowed 1 to {maximum}"
+    )]
+    TransparentOutpointCountOutOfRange {
+        /// Requested outpoint count.
+        requested: usize,
+        /// Maximum allowed outpoint count.
+        maximum: usize,
     },
 
     /// Indexed artifact is unavailable for the requested key.
@@ -983,6 +1023,9 @@ impl zinder_proto::BoundaryError for QueryError {
             Self::TransparentBalanceAddressCountExceeded { .. } => {
                 ErrorReason::TransparentBalanceAddressCountExceeded
             }
+            Self::TransparentOutpointCountOutOfRange { .. } => {
+                ErrorReason::TransparentOutpointCountOutOfRange
+            }
             Self::ChainEventCursorInvalid { .. } => ErrorReason::ChainEventCursorInvalid,
             Self::TransparentHistoryCursorInvalid { .. } => {
                 ErrorReason::TransparentHistoryCursorInvalid
@@ -1091,6 +1134,10 @@ mod error_reason_tests {
             QueryError::TransparentBalanceAddressCountExceeded {
                 requested: 257,
                 maximum: MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
+            },
+            QueryError::TransparentOutpointCountOutOfRange {
+                requested: 0,
+                maximum: zinder_core::MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST,
             },
             QueryError::ArtifactUnavailable {
                 family: ArtifactFamily::CompactBlock,

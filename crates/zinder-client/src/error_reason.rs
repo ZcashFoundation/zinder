@@ -90,6 +90,7 @@ define_error_reasons! {
     ServiceNotReady => "SERVICE_NOT_READY",
     TransactionNotFound => "TRANSACTION_NOT_FOUND",
     CanonicalHistoryUnavailable => "CANONICAL_HISTORY_UNAVAILABLE",
+    TransparentOutpointCountOutOfRange => "TRANSPARENT_OUTPOINT_COUNT_OUT_OF_RANGE",
 }
 
 #[cfg(all(test, feature = "remote"))]
@@ -151,6 +152,7 @@ mod tests {
             WireErrorReason::ServiceNotReady,
             WireErrorReason::TransactionNotFound,
             WireErrorReason::CanonicalHistoryUnavailable,
+            WireErrorReason::TransparentOutpointCountOutOfRange,
         ];
 
         for generated in generated_reasons {

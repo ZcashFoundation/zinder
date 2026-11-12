@@ -21,9 +21,13 @@ block. Canonical storage must also stay ignorant of the materialized-view plane
 
 A bundled Explorer view, `transparent_outpoint_spend`, records durable spender
 identity for every non-coinbase transparent input, keyed by the spent outpoint.
-It is Zinder's only reverse-spend index. Its owning capability is
-`explorer.transaction.detail_v4`; no wallet-query capability reads it
-([ADR-0043](0043-owned-transparent-wallet-query-surface.md)).
+It is the Explorer plane's reverse-spend index. Its owning capability is
+`explorer.transaction.detail_v4`; no wallet-query capability reads it. Wallet
+spend status, including the spender, comes from the wallet projection's
+`transparent_spent_output` family through
+`WalletQuery.TransparentOutpointSpendStatus`
+([ADR-0043](0043-owned-transparent-wallet-query-surface.md)), so wallet serving
+never depends on the optional materialized-view store.
 
 ### Authority split
 
@@ -88,8 +92,9 @@ That is a progress signal, not a retention authority.
 
 - Spender identity for a transparent outpoint is durable, so explorer
   transaction detail resolves arbitrarily old spends.
-- Wallets have no reverse-spend method. Spentness for wallets comes from the
-  wallet projection's unspent rows.
+- Wallets do not read this projection. `WalletQuery.TransparentOutpointSpendStatus`
+  answers spentness from the wallet projection's unspent rows and spender
+  identity from its spent rows.
 - Canonical storage carries no spend-keyed rows and no retention coupling to the
   materialized-view plane, so canonical commits never wait on projection
   progress.
@@ -107,3 +112,7 @@ That is a progress signal, not a retention authority.
   ([ADR-0043](0043-owned-transparent-wallet-query-surface.md)). The projection
   is an Explorer view owned by `explorer.transaction.detail_v4`, and the
   materialized-view wallet preset that also selected it no longer exists.
+- 2026-11-12: Wallet spend status by outpoint returned as
+  `WalletQuery.TransparentOutpointSpendStatus`, served from the wallet
+  projection rather than from this view. This projection stays the Explorer's
+  reverse-spend index.

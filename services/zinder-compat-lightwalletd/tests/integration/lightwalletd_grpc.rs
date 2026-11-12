@@ -35,8 +35,9 @@ use zinder_query::{
     DEFAULT_MAX_COMPACT_BLOCK_RANGE, FullBlock, FullBlockStream, QueryError, RawTransaction,
     SettledTipBlock, SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
     TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
-    TransparentAddressUnspentOutputsRequest, TreeState, VisibleTipBlock, WalletQueryApi,
-    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    TransparentAddressUnspentOutputsRequest, TransparentOutpointSpendStatuses, TreeState,
+    VisibleTipBlock, WalletQueryApi, WalletServingPairSlot, WalletServingQuery,
+    WalletServingReadPair,
 };
 use zinder_source::{
     NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError, SourceTreeState,
@@ -820,6 +821,17 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
     ) -> Result<TransparentAddressTxIds, QueryError> {
         self.inner
             .transparent_address_tx_ids_in_range(request)
+            .await
+    }
+
+    async fn transparent_outpoint_spend_status(
+        &self,
+        outpoints: Vec<TransparentOutPoint>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentOutpointSpendStatuses, QueryError> {
+        self.record(at_epoch_id);
+        self.inner
+            .transparent_outpoint_spend_status(outpoints, at_epoch_id)
             .await
     }
 

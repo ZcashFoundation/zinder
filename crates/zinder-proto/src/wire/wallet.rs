@@ -8,12 +8,12 @@ use zinder_core::wire::{
     encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex, encode_zinder_native_chain_name,
 };
 use zinder_core::{
-    ArtifactSchemaVersion, AuthDigest, BlockHash, BlockHeight, ChainEpoch, ChainEpochId,
+    ArtifactSchemaVersion, AuthDigest, BlockHash, BlockHeight, BlockId, ChainEpoch, ChainEpochId,
     ChainTipMetadata, CompactBlockArtifact, CompactChainMetadata, CompactSaplingOutput,
     CompactSaplingSpend, CompactShieldedAction, CompactTransaction, CompactTransactionData,
     CompactTransparentInput, CompactTransparentOutput, MempoolEntry, MempoolObservation,
     RawTransactionBytes, TransactionId, TransparentMempoolOutput, TransparentMempoolSpend,
-    TransparentOutPoint, UnixTimestampMillis,
+    TransparentOutPoint, TransparentOutpointSpendStatus, UnixTimestampMillis,
 };
 
 use crate::v1::wallet;
@@ -481,6 +481,100 @@ pub fn outpoint_message(outpoint: &TransparentOutPoint) -> wallet::OutPoint {
         transaction_id: encode_rpc_transaction_id_hex(outpoint.transaction_id),
         output_index: outpoint.output_index,
     }
+}
+
+/// Decodes a transparent outpoint from the native wallet protocol.
+///
+/// `field` names the message path reported when the transaction id is not
+/// RPC-form hex.
+pub fn outpoint_from_message(
+    field: &'static str,
+    message: &wallet::OutPoint,
+) -> Result<TransparentOutPoint, WalletWireDecodeError> {
+    Ok(TransparentOutPoint::new(
+        decode_transaction_id(field, &message.transaction_id)?,
+        message.output_index,
+    ))
+}
+
+/// Encodes one outpoint and its spend status as a native
+/// `TransparentOutpointSpendStatus` response entry.
+#[must_use]
+pub fn transparent_outpoint_spend_status_entry_message(
+    outpoint: &TransparentOutPoint,
+    status: TransparentOutpointSpendStatus,
+) -> wallet::TransparentOutpointSpendStatusEntry {
+    use wallet::transparent_outpoint_spend_status_entry::Status;
+
+    let status = match status {
+        TransparentOutpointSpendStatus::Unspent => {
+            Status::Unspent(wallet::TransparentOutpointUnspent {})
+        }
+        TransparentOutpointSpendStatus::SpentBy {
+            transaction_id,
+            input_index,
+            block,
+        } => Status::SpentBy(wallet::TransparentOutpointSpentBy {
+            spending_transaction_id: encode_rpc_transaction_id_hex(transaction_id),
+            input_index,
+            block: Some(wallet::BlockId {
+                height: block.height.value(),
+                block_hash: encode_rpc_block_hash_hex(block.hash),
+            }),
+        }),
+        TransparentOutpointSpendStatus::NotFound => {
+            Status::NotFound(wallet::TransparentOutpointNotFound {})
+        }
+    };
+    wallet::TransparentOutpointSpendStatusEntry {
+        outpoint: Some(outpoint_message(outpoint)),
+        status: Some(status),
+    }
+}
+
+/// Decodes one native `TransparentOutpointSpendStatus` response entry into
+/// its outpoint and spend status.
+pub fn transparent_outpoint_spend_status_entry_from_message(
+    entry: &wallet::TransparentOutpointSpendStatusEntry,
+) -> Result<(TransparentOutPoint, TransparentOutpointSpendStatus), WalletWireDecodeError> {
+    use wallet::transparent_outpoint_spend_status_entry::Status;
+
+    let outpoint = entry
+        .outpoint
+        .as_ref()
+        .ok_or(WalletWireDecodeError::MissingField {
+            field: "entries.outpoint",
+        })?;
+    let outpoint = outpoint_from_message("entries.outpoint.transaction_id", outpoint)?;
+    let status = match entry
+        .status
+        .as_ref()
+        .ok_or(WalletWireDecodeError::MissingField {
+            field: "entries.status",
+        })? {
+        Status::Unspent(_) => TransparentOutpointSpendStatus::Unspent,
+        Status::SpentBy(spent_by) => {
+            let block = spent_by
+                .block
+                .as_ref()
+                .ok_or(WalletWireDecodeError::MissingField {
+                    field: "entries.spent_by.block",
+                })?;
+            TransparentOutpointSpendStatus::SpentBy {
+                transaction_id: decode_transaction_id(
+                    "entries.spent_by.spending_transaction_id",
+                    &spent_by.spending_transaction_id,
+                )?,
+                input_index: spent_by.input_index,
+                block: BlockId::new(
+                    BlockHeight::new(block.height),
+                    decode_block_hash("entries.spent_by.block.block_hash", &block.block_hash)?,
+                ),
+            }
+        }
+        Status::NotFound(_) => TransparentOutpointSpendStatus::NotFound,
+    };
+    Ok((outpoint, status))
 }
 
 fn transparent_mempool_output_message(

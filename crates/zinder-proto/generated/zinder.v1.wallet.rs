@@ -1342,6 +1342,84 @@ pub mod transparent_unspent_outputs_chunk {
         Item(super::TransparentUnspentOutput),
     }
 }
+/// Request for the spend status of a batch of transparent outpoints at one
+/// chain epoch.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TransparentOutpointSpendStatusRequest {
+    /// Outpoints to classify. The response repeats them in this order. A request
+    /// carries 1 to 1024 outpoints; the server rejects any other count with
+    /// `INVALID_ARGUMENT` and `TRANSPARENT_OUTPOINT_COUNT_OUT_OF_RANGE`.
+    /// Duplicate outpoints are answered once per occurrence.
+    #[prost(message, repeated, tag = "1")]
+    pub outpoints: ::prost::alloc::vec::Vec<OutPoint>,
+    /// Optional chain-epoch id that pins the read to a specific `ChainEpoch`.
+    /// Absent resolves against the live visible tip.
+    #[prost(uint64, optional, tag = "2")]
+    pub at_epoch_id: ::core::option::Option<u64>,
+}
+/// Spend status of every requested outpoint, read at one chain epoch.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TransparentOutpointSpendStatusResponse {
+    /// Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+    /// Every entry was read at `chain_view.chain_epoch`.
+    #[prost(message, optional, tag = "1")]
+    pub chain_view: ::core::option::Option<ChainView>,
+    /// One entry per requested outpoint, in request order.
+    #[prost(message, repeated, tag = "2")]
+    pub entries: ::prost::alloc::vec::Vec<TransparentOutpointSpendStatusEntry>,
+}
+/// Spend status of one requested outpoint.
+///
+/// The status covers mined transactions from height 1 through the epoch's
+/// visible tip. A spend that is only in the mempool leaves the output
+/// `unspent`; `MempoolSnapshot` and `MempoolEvents` carry pending spends.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TransparentOutpointSpendStatusEntry {
+    /// Requested outpoint.
+    #[prost(message, optional, tag = "1")]
+    pub outpoint: ::core::option::Option<OutPoint>,
+    #[prost(oneof = "transparent_outpoint_spend_status_entry::Status", tags = "2, 3, 4")]
+    pub status: ::core::option::Option<transparent_outpoint_spend_status_entry::Status>,
+}
+/// Nested message and enum types in `TransparentOutpointSpendStatusEntry`.
+pub mod transparent_outpoint_spend_status_entry {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Status {
+        /// A mined transaction created the output and no mined transaction
+        /// spends it.
+        #[prost(message, tag = "2")]
+        Unspent(super::TransparentOutpointUnspent),
+        /// A mined transaction spends the output.
+        #[prost(message, tag = "3")]
+        SpentBy(super::TransparentOutpointSpentBy),
+        /// No mined transaction created an output at this outpoint.
+        #[prost(message, tag = "4")]
+        NotFound(super::TransparentOutpointNotFound),
+    }
+}
+/// Marker for an outpoint that is unspent at the response epoch.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TransparentOutpointUnspent {}
+/// Mined spend of a transparent outpoint.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TransparentOutpointSpentBy {
+    /// Transaction id in RPC byte order (64 lowercase hex characters) of the
+    /// transaction that spends the outpoint.
+    /// Reference: Zcash protocol spec term `\rpcByteOrder`.
+    #[prost(string, tag = "1")]
+    pub spending_transaction_id: ::prost::alloc::string::String,
+    /// Transparent input index of the spend within the spending transaction.
+    #[prost(uint32, tag = "2")]
+    pub input_index: u32,
+    /// Block that mined the spending transaction.
+    #[prost(message, optional, tag = "3")]
+    pub block: ::core::option::Option<BlockId>,
+}
+/// Marker for an outpoint that no mined transaction created at the response
+/// epoch, including the coinbase input sentinel and the unspendable genesis
+/// coinbase output.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TransparentOutpointNotFound {}
 /// One upstream `getblockchaininfo.valuePools` entry.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChainValuePool {
@@ -2274,6 +2352,41 @@ pub mod wallet_query_client {
                 );
             self.inner.server_streaming(req, path, codec).await
         }
+        /// Return whether each transparent outpoint is unspent, spent (with the
+        /// spending transaction, input index, and block), or unknown, all read at
+        /// one chain epoch. Capability:
+        /// `wallet.read.transparent_outpoint_spend_status_v1`.
+        pub async fn transparent_outpoint_spend_status(
+            &mut self,
+            request: impl tonic::IntoRequest<
+                super::TransparentOutpointSpendStatusRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<super::TransparentOutpointSpendStatusResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/zinder.v1.wallet.WalletQuery/TransparentOutpointSpendStatus",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "zinder.v1.wallet.WalletQuery",
+                        "TransparentOutpointSpendStatus",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         /// Return chain-wide value-pool totals at the upstream node's current tip.
         /// The response binds the source snapshot to the upstream tip's height and
         /// hash. Capability: `wallet.read.chain_value_pools_at_tip_v1`. Storage-only
@@ -2582,6 +2695,17 @@ pub mod wallet_query_server {
             request: tonic::Request<super::TransparentAddressTxIdsInRangeRequest>,
         ) -> std::result::Result<
             tonic::Response<Self::TransparentAddressTxIdsInRangeStream>,
+            tonic::Status,
+        >;
+        /// Return whether each transparent outpoint is unspent, spent (with the
+        /// spending transaction, input index, and block), or unknown, all read at
+        /// one chain epoch. Capability:
+        /// `wallet.read.transparent_outpoint_spend_status_v1`.
+        async fn transparent_outpoint_spend_status(
+            &self,
+            request: tonic::Request<super::TransparentOutpointSpendStatusRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::TransparentOutpointSpendStatusResponse>,
             tonic::Status,
         >;
         /// Return chain-wide value-pool totals at the upstream node's current tip.
@@ -3537,6 +3661,58 @@ pub mod wallet_query_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/zinder.v1.wallet.WalletQuery/TransparentOutpointSpendStatus" => {
+                    #[allow(non_camel_case_types)]
+                    struct TransparentOutpointSpendStatusSvc<T: WalletQuery>(pub Arc<T>);
+                    impl<
+                        T: WalletQuery,
+                    > tonic::server::UnaryService<
+                        super::TransparentOutpointSpendStatusRequest,
+                    > for TransparentOutpointSpendStatusSvc<T> {
+                        type Response = super::TransparentOutpointSpendStatusResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::TransparentOutpointSpendStatusRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as WalletQuery>::transparent_outpoint_spend_status(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = TransparentOutpointSpendStatusSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

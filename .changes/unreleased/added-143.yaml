@@ -1,0 +1,6 @@
+kind: added
+body: 'Native `WalletQuery.TransparentOutpointSpendStatus` reports, for 1 to 1,024 transparent outpoints read at one chain epoch, whether each output is unspent, spent (with the spending transaction, input index, and block), or not found. It replaces `TransparentSpendsByOutpoint` and `TransparentUnspentOutputsByOutpoint` with one call, is served from the wallet projection without the Explorer views, and is advertised as `wallet.read.transparent_outpoint_spend_status_v1`. In `zinder-client`, call `ChainSnapshot::transparent_outpoint_spend_status`, which splits larger batches at one pinned epoch. A request with no outpoints or more than 1,024 fails with `INVALID_ARGUMENT` and the new `TRANSPARENT_OUTPOINT_COUNT_OUT_OF_RANGE` reason.'
+time: 2026-11-12T12:00:00Z
+custom:
+  Bump: minor
+  PR: "143"

@@ -52,6 +52,7 @@ The request shape failed validation. Retry disposition: **NonRetryable**. Carrie
 | `INVALID_BLOCK_RANGE` | `start_height` exceeds `end_height` | `field_violations[start_height, end_height]` |
 | `BLOCK_RANGE_TOO_LARGE` | Requested compact- or full-block range exceeds the per-deployment cap | `field_violations[end_height]` |
 | `SUBTREE_ROOT_RANGE_TOO_LARGE` | Requested subtree-root count exceeds the public 1,024-entry per-request cap | `field_violations[max_entries]` |
+| `TRANSPARENT_OUTPOINT_COUNT_OUT_OF_RANGE` | A `TransparentOutpointSpendStatus` request carries no outpoints or more than the 1,024-outpoint per-request cap | `field_violations[outpoints]` |
 | `CHAIN_EVENT_CURSOR_INVALID` | Cursor bytes failed to parse, are for a different network / store / stream family, or a non-default request family disagrees with the cursor's encoded family | `field_violations[from_cursor]` |
 | `ADDRESS_OUTPUT_CURSOR_INVALID` | Same as above for address-output streams | `field_violations[from_cursor]` |
 | `TRANSPARENT_HISTORY_CURSOR_INVALID` | Same as above for transparent-history streams | `field_violations[from_cursor]` |

@@ -165,6 +165,15 @@ endpoints carry no materialized-view identity.
   preflights has a client-owned `Capability` variant, so consumers do not
   import protocol constants or copy wire strings. Generated protobuf types are
   not public SDK vocabulary.
+- `ChainSnapshot::transparent_outpoint_spend_status` is the canonical call for
+  the spend state of outputs a wallet already tracks. It returns
+  `TransparentOutpointSpendStatuses`: the `ChainEpoch` it read and one
+  `TransparentOutpointSpendStatus` per requested outpoint, in request order.
+  Each status is `Unspent`, `SpentBy { transaction_id, input_index, block }`,
+  or `NotFound`. The client splits slices longer than
+  `MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST` (1,024) into requests pinned to one
+  epoch, so callers never meet the wire cap; see
+  [Wallet data plane §Transparent Outpoint Spend Status](wallet-data-plane.md#transparent-outpoint-spend-status).
 - `ChainIndex::transaction_by_id` returns `TxStatus::NotFound` only for a
   proven absence that answers the request: pinned to the requested epoch, or
   covering the live mempool when unpinned. Ambiguous server answers become
@@ -426,6 +435,7 @@ wallet.events.mempool_v2
 wallet.read.chain_value_pools_at_tip_v1
 wallet.address.transparent_unspent_outputs_v1
 wallet.address.transparent_history_v1
+wallet.read.transparent_outpoint_spend_status_v1
 explorer.server_info_v1
 explorer.transaction.detail_v4
 explorer.block.summary_v1

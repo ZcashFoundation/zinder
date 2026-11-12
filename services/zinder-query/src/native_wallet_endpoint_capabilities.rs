@@ -105,6 +105,7 @@ impl NativeWalletEndpointCapabilities {
                 | capabilities::WALLET_EVENTS_CHAIN_V1
                 | capabilities::WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1
                 | capabilities::WALLET_ADDRESS_TRANSPARENT_HISTORY_V1
+                | capabilities::WALLET_READ_TRANSPARENT_OUTPOINT_SPEND_STATUS_V1
         );
         implemented_without_optional_evidence
             || (matches!(

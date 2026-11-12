@@ -9,7 +9,8 @@ use zinder_proto::capabilities::{
     WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1, WALLET_READ_SERVER_INFO_V2,
     WALLET_READ_SETTLED_TIP_BLOCK_V1, WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
     WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1, WALLET_READ_TRANSACTION_BY_ID_V2,
-    WALLET_READ_TREE_STATE_AT_HEIGHT_V2, WALLET_READ_VISIBLE_TIP_BLOCK_V1,
+    WALLET_READ_TRANSPARENT_OUTPOINT_SPEND_STATUS_V1, WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
+    WALLET_READ_VISIBLE_TIP_BLOCK_V1,
 };
 
 #[test]
@@ -67,6 +68,10 @@ fn wallet_sync_capabilities_use_client_owned_exact_match_vocabulary() {
         (
             Capability::TransparentAddressHistory,
             WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
+        ),
+        (
+            Capability::TransparentOutpointSpendStatus,
+            WALLET_READ_TRANSPARENT_OUTPOINT_SPEND_STATUS_V1,
         ),
         (Capability::ChainEvents, WALLET_EVENTS_CHAIN_V1),
     ] {

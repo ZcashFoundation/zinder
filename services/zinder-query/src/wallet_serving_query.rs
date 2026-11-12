@@ -14,9 +14,10 @@ use tracing::Instrument as _;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
     CanonicalBlockFactsSequenceDigest, CanonicalBlockFactsSequenceDigestVersion, ChainEpoch,
-    ChainEpochId, ChainValuePoolsAtTip, MinedTransaction, MinedTransactionChainContext,
-    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, TransactionId,
-    TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
+    ChainEpochId, ChainValuePoolsAtTip, MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST, MinedTransaction,
+    MinedTransactionChainContext, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
+    TransactionId, TransparentAddressBalance, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentOutpointSpendStatus,
     TransparentUnspentOutput, TxStatus,
 };
 use zinder_proto::capabilities::{
@@ -42,9 +43,10 @@ use crate::{
     FullBlockStream, NativeWalletEndpointCapabilities, QueryError, RawTransaction, SettledTipBlock,
     SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
     TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
-    TransparentAddressUnspentOutputsRequest, TreeState, UpstreamNodeCapabilities, VisibleTipBlock,
-    WalletQueryApi, WalletServingPairSlot, WalletServingReadPair, serving_read,
-    validate_block_range, validate_subtree_root_range,
+    TransparentAddressUnspentOutputsRequest, TransparentOutpointSpendStatuses, TreeState,
+    UpstreamNodeCapabilities, VisibleTipBlock, WalletProjectionReader, WalletQueryApi,
+    WalletServingPairSlot, WalletServingReadPair, serving_read, validate_block_range,
+    validate_subtree_root_range,
 };
 
 const WALLET_READ_PAGE_SIZE: NonZeroU16 = NonZeroU16::MAX;
@@ -1019,6 +1021,38 @@ where
         .await
     }
 
+    async fn transparent_outpoint_spend_status(
+        &self,
+        outpoints: Vec<TransparentOutPoint>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentOutpointSpendStatuses, QueryError> {
+        serving_read::record("transparent_outpoint_spend_status", None, async {
+            if !(1..=MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST).contains(&outpoints.len()) {
+                return Err(QueryError::TransparentOutpointCountOutOfRange {
+                    requested: outpoints.len(),
+                    maximum: MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST,
+                });
+            }
+            let pair = self.capture_pair();
+            serving_read::off_reactor(pair, move |pair| {
+                // The pair's wallet reader is frozen at the same source as its
+                // canonical epoch, so both output families answer at that
+                // epoch; a pin naming another epoch fails here instead.
+                let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                let statuses = outpoints
+                    .into_iter()
+                    .map(|outpoint| outpoint_spend_status(pair.wallet(), outpoint))
+                    .collect::<Result<_, _>>()?;
+                Ok(TransparentOutpointSpendStatuses {
+                    chain_epoch,
+                    statuses,
+                })
+            })
+            .await
+        })
+        .await
+    }
+
     async fn transparent_address_balance(
         &self,
         addresses: Vec<TransparentAddressScriptHash>,
@@ -1337,6 +1371,28 @@ async fn forward_serving_pair_full_block_sub_range(
         }
     }
     true
+}
+
+/// Classifies one outpoint from the wallet projection's output families.
+///
+/// The projection moves an output from the unspent family to the spent family
+/// in the transition that mines its spend, and back only when a reorg reverts
+/// that spend, so an outpoint is never in both families.
+fn outpoint_spend_status(
+    wallet: &dyn WalletProjectionReader,
+    outpoint: TransparentOutPoint,
+) -> Result<TransparentOutpointSpendStatus, QueryError> {
+    if wallet.find_unspent_output(outpoint)?.is_some() {
+        return Ok(TransparentOutpointSpendStatus::Unspent);
+    }
+    Ok(wallet.find_spent_output(outpoint)?.map_or(
+        TransparentOutpointSpendStatus::NotFound,
+        |spent| TransparentOutpointSpendStatus::SpentBy {
+            transaction_id: spent.spent_at.transaction_id,
+            input_index: spent.input_index,
+            block: spent.spent_at.block,
+        },
+    ))
 }
 
 fn unavailable(capability: &'static str) -> QueryError {

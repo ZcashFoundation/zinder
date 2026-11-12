@@ -82,12 +82,17 @@ The contract is split across two async traits so the compiler expresses which ca
 
 A consumer that broadcasts or subscribes bounds its handle `T: ChainIndex + EndpointBackedIndex`. Typed capability discovery (`CapabilityDescriptor::supports(Capability::…)`) probes the advertised set without matching raw strings.
 
-The public traits and protocol include optional full-block and
-transparent-outpoint methods. The admitted wallet-serving query advertises
-full-block reads only when authenticated canonical retention is `all`.
-Transparent-outpoint reads remain omitted until their concrete serving-pair
-resolvers are implemented. Method presence is not a deployment support claim;
-consumers must preflight exact capability strings.
+The public traits and protocol include optional full-block methods. The
+admitted wallet-serving query advertises full-block reads only when
+authenticated canonical retention is `all`. Method presence is not a
+deployment support claim; consumers must preflight exact capability strings.
+
+`ChainSnapshot::transparent_outpoint_spend_status` reports whether each
+transparent outpoint a wallet tracks is unspent, spent by a named mined input,
+or not found, all at the snapshot's epoch. It is the per-outpoint spend lookup
+that Zallet's `spend-index` contract and librustzcash `GetSpendingTx` need, and
+it accepts any number of outpoints: the client splits large slices at one
+pinned epoch. Preflight `Capability::TransparentOutpointSpendStatus`.
 
 When the canonical writer parks because a replacement crossed its reorg
 window, new reads and open chain-event streams return
@@ -180,8 +185,9 @@ additionally requires authenticated transaction-blob retention. Temporary
 ingest-control failure drains readiness without rewriting the immutable
 capability set. Methods with no admitted provider fail their capability guard
 before provider access. The native transparent surface contains only the
-transparent-address UTXO and ascending history reads that Zallet calls; ZODL
-reaches the same reads through the lightwalletd adapter
+transparent-address UTXO and ascending history reads that Zallet calls, plus
+the outpoint spend status that Zallet's `spend-index` contract needs; ZODL
+reaches the address reads through the lightwalletd adapter
 ([ADR-0043](../adrs/0043-owned-transparent-wallet-query-surface.md)). These
 Zinder contract claims do not replace current Zallet or ZODL consumer
 certification.

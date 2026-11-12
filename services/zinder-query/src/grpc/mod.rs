@@ -24,7 +24,7 @@ pub use native::{
     full_block_response, latest_tree_state_checkpoint_response,
     network_upgrade_activations_response, subtree_roots_response, transaction_response,
     transparent_address_tx_ids_response, transparent_address_unspent_outputs_response,
-    tree_state_at_response, visible_tip_block_response,
+    transparent_outpoint_spend_status_response, tree_state_at_response, visible_tip_block_response,
 };
 
 /// Maps a [`QueryError`] to a tonic [`Status`] using the canonical mapping
@@ -70,6 +70,7 @@ fn typed_detail_for(error: &QueryError) -> ErrorDetails {
         | QueryError::TransparentHistoryCursorInvalid { .. }
         | QueryError::InvalidAddress { .. }
         | QueryError::UnsupportedShieldedProtocol { .. }
+        | QueryError::TransparentOutpointCountOutOfRange { .. }
         | QueryError::BroadcastTransactionTooLarge { .. } => bad_request_details(error),
         QueryError::TransactionBroadcastDisabled
         | QueryError::MaterializedViewUnavailable { .. }
@@ -142,6 +143,12 @@ fn bad_request_details(error: &QueryError) -> ErrorDetails {
             ErrorDetails::with_bad_request_violation(
                 "raw_transaction",
                 format!("transaction is {actual} bytes; maximum is {maximum}"),
+            )
+        }
+        QueryError::TransparentOutpointCountOutOfRange { requested, maximum } => {
+            ErrorDetails::with_bad_request_violation(
+                "outpoints",
+                format!("requested {requested} outpoints; allowed 1 to {maximum}"),
             )
         }
         _ => ErrorDetails::new(),

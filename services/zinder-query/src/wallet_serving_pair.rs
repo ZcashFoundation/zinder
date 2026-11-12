@@ -7,6 +7,7 @@ use zinder_core::{
     BlockBlobArtifact, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId, ChainEpoch,
     CommitmentTreeCheckpoint, CompactBlockArtifact, Network, SubtreeRootArtifact, SubtreeRootRange,
     TransactionBlobArtifact, TransactionId, TransactionLocation, TransparentAddressScriptHash,
+    TransparentOutPoint,
 };
 use zinder_store::{
     BlockHashLookup, CanonicalActivationSchedule, CanonicalEventFence, CanonicalStoreError,
@@ -15,7 +16,8 @@ use zinder_store::{
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
-    WalletProjectionReadyEvidence, WalletProjectionSourcePosition,
+    WalletProjectionReadyEvidence, WalletProjectionSourcePosition, WalletSpentOutput,
+    WalletUnspentOutput,
 };
 use zinder_wallet_rocksdb::{
     RocksDbWalletError, RocksDbWalletSecondary, WalletAddressTransactionHistoryPage,
@@ -187,6 +189,18 @@ pub trait WalletProjectionReader: Send + Sync + 'static {
         &self,
         address_script_hash: TransparentAddressScriptHash,
     ) -> Result<u64, RocksDbWalletError>;
+
+    /// Reads the current unspent output at one exact outpoint.
+    fn find_unspent_output(
+        &self,
+        outpoint: TransparentOutPoint,
+    ) -> Result<Option<WalletUnspentOutput>, RocksDbWalletError>;
+
+    /// Reads the spent output at one exact outpoint, with its spending input.
+    fn find_spent_output(
+        &self,
+        outpoint: TransparentOutPoint,
+    ) -> Result<Option<WalletSpentOutput>, RocksDbWalletError>;
 }
 
 /// Typed reason why canonical and wallet readers cannot form one serving pair.
@@ -414,6 +428,20 @@ impl WalletProjectionReader for RocksDbWalletSecondary {
         address_script_hash: TransparentAddressScriptHash,
     ) -> Result<u64, RocksDbWalletError> {
         self.address_balance(address_script_hash)
+    }
+
+    fn find_unspent_output(
+        &self,
+        outpoint: TransparentOutPoint,
+    ) -> Result<Option<WalletUnspentOutput>, RocksDbWalletError> {
+        self.find_unspent_output(outpoint)
+    }
+
+    fn find_spent_output(
+        &self,
+        outpoint: TransparentOutPoint,
+    ) -> Result<Option<WalletSpentOutput>, RocksDbWalletError> {
+        self.find_spent_output(outpoint)
     }
 }
 

@@ -22,18 +22,19 @@ use zinder_core::wire::{
 use zinder_core::{
     ArtifactSchemaVersion, BlockBlobArtifact, BlockHash, BlockHeader, BlockHeight,
     BlockHeightRange, BlockSelector, ChainEpoch, ChainEpochId, ChainValuePool,
-    ChainValuePoolsAtTip, CompactBlockArtifact, ConsensusBranchId, MempoolEntry,
-    MempoolEvictionReason, MinedTransaction, MinedTransactionChainContext, Network,
-    NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
-    TransactionBroadcastOutcome, TransactionId, TransactionLocation, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentUnspentOutput,
-    TreeStateArtifact, TxStatus,
+    ChainValuePoolsAtTip, CompactBlockArtifact, ConsensusBranchId,
+    MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST, MempoolEntry, MempoolEvictionReason, MinedTransaction,
+    MinedTransactionChainContext, Network, NetworkUpgradeActivation, NetworkUpgradeActivations,
+    RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
+    SubtreeRootRange, TransactionBroadcastOutcome, TransactionId, TransactionLocation,
+    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentOutPoint,
+    TransparentOutpointSpendStatus, TransparentUnspentOutput, TreeStateArtifact, TxStatus,
 };
 use zinder_proto::v1::wallet::{self, wallet_query_client::WalletQueryClient};
 use zinder_proto::wire::{
     TransactionAbsence, WalletWireDecodeError, chain_epoch_from_message,
     compact_block_from_message as compact_block_from_wire_message, mempool_entry_from_message,
+    outpoint_message, transparent_outpoint_spend_status_entry_from_message,
 };
 
 use crate::error::ZINDER_ERROR_DOMAIN;
@@ -46,7 +47,7 @@ use crate::{
     TransparentAddressTransactionChunk, TransparentAddressTxIdsQuery,
     TransparentAddressTxIdsStream, TransparentAddressUnspentOutputsQuery,
     TransparentAddressUnspentOutputsStream, TransparentHistoryCursor,
-    TransparentUnspentOutputChunk,
+    TransparentOutpointSpendStatuses, TransparentUnspentOutputChunk,
 };
 
 /// Options for opening a remote chain index over the native wallet gRPC API.
@@ -199,6 +200,55 @@ impl RemoteChainIndex {
                 metadata_error.to_string(),
             )),
         }
+    }
+
+    /// Reads one request-sized batch of outpoint spend statuses.
+    async fn transparent_outpoint_spend_status_batch(
+        &self,
+        outpoints: &[TransparentOutPoint],
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<(ChainEpoch, Vec<TransparentOutpointSpendStatus>), IndexerError> {
+        let response = self
+            .client()
+            .transparent_outpoint_spend_status(Request::new(
+                wallet::TransparentOutpointSpendStatusRequest {
+                    outpoints: outpoints.iter().map(outpoint_message).collect(),
+                    at_epoch_id: at_epoch_id.map(ChainEpochId::value),
+                },
+            ))
+            .await
+            .map_err(|status| self.map_status(status))?
+            .into_inner();
+        let chain_epoch =
+            chain_epoch_from_chain_view_with_pin(self.network, at_epoch_id, response.chain_view)?;
+        if response.entries.len() != outpoints.len() {
+            return Err(IndexerError::malformed(
+                "entries",
+                format!(
+                    "expected {} spend-status entries, observed {}",
+                    outpoints.len(),
+                    response.entries.len()
+                ),
+            ));
+        }
+        let statuses = outpoints
+            .iter()
+            .zip(&response.entries)
+            .map(|(requested, entry)| {
+                let (outpoint, status) =
+                    transparent_outpoint_spend_status_entry_from_message(entry)
+                        .map_err(wallet_decode_error_to_indexer_error)?;
+                if outpoint == *requested {
+                    Ok(status)
+                } else {
+                    Err(IndexerError::malformed(
+                        "entries.outpoint",
+                        "spend-status entry does not match the requested outpoint at its position",
+                    ))
+                }
+            })
+            .collect::<Result<_, _>>()?;
+        Ok((chain_epoch, statuses))
     }
 
     fn rebuild_channel(&self) {
@@ -720,6 +770,34 @@ impl ChainIndex for RemoteChainIndex {
             Box::pin(wire_stream),
             history_stream_state,
         ))
+    }
+
+    async fn transparent_outpoint_spend_status(
+        &self,
+        outpoints: &[TransparentOutPoint],
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentOutpointSpendStatuses, IndexerError> {
+        let mut batches = outpoints.chunks(MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST);
+        let first_batch = batches.next().ok_or_else(|| {
+            IndexerError::invalid_request(
+                "transparent outpoint spend status requires at least one outpoint",
+            )
+        })?;
+        let (chain_epoch, mut statuses) = self
+            .transparent_outpoint_spend_status_batch(first_batch, at_epoch_id)
+            .await?;
+        // Every later batch is pinned to the first response's epoch, so a
+        // batch either answers at that epoch or fails as an unavailable pin.
+        for batch in batches {
+            let (_, batch_statuses) = self
+                .transparent_outpoint_spend_status_batch(batch, Some(chain_epoch.id))
+                .await?;
+            statuses.extend(batch_statuses);
+        }
+        Ok(TransparentOutpointSpendStatuses {
+            chain_epoch,
+            statuses,
+        })
     }
 }
 

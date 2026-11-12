@@ -11,7 +11,8 @@ use zinder_core::{
     BlockBlobArtifact, BlockHeader, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
     ChainEpoch, ChainEpochId, CompactBlockArtifact, NetworkUpgradeActivations, SubtreeRootArtifact,
     SubtreeRootRange, TransactionId, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentUnspentOutput, TreeStateArtifact, TxStatus,
+    TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentOutpointSpendStatus,
+    TransparentUnspentOutput, TreeStateArtifact, TxStatus,
 };
 #[cfg(feature = "remote")]
 use zinder_core::{
@@ -351,6 +352,19 @@ pub struct TransparentUnspentOutputChunk {
     pub output: TransparentUnspentOutput,
 }
 
+/// Spend status of a batch of transparent outpoints, read at one chain epoch.
+///
+/// Returned by [`ChainSnapshot::transparent_outpoint_spend_status`] and
+/// [`ChainIndex::transparent_outpoint_spend_status`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransparentOutpointSpendStatuses {
+    /// Chain epoch every status was read at.
+    pub chain_epoch: ChainEpoch,
+    /// One status per requested outpoint, in request order and including
+    /// duplicates, so it zips with the requested slice.
+    pub statuses: Vec<TransparentOutpointSpendStatus>,
+}
+
 /// Borrowed chain view pinned to one [`ChainEpoch`].
 ///
 /// Capture resolves [`ChainIndex::current_epoch`] exactly once. Canonical
@@ -561,6 +575,67 @@ impl<'a, I: ChainIndex + ?Sized> ChainSnapshot<'a, I> {
             .transparent_address_tx_ids_in_range(query)
             .await
     }
+
+    /// Reports whether each transparent outpoint is unspent, spent by a mined
+    /// input, or not found on the captured epoch's chain.
+    ///
+    /// This is the call a wallet makes to resolve a spend of an output it
+    /// already tracks, such as a librustzcash `GetSpendingTx` request. The
+    /// statuses follow `outpoints` in order, so they zip with the slice. The
+    /// read covers mined transactions only: a spend still in the mempool
+    /// leaves the output [`TransparentOutpointSpendStatus::Unspent`].
+    ///
+    /// Any number of outpoints is accepted. The client splits large slices
+    /// into requests of at most
+    /// [`MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST`](zinder_core::MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST)
+    /// outpoints, all pinned to this snapshot's epoch, and an empty slice
+    /// returns no statuses without a network call. When the server no longer
+    /// serves the captured epoch, the call fails with
+    /// [`IndexerError::ChainEpochPinUnavailable`]; capture a new snapshot and
+    /// ask again.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{
+    /// #     ChainIndex, IndexerError, TransactionId, TransparentOutPoint,
+    /// #     TransparentOutpointSpendStatus,
+    /// # };
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let snapshot = client.snapshot().await?;
+    /// let outpoints = [TransparentOutPoint::new(TransactionId::from_bytes([0u8; 32]), 0)];
+    /// let spend_status = snapshot.transparent_outpoint_spend_status(&outpoints).await?;
+    /// for (outpoint, status) in outpoints.iter().zip(&spend_status.statuses) {
+    ///     match status {
+    ///         TransparentOutpointSpendStatus::Unspent => {
+    ///             // Still spendable through the snapshot's visible tip.
+    ///         }
+    ///         TransparentOutpointSpendStatus::SpentBy { transaction_id, .. } => {
+    ///             // Fetch the spender at the same epoch.
+    ///             let spender = snapshot.transaction_by_id(*transaction_id).await?;
+    ///             # let _ = (outpoint, spender);
+    ///         }
+    ///         TransparentOutpointSpendStatus::NotFound => {
+    ///             // No mined transaction created this output on this chain.
+    ///         }
+    ///     }
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub async fn transparent_outpoint_spend_status(
+        &self,
+        outpoints: &[TransparentOutPoint],
+    ) -> Result<TransparentOutpointSpendStatuses, IndexerError> {
+        if outpoints.is_empty() {
+            return Ok(TransparentOutpointSpendStatuses {
+                chain_epoch: self.chain_epoch,
+                statuses: Vec::new(),
+            });
+        }
+        self.chain_index
+            .transparent_outpoint_spend_status(outpoints, Some(self.chain_epoch.id))
+            .await
+    }
 }
 
 /// Owned chain view pinned to one [`ChainEpoch`].
@@ -720,6 +795,19 @@ impl<I: ChainIndex + ?Sized> OwnedChainSnapshot<I> {
     ) -> Result<TransparentAddressTxIdsStream, IndexerError> {
         self.borrowed()
             .transparent_address_tx_ids_in_range(query)
+            .await
+    }
+
+    /// Reports whether each transparent outpoint is unspent, spent by a mined
+    /// input, or not found on the captured epoch's chain.
+    ///
+    /// See [`ChainSnapshot::transparent_outpoint_spend_status`].
+    pub async fn transparent_outpoint_spend_status(
+        &self,
+        outpoints: &[TransparentOutPoint],
+    ) -> Result<TransparentOutpointSpendStatuses, IndexerError> {
+        self.borrowed()
+            .transparent_outpoint_spend_status(outpoints)
             .await
     }
 }
@@ -1151,6 +1239,36 @@ pub trait ChainIndex: Send + Sync + 'static {
         &self,
         query: TransparentAddressTxIdsQuery,
     ) -> Result<TransparentAddressTxIdsStream, IndexerError>;
+
+    /// Reports whether each transparent outpoint is unspent, spent by a mined
+    /// input, or not found, reading every outpoint at one chain epoch.
+    ///
+    /// Prefer [`ChainSnapshot::transparent_outpoint_spend_status`], which
+    /// pins the read to the snapshot's epoch. `None` reads at the visible
+    /// epoch at call time; `Some(id)` pins the read and fails with
+    /// [`IndexerError::ChainEpochPinUnavailable`] when the server no longer
+    /// serves that epoch. Implementations split slices longer than
+    /// [`MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST`](zinder_core::MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST)
+    /// and pin every later request to the first response's epoch. An empty
+    /// slice fails with [`IndexerError::InvalidRequest`], because the
+    /// response must name the epoch it was read at.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use zinder_client::{ChainIndex, IndexerError, TransactionId, TransparentOutPoint};
+    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
+    /// let outpoints = [TransparentOutPoint::new(TransactionId::from_bytes([0u8; 32]), 0)];
+    /// let spend_status = client
+    ///     .transparent_outpoint_spend_status(&outpoints, None)
+    ///     .await?;
+    /// # let _ = spend_status; Ok(()) }
+    /// ```
+    async fn transparent_outpoint_spend_status(
+        &self,
+        outpoints: &[TransparentOutPoint],
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentOutpointSpendStatuses, IndexerError>;
 }
 
 /// Live endpoint-backed operations layered on top of [`ChainIndex`].

@@ -105,9 +105,9 @@ pub use transaction_public_facts::{
 pub use transparent_address_balance::TransparentAddressBalance;
 pub use transparent_address_tx_index::TransparentAddressTxIndexArtifact;
 pub use transparent_output::{
-    TransparentAddressScriptHash, TransparentInputFact, TransparentOutPoint,
-    TransparentOutputArtifact, TransparentOutputFact, TransparentSpendEntry, TransparentSpendFact,
-    TransparentUnspentOutput,
+    MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST, TransparentAddressScriptHash, TransparentInputFact,
+    TransparentOutPoint, TransparentOutpointSpendStatus, TransparentOutputArtifact,
+    TransparentOutputFact, TransparentSpendEntry, TransparentSpendFact, TransparentUnspentOutput,
 };
 pub use tree_state::{BlockFinalNoteCommitmentRoots, FinalNoteCommitmentRoot, TreeStateArtifact};
 pub use wallet_scan::{

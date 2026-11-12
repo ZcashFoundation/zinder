@@ -10,11 +10,16 @@ use zinder_core::wire::{
     encode_rpc_transaction_id_hex,
 };
 use zinder_core::{
-    BlockHash, CompactSaplingOutput, CompactSaplingSpend, CompactShieldedAction,
-    CompactTransactionData, CompactTransparentInput, CompactTransparentOutput, MempoolEntry,
-    MempoolObservation, RawTransactionBytes, TransactionId, UnixTimestampMillis,
+    BlockHash, BlockHeight, BlockId, CompactSaplingOutput, CompactSaplingSpend,
+    CompactShieldedAction, CompactTransactionData, CompactTransparentInput,
+    CompactTransparentOutput, MempoolEntry, MempoolObservation, RawTransactionBytes, TransactionId,
+    TransparentOutPoint, TransparentOutpointSpendStatus, UnixTimestampMillis,
 };
 use zinder_proto::v1::{ingest, ops, wallet};
+use zinder_proto::wire::{
+    WalletWireDecodeError, outpoint_message, transparent_outpoint_spend_status_entry_from_message,
+    transparent_outpoint_spend_status_entry_message,
+};
 
 #[test]
 fn chain_epoch_round_trips_through_prost() -> eyre::Result<()> {
@@ -1105,6 +1110,111 @@ fn transparent_spend_round_trips_through_prost() -> eyre::Result<()> {
 }
 
 #[test]
+fn transparent_outpoint_spend_status_request_round_trips_outpoints_and_pin() -> eyre::Result<()> {
+    let outpoints = [
+        TransparentOutPoint::new(TransactionId::from_bytes([0x11; 32]), 0),
+        TransparentOutPoint::new(TransactionId::from_bytes([0x22; 32]), 7),
+    ];
+    let request = wallet::TransparentOutpointSpendStatusRequest {
+        outpoints: outpoints.iter().map(outpoint_message).collect(),
+        at_epoch_id: Some(42),
+    };
+
+    let decoded = round_trip(&request)?;
+
+    assert_eq!(decoded, request);
+    assert_eq!(decoded.at_epoch_id, Some(42));
+    let decoded_outpoints = decoded
+        .outpoints
+        .iter()
+        .map(|outpoint| {
+            zinder_proto::wire::outpoint_from_message("outpoints.transaction_id", outpoint)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(decoded_outpoints, outpoints);
+    Ok(())
+}
+
+#[test]
+fn transparent_outpoint_spend_status_response_round_trips_every_status() -> eyre::Result<()> {
+    let spent_by = TransparentOutpointSpendStatus::SpentBy {
+        transaction_id: TransactionId::from_bytes([0xAB; 32]),
+        input_index: 2,
+        block: BlockId::new(BlockHeight::new(808), BlockHash::from_bytes([0xCD; 32])),
+    };
+    let entries = [
+        (
+            TransparentOutPoint::new(TransactionId::from_bytes([0x01; 32]), 0),
+            TransparentOutpointSpendStatus::Unspent,
+        ),
+        (
+            TransparentOutPoint::new(TransactionId::from_bytes([0x02; 32]), 1),
+            spent_by,
+        ),
+        (
+            TransparentOutPoint::new(TransactionId::from_bytes([0x03; 32]), 2),
+            TransparentOutpointSpendStatus::NotFound,
+        ),
+    ];
+    let response = wallet::TransparentOutpointSpendStatusResponse {
+        chain_view: Some(synthetic_chain_view()),
+        entries: entries
+            .iter()
+            .map(|(outpoint, status)| {
+                transparent_outpoint_spend_status_entry_message(outpoint, *status)
+            })
+            .collect(),
+    };
+
+    let decoded = round_trip(&response)?;
+
+    assert_eq!(decoded, response);
+    let decoded_entries = decoded
+        .entries
+        .iter()
+        .map(transparent_outpoint_spend_status_entry_from_message)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(decoded_entries, entries);
+    let spent_message = decoded
+        .entries
+        .get(1)
+        .and_then(|entry| entry.status.as_ref())
+        .ok_or_else(|| eyre!("decoded response is missing the spent entry"))?;
+    let wallet::transparent_outpoint_spend_status_entry::Status::SpentBy(spent_message) =
+        spent_message
+    else {
+        return Err(eyre!("second entry must decode as spent_by"));
+    };
+    assert_eq!(spent_message.spending_transaction_id, "ab".repeat(32));
+    assert_eq!(
+        spent_message
+            .block
+            .as_ref()
+            .map(|block| block.block_hash.as_str()),
+        Some("cd".repeat(32).as_str())
+    );
+    Ok(())
+}
+
+#[test]
+fn transparent_outpoint_spend_status_entry_requires_a_status() {
+    let entry = wallet::TransparentOutpointSpendStatusEntry {
+        outpoint: Some(outpoint_message(&TransparentOutPoint::new(
+            TransactionId::from_bytes([0x01; 32]),
+            0,
+        ))),
+        status: None,
+    };
+
+    assert_eq!(
+        transparent_outpoint_spend_status_entry_from_message(&entry),
+        Err(WalletWireDecodeError::MissingField {
+            field: "entries.status",
+        })
+    );
+}
+
+#[test]
 fn transparent_address_tx_ids_request_ignores_the_retired_descending_flag() -> eyre::Result<()> {
     let request = wallet::TransparentAddressTxIdsInRangeRequest {
         address: Some(wallet::AddressLookup {
@@ -1349,6 +1459,11 @@ fn transaction_lookup_reasons_round_trip_by_name_and_scalar() -> eyre::Result<()
             ops::ErrorReason::CanonicalHistoryUnavailable,
             "CANONICAL_HISTORY_UNAVAILABLE",
             52,
+        ),
+        (
+            ops::ErrorReason::TransparentOutpointCountOutOfRange,
+            "TRANSPARENT_OUTPOINT_COUNT_OUT_OF_RANGE",
+            53,
         ),
     ] {
         assert_eq!(reason.as_str_name(), name);

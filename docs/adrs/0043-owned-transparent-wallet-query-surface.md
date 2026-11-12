@@ -36,8 +36,8 @@ Zinder, so the cleanup is a coordinated breaking change without aliases.
 ## Decision
 
 The native transparent surface keeps only methods and capabilities that a
-named packaged consumer calls. Ownership comes from the consumer's code, not
-from the protocol, the registry, or a planned feature. Unowned methods are
+named consumer calls or defines as its chain contract. Ownership comes from the
+consumer's code, not from the protocol, the registry, or a planned feature. Unowned methods are
 removed together with their capability strings, typed client methods,
 adapter branches, domain types, storage representations, tests, and
 documentation.
@@ -48,6 +48,10 @@ The audit read the current consumer sources at these revisions:
 
 - Zallet (`zcash/zallet`) branch `feat/zinder-p2a-current` at `a28790a`, the
   current native Zinder backend.
+- Zallet `main` at `27f93fd`, which defines the chain contract every Zallet
+  backend implements, and Zallet's earlier Zinder backend, branch
+  `feat/zinder-chain-backend` at feature commit `0674c47`.
+- librustzcash (`zcash/librustzcash`) at `262d949`.
 - Zally at `4eaa0bb`.
 - Zpay at `94828c7`. Zpay reaches Zinder through `zinder-client` directly and
   through the `zally-chain` Zinder source.
@@ -64,8 +68,7 @@ The audit read the current consumer sources at these revisions:
 | `descending` request mode | No consumer requests newest-first history. Zallet sets `descending: false` at `backends/zinder/src/chain.rs:764`. The release query rejected `true`. | None | Removed; field 6 is reserved |
 | `TransparentAddressBalance`, `wallet.address.transparent_balance_v1` | No native consumer. The release query never advertised it. The ZODL path calls the in-process domain method at `services/zinder-compat-lightwalletd/src/grpc.rs:419` for `GetTaddressBalance`. | Wallet projection balance rows, in process | Native RPC, capability, and client method removed; the domain method stays for the compatibility adapter |
 | `TransparentOutputsByOutpoint`, `wallet.read.transparent_outputs_by_outpoint_v1` | No consumer. Zpay ADR-0007 planned it, and Zpay ADR-0015 replaced that plan with `transaction_by_id` (`crates/zpay-runtime/src/zinder_fetcher.rs:26`). | None; the release query returned a stub | Removed |
-| `TransparentSpendsByOutpoint`, `wallet.read.transparent_spends_by_outpoint_v1` | No consumer | None; the release query returned a stub | Removed |
-| `TransparentUnspentOutputsByOutpoint`, `wallet.read.transparent_unspent_outputs_by_outpoint_v1` | No consumer | None; the release query returned a stub | Removed |
+| `TransparentOutpointSpendStatus`, `wallet.read.transparent_outpoint_spend_status_v1` | Zallet's `spend-index` chain contract: `ChainView::outpoint_spend_status` and `SpendStatus` (`zallet-core/src/components/chain.rs:654-664`, `:823-834` at `27f93fd`), driven by librustzcash `GetSpendingTx` requests (`zallet-core/src/components/sync.rs:1369-1397`). Zallet's Zebra backend enables `spend-index` by default (`backends/zebra/Cargo.toml:62`). Zallet's earlier Zinder backend required and called the two outpoint RPCs this method replaces (`0674c47` `backends/zinder/src/chain.rs:63-64`, `:995-1034`). librustzcash defines `TransactionDataRequest::GetSpendingTx` for this lookup (`262d949` `zcash_client_backend/src/data_api.rs:1397-1419`). | Wallet projection `transparent_unspent_output` and `transparent_spent_output` families in the admitted `WalletServingReadPair` | Added as one batch RPC. It replaces `TransparentSpendsByOutpoint` (`wallet.read.transparent_spends_by_outpoint_v1`) and `TransparentUnspentOutputsByOutpoint` (`wallet.read.transparent_unspent_outputs_by_outpoint_v1`), whose release stubs never served a caller and are removed |
 | `TransparentUtxoSetSummary`, `wallet.read.transparent_utxo_set_summary_v1`, `wallet.read.transparent_utxo_set_commitment_v1` | Only `ExplorerQuery.UtxoSetSummary` called it, and no release query served it. No Cipherscan route reads `UtxoSetSummary`. | None; the release query returned a stub | Removed, together with `ExplorerQuery.UtxoSetSummary`, `explorer.utxo_set.summary_v1`, and `explorer.utxo_set.commitment_v1` |
 | `TransparentMempoolOutputsByAddress`, `wallet.mempool.transparent_outputs_by_address_v1` | No consumer. Zallet follows the mempool through `MempoolSnapshot` and `MempoolEvents` (`backends/zinder/src/lib.rs:37-38`). | Writer mempool index through `IngestControl` | Removed, with the matching `IngestControl` method |
 | `TransparentMempoolSpendsByOutpoint`, `wallet.mempool.transparent_spends_by_outpoint_v1` | No consumer | Writer mempool index through `IngestControl` | Removed, with the matching `IngestControl` method |
@@ -73,15 +76,36 @@ The audit read the current consumer sources at these revisions:
 
 `ChainValuePoolsAtTip` is not a transparent read and is outside this decision.
 
-### Durable reverse-spend resolution
+### Spend resolution
 
-Durable spender identity is not a wallet-query capability. No wallet consumer
-asks where a transparent output was spent. The only reader of the
-`transparent_outpoint_spend` consumer is `ExplorerQuery.TransactionDetail`
-(`explorer.transaction.detail_v4`). It reads the consumer at
-`services/zinder-explorer/src/grpc/transaction_detail.rs:323` to fill
-`TransparentOutput.spent_by`. Cipherscan reaches that response through the
-adapter route `/api/tx/{transaction_id}` at
+Wallets and the Explorer resolve spends from different readers.
+`WalletQuery.TransparentOutpointSpendStatus` answers wallet spend status from
+the wallet projection: spentness from its `transparent_unspent_output` family
+and the spender from its `transparent_spent_output` family. Each request reads
+both families from one `WalletServingReadPair`, whose wallet reader is frozen
+at the same source as its canonical epoch. A pin to any other epoch fails with
+`CHAIN_EPOCH_PIN_UNAVAILABLE`, so the two families are never read at different
+epochs. A spent row carries its spending input, so the method never reports a
+spent output without its spender, a state Zallet's contract still models as
+`SpentSpenderUnknown` for other backends. Wallet serving therefore needs no
+Explorer view and no new storage.
+
+One batch method replaces the two removed outpoint methods. Zallet's earlier
+backend called both for each outpoint, an unspent probe and then a spender
+lookup, which cost two round trips and two capabilities for one question.
+The batch request carries 1 to 1,024 outpoints and returns one entry per
+outpoint in request order, each `unspent`, `spent_by`, or `not_found`.
+`zinder-client` splits longer slices at one pinned epoch, so callers never
+meet the cap. A per-outpoint lookup also keeps the wallet's addresses private,
+which the address-scan fallback in Zallet's current Zinder backend does not
+(`a28790a` `backends/zinder/src/chain.rs:609`).
+
+The `transparent_outpoint_spend` materialized-view consumer stays the Explorer
+source for `TransactionDetail.spent_by`. Its only reader is
+`ExplorerQuery.TransactionDetail` (`explorer.transaction.detail_v4`). It reads
+the consumer at `services/zinder-explorer/src/grpc/transaction_detail.rs:323`
+to fill `TransparentOutput.spent_by`. Cipherscan reaches that response through
+the adapter route `/api/tx/{transaction_id}` at
 `services/zinder-compat-cipherscan/src/lib.rs:3211`.
 
 The consumer therefore stays as an Explorer view. ADR-0029 keeps its authority,
@@ -134,7 +158,8 @@ contract in place, so `zinder_proto::CONTRACT_REVISION` is 7.
 | `WalletQuery.TransparentAddressBalance`, `ChainIndex::transparent_address_balance`, `Capability::TransparentAddressBalance` | None on the native endpoint. Lightwalletd clients keep `GetTaddressBalance` and `GetTaddressBalanceStream`. |
 | `TransparentAddressBalance.unconfirmed_delta_zat`, `TransparentAddressBalance::projected_total_zat`, `TransparentAddressBalance::empty` | None. The domain balance is the canonical confirmed total. |
 | `TransparentAddressTxIdsInRangeRequest.descending`, `TransparentAddressTxIdsQuery::descending` | None. History is ascending; omit the field. |
-| `WalletQuery.TransparentOutputsByOutpoint`, `TransparentSpendsByOutpoint`, `TransparentUnspentOutputsByOutpoint`, and their `ChainIndex`, `ChainSnapshot`, and `OwnedChainSnapshot` methods | None. `ExplorerQuery.TransactionDetail` reports transparent inputs, outputs, and canonical spenders for one transaction. |
+| `WalletQuery.TransparentOutputsByOutpoint` and its `ChainIndex`, `ChainSnapshot`, and `OwnedChainSnapshot` methods | None. Wallets fetch the whole transaction through `Transaction`; `ExplorerQuery.TransactionDetail` reports transparent inputs, outputs, and canonical spenders for one transaction. |
+| `WalletQuery.TransparentSpendsByOutpoint`, `TransparentUnspentOutputsByOutpoint`, their capabilities, and their `ChainIndex`, `ChainSnapshot`, and `OwnedChainSnapshot` methods | `WalletQuery.TransparentOutpointSpendStatus` (`wallet.read.transparent_outpoint_spend_status_v1`) and `ChainSnapshot::transparent_outpoint_spend_status`, which return `Unspent`, `SpentBy { transaction_id, input_index, block }`, or `NotFound` for each outpoint in one call. |
 | `WalletQuery.TransparentMempoolOutputsByAddress`, `TransparentMempoolSpendsByOutpoint`, `TransparentMempoolOutputsByOutpoint`, the matching `EndpointBackedIndex` methods, and `TransparentMempoolOutputsRequest` | `MempoolSnapshot` and `MempoolEvents`. Every `MempoolEntry` carries its `transparent_outputs` and `transparent_spends`. |
 | `IngestControl.TransparentMempoolOutputsByAddress`, `TransparentMempoolSpendsByOutpoint`, `TransparentMempoolOutputsByOutpoint` | None. The wallet-query admission set shrinks from seven control methods to five. |
 | `WalletQuery.TransparentUtxoSetSummary`, `ExplorerQuery.UtxoSetSummary`, `TransparentUtxoSetSummaryView`, `zinder_core::TransparentUtxoSetSummary`, the UTXO-set commitment wire messages | None. The wallet projection keeps its internal `LtHash16` summary as construction evidence (ADR-0026). |
@@ -145,7 +170,7 @@ contract in place, so `zinder_proto::CONTRACT_REVISION` is 7.
 | `ops.ServerInfo.materialized_view_preset` and `materialized_view_identities`, `zinder_client::ServerInfo` fields of the same names, `WalletEndpointMetadata::materialized_view_preset` | `ExplorerServerInfo.materialized_view_identities` on Explorer endpoints; nothing on wallet endpoints |
 | `ReadinessReport.materialized_view_preset`, `Readiness::set_materialized_view_workload` | `Readiness::set_materialized_view_identities`; the identities field remains |
 | `zinder_materialized_view_workload_info` metric and the `preset` label | `zinder_materialized_view_identity_info{identity}` |
-| `MAX_TRANSPARENT_OUTPUTS_PER_REQUEST` | None |
+| `MAX_TRANSPARENT_OUTPUTS_PER_REQUEST` | `MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST` bounds one `TransparentOutpointSpendStatus` request; the client splits longer slices itself. |
 
 ## Consequences
 

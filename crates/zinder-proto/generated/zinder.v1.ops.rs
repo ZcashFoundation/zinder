@@ -419,6 +419,10 @@ pub enum ErrorReason {
     /// metadata carries `first_available_height`. Waiting never clears it;
     /// query a store with complete history.
     CanonicalHistoryUnavailable = 52,
+    /// INVALID_ARGUMENT family.
+    /// A `WalletQuery.TransparentOutpointSpendStatus` request carried no
+    /// outpoints or more than the 1,024-outpoint per-request cap.
+    TransparentOutpointCountOutOfRange = 53,
 }
 impl ErrorReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -479,6 +483,9 @@ impl ErrorReason {
             Self::ServiceNotReady => "SERVICE_NOT_READY",
             Self::TransactionNotFound => "TRANSACTION_NOT_FOUND",
             Self::CanonicalHistoryUnavailable => "CANONICAL_HISTORY_UNAVAILABLE",
+            Self::TransparentOutpointCountOutOfRange => {
+                "TRANSPARENT_OUTPOINT_COUNT_OUT_OF_RANGE"
+            }
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -542,6 +549,9 @@ impl ErrorReason {
             "SERVICE_NOT_READY" => Some(Self::ServiceNotReady),
             "TRANSACTION_NOT_FOUND" => Some(Self::TransactionNotFound),
             "CANONICAL_HISTORY_UNAVAILABLE" => Some(Self::CanonicalHistoryUnavailable),
+            "TRANSPARENT_OUTPOINT_COUNT_OUT_OF_RANGE" => {
+                Some(Self::TransparentOutpointCountOutOfRange)
+            }
             _ => None,
         }
     }

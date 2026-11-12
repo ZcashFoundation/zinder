@@ -13,11 +13,13 @@ use zinder_core::{
     BroadcastUnknown, ChainEpoch, ChainEpochId, CompactBlockArtifact, MinedTransactionChainContext,
     Network, RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootRange,
     TransactionBroadcastOutcome, TransactionId, TransactionLocation, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentUnspentOutput, TxStatus,
+    TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentUnspentOutput, TxStatus,
     wire::{encode_rpc_block_hash_hex, encode_rpc_merkle_root_hex, encode_rpc_transaction_id_hex},
 };
 use zinder_proto::v1::{ops, wallet};
-use zinder_proto::wire::{compact_block_message, mempool_entry_message};
+use zinder_proto::wire::{
+    compact_block_message, mempool_entry_message, transparent_outpoint_spend_status_entry_message,
+};
 use zinder_source::transparent_address_matches_network;
 
 use crate::{
@@ -321,6 +323,28 @@ pub async fn transparent_address_unspent_outputs_response<Q: WalletQueryApi + ?S
     query_api
         .transparent_address_unspent_outputs(request, at_epoch_id)
         .await
+}
+
+/// Reads the spend status of `outpoints` at one chain epoch and encodes one
+/// response entry per requested outpoint, in request order.
+pub async fn transparent_outpoint_spend_status_response<Q: WalletQueryApi + ?Sized>(
+    query_api: &Q,
+    outpoints: Vec<TransparentOutPoint>,
+    at_epoch_id: Option<ChainEpochId>,
+) -> Result<wallet::TransparentOutpointSpendStatusResponse, QueryError> {
+    let response = query_api
+        .transparent_outpoint_spend_status(outpoints.clone(), at_epoch_id)
+        .await?;
+    Ok(wallet::TransparentOutpointSpendStatusResponse {
+        chain_view: Some(build_chain_view_message(response.chain_epoch)),
+        entries: outpoints
+            .iter()
+            .zip(response.statuses)
+            .map(|(outpoint, status)| {
+                transparent_outpoint_spend_status_entry_message(outpoint, status)
+            })
+            .collect(),
+    })
 }
 
 /// Resolves a `wallet::AddressLookup` oneof to the typed

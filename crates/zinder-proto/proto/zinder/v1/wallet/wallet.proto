@@ -1279,6 +1279,74 @@ message TransparentUnspentOutputsChunk {
   }
 }
 
+// Request for the spend status of a batch of transparent outpoints at one
+// chain epoch.
+message TransparentOutpointSpendStatusRequest {
+  // Outpoints to classify. The response repeats them in this order. A request
+  // carries 1 to 1024 outpoints; the server rejects any other count with
+  // `INVALID_ARGUMENT` and `TRANSPARENT_OUTPOINT_COUNT_OUT_OF_RANGE`.
+  // Duplicate outpoints are answered once per occurrence.
+  repeated OutPoint outpoints = 1;
+
+  // Optional chain-epoch id that pins the read to a specific `ChainEpoch`.
+  // Absent resolves against the live visible tip.
+  optional uint64 at_epoch_id = 2;
+}
+
+// Spend status of every requested outpoint, read at one chain epoch.
+message TransparentOutpointSpendStatusResponse {
+  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  // Every entry was read at `chain_view.chain_epoch`.
+  ChainView chain_view = 1;
+
+  // One entry per requested outpoint, in request order.
+  repeated TransparentOutpointSpendStatusEntry entries = 2;
+}
+
+// Spend status of one requested outpoint.
+//
+// The status covers mined transactions from height 1 through the epoch's
+// visible tip. A spend that is only in the mempool leaves the output
+// `unspent`; `MempoolSnapshot` and `MempoolEvents` carry pending spends.
+message TransparentOutpointSpendStatusEntry {
+  // Requested outpoint.
+  OutPoint outpoint = 1;
+
+  oneof status {
+    // A mined transaction created the output and no mined transaction
+    // spends it.
+    TransparentOutpointUnspent unspent = 2;
+
+    // A mined transaction spends the output.
+    TransparentOutpointSpentBy spent_by = 3;
+
+    // No mined transaction created an output at this outpoint.
+    TransparentOutpointNotFound not_found = 4;
+  }
+}
+
+// Marker for an outpoint that is unspent at the response epoch.
+message TransparentOutpointUnspent {}
+
+// Mined spend of a transparent outpoint.
+message TransparentOutpointSpentBy {
+  // Transaction id in RPC byte order (64 lowercase hex characters) of the
+  // transaction that spends the outpoint.
+  // Reference: Zcash protocol spec term `\rpcByteOrder`.
+  string spending_transaction_id = 1;
+
+  // Transparent input index of the spend within the spending transaction.
+  uint32 input_index = 2;
+
+  // Block that mined the spending transaction.
+  BlockId block = 3;
+}
+
+// Marker for an outpoint that no mined transaction created at the response
+// epoch, including the coinbase input sentinel and the unspendable genesis
+// coinbase output.
+message TransparentOutpointNotFound {}
+
 // One upstream `getblockchaininfo.valuePools` entry.
 message ChainValuePool {
   // Stable upstream pool identifier, such as "transparent", "sapling",
@@ -1455,6 +1523,13 @@ service WalletQuery {
   // height range, in ascending mined order.
   rpc TransparentAddressTxIdsInRange(TransparentAddressTxIdsInRangeRequest)
       returns (stream TransparentAddressTxIdsChunk);
+
+  // Return whether each transparent outpoint is unspent, spent (with the
+  // spending transaction, input index, and block), or unknown, all read at
+  // one chain epoch. Capability:
+  // `wallet.read.transparent_outpoint_spend_status_v1`.
+  rpc TransparentOutpointSpendStatus(TransparentOutpointSpendStatusRequest)
+      returns (TransparentOutpointSpendStatusResponse);
 
   // Return chain-wide value-pool totals at the upstream node's current tip.
   // The response binds the source snapshot to the upstream tip's height and

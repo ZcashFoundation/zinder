@@ -21,7 +21,7 @@ use zinder_proto::{
         ops::ErrorReason,
         wallet::{self, wallet_query_server},
     },
-    wire::TransactionAbsence,
+    wire::{TransactionAbsence, outpoint_from_message},
 };
 use zinder_runtime::{AuthenticatedChannel, Readiness};
 
@@ -48,8 +48,8 @@ use super::native::{
     build_wallet_server_info, chain_value_pools_at_tip_response, compact_block_response,
     compact_blocks_in_range_chunks, full_block_response, latest_tree_state_checkpoint_response,
     network_upgrade_activations_response, settled_tip_block_response, subtree_roots_response,
-    transaction_response, transparent_address_unspent_outputs_response, tree_state_at_response,
-    visible_tip_block_response,
+    transaction_response, transparent_address_unspent_outputs_response,
+    transparent_outpoint_spend_status_response, tree_state_at_response, visible_tip_block_response,
 };
 use super::status_from_query_error;
 
@@ -674,6 +674,30 @@ where
             });
         let chunks = stream::once(header).chain(stream::iter(items));
         Ok(Response::new(Box::pin(chunks)))
+    }
+
+    async fn transparent_outpoint_spend_status(
+        &self,
+        request: Request<wallet::TransparentOutpointSpendStatusRequest>,
+    ) -> Result<Response<wallet::TransparentOutpointSpendStatusResponse>, Status> {
+        self.require_endpoint_capability(
+            capabilities::WALLET_READ_TRANSPARENT_OUTPOINT_SPEND_STATUS_V1,
+        )?;
+        let request = request.into_inner();
+        let outpoints = request
+            .outpoints
+            .iter()
+            .map(|outpoint| outpoint_from_message("outpoints.transaction_id", outpoint))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        transparent_outpoint_spend_status_response(
+            &self.query_api,
+            outpoints,
+            chain_epoch_id_from_request(request.at_epoch_id),
+        )
+        .await
+        .map(Response::new)
+        .map_err(|error| status_from_query_error(&error))
     }
 
     async fn server_info(

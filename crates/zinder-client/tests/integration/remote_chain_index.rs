@@ -23,12 +23,14 @@ use tonic::{
     transport::Server,
 };
 use zinder_client::{
-    BlockHeight, BlockHeightRange, Capability, CapabilityDescriptor, ChainEvent, ChainIndex,
-    ConsensusBranchId, EndpointBackedIndex, EventStreamStart, IndexerError, Network,
-    NetworkUpgradeActivation, OwnedChainSnapshot, RemoteChainIndex, RemoteOpenOptions, RetryPolicy,
-    TransactionId, TransparentAddressScriptHash, TransparentAddressTxIdsQuery, TransparentOutPoint,
+    BlockHeight, BlockHeightRange, BlockId, Capability, CapabilityDescriptor, ChainEvent,
+    ChainIndex, ConsensusBranchId, EndpointBackedIndex, EventStreamStart, IndexerError,
+    MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST, Network, NetworkUpgradeActivation, OwnedChainSnapshot,
+    RemoteChainIndex, RemoteOpenOptions, RetryPolicy, TransactionId, TransparentAddressScriptHash,
+    TransparentAddressTxIdsQuery, TransparentOutPoint, TransparentOutpointSpendStatus,
     TransparentUnspentOutput,
 };
+use zinder_core::TransparentSpendFact;
 use zinder_proto::v1::wallet;
 use zinder_query::{
     AdmittedIngestControl, WalletEndpointMetadata, WalletQueryApi, WalletQueryGrpcAdapter,
@@ -395,6 +397,153 @@ async fn serving_pair_address_indexes_are_epoch_bound_ascending_and_cursor_resum
         Some(Err(zinder_client::IndexerError::ChainEpochPinUnavailable))
     ));
 
+    Ok(())
+}
+
+/// Zallet's `spend-index` backend asks one outpoint at a time from a
+/// captured snapshot (`ChainView::outpoint_spend_status`); batch callers may
+/// pass more outpoints than one request carries.
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one server lifecycle covers the snapshot call, request splitting, empty input, and pin refusal"
+)]
+async fn outpoint_spend_status_splits_large_batches_at_one_snapshot_epoch() -> eyre::Result<()> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let chain_fixture = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+    let block_one = chain_fixture
+        .block_at(BlockHeight::new(1))
+        .cloned()
+        .ok_or_else(|| eyre!("fixture must contain height 1"))?;
+    let block_two = chain_fixture
+        .block_at(BlockHeight::new(2))
+        .cloned()
+        .ok_or_else(|| eyre!("fixture must contain height 2"))?;
+    let address_script_hash = TransparentAddressScriptHash::from_bytes([0x61; 32]);
+    let creator = TransactionId::from_bytes([0x62; 32]);
+    let spender = TransactionId::from_bytes([0x63; 32]);
+    let unspent = TransparentOutPoint::new(creator, 0);
+    let spent = TransparentOutPoint::new(creator, 1);
+    let chain_fixture = [unspent, spent]
+        .into_iter()
+        .fold(chain_fixture, |chain, outpoint| {
+            chain.with_address_output_index(TransparentUnspentOutput::new(
+                address_script_hash,
+                vec![0x61],
+                outpoint,
+                5_000,
+                block_one.height,
+                block_one.hash,
+            ))
+        })
+        .with_transparent_spend_fact(TransparentSpendFact::new(
+            spent,
+            0,
+            spender,
+            0,
+            block_two.height,
+            block_two.hash,
+            5_000,
+            address_script_hash,
+            block_one.height,
+            block_one.hash,
+        ));
+    let mut store_fixture =
+        WalletServingStoreFixture::from_chain(&chain_fixture, activations.as_ref())?;
+    let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
+    let serving_pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(canonical_reader),
+        Arc::new(wallet_reader),
+    )?);
+    let ingest_control_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+    let admitted_ingest_control = AdmittedIngestControl::connect(
+        ingest_control_fixture.endpoint(),
+        None,
+        Network::ZcashRegtest,
+    )
+    .await?;
+    let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
+        WalletServingPairSlot::new(serving_pair),
+        (),
+        admitted_ingest_control,
+        activations,
+    );
+    let endpoint = spawn_wallet_query(WalletQueryGrpcAdapter::new(
+        wallet_query,
+        WalletEndpointMetadata::default(),
+    ))
+    .await?;
+    let chain_index = Arc::new(RemoteChainIndex::connect(RemoteOpenOptions {
+        endpoint,
+        network: Network::ZcashRegtest,
+    })?);
+    assert!(
+        chain_index
+            .server_info()
+            .await?
+            .supports(Capability::TransparentOutpointSpendStatus)
+    );
+    let snapshot = OwnedChainSnapshot::capture(Arc::clone(&chain_index)).await?;
+    let spent_by = TransparentOutpointSpendStatus::SpentBy {
+        transaction_id: spender,
+        input_index: 0,
+        block: BlockId::new(block_two.height, block_two.hash),
+    };
+
+    let single = snapshot.transparent_outpoint_spend_status(&[spent]).await?;
+    assert_eq!(single.chain_epoch, snapshot.chain_epoch());
+    assert_eq!(single.statuses, vec![spent_by]);
+
+    // The server rejects more than one request's worth of outpoints, so a
+    // successful oversized call proves the client split it. The known
+    // outpoints sit at both edges of the first request boundary.
+    let never_created = TransparentOutPoint::new(TransactionId::from_bytes([0x64; 32]), 0);
+    let batch_len = MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST * 2 + 3;
+    let mut outpoints = vec![never_created; batch_len];
+    let boundary = MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST;
+    outpoints[0] = spent;
+    outpoints[boundary - 1] = unspent;
+    outpoints[boundary] = spent;
+    outpoints[batch_len - 1] = unspent;
+    let split = snapshot
+        .transparent_outpoint_spend_status(&outpoints)
+        .await?;
+    assert_eq!(split.chain_epoch, snapshot.chain_epoch());
+    assert_eq!(split.statuses.len(), batch_len);
+    for (position, status) in split.statuses.iter().enumerate() {
+        let expected = match position {
+            0 => spent_by,
+            position if position == boundary => spent_by,
+            position if position == boundary - 1 || position == batch_len - 1 => {
+                TransparentOutpointSpendStatus::Unspent
+            }
+            _ => TransparentOutpointSpendStatus::NotFound,
+        };
+        assert_eq!(*status, expected, "status at position {position}");
+    }
+    let unpinned = chain_index
+        .transparent_outpoint_spend_status(&outpoints, None)
+        .await?;
+    assert_eq!(unpinned, split);
+
+    let empty = snapshot.transparent_outpoint_spend_status(&[]).await?;
+    assert_eq!(empty.chain_epoch, snapshot.chain_epoch());
+    assert!(empty.statuses.is_empty());
+    assert!(matches!(
+        chain_index
+            .transparent_outpoint_spend_status(&[], None)
+            .await,
+        Err(IndexerError::InvalidRequest { .. })
+    ));
+
+    let retired_epoch = zinder_client::ChainEpochId::new(snapshot.chain_epoch().id.value() + 1);
+    let refused = chain_index
+        .transparent_outpoint_spend_status(&[unspent], Some(retired_epoch))
+        .await;
+    assert!(matches!(
+        refused,
+        Err(IndexerError::ChainEpochPinUnavailable)
+    ));
     Ok(())
 }
 

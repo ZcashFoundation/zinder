@@ -448,6 +448,7 @@ const fn retry_policy_for_remote(reason: &ErrorReason, code: Code) -> RetryPolic
         | ErrorReason::ArtifactPayloadTooLarge
         | ErrorReason::InvalidChainEpochArtifacts
         | ErrorReason::TransparentBalanceAddressCountExceeded
+        | ErrorReason::TransparentOutpointCountOutOfRange
         | ErrorReason::SnapshotPageCursorInvalid
         | ErrorReason::BroadcastTransactionTooLarge => RetryPolicy::ClientError,
         ErrorReason::BroadcastDisabled

@@ -9,8 +9,8 @@ use zinder_proto::capabilities::{
     WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1, WALLET_READ_SERVER_INFO_V2,
     WALLET_READ_SETTLED_TIP_BLOCK_V1, WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1,
     WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1, WALLET_READ_TRANSACTION_BY_ID_V2,
-    WALLET_READ_TREE_STATE_AT_HEIGHT_V2, WALLET_READ_VISIBLE_TIP_BLOCK_V1,
-    WALLET_SNAPSHOT_MEMPOOL_V3,
+    WALLET_READ_TRANSPARENT_OUTPOINT_SPEND_STATUS_V1, WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
+    WALLET_READ_VISIBLE_TIP_BLOCK_V1, WALLET_SNAPSHOT_MEMPOOL_V3,
 };
 
 /// A wallet-plane capability advertised by a Zinder endpoint.
@@ -47,6 +47,8 @@ pub enum Capability {
     TransparentAddressUnspentOutputs,
     /// Ascending transparent-address transaction history.
     TransparentAddressHistory,
+    /// Unspent, spent, or not-found status of transparent outpoints.
+    TransparentOutpointSpendStatus,
     /// Cursor-resumable chain-event stream.
     ChainEvents,
     /// Tip-certified bounded mempool snapshot.
@@ -83,6 +85,9 @@ impl Capability {
             Self::Transaction => WALLET_READ_TRANSACTION_BY_ID_V2,
             Self::TransparentAddressUnspentOutputs => WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
             Self::TransparentAddressHistory => WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
+            Self::TransparentOutpointSpendStatus => {
+                WALLET_READ_TRANSPARENT_OUTPOINT_SPEND_STATUS_V1
+            }
             Self::ChainEvents => WALLET_EVENTS_CHAIN_V1,
             Self::MempoolSnapshot => WALLET_SNAPSHOT_MEMPOOL_V3,
             Self::MempoolEvents => WALLET_EVENTS_MEMPOOL_V2,
@@ -109,6 +114,9 @@ impl Capability {
             WALLET_READ_TRANSACTION_BY_ID_V2 => Self::Transaction,
             WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1 => Self::TransparentAddressUnspentOutputs,
             WALLET_ADDRESS_TRANSPARENT_HISTORY_V1 => Self::TransparentAddressHistory,
+            WALLET_READ_TRANSPARENT_OUTPOINT_SPEND_STATUS_V1 => {
+                Self::TransparentOutpointSpendStatus
+            }
             WALLET_EVENTS_CHAIN_V1 => Self::ChainEvents,
             WALLET_SNAPSHOT_MEMPOOL_V3 => Self::MempoolSnapshot,
             WALLET_EVENTS_MEMPOOL_V2 => Self::MempoolEvents,

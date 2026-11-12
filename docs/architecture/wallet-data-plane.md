@@ -579,6 +579,55 @@ fails with `FAILED_PRECONDITION` instead of combining rows from two sources.
 The full projection path is the canonical worked example in
 [Extending artifacts §A worked example: transparent address transaction history](extending-artifacts.md#a-worked-example-transparent-address-transaction-history).
 
+## Transparent Outpoint Spend Status
+
+`WalletQuery.TransparentOutpointSpendStatus` answers, for each requested
+transparent outpoint, whether a mined transaction spends it. A wallet uses it
+to resolve the spend of an output it already tracks without scanning the
+output's address history, which also keeps the wallet's addresses private.
+Zallet's `spend-index` chain contract (`ChainView::outpoint_spend_status`) and
+librustzcash's `TransactionDataRequest::GetSpendingTx` are the consumers; see
+[ADR-0043](../adrs/0043-owned-transparent-wallet-query-surface.md).
+
+The request carries 1 to 1,024 outpoints and the standard
+`optional uint64 at_epoch_id`. The response carries the `ChainView` it was
+read at and one `TransparentOutpointSpendStatusEntry` per requested outpoint,
+in request order and including duplicates. Each entry's `status` oneof is one
+of:
+
+| Status | Meaning |
+| --- | --- |
+| `unspent` | A mined transaction created the output, and no mined transaction spends it. |
+| `spent_by` | A mined transaction spends the output. The entry names the `spending_transaction_id`, the `input_index` within it, and the `block` that mined it. |
+| `not_found` | No mined transaction created an output at this outpoint. This includes the coinbase input sentinel and the genesis coinbase output, which is unspendable and never indexed. |
+
+The status covers mined transactions from height 1 through the epoch's visible
+tip. A spend that is only in the mempool leaves the output `unspent`; pending
+spends arrive through `MempoolSnapshot` and `MempoolEvents` on each entry's
+`transparent_spends`. Zinder never reports a spent output without its spender,
+because the wallet projection stores the spending input in the same row that
+records the spend.
+
+The release query answers from the wallet projection's
+`transparent_unspent_output` and `transparent_spent_output` families. Each
+request captures one `WalletServingReadPair`. Its wallet reader is frozen at
+the same source identity as its canonical reader, so both families answer at
+the pair's epoch. A pin naming any other epoch fails with
+`FAILED_PRECONDITION` and `CHAIN_EPOCH_PIN_UNAVAILABLE`, as every other pinned
+wallet read does; the query never combines families from two epochs. The
+projector moves an output into the spent family in the transition that mines
+its spend and moves it back only when a reorg reverts that block, so an
+outpoint is in at most one family. The projection holds complete transparent
+history from height 1, which makes `not_found` a proven absence.
+
+A request with no outpoints or more than 1,024 fails with `INVALID_ARGUMENT`
+and `TRANSPARENT_OUTPOINT_COUNT_OUT_OF_RANGE` before any storage read.
+`zinder-client` hides the cap: `ChainSnapshot::transparent_outpoint_spend_status`
+and `ChainIndex::transparent_outpoint_spend_status` split a longer slice into
+requests of at most `MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST` outpoints and pin
+every later request to the first response's epoch. The release query
+advertises `wallet.read.transparent_outpoint_spend_status_v1`.
+
 ## Transparent Surface Ownership
 
 The native transparent surface contains only the methods a packaged consumer
@@ -590,12 +639,14 @@ mapping for removed methods.
 | --- | --- | --- | --- |
 | `TransparentAddressUnspentOutputs` | `wallet.address.transparent_unspent_outputs_v1` | Zallet, Zally, Zpay through Zally; ZODL through `GetAddressUtxos` in the compatibility runtime | Wallet projection unspent rows |
 | `TransparentAddressTxIdsInRange` | `wallet.address.transparent_history_v1` | Zallet; ZODL through `GetTaddressTxids` in the compatibility runtime | Wallet projection history rows |
+| `TransparentOutpointSpendStatus` | `wallet.read.transparent_outpoint_spend_status_v1` | Zallet `spend-index` contract; librustzcash `GetSpendingTx` | Wallet projection `transparent_unspent_output` and `transparent_spent_output` families |
 
-Prevout resolution, canonical and mempool spend lookups, unspent-by-outpoint
-probes, the UTXO-set summary, and the native transparent balance are not part
-of the protocol. Durable reverse-spend data exists only as the
-`transparent_outpoint_spend` Explorer view, which `ExplorerQuery.TransactionDetail`
-reads ([ADR-0029](../adrs/0029-durable-transparent-outpoint-spend-projection.md)).
+Prevout resolution, mempool spend lookups by outpoint, the UTXO-set summary,
+and the native transparent balance are not part of the protocol. Wallet spend
+status comes from the wallet projection. The `transparent_outpoint_spend`
+Explorer view stays the source of `TransactionDetail.spent_by` for
+`ExplorerQuery.TransactionDetail`
+([ADR-0029](../adrs/0029-durable-transparent-outpoint-spend-projection.md)).
 
 ## Chain Value Pools
 

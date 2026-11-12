@@ -72,6 +72,7 @@ fn assert_wallet_chain_index_methods_compile<T: ChainIndex>() {
     let _ = T::transaction_by_id;
     let _ = T::transparent_address_unspent_outputs;
     let _ = T::transparent_address_tx_ids_in_range;
+    let _ = T::transparent_outpoint_spend_status;
 }
 
 #[allow(
@@ -93,6 +94,7 @@ fn assert_chain_snapshot_methods_compile<T: ChainIndex>() {
     let _ = ChainSnapshot::<T>::subtree_roots_in_range;
     let _ = ChainSnapshot::<T>::transaction_by_id;
     let _ = ChainSnapshot::<T>::transparent_address_unspent_outputs;
+    let _ = ChainSnapshot::<T>::transparent_outpoint_spend_status;
 }
 
 #[allow(
@@ -115,6 +117,7 @@ fn assert_owned_chain_snapshot_methods_compile<T: ChainIndex>() {
     let _ = OwnedChainSnapshot::<T>::transaction_by_id;
     let _ = OwnedChainSnapshot::<T>::transparent_address_unspent_outputs;
     let _ = OwnedChainSnapshot::<T>::transparent_address_tx_ids_in_range;
+    let _ = OwnedChainSnapshot::<T>::transparent_outpoint_spend_status;
 }
 
 /// Compile-time existence check for the [`EndpointBackedIndex`] methods that
@@ -154,6 +157,7 @@ fn typed_capability_variants_match_table_strings() {
         Capability::FullBlockRange,
         Capability::BlockIdBySelector,
         Capability::NetworkUpgradeActivations,
+        Capability::TransparentOutpointSpendStatus,
     ] {
         assert!(
             advertised.contains(capability.as_str()),
@@ -286,6 +290,10 @@ fn typed_chain_index_covers_every_advertised_wallet_capability() {
         (
             WALLET_ADDRESS_TRANSPARENT_HISTORY_V1,
             "ChainIndex::transparent_address_tx_ids_in_range",
+        ),
+        (
+            WALLET_READ_TRANSPARENT_OUTPOINT_SPEND_STATUS_V1,
+            "ChainIndex::transparent_outpoint_spend_status",
         ),
     ];
     let covered: BTreeMap<_, _> = coverage_rows.into_iter().collect();

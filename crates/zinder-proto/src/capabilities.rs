@@ -115,6 +115,12 @@ pub const WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1: &str =
 ///
 /// The read is ascending only.
 pub const WALLET_ADDRESS_TRANSPARENT_HISTORY_V1: &str = "wallet.address.transparent_history_v1";
+/// Capability advertised for `WalletQuery.TransparentOutpointSpendStatus`.
+///
+/// Signals that the endpoint classifies each requested outpoint as unspent,
+/// spent by a named mined input, or not found, at one chain epoch.
+pub const WALLET_READ_TRANSPARENT_OUTPOINT_SPEND_STATUS_V1: &str =
+    "wallet.read.transparent_outpoint_spend_status_v1";
 /// Capability advertised for `ExplorerQuery.ServerInfo`.
 pub const EXPLORER_SERVER_INFO_V1: &str = "explorer.server_info_v1";
 /// Capability advertised for `ExplorerQuery.TransactionDetail`.
@@ -809,6 +815,12 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.TransparentAddressTxIdsInRange"),
         AdvertisePolicy::RequiresTransparentAddressHistory,
+    ),
+    CapabilitySpec::new(
+        WALLET_READ_TRANSPARENT_OUTPOINT_SPEND_STATUS_V1,
+        CapabilitySurface::Wallet,
+        Some("zinder.v1.wallet.WalletQuery.TransparentOutpointSpendStatus"),
+        AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
         EXPLORER_SERVER_INFO_V1,
