@@ -5,7 +5,7 @@
 
 //! Live regtest broadcast cycle.
 //!
-//! Signs a transparent v5 transaction inside Zinder, broadcasts it through
+//! Signs a transparent transaction inside Zinder, broadcasts it through
 //! Zebra's `sendrawtransaction`, and observes it back through the mempool
 //! source as `MempoolSourceEvent::Added`. The signer lives in
 //! `zinder-testkit` ([`TransparentTestKey`]); the broadcaster lives in
@@ -65,8 +65,8 @@ const MEMPOOL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 )]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
-async fn broadcasting_signed_transparent_v5_surfaces_through_polling_mempool_source() -> Result<()>
-{
+async fn broadcasting_signed_transparent_spend_surfaces_through_polling_mempool_source()
+-> Result<()> {
     let _guard = init();
     let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
         return Ok(());
@@ -128,7 +128,7 @@ async fn broadcasting_signed_transparent_v5_surfaces_through_polling_mempool_sou
             }
             _ => {
                 return Err(eyre!(
-                    "Zebra rejected the signed transparent v5 transaction: {broadcast_outcome:?}"
+                    "Zebra rejected the signed transparent transaction: {broadcast_outcome:?}"
                 ));
             }
         };
@@ -136,7 +136,7 @@ async fn broadcasting_signed_transparent_v5_surfaces_through_polling_mempool_sou
             target: "zinder::live",
             event = "broadcast_cycle_sendrawtransaction_accepted",
             broadcast_txid = %hex::encode(broadcast_txid.as_bytes()),
-            "Zebra accepted the signed transparent v5 spend"
+            "Zebra accepted the signed transparent spend"
         );
 
         let added_entry = wait_for_added(
@@ -166,7 +166,7 @@ async fn broadcasting_signed_transparent_v5_surfaces_through_polling_mempool_sou
     }
 
     Err(eyre!(
-        "Zebra kept reporting the signed transparent v5 transaction as already known: {}",
+        "Zebra kept reporting the signed transparent transaction as already known: {}",
         last_known_rejection.unwrap_or_else(|| "no rejection captured".to_owned())
     ))
 }
@@ -515,7 +515,7 @@ async fn invalidating_block_drops_canonical_tip_and_rebroadcast_resurfaces_mempo
         }
         _ => {
             return Err(eyre!(
-                "Zebra rejected the signed transparent v5 transaction: {broadcast_outcome:?}"
+                "Zebra rejected the signed transparent transaction: {broadcast_outcome:?}"
             ));
         }
     };
