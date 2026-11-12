@@ -1,0 +1,61 @@
+# Zebra 7.0.0 Regtest configuration for Zinder's live and parity suites.
+#
+# Zebra's Regtest activates Overwinter through Canopy at height 1 and leaves
+# NU5 and every later upgrade unset unless they are configured, so a chain
+# started with only `network = "Regtest"` never leaves Canopy. This schedule
+# activates each upgrade at its own small height, in consensus order, so a
+# live run crosses NU7 within a few seconds of mining:
+#
+#   height 1   Canopy  (Sapling coinbase from a unified miner address)
+#   height 2   NU5     (v5 transactions, Orchard)
+#   height 3   NU6     (lockbox funding stream)
+#   height 4   NU6.1
+#   height 5   NU6.2
+#   height 6   NU6.3   (v6 transactions, Ironwood)
+#   height 140 NU7     (ZIP 2003 rejects v4 transactions)
+#
+# `scripts/mine-live-regtest.sh` mines the shielded prefix and the funded
+# transparent range below NU7, so a suite can broadcast before and after the
+# activation. Environment variables cannot set these keys: config-rs lowercases
+# them, and `NU6.1` contains the separator. Mount this file and point
+# `CONFIG_FILE_PATH` at it.
+
+[network]
+network = "Regtest"
+
+[network.testnet_parameters]
+# Zebra 7 rejects funding streams whose effective height ranges overlap, so
+# each stream below starts where the previous one ends.
+extend_funding_stream_addresses_as_required = true
+
+[network.testnet_parameters.activation_heights]
+Overwinter = 1
+Sapling = 1
+Blossom = 1
+Heartwood = 1
+Canopy = 1
+NU5 = 2
+NU6 = 3
+"NU6.1" = 4
+"NU6.2" = 5
+"NU6.3" = 6
+NU7 = 140
+
+# NU6 until NU6.1: the ZIP 1015 lockbox and Major Grants streams.
+[[network.testnet_parameters.funding_streams]]
+height_range = { start = 3, end = 4 }
+recipients = [
+  { receiver = "Deferred", numerator = 12 },
+  { receiver = "MajorGrants", numerator = 8, addresses = ["t26ovBdKAJLtrvBsE2QGF4nqBkEuptuPFZz"] },
+]
+
+# NU6.1 onward, continuing across NU7 as the Mainnet streams do.
+[[network.testnet_parameters.funding_streams]]
+height_range = { start = 4, end = 100000 }
+recipients = [
+  { receiver = "Deferred", numerator = 12 },
+  { receiver = "MajorGrants", numerator = 8, addresses = ["t26ovBdKAJLtrvBsE2QGF4nqBkEuptuPFZz"] },
+]
+
+[state]
+ephemeral = false

@@ -5870,6 +5870,7 @@ dependencies = [
  "tracing",
  "zcash_primitives",
  "zebra-chain",
+ "zinder-client",
  "zinder-core",
  "zinder-materialized-views",
  "zinder-proto",

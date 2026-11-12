@@ -84,6 +84,12 @@ filter = "test(accepted_send_transaction_surfaces_in_non_empty_mempool_methods)"
 retries = { count = 0, backoff = "fixed", delay = "0s" }
 
 [[profile.ci-live.overrides]]
+# The NU7 activation test spends regtest coinbase outputs and mines across the
+# activation. A retry would start above NU7 and could not cross it again.
+filter = "test(/^live::nu7_activation::/)"
+retries = { count = 0, backoff = "fixed", delay = "0s" }
+
+[[profile.ci-live.overrides]]
 # The real-client flow creates a wallet, spends a unique UTXO, and mines
 # confirmations. Retrying after a failure would exercise a different chain
 # state, not the failed client interaction.
@@ -97,7 +103,7 @@ retries = { count = 0, backoff = "fixed", delay = "0s" }
 # destructive container-restart test, so all indexer consumers join here.
 # `ingest_control_tip_change_publisher_fires_when_zebra_mines_block` mutates
 # regtest chain state via `generate`, so it joins too.
-filter = "test(live::deep_chain) or test(live::cli) or test(/live::zebra_indexer_mempool::/) or test(/live::mempool_broadcast_cycle::/) or test(/live::parity_against_lightwalletd::/) or test(/live::zingolib::/) or test(/live::reorg_sweep::/) or test(mempool_orchestrator_runs_against_real_zebra_indexer_with_in_memory_state) or test(ingest_control_tip_change_publisher_fires_when_zebra_mines_block)"
+filter = "test(live::deep_chain) or test(live::cli) or test(/live::zebra_indexer_mempool::/) or test(/live::mempool_broadcast_cycle::/) or test(/live::parity_against_lightwalletd::/) or test(/live::zingolib::/) or test(/live::reorg_sweep::/) or test(/live::nu7_activation::/) or test(mempool_orchestrator_runs_against_real_zebra_indexer_with_in_memory_state) or test(ingest_control_tip_change_publisher_fires_when_zebra_mines_block)"
 test-group = "node-mutating"
 
 [[profile.ci-live.overrides]]

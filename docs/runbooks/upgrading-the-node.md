@@ -15,8 +15,10 @@ For NU7, Zinder parses blocks with `zebra-chain` 15.0.0 and the matching
 librustzcash family, the same parser release Zebra 7.0.0 uses. Zinder 0.9.0
 and earlier parse with `zebra-chain` 11.2.0, which rejects branch `0x77190ad9`,
 so their ingest stops at the first NU7 block. NU7 decoding is tested against
-Regtest blocks captured from Zebra 7.0.0 and Zakura 1.6.0. It has not yet run
-against an NU7 activation on Mainnet or Testnet.
+Regtest blocks captured from Zebra 7.0.0 and Zakura 1.6.0. The live suite also
+crosses an NU7 activation on a local Zebra 7.0.0 Regtest chain; see
+[Regtest through NU7](testing.md#regtest-through-nu7). Zinder has not yet run
+across an NU7 activation on Mainnet, on Testnet, or with a live Zakura node.
 
 ## Before you start
 

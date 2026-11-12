@@ -21,6 +21,8 @@ on:
       - "crates/zinder-store/**"
       - "crates/zinder-core/src/wire/**"
       - "crates/zinder-proto/src/capabilities.rs"
+      - "deploy/zebra/regtest.toml"
+      - "scripts/mine-live-regtest.sh"
       - ".github/workflows/parity-compat.yml"
 
 permissions:
@@ -30,8 +32,12 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_NEXTEST_VERSION: "0.9.116"
   PROTOC: /does/not/exist
-  REFERENCE_LIGHTWALLETD_IMAGE: docker.io/electriccoinco/lightwalletd:v0.4.19@sha256:a3dfb04b4054b78ae3107dcc804c3a15a6e38d1f0dfcadeac48da482dd1d3448
-  PARITY_REGTEST_PREMINE_BLOCKS: "125"
+  # The reference must parse the version-6 (NU6.3 and later) transactions that
+  # every block from height 6 carries under deploy/zebra/regtest.toml.
+  REFERENCE_LIGHTWALLETD_IMAGE: docker.io/electriccoinco/lightwalletd:v0.6.0@sha256:abc8199dae800e050415a3459f71c7850aeefeb1ca6a681e9b9eda7249ce8613
+  # Past NU7 (height 140), so the fixed fence covers blocks on both sides of
+  # the activation.
+  PARITY_REGTEST_TIP: "150"
   PARITY_TRANSPARENT_ADDRESS: tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx
   # Not prefixed `ZINDER_`: the binaries reject unknown `ZINDER_*` env vars as
   # invalid config keys, so a `ZINDER_*` port knob would crash them at startup.
@@ -42,27 +48,6 @@ jobs:
     name: parity diff (regtest)
     runs-on: ubuntu-latest
     timeout-minutes: 45
-
-    services:
-      # Coinbase pays to the broadcast-cycle test key so the shim and
-      # reference agree on real transaction data. The reference
-      # lightwalletd runs as a step below, not a service: its image entrypoint
-      # is `lightwalletd --help` with no env-var config, which a service
-      # container cannot override.
-      zebra:
-        image: docker.io/zfnd/zebra:7.0.0@sha256:a70d2be8ffef3a4b6e37355724e36a0e6c1838e46baa28bfb216739f00cf2d34
-        ports:
-          - 39232:39232
-        env:
-          ZEBRA_NETWORK__NETWORK: Regtest
-          ZEBRA_RPC__LISTEN_ADDR: 0.0.0.0:39232
-          ZEBRA_RPC__ENABLE_COOKIE_AUTH: "false"
-          ZEBRA_MINING__MINER_ADDRESS: ${{ env.PARITY_TRANSPARENT_ADDRESS }}
-        options: >-
-          --health-cmd "wget -q -O- http://localhost:39232 || true"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 12
 
     steps:
       - name: Checkout
@@ -80,24 +65,26 @@ jobs:
       - name: Build Zinder binaries
         run: cargo build --release -p zinder-ingest -p zinder-compat-lightwalletd -p zinder-bench
 
+      # Zebra runs as a step rather than a service container because its
+      # Regtest activation heights and funding streams come from a mounted
+      # TOML file (deploy/zebra/regtest.toml), which a service container cannot
+      # read before checkout. Coinbase pays to the broadcast-cycle test key so
+      # the shim and reference agree on real transaction data.
+      - name: Start Zebra on Regtest through NU7
+        run: |
+          docker run -d --name zebra-regtest -p 127.0.0.1:39232:39232 \
+            -v "${GITHUB_WORKSPACE}/deploy/zebra/regtest.toml:/etc/zebrad/zebrad.toml:ro" \
+            -e CONFIG_FILE_PATH=/etc/zebrad/zebrad.toml \
+            -e ZEBRA_RPC__LISTEN_ADDR=0.0.0.0:39232 \
+            -e ZEBRA_RPC__ENABLE_COOKIE_AUTH=false \
+            -e ZEBRA_MINING__MINER_ADDRESS="${PARITY_TRANSPARENT_ADDRESS}" \
+            docker.io/zfnd/zebra:7.0.0@sha256:a70d2be8ffef3a4b6e37355724e36a0e6c1838e46baa28bfb216739f00cf2d34
+
       - name: Advance regtest chain and start reference lightwalletd
         run: |
           set -euo pipefail
-          for _ in $(seq 1 60); do
-            if curl -sf -X POST -H 'content-type: application/json' \
-                -d '{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo","params":[]}' \
-                "${ZEBRA_RPC_URL}" >/dev/null 2>&1; then
-              break
-            fi
-            sleep 2
-          done
-          curl -sf -X POST -H 'content-type: application/json' \
-            -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"generate\",\"params\":[${PARITY_REGTEST_PREMINE_BLOCKS}]}" \
-            "${ZEBRA_RPC_URL}" -o /dev/null
-          tip=$(curl -sf -X POST -H 'content-type: application/json' \
-            -d '{"jsonrpc":"2.0","id":1,"method":"getblockcount","params":[]}' \
-            "${ZEBRA_RPC_URL}" | sed -E 's/.*"result":[[:space:]]*([0-9]+).*/\1/')
-          echo "regtest tip after pre-mine: ${tip}"
+          scripts/mine-live-regtest.sh "${ZEBRA_RPC_URL}" "${PARITY_REGTEST_TIP}"
+          tip="${PARITY_REGTEST_TIP}"
           # The reference image cannot be configured as a service container, so
           # run it here on the host network to reach the mapped Zebra RPC port.
           docker run -d --name lightwalletd-reference --network host \
@@ -224,6 +211,7 @@ jobs:
           echo "=== ingest.log ==="; tail -n 50 .tmp/ingest.log || true
           echo "=== compat.log ==="; tail -n 50 .tmp/compat.log || true
           echo "=== lightwalletd-reference ==="; docker logs lightwalletd-reference 2>&1 | tail -n 50 || true
+          echo "=== zebra-regtest ==="; docker logs zebra-regtest 2>&1 | tail -n 50 || true
 
       - name: Stop Zinder pipeline and reference
         if: always()
