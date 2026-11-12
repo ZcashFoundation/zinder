@@ -424,10 +424,8 @@ pub struct ReadinessReport {
     /// [ADR-0015]: ../../../docs/adrs/0015-phase-driven-ingest.md
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<IngestPhase>,
-    /// Selected closed materialized-view workload, when this service opened one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub materialized_view_preset: Option<String>,
-    /// Stable identities selected by [`Self::materialized_view_preset`].
+    /// Consumer identities of the Explorer view store this service admitted.
+    /// Empty when the service has not admitted one.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub materialized_view_identities: Vec<String>,
 }
@@ -442,16 +440,9 @@ impl ReadinessReport {
             current_height: None,
             target_height: None,
             phase: None,
-            materialized_view_preset: None,
             materialized_view_identities: Vec::new(),
         }
     }
-}
-
-#[derive(Clone, Debug, Default)]
-struct MaterializedViewWorkload {
-    preset: Option<String>,
-    identities: Vec<String>,
 }
 
 /// Internal readiness state guarded by an `Arc<Mutex<_>>` so HTTP handlers
@@ -459,7 +450,7 @@ struct MaterializedViewWorkload {
 #[derive(Clone, Debug)]
 pub struct Readiness {
     inner: Arc<Mutex<ReadinessState>>,
-    materialized_view_workload: Arc<Mutex<MaterializedViewWorkload>>,
+    materialized_view_identities: Arc<Mutex<Vec<String>>>,
 }
 
 impl Default for Readiness {
@@ -474,20 +465,14 @@ impl Readiness {
     pub fn new(state: ReadinessState) -> Self {
         Self {
             inner: Arc::new(Mutex::new(state)),
-            materialized_view_workload: Arc::new(Mutex::new(MaterializedViewWorkload::default())),
+            materialized_view_identities: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    /// Sets the closed materialized-view workload exposed by readiness and metrics.
-    pub fn set_materialized_view_workload(
-        &self,
-        preset: impl Into<String>,
-        identities: Vec<String>,
-    ) {
-        *self.materialized_view_workload.lock() = MaterializedViewWorkload {
-            preset: Some(preset.into()),
-            identities,
-        };
+    /// Records the consumer identities of the Explorer view store this
+    /// service admitted, exposed by readiness and metrics.
+    pub fn set_materialized_view_identities(&self, identities: Vec<String>) {
+        *self.materialized_view_identities.lock() = identities;
     }
 
     /// Replaces the readiness cause and heights, preserving the writer phase
@@ -550,15 +535,14 @@ impl Readiness {
     #[must_use]
     pub fn report(&self) -> ReadinessReport {
         let state = self.inner.lock().clone();
-        let materialized_view_workload = self.materialized_view_workload.lock().clone();
+        let materialized_view_identities = self.materialized_view_identities.lock().clone();
         ReadinessReport {
             is_ready: state.cause.permits_traffic(),
             cause: state.cause,
             current_height: state.current_height,
             target_height: state.target_height,
             phase: state.phase,
-            materialized_view_preset: materialized_view_workload.preset,
-            materialized_view_identities: materialized_view_workload.identities,
+            materialized_view_identities,
         }
     }
 }
@@ -1048,7 +1032,6 @@ impl From<&ReadinessReport> for ops_proto::ReadinessReport {
             current_height: report.current_height,
             target_height: report.target_height,
             detail: Option::<ops_proto::ReadinessCauseDetail>::from(&report.cause),
-            materialized_view_preset: report.materialized_view_preset.clone().unwrap_or_default(),
             materialized_view_identities: report.materialized_view_identities.clone(),
         }
     }
@@ -1250,23 +1233,19 @@ mod tests {
     }
 
     #[test]
-    fn materialized_view_workload_survives_readiness_state_changes() -> Result<(), serde_json::Error>
-    {
+    fn materialized_view_identities_survive_readiness_state_changes()
+    -> Result<(), serde_json::Error> {
         let readiness = Readiness::default();
-        readiness.set_materialized_view_workload(
-            "wallet",
-            vec![
-                "transparent_address_transaction_history".to_owned(),
-                "transparent_outpoint_spend".to_owned(),
-            ],
-        );
+        readiness.set_materialized_view_identities(vec![
+            "block_summary".to_owned(),
+            "transparent_outpoint_spend".to_owned(),
+        ]);
         readiness.set(ReadinessState::ready(Some(10)));
 
         let report = readiness.report();
-        assert_eq!(report.materialized_view_preset.as_deref(), Some("wallet"));
         assert_eq!(report.materialized_view_identities.len(), 2);
         let rendered = serde_json::to_value(report)?;
-        assert_eq!(rendered["materialized_view_preset"], "wallet");
+        assert!(rendered.get("materialized_view_preset").is_none());
         assert_eq!(
             rendered["materialized_view_identities"]
                 .as_array()
@@ -1586,7 +1565,6 @@ mod tests {
             current_height: Some(100),
             target_height: None,
             phase: None,
-            materialized_view_preset: Some("wallet".to_owned()),
             materialized_view_identities: vec!["transparent_outpoint_spend".to_owned()],
         };
 
@@ -1597,7 +1575,6 @@ mod tests {
         );
         assert_eq!(proto.current_height, Some(100));
         assert_eq!(proto.target_height, None);
-        assert_eq!(proto.materialized_view_preset, "wallet");
         assert_eq!(
             proto.materialized_view_identities,
             ["transparent_outpoint_spend"]
@@ -1626,7 +1603,6 @@ mod tests {
             current_height: None,
             target_height: None,
             phase: None,
-            materialized_view_preset: None,
             materialized_view_identities: Vec::new(),
         };
 
@@ -1651,7 +1627,6 @@ mod tests {
             current_height: Some(4_013_801),
             target_height: None,
             phase: None,
-            materialized_view_preset: None,
             materialized_view_identities: Vec::new(),
         };
 

@@ -19,8 +19,6 @@ use super::{
 #[test]
 fn parity_chain_index_surface_compiles_for_lightwalletd_operators() {
     fn assert_base_compiles<T: ChainIndex>() {
-        // GetTaddressBalance backed by typed TransparentAddressBalance
-        let _ = T::transparent_address_balance;
         // GetBlock and GetTreeState hash-only paths via BlockSelector
         let _ = T::block_id_by_selector;
         // GetSubtreeRoots typed bytes + typed pool enum

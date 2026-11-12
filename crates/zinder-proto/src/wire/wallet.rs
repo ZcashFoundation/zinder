@@ -503,58 +503,6 @@ fn transparent_mempool_spend_message(
     }
 }
 
-/// Decodes a transparent mempool output from the native wallet protocol.
-pub fn transparent_mempool_output_from_message(
-    message: wallet::TransparentMempoolOutput,
-) -> Result<TransparentMempoolOutput, WalletWireDecodeError> {
-    let outpoint = message
-        .outpoint
-        .ok_or(WalletWireDecodeError::MissingField {
-            field: "transparent_output.outpoint",
-        })?;
-    Ok(TransparentMempoolOutput {
-        address_script_hash: zinder_core::TransparentAddressScriptHash::from_bytes(fixed_bytes(
-            "transparent_output.address_script_hash",
-            message.address_script_hash,
-        )?),
-        script_pub_key: message.script_pub_key,
-        outpoint: outpoint_from_message("transparent_output.outpoint", outpoint)?,
-        value_zat: message.value_zat,
-    })
-}
-
-/// Decodes a transparent mempool spend from the native wallet protocol.
-pub fn transparent_mempool_spend_from_message(
-    message: wallet::TransparentMempoolSpend,
-) -> Result<TransparentMempoolSpend, WalletWireDecodeError> {
-    let spent_outpoint = message
-        .spent_outpoint
-        .ok_or(WalletWireDecodeError::MissingField {
-            field: "transparent_spend.spent_outpoint",
-        })?;
-    Ok(TransparentMempoolSpend {
-        spent_outpoint: outpoint_from_message("transparent_spend.spent_outpoint", spent_outpoint)?,
-        spending_transaction_id: decode_transaction_id(
-            "transparent_spend.spending_transaction_id",
-            &message.spending_transaction_id,
-        )?,
-    })
-}
-
-fn outpoint_from_message(
-    field: &'static str,
-    message: wallet::OutPoint,
-) -> Result<TransparentOutPoint, WalletWireDecodeError> {
-    let wallet::OutPoint {
-        transaction_id,
-        output_index,
-    } = message;
-    Ok(TransparentOutPoint::new(
-        decode_transaction_id(field, &transaction_id)?,
-        output_index,
-    ))
-}
-
 fn compact_actions_from_messages(
     fields: ActionFieldPaths,
     actions: Vec<wallet::CompactShieldedAction>,

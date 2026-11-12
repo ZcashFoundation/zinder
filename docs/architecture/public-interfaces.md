@@ -118,14 +118,17 @@ state, source identity, rows, build leases, or serving. Explorer materialized-vi
 names begin with `MaterializedView` when they belong to the reusable
 consumer and store framework.
 
-`MaterializedViewPreset` selects a closed set of bundled materialized-view consumers.
-The Rust preset closed set remains `wallet` and `explorer`; a preset does not
-select a database engine, raw-byte retention policy, or release topology.
-Separately, `ingest.explorer_views` is a boolean operator request. `false`
-selects no optional materialized-view plane, while `true` requests the
-complete Explorer preset. The preset and its identities become runtime
-metadata only after successful store admission. The prior unshipped
-`materialized_view_mode` candidate name has no compatibility alias.
+Every bundled materialized-view consumer is an Explorer view. The store has
+one admissible manifest: the exact bundled consumer set, opened through
+`MaterializedViewStore::open_explorer_views` or
+`MaterializedViewStore::open_explorer_views_secondary`. There is no preset or
+wallet workload. `ingest.explorer_views` is a boolean operator request: `false`
+opens no materialized-view store, and `true` opens the Explorer view store.
+Consumer identities become runtime metadata only after that exact manifest is
+admitted. They appear in `ExplorerServerInfo.materialized_view_identities`, in
+the `materialized_view_identities` readiness field of the process that admitted
+the store, and in the `zinder_materialized_view_identity_info` metric. Wallet
+endpoints carry no materialized-view identity.
 
 ## Rust API shape
 
@@ -420,18 +423,9 @@ wallet.broadcast.transaction_v1
 wallet.events.chain_v1
 wallet.snapshot.mempool_v3
 wallet.events.mempool_v2
-wallet.mempool.transparent_outputs_by_address_v1
-wallet.mempool.transparent_spends_by_outpoint_v1
-wallet.mempool.transparent_outputs_by_outpoint_v1
-wallet.read.transparent_outputs_by_outpoint_v1
-wallet.read.transparent_spends_by_outpoint_v1
-wallet.read.transparent_unspent_outputs_by_outpoint_v1
 wallet.read.chain_value_pools_at_tip_v1
-wallet.read.transparent_utxo_set_summary_v1
-wallet.read.transparent_utxo_set_commitment_v1
 wallet.address.transparent_unspent_outputs_v1
 wallet.address.transparent_history_v1
-wallet.address.transparent_balance_v1
 explorer.server_info_v1
 explorer.transaction.detail_v4
 explorer.block.summary_v1
@@ -460,8 +454,6 @@ explorer.value_pool.flow_summary_v1
 explorer.value_pool.flow_amount_threshold_summary_v1
 explorer.value_pool.flow_rounded_amount_summary_v1
 explorer.value_pool.balance_history_v1
-explorer.utxo_set.summary_v1
-explorer.utxo_set.commitment_v1
 explorer.chain.reorg_history_v1
 explorer.chain.displaced_block_history_v1
 explorer.chain.displaced_block_detail_v1

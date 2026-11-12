@@ -22,7 +22,6 @@ mod transparent_address_activity;
 mod transparent_address_deltas;
 mod transparent_address_ranking;
 mod transparent_input;
-mod utxo_set_summary;
 mod value_pool_balance_history;
 mod value_pool_flow;
 mod value_pool_summary;

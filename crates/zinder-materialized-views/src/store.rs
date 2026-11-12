@@ -160,12 +160,9 @@ impl WriteBatchSize {
 }
 const ROCKSDB_DEFAULT_COLUMN_FAMILY: &str = "default";
 
-const BUNDLED_CONSUMER_COUNT: usize = RegistrySelection::Explorer.count();
+const BUNDLED_CONSUMER_COUNT: usize = RegistrySelection::Bundled.count();
 const BUNDLED_CONSUMERS: [MaterializedViewConsumerSchema; BUNDLED_CONSUMER_COUNT] =
-    RegistrySelection::Explorer.schemas();
-const WALLET_PROJECTION_CONSUMER_COUNT: usize = RegistrySelection::Wallet.count();
-const WALLET_PROJECTION_CONSUMERS: [MaterializedViewConsumerSchema;
-    WALLET_PROJECTION_CONSUMER_COUNT] = RegistrySelection::Wallet.schemas();
+    RegistrySelection::Bundled.schemas();
 const BUNDLED_CHAIN_EVENT_CONSUMER_COUNT: usize = RegistrySelection::ChainEventBlocks.count();
 const BUNDLED_CHAIN_EVENT_CONSUMER_NAMES: [MaterializedViewConsumerName;
     BUNDLED_CHAIN_EVENT_CONSUMER_COUNT] = RegistrySelection::ChainEventBlocks.names();
@@ -174,41 +171,13 @@ const BUNDLED_EVENT_ONLY_CHAIN_EVENT_CONSUMER_COUNT: usize =
 const BUNDLED_EVENT_ONLY_CHAIN_EVENT_CONSUMER_NAMES: [MaterializedViewConsumerName;
     BUNDLED_EVENT_ONLY_CHAIN_EVENT_CONSUMER_COUNT] = RegistrySelection::ChainEventEnvelope.names();
 
-/// Closed product workload that selects durable materialized view identities.
-///
-/// Presets choose which read models the materialized-view store materializes. They do not
-/// change canonical facts, historical coverage, raw payload retention, or the
-/// process that executes a materialized view.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum MaterializedViewPreset {
-    /// Wallet-serving materialized views required for transparent history and durable
-    /// spender resolution.
-    Wallet,
-    /// Wallet-serving materialized views plus every explorer materialized view bundled with
-    /// this Zinder release.
-    #[default]
-    Explorer,
-}
-
-impl MaterializedViewPreset {
-    /// Returns the stable configuration and storage name for this preset.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Wallet => "wallet",
-            Self::Explorer => "explorer",
-        }
-    }
-
-    /// Returns the durable consumer schemas selected by this preset.
-    #[must_use]
-    pub const fn consumer_schemas(self) -> &'static [MaterializedViewConsumerSchema] {
-        match self {
-            Self::Wallet => &WALLET_PROJECTION_CONSUMERS,
-            Self::Explorer => &BUNDLED_CONSUMERS,
-        }
-    }
+/// Which recorded consumer identities an opener accepts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManifestAdmission {
+    /// Accept any recorded manifest whose declared consumers validate.
+    DeclaredConsumers,
+    /// Require exactly the bundled Explorer view manifest before opening.
+    ExactBundled,
 }
 
 /// Per-column-family options the materialized-view plane tunes at open time.
@@ -935,22 +904,19 @@ impl MaterializedViewStore {
             .any(|schema| schema.name == consumer_name)
     }
 
-    /// Returns the closed product workload represented by this store's
-    /// selected consumer identities.
-    ///
-    /// Generic test stores and stores with explorer materialized views classify as
-    /// explorer. Only the exact wallet identity set classifies as wallet.
+    /// Iterates the consumer identities selected when this store was opened.
+    pub fn consumer_identities(&self) -> impl Iterator<Item = MaterializedViewConsumerName> + '_ {
+        self.consumers.iter().map(|schema| schema.name)
+    }
+
+    /// Returns whether this store was opened with exactly this release's
+    /// Explorer view manifest, so every bundled Explorer view is readable.
     #[must_use]
-    pub fn effective_materialized_view_preset(&self) -> MaterializedViewPreset {
-        let is_wallet = self.consumers.len() == WALLET_PROJECTION_CONSUMERS.len()
-            && WALLET_PROJECTION_CONSUMERS
+    pub fn has_explorer_view_manifest(&self) -> bool {
+        self.consumers.len() == BUNDLED_CONSUMERS.len()
+            && BUNDLED_CONSUMERS
                 .iter()
-                .all(|schema| self.has_consumer(schema.name));
-        if is_wallet {
-            MaterializedViewPreset::Wallet
-        } else {
-            MaterializedViewPreset::Explorer
-        }
+                .all(|consumer| self.has_consumer(consumer.name))
     }
 
     /// Iterates the selected block-keyed chain-event consumer identities.
@@ -986,47 +952,42 @@ impl MaterializedViewStore {
         path: impl AsRef<Path>,
         options: MaterializedViewStoreOptions,
     ) -> Result<Self, MaterializedViewStoreError> {
-        Self::open_primary(path.as_ref(), options, None)
+        Self::open_primary(path.as_ref(), options, ManifestAdmission::DeclaredConsumers)
     }
 
-    /// Opens or creates a materialized-view store for one closed materialized-view preset.
+    /// Opens or creates the Explorer view store with this release's exact
+    /// bundled consumer manifest.
     ///
     /// The durable per-consumer manifest is preflighted before the primary
-    /// opens the database. Reopening a wallet store as explorer, or an explorer
-    /// store as wallet, fails before that manifest can be expanded or reduced.
-    pub fn open_with_materialized_view_preset(
+    /// opens the database. A store whose recorded identities differ from the
+    /// bundled manifest fails before that manifest can be expanded or reduced.
+    pub fn open_explorer_views(
         path: impl AsRef<Path>,
-        materialized_view_preset: MaterializedViewPreset,
         mut options: MaterializedViewStoreOptions,
     ) -> Result<Self, MaterializedViewStoreError> {
-        options.consumers = materialized_view_preset.consumer_schemas();
-        Self::open_primary(path.as_ref(), options, Some(materialized_view_preset))
+        options.consumers = &BUNDLED_CONSUMERS;
+        Self::open_primary(path.as_ref(), options, ManifestAdmission::ExactBundled)
     }
 
-    /// Detects the closed materialized-view preset recorded by an existing materialized-view
-    /// store without opening it for writes.
+    /// Reports whether `path` holds an initialized materialized-view store,
+    /// without opening it for writes.
     ///
-    /// Returns `None` when the path is not a materialized-view `RocksDB` store. Manifests
-    /// containing explorer materialized views are classified as
-    /// [`MaterializedViewPreset::Explorer`]; only the exact two-identity wallet
-    /// manifest is classified as wallet.
-    pub fn detect_materialized_view_preset_at_path(
-        path: impl AsRef<Path>,
-    ) -> Result<Option<MaterializedViewPreset>, MaterializedViewStoreError> {
+    /// Returns `false` when the path is not a materialized-view `RocksDB`
+    /// store. Rejects a store whose format version differs from this binary or
+    /// whose manifest records a consumer this release does not bundle.
+    pub fn exists_at_path(path: impl AsRef<Path>) -> Result<bool, MaterializedViewStoreError> {
         Self::require_matching_store_format_at_path(path.as_ref())?;
         let Some(recorded_consumers) = Self::read_consumer_manifest_at_path(path.as_ref())? else {
-            return Ok(None);
+            return Ok(false);
         };
         Self::reject_unknown_consumer_identities(&recorded_consumers)?;
-        Ok(Some(Self::preset_for_recorded_consumers(
-            &recorded_consumers,
-        )))
+        Ok(true)
     }
 
     fn open_primary(
         path: &Path,
         options: MaterializedViewStoreOptions,
-        materialized_view_preset: Option<MaterializedViewPreset>,
+        manifest_admission: ManifestAdmission,
     ) -> Result<Self, MaterializedViewStoreError> {
         options
             .rocksdb_resource_budget
@@ -1036,8 +997,8 @@ impl MaterializedViewStore {
         Self::require_matching_store_format_at_path(path)?;
         let existing_column_families = existing_column_family_names(path);
         let is_fresh_store = existing_column_families.is_empty();
-        if let Some(materialized_view_preset) = materialized_view_preset {
-            Self::preflight_materialized_view_preset_at_path(path, materialized_view_preset)?;
+        if manifest_admission == ManifestAdmission::ExactBundled {
+            Self::preflight_exact_bundled_manifest_at_path(path)?;
         }
         if !is_fresh_store {
             Self::preflight_consumer_schemas_at_path(path, options.consumers)?;
@@ -1114,25 +1075,25 @@ impl MaterializedViewStore {
             primary_path.as_ref(),
             secondary_path.as_ref(),
             options,
-            None,
+            ManifestAdmission::DeclaredConsumers,
         )
     }
 
-    /// Opens a secondary reader for one closed materialized-view preset.
+    /// Opens a secondary reader of the Explorer view store.
     ///
-    /// The primary must already have initialized the same durable preset.
-    pub fn open_secondary_with_materialized_view_preset(
+    /// The primary must already have recorded exactly this release's bundled
+    /// consumer manifest.
+    pub fn open_explorer_views_secondary(
         primary_path: impl AsRef<Path>,
         secondary_path: impl AsRef<Path>,
-        materialized_view_preset: MaterializedViewPreset,
         mut options: MaterializedViewStoreOptions,
     ) -> Result<Self, MaterializedViewStoreError> {
-        options.consumers = materialized_view_preset.consumer_schemas();
+        options.consumers = &BUNDLED_CONSUMERS;
         Self::open_secondary_store(
             primary_path.as_ref(),
             secondary_path.as_ref(),
             options,
-            Some(materialized_view_preset),
+            ManifestAdmission::ExactBundled,
         )
     }
 
@@ -1140,7 +1101,7 @@ impl MaterializedViewStore {
         primary_path: &Path,
         secondary_path: &Path,
         options: MaterializedViewStoreOptions,
-        materialized_view_preset: Option<MaterializedViewPreset>,
+        manifest_admission: ManifestAdmission,
     ) -> Result<Self, MaterializedViewStoreError> {
         options
             .rocksdb_resource_budget
@@ -1148,11 +1109,8 @@ impl MaterializedViewStore {
             .map_err(|reason| MaterializedViewStoreError::InvalidOptions { reason })?;
         validate_consumer_declarations(options.consumers)?;
         Self::require_matching_store_format_at_path(primary_path)?;
-        if let Some(materialized_view_preset) = materialized_view_preset {
-            Self::preflight_materialized_view_preset_at_path(
-                primary_path,
-                materialized_view_preset,
-            )?;
+        if manifest_admission == ManifestAdmission::ExactBundled {
+            Self::preflight_exact_bundled_manifest_at_path(primary_path)?;
         }
         let existing_column_families = existing_column_family_names(primary_path);
         if !existing_column_families.is_empty() {
@@ -2264,15 +2222,14 @@ impl MaterializedViewStore {
 
     /// Reads the existing per-consumer manifest without opening the store for
     /// writes or creating column families.
-    fn preflight_materialized_view_preset_at_path(
+    fn preflight_exact_bundled_manifest_at_path(
         path: &Path,
-        requested: MaterializedViewPreset,
     ) -> Result<(), MaterializedViewStoreError> {
         Self::require_matching_store_format_at_path(path)?;
         let Some(recorded_consumers) = Self::read_consumer_manifest_at_path(path)? else {
             return Ok(());
         };
-        Self::validate_preset_consumer_identities(requested, &recorded_consumers)
+        Self::validate_exact_bundled_consumer_identities(&recorded_consumers)
     }
 
     fn read_consumer_manifest_at_path(
@@ -2342,24 +2299,18 @@ impl MaterializedViewStore {
         Self::validate_declared_consumer_schemas(self.consumers, &recorded)
     }
 
-    fn validate_preset_consumer_identities(
-        requested: MaterializedViewPreset,
+    fn validate_exact_bundled_consumer_identities(
         recorded_consumers: &BTreeMap<String, ConsumerManifestEntry>,
     ) -> Result<(), MaterializedViewStoreError> {
         Self::reject_unknown_consumer_identities(recorded_consumers)?;
-        let requested_consumers = requested.consumer_schemas();
-        let exact_identity_set = recorded_consumers.len() == requested_consumers.len()
-            && requested_consumers
+        let exact_identity_set = recorded_consumers.len() == BUNDLED_CONSUMERS.len()
+            && BUNDLED_CONSUMERS
                 .iter()
                 .all(|consumer| recorded_consumers.contains_key(consumer.name.as_str()));
         if exact_identity_set {
             Ok(())
         } else {
-            Err(
-                MaterializedViewStoreError::MaterializedViewPresetRequiresFreshStore {
-                    requested: requested.as_str(),
-                },
-            )
+            Err(MaterializedViewStoreError::ExplorerViewManifestRequiresFreshStore)
         }
     }
 
@@ -2378,20 +2329,6 @@ impl MaterializedViewStore {
             }
         }
         Ok(())
-    }
-
-    fn preset_for_recorded_consumers(
-        recorded_consumers: &BTreeMap<String, ConsumerManifestEntry>,
-    ) -> MaterializedViewPreset {
-        let recorded_is_wallet = recorded_consumers.len() == WALLET_PROJECTION_CONSUMERS.len()
-            && WALLET_PROJECTION_CONSUMERS
-                .iter()
-                .all(|schema| recorded_consumers.contains_key(schema.name.as_str()));
-        if recorded_is_wallet {
-            MaterializedViewPreset::Wallet
-        } else {
-            MaterializedViewPreset::Explorer
-        }
     }
 
     fn validate_declared_consumer_schemas(
@@ -3579,11 +3516,9 @@ mod tests {
         }
 
         for outcome in [
-            MaterializedViewStore::detect_materialized_view_preset_at_path(tempdir.path())
-                .map(|_| ()),
-            MaterializedViewStore::open_with_materialized_view_preset(
+            MaterializedViewStore::exists_at_path(tempdir.path()).map(|_| ()),
+            MaterializedViewStore::open_explorer_views(
                 tempdir.path(),
-                MaterializedViewPreset::Explorer,
                 MaterializedViewStoreOptions::default(),
             )
             .map(|_| ()),

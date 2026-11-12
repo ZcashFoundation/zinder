@@ -18,8 +18,7 @@ use zinder_proto::{
     capabilities::{
         INGEST_CONTROL_MEMPOOL_EVENTS_V2, INGEST_CONTROL_MEMPOOL_SNAPSHOT_V3,
         INGEST_CONTROL_MEMPOOL_TRANSACTION_V2, INGEST_CONTROL_SERVER_INFO_V1,
-        INGEST_CONTROL_TRANSPARENT_MEMPOOL_OUTPUTS_BY_ADDRESS_V1,
-        INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPENDS_BY_OUTPOINT_V1, INGEST_CONTROL_WRITER_STATUS_V1,
+        INGEST_CONTROL_WRITER_STATUS_V1,
     },
     v1::{
         ingest::{
@@ -178,15 +177,11 @@ impl IngestControl for IngestControlFixtureService {
                     INGEST_CONTROL_MEMPOOL_SNAPSHOT_V3,
                     INGEST_CONTROL_MEMPOOL_TRANSACTION_V2,
                     INGEST_CONTROL_MEMPOOL_EVENTS_V2,
-                    INGEST_CONTROL_TRANSPARENT_MEMPOOL_OUTPUTS_BY_ADDRESS_V1,
-                    INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPENDS_BY_OUTPOINT_V1,
                 ]
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
                 contract_revision: zinder_proto::CONTRACT_REVISION,
-                materialized_view_preset: String::new(),
-                materialized_view_identities: Vec::new(),
             }),
         }))
     }
@@ -265,39 +260,6 @@ impl IngestControl for IngestControlFixtureService {
         Ok(Response::new(Box::pin(tokio_stream::pending())))
     }
 
-    async fn transparent_mempool_outputs_by_address(
-        &self,
-        _request: Request<wallet::TransparentMempoolOutputsByAddressRequest>,
-    ) -> Result<Response<wallet::TransparentMempoolOutputsByAddressResponse>, Status> {
-        Ok(Response::new(
-            wallet::TransparentMempoolOutputsByAddressResponse {
-                chain_view: Some(fixture_chain_view(self.network)),
-                outputs: Vec::new(),
-            },
-        ))
-    }
-
-    async fn transparent_mempool_spends_by_outpoint(
-        &self,
-        _request: Request<wallet::TransparentMempoolSpendsByOutpointRequest>,
-    ) -> Result<Response<wallet::TransparentMempoolSpendsByOutpointResponse>, Status> {
-        Ok(Response::new(
-            wallet::TransparentMempoolSpendsByOutpointResponse {
-                chain_view: Some(fixture_chain_view(self.network)),
-                spends: Vec::new(),
-            },
-        ))
-    }
-
-    async fn transparent_mempool_outputs_by_outpoint(
-        &self,
-        _request: Request<wallet::TransparentMempoolOutputsByOutpointRequest>,
-    ) -> Result<Response<wallet::TransparentOutputsByOutpointResponse>, Status> {
-        Err(Status::unimplemented(
-            "fixture does not implement transparent mempool outputs by outpoint",
-        ))
-    }
-
     async fn chain_value_pools_at_tip(
         &self,
         _request: Request<wallet::ChainValuePoolsAtTipRequest>,
@@ -357,7 +319,7 @@ mod tests {
             .into_inner()
             .server_info
             .ok_or_else(|| eyre::eyre!("fixture ServerInfo omitted its payload"))?;
-        assert_eq!(server_info.capabilities.len(), 7);
+        assert_eq!(server_info.capabilities.len(), 5);
 
         let writer_status = client
             .writer_status(WriterStatusRequest {})
@@ -390,28 +352,6 @@ mod tests {
             .err()
             .ok_or_else(|| eyre::eyre!("empty fixture mempool returned a transaction"))?;
         assert_eq!(transaction_error.code(), Code::NotFound);
-
-        let outputs = client
-            .transparent_mempool_outputs_by_address(
-                wallet::TransparentMempoolOutputsByAddressRequest {
-                    address: None,
-                    max_entries: Some(1),
-                },
-            )
-            .await?
-            .into_inner();
-        assert!(outputs.chain_view.is_some());
-        assert!(outputs.outputs.is_empty());
-        let spends = client
-            .transparent_mempool_spends_by_outpoint(
-                wallet::TransparentMempoolSpendsByOutpointRequest {
-                    outpoints: Vec::new(),
-                },
-            )
-            .await?
-            .into_inner();
-        assert!(spends.chain_view.is_some());
-        assert!(spends.spends.is_empty());
 
         let mut events = client
             .mempool_events(wallet::MempoolEventsRequest { start: None })

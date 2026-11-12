@@ -5980,7 +5980,6 @@ dependencies = [
  "tracing-subscriber",
  "zebra-chain",
  "zinder-core",
- "zinder-materialized-views",
  "zinder-proto",
  "zinder-runtime",
  "zinder-source",

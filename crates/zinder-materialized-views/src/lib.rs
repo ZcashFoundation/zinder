@@ -12,8 +12,9 @@
 //!   chain-events consumer follows; the in-process dispatch helpers walk the
 //!   height range from each event and dispatch per-height work.
 //! - [`bundled_materialized_view_consumer_definitions`] is the closed registry
-//!   of bundled consumers. Store presets, chain-event cursor lists, and the
-//!   replay host's dispatch sets derive from it.
+//!   of bundled Explorer views. The store's exact consumer manifest,
+//!   chain-event cursor lists, and the replay host's dispatch sets derive from
+//!   it.
 //! - [`MaterializedViewStore`] is the `RocksDB` wrapper consumers write through. It
 //!   shares its option layering with `zinder_store`'s canonical store so the
 //!   bulk-catchup-OOM bound from [ADR-0020] applies to both planes.
@@ -133,16 +134,6 @@ pub use consumer::transparent_address_ranking::{
     TransparentAddressRankingSnapshotRow, TransparentAddressScriptTypeTotals,
     TransparentAddressSummary,
 };
-pub use consumer::transparent_address_transaction_history::{
-    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILIES,
-    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_COLUMN_FAMILY,
-    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_CONSUMER_NAME,
-    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_DESCENDING_COLUMN_FAMILY,
-    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_INDEX_COLUMN_FAMILY,
-    TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_SCHEMA, TransparentAddressTransactionHistoryConsumer,
-    TransparentAddressTransactionHistoryConsumerError, TransparentAddressTransactionHistoryPage,
-    TransparentAddressTransactionHistoryPageRequest,
-};
 pub use consumer::transparent_outpoint_spend::{
     TRANSPARENT_OUTPOINT_SPEND_COLUMN_FAMILIES, TRANSPARENT_OUTPOINT_SPEND_COLUMN_FAMILY,
     TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
@@ -175,8 +166,8 @@ pub use consumer::{
 };
 pub use consumer_registry::{
     ChainEventBlockJoin, MaterializedViewActivationProbe, MaterializedViewConsumerDefinition,
-    MaterializedViewConsumerRole, MaterializedViewDispatch, MaterializedViewPresetMembership,
-    MaterializedViewRecoverySource, bundled_materialized_view_consumer_definitions,
+    MaterializedViewDispatch, MaterializedViewRecoverySource,
+    bundled_materialized_view_consumer_definitions,
 };
 pub use error::{
     MaterializedViewError, MaterializedViewStoreColumnFamily, MaterializedViewStoreError,
@@ -184,8 +175,7 @@ pub use error::{
 pub use store::{
     ChainEventDispatchConsumers, ChainEventDispatchInputs, ConsumerEntry,
     MATERIALIZED_VIEW_STORE_FORMAT_VERSION, MATERIALIZED_VIEW_STORE_SUBDIR,
-    MaterializedViewCoverage, MaterializedViewCursorEntry, MaterializedViewPreset,
-    MaterializedViewState, MaterializedViewStore, MaterializedViewStoreOptions,
-    MaterializedViewStoreReadSnapshot, MaterializedViewStoreTable,
-    MaterializedViewWriteMeasurement,
+    MaterializedViewCoverage, MaterializedViewCursorEntry, MaterializedViewState,
+    MaterializedViewStore, MaterializedViewStoreOptions, MaterializedViewStoreReadSnapshot,
+    MaterializedViewStoreTable, MaterializedViewWriteMeasurement,
 };

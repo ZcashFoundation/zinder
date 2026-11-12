@@ -57,7 +57,6 @@ Zinder owns facts whose answers are the same for every caller at a given chain e
 - Sapling, Orchard, and Ironwood tree-state reads where supported by the active network upgrade.
 - Shielded subtree-root reads for batched scanning.
 - Transparent-address unspent outputs and transaction history.
-- Admitted live-mempool outputs-by-address and spends-by-outpoint.
 - Transaction lookup and broadcast.
 - Mempool snapshots and change events.
 - Cursor-resumable committed and reorged chain events.

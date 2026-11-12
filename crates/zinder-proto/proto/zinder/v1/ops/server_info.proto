@@ -15,7 +15,7 @@ package zinder.v1.ops;
 // Every Zinder gRPC service that wants to advertise its identity and
 // capability set returns this message from a `ServerInfo` rpc. Some
 // services wrap it inside a richer descriptor (WalletQuery layers
-// retention windows and reorg-window depth on top).
+// reorg-window depth on top).
 message ServerInfo {
   // Network identifier: `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`.
   string network = 1;
@@ -38,13 +38,11 @@ message ServerInfo {
   // minimum.
   uint32 contract_revision = 5;
 
-  // Closed materialized-view workload detected from the durable manifest.
-  // Empty only when this process has no materialized-view store attached.
-  string materialized_view_preset = 6;
-
-  // Stable materialized-view identities selected by materialized_view_preset. Order is not
-  // significant; consumers compare these as a set.
-  repeated string materialized_view_identities = 7;
+  // Removed materialized-view preset and identities. Wallet and ingest
+  // endpoints do not admit Explorer views; Explorer view identities are on
+  // `zinder.v1.explorer.ExplorerServerInfo`.
+  reserved 6, 7;
+  reserved "materialized_view_preset", "materialized_view_identities";
 
   // Full Git commit embedded by the release build, or `unknown` for a local
   // build without injected source metadata.

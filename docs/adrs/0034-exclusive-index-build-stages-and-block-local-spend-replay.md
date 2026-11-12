@@ -22,7 +22,7 @@ Canary traces also showed the adaptive source controller hard-capped at 16 block
 Initial indexing has three exclusive storage-budget owners, in priority order:
 
 1. Canonical construction runs while the ingest phase is `BulkCatchup`; materialized-view replay and rebuildable historical work are paused.
-2. Materialized-view replay runs after canonical enters `FollowingTip` and until the materialized transparent-spend projection shared by every supported preset covers the canonical visible tip; historical backfills and verifiers remain closed.
+2. Materialized-view replay runs after canonical enters `FollowingTip` and until the `transparent_outpoint_spend` Explorer view covers the canonical visible tip; historical backfills and verifiers remain closed.
 3. Historical backfills and verifiers may start bounded batches only while canonical is following tip and materialized-view replay is caught up. If replay falls behind again, the gate closes before another historical batch begins.
 
 Startup observes and publishes the canonical phase before it admits synchronous materialized-view handoff work. Only a positively classified `FollowingTip` phase may replay; `BulkCatchup`, `AwaitingUpstream`, a failed tip observation, and the unclassified state fail closed. A restart during initial sync therefore resumes canonical work without first spending the bounded startup replay window on materialized-view debt.

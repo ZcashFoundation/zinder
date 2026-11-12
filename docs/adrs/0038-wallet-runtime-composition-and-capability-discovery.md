@@ -5,7 +5,7 @@
 | Status | Accepted |
 | Product | Zinder |
 | Domain | Native wallet serving, capability discovery, consumer admission |
-| Related | [Wallet data plane](../architecture/wallet-data-plane.md), [Public interfaces](../architecture/public-interfaces.md), [Canonical storage topology](0035-canonical-storage-topologies.md), [Canonical storage access](0003-canonical-storage-access-boundary.md) |
+| Related | [Wallet data plane](../architecture/wallet-data-plane.md), [Public interfaces](../architecture/public-interfaces.md), [Canonical storage topology](0035-canonical-storage-topologies.md), [Canonical storage access](0003-canonical-storage-access-boundary.md), [ADR-0043](0043-owned-transparent-wallet-query-surface.md) |
 
 ## Context
 
@@ -53,8 +53,9 @@ contract tests, and a current production-consumer flow.
 
 `ServerInfoSettings` becomes `WalletEndpointMetadata`. It contains endpoint
 identity and descriptive facts such as network, build revision, schema
-version, reorg window, and materialized-view identity; it contains no support
-decisions. Retention-duration fields with no authenticated writer evidence are
+version, and reorg window; it contains no support decisions. The wallet query
+opens no materialized-view store, so its metadata names no materialized-view
+identity. Retention-duration fields with no authenticated writer evidence are
 removed rather than populated from reader configuration. The production gRPC
 adapter accepts the admitted query and metadata,
 obtains the query-owned capability set, and encodes that exact set in
@@ -86,23 +87,20 @@ concrete provider, and `TipId`, which is the liveness prerequisite. The release
 query also admits one `AdmittedIngestControl` before opening storage or binding
 traffic. Admission opens an authenticated channel once, calls `ServerInfo`,
 and requires the exact `zinder-ingest` service identity, network, contract
-revision, and seven control methods needed by the composition:
-`ServerInfo`, `WriterStatus`, `MempoolSnapshot`, `MempoolTransaction`,
-`MempoolEvents`, `TransparentMempoolOutputsByAddress`, and
-`TransparentMempoolSpendsByOutpoint`. The query, serving-pair publisher, live
+revision, and five control methods needed by the composition:
+`ServerInfo`, `WriterStatus`, `MempoolSnapshot`, `MempoolTransaction`, and
+`MempoolEvents`. The query, serving-pair publisher, live
 wallet handlers, and readiness probe clone that same accepted channel. They do
 not accept independently configured provider identities or perform a second
 dial at their use sites.
 
-This evidence admits native transaction lookup, mempool snapshot and events,
-and transparent mempool outputs-by-address and spends-by-outpoint.
-Transaction-byte support additionally requires authenticated transaction-blob
-retention. Transparent live balance remains omitted: its gRPC handler
-performs multiple canonical and live calls without one authenticated mempool
-generation, so the two admitted primitives are not sufficient evidence for the
-composite claim. Transparent mempool outputs-by-outpoint also remains omitted
-because it is not part of the required admitted provider contract.
-Chain value pools also remain omitted: discovering an OpenRPC method name does
+This evidence admits native transaction lookup and mempool snapshot and
+events. Transaction-byte support additionally requires authenticated
+transaction-blob retention. The native transparent surface contains only the
+methods a packaged consumer calls
+([ADR-0043](0043-owned-transparent-wallet-query-surface.md)); the transparent
+mempool point lookups and the native transparent balance are not part of the
+protocol. Chain value pools remain omitted: discovering an OpenRPC method name does
 not prove that the node returns the required `valuePools` payload, and the
 readiness loop does not retain that semantic evidence. Method presence in the
 protocol, adapter, or upstream schema is not support.
@@ -235,3 +233,11 @@ view expiry and whole-workflow retry satisfy the current consumer requirement.
 
 Aliases keep obsolete names and constructors available for new code. The
 controlled consumer cutover uses the current contract without shims.
+
+## Revision history
+
+- 2026-11-12: Ingest-control admission requires five control methods instead
+  of seven, and `WalletEndpointMetadata` no longer carries a materialized-view
+  preset. The transparent mempool point lookups, the native transparent
+  balance, and the unserved canonical outpoint readers were removed from the
+  protocol ([ADR-0043](0043-owned-transparent-wallet-query-surface.md)).

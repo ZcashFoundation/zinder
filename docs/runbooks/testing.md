@@ -1272,18 +1272,9 @@ wallet.broadcast.transaction_v1
 wallet.events.chain_v1
 wallet.snapshot.mempool_v3
 wallet.events.mempool_v2
-wallet.mempool.transparent_outputs_by_address_v1
-wallet.mempool.transparent_spends_by_outpoint_v1
-wallet.mempool.transparent_outputs_by_outpoint_v1
-wallet.read.transparent_outputs_by_outpoint_v1
-wallet.read.transparent_spends_by_outpoint_v1
-wallet.read.transparent_unspent_outputs_by_outpoint_v1
 wallet.read.chain_value_pools_at_tip_v1
-wallet.read.transparent_utxo_set_summary_v1
-wallet.read.transparent_utxo_set_commitment_v1
 wallet.address.transparent_unspent_outputs_v1
 wallet.address.transparent_history_v1
-wallet.address.transparent_balance_v1
 explorer.server_info_v1
 explorer.transaction.detail_v4
 explorer.block.summary_v1
@@ -1312,8 +1303,6 @@ explorer.value_pool.flow_summary_v1
 explorer.value_pool.flow_amount_threshold_summary_v1
 explorer.value_pool.flow_rounded_amount_summary_v1
 explorer.value_pool.balance_history_v1
-explorer.utxo_set.summary_v1
-explorer.utxo_set.commitment_v1
 explorer.chain.reorg_history_v1
 explorer.chain.displaced_block_history_v1
 explorer.chain.displaced_block_detail_v1

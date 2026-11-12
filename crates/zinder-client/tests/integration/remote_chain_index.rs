@@ -29,10 +29,6 @@ use zinder_client::{
     TransactionId, TransparentAddressScriptHash, TransparentAddressTxIdsQuery, TransparentOutPoint,
     TransparentUnspentOutput,
 };
-use zinder_proto::capabilities::{
-    WALLET_READ_TRANSPARENT_OUTPUTS_V1, WALLET_READ_TRANSPARENT_SPENDS_V1,
-    WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1, WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1,
-};
 use zinder_proto::v1::wallet;
 use zinder_query::{
     AdmittedIngestControl, WalletEndpointMetadata, WalletQueryApi, WalletQueryGrpcAdapter,
@@ -308,17 +304,7 @@ async fn serving_pair_address_indexes_are_epoch_bound_ascending_and_cursor_resum
     let server_info = chain_index.server_info().await?;
     assert!(server_info.supports(Capability::TransparentAddressUnspentOutputs));
     assert!(server_info.supports(Capability::TransparentAddressHistory));
-    for omitted in [Capability::Broadcast, Capability::TransparentAddressBalance] {
-        assert!(!server_info.supports(omitted));
-    }
-    for omitted in [
-        WALLET_READ_TRANSPARENT_OUTPUTS_V1,
-        WALLET_READ_TRANSPARENT_SPENDS_V1,
-        WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1,
-        WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1,
-    ] {
-        assert!(!server_info.has(omitted));
-    }
+    assert!(!server_info.supports(Capability::Broadcast));
     let snapshot = OwnedChainSnapshot::capture(Arc::clone(&chain_index)).await?;
     let mut unspent_outputs = snapshot
         .transparent_address_unspent_outputs(address_script_hash, BlockHeight::new(0))
@@ -338,7 +324,6 @@ async fn serving_pair_address_indexes_are_epoch_bound_ascending_and_cursor_resum
             end_height: BlockHeight::new(3),
             max_entries: Some(NonZeroU32::new(2).ok_or_else(|| eyre!("two is non-zero"))?),
             from_cursor: None,
-            descending: false,
             at_epoch_id: None,
         })
         .await?;
@@ -369,7 +354,6 @@ async fn serving_pair_address_indexes_are_epoch_bound_ascending_and_cursor_resum
             end_height: BlockHeight::new(3),
             max_entries: Some(NonZeroU32::new(2).ok_or_else(|| eyre!("two is non-zero"))?),
             from_cursor: Some(cursor),
-            descending: false,
             at_epoch_id: None,
         })
         .await?;
@@ -389,7 +373,6 @@ async fn serving_pair_address_indexes_are_epoch_bound_ascending_and_cursor_resum
             end_height: BlockHeight::new(3),
             max_entries: None,
             from_cursor: None,
-            descending: false,
             at_epoch_id: None,
         })
         .await?;
@@ -402,7 +385,6 @@ async fn serving_pair_address_indexes_are_epoch_bound_ascending_and_cursor_resum
             end_height: BlockHeight::new(3),
             max_entries: None,
             from_cursor: None,
-            descending: false,
             at_epoch_id: Some(zinder_client::ChainEpochId::new(
                 snapshot.chain_epoch().id.value() + 1,
             )),

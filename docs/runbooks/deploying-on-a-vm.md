@@ -185,6 +185,47 @@ reset, immutable external publication, inactive-lane restore, and the required
 10000-block tail proof remain absent, so neither captured nor locally sealed
 manifests satisfy the restore production gate.
 
+### Rebuild Explorer views after a manifest change
+
+Each release admits only a materialized-view store whose recorded consumers
+match its bundled Explorer views exactly. A release that adds or retires an
+Explorer view therefore refuses stores built by earlier releases. For example,
+a store that still records the retired
+`transparent_address_transaction_history` view fails admission after the
+upgrade:
+
+- `zinder-ingest` logs `materialized_view_store_open_failed` with a
+  `ConsumerNotDeclared` error. It keeps writing canonical data and serving
+  wallet readers without Explorer views.
+- `zinder-explorer` exits at startup with the same error.
+
+A store that records only part of the manifest fails with
+`ExplorerViewManifestRequiresFreshStore` instead. Neither failure changes the
+store, and no Zinder service deletes it.
+
+To rebuild the Explorer views:
+
+1. Record the capabilities `ExplorerQuery.ServerInfo` advertises today. They
+   are the coverage the rebuilt store must reach again.
+2. Stop `zinder-explorer` and `zinder-ingest`.
+3. Move the `materialized-views` directory out of the canonical store path. In
+   the Compose topology it is `/var/lib/zinder/canonical/materialized-views` in
+   the `data` volume. Keep it until step 6.
+4. Start `zinder-ingest`. It creates a store with the current manifest and
+   replays retained canonical history, which must be genesis-complete or start
+   from the height-0 checkpoint. Views that own a historical backfill, such as
+   fee distributions, value-pool flows, and transaction components, fill their
+   settled history from separate backfill workers after the live tail joins.
+5. Start `zinder-explorer` once ingest reports ready.
+6. Delete the moved directory only after `ExplorerQuery.ServerInfo` reports
+   zero `lag_blocks` and advertises every capability recorded in step 1. Zero
+   lag covers only the shared replay cursor. A backfill-owned view advertises
+   its capability once its backfill completes. The transparent-address ranking
+   stays withheld until its canonical snapshot is published, and no release
+   process publishes one, so a deployment that served
+   `explorer.transparent_address.ranking_v1` keeps the old directory until
+   that capability returns.
+
 ## Verify the ownership chain
 
 Use the host ports from the selected env file. Mainnet uses 9105, 9110, 9102,

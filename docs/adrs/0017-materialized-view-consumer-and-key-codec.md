@@ -137,8 +137,8 @@ column family without one. Every consumer starts at version 1.
 Registration of a bundled consumer is one `MaterializedViewConsumerDefinition`
 entry in the closed registry returned by
 `bundled_materialized_view_consumer_definitions()`. The entry declares the
-schema, product role, preset membership, and a `MaterializedViewDispatch` that
-says how the replay host constructs and drives the consumer:
+schema and a `MaterializedViewDispatch` that says how the replay host
+constructs and drives the consumer:
 
 - `ChainEventBlocks` with a `ChainEventBlockJoin` of `Replay`,
   `CanonicalBackfill`, or `CanonicalSnapshot` (activation-gated);
@@ -147,8 +147,8 @@ says how the replay host constructs and drives the consumer:
 - `CanonicalBackfillOnly` for consumers that never receive events.
 
 The recovery source is derived from the dispatch rather than declared
-separately. `MaterializedViewStore::bundled_consumers()`, the preset schema
-lists, the chain-event and event-only cursor lists, and the replay host's
+separately. `MaterializedViewStore::bundled_consumers()`, the exact Explorer view
+manifest, the chain-event and event-only cursor lists, and the replay host's
 dispatch, cursor-agreement, and backfill-owned cursor sets all derive from
 the registry. Both enums are closed, so the replay host's exhaustive matches stop
 compiling when a dispatch shape is added without handling it.

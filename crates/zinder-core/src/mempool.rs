@@ -238,18 +238,3 @@ pub struct TransparentMempoolSpend {
     /// Transaction in the mempool that consumes the outpoint.
     pub spending_transaction_id: TransactionId,
 }
-
-/// Bounded request for transparent mempool outputs tied to one address.
-///
-/// Keyed by the same typed script hash as the mined
-/// `TransparentAddressUnspentOutputsRequest` so the call surface for
-/// transparent address queries stays uniform between mined and mempool
-/// reads; the mempool read stays bounded because the live index is not a
-/// reorg-safe projection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TransparentMempoolOutputsRequest {
-    /// Hash of the transparent address script being queried.
-    pub address_script_hash: TransparentAddressScriptHash,
-    /// Maximum number of outputs the response may carry.
-    pub max_entries: u32,
-}

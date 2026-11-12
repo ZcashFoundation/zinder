@@ -8,8 +8,7 @@ use std::collections::BTreeSet;
 use zinder_proto::capabilities::{
     AdvertisePolicy, CAPABILITIES, CapabilitySurface, ExplorerReadiness,
     WALLET_READ_FULL_BLOCK_AT_V1, WALLET_READ_FULL_BLOCK_RANGE_V1,
-    WALLET_READ_TRANSACTION_BY_ID_V2, WALLET_READ_TRANSACTION_BYTES_V1,
-    WALLET_READ_TRANSPARENT_UTXO_SET_COMMITMENT_V1, capabilities_for_surface,
+    WALLET_READ_TRANSACTION_BY_ID_V2, WALLET_READ_TRANSACTION_BYTES_V1, capabilities_for_surface,
 };
 
 fn wallet_policy(capability: &str) -> Option<AdvertisePolicy> {
@@ -57,10 +56,6 @@ fn wallet_registry_records_requirements_without_resolving_runtime_support() {
         wallet_policy(WALLET_READ_TRANSACTION_BY_ID_V2),
         Some(AdvertisePolicy::AlwaysOn)
     );
-    assert_eq!(
-        wallet_policy(WALLET_READ_TRANSPARENT_UTXO_SET_COMMITMENT_V1),
-        Some(AdvertisePolicy::RequiresUtxoSetCommitment)
-    );
 }
 
 #[test]
@@ -99,4 +94,37 @@ fn transaction_history_policies_require_typed_projection_readiness_and_wallet_qu
     };
     assert!(!AdvertisePolicy::RequiresTransactionHistory.explorer_satisfied(disconnected));
     assert!(!AdvertisePolicy::RequiresCompleteTransactionHistory.explorer_satisfied(disconnected));
+}
+
+/// Capabilities retired because no packaged consumer owned them.
+///
+/// The strings stay out of the registry so no runtime can advertise them again
+/// by accident. ADR-0043 records the ownership evidence and the old-to-new
+/// mapping.
+const RETIRED_CAPABILITIES: &[&str] = &[
+    "wallet.read.transparent_outputs_by_outpoint_v1",
+    "wallet.read.transparent_spends_by_outpoint_v1",
+    "wallet.read.transparent_unspent_outputs_by_outpoint_v1",
+    "wallet.read.transparent_utxo_set_summary_v1",
+    "wallet.read.transparent_utxo_set_commitment_v1",
+    "wallet.mempool.transparent_outputs_by_address_v1",
+    "wallet.mempool.transparent_spends_by_outpoint_v1",
+    "wallet.mempool.transparent_outputs_by_outpoint_v1",
+    "wallet.address.transparent_balance_v1",
+    "explorer.utxo_set.summary_v1",
+    "explorer.utxo_set.commitment_v1",
+    "ingest.control.transparent_mempool_outputs_by_address_v1",
+    "ingest.control.transparent_mempool_spends_by_outpoint_v1",
+    "ingest.control.transparent_mempool_outputs_by_outpoint_v1",
+];
+
+#[test]
+fn retired_transparent_capabilities_stay_out_of_the_registry() {
+    let registered: BTreeSet<&str> = CAPABILITIES.iter().map(|spec| spec.string).collect();
+    for retired in RETIRED_CAPABILITIES {
+        assert!(
+            !registered.contains(retired),
+            "{retired} has no packaged consumer and must not be registered"
+        );
+    }
 }

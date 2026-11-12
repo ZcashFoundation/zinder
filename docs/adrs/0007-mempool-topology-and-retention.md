@@ -27,8 +27,9 @@ The decisions to record here are:
 ### Mempool live state is in-memory; mempool history is in RocksDB
 
 `MempoolIndex` is owned by `zinder-ingest` as in-process state. Its primary
-entries are ordered by `TransactionId`, with hash-indexed transparent overlays
-for output and spend lookups. The ordered primary index makes snapshot paging
+entries are ordered by `TransactionId`, with hash sets of the live outpoints
+that entries create and spend. Those sets reject a source event that would let
+two live entries create the same output or spend the same outpoint. The ordered primary index makes snapshot paging
 and source-generation reconciliation use working memory bounded by the page
 size rather than cloning and sorting the full mempool. Total reconciliation
 work remains proportional to the old and staged entry counts. It is not a
@@ -92,7 +93,7 @@ can increase durable event-log and reconciliation work; lowering them provides
 a fail-closed resource ceiling at the cost of availability during unusually
 large mempool bursts.
 
-The split exists because the live index needs to answer transparent lookups in microseconds without a RocksDB round-trip, and because it can be reconstructed deterministically by replaying retained durable events before reconciling with the source at startup. The event log needs to answer cursor resume and rebroadcast detection with millisecond latency over hours of history, which RocksDB does well and an in-process ring buffer does not.
+The split exists because the live index needs to answer snapshot, transaction, and conflict checks in microseconds without a RocksDB round-trip, and because it can be reconstructed deterministically by replaying retained durable events before reconciling with the source at startup. The event log needs to answer cursor resume and rebroadcast detection with millisecond latency over hours of history, which RocksDB does well and an in-process ring buffer does not.
 
 ### Compatibility and native adapters reach the writer through `IngestControl`, not a second source connection
 
@@ -206,7 +207,7 @@ Rejected. `Mined` and `Invalidated` events have different shelf lives because th
 
 ### Persist the live `MempoolIndex` as a column family
 
-Rejected. The live index needs microsecond-latency transparent-overlay lookups. RocksDB cannot match that. Persisting also means every transparent index change causes a commit, multiplying write amplification on a hot path that has no recovery requirement (retained durable events rebuild it before source reconciliation).
+Rejected. The live index needs microsecond-latency entry and conflict checks. RocksDB cannot match that. Persisting also means every transparent index change causes a commit, multiplying write amplification on a hot path that has no recovery requirement (retained durable events rebuild it before source reconciliation).
 
 ### Skip `TipChangeWatcher`; let consumers handle stream-end semantics
 
@@ -218,3 +219,11 @@ Rejected. The Android SDK tolerates arbitrary stream end and reconnects, but the
 - A second mempool source backend type. The two existing backends (`JsonRpcMempoolSource` polling, `ZebraIndexerMempoolSource` streaming) are the supported set; new backends would be a separate ADR.
 - Shielded-by-address mempool queries. The privacy boundary forbids them; transparent-only is intentional and already encoded in [Wallet data plane](../architecture/wallet-data-plane.md).
 - Mempool-broadcast endpoints beyond the existing `SendTransaction` path. Broadcast remains a `TransactionBroadcaster` boundary owned by `zinder-source`.
+
+## Revision history
+
+- 2026-11-12: The live index keeps outpoint sets for conflict checks instead of
+  by-address and by-outpoint lookup maps. The transparent mempool point
+  lookups on `WalletQuery` and `IngestControl` were removed because no packaged
+  consumer called them
+  ([ADR-0043](0043-owned-transparent-wallet-query-surface.md)).

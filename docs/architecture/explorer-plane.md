@@ -35,8 +35,8 @@ libraries. It:
 
 The boundary rules:
 
-- A `zinder-explorer` crash does not stop ingest or wallet sync. The wallet plane keeps serving every `WalletQuery` primitive, including `WalletQuery.TransparentAddressBalance`.
-- The explorer never advertises a capability whose policy requires retained canonical facts. The methods that need canonical-store reads still exist on the wire: `BlockTransactions`, `BlockProductionSeries`, `BlockProductionInTimeRange`, `CommitmentRootSearch`, `PaidFeeDistribution`, `DisplacedBlockHistory`, and `DisplacedBlockDetail`. Each one fails with `FAILED_PRECONDITION` and the `DEPENDENCY_NOT_CONFIGURED` reason. A method that also reads materialized views reports a missing or non-explorer materialized-view store first.
+- A `zinder-explorer` crash does not stop ingest or wallet sync. The wallet plane keeps serving every `WalletQuery` primitive.
+- The explorer never advertises a capability whose policy requires retained canonical facts. The methods that need canonical-store reads still exist on the wire: `BlockTransactions`, `BlockProductionSeries`, `BlockProductionInTimeRange`, `CommitmentRootSearch`, `PaidFeeDistribution`, `DisplacedBlockHistory`, and `DisplacedBlockDetail`. Each one fails with `FAILED_PRECONDITION` and the `DEPENDENCY_NOT_CONFIGURED` reason. A method that also reads materialized views first reports a missing materialized-view store with the same reason, and an attached store that lacks the exact Explorer view manifest with `UNIMPLEMENTED` and the `EXPLORER_METHOD_DISABLED` reason.
 - The explorer plane never extends canonical artifact schemas. When a view needs an authoritative chain fact the canonical surface does not carry, the source boundary extends first, the canonical artifact or event gains the field, then the explorer subscribes.
 - Server-side shielded address scanning, persisted viewing keys, and memo decryption are out of scope by product invariant.
 
@@ -53,7 +53,7 @@ service ExplorerQuery {
 }
 ```
 
-The same service also owns `BlockSummariesInRange`, `BlockDetail`, `Search`, `TransparentAddressActivity`, `MempoolSummary`, `MempoolSnapshot`, `MempoolActivity`, `FeeSummary`, `ValuePoolSummary`, and `UtxoSetSummary`. Every method follows the same shape rules:
+The same service also owns `BlockSummariesInRange`, `BlockDetail`, `Search`, `TransparentAddressActivity`, `MempoolSummary`, `MempoolSnapshot`, `MempoolActivity`, `FeeSummary`, and `ValuePoolSummary`. Every method follows the same shape rules:
 
 - Response message field tag 1 is `ExplorerFreshness freshness` ([ADR-0011](../adrs/0011-explorer-freshness-envelope.md)).
 - Streaming responses are chunked; each chunk carries its own `ExplorerFreshness` and an opaque `cursor: bytes`.
@@ -235,7 +235,7 @@ or resumes a replacement after a schema change or interrupted bootstrap.
 
 ## Fee summary
 
-`ExplorerQuery.FeeSummary` aggregates per-transaction [ZIP-317](https://zips.z.cash/zip-0317) conventional fee floors across an inclusive block range. The fee fields are the ZIP-317 floor `MARGINAL_FEE × max(logical_actions, GRACE_ACTIONS)`, not miner-collected fees: computing actual fees requires resolving every transparent input via `WalletQuery.TransparentOutputsByOutpoint`, and that fan-out is intentionally out of scope for `v1`. The conventional-fee floor is the minimum a wallet should attach to a transaction with the given shape; aggregates over many blocks give an explorer page a useful approximation of fee floors without prevout resolution.
+`ExplorerQuery.FeeSummary` aggregates per-transaction [ZIP-317](https://zips.z.cash/zip-0317) conventional fee floors across an inclusive block range. The fee fields are the ZIP-317 floor `MARGINAL_FEE × max(logical_actions, GRACE_ACTIONS)`, not miner-collected fees: computing actual fees requires the value of every transparent input, and that resolution is intentionally out of scope for `v1`. The conventional-fee floor is the minimum a wallet should attach to a transaction with the given shape; aggregates over many blocks give an explorer page a useful approximation of fee floors without prevout resolution.
 
 `logical_actions = max(transparent_input_count, transparent_output_count, max(sapling_spend_count, sapling_output_count), orchard_action_count) + ironwood_action_count`. The materialized-view plane computes component counts from `TransactionFactsArtifact` once and materializes per-block fee aggregates in `BlockSummaryRecord`. The handler scans those typed records; it does not request raw blocks or parse `zebra-chain` bytes on the read path. The fee helper lives on `zinder_core::TransactionComponentCounts::zip317_conventional_fee_zat` so the same formula is reusable from any handler that builds the count shape. The range cap is 256 blocks per request; coinbase transactions are excluded because they have no fee.
 
@@ -260,7 +260,7 @@ by daily rows while preserving exact rolling-cutoff semantics.
 
 `ExplorerQuery.ValuePoolSummary` wraps `WalletQuery.ChainValuePoolsAtTip` in the standard `ExplorerFreshness` envelope. It does not call upstream nodes directly and it does not project pool ids into fixed response fields. The response carries `source_tip: BlockTip` plus `repeated ChainValuePool pools`, preserving the height/hash identity and pool list from the same upstream observation. Existing UI can render known ids while additional consensus pools remain visible without a new explorer wire shape.
 
-`ValuePoolSummary` reports the upstream node's `getblockchaininfo.valuePools` totals; it is not a Zinder-computed UTXO accounting. The chain-wide transparent UTXO accounting is `UtxoSetSummary`.
+`ValuePoolSummary` reports the upstream node's `getblockchaininfo.valuePools` totals; it is not a Zinder-computed UTXO accounting. The explorer has no chain-wide transparent UTXO-set method ([ADR-0043](../adrs/0043-owned-transparent-wallet-query-surface.md)).
 
 `ValuePoolSummary` is only the current source snapshot. Value-pool history and value-pool flow are outside this contract because cumulative balances and transaction movement have different inputs, coverage, and replay behavior.
 
@@ -286,18 +286,6 @@ reaches the visible tip. This deliberately conservative rule accounts for
 non-monotonic block timestamps: the timestamp at the last indexed height alone
 cannot prove that a missing later height falls outside the requested range.
 Checkpoint-based stores therefore never claim full-chain completeness.
-
-## UTXO-set summary
-
-`ExplorerQuery.UtxoSetSummary` reports the chain-wide transparent UTXO set as two totals: `utxo_count` (unspent transparent outputs) and `total_value_zat` (their summed value). It wraps `WalletQuery.TransparentUtxoSetSummary` in the standard `ExplorerFreshness` envelope. This is the Zinder-computed equivalent of `gettxoutsetinfo`.
-
-The release serving-pair query does not implement `WalletQuery.TransparentUtxoSetSummary`, so this method returns the wallet endpoint's `ENDPOINT_CAPABILITY_UNAVAILABLE` refusal in the release composition. The wallet RocksDB projection already maintains the two totals and the `LtHash16` commitment incrementally as admission evidence ([ADR-0026](../adrs/0026-utxo-set-commitment.md)); canonical storage holds no UTXO rows.
-
-The aggregate is taken at the resolved chain epoch's settled tip, and `summarized_height` reports that height. Below the settled tip the summary is the settled-tip unspent set under the configured reorg policy. A deeper reorg fails closed. Rows inside the reorg window (above the settled tip) are excluded so a later reorg or spend can never make the reported total wrong. An optional `at_epoch_id` pins the read to a specific epoch; absent resolves against the visible tip.
-
-`hash_serialized` and `bytes_serialized` (the serialized-set digest and byte size that `gettxoutsetinfo` also returns) are intentionally omitted. Both depend on a defined UTXO-set serialization ordering, and Zinder does not commit to one; inventing an ordering would expose a hash no other implementation could reproduce. Only the order-independent count and value totals are reported.
-
-The totals count every unspent transparent output, including non-standard and provably-unspendable scripts (OP_RETURN, bare data outputs). The current-UTXO projection keys outputs by the hash of their raw `scriptPubKey` and never inspects the script template, so it does not apply zcashd's `IsUnspendable` filter. The two totals can therefore sit slightly above a zcashd `gettxoutsetinfo` that excludes the unspendable class.
 
 ## Overview snapshot optional fields
 
@@ -328,7 +316,6 @@ The explorer plane uses the `explorer.*` capability prefix. The full namespace s
 | `explorer.fee.paid_distribution_v1` | `ExplorerQuery.PaidFeeDistribution` | Never; requires canonical-store reads |
 | `explorer.value_pool.summary_v1` | `ExplorerQuery.ValuePoolSummary` | When the wallet endpoint is configured and `WalletQuery.ChainValuePoolsAtTip` is available |
 | `explorer.transaction.component_summary_v2` | `ExplorerQuery.TransactionComponentSummary` | When the transaction-component consumer and wallet endpoint are available |
-| `explorer.utxo_set.summary_v1` | `ExplorerQuery.UtxoSetSummary` | When the wallet endpoint is configured |
 | `explorer.search_v1` | `ExplorerQuery.Search` | When the wallet endpoint is configured |
 
 The naming follows `explorer.<noun>.<capability>_v{N}`. The noun is a domain category; the capability is the operation. New methods add new capability strings; wire-shape changes ship as `_vN` increments.
@@ -402,10 +389,8 @@ The explorer plane fails independently from canonical state.
 - An explorer service crash does not stop `zinder-ingest`. Ingest continues writing canonical artifacts and ChainEvents.
 - An explorer service crash does not stop a separately deployed
   `zinder-query` runtime. Its admitted wallet primitives remain independent of
-  explorer state. The current release endpoint omits
-  `WalletQuery.TransparentAddressBalance`; Explorer cannot depend on that
-  primitive without a coherent canonical-and-mempool snapshot.
-- An explorer materialized view becoming inconsistent does not corrupt canonical state. Operators drop the materialized-view store and rebuild from retained canonical events. When the materialized-view store is absent, `zinder-explorer` starts with materialized-view-backed capabilities omitted.
+  explorer state.
+- An explorer materialized view becoming inconsistent does not corrupt canonical state. Operators drop the materialized-view store and rebuild from retained canonical events. When the materialized-view store is absent, or the attached store lacks the exact Explorer view manifest, `zinder-explorer` starts with materialized-view-backed capabilities omitted.
 - Explorer readiness causes flow through the `/readyz` endpoint and `WalletQuery.ServerInfo` capability gating; they never propagate to the wallet plane's readiness.
 
 ## Cursor expiry contract

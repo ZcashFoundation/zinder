@@ -18,17 +18,13 @@ use tonic_types::StatusExt;
 use zinder_core::wire::{encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex};
 use zinder_core::{
     BlockHeight, ChainEpoch, ChainEpochId, MAX_SUBTREE_ROOTS_PER_REQUEST, Network, TransactionId,
-    TransparentAddressScriptHash, TransparentOutPoint, TransparentUnspentOutput,
 };
 use zinder_proto::capabilities::{
     INGEST_CONTROL_MEMPOOL_EVENTS_V2, INGEST_CONTROL_MEMPOOL_SNAPSHOT_V3,
     INGEST_CONTROL_MEMPOOL_TRANSACTION_V2, INGEST_CONTROL_SERVER_INFO_V1,
-    INGEST_CONTROL_TRANSPARENT_MEMPOOL_OUTPUTS_BY_ADDRESS_V1,
-    INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPENDS_BY_OUTPOINT_V1, INGEST_CONTROL_WRITER_STATUS_V1,
-    WALLET_ADDRESS_TRANSPARENT_BALANCE_V1, WALLET_BROADCAST_TRANSACTION_V1, WALLET_EVENTS_CHAIN_V1,
-    WALLET_EVENTS_MEMPOOL_V2, WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
-    WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1, WALLET_READ_FULL_BLOCK_AT_V1,
-    WALLET_READ_TRANSACTION_BY_ID_V2, WALLET_READ_TRANSACTION_BYTES_V1, WALLET_SNAPSHOT_MEMPOOL_V3,
+    INGEST_CONTROL_WRITER_STATUS_V1, WALLET_BROADCAST_TRANSACTION_V1, WALLET_EVENTS_CHAIN_V1,
+    WALLET_EVENTS_MEMPOOL_V2, WALLET_READ_FULL_BLOCK_AT_V1, WALLET_READ_TRANSACTION_BY_ID_V2,
+    WALLET_READ_TRANSACTION_BYTES_V1, WALLET_SNAPSHOT_MEMPOOL_V3,
 };
 use zinder_proto::v1::{
     ingest::{
@@ -45,8 +41,7 @@ use zinder_query::{
     WalletServingQuery, WalletServingReadPair,
 };
 use zinder_store::{
-    EventStreamStartPosition, RawBlobRetention, StreamCursorTokenV1, chain_view_message,
-    event_stream_start_message,
+    EventStreamStartPosition, RawBlobRetention, StreamCursorTokenV1, event_stream_start_message,
 };
 use zinder_testkit::{
     CanonicalBaseline, CanonicalWriterFixture, ChainFixture, FixtureTransactionRows,
@@ -211,8 +206,6 @@ async fn ingest_control_admission_reports_each_missing_required_capability() -> 
         INGEST_CONTROL_MEMPOOL_SNAPSHOT_V3,
         INGEST_CONTROL_MEMPOOL_TRANSACTION_V2,
         INGEST_CONTROL_MEMPOOL_EVENTS_V2,
-        INGEST_CONTROL_TRANSPARENT_MEMPOOL_OUTPUTS_BY_ADDRESS_V1,
-        INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPENDS_BY_OUTPOINT_V1,
     ] {
         let ingest_control = StaticIngestControl::new().without_capability(missing_capability);
         let (ingest_control_addr, cancel, server_handle) =
@@ -1148,211 +1141,6 @@ async fn stalled_native_mempool_event_stream_establishment_is_bounded() -> eyre:
 }
 
 #[tokio::test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "the scenario proves admitted transparent primitives while the unfenced composite balance remains omitted"
-)]
-async fn native_grpc_service_omits_unfenced_transparent_balance_but_serves_its_primitives()
--> eyre::Result<()> {
-    let (chain, fixture) = confirmed_transparent_balance_chain_fixture()?;
-
-    let pending_inflow_zat = 300;
-    let ingest_control = configured_mempool_balance_ingest_control(&fixture, pending_inflow_zat);
-    let (ingest_control_addr, cancel, server_handle) =
-        spawn_ingest_control_server(ingest_control).await?;
-    let admitted_ingest_control = AdmittedIngestControl::connect(
-        &format!("http://{ingest_control_addr}"),
-        None,
-        Network::ZcashRegtest,
-    )
-    .await?;
-    let activations = Arc::new(sample_regtest_upgrade_activations());
-    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &activations)?;
-    let (canonical, wallet) = store_fixture.take_readers()?;
-    let serving_pair = Arc::new(WalletServingReadPair::new(
-        Arc::new(canonical),
-        Arc::new(wallet),
-    )?);
-    let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
-        WalletServingPairSlot::new(serving_pair),
-        (),
-        admitted_ingest_control,
-        activations,
-    );
-    for capability in [
-        WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
-        WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1,
-    ] {
-        assert!(
-            wallet_query
-                .native_endpoint_capabilities()
-                .contains(capability)
-        );
-    }
-    assert!(
-        !wallet_query
-            .native_endpoint_capabilities()
-            .contains(WALLET_ADDRESS_TRANSPARENT_BALANCE_V1),
-        "separate live calls cannot prove one coherent mempool generation"
-    );
-    let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
-
-    let live_outputs = WalletQueryService::transparent_mempool_outputs_by_address(
-        &grpc_adapter,
-        Request::new(wallet::TransparentMempoolOutputsByAddressRequest {
-            address: Some(wallet::AddressLookup {
-                selector: Some(wallet::address_lookup::Selector::ScriptHash(
-                    fixture.address_script_hash.as_bytes().to_vec(),
-                )),
-            }),
-            max_entries: Some(1),
-        }),
-    )
-    .await?
-    .into_inner();
-    assert_eq!(live_outputs.outputs.len(), 1);
-    assert_eq!(live_outputs.outputs[0].value_zat, pending_inflow_zat);
-
-    let live_spends = WalletQueryService::transparent_mempool_spends_by_outpoint(
-        &grpc_adapter,
-        Request::new(wallet::TransparentMempoolSpendsByOutpointRequest {
-            outpoints: vec![wallet::OutPoint {
-                transaction_id: encode_rpc_transaction_id_hex(
-                    fixture.confirmed_outpoint.transaction_id,
-                ),
-                output_index: fixture.confirmed_outpoint.output_index,
-            }],
-        }),
-    )
-    .await?
-    .into_inner();
-    assert_eq!(live_spends.spends.len(), 1);
-
-    let sentinel_status = WalletQueryService::transparent_mempool_spends_by_outpoint(
-        &grpc_adapter,
-        Request::new(wallet::TransparentMempoolSpendsByOutpointRequest {
-            outpoints: vec![wallet::OutPoint {
-                transaction_id: "00".repeat(32),
-                output_index: u32::MAX,
-            }],
-        }),
-    )
-    .await
-    .err()
-    .ok_or_else(|| eyre!("mempool spend lookup accepted the coinbase sentinel"))?;
-    assert_eq!(sentinel_status.code(), Code::InvalidArgument);
-    assert!(sentinel_status.message().contains("coinbase sentinel"));
-
-    let status = WalletQueryService::transparent_address_balance(
-        &grpc_adapter,
-        Request::new(wallet::TransparentAddressBalanceRequest {
-            addresses: vec![wallet::AddressLookup {
-                selector: Some(wallet::address_lookup::Selector::ScriptHash(
-                    fixture.address_script_hash.as_bytes().to_vec(),
-                )),
-            }],
-            at_epoch_id: Some(fixture.chain_epoch.id.value()),
-        }),
-    )
-    .await
-    .err()
-    .ok_or_else(|| eyre!("unfenced composite balance unexpectedly served"))?;
-    assert_eq!(status.code(), Code::FailedPrecondition);
-
-    cancel.cancel();
-    server_handle.await??;
-    Ok(())
-}
-
-struct ConfirmedTransparentBalanceFixture {
-    chain_epoch: ChainEpoch,
-    address_script_hash: TransparentAddressScriptHash,
-    confirmed_outpoint: TransparentOutPoint,
-}
-
-fn confirmed_transparent_balance_chain_fixture()
--> eyre::Result<(ChainFixture, ConfirmedTransparentBalanceFixture)> {
-    let address_script_hash = TransparentAddressScriptHash::from_bytes([0x42; 32]);
-    let confirmed_outpoint = TransparentOutPoint::new(TransactionId::from_bytes([0x51; 32]), 0);
-    let confirmed_value_zat = 10_000;
-    let chain = ChainFixture::new(Network::ZcashRegtest)
-        .with_raw_blob_retention(RawBlobRetention::Transactions)
-        .extend_blocks(1);
-    let block = chain
-        .block_at(zinder_core::BlockHeight::new(1))
-        .ok_or_else(|| eyre!("balance fixture omitted block one"))?;
-    let transaction_rows = FixtureTransactionRows::from_raw_transaction(
-        confirmed_outpoint.transaction_id,
-        block.height,
-        block.hash,
-        0,
-        vec![0x01],
-    );
-    let confirmed_output = TransparentUnspentOutput::new(
-        address_script_hash,
-        vec![0x76, 0xa9, 0x14],
-        confirmed_outpoint,
-        confirmed_value_zat,
-        block.height,
-        block.hash,
-    );
-    let chain_epoch = chain
-        .chain_epoch(ChainEpochId::new(1))
-        .ok_or_else(|| eyre!("balance fixture omitted chain epoch"))?;
-    let chain = chain
-        .with_transaction_rows(transaction_rows)
-        .with_address_output_index(confirmed_output);
-
-    Ok((
-        chain,
-        ConfirmedTransparentBalanceFixture {
-            chain_epoch,
-            address_script_hash,
-            confirmed_outpoint,
-        },
-    ))
-}
-
-fn configured_mempool_balance_ingest_control(
-    fixture: &ConfirmedTransparentBalanceFixture,
-    pending_inflow_zat: u64,
-) -> StaticIngestControl {
-    StaticIngestControl::new()
-        .with_transparent_mempool_outputs_by_address_response(
-            wallet::TransparentMempoolOutputsByAddressResponse {
-                chain_view: Some(chain_view_message(fixture.chain_epoch)),
-                outputs: vec![wallet::TransparentMempoolOutput {
-                    address_script_hash: fixture.address_script_hash.as_bytes().to_vec(),
-                    script_pub_key: vec![0x76, 0xa9, 0x14],
-                    outpoint: Some(wallet::OutPoint {
-                        transaction_id: encode_rpc_transaction_id_hex(TransactionId::from_bytes(
-                            [0x52; 32],
-                        )),
-                        output_index: 0,
-                    }),
-                    value_zat: pending_inflow_zat,
-                }],
-            },
-        )
-        .with_transparent_mempool_spends_by_outpoint_response(
-            wallet::TransparentMempoolSpendsByOutpointResponse {
-                chain_view: Some(chain_view_message(fixture.chain_epoch)),
-                spends: vec![wallet::TransparentMempoolSpend {
-                    spent_outpoint: Some(wallet::OutPoint {
-                        transaction_id: encode_rpc_transaction_id_hex(
-                            fixture.confirmed_outpoint.transaction_id,
-                        ),
-                        output_index: fixture.confirmed_outpoint.output_index,
-                    }),
-                    spending_transaction_id: encode_rpc_transaction_id_hex(
-                        TransactionId::from_bytes([0x53; 32]),
-                    ),
-                }],
-            },
-        )
-}
-
-#[tokio::test]
 async fn native_grpc_service_uses_query_owned_capabilities() -> eyre::Result<()> {
     let (read_only_adapter, _read_only_store, _read_only_ingest) = native_adapter().await?;
     let read_only_info = WalletQueryService::server_info(
@@ -1570,8 +1358,6 @@ struct StaticIngestControl {
     mempool_transaction_calls: Arc<AtomicUsize>,
     mempool_transaction_miss: Arc<parking_lot::Mutex<Option<Status>>>,
     mempool_events_establishment_stalled: bool,
-    outputs_by_address: Option<wallet::TransparentMempoolOutputsByAddressResponse>,
-    spends_by_outpoint: Option<wallet::TransparentMempoolSpendsByOutpointResponse>,
 }
 
 impl StaticIngestControl {
@@ -1588,23 +1374,17 @@ impl StaticIngestControl {
                     INGEST_CONTROL_MEMPOOL_SNAPSHOT_V3,
                     INGEST_CONTROL_MEMPOOL_TRANSACTION_V2,
                     INGEST_CONTROL_MEMPOOL_EVENTS_V2,
-                    INGEST_CONTROL_TRANSPARENT_MEMPOOL_OUTPUTS_BY_ADDRESS_V1,
-                    INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPENDS_BY_OUTPOINT_V1,
                 ]
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
                 contract_revision: zinder_proto::CONTRACT_REVISION,
-                materialized_view_preset: String::new(),
-                materialized_view_identities: Vec::new(),
             }),
             transaction: None,
             mempool_snapshot_status: None,
             mempool_transaction_calls: Arc::new(AtomicUsize::new(0)),
             mempool_transaction_miss: Arc::new(parking_lot::Mutex::new(None)),
             mempool_events_establishment_stalled: false,
-            outputs_by_address: None,
-            spends_by_outpoint: None,
         }
     }
 
@@ -1667,22 +1447,6 @@ impl StaticIngestControl {
                 .capabilities
                 .retain(|advertised| advertised != capability);
         }
-        self
-    }
-
-    fn with_transparent_mempool_outputs_by_address_response(
-        mut self,
-        response: wallet::TransparentMempoolOutputsByAddressResponse,
-    ) -> Self {
-        self.outputs_by_address = Some(response);
-        self
-    }
-
-    fn with_transparent_mempool_spends_by_outpoint_response(
-        mut self,
-        response: wallet::TransparentMempoolSpendsByOutpointResponse,
-    ) -> Self {
-        self.spends_by_outpoint = Some(response);
         self
     }
 }
@@ -1799,53 +1563,6 @@ impl IngestControl for StaticIngestControl {
             return std::future::pending().await;
         }
         Ok(Response::new(Box::pin(tokio_stream::pending())))
-    }
-
-    async fn transparent_mempool_outputs_by_address(
-        &self,
-        _request: Request<wallet::TransparentMempoolOutputsByAddressRequest>,
-    ) -> Result<Response<wallet::TransparentMempoolOutputsByAddressResponse>, Status> {
-        Ok(Response::new(
-            self.outputs_by_address.clone().unwrap_or_else(|| {
-                wallet::TransparentMempoolOutputsByAddressResponse {
-                    chain_view: Some(wallet::ChainView {
-                        chain_epoch: Some(test_chain_epoch()),
-                        indexed_tip: None,
-                        upstream_tip: None,
-                        materialized_views: None,
-                    }),
-                    outputs: Vec::new(),
-                }
-            }),
-        ))
-    }
-
-    async fn transparent_mempool_spends_by_outpoint(
-        &self,
-        _request: Request<wallet::TransparentMempoolSpendsByOutpointRequest>,
-    ) -> Result<Response<wallet::TransparentMempoolSpendsByOutpointResponse>, Status> {
-        Ok(Response::new(
-            self.spends_by_outpoint.clone().unwrap_or_else(|| {
-                wallet::TransparentMempoolSpendsByOutpointResponse {
-                    chain_view: Some(wallet::ChainView {
-                        chain_epoch: Some(test_chain_epoch()),
-                        indexed_tip: None,
-                        upstream_tip: None,
-                        materialized_views: None,
-                    }),
-                    spends: Vec::new(),
-                }
-            }),
-        ))
-    }
-
-    async fn transparent_mempool_outputs_by_outpoint(
-        &self,
-        _request: Request<wallet::TransparentMempoolOutputsByOutpointRequest>,
-    ) -> Result<Response<wallet::TransparentOutputsByOutpointResponse>, Status> {
-        Err(Status::unimplemented(
-            "test scaffold does not stub TransparentMempoolOutputsByOutpoint",
-        ))
     }
 
     async fn chain_value_pools_at_tip(

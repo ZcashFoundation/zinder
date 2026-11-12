@@ -76,9 +76,12 @@ message ReadinessReport {
   // Operator-actionable detail tied to the active cause. Unset when the
   // cause carries no auxiliary detail.
   optional ReadinessCauseDetail detail = 4;
-  // Selected closed materialized-view workload, or empty when no materialized-view store is open.
-  string materialized_view_preset = 5;
-  // Stable identities selected by materialized_view_preset.
+  // Removed materialized-view preset. The Explorer view manifest is the only
+  // materialized-view workload.
+  reserved 5;
+  reserved "materialized_view_preset";
+  // Consumer identities of the Explorer view store this process admitted.
+  // Empty when the process has not admitted one.
   repeated string materialized_view_identities = 6;
 }
 

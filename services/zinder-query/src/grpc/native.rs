@@ -13,16 +13,11 @@ use zinder_core::{
     BroadcastUnknown, ChainEpoch, ChainEpochId, CompactBlockArtifact, MinedTransactionChainContext,
     Network, RawTransactionBytes, ShieldedProtocol, SubtreeRootArtifact, SubtreeRootRange,
     TransactionBroadcastOutcome, TransactionId, TransactionLocation, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentOutputsByOutpointResponse,
-    TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
-    TransparentUnspentOutputsByOutpointResponse, TransparentUtxoSetSummary, TxStatus,
+    TransparentAddressTxIndexArtifact, TransparentUnspentOutput, TxStatus,
     wire::{encode_rpc_block_hash_hex, encode_rpc_merkle_root_hex, encode_rpc_transaction_id_hex},
 };
-use zinder_materialized_views::MaterializedViewPreset;
 use zinder_proto::v1::{ops, wallet};
-use zinder_proto::wire::{
-    compact_block_message, encode_transparent_utxo_set_commitment, mempool_entry_message,
-};
+use zinder_proto::wire::{compact_block_message, mempool_entry_message};
 use zinder_source::transparent_address_matches_network;
 
 use crate::{
@@ -35,8 +30,7 @@ use crate::{
 pub(crate) use zinder_store::chain_view_message as build_chain_view_message;
 use zinder_store::{
     ChainEventEncodeError, ChainEventStreamFamily, StreamCursorTokenV1,
-    chain_event_envelope_message, outpoint_message, transparent_output_entry_message,
-    transparent_spend_message,
+    chain_event_envelope_message, outpoint_message,
 };
 
 /// Encodes the configured node's advertised network-upgrade schedule.
@@ -97,8 +91,6 @@ pub struct WalletEndpointMetadata {
     pub schema_version: u32,
     /// Configured reorg window depth in blocks.
     pub reorg_window_blocks: u32,
-    /// Closed materialized-view workload when this service has an attached store.
-    pub materialized_view_preset: Option<MaterializedViewPreset>,
 }
 
 impl Default for WalletEndpointMetadata {
@@ -113,7 +105,6 @@ impl Default for WalletEndpointMetadata {
             build_git_commit: zinder_runtime::BUILD_GIT_COMMIT.to_owned(),
             schema_version: u32::from(zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION.value()),
             reorg_window_blocks: 100,
-            materialized_view_preset: None,
         }
     }
 }
@@ -128,7 +119,6 @@ pub fn build_wallet_server_info(
     capabilities: &NativeWalletEndpointCapabilities,
     upstream: Option<&UpstreamNodeCapabilities>,
 ) -> wallet::WalletServerInfo {
-    let materialized_view_preset = metadata.materialized_view_preset;
     let common = ops::ServerInfo {
         network: metadata.network,
         service_name: env!("CARGO_PKG_NAME").to_owned(),
@@ -136,15 +126,6 @@ pub fn build_wallet_server_info(
         build_git_commit: metadata.build_git_commit,
         contract_revision: zinder_proto::CONTRACT_REVISION,
         capabilities: capabilities.iter().map(str::to_owned).collect(),
-        materialized_view_preset: materialized_view_preset
-            .map_or_else(String::new, |preset| preset.as_str().to_owned()),
-        materialized_view_identities: materialized_view_preset.map_or_else(Vec::new, |preset| {
-            preset
-                .consumer_schemas()
-                .iter()
-                .map(|schema| schema.name.as_str().to_owned())
-                .collect()
-        }),
     };
 
     wallet::WalletServerInfo {
@@ -191,42 +172,6 @@ pub(super) async fn settled_tip_block_response<Q: WalletQueryApi + ?Sized>(
         .settled_tip_block(at_epoch_id)
         .await
         .map(build_settled_tip_block_response)
-}
-
-/// Aggregates the chain-wide transparent UTXO set at the settled tip and
-/// encodes the native wallet response.
-///
-/// `commitment_enabled` drives both the store-side fold and whether the
-/// optional commitment field is populated, so the capability and the field stay
-/// in lockstep.
-pub(super) async fn transparent_utxo_set_summary_response<Q: WalletQueryApi + ?Sized>(
-    query_api: &Q,
-    at_epoch_id: Option<ChainEpochId>,
-) -> Result<wallet::TransparentUtxoSetSummaryResponse, QueryError> {
-    query_api
-        .transparent_utxo_set_summary(at_epoch_id)
-        .await
-        .and_then(|summary| build_transparent_utxo_set_summary_response(&summary))
-}
-
-fn build_transparent_utxo_set_summary_response(
-    summary: &TransparentUtxoSetSummary,
-) -> Result<wallet::TransparentUtxoSetSummaryResponse, QueryError> {
-    let commitment = summary
-        .commitment
-        .as_ref()
-        .map(encode_transparent_utxo_set_commitment)
-        .transpose()
-        .map_err(|_| QueryError::UnsupportedWalletEncoding {
-            value_kind: "utxo-set commitment scheme",
-        })?;
-    Ok(wallet::TransparentUtxoSetSummaryResponse {
-        chain_view: Some(build_chain_view_message(summary.chain_epoch)),
-        utxo_count: summary.utxo_count,
-        total_value_zat: summary.total_value_zat,
-        summarized_height: summary.summarized_height.value(),
-        commitment,
-    })
 }
 
 /// Reads the compact block at `height` and encodes the native wallet response.
@@ -363,47 +308,6 @@ pub async fn chain_events_response<Q: WalletQueryApi + ?Sized>(
         .chain_events(from_cursor, family)
         .await
         .and_then(|chain_events| build_chain_events_response(&chain_events))
-}
-
-/// Resolves a batch of canonical-chain transparent outpoints to their
-/// referenced outputs and encodes the native wallet response.
-///
-pub async fn transparent_outputs_by_outpoint_response<Q: WalletQueryApi + ?Sized>(
-    query_api: &Q,
-    outpoints: Vec<TransparentOutPoint>,
-    at_epoch_id: Option<ChainEpochId>,
-) -> Result<wallet::TransparentOutputsByOutpointResponse, QueryError> {
-    query_api
-        .transparent_outputs_by_outpoint(outpoints, at_epoch_id)
-        .await
-        .map(build_transparent_outputs_by_outpoint_response)
-}
-
-/// Resolves a batch of canonical-chain transparent outpoints to their spends
-/// and encodes the native wallet response.
-///
-pub async fn transparent_spends_by_outpoint_response<Q: WalletQueryApi + ?Sized>(
-    query_api: &Q,
-    outpoints: Vec<TransparentOutPoint>,
-    at_epoch_id: Option<ChainEpochId>,
-) -> Result<wallet::TransparentSpendsByOutpointResponse, QueryError> {
-    query_api
-        .transparent_spends_by_outpoint(outpoints, at_epoch_id)
-        .await
-        .map(|response| build_transparent_spends_by_outpoint_response(&response))
-}
-
-/// Resolves a batch of canonical-chain transparent outpoints to their unspent
-/// referenced outputs (null-if-spent) and encodes the native wallet response.
-pub async fn transparent_unspent_outputs_by_outpoint_response<Q: WalletQueryApi + ?Sized>(
-    query_api: &Q,
-    outpoints: Vec<TransparentOutPoint>,
-    at_epoch_id: Option<ChainEpochId>,
-) -> Result<wallet::TransparentUnspentOutputsByOutpointResponse, QueryError> {
-    query_api
-        .transparent_unspent_outputs_by_outpoint(outpoints, at_epoch_id)
-        .await
-        .map(build_transparent_unspent_outputs_by_outpoint_response)
 }
 
 /// Reads the complete unspent transparent output set for `request` at one
@@ -560,45 +464,6 @@ pub fn build_transparent_unspent_output_message(
                 block_hash: encode_rpc_block_hash_hex(output.block_hash),
             },
         )),
-    }
-}
-
-fn build_transparent_outputs_by_outpoint_response(
-    response: TransparentOutputsByOutpointResponse,
-) -> wallet::TransparentOutputsByOutpointResponse {
-    wallet::TransparentOutputsByOutpointResponse {
-        chain_view: Some(build_chain_view_message(response.chain_epoch)),
-        entries: response
-            .entries
-            .into_iter()
-            .map(transparent_output_entry_message)
-            .collect(),
-    }
-}
-
-fn build_transparent_spends_by_outpoint_response(
-    response: &TransparentSpendsByOutpointResponse,
-) -> wallet::TransparentSpendsByOutpointResponse {
-    wallet::TransparentSpendsByOutpointResponse {
-        chain_view: Some(build_chain_view_message(response.chain_epoch)),
-        spends: response
-            .spends
-            .iter()
-            .map(transparent_spend_message)
-            .collect(),
-    }
-}
-
-fn build_transparent_unspent_outputs_by_outpoint_response(
-    response: TransparentUnspentOutputsByOutpointResponse,
-) -> wallet::TransparentUnspentOutputsByOutpointResponse {
-    wallet::TransparentUnspentOutputsByOutpointResponse {
-        chain_view: Some(build_chain_view_message(response.chain_epoch)),
-        entries: response
-            .entries
-            .into_iter()
-            .map(transparent_output_entry_message)
-            .collect(),
     }
 }
 
@@ -947,23 +812,21 @@ fn native_shielded_protocol(
 mod server_info_tests {
     use zinder_proto::capabilities::{
         WALLET_BROADCAST_TRANSACTION_V1, WALLET_EVENTS_MEMPOOL_V2,
-        WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
-        WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1, WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
-        WALLET_READ_BLOCK_ID_BY_SELECTOR_V1, WALLET_READ_COMPACT_BLOCK_RANGE_V2,
-        WALLET_READ_FULL_BLOCK_AT_V1, WALLET_READ_FULL_BLOCK_RANGE_V1,
-        WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1, WALLET_READ_SERVER_INFO_V2,
-        WALLET_READ_SETTLED_TIP_BLOCK_V1, WALLET_READ_TRANSACTION_BY_ID_V2,
-        WALLET_READ_TRANSACTION_BYTES_V1, WALLET_READ_TRANSPARENT_OUTPUTS_V1,
-        WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1, WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
-        WALLET_READ_VISIBLE_TIP_BLOCK_V1, WALLET_SNAPSHOT_MEMPOOL_V3,
+        WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1, WALLET_READ_BLOCK_ID_BY_SELECTOR_V1,
+        WALLET_READ_COMPACT_BLOCK_RANGE_V2, WALLET_READ_FULL_BLOCK_AT_V1,
+        WALLET_READ_FULL_BLOCK_RANGE_V1, WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1,
+        WALLET_READ_SERVER_INFO_V2, WALLET_READ_SETTLED_TIP_BLOCK_V1,
+        WALLET_READ_TRANSACTION_BY_ID_V2, WALLET_READ_TRANSACTION_BYTES_V1,
+        WALLET_READ_TREE_STATE_AT_HEIGHT_V2, WALLET_READ_VISIBLE_TIP_BLOCK_V1,
+        WALLET_SNAPSHOT_MEMPOOL_V3,
     };
     use zinder_source::{NodeCapabilities, NodeCapability};
     use zinder_store::RawBlobRetention;
     use zinder_testkit::IngestControlFixture;
 
     use super::{
-        MaterializedViewPreset, NativeWalletEndpointCapabilities, UpstreamNodeCapabilities,
-        WalletEndpointMetadata, build_wallet_server_info,
+        NativeWalletEndpointCapabilities, UpstreamNodeCapabilities, WalletEndpointMetadata,
+        build_wallet_server_info,
     };
     use crate::AdmittedIngestControl;
 
@@ -1008,45 +871,6 @@ mod server_info_tests {
         assert_eq!(common.service_name, env!("CARGO_PKG_NAME"));
         assert_eq!(common.build_git_commit, zinder_runtime::BUILD_GIT_COMMIT);
         assert!(!common.capabilities.is_empty());
-        assert!(common.materialized_view_preset.is_empty());
-        assert!(common.materialized_view_identities.is_empty());
-        ingest_fixture.shutdown().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn server_info_reports_the_effective_wallet_workload()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let ingest_fixture =
-            IngestControlFixture::spawn(zinder_core::Network::ZcashRegtest).await?;
-        let admitted_ingest_control = AdmittedIngestControl::connect(
-            ingest_fixture.endpoint(),
-            None,
-            zinder_core::Network::ZcashRegtest,
-        )
-        .await?;
-        let metadata = WalletEndpointMetadata {
-            materialized_view_preset: Some(MaterializedViewPreset::Wallet),
-            ..WalletEndpointMetadata::default()
-        };
-        let capabilities = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
-            RawBlobRetention::Transactions,
-            NodeCapabilities::default(),
-            &admitted_ingest_control,
-        );
-        let common = build_wallet_server_info(metadata, &capabilities, None)
-            .common
-            .unwrap_or_default();
-
-        assert_eq!(common.materialized_view_preset, "wallet");
-        assert_eq!(
-            common.materialized_view_identities,
-            MaterializedViewPreset::Wallet
-                .consumer_schemas()
-                .iter()
-                .map(|schema| schema.name.as_str().to_owned())
-                .collect::<Vec<_>>()
-        );
         ingest_fixture.shutdown().await?;
         Ok(())
     }
@@ -1110,8 +934,6 @@ mod server_info_tests {
             WALLET_READ_TRANSACTION_BYTES_V1,
             WALLET_SNAPSHOT_MEMPOOL_V3,
             WALLET_EVENTS_MEMPOOL_V2,
-            WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
-            WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1,
         ] {
             assert!(transactions.contains(always_supported));
         }
@@ -1121,8 +943,6 @@ mod server_info_tests {
             WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
             WALLET_BROADCAST_TRANSACTION_V1,
             WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
-            WALLET_READ_TRANSPARENT_OUTPUTS_V1,
-            WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1,
         ] {
             assert!(!transactions.contains(structurally_absent));
         }
@@ -1146,16 +966,8 @@ mod server_info_tests {
             WALLET_READ_TRANSACTION_BYTES_V1,
             WALLET_SNAPSHOT_MEMPOOL_V3,
             WALLET_EVENTS_MEMPOOL_V2,
-            WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
-            WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1,
         ] {
             assert!(all.contains(evidence_backed));
-        }
-        for still_absent in [
-            WALLET_READ_TRANSPARENT_OUTPUTS_V1,
-            WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1,
-        ] {
-            assert!(!all.contains(still_absent));
         }
         ingest_fixture.shutdown().await?;
         Ok(())

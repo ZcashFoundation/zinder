@@ -10,17 +10,13 @@ use tokio_stream::Stream;
 use zinder_core::{
     BlockBlobArtifact, BlockHeader, BlockHeight, BlockHeightRange, BlockId, BlockSelector,
     ChainEpoch, ChainEpochId, CompactBlockArtifact, NetworkUpgradeActivations, SubtreeRootArtifact,
-    SubtreeRootRange, TransactionId, TransparentAddressBalance, TransparentAddressScriptHash,
-    TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentOutputsByOutpointResponse,
-    TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
-    TransparentUnspentOutputsByOutpointResponse, TransparentUtxoSetCommitment, TreeStateArtifact,
-    TxStatus,
+    SubtreeRootRange, TransactionId, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, TransparentUnspentOutput, TreeStateArtifact, TxStatus,
 };
 #[cfg(feature = "remote")]
 use zinder_core::{
     BlockHash, ChainValuePoolsAtTip, MempoolEntry, MempoolEvictionReason, RawTransactionBytes,
-    TransactionBroadcastOutcome, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
-    TransparentMempoolSpend,
+    TransactionBroadcastOutcome,
 };
 
 /// Chain-event stream selected by a subscription.
@@ -326,8 +322,6 @@ pub struct TransparentAddressTxIdsQuery {
     /// Optional cursor returned by a previous read. The cursor is valid only
     /// while the visible-chain event fence is unchanged.
     pub from_cursor: Option<TransparentHistoryCursor>,
-    /// Iterate newest-first when true.
-    pub descending: bool,
     /// Optional expected response epoch. `None` accepts the server's current
     /// epoch; `Some(id)` rejects a response header from any other epoch.
     pub at_epoch_id: Option<ChainEpochId>,
@@ -355,43 +349,6 @@ pub struct TransparentUnspentOutputChunk {
     pub chain_epoch: ChainEpoch,
     /// Single unspent output.
     pub output: TransparentUnspentOutput,
-}
-
-/// Chain-wide transparent UTXO-set summary returned to a client.
-///
-/// `utxo_count` and `total_value_zat` are the order-independent set totals at
-/// `summarized_height`. `commitment` is present only when the serving
-/// deployment advertises `wallet.read.transparent_utxo_set_commitment_v1`;
-/// absence is `None`, not an error.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TransparentUtxoSetSummaryView {
-    /// Chain epoch the summary was taken at.
-    pub chain_epoch: ChainEpoch,
-    /// Settled tip height the aggregate was taken at.
-    pub summarized_height: BlockHeight,
-    /// Number of unspent transparent outputs at the settled tip.
-    pub utxo_count: u64,
-    /// Sum of the values of every unspent transparent output, in zatoshi.
-    pub total_value_zat: u64,
-    /// Homomorphic commitment to the full unspent set, when advertised.
-    pub commitment: Option<TransparentUtxoSetCommitment>,
-}
-
-impl TransparentUtxoSetSummaryView {
-    /// Returns true only when both summaries carry a commitment under the same
-    /// scheme.
-    ///
-    /// Two commitments are comparable only when their schemes match: a scheme
-    /// mismatch (or either side absent) means not-comparable, never diverged.
-    /// Callers that get `true` may then compare the commitment bytes to detect
-    /// genuine divergence at the same scheme and epoch.
-    #[must_use]
-    pub fn comparable_with(&self, other: &Self) -> bool {
-        match (self.commitment.as_ref(), other.commitment.as_ref()) {
-            (Some(left), Some(right)) => left.scheme() == right.scheme(),
-            _ => false,
-        }
-    }
 }
 
 /// Borrowed chain view pinned to one [`ChainEpoch`].
@@ -604,48 +561,6 @@ impl<'a, I: ChainIndex + ?Sized> ChainSnapshot<'a, I> {
             .transparent_address_tx_ids_in_range(query)
             .await
     }
-
-    /// Requests canonical transparent outputs from the captured epoch when the
-    /// implementation advertises the corresponding capability.
-    pub async fn transparent_outputs_by_outpoint(
-        &self,
-        outpoints: &[TransparentOutPoint],
-    ) -> Result<TransparentOutputsByOutpointResponse, IndexerError> {
-        self.chain_index
-            .transparent_outputs_by_outpoint(outpoints, Some(self.chain_epoch.id))
-            .await
-    }
-
-    /// Requests canonical transparent spends from the captured epoch when the
-    /// implementation advertises the corresponding capability.
-    pub async fn transparent_spends_by_outpoint(
-        &self,
-        outpoints: &[TransparentOutPoint],
-    ) -> Result<TransparentSpendsByOutpointResponse, IndexerError> {
-        self.chain_index
-            .transparent_spends_by_outpoint(outpoints, Some(self.chain_epoch.id))
-            .await
-    }
-
-    /// Requests canonical unspent transparent outputs from the captured epoch
-    /// when the implementation advertises the corresponding capability.
-    pub async fn transparent_unspent_outputs_by_outpoint(
-        &self,
-        outpoints: &[TransparentOutPoint],
-    ) -> Result<TransparentUnspentOutputsByOutpointResponse, IndexerError> {
-        self.chain_index
-            .transparent_unspent_outputs_by_outpoint(outpoints, Some(self.chain_epoch.id))
-            .await
-    }
-
-    /// Returns the transparent UTXO-set summary from the captured epoch.
-    pub async fn transparent_utxo_set_summary(
-        &self,
-    ) -> Result<TransparentUtxoSetSummaryView, IndexerError> {
-        self.chain_index
-            .transparent_utxo_set_summary(Some(self.chain_epoch.id))
-            .await
-    }
 }
 
 /// Owned chain view pinned to one [`ChainEpoch`].
@@ -806,46 +721,6 @@ impl<I: ChainIndex + ?Sized> OwnedChainSnapshot<I> {
         self.borrowed()
             .transparent_address_tx_ids_in_range(query)
             .await
-    }
-
-    /// Requests canonical transparent outputs from the captured epoch when the
-    /// implementation advertises the corresponding capability.
-    pub async fn transparent_outputs_by_outpoint(
-        &self,
-        outpoints: &[TransparentOutPoint],
-    ) -> Result<TransparentOutputsByOutpointResponse, IndexerError> {
-        self.borrowed()
-            .transparent_outputs_by_outpoint(outpoints)
-            .await
-    }
-
-    /// Requests canonical transparent spends from the captured epoch when the
-    /// implementation advertises the corresponding capability.
-    pub async fn transparent_spends_by_outpoint(
-        &self,
-        outpoints: &[TransparentOutPoint],
-    ) -> Result<TransparentSpendsByOutpointResponse, IndexerError> {
-        self.borrowed()
-            .transparent_spends_by_outpoint(outpoints)
-            .await
-    }
-
-    /// Requests canonical unspent transparent outputs from the captured epoch
-    /// when the implementation advertises the corresponding capability.
-    pub async fn transparent_unspent_outputs_by_outpoint(
-        &self,
-        outpoints: &[TransparentOutPoint],
-    ) -> Result<TransparentUnspentOutputsByOutpointResponse, IndexerError> {
-        self.borrowed()
-            .transparent_unspent_outputs_by_outpoint(outpoints)
-            .await
-    }
-
-    /// Returns the transparent UTXO-set summary from the captured epoch.
-    pub async fn transparent_utxo_set_summary(
-        &self,
-    ) -> Result<TransparentUtxoSetSummaryView, IndexerError> {
-        self.borrowed().transparent_utxo_set_summary().await
     }
 }
 
@@ -1267,7 +1142,6 @@ pub trait ChainIndex: Send + Sync + 'static {
     ///     end_height: BlockHeight::new(0),
     ///     max_entries: None,
     ///     from_cursor: None,
-    ///     descending: false,
     ///     at_epoch_id: None,
     /// };
     /// let stream = client.transparent_address_tx_ids_in_range(query).await?;
@@ -1277,137 +1151,6 @@ pub trait ChainIndex: Send + Sync + 'static {
         &self,
         query: TransparentAddressTxIdsQuery,
     ) -> Result<TransparentAddressTxIdsStream, IndexerError>;
-
-    /// Returns the transparent-address balance summed across `addresses`.
-    ///
-    /// The confirmed total is summed from the canonical unspent-output index.
-    /// The signed `unconfirmed_delta_zat` overlays the live mempool state
-    /// available to the serving endpoint.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use zinder_client::{ChainIndex, IndexerError, TransparentAddressScriptHash};
-    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let addresses = [TransparentAddressScriptHash::from_bytes([0u8; 32])];
-    /// let balance = client.transparent_address_balance(&addresses).await?;
-    /// # let _ = balance; Ok(()) }
-    /// ```
-    async fn transparent_address_balance(
-        &self,
-        addresses: &[TransparentAddressScriptHash],
-    ) -> Result<TransparentAddressBalance, IndexerError>;
-
-    /// Resolves a batch of canonical-chain transparent outpoints to their
-    /// referenced outputs, in input order. Each entry's `prevout` is
-    /// `None` when the canonical chain at the response's epoch does not
-    /// have the referenced output.
-    ///
-    /// Implementations reject the coinbase sentinel and silently truncate
-    /// requests above
-    /// [`zinder_core::MAX_TRANSPARENT_OUTPUTS_PER_REQUEST`]. This is an
-    /// optional protocol method; remote callers must preflight
-    /// `wallet.read.transparent_outputs_by_outpoint_v1`. The current
-    /// wallet-serving query does not advertise it until its admitted serving pair
-    /// resolver is implemented.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use zinder_client::{ChainIndex, IndexerError, TransactionId, TransparentOutPoint};
-    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let outpoints = [TransparentOutPoint::new(TransactionId::from_bytes([0u8; 32]), 0)];
-    /// let prevouts = client.transparent_outputs_by_outpoint(&outpoints, None).await?;
-    /// # let _ = prevouts; Ok(()) }
-    /// ```
-    async fn transparent_outputs_by_outpoint(
-        &self,
-        outpoints: &[TransparentOutPoint],
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransparentOutputsByOutpointResponse, IndexerError>;
-
-    /// Resolves a batch of canonical-chain transparent outpoints to where each
-    /// was spent: the spending transaction, input index, and the block that
-    /// mined the spend.
-    ///
-    /// Outpoints unspent on the canonical chain at the response's epoch produce
-    /// no entry; consumers key results by `spent_outpoint`. Implementations
-    /// reject the coinbase sentinel and silently truncate requests above
-    /// [`zinder_core::MAX_TRANSPARENT_OUTPUTS_PER_REQUEST`]. This is the
-    /// canonical half of a getspentinfo-equivalent lookup; the unmined half is
-    /// the endpoint-backed `transparent_mempool_spends_by_outpoint` method.
-    /// This is an optional protocol method; remote callers must preflight
-    /// `wallet.read.transparent_spends_by_outpoint_v1`. The current
-    /// wallet-serving query does not advertise it until its admitted serving pair
-    /// resolver is implemented.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use zinder_client::{ChainIndex, IndexerError, TransactionId, TransparentOutPoint};
-    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let outpoints = [TransparentOutPoint::new(TransactionId::from_bytes([0u8; 32]), 0)];
-    /// let spends = client.transparent_spends_by_outpoint(&outpoints, None).await?;
-    /// # let _ = spends; Ok(()) }
-    /// ```
-    async fn transparent_spends_by_outpoint(
-        &self,
-        outpoints: &[TransparentOutPoint],
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransparentSpendsByOutpointResponse, IndexerError>;
-
-    /// Resolves a batch of transparent outpoints to their referenced output,
-    /// returning each only while it is unspent on the canonical chain at the
-    /// response's epoch (gettxout-equivalent, null-if-spent).
-    ///
-    /// An outpoint produces an entry only when the canonical chain at that
-    /// epoch has the output and it carries no canonical spend; spent or
-    /// never-existed outpoints produce no entry, so every entry's `output` is
-    /// present. Consumers key results by `outpoint`. Implementations reject the
-    /// coinbase sentinel and silently truncate requests above
-    /// [`zinder_core::MAX_TRANSPARENT_OUTPUTS_PER_REQUEST`]. The read is
-    /// canonical-only: a mempool-aware caller subtracts the spends returned by
-    /// the endpoint-backed `transparent_mempool_spends_by_outpoint` method.
-    /// This is an optional protocol method; remote callers must preflight
-    /// `wallet.read.transparent_unspent_outputs_by_outpoint_v1`. The current
-    /// wallet-serving query does not advertise it until its admitted serving pair
-    /// resolver is implemented.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use zinder_client::{ChainIndex, IndexerError, TransactionId, TransparentOutPoint};
-    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let outpoints = [TransparentOutPoint::new(TransactionId::from_bytes([0u8; 32]), 0)];
-    /// let unspent = client.transparent_unspent_outputs_by_outpoint(&outpoints, None).await?;
-    /// # let _ = unspent; Ok(()) }
-    /// ```
-    async fn transparent_unspent_outputs_by_outpoint(
-        &self,
-        outpoints: &[TransparentOutPoint],
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransparentUnspentOutputsByOutpointResponse, IndexerError>;
-
-    /// Aggregates the chain-wide transparent UTXO set at the settled tip.
-    ///
-    /// Returns the order-independent count and total value (the
-    /// `gettxoutsetinfo`-equivalent), plus the homomorphic commitment when the
-    /// serving deployment advertises
-    /// `wallet.read.transparent_utxo_set_commitment_v1`. Absence of the
-    /// commitment is `None`.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use zinder_client::{ChainIndex, IndexerError};
-    /// # async fn demo<T: ChainIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let summary = client.transparent_utxo_set_summary(None).await?;
-    /// # let _ = summary; Ok(()) }
-    /// ```
-    async fn transparent_utxo_set_summary(
-        &self,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransparentUtxoSetSummaryView, IndexerError>;
 }
 
 /// Live endpoint-backed operations layered on top of [`ChainIndex`].
@@ -1619,72 +1362,4 @@ pub trait EndpointBackedIndex: ChainIndex {
     /// # let _ = present; Ok(()) }
     /// ```
     async fn is_in_mempool(&self, transaction_id: TransactionId) -> Result<bool, IndexerError>;
-
-    /// Returns transparent mempool outputs tied to one address.
-    ///
-    /// Bounded by the request's `max_entries`; values larger than the
-    /// server's configured cap are silently clamped to that cap.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use zinder_client::{
-    /// #     EndpointBackedIndex, IndexerError, TransparentAddressScriptHash,
-    /// #     TransparentMempoolOutputsRequest,
-    /// # };
-    /// # async fn demo<T: EndpointBackedIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let request = TransparentMempoolOutputsRequest {
-    ///     address_script_hash: TransparentAddressScriptHash::from_bytes([0u8; 32]),
-    ///     max_entries: 64,
-    /// };
-    /// let outputs = client.transparent_mempool_outputs_by_address(request).await?;
-    /// # let _ = outputs; Ok(()) }
-    /// ```
-    async fn transparent_mempool_outputs_by_address(
-        &self,
-        request: TransparentMempoolOutputsRequest,
-    ) -> Result<Vec<TransparentMempoolOutput>, IndexerError>;
-
-    /// Returns the mempool spends that consume any of `outpoints`.
-    ///
-    /// Outpoints with no unmined spend produce no entry; callers key
-    /// results by `spent_outpoint`. Implementations silently truncate
-    /// requests above
-    /// [`zinder_core::MAX_TRANSPARENT_OUTPUTS_PER_REQUEST`].
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use zinder_client::{
-    /// #     EndpointBackedIndex, IndexerError, TransactionId, TransparentOutPoint,
-    /// # };
-    /// # async fn demo<T: EndpointBackedIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let outpoints = [TransparentOutPoint::new(TransactionId::from_bytes([0u8; 32]), 0)];
-    /// let spends = client.transparent_mempool_spends_by_outpoint(&outpoints).await?;
-    /// # let _ = spends; Ok(()) }
-    /// ```
-    async fn transparent_mempool_spends_by_outpoint(
-        &self,
-        outpoints: &[TransparentOutPoint],
-    ) -> Result<Vec<TransparentMempoolSpend>, IndexerError>;
-
-    /// Resolves a batch of outpoints against the live mempool index. Used
-    /// when an outpoint references an output of an unconfirmed mempool
-    /// transaction (chained-mempool flows).
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use zinder_client::{
-    /// #     EndpointBackedIndex, IndexerError, TransactionId, TransparentOutPoint,
-    /// # };
-    /// # async fn demo<T: EndpointBackedIndex>(client: &T) -> Result<(), IndexerError> {
-    /// let outpoints = [TransparentOutPoint::new(TransactionId::from_bytes([0u8; 32]), 0)];
-    /// let prevouts = client.transparent_mempool_outputs_by_outpoint(&outpoints).await?;
-    /// # let _ = prevouts; Ok(()) }
-    /// ```
-    async fn transparent_mempool_outputs_by_outpoint(
-        &self,
-        outpoints: &[TransparentOutPoint],
-    ) -> Result<TransparentOutputsByOutpointResponse, IndexerError>;
 }

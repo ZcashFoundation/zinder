@@ -8,7 +8,7 @@
 #     -f deploy/docker-compose.explorer.yml \
 #     up -d
 #
-# zinder-ingest already builds the explorer materialized-view preset. This
+# zinder-ingest already builds the Explorer view store. This
 # runtime opens the materialized-view secondary and federates the native
 # WalletQuery service over the shared loopback namespace.
 

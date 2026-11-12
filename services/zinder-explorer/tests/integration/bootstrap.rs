@@ -550,7 +550,6 @@ fn seeded_reorg_history_materialized_view_store(
 ) -> Result<SeededMaterializedViewStore> {
     let primary_materialized_view_store = zinder_ingest::open_primary_materialized_view_store(
         canonical_path,
-        zinder_materialized_views::MaterializedViewPreset::Explorer,
         zinder_store::RocksDbResourceBudget::for_local_tests(),
     )?;
     record_reorg_incidents(&primary_materialized_view_store)?;

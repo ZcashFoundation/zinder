@@ -19,9 +19,7 @@ use tokio_stream::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use zinder_core::{
-    BlockId, ChainEpoch, MempoolEntry, MempoolEvictionReason, TransactionId,
-    TransparentAddressScriptHash, TransparentMempoolOutput, TransparentMempoolSpend,
-    TransparentOutPoint, TransparentOutputEntry, UnixTimestampMillis,
+    BlockId, ChainEpoch, MempoolEntry, MempoolEvictionReason, TransactionId, UnixTimestampMillis,
 };
 use zinder_proto::{
     status_for_reason,
@@ -280,48 +278,6 @@ impl LiveMempoolOwner {
         let _mutation_guard = self.mutation_gate.lock().await;
         self.coherent_serving_state_for(chain_epoch)?;
         Ok(self.index.entry_for(transaction_id))
-    }
-
-    /// Returns live transparent outputs for one script-hash selector.
-    pub(crate) async fn transparent_outputs_by_address(
-        &self,
-        chain_epoch: ChainEpoch,
-        address_script_hash: TransparentAddressScriptHash,
-        max_entries: u32,
-    ) -> Result<Vec<TransparentMempoolOutput>, Status> {
-        self.require_serving()?;
-        let _mutation_guard = self.mutation_gate.lock().await;
-        self.coherent_serving_state_for(chain_epoch)?;
-        Ok(self
-            .index
-            .transparent_outputs_by_address(address_script_hash, max_entries))
-    }
-
-    /// Returns live mempool spends for requested transparent outpoints.
-    pub(crate) async fn transparent_spends_by_outpoint(
-        &self,
-        chain_epoch: ChainEpoch,
-        outpoints: impl IntoIterator<Item = TransparentOutPoint>,
-    ) -> Result<Vec<TransparentMempoolSpend>, Status> {
-        self.require_serving()?;
-        let _mutation_guard = self.mutation_gate.lock().await;
-        self.coherent_serving_state_for(chain_epoch)?;
-        Ok(outpoints
-            .into_iter()
-            .filter_map(|outpoint| self.index.transparent_spend_by_outpoint(outpoint))
-            .collect())
-    }
-
-    /// Resolves live mempool-created outputs for requested outpoints.
-    pub(crate) async fn transparent_outputs_by_outpoints(
-        &self,
-        chain_epoch: ChainEpoch,
-        outpoints: &[TransparentOutPoint],
-    ) -> Result<Vec<TransparentOutputEntry>, Status> {
-        self.require_serving()?;
-        let _mutation_guard = self.mutation_gate.lock().await;
-        self.coherent_serving_state_for(chain_epoch)?;
-        Ok(self.index.transparent_outputs_by_outpoints(outpoints))
     }
 
     /// Reads one in-memory snapshot page with a durable events-resume anchor.

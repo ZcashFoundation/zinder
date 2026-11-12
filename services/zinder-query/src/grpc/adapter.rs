@@ -1,6 +1,6 @@
 //! Native gRPC adapter for wallet query reads.
 
-use std::{collections::HashMap, num::NonZeroU32, pin::Pin, time::Instant};
+use std::{num::NonZeroU32, pin::Pin, time::Instant};
 
 use tokio::sync::mpsc;
 use tokio_stream::{self as stream, Stream, StreamExt as _, wrappers::ReceiverStream};
@@ -11,9 +11,8 @@ use zinder_core::wire::{
     encode_rpc_transaction_id_hex,
 };
 use zinder_core::{
-    BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch, ChainEpochId,
-    MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, Network, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootIndex, SubtreeRootRange, TransactionId, TransparentOutPoint,
+    BlockHeight, BlockHeightRange, BlockSelector, ChainEpoch, ChainEpochId, Network,
+    RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange, TransactionId,
 };
 use zinder_proto::{
     capabilities, status_for_reason, status_with_reason,
@@ -49,10 +48,8 @@ use super::native::{
     build_wallet_server_info, chain_value_pools_at_tip_response, compact_block_response,
     compact_blocks_in_range_chunks, full_block_response, latest_tree_state_checkpoint_response,
     network_upgrade_activations_response, settled_tip_block_response, subtree_roots_response,
-    transaction_response, transparent_address_unspent_outputs_response,
-    transparent_outputs_by_outpoint_response, transparent_spends_by_outpoint_response,
-    transparent_unspent_outputs_by_outpoint_response, transparent_utxo_set_summary_response,
-    tree_state_at_response, visible_tip_block_response,
+    transaction_response, transparent_address_unspent_outputs_response, tree_state_at_response,
+    visible_tip_block_response,
 };
 use super::status_from_query_error;
 
@@ -594,142 +591,6 @@ where
         outcome
     }
 
-    async fn transparent_mempool_outputs_by_address(
-        &self,
-        request: Request<wallet::TransparentMempoolOutputsByAddressRequest>,
-    ) -> Result<Response<wallet::TransparentMempoolOutputsByAddressResponse>, Status> {
-        self.require_endpoint_capability(
-            capabilities::WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
-        )?;
-        let started_at = Instant::now();
-        let outcome = async {
-            let request = request.into_inner();
-            let address_script_hash =
-                address_lookup_to_script_hash(request.address.clone(), self.server_info_network()?)
-                    .map_err(|error| status_from_query_error(&error))?;
-            let normalized_request = wallet::TransparentMempoolOutputsByAddressRequest {
-                address: Some(typed_script_hash_address_lookup(
-                    &address_script_hash.as_bytes(),
-                )),
-                max_entries: request.max_entries,
-            };
-            let mut client = self
-                .ingest_control_client(INGEST_CONTROL_NOT_COMPOSED)
-                .await?;
-            client
-                .transparent_mempool_outputs_by_address(wallet_ingest_control_request(
-                    normalized_request,
-                ))
-                .await
-        }
-        .await;
-        record_proxy_outcome(
-            "transparent_mempool_outputs_by_address",
-            started_at,
-            &outcome,
-        );
-        outcome
-    }
-
-    async fn transparent_mempool_spends_by_outpoint(
-        &self,
-        request: Request<wallet::TransparentMempoolSpendsByOutpointRequest>,
-    ) -> Result<Response<wallet::TransparentMempoolSpendsByOutpointResponse>, Status> {
-        self.require_endpoint_capability(
-            capabilities::WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1,
-        )?;
-        let started_at = Instant::now();
-        let outcome = async {
-            let request = request.into_inner();
-            reject_coinbase_sentinels(&request.outpoints)?;
-            let mut client = self
-                .ingest_control_client(INGEST_CONTROL_NOT_COMPOSED)
-                .await?;
-            client
-                .transparent_mempool_spends_by_outpoint(wallet_ingest_control_request(request))
-                .await
-        }
-        .await;
-        record_proxy_outcome(
-            "transparent_mempool_spends_by_outpoint",
-            started_at,
-            &outcome,
-        );
-        outcome
-    }
-
-    async fn transparent_outputs_by_outpoint(
-        &self,
-        request: Request<wallet::TransparentOutputsByOutpointRequest>,
-    ) -> Result<Response<wallet::TransparentOutputsByOutpointResponse>, Status> {
-        self.require_endpoint_capability(capabilities::WALLET_READ_TRANSPARENT_OUTPUTS_V1)?;
-        let request = request.into_inner();
-        reject_coinbase_sentinels(&request.outpoints)?;
-        let outpoints = transparent_outpoints_from_request(request.outpoints)?;
-        let at_epoch = chain_epoch_id_from_request(request.at_epoch_id);
-        transparent_outputs_by_outpoint_response(&self.query_api, outpoints, at_epoch)
-            .await
-            .map(Response::new)
-            .map_err(|error| status_from_query_error(&error))
-    }
-
-    async fn transparent_spends_by_outpoint(
-        &self,
-        request: Request<wallet::TransparentSpendsByOutpointRequest>,
-    ) -> Result<Response<wallet::TransparentSpendsByOutpointResponse>, Status> {
-        self.require_endpoint_capability(capabilities::WALLET_READ_TRANSPARENT_SPENDS_V1)?;
-        let request = request.into_inner();
-        reject_coinbase_sentinels(&request.outpoints)?;
-        let outpoints = transparent_outpoints_from_request(request.outpoints)?;
-        let at_epoch = chain_epoch_id_from_request(request.at_epoch_id);
-        transparent_spends_by_outpoint_response(&self.query_api, outpoints, at_epoch)
-            .await
-            .map(Response::new)
-            .map_err(|error| status_from_query_error(&error))
-    }
-
-    async fn transparent_unspent_outputs_by_outpoint(
-        &self,
-        request: Request<wallet::TransparentUnspentOutputsByOutpointRequest>,
-    ) -> Result<Response<wallet::TransparentUnspentOutputsByOutpointResponse>, Status> {
-        self.require_endpoint_capability(capabilities::WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1)?;
-        let request = request.into_inner();
-        reject_coinbase_sentinels(&request.outpoints)?;
-        let outpoints = transparent_outpoints_from_request(request.outpoints)?;
-        let at_epoch = chain_epoch_id_from_request(request.at_epoch_id);
-        transparent_unspent_outputs_by_outpoint_response(&self.query_api, outpoints, at_epoch)
-            .await
-            .map(Response::new)
-            .map_err(|error| status_from_query_error(&error))
-    }
-
-    async fn transparent_mempool_outputs_by_outpoint(
-        &self,
-        request: Request<wallet::TransparentMempoolOutputsByOutpointRequest>,
-    ) -> Result<Response<wallet::TransparentOutputsByOutpointResponse>, Status> {
-        self.require_endpoint_capability(capabilities::WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_V1)?;
-        let started_at = Instant::now();
-        let outcome = async {
-            let request_inner = request.get_ref();
-            reject_coinbase_sentinels(&request_inner.outpoints)?;
-            let mut client = self
-                .ingest_control_client(INGEST_CONTROL_NOT_COMPOSED)
-                .await?;
-            client
-                .transparent_mempool_outputs_by_outpoint(wallet_ingest_control_request(
-                    request.into_inner(),
-                ))
-                .await
-        }
-        .await;
-        record_proxy_outcome(
-            "transparent_mempool_outputs_by_outpoint",
-            started_at,
-            &outcome,
-        );
-        outcome
-    }
-
     async fn chain_value_pools_at_tip(
         &self,
         _request: Request<wallet::ChainValuePoolsAtTipRequest>,
@@ -815,30 +676,6 @@ where
         Ok(Response::new(Box::pin(chunks)))
     }
 
-    async fn transparent_address_balance(
-        &self,
-        request: Request<wallet::TransparentAddressBalanceRequest>,
-    ) -> Result<Response<wallet::TransparentAddressBalanceResponse>, Status> {
-        self.require_endpoint_capability(capabilities::WALLET_ADDRESS_TRANSPARENT_BALANCE_V1)?;
-        self.compute_transparent_address_balance(request).await
-    }
-
-    async fn transparent_utxo_set_summary(
-        &self,
-        request: Request<wallet::TransparentUtxoSetSummaryRequest>,
-    ) -> Result<Response<wallet::TransparentUtxoSetSummaryResponse>, Status> {
-        self.require_endpoint_capability(
-            capabilities::WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1,
-        )?;
-        transparent_utxo_set_summary_response(
-            &self.query_api,
-            chain_epoch_id_from_request(request.into_inner().at_epoch_id),
-        )
-        .await
-        .map(Response::new)
-        .map_err(|error| status_from_query_error(&error))
-    }
-
     async fn server_info(
         &self,
         _request: Request<wallet::ServerInfoRequest>,
@@ -880,7 +717,6 @@ fn transparent_address_tx_ids_in_range_request_from_message(
         end_height: BlockHeight::new(request.end_height),
         max_entries,
         from_cursor,
-        descending: request.descending,
     })
 }
 
@@ -923,173 +759,6 @@ impl<QueryApi> WalletQueryGrpcAdapter<QueryApi> {
             .await?
             .ok_or_else(|| Status::unavailable(unconfigured_message))
     }
-
-    /// Computes the transparent-address balance: the canonical confirmed total
-    /// summed in-process plus the live mempool overlay.
-    ///
-    /// The confirmed total, address cap, and chain-epoch pin are owned by
-    /// [`WalletQueryApi::transparent_address_balance`]. The signed
-    /// `unconfirmed_delta_zat` overlay is composed here from the live mempool
-    /// surfaces reached through the query's ingest-control client.
-    async fn compute_transparent_address_balance(
-        &self,
-        request: Request<wallet::TransparentAddressBalanceRequest>,
-    ) -> Result<Response<wallet::TransparentAddressBalanceResponse>, Status>
-    where
-        QueryApi: Clone + WalletQueryApi + IngestControlClientAccess + Send + Sync + 'static,
-    {
-        let request = request.into_inner();
-        if request.addresses.is_empty() {
-            return Err(Status::invalid_argument("addresses list must not be empty"));
-        }
-        let network = self.server_info_network()?;
-        let at_epoch_id = chain_epoch_id_from_request(request.at_epoch_id);
-        let mut script_hashes = Vec::with_capacity(request.addresses.len());
-        for address_lookup in request.addresses {
-            let address_script_hash = address_lookup_to_script_hash(Some(address_lookup), network)
-                .map_err(|error| status_from_query_error(&error))?;
-            script_hashes.push(address_script_hash);
-        }
-
-        let confirmed = self
-            .query_api
-            .transparent_address_balance(script_hashes.clone(), at_epoch_id)
-            .await
-            .map_err(|error| status_from_query_error(&error))?;
-
-        let unconfirmed_delta_zat = self
-            .mempool_balance_overlay(&script_hashes, confirmed.chain_epoch.id)
-            .await?;
-
-        Ok(Response::new(wallet::TransparentAddressBalanceResponse {
-            chain_view: Some(build_chain_view_message(confirmed.chain_epoch)),
-            confirmed_zat: confirmed.confirmed_zat,
-            unconfirmed_delta_zat,
-            address_count: confirmed.address_count,
-        }))
-    }
-
-    /// Sums the signed mempool delta for the requested addresses.
-    ///
-    /// Adds pending inflows (mempool outputs paid to the addresses) and
-    /// subtracts pending outflows (mempool spends of the addresses' confirmed
-    /// unspent set), both read from the live mempool index. The release native
-    /// endpoint does not advertise transparent balance, because the confirmed
-    /// total and this overlay are not read from one coherent
-    /// canonical-and-mempool snapshot.
-    async fn mempool_balance_overlay(
-        &self,
-        script_hashes: &[zinder_core::TransparentAddressScriptHash],
-        chain_epoch_id: ChainEpochId,
-    ) -> Result<i64, Status>
-    where
-        QueryApi: Clone + WalletQueryApi + IngestControlClientAccess + Send + Sync + 'static,
-    {
-        let Some(mut client) =
-            IngestControlClientAccess::ingest_control_client(&self.query_api).await?
-        else {
-            return Ok(0);
-        };
-
-        let mut unconfirmed_delta_zat: i64 = 0;
-        let mut spendable_value_by_outpoint: HashMap<(String, u32), u64> = HashMap::new();
-        for address_script_hash in script_hashes {
-            let mempool_outputs = client
-                .transparent_mempool_outputs_by_address(wallet_ingest_control_request(
-                    wallet::TransparentMempoolOutputsByAddressRequest {
-                        address: Some(typed_script_hash_address_lookup(
-                            &address_script_hash.as_bytes(),
-                        )),
-                        max_entries: None,
-                    },
-                ))
-                .await?
-                .into_inner();
-            for output in &mempool_outputs.outputs {
-                unconfirmed_delta_zat =
-                    unconfirmed_delta_zat.saturating_add(value_zat_to_signed(output.value_zat)?);
-            }
-
-            let unspent_outputs = self
-                .query_api
-                .transparent_address_unspent_outputs(
-                    TransparentAddressUnspentOutputsRequest {
-                        address_script_hash: *address_script_hash,
-                        start_height: BlockHeight::new(0),
-                    },
-                    Some(chain_epoch_id),
-                )
-                .await
-                .map_err(|error| status_from_query_error(&error))?;
-            for output in &unspent_outputs.outputs {
-                spendable_value_by_outpoint.insert(
-                    (
-                        encode_rpc_transaction_id_hex(output.outpoint.transaction_id),
-                        output.outpoint.output_index,
-                    ),
-                    output.value_zat,
-                );
-            }
-        }
-
-        let pending_outflow_zat =
-            mempool_pending_outflow_zat(&mut client, &spendable_value_by_outpoint).await?;
-        Ok(unconfirmed_delta_zat.saturating_sub(pending_outflow_zat))
-    }
-}
-
-/// Sums the value of confirmed unspent outputs that the live mempool already
-/// spends, batched at the per-request outpoint cap.
-async fn mempool_pending_outflow_zat(
-    client: &mut AuthenticatedIngestControlClient,
-    spendable_value_by_outpoint: &HashMap<(String, u32), u64>,
-) -> Result<i64, Status> {
-    let spendable_outpoints = spendable_value_by_outpoint
-        .keys()
-        .map(|(transaction_id, output_index)| wallet::OutPoint {
-            transaction_id: transaction_id.clone(),
-            output_index: *output_index,
-        })
-        .collect::<Vec<_>>();
-    let mut pending_outflow_zat: i64 = 0;
-    for outpoint_batch in spendable_outpoints.chunks(MAX_TRANSPARENT_OUTPUTS_PER_REQUEST) {
-        let spends = client
-            .transparent_mempool_spends_by_outpoint(wallet_ingest_control_request(
-                wallet::TransparentMempoolSpendsByOutpointRequest {
-                    outpoints: outpoint_batch.to_vec(),
-                },
-            ))
-            .await?
-            .into_inner();
-        for spend in spends.spends {
-            let spent_outpoint = spend.spent_outpoint.ok_or_else(|| {
-                Status::data_loss(
-                    "TransparentMempoolSpend.spent_outpoint missing in IngestControl response",
-                )
-            })?;
-            if let Some(value_zat) = spendable_value_by_outpoint
-                .get(&(spent_outpoint.transaction_id, spent_outpoint.output_index))
-            {
-                pending_outflow_zat =
-                    pending_outflow_zat.saturating_add(value_zat_to_signed(*value_zat)?);
-            }
-        }
-    }
-    Ok(pending_outflow_zat)
-}
-
-/// Builds an `AddressLookup` whose only populated arm is the typed
-/// script-hash bytes.
-///
-/// The native adapter parses public `AddressLookup` selectors at the
-/// public boundary; this helper produces the normalized shape the
-/// private ingest-control surface accepts.
-fn typed_script_hash_address_lookup(script_hash_bytes: &[u8]) -> wallet::AddressLookup {
-    wallet::AddressLookup {
-        selector: Some(wallet::address_lookup::Selector::ScriptHash(
-            script_hash_bytes.to_vec(),
-        )),
-    }
 }
 
 fn transaction_id_from_request(transaction_id_rpc_hex: &str) -> Result<TransactionId, Status> {
@@ -1097,59 +766,8 @@ fn transaction_id_from_request(transaction_id_rpc_hex: &str) -> Result<Transacti
         .map_err(|error| Status::invalid_argument(error.to_string()))
 }
 
-/// Rejects the coinbase sentinel outpoint with `INVALID_ARGUMENT` and a
-/// `BadRequest`-shaped diagnostic naming the offending request index.
-///
-fn reject_coinbase_sentinels(outpoints: &[wallet::OutPoint]) -> Result<(), Status> {
-    let sentinel = TransparentOutPoint::COINBASE_SENTINEL;
-    let sentinel_transaction_id_rpc_hex = encode_rpc_transaction_id_hex(sentinel.transaction_id);
-    for (request_index, outpoint) in outpoints.iter().enumerate() {
-        if outpoint.transaction_id == sentinel_transaction_id_rpc_hex
-            && outpoint.output_index == sentinel.output_index
-        {
-            return Err(Status::invalid_argument(format!(
-                "outpoints[{request_index}] is the coinbase sentinel \
-                 (transaction_id is the all-zero RPC-form hash, output_index == 0xFFFFFFFF); \
-                 filter coinbase inputs at the request boundary",
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Translates a wire outpoint list into typed `TransparentOutPoint`s,
-/// silently truncating to [`MAX_TRANSPARENT_OUTPUTS_PER_REQUEST`].
-fn transparent_outpoints_from_request(
-    mut outpoints: Vec<wallet::OutPoint>,
-) -> Result<Vec<TransparentOutPoint>, Status> {
-    outpoints.truncate(MAX_TRANSPARENT_OUTPUTS_PER_REQUEST);
-    outpoints
-        .into_iter()
-        .map(|outpoint| {
-            let transaction_id = transaction_id_from_request(&outpoint.transaction_id)?;
-            Ok(TransparentOutPoint::new(
-                transaction_id,
-                outpoint.output_index,
-            ))
-        })
-        .collect()
-}
-
 fn chain_epoch_id_from_request(at_epoch_id: Option<u64>) -> Option<ChainEpochId> {
     at_epoch_id.map(ChainEpochId::new)
-}
-
-/// Converts a wire `u64` Zatoshi value to the signed delta-accumulator width.
-///
-/// Zcash's hardcoded supply cap (`MAX_MONEY = 21,000,000 * 10^8` zat) fits
-/// well inside `i64::MAX`, so a `u64` value that does not fit is upstream data
-/// corruption and surfaces as `data_loss` rather than silent saturation.
-fn value_zat_to_signed(value_zat: u64) -> Result<i64, Status> {
-    i64::try_from(value_zat).map_err(|_| {
-        Status::data_loss(format!(
-            "mempool overlay value_zat {value_zat} exceeds i64::MAX"
-        ))
-    })
 }
 
 fn block_selector_from_request(

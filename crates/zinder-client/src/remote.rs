@@ -26,20 +26,14 @@ use zinder_core::{
     MempoolEvictionReason, MinedTransaction, MinedTransactionChainContext, Network,
     NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
     SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
-    TransactionBroadcastOutcome, TransactionId, TransactionLocation, TransparentAddressBalance,
-    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentMempoolOutput,
-    TransparentMempoolOutputsRequest, TransparentMempoolSpend, TransparentOutPoint,
-    TransparentOutputsByOutpointResponse, TransparentSpendEntry,
-    TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
-    TransparentUnspentOutputsByOutpointResponse, TreeStateArtifact, TxStatus,
+    TransactionBroadcastOutcome, TransactionId, TransactionLocation, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, TransparentOutPoint, TransparentUnspentOutput,
+    TreeStateArtifact, TxStatus,
 };
 use zinder_proto::v1::wallet::{self, wallet_query_client::WalletQueryClient};
 use zinder_proto::wire::{
     TransactionAbsence, WalletWireDecodeError, chain_epoch_from_message,
-    compact_block_from_message as compact_block_from_wire_message,
-    decode_transparent_utxo_set_commitment, mempool_entry_from_message, outpoint_message,
-    transparent_mempool_output_from_message as transparent_mempool_output_from_message_shared,
-    transparent_mempool_spend_from_message as transparent_mempool_spend_from_message_shared,
+    compact_block_from_message as compact_block_from_wire_message, mempool_entry_from_message,
 };
 
 use crate::error::ZINDER_ERROR_DOMAIN;
@@ -52,7 +46,7 @@ use crate::{
     TransparentAddressTransactionChunk, TransparentAddressTxIdsQuery,
     TransparentAddressTxIdsStream, TransparentAddressUnspentOutputsQuery,
     TransparentAddressUnspentOutputsStream, TransparentHistoryCursor,
-    TransparentUnspentOutputChunk, TransparentUtxoSetSummaryView,
+    TransparentUnspentOutputChunk,
 };
 
 /// Options for opening a remote chain index over the native wallet gRPC API.
@@ -700,7 +694,6 @@ impl ChainIndex for RemoteChainIndex {
                 .as_ref()
                 .map(|cursor| cursor.as_bytes().to_vec())
                 .unwrap_or_default(),
-            descending: query.descending,
         };
         let response = self
             .client()
@@ -727,119 +720,6 @@ impl ChainIndex for RemoteChainIndex {
             Box::pin(wire_stream),
             history_stream_state,
         ))
-    }
-
-    async fn transparent_address_balance(
-        &self,
-        addresses: &[TransparentAddressScriptHash],
-    ) -> Result<TransparentAddressBalance, IndexerError> {
-        let wire_addresses = addresses
-            .iter()
-            .map(|script_hash| wallet::AddressLookup {
-                selector: Some(wallet::address_lookup::Selector::ScriptHash(
-                    script_hash.as_bytes().to_vec(),
-                )),
-            })
-            .collect();
-        let request = wallet::TransparentAddressBalanceRequest {
-            addresses: wire_addresses,
-            at_epoch_id: None,
-        };
-        let response = self
-            .client()
-            .transparent_address_balance(Request::new(request))
-            .await
-            .map_err(|status| self.map_status(status))?
-            .into_inner();
-        transparent_address_balance_from_message(self.network, response)
-    }
-
-    async fn transparent_outputs_by_outpoint(
-        &self,
-        outpoints: &[TransparentOutPoint],
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransparentOutputsByOutpointResponse, IndexerError> {
-        let wire_outpoints = outpoints.iter().map(outpoint_message).collect();
-        let request = wallet::TransparentOutputsByOutpointRequest {
-            outpoints: wire_outpoints,
-            at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-        };
-        let response = self
-            .client()
-            .transparent_outputs_by_outpoint(Request::new(request))
-            .await
-            .map_err(|status| self.map_status(status))?
-            .into_inner();
-        transparent_outputs_by_outpoint_response_from_message(self.network, response)
-    }
-
-    async fn transparent_spends_by_outpoint(
-        &self,
-        outpoints: &[TransparentOutPoint],
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransparentSpendsByOutpointResponse, IndexerError> {
-        let wire_outpoints = outpoints.iter().map(outpoint_message).collect();
-        let request = wallet::TransparentSpendsByOutpointRequest {
-            outpoints: wire_outpoints,
-            at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-        };
-        let response = self
-            .client()
-            .transparent_spends_by_outpoint(Request::new(request))
-            .await
-            .map_err(|status| self.map_status(status))?
-            .into_inner();
-        transparent_spends_by_outpoint_response_from_message(self.network, response)
-    }
-
-    async fn transparent_unspent_outputs_by_outpoint(
-        &self,
-        outpoints: &[TransparentOutPoint],
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransparentUnspentOutputsByOutpointResponse, IndexerError> {
-        let wire_outpoints = outpoints.iter().map(outpoint_message).collect();
-        let request = wallet::TransparentUnspentOutputsByOutpointRequest {
-            outpoints: wire_outpoints,
-            at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-        };
-        let response = self
-            .client()
-            .transparent_unspent_outputs_by_outpoint(Request::new(request))
-            .await
-            .map_err(|status| self.map_status(status))?
-            .into_inner();
-        transparent_unspent_outputs_by_outpoint_response_from_message(self.network, response)
-    }
-
-    async fn transparent_utxo_set_summary(
-        &self,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransparentUtxoSetSummaryView, IndexerError> {
-        let request = wallet::TransparentUtxoSetSummaryRequest {
-            at_epoch_id: at_epoch_id.map(ChainEpochId::value),
-        };
-        let response = self
-            .client()
-            .transparent_utxo_set_summary(Request::new(request))
-            .await
-            .map_err(|status| self.map_status(status))?
-            .into_inner();
-        let chain_epoch =
-            chain_epoch_from_chain_view_with_network(self.network, response.chain_view)?;
-        let commitment = response
-            .commitment
-            .map(|message| {
-                decode_transparent_utxo_set_commitment(&message)
-                    .map_err(|error| IndexerError::malformed("commitment", error.to_string()))
-            })
-            .transpose()?;
-        Ok(TransparentUtxoSetSummaryView {
-            chain_epoch,
-            summarized_height: BlockHeight::new(response.summarized_height),
-            utxo_count: response.utxo_count,
-            total_value_zat: response.total_value_zat,
-            commitment,
-        })
     }
 }
 
@@ -1072,68 +952,6 @@ impl EndpointBackedIndex for RemoteChainIndex {
         let outcome = self.transaction_by_id(transaction_id, None).await?;
         Ok(matches!(outcome, TxStatus::InMempool(_)))
     }
-
-    async fn transparent_mempool_outputs_by_address(
-        &self,
-        request: TransparentMempoolOutputsRequest,
-    ) -> Result<Vec<TransparentMempoolOutput>, IndexerError> {
-        let wire_request = wallet::TransparentMempoolOutputsByAddressRequest {
-            address: Some(wallet::AddressLookup {
-                selector: Some(wallet::address_lookup::Selector::ScriptHash(
-                    request.address_script_hash.as_bytes().to_vec(),
-                )),
-            }),
-            max_entries: Some(request.max_entries),
-        };
-        let response = self
-            .client()
-            .transparent_mempool_outputs_by_address(Request::new(wire_request))
-            .await
-            .map_err(|status| self.map_status(status))?
-            .into_inner();
-        response
-            .outputs
-            .into_iter()
-            .map(transparent_mempool_output_from_message)
-            .collect::<Result<Vec<_>, IndexerError>>()
-    }
-
-    async fn transparent_mempool_spends_by_outpoint(
-        &self,
-        outpoints: &[TransparentOutPoint],
-    ) -> Result<Vec<TransparentMempoolSpend>, IndexerError> {
-        let wire_request = wallet::TransparentMempoolSpendsByOutpointRequest {
-            outpoints: outpoints.iter().map(outpoint_message).collect(),
-        };
-        let response = self
-            .client()
-            .transparent_mempool_spends_by_outpoint(Request::new(wire_request))
-            .await
-            .map_err(|status| self.map_status(status))?
-            .into_inner();
-        response
-            .spends
-            .into_iter()
-            .map(transparent_mempool_spend_from_message)
-            .collect()
-    }
-
-    async fn transparent_mempool_outputs_by_outpoint(
-        &self,
-        outpoints: &[TransparentOutPoint],
-    ) -> Result<TransparentOutputsByOutpointResponse, IndexerError> {
-        let wire_outpoints = outpoints.iter().map(outpoint_message).collect();
-        let request = wallet::TransparentMempoolOutputsByOutpointRequest {
-            outpoints: wire_outpoints,
-        };
-        let response = self
-            .client()
-            .transparent_mempool_outputs_by_outpoint(Request::new(request))
-            .await
-            .map_err(|status| self.map_status(status))?
-            .into_inner();
-        transparent_outputs_by_outpoint_response_from_message(self.network, response)
-    }
 }
 
 fn ensure_supported_contract_revision(contract_revision: u32) -> Result<(), IndexerError> {
@@ -1188,9 +1006,6 @@ fn server_info_from_message(
             .map(Capability::from_wire_name)
             .collect(),
         contract_revision: common.contract_revision,
-        materialized_view_preset: (!common.materialized_view_preset.is_empty())
-            .then_some(common.materialized_view_preset),
-        materialized_view_identities: common.materialized_view_identities,
         build_git_commit: common.build_git_commit,
         schema_version: ArtifactSchemaVersion::new(schema_version),
         reorg_window_blocks: wallet_info.reorg_window_blocks,
@@ -1391,89 +1206,6 @@ mod server_info_conversion_tests {
     }
 }
 
-fn transparent_outputs_by_outpoint_response_from_message(
-    expected_network: Network,
-    message: wallet::TransparentOutputsByOutpointResponse,
-) -> Result<TransparentOutputsByOutpointResponse, IndexerError> {
-    let chain_epoch =
-        chain_epoch_from_chain_view_with_network(expected_network, message.chain_view)?;
-    let entries = message
-        .entries
-        .into_iter()
-        .map(transparent_output_entry_from_message)
-        .collect::<Result<Vec<_>, IndexerError>>()?;
-    Ok(TransparentOutputsByOutpointResponse {
-        chain_epoch,
-        entries,
-    })
-}
-
-fn transparent_unspent_outputs_by_outpoint_response_from_message(
-    expected_network: Network,
-    message: wallet::TransparentUnspentOutputsByOutpointResponse,
-) -> Result<TransparentUnspentOutputsByOutpointResponse, IndexerError> {
-    let chain_epoch =
-        chain_epoch_from_chain_view_with_network(expected_network, message.chain_view)?;
-    let entries = message
-        .entries
-        .into_iter()
-        .map(transparent_output_entry_from_message)
-        .collect::<Result<Vec<_>, IndexerError>>()?;
-    Ok(TransparentUnspentOutputsByOutpointResponse {
-        chain_epoch,
-        entries,
-    })
-}
-
-fn transparent_spends_by_outpoint_response_from_message(
-    expected_network: Network,
-    message: wallet::TransparentSpendsByOutpointResponse,
-) -> Result<TransparentSpendsByOutpointResponse, IndexerError> {
-    let chain_epoch =
-        chain_epoch_from_chain_view_with_network(expected_network, message.chain_view)?;
-    let spends = message
-        .spends
-        .into_iter()
-        .map(transparent_spend_from_message)
-        .collect::<Result<Vec<_>, IndexerError>>()?;
-    Ok(TransparentSpendsByOutpointResponse {
-        chain_epoch,
-        spends,
-    })
-}
-
-fn transparent_spend_from_message(
-    message: wallet::TransparentSpend,
-) -> Result<TransparentSpendEntry, IndexerError> {
-    let outpoint_message = message.spent_outpoint.ok_or_else(|| {
-        IndexerError::malformed("transparent_spend.spent_outpoint", "field is missing")
-    })?;
-    let spent_transaction_id = transaction_id_from_rpc_hex(
-        "transparent_spend.spent_outpoint.transaction_id",
-        &outpoint_message.transaction_id,
-    )?;
-    let spent_outpoint =
-        TransparentOutPoint::new(spent_transaction_id, outpoint_message.output_index);
-    let spending_transaction_id = transaction_id_from_rpc_hex(
-        "transparent_spend.spending_transaction_id",
-        &message.spending_transaction_id,
-    )?;
-    let spending_block = message.spending_block.ok_or_else(|| {
-        IndexerError::malformed("transparent_spend.spending_block", "field is missing")
-    })?;
-    let spending_block_hash = block_hash_from_rpc_hex(
-        "transparent_spend.spending_block.hash",
-        &spending_block.hash,
-    )?;
-    Ok(TransparentSpendEntry {
-        spent_outpoint,
-        spending_transaction_id,
-        input_index: message.input_index,
-        spending_block_height: BlockHeight::new(spending_block.height),
-        spending_block_hash,
-    })
-}
-
 fn chain_value_pools_at_tip_from_message(
     expected_network: Network,
     message: wallet::ChainValuePoolsAtTipResponse,
@@ -1494,57 +1226,6 @@ fn chain_value_pools_at_tip_from_message(
         source_tip: BlockId::new(BlockHeight::new(source_tip.height), source_tip_hash),
         pools,
     })
-}
-
-fn transparent_output_entry_from_message(
-    message: wallet::TransparentOutputEntry,
-) -> Result<zinder_core::TransparentOutputEntry, IndexerError> {
-    let outpoint_message = message.outpoint.ok_or_else(|| {
-        IndexerError::malformed("transparent_output_entry.outpoint", "field is missing")
-    })?;
-    let transaction_id = transaction_id_from_rpc_hex(
-        "transparent_output_entry.outpoint.transaction_id",
-        &outpoint_message.transaction_id,
-    )?;
-    let outpoint = TransparentOutPoint::new(transaction_id, outpoint_message.output_index);
-    let prevout = message
-        .output
-        .map(|prevout_message| zinder_core::TransparentOutput {
-            value_zat: prevout_message.value_zat,
-            script_pub_key: prevout_message.script_pub_key,
-        });
-    Ok(zinder_core::TransparentOutputEntry {
-        outpoint,
-        output: prevout,
-    })
-}
-
-fn transparent_address_balance_from_message(
-    expected_network: Network,
-    message: wallet::TransparentAddressBalanceResponse,
-) -> Result<TransparentAddressBalance, IndexerError> {
-    let chain_epoch =
-        chain_epoch_from_chain_view_with_network(expected_network, message.chain_view)?;
-    Ok(TransparentAddressBalance {
-        confirmed_zat: message.confirmed_zat,
-        unconfirmed_delta_zat: message.unconfirmed_delta_zat,
-        address_count: message.address_count,
-        chain_epoch,
-    })
-}
-
-fn transparent_mempool_output_from_message(
-    message: wallet::TransparentMempoolOutput,
-) -> Result<TransparentMempoolOutput, IndexerError> {
-    transparent_mempool_output_from_message_shared(message)
-        .map_err(wallet_decode_error_to_indexer_error)
-}
-
-fn transparent_mempool_spend_from_message(
-    message: wallet::TransparentMempoolSpend,
-) -> Result<TransparentMempoolSpend, IndexerError> {
-    transparent_mempool_spend_from_message_shared(message)
-        .map_err(wallet_decode_error_to_indexer_error)
 }
 
 fn ensure_network_name(expected: Network, actual_name: &str) -> Result<(), IndexerError> {

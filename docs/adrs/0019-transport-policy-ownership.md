@@ -114,7 +114,7 @@ calls-only pings still cover the bug class.
 The constants are *not* operator-tunable. Each carries a doc comment
 explaining the chosen value and citing the relevant issue
 (tonic #1254, #1635, #258; hyper #3640). This matches the existing
-pattern of `MAX_TRANSPARENT_OUTPUTS_PER_REQUEST` and `PIPELINE_DEPTH`:
+pattern of `MAX_SUBTREE_ROOTS_PER_REQUEST` and `PIPELINE_DEPTH`:
 internal policy expressed as a discoverable constant, not a runtime
 knob nobody will tune correctly.
 
@@ -201,7 +201,7 @@ translations.
   documented lock-free pointer swap.
 - Keep-alive durations are not operator-tunable. Deployments that
   need different values edit the constant in source, just as they
-  would for `MAX_TRANSPARENT_OUTPUTS_PER_REQUEST` or
+  would for `MAX_SUBTREE_ROOTS_PER_REQUEST` or
   `PIPELINE_DEPTH`. The constants carry doc comments naming the
   upstream bugs that motivated each value.
 - Migrating away from jsonrpsee to raw reqwest remains a future

@@ -119,15 +119,12 @@ pub enum MaterializedViewStoreError {
         /// Store-format version the running binary expects.
         running: u16,
     },
-    /// The requested preset conflicts with the store's durable consumer
-    /// identities.
+    /// The store's durable consumer identities differ from this release's
+    /// bundled Explorer view manifest.
     #[error(
-        "materialized-view store consumer identities are incompatible with requested preset {requested}; configure a fresh empty materialized-view path and rebuild it from a certified recovery source because in-place preset changes are unsupported"
+        "materialized-view store consumer identities differ from this release's Explorer view manifest; configure a fresh empty materialized-view path and rebuild it from a certified recovery source because in-place manifest changes are unsupported"
     )]
-    MaterializedViewPresetRequiresFreshStore {
-        /// Non-default preset requested by the opening process.
-        requested: &'static str,
-    },
+    ExplorerViewManifestRequiresFreshStore,
     /// A consumer-owned write targeted an identity omitted by the opened
     /// workload.
     #[error("materialized-view store consumer `{consumer}` is not selected by the opened workload")]

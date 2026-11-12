@@ -1030,8 +1030,8 @@ pub struct ServerInfoResponse {
     #[prost(message, optional, tag = "1")]
     pub info: ::core::option::Option<WalletServerInfo>,
 }
-/// Reference to a transparent transaction output. Used by every wallet-plane
-/// RPC keyed by `(transaction_id, output_index)`.
+/// Reference to a transparent transaction output by
+/// `(transaction_id, output_index)`.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OutPoint {
     /// Canonical transaction id in RPC byte order (64 lowercase hex
@@ -1141,65 +1141,14 @@ pub struct MempoolSnapshotResponse {
     #[prost(message, optional, tag = "6")]
     pub source_tip: ::core::option::Option<BlockTip>,
 }
-/// Bounded request for unmined transparent outputs at one transparent address.
+/// Canonical-chain spend of a transparent outpoint, carried by
+/// `zinder.v1.explorer.TransactionDetail` outputs.
 ///
-/// The mempool live state is in-memory and not chain-epoch-pinnable; the
-/// response binds the answer to the chain epoch visible at lookup time.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct TransparentMempoolOutputsByAddressRequest {
-    /// Selector for the transparent address being queried.
-    #[prost(message, optional, tag = "1")]
-    pub address: ::core::option::Option<AddressLookup>,
-    /// Maximum number of outputs returned. Absent means use the server default;
-    /// values larger than the server's configured cap are silently clamped.
-    #[prost(uint32, optional, tag = "2")]
-    pub max_entries: ::core::option::Option<u32>,
-}
-/// Response for \[`TransparentMempoolOutputsByAddress`\] bound to the chain
-/// epoch visible at lookup time.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TransparentMempoolOutputsByAddressResponse {
-    /// Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
-    #[prost(message, optional, tag = "1")]
-    pub chain_view: ::core::option::Option<ChainView>,
-    /// Unmined transparent outputs that fund the queried address, in
-    /// canonical `(transaction_id, output_index)` order.
-    #[prost(message, repeated, tag = "2")]
-    pub outputs: ::prost::alloc::vec::Vec<TransparentMempoolOutput>,
-}
-/// Batched lookup request for unmined spends of transparent outpoints.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TransparentMempoolSpendsByOutpointRequest {
-    /// Outpoints whose unmined spends are being looked up. Bounded
-    /// server-side to a hard cap; requests above the cap are silently
-    /// truncated to the first N entries.
-    #[prost(message, repeated, tag = "1")]
-    pub outpoints: ::prost::alloc::vec::Vec<OutPoint>,
-}
-/// Response for \[`TransparentMempoolSpendsByOutpoint`\] bound to the chain
-/// epoch visible at lookup time.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TransparentMempoolSpendsByOutpointResponse {
-    /// Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
-    #[prost(message, optional, tag = "1")]
-    pub chain_view: ::core::option::Option<ChainView>,
-    /// Mempool spends found for the requested outpoints. Outpoints with no
-    /// unmined spend emit no entry; consumers key results by
-    /// `spent_outpoint`.
-    #[prost(message, repeated, tag = "2")]
-    pub spends: ::prost::alloc::vec::Vec<TransparentMempoolSpend>,
-}
-/// Canonical-chain spend of a transparent outpoint.
-///
-/// Carries where the outpoint was spent on the canonical chain: the spending
-/// transaction, the input index within it, and the block that mined the spend.
-/// The intrinsic value and owning script of the spent output stay on the
-/// canonical output resolver `TransparentOutputsByOutpoint`; this message is the
-/// reverse-spend half of the getspentinfo-equivalent surface.
+/// Names the spending transaction, the input index within it, and the block
+/// that mined the spend.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentSpend {
-    /// Outpoint that was spent. Mirrors the request entry so consumers key
-    /// results by `spent_outpoint`.
+    /// Outpoint that was spent.
     #[prost(message, optional, tag = "1")]
     pub spent_outpoint: ::core::option::Option<OutPoint>,
     /// Canonical transaction id in RPC byte order (64 lowercase hex
@@ -1214,44 +1163,9 @@ pub struct TransparentSpend {
     #[prost(message, optional, tag = "4")]
     pub spending_block: ::core::option::Option<BlockTip>,
 }
-/// Batched request for canonical-chain reverse-spend resolution.
-///
-/// Given transparent outpoints, return where each was spent on the canonical
-/// chain. The unmined half is the separate `TransparentMempoolSpendsByOutpoint`
-/// RPC; a full getspentinfo-equivalent composes both.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TransparentSpendsByOutpointRequest {
-    /// Outpoints whose canonical spend is being looked up. Bounded server-side
-    /// to a hard cap; requests above the cap are silently truncated to the
-    /// first N entries. The coinbase sentinel
-    /// `(transaction_id = \[0u8; 32\], output_index = 0xFFFFFFFF)` is rejected
-    /// with `INVALID_ARGUMENT`; coinbase inputs spend no prevout and never
-    /// appear in the canonical spend-fact index.
-    #[prost(message, repeated, tag = "1")]
-    pub outpoints: ::prost::alloc::vec::Vec<OutPoint>,
-    /// Optional chain-epoch id pin. Absent resolves against the visible tip;
-    /// present pins the read to a specific epoch.
-    #[prost(uint64, optional, tag = "2")]
-    pub at_epoch_id: ::core::option::Option<u64>,
-}
-/// Response for \[`TransparentSpendsByOutpoint`\] bound to one chain epoch.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TransparentSpendsByOutpointResponse {
-    /// Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
-    /// Every entry's spend is visible at this epoch.
-    #[prost(message, optional, tag = "1")]
-    pub chain_view: ::core::option::Option<ChainView>,
-    /// Canonical spends found for the requested outpoints. Outpoints unspent on
-    /// the canonical chain at this epoch emit no entry; consumers key results by
-    /// `spent_outpoint`.
-    #[prost(message, repeated, tag = "2")]
-    pub spends: ::prost::alloc::vec::Vec<TransparentSpend>,
-}
-/// Resolved transparent output referenced by an outpoint.
-///
-/// Carries the intrinsic fields a consumer needs to compute input value and
-/// derive the owning address; identifying fields like `transaction_id` stay on
-/// the owning \[`TransparentOutputEntry.outpoint`\].
+/// Intrinsic value and scriptPubKey of one transparent output, carried by
+/// `zinder.v1.explorer.TransactionDetail` outputs. Identifying fields stay on
+/// the enclosing message.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentOutput {
     /// Output value in zatoshis.
@@ -1260,99 +1174,6 @@ pub struct TransparentOutput {
     /// Raw scriptPubKey bytes.
     #[prost(bytes = "vec", tag = "2")]
     pub script_pub_key: ::prost::alloc::vec::Vec<u8>,
-}
-/// One entry in a \[`TransparentOutputsByOutpoint`\] response, in input-order.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct TransparentOutputEntry {
-    /// Outpoint requested by the caller.
-    #[prost(message, optional, tag = "1")]
-    pub outpoint: ::core::option::Option<OutPoint>,
-    /// Resolved output, when the outpoint was found at the response's
-    /// \[`TransparentOutputsByOutpointResponse.chain_epoch`\]. Absent means the
-    /// canonical chain at that epoch did not have the referenced output
-    /// (transaction unknown, output index out of bounds, or reorged out).
-    #[prost(message, optional, tag = "2")]
-    pub output: ::core::option::Option<TransparentOutput>,
-}
-/// Batched request for canonical-chain transparent prevout resolution.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TransparentOutputsByOutpointRequest {
-    /// Outpoints to resolve. Bounded server-side to a hard cap; requests
-    /// above the cap are silently truncated to the first N entries. The
-    /// coinbase sentinel `(transaction_id = \[0u8; 32\], output_index =  0xFFFFFFFF)` is rejected with `INVALID_ARGUMENT`; consumers filter
-    /// coinbase inputs at construction time.
-    #[prost(message, repeated, tag = "1")]
-    pub outpoints: ::prost::alloc::vec::Vec<OutPoint>,
-    /// Optional chain-epoch id pin. Absent resolves against the visible tip;
-    /// present pins the read to a specific epoch.
-    #[prost(uint64, optional, tag = "2")]
-    pub at_epoch_id: ::core::option::Option<u64>,
-}
-/// Response for \[`TransparentOutputsByOutpoint`\] bound to one chain epoch.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TransparentOutputsByOutpointResponse {
-    /// Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
-    /// Every entry's `prevout` (when present) is visible at this epoch.
-    #[prost(message, optional, tag = "1")]
-    pub chain_view: ::core::option::Option<ChainView>,
-    /// Per-outpoint resolution result, in input order. Length matches the
-    /// request's `outpoints` length after server-side truncation.
-    #[prost(message, repeated, tag = "2")]
-    pub entries: ::prost::alloc::vec::Vec<TransparentOutputEntry>,
-}
-/// Batched request for canonical-chain unspent-output resolution.
-///
-/// Given transparent outpoints, return each output only while it is unspent on
-/// the canonical chain at the response epoch. This is the gettxout-equivalent
-/// surface: it composes the canonical output resolver with the canonical
-/// reverse-spend reader server-side, so a consumer needs one round-trip rather
-/// than an output lookup plus a spend lookup plus a client-side join. The read
-/// is canonical-only; mempool-aware unspent-ness composes with the separate
-/// `TransparentMempoolSpendsByOutpoint` RPC (subtract those spends).
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TransparentUnspentOutputsByOutpointRequest {
-    /// Outpoints to probe. Bounded server-side to a hard cap; requests above
-    /// the cap are silently truncated to the first N entries. The coinbase
-    /// sentinel `(transaction_id = \[0u8; 32\], output_index = 0xFFFFFFFF)` is
-    /// rejected with `INVALID_ARGUMENT`; coinbase inputs spend no prevout.
-    #[prost(message, repeated, tag = "1")]
-    pub outpoints: ::prost::alloc::vec::Vec<OutPoint>,
-    /// Optional chain-epoch id pin. Absent resolves against the visible tip;
-    /// present pins both the output and the spend read to one epoch.
-    #[prost(uint64, optional, tag = "2")]
-    pub at_epoch_id: ::core::option::Option<u64>,
-}
-/// Response for \[`TransparentUnspentOutputsByOutpoint`\] bound to one chain
-/// epoch.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TransparentUnspentOutputsByOutpointResponse {
-    /// Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
-    /// Every entry is present and unspent at this epoch.
-    #[prost(message, optional, tag = "1")]
-    pub chain_view: ::core::option::Option<ChainView>,
-    /// Unspent outputs found for the requested outpoints. An outpoint emits an
-    /// entry only when the canonical chain at this epoch has the referenced
-    /// output and it carries no canonical spend; spent or never-existed
-    /// outpoints emit no entry (null-if-spent). Each entry's `output` is always
-    /// populated. Consumers key results by `outpoint`. Duplicate request
-    /// outpoints collapse to one entry.
-    #[prost(message, repeated, tag = "2")]
-    pub entries: ::prost::alloc::vec::Vec<TransparentOutputEntry>,
-}
-/// Batched request for live mempool transparent prevout resolution.
-///
-/// Mempool reads are not chain-epoch-pinnable; the request omits
-/// `at_epoch_id` and the response binds to the chain epoch visible at
-/// lookup time. The reply uses the same \[`TransparentOutputsByOutpointResponse`\]
-/// shape as the canonical surface so consumers share one decoder.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TransparentMempoolOutputsByOutpointRequest {
-    /// Outpoints to resolve against the live mempool index. Bounded
-    /// server-side to a hard cap; requests above the cap are silently
-    /// truncated to the first N entries. The coinbase sentinel is
-    /// rejected with `INVALID_ARGUMENT`.
-    #[prost(message, repeated, tag = "1")]
-    pub outpoints: ::prost::alloc::vec::Vec<OutPoint>,
 }
 /// Replayable mempool-event stream request.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1521,50 +1342,6 @@ pub mod transparent_unspent_outputs_chunk {
         Item(super::TransparentUnspentOutput),
     }
 }
-/// Bounded transparent-address balance request computed in the wallet plane.
-///
-/// The confirmed total is summed from the complete canonical unspent output
-/// set at the requested addresses; the live mempool overlay produces the
-/// signed `unconfirmed_delta_zat`. `at_epoch_id` pins the canonical confirmed
-/// read. Mempool live state is not chain-epoch-pinnable, so the response binds
-/// to the chain epoch the confirmed read answered against. An empty
-/// `addresses` list is rejected with `INVALID_ARGUMENT`; an `addresses` list
-/// over the per-request cap is rejected with `INVALID_ARGUMENT` carrying
-/// `TRANSPARENT_BALANCE_ADDRESS_COUNT_EXCEEDED`.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TransparentAddressBalanceRequest {
-    /// Transparent addresses summed into one balance response.
-    #[prost(message, repeated, tag = "1")]
-    pub addresses: ::prost::alloc::vec::Vec<AddressLookup>,
-    /// Optional chain-epoch id pin for the canonical confirmed read. Absent
-    /// resolves against the visible tip; present pins the confirmed read to a
-    /// specific epoch. The mempool overlay always reads live state.
-    #[prost(uint64, optional, tag = "2")]
-    pub at_epoch_id: ::core::option::Option<u64>,
-}
-/// Transparent-address balance response computed in the wallet plane.
-///
-/// Splits the canonical confirmed total from the signed mempool delta so
-/// explorer-shaped clients can render `confirmed`/`unconfirmed` separately;
-/// lightwalletd-compatible clients project this into a single `value_zat` at
-/// the compatibility boundary. Named `*Response` to match the rest of
-/// `wallet.proto` and avoid a name collision with the same-named RPC.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct TransparentAddressBalanceResponse {
-    /// Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
-    #[prost(message, optional, tag = "1")]
-    pub chain_view: ::core::option::Option<ChainView>,
-    /// Sum of unspent canonical outputs at the requested addresses.
-    #[prost(uint64, tag = "2")]
-    pub confirmed_zat: u64,
-    /// Signed mempool delta: pending inflows minus pending outflows. Negative
-    /// when pending outflows exceed pending inflows.
-    #[prost(int64, tag = "3")]
-    pub unconfirmed_delta_zat: i64,
-    /// Number of transparent addresses summarized by this response.
-    #[prost(uint32, tag = "4")]
-    pub address_count: u32,
-}
 /// One upstream `getblockchaininfo.valuePools` entry.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChainValuePool {
@@ -1601,68 +1378,6 @@ pub struct ChainValuePoolsAtTipResponse {
     #[prost(message, optional, tag = "4")]
     pub source_tip: ::core::option::Option<BlockTip>,
 }
-/// Homomorphic commitment to the full transparent unspent set at one settled
-/// tip.
-///
-/// Order-independent and reproducible: two deployments at the same settled tip
-/// produce identical `commitment` bytes under the same `scheme`. The height the
-/// commitment was taken at is the enclosing ChainView's `chain_epoch.settled_tip`
-/// for request-time comparison; a `committed_height` field is added later when a
-/// snapshot manifest detaches this message from the response.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct TransparentUtxoSetCommitment {
-    /// Scheme the commitment was built under. Comparison is only meaningful
-    /// across equal schemes.
-    #[prost(enumeration = "UtxoSetCommitmentScheme", tag = "1")]
-    pub scheme: i32,
-    /// Raw accumulator bytes (2048 bytes for LTHASH16). Opaque; compare for
-    /// equality, do not interpret field-by-field.
-    #[prost(bytes = "vec", tag = "2")]
-    pub commitment: ::prost::alloc::vec::Vec<u8>,
-}
-/// Wallet-plane request for the chain-wide transparent UTXO-set summary.
-///
-/// `at_epoch_id` pins the canonical read. Absent resolves against the visible
-/// tip. The aggregate is always taken at the resolved epoch's settled tip,
-/// where the current-UTXO projection is the settled-tip unspent set under the
-/// configured reorg policy; a deeper reorg fails closed.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct TransparentUtxoSetSummaryRequest {
-    /// Optional chain-epoch id pin for the canonical read. Absent resolves
-    /// against the visible tip; present pins the read to a specific epoch.
-    #[prost(uint64, optional, tag = "1")]
-    pub at_epoch_id: ::core::option::Option<u64>,
-}
-/// Wallet-plane response for the chain-wide transparent UTXO-set summary.
-///
-/// A request-time full scan of the current-UTXO projection: rarely called and
-/// linear in the unspent-set size. `hash_serialized` and `bytes_serialized`
-/// (gettxoutsetinfo's serialized-set digest and byte size) are intentionally
-/// omitted: both depend on a defined UTXO-set serialization ordering that
-/// Zinder does not commit to. Only the order-independent count and value totals
-/// are reported.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct TransparentUtxoSetSummaryResponse {
-    /// Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
-    #[prost(message, optional, tag = "1")]
-    pub chain_view: ::core::option::Option<ChainView>,
-    /// Number of unspent transparent outputs at the summarized settled tip.
-    #[prost(uint64, tag = "2")]
-    pub utxo_count: u64,
-    /// Sum of the values of every unspent transparent output, in zatoshi.
-    #[prost(uint64, tag = "3")]
-    pub total_value_zat: u64,
-    /// Settled tip height the aggregate was taken at. Below this height the
-    /// projection is the settled-tip unspent set under the configured reorg policy;
-    /// a deeper reorg fails closed.
-    #[prost(uint32, tag = "4")]
-    pub summarized_height: u32,
-    /// Homomorphic commitment to the full unspent set. Present only when the
-    /// operator opted into the request-time fold and the server advertises
-    /// `wallet.read.transparent_utxo_set_commitment_v1`; absent otherwise.
-    #[prost(message, optional, tag = "5")]
-    pub commitment: ::core::option::Option<TransparentUtxoSetCommitment>,
-}
 /// Transparent-address tx-history range request, server-streamed.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressTxIdsInRangeRequest {
@@ -1680,15 +1395,10 @@ pub struct TransparentAddressTxIdsInRangeRequest {
     /// clamped.
     #[prost(uint32, tag = "4")]
     pub max_entries: u32,
-    /// Empty starts at start_height (in the requested direction). Non-empty
-    /// resumes strictly after the supplied opaque cursor; the cursor's
-    /// encoded direction is authoritative.
+    /// Empty starts at start_height. Non-empty resumes strictly after the
+    /// supplied opaque cursor.
     #[prost(bytes = "vec", tag = "5")]
     pub from_cursor: ::prost::alloc::vec::Vec<u8>,
-    /// Iterate newest-first when true. The cursor body encodes the direction
-    /// so resume continues in the same order.
-    #[prost(bool, tag = "6")]
-    pub descending: bool,
 }
 /// One indexed transparent-address tx-history entry.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1947,42 +1657,6 @@ impl MempoolEvictionReason {
             "MEMPOOL_EVICTION_REASON_LOW_FEE" => Some(Self::LowFee),
             "MEMPOOL_EVICTION_REASON_NODE_REJECTED" => Some(Self::NodeRejected),
             "MEMPOOL_EVICTION_REASON_UNKNOWN" => Some(Self::Unknown),
-            _ => None,
-        }
-    }
-}
-/// Snapshot scheme a TransparentUtxoSetCommitment was built under.
-///
-/// The scheme id is self-describing: comparing two commitments is meaningful
-/// only when their schemes match. A zcashd-comparable membership rule would be
-/// a new value, never a reinterpretation of an existing one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum UtxoSetCommitmentScheme {
-    /// Scheme not stated. The absence sentinel; never emitted by a server that
-    /// populated the commitment.
-    Unspecified = 0,
-    /// Componentwise u16-lane homomorphic hash (LtHash16) over the full
-    /// transparent unspent set, each element BLAKE2X-expanded to 1024 lanes and
-    /// summed modulo 2^16. The 2048-byte accumulator is the commitment.
-    Lthash16 = 1,
-}
-impl UtxoSetCommitmentScheme {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "UTXO_SET_COMMITMENT_SCHEME_UNSPECIFIED",
-            Self::Lthash16 => "UTXO_SET_COMMITMENT_SCHEME_LTHASH16",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "UTXO_SET_COMMITMENT_SCHEME_UNSPECIFIED" => Some(Self::Unspecified),
-            "UTXO_SET_COMMITMENT_SCHEME_LTHASH16" => Some(Self::Lthash16),
             _ => None,
         }
     }
@@ -2529,209 +2203,6 @@ pub mod wallet_query_client {
                 );
             self.inner.server_streaming(req, path, codec).await
         }
-        /// Return unmined transparent outputs that fund a transparent address. Mirrors
-        /// the typed Rust `transparent_mempool_outputs_by_address` so non-Rust clients
-        /// do not have to scan the full mempool snapshot.
-        pub async fn transparent_mempool_outputs_by_address(
-            &mut self,
-            request: impl tonic::IntoRequest<
-                super::TransparentMempoolOutputsByAddressRequest,
-            >,
-        ) -> std::result::Result<
-            tonic::Response<super::TransparentMempoolOutputsByAddressResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/zinder.v1.wallet.WalletQuery/TransparentMempoolOutputsByAddress",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "zinder.v1.wallet.WalletQuery",
-                        "TransparentMempoolOutputsByAddress",
-                    ),
-                );
-            self.inner.unary(req, path, codec).await
-        }
-        /// Return the unmined spends of a batch of transparent outpoints, when
-        /// any are visible in the live mempool index.
-        pub async fn transparent_mempool_spends_by_outpoint(
-            &mut self,
-            request: impl tonic::IntoRequest<
-                super::TransparentMempoolSpendsByOutpointRequest,
-            >,
-        ) -> std::result::Result<
-            tonic::Response<super::TransparentMempoolSpendsByOutpointResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/zinder.v1.wallet.WalletQuery/TransparentMempoolSpendsByOutpoint",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "zinder.v1.wallet.WalletQuery",
-                        "TransparentMempoolSpendsByOutpoint",
-                    ),
-                );
-            self.inner.unary(req, path, codec).await
-        }
-        /// Resolve a batch of canonical-chain transparent outpoints to their
-        /// referenced outputs. Closes the prevout-resolution gap that forced
-        /// consumers to fetch one full transaction per input.
-        pub async fn transparent_outputs_by_outpoint(
-            &mut self,
-            request: impl tonic::IntoRequest<super::TransparentOutputsByOutpointRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::TransparentOutputsByOutpointResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/zinder.v1.wallet.WalletQuery/TransparentOutputsByOutpoint",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "zinder.v1.wallet.WalletQuery",
-                        "TransparentOutputsByOutpoint",
-                    ),
-                );
-            self.inner.unary(req, path, codec).await
-        }
-        /// Resolve a batch of canonical-chain transparent outpoints to where each was
-        /// spent: the spending transaction, input index, and block that mined the
-        /// spend. The canonical (confirmed) half of the getspentinfo-equivalent
-        /// surface; the unmined half is `TransparentMempoolSpendsByOutpoint`.
-        pub async fn transparent_spends_by_outpoint(
-            &mut self,
-            request: impl tonic::IntoRequest<super::TransparentSpendsByOutpointRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::TransparentSpendsByOutpointResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/zinder.v1.wallet.WalletQuery/TransparentSpendsByOutpoint",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "zinder.v1.wallet.WalletQuery",
-                        "TransparentSpendsByOutpoint",
-                    ),
-                );
-            self.inner.unary(req, path, codec).await
-        }
-        /// Resolve a batch of canonical-chain transparent outpoints to their
-        /// referenced output, returning each only while it is unspent on the
-        /// canonical chain at the response epoch (null-if-spent, gettxout-equivalent).
-        /// Composes the output resolver and the canonical reverse-spend reader
-        /// server-side. Canonical-only: a mempool-aware caller subtracts the spends
-        /// from `TransparentMempoolSpendsByOutpoint`.
-        pub async fn transparent_unspent_outputs_by_outpoint(
-            &mut self,
-            request: impl tonic::IntoRequest<
-                super::TransparentUnspentOutputsByOutpointRequest,
-            >,
-        ) -> std::result::Result<
-            tonic::Response<super::TransparentUnspentOutputsByOutpointResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/zinder.v1.wallet.WalletQuery/TransparentUnspentOutputsByOutpoint",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "zinder.v1.wallet.WalletQuery",
-                        "TransparentUnspentOutputsByOutpoint",
-                    ),
-                );
-            self.inner.unary(req, path, codec).await
-        }
-        /// Resolve a batch of live-mempool transparent outpoints to their
-        /// referenced outputs. Used by chained-mempool-tx flows where the
-        /// creating transaction has not yet confirmed.
-        pub async fn transparent_mempool_outputs_by_outpoint(
-            &mut self,
-            request: impl tonic::IntoRequest<
-                super::TransparentMempoolOutputsByOutpointRequest,
-            >,
-        ) -> std::result::Result<
-            tonic::Response<super::TransparentOutputsByOutpointResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/zinder.v1.wallet.WalletQuery/TransparentMempoolOutputsByOutpoint",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "zinder.v1.wallet.WalletQuery",
-                        "TransparentMempoolOutputsByOutpoint",
-                    ),
-                );
-            self.inner.unary(req, path, codec).await
-        }
         /// Stream the complete unspent transparent output set for one transparent
         /// address at a single pinned chain epoch. The stream is always complete:
         /// no cursor, no entry cap.
@@ -2769,7 +2240,7 @@ pub mod wallet_query_client {
             self.inner.server_streaming(req, path, codec).await
         }
         /// Stream the transparent-address tx-history index for an inclusive
-        /// height range, in ascending or descending mined order.
+        /// height range, in ascending mined order.
         pub async fn transparent_address_tx_ids_in_range(
             &mut self,
             request: impl tonic::IntoRequest<
@@ -2803,40 +2274,6 @@ pub mod wallet_query_client {
                 );
             self.inner.server_streaming(req, path, codec).await
         }
-        /// Return the transparent-address balance summed across the requested
-        /// addresses. The confirmed total is summed in-process from the canonical
-        /// unspent-output index; the signed `unconfirmed_delta_zat` overlays the
-        /// live mempool when an ingest-control endpoint is wired and is zero
-        /// otherwise. Capability: `wallet.address.transparent_balance_v1`.
-        pub async fn transparent_address_balance(
-            &mut self,
-            request: impl tonic::IntoRequest<super::TransparentAddressBalanceRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::TransparentAddressBalanceResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/zinder.v1.wallet.WalletQuery/TransparentAddressBalance",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "zinder.v1.wallet.WalletQuery",
-                        "TransparentAddressBalance",
-                    ),
-                );
-            self.inner.unary(req, path, codec).await
-        }
         /// Return chain-wide value-pool totals at the upstream node's current tip.
         /// The response binds the source snapshot to the upstream tip's height and
         /// hash. Capability: `wallet.read.chain_value_pools_at_tip_v1`. Storage-only
@@ -2867,40 +2304,6 @@ pub mod wallet_query_client {
                     GrpcMethod::new(
                         "zinder.v1.wallet.WalletQuery",
                         "ChainValuePoolsAtTip",
-                    ),
-                );
-            self.inner.unary(req, path, codec).await
-        }
-        /// Return the chain-wide transparent UTXO-set summary: the count and total
-        /// value of unspent transparent outputs at the settled tip. A request-time
-        /// full scan of the canonical current-UTXO projection (gettxoutsetinfo-
-        /// equivalent, minus the format-dependent serialized hash and byte size).
-        /// Capability: `wallet.read.transparent_utxo_set_summary_v1`.
-        pub async fn transparent_utxo_set_summary(
-            &mut self,
-            request: impl tonic::IntoRequest<super::TransparentUtxoSetSummaryRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::TransparentUtxoSetSummaryResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/zinder.v1.wallet.WalletQuery/TransparentUtxoSetSummary",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "zinder.v1.wallet.WalletQuery",
-                        "TransparentUtxoSetSummary",
                     ),
                 );
             self.inner.unary(req, path, codec).await
@@ -3144,69 +2547,6 @@ pub mod wallet_query_server {
             tonic::Response<Self::MempoolEventsStream>,
             tonic::Status,
         >;
-        /// Return unmined transparent outputs that fund a transparent address. Mirrors
-        /// the typed Rust `transparent_mempool_outputs_by_address` so non-Rust clients
-        /// do not have to scan the full mempool snapshot.
-        async fn transparent_mempool_outputs_by_address(
-            &self,
-            request: tonic::Request<super::TransparentMempoolOutputsByAddressRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::TransparentMempoolOutputsByAddressResponse>,
-            tonic::Status,
-        >;
-        /// Return the unmined spends of a batch of transparent outpoints, when
-        /// any are visible in the live mempool index.
-        async fn transparent_mempool_spends_by_outpoint(
-            &self,
-            request: tonic::Request<super::TransparentMempoolSpendsByOutpointRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::TransparentMempoolSpendsByOutpointResponse>,
-            tonic::Status,
-        >;
-        /// Resolve a batch of canonical-chain transparent outpoints to their
-        /// referenced outputs. Closes the prevout-resolution gap that forced
-        /// consumers to fetch one full transaction per input.
-        async fn transparent_outputs_by_outpoint(
-            &self,
-            request: tonic::Request<super::TransparentOutputsByOutpointRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::TransparentOutputsByOutpointResponse>,
-            tonic::Status,
-        >;
-        /// Resolve a batch of canonical-chain transparent outpoints to where each was
-        /// spent: the spending transaction, input index, and block that mined the
-        /// spend. The canonical (confirmed) half of the getspentinfo-equivalent
-        /// surface; the unmined half is `TransparentMempoolSpendsByOutpoint`.
-        async fn transparent_spends_by_outpoint(
-            &self,
-            request: tonic::Request<super::TransparentSpendsByOutpointRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::TransparentSpendsByOutpointResponse>,
-            tonic::Status,
-        >;
-        /// Resolve a batch of canonical-chain transparent outpoints to their
-        /// referenced output, returning each only while it is unspent on the
-        /// canonical chain at the response epoch (null-if-spent, gettxout-equivalent).
-        /// Composes the output resolver and the canonical reverse-spend reader
-        /// server-side. Canonical-only: a mempool-aware caller subtracts the spends
-        /// from `TransparentMempoolSpendsByOutpoint`.
-        async fn transparent_unspent_outputs_by_outpoint(
-            &self,
-            request: tonic::Request<super::TransparentUnspentOutputsByOutpointRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::TransparentUnspentOutputsByOutpointResponse>,
-            tonic::Status,
-        >;
-        /// Resolve a batch of live-mempool transparent outpoints to their
-        /// referenced outputs. Used by chained-mempool-tx flows where the
-        /// creating transaction has not yet confirmed.
-        async fn transparent_mempool_outputs_by_outpoint(
-            &self,
-            request: tonic::Request<super::TransparentMempoolOutputsByOutpointRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::TransparentOutputsByOutpointResponse>,
-            tonic::Status,
-        >;
         /// Server streaming response type for the TransparentAddressUnspentOutputs method.
         type TransparentAddressUnspentOutputsStream: tonic::codegen::tokio_stream::Stream<
                 Item = std::result::Result<
@@ -3236,24 +2576,12 @@ pub mod wallet_query_server {
             + std::marker::Send
             + 'static;
         /// Stream the transparent-address tx-history index for an inclusive
-        /// height range, in ascending or descending mined order.
+        /// height range, in ascending mined order.
         async fn transparent_address_tx_ids_in_range(
             &self,
             request: tonic::Request<super::TransparentAddressTxIdsInRangeRequest>,
         ) -> std::result::Result<
             tonic::Response<Self::TransparentAddressTxIdsInRangeStream>,
-            tonic::Status,
-        >;
-        /// Return the transparent-address balance summed across the requested
-        /// addresses. The confirmed total is summed in-process from the canonical
-        /// unspent-output index; the signed `unconfirmed_delta_zat` overlays the
-        /// live mempool when an ingest-control endpoint is wired and is zero
-        /// otherwise. Capability: `wallet.address.transparent_balance_v1`.
-        async fn transparent_address_balance(
-            &self,
-            request: tonic::Request<super::TransparentAddressBalanceRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::TransparentAddressBalanceResponse>,
             tonic::Status,
         >;
         /// Return chain-wide value-pool totals at the upstream node's current tip.
@@ -3266,18 +2594,6 @@ pub mod wallet_query_server {
             request: tonic::Request<super::ChainValuePoolsAtTipRequest>,
         ) -> std::result::Result<
             tonic::Response<super::ChainValuePoolsAtTipResponse>,
-            tonic::Status,
-        >;
-        /// Return the chain-wide transparent UTXO-set summary: the count and total
-        /// value of unspent transparent outputs at the settled tip. A request-time
-        /// full scan of the canonical current-UTXO projection (gettxoutsetinfo-
-        /// equivalent, minus the format-dependent serialized hash and byte size).
-        /// Capability: `wallet.read.transparent_utxo_set_summary_v1`.
-        async fn transparent_utxo_set_summary(
-            &self,
-            request: tonic::Request<super::TransparentUtxoSetSummaryRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::TransparentUtxoSetSummaryResponse>,
             tonic::Status,
         >;
         /// Return the server capability descriptor.
@@ -4117,326 +3433,6 @@ pub mod wallet_query_server {
                     };
                     Box::pin(fut)
                 }
-                "/zinder.v1.wallet.WalletQuery/TransparentMempoolOutputsByAddress" => {
-                    #[allow(non_camel_case_types)]
-                    struct TransparentMempoolOutputsByAddressSvc<T: WalletQuery>(
-                        pub Arc<T>,
-                    );
-                    impl<
-                        T: WalletQuery,
-                    > tonic::server::UnaryService<
-                        super::TransparentMempoolOutputsByAddressRequest,
-                    > for TransparentMempoolOutputsByAddressSvc<T> {
-                        type Response = super::TransparentMempoolOutputsByAddressResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<
-                                super::TransparentMempoolOutputsByAddressRequest,
-                            >,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as WalletQuery>::transparent_mempool_outputs_by_address(
-                                        &inner,
-                                        request,
-                                    )
-                                    .await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = TransparentMempoolOutputsByAddressSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/zinder.v1.wallet.WalletQuery/TransparentMempoolSpendsByOutpoint" => {
-                    #[allow(non_camel_case_types)]
-                    struct TransparentMempoolSpendsByOutpointSvc<T: WalletQuery>(
-                        pub Arc<T>,
-                    );
-                    impl<
-                        T: WalletQuery,
-                    > tonic::server::UnaryService<
-                        super::TransparentMempoolSpendsByOutpointRequest,
-                    > for TransparentMempoolSpendsByOutpointSvc<T> {
-                        type Response = super::TransparentMempoolSpendsByOutpointResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<
-                                super::TransparentMempoolSpendsByOutpointRequest,
-                            >,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as WalletQuery>::transparent_mempool_spends_by_outpoint(
-                                        &inner,
-                                        request,
-                                    )
-                                    .await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = TransparentMempoolSpendsByOutpointSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/zinder.v1.wallet.WalletQuery/TransparentOutputsByOutpoint" => {
-                    #[allow(non_camel_case_types)]
-                    struct TransparentOutputsByOutpointSvc<T: WalletQuery>(pub Arc<T>);
-                    impl<
-                        T: WalletQuery,
-                    > tonic::server::UnaryService<
-                        super::TransparentOutputsByOutpointRequest,
-                    > for TransparentOutputsByOutpointSvc<T> {
-                        type Response = super::TransparentOutputsByOutpointResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<
-                                super::TransparentOutputsByOutpointRequest,
-                            >,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as WalletQuery>::transparent_outputs_by_outpoint(
-                                        &inner,
-                                        request,
-                                    )
-                                    .await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = TransparentOutputsByOutpointSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/zinder.v1.wallet.WalletQuery/TransparentSpendsByOutpoint" => {
-                    #[allow(non_camel_case_types)]
-                    struct TransparentSpendsByOutpointSvc<T: WalletQuery>(pub Arc<T>);
-                    impl<
-                        T: WalletQuery,
-                    > tonic::server::UnaryService<
-                        super::TransparentSpendsByOutpointRequest,
-                    > for TransparentSpendsByOutpointSvc<T> {
-                        type Response = super::TransparentSpendsByOutpointResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<
-                                super::TransparentSpendsByOutpointRequest,
-                            >,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as WalletQuery>::transparent_spends_by_outpoint(
-                                        &inner,
-                                        request,
-                                    )
-                                    .await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = TransparentSpendsByOutpointSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/zinder.v1.wallet.WalletQuery/TransparentUnspentOutputsByOutpoint" => {
-                    #[allow(non_camel_case_types)]
-                    struct TransparentUnspentOutputsByOutpointSvc<T: WalletQuery>(
-                        pub Arc<T>,
-                    );
-                    impl<
-                        T: WalletQuery,
-                    > tonic::server::UnaryService<
-                        super::TransparentUnspentOutputsByOutpointRequest,
-                    > for TransparentUnspentOutputsByOutpointSvc<T> {
-                        type Response = super::TransparentUnspentOutputsByOutpointResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<
-                                super::TransparentUnspentOutputsByOutpointRequest,
-                            >,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as WalletQuery>::transparent_unspent_outputs_by_outpoint(
-                                        &inner,
-                                        request,
-                                    )
-                                    .await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = TransparentUnspentOutputsByOutpointSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/zinder.v1.wallet.WalletQuery/TransparentMempoolOutputsByOutpoint" => {
-                    #[allow(non_camel_case_types)]
-                    struct TransparentMempoolOutputsByOutpointSvc<T: WalletQuery>(
-                        pub Arc<T>,
-                    );
-                    impl<
-                        T: WalletQuery,
-                    > tonic::server::UnaryService<
-                        super::TransparentMempoolOutputsByOutpointRequest,
-                    > for TransparentMempoolOutputsByOutpointSvc<T> {
-                        type Response = super::TransparentOutputsByOutpointResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<
-                                super::TransparentMempoolOutputsByOutpointRequest,
-                            >,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as WalletQuery>::transparent_mempool_outputs_by_outpoint(
-                                        &inner,
-                                        request,
-                                    )
-                                    .await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = TransparentMempoolOutputsByOutpointSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
                 "/zinder.v1.wallet.WalletQuery/TransparentAddressUnspentOutputs" => {
                     #[allow(non_camel_case_types)]
                     struct TransparentAddressUnspentOutputsSvc<T: WalletQuery>(
@@ -4545,58 +3541,6 @@ pub mod wallet_query_server {
                     };
                     Box::pin(fut)
                 }
-                "/zinder.v1.wallet.WalletQuery/TransparentAddressBalance" => {
-                    #[allow(non_camel_case_types)]
-                    struct TransparentAddressBalanceSvc<T: WalletQuery>(pub Arc<T>);
-                    impl<
-                        T: WalletQuery,
-                    > tonic::server::UnaryService<
-                        super::TransparentAddressBalanceRequest,
-                    > for TransparentAddressBalanceSvc<T> {
-                        type Response = super::TransparentAddressBalanceResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<
-                                super::TransparentAddressBalanceRequest,
-                            >,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as WalletQuery>::transparent_address_balance(
-                                        &inner,
-                                        request,
-                                    )
-                                    .await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = TransparentAddressBalanceSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
                 "/zinder.v1.wallet.WalletQuery/ChainValuePoolsAtTip" => {
                     #[allow(non_camel_case_types)]
                     struct ChainValuePoolsAtTipSvc<T: WalletQuery>(pub Arc<T>);
@@ -4631,58 +3575,6 @@ pub mod wallet_query_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ChainValuePoolsAtTipSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/zinder.v1.wallet.WalletQuery/TransparentUtxoSetSummary" => {
-                    #[allow(non_camel_case_types)]
-                    struct TransparentUtxoSetSummarySvc<T: WalletQuery>(pub Arc<T>);
-                    impl<
-                        T: WalletQuery,
-                    > tonic::server::UnaryService<
-                        super::TransparentUtxoSetSummaryRequest,
-                    > for TransparentUtxoSetSummarySvc<T> {
-                        type Response = super::TransparentUtxoSetSummaryResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<
-                                super::TransparentUtxoSetSummaryRequest,
-                            >,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as WalletQuery>::transparent_utxo_set_summary(
-                                        &inner,
-                                        request,
-                                    )
-                                    .await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = TransparentUtxoSetSummarySvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

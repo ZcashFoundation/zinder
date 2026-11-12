@@ -194,7 +194,7 @@ immutable while any admitted dependency is temporarily unhealthy.
 
 Before storage is opened or traffic is bound, `AdmittedIngestControl` connects
 once and validates `ServerInfo` service identity, network, contract revision,
-and the seven methods required by the native composition. The accepted
+and the five methods required by the native composition. The accepted
 identity and channel are then immutable. Health checks do not repeat structural
 admission: they call `WriterStatus` and a bounded
 `MempoolSnapshot(max_entries = 1)` through that same authenticated channel and
@@ -400,16 +400,12 @@ The native gRPC adapter records the operations it owns under the same metric
 names, with the `tonic::Code` name as `error_class`:
 
 - `chain_events` stream establishment.
-- The ingest-control proxies `mempool_transaction`, `mempool_snapshot`,
-  `mempool_events`, `transparent_mempool_outputs_by_address`,
-  `transparent_mempool_spends_by_outpoint`, and
-  `transparent_mempool_outputs_by_outpoint`.
+- The ingest-control proxies `mempool_transaction`, `mempool_snapshot`, and
+  `mempool_events`.
 
-The release native endpoint does not advertise
-`wallet.address.transparent_balance_v1`. It rejects transparent balance
-requests at the capability check with `FAILED_PRECONDITION`, which records no
-sample. A direct `WalletServingQuery` balance read, such as the lightwalletd
-compatibility balance request, records under `transparent_address_balance`.
+The native endpoint has no transparent balance method. A direct
+`WalletServingQuery` balance read, such as the lightwalletd compatibility
+balance request, records under `transparent_address_balance`.
 
 The `ZinderWalletQueryP95High` alert and the overview dashboard read these
 series.

@@ -166,27 +166,25 @@ At connect time, call `ServerInfo` and check:
 
 The release `zinder-query` composition admits one authenticated
 `IngestControl` identity before opening storage or binding traffic. Admission
-validates the exact service name, network, contract revision, and the seven
-control methods required for pair publication, transaction lookup, mempool
-snapshot and events, and the two admitted transparent mempool primitives. The query,
+validates the exact service name, network, contract revision, and the five
+control methods required for pair publication, transaction lookup, and mempool
+snapshot and events. The query,
 serving-pair publisher, live wallet handlers, and readiness probe all clone the
 same admitted channel. The probe checks `WriterStatus` plus a bounded,
 tip-coherent `MempoolSnapshot`; it does not repeat structural `ServerInfo`
 discovery.
 
-The native endpoint therefore advertises transaction lookup, mempool snapshot
-and events, transparent mempool outputs-by-address and
-spends-by-outpoint from that concrete composition. It omits
-`wallet.address.transparent_balance_v1`: the gRPC composite performs multiple
-canonical and live calls without one authenticated mempool snapshot, so
-provider presence alone is not sufficient admission evidence. Transaction-byte
-support additionally requires authenticated transaction-blob retention.
-Temporary ingest-control failure drains readiness without rewriting the
-immutable capability set. Methods with no admitted provider or coherent
-snapshot, including transparent mempool outputs-by-outpoint and transparent
-balance, remain omitted and fail their capability guard before provider
-access. These Zinder contract claims do not replace current Zallet or ZODL
-consumer certification.
+The native endpoint therefore advertises transaction lookup and mempool
+snapshot and events from that concrete composition. Transaction-byte support
+additionally requires authenticated transaction-blob retention. Temporary
+ingest-control failure drains readiness without rewriting the immutable
+capability set. Methods with no admitted provider fail their capability guard
+before provider access. The native transparent surface contains only the
+transparent-address UTXO and ascending history reads that Zallet calls; ZODL
+reaches the same reads through the lightwalletd adapter
+([ADR-0043](../adrs/0043-owned-transparent-wallet-query-surface.md)). These
+Zinder contract claims do not replace current Zallet or ZODL consumer
+certification.
 `wallet.events.chain_v1` remains independently derived from the admitted
 serving pair.
 

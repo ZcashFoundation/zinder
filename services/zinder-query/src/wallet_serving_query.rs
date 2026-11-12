@@ -22,9 +22,7 @@ use zinder_core::{
 use zinder_proto::capabilities::{
     WALLET_BROADCAST_TRANSACTION_V1, WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
     WALLET_READ_FULL_BLOCK_AT_V1, WALLET_READ_FULL_BLOCK_RANGE_V1,
-    WALLET_READ_TRANSACTION_BY_ID_V2, WALLET_READ_TRANSPARENT_OUTPUTS_V1,
-    WALLET_READ_TRANSPARENT_SPENDS_V1, WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1,
-    WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1, WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
+    WALLET_READ_TRANSACTION_BY_ID_V2, WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
 };
 use zinder_source::{NodeCapability, NodeSource, TransactionBroadcaster, TreeStateUpstream};
 use zinder_store::{
@@ -328,7 +326,6 @@ mod tests {
             end_height: BlockHeight::new(20),
             max_entries: std::num::NonZeroU32::MIN,
             from_cursor: None,
-            descending: false,
         };
         let other_address = WalletAddressTransactionKey::new(
             TransparentAddressScriptHash::from_bytes([0xa6; 32]),
@@ -931,38 +928,6 @@ where
         .await
     }
 
-    async fn transparent_outputs_by_outpoint(
-        &self,
-        _outpoints: Vec<zinder_core::TransparentOutPoint>,
-        _at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<zinder_core::TransparentOutputsByOutpointResponse, QueryError> {
-        let unserved = Err(unavailable(WALLET_READ_TRANSPARENT_OUTPUTS_V1));
-        serving_read::record("transparent_outputs_by_outpoint", None, ready(unserved)).await
-    }
-
-    async fn transparent_spends_by_outpoint(
-        &self,
-        _outpoints: Vec<zinder_core::TransparentOutPoint>,
-        _at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<zinder_core::TransparentSpendsByOutpointResponse, QueryError> {
-        let unserved = Err(unavailable(WALLET_READ_TRANSPARENT_SPENDS_V1));
-        serving_read::record("transparent_spends_by_outpoint", None, ready(unserved)).await
-    }
-
-    async fn transparent_unspent_outputs_by_outpoint(
-        &self,
-        _outpoints: Vec<zinder_core::TransparentOutPoint>,
-        _at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<zinder_core::TransparentUnspentOutputsByOutpointResponse, QueryError> {
-        let unserved = Err(unavailable(WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1));
-        serving_read::record(
-            "transparent_unspent_outputs_by_outpoint",
-            None,
-            ready(unserved),
-        )
-        .await
-    }
-
     async fn transparent_address_unspent_outputs(
         &self,
         request: TransparentAddressUnspentOutputsRequest,
@@ -1008,11 +973,6 @@ where
         request: TransparentAddressTxIdsInRangeRequest,
     ) -> Result<TransparentAddressTxIds, QueryError> {
         serving_read::record("transparent_address_tx_ids_in_range", None, async {
-            if request.descending {
-                return Err(QueryError::MaterializedViewUnavailable {
-                    capability: "descending canonical transparent history",
-                });
-            }
             let pair = self.capture_pair();
             serving_read::off_reactor(pair, move |pair| {
                 let chain_epoch = Self::chain_epoch(&pair, None)?;
@@ -1086,7 +1046,6 @@ where
                 }
                 Ok(TransparentAddressBalance {
                     confirmed_zat,
-                    unconfirmed_delta_zat: 0,
                     address_count: u32::try_from(addresses.len()).unwrap_or(u32::MAX),
                     chain_epoch,
                 })
@@ -1094,14 +1053,6 @@ where
             .await
         })
         .await
-    }
-
-    async fn transparent_utxo_set_summary(
-        &self,
-        _at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<zinder_core::TransparentUtxoSetSummary, QueryError> {
-        let unserved = Err(unavailable(WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1));
-        serving_read::record("transparent_utxo_set_summary", None, ready(unserved)).await
     }
 
     async fn tree_state_at(

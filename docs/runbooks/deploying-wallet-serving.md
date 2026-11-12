@@ -95,8 +95,8 @@ The wallet-serving ingest configuration sets
 wallet-serving readiness do not depend on the optional materialized-view plane;
 an existing materialized-view directory is left untouched. To serve Explorer
 views on the same host, use the documented Explorer Compose overlay, which
-explicitly overrides Explorer views to `true` and requires the matching
-persisted preset.
+explicitly overrides Explorer views to `true` and requires a materialized-view
+store that records this release's exact Explorer view manifest.
 
 `PORT` names the port Railway healthchecks. It must stay `9106`, the
 operational endpoint of the query process.

@@ -27,7 +27,6 @@ pub(crate) mod transaction_history;
 pub(crate) mod transparent_address_activity;
 pub(crate) mod transparent_address_deltas;
 pub(crate) mod transparent_address_ranking;
-pub(crate) mod transparent_address_transaction_history;
 pub(crate) mod transparent_outpoint_spend;
 pub(crate) mod value_pool_balance_history;
 pub(crate) mod value_pool_flow_history;

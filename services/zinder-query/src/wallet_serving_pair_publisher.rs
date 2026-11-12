@@ -3205,7 +3205,6 @@ mod tests {
                 end_height: visible_tip.height.value(),
                 max_entries: 1,
                 from_cursor: Vec::new(),
-                descending: false,
             })
             .await?
             .into_inner();

@@ -182,8 +182,6 @@ fn extract_chain_index_body_matches_known_method_set() -> Result<()> {
         "transaction_by_id",
         "transparent_address_unspent_outputs",
         "transparent_address_tx_ids_in_range",
-        "transparent_address_balance",
-        "transparent_outputs_by_outpoint",
     ];
     assert_trait_includes_methods(CHAIN_INDEX_DECLARATION, &must_include)
 }
@@ -200,9 +198,6 @@ fn extract_endpoint_backed_body_matches_known_method_set() -> Result<()> {
         "mempool_snapshot",
         "mempool_events",
         "is_in_mempool",
-        "transparent_mempool_outputs_by_address",
-        "transparent_mempool_spends_by_outpoint",
-        "transparent_mempool_outputs_by_outpoint",
     ];
     assert_trait_includes_methods(ENDPOINT_BACKED_DECLARATION, &must_include)
 }

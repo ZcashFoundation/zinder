@@ -80,14 +80,6 @@ impl NativeWalletEndpointCapabilities {
                     && ingest_control.supports(capabilities::INGEST_CONTROL_MEMPOOL_SNAPSHOT_V3))
                 || (capability == capabilities::WALLET_EVENTS_MEMPOOL_V2
                     && ingest_control.supports(capabilities::INGEST_CONTROL_MEMPOOL_EVENTS_V2))
-                || (capability == capabilities::WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1
-                    && ingest_control.supports(
-                        capabilities::INGEST_CONTROL_TRANSPARENT_MEMPOOL_OUTPUTS_BY_ADDRESS_V1,
-                    ))
-                || (capability == capabilities::WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1
-                    && ingest_control.supports(
-                        capabilities::INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPENDS_BY_OUTPOINT_V1,
-                    ))
         })
     }
 

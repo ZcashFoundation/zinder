@@ -7,9 +7,8 @@
 //! 1. Parses the raw transaction bytes via `zebra-chain` so the same
 //!    consensus parser used by chain ingestion drives mempool hydration.
 //! 2. Builds native structured wallet scan data on the ingest write side.
-//! 3. Extracts the transparent outputs and outpoint spends needed for the
-//!    `transparent_mempool_outputs_by_address` and
-//!    `transparent_mempool_spend_by_outpoint` lookups.
+//! 3. Extracts the transparent outputs and outpoint spends carried by every
+//!    snapshot entry and checked by the index's live-outpoint invariants.
 //! 4. Stamps the visible [`ChainEpoch`] supplied by ingest at observation
 //!    time. The chain epoch is the one stored alongside the source entry's
 //!    wall-clock observation time, not the chain epoch at the moment a

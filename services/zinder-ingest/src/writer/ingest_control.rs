@@ -13,8 +13,7 @@ use tokio::sync::mpsc;
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, service::interceptor::InterceptedService};
 use zinder_core::{
-    ChainEpoch, ChainValuePools, MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, Network, TransactionId,
-    TransparentAddressScriptHash, TransparentOutPoint,
+    ChainEpoch, ChainValuePools, Network, TransactionId,
     wire::{decode_rpc_transaction_id_hex, encode_zinder_native_chain_name},
 };
 use zinder_proto::{
@@ -36,8 +35,7 @@ use zinder_runtime::{
 use zinder_source::{NodeCapability, NodeSource, SourceError};
 use zinder_store::{
     CanonicalEventKind, block_tip_message, chain_epoch_message, chain_view_message,
-    event_stream_start_from_message, mempool_entry_message, transparent_mempool_output_message,
-    transparent_mempool_spend_message, transparent_output_entry_message,
+    event_stream_start_from_message, mempool_entry_message,
 };
 
 use crate::{
@@ -52,8 +50,6 @@ type MempoolEventsStream = IngestControlStream<wallet::MempoolEventEnvelope>;
 const DEFAULT_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 256;
 /// Hard response bound shared by the private writer control APIs.
 pub const MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 1_024;
-const DEFAULT_TRANSPARENT_MEMPOOL_POINT_LOOKUP_MAX_ENTRIES: u32 = 256;
-const MAX_TRANSPARENT_MEMPOOL_POINT_LOOKUP_MAX_ENTRIES: u32 = 1_024;
 const CANONICAL_EVENT_PAGE_SIZE: NonZeroU32 = NonZeroU32::MIN.saturating_add(63);
 const EVENT_STREAM_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -149,8 +145,6 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
                 build_git_commit: zinder_runtime::BUILD_GIT_COMMIT.to_owned(),
                 capabilities: self.advertised_capabilities(),
                 contract_revision: zinder_proto::CONTRACT_REVISION,
-                materialized_view_preset: String::new(),
-                materialized_view_identities: Vec::new(),
             }),
         }))
     }
@@ -301,84 +295,6 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
             self.canonical.clone(),
             after_cursor,
         )))
-    }
-
-    async fn transparent_mempool_outputs_by_address(
-        &self,
-        request: Request<wallet::TransparentMempoolOutputsByAddressRequest>,
-    ) -> Result<Response<wallet::TransparentMempoolOutputsByAddressResponse>, Status> {
-        let request = request.into_inner();
-        let address_script_hash = script_hash_from_lookup(request.address)?;
-        let snapshot = self.current_chain_epoch().await?;
-        let outputs = self
-            .mempool
-            .transparent_outputs_by_address(
-                snapshot.chain_epoch,
-                address_script_hash,
-                bounded_point_lookup_max_entries(request.max_entries),
-            )
-            .await?
-            .iter()
-            .map(transparent_mempool_output_message)
-            .collect();
-        Ok(Response::new(
-            wallet::TransparentMempoolOutputsByAddressResponse {
-                chain_view: Some(chain_view_message(snapshot.chain_epoch)),
-                outputs,
-            },
-        ))
-    }
-
-    async fn transparent_mempool_spends_by_outpoint(
-        &self,
-        request: Request<wallet::TransparentMempoolSpendsByOutpointRequest>,
-    ) -> Result<Response<wallet::TransparentMempoolSpendsByOutpointResponse>, Status> {
-        let mut outpoints = request.into_inner().outpoints;
-        outpoints.truncate(MAX_TRANSPARENT_OUTPUTS_PER_REQUEST);
-        let outpoints = outpoints
-            .into_iter()
-            .map(|outpoint| outpoint_from_request_message(Some(outpoint)))
-            .collect::<Result<Vec<_>, _>>()?;
-        let snapshot = self.current_chain_epoch().await?;
-        let spends = self
-            .mempool
-            .transparent_spends_by_outpoint(snapshot.chain_epoch, outpoints)
-            .await?
-            .iter()
-            .map(transparent_mempool_spend_message)
-            .collect();
-        Ok(Response::new(
-            wallet::TransparentMempoolSpendsByOutpointResponse {
-                chain_view: Some(chain_view_message(snapshot.chain_epoch)),
-                spends,
-            },
-        ))
-    }
-
-    async fn transparent_mempool_outputs_by_outpoint(
-        &self,
-        request: Request<wallet::TransparentMempoolOutputsByOutpointRequest>,
-    ) -> Result<Response<wallet::TransparentOutputsByOutpointResponse>, Status> {
-        let mut outpoints = request.into_inner().outpoints;
-        outpoints.truncate(MAX_TRANSPARENT_OUTPUTS_PER_REQUEST);
-        let outpoints = outpoints
-            .into_iter()
-            .map(|outpoint| outpoint_from_request_message(Some(outpoint)))
-            .collect::<Result<Vec<_>, _>>()?;
-        let snapshot = self.current_chain_epoch().await?;
-        let entries = self
-            .mempool
-            .transparent_outputs_by_outpoints(snapshot.chain_epoch, &outpoints)
-            .await?
-            .into_iter()
-            .map(transparent_output_entry_message)
-            .collect();
-        Ok(Response::new(
-            wallet::TransparentOutputsByOutpointResponse {
-                chain_view: Some(chain_view_message(snapshot.chain_epoch)),
-                entries,
-            },
-        ))
     }
 
     async fn chain_value_pools_at_tip(
@@ -640,53 +556,9 @@ const fn bounded_snapshot_page_size(requested: u32) -> u32 {
     }
 }
 
-const fn bounded_point_lookup_max_entries(requested: Option<u32>) -> u32 {
-    let Some(requested) = requested else {
-        return DEFAULT_TRANSPARENT_MEMPOOL_POINT_LOOKUP_MAX_ENTRIES;
-    };
-    if requested == 0 {
-        DEFAULT_TRANSPARENT_MEMPOOL_POINT_LOOKUP_MAX_ENTRIES
-    } else if requested > MAX_TRANSPARENT_MEMPOOL_POINT_LOOKUP_MAX_ENTRIES {
-        MAX_TRANSPARENT_MEMPOOL_POINT_LOOKUP_MAX_ENTRIES
-    } else {
-        requested
-    }
-}
-
-fn script_hash_from_lookup(
-    address: Option<wallet::AddressLookup>,
-) -> Result<TransparentAddressScriptHash, Status> {
-    let lookup = address.ok_or_else(|| Status::invalid_argument("address selector is required"))?;
-    let selector = lookup
-        .selector
-        .ok_or_else(|| Status::invalid_argument("address selector is empty"))?;
-    match selector {
-        wallet::address_lookup::Selector::ScriptHash(bytes) => {
-            let hash_bytes: [u8; 32] = bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| Status::invalid_argument("address.script_hash must be 32 bytes"))?;
-            Ok(TransparentAddressScriptHash::from_bytes(hash_bytes))
-        }
-        wallet::address_lookup::Selector::Address(_) => Err(Status::unimplemented(
-            "version-1 ingest control accepts only the script_hash address selector",
-        )),
-    }
-}
-
 fn transaction_id_from_rpc_hex(rpc_hex: &str) -> Result<TransactionId, Status> {
     decode_rpc_transaction_id_hex(rpc_hex)
         .map_err(|error| Status::invalid_argument(error.to_string()))
-}
-
-fn outpoint_from_request_message(
-    message: Option<wallet::OutPoint>,
-) -> Result<TransparentOutPoint, Status> {
-    let message = message.ok_or_else(|| Status::invalid_argument("outpoint is required"))?;
-    Ok(TransparentOutPoint::new(
-        transaction_id_from_rpc_hex(&message.transaction_id)?,
-        message.output_index,
-    ))
 }
 
 #[cfg(test)]
@@ -715,11 +587,9 @@ mod tests {
                 ingest_control_client::IngestControlClient, ingest_control_server::IngestControl,
             },
             wallet::{
-                AddressLookup, ChainEventEnvelope, MempoolEventEnvelope, MempoolEventsRequest,
-                MempoolSnapshotRequest, OutPoint, TransparentMempoolOutputsByAddressRequest,
-                TransparentMempoolOutputsByOutpointRequest,
-                TransparentMempoolSpendsByOutpointRequest, address_lookup, chain_event_envelope,
-                mempool_event_envelope, transaction_location,
+                ChainEventEnvelope, MempoolEventEnvelope, MempoolEventsRequest,
+                MempoolSnapshotRequest, chain_event_envelope, mempool_event_envelope,
+                transaction_location,
             },
         },
     };
@@ -1038,91 +908,6 @@ mod tests {
         fixture.shutdown().await
     }
 
-    /// All three transparent point lookup RPCs resolve the same current
-    /// in-memory entry and preserve absent entries as omissions/empty slots.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn shared_listener_serves_transparent_mempool_lookups()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut fixture = shared_control_fixture().await?;
-        let transaction_id = TransactionId::from_bytes([0xA1; 32]);
-        let known_outpoint = OutPoint {
-            transaction_id: encode_rpc_transaction_id_hex(transaction_id),
-            output_index: 0,
-        };
-
-        let by_address = fixture
-            .ingest_client
-            .transparent_mempool_outputs_by_address(authenticated(
-                TransparentMempoolOutputsByAddressRequest {
-                    address: Some(AddressLookup {
-                        selector: Some(address_lookup::Selector::ScriptHash(
-                            zinder_core::TransparentAddressScriptHash::of_script_pub_key(
-                                &[0xA1; 25],
-                            )
-                            .as_bytes()
-                            .to_vec(),
-                        )),
-                    }),
-                    max_entries: None,
-                },
-            ))
-            .await?
-            .into_inner();
-        assert_eq!(by_address.outputs.len(), 1);
-        assert_eq!(by_address.outputs[0].value_zat, 1_000);
-
-        let spends = fixture
-            .ingest_client
-            .transparent_mempool_spends_by_outpoint(authenticated(
-                TransparentMempoolSpendsByOutpointRequest {
-                    outpoints: vec![
-                        OutPoint {
-                            transaction_id: "55".repeat(32),
-                            output_index: 0,
-                        },
-                        OutPoint {
-                            transaction_id: "ff".repeat(32),
-                            output_index: 7,
-                        },
-                    ],
-                },
-            ))
-            .await?
-            .into_inner();
-        assert_eq!(spends.spends.len(), 1);
-        assert_eq!(
-            spends.spends[0].spending_transaction_id,
-            encode_rpc_transaction_id_hex(transaction_id)
-        );
-
-        let outputs = fixture
-            .ingest_client
-            .transparent_mempool_outputs_by_outpoint(authenticated(
-                TransparentMempoolOutputsByOutpointRequest {
-                    outpoints: vec![
-                        known_outpoint,
-                        OutPoint {
-                            transaction_id: "ff".repeat(32),
-                            output_index: 0,
-                        },
-                    ],
-                },
-            ))
-            .await?
-            .into_inner();
-        assert_eq!(outputs.entries.len(), 2);
-        assert_eq!(
-            outputs.entries[0]
-                .output
-                .as_ref()
-                .map(|output| output.value_zat),
-            Some(1_000)
-        );
-        assert!(outputs.entries[1].output.is_none());
-
-        fixture.shutdown().await
-    }
-
     /// Retention is owned by the canonical writer: once a mined envelope is
     /// pruned, its cursor must be rejected at the public replay boundary.
     #[tokio::test(flavor = "multi_thread")]
@@ -1269,8 +1054,6 @@ mod tests {
             server_info.build_git_commit,
             zinder_runtime::BUILD_GIT_COMMIT
         );
-        assert!(server_info.materialized_view_preset.is_empty());
-        assert!(server_info.materialized_view_identities.is_empty());
 
         let response = IngestControl::chain_value_pools_at_tip(
             &adapter,
@@ -1807,8 +1590,6 @@ mod tests {
             server_info.build_git_commit,
             zinder_runtime::BUILD_GIT_COMMIT
         );
-        assert!(server_info.materialized_view_preset.is_empty());
-        assert!(server_info.materialized_view_identities.is_empty());
 
         let mut chain_events = ingest_client
             .visible_chain_events(authenticated(event_stream_start_message(

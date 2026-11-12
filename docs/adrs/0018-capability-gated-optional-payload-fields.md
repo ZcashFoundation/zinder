@@ -10,10 +10,9 @@ Related: [ADR-0009](0009-explorer-plane-as-product-surface.md),
 Several wire fields in the explorer plane carry values that depend on
 upstream state the operator may or may not have wired:
 
-- `TransactionDetailResponse.paid_fee_zat` requires the wallet plane's
-  transparent prevout resolution (capability
-  `wallet.read.transparent_outputs_by_outpoint_v1`) to be online and the
-  transaction to be classified `TransparentOnly`. Canonical facts do not
+- `TransactionDetailResponse.paid_fee_zat` requires transparent prevout
+  values from the hydrated canonical spend facts and the transaction to be
+  classified `TransparentOnly`. Canonical facts do not
   retain the value balances needed to prove shielded transaction fees.
 - `MempoolActivityEntry.paid_fee_zat` requires the same upstream
   capability plus a per-mempool-tx lookup path.
@@ -62,11 +61,11 @@ convention. Specifically:
    on a per-named-flag basis. The flags are set by the binary at
    startup based on:
 
-   - probing the upstream's `ServerInfo`
-     (`wallet.read.transparent_outputs_by_outpoint_v1` flips on when the wallet
-     advertises it);
-   - whether the materialized-view store has been wired
-     (`materialized_view_store_online` covers `BlockSummary`, `BlockDetail`,
+   - the prevout-resolution flag, which the explorer sets when its
+     materialized-view store is attached and which also requires a
+     configured `WalletQuery` endpoint;
+   - whether a materialized-view store with the exact Explorer view
+     manifest has been wired (`materialized_view_store_online` covers `BlockSummary`, `BlockDetail`,
      `MempoolEventCounts`, `RecentTransactions`, and
      `TransparentAddressActivity`).
 

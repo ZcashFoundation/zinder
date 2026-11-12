@@ -140,7 +140,7 @@ async fn run_explorer(cli: Cli) -> Result<(), ExplorerConfigError> {
             return Err(error);
         }
     };
-    report_materialized_view_workload(&readiness, materialized_view_store.as_ref());
+    report_materialized_view_identities(&readiness, materialized_view_store.as_ref());
     let required_inputs: &[ReadinessInput] = if materialized_view_store.is_some() {
         &[ReadinessInput::MaterializedViewCatchup]
     } else {
@@ -233,21 +233,17 @@ async fn drain_readiness_on_cancel(cancel: CancellationToken, readiness: Compose
     readiness.publish_shutting_down();
 }
 
-fn report_materialized_view_workload(
+fn report_materialized_view_identities(
     readiness: &Readiness,
     materialized_view_store: Option<&MaterializedViewStore>,
 ) {
-    let Some(materialized_view_preset) =
-        materialized_view_store.map(MaterializedViewStore::effective_materialized_view_preset)
-    else {
+    let Some(materialized_view_store) = materialized_view_store else {
         return;
     };
-    readiness.set_materialized_view_workload(
-        materialized_view_preset.as_str(),
-        materialized_view_preset
-            .consumer_schemas()
-            .iter()
-            .map(|schema| schema.name.as_str().to_owned())
+    readiness.set_materialized_view_identities(
+        materialized_view_store
+            .consumer_identities()
+            .map(|identity| identity.as_str().to_owned())
             .collect(),
     );
 }
@@ -330,40 +326,36 @@ fn open_materialized_view_store(
         .secondary_path
         .join("materialized-views");
     let open_storage_phase = StartupPhase::OpenStorage.start();
-    let materialized_view_preset =
-        match MaterializedViewStore::detect_materialized_view_preset_at_path(
-            &materialized_view_path,
-        ) {
-            Ok(Some(materialized_view_preset)) => materialized_view_preset,
-            Ok(None) => {
-                tracing::info!(
-                    target: "zinder::explorer",
-                    event = "materialized_view_store_unavailable",
-                    "materialized-view store unavailable; materialized-view-backed explorer capabilities disabled"
-                );
-                open_storage_phase.complete();
-                return Ok(None);
-            }
-            Err(error @ MaterializedViewStoreError::Open { .. }) => {
-                tracing::info!(
-                    target: "zinder::explorer",
-                    event = "materialized_view_store_unavailable",
-                    error = %error,
-                    "materialized-view store unavailable; materialized-view-backed explorer capabilities disabled"
-                );
-                open_storage_phase.complete();
-                return Ok(None);
-            }
-            Err(error) => {
-                let wrapped = ExplorerConfigError::Store(error);
-                open_storage_phase.fail(&wrapped);
-                return Err(wrapped);
-            }
-        };
-    match MaterializedViewStore::open_secondary_with_materialized_view_preset(
+    match MaterializedViewStore::exists_at_path(&materialized_view_path) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(
+                target: "zinder::explorer",
+                event = "materialized_view_store_unavailable",
+                "materialized-view store unavailable; materialized-view-backed explorer capabilities disabled"
+            );
+            open_storage_phase.complete();
+            return Ok(None);
+        }
+        Err(error @ MaterializedViewStoreError::Open { .. }) => {
+            tracing::info!(
+                target: "zinder::explorer",
+                event = "materialized_view_store_unavailable",
+                error = %error,
+                "materialized-view store unavailable; materialized-view-backed explorer capabilities disabled"
+            );
+            open_storage_phase.complete();
+            return Ok(None);
+        }
+        Err(error) => {
+            let wrapped = ExplorerConfigError::Store(error);
+            open_storage_phase.fail(&wrapped);
+            return Err(wrapped);
+        }
+    }
+    match MaterializedViewStore::open_explorer_views_secondary(
         &materialized_view_path,
         &secondary_path,
-        materialized_view_preset,
         MaterializedViewStoreOptions {
             sync_writes: false,
             rocksdb_resource_budget: explorer_config.storage.materialized_view_rocksdb_budget,

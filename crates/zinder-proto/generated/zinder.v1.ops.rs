@@ -4,7 +4,7 @@
 /// Every Zinder gRPC service that wants to advertise its identity and
 /// capability set returns this message from a `ServerInfo` rpc. Some
 /// services wrap it inside a richer descriptor (WalletQuery layers
-/// retention windows and reorg-window depth on top).
+/// reorg-window depth on top).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ServerInfo {
     /// Network identifier: `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`.
@@ -28,16 +28,6 @@ pub struct ServerInfo {
     /// minimum.
     #[prost(uint32, tag = "5")]
     pub contract_revision: u32,
-    /// Closed materialized-view workload detected from the durable manifest.
-    /// Empty only when this process has no materialized-view store attached.
-    #[prost(string, tag = "6")]
-    pub materialized_view_preset: ::prost::alloc::string::String,
-    /// Stable materialized-view identities selected by materialized_view_preset. Order is not
-    /// significant; consumers compare these as a set.
-    #[prost(string, repeated, tag = "7")]
-    pub materialized_view_identities: ::prost::alloc::vec::Vec<
-        ::prost::alloc::string::String,
-    >,
     /// Full Git commit embedded by the release build, or `unknown` for a local
     /// build without injected source metadata.
     #[prost(string, tag = "8")]
@@ -59,10 +49,8 @@ pub struct ReadinessReport {
     /// cause carries no auxiliary detail.
     #[prost(message, optional, tag = "4")]
     pub detail: ::core::option::Option<ReadinessCauseDetail>,
-    /// Selected closed materialized-view workload, or empty when no materialized-view store is open.
-    #[prost(string, tag = "5")]
-    pub materialized_view_preset: ::prost::alloc::string::String,
-    /// Stable identities selected by materialized_view_preset.
+    /// Consumer identities of the Explorer view store this process admitted.
+    /// Empty when the process has not admitted one.
     #[prost(string, repeated, tag = "6")]
     pub materialized_view_identities: ::prost::alloc::vec::Vec<
         ::prost::alloc::string::String,
