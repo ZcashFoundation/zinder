@@ -32,7 +32,8 @@ source payload statistics. Every adapter must:
   protocol mismatches, and oversized responses.
 
 `ZebraJsonRpcSource` implements the boundary with a bounded JSON-RPC batch of
-height-keyed `getblock` requests. It decodes each raw block locally, validates
+height-keyed `getblock` requests, at most 1,000 per batch because Zakura
+refuses larger batches. It decodes each raw block locally, validates
 linkage, records observed payload bytes, and splits requests when the source or
 transport rejects the response size. It does not make a preceding
 `getblockhash` call: the decoded block hash and parent hash provide the required

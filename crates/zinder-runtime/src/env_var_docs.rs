@@ -240,7 +240,10 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Maximum JSON-RPC response body size (bytes) accepted from the node.",
+        description: "Maximum JSON-RPC response body size (bytes) accepted from the node. \
+                      Defaults to 67108864 (64 MiB). This is a ceiling on what Zinder accepts, \
+                      not a request size: Zebra 7.0.0 and Zakura 1.8.6 refuse responses above \
+                      50 MiB by default, and ingest splits a source segment the node refuses.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__BROADCAST_TIMEOUT_SECS",
@@ -1125,7 +1128,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Diagnostic override for the hard ceiling on connected blocks requested \
-                      from the source in one segment. The resource-resolved default is 64.",
+                      from the source in one segment. The resource-resolved default is 64. \
+                      Values above 1000 are rejected at startup, because each block is one \
+                      JSON-RPC batch entry and Zakura refuses batches above 1,000 entries.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__CONSTRUCTION__SOURCE_SEGMENT_TARGET_RESPONSE_BYTES",

@@ -63,7 +63,7 @@ A live test in `crates/zinder-source/tests/live/zebra_json_rpc.rs` calls `fetch_
 - Operators can iterate on regtest activation heights above the store's tip via their `zebrad.toml` without forking Zinder or coordinating a code change. Restart ingest to admit the new table; a change to an activation the store has crossed fails closed.
 - `MinedTransactionChainContext.consensus_branch_id` is correct on every network for every supported upgrade automatically; no Zinder code-change tax per upgrade.
 - New consumers that need consensus parameters have one obvious answer: accept `Arc<NetworkUpgradeActivations>` in your constructor; the production binary already discovers and shares one.
-- Custom testnets become first-class: the table discovers itself from the node; nothing in Zinder hardcodes mainnet/testnet activation heights.
+- Custom testnets become first-class: the table discovers itself from the node; nothing in Zinder hardcodes mainnet/testnet activation heights. This covers custom activation heights only. A test network with its own genesis block is not supported, because each `Network` carries a fixed genesis hash; see [Chain ingestion](../architecture/chain-ingestion.md#supported-chains).
 - Required-at-construction wiring eliminates the "silently serves branch id 0 forever" failure mode: a misconfigured service refuses to start instead of misreporting `MinedTransactionChainContext.consensus_branch_id` for its entire lifetime.
 
 ### What this costs
