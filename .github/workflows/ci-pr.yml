@@ -160,6 +160,9 @@ jobs:
       - name: Test wallet-serving entrypoint
         run: scripts/test-wallet-serving-entrypoint.sh
 
+      - name: Test indexer TLS entrypoints
+        run: scripts/test-indexer-tls-entrypoints.sh
+
       - name: Test release image publication
         run: scripts/test-release-image-publication.sh
 

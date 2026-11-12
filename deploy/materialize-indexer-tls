@@ -1,0 +1,146 @@
+# shellcheck shell=sh
+# The sourcing entrypoints read indexer_tls_pem_present.
+# shellcheck disable=SC2034
+#
+# Indexer TLS key material for platforms that deliver secrets only as
+# environment variables.
+#
+# Zinder binaries read indexer TLS material from files only. The root-run
+# single-volume image entrypoints source this file and call
+# materialize_indexer_tls before starting any runtime process. For each
+# non-empty ZINDER_NODE__INDEXER_TLS__*_PEM variable it writes the value to a
+# file readable only by the zinder user and exports the matching *_PATH
+# variable. The caller must then start every process without the *_PEM
+# variables; a Zinder binary that receives one refuses to start.
+#
+# Platforms that can mount files should set the *_PATH variables directly:
+# the values below stay visible in the platform's own environment views.
+
+indexer_tls_pem_variables="ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM"
+
+# A tmpfs keeps the private key off disk. /run is the fallback, and it may be
+# on the container's disk layer.
+indexer_tls_tmpfs_parent="/dev/shm"
+indexer_tls_fallback_parent="/run"
+indexer_tls_directory_name="zinder-indexer-tls"
+
+# Set by materialize_indexer_tls: whether any *_PEM variable is set, even to an
+# empty value, so the caller knows to start its processes without them.
+indexer_tls_pem_present=0
+
+indexer_tls_newline='
+'
+
+indexer_tls_log() {
+  printf '%s zinder-indexer-tls: %s\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >&2
+}
+
+indexer_tls_fail() {
+  indexer_tls_log "$*"
+  exit 1
+}
+
+# Succeeds when the variable named $1 is set, including to the empty string.
+indexer_tls_is_set() {
+  eval "[ \"\${$1+set}\" = set ]"
+}
+
+# Prints the value of the variable named $1, or nothing when it is unset.
+indexer_tls_read() {
+  eval "printf '%s' \"\${$1:-}\""
+}
+
+# Prints the directory that receives the files, or fails when neither
+# candidate is usable.
+indexer_tls_parent() {
+  if [ "$(stat -f -c %T "$indexer_tls_tmpfs_parent" 2>/dev/null)" = "tmpfs" ] \
+    && [ -d "$indexer_tls_tmpfs_parent" ] && [ -w "$indexer_tls_tmpfs_parent" ]; then
+    printf '%s' "$indexer_tls_tmpfs_parent"
+    return 0
+  fi
+  if [ -d "$indexer_tls_fallback_parent" ] && [ -w "$indexer_tls_fallback_parent" ]; then
+    printf '%s' "$indexer_tls_fallback_parent"
+    return 0
+  fi
+  return 1
+}
+
+# Rejects values that are not multi-line PEM text. Platform variable editors
+# can collapse line breaks, which leaves a value no PEM parser accepts.
+indexer_tls_validate() {
+  pem_variable="$1"
+  pem_text="$2"
+
+  case "$pem_text" in
+    *-----BEGIN*) ;;
+    *) indexer_tls_fail "$pem_variable does not hold PEM text: it lacks a -----BEGIN line" ;;
+  esac
+  case "$pem_text" in
+    *"$indexer_tls_newline"*) ;;
+    *) indexer_tls_fail "$pem_variable holds PEM text without line breaks; set the value with its original line breaks" ;;
+  esac
+}
+
+materialize_indexer_tls() {
+  indexer_tls_pem_present=0
+  supplied_count=0
+
+  for pem_variable in $indexer_tls_pem_variables; do
+    if ! indexer_tls_is_set "$pem_variable"; then
+      continue
+    fi
+    indexer_tls_pem_present=1
+    pem_text="$(indexer_tls_read "$pem_variable")"
+    if [ -z "$pem_text" ]; then
+      continue
+    fi
+    path_variable="${pem_variable%_PEM}_PATH"
+    if [ -n "$(indexer_tls_read "$path_variable")" ]; then
+      indexer_tls_fail "set either $pem_variable or $path_variable, not both"
+    fi
+    indexer_tls_validate "$pem_variable" "$pem_text"
+    supplied_count=$((supplied_count + 1))
+  done
+
+  if [ "$supplied_count" -eq 0 ]; then
+    return 0
+  fi
+
+  parent="$(indexer_tls_parent)" \
+    || indexer_tls_fail "neither $indexer_tls_tmpfs_parent (as a writable tmpfs) nor $indexer_tls_fallback_parent is writable; mount the PEM files and set the *_PATH variables instead"
+  if [ "$parent" = "$indexer_tls_tmpfs_parent" ]; then
+    indexer_tls_log "writing indexer TLS material to tmpfs at $parent/$indexer_tls_directory_name"
+  else
+    indexer_tls_log "writing indexer TLS material to $parent/$indexer_tls_directory_name; $indexer_tls_tmpfs_parent is not a writable tmpfs, so the files may be on disk"
+  fi
+
+  # The directory is recreated on every start. rm -rf does not follow a
+  # planted symlink, and mkdir without -p fails if anything reappears in
+  # between. Mode 0711 lets the zinder user open its own files by name
+  # without listing the directory.
+  directory="$parent/$indexer_tls_directory_name"
+  rm -rf -- "$directory"
+  mkdir -m 0711 -- "$directory" \
+    || indexer_tls_fail "could not create $directory"
+
+  previous_umask="$(umask)"
+  umask 077
+  for pem_variable in $indexer_tls_pem_variables; do
+    pem_text="$(indexer_tls_read "$pem_variable")"
+    if [ -z "$pem_text" ]; then
+      continue
+    fi
+    material="${pem_variable#ZINDER_NODE__INDEXER_TLS__}"
+    material="${material%_PEM}"
+    file="$directory/$(printf '%s' "$material" | tr '[:upper:]_' '[:lower:]-').pem"
+    printf '%s\n' "$pem_text" >"$file" \
+      || indexer_tls_fail "could not write $file"
+    chmod 0400 "$file"
+    chown -h zinder:zinder "$file" \
+      || indexer_tls_fail "could not give $file to the zinder user"
+    path_variable="${pem_variable%_PEM}_PATH"
+    export "$path_variable=$file"
+  done
+  umask "$previous_umask"
+}

@@ -77,7 +77,7 @@ These are optional:
 
 | Variable | Effect |
 | --- | --- |
-| `ZINDER_NODE__INDEXER_GRPC_ADDR` | Enables the streaming mempool source, such as `http://zebra.railway.internal:8155`. |
+| `ZINDER_NODE__INDEXER_GRPC_ADDR` | Enables the streaming mempool source, such as `http://zebra.railway.internal:8155`. An `https://` URL negotiates TLS; see [Indexer TLS](#indexer-tls). |
 | `ZINDER_INGEST__REORG_WINDOW_BLOCKS` | Sets the canonical replacement depth, applied identically to the projector and the query surface. Defaults to 1000, Zebra's finalization depth. Raising it on an existing deployment, including by upgrading to this default, raises the stores in place and irreversibly; capture a state bundle first if you need a rollback path. Lowering it requires a rebuild. |
 | `RUST_LOG` | Log filter, such as `info,zinder=info`. |
 | `INGEST_CONTROL_BEARER_TOKEN` | Ingest-control bearer secret. Generated at boot when unset. |
@@ -100,6 +100,54 @@ store that records this release's exact Explorer view manifest.
 
 `PORT` names the port Railway healthchecks. It must stay `9106`, the
 operational endpoint of the query process.
+
+### Indexer TLS
+
+A node whose indexer listens on a network address serves it over TLS. Zakura
+also requires a client certificate there. Set `ZINDER_NODE__INDEXER_GRPC_ADDR`
+to the `https://` URL, then supply the certificate material in one of two ways.
+
+If the platform can mount files, mount the PEM files and set their paths:
+
+| Variable | Value |
+| --- | --- |
+| `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH` | CA bundle that verifies the node. Omit it to use the system roots. |
+| `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH` | Client certificate chain. Set it together with the key. |
+| `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH` | Client private key. |
+| `ZINDER_NODE__INDEXER_TLS__SERVER_NAME` | Name to verify when it differs from the URL host. Optional. |
+
+If the platform delivers secrets only as variables, as Railway does, set the
+PEM text instead, with its line breaks intact:
+
+| Variable | Value |
+| --- | --- |
+| `ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM` | CA bundle PEM text. |
+| `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM` | Client certificate chain PEM text. |
+| `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM` | Client private key PEM text. |
+
+The entrypoint writes each value to a file that only the `zinder` user can
+read, and it passes the processes the matching `*_PATH` variable. No runtime
+process receives the PEM text. The entrypoint stops the container with an
+error in these cases:
+
+- a value lacks a `-----BEGIN` line;
+- a value has no line breaks, which happens when an editor collapses a
+  multi-line value;
+- both the `*_PEM` and the `*_PATH` variable are set for the same item; or
+- neither `/dev/shm` nor `/run` is writable.
+
+The deploy log names where the files went. `writing indexer TLS material to
+tmpfs at /dev/shm/zinder-indexer-tls` means they are in memory. A line naming
+`/run/zinder-indexer-tls` means `/dev/shm` is not a writable tmpfs, and the
+files may be on the container's disk. Whether Railway provides a tmpfs at
+`/dev/shm` has not been verified; check this line on the first deployment.
+
+The PEM variables stay visible in the platform's variable editor and in any
+shell you open in the container. Use mounted files when the platform supports
+them. To rotate the material, change the variables and redeploy.
+
+`zinder-ingest` checks the files at startup. A missing file, or one with no
+certificate or private key, stops the container with a configuration error.
 
 ## Deploy on Railway
 

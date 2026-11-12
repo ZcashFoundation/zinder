@@ -196,6 +196,8 @@ ENTRYPOINT ["zinder-compat-lightwalletd"]
 # serves no client protocol.
 FROM zinder-ingest AS zinder-canonical-runtime
 
+COPY --chmod=0644 deploy/materialize-indexer-tls \
+    /usr/local/lib/zinder/materialize-indexer-tls
 COPY --chmod=0755 deploy/canonical-runtime-entrypoint \
     /usr/local/bin/zinder-canonical-runtime-entrypoint
 
@@ -221,6 +223,8 @@ COPY deploy/config/wallet-serving/ingest.toml /etc/zinder/ingest.toml
 COPY deploy/config/wallet-serving/projector.toml /etc/zinder/projector.toml
 COPY deploy/config/wallet-serving/query.toml /etc/zinder/query.toml
 
+COPY --chmod=0644 deploy/materialize-indexer-tls \
+    /usr/local/lib/zinder/materialize-indexer-tls
 COPY --chmod=0755 deploy/wallet-serving-runtime-entrypoint \
     /usr/local/bin/zinder-wallet-serving-runtime-entrypoint
 COPY --chmod=0755 deploy/wallet-serving-healthcheck \

@@ -2,11 +2,22 @@
 
 set -eu
 
+# Indexer TLS values delivered as *_PEM variables become root-prepared files
+# readable only by zinder. zinder-ingest refuses the *_PEM variables, so they
+# are removed from its environment below.
+# shellcheck source=deploy/materialize-indexer-tls
+. /usr/local/lib/zinder/materialize-indexer-tls
+materialize_indexer_tls
+
 # Railway mounts the persistent volume after the image filesystem is
 # materialized, so the mount root is owned by root instead of the runtime UID.
 # Repair only the Zinder volume before dropping privileges. Fresh construction
 # still requires the final store path to be absent.
 chown -R zinder:zinder /var/lib/zinder
 
-exec setpriv --reuid=zinder --regid=zinder --init-groups --no-new-privs \
+exec env \
+    -u ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM \
+    -u ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM \
+    -u ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM \
+    setpriv --reuid=zinder --regid=zinder --init-groups --no-new-privs \
     /usr/local/bin/zinder-ingest "$@"
