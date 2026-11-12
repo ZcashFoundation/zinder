@@ -1,7 +1,8 @@
-//! Test-only transparent v5 transaction builder.
+//! Test-only transparent transaction builder.
 //!
-//! Produces signed v5 transparent transaction bytes that a Zebra regtest
-//! sidecar will accept through `sendrawtransaction`. The signer wraps
+//! Produces signed transparent transaction bytes that a Zebra regtest
+//! sidecar will accept through `sendrawtransaction`: the version the builder
+//! suggests for the target height, or version 4 on request. The signer wraps
 //! `zcash_primitives::transaction::builder::Builder::mock_build`, which is
 //! the test-only path that skips Sapling/Orchard provers; transparent-only
 //! transactions never invoke them.
@@ -32,7 +33,10 @@
 use secp256k1::PublicKey;
 use thiserror::Error;
 use zcash_address::{ToAddress, ZcashAddress};
-use zcash_primitives::transaction::builder::{BuildConfig, Builder, BundlePadding};
+use zcash_primitives::transaction::{
+    TxVersion,
+    builder::{BuildConfig, Builder, BundlePadding},
+};
 use zcash_protocol::{
     consensus::{BlockHeight, NetworkType},
     value::{BalanceError, Zatoshis},
@@ -55,7 +59,7 @@ use zip32::AccountId;
 /// they are allowed to spend.
 pub const TRANSPARENT_BROADCAST_TEST_SEED: [u8; 32] = [0x42_u8; 32];
 
-/// Exact fee charged for a v5 transaction with one transparent input and
+/// Exact fee charged for a transaction with one transparent input and
 /// one transparent output under ZIP-317's `FeeRule::standard()`.
 ///
 /// `Builder::mock_build` always enforces ZIP-317; the fee is not a free
@@ -64,7 +68,7 @@ pub const TRANSPARENT_BROADCAST_TEST_SEED: [u8; 32] = [0x42_u8; 32];
 /// pays exactly `5_000 * 2 = 10_000` zatoshis.
 pub const ZIP317_FEE_ONE_IN_ONE_OUT_ZATS: u64 = 10_000;
 
-/// Errors raised while constructing or signing a transparent v5 transaction.
+/// Errors raised while constructing or signing a transparent transaction.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum TransparentSignerError {
@@ -231,15 +235,44 @@ impl TransparentTestKey {
         TransparentAddress::PublicKeyHash(scratch)
     }
 
-    /// Builds and signs a v5 transparent transaction that spends one P2PKH
+    /// Builds and signs a transparent transaction that spends one P2PKH
     /// UTXO and forwards `value - ZIP317_FEE_ONE_IN_ONE_OUT_ZATS` to the
     /// recipient.
+    ///
+    /// The version is the one the builder suggests for `args.target_height`:
+    /// version 5 from NU5 and version 6 from NU6.3.
     ///
     /// The fee is fixed by ZIP-317 and not a free parameter; see
     /// [`ZIP317_FEE_ONE_IN_ONE_OUT_ZATS`].
     pub fn build_p2pkh_spend(
         &self,
         args: &P2pkhSpendArgs<'_>,
+    ) -> Result<Vec<u8>, TransparentSignerError> {
+        self.build_p2pkh_spend_as(args, None)
+    }
+
+    /// Builds and signs a version-4 transparent transaction with the same
+    /// shape as [`TransparentTestKey::build_p2pkh_spend`].
+    ///
+    /// `args.target_height` must fall in a branch that admits version 4
+    /// (Sapling through NU6.3); the signature commits to that branch. The
+    /// transaction expires at `expiry_height`, so a caller can submit it after
+    /// a later activation, such as NU7, which rejects version 4 under ZIP 2003.
+    pub fn build_p2pkh_spend_v4(
+        &self,
+        args: &P2pkhSpendArgs<'_>,
+        expiry_height: u32,
+    ) -> Result<Vec<u8>, TransparentSignerError> {
+        self.build_p2pkh_spend_as(args, Some(BlockHeight::from_u32(expiry_height)))
+    }
+
+    /// Builds the one-input, one-output spend. `v4_expiry_height` selects a
+    /// version-4 transaction with that expiry; `None` keeps the version and
+    /// expiry the builder suggests for the target height.
+    fn build_p2pkh_spend_as(
+        &self,
+        args: &P2pkhSpendArgs<'_>,
+        v4_expiry_height: Option<BlockHeight>,
     ) -> Result<Vec<u8>, TransparentSignerError> {
         let fee_zats = ZIP317_FEE_ONE_IN_ONE_OUT_ZATS;
         if args.coinbase_value_zats <= fee_zats {
@@ -275,6 +308,12 @@ impl TransparentTestKey {
                 ironwood_padding: BundlePadding::DEFAULT,
             },
         );
+        if let Some(expiry_height) = v4_expiry_height {
+            builder = builder.with_expiry_height(expiry_height);
+            builder
+                .propose_version::<std::convert::Infallible>(TxVersion::V4)
+                .map_err(|error| TransparentSignerError::Build(error.to_string()))?;
+        }
         builder
             .add_transparent_p2pkh_input(pubkey, outpoint, coin)
             .map_err(|error| TransparentSignerError::AddInput(error.to_string()))?;
@@ -338,11 +377,31 @@ mod tests {
         reason = "Unit test names describe the behavior under test."
     )]
 
-    use super::{P2pkhSpendArgs, TransparentSignerError, TransparentTestKey};
+    use super::{LocalNetwork, P2pkhSpendArgs, TransparentSignerError, TransparentTestKey};
+    use zcash_protocol::consensus::BlockHeight;
     use zcash_transparent::address::TransparentAddress;
 
     fn fixed_seed() -> [u8; 32] {
         [0x42_u8; 32]
+    }
+
+    /// Activation heights of `deploy/zebra/regtest.toml`, which places NU6.3
+    /// at 6 and NU7 at 140.
+    fn nu7_regtest_network() -> LocalNetwork {
+        let at = |height| Some(BlockHeight::from_u32(height));
+        LocalNetwork {
+            overwinter: at(1),
+            sapling: at(1),
+            blossom: at(1),
+            heartwood: at(1),
+            canopy: at(1),
+            nu5: at(2),
+            nu6: at(3),
+            nu6_1: at(4),
+            nu6_2: at(5),
+            nu6_3: at(6),
+            nu7: at(140),
+        }
     }
 
     #[test]
@@ -409,6 +468,55 @@ mod tests {
             "serialized tx is too short: {}",
             bytes.len()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn build_p2pkh_spend_v4_produces_v4_bytes_with_the_requested_expiry()
+    -> Result<(), TransparentSignerError> {
+        let key =
+            TransparentTestKey::from_seed_with_local_network(&fixed_seed(), nu7_regtest_network())?;
+        let recipient = TransparentAddress::PublicKeyHash([0x33_u8; 20]);
+        let expiry_height: u32 = 240;
+        let bytes = key.build_p2pkh_spend_v4(
+            &P2pkhSpendArgs {
+                coinbase_txid_be: [0xbb_u8; 32],
+                coinbase_vout: 0,
+                coinbase_value_zats: 10_000_000,
+                recipient: &recipient,
+                target_height: 100,
+            },
+            expiry_height,
+        )?;
+        // v4 header: version 4 with fOverwintered, then the Sapling version group ID.
+        assert_eq!(&bytes[0..4], &[0x04, 0x00, 0x00, 0x80]);
+        assert_eq!(&bytes[4..8], &0x892f_2085_u32.to_le_bytes());
+        let transaction = zcash_primitives::transaction::Transaction::read(
+            bytes.as_slice(),
+            zcash_protocol::consensus::BranchId::Nu6_3,
+        )
+        .map_err(|source| TransparentSignerError::Serialize { source })?;
+        assert_eq!(u32::from(transaction.expiry_height()), expiry_height);
+        Ok(())
+    }
+
+    #[test]
+    fn build_p2pkh_spend_v4_rejects_a_target_height_after_nu7() -> Result<(), TransparentSignerError>
+    {
+        let key =
+            TransparentTestKey::from_seed_with_local_network(&fixed_seed(), nu7_regtest_network())?;
+        let recipient = TransparentAddress::PublicKeyHash([0x44_u8; 20]);
+        let outcome = key.build_p2pkh_spend_v4(
+            &P2pkhSpendArgs {
+                coinbase_txid_be: [0xcc_u8; 32],
+                coinbase_vout: 0,
+                coinbase_value_zats: 10_000_000,
+                recipient: &recipient,
+                target_height: 141,
+            },
+            240,
+        );
+        assert!(matches!(outcome, Err(TransparentSignerError::Build(_))));
         Ok(())
     }
 

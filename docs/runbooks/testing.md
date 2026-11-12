@@ -176,7 +176,9 @@ The most valuable automated check that exercises a real Zebra node.
 
 ### Prerequisites
 
-1. **z3 regtest sidecar** running. The default ZF z3 setup gives you:
+1. **A Zebra Regtest node**, either the NU7 chain described in
+   [Regtest through NU7](#regtest-through-nu7), which CI uses, or a
+   **z3 regtest sidecar**. The default ZF z3 setup gives you:
    - `z3-regtest-zebra-1` (Zebra) listening JSON-RPC on host
      `127.0.0.1:29232` and indexer gRPC on `127.0.0.1:39155`.
    - Health endpoint at `127.0.0.1:28080`.
@@ -186,6 +188,118 @@ The most valuable automated check that exercises a real Zebra node.
    (mapped to host `39155`). Without it the indexer-gRPC tests skip.
 3. **Auth method** matches what z3 publishes. The default sidecar uses basic
    auth `zebra:zebra` (`ZEBRA_RPC__ENABLE_COOKIE_AUTH=false`).
+
+### Regtest through NU7
+
+Zebra 7.0.0 on Regtest activates Overwinter through Canopy at height 1 and
+leaves NU5 and every later upgrade unset unless the node is configured
+otherwise. A node started with only `ZEBRA_NETWORK__NETWORK=Regtest` stays on
+Canopy, so it never produces version-5 or version-6 transactions, Orchard or
+Ironwood notes, or an NU7 block.
+
+The live and parity workflows start Zebra with
+[`deploy/zebra/regtest.toml`](../../deploy/zebra/regtest.toml), which
+activates each upgrade at its own height:
+
+| Upgrade | Activation height |
+| ------- | ----------------- |
+| Overwinter, Sapling, Blossom, Heartwood, Canopy | 1 |
+| NU5 | 2 |
+| NU6 | 3 |
+| NU6.1 | 4 |
+| NU6.2 | 5 |
+| NU6.3 | 6 |
+| NU7 | 140 |
+
+Its lockbox and Major Grants funding streams have non-overlapping height
+ranges, as Zebra 7 requires. Environment variables cannot set these keys,
+because config-rs lowercases them and `NU6.1` contains its path separator, so
+mount the file and point the image's `CONFIG_FILE_PATH` at it. Then mine with
+`scripts/mine-live-regtest.sh`. It pays the first 10 blocks to Zebra's default
+Regtest unified address, so the Sapling, Orchard, and Ironwood trees each hold
+notes, and the rest to the configured transparent miner:
+
+```bash
+docker run -d --name zebra-regtest \
+  -p 127.0.0.1:39232:39232 -p 127.0.0.1:39155:8155 \
+  --health-cmd "curl -s -o /dev/null http://127.0.0.1:39232" \
+  --health-interval 5s --health-timeout 5s --health-retries 12 \
+  -v "$PWD/deploy/zebra/regtest.toml:/etc/zebrad/zebrad.toml:ro" \
+  -e CONFIG_FILE_PATH=/etc/zebrad/zebrad.toml \
+  -e ZEBRA_RPC__LISTEN_ADDR=0.0.0.0:39232 \
+  -e ZEBRA_RPC__INDEXER_LISTEN_ADDR=0.0.0.0:8155 \
+  -e ZEBRA_RPC__ENABLE_COOKIE_AUTH=false \
+  -e ZEBRA_MINING__MINER_ADDRESS=tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx \
+  docker.io/zfnd/zebra:7.0.0@sha256:a70d2be8ffef3a4b6e37355724e36a0e6c1838e46baa28bfb216739f00cf2d34
+scripts/mine-live-regtest.sh http://127.0.0.1:39232 120
+```
+
+`live::nu7_activation` needs a tip below NU7, so run it before the rest of the
+suite:
+
+```bash
+ZINDER_TEST_LIVE=1 \
+  ZINDER_NETWORK=zcash-regtest \
+  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232 \
+  ZINDER_NODE__AUTH__METHOD=basic \
+  ZINDER_NODE__AUTH__USERNAME=zebra \
+  ZINDER_NODE__AUTH__PASSWORD=zebra \
+  cargo nextest run --workspace --profile=ci-live --run-ignored=all \
+    -E 'test(/^live::nu7_activation::/)'
+```
+
+The test broadcasts a funded transparent spend below NU7, signs a version-4
+spend for the NU6.3 branch, mines across the activation, and broadcasts a
+second funded spend after it. It expects the version-4 spend to be rejected as
+`UnsupportedTransactionVersion` (ZIP 2003). It then constructs a production
+canonical store and wallet projection from genesis through the tip, and checks
+the following against the node:
+
+- Each funded spend is mined on its side of NU7 as a version-6 transaction,
+  with the NU6.3 or NU7 consensus branch.
+- The coinbase consensus branch changes from NU6.3 to NU7 at the activation
+  height.
+- Every block's Sapling, Orchard, and Ironwood tree sizes match `getblock`.
+- Served tree states match `z_gettreestate` at the activation heights, on both
+  sides of NU7, and at every stored checkpoint, whose frontiers Zinder computes
+  itself.
+- Subtree roots match `z_getsubtreesbyindex`.
+
+To check the rejection across the native wire contract, set
+`ZINDER_TEST_QUERY_GRPC_ADDR` to a running `zinder-query`, started as in
+[End-to-end with a real lightwalletd-compatible client](#end-to-end-with-a-real-lightwalletd-compatible-client).
+Every broadcast then goes through the `zinder-client` remote chain index
+instead of the node broadcaster. On a chain that already reached NU7, the test
+logs `nu7_activation_already_reached` and returns.
+
+Then run the rest of the suite as in [Run](#run), with
+`ZINDER_NODE__INDEXER_GRPC_ADDR=http://127.0.0.1:39155` and
+`ZINDER_TEST_INDEXER_CONTAINER_NAME=zebra-regtest`.
+
+#### What the NU7 Regtest run covers
+
+The NU7 Regtest run is local evidence from one isolated chain. It covers:
+
+- Parsing, canonical construction, wallet projection, and serving reads for
+  version-5 and version-6 blocks with Sapling, Orchard, and Ironwood note
+  commitments, before, at, and after NU7.
+- Typed broadcast outcomes across NU7, through the node broadcaster and,
+  with `ZINDER_TEST_QUERY_GRPC_ADDR`, through a running `zinder-query`.
+- The rest of the live suite on a chain past NU7, including the Zebra Indexer
+  mempool tests and the indexer restart test.
+- `zinder-compat-lightwalletd` parity with lightwalletd v0.6.0 over a fixed
+  fence past NU7, in the parity workflow (see
+  [Parity against a reference lightwalletd](#t3-parity-against-a-reference-lightwalletd)).
+
+It does not cover:
+
+- Zakura, or any node other than Zebra 7.0.0.
+- NU7 activation on Testnet or Mainnet, or production capacity.
+- Shielded spends. The shielded pools hold only coinbase outputs, so no
+  shielded nullifier is exercised and no subtree completes; both sides report
+  empty subtree-root lists.
+- Reorgs deeper than the reorg window, and restarts of the Zinder runtimes.
+- Tests that return early without their own endpoints, listed in [Run](#run).
 
 ### Pre-flight checks
 
@@ -268,7 +382,25 @@ the mainnet-only tests
 
 Without `ZINDER_NODE__INDEXER_GRPC_ADDR`, the two Zebra Indexer mempool-source
 tests skip: `zebra_indexer_mempool_source_opens_stream_against_running_indexer`
-and `streaming_source_recovers_after_zebra_indexer_restart`.
+and `streaming_source_recovers_after_zebra_indexer_restart`. The restart test
+runs `docker restart` on the container named by
+`ZINDER_TEST_INDEXER_CONTAINER_NAME` (default `z3_regtest_sidecar_zebra`) and
+waits for Docker to report it healthy, so that container needs a health check.
+
+Other tests return early, and nextest reports them as passed, unless their own
+endpoints are set:
+
+- the `live::parity_against_lightwalletd` tests need
+  `ZINDER_TEST_PARITY_ZINDER_ADDR` and `ZINDER_TEST_PARITY_LIGHTWALLETD_ADDR`;
+- the zingolib flow needs `ZINDER_TEST_ZINGOLIB_BIN` and
+  `ZINDER_TEST_ZINGOLIB_SERVER`;
+- the two `live::compact_blocks_process` tests need their process evidence
+  paths;
+- the standalone native `WalletQuery` smoke needs
+  `ZINDER_TEST_QUERY_GRPC_ADDR`;
+- `live::nu7_activation` needs a tip below NU7.
+
+When you record evidence, count only the tests that exercised the node.
 
 ### Targeted reruns
 
@@ -469,10 +601,12 @@ Currently-mainnet-only tests are
 
 ## T3: Parity against a reference lightwalletd
 
-Compares `zinder-compat-lightwalletd` against
-`electriccoinco/lightwalletd:latest`, both pointed at the same Zebra.
+Compares `zinder-compat-lightwalletd` against the pinned
+`electriccoinco/lightwalletd` v0.6.0 reference, both pointed at the same Zebra.
 Catches drift in the wire-shape contract `LightdInfo`, `BlockId`,
-`CompactBlock`, and `RawTransaction` use across the two shims.
+`CompactBlock`, and `RawTransaction` use across the two shims. The parity
+workflow runs on the [Regtest through NU7](#regtest-through-nu7) chain mined to
+height 150, so its fixed fence covers blocks on both sides of NU7.
 
 These tests live in
 [`services/zinder-compat-lightwalletd/tests/live/parity_against_lightwalletd.rs`](../../services/zinder-compat-lightwalletd/tests/live/parity_against_lightwalletd.rs)
@@ -548,7 +682,9 @@ ZINDER_TEST_LIVE=1 \
 Both tests build the production canonical store and wallet projection from
 genesis, so they run on regtest only. The boundary test returns early when
 the regtest node activates every upgrade at height 1, because there is no
-boundary to cross.
+boundary to cross. On the [Regtest through NU7](#regtest-through-nu7) chain,
+the latest reachable activation is NU7 at height 140, so the test samples
+heights 139, 140, and 141.
 
 File:
 [`services/zinder-ingest/tests/live/network_upgrade_boundary.rs`](../../services/zinder-ingest/tests/live/network_upgrade_boundary.rs).

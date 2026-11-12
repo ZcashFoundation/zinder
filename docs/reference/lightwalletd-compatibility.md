@@ -195,10 +195,14 @@ The vendored protocol pin and parity workflow image digests are:
 
 - `lightwallet-protocol` `v0.5.0`
   (`ac7cee052a1bf5d430985a478d39e8b513fc4bd4`);
-- `lightwalletd` `v0.4.19`
-  (`028401c4c4a7c8c386c81212324cc8083eed7510`) as the source reference;
-- `electriccoinco/lightwalletd:v0.4.19@sha256:a3dfb04b4054b78ae3107dcc804c3a15a6e38d1f0dfcadeac48da482dd1d3448`;
-- `docker.io/zfnd/zebra:7.0.0@sha256:a70d2be8ffef3a4b6e37355724e36a0e6c1838e46baa28bfb216739f00cf2d34`.
+- `lightwalletd` `v0.6.0`
+  (`e7436d2adb9ab5828eb8a27de534e16218841fc2`) as the source reference, which
+  parses the version-6 transactions that NU6.3 introduced;
+- `electriccoinco/lightwalletd:v0.6.0@sha256:abc8199dae800e050415a3459f71c7850aeefeb1ca6a681e9b9eda7249ce8613`;
+- `docker.io/zfnd/zebra:7.0.0@sha256:a70d2be8ffef3a4b6e37355724e36a0e6c1838e46baa28bfb216739f00cf2d34`,
+  started on Regtest with `deploy/zebra/regtest.toml`, which activates every
+  upgrade through NU7 (see
+  [Regtest through NU7](../runbooks/testing.md#regtest-through-nu7)).
 
 The pin is reproducibility, not evidence by itself. It makes a failing parity
 run explainable and a passing one repeatable.

@@ -29,19 +29,47 @@ async fn fetch_chain_checkpoint_at_tip_reflects_supported_tree_sizes() -> Result
     let tip_metadata = checkpoint.tip_metadata();
 
     assert_eq!(checkpoint.block_id.height, tip);
+    // Each shielded output or action appends one note commitment, so the tree
+    // sizes at the tip equal the commitments in every block up to it.
+    let mut expected_sizes = (0_usize, 0_usize, 0_usize);
+    for height in 1..=tip.value() {
+        let block = parse_block(&source, BlockHeight::new(height)).await?;
+        for transaction in &block.transactions {
+            expected_sizes.0 += transaction.sapling_note_commitments().count();
+            expected_sizes.1 += transaction.orchard_note_commitments().count();
+            expected_sizes.2 += transaction.ironwood_note_commitments().count();
+        }
+    }
     assert_eq!(
-        tip_metadata.sapling_commitment_tree_size, 0,
-        "coinbase-only regtest blocks should not advance the sapling tree"
-    );
-    assert_eq!(
-        tip_metadata.orchard_commitment_tree_size, 0,
-        "coinbase-only regtest blocks should not advance the orchard tree"
-    );
-    assert_eq!(
-        tip_metadata.ironwood_commitment_tree_size, 0,
-        "coinbase-only regtest blocks should not advance the ironwood tree"
+        (
+            usize::try_from(tip_metadata.sapling_commitment_tree_size)?,
+            usize::try_from(tip_metadata.orchard_commitment_tree_size)?,
+            usize::try_from(tip_metadata.ironwood_commitment_tree_size)?,
+        ),
+        expected_sizes,
+        "(Sapling, Orchard, Ironwood) tree sizes at tip {}",
+        tip.value()
     );
     Ok(())
+}
+
+async fn parse_block(
+    source: &ZebraJsonRpcSource,
+    height: BlockHeight,
+) -> Result<zebra_chain::block::Block> {
+    use zebra_chain::serialization::ZcashDeserializeInto;
+    source
+        .fetch_block_at(height)
+        .await?
+        .raw_block_bytes
+        .as_slice()
+        .zcash_deserialize_into()
+        .map_err(|error| {
+            eyre!(
+                "zebra-chain block parse failed at {}: {error}",
+                height.value()
+            )
+        })
 }
 
 #[tokio::test]
