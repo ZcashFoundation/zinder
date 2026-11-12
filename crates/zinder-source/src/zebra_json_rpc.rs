@@ -2053,6 +2053,19 @@ fn is_already_queued_message(message: &str) -> bool {
 /// [`BroadcastRejectionReason`] instead.
 fn classify_rejection_reason(message: &str) -> BroadcastRejectionReason {
     let lowercased_message = message.to_ascii_lowercase();
+    // Zebra: `transaction version {0} not supported by the network upgrade {1:?}`.
+    if lowercased_message.contains("not supported by the network upgrade") {
+        return BroadcastRejectionReason::UnsupportedTransactionVersion;
+    }
+    // Zebra: `... exceeding the next block's ZIP 218 limit of {limit}`. Zakura:
+    // `... exceeds the per-block limit of {limit}` and
+    // `... exceeds the per-block global shielded budget of {limit}`.
+    if lowercased_message.contains("zip 218 limit")
+        || lowercased_message.contains("exceeds the per-block limit")
+        || lowercased_message.contains("exceeds the per-block global shielded budget")
+    {
+        return BroadcastRejectionReason::ExceedsBlockActionLimit;
+    }
     if lowercased_message.contains("mempool is full")
         || (lowercased_message.contains("mempool") && lowercased_message.contains("full"))
     {
@@ -2584,6 +2597,96 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    fn assert_verify_rejection_kind(message: &str, expected_kind: BroadcastRejectionReason) {
+        let result = classify_broadcast_error(JsonRpcCallError {
+            code: Some(i64::from(JSON_RPC_VERIFY_CODE)),
+            message: message.to_owned(),
+        });
+
+        assert!(
+            matches!(
+                result,
+                TransactionBroadcastOutcome::Rejected(BroadcastRejected { kind, .. })
+                    if kind == expected_kind
+            ),
+            "message {message:?} did not classify as {expected_kind:?}"
+        );
+    }
+
+    #[test]
+    fn classify_broadcast_error_maps_zebra_v4_after_nu7_to_unsupported_transaction_version() {
+        // Zebra v7.0.0: `transaction version {0} not supported by the network upgrade {1:?}`.
+        assert_verify_rejection_kind(
+            "transaction did not pass consensus validation: transaction version 4 not supported by the network upgrade Nu7",
+            BroadcastRejectionReason::UnsupportedTransactionVersion,
+        );
+        // The mempool prefixes cached rejections on later submissions.
+        assert_verify_rejection_kind(
+            "the transaction will be rejected from the mempool until the next chain tip block: transaction did not pass consensus validation: transaction version 4 not supported by the network upgrade Nu7",
+            BroadcastRejectionReason::UnsupportedTransactionVersion,
+        );
+    }
+
+    #[test]
+    fn classify_broadcast_error_maps_zebra_zip_218_limit_to_exceeds_block_action_limit() {
+        // Zebra v7.0.0: `mempool transaction has {count} {pool}, exceeding the next block's
+        // ZIP 218 limit of {limit}`.
+        for (pool, count, limit) in [
+            ("Orchard actions", 331, 330),
+            ("Ironwood actions", 331, 330),
+            ("Sapling inputs and outputs", 301, 300),
+            ("Sprout JoinSplits", 21, 20),
+            ("shielded actions across all pools", 331, 330),
+        ] {
+            assert_verify_rejection_kind(
+                &format!(
+                    "transaction did not pass consensus validation: mempool transaction has {count} {pool}, exceeding the next block's ZIP 218 limit of {limit}"
+                ),
+                BroadcastRejectionReason::ExceedsBlockActionLimit,
+            );
+        }
+    }
+
+    #[test]
+    fn classify_broadcast_error_maps_zakura_action_limits_to_exceeds_block_action_limit() {
+        // Zakura v1.6.0 and v1.7.0: `{pool} count {count} exceeds the per-block limit of {limit}`
+        // and `shielded cost {cost} (...) exceeds the per-block global shielded budget of {limit}`.
+        for zakura_message in [
+            "Orchard action count 331 exceeds the per-block limit of 330",
+            "Ironwood action count 331 exceeds the per-block limit of 330",
+            "Sapling spends + outputs count 301 exceeds the per-block limit of 300",
+            "Sprout JoinSplit count 21 exceeds the per-block limit of 20",
+            "shielded cost 331 (Orchard actions + Ironwood actions + Sapling spends + Sapling outputs + 2 * Sprout JoinSplits) exceeds the per-block global shielded budget of 330",
+        ] {
+            assert_verify_rejection_kind(
+                &format!("transaction did not pass consensus validation: {zakura_message}"),
+                BroadcastRejectionReason::ExceedsBlockActionLimit,
+            );
+        }
+    }
+
+    #[test]
+    fn classify_broadcast_error_maps_zakura_v4_after_nu7_to_unsupported_transaction_version() {
+        // Zakura reuses Zebra's `UnsupportedByNetworkUpgrade` message.
+        assert_verify_rejection_kind(
+            "transaction did not pass consensus validation: transaction version 4 not supported by the network upgrade Nu7",
+            BroadcastRejectionReason::UnsupportedTransactionVersion,
+        );
+    }
+
+    #[test]
+    fn classify_broadcast_error_keeps_adjacent_zebra_messages_in_their_existing_kinds() {
+        assert_verify_rejection_kind(
+            "transaction did not pass consensus validation: transaction uses an incorrect consensus branch id",
+            BroadcastRejectionReason::BadConsensusBranch,
+        );
+        // The version-floor rule is distinct from the network-upgrade rule and stays unclassified.
+        assert_verify_rejection_kind(
+            "transaction did not pass consensus validation: transaction version number MUST be >= 4",
+            BroadcastRejectionReason::Unknown,
+        );
     }
 
     #[test]

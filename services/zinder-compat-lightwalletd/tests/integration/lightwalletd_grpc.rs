@@ -1344,6 +1344,26 @@ async fn send_transaction_maps_duplicate_and_rejected_codes() -> eyre::Result<()
             "bad-txns-invalid",
         ),
         (
+            TransactionBroadcastOutcome::Rejected(BroadcastRejected {
+                kind: BroadcastRejectionReason::UnsupportedTransactionVersion,
+                error_code: Some(-25),
+                message: "transaction version 4 not supported by the network upgrade Nu7"
+                    .to_owned(),
+            }),
+            -25,
+            "transaction version 4 not supported by the network upgrade Nu7",
+        ),
+        (
+            TransactionBroadcastOutcome::Rejected(BroadcastRejected {
+                kind: BroadcastRejectionReason::ExceedsBlockActionLimit,
+                error_code: None,
+                message: "mempool transaction has 331 Orchard actions, exceeding the next block's ZIP 218 limit of 330"
+                    .to_owned(),
+            }),
+            -26,
+            "mempool transaction has 331 Orchard actions, exceeding the next block's ZIP 218 limit of 330",
+        ),
+        (
             TransactionBroadcastOutcome::Unknown(BroadcastUnknown {
                 error_code: None,
                 message: "node returned unclassified".to_owned(),

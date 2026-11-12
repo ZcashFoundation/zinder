@@ -1970,7 +1970,7 @@ fn transaction_broadcast_outcome_from_message(
         })),
         Outcome::Rejected(rejected) => {
             Ok(TransactionBroadcastOutcome::Rejected(BroadcastRejected {
-                kind: broadcast_rejection_reason_from_message(rejected.kind)?,
+                kind: broadcast_rejection_reason_from_message(rejected.kind),
                 error_code: rejected.error_code,
                 message: rejected.message,
             }))
@@ -1982,29 +1982,34 @@ fn transaction_broadcast_outcome_from_message(
     }
 }
 
-fn broadcast_rejection_reason_from_message(
-    code: i32,
-) -> Result<zinder_core::BroadcastRejectionReason, IndexerError> {
+/// Decodes the wire reason. An unspecified or unrecognized discriminant, as
+/// written by an older or newer server, degrades to `Unknown` so the
+/// rejection and its message still reach the caller (ADR-0023).
+fn broadcast_rejection_reason_from_message(code: i32) -> zinder_core::BroadcastRejectionReason {
     use zinder_core::BroadcastRejectionReason;
 
     match wallet::BroadcastRejectionReason::try_from(code) {
         Ok(wallet::BroadcastRejectionReason::InvalidSignature) => {
-            Ok(BroadcastRejectionReason::InvalidSignature)
+            BroadcastRejectionReason::InvalidSignature
         }
         Ok(wallet::BroadcastRejectionReason::BadExpiryHeight) => {
-            Ok(BroadcastRejectionReason::BadExpiryHeight)
+            BroadcastRejectionReason::BadExpiryHeight
         }
         Ok(wallet::BroadcastRejectionReason::BadConsensusBranch) => {
-            Ok(BroadcastRejectionReason::BadConsensusBranch)
+            BroadcastRejectionReason::BadConsensusBranch
         }
-        Ok(wallet::BroadcastRejectionReason::MempoolFull) => {
-            Ok(BroadcastRejectionReason::MempoolFull)
+        Ok(wallet::BroadcastRejectionReason::MempoolFull) => BroadcastRejectionReason::MempoolFull,
+        Ok(wallet::BroadcastRejectionReason::UnsupportedTransactionVersion) => {
+            BroadcastRejectionReason::UnsupportedTransactionVersion
         }
-        Ok(wallet::BroadcastRejectionReason::Unknown) => Ok(BroadcastRejectionReason::Unknown),
-        Ok(wallet::BroadcastRejectionReason::Unspecified) | Err(_) => Err(IndexerError::malformed(
-            "rejected.kind",
-            format!("unsupported broadcast rejection reason discriminant {code}"),
-        )),
+        Ok(wallet::BroadcastRejectionReason::ExceedsBlockActionLimit) => {
+            BroadcastRejectionReason::ExceedsBlockActionLimit
+        }
+        Ok(
+            wallet::BroadcastRejectionReason::Unknown
+            | wallet::BroadcastRejectionReason::Unspecified,
+        )
+        | Err(_) => BroadcastRejectionReason::Unknown,
     }
 }
 
@@ -3821,5 +3826,74 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn rejected_response(kind: i32) -> wallet::BroadcastTransactionResponse {
+        wallet::BroadcastTransactionResponse {
+            outcome: Some(wallet::broadcast_transaction_response::Outcome::Rejected(
+                wallet::BroadcastRejected {
+                    error_code: Some(-25),
+                    message: "rejected".to_owned(),
+                    kind,
+                },
+            )),
+        }
+    }
+
+    #[test]
+    fn broadcast_rejection_reason_decodes_every_wire_value() -> Result<(), IndexerError> {
+        use zinder_core::{BroadcastRejectionReason, TransactionBroadcastOutcome};
+
+        let cases = [
+            (
+                wallet::BroadcastRejectionReason::InvalidSignature as i32,
+                BroadcastRejectionReason::InvalidSignature,
+            ),
+            (
+                wallet::BroadcastRejectionReason::BadExpiryHeight as i32,
+                BroadcastRejectionReason::BadExpiryHeight,
+            ),
+            (
+                wallet::BroadcastRejectionReason::BadConsensusBranch as i32,
+                BroadcastRejectionReason::BadConsensusBranch,
+            ),
+            (
+                wallet::BroadcastRejectionReason::MempoolFull as i32,
+                BroadcastRejectionReason::MempoolFull,
+            ),
+            (
+                wallet::BroadcastRejectionReason::UnsupportedTransactionVersion as i32,
+                BroadcastRejectionReason::UnsupportedTransactionVersion,
+            ),
+            (
+                wallet::BroadcastRejectionReason::ExceedsBlockActionLimit as i32,
+                BroadcastRejectionReason::ExceedsBlockActionLimit,
+            ),
+            (
+                wallet::BroadcastRejectionReason::Unknown as i32,
+                BroadcastRejectionReason::Unknown,
+            ),
+            (
+                wallet::BroadcastRejectionReason::Unspecified as i32,
+                BroadcastRejectionReason::Unknown,
+            ),
+            (9_999, BroadcastRejectionReason::Unknown),
+        ];
+
+        for (wire_value, expected_kind) in cases {
+            let outcome =
+                transaction_broadcast_outcome_from_message(rejected_response(wire_value))?;
+
+            assert!(
+                matches!(
+                    outcome,
+                    TransactionBroadcastOutcome::Rejected(ref rejected)
+                        if rejected.kind == expected_kind && rejected.message == "rejected"
+                ),
+                "wire value {wire_value} decoded to {outcome:?}, expected {expected_kind:?}"
+            );
+        }
+
+        Ok(())
     }
 }

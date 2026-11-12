@@ -1615,6 +1615,11 @@ fn lightd_info(
 /// When the node reports its own `error_code`, that code is forwarded
 /// instead of the default; clients that already track node codes do not
 /// need a Zinder-specific table.
+///
+/// `SendResponse` carries only a code and a message, so the typed
+/// `BroadcastRejectionReason` has no legacy field. Every rejection reason,
+/// including `UnsupportedTransactionVersion` and `ExceedsBlockActionLimit`,
+/// maps through the rejected arm with the node message forwarded verbatim.
 #[allow(
     clippy::wildcard_enum_match_arm,
     reason = "non-exhaustive broadcast outcomes from zinder-core must degrade conservatively"

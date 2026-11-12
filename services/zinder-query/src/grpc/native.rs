@@ -811,6 +811,12 @@ fn broadcast_rejection_reason_to_message(
             Ok(wallet::BroadcastRejectionReason::BadConsensusBranch)
         }
         BroadcastRejectionReason::MempoolFull => Ok(wallet::BroadcastRejectionReason::MempoolFull),
+        BroadcastRejectionReason::UnsupportedTransactionVersion => {
+            Ok(wallet::BroadcastRejectionReason::UnsupportedTransactionVersion)
+        }
+        BroadcastRejectionReason::ExceedsBlockActionLimit => {
+            Ok(wallet::BroadcastRejectionReason::ExceedsBlockActionLimit)
+        }
         BroadcastRejectionReason::Unknown => Ok(wallet::BroadcastRejectionReason::Unknown),
         _ => Err(QueryError::UnsupportedWalletEncoding {
             value_kind: "transaction broadcast rejection reason",

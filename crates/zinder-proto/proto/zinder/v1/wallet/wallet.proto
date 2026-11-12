@@ -765,6 +765,17 @@ enum BroadcastRejectionReason {
 
   // Node returned a rejection that did not match any known reason.
   BROADCAST_REJECTION_REASON_UNKNOWN = 5;
+
+  // The transaction version is not supported by the network upgrade that
+  // applies to the next block (for example v4 from NU7 under ZIP 2003, or v5
+  // before NU5). Rebuild the transaction for the current network upgrade;
+  // re-signing the same transaction cannot fix it.
+  BROADCAST_REJECTION_REASON_UNSUPPORTED_TRANSACTION_VERSION = 6;
+
+  // The transaction alone exceeds a ZIP 218 per-block shielded action limit,
+  // so no block can include it. Split the payment across several
+  // transactions.
+  BROADCAST_REJECTION_REASON_EXCEEDS_BLOCK_ACTION_LIMIT = 7;
 }
 
 // Rejected transaction broadcast details.
