@@ -603,6 +603,39 @@ mod tests {
     }
 
     #[test]
+    fn byte_entry_points_reject_trailing_and_truncated_bytes_for_every_version()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // V1 to V4 have no witnessed-identifier parse, so the complete-consumption
+        // check in `parse_zebra_transaction` is their only trailing-byte guard.
+        let activations = NetworkUpgradeActivations::empty(Network::ZcashRegtest);
+        for raw_transaction in minimal_transaction_encodings()? {
+            let mut trailing_bytes = raw_transaction.clone();
+            trailing_bytes.push(0);
+            let mut truncated_bytes = raw_transaction.clone();
+            truncated_bytes.truncate(truncated_bytes.len().saturating_sub(1));
+
+            for malformed_bytes in [&trailing_bytes, &truncated_bytes] {
+                let encoding = hex::encode(malformed_bytes);
+                assert!(
+                    matches!(
+                        parse_transaction_public_facts(malformed_bytes, None, &activations),
+                        Err(SourceError::RawTransactionParseFailed { .. })
+                    ),
+                    "parse_transaction_public_facts accepted {encoding}"
+                );
+                assert!(
+                    matches!(
+                        parse_transaction_public_fact_set(malformed_bytes, None, &activations),
+                        Err(SourceError::RawTransactionParseFailed { .. })
+                    ),
+                    "parse_transaction_public_fact_set accepted {encoding}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn sprout_joinsplit_balances_preserve_zebra_sign() -> Result<(), Box<dyn std::error::Error>> {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../../services/zinder-ingest/tests/fixtures/zcash-mainnet-sprout-block-396.json"
