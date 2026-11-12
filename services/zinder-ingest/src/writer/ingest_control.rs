@@ -705,6 +705,7 @@ mod tests {
         RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex, TransactionId,
         UnixTimestampMillis, wire::encode_rpc_transaction_id_hex,
     };
+    use zinder_proto::wire::TransactionAbsence;
     use zinder_proto::{
         capabilities::INGEST_CONTROL_VISIBLE_CHAIN_EVENTS_V1,
         v1::{
@@ -1140,8 +1141,8 @@ mod tests {
                 &fixture.canonical,
                 MempoolEvent::Mined {
                     transaction_id: TransactionId::from_bytes([0xA1; 32]),
-                    mined_height: BlockHeight::new(41),
-                    block_hash: BlockHash::from_bytes([0xA1; 32]),
+                    mined_height: chain_epoch.visible_tip_height,
+                    block_hash: chain_epoch.visible_tip_hash,
                 },
                 observed_at,
             )
@@ -1163,8 +1164,8 @@ mod tests {
                 &fixture.canonical,
                 MempoolEvent::Mined {
                     transaction_id: entry.transaction_id(),
-                    mined_height: BlockHeight::new(42),
-                    block_hash: BlockHash::from_bytes([0xE5; 32]),
+                    mined_height: chain_epoch.visible_tip_height,
+                    block_hash: chain_epoch.visible_tip_hash,
                 },
                 observed_at,
             )
@@ -1557,6 +1558,72 @@ mod tests {
         async fn fetch_chain_value_pools_at_tip(&self) -> Result<ChainValuePools, SourceError> {
             Ok(self.value_pools.clone())
         }
+    }
+
+    /// Regression: a `Mined` change for the next block that reaches the owner
+    /// before the tip change must not turn into a proven absence through
+    /// `MempoolTransaction`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mined_change_beyond_the_tip_is_never_a_proven_absence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut fixture = shared_control_fixture().await?;
+        let chain_epoch = fixture.canonical.chain_epoch().await?.chain_epoch;
+
+        // A miss in a coherent generation is a typed absence at the writer epoch.
+        let coherent_miss = fixture
+            .ingest_client
+            .mempool_transaction(authenticated(MempoolTransactionRequest {
+                transaction_id: encode_rpc_transaction_id_hex(TransactionId::from_bytes(
+                    [0xF5; 32],
+                )),
+            }))
+            .await
+            .err()
+            .ok_or("an unknown transaction must miss the live mempool")?;
+        assert_eq!(
+            TransactionAbsence::from_status(&coherent_miss)?,
+            Some(TransactionAbsence::at_epoch(chain_epoch, true))
+        );
+
+        let entry = fixture_mempool_entry_with_id(0xF6, chain_epoch)?;
+        let transaction_id = entry.transaction_id();
+        fixture
+            .mempool
+            .apply_event(
+                &fixture.canonical,
+                MempoolEvent::Added { entry },
+                UnixTimestampMillis::new(1_750_000_000_500),
+            )
+            .await?;
+        let next_height = BlockHeight::new(chain_epoch.visible_tip_height.value() + 1);
+        let outcome = fixture
+            .mempool
+            .apply_event(
+                &fixture.canonical,
+                MempoolEvent::Mined {
+                    transaction_id,
+                    mined_height: next_height,
+                    block_hash: BlockHash::from_bytes([0xF7; 32]),
+                },
+                UnixTimestampMillis::new(1_750_000_000_600),
+            )
+            .await?;
+        assert!(
+            outcome.is_some(),
+            "a Mined change beyond the tip ends the generation"
+        );
+
+        let writer_miss = fixture
+            .ingest_client
+            .mempool_transaction(authenticated(MempoolTransactionRequest {
+                transaction_id: encode_rpc_transaction_id_hex(transaction_id),
+            }))
+            .await
+            .err()
+            .ok_or("an outrun generation must not answer from the live mempool")?;
+        assert_eq!(writer_miss.code(), Code::Unavailable);
+        assert_eq!(TransactionAbsence::from_status(&writer_miss)?, None);
+        fixture.shutdown().await
     }
 
     struct SharedControlFixture {
