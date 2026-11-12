@@ -704,6 +704,20 @@ fn zero_source_segment_max_blocks_fails_before_storage_creation() -> Result<(), 
 }
 
 #[test]
+fn source_segment_max_blocks_above_node_batch_limit_fails_before_storage_creation()
+-> Result<(), Box<dyn Error>> {
+    assert_ingest_cli_rejects(
+        |root| ingest_config_toml(&root.join("oversized-source-segment-store")),
+        &[],
+        &[(
+            "ZINDER_INGEST__CONSTRUCTION__SOURCE_SEGMENT_MAX_BLOCKS",
+            "1001",
+        )],
+        "invalid ingest.construction pipeline limits: source segment max blocks 1001 exceeds the node batch limit of 1000 requests",
+    )
+}
+
+#[test]
 fn zero_block_prepare_concurrency_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
     assert_ingest_cli_rejects(
         |root| ingest_config_toml(&root.join("zero-block-prepare")),

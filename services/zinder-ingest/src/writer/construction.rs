@@ -48,6 +48,9 @@ const CANONICAL_PREPARE_FIXED_BYTES: u64 = 64 * 1_024;
 const MIB: u64 = 1_024 * 1_024;
 const DEFAULT_SOURCE_SEGMENT_TARGET_RESPONSE_BYTES: u64 = 32 * MIB;
 const DEFAULT_SOURCE_SEGMENT_MAX_BLOCKS: u32 = 64;
+/// Each segment block is one JSON-RPC batch entry, and Zakura rejects a batch
+/// with more than 1,000 entries.
+const SOURCE_SEGMENT_MAX_BLOCKS_CEILING: u32 = 1_000;
 const DEFAULT_SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS: u32 = 12;
 const FALLBACK_SOURCE_FETCH_MAX_IN_FLIGHT_BYTES: u64 = 384 * MIB;
 const FALLBACK_BLOCK_PREPARE_MEMORY_WATERMARK_BYTES: u64 = 512 * MIB;
@@ -121,6 +124,14 @@ impl CanonicalPipelineLimits {
 
     /// Returns these explicit limits after validating their cross-field invariants.
     pub fn validate(self) -> Result<Self, CanonicalPipelineLimitsError> {
+        if self.source_segment_max_blocks.get() > SOURCE_SEGMENT_MAX_BLOCKS_CEILING {
+            return Err(
+                CanonicalPipelineLimitsError::SourceSegmentExceedsBatchLimit {
+                    source_segment_max_blocks: self.source_segment_max_blocks,
+                    max_batch_entries: SOURCE_SEGMENT_MAX_BLOCKS_CEILING,
+                },
+            );
+        }
         if self.source_segment_target_response_bytes > self.max_response_bytes {
             return Err(
                 CanonicalPipelineLimitsError::SourceTargetExceedsResponseLimit {
@@ -145,6 +156,16 @@ impl CanonicalPipelineLimits {
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum CanonicalPipelineLimitsError {
+    /// One source segment would need more JSON-RPC batch entries than a node accepts.
+    #[error(
+        "source segment max blocks {source_segment_max_blocks} exceeds the node batch limit of {max_batch_entries} requests"
+    )]
+    SourceSegmentExceedsBatchLimit {
+        /// Configured maximum blocks in one source segment.
+        source_segment_max_blocks: NonZeroU32,
+        /// Largest JSON-RPC batch every supported node accepts.
+        max_batch_entries: u32,
+    },
     /// The adaptive response target is larger than the node response cap.
     #[error(
         "source segment target {source_segment_target_response_bytes} exceeds maximum response {max_response_bytes}"
@@ -946,7 +967,7 @@ fn memory_permits_for_block(raw_block_capacity: usize, available_permits: u32) -
 
 #[cfg(test)]
 mod tests {
-    use super::CanonicalPipelineLimits;
+    use super::{CanonicalPipelineLimits, CanonicalPipelineLimitsError};
     use std::num::{NonZeroU32, NonZeroU64};
 
     const MIB: u64 = 1_024 * 1_024;
@@ -966,5 +987,27 @@ mod tests {
         assert_eq!(limits.source_fetch_max_in_flight_bytes.get(), 160 * MIB);
         assert_eq!(limits.block_prepare_concurrency.get(), 10);
         assert_eq!(limits.block_prepare_memory_watermark_bytes.get(), 160 * MIB);
+    }
+
+    #[test]
+    fn pipeline_limits_reject_segments_above_the_node_batch_limit() {
+        let mut limits = CanonicalPipelineLimits::resolve(
+            None,
+            NonZeroU32::MIN,
+            NonZeroU64::new(64 * MIB).unwrap_or(NonZeroU64::MIN),
+        );
+        limits.source_segment_max_blocks = NonZeroU32::new(1_000).unwrap_or(NonZeroU32::MIN);
+        assert_eq!(limits.validate(), Ok(limits));
+
+        limits.source_segment_max_blocks = NonZeroU32::new(1_001).unwrap_or(NonZeroU32::MIN);
+        assert_eq!(
+            limits.validate(),
+            Err(
+                CanonicalPipelineLimitsError::SourceSegmentExceedsBatchLimit {
+                    source_segment_max_blocks: limits.source_segment_max_blocks,
+                    max_batch_entries: 1_000,
+                }
+            )
+        );
     }
 }
