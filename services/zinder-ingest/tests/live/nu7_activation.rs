@@ -2,8 +2,8 @@
 //!
 //! The node must advertise an NU7 activation height above its tip, mine to
 //! the transparent broadcast test key, and hold a matured coinbase below NU7.
-//! `deploy/zebra/regtest.toml` with `scripts/mine-live-regtest.sh` produces
-//! that chain. The test then:
+//! `deploy/zebra/regtest.toml` or `deploy/zakura/regtest.toml`, mined with
+//! `scripts/mine-live-regtest.sh`, produces that chain. The test then:
 //!
 //! 1. broadcasts a funded transparent spend below NU7 and mines it;
 //! 2. signs a version-4 spend for the last pre-NU7 branch, then mines across
@@ -15,6 +15,11 @@
 //!    genesis through the tip, and checks the mined spends, their consensus
 //!    branches, the per-block Sapling, Orchard, and Ironwood tree sizes, the
 //!    tree states, and the subtree roots against the node.
+//!
+//! Only the Ironwood tree must hold notes. Zakura's coinbase cannot pay
+//! Sapling or Orchard, so those trees stay empty on its chain;
+//! `scripts/mine-live-regtest.sh` checks that a node with
+//! `generatetoaddress` put notes in all three.
 //!
 //! When `ZINDER_TEST_QUERY_GRPC_ADDR` names a running `zinder-query`, every
 //! broadcast goes through the public `zinder-client` remote chain index, so
@@ -80,7 +85,7 @@ async fn funded_spends_cross_nu7_and_version_4_is_rejected_after_it() -> Result<
         tracing::warn!(
             target: "zinder::live",
             event = "nu7_activation_unconfigured",
-            "node advertises no NU7 activation height; start it with deploy/zebra/regtest.toml"
+            "node advertises no NU7 activation height; start it with deploy/zebra/regtest.toml or deploy/zakura/regtest.toml"
         );
         return Ok(());
     };
@@ -444,7 +449,7 @@ impl ServedChain {
     }
 
     /// Compares the tree sizes Zinder derives for each block with the sizes
-    /// the node reports in `getblock`.
+    /// the node reports in `getblock`, and requires Ironwood notes by the tip.
     async fn assert_tree_sizes_match_node(
         &self,
         env: &LiveTestEnv,
@@ -491,8 +496,8 @@ impl ServedChain {
             "per-block tree sizes match the node"
         );
         assert!(
-            final_sizes.0 > 0 && final_sizes.1 > 0 && final_sizes.2 > 0,
-            "every shielded tree must hold notes; mine the shielded prefix with scripts/mine-live-regtest.sh"
+            final_sizes.2 > 0,
+            "the Ironwood tree must hold notes; mine the shielded prefix with scripts/mine-live-regtest.sh"
         );
         Ok(())
     }

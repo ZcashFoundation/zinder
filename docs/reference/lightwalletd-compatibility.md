@@ -300,9 +300,11 @@ Android SDK Tor paths send no end at all (zcash-swift-wallet-sdk `ebd0add`,
 
 1. Keep the protocol pin and generated-client coverage green. Updating the
    vendored proto is a protocol change, not an adapter-only change.
-2. Run the live parity suite against pinned Zebra and reference-lightwalletd
-   images. It compares observable values and status codes; intentional
-   operator metadata differences remain allow-listed.
+2. Run the live parity suite against the pinned reference-lightwalletd image,
+   once with the pinned Zebra image and once with the pinned Zakura image as
+   the node. It compares observable values and status codes; intentional
+   operator metadata differences remain allow-listed. A release needs both
+   legs green.
 3. Keep the wallet-serving live tests focused on retained compact blocks, tree
    states, subtree roots, transaction bytes, transparent history and UTXOs, and
    strict below-floor failures.
@@ -326,7 +328,10 @@ The vendored protocol pin and parity workflow image digests are:
 - `docker.io/zfnd/zebra:7.0.0@sha256:a70d2be8ffef3a4b6e37355724e36a0e6c1838e46baa28bfb216739f00cf2d34`,
   started on Regtest with `deploy/zebra/regtest.toml`, which activates every
   upgrade through NU7 (see
-  [Regtest through NU7](../runbooks/testing.md#regtest-through-nu7)).
+  [Regtest through NU7](../runbooks/testing.md#regtest-through-nu7));
+- `docker.io/zakuracore/zakura:1.8.6@sha256:e514c89b751b685686690098928507aaa994311e6b90c79373c55b0afaa45d50`,
+  started on Regtest with `deploy/zakura/regtest.toml`, which uses the same
+  schedule.
 
 The pin is reproducibility, not evidence by itself. It makes a failing parity
 run explainable and a passing one repeatable.
