@@ -1058,6 +1058,55 @@ async fn address_utxos_respect_max_entries_for_miner_address() -> Result<()> {
     Ok(())
 }
 
+/// `maxEntries = 0` means every UTXO in lightwalletd, not a server default.
+#[tokio::test]
+#[ignore = "live parity test; see CLAUDE.md §Live Node Tests"]
+async fn address_utxos_with_zero_max_entries_match_reference_for_miner_address() -> Result<()> {
+    let _guard = init();
+    let Some(_env) = require_live()? else {
+        return Ok(());
+    };
+    let Some((mut zinder, mut reference)) = open_parity_clients().await? else {
+        return Ok(());
+    };
+    let address = parity_transparent_address()?;
+    let request = || lightwalletd::GetAddressUtxosArg {
+        addresses: vec![address.clone()],
+        start_height: 0,
+        max_entries: 0,
+    };
+
+    let zinder_list = zinder.get_address_utxos(request()).await?.into_inner();
+    let reference_list = reference.get_address_utxos(request()).await?.into_inner();
+    let zinder_stream = drain_address_utxos(
+        zinder
+            .get_address_utxos_stream(request())
+            .await?
+            .into_inner(),
+    )
+    .await?;
+    let reference_stream = drain_address_utxos(
+        reference
+            .get_address_utxos_stream(request())
+            .await?
+            .into_inner(),
+    )
+    .await?;
+
+    assert_eq!(zinder_list.address_utxos, zinder_stream);
+    assert_eq!(reference_list.address_utxos, reference_stream);
+    assert_eq!(
+        normalize_address_utxos(&zinder_stream),
+        normalize_address_utxos(&reference_stream),
+        "unbounded transparent UTXOs diverge for miner address {address}",
+    );
+    assert!(
+        !zinder_stream.is_empty(),
+        "miner address {address} should have transparent UTXOs after regtest mining",
+    );
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "live parity test; see CLAUDE.md §Live Node Tests"]
 async fn address_utxos_match_reference_for_unused_address() -> Result<()> {

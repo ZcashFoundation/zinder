@@ -51,8 +51,12 @@ struct EntryChainView {
 
 /// Default maximum subtree roots returned when lightwalletd requests "all entries".
 pub const DEFAULT_MAX_LIGHTWALLETD_SUBTREE_ROOTS: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
-/// Default maximum transparent UTXOs returned when lightwalletd requests "all entries".
-pub const DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
+/// Default maximum transparent UTXOs one `GetAddressUtxos` response returns.
+///
+/// It equals Zebra's `getaddressutxos` result cap, which bounds lightwalletd
+/// on Zebra the same way.
+pub const DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS: NonZeroU32 =
+    NonZeroU32::MIN.saturating_add(99_999);
 /// Page size used to drain the native mempool snapshot for lightwalletd.
 const LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 1024;
 /// Blocks a slow `GetBlockRange` client can stall behind, on top of the chunk
@@ -74,7 +78,13 @@ pub struct LightwalletdResponseLimits {
     /// response bounded so one compatibility request cannot materialize
     /// unbounded history.
     pub max_subtree_roots: NonZeroU32,
-    /// Bound used when `GetAddressUtxos.maxEntries` is zero.
+    /// Most UTXOs one `GetAddressUtxos` or `GetAddressUtxosStream` response
+    /// returns.
+    ///
+    /// `maxEntries = 0` means every matching UTXO, as in lightwalletd. A
+    /// request that would return more than this bound fails with
+    /// `RESOURCE_EXHAUSTED` instead of dropping rows, so a wallet never sums
+    /// a partial UTXO set as its balance.
     pub max_address_utxos: NonZeroU32,
 }
 
@@ -319,8 +329,6 @@ where
 
         let start_height = u32::try_from(request.start_height)
             .map_err(|_| Status::invalid_argument("startHeight exceeds u32"))?;
-        let max_entries =
-            NonZeroU32::new(request.max_entries).unwrap_or(self.response_limits.max_address_utxos);
         let visible_tip_block = self
             .query_api
             .visible_tip_block(None)
@@ -352,7 +360,17 @@ where
                 .then_with(|| left.index.cmp(&right.index))
                 .then_with(|| left.address.cmp(&right.address))
         });
-        replies.truncate(u32_to_usize(max_entries.get()));
+        if let Some(max_entries) = NonZeroU32::new(request.max_entries) {
+            replies.truncate(u32_to_usize(max_entries.get()));
+        }
+        let response_limit = self.response_limits.max_address_utxos.get();
+        if replies.len() > u32_to_usize(response_limit) {
+            return Err(Status::resource_exhausted(format!(
+                "{} unspent outputs match, more than the {response_limit} one response returns; \
+                 page with startHeight and maxEntries",
+                replies.len(),
+            )));
+        }
         Ok(replies)
     }
 

@@ -190,6 +190,34 @@ identifier, so `GetBlock` returns `INVALID_ARGUMENT` for it in both serving
 modes, not `NOT_FOUND`. `GetBlockNullifiers` applies the same rule where it is
 served.
 
+## Transparent address UTXOs
+
+`GetAddressUtxos` and `GetAddressUtxosStream` follow lightwalletd's
+`maxEntries` rule (lightwalletd `e7436d2`, `frontend/service.go:954`):
+
+- `maxEntries = 0` returns every unspent output at or above `startHeight` for
+  the requested addresses.
+- A positive `maxEntries` returns at most that many outputs, the oldest first.
+
+Rows are ordered by height across the whole address set, as Zebra's
+`getaddressutxos` orders them for lightwalletd. Within one block, Zinder orders
+rows by transaction id and then output index, where Zebra uses the
+transaction's position in the block. The order differs only when a positive
+`maxEntries` cuts a block's outputs in two.
+
+One response returns at most `LightwalletdResponseLimits::max_address_utxos`
+outputs, 100,000 by default, the same cap Zebra puts on `getaddressutxos`
+(Zebra 7.0.0, `zebra-rpc/src/methods.rs:4142`). A request that would return
+more fails with `RESOURCE_EXHAUSTED` and asks the client to page with
+`startHeight` and `maxEntries`. Zinder never drops rows silently, because
+librustzcash, the Android SDK, Brave, and Zingo add these rows up as the
+address balance.
+
+lightwalletd on Zebra handles the same overflow differently. Zebra rejects the
+query, and lightwalletd maps the unrecognized error to status `OK`, so the
+client receives an empty UTXO list (`frontend/service.go:931-939`). Zinder
+reports the failure instead of that empty success.
+
 ## Certification work
 
 1. Keep the protocol pin and generated-client coverage green. Updating the

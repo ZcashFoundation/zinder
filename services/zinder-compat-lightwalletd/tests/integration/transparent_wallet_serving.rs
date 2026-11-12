@@ -3,7 +3,10 @@
     reason = "Integration test names describe the production compatibility contract under test."
 )]
 
-use std::{num::NonZeroU16, sync::Arc};
+use std::{
+    num::{NonZeroU16, NonZeroU32},
+    sync::Arc,
+};
 
 use tokio::{net::TcpListener, sync::oneshot};
 use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
@@ -11,7 +14,9 @@ use tonic::{Code, Request, transport::Server};
 use zebra_chain::{
     parameters::NetworkKind as ZebraNetworkKind, transparent::Address as ZebraTransparentAddress,
 };
-use zinder_compat_lightwalletd::{LightwalletdAdmissionError, LightwalletdGrpcAdapter};
+use zinder_compat_lightwalletd::{
+    LightwalletdAdmissionError, LightwalletdGrpcAdapter, LightwalletdResponseLimits,
+};
 use zinder_core::{
     BlockBlobArtifact, BlockHeaderArtifact, BlockHeight, BlockHeightRange,
     CommitmentTreeCheckpoint, CompactBlockArtifact, ConsensusBranchId, Network,
@@ -436,6 +441,114 @@ async fn production_pair_drains_both_transparent_history_rpcs_across_native_page
     Ok(())
 }
 
+/// `maxEntries = 0` returns every UTXO, like lightwalletd.
+///
+/// lightwalletd treats `maxEntries = 0` as "every UTXO" and stops only at a
+/// positive `maxEntries` (lightwalletd `e7436d2`, `frontend/service.go:954`).
+/// librustzcash, the Android SDK, Brave, and Zingo sum these rows as the
+/// transparent balance, so a dropped row under-reports funds with no error.
+#[tokio::test]
+async fn address_utxos_with_zero_max_entries_return_every_utxo_like_lightwalletd()
+-> eyre::Result<()> {
+    let utxo_count = 1_001_u32;
+    let (mut store_fixture, activations, address_text) = many_utxo_fixture(0x34, utxo_count)?;
+    let adapter = build_wallet_serving_adapter(&mut store_fixture, activations)?;
+    let request = lightwalletd::GetAddressUtxosArg {
+        addresses: vec![address_text],
+        start_height: 0,
+        max_entries: 0,
+    };
+
+    let list = adapter
+        .get_address_utxos(Request::new(request.clone()))
+        .await?
+        .into_inner()
+        .address_utxos;
+    let streamed = collect_stream(
+        adapter
+            .get_address_utxos_stream(Request::new(request))
+            .await?
+            .into_inner(),
+    )
+    .await?;
+
+    assert_eq!(list, streamed);
+    assert_eq!(streamed.len(), u32_to_usize(utxo_count));
+    let returned_txids: Vec<_> = streamed.iter().map(|utxo| utxo.txid.clone()).collect();
+    let expected_txids: Vec<_> = (0..utxo_count)
+        .map(|index| history_transaction_id(index).as_bytes().to_vec())
+        .collect();
+    assert_eq!(returned_txids, expected_txids);
+    Ok(())
+}
+
+/// A response bound fails the request instead of dropping UTXOs. A positive
+/// `maxEntries` within the bound keeps lightwalletd's truncation to the oldest
+/// rows in chain order.
+#[tokio::test]
+async fn address_utxos_over_the_response_limit_fail_instead_of_truncating() -> eyre::Result<()> {
+    let utxo_count = 1_001_u32;
+    let response_limit = NonZeroU32::MIN.saturating_add(999);
+    let (mut store_fixture, activations, address_text) = many_utxo_fixture(0x35, utxo_count)?;
+    let (canonical_reader, wallet_reader) = store_fixture.take_readers()?;
+    let serving_pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(canonical_reader),
+        Arc::new(wallet_reader),
+    )?);
+    let query = WalletServingQuery::from_serving_pair_slot(
+        WalletServingPairSlot::new(serving_pair),
+        MockTransactionBroadcaster::broadcast_disabled(),
+        activations,
+    );
+    let adapter = LightwalletdGrpcAdapter::with_response_limits(
+        query,
+        LightwalletdResponseLimits {
+            max_address_utxos: response_limit,
+            ..LightwalletdResponseLimits::default()
+        },
+    );
+    let request = |max_entries| lightwalletd::GetAddressUtxosArg {
+        addresses: vec![address_text.clone()],
+        start_height: 0,
+        max_entries,
+    };
+
+    for max_entries in [0, utxo_count] {
+        let list_status = adapter
+            .get_address_utxos(Request::new(request(max_entries)))
+            .await
+            .err()
+            .ok_or_else(|| {
+                eyre::eyre!("maxEntries {max_entries} must exceed the response limit")
+            })?;
+        assert_eq!(list_status.code(), Code::ResourceExhausted);
+        let stream_status = adapter
+            .get_address_utxos_stream(Request::new(request(max_entries)))
+            .await
+            .err()
+            .ok_or_else(|| {
+                eyre::eyre!("maxEntries {max_entries} must exceed the response limit")
+            })?;
+        assert_eq!(stream_status.code(), Code::ResourceExhausted);
+    }
+
+    let truncated = adapter
+        .get_address_utxos(Request::new(request(response_limit.get())))
+        .await?
+        .into_inner()
+        .address_utxos;
+    assert_eq!(truncated.len(), u32_to_usize(response_limit.get()));
+    assert_eq!(
+        truncated.last().map(|utxo| utxo.txid.clone()),
+        Some(
+            history_transaction_id(response_limit.get() - 1)
+                .as_bytes()
+                .to_vec()
+        )
+    );
+    Ok(())
+}
+
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
@@ -718,6 +831,55 @@ fn pre_nu7_activations() -> eyre::Result<NetworkUpgradeActivations> {
         Network::ZcashRegtest,
         activations,
     )?)
+}
+
+/// Builds a wallet-serving store whose address holds `utxo_count` UTXOs at
+/// height 2, one per transaction, in transaction-index order.
+fn many_utxo_fixture(
+    address_byte: u8,
+    utxo_count: u32,
+) -> eyre::Result<(
+    WalletServingStoreFixture,
+    Arc<NetworkUpgradeActivations>,
+    String,
+)> {
+    let address = transparent_address(address_byte);
+    let script = address.script().as_raw_bytes().to_vec();
+    let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script);
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(2);
+    let block_two = chain
+        .block_at(BlockHeight::new(2))
+        .ok_or_else(|| eyre::eyre!("UTXO fixture must include block 2"))?
+        .clone();
+    let mut chain = chain;
+    for index in 0..utxo_count {
+        let transaction_id = history_transaction_id(index);
+        chain = chain
+            .with_transaction_rows(FixtureTransactionRows::from_raw_transaction(
+                transaction_id,
+                block_two.height,
+                block_two.hash,
+                index,
+                history_transaction_bytes(index),
+            ))
+            .with_address_output_index(TransparentUnspentOutput::new(
+                address_script_hash,
+                script.clone(),
+                TransparentOutPoint::new(transaction_id, 0),
+                1,
+                block_two.height,
+                block_two.hash,
+            ));
+    }
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let store_fixture = WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
+    Ok((store_fixture, activations, address.to_string()))
+}
+
+fn u32_to_usize(count: u32) -> usize {
+    usize::try_from(count).unwrap_or(usize::MAX)
 }
 
 fn transparent_address(byte: u8) -> ZebraTransparentAddress {
