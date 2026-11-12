@@ -113,12 +113,36 @@ Set these in the service settings:
 
 | Setting | Value |
 | --- | --- |
-| Healthcheck path | `/readyz` |
-| Healthcheck timeout | `21600` seconds |
+| Healthcheck path | `/healthz` |
+| Healthcheck timeout | `3600` seconds |
 | Restart policy | Always |
 
-The healthcheck window covers the canonical and wallet construction gates,
-because the container is only useful once the native query surface serves.
+Railway rejects a healthcheck timeout above 3600 seconds, so `3600` is the
+longest window available.
+
+On the first deployment to an empty volume, leave the healthcheck path unset
+until the deploy logs show `wallet serving is ready`, then set it. The query
+operational endpoint on port 9106 does not listen until canonical and wallet
+construction finish, so every healthcheck path on that port fails until then,
+including `/healthz`. Construction on an empty volume can outlast the one-hour
+window.
+
+If you set the healthcheck path before construction finishes, Railway marks the
+deployment failed when the window expires and stops the container. The
+entrypoint forwards `SIGTERM` and the processes exit cleanly. The volume keeps
+the stores built so far, and the next deployment resumes from them.
+
+A changed service setting, such as the healthcheck path, takes effect on a new
+deployment. Railway's Redeploy action on an existing deployment keeps that
+deployment's earlier healthcheck setting.
+
+`/healthz` passes as soon as the query endpoint listens. It does not show
+whether the native query surface serves. Watch query `/readyz` on port 9106 for
+that, and alert on it in monitoring. It is not the deploy-time healthcheck
+because it returns 503 with cause `upstream_not_ready` while the Zebra node is
+behind its estimated network tip, even when Zinder has indexed everything the
+node has committed. A lagging node would then fail the deployment without any
+Zinder fault.
 
 Also set the `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30` service variable. The
 entrypoint gives the three RocksDB openers twenty seconds to flush, so a
@@ -155,8 +179,7 @@ without a serving surface is the expected first-deploy shape, not a stall.
 Each phase carries its own deadline: three hours for canonical construction,
 two for wallet construction, thirty minutes for the serving pair. An expired
 phase logs the plane's last `/readyz` body and exits non-zero, so the reason
-reaches the deploy logs before Railway's six-hour healthcheck window closes.
-The volume is retained and the next attempt resumes from the durable fence
+reaches the deploy logs. The volume is retained and the next attempt resumes from the durable fence
 rather than starting over.
 
 A cause that no amount of waiting clears (`schema_mismatch`,
@@ -228,17 +251,16 @@ Health checks follow the same rule. The image `HEALTHCHECK` runs
 restarts unhealthy containers keeps the typed refusal up instead of restarting
 into the same park.
 
-Railway's deploy-time healthcheck is different: it requires `/readyz` to
-answer 200 within the healthcheck timeout (six hours) before a deployment counts
-as successful. Do not redeploy while the writer is parked except to ship the
-reconciliation, such as a restored state bundle or a rebuild. A redeploy
-restarts all three processes, ingest parks again on the same reorg, and query
-reports `reorg_window_exceeded`, so the new deployment never passes the
-healthcheck and Railway marks it failed when the timeout expires. Because the
-service owns a volume, Railway stops the running deployment before it starts
-the new one, so the redeploy also ends the deployment that was serving the
-typed refusal. A plain restart or a crash restart under the `ALWAYS` policy
-does not run the deploy-time healthcheck and comes back serving the halt.
+Railway's deploy-time healthcheck is different. It uses `/healthz`, which
+passes once the query endpoint listens, so a parked writer does not fail a
+deployment. Query `/readyz` still reports `reorg_window_exceeded`, which is why
+monitoring watches it. Do not redeploy while the writer is parked except to
+ship the reconciliation, such as a restored state bundle or a rebuild. A
+redeploy restarts all three processes, and ingest parks again on the same
+reorg. Because the service owns a volume, Railway stops the running deployment
+before it starts the new one, so the redeploy also ends the deployment that was
+serving the typed refusal. A plain restart or a crash restart under the
+`ALWAYS` policy comes back serving the halt.
 
 Upstream outages and sync lag drain readiness the same way but clear on their
 own, so they are tolerated for an hour before the container terminates.
