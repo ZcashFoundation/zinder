@@ -56,5 +56,6 @@ tokio-stream.workspace = true
 tokio-util.workspace = true
 tonic.workspace = true
 tonic-types.workspace = true
+zcash_primitives.workspace = true
 zinder-query.workspace = true
 zinder-testkit.workspace = true

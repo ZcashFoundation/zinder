@@ -8,8 +8,15 @@ the canonical writer admits the new table as a schedule revision instead of
 requiring a rebuild.
 
 Schedule admission only lets existing stores open against the new table. Zinder
-must also be able to parse blocks after the new upgrade activates; check the
+must also be able to parse blocks after the new upgrade activates. Check the
 release notes of the Zinder release you are installing for that support.
+
+For NU7, Zinder parses blocks with `zebra-chain` 15.0.0 and the matching
+librustzcash family, the same parser release Zebra 7.0.0 uses. Zinder 0.9.0
+and earlier parse with `zebra-chain` 11.2.0, which rejects branch `0x77190ad9`,
+so their ingest stops at the first NU7 block. NU7 decoding is tested against
+Regtest blocks captured from Zebra 7.0.0 and Zakura 1.6.0. It has not yet run
+against an NU7 activation on Mainnet or Testnet.
 
 ## Before you start
 

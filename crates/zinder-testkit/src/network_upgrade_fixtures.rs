@@ -132,5 +132,6 @@ pub fn local_network_from_activations(activations: &NetworkUpgradeActivations) -
         nu6_1: lookup("NU6.1"),
         nu6_2: lookup("NU6.2"),
         nu6_3: lookup("NU6.3"),
+        nu7: lookup("NU7"),
     }
 }

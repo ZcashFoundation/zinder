@@ -45,12 +45,11 @@ use time::{Date, Duration, Month, OffsetDateTime, format_description::well_known
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tonic::Code;
-use zcash_protocol::consensus::{BLOCKS_PER_HOUR, SECONDS_PER_BLOCK};
 use zebra_chain::{
     amount::{Amount, NonNegative},
     block::Height as ZebraHeight,
     parameters::{
-        Network as ZebraNetwork, NetworkUpgrade,
+        Network as ZebraNetwork, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING,
         subsidy::{
             self, FundingStreamReceiver, block_subsidy, funding_stream_values, height_for_halving,
             miner_subsidy,
@@ -128,8 +127,8 @@ const MAX_NON_CANONICAL_BLOCK_LIMIT: u32 = 200;
 const BLOCK_SUMMARY_PAGE_SIZE: u32 = 1_024;
 const MAX_RAW_TRANSACTION_BATCH_SIZE: usize = 1_000;
 const MAX_SCAN_RANGE_BLOCKS: u64 = 1_000_000;
-const TARGET_BLOCKS_PER_DAY: u32 = BLOCKS_PER_HOUR * 24;
-const MAX_ORCHARD_CANDIDATE_SCAN_BLOCKS: u32 = TARGET_BLOCKS_PER_DAY * 7;
+const POST_BLOSSOM_BLOCKS_PER_DAY: u32 = 86_400 / POST_BLOSSOM_POW_TARGET_SPACING;
+const MAX_ORCHARD_CANDIDATE_SCAN_BLOCKS: u32 = 8_064;
 const ORCHARD_CANDIDATE_SCAN_VIEWING_KEY_FIELDS: [&str; 6] = [
     "viewingKey",
     "viewing_key",
@@ -161,7 +160,6 @@ const MAX_MINING_METRICS_WINDOW: i64 = 100;
 const DEFAULT_MINING_METRICS_LIMIT: i64 = 120;
 const MIN_MINING_METRICS_LIMIT: i64 = 20;
 const MAX_MINING_METRICS_LIMIT: i64 = 500;
-const DEFAULT_MINING_BLOCK_INTERVAL_SECONDS: u32 = SECONDS_PER_BLOCK;
 const MAX_VALID_MINING_BLOCK_INTERVAL_SECONDS: u32 = 600;
 const COMPONENT_SUMMARY_FUTURE_TIME_MARGIN_SECONDS: i64 = 7_200;
 const PRIVACY_STATS_TREND_DAYS: i64 = 30;
@@ -1081,7 +1079,7 @@ impl CipherscanRestAdapter {
             end_height = start_height.saturating_sub(1);
         }
 
-        NetworkActivityWindow::from_entries(&entries, tip_height, cutoff_unix_seconds)
+        NetworkActivityWindow::from_entries(self.network, &entries, tip_height, cutoff_unix_seconds)
     }
 
     async fn fetch_mining_production_window(
@@ -2956,8 +2954,8 @@ fn decode_cipherscan_coinbase_miner_fields(
         .map_err(|_| {
             CipherscanRestError::InvalidUpstreamField("location.mined.raw_transaction_bytes")
         })?;
-    let miner_data = transaction
-        .inputs()
+    let inputs = transaction.inputs();
+    let miner_data = inputs
         .iter()
         .find_map(transparent::Input::miner_data)
         .ok_or(CipherscanRestError::InvalidUpstreamField(
@@ -7520,6 +7518,7 @@ struct NetworkActivityWindow {
 
 impl NetworkActivityWindow {
     fn from_entries(
+        network: Network,
         entries: &[CipherscanBlockListEntry],
         tip_height: u32,
         cutoff_unix_seconds: i64,
@@ -7541,10 +7540,13 @@ impl NetworkActivityWindow {
             transaction_count =
                 transaction_count.saturating_add(u64::from(entry.summary.transaction_count));
         }
-        let average_block_time_seconds = 86_400_u32
+        let average_block_time_seconds = match 86_400_u32
             .saturating_add(block_count / 2)
             .checked_div(block_count)
-            .unwrap_or(DEFAULT_MINING_BLOCK_INTERVAL_SECONDS);
+        {
+            Some(average_block_time_seconds) => average_block_time_seconds,
+            None => target_block_spacing_seconds(&zebra_network_for(network)?, tip_height)?,
+        };
         let network_hashrate_raw = latest_difficulty / f64::from(average_block_time_seconds);
         Ok(Self {
             latest_difficulty,
@@ -9672,7 +9674,7 @@ fn usage_clock_peak_to_low_ratio(peak_transactions: u32, low_transactions: u32) 
 
 fn usage_clock_block_limit(period: &str) -> u32 {
     usage_clock_period_days(period).map_or(MAX_USAGE_CLOCK_BLOCKS, |days| {
-        days.saturating_mul(TARGET_BLOCKS_PER_DAY)
+        days.saturating_mul(POST_BLOSSOM_BLOCKS_PER_DAY)
             .clamp(1, MAX_USAGE_CLOCK_BLOCKS)
     })
 }
@@ -10291,6 +10293,7 @@ fn node_history_json(period: &str) -> Value {
 struct MiningBlockSample {
     block_height: u32,
     block_time_unix_seconds: i64,
+    target_spacing_seconds: u32,
     difficulty: f64,
     transaction_fees_zec: f64,
     transaction_count: f64,
@@ -10325,13 +10328,16 @@ fn mining_metrics_json(
 ) -> Result<Value, CipherscanRestError> {
     let sample_set = mining_block_samples(network, response)?;
     let points = rolling_mining_metric_points(&sample_set.samples, window);
-    let latest = points.last().map_or_else(
-        || MiningMetricValues {
-            block_time_seconds: f64::from(DEFAULT_MINING_BLOCK_INTERVAL_SECONDS),
+    let latest = match points.last() {
+        Some(point) => point.values,
+        None => MiningMetricValues {
+            block_time_seconds: f64::from(target_block_spacing_seconds(
+                &zebra_network_for(network)?,
+                response.end_height,
+            )?),
             ..Default::default()
         },
-        |point| point.values,
-    );
+    };
     let mut unavailable = Vec::new();
     if response.missing_block_count > 0 {
         unavailable.push(
@@ -10372,6 +10378,7 @@ fn mining_block_samples(
     network: Network,
     response: &explorer::BlockProductionSeriesResponse,
 ) -> Result<MiningBlockSampleSet, CipherscanRestError> {
+    let zebra_network = zebra_network_for(network)?;
     let mut samples = Vec::with_capacity(response.points.len());
     let mut paid_fee_block_count = 0_u32;
     let mut conventional_fee_block_count = 0_u32;
@@ -10395,6 +10402,10 @@ fn mining_block_samples(
         samples.push(MiningBlockSample {
             block_height: summary.block_height,
             block_time_unix_seconds: summary.block_time_unix_seconds,
+            target_spacing_seconds: target_block_spacing_seconds(
+                &zebra_network,
+                summary.block_height,
+            )?,
             difficulty: cipherscan_difficulty(network, point.bits)?,
             transaction_fees_zec: zec_from_unsigned_zatoshis(transaction_fees_zat),
             transaction_count: f64::from(summary.transaction_count),
@@ -10424,7 +10435,7 @@ fn rolling_mining_metric_points(
             })
             .and_then(|interval| u32::try_from(interval).ok())
             .filter(|interval| *interval > 0 && *interval < MAX_VALID_MINING_BLOCK_INTERVAL_SECONDS)
-            .unwrap_or(DEFAULT_MINING_BLOCK_INTERVAL_SECONDS);
+            .unwrap_or(sample.target_spacing_seconds);
         sample_values.push(MiningMetricValues {
             solrate: sample.difficulty / f64::from(block_interval_seconds),
             difficulty: sample.difficulty,
@@ -12234,7 +12245,10 @@ fn migration_overview_json(
         "activationHeight": activation_height,
         "tipHeight": tip_height,
         "activated": activated,
-        "avgBlockTimeSecs": f64::from(SECONDS_PER_BLOCK),
+        "avgBlockTimeSecs": f64::from(target_block_spacing_seconds(
+            &zebra_network_for(network)?,
+            tip_height,
+        )?),
         "referenceNode": Value::Null,
         "blocksUntilActivation": blocks_until_activation,
         "poolSizes": {
@@ -14393,6 +14407,16 @@ fn zebra_network_for(network: Network) -> Result<ZebraNetwork, CipherscanRestErr
 fn zebra_height(height: u32) -> Result<ZebraHeight, CipherscanRestError> {
     ZebraHeight::try_from(height)
         .map_err(|_| chain_economics_unavailable("height is outside Zebra's supported range"))
+}
+
+fn target_block_spacing_seconds(
+    zebra_network: &ZebraNetwork,
+    height: u32,
+) -> Result<u32, CipherscanRestError> {
+    let target_spacing =
+        NetworkUpgrade::target_spacing_for_height(zebra_network, zebra_height(height)?);
+    u32::try_from(target_spacing.num_seconds())
+        .map_err(|_| chain_economics_unavailable("target block spacing is out of range"))
 }
 
 fn migration_activation_height(network: Network) -> Option<u32> {
@@ -17438,7 +17462,8 @@ mod tests {
             network_activity_entry(1, 999, 9, 68.0),
         ];
 
-        let activity = NetworkActivityWindow::from_entries(&entries, 3, 1_000)?;
+        let activity =
+            NetworkActivityWindow::from_entries(Network::ZcashTestnet, &entries, 3, 1_000)?;
 
         assert_eq!(activity.block_count, 2);
         assert_eq!(activity.transaction_count, 7);
@@ -17678,13 +17703,13 @@ mod tests {
     #[test]
     fn mining_metrics_json_preserves_cipherscan_chart_shape() -> Result<(), CipherscanRestError> {
         let response = explorer::BlockProductionSeriesResponse {
-            start_height: 100,
-            end_height: 100,
+            start_height: 4_465_026,
+            end_height: 4_465_026,
             covered_block_count: 1,
             missing_block_count: 0,
             points: vec![explorer::BlockProductionPoint {
                 summary: Some(explorer::BlockSummary {
-                    block_height: 100,
+                    block_height: 4_465_026,
                     block_time_unix_seconds: 1_700_000_000,
                     transaction_count: 3,
                     fees_collected_zat: 65_000,
@@ -17700,11 +17725,11 @@ mod tests {
 
         assert_eq!(metrics["success"], json!(true));
         assert_eq!(metrics["window"], json!(20));
-        assert_eq!(metrics["latest"]["blockTime"], json!(75.0));
+        assert_eq!(metrics["latest"]["blockTime"], json!(25.0));
         assert_eq!(metrics["latest"]["txFees"], json!(0.000_65));
         assert_eq!(metrics["latest"]["txCount"], json!(3.0));
         assert_eq!(metrics["points"].as_array().map(Vec::len), Some(1));
-        assert_eq!(metrics["points"][0]["height"], json!(100));
+        assert_eq!(metrics["points"][0]["height"], json!(4_465_026));
         for field in ["solrate", "difficulty", "blockTime", "txFees", "txCount"] {
             assert_eq!(metrics["latest"][field], metrics["points"][0][field]);
         }
@@ -17713,6 +17738,20 @@ mod tests {
         assert_eq!(metrics["coverage"]["paidFeeBlocks"], json!(0));
         assert_eq!(metrics["coverage"]["conventionalFeeBlocks"], json!(1));
         assert_eq!(metrics["degraded"], json!(true));
+        Ok(())
+    }
+
+    #[test]
+    fn target_block_spacing_follows_the_network_upgrade_at_each_height()
+    -> Result<(), CipherscanRestError> {
+        let mainnet = zebra_network_for(Network::ZcashMainnet)?;
+        let testnet = zebra_network_for(Network::ZcashTestnet)?;
+
+        assert_eq!(target_block_spacing_seconds(&testnet, 100)?, 150);
+        assert_eq!(target_block_spacing_seconds(&testnet, 4_465_025)?, 75);
+        assert_eq!(target_block_spacing_seconds(&testnet, 4_465_026)?, 25);
+        assert_eq!(target_block_spacing_seconds(&mainnet, 3_543_404)?, 75);
+        assert_eq!(target_block_spacing_seconds(&mainnet, 3_543_405)?, 25);
         Ok(())
     }
 
@@ -18539,6 +18578,7 @@ mod tests {
             MiningBlockSample {
                 block_height: 1,
                 block_time_unix_seconds: 1_000,
+                target_spacing_seconds: 75,
                 difficulty: 10.0,
                 transaction_fees_zec: 1.0,
                 transaction_count: 2.0,
@@ -18546,6 +18586,7 @@ mod tests {
             MiningBlockSample {
                 block_height: 2,
                 block_time_unix_seconds: 1_100,
+                target_spacing_seconds: 75,
                 difficulty: 20.0,
                 transaction_fees_zec: 3.0,
                 transaction_count: 4.0,
@@ -18553,6 +18594,7 @@ mod tests {
             MiningBlockSample {
                 block_height: 3,
                 block_time_unix_seconds: 1_700,
+                target_spacing_seconds: 75,
                 difficulty: 30.0,
                 transaction_fees_zec: 5.0,
                 transaction_count: 6.0,
@@ -19835,6 +19877,7 @@ mod tests {
         assert_eq!(overview["network"], json!("testnet"));
         assert_eq!(overview["activationHeight"], json!(4_134_000));
         assert_eq!(overview["tipHeight"], json!(4_134_100));
+        assert_eq!(overview["avgBlockTimeSecs"], json!(75.0));
         assert_eq!(overview["activated"], json!(true));
         assert_eq!(overview["blocksUntilActivation"], json!(0));
         assert_eq!(overview["poolSizes"]["orchardZat"], json!(800));

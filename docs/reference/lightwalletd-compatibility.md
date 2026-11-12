@@ -128,7 +128,7 @@ The vendored protocol pin and parity workflow image digests are:
 - `lightwalletd` `v0.4.19`
   (`028401c4c4a7c8c386c81212324cc8083eed7510`) as the source reference;
 - `electriccoinco/lightwalletd:v0.4.19@sha256:a3dfb04b4054b78ae3107dcc804c3a15a6e38d1f0dfcadeac48da482dd1d3448`;
-- `docker.io/zfnd/zebra:6.2.2@sha256:f464a4bf44c3402b2c9063c6df686b9177a4659ea61aecdc8aeb6947f2173197`.
+- `docker.io/zfnd/zebra:7.0.0@sha256:a70d2be8ffef3a4b6e37355724e36a0e6c1838e46baa28bfb216739f00cf2d34`.
 
 The pin is reproducibility, not evidence by itself. It makes a failing parity
 run explainable and a passing one repeatable.

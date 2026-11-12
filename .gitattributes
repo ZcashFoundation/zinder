@@ -1,2 +1,0 @@
-# Preserve the vendored crate's packaged license text byte-for-byte.
-vendor/postgres-protocol/LICENSE-MIT -whitespace

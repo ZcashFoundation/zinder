@@ -34,12 +34,11 @@ fi
 repository_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 metadata="$(cargo metadata --format-version 1 --no-deps --manifest-path "$repository_root/Cargo.toml")"
 first_party_packages="$(
-  jq --arg vendor_prefix "$repository_root/vendor/" '
+  jq '
     .workspace_members as $workspace_members
     | [
         .packages[]
         | select(.id as $id | $workspace_members | index($id))
-        | select((.manifest_path | startswith($vendor_prefix)) | not)
       ]
   ' <<< "$metadata"
 )"

@@ -6,6 +6,7 @@
 use std::error::Error;
 
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 use zebra_chain::{
     block::Block as ZebraBlock,
     serialization::{ZcashDeserializeInto, ZcashSerialize},
@@ -13,8 +14,10 @@ use zebra_chain::{
 use zinder_core::{
     BlockHash, BlockHeight, CanonicalBlockFactsDigestVersion,
     CanonicalBlockFactsSequenceDigestBuilder, CanonicalBlockFactsSequenceDigestVersion,
-    CanonicalTransactionFacts, Network, TransactionFactsArtifact, TransactionLocation,
-    TransparentInputFact, decode_canonical_block_replay,
+    CanonicalTransactionFacts, ConsensusBranchId, Network, NetworkUpgradeActivation,
+    NetworkUpgradeActivations, TransactionFactsArtifact, TransactionLocation, TransparentInputFact,
+    decode_canonical_block_replay,
+    wire::{encode_rpc_auth_digest_hex, encode_rpc_transaction_id_hex},
 };
 use zinder_ingest::{
     BlockMismatchField, CanonicalBlockConstructionError, CommitmentTreeSizes,
@@ -22,6 +25,7 @@ use zinder_ingest::{
 };
 use zinder_materialized_views::project_block_summary_record;
 use zinder_source::{SourceBlock, decode_rpc_block_hash};
+use zinder_store::encode_compact_block_artifact;
 use zinder_testkit::{
     FixtureTransactionRows, encode_fixture_block_replay_with_raw_block,
     sample_regtest_upgrade_activations,
@@ -267,6 +271,339 @@ fn ironwood_canonical_block_facts_digest_matches_known_answer() -> Result<(), Bo
         "86cb193efe15992d994f9813e061d8f3b247fd86980d50a2585ee1137a0d3f70"
     );
 
+    Ok(())
+}
+
+/// Known answers for every captured historical block: the canonical facts
+/// digest and the SHA-256 of the stored compact-block encoding.
+#[test]
+fn historical_fixture_blocks_keep_known_facts_and_compact_block_bytes() -> Result<(), Box<dyn Error>>
+{
+    let fixtures = [
+        (
+            Network::ZcashRegtest,
+            include_str!("../fixtures/z3-regtest-block-1.json"),
+        ),
+        (
+            Network::ZcashRegtest,
+            include_str!("../fixtures/z3-regtest-ironwood-block-603.json"),
+        ),
+        (
+            Network::ZcashTestnet,
+            include_str!("../fixtures/zcash-testnet-sapling-block-1842432.json"),
+        ),
+        (
+            Network::ZcashTestnet,
+            include_str!("../fixtures/zcash-testnet-orchard-block-1842462.json"),
+        ),
+        (
+            Network::ZcashRegtest,
+            include_str!("../fixtures/zakura-regtest-ironwood-block-3.json"),
+        ),
+    ];
+    let mut observed = Vec::with_capacity(fixtures.len());
+    for (network, fixture_json) in fixtures {
+        let source_block = fixture_source_block_from(network, fixture_json)?;
+        let block = build_positioned_block_for_test(&source_block)?;
+        let compact_block_bytes = encode_compact_block_artifact(&block.compact_block);
+        observed.push((
+            source_block.height.value(),
+            hex::encode(
+                block
+                    .facts
+                    .digest(CanonicalBlockFactsDigestVersion::CURRENT)
+                    .as_bytes(),
+            ),
+            compact_block_bytes.len(),
+            hex::encode(Sha256::digest(&compact_block_bytes)),
+        ));
+    }
+
+    assert_eq!(
+        observed,
+        [
+            (
+                1,
+                "76474516b2f4184e9f434750ed6970ed8eac53e5fbb698e1959dcc6c33c5456f".to_owned(),
+                215,
+                "0bc6254121524d279308856f11d27f5e758b7786e405446108ef3004c262c740".to_owned(),
+            ),
+            (
+                603,
+                "86cb193efe15992d994f9813e061d8f3b247fd86980d50a2585ee1137a0d3f70".to_owned(),
+                613,
+                "fa06b824eeed703ed33a0e277fc2a352f2cb3d2804a8ed19c7997f7f0afc73cb".to_owned(),
+            ),
+            (
+                1_842_432,
+                "9b04c3c83f7a00b6abab9f25f64506e8b0b6e8f0d46d073824b461029fc050b3".to_owned(),
+                2_282,
+                "6b45d365d02561d69a8ab566fd8c34dbf27d4d0247d20a8be6cd9a233ee35408".to_owned(),
+            ),
+            (
+                1_842_462,
+                "867c271ea799a896212975f9b764898c8d00166df7f27f5ddba7743c77999be3".to_owned(),
+                748,
+                "48abd79ee8d53c7b9101d919d9d7ea0aad40dca27d996b90a1acb1beac8f3fae".to_owned(),
+            ),
+            (
+                3,
+                "6d95a049efc9e3c0fc4ecea22b0f1dba46decaa3435c2a3134c86a3596fe0f93".to_owned(),
+                215,
+                "bdaaf9b9cacd89c2e92cab82c0cc4e6a698f20b03fa7f7c75d603b7fb47a64ee".to_owned(),
+            ),
+        ]
+    );
+
+    Ok(())
+}
+
+/// Known answers for Mainnet blocks with Sprout `JoinSplit`s and a Sapling spend,
+/// which the other captured fixtures do not contain.
+#[test]
+fn mainnet_sprout_and_sapling_spend_blocks_keep_known_facts_and_compact_block_bytes()
+-> Result<(), Box<dyn Error>> {
+    let activations = NetworkUpgradeActivations::new(
+        Network::ZcashMainnet,
+        vec![
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x5ba8_1b19),
+                activation_height: BlockHeight::new(347_500),
+                name: "Overwinter".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x76b8_09bb),
+                activation_height: BlockHeight::new(419_200),
+                name: "Sapling".to_owned(),
+            },
+        ],
+    )?;
+    let fixtures = [
+        include_str!("../fixtures/zcash-mainnet-sprout-block-396.json"),
+        include_str!("../fixtures/zcash-mainnet-sapling-spend-block-419202.json"),
+    ];
+    let mut observed = Vec::with_capacity(fixtures.len());
+    for fixture_json in fixtures {
+        let source_block = fixture_source_block_from(Network::ZcashMainnet, fixture_json)?;
+        let prepared = prepare_canonical_block(&source_block, &activations, RawBlobPolicy::All)?;
+        let block = position_canonical_block(prepared, &mut CommitmentTreeSizes::default())?;
+        assert_transaction_bytes_match_parsed_source(&source_block, &block)?;
+        assert_compact_transaction_ids_match_canonical_facts(&block)?;
+        let sprout_balances_zat: Vec<i64> = block
+            .facts
+            .transactions
+            .iter()
+            .filter(|transaction| transaction.public_facts.counts.sprout_joinsplit_count > 0)
+            .map(|transaction| transaction.intrinsic_value_balances.sprout_zat)
+            .collect();
+        let compact_sapling_spend_count: usize = block
+            .compact_block
+            .transactions()
+            .iter()
+            .map(|transaction| transaction.data.sapling_spends.len())
+            .sum();
+        let compact_block_bytes = encode_compact_block_artifact(&block.compact_block);
+        observed.push((
+            source_block.height.value(),
+            sprout_balances_zat,
+            compact_sapling_spend_count,
+            hex::encode(
+                block
+                    .facts
+                    .digest(CanonicalBlockFactsDigestVersion::CURRENT)
+                    .as_bytes(),
+            ),
+            compact_block_bytes.len(),
+            hex::encode(Sha256::digest(&compact_block_bytes)),
+        ));
+    }
+
+    assert_eq!(
+        observed,
+        [
+            (
+                396,
+                vec![-14_250_000],
+                0,
+                "3ebae4b98f78c45c590e2dfebd290b7a8fbce0e31506ddba04e262d202eea1a5".to_owned(),
+                333,
+                "df6d949c85cd7df946da4d4b0bf4c49ca43e2b531b25593097717d5f276cffa2".to_owned(),
+            ),
+            (
+                419_202,
+                vec![-165_594_882],
+                1,
+                "68b5228d0295c5c7c940a7e2bb213366f8e404edba10f46b3122177e7d801d3b".to_owned(),
+                2_476,
+                "074710a877e0bfc904cf0199b55fc4048873774537fb8ecbce384db75a03c9c6".to_owned(),
+            ),
+        ]
+    );
+
+    Ok(())
+}
+
+#[test]
+fn nu7_activation_block_prepares_canonical_facts() -> Result<(), Box<dyn Error>> {
+    let fixture_json = include_str!("../fixtures/zakura-regtest-nu7-block-3.json");
+    let fixture: Value = serde_json::from_str(fixture_json)?;
+    let source_block = fixture_source_block_from(Network::ZcashRegtest, fixture_json)?;
+    let block = build_positioned_block_for_test(&source_block)?;
+    assert_transaction_bytes_match_parsed_source(&source_block, &block)?;
+    assert_compact_transaction_ids_match_canonical_facts(&block)?;
+
+    let [coinbase] = block.facts.transactions.as_slice() else {
+        return Err("NU7 activation fixture must contain only its coinbase".into());
+    };
+    assert_eq!(
+        encode_rpc_transaction_id_hex(coinbase.public_facts.transaction_id),
+        string_field(&fixture, "coinbase_txid")?
+    );
+    assert_eq!(
+        coinbase.public_facts.version,
+        zinder_core::TransactionVersion::V6
+    );
+    assert_eq!(
+        coinbase.public_facts.consensus_branch_id,
+        Some(ConsensusBranchId::new(0x7719_0ad9))
+    );
+
+    let compact_block_bytes = encode_compact_block_artifact(&block.compact_block);
+    assert_eq!(
+        (
+            hex::encode(
+                block
+                    .facts
+                    .digest(CanonicalBlockFactsDigestVersion::CURRENT)
+                    .as_bytes(),
+            ),
+            compact_block_bytes.len(),
+            hex::encode(Sha256::digest(&compact_block_bytes)),
+        ),
+        (
+            "3238484161539ded1f5cb8e6a3b330691d66ceaaebda5f2c19f771c57a854d75".to_owned(),
+            214,
+            "b1eb170b76cb3ce176d91844eef33ab5f942b36fdc02556367e20f0500aeb709".to_owned(),
+        )
+    );
+
+    Ok(())
+}
+
+/// Zebra 7.0.0 Regtest schedule that produced the
+/// `zebra-7.0.0-regtest-nu7-block-159` fixture.
+fn zebra_7_regtest_activations() -> Result<NetworkUpgradeActivations, Box<dyn Error>> {
+    let upgrades = [
+        (0x5ba8_1b19, "Overwinter", 1),
+        (0x76b8_09bb, "Sapling", 1),
+        (0x2bb4_0e60, "Blossom", 1),
+        (0xf5b9_230b, "Heartwood", 1),
+        (0xe9ff_75a6, "Canopy", 1),
+        (0xc2d6_d0b4, "NU5", 2),
+        (0xc8e7_1055, "NU6", 3),
+        (0x4dec_4df0, "NU6.1", 4),
+        (0x5437_f330, "NU6.2", 5),
+        (0x37a5_165b, "NU6.3", 6),
+        (0x7719_0ad9, "NU7", 140),
+    ];
+    Ok(NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        upgrades
+            .into_iter()
+            .map(|(branch_id, name, height)| NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(branch_id),
+                activation_height: BlockHeight::new(height),
+                name: name.to_owned(),
+            })
+            .collect(),
+    )?)
+}
+
+#[test]
+fn zebra_7_nu7_block_prepares_canonical_facts() -> Result<(), Box<dyn Error>> {
+    let fixture_json = include_str!("../fixtures/zebra-7.0.0-regtest-nu7-block-159.json");
+    let fixture: Value = serde_json::from_str(fixture_json)?;
+    let source_block = fixture_source_block_from(Network::ZcashRegtest, fixture_json)?;
+    let activations = zebra_7_regtest_activations()?;
+
+    // Seed the running tree position with the node's sizes before this block:
+    // its reported sizes after the block, less the note commitments the block
+    // itself adds, counted by zebra-chain's parser.
+    let parsed_block: ZebraBlock = source_block
+        .raw_block_bytes
+        .as_slice()
+        .zcash_deserialize_into()?;
+    let added = |count: fn(&zebra_chain::transaction::Transaction) -> usize| {
+        parsed_block
+            .transactions
+            .iter()
+            .map(|transaction| count(transaction))
+            .sum::<usize>()
+    };
+    let node_size = |pool: &'static str| -> Result<u32, Box<dyn Error>> {
+        Ok(u32::try_from(
+            fixture
+                .get("trees")
+                .and_then(|trees| trees.get(pool))
+                .and_then(Value::as_u64)
+                .ok_or_else(|| format!("fixture tree size {pool} must be an integer"))?,
+        )?)
+    };
+    let node_sizes = (
+        node_size("sapling")?,
+        node_size("orchard")?,
+        node_size("ironwood")?,
+    );
+    let mut tree_sizes = CommitmentTreeSizes {
+        sapling: node_sizes.0 - u32::try_from(added(|tx| tx.sapling_note_commitments().count()))?,
+        orchard: node_sizes.1 - u32::try_from(added(|tx| tx.orchard_note_commitments().count()))?,
+        ironwood: node_sizes.2 - u32::try_from(added(|tx| tx.ironwood_note_commitments().count()))?,
+    };
+    let prepared = prepare_canonical_block(&source_block, &activations, RawBlobPolicy::All)?;
+    let block = position_canonical_block(prepared, &mut tree_sizes)?;
+    assert_transaction_bytes_match_parsed_source(&source_block, &block)?;
+    assert_compact_transaction_ids_match_canonical_facts(&block)?;
+
+    let expected_transactions = fixture
+        .get("transactions")
+        .and_then(Value::as_array)
+        .ok_or("fixture field transactions must be an array")?;
+    assert_eq!(block.facts.transactions.len(), expected_transactions.len());
+    for (transaction, expected) in block.facts.transactions.iter().zip(expected_transactions) {
+        let facts = &transaction.public_facts;
+        assert_eq!(
+            encode_rpc_transaction_id_hex(facts.transaction_id),
+            string_field(expected, "txid")?
+        );
+        assert_eq!(
+            facts.auth_digest.map(encode_rpc_auth_digest_hex).as_deref(),
+            Some(string_field(expected, "authdigest")?)
+        );
+        assert_eq!(facts.version, zinder_core::TransactionVersion::V6);
+        assert_eq!(
+            facts.consensus_branch_id,
+            Some(ConsensusBranchId::new(0x7719_0ad9))
+        );
+    }
+
+    let metadata = block.compact_block.chain_metadata();
+    assert_eq!(
+        (
+            metadata.sapling_commitment_tree_size,
+            metadata.orchard_commitment_tree_size,
+            metadata.ironwood_commitment_tree_size,
+        ),
+        node_sizes,
+        "compact metadata must match the node's tree sizes after the block"
+    );
+    let coinbase = block
+        .compact_block
+        .transactions()
+        .iter()
+        .find(|transaction| transaction.index == 0)
+        .ok_or("compact block must carry the shielded coinbase")?;
+    assert_eq!(coinbase.data.ironwood_actions.len(), 1);
+    assert!(coinbase.data.orchard_actions.is_empty());
     Ok(())
 }
 
