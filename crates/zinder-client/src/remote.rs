@@ -1086,11 +1086,11 @@ impl EndpointBackedIndex for RemoteChainIndex {
             .map_err(|status| self.map_status(status))?;
         let expected_network = self.network;
         let recovery = self.clone();
-        let mut stream_state = ChainEventStreamState::default();
+        let mut progression = EventStreamProgression::new(CHAIN_EVENT_STREAM_LABELS);
         let stream = response.into_inner().map(move |event_result| {
             let event = event_result.map_err(|status| recovery.map_status(status))?;
             let envelope = chain_event_envelope_from_message(expected_network, event)?;
-            stream_state.validate(&envelope)?;
+            progression.validate(envelope.event_sequence, envelope.cursor.as_bytes())?;
             Ok(envelope)
         });
 
@@ -1132,9 +1132,12 @@ impl EndpointBackedIndex for RemoteChainIndex {
             .map_err(|status| self.map_status(status))?;
         let expected_network = self.network;
         let recovery = self.clone();
+        let mut progression = EventStreamProgression::new(MEMPOOL_EVENT_STREAM_LABELS);
         let stream = response.into_inner().map(move |event_result| {
             let envelope_message = event_result.map_err(|status| recovery.map_status(status))?;
-            mempool_event_envelope_from_message(expected_network, envelope_message)
+            let envelope = mempool_event_envelope_from_message(expected_network, envelope_message)?;
+            progression.validate(envelope.event_sequence, envelope.cursor.as_bytes())?;
+            Ok(envelope)
         });
         Ok(Box::pin(stream))
     }
@@ -2191,10 +2194,35 @@ fn validate_reorg_relationship(
 // the retention cost explicit and bounded. Reaching either limit fails the
 // stream before accepting another event; callers can reconnect from the last
 // accepted cursor to start with fresh validation state.
-const CHAIN_EVENT_CURSOR_COUNT_LIMIT: usize = 65_536;
-const CHAIN_EVENT_CURSOR_BYTES_LIMIT: usize = 8 * 1024 * 1024;
+const EVENT_STREAM_CURSOR_COUNT_LIMIT: usize = 65_536;
+const EVENT_STREAM_CURSOR_BYTES_LIMIT: usize = 8 * 1024 * 1024;
 
-struct ChainEventStreamState {
+/// Names a resumable event stream in progression errors.
+#[derive(Clone, Copy)]
+struct EventStreamLabels {
+    description: &'static str,
+    sequence_field: &'static str,
+    cursor_field: &'static str,
+}
+
+const CHAIN_EVENT_STREAM_LABELS: EventStreamLabels = EventStreamLabels {
+    description: "chain event",
+    sequence_field: "event_sequence",
+    cursor_field: "cursor",
+};
+
+const MEMPOOL_EVENT_STREAM_LABELS: EventStreamLabels = EventStreamLabels {
+    description: "mempool event",
+    sequence_field: "mempool_event_envelope.event_sequence",
+    cursor_field: "mempool_event_envelope.cursor",
+};
+
+/// Per-stream progression state shared by every resumable event stream.
+///
+/// Sequences may skip values but never repeat or decrease, and a cursor may
+/// not be delivered twice. A rejected event leaves the state unchanged.
+struct EventStreamProgression {
+    labels: EventStreamLabels,
     previous_sequence: Option<u64>,
     seen_cursors: HashSet<Vec<u8>>,
     retained_cursor_bytes: usize,
@@ -2202,56 +2230,62 @@ struct ChainEventStreamState {
     cursor_bytes_limit: usize,
 }
 
-impl Default for ChainEventStreamState {
-    fn default() -> Self {
+impl EventStreamProgression {
+    fn new(labels: EventStreamLabels) -> Self {
         Self {
+            labels,
             previous_sequence: None,
             seen_cursors: HashSet::new(),
             retained_cursor_bytes: 0,
-            cursor_count_limit: CHAIN_EVENT_CURSOR_COUNT_LIMIT,
-            cursor_bytes_limit: CHAIN_EVENT_CURSOR_BYTES_LIMIT,
+            cursor_count_limit: EVENT_STREAM_CURSOR_COUNT_LIMIT,
+            cursor_bytes_limit: EVENT_STREAM_CURSOR_BYTES_LIMIT,
         }
     }
-}
 
-impl ChainEventStreamState {
-    fn validate(&mut self, envelope: &ChainEventEnvelope) -> Result<(), IndexerError> {
+    fn validate(&mut self, event_sequence: u64, cursor: &[u8]) -> Result<(), IndexerError> {
+        let labels = self.labels;
         if self
             .previous_sequence
-            .is_some_and(|previous| envelope.event_sequence <= previous)
+            .is_some_and(|previous| event_sequence <= previous)
         {
             return Err(IndexerError::malformed(
-                "event_sequence",
-                "chain event stream sequence must increase monotonically",
+                labels.sequence_field,
+                format!(
+                    "{} stream sequence must increase monotonically",
+                    labels.description
+                ),
             ));
         }
-        let cursor = envelope.cursor.as_bytes();
         if self.seen_cursors.contains(cursor) {
             return Err(IndexerError::malformed(
-                "cursor",
-                "chain event stream repeated a previously delivered cursor",
+                labels.cursor_field,
+                format!(
+                    "{} stream repeated a previously delivered cursor",
+                    labels.description
+                ),
             ));
         }
 
+        let retention_exhausted = || {
+            IndexerError::malformed(
+                labels.cursor_field,
+                format!(
+                    "{} cursor retention capacity is exhausted; reconnect from the last accepted cursor",
+                    labels.description
+                ),
+            )
+        };
         let retained_cursor_bytes = self
             .retained_cursor_bytes
             .checked_add(cursor.len())
-            .ok_or_else(|| {
-                IndexerError::malformed(
-                    "cursor",
-                    "chain event cursor retention capacity is exhausted; reconnect from the last accepted cursor",
-                )
-            })?;
+            .ok_or_else(retention_exhausted)?;
         if self.seen_cursors.len() >= self.cursor_count_limit
             || retained_cursor_bytes > self.cursor_bytes_limit
         {
-            return Err(IndexerError::malformed(
-                "cursor",
-                "chain event cursor retention capacity is exhausted; reconnect from the last accepted cursor",
-            ));
+            return Err(retention_exhausted());
         }
 
-        self.previous_sequence = Some(envelope.event_sequence);
+        self.previous_sequence = Some(event_sequence);
         self.seen_cursors.insert(cursor.to_vec());
         self.retained_cursor_bytes = retained_cursor_bytes;
         Ok(())
@@ -2718,6 +2752,18 @@ fn mempool_event_envelope_from_message(
     expected_network: Network,
     message: wallet::MempoolEventEnvelope,
 ) -> Result<MempoolEventEnvelope, IndexerError> {
+    if message.cursor.is_empty() {
+        return Err(IndexerError::malformed(
+            "mempool_event_envelope.cursor",
+            "field is empty",
+        ));
+    }
+    if message.event_sequence == 0 {
+        return Err(IndexerError::malformed(
+            "mempool_event_envelope.event_sequence",
+            "sequence must be greater than zero",
+        ));
+    }
     let event = match message.event.ok_or_else(|| {
         IndexerError::malformed("mempool_event_envelope.event", "field is missing")
     })? {
@@ -2956,9 +3002,17 @@ mod tests {
     }
 
     fn mempool_added_event_message(entry_network: Network) -> wallet::MempoolEventEnvelope {
+        mempool_added_event_message_at(entry_network, 1, vec![1])
+    }
+
+    fn mempool_added_event_message_at(
+        entry_network: Network,
+        sequence: u64,
+        cursor: Vec<u8>,
+    ) -> wallet::MempoolEventEnvelope {
         wallet::MempoolEventEnvelope {
-            cursor: Vec::new(),
-            event_sequence: 1,
+            cursor,
+            event_sequence: sequence,
             source_observed_unix_millis: 1_774_670_400_000,
             event: Some(wallet::mempool_event_envelope::Event::Added(
                 wallet::MempoolAddedEvent {
@@ -3337,13 +3391,16 @@ mod tests {
             EXPECTED_NETWORK,
             committed_event_message(4, vec![4]),
         )?;
-        let mut state = ChainEventStreamState::default();
+        let mut state = EventStreamProgression::new(CHAIN_EVENT_STREAM_LABELS);
+        let mut validate = |envelope: &ChainEventEnvelope| {
+            state.validate(envelope.event_sequence, envelope.cursor.as_bytes())
+        };
 
-        assert!(state.validate(&first).is_ok());
-        assert!(state.validate(&gap).is_ok());
-        assert!(state.validate(&duplicate_sequence).is_err());
-        assert!(state.validate(&nonadjacent_repeated_cursor).is_err());
-        assert!(state.validate(&event_after_rejections).is_ok());
+        assert!(validate(&first).is_ok());
+        assert!(validate(&gap).is_ok());
+        assert!(validate(&duplicate_sequence).is_err());
+        assert!(validate(&nonadjacent_repeated_cursor).is_err());
+        assert!(validate(&event_after_rejections).is_ok());
         Ok(())
     }
 
@@ -3358,15 +3415,22 @@ mod tests {
             EXPECTED_NETWORK,
             committed_event_message(2, vec![2]),
         )?;
-        let mut state = ChainEventStreamState {
+        let mut state = EventStreamProgression {
             cursor_count_limit: 1,
             cursor_bytes_limit: usize::MAX,
-            ..ChainEventStreamState::default()
+            ..EventStreamProgression::new(CHAIN_EVENT_STREAM_LABELS)
         };
 
-        assert!(state.validate(&first).is_ok());
+        assert!(
+            state
+                .validate(first.event_sequence, first.cursor.as_bytes())
+                .is_ok()
+        );
         assert!(matches!(
-            state.validate(&over_capacity),
+            state.validate(
+                over_capacity.event_sequence,
+                over_capacity.cursor.as_bytes()
+            ),
             Err(IndexerError::MalformedResponse {
                 field: "cursor",
                 ..
@@ -3837,6 +3901,143 @@ mod tests {
                 ..
             }) if entry.first_seen_chain_epoch().network == EXPECTED_NETWORK
         ));
+    }
+
+    fn decoded_mempool_event(
+        sequence: u64,
+        cursor: &[u8],
+    ) -> Result<MempoolEventEnvelope, IndexerError> {
+        mempool_event_envelope_from_message(
+            EXPECTED_NETWORK,
+            mempool_added_event_message_at(EXPECTED_NETWORK, sequence, cursor.to_vec()),
+        )
+    }
+
+    fn validate_mempool_progression(
+        progression: &mut EventStreamProgression,
+        envelope: &MempoolEventEnvelope,
+    ) -> Result<(), IndexerError> {
+        progression.validate(envelope.event_sequence, envelope.cursor.as_bytes())
+    }
+
+    #[test]
+    fn mempool_event_decoder_requires_a_cursor_and_a_positive_sequence() {
+        let empty_cursor = mempool_event_envelope_from_message(
+            EXPECTED_NETWORK,
+            mempool_added_event_message_at(EXPECTED_NETWORK, 1, Vec::new()),
+        );
+        let zero_sequence = mempool_event_envelope_from_message(
+            EXPECTED_NETWORK,
+            mempool_added_event_message_at(EXPECTED_NETWORK, 0, vec![1]),
+        );
+
+        assert!(matches!(
+            empty_cursor,
+            Err(IndexerError::MalformedResponse {
+                field: "mempool_event_envelope.cursor",
+                ..
+            })
+        ));
+        assert!(matches!(
+            zero_sequence,
+            Err(IndexerError::MalformedResponse {
+                field: "mempool_event_envelope.event_sequence",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn mempool_event_stream_accepts_increasing_sequences_with_gaps() -> Result<(), IndexerError> {
+        let mut progression = EventStreamProgression::new(MEMPOOL_EVENT_STREAM_LABELS);
+
+        for (sequence, cursor) in [(1, [1]), (2, [2]), (7, [3])] {
+            let envelope = decoded_mempool_event(sequence, &cursor)?;
+            validate_mempool_progression(&mut progression, &envelope)?;
+        }
+
+        assert_eq!(progression.previous_sequence, Some(7));
+        Ok(())
+    }
+
+    #[test]
+    fn mempool_event_stream_rejects_repeated_and_decreasing_sequences() -> Result<(), IndexerError>
+    {
+        let mut progression = EventStreamProgression::new(MEMPOOL_EVENT_STREAM_LABELS);
+        validate_mempool_progression(&mut progression, &decoded_mempool_event(5, &[1])?)?;
+
+        for rejected_sequence in [5, 4] {
+            let outcome = validate_mempool_progression(
+                &mut progression,
+                &decoded_mempool_event(rejected_sequence, &[9])?,
+            );
+            assert!(matches!(
+                outcome,
+                Err(IndexerError::MalformedResponse {
+                    field: "mempool_event_envelope.event_sequence",
+                    ..
+                })
+            ));
+        }
+
+        validate_mempool_progression(&mut progression, &decoded_mempool_event(6, &[9])?)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mempool_event_stream_rejects_a_repeated_cursor_even_when_not_adjacent()
+    -> Result<(), IndexerError> {
+        let mut progression = EventStreamProgression::new(MEMPOOL_EVENT_STREAM_LABELS);
+        validate_mempool_progression(&mut progression, &decoded_mempool_event(1, &[1])?)?;
+        validate_mempool_progression(&mut progression, &decoded_mempool_event(2, &[2])?)?;
+
+        let outcome =
+            validate_mempool_progression(&mut progression, &decoded_mempool_event(3, &[1])?);
+
+        assert!(matches!(
+            outcome,
+            Err(IndexerError::MalformedResponse {
+                field: "mempool_event_envelope.cursor",
+                ..
+            })
+        ));
+        assert_eq!(progression.previous_sequence, Some(2));
+        validate_mempool_progression(&mut progression, &decoded_mempool_event(3, &[3])?)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mempool_event_stream_fails_closed_when_cursor_retention_is_exhausted()
+    -> Result<(), IndexerError> {
+        let mut count_limited = EventStreamProgression {
+            cursor_count_limit: 1,
+            ..EventStreamProgression::new(MEMPOOL_EVENT_STREAM_LABELS)
+        };
+        validate_mempool_progression(&mut count_limited, &decoded_mempool_event(1, &[1])?)?;
+        let over_count =
+            validate_mempool_progression(&mut count_limited, &decoded_mempool_event(2, &[2])?);
+
+        let mut bytes_limited = EventStreamProgression {
+            cursor_bytes_limit: 2,
+            ..EventStreamProgression::new(MEMPOOL_EVENT_STREAM_LABELS)
+        };
+        validate_mempool_progression(&mut bytes_limited, &decoded_mempool_event(1, &[1, 1])?)?;
+        let over_bytes =
+            validate_mempool_progression(&mut bytes_limited, &decoded_mempool_event(2, &[2])?);
+
+        for outcome in [over_count, over_bytes] {
+            assert!(matches!(
+                outcome,
+                Err(IndexerError::MalformedResponse {
+                    field: "mempool_event_envelope.cursor",
+                    ref reason,
+                }) if reason.contains("retention capacity is exhausted")
+            ));
+        }
+        assert_eq!(count_limited.previous_sequence, Some(1));
+        assert_eq!(count_limited.seen_cursors.len(), 1);
+        assert_eq!(bytes_limited.retained_cursor_bytes, 2);
+        Ok(())
     }
 
     #[tokio::test]

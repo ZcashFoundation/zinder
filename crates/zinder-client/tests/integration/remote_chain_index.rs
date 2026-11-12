@@ -5,6 +5,7 @@
 
 use std::{
     convert::Infallible,
+    marker::PhantomData,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -15,7 +16,7 @@ use eyre::eyre;
 use tokio::net::TcpListener;
 use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
 use tonic::{
-    Request, Response, Status,
+    Response, Status,
     body::Body as TonicBody,
     codegen::{Body, BoxFuture, Service, StdError, http},
     server::{NamedService, ServerStreamingService},
@@ -496,6 +497,97 @@ async fn remote_chain_event_stream_rejects_a_nonadjacent_repeated_cursor_from_th
     Ok(())
 }
 
+#[tokio::test]
+async fn remote_mempool_event_stream_accepts_increasing_sequences_from_the_wire() -> eyre::Result<()>
+{
+    let endpoint = spawn_malformed_mempool_event_service(vec![
+        mempool_invalidated_message(1, vec![1]),
+        mempool_invalidated_message(4, vec![2]),
+    ])
+    .await?;
+    let mut stream = open_mempool_event_stream(endpoint).await?;
+
+    assert!(matches!(stream.next().await, Some(Ok(event)) if event.event_sequence == 1));
+    assert!(matches!(stream.next().await, Some(Ok(event)) if event.event_sequence == 4));
+    assert!(stream.next().await.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_mempool_event_stream_rejects_repeated_and_decreasing_sequences_from_the_wire()
+-> eyre::Result<()> {
+    for rejected_sequence in [2, 1] {
+        let endpoint = spawn_malformed_mempool_event_service(vec![
+            mempool_invalidated_message(2, vec![1]),
+            mempool_invalidated_message(rejected_sequence, vec![2]),
+        ])
+        .await?;
+        let mut stream = open_mempool_event_stream(endpoint).await?;
+
+        assert!(matches!(stream.next().await, Some(Ok(_))));
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(IndexerError::MalformedResponse {
+                field: "mempool_event_envelope.event_sequence",
+                ..
+            }))
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_mempool_event_stream_rejects_a_nonadjacent_repeated_cursor_from_the_wire()
+-> eyre::Result<()> {
+    let endpoint = spawn_malformed_mempool_event_service(vec![
+        mempool_invalidated_message(1, vec![1]),
+        mempool_invalidated_message(2, vec![2]),
+        mempool_invalidated_message(3, vec![1]),
+    ])
+    .await?;
+    let mut stream = open_mempool_event_stream(endpoint).await?;
+
+    assert!(matches!(stream.next().await, Some(Ok(_))));
+    assert!(matches!(stream.next().await, Some(Ok(_))));
+    assert!(matches!(
+        stream.next().await,
+        Some(Err(IndexerError::MalformedResponse {
+            field: "mempool_event_envelope.cursor",
+            ..
+        }))
+    ));
+    Ok(())
+}
+
+async fn open_mempool_event_stream(
+    endpoint: String,
+) -> eyre::Result<zinder_client::MempoolEventStream> {
+    let client = RemoteChainIndex::connect(RemoteOpenOptions {
+        endpoint,
+        network: Network::ZcashRegtest,
+    })?;
+    Ok(client
+        .mempool_events(EventStreamStart::EarliestRetained)
+        .await?)
+}
+
+fn mempool_invalidated_message(
+    event_sequence: u64,
+    cursor: Vec<u8>,
+) -> wallet::MempoolEventEnvelope {
+    wallet::MempoolEventEnvelope {
+        cursor,
+        event_sequence,
+        source_observed_unix_millis: 1_774_670_400_000,
+        event: Some(wallet::mempool_event_envelope::Event::Invalidated(
+            wallet::MempoolInvalidatedEvent {
+                transaction_id: "11".repeat(32),
+                reason: wallet::MempoolEvictionReason::Expired as i32,
+            },
+        )),
+    }
+}
+
 fn chain_event_message(
     chain_epoch: zinder_client::ChainEpoch,
     event_sequence: u64,
@@ -522,19 +614,54 @@ fn chain_event_message(
     }
 }
 
-#[derive(Clone)]
-struct MalformedChainEventService {
-    events: Arc<Vec<wallet::ChainEventEnvelope>>,
+/// Replays a fixed list of events for one server-streaming method and answers
+/// every other method as unimplemented.
+struct MalformedEventService<Request, Event> {
+    method_path: &'static str,
+    events: Arc<Vec<Event>>,
+    request: PhantomData<fn() -> Request>,
 }
 
-impl NamedService for MalformedChainEventService {
+impl<Request, Event> Clone for MalformedEventService<Request, Event> {
+    fn clone(&self) -> Self {
+        Self {
+            method_path: self.method_path,
+            events: Arc::clone(&self.events),
+            request: PhantomData,
+        }
+    }
+}
+
+impl<Request, Event> NamedService for MalformedEventService<Request, Event> {
     const NAME: &'static str = "zinder.v1.wallet.WalletQuery";
 }
 
-impl<B> Service<http::Request<B>> for MalformedChainEventService
+struct ReplayEventsMethod<Event>(Arc<Vec<Event>>);
+
+impl<Req, Event> ServerStreamingService<Req> for ReplayEventsMethod<Event>
+where
+    Event: Clone + Send + Sync + 'static,
+{
+    type Response = Event;
+    type ResponseStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<Self::Response, Status>> + Send>>;
+    type Future = BoxFuture<Response<Self::ResponseStream>, Status>;
+
+    fn call(&mut self, _request: tonic::Request<Req>) -> Self::Future {
+        let events = Arc::clone(&self.0);
+        Box::pin(async move {
+            let stream = tokio_stream::iter(events.as_ref().clone().into_iter().map(Ok));
+            Ok(Response::new(Box::pin(stream) as Self::ResponseStream))
+        })
+    }
+}
+
+impl<B, Req, Event> Service<http::Request<B>> for MalformedEventService<Req, Event>
 where
     B: Body + Send + 'static,
     B::Error: Into<StdError> + Send + 'static,
+    Req: tonic_prost::prost::Message + Default + Send + 'static,
+    Event: tonic_prost::prost::Message + Clone + Send + Sync + 'static,
 {
     type Response = http::Response<TonicBody>;
     type Error = Infallible;
@@ -545,7 +672,7 @@ where
     }
 
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
-        if request.uri().path() != "/zinder.v1.wallet.WalletQuery/ChainEvents" {
+        if request.uri().path() != self.method_path {
             return Box::pin(async move {
                 let mut response = http::Response::new(TonicBody::default());
                 response.headers_mut().insert(
@@ -562,49 +689,58 @@ where
 
         let events = Arc::clone(&self.events);
         Box::pin(async move {
-            struct ChainEventsMethod(Arc<Vec<wallet::ChainEventEnvelope>>);
-
-            impl ServerStreamingService<wallet::ChainEventsRequest> for ChainEventsMethod {
-                type Response = wallet::ChainEventEnvelope;
-                type ResponseStream = Pin<
-                    Box<dyn tokio_stream::Stream<Item = Result<Self::Response, Status>> + Send>,
-                >;
-                type Future = BoxFuture<Response<Self::ResponseStream>, Status>;
-
-                fn call(&mut self, _request: Request<wallet::ChainEventsRequest>) -> Self::Future {
-                    let events = Arc::clone(&self.0);
-                    Box::pin(async move {
-                        let stream =
-                            tokio_stream::iter(events.as_ref().clone().into_iter().map(Ok));
-                        Ok(Response::new(Box::pin(stream) as Self::ResponseStream))
-                    })
-                }
-            }
-
-            let codec = tonic_prost::ProstCodec::default();
+            let codec = tonic_prost::ProstCodec::<Event, Req>::default();
             let mut grpc = tonic::server::Grpc::new(codec);
             Ok(grpc
-                .server_streaming(ChainEventsMethod(events), request)
+                .server_streaming(ReplayEventsMethod(events), request)
                 .await)
         })
     }
 }
 
-async fn spawn_malformed_chain_event_service(
-    events: Vec<wallet::ChainEventEnvelope>,
-) -> eyre::Result<String> {
+async fn spawn_malformed_event_service<Request, Event>(
+    method_path: &'static str,
+    events: Vec<Event>,
+) -> eyre::Result<String>
+where
+    Request: tonic_prost::prost::Message + Default + Send + 'static,
+    Event: tonic_prost::prost::Message + Clone + Send + Sync + 'static,
+{
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let incoming = TcpListenerStream::new(listener);
+    let service = MalformedEventService::<Request, Event> {
+        method_path,
+        events: Arc::new(events),
+        request: PhantomData,
+    };
     tokio::spawn(async move {
         let _server_result = Server::builder()
-            .add_service(MalformedChainEventService {
-                events: Arc::new(events),
-            })
+            .add_service(service)
             .serve_with_incoming(incoming)
             .await;
     });
     Ok(format!("http://{addr}"))
+}
+
+async fn spawn_malformed_chain_event_service(
+    events: Vec<wallet::ChainEventEnvelope>,
+) -> eyre::Result<String> {
+    spawn_malformed_event_service::<wallet::ChainEventsRequest, _>(
+        "/zinder.v1.wallet.WalletQuery/ChainEvents",
+        events,
+    )
+    .await
+}
+
+async fn spawn_malformed_mempool_event_service(
+    events: Vec<wallet::MempoolEventEnvelope>,
+) -> eyre::Result<String> {
+    spawn_malformed_event_service::<wallet::MempoolEventsRequest, _>(
+        "/zinder.v1.wallet.WalletQuery/MempoolEvents",
+        events,
+    )
+    .await
 }
 
 async fn spawn_gated_wallet_query<QueryApi>(
