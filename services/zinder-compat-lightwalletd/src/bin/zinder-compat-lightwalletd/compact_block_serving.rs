@@ -2768,6 +2768,71 @@ mod tests {
         }
     }
 
+    /// Pins every `LightdInfo` field and the `GetLatestBlock` hash order that
+    /// the identity contract in `docs/reference/lightwalletd-compatibility.md`
+    /// classifies as comparable, live-tip, or Zinder-specific.
+    #[tokio::test]
+    async fn identity_responses_follow_the_documented_contract()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let chain =
+            zinder_testkit::ChainFixture::new(zinder_core::Network::ZcashRegtest).extend_blocks(4);
+        let activations = Arc::new(zinder_testkit::sample_regtest_upgrade_activations());
+        let mut fixture =
+            zinder_testkit::WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
+        let (canonical, wallet) = fixture.take_readers()?;
+        drop(wallet);
+        let tip = canonical.event_fence().visible_tip();
+        let nu6_2_branch_id = activations
+            .activations()
+            .iter()
+            .find(|activation| activation.name == "NU6.2")
+            .map(|activation| zinder_core::wire::encode_branch_id_hex(activation.branch_id))
+            .ok_or("the sample table must include NU6.2")?;
+        let adapter = CompactBlockAdapter::new(
+            CompactBlockServingSlot::new(Arc::new(canonical)),
+            activations,
+        );
+
+        let info = adapter
+            .get_lightd_info(Request::new(lightwalletd::Empty::default()))
+            .await?
+            .into_inner();
+        let latest = adapter
+            .get_latest_block(Request::new(lightwalletd::ChainSpec::default()))
+            .await?
+            .into_inner();
+
+        let expected = lightwalletd::LightdInfo {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            vendor: "Zinder".to_owned(),
+            taddr_support: false,
+            chain_name: "test".to_owned(),
+            sapling_activation_height: 1,
+            consensus_branch_id: nu6_2_branch_id,
+            block_height: 4,
+            git_commit: zinder_runtime::BUILD_GIT_COMMIT.to_owned(),
+            branch: String::new(),
+            build_date: String::new(),
+            build_user: String::new(),
+            estimated_height: 4,
+            zcashd_build: String::new(),
+            zcashd_subversion: String::new(),
+            donation_address: String::new(),
+            upgrade_name: "NU6.3".to_owned(),
+            upgrade_height: 603,
+            lightwallet_protocol_version:
+                zinder_proto::compat::lightwalletd::LIGHTWALLETD_PROTOCOL_COMMIT.to_owned(),
+        };
+        assert_eq!(info, expected);
+        assert_eq!(latest.height, info.block_height);
+        assert_eq!(
+            latest.hash,
+            zinder_core::wire::encode_internal_block_hash(tip.hash).to_vec()
+        );
+        assert_eq!(latest.hash.len(), 32);
+        Ok(())
+    }
+
     #[tokio::test]
     #[allow(
         clippy::too_many_lines,

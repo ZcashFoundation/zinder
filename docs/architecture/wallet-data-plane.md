@@ -414,6 +414,10 @@ raw transaction bytes and therefore requires `transactions` or `all`. The flag
 is a product contract for lightwalletd clients, not a way to silence Android
 SDK logs.
 
+The remaining `GetLightdInfo` and `GetLatestBlock` fields, and which of them
+are comparable with another lightwalletd server, are defined in
+[Lightwalletd compatibility §Identity and live-tip responses](../reference/lightwalletd-compatibility.md#identity-and-live-tip-responses).
+
 The native `WalletQuery` proto exposes the same artifact-backed read through
 one server-streaming RPC, `TransparentAddressUnspentOutputs`, which streams
 `TransparentUnspentOutputsChunk` messages. The server walks the address-output

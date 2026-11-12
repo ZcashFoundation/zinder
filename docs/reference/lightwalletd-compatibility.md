@@ -59,6 +59,58 @@ startup, which reader admission requires to equal the store's construction
 table. See
 [ADR-0039](../adrs/0039-writer-admitted-network-upgrade-schedules.md).
 
+## Identity and live-tip responses
+
+`GetLightdInfo` and `GetLatestBlock` describe the serving process and its
+current tip. Their responses are snapshots, so comparing a whole message, or a
+digest of its bytes, across Zinder, lightwalletd, and any other server
+measures build metadata and tip timing, not chain data. A full-message digest
+of either method is not parity evidence. Compare only the fields named
+comparable below, at one agreed tip.
+
+Both serving modes return the same fields under the same rules. The only
+field that differs by mode is `taddrSupport`.
+
+### `GetLightdInfo`
+
+| Class | Fields | Rule |
+| --- | --- | --- |
+| Comparable with lightwalletd | `chainName`, `saplingActivationHeight`, `consensusBranchId`, `upgradeName`, `upgradeHeight` | Derived from the chain and the activation table, so two servers on the same node agree at the same tip. `chainName` is the BIP70 name (`main` or `test`; Regtest reports `test`). `consensusBranchId` is the lowercase hex branch active at the tip. `upgradeName` and `upgradeHeight` name the next pending upgrade, as described above. Compare them only after both servers report the same `blockHeight`, because an activation height moves them. |
+| Live tip | `blockHeight` | The served visible tip. Two servers agree only when they have both applied the same block, so a harness compares it with a tolerance of one block or compares the other fields only when the heights are equal. |
+| Zinder-specific | `version`, `vendor`, `gitCommit`, `branch`, `buildDate`, `buildUser`, `zcashdBuild`, `zcashdSubversion`, `donationAddress`, `estimatedHeight`, `lightwalletProtocolVersion`, `taddrSupport` | Identify or configure this process. Never compare them with another server. |
+
+The Zinder-specific values are fixed:
+
+- `vendor` is `Zinder`. `version` is the crate version and `gitCommit` is the
+  build commit, both from the shared build identity.
+- `branch`, `buildDate`, `buildUser`, `zcashdBuild`, `zcashdSubversion`, and
+  `donationAddress` are empty. Zinder is not zcashd, has no build-host
+  metadata, and has no donation configuration, so it leaves them unset rather
+  than impersonating another build.
+- `estimatedHeight` equals `blockHeight`. Zinder serves its own visible tip and
+  does not report the node's estimate, so it stays at the served tip while the
+  node syncs.
+- `lightwalletProtocolVersion` is the pinned `lightwallet-protocol` commit
+  vendored in `zinder-proto`. Compare it with that pin, not with another
+  server's value.
+- `taddrSupport` is `true` in wallet-serving mode, where construction admitted
+  transparent reads, and `false` in compact-blocks mode and in a generic
+  adapter built without the transparent constructor.
+
+### `GetLatestBlock`
+
+`GetLatestBlock` returns the visible tip as a `BlockID`: `height` is the tip
+height and `hash` is the 32-byte block hash in internal byte order, the same
+order as `CompactBlock.hash`. It is the reverse of the display hex that Zebra
+JSON-RPC returns.
+
+The pair is comparable with lightwalletd only at one height. When two servers
+report different heights, one is mid-commit and the hashes are expected to
+differ. A harness compares `hash` only when `height` is equal, or reads
+`GetBlock` at a height both servers serve and compares that block instead. The
+height itself is live-tip data and is not comparable beyond the one-block
+tolerance used for `blockHeight`.
+
 ## Runtime serving selection
 
 The compatibility binary selects its serving plane at runtime through the
@@ -80,7 +132,8 @@ Compact-block serving admits exactly `GetLightdInfo`, `GetLatestBlock`,
 methods, transparent-address methods, transaction submission, and ping.
 `GetLightdInfo` reports the admitted network and tip with
 `taddrSupport = false`; node discovery and liveness are still required for
-that identity response.
+that identity response. Its fields follow
+[Identity and live-tip responses](#identity-and-live-tip-responses).
 
 ## Block range transaction contents
 

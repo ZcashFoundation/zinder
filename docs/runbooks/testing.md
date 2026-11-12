@@ -490,7 +490,11 @@ ZINDER_TEST_LIVE=1 \
 
 Operator-divergent fields (build metadata, version strings, donation
 address) are intentionally allow-listed; the assertions focus on the wire
-shape both shims must agree on. The fixture-backed `ci-parity` profile
+shape both shims must agree on. Never hash or diff a whole `LightdInfo` or
+`BlockID` response as parity evidence: only the fields the
+[identity contract](../reference/lightwalletd-compatibility.md#identity-and-live-tip-responses)
+names as comparable are compared, and `GetLatestBlock` hashes only at equal
+heights. The fixture-backed `ci-parity` profile
 covers the same byte-shape contract without the running-binaries
 dependency and is the gate enforced on every CI run.
 
