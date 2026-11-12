@@ -9,7 +9,7 @@
 
 [Unit]
 Description=Zinder Zcash indexer (Compose topology)
-Documentation=https://github.com/gustavovalverde/zinder
+Documentation=https://github.com/ZcashFoundation/zinder
 Requires=docker.service
 After=docker.service network-online.target
 Wants=network-online.target

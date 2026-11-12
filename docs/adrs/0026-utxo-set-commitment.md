@@ -66,7 +66,7 @@ operator boolean that independently enabled
 composition or named consumer owned that switch. ADR-0038 removes the boolean.
 The serving-pair query does not implement the summary. Removal of the unowned
 protocol surface is tracked in
-[issue #63](https://github.com/gustavovalverde/zinder/issues/63). Retaining or
+[issue #63](https://github.com/ZcashFoundation/zinder/issues/63). Retaining or
 reintroducing the commitment requires a concrete production consumer,
 authenticated admission evidence, and an enforced resource budget; a manual
 support flag is not valid evidence.

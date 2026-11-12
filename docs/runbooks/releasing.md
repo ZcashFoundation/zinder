@@ -218,7 +218,7 @@ After all three `0.5.0-rc.1` versions resolve from crates.io, revoke the
 bootstrap token and configure the same GitHub trusted publisher in the
 crates.io settings for `zinder-core`, `zinder-proto`, and `zinder-client`:
 
-- owner: `gustavovalverde`
+- owner: `ZcashFoundation`
 - repository: `zinder`
 - workflow: `release.yml`
 - environment: `release`
@@ -247,28 +247,28 @@ Sigstore bundle support, then confirm the Release and each exact image before
 changing a deployment:
 
 ```console
-git switch --detach v0.5.0
-gh release view v0.5.0
-gh release verify v0.5.0
+git switch --detach v0.9.0
+gh release view v0.9.0
+gh release verify v0.9.0
 
-gh release download v0.5.0 \
-  --pattern 'zinder-0.5.0-*-unknown-linux-gnu.tar.gz' \
-  --pattern 'zinder-0.5.0-*-unknown-linux-gnu.spdx.json' \
+gh release download v0.9.0 \
+  --pattern 'zinder-0.9.0-*-unknown-linux-gnu.tar.gz' \
+  --pattern 'zinder-0.9.0-*-unknown-linux-gnu.spdx.json' \
   --pattern SHA256SUMS \
   --pattern SHA256SUMS.sigstore.json
 sha256sum --check SHA256SUMS
 cosign verify-blob \
   --bundle SHA256SUMS.sigstore.json \
   --certificate-identity \
-    'https://github.com/gustavovalverde/zinder/.github/workflows/release.yml@refs/tags/v0.5.0' \
+    'https://github.com/ZcashFoundation/zinder/.github/workflows/release.yml@refs/tags/v0.9.0' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
 
 for package_name in zinder-core zinder-proto zinder-client; do
-  cargo info "${package_name}@0.5.0"
+  cargo info "${package_name}@0.9.0"
 done
 
-scripts/verify-published-sdk.sh 0.5.0
+scripts/verify-published-sdk.sh 0.9.0
 
 for image in \
   zinder-ingest \
@@ -279,15 +279,23 @@ for image in \
   zinder-wallet-serving
 do
   docker buildx imagetools inspect \
-    "ghcr.io/gustavovalverde/${image}:v0.5.0"
+    "ghcr.io/zcashfoundation/${image}:v0.9.0"
 done
 ```
+
+The `v0.9.0` example loops over the 6 runtime images. Releases before
+`v0.9.0-rc.1` publish only the first 4; drop `zinder-canonical-runtime` and
+`zinder-wallet-serving` from the loop when verifying one of those releases.
 
 The first release that publishes a new image name creates its GHCR package as
 private. An organization admin must set the package visibility to public once.
 After `docker logout ghcr.io`, an anonymous
-`docker pull ghcr.io/gustavovalverde/zinder-wallet-serving:v0.5.0` of the exact
-tag confirms it.
+`docker pull ghcr.io/zcashfoundation/zinder-wallet-serving:vX.Y.Z` of the exact
+release tag that first published the image confirms it.
+
+Releases before `v0.8.0` were published from `gustavovalverde/zinder`. To
+verify one of them, use that repository in the Cosign certificate identity
+and the `ghcr.io/gustavovalverde/` image namespace.
 
 The GitHub Release must contain `zinder.v1.descriptor.bin`, the versioned
 `zinder-api-docs` archive, both versioned GNU/Linux binary archives, their 2

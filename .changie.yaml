@@ -6,7 +6,7 @@ changelogPath: CHANGELOG.md
 versionExt: md
 versionFormat: '## [{{.VersionNoPrefix}}] - {{.Time.Format "2006-01-02"}}'
 kindFormat: '### {{.Kind}}'
-changeFormat: '- {{.Body}} ([#{{.Custom.PR}}](https://github.com/gustavovalverde/zinder/pull/{{.Custom.PR}}))'
+changeFormat: '- {{.Body}} ([#{{.Custom.PR}}](https://github.com/ZcashFoundation/zinder/pull/{{.Custom.PR}}))'
 fragmentFileFormat: '{{.Kind}}-{{.Custom.PR}}'
 kinds:
   - label: Added
