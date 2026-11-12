@@ -163,6 +163,62 @@ async fn lightwalletd_adapter_serves_read_sync_methods() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Pins every `LightdInfo` field and the `GetLatestBlock` hash order that the
+/// identity contract in `docs/reference/lightwalletd-compatibility.md`
+/// classifies as comparable, live-tip, or Zinder-specific.
+#[tokio::test]
+async fn lightd_info_and_latest_block_follow_the_identity_contract() -> eyre::Result<()> {
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let tip = chain
+        .block_at(ACCEPTANCE_BLOCK_HEIGHT)
+        .ok_or_else(|| eyre!("identity fixture must include the height 1 block"))?;
+    let store_fixture = acceptance_store_from_chain(&chain)?;
+    let adapter = acceptance_adapter(&store_fixture);
+
+    let lightd_info = adapter
+        .get_lightd_info(Request::new(lightwalletd::Empty {}))
+        .await?
+        .into_inner();
+    let latest_block = adapter
+        .get_latest_block(Request::new(lightwalletd::ChainSpec {}))
+        .await?
+        .into_inner();
+
+    // Regtest collapses to "test" per BIP70. Canopy is the branch active at
+    // height 1 in the sample table, and NU5 at height 2 is the next pending
+    // upgrade.
+    let expected = lightwalletd::LightdInfo {
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        vendor: "Zinder".to_owned(),
+        taddr_support: false,
+        chain_name: "test".to_owned(),
+        sapling_activation_height: 1,
+        consensus_branch_id: "e9ff75a6".to_owned(),
+        block_height: 1,
+        git_commit: zinder_runtime::BUILD_GIT_COMMIT.to_owned(),
+        branch: String::new(),
+        build_date: String::new(),
+        build_user: String::new(),
+        estimated_height: 1,
+        zcashd_build: String::new(),
+        zcashd_subversion: String::new(),
+        donation_address: String::new(),
+        upgrade_name: "NU5".to_owned(),
+        upgrade_height: 2,
+        lightwallet_protocol_version: lightwalletd::LIGHTWALLETD_PROTOCOL_COMMIT.to_owned(),
+    };
+    assert_eq!(lightd_info, expected);
+
+    assert_eq!(latest_block.height, lightd_info.block_height);
+    assert_eq!(
+        latest_block.hash,
+        encode_internal_block_hash(tip.hash).to_vec()
+    );
+    assert_eq!(latest_block.hash.len(), 32);
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn get_block_returns_lightwalletd_error_codes_for_invalid_selectors() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture()?;

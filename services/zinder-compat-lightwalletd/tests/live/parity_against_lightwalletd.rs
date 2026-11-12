@@ -13,7 +13,10 @@
 //!   endpoint pointed at the same Zebra, e.g. `http://127.0.0.1:9088`.
 //!
 //! Operator-divergent fields (build metadata, version strings, donation
-//! address) are explicitly allow-listed so the parity assertion focuses on
+//! address) are explicitly allow-listed, and `GetLightdInfo` and
+//! `GetLatestBlock` are compared field by field under the identity contract
+//! in `docs/reference/lightwalletd-compatibility.md`, never as whole
+//! messages or digests, so the parity assertion focuses on
 //! the wire shape both shims must agree on: `chainName`, `consensusBranchId`,
 //! `saplingActivationHeight`, the next pending `upgradeName` and
 //! `upgradeHeight`, latest block height and hash, single-block identity,
@@ -83,18 +86,32 @@ async fn lightd_info_advertises_matching_chain_metadata() -> Result<()> {
         zinder_info.sapling_activation_height, reference_info.sapling_activation_height,
         "saplingActivationHeight must agree",
     );
-    assert_eq!(
-        zinder_info.consensus_branch_id, reference_info.consensus_branch_id,
-        "consensusBranchId must agree",
+    // `blockHeight` is live-tip data: tolerate one block of drift, and compare
+    // the tip-dependent upgrade fields only when both servers report the same
+    // tip, because an activation height moves them.
+    assert!(
+        zinder_info
+            .block_height
+            .abs_diff(reference_info.block_height)
+            <= 1,
+        "blockHeight drifted: zinder={} reference={}",
+        zinder_info.block_height,
+        reference_info.block_height,
     );
-    assert_eq!(
-        zinder_info.upgrade_name, reference_info.upgrade_name,
-        "upgradeName must name the same next pending upgrade",
-    );
-    assert_eq!(
-        zinder_info.upgrade_height, reference_info.upgrade_height,
-        "upgradeHeight must name the same next pending activation height",
-    );
+    if zinder_info.block_height == reference_info.block_height {
+        assert_eq!(
+            zinder_info.consensus_branch_id, reference_info.consensus_branch_id,
+            "consensusBranchId must agree",
+        );
+        assert_eq!(
+            zinder_info.upgrade_name, reference_info.upgrade_name,
+            "upgradeName must name the same next pending upgrade",
+        );
+        assert_eq!(
+            zinder_info.upgrade_height, reference_info.upgrade_height,
+            "upgradeHeight must name the same next pending activation height",
+        );
+    }
     assert!(
         zinder_info.taddr_support,
         "Zinder must advertise transparent-address support",
@@ -116,8 +133,10 @@ async fn latest_block_matches_reference() -> Result<()> {
     let zinder_block = zinder.get_latest_block(ChainSpec {}).await?.into_inner();
     let reference_block = reference.get_latest_block(ChainSpec {}).await?.into_inner();
 
-    // Heights may differ by one when ingest is mid-commit; require within a
-    // tight tolerance and assert hashes only when heights agree exactly.
+    // `GetLatestBlock` is a live-tip snapshot (identity contract in
+    // docs/reference/lightwalletd-compatibility.md). Heights may differ by
+    // one when ingest is mid-commit; require within a tight tolerance and
+    // assert hashes only when heights agree exactly.
     let height_difference = zinder_block.height.abs_diff(reference_block.height);
     assert!(
         height_difference <= 1,
