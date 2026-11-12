@@ -217,4 +217,4 @@ jobs:
         # names unless the behavior itself is network-specific.
         run: |
           cargo nextest run --workspace --profile=ci-live --run-ignored=all \
-            -E 'test(mainnet) or test(backfills_last_1000_blocks_from_checkpoint) or test(canonical_blocks_load_requested_range_from_fixed_checkpoint)'
+            -E 'test(mainnet) or test(backfills_last_1000_blocks_from_checkpoint) or test(canonical_blocks_load_requested_range_from_fixed_checkpoint) or test(upgrade_activations_keep_advertised_order)'
