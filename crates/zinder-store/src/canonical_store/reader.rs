@@ -174,6 +174,22 @@ macro_rules! impl_canonical_typed_reads {
                 read_transaction_location(self, transaction_id)
             }
 
+            /// Reads the canonical location of one transaction, answering
+            /// `None` only for a proven absence.
+            ///
+            /// `Ok(None)` means the transaction is absent from this store's
+            /// canonical chain from height 1 through the visible tip. A store
+            /// whose retained history starts after a checkpoint answers a miss
+            /// with [`CanonicalStoreError::CanonicalHistoryUnavailable`]
+            /// instead, because the transaction may be mined at a height the
+            /// store never retained.
+            pub fn transaction_location_or_proven_absence(
+                &self,
+                transaction_id: TransactionId,
+            ) -> Result<Option<TransactionLocation>, CanonicalStoreError> {
+                read_transaction_location_or_proven_absence(self, transaction_id)
+            }
+
             /// Reads one retained raw transaction at its authenticated location.
             pub fn transaction_blob(
                 &self,
@@ -417,6 +433,23 @@ fn read_transaction_location(
     )?
     .map(|encoded| decode_transaction_location(transaction_id, &encoded))
     .transpose()
+}
+
+fn read_transaction_location_or_proven_absence(
+    store: &impl CanonicalServingRead,
+    transaction_id: TransactionId,
+) -> Result<Option<TransactionLocation>, CanonicalStoreError> {
+    let location = read_transaction_location(store, transaction_id)?;
+    // Canonical history starts at height 1 because the genesis block is never
+    // indexed, so only a store that retains height 1 can turn a miss into an
+    // absence. The genesis coinbase is therefore reported absent.
+    let history_bounds = store.serving_build_plan().history_bounds();
+    if location.is_none() && history_bounds.intentionally_excludes(BlockHeight::new(1)) {
+        return Err(CanonicalStoreError::CanonicalHistoryUnavailable {
+            first_available_height: history_bounds.first_available_height(),
+        });
+    }
+    Ok(location)
 }
 
 fn read_transaction_blob(

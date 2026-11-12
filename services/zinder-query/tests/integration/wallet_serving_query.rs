@@ -285,6 +285,14 @@ impl CanonicalReader for GatedCanonicalReader {
         self.canonical_reader.transaction_location(transaction_id)
     }
 
+    fn transaction_location_or_proven_absence(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<TransactionLocation>, CanonicalStoreError> {
+        self.canonical_reader
+            .transaction_location_or_proven_absence(transaction_id)
+    }
+
     fn transaction_blob(
         &self,
         location: TransactionLocation,

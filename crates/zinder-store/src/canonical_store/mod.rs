@@ -751,6 +751,17 @@ pub enum CanonicalStoreError {
         subtree_index: zinder_core::SubtreeRootIndex,
     },
 
+    /// A transaction lookup missed in a store whose retained history starts
+    /// after a checkpoint, so the miss is not a proven absence.
+    #[error(
+        "canonical history starts at height {}; a transaction miss is not a proven absence",
+        .first_available_height.value()
+    )]
+    CanonicalHistoryUnavailable {
+        /// First height this store retains.
+        first_available_height: BlockHeight,
+    },
+
     /// A fresh canonical build is incomplete or changed during cold validation.
     #[error("canonical publication refused: {reason}")]
     PublicationRefused {

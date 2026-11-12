@@ -88,6 +88,8 @@ define_error_reasons! {
     DependencyNotConfigured => "DEPENDENCY_NOT_CONFIGURED",
     UpstreamUnreachable => "UPSTREAM_UNREACHABLE",
     ServiceNotReady => "SERVICE_NOT_READY",
+    TransactionNotFound => "TRANSACTION_NOT_FOUND",
+    CanonicalHistoryUnavailable => "CANONICAL_HISTORY_UNAVAILABLE",
 }
 
 #[cfg(all(test, feature = "remote"))]
@@ -147,6 +149,8 @@ mod tests {
             WireErrorReason::DependencyNotConfigured,
             WireErrorReason::UpstreamUnreachable,
             WireErrorReason::ServiceNotReady,
+            WireErrorReason::TransactionNotFound,
+            WireErrorReason::CanonicalHistoryUnavailable,
         ];
 
         for generated in generated_reasons {

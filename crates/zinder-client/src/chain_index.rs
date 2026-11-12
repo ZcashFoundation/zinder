@@ -540,6 +540,11 @@ impl<'a, I: ChainIndex + ?Sized> ChainSnapshot<'a, I> {
     }
 
     /// Looks up a canonical transaction without consulting live mempool state.
+    ///
+    /// [`TxStatus::NotFound`] means the transaction is absent from the
+    /// captured epoch's canonical chain, from height 1 through its visible
+    /// tip. See [`ChainIndex::transaction_by_id`] for the errors that are
+    /// never reported as an absence.
     pub async fn transaction_by_id(
         &self,
         transaction_id: TransactionId,
@@ -1114,9 +1119,43 @@ pub trait ChainIndex: Send + Sync + 'static {
 
     /// Looks up a transaction by id.
     ///
-    /// `None` for `at_epoch_id` consults the live mempool when the canonical
-    /// chain has no record. `Some(id)` pins the read to that epoch and
-    /// never consults mempool state.
+    /// `Some(id)` pins the read to that epoch's canonical chain and never
+    /// consults mempool state. `None` reads the visible epoch's canonical
+    /// chain and, on a miss, the writer's live mempool at that same epoch.
+    ///
+    /// [`TxStatus::NotFound`] is a proven absence: the server searched the
+    /// canonical chain of the answering epoch from height 1 through its
+    /// visible tip (and, without a pin, the live mempool at that epoch) and
+    /// found nothing. A pinned absence is checked against the pin. Every
+    /// other outcome is an error, never `NotFound`:
+    ///
+    /// - [`IndexerError::CanonicalHistoryUnavailable`]: the indexer's history
+    ///   starts after a checkpoint, so it cannot prove an absence. Without a
+    ///   pin, the indexer still reports a pending transaction as
+    ///   [`TxStatus::InMempool`] and returns this error only when the mempool
+    ///   missed too.
+    /// - [`IndexerError::TransactionAbsenceUnverified`]: the server predates
+    ///   the typed absence signal and its `NOT_FOUND` is ambiguous.
+    /// - [`IndexerError::ChainEpochPinUnavailable`]: the pinned epoch is not
+    ///   served or, without a pin, the writer's mempool view has not yet caught
+    ///   up with the writer's chain epoch. Retry the lookup.
+    /// - Storage, missing-epoch, and dependency failures keep their own typed
+    ///   variants, including [`IndexerError::ArtifactUnavailable`],
+    ///   [`IndexerError::NotFound`] for a block outside the best chain, and
+    ///   [`IndexerError::RemoteFailure`].
+    ///
+    /// `TxStatus::NotFound` carries no epoch. After an unpinned lookup the
+    /// caller cannot tell which epoch, and so which heights, the absence
+    /// covers, and the mempool half of an unpinned absence is best effort
+    /// around reorgs and block boundaries: it can report a miss for a
+    /// transaction that is still pending or was just mined. A decision that
+    /// depends on the transaction never being mined, such as releasing a
+    /// payment, must therefore use a pinned lookup, which never consults the
+    /// mempool: take a
+    /// [`ChainSnapshot`](crate::ChainSnapshot) whose epoch's visible tip
+    /// covers the height being judged and look the transaction up through it.
+    /// A pinned lookup never reports [`TxStatus::InMempool`]; make an
+    /// unpinned lookup as well when the pending state matters.
     ///
     /// # Examples
     ///
@@ -1503,6 +1542,14 @@ pub trait EndpointBackedIndex: ChainIndex {
 
     /// Returns whether `transaction_id` is currently visible in the live
     /// mempool index.
+    ///
+    /// The remote client answers this with an unpinned
+    /// [`ChainIndex::transaction_by_id`], so a lookup that cannot prove the
+    /// transaction absent fails with that method's errors instead of
+    /// returning `false`. On an indexer whose history starts after a
+    /// checkpoint, a pending transaction still returns `true`, and any other
+    /// transaction that is not mined above the history floor fails with
+    /// [`IndexerError::CanonicalHistoryUnavailable`].
     ///
     /// # Examples
     ///

@@ -208,7 +208,8 @@ Native transaction lookup returns typed transaction status. The public Rust shap
 `WalletQuery.Transaction(TransactionRequest) returns (TransactionStatusResponse)`
 under capability `wallet.read.transaction_by_id_v2`. The response carries the
 shared `TransactionLocation` oneof on its `location` field; the oneof has two
-arms. `NotFound` is gRPC `NOT_FOUND`, not an oneof slot, because typed errors do not consume oneof variants:
+arms. `NotFound` is not an oneof slot; it is gRPC `NOT_FOUND` with reason
+`TRANSACTION_NOT_FOUND`, described under [Transaction absence](#transaction-absence):
 
 - `mined`: `MinedTransaction { MinedBlockLocation location; MinedTransactionChainContext chain_context; bytes raw_transaction_bytes }`.
 - `in_mempool`: `MempoolEntry { string transaction_id; string auth_digest; bytes raw_transaction_bytes; CompactTransactionData compact_transaction_data; uint64 first_seen_unix_millis; ChainEpoch first_seen_chain_epoch; repeated TransparentMempoolOutput transparent_outputs; repeated TransparentMempoolSpend transparent_spends }`.
@@ -264,8 +265,59 @@ response construction.
 
 The epoch rule is stricter for mempool. An `at_epoch_id` transaction lookup is a
 canonical chain read and never consults live mempool state. A non-epoch-pinned
-lookup may fall through to the writer-owned mempool index after the canonical
-chain returns `NotFound`.
+lookup falls through to the writer-owned mempool index after the canonical
+chain misses.
+
+### Transaction absence
+
+A transaction absence is an answer, not a failure, and it is reported only when
+it is proven ([ADR-0042](../adrs/0042-proven-transaction-absence.md)). The
+server returns gRPC `NOT_FOUND` with reason `TRANSACTION_NOT_FOUND` when:
+
+- the canonical chain of the answering epoch has no record of the transaction,
+  searched from height 1 through the epoch's visible tip; and
+- the store retains complete canonical history; and
+- for a lookup without `at_epoch_id`, the writer's live mempool, at the same
+  epoch id, has no record either.
+
+The writer's mempool view answers for exactly one source tip. Only a `Mined`
+change for the tip block removes an entry; a `Mined` change for any other block
+ends the mempool generation, so point reads fail with `UNAVAILABLE` until the
+next generation is certified. The mempool half of an unpinned absence is still
+best effort around reorgs and block boundaries
+([ADR-0042](../adrs/0042-proven-transaction-absence.md)); the canonical half is
+exact.
+
+`ErrorInfo.metadata` carries `chain_epoch_id`, `first_covered_height` (always
+`1`), `visible_tip_height`, and `covers_mempool`. A caller learns the covered
+range from the absence itself; a store that cannot cover height 1 never issues
+one. Zinder never indexes the genesis block at height 0, so its coinbase is
+reported absent like any unknown id.
+
+A store whose history starts after a checkpoint cannot prove an absence, but a
+pending transaction needs no such proof. An unpinned lookup on that store still
+consults the writer's live mempool and reports a hit as `in_mempool`; only a
+mempool miss becomes `CANONICAL_HISTORY_UNAVAILABLE`. A pinned lookup never
+consults the mempool, so every pinned miss on that store is
+`CANONICAL_HISTORY_UNAVAILABLE`.
+
+Every other outcome is an error:
+
+| Condition | Status and reason |
+| --- | --- |
+| Store history starts after a checkpoint; an unpinned lookup reaches this only after a mempool miss | `FAILED_PRECONDITION`, `CANONICAL_HISTORY_UNAVAILABLE`, `metadata["first_available_height"]` |
+| Pinned epoch is not served, or, for an unpinned lookup, the writer's mempool view is not yet coherent with the writer's epoch | `FAILED_PRECONDITION`, `CHAIN_EPOCH_PIN_UNAVAILABLE` |
+| Storage fault on a visible transaction | `NOT_FOUND`, `ARTIFACT_UNAVAILABLE` with `ResourceInfo`, or another storage reason |
+| Mined block is not in the best chain | `NOT_FOUND`, `BLOCK_NOT_IN_BEST_CHAIN` |
+| Mempool answered at another epoch than the canonical read | `NOT_FOUND`, `CHAIN_EPOCH_MISSING` naming the writer epoch |
+| Writer answered the mempool miss without the typed absence | `NOT_FOUND`, `ARTIFACT_UNAVAILABLE` without `ResourceInfo` |
+| Mempool view hydrating, rebuilding, or unreachable | `UNAVAILABLE` |
+
+To judge a transaction against a height, pin the lookup to an epoch whose
+visible tip covers that height, for example through a `zinder-client`
+`ChainSnapshot`, and confirm the epoch is still current afterwards when the
+judgment depends on it. A pinned absence says nothing about the mempool; make
+an unpinned lookup to learn whether the transaction is pending.
 
 Each native wire response shape pairs to one capability string. The capability records the semantic shape; a change to the response shape requires a new capability string, even when the RPC name stays the same.
 
@@ -336,7 +388,8 @@ mirror the `ChainIndex` methods:
 
 - `WalletQuery.Transaction` returns the typed `TransactionStatusResponse`
   carrying the shared `TransactionLocation` oneof
-  (`mined`/`in_mempool`, with `NotFound` mapped to gRPC `NOT_FOUND`).
+  (`mined`/`in_mempool`); a proven absence is gRPC `NOT_FOUND` with reason
+  `TRANSACTION_NOT_FOUND` (see [Transaction absence](#transaction-absence)).
 - `WalletQuery.TransparentMempoolOutputsByAddress` (capability
   `wallet.mempool.transparent_outputs_by_address_v1`) returns unmined
   transparent outputs that fund one transparent address.

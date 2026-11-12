@@ -93,6 +93,16 @@ pub trait CanonicalReader: Send + Sync + 'static {
         transaction_id: TransactionId,
     ) -> Result<Option<TransactionLocation>, CanonicalStoreError>;
 
+    /// Reads the canonical location of a transaction, answering `None` only
+    /// for a proven absence from height 1 through the visible tip.
+    ///
+    /// A store whose history starts after a checkpoint answers a miss with
+    /// [`CanonicalStoreError::CanonicalHistoryUnavailable`].
+    fn transaction_location_or_proven_absence(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<TransactionLocation>, CanonicalStoreError>;
+
     /// Reads a raw transaction at an authenticated canonical location.
     fn transaction_blob(
         &self,
@@ -292,6 +302,13 @@ macro_rules! impl_canonical_read {
                 transaction_id: TransactionId,
             ) -> Result<Option<TransactionLocation>, CanonicalStoreError> {
                 self.transaction_location(transaction_id)
+            }
+
+            fn transaction_location_or_proven_absence(
+                &self,
+                transaction_id: TransactionId,
+            ) -> Result<Option<TransactionLocation>, CanonicalStoreError> {
+                self.transaction_location_or_proven_absence(transaction_id)
             }
 
             fn transaction_blob(
