@@ -122,7 +122,8 @@ git push origin v0.5.0
 The repository must have immutable releases enabled before the tag is pushed.
 The tag must be reachable from `main`. The `release` workflow validates the tag
 against Cargo metadata, requires a matching non-empty changelog section, and
-rejects pending fragments and refuses an already published tag before it
+rejects pending fragments for a stable tag, requires them to remain for a
+prerelease tag, and refuses an already published tag before it
 logs in to GitHub Container Registry (GHCR) or requests an OIDC token. Before
 approval, it generates and validates the native proto source closure, OpenAPI
 documents, and descriptor set. It also validates exactly the three SDK archives
