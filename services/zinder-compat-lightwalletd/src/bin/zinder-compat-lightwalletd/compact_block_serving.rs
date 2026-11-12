@@ -1226,7 +1226,7 @@ fn lightd_info(
         upgrade_name,
         upgrade_height,
         lightwallet_protocol_version:
-            zinder_proto::compat::lightwalletd::LIGHTWALLETD_PROTOCOL_COMMIT.to_owned(),
+            zinder_proto::compat::lightwalletd::LIGHTWALLETD_PROTOCOL_VERSION.to_owned(),
     }
 }
 
@@ -2821,7 +2821,7 @@ mod tests {
             upgrade_name: "NU6.3".to_owned(),
             upgrade_height: 603,
             lightwallet_protocol_version:
-                zinder_proto::compat::lightwalletd::LIGHTWALLETD_PROTOCOL_COMMIT.to_owned(),
+                zinder_proto::compat::lightwalletd::LIGHTWALLETD_PROTOCOL_VERSION.to_owned(),
         };
         assert_eq!(info, expected);
         assert_eq!(latest.height, info.block_height);

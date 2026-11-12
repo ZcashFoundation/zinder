@@ -5,7 +5,7 @@
 
 use eyre::eyre;
 use prost::Message;
-use zinder_proto::compat::lightwalletd::{self, LIGHTWALLETD_PROTOCOL_COMMIT};
+use zinder_proto::compat::lightwalletd::{self, LIGHTWALLETD_PROTOCOL_VERSION};
 
 #[test]
 #[allow(
@@ -151,13 +151,13 @@ fn lightd_info_decodes_protocol_version_fields() -> eyre::Result<()> {
         donation_address: String::new(),
         upgrade_name: "NU7".to_owned(),
         upgrade_height: 3,
-        lightwallet_protocol_version: LIGHTWALLETD_PROTOCOL_COMMIT.to_owned(),
+        lightwallet_protocol_version: LIGHTWALLETD_PROTOCOL_VERSION.to_owned(),
     };
     let decoded_lightd_info = round_trip(&lightd_info)?;
 
     assert_eq!(
         decoded_lightd_info.lightwallet_protocol_version,
-        LIGHTWALLETD_PROTOCOL_COMMIT
+        LIGHTWALLETD_PROTOCOL_VERSION
     );
     assert_eq!(decoded_lightd_info.upgrade_name, "NU7");
     assert_eq!(decoded_lightd_info.upgrade_height, 3);

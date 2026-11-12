@@ -76,8 +76,9 @@ field that differs by mode is `taddrSupport`.
 | Class | Fields | Rule |
 | --- | --- | --- |
 | Comparable with lightwalletd | `chainName`, `saplingActivationHeight`, `consensusBranchId`, `upgradeName`, `upgradeHeight` | Derived from the chain and the activation table, so two servers on the same node agree at the same tip. `chainName` is the BIP70 name (`main` or `test`; Regtest reports `test`). `consensusBranchId` is the lowercase hex branch active at the tip. `upgradeName` and `upgradeHeight` name the next pending upgrade, as described above. Compare them only after both servers report the same `blockHeight`, because an activation height moves them. |
+| Protocol release | `lightwalletProtocolVersion` | The `lightwallet-protocol` release tag the server implements, such as `v0.5.0`. Two servers agree when they pin the same protocol release, whatever their build. |
 | Live tip | `blockHeight` | The served visible tip. Two servers agree only when they have both applied the same block, so a harness compares it with a tolerance of one block or compares the other fields only when the heights are equal. |
-| Zinder-specific | `version`, `vendor`, `gitCommit`, `branch`, `buildDate`, `buildUser`, `zcashdBuild`, `zcashdSubversion`, `donationAddress`, `estimatedHeight`, `lightwalletProtocolVersion`, `taddrSupport` | Identify or configure this process. Never compare them with another server. |
+| Zinder-specific | `version`, `vendor`, `gitCommit`, `branch`, `buildDate`, `buildUser`, `zcashdBuild`, `zcashdSubversion`, `donationAddress`, `estimatedHeight`, `taddrSupport` | Identify or configure this process. Never compare them with another server. |
 
 The Zinder-specific values are fixed:
 
@@ -90,12 +91,29 @@ The Zinder-specific values are fixed:
 - `estimatedHeight` equals `blockHeight`. Zinder serves its own visible tip and
   does not report the node's estimate, so it stays at the served tip while the
   node syncs.
-- `lightwalletProtocolVersion` is the pinned `lightwallet-protocol` commit
-  vendored in `zinder-proto`. Compare it with that pin, not with another
-  server's value.
 - `taddrSupport` is `true` in wallet-serving mode, where construction admitted
   transparent reads, and `false` in compact-blocks mode and in a generic
   adapter built without the transparent constructor.
+
+### `lightwalletProtocolVersion`
+
+`lightwalletProtocolVersion` is the release tag of the vendored
+`lightwallet-protocol` schemas, `v0.5.0` today, read from the `VERSION` file
+next to the pinned `COMMIT` in `zinder-proto` and exported as
+`LIGHTWALLETD_PROTOCOL_VERSION`. lightwalletd reports the same form: the pinned
+reference v0.6.0 sets the field to its protocol tag, `v0.5.0`
+(`common/common.go:51` at `e7436d2`).
+
+Wallets read the field as a version, not as an identifier. zingolib parses it
+as `vMAJOR.MINOR.PATCH` and refuses to sync below 0.5.0, the release that
+added the Ironwood pool (zingolib `f930d80`,
+`pepper-sync/src/client.rs:104-143`, checked before every sync at
+`sync.rs:464`). A commit hash fails that parse, so Zingo cannot sync against a
+server that reports one.
+
+The vendored commit stays available to Rust code as
+`LIGHTWALLETD_PROTOCOL_COMMIT`. lightwalletd reports no protocol commit on the
+wire, and `gitCommit` names the server build, so Zinder does not add one.
 
 ### `GetLatestBlock`
 

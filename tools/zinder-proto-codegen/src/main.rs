@@ -61,6 +61,10 @@ fn generate(repository_root: &Path, output_dir: &Path) -> Result<(), Box<dyn Err
         &compat_root.join("COMMIT"),
         &output_dir.join("lightwalletd_protocol_commit.txt"),
     )?;
+    write_trimmed_version(
+        &compat_root.join("VERSION"),
+        &output_dir.join("lightwalletd_protocol_version.txt"),
+    )?;
     write_trimmed_commit(
         &zebra_root.join("COMMIT"),
         &output_dir.join("zebra_indexer_protocol_commit.txt"),
@@ -76,5 +80,26 @@ fn write_trimmed_commit(source: &Path, destination: &Path) -> Result<(), Box<dyn
         return Err(format!("{} is not a 40-character commit id", source.display()).into());
     }
     std::fs::write(destination, commit)?;
+    Ok(())
+}
+
+fn write_trimmed_version(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
+    let version = std::fs::read_to_string(source)?;
+    let version = version.trim();
+    let is_release_tag = version.strip_prefix('v').is_some_and(|numbers| {
+        let parts: Vec<&str> = numbers.split('.').collect();
+        parts.len() == 3
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    });
+    if !is_release_tag {
+        return Err(format!(
+            "{} is not a vMAJOR.MINOR.PATCH release tag",
+            source.display()
+        )
+        .into());
+    }
+    std::fs::write(destination, version)?;
     Ok(())
 }

@@ -147,7 +147,7 @@ async fn lightwalletd_adapter_serves_read_sync_methods() -> eyre::Result<()> {
     assert_eq!(lightd_info.estimated_height, 1);
     assert_eq!(
         lightd_info.lightwallet_protocol_version,
-        lightwalletd::LIGHTWALLETD_PROTOCOL_COMMIT
+        lightwalletd::LIGHTWALLETD_PROTOCOL_VERSION
     );
     assert!(
         !lightd_info.taddr_support,
@@ -203,7 +203,7 @@ async fn lightd_info_and_latest_block_follow_the_identity_contract() -> eyre::Re
         donation_address: String::new(),
         upgrade_name: "NU5".to_owned(),
         upgrade_height: 2,
-        lightwallet_protocol_version: lightwalletd::LIGHTWALLETD_PROTOCOL_COMMIT.to_owned(),
+        lightwallet_protocol_version: lightwalletd::LIGHTWALLETD_PROTOCOL_VERSION.to_owned(),
     };
     assert_eq!(lightd_info, expected);
 
@@ -215,6 +215,57 @@ async fn lightd_info_and_latest_block_follow_the_identity_contract() -> eyre::Re
     assert_eq!(latest_block.hash.len(), 32);
 
     Ok(())
+}
+
+/// zingolib accepts the reported `lightwalletProtocolVersion`.
+///
+/// zingolib refuses to sync unless the field parses as
+/// `vMAJOR.MINOR.PATCH` and is at least 0.5.0 (zingolabs/zingolib `f930d80`,
+/// `pepper-sync/src/client.rs:104-143`, checked at `sync.rs:464`). The pinned
+/// reference lightwalletd v0.6.0 reports `v0.5.0` here
+/// (`common/common.go:51`), so Zinder reports the vendored protocol tag.
+#[tokio::test]
+async fn lightd_info_protocol_version_satisfies_zingolib_minimum() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let adapter = acceptance_adapter(&store_fixture);
+
+    let lightd_info = adapter
+        .get_lightd_info(Request::new(lightwalletd::Empty {}))
+        .await?
+        .into_inner();
+
+    assert_eq!(
+        lightd_info.lightwallet_protocol_version,
+        lightwalletd::LIGHTWALLETD_PROTOCOL_VERSION
+    );
+    let version =
+        zingolib_protocol_version(&lightd_info.lightwallet_protocol_version).ok_or_else(|| {
+            eyre!(
+                "zingolib cannot parse lightwalletProtocolVersion {:?}",
+                lightd_info.lightwallet_protocol_version
+            )
+        })?;
+    assert!(
+        version >= (0, 5, 0),
+        "zingolib requires protocol 0.5.0 or later, got {version:?}"
+    );
+    Ok(())
+}
+
+/// Port of zingolib's `parse_protocol_version`: an optional `v` prefix, then
+/// `major.minor.patch`, ignoring any non-digit suffix on the patch number.
+fn zingolib_protocol_version(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.trim().trim_start_matches('v').splitn(3, '.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts
+        .next()?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()?;
+    Some((major, minor, patch))
 }
 
 #[tokio::test]

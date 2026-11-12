@@ -116,6 +116,17 @@ async fn lightd_info_advertises_matching_chain_metadata() -> Result<()> {
         zinder_info.taddr_support,
         "Zinder must advertise transparent-address support",
     );
+    // Both servers report the release tag of the protocol they serve. The
+    // pinned reference lightwalletd and Zinder's vendored schemas pin the same
+    // lightwallet-protocol release, so the tags agree.
+    assert_eq!(
+        zinder_info.lightwallet_protocol_version,
+        lightwalletd::LIGHTWALLETD_PROTOCOL_VERSION,
+    );
+    assert_eq!(
+        zinder_info.lightwallet_protocol_version, reference_info.lightwallet_protocol_version,
+        "lightwalletProtocolVersion must name the same protocol release",
+    );
     Ok(())
 }
 

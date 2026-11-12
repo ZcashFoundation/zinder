@@ -321,6 +321,14 @@ jobs:
         run: |
           set -euo pipefail
           upstream_commit="$(cat crates/zinder-proto/proto/compat/lightwalletd/COMMIT)"
+          upstream_version="$(cat crates/zinder-proto/proto/compat/lightwalletd/VERSION)"
+          tagged_commit="$(git ls-remote https://github.com/zcash/lightwallet-protocol \
+            "refs/tags/${upstream_version}" "refs/tags/${upstream_version}^{}" \
+            | sort -k2 | tail -n 1 | cut -f1)"
+          if [ "${tagged_commit}" != "${upstream_commit}" ]; then
+            echo "lightwallet-protocol ${upstream_version} is ${tagged_commit:-missing}, not ${upstream_commit}" >&2
+            exit 1
+          fi
           upstream_base="https://raw.githubusercontent.com/zcash/lightwallet-protocol/${upstream_commit}/walletrpc"
           tempdir="$(mktemp -d)"
           trap 'rm -rf "${tempdir}"' EXIT

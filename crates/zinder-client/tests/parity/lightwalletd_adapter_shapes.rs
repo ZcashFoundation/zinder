@@ -107,7 +107,7 @@ async fn serves_lightwalletd_scan_shape_from_fixture() -> eyre::Result<()> {
     assert_eq!(lightd_info.estimated_height, visible_tip_block.height);
     assert_eq!(
         lightd_info.lightwallet_protocol_version,
-        lightwalletd::LIGHTWALLETD_PROTOCOL_COMMIT
+        lightwalletd::LIGHTWALLETD_PROTOCOL_VERSION
     );
     assert!(
         !lightd_info.taddr_support,

@@ -24,7 +24,7 @@ use zinder_core::{
     },
 };
 use zinder_proto::compat::lightwalletd::{
-    self, LIGHTWALLETD_PROTOCOL_COMMIT, compact_tx_streamer_server,
+    self, LIGHTWALLETD_PROTOCOL_VERSION, compact_tx_streamer_server,
 };
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
@@ -1586,7 +1586,7 @@ fn lightd_info(
         donation_address: String::new(),
         upgrade_name,
         upgrade_height,
-        lightwallet_protocol_version: LIGHTWALLETD_PROTOCOL_COMMIT.to_owned(),
+        lightwallet_protocol_version: LIGHTWALLETD_PROTOCOL_VERSION.to_owned(),
     }
 }
 
