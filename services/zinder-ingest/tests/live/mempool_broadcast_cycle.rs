@@ -23,8 +23,14 @@
 //! before broadcasting with a diagnostic message naming the expected
 //! address. This is intentional: silent skips on misconfigured live
 //! environments hide bugs.
+//!
+//! The shielded test also signs a transparent-to-Ironwood shielding spend
+//! with a real Halo2 proof, so the node must have activated NU6.3.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use eyre::{Result, eyre};
 use serde::Deserialize;
@@ -33,6 +39,7 @@ use zinder_core::{
     BlockHeight, BroadcastAccepted, BroadcastRejected, Network, RawTransactionBytes,
     TransactionBroadcastOutcome, TransactionId, UnixTimestampMillis,
 };
+use zinder_query::{WalletQueryApi as _, WalletServingQuery};
 use zinder_source::{
     JsonRpcMempoolSource, JsonRpcMempoolSourceOptions, MempoolSource, MempoolSourceEvent,
     NodeSource, TransactionBroadcaster, UpstreamTransactionLookup, ZebraJsonRpcSource,
@@ -40,11 +47,15 @@ use zinder_source::{
 };
 use zinder_testkit::live::{init, require_live_for};
 use zinder_testkit::{
-    P2pkhSpendArgs, TRANSPARENT_BROADCAST_TEST_SEED, TransparentTestKey,
-    ZIP317_FEE_ONE_IN_ONE_OUT_ZATS, local_network_from_activations,
+    OrchardTestKey, P2pkhShieldingSpendArgs, P2pkhSpendArgs, ShieldedOutputPool,
+    TRANSPARENT_BROADCAST_TEST_SEED, TransparentTestKey, ZIP317_FEE_ONE_IN_ONE_OUT_ZATS,
+    local_network_from_activations,
 };
 
-use crate::common::{regtest_generate_blocks, rpc_invalidate_block, rpc_reconsider_block};
+use crate::common::{
+    LiveServingPair, fetch_live_network_upgrade_activations, live_serving_pair,
+    regtest_generate_blocks, regtest_json_rpc_call, rpc_invalidate_block, rpc_reconsider_block,
+};
 
 /// Maximum time we wait for the polling mempool source to emit the broadcast
 /// transaction's `Added` event after `sendrawtransaction` returns.
@@ -169,6 +180,142 @@ async fn broadcasting_signed_transparent_spend_surfaces_through_polling_mempool_
         "Zebra kept reporting the signed transparent transaction as already known: {}",
         last_known_rejection.unwrap_or_else(|| "no rejection captured".to_owned())
     ))
+}
+
+/// Mines a `zinder-testkit` Ironwood shielding spend and checks its index.
+///
+/// The test signs a transparent-to-Ironwood shielding spend, broadcasts and
+/// mines it, and builds a serving pair from the node. The compact block at the
+/// mined height must carry the spend's transparent input and its two Ironwood
+/// actions, and its Ironwood tree size must match the node's.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live test; see CLAUDE.md §Live Node Tests"]
+async fn shielded_outputs_are_indexed_after_mining() -> Result<()> {
+    let _guard = init();
+    let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
+        return Ok(());
+    };
+    let json_rpc = zebra_source(&env)?;
+    let activations = fetch_live_network_upgrade_activations(&env).await?;
+    let shielding_txid = broadcast_ironwood_shielding_spend(&env, &json_rpc, &activations).await?;
+    regtest_generate_blocks(&env, 1).await?;
+    let mined_height =
+        wait_for_upstream_mined(&json_rpc, shielding_txid, MEMPOOL_OBSERVE_TIMEOUT).await?;
+
+    let tip = json_rpc.tip_id().await?.height;
+    let LiveServingPair {
+        slot,
+        source,
+        store_fixture: _store_fixture,
+    } = live_serving_pair(&env, &activations, tip).await?;
+    let wallet_query =
+        WalletServingQuery::from_probed_node_source(slot, source, Arc::clone(&activations))?;
+    let compact = wallet_query.compact_block_at(mined_height, None).await?;
+    let shielding_transaction = compact
+        .compact_block
+        .transactions()
+        .iter()
+        .find(|transaction| transaction.transaction_id == shielding_txid)
+        .ok_or_else(|| {
+            eyre!(
+                "compact block {} does not carry the shielding spend {}",
+                mined_height.value(),
+                hex::encode(shielding_txid.as_bytes())
+            )
+        })?;
+    assert_eq!(shielding_transaction.data.transparent_inputs.len(), 1);
+    assert!(shielding_transaction.data.transparent_outputs.is_empty());
+    assert_eq!(
+        shielding_transaction.data.ironwood_actions.len(),
+        2,
+        "one Ironwood note padded to two actions"
+    );
+    assert!(shielding_transaction.data.orchard_actions.is_empty());
+    assert!(shielding_transaction.data.sapling_outputs.is_empty());
+
+    let node_block = regtest_json_rpc_call(
+        &env,
+        "getblock",
+        serde_json::json!([mined_height.value().to_string(), 1]),
+    )
+    .await?;
+    let node_ironwood_size = node_block["trees"]["ironwood"]["size"]
+        .as_u64()
+        .ok_or_else(|| {
+            eyre!(
+                "getblock {} reports no Ironwood tree size",
+                mined_height.value()
+            )
+        })?;
+    assert_eq!(
+        u64::from(
+            compact
+                .compact_block
+                .chain_metadata()
+                .ironwood_commitment_tree_size
+        ),
+        node_ironwood_size,
+        "Ironwood tree size at height {}",
+        mined_height.value()
+    );
+    Ok(())
+}
+
+/// Broadcasts a shielding spend into one Ironwood note and returns its txid.
+///
+/// The spend moves a matured test-key output for the next block. It fails
+/// unless NU6.3 is active at the next block and the node accepts the spend.
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "TransactionBroadcastOutcome is #[non_exhaustive]; every outcome other than Accepted fails the test"
+)]
+async fn broadcast_ironwood_shielding_spend(
+    env: &zinder_testkit::live::LiveTestEnv,
+    json_rpc: &ZebraJsonRpcSource,
+    activations: &zinder_core::NetworkUpgradeActivations,
+) -> Result<TransactionId> {
+    let target_height = json_rpc.tip_id().await?.height.value().saturating_add(1);
+    let nu6_3_height = activations
+        .activation_height_by_name("NU6.3")
+        .ok_or_else(|| eyre!("node advertises no NU6.3 activation; start it with deploy/zebra/regtest.toml or deploy/zakura/regtest.toml"))?;
+    if target_height < nu6_3_height.value() {
+        return Err(eyre!(
+            "NU6.3 activates at {} but the next block is {target_height}; Ironwood takes no notes yet",
+            nu6_3_height.value()
+        ));
+    }
+    let test_key = TransparentTestKey::from_seed_with_local_network(
+        &TRANSPARENT_BROADCAST_TEST_SEED,
+        local_network_from_activations(activations),
+    )
+    .map_err(|error| eyre!("could not derive test key: {error}"))?;
+    let coinbase =
+        locate_spendable_test_coinbase(env, json_rpc, &test_key.address_base58()).await?;
+    let recipient = OrchardTestKey::from_seed(&TRANSPARENT_BROADCAST_TEST_SEED)
+        .map_err(|error| eyre!("could not derive Orchard test key: {error}"))?
+        .address();
+    let raw_tx = test_key
+        .build_p2pkh_shielding_spend(&P2pkhShieldingSpendArgs {
+            coinbase_txid_be: coinbase.txid_be,
+            coinbase_vout: coinbase.vout,
+            coinbase_value_zats: coinbase.value_zats,
+            pool: ShieldedOutputPool::Ironwood,
+            recipient: &recipient,
+            target_height: coinbase.target_height,
+        })
+        .map_err(|error| eyre!("shielding signer rejected the spend: {error}"))?;
+    match json_rpc
+        .broadcast_transaction(RawTransactionBytes::new(raw_tx))
+        .await?
+    {
+        TransactionBroadcastOutcome::Accepted(BroadcastAccepted { transaction_id }) => {
+            Ok(transaction_id)
+        }
+        outcome => Err(eyre!(
+            "node rejected the Ironwood shielding spend at height {}: {outcome:?}",
+            coinbase.target_height
+        )),
+    }
 }
 
 fn zebra_source(env: &zinder_testkit::live::LiveTestEnv) -> Result<ZebraJsonRpcSource> {

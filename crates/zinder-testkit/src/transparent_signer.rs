@@ -1,17 +1,18 @@
-//! Test-only transparent transaction builder.
+//! Test-only transaction builder that spends transparent outputs.
 //!
-//! Produces signed transparent transaction bytes that a Zebra regtest
-//! sidecar will accept through `sendrawtransaction`: the version the builder
-//! suggests for the target height, or version 4 on request. The signer wraps
-//! `zcash_primitives::transaction::builder::Builder::mock_build`, which is
-//! the test-only path that skips Sapling/Orchard provers; transparent-only
-//! transactions never invoke them.
+//! Produces signed transaction bytes that a Regtest node accepts through
+//! `sendrawtransaction`: transparent spends in the version the builder
+//! suggests for the target height, or version 4 on request, and shielding
+//! spends that move one transparent output into the Orchard or Ironwood pool.
+//! The signer wraps `zcash_primitives::transaction::builder::Builder::mock_build`,
+//! the test-only build path. It mocks only the Sapling provers; Orchard and
+//! Ironwood bundles still carry real Halo2 proofs, so a shielding spend
+//! verifies on a node.
 //!
-//! The signer exists for the regtest broadcast cycle without depending on
-//! Zallet (Zallet v0.1.0-alpha.3 is shielded-first, Zebra refuses
-//! non-transparent miner addresses). It is unsuitable for any production
-//! signing path: every secret derivation flows through `mock_build`'s
-//! deterministic RNG and the test-vector code paths.
+//! The signer exists for the Regtest broadcast cycle and fixture capture
+//! without an external wallet. It is unsuitable for any production signing
+//! path: its keys come from a fixed, public seed, and `mock_build` accepts any
+//! random number generator as a cryptographic one.
 //!
 //! # Activation heights
 //!
@@ -36,9 +37,11 @@ use zcash_address::{ToAddress, ZcashAddress};
 use zcash_primitives::transaction::{
     TxVersion,
     builder::{BuildConfig, Builder, BundlePadding},
+    fees::zip317,
 };
 use zcash_protocol::{
     consensus::{BlockHeight, NetworkType},
+    memo::MemoBytes,
     value::{BalanceError, Zatoshis},
 };
 use zcash_transparent::address::Script as TransparentScript;
@@ -51,6 +54,8 @@ use zcash_transparent::{
 pub use zcash_protocol::local_consensus::LocalNetwork;
 pub use zcash_transparent::address::TransparentAddress;
 use zip32::AccountId;
+
+use crate::orchard_test_key::OrchardAddress;
 
 /// Test seed for live regtest transparent-broadcast gates.
 ///
@@ -84,6 +89,21 @@ pub enum TransparentSignerError {
     /// Adding the transparent output to the builder failed.
     #[error("could not add transparent output: {0}")]
     AddOutput(String),
+    /// Adding the shielded output to the builder failed, for example because
+    /// the pool does not accept new value at the target height.
+    #[error("could not add {pool:?} output: {reason}")]
+    AddShieldedOutput {
+        /// The pool that rejected the output.
+        pool: ShieldedOutputPool,
+        /// The builder's reason.
+        reason: String,
+    },
+    /// Shielded test-key derivation or address encoding failed.
+    #[error("shielded test key derivation failed: {0}")]
+    ShieldedKey(String),
+    /// The builder could not compute the ZIP-317 fee.
+    #[error("ZIP-317 fee computation failed: {0}")]
+    Fee(String),
     /// The configured value did not fit a valid `Zatoshis` amount.
     #[error("amount {amount_zats} zats is not a valid Zatoshis amount: {source}")]
     InvalidValue {
@@ -142,6 +162,44 @@ pub struct P2pkhSpendArgs<'a> {
     /// Block height the transaction targets. Must satisfy regtest coinbase
     /// maturity (`coinbase_height + 100 <= target_height`).
     pub target_height: u32,
+}
+
+/// Shielded pool that receives the output of a shielding spend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ShieldedOutputPool {
+    /// The Orchard pool, which accepts new value from NU5 until NU6.3.
+    Orchard,
+    /// The Ironwood pool, from NU6.3 onward.
+    Ironwood,
+}
+
+/// Inputs for [`TransparentTestKey::build_p2pkh_shielding_spend`].
+#[derive(Clone, Debug)]
+pub struct P2pkhShieldingSpendArgs<'a> {
+    /// 32-byte txid of the spent output in wire byte order; see
+    /// [`P2pkhSpendArgs::coinbase_txid_be`].
+    pub coinbase_txid_be: [u8; 32],
+    /// Output index of the spent output.
+    pub coinbase_vout: u32,
+    /// Value of the spent output in zatoshis.
+    pub coinbase_value_zats: u64,
+    /// Pool that receives the shielded note.
+    pub pool: ShieldedOutputPool,
+    /// Recipient of the shielded note, an address of
+    /// [`crate::OrchardTestKey`] or any other Orchard-format address.
+    pub recipient: &'a OrchardAddress,
+    /// Block height the transaction targets. Must satisfy regtest coinbase
+    /// maturity when the spent output is a coinbase output.
+    pub target_height: u32,
+}
+
+/// One transparent P2PKH output of the test key, ready to add to a builder.
+struct SpentTestOutput {
+    signing_set: TransparentSigningSet,
+    pubkey: PublicKey,
+    outpoint: OutPoint,
+    coin: TxOut,
 }
 
 impl TransparentTestKey {
@@ -281,32 +339,22 @@ impl TransparentTestKey {
                 fee_zats,
             });
         }
-        let coinbase_amount = zatoshis_from_u64(args.coinbase_value_zats)?;
         let send_amount = zatoshis_from_u64(args.coinbase_value_zats - fee_zats)?;
-
-        let mut signing_set = TransparentSigningSet::new();
-        let secret_key = self
-            .account_key
-            .derive_external_secret_key(NonHardenedChildIndex::ZERO)
-            .map_err(|error| TransparentSignerError::ExternalKey(error.to_string()))?;
-        let pubkey = signing_set.add_key(secret_key);
-
-        let coin = TxOut::new(
-            coinbase_amount,
-            TransparentAddress::from_pubkey(&pubkey).script().into(),
-        );
-        let outpoint = OutPoint::new(args.coinbase_txid_be, args.coinbase_vout);
+        let SpentTestOutput {
+            signing_set,
+            pubkey,
+            outpoint,
+            coin,
+        } = self.spent_output(
+            args.coinbase_txid_be,
+            args.coinbase_vout,
+            args.coinbase_value_zats,
+        )?;
 
         let mut builder = Builder::new(
             self.params,
             BlockHeight::from_u32(args.target_height),
-            BuildConfig::Standard {
-                sapling_anchor: None,
-                orchard_anchor: None,
-                ironwood_anchor: None,
-                orchard_padding: BundlePadding::DEFAULT,
-                ironwood_padding: BundlePadding::DEFAULT,
-            },
+            standard_build_config(None),
         );
         if let Some(expiry_height) = v4_expiry_height {
             builder = builder.with_expiry_height(expiry_height);
@@ -321,17 +369,147 @@ impl TransparentTestKey {
             .add_transparent_output(args.recipient, send_amount)
             .map_err(|error| TransparentSignerError::AddOutput(error.to_string()))?;
 
-        let build_outcome = builder
-            .mock_build(&signing_set, &[], &[], rand::rng())
-            .map_err(|error| TransparentSignerError::Build(error.to_string()))?;
-
-        let mut bytes = Vec::new();
-        build_outcome
-            .transaction()
-            .write(&mut bytes)
-            .map_err(|source| TransparentSignerError::Serialize { source })?;
-        Ok(bytes)
+        mock_build_bytes(builder, &signing_set)
     }
+
+    /// Builds and signs a transaction that moves one P2PKH output into a
+    /// single shielded note in `args.pool`.
+    ///
+    /// The version is the one the builder suggests for `args.target_height`.
+    /// The note's value is the spent value less the ZIP-317 fee, which counts
+    /// the transparent input and the padded shielded actions: 15,000 zatoshis
+    /// for one input and one note. The bundle's anchor is the empty tree,
+    /// which Zebra 7.0.0 and Zakura 1.8.6 accept for a bundle without real
+    /// spends.
+    ///
+    /// Orchard accepts new value only before NU6.3 and Ironwood only from
+    /// NU6.3 onward; any other combination returns
+    /// [`TransparentSignerError::AddShieldedOutput`]. Building the bundle's
+    /// Halo2 proof takes seconds even in an optimized build.
+    pub fn build_p2pkh_shielding_spend(
+        &self,
+        args: &P2pkhShieldingSpendArgs<'_>,
+    ) -> Result<Vec<u8>, TransparentSignerError> {
+        // The fee depends on the action count, not on the note value.
+        let (fee_probe, _) = self.shielding_builder(args, Zatoshis::ZERO)?;
+        let fee = fee_probe
+            .get_fee(&zip317::FeeRule::standard())
+            .map_err(|error| TransparentSignerError::Fee(error.to_string()))?;
+        let fee_zats = u64::from(fee);
+        let note_value_zats = args
+            .coinbase_value_zats
+            .checked_sub(fee_zats)
+            .filter(|note_value_zats| *note_value_zats > 0)
+            .ok_or(TransparentSignerError::FeeExceedsValue {
+                value_zats: args.coinbase_value_zats,
+                fee_zats,
+            })?;
+        let (builder, signing_set) =
+            self.shielding_builder(args, zatoshis_from_u64(note_value_zats)?)?;
+        mock_build_bytes(builder, &signing_set)
+    }
+
+    /// Returns a builder that spends the output in `args` into one note of
+    /// `note_value` in `args.pool`, and the signing set for its input.
+    fn shielding_builder(
+        &self,
+        args: &P2pkhShieldingSpendArgs<'_>,
+        note_value: Zatoshis,
+    ) -> Result<(Builder<LocalNetwork, ()>, TransparentSigningSet), TransparentSignerError> {
+        let SpentTestOutput {
+            signing_set,
+            pubkey,
+            outpoint,
+            coin,
+        } = self.spent_output(
+            args.coinbase_txid_be,
+            args.coinbase_vout,
+            args.coinbase_value_zats,
+        )?;
+        let mut builder = Builder::new(
+            self.params,
+            BlockHeight::from_u32(args.target_height),
+            standard_build_config(Some(args.pool)),
+        );
+        builder
+            .add_transparent_p2pkh_input(pubkey, outpoint, coin)
+            .map_err(|error| TransparentSignerError::AddInput(error.to_string()))?;
+        let added = match args.pool {
+            ShieldedOutputPool::Orchard => builder.add_orchard_output::<std::convert::Infallible>(
+                None,
+                *args.recipient,
+                note_value,
+                MemoBytes::empty(),
+            ),
+            ShieldedOutputPool::Ironwood => builder
+                .add_ironwood_output::<std::convert::Infallible>(
+                    None,
+                    *args.recipient,
+                    note_value,
+                    MemoBytes::empty(),
+                ),
+        };
+        added.map_err(|error| TransparentSignerError::AddShieldedOutput {
+            pool: args.pool,
+            reason: error.to_string(),
+        })?;
+        Ok((builder, signing_set))
+    }
+
+    /// Returns this key's P2PKH output at `txid_be:vout` with `value_zats`,
+    /// and a signing set that can spend it.
+    fn spent_output(
+        &self,
+        txid_be: [u8; 32],
+        vout: u32,
+        value_zats: u64,
+    ) -> Result<SpentTestOutput, TransparentSignerError> {
+        let mut signing_set = TransparentSigningSet::new();
+        let secret_key = self
+            .account_key
+            .derive_external_secret_key(NonHardenedChildIndex::ZERO)
+            .map_err(|error| TransparentSignerError::ExternalKey(error.to_string()))?;
+        let pubkey = signing_set.add_key(secret_key);
+        let coin = TxOut::new(
+            zatoshis_from_u64(value_zats)?,
+            TransparentAddress::from_pubkey(&pubkey).script().into(),
+        );
+        Ok(SpentTestOutput {
+            signing_set,
+            pubkey,
+            outpoint: OutPoint::new(txid_be, vout),
+            coin,
+        })
+    }
+}
+
+/// Returns a non-coinbase build configuration whose only shielded bundle,
+/// when `pool` names one, is anchored at that pool's empty tree.
+fn standard_build_config(pool: Option<ShieldedOutputPool>) -> BuildConfig {
+    let empty_anchor_for = |candidate| (pool == Some(candidate)).then(orchard::Anchor::empty_tree);
+    BuildConfig::Standard {
+        sapling_anchor: None,
+        orchard_anchor: empty_anchor_for(ShieldedOutputPool::Orchard),
+        ironwood_anchor: empty_anchor_for(ShieldedOutputPool::Ironwood),
+        orchard_padding: BundlePadding::DEFAULT,
+        ironwood_padding: BundlePadding::DEFAULT,
+    }
+}
+
+/// Builds `builder` with `mock_build` and serializes the transaction.
+fn mock_build_bytes(
+    builder: Builder<LocalNetwork, ()>,
+    signing_set: &TransparentSigningSet,
+) -> Result<Vec<u8>, TransparentSignerError> {
+    let build_outcome = builder
+        .mock_build(signing_set, &[], &[], rand::rng())
+        .map_err(|error| TransparentSignerError::Build(error.to_string()))?;
+    let mut bytes = Vec::new();
+    build_outcome
+        .transaction()
+        .write(&mut bytes)
+        .map_err(|source| TransparentSignerError::Serialize { source })?;
+    Ok(bytes)
 }
 
 impl std::fmt::Debug for TransparentTestKey {
@@ -377,8 +555,13 @@ mod tests {
         reason = "Unit test names describe the behavior under test."
     )]
 
-    use super::{LocalNetwork, P2pkhSpendArgs, TransparentSignerError, TransparentTestKey};
-    use zcash_protocol::consensus::BlockHeight;
+    use super::{
+        LocalNetwork, P2pkhShieldingSpendArgs, P2pkhSpendArgs, ShieldedOutputPool,
+        TransparentSignerError, TransparentTestKey,
+    };
+    use crate::OrchardTestKey;
+    use zcash_primitives::transaction::Transaction;
+    use zcash_protocol::consensus::{BlockHeight, BranchId};
     use zcash_transparent::address::TransparentAddress;
 
     fn fixed_seed() -> [u8; 32] {
@@ -402,6 +585,126 @@ mod tests {
             nu6_3: at(6),
             nu7: at(140),
         }
+    }
+
+    /// Activation heights of `deploy/zakura/regtest-fixture-capture.toml`,
+    /// which place NU6.3 at 130 and NU7 at 160 so a coinbase matures while
+    /// Orchard still accepts new value.
+    fn fixture_capture_network() -> LocalNetwork {
+        LocalNetwork {
+            nu6_3: Some(BlockHeight::from_u32(130)),
+            nu7: Some(BlockHeight::from_u32(160)),
+            ..nu7_regtest_network()
+        }
+    }
+
+    const SHIELDED_SPEND_VALUE_ZATS: u64 = 10_000_000;
+    /// The spent value less the ZIP-317 fee for one transparent input and two
+    /// padded shielded actions, 15,000 zatoshis, leaving the shielded pool.
+    const SHIELDED_VALUE_BALANCE_ZATS: i64 = -9_985_000;
+
+    fn shielding_spend(
+        params: LocalNetwork,
+        pool: ShieldedOutputPool,
+        target_height: u32,
+    ) -> Result<Vec<u8>, TransparentSignerError> {
+        let key = TransparentTestKey::from_seed_with_local_network(&fixed_seed(), params)?;
+        let recipient = OrchardTestKey::from_seed(&fixed_seed())?.address();
+        key.build_p2pkh_shielding_spend(&P2pkhShieldingSpendArgs {
+            coinbase_txid_be: [0xdd_u8; 32],
+            coinbase_vout: 0,
+            coinbase_value_zats: SHIELDED_SPEND_VALUE_ZATS,
+            pool,
+            recipient: &recipient,
+            target_height,
+        })
+    }
+
+    fn read_transaction(
+        bytes: &[u8],
+        branch_id: BranchId,
+    ) -> Result<Transaction, TransparentSignerError> {
+        Transaction::read(bytes, branch_id)
+            .map_err(|source| TransparentSignerError::Serialize { source })
+    }
+
+    #[test]
+    fn shielding_spend_before_nu6_3_pays_one_orchard_note() -> Result<(), TransparentSignerError> {
+        let bytes = shielding_spend(fixture_capture_network(), ShieldedOutputPool::Orchard, 111)?;
+        // v5 header: version 5 with fOverwintered.
+        assert_eq!(&bytes[0..4], &[0x05, 0x00, 0x00, 0x80]);
+        let transaction = read_transaction(&bytes, BranchId::Nu6_2)?;
+        let orchard = transaction
+            .orchard_bundle()
+            .ok_or_else(|| TransparentSignerError::Build("no Orchard bundle".to_owned()))?;
+        assert_eq!(
+            orchard.actions().len(),
+            2,
+            "one output padded to two actions"
+        );
+        assert_eq!(
+            i64::from(*orchard.value_balance()),
+            SHIELDED_VALUE_BALANCE_ZATS
+        );
+        assert!(transaction.ironwood_bundle().is_none());
+        assert!(transaction.sapling_bundle().is_none());
+        let transparent = transaction
+            .transparent_bundle()
+            .ok_or_else(|| TransparentSignerError::Build("no transparent bundle".to_owned()))?;
+        assert_eq!((transparent.vin.len(), transparent.vout.len()), (1, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn shielding_spend_from_nu6_3_pays_one_ironwood_note() -> Result<(), TransparentSignerError> {
+        let bytes = shielding_spend(nu7_regtest_network(), ShieldedOutputPool::Ironwood, 100)?;
+        assert_eq!(&bytes[0..4], &[0x06, 0x00, 0x00, 0x80]);
+        let transaction = read_transaction(&bytes, BranchId::Nu6_3)?;
+        let ironwood = transaction
+            .ironwood_bundle()
+            .ok_or_else(|| TransparentSignerError::Build("no Ironwood bundle".to_owned()))?;
+        assert_eq!(
+            ironwood.actions().len(),
+            2,
+            "one output padded to two actions"
+        );
+        assert_eq!(
+            i64::from(*ironwood.value_balance()),
+            SHIELDED_VALUE_BALANCE_ZATS
+        );
+        assert!(transaction.orchard_bundle().is_none());
+        assert!(transaction.sapling_bundle().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn shielding_spend_refuses_orchard_from_nu6_3() {
+        let outcome = shielding_spend(nu7_regtest_network(), ShieldedOutputPool::Orchard, 100);
+        assert!(
+            matches!(
+                outcome,
+                Err(TransparentSignerError::AddShieldedOutput {
+                    pool: ShieldedOutputPool::Orchard,
+                    ..
+                })
+            ),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn shielding_spend_refuses_ironwood_before_nu6_3() {
+        let outcome = shielding_spend(fixture_capture_network(), ShieldedOutputPool::Ironwood, 111);
+        assert!(
+            matches!(
+                outcome,
+                Err(TransparentSignerError::AddShieldedOutput {
+                    pool: ShieldedOutputPool::Ironwood,
+                    ..
+                })
+            ),
+            "{outcome:?}"
+        );
     }
 
     #[test]

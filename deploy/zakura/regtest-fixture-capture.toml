@@ -1,0 +1,98 @@
+# Zakura 1.8.6 Regtest configuration for capturing shielded block fixtures.
+#
+# A maintainer runs this node to record the zakura-1.8.6-regtest-*.json
+# fixtures under services/zinder-ingest/tests/fixtures/; CI never starts it.
+# See docs/runbooks/capturing-node-fixtures.md.
+#
+# The schedule differs from deploy/zakura/regtest.toml so one chain can carry
+# all three shielded blocks without restarting the node:
+#
+#   height 1   Canopy
+#   height 2   NU5     (v5 transactions, Orchard)
+#   height 3   NU6     (lockbox funding stream)
+#   height 4   NU6.1   (one-time lockbox disbursement)
+#   height 5   NU6.2
+#   height 130 NU6.3   (v6 transactions, Ironwood; Orchard takes no new value)
+#   height 160 NU7
+#
+# Orchard accepts new value only before NU6.3, and a coinbase output matures
+# after 100 blocks, so NU6.3 must come late enough for an early coinbase to
+# be shielded into Orchard first.
+#
+# The miner address is the unified address of zinder-testkit's broadcast test
+# seed: its P2PKH receiver and its Orchard receiver. Zakura pays the P2PKH
+# receiver before NU6.3 and an Ironwood note to the Orchard receiver from NU6.3
+# onward, so the capture spends coinbase outputs it holds the keys to. Print it
+# with `cargo run -p zinder-testkit --example print_broadcast_test_address --
+# --unified`; a zinder-testkit unit test keeps this file in step with it.
+#
+# Every listener binds loopback, and the QUIC endpoint is pinned so it does not
+# bind 0.0.0.0:8234. Run the container with host networking.
+#
+# Environment variables cannot set the activation keys: config-rs lowercases
+# them, and `NU6.1` contains the separator. Mount this file and pass it to
+# `zakurad --config`.
+
+[network]
+network = "Regtest"
+listen_addr = "127.0.0.1:38233"
+cache_dir = false
+initial_testnet_peers = []
+
+[network.zakura]
+listen_addr = "127.0.0.1:38234"
+
+[network.testnet_parameters]
+extend_funding_stream_addresses_as_required = true
+
+[network.testnet_parameters.activation_heights]
+Overwinter = 1
+Sapling = 1
+Blossom = 1
+Heartwood = 1
+Canopy = 1
+NU5 = 2
+NU6 = 3
+"NU6.1" = 4
+"NU6.2" = 5
+"NU6.3" = 130
+NU7 = 160
+
+# The same funding streams as deploy/zakura/regtest.toml. Streams whose
+# effective height ranges overlap are rejected, so the second starts where the
+# first ends.
+[[network.testnet_parameters.funding_streams]]
+height_range = { start = 3, end = 4 }
+recipients = [
+  { receiver = "Deferred", numerator = 12 },
+  { receiver = "MajorGrants", numerator = 8, addresses = ["t26ovBdKAJLtrvBsE2QGF4nqBkEuptuPFZz"] },
+]
+
+[[network.testnet_parameters.funding_streams]]
+height_range = { start = 4, end = 100000 }
+recipients = [
+  { receiver = "Deferred", numerator = 12 },
+  { receiver = "MajorGrants", numerator = 8, addresses = ["t26ovBdKAJLtrvBsE2QGF4nqBkEuptuPFZz"] },
+]
+
+# Zakura rejects the NU6.1 activation block unless at least one ZIP 271
+# lockbox disbursement is configured; this zero-value entry satisfies the rule
+# and leaves the deferred pool untouched.
+[[network.testnet_parameters.lockbox_disbursements]]
+address = "t2RnBRiqrN1nW4ecZs1Fj3WWjNdnSs4kiX8"
+amount = 0
+
+[state]
+# The capture runs in one session, so the chain need not survive a restart.
+ephemeral = true
+
+[rpc]
+listen_addr = "127.0.0.1:39232"
+# Regtest keeps `generate` on the unauthenticated listener.
+enable_cookie_auth = false
+
+[mining]
+miner_address = "uregtest16fd73u9szufftdzzce3h0mx9jt08q5f9tapnu0ygr0teqhqzwdjed3hv7x9j84xkl3kklhzumzn3ny4kjj3d3zdfpsalwqeh462pvrtjegcr6vprz634hh68wzkdmj490gklyzd6qr7"
+
+[tracing]
+use_color = false

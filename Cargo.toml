@@ -157,3 +157,19 @@ disallowed_types = "deny"
 
 [profile.release]
 lto = "thin"
+
+# `zinder-testkit` builds Orchard and Ironwood bundles with real Halo2 proofs.
+# Unoptimized, building the proving key and one proof takes about five times
+# longer, which pushes shielded tests toward their timeouts on CI runners. The
+# cost is a slower first dev build of these crates.
+[profile.dev.package.halo2_proofs]
+opt-level = 3
+
+[profile.dev.package.halo2_gadgets]
+opt-level = 3
+
+[profile.dev.package.orchard]
+opt-level = 3
+
+[profile.dev.package.pasta_curves]
+opt-level = 3

@@ -39,6 +39,14 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 filter = "test(every_bundled_consumer_is_reorg_path_independent)"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
+[[profile.default.overrides]]
+# These tests build an Orchard or Ironwood bundle with a real Halo2 proof,
+# including the proving key, which each test process builds once. That takes
+# seconds even with the optimized dev profile of the proving crates, and more
+# on a contended runner.
+filter = "test(/^transparent_signer::tests::shielding_spend_.*_pays_one_/)"
+slow-timeout = { period = "60s", terminate-after = 2 }
+
 [profile.ci-perf]
 default-filter = "test(/^perf::/)"
 slow-timeout = { period = "5m", terminate-after = 1 }
@@ -87,6 +95,15 @@ retries = { count = 0, backoff = "fixed", delay = "0s" }
 # The NU7 activation test spends regtest coinbase outputs and mines across the
 # activation. A retry would start above NU7 and could not cross it again.
 filter = "test(/^live::nu7_activation::/)"
+retries = { count = 0, backoff = "fixed", delay = "0s" }
+
+[[profile.ci-live.overrides]]
+# The shielded broadcast test builds a Halo2 proof and then constructs a
+# canonical store from genesis through the tip. A retry would repeat that cost
+# against a chain the failed attempt already advanced, so it reports the first
+# failure instead.
+filter = "test(shielded_outputs_are_indexed_after_mining)"
+slow-timeout = { period = "180s", terminate-after = 1 }
 retries = { count = 0, backoff = "fixed", delay = "0s" }
 
 [[profile.ci-live.overrides]]

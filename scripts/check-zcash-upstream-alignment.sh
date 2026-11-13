@@ -10,6 +10,7 @@ runtime_pin_files=(
   .github/workflows/live-tests.yml
   .github/workflows/parity-compat.yml
   docs/reference/lightwalletd-compatibility.md
+  docs/runbooks/capturing-node-fixtures.md
   docs/runbooks/testing.md
 )
 

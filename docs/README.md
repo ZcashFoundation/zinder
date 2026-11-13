@@ -54,6 +54,7 @@ Extension guides:
 - [Cipherscan adapter verification](runbooks/cipherscan-adapter-verification.md)
 - [Releasing Zinder](runbooks/releasing.md)
 - [Testing](runbooks/testing.md)
+- [Capturing node fixtures](runbooks/capturing-node-fixtures.md)
 
 ## Architecture decision records
 
