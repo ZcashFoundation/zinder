@@ -1,6 +1,0 @@
-kind: fixed
-body: 'Compact-blocks `GetBlockRange` now omits transactions that the requested pool types leave with no data, such as a transparent-only coinbase under the default shielded selection, so range responses match lightwalletd. Remaining transactions keep their `CompactTx.index`.'
-time: 2026-11-12T14:00:00Z
-custom:
-  Bump: patch
-  PR: "137"

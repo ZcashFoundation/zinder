@@ -1,6 +1,0 @@
-kind: changed
-body: Document the `GetLightdInfo` and `GetLatestBlock` identity contracts for lightwalletd compatibility, and compare tip-dependent fields in live parity tests only at equal tips.
-time: 2026-11-12T14:02:50.216125826Z
-custom:
-    Bump: patch
-    PR: "135"

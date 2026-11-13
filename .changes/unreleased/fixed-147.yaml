@@ -1,6 +1,0 @@
-kind: fixed
-body: 'The lightwalletd-compatible service now matches lightwalletd for four requests wallet SDKs send. `GetLightdInfo.lightwalletProtocolVersion` reports the protocol release tag (`v0.5.0`) instead of a commit hash, so Zingo can sync. `GetAddressUtxos` and `GetAddressUtxosStream` with `maxEntries = 0` return every UTXO instead of silently stopping at 1,000, and fail with `RESOURCE_EXHAUSTED` above 100,000 rather than truncating. Transparent history accepts an absent, zero, or oversized `range.end` and reads to the tip. `GetTransaction` returns a transaction in the mempool at height 0, and answers `UNAVAILABLE` (retry) instead of `NOT_FOUND` when the mempool view is at a different epoch than the chain read. Upgrade notes for Rust users of `zinder-compat-lightwalletd`: `MempoolSurface` has a new required `mempool_transaction` method, and `DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS` is now 100,000.'
-time: 2026-11-13T12:00:00Z
-custom:
-  Bump: minor
-  PR: "147"
