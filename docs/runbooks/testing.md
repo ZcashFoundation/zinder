@@ -280,8 +280,8 @@ at shutdown, so wait before stopping it and check that the restart kept height
 your own user on a state directory you own:
 
 ```bash
-scripts/generate-live-indexer-tls.sh .tmp/indexer-tls
 mkdir -p .tmp/zakura-regtest-state
+scripts/generate-live-indexer-tls.sh .tmp/indexer-tls
 start_zakura() {
   docker run -d --name zakura-regtest --network host \
     --user "$(id -u):$(id -g)" --entrypoint /usr/local/bin/zakurad \
