@@ -94,13 +94,20 @@ pruned node.
 
 A Zakura node built by verified-commitment-trees fast sync is an archive node
 for block bodies but never wrote per-height commitment trees or subtree roots
-below its last checkpoint. That band exists only on Mainnet. A checkpoint,
-construction subtree range, or query tree-state read inside the band fails
-with failure class `capability_missing`. Ingest reports `node_unavailable` with
-that class and retries on its 10-second operator-action backoff; the read will
-not succeed against the same node. Native query returns the non-retryable
-`NODE_CAPABILITY_MISSING`. Use a node synchronized without fast sync, or one
-that serves the band from its historical frontier artifact.
+below its last checkpoint. That band exists only on Mainnet. Reads inside the
+band fail with failure class `capability_missing`, and retrying against the
+same node never succeeds:
+
+- During construction, a checkpoint or subtree-range read inside the band
+  stops initial sync, and the process exits with the error. Restarting against
+  the same node fails the same way.
+- While following, a tree-state read inside the band reports
+  `node_unavailable` with that class and retries on the 10-second
+  operator-action backoff.
+- Native query returns the non-retryable `NODE_CAPABILITY_MISSING`.
+
+Use a node synchronized without fast sync, or one that serves the band from
+its historical frontier artifact.
 
 ## Wallet construction
 
