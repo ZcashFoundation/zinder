@@ -152,7 +152,13 @@ impl AdmittedIngestControl {
     }
 }
 
-pub(crate) fn wallet_ingest_control_request<T>(message: T) -> Request<T> {
+/// Wraps `message` in a request bounded by the wallet ingest-control timeout.
+///
+/// The bound rides as the `grpc-timeout` header, which both the tonic client
+/// channel and the writer enforce, so a stalled writer cannot hold a wallet
+/// read open indefinitely.
+#[must_use]
+pub fn wallet_ingest_control_request<T>(message: T) -> Request<T> {
     let mut request = Request::new(message);
     request.set_timeout(WALLET_INGEST_CONTROL_REQUEST_TIMEOUT);
     request

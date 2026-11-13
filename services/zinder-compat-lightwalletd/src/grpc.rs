@@ -37,8 +37,8 @@ use zinder_source::transparent_address_matches_network;
 use zinder_store::{MempoolEvent, RawBlobRetention};
 
 use crate::mempool::{
-    MempoolSnapshotPage, MempoolSurfaceError, SharedMempoolSurface, SharedTipChangeWatcher,
-    TipChangeWatcherError,
+    MempoolSnapshotPage, MempoolSurfaceError, MempoolTransactionLookup, SharedMempoolSurface,
+    SharedTipChangeWatcher, TipChangeWatcherError,
 };
 
 type GrpcStream<T> =
@@ -379,23 +379,46 @@ where
     /// mempool, as lightwalletd does through Zebra's `getrawtransaction`.
     ///
     /// A pending transaction is returned at height 0, the protocol's
-    /// "in the mempool" sentinel. A mempool miss, or a deployment without a
-    /// mempool surface, keeps `canonical_miss`. A mempool failure is
-    /// returned instead, because the transaction may be pending.
+    /// "in the mempool" sentinel. A deployment without a mempool surface keeps
+    /// `canonical_miss`, and so does a mempool miss after a canonical read
+    /// that searched the chain of the same epoch. A mempool miss at another
+    /// epoch is `UNAVAILABLE`, because the transaction may have been mined
+    /// into a block this replica has not applied yet. A mempool failure is
+    /// returned instead of `canonical_miss`, because the transaction may be
+    /// pending.
     async fn pending_transaction(
         &self,
         transaction_id: TransactionId,
-        canonical_miss: Status,
+        canonical_miss: CanonicalTransactionMiss,
     ) -> Result<lightwalletd::RawTransaction, Status> {
         let Some(mempool_surface) = self.mempool_surface.as_ref() else {
-            return Err(canonical_miss);
+            return Err(canonical_miss.into_status());
         };
-        mempool_surface
+        let lookup = mempool_surface
             .mempool_transaction(transaction_id)
             .await
-            .map_err(status_from_mempool_surface_error)?
-            .map(|entry| mempool_raw_transaction(&entry))
-            .ok_or(canonical_miss)
+            .map_err(status_from_mempool_surface_error)?;
+        match (lookup, canonical_miss) {
+            (MempoolTransactionLookup::Pending(entry), _) => Ok(mempool_raw_transaction(&entry)),
+            (
+                MempoolTransactionLookup::Absent { chain_epoch_id },
+                CanonicalTransactionMiss::NotInChain { at_epoch_id },
+            ) if chain_epoch_id == at_epoch_id => {
+                Err(CanonicalTransactionMiss::NotInChain { at_epoch_id }.into_status())
+            }
+            (
+                MempoolTransactionLookup::Absent { chain_epoch_id },
+                CanonicalTransactionMiss::NotInChain { at_epoch_id },
+            ) => Err(Status::unavailable(format!(
+                "the live mempool answered at chain epoch {} but this replica read chain epoch {}; retry",
+                chain_epoch_id.value(),
+                at_epoch_id.value(),
+            ))),
+            (
+                MempoolTransactionLookup::Absent { .. },
+                CanonicalTransactionMiss::BelowHistoryFloor(history_floor),
+            ) => Err(history_floor),
+        }
     }
 
     async fn transparent_address_raw_transactions(
@@ -607,15 +630,10 @@ where
                 TxStatus::InMempool(entry) => {
                     return Ok(Response::new(mempool_raw_transaction(&entry)));
                 }
-                TxStatus::NotFound => {
-                    Status::not_found("transaction is not mined in the canonical chain")
-                }
-                _ => Status::not_found(
-                    "transaction status is not representable on the lightwalletd wire",
-                ),
+                _ => CanonicalTransactionMiss::NotInChain { at_epoch_id },
             },
             Err(error @ QueryError::CanonicalHistoryUnavailable { .. }) => {
-                status_from_query_error(&error)
+                CanonicalTransactionMiss::BelowHistoryFloor(status_from_query_error(&error))
             }
             Err(error) => return Err(status_from_query_error(&error)),
         };
@@ -1912,6 +1930,29 @@ fn project_added_to_raw_transaction(
             _ => None,
         },
         Err(error) => Some(Err(status_from_mempool_surface_error(error))),
+    }
+}
+
+/// A `GetTransaction` canonical read that did not find the transaction.
+enum CanonicalTransactionMiss {
+    /// The canonical chain of `at_epoch_id` does not hold the transaction.
+    NotInChain {
+        /// Chain epoch the canonical read searched.
+        at_epoch_id: ChainEpochId,
+    },
+    /// The store's history starts after a checkpoint, so the transaction may
+    /// be mined below the floor this status names.
+    BelowHistoryFloor(Status),
+}
+
+impl CanonicalTransactionMiss {
+    fn into_status(self) -> Status {
+        match self {
+            Self::NotInChain { .. } => {
+                Status::not_found("transaction is not in the canonical chain or the live mempool")
+            }
+            Self::BelowHistoryFloor(history_floor) => history_floor,
+        }
     }
 }
 

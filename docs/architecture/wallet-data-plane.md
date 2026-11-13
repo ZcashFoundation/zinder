@@ -877,6 +877,10 @@ range cap is the memory bound.
 `GetAddressUtxos` and `GetAddressUtxosStream` are not bounded at the read yet.
 They read each address through `TransparentAddressUnspentOutputs`, which
 returns the complete unspent set in memory with no row bound, and then apply
-the response bound. The bound limits the response size but not the read.
+`maxEntries` and the response bound. The bound limits the response size but
+not the read. A paged unspent-output read that stops at the response bound is
+follow-up work.
 
-Do not materialize an unbounded list and truncate it after the fact. The storage and protocol signatures should make that shape impossible.
+Every other compatibility read keeps the bound at the read: it does not
+materialize an unbounded list and truncate it after the fact, and its storage
+and protocol signatures make that shape impossible.

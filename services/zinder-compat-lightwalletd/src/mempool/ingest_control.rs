@@ -35,13 +35,16 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request};
 use zinder_core::{
-    BlockHeight, BlockId, ChainEpochId, MempoolEntry, TransactionId,
-    wire::encode_rpc_transaction_id_hex,
+    BlockHeight, BlockId, ChainEpochId, TransactionId, wire::encode_rpc_transaction_id_hex,
 };
-use zinder_proto::v1::{
-    ingest::{MempoolTransactionRequest, ingest_control_client::IngestControlClient},
-    wallet,
+use zinder_proto::{
+    v1::{
+        ingest::{MempoolTransactionRequest, ingest_control_client::IngestControlClient},
+        wallet,
+    },
+    wire::TransactionAbsence,
 };
+use zinder_query::wallet_ingest_control_request;
 use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_zinder_grpc};
 use zinder_store::{
     EventStreamStartPosition, StreamCursorTokenV1, event_stream_start_message,
@@ -51,7 +54,7 @@ use zinder_store::{
 
 use super::surface::{
     MempoolEventEnvelopeStream, MempoolSnapshotPage, MempoolSurface, MempoolSurfaceError,
-    TipChangeWatcher, TipChangeWatcherError,
+    MempoolTransactionLookup, TipChangeWatcher, TipChangeWatcherError,
 };
 
 type AuthenticatedIngestControlClient = IngestControlClient<AuthenticatedChannel>;
@@ -253,21 +256,16 @@ impl MempoolSurface for IngestControlMempoolSurface {
     async fn mempool_transaction(
         &self,
         transaction_id: TransactionId,
-    ) -> Result<Option<MempoolEntry>, MempoolSurfaceError> {
+    ) -> Result<MempoolTransactionLookup, MempoolSurfaceError> {
         let mut client = self.ingest_control_client().await?;
         let response = match client
-            .mempool_transaction(MempoolTransactionRequest {
+            .mempool_transaction(wallet_ingest_control_request(MempoolTransactionRequest {
                 transaction_id: encode_rpc_transaction_id_hex(transaction_id),
-            })
+            }))
             .await
         {
             Ok(response) => response.into_inner(),
-            Err(status) if status.code() == Code::NotFound => return Ok(None),
-            Err(status) => {
-                return Err(MempoolSurfaceError::Unavailable {
-                    reason: format!("ingest-control mempool_transaction failed: {status}"),
-                });
-            }
+            Err(status) => return mempool_transaction_miss(&status),
         };
         let Some(wallet::transaction_location::Location::InMempool(entry)) =
             response.location.and_then(|location| location.location)
@@ -288,7 +286,36 @@ impl MempoolSurface for IngestControlMempoolSurface {
                     .to_owned(),
             });
         }
-        Ok(Some(entry))
+        Ok(MempoolTransactionLookup::Pending(Box::new(entry)))
+    }
+}
+
+/// Reads a failed `IngestControl.MempoolTransaction` call.
+///
+/// Only a typed `TRANSACTION_NOT_FOUND` absence is a miss, because it names
+/// the writer epoch the miss is coherent with. A bare `NOT_FOUND` cannot be
+/// compared with the canonical read, so it is not reported as an absence.
+fn mempool_transaction_miss(
+    status: &tonic::Status,
+) -> Result<MempoolTransactionLookup, MempoolSurfaceError> {
+    match TransactionAbsence::from_status(status) {
+        Ok(Some(absence)) => Ok(MempoolTransactionLookup::Absent {
+            chain_epoch_id: absence.chain_epoch_id,
+        }),
+        Ok(None) if status.code() == Code::NotFound => Err(MempoolSurfaceError::Unavailable {
+            reason: "ingest-control mempool_transaction answered without a typed absence; \
+                     transaction absence cannot be proven"
+                .to_owned(),
+        }),
+        Ok(None) => Err(MempoolSurfaceError::Unavailable {
+            reason: format!("ingest-control mempool_transaction failed: {status}"),
+        }),
+        Err(metadata_error) => Err(MempoolSurfaceError::Unavailable {
+            reason: format!(
+                "ingest-control mempool_transaction returned a malformed transaction absence: \
+                 {metadata_error}"
+            ),
+        }),
     }
 }
 

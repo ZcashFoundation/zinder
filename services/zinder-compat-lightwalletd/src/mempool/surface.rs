@@ -46,6 +46,23 @@ pub struct MempoolSnapshotPage {
     pub next_cursor: Option<Vec<u8>>,
 }
 
+/// Outcome of a [`MempoolSurface::mempool_transaction`] lookup.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum MempoolTransactionLookup {
+    /// The live mempool holds the transaction.
+    Pending(Box<MempoolEntry>),
+    /// The live mempool does not hold the transaction.
+    ///
+    /// The miss is coherent with `chain_epoch_id`, the writer's canonical
+    /// epoch when it answered. It proves an absence only for a canonical read
+    /// at the same epoch.
+    Absent {
+        /// Writer chain epoch the mempool answered at.
+        chain_epoch_id: ChainEpochId,
+    },
+}
+
 /// Error vocabulary for [`MempoolSurface`] consumers.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -86,12 +103,15 @@ pub trait MempoolSurface: Send + Sync + 'static {
         from_cursor: Option<StreamCursorTokenV1>,
     ) -> Result<MempoolEventEnvelopeStream, MempoolSurfaceError>;
 
-    /// Returns the live mempool entry for `transaction_id`, or `None` when
-    /// the mempool does not hold it.
+    /// Looks `transaction_id` up in the live mempool.
+    ///
+    /// A miss names the chain epoch it is coherent with. A source that cannot
+    /// state that epoch fails with [`MempoolSurfaceError::Unavailable`]
+    /// rather than reporting an absence.
     async fn mempool_transaction(
         &self,
         transaction_id: TransactionId,
-    ) -> Result<Option<MempoolEntry>, MempoolSurfaceError>;
+    ) -> Result<MempoolTransactionLookup, MempoolSurfaceError>;
 }
 
 /// Convenience wrapper for a shared [`MempoolSurface`] handle.

@@ -14,7 +14,7 @@ use zebra_chain::{
 };
 use zinder_compat_lightwalletd::{
     LightwalletdGrpcAdapter, MempoolEventEnvelopeStream, MempoolSnapshotPage, MempoolSurface,
-    MempoolSurfaceError,
+    MempoolSurfaceError, MempoolTransactionLookup,
 };
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, ChainEpoch, ChainEpochId, ChainTipMetadata,
@@ -404,8 +404,16 @@ impl MempoolSurface for AndroidSdkMempoolSurface {
     async fn mempool_transaction(
         &self,
         transaction_id: TransactionId,
-    ) -> Result<Option<MempoolEntry>, MempoolSurfaceError> {
-        Ok((self.entry.transaction_id() == transaction_id).then(|| self.entry.clone()))
+    ) -> Result<MempoolTransactionLookup, MempoolSurfaceError> {
+        if self.entry.transaction_id() == transaction_id {
+            Ok(MempoolTransactionLookup::Pending(Box::new(
+                self.entry.clone(),
+            )))
+        } else {
+            Ok(MempoolTransactionLookup::Absent {
+                chain_epoch_id: synthetic_chain_epoch().id,
+            })
+        }
     }
 }
 

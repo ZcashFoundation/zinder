@@ -14,6 +14,7 @@ pub use grpc::{
 };
 pub use mempool::{
     IngestControlMempoolSurface, MempoolEventEnvelopeStream, MempoolSnapshotPage, MempoolSurface,
-    MempoolSurfaceError, SharedMempoolSurface, SharedTipChangeWatcher, TipChangeWatcher,
-    TipChangeWatcherError, WatchTipChangeWatcher, spawn_ingest_control_tip_change_publisher,
+    MempoolSurfaceError, MempoolTransactionLookup, SharedMempoolSurface, SharedTipChangeWatcher,
+    TipChangeWatcher, TipChangeWatcherError, WatchTipChangeWatcher,
+    spawn_ingest_control_tip_change_publisher,
 };

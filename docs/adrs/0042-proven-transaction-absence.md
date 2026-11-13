@@ -137,11 +137,18 @@ Introducing this contract raised `zinder_proto::CONTRACT_REVISION` to 6.
   such a store it returns a pending transaction at height 0 and answers every
   other miss with `CANONICAL_HISTORY_UNAVAILABLE` instead of `NOT_FOUND`. An
   unpinned lookup still reports a pending transaction as `in_mempool`, so
-  `is_in_mempool` returns `true` for it; for a transaction that is neither pending nor mined above the floor,
-  `is_in_mempool` fails with `CanonicalHistoryUnavailable` instead of
-  returning `false`. The wallet-serving coverage profile builds complete
-  history, so supported wallet-serving deployments are unaffected.
+  `is_in_mempool` returns `true` for it; for a transaction that is neither
+  pending nor mined above the floor, `is_in_mempool` fails with
+  `CanonicalHistoryUnavailable` instead of returning `false`. The
+  wallet-serving coverage profile builds complete history, so supported
+  wallet-serving deployments are unaffected.
 - A replica behind its writer returns `CHAIN_EPOCH_MISSING` for an unpinned
   miss until it catches up to the writer's epoch. Clients retry with backoff.
+- The lightwalletd compatibility `GetTransaction` call compares the same
+  epochs. It answers `NOT_FOUND` only when the writer's mempool missed at the
+  epoch of its canonical read. A mempool miss at another epoch, or a writer
+  miss without the typed absence, is `UNAVAILABLE`: lightwalletd wallets read
+  `NOT_FOUND` as an unknown transaction id and do not see the typed reason,
+  so the retryable answer uses the code they retry.
 - An older client keeps mapping every `NOT_FOUND` to `TxStatus::NotFound`,
   including the failures above, until it upgrades.

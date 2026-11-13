@@ -206,12 +206,20 @@ misses, it asks the writer's live mempool through
 `IngestControl.MempoolTransaction`:
 
 - A pending transaction is returned with its raw bytes at height 0.
-- A transaction in neither is `NOT_FOUND`, as in lightwalletd. On a store
-  whose history starts at a checkpoint, the miss is
-  `CANONICAL_HISTORY_UNAVAILABLE` instead
+- A transaction in neither is `NOT_FOUND`, as in lightwalletd. The mempool
+  miss counts only when the writer answered it at the same chain epoch as the
+  canonical read
   ([ADR-0042](../adrs/0042-proven-transaction-absence.md)).
-- A failed mempool read returns its own status, such as `UNAVAILABLE`, rather
-  than `NOT_FOUND`, because the transaction may be pending.
+- A mempool miss at another chain epoch is `UNAVAILABLE`. The transaction may
+  have been mined into a block this replica has not applied yet, so the lookup
+  is retryable; a later lookup returns it mined or `NOT_FOUND`.
+- On a store whose history starts at a checkpoint, a mempool miss is
+  `CANONICAL_HISTORY_UNAVAILABLE` instead of `NOT_FOUND`, because the
+  transaction may be mined below the checkpoint.
+- A failed or timed-out mempool read is `UNAVAILABLE` rather than
+  `NOT_FOUND`, because the transaction may be pending. So is a writer miss
+  that names no chain epoch. The mempool read has the same 15-second timeout
+  as the native wallet query's `IngestControl` calls.
 - The wallet-serving binary always connects the mempool surface to the
   writer's `IngestControl` endpoint. A `LightwalletdGrpcAdapter` built in Rust
   without `with_mempool_surface` cannot see pending transactions and answers
@@ -224,10 +232,6 @@ unmined and `NOT_FOUND` as an unknown transaction id
 and the Android SDK marks a transaction it cannot fetch as `TxidNotRecognized`
 (zcash-android-wallet-sdk `a95780a`, `CompactBlockProcessor.kt:2404-2430`).
 A just-broadcast transaction therefore reads as pending, not unknown.
-
-The two reads are not one snapshot. A transaction mined between them can read
-as `NOT_FOUND` until this replica applies the block; the next lookup returns
-it mined.
 
 ## Transparent address UTXOs
 
