@@ -33,6 +33,9 @@ pub enum NodeCapability {
     ChainValuePools,
     /// Source can report cumulative value-pool balances for an exact block.
     BlockValuePoolBalances,
+    /// Source stores every historical block body, so any best-chain height
+    /// can be fetched. A pruned node lacks it.
+    HistoricalBlockBodies,
 }
 
 impl fmt::Display for NodeCapability {
@@ -58,6 +61,7 @@ impl NodeCapability {
             Self::OpenRpcDiscovery => "openrpc_discovery",
             Self::ChainValuePools => "chain_value_pools",
             Self::BlockValuePoolBalances => "block_value_pool_balances",
+            Self::HistoricalBlockBodies => "historical_block_bodies",
         }
     }
 }
@@ -75,6 +79,7 @@ const ORDERED_CAPABILITIES: &[NodeCapability] = &[
     NodeCapability::OpenRpcDiscovery,
     NodeCapability::ChainValuePools,
     NodeCapability::BlockValuePoolBalances,
+    NodeCapability::HistoricalBlockBodies,
 ];
 
 const fn capability_bit(capability: NodeCapability) -> u16 {
@@ -91,6 +96,7 @@ const fn capability_bit(capability: NodeCapability) -> u16 {
         NodeCapability::OpenRpcDiscovery => 1 << 9,
         NodeCapability::ChainValuePools => 1 << 10,
         NodeCapability::BlockValuePoolBalances => 1 << 11,
+        NodeCapability::HistoricalBlockBodies => 1 << 12,
     }
 }
 

@@ -56,6 +56,7 @@ const REQUIRED_INGEST_NODE_CAPABILITIES: &[NodeCapability] = &[
     NodeCapability::TipId,
     NodeCapability::TreeState,
     NodeCapability::SubtreeRoots,
+    NodeCapability::HistoricalBlockBodies,
 ];
 
 /// Suffix of the reader-local metadata directory the in-process canonical
@@ -1096,13 +1097,25 @@ async fn ensure_node_capabilities(
                 target: "zinder::ingest",
                 event = "node_capability_missing",
                 capability = capability.name(),
-                "upstream node is missing a capability required by ingestion"
+                "upstream node is missing a capability required by ingestion: {}{}",
+                capability.name(),
+                missing_capability_remediation(*capability),
             );
         }
         return Err(IngestError::from(error).into());
     }
 
     Ok(probed_capabilities)
+}
+
+/// Operator guidance appended to the missing-capability log line.
+fn missing_capability_remediation(capability: NodeCapability) -> &'static str {
+    if capability == NodeCapability::HistoricalBlockBodies {
+        ". The node reports pruned storage or did not report its storage mode. \
+         Point zinder-ingest at an archive node."
+    } else {
+        ""
+    }
 }
 
 fn require_ingest_node_capabilities(
@@ -1672,6 +1685,28 @@ mod tests {
             error,
             zinder_source::SourceError::NodeCapabilityMissing {
                 capability: NodeCapability::TreeState
+            }
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_capability_validation_rejects_pruned_node() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let capabilities = NodeCapabilities::new(
+            ZebraJsonRpcSource::baseline_capabilities()
+                .iter()
+                .filter(|capability| *capability != NodeCapability::HistoricalBlockBodies),
+        )?;
+
+        let error = require_ingest_node_capabilities(capabilities)
+            .err()
+            .ok_or("a node without historical block bodies must be rejected")?;
+        assert!(matches!(
+            error,
+            zinder_source::SourceError::NodeCapabilityMissing {
+                capability: NodeCapability::HistoricalBlockBodies
             }
         ));
 

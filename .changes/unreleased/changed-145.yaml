@@ -1,0 +1,6 @@
+kind: changed
+body: "`zinder-ingest` now refuses to start against a pruned node. At startup it reads `pruned` from `getblockchaininfo` and requires the new `historical_block_bodies` capability. A node that reports `pruned: true` or omits the field makes readiness report `node_capability_missing`, and the process exits before it touches the store. This applies to restarts of an existing store too, so point ingest at an archive Zebra or Zakura node. `zinder-query` and `zinder-compat-lightwalletd` still accept pruned nodes. A Zakura node built by verified-commitment-trees fast sync permanently refuses tree states and subtree roots below its last checkpoint, and those refusals are now classed `capability_missing`. Native query returns them as the non-retryable `NODE_CAPABILITY_MISSING` instead of a retryable node error."
+time: 2026-11-13T12:00:00Z
+custom:
+  Bump: minor
+  PR: "145"

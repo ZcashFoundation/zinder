@@ -29,7 +29,7 @@ version and commit appear in the `zinder_build_info` metric and native
 | `syncing` | Owned state is healthy but behind its target. |
 | `ready` | The runtime can serve its contract. |
 | `node_unavailable` | Zebra or its transport is temporarily unavailable. |
-| `node_capability_missing` | Zebra cannot provide a required capability. |
+| `node_capability_missing` | The node cannot provide a required capability. |
 | `upstream_not_ready` | Zebra is reachable but not sufficiently synchronized. |
 | `storage_unavailable` | Required local storage cannot be opened or read. |
 | `schema_mismatch` | Persisted identity or schema differs from the binary. |

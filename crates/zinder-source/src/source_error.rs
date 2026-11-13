@@ -314,6 +314,37 @@ pub enum SourceError {
         reason: String,
     },
 
+    /// The node permanently lacks the commitment-tree state at `height`.
+    ///
+    /// A node built by a fast-sync path that skips per-height trees refuses
+    /// tree-state reads below its last checkpoint. Retrying the same node
+    /// cannot succeed, so this is classed as a missing capability rather than
+    /// a changed upstream view.
+    #[error("tree state at height {height:?} is permanently unavailable from this node: {reason}")]
+    HistoricalTreeStateUnavailable {
+        /// Requested block height.
+        height: BlockHeight,
+        /// Node error message.
+        reason: String,
+    },
+
+    /// The node permanently lacks the requested shielded subtree roots.
+    ///
+    /// A node built by a fast-sync path that skips per-height trees never
+    /// records subtrees completed below its last checkpoint, and continued
+    /// synchronization does not restore them.
+    #[error(
+        "{protocol:?} subtree roots from {start_index:?} are permanently unavailable from this node: {reason}"
+    )]
+    HistoricalSubtreeRootsUnavailable {
+        /// Shielded protocol requested.
+        protocol: zinder_core::ShieldedProtocol,
+        /// First requested subtree-root index.
+        start_index: zinder_core::SubtreeRootIndex,
+        /// Node error message.
+        reason: String,
+    },
+
     /// The node response did not match the expected JSON-RPC contract.
     ///
     /// Prefer this variant when the JSON-RPC envelope or response shape is
@@ -473,9 +504,16 @@ impl SourceFailureClass {
 impl SourceError {
     /// Returns true when the upstream node lacks a capability the request
     /// requires, a condition operator reconfiguration must clear.
+    ///
+    /// This covers every error classed
+    /// [`SourceFailureClass::CapabilityMissing`], including the permanent
+    /// historical tree-state and subtree-root refusals of a fast-synced node.
     #[must_use]
     pub const fn is_node_capability_missing(&self) -> bool {
-        matches!(self, Self::NodeCapabilityMissing { .. })
+        matches!(
+            self.upstream_classification(),
+            SourceFailureClass::CapabilityMissing
+        )
     }
 
     /// Returns the operator-facing class describing what the upstream did.
@@ -499,7 +537,11 @@ impl SourceError {
             Self::MempoolStreamUnavailable { .. } | Self::ChainTipStreamUnavailable { .. } => {
                 SourceFailureClass::StreamDisconnected
             }
-            Self::NodeCapabilityMissing { .. } => SourceFailureClass::CapabilityMissing,
+            Self::NodeCapabilityMissing { .. }
+            | Self::HistoricalTreeStateUnavailable { .. }
+            | Self::HistoricalSubtreeRootsUnavailable { .. } => {
+                SourceFailureClass::CapabilityMissing
+            }
             Self::SourceProtocolMismatch { .. } => SourceFailureClass::ProtocolMismatch,
             Self::InvalidBlockHashHex { .. }
             | Self::InvalidRawBlockHex { .. }

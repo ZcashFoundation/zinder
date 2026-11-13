@@ -297,7 +297,8 @@ struct IngestSection {
     /// requested. Omitted values remain false for every coverage.
     explorer_views: bool,
     /// Chain-truth invariant: how deep into the upstream tip the
-    /// settled-tip cliff sits. Defaults to `100`.
+    /// settled-tip cliff sits. Defaults to
+    /// `zinder_store::DEFAULT_REORG_WINDOW_BLOCKS`.
     reorg_window_blocks: Option<u32>,
     /// Phase classifier knobs for `zinder-ingest probe`.
     phase_classification: IngestPhaseClassificationSection,
