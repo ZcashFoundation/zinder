@@ -251,10 +251,17 @@ transaction's position in the block. The order differs only when a positive
 One response returns at most `LightwalletdResponseLimits::max_address_utxos`
 outputs, 100,000 by default, the same cap Zebra puts on `getaddressutxos`
 (Zebra 7.0.0, `zebra-rpc/src/methods.rs:4142`). A request that would return
-more fails with `RESOURCE_EXHAUSTED` and asks the client to page with
-`startHeight` and `maxEntries`. Zinder never drops rows silently, because
+more fails with `RESOURCE_EXHAUSTED`. Zinder never drops rows silently, because
 librustzcash, the Android SDK, Brave, and Zingo add these rows up as the
-address balance.
+address balance. `GetAddressUtxosStream` has the same bound.
+
+The protocol has no lossless way to page past the bound. A positive
+`maxEntries` at or below the bound returns the oldest outputs, and a client can
+continue from the next height only when that page ends at a block boundary. If
+the page ends inside a block, repeating that block's height returns the same
+first outputs again, and starting at the next height skips the rest of that
+block. A single block that holds more outputs for the requested addresses than
+the bound cannot be served.
 
 lightwalletd on Zebra handles the same overflow differently. Zebra rejects the
 query, and lightwalletd maps the unrecognized error to status `OK`, so the

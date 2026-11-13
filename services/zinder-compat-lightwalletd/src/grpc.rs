@@ -367,8 +367,7 @@ where
         let response_limit = self.response_limits.max_address_utxos.get();
         if replies.len() > u32_to_usize(response_limit) {
             return Err(Status::resource_exhausted(format!(
-                "{} unspent outputs match, more than the {response_limit} one response returns; \
-                 page with startHeight and maxEntries",
+                "{} unspent outputs match, more than the {response_limit} one response returns",
                 replies.len(),
             )));
         }
