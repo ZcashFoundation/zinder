@@ -390,6 +390,11 @@ Zebra 7.0.0 and on Zakura 1.8.6. It covers:
   in which each node advertises its network upgrades.
 - Typed broadcast outcomes across NU7, through the node broadcaster and,
   with `ZINDER_TEST_QUERY_GRPC_ADDR`, through a running `zinder-query`.
+- A transparent-to-Ironwood shielding spend that `zinder-testkit` builds with
+  a real Halo2 proof, which each node accepts and mines, and which Zinder
+  indexes with its two Ironwood actions
+  (`shielded_outputs_are_indexed_after_mining`). The workflow runs it after
+  the activation test, so on a chain past NU7.
 - The rest of the live suite on a chain past NU7, including the indexer
   mempool tests and the indexer restart test, over a loopback indexer channel:
   plaintext on Zebra, and mutual TLS with a private CA on Zakura.
@@ -400,13 +405,15 @@ Zebra 7.0.0 and on Zakura 1.8.6. It covers:
 It does not cover:
 
 - Any node other than Zebra 7.0.0 and Zakura 1.8.6, and Zakura's Sapling and
-  Orchard pools, which its coinbase cannot pay.
+  Orchard pools, which its coinbase cannot pay. A Zakura block with an Orchard
+  shielding spend is covered only by a captured fixture; see
+  [Capturing node fixtures](capturing-node-fixtures.md).
 - Indexer TLS that verifies the node against the system roots or through a
   `server_name` override, or that reloads rotated certificate files.
 - NU7 activation on Testnet or Mainnet, or production capacity.
-- Shielded spends. The shielded pools hold only coinbase outputs, so no
-  shielded nullifier is exercised and no subtree completes; both sides report
-  empty subtree-root lists.
+- Spends of shielded notes. The shielded pools receive only coinbase outputs
+  and shielding spends, so no shielded nullifier is exercised and no subtree
+  completes; both sides report empty subtree-root lists.
 - Reorgs deeper than the reorg window, and restarts of the Zinder runtimes.
 - Tests that return early without their own endpoints, listed in [Run](#run).
 

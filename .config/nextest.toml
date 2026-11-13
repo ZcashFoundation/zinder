@@ -98,6 +98,15 @@ filter = "test(/^live::nu7_activation::/)"
 retries = { count = 0, backoff = "fixed", delay = "0s" }
 
 [[profile.ci-live.overrides]]
+# The shielded broadcast test builds a Halo2 proof and then constructs a
+# canonical store from genesis through the tip. A retry would repeat that cost
+# against a chain the failed attempt already advanced, so it reports the first
+# failure instead.
+filter = "test(shielded_outputs_are_indexed_after_mining)"
+slow-timeout = { period = "180s", terminate-after = 1 }
+retries = { count = 0, backoff = "fixed", delay = "0s" }
+
+[[profile.ci-live.overrides]]
 # The real-client flow creates a wallet, spends a unique UTXO, and mines
 # confirmations. Retrying after a failure would exercise a different chain
 # state, not the failed client interaction.
