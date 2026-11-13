@@ -63,8 +63,10 @@ if ! grep -qF "miner_address = \"${miner_address}\"" "$capture_config"; then
   exit 1
 fi
 
+# rpc exits on failure, so probe in a subshell to keep retrying until the node
+# answers; the call after the loop reports the error if it never does.
 for _ in $(seq 1 60); do
-  if rpc getblockcount '[]' >/dev/null 2>&1; then
+  if (rpc getblockcount '[]') >/dev/null 2>&1; then
     break
   fi
   sleep 2
