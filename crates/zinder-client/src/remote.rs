@@ -111,9 +111,11 @@ const TCP_KEEPALIVE: Duration = Duration::from_mins(1);
 
 /// Oldest native wallet contract revision this client can safely consume.
 ///
-/// Revision 7 sends the `CompactBlocksInRange` chain view once as a leading
-/// stream header instead of on every block.
-pub const MIN_SUPPORTED_CONTRACT_REVISION: u32 = 7;
+/// Revision 8 adds `TransparentOutpointSpendStatus` and removes the transparent
+/// reads that no packaged consumer calls. It keeps the revision 7
+/// `CompactBlocksInRange` stream, which sends the chain view once as a leading
+/// header instead of on every block.
+pub const MIN_SUPPORTED_CONTRACT_REVISION: u32 = 8;
 
 impl RemoteChainIndex {
     /// Builds a remote-chain-index handle pointed at a `WalletQuery` endpoint.
@@ -2912,13 +2914,13 @@ mod tests {
     }
 
     #[test]
-    fn contract_revision_seven_is_the_minimum() {
+    fn contract_revision_eight_is_the_minimum() {
         assert!(matches!(
-            ensure_supported_contract_revision(6),
+            ensure_supported_contract_revision(7),
             Err(IndexerError::FailedPrecondition { .. })
         ));
-        assert!(ensure_supported_contract_revision(7).is_ok());
         assert!(ensure_supported_contract_revision(8).is_ok());
+        assert!(ensure_supported_contract_revision(9).is_ok());
     }
 
     #[test]

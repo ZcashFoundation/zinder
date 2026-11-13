@@ -158,8 +158,11 @@ The readiness `materialized_view_identities` field and the
 admitted the Explorer view store sets them, and the metric no longer has a
 `preset` label.
 
-Removing request fields, methods, and response fields changes the native wire
-contract in place, so `zinder_proto::CONTRACT_REVISION` is 7.
+Removing request fields, methods, and response fields, and adding
+`TransparentOutpointSpendStatus`, changes the native wire contract in place, so
+`zinder_proto::CONTRACT_REVISION` is 8. A revision 7 server still serves the
+removed methods and lacks the new one, so
+`zinder_client::MIN_SUPPORTED_CONTRACT_REVISION` is also 8.
 
 ## Old-to-new mapping
 
@@ -205,14 +208,20 @@ and the shape the method would take.
   Canonical storage and the wallet projection are unaffected.
 - A store built with the old `wallet` preset records only part of the
   manifest and is refused the same way.
-- Native clients built against contract revision 6 that call a removed method
-  receive `UNIMPLEMENTED`. A revision-6 client that still sends
-  `descending = true` is answered in ascending order, because the server
-  ignores the reserved field.
-- `zinder-query` admits `zinder-ingest` only at the same contract revision,
-  so this release is a coordinated upgrade: stop both, replace both, and start
-  ingest before query. A mixed revision-6 and revision-7 pair fails admission
-  in either direction.
+- Older native clients and the revision 8 `zinder-client` cannot talk across
+  this change in either direction. A client built against revision 7 or
+  earlier receives `UNIMPLEMENTED` when it calls a removed method, and one
+  that still sends `descending = true` is answered in ascending order, because
+  the server ignores the reserved field. The revision 8 `zinder-client`
+  refuses any server below revision 8 at preflight.
+- No upgrade order is safe for native clients, so the rollout is a
+  coordinated cutover. Release consumers such as Zally-based wallets on the
+  revision 8 `zinder-client`, then cut the Zinder services and those consumers
+  over together.
+- `zinder-query` admits `zinder-ingest` only at its own contract revision and
+  fails at startup against a revision 7 ingest, so stop both, replace both,
+  and start ingest before query. A mixed revision 7 and revision 8 pair fails
+  admission in either direction.
 - The writer's mempool index keeps only the outpoint sets that reject
   conflicting live entries; it no longer holds a by-address index.
 - Adding a transparent method again requires a named consumer call site,

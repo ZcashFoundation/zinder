@@ -101,8 +101,8 @@ when the server does any of the following:
 
 Contract revision 7 introduced this shape. In revision 6 and earlier, every
 chunk repeated the full `ChainView` beside its block. `zinder-client` requires
-revision 7, so it rejects an older server at preflight instead of misreading
-its stream. The removed fields map directly to the new ones:
+revision 8, which keeps this shape, so it rejects an older server at preflight
+instead of misreading its stream. The removed fields map directly to the new ones:
 
 | Revision 6 field | Revision 7 replacement |
 | --- | --- |
