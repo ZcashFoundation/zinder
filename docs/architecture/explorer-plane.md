@@ -390,7 +390,7 @@ The explorer plane fails independently from canonical state.
 - An explorer service crash does not stop a separately deployed
   `zinder-query` runtime. Its admitted wallet primitives remain independent of
   explorer state.
-- An explorer materialized view becoming inconsistent does not corrupt canonical state. Operators drop the materialized-view store and rebuild from retained canonical events. When the materialized-view store is absent, or the attached store lacks the exact Explorer view manifest, `zinder-explorer` starts with materialized-view-backed capabilities omitted.
+- An explorer materialized view becoming inconsistent does not corrupt canonical state. Operators drop the materialized-view store and rebuild from retained canonical events. When the materialized-view store is absent or cannot be opened, `zinder-explorer` starts with materialized-view-backed capabilities omitted. A store whose recorded consumers do not match the bundled Explorer view manifest is different: `zinder-explorer` exits at startup with `ConsumerNotDeclared` or `ExplorerViewManifestRequiresFreshStore`, and the operator rebuilds the views on a fresh path ([Rebuild Explorer views after a manifest change](../runbooks/deploying-on-a-vm.md#rebuild-explorer-views-after-a-manifest-change)).
 - Explorer readiness causes flow through the `/readyz` endpoint and `WalletQuery.ServerInfo` capability gating; they never propagate to the wallet plane's readiness.
 
 ## Cursor expiry contract
