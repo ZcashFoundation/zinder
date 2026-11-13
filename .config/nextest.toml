@@ -39,6 +39,14 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 filter = "test(every_bundled_consumer_is_reorg_path_independent)"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
+[[profile.default.overrides]]
+# These tests build an Orchard or Ironwood bundle with a real Halo2 proof,
+# including the proving key, which each test process builds once. That takes
+# seconds even with the optimized dev profile of the proving crates, and more
+# on a contended runner.
+filter = "test(/^transparent_signer::tests::shielding_spend_.*_pays_one_/)"
+slow-timeout = { period = "60s", terminate-after = 2 }
+
 [profile.ci-perf]
 default-filter = "test(/^perf::/)"
 slow-timeout = { period = "5m", terminate-after = 1 }

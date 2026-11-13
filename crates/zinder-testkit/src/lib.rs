@@ -17,6 +17,8 @@
 //!   stores, then opens immutable secondaries at one admitted serving fence.
 //! - [`process_crash`] runs a child test that aborts at an armed crash point,
 //!   so a parent test can reopen the store and assert crash recovery.
+//! - [`TransparentTestKey`] signs transparent and shielding spends of a fixed
+//!   test seed's outputs, and [`OrchardTestKey`] receives their shielded notes.
 //! - [`MockTransactionBroadcaster`] implements
 //!   [`zinder_source::TransactionBroadcaster`] with configurable per-call
 //!   outcomes and a recording mode that captures calls for later inspection.
@@ -49,6 +51,7 @@ pub mod materialized_view_fixture;
 pub mod mock_mempool_source;
 pub mod mock_transaction_broadcaster;
 pub mod network_upgrade_fixtures;
+pub mod orchard_test_key;
 pub mod process_crash;
 pub mod transparent_signer;
 pub mod wallet_serving_store_fixture;
@@ -80,9 +83,10 @@ pub use mock_transaction_broadcaster::MockTransactionBroadcaster;
 pub use network_upgrade_fixtures::{
     local_network_from_activations, sample_regtest_upgrade_activations,
 };
+pub use orchard_test_key::{OrchardAddress, OrchardTestKey, regtest_unified_address};
 pub use transparent_signer::{
-    LocalNetwork, P2pkhSpendArgs, TRANSPARENT_BROADCAST_TEST_SEED, TransparentAddress,
-    TransparentSignerError, TransparentTestKey, ZIP317_FEE_ONE_IN_ONE_OUT_ZATS,
-    regtest_local_network,
+    LocalNetwork, P2pkhShieldingSpendArgs, P2pkhSpendArgs, ShieldedOutputPool,
+    TRANSPARENT_BROADCAST_TEST_SEED, TransparentAddress, TransparentSignerError,
+    TransparentTestKey, ZIP317_FEE_ONE_IN_ONE_OUT_ZATS, regtest_local_network,
 };
 pub use wallet_serving_store_fixture::WalletServingStoreFixture;
