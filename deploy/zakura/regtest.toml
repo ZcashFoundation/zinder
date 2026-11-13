@@ -24,6 +24,11 @@
 # any other address, and its QUIC endpoint otherwise binds 0.0.0.0:8234. Run
 # the container with host networking so the host reaches these ports.
 #
+# The indexer listener below is plaintext. The live workflow adds mutual TLS
+# with `ZAKURA_RPC__INDEXER_TLS__CERT_FILE`, `ZAKURA_RPC__INDEXER_TLS__KEY_FILE`,
+# and `ZAKURA_RPC__INDEXER_TLS__CLIENT_CA_FILE`, pointing at material from
+# scripts/generate-live-indexer-tls.sh.
+#
 # Environment variables cannot set the activation keys: config-rs lowercases
 # them, and `NU6.1` contains the separator. Mount this file and pass it to
 # `zakurad --config`.

@@ -6,7 +6,8 @@ name: live-tests
 #     once against a Dockerized Zebra 7.0.0 and once against a Dockerized
 #     Zakura 1.8.6 Regtest node. Both activate every upgrade through NU7 on the
 #     same schedule (deploy/zebra/regtest.toml, deploy/zakura/regtest.toml).
-#     Both legs must pass on a release commit.
+#     The Zebra leg reads the indexer over plaintext and the Zakura leg over
+#     mutual TLS. Both legs must pass on a release commit.
 #   - testnet runs weekly against a hosted testnet node
 #   - mainnet is workflow_dispatch-only until runner topology and trigger
 #     ownership are settled.
@@ -17,7 +18,7 @@ on:
     # Keep this list identical in live-tests.yml and parity-compat.yml. It
     # covers every crate the live and parity tests exercise, the workspace
     # manifest and lockfile that pin the consensus cohort, the node
-    # configurations, the mining script, and both workflows.
+    # configurations, the mining and indexer TLS scripts, and both workflows.
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
@@ -31,6 +32,7 @@ on:
       - "deploy/zakura/**"
       - "deploy/zebra/**"
       - "scripts/mine-live-regtest.sh"
+      - "scripts/generate-live-indexer-tls.sh"
       - ".github/workflows/live-tests.yml"
       - ".github/workflows/parity-compat.yml"
   schedule:
@@ -76,7 +78,7 @@ jobs:
             indexer_grpc_addr: http://127.0.0.1:39155
           - node: zakura
             container: zakura-regtest
-            indexer_grpc_addr: http://127.0.0.1:39230
+            indexer_grpc_addr: https://127.0.0.1:39230
     # Every leg starts its own node on these loopback ports, so the node
     # address comes from the matrix rather than from repository secrets. Both
     # nodes run with cookie auth disabled and ignore the basic-auth pair.
@@ -127,12 +129,32 @@ jobs:
             -e ZEBRA_MINING__MINER_ADDRESS=tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx \
             docker.io/zfnd/zebra:7.0.0@sha256:a70d2be8ffef3a4b6e37355724e36a0e6c1838e46baa28bfb216739f00cf2d34
 
+      # The Zakura leg serves its indexer over mutual TLS, so the indexer tests
+      # run Zinder's TLS client against a real node while the Zebra leg covers
+      # the plaintext channel. The material is throwaway, signed by one CA, and
+      # readable only by the runner user, which Zakura runs as. The indexer
+      # steps below read the client paths from these variables; on the Zebra
+      # leg they are unset, so the TLS settings resolve as absent.
+      - name: Generate indexer mTLS material
+        if: matrix.node == 'zakura'
+        run: |
+          tls_dir="${RUNNER_TEMP}/indexer-tls"
+          scripts/generate-live-indexer-tls.sh "${tls_dir}"
+          {
+            echo "INDEXER_TLS_DIR=${tls_dir}"
+            echo "INDEXER_TLS_CA_CERT_PATH=${tls_dir}/ca.pem"
+            echo "INDEXER_TLS_CLIENT_CERT_PATH=${tls_dir}/client.pem"
+            echo "INDEXER_TLS_CLIENT_KEY_PATH=${tls_dir}/client-key.pem"
+          } >> "${GITHUB_ENV}"
+
       # Zakura refuses a plaintext indexer listener on a non-loopback address,
       # and a published port needs one inside the container, so Zakura runs on
       # the host network with every listener on loopback
       # (deploy/zakura/regtest.toml). It runs as the runner user on a host
       # state directory, bypassing the image entrypoint that drops root to
-      # UID 10001.
+      # UID 10001, so it can read the indexer key generated above. The
+      # `ZAKURA_RPC__INDEXER_TLS__*` variables turn on mutual TLS for the
+      # loopback indexer listener.
       #
       # Zakura has no `generatetoaddress`, and its coinbase cannot pay Sapling
       # or Orchard, so the shielded prefix comes from two starts on the same
@@ -155,6 +177,10 @@ jobs:
               --health-interval 5s --health-timeout 5s --health-retries 12 \
               -v "${GITHUB_WORKSPACE}/deploy/zakura/regtest.toml:/etc/zakura/zakurad.toml:ro" \
               -v "${state_dir}:/var/lib/zakura/state" \
+              -v "${INDEXER_TLS_DIR}:/etc/zakura/indexer-tls:ro" \
+              -e ZAKURA_RPC__INDEXER_TLS__CERT_FILE=/etc/zakura/indexer-tls/server.pem \
+              -e ZAKURA_RPC__INDEXER_TLS__KEY_FILE=/etc/zakura/indexer-tls/server-key.pem \
+              -e ZAKURA_RPC__INDEXER_TLS__CLIENT_CA_FILE=/etc/zakura/indexer-tls/ca.pem \
               "$@" \
               docker.io/zakuracore/zakura:1.8.6@sha256:e514c89b751b685686690098928507aaa994311e6b90c79373c55b0afaa45d50 \
               --config /etc/zakura/zakurad.toml start
@@ -202,6 +228,9 @@ jobs:
       - name: Run T3 live tests against regtest
         env:
           ZINDER_NODE__INDEXER_GRPC_ADDR: ${{ matrix.indexer_grpc_addr }}
+          ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH: ${{ env.INDEXER_TLS_CA_CERT_PATH }}
+          ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH: ${{ env.INDEXER_TLS_CLIENT_CERT_PATH }}
+          ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH: ${{ env.INDEXER_TLS_CLIENT_KEY_PATH }}
         # Run every live test except mainnet-only ones, the activation test
         # above, and the node restart test below. Regtest is the only network
         # where deep_chain and latency fit in CI budgets without checkpoint
@@ -215,6 +244,9 @@ jobs:
       - name: Run the node restart test against regtest
         env:
           ZINDER_NODE__INDEXER_GRPC_ADDR: ${{ matrix.indexer_grpc_addr }}
+          ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH: ${{ env.INDEXER_TLS_CA_CERT_PATH }}
+          ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH: ${{ env.INDEXER_TLS_CLIENT_CERT_PATH }}
+          ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH: ${{ env.INDEXER_TLS_CLIENT_KEY_PATH }}
           ZINDER_TEST_INDEXER_CONTAINER_NAME: ${{ matrix.container }}
         # This test restarts the node container, so it runs alone after every
         # other live test has finished. A nextest group only serializes its own
