@@ -217,7 +217,9 @@ other projects. Start the node with these settings:
 
 Zakura refuses to start a plaintext indexer gRPC listener on a non-loopback
 address. The Zakura env files therefore leave
-`ZINDER_NODE__INDEXER_GRPC_ADDR` empty, and ingest polls the mempool.
+`ZINDER_NODE__INDEXER_GRPC_ADDR` empty, and ingest polls the mempool. To stream
+mempool events from Zakura instead, follow
+[Stream mempool events over indexer TLS](#stream-mempool-events-over-indexer-tls).
 
 Zebra and Zakura write the cookie as UID 10001 with mode 0600, and replace it
 on every start. The Zinder runtimes run as UID 1000 and cannot read it. Run
