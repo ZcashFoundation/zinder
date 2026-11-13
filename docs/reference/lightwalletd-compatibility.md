@@ -219,7 +219,8 @@ misses, it asks the writer's live mempool through
 - A failed or timed-out mempool read is `UNAVAILABLE` rather than
   `NOT_FOUND`, because the transaction may be pending. So is a writer miss
   that names no chain epoch. The mempool read has the same 15-second timeout
-  as the native wallet query's `IngestControl` calls.
+  as the native wallet query's `IngestControl` calls, and the timeout covers
+  the first connection to the writer as well as the call itself.
 - The wallet-serving binary always connects the mempool surface to the
   writer's `IngestControl` endpoint. A `LightwalletdGrpcAdapter` built in Rust
   without `with_mempool_surface` cannot see pending transactions and answers

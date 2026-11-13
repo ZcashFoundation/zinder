@@ -30,7 +30,7 @@ use zinder_runtime::{
     connect_zinder_grpc,
 };
 /// Bound applied to native wallet unary ingest-control calls and stream establishment.
-pub(crate) const WALLET_INGEST_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+pub const WALLET_INGEST_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUIRED_CAPABILITIES: [&str; 5] = [
     INGEST_CONTROL_SERVER_INFO_V1,
     INGEST_CONTROL_WRITER_STATUS_V1,

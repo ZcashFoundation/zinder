@@ -49,7 +49,8 @@ pub use grpc::{
     transparent_outpoint_spend_status_response, tree_state_at_response, visible_tip_block_response,
 };
 pub use ingest_control::{
-    AdmittedIngestControl, IngestControlAdmissionError, wallet_ingest_control_request,
+    AdmittedIngestControl, IngestControlAdmissionError, WALLET_INGEST_CONTROL_REQUEST_TIMEOUT,
+    wallet_ingest_control_request,
 };
 pub use native_wallet_endpoint_capabilities::{
     NativeWalletEndpointCapabilities, UpstreamNodeCapabilities,
