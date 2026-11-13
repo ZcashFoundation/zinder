@@ -1,0 +1,104 @@
+# Zakura 1.8.6 Regtest configuration for Zinder's live and parity suites.
+#
+# The activation schedule, funding streams, and lockbox disbursement match
+# deploy/zebra/regtest.toml, so a live run crosses the same upgrades at the
+# same heights on either node:
+#
+#   height 1   Canopy
+#   height 2   NU5     (v5 transactions, Orchard)
+#   height 3   NU6     (lockbox funding stream)
+#   height 4   NU6.1   (one-time lockbox disbursement)
+#   height 5   NU6.2
+#   height 6   NU6.3   (v6 transactions, Ironwood)
+#   height 140 NU7     (ZIP 2003 rejects v4 transactions)
+#
+# Zakura's coinbase cannot pay Sapling or Orchard. A unified miner address
+# pays its transparent receiver before NU6.3 and an Ironwood action from NU6.3
+# onward. Zakura also has no `generatetoaddress`, so the live workflows start
+# it twice on the same state: first with the unified address below as miner,
+# to mine 10 blocks whose last five put notes in the Ironwood tree, then with
+# `ZAKURA_MINING__MINER_ADDRESS` set to the transparent broadcast test key to
+# mine the rest. See "Regtest through NU7" in docs/runbooks/testing.md.
+#
+# Every listener binds loopback: Zakura refuses a plaintext indexer listener on
+# any other address, and its QUIC endpoint otherwise binds 0.0.0.0:8234. Run
+# the container with host networking so the host reaches these ports.
+#
+# Environment variables cannot set the activation keys: config-rs lowercases
+# them, and `NU6.1` contains the separator. Mount this file and pass it to
+# `zakurad --config`.
+
+[network]
+network = "Regtest"
+listen_addr = "127.0.0.1:38233"
+cache_dir = false
+initial_testnet_peers = []
+
+[network.zakura]
+listen_addr = "127.0.0.1:38234"
+
+[network.testnet_parameters]
+# Funding streams whose effective height ranges overlap are rejected, so each
+# stream below starts where the previous one ends.
+extend_funding_stream_addresses_as_required = true
+
+[network.testnet_parameters.activation_heights]
+Overwinter = 1
+Sapling = 1
+Blossom = 1
+Heartwood = 1
+Canopy = 1
+NU5 = 2
+NU6 = 3
+"NU6.1" = 4
+"NU6.2" = 5
+"NU6.3" = 6
+NU7 = 140
+
+# NU6 until NU6.1: the ZIP 1015 lockbox and Major Grants streams.
+[[network.testnet_parameters.funding_streams]]
+height_range = { start = 3, end = 4 }
+recipients = [
+  { receiver = "Deferred", numerator = 12 },
+  { receiver = "MajorGrants", numerator = 8, addresses = ["t26ovBdKAJLtrvBsE2QGF4nqBkEuptuPFZz"] },
+]
+
+# NU6.1 onward, continuing across NU7 as the Mainnet streams do.
+[[network.testnet_parameters.funding_streams]]
+height_range = { start = 4, end = 100000 }
+recipients = [
+  { receiver = "Deferred", numerator = 12 },
+  { receiver = "MajorGrants", numerator = 8, addresses = ["t26ovBdKAJLtrvBsE2QGF4nqBkEuptuPFZz"] },
+]
+
+# The ZIP 271 one-time lockbox disbursement in the NU6.1 activation block.
+# Zakura rejects that block unless at least one disbursement is configured; a
+# single zero-value P2SH output is the smallest entry that satisfies the rule
+# and leaves the deferred pool untouched.
+[[network.testnet_parameters.lockbox_disbursements]]
+address = "t2RnBRiqrN1nW4ecZs1Fj3WWjNdnSs4kiX8"
+amount = 0
+
+[state]
+cache_dir = "/var/lib/zakura/state"
+ephemeral = false
+
+[rpc]
+listen_addr = "127.0.0.1:39232"
+indexer_listen_addr = "127.0.0.1:39230"
+# Regtest keeps `generate`, `invalidateblock`, and `reconsiderblock` on the
+# unauthenticated listener. The suites send a basic-auth pair that Zakura
+# ignores in this mode.
+enable_cookie_auth = false
+
+[health]
+listen_addr = "127.0.0.1:38080"
+# A Regtest node has no peers; `/healthy` would otherwise report 503 forever.
+min_connected_peers = 0
+
+[mining]
+# The default Regtest unified address, used for the first 10 blocks only.
+miner_address = "uregtest1efxggx6lduhm2fx5lnrhxv7h7kpztlpa3ahf3n4w0q0zj5epj4av9xjq6ljsja3xk8z7rzd067kc7mgpy9448rdfzpfjz5gq389zdmpgnk6rp4ykk0xk6cmqw6zqcrnmsuaxv3yzsvcwsd4gagtalh0uzrdvy03nhmltjz2eu0232qlcs0zvxuqyut73yucd9gy5jaudnyt7yqhgpqv"
+
+[tracing]
+use_color = false

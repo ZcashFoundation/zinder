@@ -16,9 +16,10 @@
 #
 # `scripts/mine-live-regtest.sh` mines the shielded prefix and the funded
 # transparent range below NU7, so a suite can broadcast before and after the
-# activation. Environment variables cannot set these keys: config-rs lowercases
-# them, and `NU6.1` contains the separator. Mount this file and point
-# `CONFIG_FILE_PATH` at it.
+# activation. deploy/zakura/regtest.toml runs Zakura on the same schedule.
+# Environment variables cannot set these keys: config-rs lowercases them, and
+# `NU6.1` contains the separator. Mount this file and point `CONFIG_FILE_PATH`
+# at it.
 
 [network]
 network = "Regtest"
@@ -56,6 +57,15 @@ recipients = [
   { receiver = "Deferred", numerator = 12 },
   { receiver = "MajorGrants", numerator = 8, addresses = ["t26ovBdKAJLtrvBsE2QGF4nqBkEuptuPFZz"] },
 ]
+
+# The ZIP 271 one-time lockbox disbursement in the NU6.1 activation block.
+# Zakura rejects that block unless at least one disbursement is configured; a
+# single zero-value P2SH output is the smallest entry that satisfies the rule
+# and leaves the deferred pool untouched. deploy/zakura/regtest.toml carries
+# the same entry, so both nodes mine the same coinbase shape.
+[[network.testnet_parameters.lockbox_disbursements]]
+address = "t2RnBRiqrN1nW4ecZs1Fj3WWjNdnSs4kiX8"
+amount = 0
 
 [state]
 ephemeral = false

@@ -2,8 +2,10 @@ name: parity-compat
 
 # T3 (live) fixed-fence parity diff between Zinder's `zinder-compat-lightwalletd`
 # and the pinned upstream `electriccoinco/lightwalletd` Go reference, both
-# pointed at the same pinned regtest Zebra node. Mempool parity remains outside
-# this workflow until dedicated ingest-control composition is restored.
+# pointed at the same pinned regtest node. One leg runs against Zebra 7.0.0 and
+# one against Zakura 1.8.6; both legs must pass on a release commit. Mempool
+# parity remains outside this workflow until dedicated ingest-control
+# composition is restored.
 #
 # Test sources: services/zinder-compat-lightwalletd/tests/live/parity_against_lightwalletd.rs
 
@@ -12,17 +14,24 @@ on:
     - cron: "47 2 * * *"
   workflow_dispatch:
   pull_request:
+    # Keep this list identical in live-tests.yml and parity-compat.yml. It
+    # covers every crate the live and parity tests exercise, the workspace
+    # manifest and lockfile that pin the consensus cohort, the node
+    # configurations, the mining script, and both workflows.
     paths:
-      - "services/zinder-compat-lightwalletd/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".config/nextest.toml"
+      - "crates/**"
       - "services/zinder-bench/**"
+      - "services/zinder-compat-lightwalletd/**"
+      - "services/zinder-explorer/**"
       - "services/zinder-ingest/**"
-      - "crates/zinder-proto/proto/compat/lightwalletd/**"
       - "services/zinder-query/**"
-      - "crates/zinder-store/**"
-      - "crates/zinder-core/src/wire/**"
-      - "crates/zinder-proto/src/capabilities.rs"
-      - "deploy/zebra/regtest.toml"
+      - "deploy/zakura/**"
+      - "deploy/zebra/**"
       - "scripts/mine-live-regtest.sh"
+      - ".github/workflows/live-tests.yml"
       - ".github/workflows/parity-compat.yml"
 
 permissions:
@@ -33,7 +42,8 @@ env:
   CARGO_NEXTEST_VERSION: "0.9.116"
   PROTOC: /does/not/exist
   # The reference must parse the version-6 (NU6.3 and later) transactions that
-  # every block from height 6 carries under deploy/zebra/regtest.toml.
+  # every block from height 6 carries on the shared Regtest schedule in
+  # deploy/zebra/regtest.toml and deploy/zakura/regtest.toml.
   REFERENCE_LIGHTWALLETD_IMAGE: docker.io/electriccoinco/lightwalletd:v0.6.0@sha256:abc8199dae800e050415a3459f71c7850aeefeb1ca6a681e9b9eda7249ce8613
   # Past NU7 (height 140), so the fixed fence covers blocks on both sides of
   # the activation.
@@ -41,13 +51,21 @@ env:
   PARITY_TRANSPARENT_ADDRESS: tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx
   # Not prefixed `ZINDER_`: the binaries reject unknown `ZINDER_*` env vars as
   # invalid config keys, so a `ZINDER_*` port knob would crash them at startup.
-  ZEBRA_RPC_URL: http://127.0.0.1:39232
+  REGTEST_NODE_RPC_URL: http://127.0.0.1:39232
 
 jobs:
   parity-regtest:
-    name: parity diff (regtest)
+    name: parity diff (regtest, ${{ matrix.node }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - node: zebra
+            container: zebra-regtest
+          - node: zakura
+            container: zakura-regtest
 
     steps:
       - name: Checkout
@@ -71,6 +89,7 @@ jobs:
       # read before checkout. Coinbase pays to the broadcast-cycle test key so
       # the shim and reference agree on real transaction data.
       - name: Start Zebra on Regtest through NU7
+        if: matrix.node == 'zebra'
         run: |
           docker run -d --name zebra-regtest -p 127.0.0.1:39232:39232 \
             -v "${GITHUB_WORKSPACE}/deploy/zebra/regtest.toml:/etc/zebrad/zebrad.toml:ro" \
@@ -80,13 +99,64 @@ jobs:
             -e ZEBRA_MINING__MINER_ADDRESS="${PARITY_TRANSPARENT_ADDRESS}" \
             docker.io/zfnd/zebra:7.0.0@sha256:a70d2be8ffef3a4b6e37355724e36a0e6c1838e46baa28bfb216739f00cf2d34
 
+      # Zakura runs on the host network with every listener on loopback
+      # (deploy/zakura/regtest.toml), because it refuses a plaintext indexer
+      # listener on any other address. Its coinbase cannot pay Sapling or
+      # Orchard and it has no `generatetoaddress`, so the first start mines 10
+      # blocks to the unified address in the TOML and the second pays the
+      # parity transparent address on the same state. The step waits past
+      # Zakura's 5-second non-finalized backup interval before the restart and
+      # checks that all 10 blocks survived it. See live-tests.yml.
+      - name: Start Zakura on Regtest through NU7
+        if: matrix.node == 'zakura'
+        run: |
+          set -euo pipefail
+          state_dir="${RUNNER_TEMP}/zakura-regtest-state"
+          mkdir -p "${state_dir}"
+          start_zakura() {
+            docker run -d --name zakura-regtest --network host \
+              --user "$(id -u):$(id -g)" --entrypoint /usr/local/bin/zakurad \
+              --health-cmd "curl -sf http://127.0.0.1:38080/healthy" \
+              --health-interval 5s --health-timeout 5s --health-retries 12 \
+              -v "${GITHUB_WORKSPACE}/deploy/zakura/regtest.toml:/etc/zakura/zakurad.toml:ro" \
+              -v "${state_dir}:/var/lib/zakura/state" \
+              "$@" \
+              docker.io/zakuracore/zakura:1.8.6@sha256:e514c89b751b685686690098928507aaa994311e6b90c79373c55b0afaa45d50 \
+              --config /etc/zakura/zakurad.toml start
+          }
+          rpc() {
+            curl -s -X POST -H 'content-type: application/json' \
+              -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":$2}" \
+              "${REGTEST_NODE_RPC_URL}"
+          }
+
+          start_zakura
+          scripts/mine-live-regtest.sh "${REGTEST_NODE_RPC_URL}" 10
+          sleep 6
+          docker stop zakura-regtest
+          docker rm zakura-regtest
+
+          start_zakura -e ZAKURA_MINING__MINER_ADDRESS="${PARITY_TRANSPARENT_ADDRESS}"
+          for _ in $(seq 1 60); do
+            if rpc getblockcount '[]' | jq -e '.result' >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          tip="$(rpc getblockcount '[]' | jq -r '.result')"
+          ironwood="$(rpc getblock '["10",1]' | jq -r '.result.trees.ironwood.size // 0')"
+          if [[ "${tip}" != 10 || "${ironwood}" -eq 0 ]]; then
+            echo "::error::Zakura restart did not keep the shielded prefix: tip ${tip}, Ironwood notes at height 10: ${ironwood}"
+            exit 1
+          fi
+
       - name: Advance regtest chain and start reference lightwalletd
         run: |
           set -euo pipefail
-          scripts/mine-live-regtest.sh "${ZEBRA_RPC_URL}" "${PARITY_REGTEST_TIP}"
+          scripts/mine-live-regtest.sh "${REGTEST_NODE_RPC_URL}" "${PARITY_REGTEST_TIP}"
           tip="${PARITY_REGTEST_TIP}"
           # The reference image cannot be configured as a service container, so
-          # run it here on the host network to reach the mapped Zebra RPC port.
+          # run it here on the host network to reach the node RPC port.
           docker run -d --name lightwalletd-reference --network host \
             "${REFERENCE_LIGHTWALLETD_IMAGE}" \
             --grpc-bind-addr 0.0.0.0:9088 \
@@ -117,7 +187,7 @@ jobs:
           echo "ingest=$!" > .tmp/parity.pids
           tip=$(curl -sf -X POST -H 'content-type: application/json' \
             -d '{"jsonrpc":"2.0","id":1,"method":"getblockcount","params":[]}' \
-            "${ZEBRA_RPC_URL}" | sed -E 's/.*"result":[[:space:]]*([0-9]+).*/\1/')
+            "${REGTEST_NODE_RPC_URL}" | sed -E 's/.*"result":[[:space:]]*([0-9]+).*/\1/')
           # Bring ingest to the mined tip. The one-shot benchmark wallet builder
           # still opens its input as a primary, so stop only long enough to make
           # that fixture, then restore the writer before compat starts. Compat
@@ -142,7 +212,7 @@ jobs:
           wait "${ingest_pid}" || true
           ./target/release/zinder-bench rocksdb-wallet-rebuild \
             --network zcash-regtest \
-            --json-rpc-addr "${ZEBRA_RPC_URL}" \
+            --json-rpc-addr "${REGTEST_NODE_RPC_URL}" \
             --raw-blob-retention all \
             --canonical-store .tmp/parity-store \
             --wallet-store .tmp/parity-wallet-store > .tmp/wallet-rebuild.json
@@ -211,7 +281,7 @@ jobs:
           echo "=== ingest.log ==="; tail -n 50 .tmp/ingest.log || true
           echo "=== compat.log ==="; tail -n 50 .tmp/compat.log || true
           echo "=== lightwalletd-reference ==="; docker logs lightwalletd-reference 2>&1 | tail -n 50 || true
-          echo "=== zebra-regtest ==="; docker logs zebra-regtest 2>&1 | tail -n 50 || true
+          echo "=== ${{ matrix.container }} ==="; docker logs ${{ matrix.container }} 2>&1 | tail -n 50 || true
 
       - name: Stop Zinder pipeline and reference
         if: always()

@@ -13,7 +13,7 @@ runner profiles, live-node gates, and consumer-facing certification evidence.
 | T1 PostgreSQL integration | `services/zinder-bench/tests/integration/postgres_canonical_replay.rs` | `ci-postgres` | Every pull request with disposable PostgreSQL | SCRAM connection, binary COPY, transaction, reconnect, and persisted read-back through the diagnostic driver |
 | T2 perf | `tests/perf/` | `ci-perf` | Every commit | Latency budget regressions per the published budgets |
 | Consumer parity | `crates/zinder-client/tests/parity/` | `ci-parity` | Consumer contract changes / release certification | Consumer-shaped request and error-shape regressions against production serving compositions |
-| T3 live | `tests/live/` | `ci-live` | Manual / scheduled CI | Real upstream-node behavior (Zebra JSON-RPC, indexer gRPC) |
+| T3 live | `tests/live/` | `ci-live` | Manual / scheduled CI / node-facing pull requests | Real upstream-node behavior (Zebra and Zakura JSON-RPC, indexer gRPC) |
 | External | n/a | n/a | Manual | Exploratory wallet runs (Zodl/Android SDK, public lightwalletd clients) |
 
 `default-filter = "not test(/^live::/) and not test(/^perf::/) and not test(/^parity::/)"`
@@ -172,22 +172,32 @@ the slower external runs start.
 
 ## T3: Live regtest sweep
 
-The most valuable automated check that exercises a real Zebra node.
+The most valuable automated check that exercises a real node. CI runs it
+against both certified nodes, Zebra 7.0.0 and Zakura 1.8.6, every night and on
+pull requests. The live and parity workflows share one pull request path
+filter: a crate the live or parity tests exercise, the workspace manifest or
+lockfile, the nextest configuration, either node TOML, the mining script, or
+either workflow.
 
 ### Prerequisites
 
-1. **A Zebra Regtest node**, either the NU7 chain described in
+1. **A Regtest node**, either Zebra or Zakura on the NU7 chain described in
    [Regtest through NU7](#regtest-through-nu7), which CI uses, or a
-   **z3 regtest sidecar**. The default ZF z3 setup gives you:
+   **z3 regtest sidecar** running Zebra. The default ZF z3 setup gives you:
    - `z3-regtest-zebra-1` (Zebra) listening JSON-RPC on host
      `127.0.0.1:29232` and indexer gRPC on `127.0.0.1:39155`.
    - Health endpoint at `127.0.0.1:28080`.
    - Mining target seed-derived address `tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx`
      (configured via `ZEBRA_MINING__MINER_ADDRESS`).
-2. **Container env contains** `ZEBRA_RPC__INDEXER_LISTEN_ADDR=0.0.0.0:8155`
-   (mapped to host `39155`). Without it the indexer-gRPC tests skip.
-3. **Auth method** matches what z3 publishes. The default sidecar uses basic
-   auth `zebra:zebra` (`ZEBRA_RPC__ENABLE_COOKIE_AUTH=false`).
+2. **An indexer gRPC listener.** Zebra in a container needs
+   `ZEBRA_RPC__INDEXER_LISTEN_ADDR=0.0.0.0:8155` (mapped to host `39155`).
+   Zakura refuses a plaintext indexer listener on any non-loopback address, so
+   bind it to loopback and run the container on the host network, as
+   `deploy/zakura/regtest.toml` does. Without an indexer address, the
+   indexer-gRPC tests skip.
+3. **Auth method** matches what the node publishes. The default sidecar and
+   the CI nodes disable cookie auth and ignore the basic-auth pair
+   `zebra:zebra`.
 
 ### Regtest through NU7
 
@@ -197,9 +207,11 @@ otherwise. A node started with only `ZEBRA_NETWORK__NETWORK=Regtest` stays on
 Canopy, so it never produces version-5 or version-6 transactions, Orchard or
 Ironwood notes, or an NU7 block.
 
-The live and parity workflows start Zebra with
-[`deploy/zebra/regtest.toml`](../../deploy/zebra/regtest.toml), which
-activates each upgrade at its own height:
+The live and parity workflows run every Regtest job twice, once against Zebra
+with [`deploy/zebra/regtest.toml`](../../deploy/zebra/regtest.toml) and once
+against Zakura 1.8.6 with
+[`deploy/zakura/regtest.toml`](../../deploy/zakura/regtest.toml). Both files
+activate each upgrade at its own height:
 
 | Upgrade | Activation height |
 | ------- | ----------------- |
@@ -211,13 +223,17 @@ activates each upgrade at its own height:
 | NU6.3 | 6 |
 | NU7 | 140 |
 
-Its lockbox and Major Grants funding streams have non-overlapping height
-ranges, as Zebra 7 requires. Environment variables cannot set these keys,
-because config-rs lowercases them and `NU6.1` contains its path separator, so
-mount the file and point the image's `CONFIG_FILE_PATH` at it. Then mine with
-`scripts/mine-live-regtest.sh`. It pays the first 10 blocks to Zebra's default
-Regtest unified address, so the Sapling, Orchard, and Ironwood trees each hold
-notes, and the rest to the configured transparent miner:
+Both files configure the same lockbox and Major Grants funding streams, with
+non-overlapping height ranges as Zebra 7 requires, and the same zero-value
+lockbox disbursement in the NU6.1 activation block, which Zakura requires.
+Environment variables cannot set these keys, because config-rs lowercases them
+and `NU6.1` contains its path separator, so mount the file.
+
+Then mine with `scripts/mine-live-regtest.sh`. On a fresh chain it asks the
+node to pay the first 10 blocks to the default Regtest unified address with
+`generatetoaddress`, checks that the Sapling, Orchard, and Ironwood trees each
+hold notes at height 10, and mines the rest to the configured transparent
+miner. For Zebra:
 
 ```bash
 docker run -d --name zebra-regtest \
@@ -233,6 +249,59 @@ docker run -d --name zebra-regtest \
   docker.io/zfnd/zebra:7.0.0@sha256:a70d2be8ffef3a4b6e37355724e36a0e6c1838e46baa28bfb216739f00cf2d34
 scripts/mine-live-regtest.sh http://127.0.0.1:39232 120
 ```
+
+Zakura differs in three ways:
+
+- It has no `generatetoaddress`, which the script detects from JSON-RPC error
+  `-32601`, so every block pays the configured miner.
+- Its coinbase cannot pay Sapling or Orchard. A unified miner address pays its
+  transparent receiver before NU6.3 and an Ironwood action from NU6.3 onward,
+  so on this schedule only the Ironwood tree holds notes.
+- It refuses a plaintext indexer listener on any non-loopback address, so the
+  TOML binds every listener, including the QUIC endpoint, to loopback, and the
+  container runs on the host network.
+
+Start it twice on the same state: first with the unified address in the TOML
+as miner for 10 blocks, then with the transparent broadcast test key. Zakura
+backs up its non-finalized state at most every 5 seconds and does not flush it
+at shutdown, so wait before stopping it and check that the restart kept height
+10. The image entrypoint drops root to UID 10001, so run `zakurad` directly as
+your own user on a state directory you own:
+
+```bash
+mkdir -p .tmp/zakura-regtest-state
+start_zakura() {
+  docker run -d --name zakura-regtest --network host \
+    --user "$(id -u):$(id -g)" --entrypoint /usr/local/bin/zakurad \
+    --health-cmd "curl -sf http://127.0.0.1:38080/healthy" \
+    --health-interval 5s --health-timeout 5s --health-retries 12 \
+    -v "$PWD/deploy/zakura/regtest.toml:/etc/zakura/zakurad.toml:ro" \
+    -v "$PWD/.tmp/zakura-regtest-state:/var/lib/zakura/state" \
+    "$@" \
+    docker.io/zakuracore/zakura:1.8.6@sha256:e514c89b751b685686690098928507aaa994311e6b90c79373c55b0afaa45d50 \
+    --config /etc/zakura/zakurad.toml start
+}
+start_zakura
+scripts/mine-live-regtest.sh http://127.0.0.1:39232 10
+sleep 6
+docker stop zakura-regtest && docker rm zakura-regtest
+start_zakura -e ZAKURA_MINING__MINER_ADDRESS=tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx
+until curl -sf -o /dev/null http://127.0.0.1:38080/healthy; do sleep 1; done
+# Expect a tip of 10 and a non-zero Ironwood tree size at height 10.
+for request in '"getblockcount","params":[]' '"getblock","params":["10",1]'; do
+  curl -s -H 'content-type: application/json' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":${request}}" \
+    http://127.0.0.1:39232 | jq -c '.result | if type == "object" then .trees else . end'
+done
+scripts/mine-live-regtest.sh http://127.0.0.1:39232 120
+```
+
+The TOML uses the CI ports: JSON-RPC `39232`, indexer `39230`, health `38080`,
+legacy P2P `38233`, and QUIC `38234`. To run beside another node on the same
+host, override each listener with `ZAKURA_RPC__LISTEN_ADDR`,
+`ZAKURA_RPC__INDEXER_LISTEN_ADDR`, `ZAKURA_HEALTH__LISTEN_ADDR`,
+`ZAKURA_NETWORK__LISTEN_ADDR`, and `ZAKURA_NETWORK__ZAKURA__LISTEN_ADDR`, all
+on `127.0.0.1`, and point the health command at the new health port.
 
 `live::nu7_activation` needs a tip below NU7, so run it before the rest of the
 suite:
@@ -259,7 +328,10 @@ the following against the node:
   with the NU6.3 or NU7 consensus branch.
 - The coinbase consensus branch changes from NU6.3 to NU7 at the activation
   height.
-- Every block's Sapling, Orchard, and Ironwood tree sizes match `getblock`.
+- Every block's Sapling, Orchard, and Ironwood tree sizes match `getblock`,
+  and the Ironwood tree holds notes. Only Ironwood is required, because
+  Zakura's Sapling and Orchard trees stay empty on this schedule; the mining
+  script checks all three on Zebra.
 - Served tree states match `z_gettreestate` at the activation heights, on both
   sides of NU7, and at every stored checkpoint, whose frontiers Zinder computes
   itself.
@@ -272,28 +344,38 @@ Every broadcast then goes through the `zinder-client` remote chain index
 instead of the node broadcaster. On a chain that already reached NU7, the test
 logs `nu7_activation_already_reached` and returns.
 
-Then run the rest of the suite as in [Run](#run), with
+Then run the rest of the suite as in [Run](#run). For Zebra, set
 `ZINDER_NODE__INDEXER_GRPC_ADDR=http://127.0.0.1:39155` and
-`ZINDER_TEST_INDEXER_CONTAINER_NAME=zebra-regtest`.
+`ZINDER_TEST_INDEXER_CONTAINER_NAME=zebra-regtest`. For Zakura, set
+`ZINDER_NODE__INDEXER_GRPC_ADDR=http://127.0.0.1:39230` and
+`ZINDER_TEST_INDEXER_CONTAINER_NAME=zakura-regtest`. Run the restart test last
+and at least 6 seconds after the last mined block, so the node's non-finalized
+backup holds the whole chain when the container restarts.
 
 #### What the NU7 Regtest run covers
 
-The NU7 Regtest run is local evidence from one isolated chain. It covers:
+The NU7 Regtest run is local evidence from one isolated chain per node, on
+Zebra 7.0.0 and on Zakura 1.8.6. It covers:
 
 - Parsing, canonical construction, wallet projection, and serving reads for
-  version-5 and version-6 blocks with Sapling, Orchard, and Ironwood note
-  commitments, before, at, and after NU7.
+  version-5 and version-6 blocks with Ironwood note commitments, before, at,
+  and after NU7, and on Zebra also Sapling and Orchard note commitments.
+- Byte-exact re-serialization of every block each node serves, and the order
+  in which each node advertises its network upgrades.
 - Typed broadcast outcomes across NU7, through the node broadcaster and,
   with `ZINDER_TEST_QUERY_GRPC_ADDR`, through a running `zinder-query`.
-- The rest of the live suite on a chain past NU7, including the Zebra Indexer
-  mempool tests and the indexer restart test.
+- The rest of the live suite on a chain past NU7, including the indexer
+  mempool tests and the indexer restart test, over a loopback plaintext
+  indexer channel on both nodes.
 - `zinder-compat-lightwalletd` parity with lightwalletd v0.6.0 over a fixed
   fence past NU7, in the parity workflow (see
   [Parity against a reference lightwalletd](#t3-parity-against-a-reference-lightwalletd)).
 
 It does not cover:
 
-- Zakura, or any node other than Zebra 7.0.0.
+- Any node other than Zebra 7.0.0 and Zakura 1.8.6, and Zakura's Sapling and
+  Orchard pools, which its coinbase cannot pay.
+- A TLS indexer channel.
 - NU7 activation on Testnet or Mainnet, or production capacity.
 - Shielded spends. The shielded pools hold only coinbase outputs, so no
   shielded nullifier is exercised and no subtree completes; both sides report
@@ -606,11 +688,12 @@ Currently-mainnet-only tests are
 ## T3: Parity against a reference lightwalletd
 
 Compares `zinder-compat-lightwalletd` against the pinned
-`electriccoinco/lightwalletd` v0.6.0 reference, both pointed at the same Zebra.
+`electriccoinco/lightwalletd` v0.6.0 reference, both pointed at the same node.
 Catches drift in the wire-shape contract `LightdInfo`, `BlockId`,
 `CompactBlock`, and `RawTransaction` use across the two shims. The parity
-workflow runs on the [Regtest through NU7](#regtest-through-nu7) chain mined to
-height 150, so its fixed fence covers blocks on both sides of NU7.
+workflow runs once against Zebra and once against Zakura, each on the
+[Regtest through NU7](#regtest-through-nu7) chain mined to height 150, so its
+fixed fence covers blocks on both sides of NU7.
 
 These tests live in
 [`services/zinder-compat-lightwalletd/tests/live/parity_against_lightwalletd.rs`](../../services/zinder-compat-lightwalletd/tests/live/parity_against_lightwalletd.rs)
@@ -1338,9 +1421,9 @@ debugging code.
 | `set ZINDER_TEST_LIVE=1 plus ZINDER_NETWORK and ZINDER_NODE__* env vars` | Opt-in missing | Add the env vars; not a real failure |
 | `live test allowed only on [ZcashMainnet]` | Mainnet-only gate | Expected on regtest/testnet; refuse to bypass |
 | `live test allowed only on [ZcashTestnet, ZcashMainnet]` | Hosted-network-only gate | Expected on regtest; rerun against testnet or mainnet |
-| `requires ZINDER_NODE__INDEXER_GRPC_ADDR` | Indexer-feature missing | Restart Zebra with `ZEBRA_RPC__INDEXER_LISTEN_ADDR` and add the env var |
+| `requires ZINDER_NODE__INDEXER_GRPC_ADDR` | Indexer-feature missing | Restart the node with its indexer listener enabled (`ZEBRA_RPC__INDEXER_LISTEN_ADDR` for Zebra, `rpc.indexer_listen_addr` on loopback for Zakura) and add the env var |
 | `connection refused` / `transport error` | Sidecar not running | Restart z3 / verify ports |
-| `chain_epoch.network does not match` | Wrong network | Check `ZINDER_NETWORK` matches the running Zebra |
+| `chain_epoch.network does not match` | Wrong network | Check `ZINDER_NETWORK` matches the running node |
 | `schema mismatch` | Persisted store from a different schema version | Use a fresh `.tmp/<network>.zinder-store/` directory |
 | `compact_block_range_too_large` / `invalid_block_range` | Real assertion | Treat as a real failure — investigate |
 | `block_not_in_best_chain` from a hash lookup | Reorged out OR never indexed | Check the chain epoch you queried; not necessarily a bug |
@@ -1388,7 +1471,10 @@ For ordinary code changes, use the shorter pre-flight checklist below.
 - [ ] Default validation gate is green.
 - [ ] `cargo nextest run --profile=ci-parity` is green and its report is archived
       with the release evidence.
-- [ ] T3 regtest is green with Zebra indexer gRPC enabled.
+- [ ] T3 regtest is green on both the Zebra and the Zakura leg, with indexer
+      gRPC enabled, and both legs of the lightwalletd parity workflow are green
+      on the release commit (see
+      [Releasing Zinder](releasing.md#publish-a-release)).
 - [ ] Testnet live sweep is green for every wallet-serving claim in the release.
 - [ ] Testnet upstream-readiness calibration records the best-header timestamp
       and first local height observation, then proves the configured estimator

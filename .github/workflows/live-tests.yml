@@ -2,14 +2,37 @@ name: live-tests
 
 # T3 (live) tests under tests/live/, double-gated by #[ignore] and
 # require_live():
-#   - regtest runs nightly against a Dockerized Zebra 7.0.0 Regtest node that
-#     activates every upgrade through NU7 (deploy/zebra/regtest.toml)
+#   - regtest runs nightly, and on pull requests that touch node-facing code,
+#     once against a Dockerized Zebra 7.0.0 and once against a Dockerized
+#     Zakura 1.8.6 Regtest node. Both activate every upgrade through NU7 on the
+#     same schedule (deploy/zebra/regtest.toml, deploy/zakura/regtest.toml).
+#     Both legs must pass on a release commit.
 #   - testnet runs weekly against a hosted testnet node
 #   - mainnet is workflow_dispatch-only until runner topology and trigger
 #     ownership are settled.
 # CI secrets mirror the env-var schema: NODE_<NETWORK>_JSON_RPC_ADDR etc.
 
 on:
+  pull_request:
+    # Keep this list identical in live-tests.yml and parity-compat.yml. It
+    # covers every crate the live and parity tests exercise, the workspace
+    # manifest and lockfile that pin the consensus cohort, the node
+    # configurations, the mining script, and both workflows.
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".config/nextest.toml"
+      - "crates/**"
+      - "services/zinder-bench/**"
+      - "services/zinder-compat-lightwalletd/**"
+      - "services/zinder-explorer/**"
+      - "services/zinder-ingest/**"
+      - "services/zinder-query/**"
+      - "deploy/zakura/**"
+      - "deploy/zebra/**"
+      - "scripts/mine-live-regtest.sh"
+      - ".github/workflows/live-tests.yml"
+      - ".github/workflows/parity-compat.yml"
   schedule:
     # Nightly regtest at 02:17 UTC.
     - cron: "17 2 * * *"
@@ -37,12 +60,33 @@ env:
 
 jobs:
   regtest:
-    name: live regtest
+    name: live regtest (${{ matrix.node }})
     if: |
-      github.event_name == 'workflow_dispatch' && inputs.network == 'zcash-regtest'
+      github.event_name == 'pull_request'
+        || github.event_name == 'workflow_dispatch' && inputs.network == 'zcash-regtest'
         || (github.event_name == 'schedule' && github.event.schedule == '17 2 * * *')
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - node: zebra
+            container: zebra-regtest
+            indexer_grpc_addr: http://127.0.0.1:39155
+          - node: zakura
+            container: zakura-regtest
+            indexer_grpc_addr: http://127.0.0.1:39230
+    # Every leg starts its own node on these loopback ports, so the node
+    # address comes from the matrix rather than from repository secrets. Both
+    # nodes run with cookie auth disabled and ignore the basic-auth pair.
+    env:
+      ZINDER_TEST_LIVE: "1"
+      ZINDER_NETWORK: zcash-regtest
+      ZINDER_NODE__JSON_RPC_ADDR: http://127.0.0.1:39232
+      ZINDER_NODE__AUTH__METHOD: basic
+      ZINDER_NODE__AUTH__USERNAME: zebra
+      ZINDER_NODE__AUTH__PASSWORD: zebra
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -62,14 +106,14 @@ jobs:
       # read before checkout. The image is pinned by digest to the current
       # upstream Zebra release; Zinder's dependency-alignment gate verifies
       # that its zebra-chain boundary uses the same Zcash protocol family.
-      # Cookie auth is disabled to mirror Z3's regtest topology; tests below
-      # send a no-op basic-auth pair that Zebra ignores in this mode. Coinbase
+      # Cookie auth is disabled to mirror Z3's regtest topology. Coinbase
       # pays to the broadcast-cycle test key, so the spend, UTXO, and balance
       # live tests find outputs they control. Derive the address with
       # `cargo run -p zinder-testkit --example print_broadcast_test_address`.
       # The indexer gRPC port and the health check let the Zebra Indexer
       # mempool tests run, including the one that restarts this container.
       - name: Start Zebra on Regtest through NU7
+        if: matrix.node == 'zebra'
         run: |
           docker run -d --name zebra-regtest \
             -p 127.0.0.1:39232:39232 -p 127.0.0.1:39155:8155 \
@@ -83,66 +127,109 @@ jobs:
             -e ZEBRA_MINING__MINER_ADDRESS=tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx \
             docker.io/zfnd/zebra:7.0.0@sha256:a70d2be8ffef3a4b6e37355724e36a0e6c1838e46baa28bfb216739f00cf2d34
 
+      # Zakura refuses a plaintext indexer listener on a non-loopback address,
+      # and a published port needs one inside the container, so Zakura runs on
+      # the host network with every listener on loopback
+      # (deploy/zakura/regtest.toml). It runs as the runner user on a host
+      # state directory, bypassing the image entrypoint that drops root to
+      # UID 10001.
+      #
+      # Zakura has no `generatetoaddress`, and its coinbase cannot pay Sapling
+      # or Orchard, so the shielded prefix comes from two starts on the same
+      # state. The first mines 10 blocks to the unified address in the TOML;
+      # heights 6 through 10 pay Ironwood. The second pays the broadcast-cycle
+      # test key, like the Zebra leg. Zakura backs up its non-finalized state
+      # at most every 5 seconds and does not flush it at shutdown, so the step
+      # waits before stopping the node and then checks that the restart kept
+      # all 10 blocks.
+      - name: Start Zakura on Regtest through NU7
+        if: matrix.node == 'zakura'
+        run: |
+          set -euo pipefail
+          state_dir="${RUNNER_TEMP}/zakura-regtest-state"
+          mkdir -p "${state_dir}"
+          start_zakura() {
+            docker run -d --name zakura-regtest --network host \
+              --user "$(id -u):$(id -g)" --entrypoint /usr/local/bin/zakurad \
+              --health-cmd "curl -sf http://127.0.0.1:38080/healthy" \
+              --health-interval 5s --health-timeout 5s --health-retries 12 \
+              -v "${GITHUB_WORKSPACE}/deploy/zakura/regtest.toml:/etc/zakura/zakurad.toml:ro" \
+              -v "${state_dir}:/var/lib/zakura/state" \
+              "$@" \
+              docker.io/zakuracore/zakura:1.8.6@sha256:e514c89b751b685686690098928507aaa994311e6b90c79373c55b0afaa45d50 \
+              --config /etc/zakura/zakurad.toml start
+          }
+          rpc() {
+            curl -s -X POST -H 'content-type: application/json' \
+              -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":$2}" \
+              "${ZINDER_NODE__JSON_RPC_ADDR}"
+          }
+
+          start_zakura
+          scripts/mine-live-regtest.sh "${ZINDER_NODE__JSON_RPC_ADDR}" 10
+          sleep 6
+          docker stop zakura-regtest
+          docker rm zakura-regtest
+
+          start_zakura -e ZAKURA_MINING__MINER_ADDRESS=tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx
+          for _ in $(seq 1 60); do
+            if rpc getblockcount '[]' | jq -e '.result' >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          tip="$(rpc getblockcount '[]' | jq -r '.result')"
+          ironwood="$(rpc getblock '["10",1]' | jq -r '.result.trees.ironwood.size // 0')"
+          if [[ "${tip}" != 10 || "${ironwood}" -eq 0 ]]; then
+            echo "::error::Zakura restart did not keep the shielded prefix: tip ${tip}, Ironwood notes at height 10: ${ironwood}"
+            exit 1
+          fi
+
       # Live tests need a chain tall enough to bulk-catch-up (>= 60 blocks), a
       # matured coinbase to spend, and a tip below NU7 (height 140) so the
       # activation test can broadcast on both sides of it.
       - name: Advance regtest chain to a testable height
-        run: scripts/mine-live-regtest.sh http://127.0.0.1:39232 120
+        run: scripts/mine-live-regtest.sh "${ZINDER_NODE__JSON_RPC_ADDR}" 120
 
       # The activation test runs first and alone: it broadcasts below NU7,
       # mines across the activation, and broadcasts again after it, so it needs
       # the pre-NU7 tip that the rest of the suite would otherwise mine past.
       - name: Run the NU7 activation test against regtest
-        env:
-          ZINDER_TEST_LIVE: "1"
-          ZINDER_NETWORK: zcash-regtest
-          ZINDER_NODE__JSON_RPC_ADDR: ${{ secrets.NODE_REGTEST_JSON_RPC_ADDR || 'http://127.0.0.1:39232' }}
-          ZINDER_NODE__AUTH__METHOD: ${{ secrets.NODE_REGTEST_AUTH_METHOD || 'basic' }}
-          ZINDER_NODE__AUTH__USERNAME: ${{ secrets.NODE_REGTEST_AUTH_USERNAME || 'zebra' }}
-          ZINDER_NODE__AUTH__PASSWORD: ${{ secrets.NODE_REGTEST_AUTH_PASSWORD || 'zebra' }}
         run: |
           cargo nextest run --workspace --profile=ci-live --run-ignored=all \
             -E 'test(/^live::nu7_activation::/)'
 
       - name: Run T3 live tests against regtest
         env:
-          ZINDER_TEST_LIVE: "1"
-          ZINDER_NETWORK: zcash-regtest
-          ZINDER_NODE__JSON_RPC_ADDR: ${{ secrets.NODE_REGTEST_JSON_RPC_ADDR || 'http://127.0.0.1:39232' }}
-          ZINDER_NODE__INDEXER_GRPC_ADDR: http://127.0.0.1:39155
-          ZINDER_NODE__AUTH__METHOD: ${{ secrets.NODE_REGTEST_AUTH_METHOD || 'basic' }}
-          ZINDER_NODE__AUTH__USERNAME: ${{ secrets.NODE_REGTEST_AUTH_USERNAME || 'zebra' }}
-          ZINDER_NODE__AUTH__PASSWORD: ${{ secrets.NODE_REGTEST_AUTH_PASSWORD || 'zebra' }}
+          ZINDER_NODE__INDEXER_GRPC_ADDR: ${{ matrix.indexer_grpc_addr }}
         # Run every live test except mainnet-only ones, the activation test
-        # above, and the Zebra restart test below. Regtest is the only network where deep_chain and latency fit
-        # in CI budgets without checkpoint backfill. Mainnet-only tests are
-        # excluded by explicit behavior name because live test names avoid
-        # network labels unless the behavior itself is network-specific.
+        # above, and the node restart test below. Regtest is the only network
+        # where deep_chain and latency fit in CI budgets without checkpoint
+        # backfill. Mainnet-only tests are excluded by explicit behavior name
+        # because live test names avoid network labels unless the behavior
+        # itself is network-specific.
         run: |
           cargo nextest run --workspace --profile=ci-live --run-ignored=all \
             -E 'test(/^live::/) and not test(/^live::nu7_activation::/) and not test(mainnet) and not test(backfills_last_1000_blocks_from_checkpoint) and not test(streaming_source_recovers_after_zebra_indexer_restart)'
 
-      - name: Run the Zebra restart test against regtest
+      - name: Run the node restart test against regtest
         env:
-          ZINDER_TEST_LIVE: "1"
-          ZINDER_NETWORK: zcash-regtest
-          ZINDER_NODE__JSON_RPC_ADDR: ${{ secrets.NODE_REGTEST_JSON_RPC_ADDR || 'http://127.0.0.1:39232' }}
-          ZINDER_NODE__INDEXER_GRPC_ADDR: http://127.0.0.1:39155
-          ZINDER_NODE__AUTH__METHOD: ${{ secrets.NODE_REGTEST_AUTH_METHOD || 'basic' }}
-          ZINDER_NODE__AUTH__USERNAME: ${{ secrets.NODE_REGTEST_AUTH_USERNAME || 'zebra' }}
-          ZINDER_NODE__AUTH__PASSWORD: ${{ secrets.NODE_REGTEST_AUTH_PASSWORD || 'zebra' }}
-          ZINDER_TEST_INDEXER_CONTAINER_NAME: zebra-regtest
-        # This test restarts the Zebra container, so it runs alone after every
+          ZINDER_NODE__INDEXER_GRPC_ADDR: ${{ matrix.indexer_grpc_addr }}
+          ZINDER_TEST_INDEXER_CONTAINER_NAME: ${{ matrix.container }}
+        # This test restarts the node container, so it runs alone after every
         # other live test has finished. A nextest group only serializes its own
         # members, and JSON-RPC tests outside the group would otherwise see the
-        # node disappear mid-request.
+        # node disappear mid-request. Both nodes back up non-finalized state at
+        # most every 5 seconds, so the step waits past the last mined block
+        # before the restart.
         run: |
+          sleep 6
           cargo nextest run --workspace --profile=ci-live --run-ignored=all \
             -E 'test(streaming_source_recovers_after_zebra_indexer_restart)'
 
-      - name: Dump Zebra logs on failure
+      - name: Dump node logs on failure
         if: failure()
-        run: docker logs zebra-regtest 2>&1 | tail -n 100 || true
+        run: docker logs ${{ matrix.container }} 2>&1 | tail -n 100 || true
 
   testnet:
     name: live testnet
@@ -217,4 +304,4 @@ jobs:
         # names unless the behavior itself is network-specific.
         run: |
           cargo nextest run --workspace --profile=ci-live --run-ignored=all \
-            -E 'test(mainnet) or test(backfills_last_1000_blocks_from_checkpoint) or test(canonical_blocks_load_requested_range_from_fixed_checkpoint)'
+            -E 'test(mainnet) or test(backfills_last_1000_blocks_from_checkpoint) or test(canonical_blocks_load_requested_range_from_fixed_checkpoint) or test(upgrade_activations_keep_advertised_order)'

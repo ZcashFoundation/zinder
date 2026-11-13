@@ -4,27 +4,40 @@ set -euo pipefail
 repository_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$repository_root"
 
-zebra_runtime_image='docker.io/zfnd/zebra:7.0.0@sha256:a70d2be8ffef3a4b6e37355724e36a0e6c1838e46baa28bfb216739f00cf2d34'
-zebra_runtime_pin_files=(
+# Each certified node runtime must be pinned to exactly one image, by digest,
+# everywhere the live and parity lanes or their reference docs name it.
+runtime_pin_files=(
   .github/workflows/live-tests.yml
   .github/workflows/parity-compat.yml
   docs/reference/lightwalletd-compatibility.md
+  docs/runbooks/testing.md
 )
 
-mapfile -t zebra_runtime_images < <(
-  grep -hEo \
-    '(docker\.io/)?zfnd/zebra:[0-9A-Za-z._-]+(@sha256:[a-f0-9]{64})?' \
-    "${zebra_runtime_pin_files[@]}" |
-    sort -u
-)
-if [[
-  "${#zebra_runtime_images[@]}" -ne 1 ||
-  "${zebra_runtime_images[0]:-}" != "$zebra_runtime_image"
-]]; then
-  echo >&2 \
-    "Zebra runtime certification must use exactly $zebra_runtime_image; found: ${zebra_runtime_images[*]:-none}"
-  exit 1
-fi
+require_single_runtime_pin() {
+  local node_name="$1"
+  local expected_image="$2"
+  local image_pattern="$3"
+  local found_images
+
+  mapfile -t found_images < <(
+    grep -hEo "$image_pattern" "${runtime_pin_files[@]}" | sort -u
+  )
+  if [[
+    "${#found_images[@]}" -ne 1 ||
+    "${found_images[0]:-}" != "$expected_image"
+  ]]; then
+    echo >&2 \
+      "$node_name runtime certification must use exactly $expected_image; found: ${found_images[*]:-none}"
+    exit 1
+  fi
+}
+
+require_single_runtime_pin Zebra \
+  'docker.io/zfnd/zebra:7.0.0@sha256:a70d2be8ffef3a4b6e37355724e36a0e6c1838e46baa28bfb216739f00cf2d34' \
+  '(docker\.io/)?zfnd/zebra:[0-9A-Za-z._-]+(@sha256:[a-f0-9]{64})?'
+require_single_runtime_pin Zakura \
+  'docker.io/zakuracore/zakura:1.8.6@sha256:e514c89b751b685686690098928507aaa994311e6b90c79373c55b0afaa45d50' \
+  '(docker\.io/)?zakuracore/zakura:[0-9A-Za-z._-]+(@sha256:[a-f0-9]{64})?'
 
 workspace_tree="$(cargo tree --workspace --locked --prefix none)"
 zebra_tree="$(cargo tree -p zebra-chain --locked --prefix none)"

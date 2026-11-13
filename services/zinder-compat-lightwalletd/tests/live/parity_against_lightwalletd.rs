@@ -1,6 +1,6 @@
 //! Live parity diff between Zinder's `zinder-compat-lightwalletd` and the
 //! upstream `electriccoinco/lightwalletd` Go reference implementation, both
-//! pointed at the same Zebra node.
+//! pointed at the same node.
 //!
 //! Double-gated by the Testing Runbook: `#[ignore]` keeps the test off the
 //! default filter, and `require_live()` reads `ZINDER_TEST_LIVE=1`. Two additional
@@ -10,7 +10,7 @@
 //! - `ZINDER_TEST_PARITY_ZINDER_ADDR` — Zinder compat-shim endpoint, e.g.
 //!   `http://127.0.0.1:9087`.
 //! - `ZINDER_TEST_PARITY_LIGHTWALLETD_ADDR` — reference lightwalletd-go
-//!   endpoint pointed at the same Zebra, e.g. `http://127.0.0.1:9088`.
+//!   endpoint pointed at the same node, e.g. `http://127.0.0.1:9088`.
 //!
 //! Operator-divergent fields (build metadata, version strings, donation
 //! address) are explicitly allow-listed, and `GetLightdInfo` and
@@ -834,7 +834,7 @@ async fn subtree_roots_match_reference_for_supported_pools() -> Result<()> {
 ///
 /// If a mempool transaction does exist at call time, this issues two
 /// separate unary calls (Zinder, then reference) against the same live
-/// Zebra mempool; a transaction entering or leaving between the two calls
+/// node mempool; a transaction entering or leaving between the two calls
 /// would read as a false parity failure. Low risk against the pinned,
 /// otherwise-idle regtest fixture; do not point this test at a node with
 /// organic traffic.

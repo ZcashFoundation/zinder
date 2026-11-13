@@ -385,8 +385,8 @@ mod tests {
         [0x42_u8; 32]
     }
 
-    /// Activation heights of `deploy/zebra/regtest.toml`, which places NU6.3
-    /// at 6 and NU7 at 140.
+    /// Activation heights of `deploy/zebra/regtest.toml` and
+    /// `deploy/zakura/regtest.toml`, which place NU6.3 at 6 and NU7 at 140.
     fn nu7_regtest_network() -> LocalNetwork {
         let at = |height| Some(BlockHeight::from_u32(height));
         LocalNetwork {
