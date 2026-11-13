@@ -226,6 +226,77 @@ To rebuild the Explorer views:
    `explorer.transparent_address.ranking_v1` keeps the old directory until
    that capability returns.
 
+### Stream mempool events over indexer TLS
+
+Ingest streams mempool events and chain-tip wakeups from the node's indexer
+gRPC listener when `ZINDER_NODE__INDEXER_GRPC_ADDR` is set, and polls the node
+over JSON-RPC otherwise. A node that serves its indexer listener over TLS
+needs the indexer TLS overlay, `deploy/docker-compose.indexer-tls.yml`.
+Zakura requires mutual TLS on any indexer listener that is not on loopback, so
+a Zakura node in another container streams to Zinder only this way.
+
+Configure the node's listener first. For Zakura, set:
+
+- `ZAKURA_RPC__INDEXER_LISTEN_ADDR=0.0.0.0:8230`;
+- `ZAKURA_RPC__INDEXER_TLS__CERT_FILE` and `ZAKURA_RPC__INDEXER_TLS__KEY_FILE`
+  to the node's certificate and key. The certificate must name the host that
+  Zinder dials, such as `zakura` on the shared Docker network;
+- `ZAKURA_RPC__INDEXER_TLS__CLIENT_CA_FILE` to the CA that signs Zinder's
+  client certificate.
+
+Zinder needs three PEM files:
+
+| File | Contents |
+| --- | --- |
+| `ca.pem` | The CA certificates that verify the node's indexer certificate. |
+| `client.pem` | Zinder's client certificate chain. |
+| `client-key.pem` | The private key for that certificate. |
+
+Install them in a root-owned directory that the container service group can
+read, outside the shared RocksDB volume:
+
+```bash
+sudo install -d -o root -g 1000 -m 0750 /etc/zinder/indexer-tls
+sudo install -o root -g 1000 -m 0440 node-indexer-ca.pem /etc/zinder/indexer-tls/ca.pem
+sudo install -o root -g 1000 -m 0440 zinder-client.pem /etc/zinder/indexer-tls/client.pem
+sudo install -o root -g 1000 -m 0440 zinder-client-key.pem /etc/zinder/indexer-tls/client-key.pem
+```
+
+Then set the indexer URL and the directory in `/etc/zinder/env`:
+
+```bash
+ZINDER_NODE__INDEXER_GRPC_ADDR=https://zakura:8230
+ZINDER_INDEXER_TLS_DIR=/etc/zinder/indexer-tls
+```
+
+When the node's certificate names a different host than the URL, also set
+`ZINDER_NODE__INDEXER_TLS__SERVER_NAME` to the name it carries.
+
+Validate and start the topology with the overlay:
+
+```bash
+docker compose --env-file /etc/zinder/env \
+  -f deploy/docker-compose.yml \
+  -f deploy/docker-compose.indexer-tls.yml \
+  config -q
+docker compose --env-file /etc/zinder/env \
+  -f deploy/docker-compose.yml \
+  -f deploy/docker-compose.indexer-tls.yml \
+  up -d --build
+```
+
+The overlay mounts the directory read-only into `zinder-ingest` only, because
+no other runtime reads the indexer, and points `[node.indexer_tls]` at the
+three files. Compose refuses to resolve the overlay without an indexer URL or
+`ZINDER_INDEXER_TLS_DIR`. Ingest checks the files at startup and exits with a
+configuration error when one is missing or holds no certificate or key, or
+when the indexer URL is not `https://`.
+
+Ingest reads the files again each time it reconnects to the indexer. The
+overlay mounts the directory rather than individual files, so a replaced file,
+including one renamed into place, takes effect on the next reconnect without a
+restart. A running stream keeps the session it opened with the old material.
+
 ## Verify the ownership chain
 
 Use the host ports from the selected env file. Mainnet uses 9105, 9110, 9102,
@@ -283,6 +354,21 @@ sudo cp /opt/zinder/deploy/systemd/zinder.service \
 sudo systemctl daemon-reload
 sudo systemctl enable --now zinder
 sudo journalctl -u zinder.service -f
+```
+
+The unit runs only `deploy/docker-compose.yml`. A deployment that merges an
+overlay, such as the explorer or indexer TLS overlay, must name it in the
+unit's commands too, or the next start drops it. Add it with a drop-in from
+`sudo systemctl edit zinder`, for example for the indexer TLS overlay:
+
+```ini
+[Service]
+ExecStartPre=
+ExecStartPre=-/usr/bin/docker compose --env-file /etc/zinder/env -f docker-compose.yml -f docker-compose.indexer-tls.yml down --remove-orphans
+ExecStart=
+ExecStart=/usr/bin/docker compose --env-file /etc/zinder/env -f docker-compose.yml -f docker-compose.indexer-tls.yml up
+ExecStop=
+ExecStop=/usr/bin/docker compose --env-file /etc/zinder/env -f docker-compose.yml -f docker-compose.indexer-tls.yml down
 ```
 
 ## Side-by-side wallet rebuild and cutover

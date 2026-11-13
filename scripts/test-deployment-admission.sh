@@ -82,6 +82,51 @@ docker compose \
   config --format json > "$resolved_compose"
 bash "$validator" --compose-contract "$resolved_compose"
 
+indexer_tls_directory="$temporary_directory/indexer-tls"
+mkdir -p "$indexer_tls_directory"
+resolve_indexer_tls_compose() {
+  ZINDER_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
+    --env-file "$repository_root/deploy/.env.testnet" \
+    -f "$repository_root/deploy/docker-compose.yml" \
+    -f "$repository_root/deploy/docker-compose.indexer-tls.yml" \
+    config "$@"
+}
+resolved_indexer_tls_compose="$temporary_directory/resolved-indexer-tls-compose.json"
+ZINDER_INDEXER_TLS_DIR="$indexer_tls_directory" \
+ZINDER_NODE__INDEXER_GRPC_ADDR=https://zakura:8230 \
+ZINDER_NODE__INDEXER_TLS__SERVER_NAME=zakura.internal \
+  resolve_indexer_tls_compose --format json > "$resolved_indexer_tls_compose"
+bash "$validator" --compose-contract "$resolved_indexer_tls_compose"
+jq -e --arg tls_directory "$indexer_tls_directory" '
+  .services["zinder-ingest"].environment as $ingest_environment
+  | $ingest_environment.ZINDER_NODE__INDEXER_GRPC_ADDR == "https://zakura:8230"
+  and $ingest_environment.ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH
+    == "/var/run/zinder-indexer-tls/ca.pem"
+  and $ingest_environment.ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH
+    == "/var/run/zinder-indexer-tls/client.pem"
+  and $ingest_environment.ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH
+    == "/var/run/zinder-indexer-tls/client-key.pem"
+  and $ingest_environment.ZINDER_NODE__INDEXER_TLS__SERVER_NAME == "zakura.internal"
+  and (.services["zinder-ingest"].volumes
+    | any(.source == $tls_directory
+      and .target == "/var/run/zinder-indexer-tls"
+      and .read_only == true))
+  and ([.services | to_entries[] | select(.key != "zinder-ingest") | .value]
+    | all(
+      ((.environment // {}) | keys | all(startswith("ZINDER_NODE__INDEXER_TLS__") | not))
+      and ((.volumes // []) | all(.target != "/var/run/zinder-indexer-tls"))
+    ))
+' "$resolved_indexer_tls_compose" >/dev/null \
+  || fail "the indexer TLS overlay does not give its material to ingest alone"
+if ZINDER_INDEXER_TLS_DIR="$indexer_tls_directory" ZINDER_NODE__INDEXER_GRPC_ADDR='' \
+  resolve_indexer_tls_compose -q >/dev/null 2>&1; then
+  fail "the indexer TLS overlay resolved without an indexer URL"
+fi
+if ZINDER_INDEXER_TLS_DIR='' ZINDER_NODE__INDEXER_GRPC_ADDR=https://zakura:8230 \
+  resolve_indexer_tls_compose -q >/dev/null 2>&1; then
+  fail "the indexer TLS overlay resolved without ZINDER_INDEXER_TLS_DIR"
+fi
+
 resolved_explorer_compose="$temporary_directory/resolved-explorer-compose.json"
 ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
 docker compose \

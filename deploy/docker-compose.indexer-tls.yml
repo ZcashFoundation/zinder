@@ -1,0 +1,37 @@
+# Optional mutual TLS for the node's indexer gRPC stream.
+#
+# Merge this overlay when the node serves its indexer listener over TLS. Zakura
+# requires mutual TLS on any indexer listener that is not on loopback, so a
+# Zakura node in another container streams mempool events only this way:
+#
+#   docker compose \
+#     --env-file /etc/zinder/env \
+#     -f deploy/docker-compose.yml \
+#     -f deploy/docker-compose.indexer-tls.yml \
+#     up -d
+#
+# The env file sets ZINDER_NODE__INDEXER_GRPC_ADDR to the node's https://
+# indexer URL and ZINDER_INDEXER_TLS_DIR to a host directory that holds:
+#
+#   ca.pem          CA certificates that verify the node's indexer certificate
+#   client.pem      Zinder's client certificate chain
+#   client-key.pem  the client certificate's private key
+#
+# Only zinder-ingest reads the indexer, so only it mounts the directory. The
+# directory is mounted rather than its files, so replacing a file, including
+# by rename, reaches ingest on its next indexer reconnect without a restart.
+# See "Stream mempool events over indexer TLS" in
+# docs/runbooks/deploying-on-a-vm.md.
+
+services:
+  zinder-ingest:
+    volumes:
+      - ${ZINDER_INDEXER_TLS_DIR:?set a directory containing ca.pem, client.pem, and client-key.pem}:/var/run/zinder-indexer-tls:ro
+    environment:
+      ZINDER_NODE__INDEXER_GRPC_ADDR: ${ZINDER_NODE__INDEXER_GRPC_ADDR:?set the node's https:// indexer URL}
+      ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH: /var/run/zinder-indexer-tls/ca.pem
+      ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH: /var/run/zinder-indexer-tls/client.pem
+      ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH: /var/run/zinder-indexer-tls/client-key.pem
+      # Empty verifies the host in the indexer URL. Set it when the node's
+      # certificate names a different host.
+      ZINDER_NODE__INDEXER_TLS__SERVER_NAME: ${ZINDER_NODE__INDEXER_TLS__SERVER_NAME-}

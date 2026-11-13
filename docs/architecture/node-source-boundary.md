@@ -151,7 +151,10 @@ channel, so a streaming source uses rotated files on its next reconnect.
 error when one is missing or holds no certificate or key. Binaries accept the
 material only as file paths; see
 [ADR-0019](../adrs/0019-transport-policy-ownership.md#credential-delivery) for
-delivery on platforms that provide secrets only as environment variables.
+delivery on platforms that provide secrets only as environment variables. The
+Compose topology mounts the files into ingest with
+`deploy/docker-compose.indexer-tls.yml`; see
+[Deploying on one VM](../runbooks/deploying-on-a-vm.md#stream-mempool-events-over-indexer-tls).
 
 When `[node.health].addr` is configured, `ZebraJsonRpcSource` polls Zebra's
 readiness endpoint using the configured cadence and thresholds. Without that
