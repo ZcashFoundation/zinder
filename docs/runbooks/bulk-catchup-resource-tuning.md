@@ -28,9 +28,13 @@ limit, and compare throughput and peak memory on the same chain range.
 The `[ingest.construction]` section owns canonical construction concurrency and
 queue admission:
 
-- `source_segment_max_blocks` is a hard request-shape ceiling.
+- `source_segment_max_blocks` is a hard request-shape ceiling. Startup
+  rejects values above 1000, the largest JSON-RPC batch Zakura accepts.
 - `source_segment_target_response_bytes` is the adaptive source-response target
-  and must not exceed `node.max_response_bytes`.
+  and must not exceed `node.max_response_bytes`. Keep it below the node's own
+  response limit, which is 50 MiB by default on Zebra 7.0.0 and Zakura 1.8.6.
+  The 64 MiB `node.max_response_bytes` default is a ceiling on what Zinder
+  accepts, not a request size.
 - `source_fetch_max_in_flight_requests` and
   `source_fetch_max_in_flight_bytes` bound active source requests and completed
   response backlog.

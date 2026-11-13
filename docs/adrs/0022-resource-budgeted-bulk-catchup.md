@@ -40,7 +40,8 @@ Fresh canonical construction consumes one `CanonicalPipelineLimits` value.
 The runtime resolves it from the container memory budget, logical CPU count,
 and `node.max_response_bytes`:
 
-- `source_segment_max_blocks = 64`
+- `source_segment_max_blocks = 64`, and validation rejects values above 1000,
+  the largest JSON-RPC batch a Zakura node accepts
 - `source_segment_target_response_bytes = min(node.max_response_bytes, 33554432)`
 - `source_fetch_max_in_flight_requests = 12`
 - `source_fetch_max_in_flight_bytes = max(node.max_response_bytes, clamp(memory / 64, 128 MiB, 384 MiB))`

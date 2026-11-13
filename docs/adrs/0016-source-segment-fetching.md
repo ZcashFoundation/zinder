@@ -31,8 +31,11 @@ source payload statistics. Every adapter must:
 - return typed source errors for unavailable blocks, incoherent observations,
   protocol mismatches, and oversized responses.
 
-`ZebraJsonRpcSource` implements the boundary with a bounded JSON-RPC batch of
-height-keyed `getblock` requests. It decodes each raw block locally, validates
+`ZebraJsonRpcSource` implements the boundary with one JSON-RPC batch of
+height-keyed `getblock` requests, one entry per requested block. The adapter
+does not cap the batch: Zakura refuses batches above 1,000 entries, so ingest
+rejects `source_segment_max_blocks` above 1000 at config load, and other
+callers must keep `SourceChainSegmentLimits` within that bound. It decodes each raw block locally, validates
 linkage, records observed payload bytes, and splits requests when the source or
 transport rejects the response size. It does not make a preceding
 `getblockhash` call: the decoded block hash and parent hash provide the required

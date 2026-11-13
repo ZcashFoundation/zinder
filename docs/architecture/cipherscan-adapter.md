@@ -92,6 +92,28 @@ The matrix records which behavior each route family has.
 | Client scanning helpers: `/api/scan/orchard`, `/api/lightwalletd/scan` | Recent Orchard candidate discovery complete; birthday compact-block scans rejected | `TransactionHistory` v2, retained bytes, `zinder-compat-lightwalletd` streaming | Require same-epoch retained bytes; keep viewing keys and decryption in the client | Server-side viewing-key scans and unbounded compact-block REST documents are unavailable | Zinder, adapter, unavailable |
 | Physical chain size: `/api/network/chain-size-history` | Degraded | None | Preserve chart metadata and an unavailable response | Physical storage telemetry is operational data and requires a sidecar | Sidecar |
 
+## Known Limitations
+
+The adapter computes consensus economics locally instead of observing them
+from the node. These values include block subsidy, funding-stream and lockbox
+amounts, halving height, emission, target block spacing, and difficulty. They
+appear on `/api/network/stats`, `/api/network/halving`,
+`/api/network/emission`, and `/api/circulating-supply`.
+
+The adapter takes these values from the `zebra-chain` release Zinder is built
+with:
+
+- Mainnet and Testnet use that release's built-in network parameters.
+- Regtest uses that release's default Regtest parameters, not the activation
+  heights the node reports.
+
+The values can therefore differ from the rewards the connected node pays when:
+
+- the node runs Regtest or a test network with its own activation heights,
+  funding streams, or lockbox disbursements; or
+- the node release, such as a Zakura release, applies consensus or fee rules
+  that this `zebra-chain` release does not.
+
 ## Review Invariants
 
 1. Native Zinder contracts carry chain facts, freshness, coverage, and absence;

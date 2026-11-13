@@ -42,6 +42,21 @@ The response carries ordered `SourceChainUpdate` values plus payload statistics
 used by the writer's resource controller. See
 [ADR-0016](../adrs/0016-source-segment-fetching.md).
 
+`ZebraJsonRpcSource` fetches a segment as one JSON-RPC batch with one
+`getblock` entry per block. Two node limits shape that batch:
+
+- Zakura 1.8.6 refuses a batch with more than 1,000 entries. Zebra 7.0.0 has
+  no entry limit. Ingest therefore rejects a configured segment size above
+  1000 blocks at startup.
+- Zebra 7.0.0 and Zakura 1.8.6 each refuse a response larger than 50 MiB by
+  default. Either node answers an oversized batch with a single error object
+  instead of a response array. The source treats that answer like an
+  oversized response and splits the segment.
+
+`node.max_response_bytes`, 64 MiB by default, is a ceiling on what Zinder
+accepts, not a request size. The default segment target of 32 MiB stays below
+both node limits, so a split is the exception rather than the normal path.
+
 `tip_id` returns height and hash from one source observation. Height alone is
 not a chain identity and must not be used to accept a value across a reorg.
 

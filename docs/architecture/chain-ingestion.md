@@ -61,6 +61,10 @@ publication remain ordered.
 - the memory reserved by blocks admitted to preparation until their ordered
   store write completes.
 
+Startup rejects `ingest.construction.source_segment_max_blocks` above 1000.
+Each segment block is one entry in a JSON-RPC batch, and Zakura refuses a batch
+with more than 1,000 entries.
+
 Construction loads an inactive `RocksDbCanonicalBuilder`, validates continuity,
 manifest identity, per-block replay envelopes, and the ordered facts digest,
 then publishes `CanonicalBaselinePublication`. The candidate is not readable as
@@ -149,6 +153,20 @@ The release writer uses these sections:
 The writer selects construction or following from the store lifecycle described
 in [Runtime sequence](#runtime-sequence), not from a gap threshold, so no
 setting chooses between two binaries or requires an operator handoff.
+
+## Supported chains
+
+Zinder indexes the public Mainnet and Testnet chains and Regtest. Each
+`Network` carries a fixed genesis block hash. A genesis-complete build uses
+that hash as its history predecessor, so it fails when the node's block 1 does
+not descend from it.
+
+A Zebra or Zakura test network configured with its own genesis block is not
+supported. Its activation heights are discovered like any other network's, but
+its genesis differs from the one Zinder expects. A checkpointed build never
+compares the node's chain with the genesis hash. Pointing a checkpointed build
+at such a node can therefore store a different chain under the `zcash-testnet`
+identity.
 
 ## Invariants
 
