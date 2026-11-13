@@ -545,8 +545,10 @@ resync anchors; that deployment posture is not wallet-serving.
 requested address set. The compatibility adapter may make several internal
 artifact reads to satisfy the request, but the public response and stream must
 be deterministically ordered and capped as one result set. `maxEntries = 0`
-uses the adapter's configured default bound rather than becoming an unbounded
-query.
+means every matching output, as in lightwalletd. A response that would exceed
+the adapter's configured bound fails with `RESOURCE_EXHAUSTED` instead of
+dropping rows; see
+[Transparent address UTXOs](../reference/lightwalletd-compatibility.md#transparent-address-utxos).
 
 ## Transparent Address Tx History
 
@@ -576,6 +578,8 @@ depend on the optional materialized-view store. Its ascending page cursor binds
 the wallet row key to the exact `WalletCanonicalSourceIdentity` that issued the
 page. If the publisher installs another serving pair between pages, resumption
 fails with `FAILED_PRECONDITION` instead of combining rows from two sources.
+An absent, zero, or above-tip `range.end` reads to the visible tip; see
+[Transparent address history](../reference/lightwalletd-compatibility.md#transparent-address-history).
 
 The full projection path is the canonical worked example in
 [Extending artifacts §A worked example: transparent address transaction history](extending-artifacts.md#a-worked-example-transparent-address-transaction-history).
@@ -870,8 +874,13 @@ materialize every retained subtree root.
 lightwalletd blocks without a second full-range allocation. True per-item store
 back-pressure requires an owned snapshot streaming read API; until then the
 range cap is the memory bound.
-`GetAddressUtxosStream` must follow the same rule: page or stream from a
-bounded transparent output artifact read, never from an unbounded in-memory
-address result.
+`GetAddressUtxos` and `GetAddressUtxosStream` are not bounded at the read yet.
+They read each address through `TransparentAddressUnspentOutputs`, which
+returns the complete unspent set in memory with no row bound, and then apply
+`maxEntries` and the response bound. The bound limits the response size but
+not the read. A paged unspent-output read that stops at the response bound is
+follow-up work.
 
-Do not materialize an unbounded list and truncate it after the fact. The storage and protocol signatures should make that shape impossible.
+Every other compatibility read keeps the bound at the read: it does not
+materialize an unbounded list and truncate it after the fact, and its storage
+and protocol signatures make that shape impossible.

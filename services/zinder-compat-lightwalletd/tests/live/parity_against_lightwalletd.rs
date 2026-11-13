@@ -47,7 +47,8 @@ use zebra_chain::{
     parameters::NetworkKind as ZebraNetworkKind, transparent::Address as ZebraTransparentAddress,
 };
 use zinder_core::{
-    Network, TransactionId, UnixTimestampMillis, wire::decode_rpc_transaction_id_hex,
+    Network, TransactionId, UnixTimestampMillis,
+    wire::{decode_rpc_transaction_id_hex, encode_internal_transaction_id},
 };
 use zinder_proto::compat::lightwalletd::{
     self, BlockId, BlockRange, ChainSpec, Empty, TxFilter,
@@ -115,6 +116,17 @@ async fn lightd_info_advertises_matching_chain_metadata() -> Result<()> {
     assert!(
         zinder_info.taddr_support,
         "Zinder must advertise transparent-address support",
+    );
+    // Both servers report the release tag of the protocol they serve. The
+    // pinned reference lightwalletd and Zinder's vendored schemas pin the same
+    // lightwallet-protocol release, so the tags agree.
+    assert_eq!(
+        zinder_info.lightwallet_protocol_version,
+        lightwalletd::LIGHTWALLETD_PROTOCOL_VERSION,
+    );
+    assert_eq!(
+        zinder_info.lightwallet_protocol_version, reference_info.lightwallet_protocol_version,
+        "lightwalletProtocolVersion must name the same protocol release",
     );
     Ok(())
 }
@@ -473,6 +485,14 @@ async fn accepted_send_transaction_surfaces_in_non_empty_mempool_methods() -> Re
         reference_raw.height, 0,
         "reference mempool RawTransaction height"
     );
+
+    assert_pending_transaction_matches_reference(
+        &mut zinder,
+        &mut reference,
+        broadcast_txid,
+        &raw_transaction,
+    )
+    .await?;
 
     let zinder_compact =
         wait_for_compact_mempool_transaction(&mut zinder, broadcast_txid, "Zinder").await?;
@@ -1047,6 +1067,55 @@ async fn address_utxos_respect_max_entries_for_miner_address() -> Result<()> {
     Ok(())
 }
 
+/// `maxEntries = 0` means every UTXO in lightwalletd, not a server default.
+#[tokio::test]
+#[ignore = "live parity test; see CLAUDE.md §Live Node Tests"]
+async fn address_utxos_with_zero_max_entries_match_reference_for_miner_address() -> Result<()> {
+    let _guard = init();
+    let Some(_env) = require_live()? else {
+        return Ok(());
+    };
+    let Some((mut zinder, mut reference)) = open_parity_clients().await? else {
+        return Ok(());
+    };
+    let address = parity_transparent_address()?;
+    let request = || lightwalletd::GetAddressUtxosArg {
+        addresses: vec![address.clone()],
+        start_height: 0,
+        max_entries: 0,
+    };
+
+    let zinder_list = zinder.get_address_utxos(request()).await?.into_inner();
+    let reference_list = reference.get_address_utxos(request()).await?.into_inner();
+    let zinder_stream = drain_address_utxos(
+        zinder
+            .get_address_utxos_stream(request())
+            .await?
+            .into_inner(),
+    )
+    .await?;
+    let reference_stream = drain_address_utxos(
+        reference
+            .get_address_utxos_stream(request())
+            .await?
+            .into_inner(),
+    )
+    .await?;
+
+    assert_eq!(zinder_list.address_utxos, zinder_stream);
+    assert_eq!(reference_list.address_utxos, reference_stream);
+    assert_eq!(
+        normalize_address_utxos(&zinder_stream),
+        normalize_address_utxos(&reference_stream),
+        "unbounded transparent UTXOs diverge for miner address {address}",
+    );
+    assert!(
+        !zinder_stream.is_empty(),
+        "miner address {address} should have transparent UTXOs after regtest mining",
+    );
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "live parity test; see CLAUDE.md §Live Node Tests"]
 async fn address_utxos_match_reference_for_unused_address() -> Result<()> {
@@ -1195,6 +1264,133 @@ async fn taddress_balance_matches_reference_for_unused_address() -> Result<()> {
     assert_eq!(zinder_balance, zinder_stream_balance);
     assert_eq!(reference_balance, reference_stream_balance);
     assert_eq!(zinder_balance.value_zat, 0);
+    Ok(())
+}
+
+/// Open-ended and oversized history ranges read to the tip, like lightwalletd.
+///
+/// lightwalletd reads an absent or zero `range.end` as the tip, and Zebra
+/// clamps an end above its tip. lightwalletd rejects a span wider than
+/// 10,000,000 blocks, such as the `end = u64::MAX` that `WebZjs` sends, where
+/// Zinder clamps it to the tip.
+#[tokio::test]
+#[ignore = "live parity test; see CLAUDE.md §Live Node Tests"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Each open-ended range shape is compared against the same shared-tip baseline in one flow."
+)]
+async fn taddress_history_with_open_or_oversized_end_matches_reference_for_miner_address()
+-> Result<()> {
+    let _guard = init();
+    let Some(_env) = require_live()? else {
+        return Ok(());
+    };
+    let Some((mut zinder, mut reference)) = open_parity_clients().await? else {
+        return Ok(());
+    };
+    let address = parity_transparent_address()?;
+    let tip_height = common_latest_height(&mut zinder, &mut reference).await?;
+    let reference_tip = reference.get_latest_block(ChainSpec {}).await?.into_inner();
+    if reference_tip.height != tip_height {
+        return Err(eyre!(
+            "open-ended history parity needs one shared tip: zinder={tip_height} reference={}",
+            reference_tip.height,
+        ));
+    }
+    let request = |end_height: Option<u64>| lightwalletd::TransparentAddressBlockFilter {
+        address: address.clone(),
+        range: Some(BlockRange {
+            start: Some(BlockId {
+                height: 1,
+                hash: Vec::new(),
+            }),
+            end: end_height.map(|height| BlockId {
+                height,
+                hash: Vec::new(),
+            }),
+            pool_types: Vec::new(),
+        }),
+    };
+    let tip_bounded = normalize_raw_transactions(
+        &drain_raw_transactions(
+            zinder
+                .get_taddress_txids(request(Some(tip_height)))
+                .await?
+                .into_inner(),
+        )
+        .await?,
+    );
+    assert!(
+        !tip_bounded.is_empty(),
+        "miner address {address} should have transparent history after regtest mining",
+    );
+
+    for end_height in [None, Some(0), Some(tip_height.saturating_add(1_000))] {
+        let zinder_txids = drain_raw_transactions(
+            zinder
+                .get_taddress_txids(request(end_height))
+                .await?
+                .into_inner(),
+        )
+        .await?;
+        let reference_txids = drain_raw_transactions(
+            reference
+                .get_taddress_txids(request(end_height))
+                .await?
+                .into_inner(),
+        )
+        .await?;
+        let zinder_transactions = drain_raw_transactions(
+            zinder
+                .get_taddress_transactions(request(end_height))
+                .await?
+                .into_inner(),
+        )
+        .await?;
+        let reference_transactions = drain_raw_transactions(
+            reference
+                .get_taddress_transactions(request(end_height))
+                .await?
+                .into_inner(),
+        )
+        .await?;
+
+        assert_eq!(
+            normalize_raw_transactions(&zinder_txids),
+            normalize_raw_transactions(&reference_txids),
+            "GetTaddressTxids diverges for end {end_height:?}",
+        );
+        assert_eq!(
+            normalize_raw_transactions(&zinder_transactions),
+            normalize_raw_transactions(&reference_transactions),
+            "GetTaddressTransactions diverges for end {end_height:?}",
+        );
+        assert_eq!(
+            normalize_raw_transactions(&zinder_txids),
+            tip_bounded,
+            "end {end_height:?} must read to the tip",
+        );
+    }
+
+    let zinder_unbounded = drain_raw_transactions(
+        zinder
+            .get_taddress_txids(request(Some(u64::MAX)))
+            .await?
+            .into_inner(),
+    )
+    .await?;
+    assert_eq!(normalize_raw_transactions(&zinder_unbounded), tip_bounded);
+    let reference_status = stream_error_status(
+        reference.get_taddress_txids(request(Some(u64::MAX))).await,
+        "reference GetTaddressTxids",
+        "end = u64::MAX",
+    )
+    .await?;
+    assert_eq!(
+        reference_status.code(),
+        Code::InvalidArgument,
+        "the pinned reference rejects a span above 10,000,000 blocks: {reference_status:?}",
+    );
     Ok(())
 }
 
@@ -1655,6 +1851,37 @@ async fn select_spendable_lightwalletd_utxo(
     Err(eyre!(
         "no mature spendable UTXO for parity address {address}; the parity fixture must premine at least 125 blocks to the address printed by `cargo run -p zinder-testkit --example print_broadcast_test_address`"
     ))
+}
+
+/// Both servers answer `GetTransaction` for a pending transaction with its
+/// bytes at height 0, the protocol's "in the mempool" sentinel.
+async fn assert_pending_transaction_matches_reference(
+    zinder: &mut CompactTxStreamerClient<tonic::transport::Channel>,
+    reference: &mut CompactTxStreamerClient<tonic::transport::Channel>,
+    transaction_id: TransactionId,
+    raw_transaction: &[u8],
+) -> Result<()> {
+    let pending_filter = || TxFilter {
+        block: None,
+        index: 0,
+        hash: encode_internal_transaction_id(transaction_id).to_vec(),
+    };
+    let zinder_pending = zinder.get_transaction(pending_filter()).await?.into_inner();
+    let reference_pending = reference
+        .get_transaction(pending_filter())
+        .await?
+        .into_inner();
+    assert_eq!(
+        zinder_pending.height, 0,
+        "Zinder pending GetTransaction height"
+    );
+    assert_eq!(
+        reference_pending.height, 0,
+        "reference pending GetTransaction height"
+    );
+    assert_eq!(zinder_pending.data, raw_transaction);
+    assert_eq!(zinder_pending.data, reference_pending.data);
+    Ok(())
 }
 
 async fn wait_for_mempool_stream_snapshot_transaction(

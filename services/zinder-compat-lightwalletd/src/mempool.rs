@@ -12,5 +12,6 @@ pub use ingest_control::{
 };
 pub use surface::{
     MempoolEventEnvelopeStream, MempoolSnapshotPage, MempoolSurface, MempoolSurfaceError,
-    SharedMempoolSurface, SharedTipChangeWatcher, TipChangeWatcher, TipChangeWatcherError,
+    MempoolTransactionLookup, SharedMempoolSurface, SharedTipChangeWatcher, TipChangeWatcher,
+    TipChangeWatcherError,
 };

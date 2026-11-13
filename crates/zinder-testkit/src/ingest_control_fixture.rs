@@ -13,7 +13,7 @@ use tokio::net::TcpListener;
 use tokio_stream::{Stream, wrappers::TcpListenerStream};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, transport::Server};
-use zinder_core::{Network, wire::encode_zinder_native_chain_name};
+use zinder_core::{MempoolEntry, Network, wire::encode_zinder_native_chain_name};
 use zinder_proto::{
     capabilities::{
         INGEST_CONTROL_MEMPOOL_EVENTS_V2, INGEST_CONTROL_MEMPOOL_SNAPSHOT_V3,
@@ -90,6 +90,17 @@ impl IngestControlFixture {
         self.service.set_mempool_snapshot_error(snapshot_error);
     }
 
+    /// Replaces the live mempool that the snapshot and transaction RPCs serve.
+    pub fn set_mempool_entries(&self, entries: &[MempoolEntry]) {
+        self.service.set_mempool_entries(entries);
+    }
+
+    /// Controls a deterministic error returned by the mempool transaction RPC.
+    pub fn set_mempool_transaction_error(&self, transaction_error: Option<Status>) {
+        self.service
+            .set_mempool_transaction_error(transaction_error);
+    }
+
     /// Reports a canonical writer parked by a reorg deeper than its window,
     /// or clears the halt with `None`.
     pub fn set_reorg_window_exceeded(&self, halt: Option<ops::ReorgWindowExceededDetail>) {
@@ -117,6 +128,8 @@ pub struct IngestControlFixtureService {
     health_available: Arc<AtomicBool>,
     health_stalled: Arc<AtomicBool>,
     snapshot_error: Arc<Mutex<Option<Status>>>,
+    mempool_entries: Arc<Mutex<Vec<wallet::MempoolEntry>>>,
+    mempool_transaction_error: Arc<Mutex<Option<Status>>>,
     reorg_window_exceeded: Arc<Mutex<Option<ops::ReorgWindowExceededDetail>>>,
 }
 
@@ -129,6 +142,8 @@ impl IngestControlFixtureService {
             health_available: Arc::new(AtomicBool::new(true)),
             health_stalled: Arc::new(AtomicBool::new(false)),
             snapshot_error: Arc::new(Mutex::new(None)),
+            mempool_entries: Arc::new(Mutex::new(Vec::new())),
+            mempool_transaction_error: Arc::new(Mutex::new(None)),
             reorg_window_exceeded: Arc::new(Mutex::new(None)),
         }
     }
@@ -147,6 +162,19 @@ impl IngestControlFixtureService {
     /// Controls a deterministic error returned by the mempool snapshot RPC.
     pub fn set_mempool_snapshot_error(&self, snapshot_error: Option<Status>) {
         *self.snapshot_error.lock() = snapshot_error;
+    }
+
+    /// Replaces the live mempool that the snapshot and transaction RPCs serve.
+    pub fn set_mempool_entries(&self, entries: &[MempoolEntry]) {
+        *self.mempool_entries.lock() = entries
+            .iter()
+            .map(zinder_proto::wire::mempool_entry_message)
+            .collect();
+    }
+
+    /// Controls a deterministic error returned by the mempool transaction RPC.
+    pub fn set_mempool_transaction_error(&self, transaction_error: Option<Status>) {
+        *self.mempool_transaction_error.lock() = transaction_error;
     }
 
     /// Reports a canonical writer parked by a reorg deeper than its window,
@@ -240,7 +268,7 @@ impl IngestControl for IngestControlFixtureService {
             chain_view: Some(chain_view),
             events_resume_cursor: Vec::new(),
             snapshot_age_millis: 0,
-            entries: Vec::new(),
+            entries: self.mempool_entries.lock().clone(),
             next_cursor: Vec::new(),
             source_tip,
         }))
@@ -248,9 +276,26 @@ impl IngestControl for IngestControlFixtureService {
 
     async fn mempool_transaction(
         &self,
-        _request: Request<MempoolTransactionRequest>,
+        request: Request<MempoolTransactionRequest>,
     ) -> Result<Response<wallet::TransactionStatusResponse>, Status> {
-        Err(Status::not_found("fixture mempool is empty"))
+        let transaction_error = self.mempool_transaction_error.lock().clone();
+        if let Some(error) = transaction_error {
+            return Err(error);
+        }
+        let transaction_id = request.into_inner().transaction_id;
+        let entry = self
+            .mempool_entries
+            .lock()
+            .iter()
+            .find(|entry| entry.transaction_id == transaction_id)
+            .cloned()
+            .ok_or_else(|| Status::not_found("fixture mempool does not hold the transaction"))?;
+        Ok(Response::new(wallet::TransactionStatusResponse {
+            chain_view: Some(fixture_chain_view(self.network)),
+            location: Some(wallet::TransactionLocation {
+                location: Some(wallet::transaction_location::Location::InMempool(entry)),
+            }),
+        }))
     }
 
     async fn mempool_events(

@@ -15,6 +15,10 @@
 //! handles transparent HTTP/2 reconnect, so a transient writer outage does
 //! not require restarting the compat process.
 //!
+//! Every surface method shares the wallet ingest-control bound across the
+//! first dial and its RPC. Unary calls are bounded end to end; the event
+//! stream bounds only its establishment so a healthy stream can stay open.
+//!
 //! With N concurrent lightwalletd `GetMempoolStream` clients there are N
 //! concurrent `IngestControl` `MempoolEvents` subscriptions multiplexed over
 //! the cached channel. Operators capping the public lightwalletd surface
@@ -26,6 +30,7 @@
 //! fenced mempool stream. A 500 ms backoff between attempts prevents a writer
 //! restart from driving a tight reconnect loop.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,9 +38,18 @@ use async_trait::async_trait;
 use tokio::sync::{OnceCell, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tonic::Request;
-use zinder_core::{BlockHeight, BlockId, ChainEpochId};
-use zinder_proto::v1::{ingest::ingest_control_client::IngestControlClient, wallet};
+use tonic::{Code, Request};
+use zinder_core::{
+    BlockHeight, BlockId, ChainEpochId, TransactionId, wire::encode_rpc_transaction_id_hex,
+};
+use zinder_proto::{
+    v1::{
+        ingest::{MempoolTransactionRequest, ingest_control_client::IngestControlClient},
+        wallet,
+    },
+    wire::TransactionAbsence,
+};
+use zinder_query::{WALLET_INGEST_CONTROL_REQUEST_TIMEOUT, wallet_ingest_control_request};
 use zinder_runtime::{AuthenticatedChannel, BearerToken, connect_zinder_grpc};
 use zinder_store::{
     EventStreamStartPosition, StreamCursorTokenV1, event_stream_start_message,
@@ -45,7 +59,7 @@ use zinder_store::{
 
 use super::surface::{
     MempoolEventEnvelopeStream, MempoolSnapshotPage, MempoolSurface, MempoolSurfaceError,
-    TipChangeWatcher, TipChangeWatcherError,
+    MempoolTransactionLookup, TipChangeWatcher, TipChangeWatcherError,
 };
 
 type AuthenticatedIngestControlClient = IngestControlClient<AuthenticatedChannel>;
@@ -63,6 +77,7 @@ pub struct IngestControlMempoolSurface {
     endpoint: String,
     bearer_token: Option<BearerToken>,
     channel: Arc<OnceCell<AuthenticatedChannel>>,
+    request_timeout: Duration,
 }
 
 impl IngestControlMempoolSurface {
@@ -75,6 +90,7 @@ impl IngestControlMempoolSurface {
             endpoint,
             bearer_token: None,
             channel: Arc::new(OnceCell::new()),
+            request_timeout: WALLET_INGEST_CONTROL_REQUEST_TIMEOUT,
         }
     }
 
@@ -109,6 +125,27 @@ impl IngestControlMempoolSurface {
             .await?;
         Ok(IngestControlClient::new(channel.clone()))
     }
+
+    /// Runs `operation` under the surface's request timeout.
+    ///
+    /// The bound must cover [`Self::ingest_control_client`] as well as the
+    /// RPC: the first dial has no deadline of its own, and concurrent callers
+    /// wait on the same cell. A cancelled dial leaves the cell empty, so the
+    /// next call dials again.
+    async fn bounded<T>(
+        &self,
+        operation_name: &str,
+        operation: impl Future<Output = Result<T, MempoolSurfaceError>>,
+    ) -> Result<T, MempoolSurfaceError> {
+        tokio::time::timeout(self.request_timeout, operation)
+            .await
+            .map_err(|_| MempoolSurfaceError::Unavailable {
+                reason: format!(
+                    "ingest-control {operation_name} timed out after {:?}",
+                    self.request_timeout
+                ),
+            })?
+    }
 }
 
 #[async_trait]
@@ -118,16 +155,22 @@ impl MempoolSurface for IngestControlMempoolSurface {
         max_entries: u32,
         from_cursor: Option<Vec<u8>>,
     ) -> Result<MempoolSnapshotPage, MempoolSurfaceError> {
-        let mut client = self.ingest_control_client().await?;
-        let response = client
-            .mempool_snapshot(wallet::MempoolSnapshotRequest {
-                max_entries,
-                from_cursor: from_cursor.unwrap_or_default(),
+        let response = self
+            .bounded("mempool_snapshot", async {
+                let mut client = self.ingest_control_client().await?;
+                client
+                    .mempool_snapshot(wallet_ingest_control_request(
+                        wallet::MempoolSnapshotRequest {
+                            max_entries,
+                            from_cursor: from_cursor.unwrap_or_default(),
+                        },
+                    ))
+                    .await
+                    .map_err(|status| MempoolSurfaceError::Unavailable {
+                        reason: format!("ingest-control mempool_snapshot failed: {status}"),
+                    })
             })
-            .await
-            .map_err(|status| MempoolSurfaceError::Unavailable {
-                reason: format!("ingest-control mempool_snapshot failed: {status}"),
-            })?
+            .await?
             .into_inner();
         let entries = response
             .entries
@@ -193,19 +236,23 @@ impl MempoolSurface for IngestControlMempoolSurface {
         &self,
         from_cursor: Option<StreamCursorTokenV1>,
     ) -> Result<MempoolEventEnvelopeStream, MempoolSurfaceError> {
-        let mut client = self.ingest_control_client().await?;
         let start = from_cursor.map_or(
             EventStreamStartPosition::EarliestRetained,
             EventStreamStartPosition::AfterCursor,
         );
-        let response = client
-            .mempool_events(wallet::MempoolEventsRequest {
-                start: Some(event_stream_start_message(&start)),
+        let response = self
+            .bounded("mempool_events", async {
+                let mut client = self.ingest_control_client().await?;
+                client
+                    .mempool_events(wallet::MempoolEventsRequest {
+                        start: Some(event_stream_start_message(&start)),
+                    })
+                    .await
+                    .map_err(|status| MempoolSurfaceError::Unavailable {
+                        reason: format!("ingest-control mempool_events failed: {status}"),
+                    })
             })
-            .await
-            .map_err(|status| MempoolSurfaceError::Unavailable {
-                reason: format!("ingest-control mempool_events failed: {status}"),
-            })?;
+            .await?;
 
         let (output_sender, output_receiver) = mpsc::channel(16);
         let mut response_stream = response.into_inner();
@@ -242,6 +289,75 @@ impl MempoolSurface for IngestControlMempoolSurface {
             }
         });
         Ok(Box::pin(ReceiverStream::new(output_receiver)))
+    }
+
+    async fn mempool_transaction(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<MempoolTransactionLookup, MempoolSurfaceError> {
+        let rpc_outcome = self
+            .bounded("mempool_transaction", async {
+                let mut client = self.ingest_control_client().await?;
+                Ok(client
+                    .mempool_transaction(wallet_ingest_control_request(MempoolTransactionRequest {
+                        transaction_id: encode_rpc_transaction_id_hex(transaction_id),
+                    }))
+                    .await)
+            })
+            .await?;
+        let response = match rpc_outcome {
+            Ok(response) => response.into_inner(),
+            Err(status) => return mempool_transaction_miss(&status),
+        };
+        let Some(wallet::transaction_location::Location::InMempool(entry)) =
+            response.location.and_then(|location| location.location)
+        else {
+            return Err(MempoolSurfaceError::Unavailable {
+                reason: "ingest-control mempool_transaction did not return a mempool entry"
+                    .to_owned(),
+            });
+        };
+        let entry = mempool_entry_from_message(entry).map_err(|error| {
+            MempoolSurfaceError::Unavailable {
+                reason: error.to_string(),
+            }
+        })?;
+        if entry.transaction_id() != transaction_id {
+            return Err(MempoolSurfaceError::Unavailable {
+                reason: "ingest-control mempool_transaction returned another transaction"
+                    .to_owned(),
+            });
+        }
+        Ok(MempoolTransactionLookup::Pending(Box::new(entry)))
+    }
+}
+
+/// Reads a failed `IngestControl.MempoolTransaction` call.
+///
+/// Only a typed `TRANSACTION_NOT_FOUND` absence is a miss, because it names
+/// the writer epoch the miss is coherent with. A bare `NOT_FOUND` cannot be
+/// compared with the canonical read, so it is not reported as an absence.
+fn mempool_transaction_miss(
+    status: &tonic::Status,
+) -> Result<MempoolTransactionLookup, MempoolSurfaceError> {
+    match TransactionAbsence::from_status(status) {
+        Ok(Some(absence)) => Ok(MempoolTransactionLookup::Absent {
+            chain_epoch_id: absence.chain_epoch_id,
+        }),
+        Ok(None) if status.code() == Code::NotFound => Err(MempoolSurfaceError::Unavailable {
+            reason: "ingest-control mempool_transaction answered without a typed absence; \
+                     transaction absence cannot be proven"
+                .to_owned(),
+        }),
+        Ok(None) => Err(MempoolSurfaceError::Unavailable {
+            reason: format!("ingest-control mempool_transaction failed: {status}"),
+        }),
+        Err(metadata_error) => Err(MempoolSurfaceError::Unavailable {
+            reason: format!(
+                "ingest-control mempool_transaction returned a malformed transaction absence: \
+                 {metadata_error}"
+            ),
+        }),
     }
 }
 
@@ -377,4 +493,44 @@ async fn connect_authenticated_ingest_control(
             reason: error.to_string(),
         })?;
     Ok(IngestControlClient::new(channel))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    /// A writer that accepts TCP but never answers HTTP/2 must not hold a
+    /// mempool lookup past the request bound.
+    #[tokio::test]
+    async fn mempool_transaction_is_unavailable_when_the_writer_never_answers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let mut surface = IngestControlMempoolSurface::new(endpoint);
+        let request_timeout = Duration::from_millis(200);
+        surface.request_timeout = request_timeout;
+
+        let started_at = Instant::now();
+        let lookup = tokio::time::timeout(
+            Duration::from_secs(5),
+            surface.mempool_transaction(TransactionId::from_bytes([7; 32])),
+        )
+        .await?;
+        let elapsed = started_at.elapsed();
+
+        let Err(MempoolSurfaceError::Unavailable { reason }) = lookup else {
+            return Err(format!("stalled writer must be unavailable, got {lookup:?}").into());
+        };
+        assert!(reason.contains("timed out"), "unexpected reason: {reason}");
+        assert!(
+            elapsed >= request_timeout && elapsed < Duration::from_secs(2),
+            "lookup took {elapsed:?}"
+        );
+        drop(listener);
+        Ok(())
+    }
 }

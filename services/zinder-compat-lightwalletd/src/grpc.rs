@@ -15,7 +15,7 @@ use zinder_core::{
     BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastUnknown, ChainEpochId,
     CompactBlockArtifact, CompactTransaction, CompactTransactionData, Network,
     NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex,
-    SubtreeRootRange, TransactionBroadcastOutcome, TransactionLocation,
+    SubtreeRootRange, TransactionBroadcastOutcome, TransactionId, TransactionLocation,
     TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TxStatus,
     wire::{
         decode_internal_transaction_id, encode_bip70_chain_name, encode_branch_id_hex,
@@ -24,20 +24,21 @@ use zinder_core::{
     },
 };
 use zinder_proto::compat::lightwalletd::{
-    self, LIGHTWALLETD_PROTOCOL_COMMIT, compact_tx_streamer_server,
+    self, LIGHTWALLETD_PROTOCOL_VERSION, compact_tx_streamer_server,
 };
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
-    DEFAULT_MAX_COMPACT_BLOCK_RANGE, SubtreeRoots, TransparentAddressTxIdsInRangeRequest,
-    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest, TreeState,
-    WalletQueryApi, WalletServingQuery, address_lookup_to_script_hash, status_from_query_error,
+    DEFAULT_MAX_COMPACT_BLOCK_RANGE, QueryError, SubtreeRoots,
+    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
+    TransparentAddressUnspentOutputsRequest, TreeState, WalletQueryApi, WalletServingQuery,
+    address_lookup_to_script_hash, status_from_query_error,
 };
 use zinder_source::transparent_address_matches_network;
 use zinder_store::{MempoolEvent, RawBlobRetention};
 
 use crate::mempool::{
-    MempoolSnapshotPage, MempoolSurfaceError, SharedMempoolSurface, SharedTipChangeWatcher,
-    TipChangeWatcherError,
+    MempoolSnapshotPage, MempoolSurfaceError, MempoolTransactionLookup, SharedMempoolSurface,
+    SharedTipChangeWatcher, TipChangeWatcherError,
 };
 
 type GrpcStream<T> =
@@ -51,8 +52,12 @@ struct EntryChainView {
 
 /// Default maximum subtree roots returned when lightwalletd requests "all entries".
 pub const DEFAULT_MAX_LIGHTWALLETD_SUBTREE_ROOTS: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
-/// Default maximum transparent UTXOs returned when lightwalletd requests "all entries".
-pub const DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS: NonZeroU32 = NonZeroU32::MIN.saturating_add(999);
+/// Default maximum transparent UTXOs one `GetAddressUtxos` response returns.
+///
+/// It equals Zebra's `getaddressutxos` result cap, which bounds lightwalletd
+/// on Zebra the same way.
+pub const DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS: NonZeroU32 =
+    NonZeroU32::MIN.saturating_add(99_999);
 /// Page size used to drain the native mempool snapshot for lightwalletd.
 const LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 1024;
 /// Blocks a slow `GetBlockRange` client can stall behind, on top of the chunk
@@ -74,7 +79,13 @@ pub struct LightwalletdResponseLimits {
     /// response bounded so one compatibility request cannot materialize
     /// unbounded history.
     pub max_subtree_roots: NonZeroU32,
-    /// Bound used when `GetAddressUtxos.maxEntries` is zero.
+    /// Most UTXOs one `GetAddressUtxos` or `GetAddressUtxosStream` response
+    /// returns.
+    ///
+    /// `maxEntries = 0` means every matching UTXO, as in lightwalletd. A
+    /// request that would return more than this bound fails with
+    /// `RESOURCE_EXHAUSTED` instead of dropping rows, so a wallet never sums
+    /// a partial UTXO set as its balance.
     pub max_address_utxos: NonZeroU32,
 }
 
@@ -319,8 +330,6 @@ where
 
         let start_height = u32::try_from(request.start_height)
             .map_err(|_| Status::invalid_argument("startHeight exceeds u32"))?;
-        let max_entries =
-            NonZeroU32::new(request.max_entries).unwrap_or(self.response_limits.max_address_utxos);
         let visible_tip_block = self
             .query_api
             .visible_tip_block(None)
@@ -352,8 +361,63 @@ where
                 .then_with(|| left.index.cmp(&right.index))
                 .then_with(|| left.address.cmp(&right.address))
         });
-        replies.truncate(u32_to_usize(max_entries.get()));
+        if let Some(max_entries) = NonZeroU32::new(request.max_entries) {
+            replies.truncate(u32_to_usize(max_entries.get()));
+        }
+        let response_limit = self.response_limits.max_address_utxos.get();
+        if replies.len() > u32_to_usize(response_limit) {
+            return Err(Status::resource_exhausted(format!(
+                "{} unspent outputs match, more than the {response_limit} one response returns",
+                replies.len(),
+            )));
+        }
         Ok(replies)
+    }
+
+    /// Answers a `GetTransaction` whose canonical read missed from the live
+    /// mempool, as lightwalletd does through Zebra's `getrawtransaction`.
+    ///
+    /// A pending transaction is returned at height 0, the protocol's
+    /// "in the mempool" sentinel. A deployment without a mempool surface keeps
+    /// `canonical_miss`, and so does a mempool miss after a canonical read
+    /// that searched the chain of the same epoch. A mempool miss at another
+    /// epoch is `UNAVAILABLE`, because the transaction may have been mined
+    /// into a block this replica has not applied yet. A mempool failure is
+    /// returned instead of `canonical_miss`, because the transaction may be
+    /// pending.
+    async fn pending_transaction(
+        &self,
+        transaction_id: TransactionId,
+        canonical_miss: CanonicalTransactionMiss,
+    ) -> Result<lightwalletd::RawTransaction, Status> {
+        let Some(mempool_surface) = self.mempool_surface.as_ref() else {
+            return Err(canonical_miss.into_status());
+        };
+        let lookup = mempool_surface
+            .mempool_transaction(transaction_id)
+            .await
+            .map_err(status_from_mempool_surface_error)?;
+        match (lookup, canonical_miss) {
+            (MempoolTransactionLookup::Pending(entry), _) => Ok(mempool_raw_transaction(&entry)),
+            (
+                MempoolTransactionLookup::Absent { chain_epoch_id },
+                CanonicalTransactionMiss::NotInChain { at_epoch_id },
+            ) if chain_epoch_id == at_epoch_id => {
+                Err(CanonicalTransactionMiss::NotInChain { at_epoch_id }.into_status())
+            }
+            (
+                MempoolTransactionLookup::Absent { chain_epoch_id },
+                CanonicalTransactionMiss::NotInChain { at_epoch_id },
+            ) => Err(Status::unavailable(format!(
+                "the live mempool answered at chain epoch {} but this replica read chain epoch {}; retry",
+                chain_epoch_id.value(),
+                at_epoch_id.value(),
+            ))),
+            (
+                MempoolTransactionLookup::Absent { .. },
+                CanonicalTransactionMiss::BelowHistoryFloor(history_floor),
+            ) => Err(history_floor),
+        }
     }
 
     async fn transparent_address_raw_transactions(
@@ -366,8 +430,11 @@ where
             .await
             .map_err(|error| status_from_query_error(&error))?;
         let at_epoch_id = visible_tip_block.chain_epoch.id;
-        let typed_request =
-            transparent_address_tx_history_request(filter, visible_tip_block.chain_epoch.network)?;
+        let typed_request = transparent_address_tx_history_request(
+            filter,
+            visible_tip_block.chain_epoch.network,
+            visible_tip_block.height,
+        )?;
         let history = transparent_address_tx_history(&self.query_api, typed_request).await?;
         let mut raw_transactions = Vec::with_capacity(history.len());
 
@@ -543,16 +610,36 @@ where
         }
         let transaction_id = decode_internal_transaction_id(&filter.hash)
             .map_err(|error| wire_decode_error_to_status(&error))?;
-        let response = self
+        let lookup = self
             .query_api
             .transaction(transaction_id, Some(at_epoch_id))
-            .await
-            .map_err(|error| status_from_query_error(&error))?;
-        let location = mined_location_from_status(response.status)?;
+            .await;
+        #[allow(
+            clippy::wildcard_enum_match_arm,
+            reason = "TxStatus is #[non_exhaustive]; a status added later is not mined, so it falls back to the mempool like NotFound."
+        )]
+        let canonical_miss = match lookup {
+            Ok(response) => match response.status {
+                TxStatus::Mined(mined) => {
+                    return Ok(Response::new(
+                        raw_transaction_from_location(&self.query_api, at_epoch_id, mined.location)
+                            .await?,
+                    ));
+                }
+                TxStatus::InMempool(entry) => {
+                    return Ok(Response::new(mempool_raw_transaction(&entry)));
+                }
+                _ => CanonicalTransactionMiss::NotInChain { at_epoch_id },
+            },
+            Err(error @ QueryError::CanonicalHistoryUnavailable { .. }) => {
+                CanonicalTransactionMiss::BelowHistoryFloor(status_from_query_error(&error))
+            }
+            Err(error) => return Err(status_from_query_error(&error)),
+        };
 
-        Ok(Response::new(
-            raw_transaction_from_location(&self.query_api, at_epoch_id, location).await?,
-        ))
+        self.pending_transaction(transaction_id, canonical_miss)
+            .await
+            .map(Response::new)
     }
 
     async fn send_transaction(
@@ -1381,9 +1468,15 @@ fn shielded_protocol_from_request(protocol: i32) -> Result<ShieldedProtocol, Sta
     }
 }
 
+/// Builds the native history request for a lightwalletd address filter.
+///
+/// The range resolves as lightwalletd resolves it on Zebra: an absent or zero
+/// `range.end` means the visible tip, and both bounds are clamped to the
+/// visible tip, so an end above the tip, even above `u32`, reads to the tip.
 fn transparent_address_tx_history_request(
     filter: &lightwalletd::TransparentAddressBlockFilter,
     network: Network,
+    visible_tip_height: BlockHeight,
 ) -> Result<TransparentAddressTxIdsInRangeRequest, Status> {
     let address_text = filter.address.as_str();
     let zebra_address: ZebraTransparentAddress = address_text.parse().map_err(|source| {
@@ -1409,12 +1502,11 @@ fn transparent_address_tx_history_request(
         .start
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("range.start is required"))?;
-    let end_block = range
-        .end
-        .as_ref()
-        .ok_or_else(|| Status::invalid_argument("range.end is required"))?;
-    let start_height = block_height_from_id(start_block)?;
-    let end_height = block_height_from_id(end_block)?;
+    let start_height = height_clamped_to_tip(start_block.height, visible_tip_height);
+    let end_height = match range.end.as_ref().map(|end_block| end_block.height) {
+        None | Some(0) => visible_tip_height,
+        Some(end_height) => height_clamped_to_tip(end_height, visible_tip_height),
+    };
     if start_height > end_height {
         return Err(Status::invalid_argument(
             "range.start.height must not exceed range.end.height",
@@ -1426,6 +1518,12 @@ fn transparent_address_tx_history_request(
         end_height,
         max_entries: NonZeroU32::MIN.saturating_add(999),
         from_cursor: None,
+    })
+}
+
+fn height_clamped_to_tip(height: u64, visible_tip_height: BlockHeight) -> BlockHeight {
+    u32::try_from(height).map_or(visible_tip_height, |height| {
+        BlockHeight::new(height).min(visible_tip_height)
     })
 }
 
@@ -1586,7 +1684,7 @@ fn lightd_info(
         donation_address: String::new(),
         upgrade_name,
         upgrade_height,
-        lightwallet_protocol_version: LIGHTWALLETD_PROTOCOL_COMMIT.to_owned(),
+        lightwallet_protocol_version: LIGHTWALLETD_PROTOCOL_VERSION.to_owned(),
     }
 }
 
@@ -1831,6 +1929,29 @@ fn project_added_to_raw_transaction(
             _ => None,
         },
         Err(error) => Some(Err(status_from_mempool_surface_error(error))),
+    }
+}
+
+/// A `GetTransaction` canonical read that did not find the transaction.
+enum CanonicalTransactionMiss {
+    /// The canonical chain of `at_epoch_id` does not hold the transaction.
+    NotInChain {
+        /// Chain epoch the canonical read searched.
+        at_epoch_id: ChainEpochId,
+    },
+    /// The store's history starts after a checkpoint, so the transaction may
+    /// be mined below the floor this status names.
+    BelowHistoryFloor(Status),
+}
+
+impl CanonicalTransactionMiss {
+    fn into_status(self) -> Status {
+        match self {
+            Self::NotInChain { .. } => {
+                Status::not_found("transaction is not in the canonical chain or the live mempool")
+            }
+            Self::BelowHistoryFloor(history_floor) => history_floor,
+        }
     }
 }
 

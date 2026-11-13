@@ -21,7 +21,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 use tokio_stream::Stream;
-use zinder_core::{ChainEpochId, MempoolEntry};
+use zinder_core::{ChainEpochId, MempoolEntry, TransactionId};
 use zinder_store::{MempoolEventEnvelope, StreamCursorTokenV1};
 
 /// Stream of mempool event envelopes returned by [`MempoolSurface::mempool_events`].
@@ -44,6 +44,23 @@ pub struct MempoolSnapshotPage {
     pub entries: Vec<MempoolEntry>,
     /// Opaque cursor for the next page, when more entries remain.
     pub next_cursor: Option<Vec<u8>>,
+}
+
+/// Outcome of a [`MempoolSurface::mempool_transaction`] lookup.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum MempoolTransactionLookup {
+    /// The live mempool holds the transaction.
+    Pending(Box<MempoolEntry>),
+    /// The live mempool does not hold the transaction.
+    ///
+    /// The miss is coherent with `chain_epoch_id`, the writer's canonical
+    /// epoch when it answered. It proves an absence only for a canonical read
+    /// at the same epoch.
+    Absent {
+        /// Writer chain epoch the mempool answered at.
+        chain_epoch_id: ChainEpochId,
+    },
 }
 
 /// Error vocabulary for [`MempoolSurface`] consumers.
@@ -85,6 +102,16 @@ pub trait MempoolSurface: Send + Sync + 'static {
         &self,
         from_cursor: Option<StreamCursorTokenV1>,
     ) -> Result<MempoolEventEnvelopeStream, MempoolSurfaceError>;
+
+    /// Looks `transaction_id` up in the live mempool.
+    ///
+    /// A miss names the chain epoch it is coherent with. A source that cannot
+    /// state that epoch fails with [`MempoolSurfaceError::Unavailable`]
+    /// rather than reporting an absence.
+    async fn mempool_transaction(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<MempoolTransactionLookup, MempoolSurfaceError>;
 }
 
 /// Convenience wrapper for a shared [`MempoolSurface`] handle.

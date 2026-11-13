@@ -154,6 +154,17 @@ pub mod compat {
             "/generated/lightwalletd_protocol_commit.txt"
         ));
 
+        /// Upstream `lightwallet-protocol` release tag that
+        /// [`LIGHTWALLETD_PROTOCOL_COMMIT`] points to, such as `v0.5.0`.
+        ///
+        /// `LightdInfo.lightwalletProtocolVersion` carries this tag, as
+        /// lightwalletd does, because wallets parse that field as
+        /// `vMAJOR.MINOR.PATCH` to decide which protocol features they may use.
+        pub const LIGHTWALLETD_PROTOCOL_VERSION: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/generated/lightwalletd_protocol_version.txt"
+        ));
+
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/generated/cash.z.wallet.sdk.rpc.rs"

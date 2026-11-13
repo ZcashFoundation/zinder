@@ -14,7 +14,7 @@ use zebra_chain::{
 };
 use zinder_compat_lightwalletd::{
     LightwalletdGrpcAdapter, MempoolEventEnvelopeStream, MempoolSnapshotPage, MempoolSurface,
-    MempoolSurfaceError,
+    MempoolSurfaceError, MempoolTransactionLookup,
 };
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, ChainEpoch, ChainEpochId, ChainTipMetadata,
@@ -41,6 +41,7 @@ use zinder_testkit::{
 const BLOCK_HEIGHT: BlockHeight = BlockHeight::new(1);
 const RAW_TRANSACTION_BYTES: &[u8] = b"current-android-sdk-mined-transaction";
 const MEMPOOL_TRANSACTION_BYTES: &[u8] = b"current-android-sdk-mempool-transaction";
+const MEMPOOL_TRANSACTION_ID: TransactionId = TransactionId::from_bytes([0x61; 32]);
 const SUBMITTED_TRANSACTION_BYTES: &[u8] = b"current-android-sdk-submitted-transaction";
 const TREE_STATE_PAYLOAD: &[u8] = br#"{"sapling":{"commitments":{"finalState":"sapling"}},"orchard":{"commitments":{"finalState":"orchard"}},"ironwood":{"commitments":{"finalState":"ironwood"}}}"#;
 
@@ -306,6 +307,20 @@ async fn current_android_sdk_rpc_contract_uses_admitted_production_pair() -> eyr
     assert_eq!(mempool_transaction.height, 0);
     assert!(mempool_transactions.message().await?.is_none());
 
+    // The SDK's transaction-status poll reads a pending transaction through
+    // GetTransaction, maps NOT_FOUND to TxidNotRecognized, and treats
+    // height 0 as pending (CompactBlockProcessor.kt:2404-2430 at a95780a).
+    let pending_transaction = client
+        .get_transaction(lightwalletd::TxFilter {
+            block: None,
+            index: 0,
+            hash: encode_internal_transaction_id(MEMPOOL_TRANSACTION_ID).to_vec(),
+        })
+        .await?
+        .into_inner();
+    assert_eq!(pending_transaction.data, MEMPOOL_TRANSACTION_BYTES);
+    assert_eq!(pending_transaction.height, 0);
+
     if shutdown_sender.send(()).is_err() {
         return Err(eyre::eyre!(
             "Android SDK contract listener shutdown receiver dropped"
@@ -345,7 +360,7 @@ impl AndroidSdkMempoolSurface {
     fn new() -> eyre::Result<Self> {
         Ok(Self {
             entry: MempoolEntry::new(
-                TransactionId::from_bytes([0x61; 32]),
+                MEMPOOL_TRANSACTION_ID,
                 None,
                 RawTransactionBytes::new(MEMPOOL_TRANSACTION_BYTES.to_vec()),
                 CompactTransactionData::default(),
@@ -384,6 +399,21 @@ impl MempoolSurface for AndroidSdkMempoolSurface {
         Ok(Box::pin(tokio_stream::empty::<
             Result<MempoolEventEnvelope, MempoolSurfaceError>,
         >()))
+    }
+
+    async fn mempool_transaction(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<MempoolTransactionLookup, MempoolSurfaceError> {
+        if self.entry.transaction_id() == transaction_id {
+            Ok(MempoolTransactionLookup::Pending(Box::new(
+                self.entry.clone(),
+            )))
+        } else {
+            Ok(MempoolTransactionLookup::Absent {
+                chain_epoch_id: synthetic_chain_epoch().id,
+            })
+        }
     }
 }
 

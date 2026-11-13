@@ -76,8 +76,9 @@ field that differs by mode is `taddrSupport`.
 | Class | Fields | Rule |
 | --- | --- | --- |
 | Comparable with lightwalletd | `chainName`, `saplingActivationHeight`, `consensusBranchId`, `upgradeName`, `upgradeHeight` | Derived from the chain and the activation table, so two servers on the same node agree at the same tip. `chainName` is the BIP70 name (`main` or `test`; Regtest reports `test`). `consensusBranchId` is the lowercase hex branch active at the tip. `upgradeName` and `upgradeHeight` name the next pending upgrade, as described above. Compare them only after both servers report the same `blockHeight`, because an activation height moves them. |
+| Protocol release | `lightwalletProtocolVersion` | The `lightwallet-protocol` release tag the server implements, such as `v0.5.0`. Two servers agree when they pin the same protocol release, whatever their build. |
 | Live tip | `blockHeight` | The served visible tip. Two servers agree only when they have both applied the same block, so a harness compares it with a tolerance of one block or compares the other fields only when the heights are equal. |
-| Zinder-specific | `version`, `vendor`, `gitCommit`, `branch`, `buildDate`, `buildUser`, `zcashdBuild`, `zcashdSubversion`, `donationAddress`, `estimatedHeight`, `lightwalletProtocolVersion`, `taddrSupport` | Identify or configure this process. Never compare them with another server. |
+| Zinder-specific | `version`, `vendor`, `gitCommit`, `branch`, `buildDate`, `buildUser`, `zcashdBuild`, `zcashdSubversion`, `donationAddress`, `estimatedHeight`, `taddrSupport` | Identify or configure this process. Never compare them with another server. |
 
 The Zinder-specific values are fixed:
 
@@ -90,12 +91,29 @@ The Zinder-specific values are fixed:
 - `estimatedHeight` equals `blockHeight`. Zinder serves its own visible tip and
   does not report the node's estimate, so it stays at the served tip while the
   node syncs.
-- `lightwalletProtocolVersion` is the pinned `lightwallet-protocol` commit
-  vendored in `zinder-proto`. Compare it with that pin, not with another
-  server's value.
 - `taddrSupport` is `true` in wallet-serving mode, where construction admitted
   transparent reads, and `false` in compact-blocks mode and in a generic
   adapter built without the transparent constructor.
+
+### `lightwalletProtocolVersion`
+
+`lightwalletProtocolVersion` is the release tag of the vendored
+`lightwallet-protocol` schemas, `v0.5.0` today, read from the `VERSION` file
+next to the pinned `COMMIT` in `zinder-proto` and exported as
+`LIGHTWALLETD_PROTOCOL_VERSION`. lightwalletd reports the same form: the pinned
+reference v0.6.0 sets the field to its protocol tag, `v0.5.0`
+(`common/common.go:51` at `e7436d2`).
+
+Wallets read the field as a version, not as an identifier. zingolib parses it
+as `vMAJOR.MINOR.PATCH` and refuses to sync below 0.5.0, the release that
+added the Ironwood pool (zingolib `f930d80`,
+`pepper-sync/src/client.rs:104-143`, checked before every sync at
+`sync.rs:464`). A commit hash fails that parse, so Zingo cannot sync against a
+server that reports one.
+
+The vendored commit stays available to Rust code as
+`LIGHTWALLETD_PROTOCOL_COMMIT`. lightwalletd reports no protocol commit on the
+wire, and `gitCommit` names the server build, so Zinder does not add one.
 
 ### `GetLatestBlock`
 
@@ -171,6 +189,112 @@ Unary block lookups validate the selector before reading. Height 0 with a
 identifier, so `GetBlock` returns `INVALID_ARGUMENT` for it in both serving
 modes, not `NOT_FOUND`. `GetBlockNullifiers` applies the same rule where it is
 served.
+
+## Transaction lookup
+
+`GetTransaction` returns a pending transaction the way lightwalletd does.
+lightwalletd calls Zebra's `getrawtransaction`, which checks the mempool first
+and omits `height` for a mempool transaction (Zebra 7.0.0,
+`zebra-rpc/src/methods.rs:2114-2144` and
+`zebra-rpc/src/methods/types/transaction.rs:313-317`), so lightwalletd answers
+with the raw bytes at height 0 (lightwalletd `e7436d2`,
+`frontend/service.go:474-485` and `common/common.go:765-779`). The protocol
+defines height 0 as "in the mempool".
+
+Zinder reads the canonical chain at the request's epoch first. When that read
+misses, it asks the writer's live mempool through
+`IngestControl.MempoolTransaction`:
+
+- A pending transaction is returned with its raw bytes at height 0.
+- A transaction in neither is `NOT_FOUND`, as in lightwalletd. The mempool
+  miss counts only when the writer answered it at the same chain epoch as the
+  canonical read
+  ([ADR-0042](../adrs/0042-proven-transaction-absence.md)).
+- A mempool miss at another chain epoch is `UNAVAILABLE`. The transaction may
+  have been mined into a block this replica has not applied yet, so the lookup
+  is retryable; a later lookup returns it mined or `NOT_FOUND`.
+- On a store whose history starts at a checkpoint, a mempool miss is
+  `CANONICAL_HISTORY_UNAVAILABLE` instead of `NOT_FOUND`, because the
+  transaction may be mined below the checkpoint.
+- A failed or timed-out mempool read is `UNAVAILABLE` rather than
+  `NOT_FOUND`, because the transaction may be pending. So is a writer miss
+  that names no chain epoch. The mempool read has the same 15-second timeout
+  as the native wallet query's `IngestControl` calls, and the timeout covers
+  the first connection to the writer as well as the call itself.
+- The wallet-serving binary always connects the mempool surface to the
+  writer's `IngestControl` endpoint. A `LightwalletdGrpcAdapter` built in Rust
+  without `with_mempool_surface` cannot see pending transactions and answers
+  `NOT_FOUND` for them.
+
+Wallet SDKs depend on the distinction. The Swift SDK treats height 0 as
+unmined and `NOT_FOUND` as an unknown transaction id
+(zcash-swift-wallet-sdk `ebd0add`,
+`Sources/ZcashLightClientKit/Modules/Service/GRPC/LightWalletGRPCService.swift:282-297`),
+and the Android SDK marks a transaction it cannot fetch as `TxidNotRecognized`
+(zcash-android-wallet-sdk `a95780a`, `CompactBlockProcessor.kt:2404-2430`).
+A just-broadcast transaction therefore reads as pending, not unknown.
+
+## Transparent address UTXOs
+
+`GetAddressUtxos` and `GetAddressUtxosStream` follow lightwalletd's
+`maxEntries` rule (lightwalletd `e7436d2`, `frontend/service.go:954`):
+
+- `maxEntries = 0` returns every unspent output at or above `startHeight` for
+  the requested addresses.
+- A positive `maxEntries` returns at most that many outputs, the oldest first.
+
+Rows are ordered by height across the whole address set, as Zebra's
+`getaddressutxos` orders them for lightwalletd. Within one block, Zinder orders
+rows by transaction id and then output index, where Zebra uses the
+transaction's position in the block. The order differs only when a positive
+`maxEntries` cuts a block's outputs in two.
+
+One response returns at most `LightwalletdResponseLimits::max_address_utxos`
+outputs, 100,000 by default, the same cap Zebra puts on `getaddressutxos`
+(Zebra 7.0.0, `zebra-rpc/src/methods.rs:4142`). A request that would return
+more fails with `RESOURCE_EXHAUSTED`. Zinder never drops rows silently, because
+librustzcash, the Android SDK, Brave, and Zingo add these rows up as the
+address balance. `GetAddressUtxosStream` has the same bound.
+
+The protocol has no lossless way to page past the bound. A positive
+`maxEntries` at or below the bound returns the oldest outputs, and a client can
+continue from the next height only when that page ends at a block boundary. If
+the page ends inside a block, repeating that block's height returns the same
+first outputs again, and starting at the next height skips the rest of that
+block. A single block that holds more outputs for the requested addresses than
+the bound cannot be served.
+
+lightwalletd on Zebra handles the same overflow differently. Zebra rejects the
+query, and lightwalletd maps the unrecognized error to status `OK`, so the
+client receives an empty UTXO list (`frontend/service.go:931-939`). Zinder
+reports the failure instead of that empty success.
+
+## Transparent address history
+
+`GetTaddressTxids` and `GetTaddressTransactions` resolve `range` the way
+lightwalletd resolves it on Zebra, so a request that works there works here:
+
+- `range` and `range.start` are required; a missing one is
+  `INVALID_ARGUMENT`.
+- An absent `range.end`, or an end of 0, means the visible tip. lightwalletd
+  defaults both to the chain tip (lightwalletd `e7436d2`,
+  `frontend/service.go:128-137`).
+- Both bounds are clamped to the visible tip, as Zebra's `getaddresstxids`
+  clamps them (Zebra 7.0.0, `zebra-rpc/src/methods.rs:5163-5187`). An end
+  above the tip reads to the tip, and a start above the tip reads the tip
+  block. A start of 0 reads from genesis.
+- An explicit end below the start is `INVALID_ARGUMENT`.
+
+One case differs on purpose. lightwalletd rejects a span wider than
+10,000,000 blocks with `INVALID_ARGUMENT` (`frontend/service.go:98` and
+`:138-142`), which protects zcashd from an unbounded index scan. Zinder clamps
+the end to the visible tip before reading, so the read is already bounded, and
+it serves such a request to the tip. WebZjs birthday detection sends
+`end = u64::MAX` (WebZjs `a50df94`,
+`crates/webzjs-wallet/src/bindgen/wallet.rs:638-641`), and the Swift and
+Android SDK Tor paths send no end at all (zcash-swift-wallet-sdk `ebd0add`,
+`rust/src/tor.rs:274`; zcash-android-wallet-sdk `a95780a`,
+`backend-lib/src/main/rust/tor.rs:246`).
 
 ## Certification work
 

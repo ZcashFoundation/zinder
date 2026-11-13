@@ -30,7 +30,7 @@ use zinder_runtime::{
     connect_zinder_grpc,
 };
 /// Bound applied to native wallet unary ingest-control calls and stream establishment.
-pub(crate) const WALLET_INGEST_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+pub const WALLET_INGEST_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUIRED_CAPABILITIES: [&str; 5] = [
     INGEST_CONTROL_SERVER_INFO_V1,
     INGEST_CONTROL_WRITER_STATUS_V1,
@@ -152,7 +152,13 @@ impl AdmittedIngestControl {
     }
 }
 
-pub(crate) fn wallet_ingest_control_request<T>(message: T) -> Request<T> {
+/// Wraps `message` in a request bounded by the wallet ingest-control timeout.
+///
+/// The bound rides as the `grpc-timeout` header, which both the tonic client
+/// channel and the writer enforce, so a stalled writer cannot hold a wallet
+/// read open indefinitely.
+#[must_use]
+pub fn wallet_ingest_control_request<T>(message: T) -> Request<T> {
     let mut request = Request::new(message);
     request.set_timeout(WALLET_INGEST_CONTROL_REQUEST_TIMEOUT);
     request
