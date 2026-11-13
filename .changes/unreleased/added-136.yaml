@@ -1,6 +1,0 @@
-kind: added
-body: Ingest now decodes blocks after NU7 activates (branch ID 0x77190ad9). Zinder 0.9.0 and earlier stop at the first NU7 block, so upgrade Zinder before the node serves NU7 blocks.
-time: 2026-11-12T14:13:27.518140182Z
-custom:
-    Bump: minor
-    PR: "136"

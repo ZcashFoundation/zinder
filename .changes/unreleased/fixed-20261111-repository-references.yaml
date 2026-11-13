@@ -1,6 +1,0 @@
-kind: fixed
-body: 'The release verification commands in the deployment and release runbooks now name the `ZcashFoundation/zinder` repository. Releases from v0.8.0 onward are signed by `https://github.com/ZcashFoundation/zinder/.github/workflows/release.yml` and publish images under `ghcr.io/zcashfoundation/`, so the previously documented `gustavovalverde` identity and image path rejected genuine releases.'
-time: 2026-11-11T19:30:18Z
-custom:
-  Bump: patch
-  PR: "126"

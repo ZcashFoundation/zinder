@@ -1,6 +1,0 @@
-kind: fixed
-body: RemoteChainIndex::mempool_events now fails the stream with MalformedResponse, before yielding the event, when a mempool event repeats or decreases event_sequence, reuses a cursor, or carries an empty cursor. Cursor retention is bounded to 65,536 cursors and 8 MiB per stream, matching chain events.
-time: 2026-11-12T20:13:54.998138761Z
-custom:
-    Bump: patch
-    PR: "141"

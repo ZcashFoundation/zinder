@@ -1,6 +1,0 @@
-kind: added
-body: 'Broadcast results now distinguish transactions rejected for an unsupported transaction version (`UnsupportedTransactionVersion`, wire value 6) from transactions that exceed the per-block action limit (`ExceedsBlockActionLimit`, wire value 7), where both previously appeared as `Unknown`. `zinder-client` now decodes unspecified and unrecognized rejection reasons as `Unknown` instead of failing with `MalformedResponse`. Earlier `zinder-client` releases reject the new values, so release the client and update consumer pins before or together with the server.'
-time: 2026-11-12T12:00:00Z
-custom:
-  Bump: minor
-  PR: "134"

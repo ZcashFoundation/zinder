@@ -1,6 +1,0 @@
-kind: changed
-body: Raw transaction bytes with trailing data now fail with RawTransactionParseFailed instead of being accepted for v1 to v4 transactions. Cipherscan avgBlockTimeSecs, the mining blockTime fallback, and the network-activity fallback interval now follow the target spacing at the block height (25 s from NU7) instead of a fixed 75 s.
-time: 2026-11-12T14:13:27.51987586Z
-custom:
-    Bump: minor
-    PR: "136"
