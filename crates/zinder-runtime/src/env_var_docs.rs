@@ -172,9 +172,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ),
         sensitive: false,
         description: "Path to the PEM private key for the indexer client certificate. The path is \
-                      shown in `--print-config`; the key is read only when a channel is built. \
-                      The `*_PEM` variables that the single-volume image entrypoints convert \
-                      into these files are refused by the binaries.",
+                      shown in `--print-config`; the key is read at startup and whenever an \
+                      indexer stream reconnects. The `*_PEM` variables that the single-volume \
+                      image entrypoints convert into these files are refused by the binaries.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__INDEXER_TLS__SERVER_NAME",

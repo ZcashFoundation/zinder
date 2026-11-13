@@ -636,9 +636,11 @@ fn resolve_node_indexer_tls(
 }
 
 /// Returns whether `url` names the `https` scheme, which selects TLS for the
-/// indexer channel. The transport applies the same lowercase match.
+/// indexer channel. Schemes are case-insensitive, as in the transport's URI
+/// parser.
 fn uses_tls_scheme(url: &str) -> bool {
-    url.starts_with("https://")
+    url.get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
 }
 
 fn resolve_node_auth(section: NodeAuthSection) -> Result<NodeAuth, NodeConfigError> {
@@ -903,6 +905,17 @@ mod tests {
                     .with_server_name("zakura.internal")
             )
         );
+        Ok(())
+    }
+
+    #[test]
+    fn indexer_tls_scheme_match_ignores_case() -> Result<(), NodeConfigError> {
+        let target = NodeTarget::resolve(
+            Network::ZcashRegtest,
+            indexer_tls_section(Some("HTTPS://zakura:8230"), mutual_tls_section()),
+        )?;
+
+        assert!(target.indexer_tls.is_some());
         Ok(())
     }
 

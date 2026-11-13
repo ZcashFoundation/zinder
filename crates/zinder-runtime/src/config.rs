@@ -43,12 +43,26 @@ use crate::sections::{
 const ENV_PREFIX: &str = "ZINDER_";
 const TEST_ENV_PREFIXES: &[&str] = &["ZINDER_TEST_"];
 
-/// Name parts of the entrypoint-only indexer TLS variables that carry PEM text.
+/// Entrypoint-only indexer TLS variables that carry PEM text, each paired with
+/// the file-path variable a binary accepts instead.
 ///
 /// Only the single-volume image entrypoints accept them; they turn the value
-/// into a file and pass the binary the matching `_PATH` variable instead.
-const ENTRYPOINT_PEM_ENV_PREFIX: &str = "ZINDER_NODE__INDEXER_TLS__";
-const ENTRYPOINT_PEM_ENV_SUFFIX: &str = "_PEM";
+/// into a file and pass the binary the matching `_PATH` variable instead. The
+/// list mirrors `indexer_tls_pem_variables` in `deploy/materialize-indexer-tls`.
+const ENTRYPOINT_PEM_ENV_VARS: &[(&str, &str)] = &[
+    (
+        "ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM",
+        "ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH",
+    ),
+    (
+        "ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM",
+        "ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH",
+    ),
+    (
+        "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM",
+        "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH",
+    ),
+];
 
 /// Error returned while resolving Zinder service configuration from defaults,
 /// file, environment, and CLI overrides.
@@ -281,10 +295,10 @@ where
 /// Returns the `_PATH` variable that replaces `variable` when `variable` is an
 /// entrypoint-only indexer TLS PEM variable.
 fn entrypoint_pem_path_name(variable: &str) -> Option<String> {
-    let material = variable
-        .strip_prefix(ENTRYPOINT_PEM_ENV_PREFIX)?
-        .strip_suffix(ENTRYPOINT_PEM_ENV_SUFFIX)?;
-    Some(format!("{ENTRYPOINT_PEM_ENV_PREFIX}{material}_PATH"))
+    ENTRYPOINT_PEM_ENV_VARS
+        .iter()
+        .find(|(pem_name, _)| *pem_name == variable)
+        .map(|(_, path_name)| (*path_name).to_owned())
 }
 
 /// Mirrors how `config-rs` transforms an env-var key (post-`ZINDER_`
@@ -859,6 +873,22 @@ mod tests {
             assert!(message.contains(&expected_path_name));
             assert!(!message.contains("secret-material"));
         }
+    }
+
+    #[test]
+    fn unrecognized_indexer_tls_pem_name_is_left_to_the_unknown_key_check()
+    -> Result<(), ConfigError> {
+        let env_source = zinder_environment_source_from_map([(
+            "ZINDER_NODE__INDEXER_TLS__CLIENT_PEM".to_owned(),
+            "-----BEGIN CERTIFICATE-----\n".to_owned(),
+        )])?;
+
+        assert!(
+            env_source
+                .reverse_index
+                .contains_key("node.indexer_tls.client_pem")
+        );
+        Ok(())
     }
 
     #[test]
