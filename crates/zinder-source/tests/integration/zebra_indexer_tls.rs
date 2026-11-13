@@ -271,6 +271,45 @@ async fn mutual_tls_identity_streams_chain_tip_notifications() -> Result<()> {
     Ok(())
 }
 
+async fn first_tip_from(source: &ZebraIndexerChainTipSource) -> Result<u32> {
+    let mut notifications = tokio::time::timeout(SUBSCRIBE_DEADLINE, source.subscribe()).await??;
+    let notification = tokio::time::timeout(SUBSCRIBE_DEADLINE, notifications.next())
+        .await?
+        .ok_or_else(|| eyre!("chain-tip stream ended before its first notification"))??;
+    Ok(notification.tip_id.height.value())
+}
+
+#[tokio::test]
+async fn each_subscription_reads_the_client_identity_files_again() -> Result<()> {
+    let pki = TestPki::generate()?;
+    let indexer = start_mutual_tls_indexer(&pki).await?;
+    let source = ZebraIndexerChainTipSource::new(
+        ZebraIndexerSourceTarget::new(indexer.endpoint_url.clone())
+            .with_tls(pki.trusted_identity()),
+    );
+    let trusted_cert = fs::read_to_string(pki.path("client.pem"))?;
+    let trusted_key = fs::read_to_string(pki.path("client.key"))?;
+
+    assert_eq!(first_tip_from(&source).await?, TIP_HEIGHT);
+
+    // Rotating an untrusted identity into the same paths must reach the next
+    // subscription; a source that cached the first identity would still pass.
+    fs::copy(pki.path("untrusted-client.pem"), pki.path("client.pem"))?;
+    fs::copy(pki.path("untrusted-client.key"), pki.path("client.key"))?;
+    let refused = first_tip_from(&source).await;
+    assert!(
+        refused.is_err(),
+        "the rotated untrusted identity was not used: {refused:?}"
+    );
+    assert_eq!(indexer.served_calls.load(Ordering::Relaxed), 1);
+
+    write_file(&pki.path("client.pem"), &trusted_cert)?;
+    write_file(&pki.path("client.key"), &trusted_key)?;
+    assert_eq!(first_tip_from(&source).await?, TIP_HEIGHT);
+    assert_eq!(indexer.served_calls.load(Ordering::Relaxed), 2);
+    Ok(())
+}
+
 #[tokio::test]
 async fn indexer_refuses_client_without_identity() -> Result<()> {
     let pki = TestPki::generate()?;
