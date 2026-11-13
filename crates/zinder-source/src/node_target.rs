@@ -15,6 +15,10 @@
 //! | `ZINDER_NETWORK` | resolved separately (each binary owns its `[network]`) |
 //! | `ZINDER_NODE__JSON_RPC_ADDR` | [`NodeTarget::json_rpc_addr`] |
 //! | `ZINDER_NODE__INDEXER_GRPC_ADDR` | [`NodeTarget::indexer_grpc_addr`] |
+//! | `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH` | [`NodeIndexerTls::ca_cert_path`] |
+//! | `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH` | [`NodeIndexerClientIdentity::cert_path`] |
+//! | `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH` | [`NodeIndexerClientIdentity::key_path`] |
+//! | `ZINDER_NODE__INDEXER_TLS__SERVER_NAME` | [`NodeIndexerTls::server_name`] |
 //! | `ZINDER_NODE__AUTH__METHOD` | `none` / `basic` / `cookie` |
 //! | `ZINDER_NODE__AUTH__USERNAME` | Basic-auth username |
 //! | `ZINDER_NODE__AUTH__PASSWORD` | Basic-auth password |
@@ -27,6 +31,10 @@
 //! both). Inline credentials let `PaaS`-style deployments inject the secret
 //! directly through the environment without writing a shim that materializes
 //! a cookie file.
+//!
+//! Indexer TLS material is accepted only as file paths. The indexer URL scheme
+//! decides whether the channel uses TLS; see
+//! [ADR-0019](../../../docs/adrs/0019-transport-policy-ownership.md).
 
 use std::{num::NonZeroU64, path::PathBuf, time::Duration};
 
@@ -66,6 +74,11 @@ pub struct NodeTarget {
     /// backend instead of the polling fallback. Zebra exposes this port
     /// when started with `ZEBRA_RPC__INDEXER_LISTEN_ADDR`.
     pub indexer_grpc_addr: Option<String>,
+    /// TLS settings for an `https://` indexer endpoint.
+    ///
+    /// `None` with an `https://` indexer URL verifies the node against the
+    /// system roots and presents no client certificate.
+    pub indexer_tls: Option<NodeIndexerTls>,
     /// Node authentication.
     pub node_auth: NodeAuth,
     /// Per-RPC request timeout.
@@ -156,6 +169,7 @@ impl NodeTarget {
             network,
             json_rpc_addr,
             indexer_grpc_addr: None,
+            indexer_tls: None,
             node_auth,
             request_timeout,
             max_response_bytes,
@@ -176,6 +190,14 @@ impl NodeTarget {
     #[must_use]
     pub fn with_indexer_grpc_addr(mut self, indexer_grpc_addr: Option<String>) -> Self {
         self.indexer_grpc_addr = indexer_grpc_addr;
+        self
+    }
+
+    /// Returns a new [`NodeTarget`] with [`NodeTarget::indexer_tls`] replaced
+    /// by `indexer_tls`.
+    #[must_use]
+    pub fn with_indexer_tls(mut self, indexer_tls: Option<NodeIndexerTls>) -> Self {
+        self.indexer_tls = indexer_tls;
         self
     }
 
@@ -227,6 +249,9 @@ impl NodeTarget {
         let broadcast_timeout = section.broadcast_timeout_secs.map(Duration::from_secs);
         let node_auth = resolve_node_auth(section.auth)?;
         let health = resolve_node_health(section.health)?;
+        let indexer_grpc_addr = nonempty_optional(section.indexer_grpc_addr);
+        let indexer_tls =
+            resolve_node_indexer_tls(indexer_grpc_addr.as_deref(), section.indexer_tls)?;
 
         Ok(Self::new(
             network,
@@ -235,7 +260,8 @@ impl NodeTarget {
             request_timeout,
             max_response_bytes,
         )
-        .with_indexer_grpc_addr(nonempty_optional(section.indexer_grpc_addr))
+        .with_indexer_grpc_addr(indexer_grpc_addr)
+        .with_indexer_tls(indexer_tls)
         .with_broadcast_timeout(broadcast_timeout)
         .with_health(health))
     }
@@ -257,6 +283,15 @@ impl NodeTarget {
         let section = NodeSection {
             json_rpc_addr: read_optional("ZINDER_NODE__JSON_RPC_ADDR"),
             indexer_grpc_addr: read_optional("ZINDER_NODE__INDEXER_GRPC_ADDR"),
+            indexer_tls: NodeIndexerTlsSection {
+                ca_cert_path: read_optional("ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH")
+                    .map(PathBuf::from),
+                client_cert_path: read_optional("ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH")
+                    .map(PathBuf::from),
+                client_key_path: read_optional("ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH")
+                    .map(PathBuf::from),
+                server_name: read_optional("ZINDER_NODE__INDEXER_TLS__SERVER_NAME"),
+            },
             request_timeout_secs: read_optional_parsed::<u64>(
                 "ZINDER_NODE__REQUEST_TIMEOUT_SECS",
                 "node.request_timeout_secs",
@@ -313,7 +348,8 @@ pub struct NodeSection {
     /// Zebra indexer gRPC endpoint URL.
     ///
     /// When set, enables the streaming mempool source backend and chain-tip
-    /// wakeups. Omit to fall back to JSON-RPC polling.
+    /// wakeups. Omit to fall back to JSON-RPC polling. An `https://` URL
+    /// negotiates TLS.
     pub indexer_grpc_addr: Option<String>,
     /// Per-RPC request timeout in seconds.
     pub request_timeout_secs: Option<u64>,
@@ -324,10 +360,100 @@ pub struct NodeSection {
     /// Overrides `request_timeout_secs` for broadcast calls only. Omit to
     /// fall back to `request_timeout_secs`.
     pub broadcast_timeout_secs: Option<u64>,
+    /// TLS subsection for an `https://` indexer endpoint.
+    pub indexer_tls: NodeIndexerTlsSection,
     /// Authentication subsection.
     pub auth: NodeAuthSection,
     /// Upstream-readiness probe subsection.
     pub health: NodeHealthSection,
+}
+
+/// Raw `[node.indexer_tls]` config section.
+///
+/// Every field holds a path or a name, never key material. Empty or
+/// whitespace-only fields count as absent, so an environment that sets a
+/// variable to the empty string leaves the field unset.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NodeIndexerTlsSection {
+    /// PEM CA bundle that verifies the indexer's server certificate. Omit to
+    /// use the system roots.
+    pub ca_cert_path: Option<PathBuf>,
+    /// PEM client certificate chain presented to the indexer. Set together
+    /// with [`Self::client_key_path`].
+    pub client_cert_path: Option<PathBuf>,
+    /// PEM private key for [`Self::client_cert_path`].
+    pub client_key_path: Option<PathBuf>,
+    /// Name verified against the indexer's certificate when it differs from
+    /// the URL host.
+    pub server_name: Option<String>,
+}
+
+/// Resolved `[node.indexer_tls]` configuration.
+///
+/// Holds file paths only. The transport reads the files each time it builds
+/// an indexer channel, so key bytes never live in configuration values.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NodeIndexerTls {
+    /// PEM CA bundle that verifies the indexer's server certificate. `None`
+    /// uses the system roots.
+    pub ca_cert_path: Option<PathBuf>,
+    /// Client identity presented to the indexer. `None` presents none.
+    pub client_identity: Option<NodeIndexerClientIdentity>,
+    /// Name verified against the indexer's certificate instead of the URL
+    /// host.
+    pub server_name: Option<String>,
+}
+
+impl NodeIndexerTls {
+    /// Returns settings that verify the indexer against the system roots and
+    /// present no client certificate.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Verifies the indexer's certificate against the PEM CA bundle at `path`
+    /// instead of the system roots.
+    #[must_use]
+    pub fn with_ca_cert_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.ca_cert_path = Some(path.into());
+        self
+    }
+
+    /// Presents the PEM certificate chain at `cert_path`, signed with the PEM
+    /// private key at `key_path`.
+    #[must_use]
+    pub fn with_client_identity(
+        mut self,
+        cert_path: impl Into<PathBuf>,
+        key_path: impl Into<PathBuf>,
+    ) -> Self {
+        self.client_identity = Some(NodeIndexerClientIdentity {
+            cert_path: cert_path.into(),
+            key_path: key_path.into(),
+        });
+        self
+    }
+
+    /// Verifies the indexer's certificate against `server_name` instead of the
+    /// URL host.
+    #[must_use]
+    pub fn with_server_name(mut self, server_name: impl Into<String>) -> Self {
+        self.server_name = Some(server_name.into());
+        self
+    }
+}
+
+/// Client certificate and key paths for indexer mutual TLS.
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeIndexerClientIdentity {
+    /// PEM client certificate chain, leaf first.
+    pub cert_path: PathBuf,
+    /// PEM private key for the leaf certificate.
+    pub key_path: PathBuf,
 }
 
 /// Raw `[node.health]` config section.
@@ -410,6 +536,22 @@ pub enum NodeConfigError {
         method: String,
     },
 
+    /// `[node.indexer_tls]` is set without an indexer endpoint to apply it to.
+    #[error("node.indexer_tls is set but node.indexer_grpc_addr is not")]
+    IndexerTlsWithoutIndexerAddr,
+
+    /// `[node.indexer_tls]` is set for an indexer URL that does not use TLS.
+    #[error(
+        "node.indexer_tls requires an https:// node.indexer_grpc_addr; the configured URL does not negotiate TLS"
+    )]
+    IndexerTlsRequiresHttps,
+
+    /// Only one of the client certificate and client key paths is set.
+    #[error(
+        "node.indexer_tls.client_cert_path and node.indexer_tls.client_key_path must be set together"
+    )]
+    IndexerTlsClientIdentityIncomplete,
+
     /// An environment variable could not be parsed as the expected type.
     #[error("failed to parse environment variable for {field}: {reason}")]
     EnvParseFailed {
@@ -452,6 +594,53 @@ fn resolve_node_health(
         verification_progress_floor,
         estimated_gap_floor_blocks,
     )))
+}
+
+fn resolve_node_indexer_tls(
+    indexer_grpc_addr: Option<&str>,
+    section: NodeIndexerTlsSection,
+) -> Result<Option<NodeIndexerTls>, NodeConfigError> {
+    let ca_cert_path = nonempty_path(section.ca_cert_path);
+    let client_cert_path = nonempty_path(section.client_cert_path);
+    let client_key_path = nonempty_path(section.client_key_path);
+    let server_name = nonempty_optional(section.server_name);
+    if ca_cert_path.is_none()
+        && client_cert_path.is_none()
+        && client_key_path.is_none()
+        && server_name.is_none()
+    {
+        return Ok(None);
+    }
+
+    let indexer_grpc_addr =
+        indexer_grpc_addr.ok_or(NodeConfigError::IndexerTlsWithoutIndexerAddr)?;
+    if !uses_tls_scheme(indexer_grpc_addr) {
+        return Err(NodeConfigError::IndexerTlsRequiresHttps);
+    }
+    let client_identity = match (client_cert_path, client_key_path) {
+        (Some(cert_path), Some(key_path)) => Some(NodeIndexerClientIdentity {
+            cert_path,
+            key_path,
+        }),
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(NodeConfigError::IndexerTlsClientIdentityIncomplete);
+        }
+    };
+
+    Ok(Some(NodeIndexerTls {
+        ca_cert_path,
+        client_identity,
+        server_name,
+    }))
+}
+
+/// Returns whether `url` names the `https` scheme, which selects TLS for the
+/// indexer channel. Schemes are case-insensitive, as in the transport's URI
+/// parser.
+fn uses_tls_scheme(url: &str) -> bool {
+    url.get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
 }
 
 fn resolve_node_auth(section: NodeAuthSection) -> Result<NodeAuth, NodeConfigError> {
@@ -535,6 +724,10 @@ fn nonempty_optional(text: Option<String>) -> Option<String> {
     text.filter(|text| !text.trim().is_empty())
 }
 
+fn nonempty_path(path: Option<PathBuf>) -> Option<PathBuf> {
+    path.filter(|path| !path.as_os_str().to_string_lossy().trim().is_empty())
+}
+
 fn read_optional_parsed<TargetType>(
     env_var: &'static str,
     field: &'static str,
@@ -565,6 +758,7 @@ mod tests {
             request_timeout_secs: Some(15),
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection {
                 method: Some("basic".to_owned()),
                 username: Some("zebra".to_owned()),
@@ -595,6 +789,7 @@ mod tests {
             request_timeout_secs: None,
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection {
                 method: Some("none".to_owned()),
                 username: None,
@@ -618,6 +813,7 @@ mod tests {
             request_timeout_secs: None,
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection {
                 method: Some("none".to_owned()),
                 username: None,
@@ -641,12 +837,155 @@ mod tests {
             request_timeout_secs: None,
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection::default(),
             health: NodeHealthSection::default(),
         };
         let target = NodeTarget::resolve(Network::ZcashRegtest, section)?;
 
         assert!(target.indexer_grpc_addr.is_none());
+        Ok(())
+    }
+
+    fn indexer_tls_section(
+        indexer_grpc_addr: Option<&str>,
+        indexer_tls: NodeIndexerTlsSection,
+    ) -> NodeSection {
+        NodeSection {
+            json_rpc_addr: Some("http://127.0.0.1:8232".to_owned()),
+            indexer_grpc_addr: indexer_grpc_addr.map(str::to_owned),
+            indexer_tls,
+            ..NodeSection::default()
+        }
+    }
+
+    fn mutual_tls_section() -> NodeIndexerTlsSection {
+        NodeIndexerTlsSection {
+            ca_cert_path: Some(PathBuf::from("/run/secrets/indexer-ca.pem")),
+            client_cert_path: Some(PathBuf::from("/run/secrets/indexer-client.pem")),
+            client_key_path: Some(PathBuf::from("/run/secrets/indexer-client.key")),
+            server_name: Some("zakura.internal".to_owned()),
+        }
+    }
+
+    #[test]
+    fn https_indexer_without_tls_section_uses_system_roots() -> Result<(), NodeConfigError> {
+        let target = NodeTarget::resolve(
+            Network::ZcashRegtest,
+            indexer_tls_section(
+                Some("https://zakura:8230"),
+                NodeIndexerTlsSection::default(),
+            ),
+        )?;
+
+        assert_eq!(
+            target.indexer_grpc_addr.as_deref(),
+            Some("https://zakura:8230")
+        );
+        assert!(target.indexer_tls.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn indexer_tls_section_resolves_paths_and_server_name() -> Result<(), NodeConfigError> {
+        let target = NodeTarget::resolve(
+            Network::ZcashRegtest,
+            indexer_tls_section(Some("https://zakura:8230"), mutual_tls_section()),
+        )?;
+
+        assert_eq!(
+            target.indexer_tls,
+            Some(
+                NodeIndexerTls::new()
+                    .with_ca_cert_path("/run/secrets/indexer-ca.pem")
+                    .with_client_identity(
+                        "/run/secrets/indexer-client.pem",
+                        "/run/secrets/indexer-client.key",
+                    )
+                    .with_server_name("zakura.internal")
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn indexer_tls_scheme_match_ignores_case() -> Result<(), NodeConfigError> {
+        let target = NodeTarget::resolve(
+            Network::ZcashRegtest,
+            indexer_tls_section(Some("HTTPS://zakura:8230"), mutual_tls_section()),
+        )?;
+
+        assert!(target.indexer_tls.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn indexer_tls_section_rejects_plaintext_indexer_url() {
+        let outcome = NodeTarget::resolve(
+            Network::ZcashRegtest,
+            indexer_tls_section(Some("http://zakura:8230"), mutual_tls_section()),
+        );
+
+        assert!(matches!(
+            outcome,
+            Err(NodeConfigError::IndexerTlsRequiresHttps)
+        ));
+    }
+
+    #[test]
+    fn indexer_tls_section_requires_indexer_url() {
+        for indexer_grpc_addr in [None, Some(""), Some("  ")] {
+            let outcome = NodeTarget::resolve(
+                Network::ZcashRegtest,
+                indexer_tls_section(indexer_grpc_addr, mutual_tls_section()),
+            );
+
+            assert!(matches!(
+                outcome,
+                Err(NodeConfigError::IndexerTlsWithoutIndexerAddr)
+            ));
+        }
+    }
+
+    #[test]
+    fn indexer_client_certificate_and_key_are_set_together() {
+        let without_key = NodeIndexerTlsSection {
+            client_key_path: None,
+            ..mutual_tls_section()
+        };
+        let without_certificate = NodeIndexerTlsSection {
+            client_cert_path: Some(PathBuf::from(" ")),
+            ..mutual_tls_section()
+        };
+
+        for indexer_tls in [without_key, without_certificate] {
+            let outcome = NodeTarget::resolve(
+                Network::ZcashRegtest,
+                indexer_tls_section(Some("https://zakura:8230"), indexer_tls),
+            );
+
+            assert!(matches!(
+                outcome,
+                Err(NodeConfigError::IndexerTlsClientIdentityIncomplete)
+            ));
+        }
+    }
+
+    #[test]
+    fn blank_indexer_tls_fields_count_as_absent() -> Result<(), NodeConfigError> {
+        let blank = NodeIndexerTlsSection {
+            ca_cert_path: Some(PathBuf::new()),
+            client_cert_path: Some(PathBuf::from("   ")),
+            client_key_path: Some(PathBuf::new()),
+            server_name: Some(String::new()),
+        };
+
+        let target = NodeTarget::resolve(
+            Network::ZcashRegtest,
+            indexer_tls_section(Some("http://127.0.0.1:8230"), blank),
+        )?;
+
+        assert!(target.indexer_tls.is_none());
         Ok(())
     }
 
@@ -671,6 +1010,7 @@ mod tests {
             request_timeout_secs: None,
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection {
                 method: Some("basic".to_owned()),
                 username: Some("zebra".to_owned()),
@@ -699,6 +1039,7 @@ mod tests {
             request_timeout_secs: None,
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection {
                 method: Some("cookie".to_owned()),
                 username: None,
@@ -725,6 +1066,7 @@ mod tests {
             request_timeout_secs: None,
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection {
                 method: Some("cookie".to_owned()),
                 username: None,
@@ -751,6 +1093,7 @@ mod tests {
             request_timeout_secs: None,
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection {
                 method: Some("cookie".to_owned()),
                 username: None,
@@ -778,6 +1121,7 @@ mod tests {
             request_timeout_secs: None,
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection {
                 method: Some("cookie".to_owned()),
                 username: None,
@@ -805,6 +1149,7 @@ mod tests {
             request_timeout_secs: None,
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection {
                 method: Some("oauth".to_owned()),
                 username: None,
@@ -830,6 +1175,7 @@ mod tests {
             request_timeout_secs: None,
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection::default(),
             health: NodeHealthSection::default(),
         };
@@ -846,6 +1192,7 @@ mod tests {
             request_timeout_secs: None,
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection::default(),
             health: NodeHealthSection {
                 addr: Some("http://127.0.0.1:18233/ready".to_owned()),
@@ -883,6 +1230,7 @@ mod tests {
             request_timeout_secs: None,
             max_response_bytes: None,
             broadcast_timeout_secs: None,
+            indexer_tls: NodeIndexerTlsSection::default(),
             auth: NodeAuthSection::default(),
             health: NodeHealthSection {
                 addr: Some("http://127.0.0.1:18233/ready".to_owned()),
@@ -908,6 +1256,7 @@ mod tests {
                 request_timeout_secs: None,
                 max_response_bytes: None,
                 broadcast_timeout_secs: None,
+                indexer_tls: NodeIndexerTlsSection::default(),
                 auth: NodeAuthSection::default(),
                 health: NodeHealthSection {
                     addr: Some("http://127.0.0.1:18233/ready".to_owned()),

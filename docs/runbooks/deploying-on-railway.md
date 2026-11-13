@@ -66,6 +66,19 @@ that Railway healthchecks, and `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30`.
 Railway's default drain window gives the canonical writer no time to flush
 RocksDB on redeploy or stop.
 
+To reach a node indexer over TLS, set `ZINDER_NODE__INDEXER_GRPC_ADDR` to its
+`https://` URL. Railway delivers secrets only as variables, so set the PEM text
+in `ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM`,
+`ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM`, and
+`ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM`, with line breaks intact. The
+entrypoint turns them into files readable only by the `zinder` user and starts
+`zinder-ingest` without the PEM variables. It prefers a tmpfs at `/dev/shm`
+and otherwise uses `/run`, which may be on disk; the deploy log names the
+location. Whether Railway provides that tmpfs has not been verified, so check
+the log on the first deployment.
+[Wallet-serving deployment §Indexer TLS](deploying-wallet-serving.md#indexer-tls)
+lists the errors that stop the container.
+
 `/healthz` proves process liveness. `/readyz` proves only the canonical writer
 and mempool contract. It does not prove wallet projection, wallet-serving admission,
 public TLS, coherent recovery, or client compatibility.

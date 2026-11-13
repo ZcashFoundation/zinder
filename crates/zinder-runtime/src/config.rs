@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use zinder_core::Network;
 use zinder_core::wire::{decode_zinder_native_chain_name, encode_zinder_native_chain_name};
-use zinder_source::{NodeAuth, NodeConfigError, NodeHealthConfig, NodeTarget};
+use zinder_source::{NodeAuth, NodeConfigError, NodeHealthConfig, NodeIndexerTls, NodeTarget};
 
 use crate::auth::{BearerToken, BearerTokenError};
 use crate::env_diagnostics::{RejectedEnvVar, translate_env_error};
@@ -42,6 +42,27 @@ use crate::sections::{
 
 const ENV_PREFIX: &str = "ZINDER_";
 const TEST_ENV_PREFIXES: &[&str] = &["ZINDER_TEST_"];
+
+/// Entrypoint-only indexer TLS variables that carry PEM text, each paired with
+/// the file-path variable a binary accepts instead.
+///
+/// Only the single-volume image entrypoints accept them; they turn the value
+/// into a file and pass the binary the matching `_PATH` variable instead. The
+/// list mirrors `indexer_tls_pem_variables` in `deploy/materialize-indexer-tls`.
+const ENTRYPOINT_PEM_ENV_VARS: &[(&str, &str)] = &[
+    (
+        "ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM",
+        "ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH",
+    ),
+    (
+        "ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM",
+        "ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH",
+    ),
+    (
+        "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM",
+        "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH",
+    ),
+];
 
 /// Error returned while resolving Zinder service configuration from defaults,
 /// file, environment, and CLI overrides.
@@ -106,6 +127,22 @@ pub enum ConfigError {
         /// Suggested corrected env var name. `None` when the heuristic
         /// cannot confidently propose an alternative.
         suggested_name: Option<String>,
+    },
+
+    /// The operator passed PEM text through an environment variable that
+    /// only the single-volume image entrypoints accept. Zinder binaries read
+    /// TLS material from files only.
+    #[error(
+        "environment variable `{original_name}` carries PEM text, which Zinder binaries do not \
+         read from the environment. Only the zinder-canonical-runtime and zinder-wallet-serving \
+         image entrypoints accept it, by writing the value to a file. Elsewhere, mount the PEM \
+         file and set `{path_name}` to its path."
+    )]
+    EntrypointOnlyEnvVar {
+        /// Original `ZINDER_…` name as set by the operator.
+        original_name: String,
+        /// The file-path variable the binary accepts instead.
+        path_name: String,
     },
 }
 
@@ -172,6 +209,11 @@ impl From<NodeConfigError> for ConfigError {
             NodeConfigError::EnvParseFailed { field, reason } => Self::invalid(format!(
                 "failed to parse environment variable for {field}: {reason}"
             )),
+            NodeConfigError::IndexerTlsWithoutIndexerAddr
+            | NodeConfigError::IndexerTlsRequiresHttps
+            | NodeConfigError::IndexerTlsClientIdentityIncomplete => {
+                Self::invalid(error.to_string())
+            }
             other => Self::invalid(other.to_string()),
         }
     }
@@ -228,6 +270,12 @@ where
         let Some(env_key) = variable.strip_prefix(ENV_PREFIX) else {
             continue;
         };
+        if let Some(path_name) = entrypoint_pem_path_name(&variable) {
+            return Err(ConfigError::EntrypointOnlyEnvVar {
+                original_name: variable,
+                path_name,
+            });
+        }
 
         reverse_index.insert(env_key_to_config_key(env_key), variable.clone());
         filtered_env.insert(env_key.to_owned(), env_value);
@@ -242,6 +290,15 @@ where
         source,
         reverse_index,
     })
+}
+
+/// Returns the `_PATH` variable that replaces `variable` when `variable` is an
+/// entrypoint-only indexer TLS PEM variable.
+fn entrypoint_pem_path_name(variable: &str) -> Option<String> {
+    ENTRYPOINT_PEM_ENV_VARS
+        .iter()
+        .find(|(pem_name, _)| *pem_name == variable)
+        .map(|(_, path_name)| (*path_name).to_owned())
 }
 
 /// Mirrors how `config-rs` transforms an env-var key (post-`ZINDER_`
@@ -594,6 +651,48 @@ impl NodeHealthToml {
     }
 }
 
+/// TOML projection of `[node.indexer_tls]` for `--print-config`.
+///
+/// Shows paths and the server name. The files' contents are never loaded into
+/// configuration.
+#[derive(Debug, Serialize)]
+pub struct NodeIndexerTlsToml {
+    /// PEM CA bundle path, when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ca_cert_path: Option<String>,
+    /// PEM client certificate chain path, when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_cert_path: Option<String>,
+    /// PEM client private key path, when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_key_path: Option<String>,
+    /// Name verified against the indexer certificate, when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+}
+
+impl NodeIndexerTlsToml {
+    /// Builds a [`NodeIndexerTlsToml`] from resolved [`NodeIndexerTls`].
+    #[must_use]
+    pub fn from_node_indexer_tls(tls: &NodeIndexerTls) -> Self {
+        Self {
+            ca_cert_path: tls
+                .ca_cert_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            client_cert_path: tls
+                .client_identity
+                .as_ref()
+                .map(|identity| identity.cert_path.display().to_string()),
+            client_key_path: tls
+                .client_identity
+                .as_ref()
+                .map(|identity| identity.key_path.display().to_string()),
+            server_name: tls.server_name.clone(),
+        }
+    }
+}
+
 /// Redacted TOML projection of `[node]` for `--print-config`.
 #[derive(Debug, Serialize)]
 pub struct NodeToml {
@@ -612,6 +711,9 @@ pub struct NodeToml {
     /// Optional upstream-health probe subsection.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub health: Option<NodeHealthToml>,
+    /// Optional indexer TLS subsection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexer_tls: Option<NodeIndexerTlsToml>,
     /// Auth subsection.
     pub auth: NodeAuthToml,
 }
@@ -630,6 +732,10 @@ impl NodeToml {
                 .health
                 .as_ref()
                 .map(NodeHealthToml::from_node_health_config),
+            indexer_tls: target
+                .indexer_tls
+                .as_ref()
+                .map(NodeIndexerTlsToml::from_node_indexer_tls),
             auth: NodeAuthToml::from_node_auth(&target.node_auth),
         }
     }
@@ -698,6 +804,106 @@ mod tests {
                 "[auth]\n",
                 "method = \"none\"\n",
             )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn indexer_tls_paths_survive_node_toml_serialization() -> Result<(), toml::ser::Error> {
+        let target = NodeTarget::new(
+            Network::ZcashRegtest,
+            "http://127.0.0.1:18232".to_owned(),
+            NodeAuth::None,
+            Duration::from_secs(30),
+            std::num::NonZeroU64::MIN,
+        )
+        .with_indexer_grpc_addr(Some("https://zakura:8230".to_owned()))
+        .with_indexer_tls(Some(
+            NodeIndexerTls::new()
+                .with_ca_cert_path("/run/secrets/indexer-ca.pem")
+                .with_client_identity(
+                    "/run/secrets/indexer-client.pem",
+                    "/run/secrets/indexer-client.key",
+                )
+                .with_server_name("zakura.internal"),
+        ));
+
+        let rendered = toml::to_string(&NodeToml::from_node_target(&target))?;
+
+        assert_eq!(
+            rendered,
+            concat!(
+                "json_rpc_addr = \"http://127.0.0.1:18232\"\n",
+                "indexer_grpc_addr = \"https://zakura:8230\"\n",
+                "request_timeout_secs = 30\n",
+                "max_response_bytes = 1\n",
+                "\n",
+                "[indexer_tls]\n",
+                "ca_cert_path = \"/run/secrets/indexer-ca.pem\"\n",
+                "client_cert_path = \"/run/secrets/indexer-client.pem\"\n",
+                "client_key_path = \"/run/secrets/indexer-client.key\"\n",
+                "server_name = \"zakura.internal\"\n",
+                "\n",
+                "[auth]\n",
+                "method = \"none\"\n",
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn indexer_tls_pem_variables_name_the_accepting_images_and_path_variable() {
+        for material in ["CA_CERT", "CLIENT_CERT", "CLIENT_KEY"] {
+            let pem_value = "-----BEGIN PRIVATE KEY-----\nsecret-material\n";
+            let outcome = zinder_environment_source_from_map([(
+                format!("ZINDER_NODE__INDEXER_TLS__{material}_PEM"),
+                pem_value.to_owned(),
+            )]);
+
+            let expected_path_name = format!("ZINDER_NODE__INDEXER_TLS__{material}_PATH");
+            let error = outcome.err();
+            assert!(matches!(
+                &error,
+                Some(ConfigError::EntrypointOnlyEnvVar { path_name, .. })
+                    if *path_name == expected_path_name
+            ));
+            let message = error.map(|error| error.to_string()).unwrap_or_default();
+            assert!(message.contains("zinder-canonical-runtime"));
+            assert!(message.contains("zinder-wallet-serving"));
+            assert!(message.contains(&expected_path_name));
+            assert!(!message.contains("secret-material"));
+        }
+    }
+
+    #[test]
+    fn unrecognized_indexer_tls_pem_name_is_left_to_the_unknown_key_check()
+    -> Result<(), ConfigError> {
+        let env_source = zinder_environment_source_from_map([(
+            "ZINDER_NODE__INDEXER_TLS__CLIENT_PEM".to_owned(),
+            "-----BEGIN CERTIFICATE-----\n".to_owned(),
+        )])?;
+
+        assert!(
+            env_source
+                .reverse_index
+                .contains_key("node.indexer_tls.client_pem")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn indexer_tls_path_variables_reach_the_loader() -> Result<(), ConfigError> {
+        let env_source = zinder_environment_source_from_map([(
+            "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH".to_owned(),
+            "/run/secrets/indexer-client.key".to_owned(),
+        )])?;
+
+        assert_eq!(
+            env_source
+                .reverse_index
+                .get("node.indexer_tls.client_key_path")
+                .map(String::as_str),
+            Some("ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH")
         );
         Ok(())
     }

@@ -28,7 +28,7 @@ use zinder_ingest::{
 };
 use zinder_materialized_views::MaterializedViewStore;
 use zinder_runtime::{
-    ComposedReadiness, OpsEndpointHandle, OpsServerError, Readiness, ReadinessInput,
+    ComposedReadiness, ConfigError, OpsEndpointHandle, OpsServerError, Readiness, ReadinessInput,
     ReadinessState, RuntimeService, StartupPhase, cancel_on_terminating_signal,
     host_cpu_meets_compiled_baseline, install_tracing_subscriber, spawn_ops_endpoint_for,
 };
@@ -36,7 +36,7 @@ use zinder_source::{
     JsonRpcMempoolSource, JsonRpcMempoolSourceOptions, MempoolSource, NodeCapabilities,
     NodeCapability, NodeHealthConfig, NodeSource, NodeTarget, ZebraIndexerMempoolSource,
     ZebraIndexerMempoolSourceOptions, ZebraIndexerSourceTarget, ZebraJsonRpcSource,
-    ZebraJsonRpcSourceOptions,
+    ZebraJsonRpcSourceOptions, validate_zebra_indexer_endpoint,
 };
 use zinder_store::{
     CanonicalReorgPolicy, CanonicalStoreWorkload, MempoolEventRetentionConfig,
@@ -273,6 +273,7 @@ async fn run_ingest(
         command_config.runtime_config.node_source,
         &command_config.runtime_config.node,
     )?;
+    validate_indexer_endpoint(&command_config.runtime_config.node)?;
     connect_node_phase.complete();
     let check_schema_phase = StartupPhase::CheckSchema.start();
     ensure_node_capabilities(&source, &writer_readiness).await?;
@@ -1144,7 +1145,7 @@ fn build_live_mempool_source(
     json_rpc: &ZebraJsonRpcSource,
     mempool: MempoolIngestSettings,
 ) -> Arc<dyn MempoolSource> {
-    node_target.indexer_grpc_addr.as_ref().map_or_else(
+    ZebraIndexerSourceTarget::from_node_target(node_target).map_or_else(
         || {
             tracing::info!(
                 target: "zinder::ingest",
@@ -1160,16 +1161,20 @@ fn build_live_mempool_source(
                 },
             )) as Arc<dyn MempoolSource>
         },
-        |indexer_endpoint| {
+        |indexer_target| {
             tracing::info!(
                 target: "zinder::ingest",
                 event = "mempool_source_selected",
                 backend = "zebra-indexer-grpc",
-                indexer_endpoint = %indexer_endpoint,
+                indexer_endpoint = %indexer_target.endpoint_url,
+                client_certificate = indexer_target
+                    .tls
+                    .as_ref()
+                    .is_some_and(|tls| tls.client_identity.is_some()),
                 "selected streaming mempool source"
             );
             Arc::new(ZebraIndexerMempoolSource::with_options(
-                ZebraIndexerSourceTarget::new(indexer_endpoint.clone()),
+                indexer_target,
                 json_rpc.clone(),
                 ZebraIndexerMempoolSourceOptions {
                     admission_limits: mempool.source_admission_limits,
@@ -1178,6 +1183,20 @@ fn build_live_mempool_source(
             )) as Arc<dyn MempoolSource>
         },
     )
+}
+
+/// Fails startup when the configured indexer endpoint or its TLS files are
+/// unusable, so the streaming mempool source does not retry a channel that can
+/// never be built.
+fn validate_indexer_endpoint(node_target: &NodeTarget) -> Result<(), IngestConfigError> {
+    let Some(indexer_target) = ZebraIndexerSourceTarget::from_node_target(node_target) else {
+        return Ok(());
+    };
+    validate_zebra_indexer_endpoint(&indexer_target).map_err(|error| {
+        IngestConfigError::from(ConfigError::invalid(format!(
+            "node.indexer_grpc_addr or node.indexer_tls: {error}"
+        )))
+    })
 }
 
 fn spawn_upstream_health_probe_for(

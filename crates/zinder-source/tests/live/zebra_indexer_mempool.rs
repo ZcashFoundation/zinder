@@ -22,10 +22,10 @@ async fn zebra_indexer_mempool_source_opens_stream_against_running_indexer() -> 
     let Some(env) = require_live()? else {
         return Ok(());
     };
-    let Some(indexer_endpoint_url) = env.target.indexer_grpc_addr.clone() else {
+    let Some(indexer_target) = ZebraIndexerSourceTarget::from_node_target(&env.target) else {
         return Ok(());
     };
-    let mempool_source = build_indexer_mempool_source(&env, indexer_endpoint_url)?;
+    let mempool_source = build_indexer_mempool_source(&env, indexer_target)?;
     assert_eq!(
         mempool_source.capabilities().backend,
         MempoolSourceBackend::Streaming
@@ -61,7 +61,7 @@ async fn zebra_indexer_mempool_source_opens_stream_against_running_indexer() -> 
 
 fn build_indexer_mempool_source(
     env: &LiveTestEnv,
-    indexer_endpoint_url: String,
+    indexer_target: ZebraIndexerSourceTarget,
 ) -> Result<ZebraIndexerMempoolSource> {
     let hydration_json_rpc = ZebraJsonRpcSource::with_options(
         env.target.network,
@@ -74,7 +74,7 @@ fn build_indexer_mempool_source(
         },
     )?;
     Ok(ZebraIndexerMempoolSource::with_options(
-        ZebraIndexerSourceTarget::new(indexer_endpoint_url),
+        indexer_target,
         hydration_json_rpc,
         ZebraIndexerMempoolSourceOptions::default(),
     ))
@@ -97,13 +97,13 @@ async fn streaming_source_recovers_after_zebra_indexer_restart() -> Result<()> {
     let Some(env) = require_live_for(&[Network::ZcashRegtest])? else {
         return Ok(());
     };
-    let Some(indexer_endpoint_url) = env.target.indexer_grpc_addr.clone() else {
+    let Some(indexer_target) = ZebraIndexerSourceTarget::from_node_target(&env.target) else {
         return Ok(());
     };
     let container_name = std::env::var("ZINDER_TEST_INDEXER_CONTAINER_NAME")
         .unwrap_or_else(|_| "z3_regtest_sidecar_zebra".to_owned());
 
-    let mempool_source = build_indexer_mempool_source(&env, indexer_endpoint_url.clone())?;
+    let mempool_source = build_indexer_mempool_source(&env, indexer_target)?;
     let mut event_stream = mempool_source.events().await?;
     assert_stream_alive_for(&mut event_stream, Duration::from_secs(2)).await?;
 

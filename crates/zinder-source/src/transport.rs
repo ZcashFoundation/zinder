@@ -19,6 +19,7 @@
 
 use std::future::Future;
 use std::num::{NonZeroU32, NonZeroU64};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -26,11 +27,12 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use futures_util::future::BoxFuture;
 use jsonrpsee::http_client::{HeaderMap, HttpClient, HttpClientBuilder};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
 use thiserror::Error;
 use tokio::sync::Mutex;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
-use crate::{SourceError, SourceFailureClass, ZebraIndexerSourceTarget};
+use crate::{NodeIndexerTls, SourceError, SourceFailureClass, ZebraIndexerSourceTarget};
 
 /// Consecutive transport-class failures that trigger a
 /// [`ResilientClient`] rebuild.
@@ -78,6 +80,19 @@ pub enum ZebraTransportError {
     /// The HTTP/JSON-RPC client could not be built (header or builder error).
     #[error("Zebra HTTP client build failed: {0}")]
     ClientBuildFailed(String),
+    /// An indexer TLS file could not be read or holds no usable PEM item.
+    #[error("indexer TLS {role} file {} is unusable: {reason}", path.display())]
+    TlsMaterialUnreadable {
+        /// What the file supplies, such as `client key`.
+        role: &'static str,
+        /// Configured file path.
+        path: PathBuf,
+        /// Why the file was rejected. Never contains file contents.
+        reason: String,
+    },
+    /// The indexer TLS settings were rejected before connecting.
+    #[error("indexer TLS configuration rejected: {0}")]
+    TlsConfigRejected(String),
 }
 
 /// Builds a jsonrpsee HTTP client for a Zebra full node's JSON-RPC.
@@ -123,14 +138,51 @@ pub struct ZebraIndexerChannelOptions {
 /// Opens a long-lived gRPC channel to a Zebra Indexer endpoint.
 ///
 /// The returned [`Channel`] carries the HTTP/2 + TCP keep-alive policy
-/// mandated by ADR-0019. Callers wrap it in the generated Indexer
-/// client (`IndexerClient::new(channel)`) and hold the channel through
-/// stream re-subscribes; the `ResilientClient<C>` wrapper rebuilds the
-/// channel after N consecutive transport errors.
+/// mandated by ADR-0019. Callers wrap it in the generated Indexer client
+/// (`IndexerClient::new(channel)`). Streaming sources open a fresh channel on
+/// every subscription; [`ResilientClient`] does not wrap indexer channels.
+///
+/// An `https://` endpoint negotiates TLS. Its PEM files are read on every
+/// call, so a subscription opened after a certificate rotation presents the
+/// rotated files.
 pub async fn connect_zebra_indexer_channel(
     target: &ZebraIndexerSourceTarget,
     options: ZebraIndexerChannelOptions,
 ) -> Result<Channel, ZebraTransportError> {
+    zebra_indexer_endpoint(target, options)?
+        .connect()
+        .await
+        .map_err(|error| ZebraTransportError::ConnectFailed(transport_error_chain(&error)))
+}
+
+/// Checks that an indexer channel to `target` can be built, without
+/// connecting.
+///
+/// Parses the endpoint URL and, for an `https://` endpoint, reads and checks
+/// every configured PEM file the way [`connect_zebra_indexer_channel`] does.
+/// Startup calls this so a missing or empty certificate file fails the
+/// process instead of every later subscription.
+pub fn validate_zebra_indexer_endpoint(
+    target: &ZebraIndexerSourceTarget,
+) -> Result<(), ZebraTransportError> {
+    zebra_indexer_endpoint(
+        target,
+        ZebraIndexerChannelOptions {
+            connect_timeout: ZEBRA_INDEXER_TLS_VALIDATION_TIMEOUT,
+            request_timeout: ZEBRA_INDEXER_TLS_VALIDATION_TIMEOUT,
+        },
+    )
+    .map(drop)
+}
+
+/// Placeholder timeout for [`validate_zebra_indexer_endpoint`], which builds
+/// an endpoint it never connects.
+const ZEBRA_INDEXER_TLS_VALIDATION_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn zebra_indexer_endpoint(
+    target: &ZebraIndexerSourceTarget,
+    options: ZebraIndexerChannelOptions,
+) -> Result<Endpoint, ZebraTransportError> {
     let endpoint = Endpoint::from_shared(target.endpoint_url.clone())
         .map_err(|error| ZebraTransportError::InvalidEndpoint(error.to_string()))?
         .connect_timeout(options.connect_timeout)
@@ -138,10 +190,112 @@ pub async fn connect_zebra_indexer_channel(
         .http2_keep_alive_interval(ZEBRA_INDEXER_HTTP2_KEEPALIVE_INTERVAL)
         .keep_alive_timeout(ZEBRA_INDEXER_HTTP2_KEEPALIVE_TIMEOUT)
         .tcp_keepalive(Some(ZEBRA_INDEXER_TCP_KEEPALIVE));
+    if endpoint.uri().scheme_str() != Some("https") {
+        if target.tls.is_some() {
+            return Err(ZebraTransportError::TlsConfigRejected(
+                "indexer TLS settings require an https:// indexer URL".to_owned(),
+            ));
+        }
+        return Ok(endpoint);
+    }
+    let tls_config = zebra_indexer_tls_config(target.tls.as_ref(), options.connect_timeout)?;
     endpoint
-        .connect()
-        .await
-        .map_err(|error| ZebraTransportError::ConnectFailed(error.to_string()))
+        .tls_config(tls_config)
+        .map_err(|error| ZebraTransportError::TlsConfigRejected(transport_error_chain(&error)))
+}
+
+fn zebra_indexer_tls_config(
+    tls: Option<&NodeIndexerTls>,
+    handshake_timeout: Duration,
+) -> Result<ClientTlsConfig, ZebraTransportError> {
+    let mut config = ClientTlsConfig::new().timeout(handshake_timeout);
+    config = match tls.and_then(|tls| tls.ca_cert_path.as_deref()) {
+        Some(ca_cert_path) => config.ca_certificate(Certificate::from_pem(read_pem_certificates(
+            ca_cert_path,
+            "CA certificate",
+        )?)),
+        None => config.with_native_roots(),
+    };
+    if let Some(identity) = tls.and_then(|tls| tls.client_identity.as_ref()) {
+        let cert_chain = read_pem_certificates(&identity.cert_path, "client certificate")?;
+        let key = read_pem_private_key(&identity.key_path)?;
+        config = config.identity(Identity::from_pem(cert_chain, key));
+    }
+    if let Some(server_name) = tls.and_then(|tls| tls.server_name.as_ref()) {
+        config = config.domain_name(server_name.clone());
+    }
+    Ok(config)
+}
+
+/// Reads a PEM file that must hold at least one certificate.
+///
+/// tonic skips unparsable entries, so a file without certificates would
+/// otherwise yield an empty trust store or chain without an error.
+fn read_pem_certificates(path: &Path, role: &'static str) -> Result<Vec<u8>, ZebraTransportError> {
+    let pem = read_tls_file(path, role)?;
+    let mut certificate_count = 0_usize;
+    for certificate in CertificateDer::pem_slice_iter(&pem) {
+        certificate.map_err(|error| tls_material_unreadable(path, role, error.to_string()))?;
+        certificate_count = certificate_count.saturating_add(1);
+    }
+    if certificate_count == 0 {
+        return Err(tls_material_unreadable(
+            path,
+            role,
+            "contains no PEM certificate",
+        ));
+    }
+    Ok(pem)
+}
+
+fn read_pem_private_key(path: &Path) -> Result<Vec<u8>, ZebraTransportError> {
+    const ROLE: &str = "client key";
+    let pem = read_tls_file(path, ROLE)?;
+    PrivateKeyDer::from_pem_slice(&pem).map_err(|error| {
+        let reason = if matches!(error, rustls_pki_types::pem::Error::NoItemsFound) {
+            "contains no PEM private key".to_owned()
+        } else {
+            error.to_string()
+        };
+        tls_material_unreadable(path, ROLE, reason)
+    })?;
+    Ok(pem)
+}
+
+fn read_tls_file(path: &Path, role: &'static str) -> Result<Vec<u8>, ZebraTransportError> {
+    std::fs::read(path).map_err(|error| tls_material_unreadable(path, role, error.to_string()))
+}
+
+fn tls_material_unreadable(
+    path: &Path,
+    role: &'static str,
+    reason: impl Into<String>,
+) -> ZebraTransportError {
+    ZebraTransportError::TlsMaterialUnreadable {
+        role,
+        path: path.to_path_buf(),
+        reason: reason.into(),
+    }
+}
+
+/// Renders a tonic transport error with its sources, which carry the I/O or
+/// rustls reason, such as an unknown certificate issuer, that tonic's own
+/// message omits.
+///
+/// A source whose message the rendering already ends with is skipped: the I/O
+/// wrapper around a rustls error repeats that error's message.
+fn transport_error_chain(error: &dyn std::error::Error) -> String {
+    let mut rendered = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let message = cause.to_string();
+        if !rendered.ends_with(&message) {
+            rendered.push_str(": ");
+            rendered.push_str(&message);
+        }
+        source = cause.source();
+    }
+    rendered
 }
 
 /// Erased rebuilder closure: takes no arguments and produces a future
@@ -379,6 +533,69 @@ fn record_transport_event(peer: &str, event: TransportEvent, reason: &'static st
         "reason" => reason,
     )
     .increment(1);
+}
+
+#[cfg(test)]
+mod transport_error_chain_tests {
+    use std::fmt;
+
+    use super::transport_error_chain;
+
+    #[derive(Debug)]
+    struct ChainedError {
+        message: &'static str,
+        source: Option<Box<Self>>,
+    }
+
+    impl fmt::Display for ChainedError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(self.message)
+        }
+    }
+
+    impl std::error::Error for ChainedError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source
+                .as_deref()
+                .map(|source| source as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    fn chain(message: &'static str, causes: &[&'static str]) -> ChainedError {
+        let source = causes.iter().rev().fold(None, |source, message| {
+            Some(Box::new(ChainedError { message, source }))
+        });
+        ChainedError { message, source }
+    }
+
+    #[test]
+    fn keeps_every_distinct_cause() {
+        let error = chain(
+            "transport error",
+            &["tcp connect error", "Connection refused"],
+        );
+
+        assert_eq!(
+            transport_error_chain(&error),
+            "transport error: tcp connect error: Connection refused"
+        );
+    }
+
+    #[test]
+    fn skips_a_cause_its_wrapper_already_printed() {
+        let error = chain(
+            "transport error",
+            &[
+                "invalid peer certificate: UnknownIssuer",
+                "invalid peer certificate: UnknownIssuer",
+            ],
+        );
+
+        assert_eq!(
+            transport_error_chain(&error),
+            "transport error: invalid peer certificate: UnknownIssuer"
+        );
+    }
 }
 
 #[cfg(test)]

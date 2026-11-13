@@ -41,9 +41,9 @@ use zinder_proto::external::zebra_indexer_rpc::{
 use crate::{
     ChainTipNotification, MempoolHydrationFailureReason, MempoolSource,
     MempoolSourceAdmissionLimits, MempoolSourceCapabilities, MempoolSourceEntry,
-    MempoolSourceEvent, MempoolSourceEventStream, NodeSource, SourceError,
-    UpstreamTransactionLookup, ZebraIndexerChainTipSource, ZebraIndexerChainTipSourceOptions,
-    ZebraJsonRpcSource, mempool_source::MempoolSourceAdmission,
+    MempoolSourceEvent, MempoolSourceEventStream, NodeIndexerTls, NodeSource, NodeTarget,
+    SourceError, UpstreamTransactionLookup, ZebraIndexerChainTipSource,
+    ZebraIndexerChainTipSourceOptions, ZebraJsonRpcSource, mempool_source::MempoolSourceAdmission,
 };
 
 const ZEBRA_INDEXER_STREAMING_BACKEND_LABEL: &str = "zebra_indexer_streaming";
@@ -65,11 +65,18 @@ fn increment_streaming_hydration_failure(reason: MempoolHydrationFailureReason) 
 }
 
 /// Endpoint for a Zebra indexer-feature gRPC port.
+///
+/// The URL scheme selects the transport: `http://` is plaintext HTTP/2 and
+/// `https://` negotiates TLS, configured by [`Self::tls`].
+#[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ZebraIndexerSourceTarget {
     /// HTTP/2 endpoint URL of the Zebra indexer port (e.g.
     /// `http://127.0.0.1:8154`).
     pub endpoint_url: String,
+    /// TLS settings for an `https://` endpoint. `None` verifies the node
+    /// against the system roots and presents no client certificate.
+    pub tls: Option<NodeIndexerTls>,
 }
 
 impl ZebraIndexerSourceTarget {
@@ -77,7 +84,25 @@ impl ZebraIndexerSourceTarget {
     pub fn new(endpoint_url: impl Into<String>) -> Self {
         Self {
             endpoint_url: endpoint_url.into(),
+            tls: None,
         }
+    }
+
+    /// Returns this target with `tls` applied to its `https://` channel.
+    #[must_use]
+    pub fn with_tls(mut self, tls: NodeIndexerTls) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+
+    /// Returns the indexer target `node` configures, or `None` when it sets no
+    /// indexer endpoint.
+    #[must_use]
+    pub fn from_node_target(node: &NodeTarget) -> Option<Self> {
+        node.indexer_grpc_addr.as_ref().map(|endpoint_url| Self {
+            endpoint_url: endpoint_url.clone(),
+            tls: node.indexer_tls.clone(),
+        })
     }
 }
 

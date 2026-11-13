@@ -488,6 +488,15 @@ endpoints are set:
 
 When you record evidence, count only the tests that exercised the node.
 
+The two indexer tests build their channel from the same `[node]` settings as
+`zinder-ingest`. To run them against an indexer that requires mutual TLS, set
+an `https://` `ZINDER_NODE__INDEXER_GRPC_ADDR` and the
+`ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH`,
+`ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH`, and
+`ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH` file paths. Add
+`ZINDER_NODE__INDEXER_TLS__SERVER_NAME` when the node's certificate does not
+name the URL host.
+
 ### Targeted reruns
 
 ```bash

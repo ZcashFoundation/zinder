@@ -10,8 +10,9 @@
 //! - The shared configuration error type, fluent layered loader, and shared
 //!   schema/redacted-render mirrors ([`ConfigError`], [`ConfigLoader`],
 //!   [`NetworkSection`], [`NetworkToml`], [`NodeAuthToml`], [`NodeHealthToml`],
-//!   [`NodeToml`], [`zinder_environment_source`], [`require_field`],
-//!   [`duration_as_millis_u64`]) that every service binary uses to honor the
+//!   [`NodeIndexerTlsToml`], [`NodeToml`], [`zinder_environment_source`],
+//!   [`require_field`], [`duration_as_millis_u64`]) that every service binary
+//!   uses to honor the
 //!   `defaults -> file -> ZINDER_* env -> CLI overrides` precedence.
 //! - Two thin lifecycle helpers used by every binary entry point:
 //!   [`cancel_on_terminating_signal`] and [`install_tracing_subscriber`].
@@ -56,9 +57,10 @@ pub use canonical_fence_attestation::{
 };
 pub use composed_readiness::{ComposedReadiness, ReadinessInput};
 pub use config::{
-    ConfigError, ConfigLoader, NetworkSection, NetworkToml, NodeAuthToml, NodeHealthToml, NodeToml,
-    ZinderEnvironmentSource, duration_as_millis_u64, load_bearer_token, parse_socket_addr,
-    require_field, zinder_environment_source, zinder_environment_source_from_map,
+    ConfigError, ConfigLoader, NetworkSection, NetworkToml, NodeAuthToml, NodeHealthToml,
+    NodeIndexerTlsToml, NodeToml, ZinderEnvironmentSource, duration_as_millis_u64,
+    load_bearer_token, parse_socket_addr, require_field, zinder_environment_source,
+    zinder_environment_source_from_map,
 };
 pub use env_var_docs::{
     ENVIRONMENT_VARIABLES, EnvVarDoc, Requirement as EnvVarRequirement,

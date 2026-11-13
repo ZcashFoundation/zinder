@@ -2,6 +2,22 @@
 
 set -eu
 
+# Indexer TLS values delivered as *_PEM variables become root-prepared files
+# readable only by zinder. This shell then replaces itself without the *_PEM
+# variables, so neither the supervising shell's initial environment nor any
+# runtime process it starts carries them. The second pass finds no *_PEM
+# variable and continues.
+# shellcheck source=deploy/materialize-indexer-tls
+. /usr/local/lib/zinder/materialize-indexer-tls
+materialize_indexer_tls
+if [ "$indexer_tls_pem_present" -eq 1 ]; then
+  exec env \
+    -u ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM \
+    -u ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM \
+    -u ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM \
+    "$0" "$@"
+fi
+
 # RocksDB opens the canonical primary, the in-process canonical secondary, the
 # materialized-view store, and both reader secondaries from one process table.
 nofile_limit=65536

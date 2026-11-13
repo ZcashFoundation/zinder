@@ -140,7 +140,50 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Optional Zebra indexer gRPC endpoint enabling the streaming mempool source. \
-                      Falls back to JSON-RPC mempool polling when unset or empty.",
+                      Falls back to JSON-RPC mempool polling when unset or empty. An `https://` \
+                      URL negotiates TLS, configured by the `ZINDER_NODE__INDEXER_TLS__*` \
+                      variables; without them the node is verified against the system roots.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH",
+        toml_path: "node.indexer_tls.ca_cert_path",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "PEM CA bundle that verifies the indexer's server certificate instead of the \
+                      system roots. Requires an `https://` `ZINDER_NODE__INDEXER_GRPC_ADDR`. Read \
+                      at startup and whenever an indexer stream reconnects.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH",
+        toml_path: "node.indexer_tls.client_cert_path",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::ConditionalOn("ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH is set"),
+        sensitive: false,
+        description: "PEM client certificate chain presented to an indexer that requires mutual \
+                      TLS. Set together with `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH`.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH",
+        toml_path: "node.indexer_tls.client_key_path",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::ConditionalOn(
+            "ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH is set",
+        ),
+        sensitive: false,
+        description: "Path to the PEM private key for the indexer client certificate. The path is \
+                      shown in `--print-config`; the key is read at startup and whenever an \
+                      indexer stream reconnects. The `*_PEM` variables that the single-volume \
+                      image entrypoints convert into these files are refused by the binaries.",
+    },
+    EnvVarDoc {
+        name: "ZINDER_NODE__INDEXER_TLS__SERVER_NAME",
+        toml_path: "node.indexer_tls.server_name",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Name verified against the indexer's certificate when it differs from the \
+                      host in `ZINDER_NODE__INDEXER_GRPC_ADDR`.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__AUTH__METHOD",

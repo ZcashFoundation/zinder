@@ -175,6 +175,11 @@ token, both sides have to agree on it."
 These are out of scope for the accepted design. Adding one requires a
 separate decision that names the deployment shape it serves.
 
+These exclusions cover the IngestControl plane only. The upstream node's
+indexer channel follows
+[ADR-0019](0019-transport-policy-ownership.md#indexer-channel-tls), because the
+node operator sets that server's TLS policy.
+
 ## Consequences
 
 ### Operational
