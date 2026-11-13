@@ -1,27 +1,24 @@
 //! Live in-memory mempool index owned by `zinder-ingest`.
 //!
-//! Stores hydrated [`MempoolEntry`] records and the secondary indexes
-//! needed by the wallet data plane: transparent outputs by address and
-//! transparent spends by outpoint. Mempool state is non-canonical and is
-//! never written by a canonical block commit; the ingest layer holds it
-//! exclusively and exposes read methods to the colocated `IngestControl`
-//! gRPC handlers.
+//! Stores hydrated [`MempoolEntry`] records plus the live transparent
+//! outpoints they create and spend. Those outpoint sets reject a source
+//! event that would let two live entries create the same output or spend the
+//! same outpoint. Mempool state is non-canonical and is never written by a
+//! canonical block commit; the ingest layer holds it exclusively and exposes
+//! read methods to the colocated `IngestControl` gRPC handlers.
 //!
-//! The index is concurrency-safe; readers (snapshot, address-lookup,
-//! presence checks) take a read lock, writers ([`MempoolIndex::apply_added`],
+//! The index is concurrency-safe; readers (snapshot, entry, and presence
+//! checks) take a read lock, writers ([`MempoolIndex::apply_added`],
 //! [`MempoolIndex::apply_invalidated`], [`MempoolIndex::apply_mined`]) take
 //! a write lock.
 
-use std::collections::{BTreeMap, HashMap, HashSet, btree_map::Entry};
+use std::collections::{BTreeMap, HashSet, btree_map::Entry};
 use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 use thiserror::Error;
-use zinder_core::{
-    MempoolEntry, TransactionId, TransparentAddressScriptHash, TransparentMempoolOutput,
-    TransparentMempoolSpend, TransparentOutPoint, TransparentOutput, TransparentOutputEntry,
-};
+use zinder_core::{MempoolEntry, TransactionId, TransparentOutPoint};
 use zinder_store::{MempoolEvent, MempoolEventPosition};
 
 /// Outcome of applying a single source-observed event to the index.
@@ -101,12 +98,8 @@ pub struct MempoolIndex {
 #[derive(Debug, Default)]
 struct MempoolIndexState {
     entries: BTreeMap<TransactionId, Arc<MempoolEntry>>,
-    outputs_by_address: HashMap<
-        TransparentAddressScriptHash,
-        HashMap<TransparentOutPoint, TransparentMempoolOutput>,
-    >,
-    output_by_outpoint: HashMap<TransparentOutPoint, TransparentMempoolOutput>,
-    spend_by_outpoint: HashMap<TransparentOutPoint, TransactionId>,
+    live_output_outpoints: HashSet<TransparentOutPoint>,
+    live_spent_outpoints: HashSet<TransparentOutPoint>,
     last_applied_event: Option<MempoolEventPosition>,
 }
 
@@ -139,7 +132,7 @@ impl MempoolIndex {
                             outpoint: output.outpoint,
                         });
                     }
-                    if state.output_by_outpoint.contains_key(&output.outpoint) {
+                    if state.live_output_outpoints.contains(&output.outpoint) {
                         return Err(MempoolIndexInvariantError::OutputCollision {
                             outpoint: output.outpoint,
                         });
@@ -152,7 +145,7 @@ impl MempoolIndex {
                             outpoint: spend.spent_outpoint,
                         });
                     }
-                    if state.spend_by_outpoint.contains_key(&spend.spent_outpoint) {
+                    if state.live_spent_outpoints.contains(&spend.spent_outpoint) {
                         return Err(MempoolIndexInvariantError::SpendCollision {
                             outpoint: spend.spent_outpoint,
                         });
@@ -271,77 +264,6 @@ impl MempoolIndex {
         self.state.read().entries.len()
     }
 
-    /// Returns transparent mempool outputs for `address_script_hash`,
-    /// bounded by `max_entries`.
-    #[must_use]
-    pub fn transparent_outputs_by_address(
-        &self,
-        address_script_hash: TransparentAddressScriptHash,
-        max_entries: u32,
-    ) -> Vec<TransparentMempoolOutput> {
-        let state = self.state.read();
-        let Some(outputs) = state.outputs_by_address.get(&address_script_hash) else {
-            return Vec::new();
-        };
-        let bound = u32_to_usize(max_entries);
-        let transparent_outputs = outputs.values().take(bound).cloned().collect::<Vec<_>>();
-        drop(state);
-        transparent_outputs
-    }
-
-    /// Resolves a batch of outpoints against the live mempool index.
-    ///
-    /// Returns one entry per requested outpoint, in input order. Each entry
-    /// carries the resolved transparent output when the outpoint references
-    /// a transaction currently in the mempool and the output index is in
-    /// bounds; otherwise the entry's `prevout` is `None`.
-    #[must_use]
-    pub fn transparent_outputs_by_outpoints(
-        &self,
-        outpoints: &[TransparentOutPoint],
-    ) -> Vec<TransparentOutputEntry> {
-        let state = self.state.read();
-        outpoints
-            .iter()
-            .map(|outpoint| {
-                let prevout = state
-                    .output_by_outpoint
-                    .get(outpoint)
-                    .map(|mempool_output| TransparentOutput {
-                        value_zat: mempool_output.value_zat,
-                        script_pub_key: mempool_output.script_pub_key.clone(),
-                    });
-                TransparentOutputEntry {
-                    outpoint: *outpoint,
-                    output: prevout,
-                }
-            })
-            .collect()
-    }
-
-    /// Returns the mempool spend that consumes `spent_outpoint`, when
-    /// present.
-    #[must_use]
-    pub fn transparent_spend_by_outpoint(
-        &self,
-        spent_outpoint: TransparentOutPoint,
-    ) -> Option<TransparentMempoolSpend> {
-        let state = self.state.read();
-        let outcome = state
-            .spend_by_outpoint
-            .get(&spent_outpoint)
-            .and_then(|spending_transaction_id| state.entries.get(spending_transaction_id))
-            .and_then(|entry| {
-                entry
-                    .transparent_spends()
-                    .iter()
-                    .find(|spend| spend.spent_outpoint == spent_outpoint)
-                    .copied()
-            });
-        drop(state);
-        outcome
-    }
-
     /// Returns a snapshot of up to `max_entries` mempool entries.
     ///
     /// Each returned [`Arc`] aliases the in-index entry so callers serialize
@@ -411,41 +333,25 @@ const fn u32_to_usize(count: u32) -> usize {
 fn index_secondary_overlays(state: &mut MempoolIndexState, entry: &MempoolEntry) {
     for transparent_output in entry.transparent_outputs() {
         state
-            .outputs_by_address
-            .entry(transparent_output.address_script_hash)
-            .or_default()
-            .insert(transparent_output.outpoint, transparent_output.clone());
-        state
-            .output_by_outpoint
-            .insert(transparent_output.outpoint, transparent_output.clone());
+            .live_output_outpoints
+            .insert(transparent_output.outpoint);
     }
     for transparent_spend in entry.transparent_spends() {
         state
-            .spend_by_outpoint
-            .insert(transparent_spend.spent_outpoint, entry.transaction_id());
+            .live_spent_outpoints
+            .insert(transparent_spend.spent_outpoint);
     }
 }
 
 fn unindex_secondary_overlays(state: &mut MempoolIndexState, entry: &MempoolEntry) {
     for transparent_output in entry.transparent_outputs() {
-        if let Some(outputs) = state
-            .outputs_by_address
-            .get_mut(&transparent_output.address_script_hash)
-        {
-            outputs.remove(&transparent_output.outpoint);
-            if outputs.is_empty() {
-                state
-                    .outputs_by_address
-                    .remove(&transparent_output.address_script_hash);
-            }
-        }
         state
-            .output_by_outpoint
+            .live_output_outpoints
             .remove(&transparent_output.outpoint);
     }
     for transparent_spend in entry.transparent_spends() {
         state
-            .spend_by_outpoint
+            .live_spent_outpoints
             .remove(&transparent_spend.spent_outpoint);
     }
 }
@@ -457,14 +363,16 @@ mod tests {
         reason = "Unit test names describe the behavior under test."
     )]
 
-    use super::{MempoolApplyOutcome, MempoolIndex};
+    use super::{
+        MempoolApplyOutcome, MempoolIndex, MempoolIndexInvariantError, MempoolIndexPreflight,
+    };
     use zinder_core::{
         BlockHash, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata, CompactTransactionData,
         CompactTransparentInput, CompactTransparentOutput, MempoolEntry, MempoolEntryBuildError,
-        MempoolObservation, Network, RawTransactionBytes, TransactionId,
-        TransparentAddressScriptHash, TransparentOutPoint, UnixTimestampMillis,
+        MempoolObservation, Network, RawTransactionBytes, TransactionId, TransparentOutPoint,
+        UnixTimestampMillis,
     };
-    use zinder_store::{CURRENT_ARTIFACT_SCHEMA_VERSION, MempoolEventPosition};
+    use zinder_store::{CURRENT_ARTIFACT_SCHEMA_VERSION, MempoolEvent, MempoolEventPosition};
 
     fn applied_at(event_sequence: u64, transaction_id: TransactionId) -> MempoolEventPosition {
         MempoolEventPosition {
@@ -532,17 +440,14 @@ mod tests {
             Some(applied_at(1, entry.transaction_id()))
         );
 
-        let outputs = index.transparent_outputs_by_address(
-            TransparentAddressScriptHash::of_script_pub_key(&[0xAA; 25]),
-            10,
-        );
-        assert_eq!(outputs.len(), 1);
-
-        let spend = index.transparent_spend_by_outpoint(TransparentOutPoint::new(
-            TransactionId::from_bytes([0x20; 32]),
-            0,
+        let double_spend = entry_with_outputs_and_spend(0x11, 0xAB, 0x20)?;
+        assert!(matches!(
+            index.preflight_event(&MempoolEvent::Added {
+                entry: double_spend
+            }),
+            Err(MempoolIndexInvariantError::SpendCollision { outpoint })
+                if outpoint == TransparentOutPoint::new(TransactionId::from_bytes([0x20; 32]), 0)
         ));
-        assert!(spend.is_some());
         Ok(())
     }
 
@@ -582,22 +487,11 @@ mod tests {
 
         assert_eq!(outcome, MempoolApplyOutcome::Applied);
         assert!(!index.is_in_mempool(entry.transaction_id()));
-        assert!(
-            index
-                .transparent_outputs_by_address(
-                    TransparentAddressScriptHash::of_script_pub_key(&[0xAA; 25]),
-                    10,
-                )
-                .is_empty()
-        );
-        assert!(
-            index
-                .transparent_spend_by_outpoint(TransparentOutPoint::new(
-                    TransactionId::from_bytes([0x20; 32]),
-                    0,
-                ))
-                .is_none()
-        );
+        let respend = entry_with_outputs_and_spend(0x11, 0xAB, 0x20)?;
+        assert!(matches!(
+            index.preflight_event(&MempoolEvent::Added { entry: respend }),
+            Ok(MempoolIndexPreflight::Apply)
+        ));
         Ok(())
     }
 
@@ -665,15 +559,5 @@ mod tests {
             Some(position)
         );
         Ok(())
-    }
-
-    #[test]
-    fn transparent_outputs_lookup_returns_empty_for_unknown_address() {
-        let index = MempoolIndex::new();
-        let outputs = index.transparent_outputs_by_address(
-            TransparentAddressScriptHash::from_bytes([0x99; 32]),
-            10,
-        );
-        assert!(outputs.is_empty());
     }
 }

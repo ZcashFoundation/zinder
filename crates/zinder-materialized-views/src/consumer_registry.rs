@@ -1,8 +1,9 @@
-//! Closed registry of the materialized-view consumers bundled with this release.
+//! Closed registry of the Explorer views bundled with this release.
 //!
-//! Each entry declares one consumer's durable schema, product role, preset
-//! membership, and how the replay host constructs and drives it. Store preset lists, chain-event cursor lists, and
-//! the replay host's dispatch sets all derive from this one table.
+//! Each entry declares one consumer's durable schema and how the replay host
+//! constructs and drives it. The store's exact consumer manifest, chain-event
+//! cursor lists, and the replay host's dispatch sets all derive from this one
+//! table.
 
 use crate::{
     BLOCK_PRODUCTION_TIME_SCHEMA, BLOCK_SUMMARY_SCHEMA, BlockKeyedConsumer,
@@ -10,31 +11,18 @@ use crate::{
     CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA, CommitmentRootSearchConsumer,
     ConventionalFeeDistributionConsumer, IRONWOOD_MIGRATION_SCHEMA, IronwoodMigrationConsumer,
     MEMPOOL_EVENT_COUNTS_SCHEMA, MaterializedViewConsumer, MaterializedViewConsumerName,
-    MaterializedViewConsumerSchema, MaterializedViewMempoolConsumer, MaterializedViewPreset,
-    MaterializedViewStore, MaterializedViewStoreError, MempoolEventCountsConsumer,
-    PAID_FEE_DISTRIBUTION_SCHEMA, PaidFeeDistributionConsumer, RECENT_TRANSACTIONS_SCHEMA,
-    REORG_INCIDENTS_SCHEMA, RecentTransactionsConsumer, ReorgIncidentsConsumer,
-    TRANSACTION_COMPONENT_SUMMARY_SCHEMA, TRANSACTION_FEES_SCHEMA, TRANSACTION_HISTORY_SCHEMA,
-    TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA, TRANSPARENT_ADDRESS_DELTAS_SCHEMA,
-    TRANSPARENT_ADDRESS_RANKING_SCHEMA, TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_SCHEMA,
+    MaterializedViewConsumerSchema, MaterializedViewMempoolConsumer, MaterializedViewStore,
+    MaterializedViewStoreError, MempoolEventCountsConsumer, PAID_FEE_DISTRIBUTION_SCHEMA,
+    PaidFeeDistributionConsumer, RECENT_TRANSACTIONS_SCHEMA, REORG_INCIDENTS_SCHEMA,
+    RecentTransactionsConsumer, ReorgIncidentsConsumer, TRANSACTION_COMPONENT_SUMMARY_SCHEMA,
+    TRANSACTION_FEES_SCHEMA, TRANSACTION_HISTORY_SCHEMA, TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA,
+    TRANSPARENT_ADDRESS_DELTAS_SCHEMA, TRANSPARENT_ADDRESS_RANKING_SCHEMA,
     TRANSPARENT_OUTPOINT_SPEND_SCHEMA, TransactionComponentSummaryConsumer,
     TransactionFeesConsumer, TransactionHistoryConsumer, TransparentAddressActivityConsumer,
     TransparentAddressDeltasConsumer, TransparentAddressRankingConsumer,
-    TransparentAddressTransactionHistoryConsumer, TransparentOutpointSpendConsumer,
-    VALUE_POOL_BALANCE_HISTORY_SCHEMA, VALUE_POOL_FLOW_HISTORY_SCHEMA,
-    ValuePoolFlowHistoryConsumer,
+    TransparentOutpointSpendConsumer, VALUE_POOL_BALANCE_HISTORY_SCHEMA,
+    VALUE_POOL_FLOW_HISTORY_SCHEMA, ValuePoolFlowHistoryConsumer,
 };
-
-/// Product responsibility assigned to one consumer identity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MaterializedViewConsumerRole {
-    /// Required for wallet spend-resolution correctness.
-    WalletCorrectness,
-    /// Required by the supported wallet-serving read contract.
-    WalletServing,
-    /// Explorer, analytics, dashboard, or other optional product view.
-    OptionalProductView,
-}
 
 /// Durable source used to reconstruct one materialized-view consumer.
 ///
@@ -52,15 +40,6 @@ pub enum MaterializedViewRecoverySource {
     CanonicalBackfill,
     /// Replays writer-owned mempool events.
     MempoolEvents,
-}
-
-/// Product presets that include one consumer identity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MaterializedViewPresetMembership {
-    /// Consumer is required by both wallet and explorer deployments.
-    WalletAndExplorer,
-    /// Consumer is included only in the explorer workload.
-    ExplorerOnly,
 }
 
 /// Reports whether an activation-gated consumer may receive chain events.
@@ -111,34 +90,16 @@ pub enum MaterializedViewDispatch {
     CanonicalBackfillOnly,
 }
 
-/// Complete product, recovery, and dispatch declaration for one durable consumer.
+/// Recovery and dispatch declaration for one bundled Explorer view.
 #[derive(Clone, Copy, Debug)]
 pub struct MaterializedViewConsumerDefinition {
     /// Durable schema identity and owned row contract.
     pub schema: MaterializedViewConsumerSchema,
-    /// Product role served by the consumer.
-    pub role: MaterializedViewConsumerRole,
-    /// Presets that select the consumer.
-    pub preset_membership: MaterializedViewPresetMembership,
     /// How the replay host constructs and drives the consumer.
     pub dispatch: MaterializedViewDispatch,
 }
 
 impl MaterializedViewConsumerDefinition {
-    /// Returns whether this consumer belongs to `preset`.
-    #[must_use]
-    pub const fn included_in(self, preset: MaterializedViewPreset) -> bool {
-        match (self.preset_membership, preset) {
-            (MaterializedViewPresetMembership::WalletAndExplorer, _)
-            | (MaterializedViewPresetMembership::ExplorerOnly, MaterializedViewPreset::Explorer) => {
-                true
-            }
-            (MaterializedViewPresetMembership::ExplorerOnly, MaterializedViewPreset::Wallet) => {
-                false
-            }
-        }
-    }
-
     /// Returns the durable source used to reconstruct this consumer.
     #[must_use]
     pub const fn recovery_source(self) -> MaterializedViewRecoverySource {
@@ -168,16 +129,11 @@ impl MaterializedViewConsumerDefinition {
     }
 }
 
-const fn optional(
+const fn view(
     schema: MaterializedViewConsumerSchema,
     dispatch: MaterializedViewDispatch,
 ) -> MaterializedViewConsumerDefinition {
-    MaterializedViewConsumerDefinition {
-        schema,
-        role: MaterializedViewConsumerRole::OptionalProductView,
-        preset_membership: MaterializedViewPresetMembership::ExplorerOnly,
-        dispatch,
-    }
+    MaterializedViewConsumerDefinition { schema, dispatch }
 }
 
 const fn chain_event_blocks(
@@ -194,91 +150,91 @@ fn transparent_address_ranking_is_active(
 }
 
 const BUNDLED_MATERIALIZED_VIEW_CONSUMER_DEFINITIONS: &[MaterializedViewConsumerDefinition] = &[
-    optional(
+    view(
         BLOCK_PRODUCTION_TIME_SCHEMA,
         chain_event_blocks(ChainEventBlockJoin::CanonicalBackfill, || {
             Box::new(BlockProductionTimeConsumer::new())
         }),
     ),
-    optional(
+    view(
         BLOCK_SUMMARY_SCHEMA,
         chain_event_blocks(ChainEventBlockJoin::Replay, || {
             Box::new(BlockSummaryConsumer::new())
         }),
     ),
-    optional(
+    view(
         IRONWOOD_MIGRATION_SCHEMA,
         chain_event_blocks(ChainEventBlockJoin::Replay, || {
             Box::new(IronwoodMigrationConsumer::new())
         }),
     ),
-    optional(
+    view(
         COMMITMENT_ROOT_SEARCH_SCHEMA,
         chain_event_blocks(ChainEventBlockJoin::CanonicalBackfill, || {
             Box::new(CommitmentRootSearchConsumer::new())
         }),
     ),
-    optional(
+    view(
         CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA,
         chain_event_blocks(ChainEventBlockJoin::CanonicalBackfill, || {
             Box::new(ConventionalFeeDistributionConsumer::new())
         }),
     ),
-    optional(
+    view(
         MEMPOOL_EVENT_COUNTS_SCHEMA,
         MaterializedViewDispatch::MempoolEvents {
             construct: || Box::new(MempoolEventCountsConsumer::new()),
         },
     ),
-    optional(
+    view(
         PAID_FEE_DISTRIBUTION_SCHEMA,
         chain_event_blocks(ChainEventBlockJoin::CanonicalBackfill, || {
             Box::new(PaidFeeDistributionConsumer::new())
         }),
     ),
-    optional(
+    view(
         RECENT_TRANSACTIONS_SCHEMA,
         chain_event_blocks(ChainEventBlockJoin::Replay, || {
             Box::new(RecentTransactionsConsumer::new())
         }),
     ),
-    optional(
+    view(
         TRANSACTION_HISTORY_SCHEMA,
         chain_event_blocks(ChainEventBlockJoin::Replay, || {
             Box::new(TransactionHistoryConsumer::new())
         }),
     ),
-    optional(
+    view(
         REORG_INCIDENTS_SCHEMA,
         MaterializedViewDispatch::ChainEventEnvelope {
             construct: || Box::new(ReorgIncidentsConsumer::new()),
         },
     ),
-    optional(
+    view(
         TRANSACTION_FEES_SCHEMA,
         chain_event_blocks(ChainEventBlockJoin::Replay, || {
             Box::new(TransactionFeesConsumer::new())
         }),
     ),
-    optional(
+    view(
         TRANSACTION_COMPONENT_SUMMARY_SCHEMA,
         chain_event_blocks(ChainEventBlockJoin::CanonicalBackfill, || {
             Box::new(TransactionComponentSummaryConsumer::new())
         }),
     ),
-    optional(
+    view(
         TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA,
         chain_event_blocks(ChainEventBlockJoin::Replay, || {
             Box::new(TransparentAddressActivityConsumer::new())
         }),
     ),
-    optional(
+    view(
         TRANSPARENT_ADDRESS_DELTAS_SCHEMA,
         chain_event_blocks(ChainEventBlockJoin::Replay, || {
             Box::new(TransparentAddressDeltasConsumer::new())
         }),
     ),
-    optional(
+    view(
         TRANSPARENT_ADDRESS_RANKING_SCHEMA,
         chain_event_blocks(
             ChainEventBlockJoin::CanonicalSnapshot {
@@ -287,27 +243,17 @@ const BUNDLED_MATERIALIZED_VIEW_CONSUMER_DEFINITIONS: &[MaterializedViewConsumer
             || Box::new(TransparentAddressRankingConsumer::new()),
         ),
     ),
-    MaterializedViewConsumerDefinition {
-        schema: TRANSPARENT_ADDRESS_TRANSACTION_HISTORY_SCHEMA,
-        role: MaterializedViewConsumerRole::WalletServing,
-        preset_membership: MaterializedViewPresetMembership::WalletAndExplorer,
-        dispatch: chain_event_blocks(ChainEventBlockJoin::Replay, || {
-            Box::new(TransparentAddressTransactionHistoryConsumer::new())
-        }),
-    },
-    MaterializedViewConsumerDefinition {
-        schema: TRANSPARENT_OUTPOINT_SPEND_SCHEMA,
-        role: MaterializedViewConsumerRole::WalletCorrectness,
-        preset_membership: MaterializedViewPresetMembership::WalletAndExplorer,
-        dispatch: chain_event_blocks(ChainEventBlockJoin::Replay, || {
+    view(
+        TRANSPARENT_OUTPOINT_SPEND_SCHEMA,
+        chain_event_blocks(ChainEventBlockJoin::Replay, || {
             Box::new(TransparentOutpointSpendConsumer::new())
         }),
-    },
-    optional(
+    ),
+    view(
         VALUE_POOL_BALANCE_HISTORY_SCHEMA,
         MaterializedViewDispatch::CanonicalBackfillOnly,
     ),
-    optional(
+    view(
         VALUE_POOL_FLOW_HISTORY_SCHEMA,
         chain_event_blocks(ChainEventBlockJoin::CanonicalBackfill, || {
             Box::new(ValuePoolFlowHistoryConsumer::new())
@@ -315,7 +261,7 @@ const BUNDLED_MATERIALIZED_VIEW_CONSUMER_DEFINITIONS: &[MaterializedViewConsumer
     ),
 ];
 
-/// Returns every bundled consumer's product, recovery, and dispatch declaration.
+/// Returns every bundled Explorer view's recovery and dispatch declaration.
 #[must_use]
 pub const fn bundled_materialized_view_consumer_definitions()
 -> &'static [MaterializedViewConsumerDefinition] {
@@ -326,9 +272,7 @@ pub const fn bundled_materialized_view_consumer_definitions()
 #[derive(Clone, Copy)]
 pub(crate) enum RegistrySelection {
     /// Every bundled consumer.
-    Explorer,
-    /// Consumers the wallet preset selects.
-    Wallet,
+    Bundled,
     /// Block-keyed chain-event consumers.
     ChainEventBlocks,
     /// Envelope-only chain-event consumers.
@@ -338,8 +282,7 @@ pub(crate) enum RegistrySelection {
 impl RegistrySelection {
     const fn selects(self, definition: &MaterializedViewConsumerDefinition) -> bool {
         match self {
-            Self::Explorer => definition.included_in(MaterializedViewPreset::Explorer),
-            Self::Wallet => definition.included_in(MaterializedViewPreset::Wallet),
+            Self::Bundled => true,
             Self::ChainEventBlocks => matches!(
                 definition.dispatch,
                 MaterializedViewDispatch::ChainEventBlocks { .. }

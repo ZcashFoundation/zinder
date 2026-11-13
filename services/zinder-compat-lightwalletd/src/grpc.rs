@@ -389,10 +389,8 @@ where
     /// plane's transparent-address balance primitive.
     ///
     /// The legacy proto carries one signed `value_zat` field that wallets
-    /// interpret as confirmed balance. The compat shim projects the native
-    /// balance into that field by ignoring pending inflows and subtracting
-    /// pending outflows from the confirmed total, saturating to zero and
-    /// capping at the `int64` wire ceiling.
+    /// interpret as confirmed balance. The compat shim reports the canonical
+    /// confirmed total and rejects a total above the `int64` wire ceiling.
     async fn compat_balance_response(
         &self,
         addresses: Vec<String>,
@@ -429,17 +427,9 @@ where
 fn lightwalletd_balance_value_zat(
     balance: zinder_core::TransparentAddressBalance,
 ) -> Result<i64, Status> {
-    let value_zat = if balance.unconfirmed_delta_zat.is_negative() {
-        balance
-            .confirmed_zat
-            .saturating_sub(balance.unconfirmed_delta_zat.unsigned_abs())
-    } else {
-        balance.confirmed_zat
-    };
-    i64::try_from(value_zat).map_err(|_| {
+    i64::try_from(balance.confirmed_zat).map_err(|_| {
         Status::out_of_range(
-            "transparent address balance exceeds i64::MAX; \
-             use the native WalletQuery.TransparentAddressBalance surface",
+            "transparent address balance exceeds the lightwalletd int64 balance field",
         )
     })
 }
@@ -1436,7 +1426,6 @@ fn transparent_address_tx_history_request(
         end_height,
         max_entries: NonZeroU32::MIN.saturating_add(999),
         from_cursor: None,
-        descending: false,
     })
 }
 
@@ -1877,13 +1866,9 @@ mod tests {
         }
     }
 
-    fn transparent_address_balance(
-        confirmed_zat: u64,
-        unconfirmed_delta_zat: i64,
-    ) -> TransparentAddressBalance {
+    fn transparent_address_balance(confirmed_zat: u64) -> TransparentAddressBalance {
         TransparentAddressBalance {
             confirmed_zat,
-            unconfirmed_delta_zat,
             address_count: 1,
             chain_epoch: test_chain_epoch(),
         }
@@ -1955,33 +1940,21 @@ mod tests {
     }
 
     #[test]
-    fn lightwalletd_balance_projection_ignores_pending_inflows() -> Result<(), Status> {
-        let balance = transparent_address_balance(100, 25);
-
-        let value_zat = lightwalletd_balance_value_zat(balance)?;
+    fn lightwalletd_balance_projection_reports_the_confirmed_total() -> Result<(), Status> {
+        let value_zat = lightwalletd_balance_value_zat(transparent_address_balance(100))?;
 
         assert_eq!(value_zat, 100);
         Ok(())
     }
 
     #[test]
-    fn lightwalletd_balance_projection_subtracts_pending_outflows() -> Result<(), Status> {
-        let balance = transparent_address_balance(100, -25);
+    fn lightwalletd_balance_projection_rejects_a_total_above_the_int64_field() {
+        let outcome = lightwalletd_balance_value_zat(transparent_address_balance(u64::MAX));
 
-        let value_zat = lightwalletd_balance_value_zat(balance)?;
-
-        assert_eq!(value_zat, 75);
-        Ok(())
-    }
-
-    #[test]
-    fn lightwalletd_balance_projection_saturates_pending_outflows_to_zero() -> Result<(), Status> {
-        let balance = transparent_address_balance(100, -250);
-
-        let value_zat = lightwalletd_balance_value_zat(balance)?;
-
-        assert_eq!(value_zat, 0);
-        Ok(())
+        assert!(matches!(
+            outcome,
+            Err(status) if status.code() == tonic::Code::OutOfRange
+        ));
     }
 
     #[test]

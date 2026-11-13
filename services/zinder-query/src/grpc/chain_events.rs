@@ -187,7 +187,6 @@ async fn address_touched_in_range<Q: WalletQueryApi + ?Sized>(
         end_height,
         max_entries: NonZeroU32::MIN,
         from_cursor: None,
-        descending: false,
     };
     let page = query_api
         .transparent_address_tx_ids_in_range(request)

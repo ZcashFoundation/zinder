@@ -47,7 +47,7 @@ fn ingest_writer_phase_is_always_on() {
 }
 
 /// Compile-time existence check for the [`ChainIndex`] base reads that back
-/// the canonical and materialized-view wallet capabilities.
+/// the canonical and wallet-projection capabilities.
 ///
 /// The function body references each base trait method a wallet capability
 /// calls; renaming or removing any of them breaks the build. The function
@@ -70,13 +70,9 @@ fn assert_wallet_chain_index_methods_compile<T: ChainIndex>() {
     let _ = T::latest_tree_state_checkpoint;
     let _ = T::subtree_roots_in_range;
     let _ = T::transaction_by_id;
-    let _ = T::transparent_outputs_by_outpoint;
-    let _ = T::transparent_spends_by_outpoint;
-    let _ = T::transparent_unspent_outputs_by_outpoint;
     let _ = T::transparent_address_unspent_outputs;
     let _ = T::transparent_address_tx_ids_in_range;
-    let _ = T::transparent_address_balance;
-    let _ = T::transparent_utxo_set_summary;
+    let _ = T::transparent_outpoint_spend_status;
 }
 
 #[allow(
@@ -98,10 +94,7 @@ fn assert_chain_snapshot_methods_compile<T: ChainIndex>() {
     let _ = ChainSnapshot::<T>::subtree_roots_in_range;
     let _ = ChainSnapshot::<T>::transaction_by_id;
     let _ = ChainSnapshot::<T>::transparent_address_unspent_outputs;
-    let _ = ChainSnapshot::<T>::transparent_outputs_by_outpoint;
-    let _ = ChainSnapshot::<T>::transparent_spends_by_outpoint;
-    let _ = ChainSnapshot::<T>::transparent_unspent_outputs_by_outpoint;
-    let _ = ChainSnapshot::<T>::transparent_utxo_set_summary;
+    let _ = ChainSnapshot::<T>::transparent_outpoint_spend_status;
 }
 
 #[allow(
@@ -124,10 +117,7 @@ fn assert_owned_chain_snapshot_methods_compile<T: ChainIndex>() {
     let _ = OwnedChainSnapshot::<T>::transaction_by_id;
     let _ = OwnedChainSnapshot::<T>::transparent_address_unspent_outputs;
     let _ = OwnedChainSnapshot::<T>::transparent_address_tx_ids_in_range;
-    let _ = OwnedChainSnapshot::<T>::transparent_outputs_by_outpoint;
-    let _ = OwnedChainSnapshot::<T>::transparent_spends_by_outpoint;
-    let _ = OwnedChainSnapshot::<T>::transparent_unspent_outputs_by_outpoint;
-    let _ = OwnedChainSnapshot::<T>::transparent_utxo_set_summary;
+    let _ = OwnedChainSnapshot::<T>::transparent_outpoint_spend_status;
 }
 
 /// Compile-time existence check for the [`EndpointBackedIndex`] methods that
@@ -146,9 +136,6 @@ fn assert_wallet_endpoint_methods_compile<T: EndpointBackedIndex>() {
     let _ = T::mempool_snapshot;
     let _ = T::mempool_events;
     let _ = T::is_in_mempool;
-    let _ = T::transparent_mempool_outputs_by_address;
-    let _ = T::transparent_mempool_spends_by_outpoint;
-    let _ = T::transparent_mempool_outputs_by_outpoint;
     let _ = T::chain_value_pools_at_tip;
 }
 
@@ -166,11 +153,11 @@ fn typed_capability_variants_match_table_strings() {
         Capability::MempoolEvents,
         Capability::ChainValuePools,
         Capability::NetworkUpgradeActivations,
-        Capability::TransparentAddressBalance,
         Capability::FullBlock,
         Capability::FullBlockRange,
         Capability::BlockIdBySelector,
         Capability::NetworkUpgradeActivations,
+        Capability::TransparentOutpointSpendStatus,
     ] {
         assert!(
             advertised.contains(capability.as_str()),
@@ -280,18 +267,6 @@ fn typed_chain_index_covers_every_advertised_wallet_capability() {
             "ChainIndex::network_upgrade_activations",
         ),
         (
-            WALLET_READ_TRANSPARENT_OUTPUTS_V1,
-            "ChainIndex::transparent_outputs_by_outpoint",
-        ),
-        (
-            WALLET_READ_TRANSPARENT_SPENDS_V1,
-            "ChainIndex::transparent_spends_by_outpoint",
-        ),
-        (
-            WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1,
-            "ChainIndex::transparent_unspent_outputs_by_outpoint",
-        ),
-        (
             WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
             "EndpointBackedIndex::chain_value_pools_at_tip",
         ),
@@ -309,18 +284,6 @@ fn typed_chain_index_covers_every_advertised_wallet_capability() {
             "EndpointBackedIndex::mempool_events",
         ),
         (
-            WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
-            "EndpointBackedIndex::transparent_mempool_outputs_by_address",
-        ),
-        (
-            WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1,
-            "EndpointBackedIndex::transparent_mempool_spends_by_outpoint",
-        ),
-        (
-            WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_V1,
-            "EndpointBackedIndex::transparent_mempool_outputs_by_outpoint",
-        ),
-        (
             WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
             "ChainIndex::transparent_address_unspent_outputs",
         ),
@@ -329,16 +292,8 @@ fn typed_chain_index_covers_every_advertised_wallet_capability() {
             "ChainIndex::transparent_address_tx_ids_in_range",
         ),
         (
-            WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
-            "ChainIndex::transparent_address_balance",
-        ),
-        (
-            WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1,
-            "ChainIndex::transparent_utxo_set_summary",
-        ),
-        (
-            WALLET_READ_TRANSPARENT_UTXO_SET_COMMITMENT_V1,
-            "ChainIndex::transparent_utxo_set_summary",
+            WALLET_READ_TRANSPARENT_OUTPOINT_SPEND_STATUS_V1,
+            "ChainIndex::transparent_outpoint_spend_status",
         ),
     ];
     let covered: BTreeMap<_, _> = coverage_rows.into_iter().collect();

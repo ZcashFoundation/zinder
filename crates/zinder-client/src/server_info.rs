@@ -31,10 +31,6 @@ pub struct ServerInfo {
     pub capabilities: Vec<Capability>,
     /// Monotonic native contract revision.
     pub contract_revision: u32,
-    /// Closed materialized-view preset, when a view store is attached.
-    pub materialized_view_preset: Option<String>,
-    /// Stable materialized-view identities selected by the preset.
-    pub materialized_view_identities: Vec<String>,
     /// Full source commit embedded by the release build.
     pub build_git_commit: String,
     /// Canonical artifact schema version.

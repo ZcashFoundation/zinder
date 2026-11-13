@@ -17,9 +17,7 @@ use zinder_core::{
     ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange,
     TransactionBlobArtifact, TransactionBroadcastOutcome, TransactionId, TransactionLocation,
     TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TransparentOutPoint, TransparentOutputsByOutpointResponse, TransparentSpendsByOutpointResponse,
-    TransparentUnspentOutput, TransparentUnspentOutputsByOutpointResponse,
-    TransparentUtxoSetSummary, TxStatus,
+    TransparentOutPoint, TransparentOutpointSpendStatus, TransparentUnspentOutput, TxStatus,
 };
 use zinder_proto::capabilities::WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1;
 use zinder_source::SourceError;
@@ -48,9 +46,7 @@ pub use grpc::{
     latest_tree_state_checkpoint_response, network_upgrade_activations_response,
     status_from_query_error, subtree_roots_response, transaction_response,
     transparent_address_tx_ids_response, transparent_address_unspent_outputs_response,
-    transparent_outputs_by_outpoint_response, transparent_spends_by_outpoint_response,
-    transparent_unspent_outputs_by_outpoint_response, tree_state_at_response,
-    visible_tip_block_response,
+    transparent_outpoint_spend_status_response, tree_state_at_response, visible_tip_block_response,
 };
 pub use ingest_control::{AdmittedIngestControl, IngestControlAdmissionError};
 pub use native_wallet_endpoint_capabilities::{
@@ -197,49 +193,6 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<RawTransaction, QueryError>;
 
-    /// Resolves a batch of canonical-chain transparent outpoints to their
-    /// referenced outputs.
-    ///
-    /// Reads each unique outpoint from the canonical transparent-output
-    /// index. Outpoints that do not resolve at the response's [`ChainEpoch`]
-    /// return an entry with `prevout = None`. The response preserves input
-    /// order; duplicate outpoints emit duplicate entries.
-    ///
-    async fn transparent_outputs_by_outpoint(
-        &self,
-        outpoints: Vec<TransparentOutPoint>,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransparentOutputsByOutpointResponse, QueryError>;
-
-    /// Resolves a batch of canonical-chain transparent outpoints to where each
-    /// was spent on the canonical chain.
-    ///
-    /// Reads the canonical spend-fact index. Outpoints unspent at the
-    /// response's [`ChainEpoch`] produce no entry; consumers key results by
-    /// `spent_outpoint`. Coinbase inputs spend no prevout and never appear.
-    async fn transparent_spends_by_outpoint(
-        &self,
-        outpoints: Vec<TransparentOutPoint>,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransparentSpendsByOutpointResponse, QueryError>;
-
-    /// Resolves a batch of transparent outpoints to their referenced output,
-    /// keeping each only while it is unspent on the canonical chain at the
-    /// response's [`ChainEpoch`] (gettxout-equivalent, null-if-spent).
-    ///
-    /// Composes the canonical output resolver and the canonical spend-fact
-    /// reader at one pinned epoch. An outpoint emits an entry only when the
-    /// output is present and carries no canonical spend; spent or never-existed
-    /// outpoints produce no entry, so every entry's `output` is present.
-    /// Consumers key results by `outpoint`; duplicate outpoints collapse to one
-    /// entry. The read is canonical-only: mempool-aware unspent-ness composes
-    /// with [`Self::transparent_spends_by_outpoint`]'s mempool counterpart.
-    async fn transparent_unspent_outputs_by_outpoint(
-        &self,
-        outpoints: Vec<TransparentOutPoint>,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransparentUnspentOutputsByOutpointResponse, QueryError>;
-
     /// Reads the complete unspent transparent output set for one transparent
     /// address script at a single pinned chain epoch.
     async fn transparent_address_unspent_outputs(
@@ -255,15 +208,31 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         request: TransparentAddressTxIdsInRangeRequest,
     ) -> Result<TransparentAddressTxIds, QueryError>;
 
+    /// Classifies each transparent outpoint as unspent, spent by a mined
+    /// input, or not found, reading every outpoint at one chain epoch.
+    ///
+    /// The returned statuses follow `outpoints` in order and length,
+    /// including duplicates. The read covers mined transactions only.
+    ///
+    /// Rejects an empty list and any list above
+    /// [`zinder_core::MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST`] with
+    /// [`QueryError::TransparentOutpointCountOutOfRange`] before reading
+    /// storage. `NotFound` is a proven absence from height 1 through the
+    /// visible tip; a store whose history starts after a checkpoint answers a
+    /// miss with [`QueryError::CanonicalHistoryUnavailable`] instead.
+    async fn transparent_outpoint_spend_status(
+        &self,
+        outpoints: Vec<TransparentOutPoint>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentOutpointSpendStatuses, QueryError>;
+
     /// Sums the canonical confirmed balance across one or more transparent
     /// addresses at a single pinned chain epoch.
     ///
     /// Folds the complete unspent transparent output set of every requested
-    /// address into one saturating `confirmed_zat` total. The returned
-    /// [`TransparentAddressBalance`] carries `unconfirmed_delta_zat = 0`: the
-    /// canonical read knows nothing about live mempool state. The wallet-side
-    /// gRPC adapter overlays the signed mempool delta on top of this total
-    /// when an ingest-control endpoint is wired.
+    /// address into one saturating `confirmed_zat` total. The lightwalletd
+    /// compatibility adapter is the only consumer; the native endpoint does
+    /// not serve a balance.
     ///
     /// Rejects an empty address list and any list above
     /// [`MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES`] with
@@ -274,19 +243,6 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         addresses: Vec<TransparentAddressScriptHash>,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressBalance, QueryError>;
-
-    /// Aggregates the chain-wide transparent UTXO set at the settled tip.
-    ///
-    /// Folds the canonical current-UTXO projection into an unspent count and a
-    /// total value (gettxoutsetinfo-equivalent) by a request-time full scan.
-    /// The aggregate is taken at the resolved epoch's settled tip, where the
-    /// projection is the settled-tip unspent set under the configured reorg
-    /// policy; a deeper reorg fails closed. When `commitment_enabled`
-    /// is set the same scan also folds the `LtHash16` homomorphic commitment.
-    async fn transparent_utxo_set_summary(
-        &self,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransparentUtxoSetSummary, QueryError>;
 
     /// Reads the tree state at exactly `height`.
     ///
@@ -444,6 +400,9 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         Some(QueryError::TransparentBalanceAddressCountExceeded { .. }) => {
             "transparent_balance_address_count_exceeded"
         }
+        Some(QueryError::TransparentOutpointCountOutOfRange { .. }) => {
+            "transparent_outpoint_count_out_of_range"
+        }
         Some(QueryError::ArtifactUnavailable { .. }) => "artifact_unavailable",
         Some(QueryError::CompactBlockPayloadMalformed { .. }) => "compact_block_payload_malformed",
         Some(QueryError::UnsupportedShieldedProtocol { .. }) => "unsupported_shielded_protocol",
@@ -467,7 +426,6 @@ fn query_error_class(error: Option<&QueryError>) -> &'static str {
         Some(QueryError::ArtifactCorrupt { .. }) => "artifact_corrupt",
         Some(QueryError::BlockNotInBestChain) => "block_not_in_best_chain",
         Some(QueryError::Store(_)) => "store",
-        Some(QueryError::MaterializedViewStore(_)) => "materialized_view_store",
         Some(QueryError::WalletProjectionRead { .. }) => "wallet_projection_read",
         Some(QueryError::CanonicalStore(_)) => "canonical_store",
         Some(QueryError::WalletStore(_)) => "wallet_store",
@@ -669,6 +627,15 @@ pub struct TransparentAddressUnspentOutputs {
     pub outputs: Vec<TransparentUnspentOutput>,
 }
 
+/// Spend status of a batch of transparent outpoints, read at one chain epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransparentOutpointSpendStatuses {
+    /// Chain epoch every status was read at.
+    pub chain_epoch: ChainEpoch,
+    /// One status per requested outpoint, in request order.
+    pub statuses: Vec<TransparentOutpointSpendStatus>,
+}
+
 /// Transparent-address tx-history range request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransparentAddressTxIdsInRangeRequest {
@@ -684,8 +651,6 @@ pub struct TransparentAddressTxIdsInRangeRequest {
     /// to the response's visible-chain event fence and is rejected after a
     /// reorg.
     pub from_cursor: Option<StreamCursorTokenV1>,
-    /// Iterate newest-first when true.
-    pub descending: bool,
 }
 
 /// Transparent-address tx-history page response bound to one chain epoch.
@@ -693,7 +658,7 @@ pub struct TransparentAddressTxIdsInRangeRequest {
 pub struct TransparentAddressTxIds {
     /// Chain epoch used to answer the query.
     pub chain_epoch: ChainEpoch,
-    /// Tx-history artifacts in the requested order.
+    /// Tx-history artifacts in ascending mined order.
     pub artifacts: Vec<TransparentAddressTxIndexArtifact>,
     /// Resume cursor when more entries may be available.
     pub next_cursor: Option<StreamCursorTokenV1>,
@@ -819,6 +784,18 @@ pub enum QueryError {
         maximum: u32,
     },
 
+    /// Outpoint spend-status request named no outpoints or more than the
+    /// per-request cap.
+    #[error(
+        "transparent outpoint count is out of range: requested {requested}, allowed 1 to {maximum}"
+    )]
+    TransparentOutpointCountOutOfRange {
+        /// Requested outpoint count.
+        requested: usize,
+        /// Maximum allowed outpoint count.
+        maximum: usize,
+    },
+
     /// Indexed artifact is unavailable for the requested key.
     #[error("{family:?} artifact is unavailable for {key}")]
     ArtifactUnavailable {
@@ -897,9 +874,10 @@ pub enum QueryError {
     },
 
     /// The store's retained canonical history starts after a checkpoint, so a
-    /// transaction lookup that missed cannot prove the transaction absent.
+    /// transaction or transparent outpoint lookup that missed cannot prove
+    /// its subject absent.
     #[error(
-        "canonical history starts at height {}; transaction absence cannot be proven",
+        "canonical history starts at height {}; absence cannot be proven",
         .first_available_height.value()
     )]
     CanonicalHistoryUnavailable {
@@ -972,10 +950,6 @@ pub enum QueryError {
     /// Canonical read API returned a storage error.
     #[error(transparent)]
     Store(#[from] StoreError),
-
-    /// Materialized-view store returned a storage error.
-    #[error(transparent)]
-    MaterializedViewStore(#[from] zinder_materialized_views::MaterializedViewStoreError),
 
     /// Typed wallet-projection backend returned a storage failure.
     #[error("wallet projection read failed: {source}")]
@@ -1052,6 +1026,9 @@ impl zinder_proto::BoundaryError for QueryError {
             Self::TransparentBalanceAddressCountExceeded { .. } => {
                 ErrorReason::TransparentBalanceAddressCountExceeded
             }
+            Self::TransparentOutpointCountOutOfRange { .. } => {
+                ErrorReason::TransparentOutpointCountOutOfRange
+            }
             Self::ChainEventCursorInvalid { .. } => ErrorReason::ChainEventCursorInvalid,
             Self::TransparentHistoryCursorInvalid { .. } => {
                 ErrorReason::TransparentHistoryCursorInvalid
@@ -1080,8 +1057,7 @@ impl zinder_proto::BoundaryError for QueryError {
                 ErrorReason::NodeCapabilityMissing
             }
             Self::Node(_) => ErrorReason::NodeUnavailable,
-            Self::MaterializedViewStore(_)
-            | Self::Store(_)
+            Self::Store(_)
             | Self::WalletProjectionRead { .. }
             | Self::CanonicalStore(_)
             | Self::WalletStore(_) => ErrorReason::StorageUnavailable,
@@ -1162,6 +1138,10 @@ mod error_reason_tests {
                 requested: 257,
                 maximum: MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
             },
+            QueryError::TransparentOutpointCountOutOfRange {
+                requested: 0,
+                maximum: zinder_core::MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST,
+            },
             QueryError::ArtifactUnavailable {
                 family: ArtifactFamily::CompactBlock,
                 key: ArtifactKey::BlockHeight(BlockHeight::new(1)),
@@ -1212,11 +1192,6 @@ mod error_reason_tests {
                 reason: "probe".to_owned(),
             },
             QueryError::Store(StoreError::InvalidChainEpochArtifacts { reason: "probe" }),
-            QueryError::MaterializedViewStore(
-                zinder_materialized_views::MaterializedViewStoreError::InvalidOptions {
-                    reason: "probe",
-                },
-            ),
             QueryError::WalletProjectionRead {
                 source: Box::new(std::io::Error::other("probe")),
             },

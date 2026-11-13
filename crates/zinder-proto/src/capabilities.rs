@@ -95,48 +95,11 @@ pub const WALLET_READ_SERVER_INFO_V2: &str = "wallet.read.server_info_v2";
 /// Capability advertised for `WalletQuery.NetworkUpgradeActivations`.
 pub const WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1: &str =
     "wallet.read.network_upgrade_activations_v1";
-/// Capability advertised for `WalletQuery.TransparentOutputsByOutpoint`.
-///
-/// A wallet composition claims this capability only when its admitted query
-/// implements the canonical output resolver.
-pub const WALLET_READ_TRANSPARENT_OUTPUTS_V1: &str =
-    "wallet.read.transparent_outputs_by_outpoint_v1";
-/// Capability advertised for `WalletQuery.TransparentSpendsByOutpoint`.
-///
-/// A wallet composition claims this capability only when its admitted query
-/// implements the canonical (confirmed) reverse-spend resolver over the
-/// canonical spend-fact index. The unmined half is
-/// [`WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1`].
-pub const WALLET_READ_TRANSPARENT_SPENDS_V1: &str = "wallet.read.transparent_spends_by_outpoint_v1";
-/// Capability advertised for `WalletQuery.TransparentUnspentOutputsByOutpoint`.
-///
-/// A wallet composition claims this capability only when its admitted query
-/// implements the canonical single-outpoint unspent probe
-/// (gettxout-equivalent) over the canonical output and spend-fact indexes.
-/// Mempool-aware unspent-ness composes with
-/// [`WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1`].
-pub const WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1: &str =
-    "wallet.read.transparent_unspent_outputs_by_outpoint_v1";
 /// Capability advertised for `WalletQuery.ChainValuePoolsAtTip`.
 ///
 /// The response binds the upstream pool snapshot to one source tip height and
 /// hash.
 pub const WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1: &str = "wallet.read.chain_value_pools_at_tip_v1";
-/// Capability advertised for `WalletQuery.TransparentUtxoSetSummary`.
-///
-/// The count and total value are folded in-process from the canonical
-/// current-UTXO projection at the settled tip. A composition advertises this
-/// only when that projection and the bounded summary implementation are
-/// concretely admitted. The release serving-pair query currently omits it.
-pub const WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1: &str =
-    "wallet.read.transparent_utxo_set_summary_v1";
-/// Field capability gating `commitment` on `TransparentUtxoSetSummaryResponse`.
-///
-/// The `LtHash16` commitment has real per-output CPU cost. No current production
-/// composition admits this field, and a manual operator support flag is not
-/// valid admission evidence. When absent the field is `None`.
-pub const WALLET_READ_TRANSPARENT_UTXO_SET_COMMITMENT_V1: &str =
-    "wallet.read.transparent_utxo_set_commitment_v1";
 /// Capability advertised for `WalletQuery.BroadcastTransaction`.
 pub const WALLET_BROADCAST_TRANSACTION_V1: &str = "wallet.broadcast.transaction_v1";
 /// Capability advertised for `WalletQuery.ChainEvents`.
@@ -145,30 +108,19 @@ pub const WALLET_EVENTS_CHAIN_V1: &str = "wallet.events.chain_v1";
 pub const WALLET_SNAPSHOT_MEMPOOL_V3: &str = "wallet.snapshot.mempool_v3";
 /// Capability advertised for `WalletQuery.MempoolEvents`.
 pub const WALLET_EVENTS_MEMPOOL_V2: &str = "wallet.events.mempool_v2";
-/// Capability advertised for `WalletQuery.TransparentMempoolOutputsByAddress`.
-pub const WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1: &str =
-    "wallet.mempool.transparent_outputs_by_address_v1";
-/// Capability advertised for `WalletQuery.TransparentMempoolSpendsByOutpoint`.
-pub const WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1: &str =
-    "wallet.mempool.transparent_spends_by_outpoint_v1";
-/// Capability advertised for `WalletQuery.TransparentMempoolOutputsByOutpoint`.
-pub const WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_V1: &str =
-    "wallet.mempool.transparent_outputs_by_outpoint_v1";
 /// Capability advertised for `WalletQuery.TransparentAddressUnspentOutputs`.
 pub const WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1: &str =
     "wallet.address.transparent_unspent_outputs_v1";
-/// Capability advertised for ascending
-/// `WalletQuery.TransparentAddressTxIdsInRange` reads.
+/// Capability advertised for `WalletQuery.TransparentAddressTxIdsInRange`.
 ///
-/// This capability does not imply that newest-first iteration is available.
+/// The read is ascending only.
 pub const WALLET_ADDRESS_TRANSPARENT_HISTORY_V1: &str = "wallet.address.transparent_history_v1";
-/// Capability advertised for `WalletQuery.TransparentAddressBalance`.
+/// Capability advertised for `WalletQuery.TransparentOutpointSpendStatus`.
 ///
-/// The endpoint must prove the complete balance semantics implemented by its
-/// adapter. A wallet projection alone does not admit a native composite that
-/// also reads live mempool state; compatibility adapters own their independent
-/// support decision.
-pub const WALLET_ADDRESS_TRANSPARENT_BALANCE_V1: &str = "wallet.address.transparent_balance_v1";
+/// Signals that the endpoint classifies each requested outpoint as unspent,
+/// spent by a named mined input, or not found, at one chain epoch.
+pub const WALLET_READ_TRANSPARENT_OUTPOINT_SPEND_STATUS_V1: &str =
+    "wallet.read.transparent_outpoint_spend_status_v1";
 /// Capability advertised for `ExplorerQuery.ServerInfo`.
 pub const EXPLORER_SERVER_INFO_V1: &str = "explorer.server_info_v1";
 /// Capability advertised for `ExplorerQuery.TransactionDetail`.
@@ -384,21 +336,6 @@ pub const EXPLORER_VALUE_POOL_FLOW_ROUNDED_AMOUNT_SUMMARY_V1: &str =
 /// Signals that the explorer serves authoritative cumulative pool balances
 /// sampled at canonical UTC-day boundaries with explicit height coverage.
 pub const EXPLORER_VALUE_POOL_BALANCE_HISTORY_V1: &str = "explorer.value_pool.balance_history_v1";
-/// Capability advertised for `ExplorerQuery.UtxoSetSummary`.
-///
-/// Signals that the explorer plane can surface the chain-wide transparent
-/// UTXO-set count and total value through the wallet-plane
-/// `TransparentUtxoSetSummary` primitive. A request-time full scan of the
-/// current-UTXO projection; the serialized-set hash and byte size are not
-/// reported.
-pub const EXPLORER_UTXO_SET_SUMMARY_V1: &str = "explorer.utxo_set.summary_v1";
-/// Field capability gating `commitment` on `UtxoSetSummaryResponse`.
-///
-/// Mirrors [`WALLET_READ_TRANSPARENT_UTXO_SET_COMMITMENT_V1`]: the explorer
-/// surfaces the wallet-plane commitment when a `WalletQuery` endpoint is wired.
-/// The wallet endpoint populates the field only when its own commitment
-/// capability is advertised, so a present field here always carries real bytes.
-pub const EXPLORER_UTXO_SET_COMMITMENT_V1: &str = "explorer.utxo_set.commitment_v1";
 /// Capability advertised for the per-transaction paid-fee surface.
 ///
 /// Signals that the explorer plane has transparent-output facts online and
@@ -504,15 +441,6 @@ pub const INGEST_CONTROL_MEMPOOL_SNAPSHOT_V3: &str = "ingest.control.mempool_sna
 pub const INGEST_CONTROL_MEMPOOL_TRANSACTION_V2: &str = "ingest.control.mempool_transaction_v2";
 /// Capability advertised for `IngestControl.MempoolEvents`.
 pub const INGEST_CONTROL_MEMPOOL_EVENTS_V2: &str = "ingest.control.mempool_events_v2";
-/// Capability advertised for `IngestControl.TransparentMempoolOutputsByAddress`.
-pub const INGEST_CONTROL_TRANSPARENT_MEMPOOL_OUTPUTS_BY_ADDRESS_V1: &str =
-    "ingest.control.transparent_mempool_outputs_by_address_v1";
-/// Capability advertised for `IngestControl.TransparentMempoolSpendsByOutpoint`.
-pub const INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPENDS_BY_OUTPOINT_V1: &str =
-    "ingest.control.transparent_mempool_spends_by_outpoint_v1";
-/// Capability advertised for `IngestControl.TransparentMempoolOutputsByOutpoint`.
-pub const INGEST_CONTROL_TRANSPARENT_MEMPOOL_PREVOUTS_V1: &str =
-    "ingest.control.transparent_mempool_outputs_by_outpoint_v1";
 /// Capability advertised for `IngestControl.ChainValuePoolsAtTip`.
 ///
 /// The response binds the upstream pool snapshot to one source tip height and
@@ -596,14 +524,8 @@ pub enum AdvertisePolicy {
     /// Wallet: requires a store that retains transaction blobs
     /// (ingest `raw_blob_policy` in `{transactions, all}`).
     RequiresTransactionBlobs,
-    /// Wallet: requires an admitted transparent UTXO-set commitment fold.
-    ///
-    /// No release composition currently satisfies this policy.
-    RequiresUtxoSetCommitment,
     /// Wallet: requires an available transparent-address history projection.
     RequiresTransparentAddressHistory,
-    /// Wallet: requires an available durable transparent-spend projection.
-    RequiresTransparentOutpointSpend,
 }
 
 impl AdvertisePolicy {
@@ -644,9 +566,7 @@ impl AdvertisePolicy {
             | Self::RequiresChainValuePools
             | Self::RequiresBlockBlobs
             | Self::RequiresTransactionBlobs
-            | Self::RequiresUtxoSetCommitment
-            | Self::RequiresTransparentAddressHistory
-            | Self::RequiresTransparentOutpointSpend => false,
+            | Self::RequiresTransparentAddressHistory => false,
         }
     }
 
@@ -671,9 +591,7 @@ impl AdvertisePolicy {
             | Self::RequiresPrevoutResolution
             | Self::RequiresBlockBlobs
             | Self::RequiresTransactionBlobs
-            | Self::RequiresUtxoSetCommitment
             | Self::RequiresTransparentAddressHistory
-            | Self::RequiresTransparentOutpointSpend
             | Self::RequiresTransactionHistory
             | Self::RequiresCompleteTransactionHistory => false,
         }
@@ -696,7 +614,8 @@ pub struct ExplorerReadiness {
     pub wallet_query_online: bool,
     /// The canonical secondary store is open.
     pub canonical_store_online: bool,
-    /// The materialized-view store is open.
+    /// A materialized-view store with the exact Explorer view manifest is
+    /// open.
     pub materialized_view_store_online: bool,
     /// Transparent-output prevout resolution is online (implies
     /// `wallet_query_online`).
@@ -856,24 +775,6 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
-        WALLET_READ_TRANSPARENT_OUTPUTS_V1,
-        CapabilitySurface::Wallet,
-        Some("zinder.v1.wallet.WalletQuery.TransparentOutputsByOutpoint"),
-        AdvertisePolicy::AlwaysOn,
-    ),
-    CapabilitySpec::new(
-        WALLET_READ_TRANSPARENT_SPENDS_V1,
-        CapabilitySurface::Wallet,
-        Some("zinder.v1.wallet.WalletQuery.TransparentSpendsByOutpoint"),
-        AdvertisePolicy::RequiresTransparentOutpointSpend,
-    ),
-    CapabilitySpec::new(
-        WALLET_READ_TRANSPARENT_UNSPENT_OUTPUTS_V1,
-        CapabilitySurface::Wallet,
-        Some("zinder.v1.wallet.WalletQuery.TransparentUnspentOutputsByOutpoint"),
-        AdvertisePolicy::AlwaysOn,
-    ),
-    CapabilitySpec::new(
         WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.ChainValuePoolsAtTip"),
@@ -904,24 +805,6 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
-        WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_BY_ADDRESS_V1,
-        CapabilitySurface::Wallet,
-        Some("zinder.v1.wallet.WalletQuery.TransparentMempoolOutputsByAddress"),
-        AdvertisePolicy::AlwaysOn,
-    ),
-    CapabilitySpec::new(
-        WALLET_MEMPOOL_TRANSPARENT_SPENDS_BY_OUTPOINT_V1,
-        CapabilitySurface::Wallet,
-        Some("zinder.v1.wallet.WalletQuery.TransparentMempoolSpendsByOutpoint"),
-        AdvertisePolicy::AlwaysOn,
-    ),
-    CapabilitySpec::new(
-        WALLET_MEMPOOL_TRANSPARENT_OUTPUTS_V1,
-        CapabilitySurface::Wallet,
-        Some("zinder.v1.wallet.WalletQuery.TransparentMempoolOutputsByOutpoint"),
-        AdvertisePolicy::AlwaysOn,
-    ),
-    CapabilitySpec::new(
         WALLET_ADDRESS_TRANSPARENT_UNSPENT_OUTPUTS_V1,
         CapabilitySurface::Wallet,
         Some("zinder.v1.wallet.WalletQuery.TransparentAddressUnspentOutputs"),
@@ -934,22 +817,10 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::RequiresTransparentAddressHistory,
     ),
     CapabilitySpec::new(
-        WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
+        WALLET_READ_TRANSPARENT_OUTPOINT_SPEND_STATUS_V1,
         CapabilitySurface::Wallet,
-        Some("zinder.v1.wallet.WalletQuery.TransparentAddressBalance"),
+        Some("zinder.v1.wallet.WalletQuery.TransparentOutpointSpendStatus"),
         AdvertisePolicy::AlwaysOn,
-    ),
-    CapabilitySpec::new(
-        WALLET_READ_TRANSPARENT_UTXO_SET_SUMMARY_V1,
-        CapabilitySurface::Wallet,
-        Some("zinder.v1.wallet.WalletQuery.TransparentUtxoSetSummary"),
-        AdvertisePolicy::AlwaysOn,
-    ),
-    CapabilitySpec::new(
-        WALLET_READ_TRANSPARENT_UTXO_SET_COMMITMENT_V1,
-        CapabilitySurface::Wallet,
-        None,
-        AdvertisePolicy::RequiresUtxoSetCommitment,
     ),
     CapabilitySpec::new(
         EXPLORER_SERVER_INFO_V1,
@@ -1132,18 +1003,6 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::RequiresMaterializedViewStoreAndWalletQuery,
     ),
     CapabilitySpec::new(
-        EXPLORER_UTXO_SET_SUMMARY_V1,
-        CapabilitySurface::Explorer,
-        Some("zinder.v1.explorer.ExplorerQuery.UtxoSetSummary"),
-        AdvertisePolicy::RequiresWalletQuery,
-    ),
-    CapabilitySpec::new(
-        EXPLORER_UTXO_SET_COMMITMENT_V1,
-        CapabilitySurface::Explorer,
-        None,
-        AdvertisePolicy::RequiresWalletQuery,
-    ),
-    CapabilitySpec::new(
         EXPLORER_CHAIN_REORG_HISTORY_V1,
         CapabilitySurface::Explorer,
         Some("zinder.v1.explorer.ExplorerQuery.ChainReorgHistory"),
@@ -1258,24 +1117,6 @@ pub const CAPABILITIES: &[CapabilitySpec] = &[
         AdvertisePolicy::AlwaysOn,
     ),
     CapabilitySpec::new(
-        INGEST_CONTROL_TRANSPARENT_MEMPOOL_OUTPUTS_BY_ADDRESS_V1,
-        CapabilitySurface::Ingest,
-        Some("zinder.v1.ingest.IngestControl.TransparentMempoolOutputsByAddress"),
-        AdvertisePolicy::AlwaysOn,
-    ),
-    CapabilitySpec::new(
-        INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPENDS_BY_OUTPOINT_V1,
-        CapabilitySurface::Ingest,
-        Some("zinder.v1.ingest.IngestControl.TransparentMempoolSpendsByOutpoint"),
-        AdvertisePolicy::AlwaysOn,
-    ),
-    CapabilitySpec::new(
-        INGEST_CONTROL_TRANSPARENT_MEMPOOL_PREVOUTS_V1,
-        CapabilitySurface::Ingest,
-        Some("zinder.v1.ingest.IngestControl.TransparentMempoolOutputsByOutpoint"),
-        AdvertisePolicy::AlwaysOn,
-    ),
-    CapabilitySpec::new(
         INGEST_WRITER_PHASE_V1,
         CapabilitySurface::Ingest,
         None,
@@ -1338,8 +1179,6 @@ pub enum Capability {
     /// Immutable network-upgrade activation metadata
     /// (`wallet.read.network_upgrade_activations_v1`).
     NetworkUpgradeActivations,
-    /// Transparent-address balance (`wallet.address.transparent_balance_v1`).
-    TransparentAddressBalance,
 }
 
 impl Capability {
@@ -1353,7 +1192,6 @@ impl Capability {
             Self::MempoolEvents => WALLET_EVENTS_MEMPOOL_V2,
             Self::ChainValuePools => WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
             Self::NetworkUpgradeActivations => WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1,
-            Self::TransparentAddressBalance => WALLET_ADDRESS_TRANSPARENT_BALANCE_V1,
         }
     }
 }

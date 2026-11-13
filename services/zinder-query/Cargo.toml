@@ -32,7 +32,6 @@ tonic-types.workspace = true
 tracing.workspace = true
 zebra-chain.workspace = true
 zinder-core.workspace = true
-zinder-materialized-views.workspace = true
 zinder-proto.workspace = true
 zinder-runtime.workspace = true
 zinder-source.workspace = true

@@ -221,7 +221,6 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         service_version: env!("CARGO_PKG_VERSION").to_owned(),
         schema_version: u32::from(zinder_store::CURRENT_ARTIFACT_SCHEMA_VERSION.value()),
         reorg_window_blocks: query_config.canonical_reorg_policy.reorg_window_blocks(),
-        materialized_view_preset: Some(zinder_materialized_views::MaterializedViewPreset::Wallet),
         ..WalletEndpointMetadata::default()
     };
     let native_endpoint_capabilities = query.native_endpoint_capabilities().clone();

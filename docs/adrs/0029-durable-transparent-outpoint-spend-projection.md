@@ -5,12 +5,12 @@
 | Status | Accepted |
 | Product | Zinder |
 | Domain | Materialized-view plane, transparent spend resolution |
-| Related | [ADR-0003](0003-canonical-storage-access-boundary.md), [ADR-0017](0017-materialized-view-consumer-and-key-codec.md), [ADR-0026](0026-utxo-set-commitment.md), [ADR-0028](0028-materialized-view-schema-versioning.md), [ADR-0034](0034-exclusive-index-build-stages-and-block-local-spend-replay.md), [Wallet data plane §Transparent Reverse-Spend Resolution](../architecture/wallet-data-plane.md#transparent-reverse-spend-resolution) |
+| Related | [ADR-0003](0003-canonical-storage-access-boundary.md), [ADR-0017](0017-materialized-view-consumer-and-key-codec.md), [ADR-0026](0026-utxo-set-commitment.md), [ADR-0028](0028-materialized-view-schema-versioning.md), [ADR-0034](0034-exclusive-index-build-stages-and-block-local-spend-replay.md), [ADR-0043](0043-owned-transparent-wallet-query-surface.md) |
 
 ## Context
 
-Wallet offline recovery and explorer transaction detail need the transaction
-that spent a transparent output, however long ago the spend happened.
+Explorer transaction detail needs the transaction that spent a transparent
+output, however long ago the spend happened.
 Canonical storage keeps block-local facts only: each block's replay row and the
 transaction-location index. It has no spend-keyed family, so answering "who
 spent this outpoint" from canonical rows alone would mean scanning every later
@@ -19,9 +19,15 @@ block. Canonical storage must also stay ignorant of the materialized-view plane
 
 ## Decision
 
-A bundled materialized-view consumer, `transparent_outpoint_spend`, records
-durable spender identity for every non-coinbase transparent input, keyed by the
-spent outpoint. It is Zinder's only reverse-spend index.
+A bundled Explorer view, `transparent_outpoint_spend`, records durable spender
+identity for every non-coinbase transparent input, keyed by the spent outpoint.
+It is the Explorer plane's reverse-spend index. Its owning capability is
+`explorer.transaction.detail_v4`; no wallet-query capability reads it. Wallet
+spend status, including the spender, comes from the wallet projection's
+`transparent_spent_output` family through
+`WalletQuery.TransparentOutpointSpendStatus`
+([ADR-0043](0043-owned-transparent-wallet-query-surface.md)), so wallet serving
+never depends on the optional materialized-view store.
 
 ### Authority split
 
@@ -68,23 +74,27 @@ orders the two stores.
 
 ### Serving
 
-`ExplorerQuery.TransactionDetail` reads the projection from one
-materialized-view snapshot. It answers only when the consumer state matches the
+`ExplorerQuery.TransactionDetail` is the only reader. It reads the projection
+from one materialized-view snapshot. It answers only when the consumer state matches the
 requested chain epoch's visible tip and the verified coverage spans from the
 transaction's mined height through that tip with a matching hash; otherwise it
 refuses with `ARTIFACT_UNAVAILABLE`. Under that coverage the projection has
 recorded every spend since the output was created, so the handler may treat an
 absent row for an output it already holds as unspent at that epoch.
 
-`WalletQuery.TransparentSpendsByOutpoint` keeps the `contract_revision` 1
-meaning under `wallet.read.transparent_spends_by_outpoint_v1`: durable spender
-identity, not scoped to the reorg window. The release serving-pair query does
-not implement the method and does not advertise the capability.
+The ingest replay host also uses the projection's coverage as the replay
+progress anchor: materialized-view replay has caught up when this consumer
+covers the canonical visible tip
+([ADR-0034](0034-exclusive-index-build-stages-and-block-local-spend-replay.md)).
+That is a progress signal, not a retention authority.
 
 ## Consequences
 
 - Spender identity for a transparent outpoint is durable, so explorer
   transaction detail resolves arbitrarily old spends.
+- Wallets do not read this projection. `WalletQuery.TransparentOutpointSpendStatus`
+  answers spentness from the wallet projection's unspent rows and spender
+  identity from its spent rows.
 - Canonical storage carries no spend-keyed rows and no retention coupling to the
   materialized-view plane, so canonical commits never wait on projection
   progress.
@@ -93,3 +103,16 @@ not implement the method and does not advertise the capability.
   host this projection.
 - The projection stores one row per transparent input plus one index row per
   block, and that storage grows with chain history.
+
+## Revision history
+
+- 2026-11-12: `WalletQuery.TransparentSpendsByOutpoint` and
+  `wallet.read.transparent_spends_by_outpoint_v1` were removed because no
+  packaged consumer called them
+  ([ADR-0043](0043-owned-transparent-wallet-query-surface.md)). The projection
+  is an Explorer view owned by `explorer.transaction.detail_v4`, and the
+  materialized-view wallet preset that also selected it no longer exists.
+- 2026-11-12: Wallet spend status by outpoint returned as
+  `WalletQuery.TransparentOutpointSpendStatus`, served from the wallet
+  projection rather than from this view. This projection stays the Explorer's
+  reverse-spend index.

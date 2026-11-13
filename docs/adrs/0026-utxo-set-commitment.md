@@ -2,14 +2,14 @@
 
 | Field | Value |
 | ----- | ----- |
-| Status | Accepted encoding; runtime admission withdrawn by ADR-0038 |
+| Status | Accepted encoding for wallet-projection evidence; wire surface removed by ADR-0043 |
 | Product | Zinder |
 | Domain | Wire format, UTXO-set accounting, public proto contract, capability discovery |
-| Related | [ADR-0003](0003-canonical-storage-access-boundary.md), [ADR-0011](0011-explorer-freshness-envelope.md), [ADR-0018](0018-capability-gated-optional-payload-fields.md), [ADR-0024](0024-wire-format-rpc-byte-order.md), [ADR-0029](0029-durable-transparent-outpoint-spend-projection.md), [ADR-0038](0038-wallet-runtime-composition-and-capability-discovery.md), [Public interfaces §Wire Conventions](../architecture/public-interfaces.md#wire-conventions) |
+| Related | [ADR-0003](0003-canonical-storage-access-boundary.md), [ADR-0011](0011-explorer-freshness-envelope.md), [ADR-0018](0018-capability-gated-optional-payload-fields.md), [ADR-0024](0024-wire-format-rpc-byte-order.md), [ADR-0029](0029-durable-transparent-outpoint-spend-projection.md), [ADR-0038](0038-wallet-runtime-composition-and-capability-discovery.md), [ADR-0043](0043-owned-transparent-wallet-query-surface.md), [Public interfaces §Wire Conventions](../architecture/public-interfaces.md#wire-conventions) |
 
 ## Context
 
-`WalletQuery.TransparentUtxoSetSummary` reports the chain-wide transparent unspent set as a count and a total value. Two deployments at the same settled tip should be able to prove they hold the same set, and a third party should be able to recompute the same value from a plain UTXO dump. A plain count and sum do not bind set membership: two different sets can share a count and a total.
+The wallet projection keeps a chain-wide transparent unspent-set summary, a count and a total value, as construction and admission evidence. Two deployments at the same settled tip should be able to prove they hold the same set, and a third party should be able to recompute the same value from a plain UTXO dump. A plain count and sum do not bind set membership: two different sets can share a count and a total.
 
 `gettxoutsetinfo` answers this with `hash_serialized`, a digest over the serialized set in a defined iteration order. Zinder does not define a UTXO-set serialization ordering, so that digest is not reproducible here. A commitment that does not depend on iteration order removes the ordering requirement.
 
@@ -47,12 +47,10 @@ The commitment folds every output the wallet projection's unspent-output rows ho
 
 ### Self-describing scheme and comparison rules
 
-The wire message carries the scheme as an enum (`UtxoSetCommitmentScheme { UNSPECIFIED = 0; LTHASH16 = 1; }`), not a string, so it avoids the duplicate-wire-string anti-pattern. Comparison is governed by the scheme:
+The persisted evidence records the scheme as the `UtxoSetCommitmentScheme` enum, not a string. Comparison is governed by the scheme:
 
 - Schemes differ, or either side is absent: not comparable. This is not divergence.
 - Same scheme, same chain epoch, different accumulator bytes: genuine divergence.
-
-The comparison rule lives in the client library (`TransparentUtxoSetSummaryView::comparable_with`), so consumers cannot accidentally compare across schemes.
 
 ### Maintenance: wallet-projection accumulator
 
@@ -61,20 +59,28 @@ Canonical storage holds no UTXO rows and computes no aggregate. The wallet Rocks
 ### Capability gating
 
 The fold has real per-output CPU cost. The original implementation exposed an
-operator boolean that independently enabled
-`wallet.read.transparent_utxo_set_commitment_v1`; no current production
-composition or named consumer owned that switch. ADR-0038 removes the boolean.
-The serving-pair query does not implement the summary. Removal of the unowned
-protocol surface is tracked in
-[issue #63](https://github.com/ZcashFoundation/zinder/issues/63). Retaining or
-reintroducing the commitment requires a concrete production consumer,
-authenticated admission evidence, and an enforced resource budget; a manual
-support flag is not valid evidence.
+operator boolean that independently enabled a wire commitment field; no
+production composition or named consumer owned that switch, and ADR-0038
+removed the boolean. No packaged consumer reads the summary, so
+`WalletQuery.TransparentUtxoSetSummary`, `ExplorerQuery.UtxoSetSummary`, their
+capabilities, and the commitment wire messages are not part of the protocol
+([ADR-0043](0043-owned-transparent-wallet-query-surface.md)). Exposing the
+summary again requires a concrete consumer, authenticated admission evidence
+from the wallet projection, and an enforced resource budget.
 
 ## Consequences
 
-A consumer can verify two Zinder deployments hold the same transparent unspent set at one chain epoch by comparing 32-byte display digests, and can recompute the commitment from a UTXO dump without Zinder-specific plumbing. The cost is one BLAKE2X expansion per output a wallet transition creates, spends, or reverts, plus one per unspent output during cold validation.
+Cold validation can prove that a wallet projection holds exactly the transparent unspent set its evidence claims, and the commitment can be recomputed from a UTXO dump without Zinder-specific plumbing. The cost is one BLAKE2X expansion per output a wallet transition creates, spends, or reverts, plus one per unspent output during cold validation.
 
-The 2048-byte accumulator (not the 32-byte digest) is the canonical commitment carried on the wire, so two accumulators can be summed or differenced off-Zinder to reason about set deltas. A future zcashd-comparable membership rule or a wider lane width lands as a new scheme value, leaving `LtHash16` stable.
+The 2048-byte accumulator (not the 32-byte digest) is the canonical commitment, so two accumulators can be summed or differenced to reason about set deltas. A future zcashd-comparable membership rule or a wider lane width lands as a new scheme value, leaving `LtHash16` stable.
 
-The committed unspent set is also the spentness authority in the wallet plane's authority split ([ADR-0029]): absence from `TransparentUnspentOutputsByOutpoint` decides spent-versus-unspent, while the durable spend projection resolves only spender identity.
+The committed unspent set is also the spentness authority in the wallet plane's authority split ([ADR-0029]): the wallet projection's unspent rows decide spent-versus-unspent, while the durable spend projection resolves only spender identity.
+
+## Revision history
+
+- 2026-11-12: The summary and commitment are wallet-projection evidence only.
+  `WalletQuery.TransparentUtxoSetSummary`, `ExplorerQuery.UtxoSetSummary`,
+  their capabilities, the commitment wire messages, and
+  `TransparentUtxoSetSummaryView::comparable_with` were removed because no
+  packaged consumer read them
+  ([ADR-0043](0043-owned-transparent-wallet-query-surface.md)).

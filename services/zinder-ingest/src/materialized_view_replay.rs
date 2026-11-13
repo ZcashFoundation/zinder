@@ -30,7 +30,7 @@ use zinder_materialized_views::{
     BlockKeyedConsumer, BlockProductionTimeConsumer, CONVENTIONAL_FEE_DISTRIBUTION_CONSUMER_NAME,
     ChainEventBlockJoin, ChainEventDispatchConsumers, ChainEventDispatchInputs,
     ConventionalFeeDistributionConsumer, MaterializedViewConsumer, MaterializedViewConsumerName,
-    MaterializedViewDispatch, MaterializedViewPreset, MaterializedViewState, MaterializedViewStore,
+    MaterializedViewDispatch, MaterializedViewState, MaterializedViewStore,
     MaterializedViewStoreOptions, MaterializedViewWriteMeasurement,
     PAID_FEE_DISTRIBUTION_CONSUMER_NAME, TRANSACTION_COMPONENT_SUMMARY_CONSUMER_NAME,
     TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY,
@@ -315,15 +315,14 @@ fn effective_replay_batch_blocks(
     }
 }
 
-/// Opens the replay-host-owned materialized-view store nested under a canonical store path.
+/// Opens the replay-host-owned Explorer view store nested under a canonical
+/// store path, admitting only this release's exact bundled consumer manifest.
 pub fn open_primary_materialized_view_store(
     canonical_path: &Path,
-    materialized_view_preset: MaterializedViewPreset,
     rocksdb_resource_budget: RocksDbResourceBudget,
 ) -> Result<MaterializedViewStore, zinder_materialized_views::MaterializedViewStoreError> {
-    MaterializedViewStore::open_with_materialized_view_preset(
+    MaterializedViewStore::open_explorer_views(
         MaterializedViewStore::path_for_canonical(canonical_path),
-        materialized_view_preset,
         MaterializedViewStoreOptions {
             sync_writes: false,
             rocksdb_resource_budget,

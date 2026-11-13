@@ -128,4 +128,9 @@ enum ErrorReason {
   // metadata carries `first_available_height`. Waiting never clears it;
   // query a store with complete history.
   CANONICAL_HISTORY_UNAVAILABLE = 52;
+
+  // INVALID_ARGUMENT family.
+  // A `WalletQuery.TransparentOutpointSpendStatus` request carried no
+  // outpoints or more than the 1,024-outpoint per-request cap.
+  TRANSPARENT_OUTPOINT_COUNT_OUT_OF_RANGE = 53;
 }

@@ -2,11 +2,7 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::{BlockHash, BlockHeight, ChainEpoch, TransactionId};
-
-/// Hard cap on the number of transparent outpoints one output-resolution
-/// request may resolve.
-pub const MAX_TRANSPARENT_OUTPUTS_PER_REQUEST: usize = 1024;
+use crate::{BlockHash, BlockHeight, BlockId, TransactionId};
 
 /// Hash of a transparent address `scriptPubKey`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -61,15 +57,6 @@ impl TransparentOutPoint {
     pub fn is_coinbase_sentinel(self) -> bool {
         self == Self::COINBASE_SENTINEL
     }
-}
-
-/// Resolved transparent output referenced by an outpoint.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TransparentOutput {
-    /// Output value in zatoshis.
-    pub value_zat: u64,
-    /// Raw scriptPubKey bytes.
-    pub script_pub_key: Vec<u8>,
 }
 
 /// Transparent input fact local to a mined transaction.
@@ -164,15 +151,6 @@ impl TransparentOutputArtifact {
             block_hash,
         }
     }
-
-    /// Converts the persisted artifact into the public output payload.
-    #[must_use]
-    pub fn into_output(self) -> TransparentOutput {
-        TransparentOutput {
-            value_zat: self.value_zat,
-            script_pub_key: self.script_pub_key,
-        }
-    }
 }
 
 /// Unspent transparent output projected for one transparent address.
@@ -216,6 +194,44 @@ impl TransparentUnspentOutput {
             block_hash,
         }
     }
+}
+
+/// Maximum number of outpoints one transparent outpoint spend-status request
+/// may carry.
+///
+/// The bound keeps one request to a fixed number of point reads. Typed clients
+/// split larger batches into requests of at most this size at one pinned epoch.
+pub const MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST: usize = 1_024;
+
+/// Spend status of one transparent outpoint on the canonical chain of one
+/// chain epoch.
+///
+/// The status covers mined transactions only, from height 1 through the
+/// epoch's visible tip. A spend that is still in the mempool leaves the output
+/// [`Self::Unspent`].
+///
+/// The three variants partition every outpoint, so the enum is exhaustive and
+/// a caller's `match` must handle each one. An indexer that cannot prove an
+/// absence returns an error instead of a status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransparentOutpointSpendStatus {
+    /// A mined transaction created the output, and no mined transaction
+    /// spends it.
+    Unspent,
+    /// A mined transaction spends the output.
+    SpentBy {
+        /// Transaction that spends the output.
+        transaction_id: TransactionId,
+        /// Transparent input index of the spend within that transaction.
+        input_index: u32,
+        /// Block that mined the spending transaction.
+        block: BlockId,
+    },
+    /// No mined transaction created an output at this outpoint.
+    ///
+    /// This includes the coinbase input sentinel and the genesis coinbase
+    /// output, which is unspendable and never indexed.
+    NotFound,
 }
 
 /// Canonical transparent spend fact resolved from a spend-index row and the
@@ -312,31 +328,12 @@ impl TransparentSpendFact {
     }
 }
 
-/// One entry in a transparent-output resolution response.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TransparentOutputEntry {
-    /// Outpoint requested by the caller.
-    pub outpoint: TransparentOutPoint,
-    /// Resolved output, when found.
-    pub output: Option<TransparentOutput>,
-}
-
-/// Transparent-output resolution response bound to one chain epoch.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TransparentOutputsByOutpointResponse {
-    /// Chain epoch the response binds to.
-    pub chain_epoch: ChainEpoch,
-    /// Per-outpoint resolution result, in input order.
-    pub entries: Vec<TransparentOutputEntry>,
-}
-
-/// Canonical-chain spend of one transparent outpoint, projected to the
-/// reverse-spend fields a getspentinfo-equivalent consumer needs.
+/// Canonical-chain spend of one transparent outpoint: the spending
+/// transaction, its input index, and the block that mined it.
 ///
 /// Derived from a [`TransparentSpendFact`] by keeping the spending-side
-/// identity (transaction, input index, mining block) and dropping the
-/// spent-output value and script, which the canonical output resolver already
-/// serves.
+/// identity and dropping the spent-output value and script. The durable
+/// `transparent_outpoint_spend` Explorer view stores these entries.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransparentSpendEntry {
     /// Outpoint that was spent.
@@ -363,30 +360,4 @@ impl TransparentSpendEntry {
             spending_block_hash: fact.block_hash,
         }
     }
-}
-
-/// Canonical reverse-spend resolution response bound to one chain epoch.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TransparentSpendsByOutpointResponse {
-    /// Chain epoch the response binds to.
-    pub chain_epoch: ChainEpoch,
-    /// Spends found for the requested outpoints. Unspent outpoints produce no
-    /// entry; consumers key results by `spent_outpoint`.
-    pub spends: Vec<TransparentSpendEntry>,
-}
-
-/// Canonical unspent-output probe response bound to one chain epoch.
-///
-/// The gettxout-equivalent surface: each entry is an outpoint that the
-/// canonical chain has and that carries no canonical spend at the bound epoch
-/// (null-if-spent). Spent or never-existed outpoints produce no entry, so every
-/// entry's [`TransparentOutputEntry::output`] is present. Mempool-aware
-/// unspent-ness composes with the mempool spend resolver: a caller subtracts
-/// those spends from this canonical result.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TransparentUnspentOutputsByOutpointResponse {
-    /// Chain epoch the response binds to.
-    pub chain_epoch: ChainEpoch,
-    /// Unspent outputs found for the requested outpoints, keyed by `outpoint`.
-    pub entries: Vec<TransparentOutputEntry>,
 }

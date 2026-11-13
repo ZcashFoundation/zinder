@@ -26,7 +26,7 @@ use zinder_ingest::{
     spawn_runtime_memory_metrics_task, spawn_transaction_component_backfill_task,
     spawn_upstream_health_probe_task,
 };
-use zinder_materialized_views::{MaterializedViewPreset, MaterializedViewStore};
+use zinder_materialized_views::MaterializedViewStore;
 use zinder_runtime::{
     ComposedReadiness, OpsEndpointHandle, OpsServerError, Readiness, ReadinessInput,
     ReadinessState, RuntimeService, StartupPhase, cancel_on_terminating_signal,
@@ -782,11 +782,7 @@ async fn run_materialized_view_plane(
     let Some(canonical) = open_canonical_secondary_when_published(&spec, &cancel).await else {
         return;
     };
-    let Some(materialized_view_preset) = explorer_view_preset(spec.explorer_views) else {
-        return;
-    };
-    let Some(materialized_view_store) =
-        open_and_admit_materialized_view_store(&spec, materialized_view_preset, &readiness)
+    let Some(materialized_view_store) = open_and_admit_materialized_view_store(&spec, &readiness)
     else {
         return;
     };
@@ -795,7 +791,6 @@ async fn run_materialized_view_plane(
         target: "zinder::ingest",
         event = "explorer_views_admitted",
         explorer_views = true,
-        preset = materialized_view_preset.as_str(),
         "Explorer views admitted after store open"
     );
     if let Err(error) = seed_backfill_owned_consumer_cursors(
@@ -841,12 +836,10 @@ async fn run_materialized_view_plane(
 
 fn open_and_admit_materialized_view_store(
     spec: &MaterializedViewPlaneSpec,
-    preset: MaterializedViewPreset,
     readiness: &Readiness,
 ) -> Option<MaterializedViewStore> {
     let materialized_view_store = match open_primary_materialized_view_store(
         &spec.storage_path,
-        preset,
         spec.materialized_view_rocksdb_budget,
     ) {
         Ok(materialized_view_store) => materialized_view_store,
@@ -861,12 +854,10 @@ fn open_and_admit_materialized_view_store(
             return None;
         }
     };
-    readiness.set_materialized_view_workload(
-        preset.as_str(),
-        preset
-            .consumer_schemas()
-            .iter()
-            .map(|schema| schema.name.as_str().to_owned())
+    readiness.set_materialized_view_identities(
+        materialized_view_store
+            .consumer_identities()
+            .map(|identity| identity.as_str().to_owned())
             .collect(),
     );
     Some(materialized_view_store)
@@ -931,14 +922,6 @@ async fn await_materialized_view_workers(
 
 const fn explorer_views_start_backfills(explorer_views: bool) -> bool {
     explorer_views
-}
-
-const fn explorer_view_preset(explorer_views: bool) -> Option<MaterializedViewPreset> {
-    if explorer_views {
-        Some(MaterializedViewPreset::Explorer)
-    } else {
-        None
-    }
 }
 
 fn record_explorer_views_admitted(admitted: bool) {
@@ -1320,10 +1303,9 @@ mod tests {
 
     use super::{
         CanonicalControlTasks, MaterializedViewPlaneSpec, NodeCapabilities, NodeCapability,
-        ZebraJsonRpcSource, coordinate_canonical_writer_lifecycle, explorer_view_preset,
-        explorer_views_start_backfills, materialized_view_secondary_path,
-        require_ingest_node_capabilities, run_materialized_view_plane, supervise_canonical_writer,
-        writer_readiness_for,
+        ZebraJsonRpcSource, coordinate_canonical_writer_lifecycle, explorer_views_start_backfills,
+        materialized_view_secondary_path, require_ingest_node_capabilities,
+        run_materialized_view_plane, supervise_canonical_writer, writer_readiness_for,
     };
 
     fn writer_readiness() -> (zinder_runtime::Readiness, zinder_runtime::ComposedReadiness) {
@@ -1388,11 +1370,6 @@ mod tests {
     fn explorer_views_task_composition_matches_admission() {
         assert!(!explorer_views_start_backfills(false));
         assert!(explorer_views_start_backfills(true));
-        assert!(explorer_view_preset(false).is_none());
-        assert_eq!(
-            explorer_view_preset(true),
-            Some(zinder_materialized_views::MaterializedViewPreset::Explorer)
-        );
     }
 
     #[tokio::test]
@@ -1431,7 +1408,6 @@ mod tests {
         .await;
 
         let report = readiness.report();
-        assert!(report.materialized_view_preset.is_none());
         assert!(report.materialized_view_identities.is_empty());
         assert!(materialized_view_path.is_dir());
         assert_eq!(fs::read(&sentinel_path)?, b"leave this store untouched");

@@ -9,5 +9,5 @@ mod reflection;
 mod single_artifact_lookup;
 mod stream_cancellation;
 mod transaction_broadcast;
-mod transparent_address_balance;
+mod transparent_outpoint_spend_status;
 mod wallet_serving_query;

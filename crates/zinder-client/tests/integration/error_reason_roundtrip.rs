@@ -190,6 +190,7 @@ fn every_error_reason_round_trips_through_proto_str_name() {
         WireErrorReason::ServiceNotReady,
         WireErrorReason::TransactionNotFound,
         WireErrorReason::CanonicalHistoryUnavailable,
+        WireErrorReason::TransparentOutpointCountOutOfRange,
     ];
 
     for reason in reasons {

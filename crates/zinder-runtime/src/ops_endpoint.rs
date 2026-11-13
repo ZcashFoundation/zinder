@@ -305,8 +305,6 @@ struct ReadinessResponseBody {
     current_height: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     target_height: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    materialized_view_preset: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     materialized_view_identities: Vec<String>,
 }
@@ -328,7 +326,6 @@ fn readyz_handler(readiness: &Readiness) -> (StatusCode, Json<ReadinessResponseB
         cause: report.cause,
         current_height: report.current_height,
         target_height: report.target_height,
-        materialized_view_preset: report.materialized_view_preset,
         materialized_view_identities: report.materialized_view_identities,
     };
 
@@ -350,24 +347,14 @@ fn metrics_handler(state: &MetricsState) -> (StatusCode, String) {
 
 fn record_readiness_metrics(state: &MetricsState) {
     let report = state.readiness.report();
-    if let Some(materialized_view_preset) = &report.materialized_view_preset {
+    for materialized_view_identity in &report.materialized_view_identities {
         metrics::gauge!(
-            "zinder_materialized_view_workload_info",
+            "zinder_materialized_view_identity_info",
             "service" => state.service_name,
             "network" => state.network_name,
-            "preset" => materialized_view_preset.clone(),
+            "identity" => materialized_view_identity.clone(),
         )
         .set(1.0);
-        for materialized_view_identity in &report.materialized_view_identities {
-            metrics::gauge!(
-                "zinder_materialized_view_identity_info",
-                "service" => state.service_name,
-                "network" => state.network_name,
-                "preset" => materialized_view_preset.clone(),
-                "identity" => materialized_view_identity.clone(),
-            )
-            .set(1.0);
-        }
     }
     let active_cause = report.cause.metric_label();
     for cause in crate::ReadinessCause::ALL_METRIC_LABELS {

@@ -11,7 +11,7 @@ use zinder_proto::capabilities::{
     EXPLORER_MEMPOOL_SNAPSHOT_V1, EXPLORER_MIGRATION_COHORTS_V1,
     EXPLORER_MIGRATION_DENOMINATIONS_V1, EXPLORER_MIGRATION_OVERVIEW_V1,
     EXPLORER_NETWORK_UPGRADE_STATUS_V1, EXPLORER_OVERVIEW_SNAPSHOT_V1,
-    EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1, EXPLORER_UTXO_SET_SUMMARY_V1,
+    EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1,
 };
 use zinder_proto::v1::{explorer, wallet};
 
@@ -681,58 +681,24 @@ fn transparent_address_deltas_response_carries_freshness_and_cursor() -> eyre::R
 }
 
 #[test]
-fn utxo_set_summary_response_round_trips_through_prost() -> eyre::Result<()> {
-    let response = explorer::UtxoSetSummaryResponse {
-        freshness: Some(explorer::ExplorerFreshness {
-            chain_view: Some(wallet::ChainView {
-                chain_epoch: Some(wallet::ChainEpoch::default()),
-                indexed_tip: None,
-                upstream_tip: None,
-                materialized_views: None,
-            }),
-            snapshot_age_millis: 0,
-            capability_version: EXPLORER_UTXO_SET_SUMMARY_V1.to_owned(),
-            unavailable: Vec::new(),
-        }),
-        utxo_count: 4096,
-        total_value_zat: 2_100_000_000_000_000,
-        summarized_height: 2_500_000,
-        commitment: Some(wallet::TransparentUtxoSetCommitment {
-            scheme: wallet::UtxoSetCommitmentScheme::Lthash16 as i32,
-            commitment: vec![0xcd; 2048],
-        }),
+fn explorer_server_info_round_trips_materialized_view_identities() -> eyre::Result<()> {
+    let server_info = explorer::ExplorerServerInfo {
+        common: None,
+        vendor: "Zinder".to_owned(),
+        materialized_view_status: None,
+        materialized_view_identities: vec![
+            "block_summary".to_owned(),
+            "transparent_outpoint_spend".to_owned(),
+        ],
     };
-    let decoded = round_trip(&response)?;
+    let decoded = round_trip(&server_info)?;
 
-    assert_eq!(decoded.utxo_count, 4096);
-    assert_eq!(decoded.total_value_zat, 2_100_000_000_000_000);
-    assert_eq!(decoded.summarized_height, 2_500_000);
-    assert_eq!(
-        decoded
-            .commitment
-            .ok_or_else(|| eyre!("commitment present after round-trip"))?
-            .commitment
-            .len(),
-        2048
+    assert_eq!(decoded, server_info);
+    assert!(
+        round_trip(&explorer::ExplorerServerInfo::default())?
+            .materialized_view_identities
+            .is_empty()
     );
-    assert_eq!(
-        decoded
-            .freshness
-            .ok_or_else(|| eyre!("freshness envelope missing"))?
-            .capability_version,
-        EXPLORER_UTXO_SET_SUMMARY_V1
-    );
-    Ok(())
-}
-
-#[test]
-fn utxo_set_summary_request_round_trips_the_epoch_pin() -> eyre::Result<()> {
-    let request = explorer::UtxoSetSummaryRequest {
-        at_epoch_id: Some(77),
-    };
-    let decoded = round_trip(&request)?;
-
-    assert_eq!(decoded.at_epoch_id, Some(77));
     Ok(())
 }
 

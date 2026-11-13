@@ -14,12 +14,8 @@ use tonic::Request;
 use zinder_core::{
     BlockHeight, BlockHeightRange, BlockSelector, Network, RawTransactionBytes, ShieldedProtocol,
     SubtreeRootIndex, SubtreeRootRange, TransactionId, TransparentAddressScriptHash,
-    TransparentOutPoint,
 };
-use zinder_proto::v1::wallet::{
-    self, AddressLookup, TransparentAddressBalanceRequest, address_lookup,
-    wallet_query_server::WalletQuery as WalletQueryService,
-};
+use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
 use zinder_query::{
     AdmittedIngestControl, MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
     TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest,
@@ -169,13 +165,9 @@ const SERVING_QUERY_OPERATIONS: &[&str] = &[
     "transaction_by_id",
     "transaction_at_block_index",
     "raw_transaction",
-    "transparent_outputs_by_outpoint",
-    "transparent_spends_by_outpoint",
-    "transparent_unspent_outputs_by_outpoint",
     "transparent_address_unspent_outputs",
     "transparent_address_tx_ids_in_range",
     "transparent_address_balance",
-    "transparent_utxo_set_summary",
     "tree_state_at",
     "latest_tree_state_checkpoint",
     "subtree_roots_in_range",
@@ -216,27 +208,9 @@ fn every_serving_query_request_records_exactly_one_sample() -> eyre::Result<()> 
 }
 
 #[test]
-fn release_transparent_address_balance_records_only_the_domain_read() -> eyre::Result<()> {
+fn transparent_address_balance_records_its_own_rejection() -> eyre::Result<()> {
     let exposition = render_metrics_of(async {
         let release = ReleaseAdapter::open().await?;
-        let gated = WalletQueryService::transparent_address_balance(
-            &release.adapter,
-            Request::new(TransparentAddressBalanceRequest {
-                addresses: vec![script_hash_lookup(
-                    TransparentAddressScriptHash::from_bytes([0x11; 32]),
-                )],
-                at_epoch_id: None,
-            }),
-        )
-        .await;
-        match gated {
-            Err(status) if status.code() == tonic::Code::FailedPrecondition => {}
-            other => {
-                return Err(eyre!(
-                    "release native balance passed its capability check: {other:?}"
-                ));
-            }
-        }
         let over_cap = (0..=MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES)
             .map(|index| {
                 let mut script_hash = [0_u8; 32];
@@ -268,7 +242,7 @@ fn release_transparent_address_balance_records_only_the_domain_read() -> eyre::R
     assert_eq!(
         operation_count(&exposition, "transparent_address_balance"),
         1,
-        "the capability-gated adapter request records nothing:\n{exposition}"
+        "{exposition}"
     );
     Ok(())
 }
@@ -321,19 +295,6 @@ async fn request_every_transaction_read(query: &WalletServingQuery<()>) {
 
 async fn request_every_transparent_read(query: &WalletServingQuery<()>) {
     let address_script_hash = TransparentAddressScriptHash::from_bytes([0x11; 32]);
-    let outpoints = vec![TransparentOutPoint::new(
-        TransactionId::from_bytes([0x22; 32]),
-        0,
-    )];
-    let _ = query
-        .transparent_outputs_by_outpoint(outpoints.clone(), None)
-        .await;
-    let _ = query
-        .transparent_spends_by_outpoint(outpoints.clone(), None)
-        .await;
-    let _ = query
-        .transparent_unspent_outputs_by_outpoint(outpoints, None)
-        .await;
     let _ = query
         .transparent_address_unspent_outputs(
             TransparentAddressUnspentOutputsRequest {
@@ -350,13 +311,11 @@ async fn request_every_transparent_read(query: &WalletServingQuery<()>) {
             end_height: BlockHeight::new(2),
             max_entries: NonZeroU32::MIN,
             from_cursor: None,
-            descending: false,
         })
         .await;
     let _ = query
         .transparent_address_balance(vec![address_script_hash], None)
         .await;
-    let _ = query.transparent_utxo_set_summary(None).await;
 }
 
 async fn request_chain_event_reads(query: &WalletServingQuery<()>) {
@@ -389,14 +348,6 @@ fn shared_serving_query() -> eyre::Result<(WalletServingQuery<()>, WalletServing
         activations,
     );
     Ok((query, store_fixture))
-}
-
-fn script_hash_lookup(script_hash: TransparentAddressScriptHash) -> AddressLookup {
-    AddressLookup {
-        selector: Some(address_lookup::Selector::ScriptHash(
-            script_hash.as_bytes().to_vec(),
-        )),
-    }
 }
 
 /// Release native adapter over the admitted serving query, with the fixtures

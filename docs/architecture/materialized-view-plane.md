@@ -37,29 +37,37 @@ untouched and no materialized-view secondary, store, tailer, replay sampler,
 or historical backfill starts. It does not change canonical-writer or
 wallet-projection ownership or readiness.
 
-`explorer_views = true` selects `MaterializedViewPreset::Explorer` and
-preserves the complete Explorer workload. Wallet projection and wallet-serving readiness
-remain owned by `zinder-projector`, `zinder-wallet-rocksdb`, and the wallet
-readers; that projection is not an operator-selectable materialized-view
-profile.
+`explorer_views = true` opens the Explorer view store with every bundled
+consumer. Every bundled consumer is an Explorer view; there is no wallet
+workload in the materialized-view store
+([ADR-0043](../adrs/0043-owned-transparent-wallet-query-surface.md)). Wallet
+projection and wallet-serving readiness remain owned by `zinder-projector`,
+`zinder-wallet-rocksdb`, and the wallet readers.
 
 When the field is true, the request is printed by `--print-config` and the
 admitted state is emitted in bounded ingest startup evidence. Wallet-serving
 deployment files set `explorer_views = false`; the Explorer Compose overlay
 sets `ZINDER_INGEST__EXPLORER_VIEWS=true`.
 
-An enabled workload is admitted only after the selected preset's persisted
-manifest matches exactly. Reopening the same preset is supported; changing the
-consumer set fails before mutation and requires a fresh materialized-view
-store. This selection does not introduce a storage-layout migration. Enabled
+An enabled store is admitted only after its persisted manifest matches this
+release's bundled consumer set exactly. `MaterializedViewStore::open_explorer_views`
+and `MaterializedViewStore::open_explorer_views_secondary` preflight the
+manifest before the database opens. A recorded identity this release does not
+bundle fails with `ConsumerNotDeclared`, and a recorded subset fails with
+`ExplorerViewManifestRequiresFreshStore`. Neither failure mutates the store;
+the operator rebuilds Explorer views on a fresh materialized-view path. A store
+built before the `transparent_address_transaction_history` consumer was
+retired records that identity and needs this rebuild. This selection does not introduce a storage-layout migration. Enabled
 materialized views require genesis-complete canonical history or the
 authenticated height-0 checkpoint: checkpoint heights above zero are not
 admitted because cumulative address views can under-report when their producing
 blocks precede the first retained height.
 
-Readiness reports materialized-view preset and consumer identities only after
-enabled-store admission. Disabled ingest therefore omits materialized-view
-workload fields rather than claiming view readiness.
+Readiness reports consumer identities in `materialized_view_identities` only
+after enabled-store admission, and only from the process that admitted the
+store. Disabled ingest therefore omits the field rather than claiming view
+readiness. `ExplorerServerInfo.materialized_view_identities` carries the same
+identities on the Explorer endpoint. Wallet endpoints carry none.
 
 A store built with `ingest.run_overrides.checkpoint_height` at height 0 may host
 enabled materialized views because height 0 is the authenticated predecessor
@@ -123,8 +131,8 @@ cleanup.
 ## Bundled consumer registry
 
 `bundled_materialized_view_consumer_definitions()` is the single, closed list
-of consumers bundled with a release. Each `MaterializedViewConsumerDefinition`
-declares the schema, product role, preset membership, and
+of Explorer views bundled with a release. Each
+`MaterializedViewConsumerDefinition` declares the schema and the
 `MaterializedViewDispatch`:
 
 | Dispatch | Receives | Recovery source |
@@ -136,13 +144,13 @@ declares the schema, product role, preset membership, and
 | `MempoolEvents` | Mempool events, once a host drives them | Mempool events |
 | `CanonicalBackfillOnly` | No events | Canonical backfill |
 
-The store derives its preset schema lists and chain-event cursor lists from
+The store derives its exact consumer manifest and chain-event cursor lists from
 the registry. The ingest replay host constructs each selected chain-event
 consumer from its entry and derives its cursor-agreement and backfill-owned
 sets from the join kind. Neither side keeps its own consumer list, so a
 registered chain-event consumer cannot be left out of chain-event dispatch.
 No bundled runtime drives `MempoolEvents` consumers yet.
-`mempool_event_counts` is registered and included in the Explorer preset, but
+`mempool_event_counts` is registered and included in the Explorer manifest, but
 nothing calls `MaterializedViewStore::write_mempool_event`, so its column
 family receives no rows.
 
@@ -248,8 +256,7 @@ When adding a consumer:
 3. add reusable key codecs to `zinder-core::wire`;
 4. implement apply and revert behavior in one atomic batch, encoding index
    payloads in a deterministic order;
-5. add one registry entry declaring the schema, role, preset membership, and
-   dispatch;
+5. add one registry entry declaring the schema and dispatch;
 6. persist truthful materialized-view coverage when the public method needs it;
 7. define the fresh-store recovery behavior for a schema change;
 8. expose the method under an explorer capability; and

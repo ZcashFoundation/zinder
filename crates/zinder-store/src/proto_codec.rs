@@ -11,8 +11,7 @@ use zinder_core::{
     ArtifactSchemaVersion, BlockHash, BlockHeight, ChainEpoch, ChainEpochId, ChainTipMetadata,
     CompactBlockArtifact, CompactChainMetadata, CompactShieldedAction, CompactTransaction,
     CompactTransactionData, MempoolEntry, MempoolEvictionReason, TransactionId,
-    TransparentAddressScriptHash, TransparentMempoolOutput, TransparentMempoolSpend,
-    TransparentOutPoint, TransparentOutput, TransparentOutputEntry, TransparentSpendEntry,
+    TransparentMempoolOutput, TransparentMempoolSpend, TransparentOutPoint, TransparentSpendEntry,
     UnixTimestampMillis,
 };
 use zinder_proto::v1::wallet;
@@ -303,36 +302,11 @@ pub fn outpoint_message(outpoint: &TransparentOutPoint) -> wallet::OutPoint {
     }
 }
 
-/// Encodes a [`TransparentOutput`] into the wallet protocol message.
-#[must_use]
-pub fn transparent_output_message(output: TransparentOutput) -> wallet::TransparentOutput {
-    wallet::TransparentOutput {
-        value_zat: output.value_zat,
-        script_pub_key: output.script_pub_key,
-    }
-}
-
-/// Encodes a [`TransparentOutputEntry`] into the wallet protocol message.
-///
-/// Used by both the canonical `WalletQuery.TransparentOutputsByOutpoint` surface and
-/// the live-mempool `WalletQuery.TransparentMempoolOutputsByOutpoint` surface, so the
-/// two sides share one wire shape and one encoder.
-#[must_use]
-pub fn transparent_output_entry_message(
-    entry: TransparentOutputEntry,
-) -> wallet::TransparentOutputEntry {
-    wallet::TransparentOutputEntry {
-        outpoint: Some(outpoint_message(&entry.outpoint)),
-        output: entry.output.map(transparent_output_message),
-    }
-}
-
 /// Encodes a [`TransparentSpendEntry`] into the wallet protocol message.
 ///
-/// The canonical reverse-spend resolver `WalletQuery.TransparentSpendsByOutpoint`
-/// projects each found spend through this one encoder so the outpoint, spending
-/// transaction id, input index, and spending-block hash all route through the
-/// shared wire helpers.
+/// `ExplorerQuery.TransactionDetail` projects each spent output through this
+/// one encoder so the outpoint, spending transaction id, input index, and
+/// spending-block hash all route through the shared wire helpers.
 #[must_use]
 pub fn transparent_spend_message(entry: &TransparentSpendEntry) -> wallet::TransparentSpend {
     wallet::TransparentSpend {
@@ -417,11 +391,7 @@ pub fn event_stream_start_message(start: &EventStreamStartPosition) -> wallet::E
 }
 
 /// Encodes a [`TransparentMempoolOutput`] into the wallet protocol message.
-///
-/// Public so the writer-side mempool point-lookup adapter can encode
-/// responses without re-deriving the field layout.
-#[must_use]
-pub fn transparent_mempool_output_message(
+fn transparent_mempool_output_message(
     transparent_output: &TransparentMempoolOutput,
 ) -> wallet::TransparentMempoolOutput {
     wallet::TransparentMempoolOutput {
@@ -433,10 +403,7 @@ pub fn transparent_mempool_output_message(
 }
 
 /// Encodes a [`TransparentMempoolSpend`] into the wallet protocol message.
-///
-/// Public for the same reason as [`transparent_mempool_output_message`].
-#[must_use]
-pub fn transparent_mempool_spend_message(
+fn transparent_mempool_spend_message(
     transparent_spend: &TransparentMempoolSpend,
 ) -> wallet::TransparentMempoolSpend {
     wallet::TransparentMempoolSpend {
@@ -532,14 +499,6 @@ pub enum MempoolDecodeError {
         /// Static field path that was missing.
         field: &'static str,
     },
-    /// A 32-byte hash field carried the wrong length.
-    #[error("{field} expected 32 bytes, got {actual}")]
-    WrongHashLength {
-        /// Static field path that carried the wrong length.
-        field: &'static str,
-        /// Observed length on the wire.
-        actual: usize,
-    },
     /// A fixed-width byte field carried the wrong length.
     #[error("{field} expected {expected} bytes, got {actual}")]
     WrongLength {
@@ -591,7 +550,6 @@ impl MempoolDecodeError {
         match self {
             Self::MalformedMessage { field }
             | Self::MissingField { field }
-            | Self::WrongHashLength { field, .. }
             | Self::WrongLength { field, .. }
             | Self::InvalidRpcHashHex { field, .. }
             | Self::Overflow { field, .. }
@@ -713,72 +671,6 @@ pub fn mempool_event_envelope_from_message(
     })
 }
 
-/// Decodes a wallet-protocol [`wallet::OutPoint`] into the canonical type.
-///
-/// `field` is the field path of the outpoint message itself (used in
-/// diagnostics if `transaction_id` carries the wrong length). Callers
-/// pre-unwrap the `Option<wallet::OutPoint>` and emit
-/// [`MempoolDecodeError::MissingField`] with their own precise path when
-/// the message is absent.
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "OutPoint is a tiny POD; taking by value keeps caller ergonomics symmetric with the message constructor."
-)]
-pub fn outpoint_from_message(
-    field: &'static str,
-    message: wallet::OutPoint,
-) -> Result<TransparentOutPoint, MempoolDecodeError> {
-    Ok(TransparentOutPoint::new(
-        transaction_id_from_rpc_hex(field, &message.transaction_id)?,
-        message.output_index,
-    ))
-}
-
-/// Decodes a wallet-protocol [`wallet::TransparentMempoolOutput`] into the canonical type.
-///
-/// Public for the same reason as [`transparent_mempool_output_message`]:
-/// writer-side and reader-side adapters share one decoder.
-pub fn transparent_mempool_output_from_message(
-    message: wallet::TransparentMempoolOutput,
-) -> Result<TransparentMempoolOutput, MempoolDecodeError> {
-    let outpoint_message = message.outpoint.ok_or(MempoolDecodeError::MissingField {
-        field: "transparent_output.outpoint",
-    })?;
-    Ok(TransparentMempoolOutput {
-        address_script_hash: TransparentAddressScriptHash::from_bytes(fixed_32_bytes(
-            "transparent_output.address_script_hash",
-            message.address_script_hash,
-        )?),
-        script_pub_key: message.script_pub_key,
-        outpoint: outpoint_from_message("transparent_output.outpoint", outpoint_message)?,
-        value_zat: message.value_zat,
-    })
-}
-
-/// Decodes a wallet-protocol [`wallet::TransparentMempoolSpend`] into the canonical type.
-///
-/// Public for the same reason as [`transparent_mempool_spend_message`].
-pub fn transparent_mempool_spend_from_message(
-    message: wallet::TransparentMempoolSpend,
-) -> Result<TransparentMempoolSpend, MempoolDecodeError> {
-    let spent_outpoint_message =
-        message
-            .spent_outpoint
-            .ok_or(MempoolDecodeError::MissingField {
-                field: "transparent_spend.spent_outpoint",
-            })?;
-    Ok(TransparentMempoolSpend {
-        spent_outpoint: outpoint_from_message(
-            "transparent_spend.spent_outpoint",
-            spent_outpoint_message,
-        )?,
-        spending_transaction_id: transaction_id_from_rpc_hex(
-            "transparent_spend.spending_transaction_id",
-            &message.spending_transaction_id,
-        )?,
-    })
-}
-
 fn mempool_eviction_reason_from_message(
     field: &'static str,
     encoded: i32,
@@ -813,11 +705,4 @@ fn block_hash_from_rpc_hex(
         field,
         reason: error.to_string(),
     })
-}
-
-fn fixed_32_bytes(field: &'static str, bytes: Vec<u8>) -> Result<[u8; 32], MempoolDecodeError> {
-    let actual = bytes.len();
-    bytes
-        .try_into()
-        .map_err(|_| MempoolDecodeError::WrongHashLength { field, actual })
 }

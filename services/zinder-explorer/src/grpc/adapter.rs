@@ -49,14 +49,13 @@ use zinder_proto::v1::{
         TransactionHistoryResponse, TransparentAddressActivityRequest,
         TransparentAddressActivityResponse, TransparentAddressDeltasRequest,
         TransparentAddressDeltasResponse, TransparentAddressRankingRequest,
-        TransparentAddressRankingResponse, UtxoSetSummaryRequest, UtxoSetSummaryResponse,
-        ValuePoolBalanceHistoryRequest, ValuePoolBalanceHistoryResponse,
-        ValuePoolFlowAmountThresholdSummaryRequest, ValuePoolFlowAmountThresholdSummaryResponse,
-        ValuePoolFlowEventsInRangeRequest, ValuePoolFlowEventsInRangeResponse,
-        ValuePoolFlowHistoryRequest, ValuePoolFlowHistoryResponse,
-        ValuePoolFlowRoundedAmountSummaryRequest, ValuePoolFlowRoundedAmountSummaryResponse,
-        ValuePoolFlowSummaryRequest, ValuePoolFlowSummaryResponse, ValuePoolSummaryRequest,
-        ValuePoolSummaryResponse,
+        TransparentAddressRankingResponse, ValuePoolBalanceHistoryRequest,
+        ValuePoolBalanceHistoryResponse, ValuePoolFlowAmountThresholdSummaryRequest,
+        ValuePoolFlowAmountThresholdSummaryResponse, ValuePoolFlowEventsInRangeRequest,
+        ValuePoolFlowEventsInRangeResponse, ValuePoolFlowHistoryRequest,
+        ValuePoolFlowHistoryResponse, ValuePoolFlowRoundedAmountSummaryRequest,
+        ValuePoolFlowRoundedAmountSummaryResponse, ValuePoolFlowSummaryRequest,
+        ValuePoolFlowSummaryResponse, ValuePoolSummaryRequest, ValuePoolSummaryResponse,
         explorer_query_server::{ExplorerQuery, ExplorerQueryServer},
     },
     ops,
@@ -105,7 +104,6 @@ use super::transparent_address_activity::{
 };
 use super::transparent_address_deltas::query_transparent_address_deltas;
 use super::transparent_address_ranking::query_transparent_address_ranking;
-use super::utxo_set_summary::query_utxo_set_summary;
 use super::value_pool_balance_history::query_value_pool_balance_history;
 use super::value_pool_flow::{
     query_value_pool_flow_amount_threshold_summary, query_value_pool_flow_events_in_range,
@@ -113,7 +111,7 @@ use super::value_pool_flow::{
     query_value_pool_flow_summary,
 };
 use super::value_pool_summary::query_value_pool_summary;
-use zinder_materialized_views::{MaterializedViewPreset, MaterializedViewStore};
+use zinder_materialized_views::MaterializedViewStore;
 
 /// Settings the binary populates before constructing the adapter.
 #[derive(Clone, Copy, Debug)]
@@ -143,7 +141,6 @@ pub struct ExplorerQueryGrpcAdapter {
     wallet_query_bearer_token: Option<BearerToken>,
     bearer_token: Option<BearerToken>,
     materialized_view_store: Option<MaterializedViewStore>,
-    materialized_view_preset: Option<MaterializedViewPreset>,
     transaction_history_materialized_view_reader:
         Option<Arc<dyn TransactionHistoryMaterializedViewReadApi>>,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
@@ -162,7 +159,6 @@ impl ExplorerQueryGrpcAdapter {
             wallet_query_bearer_token: None,
             bearer_token: None,
             materialized_view_store: None,
-            materialized_view_preset: None,
             transaction_history_materialized_view_reader: None,
             network_upgrade_activations: Arc::new(NetworkUpgradeActivations::empty(
                 settings.network,
@@ -177,7 +173,6 @@ impl ExplorerQueryGrpcAdapter {
     /// materialized `BlockSummary` records.
     #[must_use]
     pub fn with_materialized_view_store(mut self, store: MaterializedViewStore) -> Self {
-        self.materialized_view_preset = Some(store.effective_materialized_view_preset());
         self.transaction_history_materialized_view_reader = Some(Arc::new(
             TransactionHistoryMaterializedViewReader::new(store.clone()),
         ));
@@ -288,8 +283,10 @@ impl ExplorerQueryGrpcAdapter {
         ExplorerReadiness {
             wallet_query_online,
             canonical_store_online: false,
-            materialized_view_store_online: self.materialized_view_preset
-                == Some(MaterializedViewPreset::Explorer),
+            materialized_view_store_online: self
+                .materialized_view_store
+                .as_ref()
+                .is_some_and(MaterializedViewStore::has_explorer_view_manifest),
             prevout_resolution_online: self.prevout_resolution_online && wallet_query_online,
             transaction_history_available: transaction_history_readiness
                 .is_some_and(TransactionHistoryMaterializedViewReadiness::is_available),
@@ -427,22 +424,10 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
                         .map(str::to_owned)
                         .collect(),
                     contract_revision: zinder_proto::CONTRACT_REVISION,
-                    materialized_view_preset: self
-                        .materialized_view_preset
-                        .map_or_else(String::new, |preset| preset.as_str().to_owned()),
-                    materialized_view_identities: self.materialized_view_preset.map_or_else(
-                        Vec::new,
-                        |preset| {
-                            preset
-                                .consumer_schemas()
-                                .iter()
-                                .map(|schema| schema.name.as_str().to_owned())
-                                .collect()
-                        },
-                    ),
                 }),
                 vendor: "Zinder".to_owned(),
                 materialized_view_status,
+                materialized_view_identities: self.materialized_view_identities(),
             }),
         }))
     }
@@ -1092,30 +1077,6 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         outcome
     }
 
-    async fn utxo_set_summary(
-        &self,
-        request: Request<UtxoSetSummaryRequest>,
-    ) -> Result<Response<UtxoSetSummaryResponse>, Status> {
-        const OP: OperationNames = OperationNames {
-            method: "UtxoSetSummary",
-            metric: "utxo_set_summary",
-        };
-        let started = Instant::now();
-        let outcome = async {
-            let mut client = self.wallet_client(OP.method).await?;
-            query_utxo_set_summary(
-                self.materialized_view_store.as_ref(),
-                &mut client,
-                &self.upstream_observation_cache,
-                request,
-            )
-            .await
-        }
-        .await;
-        record_explorer_request(OP.metric, started.elapsed(), outcome.as_ref().err());
-        outcome
-    }
-
     async fn chain_reorg_history(
         &self,
         request: Request<ChainReorgHistoryRequest>,
@@ -1377,6 +1338,21 @@ impl ExplorerQueryGrpcAdapter {
             })
     }
 
+    /// Consumer identities of the attached Explorer view store. Empty unless
+    /// the store carries the exact Explorer view manifest, because only that
+    /// manifest admits the view-backed readers.
+    fn materialized_view_identities(&self) -> Vec<String> {
+        self.materialized_view_store
+            .as_ref()
+            .filter(|store| store.has_explorer_view_manifest())
+            .map_or_else(Vec::new, |store| {
+                store
+                    .consumer_identities()
+                    .map(|identity| identity.as_str().to_owned())
+                    .collect()
+            })
+    }
+
     fn require_materialized_view_store(
         &self,
         method: &'static str,
@@ -1387,10 +1363,10 @@ impl ExplorerQueryGrpcAdapter {
                  --storage-path and start the explorer with the consumer wired"
             )))
         })?;
-        if self.materialized_view_preset != Some(MaterializedViewPreset::Explorer) {
+        if !materialized_view_store.has_explorer_view_manifest() {
             return Err(ExplorerError::unsupported(format!(
-                "{method} is unavailable because the stored materialized-view workload omits \
-                 explorer product views"
+                "{method} is unavailable because the attached materialized-view store lacks \
+                 the Explorer view manifest"
             ))
             .into());
         }
@@ -1510,9 +1486,10 @@ mod tests {
     use tonic_types::StatusExt as _;
     use zinder_core::{BlockHash, BlockHeight, ChainEpochId};
     use zinder_materialized_views::{
-        CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA, MaterializedViewCoverage, MaterializedViewPreset,
-        MaterializedViewState, MaterializedViewStoreOptions, PAID_FEE_DISTRIBUTION_SCHEMA,
-        TRANSACTION_HISTORY_CONSUMER_NAME,
+        CONVENTIONAL_FEE_DISTRIBUTION_SCHEMA, MaterializedViewCoverage, MaterializedViewState,
+        MaterializedViewStoreOptions, PAID_FEE_DISTRIBUTION_SCHEMA,
+        TRANSACTION_HISTORY_CONSUMER_NAME, TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
+        TRANSPARENT_OUTPOINT_SPEND_SCHEMA,
     };
     use zinder_proto::capabilities::{
         EXPLORER_BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_V1, EXPLORER_BLOCK_PRODUCTION_SERIES_V2,
@@ -1590,9 +1567,8 @@ mod tests {
     async fn canonical_fact_methods_fail_as_unconfigured_and_stay_unadvertised()
     -> Result<(), Box<dyn std::error::Error>> {
         let tempdir = tempdir()?;
-        let materialized_view_store = MaterializedViewStore::open_with_materialized_view_preset(
+        let materialized_view_store = MaterializedViewStore::open_explorer_views(
             tempdir.path(),
-            MaterializedViewPreset::Explorer,
             MaterializedViewStoreOptions {
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 ..MaterializedViewStoreOptions::default()
@@ -1735,9 +1711,8 @@ mod tests {
         );
 
         let tempdir = tempdir()?;
-        let materialized_view_store = MaterializedViewStore::open_with_materialized_view_preset(
+        let materialized_view_store = MaterializedViewStore::open_explorer_views(
             tempdir.path(),
-            MaterializedViewPreset::Explorer,
             MaterializedViewStoreOptions {
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 ..MaterializedViewStoreOptions::default()
@@ -1763,13 +1738,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_info_reports_view_identities_for_the_exact_manifest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tempdir = tempdir()?;
+        let materialized_view_store = MaterializedViewStore::open_explorer_views(
+            tempdir.path(),
+            MaterializedViewStoreOptions {
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                ..MaterializedViewStoreOptions::default()
+            },
+        )?;
+        let expected_identity_count = materialized_view_store.consumer_identities().count();
+        let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings::default())
+            .with_materialized_view_store(materialized_view_store);
+
+        let info = adapter
+            .server_info(Request::new(ServerInfoRequest {}))
+            .await?
+            .into_inner()
+            .info
+            .ok_or("explorer server info missing its descriptor")?;
+
+        assert_eq!(
+            info.materialized_view_identities.len(),
+            expected_identity_count
+        );
+        assert!(
+            info.materialized_view_identities
+                .iter()
+                .any(|identity| identity == TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME.as_str())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn omitted_transaction_history_disables_capabilities_and_fails_before_wallet_connect()
     -> Result<(), Box<dyn std::error::Error>> {
         let tempdir = tempdir()?;
-        let materialized_view_store = MaterializedViewStore::open_with_materialized_view_preset(
+        let materialized_view_store = MaterializedViewStore::open(
             tempdir.path(),
-            MaterializedViewPreset::Wallet,
             MaterializedViewStoreOptions {
+                consumers: &[TRANSPARENT_OUTPOINT_SPEND_SCHEMA],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 ..MaterializedViewStoreOptions::default()
             },
@@ -1786,13 +1795,14 @@ mod tests {
             .server_info(Request::new(ServerInfoRequest {}))
             .await?
             .into_inner();
-        let common = server_info
+        let info = server_info
             .info
-            .and_then(|info| info.common)
+            .ok_or("explorer server info missing its descriptor")?;
+        let common = info
+            .common
             .ok_or("explorer server info missing common descriptor")?;
         assert_eq!(common.build_git_commit, zinder_runtime::BUILD_GIT_COMMIT);
-        assert_eq!(common.materialized_view_preset, "wallet");
-        assert_eq!(common.materialized_view_identities.len(), 2);
+        assert!(info.materialized_view_identities.is_empty());
         let outcome = adapter
             .transaction_history(Request::new(TransactionHistoryRequest::default()))
             .await;
@@ -1802,6 +1812,13 @@ mod tests {
             );
         };
         assert_eq!(error.code(), Code::Unimplemented);
+        let block_summaries = adapter
+            .block_summaries_in_range(Request::new(BlockSummariesInRangeRequest::default()))
+            .await;
+        let Err(error) = block_summaries else {
+            return Err("partial view store unexpectedly reached the wallet connection".into());
+        };
+        assert_eq!(error.code(), Code::Unimplemented);
         Ok(())
     }
 
@@ -1809,9 +1826,8 @@ mod tests {
     async fn materializing_transaction_history_fails_before_wallet_connect()
     -> Result<(), Box<dyn std::error::Error>> {
         let tempdir = tempdir()?;
-        let materialized_view_store = MaterializedViewStore::open_with_materialized_view_preset(
+        let materialized_view_store = MaterializedViewStore::open_explorer_views(
             tempdir.path(),
-            MaterializedViewPreset::Explorer,
             MaterializedViewStoreOptions {
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 ..MaterializedViewStoreOptions::default()

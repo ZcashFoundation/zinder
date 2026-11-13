@@ -52,6 +52,7 @@ The request shape failed validation. Retry disposition: **NonRetryable**. Carrie
 | `INVALID_BLOCK_RANGE` | `start_height` exceeds `end_height` | `field_violations[start_height, end_height]` |
 | `BLOCK_RANGE_TOO_LARGE` | Requested compact- or full-block range exceeds the per-deployment cap | `field_violations[end_height]` |
 | `SUBTREE_ROOT_RANGE_TOO_LARGE` | Requested subtree-root count exceeds the public 1,024-entry per-request cap | `field_violations[max_entries]` |
+| `TRANSPARENT_OUTPOINT_COUNT_OUT_OF_RANGE` | A `TransparentOutpointSpendStatus` request carries no outpoints or more than the 1,024-outpoint per-request cap | `field_violations[outpoints]` |
 | `CHAIN_EVENT_CURSOR_INVALID` | Cursor bytes failed to parse, are for a different network / store / stream family, or a non-default request family disagrees with the cursor's encoded family | `field_violations[from_cursor]` |
 | `ADDRESS_OUTPUT_CURSOR_INVALID` | Same as above for address-output streams | `field_violations[from_cursor]` |
 | `TRANSPARENT_HISTORY_CURSOR_INVALID` | Same as above for transparent-history streams | `field_violations[from_cursor]` |
@@ -84,7 +85,7 @@ The request shape is valid but the deployment is in a state that cannot serve it
 | `DEPENDENCY_NOT_CONFIGURED` | A federated dependency the explorer request needs (the canonical store, a materialized view, or a wallet-query endpoint) is not wired on this deployment | — |
 | `NODE_CAPABILITY_MISSING` | The upstream Zcash node does not advertise a capability the request requires; the operator must reconfigure the node | — |
 | `EXPLORER_PRECONDITION_UNSATISFIED` | An explorer read cannot serve the requested transaction state | — |
-| `CANONICAL_HISTORY_UNAVAILABLE` | The store's retained canonical history starts after a checkpoint, so a transaction lookup that missed cannot prove an absence; query a store with complete history. An unpinned lookup returns it only after the live mempool also missed, so a pending transaction is still reported | `ErrorInfo.metadata["first_available_height"]` |
+| `CANONICAL_HISTORY_UNAVAILABLE` | The store's retained canonical history starts after a checkpoint, so a transaction lookup or a `TransparentOutpointSpendStatus` request that missed cannot prove an absence; query a store with complete history. An unpinned transaction lookup returns it only after the live mempool also missed, so a pending transaction is still reported | `ErrorInfo.metadata["first_available_height"]` |
 
 ### `NOT_FOUND` family
 

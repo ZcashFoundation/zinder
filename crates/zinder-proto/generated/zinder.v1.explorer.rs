@@ -3,7 +3,7 @@
 ///
 /// `common` carries the cross-service identity, capability set, and
 /// deprecation metadata defined in \[`zinder.v1.ops.ServerInfo`\]. The
-/// `vendor` field is the only explorer-specific addition today.
+/// remaining fields describe the Explorer view plane.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExplorerServerInfo {
     /// Cross-service identity and capability descriptor.
@@ -20,6 +20,12 @@ pub struct ExplorerServerInfo {
     #[prost(message, optional, tag = "3")]
     pub materialized_view_status: ::core::option::Option<
         super::wallet::MaterializedViewStatus,
+    >,
+    /// Consumer identities of the admitted Explorer view store. Empty when no
+    /// view store is admitted. Order is not significant; compare as a set.
+    #[prost(string, repeated, tag = "4")]
+    pub materialized_view_identities: ::prost::alloc::vec::Vec<
+        ::prost::alloc::string::String,
     >,
 }
 /// Server descriptor request.
@@ -1261,9 +1267,10 @@ pub struct MempoolActivityResponse {
 /// `ExplorerQuery.TransparentAddressActivity` request.
 ///
 /// Returns confirmed transparent-address activity from the materialized view.
-/// Mempool activity for a transparent address is served
-/// separately through `MempoolActivity` so each surface has one source
-/// of truth.
+/// ExplorerQuery has no per-address mempool read: `MempoolActivity` entries
+/// carry no outputs or scripts. Pending activity for an address comes from
+/// filtering `WalletQuery.MempoolSnapshot` and `MempoolEvents` entries on their
+/// `transparent_outputs` and `transparent_spends`.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressActivityRequest {
     /// Selector for the transparent address being queried.
@@ -1415,8 +1422,10 @@ pub struct TransparentAddressActivityResponse {
 /// over an inclusive height range, ordered ascending. One entry per received
 /// output and per resolved spend, so the series is strictly finer than
 /// `TransparentAddressActivity`, which folds the same events into one net row
-/// per transaction. The mempool view is served separately through
-/// `MempoolActivity`.
+/// per transaction. Pending deltas for an address come from filtering
+/// `WalletQuery.MempoolSnapshot` and `MempoolEvents` entries on their
+/// `transparent_outputs` and `transparent_spends`; ExplorerQuery has no
+/// per-address mempool read.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransparentAddressDeltasRequest {
     /// Selector for the transparent address being queried.
@@ -2454,43 +2463,6 @@ pub struct NetworkUpgradeStatusResponse {
     #[prost(string, tag = "5")]
     pub active_upgrade_branch_id_hex: ::prost::alloc::string::String,
 }
-/// `ExplorerQuery.UtxoSetSummary` request.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct UtxoSetSummaryRequest {
-    /// Optional chain-epoch id pin for the canonical read. Absent resolves
-    /// against the visible tip; present pins the read to a specific epoch.
-    #[prost(uint64, optional, tag = "1")]
-    pub at_epoch_id: ::core::option::Option<u64>,
-}
-/// `ExplorerQuery.UtxoSetSummary` response.
-///
-/// The chain-wide transparent UTXO-set aggregate, computed by a request-time
-/// full scan of the current UTXO materialized view at the settled tip
-/// (gettxoutsetinfo-equivalent). `hash_serialized` and `bytes_serialized` are
-/// intentionally omitted: both depend on a defined UTXO-set serialization
-/// ordering that Zinder does not commit to, so only the order-independent
-/// count and value totals are reported.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct UtxoSetSummaryResponse {
-    #[prost(message, optional, tag = "1")]
-    pub freshness: ::core::option::Option<ExplorerFreshness>,
-    /// Number of unspent transparent outputs at the summarized settled tip.
-    #[prost(uint64, tag = "2")]
-    pub utxo_count: u64,
-    /// Sum of the values of every unspent transparent output, in zatoshi.
-    #[prost(uint64, tag = "3")]
-    pub total_value_zat: u64,
-    /// Settled tip height the aggregate was taken at. Below this height the
-    /// materialized view is the settled-tip unspent set under the configured reorg policy;
-    /// a deeper reorg fails closed.
-    #[prost(uint32, tag = "4")]
-    pub summarized_height: u32,
-    /// Homomorphic commitment to the full unspent set. Mirrors the wallet-plane
-    /// field: present only when the server advertises
-    /// `explorer.utxo_set.commitment_v1`, absent otherwise.
-    #[prost(message, optional, tag = "5")]
-    pub commitment: ::core::option::Option<super::wallet::TransparentUtxoSetCommitment>,
-}
 /// Per-row record materialized by `TransparentAddressActivityConsumer`.
 ///
 /// Storage-only: never returned directly on the wire. Encoded into the
@@ -3355,10 +3327,9 @@ impl PrivacyShape {
 /// Classification of a transaction's transparent prevout resolution state.
 ///
 /// `TransactionFeesConsumer` writes `RESOLVED` when every transparent input
-/// has a known prevout value in the wallet plane's prevout index, `PARTIAL`
-/// when at least one is missing, and `UNAVAILABLE` when the indexer is not
-/// resolving prevouts at all (the upstream node does not advertise
-/// `WALLET_READ_TRANSPARENT_OUTPUTS_V1`).
+/// has a known prevout value in the hydrated canonical spend facts, `PARTIAL`
+/// when at least one is missing, and `UNAVAILABLE` when the committed block
+/// carried no hydrated spend facts for the transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum PrevoutResolutionStatus {
@@ -4336,9 +4307,10 @@ pub mod explorer_query_client {
             self.inner.unary(req, path, codec).await
         }
         /// Returns the confirmed transparent-address activity feed materialized
-        /// by `TransparentAddressActivityConsumer`. The mempool view for an
-        /// address is served separately through `MempoolActivity` so each
-        /// surface has one source of truth. Capability:
+        /// by `TransparentAddressActivityConsumer`, newest first. ExplorerQuery has
+        /// no per-address mempool read; pending activity comes from filtering
+        /// `WalletQuery.MempoolSnapshot` and `MempoolEvents` entries on their
+        /// `transparent_outputs` and `transparent_spends`. Capability:
         /// `explorer.transparent_address.activity_v2`.
         pub async fn transparent_address_activity(
             &mut self,
@@ -4755,36 +4727,6 @@ pub mod explorer_query_client {
                         "zinder.v1.explorer.ExplorerQuery",
                         "ValuePoolBalanceHistory",
                     ),
-                );
-            self.inner.unary(req, path, codec).await
-        }
-        /// Returns the chain-wide transparent UTXO-set summary: the count and total
-        /// value of unspent transparent outputs at the settled tip. Composed from
-        /// `WalletQuery.TransparentUtxoSetSummary`. Capability:
-        /// `explorer.utxo_set.summary_v1`.
-        pub async fn utxo_set_summary(
-            &mut self,
-            request: impl tonic::IntoRequest<super::UtxoSetSummaryRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::UtxoSetSummaryResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/zinder.v1.explorer.ExplorerQuery/UtxoSetSummary",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new("zinder.v1.explorer.ExplorerQuery", "UtxoSetSummary"),
                 );
             self.inner.unary(req, path, codec).await
         }
@@ -5275,9 +5217,10 @@ pub mod explorer_query_server {
             tonic::Status,
         >;
         /// Returns the confirmed transparent-address activity feed materialized
-        /// by `TransparentAddressActivityConsumer`. The mempool view for an
-        /// address is served separately through `MempoolActivity` so each
-        /// surface has one source of truth. Capability:
+        /// by `TransparentAddressActivityConsumer`, newest first. ExplorerQuery has
+        /// no per-address mempool read; pending activity comes from filtering
+        /// `WalletQuery.MempoolSnapshot` and `MempoolEvents` entries on their
+        /// `transparent_outputs` and `transparent_spends`. Capability:
         /// `explorer.transparent_address.activity_v2`.
         async fn transparent_address_activity(
             &self,
@@ -5408,17 +5351,6 @@ pub mod explorer_query_server {
             request: tonic::Request<super::ValuePoolBalanceHistoryRequest>,
         ) -> std::result::Result<
             tonic::Response<super::ValuePoolBalanceHistoryResponse>,
-            tonic::Status,
-        >;
-        /// Returns the chain-wide transparent UTXO-set summary: the count and total
-        /// value of unspent transparent outputs at the settled tip. Composed from
-        /// `WalletQuery.TransparentUtxoSetSummary`. Capability:
-        /// `explorer.utxo_set.summary_v1`.
-        async fn utxo_set_summary(
-            &self,
-            request: tonic::Request<super::UtxoSetSummaryRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::UtxoSetSummaryResponse>,
             tonic::Status,
         >;
         /// Returns retained chain reorg events from the canonical chain-event log,
@@ -6964,52 +6896,6 @@ pub mod explorer_query_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ValuePoolBalanceHistorySvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/zinder.v1.explorer.ExplorerQuery/UtxoSetSummary" => {
-                    #[allow(non_camel_case_types)]
-                    struct UtxoSetSummarySvc<T: ExplorerQuery>(pub Arc<T>);
-                    impl<
-                        T: ExplorerQuery,
-                    > tonic::server::UnaryService<super::UtxoSetSummaryRequest>
-                    for UtxoSetSummarySvc<T> {
-                        type Response = super::UtxoSetSummaryResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::UtxoSetSummaryRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as ExplorerQuery>::utxo_set_summary(&inner, request)
-                                    .await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = UtxoSetSummarySvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

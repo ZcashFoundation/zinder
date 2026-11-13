@@ -10,11 +10,16 @@ use zinder_core::wire::{
     encode_rpc_transaction_id_hex,
 };
 use zinder_core::{
-    BlockHash, CompactSaplingOutput, CompactSaplingSpend, CompactShieldedAction,
-    CompactTransactionData, CompactTransparentInput, CompactTransparentOutput, MempoolEntry,
-    MempoolObservation, RawTransactionBytes, TransactionId, UnixTimestampMillis,
+    BlockHash, BlockHeight, BlockId, CompactSaplingOutput, CompactSaplingSpend,
+    CompactShieldedAction, CompactTransactionData, CompactTransparentInput,
+    CompactTransparentOutput, MempoolEntry, MempoolObservation, RawTransactionBytes, TransactionId,
+    TransparentOutPoint, TransparentOutpointSpendStatus, UnixTimestampMillis,
 };
 use zinder_proto::v1::{ingest, ops, wallet};
+use zinder_proto::wire::{
+    WalletWireDecodeError, outpoint_message, transparent_outpoint_spend_status_entry_from_message,
+    transparent_outpoint_spend_status_entry_message,
+};
 
 #[test]
 fn chain_epoch_round_trips_through_prost() -> eyre::Result<()> {
@@ -1063,103 +1068,36 @@ fn synthetic_chain_view() -> wallet::ChainView {
 }
 
 #[test]
-fn transparent_utxo_set_summary_response_round_trips_through_prost() -> eyre::Result<()> {
-    let response = wallet::TransparentUtxoSetSummaryResponse {
-        chain_view: Some(synthetic_chain_view()),
-        utxo_count: 4096,
-        total_value_zat: 2_100_000_000_000_000,
-        summarized_height: 2_500_000,
-        commitment: Some(wallet::TransparentUtxoSetCommitment {
-            scheme: wallet::UtxoSetCommitmentScheme::Lthash16 as i32,
-            commitment: vec![0xab; 2048],
+fn transparent_spend_round_trips_through_prost() -> eyre::Result<()> {
+    let spending_transaction_id = TransactionId::from_bytes([0xAB; 32]);
+    let spending_block_hash = BlockHash::from_bytes([0xCD; 32]);
+    let spend = wallet::TransparentSpend {
+        spent_outpoint: Some(wallet::OutPoint {
+            transaction_id: "11".repeat(32),
+            output_index: 3,
+        }),
+        spending_transaction_id: encode_rpc_transaction_id_hex(spending_transaction_id),
+        input_index: 2,
+        spending_block: Some(wallet::BlockTip {
+            height: 808,
+            hash: encode_rpc_block_hash_hex(spending_block_hash),
         }),
     };
 
-    let decoded = round_trip(&response)?;
+    let decoded = round_trip(&spend)?;
 
-    assert!(decoded.chain_view.is_some());
-    assert_eq!(decoded.utxo_count, 4096);
-    assert_eq!(decoded.total_value_zat, 2_100_000_000_000_000);
-    assert_eq!(decoded.summarized_height, 2_500_000);
-    let commitment = decoded
-        .commitment
-        .ok_or_else(|| eyre::eyre!("commitment present after round-trip"))?;
-    assert_eq!(
-        commitment.scheme,
-        wallet::UtxoSetCommitmentScheme::Lthash16 as i32
-    );
-    assert_eq!(commitment.commitment.len(), 2048);
-    Ok(())
-}
-
-#[test]
-fn transparent_utxo_set_summary_response_omits_absent_commitment() -> eyre::Result<()> {
-    let response = wallet::TransparentUtxoSetSummaryResponse {
-        chain_view: Some(synthetic_chain_view()),
-        utxo_count: 0,
-        total_value_zat: 0,
-        summarized_height: 0,
-        commitment: None,
-    };
-
-    let decoded = round_trip(&response)?;
-
-    assert!(decoded.commitment.is_none());
-    Ok(())
-}
-
-#[test]
-fn transparent_utxo_set_summary_request_round_trips_the_epoch_pin() -> eyre::Result<()> {
-    let request = wallet::TransparentUtxoSetSummaryRequest {
-        at_epoch_id: Some(77),
-    };
-
-    let decoded = round_trip(&request)?;
-
-    assert_eq!(decoded.at_epoch_id, Some(77));
-    Ok(())
-}
-
-#[test]
-fn transparent_spends_by_outpoint_response_round_trips_through_prost() -> eyre::Result<()> {
-    let spending_transaction_id = TransactionId::from_bytes([0xAB; 32]);
-    let spending_block_hash = BlockHash::from_bytes([0xCD; 32]);
-    let response = wallet::TransparentSpendsByOutpointResponse {
-        chain_view: Some(synthetic_chain_view()),
-        spends: vec![wallet::TransparentSpend {
-            spent_outpoint: Some(wallet::OutPoint {
-                transaction_id: "11".repeat(32),
-                output_index: 3,
-            }),
-            spending_transaction_id: encode_rpc_transaction_id_hex(spending_transaction_id),
-            input_index: 2,
-            spending_block: Some(wallet::BlockTip {
-                height: 808,
-                hash: encode_rpc_block_hash_hex(spending_block_hash),
-            }),
-        }],
-    };
-
-    let decoded = round_trip(&response)?;
-
-    assert!(decoded.chain_view.is_some());
-    assert_eq!(decoded.spends.len(), 1);
-    let spend = decoded
-        .spends
-        .first()
-        .ok_or_else(|| eyre!("decoded response is missing the spend entry"))?;
-    let spent_outpoint = spend
+    let spent_outpoint = decoded
         .spent_outpoint
         .as_ref()
         .ok_or_else(|| eyre!("decoded spend is missing its spent outpoint"))?;
     assert_eq!(spent_outpoint.transaction_id, "11".repeat(32));
     assert_eq!(spent_outpoint.output_index, 3);
-    assert_eq!(spend.input_index, 2);
+    assert_eq!(decoded.input_index, 2);
     assert_eq!(
-        decode_rpc_transaction_id_hex(&spend.spending_transaction_id)?,
+        decode_rpc_transaction_id_hex(&decoded.spending_transaction_id)?,
         spending_transaction_id
     );
-    let spending_block = spend
+    let spending_block = decoded
         .spending_block
         .as_ref()
         .ok_or_else(|| eyre!("decoded spend is missing its spending block"))?;
@@ -1172,42 +1110,135 @@ fn transparent_spends_by_outpoint_response_round_trips_through_prost() -> eyre::
 }
 
 #[test]
-fn transparent_unspent_outputs_by_outpoint_response_round_trips_through_prost() -> eyre::Result<()>
-{
-    let response = wallet::TransparentUnspentOutputsByOutpointResponse {
+fn transparent_outpoint_spend_status_request_round_trips_outpoints_and_pin() -> eyre::Result<()> {
+    let outpoints = [
+        TransparentOutPoint::new(TransactionId::from_bytes([0x11; 32]), 0),
+        TransparentOutPoint::new(TransactionId::from_bytes([0x22; 32]), 7),
+    ];
+    let request = wallet::TransparentOutpointSpendStatusRequest {
+        outpoints: outpoints.iter().map(outpoint_message).collect(),
+        at_epoch_id: Some(42),
+    };
+
+    let decoded = round_trip(&request)?;
+
+    assert_eq!(decoded, request);
+    assert_eq!(decoded.at_epoch_id, Some(42));
+    let decoded_outpoints = decoded
+        .outpoints
+        .iter()
+        .map(|outpoint| {
+            zinder_proto::wire::outpoint_from_message("outpoints.transaction_id", outpoint)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(decoded_outpoints, outpoints);
+    Ok(())
+}
+
+#[test]
+fn transparent_outpoint_spend_status_response_round_trips_every_status() -> eyre::Result<()> {
+    let spent_by = TransparentOutpointSpendStatus::SpentBy {
+        transaction_id: TransactionId::from_bytes([0xAB; 32]),
+        input_index: 2,
+        block: BlockId::new(BlockHeight::new(808), BlockHash::from_bytes([0xCD; 32])),
+    };
+    let entries = [
+        (
+            TransparentOutPoint::new(TransactionId::from_bytes([0x01; 32]), 0),
+            TransparentOutpointSpendStatus::Unspent,
+        ),
+        (
+            TransparentOutPoint::new(TransactionId::from_bytes([0x02; 32]), 1),
+            spent_by,
+        ),
+        (
+            TransparentOutPoint::new(TransactionId::from_bytes([0x03; 32]), 2),
+            TransparentOutpointSpendStatus::NotFound,
+        ),
+    ];
+    let response = wallet::TransparentOutpointSpendStatusResponse {
         chain_view: Some(synthetic_chain_view()),
-        entries: vec![wallet::TransparentOutputEntry {
-            outpoint: Some(wallet::OutPoint {
-                transaction_id: "22".repeat(32),
-                output_index: 4,
-            }),
-            output: Some(wallet::TransparentOutput {
-                value_zat: 9_999,
-                script_pub_key: vec![0x76, 0xa9, 0x14, 0x88, 0xac],
-            }),
-        }],
+        entries: entries
+            .iter()
+            .map(|(outpoint, status)| {
+                transparent_outpoint_spend_status_entry_message(outpoint, *status)
+            })
+            .collect(),
     };
 
     let decoded = round_trip(&response)?;
 
-    assert!(decoded.chain_view.is_some());
-    assert_eq!(decoded.entries.len(), 1);
-    let entry = decoded
+    assert_eq!(decoded, response);
+    let decoded_entries = decoded
         .entries
-        .first()
-        .ok_or_else(|| eyre!("decoded response is missing the entry"))?;
-    let outpoint = entry
-        .outpoint
-        .as_ref()
-        .ok_or_else(|| eyre!("decoded entry is missing its outpoint"))?;
-    assert_eq!(outpoint.transaction_id, "22".repeat(32));
-    assert_eq!(outpoint.output_index, 4);
-    let output = entry
-        .output
-        .as_ref()
-        .ok_or_else(|| eyre!("decoded entry is missing its output"))?;
-    assert_eq!(output.value_zat, 9_999);
-    assert_eq!(output.script_pub_key, vec![0x76, 0xa9, 0x14, 0x88, 0xac]);
+        .iter()
+        .map(transparent_outpoint_spend_status_entry_from_message)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(decoded_entries, entries);
+    let spent_message = decoded
+        .entries
+        .get(1)
+        .and_then(|entry| entry.status.as_ref())
+        .ok_or_else(|| eyre!("decoded response is missing the spent entry"))?;
+    let wallet::transparent_outpoint_spend_status_entry::Status::SpentBy(spent_message) =
+        spent_message
+    else {
+        return Err(eyre!("second entry must decode as spent_by"));
+    };
+    assert_eq!(spent_message.spending_transaction_id, "ab".repeat(32));
+    assert_eq!(
+        spent_message
+            .block
+            .as_ref()
+            .map(|block| block.block_hash.as_str()),
+        Some("cd".repeat(32).as_str())
+    );
+    Ok(())
+}
+
+#[test]
+fn transparent_outpoint_spend_status_entry_requires_a_status() {
+    let entry = wallet::TransparentOutpointSpendStatusEntry {
+        outpoint: Some(outpoint_message(&TransparentOutPoint::new(
+            TransactionId::from_bytes([0x01; 32]),
+            0,
+        ))),
+        status: None,
+    };
+
+    assert_eq!(
+        transparent_outpoint_spend_status_entry_from_message(&entry),
+        Err(WalletWireDecodeError::MissingField {
+            field: "entries.status",
+        })
+    );
+}
+
+#[test]
+fn transparent_address_tx_ids_request_ignores_the_retired_descending_flag() -> eyre::Result<()> {
+    let request = wallet::TransparentAddressTxIdsInRangeRequest {
+        address: Some(wallet::AddressLookup {
+            selector: Some(wallet::address_lookup::Selector::ScriptHash(vec![0x5A; 32])),
+        }),
+        start_height: 10,
+        end_height: 20,
+        max_entries: 50,
+        from_cursor: vec![0x01, 0x02],
+    };
+
+    let decoded = round_trip(&request)?;
+
+    assert_eq!(decoded, request);
+    // Field 6 carried the removed `descending` flag. A request from an older
+    // client that set it decodes to the same ascending request.
+    let mut encoded_with_retired_flag = request.encode_to_vec();
+    encoded_with_retired_flag.extend_from_slice(&[0x30, 0x01]);
+    assert_eq!(
+        wallet::TransparentAddressTxIdsInRangeRequest::decode(
+            encoded_with_retired_flag.as_slice()
+        )?,
+        request
+    );
     Ok(())
 }
 
@@ -1370,8 +1401,6 @@ fn ops_server_info_round_trips_contract_revision() -> eyre::Result<()> {
         build_git_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
         capabilities: vec![zinder_proto::capabilities::WALLET_EVENTS_CHAIN_V1.to_owned()],
         contract_revision: zinder_proto::CONTRACT_REVISION,
-        materialized_view_preset: "wallet".to_owned(),
-        materialized_view_identities: vec!["transparent_outpoint_spend".to_owned()],
     };
     let decoded = round_trip(&server_info)?;
 
@@ -1380,11 +1409,33 @@ fn ops_server_info_round_trips_contract_revision() -> eyre::Result<()> {
         decoded.build_git_commit,
         "0123456789abcdef0123456789abcdef01234567"
     );
-    assert_eq!(decoded.materialized_view_preset, "wallet");
+    // Fields 6 and 7 carried the removed materialized-view preset and
+    // identities. A descriptor from an older server decodes without them.
+    let mut encoded_with_retired_fields = server_info.encode_to_vec();
+    encoded_with_retired_fields.extend_from_slice(&[0x32, 0x06]);
+    encoded_with_retired_fields.extend_from_slice(b"wallet");
+    encoded_with_retired_fields.extend_from_slice(&[0x3A, 0x02]);
+    encoded_with_retired_fields.extend_from_slice(b"id");
     assert_eq!(
-        decoded.materialized_view_identities,
-        vec!["transparent_outpoint_spend"]
+        ops::ServerInfo::decode(encoded_with_retired_fields.as_slice())?,
+        server_info
     );
+    Ok(())
+}
+
+#[test]
+fn ops_readiness_report_round_trips_explorer_view_identities() -> eyre::Result<()> {
+    let report = ops::ReadinessReport {
+        cause: ops::ReadinessCause::Ready as i32,
+        current_height: Some(42),
+        target_height: Some(42),
+        detail: None,
+        materialized_view_identities: vec!["block_summary".to_owned()],
+    };
+
+    let decoded = round_trip(&report)?;
+
+    assert_eq!(decoded, report);
     Ok(())
 }
 
@@ -1408,6 +1459,11 @@ fn transaction_lookup_reasons_round_trip_by_name_and_scalar() -> eyre::Result<()
             ops::ErrorReason::CanonicalHistoryUnavailable,
             "CANONICAL_HISTORY_UNAVAILABLE",
             52,
+        ),
+        (
+            ops::ErrorReason::TransparentOutpointCountOutOfRange,
+            "TRANSPARENT_OUTPOINT_COUNT_OUT_OF_RANGE",
+            53,
         ),
     ] {
         assert_eq!(reason.as_str_name(), name);

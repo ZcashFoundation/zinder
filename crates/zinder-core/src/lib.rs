@@ -29,7 +29,6 @@ mod transaction_public_facts;
 mod transparent_address_balance;
 mod transparent_address_tx_index;
 mod transparent_output;
-mod transparent_utxo_set_summary;
 mod tree_state;
 mod utxo_set_commitment;
 mod wallet_scan;
@@ -79,8 +78,7 @@ pub use displaced_block::{
 };
 pub use mempool::{
     MempoolEntry, MempoolEntryBuildError, MempoolEntryParts, MempoolEvictionReason,
-    MempoolObservation, TransparentMempoolOutput, TransparentMempoolOutputsRequest,
-    TransparentMempoolSpend,
+    MempoolObservation, TransparentMempoolOutput, TransparentMempoolSpend,
 };
 pub use network_upgrade_activations::{
     ConsensusBranchId, NetworkUpgradeActivation, NetworkUpgradeActivations,
@@ -107,13 +105,10 @@ pub use transaction_public_facts::{
 pub use transparent_address_balance::TransparentAddressBalance;
 pub use transparent_address_tx_index::TransparentAddressTxIndexArtifact;
 pub use transparent_output::{
-    MAX_TRANSPARENT_OUTPUTS_PER_REQUEST, TransparentAddressScriptHash, TransparentInputFact,
-    TransparentOutPoint, TransparentOutput, TransparentOutputArtifact, TransparentOutputEntry,
-    TransparentOutputFact, TransparentOutputsByOutpointResponse, TransparentSpendEntry,
-    TransparentSpendFact, TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
-    TransparentUnspentOutputsByOutpointResponse,
+    MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST, TransparentAddressScriptHash, TransparentInputFact,
+    TransparentOutPoint, TransparentOutpointSpendStatus, TransparentOutputArtifact,
+    TransparentOutputFact, TransparentSpendEntry, TransparentSpendFact, TransparentUnspentOutput,
 };
-pub use transparent_utxo_set_summary::TransparentUtxoSetSummary;
 pub use tree_state::{BlockFinalNoteCommitmentRoots, FinalNoteCommitmentRoot, TreeStateArtifact};
 pub use wallet_scan::{
     CompactSaplingOutput, CompactSaplingSpend, CompactShieldedAction, CompactTransactionData,

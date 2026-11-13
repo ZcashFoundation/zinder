@@ -50,12 +50,10 @@ The explorer plane exposes this baseline capability string:
 | ------ | ----- |
 | `explorer.server_info_v1` | Explorer server-info descriptor |
 
-Transparent-address balance remains a wallet-plane protocol primitive, not an
-explorer capability. The current release wallet endpoint omits
-`wallet.address.transparent_balance_v1` because no admitted composition owns
-one coherent canonical-and-mempool snapshot; Explorer must not infer support
-from the presence of separate live primitives. The contract is documented in
-[Wallet data plane](../architecture/wallet-data-plane.md).
+Transparent-address balance is not an explorer capability, and the native
+wallet endpoint has no balance method
+([ADR-0043](0043-owned-transparent-wallet-query-surface.md)). The contract is
+documented in [Wallet data plane](../architecture/wallet-data-plane.md).
 
 ### The SDK uses materialized-view vocabulary
 
@@ -101,9 +99,7 @@ An explorer view that needs a new authoritative chain fact extends the source an
 - Operators configure the explorer through `[explorer]` and `ZINDER_EXPLORER__*`.
 - Prometheus scrapes use the `zinder_explorer_*` metric prefix.
 - A deployment that does not run `zinder-explorer` advertises only the
-  structurally admitted `wallet.*` capabilities. It currently omits
-  `wallet.address.transparent_balance_v1`; a missing or unhealthy
-  ingest-control dependency must not be disguised as a zero mempool delta.
+  structurally admitted `wallet.*` capabilities.
 
 ## Alternatives Considered
 

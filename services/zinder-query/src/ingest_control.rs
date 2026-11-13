@@ -14,8 +14,7 @@ use zinder_proto::{
     capabilities::{
         INGEST_CONTROL_MEMPOOL_EVENTS_V2, INGEST_CONTROL_MEMPOOL_SNAPSHOT_V3,
         INGEST_CONTROL_MEMPOOL_TRANSACTION_V2, INGEST_CONTROL_SERVER_INFO_V1,
-        INGEST_CONTROL_TRANSPARENT_MEMPOOL_OUTPUTS_BY_ADDRESS_V1,
-        INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPENDS_BY_OUTPOINT_V1, INGEST_CONTROL_WRITER_STATUS_V1,
+        INGEST_CONTROL_WRITER_STATUS_V1,
     },
     v1::ingest::{
         ServerInfoRequest, WriterStatusRequest, ingest_control_client::IngestControlClient,
@@ -32,14 +31,12 @@ use zinder_runtime::{
 };
 /// Bound applied to native wallet unary ingest-control calls and stream establishment.
 pub(crate) const WALLET_INGEST_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-const REQUIRED_CAPABILITIES: [&str; 7] = [
+const REQUIRED_CAPABILITIES: [&str; 5] = [
     INGEST_CONTROL_SERVER_INFO_V1,
     INGEST_CONTROL_WRITER_STATUS_V1,
     INGEST_CONTROL_MEMPOOL_SNAPSHOT_V3,
     INGEST_CONTROL_MEMPOOL_TRANSACTION_V2,
     INGEST_CONTROL_MEMPOOL_EVENTS_V2,
-    INGEST_CONTROL_TRANSPARENT_MEMPOOL_OUTPUTS_BY_ADDRESS_V1,
-    INGEST_CONTROL_TRANSPARENT_MEMPOOL_SPENDS_BY_OUTPOINT_V1,
 ];
 
 /// One authenticated ingest-control identity admitted before the wallet query binds.

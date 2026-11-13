@@ -9,7 +9,7 @@ import "zinder/v1/wallet/wallet.proto";
 //
 // `common` carries the cross-service identity, capability set, and
 // deprecation metadata defined in [`zinder.v1.ops.ServerInfo`]. The
-// `vendor` field is the only explorer-specific addition today.
+// remaining fields describe the Explorer view plane.
 message ExplorerServerInfo {
   // Cross-service identity and capability descriptor.
   zinder.v1.ops.ServerInfo common = 1;
@@ -23,6 +23,10 @@ message ExplorerServerInfo {
   // Absent until the ingest plane writes its first status record. See
   // `zinder.v1.wallet.MaterializedViewStatus`.
   optional zinder.v1.wallet.MaterializedViewStatus materialized_view_status = 3;
+
+  // Consumer identities of the admitted Explorer view store. Empty when no
+  // view store is admitted. Order is not significant; compare as a set.
+  repeated string materialized_view_identities = 4;
 }
 
 // Server descriptor request.
@@ -232,10 +236,9 @@ message TransactionPublicFacts {
 // Classification of a transaction's transparent prevout resolution state.
 //
 // `TransactionFeesConsumer` writes `RESOLVED` when every transparent input
-// has a known prevout value in the wallet plane's prevout index, `PARTIAL`
-// when at least one is missing, and `UNAVAILABLE` when the indexer is not
-// resolving prevouts at all (the upstream node does not advertise
-// `WALLET_READ_TRANSPARENT_OUTPUTS_V1`).
+// has a known prevout value in the hydrated canonical spend facts, `PARTIAL`
+// when at least one is missing, and `UNAVAILABLE` when the committed block
+// carried no hydrated spend facts for the transaction.
 enum PrevoutResolutionStatus {
   PREVOUT_RESOLUTION_STATUS_UNSPECIFIED = 0;
   PREVOUT_RESOLUTION_STATUS_RESOLVED = 1;
@@ -1218,9 +1221,10 @@ message MempoolActivityResponse {
 // `ExplorerQuery.TransparentAddressActivity` request.
 //
 // Returns confirmed transparent-address activity from the materialized view.
-// Mempool activity for a transparent address is served
-// separately through `MempoolActivity` so each surface has one source
-// of truth.
+// ExplorerQuery has no per-address mempool read: `MempoolActivity` entries
+// carry no outputs or scripts. Pending activity for an address comes from
+// filtering `WalletQuery.MempoolSnapshot` and `MempoolEvents` entries on their
+// `transparent_outputs` and `transparent_spends`.
 message TransparentAddressActivityRequest {
   // Selector for the transparent address being queried.
   zinder.v1.wallet.AddressLookup address = 1;
@@ -1354,8 +1358,10 @@ message TransparentAddressActivityResponse {
 // over an inclusive height range, ordered ascending. One entry per received
 // output and per resolved spend, so the series is strictly finer than
 // `TransparentAddressActivity`, which folds the same events into one net row
-// per transaction. The mempool view is served separately through
-// `MempoolActivity`.
+// per transaction. Pending deltas for an address come from filtering
+// `WalletQuery.MempoolSnapshot` and `MempoolEvents` entries on their
+// `transparent_outputs` and `transparent_spends`; ExplorerQuery has no
+// per-address mempool read.
 message TransparentAddressDeltasRequest {
   // Selector for the transparent address being queried.
   zinder.v1.wallet.AddressLookup address = 1;
@@ -1951,9 +1957,10 @@ service ExplorerQuery {
   rpc MempoolActivity(MempoolActivityRequest) returns (MempoolActivityResponse);
 
   // Returns the confirmed transparent-address activity feed materialized
-  // by `TransparentAddressActivityConsumer`. The mempool view for an
-  // address is served separately through `MempoolActivity` so each
-  // surface has one source of truth. Capability:
+  // by `TransparentAddressActivityConsumer`, newest first. ExplorerQuery has
+  // no per-address mempool read; pending activity comes from filtering
+  // `WalletQuery.MempoolSnapshot` and `MempoolEvents` entries on their
+  // `transparent_outputs` and `transparent_spends`. Capability:
   // `explorer.transparent_address.activity_v2`.
   rpc TransparentAddressActivity(TransparentAddressActivityRequest)
       returns (TransparentAddressActivityResponse);
@@ -2030,12 +2037,6 @@ service ExplorerQuery {
   // `explorer.value_pool.balance_history_v1`.
   rpc ValuePoolBalanceHistory(ValuePoolBalanceHistoryRequest)
       returns (ValuePoolBalanceHistoryResponse);
-
-  // Returns the chain-wide transparent UTXO-set summary: the count and total
-  // value of unspent transparent outputs at the settled tip. Composed from
-  // `WalletQuery.TransparentUtxoSetSummary`. Capability:
-  // `explorer.utxo_set.summary_v1`.
-  rpc UtxoSetSummary(UtxoSetSummaryRequest) returns (UtxoSetSummaryResponse);
 
   // Returns retained chain reorg events from the canonical chain-event log,
   // scanning at most `max_events` retained chain events per request.
@@ -2445,41 +2446,6 @@ message NetworkUpgradeStatusResponse {
   // Branch id of the upgrade active at `tip_height` in 8-character lowercase
   // hex, empty when no advertised upgrade has activated yet.
   string active_upgrade_branch_id_hex = 5;
-}
-
-// `ExplorerQuery.UtxoSetSummary` request.
-message UtxoSetSummaryRequest {
-  // Optional chain-epoch id pin for the canonical read. Absent resolves
-  // against the visible tip; present pins the read to a specific epoch.
-  optional uint64 at_epoch_id = 1;
-}
-
-// `ExplorerQuery.UtxoSetSummary` response.
-//
-// The chain-wide transparent UTXO-set aggregate, computed by a request-time
-// full scan of the current UTXO materialized view at the settled tip
-// (gettxoutsetinfo-equivalent). `hash_serialized` and `bytes_serialized` are
-// intentionally omitted: both depend on a defined UTXO-set serialization
-// ordering that Zinder does not commit to, so only the order-independent
-// count and value totals are reported.
-message UtxoSetSummaryResponse {
-  ExplorerFreshness freshness = 1;
-
-  // Number of unspent transparent outputs at the summarized settled tip.
-  uint64 utxo_count = 2;
-
-  // Sum of the values of every unspent transparent output, in zatoshi.
-  uint64 total_value_zat = 3;
-
-  // Settled tip height the aggregate was taken at. Below this height the
-  // materialized view is the settled-tip unspent set under the configured reorg policy;
-  // a deeper reorg fails closed.
-  uint32 summarized_height = 4;
-
-  // Homomorphic commitment to the full unspent set. Mirrors the wallet-plane
-  // field: present only when the server advertises
-  // `explorer.utxo_set.commitment_v1`, absent otherwise.
-  optional zinder.v1.wallet.TransparentUtxoSetCommitment commitment = 5;
 }
 
 // Per-row record materialized by `TransparentAddressActivityConsumer`.

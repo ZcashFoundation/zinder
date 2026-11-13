@@ -23,10 +23,7 @@ use zinder_core::{
     SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
     TransactionBroadcastOutcome, TransactionComponentCounts, TransactionId, TransactionLocation,
     TransparentAddressBalance, TransparentAddressScriptHash, TransparentOutPoint,
-    TransparentOutputsByOutpointResponse, TransparentSpendFact,
-    TransparentSpendsByOutpointResponse, TransparentUnspentOutput,
-    TransparentUnspentOutputsByOutpointResponse, TransparentUtxoSetSummary,
-    wire::encode_internal_block_hash,
+    TransparentSpendFact, TransparentUnspentOutput, wire::encode_internal_block_hash,
 };
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
@@ -38,8 +35,9 @@ use zinder_query::{
     DEFAULT_MAX_COMPACT_BLOCK_RANGE, FullBlock, FullBlockStream, QueryError, RawTransaction,
     SettledTipBlock, SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
     TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
-    TransparentAddressUnspentOutputsRequest, TreeState, VisibleTipBlock, WalletQueryApi,
-    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    TransparentAddressUnspentOutputsRequest, TransparentOutpointSpendStatuses, TreeState,
+    VisibleTipBlock, WalletQueryApi, WalletServingPairSlot, WalletServingQuery,
+    WalletServingReadPair,
 };
 use zinder_source::{
     NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError, SourceTreeState,
@@ -806,39 +804,6 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
             .await
     }
 
-    async fn transparent_outputs_by_outpoint(
-        &self,
-        outpoints: Vec<TransparentOutPoint>,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransparentOutputsByOutpointResponse, QueryError> {
-        self.record(at_epoch_id);
-        self.inner
-            .transparent_outputs_by_outpoint(outpoints, at_epoch_id)
-            .await
-    }
-
-    async fn transparent_spends_by_outpoint(
-        &self,
-        outpoints: Vec<TransparentOutPoint>,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransparentSpendsByOutpointResponse, QueryError> {
-        self.record(at_epoch_id);
-        self.inner
-            .transparent_spends_by_outpoint(outpoints, at_epoch_id)
-            .await
-    }
-
-    async fn transparent_unspent_outputs_by_outpoint(
-        &self,
-        outpoints: Vec<TransparentOutPoint>,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransparentUnspentOutputsByOutpointResponse, QueryError> {
-        self.record(at_epoch_id);
-        self.inner
-            .transparent_unspent_outputs_by_outpoint(outpoints, at_epoch_id)
-            .await
-    }
-
     async fn transparent_address_unspent_outputs(
         &self,
         request: TransparentAddressUnspentOutputsRequest,
@@ -859,6 +824,17 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
             .await
     }
 
+    async fn transparent_outpoint_spend_status(
+        &self,
+        outpoints: Vec<TransparentOutPoint>,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<TransparentOutpointSpendStatuses, QueryError> {
+        self.record(at_epoch_id);
+        self.inner
+            .transparent_outpoint_spend_status(outpoints, at_epoch_id)
+            .await
+    }
+
     async fn transparent_address_balance(
         &self,
         addresses: Vec<TransparentAddressScriptHash>,
@@ -871,14 +847,6 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         self.inner
             .transparent_address_balance(addresses, at_epoch_id)
             .await
-    }
-
-    async fn transparent_utxo_set_summary(
-        &self,
-        at_epoch_id: Option<ChainEpochId>,
-    ) -> Result<TransparentUtxoSetSummary, QueryError> {
-        self.record(at_epoch_id);
-        self.inner.transparent_utxo_set_summary(at_epoch_id).await
     }
 
     async fn tree_state_at(
@@ -1497,7 +1465,7 @@ async fn send_transaction_reports_broadcast_disabled() -> eyre::Result<()> {
 }
 
 #[tokio::test]
-async fn taddress_balance_projects_native_delta_for_generated_lightwalletd_clients()
+async fn taddress_balance_reports_the_confirmed_total_to_generated_lightwalletd_clients()
 -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture()?;
     let wallet_query = store_fixture.query();
@@ -1505,7 +1473,6 @@ async fn taddress_balance_projects_native_delta_for_generated_lightwalletd_clien
     let query_api = EpochPinRecorder::new(wallet_query).with_transparent_address_balance(
         TransparentAddressBalance {
             confirmed_zat: 1_000,
-            unconfirmed_delta_zat: -375,
             address_count: 1,
             chain_epoch: visible_tip_block.chain_epoch,
         },
@@ -1541,7 +1508,7 @@ async fn taddress_balance_projects_native_delta_for_generated_lightwalletd_clien
             .await?
             .into_inner();
 
-        assert_eq!(unary_balance.value_zat, 625);
+        assert_eq!(unary_balance.value_zat, 1_000);
         assert_eq!(unary_balance, stream_balance);
     }
 

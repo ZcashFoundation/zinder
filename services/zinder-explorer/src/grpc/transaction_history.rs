@@ -1093,7 +1093,7 @@ mod tests {
     use tempfile::tempdir;
     use zinder_core::{BlockHash, ChainEpochId};
     use zinder_materialized_views::{
-        MaterializedViewCoverage, MaterializedViewPreset, MaterializedViewStoreOptions,
+        MaterializedViewCoverage, MaterializedViewStoreOptions, TRANSPARENT_OUTPOINT_SPEND_SCHEMA,
     };
     use zinder_store::RocksDbResourceBudget;
 
@@ -1109,24 +1109,23 @@ mod tests {
     #[test]
     fn typed_readiness_distinguishes_omitted_materializing_and_verified_states()
     -> Result<(), Box<dyn std::error::Error>> {
-        let wallet_path = tempdir()?;
-        let wallet_store = MaterializedViewStore::open_with_materialized_view_preset(
-            wallet_path.path(),
-            MaterializedViewPreset::Wallet,
-            test_options(),
+        let partial_path = tempdir()?;
+        let partial_store = MaterializedViewStore::open(
+            partial_path.path(),
+            MaterializedViewStoreOptions {
+                consumers: &[TRANSPARENT_OUTPOINT_SPEND_SCHEMA],
+                ..test_options()
+            },
         )?;
-        let wallet_reader = TransactionHistoryMaterializedViewReader::new(wallet_store);
+        let partial_reader = TransactionHistoryMaterializedViewReader::new(partial_store);
         assert_eq!(
-            wallet_reader.readiness()?,
+            partial_reader.readiness()?,
             TransactionHistoryMaterializedViewReadiness::Omitted
         );
 
         let explorer_path = tempdir()?;
-        let explorer_store = MaterializedViewStore::open_with_materialized_view_preset(
-            explorer_path.path(),
-            MaterializedViewPreset::Explorer,
-            test_options(),
-        )?;
+        let explorer_store =
+            MaterializedViewStore::open_explorer_views(explorer_path.path(), test_options())?;
         let explorer_reader = TransactionHistoryMaterializedViewReader::new(explorer_store.clone());
         assert_eq!(
             explorer_reader.readiness()?,

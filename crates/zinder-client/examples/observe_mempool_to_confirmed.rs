@@ -3,11 +3,11 @@
 //! Pairs with [`observe_transparent_address`] to demonstrate the
 //! mempool-to-confirmed handoff:
 //!
-//! 1. Snapshot the live mempool outputs for the watched address through
-//!    [`EndpointBackedIndex::transparent_mempool_outputs_by_address`].
+//! 1. Page the live mempool through [`EndpointBackedIndex::mempool_snapshot`]
+//!    and keep the entries whose transparent outputs pay the watched address.
 //! 2. Subscribe to the mempool event log via
-//!    [`EndpointBackedIndex::mempool_events`] to receive
-//!    `Added`/`Mined`/`Invalidated` transitions.
+//!    [`EndpointBackedIndex::mempool_events`] from the snapshot's resume
+//!    cursor to receive `Added`/`Mined`/`Invalidated` transitions.
 //! 3. Track each unconfirmed transaction id observed for the address until
 //!    one of those transitions resolves it; emit one line per state change.
 //!
@@ -38,14 +38,14 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use tokio_stream::StreamExt;
 use zinder_client::{
-    EndpointBackedIndex, EventStreamStart, IndexerError, MempoolEvent, Network, RemoteChainIndex,
-    RemoteOpenOptions, RetryPolicy, TransactionId, TransparentAddressScriptHash,
-    TransparentMempoolOutputsRequest,
+    EndpointBackedIndex, EventStreamStart, IndexerError, MempoolEntry, MempoolEvent,
+    MempoolEventCursor, MempoolSnapshotRequest, Network, RemoteChainIndex, RemoteOpenOptions,
+    RetryPolicy, TransactionId, TransparentAddressScriptHash,
 };
 
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
-const MEMPOOL_SNAPSHOT_LIMIT: u32 = 256;
+const MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 256;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -116,41 +116,57 @@ async fn observe_once(endpoint: &str, network: Network, address: &str) -> Result
     })?;
 
     let script_hash = transparent_address_script_hash(address)?;
-    let watched = snapshot_mempool(&chain_index, script_hash, address).await?;
-    subscribe_mempool_events(chain_index, watched, script_hash).await
+    let (watched, resume_cursor) = snapshot_mempool(&chain_index, script_hash, address).await?;
+    subscribe_mempool_events(chain_index, watched, resume_cursor, script_hash).await
 }
 
 async fn snapshot_mempool(
     chain_index: &RemoteChainIndex,
     script_hash: TransparentAddressScriptHash,
     address: &str,
-) -> Result<HashSet<TransactionId>, IndexerError> {
-    let outputs = chain_index
-        .transparent_mempool_outputs_by_address(TransparentMempoolOutputsRequest {
-            address_script_hash: script_hash,
-            max_entries: MEMPOOL_SNAPSHOT_LIMIT,
-        })
-        .await?;
+) -> Result<(HashSet<TransactionId>, Option<MempoolEventCursor>), IndexerError> {
     let mut watched = HashSet::new();
-    for output in &outputs {
-        watched.insert(output.outpoint.transaction_id);
-        println!(
-            "mempool snapshot: address={} outpoint={:?} value_zat={}",
-            address, output.outpoint, output.value_zat
-        );
+    let mut request = MempoolSnapshotRequest {
+        max_entries: MEMPOOL_SNAPSHOT_PAGE_SIZE,
+        from_cursor: None,
+    };
+    loop {
+        let page = chain_index.mempool_snapshot(request).await?;
+        for entry in &page.entries {
+            for output in entry
+                .transparent_outputs()
+                .iter()
+                .filter(|output| output.address_script_hash == script_hash)
+            {
+                watched.insert(entry.transaction_id());
+                println!(
+                    "mempool snapshot: address={} outpoint={:?} value_zat={}",
+                    address, output.outpoint, output.value_zat
+                );
+            }
+        }
+        let Some(next_cursor) = page.next_cursor else {
+            println!("snapshot complete: tracked={}", watched.len());
+            return Ok((watched, page.events_resume_cursor));
+        };
+        request = MempoolSnapshotRequest {
+            max_entries: MEMPOOL_SNAPSHOT_PAGE_SIZE,
+            from_cursor: Some(next_cursor),
+        };
     }
-    println!("snapshot complete: tracked={}", watched.len());
-    Ok(watched)
 }
 
 async fn subscribe_mempool_events(
     chain_index: RemoteChainIndex,
     initial_watched: HashSet<TransactionId>,
+    resume_cursor: Option<MempoolEventCursor>,
     script_hash: TransparentAddressScriptHash,
 ) -> Result<(), IndexerError> {
-    let mut events = chain_index
-        .mempool_events(EventStreamStart::EarliestRetained)
-        .await?;
+    let start = resume_cursor.map_or(
+        EventStreamStart::EarliestRetained,
+        EventStreamStart::AfterCursor,
+    );
+    let mut events = chain_index.mempool_events(start).await?;
     let mut watched = initial_watched;
     println!(
         "subscribed to mempool events; tracking {} transactions",
@@ -160,8 +176,7 @@ async fn subscribe_mempool_events(
         let envelope = envelope?;
         match envelope.event {
             MempoolEvent::Added { entry } => {
-                if entry_touches_address(&chain_index, &entry.transaction_id(), script_hash).await?
-                    && watched.insert(entry.transaction_id())
+                if entry_pays_address(&entry, script_hash) && watched.insert(entry.transaction_id())
                 {
                     println!(
                         "mempool added: tx={:?} first_seen_unix_millis={}",
@@ -203,20 +218,11 @@ async fn subscribe_mempool_events(
     Ok(())
 }
 
-async fn entry_touches_address(
-    chain_index: &RemoteChainIndex,
-    transaction_id: &TransactionId,
-    script_hash: TransparentAddressScriptHash,
-) -> Result<bool, IndexerError> {
-    let outputs = chain_index
-        .transparent_mempool_outputs_by_address(TransparentMempoolOutputsRequest {
-            address_script_hash: script_hash,
-            max_entries: MEMPOOL_SNAPSHOT_LIMIT,
-        })
-        .await?;
-    Ok(outputs
+fn entry_pays_address(entry: &MempoolEntry, script_hash: TransparentAddressScriptHash) -> bool {
+    entry
+        .transparent_outputs()
         .iter()
-        .any(|output| &output.outpoint.transaction_id == transaction_id))
+        .any(|output| output.address_script_hash == script_hash)
 }
 
 fn transparent_address_script_hash(
