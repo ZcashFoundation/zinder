@@ -176,8 +176,8 @@ The most valuable automated check that exercises a real node. CI runs it
 against both certified nodes, Zebra 7.0.0 and Zakura 1.8.6, every night and on
 pull requests. The live and parity workflows share one pull request path
 filter: a crate the live or parity tests exercise, the workspace manifest or
-lockfile, the nextest configuration, either node TOML, the mining script, or
-either workflow.
+lockfile, the nextest configuration, either node TOML, the mining or indexer
+TLS script, or either workflow.
 
 ### Prerequisites
 
@@ -193,8 +193,9 @@ either workflow.
    `ZEBRA_RPC__INDEXER_LISTEN_ADDR=0.0.0.0:8155` (mapped to host `39155`).
    Zakura refuses a plaintext indexer listener on any non-loopback address, so
    bind it to loopback and run the container on the host network, as
-   `deploy/zakura/regtest.toml` does. Without an indexer address, the
-   indexer-gRPC tests skip.
+   `deploy/zakura/regtest.toml` does. CI serves the Zakura indexer over mutual
+   TLS, as described in [Regtest through NU7](#regtest-through-nu7). Without an
+   indexer address, the indexer-gRPC tests skip.
 3. **Auth method** matches what the node publishes. The default sidecar and
    the CI nodes disable cookie auth and ignore the basic-auth pair
    `zebra:zebra`.
@@ -261,6 +262,16 @@ Zakura differs in three ways:
   TOML binds every listener, including the QUIC endpoint, to loopback, and the
   container runs on the host network.
 
+The live workflow also serves Zakura's indexer over mutual TLS, so the indexer
+tests exercise Zinder's TLS client against a real node, while the Zebra leg
+covers the plaintext channel. `scripts/generate-live-indexer-tls.sh` writes
+throwaway material into a new directory: a CA in `ca.pem`, the node's
+certificate for `localhost` and `127.0.0.1` in `server.pem` and
+`server-key.pem`, and Zinder's client certificate in `client.pem` and
+`client-key.pem`. Every file is readable only by you, so the node must run as
+your user. The certificates expire after two days; delete the directory and
+run the script again to renew them.
+
 Start it twice on the same state: first with the unified address in the TOML
 as miner for 10 blocks, then with the transparent broadcast test key. Zakura
 backs up its non-finalized state at most every 5 seconds and does not flush it
@@ -270,6 +281,7 @@ your own user on a state directory you own:
 
 ```bash
 mkdir -p .tmp/zakura-regtest-state
+scripts/generate-live-indexer-tls.sh .tmp/indexer-tls
 start_zakura() {
   docker run -d --name zakura-regtest --network host \
     --user "$(id -u):$(id -g)" --entrypoint /usr/local/bin/zakurad \
@@ -277,6 +289,10 @@ start_zakura() {
     --health-interval 5s --health-timeout 5s --health-retries 12 \
     -v "$PWD/deploy/zakura/regtest.toml:/etc/zakura/zakurad.toml:ro" \
     -v "$PWD/.tmp/zakura-regtest-state:/var/lib/zakura/state" \
+    -v "$PWD/.tmp/indexer-tls:/etc/zakura/indexer-tls:ro" \
+    -e ZAKURA_RPC__INDEXER_TLS__CERT_FILE=/etc/zakura/indexer-tls/server.pem \
+    -e ZAKURA_RPC__INDEXER_TLS__KEY_FILE=/etc/zakura/indexer-tls/server-key.pem \
+    -e ZAKURA_RPC__INDEXER_TLS__CLIENT_CA_FILE=/etc/zakura/indexer-tls/ca.pem \
     "$@" \
     docker.io/zakuracore/zakura:1.8.6@sha256:e514c89b751b685686690098928507aaa994311e6b90c79373c55b0afaa45d50 \
     --config /etc/zakura/zakurad.toml start
@@ -347,10 +363,20 @@ logs `nu7_activation_already_reached` and returns.
 Then run the rest of the suite as in [Run](#run). For Zebra, set
 `ZINDER_NODE__INDEXER_GRPC_ADDR=http://127.0.0.1:39155` and
 `ZINDER_TEST_INDEXER_CONTAINER_NAME=zebra-regtest`. For Zakura, set
-`ZINDER_NODE__INDEXER_GRPC_ADDR=http://127.0.0.1:39230` and
-`ZINDER_TEST_INDEXER_CONTAINER_NAME=zakura-regtest`. Run the restart test last
-and at least 6 seconds after the last mined block, so the node's non-finalized
-backup holds the whole chain when the container restarts.
+`ZINDER_TEST_INDEXER_CONTAINER_NAME=zakura-regtest` and the TLS indexer
+settings. nextest runs each test binary from its own crate directory, so the
+paths must be absolute:
+
+```bash
+export ZINDER_NODE__INDEXER_GRPC_ADDR=https://127.0.0.1:39230
+export ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH="$PWD/.tmp/indexer-tls/ca.pem"
+export ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH="$PWD/.tmp/indexer-tls/client.pem"
+export ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH="$PWD/.tmp/indexer-tls/client-key.pem"
+```
+
+Run the restart test last and at least 6 seconds after the last mined block,
+so the node's non-finalized backup holds the whole chain when the container
+restarts.
 
 #### What the NU7 Regtest run covers
 
@@ -365,8 +391,8 @@ Zebra 7.0.0 and on Zakura 1.8.6. It covers:
 - Typed broadcast outcomes across NU7, through the node broadcaster and,
   with `ZINDER_TEST_QUERY_GRPC_ADDR`, through a running `zinder-query`.
 - The rest of the live suite on a chain past NU7, including the indexer
-  mempool tests and the indexer restart test, over a loopback plaintext
-  indexer channel on both nodes.
+  mempool tests and the indexer restart test, over a loopback indexer channel:
+  plaintext on Zebra, and mutual TLS with a private CA on Zakura.
 - `zinder-compat-lightwalletd` parity with lightwalletd v0.6.0 over a fixed
   fence past NU7, in the parity workflow (see
   [Parity against a reference lightwalletd](#t3-parity-against-a-reference-lightwalletd)).
@@ -375,7 +401,8 @@ It does not cover:
 
 - Any node other than Zebra 7.0.0 and Zakura 1.8.6, and Zakura's Sapling and
   Orchard pools, which its coinbase cannot pay.
-- A TLS indexer channel.
+- Indexer TLS that verifies the node against the system roots or through a
+  `server_name` override, or that reloads rotated certificate files.
 - NU7 activation on Testnet or Mainnet, or production capacity.
 - Shielded spends. The shielded pools hold only coinbase outputs, so no
   shielded nullifier is exercised and no subtree completes; both sides report
@@ -394,9 +421,17 @@ curl -s -u zebra:zebra -H "Content-Type: application/json" \
 # Indexer gRPC reachable (and feature compiled in)
 grpcurl -plaintext 127.0.0.1:39155 list
 # Expect: zebra.indexer.rpc.Indexer
+
+# Zakura's mutual-TLS indexer accepts Zinder's client certificate. Zakura
+# serves no reflection, so check the handshake instead of listing services.
+openssl s_client -connect 127.0.0.1:39230 -alpn h2 \
+  -CAfile .tmp/indexer-tls/ca.pem -verify_return_error \
+  -cert .tmp/indexer-tls/client.pem -key .tmp/indexer-tls/client-key.pem \
+  </dev/null 2>&1 | grep -E 'ALPN protocol|Verify return code'
+# Expect: ALPN protocol: h2, Verify return code: 0 (ok)
 ```
 
-If either probe fails, fix the sidecar before running tests. Don't use a
+If a probe fails, fix the node before running tests. Don't use a
 "--insecure" or "--ignore-failures" flag to paper over a missing service.
 
 ### Cleanup between runs
@@ -493,7 +528,8 @@ The two indexer tests build their channel from the same `[node]` settings as
 an `https://` `ZINDER_NODE__INDEXER_GRPC_ADDR` and the
 `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH`,
 `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH`, and
-`ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH` file paths. Add
+`ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH` file paths, as the Zakura leg does
+in [Regtest through NU7](#regtest-through-nu7). Add
 `ZINDER_NODE__INDEXER_TLS__SERVER_NAME` when the node's certificate does not
 name the URL host.
 
