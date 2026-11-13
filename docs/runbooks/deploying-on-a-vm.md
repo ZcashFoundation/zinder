@@ -136,8 +136,8 @@ Earlier releases derived the project, network, and cookie volume names from
 ignores `Z3_NETWORK_LOWER` and requires the new variables. Before you start
 an upgraded checkout, edit `/etc/zinder/env`:
 
-1. Replace `Z3_NETWORK_LOWER=<network>` with `ZINDER_DEPLOY_NETWORK=<network>`.
-   Keep the same value: it keeps the `zinder-<network>` project and volume
+1. Add `ZINDER_DEPLOY_NETWORK=<network>` next to `Z3_NETWORK_LOWER=<network>`.
+   Use the same value: it keeps the `zinder-<network>` project and volume
    names, so the existing stores stay attached.
 2. Add `ZINDER_SOURCE_NETWORK_NAME=z3-<network>` and
    `ZINDER_SOURCE_COOKIE_VOLUME_NAME=z3-<network>-cookie`.
@@ -148,6 +148,11 @@ an upgraded checkout, edit `/etc/zinder/env`:
 
 Comparing the file with the current `deploy/.env.<network>` shows any other
 missing value.
+
+Keep the old `Z3_NETWORK_LOWER=<network>` line until the upgrade is final.
+An earlier checkout ignores the new variables and falls back to
+`zinder-mainnet` without it, so a rollback on a testnet or regtest host would
+attach to the wrong project and volumes.
 
 Create the root-owned file-backed control-secret directory before validating
 Compose. The ordinary ingest token is mounted into all four runtimes; the
