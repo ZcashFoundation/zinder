@@ -281,12 +281,18 @@ fn tls_material_unreadable(
 /// Renders a tonic transport error with its sources, which carry the I/O or
 /// rustls reason, such as an unknown certificate issuer, that tonic's own
 /// message omits.
-fn transport_error_chain(error: &tonic::transport::Error) -> String {
+///
+/// A source whose message the rendering already ends with is skipped: the I/O
+/// wrapper around a rustls error repeats that error's message.
+fn transport_error_chain(error: &dyn std::error::Error) -> String {
     let mut rendered = error.to_string();
-    let mut source = std::error::Error::source(error);
+    let mut source = error.source();
     while let Some(cause) = source {
-        rendered.push_str(": ");
-        rendered.push_str(&cause.to_string());
+        let message = cause.to_string();
+        if !rendered.ends_with(&message) {
+            rendered.push_str(": ");
+            rendered.push_str(&message);
+        }
         source = cause.source();
     }
     rendered
@@ -527,6 +533,69 @@ fn record_transport_event(peer: &str, event: TransportEvent, reason: &'static st
         "reason" => reason,
     )
     .increment(1);
+}
+
+#[cfg(test)]
+mod transport_error_chain_tests {
+    use std::fmt;
+
+    use super::transport_error_chain;
+
+    #[derive(Debug)]
+    struct ChainedError {
+        message: &'static str,
+        source: Option<Box<Self>>,
+    }
+
+    impl fmt::Display for ChainedError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(self.message)
+        }
+    }
+
+    impl std::error::Error for ChainedError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source
+                .as_deref()
+                .map(|source| source as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    fn chain(message: &'static str, causes: &[&'static str]) -> ChainedError {
+        let source = causes.iter().rev().fold(None, |source, message| {
+            Some(Box::new(ChainedError { message, source }))
+        });
+        ChainedError { message, source }
+    }
+
+    #[test]
+    fn keeps_every_distinct_cause() {
+        let error = chain(
+            "transport error",
+            &["tcp connect error", "Connection refused"],
+        );
+
+        assert_eq!(
+            transport_error_chain(&error),
+            "transport error: tcp connect error: Connection refused"
+        );
+    }
+
+    #[test]
+    fn skips_a_cause_its_wrapper_already_printed() {
+        let error = chain(
+            "transport error",
+            &[
+                "invalid peer certificate: UnknownIssuer",
+                "invalid peer certificate: UnknownIssuer",
+            ],
+        );
+
+        assert_eq!(
+            transport_error_chain(&error),
+            "transport error: invalid peer certificate: UnknownIssuer"
+        );
+    }
 }
 
 #[cfg(test)]
