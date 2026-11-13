@@ -51,8 +51,8 @@ rejected and invalid cross-field combinations fail before storage opens. A
 service does not accept a section for a role it does not own, but a shared
 section type accepts every field of its role pair: for example, `[node]`
 accepts the ingest-only `indexer_grpc_addr` and `[node.indexer_tls]` in every
-binary that reads `[node]`, and `[ingest_control]` accepts both the writer fields and the reader
-fields. A binary ignores the fields it does not consume. The environment-variable
+binary that reads `[node]`, and `[ingest_control]` accepts both the writer
+fields and the reader fields. A binary ignores the fields it does not consume. The environment-variable
 reference names the binaries that read a variable into their configuration, and
 a description states when a listed binary does not apply it, such as RocksDB
 background job caps on secondary opens.
