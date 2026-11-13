@@ -82,7 +82,7 @@ The request shape is valid but the deployment is in a state that cannot serve it
 | `MATERIALIZED_VIEW_UNAVAILABLE` | A required wallet projection or explorer materialized view is not configured for this deployment | `type=MATERIALIZED_VIEW_UNAVAILABLE, subject=<capability>` |
 | `ENDPOINT_CAPABILITY_UNAVAILABLE` | The admitted wallet endpoint does not expose the capability required by this operation | `type=ENDPOINT_CAPABILITY_UNAVAILABLE, subject=<capability>` |
 | `DEPENDENCY_NOT_CONFIGURED` | A federated dependency the explorer request needs (the canonical store, a materialized view, or a wallet-query endpoint) is not wired on this deployment | — |
-| `NODE_CAPABILITY_MISSING` | The upstream Zcash node does not advertise a capability the request requires; the operator must reconfigure the node | — |
+| `NODE_CAPABILITY_MISSING` | The upstream Zcash node does not advertise a capability the request requires, or permanently refuses the requested historical data (for example, tree states below a fast-synced node's checkpoint); the operator must reconfigure or replace the node | — |
 | `EXPLORER_PRECONDITION_UNSATISFIED` | An explorer read cannot serve the requested transaction state | — |
 | `CANONICAL_HISTORY_UNAVAILABLE` | The store's retained canonical history starts after a checkpoint, so a transaction lookup that missed cannot prove an absence; query a store with complete history. An unpinned lookup returns it only after the live mempool also missed, so a pending transaction is still reported | `ErrorInfo.metadata["first_available_height"]` |
 
