@@ -1,0 +1,59 @@
+# Node cookie permissions for the single-host Compose topology.
+#
+# Zebra and Zakura write the JSON-RPC cookie as UID 10001 with mode 0600 and
+# replace it on every node start. Zinder runs as UID 1000, so it cannot read
+# the cookie as written. This project runs beside the node and re-applies mode
+# 0644 to the cookie in place every 5 seconds. It never copies the cookie.
+#
+# Start it with the same env file as the Zinder deployment, after the node has
+# created its cookie volume:
+#
+#   docker compose --env-file deploy/.env.zakura-mainnet \
+#     -f deploy/node-cookie-permissions.yml up -d
+#
+# Z3 already runs an equivalent service, so the Z3 env files do not need it.
+# It is a separate Compose project, so stopping or replacing the Zinder
+# deployment leaves it running.
+#
+# After a node restart, Zinder can find the cookie unreadable for up to one
+# poll interval. Ingest treats that as an unavailable node and retries.
+name: zinder-${ZINDER_DEPLOY_NETWORK:?set ZINDER_DEPLOY_NETWORK to mainnet, testnet, or regtest}-node-cookie
+
+services:
+  cookie-permissions:
+    image: alpine:3.22
+    # The node's UID owns the cookie, so it can change the mode without
+    # capabilities.
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    network_mode: none
+    init: true
+    mem_limit: 16m
+    pids_limit: 16
+    restart: unless-stopped
+    volumes:
+      - node-cookie:/var/run/auth
+    command:
+      - sh
+      - -c
+      - |
+        cookie=/var/run/auth/.cookie
+        while true; do
+          if [ -f "$$cookie" ] && [ "$$(stat -c %a "$$cookie")" != 644 ]; then
+            chmod 0644 "$$cookie" || echo "cannot change the mode of $$cookie; it must be owned by UID 10001" >&2
+          fi
+          sleep 5
+        done
+    healthcheck:
+      test: ["CMD-SHELL", "test \"$$(stat -c %a /var/run/auth/.cookie)\" = 644"]
+      interval: 10s
+      timeout: 2s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  node-cookie:
+    external: true
+    name: ${ZINDER_SOURCE_COOKIE_VOLUME_NAME:?set the node's external cookie volume name}

@@ -6,6 +6,10 @@
 #
 # The pinned release checkout is expected at /opt/zinder; adjust
 # WorkingDirectory below if your operator-chosen layout differs.
+#
+# /etc/zinder/env is a copy of one deploy/.env.* file. Its
+# ZINDER_DEPLOY_NETWORK names the Compose project that ExecStartPre removes
+# with --remove-orphans, so Compose refuses to run when it is unset.
 
 [Unit]
 Description=Zinder Zcash indexer (Compose topology)

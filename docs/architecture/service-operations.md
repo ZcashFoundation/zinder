@@ -490,9 +490,12 @@ which predate schedule admission, remain readable.
 ## Deployment support
 
 The complete supported composition is the same-host RocksDB deployment in
-`deploy/docker-compose.yml` and `deploy/systemd/`. The runtime release-image
-catalog, `deploy/release-images.json`, is limited to ingest, projector, native
-query, and lightwalletd compatibility. A release also publishes the two
+`deploy/docker-compose.yml` and `deploy/systemd/`. It attaches to an external
+Zebra or Zakura node selected entirely by a `deploy/.env.*` file, and
+`deploy/node-cookie-permissions.yml` makes a non-Z3 node's cookie readable to
+the Zinder runtimes. The runtime release-image catalog,
+`deploy/release-images.json`, is limited to ingest, projector, native query,
+and lightwalletd compatibility. A release also publishes the two
 single-volume host images in `deploy/release-single-volume-images.json` for
 hosts that attach one volume to one container: `zinder-wallet-serving`, which
 is native-only and omits lightwalletd compatibility, and

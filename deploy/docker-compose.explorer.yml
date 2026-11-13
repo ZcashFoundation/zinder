@@ -41,11 +41,11 @@ services:
     volumes:
       - data:/var/lib/zinder
       - ./config/explorer.toml:/etc/zinder/config.toml:ro
-      - z3-cookie:/var/run/auth:ro
+      - node-cookie:/var/run/auth:ro
     command: ["--config", "/etc/zinder/config.toml"]
     environment:
-      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:-zcash-mainnet}
-      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:-http://zebra:8232}
+      ZINDER_NETWORK__NAME: ${ZINDER_NETWORK__NAME:?set the Zinder network name}
+      ZINDER_NODE__JSON_RPC_ADDR: ${ZINDER_NODE__JSON_RPC_ADDR:?set the node JSON-RPC URL}
       ZINDER_NODE__AUTH__METHOD: ${ZINDER_NODE__AUTH__METHOD:-cookie}
       ZINDER_EXPLORER__LISTEN_ADDR: "[::]:9068"
       ZINDER_OPS__LISTEN_ADDR: "[::]:9069"

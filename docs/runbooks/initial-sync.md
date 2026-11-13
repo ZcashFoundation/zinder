@@ -12,7 +12,9 @@ Use empty target paths or a certified coherent restore bundle.
 ## Prerequisites
 
 - A Zebra or Zakura archive node on the selected network with required
-  JSON-RPC capabilities. See [Archive node required for ingest](#archive-node-required-for-ingest).
+  JSON-RPC capabilities, attached as described in
+  [Deploying on a VM](deploying-on-a-vm.md#deploy-with-compose). See
+  [Archive node required for ingest](#archive-node-required-for-ingest).
 - Enough local storage for canonical data, wallet state, staging, compaction,
   checkpoints, and growth reserve.
 - Stable canonical and wallet primary paths on one host filesystem.
@@ -21,7 +23,8 @@ Use empty target paths or a certified coherent restore bundle.
 - Resource limits that leave headroom outside RocksDB caches and memtables.
 
 For Z3-managed nodes, start and synchronize the selected Z3 network before
-starting Zinder.
+starting Zinder. The example uses the Z3 Testnet env file; pick the file for
+your node and network from the table in the VM runbook.
 
 ## Start the stack
 
