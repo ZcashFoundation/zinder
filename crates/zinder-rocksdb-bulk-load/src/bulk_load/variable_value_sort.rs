@@ -95,6 +95,28 @@ impl TemporaryFileBudget {
         Ok(())
     }
 
+    /// Reserves one more initial run of a sort that already holds a run.
+    ///
+    /// Finishing a sort with two or more runs ends in one merge that writes
+    /// every record again while all of its input runs still exist, so the sort
+    /// needs at least twice its total run bytes. Refusing here, before the run
+    /// is written, stops a sort that cannot finish while records are still
+    /// arriving instead of after the whole input has been spilled.
+    fn reserve_merged_run(&mut self, bytes: u64) -> Result<(), BulkLoadError> {
+        let required_bytes = self
+            .bytes_in_use
+            .checked_add(bytes)
+            .and_then(|run_bytes| run_bytes.checked_mul(2))
+            .ok_or_else(|| BulkLoadError::invalid("temporary file bytes exceed u64::MAX"))?;
+        if required_bytes > self.byte_limit {
+            return Err(BulkLoadError::TemporaryFileLimit {
+                limit_bytes: self.byte_limit,
+                required_bytes,
+            });
+        }
+        self.reserve(bytes)
+    }
+
     fn release(&mut self, bytes: u64) -> Result<(), BulkLoadError> {
         self.bytes_in_use = self
             .bytes_in_use
@@ -110,7 +132,8 @@ impl TemporaryFileBudget {
 /// Allocator metadata and the fixed per-run buffered-I/O overhead are not part
 /// of that caller-selected ceiling; merge fan-in caps the latter independently.
 /// Temporary-file admission accounts for both input and output runs while a
-/// merge is in progress. Duplicate keys remain adjacent for the domain caller
+/// merge is in progress, and refuses a new run as soon as the final merge
+/// could no longer fit under the ceiling. Duplicate keys remain adjacent for the domain caller
 /// to accept or reject.
 pub struct VariableValueSorter<const KEY_LEN: usize> {
     workspace: TempDir,
@@ -188,7 +211,8 @@ impl<const KEY_LEN: usize> VariableValueSorter<KEY_LEN> {
             .checked_add(record_bytes)
             .ok_or_else(|| BulkLoadError::invalid("accounted record bytes exceed u64::MAX"))?;
         if required_bytes > self.max_accounted_memory_bytes {
-            self.flush_run()?;
+            self.flush_run()
+                .map_err(BulkLoadError::temporary_file_limit_before_finish)?;
         }
 
         self.staged_records.try_reserve_exact(1).map_err(|source| {
@@ -293,7 +317,11 @@ impl<const KEY_LEN: usize> VariableValueSorter<KEY_LEN> {
                     .checked_add(encoded_run_record_bytes::<KEY_LEN>(value_bytes)?)
                     .ok_or_else(|| BulkLoadError::invalid("run file bytes exceed u64::MAX"))
             })?;
-        self.temporary_files.reserve(run_file_bytes)?;
+        if self.runs.is_empty() {
+            self.temporary_files.reserve(run_file_bytes)?;
+        } else {
+            self.temporary_files.reserve_merged_run(run_file_bytes)?;
+        }
         let path = self
             .workspace
             .path()
@@ -828,6 +856,52 @@ mod tests {
             Err(BulkLoadError::TemporaryFileLimit { .. })
         ));
         assert_eq!(fs::read_dir(temporary.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn spill_refuses_once_the_final_merge_cannot_fit() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let one_run_bytes = encoded_run_record_bytes::<1>(1)?;
+        let mut staged_sort = VariableValueSorter::<1>::new(
+            temporary.path(),
+            "early-disk-limit",
+            one_record_memory_limit::<1>(1),
+            one_run_bytes.checked_mul(3).ok_or("test byte overflow")?,
+        )?;
+        staged_sort.push([3], b"c")?;
+        staged_sort.push([2], b"b")?;
+        let refused = staged_sort.push([1], b"a");
+
+        assert!(matches!(
+            refused,
+            Err(BulkLoadError::TemporaryFileLimitBeforeFinish { limit_bytes, required_bytes })
+                if Some(limit_bytes) == one_run_bytes.checked_mul(3)
+                    && Some(required_bytes) == one_run_bytes.checked_mul(4)
+        ));
+        assert_eq!(staged_sort.runs.len(), 1);
+        assert_eq!(fs::read_dir(staged_sort.workspace.path())?.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn single_run_needs_no_merge_headroom() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let one_run_bytes = encoded_run_record_bytes::<1>(1)?;
+        let mut staged_sort = VariableValueSorter::<1>::new(
+            temporary.path(),
+            "single-run",
+            one_record_memory_limit::<1>(1),
+            one_run_bytes,
+        )?;
+        staged_sort.push([1], b"a")?;
+        let sorted_records = staged_sort.finish()?;
+
+        assert_eq!(sorted_records.evidence().merge_pass_count, 0);
+        assert_eq!(
+            sorted_records.evidence().peak_temporary_file_bytes,
+            one_run_bytes
+        );
         Ok(())
     }
 

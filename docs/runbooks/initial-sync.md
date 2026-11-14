@@ -121,6 +121,32 @@ elapses), and binds a wallet build plan to that source identity. It acquires
 a wallet projection build lease and a writer-owned canonical retention lease,
 then builds the wallet store in its owned path.
 
+Construction sorts transparent outputs, spends, and address rows externally.
+Each sorter spills to a staging directory beside the wallet store, up to
+`projector.build.max_temporary_file_bytes_per_sorter` bytes. The default is
+206158430208 (192 GiB). A sorter that spills more than one run needs about
+twice its spilled bytes, because its final merge writes every record again
+while the input runs still exist. In late 2026, the largest sorter of a Mainnet
+build from genesis, the outpoint sorter, needed about 99 GB.
+
+The ceiling applies to each sorter separately, but the staging directory holds
+several sorters' files and the finished SST files at the same time. While the
+outpoint sorter's merged run is read, the address sorters and the spent-output
+SST files grow beside it. The address-transaction sorter then merges while
+those SST files remain. In a November 2026 Mainnet build from genesis, staging
+peaked at about 117 GB near the end of the outpoint drain, and at about 110 GB
+during the address-transaction merge. Keep about 130 GB free on the volume when
+wallet construction starts. The finished wallet store keeps part of that space. The
+ceiling does not check free space, so an undersized volume fails with a
+disk-full error late in construction.
+
+If the ceiling is too small, the projector stops as soon as a sorter's final
+merge can no longer fit, which is usually while the canonical scan is still
+running. The figure in that error covers only the records sorted so far, so it
+is not a target: unset the setting to use the default, or raise it well above
+that figure. A sorter refused after its input ended reports its exact
+requirement instead. A restart with the same setting fails the same way.
+
 Wallet publication requires the complete build digest and source position to
 match the admitted canonical fence. The projector then catches up and takes
 continuous following ownership before releasing construction leases.

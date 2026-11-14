@@ -1,0 +1,6 @@
+kind: fixed
+body: "The default wallet-build spill ceiling no longer stops a Mainnet wallet build from genesis. A complete Mainnet build with the shipped wallet-serving image still needs longer construction deadlines (#158). `projector.build.max_temporary_file_bytes_per_sorter` (`ZINDER_PROJECTOR__BUILD__MAX_TEMPORARY_FILE_BYTES_PER_SORTER`) now defaults to 206158430208 (192 GiB) instead of 64 GiB, because the largest sorter of a Mainnet build needs about 99 GB. Several sorters spill at once, so keep about 130 GB free on the volume when a Mainnet wallet construction starts. When the setting is too small, `zinder-projector` now usually stops during the canonical scan instead of after it, with an error that names the setting and its environment variable. A refusal before a sorter has seen all of its records gives only a lower bound, so unset the setting or raise it well above that figure. Explicitly configured values are unchanged."
+time: 2026-11-14T12:00:00Z
+custom:
+  Bump: patch
+  PR: "164"

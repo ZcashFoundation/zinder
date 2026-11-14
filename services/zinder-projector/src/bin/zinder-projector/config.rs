@@ -38,7 +38,7 @@ const DEFAULT_FENCE_CONVERGENCE_TIMEOUT_SECONDS: u64 = 30;
 const MINIMUM_LEASE_DURATION_SECONDS: u64 = 4 * 60 * 60;
 const DEFAULT_OUTPOINT_SORT_MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const DEFAULT_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER: u64 = 1024 * 1024 * 1024;
-const DEFAULT_TEMPORARY_FILE_BYTES_PER_SORTER: u64 = 64 * 1024 * 1024 * 1024;
+const DEFAULT_TEMPORARY_FILE_BYTES_PER_SORTER: u64 = 192 * 1024 * 1024 * 1024;
 const DEFAULT_SST_TARGET_LOGICAL_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_ACCOUNTED_REORG_UNDO_BYTES: u64 = 512 * 1024 * 1024;
 /// One following transition may account for at most this many logical bytes
@@ -129,7 +129,27 @@ pub(crate) enum ProjectorError {
     CanonicalStore(#[from] zinder_store::CanonicalStoreError),
 
     #[error(transparent)]
-    WalletStore(#[from] zinder_wallet_rocksdb::RocksDbWalletError),
+    WalletStore(zinder_wallet_rocksdb::RocksDbWalletError),
+
+    #[error(
+        "wallet construction needs {required_bytes} temporary bytes in one sorter, but projector.build.max_temporary_file_bytes_per_sorter (ZINDER_PROJECTOR__BUILD__MAX_TEMPORARY_FILE_BYTES_PER_SORTER) is {limit_bytes}; set it to at least {required_bytes} and free that much space beside the wallet store, because restarting with the same setting fails again"
+    )]
+    WalletBuildTemporaryFileLimit {
+        /// Configured per-sorter temporary-file ceiling.
+        limit_bytes: u64,
+        /// Temporary bytes the refused sort needs.
+        required_bytes: u64,
+    },
+
+    #[error(
+        "wallet construction stopped a sorter whose input had not ended: the records so far already need {required_bytes} temporary bytes, more than projector.build.max_temporary_file_bytes_per_sorter (ZINDER_PROJECTOR__BUILD__MAX_TEMPORARY_FILE_BYTES_PER_SORTER) allows ({limit_bytes}), and the complete sort needs more; unset it to use the default of {DEFAULT_TEMPORARY_FILE_BYTES_PER_SORTER} bytes, which covers a Mainnet build from genesis, or raise it well above {required_bytes} with matching free space beside the wallet store, because restarting with the same setting fails again"
+    )]
+    WalletBuildTemporaryFileLimitBeforeFinish {
+        /// Configured per-sorter temporary-file ceiling.
+        limit_bytes: u64,
+        /// Temporary bytes required by the records sorted so far.
+        required_bytes: u64,
+    },
 
     #[error(transparent)]
     CanonicalControl(#[from] crate::canonical_writer_control::CanonicalWriterControlError),
@@ -215,6 +235,37 @@ pub(crate) enum ProjectorError {
 
     #[error("could not generate a unique canonical retention lease identity: {0}")]
     RetentionLeaseEntropy(#[from] getrandom::Error),
+}
+
+impl From<zinder_wallet_rocksdb::RocksDbWalletError> for ProjectorError {
+    fn from(error: zinder_wallet_rocksdb::RocksDbWalletError) -> Self {
+        use zinder_rocksdb_bulk_load::BulkLoadError;
+        use zinder_wallet_rocksdb::RocksDbWalletError;
+
+        // An undersized spill ceiling is an operator setting, not a storage
+        // fault, and every restart with the same value fails the same way.
+        if let RocksDbWalletError::BulkLoad(BulkLoadError::TemporaryFileLimit {
+            limit_bytes,
+            required_bytes,
+        }) = error
+        {
+            return Self::WalletBuildTemporaryFileLimit {
+                limit_bytes,
+                required_bytes,
+            };
+        }
+        if let RocksDbWalletError::BulkLoad(BulkLoadError::TemporaryFileLimitBeforeFinish {
+            limit_bytes,
+            required_bytes,
+        }) = error
+        {
+            return Self::WalletBuildTemporaryFileLimitBeforeFinish {
+                limit_bytes,
+                required_bytes,
+            };
+        }
+        Self::WalletStore(error)
+    }
 }
 
 /// Loads and validates projector configuration.
@@ -739,10 +790,80 @@ fn encode_hex(bytes: [u8; 16]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use zinder_rocksdb_bulk_load::BulkLoadError;
+    use zinder_wallet_rocksdb::RocksDbWalletError;
+
     use super::{
-        DEFAULT_FOLLOW_MAX_TRANSITION_LOGICAL_BYTES, MAX_FOLLOW_MAX_TRANSITION_LOGICAL_BYTES,
-        ProjectorFollowSection, resolve_follow_config,
+        DEFAULT_FOLLOW_MAX_TRANSITION_LOGICAL_BYTES, DEFAULT_TEMPORARY_FILE_BYTES_PER_SORTER,
+        MAX_FOLLOW_MAX_TRANSITION_LOGICAL_BYTES, ProjectorError, ProjectorFollowSection,
+        resolve_follow_config,
     };
+
+    /// Largest single-sorter spill observed for a Mainnet wallet build from
+    /// genesis in late 2026.
+    const OBSERVED_MAINNET_SORTER_SPILL_BYTES: u64 = 98_524_054_494;
+
+    #[test]
+    fn default_spill_ceiling_doubles_the_observed_mainnet_requirement() {
+        assert!(
+            OBSERVED_MAINNET_SORTER_SPILL_BYTES
+                .checked_mul(2)
+                .is_some_and(|headroom| DEFAULT_TEMPORARY_FILE_BYTES_PER_SORTER >= headroom)
+        );
+    }
+
+    #[test]
+    fn spill_refused_before_the_input_ended_is_not_reported_as_the_target() {
+        let error = ProjectorError::from(RocksDbWalletError::BulkLoad(
+            BulkLoadError::TemporaryFileLimitBeforeFinish {
+                limit_bytes: 68_719_476_736,
+                required_bytes: 69_000_000_000,
+            },
+        ));
+        let message = error.to_string();
+
+        assert!(matches!(
+            error,
+            ProjectorError::WalletBuildTemporaryFileLimitBeforeFinish {
+                limit_bytes: 68_719_476_736,
+                required_bytes: 69_000_000_000,
+            }
+        ));
+        assert!(message.contains("ZINDER_PROJECTOR__BUILD__MAX_TEMPORARY_FILE_BYTES_PER_SORTER"));
+        assert!(message.contains("the complete sort needs more"));
+        assert!(message.contains(&DEFAULT_TEMPORARY_FILE_BYTES_PER_SORTER.to_string()));
+        assert!(!message.contains("set it to at least"));
+    }
+
+    #[test]
+    fn undersized_spill_ceiling_names_the_setting_and_required_bytes() {
+        let error = ProjectorError::from(RocksDbWalletError::BulkLoad(
+            BulkLoadError::TemporaryFileLimit {
+                limit_bytes: 68_719_476_736,
+                required_bytes: OBSERVED_MAINNET_SORTER_SPILL_BYTES,
+            },
+        ));
+        let message = error.to_string();
+
+        assert!(matches!(
+            error,
+            ProjectorError::WalletBuildTemporaryFileLimit {
+                limit_bytes: 68_719_476_736,
+                required_bytes: OBSERVED_MAINNET_SORTER_SPILL_BYTES,
+            }
+        ));
+        assert!(message.contains("projector.build.max_temporary_file_bytes_per_sorter"));
+        assert!(message.contains("ZINDER_PROJECTOR__BUILD__MAX_TEMPORARY_FILE_BYTES_PER_SORTER"));
+        assert!(message.contains("98524054494"));
+    }
+
+    #[test]
+    fn other_wallet_failures_stay_wallet_store_errors() {
+        assert!(matches!(
+            ProjectorError::from(RocksDbWalletError::EmptyCanonicalHistory),
+            ProjectorError::WalletStore(RocksDbWalletError::EmptyCanonicalHistory)
+        ));
+    }
 
     #[test]
     fn follow_transition_budget_defaults_within_the_single_host_envelope()

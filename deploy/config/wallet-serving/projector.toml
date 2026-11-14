@@ -25,8 +25,11 @@ reorg_window_blocks = 1000
 lease_duration_seconds = 14400
 
 # Fresh wallet construction sorts in memory until these ceilings, then spills
-# to the staging directory beside the wallet store. The defaults assume the
-# projector owns its container.
+# to the staging directory beside the wallet store. The memory defaults assume
+# the projector owns its container. The default spill ceiling per sorter
+# (max_temporary_file_bytes_per_sorter, 192 GiB) covers a Mainnet build from
+# genesis, whose largest sorter needs about 99 GB. Several sorters spill at
+# once, so a Mainnet build needs about 130 GB free on the volume.
 [projector.build]
 max_outpoint_sort_memory_bytes = 1073741824
 max_secondary_sort_memory_bytes_per_sorter = 268435456

@@ -6053,6 +6053,7 @@ dependencies = [
  "tracing",
  "zinder-core",
  "zinder-proto",
+ "zinder-rocksdb-bulk-load",
  "zinder-runtime",
  "zinder-source",
  "zinder-store",
