@@ -6,13 +6,15 @@
 //! block can instead activate an empty genesis generation directly.
 //! Steady-state blocks mutate only the active generation and persist complete
 //! before-images by height, allowing a reorg batch to restore summaries,
-//! ranking keys, aggregate statistics, and coverage atomically.
+//! ranking keys, aggregate statistics, and coverage atomically. The same
+//! before-images let a read pinned to an earlier block answer as the generation
+//! stood at that block.
 
 use std::collections::{HashMap, HashSet};
 
 use rust_rocksdb::WriteBatch;
 use zinder_core::wire::{encode_address_script_hash, encode_height_key_ascending};
-use zinder_core::{BlockHash, BlockHeight, TransparentAddressScriptHash};
+use zinder_core::{BlockHash, BlockHeight, BlockId, TransparentAddressScriptHash};
 
 use crate::consumer::address_value_event::{AddressValueEventKind, address_value_events};
 use crate::consumer::{
@@ -20,7 +22,7 @@ use crate::consumer::{
     MaterializedViewConsumerError, MaterializedViewConsumerName, MaterializedViewConsumerSchema,
 };
 use crate::error::{MaterializedViewStoreColumnFamily, MaterializedViewStoreError};
-use crate::store::MaterializedViewStore;
+use crate::store::{MaterializedViewStore, MaterializedViewStoreReadSnapshot};
 
 /// Generation-prefixed per-address summary rows.
 pub const TRANSPARENT_ADDRESS_RANKING_SUMMARY_COLUMN_FAMILY: &str =
@@ -74,6 +76,12 @@ const TOP_TEN: usize = 10;
 const TOP_ONE_HUNDRED: usize = 100;
 /// Hard native bound for one ranking page.
 pub const TRANSPARENT_ADDRESS_RANKING_MAX_PAGE_SIZE: usize = 500;
+/// Most blocks one block-pinned summary read rewinds through undo journals.
+///
+/// The ranking normally leads a reader's chain epoch only by the blocks the
+/// wallet query has not published yet, so the bound limits per-read work
+/// without refusing ordinary reads.
+pub const TRANSPARENT_ADDRESS_RANKING_MAX_REWIND_BLOCKS: u32 = 1_000;
 
 /// Lifetime facts and current balance for one transparent script hash.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -246,6 +254,20 @@ pub struct TransparentAddressRankingPage {
     pub entries: Vec<TransparentAddressRankingEntry>,
     /// Metadata for the generation read by this page.
     pub metadata: TransparentAddressRankingMetadata,
+}
+
+/// One address summary as the active generation stood at a requested block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransparentAddressSummaryAtBlock {
+    /// Generation the summary was read from.
+    pub generation: u64,
+    /// Summary at the answered height, or `None` when the address had no
+    /// covered activity by then.
+    pub summary: Option<TransparentAddressSummary>,
+    /// Coverage of the answered state. Balances are complete through the
+    /// requested height, or through a lower height while the generation has
+    /// not reached the requested block yet.
+    pub coverage: TransparentAddressRankingCoverage,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -647,6 +669,68 @@ impl TransparentAddressRankingConsumer {
             .get_consumer(TRANSPARENT_ADDRESS_RANKING_SUMMARY_COLUMN_FAMILY, &key)?
             .map(|payload| decode_summary(&payload).map_err(store_decode_error))
             .transpose()
+    }
+
+    /// Reads one summary as the active generation stood at `block`.
+    ///
+    /// A generation that has applied blocks above `block` answers from the
+    /// before-images its undo journals keep for those heights, so a read pinned
+    /// to an earlier chain epoch still succeeds after the ranking advances. A
+    /// generation that has not reached `block` answers from its current rows,
+    /// and the returned coverage says how far they reach. Every read goes
+    /// through `snapshot`. Returns `None` when no generation is active.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for which
+    /// [`TransparentAddressRankingConsumerError::is_read_block_unavailable`] is
+    /// true when the generation applied a different block at `block.height`,
+    /// or when reaching that height would rewind more than
+    /// [`TRANSPARENT_ADDRESS_RANKING_MAX_REWIND_BLOCKS`] blocks or below the
+    /// generation's snapshot base.
+    pub fn summary_at_block(
+        snapshot: &MaterializedViewStoreReadSnapshot<'_>,
+        address_script_hash: TransparentAddressScriptHash,
+        block: BlockId,
+    ) -> Result<Option<TransparentAddressSummaryAtBlock>, TransparentAddressRankingConsumerError>
+    {
+        let Some(active) = snapshot
+            .get_consumer(
+                TRANSPARENT_ADDRESS_RANKING_METADATA_COLUMN_FAMILY,
+                ACTIVE_METADATA_KEY,
+            )?
+            .map(|payload| decode_metadata(&payload))
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+        let generation = active.generation;
+        let current = snapshot
+            .get_consumer(
+                TRANSPARENT_ADDRESS_RANKING_SUMMARY_COLUMN_FAMILY,
+                &summary_key(generation, address_script_hash),
+            )?
+            .map(|payload| decode_summary(&payload))
+            .transpose()?;
+        let applied_through = active.coverage.balance_complete_through_height;
+        if applied_through < block.height {
+            return Ok(Some(TransparentAddressSummaryAtBlock {
+                generation,
+                summary: current,
+                coverage: active.coverage,
+            }));
+        }
+        verify_read_block(snapshot, generation, block)?;
+        let (summary, coverage) = if applied_through == block.height {
+            (current, active.coverage)
+        } else {
+            rewind_summary(snapshot, active, address_script_hash, current, block.height)?
+        };
+        Ok(Some(TransparentAddressSummaryAtBlock {
+            generation,
+            summary,
+            coverage,
+        }))
     }
 
     /// Reads a bounded page from the active generation.
@@ -1331,6 +1415,100 @@ fn verify_applied_block(
         );
     }
     Ok(())
+}
+
+/// Proves the generation applied `block` at its height.
+///
+/// Only genesis, a snapshot base, and heights below that base have no journal.
+/// Genesis and a snapshot base are settled, so no other block can occupy them,
+/// and [`rewind_summary`] refuses a height below the base.
+fn verify_read_block(
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
+    generation: u64,
+    block: BlockId,
+) -> Result<(), TransparentAddressRankingConsumerError> {
+    match read_undo_journal(snapshot, generation, block.height)? {
+        Some(journal) if journal.block_hash != block.hash => {
+            Err(TransparentAddressRankingConsumerError::ReadBlockMismatch {
+                height: block.height.value(),
+            })
+        }
+        Some(_) | None => Ok(()),
+    }
+}
+
+/// Rewinds one address from the active generation's tip to `height`.
+///
+/// The first journal above `height` that touched the address holds its
+/// summary at `height`; an address no journal touched still has `current`.
+/// The journal at `height + 1` holds the generation's coverage at `height`.
+fn rewind_summary(
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
+    active: TransparentAddressRankingMetadata,
+    address_script_hash: TransparentAddressScriptHash,
+    current: Option<TransparentAddressSummary>,
+    height: BlockHeight,
+) -> Result<
+    (
+        Option<TransparentAddressSummary>,
+        TransparentAddressRankingCoverage,
+    ),
+    TransparentAddressRankingConsumerError,
+> {
+    let applied_through = active.coverage.balance_complete_through_height;
+    let unavailable = TransparentAddressRankingConsumerError::ReadHeightUnavailable {
+        height: height.value(),
+        applied_through_height: applied_through.value(),
+    };
+    if applied_through.value().saturating_sub(height.value())
+        > TRANSPARENT_ADDRESS_RANKING_MAX_REWIND_BLOCKS
+    {
+        return Err(unavailable);
+    }
+    let mut coverage_at_height = None;
+    for raw_height in height.value().saturating_add(1)..=applied_through.value() {
+        let Some(journal) =
+            read_undo_journal(snapshot, active.generation, BlockHeight::new(raw_height))?
+        else {
+            return Err(unavailable);
+        };
+        let coverage = *coverage_at_height.get_or_insert(journal.metadata_before.coverage);
+        if let Some((_, before)) = journal
+            .summaries_before
+            .into_iter()
+            .find(|(journal_address, _)| *journal_address == address_script_hash)
+        {
+            return Ok((before, coverage));
+        }
+    }
+    coverage_at_height
+        .map(|coverage| (current, coverage))
+        .ok_or(unavailable)
+}
+
+fn read_undo_journal(
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
+    generation: u64,
+    height: BlockHeight,
+) -> Result<Option<UndoJournal>, TransparentAddressRankingConsumerError> {
+    let Some(payload) = snapshot.get_consumer(
+        TRANSPARENT_ADDRESS_RANKING_UNDO_COLUMN_FAMILY,
+        &undo_key(generation, height),
+    )?
+    else {
+        return Ok(None);
+    };
+    let journal = decode_undo_journal(&payload)?;
+    if journal.generation != generation {
+        return Err(
+            TransparentAddressRankingConsumerError::UndoGenerationMismatch {
+                height: height.value(),
+                active_generation: generation,
+                journal_generation: journal.generation,
+            },
+        );
+    }
+    Ok(Some(journal))
 }
 
 fn sealed_snapshot_build(
@@ -2218,6 +2396,24 @@ pub enum TransparentAddressRankingConsumerError {
         /// Height whose canonical identity changed unexpectedly.
         height: u32,
     },
+    /// A block-pinned read named a block the generation did not apply at
+    /// that height, as when a reorg has reached the generation but not the
+    /// reader's chain epoch, or the reverse.
+    #[error("transparent-address ranking applied a different block at requested height {height}")]
+    ReadBlockMismatch {
+        /// Requested height.
+        height: u32,
+    },
+    /// A block-pinned read named a height the generation cannot rewind to.
+    #[error(
+        "transparent-address ranking applied blocks through height {applied_through_height} and cannot rewind to requested height {height}"
+    )]
+    ReadHeightUnavailable {
+        /// Requested height.
+        height: u32,
+        /// Height through which the generation has applied blocks.
+        applied_through_height: u32,
+    },
     /// Height successor could not be represented.
     #[error("transparent-address ranking coverage height overflowed")]
     CoverageOverflow,
@@ -2274,6 +2470,18 @@ pub enum TransparentAddressRankingConsumerError {
     MalformedEncoding,
 }
 
+impl TransparentAddressRankingConsumerError {
+    /// Returns true when a block-pinned read cannot answer at the requested
+    /// block, so a read pinned to a newer chain epoch can succeed.
+    #[must_use]
+    pub const fn is_read_block_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::ReadBlockMismatch { .. } | Self::ReadHeightUnavailable { .. }
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, error::Error, sync::Arc};
@@ -2282,7 +2490,8 @@ mod tests {
         AddressBlockDelta, TRANSPARENT_ADDRESS_RANKING_SCHEMA, TransparentAddressRankingConsumer,
         TransparentAddressRankingCoverage, TransparentAddressRankingSnapshotPlan,
         TransparentAddressRankingSnapshotRow, TransparentAddressScriptTypeTotals,
-        TransparentAddressSummary, apply_delta, decode_summary, encode_summary, ranking_key,
+        TransparentAddressSummary, TransparentAddressSummaryAtBlock, apply_delta, decode_summary,
+        encode_summary, ranking_key,
     };
     use crate::consumer::{
         BlockCommitContext, BlockCommitInput, BlockKeyedConsumer, MaterializedViewConsumerCtx,
@@ -2292,7 +2501,7 @@ mod tests {
     use rust_rocksdb::WriteBatch;
     use tempfile::tempdir;
     use zinder_core::{
-        BlockHash, BlockHeight, LockTime, PrivacyShape, TransactionComponentCounts,
+        BlockHash, BlockHeight, BlockId, LockTime, PrivacyShape, TransactionComponentCounts,
         TransactionFactsArtifact, TransactionId, TransactionLocation, TransactionPublicFacts,
         TransactionVersion, TransparentAddressScriptHash, TransparentInputFact,
         TransparentOutPoint, TransparentOutputFact,
@@ -3189,5 +3398,202 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    fn read_point(height: u32) -> BlockId {
+        BlockId::new(
+            BlockHeight::new(height),
+            BlockHash::from_bytes([height.to_le_bytes()[0]; 32]),
+        )
+    }
+
+    fn summary_at(
+        store: &MaterializedViewStore,
+        address_script_hash: TransparentAddressScriptHash,
+        block: BlockId,
+    ) -> Result<
+        Option<TransparentAddressSummaryAtBlock>,
+        super::TransparentAddressRankingConsumerError,
+    > {
+        TransparentAddressRankingConsumer::summary_at_block(
+            &store.read_snapshot(),
+            address_script_hash,
+            block,
+        )
+    }
+
+    fn empty_block(height: u32) -> BlockCommitContext {
+        BlockCommitContext::new(
+            BlockCommitInput {
+                height: BlockHeight::new(height),
+                block_hash: BlockHash::from_bytes([height.to_le_bytes()[0]; 32]),
+                previous_block_hash: BlockHash::from_bytes(
+                    [height.saturating_sub(1).to_le_bytes()[0]; 32],
+                ),
+                block_time_unix_seconds: 1_700_000_000 + i64::from(height),
+                block_size_bytes: 0,
+                transactions: Vec::new(),
+                final_note_commitment_roots: None,
+            },
+            TransparentSpendFacts::Offline,
+        )
+    }
+
+    #[test]
+    fn summary_at_block_rewinds_a_generation_that_advanced_past_the_block() -> TestResult {
+        let (_tempdir, store) = open_store()?;
+        TransparentAddressRankingConsumer::activate_genesis_generation(&store)?;
+        let mut consumer = TransparentAddressRankingConsumer::new();
+        let first = TransparentAddressScriptHash::of_script_pub_key(&p2pkh(1));
+        let second = TransparentAddressScriptHash::of_script_pub_key(&p2sh(2));
+        let untouched = TransparentAddressScriptHash::of_script_pub_key(&p2pkh(3));
+        apply_and_commit(&store, &mut consumer, &receive_block(1, p2pkh(1), 100))?;
+        apply_and_commit(&store, &mut consumer, &receive_block(2, p2sh(2), 50))?;
+        let first_at_two = TransparentAddressRankingConsumer::summary(&store, first)?;
+        let second_at_two = TransparentAddressRankingConsumer::summary(&store, second)?;
+        let metadata_at_two = TransparentAddressRankingConsumer::active_metadata(&store)?
+            .ok_or("ranking generation is not active")?;
+        apply_and_commit(&store, &mut consumer, &receive_block(3, p2pkh(1), 400))?;
+        apply_and_commit(&store, &mut consumer, &receive_block(4, p2sh(2), 25))?;
+
+        let first_read =
+            summary_at(&store, first, read_point(2))?.ok_or("ranking generation is not active")?;
+        let second_read =
+            summary_at(&store, second, read_point(2))?.ok_or("ranking generation is not active")?;
+        let untouched_read = summary_at(&store, untouched, read_point(2))?
+            .ok_or("ranking generation is not active")?;
+
+        assert_eq!(first_read.summary, first_at_two);
+        assert_eq!(second_read.summary, second_at_two);
+        assert_eq!(untouched_read.summary, None);
+        for read in [&first_read, &second_read, &untouched_read] {
+            assert_eq!(read.generation, metadata_at_two.generation);
+            assert_eq!(read.coverage, metadata_at_two.coverage);
+        }
+        let first_at_three =
+            summary_at(&store, first, read_point(3))?.ok_or("ranking generation is not active")?;
+        assert_eq!(
+            first_at_three.summary,
+            TransparentAddressRankingConsumer::summary(&store, first)?
+        );
+        assert_eq!(
+            first_at_three.coverage.balance_complete_through_height,
+            BlockHeight::new(3)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn summary_at_block_refuses_a_block_the_generation_did_not_apply() -> TestResult {
+        let (_tempdir, store) = open_store()?;
+        TransparentAddressRankingConsumer::activate_genesis_generation(&store)?;
+        let mut consumer = TransparentAddressRankingConsumer::new();
+        apply_and_commit(&store, &mut consumer, &receive_block(1, p2pkh(1), 100))?;
+        apply_and_commit(&store, &mut consumer, &receive_block(2, p2pkh(1), 200))?;
+        let address = TransparentAddressScriptHash::of_script_pub_key(&p2pkh(1));
+
+        for height in [1, 2] {
+            let replaced =
+                BlockId::new(BlockHeight::new(height), BlockHash::from_bytes([0xEE; 32]));
+            let outcome = summary_at(&store, address, replaced);
+            assert!(matches!(
+                outcome,
+                Err(ref error @ super::TransparentAddressRankingConsumerError::ReadBlockMismatch {
+                    height: mismatched,
+                }) if mismatched == height && error.is_read_block_unavailable()
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn summary_at_block_answers_from_current_rows_while_the_generation_trails() -> TestResult {
+        let (_tempdir, store) = open_store()?;
+        TransparentAddressRankingConsumer::activate_genesis_generation(&store)?;
+        let mut consumer = TransparentAddressRankingConsumer::new();
+        apply_and_commit(&store, &mut consumer, &receive_block(1, p2pkh(1), 100))?;
+        let address = TransparentAddressScriptHash::of_script_pub_key(&p2pkh(1));
+
+        let read = summary_at(&store, address, read_point(9))?
+            .ok_or("ranking generation is not active")?;
+
+        assert_eq!(
+            read.summary,
+            TransparentAddressRankingConsumer::summary(&store, address)?
+        );
+        assert_eq!(
+            read.coverage.balance_complete_through_height,
+            BlockHeight::new(1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn summary_at_block_without_an_active_generation_is_absent() -> TestResult {
+        let (_tempdir, store) = open_store()?;
+        let address = TransparentAddressScriptHash::of_script_pub_key(&p2pkh(1));
+
+        assert_eq!(summary_at(&store, address, read_point(1))?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn summary_at_block_rewinds_at_most_the_bounded_number_of_blocks() -> TestResult {
+        let (_tempdir, store) = open_store()?;
+        TransparentAddressRankingConsumer::activate_genesis_generation(&store)?;
+        let mut consumer = TransparentAddressRankingConsumer::new();
+        let tip = super::TRANSPARENT_ADDRESS_RANKING_MAX_REWIND_BLOCKS + 1;
+        let mut batch = WriteBatch::default();
+        let mut context = MaterializedViewConsumerCtx {
+            store: &store,
+            batch: &mut batch,
+        };
+        consumer.begin_batch(&mut context)?;
+        for height in 1..=tip {
+            consumer.apply_block(&empty_block(height), &mut context)?;
+        }
+        consumer.finish_batch(&mut context)?;
+        store.write_batch(&batch)?;
+        let address = TransparentAddressScriptHash::of_script_pub_key(&p2pkh(1));
+
+        let deepest = summary_at(&store, address, read_point(1))?
+            .ok_or("ranking generation is not active")?;
+        assert_eq!(
+            deepest.coverage.balance_complete_through_height,
+            BlockHeight::new(1)
+        );
+        assert!(matches!(
+            summary_at(&store, address, read_point(0)),
+            Err(ref error @ super::TransparentAddressRankingConsumerError::ReadHeightUnavailable {
+                height: 0,
+                applied_through_height,
+            }) if applied_through_height == tip && error.is_read_block_unavailable()
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn summary_at_block_cannot_rewind_below_a_snapshot_base() -> TestResult {
+        let (_tempdir, store) = open_store()?;
+        initialize(&store, 1, 5, 0)?;
+        activate(&store, 1)?;
+        let mut consumer = TransparentAddressRankingConsumer::new();
+        apply_and_commit(&store, &mut consumer, &receive_block(6, p2pkh(1), 100))?;
+        let address = TransparentAddressScriptHash::of_script_pub_key(&p2pkh(1));
+
+        let at_base = summary_at(&store, address, read_point(5))?
+            .ok_or("ranking generation is not active")?;
+        assert_eq!(at_base.summary, None);
+        assert_eq!(at_base.coverage, coverage(5));
+        assert!(matches!(
+            summary_at(&store, address, read_point(4)),
+            Err(
+                super::TransparentAddressRankingConsumerError::ReadHeightUnavailable {
+                    height: 4,
+                    applied_through_height: 6,
+                }
+            )
+        ));
+        Ok(())
     }
 }

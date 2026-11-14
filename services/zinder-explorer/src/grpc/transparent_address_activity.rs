@@ -11,9 +11,10 @@ use prost::Message as _;
 use tonic::{Request, Response, Status};
 use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_core::wire::{
-    decode_address_script_hash, decode_height_key_descending, encode_address_script_hash,
+    decode_address_script_hash, decode_height_key_descending, decode_rpc_block_hash_hex,
+    encode_address_script_hash,
 };
-use zinder_core::{Network, TransparentAddressScriptHash};
+use zinder_core::{BlockHeight, BlockId, Network, TransparentAddressScriptHash};
 use zinder_proto::capabilities::EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2;
 use zinder_proto::v1::explorer::{
     TransparentAddressActivityEntry, TransparentAddressActivityRecord,
@@ -32,8 +33,9 @@ use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
 use zinder_materialized_views::{
-    MaterializedViewStore, TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY,
-    TRANSPARENT_ADDRESS_ACTIVITY_KEY_LEN, TransparentAddressRankingConsumer,
+    MaterializedViewStore, MaterializedViewStoreReadSnapshot,
+    TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY, TRANSPARENT_ADDRESS_ACTIVITY_KEY_LEN,
+    TransparentAddressRankingConsumer, TransparentAddressRankingConsumerError,
     TransparentAddressSummary as ProjectedTransparentAddressSummary,
 };
 
@@ -73,21 +75,16 @@ pub(crate) async fn query_transparent_address_activity(
         .address
         .ok_or_else(|| ExplorerError::invalid_request("address selector is required"))?;
     let resolved_address = resolve_address_lookup(&address, network)?;
-    let active_metadata =
-        TransparentAddressRankingConsumer::active_metadata(materialized_view_store)
-            .map_err(|error| ExplorerError::internal(error.to_string()))?
-            .ok_or_else(|| {
-                ExplorerError::not_materialized(
-                    "transparent-address ranking has no active materialized generation",
-                )
-            })?;
     let max_entries = clamp_max_entries(
         inner.max_entries,
         DEFAULT_TRANSPARENT_ADDRESS_ACTIVITY_ENTRIES,
         MAX_TRANSPARENT_ADDRESS_ACTIVITY_ENTRIES_PER_REQUEST,
     );
-    let (entries, next_cursor) = scan_address_activity(
+    let chain_epoch = resolve_activity_chain_epoch(wallet_client, inner.at_epoch_id).await?;
+    let address_read = read_address_at_block(
         materialized_view_store,
+        &resolved_address,
+        visible_tip_block(&chain_epoch)?,
         &ActivityScanParameters {
             script_hash: resolved_address.script_hash,
             offset: inner.offset,
@@ -97,14 +94,6 @@ pub(crate) async fn query_transparent_address_activity(
             from_cursor: inner.from_cursor.as_slice(),
         },
     )?;
-    let chain_epoch = resolve_activity_chain_epoch(wallet_client, inner.at_epoch_id).await?;
-    validate_ranking_metadata_at_chain_epoch(active_metadata, &chain_epoch)?;
-    let summary = read_address_summary_at_metadata(
-        materialized_view_store,
-        active_metadata,
-        &resolved_address,
-    )?;
-    let coverage = encode_ranking_coverage(active_metadata.coverage);
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
@@ -117,10 +106,10 @@ pub(crate) async fn query_transparent_address_activity(
     .await;
     Ok(Response::new(TransparentAddressActivityResponse {
         freshness: Some(freshness),
-        entries,
-        next_cursor,
-        summary: Some(summary),
-        coverage: Some(coverage),
+        entries: address_read.entries,
+        next_cursor: address_read.next_cursor,
+        summary: Some(address_read.summary),
+        coverage: Some(address_read.coverage),
     }))
 }
 
@@ -139,51 +128,77 @@ async fn resolve_activity_chain_epoch(
         })
 }
 
-fn read_address_summary_at_metadata(
-    materialized_view_store: &MaterializedViewStore,
-    expected_metadata: zinder_materialized_views::TransparentAddressRankingMetadata,
-    resolved_address: &ResolvedAddressLookup,
-) -> Result<WireTransparentAddressSummary, Status> {
-    let derived_summary = TransparentAddressRankingConsumer::summary(
-        materialized_view_store,
-        resolved_address.script_hash,
-    )
-    .map_err(|error| ExplorerError::internal(error.to_string()))?;
-    let confirmed_metadata =
-        TransparentAddressRankingConsumer::active_metadata(materialized_view_store)
-            .map_err(|error| ExplorerError::internal(error.to_string()))?;
-    if confirmed_metadata != Some(expected_metadata) {
-        return Err(ExplorerError::unsatisfied_precondition(
-            "active transparent-address ranking changed while reading address summary",
-        )
-        .into());
-    }
-    Ok(encode_address_summary(
-        derived_summary,
-        resolved_address.script_pub_key.as_deref(),
-    ))
-}
-
-fn validate_ranking_metadata_at_chain_epoch(
-    metadata: zinder_materialized_views::TransparentAddressRankingMetadata,
-    chain_epoch: &wallet::ChainEpoch,
-) -> Result<(), Status> {
+fn visible_tip_block(chain_epoch: &wallet::ChainEpoch) -> Result<BlockId, Status> {
     let visible_tip = chain_epoch.visible_tip.as_ref().ok_or_else(|| {
         ExplorerError::internal("VisibleTipBlockResponse chain epoch visible_tip missing")
     })?;
-    let coverage = metadata.coverage;
-    let balance_height = coverage.balance_complete_through_height.value();
-    let history_height = coverage
-        .history_complete_through_height
-        .map_or(0, zinder_core::BlockHeight::value);
-    if balance_height > visible_tip.height || history_height > visible_tip.height {
-        return Err(ExplorerError::unsatisfied_precondition(format!(
-            "active transparent-address ranking generation {} is newer than requested chain epoch {}: ranking balance/history through {balance_height}/{history_height}, visible tip {}",
-            metadata.generation, chain_epoch.chain_epoch_id, visible_tip.height,
+    let hash = decode_rpc_block_hash_hex(&visible_tip.hash).map_err(|error| {
+        ExplorerError::internal(format!(
+            "VisibleTipBlockResponse chain epoch visible_tip hash is invalid: {error}"
         ))
-        .into());
+    })?;
+    Ok(BlockId::new(BlockHeight::new(visible_tip.height), hash))
+}
+
+/// Activity rows, summary, and ranking coverage for one address at one block.
+struct AddressReadAtBlock {
+    entries: Vec<TransparentAddressActivityEntry>,
+    next_cursor: Vec<u8>,
+    summary: WireTransparentAddressSummary,
+    coverage: TransparentAddressRankingCoverage,
+}
+
+/// Reads one address as the Explorer views stood at `block`.
+///
+/// The ranking summary and the activity rows come from one store snapshot, so
+/// a block the views apply meanwhile cannot split them. Rows above `block` are
+/// left out because the summary does not include them.
+fn read_address_at_block(
+    materialized_view_store: &MaterializedViewStore,
+    resolved_address: &ResolvedAddressLookup,
+    block: BlockId,
+    scan: &ActivityScanParameters<'_>,
+) -> Result<AddressReadAtBlock, Status> {
+    let snapshot = materialized_view_store.read_snapshot();
+    let summary_at_block = TransparentAddressRankingConsumer::summary_at_block(
+        &snapshot,
+        resolved_address.script_hash,
+        block,
+    )
+    .map_err(|error| ranking_read_status(&error))?
+    .ok_or_else(|| {
+        ExplorerError::not_materialized(
+            "transparent-address ranking has no active materialized generation",
+        )
+    })?;
+    let (entries, next_cursor) = scan_address_activity(
+        &snapshot,
+        &ActivityScanParameters {
+            end_height: scan.end_height.min(block.height.value()),
+            ..*scan
+        },
+    )?;
+    drop(snapshot);
+    Ok(AddressReadAtBlock {
+        entries,
+        next_cursor,
+        summary: encode_address_summary(
+            summary_at_block.summary,
+            resolved_address.script_pub_key.as_deref(),
+        ),
+        coverage: encode_ranking_coverage(summary_at_block.coverage),
+    })
+}
+
+fn ranking_read_status(error: &TransparentAddressRankingConsumerError) -> Status {
+    if error.is_read_block_unavailable() {
+        ExplorerError::unsatisfied_precondition(format!(
+            "transparent-address ranking cannot answer at the requested chain epoch: {error}"
+        ))
+        .into()
+    } else {
+        ExplorerError::internal(error.to_string()).into()
     }
-    Ok(())
 }
 
 fn validate_activity_pagination(offset: u64, from_cursor: &[u8]) -> Result<(), Status> {
@@ -203,6 +218,7 @@ fn validate_activity_pagination(offset: u64, from_cursor: &[u8]) -> Result<(), S
 }
 
 /// Bundled inputs to [`scan_address_activity`].
+#[derive(Clone, Copy)]
 struct ActivityScanParameters<'a> {
     script_hash: TransparentAddressScriptHash,
     offset: u64,
@@ -213,7 +229,7 @@ struct ActivityScanParameters<'a> {
 }
 
 fn scan_address_activity(
-    materialized_view_store: &MaterializedViewStore,
+    snapshot: &MaterializedViewStoreReadSnapshot<'_>,
     parameters: &ActivityScanParameters<'_>,
 ) -> Result<(Vec<TransparentAddressActivityEntry>, Vec<u8>), Status> {
     let prefix = encode_address_script_hash(parameters.script_hash);
@@ -230,7 +246,7 @@ fn scan_address_activity(
         Vec::with_capacity(usize::try_from(parameters.max_entries).unwrap_or(usize::MAX));
     let mut last_key: Option<RowKey> = None;
     'scan: loop {
-        let rows = materialized_view_store
+        let rows = snapshot
             .range_iterate_consumer(
                 TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY,
                 &start_key,
@@ -353,10 +369,10 @@ fn encode_ranking_coverage(
         balance_complete_through_height: coverage.balance_complete_through_height.value(),
         history_complete_from_height: coverage
             .history_complete_from_height
-            .map(zinder_core::BlockHeight::value),
+            .map(BlockHeight::value),
         history_complete_through_height: coverage
             .history_complete_through_height
-            .map(zinder_core::BlockHeight::value),
+            .map(BlockHeight::value),
         lifetime_statistics_complete: coverage.lifetime_statistics_complete,
     }
 }
@@ -422,7 +438,7 @@ fn decode_row_height(key: &RowKey) -> Result<u32, Status> {
         .try_into()
         .map_err(|_| ExplorerError::internal("height segment not 4 bytes"))?;
     decode_height_key_descending(&height_bytes)
-        .map(zinder_core::BlockHeight::value)
+        .map(BlockHeight::value)
         .map_err(|error| ExplorerError::internal(error.to_string()).into())
 }
 
@@ -501,19 +517,25 @@ fn network_matches(
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error;
+    use std::{collections::HashMap, error::Error, sync::Arc};
 
     use prost::Message as _;
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
     use tonic::Code;
-    use zinder_core::BlockHeight;
-    use zinder_materialized_views::{
-        MaterializedViewStoreOptions, TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA,
-        TransparentAddressActivityConsumer,
-        TransparentAddressRankingCoverage as ProjectedRankingCoverage,
-        TransparentAddressRankingMetadata, TransparentAddressScriptTypeTotals,
+    use zinder_core::wire::encode_rpc_block_hash_hex;
+    use zinder_core::{
+        ArtifactSchemaVersion, BlockHash, BlockHeightRange, ChainEpoch, ChainEpochId,
+        ChainTipMetadata, TransactionFactsArtifact, TransactionId, TransactionLocation,
+        TransactionPublicFacts, TransparentOutputFact, UnixTimestampMillis,
     };
-    use zinder_store::RocksDbResourceBudget;
+    use zinder_materialized_views::{
+        BlockCommitContext, BlockCommitInput, BlockKeyedConsumer, ChainEventDispatchInputs,
+        MaterializedViewStoreOptions, TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA,
+        TRANSPARENT_ADDRESS_RANKING_SCHEMA, TransparentAddressActivityConsumer,
+        TransparentSpendFacts,
+    };
+    use zinder_store::{ChainEpochCommitted, ChainEvent, RocksDbResourceBudget};
+    use zinder_testkit::synthetic_transaction_public_facts;
 
     use super::*;
 
@@ -526,35 +548,72 @@ mod tests {
     }
 
     #[test]
-    fn newer_ranking_generation_is_rejected_for_older_chain_epoch() {
-        let metadata = ranking_metadata(101);
-        let chain_epoch = wallet::ChainEpoch {
-            chain_epoch_id: 7,
-            visible_tip: Some(wallet::BlockTip {
-                height: 100,
-                hash: "11".repeat(32),
-            }),
-            ..Default::default()
-        };
+    fn address_read_answers_at_an_epoch_the_ranking_advanced_past() -> TestResult {
+        let (_tempdir, store) = open_address_views()?;
+        let address = receiving_address();
+        commit_receipts(&store, &address, &[(1, 100), (2, 200)])?;
+        let epoch_tip = BlockId::new(BlockHeight::new(2), test_block_hash(2));
+        commit_receipts(&store, &address, &[(3, 400)])?;
 
-        let outcome = validate_ranking_metadata_at_chain_epoch(metadata, &chain_epoch);
+        let read = read_address_at_block(&store, &address, epoch_tip, &full_scan(&address))?;
 
-        assert!(matches!(outcome, Err(error) if error.code() == Code::FailedPrecondition));
+        assert_eq!(read.summary.balance_zat, 300);
+        assert_eq!(read.summary.total_received_zat, Some(300));
+        assert_eq!(read.summary.distinct_transaction_count, Some(2));
+        assert_eq!(read.coverage.balance_complete_through_height, 2);
+        assert_eq!(read.coverage.history_complete_through_height, Some(2));
+        let heights = read
+            .entries
+            .iter()
+            .map(|entry| entry.block_height)
+            .collect::<Vec<_>>();
+        assert_eq!(heights, [2, 1]);
+        Ok(())
     }
 
     #[test]
-    fn ranking_at_pinned_visible_tip_is_accepted() -> TestResult {
-        let metadata = ranking_metadata(100);
+    fn address_read_at_the_ranking_tip_includes_every_block() -> TestResult {
+        let (_tempdir, store) = open_address_views()?;
+        let address = receiving_address();
+        commit_receipts(&store, &address, &[(1, 100), (2, 200), (3, 400)])?;
+        let epoch_tip = BlockId::new(BlockHeight::new(3), test_block_hash(3));
+
+        let read = read_address_at_block(&store, &address, epoch_tip, &full_scan(&address))?;
+
+        assert_eq!(read.summary.balance_zat, 700);
+        assert_eq!(read.coverage.balance_complete_through_height, 3);
+        assert_eq!(read.entries.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn address_read_refuses_an_epoch_on_another_branch() -> TestResult {
+        let (_tempdir, store) = open_address_views()?;
+        let address = receiving_address();
+        commit_receipts(&store, &address, &[(1, 100), (2, 200), (3, 400)])?;
+        let replaced_tip = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([0xEE; 32]));
+
+        let outcome = read_address_at_block(&store, &address, replaced_tip, &full_scan(&address));
+
+        assert!(matches!(outcome, Err(error) if error.code() == Code::FailedPrecondition));
+        Ok(())
+    }
+
+    #[test]
+    fn visible_tip_block_decodes_the_epoch_tip_identity() -> TestResult {
+        let hash = test_block_hash(9);
         let chain_epoch = wallet::ChainEpoch {
-            chain_epoch_id: 7,
             visible_tip: Some(wallet::BlockTip {
-                height: 100,
-                hash: "11".repeat(32),
+                height: 9,
+                hash: encode_rpc_block_hash_hex(hash),
             }),
             ..Default::default()
         };
 
-        validate_ranking_metadata_at_chain_epoch(metadata, &chain_epoch)?;
+        assert_eq!(
+            visible_tip_block(&chain_epoch)?,
+            BlockId::new(BlockHeight::new(9), hash)
+        );
         Ok(())
     }
 
@@ -592,7 +651,7 @@ mod tests {
         }
 
         let (entries, next_cursor) = scan_address_activity(
-            &store,
+            &store.read_snapshot(),
             &ActivityScanParameters {
                 script_hash,
                 offset: 1,
@@ -646,21 +705,145 @@ mod tests {
         assert_eq!(summary.total_received_zat, Some(1_200));
     }
 
-    fn ranking_metadata(height: u32) -> TransparentAddressRankingMetadata {
-        TransparentAddressRankingMetadata {
-            generation: 9,
-            positive_address_count: 1,
-            total_positive_balance_zat: 100,
-            top_10_balance_zat: 100,
-            top_100_balance_zat: 100,
-            p2pkh: TransparentAddressScriptTypeTotals::default(),
-            p2sh: TransparentAddressScriptTypeTotals::default(),
-            coverage: ProjectedRankingCoverage {
-                balance_complete_through_height: BlockHeight::new(height),
-                history_complete_from_height: Some(BlockHeight::new(1)),
-                history_complete_through_height: Some(BlockHeight::new(height)),
-                lifetime_statistics_complete: true,
+    fn open_address_views() -> TestResult<(TempDir, MaterializedViewStore)> {
+        let tempdir = tempdir()?;
+        let store = MaterializedViewStore::open(
+            tempdir.path(),
+            MaterializedViewStoreOptions {
+                consumers: &[
+                    TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA,
+                    TRANSPARENT_ADDRESS_RANKING_SCHEMA,
+                ],
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                sync_writes: false,
             },
+        )?;
+        TransparentAddressRankingConsumer::activate_genesis_generation(&store)?;
+        Ok((tempdir, store))
+    }
+
+    fn receiving_address() -> ResolvedAddressLookup {
+        let mut script_pub_key = vec![0x76, 0xa9, 0x14];
+        script_pub_key.extend_from_slice(&[0x42; 20]);
+        script_pub_key.extend_from_slice(&[0x88, 0xac]);
+        ResolvedAddressLookup {
+            script_hash: TransparentAddressScriptHash::of_script_pub_key(&script_pub_key),
+            script_pub_key: Some(script_pub_key),
         }
+    }
+
+    fn full_scan(address: &ResolvedAddressLookup) -> ActivityScanParameters<'static> {
+        ActivityScanParameters {
+            script_hash: address.script_hash,
+            offset: 0,
+            start_height: 0,
+            end_height: u32::MAX,
+            max_entries: DEFAULT_TRANSPARENT_ADDRESS_ACTIVITY_ENTRIES,
+            from_cursor: &[],
+        }
+    }
+
+    fn test_block_hash(height: u32) -> BlockHash {
+        let mut bytes = [0; 32];
+        bytes[..4].copy_from_slice(&height.to_be_bytes());
+        BlockHash::from_bytes(bytes)
+    }
+
+    /// Commits one block per `(height, value)` receipt through the replay
+    /// dispatch, so the ranking and activity views advance together.
+    fn commit_receipts(
+        store: &MaterializedViewStore,
+        address: &ResolvedAddressLookup,
+        receipts: &[(u32, u64)],
+    ) -> TestResult {
+        let (Some(&(start, _)), Some(&(end, _))) = (receipts.first(), receipts.last()) else {
+            return Ok(());
+        };
+        let mut blocks = HashMap::new();
+        for &(height, value_zat) in receipts {
+            blocks.insert(
+                BlockHeight::new(height),
+                Arc::new(receipt_block(height, address, value_zat)?),
+            );
+        }
+        let chain_epoch = ChainEpoch {
+            id: ChainEpochId::new(u64::from(end)),
+            network: Network::ZcashRegtest,
+            visible_tip_height: BlockHeight::new(end),
+            visible_tip_hash: test_block_hash(end),
+            settled_tip_height: BlockHeight::new(0),
+            settled_tip_hash: Network::ZcashRegtest.genesis_hash(),
+            artifact_schema_version: ArtifactSchemaVersion::new(1),
+            tip_metadata: ChainTipMetadata::empty(),
+            created_at: UnixTimestampMillis::new(u64::from(end)),
+        };
+        let chain_event = ChainEvent::ChainCommitted {
+            committed: ChainEpochCommitted {
+                chain_epoch,
+                block_range: BlockHeightRange::inclusive(
+                    BlockHeight::new(start),
+                    BlockHeight::new(end),
+                ),
+            },
+        };
+        let cursor = end.to_be_bytes();
+        let mut ranking = TransparentAddressRankingConsumer::new();
+        let mut activity = TransparentAddressActivityConsumer::new();
+        let mut consumers: [&mut dyn BlockKeyedConsumer; 2] = [&mut ranking, &mut activity];
+        store.write_chain_event_chunk(
+            &mut consumers,
+            ChainEventDispatchInputs {
+                chain_epoch,
+                chain_event: &chain_event,
+                chain_cursor: &cursor,
+                event_sequence: u64::from(end),
+                settled_tip_height: BlockHeight::new(0),
+            },
+            &blocks,
+            true,
+        )?;
+        Ok(())
+    }
+
+    fn receipt_block(
+        height: u32,
+        address: &ResolvedAddressLookup,
+        value_zat: u64,
+    ) -> TestResult<BlockCommitContext> {
+        let block_height = BlockHeight::new(height);
+        let block_hash = test_block_hash(height);
+        let transaction_id = TransactionId::from_bytes(block_hash.as_bytes());
+        let script_pub_key = address
+            .script_pub_key
+            .clone()
+            .ok_or("receiving address has no script")?;
+        let transaction = TransactionFactsArtifact::new(
+            TransactionLocation::new(transaction_id, block_height, block_hash, 0),
+            TransactionPublicFacts {
+                is_coinbase: true,
+                ..synthetic_transaction_public_facts(transaction_id, 0)
+            },
+        )
+        .with_transparent_facts(
+            Vec::new(),
+            vec![TransparentOutputFact::new(
+                0,
+                value_zat,
+                script_pub_key,
+                address.script_hash,
+            )],
+        );
+        Ok(BlockCommitContext::new(
+            BlockCommitInput {
+                height: block_height,
+                block_hash,
+                previous_block_hash: test_block_hash(height.saturating_sub(1)),
+                block_time_unix_seconds: 1_700_000_000 + i64::from(height),
+                block_size_bytes: 0,
+                transactions: vec![transaction],
+                final_note_commitment_roots: None,
+            },
+            TransparentSpendFacts::Offline,
+        ))
     }
 }

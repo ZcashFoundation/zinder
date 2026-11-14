@@ -125,6 +125,7 @@ pub use consumer::transparent_address_deltas::{
 pub use consumer::transparent_address_ranking::{
     TRANSPARENT_ADDRESS_RANKING_COLUMN_FAMILIES, TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME,
     TRANSPARENT_ADDRESS_RANKING_INDEX_COLUMN_FAMILY, TRANSPARENT_ADDRESS_RANKING_MAX_PAGE_SIZE,
+    TRANSPARENT_ADDRESS_RANKING_MAX_REWIND_BLOCKS,
     TRANSPARENT_ADDRESS_RANKING_METADATA_COLUMN_FAMILY, TRANSPARENT_ADDRESS_RANKING_SCHEMA,
     TRANSPARENT_ADDRESS_RANKING_SUMMARY_COLUMN_FAMILY,
     TRANSPARENT_ADDRESS_RANKING_UNDO_COLUMN_FAMILY, TransparentAddressRankingConsumer,
@@ -132,7 +133,7 @@ pub use consumer::transparent_address_ranking::{
     TransparentAddressRankingEntry, TransparentAddressRankingMetadata,
     TransparentAddressRankingPage, TransparentAddressRankingSnapshotPlan,
     TransparentAddressRankingSnapshotRow, TransparentAddressScriptTypeTotals,
-    TransparentAddressSummary,
+    TransparentAddressSummary, TransparentAddressSummaryAtBlock,
 };
 pub use consumer::transparent_outpoint_spend::{
     TRANSPARENT_OUTPOINT_SPEND_COLUMN_FAMILIES, TRANSPARENT_OUTPOINT_SPEND_COLUMN_FAMILY,

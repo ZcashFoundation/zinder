@@ -195,12 +195,24 @@ component counts, address-specific input and output values, and scripts of
 other transparent inputs and outputs. `input_facts_complete` is false, so a
 client never reads a partial input sum as complete.
 
-The handler pins its epoch through `WalletQuery.VisibleTipBlock`. Ranking
-coverage newer than the selected epoch is rejected, and active
-metadata is read again after the summary to close generation activation and
-live-tail races. `ExplorerFreshness` carries the shared materialized-view
-indexed tip, including its hash, so adapters can mark a same-height mismatch as
-degraded.
+The handler pins its epoch through `WalletQuery.VisibleTipBlock` and answers
+as of that epoch's visible tip. Ingest replays a block into the views before
+the wallet query publishes it, so the ranking is often a few blocks ahead of
+the epoch. The summary and coverage then come from the ranking's per-height
+undo journals, which keep each touched address's summary from before every
+applied block, and activity rows above the visible tip are left out. One
+materialized-view snapshot holds both reads, so a block the views apply during
+the request cannot split them. A ranking that has not reached the epoch's tip
+answers from its current rows, and its coverage shows how far they reach.
+
+The read fails with `FAILED_PRECONDITION` and the
+`EXPLORER_PRECONDITION_UNSATISFIED` reason when the ranking applied a different
+block at the epoch's tip height, as during a reorg only one side has seen. It
+fails the same way when answering would rewind more than 1,000 blocks
+(`TRANSPARENT_ADDRESS_RANKING_MAX_REWIND_BLOCKS`) or below the generation's
+snapshot base. A retry at a newer epoch can succeed. `ExplorerFreshness` carries
+the shared materialized-view indexed tip, including its hash, so adapters can
+mark a same-height mismatch as degraded.
 
 Offset paging and summary composition are request-time operations over the
 activity and ranking materialized views. Mempool address activity remains a
