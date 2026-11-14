@@ -145,7 +145,9 @@ secondary generations, catches both up, and publishes a
 `WalletServingQuery` captures one published pair at request start. Its
 `CanonicalReader` and `WalletProjectionReader` therefore cannot advance to
 different generations during a response. Pair replacement is atomic for new
-requests and does not mutate readers held by in-flight requests.
+requests and does not mutate readers held by in-flight requests. A replaced
+pair answers reads pinned to its epoch for a bounded window; see
+[Wallet data plane §Query Consistency](wallet-data-plane.md#query-consistency).
 
 The lightwalletd adapter translates `CompactTxStreamer` requests onto this Rust
 query contract. Node-backed transaction broadcast and sparse tree-state fill are

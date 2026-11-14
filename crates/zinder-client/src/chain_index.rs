@@ -372,7 +372,17 @@ pub struct TransparentOutpointSpendStatuses {
 /// mandatory response header against it. A multi-call operation either
 /// remains on one chain view or receives
 /// [`IndexerError::ChainEpochPinUnavailable`] after the serving implementation
-/// stops retaining that epoch.
+/// stops retaining that epoch. On that error, capture a new snapshot and
+/// restart the whole operation.
+///
+/// Zinder's wallet-serving runtime keeps serving an epoch through the next two
+/// pair publications, for at most one minute after a newer epoch replaces it.
+/// Reads that send the snapshot's epoch id with the request, such as
+/// [`Self::transparent_address_unspent_outputs`], therefore normally finish on
+/// one view even when a new block arrives. The first page of
+/// [`Self::transparent_address_tx_ids_in_range`] sends no epoch id: the server
+/// answers it from its current epoch, so it fails once a newer epoch is
+/// published. Its continuation pages resume on the epoch that issued them.
 pub struct ChainSnapshot<'a, I: ChainIndex + ?Sized> {
     chain_index: &'a I,
     chain_epoch: ChainEpoch,

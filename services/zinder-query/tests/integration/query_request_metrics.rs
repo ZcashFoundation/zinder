@@ -305,13 +305,16 @@ async fn request_every_transparent_read(query: &WalletServingQuery<()>) {
         )
         .await;
     let _ = query
-        .transparent_address_tx_ids_in_range(TransparentAddressTxIdsInRangeRequest {
-            address_script_hash,
-            start_height: BlockHeight::new(0),
-            end_height: BlockHeight::new(2),
-            max_entries: NonZeroU32::MIN,
-            from_cursor: None,
-        })
+        .transparent_address_tx_ids_in_range(
+            TransparentAddressTxIdsInRangeRequest {
+                address_script_hash,
+                start_height: BlockHeight::new(0),
+                end_height: BlockHeight::new(2),
+                max_entries: NonZeroU32::MIN,
+                from_cursor: None,
+            },
+            None,
+        )
         .await;
     let _ = query
         .transparent_address_balance(vec![address_script_hash], None)

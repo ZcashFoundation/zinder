@@ -54,9 +54,12 @@ so the baked configs pin every budget that would otherwise be derived from it:
 | --- | --- | --- |
 | `zinder-ingest` | ~2.6 GiB | canonical and materialized-view writer stores |
 | `zinder-projector` | ~2.7 GiB while building, ~1.2 GiB while following | wallet-build sorters |
-| `zinder-query` | ~0.4 GiB | canonical secondary block cache |
+| `zinder-query` | ~0.4 GiB per open serving pair, up to ~1.4 GiB | canonical secondary block cache |
 
-The remainder covers allocator overhead, gRPC buffers, and task stacks. In a
+Query keeps up to four serving pairs open, each with its own block caches: the
+current pair, the candidate it is catching up, and two replaced pairs that
+either still answer pinned reads or are held by a long request. The remainder covers allocator
+overhead, gRPC buffers, and task stacks. In a
 smaller container the cgroup OOM-killer takes one process during construction.
 That terminates the whole container, and the restart resumes construction from
 the last durable fence only to be killed again.

@@ -171,9 +171,15 @@ missing set before opening or migrating wallet storage. A capability profile
 named after a consumer is not added to Zinder.
 
 Zallet treats an expired exact view as a typed retry condition and reacquires
-the whole workflow boundary. Zinder does not retain an unbounded history of
-serving pairs. Consumer tests must prove that a retry does not commit a partial
-block batch.
+the whole workflow boundary. Zinder retains a bounded history of serving pairs:
+the two most recently replaced pairs answer reads pinned to their epochs, each
+for at most one minute after it was replaced. Retention lets a multi-request
+workflow whose reads carry `at_epoch_id`, such as a transparent UTXO refresh
+across a wallet's receivers, finish across a new block without changing the
+expiry contract. A transparent-history first page carries no wire pin and is
+answered from the current pair, so a history walk that starts a new receiver
+after a publication still restarts. Consumer tests must prove that
+a retry does not commit a partial block batch.
 
 ZODL continues to consume the separate lightwalletd-compatible
 `CompactTxStreamer` surface through trusted TLS at the deployment edge. Native
@@ -226,8 +232,16 @@ handler and evidence.
 
 ### Retain historical pairs indefinitely
 
-Unbounded pair retention has unbounded storage and resource semantics. Typed
-view expiry and whole-workflow retry satisfy the current consumer requirement.
+Unbounded pair retention has unbounded storage and resource semantics. Every
+retained pair keeps its own canonical and wallet secondaries open. Two pairs
+for at most one minute cover a multi-request workflow across a burst of
+blocks, and typed view expiry with whole-workflow retry covers the rest.
+
+### Serve only the current pair
+
+Expiring a pin at the next publication fails any workflow that spans a block.
+On a chain with 25-second blocks, a wallet that reads its transparent
+receivers under one pin in about 20 seconds fails about half of its walks.
 
 ### Add compatibility aliases
 
@@ -236,6 +250,12 @@ controlled consumer cutover uses the current contract without shims.
 
 ## Revision history
 
+- 2026-11-14: The two most recently replaced serving pairs keep answering
+  reads pinned to their epochs, each for at most one minute after it was
+  replaced, so a workflow whose reads carry `at_epoch_id` survives a new
+  block. A transparent-history continuation resumes on the pair that issued it
+  while that pair is retained; a first history page still answers from the
+  current pair.
 - 2026-11-12: Ingest-control admission requires five control methods instead
   of seven, and `WalletEndpointMetadata` no longer carries a materialized-view
   preset. The transparent mempool point lookups, the native transparent

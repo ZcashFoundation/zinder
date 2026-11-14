@@ -435,7 +435,8 @@ where
             visible_tip_block.chain_epoch.network,
             visible_tip_block.height,
         )?;
-        let history = transparent_address_tx_history(&self.query_api, typed_request).await?;
+        let history =
+            transparent_address_tx_history(&self.query_api, typed_request, at_epoch_id).await?;
         let mut raw_transactions = Vec::with_capacity(history.len());
 
         for artifact in history {
@@ -930,6 +931,7 @@ where
 async fn transparent_address_tx_history<QueryApi>(
     query_api: &QueryApi,
     mut request: TransparentAddressTxIdsInRangeRequest,
+    at_epoch_id: ChainEpochId,
 ) -> Result<Vec<TransparentAddressTxIndexArtifact>, Status>
 where
     QueryApi: WalletQueryApi + ?Sized,
@@ -937,7 +939,7 @@ where
     let mut artifacts = Vec::new();
     loop {
         let response = query_api
-            .transparent_address_tx_ids_in_range(request.clone())
+            .transparent_address_tx_ids_in_range(request.clone(), Some(at_epoch_id))
             .await
             .map_err(|error| status_from_query_error(&error))?;
         artifacts.extend(response.artifacts);

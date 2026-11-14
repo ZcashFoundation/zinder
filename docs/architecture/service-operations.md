@@ -435,12 +435,18 @@ series.
 Native query and compatibility share the serving-pair publisher. Its metrics
 report writer-status availability, catch-up duration, retired-pair teardown
 duration, pair convergence attempts, published generation, replica lag, pair
-admission failure, and wallet-serving pair replacement. gRPC request metrics
+admission failure, wallet-serving pair replacement, and the number of replaced
+pairs retained for pinned reads
+(`zinder_wallet_serving_pair_publisher_retained_pairs`). gRPC request metrics
 remain separate from pair-maintenance metrics.
 
 A request keeps the pair it captured open until it finishes, which pins that
 pair's secondary generation. The publisher rotates through four generation
-slots, so publication continues while up to two retired pairs are pinned.
+slots: the current pair, the candidate, and two for replaced pairs, which are
+either retained for pinned reads or retired but still held by a request. When
+a held retired pair leaves no slot free, the publisher releases a retained
+pair that no request holds, so publication continues while up to two retired
+pairs are pinned.
 `zinder_wallet_serving_pair_publisher_pinned_retired_pairs` reports how many
 retired pairs requests still hold, and
 `zinder_wallet_serving_pair_publisher_generation_wait_total{reason="in_flight_requests"}`

@@ -1,0 +1,6 @@
+kind: fixed
+body: Reads pinned to a chain epoch with `at_epoch_id` no longer fail as soon as a new block arrives. `zinder-query` keeps serving the two most recently replaced epochs, each for up to one minute after it is replaced, so a wallet that reads the unspent outputs of its transparent receivers one by one under a single pin finishes across a new block instead of restarting. A `TransparentAddressTxIdsInRange` continuation resumes on the epoch that issued it during the same window. The first page of that history read carries no epoch pin and still answers only from the current epoch. On a transparent-serving `zinder-compat-lightwalletd`, `GetTaddressTxids` and `GetTaddressTransactions` read history and transactions at one epoch, so a new block during the request no longer fails it. Each retained epoch keeps its own canonical and wallet secondaries open, so the query process can hold up to four serving pairs at once, about 1.4 GiB on the `zinder-wallet-serving` image.
+time: 2026-11-14T11:02:41.620701018Z
+custom:
+    Bump: patch
+    PR: "171"

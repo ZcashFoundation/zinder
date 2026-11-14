@@ -156,7 +156,7 @@ Use these errors at the event and source boundaries:
 | `EventCursorExpired` | `RocksDbCanonicalSecondary` and `CanonicalReader` | The event cursor is older than retained event history |
 | `EventCursorInvalid` | `RocksDbCanonicalSecondary` and `CanonicalReader` | The cursor fails authentication, network, store, or stream-family validation |
 
-Canonical storage errors map to API errors at service boundaries. A requested `at_epoch_id` that is not the serving pair's admitted chain epoch maps to `CHAIN_EPOCH_PIN_UNAVAILABLE`. A block-keyed artifact that the admitted epoch does not hold maps to `ARTIFACT_UNAVAILABLE`, with the artifact family label in `ResourceInfo`.
+Canonical storage errors map to API errors at service boundaries. A requested `at_epoch_id` that neither the current serving pair nor a retained one answers maps to `CHAIN_EPOCH_PIN_UNAVAILABLE`. A block-keyed artifact that the admitted epoch does not hold maps to `ARTIFACT_UNAVAILABLE`, with the artifact family label in `ResourceInfo`.
 
 ## Retention And Backpressure
 

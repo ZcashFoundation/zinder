@@ -402,7 +402,9 @@ pub async fn transparent_address_tx_ids_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
     request: TransparentAddressTxIdsInRangeRequest,
 ) -> Result<TransparentAddressTxIds, QueryError> {
-    query_api.transparent_address_tx_ids_in_range(request).await
+    query_api
+        .transparent_address_tx_ids_in_range(request, None)
+        .await
 }
 
 /// Builds the leading header chunk carrying the chain epoch pinned for the
