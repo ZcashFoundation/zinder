@@ -851,6 +851,14 @@ async fn run_materialized_view_plane(
         explorer_views = true,
         "Explorer views admitted after store open"
     );
+    // Cursor seeding writes view rows before the tailer applies the guard.
+    if let Some(guard) = &spec.volume_space_guard
+        && !guard
+            .wait_for_room(DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL, &cancel)
+            .await
+    {
+        return;
+    }
     if let Err(error) = seed_backfill_owned_consumer_cursors(
         &canonical,
         &spec.activations,

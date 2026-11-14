@@ -225,8 +225,9 @@ never depend on it.
 
 Replay pauses while the volume that holds the canonical store, and therefore
 the view store, has less available space than
-`ingest.explorer_views_min_free_bytes` (10 GiB by default). It resumes on its
-own once at least a tenth more than that is available. Canonical ingest and
+`ingest.explorer_views_min_free_bytes` (10 GiB by default). Startup cursor
+seeding waits behind the same floor. Replay resumes on its own once at least a
+tenth more than that is available. Canonical ingest and
 wallet serving keep running while the views are paused.
 [ADR-0034](../adrs/0034-exclusive-index-build-stages-and-block-local-spend-replay.md)
 records the resolution order, the cache bound, and the guard.

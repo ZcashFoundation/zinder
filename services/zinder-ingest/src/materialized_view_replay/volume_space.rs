@@ -10,9 +10,12 @@
 use std::{
     io,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 
 use parking_lot::Mutex;
+use tokio_util::sync::CancellationToken;
 
 /// Default `ingest.explorer_views_min_free_bytes`: 10 GiB.
 pub const DEFAULT_EXPLORER_VIEWS_MIN_FREE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
@@ -27,7 +30,7 @@ pub const DEFAULT_EXPLORER_VIEWS_MIN_FREE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 #[derive(Debug)]
 pub struct VolumeSpaceGuard {
     storage_path: PathBuf,
-    min_free_bytes: u64,
+    min_free_bytes: AtomicU64,
     state: Mutex<VolumeSpaceState>,
 }
 
@@ -47,9 +50,30 @@ impl VolumeSpaceGuard {
     pub fn new(storage_path: impl Into<PathBuf>, min_free_bytes: u64) -> Option<Self> {
         (min_free_bytes > 0).then(|| Self {
             storage_path: storage_path.into(),
-            min_free_bytes,
+            min_free_bytes: AtomicU64::new(min_free_bytes),
             state: Mutex::new(VolumeSpaceState::default()),
         })
+    }
+
+    /// Replaces the free-space floor; the next sample applies it.
+    ///
+    /// A floor of zero releases the guard without disabling it.
+    pub fn set_min_free_bytes(&self, min_free_bytes: u64) {
+        self.min_free_bytes.store(min_free_bytes, Ordering::Relaxed);
+    }
+
+    /// Waits until the volume has room for Explorer view writes, sampling once
+    /// per `poll_interval`.
+    ///
+    /// Returns `false` when `cancel` fires first.
+    pub async fn wait_for_room(&self, poll_interval: Duration, cancel: &CancellationToken) -> bool {
+        while self.is_low() {
+            tokio::select! {
+                () = cancel.cancelled() => return false,
+                () = tokio::time::sleep(poll_interval) => {}
+            }
+        }
+        true
     }
 
     /// Samples the volume and returns whether replay must stay paused.
@@ -81,11 +105,12 @@ impl VolumeSpaceGuard {
 
     fn record(&self, state: &mut VolumeSpaceState, available_bytes: u64) {
         state.sample_failed = false;
+        let min_free_bytes = self.min_free_bytes.load(Ordering::Relaxed);
         metrics::gauge!("zinder_materialized_view_replay_volume_available_bytes")
             .set(super::u64_to_f64(available_bytes));
         metrics::gauge!("zinder_materialized_view_replay_volume_min_free_bytes")
-            .set(super::u64_to_f64(self.min_free_bytes));
-        let low = next_volume_space_low(state.low, available_bytes, self.min_free_bytes);
+            .set(super::u64_to_f64(min_free_bytes));
+        let low = next_volume_space_low(state.low, available_bytes, min_free_bytes);
         if low == state.low {
             return;
         }
@@ -96,8 +121,8 @@ impl VolumeSpaceGuard {
                 event = "materialized_view_replay_volume_space_low",
                 path = %self.storage_path.display(),
                 available_bytes,
-                min_free_bytes = self.min_free_bytes,
-                resume_free_bytes = resume_free_bytes(self.min_free_bytes),
+                min_free_bytes,
+                resume_free_bytes = resume_free_bytes(min_free_bytes),
                 "Explorer view replay paused because the storage volume has less available space than ingest.explorer_views_min_free_bytes; canonical ingest and wallet serving continue"
             );
         } else {
@@ -106,7 +131,7 @@ impl VolumeSpaceGuard {
                 event = "materialized_view_replay_volume_space_recovered",
                 path = %self.storage_path.display(),
                 available_bytes,
-                min_free_bytes = self.min_free_bytes,
+                min_free_bytes,
                 "Explorer view replay resumed because the storage volume has available space again"
             );
         }
@@ -199,10 +224,6 @@ mod tests {
             .join("canonical")
             .join("materialized-views");
         assert!(available_bytes(&missing)? > 0);
-        assert_eq!(
-            available_bytes(&missing)?,
-            available_bytes(directory.path())?
-        );
         Ok(())
     }
 

@@ -404,41 +404,62 @@ async fn the_tailer_publishes_a_live_status_and_opens_the_historical_work_gate()
 }
 
 #[tokio::test]
-async fn a_volume_below_the_free_space_floor_pauses_replay_and_closes_the_historical_work_gate()
+async fn a_volume_below_the_free_space_floor_pauses_replay_until_space_recovers()
 -> Result<(), Box<dyn Error>> {
     let mut harness = CanonicalHarness::baseline().await?;
-    harness.follow_to_tip().await?;
     let (directory, view) = view_store()?;
     let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     readiness.update_admission(|admission| admission.phase = Some(IngestPhase::FollowingTip));
     let gate = zinder_ingest::HistoricalWorkGate::new(readiness);
     let cancel = CancellationToken::new();
+    let guard = Arc::new(VolumeSpaceGuard::new(directory.path(), 1).ok_or("guard enabled")?);
     let mut tailer = harness.tailer(&view);
-    tailer.volume_space_guard = VolumeSpaceGuard::new(directory.path(), u64::MAX).map(Arc::new);
-
+    tailer.volume_space_guard = Some(Arc::clone(&guard));
     let handle = spawn_materialized_view_tailer_task(
         tailer,
         Duration::from_millis(10),
         gate.clone(),
         cancel.clone(),
     );
-    let paused = tokio::time::timeout(Duration::from_secs(30), async {
-        while view.get_materialized_view_status().ok().flatten().is_none() {
+
+    let phases = async {
+        wait_until(|| gate.is_open()).await?;
+        guard.set_min_free_bytes(u64::MAX);
+        wait_until(|| !gate.is_open()).await?;
+        harness.follow_to_tip().await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let paused = materialized_view_status(&view)?;
+        guard.set_min_free_bytes(0);
+        wait_until(|| {
+            gate.is_open()
+                && materialized_view_status(&view)
+                    .is_ok_and(|status| status.indexed_height == CHAIN_TIP_HEIGHT)
+        })
+        .await?;
+        Ok::<_, Box<dyn Error>>(paused)
+    }
+    .await;
+    cancel.cancel();
+    handle.await?;
+    let paused = phases?;
+
+    assert_eq!(paused.health, MaterializedViewHealth::Paused as i32);
+    assert_eq!(paused.indexed_height, BASELINE_TIP_HEIGHT);
+    assert_eq!(
+        materialized_view_status(&view)?.health,
+        MaterializedViewHealth::Live as i32
+    );
+    Ok(())
+}
+
+async fn wait_until(condition: impl Fn() -> bool + Sync) -> Result<(), Box<dyn Error>> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !condition() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    cancel.cancel();
-    handle.await?;
-    paused.map_err(|_| "the paused tailer must still persist its status")?;
-
-    let status = materialized_view_status(&view)?;
-    assert_eq!(status.health, MaterializedViewHealth::Paused as i32);
-    assert_eq!(status.indexed_height, 0);
-    assert!(!gate.is_open());
-    assert!(chain_event_cursors(&view)?.values().all(Option::is_none));
-    Ok(())
+    .await
+    .map_err(|_| "the tailer did not reach the expected state within 30 seconds".into())
 }
 
 fn view_store() -> Result<(TempDir, MaterializedViewStore), Box<dyn Error>> {
