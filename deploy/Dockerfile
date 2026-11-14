@@ -118,9 +118,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
+# BuildKit gives directories that `COPY --chmod` creates the file mode, so
+# /usr/local/lib/zinder must exist before a 0644 file is copied into it.
 RUN groupadd --system --gid 1000 zinder \
     && useradd --system --uid 1000 --gid zinder --home /var/lib/zinder --shell /usr/sbin/nologin zinder \
-    && mkdir -p /var/lib/zinder/secondary /etc/zinder \
+    && mkdir -p /var/lib/zinder/secondary /etc/zinder /usr/local/lib/zinder \
     && chown -R zinder:zinder /var/lib/zinder /etc/zinder
 
 FROM zinder-runtime-base AS zinder-ingest
