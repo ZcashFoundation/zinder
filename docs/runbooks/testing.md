@@ -1461,7 +1461,7 @@ The wallet rows above describe the public native contract advertised by the
 standalone `zinder-query` runtime. The compatibility adapter may consume those
 capabilities internally, but its lightwalletd protocol remains a separately
 certified external surface. Explorer rows belong to the optional
-`zinder-explorer` runtime and are not published as a release image.
+`zinder-explorer` runtime, which these wallet tiers do not certify.
 
 ## Failure interpretation reference
 

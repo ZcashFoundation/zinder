@@ -10,6 +10,7 @@
 #     docker build -f deploy/Dockerfile --target zinder-compat-lightwalletd -t zinder-compat-lightwalletd .
 #     docker build -f deploy/Dockerfile --target zinder-canonical-runtime -t zinder-canonical-runtime .
 #     docker build -f deploy/Dockerfile --target zinder-wallet-serving -t zinder-wallet-serving .
+#     docker build -f deploy/Dockerfile --target zinder-wallet-serving-explorer -t zinder-wallet-serving-explorer .
 #     docker build -f deploy/Dockerfile --target zinder-explorer -t zinder-explorer .
 #     docker build -f deploy/Dockerfile --target zinder-bench -t zinder-bench .
 #     docker build -f deploy/Dockerfile --target zinder-ingest-live-tests -t zinder-ingest-live-tests .
@@ -92,6 +93,7 @@ COPY --from=zinder-binaries /zinder-binaries/zinder-ingest /bin/zinder-ingest
 COPY --from=zinder-binaries /zinder-binaries/zinder-projector /bin/zinder-projector
 COPY --from=zinder-binaries /zinder-binaries/zinder-query /bin/zinder-query
 COPY --from=zinder-binaries /zinder-binaries/zinder-compat-lightwalletd /bin/zinder-compat-lightwalletd
+COPY --from=zinder-binaries /zinder-binaries/zinder-explorer /bin/zinder-explorer
 
 FROM zinder-build-base AS zinder-ingest-live-test-binary
 
@@ -190,6 +192,20 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
 
 ENTRYPOINT ["zinder-compat-lightwalletd"]
 
+FROM zinder-runtime-base AS zinder-explorer
+
+COPY --from=zinder-binaries /zinder-binaries/zinder-explorer /usr/local/bin/zinder-explorer
+
+USER zinder:zinder
+WORKDIR /var/lib/zinder
+
+EXPOSE 9068 9069
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5m --retries=3 \
+    CMD curl -fsS http://localhost:9069/readyz || exit 1
+
+ENTRYPOINT ["zinder-explorer"]
+
 # Single-volume host images. Platforms that attach one volume to one container
 # mount it root-owned, so these targets start as root and their entrypoints
 # drop every runtime process to zinder.
@@ -249,19 +265,31 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=6h --retries=3 \
 
 ENTRYPOINT ["zinder-wallet-serving-runtime-entrypoint"]
 
-FROM zinder-runtime-base AS zinder-explorer
+# Wallet serving plus the Explorer on one volume. zinder-explorer opens the
+# materialized-view store that zinder-ingest writes as a RocksDB secondary, so
+# it must share the writer's filesystem. The baked ingest config differs from
+# zinder-wallet-serving in one setting: ingest also writes the Explorer views.
+FROM zinder-wallet-serving AS zinder-wallet-serving-explorer
 
 COPY --from=zinder-binaries /zinder-binaries/zinder-explorer /usr/local/bin/zinder-explorer
 
-USER zinder:zinder
-WORKDIR /var/lib/zinder
+COPY deploy/config/wallet-serving/explorer.toml /etc/zinder/explorer.toml
 
-EXPOSE 9068 9069
+RUN sed -i 's/^explorer_views = false$/explorer_views = true/' /etc/zinder/ingest.toml \
+    && grep -qx 'explorer_views = true' /etc/zinder/ingest.toml
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5m --retries=3 \
-    CMD curl -fsS http://localhost:9069/readyz || exit 1
+COPY --chmod=0755 deploy/wallet-serving-explorer-runtime-entrypoint \
+    /usr/local/bin/zinder-wallet-serving-explorer-runtime-entrypoint
 
-ENTRYPOINT ["zinder-explorer"]
+EXPOSE 9068 9069 9102 9106
+
+# The wallet-serving check keeps a parked canonical writer healthy; the
+# Explorer must also admit traffic.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=6h --retries=3 \
+    CMD zinder-wallet-serving-healthcheck \
+        && curl -fsS --connect-timeout 2 --max-time 4 -o /dev/null http://127.0.0.1:9069/readyz
+
+ENTRYPOINT ["zinder-wallet-serving-explorer-runtime-entrypoint"]
 
 FROM zinder-runtime-base AS zinder-bench
 

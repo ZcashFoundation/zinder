@@ -14,8 +14,10 @@ each serve process-owned immutable readers admitted at one exact fence.
 | `zinder-compat-lightwalletd` | Canonical and wallet secondary generations, wallet-serving admission, `CompactTxStreamer` translation, transaction broadcast, sparse tree-state fill | Either primary store, projection construction, or mixed-generation responses |
 
 `zinder-explorer` and `zinder-compat-cipherscan` are optional workspace
-services. They compile, but the release workflow and checked single-host
-composition do not publish or start them.
+services, and the checked single-host composition does not start them. The
+release workflow publishes `zinder-explorer` as a runtime image and inside the
+`zinder-wallet-serving-explorer` single-volume image. It does not publish
+`zinder-compat-cipherscan`.
 
 ## Ownership rules
 

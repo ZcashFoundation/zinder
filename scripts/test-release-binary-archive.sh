@@ -14,7 +14,7 @@ fail() {
 
 fixture_binaries="$temporary_directory/binaries"
 mkdir -p "$fixture_binaries"
-for binary_name in zinder-ingest zinder-projector zinder-query zinder-compat-lightwalletd; do
+for binary_name in zinder-ingest zinder-projector zinder-query zinder-compat-lightwalletd zinder-explorer; do
   printf '#!/usr/bin/env bash\n# 0123456789abcdef0123456789abcdef01234567\nprintf "%%s 0.5.0-rc.1\\n" "$(basename "$0")"\n' \
     > "$fixture_binaries/$binary_name"
   chmod 755 "$fixture_binaries/$binary_name"

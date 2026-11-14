@@ -22,10 +22,10 @@ Every stable or prerelease tag produces two GNU/Linux archives:
 - `x86_64-v3-unknown-linux-gnu`, built for the x86-64-v3 CPU baseline; and
 - `aarch64-unknown-linux-gnu`, built for the Armv8-A baseline.
 
-Each archive contains exactly the four runtime catalog executables from
-`deploy/release-images.json`: ingest, projector, native query, and lightwalletd
-compatibility. Benchmark, explorer, Cipherscan, and code-generation binaries
-are excluded. The archive root also contains `BUILD-INFO.json`, `LICENSE`,
+Each archive contains exactly the five runtime catalog executables from
+`deploy/release-images.json`: ingest, projector, native query, lightwalletd
+compatibility, and the optional Explorer. Benchmark, Cipherscan, and
+code-generation binaries are excluded. The archive root also contains `BUILD-INFO.json`, `LICENSE`,
 `README.md`, and an internal `SHA256SUMS`.
 
 The release build uses Rust 1.95.0, explicit GNU target triples, an embedded
@@ -45,8 +45,8 @@ epoch, and every binary hash and size.
 
 ## Consequences
 
-- Operators can install the same four-process topology without extracting a
-  container image.
+- Operators can install the same four-process topology, and the optional
+  Explorer, without extracting a container image.
 - x86 hosts must support x86-64-v3; the filename makes that requirement
   visible before execution.
 - Binary release failure blocks crates.io authentication and every image
@@ -59,3 +59,9 @@ epoch, and every binary hash and size.
 Musl builds are a separate portability product and are not aliases for these
 GNU artifacts. Artifact signing, SBOMs, and attestations are defined separately
 by [ADR-0037](0037-release-artifact-provenance-and-sboms.md).
+
+## Revision history
+
+- 2026-11-14: The runtime catalog, and with it each archive, gained the
+  optional `zinder-explorer` executable, so the Explorer release images reuse a
+  reproduced binary like every other runtime image.

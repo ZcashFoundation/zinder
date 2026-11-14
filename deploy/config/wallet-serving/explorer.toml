@@ -1,0 +1,24 @@
+# ExplorerQuery configuration for the zinder-wallet-serving-explorer image.
+# Holds only the container topology; network, node endpoint, and node
+# authentication come from ZINDER_* variables on the service.
+
+[node]
+request_timeout_secs = 30
+
+# zinder-ingest writes the materialized-view store beneath this canonical path.
+[storage]
+path = "/var/lib/zinder/canonical"
+secondary_path = "/var/lib/zinder/explorer/secondary"
+
+# Explorer consumers reach ExplorerQuery from outside the container, over
+# Railway's IPv6-only private network. WalletQuery reads stay on the
+# container's own query process.
+[explorer]
+listen_addr = "[::]:9068"
+wallet_query_endpoint = "http://127.0.0.1:9102"
+
+[ops]
+listen_addr = "[::]:9069"
+
+[security]
+allow_public_bind = true

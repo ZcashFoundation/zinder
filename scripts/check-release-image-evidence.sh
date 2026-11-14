@@ -62,6 +62,9 @@ case "$service_name" in
   zinder-wallet-serving)
     image_runtime_packages='["zinder-ingest", "zinder-projector", "zinder-query"]'
     ;;
+  zinder-wallet-serving-explorer)
+    image_runtime_packages='["zinder-ingest", "zinder-projector", "zinder-query", "zinder-explorer"]'
+    ;;
   *)
     image_runtime_packages="$(jq -c -n --arg service "$service_name" '[$service]')"
     ;;
@@ -149,7 +152,7 @@ check_child_sbom() {
       and all(.packages[]?;
         (.name as $name
           | (
-            ["zinder-ingest", "zinder-projector", "zinder-query", "zinder-compat-lightwalletd"]
+            ["zinder-ingest", "zinder-projector", "zinder-query", "zinder-compat-lightwalletd", "zinder-explorer"]
             - $image_runtime_packages
           )
           | index($name)) == null
