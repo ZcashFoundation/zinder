@@ -320,9 +320,12 @@ impl TransparentAddressRankingConsumer {
     ///
     /// A build with the same generation, base, and row count resumes under the
     /// requested target when its tail has not passed that target, so a build
-    /// that follows a moving visible tip keeps its progress. Any other stale
-    /// build is cleared before the new plan is persisted, so rows absent from a
-    /// restarted canonical snapshot cannot survive.
+    /// that follows a moving visible tip keeps its progress. A retained tail
+    /// is not trusted to be canonical: every later tail block must extend the
+    /// block applied below it, and activation proves the target block, so a
+    /// tail left on a replaced branch fails instead of activating. Any other
+    /// stale build is cleared before the new plan is persisted, so rows absent
+    /// from a restarted canonical snapshot cannot survive.
     pub fn initialize_snapshot_generation(
         store: &MaterializedViewStore,
         plan: TransparentAddressRankingSnapshotPlan,
@@ -740,14 +743,33 @@ impl TransparentAddressRankingConsumer {
     ) -> Result<Self, TransparentAddressRankingConsumerError> {
         let mut consumer = Self::new();
         consumer.pending_metadata = Some(metadata);
+        let mut covered_through = metadata.coverage.balance_complete_through_height;
+        let mut covered_tip_hash = None;
         let mut ctx = MaterializedViewConsumerCtx { store, batch };
         for block in blocks {
             if block.height > manifest.plan.target_height {
                 return Err(TransparentAddressRankingConsumerError::SnapshotTailPastTarget);
             }
+            if block.height > covered_through {
+                let parent_hash = match covered_tip_hash {
+                    Some(hash) => hash,
+                    None => snapshot_build_tip_hash(store, manifest, covered_through)?,
+                };
+                if block.previous_block_hash != parent_hash {
+                    return Err(
+                        TransparentAddressRankingConsumerError::SnapshotTailDisconnected {
+                            height: block.height.value(),
+                        },
+                    );
+                }
+            }
             consumer.apply_block(block, &mut ctx).map_err(|error| {
                 TransparentAddressRankingConsumerError::SnapshotTail(error.to_string())
             })?;
+            if block.height > covered_through {
+                covered_through = block.height;
+                covered_tip_hash = Some(block.block_hash);
+            }
         }
         Ok(consumer)
     }
@@ -1328,6 +1350,31 @@ fn sealed_snapshot_build(
         .filter(|metadata| metadata.generation == generation)
         .ok_or(TransparentAddressRankingConsumerError::SnapshotBuildMissing { generation })?;
     Ok((manifest, metadata))
+}
+
+/// Returns the hash of the block an inactive build has applied at `height`.
+///
+/// A build retained across a target change may hold blocks from a branch a
+/// reorg replaced, so the next applied block must link to this hash.
+fn snapshot_build_tip_hash(
+    store: &MaterializedViewStore,
+    manifest: &SnapshotBuildManifest,
+    height: BlockHeight,
+) -> Result<BlockHash, TransparentAddressRankingConsumerError> {
+    if height == manifest.plan.base_height {
+        return Ok(manifest.plan.base_block_hash);
+    }
+    let payload = store
+        .get_consumer(
+            TRANSPARENT_ADDRESS_RANKING_UNDO_COLUMN_FAMILY,
+            &undo_key(manifest.plan.generation, height),
+        )?
+        .ok_or_else(
+            || TransparentAddressRankingConsumerError::AppliedBlockJournalMissing {
+                height: height.value(),
+            },
+        )?;
+    Ok(decode_undo_journal(&payload)?.block_hash)
 }
 
 fn verify_snapshot_target(
@@ -2150,6 +2197,15 @@ pub enum TransparentAddressRankingConsumerError {
         /// Supplied height.
         actual_height: u32,
     },
+    /// A snapshot tail block does not extend the block the build applied
+    /// below it, as when the build holds blocks from a replaced branch.
+    #[error(
+        "transparent-address ranking snapshot tail block at height {height} does not extend the build"
+    )]
+    SnapshotTailDisconnected {
+        /// Height of the block whose parent differs.
+        height: u32,
+    },
     /// An idempotent chunk replay had no persisted journal for its block.
     #[error("transparent-address ranking applied-block journal is missing at height {height}")]
     AppliedBlockJournalMissing {
@@ -2855,7 +2911,7 @@ mod tests {
         TransparentAddressRankingSnapshotPlan {
             generation,
             base_height: BlockHeight::new(0),
-            base_block_hash: zinder_core::Network::ZcashRegtest.genesis_hash(),
+            base_block_hash: BlockHash::from_bytes([0; 32]),
             target_height: target.height,
             target_block_hash: target.block_hash,
             expected_summary_count: 0,
@@ -3057,6 +3113,67 @@ mod tests {
         ));
         assert!(TransparentAddressRankingConsumer::active_metadata(&store)?.is_none());
         assert_eq!(build_coverage_height(&store)?, BlockHeight::new(0));
+        Ok(())
+    }
+
+    #[test]
+    fn retargeted_build_refuses_a_tail_from_a_replaced_branch() -> TestResult {
+        let (_tempdir, store) = open_store()?;
+        let script = p2pkh(16);
+        let replaced = (1..=2)
+            .map(|height| receive_block(height, script.clone(), 5))
+            .collect::<Vec<_>>();
+        let template = receive_block(3, script, 7);
+        let replacement = BlockCommitContext::new(
+            BlockCommitInput {
+                height: template.height,
+                block_hash: template.block_hash,
+                previous_block_hash: BlockHash::from_bytes([0xd2; 32]),
+                block_time_unix_seconds: template.block_time_unix_seconds,
+                block_size_bytes: 0,
+                transactions: template.transactions,
+                final_note_commitment_roots: None,
+            },
+            TransparentSpendFacts::Offline,
+        );
+        TransparentAddressRankingConsumer::initialize_snapshot_generation(
+            &store,
+            genesis_plan(1, &replaced[1]),
+        )?;
+        TransparentAddressRankingConsumer::finalize_snapshot_base(&store, 1)?;
+        TransparentAddressRankingConsumer::write_snapshot_tail_blocks(&store, 1, &replaced)?;
+        TransparentAddressRankingConsumer::initialize_snapshot_generation(
+            &store,
+            genesis_plan(1, &replacement),
+        )?;
+
+        assert!(matches!(
+            TransparentAddressRankingConsumer::write_snapshot_tail_blocks(
+                &store,
+                1,
+                std::slice::from_ref(&replacement),
+            ),
+            Err(
+                super::TransparentAddressRankingConsumerError::SnapshotTailDisconnected {
+                    height: 3
+                }
+            )
+        ));
+        assert!(matches!(
+            TransparentAddressRankingConsumer::activate_snapshot_generation_at_cursor(
+                &store,
+                1,
+                std::slice::from_ref(&replacement),
+                &[3],
+            ),
+            Err(
+                super::TransparentAddressRankingConsumerError::SnapshotTailDisconnected {
+                    height: 3
+                }
+            )
+        ));
+        assert!(TransparentAddressRankingConsumer::active_metadata(&store)?.is_none());
+        assert_eq!(build_coverage_height(&store)?, BlockHeight::new(2));
         Ok(())
     }
 

@@ -182,7 +182,14 @@ impl<'tailer> RankingBuild<'tailer> {
             .map_err(ranking_error)?;
             through = page.end;
         }
+        if pass.yields() {
+            self.log_progress(through);
+            return Ok(());
+        }
         let unsettled_tail = self.read_unsettled_tail(through, pass)?;
+        if pass.yields() {
+            return Ok(());
+        }
         let metadata = {
             let _write_guard = materialized_view_write_guard();
             TransparentAddressRankingConsumer::activate_snapshot_generation_at_cursor(

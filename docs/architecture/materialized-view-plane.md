@@ -176,7 +176,10 @@ ways:
 The pass that reaches the settled tip reads the unsettled tail, at most one
 reorg window long. One write applies that tail, activates the generation, and
 adopts the shared cursor. Settled heights never change, so the inactive build
-never holds a block that a reorg could replace.
+never holds a block that a reorg could replace. A pass that pauses or is
+cancelled before that write leaves only settled progress behind. The ranking
+store also checks that every tail block extends the block applied below it, so
+a build left on a replaced branch fails instead of activating.
 
 ## Store contract
 
