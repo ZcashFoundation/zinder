@@ -288,6 +288,11 @@ pub(crate) struct SecondaryReport {
     pub(crate) separate_process: bool,
     pub(crate) follower_peak_vmhwm_bytes: Option<u64>,
     pub(crate) follower_report: Option<String>,
+    /// Catch-up calls in the follower that returned an error and were retried.
+    pub(crate) follower_catch_up_errors: u64,
+    pub(crate) follower_first_catch_up_error: Option<String>,
+    /// Set when the follower process itself failed; the writer report is kept.
+    pub(crate) follower_failure: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -921,7 +926,14 @@ pub(crate) async fn run_replay(args: ReplayArgs) -> Result<ReplayReport, BenchEr
 
     if let (Some(report), Some(child)) = (secondary_report.as_mut(), secondary_child) {
         let follower_report = child.report_path().display().to_string();
-        let follow = child.finish()?;
+        match child.finish() {
+            Err(error) => {
+                report.follower_failure = Some(error.to_string());
+                report.follower_report = Some(follower_report);
+            }
+            Ok(follow) => {
+        report.follower_catch_up_errors = follow.catch_up_errors;
+        report.follower_first_catch_up_error = follow.first_catch_up_error.clone();
         report.open_seconds = follow.open_seconds;
         report.periodic_catch_ups = LatencySummary {
             count: follow.periodic_catch_up_count,
@@ -937,6 +949,8 @@ pub(crate) async fn run_replay(args: ReplayArgs) -> Result<ReplayReport, BenchEr
         report.wallet_control_matches_fence = follow.wallet_control_matches_fence;
         report.follower_peak_vmhwm_bytes = follow.peak_vmhwm_bytes;
         report.follower_report = Some(follower_report);
+            }
+        }
     }
     if let (Some(report), Some(state)) = (secondary_report.as_mut(), secondary_state) {
         let mut secondary = match state {

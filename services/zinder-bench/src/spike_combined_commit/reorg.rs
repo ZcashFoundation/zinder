@@ -174,6 +174,8 @@ pub(crate) struct ReorgReport {
     pub(crate) stalls: StallSummary,
     pub(crate) properties: PropertySamples,
     pub(crate) final_fence: FenceView,
+    /// The follower's own report (catch-up errors it recorded and retried).
+    pub(crate) secondary_follower: Option<super::secondary_follow::SecondaryFollowReport>,
     pub(crate) wallet_before: Option<WalletView>,
     pub(crate) wallet_final: Option<WalletView>,
     /// Seconds of the cold readback that matched the READY evidence.
@@ -412,8 +414,9 @@ pub(crate) async fn run_reorg(args: ReorgArgs) -> Result<ReorgReport, BenchError
     }
     let store = store.ok_or_else(|| BenchError::spike("store lost"))?;
     let has_secondary = secondary.is_some() || secondary_child.is_some();
+    let mut secondary_follower = None;
     if let Some(child) = secondary_child {
-        child.finish()?;
+        secondary_follower = Some(child.finish()?);
     }
     let properties = sampler.finish();
     let tickers = ticker_delta(&tickers_before, &ticker_snapshot(&statistics));
@@ -533,6 +536,7 @@ pub(crate) async fn run_reorg(args: ReorgArgs) -> Result<ReorgReport, BenchError
         stalls: stalls.summary(),
         properties,
         final_fence: FenceView::from(store.event_fence()),
+        secondary_follower,
         wallet_before,
         wallet_final: wallet
             .as_ref()

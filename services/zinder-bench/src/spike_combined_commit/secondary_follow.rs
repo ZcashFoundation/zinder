@@ -86,6 +86,67 @@ pub(crate) struct SecondaryFollowReport {
     pub(crate) final_event_sequence: u64,
     pub(crate) wallet_control_matches_fence: Option<bool>,
     pub(crate) peak_vmhwm_bytes: Option<u64>,
+    /// Catch-up calls that returned an error (the follower records and retries them).
+    #[serde(default)]
+    pub(crate) catch_up_errors: u64,
+    /// The first catch-up error, with the time it happened.
+    #[serde(default)]
+    pub(crate) first_catch_up_error: Option<String>,
+}
+
+/// Catch-up errors seen by the follower.
+#[derive(Default)]
+struct ErrorLog {
+    count: u64,
+    first: Option<String>,
+}
+
+impl ErrorLog {
+    fn record(&mut self, context: &str, error: &BenchError) {
+        self.count += 1;
+        let line = format!(
+            "{} {context}: {error}",
+            chrono_like_now()
+        );
+        tracing::warn!(
+            target: "zinder::bench::spike",
+            event = "spike_secondary_catch_up_error",
+            count = self.count,
+            error = %line,
+            "secondary catch-up failed; retrying on the next poll"
+        );
+        if self.first.is_none() {
+            self.first = Some(line);
+        }
+    }
+}
+
+fn chrono_like_now() -> String {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("unix_ms={}", since.as_millis())
+}
+
+/// Retries one measured catch-up a few times, recording each failure.
+fn finish_with_retry(
+    secondary: &mut zinder_store::RocksDbCanonicalSecondary,
+    combined: bool,
+    errors: &mut ErrorLog,
+) -> Result<(f64, FenceView, bool, Option<bool>), BenchError> {
+    let mut attempt = 0;
+    loop {
+        let fence_before = secondary.event_fence();
+        match finish_secondary(secondary, fence_before, combined) {
+            Ok(outcome) => return Ok(outcome),
+            Err(error) if attempt < 20 => {
+                errors.record("measured catch-up", &error);
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Runs the follower until the stop file appears.
@@ -121,12 +182,12 @@ pub(crate) fn run_secondary_follow(args: &SecondaryFollowArgs) -> Result<(), Ben
     let poll = Duration::from_millis(args.poll_ms);
     let request_file = control_file(&args.stop_file, "request");
     let mut last_poll = Instant::now();
+    let mut errors = ErrorLog::default();
     while !args.stop_file.exists() {
         if let Ok(encoded) = std::fs::read_to_string(&request_file) {
             let index = encoded.trim().to_owned();
-            let fence_before = secondary.event_fence();
             let (seconds, fence, _, wallet_matches) =
-                finish_secondary(&mut secondary, fence_before, combined)?;
+                finish_with_retry(&mut secondary, combined, &mut errors)?;
             let response = CatchUpResponse {
                 seconds,
                 tip_height: fence.tip_height,
@@ -145,15 +206,16 @@ pub(crate) fn run_secondary_follow(args: &SecondaryFollowArgs) -> Result<(), Ben
         if args.poll_ms > 0 && last_poll.elapsed() >= poll {
             last_poll = Instant::now();
             let catch_up_started = Instant::now();
-            secondary.try_catch_up()?;
-            durations.push(catch_up_started.elapsed().as_secs_f64());
+            match secondary.try_catch_up() {
+                Ok(_) => durations.push(catch_up_started.elapsed().as_secs_f64()),
+                Err(error) => errors.record("periodic catch-up", &BenchError::from(error)),
+            }
             continue;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    let fence_before = secondary.event_fence();
     let (final_seconds, fence, _, wallet_matches) =
-        finish_secondary(&mut secondary, fence_before, combined)?;
+        finish_with_retry(&mut secondary, combined, &mut errors)?;
     let periodic: LatencySummary = summarize_seconds(&durations);
     let report = SecondaryFollowReport {
         network_label: NETWORK_LABEL_TESTNET.to_owned(),
@@ -170,6 +232,8 @@ pub(crate) fn run_secondary_follow(args: &SecondaryFollowArgs) -> Result<(), Ben
         final_event_sequence: fence.event_sequence,
         wallet_control_matches_fence: wallet_matches,
         peak_vmhwm_bytes: peak_rss_bytes(),
+        catch_up_errors: errors.count,
+        first_catch_up_error: errors.first,
     };
     let encoded = serde_json::to_vec_pretty(&report)?;
     std::fs::write(&args.report, encoded).map_err(|source| BenchError::io(&args.report, source))
