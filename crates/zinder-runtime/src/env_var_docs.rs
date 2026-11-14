@@ -1125,7 +1125,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Temporary spill-file ceiling for each wallet builder sorter. Defaults to \
-                      68719476736.",
+                      206158430208.",
     },
     EnvVarDoc {
         name: "ZINDER_PROJECTOR__BUILD__SST_TARGET_LOGICAL_BYTES",

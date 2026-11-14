@@ -47,6 +47,10 @@ pub enum BulkLoadError {
         /// Caller-supplied temporary-file byte ceiling.
         limit_bytes: u64,
         /// Peak temporary bytes required by the refused operation.
+        ///
+        /// A refusal raised while records are still arriving reports the
+        /// requirement of the records seen so far, so the complete sort needs
+        /// at least this much and possibly more.
         required_bytes: u64,
     },
     /// A bounded staging allocation could not be reserved.

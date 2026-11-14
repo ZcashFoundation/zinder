@@ -27,6 +27,7 @@ tonic = { workspace = true, features = ["transport"] }
 tracing.workspace = true
 zinder-proto.workspace = true
 zinder-core.workspace = true
+zinder-rocksdb-bulk-load.workspace = true
 zinder-runtime.workspace = true
 zinder-source.workspace = true
 zinder-store.workspace = true

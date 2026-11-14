@@ -121,6 +121,21 @@ elapses), and binds a wallet build plan to that source identity. It acquires
 a wallet projection build lease and a writer-owned canonical retention lease,
 then builds the wallet store in its owned path.
 
+Construction sorts transparent outputs, spends, and address rows externally.
+Each sorter spills to a staging directory beside the wallet store, up to
+`projector.build.max_temporary_file_bytes_per_sorter` bytes. The default is
+206158430208 (192 GiB). A sorter that spills more than one run needs about
+twice its spilled bytes, because its final merge writes every record again
+while the input runs still exist. In late 2026, the largest sorter of a Mainnet
+build from genesis needed about 99 GB. Keep at least that much free space on
+the wallet volume, beside the stores themselves.
+
+If the ceiling is too small, the projector stops as soon as the final merge can
+no longer fit, which is usually while the canonical scan is still running. The
+error names the setting and the bytes required so far. When the scan had not
+finished, the complete build needs more than that figure, so raise the setting
+with headroom. A restart with the same setting fails the same way.
+
 Wallet publication requires the complete build digest and source position to
 match the admitted canonical fence. The projector then catches up and takes
 continuous following ownership before releasing construction leases.
