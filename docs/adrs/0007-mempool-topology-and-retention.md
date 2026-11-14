@@ -72,20 +72,24 @@ needs, so block arrival never makes the live index unavailable. Source
 transitions are staged for the replacement and do not touch the serving index.
 A tip change is not a source failure or durable-state rebuild and therefore
 adds no source-error telemetry or recovery backoff. Transport, monitor,
-hydration, admission, and protocol failures continue through the bounded
-rebuild path, which withdraws the serving generation. When the replacement
+hydration, admission, and protocol failures, including a failure to reopen the
+source after a tip change, continue through the bounded rebuild path, which
+withdraws the serving generation. When the replacement
 snapshot completes before canonical ingest reaches the same tip, the owner
 keeps it private, continues staging source transitions, and certifies it as
 soon as the canonical tip catches up. Certification reconciles the replacement
 against the serving index under the mutation gate and moves the serving tip in
-one step.
+one step. A reconciliation that fails partway withdraws the index for rebuild
+before the gate is released, because the serving generation no longer
+describes it.
 
 A read is answered at the canonical writer's current epoch. Between canonical
 ingest committing a block and the owner certifying the replacement at that
 block, the serving generation is one tip behind. `MempoolSnapshot` and
 `MempoolTransaction` then wait up to five seconds for the replacement, waking
 on each owner status change and recapturing the canonical epoch, and answer
-coherently once it is certified. A read that is still incoherent at the bound
+coherently once it is certified. The bound includes any wait for the mutation
+gate while the replacement reconciles. A read that is still incoherent at the bound
 returns `CHAIN_EPOCH_PIN_UNAVAILABLE`, and a read refused because the owner is
 rebuilding or halted fails at once. With the streaming source the transition
 takes milliseconds, so wallets see a short delay at block boundaries instead

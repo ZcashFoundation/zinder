@@ -326,6 +326,8 @@ impl LiveMempoolOwner {
     ///
     /// The status watch is subscribed before the epoch is captured, so a
     /// certification that lands after the capture always wakes the retry.
+    /// The bound also covers the read itself, which waits for the mutation
+    /// gate while a replacement generation reconciles.
     async fn read_at_canonical_tip<Answer, Read, ReadFuture>(
         &self,
         canonical: &CanonicalControlHandle,
@@ -339,19 +341,24 @@ impl LiveMempoolOwner {
         loop {
             let mut status_changes = self.status_changes.subscribe();
             let chain_epoch = canonical.chain_epoch().await?.chain_epoch;
-            let refusal = match read(chain_epoch).await {
-                Ok(answer) => return Ok((chain_epoch, answer)),
-                Err(refusal) => refusal,
+            let refusal = match tokio::time::timeout_at(deadline, read(chain_epoch)).await {
+                Ok(Ok(answer)) => return Ok((chain_epoch, answer)),
+                Ok(Err(refusal)) => refusal,
+                Err(_elapsed) => return Err(tip_transition_read_expired()),
             };
             if tokio::time::Instant::now() >= deadline {
                 return Err(refusal);
             }
+            let visible_tip =
+                BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash);
+            // `set_status` publishes the watch bump before releasing the
+            // status lock, so checking the watch after reading the status
+            // catches a certification that landed after the refusal.
+            let awaits_tip = self.awaits_tip(visible_tip);
             if status_changes.has_changed().unwrap_or(false) {
                 continue;
             }
-            let visible_tip =
-                BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash);
-            if !self.awaits_tip(visible_tip) {
+            if !awaits_tip {
                 return Err(refusal);
             }
             match tokio::time::timeout_at(deadline, status_changes.changed()).await {
@@ -704,6 +711,10 @@ impl LiveMempoolOwner {
         self.set_status(MempoolOwnerStatus::RebuildRequired);
     }
 
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the status-change bump must be visible before a reader can observe the new status"
+    )]
     fn set_status(&self, status: MempoolOwnerStatus) {
         let mut current = self.status.write();
         // A halt is terminal for the process; nothing may resume serving.
@@ -711,10 +722,10 @@ impl LiveMempoolOwner {
             return;
         }
         *current = status;
-        drop(current);
-        record_mempool_lifecycle_status(status);
         self.status_changes
             .send_modify(|changes| *changes = changes.wrapping_add(1));
+        drop(current);
+        record_mempool_lifecycle_status(status);
     }
 
     /// Starts staging a new source generation and returns whether a certified
@@ -778,8 +789,11 @@ impl LiveMempoolOwner {
         let staged_generation = self.staged_generation.lock().take().ok_or_else(|| {
             Status::failed_precondition("mempool source completion marker has no staged snapshot")
         })?;
+        // Earlier batches may already have changed the index, which the
+        // previous generation then no longer describes.
         self.reconcile_staged_generation_locked(canonical, staged_generation)
-            .await?;
+            .await
+            .inspect_err(|_status| self.mark_rebuild_required())?;
         self.set_status(MempoolOwnerStatus::Serving {
             source_tip,
             snapshot_certified_at: UnixTimestampMillis::now(),
@@ -1090,11 +1104,11 @@ async fn run_source_generation(
             event_stream
         }
         Err(error) => {
+            // A serving generation stops following the node mempool here, so
+            // it is withdrawn rather than kept certified through the outage.
             record_source_open_failure(&error);
-            return if wait_or_cancel(cancel, MEMPOOL_RECONNECT_BACKOFF).await {
-                MempoolOwnerLoopOutcome::Shutdown
-            } else {
-                MempoolOwnerLoopOutcome::Rehydrate
+            return MempoolOwnerLoopOutcome::Rebuild {
+                reconnect_backoff: MEMPOOL_RECONNECT_BACKOFF,
             };
         }
     };
@@ -1227,6 +1241,13 @@ async fn certify_source_snapshot(
         }
     }
     Ok(certification)
+}
+
+fn tip_transition_read_expired() -> Status {
+    status_for_reason(
+        ErrorReason::ChainEpochPinUnavailable,
+        "live mempool index did not settle on the canonical chain epoch within the read bound",
+    )
 }
 
 fn rejected_snapshot_outcome(status: &Status) -> MempoolOwnerLoopOutcome {
@@ -1620,7 +1641,10 @@ mod tests {
     use std::{
         error::Error,
         num::{NonZeroU32, NonZeroU64},
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU32, Ordering},
+        },
         time::{Duration, Instant},
     };
 
@@ -1654,8 +1678,9 @@ mod tests {
     };
 
     use super::{
-        LiveMempoolOwner, MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS, MempoolOwnerLoopOutcome,
-        MempoolOwnerStatus, MempoolRetentionSettings, SnapshotCertification, consume_source_events,
+        LiveMempoolOwner, MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS,
+        MEMPOOL_TIP_TRANSITION_READ_WAIT, MempoolOwnerLoopOutcome, MempoolOwnerStatus,
+        MempoolRetentionSettings, SnapshotCertification, consume_source_events,
         record_mempool_lifecycle_status, record_mempool_retention_pass, run_live_mempool_owner,
         run_mempool_retention,
     };
@@ -2172,6 +2197,220 @@ mod tests {
             outcome.err().map(|status| status.code()),
             Some(Code::Unavailable)
         );
+        command_task.abort();
+        let _join_result = command_task.await;
+        Ok(())
+    }
+
+    /// The tip-transition bound also covers the wait for the mutation gate,
+    /// so a read queued behind a long reconciliation still answers in time.
+    #[tokio::test]
+    async fn read_behind_a_held_mutation_gate_expires_at_the_transition_bound()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let (canonical, mut commands) = canonical_control_channel();
+        let command_task = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                apply_canonical_control_command(&mut store, command);
+            }
+        });
+        let owner = LiveMempoolOwner::default();
+        assert_eq!(
+            owner
+                .try_complete_hydration(&canonical, fixture_source_tip())
+                .await?,
+            SnapshotCertification::Certified
+        );
+        let _stalled_reconciliation = owner.mutation_gate.lock().await;
+
+        let outcome = tokio::time::timeout(
+            MEMPOOL_TIP_TRANSITION_READ_WAIT + Duration::from_secs(2),
+            owner.entry_at_canonical_tip(&canonical, TransactionId::from_bytes([0xE2; 32])),
+        )
+        .await?;
+        let status = outcome
+            .err()
+            .ok_or("read behind a held mutation gate unexpectedly succeeded")?;
+        let error_info = status
+            .get_error_details()
+            .error_info()
+            .cloned()
+            .ok_or("tip-transition expiry omitted ErrorInfo")?;
+
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert_eq!(
+            error_info.reason,
+            ErrorReason::ChainEpochPinUnavailable.as_str_name()
+        );
+        command_task.abort();
+        let _join_result = command_task.await;
+        Ok(())
+    }
+
+    /// A certification that lands after a read was refused retries the read
+    /// instead of returning the stale refusal.
+    #[tokio::test]
+    async fn read_retries_when_certification_lands_after_its_refusal() -> Result<(), Box<dyn Error>>
+    {
+        let temporary = tempfile::TempDir::new()?;
+        let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let (canonical, mut commands) = canonical_control_channel();
+        let command_task = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                apply_canonical_control_command(&mut store, command);
+            }
+        });
+        let owner = LiveMempoolOwner::default();
+        let attempts = AtomicU32::new(0);
+        let owner_ref = &owner;
+        let attempts_ref = &attempts;
+
+        let (chain_epoch, answered_tip) = tokio::time::timeout(
+            Duration::from_secs(2),
+            owner.read_at_canonical_tip(&canonical, move |chain_epoch| {
+                let attempt = attempts_ref.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        owner_ref.set_status(MempoolOwnerStatus::Serving {
+                            source_tip: visible_tip(chain_epoch),
+                            snapshot_certified_at: UnixTimestampMillis::now(),
+                        });
+                        return Err(tonic::Status::unavailable("refused before certification"));
+                    }
+                    owner_ref
+                        .coherent_serving_state_for(chain_epoch)
+                        .map(|(source_tip, _snapshot_certified_at)| source_tip)
+                }
+            }),
+        )
+        .await??;
+
+        assert_eq!(answered_tip, visible_tip(chain_epoch));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        command_task.abort();
+        let _join_result = command_task.await;
+        Ok(())
+    }
+
+    /// A replacement reconciliation that fails after earlier batches changed
+    /// the index withdraws it before a read queued at the old epoch runs, so
+    /// that read cannot observe a partially reconciled index.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_replacement_reconciliation_withdraws_before_a_queued_read()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let transaction_count = MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS * 2;
+        // Two addition batches certify the first generation; the replacement's
+        // second removal batch fails.
+        let StalledAppendCanonicalControl {
+            canonical,
+            canonical_epoch,
+            append_reached,
+            release_append,
+            command_task,
+        } = stalled_append_canonical_control(store, 4)?;
+        let (source, source_control) = MockMempoolSource::streaming();
+        let owner = LiveMempoolOwner::default();
+        let (ready_signal, _ready_gate) = mempool_ready_channel();
+        let cancel = CancellationToken::new();
+        let serving_tip = fixture_tip(2);
+        let next_tip = fixture_tip(3);
+        set_canonical_visible_tip(&canonical_epoch, serving_tip);
+        let serving_epoch = canonical.chain_epoch().await?.chain_epoch;
+        let owner_task = tokio::spawn(run_live_mempool_owner(
+            Arc::new(source),
+            canonical.clone(),
+            owner.clone(),
+            ready_signal,
+            cancel.clone(),
+        ));
+        wait_for_source_open(&source_control, 1).await?;
+        for transaction_nonce in 0..transaction_count {
+            source_control
+                .push_added(source_entry_with_nonce(u32::try_from(transaction_nonce)?)?)?;
+        }
+        wait_for_staged_entries(&owner, transaction_count).await?;
+        source_control.complete_initial_snapshot(serving_tip)?;
+        wait_for_serving(&owner, true).await?;
+
+        source_control.change_source_tip(serving_tip, next_tip)?;
+        wait_for_source_open(&source_control, 2).await?;
+        source_control.complete_initial_snapshot(next_tip)?;
+        set_canonical_visible_tip(&canonical_epoch, next_tip);
+        tokio::time::timeout(Duration::from_secs(3), append_reached).await??;
+        let read_owner = owner.clone();
+        let queued_read = tokio::spawn(async move {
+            read_owner
+                .entry_for(serving_epoch, TransactionId::from_bytes([0xE1; 32]))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !queued_read.is_finished(),
+            "the read queues behind the reconciliation"
+        );
+        release_append
+            .send(())
+            .map_err(|()| "the stalled append was already released")?;
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), queued_read).await??;
+        assert_eq!(
+            outcome.err().map(|status| status.code()),
+            Some(Code::Unavailable)
+        );
+
+        cancel.cancel();
+        owner_task.await?;
+        command_task.abort();
+        let _join_result = command_task.await;
+        Ok(())
+    }
+
+    /// A source that cannot be reopened after a tip change withdraws the
+    /// serving generation, which would otherwise stay certified while it no
+    /// longer follows the node mempool.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_source_reopen_after_a_tip_change_withdraws_the_serving_generation()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let MutableEpochCanonicalControl {
+            canonical,
+            canonical_epoch,
+            command_task,
+        } = mutable_epoch_canonical_control(store)?;
+        let (mock_source, source_control) = MockMempoolSource::streaming();
+        let fail_opens = Arc::new(AtomicBool::new(false));
+        let source = ReopenFailingMempoolSource {
+            inner: mock_source,
+            fail_opens: Arc::clone(&fail_opens),
+        };
+        let owner = LiveMempoolOwner::default();
+        let (ready_signal, ready_gate) = mempool_ready_channel();
+        let cancel = CancellationToken::new();
+        let serving_tip = fixture_tip(2);
+        set_canonical_visible_tip(&canonical_epoch, serving_tip);
+        let owner_task = tokio::spawn(run_live_mempool_owner(
+            Arc::new(source),
+            canonical.clone(),
+            owner.clone(),
+            ready_signal,
+            cancel.clone(),
+        ));
+        wait_for_source_open(&source_control, 1).await?;
+        source_control.complete_initial_snapshot(serving_tip)?;
+        wait_for_hydration(&ready_gate, true).await?;
+
+        fail_opens.store(true, Ordering::SeqCst);
+        source_control.change_source_tip(serving_tip, fixture_tip(3))?;
+        wait_for_serving(&owner, false).await?;
+        wait_for_hydration(&ready_gate, false).await?;
+        assert!(owner.require_serving().is_err());
+
+        cancel.cancel();
+        owner_task.await?;
         command_task.abort();
         let _join_result = command_task.await;
         Ok(())
@@ -3140,6 +3379,102 @@ mod tests {
         Ok(MutableEpochCanonicalControl {
             canonical,
             canonical_epoch,
+            command_task,
+        })
+    }
+
+    /// Delegates to a mock source until `fail_opens` is set, then refuses
+    /// every reopen.
+    #[derive(Debug)]
+    struct ReopenFailingMempoolSource {
+        inner: MockMempoolSource,
+        fail_opens: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl zinder_source::MempoolSource for ReopenFailingMempoolSource {
+        fn capabilities(&self) -> zinder_source::MempoolSourceCapabilities {
+            self.inner.capabilities()
+        }
+
+        async fn events(
+            &self,
+        ) -> Result<zinder_source::MempoolSourceEventStream, zinder_source::SourceError> {
+            if self.fail_opens.load(Ordering::SeqCst) {
+                return Err(zinder_source::SourceError::NodeUnavailable {
+                    reason: "injected mempool source reopen failure".to_owned(),
+                });
+            }
+            self.inner.events().await
+        }
+    }
+
+    struct StalledAppendCanonicalControl {
+        canonical: CanonicalControlHandle,
+        canonical_epoch: Arc<ParkingMutex<ChainEpoch>>,
+        append_reached: tokio::sync::oneshot::Receiver<()>,
+        release_append: tokio::sync::oneshot::Sender<()>,
+        command_task: tokio::task::JoinHandle<()>,
+    }
+
+    /// A mutable-epoch canonical control whose `failing_append`-th mempool
+    /// append reports that it was reached, waits for release, and then fails.
+    fn stalled_append_canonical_control(
+        mut store: RocksDbCanonicalStore,
+        failing_append: usize,
+    ) -> Result<StalledAppendCanonicalControl, Box<dyn Error>> {
+        let canonical_epoch = Arc::new(ParkingMutex::new(store.chain_epoch()?));
+        let command_epoch = canonical_epoch.clone();
+        let canonical_fence = store.event_fence();
+        let (canonical, mut commands) = canonical_control_channel();
+        let (reached_sender, append_reached) = tokio::sync::oneshot::channel();
+        let (release_append, release_receiver) = tokio::sync::oneshot::channel::<()>();
+        let command_task = tokio::spawn(async move {
+            let mut reached_sender = Some(reached_sender);
+            let mut release_receiver = Some(release_receiver);
+            let mut append_count = 0_usize;
+            while let Some(command) = commands.recv().await {
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "the test overrides epoch reads and mempool appends and delegates the full control contract"
+                )]
+                match command {
+                    CanonicalControlCommand::ChainEpoch { reply } => {
+                        let _send_outcome = reply.send(Ok(CanonicalWriterSnapshot {
+                            chain_epoch: *command_epoch.lock(),
+                            fence: canonical_fence,
+                        }));
+                    }
+                    CanonicalControlCommand::AppendMempoolEvents { events, reply } => {
+                        append_count = append_count.saturating_add(1);
+                        if append_count != failing_append {
+                            apply_canonical_control_command(
+                                &mut store,
+                                CanonicalControlCommand::AppendMempoolEvents { events, reply },
+                            );
+                            continue;
+                        }
+                        if let Some(sender) = reached_sender.take() {
+                            let _send_outcome = sender.send(());
+                        }
+                        if let Some(receiver) = release_receiver.take() {
+                            let _release_outcome = receiver.await;
+                        }
+                        let _send_outcome = reply.send(Err(tonic::Status::unavailable(
+                            "injected durable mempool append failure",
+                        )));
+                    }
+                    command => {
+                        apply_canonical_control_command(&mut store, command);
+                    }
+                }
+            }
+        });
+        Ok(StalledAppendCanonicalControl {
+            canonical,
+            canonical_epoch,
+            append_reached,
+            release_append,
             command_task,
         })
     }
