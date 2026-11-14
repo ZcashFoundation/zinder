@@ -428,9 +428,10 @@ observe_plane_readiness() {
 # only exit that subshell and leave the container running.
 #
 # An unready stretch becomes an episode when the plane is unreachable, or once
-# an answered drain has lasted recurrence_min_answered_episode_seconds. Every
-# stretch, episode or not, adds its length to the cumulative unready time and
-# restarts the sustained-recovery clock when it ends.
+# an answered drain has lasted recurrence_min_answered_episode_seconds,
+# measured up to the poll that observes its recovery. Every stretch, episode
+# or not, adds its length to the cumulative unready time and restarts the
+# sustained-recovery clock when it ends.
 update_plane_recurrence() {
   role="$1"
   is_ready="$2"
@@ -447,6 +448,11 @@ update_plane_recurrence() {
     if [ "$flap_unready_since_epoch" -ne 0 ]; then
       episode_seconds=$((now_epoch - flap_unready_since_epoch))
       cumulative_unready_seconds=$((cumulative_unready_seconds + episode_seconds))
+      if [ "$flap_episode_counted" -eq 0 ] \
+        && [ "$episode_seconds" -ge "$recurrence_min_answered_episode_seconds" ]; then
+        episode_count=$((episode_count + 1))
+        flap_episode_counted=1
+      fi
       if [ "$flap_episode_counted" -eq 1 ]; then
         log "$role recovered after ${episode_seconds}s unready: episode $episode_count ended, ${cumulative_unready_seconds}s unready in the current recurrence window"
       else

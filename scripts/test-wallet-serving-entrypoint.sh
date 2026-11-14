@@ -231,6 +231,14 @@ poll_recurrence 0 0 $((2000 + recurrence_min_answered_episode_seconds))
 [ "$(recurrence_episode_count)" -eq 1 ] \
   || test_failure "a sustained answered drain did not count as an episode"
 
+# A drain that reaches the minimum episode length on its recovery poll counts.
+reset_recurrence
+poll_recurrence 0 0 2500
+poll_recurrence 0 0 2545
+poll_recurrence 1 0 $((2500 + recurrence_min_answered_episode_seconds))
+[ "$(recurrence_episode_count)" -eq 1 ] \
+  || test_failure "a drain that recovered at the minimum episode length did not count"
+
 # An unreachable plane counts at once, and repeated short wedges escalate.
 reset_recurrence
 poll_epoch=3000
