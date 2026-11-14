@@ -6,7 +6,9 @@ and serves no client protocol.
 
 Use [Deploying on a VM](deploying-on-a-vm.md) for the complete topology, or
 [Wallet-serving deployment (single-volume hosts)](deploying-wallet-serving.md)
-for the native `WalletQuery` service.
+for the native `WalletQuery` service. The same runbook covers
+[wallet serving with the Explorer](deploying-wallet-serving.md#serving-the-explorer-from-the-same-volume),
+which adds the native `ExplorerQuery` service on the same volume.
 
 ## Image
 

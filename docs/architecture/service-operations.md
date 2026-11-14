@@ -530,12 +530,14 @@ The complete supported composition is the same-host RocksDB deployment in
 Zebra or Zakura node selected entirely by a `deploy/.env.*` file, and
 `deploy/node-cookie-permissions.yml` makes a non-Z3 node's cookie readable to
 the Zinder runtimes. The runtime release-image catalog,
-`deploy/release-images.json`, is limited to ingest, projector, native query,
-and lightwalletd compatibility. A release also publishes the two
-single-volume host images in `deploy/release-single-volume-images.json` for
-hosts that attach one volume to one container: `zinder-wallet-serving`, which
-is native-only and omits lightwalletd compatibility, and
-`zinder-canonical-runtime`, an ingest-only diagnostic or canary runtime.
-Neither is the complete supported composition. Every image is a target of the
-single `deploy/Dockerfile`. Explorer, Cipherscan, and
-PostgreSQL are not release classes.
+`deploy/release-images.json`, holds ingest, projector, native query,
+lightwalletd compatibility, and the optional Explorer, which the
+`deploy/docker-compose.explorer.yml` overlay adds to that composition. A
+release also publishes the three single-volume host images in
+`deploy/release-single-volume-images.json` for hosts that attach one volume to
+one container: `zinder-wallet-serving`, which is native-only and omits
+lightwalletd compatibility; `zinder-wallet-serving-explorer`, which adds the
+Explorer to it; and `zinder-canonical-runtime`, an ingest-only diagnostic or
+canary runtime. None is the complete supported composition. Every image is a
+target of the single `deploy/Dockerfile`. Cipherscan and PostgreSQL are not
+release classes.

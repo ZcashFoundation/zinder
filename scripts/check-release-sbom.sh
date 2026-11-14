@@ -77,12 +77,14 @@ jq -e \
     )
     and ([.packages[] | select(.SPDXID | startswith("SPDXRef-Binary-")) | .name] | sort) == [
       "zinder-compat-lightwalletd",
+      "zinder-explorer",
       "zinder-ingest",
       "zinder-projector",
       "zinder-query"
     ]
     and ([.files[].fileName] | sort) == [
       "./bin/zinder-compat-lightwalletd",
+      "./bin/zinder-explorer",
       "./bin/zinder-ingest",
       "./bin/zinder-projector",
       "./bin/zinder-query"
@@ -90,7 +92,7 @@ jq -e \
     and any(.packages[]; .name == "rust-librocksdb-sys" and .versionInfo == $rocksdb_version)
     and any(.packages[]; any(.externalRefs[]?; .referenceType == "purl" and (.referenceLocator | startswith("pkg:cargo/"))))
     and all(.packages[];
-      (.name | test("^zinder-(bench|testkit|proto-codegen|explorer|compat-cipherscan)$"; "i") | not)
+      (.name | test("^zinder-(bench|testkit|proto-codegen|compat-cipherscan)$"; "i") | not)
     )
   ' "$sbom" >/dev/null
 

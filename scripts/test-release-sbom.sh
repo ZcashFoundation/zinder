@@ -301,6 +301,15 @@ wallet_serving_fixture="$scratch/wallet-serving-syft-fixture.json"
 jq --argjson ingest "$(cargo_package zinder-ingest)" \
   --argjson projector "$(cargo_package zinder-projector)" \
   '.packages += [$ingest, $projector]' "$fixture" > "$wallet_serving_fixture"
+wallet_serving_explorer_image=ghcr.io/example/zinder-wallet-serving-explorer
+wallet_serving_explorer_fixture="$scratch/wallet-serving-explorer-syft-fixture.json"
+jq --argjson explorer "$(cargo_package zinder-explorer)" \
+  '.packages += [$explorer]' "$wallet_serving_fixture" > "$wallet_serving_explorer_fixture"
+explorer_image=ghcr.io/example/zinder-explorer
+explorer_fixture="$scratch/explorer-syft-fixture.json"
+jq --argjson explorer "$(cargo_package zinder-explorer)" \
+  'del(.packages[] | select(.name == "zinder-query")) | .packages += [$explorer]' \
+  "$fixture" > "$explorer_fixture"
 canonical_runtime_image=ghcr.io/example/zinder-canonical-runtime
 canonical_runtime_fixture="$scratch/canonical-runtime-syft-fixture.json"
 jq --argjson ingest "$(cargo_package zinder-ingest)" \
@@ -313,6 +322,16 @@ for architecture in amd64 arm64; do
       --image "$wallet_serving_image" --tag "$image_tag" --commit "$commit" \
       --architecture "$architecture" --digest "${!digest_variable}" \
       --output "$scratch/wallet-serving-${architecture}.spdx.json"
+  ZINDER_SYFT="$fake_syft" ZINDER_SYFT_FIXTURE="$wallet_serving_explorer_fixture" \
+    "$repository_root/scripts/generate-release-sbom.sh" \
+      --image "$wallet_serving_explorer_image" --tag "$image_tag" --commit "$commit" \
+      --architecture "$architecture" --digest "${!digest_variable}" \
+      --output "$scratch/wallet-serving-explorer-${architecture}.spdx.json"
+  ZINDER_SYFT="$fake_syft" ZINDER_SYFT_FIXTURE="$explorer_fixture" \
+    "$repository_root/scripts/generate-release-sbom.sh" \
+      --image "$explorer_image" --tag "$image_tag" --commit "$commit" \
+      --architecture "$architecture" --digest "${!digest_variable}" \
+      --output "$scratch/explorer-${architecture}.spdx.json"
   ZINDER_SYFT="$fake_syft" ZINDER_SYFT_FIXTURE="$canonical_runtime_fixture" \
     "$repository_root/scripts/generate-release-sbom.sh" \
       --image "$canonical_runtime_image" --tag "$image_tag" --commit "$commit" \
@@ -323,6 +342,31 @@ check_single_volume_image_evidence "$wallet_serving_image" \
   "$scratch/wallet-serving-amd64.spdx.json" "$scratch/wallet-serving-arm64.spdx.json"
 check_single_volume_image_evidence "$canonical_runtime_image" \
   "$scratch/canonical-runtime-amd64.spdx.json" "$scratch/canonical-runtime-arm64.spdx.json"
+check_single_volume_image_evidence "$wallet_serving_explorer_image" \
+  "$scratch/wallet-serving-explorer-amd64.spdx.json" "$scratch/wallet-serving-explorer-arm64.spdx.json"
+check_single_volume_image_evidence "$explorer_image" \
+  "$scratch/explorer-amd64.spdx.json" "$scratch/explorer-arm64.spdx.json"
+
+wallet_serving_with_explorer_sbom="$scratch/wallet-serving-with-explorer.spdx.json"
+jq --argjson explorer "$(cargo_package zinder-explorer)" '.packages += [$explorer]' \
+  "$scratch/wallet-serving-amd64.spdx.json" > "$wallet_serving_with_explorer_sbom"
+expect_rejected "a wallet-serving image SBOM containing the Explorer executable package" \
+  check_single_volume_image_evidence "$wallet_serving_image" \
+    "$wallet_serving_with_explorer_sbom" "$scratch/wallet-serving-arm64.spdx.json"
+
+wallet_serving_explorer_missing_explorer_sbom="$scratch/wallet-serving-explorer-missing-explorer.spdx.json"
+jq 'del(.packages[] | select(.name == "zinder-explorer"))' \
+  "$scratch/wallet-serving-explorer-amd64.spdx.json" > "$wallet_serving_explorer_missing_explorer_sbom"
+expect_rejected "a wallet-serving Explorer image SBOM without the Explorer executable package" \
+  check_single_volume_image_evidence "$wallet_serving_explorer_image" \
+    "$wallet_serving_explorer_missing_explorer_sbom" "$scratch/wallet-serving-explorer-arm64.spdx.json"
+
+explorer_query_sbom="$scratch/explorer-query.spdx.json"
+jq --argjson query "$(cargo_package zinder-query)" '.packages += [$query]' \
+  "$scratch/explorer-amd64.spdx.json" > "$explorer_query_sbom"
+expect_rejected "an Explorer image SBOM containing the native query executable package" \
+  check_single_volume_image_evidence "$explorer_image" \
+    "$explorer_query_sbom" "$scratch/explorer-arm64.spdx.json"
 
 wallet_serving_missing_projector_sbom="$scratch/wallet-serving-missing-projector.spdx.json"
 jq 'del(.packages[] | select(.name == "zinder-projector"))' \

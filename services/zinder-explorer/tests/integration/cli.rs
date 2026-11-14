@@ -66,6 +66,33 @@ fn print_config_accepts_explorer_bearer_token_path() -> eyre::Result<()> {
 }
 
 #[test]
+fn wallet_serving_explorer_image_config_resolves() -> eyre::Result<()> {
+    let config_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../deploy/config/wallet-serving/explorer.toml");
+
+    let output = zinder_explorer_command()
+        .args(["--config", path_str(&config_path)?, "--print-config"])
+        .env("ZINDER_NETWORK__NAME", "zcash-testnet")
+        .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:18232")
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    for expected in [
+        "path = \"/var/lib/zinder/canonical\"",
+        "secondary_path = \"/var/lib/zinder/explorer/secondary\"",
+        "listen_addr = \"[::]:9068\"",
+        "wallet_query_endpoint = \"http://127.0.0.1:9102\"",
+        "listen_addr = \"[::]:9069\"",
+        "allow_public_bind = true",
+    ] {
+        assert!(stdout.contains(expected), "missing {expected}: {stdout}");
+    }
+
+    Ok(())
+}
+
+#[test]
 fn invalid_explorer_bearer_token_path_is_rejected() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let storage_path = tempdir.path().join("materialized-view-invalid-token-store");

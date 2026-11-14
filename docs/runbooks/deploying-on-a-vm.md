@@ -5,8 +5,8 @@ topology. Four independent processes share one host filesystem:
 `zinder-ingest` owns canonical storage, `zinder-projector` owns the wallet
 projection, and `zinder-query` plus `zinder-compat-lightwalletd` independently
 serve immutable canonical and wallet secondary pairs. The optional explorer
-overlay builds a local `zinder-explorer` image for named explorer consumers;
-it is not part of the published release-image catalog. The single-volume host
+overlay adds `zinder-explorer` for named explorer consumers; it is not part of
+the certified four-runtime topology. The single-volume host
 images that a release also publishes are separate deployment shapes, described
 in [Wallet-serving deployment (single-volume hosts)](deploying-wallet-serving.md),
 and are not this topology.
@@ -249,7 +249,10 @@ docker compose --env-file /etc/zinder/env \
   up -d --build
 ```
 
-The overlay builds `zinder-explorer`, opens a process-owned materialized-view
+The overlay builds a local `zinder-explorer` image unless
+`ZINDER_EXPLORER_IMAGE` names one, such as the released
+`ghcr.io/zcashfoundation/zinder-explorer:vX.Y.Z`. The Explorer opens a
+process-owned materialized-view
 secondary, and federates `WalletQuery` over the shared loopback namespace. The
 runtime does not open a canonical secondary. It publishes gRPC and ops
 endpoints on host loopback using `ZINDER_EXPLORER_HOST_PORT` and

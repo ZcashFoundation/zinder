@@ -19,6 +19,7 @@ on:
       - "deploy/canonical-runtime-entrypoint"
       - "deploy/materialize-indexer-tls"
       - "deploy/wallet-serving-runtime-entrypoint"
+      - "deploy/wallet-serving-explorer-runtime-entrypoint"
       - "deploy/wallet-serving-healthcheck"
       - "deploy/config/wallet-serving/**"
       - "scripts/validate-deployment-admission.sh"
@@ -97,10 +98,7 @@ jobs:
             rm -rf "$image_root"
           }
 
-          image_names="$(
-            jq -r '.[]' <<< "$RELEASE_IMAGES_JSON"
-            printf '%s\n' zinder-explorer
-          )"
+          image_names="$(jq -r '.[]' <<< "$RELEASE_IMAGES_JSON")"
           while IFS= read -r image_name; do
 
             docker buildx build \
