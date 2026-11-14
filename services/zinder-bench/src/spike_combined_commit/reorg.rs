@@ -39,6 +39,7 @@ use super::{
     },
     pipeline::derive_block,
     replay::{FenceView, ThresholdCheck, WalletView, finish_secondary},
+    secondary_follow::SecondaryChild,
     spike_error,
 };
 
@@ -72,6 +73,9 @@ pub(crate) struct ReorgArgs {
     /// Directory for a canonical secondary caught up after each replacement.
     #[arg(long)]
     secondary_dir: Option<PathBuf>,
+    /// Run the secondary inside the writer process instead of a child process.
+    #[arg(long, default_value_t = false)]
+    secondary_in_process: bool,
     /// Wallet transition logical-byte ceiling passed to the planner.
     #[arg(long, default_value_t = MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES)]
     wallet_max_transition_bytes: u64,
@@ -210,15 +214,24 @@ pub(crate) async fn run_reorg(args: ReorgArgs) -> Result<ReorgReport, BenchError
     let tickers_before = ticker_snapshot(&statistics);
 
     let mut secondary_open_seconds = None;
-    let mut secondary = match args.secondary_dir.as_ref() {
-        Some(dir) => {
-            let started = Instant::now();
-            let opened = open_secondary(&path, dir, &activations, args.common.reorg_window_blocks)?;
-            secondary_open_seconds = Some(started.elapsed().as_secs_f64());
-            Some(opened)
+    let mut secondary = None;
+    let mut secondary_child = None;
+    if let Some(dir) = args.secondary_dir.as_ref() {
+        let started = Instant::now();
+        if args.secondary_in_process {
+            secondary = Some(open_secondary(&path, dir, &activations, args.common.reorg_window_blocks)?);
+        } else {
+            secondary_child = Some(SecondaryChild::spawn(
+                &args.common.fixture,
+                &args.common.network,
+                &path,
+                dir,
+                0,
+                args.common.reorg_window_blocks,
+            )?);
         }
-        None => None,
-    };
+        secondary_open_seconds = Some(started.elapsed().as_secs_f64());
+    }
 
     let source = FixtureNodeSource::open(&args.common.fixture, &manifest)?;
     let cancel = CancellationToken::new();
@@ -315,6 +328,15 @@ pub(crate) async fn run_reorg(args: ReorgArgs) -> Result<ReorgReport, BenchError
             sample.secondary_fence_matches_primary = Some(matches);
             sample.secondary_wallet_control_matches_fence = wallet_matches;
         }
+        if let Some(child) = secondary_child.as_mut() {
+            let response = child.request_catch_up()?;
+            sample.secondary_catch_up_seconds = Some(response.seconds);
+            sample.secondary_fence_matches_primary = Some(
+                response.tip_height == primary_fence.visible_tip().height.value()
+                    && response.event_sequence == primary_fence.chain_event_sequence(),
+            );
+            sample.secondary_wallet_control_matches_fence = response.wallet_control_matches_fence;
+        }
         tracing::info!(
             target: "zinder::bench::spike",
             event = "spike_replacement_committed",
@@ -328,6 +350,10 @@ pub(crate) async fn run_reorg(args: ReorgArgs) -> Result<ReorgReport, BenchError
         replacements.push(sample);
     }
     let store = store.ok_or_else(|| BenchError::spike("store lost"))?;
+    let has_secondary = secondary.is_some() || secondary_child.is_some();
+    if let Some(child) = secondary_child {
+        child.finish()?;
+    }
     let properties = sampler.finish();
     let tickers = ticker_delta(&tickers_before, &ticker_snapshot(&statistics));
     let peak = peak_rss_bytes();
@@ -393,7 +419,7 @@ pub(crate) async fn run_reorg(args: ReorgArgs) -> Result<ReorgReport, BenchError
             passed: max_wallet_logical <= PROJECTOR_DEFAULT_FOLLOW_MAX_TRANSITION_BYTES,
         });
     }
-    if secondary.is_some() {
+    if has_secondary {
         ceilings.push(ThresholdCheck {
             check: "secondary catch-up after each replacement under 30 s",
             threshold: "< 30 s".to_owned(),

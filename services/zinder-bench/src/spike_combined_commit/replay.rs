@@ -51,6 +51,7 @@ use super::{
         PressureWriter, apply_lanes,
     },
     pipeline::{DerivedBlock, spawn_pipeline},
+    secondary_follow::SecondaryChild,
     spike_error,
 };
 
@@ -91,11 +92,17 @@ pub(crate) struct ReplayArgs {
     /// Secondary catch-up poll interval during the replay (0 = only after it).
     #[arg(long, default_value_t = 1000)]
     secondary_poll_ms: u64,
+    /// Run the secondary inside the writer process instead of a child process.
+    ///
+    /// The default child process keeps the reader's memory out of the
+    /// writer's peak RSS, as separate reader runtimes do.
+    #[arg(long, default_value_t = false)]
+    secondary_in_process: bool,
     /// Wallet transition logical-byte ceiling passed to the planner.
     #[arg(long, default_value_t = MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES)]
     wallet_max_transition_bytes: u64,
-    /// Blocks derived ahead of the committer.
-    #[arg(long, default_value_t = 64)]
+    /// Blocks derived ahead of the committer (production follow holds one).
+    #[arg(long, default_value_t = 2)]
     pipeline_depth: usize,
     /// Log progress every this many blocks.
     #[arg(long, default_value_t = 1000)]
@@ -268,6 +275,10 @@ pub(crate) struct SecondaryReport {
     /// Combined only: the wallet control read through the secondary names
     /// exactly the canonical fence the secondary admitted.
     pub(crate) wallet_control_matches_fence: Option<bool>,
+    /// The secondary ran in a separate process.
+    pub(crate) separate_process: bool,
+    pub(crate) follower_peak_vmhwm_bytes: Option<u64>,
+    pub(crate) follower_report: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -741,25 +752,44 @@ pub(crate) async fn run_replay(args: ReplayArgs) -> Result<ReplayReport, BenchEr
 
     let mut secondary_report = None;
     let mut secondary_state = None;
+    let mut secondary_child = None;
     if let Some(dir) = args.secondary_dir.as_ref() {
-        let started = Instant::now();
-        let secondary = open_secondary(&args.work, dir, &activations, args.common.reorg_window_blocks)?;
-        let open = started.elapsed().as_secs_f64();
-        secondary_report = Some(SecondaryReport {
-            path: absolute(dir).display().to_string(),
-            open_seconds: open,
-            poll_ms: args.secondary_poll_ms,
-            ..SecondaryReport::default()
-        });
-        secondary_state = Some(if args.secondary_poll_ms > 0 {
-            Err(SecondaryPoller::spawn(
-                secondary,
-                Duration::from_millis(args.secondary_poll_ms),
-                Arc::clone(&primary_tip),
-            ))
+        if args.secondary_in_process {
+            let started = Instant::now();
+            let secondary =
+                open_secondary(&args.work, dir, &activations, args.common.reorg_window_blocks)?;
+            let open = started.elapsed().as_secs_f64();
+            secondary_report = Some(SecondaryReport {
+                path: absolute(dir).display().to_string(),
+                open_seconds: open,
+                poll_ms: args.secondary_poll_ms,
+                ..SecondaryReport::default()
+            });
+            secondary_state = Some(if args.secondary_poll_ms > 0 {
+                Err(SecondaryPoller::spawn(
+                    secondary,
+                    Duration::from_millis(args.secondary_poll_ms),
+                    Arc::clone(&primary_tip),
+                ))
+            } else {
+                Ok(secondary)
+            });
         } else {
-            Ok(secondary)
-        });
+            secondary_report = Some(SecondaryReport {
+                path: absolute(dir).display().to_string(),
+                poll_ms: args.secondary_poll_ms,
+                separate_process: true,
+                ..SecondaryReport::default()
+            });
+            secondary_child = Some(SecondaryChild::spawn(
+                &args.common.fixture,
+                &args.common.network,
+                &args.work,
+                dir,
+                args.secondary_poll_ms,
+                args.common.reorg_window_blocks,
+            )?);
+        }
     }
 
     let db = Arc::clone(&store.spike_bounded_open().db);
@@ -845,6 +875,25 @@ pub(crate) async fn run_replay(args: ReplayArgs) -> Result<ReplayReport, BenchEr
     let stall_summary = stalls.summary();
     let final_fence = store.event_fence();
 
+    if let (Some(report), Some(child)) = (secondary_report.as_mut(), secondary_child) {
+        let follower_report = child.report_path().display().to_string();
+        let follow = child.finish()?;
+        report.open_seconds = follow.open_seconds;
+        report.periodic_catch_ups = LatencySummary {
+            count: follow.periodic_catch_up_count,
+            p50_ms: follow.periodic_catch_up_p50_ms,
+            p99_ms: follow.periodic_catch_up_p99_ms,
+            max_ms: follow.periodic_catch_up_max_ms,
+            ..LatencySummary::default()
+        };
+        report.final_catch_up_seconds = follow.final_catch_up_seconds;
+        report.final_fence_matches_primary = follow.final_tip_height
+            == final_fence.visible_tip().height.value()
+            && follow.final_event_sequence == final_fence.chain_event_sequence();
+        report.wallet_control_matches_fence = follow.wallet_control_matches_fence;
+        report.follower_peak_vmhwm_bytes = follow.peak_vmhwm_bytes;
+        report.follower_report = Some(follower_report);
+    }
     if let (Some(report), Some(state)) = (secondary_report.as_mut(), secondary_state) {
         let mut secondary = match state {
             Ok(secondary) => secondary,

@@ -31,6 +31,10 @@ pub(crate) struct VerifyArgs {
     /// Optional canonical-only store at the same tip, to compare canonical fences.
     #[arg(long)]
     baseline: Option<PathBuf>,
+    /// Copy the reference wallet here (SSTs hard-linked) and open the copy,
+    /// so a read-only reference is never opened or written.
+    #[arg(long)]
+    reference_copy: Option<PathBuf>,
 }
 
 /// Verify report.
@@ -65,8 +69,15 @@ pub(crate) fn run_verify(args: VerifyArgs) -> Result<VerifyReport, BenchError> {
     let network = args.common.network()?;
     let (_manifest, activations) = args.common.manifest_and_activations()?;
 
+    let reference_path = match args.reference_copy.as_ref() {
+        Some(copy) => {
+            super::layout::copy_closed_store(&args.reference_wallet, copy)?;
+            copy.clone()
+        }
+        None => args.reference_wallet.clone(),
+    };
     let reference = RocksDbWalletStore::open_ready_for_following(
-        &args.reference_wallet,
+        &reference_path,
         network,
         RocksDbResourceBudget::wallet_projection_reader_defaults(),
     )?;

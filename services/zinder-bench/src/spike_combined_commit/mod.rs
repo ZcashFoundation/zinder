@@ -24,6 +24,7 @@ pub(crate) mod pipeline;
 pub(crate) mod prepare;
 pub(crate) mod reorg;
 pub(crate) mod replay;
+pub(crate) mod secondary_follow;
 pub(crate) mod verify;
 
 use std::{fs::OpenOptions, io::Write, path::PathBuf};
@@ -55,6 +56,9 @@ enum SpikeAction {
     Verify(verify::VerifyArgs),
     /// Compare a combined replay report with its canonical-only baseline report.
     Compare(compare::CompareArgs),
+    /// Internal: a canonical secondary in its own process (spawned by the arms).
+    #[command(name = "secondary-follow")]
+    SecondaryFollow(secondary_follow::SecondaryFollowArgs),
 }
 
 /// Whether wallet rows join the canonical batch.
@@ -136,6 +140,7 @@ pub(crate) async fn run_spike_combined_commit(
             let report = reorg::run_reorg(args).await?;
             write_report(&report, report_path.as_deref())
         }
+        SpikeAction::SecondaryFollow(args) => secondary_follow::run_secondary_follow(&args),
         SpikeAction::Compare(args) => {
             let report_path = args.report.clone();
             let report = compare::run_compare(&args)?;
