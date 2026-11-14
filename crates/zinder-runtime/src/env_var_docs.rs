@@ -1077,7 +1077,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Required,
         sensitive: false,
         description: "Stable 16-byte wallet-build lease owner encoded as exactly 32 hexadecimal \
-                      characters. Use a distinct value for each concurrently provisioned lane.",
+                      characters. A restart with the same value reclaims its own construction \
+                      leases immediately. Use a distinct value for each concurrently provisioned \
+                      lane.",
     },
     EnvVarDoc {
         name: "ZINDER_PROJECTOR__LEASE_DURATION_SECONDS",

@@ -338,12 +338,23 @@ async fn run_owned_projector(
                 }
             }
             Err(zinder_wallet_rocksdb::RocksDbWalletError::StoreNotReady { .. }) => {
+                // A crashed build still holds its lease under this owner,
+                // which may discard it at once; another owner must wait for
+                // the lease to expire.
                 RocksDbWalletBuildStore::open(
                     &config.wallet_path,
                     config.network,
                     config.wallet_rocksdb_budget,
                 )?
-                .discard_unpublished(UnixTimestampMillis::now())?;
+                .discard_unpublished(
+                    WalletProjectionBuildOwner::from_bytes(config.build_owner),
+                    UnixTimestampMillis::now(),
+                )?;
+                tracing::info!(
+                    target: "zinder::projector",
+                    event = "wallet_projection_unpublished_build_discarded",
+                    "discarded an unpublished wallet build; constructing again from the current canonical fence"
+                );
             }
             Err(error) => return Err(error.into()),
         }

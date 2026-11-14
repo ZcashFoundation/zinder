@@ -217,12 +217,15 @@ impl ProjectionBuildAnchor {
     }
 }
 
-/// Opaque durable identity for one projection construction generation.
+/// Opaque durable identity of one projection-build lease owner.
+///
+/// Re-acquiring a live identity reclaims it at a higher generation, so two
+/// concurrently running builders must never share one identity.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ProjectionBuildLeaseId([u8; 16]);
 
 impl ProjectionBuildLeaseId {
-    /// Creates an opaque projection-build generation identity.
+    /// Creates an opaque projection-build lease identity.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
@@ -335,8 +338,11 @@ impl RocksDbCanonicalStore {
     /// Acquires a durable lease for one inactive projection generation.
     ///
     /// The exact anchored event must still be retained and must produce the
-    /// supplied epoch. A live lease with the same generation identity cannot
-    /// be acquired by a competing builder; renewal is a distinct operation.
+    /// supplied epoch. The lease identity names its owner, so acquiring an
+    /// identity that is still live reclaims it: a builder restarted after a
+    /// crash replaces its own lease without waiting for expiry. Every
+    /// acquisition assigns a strictly higher generation, so renewals and
+    /// releases presenting a replaced generation fail.
     pub fn acquire_projection_build_lease(
         &self,
         lease: ProjectionBuildLease,
@@ -345,14 +351,11 @@ impl RocksDbCanonicalStore {
         let _lifecycle_guard = self.lifecycle_lock.lock();
         validate_live_lease_expiry(lease, now)?;
         let (live_leases, expired_lease_ids) = self.live_projection_build_lease_state(now)?;
-        if read_projection_build_lease(self, lease.id)?
-            .is_some_and(|existing| existing.expires_at > now)
-        {
-            return Err(CanonicalStoreError::ProjectionBuildLeaseInvalid {
-                reason: "lease identity is already held by a live builder",
-            });
-        }
-        if live_leases.len() >= MAX_LIVE_PROJECTION_BUILD_LEASES {
+        let other_live_lease_count = live_leases
+            .iter()
+            .filter(|live_lease| live_lease.id != lease.id)
+            .count();
+        if other_live_lease_count >= MAX_LIVE_PROJECTION_BUILD_LEASES {
             return Err(CanonicalStoreError::ProjectionBuildLeaseInvalid {
                 reason: "live projection build lease capacity is exhausted",
             });
@@ -959,6 +962,12 @@ pub(super) fn seed_projection_build_leases_for_capacity_test(
         batch.put(
             projection_build_lease_key(lease.id),
             encode_projection_build_lease(*lease),
+        );
+    }
+    if let Some(generation) = leases.iter().map(|lease| lease.generation).max() {
+        batch.put(
+            PROJECTION_BUILD_LEASE_GENERATION_KEY,
+            generation.to_be_bytes(),
         );
     }
     write_lifecycle_batch(store, &batch, "projection build lease capacity test seed")

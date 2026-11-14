@@ -149,9 +149,11 @@ pub enum RocksDbWalletError {
         observed: Box<WalletCanonicalSourceIdentity>,
     },
     /// A different owner holds an unexpired durable projection-build lease.
-    #[error("wallet projection build lease is held until {expires_at:?}")]
+    #[error("wallet projection build lease is held by owner {holder} until {expires_at:?}")]
     WalletProjectionBuildLeaseHeld {
-        /// The first instant at which takeover may be attempted.
+        /// Owner identity persisted by the live lease.
+        holder: WalletProjectionBuildOwner,
+        /// The first instant at which a different owner may take over.
         expires_at: UnixTimestampMillis,
     },
     /// The supplied lease is no longer live at the caller's explicit clock.

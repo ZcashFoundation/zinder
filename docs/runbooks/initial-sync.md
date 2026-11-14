@@ -140,8 +140,50 @@ requested at startup, ingest rejects it; rebuild the canonical and wallet stores
 instead of attempting to follow the narrower store forward.
 
 Restarting projector is safe. Lease generation, build state, source identity,
-and ready evidence are persisted. A second projector using the same wallet path
-must fail lease or writer admission rather than run concurrently.
+and ready evidence are persisted.
+
+Both construction leases belong to the configured `projector.build_owner_hex`.
+After a crash during construction, a restart with the same owner value resumes
+at once:
+
+1. It discards the unpublished wallet store, including its live build lease,
+   and logs `wallet_projection_unpublished_build_discarded`.
+2. It reclaims its canonical retention lease at a higher generation.
+3. It builds again from the current canonical fence under a new wallet build
+   lease.
+
+The restart does not wait for `projector.lease_duration_seconds` to elapse.
+
+A second projector cannot build the same wallet path concurrently:
+
+- While one projector holds the wallet primary open, another fails to open it.
+- A projector with a different owner value is refused until the live lease
+  expires.
+
+Give each concurrently running projector its own owner value. Projectors that
+share one value interrupt each other's builds instead of being refused.
+
+### Construction refused by another owner
+
+The projector can exit with this error:
+
+```text
+wallet projection build lease is held by owner <owner> until <expiry>
+```
+
+The unpublished wallet store then belongs to an owner value other than the
+configured one. This usually means `projector.build_owner_hex` changed between
+runs. Recover in one of these ways:
+
+- Set `projector.build_owner_hex` back to the reported owner and restart the
+  projector. It reclaims the build immediately.
+- Keep the new value and restart the projector after the reported expiry. It
+  then discards the store and builds again.
+
+Do not delete the unpublished wallet store by hand to skip the wait. The
+reported owner may be a projector that is still running. The canonical
+retention lease of an earlier owner expires on its own and does not block a
+new owner.
 
 ## Wallet-serving admission
 

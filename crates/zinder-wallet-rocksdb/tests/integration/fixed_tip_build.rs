@@ -20,12 +20,13 @@ use zinder_core::{
 };
 use zinder_store::{
     CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalBaselinePublication,
-    CanonicalBuildBlock, CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalLiveAppend,
-    CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,
-    CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload, RawBlobRetention,
-    RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
-    RocksDbResourceBudget,
+    CanonicalBuildBlock, CanonicalEventCursor, CanonicalEventFence, CanonicalEventHistoryRequest,
+    CanonicalLiveAppend, CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,
+    CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload, ProjectionBuildAnchor,
+    ProjectionBuildLease, ProjectionBuildLeaseId, RawBlobRetention, RocksDbCanonicalBuilder,
+    RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
 };
+use zinder_testkit::process_crash;
 use zinder_wallet_projection::{
     WALLET_PROJECTION_STORE_IDENTITY, WalletAddressTransactionKey, WalletAddressUnspentOutputKey,
     WalletCanonicalSourceIdentity, WalletOutpointKey, WalletProjectionBuildLeaseRequest,
@@ -650,11 +651,168 @@ fn cancelled_build_releases_its_exact_lease_for_immediate_discard_and_retry()
         Network::ZcashRegtest,
         RocksDbResourceBudget::for_local_tests(),
     )?
-    .discard_unpublished(UnixTimestampMillis::new(1))?;
+    .discard_unpublished(
+        WalletProjectionBuildOwner::from_bytes([0x22; 16]),
+        UnixTimestampMillis::new(1),
+    )?;
     assert!(!wallet_path.exists());
     let retry = build_wallet_from_canonical(&canonical_store, &wallet_path, options)?;
     assert_store(&retry, &fixture)?;
     Ok(())
+}
+
+#[cfg(unix)]
+const KILLED_BUILD_CHILD: &str = "integration::fixed_tip_build::killed_wallet_build_child";
+const KILLED_BUILD_OWNER: [u8; 16] = [0x5a; 16];
+const KILLED_BUILD_LEASE_DURATION_MILLIS: u64 = 4 * 60 * 60 * 1_000;
+
+/// Runs one projector-shaped construction and aborts at the armed build phase.
+///
+/// Like `zinder-projector`, it leases the canonical anchor under the build
+/// owner's identity before it builds the wallet under the same owner.
+#[test]
+fn killed_wallet_build_child() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(child) = process_crash::crash_child() else {
+        return Ok(());
+    };
+    let canonical_store = reopen_canonical_primary(child.store_path())?;
+    let now = UnixTimestampMillis::now();
+    let _canonical_lease =
+        acquire_owner_canonical_lease(&canonical_store, killed_build_lease_expiry(now), now)?;
+    let mut heartbeat = |phase: WalletBuildLeasePhase, _| {
+        process_crash::crash_point(&killed_build_crash_point(phase));
+        Ok(WalletBuildLeaseHeartbeat::at(UnixTimestampMillis::now()))
+    };
+    build_wallet_from_canonical_with_lease_and_heartbeat(
+        &canonical_store,
+        child.store_path().join("wallet"),
+        RocksDbWalletBuildOptions::for_local_tests(),
+        owned_build_lease_execution(
+            &canonical_store,
+            WalletProjectionBuildOwner::from_bytes(KILLED_BUILD_OWNER),
+            killed_build_lease_expiry(now),
+            now,
+        ),
+        &mut heartbeat,
+    )?;
+    Err("wallet build returned without reaching its crash point".into())
+}
+
+#[cfg(unix)]
+#[test]
+fn killed_wallet_build_restarts_under_the_same_owner_without_waiting_for_lease_expiry()
+-> Result<(), Box<dyn std::error::Error>> {
+    let owner = WalletProjectionBuildOwner::from_bytes(KILLED_BUILD_OWNER);
+    let other_owner = WalletProjectionBuildOwner::from_bytes([0xa5; 16]);
+    for phase in [
+        WalletBuildLeasePhase::CanonicalReplayComplete,
+        WalletBuildLeasePhase::ProjectionRowsLoaded,
+    ] {
+        let temporary = TempDir::new()?;
+        let fixture = wallet_baseline_fixture();
+        drop(build_ready_canonical_store(&temporary, &fixture)?);
+        process_crash::run_crash_child(
+            KILLED_BUILD_CHILD,
+            temporary.path(),
+            &killed_build_crash_point(phase),
+        )?;
+
+        let canonical_store = reopen_canonical_primary(temporary.path())?;
+        let now = UnixTimestampMillis::now();
+        let crashed_canonical_lease = canonical_store
+            .active_projection_build_lease(
+                ProjectionBuildLeaseId::from_bytes(KILLED_BUILD_OWNER),
+                now,
+            )?
+            .ok_or("killed build left no live canonical retention lease")?;
+        let wallet_path = temporary.path().join("wallet");
+        let open_build = || {
+            RocksDbWalletBuildStore::open(
+                &wallet_path,
+                Network::ZcashRegtest,
+                RocksDbResourceBudget::for_local_tests(),
+            )
+        };
+        assert!(matches!(
+            open_build()?.discard_unpublished(other_owner, now),
+            Err(RocksDbWalletError::WalletProjectionBuildLeaseHeld { holder, expires_at })
+                if holder == owner && expires_at > now
+        ));
+
+        let reclaimed_canonical_lease =
+            acquire_owner_canonical_lease(&canonical_store, killed_build_lease_expiry(now), now)?;
+        assert!(reclaimed_canonical_lease.generation() > crashed_canonical_lease.generation());
+        open_build()?.discard_unpublished(owner, now)?;
+        assert!(!wallet_path.exists());
+        assert!(
+            !temporary
+                .path()
+                .join("wallet.projection-load-staging")
+                .exists()
+        );
+        let mut heartbeat = |_, _| Ok(WalletBuildLeaseHeartbeat::at(UnixTimestampMillis::now()));
+        let rebuilt = build_wallet_from_canonical_with_lease_and_heartbeat(
+            &canonical_store,
+            &wallet_path,
+            RocksDbWalletBuildOptions::for_local_tests(),
+            owned_build_lease_execution(
+                &canonical_store,
+                owner,
+                killed_build_lease_expiry(now),
+                now,
+            ),
+            &mut heartbeat,
+        )?;
+        assert_store(&rebuilt, &fixture)?;
+        canonical_store.release_projection_build_lease(reclaimed_canonical_lease)?;
+    }
+    Ok(())
+}
+
+fn killed_build_crash_point(phase: WalletBuildLeasePhase) -> String {
+    format!("wallet_projection.build.{phase:?}")
+}
+
+fn killed_build_lease_expiry(now: UnixTimestampMillis) -> UnixTimestampMillis {
+    UnixTimestampMillis::new(
+        now.value()
+            .saturating_add(KILLED_BUILD_LEASE_DURATION_MILLIS),
+    )
+}
+
+fn reopen_canonical_primary(
+    root: &std::path::Path,
+) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+    Ok(RocksDbCanonicalStore::open_ready(
+        root.join("canonical"),
+        &inactive_upgrade_activations()?,
+        CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(100)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?)
+}
+
+/// Leases the visible canonical event under the build owner's identity, as
+/// the projector's construction retention lease does.
+fn acquire_owner_canonical_lease(
+    canonical_store: &RocksDbCanonicalStore,
+    expires_at: UnixTimestampMillis,
+    now: UnixTimestampMillis,
+) -> Result<ProjectionBuildLease, Box<dyn std::error::Error>> {
+    let ready = canonical_store.ready_evidence();
+    let anchor = ProjectionBuildAnchor::new(
+        ready.visible_epoch,
+        CanonicalEventCursor::at(ready.visible_event_sequence)?,
+    );
+    Ok(canonical_store.acquire_projection_build_lease(
+        ProjectionBuildLease::new(
+            ProjectionBuildLeaseId::from_bytes(KILLED_BUILD_OWNER),
+            anchor,
+            expires_at,
+        ),
+        now,
+    )?)
 }
 
 #[test]
@@ -691,7 +849,10 @@ fn pre_promotion_error_releases_its_exact_lease_for_immediate_discard_and_retry(
         Network::ZcashRegtest,
         RocksDbResourceBudget::for_local_tests(),
     )?
-    .discard_unpublished(UnixTimestampMillis::new(1))?;
+    .discard_unpublished(
+        WalletProjectionBuildOwner::from_bytes([0x22; 16]),
+        UnixTimestampMillis::new(1),
+    )?;
     assert!(!wallet_path.exists());
     let retry = build_wallet_from_canonical(&canonical_store, &wallet_path, options)?;
     assert_store(&retry, &fixture)?;
@@ -1355,6 +1516,20 @@ fn transition_logical_byte_limit() -> NonZeroU64 {
 fn build_lease_execution(
     canonical_store: &RocksDbCanonicalStore,
 ) -> WalletProjectionBuildLeaseExecution {
+    owned_build_lease_execution(
+        canonical_store,
+        WalletProjectionBuildOwner::from_bytes([0x91; 16]),
+        UnixTimestampMillis::new(u64::MAX),
+        UnixTimestampMillis::new(0),
+    )
+}
+
+fn owned_build_lease_execution(
+    canonical_store: &RocksDbCanonicalStore,
+    owner: WalletProjectionBuildOwner,
+    expires_at: UnixTimestampMillis,
+    now: UnixTimestampMillis,
+) -> WalletProjectionBuildLeaseExecution {
     let ready = canonical_store.ready_evidence();
     let source = WalletCanonicalSourceIdentity::new(
         WalletProjectionSourcePosition::new(
@@ -1370,12 +1545,12 @@ fn build_lease_execution(
         ready.sequence_checkpoint.through(),
     );
     let lease_request = WalletProjectionBuildLeaseRequest::new(
-        WalletProjectionBuildOwner::from_bytes([0x91; 16]),
+        owner,
         source,
         WalletProjectionRetainedEventAnchor::new(ready.visible_event_sequence),
-        UnixTimestampMillis::new(u64::MAX),
+        expires_at,
     );
-    WalletProjectionBuildLeaseExecution::new(lease_request, UnixTimestampMillis::new(0))
+    WalletProjectionBuildLeaseExecution::new(lease_request, now)
 }
 
 fn assert_report(outcome: &RocksDbWalletBuildOutcome) {

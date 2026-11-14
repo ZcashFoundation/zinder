@@ -30,10 +30,10 @@ use zinder_wallet_projection::{
     WALLET_PROJECTION_SCHEMA_VERSION, WALLET_PROJECTION_STORE_IDENTITY, WALLET_STORE_CONTROL_KEY,
     WalletAddressBalance, WalletAddressTransaction, WalletAddressTransactionKey,
     WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity, WalletOutpointKey,
-    WalletProjectionBuildLease, WalletProjectionBuildLeaseRequest, WalletProjectionBuildPlan,
-    WalletProjectionBuildState, WalletProjectionDigestBuilder, WalletProjectionReadyEvidence,
-    WalletProjectionRowFamily, WalletReorgUndo, WalletSpentOutput, WalletStoreControlRecord,
-    WalletUnspentOutput, WalletUtxoSetSummary,
+    WalletProjectionBuildLease, WalletProjectionBuildLeaseRequest, WalletProjectionBuildOwner,
+    WalletProjectionBuildPlan, WalletProjectionBuildState, WalletProjectionDigestBuilder,
+    WalletProjectionReadyEvidence, WalletProjectionRowFamily, WalletReorgUndo, WalletSpentOutput,
+    WalletStoreControlRecord, WalletUnspentOutput, WalletUtxoSetSummary,
 };
 
 use crate::{
@@ -290,10 +290,14 @@ impl RocksDbWalletBuildStore {
         })
     }
 
-    /// Acquires exclusive durable ownership when no active lease is present.
+    /// Acquires exclusive durable ownership of the BUILDING store.
     ///
-    /// An expired lease may be replaced by a new owner at a strictly higher
-    /// generation. An unexpired lease is never silently shared or stolen.
+    /// A live lease held by a different owner is never shared or stolen: it
+    /// refuses the request until it expires. The owner of a live lease may
+    /// reclaim it immediately, which is how a restarted builder recovers
+    /// after a crash. Every acquisition, including a reclaim, persists a
+    /// strictly higher generation, so a capability held by an earlier
+    /// incarnation can no longer renew, release, or publish.
     pub fn try_acquire_lease(
         &self,
         request: WalletProjectionBuildLeaseRequest,
@@ -301,13 +305,7 @@ impl RocksDbWalletBuildStore {
     ) -> Result<WalletProjectionBuildLease, RocksDbWalletError> {
         let (bounded_open, control) = self.open_building_control()?;
         validate_lease_request(&control, request, now)?;
-        if let Some(lease) = control.build_lease
-            && lease.expires_at() > now
-        {
-            return Err(RocksDbWalletError::WalletProjectionBuildLeaseHeld {
-                expires_at: lease.expires_at(),
-            });
-        }
+        require_no_live_lease_of_another_owner(&control, request.owner(), now)?;
         let generation = control
             .writer_generation
             .checked_add(1)
@@ -385,16 +383,19 @@ impl RocksDbWalletBuildStore {
     /// READY stores are refused. This operation deliberately provides the only
     /// recovery path for an abandoned pre-release build, rather than allowing
     /// callers to raw-delete ambiguous wallet paths.
-    pub fn discard_unpublished(self, now: UnixTimestampMillis) -> Result<(), RocksDbWalletError> {
+    ///
+    /// `owner` is the caller's build-owner identity. A live lease held by a
+    /// different owner refuses the discard until it expires; the lease's own
+    /// owner, typically a builder restarted after a crash, may discard
+    /// immediately.
+    pub fn discard_unpublished(
+        self,
+        owner: WalletProjectionBuildOwner,
+        now: UnixTimestampMillis,
+    ) -> Result<(), RocksDbWalletError> {
         let (bounded_open, control) = self.open_building_control()?;
         require_building_control(&control, &self.store_path, self.network)?;
-        if let Some(lease) = control.build_lease
-            && lease.expires_at() > now
-        {
-            return Err(RocksDbWalletError::WalletProjectionBuildLeaseHeld {
-                expires_at: lease.expires_at(),
-            });
-        }
+        require_no_live_lease_of_another_owner(&control, owner, now)?;
         drop(bounded_open);
 
         let staging_path = crate::build::projection_staging_path(&self.store_path);
@@ -1548,6 +1549,23 @@ fn require_building_control(
     if !matches!(control.build_state, WalletProjectionBuildState::Building(_)) {
         return Err(RocksDbWalletError::StoreNotReady {
             path: store_path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+fn require_no_live_lease_of_another_owner(
+    control: &WalletStoreControlRecord,
+    owner: WalletProjectionBuildOwner,
+    now: UnixTimestampMillis,
+) -> Result<(), RocksDbWalletError> {
+    if let Some(lease) = control.build_lease
+        && lease.expires_at() > now
+        && lease.owner() != owner
+    {
+        return Err(RocksDbWalletError::WalletProjectionBuildLeaseHeld {
+            holder: lease.owner(),
+            expires_at: lease.expires_at(),
         });
     }
     Ok(())
