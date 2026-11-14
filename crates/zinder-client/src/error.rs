@@ -86,7 +86,7 @@ pub enum IndexerError {
     #[error("no visible chain epoch has been committed")]
     NoVisibleChainEpoch,
 
-    /// Requested chain epoch is no longer retained by this serving pair.
+    /// The server no longer serves the requested chain epoch.
     #[error("requested chain epoch pin is unavailable")]
     ChainEpochPinUnavailable,
 

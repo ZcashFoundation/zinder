@@ -649,7 +649,7 @@ where
         )?;
         let response = self
             .query_api
-            .transparent_address_tx_ids_in_range(typed_request)
+            .transparent_address_tx_ids_in_range(typed_request, None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
         let header = Ok(build_transparent_address_tx_ids_header(

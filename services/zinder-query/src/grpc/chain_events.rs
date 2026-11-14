@@ -189,7 +189,7 @@ async fn address_touched_in_range<Q: WalletQueryApi + ?Sized>(
         from_cursor: None,
     };
     let page = query_api
-        .transparent_address_tx_ids_in_range(request)
+        .transparent_address_tx_ids_in_range(request, None)
         .await?;
     Ok(!page.artifacts.is_empty())
 }

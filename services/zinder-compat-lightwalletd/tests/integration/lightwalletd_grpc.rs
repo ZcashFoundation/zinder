@@ -869,9 +869,11 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
     async fn transparent_address_tx_ids_in_range(
         &self,
         request: TransparentAddressTxIdsInRangeRequest,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressTxIds, QueryError> {
+        self.record(at_epoch_id);
         self.inner
-            .transparent_address_tx_ids_in_range(request)
+            .transparent_address_tx_ids_in_range(request, at_epoch_id)
             .await
     }
 

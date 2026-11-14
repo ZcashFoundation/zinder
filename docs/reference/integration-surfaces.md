@@ -101,12 +101,16 @@ the server reports them. Its retry policy is `OperatorActionRequired`: the
 indexer serves a chain that no longer advances, so a wallet should stop
 creating spends against it until an operator reconciles the indexer.
 
-Capture calls `current_epoch` once. A remote serving pair that has advanced
-returns `IndexerError::ChainEpochPinUnavailable`; its
-retry policy is `RefreshChainEpoch`. The released wallet-serving runtime keeps
-only its current exact read pair, so consumers must refresh rather than assume
-historical epoch retention. Implementations may retain older epochs, but may
-serve a pin only when they can answer that exact canonical epoch.
+Capture calls `current_epoch` once. A remote that no longer serves the
+captured epoch returns `IndexerError::ChainEpochPinUnavailable`; its retry
+policy is `RefreshChainEpoch`. The released wallet-serving runtime keeps
+serving its two most recently replaced epochs, each for at most one minute
+after it was replaced, so a snapshot workflow whose reads send the pinned
+epoch id normally finishes across a new block. A transparent-history first
+page sends no epoch id and is answered from the current epoch, so it fails
+after a new block even while the old epoch is retained. Consumers must still refresh and restart the workflow on this error
+rather than assume longer retention. Implementations may retain older epochs,
+but may serve a pin only when they can answer that exact canonical epoch.
 
 Native clients get typed errors, capability discovery, epoch-pinned reads,
 chain-event cursors, transaction broadcast outcomes, mempool reads, and

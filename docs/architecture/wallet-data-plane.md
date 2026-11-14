@@ -74,7 +74,7 @@ If a requested compact block is outside the store's retained history, `zinder-qu
 
 The native wallet protocol slices expose latest block metadata, compact block ranges, checkpoint tree-state reads, latest checkpoint tree-state reads, subtree roots, lightd-compatible network metadata, and the chain-event subscription described below as generated `zinder_proto::v1::wallet` responses. Each unary response carries the cross-plane `ChainView` at field tag 1; wallet responses fill `chain_view.chain_epoch` with the epoch used to answer the read and leave the materialized-view axes unset (see [ADR-0011](../adrs/0011-explorer-freshness-envelope.md)). Native gRPC streams compact block ranges as `CompactBlocksInRangeChunk` messages so range size is bounded by request limits and not by a single gRPC response message. `WalletQueryGrpcAdapter` serves the generated native `WalletQuery` tonic service over `WalletQueryApi` through `grpc/native.rs` response builders and preserves the same epoch binding, unavailable-artifact, and range limit behavior.
 
-A request pins a chain snapshot with `optional uint64 at_epoch_id`: absent resolves to the visible epoch at request time; present resolves the canonical epoch by id. The store keys the epoch by id, so a pinned read either resolves it or returns `CHAIN_EPOCH_PIN_UNAVAILABLE` when the id is no longer retained. `ChainEpoch` is a response-only descriptor nested in `ChainView`; the request never echoes the epoch body.
+A request pins a chain snapshot with `optional uint64 at_epoch_id`: absent resolves to the visible epoch at request time; present resolves the canonical epoch by id. A pinned read either resolves that epoch or returns `CHAIN_EPOCH_PIN_UNAVAILABLE` when no retained serving pair answers it; [Query Consistency](#query-consistency) defines how long a replaced epoch stays retained. `ChainEpoch` is a response-only descriptor nested in `ChainView`; the request never echoes the epoch body.
 
 ### Compact block range stream
 
@@ -531,6 +531,11 @@ empty bytes (stream fully drained). Clients that lose the connection mid-stream
 must restart the page rather than resume from a non-terminal item; bounded
 history pages keep that restart cost small.
 
+A cursor names the serving pair that issued it. The next page resumes on that
+pair, at the same epoch, while the pair is current or retained. Once it is
+released, the page fails with `CHAIN_EPOCH_PIN_UNAVAILABLE` and the client
+restarts the history read from its first page.
+
 Operators must publish only a `zinder-compat-lightwalletd` process whose
 constructor admitted `taddr_support=true` from transaction retention and the
 exact transparent serving pair. It is not an operator opt-in. The
@@ -564,8 +569,9 @@ epoch, including for empty pages.
 
 The release query advertises `wallet.address.transparent_history_v1` for its
 ascending, page-bounded wallet-projection read. Its opaque cursor carries the
-exact `WalletCanonicalSourceIdentity` that issued the page, so pair replacement
-fails with `FAILED_PRECONDITION`. History is ascending only: the request has no
+exact `WalletCanonicalSourceIdentity` that issued the page. The next page
+resumes on that pair while it is current or retained, and fails with
+`CHAIN_EPOCH_PIN_UNAVAILABLE` once it is released. History is ascending only: the request has no
 direction field, and field 6, which once carried a newest-first flag, is
 reserved. Newest-first address history is `ExplorerQuery.TransparentAddressActivity`.
 Only the terminal chunk carries a non-empty resume cursor.
@@ -574,10 +580,13 @@ The compatibility adapter implements `GetTaddressTxids` and
 `GetTaddressTransactions` through `WalletServingQuery`. That path reads
 the transparent history already present in the admitted wallet projection,
 alongside the canonical half of the same `WalletServingReadPair`; it does not
-depend on the optional materialized-view store. Its ascending page cursor binds
-the wallet row key to the exact `WalletCanonicalSourceIdentity` that issued the
-page. If the publisher installs another serving pair between pages, resumption
-fails with `FAILED_PRECONDITION` instead of combining rows from two sources.
+depend on the optional materialized-view store. The adapter pins every history
+page and every transaction read of one request to the epoch of the visible tip
+it read first, so a new block mid-request either leaves the request on the
+retained pair or fails it with `CHAIN_EPOCH_PIN_UNAVAILABLE`; it never combines
+history from one epoch with transactions from another. Its ascending page
+cursor binds the wallet row key to the exact `WalletCanonicalSourceIdentity`
+that issued the page, so resumption never combines rows from two sources.
 An absent, zero, or above-tip `range.end` reads to the visible tip; see
 [Transparent address history](../reference/lightwalletd-compatibility.md#transparent-address-history).
 
@@ -825,10 +834,41 @@ For example, a compact block range response should bind:
 
 If the chain tip changes while the request is executing, the response should still finish from the epoch it started with or restart from a new epoch. It should not mix both.
 
-The production `WalletServingQuery` publishes one current exact read pair and
-does not promise historical pair retention. After publication advances, an old
-snapshot receives `CHAIN_EPOCH_PIN_UNAVAILABLE` and captures a new snapshot;
-it must not silently read replacement-branch artifacts.
+The production `WalletServingQuery` answers unpinned reads from its current
+exact read pair. The two most recently replaced pairs keep answering reads
+pinned to their epochs, each for at most one minute after it was replaced. The
+publisher publishes a new pair when the writer's fence advances, normally once
+per new block, so a workflow pinned to the current epoch survives the next two
+publications for up to one minute after its epoch is replaced. A wallet that
+pins one epoch and then reads the unspent outputs of each of its transparent
+receivers in turn therefore completes across a new block instead of
+restarting.
+
+Retention covers reads that carry `at_epoch_id` on the wire. The first page of
+`TransparentAddressTxIdsInRange` carries no wire pin, so the current pair
+answers it and a client expecting a replaced epoch rejects its header with
+`ChainEpochPinUnavailable`. A walk that starts a new receiver's history under
+an old snapshot therefore still restarts after a new block; only that
+receiver's continuation pages resume on the retained pair.
+
+Retention is bounded in both count and time, and on its own it never delays
+tip following: a publication beyond the limit releases the oldest retained pair,
+and a retained pair that no request holds gives up its generation when a
+request still reading a released pair leaves no other slot free. A request
+still reading a released pair keeps its generation open until it finishes.
+A pin on a released or never-served epoch receives
+`CHAIN_EPOCH_PIN_UNAVAILABLE`, and the client captures a new snapshot and
+restarts the whole workflow; it must not silently read replacement-branch
+artifacts. A retained pair still answers its epoch after a reorg replaces that
+epoch's blocks, because a pinned read promises the pinned epoch's view, not the
+current best chain.
+
+Each retained pair keeps its canonical and wallet secondaries open, with their
+own block caches and memtables, so a wallet-serving reader holds up to four
+secondary pairs at once: the current pair, the candidate it is catching up,
+and two replaced pairs, either retained or still held by a request. The
+`zinder_wallet_serving_pair_publisher_retained_pairs` gauge reports the
+retained count.
 
 ## Performance and Pagination
 

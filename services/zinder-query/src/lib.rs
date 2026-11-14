@@ -206,9 +206,13 @@ pub trait WalletQueryApi: Send + Sync + 'static {
 
     /// Reads a bounded page of transparent-address tx-history index
     /// artifacts.
+    ///
+    /// A continuation resumes at the epoch named by its cursor. A non-`None`
+    /// `at_epoch_id` must name that same epoch.
     async fn transparent_address_tx_ids_in_range(
         &self,
         request: TransparentAddressTxIdsInRangeRequest,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressTxIds, QueryError>;
 
     /// Classifies each transparent outpoint as unspent, spent by a mined

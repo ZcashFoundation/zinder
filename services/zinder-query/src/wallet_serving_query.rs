@@ -85,17 +85,27 @@ impl TransparentHistoryCursor {
         StreamCursorTokenV1::from_bytes(encoded)
     }
 
-    fn resume(
-        cursor: &StreamCursorTokenV1,
+    fn parse(cursor: &StreamCursorTokenV1) -> Result<Self, QueryError> {
+        Self::decode(cursor.as_bytes())
+    }
+
+    /// Chain epoch of the pair that issued this cursor.
+    fn chain_epoch_id(self) -> ChainEpochId {
+        self.source.source_position().chain_epoch_id
+    }
+
+    /// Returns the key to resume after when `expected_source` issued this
+    /// cursor.
+    fn resume_on(
+        self,
         expected_source: WalletCanonicalSourceIdentity,
     ) -> Result<WalletAddressTransactionKey, QueryError> {
-        let decoded = Self::decode(cursor.as_bytes())?;
-        if decoded.source != expected_source {
+        if self.source != expected_source {
             return Err(QueryError::ChainEpochPinUnavailable {
-                chain_epoch_id: decoded.source.source_position().chain_epoch_id,
+                chain_epoch_id: self.chain_epoch_id(),
             });
         }
-        Ok(decoded.after)
+        Ok(self.after)
     }
 
     fn decode(encoded: &[u8]) -> Result<Self, QueryError> {
@@ -232,21 +242,19 @@ mod tests {
 
         // The pair remains current while the client reads its second page.
         assert_eq!(
-            TransparentHistoryCursor::resume(&first_page_cursor, first_page_source)?,
+            resume_cursor(&first_page_cursor, first_page_source)?,
             first_page_after
         );
         let second_page_cursor =
             TransparentHistoryCursor::issue(first_page_source, second_page_after);
         assert_eq!(
-            TransparentHistoryCursor::resume(&second_page_cursor, first_page_source)?,
+            resume_cursor(&second_page_cursor, first_page_source)?,
             second_page_after
         );
 
         // A pair replacement between pages must never resume its raw key on
         // the replacement fork.
-        let Err(error) =
-            TransparentHistoryCursor::resume(&first_page_cursor, replacement_pair_source)
-        else {
+        let Err(error) = resume_cursor(&first_page_cursor, replacement_pair_source) else {
             return Err("replacement pair unexpectedly accepted prior-page cursor".into());
         };
         assert!(matches!(
@@ -264,7 +272,7 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let source = source_identity(1, 0x11);
         let malformed = zinder_store::StreamCursorTokenV1::from_bytes(vec![0; 40]);
-        let Err(error) = TransparentHistoryCursor::resume(&malformed, source) else {
+        let Err(error) = resume_cursor(&malformed, source) else {
             return Err("malformed transparent-history cursor unexpectedly resumed".into());
         };
         assert!(matches!(
@@ -292,7 +300,7 @@ mod tests {
         let zero_event_sequence =
             zinder_store::StreamCursorTokenV1::from_bytes(zero_event_sequence);
 
-        let Err(error) = TransparentHistoryCursor::resume(&zero_event_sequence, source) else {
+        let Err(error) = resume_cursor(&zero_event_sequence, source) else {
             return Err("zero event sequence unexpectedly resumed".into());
         };
         assert!(matches!(
@@ -307,7 +315,7 @@ mod tests {
         digest_block_count.fill(0);
         let zero_digest_block_count =
             zinder_store::StreamCursorTokenV1::from_bytes(zero_digest_block_count);
-        let Err(error) = TransparentHistoryCursor::resume(&zero_digest_block_count, source) else {
+        let Err(error) = resume_cursor(&zero_digest_block_count, source) else {
             return Err("zero digest block count unexpectedly resumed".into());
         };
         assert!(matches!(
@@ -359,6 +367,13 @@ mod tests {
         Ok(())
     }
 
+    fn resume_cursor(
+        cursor: &zinder_store::StreamCursorTokenV1,
+        expected_source: WalletCanonicalSourceIdentity,
+    ) -> Result<WalletAddressTransactionKey, QueryError> {
+        TransparentHistoryCursor::parse(cursor)?.resume_on(expected_source)
+    }
+
     fn source_identity(chain_epoch: u64, hash_byte: u8) -> WalletCanonicalSourceIdentity {
         let tip = BlockId::new(BlockHeight::new(13), BlockHash::from_bytes([hash_byte; 32]));
         WalletCanonicalSourceIdentity::new(
@@ -375,10 +390,9 @@ mod tests {
 
 /// Exact-fence wallet query over canonical and wallet-projection stores.
 ///
-/// An epoch pin succeeds only when it names the captured pair's current
-/// epoch. The `WalletQueryApi` contract permits retained historical epochs,
-/// but it does not guarantee them; this secondary composition reports
-/// [`QueryError::ChainEpochPinUnavailable`] for every other epoch.
+/// An epoch pin succeeds when it names the current pair's epoch or the epoch
+/// of a pair the [`WalletServingPairSlot`] still retains. This composition
+/// reports [`QueryError::ChainEpochPinUnavailable`] for every other epoch.
 ///
 /// Every method captures its pair on the async side and then runs the whole
 /// store read on the blocking pool. The secondaries use direct I/O, so a cache
@@ -479,6 +493,10 @@ impl<Broadcaster> WalletServingQuery<Broadcaster, AdmittedIngestControl> {
 impl<Broadcaster, NativeIngest> WalletServingQuery<Broadcaster, NativeIngest> {
     fn capture_pair(&self) -> Arc<WalletServingReadPair> {
         self.serving_pair_slot.capture()
+    }
+
+    fn capture_pair_at(&self, at_epoch_id: Option<ChainEpochId>) -> Arc<WalletServingReadPair> {
+        self.serving_pair_slot.capture_at(at_epoch_id)
     }
 
     /// Returns the canonical raw-blob retention authenticated by this query's
@@ -679,7 +697,7 @@ where
         &self,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<VisibleTipBlock, QueryError> {
-        let pair = self.capture_pair();
+        let pair = self.capture_pair_at(at_epoch_id);
         serving_read::run("visible_tip_block", pair, move |pair| {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
             Ok(VisibleTipBlock {
@@ -695,7 +713,7 @@ where
         &self,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<SettledTipBlock, QueryError> {
-        let pair = self.capture_pair();
+        let pair = self.capture_pair_at(at_epoch_id);
         serving_read::run("settled_tip_block", pair, move |pair| {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
             Ok(SettledTipBlock {
@@ -712,7 +730,7 @@ where
         selector: BlockSelector,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockIdAtEpoch, QueryError> {
-        let pair = self.capture_pair();
+        let pair = self.capture_pair_at(at_epoch_id);
         serving_read::run("block_id_by_selector", pair, move |pair| {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
             Self::resolve_block_id_by_selector(&pair, selector, chain_epoch)
@@ -725,7 +743,7 @@ where
         selector: BlockSelector,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockHeaderAtEpoch, QueryError> {
-        let pair = self.capture_pair();
+        let pair = self.capture_pair_at(at_epoch_id);
         serving_read::run("block_header_by_selector", pair, move |pair| {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
             let resolved = Self::resolve_block_id_by_selector(&pair, selector, chain_epoch)?;
@@ -747,7 +765,7 @@ where
         height: BlockHeight,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlock, QueryError> {
-        let pair = self.capture_pair();
+        let pair = self.capture_pair_at(at_epoch_id);
         serving_read::run("compact_block_at", pair, move |pair| {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
             let compact_block = pair
@@ -770,7 +788,7 @@ where
         let requested_blocks = Some(block_range.into_iter().len());
         serving_read::record("compact_blocks_in_range", requested_blocks, async {
             validate_block_range(block_range, DEFAULT_MAX_COMPACT_BLOCK_RANGE)?;
-            let pair = self.capture_pair();
+            let pair = self.capture_pair_at(at_epoch_id);
             serving_read::off_reactor(pair, move |pair| {
                 let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
                 let compact_blocks = pair.canonical().compact_blocks_in_range(block_range)?;
@@ -790,7 +808,7 @@ where
         height: BlockHeight,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<FullBlock, QueryError> {
-        let pair = self.capture_pair();
+        let pair = self.capture_pair_at(at_epoch_id);
         serving_read::run("full_block_at", pair, move |pair| {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
             if !pair.canonical().raw_blob_retention().retains_block_blobs() {
@@ -815,7 +833,7 @@ where
     ) -> Result<FullBlockStream, QueryError> {
         serving_read::record("full_blocks_in_range", None, async {
             validate_block_range(block_range, DEFAULT_MAX_FULL_BLOCK_RANGE)?;
-            let pair = self.capture_pair();
+            let pair = self.capture_pair_at(at_epoch_id);
             let (pair, chain_epoch) = serving_read::off_reactor(pair, move |pair| {
                 let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
                 if !pair.canonical().raw_blob_retention().retains_block_blobs() {
@@ -841,7 +859,7 @@ where
         transaction_id: TransactionId,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransactionStatus, QueryError> {
-        let pair = self.capture_pair();
+        let pair = self.capture_pair_at(at_epoch_id);
         let discovered_activations = Arc::clone(&self.network_upgrade_activations);
         serving_read::run("transaction_by_id", pair, move |pair| {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
@@ -905,7 +923,7 @@ where
         transaction_id: TransactionId,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<RawTransaction, QueryError> {
-        let pair = self.capture_pair();
+        let pair = self.capture_pair_at(at_epoch_id);
         serving_read::run("raw_transaction", pair, move |pair| {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
             let location = pair
@@ -935,7 +953,7 @@ where
         request: TransparentAddressUnspentOutputsRequest,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
-        let pair = self.capture_pair();
+        let pair = self.capture_pair_at(at_epoch_id);
         // An address can hold millions of outputs. Checking for a dropped
         // request between pages lets an abandoned scan release its pair.
         serving_read::run_until_dropped(
@@ -980,15 +998,25 @@ where
     async fn transparent_address_tx_ids_in_range(
         &self,
         request: TransparentAddressTxIdsInRangeRequest,
+        at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressTxIds, QueryError> {
         serving_read::record("transparent_address_tx_ids_in_range", None, async {
-            let pair = self.capture_pair();
+            // A continuation resumes on the pair that issued it, which can be
+            // a retained pair after a newer one was published.
+            let cursor = request
+                .from_cursor
+                .as_ref()
+                .map(TransparentHistoryCursor::parse)
+                .transpose()?;
+            let pair = self.capture_pair_at(
+                cursor
+                    .map(TransparentHistoryCursor::chain_epoch_id)
+                    .or(at_epoch_id),
+            );
             serving_read::off_reactor(pair, move |pair| {
-                let chain_epoch = Self::chain_epoch(&pair, None)?;
-                let after = request
-                    .from_cursor
-                    .as_ref()
-                    .map(|cursor| TransparentHistoryCursor::resume(cursor, pair.wallet_source()))
+                let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                let after = cursor
+                    .map(|cursor| cursor.resume_on(pair.wallet_source()))
                     .transpose()?;
                 if let Some(after) = after {
                     validate_transparent_history_cursor_key(after, &request)?;
@@ -1040,7 +1068,7 @@ where
                     maximum: MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST,
                 });
             }
-            let pair = self.capture_pair();
+            let pair = self.capture_pair_at(at_epoch_id);
             serving_read::off_reactor(pair, move |pair| {
                 // The pair's wallet reader is frozen at the same source as its
                 // canonical epoch, so both output families answer at that
@@ -1077,7 +1105,7 @@ where
                     maximum: crate::MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
                 });
             }
-            let pair = self.capture_pair();
+            let pair = self.capture_pair_at(at_epoch_id);
             serving_read::off_reactor(pair, move |pair| {
                 let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
                 let addresses: HashSet<_> = addresses.into_iter().collect();
@@ -1109,7 +1137,7 @@ where
             {
                 return Err(unavailable(WALLET_READ_TREE_STATE_AT_HEIGHT_V2));
             }
-            let pair = self.capture_pair();
+            let pair = self.capture_pair_at(at_epoch_id);
             let resolved = serving_read::off_reactor(pair, move |pair| {
                 let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
                 let checkpoint = pair
@@ -1180,7 +1208,7 @@ where
         &self,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError> {
-        let pair = self.capture_pair();
+        let pair = self.capture_pair_at(at_epoch_id);
         serving_read::run("latest_tree_state_checkpoint", pair, move |pair| {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
             let checkpoint = pair
@@ -1201,7 +1229,7 @@ where
     ) -> Result<SubtreeRoots, QueryError> {
         serving_read::record("subtree_roots_in_range", None, async {
             validate_subtree_root_range(subtree_root_range)?;
-            let pair = self.capture_pair();
+            let pair = self.capture_pair_at(at_epoch_id);
             serving_read::off_reactor(pair, move |pair| {
                 let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
                 let completed_subtree_count = chain_epoch
