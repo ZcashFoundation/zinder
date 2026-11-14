@@ -580,11 +580,10 @@ require_known_entrypoint_settings() {
 }
 
 # Without the node indexer stream, ingest follows the node mempool by polling
-# JSON-RPC and rebuilds its live index from a full re-read after every block,
-# withholding readiness until the rebuild completes. At the tip that drain
-# repeats with every block.
+# JSON-RPC and re-reads the whole mempool after every block, withdrawing
+# readiness whenever that re-read outlasts its 30-second tip-transition grace.
 if [ -z "${ZINDER_NODE__INDEXER_GRPC_ADDR:-}" ]; then
-  fail "ZINDER_NODE__INDEXER_GRPC_ADDR is required: set it to the node's indexer gRPC URL. Without the indexer stream, ingest re-reads the node mempool over JSON-RPC after every block and withholds readiness while it does"
+  fail "ZINDER_NODE__INDEXER_GRPC_ADDR is required: set it to the node's indexer gRPC URL. Without the indexer stream, ingest re-reads the whole node mempool over JSON-RPC after every block and withdraws readiness when that takes longer than 30 seconds"
 fi
 require_known_entrypoint_settings
 require_positive_seconds ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE_SECONDS \

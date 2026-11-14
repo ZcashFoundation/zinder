@@ -79,10 +79,10 @@ private network; substitute your host's):
 
 The entrypoint stops the container at startup when
 `ZINDER_NODE__INDEXER_GRPC_ADDR` is unset or empty. Without the indexer
-stream, ingest follows the node mempool by polling JSON-RPC. It then rebuilds
-its live mempool index from a full re-read after every block, and its
-readiness drops until the rebuild finishes. At the tip, that drain repeats
-with every block.
+stream, ingest follows the node mempool by polling JSON-RPC and re-reads the
+whole mempool after every block. The mempool view for each new tip then
+arrives a poll interval plus a full re-read late, and ingest withdraws
+readiness whenever that takes longer than 30 seconds.
 
 These are optional:
 

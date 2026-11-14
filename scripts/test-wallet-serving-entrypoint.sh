@@ -189,8 +189,8 @@ recurrence_episode_count() {
   printf '%s' "${recurrence_state%% *}"
 }
 
-# A brief answered drain at every block, as JSON-RPC mempool polling produces
-# at the tip, is not an episode and spends only the cumulative budget.
+# A brief answered drain at every block is not an episode and spends only the
+# cumulative budget.
 reset_recurrence
 poll_epoch=1000
 for _ in $(seq 1 40); do
