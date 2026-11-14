@@ -936,37 +936,44 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
         let pair = self.capture_pair();
-        serving_read::run("transparent_address_unspent_outputs", pair, move |pair| {
-            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-            let mut outputs = Vec::new();
-            let mut after: Option<WalletAddressUnspentOutputKey> = None;
-            loop {
-                let page = pair.wallet().address_unspent_outputs_page_from_height(
-                    request.address_script_hash,
-                    request.start_height,
-                    after,
-                    WALLET_READ_PAGE_SIZE,
-                )?;
-                outputs.extend(page.outputs.into_iter().map(|output| {
-                    TransparentUnspentOutput::new(
-                        output.address_script_hash,
-                        output.script_pub_key,
-                        output.outpoint,
-                        output.value_zat,
-                        output.created_at.block.height,
-                        output.created_at.block.hash,
-                    )
-                }));
-                let Some(next) = page.next_page_after else {
-                    break;
-                };
-                after = Some(next);
-            }
-            Ok(TransparentAddressUnspentOutputs {
-                chain_epoch,
-                outputs,
-            })
-        })
+        // An address can hold millions of outputs. Checking for a dropped
+        // request between pages lets an abandoned scan release its pair.
+        serving_read::run_until_dropped(
+            "transparent_address_unspent_outputs",
+            pair,
+            move |pair, request_dropped| {
+                let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                let mut outputs = Vec::new();
+                let mut after: Option<WalletAddressUnspentOutputKey> = None;
+                loop {
+                    request_dropped.check()?;
+                    let page = pair.wallet().address_unspent_outputs_page_from_height(
+                        request.address_script_hash,
+                        request.start_height,
+                        after,
+                        WALLET_READ_PAGE_SIZE,
+                    )?;
+                    outputs.extend(page.outputs.into_iter().map(|output| {
+                        TransparentUnspentOutput::new(
+                            output.address_script_hash,
+                            output.script_pub_key,
+                            output.outpoint,
+                            output.value_zat,
+                            output.created_at.block.height,
+                            output.created_at.block.hash,
+                        )
+                    }));
+                    let Some(next) = page.next_page_after else {
+                        break;
+                    };
+                    after = Some(next);
+                }
+                Ok(TransparentAddressUnspentOutputs {
+                    chain_epoch,
+                    outputs,
+                })
+            },
+        )
         .await
     }
 

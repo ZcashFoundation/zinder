@@ -430,13 +430,23 @@ balance request, records under `transparent_address_balance`.
 The `ZinderWalletQueryP95High` alert and the overview dashboard read these
 series.
 
-### Compatibility reader
+### Serving-pair publisher
 
-Compatibility metrics report writer-status availability, catch-up duration,
-retired-pair teardown duration, pair convergence attempts, published
-generation, replica lag, pair admission failure, and wallet-serving pair
-replacement. gRPC request metrics remain separate from pair-maintenance
-metrics.
+Native query and compatibility share the serving-pair publisher. Its metrics
+report writer-status availability, catch-up duration, retired-pair teardown
+duration, pair convergence attempts, published generation, replica lag, pair
+admission failure, and wallet-serving pair replacement. gRPC request metrics
+remain separate from pair-maintenance metrics.
+
+A request keeps the pair it captured open until it finishes, which pins that
+pair's secondary generation. The publisher rotates through four generation
+slots, so publication continues while up to two retired pairs are pinned.
+`zinder_wallet_serving_pair_publisher_pinned_retired_pairs` reports how many
+retired pairs requests still hold, and
+`zinder_wallet_serving_pair_publisher_generation_wait_total{reason="in_flight_requests"}`
+counts refreshes that found every unpublished slot pinned and published
+nothing. A steadily rising wait count means a request is holding pairs for
+minutes, and the reader stops advancing until it ends.
 
 ### RocksDB
 

@@ -4,7 +4,9 @@
 //! up only an inactive generation, authenticates that generation against the
 //! canonical writer control plane, and atomically publishes it as one
 //! immutable canonical/wallet pair. The prior generation stays open until
-//! every in-flight request has dropped its captured pair `Arc`.
+//! every in-flight request has dropped its captured pair `Arc`. A request that
+//! holds an old pair for a long time pins only that generation: the publisher
+//! keeps refreshing into the other bounded generation slots.
 
 use std::{
     borrow::Cow,
@@ -47,7 +49,10 @@ use zinder_store::{
 use zinder_wallet_projection::WalletCanonicalSourceIdentity;
 use zinder_wallet_rocksdb::{RocksDbWalletError, RocksDbWalletSecondary};
 
-const SECONDARY_GENERATION_COUNT: usize = 2;
+/// Secondary generation slots, so one or two long-lived readers that pin
+/// retired pairs cannot stop publication. Steady state uses two; each extra
+/// slot opens only while an older pair is still held.
+const SECONDARY_GENERATION_COUNT: usize = 4;
 const CONVERGENCE_RETRY_DELAY_CAP: Duration = Duration::from_millis(100);
 const READINESS_REASON_MAX_BYTES: usize = 256;
 
@@ -465,7 +470,7 @@ impl WalletServingConvergence {
     }
 }
 
-/// Owns the two bounded reader generations and their publication slot.
+/// Owns the bounded reader generations and their publication slot.
 pub struct WalletServingPairPublisher {
     config: WalletServingPairConfig,
     writer_status: CanonicalWriterStatusClient,
@@ -473,14 +478,14 @@ pub struct WalletServingPairPublisher {
     serving_pair_slot: Option<WalletServingPairSlot>,
     generations: [SecondaryGeneration; SECONDARY_GENERATION_COUNT],
     published_generation: Option<usize>,
-    /// Trailing reference to the pair swapped out of the slot.
+    /// Trailing references to pairs swapped out of the slot.
     ///
-    /// Holding it makes the publisher the last owner of every retired pair,
+    /// Holding them makes the publisher the last owner of every retired pair,
     /// so the direct-I/O `RocksDB` close never runs on a request task's
-    /// reactor thread. Only one pair is ever retained: reusing a generation
-    /// requires its lease to have drained, which cannot happen while this
-    /// reference is alive.
-    retired_pair: Option<Arc<WalletServingReadPair>>,
+    /// reactor thread. At most one pair per unpublished generation is
+    /// retained: reusing a generation requires its lease to have drained,
+    /// which cannot happen while its reference is here.
+    retired_pairs: Vec<Arc<WalletServingReadPair>>,
     /// Last attestation of the published pair by a following writer with a
     /// confirmed tip, and the halt the writer last reported, which refresh
     /// failures republish so a writer-status outage or a writer restart cannot
@@ -542,7 +547,7 @@ impl WalletServingPairPublisher {
             serving_pair_slot: None,
             generations,
             published_generation: None,
-            retired_pair: None,
+            retired_pairs: Vec::with_capacity(SECONDARY_GENERATION_COUNT),
             writer_attestation,
             observed_lag_chain_epochs: 0,
             secondary_activations,
@@ -604,7 +609,7 @@ impl WalletServingPairPublisher {
     }
 
     async fn refresh_once(&mut self) -> Result<(), WalletServingPairError> {
-        self.reap_retired_pair().await;
+        self.reap_retired_pairs().await;
         let serving_pair_slot = self
             .serving_pair_slot
             .as_ref()
@@ -620,30 +625,39 @@ impl WalletServingPairPublisher {
         }
         self.follow_writer_schedule(&writer_status)?;
 
-        let generation = self.inactive_generation();
-        if !self.prepare_candidate(generation).await? {
+        let Some(generation) = self.inactive_generation() else {
+            metrics::counter!(
+                "zinder_wallet_serving_pair_publisher_generation_wait_total",
+                "reason" => "in_flight_requests"
+            )
+            .increment(1);
             return Ok(());
-        }
+        };
+        self.prepare_candidate(generation).await?;
         self.converge_and_publish(generation).await
     }
 
-    /// Closes the retired pair's `RocksDB` handles on the blocking pool.
+    /// Closes every retired pair that no request still holds, on the
+    /// blocking pool.
     ///
     /// Closing a direct-I/O instance is expensive, so the drop that actually
-    /// runs the destructors is moved off the reactor. The pair stays open
+    /// runs the destructors is moved off the reactor. A pair stays open
     /// until the last request that captured it has released it; that is the
-    /// same condition [`Self::prepare_candidate`] already waits on before
-    /// reopening the generation.
-    async fn reap_retired_pair(&mut self) {
-        let Some(retired_pair) = self.retired_pair.take() else {
-            return;
-        };
-        if Arc::strong_count(&retired_pair) > 1 {
-            self.retired_pair = Some(retired_pair);
+    /// same condition [`Self::inactive_generation`] waits on before reopening
+    /// its generation.
+    async fn reap_retired_pairs(&mut self) {
+        let (released, pinned): (Vec<_>, Vec<_>) = std::mem::take(&mut self.retired_pairs)
+            .into_iter()
+            .partition(|retired_pair| Arc::strong_count(retired_pair) == 1);
+        self.retired_pairs = pinned;
+        metrics::gauge!("zinder_wallet_serving_pair_publisher_pinned_retired_pairs").set(
+            f64::from(u32::try_from(self.retired_pairs.len()).unwrap_or(u32::MAX)),
+        );
+        if released.is_empty() {
             return;
         }
         let started_at = Instant::now();
-        let teardown = tokio::task::spawn_blocking(move || drop(retired_pair)).await;
+        let teardown = tokio::task::spawn_blocking(move || drop(released)).await;
         metrics::histogram!(
             "zinder_wallet_serving_pair_publisher_teardown_duration_seconds",
             "status" => if teardown.is_ok() { "ok" } else { "error" }
@@ -671,32 +685,42 @@ impl WalletServingPairPublisher {
         Ok(())
     }
 
-    fn inactive_generation(&self) -> usize {
-        self.published_generation.map_or(0, |generation| {
-            (generation + 1) % SECONDARY_GENERATION_COUNT
-        })
+    /// Chooses the generation slot for the next candidate, or `None` while
+    /// requests still hold the pair of every slot but the published one.
+    ///
+    /// An open candidate is reused first. A drained published slot is
+    /// preferred over a vacant one, so steady state alternates between two
+    /// directories and the extra slots open only while an older pair is
+    /// pinned.
+    fn inactive_generation(&self) -> Option<usize> {
+        let unpublished = || {
+            (0..SECONDARY_GENERATION_COUNT)
+                .filter(|generation| Some(*generation) != self.published_generation)
+        };
+        let state = |generation: usize| &self.generations[generation].state;
+        unpublished()
+            .find(|generation| matches!(state(*generation), SecondaryGenerationState::Candidate { .. }))
+            .or_else(|| {
+                unpublished().find(|generation| {
+                    matches!(state(*generation), SecondaryGenerationState::Published { lease } if lease.is_reusable())
+                })
+            })
+            .or_else(|| {
+                unpublished()
+                    .find(|generation| matches!(state(*generation), SecondaryGenerationState::Vacant))
+            })
     }
 
-    /// Opens a generation only after the prior pair in that exact path has no
-    /// strong references. It deliberately does not delete the metadata path:
-    /// opening an inactive path is safe and bounded, while deleting it would
-    /// widen the failure surface without improving correctness.
-    async fn prepare_candidate(
-        &mut self,
-        generation: usize,
-    ) -> Result<bool, WalletServingPairError> {
+    /// Opens a candidate in `generation` unless one is already open there.
+    ///
+    /// The caller chooses a slot whose prior pair has no strong references.
+    /// This deliberately does not delete the metadata path: opening an
+    /// inactive path is safe and bounded, while deleting it would widen the
+    /// failure surface without improving correctness.
+    async fn prepare_candidate(&mut self, generation: usize) -> Result<(), WalletServingPairError> {
         let secondary_generation = &mut self.generations[generation];
-        match &secondary_generation.state {
-            SecondaryGenerationState::Candidate { .. } => return Ok(true),
-            SecondaryGenerationState::Published { lease } if !lease.is_reusable() => {
-                metrics::counter!(
-                    "zinder_wallet_serving_pair_publisher_generation_wait_total",
-                    "reason" => "in_flight_requests"
-                )
-                .increment(1);
-                return Ok(false);
-            }
-            SecondaryGenerationState::Vacant | SecondaryGenerationState::Published { .. } => {}
+        if let SecondaryGenerationState::Candidate { .. } = secondary_generation.state {
+            return Ok(());
         }
         secondary_generation.state = SecondaryGenerationState::Vacant;
         let canonical_primary_path = self.config.canonical_primary_path.clone();
@@ -743,7 +767,7 @@ impl WalletServingPairPublisher {
         })
         .await??;
         self.generations[generation].state = SecondaryGenerationState::Candidate { candidate };
-        Ok(true)
+        Ok(())
     }
 
     async fn converge_and_publish(
@@ -882,12 +906,11 @@ impl WalletServingPairPublisher {
         })
         .await
         .map_err(WalletServingPairError::CandidateTask)??;
-        self.retired_pair = if let Some(slot) = &self.serving_pair_slot {
-            Some(slot.publish(Arc::clone(&pair)))
+        if let Some(slot) = &self.serving_pair_slot {
+            self.retired_pairs.push(slot.publish(Arc::clone(&pair)));
         } else {
             self.serving_pair_slot = Some(WalletServingPairSlot::new(Arc::clone(&pair)));
-            None
-        };
+        }
         self.generations[generation].state = SecondaryGenerationState::Published {
             lease: GenerationLease::new(&pair),
         };
@@ -2212,6 +2235,130 @@ mod tests {
         Ok(())
     }
 
+    /// A request that keeps a retired pair alive pins only that pair's
+    /// generation. Publication continues through the spare slots and waits
+    /// only once every unpublished slot is pinned.
+    #[tokio::test(flavor = "multi_thread")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the scenario pins every spare generation and then releases one"
+    )]
+    async fn a_pinned_retired_pair_does_not_stop_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let activations = lifecycle_upgrade_activations()?;
+        let canonical_primary_path = temporary.path().join("canonical-primary");
+        let wallet_primary_path = temporary.path().join("wallet-primary");
+        let mut canonical_primary =
+            build_lifecycle_canonical_primary(&canonical_primary_path, &activations)?;
+        build_wallet_from_canonical(
+            &canonical_primary,
+            &wallet_primary_path,
+            RocksDbWalletBuildOptions {
+                supported_reorg_depth: 100,
+                ..RocksDbWalletBuildOptions::for_local_tests()
+            },
+        )?;
+        let control = MutableCanonicalControl::new(writer_status_for_store(&canonical_primary));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server_task = tokio::spawn({
+            let control = control.clone();
+            async move {
+                Server::builder()
+                    .add_service(CanonicalControlServer::new(control))
+                    .serve_with_incoming_shutdown(
+                        TcpListenerStream::new(listener),
+                        server_cancel.cancelled_owned(),
+                    )
+                    .await
+            }
+        });
+        let (mut publisher, slot) =
+            WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
+                wallet_serving_pair_config(
+                    canonical_primary_path.clone(),
+                    temporary.path().join("canonical-secondaries"),
+                    wallet_primary_path.clone(),
+                    temporary.path().join("wallet-secondaries"),
+                    Arc::new(activations.clone()),
+                )?,
+                WalletServingReadiness::without_node_source(zinder_runtime::Readiness::default()),
+                &endpoint,
+                None,
+            )
+            .await?;
+        // Each schedule revision makes the next refresh publish a new pair,
+        // and every published pair stays captured like a long-running read.
+        let mut admit_schedule_revision = |revision: u32| {
+            let mut entries = activations.activations().to_vec();
+            entries.push(NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x7719_0ad9),
+                activation_height: BlockHeight::new(200 + revision),
+                name: "NU7".to_owned(),
+            });
+            NetworkUpgradeActivations::new(Network::ZcashRegtest, entries)
+                .map_err(Box::<dyn std::error::Error>::from)
+                .and_then(|extended| {
+                    canonical_primary
+                        .admit_network_upgrade_schedule(&extended)
+                        .map_err(Box::<dyn std::error::Error>::from)
+                })
+                .map(|()| control.set_writer_status(writer_status_for_store(&canonical_primary)))
+        };
+        let mut pinned_pairs = vec![slot.capture()];
+        for revision in 1..u32::try_from(super::SECONDARY_GENERATION_COUNT)? {
+            admit_schedule_revision(revision)?;
+            publisher.refresh_once().await?;
+            let refreshed_pair = slot.capture();
+            assert!(
+                !Arc::ptr_eq(
+                    &refreshed_pair,
+                    pinned_pairs.last().ok_or("no pinned pair")?
+                ),
+                "revision {revision} must publish while older pairs are pinned"
+            );
+            pinned_pairs.push(refreshed_pair);
+        }
+
+        let revision = u32::try_from(super::SECONDARY_GENERATION_COUNT)?;
+        admit_schedule_revision(revision)?;
+        publisher.refresh_once().await?;
+        assert!(
+            Arc::ptr_eq(
+                &slot.capture(),
+                pinned_pairs.last().ok_or("no pinned pair")?
+            ),
+            "with every unpublished slot pinned, the publisher waits"
+        );
+
+        drop(pinned_pairs.remove(0));
+        publisher.refresh_once().await?;
+        let released_slot_pair = slot.capture();
+        assert!(!Arc::ptr_eq(
+            &released_slot_pair,
+            pinned_pairs.last().ok_or("no pinned pair")?
+        ));
+        assert_eq!(publisher.published_generation, Some(0));
+        assert_eq!(
+            released_slot_pair
+                .canonical()
+                .network_upgrade_schedule()
+                .map(zinder_store::CanonicalActivationSchedule::revision),
+            Some(u64::from(revision))
+        );
+
+        drop(released_slot_pair);
+        drop(pinned_pairs);
+        drop(publisher);
+        drop(slot);
+        cancel.cancel();
+        server_task.await??;
+        Ok(())
+    }
+
     /// A publisher that started with the node's pre-upgrade table must keep
     /// refreshing after ingest admits the upgrade and the chain crosses its
     /// activation height.
@@ -3392,7 +3539,7 @@ mod tests {
 
         drop(old_pair);
         assert_eq!(published_generation_is_reusable(&publisher, 0), Some(false));
-        publisher.reap_retired_pair().await;
+        publisher.reap_retired_pairs().await;
         assert_eq!(published_generation_is_reusable(&publisher, 0), Some(true));
         drop(live_chain_events);
         drop(resumed_chain_events);

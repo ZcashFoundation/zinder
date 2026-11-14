@@ -1151,7 +1151,7 @@ gate on whether you actually changed trust-sensitive code.
   `zinder-query`, and `zinder-compat-lightwalletd`. Each accepts a TOML file,
   the `ZINDER_*` environment schema, and CLI overrides in that order.
 - Keep every primary and secondary path distinct. Ingest owns the canonical
-  primary, projector owns the wallet primary, and each reader owns exactly 2
+  primary, projector owns the wallet primary, and each reader owns up to 4
   bounded generations beneath its distinct canonical and wallet secondary roots.
 - Run `CanonicalControl` and `IngestControl` on loopback for same-host tests.
   A non-loopback writer requires one bearer-token file shared with projector
