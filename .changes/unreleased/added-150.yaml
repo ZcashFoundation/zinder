@@ -1,6 +1,0 @@
-kind: added
-body: "`zinder-ingest` can now reach a node's indexer gRPC endpoint over TLS, including mutual TLS, which a Zakura indexer on any non-loopback address requires. An `https://` `node.indexer_grpc_addr` negotiates TLS. The new `[node.indexer_tls]` section (`ca_cert_path`, `client_cert_path`, `client_key_path`, and `server_name`, or the matching `ZINDER_NODE__INDEXER_TLS__*` variables) names a CA bundle, a client certificate and key, and a server name override, all as file paths. Ingest checks those files at startup and exits with a configuration error when one is missing or holds no certificate or key. On platforms that deliver secrets only as environment variables, the `zinder-canonical-runtime` and `zinder-wallet-serving` images accept `ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM`, `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM`, and `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM`, and write them to files that only the `zinder` user can read. Every Zinder binary refuses these PEM variables when they are set directly."
-time: 2026-11-13T12:00:00Z
-custom:
-  Bump: minor
-  PR: "150"

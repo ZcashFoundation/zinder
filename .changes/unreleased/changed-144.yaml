@@ -1,6 +1,0 @@
-kind: changed
-body: "The single-host Compose deployment no longer defaults to a Zebra node in Z3. Compose refuses to start unless the env file sets `ZINDER_DEPLOY_NETWORK` (replacing `Z3_NETWORK_LOWER`), `ZINDER_SOURCE_NETWORK_NAME`, `ZINDER_SOURCE_COOKIE_VOLUME_NAME`, `ZINDER_NETWORK__NAME`, and `ZINDER_NODE__JSON_RPC_ADDR`. The checked-in env files now poll the mempool over JSON-RPC instead of streaming from `http://zebra:8155`. New `deploy/.env.zakura-mainnet` and `deploy/.env.zakura-testnet` files attach a Zakura node, and `deploy/node-cookie-permissions.yml` makes a non-Z3 node's cookie readable to Zinder. Update `/etc/zinder/env` as the VM deployment runbook describes before upgrading."
-time: 2026-11-13T12:00:00Z
-custom:
-  Bump: minor
-  PR: "144"
