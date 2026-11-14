@@ -25,8 +25,10 @@ use zinder_testkit::live::{LiveTestEnv, init, require_live};
 /// agree with `zebra-chain`'s view.
 ///
 /// This exercises the parsing pipeline used for an observed `Added` event
-/// against the regtest tip's coinbase transaction, so it needs no wallet
-/// setup. The signed-transaction broadcast cycle is covered by
+/// against the tip's coinbase transaction, so it needs no wallet setup. A
+/// version-6 coinbase may pay the miner entirely in shielded notes, so the
+/// transparent overlay must match the parsed output count, which can be zero.
+/// The signed-transaction broadcast cycle is covered by
 /// `mempool_broadcast_cycle.rs`.
 #[tokio::test]
 #[ignore = "live test; see CLAUDE.md §Live Node Tests"]
@@ -63,9 +65,10 @@ async fn build_mempool_entry_decodes_real_zebra_coinbase_into_canonical_form() -
         "coinbase contributes no transparent spends; got {} spends",
         mempool_entry.transparent_spends().len()
     );
-    assert!(
-        !mempool_entry.transparent_outputs().is_empty(),
-        "coinbase has at least one transparent output to the miner address"
+    assert_eq!(
+        mempool_entry.transparent_outputs().len(),
+        coinbase.transparent_output_count,
+        "transparent overlay must carry every transparent coinbase output"
     );
     for transparent_output in mempool_entry.transparent_outputs() {
         assert_eq!(
@@ -100,6 +103,7 @@ struct ZebraCoinbase {
     transaction_id: TransactionId,
     auth_digest: Option<AuthDigest>,
     raw_bytes: Vec<u8>,
+    transparent_output_count: usize,
 }
 
 async fn fetch_tip_coinbase(
@@ -115,7 +119,7 @@ async fn fetch_tip_coinbase(
     let coinbase_transaction = parsed_block
         .transactions
         .first()
-        .ok_or_else(|| eyre!("regtest tip block has no coinbase transaction"))?;
+        .ok_or_else(|| eyre!("tip block has no coinbase transaction"))?;
     let raw_bytes = coinbase_transaction
         .zcash_serialize_to_vec()
         .map_err(|error| eyre!("coinbase serialize failed: {error}"))?;
@@ -125,6 +129,7 @@ async fn fetch_tip_coinbase(
             .auth_digest()
             .map(|digest| AuthDigest::from_bytes(digest.0)),
         raw_bytes,
+        transparent_output_count: coinbase_transaction.outputs().len(),
     })
 }
 
