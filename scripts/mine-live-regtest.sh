@@ -72,8 +72,10 @@ require_shielded_prefix() {
   echo "shielded prefix: Sapling ${sapling}, Orchard ${orchard}, Ironwood ${ironwood} notes at height ${shielded_prefix_blocks}"
 }
 
+# Zebra answers RPC before it commits the genesis block, and getblockcount
+# fails with "No blocks in state" until it does.
 for _ in $(seq 1 60); do
-  if rpc getblockchaininfo '[]' | jq -e '.result' >/dev/null 2>&1; then
+  if rpc getblockcount '[]' | jq -e '.result != null and .error == null' >/dev/null 2>&1; then
     break
   fi
   sleep 2
