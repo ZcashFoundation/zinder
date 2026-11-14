@@ -1,0 +1,6 @@
+kind: fixed
+body: "A default wallet-serving deployment can now build a Mainnet wallet from genesis. `projector.build.max_temporary_file_bytes_per_sorter` (`ZINDER_PROJECTOR__BUILD__MAX_TEMPORARY_FILE_BYTES_PER_SORTER`) now defaults to 206158430208 (192 GiB) instead of 64 GiB, because the largest sorter of a Mainnet build needs about 99 GB. Keep about 100 GB free on the wallet volume during Mainnet construction. When the setting is too small, `zinder-projector` now stops during the canonical scan instead of after it, with an error that names the setting and the bytes required so far. Explicitly configured values are unchanged."
+time: 2026-11-14T12:00:00Z
+custom:
+  Bump: patch
+  PR: "164"
