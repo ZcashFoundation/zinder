@@ -22,6 +22,8 @@ use std::{collections::BTreeSet, path::PathBuf, process::Command};
 use eyre::{Result, WrapErr, bail, eyre};
 
 const ENV_PREFIX: &str = "ZINDER_";
+const WALLET_SERVING_ENTRYPOINT: &str =
+    include_str!("../../../deploy/wallet-serving-runtime-entrypoint");
 const PROBE_SECTION: &str = "CONTRACT_PROBE";
 const PROBE_LEAF: &str = "UNUSED";
 const PROBE_KEY: &str = "contract_probe";
@@ -109,6 +111,39 @@ impl EnvVarContractProbe {
         );
     }
 
+    /// Fails unless `listed_sections` names exactly the top-level sections
+    /// the loader defines.
+    ///
+    /// The wallet-serving image entrypoint passes each process only the
+    /// `ZINDER_*` sections its binary defines, so a section missing from its
+    /// list silently drops every variable of that section.
+    pub fn check_top_level_sections<'a>(
+        &self,
+        listed_sections: impl IntoIterator<Item = &'a str>,
+    ) -> Result<()> {
+        let defined = self
+            .accepted_field_names(&[])?
+            .ok_or_else(|| {
+                eyre!(
+                    "{} did not reject an unknown top-level key",
+                    self.executable_name()
+                )
+            })?
+            .into_iter()
+            .collect::<BTreeSet<String>>();
+        let listed = listed_sections
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<String>>();
+        if defined == listed {
+            return Ok(());
+        }
+        bail!(
+            "{} defines the sections {defined:?}, but the list names {listed:?}",
+            self.executable_name(),
+        );
+    }
+
     fn accepted_variables(&self) -> Result<BTreeSet<String>> {
         let mut accepted = BTreeSet::new();
         self.collect_accepted_variables(&[], &mut accepted)?;
@@ -179,6 +214,21 @@ impl EnvVarContractProbe {
             .and_then(|name| name.to_str())
             .unwrap_or("service binary")
     }
+}
+
+/// Returns the sections the wallet-serving image entrypoint passes to one
+/// process, from its `<process>_sections="..."` setting, such as
+/// `ingest_sections`.
+pub fn wallet_serving_entrypoint_sections(process: &str) -> Result<Vec<&'static str>> {
+    let setting_prefix = format!("{process}_sections=\"");
+    WALLET_SERVING_ENTRYPOINT
+        .lines()
+        .find_map(|line| line.strip_prefix(setting_prefix.as_str()))
+        .and_then(|quoted| quoted.strip_suffix('"'))
+        .map(|sections| sections.split_whitespace().collect())
+        .ok_or_else(|| {
+            eyre!("deploy/wallet-serving-runtime-entrypoint does not set {process}_sections")
+        })
 }
 
 /// Renders a configuration path such as `["storage", "path"]` as

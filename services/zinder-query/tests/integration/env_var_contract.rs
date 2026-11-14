@@ -2,7 +2,7 @@
 //! the `zinder-query` loader accepts.
 
 use zinder_runtime::ENVIRONMENT_VARIABLES;
-use zinder_testkit::EnvVarContractProbe;
+use zinder_testkit::{EnvVarContractProbe, wallet_serving_entrypoint_sections};
 
 const BINARY: &str = "zinder-query";
 
@@ -37,4 +37,10 @@ fn every_documented_variable_is_accepted_by_the_loader() -> eyre::Result<()> {
 fn every_variable_the_loader_accepts_is_documented() -> eyre::Result<()> {
     EnvVarContractProbe::new(env!("CARGO_BIN_EXE_zinder-query"))
         .check_accepted_variables_are_documented(documented_variables(), ACCEPTED_BUT_UNCONSUMED)
+}
+
+#[test]
+fn wallet_serving_entrypoint_passes_every_section_the_loader_defines() -> eyre::Result<()> {
+    EnvVarContractProbe::new(env!("CARGO_BIN_EXE_zinder-query"))
+        .check_top_level_sections(wallet_serving_entrypoint_sections("query")?)
 }

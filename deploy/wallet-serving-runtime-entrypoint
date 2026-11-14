@@ -32,10 +32,12 @@ unready_report_interval_seconds=300
 # before the platform sends SIGKILL.
 shutdown_grace_seconds=20
 
-# The three phase deadlines sum below Railway's healthcheck window, so a stalled
-# phase names itself in the logs before the platform reports a generic timeout.
-canonical_construction_deadline_seconds=10800
-wallet_construction_deadline_seconds=7200
+# A phase that outlives its deadline names itself and its last readiness in the
+# logs. The construction defaults fit Testnet; a Mainnet build from an empty
+# volume needs the documented longer values. A restart discards unpublished
+# construction staging, so a deadline shorter than the build never finishes.
+canonical_construction_deadline_seconds="${ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE_SECONDS:-10800}"
+wallet_construction_deadline_seconds="${ZINDER_WALLET_SERVING__WALLET_CONSTRUCTION_DEADLINE_SECONDS:-7200}"
 wallet_serving_deadline_seconds=1800
 
 # Upstream outages and sync lag clear on their own; a plane that stays unready
@@ -51,6 +53,22 @@ recurrence_clear_window_seconds=600
 recurrence_episode_budget=6
 recurrence_cumulative_unready_seconds_budget=900
 
+# A plane that answers `/readyz` with a cause is reporting a state it tracks,
+# such as a mempool rebuild at a new block, so its drain becomes an episode
+# only once it lasts this long. An unanswerable ops listener counts at once:
+# that is the wedged runtime this budget exists to catch.
+recurrence_min_answered_episode_seconds=60
+
+# The `ZINDER_*` sections each binary's configuration loader defines. Every
+# binary rejects a section it does not define, so each process receives only
+# its own sections. The `env_var_contract` tests of each service hold these
+# lists to the loaders. `[wallet_serving]` configures this entrypoint and
+# reaches no process.
+ingest_sections="network ops node storage ingest ingest_control retention security"
+projector_sections="network storage wallet projector node ingest_control projector_control ops security"
+query_sections="network ops storage wallet ingest_control query node security"
+entrypoint_sections="wallet_serving"
+
 ingest_ops_addr="127.0.0.1:9105"
 projector_ops_addr="127.0.0.1:9110"
 query_ops_addr="127.0.0.1:9106"
@@ -64,19 +82,23 @@ query_pid=""
 sleep_pid=""
 
 # Per-plane recurrence counters. `*_flap_unready_since_epoch` is 0 while the
-# plane is ready; nonzero marks the start of the episode in progress.
+# plane is ready; nonzero marks the start of the unready stretch in progress,
+# and `*_flap_episode_counted` records whether that stretch is an episode yet.
 ingest_episode_count=0
 ingest_flap_unready_since_epoch=0
+ingest_flap_episode_counted=0
 ingest_cumulative_unready_seconds=0
 ingest_flap_ready_since_epoch=0
 
 projector_episode_count=0
 projector_flap_unready_since_epoch=0
+projector_flap_episode_counted=0
 projector_cumulative_unready_seconds=0
 projector_flap_ready_since_epoch=0
 
 query_episode_count=0
 query_flap_unready_since_epoch=0
+query_flap_episode_counted=0
 query_cumulative_unready_seconds=0
 query_flap_ready_since_epoch=0
 
@@ -395,42 +417,61 @@ observe_plane_readiness() {
 
 # Folds one plane's readiness observation from this poll into its recurrence
 # counters and reports the updated state on stdout as "<episode_count>
-# <flap_unready_since_epoch> <cumulative_unready_seconds>
-# <flap_ready_since_epoch> <total_unready_seconds> <escalate>", so the caller
-# can persist the counters into its own variables with `set --`. Escalation
-# is reported rather than acted on here: this function runs inside a command
-# substitution, so calling fail() from it would only exit that subshell and
-# leave the container running.
+# <flap_unready_since_epoch> <flap_episode_counted>
+# <cumulative_unready_seconds> <flap_ready_since_epoch> <total_unready_seconds>
+# <escalate>", so the caller can persist the counters into its own variables
+# with `set --`. Escalation is reported rather than acted on here: this
+# function runs inside a command substitution, so calling fail() from it would
+# only exit that subshell and leave the container running.
+#
+# An unready stretch becomes an episode when the plane is unreachable, or once
+# an answered drain has lasted recurrence_min_answered_episode_seconds. A
+# stretch that recovers before either leaves every counter untouched,
+# including the sustained-recovery clock.
 update_plane_recurrence() {
   role="$1"
   is_ready="$2"
-  now_epoch="$3"
-  episode_count="$4"
-  flap_unready_since_epoch="$5"
-  cumulative_unready_seconds="$6"
-  flap_ready_since_epoch="$7"
-  report="$8"
+  is_unreachable="$3"
+  now_epoch="$4"
+  episode_count="$5"
+  flap_unready_since_epoch="$6"
+  flap_episode_counted="$7"
+  cumulative_unready_seconds="$8"
+  flap_ready_since_epoch="$9"
+  report="${10}"
 
   if [ "$is_ready" -eq 1 ]; then
     if [ "$flap_unready_since_epoch" -ne 0 ]; then
       episode_seconds=$((now_epoch - flap_unready_since_epoch))
-      cumulative_unready_seconds=$((cumulative_unready_seconds + episode_seconds))
-      log "$role recovered after ${episode_seconds}s unready: episode $episode_count ended, ${cumulative_unready_seconds}s unready in the current recurrence window"
+      if [ "$flap_episode_counted" -eq 1 ]; then
+        cumulative_unready_seconds=$((cumulative_unready_seconds + episode_seconds))
+        log "$role recovered after ${episode_seconds}s unready: episode $episode_count ended, ${cumulative_unready_seconds}s unready in the current recurrence window"
+        flap_ready_since_epoch="$now_epoch"
+      else
+        log "$role recovered after ${episode_seconds}s unready, too brief to count toward the recurrence budget"
+      fi
       flap_unready_since_epoch=0
-      flap_ready_since_epoch="$now_epoch"
+      flap_episode_counted=0
     elif [ "$episode_count" -gt 0 ] \
       && [ $((now_epoch - flap_ready_since_epoch)) -ge "$recurrence_clear_window_seconds" ]; then
       log "$role stayed ready for ${recurrence_clear_window_seconds}s, clearing $episode_count recorded episode(s) (${cumulative_unready_seconds}s unready)"
       episode_count=0
       cumulative_unready_seconds=0
     fi
-  elif [ "$flap_unready_since_epoch" -eq 0 ]; then
-    episode_count=$((episode_count + 1))
-    flap_unready_since_epoch="$now_epoch"
-    log "$role flap episode $episode_count began: $report"
+  else
+    if [ "$flap_unready_since_epoch" -eq 0 ]; then
+      flap_unready_since_epoch="$now_epoch"
+    fi
+    if [ "$flap_episode_counted" -eq 0 ] \
+      && { [ "$is_unreachable" -eq 1 ] \
+        || [ $((now_epoch - flap_unready_since_epoch)) -ge "$recurrence_min_answered_episode_seconds" ]; }; then
+      episode_count=$((episode_count + 1))
+      flap_episode_counted=1
+      log "$role flap episode $episode_count began $((now_epoch - flap_unready_since_epoch))s ago: $report"
+    fi
   fi
 
-  if [ "$flap_unready_since_epoch" -ne 0 ]; then
+  if [ "$flap_episode_counted" -eq 1 ]; then
     total_unready_seconds=$((cumulative_unready_seconds + now_epoch - flap_unready_since_epoch))
   else
     total_unready_seconds="$cumulative_unready_seconds"
@@ -447,10 +488,89 @@ update_plane_recurrence() {
     escalate=1
   fi
 
-  printf '%s %s %s %s %s %s\n' \
-    "$episode_count" "$flap_unready_since_epoch" "$cumulative_unready_seconds" \
-    "$flap_ready_since_epoch" "$total_unready_seconds" "$escalate"
+  printf '%s %s %s %s %s %s %s\n' \
+    "$episode_count" "$flap_unready_since_epoch" "$flap_episode_counted" \
+    "$cumulative_unready_seconds" "$flap_ready_since_epoch" "$total_unready_seconds" \
+    "$escalate"
 }
+
+# Prints, one per line, every `ZINDER_*` variable in the environment whose
+# section is not among the space-separated sections in $1. The section is the
+# lowercased name between `ZINDER_` and the first `__`, as the binaries'
+# configuration loaders read it.
+zinder_variables_outside() {
+  awk -v sections="$1" '
+    BEGIN {
+      split(sections, listed, " ")
+      for (index_in_list in listed) {
+        kept[listed[index_in_list]] = 1
+      }
+      for (name in ENVIRON) {
+        if (name !~ /^ZINDER_[A-Za-z0-9_]+$/) {
+          continue
+        }
+        section = tolower(substr(name, 8))
+        sub(/__.*/, "", section)
+        if (!(section in kept)) {
+          print name
+        }
+      }
+    }
+  '
+}
+
+# Starts one runtime process as zinder in the background with only the
+# `ZINDER_*` sections its binary defines, and without the bearer secrets this
+# entrypoint materializes into token files.
+start_runtime_process() {
+  runtime_binary="$1"
+  runtime_config_path="$2"
+  runtime_sections="$3"
+
+  unset_arguments=""
+  for variable_name in $(zinder_variables_outside "$runtime_sections"); do
+    unset_arguments="$unset_arguments -u $variable_name"
+  done
+
+  # shellcheck disable=SC2086 # each word of unset_arguments is one env argument
+  env $unset_arguments \
+    -u INGEST_CONTROL_BEARER_TOKEN \
+    -u CHECKPOINT_BEARER_TOKEN \
+    setpriv --reuid=zinder --regid=zinder --init-groups --no-new-privs \
+    "$runtime_binary" --config "$runtime_config_path" &
+}
+
+# Fails unless the variable named $1 holds $2 as a positive whole number of
+# seconds.
+require_positive_seconds() {
+  case "$2" in
+    '' | *[!0-9]* | 0*)
+      fail "$1 must be a positive whole number of seconds, got '$2'"
+      ;;
+    *) ;;
+  esac
+}
+
+# Without the node indexer stream, ingest follows the node mempool by polling
+# JSON-RPC and rebuilds its live index from a full re-read after every block,
+# withholding readiness until the rebuild completes. At the tip that drain
+# repeats with every block.
+if [ -z "${ZINDER_NODE__INDEXER_GRPC_ADDR:-}" ]; then
+  fail "ZINDER_NODE__INDEXER_GRPC_ADDR is required: set it to the node's indexer gRPC URL. Without the indexer stream, ingest re-reads the node mempool over JSON-RPC after every block and withholds readiness while it does"
+fi
+require_positive_seconds ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE_SECONDS \
+  "$canonical_construction_deadline_seconds"
+require_positive_seconds ZINDER_WALLET_SERVING__WALLET_CONSTRUCTION_DEADLINE_SECONDS \
+  "$wallet_construction_deadline_seconds"
+
+unread_variables="$(
+  zinder_variables_outside \
+    "$ingest_sections $projector_sections $query_sections $entrypoint_sections" \
+    | sort | tr '\n' ' '
+)"
+if [ -n "$unread_variables" ]; then
+  log "no process in this container reads these variables, so none receives them: ${unread_variables% }"
+fi
 
 # Railway mounts the persistent volume after the image filesystem is
 # materialized, so the mount root is owned by root instead of the runtime UID.
@@ -477,42 +597,23 @@ if [ -n "${ZINDER_INGEST__REORG_WINDOW_BLOCKS:-}" ]; then
   export ZINDER_PROJECTOR__REORG_WINDOW_BLOCKS ZINDER_QUERY__REORG_WINDOW_BLOCKS
 fi
 
-# Every binary rejects an unknown `ZINDER_*` section, so each process starts
-# without the role-scoped variables and the bearer secrets it does not own.
-log "starting canonical construction"
-env \
-  -u ZINDER_PROJECTOR__BUILD_OWNER_HEX \
-  -u ZINDER_PROJECTOR__REORG_WINDOW_BLOCKS \
-  -u ZINDER_QUERY__REORG_WINDOW_BLOCKS \
-  -u INGEST_CONTROL_BEARER_TOKEN \
-  -u CHECKPOINT_BEARER_TOKEN \
-  setpriv --reuid=zinder --regid=zinder --init-groups --no-new-privs \
-  /usr/local/bin/zinder-ingest --config /etc/zinder/ingest.toml &
+log "starting canonical construction (deadline ${canonical_construction_deadline_seconds}s)"
+start_runtime_process /usr/local/bin/zinder-ingest /etc/zinder/ingest.toml \
+  "$ingest_sections"
 ingest_pid="$!"
 await_readiness zinder-ingest "$ingest_ops_addr" \
   "$canonical_construction_deadline_seconds"
 
-log "starting wallet construction"
-env \
-  -u ZINDER_INGEST__REORG_WINDOW_BLOCKS \
-  -u ZINDER_QUERY__REORG_WINDOW_BLOCKS \
-  -u INGEST_CONTROL_BEARER_TOKEN \
-  -u CHECKPOINT_BEARER_TOKEN \
-  setpriv --reuid=zinder --regid=zinder --init-groups --no-new-privs \
-  /usr/local/bin/zinder-projector --config /etc/zinder/projector.toml &
+log "starting wallet construction (deadline ${wallet_construction_deadline_seconds}s)"
+start_runtime_process /usr/local/bin/zinder-projector /etc/zinder/projector.toml \
+  "$projector_sections"
 projector_pid="$!"
 await_readiness zinder-projector "$projector_ops_addr" \
   "$wallet_construction_deadline_seconds"
 
 log "starting wallet serving"
-env \
-  -u ZINDER_INGEST__REORG_WINDOW_BLOCKS \
-  -u ZINDER_PROJECTOR__BUILD_OWNER_HEX \
-  -u ZINDER_PROJECTOR__REORG_WINDOW_BLOCKS \
-  -u INGEST_CONTROL_BEARER_TOKEN \
-  -u CHECKPOINT_BEARER_TOKEN \
-  setpriv --reuid=zinder --regid=zinder --init-groups --no-new-privs \
-  /usr/local/bin/zinder-query --config /etc/zinder/query.toml &
+start_runtime_process /usr/local/bin/zinder-query /etc/zinder/query.toml \
+  "$query_sections"
 query_pid="$!"
 await_readiness zinder-query "$query_ops_addr" "$wallet_serving_deadline_seconds"
 
@@ -547,6 +648,10 @@ while true; do
     ingest_ready=1
   fi
   ingest_report="$probe_report"
+  ingest_unreachable=0
+  if [ -z "$probe_http_status" ]; then
+    ingest_unreachable=1
+  fi
   plane_halted=$((plane_halted | probe_halted))
 
   projector_ready=0
@@ -554,6 +659,10 @@ while true; do
     projector_ready=1
   fi
   projector_report="$probe_report"
+  projector_unreachable=0
+  if [ -z "$probe_http_status" ]; then
+    projector_unreachable=1
+  fi
   plane_halted=$((plane_halted | probe_halted))
 
   query_ready=0
@@ -561,6 +670,10 @@ while true; do
     query_ready=1
   fi
   query_report="$probe_report"
+  query_unreachable=0
+  if [ -z "$probe_http_status" ]; then
+    query_unreachable=1
+  fi
   plane_halted=$((plane_halted | probe_halted))
 
   if [ "$plane_halted" -eq 1 ] && [ "$writer_halt_reported" -eq 0 ]; then
@@ -572,37 +685,43 @@ while true; do
   fi
 
   # shellcheck disable=SC2046 # word-splitting the fixed-width numeric fields update_plane_recurrence prints is intentional; see its own comment.
-  set -- $(update_plane_recurrence zinder-ingest "$ingest_ready" "$now_epoch" \
-    "$ingest_episode_count" "$ingest_flap_unready_since_epoch" \
-    "$ingest_cumulative_unready_seconds" "$ingest_flap_ready_since_epoch" "$ingest_report")
+  set -- $(update_plane_recurrence zinder-ingest "$ingest_ready" "$ingest_unreachable" \
+    "$now_epoch" "$ingest_episode_count" "$ingest_flap_unready_since_epoch" \
+    "$ingest_flap_episode_counted" "$ingest_cumulative_unready_seconds" \
+    "$ingest_flap_ready_since_epoch" "$ingest_report")
   ingest_episode_count="$1"
   ingest_flap_unready_since_epoch="$2"
-  ingest_cumulative_unready_seconds="$3"
-  ingest_flap_ready_since_epoch="$4"
-  ingest_total_unready_seconds="$5"
-  ingest_escalate="$6"
+  ingest_flap_episode_counted="$3"
+  ingest_cumulative_unready_seconds="$4"
+  ingest_flap_ready_since_epoch="$5"
+  ingest_total_unready_seconds="$6"
+  ingest_escalate="$7"
 
   # shellcheck disable=SC2046 # word-splitting the fixed-width numeric fields update_plane_recurrence prints is intentional; see its own comment.
-  set -- $(update_plane_recurrence zinder-projector "$projector_ready" "$now_epoch" \
-    "$projector_episode_count" "$projector_flap_unready_since_epoch" \
-    "$projector_cumulative_unready_seconds" "$projector_flap_ready_since_epoch" "$projector_report")
+  set -- $(update_plane_recurrence zinder-projector "$projector_ready" "$projector_unreachable" \
+    "$now_epoch" "$projector_episode_count" "$projector_flap_unready_since_epoch" \
+    "$projector_flap_episode_counted" "$projector_cumulative_unready_seconds" \
+    "$projector_flap_ready_since_epoch" "$projector_report")
   projector_episode_count="$1"
   projector_flap_unready_since_epoch="$2"
-  projector_cumulative_unready_seconds="$3"
-  projector_flap_ready_since_epoch="$4"
-  projector_total_unready_seconds="$5"
-  projector_escalate="$6"
+  projector_flap_episode_counted="$3"
+  projector_cumulative_unready_seconds="$4"
+  projector_flap_ready_since_epoch="$5"
+  projector_total_unready_seconds="$6"
+  projector_escalate="$7"
 
   # shellcheck disable=SC2046 # word-splitting the fixed-width numeric fields update_plane_recurrence prints is intentional; see its own comment.
-  set -- $(update_plane_recurrence zinder-query "$query_ready" "$now_epoch" \
-    "$query_episode_count" "$query_flap_unready_since_epoch" \
-    "$query_cumulative_unready_seconds" "$query_flap_ready_since_epoch" "$query_report")
+  set -- $(update_plane_recurrence zinder-query "$query_ready" "$query_unreachable" \
+    "$now_epoch" "$query_episode_count" "$query_flap_unready_since_epoch" \
+    "$query_flap_episode_counted" "$query_cumulative_unready_seconds" \
+    "$query_flap_ready_since_epoch" "$query_report")
   query_episode_count="$1"
   query_flap_unready_since_epoch="$2"
-  query_cumulative_unready_seconds="$3"
-  query_flap_ready_since_epoch="$4"
-  query_total_unready_seconds="$5"
-  query_escalate="$6"
+  query_flap_episode_counted="$3"
+  query_cumulative_unready_seconds="$4"
+  query_flap_ready_since_epoch="$5"
+  query_total_unready_seconds="$6"
+  query_escalate="$7"
 
   if [ "$ingest_escalate" -eq 1 ]; then
     fail "zinder-ingest recurrence budget exceeded: $ingest_episode_count episode(s), ${ingest_total_unready_seconds}s unready without a sustained recovery: $ingest_report"
