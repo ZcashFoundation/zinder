@@ -34,6 +34,13 @@ explorer_secondary_path="/var/lib/zinder/explorer/secondary"
 poll_interval_seconds=15
 nofile_limit=65536
 
+# Ingest admits the Explorer view store on its own task after wallet serving
+# may already answer. The Explorer opens the store only at startup, so it waits
+# for that admission, and starts anyway after the deadline so an admission
+# failure surfaces in its own log.
+ingest_readyz_url="http://127.0.0.1:9105/readyz"
+explorer_view_admission_deadline_seconds=600
+
 # An Explorer that keeps exiting is restarted after a delay that doubles up to
 # the maximum, and returns to the initial delay once a run lasts that long.
 explorer_restart_initial_seconds=15
@@ -71,7 +78,7 @@ sleep_interruptibly() {
 }
 
 # Stops both sides and exits with the given status, or with 1 when a side still
-# runs after the grace window.
+# runs after the grace window or stops with a non-zero status.
 stop_and_exit() {
   exit_code="$1"
 
@@ -94,6 +101,27 @@ stop_and_exit() {
   if is_alive "$explorer_pid" || is_alive "$wallet_serving_pid"; then
     log "processes still running after the ${shutdown_grace_seconds}s grace window"
     exit 1
+  fi
+
+  # The wallet-serving entrypoint exits non-zero when a RocksDB owner outlived
+  # its own drain window, so a clean stop must preserve that status. An
+  # Explorer that SIGTERM ends before its handler is installed exits 143; it
+  # holds only a secondary, so that stop is clean.
+  if [ -n "$explorer_pid" ]; then
+    child_status=0
+    wait "$explorer_pid" || child_status="$?"
+    if [ "$child_status" -ne 0 ] && [ "$child_status" -ne 143 ]; then
+      log "zinder-explorer stopped with status $child_status"
+      exit_code=1
+    fi
+  fi
+  if [ -n "$wallet_serving_pid" ]; then
+    child_status=0
+    wait "$wallet_serving_pid" || child_status="$?"
+    if [ "$child_status" -ne 0 ]; then
+      log "the wallet-serving entrypoint stopped with status $child_status"
+      exit_code=1
+    fi
   fi
 
   exit "$exit_code"
@@ -141,6 +169,13 @@ run_explorer() {
     "$explorer_binary" --config "$explorer_config_path" "$@"
 }
 
+# Ingest's /readyz lists materialized_view_identities only after it admits the
+# view store, whether or not ingest itself is ready.
+explorer_views_admitted() {
+  curl -sS --connect-timeout 2 --max-time 5 "$ingest_readyz_url" 2>/dev/null \
+    | grep -q '"materialized_view_identities":\['
+}
+
 start_explorer() {
   log "starting zinder-explorer"
   (run_explorer) &
@@ -183,6 +218,21 @@ until "$wallet_serving_healthcheck" >/dev/null 2>&1; do
     exit "$wallet_serving_status"
   fi
   sleep_interruptibly "$poll_interval_seconds"
+done
+
+admission_waited_seconds=0
+until explorer_views_admitted; do
+  if [ "$admission_waited_seconds" -ge "$explorer_view_admission_deadline_seconds" ]; then
+    log "ingest has not admitted the Explorer views after ${admission_waited_seconds}s; starting zinder-explorer anyway"
+    break
+  fi
+  if ! is_alive "$wallet_serving_pid"; then
+    collect_wallet_serving_status
+    log "the wallet-serving entrypoint exited with status $wallet_serving_status; zinder-explorer was not started"
+    exit "$wallet_serving_status"
+  fi
+  sleep_interruptibly "$poll_interval_seconds"
+  admission_waited_seconds=$((admission_waited_seconds + poll_interval_seconds))
 done
 
 start_explorer
