@@ -1099,7 +1099,10 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "Deadline for the projector's canonical secondary to authenticate the \
                       writer's exact fence. A secondary behind the writer is retried with \
                       capped backoff and reported as syncing once the lag lasts longer than one \
-                      second; a same-sequence mismatch or a secondary ahead of the writer fails \
+                      second, unless the projector is ready and its wallet trails the writer by \
+                      at most one block, which keeps it ready within the tip-transition grace \
+                      described in [Service operations](service-operations.md#projector); a \
+                      same-sequence mismatch or a secondary ahead of the writer fails \
                       immediately. Must be greater than zero. Defaults to 30.",
     },
     EnvVarDoc {

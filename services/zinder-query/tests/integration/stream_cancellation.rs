@@ -7,6 +7,8 @@
 //! - A client that disconnects mid-stream must not leave the server in a
 //!   broken state. The next request through the same server has to succeed
 //!   with no cooldown.
+//! - Shutdown must end open event streams, which never end on their own, so
+//!   graceful server shutdown can drain instead of waiting forever.
 //! - The server must serve many concurrent streamed reads without
 //!   serializing them or returning errors. The default deployment shape
 //!   puts one `zinder-query` process behind several native wallet clients,
@@ -28,7 +30,9 @@ use std::time::Duration;
 use eyre::{Result, eyre};
 use tokio::net::TcpListener;
 use tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
-use tonic::transport::Server;
+use tokio_util::sync::CancellationToken;
+use tonic::{Code, transport::Server};
+use tonic_types::StatusExt as _;
 use zinder_core::Network;
 use zinder_proto::v1::wallet::{self, wallet_query_client::WalletQueryClient};
 use zinder_query::{
@@ -218,7 +222,71 @@ async fn parallel_compact_block_range_readers_all_drain_to_completion() -> Resul
     Ok(())
 }
 
+/// Bound on how long the shutdown test waits for the stream to end and the
+/// server to drain.
+const SHUTDOWN_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_ends_an_open_chain_events_stream_and_drains_the_server() -> Result<()> {
+    let shutdown = CancellationToken::new();
+    let (grpc_adapter, _store_fixture) = commit_store_and_build_adapter().await?;
+    let grpc_adapter = grpc_adapter.with_shutdown(shutdown.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let server_addr = format!("http://{}", listener.local_addr()?);
+    let server_shutdown = shutdown.clone();
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(grpc_adapter.into_server())
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(listener),
+                server_shutdown.cancelled_owned(),
+            )
+            .await
+    });
+    let mut client = WalletQueryClient::connect(server_addr).await?;
+    let mut events = client
+        .chain_events(wallet::ChainEventsRequest {
+            start: Some(wallet::EventStreamStart {
+                position: Some(wallet::event_stream_start::Position::LiveTail(
+                    wallet::LiveTail {},
+                )),
+            }),
+            family: wallet::ChainEventStreamFamily::Visible as i32,
+            address_filter: Vec::new(),
+        })
+        .await?
+        .into_inner();
+
+    shutdown.cancel();
+    let stream_end = tokio::time::timeout(SHUTDOWN_DRAIN_DEADLINE, events.next())
+        .await
+        .map_err(|_| eyre!("shutdown did not end the open chain-events stream"))?
+        .ok_or_else(|| eyre!("chain-events stream ended without a shutdown status"))?;
+    let status = stream_end
+        .err()
+        .ok_or_else(|| eyre!("an idle live-tail stream must not deliver an event"))?;
+    assert_eq!(status.code(), Code::Unavailable);
+    let readiness_cause = status
+        .get_error_details()
+        .error_info()
+        .and_then(|error_info| error_info.metadata.get("readiness_cause").cloned());
+    assert_eq!(readiness_cause.as_deref(), Some("shutting_down"));
+
+    tokio::time::timeout(SHUTDOWN_DRAIN_DEADLINE, server)
+        .await
+        .map_err(|_| eyre!("the server did not drain after its streams ended"))???;
+    Ok(())
+}
+
+type ServingAdapter =
+    WalletQueryGrpcAdapter<WalletServingQuery<(), zinder_query::AdmittedIngestControl>>;
+
 async fn commit_store_and_spawn_grpc() -> Result<String> {
+    let (grpc_adapter, store_fixture) = commit_store_and_build_adapter().await?;
+    spawn_wallet_query_server(grpc_adapter, store_fixture).await
+}
+
+async fn commit_store_and_build_adapter() -> Result<(ServingAdapter, WalletServingStoreFixture)> {
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let chain_fixture = ChainFixture::new(Network::ZcashRegtest)
         .with_raw_blob_retention(RawBlobRetention::All)
@@ -238,13 +306,11 @@ async fn commit_store_and_spawn_grpc() -> Result<String> {
         activations,
     );
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
-    spawn_wallet_query_server(grpc_adapter, store_fixture).await
+    Ok((grpc_adapter, store_fixture))
 }
 
 async fn spawn_wallet_query_server(
-    grpc_adapter: WalletQueryGrpcAdapter<
-        WalletServingQuery<(), zinder_query::AdmittedIngestControl>,
-    >,
+    grpc_adapter: ServingAdapter,
     store_fixture: WalletServingStoreFixture,
 ) -> Result<String> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;

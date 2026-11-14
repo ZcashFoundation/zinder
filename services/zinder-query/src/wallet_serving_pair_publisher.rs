@@ -423,7 +423,10 @@ where
     Ok(tokio::spawn(async move {
         let mut outage = None;
         loop {
-            let observation = probe_wallet_node_readiness(&source).await;
+            let observation = tokio::select! {
+                () = cancel.cancelled() => break,
+                observation = probe_wallet_node_readiness(&source) => observation,
+            };
             match observation {
                 Ok(snapshot) if snapshot.ready_for_queries => {
                     outage = None;
@@ -1829,6 +1832,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wallet_node_probe_stops_while_a_node_request_is_pending()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = MutableHealthSource::new()?;
+        source.stalled.store(true, Ordering::SeqCst);
+        let ingest_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+        let admitted_ingest_control =
+            AdmittedIngestControl::connect(ingest_fixture.endpoint(), None, Network::ZcashRegtest)
+                .await?;
+        let capabilities = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
+            RawBlobRetention::Transactions,
+            source.capabilities(),
+            &admitted_ingest_control,
+        );
+        let runtime = zinder_runtime::Readiness::default();
+        let readiness = WalletServingReadiness::awaiting_node_source(runtime);
+        let cancel = CancellationToken::new();
+        let handle = spawn_wallet_node_readiness_probe(
+            source.clone(),
+            &capabilities,
+            readiness,
+            Duration::from_millis(5),
+            cancel.clone(),
+        )?;
+
+        source.stalled_request_started.notified().await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), handle).await??;
+        ingest_fixture.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn wallet_ingest_control_probe_preserves_stale_snapshot_as_ready()
     -> Result<(), Box<dyn std::error::Error>> {
         let ingest_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
@@ -2143,6 +2178,8 @@ mod tests {
     struct MutableHealthSource {
         available: Arc<AtomicBool>,
         synchronized: Arc<AtomicBool>,
+        stalled: Arc<AtomicBool>,
+        stalled_request_started: Arc<tokio::sync::Notify>,
         capabilities: NodeCapabilities,
     }
 
@@ -2151,6 +2188,8 @@ mod tests {
             Ok(Self {
                 available: Arc::new(AtomicBool::new(true)),
                 synchronized: Arc::new(AtomicBool::new(true)),
+                stalled: Arc::new(AtomicBool::new(false)),
+                stalled_request_started: Arc::new(tokio::sync::Notify::new()),
                 capabilities: NodeCapabilities::new([
                     NodeCapability::TipId,
                     NodeCapability::TreeState,
@@ -2173,6 +2212,10 @@ mod tests {
         }
 
         async fn tip_id(&self) -> Result<BlockId, SourceError> {
+            if self.stalled.load(Ordering::SeqCst) {
+                self.stalled_request_started.notify_one();
+                std::future::pending::<()>().await;
+            }
             if !self.available.load(Ordering::SeqCst) {
                 return Err(SourceError::NodeUnavailable {
                     reason: "synthetic transient node outage".to_owned(),

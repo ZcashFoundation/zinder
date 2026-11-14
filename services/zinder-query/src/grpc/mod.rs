@@ -3,6 +3,7 @@
 mod adapter;
 mod chain_events;
 mod native;
+mod shutdown_stream;
 
 use tonic::Status;
 use tonic_types::{ErrorDetails, FieldViolation, PreconditionViolation};
