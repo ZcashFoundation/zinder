@@ -12,6 +12,7 @@ Start with these documents:
 - [Canonical and materialized-view architecture](architecture/canonical-materialized-view-architecture.md) explains how canonical storage, wallet state, and explorer materialized views fit together.
 - [Service operations](architecture/service-operations.md) defines health, readiness, metrics, security, and recovery behavior.
 - [Testing](runbooks/testing.md) defines the validation tiers and commands.
+- [Testnet performance](reference/testnet-performance.md) reports measured Testnet build times against lightwalletd-rs and Zaino.
 
 ## Architecture
 
@@ -41,6 +42,7 @@ Extension guides:
 - [Error vocabulary](reference/error-vocabulary.md)
 - [Integration surfaces](reference/integration-surfaces.md)
 - [Lightwalletd compatibility](reference/lightwalletd-compatibility.md)
+- [Testnet performance](reference/testnet-performance.md)
 
 ## Runbooks
 
