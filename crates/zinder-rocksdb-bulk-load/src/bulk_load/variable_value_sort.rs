@@ -100,8 +100,8 @@ impl TemporaryFileBudget {
     /// Finishing a sort with two or more runs ends in one merge that writes
     /// every record again while all of its input runs still exist, so the sort
     /// needs at least twice its total run bytes. Refusing here, before the run
-    /// is written, reports that requirement while records are still arriving
-    /// instead of after the whole input has been spilled.
+    /// is written, stops a sort that cannot finish while records are still
+    /// arriving instead of after the whole input has been spilled.
     fn reserve_merged_run(&mut self, bytes: u64) -> Result<(), BulkLoadError> {
         let required_bytes = self
             .bytes_in_use
@@ -211,7 +211,8 @@ impl<const KEY_LEN: usize> VariableValueSorter<KEY_LEN> {
             .checked_add(record_bytes)
             .ok_or_else(|| BulkLoadError::invalid("accounted record bytes exceed u64::MAX"))?;
         if required_bytes > self.max_accounted_memory_bytes {
-            self.flush_run()?;
+            self.flush_run()
+                .map_err(BulkLoadError::temporary_file_limit_before_finish)?;
         }
 
         self.staged_records.try_reserve_exact(1).map_err(|source| {
@@ -874,7 +875,7 @@ mod tests {
 
         assert!(matches!(
             refused,
-            Err(BulkLoadError::TemporaryFileLimit { limit_bytes, required_bytes })
+            Err(BulkLoadError::TemporaryFileLimitBeforeFinish { limit_bytes, required_bytes })
                 if Some(limit_bytes) == one_run_bytes.checked_mul(3)
                     && Some(required_bytes) == one_run_bytes.checked_mul(4)
         ));

@@ -132,12 +132,22 @@ pub(crate) enum ProjectorError {
     WalletStore(zinder_wallet_rocksdb::RocksDbWalletError),
 
     #[error(
-        "wallet construction needs at least {required_bytes} temporary bytes in one sorter, but projector.build.max_temporary_file_bytes_per_sorter (ZINDER_PROJECTOR__BUILD__MAX_TEMPORARY_FILE_BYTES_PER_SORTER) is {limit_bytes}; raise it above the required value and free that much space beside the wallet store, because restarting with the same setting fails again"
+        "wallet construction needs {required_bytes} temporary bytes in one sorter, but projector.build.max_temporary_file_bytes_per_sorter (ZINDER_PROJECTOR__BUILD__MAX_TEMPORARY_FILE_BYTES_PER_SORTER) is {limit_bytes}; set it to at least {required_bytes} and free that much space beside the wallet store, because restarting with the same setting fails again"
     )]
     WalletBuildTemporaryFileLimit {
         /// Configured per-sorter temporary-file ceiling.
         limit_bytes: u64,
-        /// Temporary bytes the refused sort needs at minimum.
+        /// Temporary bytes the refused sort needs.
+        required_bytes: u64,
+    },
+
+    #[error(
+        "wallet construction stopped a sorter whose input had not ended: the records so far already need {required_bytes} temporary bytes, more than projector.build.max_temporary_file_bytes_per_sorter (ZINDER_PROJECTOR__BUILD__MAX_TEMPORARY_FILE_BYTES_PER_SORTER) allows ({limit_bytes}), and the complete sort needs more; unset it to use the default of {DEFAULT_TEMPORARY_FILE_BYTES_PER_SORTER} bytes, which covers a Mainnet build from genesis, or raise it well above {required_bytes} with matching free space beside the wallet store, because restarting with the same setting fails again"
+    )]
+    WalletBuildTemporaryFileLimitBeforeFinish {
+        /// Configured per-sorter temporary-file ceiling.
+        limit_bytes: u64,
+        /// Temporary bytes required by the records sorted so far.
         required_bytes: u64,
     },
 
@@ -229,16 +239,27 @@ pub(crate) enum ProjectorError {
 
 impl From<zinder_wallet_rocksdb::RocksDbWalletError> for ProjectorError {
     fn from(error: zinder_wallet_rocksdb::RocksDbWalletError) -> Self {
+        use zinder_rocksdb_bulk_load::BulkLoadError;
+        use zinder_wallet_rocksdb::RocksDbWalletError;
+
         // An undersized spill ceiling is an operator setting, not a storage
         // fault, and every restart with the same value fails the same way.
-        if let zinder_wallet_rocksdb::RocksDbWalletError::BulkLoad(
-            zinder_rocksdb_bulk_load::BulkLoadError::TemporaryFileLimit {
-                limit_bytes,
-                required_bytes,
-            },
-        ) = error
+        if let RocksDbWalletError::BulkLoad(BulkLoadError::TemporaryFileLimit {
+            limit_bytes,
+            required_bytes,
+        }) = error
         {
             return Self::WalletBuildTemporaryFileLimit {
+                limit_bytes,
+                required_bytes,
+            };
+        }
+        if let RocksDbWalletError::BulkLoad(BulkLoadError::TemporaryFileLimitBeforeFinish {
+            limit_bytes,
+            required_bytes,
+        }) = error
+        {
+            return Self::WalletBuildTemporaryFileLimitBeforeFinish {
                 limit_bytes,
                 required_bytes,
             };
@@ -789,6 +810,29 @@ mod tests {
                 .checked_mul(2)
                 .is_some_and(|headroom| DEFAULT_TEMPORARY_FILE_BYTES_PER_SORTER >= headroom)
         );
+    }
+
+    #[test]
+    fn spill_refused_before_the_input_ended_is_not_reported_as_the_target() {
+        let error = ProjectorError::from(RocksDbWalletError::BulkLoad(
+            BulkLoadError::TemporaryFileLimitBeforeFinish {
+                limit_bytes: 68_719_476_736,
+                required_bytes: 69_000_000_000,
+            },
+        ));
+        let message = error.to_string();
+
+        assert!(matches!(
+            error,
+            ProjectorError::WalletBuildTemporaryFileLimitBeforeFinish {
+                limit_bytes: 68_719_476_736,
+                required_bytes: 69_000_000_000,
+            }
+        ));
+        assert!(message.contains("ZINDER_PROJECTOR__BUILD__MAX_TEMPORARY_FILE_BYTES_PER_SORTER"));
+        assert!(message.contains("the complete sort needs more"));
+        assert!(message.contains(&DEFAULT_TEMPORARY_FILE_BYTES_PER_SORTER.to_string()));
+        assert!(!message.contains("set it to at least"));
     }
 
     #[test]

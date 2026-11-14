@@ -47,10 +47,20 @@ pub enum BulkLoadError {
         /// Caller-supplied temporary-file byte ceiling.
         limit_bytes: u64,
         /// Peak temporary bytes required by the refused operation.
+        required_bytes: u64,
+    },
+    /// Records staged before `finish` already need more temporary-file bytes
+    /// than the ceiling allows, so the complete sort cannot fit either.
+    #[error(
+        "RocksDB bulk-load runs already require at least {required_bytes} temporary bytes before the input ended, limit is {limit_bytes}"
+    )]
+    TemporaryFileLimitBeforeFinish {
+        /// Caller-supplied temporary-file byte ceiling.
+        limit_bytes: u64,
+        /// Temporary bytes required by the records staged so far.
         ///
-        /// A refusal raised while records are still arriving reports the
-        /// requirement of the records seen so far, so the complete sort needs
-        /// at least this much and possibly more.
+        /// This is a lower bound: records the caller has not pushed yet add
+        /// to the complete requirement.
         required_bytes: u64,
     },
     /// A bounded staging allocation could not be reserved.
@@ -87,6 +97,21 @@ impl BulkLoadError {
         Self::InvalidInput {
             reason: reason.into(),
         }
+    }
+
+    /// Marks a temporary-file refusal as covering only the records seen so far.
+    fn temporary_file_limit_before_finish(self) -> Self {
+        if let Self::TemporaryFileLimit {
+            limit_bytes,
+            required_bytes,
+        } = self
+        {
+            return Self::TemporaryFileLimitBeforeFinish {
+                limit_bytes,
+                required_bytes,
+            };
+        }
+        self
     }
 }
 

@@ -1010,6 +1010,12 @@ impl From<zinder_rocksdb_bulk_load::BulkLoadError> for CanonicalStoreError {
             } => Self::block_load_sequence(format!(
                 "bulk-load runs require {required_bytes} temporary bytes, limit is {limit_bytes}"
             )),
+            zinder_rocksdb_bulk_load::BulkLoadError::TemporaryFileLimitBeforeFinish {
+                limit_bytes,
+                required_bytes,
+            } => Self::block_load_sequence(format!(
+                "bulk-load runs already require at least {required_bytes} temporary bytes before the input ended, limit is {limit_bytes}"
+            )),
             zinder_rocksdb_bulk_load::BulkLoadError::MemoryAllocation { operation, source } => {
                 Self::block_load_sequence(format!(
                     "bulk-load {operation} allocation failed: {source}"
