@@ -347,6 +347,15 @@ Watch cgroup memory, RocksDB block cache, memtables, WAL bytes, pending
 compaction, write-stop state, construction queue reservations, and disk free
 space. Store size must not determine process RSS.
 
+Explorer view replay pauses on its own when the volume holding the canonical
+store has less available space than `ingest.explorer_views_min_free_bytes`
+(10 GiB by default). Ingest logs `materialized_view_replay_volume_space_low`
+and `zinder_materialized_view_replay_volume_space_low` reads `1`. Canonical
+ingest and wallet serving keep running. Free or add space, and replay resumes
+from its persisted position once at least a tenth more than the floor is
+available. Raise the floor when other writers on the volume, such as a wallet
+rebuild, need more headroom.
+
 If construction approaches its memory boundary, stop the owner cleanly and
 reduce the source-request, reserved-response, preparation, or RocksDB budgets
 before restarting. Do not delete an admitted ready store merely to change a

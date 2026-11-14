@@ -18,10 +18,11 @@ use zinder_ingest::{
     DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL, DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL,
     HistoricalWorkGate, IngestError, LiveMempoolOwner, MaterializedViewReplayConfig,
     MaterializedViewTailer, MempoolIngestSettings, MempoolReadySignal, MempoolRetentionSettings,
-    NodeSourceKind, TransactionComponentBackfillConfig, TransactionComponentBackfillContext,
-    admit_canonical_store, canonical_control_channel, classify_phase,
-    follow_admitted_canonical_store, mempool_ready_channel, open_primary_materialized_view_store,
-    run_live_mempool_owner, run_mempool_retention, seed_backfill_owned_consumer_cursors,
+    NodeSourceKind, ReplayPrevoutCaches, TransactionComponentBackfillConfig,
+    TransactionComponentBackfillContext, VolumeSpaceGuard, admit_canonical_store,
+    canonical_control_channel, classify_phase, follow_admitted_canonical_store,
+    mempool_ready_channel, open_primary_materialized_view_store, run_live_mempool_owner,
+    run_mempool_retention, seed_backfill_owned_consumer_cursors,
     spawn_conventional_fee_distribution_backfill_task,
     spawn_materialized_view_replay_budget_metrics_task, spawn_materialized_view_tailer_task,
     spawn_runtime_memory_metrics_task, spawn_transaction_component_backfill_task,
@@ -301,8 +302,10 @@ async fn run_ingest(
         event = "explorer_views_config_resolved",
         coverage = command_config.coverage.as_kebab_case(),
         explorer_views = command_config.explorer_views,
+        explorer_views_min_free_bytes = command_config.explorer_views_min_free_bytes,
         "resolved Explorer views configuration"
     );
+    let volume_space_guard = materialized_view_plane.volume_space_guard.clone();
     let worker_tasks = IngestWorkerTaskHandles {
         upstream_health_probe: spawn_upstream_health_probe_for(
             &command_config.runtime_config.node,
@@ -323,7 +326,7 @@ async fn run_ingest(
         replay_budget_metrics: command_config.explorer_views.then(|| {
             spawn_materialized_view_replay_budget_metrics_task(
                 MaterializedViewReplayConfig::DEFAULT,
-                DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL,
+                volume_space_guard,
                 MATERIALIZED_VIEW_REPLAY_BUDGET_SAMPLE_INTERVAL,
                 readiness.clone(),
                 worker_cancel.clone(),
@@ -773,6 +776,7 @@ struct MaterializedViewPlaneSpec {
     reorg_policy: CanonicalReorgPolicy,
     chain_event_retention_window: Option<Duration>,
     cursor_at_risk_warning: Duration,
+    volume_space_guard: Option<Arc<VolumeSpaceGuard>>,
 }
 
 fn materialized_view_plane_spec(
@@ -792,6 +796,16 @@ fn materialized_view_plane_spec(
             .map_err(zinder_ingest::CanonicalWriterError::from)?,
         chain_event_retention_window: command_config.retention.chain_event_window(),
         cursor_at_risk_warning: command_config.retention.cursor_at_risk_warning(),
+        volume_space_guard: command_config
+            .explorer_views
+            .then(|| {
+                VolumeSpaceGuard::new(
+                    &runtime_config.storage_path,
+                    command_config.explorer_views_min_free_bytes,
+                )
+            })
+            .flatten()
+            .map(Arc::new),
     })
 }
 
@@ -837,6 +851,14 @@ async fn run_materialized_view_plane(
         explorer_views = true,
         "Explorer views admitted after store open"
     );
+    // Cursor seeding writes view rows before the tailer applies the guard.
+    if let Some(guard) = &spec.volume_space_guard
+        && !guard
+            .wait_for_room(DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL, &cancel)
+            .await
+    {
+        return;
+    }
     if let Err(error) = seed_backfill_owned_consumer_cursors(
         &canonical,
         &spec.activations,
@@ -859,6 +881,8 @@ async fn run_materialized_view_plane(
             reorg_window_blocks: spec.reorg_policy.reorg_window_blocks(),
             chain_event_retention_window: spec.chain_event_retention_window,
             cursor_at_risk_warning: spec.cursor_at_risk_warning,
+            prevout_caches: ReplayPrevoutCaches::default(),
+            volume_space_guard: spec.volume_space_guard,
         },
         DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL,
         historical_work_gate.clone(),
@@ -1471,6 +1495,7 @@ mod tests {
             reorg_policy: zinder_store::CanonicalReorgPolicy::new(100)?,
             chain_event_retention_window: None,
             cursor_at_risk_warning: std::time::Duration::from_mins(1),
+            volume_space_guard: None,
         };
 
         run_materialized_view_plane(

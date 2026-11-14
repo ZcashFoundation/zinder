@@ -17,8 +17,8 @@ use zinder_core::{
 };
 use zinder_ingest::{
     CanonicalConstructionConfig, CanonicalFollowConfig, CanonicalFollower, IngestError,
-    MaterializedViewReplayConfig, MaterializedViewTailer, follow_canonical_tip,
-    load_fresh_canonical, spawn_materialized_view_tailer_task,
+    MaterializedViewReplayConfig, MaterializedViewTailer, ReplayPrevoutCaches, VolumeSpaceGuard,
+    follow_canonical_tip, load_fresh_canonical, spawn_materialized_view_tailer_task,
 };
 use zinder_materialized_views::{
     BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME, BlockSummaryConsumer,
@@ -403,6 +403,65 @@ async fn the_tailer_publishes_a_live_status_and_opens_the_historical_work_gate()
     Ok(())
 }
 
+#[tokio::test]
+async fn a_volume_below_the_free_space_floor_pauses_replay_until_space_recovers()
+-> Result<(), Box<dyn Error>> {
+    let mut harness = CanonicalHarness::baseline().await?;
+    let (directory, view) = view_store()?;
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    readiness.update_admission(|admission| admission.phase = Some(IngestPhase::FollowingTip));
+    let gate = zinder_ingest::HistoricalWorkGate::new(readiness);
+    let cancel = CancellationToken::new();
+    let guard = Arc::new(VolumeSpaceGuard::new(directory.path(), 1).ok_or("guard enabled")?);
+    let mut tailer = harness.tailer(&view);
+    tailer.volume_space_guard = Some(Arc::clone(&guard));
+    let handle = spawn_materialized_view_tailer_task(
+        tailer,
+        Duration::from_millis(10),
+        gate.clone(),
+        cancel.clone(),
+    );
+
+    let phases = async {
+        wait_until(|| gate.is_open()).await?;
+        guard.set_min_free_bytes(u64::MAX);
+        wait_until(|| !gate.is_open()).await?;
+        harness.follow_to_tip().await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let paused = materialized_view_status(&view)?;
+        guard.set_min_free_bytes(0);
+        wait_until(|| {
+            gate.is_open()
+                && materialized_view_status(&view)
+                    .is_ok_and(|status| status.indexed_height == CHAIN_TIP_HEIGHT)
+        })
+        .await?;
+        Ok::<_, Box<dyn Error>>(paused)
+    }
+    .await;
+    cancel.cancel();
+    handle.await?;
+    let paused = phases?;
+
+    assert_eq!(paused.health, MaterializedViewHealth::Paused as i32);
+    assert_eq!(paused.indexed_height, BASELINE_TIP_HEIGHT);
+    assert_eq!(
+        materialized_view_status(&view)?.health,
+        MaterializedViewHealth::Live as i32
+    );
+    Ok(())
+}
+
+async fn wait_until(condition: impl Fn() -> bool + Sync) -> Result<(), Box<dyn Error>> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| "the tailer did not reach the expected state within 30 seconds".into())
+}
+
 fn view_store() -> Result<(TempDir, MaterializedViewStore), Box<dyn Error>> {
     let directory = TempDir::new()?;
     let store = open_view_store(directory.path())?;
@@ -603,6 +662,8 @@ impl CanonicalHarness {
             reorg_window_blocks: REORG_WINDOW_BLOCKS,
             chain_event_retention_window: Some(Duration::from_hours(168)),
             cursor_at_risk_warning: Duration::from_hours(24),
+            prevout_caches: ReplayPrevoutCaches::default(),
+            volume_space_guard: None,
         }
     }
 

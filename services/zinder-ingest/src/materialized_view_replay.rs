@@ -48,7 +48,8 @@ use zinder_store::{
 
 use crate::{
     CanonicalBlockContextReader, IngestError, MaterializedViewReplayConfig,
-    MaterializedViewReplayPolicy,
+    MaterializedViewReplayPolicy, PrevoutCache,
+    canonical_block_context::DEFAULT_PREVOUT_CACHE_MAX_OUTPUTS,
     chain_ingest::{ingest_error_class, outcome_status},
     conventional_fee_distribution_backfill::seed_conventional_fee_distribution_visible_tail,
     memory_pressure::RuntimeMemorySnapshot,
@@ -58,6 +59,9 @@ use crate::{
 };
 
 mod transparent_address_ranking;
+mod volume_space;
+
+pub use volume_space::{DEFAULT_EXPLORER_VIEWS_MIN_FREE_BYTES, VolumeSpaceGuard};
 
 const MATERIALIZED_VIEW_REPLAY_STAGE_READ_EVENTS: &str = "read_events";
 const MATERIALIZED_VIEW_REPLAY_STAGE_HYDRATE_BLOCKS: &str = "hydrate_blocks";
@@ -112,6 +116,7 @@ struct EffectiveMaterializedViewReplayLimits {
     memory_budget_bytes: Option<u64>,
     memory_pressure_ratio: Option<f64>,
     phase_gate_engaged: bool,
+    volume_space_low: bool,
 }
 
 /// Returns whether the current ingest phase gives the storage budget
@@ -135,6 +140,9 @@ struct MaterializedViewReplayBudget {
     phase_gate: Option<Readiness>,
     /// Process cancellation sampled at replay page boundaries.
     cancel: Option<CancellationToken>,
+    /// Free-space floor on the store volume, shared by every budget in the
+    /// process so each transition is logged once.
+    volume_space: Option<Arc<VolumeSpaceGuard>>,
 }
 
 impl MaterializedViewReplayBudget {
@@ -145,6 +153,7 @@ impl MaterializedViewReplayBudget {
             applied_state: MaterializedViewReplayBudgetState::Normal,
             phase_gate: None,
             cancel: None,
+            volume_space: None,
         }
     }
 
@@ -155,6 +164,7 @@ impl MaterializedViewReplayBudget {
             applied_state: MaterializedViewReplayBudgetState::Normal,
             phase_gate: Some(readiness),
             cancel: None,
+            volume_space: None,
         }
     }
 
@@ -169,7 +179,13 @@ impl MaterializedViewReplayBudget {
             applied_state: MaterializedViewReplayBudgetState::Normal,
             phase_gate: Some(readiness),
             cancel: Some(cancel),
+            volume_space: None,
         }
+    }
+
+    fn with_volume_space_guard(mut self, volume_space: Option<Arc<VolumeSpaceGuard>>) -> Self {
+        self.volume_space = volume_space;
+        self
     }
 
     fn is_cancelled(&self) -> bool {
@@ -206,7 +222,17 @@ impl MaterializedViewReplayBudget {
         self.memory_state =
             next_memory_budget_state(self.config, self.memory_state, memory_pressure_ratio);
         let phase_gate_engaged = phase_engages_replay_gate(phase);
-        let state = compose_replay_state(self.config, self.memory_state, phase_gate_engaged);
+        let volume_space_low = self
+            .volume_space
+            .as_deref()
+            .is_some_and(VolumeSpaceGuard::is_low);
+        let state = compose_replay_state(self.config, self.memory_state, phase_gate_engaged).max(
+            if volume_space_low {
+                MaterializedViewReplayBudgetState::Paused
+            } else {
+                MaterializedViewReplayBudgetState::Normal
+            },
+        );
         self.applied_state = state;
         EffectiveMaterializedViewReplayLimits {
             state,
@@ -219,6 +245,7 @@ impl MaterializedViewReplayBudget {
             memory_budget_bytes,
             memory_pressure_ratio,
             phase_gate_engaged,
+            volume_space_low,
         }
     }
 }
@@ -730,14 +757,56 @@ pub struct MaterializedViewTailer {
     /// Stall duration after which a consumer cursor that has not advanced is
     /// reported through [`ReadinessCause::CursorAtRisk`].
     pub cursor_at_risk_warning: Duration,
+    /// Spent-output memory replay keeps between passes.
+    pub prevout_caches: ReplayPrevoutCaches,
+    /// Free-space floor on the store volume, or `None` when the guard is off.
+    pub volume_space_guard: Option<Arc<VolumeSpaceGuard>>,
+}
+
+/// Spent-output memory the tailer keeps between replay passes.
+///
+/// Replay and the transparent-address ranking build walk different heights, so
+/// each has its own [`PrevoutCache`]. A cache holds memory only while there is
+/// history to walk. Both empty while replay is paused, which returns their
+/// memory under memory pressure. The replay cache also empties once replay
+/// reaches the canonical fence, and the ranking cache once no ranking build is
+/// pending.
+#[derive(Debug)]
+pub struct ReplayPrevoutCaches {
+    replay: Mutex<PrevoutCache>,
+    ranking_build: Mutex<PrevoutCache>,
+}
+
+impl ReplayPrevoutCaches {
+    /// Creates empty caches that each hold at most `max_outputs_per_cache`.
+    #[must_use]
+    pub fn new(max_outputs_per_cache: usize) -> Self {
+        Self {
+            replay: Mutex::new(PrevoutCache::new(max_outputs_per_cache)),
+            ranking_build: Mutex::new(PrevoutCache::new(max_outputs_per_cache)),
+        }
+    }
+
+    fn release(&self) {
+        self.replay.lock().clear();
+        self.ranking_build.lock().clear();
+    }
+}
+
+impl Default for ReplayPrevoutCaches {
+    /// Caches sized to keep each hash table within about 375 MB.
+    fn default() -> Self {
+        Self::new(DEFAULT_PREVOUT_CACHE_MAX_OUTPUTS)
+    }
 }
 
 impl MaterializedViewTailer {
     /// Replays every retained canonical transition into the materialized-view store.
     pub fn catch_up(&self) -> Result<(), IngestError> {
-        self.catch_up_with_pass(&mut ReplayPass::new(MaterializedViewReplayBudget::new(
-            self.config,
-        )))
+        self.catch_up_with_pass(&mut ReplayPass::new(
+            MaterializedViewReplayBudget::new(self.config)
+                .with_volume_space_guard(self.volume_space_guard.clone()),
+        ))
     }
 
     fn catch_up_with_pass(&self, pass: &mut ReplayPass) -> Result<(), IngestError> {
@@ -749,6 +818,11 @@ impl MaterializedViewTailer {
         self.replay_event_only_consumers(&canonical)?;
         self.join_transparent_address_ranking_at_genesis(&canonical)?;
         self.replay_block_consumers(&canonical, pass)?;
+        if pass.budget.applied_state.is_paused()
+            || matches!(self.replay_caught_up(&canonical), Ok(true))
+        {
+            self.prevout_caches.replay.lock().clear();
+        }
         self.build_transparent_address_ranking(&canonical, pass)
     }
 
@@ -1001,6 +1075,10 @@ impl MaterializedViewTailer {
     /// Only the last page advances the consumer cursors, so an interrupted
     /// transition replays from its start and re-applies the already-written
     /// pages idempotently.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the hydrator borrows the locked replay cache for every page of the range"
+    )]
     fn dispatch_committed_range(
         &self,
         canonical: &RocksDbCanonicalSecondary,
@@ -1011,7 +1089,12 @@ impl MaterializedViewTailer {
         if committed.start > committed.end {
             return self.dispatch_page(transition, committed, &HashMap::new(), true);
         }
-        let mut hydrator = CanonicalBlockContextReader::new(canonical, &self.activations);
+        let mut prevouts = self.prevout_caches.replay.lock();
+        let mut hydrator = CanonicalBlockContextReader::with_prevout_cache(
+            canonical,
+            &self.activations,
+            &mut prevouts,
+        );
         let mut next_height = committed.start;
         let mut first_page = true;
         while next_height <= committed.end {
@@ -1240,10 +1323,13 @@ impl MaterializedViewTailer {
         }
     }
 
+    /// Opens historical work only while replay covers the canonical tip and
+    /// the store volume is above its free-space floor.
     fn refresh_historical_work_gate(
         &self,
         canonical: &RocksDbCanonicalSecondary,
         historical_work_gate: &HistoricalWorkGate,
+        volume_space_low: bool,
     ) {
         let caught_up = self.replay_caught_up(canonical).unwrap_or_else(|error| {
             tracing::warn!(
@@ -1254,7 +1340,7 @@ impl MaterializedViewTailer {
             );
             false
         });
-        historical_work_gate.set_materialized_views_caught_up(caught_up);
+        historical_work_gate.set_materialized_views_caught_up(caught_up && !volume_space_low);
     }
 
     fn replay_caught_up(&self, canonical: &RocksDbCanonicalSecondary) -> Result<bool, IngestError> {
@@ -1423,7 +1509,8 @@ async fn run_materialized_view_tailer(
         tailer.config,
         historical_work_gate.readiness().runtime_readiness(),
         cancel.clone(),
-    );
+    )
+    .with_volume_space_guard(tailer.volume_space_guard.clone());
     let mut cursor_risk = CursorRiskWatch::new(&tailer, historical_work_gate.readiness());
     loop {
         let effective_limits = budget.evaluate_current();
@@ -1434,10 +1521,16 @@ async fn run_materialized_view_tailer(
         );
         {
             let canonical = tailer.canonical.read();
-            tailer.refresh_historical_work_gate(&canonical, &historical_work_gate);
+            tailer.refresh_historical_work_gate(
+                &canonical,
+                &historical_work_gate,
+                effective_limits.volume_space_low,
+            );
             tailer.persist_status(&canonical, effective_limits.state);
         }
-        if !effective_limits.state.is_paused() {
+        if effective_limits.state.is_paused() {
+            tailer.prevout_caches.release();
+        } else {
             budget = run_materialized_view_tailer_pass(&tailer, budget).await;
         }
         if let Some(cursor_risk) = cursor_risk.as_mut() {
@@ -1484,7 +1577,10 @@ async fn run_materialized_view_tailer_pass(
             "materialized-view tailer failed to replay canonical transitions; retrying"
         );
     }
-    budget.unwrap_or_else(|| MaterializedViewReplayBudget::new(tailer.config))
+    budget.unwrap_or_else(|| {
+        MaterializedViewReplayBudget::new(tailer.config)
+            .with_volume_space_guard(tailer.volume_space_guard.clone())
+    })
 }
 
 const SECONDS_PER_HOUR: u64 = 3_600;
@@ -1634,21 +1730,22 @@ fn log_phase_gate_transition(
 #[must_use = "drop the handle to detach the materialized-view replay budget sampler or await it for symmetric shutdown"]
 pub fn spawn_materialized_view_replay_budget_metrics_task(
     materialized_view_config: MaterializedViewReplayConfig,
-    poll_interval: Duration,
+    volume_space_guard: Option<Arc<VolumeSpaceGuard>>,
     sample_interval: Duration,
     readiness: Readiness,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut replay_budget =
-            MaterializedViewReplayBudget::with_phase_gate(materialized_view_config, readiness);
+            MaterializedViewReplayBudget::with_phase_gate(materialized_view_config, readiness)
+                .with_volume_space_guard(volume_space_guard);
         let mut last_phase_gate_engaged: Option<bool> = None;
         loop {
             let effective_limits = replay_budget.evaluate_current();
             record_materialized_view_replay_budget(
                 materialized_view_config.replay_policy,
                 effective_limits,
-                poll_interval,
+                DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL,
             );
             log_phase_gate_transition(
                 materialized_view_config.replay_policy,
@@ -2003,6 +2100,13 @@ fn record_materialized_view_replay_budget(
     );
     metrics::gauge!("zinder_materialized_view_replay_phase_gate").set(
         if effective_limits.phase_gate_engaged {
+            1.0
+        } else {
+            0.0
+        },
+    );
+    metrics::gauge!("zinder_materialized_view_replay_volume_space_low").set(
+        if effective_limits.volume_space_low {
             1.0
         } else {
             0.0

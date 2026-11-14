@@ -24,14 +24,17 @@ pub use artifact_builder::{
     PositionedCanonicalBlock, PreparedCanonicalBlock, RawBlobPolicy, RetainedRawBlobs,
     position_canonical_block, prepare_canonical_block,
 };
-pub use canonical_block_context::{CanonicalBlockContextReader, require_genesis_complete_history};
+pub use canonical_block_context::{
+    CanonicalBlockContextReader, PrevoutCache, require_genesis_complete_history,
+};
 pub use chain_ingest::{IngestError, NodeSourceKind};
 pub use conventional_fee_distribution_backfill::{
     ConventionalFeeDistributionBackfillConfig, ConventionalFeeDistributionBackfillContext,
     spawn_conventional_fee_distribution_backfill_task,
 };
 pub use materialized_view_replay::{
-    DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL, MaterializedViewTailer,
+    DEFAULT_EXPLORER_VIEWS_MIN_FREE_BYTES, DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL,
+    MaterializedViewTailer, ReplayPrevoutCaches, VolumeSpaceGuard,
     open_primary_materialized_view_store, seed_backfill_owned_consumer_cursors,
     spawn_materialized_view_replay_budget_metrics_task, spawn_materialized_view_tailer_task,
 };

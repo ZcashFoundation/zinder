@@ -302,6 +302,18 @@ The build reads every canonical block from height 1 and resumes after a
 restart. `ExplorerQuery.ServerInfo` advertises both capabilities once the
 ranking activates.
 
+### Keep Explorer views from filling the volume
+
+Explorer views live inside the canonical store directory, so they share its
+volume. Ingest pauses view replay while that volume has less available space
+than `ZINDER_INGEST__EXPLORER_VIEWS_MIN_FREE_BYTES`, 10 GiB by default. It
+logs `materialized_view_replay_volume_space_low`, and `ExplorerQuery.ServerInfo`
+reports the views as paused. Canonical ingest and wallet serving keep running.
+
+To resume, grow the volume or free space on it. Replay continues from its
+persisted position once at least a tenth more than the floor is available.
+Set the variable to `0` only on a volume whose space you watch separately.
+
 ### Rebuild Explorer views after a manifest change
 
 Each release admits only a materialized-view store whose recorded consumers

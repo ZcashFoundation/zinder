@@ -361,6 +361,29 @@ build Git commit, and network. Important runtime metrics include:
 The last two counters are expected to remain zero and protect the canonical
 block-local boundary.
 
+### Explorer view replay
+
+- `zinder_materialized_view_replay_height` and
+  `zinder_materialized_view_replay_lag_blocks` report the shared replay
+  position and its distance from the canonical tip.
+- `zinder_materialized_view_replay_paused` is `1` while replay is paused for
+  any reason. `zinder_materialized_view_replay_phase_gate` and
+  `zinder_materialized_view_replay_volume_space_low` show whether canonical
+  bulk catch-up or the free-space guard holds it.
+- `zinder_materialized_view_replay_volume_available_bytes` and
+  `zinder_materialized_view_replay_volume_min_free_bytes` report the last
+  sample of the store volume and the configured
+  `ingest.explorer_views_min_free_bytes`.
+- `zinder_materialized_view_prevout_resolutions_total{source}` counts the
+  distinct spent outputs each hydrated range resolved, by where they were
+  found: `range`, `cache`, or `canonical`.
+- `zinder_materialized_view_prevout_block_reads_total` counts the producing
+  blocks read from canonical storage to resolve the `canonical` share.
+
+A steady `canonical` share while replay walks history means the prevout cache
+is missing outputs, for example after a restart, and the producing-block reads
+set the replay speed.
+
 ### Mempool owner
 
 - `zinder_mempool_lifecycle_state{status}` is a one-hot gauge over the closed
@@ -498,6 +521,11 @@ events include:
 - `canonical_unpublished_construction_restarted`
 - `canonical_live_append_committed`
 - `canonical_live_replacement_committed`
+
+Explorer view replay logs `materialized_view_replay_volume_space_low` once
+when the free-space guard pauses replay and
+`materialized_view_replay_volume_space_recovered` once when it resumes. Both
+carry `available_bytes` and `min_free_bytes`.
 
 Messages explain the event for humans; automation keys on structured fields.
 Logs may include bounded heights, epoch numbers, sequence numbers, durations,

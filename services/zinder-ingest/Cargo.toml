@@ -38,6 +38,9 @@ zinder-runtime.workspace = true
 zinder-source.workspace = true
 zinder-store.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [lints]
 workspace = true
 

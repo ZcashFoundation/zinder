@@ -3,10 +3,18 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
-use std::{collections::BTreeMap, error::Error, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    error::Error,
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
+use metrics_exporter_prometheus::PrometheusBuilder;
 use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
 use zcash_primitives::transaction::{Authorized, Transaction as ZcashTransaction, TransactionData};
 use zebra_chain::{
     block::Block as ZebraBlock,
@@ -20,9 +28,13 @@ use zinder_core::{
     ShieldedProtocol, TransactionId, TransparentOutPoint, UnixTimestampMillis,
 };
 use zinder_ingest::{
-    CanonicalBlockContextReader, CanonicalConstructionConfig, IngestError, RawBlobPolicy,
-    load_fresh_canonical, prepare_canonical_block, require_genesis_complete_history,
+    CanonicalBlockContextReader, CanonicalConstructionConfig, CanonicalFollowConfig,
+    CanonicalFollower, DEFAULT_MAX_REPLACEMENT_BYTES, IngestError, PrevoutCache, RawBlobPolicy,
+    follow_canonical_tip, load_fresh_canonical, prepare_canonical_block,
+    require_genesis_complete_history,
 };
+use zinder_materialized_views::BlockCommitContext;
+use zinder_runtime::{ComposedReadiness, Readiness};
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceChainSegment, SourceChainSegmentLimits,
     SourceError,
@@ -43,6 +55,7 @@ use super::fixture_block::{
 
 const SERIALIZED_HEADER_PARENT_OFFSET: usize = 4;
 const SERIALIZED_HEADER_PARENT_END: usize = SERIALIZED_HEADER_PARENT_OFFSET + 32;
+const SERIALIZED_HEADER_TIME_OFFSET: usize = 100;
 const COINBASE_HEIGHT_OPCODE_OFFSET: usize = 1_534;
 const CHAIN_TIP_HEIGHT: u32 = 4;
 const SAPLING_BLOCK_HEIGHT: u32 = 2;
@@ -50,6 +63,8 @@ const SPENDING_BLOCK_HEIGHT: u32 = 3;
 const ORCHARD_BLOCK_HEIGHT: u32 = 4;
 const SPEND_OUTPUT_VALUE_ZAT: u64 = 12_345;
 const REORG_WINDOW_BLOCKS: u32 = 100;
+const FORK_PARENT_HEIGHT: u32 = 2;
+const REPLACEMENT_TIP_HEIGHT: u32 = 5;
 
 #[tokio::test]
 async fn canonical_block_contexts_carry_header_transaction_and_intrinsic_facts()
@@ -214,6 +229,134 @@ async fn cross_block_transparent_spends_resolve_from_the_producing_block()
 }
 
 #[tokio::test]
+async fn a_prevout_cache_resolves_spends_from_earlier_ranges_without_reading_the_producing_block()
+-> Result<(), Box<dyn Error>> {
+    let harness = CanonicalHarness::genesis_complete().await?;
+    let activations = sample_regtest_upgrade_activations();
+    let expected = CanonicalBlockContextReader::new(harness.secondary(), &activations)
+        .read_block_commit_contexts(chain_range())?;
+    let mut prevouts = PrevoutCache::new(1_024);
+
+    let (paged, reads) = with_prevout_metrics(|| {
+        let mut reader = CanonicalBlockContextReader::with_prevout_cache(
+            harness.secondary(),
+            &activations,
+            &mut prevouts,
+        );
+        let mut contexts = HashMap::new();
+        for height in chain_range() {
+            contexts.extend(
+                reader.read_block_commit_contexts(BlockHeightRange::inclusive(height, height))?,
+            );
+        }
+        Ok(contexts)
+    })?;
+
+    assert_same_spends(&paged, &expected)?;
+    assert_eq!(reads.producing_block_reads, 0);
+    assert_eq!(reads.from_cache, 1);
+    assert_eq!(reads.from_canonical, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_prevout_cache_reads_canonical_storage_after_a_disconnected_range()
+-> Result<(), Box<dyn Error>> {
+    let harness = CanonicalHarness::genesis_complete().await?;
+    let activations = sample_regtest_upgrade_activations();
+    let expected = CanonicalBlockContextReader::new(harness.secondary(), &activations)
+        .read_block_commit_contexts(chain_range())?;
+    let mut prevouts = PrevoutCache::new(1_024);
+    let first = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(1));
+    let spending = BlockHeightRange::inclusive(
+        BlockHeight::new(SPENDING_BLOCK_HEIGHT),
+        BlockHeight::new(SPENDING_BLOCK_HEIGHT),
+    );
+
+    let (contexts, reads) = with_prevout_metrics(|| {
+        let mut contexts = CanonicalBlockContextReader::with_prevout_cache(
+            harness.secondary(),
+            &activations,
+            &mut prevouts,
+        )
+        .read_block_commit_contexts(first)?;
+        contexts.extend(
+            CanonicalBlockContextReader::with_prevout_cache(
+                harness.secondary(),
+                &activations,
+                &mut prevouts,
+            )
+            .read_block_commit_contexts(spending)?,
+        );
+        Ok(contexts)
+    })?;
+
+    assert_same_spends(&contexts, &expected)?;
+    assert_eq!(reads.from_cache, 0);
+    assert_eq!(reads.from_canonical, 1);
+    assert_eq!(reads.producing_block_reads, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_prevout_cache_rereads_outputs_whose_producing_block_a_reorg_replaced()
+-> Result<(), Box<dyn Error>> {
+    let activations = sample_regtest_upgrade_activations();
+    let ForkedSpendChains {
+        original,
+        replacement,
+        first_spend_output,
+    } = forked_spend_chains()?;
+    let mut harness = CanonicalHarness::forkable(original).await?;
+    let mut prevouts = PrevoutCache::new(1_024);
+    {
+        let mut reader = CanonicalBlockContextReader::with_prevout_cache(
+            harness.secondary(),
+            &activations,
+            &mut prevouts,
+        );
+        for height in chain_range() {
+            reader.read_block_commit_contexts(BlockHeightRange::inclusive(height, height))?;
+        }
+    }
+    assert!(!prevouts.is_empty());
+
+    harness.reorg_to(replacement).await?;
+    let tip = BlockHeightRange::inclusive(
+        BlockHeight::new(REPLACEMENT_TIP_HEIGHT),
+        BlockHeight::new(REPLACEMENT_TIP_HEIGHT),
+    );
+    let expected = CanonicalBlockContextReader::new(harness.secondary(), &activations)
+        .read_block_commit_contexts(tip)?;
+    let (contexts, reads) = with_prevout_metrics(|| {
+        CanonicalBlockContextReader::with_prevout_cache(
+            harness.secondary(),
+            &activations,
+            &mut prevouts,
+        )
+        .read_block_commit_contexts(tip)
+    })?;
+
+    assert_same_spends(&contexts, &expected)?;
+    let spends = contexts
+        .get(&BlockHeight::new(REPLACEMENT_TIP_HEIGHT))
+        .and_then(|context| context.transparent_spends())
+        .ok_or("transparent spends must be hydrated")?;
+    let spend = spends
+        .get(&first_spend_output)
+        .ok_or("the replacement tip must spend the first spend's output")?;
+    assert_eq!(
+        spend.spent_block_hash,
+        harness
+            .block_at(BlockHeight::new(SPENDING_BLOCK_HEIGHT))?
+            .hash
+    );
+    assert_eq!(reads.from_cache, 0);
+    assert_eq!(reads.from_canonical, 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn unresolvable_transparent_prevouts_fail_hydration() -> Result<(), Box<dyn Error>> {
     let fabricated = TransactionId::from_bytes([0x5c; 32]);
     let harness = CanonicalHarness::spending(TransparentOutPoint::new(fabricated, 0)).await?;
@@ -259,6 +402,129 @@ async fn materialized_view_hydration_requires_genesis_complete_history()
     Ok(())
 }
 
+/// Two chains that mine the same transparent spend at [`SPENDING_BLOCK_HEIGHT`]
+/// in different blocks; only the replacement extends to a block spending it.
+struct ForkedSpendChains {
+    original: BTreeMap<BlockHeight, SourceBlock>,
+    replacement: BTreeMap<BlockHeight, SourceBlock>,
+    first_spend_output: TransparentOutPoint,
+}
+
+fn forked_spend_chains() -> Result<ForkedSpendChains, Box<dyn Error>> {
+    let coinbase = coinbase_chain()?;
+    let produced = coinbase
+        .get(&BlockHeight::new(1))
+        .ok_or("the chain must start at height 1")?;
+    let first_spend = Arc::new(spending_transaction(TransparentOutPoint::new(
+        coinbase_transaction_id(produced)?,
+        0,
+    ))?);
+    let original = chain_through(CHAIN_TIP_HEIGHT, 0, &|height| {
+        Ok(if height == SPENDING_BLOCK_HEIGHT {
+            vec![Arc::clone(&first_spend)]
+        } else {
+            Vec::new()
+        })
+    })?;
+    let first_spend_output = TransparentOutPoint::new(
+        source_block_facts(
+            original
+                .get(&BlockHeight::new(SPENDING_BLOCK_HEIGHT))
+                .ok_or("the chain must contain the spending block")?,
+        )?
+        .transactions
+        .get(1)
+        .ok_or("the spending block must carry the first spend")?
+        .public_facts
+        .transaction_id,
+        0,
+    );
+    let second_spend = Arc::new(spending_transaction(first_spend_output)?);
+    let replacement = chain_through(REPLACEMENT_TIP_HEIGHT, 1, &|height| {
+        Ok(match height {
+            SPENDING_BLOCK_HEIGHT => vec![Arc::clone(&first_spend)],
+            REPLACEMENT_TIP_HEIGHT => vec![Arc::clone(&second_spend)],
+            _ => Vec::new(),
+        })
+    })?;
+    Ok(ForkedSpendChains {
+        original,
+        replacement,
+        first_spend_output,
+    })
+}
+
+/// Prevout resolution counters recorded while one closure hydrated.
+struct PrevoutReads {
+    from_cache: u64,
+    from_canonical: u64,
+    producing_block_reads: u64,
+}
+
+fn with_prevout_metrics<T>(
+    hydrate: impl FnOnce() -> Result<T, IngestError>,
+) -> Result<(T, PrevoutReads), Box<dyn Error>> {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let hydrated = metrics::with_local_recorder(&recorder, hydrate)?;
+    let rendered = handle.render();
+    Ok((
+        hydrated,
+        PrevoutReads {
+            from_cache: counter_value(
+                &rendered,
+                "zinder_materialized_view_prevout_resolutions_total{source=\"cache\"}",
+            ),
+            from_canonical: counter_value(
+                &rendered,
+                "zinder_materialized_view_prevout_resolutions_total{source=\"canonical\"}",
+            ),
+            producing_block_reads: counter_value(
+                &rendered,
+                "zinder_materialized_view_prevout_block_reads_total",
+            ),
+        },
+    ))
+}
+
+fn counter_value(rendered: &str, series: &str) -> u64 {
+    rendered
+        .lines()
+        .filter_map(|line| line.strip_prefix(series)?.trim().parse::<u64>().ok())
+        .sum()
+}
+
+/// Asserts that every block in `hydrated` carries the spend facts the
+/// uncached whole-range hydration derived for that block's inputs.
+fn assert_same_spends(
+    hydrated: &HashMap<BlockHeight, Arc<BlockCommitContext>>,
+    expected: &HashMap<BlockHeight, Arc<BlockCommitContext>>,
+) -> Result<(), Box<dyn Error>> {
+    for (height, context) in hydrated {
+        let expected_context = expected
+            .get(height)
+            .ok_or_else(|| format!("expected hydration must cover height {}", height.value()))?;
+        let spends = context
+            .transparent_spends()
+            .ok_or("transparent spends must be hydrated")?;
+        let expected_spends = expected_context
+            .transparent_spends()
+            .ok_or("transparent spends must be hydrated")?;
+        for input in context
+            .transactions
+            .iter()
+            .flat_map(|transaction| &transaction.transparent_inputs)
+            .filter(|input| !input.spent_outpoint.is_coinbase_sentinel())
+        {
+            let spend = spends
+                .get(&input.spent_outpoint)
+                .ok_or("every non-coinbase input must resolve")?;
+            assert_eq!(Some(spend), expected_spends.get(&input.spent_outpoint));
+        }
+    }
+    Ok(())
+}
+
 const fn chain_range() -> BlockHeightRange {
     BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(CHAIN_TIP_HEIGHT))
 }
@@ -267,7 +533,7 @@ const fn chain_range() -> BlockHeightRange {
 struct CanonicalHarness {
     blocks: BTreeMap<BlockHeight, SourceBlock>,
     secondary: RocksDbCanonicalSecondary,
-    _store: RocksDbCanonicalStore,
+    store: Option<RocksDbCanonicalStore>,
     _temporary: TempDir,
 }
 
@@ -317,13 +583,39 @@ impl CanonicalHarness {
         Self::publish(blocks, build_plan).await
     }
 
+    /// Publishes `blocks` with only the fork parent settled, so a later
+    /// [`Self::reorg_to`] can replace every height above it.
+    async fn forkable(blocks: BTreeMap<BlockHeight, SourceBlock>) -> Result<Self, Box<dyn Error>> {
+        let first_block = blocks
+            .values()
+            .next()
+            .ok_or("the chain must not be empty")?
+            .clone();
+        let build_plan = CanonicalStoreBuildPlan::complete(
+            &sample_regtest_upgrade_activations(),
+            first_block.block_time_seconds.saturating_sub(1),
+            block_id(&blocks, CHAIN_TIP_HEIGHT)?,
+            zinder_store::RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
+        )?;
+        Self::publish_settled_at(blocks, build_plan, FORK_PARENT_HEIGHT).await
+    }
+
     async fn publish(
         blocks: BTreeMap<BlockHeight, SourceBlock>,
         build_plan: CanonicalStoreBuildPlan,
     ) -> Result<Self, Box<dyn Error>> {
+        Self::publish_settled_at(blocks, build_plan, CHAIN_TIP_HEIGHT).await
+    }
+
+    async fn publish_settled_at(
+        blocks: BTreeMap<BlockHeight, SourceBlock>,
+        build_plan: CanonicalStoreBuildPlan,
+        settled_height: u32,
+    ) -> Result<Self, Box<dyn Error>> {
         let temporary = TempDir::new()?;
         let store_path = temporary.path().join("canonical");
-        let store = build_canonical_store(&store_path, &blocks, build_plan).await?;
+        let store = build_canonical_store(&store_path, &blocks, build_plan, settled_height).await?;
         let secondary = RocksDbCanonicalSecondary::open_ready(
             &store_path,
             temporary.path().join("canonical-secondary"),
@@ -336,9 +628,53 @@ impl CanonicalHarness {
         Ok(Self {
             blocks,
             secondary,
-            _store: store,
+            store: Some(store),
             _temporary: temporary,
         })
+    }
+
+    /// Follows the canonical writer onto `blocks`, replacing every height
+    /// where they differ from the published chain, and catches the secondary up.
+    async fn reorg_to(
+        &mut self,
+        blocks: BTreeMap<BlockHeight, SourceBlock>,
+    ) -> Result<(), Box<dyn Error>> {
+        let activations = Arc::new(sample_regtest_upgrade_activations());
+        let tip_height = blocks
+            .keys()
+            .next_back()
+            .copied()
+            .ok_or("the replacement chain must not be empty")?;
+        let source = StaticChainSource {
+            checkpoints: chain_checkpoints(&blocks, &activations)?,
+            blocks: blocks.clone(),
+        };
+        let store = self
+            .store
+            .take()
+            .ok_or("the canonical store must be open")?;
+        let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+        let cancel = CancellationToken::new();
+        let follower = CanonicalFollower::new(
+            &source,
+            activations,
+            CanonicalFollowConfig {
+                request_timeout: Duration::from_secs(5),
+                poll_interval: Duration::ZERO,
+                lag_threshold_blocks: 0,
+                target_height: Some(tip_height),
+                event_retention_window: None,
+                event_retention_check_interval: Duration::from_secs(1),
+                mempool_ready_gate: None,
+                max_replacement_bytes: DEFAULT_MAX_REPLACEMENT_BYTES,
+            },
+            &readiness,
+            &cancel,
+        );
+        self.store = Some(follow_canonical_tip(store, follower).await?);
+        self.secondary.try_catch_up()?;
+        self.blocks = blocks;
+        Ok(())
     }
 
     const fn secondary(&self) -> &RocksDbCanonicalSecondary {
@@ -356,6 +692,7 @@ async fn build_canonical_store(
     store_path: &Path,
     blocks: &BTreeMap<BlockHeight, SourceBlock>,
     build_plan: CanonicalStoreBuildPlan,
+    settled_height: u32,
 ) -> Result<RocksDbCanonicalStore, Box<dyn Error>> {
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let builder = RocksDbCanonicalBuilder::create_fresh(
@@ -375,7 +712,7 @@ async fn build_canonical_store(
     let built = load_fresh_canonical(builder, &source, &construction).await?;
     let validated = built.builder.prepare_cold_certified_publication()?;
     let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
-        block_id(blocks, CHAIN_TIP_HEIGHT)?,
+        block_id(blocks, settled_height)?,
         UnixTimestampMillis::new(1_783_933_200_000),
     ))?;
     Ok(validated.publish_baseline(publication)?)
@@ -584,12 +921,30 @@ type ExtraTransactions<'chain> =
 fn chain_with_extra_transactions(
     extra_transactions: ExtraTransactions<'_>,
 ) -> Result<BTreeMap<BlockHeight, SourceBlock>, Box<dyn Error>> {
+    chain_through(CHAIN_TIP_HEIGHT, 0, extra_transactions)
+}
+
+/// Builds heights `1..=tip_height` on the coinbase fixture.
+///
+/// Every block above [`FORK_PARENT_HEIGHT`] shifts its header time by
+/// `fork_time_nonce`, so chains built with different nonces fork there even
+/// when they carry the same transactions.
+fn chain_through(
+    tip_height: u32,
+    fork_time_nonce: u8,
+    extra_transactions: ExtraTransactions<'_>,
+) -> Result<BTreeMap<BlockHeight, SourceBlock>, Box<dyn Error>> {
     let mut parent_hash = Network::ZcashRegtest.genesis_hash();
     let mut blocks = BTreeMap::new();
-    for height in 1..=CHAIN_TIP_HEIGHT {
+    for height in 1..=tip_height {
         let block = chained_source_block(
             BlockHeight::new(height),
             parent_hash,
+            if height > FORK_PARENT_HEIGHT {
+                fork_time_nonce
+            } else {
+                0
+            },
             extra_transactions(height)?,
         )?;
         parent_hash = block.hash;
@@ -675,6 +1030,7 @@ fn without_transparent_inputs(
 fn chained_source_block(
     height: BlockHeight,
     parent_hash: BlockHash,
+    time_nonce: u8,
     extra_transactions: Vec<Arc<ZebraTransaction>>,
 ) -> Result<SourceBlock, Box<dyn Error>> {
     let fixture = fixture_source_block()?;
@@ -683,6 +1039,10 @@ fn chained_source_block(
         .get_mut(SERIALIZED_HEADER_PARENT_OFFSET..SERIALIZED_HEADER_PARENT_END)
         .ok_or("fixture block is too short to carry a parent hash")?
         .copy_from_slice(&parent_hash.as_bytes());
+    let block_time = raw_block_bytes
+        .get_mut(SERIALIZED_HEADER_TIME_OFFSET)
+        .ok_or("fixture block is too short to carry a block time")?;
+    *block_time = block_time.wrapping_add(time_nonce);
     let coinbase_height_opcode = raw_block_bytes
         .get_mut(COINBASE_HEIGHT_OPCODE_OFFSET)
         .ok_or("fixture block is too short to carry a coinbase height")?;

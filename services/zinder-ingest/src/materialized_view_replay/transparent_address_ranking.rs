@@ -24,7 +24,9 @@ use super::{
     MaterializedViewTailer, ReplayPass, fence_cursor, materialized_view_write_guard,
     persisted_chain_event_cursor, replay_page,
 };
-use crate::{CanonicalBlockContextReader, IngestError, require_genesis_complete_history};
+use crate::{
+    CanonicalBlockContextReader, IngestError, PrevoutCache, require_genesis_complete_history,
+};
 
 /// Longest one replay pass extends the ranking build over settled history
 /// before it yields, so the other views keep following new canonical events.
@@ -73,6 +75,7 @@ impl MaterializedViewTailer {
         pass: &mut ReplayPass,
     ) -> Result<(), IngestError> {
         if !transparent_address_ranking_is_unpublished(&self.materialized_view_store)? {
+            self.prevout_caches.ranking_build.lock().clear();
             return Ok(());
         }
         let Some(cursor) = persisted_chain_event_cursor(&self.materialized_view_store)? else {
@@ -84,25 +87,30 @@ impl MaterializedViewTailer {
         {
             return Ok(());
         }
-        RankingBuild::resume(self, canonical, chain_epoch)?.run(pass, cursor)
+        let mut prevouts = self.prevout_caches.ranking_build.lock();
+        RankingBuild::resume(self, canonical, &mut prevouts, chain_epoch)?.run(pass, cursor)
     }
 }
 
 /// One replay pass's share of a ranking build pinned to a canonical fence.
-struct RankingBuild<'tailer> {
-    store: &'tailer MaterializedViewStore,
-    hydrator: CanonicalBlockContextReader<'tailer>,
+struct RankingBuild<'build> {
+    store: &'build MaterializedViewStore,
+    hydrator: CanonicalBlockContextReader<'build>,
     chain_epoch: ChainEpoch,
     generation: u64,
     resumed_through: BlockHeight,
 }
 
-impl<'tailer> RankingBuild<'tailer> {
+impl<'build> RankingBuild<'build> {
     /// Resumes the inactive build under this fence's visible tip, or starts
     /// one from genesis.
+    ///
+    /// The build walks settled history in order across passes, so `prevouts`
+    /// carries the outputs earlier passes saw produced.
     fn resume(
-        tailer: &'tailer MaterializedViewTailer,
-        canonical: &'tailer RocksDbCanonicalSecondary,
+        tailer: &'build MaterializedViewTailer,
+        canonical: &'build RocksDbCanonicalSecondary,
+        prevouts: &'build mut PrevoutCache,
         chain_epoch: ChainEpoch,
     ) -> Result<Self, IngestError> {
         let store = &tailer.materialized_view_store;
@@ -138,7 +146,11 @@ impl<'tailer> RankingBuild<'tailer> {
         }
         Ok(Self {
             store,
-            hydrator: CanonicalBlockContextReader::new(canonical, &tailer.activations),
+            hydrator: CanonicalBlockContextReader::with_prevout_cache(
+                canonical,
+                &tailer.activations,
+                prevouts,
+            ),
             chain_epoch,
             generation,
             resumed_through,

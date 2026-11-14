@@ -211,6 +211,13 @@ impl CanonicalWriterFixture {
         })
     }
 
+    /// Returns the filesystem path of the canonical primary, for tests that
+    /// open their own secondary over it.
+    #[must_use]
+    pub fn canonical_primary_path(&self) -> &std::path::Path {
+        &self.canonical_primary_path
+    }
+
     /// Returns the admitted canonical primary.
     ///
     /// # Errors

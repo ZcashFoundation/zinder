@@ -217,6 +217,21 @@ canonical, because every row below a canonical block is canonical too. When the
 view wrote its newest height, the settled tip was at least that height minus the
 reorg window, so no replacement reaches below that window.
 
+Hydration resolves each transparent input's previous output from the hydrated
+range, then from an in-memory prevout cache of outputs that earlier ranges
+produced, and last from the producing block's canonical replay row. The cache
+answers only for a range that extends the last block it applied, so results
+never depend on it.
+
+Replay pauses while the volume that holds the canonical store, and therefore
+the view store, has less available space than
+`ingest.explorer_views_min_free_bytes` (10 GiB by default). Startup cursor
+seeding waits behind the same floor. Replay resumes on its own once at least a
+tenth more than that is available. Canonical ingest and
+wallet serving keep running while the views are paused.
+[ADR-0034](../adrs/0034-exclusive-index-build-stages-and-block-local-spend-replay.md)
+records the resolution order, the cache bound, and the guard.
+
 Consumers that make completeness claims persist `MaterializedViewState`
 beside their rows. It records the canonical epoch, materialized-view tip, revision,
 and optional contiguous `MaterializedViewCoverage`. Cursor position alone is

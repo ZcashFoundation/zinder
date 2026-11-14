@@ -4,7 +4,12 @@
 //! materialized-view consumers require are therefore derived here rather than
 //! read from a dedicated family: final note-commitment roots come from the
 //! persisted tree-state checkpoints plus compact-block commitments, and
-//! transparent spend facts come from the producing block's replay row.
+//! transparent spend facts come from the output the spend names. That output
+//! is found in the hydrated range, then in an optional [`PrevoutCache`] of
+//! outputs earlier ranges produced, and last in the producing block's replay
+//! row.
+
+mod prevout_cache;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -26,6 +31,9 @@ use zinder_materialized_views::{
 use zinder_store::RocksDbCanonicalSecondary;
 
 use crate::{CanonicalBlockConstructionError, IngestError};
+
+pub(crate) use prevout_cache::DEFAULT_PREVOUT_CACHE_MAX_OUTPUTS;
+pub use prevout_cache::PrevoutCache;
 
 /// First height a canonical store retains when its history is complete.
 const GENESIS_COMPLETE_FIRST_HEIGHT: BlockHeight = BlockHeight::new(1);
@@ -56,10 +64,14 @@ pub struct CanonicalBlockContextReader<'canonical> {
     secondary: &'canonical RocksDbCanonicalSecondary,
     activations: &'canonical NetworkUpgradeActivations,
     roots: FinalRootsCursor,
+    prevouts: Option<&'canonical mut PrevoutCache>,
 }
 
 impl<'canonical> CanonicalBlockContextReader<'canonical> {
     /// Binds one hydrator to an admitted canonical secondary.
+    ///
+    /// Every spent output produced before a hydrated range is read from its
+    /// producing block.
     #[must_use]
     pub const fn new(
         secondary: &'canonical RocksDbCanonicalSecondary,
@@ -69,6 +81,26 @@ impl<'canonical> CanonicalBlockContextReader<'canonical> {
             secondary,
             activations,
             roots: FinalRootsCursor { accumulator: None },
+            prevouts: None,
+        }
+    }
+
+    /// Binds one hydrator that resolves spent outputs through `prevouts`.
+    ///
+    /// The cache answers for outputs that earlier connected ranges produced,
+    /// including ranges an earlier reader hydrated through the same cache, and
+    /// learns the outputs each hydrated range produces and spends.
+    #[must_use]
+    pub const fn with_prevout_cache(
+        secondary: &'canonical RocksDbCanonicalSecondary,
+        activations: &'canonical NetworkUpgradeActivations,
+        prevouts: &'canonical mut PrevoutCache,
+    ) -> Self {
+        Self {
+            secondary,
+            activations,
+            roots: FinalRootsCursor { accumulator: None },
+            prevouts: Some(prevouts),
         }
     }
 
@@ -146,7 +178,27 @@ impl<'canonical> CanonicalBlockContextReader<'canonical> {
         Ok(roots)
     }
 
+    /// Resolves every non-coinbase input in `blocks`, then teaches the cache
+    /// what the blocks produced and spent.
+    ///
+    /// The cache learns a range only after all of its inputs resolve, so a
+    /// failed range leaves it at the last fully hydrated block.
     fn resolve_transparent_spends(
+        &mut self,
+        blocks: &[CanonicalBlockFacts],
+    ) -> Result<HashMap<TransparentOutPoint, TransparentSpendFact>, IngestError> {
+        if let (Some(prevouts), Some(first_block)) = (self.prevouts.as_deref_mut(), blocks.first())
+        {
+            prevouts.connect(&first_block.block_header);
+        }
+        let spends = self.resolve_spend_requests(blocks)?;
+        if let Some(prevouts) = self.prevouts.as_deref_mut() {
+            prevouts.apply(blocks);
+        }
+        Ok(spends)
+    }
+
+    fn resolve_spend_requests(
         &self,
         blocks: &[CanonicalBlockFacts],
     ) -> Result<HashMap<TransparentOutPoint, TransparentSpendFact>, IngestError> {
@@ -159,7 +211,21 @@ impl<'canonical> CanonicalBlockContextReader<'canonical> {
             .map(|request| request.outpoint)
             .collect::<HashSet<_>>();
         let mut produced = produced_outputs_in_range(blocks, &requested);
-        self.read_produced_outputs_below_range(&requested, &mut produced)?;
+        let resolved_in_range = produced.len();
+        let resolved_from_cache = self.prevouts.as_deref().map_or(0, |prevouts| {
+            prevouts.resolve_into(&requested, &mut produced)
+        });
+        let producing_block_reads =
+            self.read_produced_outputs_below_range(&requested, &mut produced)?;
+        record_prevout_resolutions(PrevoutResolutionCounts {
+            in_range: resolved_in_range,
+            from_cache: resolved_from_cache,
+            from_canonical: requested
+                .len()
+                .saturating_sub(resolved_in_range)
+                .saturating_sub(resolved_from_cache),
+            producing_block_reads,
+        });
         requests
             .into_iter()
             .map(|request| {
@@ -171,11 +237,13 @@ impl<'canonical> CanonicalBlockContextReader<'canonical> {
             .collect()
     }
 
+    /// Reads the outputs `produced` still lacks from their producing blocks and
+    /// returns how many producing blocks it read.
     fn read_produced_outputs_below_range(
         &self,
         requested: &HashSet<TransparentOutPoint>,
         produced: &mut HashMap<TransparentOutPoint, ProducedOutput>,
-    ) -> Result<(), IngestError> {
+    ) -> Result<usize, IngestError> {
         let mut locations = HashMap::new();
         let mut by_producing_height =
             BTreeMap::<BlockHeight, Vec<(TransparentOutPoint, u32)>>::new();
@@ -189,6 +257,7 @@ impl<'canonical> CanonicalBlockContextReader<'canonical> {
                 .or_default()
                 .push((*outpoint, location.tx_index_in_block));
         }
+        let producing_block_reads = by_producing_height.len();
         for (height, outpoints) in by_producing_height {
             let block = self.secondary.block_replay_facts_at(height)?;
             for (outpoint, tx_index_in_block) in outpoints {
@@ -201,7 +270,7 @@ impl<'canonical> CanonicalBlockContextReader<'canonical> {
                 );
             }
         }
-        Ok(())
+        Ok(producing_block_reads)
     }
 
     fn transaction_location(
@@ -361,6 +430,7 @@ impl SpendRequest {
 }
 
 /// One previous output located at the block that mined it.
+#[derive(Clone, Copy, Debug)]
 struct ProducedOutput {
     value_zat: u64,
     address_script_hash: TransparentAddressScriptHash,
@@ -483,6 +553,31 @@ const fn prevout_unresolved(outpoint: TransparentOutPoint, reason: &'static str)
         output_index: outpoint.output_index,
         reason,
     }
+}
+
+/// Where one hydrated range's distinct spent outputs were found.
+#[derive(Clone, Copy)]
+struct PrevoutResolutionCounts {
+    in_range: usize,
+    from_cache: usize,
+    from_canonical: usize,
+    producing_block_reads: usize,
+}
+
+fn record_prevout_resolutions(counts: PrevoutResolutionCounts) {
+    for (source, resolved) in [
+        ("range", counts.in_range),
+        ("cache", counts.from_cache),
+        ("canonical", counts.from_canonical),
+    ] {
+        metrics::counter!(
+            "zinder_materialized_view_prevout_resolutions_total",
+            "source" => source
+        )
+        .increment(u64::try_from(resolved).unwrap_or(u64::MAX));
+    }
+    metrics::counter!("zinder_materialized_view_prevout_block_reads_total")
+        .increment(u64::try_from(counts.producing_block_reads).unwrap_or(u64::MAX));
 }
 
 fn intrinsic_value_balances(
