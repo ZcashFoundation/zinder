@@ -124,7 +124,7 @@ density)
 arm3-one)
   MODE=${1:?mode}; LANES=${2:?lanes}; PROFILE=${3:-summed}; TAG=${4:-arm3}
   run $TAG-$MODE $SPIKE replay --fixture "$FIX" --golden "$(golden $MODE)" --work "$WORK/$TAG-$MODE" \
-    --mode $MODE --pressure-lanes $LANES --budget-profile $PROFILE \
+    --mode $MODE --pressure-lanes $LANES --budget-profile $PROFILE --pressure-families ${PFAM:-all} \
     --secondary-dir "$WORK/$TAG-$MODE.secondary" --secondary-poll-ms 1000 \
     --samples "$OUT/$TAG-$MODE.samples.jsonl" --report "$OUT/$TAG-$MODE.json" --label $TAG
   rm -rf "$WORK/$TAG-$MODE" "$WORK/$TAG-$MODE.secondary"
