@@ -1,0 +1,6 @@
+kind: changed
+body: "The `zinder-wallet-serving` image now passes each process every `ZINDER_*` variable in the sections its binary defines, so any documented `zinder-ingest`, `zinder-projector`, or `zinder-query` variable, such as `ZINDER_PROJECTOR__BUILD__MAX_TEMPORARY_FILE_BYTES_PER_SORTER`, can be set on the container and reaches only the processes that read it. Variables no process reads are logged by name at startup. The construction deadlines are now set by `ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE_SECONDS` (default `10800`) and `ZINDER_WALLET_SERVING__WALLET_CONSTRUCTION_DEADLINE_SECONDS` (default `7200`); a Mainnet build from an empty volume needs the longer values in the wallet-serving runbook. The image now refuses to start without `ZINDER_NODE__INDEXER_GRPC_ADDR`, because JSON-RPC mempool polling drops ingest readiness at every block; set it to the node's indexer gRPC URL before upgrading. The supervisor no longer restarts the container over brief readiness drains: an answered unready stretch counts toward its flap budget only after 60 seconds."
+time: 2026-11-14T12:00:00Z
+custom:
+  Bump: minor
+  PR: "166"
