@@ -1,0 +1,6 @@
+kind: added
+body: "Releases now publish the Explorer. The `ghcr.io/zcashfoundation/zinder-explorer` image can replace the locally built Explorer in the Compose overlay when it is pulled and started without a build, and the GNU/Linux binary archives include the `zinder-explorer` executable. For hosts that attach one volume to one container, such as Railway, the new `ghcr.io/zcashfoundation/zinder-wallet-serving-explorer` image runs wallet serving with Explorer views enabled on ingest. It serves `ExplorerQuery` on port 9068 and Explorer operations on port 9069, and starts the Explorer once wallet serving answers. If the Explorer exits, only the Explorer restarts, and wallet serving continues. The image healthcheck covers wallet serving alone, so monitor Explorer readiness on port 9069. `ZINDER_EXPLORER__*` variables reach only the Explorer. A volume built by `zinder-wallet-serving` can switch to this image: ingest then builds the Explorer views from canonical history. See the wallet-serving deployment runbook."
+time: 2026-11-14T12:00:00Z
+custom:
+  Bump: minor
+  PR: "165"

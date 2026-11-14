@@ -84,25 +84,26 @@ validate_release_images_catalog() {
 
   jq -e '
     type == "array"
-    and length == 4
+    and length == 5
     and all(.[]; type == "string" and test("^zinder-[a-z0-9-]+$"))
     and ([.[]] | unique | length) == length
   ' "$release_images_catalog" >/dev/null || {
     cat >&2 <<'EOF'
 release admission rejected: the release image catalog must be a JSON array of
-four unique, safely named Zinder runtime images.
+five unique, safely named Zinder runtime images.
 EOF
     exit 1
   }
 
   required_release_images="$({
-    printf '%s\n' zinder-ingest zinder-projector zinder-query zinder-compat-lightwalletd
+    printf '%s\n' zinder-ingest zinder-projector zinder-query zinder-compat-lightwalletd zinder-explorer
   } | sort)"
   configured_release_images="$(jq -r '.[]' "$release_images_catalog" | sort)"
   if [[ "$configured_release_images" != "$required_release_images" ]]; then
     cat >&2 <<'EOF'
 release admission rejected: the release image catalog must contain exactly
-ingest, projector, native query, and lightwalletd compatibility images.
+ingest, projector, native query, lightwalletd compatibility, and Explorer
+images.
 EOF
     exit 1
   fi
@@ -117,11 +118,12 @@ validate_single_volume_images_catalog() {
     exit 1
   }
 
-  if ! jq -e 'type == "array" and (sort == ["zinder-canonical-runtime", "zinder-wallet-serving"])' \
+  if ! jq -e 'type == "array" and (sort == ["zinder-canonical-runtime", "zinder-wallet-serving", "zinder-wallet-serving-explorer"])' \
     "$single_volume_images_catalog" > /dev/null 2>&1; then
     cat >&2 <<'EOF'
 release admission rejected: the single-volume image catalog must contain
-exactly the canonical-runtime canary and the wallet-serving image.
+exactly the canonical-runtime canary, the wallet-serving image, and the
+wallet-serving image with the Explorer.
 EOF
     exit 1
   fi
@@ -603,14 +605,6 @@ EOF
     exit 1
   fi
 
-  if grep -Eq '"zinder-explorer:zinder-explorer"' "$release_workflow"; then
-    cat >&2 <<'EOF'
-release admission rejected: the release image set does not publish the optional
-explorer runtime.
-EOF
-    exit 1
-  fi
-
   # These literals are workflow expressions and shell variables being inspected.
   # shellcheck disable=SC2016
   if ! grep -Fq 'release_images: ${{ steps.images.outputs.release_images }}' \
@@ -642,7 +636,7 @@ EOF
       <<< "$binary_export_stage" | sort
   )"
   if [[ "$exported_binary_catalog" != "$configured_release_images" ]] \
-    || grep -Eq 'zinder-(bench|explorer|compat-cipherscan|proto-codegen)' <<< "$binary_export_stage" \
+    || grep -Eq 'zinder-(bench|compat-cipherscan|proto-codegen)' <<< "$binary_export_stage" \
     || ! grep -Fq 'ARG RUST_VERSION=1.95.0' "$dockerfile" \
     || ! grep -Eq '^ARG RUST_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$dockerfile" \
     || ! grep -Eq '^ARG DEBIAN_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$dockerfile" \
@@ -657,7 +651,7 @@ EOF
     || ! grep -Fq 'libstdc++6' "$dockerfile"; then
     cat >&2 <<'EOF'
 release admission rejected: the Docker release-binaries target must export
-exactly the four runtime catalog binaries with the pinned reproducible GNU
+exactly the runtime catalog binaries with the pinned reproducible GNU
 build inputs and runtime libstdc++ dependency.
 EOF
     exit 1

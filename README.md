@@ -44,11 +44,12 @@ compatibility protocols over immutable exact-fence pairs. A separate
 [single-volume container target](docs/runbooks/deploying-wallet-serving.md)
 runs ingest, projector, and native query as supervised processes when a host
 can attach one volume to only one container; that image omits
-`zinder-compat-lightwalletd` and is published beside the four runtime images. Explorer
-images are also outside the release catalog.
+`zinder-compat-lightwalletd` and is published beside the runtime images. A
+variant of it also runs `zinder-explorer`, and the Explorer has its own runtime
+image for hosts that share a volume across containers.
 
 Tagged releases also provide checksum-bound GNU/Linux bundles containing these
-same 4 executables for `x86_64-v3` and AArch64 hosts. The x86 archive
+same 4 executables plus `zinder-explorer` for `x86_64-v3` and AArch64 hosts. The x86 archive
 requires an x86-64-v3 CPU; both archives require glibc 2.34 or newer and
 dynamic `libstdc++.so.6` with `GLIBCXX_3.4.30`, with Debian 12 Bookworm as the
 certified runtime baseline. Each archive is accompanied by an SPDX 2.3 SBOM
@@ -171,9 +172,9 @@ The release workflow builds these deployable services:
 The `zinder-query` crate also owns the internal `WalletQueryApi`,
 `WalletServingQuery`, request types, shared exact-fence serving-pair publisher,
 and native adapter.
-`zinder-explorer` and
-`zinder-compat-cipherscan` compile as optional services but are not release
-images.
+`zinder-explorer` is an optional runtime with its own release image.
+`zinder-compat-cipherscan` compiles as an optional service but is not a release
+image.
 
 ## Validation Gate
 

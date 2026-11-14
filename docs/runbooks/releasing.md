@@ -1,20 +1,21 @@
 # Releasing Zinder
 
 Zinder releases one lockstep product version across every first-party crate and
-service. A tagged release publishes 4 multi-architecture runtime images, 2
+service. A tagged release publishes 5 multi-architecture runtime images, 3
 multi-architecture single-volume host images, the
 native protocol source and descriptor, generated OpenAPI documents, and one
 GitHub Release. It also publishes deterministic GNU/Linux binary bundles for
 x86-64-v3 and AArch64 and the Rust SDK formed by `zinder-core`, `zinder-proto`,
-and `zinder-client` to crates.io in dependency order. The optional explorer and
-Cipherscan services, benchmark executable, code-generation tools, and internal
-Rust crates are not release artifacts.
+and `zinder-client` to crates.io in dependency order. The optional Cipherscan
+service, benchmark executable, code-generation tools, and internal Rust crates
+are not release artifacts.
 
 `deploy/release-images.json` is the authoritative runtime image and binary
-set. `deploy/release-single-volume-images.json` lists the two single-volume
-host images, `zinder-canonical-runtime` and `zinder-wallet-serving`, which
-package those runtime binaries with an entrypoint and are published as images
-only. Every image is a target of `deploy/Dockerfile`. The PR smoke build and
+set: ingest, projector, native query, lightwalletd compatibility, and the
+optional Explorer. `deploy/release-single-volume-images.json` lists the three
+single-volume host images, `zinder-canonical-runtime`,
+`zinder-wallet-serving`, and `zinder-wallet-serving-explorer`, which package
+those runtime binaries with an entrypoint and are published as images only. Every image is a target of `deploy/Dockerfile`. The PR smoke build and
 tagged release both consume the exact catalog values validated by their
 admission job.
 
@@ -187,7 +188,7 @@ After approval, the workflow performs these operations in order:
    side by side. The primary job validates the catalog, embedded commit, ELF
    machine, dynamic libraries, symbol ceilings, and clean Debian runtime
    probes, and generates one SPDX 2.3 SBOM from the auditable archive.
-4. In the primary job, build the 4 runtime images and 2 single-volume host
+4. In the primary job, build the 5 runtime images and 3 single-volume host
    images natively for Linux amd64 and arm64 from the same binary stage with
    BuildKit max-mode provenance and SBOMs, and confirm each image carries the
    archived binaries byte for byte.
@@ -200,7 +201,7 @@ After approval, the workflow performs these operations in order:
    keyless-sign that checksum file into `SHA256SUMS.sigstore.json`.
 8. Publish the draft GitHub Release, then verify its immutable release
    attestation and every asset.
-9. For a stable release, promote the 6 `latest` tags only after immutable
+9. For a stable release, promote the 8 `latest` tags only after immutable
    release verification succeeds.
 
 Stable and prerelease tags publish the same three-crate SDK catalog.
@@ -312,16 +313,19 @@ for image in \
   zinder-query \
   zinder-compat-lightwalletd \
   zinder-canonical-runtime \
-  zinder-wallet-serving
+  zinder-wallet-serving \
+  zinder-explorer \
+  zinder-wallet-serving-explorer
 do
   docker buildx imagetools inspect \
     "ghcr.io/zcashfoundation/${image}:v0.9.0"
 done
 ```
 
-The `v0.9.0` example loops over the 6 runtime images. Releases before
-`v0.9.0-rc.1` publish only the first 4; drop `zinder-canonical-runtime` and
-`zinder-wallet-serving` from the loop when verifying one of those releases.
+The loop lists the 8 images that current releases publish. Releases through
+`v0.10.0`, including the `v0.9.0` example, publish only the first 6, and
+releases before `v0.9.0-rc.1` publish only the first 4. Drop the names a
+release does not publish when verifying it.
 
 The first release that publishes a new image name creates its GHCR package as
 private. An organization admin must set the package visibility to public once.
@@ -338,7 +342,7 @@ The GitHub Release must contain `zinder.v1.descriptor.bin`, the versioned
 SPDX 2.3 JSON SBOMs, `SHA256SUMS`, and `SHA256SUMS.sigstore.json`. The API
 archive contains the exact native `.proto` source closure alongside OpenAPI and
 the descriptor. Each binary archive is rooted and contains exactly `bin/` with
-the 4 runtime executables plus
+the 5 runtime executables plus
 `BUILD-INFO.json`, `LICENSE`, `README.md`, and an internal `SHA256SUMS`. Each
 image must contain amd64 and arm64 runtime manifests, and its OCI revision
 label must equal the tag-target commit. Binary SBOMs describe the recoverable
@@ -401,15 +405,16 @@ Image SBOM evidence may contain another runtime-named Rust package only when
 the owning service declares it as a production dependency. In particular,
 `zinder-compat-lightwalletd` includes and must report `zinder-query`. A
 single-volume host image must report exactly the executables its target
-copies: `zinder-canonical-runtime` reports `zinder-ingest`, and
+copies: `zinder-canonical-runtime` reports `zinder-ingest`,
 `zinder-wallet-serving` reports `zinder-ingest`, `zinder-projector`, and
-`zinder-query`. All other sibling runtime packages remain rejected. If image evidence fails, regenerate
+`zinder-query`, and `zinder-wallet-serving-explorer` reports those 3 plus
+`zinder-explorer`. All other sibling runtime packages remain rejected. If image evidence fails, regenerate
 the SBOM from the exact child digest and compare its runtime-named packages
 with the owning service manifest before changing the policy. Do not remove a
 declared dependency from the evidence or broaden the allowed package set.
 
 If only the final stable promotion fails, rerun the failed
-`promote stable image tags` job. It verifies all 6 exact manifests before moving
+`promote stable image tags` job. It verifies all 8 exact manifests before moving
 any `latest` tag. Do not move a release tag or rebuild it from another commit.
 
 Application rollback remains constrained by storage compatibility. Follow the

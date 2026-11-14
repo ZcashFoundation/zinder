@@ -69,6 +69,7 @@ expected_members="$({
     "$archive_root/SHA256SUMS" \
     "$archive_root/bin/" \
     "$archive_root/bin/zinder-compat-lightwalletd" \
+    "$archive_root/bin/zinder-explorer" \
     "$archive_root/bin/zinder-ingest" \
     "$archive_root/bin/zinder-projector" \
     "$archive_root/bin/zinder-query"
@@ -103,6 +104,7 @@ expected_files="$({
     README.md \
     SHA256SUMS \
     bin/zinder-compat-lightwalletd \
+    bin/zinder-explorer \
     bin/zinder-ingest \
     bin/zinder-projector \
     bin/zinder-query
@@ -181,6 +183,7 @@ jq -e \
     and .source_date_epoch == $source_date_epoch
     and ([.binaries[].name] | sort) == [
       "zinder-compat-lightwalletd",
+      "zinder-explorer",
       "zinder-ingest",
       "zinder-projector",
       "zinder-query"

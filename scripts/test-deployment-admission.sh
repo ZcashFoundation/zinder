@@ -467,13 +467,21 @@ while IFS= read -r omitted_image; do
     --release-images-catalog "$omitted_image_catalog"
 done < <(jq -r '.[]' "$release_images_catalog")
 
-explorer_release_images_catalog="$temporary_directory/catalog-with-explorer.json"
-jq '. + ["zinder-explorer"]' \
-  "$release_images_catalog" > "$explorer_release_images_catalog"
+bench_release_images_catalog="$temporary_directory/catalog-with-bench.json"
+jq '. + ["zinder-bench"]' \
+  "$release_images_catalog" > "$bench_release_images_catalog"
 expect_rejected \
-  "a release image catalog containing the optional explorer" \
+  "a release image catalog containing the benchmark" \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
-  --release-images-catalog "$explorer_release_images_catalog"
+  --release-images-catalog "$bench_release_images_catalog"
+
+swapped_release_images_catalog="$temporary_directory/catalog-with-bench-for-explorer.json"
+jq 'map(if . == "zinder-explorer" then "zinder-bench" else . end)' \
+  "$release_images_catalog" > "$swapped_release_images_catalog"
+expect_rejected \
+  "a release image catalog naming the benchmark instead of the Explorer" \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --release-images-catalog "$swapped_release_images_catalog"
 
 mixed_release_images_catalog="$temporary_directory/catalog-with-mixed-runtime.json"
 jq '.[0] = "zinder-single-container"' \

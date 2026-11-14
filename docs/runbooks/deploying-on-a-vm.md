@@ -5,8 +5,8 @@ topology. Four independent processes share one host filesystem:
 `zinder-ingest` owns canonical storage, `zinder-projector` owns the wallet
 projection, and `zinder-query` plus `zinder-compat-lightwalletd` independently
 serve immutable canonical and wallet secondary pairs. The optional explorer
-overlay builds a local `zinder-explorer` image for named explorer consumers;
-it is not part of the published release-image catalog. The single-volume host
+overlay adds `zinder-explorer` for named explorer consumers; it is not part of
+the certified four-runtime topology. The single-volume host
 images that a release also publishes are separate deployment shapes, described
 in [Wallet-serving deployment (single-volume hosts)](deploying-wallet-serving.md),
 and are not this topology.
@@ -80,9 +80,10 @@ and the `ghcr.io/gustavovalverde/` image namespace.
 
 Use `aarch64-unknown-linux-gnu` on AArch64. Inspect `BUILD-INFO.json`, the
 internal `SHA256SUMS`, and the accompanying SPDX SBOM before installation. The
-4 executables still require separate service configuration, storage paths,
-control secrets, process supervision, and the ownership order documented below;
-downloading the bundle does not create a mixed single-process deployment.
+5 executables, including the optional `zinder-explorer`, still require
+separate service configuration, storage paths, control secrets, process
+supervision, and the ownership order documented below; downloading the bundle
+does not create a mixed single-process deployment.
 
 ### Deploy with Compose
 
@@ -249,7 +250,27 @@ docker compose --env-file /etc/zinder/env \
   up -d --build
 ```
 
-The overlay builds `zinder-explorer`, opens a process-owned materialized-view
+With `--build`, the overlay builds `zinder-explorer` from the checked-out
+source. To run the released image instead, set
+`ZINDER_EXPLORER_IMAGE=ghcr.io/zcashfoundation/zinder-explorer:vX.Y.Z` in
+`/etc/zinder/env`, then pull it and start the Explorer without a build:
+
+```bash
+docker compose --env-file /etc/zinder/env \
+  -f deploy/docker-compose.yml \
+  -f deploy/docker-compose.explorer.yml \
+  pull zinder-explorer
+docker compose --env-file /etc/zinder/env \
+  -f deploy/docker-compose.yml \
+  -f deploy/docker-compose.explorer.yml \
+  up -d --no-build zinder-explorer
+```
+
+Do not pass `--build` while `ZINDER_EXPLORER_IMAGE` names a released image.
+Compose then builds from source and tags the local result with the release
+name.
+
+The Explorer opens a process-owned materialized-view
 secondary, and federates `WalletQuery` over the shared loopback namespace. The
 runtime does not open a canonical secondary. It publishes gRPC and ops
 endpoints on host loopback using `ZINDER_EXPLORER_HOST_PORT` and

@@ -1,0 +1,271 @@
+#!/bin/sh
+
+set -eu
+
+# Runs the wallet-serving runtime entrypoint, which supervises zinder-ingest,
+# zinder-projector, and zinder-query over /var/lib/zinder, and starts
+# zinder-explorer once native wallet serving answers. The Explorer opens the
+# materialized-view store that ingest writes and composes its wallet reads
+# through zinder-query. A wallet-serving exit stops the Explorer and ends the
+# container. An Explorer exit restarts only the Explorer, with a growing delay,
+# because an Explorer view failure must not take wallet serving down.
+
+# Indexer TLS values delivered as *_PEM variables become root-prepared files
+# readable only by zinder before either side starts, so the Explorer receives
+# the same *_PATH variables as the wallet-serving processes. The second pass
+# finds no *_PEM variable and continues.
+# shellcheck source=deploy/materialize-indexer-tls
+. /usr/local/lib/zinder/materialize-indexer-tls
+materialize_indexer_tls
+if [ "$indexer_tls_pem_present" -eq 1 ]; then
+  exec env \
+    -u ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM \
+    -u ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM \
+    -u ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM \
+    "$0" "$@"
+fi
+
+wallet_serving_entrypoint="/usr/local/bin/zinder-wallet-serving-runtime-entrypoint"
+wallet_serving_healthcheck="/usr/local/bin/zinder-wallet-serving-healthcheck"
+explorer_binary="/usr/local/bin/zinder-explorer"
+explorer_config_path="/etc/zinder/explorer.toml"
+explorer_secondary_path="/var/lib/zinder/explorer/secondary"
+
+poll_interval_seconds=15
+nofile_limit=65536
+
+# Ingest admits the Explorer view store on its own task after wallet serving
+# may already answer. The Explorer opens the store only at startup, so it waits
+# for that admission, and starts anyway after the deadline so an admission
+# failure surfaces in its own log.
+ingest_readyz_url="http://127.0.0.1:9105/readyz"
+explorer_view_admission_deadline_seconds=600
+
+# An Explorer that keeps exiting is restarted after a delay that doubles up to
+# the maximum, and returns to the initial delay once a run lasts that long.
+explorer_restart_initial_seconds=15
+explorer_restart_max_seconds=300
+
+# Railway drains this container for 30 seconds, and the wallet-serving
+# entrypoint gives its own processes 20 of them.
+shutdown_grace_seconds=25
+
+wallet_serving_pid=""
+wallet_serving_status=0
+explorer_pid=""
+explorer_started_at=0
+explorer_restart_at=0
+explorer_restart_delay_seconds=0
+sleep_pid=""
+
+log() {
+  printf '%s zinder-wallet-serving-explorer-runtime: %s\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >&2
+}
+
+is_alive() {
+  [ -n "$1" ] && kill -0 "$1" 2>/dev/null
+}
+
+# Sleeps in a child process so a signal reaches the trap immediately, and
+# reaps every child that exited during the interval so the liveness checks
+# observe exits instead of unreaped entries.
+sleep_interruptibly() {
+  sleep "$1" &
+  sleep_pid="$!"
+  wait "$sleep_pid" 2>/dev/null || true
+  sleep_pid=""
+}
+
+# Stops both sides and exits with the given status, or with 1 when a side still
+# runs after the grace window or stops with a non-zero status.
+stop_and_exit() {
+  exit_code="$1"
+
+  trap - INT TERM
+  for child_pid in "$explorer_pid" "$wallet_serving_pid"; do
+    if [ -n "$child_pid" ]; then
+      kill -s TERM "$child_pid" 2>/dev/null || true
+    fi
+  done
+  if [ -n "$sleep_pid" ]; then
+    kill -s TERM "$sleep_pid" 2>/dev/null || true
+  fi
+
+  remaining_seconds="$shutdown_grace_seconds"
+  while [ "$remaining_seconds" -gt 0 ] \
+    && { is_alive "$explorer_pid" || is_alive "$wallet_serving_pid"; }; do
+    sleep_interruptibly 1
+    remaining_seconds=$((remaining_seconds - 1))
+  done
+  if is_alive "$explorer_pid" || is_alive "$wallet_serving_pid"; then
+    log "processes still running after the ${shutdown_grace_seconds}s grace window"
+    exit 1
+  fi
+
+  # The wallet-serving entrypoint exits non-zero when a RocksDB owner outlived
+  # its own drain window, so a clean stop must preserve that status. An
+  # Explorer that SIGTERM ends before its handler is installed exits 143; it
+  # holds only a secondary, so that stop is clean.
+  if [ -n "$explorer_pid" ]; then
+    child_status=0
+    wait "$explorer_pid" || child_status="$?"
+    if [ "$child_status" -ne 0 ] && [ "$child_status" -ne 143 ]; then
+      log "zinder-explorer stopped with status $child_status"
+      exit_code=1
+    fi
+  fi
+  if [ -n "$wallet_serving_pid" ]; then
+    child_status=0
+    wait "$wallet_serving_pid" || child_status="$?"
+    if [ "$child_status" -ne 0 ]; then
+      log "the wallet-serving entrypoint stopped with status $child_status"
+      exit_code=1
+    fi
+  fi
+
+  exit "$exit_code"
+}
+
+fail() {
+  log "$*"
+  stop_and_exit 1
+}
+
+# ShellCheck cannot see function references embedded in trap actions.
+# shellcheck disable=SC2329
+forward_signal() {
+  log "forwarding SIG$1 to zinder-explorer and the wallet-serving processes"
+  stop_and_exit 0
+}
+
+trap 'forward_signal INT' INT
+trap 'forward_signal TERM' TERM
+
+# The wallet-serving entrypoint exits on its own only when its topology failed.
+# It exits zero only after a signal this script forwarded, so a zero status
+# seen here still reports a failure. Runs in this shell, not a command
+# substitution, because only the parent can wait for the process.
+collect_wallet_serving_status() {
+  wallet_serving_status=0
+  wait "$wallet_serving_pid" || wallet_serving_status="$?"
+  if [ "$wallet_serving_status" -eq 0 ]; then
+    wallet_serving_status=1
+  fi
+}
+
+# Runs zinder-explorer as zinder with the given extra arguments. The Explorer
+# shares only [network] and [node] with the wallet-serving processes; its
+# storage, listeners, and bind policy come from its own config.
+run_explorer() {
+  for variable_name in $(env | sed -n 's/^\(ZINDER_[A-Z0-9_]*\)=.*/\1/p'); do
+    case "$variable_name" in
+      ZINDER_NETWORK__* | ZINDER_NODE__* | ZINDER_EXPLORER__*) ;;
+      *) unset "$variable_name" ;;
+    esac
+  done
+  unset INGEST_CONTROL_BEARER_TOKEN CHECKPOINT_BEARER_TOKEN
+  exec setpriv --reuid=zinder --regid=zinder --init-groups --no-new-privs \
+    "$explorer_binary" --config "$explorer_config_path" "$@"
+}
+
+# Ingest's /readyz lists materialized_view_identities only after it admits the
+# view store, whether or not ingest itself is ready.
+explorer_views_admitted() {
+  curl -sS --connect-timeout 2 --max-time 5 "$ingest_readyz_url" 2>/dev/null \
+    | grep -q '"materialized_view_identities":\['
+}
+
+start_explorer() {
+  log "starting zinder-explorer"
+  (run_explorer) &
+  explorer_pid="$!"
+  explorer_started_at="$(date +%s)"
+}
+
+# The runtime shell implements the open-file resource POSIX leaves undefined.
+# shellcheck disable=SC3045
+ulimit -n "$nofile_limit" \
+  || fail "could not raise the open-file limit to $nofile_limit"
+
+mkdir -p "$explorer_secondary_path"
+chown -R zinder:zinder "$(dirname "$explorer_secondary_path")"
+
+# An invalid Explorer configuration fails the deployment here, before wallet
+# serving spends hours building readiness, instead of on every Explorer start.
+if ! (run_explorer --print-config) >/dev/null; then
+  fail "zinder-explorer rejected its configuration; wallet serving was not started"
+fi
+
+# Every Zinder binary rejects a ZINDER_* variable naming a section it does not
+# own, so ZINDER_EXPLORER__* overrides reach only the Explorer.
+log "starting wallet serving"
+(
+  for variable_name in $(env | sed -n 's/^\(ZINDER_EXPLORER__[A-Z0-9_]*\)=.*/\1/p'); do
+    unset "$variable_name"
+  done
+  exec "$wallet_serving_entrypoint"
+) &
+wallet_serving_pid="$!"
+
+# The healthcheck passes once query admits traffic, or while query serves the
+# typed refusal of a parked canonical writer, which the wallet-serving
+# entrypoint keeps up.
+until "$wallet_serving_healthcheck" >/dev/null 2>&1; do
+  if ! is_alive "$wallet_serving_pid"; then
+    collect_wallet_serving_status
+    log "the wallet-serving entrypoint exited with status $wallet_serving_status before serving"
+    exit "$wallet_serving_status"
+  fi
+  sleep_interruptibly "$poll_interval_seconds"
+done
+
+admission_waited_seconds=0
+until explorer_views_admitted; do
+  if [ "$admission_waited_seconds" -ge "$explorer_view_admission_deadline_seconds" ]; then
+    log "ingest has not admitted the Explorer views after ${admission_waited_seconds}s; starting zinder-explorer anyway"
+    break
+  fi
+  if ! is_alive "$wallet_serving_pid"; then
+    collect_wallet_serving_status
+    log "the wallet-serving entrypoint exited with status $wallet_serving_status; zinder-explorer was not started"
+    exit "$wallet_serving_status"
+  fi
+  sleep_interruptibly "$poll_interval_seconds"
+  admission_waited_seconds=$((admission_waited_seconds + poll_interval_seconds))
+done
+
+start_explorer
+
+while true; do
+  sleep_interruptibly "$poll_interval_seconds"
+
+  if ! is_alive "$wallet_serving_pid"; then
+    collect_wallet_serving_status
+    log "the wallet-serving entrypoint exited with status $wallet_serving_status; stopping zinder-explorer"
+    wallet_serving_pid=""
+    stop_and_exit "$wallet_serving_status"
+  fi
+
+  now="$(date +%s)"
+  if [ -n "$explorer_pid" ] && ! is_alive "$explorer_pid"; then
+    explorer_status=0
+    wait "$explorer_pid" || explorer_status="$?"
+    explorer_pid=""
+    explorer_uptime_seconds=$((now - explorer_started_at))
+    if [ "$explorer_uptime_seconds" -ge "$explorer_restart_max_seconds" ] \
+      || [ "$explorer_restart_delay_seconds" -eq 0 ]; then
+      explorer_restart_delay_seconds="$explorer_restart_initial_seconds"
+    fi
+    log "zinder-explorer exited with status $explorer_status after ${explorer_uptime_seconds}s; wallet serving continues; restarting zinder-explorer in ${explorer_restart_delay_seconds}s"
+    explorer_restart_at=$((now + explorer_restart_delay_seconds))
+    explorer_restart_delay_seconds=$((explorer_restart_delay_seconds * 2))
+    if [ "$explorer_restart_delay_seconds" -gt "$explorer_restart_max_seconds" ]; then
+      explorer_restart_delay_seconds="$explorer_restart_max_seconds"
+    fi
+  fi
+
+  if [ -z "$explorer_pid" ] && [ "$now" -ge "$explorer_restart_at" ]; then
+    start_explorer
+  fi
+done

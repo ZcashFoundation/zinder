@@ -135,9 +135,8 @@ The wallet-serving ingest configuration sets
 `ingest.explorer_views = false` explicitly. Wallet projection and
 wallet-serving readiness do not depend on the optional materialized-view plane;
 an existing materialized-view directory is left untouched. To serve Explorer
-views on the same host, use the documented Explorer Compose overlay, which
-explicitly overrides Explorer views to `true` and requires a materialized-view
-store that records this release's exact Explorer view manifest.
+views from the same volume, use the
+[`zinder-wallet-serving-explorer` image](#serving-the-explorer-from-the-same-volume).
 
 `PORT` names the port Railway healthchecks. It must stay `9106`, the
 operational endpoint of the query process.
@@ -428,6 +427,135 @@ inside Railway's thirty-second drain window. It exits zero once all three stop,
 and non-zero naming the survivors if any still holds a RocksDB instance open
 when the window expires.
 
+## Serving the Explorer from the same volume
+
+The `zinder-wallet-serving-explorer` image runs this topology plus
+`zinder-explorer`, which serves the native `ExplorerQuery` protocol for
+explorer consumers such as Zexplorer. The Explorer opens the materialized-view
+store that `zinder-ingest` writes as a RocksDB secondary, so it must run on the
+writer's volume. On a host that attaches one volume to one container, it must
+run in the same container.
+
+Each release publishes the image for Linux amd64 and arm64:
+
+```text
+ghcr.io/zcashfoundation/zinder-wallet-serving-explorer:vX.Y.Z
+```
+
+The image is the `zinder-wallet-serving-explorer` target of
+`deploy/Dockerfile`. It differs from `zinder-wallet-serving` in two ways:
+
+- Its ingest configuration sets `ingest.explorer_views = true`, so ingest also
+  writes the Explorer views.
+- Its entrypoint starts `zinder-explorer` with
+  `deploy/config/wallet-serving/explorer.toml` after wallet serving is up.
+
+Its `HEALTHCHECK` is the wallet-serving check alone and does not cover the
+Explorer.
+
+Configure the service exactly as described above, with the same volume,
+variables, and Railway settings. `PORT` stays `9106`, and the Railway
+healthcheck path stays `/healthz` on the query process. Provision memory
+beyond the 8 GB minimum for the Explorer process. Its budget has not been
+measured.
+
+The Explorer reads only these variables:
+
+- `ZINDER_NETWORK__*` and `ZINDER_NODE__*`, which it shares with the
+  wallet-serving processes.
+- `ZINDER_EXPLORER__*`, such as `ZINDER_EXPLORER__BEARER_TOKEN_PATH`. The
+  entrypoint delivers these variables to the Explorer alone.
+
+Its storage paths, listen addresses, and bind policy are fixed in its
+configuration file. Indexer TLS PEM variables become files before either side
+starts, so the Explorer receives the same `*_PATH` variables as the other
+processes.
+
+### Explorer startup
+
+The entrypoint first checks the Explorer configuration with
+`zinder-explorer --print-config`. A rejected configuration, such as an
+unreadable `ZINDER_EXPLORER__BEARER_TOKEN_PATH`, ends the container before
+wallet serving starts, so the deployment fails at once instead of hours later.
+
+The entrypoint then starts the wallet-serving entrypoint. It starts
+`zinder-explorer` once `zinder-wallet-serving-healthcheck` passes, which
+happens when query `/readyz` answers 200 or reports `reorg_window_exceeded`.
+It then waits until ingest `/readyz` on port 9105 lists
+`materialized_view_identities`, which ingest reports once it admits the
+Explorer view store. The Explorer opens that store only when it starts, so it
+would otherwise serve without its view-backed capabilities. After 10 minutes
+without admission, the entrypoint logs the wait and starts the Explorer anyway.
+The deploy log then shows `starting zinder-explorer`. The Explorer composes
+transaction, block, search, and mempool reads through the container's own
+query endpoint at `127.0.0.1:9102`.
+
+The Explorer views need genesis-complete canonical history. The
+wallet-serving coverage provides it. A volume built by `zinder-wallet-serving`
+has no Explorer view store yet. On such a volume, ingest creates the store
+beneath the canonical path and builds the views from canonical heights while it
+keeps following the chain. Each Explorer response reports how far the views
+trail the chain in `ExplorerFreshness`.
+
+### Rebuild the Explorer views
+
+A view store that another release built can fail admission. Ingest then logs
+`materialized_view_store_open_failed` with `ConsumerNotDeclared` or
+`ExplorerViewManifestRequiresFreshStore` and keeps serving wallets without
+Explorer views. The Explorer exits with the same error on every start, and
+the entrypoint keeps restarting it. Neither process changes the store.
+
+This image fixes the store path at
+`/var/lib/zinder/canonical/materialized-views`. To rebuild the views:
+
+1. Record the capabilities `ExplorerQuery.ServerInfo` advertised before the
+   upgrade. They are the coverage the rebuilt store must reach again.
+2. Open a shell in the running container, for example with `railway ssh`.
+   Neither process holds the refused store open.
+3. Move the store aside on the same volume:
+   `mv /var/lib/zinder/canonical/materialized-views /var/lib/zinder/materialized-views.previous`.
+4. Restart the deployment. Ingest creates a store with the current manifest and
+   rebuilds the views from canonical history while wallet serving continues.
+5. Delete `/var/lib/zinder/materialized-views.previous` only after
+   `ExplorerQuery.ServerInfo` reports zero `lag_blocks` and advertises every
+   capability recorded in step 1, as
+   [Rebuild Explorer views after a manifest change](deploying-on-a-vm.md#rebuild-explorer-views-after-a-manifest-change)
+   describes.
+
+### Explorer ports
+
+| Port | Surface | Reachability |
+| --- | --- | --- |
+| 9068 | native `ExplorerQuery` gRPC | Railway private network |
+| 9069 | Explorer operational HTTP | Railway private network |
+
+Both bind `[::]` because the Railway private network is IPv6-only. Clients reach
+`<service>.railway.internal:9068`. Do not attach a public domain to 9068. Like
+9102, the surface is plaintext.
+
+### Explorer failure handling
+
+Watch Explorer `/readyz` on port 9069 in monitoring. Neither the Railway
+deploy-time healthcheck nor the container's `HEALTHCHECK` covers it, so a host
+that restarts unhealthy containers never restarts wallet serving because the
+Explorer is down.
+
+An Explorer failure does not stop wallet serving. When `zinder-explorer`
+exits, the entrypoint logs its status and restarts it after 15 seconds. The
+delay doubles on each further exit, up to 5 minutes, and returns to 15 seconds
+after a run that lasts 5 minutes.
+
+The container terminates with a non-zero status when the wallet-serving
+entrypoint exits for any reason in [Failure handling](#failure-handling). The
+entrypoint stops the Explorer first, and the restart policy then restarts the
+complete set.
+
+On `SIGTERM`, the entrypoint forwards the signal to the Explorer and to the
+wallet-serving entrypoint. It waits up to twenty-five seconds for both to stop,
+inside Railway's thirty-second drain window. It exits non-zero when either
+stops with a failure status, such as a wallet-serving process that outlived
+its own drain window.
+
 ## Boundaries
 
 - Do not label this target as the complete version-1 production topology; it
@@ -437,8 +565,9 @@ when the window expires.
 - Do not override storage paths, listen addresses, control endpoints, or
   bearer token paths through `ZINDER_*` variables.
 - Do not expose 9100, 9101, 9105, or 9110 beyond the container.
-- Do not attach a public domain to 9102. The native surface is plaintext;
-  public exposure requires TLS, authentication, and quotas at a reverse proxy.
+- Do not attach a public domain to 9102 or 9068. The native surfaces are
+  plaintext; public exposure requires TLS, authentication, and quotas at a
+  reverse proxy.
 
 See [Service boundaries](../architecture/service-boundaries.md) and
 [Public interface configuration](../architecture/public-interfaces.md#configuration).

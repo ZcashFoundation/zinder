@@ -25,7 +25,7 @@ Storage encodings belong to [Storage backend](storage-backend.md).
 | Surface | Rust module | Service owner | Release status |
 | --- | --- | --- | --- |
 | Native wallet API | `zinder_proto::v1::wallet` | `WalletQueryGrpcAdapter` in `zinder-query` | Published native query runtime |
-| Native explorer API | `zinder_proto::v1::explorer` | `zinder-explorer` | Optional Compose overlay and local image target; no published release image |
+| Native explorer API | `zinder_proto::v1::explorer` | `zinder-explorer` | Optional runtime: the `zinder-explorer` release image with the Compose overlay, or the `zinder-wallet-serving-explorer` single-volume image |
 | Private control APIs | `zinder_proto::v1::ingest` | `zinder-ingest` and `zinder-projector` | Internal deployed services |
 | Shared operations messages | `zinder_proto::v1::ops` | Runtime and service adapters | Embedded in native/control surfaces |
 | Lightwalletd compatibility API | `zinder_proto::compat::lightwalletd` | `zinder-compat-lightwalletd` | Published compatibility service |

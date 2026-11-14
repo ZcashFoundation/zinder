@@ -2,5 +2,6 @@
   "zinder-ingest",
   "zinder-projector",
   "zinder-query",
-  "zinder-compat-lightwalletd"
+  "zinder-compat-lightwalletd",
+  "zinder-explorer"
 ]
