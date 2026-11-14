@@ -31,7 +31,7 @@ use zinder_wallet_projection::{
 };
 use zinder_wallet_rocksdb::{
     MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES, RocksDbWalletStore,
-    SPIKE_WALLET_CONTROL_COLUMN_FAMILY, spike_decode_wallet_control,
+    SPIKE_WALLET_CONTROL_COLUMN_FAMILY, SpikeMirrorPlanOverlay, spike_decode_wallet_control,
 };
 
 use super::{
@@ -222,6 +222,8 @@ pub(crate) struct BatchBlock {
     pub(crate) wallet_bytes: ValueSummary,
     pub(crate) mirror_bytes: ValueSummary,
     pub(crate) wallet_plan_logical_bytes: ValueSummary,
+    /// Mirror wallet rows charged under the planner's rules (density arm).
+    pub(crate) mirror_wallet_plan_logical_bytes: ValueSummary,
     pub(crate) wallet_point_reads: ValueSummary,
 }
 
@@ -249,7 +251,10 @@ pub(crate) struct RssBlock {
     pub(crate) start_bytes: Option<u64>,
     pub(crate) end_bytes: Option<u64>,
     pub(crate) max_sampled_bytes: u64,
+    /// VmHWM after the replay and the final secondary catch-up, before any cold readback.
     pub(crate) peak_vmhwm_bytes: Option<u64>,
+    /// VmHWM after the optional cold readback.
+    pub(crate) peak_vmhwm_after_cold_readback_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -370,6 +375,7 @@ struct BlockSample {
     wallet_bytes: u64,
     mirror_bytes: u64,
     wallet_plan_logical_bytes: u64,
+    mirror_wallet_plan_logical_bytes: u64,
     wallet_point_reads: u64,
     perf_write_delay_us: f64,
     perf_write_wal_us: f64,
@@ -393,6 +399,7 @@ struct Series {
     wallet_bytes: Vec<f64>,
     mirror_bytes: Vec<f64>,
     wallet_plan_logical: Vec<f64>,
+    mirror_wallet_plan_logical: Vec<f64>,
     wallet_point_reads: Vec<f64>,
     transactions: Vec<f64>,
     transparent_inputs: Vec<f64>,
@@ -431,6 +438,7 @@ pub(crate) struct CommitPhases {
     pub(crate) wallet_bytes: u64,
     pub(crate) mirror_bytes: u64,
     pub(crate) wallet_plan_logical_bytes: u64,
+    pub(crate) mirror_wallet_plan_logical_bytes: u64,
     pub(crate) wallet_point_reads: u64,
     pub(crate) perf: super::metrics::PerfWrite,
 }
@@ -499,6 +507,7 @@ impl Committer {
         phases.canonical_bytes = batch.size_in_bytes() as u64 - after_wallet;
         let mirror_started = Instant::now();
         let mut mirror_work = None;
+        let mut mirror_overlay = None;
         if record_ops {
             let mut canonical_rows = Vec::new();
             prepared.for_each_block_row(|family, key, value| {
@@ -510,6 +519,7 @@ impl Committer {
             };
             if self.density_lanes > 0 {
                 let before = batch.size_in_bytes();
+                let overlay = mirror_overlay.insert(SpikeMirrorPlanOverlay::default());
                 let counts = apply_lanes(
                     &store.spike_bounded_open().db,
                     &self.mirror_names,
@@ -519,7 +529,10 @@ impl Committer {
                     MirrorFamilies::All,
                     true,
                     Some(&mut self.density_accumulator),
+                    Some(overlay),
                 )?;
+                phases.mirror_wallet_plan_logical_bytes =
+                    overlay.batch_logical_bytes() + overlay.overlay_logical_bytes();
                 self.density_counts.puts += counts.puts;
                 self.density_counts.deletes += counts.deletes;
                 self.density_counts.reads += counts.reads;
@@ -540,6 +553,8 @@ impl Committer {
         if let Some(perf) = perf.as_deref() {
             phases.perf = perf.read();
         }
+        // Held until the write finished, as the planner holds its overlay.
+        drop(mirror_overlay);
         self.store = Some(store);
         phases.write = timing.write.as_secs_f64();
         phases.readback = timing.readback.as_secs_f64();
@@ -643,7 +658,7 @@ pub(crate) fn finish_secondary(
 
 /// Scratch accumulator for mirror lanes, seeded with large row counts so a
 /// lane may remove rows it never inserted (outputs created before H0).
-fn mirror_scratch_accumulator() -> WalletProjectionDigestBuilder {
+pub(crate) fn mirror_scratch_accumulator() -> WalletProjectionDigestBuilder {
     let seed = u64::MAX / 2;
     let empty = WalletProjectionDigestBuilder::new();
     WalletProjectionDigestBuilder::from_parts(
@@ -912,6 +927,9 @@ pub(crate) async fn run_replay(args: ReplayArgs) -> Result<ReplayReport, BenchEr
         report.wallet_control_matches_fence = wallet_matches;
     }
 
+    // Writer peak for the replay itself, read before the optional cold readback.
+    let peak = peak_rss_bytes();
+    let rss_end = current_rss_bytes();
     let mut cold_readback_seconds = None;
     if let (true, Some(wallet)) = (args.cold_readback, wallet.as_ref()) {
         let readback = wallet.spike_cold_readback(512 * 1024 * 1024)?;
@@ -921,9 +939,8 @@ pub(crate) async fn run_replay(args: ReplayArgs) -> Result<ReplayReport, BenchEr
         .as_ref()
         .map(|wallet| WalletView::from(wallet.ready_evidence()));
 
+    let peak_after_cold_readback = peak_rss_bytes();
     let raw_files = write_raw_files(&args, &stalls, &db)?;
-    let rss_end = current_rss_bytes();
-    let peak = peak_rss_bytes();
     let wall_seconds = loop_stats.wall.as_secs_f64();
     let blocks = loop_stats.blocks;
     let chain_time_seconds = loop_stats.last_block_time - loop_stats.first_block_time_parent;
@@ -1040,6 +1057,7 @@ pub(crate) async fn run_replay(args: ReplayArgs) -> Result<ReplayReport, BenchEr
             wallet_bytes: summarize_values(&series.wallet_bytes),
             mirror_bytes: summarize_values(&series.mirror_bytes),
             wallet_plan_logical_bytes: summarize_values(&series.wallet_plan_logical),
+            mirror_wallet_plan_logical_bytes: summarize_values(&series.mirror_wallet_plan_logical),
             wallet_point_reads: summarize_values(&series.wallet_point_reads),
         },
         workload: WorkloadBlock {
@@ -1055,6 +1073,7 @@ pub(crate) async fn run_replay(args: ReplayArgs) -> Result<ReplayReport, BenchEr
             end_bytes: rss_end,
             max_sampled_bytes: loop_stats.max_rss,
             peak_vmhwm_bytes: peak,
+            peak_vmhwm_after_cold_readback_bytes: peak_after_cold_readback,
         },
         tickers,
         write_amplification: WriteAmplification {
@@ -1184,6 +1203,9 @@ fn commit_loop(
             .wallet_plan_logical
             .push(phases.wallet_plan_logical_bytes as f64);
         series
+            .mirror_wallet_plan_logical
+            .push(phases.mirror_wallet_plan_logical_bytes as f64);
+        series
             .wallet_point_reads
             .push(phases.wallet_point_reads as f64);
         series.transactions.push(transactions as f64);
@@ -1229,6 +1251,7 @@ fn commit_loop(
                     wallet_bytes: phases.wallet_bytes,
                     mirror_bytes: phases.mirror_bytes,
                     wallet_plan_logical_bytes: phases.wallet_plan_logical_bytes,
+                    mirror_wallet_plan_logical_bytes: phases.mirror_wallet_plan_logical_bytes,
                     wallet_point_reads: phases.wallet_point_reads,
                     perf_write_delay_us: phases.perf.write_delay_ns as f64 / 1000.0,
                     perf_write_wal_us: phases.perf.write_wal_ns as f64 / 1000.0,

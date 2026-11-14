@@ -1005,6 +1005,77 @@ pub struct SpikeWalletRowOp {
     pub insert: bool,
 }
 
+/// Spike: the planner's overlay and logical-byte accounting for mirrored rows.
+///
+/// Density lanes add row operations outside the planner. This applies the
+/// planner's own accounting rules (`reserve_put`, `reserve_delete`) and holds
+/// the same overlay entries in memory, so the scaled plan size and its memory
+/// are measured rather than extrapolated.
+#[derive(Debug)]
+pub struct SpikeMirrorPlanOverlay {
+    accounting: TransitionLogicalByteAccounting,
+    overlay: BTreeMap<(u8, &'static str, Vec<u8>), Option<Vec<u8>>>,
+}
+
+impl Default for SpikeMirrorPlanOverlay {
+    fn default() -> Self {
+        Self {
+            accounting: TransitionLogicalByteAccounting::new(u64::MAX),
+            overlay: BTreeMap::new(),
+        }
+    }
+}
+
+impl SpikeMirrorPlanOverlay {
+    /// Records one mirrored put in lane `lane`.
+    pub fn put(
+        &mut self,
+        lane: u8,
+        family: &'static str,
+        key: &[u8],
+        encoded_value: &[u8],
+    ) -> Result<(), RocksDbWalletError> {
+        let overlay_key = (lane, family, key.to_vec());
+        self.accounting
+            .reserve_put(key, encoded_value, self.overlay.get(&overlay_key))?;
+        self.overlay
+            .insert(overlay_key, Some(encoded_value.to_vec()));
+        Ok(())
+    }
+
+    /// Records one mirrored delete in lane `lane`.
+    pub fn delete(
+        &mut self,
+        lane: u8,
+        family: &'static str,
+        key: &[u8],
+    ) -> Result<(), RocksDbWalletError> {
+        let overlay_key = (lane, family, key.to_vec());
+        self.accounting
+            .reserve_delete(key, self.overlay.get(&overlay_key))?;
+        self.overlay.insert(overlay_key, None);
+        Ok(())
+    }
+
+    /// Batch logical bytes under the planner's rules.
+    #[must_use]
+    pub const fn batch_logical_bytes(&self) -> u64 {
+        self.accounting.batch
+    }
+
+    /// Overlay logical bytes under the planner's rules.
+    #[must_use]
+    pub const fn overlay_logical_bytes(&self) -> u64 {
+        self.accounting.overlay
+    }
+
+    /// Overlay entries held.
+    #[must_use]
+    pub fn entries(&self) -> usize {
+        self.overlay.len()
+    }
+}
+
 struct WalletTransitionPlanner<'store> {
     store: &'store RocksDbWalletStore,
     batch: WriteBatch,

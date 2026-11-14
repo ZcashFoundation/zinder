@@ -22,6 +22,7 @@ use super::{
     event_lifecycle::decode_retained_event,
     live_commit::{PreparedLiveAppendCommit, PreparedLiveBlockRows},
     live_replacement::PreparedLiveReplacement,
+    rocksdb::DISPLACED_BLOCK_FACTS_COLUMN_FAMILY,
 };
 use crate::{BoundedRocksDbOpen, RocksDbResourceBudget};
 
@@ -175,6 +176,27 @@ impl SpikePreparedLiveReplacement {
         &self,
     ) -> Result<Vec<ValidatedCanonicalBlockReplay>, CanonicalStoreError> {
         decode_block_rows_replays(&self.inner.replacement_rows)
+    }
+
+    /// Visits every per-block canonical operation of this replacement: the
+    /// displaced-row deletions (`None`), the replacement block rows, and the
+    /// permanent archive rows. The single epoch, event, and control records
+    /// are excluded because they do not scale with block density.
+    pub fn for_each_block_scaled_op(
+        &self,
+        mut visit: impl FnMut(&'static str, &[u8], Option<&[u8]>),
+    ) {
+        for (family, key) in &self.inner.deletions.rows {
+            visit(family, key, None);
+        }
+        for block_rows in &self.inner.replacement_rows {
+            for row in &block_rows.rows {
+                visit(row.family, &row.key, Some(&row.encoded_value));
+            }
+        }
+        for (key, encoded) in &self.inner.archive.rows {
+            visit(DISPLACED_BLOCK_FACTS_COLUMN_FAMILY, key, Some(encoded));
+        }
     }
 }
 

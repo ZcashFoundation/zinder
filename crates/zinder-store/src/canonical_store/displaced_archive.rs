@@ -71,7 +71,7 @@ pub(super) struct CanonicalDisplacedBlock {
 }
 
 pub(super) struct PreparedDisplacedArchiveWrite {
-    rows: Vec<(Vec<u8>, Vec<u8>)>,
+    pub(super) rows: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 #[derive(Clone, Copy)]

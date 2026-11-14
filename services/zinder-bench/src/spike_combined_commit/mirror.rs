@@ -21,7 +21,9 @@ use rust_rocksdb::{DB, WriteBatch, WriteOptions};
 use serde::Serialize;
 use zinder_bench::BenchError;
 use zinder_wallet_projection::WalletProjectionDigestBuilder;
-use zinder_wallet_rocksdb::{SpikeWalletPlanOps, spike_wallet_data_column_family_names};
+use zinder_wallet_rocksdb::{
+    SpikeMirrorPlanOverlay, SpikeWalletPlanOps, spike_wallet_data_column_family_names,
+};
 
 use super::{
     layout::{CANONICAL_DATA_FAMILIES, mirror_family},
@@ -81,7 +83,7 @@ impl MirrorFamilyNames {
         }
     }
 
-    fn get(&self, family: &'static str) -> Result<&str, BenchError> {
+    pub(crate) fn get(&self, family: &'static str) -> Result<&str, BenchError> {
         self.names
             .get(family)
             .map(String::as_str)
@@ -102,7 +104,9 @@ pub(crate) fn lane_key(key: &[u8], lane: u8) -> Vec<u8> {
 ///
 /// With `reads`, each recorded planner point read is repeated against the
 /// lane's mirror family. With `accumulator`, each mirrored wallet row is also
-/// folded into a scratch projection accumulator, as the planner does.
+/// folded into a scratch projection accumulator, as the planner does. With
+/// `plan_overlay`, each mirrored wallet row is also charged and held under the
+/// planner's overlay and logical-byte rules.
 pub(crate) fn apply_lanes(
     db: &DB,
     names: &MirrorFamilyNames,
@@ -112,6 +116,7 @@ pub(crate) fn apply_lanes(
     families: MirrorFamilies,
     reads: bool,
     mut accumulator: Option<&mut WalletProjectionDigestBuilder>,
+    mut plan_overlay: Option<&mut SpikeMirrorPlanOverlay>,
 ) -> Result<MirrorCounts, BenchError> {
     let mut counts = MirrorCounts::default();
     for lane in lanes {
@@ -153,6 +158,17 @@ pub(crate) fn apply_lanes(
                     accumulator
                         .remove_row(op.family, &key, &op.value)
                         .map_err(|source| spike_error("mirror accumulator", source))?;
+                }
+            }
+            if let Some(plan_overlay) = plan_overlay.as_deref_mut() {
+                if op.insert {
+                    plan_overlay
+                        .put(lane, op.column_family, &key, &op.value)
+                        .map_err(|source| spike_error("mirror plan overlay", source))?;
+                } else {
+                    plan_overlay
+                        .delete(lane, op.column_family, &key)
+                        .map_err(|source| spike_error("mirror plan overlay", source))?;
                 }
             }
             if op.insert {
@@ -258,6 +274,7 @@ fn pressure_loop(
                 lane..=lane,
                 families,
                 false,
+                None,
                 None,
             )?;
             stats.counts.add(counts);

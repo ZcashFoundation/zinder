@@ -35,5 +35,6 @@ pub use spike_combined::{
     spike_wallet_data_column_family_names, spike_wallet_data_options,
 };
 pub use transition::{
-    MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES, SpikeWalletPlanOps, SpikeWalletRowOp,
+    MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES, SpikeMirrorPlanOverlay, SpikeWalletPlanOps,
+    SpikeWalletRowOp,
 };

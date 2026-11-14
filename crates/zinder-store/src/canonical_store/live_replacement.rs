@@ -179,9 +179,9 @@ impl RocksDbCanonicalStore {
 }
 
 pub(super) struct PreparedLiveReplacement {
-    deletions: PreparedCanonicalDeletions,
+    pub(super) deletions: PreparedCanonicalDeletions,
     pub(super) replacement_rows: Vec<PreparedLiveBlockRows>,
-    archive: PreparedDisplacedArchiveWrite,
+    pub(super) archive: PreparedDisplacedArchiveWrite,
     encoded_epoch: Vec<u8>,
     pub(super) encoded_event: Vec<u8>,
     encoded_control: Vec<u8>,
@@ -771,8 +771,8 @@ fn capture_displaced_blocks(
         .collect()
 }
 
-struct PreparedCanonicalDeletions {
-    rows: Vec<(&'static str, Vec<u8>)>,
+pub(super) struct PreparedCanonicalDeletions {
+    pub(super) rows: Vec<(&'static str, Vec<u8>)>,
 }
 
 impl PreparedCanonicalDeletions {
