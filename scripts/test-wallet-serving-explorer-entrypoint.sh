@@ -70,6 +70,14 @@ cat >"$work/healthcheck" <<'STUB'
 STUB
 cat >"$work/explorer" <<'STUB'
 #!/bin/sh
+case "$*" in
+  *--print-config*)
+    env >"$STUB_WORK/explorer-preflight.env"
+    [ "$STUB_EXPLORER_MODE" != invalid-config ] || exit 2
+    exit 0
+    ;;
+esac
+printf 'start\n' >>"$STUB_WORK/explorer.starts"
 [ -e "$STUB_WORK/ready" ] || printf 'started before wallet serving was ready\n' >"$STUB_WORK/explorer.early"
 printf '%s\n' "$*" >"$STUB_WORK/explorer.args"
 env >"$STUB_WORK/explorer.env"
@@ -119,6 +127,8 @@ rewrite_line "$test_entrypoint" \
   "explorer_secondary_path=\"$work/volume/explorer/secondary\""
 rewrite_line "$test_entrypoint" 'poll_interval_seconds=15' 'poll_interval_seconds=1'
 rewrite_line "$test_entrypoint" 'shutdown_grace_seconds=25' 'shutdown_grace_seconds=5'
+rewrite_line "$test_entrypoint" 'explorer_restart_initial_seconds=15' 'explorer_restart_initial_seconds=1'
+rewrite_line "$test_entrypoint" 'explorer_restart_max_seconds=300' 'explorer_restart_max_seconds=8'
 # An unprivileged test cannot raise the open-file limit past its hard limit.
 rewrite_line "$test_entrypoint" 'nofile_limit=65536' "nofile_limit=$(ulimit -n)"
 chmod +x "$test_entrypoint"
@@ -199,10 +209,14 @@ for expected in ZINDER_NETWORK__NAME ZINDER_NODE__JSON_RPC_ADDR ZINDER_EXPLORER_
   grep -q "^${expected}=" "$explorer_env" || test_failure "the Explorer did not receive $expected"
 done
 for unexpected in ZINDER_INGEST__ ZINDER_PROJECTOR__ INGEST_CONTROL_BEARER_TOKEN CHECKPOINT_BEARER_TOKEN; do
-  if grep -q "^${unexpected}" "$explorer_env"; then
-    test_failure "$unexpected reached the Explorer"
-  fi
+  for runtime_env in "$explorer_env" "$work/case/explorer-preflight.env"; do
+    if grep -q "^${unexpected}" "$runtime_env"; then
+      test_failure "$unexpected reached $runtime_env"
+    fi
+  done
 done
+grep -q '^ZINDER_EXPLORER__BEARER_TOKEN_PATH=' "$work/case/explorer-preflight.env" \
+  || test_failure "the Explorer configuration check did not receive its variables"
 for runtime_env in "$wallet_env" "$explorer_env"; do
   if grep -q '_PEM=' "$runtime_env" || grep -q 'BEGIN' "$runtime_env"; then
     test_failure "indexer TLS PEM text reached $runtime_env"
@@ -225,14 +239,36 @@ await_entrypoint_exit
 [[ "$wrapper_status" -eq 3 ]] || test_failure "a failed wallet-serving start exited $wrapper_status, expected 3"
 [[ ! -e "$work/case/explorer.env" ]] || test_failure "the Explorer started after wallet serving failed"
 
-# An Explorer exit stops the wallet-serving processes and fails the container.
+# An Explorer configuration the binary rejects fails the container before wallet
+# serving starts.
+reset_case
+wallet_mode=serve explorer_mode=invalid-config start_entrypoint
+await_entrypoint_exit
+[[ "$wrapper_status" -eq 1 ]] || test_failure "a rejected Explorer config exited $wrapper_status, expected 1"
+[[ ! -e "$work/case/wallet.env" ]] || test_failure "wallet serving started after the Explorer config was rejected"
+grep -q 'zinder-explorer rejected its configuration' "$work/case/stderr" \
+  || test_failure "the rejected Explorer config was not logged"
+
+# An Explorer that keeps exiting is restarted while wallet serving keeps
+# running, and SIGTERM still stops both cleanly.
 reset_case
 wallet_mode=serve explorer_mode=crash start_entrypoint
+for _ in $(seq 1 150); do
+  [[ -e "$work/case/explorer.starts" ]] && [[ "$(wc -l <"$work/case/explorer.starts")" -ge 3 ]] && break
+  sleep 0.1
+done
+[[ "$(wc -l <"$work/case/explorer.starts")" -ge 3 ]] \
+  || test_failure "a crashing Explorer was not restarted: $(cat "$work/case/stderr")"
+kill -0 "$wrapper_pid" 2>/dev/null || test_failure "an Explorer exit ended the container"
+[[ ! -e "$work/case/wallet.stopped" ]] || test_failure "an Explorer exit stopped wallet serving"
+grep -q 'zinder-explorer exited with status 5 .*; wallet serving continues; restarting zinder-explorer in 1s' \
+  "$work/case/stderr" || test_failure "the first Explorer exit was not logged: $(cat "$work/case/stderr")"
+grep -q 'restarting zinder-explorer in 2s' "$work/case/stderr" \
+  || test_failure "the Explorer restart delay did not grow: $(cat "$work/case/stderr")"
+kill -s TERM "$wrapper_pid"
 await_entrypoint_exit
-[[ "$wrapper_status" -eq 1 ]] || test_failure "an Explorer exit ended the container with $wrapper_status"
-[[ -e "$work/case/wallet.stopped" ]] || test_failure "an Explorer exit left wallet serving running"
-grep -q 'zinder-explorer exited with status 5' "$work/case/stderr" \
-  || test_failure "the Explorer exit status was not logged"
+[[ "$wrapper_status" -eq 0 ]] || test_failure "SIGTERM during Explorer restarts exited $wrapper_status"
+[[ -e "$work/case/wallet.stopped" ]] || test_failure "SIGTERM did not reach wallet serving"
 
 # A wallet-serving exit stops the Explorer, and a zero status still fails the
 # container because only a forwarded signal ends wallet serving cleanly.

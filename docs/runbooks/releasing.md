@@ -201,7 +201,7 @@ After approval, the workflow performs these operations in order:
    keyless-sign that checksum file into `SHA256SUMS.sigstore.json`.
 8. Publish the draft GitHub Release, then verify its immutable release
    attestation and every asset.
-9. For a stable release, promote the 6 `latest` tags only after immutable
+9. For a stable release, promote the 8 `latest` tags only after immutable
    release verification succeeds.
 
 Stable and prerelease tags publish the same three-crate SDK catalog.
@@ -313,16 +313,19 @@ for image in \
   zinder-query \
   zinder-compat-lightwalletd \
   zinder-canonical-runtime \
-  zinder-wallet-serving
+  zinder-wallet-serving \
+  zinder-explorer \
+  zinder-wallet-serving-explorer
 do
   docker buildx imagetools inspect \
     "ghcr.io/zcashfoundation/${image}:v0.9.0"
 done
 ```
 
-The `v0.9.0` example loops over the 6 runtime images. Releases before
-`v0.9.0-rc.1` publish only the first 4; drop `zinder-canonical-runtime` and
-`zinder-wallet-serving` from the loop when verifying one of those releases.
+The loop lists the 8 images that current releases publish. Releases through
+`v0.10.0`, including the `v0.9.0` example, publish only the first 6, and
+releases before `v0.9.0-rc.1` publish only the first 4. Drop the names a
+release does not publish when verifying it.
 
 The first release that publishes a new image name creates its GHCR package as
 private. An organization admin must set the package visibility to public once.
@@ -402,15 +405,16 @@ Image SBOM evidence may contain another runtime-named Rust package only when
 the owning service declares it as a production dependency. In particular,
 `zinder-compat-lightwalletd` includes and must report `zinder-query`. A
 single-volume host image must report exactly the executables its target
-copies: `zinder-canonical-runtime` reports `zinder-ingest`, and
+copies: `zinder-canonical-runtime` reports `zinder-ingest`,
 `zinder-wallet-serving` reports `zinder-ingest`, `zinder-projector`, and
-`zinder-query`. All other sibling runtime packages remain rejected. If image evidence fails, regenerate
+`zinder-query`, and `zinder-wallet-serving-explorer` reports those 3 plus
+`zinder-explorer`. All other sibling runtime packages remain rejected. If image evidence fails, regenerate
 the SBOM from the exact child digest and compare its runtime-named packages
 with the owning service manifest before changing the policy. Do not remove a
 declared dependency from the evidence or broaden the allowed package set.
 
 If only the final stable promotion fails, rerun the failed
-`promote stable image tags` job. It verifies all 6 exact manifests before moving
+`promote stable image tags` job. It verifies all 8 exact manifests before moving
 any `latest` tag. Do not move a release tag or rebuild it from another commit.
 
 Application rollback remains constrained by storage compatibility. Follow the
