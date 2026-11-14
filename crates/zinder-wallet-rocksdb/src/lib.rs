@@ -8,6 +8,7 @@ mod build_lock;
 mod error;
 mod projection_load;
 mod secondary;
+mod spike_in_process;
 mod store;
 mod transition;
 
@@ -21,6 +22,10 @@ pub use build::{
 };
 pub use error::RocksDbWalletError;
 pub use secondary::{RocksDbWalletSecondary, WalletSecondaryCatchupOutcome};
+pub use spike_in_process::{
+    SPIKE_WALLET_FAMILIES, SpikeProjectionSsts, spike_resolve_family, spike_set_family_alias,
+    spike_wallet_ready_evidence_at, spike_write_projection_ssts,
+};
 pub use store::{
     RocksDbWalletBuildStore, RocksDbWalletFollowingStore, RocksDbWalletStore,
     WALLET_ROCKSDB_SCHEMA_VERSION, WalletAddressTransactionHistoryPage,

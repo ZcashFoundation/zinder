@@ -218,7 +218,7 @@ pub struct RocksDbWalletStore {
 /// transitions, then requires an exact source match through
 /// [`Self::into_ready_store`] before it can become a query-serving store.
 pub struct RocksDbWalletFollowingStore {
-    store: RocksDbWalletStore,
+    pub(crate) store: RocksDbWalletStore,
 }
 
 impl RocksDbWalletBuildStore {
@@ -1501,7 +1501,10 @@ pub(crate) fn wallet_column_family_descriptors(
         .collect()
 }
 
-fn wallet_data_options(block_cache: &Cache, resource_budget: RocksDbResourceBudget) -> Options {
+pub(crate) fn wallet_data_options(
+    block_cache: &Cache,
+    resource_budget: RocksDbResourceBudget,
+) -> Options {
     let mut options = Options::default();
     options.set_compression_type(DBCompressionType::Snappy);
     options.set_block_based_table_factory(&build_block_based_table_factory(block_cache));
@@ -2843,9 +2846,10 @@ pub(crate) fn column_family<'db>(
     bounded_open: &'db BoundedRocksDbOpen,
     name: &'static str,
 ) -> Result<Arc<BoundColumnFamily<'db>>, RocksDbWalletError> {
+    let physical = crate::spike_in_process::spike_resolve_family(name);
     bounded_open
         .db
-        .cf_handle(name)
+        .cf_handle(&physical)
         .ok_or(RocksDbWalletError::ColumnFamilyUnavailable { name })
 }
 

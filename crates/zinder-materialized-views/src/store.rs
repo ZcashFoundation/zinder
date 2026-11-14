@@ -1021,7 +1021,7 @@ impl MaterializedViewStore {
             source,
         })?;
         let store = Self {
-            db: Arc::new(bounded_open.db),
+            db: bounded_open.db,
             sync_writes: options.sync_writes,
             storage_path: path.to_path_buf(),
             consumers: options.consumers,
@@ -1137,7 +1137,7 @@ impl MaterializedViewStore {
             source,
         })?;
         let store = Self {
-            db: Arc::new(bounded_open.db),
+            db: bounded_open.db,
             sync_writes: options.sync_writes,
             storage_path: primary_path.to_path_buf(),
             consumers: options.consumers,

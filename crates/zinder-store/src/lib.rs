@@ -35,8 +35,13 @@ pub use canonical_store::{
     DEFAULT_REORG_WINDOW_BLOCKS, DisplacedBlockCursor, DisplacedBlockPage,
     MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS, PreparedCanonicalBaselinePublication,
     ProjectionBuildAnchor, ProjectionBuildLease, ProjectionBuildLeaseId, RocksDbCanonicalBuilder,
-    RocksDbCanonicalSecondary, RocksDbCanonicalStore, TREE_STATE_CHECKPOINT_STRIDE,
-    ValidatedRocksDbCanonicalBuild,
+    RocksDbCanonicalSecondary, RocksDbCanonicalStore, SpikeBatchKind, SpikeBatchObserver,
+    SpikeCanonicalViewFingerprint, SpikeCompactBlockCursor, SpikeCompactBlockRead,
+    SpikeCompactBlockRow, SpikeSnapshot, TREE_STATE_CHECKPOINT_STRIDE,
+    ValidatedRocksDbCanonicalBuild, spike_block_replay_at, spike_canonical_epoch_tip,
+    spike_canonical_view_fingerprint, spike_compact_block_exists, spike_compact_blocks,
+    spike_install_batch_observer, spike_observed_write, spike_read_options,
+    spike_replay_scan_at_snapshot, spike_transaction_lookup,
 };
 pub use chain_event::{
     ChainEpochCommitted, ChainEvent, ChainEventEnvelope, ChainEventHistoryRequest,

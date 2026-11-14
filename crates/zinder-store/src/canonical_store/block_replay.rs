@@ -154,6 +154,33 @@ impl Iterator for CanonicalReplayRangeScan<'_> {
 }
 
 impl<'a> CanonicalReplayScan<'a> {
+    /// Spike: the same authenticated scan, bound to one primary snapshot.
+    pub(super) fn spike_new_at_snapshot(
+        db: &'a DB,
+        ready_evidence: &CanonicalStoreReadyEvidence,
+        snapshot: &'a rust_rocksdb::SnapshotWithThreadMode<'a, DB>,
+    ) -> Result<Self, CanonicalStoreError> {
+        let block_replay = block_replay_column_family(db)?;
+        let mut read_options = ReadOptions::default();
+        read_options.fill_cache(false);
+        read_options.set_readahead_size(2 * 1024 * 1024);
+        read_options.set_snapshot(snapshot);
+        let mut iterator = db.raw_iterator_cf_opt(&block_replay, read_options);
+        iterator.seek(encode_height_key_ascending(
+            ready_evidence.first_retained_block.height,
+        ));
+        Ok(Self {
+            iterator,
+            ready_evidence: *ready_evidence,
+            previous_block: None,
+            observed_block_count: 0,
+            sequence_digest_builder: Some(CanonicalBlockFactsSequenceDigestBuilder::new(
+                CanonicalBlockFactsSequenceDigestVersion::V1,
+            )),
+            finished: false,
+        })
+    }
+
     pub(super) fn new(
         db: &'a DB,
         ready_evidence: &CanonicalStoreReadyEvidence,
@@ -500,7 +527,7 @@ pub(super) fn read_persisted_replay(
     })
 }
 
-fn decode_persisted_replay(
+pub(super) fn decode_persisted_replay(
     key: &[u8],
     encoded_replay: &[u8],
 ) -> Result<(BlockHeight, ValidatedCanonicalBlockReplay), CanonicalStoreError> {
@@ -544,7 +571,9 @@ impl PersistedBlockReplayEvidence {
     }
 }
 
-fn block_replay_column_family(db: &DB) -> Result<Arc<BoundColumnFamily<'_>>, CanonicalStoreError> {
+pub(super) fn block_replay_column_family(
+    db: &DB,
+) -> Result<Arc<BoundColumnFamily<'_>>, CanonicalStoreError> {
     db.cf_handle(BLOCK_REPLAY_COLUMN_FAMILY).ok_or_else(|| {
         CanonicalStoreError::block_replay_sequence("block_replay column family is absent")
     })

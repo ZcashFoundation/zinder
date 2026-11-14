@@ -157,7 +157,10 @@ impl<'path> RocksDbOpenRole<'path> {
 /// Opened `RocksDB` handle plus the resource handles that must outlive it.
 pub struct BoundedRocksDbOpen {
     /// Opened database handle.
-    pub db: DB,
+    ///
+    /// Spike: shared so in-process readers can hold primary snapshots while
+    /// the owning store handle moves through consuming commits.
+    pub db: Arc<DB>,
     /// Shared block cache retained for the database lifetime.
     pub block_cache: Cache,
     /// Shared write-buffer manager retained for the database lifetime.
@@ -198,7 +201,7 @@ pub fn open_bounded_rocksdb(
         Ok((db, statistics)) => {
             record_rocksdb_io_mode(role, RocksDbIoMode::Direct);
             Ok(BoundedRocksDbOpen {
-                db,
+                db: Arc::new(db),
                 block_cache,
                 write_buffer_manager,
                 io_mode: RocksDbIoMode::Direct,
@@ -218,7 +221,7 @@ pub fn open_bounded_rocksdb(
                 open_bounded_rocksdb_once(&open_attempt, RocksDbIoMode::Buffered)?;
             record_rocksdb_io_mode(role, RocksDbIoMode::Buffered);
             Ok(BoundedRocksDbOpen {
-                db,
+                db: Arc::new(db),
                 block_cache,
                 write_buffer_manager,
                 io_mode: RocksDbIoMode::Buffered,

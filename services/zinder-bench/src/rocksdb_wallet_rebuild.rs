@@ -1,4 +1,9 @@
 //! One-shot wallet rebuild from an existing authenticated canonical store.
+#![allow(
+    clippy::all,
+    clippy::pedantic,
+    reason = "spike: RSS and staging sampling added for the in-process serving rebuild arm"
+)]
 
 use std::{path::PathBuf, time::Duration};
 
@@ -86,6 +91,91 @@ pub(crate) struct RocksDbWalletRebuildReport {
     cold_validation_reorg_undo_readback_seconds: f64,
     ready_publication_seconds: f64,
     total_seconds: f64,
+    /// Spike: process peak RSS (VmHWM) after the build.
+    peak_rss_bytes: Option<u64>,
+    /// Spike: largest sampled VmRSS during the build.
+    max_sampled_rss_bytes: u64,
+    /// Spike: largest sampled size of the projection staging sibling directory.
+    max_sampled_staging_bytes: u64,
+    /// Spike: size of the canonical store directory.
+    canonical_store_bytes: u64,
+    /// Spike: size of the finished wallet store directory.
+    wallet_store_bytes: u64,
+    staged_output_count: u64,
+    staged_spend_count: u64,
+    logical_row_bytes: u64,
+    sst_file_bytes: u64,
+    sst_file_count: u64,
+    row_counts: RowCounts,
+    /// Spike: external-sort evidence (compare with the documented Mainnet outpoint sorter size).
+    outpoint_sort: SortEvidence,
+    address_index_sort: SortEvidence,
+    address_transaction_sort: SortEvidence,
+}
+
+/// Spike: one external sorter's evidence.
+#[derive(Serialize)]
+struct SortEvidence {
+    record_count: u64,
+    initial_run_count: u64,
+    merge_pass_count: u64,
+    peak_accounted_memory_bytes: u64,
+    peak_temporary_file_bytes: u64,
+    final_run_file_bytes: u64,
+}
+
+impl From<zinder_rocksdb_bulk_load::VariableValueSortEvidence> for SortEvidence {
+    fn from(evidence: zinder_rocksdb_bulk_load::VariableValueSortEvidence) -> Self {
+        Self {
+            record_count: evidence.record_count,
+            initial_run_count: evidence.initial_run_count,
+            merge_pass_count: evidence.merge_pass_count,
+            peak_accounted_memory_bytes: evidence.peak_accounted_memory_bytes,
+            peak_temporary_file_bytes: evidence.peak_temporary_file_bytes,
+            final_run_file_bytes: evidence.final_run_file_bytes,
+        }
+    }
+}
+
+/// Spike: published row counts per wallet family.
+#[derive(Serialize)]
+struct RowCounts {
+    transparent_unspent_output: u64,
+    transparent_unspent_output_by_address: u64,
+    transparent_spent_output: u64,
+    transparent_address_transaction: u64,
+    transparent_address_balance: u64,
+    reorg_undo: u64,
+}
+
+fn directory_bytes(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.metadata() {
+            Ok(metadata) if metadata.is_dir() => directory_bytes(&entry.path()),
+            Ok(metadata) => metadata.len(),
+            Err(_) => 0,
+        })
+        .sum()
+}
+
+fn current_rss_bytes() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status.lines().find_map(|line| {
+                line.strip_prefix("VmRSS:")?
+                    .trim()
+                    .trim_end_matches("kB")
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+            })
+        })
+        .map_or(0, |kib| kib * 1024)
 }
 
 /// Rebuilds one wallet projection from the exact admitted canonical fence.
@@ -123,6 +213,25 @@ pub(crate) async fn run_rocksdb_wallet_rebuild(
         RocksDbResourceBudget::canonical_reader_defaults(),
     )?;
     let canonical_ready = canonical_store.ready_evidence();
+    let staging_path = {
+        let mut name = args.wallet_store.as_os_str().to_owned();
+        name.push(".projection-load-staging");
+        std::path::PathBuf::from(name)
+    };
+    let sampler_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampler = {
+        let stop = std::sync::Arc::clone(&sampler_stop);
+        let staging_path = staging_path.clone();
+        std::thread::spawn(move || {
+            let (mut max_rss, mut max_staging) = (0_u64, 0_u64);
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                max_rss = max_rss.max(current_rss_bytes());
+                max_staging = max_staging.max(directory_bytes(&staging_path));
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            (max_rss, max_staging)
+        })
+    };
     let outcome = build_wallet_from_canonical(
         &canonical_store,
         &args.wallet_store,
@@ -136,8 +245,17 @@ pub(crate) async fn run_rocksdb_wallet_rebuild(
             max_accounted_reorg_undo_bytes: WALLET_ACCOUNTED_REORG_UNDO_BYTES,
             supported_reorg_depth: args.supported_reorg_depth,
         },
-    )?;
-    Ok(rebuild_report(&canonical_ready, &outcome.report))
+    );
+    sampler_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (max_sampled_rss_bytes, max_sampled_staging_bytes) = sampler.join().unwrap_or((0, 0));
+    let outcome = outcome?;
+    let mut report = rebuild_report(&canonical_ready, &outcome.report);
+    report.peak_rss_bytes = zinder_bench::rss::peak_rss().bytes;
+    report.max_sampled_rss_bytes = max_sampled_rss_bytes;
+    report.max_sampled_staging_bytes = max_sampled_staging_bytes;
+    report.canonical_store_bytes = directory_bytes(&args.canonical_store);
+    report.wallet_store_bytes = directory_bytes(&args.wallet_store);
+    Ok(report)
 }
 
 fn rebuild_report(
@@ -182,6 +300,31 @@ fn rebuild_report(
             .as_secs_f64(),
         ready_publication_seconds: durations.ready_publication.as_secs_f64(),
         total_seconds: durations.total.as_secs_f64(),
+        peak_rss_bytes: None,
+        max_sampled_rss_bytes: 0,
+        max_sampled_staging_bytes: 0,
+        canonical_store_bytes: 0,
+        wallet_store_bytes: 0,
+        staged_output_count: report.staged_output_count,
+        staged_spend_count: report.staged_spend_count,
+        logical_row_bytes: report.logical_row_bytes,
+        sst_file_bytes: report.sst_file_bytes,
+        sst_file_count: report.sst_file_count,
+        row_counts: RowCounts {
+            transparent_unspent_output: report.row_counts.transparent_unspent_output_count,
+            transparent_unspent_output_by_address: report
+                .row_counts
+                .transparent_unspent_output_by_address_count,
+            transparent_spent_output: report.row_counts.transparent_spent_output_count,
+            transparent_address_transaction: report
+                .row_counts
+                .transparent_address_transaction_count,
+            transparent_address_balance: report.row_counts.transparent_address_balance_count,
+            reorg_undo: report.row_counts.reorg_undo_count,
+        },
+        outpoint_sort: report.outpoint_sort.into(),
+        address_index_sort: report.address_index_sort.into(),
+        address_transaction_sort: report.address_transaction_sort.into(),
     }
 }
 

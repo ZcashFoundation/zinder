@@ -1926,3 +1926,108 @@ mod tests {
         assert!(outcome.is_err());
     }
 }
+
+/// Spike: one prepared follow step for a benchmark-owned writer loop.
+pub enum SpikeFollowStep {
+    /// The source tip is not ahead of the store.
+    AtTip,
+    /// The next append, prepared exactly as the follower prepares it.
+    Append(Box<CanonicalLiveAppend>),
+    /// A suffix replacement the source requires.
+    Replacement(Box<CanonicalLiveReplacement>),
+}
+
+/// Spike: prepares the next follow step with the production preparation path.
+pub async fn spike_prepare_follow_step<Source>(
+    store: &RocksDbCanonicalStore,
+    source: &Source,
+    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+    config: CanonicalFollowConfig,
+    cancel: &CancellationToken,
+) -> Result<SpikeFollowStep, CanonicalFollowError>
+where
+    Source: NodeSource,
+{
+    Ok(
+        match prepare_follow_iteration(store, source, network_upgrade_activations, config, cancel)
+            .await?
+        {
+            FollowIteration::AtTip { .. } => SpikeFollowStep::AtTip,
+            FollowIteration::Append { append, .. } => SpikeFollowStep::Append(append),
+            FollowIteration::Replacement { replacement, .. } => {
+                SpikeFollowStep::Replacement(replacement)
+            }
+        },
+    )
+}
+
+/// Spike: prepares a replacement of `first_height..=last_height` from the source.
+///
+/// The replacement displaces the whole visible suffix from `first_height`. With
+/// an unchanged source chain the replacement blocks equal the displaced ones;
+/// a `last_height` below the visible tip shortens the chain.
+pub async fn spike_prepare_suffix_replacement<Source>(
+    store: &RocksDbCanonicalStore,
+    source: &Source,
+    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+    request_timeout: Duration,
+    cancel: &CancellationToken,
+    first_height: BlockHeight,
+    last_height: BlockHeight,
+) -> Result<CanonicalLiveReplacement, CanonicalFollowError>
+where
+    Source: NodeSource,
+{
+    let anchor = store.append_anchor()?;
+    let parent_height = BlockHeight::new(first_height.value().saturating_sub(1));
+    let parent_header = store.block_header_at(parent_height)?.ok_or(
+        CanonicalFollowError::SettlementHeaderAbsent {
+            height: parent_height,
+        },
+    )?;
+    let common_parent = BlockId::new(parent_height, parent_header.block_hash);
+    let mut predecessor_checkpoint =
+        store.replacement_parent_checkpoint(common_parent, network_upgrade_activations.as_ref())?;
+    let raw_blob_retention = store.raw_blob_retention();
+    let mut previous_tip_metadata = predecessor_checkpoint.tip_metadata();
+    let mut replacement_blocks = Vec::new();
+    let mut height = Some(first_height);
+    while let Some(current_height) = height.filter(|height| *height <= last_height) {
+        let source_block = source_request(
+            request_timeout,
+            cancel,
+            source.fetch_block_at(current_height),
+        )
+        .await?;
+        let source_checkpoint = source_request(
+            request_timeout,
+            cancel,
+            source.fetch_chain_checkpoint(current_height, network_upgrade_activations.as_ref()),
+        )
+        .await?;
+        let (block, next_tip_metadata) = prepare_live_block(
+            &source_block,
+            &predecessor_checkpoint,
+            &source_checkpoint,
+            network_upgrade_activations.as_ref(),
+            raw_blob_retention,
+        )?;
+        let subtree_roots = fetch_live_subtree_roots(
+            source,
+            request_timeout,
+            cancel,
+            previous_tip_metadata,
+            next_tip_metadata,
+        )
+        .await?;
+        replacement_blocks.push(CanonicalReplacementBlock::new(block, subtree_roots));
+        predecessor_checkpoint = source_checkpoint;
+        previous_tip_metadata = next_tip_metadata;
+        height = current_height.next();
+    }
+    Ok(CanonicalLiveReplacement::new(
+        anchor.event_fence(),
+        replacement_blocks,
+        UnixTimestampMillis::now(),
+    ))
+}

@@ -667,7 +667,7 @@ fn read_optional(
         .map_err(|source| CanonicalStoreError::RocksDbOperation { operation, source })
 }
 
-fn decode_chain_epoch(
+pub(super) fn decode_chain_epoch(
     network: Network,
     epoch_id: zinder_core::ChainEpochId,
     encoded: &[u8],
@@ -694,7 +694,7 @@ fn decode_chain_epoch(
     })
 }
 
-fn decode_block_header(
+pub(super) fn decode_block_header(
     height: BlockHeight,
     encoded: &[u8],
 ) -> Result<BlockHeaderArtifact, CanonicalStoreError> {
@@ -717,7 +717,7 @@ fn decode_block_header(
     ))
 }
 
-fn decode_transaction_location(
+pub(super) fn decode_transaction_location(
     transaction_id: TransactionId,
     encoded: &[u8],
 ) -> Result<TransactionLocation, CanonicalStoreError> {

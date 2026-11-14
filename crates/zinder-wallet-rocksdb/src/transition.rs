@@ -358,12 +358,15 @@ impl RocksDbWalletStore {
         let mut write_options = WriteOptions::default();
         write_options.set_sync(true);
         crash_point("wallet_projection.transition.before_atomic_write");
-        self.bounded_open
-            .db
-            .write_opt(&batch, &write_options)
-            .map_err(|source| {
-                RocksDbWalletError::rocksdb("atomic wallet projection transition", source)
-            })?;
+        zinder_store::spike_observed_write(
+            zinder_store::SpikeBatchKind::WalletTransition,
+            &self.bounded_open.db,
+            &mut batch,
+            &write_options,
+        )
+        .map_err(|source| {
+            RocksDbWalletError::rocksdb("atomic wallet projection transition", source)
+        })?;
         crash_point("wallet_projection.transition.after_atomic_write");
 
         self.control = next_control;

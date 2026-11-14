@@ -28,6 +28,7 @@ mod rocksdb;
 mod secondary;
 #[cfg(test)]
 mod secondary_tests;
+mod spike_in_process;
 mod subtree_load;
 mod wallet_events;
 
@@ -77,6 +78,13 @@ pub use publication::{
 pub use rocksdb::RocksDbCanonicalStore;
 pub use rocksdb::{CanonicalOwnerCheckpointAdmission, CanonicalOwnerCheckpointEvidence};
 pub use secondary::{CanonicalSecondaryCatchupOutcome, RocksDbCanonicalSecondary};
+pub use spike_in_process::{
+    SpikeBatchKind, SpikeBatchObserver, SpikeCanonicalViewFingerprint, SpikeCompactBlockCursor,
+    SpikeCompactBlockRead, SpikeCompactBlockRow, SpikeSnapshot, spike_block_replay_at,
+    spike_canonical_epoch_tip, spike_canonical_view_fingerprint, spike_compact_block_exists,
+    spike_compact_blocks, spike_install_batch_observer, spike_observed_write, spike_read_options,
+    spike_replay_scan_at_snapshot, spike_transaction_lookup,
+};
 pub use subtree_load::{
     CanonicalBuildSubtreeRoot, CanonicalSubtreeRootLoadCoverage, CanonicalSubtreeRootLoadEvidence,
 };

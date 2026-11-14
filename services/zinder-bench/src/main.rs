@@ -25,6 +25,7 @@ use zinder_source::{CookieSource, NodeAuth, ZebraJsonRpcSource, ZebraJsonRpcSour
 
 #[path = "canonical_replay_storage/command.rs"]
 mod canonical_replay_storage_command;
+mod in_process_serving;
 mod rocksdb_canonical_fixture_replay;
 mod rocksdb_compact_block_range;
 mod rocksdb_raw_blob_retention_comparison;
@@ -32,6 +33,7 @@ mod rocksdb_storage_lifecycle;
 mod rocksdb_wallet_rebuild;
 
 use canonical_replay_storage_command::{CanonicalReplayStorageArgs, run_canonical_replay_storage};
+use in_process_serving::{InProcessServingArgs, run_in_process_serving};
 use rocksdb_canonical_fixture_replay::{
     RocksDbCanonicalFixtureReplayArgs, run_rocksdb_canonical_fixture_replay,
 };
@@ -87,6 +89,9 @@ enum Command {
     /// Measure version-1 compact-block ranges through an admitted secondary.
     #[command(name = "rocksdb-compact-block-range")]
     RocksDbCompactBlockRange(RocksDbCompactBlockRangeArgs),
+    /// Spike: serve snapshot reads in-process while one writer commits canonical and wallet rows.
+    #[command(name = "rocksdb-in-process-serving")]
+    RocksDbInProcessServing(InProcessServingArgs),
 }
 
 #[derive(Args)]
@@ -248,6 +253,16 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
         Command::RocksDbCompactBlockRange(args) => {
             let output = run_rocksdb_compact_block_range(args)?;
             emit_report(&output.report, output.report_path.as_deref())
+        }
+        Command::RocksDbInProcessServing(args) => {
+            let output = run_in_process_serving(args).await?;
+            tracing::info!(
+                target: "zinder::bench",
+                event = "in_process_serving_report_written",
+                report = ?output.report_path,
+                "in-process serving spike finished"
+            );
+            Ok(())
         }
     }
 }

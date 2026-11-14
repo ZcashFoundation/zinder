@@ -27,6 +27,7 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "signal", "time"] }
 tokio-stream = { workspace = true, features = ["net"] }
+tokio-util.workspace = true
 tokio-postgres.workspace = true
 tonic.workspace = true
 tracing.workspace = true

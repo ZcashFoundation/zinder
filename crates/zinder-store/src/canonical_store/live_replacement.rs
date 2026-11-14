@@ -157,15 +157,18 @@ impl RocksDbCanonicalStore {
         write_options.disable_wal(false);
         write_options.set_sync(true);
         super::crash_point("canonical.live_replacement.before_atomic_write");
-        self.bounded_open
-            .db
-            .write_opt(&batch, &write_options)
-            .map_err(
-                |source| CanonicalStoreError::LiveCommitWriteOutcomeUnknown {
-                    path: self.bounded_open.db.path().to_path_buf(),
-                    source,
-                },
-            )?;
+        super::spike_in_process::spike_observed_write(
+            super::spike_in_process::SpikeBatchKind::CanonicalReplacement,
+            &self.bounded_open.db,
+            &mut batch,
+            &write_options,
+        )
+        .map_err(
+            |source| CanonicalStoreError::LiveCommitWriteOutcomeUnknown {
+                path: self.bounded_open.db.path().to_path_buf(),
+                source,
+            },
+        )?;
         super::crash_point("canonical.live_replacement.after_atomic_write");
         prepared.validate_readback(&mut self).map_err(|source| {
             CanonicalStoreError::LiveCommitCompletedButUnverified {
