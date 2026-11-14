@@ -39,7 +39,7 @@ tokio-stream.workspace = true
 tonic = { workspace = true, features = ["transport", "tls-ring", "tls-native-roots"], optional = true }
 tonic-types = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
-zinder-core = { version = "0.11.1", path = "../zinder-core", default-features = false }
+zinder-core = { version = "0.12.0", path = "../zinder-core", default-features = false }
 zinder-proto = { workspace = true, optional = true }
 
 [dev-dependencies]

@@ -1,6 +1,0 @@
-kind: fixed
-body: "`zinder-projector` no longer reports `syncing` with `lag_blocks: 1` for a moment after every block: a ready projector within one block of the canonical tip stays `ready` while it applies the block, and reports `syncing` only if 30 seconds pass without it applying a block or it trails by more than one block. `zinder-query` now exits promptly on `SIGTERM` even while wallets hold `ChainEvents` or `MempoolEvents` streams open: it ends every open stream with `UNAVAILABLE` and readiness cause `shutting_down`, and stops waiting for in-flight calls after 10 seconds, so it stops within the wallet-serving supervisor's 20-second grace window."
-time: 2026-11-14T18:00:00Z
-custom:
-  Bump: patch
-  PR: "182"
