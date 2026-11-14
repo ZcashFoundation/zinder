@@ -2,6 +2,8 @@
 //!
 //! Snapshot bootstrap writes a new generation without touching the shared
 //! chain-event cursor, then activates that generation in one metadata write.
+//! A snapshot built from genesis has no base rows; a store that has applied no
+//! block can instead activate an empty genesis generation directly.
 //! Steady-state blocks mutate only the active generation and persist complete
 //! before-images by height, allowing a reorg batch to restore summaries,
 //! ranking keys, aggregate statistics, and coverage atomically.
@@ -140,6 +142,16 @@ pub struct TransparentAddressRankingSnapshotPlan {
     pub base_coverage: TransparentAddressRankingCoverage,
 }
 
+impl TransparentAddressRankingSnapshotPlan {
+    const fn with_target_of(self, other: Self) -> Self {
+        Self {
+            target_height: other.target_height,
+            target_block_hash: other.target_block_hash,
+            ..self
+        }
+    }
+}
+
 /// Completeness claims attached to one active or building generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransparentAddressRankingCoverage {
@@ -151,6 +163,24 @@ pub struct TransparentAddressRankingCoverage {
     pub history_complete_through_height: Option<BlockHeight>,
     /// Whether lifetime totals and extrema cover the canonical history.
     pub lifetime_statistics_complete: bool,
+}
+
+impl TransparentAddressRankingCoverage {
+    /// Coverage of a generation that has applied no block above genesis.
+    ///
+    /// Balances are complete through height 0, and lifetime history is
+    /// complete over the empty range that starts at height 1. Applying height
+    /// 1 extends both, so a generation built from genesis keeps complete
+    /// lifetime statistics.
+    #[must_use]
+    pub const fn at_genesis() -> Self {
+        Self {
+            balance_complete_through_height: BlockHeight::new(0),
+            history_complete_from_height: Some(BlockHeight::new(1)),
+            history_complete_through_height: Some(BlockHeight::new(0)),
+            lifetime_statistics_complete: true,
+        }
+    }
 }
 
 /// Positive-address count and balance for one standard script template.
@@ -288,8 +318,11 @@ impl TransparentAddressRankingConsumer {
 
     /// Initializes or resumes one canonically pinned inactive snapshot build.
     ///
-    /// A different stale build is cleared before the new plan is persisted, so
-    /// rows absent from a restarted canonical snapshot cannot survive.
+    /// A build with the same generation, base, and row count resumes under the
+    /// requested target when its tail has not passed that target, so a build
+    /// that follows a moving visible tip keeps its progress. Any other stale
+    /// build is cleared before the new plan is persisted, so rows absent from a
+    /// restarted canonical snapshot cannot survive.
     pub fn initialize_snapshot_generation(
         store: &MaterializedViewStore,
         plan: TransparentAddressRankingSnapshotPlan,
@@ -312,8 +345,23 @@ impl TransparentAddressRankingConsumer {
             base_rows_complete: false,
         };
         let existing_build = read_snapshot_build_manifest(store)?;
-        if existing_build.is_some_and(|existing| existing.plan == plan) {
-            return Ok(());
+        if let Some(existing) = existing_build {
+            if existing.plan == plan {
+                return Ok(());
+            }
+            if existing.plan.with_target_of(plan) == plan
+                && Self::build_metadata(store)?.is_some_and(|metadata| {
+                    metadata.generation == plan.generation
+                        && metadata.coverage.balance_complete_through_height <= plan.target_height
+                })
+            {
+                store.put_consumer(
+                    TRANSPARENT_ADDRESS_RANKING_METADATA_COLUMN_FAMILY,
+                    BUILD_MANIFEST_KEY,
+                    &encode_snapshot_build_manifest(SnapshotBuildManifest { plan, ..existing }),
+                )?;
+                return Ok(());
+            }
         }
         let mut batch = WriteBatch::default();
         if let Some(existing) = existing_build {
@@ -445,44 +493,27 @@ impl TransparentAddressRankingConsumer {
         Ok(())
     }
 
-    /// Applies one canonical unsettled block to an inactive settled base.
+    /// Applies contiguous canonical blocks to an inactive settled base in one
+    /// write.
     ///
-    /// The write is cursor-neutral and persists the same undo journal normal
-    /// live dispatch would need if a later reorg reaches this height.
-    pub fn write_snapshot_tail_block(
+    /// The write is cursor-neutral and persists the same undo journals normal
+    /// live dispatch would need if a later reorg reaches these heights. Blocks
+    /// at or below the build's coverage are verified against their journals
+    /// instead of being applied again.
+    pub fn write_snapshot_tail_blocks(
         store: &MaterializedViewStore,
         generation: u64,
-        block: &BlockCommitContext,
+        blocks: &[BlockCommitContext],
     ) -> Result<(), TransparentAddressRankingConsumerError> {
-        let manifest = read_snapshot_build_manifest(store)?
-            .filter(|manifest| manifest.plan.generation == generation)
-            .ok_or(TransparentAddressRankingConsumerError::SnapshotBuildMissing { generation })?;
-        if !manifest.base_rows_complete {
-            return Err(TransparentAddressRankingConsumerError::SnapshotBaseIncomplete);
-        }
-        let metadata = Self::build_metadata(store)?
-            .filter(|metadata| metadata.generation == generation)
-            .ok_or(TransparentAddressRankingConsumerError::SnapshotBuildMissing { generation })?;
-        if block.height > manifest.plan.target_height {
-            return Err(TransparentAddressRankingConsumerError::SnapshotTailPastTarget);
-        }
-        if block.height <= metadata.coverage.balance_complete_through_height {
-            return verify_applied_block(store, generation, block);
-        }
-
-        let mut consumer = Self::new();
-        consumer.pending_metadata = Some(metadata);
+        let (manifest, metadata) = sealed_snapshot_build(store, generation)?;
         let mut batch = WriteBatch::default();
-        let mut ctx = MaterializedViewConsumerCtx {
-            store,
-            batch: &mut batch,
-        };
-        consumer.apply_block(block, &mut ctx).map_err(|error| {
-            TransparentAddressRankingConsumerError::SnapshotTail(error.to_string())
-        })?;
-        let mut updated = consumer
+        let consumer = Self::stage_snapshot_tail(store, &manifest, metadata, blocks, &mut batch)?;
+        let Some(mut updated) = consumer
             .pending_metadata
-            .ok_or(TransparentAddressRankingConsumerError::SnapshotBaseIncomplete)?;
+            .filter(|updated| updated.coverage != metadata.coverage)
+        else {
+            return Ok(());
+        };
         let (top_ten_sum, top_hundred_sum) =
             top_balance_sums_with_overlay(store, generation, &consumer.pending_summaries)?;
         updated.top_10_balance_zat = top_ten_sum;
@@ -495,12 +526,20 @@ impl TransparentAddressRankingConsumer {
     }
 
     /// Atomically activates a built generation at one chain-event boundary.
+    ///
+    /// `unsettled_tail` carries the canonical blocks between the build's
+    /// coverage and its target. They are applied in the same write that
+    /// activates the generation and adopts `cursor_bytes`, so an interrupted
+    /// activation never leaves replaceable blocks in an inactive build.
+    /// Repeating an activation that already happened returns the active
+    /// metadata when the active cursor matches.
     pub fn activate_snapshot_generation_at_cursor(
         store: &MaterializedViewStore,
         generation: u64,
+        unsettled_tail: &[BlockCommitContext],
         cursor_bytes: &[u8],
     ) -> Result<TransparentAddressRankingMetadata, TransparentAddressRankingConsumerError> {
-        let Some(mut metadata) = Self::build_metadata(store)? else {
+        let Some(metadata) = Self::build_metadata(store)? else {
             let active = Self::active_metadata(store)?
                 .filter(|active| active.generation == generation)
                 .ok_or(
@@ -521,23 +560,33 @@ impl TransparentAddressRankingConsumer {
                 },
             );
         }
-        let manifest = read_snapshot_build_manifest(store)?
-            .filter(|manifest| manifest.plan.generation == generation)
-            .ok_or(TransparentAddressRankingConsumerError::SnapshotBuildMissing { generation })?;
-        if !manifest.base_rows_complete
-            || metadata.coverage.balance_complete_through_height != manifest.plan.target_height
-            || metadata.coverage.history_complete_through_height
-                != Some(manifest.plan.target_height)
+        let (manifest, metadata) = sealed_snapshot_build(store, generation)?;
+        let mut batch = WriteBatch::default();
+        let consumer =
+            Self::stage_snapshot_tail(store, &manifest, metadata, unsettled_tail, &mut batch)?;
+        let mut metadata = consumer
+            .pending_metadata
+            .ok_or(TransparentAddressRankingConsumerError::SnapshotTailIncomplete)?;
+        let target_height = manifest.plan.target_height;
+        if metadata.coverage.balance_complete_through_height != target_height
+            || metadata.coverage.history_complete_through_height != Some(target_height)
         {
             return Err(TransparentAddressRankingConsumerError::SnapshotTailIncomplete);
         }
-        verify_snapshot_target(store, &manifest)?;
-        let (top_ten_sum, top_hundred_sum) = top_balance_sums_for_generation(store, generation)?;
+        match unsettled_tail.last() {
+            Some(block) if block.height == target_height => {
+                if block.block_hash != manifest.plan.target_block_hash {
+                    return Err(TransparentAddressRankingConsumerError::SnapshotTargetMismatch);
+                }
+            }
+            Some(_) | None => verify_snapshot_target(store, &manifest)?,
+        }
+        let (top_ten_sum, top_hundred_sum) =
+            top_balance_sums_with_overlay(store, generation, &consumer.pending_summaries)?;
         metadata.top_10_balance_zat = top_ten_sum;
         metadata.top_100_balance_zat = top_hundred_sum;
         let metadata_cf =
             store.consumer_column_family(TRANSPARENT_ADDRESS_RANKING_METADATA_COLUMN_FAMILY)?;
-        let mut batch = WriteBatch::default();
         batch.put_cf(&metadata_cf, ACTIVE_METADATA_KEY, encode_metadata(metadata));
         batch.delete_cf(&metadata_cf, BUILD_METADATA_KEY);
         batch.delete_cf(&metadata_cf, BUILD_MANIFEST_KEY);
@@ -546,6 +595,38 @@ impl TransparentAddressRankingConsumer {
             TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME,
             cursor_bytes,
         )?;
+        store.write_consumer_batch(TRANSPARENT_ADDRESS_RANKING_SCHEMA.name, &batch)?;
+        Ok(metadata)
+    }
+
+    /// Activates an empty generation that has applied no block above genesis.
+    ///
+    /// A view store that has not materialized any height uses this so the
+    /// ranking replays canonical history from height 1 together with the other
+    /// views. Any inactive build is discarded. The generation joins without a
+    /// chain-event cursor, so the replay that applies height 1 supplies it.
+    pub fn activate_genesis_generation(
+        store: &MaterializedViewStore,
+    ) -> Result<TransparentAddressRankingMetadata, TransparentAddressRankingConsumerError> {
+        if let Some(active) = Self::active_metadata(store)? {
+            return Err(
+                TransparentAddressRankingConsumerError::GenerationAlreadyActive {
+                    generation: active.generation,
+                },
+            );
+        }
+        let generation = Self::build_metadata(store)?.map_or(1, |build| build.generation);
+        let metadata = TransparentAddressRankingMetadata::empty(
+            generation,
+            TransparentAddressRankingCoverage::at_genesis(),
+        );
+        let mut batch = WriteBatch::default();
+        stage_generation_clear(store, &mut batch, generation)?;
+        let metadata_cf =
+            store.consumer_column_family(TRANSPARENT_ADDRESS_RANKING_METADATA_COLUMN_FAMILY)?;
+        batch.delete_cf(&metadata_cf, BUILD_METADATA_KEY);
+        batch.delete_cf(&metadata_cf, BUILD_MANIFEST_KEY);
+        batch.put_cf(&metadata_cf, ACTIVE_METADATA_KEY, encode_metadata(metadata));
         store.write_consumer_batch(TRANSPARENT_ADDRESS_RANKING_SCHEMA.name, &batch)?;
         Ok(metadata)
     }
@@ -648,6 +729,27 @@ impl TransparentAddressRankingConsumer {
             )?
             .map(|payload| decode_summary(&payload))
             .transpose()
+    }
+
+    fn stage_snapshot_tail(
+        store: &MaterializedViewStore,
+        manifest: &SnapshotBuildManifest,
+        metadata: TransparentAddressRankingMetadata,
+        blocks: &[BlockCommitContext],
+        batch: &mut WriteBatch,
+    ) -> Result<Self, TransparentAddressRankingConsumerError> {
+        let mut consumer = Self::new();
+        consumer.pending_metadata = Some(metadata);
+        let mut ctx = MaterializedViewConsumerCtx { store, batch };
+        for block in blocks {
+            if block.height > manifest.plan.target_height {
+                return Err(TransparentAddressRankingConsumerError::SnapshotTailPastTarget);
+            }
+            consumer.apply_block(block, &mut ctx).map_err(|error| {
+                TransparentAddressRankingConsumerError::SnapshotTail(error.to_string())
+            })?;
+        }
+        Ok(consumer)
     }
 
     fn stage_summary_transition(
@@ -1029,7 +1131,9 @@ fn validate_coverage(
         coverage.history_complete_from_height,
         coverage.history_complete_through_height,
     ) {
-        (Some(from), Some(through)) if from <= through => {}
+        // `from == through + 1` is the empty range a generation built from
+        // genesis starts with.
+        (Some(from), Some(through)) if from.value() <= through.value().saturating_add(1) => {}
         (None, None) if !coverage.lifetime_statistics_complete => {}
         _ => return Err(TransparentAddressRankingConsumerError::InvalidCoverage),
     }
@@ -1207,6 +1311,25 @@ fn verify_applied_block(
     Ok(())
 }
 
+fn sealed_snapshot_build(
+    store: &MaterializedViewStore,
+    generation: u64,
+) -> Result<
+    (SnapshotBuildManifest, TransparentAddressRankingMetadata),
+    TransparentAddressRankingConsumerError,
+> {
+    let manifest = read_snapshot_build_manifest(store)?
+        .filter(|manifest| manifest.plan.generation == generation)
+        .ok_or(TransparentAddressRankingConsumerError::SnapshotBuildMissing { generation })?;
+    if !manifest.base_rows_complete {
+        return Err(TransparentAddressRankingConsumerError::SnapshotBaseIncomplete);
+    }
+    let metadata = TransparentAddressRankingConsumer::build_metadata(store)?
+        .filter(|metadata| metadata.generation == generation)
+        .ok_or(TransparentAddressRankingConsumerError::SnapshotBuildMissing { generation })?;
+    Ok((manifest, metadata))
+}
+
 fn verify_snapshot_target(
     store: &MaterializedViewStore,
     manifest: &SnapshotBuildManifest,
@@ -1337,20 +1460,6 @@ fn stage_ranking_put(
         );
     }
     Ok(())
-}
-
-fn top_balance_sums_for_generation(
-    store: &MaterializedViewStore,
-    generation: u64,
-) -> Result<(u64, u64), TransparentAddressRankingConsumerError> {
-    let (start, end) = generation_range(generation);
-    let rows = store.range_iterate_consumer(
-        TRANSPARENT_ADDRESS_RANKING_INDEX_COLUMN_FAMILY,
-        &start,
-        &end,
-        TOP_ONE_HUNDRED,
-    )?;
-    top_balance_sums(rows.into_iter().map(|(key, _)| key))
 }
 
 fn top_balance_sums_with_overlay(
@@ -1951,6 +2060,12 @@ pub enum TransparentAddressRankingConsumerError {
         /// Rejected generation.
         generation: u64,
     },
+    /// A genesis generation was requested while another generation is active.
+    #[error("transparent-address ranking generation {generation} is already active")]
+    GenerationAlreadyActive {
+        /// Active generation.
+        generation: u64,
+    },
     /// Another snapshot generation is already building.
     #[error(
         "transparent-address ranking generation {requested_generation} conflicts with building generation {existing_generation}"
@@ -2193,6 +2308,7 @@ mod tests {
         TransparentAddressRankingConsumer::activate_snapshot_generation_at_cursor(
             store,
             generation,
+            &[],
             &[9, 8, 7],
         )
     }
@@ -2580,8 +2696,16 @@ mod tests {
             }],
         )?;
         TransparentAddressRankingConsumer::finalize_snapshot_base(&store, 8)?;
-        TransparentAddressRankingConsumer::write_snapshot_tail_block(&store, 8, &block)?;
-        TransparentAddressRankingConsumer::write_snapshot_tail_block(&store, 8, &block)?;
+        TransparentAddressRankingConsumer::write_snapshot_tail_blocks(
+            &store,
+            8,
+            std::slice::from_ref(&block),
+        )?;
+        TransparentAddressRankingConsumer::write_snapshot_tail_blocks(
+            &store,
+            8,
+            std::slice::from_ref(&block),
+        )?;
         assert!(
             store
                 .get_chain_event_cursor(super::TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)?
@@ -2590,6 +2714,7 @@ mod tests {
         TransparentAddressRankingConsumer::activate_snapshot_generation_at_cursor(
             &store,
             8,
+            &[],
             &[4, 5, 6],
         )?;
         let mut consumer = TransparentAddressRankingConsumer::new();
@@ -2721,5 +2846,231 @@ mod tests {
             .is_none()
         );
         Ok(())
+    }
+
+    fn genesis_plan(
+        generation: u64,
+        target: &BlockCommitContext,
+    ) -> TransparentAddressRankingSnapshotPlan {
+        TransparentAddressRankingSnapshotPlan {
+            generation,
+            base_height: BlockHeight::new(0),
+            base_block_hash: zinder_core::Network::ZcashRegtest.genesis_hash(),
+            target_height: target.height,
+            target_block_hash: target.block_hash,
+            expected_summary_count: 0,
+            base_coverage: TransparentAddressRankingCoverage::at_genesis(),
+        }
+    }
+
+    fn build_coverage_height(store: &MaterializedViewStore) -> TestResult<BlockHeight> {
+        Ok(TransparentAddressRankingConsumer::build_metadata(store)?
+            .ok_or("build metadata missing")?
+            .coverage
+            .balance_complete_through_height)
+    }
+
+    #[test]
+    fn genesis_generation_applies_height_one_with_complete_lifetime_coverage() -> TestResult {
+        let (_tempdir, store) = open_store()?;
+        let script = p2pkh(11);
+        let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script);
+        let activated = TransparentAddressRankingConsumer::activate_genesis_generation(&store)?;
+        assert_eq!(activated.generation, 1);
+        assert_eq!(
+            activated.coverage,
+            TransparentAddressRankingCoverage::at_genesis()
+        );
+        assert_eq!(
+            TransparentAddressRankingConsumer::active_metadata(&store)?,
+            Some(activated)
+        );
+        assert!(
+            store
+                .get_chain_event_cursor(super::TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)?
+                .is_none()
+        );
+
+        let mut consumer = TransparentAddressRankingConsumer::new();
+        apply_and_commit(&store, &mut consumer, &receive_block(1, script, 40))?;
+
+        let metadata = TransparentAddressRankingConsumer::active_metadata(&store)?
+            .ok_or("active metadata missing")?;
+        assert_eq!(metadata.coverage, coverage(1));
+        assert_eq!(metadata.total_positive_balance_zat, 40);
+        let summary = TransparentAddressRankingConsumer::summary(&store, address_script_hash)?
+            .ok_or("summary missing")?;
+        assert_eq!(summary.balance_zat, 40);
+        assert_eq!(summary.distinct_transaction_count, 1);
+        assert!(matches!(
+            TransparentAddressRankingConsumer::activate_genesis_generation(&store),
+            Err(
+                super::TransparentAddressRankingConsumerError::GenerationAlreadyActive {
+                    generation: 1
+                }
+            )
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn genesis_generation_discards_an_inactive_build() -> TestResult {
+        let (_tempdir, store) = open_store()?;
+        let script = p2pkh(12);
+        let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script);
+        initialize(&store, 3, 9, 1)?;
+        TransparentAddressRankingConsumer::write_snapshot_batch(
+            &store,
+            3,
+            &[TransparentAddressRankingSnapshotRow {
+                address_script_hash,
+                summary: summary(Some(script), 50),
+            }],
+        )?;
+
+        let activated = TransparentAddressRankingConsumer::activate_genesis_generation(&store)?;
+
+        assert_eq!(activated.generation, 3);
+        assert_eq!(activated.positive_address_count, 0);
+        assert!(TransparentAddressRankingConsumer::build_metadata(&store)?.is_none());
+        assert!(TransparentAddressRankingConsumer::summary(&store, address_script_hash)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn genesis_build_keeps_its_tail_while_the_target_advances() -> TestResult {
+        let (_tempdir, store) = open_store()?;
+        let script = p2sh(13);
+        let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script);
+        let blocks = (1..=4)
+            .map(|height| receive_block(height, script.clone(), u64::from(height)))
+            .collect::<Vec<_>>();
+        TransparentAddressRankingConsumer::initialize_snapshot_generation(
+            &store,
+            genesis_plan(1, &blocks[1]),
+        )?;
+        TransparentAddressRankingConsumer::finalize_snapshot_base(&store, 1)?;
+        TransparentAddressRankingConsumer::write_snapshot_tail_blocks(&store, 1, &blocks[..2])?;
+        assert_eq!(build_coverage_height(&store)?, BlockHeight::new(2));
+
+        TransparentAddressRankingConsumer::initialize_snapshot_generation(
+            &store,
+            genesis_plan(1, &blocks[3]),
+        )?;
+        assert_eq!(build_coverage_height(&store)?, BlockHeight::new(2));
+        TransparentAddressRankingConsumer::write_snapshot_tail_blocks(&store, 1, &blocks[2..3])?;
+        assert!(TransparentAddressRankingConsumer::active_metadata(&store)?.is_none());
+
+        let activated = TransparentAddressRankingConsumer::activate_snapshot_generation_at_cursor(
+            &store,
+            1,
+            &blocks[3..],
+            &[1, 2, 3],
+        )?;
+        assert_eq!(activated.coverage, coverage(4));
+        assert_eq!(activated.total_positive_balance_zat, 10);
+        assert_eq!(activated.p2sh.total_positive_balance_zat, 10);
+        assert_eq!(activated.top_10_balance_zat, 10);
+        assert!(TransparentAddressRankingConsumer::build_metadata(&store)?.is_none());
+        assert_eq!(
+            store
+                .get_chain_event_cursor(super::TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)?
+                .as_deref(),
+            Some([1, 2, 3].as_slice())
+        );
+        let summary = TransparentAddressRankingConsumer::summary(&store, address_script_hash)?
+            .ok_or("summary missing")?;
+        assert_eq!(summary.balance_zat, 10);
+        assert_eq!(summary.distinct_transaction_count, 4);
+
+        let mut batch = WriteBatch::default();
+        let mut context = MaterializedViewConsumerCtx {
+            store: &store,
+            batch: &mut batch,
+        };
+        let mut consumer = TransparentAddressRankingConsumer::new();
+        consumer.begin_batch(&mut context)?;
+        consumer.revert_block(BlockHeight::new(4), &mut context)?;
+        consumer.finish_batch(&mut context)?;
+        store.write_batch(&batch)?;
+        let reverted = TransparentAddressRankingConsumer::summary(&store, address_script_hash)?
+            .ok_or("summary missing after reverting the activation tail")?;
+        assert_eq!(reverted.balance_zat, 6);
+        Ok(())
+    }
+
+    #[test]
+    fn genesis_build_restarts_when_the_target_falls_below_its_tail() -> TestResult {
+        let (_tempdir, store) = open_store()?;
+        let blocks = (1..=2)
+            .map(|height| receive_block(height, p2pkh(14), 5))
+            .collect::<Vec<_>>();
+        TransparentAddressRankingConsumer::initialize_snapshot_generation(
+            &store,
+            genesis_plan(1, &blocks[1]),
+        )?;
+        TransparentAddressRankingConsumer::finalize_snapshot_base(&store, 1)?;
+        TransparentAddressRankingConsumer::write_snapshot_tail_blocks(&store, 1, &blocks)?;
+
+        TransparentAddressRankingConsumer::initialize_snapshot_generation(
+            &store,
+            genesis_plan(1, &blocks[0]),
+        )?;
+
+        assert_eq!(build_coverage_height(&store)?, BlockHeight::new(0));
+        let build = TransparentAddressRankingConsumer::build_metadata(&store)?
+            .ok_or("build metadata missing")?;
+        assert_eq!(build.positive_address_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn activation_refuses_a_tail_that_ends_on_another_block() -> TestResult {
+        let (_tempdir, store) = open_store()?;
+        let target = receive_block(1, p2pkh(15), 5);
+        let replacement = BlockCommitContext::new(
+            BlockCommitInput {
+                height: target.height,
+                block_hash: BlockHash::from_bytes([0xee; 32]),
+                previous_block_hash: target.previous_block_hash,
+                block_time_unix_seconds: target.block_time_unix_seconds,
+                block_size_bytes: 0,
+                transactions: target.transactions.clone(),
+                final_note_commitment_roots: None,
+            },
+            TransparentSpendFacts::Offline,
+        );
+        TransparentAddressRankingConsumer::initialize_snapshot_generation(
+            &store,
+            genesis_plan(1, &target),
+        )?;
+        TransparentAddressRankingConsumer::finalize_snapshot_base(&store, 1)?;
+
+        assert!(matches!(
+            TransparentAddressRankingConsumer::activate_snapshot_generation_at_cursor(
+                &store,
+                1,
+                std::slice::from_ref(&replacement),
+                &[1],
+            ),
+            Err(super::TransparentAddressRankingConsumerError::SnapshotTargetMismatch)
+        ));
+        assert!(TransparentAddressRankingConsumer::active_metadata(&store)?.is_none());
+        assert_eq!(build_coverage_height(&store)?, BlockHeight::new(0));
+        Ok(())
+    }
+
+    #[test]
+    fn coverage_admits_only_the_empty_range_that_starts_after_the_balance() {
+        assert!(super::validate_coverage(TransparentAddressRankingCoverage::at_genesis()).is_ok());
+        assert!(
+            super::validate_coverage(TransparentAddressRankingCoverage {
+                balance_complete_through_height: BlockHeight::new(4),
+                history_complete_from_height: Some(BlockHeight::new(6)),
+                history_complete_through_height: Some(BlockHeight::new(4)),
+                lifetime_statistics_complete: false,
+            })
+            .is_err()
+        );
     }
 }

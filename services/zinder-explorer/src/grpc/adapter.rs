@@ -1878,4 +1878,37 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn transparent_address_capabilities_follow_the_active_ranking_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tempdir = tempdir()?;
+        let materialized_view_store = MaterializedViewStore::open(
+            tempdir.path(),
+            MaterializedViewStoreOptions {
+                consumers: MaterializedViewStore::bundled_consumers(),
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                sync_writes: false,
+            },
+        )?;
+        let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings::default())
+            .with_materialized_view_store(materialized_view_store.clone())
+            .with_wallet_query_endpoint(String::from("http://127.0.0.1:1"));
+        let ranking_capabilities = [
+            EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2,
+            EXPLORER_TRANSPARENT_ADDRESS_RANKING_V1,
+        ];
+        for capability in &ranking_capabilities {
+            assert!(!adapter.advertised_capabilities().contains(capability));
+        }
+
+        zinder_materialized_views::TransparentAddressRankingConsumer::activate_genesis_generation(
+            &materialized_view_store,
+        )?;
+
+        for capability in &ranking_capabilities {
+            assert!(adapter.advertised_capabilities().contains(capability));
+        }
+        Ok(())
+    }
 }

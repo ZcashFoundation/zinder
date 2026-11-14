@@ -230,8 +230,16 @@ or decoding every ranked row.
 The method is available only while an active materialized generation exists.
 Its `ExplorerFreshness` must describe the same materialized-view cursor and canonical epoch
 as that generation; an in-progress replacement generation is never visible.
-This gives dashboards and agents a stable rank snapshot while ingest constructs
-or resumes a replacement after a schema change or interrupted bootstrap.
+This gives dashboards and agents a stable rank snapshot while ingest builds or
+resumes an inactive generation.
+
+Ingest publishes the generation without an operator step. A fresh Explorer
+views build activates it at genesis, and its coverage then advances with the
+shared replay like every other view's. A store whose views were built without
+the ranking builds it from genesis in the background and activates it at the
+shared replay cursor. [Publishing the canonical
+snapshot](materialized-view-plane.md#publishing-the-canonical-snapshot)
+describes both paths.
 
 ## Fee summary
 
@@ -305,7 +313,7 @@ The explorer plane uses the `explorer.*` capability prefix. The full namespace s
 | `explorer.block.detail_v1` | `ExplorerQuery.BlockDetail` per-tx rows | When the block-detail consumer is built and caught up |
 | `explorer.block.activity_distribution_v1` | `ExplorerQuery.BlockActivityDistribution` | When the block-summary consumer and wallet endpoint are available |
 | `explorer.transparent_address.activity_v1` | `ExplorerQuery.TransparentAddressActivity` | When the wallet endpoint is configured |
-| `explorer.transparent_address.activity_v2` | `ExplorerQuery.TransparentAddressActivity` | When the wallet endpoint plus explorer activity and ranking consumers are available, and the ranking has an active complete generation |
+| `explorer.transparent_address.activity_v2` | `ExplorerQuery.TransparentAddressActivity` | When the wallet endpoint plus explorer activity and ranking consumers are available, and the ranking has an active generation |
 | `explorer.transparent_address.deltas_v1` | `ExplorerQuery.TransparentAddressDeltas` | When the wallet endpoint is configured |
 | `explorer.transparent_address.ranking_v1` | `ExplorerQuery.TransparentAddressRanking` | When the ranking consumer has an active generation and the wallet endpoint is configured |
 | `explorer.mempool.summary_v1` | `ExplorerQuery.MempoolSummary` | When the wallet endpoint is configured |

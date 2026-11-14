@@ -57,6 +57,8 @@ use crate::{
     transaction_component_backfill::seed_transaction_component_visible_tail,
 };
 
+mod transparent_address_ranking;
+
 const MATERIALIZED_VIEW_REPLAY_STAGE_READ_EVENTS: &str = "read_events";
 const MATERIALIZED_VIEW_REPLAY_STAGE_HYDRATE_BLOCKS: &str = "hydrate_blocks";
 const MATERIALIZED_VIEW_REPLAY_STAGE_DISPATCH_EVENT: &str = "dispatch_event";
@@ -745,7 +747,9 @@ impl MaterializedViewTailer {
         self.canonical.write().try_catch_up()?;
         let canonical = self.canonical.read();
         self.replay_event_only_consumers(&canonical)?;
-        self.replay_block_consumers(&canonical, pass)
+        self.join_transparent_address_ranking_at_genesis(&canonical)?;
+        self.replay_block_consumers(&canonical, pass)?;
+        self.build_transparent_address_ranking(&canonical, pass)
     }
 
     /// Replays retained transitions into the block-keyed consumers, then

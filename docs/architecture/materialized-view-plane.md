@@ -154,6 +154,30 @@ No bundled runtime drives `MempoolEvents` consumers yet.
 nothing calls `MaterializedViewStore::write_mempool_event`, so its column
 family receives no rows.
 
+### Publishing the canonical snapshot
+
+The transparent-address ranking is the only `CanonicalSnapshot` consumer. Its
+summaries are cumulative, so it cannot join the shared replay cursor partway
+through history. The ingest replay host publishes its snapshot in one of two
+ways:
+
+- On a view store that has not materialized any height, the host activates an
+  empty generation at genesis before the first rebuild. Its coverage is
+  complete through height 0, and its lifetime history is the empty range that
+  starts at height 1. The ranking then replays from height 1 with every other
+  block consumer and follows the tip at the shared cursor.
+- On a store whose views materialized heights without the ranking, the host
+  builds an inactive generation from genesis. It starts only while the shared
+  replay sits at the canonical fence. Each replay pass extends the build over
+  settled history for at most 10 seconds, so the other views keep following
+  the tip. The build resumes after a restart and adopts each pass's visible tip
+  as its target.
+
+The pass that reaches the settled tip reads the unsettled tail, at most one
+reorg window long. One write applies that tail, activates the generation, and
+adopts the shared cursor. Settled heights never change, so the inactive build
+never holds a block that a reorg could replace.
+
 ## Store contract
 
 `MaterializedViewStore` is a separate RocksDB instance located under

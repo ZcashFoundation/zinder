@@ -21,11 +21,14 @@ use zinder_ingest::{
     load_fresh_canonical, spawn_materialized_view_tailer_task,
 };
 use zinder_materialized_views::{
-    BLOCK_SUMMARY_COLUMN_FAMILY, BlockSummaryConsumer, ChainEventBlockJoin,
+    BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME, BlockSummaryConsumer,
     MaterializedViewConsumerName, MaterializedViewDispatch, MaterializedViewStore,
     MaterializedViewStoreOptions, MaterializedViewStoreTable, RECENT_TRANSACTIONS_CONSUMER_NAME,
-    REORG_INCIDENTS_CONSUMER_NAME, bundled_materialized_view_consumer_definitions,
-    decode_stored_record,
+    REORG_INCIDENTS_CONSUMER_NAME, TRANSPARENT_ADDRESS_RANKING_COLUMN_FAMILIES,
+    TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME, TRANSPARENT_ADDRESS_RANKING_MAX_PAGE_SIZE,
+    TransparentAddressRankingConsumer, TransparentAddressRankingCoverage,
+    TransparentAddressRankingMetadata, TransparentAddressRankingPage,
+    bundled_materialized_view_consumer_definitions, decode_stored_record,
 };
 use zinder_proto::v1::wallet::{MaterializedViewHealth, MaterializedViewStatus};
 use zinder_runtime::{ComposedReadiness, IngestPhase, Readiness};
@@ -51,6 +54,7 @@ const CHAIN_TIP_HEIGHT: u32 = 4;
 const REPLACEMENT_TIP_HEIGHT: u32 = 5;
 const REORG_WINDOW_BLOCKS: u32 = 2;
 const UNCURSORED_HEAD_REPLACED_EVENT: &str = "materialized_view_replay_uncursored_head_replaced";
+const RANKING_ACTIVATED_EVENT: &str = "transparent_address_ranking_activated";
 
 #[tokio::test]
 async fn a_fresh_view_store_rebuilds_the_rows_event_replay_would_have_written()
@@ -214,19 +218,14 @@ async fn catching_up_a_fresh_store_advances_every_dispatched_consumer_to_the_new
         .get_chain_event_cursor(REORG_INCIDENTS_CONSUMER_NAME)?
         .ok_or("the event-only consumer must observe every retained event")?;
     for definition in bundled_materialized_view_consumer_definitions() {
+        // A fresh store publishes its canonical snapshot at genesis, so a
+        // snapshot-joined consumer replays with every other block consumer.
         let expected_cursor = match definition.dispatch {
-            MaterializedViewDispatch::ChainEventBlocks {
-                join: ChainEventBlockJoin::Replay | ChainEventBlockJoin::CanonicalBackfill,
-                ..
-            }
+            MaterializedViewDispatch::ChainEventBlocks { .. }
             | MaterializedViewDispatch::ChainEventEnvelope { .. } => {
                 Some(newest_event_cursor.as_slice())
             }
-            MaterializedViewDispatch::ChainEventBlocks {
-                join: ChainEventBlockJoin::CanonicalSnapshot { .. },
-                ..
-            }
-            | MaterializedViewDispatch::MempoolEvents { .. }
+            MaterializedViewDispatch::MempoolEvents { .. }
             | MaterializedViewDispatch::CanonicalBackfillOnly => None,
         };
         assert_eq!(
@@ -237,6 +236,89 @@ async fn catching_up_a_fresh_store_advances_every_dispatched_consumer_to_the_new
             definition.schema.name.as_str()
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_fresh_view_store_publishes_the_transparent_address_ranking_and_follows_the_tip()
+-> Result<(), Box<dyn Error>> {
+    let mut harness = CanonicalHarness::baseline().await?;
+    harness.follow_to_tip().await?;
+    let (_directory, view) = view_store()?;
+    harness.tailer(&view).catch_up()?;
+
+    let (metadata, page) = transparent_address_ranking(&view)?;
+    assert_eq!(
+        metadata.coverage,
+        complete_ranking_coverage(CHAIN_TIP_HEIGHT)
+    );
+    assert_eq!(
+        view.get_chain_event_cursor(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)?,
+        view.get_chain_event_cursor(BLOCK_SUMMARY_CONSUMER_NAME)?,
+        "the ranking must replay at the shared block-consumer cursor"
+    );
+    let top = page
+        .entries
+        .first()
+        .ok_or("the fixture chain must rank at least one transparent address")?;
+    let summary = TransparentAddressRankingConsumer::summary(&view, top.address_script_hash)?
+        .ok_or("TransparentAddressActivity reads a summary for every ranked address")?;
+    assert_eq!(summary, top.summary);
+    assert!(summary.balance_zat > 0);
+
+    harness.replace_tip().await?;
+    harness.tailer(&view).catch_up()?;
+    let (_rebuilt_directory, rebuilt) = view_store()?;
+    harness.tailer(&rebuilt).catch_up()?;
+
+    let followed = transparent_address_ranking(&view)?;
+    assert_eq!(
+        followed.0.coverage,
+        complete_ranking_coverage(REPLACEMENT_TIP_HEIGHT)
+    );
+    assert_eq!(followed, transparent_address_ranking(&rebuilt)?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_view_store_built_without_the_ranking_builds_and_activates_it_in_place()
+-> Result<(), Box<dyn Error>> {
+    let mut harness = CanonicalHarness::baseline().await?;
+    harness.follow_to_tip().await?;
+    let (directory, view) = view_store()?;
+    harness.tailer(&view).catch_up()?;
+    drop(view);
+    clear_transparent_address_ranking(directory.path())?;
+    let view = open_view_store(directory.path())?;
+    assert!(TransparentAddressRankingConsumer::active_metadata(&view)?.is_none());
+
+    let capture = LogCapture::install_for_target("zinder::ingest");
+    harness.tailer(&view).catch_up()?;
+
+    let (_rebuilt_directory, rebuilt) = view_store()?;
+    harness.tailer(&rebuilt).catch_up()?;
+    assert!(
+        capture.any(|event| event.field("event") == Some(RANKING_ACTIVATED_EVENT)),
+        "a store built without the ranking must build and activate it in place"
+    );
+    let (metadata, _) = transparent_address_ranking(&view)?;
+    assert_eq!(
+        metadata.coverage,
+        complete_ranking_coverage(CHAIN_TIP_HEIGHT)
+    );
+    assert_eq!(
+        transparent_address_ranking(&view)?,
+        transparent_address_ranking(&rebuilt)?
+    );
+    assert_eq!(chain_event_cursors(&view)?, chain_event_cursors(&rebuilt)?);
+
+    harness.replace_tip().await?;
+    harness.tailer(&view).catch_up()?;
+    harness.tailer(&rebuilt).catch_up()?;
+    assert_eq!(
+        transparent_address_ranking(&view)?,
+        transparent_address_ranking(&rebuilt)?
+    );
     Ok(())
 }
 
@@ -354,6 +436,66 @@ fn delete_chain_event_cursors(
         db.delete_cf(&cursors, consumer.as_str().as_bytes())?;
     }
     Ok(())
+}
+
+/// Removes every transparent-address ranking row and its cursor from a closed
+/// view store, as a store whose views were built before the ranking was
+/// published leaves them.
+fn clear_transparent_address_ranking(path: &Path) -> Result<(), Box<dyn Error>> {
+    let options = rust_rocksdb::Options::default();
+    let column_families = rust_rocksdb::DB::list_cf(&options, path)?;
+    let db = rust_rocksdb::DB::open_cf(&options, path, &column_families)?;
+    for column_family in TRANSPARENT_ADDRESS_RANKING_COLUMN_FAMILIES {
+        let handle = db
+            .cf_handle(column_family)
+            .ok_or("a view store must own every ranking column family")?;
+        let keys = db
+            .iterator_cf(&handle, rust_rocksdb::IteratorMode::Start)
+            .map(|entry| entry.map(|(key, _)| key))
+            .collect::<Result<Vec<_>, _>>()?;
+        for key in keys {
+            db.delete_cf(&handle, key)?;
+        }
+    }
+    let cursors = db
+        .cf_handle(MaterializedViewStoreTable::ChainEventCursor.column_family_name())
+        .ok_or("a view store must own the chain-event cursor column family")?;
+    db.delete_cf(
+        &cursors,
+        TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME
+            .as_str()
+            .as_bytes(),
+    )?;
+    Ok(())
+}
+
+fn transparent_address_ranking(
+    view: &MaterializedViewStore,
+) -> Result<
+    (
+        TransparentAddressRankingMetadata,
+        TransparentAddressRankingPage,
+    ),
+    Box<dyn Error>,
+> {
+    let metadata = TransparentAddressRankingConsumer::active_metadata(view)?
+        .ok_or("the transparent-address ranking must have an active generation")?;
+    let page = TransparentAddressRankingConsumer::page(
+        view,
+        0,
+        TRANSPARENT_ADDRESS_RANKING_MAX_PAGE_SIZE,
+    )?
+    .ok_or("the active ranking generation must serve a page")?;
+    Ok((metadata, page))
+}
+
+const fn complete_ranking_coverage(tip_height: u32) -> TransparentAddressRankingCoverage {
+    TransparentAddressRankingCoverage {
+        balance_complete_through_height: BlockHeight::new(tip_height),
+        history_complete_from_height: Some(BlockHeight::new(1)),
+        history_complete_through_height: Some(BlockHeight::new(tip_height)),
+        lifetime_statistics_complete: true,
+    }
 }
 
 fn block_summary_hashes(
