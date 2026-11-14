@@ -283,12 +283,9 @@ COPY --chmod=0755 deploy/wallet-serving-explorer-runtime-entrypoint \
 
 EXPOSE 9068 9069 9102 9106
 
-# The wallet-serving check keeps a parked canonical writer healthy; the
-# Explorer must also admit traffic.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=6h --retries=3 \
-    CMD zinder-wallet-serving-healthcheck \
-        && curl -fsS --connect-timeout 2 --max-time 4 -o /dev/null http://127.0.0.1:9069/readyz
-
+# The inherited wallet-serving HEALTHCHECK deliberately ignores the Explorer:
+# the entrypoint restarts the Explorer alone, and a host that restarts
+# unhealthy containers must not tear down wallet serving when it fails.
 ENTRYPOINT ["zinder-wallet-serving-explorer-runtime-entrypoint"]
 
 FROM zinder-runtime-base AS zinder-bench
