@@ -501,9 +501,8 @@ where
 /// Loads every source family until `cancel` fires.
 ///
 /// Cancellation during the block stream stops the blocking loader at its next
-/// block boundary and waits for it, so the builder is closed on return. Once
-/// every block is queued, the loader finalizes SST files that cannot be
-/// interrupted, and cancellation stops waiting for that work instead.
+/// block boundary. Once every block is queued, the loader finalizes SST files,
+/// which cannot be interrupted. Either way the builder is closed on return.
 pub(crate) async fn load_fresh_canonical_until_cancelled<Source>(
     builder: RocksDbCanonicalBuilder,
     source: &Source,
@@ -534,7 +533,7 @@ pub(crate) fn record_construction_cancelled(stage: &'static str) {
         target: "zinder::ingest",
         event = "canonical_construction_cancelled",
         stage,
-        "stopped canonical construction for shutdown; the next start discards the unpublished staging"
+        "stopped canonical construction for shutdown; the next start rebuilds unpublished staging or installs a staged READY store"
     );
 }
 
@@ -793,7 +792,7 @@ where
     let build_tip_height = builder.build_plan().build_tip().height;
     let (block_sender, block_receiver) = mpsc::channel(block_queue_capacity);
     let loader_cancel = cancel.clone();
-    let mut loader_task = tokio::task::spawn_blocking(move || {
+    let loader_task = tokio::task::spawn_blocking(move || {
         let mut builder = builder;
         let mut build_blocks = CanonicalBuildBlockReceiver {
             receiver: block_receiver,
@@ -811,22 +810,22 @@ where
         Ok(CanonicalBlockLoadOutcome { builder, evidence })
     });
 
-    if cancel
+    let forwarded = cancel
         .run_until_cancelled(forward_prepared_blocks(prepared_blocks, block_sender))
         .await
-        .is_none()
-    {
-        // The loader observes cancellation at its next block boundary and
-        // drops the builder, so waiting here is short and leaves no open store.
-        let _cancelled_load = (&mut loader_task).await;
-        record_construction_cancelled("block_stream");
+        .is_some();
+    // A cancelled loader stops at its next block boundary, but SST
+    // finalization after the last block runs to completion. Waiting for the
+    // task either way keeps `RocksDB` work from outliving the writer.
+    let loaded = loader_task.await;
+    if cancel.is_cancelled() {
+        record_construction_cancelled(if forwarded {
+            "block_finalize"
+        } else {
+            "block_stream"
+        });
         return Err(CanonicalConstructionError::Cancelled);
     }
-
-    let Some(loaded) = cancel.run_until_cancelled(loader_task).await else {
-        record_construction_cancelled("block_finalize");
-        return Err(CanonicalConstructionError::Cancelled);
-    };
     loaded.map_err(|source| CanonicalConstructionError::LoaderTaskFailed {
         reason: source.to_string(),
     })?

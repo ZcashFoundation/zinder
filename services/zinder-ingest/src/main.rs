@@ -71,14 +71,6 @@ const CANONICAL_SECONDARY_OPEN_RETRY_INTERVAL: Duration = Duration::from_secs(5)
 /// Cadence at which the replay budget sampler refreshes its gauges.
 const MATERIALIZED_VIEW_REPLAY_BUDGET_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Longest wait at exit for blocking work that cancellation cannot interrupt,
-/// such as `RocksDB` file finalization during fresh construction.
-///
-/// Unpublished construction restarts on the next start, so abandoning this
-/// work is safe. The bound keeps ingest well inside the wallet-serving
-/// supervisor's 20-second shutdown grace window.
-const BLOCKING_WORK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-
 #[derive(Parser)]
 #[command(name = "zinder-ingest")]
 #[command(about = "Zinder canonical chain ingestion")]
@@ -176,7 +168,8 @@ enum Command {
     Probe,
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let cli = Cli::parse();
     install_tracing_subscriber();
 
@@ -188,24 +181,7 @@ fn main() -> ExitCode {
         return run_print_config(&cli);
     }
 
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            tracing::error!(
-                target: "zinder::ingest",
-                event = "ingest_runtime_start_failed",
-                error = %error,
-                "could not start the async runtime"
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-    let exit_code = runtime.block_on(Box::pin(run_runtime(cli)));
-    runtime.shutdown_timeout(BLOCKING_WORK_SHUTDOWN_TIMEOUT);
-    exit_code
+    Box::pin(run_runtime(cli)).await
 }
 
 #[allow(

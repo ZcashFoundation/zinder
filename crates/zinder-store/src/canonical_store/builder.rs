@@ -153,6 +153,11 @@ impl RocksDbCanonicalBuilder {
     /// and never enter the random-key sort.
     /// The returned evidence describes the prepared rows accepted by `RocksDB`;
     /// READY publication additionally requires cache-bypassing family readback.
+    ///
+    /// A source error leaves the block-load staging in place, so a source
+    /// that stops for shutdown returns without deleting it. Discard it with
+    /// [`Self::discard_unpublished_block_load_staging`] along with the
+    /// unpublished build. Other failures remove the staging before returning.
     pub fn bulk_load_blocks<SourceError>(
         &mut self,
         blocks: impl IntoIterator<Item = Result<CanonicalBuildBlock, SourceError>>,
@@ -179,7 +184,7 @@ impl RocksDbCanonicalBuilder {
         let staging = FreshCanonicalBlockStaging::create(staging_path)?;
         let sst_options =
             canonical_data_options(&self.bounded_open.block_cache, self.resource_budget);
-        let prepared = write_canonical_block_ssts(
+        let prepared = match write_canonical_block_ssts(
             CanonicalBlockSstConfig {
                 staging_path: staging.path(),
                 options: &sst_options,
@@ -189,7 +194,17 @@ impl RocksDbCanonicalBuilder {
                 reverse_index_sort_memory_bytes,
             },
             blocks,
-        )?;
+        ) {
+            Ok(prepared) => prepared,
+            Err(error @ CanonicalStoreBuildError::Source { .. }) => {
+                // A source that stops, for example on shutdown, must not wait
+                // for a large staging deletion. The owner discards the staging
+                // with the unpublished build.
+                staging.keep_for_discard();
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         validate_block_load_range(&self.build_plan, &prepared.evidence)?;
         let ingested = ingest_canonical_block_ssts(&self.bounded_open.db, prepared)?;
         staging.remove()?;
@@ -354,6 +369,10 @@ impl FreshCanonicalBlockStaging {
 
     fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    fn keep_for_discard(mut self) {
+        self.remove_on_drop = false;
     }
 
     fn remove(mut self) -> Result<(), CanonicalStoreError> {
@@ -2628,7 +2647,7 @@ mod tests {
     }
 
     #[test]
-    fn bulk_load_blocks_source_error_leaves_every_family_empty()
+    fn bulk_load_blocks_source_error_leaves_families_empty_and_staging_for_discard()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let store_path = temporary.path().join("canonical");
@@ -2649,7 +2668,8 @@ mod tests {
 
         assert!(matches!(error, CanonicalStoreBuildError::Source { .. }));
         assert!(canonical_block_families_are_empty(&store.bounded_open.db)?);
-        assert!(!canonical_block_staging_path(&store.store_path).exists());
+        assert!(canonical_block_staging_path(&store.store_path).exists());
+        assert!(RocksDbCanonicalBuilder::discard_unpublished_block_load_staging(&store_path)?);
         Ok(())
     }
 

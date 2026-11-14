@@ -208,8 +208,9 @@ where
 /// constructing a fresh store when none exists.
 ///
 /// Returns [`CanonicalWriterError::Cancelled`] when `cancel` fires before
-/// admission. Construction stops at its next block boundary or, while the
-/// store finalizes files or publishes, stops waiting for that blocking work.
+/// admission. Construction stops at its next block boundary, except that SST
+/// finalization and publication, which cannot be interrupted, finish first.
+/// When it returns, no construction work is still using `RocksDB`.
 pub async fn admit_canonical_store<Source>(
     source: &Source,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
@@ -504,9 +505,10 @@ where
 
 /// Validates and publishes the staged build on the blocking pool.
 ///
-/// Publication flushes and reopens `RocksDB` and cannot be interrupted, so
-/// cancellation stops waiting for it. Work that finishes after shutdown
-/// leaves a staged READY store that the next start installs.
+/// Publication flushes and reopens `RocksDB` and cannot be interrupted, so the
+/// writer waits for it even after shutdown and then returns
+/// [`CanonicalWriterError::Cancelled`]. The staged READY store it leaves is
+/// installed on the next start.
 async fn publish_constructed_baseline(
     loaded: crate::CanonicalSourceLoadOutcome,
     settled_tip: BlockId,
@@ -521,10 +523,11 @@ async fn publish_constructed_baseline(
         let staged_ready = validated.publish_baseline(publication)?;
         Ok::<_, CanonicalStoreError>(staged_ready.event_fence())
     });
-    let Some(published) = cancel.run_until_cancelled(publication).await else {
+    let published = publication.await;
+    if cancel.is_cancelled() {
         record_construction_cancelled("publication");
         return Err(CanonicalWriterError::Cancelled);
-    };
+    }
     published
         .map_err(|source| CanonicalWriterError::PublicationTaskFailed {
             reason: source.to_string(),

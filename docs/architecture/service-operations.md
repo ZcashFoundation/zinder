@@ -170,10 +170,11 @@ stays unready until the writer publishes its first epoch.
 
 Ingest reports `shutting_down` as soon as termination is requested, before the
 writer and its workers drain. Termination during fresh construction stops the
-writer without publishing, and the process exits within the wallet-serving
-supervisor's 20-second grace window. The exit waits at most five seconds for
-blocking `RocksDB` work that cannot be interrupted. The next start discards the
-unpublished staging or installs a staged READY store, as described in
+writer without admitting a store. While blocks stream in, ingest exits within
+the wallet-serving supervisor's 20-second grace window. SST finalization and
+publication cannot be interrupted, and ingest waits for them before it exits,
+which on a long chain can outlast the grace window. The next start discards the unpublished staging or installs a staged READY store,
+as described in
 [Chain ingestion §Fresh construction](chain-ingestion.md#fresh-construction).
 
 The private control server, live mempool owner, and mempool retention task are

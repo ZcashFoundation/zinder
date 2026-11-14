@@ -485,13 +485,16 @@ fn regtest_activations() -> Arc<NetworkUpgradeActivations> {
 const CANCELLED_CONSTRUCTION_STOP_BOUND: Duration = Duration::from_secs(5);
 
 /// Serves a one-block chain to the canonical writer and can hold the block
-/// stream open, so shutdown lands while construction is in progress.
+/// stream open or request shutdown with the fixed-tip checkpoint, so shutdown
+/// lands while construction is in progress.
 #[derive(Clone)]
 struct HeldConstructionSource {
     block: SourceBlock,
     chain_checkpoint: CommitmentTreeCheckpoint,
     hold_chain_segments: Arc<AtomicBool>,
     chain_segment_held: Arc<Notify>,
+    chain_segment_requests: Arc<AtomicUsize>,
+    cancel_with_tip_checkpoint: Option<CancellationToken>,
 }
 
 impl HeldConstructionSource {
@@ -501,7 +504,24 @@ impl HeldConstructionSource {
             chain_checkpoint,
             hold_chain_segments: Arc::new(AtomicBool::new(true)),
             chain_segment_held: Arc::new(Notify::new()),
+            chain_segment_requests: Arc::new(AtomicUsize::new(0)),
+            cancel_with_tip_checkpoint: None,
         }
+    }
+
+    /// Streams blocks without holding and cancels `cancel` as it returns the
+    /// fixed-tip checkpoint, the last source request before publication.
+    fn cancelling_before_publication(
+        block: SourceBlock,
+        chain_checkpoint: CommitmentTreeCheckpoint,
+        cancel: CancellationToken,
+    ) -> Self {
+        let source = Self {
+            cancel_with_tip_checkpoint: Some(cancel),
+            ..Self::new(block, chain_checkpoint)
+        };
+        source.release_chain_segments();
+        source
     }
 
     fn release_chain_segments(&self) {
@@ -541,6 +561,7 @@ impl NodeSource for HeldConstructionSource {
         &self,
         _limits: SourceChainSegmentLimits,
     ) -> Result<SourceChainSegment, SourceError> {
+        self.chain_segment_requests.fetch_add(1, Ordering::SeqCst);
         if self.hold_chain_segments.load(Ordering::SeqCst) {
             self.chain_segment_held.notify_one();
             std::future::pending::<()>().await;
@@ -558,6 +579,9 @@ impl NodeSource for HeldConstructionSource {
         _network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> Result<CommitmentTreeCheckpoint, SourceError> {
         if height == self.chain_checkpoint.block_id.height {
+            if let Some(cancel) = &self.cancel_with_tip_checkpoint {
+                cancel.cancel();
+            }
             return Ok(self.chain_checkpoint.clone());
         }
         Err(SourceError::BlockUnavailable {
@@ -594,9 +618,8 @@ fn held_construction_writer_config(
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shutdown_during_construction_stops_promptly_and_the_next_start_rebuilds()
--> Result<(), Box<dyn std::error::Error>> {
+fn held_construction_chain()
+-> Result<(SourceBlock, CommitmentTreeCheckpoint), Box<dyn std::error::Error>> {
     let source_block = fixture_source_block()?;
     let fixed_tip = BlockId::new(source_block.height, source_block.hash);
     let chain_checkpoint = CommitmentTreeCheckpoint::new(
@@ -608,6 +631,14 @@ async fn shutdown_during_construction_stops_promptly_and_the_next_start_rebuilds
             None,
         ),
     );
+    Ok((source_block, chain_checkpoint))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_during_construction_stops_promptly_and_the_next_start_rebuilds()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (source_block, chain_checkpoint) = held_construction_chain()?;
+    let fixed_tip = chain_checkpoint.block_id;
     let source = HeldConstructionSource::new(source_block, chain_checkpoint);
     let temporary = TempDir::new()?;
     let config =
@@ -630,6 +661,13 @@ async fn shutdown_during_construction_stops_promptly_and_the_next_start_rebuilds
         .map_err(|_| "cancelled construction outlived its shutdown bound")?;
     assert!(matches!(stopped, Err(CanonicalWriterError::Cancelled)));
     assert!(!config.storage_path.exists());
+    // Shutdown leaves the block-load staging for the next start to discard.
+    assert!(
+        temporary
+            .path()
+            .join("canonical.building.block-load-staging")
+            .exists()
+    );
 
     // Reopening the staging proves the cancelled loader already closed it.
     source.release_chain_segments();
@@ -642,5 +680,46 @@ async fn shutdown_during_construction_stops_promptly_and_the_next_start_rebuilds
     )
     .await?;
     assert_eq!(store.event_fence().visible_tip(), fixed_tip);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_before_publication_finishes_publishing_and_the_next_start_installs_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (source_block, chain_checkpoint) = held_construction_chain()?;
+    let fixed_tip = chain_checkpoint.block_id;
+    let cancel = CancellationToken::new();
+    let source = HeldConstructionSource::cancelling_before_publication(
+        source_block,
+        chain_checkpoint,
+        cancel.clone(),
+    );
+    let temporary = TempDir::new()?;
+    let config =
+        held_construction_writer_config(temporary.path().join("canonical"), regtest_activations());
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+
+    // Publication cannot be interrupted, so admission returns only after it.
+    let stopped =
+        admit_canonical_store(&source, regtest_activations(), &config, &readiness, &cancel).await;
+    assert!(matches!(stopped, Err(CanonicalWriterError::Cancelled)));
+    assert!(!config.storage_path.exists());
+    assert!(temporary.path().join("canonical.building").exists());
+    let block_requests = source.chain_segment_requests.load(Ordering::SeqCst);
+
+    // The next start installs the staged READY store without rebuilding it.
+    let store = admit_canonical_store(
+        &source,
+        regtest_activations(),
+        &config,
+        &readiness,
+        &CancellationToken::new(),
+    )
+    .await?;
+    assert_eq!(store.event_fence().visible_tip(), fixed_tip);
+    assert_eq!(
+        source.chain_segment_requests.load(Ordering::SeqCst),
+        block_requests
+    );
     Ok(())
 }
