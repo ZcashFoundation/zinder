@@ -4,6 +4,7 @@ use std::{num::NonZeroU32, pin::Pin, time::Instant};
 
 use tokio::sync::mpsc;
 use tokio_stream::{self as stream, Stream, StreamExt as _, wrappers::ReceiverStream};
+use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, Response, Status};
 use tonic_types::ErrorDetails;
 use zinder_core::wire::{
@@ -51,6 +52,7 @@ use super::native::{
     transaction_response, transparent_address_unspent_outputs_response,
     transparent_outpoint_spend_status_response, tree_state_at_response, visible_tip_block_response,
 };
+use super::shutdown_stream::end_on_shutdown;
 use super::status_from_query_error;
 
 type WalletGrpcStream<Message> = Pin<Box<dyn Stream<Item = Result<Message, Status>> + Send>>;
@@ -160,6 +162,7 @@ pub struct WalletQueryGrpcAdapter<QueryApi> {
     query_api: QueryApi,
     server_info: wallet::WalletServerInfo,
     traffic_readiness: Option<Readiness>,
+    shutdown: Option<CancellationToken>,
 }
 
 impl<QueryApi: WalletQueryApi> WalletQueryGrpcAdapter<QueryApi> {
@@ -176,6 +179,7 @@ impl<QueryApi: WalletQueryApi> WalletQueryGrpcAdapter<QueryApi> {
             query_api,
             server_info,
             traffic_readiness: None,
+            shutdown: None,
         }
     }
 
@@ -190,6 +194,25 @@ impl<QueryApi: WalletQueryApi> WalletQueryGrpcAdapter<QueryApi> {
     pub fn with_traffic_readiness(mut self, readiness: Readiness) -> Self {
         self.traffic_readiness = Some(readiness);
         self
+    }
+
+    /// Ends open server streams once `shutdown` is cancelled.
+    ///
+    /// Graceful server shutdown waits for every open call, and `ChainEvents`
+    /// and `MempoolEvents` never end on their own. With this token, every
+    /// server stream ends with `UNAVAILABLE` and readiness cause
+    /// `shutting_down` when shutdown starts, so the server can drain.
+    #[must_use]
+    pub fn with_shutdown(mut self, shutdown: CancellationToken) -> Self {
+        self.shutdown = Some(shutdown);
+        self
+    }
+
+    fn server_stream<Message: Send + 'static>(
+        &self,
+        stream: WalletGrpcStream<Message>,
+    ) -> Response<WalletGrpcStream<Message>> {
+        Response::new(end_on_shutdown(stream, self.shutdown.as_ref()))
     }
 
     /// Wraps this adapter in the generated tonic server type.
@@ -401,7 +424,7 @@ where
             .map_err(|error| status_from_query_error(&error))?;
         let chunks = compact_blocks_in_range_chunks(compact_block_range).map(Ok);
 
-        Ok(Response::new(Box::pin(stream::iter(chunks))))
+        Ok(self.server_stream(Box::pin(stream::iter(chunks))))
     }
 
     async fn full_blocks_in_range(
@@ -431,7 +454,7 @@ where
                 .map_err(|error| status_from_query_error(&error))
         });
 
-        Ok(Response::new(Box::pin(full_block_chunks)))
+        Ok(self.server_stream(Box::pin(full_block_chunks)))
     }
 
     async fn tree_state_at_height(
@@ -532,8 +555,7 @@ where
                 event_sender,
             );
 
-            let stream: ChainEventsStream = Box::pin(ReceiverStream::new(event_receiver));
-            Ok(Response::new(stream))
+            Ok(self.server_stream(Box::pin(ReceiverStream::new(event_receiver))))
         }
         .await;
         record_proxy_outcome("chain_events", started_at, &outcome);
@@ -583,8 +605,7 @@ where
                     "ingest-control mempool event stream establishment timed out",
                 )
             })??;
-            let stream: MempoolEventsStream = Box::pin(response.into_inner());
-            Ok(Response::new(stream))
+            Ok(self.server_stream(Box::pin(response.into_inner())))
         }
         .await;
         record_proxy_outcome("mempool_events", started_at, &outcome);
@@ -634,7 +655,7 @@ where
             .map(|output| Ok(build_transparent_unspent_output_message(&output)));
         let messages = stream::once(header).chain(stream::iter(items));
 
-        Ok(Response::new(Box::pin(messages)))
+        Ok(self.server_stream(Box::pin(messages)))
     }
 
     async fn transparent_address_tx_ids_in_range(
@@ -673,7 +694,7 @@ where
                 Ok(build_transparent_address_tx_ids_chunk(&artifact, cursor))
             });
         let chunks = stream::once(header).chain(stream::iter(items));
-        Ok(Response::new(Box::pin(chunks)))
+        Ok(self.server_stream(Box::pin(chunks)))
     }
 
     async fn transparent_outpoint_spend_status(

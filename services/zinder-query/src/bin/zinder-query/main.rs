@@ -1,6 +1,9 @@
 //! Zinder native wallet-query gRPC server entry point.
 
-use std::{future::Future, net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc};
+use std::{
+    future::Future, net::SocketAddr, path::PathBuf, pin::Pin, process::ExitCode, sync::Arc,
+    time::Duration,
+};
 
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
@@ -23,6 +26,14 @@ use zinder_source::{
 mod config;
 
 use config::{QueryConfigError, QueryConfigOverrides};
+
+/// Longest the gRPC server may drain after shutdown starts before open calls
+/// are abandoned.
+///
+/// Open server streams already end when shutdown starts; this bound keeps any
+/// other call from holding the process past the wallet-serving supervisor's
+/// 20-second grace window, with room left for secondary teardown.
+const GRPC_SERVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser)]
 #[command(name = "zinder-query")]
@@ -235,14 +246,15 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         advertised_capabilities,
     )
     .await?;
+    let cancel = CancellationToken::new();
+    let _signal_handle = cancel_on_terminating_signal(cancel.clone());
     let grpc_adapter = WalletQueryGrpcAdapter::new(query, endpoint_metadata)
-        .with_traffic_readiness(readiness.clone());
+        .with_traffic_readiness(readiness.clone())
+        .with_shutdown(cancel.clone());
 
     let reflection_service = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET)
         .build_v1()?;
-    let cancel = CancellationToken::new();
-    let _signal_handle = cancel_on_terminating_signal(cancel.clone());
     let node_readiness_handle = spawn_wallet_node_readiness_probe(
         source,
         &native_endpoint_capabilities,
@@ -366,7 +378,7 @@ where
 
     match exit {
         QueryRuntimeExit::ShutdownRequested => {
-            let server_result = server.await;
+            let server_result = drain_grpc_server(server.as_mut()).await;
             serving_runtime_drained.cancel();
             require_clean_task_shutdown("serving-pair publisher", serving_pair_publisher.await)?;
             require_clean_task_shutdown("node-readiness probe", node_readiness_probe.await)?;
@@ -391,7 +403,7 @@ where
         }
         QueryRuntimeExit::ServingPairPublisher(task_result) => {
             let task_error = unexpected_task_exit("serving-pair publisher", task_result);
-            drain_server_after_runtime_failure(server.await);
+            drain_server_after_runtime_failure(drain_grpc_server(server.as_mut()).await);
             serving_runtime_drained.cancel();
             drain_task_after_runtime_failure("node-readiness probe", node_readiness_probe.await);
             drain_task_after_runtime_failure(
@@ -403,7 +415,7 @@ where
         }
         QueryRuntimeExit::NodeReadinessProbe(task_result) => {
             let task_error = unexpected_task_exit("node-readiness probe", task_result);
-            drain_server_after_runtime_failure(server.await);
+            drain_server_after_runtime_failure(drain_grpc_server(server.as_mut()).await);
             serving_runtime_drained.cancel();
             drain_task_after_runtime_failure(
                 "serving-pair publisher",
@@ -418,7 +430,7 @@ where
         }
         QueryRuntimeExit::IngestControlReadinessProbe(task_result) => {
             let task_error = unexpected_task_exit("ingest-control-readiness probe", task_result);
-            drain_server_after_runtime_failure(server.await);
+            drain_server_after_runtime_failure(drain_grpc_server(server.as_mut()).await);
             serving_runtime_drained.cancel();
             drain_task_after_runtime_failure(
                 "serving-pair publisher",
@@ -435,7 +447,7 @@ where
                 },
                 Err(error) => QueryConfigError::Operations(error),
             };
-            drain_server_after_runtime_failure(server.await);
+            drain_server_after_runtime_failure(drain_grpc_server(server.as_mut()).await);
             serving_runtime_drained.cancel();
             drain_task_after_runtime_failure(
                 "serving-pair publisher",
@@ -450,6 +462,24 @@ where
             Err(task_error)
         }
     }
+}
+
+/// Waits for the gRPC server's graceful drain, abandoning calls that are
+/// still open after [`GRPC_SERVER_DRAIN_TIMEOUT`].
+async fn drain_grpc_server<Server>(server: Pin<&mut Server>) -> Result<(), tonic::transport::Error>
+where
+    Server: Future<Output = Result<(), tonic::transport::Error>>,
+{
+    if let Ok(server_outcome) = tokio::time::timeout(GRPC_SERVER_DRAIN_TIMEOUT, server).await {
+        return server_outcome;
+    }
+    tracing::warn!(
+        target: "zinder::query",
+        event = "query_server_drain_timed_out",
+        timeout_seconds = GRPC_SERVER_DRAIN_TIMEOUT.as_secs(),
+        "native query gRPC server did not drain before its shutdown deadline; abandoning open calls"
+    );
+    Ok(())
 }
 
 async fn wait_for_operations_exit(
@@ -655,6 +685,54 @@ mod tests {
         .await;
 
         assert!(runtime_outcome.is_ok());
+        assert!(matches!(
+            runtime_readiness.report().cause,
+            ReadinessCause::ShuttingDown
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn requested_shutdown_abandons_a_server_that_does_not_drain() {
+        let runtime_readiness = Readiness::new(ReadinessState::ready(Some(1)));
+        let serving_readiness =
+            WalletServingReadiness::without_node_source(runtime_readiness.clone());
+        let cancel = CancellationToken::new();
+        let serving_runtime_drained = CancellationToken::new();
+        let publisher_cancel = cancel.clone();
+        let publisher_runtime_drained = serving_runtime_drained.clone();
+        let publisher = tokio::spawn(async move {
+            publisher_cancel.cancelled().await;
+            publisher_runtime_drained.cancelled().await;
+        });
+        let node_cancel = cancel.clone();
+        let node_probe = tokio::spawn(async move {
+            node_cancel.cancelled().await;
+        });
+        let ingest_control_cancel = cancel.clone();
+        let ingest_control_probe = tokio::spawn(async move {
+            ingest_control_cancel.cancelled().await;
+        });
+        cancel.cancel();
+        let shutdown_started = tokio::time::Instant::now();
+
+        let runtime_outcome = supervise_query_runtime(
+            future::pending(),
+            cancel,
+            &serving_readiness,
+            QueryBackgroundTasks {
+                serving_pair_publisher: publisher,
+                serving_runtime_drained,
+                node_readiness_probe: node_probe,
+                ingest_control_readiness_probe: ingest_control_probe,
+                operations: None,
+            },
+        )
+        .await;
+
+        assert!(runtime_outcome.is_ok());
+        let shutdown_duration = shutdown_started.elapsed();
+        assert!(shutdown_duration >= GRPC_SERVER_DRAIN_TIMEOUT);
+        assert!(shutdown_duration < GRPC_SERVER_DRAIN_TIMEOUT + Duration::from_secs(1));
         assert!(matches!(
             runtime_readiness.report().cause,
             ReadinessCause::ShuttingDown

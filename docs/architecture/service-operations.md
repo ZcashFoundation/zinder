@@ -103,7 +103,9 @@ next generation with the schedule the writer reports.
 
 The runtimes differ in their bounds. Projector retries until
 `projector.fence_convergence_timeout_seconds`, starting at 50 ms and doubling
-to 1 s, and reports `syncing` once lag lasts longer than one second. Query and
+to 1 s, and reports `syncing` once lag lasts longer than one second, except
+that a ready projector trailing by at most one block stays `ready` as described
+in [Projector](#projector). Query and
 compatibility stop at their configured pair-convergence attempts or timeout,
 whichever comes first, and wait the smaller of the catch-up interval and
 100 ms between attempts.
@@ -194,6 +196,14 @@ continuous following at an authenticated source position. An individually
 healthy canonical or wallet store is insufficient if their source identities
 do not agree.
 
+A block does not withdraw readiness. Each new block leaves the wallet one block
+behind the canonical fence until the projector applies it, so a ready projector
+that trails the fence by at most one block, or follows a replacement at the
+same height, stays `ready` for up to 30 seconds and reports the fence height as
+its target. A projector that trails by more than one block, trails for longer
+than 30 seconds, or was not ready when the trail began reports `syncing`. Each
+block it applies starts a new grace.
+
 ### Native wallet query
 
 Native wallet query is ready only when all three independently retained inputs
@@ -233,6 +243,14 @@ structural capability discovery. Any node-backed composition must admit
 configuration surprise. The serving-pair publisher, node-readiness probe, and
 ingest-control-readiness probe are supervised with the gRPC server; an
 unexpected exit drains readiness and terminates the runtime.
+
+Native query reports `shutting_down` as soon as termination is requested and
+ends every open server stream, including `ChainEvents` and `MempoolEvents`,
+with `UNAVAILABLE`, `ErrorReason = SERVICE_NOT_READY`, and readiness cause
+`shutting_down`. Event streams never end on their own, so without this the
+graceful gRPC drain would wait for them indefinitely. The drain is also bounded
+at 10 seconds, after which calls still open are abandoned, so query exits
+within the wallet-serving supervisor's 20-second grace window.
 
 When the shared traffic gate is closed, new gRPC calls return
 `UNAVAILABLE` with `ErrorReason = SERVICE_NOT_READY` and

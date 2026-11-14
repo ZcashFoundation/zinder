@@ -37,10 +37,12 @@ use zinder_wallet_rocksdb::{
 
 mod canonical_writer_control;
 mod config;
+mod following_readiness;
 mod projector_control;
 
 use canonical_writer_control::{CanonicalRetentionLease, CanonicalWriterControlClient};
 use config::{ProjectorConfigOverrides, ProjectorError};
+use following_readiness::FollowingReadiness;
 use projector_control::{
     ProjectorControlCommand, ProjectorControlGrpcAdapter, projector_control_channel,
 };
@@ -267,7 +269,7 @@ async fn run_owned_projector(
     let Some(canonical_ready) = converge_on_writer_fence(
         &mut canonical,
         &mut canonical_control,
-        readiness,
+        &mut FollowingReadiness::new(readiness),
         &cancel,
         config.fence_convergence_timeout,
     )
@@ -573,6 +575,7 @@ async fn run_continuous_wallet_following(
     mut canonical_lease: CanonicalRetentionLease,
 ) -> Result<(), ProjectorError> {
     let mut control = ProjectorControlTasks::start(&config.projector_control, &cancel).await?;
+    let mut following_readiness = FollowingReadiness::new(readiness);
     loop {
         control.require_running(&cancel)?;
         if cancel.is_cancelled() {
@@ -587,7 +590,7 @@ async fn run_continuous_wallet_following(
         let Some(canonical_ready) = converge_on_writer_fence(
             &mut canonical,
             &mut canonical_control,
-            readiness,
+            &mut following_readiness,
             &cancel,
             config.fence_convergence_timeout,
         )
@@ -611,7 +614,7 @@ async fn run_continuous_wallet_following(
                 let Some(post_renewal_canonical) = converge_on_writer_fence(
                     &mut canonical,
                     &mut canonical_control,
-                    readiness,
+                    &mut following_readiness,
                     &cancel,
                     config.fence_convergence_timeout,
                 )
@@ -623,9 +626,7 @@ async fn run_continuous_wallet_following(
                     continue;
                 }
             }
-            readiness.set(ReadinessState::ready(Some(
-                wallet_source.source_position().tip.height.value(),
-            )));
+            following_readiness.caught_up(wallet_source.source_position().tip.height.value());
             if let Some(command) = control.next_command_or_poll(&cancel).await? {
                 apply_projector_control_command(
                     config,
@@ -650,7 +651,10 @@ async fn run_continuous_wallet_following(
             });
         }
 
-        set_following_syncing(readiness, wallet_source, target_source);
+        following_readiness.trailing(
+            wallet_source.source_position().tip.height.value(),
+            target_source.source_position().tip.height.value(),
+        );
         let _renewed = renew_following_retention_lease_if_due(
             &mut canonical_control,
             &mut canonical_lease,
@@ -935,6 +939,7 @@ async fn bootstrap_resumed_wallet_following(
     first_retained_event_sequence: u64,
 ) -> Result<(), ProjectorError> {
     let wallet_source = WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
+    let mut following_readiness = FollowingReadiness::new(readiness);
     let mut bootstrap_lease = loop {
         if cancel.is_cancelled() {
             return Ok(());
@@ -942,7 +947,7 @@ async fn bootstrap_resumed_wallet_following(
         let Some(canonical_ready) = converge_on_writer_fence(
             &mut canonical,
             &mut canonical_control,
-            readiness,
+            &mut following_readiness,
             &cancel,
             config.fence_convergence_timeout,
         )
@@ -1002,7 +1007,7 @@ async fn bootstrap_resumed_wallet_following(
         let Some(canonical_ready) = converge_on_writer_fence(
             &mut canonical,
             &mut canonical_control,
-            readiness,
+            &mut following_readiness,
             &cancel,
             config.fence_convergence_timeout,
         )
@@ -1543,7 +1548,7 @@ fn require_pre_promotion_follower_admission(
 async fn converge_on_writer_fence(
     canonical: &mut RocksDbCanonicalSecondary,
     control: &mut CanonicalWriterControlClient,
-    readiness: &Readiness,
+    readiness: &mut FollowingReadiness<'_>,
     cancel: &CancellationToken,
     timeout: Duration,
 ) -> Result<Option<CanonicalStoreReadyEvidence>, ProjectorError> {
@@ -1577,13 +1582,13 @@ async fn converge_on_writer_fence(
     }
 }
 
-struct LiveWriterFenceProbe<'a> {
+struct LiveWriterFenceProbe<'a, 'readiness> {
     canonical: &'a mut RocksDbCanonicalSecondary,
     control: &'a mut CanonicalWriterControlClient,
-    readiness: &'a Readiness,
+    readiness: &'a mut FollowingReadiness<'readiness>,
 }
 
-impl CanonicalFenceProbe for LiveWriterFenceProbe<'_> {
+impl CanonicalFenceProbe for LiveWriterFenceProbe<'_, '_> {
     type Error = ProjectorError;
 
     async fn catch_up(
@@ -1615,18 +1620,19 @@ impl CanonicalFenceProbe for LiveWriterFenceProbe<'_> {
 }
 
 /// Reports lag that outlasts `CANONICAL_FENCE_CONVERGENCE_SYNCING_AFTER` as
-/// syncing; shorter races leave readiness untouched.
-fn report_writer_fence_lag(readiness: &Readiness, lag: CanonicalFenceLag, elapsed: Duration) {
+/// trailing the writer; shorter races leave readiness untouched.
+fn report_writer_fence_lag(
+    readiness: &mut FollowingReadiness<'_>,
+    lag: CanonicalFenceLag,
+    elapsed: Duration,
+) {
     if elapsed < CANONICAL_FENCE_CONVERGENCE_SYNCING_AFTER {
         return;
     }
-    readiness.set(ReadinessState::syncing(
-        lag.writer_visible_tip_height
-            .checked_sub(lag.secondary_visible_tip_height)
-            .map(u64::from),
-        Some(lag.secondary_visible_tip_height),
-        Some(lag.writer_visible_tip_height),
-    ));
+    readiness.trailing(
+        lag.secondary_visible_tip_height,
+        lag.writer_visible_tip_height,
+    );
 }
 
 fn canonical_source_identity(ready: &CanonicalStoreReadyEvidence) -> WalletCanonicalSourceIdentity {
@@ -2083,14 +2089,14 @@ mod tests {
 
     use super::{
         CanonicalBlockFactsSequenceDigest, CanonicalFenceLag, CanonicalRetentionLease,
-        NextWalletTransition, ProjectorControlTasks, ProjectorError, ResumedFollowingRetentionPlan,
-        WalletCanonicalSourceIdentity, WalletProjectionSourcePosition,
-        classify_resumed_following_retention, encode_zinder_native_chain_name,
-        following_retention_lease_renewal_expiry, following_retention_lease_transition_expiry,
-        lease_expiry, reconciliation_ranges, report_writer_fence_lag,
-        require_bounded_reconciliation_replay, require_built_wallet_source,
-        require_pre_promotion_follower_admission, require_retention_lease_anchor,
-        settled_tip_for_transition,
+        FollowingReadiness, NextWalletTransition, ProjectorControlTasks, ProjectorError,
+        ResumedFollowingRetentionPlan, WalletCanonicalSourceIdentity,
+        WalletProjectionSourcePosition, classify_resumed_following_retention,
+        encode_zinder_native_chain_name, following_retention_lease_renewal_expiry,
+        following_retention_lease_transition_expiry, lease_expiry, reconciliation_ranges,
+        report_writer_fence_lag, require_bounded_reconciliation_replay,
+        require_built_wallet_source, require_pre_promotion_follower_admission,
+        require_retention_lease_anchor, settled_tip_for_transition,
     };
     use zinder_proto::v1::ingest::{CanonicalWriterFence, CanonicalWriterStatusResponse};
     use zinder_store::{
@@ -2362,10 +2368,11 @@ mod tests {
             writer_visible_tip_height: 3,
         };
 
-        report_writer_fence_lag(&readiness, lag, Duration::from_millis(10));
+        let mut following_readiness = FollowingReadiness::new(&readiness);
+        report_writer_fence_lag(&mut following_readiness, lag, Duration::from_millis(10));
         assert!(readiness.report().is_ready);
 
-        report_writer_fence_lag(&readiness, lag, Duration::from_secs(1));
+        report_writer_fence_lag(&mut following_readiness, lag, Duration::from_secs(1));
         let report = readiness.report();
         assert!(!report.is_ready);
         assert!(matches!(
@@ -2376,6 +2383,24 @@ mod tests {
         ));
         assert_eq!(report.current_height, Some(1));
         assert_eq!(report.target_height, Some(3));
+    }
+
+    #[test]
+    fn writer_fence_lag_of_one_block_keeps_a_ready_projector_ready() {
+        let readiness =
+            zinder_runtime::Readiness::new(zinder_runtime::ReadinessState::ready(Some(1)));
+        let lag = CanonicalFenceLag {
+            lag_chain_epochs: 1,
+            secondary_visible_tip_height: 1,
+            writer_visible_tip_height: 2,
+        };
+
+        let mut following_readiness = FollowingReadiness::new(&readiness);
+        report_writer_fence_lag(&mut following_readiness, lag, Duration::from_secs(1));
+        let report = readiness.report();
+        assert!(report.is_ready);
+        assert_eq!(report.current_height, Some(1));
+        assert_eq!(report.target_height, Some(2));
     }
 
     #[test]
