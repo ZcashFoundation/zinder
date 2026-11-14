@@ -169,11 +169,19 @@ Native query treats a missing `chain_view` as an invalid writer status, so it
 stays unready until the writer publishes its first epoch.
 
 Ingest reports `shutting_down` as soon as termination is requested, before the
-writer and its workers drain.
+writer and its workers drain. Termination during fresh construction stops the
+writer without admitting a store. While blocks stream in, ingest exits within
+the wallet-serving supervisor's 20-second grace window. SST finalization and
+publication cannot be interrupted, and ingest waits for them before it exits,
+which on a long chain can outlast the grace window. The next start discards the unpublished staging or installs a staged READY store,
+as described in
+[Chain ingestion §Fresh construction](chain-ingestion.md#fresh-construction).
 
 The private control server, live mempool owner, and mempool retention task are
 supervised with the writer; an unexpected exit from any of them terminates the
-runtime.
+runtime. The mempool owner and retention task start after the writer admits a
+READY store, so fresh construction logs no `mempool_durable_replay_failed` or
+`mempool_event_retention_failed` warnings.
 
 ### Projector
 

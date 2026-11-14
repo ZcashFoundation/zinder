@@ -16,6 +16,7 @@ use futures_util::{
 use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio_util::sync::CancellationToken;
 use zinder_core::{
     BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeAccumulator,
     CommitmentTreeAccumulatorError, CommitmentTreeCheckpoint, Network, NetworkUpgradeActivations,
@@ -329,6 +330,12 @@ pub enum CanonicalConstructionError {
         /// Per-request deadline from construction config.
         timeout: Duration,
     },
+    /// Shutdown stopped construction before the store was published.
+    ///
+    /// Only the canonical writer's cancellable construction returns this; the
+    /// unpublished staging is discarded on the next start.
+    #[error("canonical construction was cancelled before publication")]
+    Cancelled,
 }
 
 /// Result of staging and ingesting block-local families into a fresh store.
@@ -367,6 +374,24 @@ pub async fn load_fresh_canonical_blocks<Source>(
 where
     Source: NodeSource + Clone,
 {
+    Box::pin(load_fresh_canonical_blocks_until_cancelled(
+        builder,
+        source,
+        config,
+        &CancellationToken::new(),
+    ))
+    .await
+}
+
+async fn load_fresh_canonical_blocks_until_cancelled<Source>(
+    builder: RocksDbCanonicalBuilder,
+    source: &Source,
+    config: &CanonicalConstructionConfig,
+    cancel: &CancellationToken,
+) -> Result<CanonicalBlockLoadOutcome, CanonicalConstructionError>
+where
+    Source: NodeSource + Clone,
+{
     register_prohibited_read_metrics();
     let build_plan = builder.build_plan().clone();
     validate_construction_identity(&build_plan, config)?;
@@ -383,8 +408,11 @@ where
     drive_block_loader(
         builder,
         prepared_blocks,
-        block_queue_capacity,
-        Arc::clone(&config.network_upgrade_activations),
+        BlockLoaderSettings {
+            block_queue_capacity,
+            network_upgrade_activations: Arc::clone(&config.network_upgrade_activations),
+            cancel: cancel.clone(),
+        },
     )
     .await
 }
@@ -461,8 +489,52 @@ pub async fn load_fresh_canonical<Source>(
 where
     Source: NodeSource + Clone,
 {
-    let block_outcome = load_fresh_canonical_blocks(builder, source, config).await?;
-    load_fresh_canonical_source_families(block_outcome, source, config).await
+    Box::pin(load_fresh_canonical_until_cancelled(
+        builder,
+        source,
+        config,
+        &CancellationToken::new(),
+    ))
+    .await
+}
+
+/// Loads every source family until `cancel` fires.
+///
+/// Cancellation during the block stream stops the blocking loader at its next
+/// block boundary. Once every block is queued, the loader finalizes SST files,
+/// which cannot be interrupted. Either way the builder is closed on return.
+pub(crate) async fn load_fresh_canonical_until_cancelled<Source>(
+    builder: RocksDbCanonicalBuilder,
+    source: &Source,
+    config: &CanonicalConstructionConfig,
+    cancel: &CancellationToken,
+) -> Result<CanonicalSourceLoadOutcome, CanonicalConstructionError>
+where
+    Source: NodeSource + Clone,
+{
+    let block_outcome =
+        load_fresh_canonical_blocks_until_cancelled(builder, source, config, cancel).await?;
+    cancel
+        .run_until_cancelled(load_fresh_canonical_source_families(
+            block_outcome,
+            source,
+            config,
+        ))
+        .await
+        .unwrap_or_else(|| {
+            record_construction_cancelled("source_families");
+            Err(CanonicalConstructionError::Cancelled)
+        })
+}
+
+/// Logs the construction stage that shutdown interrupted.
+pub(crate) fn record_construction_cancelled(stage: &'static str) {
+    tracing::info!(
+        target: "zinder::ingest",
+        event = "canonical_construction_cancelled",
+        stage,
+        "stopped canonical construction for shutdown; the next start rebuilds unpublished staging or installs a staged READY store"
+    );
 }
 
 pub(crate) fn register_prohibited_read_metrics() {
@@ -686,15 +758,25 @@ struct QueuedPreparedBlock {
     memory_permit: OwnedSemaphorePermit,
 }
 
+struct BlockLoaderSettings {
+    block_queue_capacity: usize,
+    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+    cancel: CancellationToken,
+}
+
 async fn drive_block_loader<PreparedBlocks>(
     builder: RocksDbCanonicalBuilder,
     prepared_blocks: PreparedBlocks,
-    block_queue_capacity: usize,
-    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+    settings: BlockLoaderSettings,
 ) -> Result<CanonicalBlockLoadOutcome, CanonicalConstructionError>
 where
     PreparedBlocks: Stream<Item = Result<QueuedPreparedBlock, CanonicalConstructionError>> + Send,
 {
+    let BlockLoaderSettings {
+        block_queue_capacity,
+        network_upgrade_activations,
+        cancel,
+    } = settings;
     let predecessor = builder.build_plan().history_predecessor();
     let predecessor_tip_metadata = predecessor.tip_metadata();
     let commitment_tree_accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
@@ -709,15 +791,18 @@ where
     let workload = builder.workload();
     let build_tip_height = builder.build_plan().build_tip().height;
     let (block_sender, block_receiver) = mpsc::channel(block_queue_capacity);
+    let loader_cancel = cancel.clone();
     let loader_task = tokio::task::spawn_blocking(move || {
         let mut builder = builder;
-        let mut build_blocks = CanonicalBuildBlockReceiver::new(
-            block_receiver,
-            CommitmentTreeSizes::from_tip_metadata(predecessor_tip_metadata),
+        let mut build_blocks = CanonicalBuildBlockReceiver {
+            receiver: block_receiver,
+            active_memory_permit: None,
+            running_tree_sizes: CommitmentTreeSizes::from_tip_metadata(predecessor_tip_metadata),
             commitment_tree_accumulator,
             workload,
             build_tip_height,
-        );
+            cancel: loader_cancel,
+        };
         let evidence = builder
             .bulk_load_blocks(&mut build_blocks)
             .map_err(canonical_build_error)?;
@@ -725,28 +810,40 @@ where
         Ok(CanonicalBlockLoadOutcome { builder, evidence })
     });
 
-    let mut prepared_blocks = Box::pin(prepared_blocks);
+    let forwarded = cancel
+        .run_until_cancelled(forward_prepared_blocks(prepared_blocks, block_sender))
+        .await
+        .is_some();
+    // A cancelled loader stops at its next block boundary, but SST
+    // finalization after the last block runs to completion. Waiting for the
+    // task either way keeps `RocksDB` work from outliving the writer.
+    let loaded = loader_task.await;
+    if cancel.is_cancelled() {
+        record_construction_cancelled(if forwarded {
+            "block_finalize"
+        } else {
+            "block_stream"
+        });
+        return Err(CanonicalConstructionError::Cancelled);
+    }
+    loaded.map_err(|source| CanonicalConstructionError::LoaderTaskFailed {
+        reason: source.to_string(),
+    })?
+}
+
+async fn forward_prepared_blocks<PreparedBlocks>(
+    prepared_blocks: PreparedBlocks,
+    block_sender: mpsc::Sender<Result<QueuedPreparedBlock, CanonicalConstructionError>>,
+) where
+    PreparedBlocks: Stream<Item = Result<QueuedPreparedBlock, CanonicalConstructionError>> + Send,
+{
+    let mut prepared_blocks = std::pin::pin!(prepared_blocks);
     while let Some(prepared_block) = prepared_blocks.next().await {
-        match prepared_block {
-            Ok(queued_block) => {
-                if block_sender.send(Ok(queued_block)).await.is_err() {
-                    break;
-                }
-            }
-            Err(source) => {
-                let _ = block_sender.send(Err(source)).await;
-                break;
-            }
+        let source_failed = prepared_block.is_err();
+        if block_sender.send(prepared_block).await.is_err() || source_failed {
+            break;
         }
     }
-    drop(prepared_blocks);
-    drop(block_sender);
-
-    loader_task
-        .await
-        .map_err(|source| CanonicalConstructionError::LoaderTaskFailed {
-            reason: source.to_string(),
-        })?
 }
 
 struct CanonicalBuildBlockReceiver {
@@ -756,25 +853,7 @@ struct CanonicalBuildBlockReceiver {
     commitment_tree_accumulator: CommitmentTreeAccumulator,
     workload: CanonicalStoreWorkload,
     build_tip_height: BlockHeight,
-}
-
-impl CanonicalBuildBlockReceiver {
-    fn new(
-        receiver: mpsc::Receiver<Result<QueuedPreparedBlock, CanonicalConstructionError>>,
-        running_tree_sizes: CommitmentTreeSizes,
-        commitment_tree_accumulator: CommitmentTreeAccumulator,
-        workload: CanonicalStoreWorkload,
-        build_tip_height: BlockHeight,
-    ) -> Self {
-        Self {
-            receiver,
-            active_memory_permit: None,
-            running_tree_sizes,
-            commitment_tree_accumulator,
-            workload,
-            build_tip_height,
-        }
-    }
+    cancel: CancellationToken,
 }
 
 impl Iterator for CanonicalBuildBlockReceiver {
@@ -786,7 +865,18 @@ impl Iterator for CanonicalBuildBlockReceiver {
     )]
     fn next(&mut self) -> Option<Self::Item> {
         self.active_memory_permit = None;
-        let received = self.receiver.blocking_recv()?;
+        // A cancelled producer drops its sender, so a closed channel must not
+        // read as a complete stream and start SST finalization.
+        let received = self
+            .receiver
+            .blocking_recv()
+            .filter(|_| !self.cancel.is_cancelled());
+        let Some(received) = received else {
+            return self
+                .cancel
+                .is_cancelled()
+                .then_some(Err(CanonicalConstructionError::Cancelled));
+        };
         let queued_block = match received {
             Ok(queued_block) => queued_block,
             Err(source) => return Some(Err(source)),

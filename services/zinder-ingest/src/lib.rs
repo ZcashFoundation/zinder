@@ -74,7 +74,7 @@ pub use writer::ingest_control::{
     MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE as CANONICAL_WRITER_MAX_MEMPOOL_SNAPSHOT_PAGE_SIZE,
 };
 pub use writer::{
-    CanonicalWriterConfig, CanonicalWriterError, run_canonical_writer,
-    run_canonical_writer_with_control,
+    CanonicalWriterConfig, CanonicalWriterError, admit_canonical_store,
+    follow_admitted_canonical_store, run_canonical_writer, run_canonical_writer_with_control,
 };
 pub use zinder_runtime::container_memory_budget_bytes;
