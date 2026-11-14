@@ -74,24 +74,60 @@ private network; substitute your host's):
 | `ZINDER_NODE__JSON_RPC_ADDR` | `http://zebra.railway.internal:18232` |
 | `ZINDER_NODE__AUTH__METHOD` | `cookie` |
 | `ZINDER_NODE__AUTH__COOKIE` | the inline `user:password` cookie string |
+| `ZINDER_NODE__INDEXER_GRPC_ADDR` | `http://zebra.railway.internal:8155`, the node's indexer gRPC URL. An `https://` URL negotiates TLS; see [Indexer TLS](#indexer-tls). |
 | `ZINDER_PROJECTOR__BUILD_OWNER_HEX` | a stable 32-character hexadecimal value |
+
+The entrypoint stops the container at startup when
+`ZINDER_NODE__INDEXER_GRPC_ADDR` is unset or empty. Without the indexer
+stream, ingest follows the node mempool by polling JSON-RPC and re-reads the
+whole mempool after every block. The mempool view for each new tip then
+arrives a poll interval plus a full re-read late, and ingest withdraws
+readiness whenever that takes longer than 30 seconds.
 
 These are optional:
 
 | Variable | Effect |
 | --- | --- |
-| `ZINDER_NODE__INDEXER_GRPC_ADDR` | Enables the streaming mempool source, such as `http://zebra.railway.internal:8155`. An `https://` URL negotiates TLS; see [Indexer TLS](#indexer-tls). |
+| `ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE_SECONDS` | Seconds canonical construction may take before the container stops. Defaults to `10800` (three hours). See [Construction deadlines](#construction-deadlines). |
+| `ZINDER_WALLET_SERVING__WALLET_CONSTRUCTION_DEADLINE_SECONDS` | Seconds wallet construction may take before the container stops. Defaults to `7200` (two hours). See [Construction deadlines](#construction-deadlines). |
 | `ZINDER_INGEST__REORG_WINDOW_BLOCKS` | Sets the canonical replacement depth, applied identically to the projector and the query surface. Defaults to 1000, Zebra's finalization depth. Raising it on an existing deployment, including by upgrading to this default, raises the stores in place and irreversibly; capture a state bundle first if you need a rollback path. Lowering it requires a rebuild. |
 | `RUST_LOG` | Log filter, such as `info,zinder=info`. |
 | `INGEST_CONTROL_BEARER_TOKEN` | Ingest-control bearer secret. Generated at boot when unset. |
 | `CHECKPOINT_BEARER_TOKEN` | Checkpoint bearer secret. Generated at boot when unset. |
 
-Only the `[network]` and `[node]` fields are shared by all three processes.
-Every process rejects a `ZINDER_*` variable naming a section it does not own,
-and the entrypoint delivers the two role-scoped variables above to their owner
-alone. Add no other role-scoped variable. Storage paths, listen addresses,
-control endpoints, and bearer token paths are fixed in
-`deploy/config/wallet-serving/`.
+You can also set any variable in the
+[environment-variable reference](../architecture/public-interfaces.md#environment-variable-reference)
+whose "Used by" column names `zinder-ingest`, `zinder-projector`, or
+`zinder-query`. Each process rejects a `ZINDER_*` variable that its binary
+does not define. For that reason, the entrypoint gives each process only the
+variables its binary accepts:
+
+| Variables | `zinder-ingest` | `zinder-projector` | `zinder-query` |
+| --- | --- | --- | --- |
+| `ZINDER_NETWORK__*`, `ZINDER_NODE__*`, `ZINDER_OPS__*`, `ZINDER_SECURITY__*`, `ZINDER_INGEST_CONTROL__*` | yes | yes | yes |
+| `ZINDER_STORAGE__CANONICAL__*`, `ZINDER_STORAGE__RAW_BLOB_POLICY` | yes | yes | yes |
+| `ZINDER_INGEST__*`, `ZINDER_RETENTION__*`, `ZINDER_STORAGE__MATERIALIZED_VIEWS__*` | yes | | |
+| `ZINDER_PROJECTOR__*`, `ZINDER_PROJECTOR_CONTROL__*` | | yes | |
+| `ZINDER_WALLET__ROCKSDB__*` | | yes | yes |
+| `ZINDER_QUERY__*`, `ZINDER_STORAGE__INITIAL_CATCHUP_TIMEOUT_MS`, `ZINDER_STORAGE__SECONDARY_CATCHUP_INTERVAL_MS`, `ZINDER_STORAGE__SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS`, `ZINDER_STORAGE__SERVING_PAIR_STALENESS_CEILING_MS` | | | yes |
+
+For example, `ZINDER_PROJECTOR__BUILD__MAX_TEMPORARY_FILE_BYTES_PER_SORTER`
+and `ZINDER_STORAGE__SERVING_PAIR_STALENESS_CEILING_MS` each reach one
+process, while `ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES` applies to
+all three.
+
+No process receives the `ZINDER_WALLET_SERVING__*` variables, which configure
+the entrypoint itself, or the two bearer secrets. Any other
+`ZINDER_WALLET_SERVING__*` name, such as a misspelled deadline, stops the
+container at startup. At startup the entrypoint
+logs the names of any other `ZINDER_*` variables that no process reads, such
+as a misspelled section or storage key. Check that line after you add a
+variable.
+
+Storage paths, listen addresses, control endpoints, and bearer token paths are
+fixed in `deploy/config/wallet-serving/`. Do not override them: each process
+uses its own path, and a path variable such as `ZINDER_STORAGE__PATH` reaches
+more than one process.
 
 The wallet-serving ingest configuration sets
 `ingest.explorer_views = false` explicitly. Wallet projection and
@@ -178,6 +214,10 @@ construction finish, so every healthcheck path on that port fails until then,
 including `/healthz`. Construction on an empty volume can outlast the one-hour
 window.
 
+On Mainnet, set the
+[construction deadlines](#construction-deadlines) before the first deployment.
+The defaults end a Mainnet build from an empty volume before it finishes.
+
 If you set the healthcheck path before construction finishes, Railway marks the
 deployment failed when the window expires and stops the container. The
 entrypoint forwards `SIGTERM` and the processes exit cleanly. The volume keeps
@@ -223,15 +263,8 @@ loopback; the two control planes stay private to the container.
 ## Fresh-sync behaviour
 
 A fresh volume constructs canonical storage before the wallet projection, and
-serves nothing until both complete. Canonical construction has a three-hour
-production gate and wallet construction has a two-hour gate, so several hours
-without a serving surface is the expected first-deploy shape, not a stall.
-
-Each phase carries its own deadline: three hours for canonical construction,
-two for wallet construction, thirty minutes for the serving pair. An expired
-phase logs the plane's last `/readyz` body and exits non-zero, so the reason
-reaches the deploy logs. The volume is retained and the next attempt resumes from the durable fence
-rather than starting over.
+serves nothing until both complete. Several hours without a serving surface is
+the expected first-deploy shape, not a stall.
 
 A cause that no amount of waiting clears (`schema_mismatch`,
 `node_capability_missing`) ends the container as soon as a plane reports it,
@@ -273,13 +306,52 @@ readiness proves the projection. Serving readiness proves an admitted
 canonical and wallet pair at an exact fence, and it is the only one that
 proves a client can be answered.
 
+### Construction deadlines
+
+Each phase carries its own deadline:
+
+| Phase | Default | Variable |
+| --- | --- | --- |
+| Canonical construction | 3 hours (`10800`) | `ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE_SECONDS` |
+| Wallet construction | 2 hours (`7200`) | `ZINDER_WALLET_SERVING__WALLET_CONSTRUCTION_DEADLINE_SECONDS` |
+| Serving pair | 30 minutes | fixed |
+
+A phase that outlives its deadline logs the plane's last `/readyz` body and
+exits non-zero, so the reason reaches the deploy logs. The `starting canonical
+construction` and `starting wallet construction` lines name the deadline in
+effect. A value that is not a positive whole number of seconds stops the
+container at startup.
+
+The defaults fit Testnet. They are too short for Mainnet from an empty volume.
+One measured Mainnet build from genesis took about four hours for canonical
+construction, with staging near 310 GB, and then more than two hours for
+wallet construction. A restart discards unpublished construction staging, so
+a phase that hits its deadline starts over and never finishes. For a Mainnet
+build from an empty volume, set at least:
+
+| Variable | Mainnet value |
+| --- | --- |
+| `ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE_SECONDS` | `86400` (24 hours) |
+| `ZINDER_WALLET_SERVING__WALLET_CONSTRUCTION_DEADLINE_SECONDS` | `43200` (12 hours) |
+
+Raise them further on slower disks or a slower node. Once construction has
+published, a restart resumes from the durable fence and the defaults are
+enough. The image `HEALTHCHECK` start period covers only the default
+deadlines. A Docker host that restarts unhealthy containers needs a longer
+start period for a Mainnet build.
+
 ## Failure handling
 
-The container terminates with a non-zero status when any of the three processes
-exits, when a plane reports `schema_mismatch` or `node_capability_missing`, or
-when a plane stops admitting traffic for an hour. The restart policy is `ALWAYS` with no
-retry cap, so a surviving subset never keeps answering requests it cannot
-satisfy and the platform never stops restarting a crash loop.
+The container terminates with a non-zero status in these cases:
+
+- any of the three processes exits;
+- a plane reports `schema_mismatch` or `node_capability_missing`;
+- a plane stops admitting traffic for an hour; or
+- a plane keeps flapping, as described below.
+
+The restart policy is `ALWAYS` with no retry cap, so a surviving subset never
+keeps answering requests it cannot satisfy and the platform never stops
+restarting a crash loop.
 
 Liveness alone does not prove the topology advances, so the supervisor polls
 all three `/readyz` endpoints as well. A canonical writer that meets a reorg
@@ -316,6 +388,22 @@ serving the typed refusal. A plain restart or a crash restart under the
 Upstream outages and sync lag drain readiness the same way but clear on their
 own, so they are tolerated for an hour before the container terminates.
 
+A plane that flaps between ready and unready never stays down for an hour, so
+the supervisor also tracks its unready stretches. It terminates the container
+after six episodes, or after 900 seconds unready in total, unless the plane
+first stays ready for ten minutes in a row. An unready stretch counts as an
+episode in two cases:
+
+- the plane's `/readyz` stops answering, which counts at once; or
+- the plane answers with an unready cause for at least 60 seconds.
+
+A shorter answered drain is not an episode, but its time still counts toward
+the 900 seconds and it restarts the ten-minute clock. An occasional brief
+drain therefore never restarts the container, while a plane that is unready
+most of the time in short bursts still does. The supervisor logs each short
+drain as `recovered after <n>s unready, too brief to count as an episode`,
+with the unready total so far.
+
 For Testnet, configure Zebra with `ready_max_blocks_behind = 4` and
 `ready_max_tip_age = "5m"`. The four-block limit is the bounded correction for
 an observed `lag=3` transition during a canonically current 225-second block
@@ -344,8 +432,8 @@ when the window expires.
   omits `zinder-compat-lightwalletd`.
 - Do not attach a second service to this volume. The canonical and wallet
   primaries have exactly one owner process each.
-- Do not set role-scoped `ZINDER_*` variables beyond the two the entrypoint
-  scopes to their owner.
+- Do not override storage paths, listen addresses, control endpoints, or
+  bearer token paths through `ZINDER_*` variables.
 - Do not expose 9100, 9101, 9105, or 9110 beyond the container.
 - Do not attach a public domain to 9102. The native surface is plaintext;
   public exposure requires TLS, authentication, and quotas at a reverse proxy.

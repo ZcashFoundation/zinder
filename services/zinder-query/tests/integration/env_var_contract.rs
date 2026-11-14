@@ -38,3 +38,11 @@ fn every_variable_the_loader_accepts_is_documented() -> eyre::Result<()> {
     EnvVarContractProbe::new(env!("CARGO_BIN_EXE_zinder-query"))
         .check_accepted_variables_are_documented(documented_variables(), ACCEPTED_BUT_UNCONSUMED)
 }
+
+#[test]
+fn wallet_serving_entrypoint_routes_exactly_the_accepted_variables() -> eyre::Result<()> {
+    EnvVarContractProbe::new(env!("CARGO_BIN_EXE_zinder-query")).check_wallet_serving_routing(
+        "query",
+        ENVIRONMENT_VARIABLES.iter().map(|env_var| env_var.name),
+    )
+}

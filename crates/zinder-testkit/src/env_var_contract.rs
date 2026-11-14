@@ -14,6 +14,9 @@
 //! - [`EnvVarContractProbe::check_accepted_variables_are_documented`] fails on
 //!   any accepted key without a documented name.
 //!
+//! [`EnvVarContractProbe::check_wallet_serving_routing`] also holds the
+//! wallet-serving image entrypoint's per-process routing to the loader.
+//!
 //! The accepted keys come from the loader itself: the probe provokes its
 //! unknown-field error at every section and reads the expected-field list.
 
@@ -22,6 +25,8 @@ use std::{collections::BTreeSet, path::PathBuf, process::Command};
 use eyre::{Result, WrapErr, bail, eyre};
 
 const ENV_PREFIX: &str = "ZINDER_";
+const WALLET_SERVING_ENTRYPOINT: &str =
+    include_str!("../../../deploy/wallet-serving-runtime-entrypoint");
 const PROBE_SECTION: &str = "CONTRACT_PROBE";
 const PROBE_LEAF: &str = "UNUSED";
 const PROBE_KEY: &str = "contract_probe";
@@ -109,6 +114,62 @@ impl EnvVarContractProbe {
         );
     }
 
+    /// Fails unless the wallet-serving image entrypoint gives `process`
+    /// exactly the variables this loader accepts.
+    ///
+    /// The entrypoint passes a `ZINDER_*` variable to a process only when the
+    /// variable names one of that process's `<process>_config_paths` or a key
+    /// beneath one. `known_names` lists every documented variable, whichever
+    /// binary uses it. A routed name the loader rejects stops the process at
+    /// startup, and an accepted name that is not routed never reaches it.
+    pub fn check_wallet_serving_routing<'a>(
+        &self,
+        process: &str,
+        known_names: impl IntoIterator<Item = &'a str>,
+    ) -> Result<()> {
+        let config_paths = wallet_serving_entrypoint_config_paths(process)?;
+        let accepted = self.accepted_variables()?;
+        let mut candidates = known_names
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<String>>();
+        candidates.extend(accepted.iter().cloned());
+
+        let mut problems = Vec::new();
+        for name in &candidates {
+            let routed = config_paths
+                .iter()
+                .any(|config_path| config_path_covers(config_path, name));
+            match (routed, accepted.contains(name)) {
+                (true, false) => problems.push(format!(
+                    "{name}: reaches {process}, whose loader rejects it"
+                )),
+                (false, true) => problems.push(format!(
+                    "{name}: accepted by the loader but never reaches {process}"
+                )),
+                (true, true) | (false, false) => {}
+            }
+        }
+        for config_path in &config_paths {
+            if !accepted
+                .iter()
+                .any(|name| config_path_covers(config_path, name))
+            {
+                problems.push(format!(
+                    "{config_path}: listed for {process} but covers no variable the loader accepts"
+                ));
+            }
+        }
+        if problems.is_empty() {
+            return Ok(());
+        }
+        bail!(
+            "deploy/wallet-serving-runtime-entrypoint {process}_config_paths disagrees with {}:\n{}",
+            self.executable_name(),
+            problems.join("\n"),
+        );
+    }
+
     fn accepted_variables(&self) -> Result<BTreeSet<String>> {
         let mut accepted = BTreeSet::new();
         self.collect_accepted_variables(&[], &mut accepted)?;
@@ -179,6 +240,32 @@ impl EnvVarContractProbe {
             .and_then(|name| name.to_str())
             .unwrap_or("service binary")
     }
+}
+
+/// Returns the configuration paths the wallet-serving image entrypoint routes
+/// to one process, from its `<process>_config_paths="..."` setting.
+fn wallet_serving_entrypoint_config_paths(process: &str) -> Result<Vec<&'static str>> {
+    let setting_prefix = format!("{process}_config_paths=\"");
+    WALLET_SERVING_ENTRYPOINT
+        .lines()
+        .find_map(|line| line.strip_prefix(setting_prefix.as_str()))
+        .and_then(|quoted| quoted.strip_suffix('"'))
+        .map(|config_paths| config_paths.split_whitespace().collect())
+        .ok_or_else(|| {
+            eyre!("deploy/wallet-serving-runtime-entrypoint does not set {process}_config_paths")
+        })
+}
+
+/// Reports whether the variable `name` names the dotted `config_path`, such as
+/// `storage.path`, or a key beneath it, as the entrypoint's routing reads it.
+fn config_path_covers(config_path: &str, name: &str) -> bool {
+    let segments = config_path
+        .split('.')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let prefix = variable_name(&segments);
+    name.strip_prefix(prefix.as_str())
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with("__"))
 }
 
 /// Renders a configuration path such as `["storage", "path"]` as
@@ -260,6 +347,24 @@ mod tests {
             parse_expected_fields("there are no fields"),
             Some(Vec::new())
         );
+    }
+
+    #[test]
+    fn config_path_covers_itself_and_keys_beneath_it() {
+        assert!(config_path_covers("storage.path", "ZINDER_STORAGE__PATH"));
+        assert!(config_path_covers(
+            "storage.canonical",
+            "ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES"
+        ));
+        assert!(config_path_covers("query", "ZINDER_QUERY__LISTEN_ADDR"));
+        assert!(!config_path_covers(
+            "storage.canonical",
+            "ZINDER_STORAGE__CANONICAL_PATH"
+        ));
+        assert!(!config_path_covers(
+            "ingest",
+            "ZINDER_INGEST_CONTROL__LISTEN_ADDR"
+        ));
     }
 
     #[test]

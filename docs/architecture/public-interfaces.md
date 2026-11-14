@@ -250,6 +250,12 @@ ZINDER_COMPAT__PAIR_CONVERGENCE_ATTEMPTS
 ZINDER_COMPAT__SERVING
 ```
 
+`ZINDER_WALLET_SERVING__*` variables configure the wallet-serving image
+entrypoint rather than a binary. The entrypoint reads them itself and passes
+each process only the `ZINDER_*` variables its binary accepts, as
+[Wallet-serving deployment](../runbooks/deploying-wallet-serving.md#service-configuration)
+describes.
+
 The service's `--print-config` output is the authoritative field and default
 inventory for its current binary. It must show explicit redaction markers for
 secrets and raw authorization material. Examples under `deploy/config/` must

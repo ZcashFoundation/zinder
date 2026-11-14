@@ -238,8 +238,8 @@ WORKDIR /var/lib/zinder
 
 EXPOSE 9102 9106
 
-# The start period covers the entrypoint's canonical, wallet, and serving
-# construction deadlines, which together run to five and a half hours. A parked
+# The start period covers the entrypoint's default canonical, wallet, and
+# serving deadlines, which together run to five and a half hours. A parked
 # canonical writer counts as healthy: query then refuses wallets with the typed
 # REORG_WINDOW_EXCEEDED halt, and the entrypoint keeps that refusal up.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=6h --retries=3 \
