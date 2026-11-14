@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.11.1] - 2026-11-14
+
+### Fixed
+
+- The `zinder-canonical-runtime` and `zinder-wallet-serving` images now carry `/usr/local/lib/zinder` as a traversable directory. In 0.11.0 the image build gave that directory mode 0644, which stopped the release from publishing images, binary archives, and a GitHub Release for that version. Zinder 0.11.0 exists only as the `zinder-core`, `zinder-proto`, and `zinder-client` crates; deploy 0.11.1 instead, which contains every 0.11.0 change. ([#174](https://github.com/ZcashFoundation/zinder/pull/174))
+
+
 ## [0.11.0] - 2026-11-14
 
 ### Added
