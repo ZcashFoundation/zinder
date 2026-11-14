@@ -72,10 +72,12 @@ The server issues the absence only when all of these hold:
    block can arrive before the tip change: the next block, the tip height on
    another branch, or a lower block on a branch a reorg made best. The owner
    applies only a `Mined` change for the tip block as a removal. Any other
-   `Mined` change ends the generation without being applied, exactly as a tip
-   change does, and a snapshot whose staged changes include one is not
-   certified. Point reads stay `UNAVAILABLE` until the next generation is
-   certified.
+   `Mined` change ends the source generation without being applied, exactly
+   as a tip change does, and a snapshot whose staged changes include one is
+   not certified. The serving generation keeps answering at its own tip until
+   the next generation is certified, so the transaction stays pending there
+   rather than becoming a mempool miss
+   ([ADR-0007](0007-mempool-topology-and-retention.md)).
 
    An `Invalidated` change still removes the entry within the generation. The
    source reports it when the node evicts the transaction, and also when the
@@ -152,3 +154,9 @@ Introducing this contract raised `zinder_proto::CONTRACT_REVISION` to 6.
   so the retryable answer uses the code they retry.
 - An older client keeps mapping every `NOT_FOUND` to `TxStatus::NotFound`,
   including the failures above, until it upgrades.
+
+## Revision history
+
+- 2026-11-14: An off-tip `Mined` change no longer withdraws point reads. The
+  serving generation keeps the entry at its own tip until the replacement is
+  certified.

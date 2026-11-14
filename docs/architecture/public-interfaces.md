@@ -88,8 +88,8 @@ describing an actual consensus rule.
 `events_resume_cursor` resumes `MempoolEvents` without a delivery gap. Its
 `chain_epoch.id` proves which canonical chain fence was captured before the
 page read. Its `source_tip` must exactly equal that epoch's `visible_tip` by
-height and hash; the server returns `UNAVAILABLE` instead of exposing an empty
-or stale answer when the certified mempool generation differs. Epoch ids and
+height and hash. The server waits briefly for a new tip's mempool generation
+and otherwise refuses instead of exposing an empty or stale answer. Epoch ids and
 chain-event sequences share one identity space, so a tip-coherent consumer
 restarts when it observes a larger chain-event sequence. The mempool cursor and
 chain epoch do not substitute for each other; live mempool-event consumers

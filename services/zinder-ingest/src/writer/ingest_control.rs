@@ -225,21 +225,19 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
         request: Request<wallet::MempoolSnapshotRequest>,
     ) -> Result<Response<wallet::MempoolSnapshotResponse>, Status> {
         let request = request.into_inner();
-        // Capture the canonical fence before touching the mempool page. A tip
-        // committed during or after the page read is therefore observable as
-        // a strictly newer chain event by tip-coherent consumers.
-        let snapshot = self.current_chain_epoch().await?;
-        let page = self
+        // The owner captures the canonical fence before touching the mempool
+        // page. A tip committed during or after the page read is therefore
+        // observable as a strictly newer chain event by tip-coherent consumers.
+        let (chain_epoch, page) = self
             .mempool
-            .snapshot_page(
+            .snapshot_page_at_canonical_tip(
                 &self.canonical,
-                snapshot.chain_epoch,
                 bounded_snapshot_page_size(request.max_entries),
                 request.from_cursor,
             )
             .await?;
         Ok(Response::new(wallet::MempoolSnapshotResponse {
-            chain_view: Some(chain_view_message(snapshot.chain_epoch)),
+            chain_view: Some(chain_view_message(chain_epoch)),
             events_resume_cursor: page.events_resume_cursor,
             snapshot_age_millis: page.snapshot_age_millis,
             entries: page
@@ -260,17 +258,16 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
         request: Request<MempoolTransactionRequest>,
     ) -> Result<Response<wallet::TransactionStatusResponse>, Status> {
         let transaction_id = transaction_id_from_rpc_hex(&request.into_inner().transaction_id)?;
-        let snapshot = self.current_chain_epoch().await?;
-        let entry = self
+        let (chain_epoch, entry) = self
             .mempool
-            .entry_for(snapshot.chain_epoch, transaction_id)
-            .await?
-            .ok_or_else(|| {
-                TransactionAbsence::at_epoch(snapshot.chain_epoch, true)
-                    .into_status("transaction is not visible in the live mempool index")
-            })?;
+            .entry_at_canonical_tip(&self.canonical, transaction_id)
+            .await?;
+        let entry = entry.ok_or_else(|| {
+            TransactionAbsence::at_epoch(chain_epoch, true)
+                .into_status("transaction is not visible in the live mempool index")
+        })?;
         Ok(Response::new(wallet::TransactionStatusResponse {
-            chain_view: Some(chain_view_message(snapshot.chain_epoch)),
+            chain_view: Some(chain_view_message(chain_epoch)),
             location: Some(wallet::TransactionLocation {
                 location: Some(wallet::transaction_location::Location::InMempool(
                     zinder_proto::wire::mempool_entry_message(&entry),
@@ -1393,19 +1390,22 @@ mod tests {
             .await?;
         assert!(
             outcome.is_some(),
-            "a Mined change beyond the tip ends the generation"
+            "a Mined change beyond the tip ends the source generation"
         );
 
-        let writer_miss = fixture
+        // The removal is not applied, so the serving generation keeps the
+        // entry at its own tip instead of claiming an absence.
+        let writer_hit = fixture
             .ingest_client
             .mempool_transaction(authenticated(MempoolTransactionRequest {
                 transaction_id: encode_rpc_transaction_id_hex(transaction_id),
             }))
-            .await
-            .err()
-            .ok_or("an outrun generation must not answer from the live mempool")?;
-        assert_eq!(writer_miss.code(), Code::Unavailable);
-        assert_eq!(TransactionAbsence::from_status(&writer_miss)?, None);
+            .await?
+            .into_inner();
+        assert!(matches!(
+            writer_hit.location.and_then(|location| location.location),
+            Some(zinder_proto::v1::wallet::transaction_location::Location::InMempool(_))
+        ));
         fixture.shutdown().await
     }
 

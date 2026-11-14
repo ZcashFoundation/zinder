@@ -131,8 +131,11 @@ client.
 ### Ingest
 
 Ingest is ready when its canonical fence is within the configured source lag
-and the current mempool source generation has published a complete snapshot
-certified at that exact canonical tip.
+and a mempool source generation has published a complete snapshot certified at
+the canonical tip. A block does not withdraw readiness: the owner keeps the
+previous generation certified while its replacement hydrates, and the follower
+admits a certified tip that has trailed the canonical tip for less than 30
+seconds. A certified tip that trails for longer reports `syncing`.
 Fresh construction, source recovery, schema admission, and reorg refusal keep
 it unready.
 
@@ -206,7 +209,11 @@ and the five methods required by the native composition. The accepted
 identity and channel are then immutable. Health checks do not repeat structural
 admission: they call `WriterStatus` and a bounded
 `MempoolSnapshot(max_entries = 1)` through that same authenticated channel and
-validate coherent network and tip evidence. A transition into failure emits
+validate coherent network and tip evidence. Block arrival does not fail the
+check: the writer answers a mempool read at a new tip once its replacement
+generation is certified, waiting up to five seconds, and a snapshot that is
+still not coherent returns `CHAIN_EPOCH_PIN_UNAVAILABLE`, which the probe
+accepts as healthy. A transition into failure emits
 one classified warning and drains readiness with
 `ingest_control_unavailable`; recovery emits one event and restores only the
 ingest-control input. A `WriterStatus` that reports a parked writer instead
@@ -334,9 +341,14 @@ block-local boundary.
 ### Mempool owner
 
 - `zinder_mempool_lifecycle_state{status}` is a one-hot gauge over the closed
-  `hydrating`, `serving`, `rebuild_required`, and `halted` states. `halted`
-  means the canonical writer parked on a reorg deeper than its window and the
-  owner stopped following the node mempool until the process restarts.
+  `hydrating`, `serving`, `rebuild_required`, and `halted` states. A normal
+  tip change stays `serving`; `hydrating` means no generation has been
+  certified yet. `halted` means the canonical writer parked on a reorg deeper
+  than its window and the owner stopped following the node mempool until the
+  process restarts.
+- `zinder_mempool_source_tip_changes_total` counts source generations that
+  ended at a tip boundary, including a `Mined` change for a block other than
+  the serving tip.
 - `zinder_mempool_entries` reports the current process-local live entry count.
 - `zinder_mempool_source_errors_total{kind,failure_class}` and
   `zinder_mempool_hydration_failures_total{reason}` diagnose bounded source

@@ -7,6 +7,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     num::NonZeroU64,
     sync::Arc,
     time::{Duration, Instant},
@@ -14,7 +15,10 @@ use std::{
 
 use futures_util::FutureExt as _;
 use parking_lot::{Mutex as ParkingMutex, RwLock};
-use tokio::{sync::Mutex, time::MissedTickBehavior};
+use tokio::{
+    sync::{Mutex, watch},
+    time::MissedTickBehavior,
+};
 use tokio_stream::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
@@ -48,14 +52,22 @@ const MEMPOOL_CANONICAL_TIP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_MEMPOOL_RECONCILIATION_BATCH_EVENTS: usize = 256;
 const MEMPOOL_LIFECYCLE_STATUS_LABELS: &[&str] =
     &["hydrating", "serving", "rebuild_required", "halted"];
+/// Longest a live read waits for the owner to certify the canonical tip.
+///
+/// After a block, canonical ingest and the replacement source generation
+/// reach the new tip independently. A read in between waits for the
+/// replacement instead of refusing a wallet that asked at the wrong moment.
+const MEMPOOL_TIP_TRANSITION_READ_WAIT: Duration = Duration::from_secs(5);
 /// Default raw transaction payload budget for one durable reconciliation append.
 pub const DEFAULT_RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES: u64 = 16_000_000;
 
 /// One source generation buffered until its snapshot-complete marker.
 ///
 /// Staging keeps a reconnect's partial observations out of the durable event
-/// log. At completion, the owner reconciles the staged set against the last
-/// durable/live set while reads remain unavailable.
+/// log. Until completion, a previously certified generation keeps answering
+/// reads at its own tip. At completion, the owner reconciles the staged set
+/// against the last durable/live set under the mutation gate, so no read
+/// observes a partially reconciled index.
 #[derive(Debug)]
 struct StagedMempoolGeneration {
     index: MempoolIndex,
@@ -147,10 +159,13 @@ pub(crate) struct LiveMempoolSnapshotPage {
 /// Live mempool ownership state visible to the private control surface.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MempoolOwnerStatus {
-    /// A source generation is building an in-memory snapshot that must not be
-    /// exposed until its completion marker arrives.
+    /// No certified generation exists yet, so the first source generation
+    /// builds an in-memory snapshot that must not be exposed until its
+    /// completion marker arrives.
     Hydrating,
-    /// The durable log and process-local index have a verified transition path.
+    /// The durable log and process-local index have a verified transition
+    /// path at `source_tip`. A replacement generation may be staging behind
+    /// it after a normal tip change.
     Serving {
         source_tip: BlockId,
         snapshot_certified_at: UnixTimestampMillis,
@@ -164,6 +179,12 @@ enum MempoolOwnerStatus {
 }
 
 impl MempoolOwnerStatus {
+    /// Whether the owner still follows its source, so a staged generation may
+    /// complete. A rebuild or a halt discards staging instead.
+    const fn follows_source(self) -> bool {
+        matches!(self, Self::Hydrating | Self::Serving { .. })
+    }
+
     /// Returns the source tip and certification time of a serving index, or
     /// the status a request that needs one is refused with.
     fn serving_anchor(self) -> Result<(BlockId, UnixTimestampMillis), Status> {
@@ -193,6 +214,9 @@ pub struct LiveMempoolOwner {
     /// durable append and its verified in-memory mutation.
     mutation_gate: Arc<Mutex<()>>,
     status: Arc<RwLock<MempoolOwnerStatus>>,
+    /// Bumped on every status change so a waiting read can retry.
+    status_changes: Arc<watch::Sender<u64>>,
+    /// A generation hydrating behind the serving one, or the first one.
     staged_generation: Arc<ParkingMutex<Option<StagedMempoolGeneration>>>,
 }
 
@@ -200,16 +224,7 @@ impl LiveMempoolOwner {
     /// Creates an empty live index backed by the configured canonical writer.
     #[must_use]
     pub fn new() -> Self {
-        let owner = Self {
-            index: MempoolIndex::new(),
-            reconciliation_batch_target_raw_transaction_bytes:
-                DEFAULT_RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES,
-            mutation_gate: Arc::new(Mutex::new(())),
-            status: Arc::new(RwLock::new(MempoolOwnerStatus::Hydrating)),
-            staged_generation: Arc::new(ParkingMutex::new(Some(StagedMempoolGeneration::new()))),
-        };
-        record_mempool_lifecycle_status(MempoolOwnerStatus::Hydrating);
-        owner
+        Self::with_batch_target(DEFAULT_RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES)
     }
 
     /// Creates an empty live index with a custom raw transaction payload budget
@@ -218,12 +233,16 @@ impl LiveMempoolOwner {
     pub fn with_reconciliation_batch_target_raw_transaction_bytes(
         reconciliation_batch_target_raw_transaction_bytes: NonZeroU64,
     ) -> Self {
+        Self::with_batch_target(reconciliation_batch_target_raw_transaction_bytes.get())
+    }
+
+    fn with_batch_target(reconciliation_batch_target_raw_transaction_bytes: u64) -> Self {
         let owner = Self {
             index: MempoolIndex::new(),
-            reconciliation_batch_target_raw_transaction_bytes:
-                reconciliation_batch_target_raw_transaction_bytes.get(),
+            reconciliation_batch_target_raw_transaction_bytes,
             mutation_gate: Arc::new(Mutex::new(())),
             status: Arc::new(RwLock::new(MempoolOwnerStatus::Hydrating)),
+            status_changes: Arc::new(watch::Sender::new(0)),
             staged_generation: Arc::new(ParkingMutex::new(Some(StagedMempoolGeneration::new()))),
         };
         record_mempool_lifecycle_status(MempoolOwnerStatus::Hydrating);
@@ -266,6 +285,91 @@ impl LiveMempoolOwner {
             ));
         }
         Ok((source_tip, snapshot_certified_at))
+    }
+
+    /// Returns the live entry for a transaction at the canonical writer's
+    /// current chain epoch, and that epoch.
+    ///
+    /// A read that arrives while canonical ingest and the live index are
+    /// moving to a new tip waits up to [`MEMPOOL_TIP_TRANSITION_READ_WAIT`] for
+    /// both to agree.
+    pub(crate) async fn entry_at_canonical_tip(
+        &self,
+        canonical: &CanonicalControlHandle,
+        transaction_id: TransactionId,
+    ) -> Result<(ChainEpoch, Option<Arc<MempoolEntry>>), Status> {
+        self.read_at_canonical_tip(canonical, |chain_epoch| {
+            self.entry_for(chain_epoch, transaction_id)
+        })
+        .await
+    }
+
+    /// Reads one snapshot page at the canonical writer's current chain epoch,
+    /// and returns that epoch.
+    ///
+    /// Like [`Self::entry_at_canonical_tip`], a read during a tip transition
+    /// waits for canonical ingest and the live index to agree.
+    pub(crate) async fn snapshot_page_at_canonical_tip(
+        &self,
+        canonical: &CanonicalControlHandle,
+        max_entries: u32,
+        from_cursor: Vec<u8>,
+    ) -> Result<(ChainEpoch, LiveMempoolSnapshotPage), Status> {
+        self.read_at_canonical_tip(canonical, |chain_epoch| {
+            self.snapshot_page(canonical, chain_epoch, max_entries, from_cursor.clone())
+        })
+        .await
+    }
+
+    /// Runs `read` at the canonical writer's current chain epoch, retrying
+    /// while a refusal can still turn into an answer.
+    ///
+    /// The status watch is subscribed before the epoch is captured, so a
+    /// certification that lands after the capture always wakes the retry.
+    async fn read_at_canonical_tip<Answer, Read, ReadFuture>(
+        &self,
+        canonical: &CanonicalControlHandle,
+        mut read: Read,
+    ) -> Result<(ChainEpoch, Answer), Status>
+    where
+        Read: FnMut(ChainEpoch) -> ReadFuture,
+        ReadFuture: Future<Output = Result<Answer, Status>>,
+    {
+        let deadline = tokio::time::Instant::now() + MEMPOOL_TIP_TRANSITION_READ_WAIT;
+        loop {
+            let mut status_changes = self.status_changes.subscribe();
+            let chain_epoch = canonical.chain_epoch().await?.chain_epoch;
+            let refusal = match read(chain_epoch).await {
+                Ok(answer) => return Ok((chain_epoch, answer)),
+                Err(refusal) => refusal,
+            };
+            if tokio::time::Instant::now() >= deadline {
+                return Err(refusal);
+            }
+            if status_changes.has_changed().unwrap_or(false) {
+                continue;
+            }
+            let visible_tip =
+                BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash);
+            if !self.awaits_tip(visible_tip) {
+                return Err(refusal);
+            }
+            match tokio::time::timeout_at(deadline, status_changes.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => return Err(refusal),
+            }
+        }
+    }
+
+    /// Whether a refused read at `visible_tip` can succeed once the owner
+    /// certifies a generation, rather than failing for a lasting reason.
+    fn awaits_tip(&self, visible_tip: BlockId) -> bool {
+        let status = *self.status.read();
+        match status {
+            MempoolOwnerStatus::Hydrating => true,
+            MempoolOwnerStatus::Serving { source_tip, .. } => source_tip != visible_tip,
+            MempoolOwnerStatus::RebuildRequired | MempoolOwnerStatus::Halted(_) => false,
+        }
     }
 
     /// Returns the live entry for a transaction when it is currently visible.
@@ -357,21 +461,23 @@ impl LiveMempoolOwner {
             .collect()
     }
 
-    /// Stages one source transition during hydration or applies it durably
-    /// while the reconciled generation is serving.
+    /// Stages one source transition while a generation hydrates, or applies
+    /// it durably to the serving generation otherwise.
     ///
     /// A generation never publishes partial snapshot observations to the
     /// durable log. Its marker first reconciles the staged state with the
-    /// last durable/live state while reads remain unavailable.
+    /// last durable/live state under the mutation gate.
     ///
     /// A serving generation answers "not in the mempool" for its source tip.
     /// Zebra's mempool changes and tip notifications have no shared order, so
     /// a `Mined` transition for a block other than the tip (the next block, or
     /// a block on a reorged branch) can arrive before the tip change. Removing
     /// the transaction then could leave it in neither the canonical chain at
-    /// the tip nor the mempool, so such a transition ends the generation
-    /// instead, exactly as a tip change does. Only a `Mined` transition for
-    /// the tip block itself removes the entry.
+    /// the tip nor the mempool, so such a transition starts a replacement
+    /// generation instead, exactly as a tip change does. The serving
+    /// generation keeps answering at its own tip until the replacement is
+    /// certified. Only a `Mined` transition for the tip block itself removes
+    /// the entry.
     pub(crate) async fn apply_event(
         &self,
         canonical: &CanonicalControlHandle,
@@ -380,7 +486,7 @@ impl LiveMempoolOwner {
     ) -> Result<Option<GenerationOutran>, Status> {
         let _mutation_guard = self.mutation_gate.lock().await;
         let state = *self.status.read();
-        if state == MempoolOwnerStatus::Hydrating {
+        if state.follows_source() && self.staged_generation.lock().is_some() {
             self.stage_event_locked(event, observed_at)?;
             return Ok(None);
         }
@@ -388,7 +494,7 @@ impl LiveMempoolOwner {
         if let Some(observed_source_tip) =
             mined_block(&event).filter(|mined_block| *mined_block != source_tip)
         {
-            self.begin_hydration_locked();
+            self.begin_next_generation_locked();
             return Ok(Some(GenerationOutran {
                 generation_source_tip: source_tip,
                 observed_source_tip,
@@ -607,28 +713,43 @@ impl LiveMempoolOwner {
         *current = status;
         drop(current);
         record_mempool_lifecycle_status(status);
+        self.status_changes
+            .send_modify(|changes| *changes = changes.wrapping_add(1));
     }
 
-    async fn begin_hydration(&self) {
+    /// Starts staging a new source generation and returns whether a certified
+    /// generation keeps serving behind it.
+    async fn begin_next_generation(&self) -> bool {
         let _mutation_guard = self.mutation_gate.lock().await;
-        self.begin_hydration_locked();
+        self.begin_next_generation_locked()
     }
 
-    fn begin_hydration_locked(&self) {
+    /// Stages a new source generation behind the serving one, or hydrates
+    /// from scratch when none is serving.
+    ///
+    /// A normal tip change keeps the serving generation: it still describes
+    /// the mempool at its own tip, which is exactly what a reader whose
+    /// canonical epoch has not moved yet needs.
+    fn begin_next_generation_locked(&self) -> bool {
         *self.staged_generation.lock() = Some(StagedMempoolGeneration::new());
+        if matches!(*self.status.read(), MempoolOwnerStatus::Serving { .. }) {
+            return true;
+        }
         self.set_status(MempoolOwnerStatus::Hydrating);
+        false
     }
 
     /// Reconciles a complete source snapshot once its tip matches canonical
     /// ingest, or keeps the snapshot private while canonical ingest catches up.
-    /// A snapshot a staged `Mined` transition outran ends without certifying.
+    /// A snapshot a staged `Mined` transition outran ends without certifying,
+    /// and a serving generation keeps answering throughout.
     pub(crate) async fn try_complete_hydration(
         &self,
         canonical: &CanonicalControlHandle,
         source_tip: BlockId,
     ) -> Result<SnapshotCertification, Status> {
         let _mutation_guard = self.mutation_gate.lock().await;
-        if !matches!(*self.status.read(), MempoolOwnerStatus::Hydrating) {
+        if !self.status.read().follows_source() || self.staged_generation.lock().is_none() {
             return Err(Status::failed_precondition(
                 "mempool source emitted an unexpected snapshot-complete marker",
             ));
@@ -642,7 +763,7 @@ impl LiveMempoolOwner {
             .as_ref()
             .and_then(|staged_generation| staged_generation.mined_block_off_tip(source_tip));
         if let Some(observed_source_tip) = mined_block_off_tip {
-            self.begin_hydration_locked();
+            self.begin_next_generation_locked();
             return Ok(SnapshotCertification::GenerationOutran(GenerationOutran {
                 generation_source_tip: source_tip,
                 observed_source_tip,
@@ -840,9 +961,11 @@ impl Default for LiveMempoolOwner {
 /// A completed source generation is reconciled with the durable/live state
 /// under the owner gate. Serving transitions append to the follower-owned
 /// primary before applying the matching in-memory overlay; hydrating
-/// transitions remain staged until their snapshot-complete marker. If the
-/// impossible post-append mismatch is detected, the public index is withdrawn
-/// and the source stream is reopened from a fresh snapshot.
+/// transitions remain staged until their snapshot-complete marker. A normal
+/// tip change keeps the serving generation answering at its own tip while the
+/// replacement stages. If the impossible post-append mismatch is detected,
+/// the public index is withdrawn and the source stream is reopened from a
+/// fresh snapshot.
 pub async fn run_live_mempool_owner(
     source: Arc<dyn MempoolSource>,
     canonical: CanonicalControlHandle,
@@ -951,8 +1074,9 @@ async fn run_source_generation(
     mempool_ready_signal: &MempoolReadySignal,
     cancel: &CancellationToken,
 ) -> MempoolOwnerLoopOutcome {
-    mempool_ready_signal.withdraw_certification();
-    owner.begin_hydration().await;
+    if !owner.begin_next_generation().await {
+        mempool_ready_signal.withdraw_certification();
+    }
     if wait_for_canonical_epoch(canonical, cancel).await.is_none() {
         return MempoolOwnerLoopOutcome::Shutdown;
     }
@@ -987,7 +1111,6 @@ async fn consume_source_events(
     let context = SourceGenerationContext {
         canonical,
         owner,
-        mempool_ready_signal,
         cancel,
     };
     let mut pending_source_tip = None;
@@ -1020,7 +1143,7 @@ async fn consume_source_events(
                         continue;
                     }
                     Ok(SnapshotCertification::GenerationOutran(outran)) => {
-                        return rehydrate_after_outran(owner, mempool_ready_signal, outran).await;
+                        return rehydrate_after_outran(outran);
                     }
                     Err(status) => return rejected_snapshot_outcome(&status),
                 }
@@ -1041,7 +1164,6 @@ async fn consume_source_events(
 struct SourceGenerationContext<'a> {
     canonical: &'a CanonicalControlHandle,
     owner: &'a LiveMempoolOwner,
-    mempool_ready_signal: &'a MempoolReadySignal,
     cancel: &'a CancellationToken,
 }
 
@@ -1055,13 +1177,7 @@ async fn handle_source_event(
             generation_source_tip,
             observed_source_tip,
         }) => {
-            rehydrate_after_source_tip_change(
-                context.owner,
-                context.mempool_ready_signal,
-                generation_source_tip,
-                observed_source_tip,
-            )
-            .await;
+            record_source_tip_change(generation_source_tip, observed_source_tip);
             Some(MempoolOwnerLoopOutcome::Rehydrate)
         }
         Ok(MempoolSourceEvent::InitialSnapshotComplete { source_tip }) => {
@@ -1077,9 +1193,7 @@ async fn handle_source_event(
         .await
         {
             Ok(None) => None,
-            Ok(Some(outran)) => Some(
-                rehydrate_after_outran(context.owner, context.mempool_ready_signal, outran).await,
-            ),
+            Ok(Some(outran)) => Some(rehydrate_after_outran(outran)),
             Err(status) => Some(rejected_source_event_outcome(&status)),
         },
         Err(error) => Some(source_item_error_outcome(&error)),
@@ -1168,14 +1282,14 @@ fn rebuild_after_source_closed() -> MempoolOwnerLoopOutcome {
     }
 }
 
-async fn rehydrate_after_source_tip_change(
-    owner: &LiveMempoolOwner,
-    mempool_ready_signal: &MempoolReadySignal,
+/// Records a normal tip boundary. The next source generation stages behind
+/// the serving one, which keeps its certification until the replacement is
+/// certified.
+fn record_source_tip_change(
     generation_source_tip: zinder_core::BlockId,
     observed_source_tip: zinder_core::BlockId,
 ) {
-    mempool_ready_signal.withdraw_certification();
-    owner.begin_hydration().await;
+    metrics::counter!("zinder_mempool_source_tip_changes_total").increment(1);
     tracing::debug!(
         target: "zinder::ingest",
         event = "mempool_source_tip_changed",
@@ -1185,18 +1299,8 @@ async fn rehydrate_after_source_tip_change(
     );
 }
 
-async fn rehydrate_after_outran(
-    owner: &LiveMempoolOwner,
-    mempool_ready_signal: &MempoolReadySignal,
-    outran: GenerationOutran,
-) -> MempoolOwnerLoopOutcome {
-    rehydrate_after_source_tip_change(
-        owner,
-        mempool_ready_signal,
-        outran.generation_source_tip,
-        outran.observed_source_tip,
-    )
-    .await;
+fn rehydrate_after_outran(outran: GenerationOutran) -> MempoolOwnerLoopOutcome {
+    record_source_tip_change(outran.generation_source_tip, outran.observed_source_tip);
     MempoolOwnerLoopOutcome::Rehydrate
 }
 
@@ -1541,7 +1645,7 @@ mod tests {
     use zinder_testkit::{MockMempoolSource, MockMempoolSourceControl};
 
     use crate::{
-        MempoolReadyGate, mempool_ready_channel,
+        MempoolReadyGate, MempoolReadySignal, mempool_ready_channel,
         writer::control::{
             CanonicalControlCommand, CanonicalControlHandle, CanonicalWriterSnapshot,
             ParkedWriterHalt, apply_canonical_control_command, canonical_control_channel,
@@ -1859,8 +1963,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn source_tip_change_rehydrates_without_reconnect_backoff() -> Result<(), Box<dyn Error>>
-    {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the scenario follows one serving generation through consecutive tip changes"
+    )]
+    async fn source_tip_change_stages_a_replacement_behind_the_serving_generation()
+    -> Result<(), Box<dyn Error>> {
         let temporary = tempfile::TempDir::new()?;
         let store = published_fixture_store(&temporary.path().join("canonical"))?;
         let MutableEpochCanonicalControl {
@@ -1893,23 +2001,29 @@ mod tests {
             wait_for_source_open(&source_control, 2),
         )
         .await??;
-        assert_eq!(ready_gate.certified_source_tip(), None);
-        assert!(matches!(
-            *owner.status.read(),
-            MempoolOwnerStatus::Hydrating
-        ));
+        assert_eq!(
+            ready_gate.certified_source_tip(),
+            Some(generation_source_tip),
+            "a normal tip change keeps the serving generation certified"
+        );
+        assert_serving_at(&owner, generation_source_tip);
 
         source_control.complete_initial_snapshot(observed_source_tip)?;
         tokio::time::sleep(Duration::from_millis(75)).await;
-        assert!(matches!(
-            *owner.status.read(),
-            MempoolOwnerStatus::Hydrating
-        ));
+        assert_serving_at(&owner, generation_source_tip);
+        assert_eq!(
+            ready_gate.certified_source_tip(),
+            Some(generation_source_tip)
+        );
         assert_eq!(source_control.open_count(), 2);
 
         set_canonical_visible_tip(&canonical_epoch, observed_source_tip);
-        tokio::time::timeout(Duration::from_millis(250), wait_for_serving(&owner, true)).await??;
-        assert_eq!(ready_gate.certified_source_tip(), Some(observed_source_tip));
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            wait_until(|| ready_gate.certified_source_tip() == Some(observed_source_tip)),
+        )
+        .await??;
+        assert_serving_at(&owner, observed_source_tip);
         assert_eq!(source_control.open_count(), 2);
 
         source_control.change_source_tip(observed_source_tip, next_source_tip)?;
@@ -1940,6 +2054,124 @@ mod tests {
 
         cancel.cancel();
         owner_task.await?;
+        command_task.abort();
+        let _join_result = command_task.await;
+        Ok(())
+    }
+
+    /// Block arrival during steady-state following never withdraws the live
+    /// index.
+    ///
+    /// The serving generation answers at its own tip, and a read at the new
+    /// canonical tip waits for the replacement generation instead of failing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshot_read_during_a_tip_change_waits_for_the_replacement_generation()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let MutableEpochCanonicalControl {
+            canonical,
+            canonical_epoch,
+            command_task,
+        } = mutable_epoch_canonical_control(store)?;
+        let (source, source_control) = MockMempoolSource::streaming();
+        let owner = LiveMempoolOwner::default();
+        let (ready_signal, ready_gate) = mempool_ready_channel();
+        let cancel = CancellationToken::new();
+        let owner_task = tokio::spawn(run_live_mempool_owner(
+            Arc::new(source),
+            canonical.clone(),
+            owner.clone(),
+            ready_signal,
+            cancel.clone(),
+        ));
+        let serving_tip = fixture_tip(2);
+        let next_tip = fixture_tip(3);
+        set_canonical_visible_tip(&canonical_epoch, serving_tip);
+        wait_for_source_open(&source_control, 1).await?;
+        source_control.push_added(source_entry(0xD1)?)?;
+        source_control.complete_initial_snapshot(serving_tip)?;
+        wait_for_serving(&owner, true).await?;
+
+        // The node reports the block first: the replacement generation stages
+        // while canonical ingest still shows the serving tip.
+        source_control.change_source_tip(serving_tip, next_tip)?;
+        wait_for_source_open(&source_control, 2).await?;
+        let (chain_epoch, page) = owner
+            .snapshot_page_at_canonical_tip(&canonical, 8, Vec::new())
+            .await?;
+        assert_eq!(visible_tip(chain_epoch), serving_tip);
+        assert_eq!(page.source_tip, serving_tip);
+        assert_eq!(page.entries.len(), 1);
+
+        // Canonical ingest commits the block before the replacement certifies.
+        set_canonical_visible_tip(&canonical_epoch, next_tip);
+        let read_owner = owner.clone();
+        let read_canonical = canonical.clone();
+        let read_at_next_tip = tokio::spawn(async move {
+            read_owner
+                .snapshot_page_at_canonical_tip(&read_canonical, 8, Vec::new())
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert!(
+            !read_at_next_tip.is_finished(),
+            "a read at the new tip waits for the replacement generation"
+        );
+        assert!(owner.require_serving().is_ok());
+        assert_eq!(ready_gate.certified_source_tip(), Some(serving_tip));
+        assert!(
+            ready_gate.admits_canonical_tip(next_tip),
+            "block arrival must not withdraw ingest readiness"
+        );
+
+        source_control.push_added(source_entry(0xD1)?)?;
+        source_control.push_added(source_entry(0xD2)?)?;
+        source_control.complete_initial_snapshot(next_tip)?;
+        let (chain_epoch, page) =
+            tokio::time::timeout(Duration::from_secs(2), read_at_next_tip).await???;
+        assert_eq!(visible_tip(chain_epoch), next_tip);
+        assert_eq!(page.source_tip, next_tip);
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(ready_gate.certified_source_tip(), Some(next_tip));
+        assert_eq!(
+            durable_event_count(&canonical).await?,
+            2,
+            "only the replacement's new entry becomes durable"
+        );
+
+        cancel.cancel();
+        owner_task.await?;
+        command_task.abort();
+        let _join_result = command_task.await;
+        Ok(())
+    }
+
+    /// A read refused for a lasting reason fails at once instead of waiting
+    /// out the tip-transition bound.
+    #[tokio::test]
+    async fn read_during_a_rebuild_fails_without_waiting() -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let (canonical, mut commands) = canonical_control_channel();
+        let command_task = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                apply_canonical_control_command(&mut store, command);
+            }
+        });
+        let owner = LiveMempoolOwner::default();
+        owner.withdraw_for_rebuild().await;
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(500),
+            owner.entry_at_canonical_tip(&canonical, TransactionId::from_bytes([0xD3; 32])),
+        )
+        .await?;
+
+        assert_eq!(
+            outcome.err().map(|status| status.code()),
+            Some(Code::Unavailable)
+        );
         command_task.abort();
         let _join_result = command_task.await;
         Ok(())
@@ -2101,7 +2333,8 @@ mod tests {
         Ok(())
     }
 
-    /// A `Mined` change for any block but the serving tip ends the generation.
+    /// A `Mined` change for any block but the serving tip ends the source
+    /// generation without applying the removal.
     ///
     /// Zebra's mempool changes and tip notifications have no shared order, so
     /// a `Mined` change for the next block can reach a serving generation
@@ -2124,14 +2357,16 @@ mod tests {
             let outcome = harness.finish().await?;
 
             assert_eq!(outcome, MempoolOwnerLoopOutcome::Rehydrate);
-            assert!(!harness.owner.is_serving());
-            assert_eq!(harness.ready_gate.certified_source_tip(), None);
+            assert_serving_at(&harness.owner, source_tip);
+            assert_eq!(harness.ready_gate.certified_source_tip(), Some(source_tip));
             let chain_epoch = harness.chain_epoch().await?;
-            let point_read = harness.owner.entry_for(chain_epoch, transaction_id).await;
-            assert_eq!(
-                point_read.err().map(|status| status.code()),
-                Some(Code::Unavailable),
-                "a generation outrun by {off_tip:?} must not answer a mempool miss"
+            assert!(
+                harness
+                    .owner
+                    .entry_for(chain_epoch, transaction_id)
+                    .await?
+                    .is_some(),
+                "a generation outrun by {off_tip:?} keeps the entry at its own tip"
             );
             assert_eq!(
                 durable_event_count(&harness.canonical).await?,
@@ -2231,6 +2466,9 @@ mod tests {
         source_control: MockMempoolSourceControl,
         owner: LiveMempoolOwner,
         ready_gate: MempoolReadyGate,
+        /// Keeps the gate open after the owner loop returns, so a test can
+        /// read the certification the loop left behind.
+        _ready_signal: MempoolReadySignal,
         cancel: CancellationToken,
         owner_task: Option<tokio::task::JoinHandle<MempoolOwnerLoopOutcome>>,
     }
@@ -2249,6 +2487,7 @@ mod tests {
             let event_stream = source.events().await?;
             let owner = LiveMempoolOwner::default();
             let (ready_signal, ready_gate) = mempool_ready_channel();
+            let retained_ready_signal = ready_signal.clone();
             let cancel = CancellationToken::new();
             let task_canonical = canonical.clone();
             let task_owner = owner.clone();
@@ -2272,6 +2511,7 @@ mod tests {
                 source_control,
                 owner,
                 ready_gate,
+                _ready_signal: retained_ready_signal,
                 cancel,
                 owner_task: Some(owner_task),
             })
@@ -2956,6 +3196,21 @@ mod tests {
         expected: bool,
     ) -> Result<(), Box<dyn Error>> {
         wait_until(|| owner.is_serving() == expected).await
+    }
+
+    fn visible_tip(chain_epoch: ChainEpoch) -> zinder_core::BlockId {
+        zinder_core::BlockId::new(chain_epoch.visible_tip_height, chain_epoch.visible_tip_hash)
+    }
+
+    fn assert_serving_at(owner: &LiveMempoolOwner, expected_source_tip: zinder_core::BlockId) {
+        let status = *owner.status.read();
+        assert!(
+            matches!(
+                status,
+                MempoolOwnerStatus::Serving { source_tip, .. } if source_tip == expected_source_tip
+            ),
+            "expected the owner to serve at {expected_source_tip:?}, found {status:?}"
+        );
     }
 
     async fn wait_for_hydration(

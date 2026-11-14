@@ -19,7 +19,7 @@ The decisions to record here are:
 
 1. The split between in-memory `MempoolIndex` (live state) and durable mempool event history (cursor-resumable history) and why the canonical store carries the latter but not the former.
 2. The `IngestControlMempoolSurface` topology: secondary readers and the lightwalletd compat shim consume the writer's mempool through the same `IngestControl` endpoint that already serves chain events, instead of opening a second source connection.
-3. The two-tier retention windows, their defaults, their metrics-only operational diagnostics, and the exact-tip hydration prerequisite that keeps ingest `syncing` until the mempool and canonical tips agree.
+3. The two-tier retention windows, their defaults, their metrics-only operational diagnostics, the hydration prerequisite that keeps ingest `syncing` until a mempool generation is certified, and the bounded tip-transition grace that keeps block arrival from withdrawing ingest readiness.
 4. The `TxStatus::InMempool(MempoolEntry)` typed shape that carries the hydrated mempool entry, the chain epoch at first observation, the transparent overlay, and the precomputed compact-tx bytes; clients receive the typed status directly rather than parsing error strings.
 
 ## Decision
@@ -48,7 +48,7 @@ raw-byte bound covers the variable transaction payload rather than claiming an
 exact encoded RocksDB batch size; envelope and derived compact-transaction
 overhead remain bounded by the event-count ceiling. A single oversized event is
 still admitted as a singleton so reconciliation always makes progress. Reads
-remain unavailable until every batch has been applied and the source generation
+wait on the gate until every batch has been applied and the source generation
 is certified. A
 network-upgrade activation can therefore evict thousands of transactions
 without issuing one synchronous write per transaction or constructing one
@@ -63,14 +63,33 @@ privately and discards the generation if hydration fails or its source tip
 changes. Polling verifies the source tip between bounded-size hydration batches;
 the streaming source verifies it before publishing the completion marker.
 Normal source-tip movement emits a typed, non-durable `SourceTipChanged`
-control event: the owner withdraws exact-tip certification, discards any
-provisional generation, and immediately opens a replacement generation. It is
-not a source failure or durable-state rebuild and therefore adds no source-error
-telemetry or recovery backoff. Transport, monitor, hydration, admission, and
-protocol failures continue through the bounded rebuild path. When the
-replacement snapshot completes before canonical ingest reaches the same tip,
-the owner keeps it private, continues staging source transitions, and certifies
-it as soon as the canonical tip catches up.
+control event, and a `Mined` change for a block other than the serving tip is
+treated the same way. The owner discards any provisional generation and
+immediately opens a replacement generation, but it keeps the serving generation
+and its certification. That generation still describes the mempool at its own
+tip, which is exactly what a reader whose canonical epoch has not moved yet
+needs, so block arrival never makes the live index unavailable. Source
+transitions are staged for the replacement and do not touch the serving index.
+A tip change is not a source failure or durable-state rebuild and therefore
+adds no source-error telemetry or recovery backoff. Transport, monitor,
+hydration, admission, and protocol failures continue through the bounded
+rebuild path, which withdraws the serving generation. When the replacement
+snapshot completes before canonical ingest reaches the same tip, the owner
+keeps it private, continues staging source transitions, and certifies it as
+soon as the canonical tip catches up. Certification reconciles the replacement
+against the serving index under the mutation gate and moves the serving tip in
+one step.
+
+A read is answered at the canonical writer's current epoch. Between canonical
+ingest committing a block and the owner certifying the replacement at that
+block, the serving generation is one tip behind. `MempoolSnapshot` and
+`MempoolTransaction` then wait up to five seconds for the replacement, waking
+on each owner status change and recapturing the canonical epoch, and answer
+coherently once it is certified. A read that is still incoherent at the bound
+returns `CHAIN_EPOCH_PIN_UNAVAILABLE`, and a read refused because the owner is
+rebuilding or halted fails at once. With the streaming source the transition
+takes milliseconds, so wallets see a short delay at block boundaries instead
+of an error.
 
 Every polling and streaming generation also has source-admission ceilings for
 distinct transaction count and cumulative raw transaction bytes. The defaults
@@ -158,10 +177,16 @@ loop instead reports retained rows, floor sequence and age, per-kind prune
 counts, bounded work, and typed step outcomes through metrics. Source and
 hydration failures remain source-owner diagnostics. The canonical follower is
 the only publisher of ingest readiness and treats the mempool hydration gate
-as a hard prerequisite. The gate carries the source tip certified by the
-hydrated generation, and readiness requires exact equality with the canonical
-fence, avoiding both cross-tip admission and last-writer-wins races between
-independent background tasks.
+as a hard prerequisite, avoiding last-writer-wins races between independent
+background tasks. The gate carries the source tip certified by the serving
+generation. Readiness requires a certified generation, and its source tip must
+equal the canonical fence or have disagreed with it for less than 30 seconds.
+The grace covers a normal tip transition: the streaming source certifies the
+replacement within milliseconds, while the polling source can take one poll
+interval plus a full mempool hydration. Its clock starts when the two tips
+first disagree and does not restart on a later block, so a mempool that stops
+following the tip withdraws readiness within the grace even while blocks keep
+arriving.
 
 `snapshot_age_millis` measures time since the current source generation's
 snapshot was certified, including for a certified empty mempool. It is not the
@@ -193,7 +218,7 @@ The `MempoolEntry` carries the hydrated transaction, the chain epoch at first ob
 
 - One privileged path (`IngestControl`) serves writer status, visible chain events, mempool snapshots, and mempool events. Bearer-token auth from ADR-0006 covers every method.
 - Operators tune mempool retention separately from chain-event retention. Default `mined_window = 60 minutes` and `invalidated_window = 24 hours` are shipped values; production deployments with longer wallet reconnect SLAs raise them and accept the larger `mempool_event` column-family footprint.
-- Mempool lifecycle, source, hydration, and retention conditions are metrics-only diagnostics and add no readiness causes. Ingest remains `syncing` until a certified hydrated generation matches the exact canonical tip.
+- Mempool lifecycle, source, hydration, and retention conditions are metrics-only diagnostics and add no readiness causes. Ingest remains `syncing` until a generation is certified, and again when the certified tip has trailed the canonical tip for 30 seconds. Block arrival alone causes no readiness transition in ingest or in the native query's ingest-control probe.
 
 ## Alternatives Considered
 
@@ -221,6 +246,13 @@ Rejected. The Android SDK tolerates arbitrary stream end and reconnects, but the
 - Mempool-broadcast endpoints beyond the existing `SendTransaction` path. Broadcast remains a `TransactionBroadcaster` boundary owned by `zinder-source`.
 
 ## Revision history
+
+- 2026-11-14: A normal tip change keeps the serving generation and its
+  certification while the replacement hydrates, live reads wait up to five
+  seconds for tip coherence, and ingest readiness tolerates a certified tip
+  that has trailed the canonical tip for less than 30 seconds. Previously each
+  block withdrew the live index until the replacement was certified, so every
+  block briefly made ingest and native query not ready.
 
 - 2026-11-12: The live index keeps outpoint sets for conflict checks instead of
   by-address and by-outpoint lookup maps. The transparent mempool point
