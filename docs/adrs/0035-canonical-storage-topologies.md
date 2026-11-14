@@ -72,6 +72,37 @@ and a canonical retention lease, builds an inactive wallet store, validates its
 source identity and digest, catches up, and publishes ready evidence. Continuous
 following takes ownership before the construction leases are released.
 
+Both construction leases belong to the projector's configured build-owner
+identity. The wallet build lease records it as the lease owner, and the
+canonical retention lease uses it as the lease identity. The wallet build
+lease refuses a different owner until it expires, so two projectors with
+distinct identities never share a build. The owner of a live lease may reclaim
+it at once, and may discard the unpublished wallet store it guards. A projector
+restarted after a crash therefore discards its own unpublished store, reclaims
+its canonical retention lease, and builds again without waiting for the lease
+duration.
+
+Every acquisition, including a reclaim, persists a strictly higher lease
+generation. Both stores compare the generation on each renewal and release, and
+the wallet store also compares it before READY publication. A process still
+holding a replaced generation therefore cannot renew, release, or publish
+under it.
+
+Lease ownership cannot tell a restarted owner from a second live process
+configured with the same identity. A non-blocking advisory lock on a
+`<wallet>.build-lock` file beside the wallet path does. A projector holds it
+for the whole of a wallet construction and while it discards an unpublished
+store, and the operating system releases it when the process exits, including
+on a kill. A restart therefore always acquires it, while a second live process
+building or discarding the same path is refused. The lock file is never
+removed, so every process locks the same file.
+
+A fresh wallet store is initialized in a `<wallet>.initializing` sibling and
+renamed to the wallet path after its BUILDING control record is durable. The
+wallet path therefore never holds a store without that record. Under the lock,
+a construction whose wallet path does not exist yet removes the staging and
+initialization siblings an interrupted build left behind.
+
 Serving admission catches canonical and wallet secondaries up independently and
 publishes a pair only when their identities and positions agree. In-flight
 requests retain their original immutable pair while later requests atomically
@@ -121,6 +152,10 @@ not prove this contract.
   generic database adapter or a successful persistence microbenchmark.
 - Operators must place the supported primary stores on one host filesystem and
   preserve separate secondary metadata paths per reader process.
+- A projector that crashes during construction resumes as soon as it restarts
+  with the same build-owner identity. Concurrently running projectors need
+  distinct identities, because projectors that share one interrupt each
+  other's builds instead of being refused.
 
 ## Rejected alternatives
 
@@ -141,8 +176,31 @@ recovery mechanics. Domain-shaped APIs remain stable while engine-specific
 modules own physical behavior. Shared abstractions are introduced only when two
 supported implementations prove the same boundary.
 
+### Release construction leases only on a clean exit
+
+The projector already releases both leases when construction fails or is
+cancelled. A process stopped by the out-of-memory killer, a kill signal, or a
+host restart runs no cleanup. Releasing on exit alone would still stall
+construction for the full lease duration after every crash.
+
+### Shorter construction leases
+
+The lease must outlive the longest durable construction phase, so
+`projector.lease_duration_seconds` has a 14400-second floor. A shorter lease
+would bound the stall after a crash, but a healthy long build could lose
+ownership between heartbeats.
+
 ### Mixed storage-engine deployments
 
 Per-plane engine mixing multiplies backup, readiness, failover, and support
 combinations. A future topology must define one coherent application contract
 for all required stores and runtimes.
+
+## Revision history
+
+- 2026-11-14: Construction leases belong to the build-owner identity. The same
+  owner reclaims a live lease at a higher generation instead of waiting for it
+  to expire, and a different owner is still refused. A process-lifetime lock
+  beside the wallet path refuses a concurrent build or discard of that path,
+  and a fresh store reaches the wallet path only by rename after its control
+  record is durable.

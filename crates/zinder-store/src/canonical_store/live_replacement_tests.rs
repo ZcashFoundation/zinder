@@ -638,10 +638,9 @@ fn retained_events_resume_exactly_and_leases_bound_pruning()
     let acquired_lease =
         store.acquire_projection_build_lease(lease, UnixTimestampMillis::new(10))?;
     assert_eq!(acquired_lease.generation(), 1);
-    assert!(matches!(
-        store.acquire_projection_build_lease(lease, UnixTimestampMillis::new(10)),
-        Err(CanonicalStoreError::ProjectionBuildLeaseInvalid { .. })
-    ));
+    let reclaimed_lease =
+        store.acquire_projection_build_lease(lease, UnixTimestampMillis::new(10))?;
+    assert_eq!(reclaimed_lease.generation(), 2);
     let beyond_maximum_ttl = ProjectionBuildLease::new(
         ProjectionBuildLeaseId::from_bytes([9; 16]),
         page[1].projection_build_anchor(),
@@ -719,7 +718,7 @@ fn retained_events_resume_exactly_and_leases_bound_pruning()
     );
     let takeover =
         store.acquire_projection_build_lease(takeover_request, UnixTimestampMillis::new(20))?;
-    assert_eq!(takeover.generation(), 3);
+    assert_eq!(takeover.generation(), 4);
     let stale_renewal = ProjectionBuildLease::new(
         acquired_lease.id(),
         acquired_lease.anchor(),
@@ -1087,6 +1086,100 @@ fn projection_build_lease_capacity_is_bounded() -> Result<(), Box<dyn std::error
         ),
         "unexpected cardinality rejection: {error:?}"
     );
+
+    let held = leases.first().ok_or("capacity fixture seeded no lease")?;
+    let reclaimed = store.acquire_projection_build_lease(
+        ProjectionBuildLease::new(held.id(), anchor, expires_at),
+        now,
+    )?;
+    assert!(reclaimed.generation() > held.generation());
+    Ok(())
+}
+
+#[test]
+fn reacquiring_a_live_lease_identity_reclaims_it_and_fences_the_replaced_generation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let store = published_store(&store_path, 2, BlockHeight::new(3), BlockHeight::new(2))?;
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let crashed_anchor = store
+        .canonical_event_history(CanonicalEventHistoryRequest::new(None, NonZeroU32::MIN))?
+        .first()
+        .ok_or("published baseline did not produce a canonical event")?
+        .projection_build_anchor();
+    let appended_four = replacement_block(BlockHeight::new(4), [44; 32], [3; 32], 204)?;
+    let append_fence = store.event_fence();
+    let (store, _) = store.commit_live_append(
+        CanonicalLiveAppend::new(
+            append_fence,
+            appended_four,
+            Vec::new(),
+            BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([2; 32])),
+            UnixTimestampMillis::new(1_750_000_000_003),
+        ),
+        &activations,
+    )?;
+    let restart_anchor = store
+        .canonical_event_history(CanonicalEventHistoryRequest::new(
+            None,
+            NonZeroU32::new(10).ok_or("zero page limit")?,
+        ))?
+        .last()
+        .ok_or("live append did not produce a canonical event")?
+        .projection_build_anchor();
+    assert!(
+        restart_anchor.event_cursor().event_sequence()
+            > crashed_anchor.event_cursor().event_sequence()
+    );
+    let owner = ProjectionBuildLeaseId::from_bytes([0x5a; 16]);
+    let expires_at =
+        UnixTimestampMillis::new(UnixTimestampMillis::now().value().saturating_add(60_000));
+    let crashed = store.acquire_projection_build_lease(
+        ProjectionBuildLease::new(owner, crashed_anchor, expires_at),
+        UnixTimestampMillis::now(),
+    )?;
+
+    // The builder holding `crashed` stops without releasing it; the writer
+    // keeps the lease durable across its own restart.
+    drop(store);
+    let store = open_store(&store_path, &activations, 2)?;
+    assert_eq!(
+        store.active_projection_build_lease(owner, UnixTimestampMillis::now())?,
+        Some(crashed)
+    );
+
+    let reclaimed = store.acquire_projection_build_lease(
+        ProjectionBuildLease::new(owner, restart_anchor, expires_at),
+        UnixTimestampMillis::now(),
+    )?;
+    assert!(reclaimed.generation() > crashed.generation());
+    assert_eq!(reclaimed.anchor(), restart_anchor);
+    assert_eq!(
+        store.active_projection_build_lease(owner, UnixTimestampMillis::now())?,
+        Some(reclaimed)
+    );
+    let replaced_renewal = ProjectionBuildLease::new(
+        owner,
+        crashed_anchor,
+        UnixTimestampMillis::new(expires_at.value().saturating_add(1)),
+    )
+    .with_generation(crashed.generation());
+    assert!(matches!(
+        store.renew_projection_build_lease(replaced_renewal, UnixTimestampMillis::now()),
+        Err(CanonicalStoreError::ProjectionBuildLeaseInvalid { .. })
+    ));
+    assert!(matches!(
+        store.release_projection_build_lease(crashed),
+        Err(CanonicalStoreError::ProjectionBuildLeaseInvalid { .. })
+    ));
+
+    let restart_sequence = restart_anchor.event_cursor().event_sequence();
+    let pruned =
+        store.prune_canonical_events_before(restart_sequence, UnixTimestampMillis::now())?;
+    assert_eq!(pruned.oldest_retained_sequence, restart_sequence);
+    assert_eq!(pruned.lease_protected_anchor, Some(restart_anchor));
+    store.release_projection_build_lease(reclaimed)?;
     Ok(())
 }
 

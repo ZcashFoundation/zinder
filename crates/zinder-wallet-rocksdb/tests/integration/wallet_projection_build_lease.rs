@@ -32,9 +32,71 @@ fn active_build_lease_refuses_a_competing_owner() -> Result<(), Box<dyn std::err
     );
     assert!(matches!(
         build.try_acquire_lease(request(0x22, source, UnixTimestampMillis::new(300)), now),
-        Err(RocksDbWalletError::WalletProjectionBuildLeaseHeld { .. })
+        Err(RocksDbWalletError::WalletProjectionBuildLeaseHeld { holder, expires_at })
+            if holder == lease.owner() && expires_at == lease.expires_at()
     ));
     drop(build);
+    Ok(())
+}
+
+#[test]
+fn same_owner_reclaims_a_live_lease_at_a_higher_generation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let source = source_identity();
+    let path = temporary.path().join("wallet");
+    let build = RocksDbWalletBuildStore::create_fresh(
+        &path,
+        Network::ZcashRegtest,
+        source,
+        0,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    let crashed = build.try_acquire_lease(
+        request(0x11, source, UnixTimestampMillis::new(10_000)),
+        UnixTimestampMillis::new(100),
+    )?;
+    drop(build);
+
+    let restarted = RocksDbWalletBuildStore::open(
+        &path,
+        Network::ZcashRegtest,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert!(matches!(
+        restarted.try_acquire_lease(
+            request(0x22, source, UnixTimestampMillis::new(10_000)),
+            UnixTimestampMillis::new(101),
+        ),
+        Err(RocksDbWalletError::WalletProjectionBuildLeaseHeld { holder, .. })
+            if holder == crashed.owner()
+    ));
+    let reclaimed = restarted.try_acquire_lease(
+        request(0x11, source, UnixTimestampMillis::new(20_000)),
+        UnixTimestampMillis::new(101),
+    )?;
+    assert_eq!(reclaimed.owner(), crashed.owner());
+    assert_eq!(reclaimed.generation(), crashed.generation() + 1);
+    assert_eq!(reclaimed.expires_at(), UnixTimestampMillis::new(20_000));
+
+    assert!(matches!(
+        restarted.renew_lease(
+            crashed,
+            UnixTimestampMillis::new(30_000),
+            UnixTimestampMillis::new(102),
+        ),
+        Err(RocksDbWalletError::WalletProjectionBuildLeaseGenerationMismatch { .. })
+    ));
+    assert!(matches!(
+        restarted.release_lease(crashed, UnixTimestampMillis::new(102)),
+        Err(RocksDbWalletError::WalletProjectionBuildLeaseGenerationMismatch { .. })
+    ));
+    let renewed = restarted.renew_lease(
+        reclaimed,
+        UnixTimestampMillis::new(30_000),
+        UnixTimestampMillis::new(102),
+    )?;
+    restarted.release_lease(renewed, UnixTimestampMillis::new(103))?;
     Ok(())
 }
 
@@ -146,7 +208,7 @@ fn build_lease_rejects_a_stale_canonical_or_retained_event_anchor()
 }
 
 #[test]
-fn discard_unpublished_refuses_a_live_owner_then_removes_an_expired_build()
+fn discard_unpublished_refuses_another_live_owner_then_removes_an_expired_build()
 -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;
     let source = source_identity();
@@ -158,17 +220,41 @@ fn discard_unpublished_refuses_a_live_owner_then_removes_an_expired_build()
         0,
         RocksDbResourceBudget::for_local_tests(),
     )?;
-    let _lease = build.try_acquire_lease(
+    let lease = build.try_acquire_lease(
         request(0x11, source, UnixTimestampMillis::new(200)),
         UnixTimestampMillis::new(100),
     )?;
+    let other_owner = WalletProjectionBuildOwner::from_bytes([0x22; 16]);
     assert!(matches!(
         build
             .clone()
-            .discard_unpublished(UnixTimestampMillis::new(199)),
-        Err(RocksDbWalletError::WalletProjectionBuildLeaseHeld { .. })
+            .discard_unpublished(other_owner, UnixTimestampMillis::new(199)),
+        Err(RocksDbWalletError::WalletProjectionBuildLeaseHeld { holder, .. })
+            if holder == lease.owner()
     ));
-    build.discard_unpublished(UnixTimestampMillis::new(200))?;
+    build.discard_unpublished(other_owner, UnixTimestampMillis::new(200))?;
+    assert!(!path.exists());
+    Ok(())
+}
+
+#[test]
+fn discard_unpublished_admits_the_live_lease_owner_immediately()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let source = source_identity();
+    let path = temporary.path().join("wallet");
+    let build = RocksDbWalletBuildStore::create_fresh(
+        &path,
+        Network::ZcashRegtest,
+        source,
+        0,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    let lease = build.try_acquire_lease(
+        request(0x11, source, UnixTimestampMillis::new(10_000)),
+        UnixTimestampMillis::new(100),
+    )?;
+    build.discard_unpublished(lease.owner(), UnixTimestampMillis::new(101))?;
     assert!(!path.exists());
     Ok(())
 }

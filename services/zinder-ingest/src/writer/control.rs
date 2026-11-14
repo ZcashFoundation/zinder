@@ -1558,9 +1558,6 @@ fn map_store_error(error: &CanonicalStoreError) -> Status {
             Status::failed_precondition("canonical event cursor has expired")
         }
         CanonicalStoreError::ProjectionBuildLeaseInvalid {
-            reason: "lease identity is already held by a live builder",
-        } => Status::already_exists("projection build lease is already held"),
-        CanonicalStoreError::ProjectionBuildLeaseInvalid {
             reason: "lease identity is not held",
         } => Status::failed_precondition("projection build lease is not held"),
         CanonicalStoreError::CanonicalEventCursorMalformed { .. }
@@ -2149,8 +2146,9 @@ pub(crate) mod test_support {
             .lease
             .ok_or("renew response omitted lease")?;
         assert_eq!(renewed.generation, acquired.generation);
+        let reclaimed = assert_live_lease_identity_reclaim(client, renewed).await?;
 
-        let mut stale_release = renewed.clone();
+        let mut stale_release = reclaimed.clone();
         stale_release.generation = stale_release.generation.saturating_add(1);
         let stale_status = client
             .release_projection_build_lease(authenticated(
@@ -2165,11 +2163,50 @@ pub(crate) mod test_support {
         client
             .release_projection_build_lease(authenticated(
                 ReleaseCanonicalProjectionBuildLeaseRequest {
-                    lease: Some(renewed),
+                    lease: Some(reclaimed),
                 },
             ))
             .await?;
         Ok(())
+    }
+
+    /// A restarted builder re-acquires its live lease identity at a higher
+    /// generation, and the replaced generation can no longer renew.
+    async fn assert_live_lease_identity_reclaim(
+        client: &mut CanonicalControlClient<tonic::transport::Channel>,
+        live: CanonicalProjectionBuildLease,
+    ) -> Result<CanonicalProjectionBuildLease, Box<dyn std::error::Error>> {
+        let reclaimed = client
+            .acquire_projection_build_lease(authenticated(
+                AcquireCanonicalProjectionBuildLeaseRequest {
+                    lease: Some(CanonicalProjectionBuildLease {
+                        generation: 0,
+                        ..live.clone()
+                    }),
+                },
+            ))
+            .await?
+            .into_inner()
+            .lease
+            .ok_or("reclaim response omitted lease")?;
+        assert_eq!(reclaimed.lease_id, live.lease_id);
+        assert!(reclaimed.generation > live.generation);
+
+        let mut replaced_renewal = live;
+        replaced_renewal.expires_at_unix_millis = replaced_renewal
+            .expires_at_unix_millis
+            .saturating_add(1_000);
+        let replaced_status = client
+            .renew_projection_build_lease(authenticated(
+                RenewCanonicalProjectionBuildLeaseRequest {
+                    lease: Some(replaced_renewal),
+                },
+            ))
+            .await
+            .err()
+            .ok_or("replaced generation renewal unexpectedly succeeded")?;
+        assert_eq!(replaced_status.code(), tonic::Code::InvalidArgument);
+        Ok(reclaimed)
     }
 
     #[test]

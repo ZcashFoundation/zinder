@@ -200,6 +200,17 @@ impl WalletProjectionBuildOwner {
     }
 }
 
+/// Formats the owner as the 32 lowercase hexadecimal characters that
+/// `projector.build_owner_hex` configures, so an operator can match a
+/// reported lease holder to its configuration.
+impl core::fmt::Display for WalletProjectionBuildOwner {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.0
+            .iter()
+            .try_for_each(|byte| write!(formatter, "{byte:02x}"))
+    }
+}
+
 /// Exact retained chain-event position from which projection following may resume.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WalletProjectionRetainedEventAnchor {
@@ -1164,6 +1175,14 @@ mod tests {
 
         assert_eq!(control.encode(), Ok(expected.clone()));
         assert_eq!(WalletStoreControlRecord::decode(&expected), Ok(control));
+    }
+
+    #[test]
+    fn build_owner_displays_as_its_configured_hexadecimal_value() {
+        let owner = WalletProjectionBuildOwner::from_bytes(
+            0x0011_2233_4455_6677_8899_aabb_ccdd_eeff_u128.to_be_bytes(),
+        );
+        assert_eq!(owner.to_string(), "00112233445566778899aabbccddeeff");
     }
 
     #[test]

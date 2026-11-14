@@ -29,7 +29,7 @@ junit = { path = "target/nextest/junit.xml" }
 # reopen the store. Each abort plus RocksDB reopen costs seconds where the host
 # collects core dumps, which exceeds the 20s default kill window under
 # full-workspace parallelism.
-filter = "test(publication_crashes_preserve_the_atomic_build_state) | test(live_commit_crashes_reopen_at_one_complete_atomic_fence) | test(activation_schedule_crash_recovers_before_or_after_atomic_record_and_control_write) | test(/across_process_abort$/) | test(/^process_crash::tests::/)"
+filter = "test(publication_crashes_preserve_the_atomic_build_state) | test(live_commit_crashes_reopen_at_one_complete_atomic_fence) | test(activation_schedule_crash_recovers_before_or_after_atomic_record_and_control_write) | test(killed_wallet_build_restarts_under_the_same_owner_without_waiting_for_lease_expiry) | test(/across_process_abort$/) | test(/^process_crash::tests::/)"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]

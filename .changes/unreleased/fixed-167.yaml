@@ -1,0 +1,6 @@
+kind: fixed
+body: "A `zinder-projector` that crashes or is killed during wallet construction now resumes as soon as it restarts with the same `projector.build_owner_hex`. Previously its leftover construction leases refused the restart for up to `projector.lease_duration_seconds`. A projector with a different owner value is still refused until the lease expires, and the error now names the owner that holds the build; the initial-sync runbook describes how to recover. A second projector running against the same wallet path is refused while the first builds, even with the same owner value, and a crash before the wallet store is created no longer blocks the next build."
+time: 2026-11-14T12:00:00Z
+custom:
+  Bump: patch
+  PR: "167"
