@@ -133,10 +133,10 @@ The ceiling applies to each sorter separately, but the staging directory holds
 several sorters' files and the finished SST files at the same time. While the
 outpoint sorter's merged run is read, the address sorters and the spent-output
 SST files grow beside it. The address-transaction sorter then merges while
-those SST files remain. Scaled from the measured outpoint sorter by record
-size, a Mainnet build from genesis peaks at about 130 GB of staging. This is an
-estimate, not a measured peak. Keep about 140 GB free on the volume when wallet
-construction starts. The finished wallet store keeps part of that space. The
+those SST files remain. In a November 2026 Mainnet build from genesis, staging
+peaked at about 117 GB near the end of the outpoint drain, and at about 110 GB
+during the address-transaction merge. Keep about 130 GB free on the volume when
+wallet construction starts. The finished wallet store keeps part of that space. The
 ceiling does not check free space, so an undersized volume fails with a
 disk-full error late in construction.
 

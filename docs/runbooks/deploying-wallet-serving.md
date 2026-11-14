@@ -45,7 +45,7 @@ docker build -f deploy/Dockerfile --target zinder-wallet-serving \
 Attach one persistent volume at `/var/lib/zinder`. Size it for canonical data,
 the wallet projection, checkpoint staging, the reader secondaries, and
 chain-growth reserve. Fresh wallet construction also spills its sorters to a
-staging directory beside the wallet store. On Mainnet, keep about 140 GB free
+staging directory beside the wallet store. On Mainnet, keep about 130 GB free
 when wallet construction starts; see
 [Wallet construction](initial-sync.md#wallet-construction).
 
