@@ -64,6 +64,8 @@ $SPIKE verify --fixture "$FIX" --combined "$WORK/arm1-combined" --reference-wall
 # Arm 3: Arm 1 plus a background writer adding mirror lanes of every committed
 # block (unsynced, WAL on). Check pressure_to_commit_bytes_ratio in the report
 # and raise --pressure-lanes until it is about 9 (total volume about 10x).
+# Smoke: 9 lanes gave 6.28x over heights 4570123..4571122 (sparse blocks, where
+# the unmirrored per-commit control records weigh more).
 for MODE in canonical-only combined; do
   $SPIKE replay --fixture "$FIX" --golden "$(golden $MODE)" --work "$WORK/arm3-$MODE" --mode $MODE \
     --pressure-lanes ${PRESSURE_LANES:-9} --samples "$OUT/arm3-$MODE.samples.jsonl" \
