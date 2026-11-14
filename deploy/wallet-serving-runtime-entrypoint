@@ -36,8 +36,9 @@ shutdown_grace_seconds=20
 # logs. The construction defaults fit Testnet; a Mainnet build from an empty
 # volume needs the documented longer values. A restart discards unpublished
 # construction staging, so a deadline shorter than the build never finishes.
-canonical_construction_deadline_seconds="${ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE_SECONDS:-10800}"
-wallet_construction_deadline_seconds="${ZINDER_WALLET_SERVING__WALLET_CONSTRUCTION_DEADLINE_SECONDS:-7200}"
+# A set but empty variable fails validation instead of taking the default.
+canonical_construction_deadline_seconds="${ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE_SECONDS-10800}"
+wallet_construction_deadline_seconds="${ZINDER_WALLET_SERVING__WALLET_CONSTRUCTION_DEADLINE_SECONDS-7200}"
 wallet_serving_deadline_seconds=1800
 
 # Upstream outages and sync lag clear on their own; a plane that stays unready
