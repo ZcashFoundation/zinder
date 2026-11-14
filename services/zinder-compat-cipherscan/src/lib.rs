@@ -13068,13 +13068,8 @@ fn address_detail_json(
         summary.distinct_transaction_count
     };
     let total_pages = total.map(|total| total.div_ceil(u64::from(limit)));
-    let mut unavailable = address_activity_unavailable(
-        summary,
-        coverage,
-        chain_epoch,
-        activity.freshness.as_ref(),
-        is_zero_history,
-    );
+    let mut unavailable =
+        address_activity_unavailable(summary, coverage, chain_epoch, is_zero_history);
     if activity
         .freshness
         .as_ref()
@@ -13248,7 +13243,6 @@ fn address_activity_unavailable(
     summary: &explorer::TransparentAddressSummary,
     coverage: &explorer::TransparentAddressRankingCoverage,
     chain_epoch: &wallet::ChainEpoch,
-    freshness: Option<&explorer::ExplorerFreshness>,
     is_zero_history: bool,
 ) -> Vec<&'static str> {
     let mut unavailable = Vec::new();
@@ -13258,22 +13252,6 @@ fn address_activity_unavailable(
     }
     if !coverage.lifetime_statistics_complete {
         unavailable.push("Transparent-address lifetime history coverage is incomplete.");
-    }
-    let indexed_tip = freshness
-        .and_then(|freshness| freshness.chain_view.as_ref())
-        .and_then(|chain_view| chain_view.indexed_tip.as_ref())
-        .and_then(|indexed_tip| indexed_tip.tip.as_ref());
-    let indexed_tip_matches_epoch = chain_epoch
-        .visible_tip
-        .as_ref()
-        .zip(indexed_tip)
-        .is_some_and(|(visible_tip, indexed_tip)| {
-            visible_tip.height == indexed_tip.height && visible_tip.hash == indexed_tip.hash
-        });
-    if !indexed_tip_matches_epoch {
-        unavailable.push(
-            "Transparent-address materialized views do not match the pinned canonical tip yet.",
-        );
     }
     if !is_zero_history
         && (summary.total_received_zat.is_none()
@@ -17808,7 +17786,7 @@ mod tests {
     }
 
     #[test]
-    fn address_summary_marks_a_same_height_indexed_tip_mismatch_as_degraded()
+    fn address_summary_answered_at_the_epoch_tip_is_exact_while_views_lead()
     -> Result<(), CipherscanRestError> {
         let epoch = address_activity_epoch(7, 200);
         let mut activity = address_activity_response(
@@ -17833,7 +17811,43 @@ mod tests {
             .ok_or(CipherscanRestError::MissingUpstreamField(
                 "test.indexed_tip",
             ))?;
+        indexed_tip.height += 1;
         indexed_tip.hash = "22".repeat(32);
+
+        let response = address_detail_json(&CipherscanAddressDetailInput {
+            network: Network::ZcashTestnet,
+            address: "tmFkhJaNXuoMeKKBHp8EE9oiFW4uXKAPWnH",
+            page: 1,
+            limit: 25,
+            activity: &activity,
+        })?;
+
+        assert_eq!(response["degraded"], json!(false));
+        Ok(())
+    }
+
+    #[test]
+    fn address_summary_with_balance_coverage_below_the_epoch_tip_is_degraded()
+    -> Result<(), CipherscanRestError> {
+        let epoch = address_activity_epoch(7, 200);
+        let mut activity = address_activity_response(
+            epoch,
+            explorer::TransparentAddressSummary {
+                balance_zat: 1,
+                total_received_zat: Some(1),
+                total_sent_zat: Some(0),
+                distinct_transaction_count: Some(1),
+                first_seen_unix_seconds: Some(1),
+                last_seen_unix_seconds: Some(1),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        let coverage = activity
+            .coverage
+            .as_mut()
+            .ok_or(CipherscanRestError::MissingUpstreamField("test.coverage"))?;
+        coverage.balance_complete_through_height = 199;
 
         let response = address_detail_json(&CipherscanAddressDetailInput {
             network: Network::ZcashTestnet,
@@ -17846,8 +17860,7 @@ mod tests {
         assert_eq!(response["degraded"], json!(true));
         assert!(response["unavailable"].as_array().is_some_and(|reasons| {
             reasons.iter().any(|reason| {
-                reason
-                    == "Transparent-address materialized views do not match the pinned canonical tip yet."
+                reason == "The native transparent-address summary has incomplete balance coverage."
             })
         }));
         Ok(())
