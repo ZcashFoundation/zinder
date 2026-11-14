@@ -22,7 +22,8 @@ use zinder_proto::v1::explorer::{
     TransparentAddressRankingCoverage, TransparentAddressSummary as WireTransparentAddressSummary,
 };
 use zinder_proto::v1::wallet::{
-    self, AddressLookup, VisibleTipBlockRequest, address_lookup::Selector as AddressSelector,
+    self, AddressLookup, BlockSelector, VisibleTipBlockRequest,
+    address_lookup::Selector as AddressSelector, block_selector,
     wallet_query_client::WalletQueryClient,
 };
 use zinder_runtime::AuthenticatedChannel;
@@ -81,19 +82,32 @@ pub(crate) async fn query_transparent_address_activity(
         MAX_TRANSPARENT_ADDRESS_ACTIVITY_ENTRIES_PER_REQUEST,
     );
     let chain_epoch = resolve_activity_chain_epoch(wallet_client, inner.at_epoch_id).await?;
-    let address_read = read_address_at_block(
-        materialized_view_store,
-        &resolved_address,
-        visible_tip_block(&chain_epoch)?,
-        &ActivityScanParameters {
-            script_hash: resolved_address.script_hash,
-            offset: inner.offset,
-            start_height: inner.start_height,
-            end_height: inner.end_height,
-            max_entries,
-            from_cursor: inner.from_cursor.as_slice(),
-        },
-    )?;
+    let block = visible_tip_block(&chain_epoch)?;
+    let store = materialized_view_store.clone();
+    let address_read = tokio::task::spawn_blocking(move || {
+        read_address_at_block(
+            &store,
+            &resolved_address,
+            block,
+            &ActivityScanParameters {
+                script_hash: resolved_address.script_hash,
+                offset: inner.offset,
+                start_height: inner.start_height,
+                end_height: inner.end_height,
+                max_entries,
+                from_cursor: inner.from_cursor.as_slice(),
+            },
+        )
+    })
+    .await
+    .map_err(|error| {
+        ExplorerError::internal(format!("transparent-address activity read failed: {error}"))
+    })??;
+    if let Some(trailing_tip) = address_read.trailing_tip {
+        let epoch_block =
+            epoch_block_at_height(wallet_client, &chain_epoch, trailing_tip.height).await?;
+        require_trailing_tip_on_epoch(trailing_tip, epoch_block)?;
+    }
     let freshness = attach_upstream_observation(
         upstream_observation_cache,
         build_explorer_freshness(
@@ -140,12 +154,52 @@ fn visible_tip_block(chain_epoch: &wallet::ChainEpoch) -> Result<BlockId, Status
     Ok(BlockId::new(BlockHeight::new(visible_tip.height), hash))
 }
 
+async fn epoch_block_at_height(
+    wallet_client: &mut WalletQueryClient<AuthenticatedChannel>,
+    chain_epoch: &wallet::ChainEpoch,
+    height: BlockHeight,
+) -> Result<BlockId, Status> {
+    let block_id = wallet_client
+        .block_id_by_selector(Request::new(wallet::BlockSelectorRequest {
+            selector: Some(BlockSelector {
+                selector: Some(block_selector::Selector::Height(height.value())),
+            }),
+            at_epoch_id: Some(chain_epoch.chain_epoch_id),
+        }))
+        .await?
+        .into_inner()
+        .block_id
+        .ok_or_else(|| ExplorerError::internal("BlockIdResponse.block_id missing"))?;
+    let hash = decode_rpc_block_hash_hex(&block_id.block_hash).map_err(|error| {
+        ExplorerError::internal(format!("BlockIdResponse.block_id hash is invalid: {error}"))
+    })?;
+    Ok(BlockId::new(BlockHeight::new(block_id.height), hash))
+}
+
+/// Refuses an answer from a ranking that trails the epoch on another branch,
+/// as when a reorg reached the wallet query before the views replayed it.
+fn require_trailing_tip_on_epoch(
+    trailing_tip: BlockId,
+    epoch_block: BlockId,
+) -> Result<(), Status> {
+    if trailing_tip == epoch_block {
+        return Ok(());
+    }
+    Err(ExplorerError::unsatisfied_precondition(format!(
+        "transparent-address ranking applied a different block at height {} than the requested chain epoch",
+        trailing_tip.height.value()
+    ))
+    .into())
+}
+
 /// Activity rows, summary, and ranking coverage for one address at one block.
 struct AddressReadAtBlock {
     entries: Vec<TransparentAddressActivityEntry>,
     next_cursor: Vec<u8>,
     summary: WireTransparentAddressSummary,
     coverage: TransparentAddressRankingCoverage,
+    /// Ranking tip to find on the epoch's chain before serving the answer.
+    trailing_tip: Option<BlockId>,
 }
 
 /// Reads one address as the Explorer views stood at `block`.
@@ -187,6 +241,7 @@ fn read_address_at_block(
             resolved_address.script_pub_key.as_deref(),
         ),
         coverage: encode_ranking_coverage(summary_at_block.coverage),
+        trailing_tip: summary_at_block.trailing_tip,
     })
 }
 
@@ -568,6 +623,37 @@ mod tests {
             .map(|entry| entry.block_height)
             .collect::<Vec<_>>();
         assert_eq!(heights, [2, 1]);
+        assert_eq!(read.trailing_tip, None);
+        Ok(())
+    }
+
+    #[test]
+    fn address_read_names_the_ranking_tip_while_the_ranking_trails_the_epoch() -> TestResult {
+        let (_tempdir, store) = open_address_views()?;
+        let address = receiving_address();
+        commit_receipts(&store, &address, &[(1, 100), (2, 200)])?;
+        let epoch_tip = BlockId::new(BlockHeight::new(4), test_block_hash(4));
+
+        let read = read_address_at_block(&store, &address, epoch_tip, &full_scan(&address))?;
+
+        assert_eq!(read.summary.balance_zat, 300);
+        assert_eq!(read.coverage.balance_complete_through_height, 2);
+        assert_eq!(
+            read.trailing_tip,
+            Some(BlockId::new(BlockHeight::new(2), test_block_hash(2)))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn trailing_ranking_tip_must_be_on_the_epoch_chain() -> TestResult {
+        let trailing_tip = BlockId::new(BlockHeight::new(2), test_block_hash(2));
+
+        require_trailing_tip_on_epoch(trailing_tip, trailing_tip)?;
+        let replaced = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([0xEE; 32]));
+        let outcome = require_trailing_tip_on_epoch(trailing_tip, replaced);
+
+        assert!(matches!(outcome, Err(error) if error.code() == Code::FailedPrecondition));
         Ok(())
     }
 

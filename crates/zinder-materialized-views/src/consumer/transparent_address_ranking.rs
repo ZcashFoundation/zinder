@@ -268,6 +268,13 @@ pub struct TransparentAddressSummaryAtBlock {
     /// requested height, or through a lower height while the generation has
     /// not reached the requested block yet.
     pub coverage: TransparentAddressRankingCoverage,
+    /// Last block the generation applied, when it has not reached the
+    /// requested block and that block could still be replaced by a reorg.
+    ///
+    /// The generation may still hold a branch the requested chain no longer
+    /// contains, so a caller serves the answer only after confirming this
+    /// block is on the requested chain.
+    pub trailing_tip: Option<BlockId>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -677,7 +684,9 @@ impl TransparentAddressRankingConsumer {
     /// before-images its undo journals keep for those heights, so a read pinned
     /// to an earlier chain epoch still succeeds after the ranking advances. A
     /// generation that has not reached `block` answers from its current rows,
-    /// and the returned coverage says how far they reach. Every read goes
+    /// the returned coverage says how far they reach, and
+    /// [`TransparentAddressSummaryAtBlock::trailing_tip`] names the block the
+    /// caller must find on its chain before serving them. Every read goes
     /// through `snapshot`. Returns `None` when no generation is active.
     ///
     /// # Errors
@@ -714,10 +723,13 @@ impl TransparentAddressRankingConsumer {
             .transpose()?;
         let applied_through = active.coverage.balance_complete_through_height;
         if applied_through < block.height {
+            let trailing_tip = read_undo_journal_header(snapshot, generation, applied_through)?
+                .map(|(_, header)| BlockId::new(applied_through, header.block_hash));
             return Ok(Some(TransparentAddressSummaryAtBlock {
                 generation,
                 summary: current,
                 coverage: active.coverage,
+                trailing_tip,
             }));
         }
         verify_read_block(snapshot, generation, block)?;
@@ -730,6 +742,7 @@ impl TransparentAddressRankingConsumer {
             generation,
             summary,
             coverage,
+            trailing_tip: None,
         }))
     }
 
@@ -1420,15 +1433,17 @@ fn verify_applied_block(
 /// Proves the generation applied `block` at its height.
 ///
 /// Only genesis, a snapshot base, and heights below that base have no journal.
-/// Genesis and a snapshot base are settled, so no other block can occupy them,
-/// and [`rewind_summary`] refuses a height below the base.
+/// The generation keeps no block identity for genesis or its base. Both are
+/// settled canonical heights, so the read accepts them, and
+/// [`rewind_summary`] refuses a height below the base or a journal gap above
+/// it.
 fn verify_read_block(
     snapshot: &MaterializedViewStoreReadSnapshot<'_>,
     generation: u64,
     block: BlockId,
 ) -> Result<(), TransparentAddressRankingConsumerError> {
-    match read_undo_journal(snapshot, generation, block.height)? {
-        Some(journal) if journal.block_hash != block.hash => {
+    match read_undo_journal_header(snapshot, generation, block.height)? {
+        Some((_, header)) if header.block_hash != block.hash => {
             Err(TransparentAddressRankingConsumerError::ReadBlockMismatch {
                 height: block.height.value(),
             })
@@ -1467,16 +1482,14 @@ fn rewind_summary(
     }
     let mut coverage_at_height = None;
     for raw_height in height.value().saturating_add(1)..=applied_through.value() {
-        let Some(journal) =
-            read_undo_journal(snapshot, active.generation, BlockHeight::new(raw_height))?
+        let Some((payload, header)) =
+            read_undo_journal_header(snapshot, active.generation, BlockHeight::new(raw_height))?
         else {
             return Err(unavailable);
         };
-        let coverage = *coverage_at_height.get_or_insert(journal.metadata_before.coverage);
-        if let Some((_, before)) = journal
-            .summaries_before
-            .into_iter()
-            .find(|(journal_address, _)| *journal_address == address_script_hash)
+        let coverage = *coverage_at_height.get_or_insert(header.metadata_before.coverage);
+        if let UndoSummaryBefore::Touched(before) =
+            decode_undo_summary_before(&payload, &header, address_script_hash)?
         {
             return Ok((before, coverage));
         }
@@ -1486,11 +1499,13 @@ fn rewind_summary(
         .ok_or(unavailable)
 }
 
-fn read_undo_journal(
+/// Reads one journal's encoded bytes and decoded header for a block-pinned
+/// read, leaving its before-images encoded.
+fn read_undo_journal_header(
     snapshot: &MaterializedViewStoreReadSnapshot<'_>,
     generation: u64,
     height: BlockHeight,
-) -> Result<Option<UndoJournal>, TransparentAddressRankingConsumerError> {
+) -> Result<Option<(Vec<u8>, UndoJournalHeader)>, TransparentAddressRankingConsumerError> {
     let Some(payload) = snapshot.get_consumer(
         TRANSPARENT_ADDRESS_RANKING_UNDO_COLUMN_FAMILY,
         &undo_key(generation, height),
@@ -1498,17 +1513,17 @@ fn read_undo_journal(
     else {
         return Ok(None);
     };
-    let journal = decode_undo_journal(&payload)?;
-    if journal.generation != generation {
+    let header = decode_undo_journal_header(&payload)?;
+    if header.generation != generation {
         return Err(
             TransparentAddressRankingConsumerError::UndoGenerationMismatch {
                 height: height.value(),
                 active_generation: generation,
-                journal_generation: journal.generation,
+                journal_generation: header.generation,
             },
         );
     }
-    Ok(Some(journal))
+    Ok(Some((payload, header)))
 }
 
 fn sealed_snapshot_build(
@@ -2108,9 +2123,18 @@ fn encode_undo_journal(
     Ok(bytes)
 }
 
-fn decode_undo_journal(
+/// Fixed fields of an encoded undo journal and where its entries start.
+struct UndoJournalHeader {
+    generation: u64,
+    block_hash: BlockHash,
+    metadata_before: TransparentAddressRankingMetadata,
+    entry_count: usize,
+    entries_offset: usize,
+}
+
+fn decode_undo_journal_header(
     bytes: &[u8],
-) -> Result<UndoJournal, TransparentAddressRankingConsumerError> {
+) -> Result<UndoJournalHeader, TransparentAddressRankingConsumerError> {
     if bytes.len() < UNDO_HEADER_LEN || bytes[0] != FORMAT_VERSION {
         return Err(TransparentAddressRankingConsumerError::MalformedUndoJournal);
     }
@@ -2136,44 +2160,105 @@ fn decode_undo_journal(
     offset = metadata_end;
     let entry_count = usize::try_from(take_u32(bytes, &mut offset)?)
         .map_err(|_| TransparentAddressRankingConsumerError::MalformedUndoJournal)?;
-    let mut summaries_before = Vec::with_capacity(entry_count.min(64));
-    for _ in 0..entry_count {
-        let address_end = offset
-            .checked_add(ADDRESS_HASH_LEN)
-            .filter(|end| *end <= bytes.len())
-            .ok_or(TransparentAddressRankingConsumerError::MalformedUndoJournal)?;
-        let address_script_hash = TransparentAddressScriptHash::from_bytes(
-            bytes[offset..address_end]
-                .try_into()
-                .map_err(|_| TransparentAddressRankingConsumerError::MalformedUndoJournal)?,
-        );
-        offset = address_end;
-        let summary_len = take_u32(bytes, &mut offset)?;
-        let summary = if summary_len == ABSENT_SUMMARY_LEN {
-            None
-        } else {
-            let summary_end =
-                offset
-                    .checked_add(usize::try_from(summary_len).map_err(|_| {
-                        TransparentAddressRankingConsumerError::MalformedUndoJournal
-                    })?)
-                    .filter(|end| *end <= bytes.len())
-                    .ok_or(TransparentAddressRankingConsumerError::MalformedUndoJournal)?;
-            let summary = decode_summary(&bytes[offset..summary_end])?;
-            offset = summary_end;
-            Some(summary)
-        };
-        summaries_before.push((address_script_hash, summary));
-    }
-    if offset != bytes.len() || metadata_before.generation != generation {
+    if metadata_before.generation != generation {
         return Err(TransparentAddressRankingConsumerError::MalformedUndoJournal);
     }
-    Ok(UndoJournal {
+    Ok(UndoJournalHeader {
         generation,
         block_hash,
         metadata_before,
+        entry_count,
+        entries_offset: offset,
+    })
+}
+
+/// Takes one journal entry: its address and its still-encoded before-image,
+/// or `None` when the address had no summary before the block.
+fn take_undo_entry<'bytes>(
+    bytes: &'bytes [u8],
+    offset: &mut usize,
+) -> Result<
+    (TransparentAddressScriptHash, Option<&'bytes [u8]>),
+    TransparentAddressRankingConsumerError,
+> {
+    let address_end = offset
+        .checked_add(ADDRESS_HASH_LEN)
+        .filter(|end| *end <= bytes.len())
+        .ok_or(TransparentAddressRankingConsumerError::MalformedUndoJournal)?;
+    let address_script_hash = TransparentAddressScriptHash::from_bytes(
+        bytes[*offset..address_end]
+            .try_into()
+            .map_err(|_| TransparentAddressRankingConsumerError::MalformedUndoJournal)?,
+    );
+    *offset = address_end;
+    let summary_len = take_u32(bytes, offset)?;
+    if summary_len == ABSENT_SUMMARY_LEN {
+        return Ok((address_script_hash, None));
+    }
+    let summary_end = offset
+        .checked_add(
+            usize::try_from(summary_len)
+                .map_err(|_| TransparentAddressRankingConsumerError::MalformedUndoJournal)?,
+        )
+        .filter(|end| *end <= bytes.len())
+        .ok_or(TransparentAddressRankingConsumerError::MalformedUndoJournal)?;
+    let payload = &bytes[*offset..summary_end];
+    *offset = summary_end;
+    Ok((address_script_hash, Some(payload)))
+}
+
+fn decode_undo_journal(
+    bytes: &[u8],
+) -> Result<UndoJournal, TransparentAddressRankingConsumerError> {
+    let header = decode_undo_journal_header(bytes)?;
+    let mut offset = header.entries_offset;
+    let mut summaries_before = Vec::with_capacity(header.entry_count.min(64));
+    for _ in 0..header.entry_count {
+        let (address_script_hash, payload) = take_undo_entry(bytes, &mut offset)?;
+        summaries_before.push((
+            address_script_hash,
+            payload.map(decode_summary).transpose()?,
+        ));
+    }
+    if offset != bytes.len() {
+        return Err(TransparentAddressRankingConsumerError::MalformedUndoJournal);
+    }
+    Ok(UndoJournal {
+        generation: header.generation,
+        block_hash: header.block_hash,
+        metadata_before: header.metadata_before,
         summaries_before,
     })
+}
+
+/// What one undo journal records for one address.
+enum UndoSummaryBefore {
+    /// The journal's block did not touch the address.
+    Untouched,
+    /// The address's summary before the block, or `None` when it had none.
+    Touched(Option<TransparentAddressSummary>),
+}
+
+/// Decodes one address's before-image without decoding the other entries.
+fn decode_undo_summary_before(
+    bytes: &[u8],
+    header: &UndoJournalHeader,
+    address_script_hash: TransparentAddressScriptHash,
+) -> Result<UndoSummaryBefore, TransparentAddressRankingConsumerError> {
+    let mut offset = header.entries_offset;
+    for _ in 0..header.entry_count {
+        let (entry_address, payload) = take_undo_entry(bytes, &mut offset)?;
+        if entry_address == address_script_hash {
+            return payload
+                .map(decode_summary)
+                .transpose()
+                .map(UndoSummaryBefore::Touched);
+        }
+    }
+    if offset != bytes.len() {
+        return Err(TransparentAddressRankingConsumerError::MalformedUndoJournal);
+    }
+    Ok(UndoSummaryBefore::Untouched)
 }
 
 fn take_u8(bytes: &[u8], offset: &mut usize) -> Result<u8, TransparentAddressRankingConsumerError> {
@@ -2490,8 +2575,10 @@ mod tests {
         AddressBlockDelta, TRANSPARENT_ADDRESS_RANKING_SCHEMA, TransparentAddressRankingConsumer,
         TransparentAddressRankingCoverage, TransparentAddressRankingSnapshotPlan,
         TransparentAddressRankingSnapshotRow, TransparentAddressScriptTypeTotals,
-        TransparentAddressSummary, TransparentAddressSummaryAtBlock, apply_delta, decode_summary,
-        encode_summary, ranking_key,
+        TransparentAddressSummary, TransparentAddressSummaryAtBlock, UndoJournal,
+        UndoSummaryBefore, apply_delta, decode_summary, decode_undo_journal,
+        decode_undo_journal_header, decode_undo_summary_before, encode_summary,
+        encode_undo_journal, ranking_key,
     };
     use crate::consumer::{
         BlockCommitContext, BlockCommitInput, BlockKeyedConsumer, MaterializedViewConsumerCtx,
@@ -3469,6 +3556,7 @@ mod tests {
         for read in [&first_read, &second_read, &untouched_read] {
             assert_eq!(read.generation, metadata_at_two.generation);
             assert_eq!(read.coverage, metadata_at_two.coverage);
+            assert_eq!(read.trailing_tip, None);
         }
         let first_at_three =
             summary_at(&store, first, read_point(3))?.ok_or("ranking generation is not active")?;
@@ -3525,6 +3613,21 @@ mod tests {
             read.coverage.balance_complete_through_height,
             BlockHeight::new(1)
         );
+        assert_eq!(read.trailing_tip, Some(read_point(1)));
+        Ok(())
+    }
+
+    #[test]
+    fn summary_at_block_names_no_trailing_tip_for_a_settled_generation_tip() -> TestResult {
+        let (_tempdir, store) = open_store()?;
+        TransparentAddressRankingConsumer::activate_genesis_generation(&store)?;
+        let address = TransparentAddressScriptHash::of_script_pub_key(&p2pkh(1));
+
+        let read = summary_at(&store, address, read_point(9))?
+            .ok_or("ranking generation is not active")?;
+
+        assert_eq!(read.summary, None);
+        assert_eq!(read.trailing_tip, None);
         Ok(())
     }
 
@@ -3593,6 +3696,51 @@ mod tests {
                     applied_through_height: 6,
                 }
             )
+        ));
+        Ok(())
+    }
+    #[test]
+    fn undo_summary_lookup_matches_the_full_journal_decode() -> TestResult {
+        let touched = TransparentAddressScriptHash::of_script_pub_key(&p2pkh(1));
+        let created = TransparentAddressScriptHash::of_script_pub_key(&p2sh(2));
+        let untouched = TransparentAddressScriptHash::of_script_pub_key(&p2pkh(3));
+        let before = TransparentAddressSummary {
+            script_pub_key: Some(p2pkh(1)),
+            balance_zat: 70,
+            total_received_zat: 100,
+            total_sent_zat: 30,
+            distinct_transaction_count: 2,
+            first_seen_unix_seconds: Some(10),
+            last_seen_unix_seconds: Some(20),
+            snapshot_first_seen_unix_seconds: None,
+            snapshot_last_seen_unix_seconds: None,
+        };
+        let journal = UndoJournal {
+            generation: 3,
+            block_hash: BlockHash::from_bytes([0x33; 32]),
+            metadata_before: super::TransparentAddressRankingMetadata::empty(3, coverage(4)),
+            summaries_before: vec![(created, None), (touched, Some(before.clone()))],
+        };
+        let bytes = encode_undo_journal(&journal)?;
+        let header = decode_undo_journal_header(&bytes)?;
+
+        assert_eq!(
+            decode_undo_journal(&bytes)?.summaries_before,
+            journal.summaries_before
+        );
+        assert_eq!(header.block_hash, journal.block_hash);
+        assert_eq!(header.metadata_before, journal.metadata_before);
+        assert!(matches!(
+            decode_undo_summary_before(&bytes, &header, touched)?,
+            UndoSummaryBefore::Touched(Some(ref summary)) if *summary == before
+        ));
+        assert!(matches!(
+            decode_undo_summary_before(&bytes, &header, created)?,
+            UndoSummaryBefore::Touched(None)
+        ));
+        assert!(matches!(
+            decode_undo_summary_before(&bytes, &header, untouched)?,
+            UndoSummaryBefore::Untouched
         ));
         Ok(())
     }

@@ -203,16 +203,23 @@ undo journals, which keep each touched address's summary from before every
 applied block, and activity rows above the visible tip are left out. One
 materialized-view snapshot holds both reads, so a block the views apply during
 the request cannot split them. A ranking that has not reached the epoch's tip
-answers from its current rows, and its coverage shows how far they reach.
+answers from its current rows once `WalletQuery.BlockIdBySelector`, pinned to
+the same epoch, confirms the ranking's last applied block is on the epoch's
+chain. Its coverage then shows how far those rows reach.
 
 The read fails with `FAILED_PRECONDITION` and the
 `EXPLORER_PRECONDITION_UNSATISFIED` reason when the ranking applied a different
-block at the epoch's tip height, as during a reorg only one side has seen. It
-fails the same way when answering would rewind more than 1,000 blocks
+block than the epoch at the epoch's tip height, or at the ranking's own tip
+while it trails, as during a reorg only one side has seen. It fails the same
+way when answering would rewind more than 1,000 blocks
 (`TRANSPARENT_ADDRESS_RANKING_MAX_REWIND_BLOCKS`) or below the generation's
-snapshot base. A retry at a newer epoch can succeed. `ExplorerFreshness` carries
-the shared materialized-view indexed tip, including its hash, so adapters can
-mark a same-height mismatch as degraded.
+snapshot base. A retry at a newer epoch can succeed.
+
+Ranking coverage, not the `ExplorerFreshness` indexed tip, says whether an
+answer is complete for the epoch. The indexed tip reports the views' live
+progress, which usually leads the epoch, so adapters mark an address response
+degraded only when `balance_complete_through_height` is below the epoch's
+visible tip height or lifetime statistics are incomplete.
 
 Offset paging and summary composition are request-time operations over the
 activity and ranking materialized views. Mempool address activity remains a
