@@ -3,9 +3,16 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
-use std::{collections::BTreeMap, error::Error, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    error::Error,
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
+use metrics_exporter_prometheus::PrometheusBuilder;
 use tempfile::TempDir;
 use zcash_primitives::transaction::{Authorized, Transaction as ZcashTransaction, TransactionData};
 use zebra_chain::{
@@ -20,9 +27,10 @@ use zinder_core::{
     ShieldedProtocol, TransactionId, TransparentOutPoint, UnixTimestampMillis,
 };
 use zinder_ingest::{
-    CanonicalBlockContextReader, CanonicalConstructionConfig, IngestError, RawBlobPolicy,
-    load_fresh_canonical, prepare_canonical_block, require_genesis_complete_history,
+    CanonicalBlockContextReader, CanonicalConstructionConfig, IngestError, PrevoutCache,
+    RawBlobPolicy, load_fresh_canonical, prepare_canonical_block, require_genesis_complete_history,
 };
+use zinder_materialized_views::BlockCommitContext;
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceChainSegment, SourceChainSegmentLimits,
     SourceError,
@@ -214,6 +222,76 @@ async fn cross_block_transparent_spends_resolve_from_the_producing_block()
 }
 
 #[tokio::test]
+async fn a_prevout_cache_resolves_spends_from_earlier_ranges_without_reading_the_producing_block()
+-> Result<(), Box<dyn Error>> {
+    let harness = CanonicalHarness::genesis_complete().await?;
+    let activations = sample_regtest_upgrade_activations();
+    let expected = CanonicalBlockContextReader::new(harness.secondary(), &activations)
+        .read_block_commit_contexts(chain_range())?;
+    let mut prevouts = PrevoutCache::new(1_024);
+
+    let (paged, reads) = with_prevout_metrics(|| {
+        let mut reader = CanonicalBlockContextReader::with_prevout_cache(
+            harness.secondary(),
+            &activations,
+            &mut prevouts,
+        );
+        let mut contexts = HashMap::new();
+        for height in chain_range() {
+            contexts.extend(
+                reader.read_block_commit_contexts(BlockHeightRange::inclusive(height, height))?,
+            );
+        }
+        Ok(contexts)
+    })?;
+
+    assert_same_spends(&paged, &expected)?;
+    assert_eq!(reads.producing_block_reads, 0);
+    assert_eq!(reads.from_cache, 1);
+    assert_eq!(reads.from_canonical, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_prevout_cache_reads_canonical_storage_after_a_disconnected_range()
+-> Result<(), Box<dyn Error>> {
+    let harness = CanonicalHarness::genesis_complete().await?;
+    let activations = sample_regtest_upgrade_activations();
+    let expected = CanonicalBlockContextReader::new(harness.secondary(), &activations)
+        .read_block_commit_contexts(chain_range())?;
+    let mut prevouts = PrevoutCache::new(1_024);
+    let first = BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(1));
+    let spending = BlockHeightRange::inclusive(
+        BlockHeight::new(SPENDING_BLOCK_HEIGHT),
+        BlockHeight::new(SPENDING_BLOCK_HEIGHT),
+    );
+
+    let (contexts, reads) = with_prevout_metrics(|| {
+        let mut contexts = CanonicalBlockContextReader::with_prevout_cache(
+            harness.secondary(),
+            &activations,
+            &mut prevouts,
+        )
+        .read_block_commit_contexts(first)?;
+        contexts.extend(
+            CanonicalBlockContextReader::with_prevout_cache(
+                harness.secondary(),
+                &activations,
+                &mut prevouts,
+            )
+            .read_block_commit_contexts(spending)?,
+        );
+        Ok(contexts)
+    })?;
+
+    assert_same_spends(&contexts, &expected)?;
+    assert_eq!(reads.from_cache, 0);
+    assert_eq!(reads.from_canonical, 1);
+    assert_eq!(reads.producing_block_reads, 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn unresolvable_transparent_prevouts_fail_hydration() -> Result<(), Box<dyn Error>> {
     let fabricated = TransactionId::from_bytes([0x5c; 32]);
     let harness = CanonicalHarness::spending(TransparentOutPoint::new(fabricated, 0)).await?;
@@ -256,6 +334,77 @@ async fn materialized_view_hydration_requires_genesis_complete_history()
         return Err(format!("expected an incomplete-history refusal, got {error:?}").into());
     };
     assert_eq!(first_available_height, BlockHeight::new(2));
+    Ok(())
+}
+
+/// Prevout resolution counters recorded while one closure hydrated.
+struct PrevoutReads {
+    from_cache: u64,
+    from_canonical: u64,
+    producing_block_reads: u64,
+}
+
+fn with_prevout_metrics<T>(
+    hydrate: impl FnOnce() -> Result<T, IngestError>,
+) -> Result<(T, PrevoutReads), Box<dyn Error>> {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let hydrated = metrics::with_local_recorder(&recorder, hydrate)?;
+    let rendered = handle.render();
+    Ok((
+        hydrated,
+        PrevoutReads {
+            from_cache: counter_value(
+                &rendered,
+                "zinder_materialized_view_prevout_resolutions_total{source=\"cache\"}",
+            ),
+            from_canonical: counter_value(
+                &rendered,
+                "zinder_materialized_view_prevout_resolutions_total{source=\"canonical\"}",
+            ),
+            producing_block_reads: counter_value(
+                &rendered,
+                "zinder_materialized_view_prevout_block_reads_total",
+            ),
+        },
+    ))
+}
+
+fn counter_value(rendered: &str, series: &str) -> u64 {
+    rendered
+        .lines()
+        .filter_map(|line| line.strip_prefix(series)?.trim().parse::<u64>().ok())
+        .sum()
+}
+
+/// Asserts that every block in `hydrated` carries the spend facts the
+/// uncached whole-range hydration derived for that block's inputs.
+fn assert_same_spends(
+    hydrated: &HashMap<BlockHeight, Arc<BlockCommitContext>>,
+    expected: &HashMap<BlockHeight, Arc<BlockCommitContext>>,
+) -> Result<(), Box<dyn Error>> {
+    for (height, context) in hydrated {
+        let expected_context = expected
+            .get(height)
+            .ok_or_else(|| format!("expected hydration must cover height {}", height.value()))?;
+        let spends = context
+            .transparent_spends()
+            .ok_or("transparent spends must be hydrated")?;
+        let expected_spends = expected_context
+            .transparent_spends()
+            .ok_or("transparent spends must be hydrated")?;
+        for input in context
+            .transactions
+            .iter()
+            .flat_map(|transaction| &transaction.transparent_inputs)
+            .filter(|input| !input.spent_outpoint.is_coinbase_sentinel())
+        {
+            let spend = spends
+                .get(&input.spent_outpoint)
+                .ok_or("every non-coinbase input must resolve")?;
+            assert_eq!(Some(spend), expected_spends.get(&input.spent_outpoint));
+        }
+    }
     Ok(())
 }
 

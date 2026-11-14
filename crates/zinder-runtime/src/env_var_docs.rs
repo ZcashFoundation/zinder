@@ -997,6 +997,18 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       evidence appears only after the Explorer store opens successfully.",
     },
     EnvVarDoc {
+        name: "ZINDER_INGEST__EXPLORER_VIEWS_MIN_FREE_BYTES",
+        toml_path: "ingest.explorer_views_min_free_bytes",
+        used_by: &["zinder-ingest"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Available bytes on the volume holding `storage.path` below which Explorer \
+                      view replay, the transparent-address ranking build, and historical view \
+                      backfills pause, so the views cannot fill the volume canonical ingest and \
+                      wallet serving need. Replay resumes once at least a tenth more than this \
+                      is available. Defaults to 10737418240 (10 GiB); `0` disables the guard.",
+    },
+    EnvVarDoc {
         name: "ZINDER_STORAGE__RAW_BLOB_POLICY",
         toml_path: "storage.raw_blob_policy",
         used_by: &[

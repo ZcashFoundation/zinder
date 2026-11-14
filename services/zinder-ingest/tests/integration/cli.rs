@@ -655,6 +655,37 @@ fn explorer_views_can_be_enabled_through_environment_without_changing_coverage()
 }
 
 #[test]
+fn explorer_views_free_space_floor_defaults_to_ten_gib_and_accepts_zero()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempdir()?;
+    let storage_path = temporary.path().join("explorer-views-store");
+    let config_path = temporary.path().join("zinder-ingest.toml");
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
+
+    let default_output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+    let disabled_output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .env("ZINDER_INGEST__EXPLORER_VIEWS_MIN_FREE_BYTES", "0")
+        .output()?;
+
+    assert!(default_output.status.success(), "{default_output:?}");
+    let default_stdout = String::from_utf8(default_output.stdout)?;
+    assert!(
+        default_stdout.contains("explorer_views_min_free_bytes = 10737418240"),
+        "{default_stdout}"
+    );
+    assert!(disabled_output.status.success(), "{disabled_output:?}");
+    let disabled_stdout = String::from_utf8(disabled_output.stdout)?;
+    assert!(
+        disabled_stdout.contains("explorer_views_min_free_bytes = 0"),
+        "{disabled_stdout}"
+    );
+    Ok(())
+}
+
+#[test]
 fn explorer_views_reject_positive_checkpoint_before_storage_mutation() -> Result<(), Box<dyn Error>>
 {
     let temporary = tempdir()?;

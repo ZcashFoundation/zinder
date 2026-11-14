@@ -17,8 +17,8 @@ use zinder_core::{
 };
 use zinder_ingest::{
     CanonicalConstructionConfig, CanonicalFollowConfig, CanonicalFollower, IngestError,
-    MaterializedViewReplayConfig, MaterializedViewTailer, follow_canonical_tip,
-    load_fresh_canonical, spawn_materialized_view_tailer_task,
+    MaterializedViewReplayConfig, MaterializedViewTailer, ReplayPrevoutCaches, VolumeSpaceGuard,
+    follow_canonical_tip, load_fresh_canonical, spawn_materialized_view_tailer_task,
 };
 use zinder_materialized_views::{
     BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME, BlockSummaryConsumer,
@@ -403,6 +403,44 @@ async fn the_tailer_publishes_a_live_status_and_opens_the_historical_work_gate()
     Ok(())
 }
 
+#[tokio::test]
+async fn a_volume_below_the_free_space_floor_pauses_replay_and_closes_the_historical_work_gate()
+-> Result<(), Box<dyn Error>> {
+    let mut harness = CanonicalHarness::baseline().await?;
+    harness.follow_to_tip().await?;
+    let (directory, view) = view_store()?;
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    readiness.update_admission(|admission| admission.phase = Some(IngestPhase::FollowingTip));
+    let gate = zinder_ingest::HistoricalWorkGate::new(readiness);
+    let cancel = CancellationToken::new();
+    let mut tailer = harness.tailer(&view);
+    tailer.volume_space_guard = VolumeSpaceGuard::new(directory.path(), u64::MAX).map(Arc::new);
+
+    let handle = spawn_materialized_view_tailer_task(
+        tailer,
+        Duration::from_millis(10),
+        gate.clone(),
+        cancel.clone(),
+    );
+    let paused = tokio::time::timeout(Duration::from_secs(30), async {
+        while view.get_materialized_view_status().ok().flatten().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cancel.cancel();
+    handle.await?;
+    paused.map_err(|_| "the paused tailer must still persist its status")?;
+
+    let status = materialized_view_status(&view)?;
+    assert_eq!(status.health, MaterializedViewHealth::Paused as i32);
+    assert_eq!(status.indexed_height, 0);
+    assert!(!gate.is_open());
+    assert!(chain_event_cursors(&view)?.values().all(Option::is_none));
+    Ok(())
+}
+
 fn view_store() -> Result<(TempDir, MaterializedViewStore), Box<dyn Error>> {
     let directory = TempDir::new()?;
     let store = open_view_store(directory.path())?;
@@ -603,6 +641,8 @@ impl CanonicalHarness {
             reorg_window_blocks: REORG_WINDOW_BLOCKS,
             chain_event_retention_window: Some(Duration::from_hours(168)),
             cursor_at_risk_warning: Duration::from_hours(24),
+            prevout_caches: ReplayPrevoutCaches::default(),
+            volume_space_guard: None,
         }
     }
 

@@ -14,7 +14,8 @@ use thiserror::Error;
 use zinder_core::BlockHeight;
 use zinder_ingest::{
     CanonicalConstructionSettings, CanonicalFollowSettings, CanonicalPipelineLimits,
-    CanonicalRunOverrides, DEFAULT_RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES,
+    CanonicalRunOverrides, DEFAULT_EXPLORER_VIEWS_MIN_FREE_BYTES,
+    DEFAULT_RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES,
     DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, IngestError, IngestRuntimeConfig,
     MempoolIngestSettings, NodeSourceKind, PhaseClassificationConfig, RawBlobPolicy,
     container_memory_budget_bytes,
@@ -48,6 +49,7 @@ pub(crate) struct IngestCommandConfig {
     pub(crate) runtime_config: IngestRuntimeConfig,
     pub(crate) coverage: IngestCoverage,
     pub(crate) explorer_views: bool,
+    pub(crate) explorer_views_min_free_bytes: u64,
     pub(crate) ingest_control_listen_addr: Option<SocketAddr>,
     pub(crate) ingest_control_bearer_token_path: Option<PathBuf>,
     pub(crate) ingest_control_checkpoint_bearer_token_path: Option<PathBuf>,
@@ -148,6 +150,10 @@ pub(crate) fn load_ingest_config(
         // `--storage-path` CLI flag.
         .with_default("storage.path", "/var/lib/zinder/store")?
         .with_default("ingest.reorg_window_blocks", DEFAULT_REORG_WINDOW_BLOCKS)?
+        .with_default(
+            "ingest.explorer_views_min_free_bytes",
+            DEFAULT_EXPLORER_VIEWS_MIN_FREE_BYTES,
+        )?
         .with_default(
             "ingest.mempool.max_transaction_count",
             DEFAULT_MEMPOOL_MAX_TRANSACTION_COUNT.get(),
@@ -296,6 +302,9 @@ struct IngestSection {
     /// Whether the complete bundled Explorer materialized-view workload is
     /// requested. Omitted values remain false for every coverage.
     explorer_views: bool,
+    /// Available bytes on the store volume below which Explorer view replay
+    /// pauses. Zero disables the guard.
+    explorer_views_min_free_bytes: Option<u64>,
     /// Chain-truth invariant: how deep into the upstream tip the
     /// settled-tip cliff sits. Defaults to
     /// `zinder_store::DEFAULT_REORG_WINDOW_BLOCKS`.
@@ -534,6 +543,10 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         config.ingest.explorer_views,
         config.ingest.run_overrides.checkpoint_height,
     )?;
+    let explorer_views_min_free_bytes = require_field(
+        config.ingest.explorer_views_min_free_bytes,
+        "ingest.explorer_views_min_free_bytes",
+    )?;
 
     if matches!(coverage, IngestCoverage::WalletServing)
         && config.ingest.run_overrides.checkpoint_height.is_some()
@@ -609,6 +622,7 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
         runtime_config,
         coverage,
         explorer_views,
+        explorer_views_min_free_bytes,
         ingest_control_listen_addr,
         ingest_control_bearer_token_path,
         ingest_control_checkpoint_bearer_token_path,
@@ -694,6 +708,7 @@ impl RedactedIngestConfigToml {
             ingest: IngestToml {
                 source: node_source_name(runtime_config.node_source),
                 explorer_views: config.explorer_views,
+                explorer_views_min_free_bytes: config.explorer_views_min_free_bytes,
                 reorg_window_blocks: runtime_config.reorg_window_blocks,
                 phase_classification: IngestPhaseClassificationToml {
                     catchup_threshold_blocks: runtime_config
@@ -782,6 +797,7 @@ impl RedactedIngestConfigToml {
 struct IngestToml {
     source: &'static str,
     explorer_views: bool,
+    explorer_views_min_free_bytes: u64,
     reorg_window_blocks: u32,
     phase_classification: IngestPhaseClassificationToml,
     construction: IngestConstructionToml,
