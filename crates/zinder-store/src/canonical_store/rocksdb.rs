@@ -866,12 +866,17 @@ pub(super) fn canonical_column_family_descriptors(
     block_cache: &Cache,
     resource_budget: RocksDbResourceBudget,
 ) -> Vec<ColumnFamilyDescriptor> {
-    CANONICAL_DATA_COLUMN_FAMILIES
+    let mut descriptors = CANONICAL_DATA_COLUMN_FAMILIES
         .into_iter()
         .map(|name| {
             ColumnFamilyDescriptor::new(name, canonical_data_options(block_cache, resource_budget))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    descriptors.extend(super::spike_combined::spike_extra_column_family_descriptors(
+        block_cache,
+        resource_budget,
+    ));
+    descriptors
 }
 
 pub(super) fn canonical_data_options(
@@ -1001,6 +1006,7 @@ fn validate_exact_column_families(
         .map(str::to_owned)
         .collect::<Vec<_>>();
     expected.push(DEFAULT_COLUMN_FAMILY_NAME.to_owned());
+    expected.extend(super::spike_combined::spike_extra_column_family_names());
     expected.sort_unstable();
     if observed != expected {
         return Err(CanonicalStoreError::admission(

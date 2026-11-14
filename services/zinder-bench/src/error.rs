@@ -124,6 +124,12 @@ pub enum BenchError {
         /// Human-readable description of the failure.
         reason: String,
     },
+    /// Spike combined-commit harness failure.
+    #[error("spike combined-commit error: {reason}")]
+    Spike {
+        /// Human-readable failure description.
+        reason: String,
+    },
     /// A caller-supplied argument was rejected before any work started.
     #[error("invalid argument: {reason}")]
     InvalidArgument {
@@ -228,6 +234,14 @@ impl BenchError {
     #[must_use]
     pub fn report_format(reason: impl Into<String>) -> Self {
         Self::ReportFormat {
+            reason: reason.into(),
+        }
+    }
+
+    /// Builds a spike harness error from a reason string.
+    #[must_use]
+    pub fn spike(reason: impl Into<String>) -> Self {
+        Self::Spike {
             reason: reason.into(),
         }
     }

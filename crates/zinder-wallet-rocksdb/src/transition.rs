@@ -114,6 +114,45 @@ impl RocksDbWalletStore {
         I: IntoIterator<Item = Result<ValidatedCanonicalBlockReplay, CanonicalStoreError>>,
         Cancel: FnOnce() -> bool,
     {
+        let planned = self.plan_canonical_event_range(
+            expected_source,
+            event,
+            resulting_fence,
+            resulting_settled_tip,
+            max_logical_bytes,
+            replay_rows,
+            WriteBatch::default(),
+            false,
+        )?;
+        self.publish_planned_transition(
+            planned.batch,
+            planned.ready_evidence,
+            planned.logical_bytes,
+            cancelled_before_write,
+        )
+    }
+
+    /// Plans one retained canonical event into `batch` without writing it.
+    ///
+    /// Spike: the shared planning half of [`Self::apply_canonical_event_range_cancellable`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "spike planner keeps the public transition inputs explicit"
+    )]
+    pub(crate) fn plan_canonical_event_range<I>(
+        &self,
+        expected_source: WalletCanonicalSourceIdentity,
+        event: CanonicalRetainedEvent,
+        resulting_fence: CanonicalEventFence,
+        resulting_settled_tip: BlockId,
+        max_logical_bytes: NonZeroU64,
+        replay_rows: I,
+        batch: WriteBatch,
+        record_ops: bool,
+    ) -> Result<PlannedWalletTransition, RocksDbWalletError>
+    where
+        I: IntoIterator<Item = Result<ValidatedCanonicalBlockReplay, CanonicalStoreError>>,
+    {
         self.require_current_ready_control()?;
         let max_logical_bytes = validate_transition_logical_byte_limit(max_logical_bytes)?;
         let observed_source =
@@ -131,7 +170,10 @@ impl RocksDbWalletStore {
             resulting_fence.visible_tip(),
         )?;
 
-        let mut planner = WalletTransitionPlanner::new(self, max_logical_bytes);
+        let mut planner = WalletTransitionPlanner::with_batch(self, max_logical_bytes, batch);
+        if record_ops {
+            *planner.ops.borrow_mut() = Some(SpikeWalletPlanOps::default());
+        }
         match event.kind() {
             CanonicalEventKind::Committed => {
                 validate_committed_event_shape(&planner, event, resulting_fence)?;
@@ -168,13 +210,16 @@ impl RocksDbWalletStore {
             resulting_fence.chain_event_sequence(),
             event_cursor,
         )?;
+        let point_reads = planner.point_reads.get();
+        let ops = planner.ops.take();
         let (batch, ready_evidence, logical_bytes) = planner.into_publication(source_position);
-        self.publish_planned_transition(
+        Ok(PlannedWalletTransition {
             batch,
             ready_evidence,
             logical_bytes,
-            cancelled_before_write,
-        )
+            point_reads,
+            ops,
+        })
     }
 
     /// Reconciles a lagged following wallet directly to one current canonical fence.
@@ -319,14 +364,46 @@ impl RocksDbWalletStore {
 
     fn publish_planned_transition<Cancel>(
         &mut self,
-        mut batch: WriteBatch,
+        batch: WriteBatch,
         ready_evidence: WalletProjectionReadyEvidence,
-        mut logical_bytes: TransitionLogicalByteAccounting,
+        logical_bytes: TransitionLogicalByteAccounting,
         cancelled_before_write: Cancel,
     ) -> Result<(), RocksDbWalletError>
     where
         Cancel: FnOnce() -> bool,
     {
+        let (batch, next_control, _logical_bytes) =
+            self.prepare_publication(batch, &ready_evidence, logical_bytes)?;
+        if cancelled_before_write() {
+            return Err(RocksDbWalletError::ProjectionTransitionCancelled);
+        }
+        let mut write_options = WriteOptions::default();
+        write_options.set_sync(true);
+        crash_point("wallet_projection.transition.before_atomic_write");
+        self.bounded_open
+            .db
+            .write_opt(&batch, &write_options)
+            .map_err(|source| {
+                RocksDbWalletError::rocksdb("atomic wallet projection transition", source)
+            })?;
+        crash_point("wallet_projection.transition.after_atomic_write");
+        self.finish_publication(next_control, ready_evidence)
+    }
+
+    /// Adds the next READY control to a planned batch (spike: shared with the combined path).
+    pub(crate) fn prepare_publication(
+        &self,
+        mut batch: WriteBatch,
+        ready_evidence: &WalletProjectionReadyEvidence,
+        mut logical_bytes: TransitionLogicalByteAccounting,
+    ) -> Result<
+        (
+            WriteBatch,
+            WalletStoreControlRecord,
+            TransitionLogicalByteAccounting,
+        ),
+        RocksDbWalletError,
+    > {
         let writer_generation = self
             .control
             .writer_generation
@@ -348,27 +425,29 @@ impl RocksDbWalletStore {
         // Re-admit immediately before publication so a sequential second
         // handle cannot overwrite a newer READY control it did not observe.
         self.require_current_ready_control()?;
-        if cancelled_before_write() {
-            return Err(RocksDbWalletError::ProjectionTransitionCancelled);
+        match self.control_family {
+            None => batch.put(
+                zinder_wallet_projection::WALLET_STORE_CONTROL_KEY,
+                encoded_control,
+            ),
+            Some(family_name) => batch.put_cf(
+                &column_family(&self.bounded_open, family_name)?,
+                zinder_wallet_projection::WALLET_STORE_CONTROL_KEY,
+                encoded_control,
+            ),
         }
-        batch.put(
-            zinder_wallet_projection::WALLET_STORE_CONTROL_KEY,
-            encoded_control,
-        );
-        let mut write_options = WriteOptions::default();
-        write_options.set_sync(true);
-        crash_point("wallet_projection.transition.before_atomic_write");
-        self.bounded_open
-            .db
-            .write_opt(&batch, &write_options)
-            .map_err(|source| {
-                RocksDbWalletError::rocksdb("atomic wallet projection transition", source)
-            })?;
-        crash_point("wallet_projection.transition.after_atomic_write");
+        Ok((batch, next_control, logical_bytes))
+    }
 
+    /// Adopts a durably written READY control and verifies its readback.
+    pub(crate) fn finish_publication(
+        &mut self,
+        next_control: WalletStoreControlRecord,
+        ready_evidence: WalletProjectionReadyEvidence,
+    ) -> Result<(), RocksDbWalletError> {
         self.control = next_control;
         self.ready_evidence = ready_evidence;
-        let persisted = decode_only_control(&self.bounded_open)?;
+        let persisted = self.read_control()?;
         if persisted != self.control {
             return Err(RocksDbWalletError::AdmissionChanged {
                 reason: "READY control differs after atomic wallet transition",
@@ -377,8 +456,18 @@ impl RocksDbWalletStore {
         Ok(())
     }
 
+    /// Reads the persisted control from this store's control family.
+    pub(crate) fn read_control(&self) -> Result<WalletStoreControlRecord, RocksDbWalletError> {
+        match self.control_family {
+            None => decode_only_control(&self.bounded_open),
+            Some(family_name) => {
+                crate::spike_combined::decode_control_in_family(&self.bounded_open, family_name)
+            }
+        }
+    }
+
     fn require_current_ready_control(&self) -> Result<(), RocksDbWalletError> {
-        let persisted = decode_only_control(&self.bounded_open)?;
+        let persisted = self.read_control()?;
         if persisted != self.control {
             return Err(RocksDbWalletError::AdmissionChanged {
                 reason: "wallet control changed since READY admission",
@@ -771,10 +860,10 @@ fn validate_transition_logical_byte_limit(
 }
 
 #[derive(Debug)]
-struct TransitionLogicalByteAccounting {
+pub(crate) struct TransitionLogicalByteAccounting {
     limit: u64,
-    batch: u64,
-    overlay: u64,
+    pub(crate) batch: u64,
+    pub(crate) overlay: u64,
 }
 
 impl TransitionLogicalByteAccounting {
@@ -883,9 +972,44 @@ fn checked_transition_bytes(left: u64, right: u64) -> Result<u64, RocksDbWalletE
 
 type OverlayKey = (&'static str, Vec<u8>);
 
+/// Spike: one planned wallet transition that has not been written.
+pub(crate) struct PlannedWalletTransition {
+    pub(crate) batch: WriteBatch,
+    pub(crate) ready_evidence: WalletProjectionReadyEvidence,
+    pub(crate) logical_bytes: TransitionLogicalByteAccounting,
+    pub(crate) point_reads: u64,
+    pub(crate) ops: Option<SpikeWalletPlanOps>,
+}
+
+/// Spike: every database point read and row mutation one plan performed.
+#[derive(Debug, Default)]
+pub struct SpikeWalletPlanOps {
+    /// Point reads not served by the planner overlay: (column family, key).
+    pub reads: Vec<(&'static str, Vec<u8>)>,
+    /// Row mutations in plan order.
+    pub row_ops: Vec<SpikeWalletRowOp>,
+}
+
+/// Spike: one wallet row mutation recorded by the planner.
+#[derive(Debug)]
+pub struct SpikeWalletRowOp {
+    /// Logical projection family folded into the accumulator.
+    pub family: WalletProjectionRowFamily,
+    /// Physical column family.
+    pub column_family: &'static str,
+    /// Encoded row key.
+    pub key: Vec<u8>,
+    /// Inserted value, or the observed value being removed.
+    pub value: Vec<u8>,
+    /// `true` for an insert, `false` for a removal.
+    pub insert: bool,
+}
+
 struct WalletTransitionPlanner<'store> {
     store: &'store RocksDbWalletStore,
     batch: WriteBatch,
+    point_reads: std::cell::Cell<u64>,
+    ops: std::cell::RefCell<Option<SpikeWalletPlanOps>>,
     overlay: BTreeMap<OverlayKey, Option<Vec<u8>>>,
     logical_bytes: TransitionLogicalByteAccounting,
     accumulator: WalletProjectionDigestBuilder,
@@ -900,9 +1024,19 @@ struct WalletTransitionPlanner<'store> {
 
 impl<'store> WalletTransitionPlanner<'store> {
     fn new(store: &'store RocksDbWalletStore, max_logical_bytes: u64) -> Self {
+        Self::with_batch(store, max_logical_bytes, WriteBatch::default())
+    }
+
+    fn with_batch(
+        store: &'store RocksDbWalletStore,
+        max_logical_bytes: u64,
+        batch: WriteBatch,
+    ) -> Self {
         Self {
             store,
-            batch: WriteBatch::default(),
+            batch,
+            point_reads: std::cell::Cell::new(0),
+            ops: std::cell::RefCell::new(None),
             overlay: BTreeMap::new(),
             logical_bytes: TransitionLogicalByteAccounting::new(max_logical_bytes),
             accumulator: WalletProjectionDigestBuilder::from_parts(
@@ -1739,6 +1873,15 @@ impl<'store> WalletTransitionPlanner<'store> {
     ) -> Result<(), RocksDbWalletError> {
         self.accumulator.append_row(family, key, &encoded_value)?;
         self.accumulator_row_counts = self.accumulator.row_counts();
+        if let Some(ops) = self.ops.borrow_mut().as_mut() {
+            ops.row_ops.push(SpikeWalletRowOp {
+                family,
+                column_family: column_family_name,
+                key: key.to_vec(),
+                value: encoded_value.clone(),
+                insert: true,
+            });
+        }
         self.put_raw(column_family_name, key, encoded_value)
     }
 
@@ -1771,6 +1914,15 @@ impl<'store> WalletTransitionPlanner<'store> {
     ) -> Result<(), RocksDbWalletError> {
         self.accumulator.remove_row(family, key, observed_value)?;
         self.accumulator_row_counts = self.accumulator.row_counts();
+        if let Some(ops) = self.ops.borrow_mut().as_mut() {
+            ops.row_ops.push(SpikeWalletRowOp {
+                family,
+                column_family: column_family_name,
+                key: key.to_vec(),
+                value: observed_value.to_vec(),
+                insert: false,
+            });
+        }
         self.delete_raw(column_family_name, key)
     }
 
@@ -1782,6 +1934,10 @@ impl<'store> WalletTransitionPlanner<'store> {
         let overlay_key = (column_family_name, key.to_vec());
         if let Some(overlay_value) = self.overlay.get(&overlay_key) {
             return Ok(overlay_value.clone());
+        }
+        self.point_reads.set(self.point_reads.get() + 1);
+        if let Some(ops) = self.ops.borrow_mut().as_mut() {
+            ops.reads.push((column_family_name, key.to_vec()));
         }
         let column_family = column_family(&self.store.bounded_open, column_family_name)?;
         self.store

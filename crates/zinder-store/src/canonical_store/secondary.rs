@@ -441,6 +441,7 @@ fn required_canonical_column_family_names() -> Vec<String> {
         .map(str::to_owned)
         .collect::<Vec<_>>();
     expected.push(DEFAULT_COLUMN_FAMILY_NAME.to_owned());
+    expected.extend(super::spike_combined::spike_extra_column_family_names());
     expected.sort_unstable();
     expected
 }

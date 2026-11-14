@@ -30,6 +30,7 @@ mod rocksdb_compact_block_range;
 mod rocksdb_raw_blob_retention_comparison;
 mod rocksdb_storage_lifecycle;
 mod rocksdb_wallet_rebuild;
+mod spike_combined_commit;
 
 use canonical_replay_storage_command::{CanonicalReplayStorageArgs, run_canonical_replay_storage};
 use rocksdb_canonical_fixture_replay::{
@@ -41,6 +42,7 @@ use rocksdb_raw_blob_retention_comparison::{
 };
 use rocksdb_storage_lifecycle::{RocksDbStorageLifecycleArgs, run_rocksdb_storage_lifecycle};
 use rocksdb_wallet_rebuild::{RocksDbWalletRebuildArgs, run_rocksdb_wallet_rebuild};
+use spike_combined_commit::{SpikeCombinedCommitArgs, run_spike_combined_commit};
 
 const DEFAULT_FROM_HEIGHT: u32 = 150_000;
 const DEFAULT_TO_HEIGHT: u32 = 200_000;
@@ -87,6 +89,9 @@ enum Command {
     /// Measure version-1 compact-block ranges through an admitted secondary.
     #[command(name = "rocksdb-compact-block-range")]
     RocksDbCompactBlockRange(RocksDbCompactBlockRangeArgs),
+    /// Spike A: wallet rows in the canonical synced batch of one database.
+    #[command(name = "spike-combined-commit")]
+    SpikeCombinedCommit(SpikeCombinedCommitArgs),
 }
 
 #[derive(Args)]
@@ -249,6 +254,7 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
             let output = run_rocksdb_compact_block_range(args)?;
             emit_report(&output.report, output.report_path.as_deref())
         }
+        Command::SpikeCombinedCommit(args) => run_spike_combined_commit(args).await,
     }
 }
 

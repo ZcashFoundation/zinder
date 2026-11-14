@@ -26,6 +26,7 @@ mod reader;
 mod replay_tail;
 mod rocksdb;
 mod secondary;
+mod spike_combined;
 #[cfg(test)]
 mod secondary_tests;
 mod subtree_load;
@@ -77,6 +78,12 @@ pub use publication::{
 pub use rocksdb::RocksDbCanonicalStore;
 pub use rocksdb::{CanonicalOwnerCheckpointAdmission, CanonicalOwnerCheckpointEvidence};
 pub use secondary::{CanonicalSecondaryCatchupOutcome, RocksDbCanonicalSecondary};
+#[allow(unused_imports, reason = "spike re-export list")]
+pub use spike_combined::{
+    SpikeCommitTiming, SpikePreparedLiveAppend, SpikePreparedLiveReplacement,
+    spike_clear_extra_column_families,
+    spike_set_extra_column_families,
+};
 pub use subtree_load::{
     CanonicalBuildSubtreeRoot, CanonicalSubtreeRootLoadCoverage, CanonicalSubtreeRootLoadEvidence,
 };

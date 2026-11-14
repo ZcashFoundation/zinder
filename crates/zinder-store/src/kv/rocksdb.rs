@@ -155,9 +155,13 @@ impl<'path> RocksDbOpenRole<'path> {
 }
 
 /// Opened `RocksDB` handle plus the resource handles that must outlive it.
+///
+/// Spike: the database handle is reference counted so one physical database
+/// can back both the canonical and the wallet store handles.
+#[derive(Clone)]
 pub struct BoundedRocksDbOpen {
     /// Opened database handle.
-    pub db: DB,
+    pub db: Arc<DB>,
     /// Shared block cache retained for the database lifetime.
     pub block_cache: Cache,
     /// Shared write-buffer manager retained for the database lifetime.
@@ -198,7 +202,7 @@ pub fn open_bounded_rocksdb(
         Ok((db, statistics)) => {
             record_rocksdb_io_mode(role, RocksDbIoMode::Direct);
             Ok(BoundedRocksDbOpen {
-                db,
+                db: Arc::new(db),
                 block_cache,
                 write_buffer_manager,
                 io_mode: RocksDbIoMode::Direct,
@@ -218,7 +222,7 @@ pub fn open_bounded_rocksdb(
                 open_bounded_rocksdb_once(&open_attempt, RocksDbIoMode::Buffered)?;
             record_rocksdb_io_mode(role, RocksDbIoMode::Buffered);
             Ok(BoundedRocksDbOpen {
-                db,
+                db: Arc::new(db),
                 block_cache,
                 write_buffer_manager,
                 io_mode: RocksDbIoMode::Buffered,
@@ -277,6 +281,9 @@ where
         db_options.set_max_file_opening_threads(max_file_opening_threads);
     }
     db_options.set_write_buffer_manager(open_attempt.write_buffer_manager);
+    if open_attempt.role.is_primary() {
+        spike_apply_primary_options_hook(&mut db_options);
+    }
     if io_mode == RocksDbIoMode::Direct {
         db_options.set_use_direct_reads(true);
         if open_attempt.role.is_primary() {
@@ -315,6 +322,25 @@ fn record_rocksdb_io_mode(role: RocksDbOpenRole<'_>, io_mode: RocksDbIoMode) {
         mode = io_mode.as_str(),
         "RocksDB I/O mode resolved"
     );
+}
+
+type SpikePrimaryOptionsHook = Box<dyn Fn(&mut Options) + Send + Sync>;
+
+static SPIKE_PRIMARY_OPTIONS_HOOK: parking_lot::RwLock<Option<SpikePrimaryOptionsHook>> =
+    parking_lot::RwLock::new(None);
+
+/// Spike: installs a process-wide hook applied to every primary open's DB options.
+///
+/// The combined-commit benchmark uses it to attach a write-stall event
+/// listener. Passing `None` removes the hook.
+pub fn spike_set_primary_options_hook(hook: Option<SpikePrimaryOptionsHook>) {
+    *SPIKE_PRIMARY_OPTIONS_HOOK.write() = hook;
+}
+
+fn spike_apply_primary_options_hook(db_options: &mut Options) {
+    if let Some(hook) = SPIKE_PRIMARY_OPTIONS_HOOK.read().as_ref() {
+        hook(db_options);
+    }
 }
 
 /// Inputs for [`record_rocksdb_resource_gauges`].

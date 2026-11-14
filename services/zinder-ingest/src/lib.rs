@@ -68,6 +68,8 @@ pub use writer::control::{
 pub use writer::follow::{
     CanonicalFollowConfig, CanonicalFollowError, CanonicalFollower, CanonicalReorgWindowExceeded,
     DEFAULT_MAX_REPLACEMENT_BYTES, follow_canonical_tip, follow_canonical_tip_with_control,
+    spike_derive_live_block, spike_fetch_live_subtree_roots, spike_next_append_settled_tip,
+    spike_prepared_replacement_bytes,
 };
 pub use writer::ingest_control::{
     CanonicalIngestControlGrpcAdapter,

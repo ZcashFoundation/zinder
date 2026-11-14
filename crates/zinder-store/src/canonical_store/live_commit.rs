@@ -160,33 +160,31 @@ impl RocksDbCanonicalStore {
     /// unverified write outcome cannot leave a reusable handle with a stale
     /// fence; only successful readback returns the next admitted store.
     pub fn commit_live_append(
-        mut self,
+        self,
         append: CanonicalLiveAppend,
         network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> Result<(Self, CanonicalEventFence), CanonicalStoreError> {
         let prepared = PreparedLiveAppendCommit::new(&self, append, network_upgrade_activations)?;
         let mut batch = WriteBatch::default();
-        prepared
-            .block_rows
-            .put_into(&self.bounded_open.db, &mut batch)?;
-        batch.put_cf(
-            &column_family(&self.bounded_open.db, CHAIN_EPOCH_COLUMN_FAMILY)?,
-            prepared.outcome.chain_epoch_id.value().to_be_bytes(),
-            &prepared.encoded_epoch,
-        );
-        batch.put_cf(
-            &column_family(&self.bounded_open.db, CHAIN_EVENT_COLUMN_FAMILY)?,
-            prepared.outcome.chain_event_sequence.to_be_bytes(),
-            &prepared.encoded_event,
-        );
-        batch.put(STORE_CONTROL_KEY, &prepared.encoded_control);
+        prepared.put_into(&self.bounded_open.db, &mut batch)?;
+        let (store, fence, _timing) = self.write_prepared_live_append(prepared, &batch)?;
+        Ok((store, fence))
+    }
+
+    /// Writes a batch holding a prepared append synced and runs its readback.
+    pub(super) fn write_prepared_live_append(
+        mut self,
+        prepared: PreparedLiveAppendCommit,
+        batch: &WriteBatch,
+    ) -> Result<(Self, CanonicalEventFence, super::SpikeCommitTiming), CanonicalStoreError> {
         let mut write_options = WriteOptions::default();
         write_options.disable_wal(false);
         write_options.set_sync(true);
+        let write_started = std::time::Instant::now();
         super::crash_point("canonical.live_commit.before_atomic_write");
         self.bounded_open
             .db
-            .write_opt(&batch, &write_options)
+            .write_opt(batch, &write_options)
             .map_err(
                 |source| CanonicalStoreError::LiveCommitWriteOutcomeUnknown {
                     path: self.bounded_open.db.path().to_path_buf(),
@@ -194,6 +192,8 @@ impl RocksDbCanonicalStore {
                 },
             )?;
         super::crash_point("canonical.live_commit.after_atomic_write");
+        let write = write_started.elapsed();
+        let readback_started = std::time::Instant::now();
         let reorg_policy = self.reorg_policy();
         validate_live_commit_readback(
             &self.bounded_open.db,
@@ -208,7 +208,11 @@ impl RocksDbCanonicalStore {
             },
         )?;
         self.ready_evidence = prepared.ready_evidence;
-        Ok((self, prepared.outcome))
+        let timing = super::SpikeCommitTiming {
+            write,
+            readback: readback_started.elapsed(),
+        };
+        Ok((self, prepared.outcome, timing))
     }
 
     /// Returns the exact source fence authenticated by the READY control record.
@@ -243,18 +247,35 @@ impl RocksDbCanonicalStore {
     }
 }
 
-struct PreparedLiveAppendCommit {
-    block_rows: PreparedLiveBlockRows,
+pub(super) struct PreparedLiveAppendCommit {
+    pub(super) block_rows: PreparedLiveBlockRows,
     encoded_epoch: Vec<u8>,
-    encoded_event: Vec<u8>,
+    pub(super) encoded_event: Vec<u8>,
     encoded_control: Vec<u8>,
     ready_evidence: CanonicalStoreReadyEvidence,
-    previous_epoch_id: ChainEpochId,
-    outcome: CanonicalEventFence,
+    pub(super) previous_epoch_id: ChainEpochId,
+    pub(super) settled_tip: BlockId,
+    pub(super) outcome: CanonicalEventFence,
 }
 
 impl PreparedLiveAppendCommit {
-    fn new(
+    pub(super) fn put_into(&self, db: &DB, batch: &mut WriteBatch) -> Result<(), CanonicalStoreError> {
+        self.block_rows.put_into(db, batch)?;
+        batch.put_cf(
+            &column_family(db, CHAIN_EPOCH_COLUMN_FAMILY)?,
+            self.outcome.chain_epoch_id.value().to_be_bytes(),
+            &self.encoded_epoch,
+        );
+        batch.put_cf(
+            &column_family(db, CHAIN_EVENT_COLUMN_FAMILY)?,
+            self.outcome.chain_event_sequence.to_be_bytes(),
+            &self.encoded_event,
+        );
+        batch.put(STORE_CONTROL_KEY, &self.encoded_control);
+        Ok(())
+    }
+
+    pub(super) fn new(
         store: &RocksDbCanonicalStore,
         append: CanonicalLiveAppend,
         network_upgrade_activations: &NetworkUpgradeActivations,
@@ -334,6 +355,7 @@ impl PreparedLiveAppendCommit {
             encoded_control,
             ready_evidence,
             previous_epoch_id,
+            settled_tip: append.settled_tip,
             outcome: event_fence_from_ready(&ready_evidence),
         })
     }

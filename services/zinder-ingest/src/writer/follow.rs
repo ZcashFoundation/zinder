@@ -1123,6 +1123,10 @@ fn source_block_bytes(block: &SourceBlock) -> u64 {
 
 /// Estimates the bytes one prepared replacement block holds until commit: its
 /// replay envelope and the decoded facts it encodes, plus retained raw bytes.
+pub fn spike_prepared_replacement_bytes(block: &CanonicalBuildBlock) -> u64 {
+    prepared_replacement_bytes(block)
+}
+
 fn prepared_replacement_bytes(block: &CanonicalBuildBlock) -> u64 {
     let replay_bytes = u64::try_from(block.replay_envelope.as_bytes().len()).unwrap_or(u64::MAX);
     let raw_bytes = block
@@ -1174,6 +1178,15 @@ async fn serve_parked_writer(
     }
 }
 
+/// Spike: the settled tip following selects for the next appended height.
+pub fn spike_next_append_settled_tip(
+    store: &RocksDbCanonicalStore,
+    anchor: &zinder_store::CanonicalAppendAnchor,
+    next_visible_height: BlockHeight,
+) -> Result<BlockId, CanonicalFollowError> {
+    next_append_settled_tip(store, anchor, next_visible_height)
+}
+
 fn next_append_settled_tip(
     store: &RocksDbCanonicalStore,
     anchor: &zinder_store::CanonicalAppendAnchor,
@@ -1218,6 +1231,30 @@ fn prepare_live_block(
     network_upgrade_activations: &NetworkUpgradeActivations,
     raw_blob_retention: zinder_store::RawBlobRetention,
 ) -> Result<(CanonicalBuildBlock, ChainTipMetadata), CanonicalFollowError> {
+    let (block, tip_metadata, derived_checkpoint) = spike_derive_live_block(
+        source_block,
+        predecessor_checkpoint,
+        network_upgrade_activations,
+        raw_blob_retention,
+    )?;
+    if &derived_checkpoint != source_checkpoint {
+        return Err(CanonicalFollowError::SourceCheckpointMismatch {
+            height: source_block.height,
+        });
+    }
+    Ok((block, tip_metadata))
+}
+
+/// Spike: derives one live canonical block from its source block and the
+/// predecessor checkpoint, exactly as following does, returning the derived
+/// transition-tip checkpoint instead of comparing it with a node checkpoint.
+pub fn spike_derive_live_block(
+    source_block: &SourceBlock,
+    predecessor_checkpoint: &CommitmentTreeCheckpoint,
+    network_upgrade_activations: &NetworkUpgradeActivations,
+    raw_blob_retention: zinder_store::RawBlobRetention,
+) -> Result<(CanonicalBuildBlock, ChainTipMetadata, CommitmentTreeCheckpoint), CanonicalFollowError>
+{
     let height = source_block.height;
     let prepared = prepare_canonical_block(
         source_block,
@@ -1257,14 +1294,33 @@ fn prepare_live_block(
             .validated_frontiers()
             .map_err(|source| CanonicalFollowError::CommitmentTreeState { height, source })?,
     );
-    if &derived_checkpoint != source_checkpoint {
-        return Err(CanonicalFollowError::SourceCheckpointMismatch { height });
-    }
     let tip_metadata = positioned.tip_metadata;
     Ok((
-        canonical_build_block(positioned, Some(derived_checkpoint), None),
+        canonical_build_block(positioned, Some(derived_checkpoint.clone()), None),
         tip_metadata,
+        derived_checkpoint,
     ))
+}
+
+/// Spike: fetches the subtree roots completed between two tip positions.
+pub async fn spike_fetch_live_subtree_roots<Source>(
+    source: &Source,
+    request_timeout: Duration,
+    cancel: &CancellationToken,
+    previous_tip_metadata: ChainTipMetadata,
+    next_tip_metadata: ChainTipMetadata,
+) -> Result<Vec<CanonicalBuildSubtreeRoot>, CanonicalFollowError>
+where
+    Source: NodeSource,
+{
+    fetch_live_subtree_roots(
+        source,
+        request_timeout,
+        cancel,
+        previous_tip_metadata,
+        next_tip_metadata,
+    )
+    .await
 }
 
 async fn fetch_live_subtree_roots<Source>(

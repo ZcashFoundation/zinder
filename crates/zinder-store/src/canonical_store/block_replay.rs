@@ -500,7 +500,7 @@ pub(super) fn read_persisted_replay(
     })
 }
 
-fn decode_persisted_replay(
+pub(super) fn decode_persisted_replay(
     key: &[u8],
     encoded_replay: &[u8],
 ) -> Result<(BlockHeight, ValidatedCanonicalBlockReplay), CanonicalStoreError> {

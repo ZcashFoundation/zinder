@@ -141,7 +141,7 @@ pub(crate) const TRANSPARENT_ADDRESS_TRANSACTION_COLUMN_FAMILY: &str =
 pub(crate) const TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY: &str = "transparent_address_balance";
 pub(crate) const REORG_UNDO_COLUMN_FAMILY: &str = "reorg_undo";
 
-const WALLET_DATA_COLUMN_FAMILIES: [&str; 6] = [
+pub(crate) const WALLET_DATA_COLUMN_FAMILIES: [&str; 6] = [
     TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY,
     TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
     TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY,
@@ -209,6 +209,8 @@ pub struct RocksDbWalletStore {
     pub(crate) bounded_open: BoundedRocksDbOpen,
     pub(crate) control: WalletStoreControlRecord,
     pub(crate) ready_evidence: WalletProjectionReadyEvidence,
+    /// Spike: column family holding the control record; `None` is the default family.
+    pub(crate) control_family: Option<&'static str>,
 }
 
 /// A cold-admitted READY wallet held only for canonical following.
@@ -711,6 +713,7 @@ impl ValidatedRocksDbWalletBuild {
             bounded_open: self.bounded_open,
             control: ready_control,
             ready_evidence,
+            control_family: None,
         })
     }
 }
@@ -774,6 +777,7 @@ impl RocksDbWalletStore {
                 bounded_open,
                 ready_evidence: ready_evidence.clone(),
                 control,
+                control_family: None,
             },
         })
     }
@@ -1501,7 +1505,10 @@ pub(crate) fn wallet_column_family_descriptors(
         .collect()
 }
 
-fn wallet_data_options(block_cache: &Cache, resource_budget: RocksDbResourceBudget) -> Options {
+pub(crate) fn wallet_data_options(
+    block_cache: &Cache,
+    resource_budget: RocksDbResourceBudget,
+) -> Options {
     let mut options = Options::default();
     options.set_compression_type(DBCompressionType::Snappy);
     options.set_block_based_table_factory(&build_block_based_table_factory(block_cache));
@@ -1990,7 +1997,7 @@ fn require_ready_evidence_matches_rows(
 /// second external sort. Cross-family consistency of the construction itself is
 /// established by the construction tests and the serial oracle, and by the
 /// semantic re-derivation that recovery admission still runs.
-fn validate_ready_rows_by_readback(
+pub(crate) fn validate_ready_rows_by_readback(
     bounded_open: &BoundedRocksDbOpen,
     network: Network,
     evidence: &WalletProjectionReadyEvidence,

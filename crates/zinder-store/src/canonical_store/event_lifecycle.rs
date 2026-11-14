@@ -655,8 +655,16 @@ pub(super) fn read_retained_event_from_db(
             event_sequence,
             reason: "retained event row is absent",
         })?;
-    validate_event_record_shape(event_sequence, &encoded)?;
-    let decoded = decode_chain_event(&encoded).map_err(|_| {
+    decode_retained_event(event_sequence, &encoded)
+}
+
+/// Decodes one retained event row (spike: also used before the row is written).
+pub(super) fn decode_retained_event(
+    event_sequence: u64,
+    encoded: &[u8],
+) -> Result<CanonicalRetainedEvent, CanonicalStoreError> {
+    validate_event_record_shape(event_sequence, encoded)?;
+    let decoded = decode_chain_event(encoded).map_err(|_| {
         CanonicalStoreError::CanonicalEventRecordMalformed {
             event_sequence,
             reason: "event record does not satisfy the version-1 transition contract",

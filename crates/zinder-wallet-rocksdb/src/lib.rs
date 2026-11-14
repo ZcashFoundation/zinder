@@ -8,6 +8,7 @@ mod build_lock;
 mod error;
 mod projection_load;
 mod secondary;
+mod spike_combined;
 mod store;
 mod transition;
 
@@ -27,4 +28,12 @@ pub use store::{
     WalletAddressUnspentOutputsPage, WalletOwnerCheckpointAdmission, WalletOwnerCheckpointEvidence,
     WalletRecoveryAdmissionConfig,
 };
-pub use transition::MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES;
+pub use spike_combined::{
+    SPIKE_WALLET_CONTROL_COLUMN_FAMILY, SpikeColdReadback, SpikePendingWalletPublication,
+    SpikePlannedWalletTransition, SpikeWalletPlanStats, spike_decode_wallet_control,
+    spike_wallet_column_family_descriptors, spike_wallet_column_family_names,
+    spike_wallet_data_column_family_names, spike_wallet_data_options,
+};
+pub use transition::{
+    MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES, SpikeWalletPlanOps, SpikeWalletRowOp,
+};

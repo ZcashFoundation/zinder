@@ -128,38 +128,32 @@ impl RocksDbCanonicalStore {
     /// and READY control record is committed by one synced batch. Only exact
     /// readback returns a new admitted handle.
     pub fn commit_live_replacement(
-        mut self,
+        self,
         replacement: CanonicalLiveReplacement,
         network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> Result<(Self, CanonicalEventFence), CanonicalStoreError> {
         let prepared =
             PreparedLiveReplacement::new(&self, replacement, network_upgrade_activations)?;
         let mut batch = WriteBatch::default();
-        prepared
-            .deletions
-            .delete_from(&self.bounded_open.db, &mut batch)?;
-        for block_rows in &prepared.replacement_rows {
-            block_rows.put_into(&self.bounded_open.db, &mut batch)?;
-        }
-        prepared.archive.put_into(&self, &mut batch)?;
-        batch.put_cf(
-            &column_family(&self.bounded_open.db, CHAIN_EPOCH_COLUMN_FAMILY)?,
-            prepared.outcome.chain_epoch_id().value().to_be_bytes(),
-            &prepared.encoded_epoch,
-        );
-        batch.put_cf(
-            &column_family(&self.bounded_open.db, CHAIN_EVENT_COLUMN_FAMILY)?,
-            prepared.outcome.chain_event_sequence().to_be_bytes(),
-            &prepared.encoded_event,
-        );
-        batch.put(STORE_CONTROL_KEY, &prepared.encoded_control);
+        prepared.put_into(&self, &mut batch)?;
+        let (store, fence, _timing) = self.write_prepared_live_replacement(prepared, &batch)?;
+        Ok((store, fence))
+    }
+
+    /// Writes a batch holding a prepared replacement synced and runs its readback.
+    pub(super) fn write_prepared_live_replacement(
+        mut self,
+        prepared: PreparedLiveReplacement,
+        batch: &WriteBatch,
+    ) -> Result<(Self, CanonicalEventFence, super::SpikeCommitTiming), CanonicalStoreError> {
         let mut write_options = WriteOptions::default();
         write_options.disable_wal(false);
         write_options.set_sync(true);
+        let write_started = std::time::Instant::now();
         super::crash_point("canonical.live_replacement.before_atomic_write");
         self.bounded_open
             .db
-            .write_opt(&batch, &write_options)
+            .write_opt(batch, &write_options)
             .map_err(
                 |source| CanonicalStoreError::LiveCommitWriteOutcomeUnknown {
                     path: self.bounded_open.db.path().to_path_buf(),
@@ -167,6 +161,8 @@ impl RocksDbCanonicalStore {
                 },
             )?;
         super::crash_point("canonical.live_replacement.after_atomic_write");
+        let write = write_started.elapsed();
+        let readback_started = std::time::Instant::now();
         prepared.validate_readback(&mut self).map_err(|source| {
             CanonicalStoreError::LiveCommitCompletedButUnverified {
                 path: self.bounded_open.db.path().to_path_buf(),
@@ -174,30 +170,59 @@ impl RocksDbCanonicalStore {
             }
         })?;
         self.ready_evidence = prepared.ready_evidence;
-        Ok((self, prepared.outcome))
+        let timing = super::SpikeCommitTiming {
+            write,
+            readback: readback_started.elapsed(),
+        };
+        Ok((self, prepared.outcome, timing))
     }
 }
 
-struct PreparedLiveReplacement {
+pub(super) struct PreparedLiveReplacement {
     deletions: PreparedCanonicalDeletions,
-    replacement_rows: Vec<PreparedLiveBlockRows>,
+    pub(super) replacement_rows: Vec<PreparedLiveBlockRows>,
     archive: PreparedDisplacedArchiveWrite,
     encoded_epoch: Vec<u8>,
-    encoded_event: Vec<u8>,
+    pub(super) encoded_event: Vec<u8>,
     encoded_control: Vec<u8>,
     ready_evidence: CanonicalStoreReadyEvidence,
     previous_epoch_id: ChainEpochId,
-    reverted_range: BlockHeightRange,
-    committed_range: BlockHeightRange,
-    outcome: CanonicalEventFence,
+    pub(super) settled_tip: BlockId,
+    pub(super) reverted_range: BlockHeightRange,
+    pub(super) committed_range: BlockHeightRange,
+    pub(super) outcome: CanonicalEventFence,
 }
 
 impl PreparedLiveReplacement {
+    pub(super) fn put_into(
+        &self,
+        store: &RocksDbCanonicalStore,
+        batch: &mut WriteBatch,
+    ) -> Result<(), CanonicalStoreError> {
+        self.deletions.delete_from(&store.bounded_open.db, batch)?;
+        for block_rows in &self.replacement_rows {
+            block_rows.put_into(&store.bounded_open.db, batch)?;
+        }
+        self.archive.put_into(store, batch)?;
+        batch.put_cf(
+            &column_family(&store.bounded_open.db, CHAIN_EPOCH_COLUMN_FAMILY)?,
+            self.outcome.chain_epoch_id().value().to_be_bytes(),
+            &self.encoded_epoch,
+        );
+        batch.put_cf(
+            &column_family(&store.bounded_open.db, CHAIN_EVENT_COLUMN_FAMILY)?,
+            self.outcome.chain_event_sequence().to_be_bytes(),
+            &self.encoded_event,
+        );
+        batch.put(STORE_CONTROL_KEY, &self.encoded_control);
+        Ok(())
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "one preparation pass binds every deletion, replacement, archive, event, and READY invariant before the atomic batch"
     )]
-    fn new(
+    pub(super) fn new(
         store: &RocksDbCanonicalStore,
         replacement: CanonicalLiveReplacement,
         network_upgrade_activations: &NetworkUpgradeActivations,
@@ -352,6 +377,7 @@ impl PreparedLiveReplacement {
             encoded_control,
             ready_evidence,
             previous_epoch_id,
+            settled_tip: anchor.settled_tip(),
             reverted_range,
             committed_range,
             outcome,
