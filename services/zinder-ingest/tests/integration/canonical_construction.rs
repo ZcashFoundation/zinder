@@ -6,13 +6,15 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use async_trait::async_trait;
 use tempfile::TempDir;
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use zinder_core::{
     BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeCheckpoint, CommitmentTreeFrontier,
     CommitmentTreeFrontiers, Network, NetworkUpgradeActivations,
@@ -20,11 +22,13 @@ use zinder_core::{
 };
 use zinder_ingest::{
     CanonicalBlockLoadOutcome, CanonicalConstructionConfig, CanonicalConstructionError,
+    CanonicalFollowConfig, CanonicalWriterConfig, CanonicalWriterError, admit_canonical_store,
     load_fresh_canonical, load_fresh_canonical_blocks,
 };
+use zinder_runtime::{ComposedReadiness, Readiness};
 use zinder_source::{
-    NodeCapabilities, NodeSource, SourceBlock, SourceChainSegment, SourceChainSegmentLimits,
-    SourceError,
+    NodeCapabilities, NodeSource, SourceBlock, SourceBlockHeader, SourceChainSegment,
+    SourceChainSegmentLimits, SourceError,
 };
 use zinder_store::{
     CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload,
@@ -474,4 +478,169 @@ async fn canonical_construction_rejects_activation_mismatch_before_source_work()
 
 fn regtest_activations() -> Arc<NetworkUpgradeActivations> {
     Arc::new(sample_regtest_upgrade_activations())
+}
+
+/// Upper bound for a cancelled construction to return, well inside the
+/// wallet-serving supervisor's 20-second shutdown grace window.
+const CANCELLED_CONSTRUCTION_STOP_BOUND: Duration = Duration::from_secs(5);
+
+/// Serves a one-block chain to the canonical writer and can hold the block
+/// stream open, so shutdown lands while construction is in progress.
+#[derive(Clone)]
+struct HeldConstructionSource {
+    block: SourceBlock,
+    chain_checkpoint: CommitmentTreeCheckpoint,
+    hold_chain_segments: Arc<AtomicBool>,
+    chain_segment_held: Arc<Notify>,
+}
+
+impl HeldConstructionSource {
+    fn new(block: SourceBlock, chain_checkpoint: CommitmentTreeCheckpoint) -> Self {
+        Self {
+            block,
+            chain_checkpoint,
+            hold_chain_segments: Arc::new(AtomicBool::new(true)),
+            chain_segment_held: Arc::new(Notify::new()),
+        }
+    }
+
+    fn release_chain_segments(&self) {
+        self.hold_chain_segments.store(false, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl NodeSource for HeldConstructionSource {
+    fn capabilities(&self) -> NodeCapabilities {
+        NodeCapabilities::default()
+    }
+
+    async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+        if height == BlockHeight::new(0) {
+            return Ok(SourceBlock::new(
+                SourceBlockHeader {
+                    network: Network::ZcashRegtest,
+                    height,
+                    hash: self.block.parent_hash,
+                    parent_hash: self.block.parent_hash,
+                    block_time_seconds: self.block.block_time_seconds.saturating_sub(1),
+                },
+                Vec::new(),
+            ));
+        }
+        if height == self.block.height {
+            return Ok(self.block.clone());
+        }
+        Err(SourceError::BlockUnavailable {
+            height,
+            reason: "held construction source has no block at the requested height".to_owned(),
+        })
+    }
+
+    async fn fetch_chain_segment(
+        &self,
+        _limits: SourceChainSegmentLimits,
+    ) -> Result<SourceChainSegment, SourceError> {
+        if self.hold_chain_segments.load(Ordering::SeqCst) {
+            self.chain_segment_held.notify_one();
+            std::future::pending::<()>().await;
+        }
+        Ok(SourceChainSegment::connected_blocks([self.block.clone()]))
+    }
+
+    async fn tip_id(&self) -> Result<BlockId, SourceError> {
+        Ok(BlockId::new(self.block.height, self.block.hash))
+    }
+
+    async fn fetch_chain_checkpoint(
+        &self,
+        height: BlockHeight,
+        _network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> Result<CommitmentTreeCheckpoint, SourceError> {
+        if height == self.chain_checkpoint.block_id.height {
+            return Ok(self.chain_checkpoint.clone());
+        }
+        Err(SourceError::BlockUnavailable {
+            height,
+            reason: "held construction source has no checkpoint at the requested height".to_owned(),
+        })
+    }
+}
+
+fn held_construction_writer_config(
+    storage_path: std::path::PathBuf,
+    activations: Arc<NetworkUpgradeActivations>,
+) -> CanonicalWriterConfig {
+    CanonicalWriterConfig {
+        storage_path,
+        resource_budget: RocksDbResourceBudget::for_local_tests(),
+        construction: CanonicalConstructionConfig::for_local_tests(
+            Duration::from_secs(5),
+            activations,
+        ),
+        checkpoint_height: None,
+        raw_blob_retention: RawBlobRetention::Transactions,
+        reorg_window_blocks: 100,
+        follow: CanonicalFollowConfig {
+            request_timeout: Duration::from_secs(5),
+            poll_interval: Duration::from_millis(10),
+            lag_threshold_blocks: 0,
+            target_height: None,
+            event_retention_window: None,
+            event_retention_check_interval: Duration::from_secs(1),
+            mempool_ready_gate: None,
+            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+        },
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_during_construction_stops_promptly_and_the_next_start_rebuilds()
+-> Result<(), Box<dyn std::error::Error>> {
+    let source_block = fixture_source_block()?;
+    let fixed_tip = BlockId::new(source_block.height, source_block.hash);
+    let chain_checkpoint = CommitmentTreeCheckpoint::new(
+        fixed_tip,
+        source_block.block_time_seconds,
+        CommitmentTreeFrontiers::from_validated_parts(
+            Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
+            None,
+            None,
+        ),
+    );
+    let source = HeldConstructionSource::new(source_block, chain_checkpoint);
+    let temporary = TempDir::new()?;
+    let config =
+        held_construction_writer_config(temporary.path().join("canonical"), regtest_activations());
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let cancel = CancellationToken::new();
+
+    let admission =
+        admit_canonical_store(&source, regtest_activations(), &config, &readiness, &cancel);
+    tokio::pin!(admission);
+    tokio::select! {
+        () = source.chain_segment_held.notified() => {}
+        _ = &mut admission => {
+            return Err("construction finished before its block stream was held".into());
+        }
+    }
+    cancel.cancel();
+    let stopped = tokio::time::timeout(CANCELLED_CONSTRUCTION_STOP_BOUND, admission)
+        .await
+        .map_err(|_| "cancelled construction outlived its shutdown bound")?;
+    assert!(matches!(stopped, Err(CanonicalWriterError::Cancelled)));
+    assert!(!config.storage_path.exists());
+
+    // Reopening the staging proves the cancelled loader already closed it.
+    source.release_chain_segments();
+    let store = admit_canonical_store(
+        &source,
+        regtest_activations(),
+        &config,
+        &readiness,
+        &CancellationToken::new(),
+    )
+    .await?;
+    assert_eq!(store.event_fence().visible_tip(), fixed_tip);
+    Ok(())
 }

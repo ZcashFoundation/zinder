@@ -23,8 +23,9 @@ use zinder_store::{
 use crate::{
     CanonicalConstructionConfig, CanonicalConstructionError, CanonicalControlCommand,
     CanonicalFollowConfig, CanonicalFollowError, CanonicalFollower, RawBlobPolicy,
-    follow_canonical_tip, follow_canonical_tip_with_control, load_fresh_canonical,
+    follow_canonical_tip, follow_canonical_tip_with_control,
 };
+use construction::{load_fresh_canonical_until_cancelled, record_construction_cancelled};
 
 pub(super) const fn raw_blob_policy_for_retention(retention: RawBlobRetention) -> RawBlobPolicy {
     match retention {
@@ -126,6 +127,18 @@ pub enum CanonicalWriterError {
         /// Bounded task-completion diagnostic.
         reason: String,
     },
+    /// The blocking task that publishes a freshly constructed store failed.
+    #[error("canonical publication task failed: {reason}")]
+    PublicationTaskFailed {
+        /// Tokio blocking-task failure.
+        reason: String,
+    },
+    /// Shutdown was requested before the writer admitted a READY store.
+    ///
+    /// This is a clean stop. An unpublished construction restarts on the next
+    /// start, and a staged READY store is installed then.
+    #[error("canonical writer was cancelled before admitting a READY store")]
+    Cancelled,
 }
 
 /// Opens or freshly constructs the canonical store, then follows Zebra.
@@ -144,14 +157,14 @@ pub async fn run_canonical_writer<Source>(
 where
     Source: NodeSource + Clone,
 {
-    run_canonical_writer_with_control(
+    Box::pin(run_canonical_writer_with_control(
         source,
         network_upgrade_activations,
         config,
         readiness,
         cancel,
         None,
-    )
+    ))
     .await
 }
 
@@ -172,45 +185,37 @@ pub async fn run_canonical_writer_with_control<Source>(
 where
     Source: NodeSource + Clone,
 {
-    let store = open_or_construct_canonical_store(
+    let store = admit_canonical_store(
         source,
-        Arc::clone(&network_upgrade_activations),
+        network_upgrade_activations,
         &config,
         readiness,
+        cancel,
     )
     .await?;
-    let admitted_activations = admitted_network_upgrade_activations(&store)?;
-    let follower = CanonicalFollower::new(
+    Box::pin(follow_admitted_canonical_store(
+        store,
         source,
-        admitted_activations,
         config.follow,
         readiness,
         cancel,
-    );
-    let store = match control_commands {
-        Some(control_commands) => {
-            follow_canonical_tip_with_control(store, follower, control_commands).await?
-        }
-        None => follow_canonical_tip(store, follower).await?,
-    };
-    Ok(store)
+        control_commands,
+    ))
+    .await
 }
 
-fn admitted_network_upgrade_activations(
-    store: &RocksDbCanonicalStore,
-) -> Result<Arc<NetworkUpgradeActivations>, CanonicalWriterError> {
-    store
-        .network_upgrade_activations()
-        .cloned()
-        .map(Arc::new)
-        .ok_or(CanonicalWriterError::NetworkUpgradeScheduleNotAdmitted)
-}
-
-async fn open_or_construct_canonical_store<Source>(
+/// Admits the READY canonical primary, first recovering a staged build or
+/// constructing a fresh store when none exists.
+///
+/// Returns [`CanonicalWriterError::Cancelled`] when `cancel` fires before
+/// admission. Construction stops at its next block boundary or, while the
+/// store finalizes files or publishes, stops waiting for that blocking work.
+pub async fn admit_canonical_store<Source>(
     source: &Source,
     network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     config: &CanonicalWriterConfig,
     readiness: &ComposedReadiness,
+    cancel: &CancellationToken,
 ) -> Result<RocksDbCanonicalStore, CanonicalWriterError>
 where
     Source: NodeSource + Clone,
@@ -229,9 +234,47 @@ where
         network_upgrade_activations.as_ref(),
         config,
         readiness,
-        &staging_path,
+        cancel,
     )
     .await
+}
+
+/// Follows the node from an admitted READY store until `cancel` fires,
+/// serving canonical-control commands when a receiver is supplied.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "following keeps the writer dependency boundary of run_canonical_writer_with_control after admission"
+)]
+pub async fn follow_admitted_canonical_store<Source>(
+    store: RocksDbCanonicalStore,
+    source: &Source,
+    follow: CanonicalFollowConfig,
+    readiness: &ComposedReadiness,
+    cancel: &CancellationToken,
+    control_commands: Option<mpsc::Receiver<CanonicalControlCommand>>,
+) -> Result<RocksDbCanonicalStore, CanonicalWriterError>
+where
+    Source: NodeSource + Clone,
+{
+    let admitted_activations = admitted_network_upgrade_activations(&store)?;
+    let follower = CanonicalFollower::new(source, admitted_activations, follow, readiness, cancel);
+    let store = match control_commands {
+        Some(control_commands) => {
+            follow_canonical_tip_with_control(store, follower, control_commands).await?
+        }
+        None => follow_canonical_tip(store, follower).await?,
+    };
+    Ok(store)
+}
+
+fn admitted_network_upgrade_activations(
+    store: &RocksDbCanonicalStore,
+) -> Result<Arc<NetworkUpgradeActivations>, CanonicalWriterError> {
+    store
+        .network_upgrade_activations()
+        .cloned()
+        .map(Arc::new)
+        .ok_or(CanonicalWriterError::NetworkUpgradeScheduleNotAdmitted)
 }
 
 fn open_existing_store(
@@ -378,16 +421,28 @@ async fn construct_fresh_store<Source>(
     network_upgrade_activations: &NetworkUpgradeActivations,
     config: &CanonicalWriterConfig,
     readiness: &ComposedReadiness,
-    staging_path: &std::path::Path,
+    cancel: &CancellationToken,
 ) -> Result<RocksDbCanonicalStore, CanonicalWriterError>
 where
     Source: NodeSource + Clone,
 {
+    let staging_path = construction_staging_path(&config.storage_path);
+    let staging_path = staging_path.as_path();
     readiness.publish_admission(
         ReadinessState::syncing(None, None, None).with_phase(IngestPhase::BulkCatchup),
     );
-    let (build_plan, settled_tip, observed_tip) =
-        resolve_construction_range(source, network_upgrade_activations, config).await?;
+    let Some(construction_range) = cancel
+        .run_until_cancelled(resolve_construction_range(
+            source,
+            network_upgrade_activations,
+            config,
+        ))
+        .await
+    else {
+        record_construction_cancelled("construction_range");
+        return Err(CanonicalWriterError::Cancelled);
+    };
+    let (build_plan, settled_tip, observed_tip) = construction_range?;
     readiness.publish_admission(
         ReadinessState::syncing(
             Some(u64::from(observed_tip.height.value().saturating_sub(
@@ -411,15 +466,17 @@ where
         fixed_tip_height = observed_tip.height.value(),
         "started canonical construction"
     );
-    let loaded = load_fresh_canonical(builder, source, &config.construction).await?;
-    let validated = loaded.builder.prepare_trusted_fresh_publication()?;
-    let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
-        settled_tip,
-        UnixTimestampMillis::now(),
-    ))?;
-    let staged_ready = validated.publish_baseline(publication)?;
-    let published_fence = staged_ready.event_fence();
-    drop(staged_ready);
+    let loaded =
+        load_fresh_canonical_until_cancelled(builder, source, &config.construction, cancel)
+            .await
+            .map_err(|error| {
+                if matches!(error, CanonicalConstructionError::Cancelled) {
+                    CanonicalWriterError::Cancelled
+                } else {
+                    CanonicalWriterError::Construction(error)
+                }
+            })?;
+    let published_fence = publish_constructed_baseline(loaded, settled_tip, cancel).await?;
     install_staged_store(staging_path, &config.storage_path)?;
     let store = RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
         &config.storage_path,
@@ -443,6 +500,36 @@ where
         "published and cold-reopened the canonical baseline"
     );
     Ok(store)
+}
+
+/// Validates and publishes the staged build on the blocking pool.
+///
+/// Publication flushes and reopens `RocksDB` and cannot be interrupted, so
+/// cancellation stops waiting for it. Work that finishes after shutdown
+/// leaves a staged READY store that the next start installs.
+async fn publish_constructed_baseline(
+    loaded: crate::CanonicalSourceLoadOutcome,
+    settled_tip: BlockId,
+    cancel: &CancellationToken,
+) -> Result<zinder_store::CanonicalEventFence, CanonicalWriterError> {
+    let publication = tokio::task::spawn_blocking(move || {
+        let validated = loaded.builder.prepare_trusted_fresh_publication()?;
+        let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
+            settled_tip,
+            UnixTimestampMillis::now(),
+        ))?;
+        let staged_ready = validated.publish_baseline(publication)?;
+        Ok::<_, CanonicalStoreError>(staged_ready.event_fence())
+    });
+    let Some(published) = cancel.run_until_cancelled(publication).await else {
+        record_construction_cancelled("publication");
+        return Err(CanonicalWriterError::Cancelled);
+    };
+    published
+        .map_err(|source| CanonicalWriterError::PublicationTaskFailed {
+            reason: source.to_string(),
+        })?
+        .map_err(CanonicalWriterError::from)
 }
 
 fn validate_retained_history_coverage(

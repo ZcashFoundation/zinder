@@ -91,6 +91,16 @@ On restart, a ready staging store is installed and cold-opened at the configured
 path. An unpublished or invalid staging store is removed and reconstructed. A
 ready configured store is never replaced by staging data.
 
+Shutdown stops construction at any stage, and the writer returns without
+admitting a store. While blocks stream into the builder, the blocking loader
+stops at its next block boundary and closes the builder before the writer
+returns. Two later stages cannot be interrupted: SST finalization after the
+last block, and publication, which flushes and reopens the store. For those
+stages, the writer stops waiting, and the process exit waits at most five
+seconds for the blocking work. Either way the next start applies the restart
+rules above, so a cancelled construction is equivalent to a crash before
+publication.
+
 ## Continuous following
 
 `CanonicalFollower` polls one atomic source tip and compares it with the
@@ -126,7 +136,10 @@ See [Chain events](chain-events.md) for event semantics and cursor behavior.
 
 ## Mempool ownership
 
-The live mempool owner starts with the control surface and consumes either the
+The live mempool owner and the mempool-event retention task start once the
+writer admits a READY canonical store, not with the control surface. During
+fresh construction the writer does not service its command queue, so durable
+mempool replay and retention would only time out. The owner consumes either the
 Zebra indexer stream or the JSON-RPC source selected by configuration. It
 publishes a complete in-memory snapshot before satisfying the writer readiness
 gate, then applies typed added, mined, and invalidated events. Retained mempool
