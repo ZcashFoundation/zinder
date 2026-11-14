@@ -1,0 +1,6 @@
+kind: fixed
+body: "Explorer view replay and the transparent-address ranking build no longer re-read the producing block for each transparent spend of an output they already replayed, which made transparent-heavy history such as early Mainnet replay at a few hundred blocks per minute; they keep up to about 375 MB of unspent outputs in memory while they walk history and release it at the tip or under memory pressure. Explorer view replay, the ranking build, and historical view backfills now also pause while the volume holding `storage.path` has less available space than the new `ingest.explorer_views_min_free_bytes` (`ZINDER_INGEST__EXPLORER_VIEWS_MIN_FREE_BYTES`, default 10 GiB, `0` disables), logging `materialized_view_replay_volume_space_low`, and resume on their own once a tenth more is available; canonical ingest and wallet serving keep running. Existing Explorer view stores resume in place."
+time: 2026-11-14T21:00:00Z
+custom:
+  Bump: minor
+  PR: "184"
