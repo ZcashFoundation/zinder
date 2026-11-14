@@ -797,6 +797,7 @@ impl ReplayStore {
         TransparentAddressRankingConsumer::activate_snapshot_generation_at_cursor(
             &self.store,
             RANKING_GENERATION,
+            &[],
             &cursor,
         )?;
         Ok(())

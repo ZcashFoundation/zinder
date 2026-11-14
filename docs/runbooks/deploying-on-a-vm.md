@@ -281,6 +281,27 @@ reset, immutable external publication, inactive-lane restore, and the required
 10000-block tail proof remain absent, so neither captured nor locally sealed
 manifests satisfy the restore production gate.
 
+### Wait for the transparent-address ranking after an upgrade
+
+`ExplorerQuery.TransparentAddressActivity` and
+`ExplorerQuery.TransparentAddressRanking` read the transparent-address
+ranking. Explorer views built by Zinder 0.10.0 have no ranking, so they
+withhold `explorer.transparent_address.activity_v2` and
+`explorer.transparent_address.ranking_v1`.
+
+You do not need to rebuild those views. After the upgrade, `zinder-ingest`
+builds the ranking from canonical history while the other views keep following
+the tip. It logs these events:
+
+- `transparent_address_ranking_build_started` when the build begins.
+- `transparent_address_ranking_build_progress` as it passes each
+  100000-height mark.
+- `transparent_address_ranking_activated` when the ranking serves.
+
+The build reads every canonical block from height 1 and resumes after a
+restart. `ExplorerQuery.ServerInfo` advertises both capabilities once the
+ranking activates.
+
 ### Rebuild Explorer views after a manifest change
 
 Each release admits only a materialized-view store whose recorded consumers
@@ -316,11 +337,8 @@ To rebuild the Explorer views:
 6. Delete the moved directory only after `ExplorerQuery.ServerInfo` reports
    zero `lag_blocks` and advertises every capability recorded in step 1. Zero
    lag covers only the shared replay cursor. A backfill-owned view advertises
-   its capability once its backfill completes. The transparent-address ranking
-   stays withheld until its canonical snapshot is published, and no release
-   process publishes one, so a deployment that served
-   `explorer.transparent_address.ranking_v1` keeps the old directory until
-   that capability returns.
+   its capability once its backfill completes. The transparent-address
+   ranking replays from genesis with the shared cursor, so zero lag covers it.
 
 ### Stream mempool events over indexer TLS
 
