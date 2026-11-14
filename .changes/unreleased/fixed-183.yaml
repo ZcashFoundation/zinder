@@ -1,0 +1,6 @@
+kind: fixed
+body: "`ExplorerQuery.TransparentAddressActivity` no longer fails with `FAILED_PRECONDITION` while the transparent-address ranking is ahead of the requested chain epoch, which happened for most of every block interval. Address summaries, ranking coverage, and activity rows now describe the epoch's visible tip, and a read still fails with `FAILED_PRECONDITION` when the ranking applied a different block at that height or would need to rewind more than 1,000 blocks."
+time: 2026-11-14T20:00:00Z
+custom:
+  Bump: patch
+  PR: "183"
