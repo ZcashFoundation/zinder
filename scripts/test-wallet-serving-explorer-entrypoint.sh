@@ -32,6 +32,16 @@ cat >"$stub_bin/chown" <<'STUB'
 #!/bin/sh
 exit 0
 STUB
+# Answers the ingest /readyz probe, listing view identities once the
+# wallet-serving stub has admitted the Explorer views.
+cat >"$stub_bin/curl" <<'STUB'
+#!/bin/sh
+if [ -e "$STUB_WORK/admitted" ]; then
+  printf '{"status":"ready","cause":"ready","materialized_view_identities":["explorer.view"]}'
+else
+  printf '{"status":"ready","cause":"ready"}'
+fi
+STUB
 # Drops the privilege options and runs the command as the current user.
 cat >"$stub_bin/setpriv" <<'STUB'
 #!/bin/sh
@@ -49,11 +59,16 @@ STUB
 cat >"$work/wallet-serving" <<'STUB'
 #!/bin/sh
 env >"$STUB_WORK/wallet.env"
-trap 'printf terminated >"$STUB_WORK/wallet.stopped"; exit 0' TERM
+trap 'printf terminated >"$STUB_WORK/wallet.stopped"; exit "${STUB_WALLET_STOP_STATUS:-0}"' TERM
 case "$STUB_WALLET_MODE" in
   fail-before-ready) exit 3 ;;
 esac
 : >"$STUB_WORK/ready"
+# Ingest admits the view store a moment after wallet serving answers.
+if [ "${STUB_ADMISSION:-admit}" = admit ]; then
+  sleep 2
+  : >"$STUB_WORK/admitted"
+fi
 elapsed=0
 while true; do
   sleep 0.1
@@ -78,6 +93,7 @@ case "$*" in
     ;;
 esac
 printf 'start\n' >>"$STUB_WORK/explorer.starts"
+[ -e "$STUB_WORK/admitted" ] || printf 'started before view admission\n' >"$STUB_WORK/explorer.unadmitted"
 [ -e "$STUB_WORK/ready" ] || printf 'started before wallet serving was ready\n' >"$STUB_WORK/explorer.early"
 printf '%s\n' "$*" >"$STUB_WORK/explorer.args"
 env >"$STUB_WORK/explorer.env"
@@ -89,7 +105,7 @@ while true; do
   sleep 0.1
 done
 STUB
-chmod +x "$stub_bin/chown" "$stub_bin/setpriv" "$work/wallet-serving" "$work/healthcheck" "$work/explorer"
+chmod +x "$stub_bin/curl" "$stub_bin/chown" "$stub_bin/setpriv" "$work/wallet-serving" "$work/healthcheck" "$work/explorer"
 
 # Rewrites one exact line in a copied file and fails when it is missing, so a
 # change to the entrypoint cannot silently bypass the scratch locations.
@@ -127,6 +143,8 @@ rewrite_line "$test_entrypoint" \
   "explorer_secondary_path=\"$work/volume/explorer/secondary\""
 rewrite_line "$test_entrypoint" 'poll_interval_seconds=15' 'poll_interval_seconds=1'
 rewrite_line "$test_entrypoint" 'shutdown_grace_seconds=25' 'shutdown_grace_seconds=5'
+rewrite_line "$test_entrypoint" 'explorer_view_admission_deadline_seconds=600' \
+  'explorer_view_admission_deadline_seconds=3'
 rewrite_line "$test_entrypoint" 'explorer_restart_initial_seconds=15' 'explorer_restart_initial_seconds=1'
 rewrite_line "$test_entrypoint" 'explorer_restart_max_seconds=300' 'explorer_restart_max_seconds=8'
 # An unprivileged test cannot raise the open-file limit past its hard limit.
@@ -192,6 +210,7 @@ wallet_mode=serve explorer_mode=serve start_entrypoint \
   RUST_LOG=info
 await_file "$work/case/explorer.env"
 [[ ! -e "$work/case/explorer.early" ]] || test_failure "the Explorer started before wallet serving was ready"
+[[ ! -e "$work/case/explorer.unadmitted" ]] || test_failure "the Explorer started before ingest admitted its views"
 [[ -d "$work/volume/explorer/secondary" ]] || test_failure "the Explorer secondary directory was not created"
 [[ "$(cat "$work/case/explorer.args")" == "--config /etc/zinder/explorer.toml" ]] \
   || test_failure "the Explorer was not started with its baked config"
@@ -230,6 +249,22 @@ await_entrypoint_exit
 [[ "$wrapper_status" -eq 0 ]] || test_failure "a forwarded SIGTERM exited $wrapper_status"
 [[ -e "$work/case/wallet.stopped" ]] || test_failure "SIGTERM did not reach wallet serving"
 [[ -e "$work/case/explorer.stopped" ]] || test_failure "SIGTERM did not reach the Explorer"
+
+# A view store that ingest never admits delays the Explorer only until the
+# deadline, and a wallet-serving entrypoint that stops non-zero on SIGTERM
+# fails the container.
+reset_case
+wallet_mode=serve explorer_mode=serve start_entrypoint \
+  STUB_ADMISSION=never STUB_WALLET_STOP_STATUS=1
+await_file "$work/case/explorer.env"
+[[ -e "$work/case/explorer.unadmitted" ]] || test_failure "the Explorer started before the admission deadline"
+grep -q 'ingest has not admitted the Explorer views after' "$work/case/stderr" \
+  || test_failure "the admission deadline was not logged"
+kill -s TERM "$wrapper_pid"
+await_entrypoint_exit
+[[ "$wrapper_status" -eq 1 ]] || test_failure "a failed wallet-serving stop exited $wrapper_status, expected 1"
+grep -q 'the wallet-serving entrypoint stopped with status 1' "$work/case/stderr" \
+  || test_failure "the failed wallet-serving stop was not logged"
 
 # A wallet-serving topology that fails before serving ends the container with
 # its status and never starts the Explorer.

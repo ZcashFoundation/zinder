@@ -480,6 +480,11 @@ wallet serving starts, so the deployment fails at once instead of hours later.
 The entrypoint then starts the wallet-serving entrypoint. It starts
 `zinder-explorer` once `zinder-wallet-serving-healthcheck` passes, which
 happens when query `/readyz` answers 200 or reports `reorg_window_exceeded`.
+It then waits until ingest `/readyz` on port 9105 lists
+`materialized_view_identities`, which ingest reports once it admits the
+Explorer view store. The Explorer opens that store only when it starts, so it
+would otherwise serve without its view-backed capabilities. After 10 minutes
+without admission, the entrypoint logs the wait and starts the Explorer anyway.
 The deploy log then shows `starting zinder-explorer`. The Explorer composes
 transaction, block, search, and mempool reads through the container's own
 query endpoint at `127.0.0.1:9102`.
@@ -545,7 +550,9 @@ complete set.
 
 On `SIGTERM`, the entrypoint forwards the signal to the Explorer and to the
 wallet-serving entrypoint. It waits up to twenty-five seconds for both to stop,
-inside Railway's thirty-second drain window.
+inside Railway's thirty-second drain window. It exits non-zero when either
+stops with a failure status, such as a wallet-serving process that outlived
+its own drain window.
 
 ## Boundaries
 
