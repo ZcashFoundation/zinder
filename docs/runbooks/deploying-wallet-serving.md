@@ -98,32 +98,34 @@ These are optional:
 You can also set any variable in the
 [environment-variable reference](../architecture/public-interfaces.md#environment-variable-reference)
 whose "Used by" column names `zinder-ingest`, `zinder-projector`, or
-`zinder-query`. Each process rejects a `ZINDER_*` section that its binary does
-not define. For that reason, the entrypoint gives each process only the
-sections its binary defines:
+`zinder-query`. Each process rejects a `ZINDER_*` variable that its binary
+does not define. For that reason, the entrypoint gives each process only the
+variables its binary accepts:
 
-| Section | `zinder-ingest` | `zinder-projector` | `zinder-query` |
+| Variables | `zinder-ingest` | `zinder-projector` | `zinder-query` |
 | --- | --- | --- | --- |
-| `ZINDER_NETWORK__*`, `ZINDER_NODE__*`, `ZINDER_OPS__*`, `ZINDER_SECURITY__*` | yes | yes | yes |
-| `ZINDER_STORAGE__*`, `ZINDER_INGEST_CONTROL__*` | yes | yes | yes |
-| `ZINDER_INGEST__*`, `ZINDER_RETENTION__*` | yes | | |
+| `ZINDER_NETWORK__*`, `ZINDER_NODE__*`, `ZINDER_OPS__*`, `ZINDER_SECURITY__*`, `ZINDER_INGEST_CONTROL__*` | yes | yes | yes |
+| `ZINDER_STORAGE__CANONICAL__*`, `ZINDER_STORAGE__RAW_BLOB_POLICY` | yes | yes | yes |
+| `ZINDER_INGEST__*`, `ZINDER_RETENTION__*`, `ZINDER_STORAGE__MATERIALIZED_VIEWS__*` | yes | | |
 | `ZINDER_PROJECTOR__*`, `ZINDER_PROJECTOR_CONTROL__*` | | yes | |
-| `ZINDER_WALLET__*` | | yes | yes |
-| `ZINDER_QUERY__*` | | | yes |
+| `ZINDER_WALLET__ROCKSDB__*` | | yes | yes |
+| `ZINDER_QUERY__*`, `ZINDER_STORAGE__INITIAL_CATCHUP_TIMEOUT_MS`, `ZINDER_STORAGE__SECONDARY_CATCHUP_INTERVAL_MS`, `ZINDER_STORAGE__SECONDARY_REPLICA_LAG_THRESHOLD_CHAIN_EPOCHS`, `ZINDER_STORAGE__SERVING_PAIR_STALENESS_CEILING_MS` | | | yes |
 
 For example, `ZINDER_PROJECTOR__BUILD__MAX_TEMPORARY_FILE_BYTES_PER_SORTER`
-reaches only `zinder-projector`. A variable in a shared section reaches every
-process that defines it, so
-`ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES` applies to all three.
+and `ZINDER_STORAGE__SERVING_PAIR_STALENESS_CEILING_MS` each reach one
+process, while `ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES` applies to
+all three.
 
 No process receives the `ZINDER_WALLET_SERVING__*` variables, which configure
 the entrypoint itself, or the two bearer secrets. At startup the entrypoint
 logs the names of any other `ZINDER_*` variables that no process reads, such
-as a misspelled section. Check that line after you add a variable.
+as a misspelled section or storage key. Check that line after you add a
+variable.
 
 Storage paths, listen addresses, control endpoints, and bearer token paths are
-fixed in `deploy/config/wallet-serving/`. Do not override them: the shared
-sections would apply one value to all three processes.
+fixed in `deploy/config/wallet-serving/`. Do not override them: each process
+uses its own path, and a path variable such as `ZINDER_STORAGE__PATH` reaches
+more than one process.
 
 The wallet-serving ingest configuration sets
 `ingest.explorer_views = false` explicitly. Wallet projection and
@@ -385,17 +387,20 @@ Upstream outages and sync lag drain readiness the same way but clear on their
 own, so they are tolerated for an hour before the container terminates.
 
 A plane that flaps between ready and unready never stays down for an hour, so
-the supervisor also counts flap episodes. It terminates the container after
-six episodes, or after 900 seconds unready across episodes, unless the plane
-first stays ready for ten minutes. An unready stretch counts as an episode in
-two cases:
+the supervisor also tracks its unready stretches. It terminates the container
+after six episodes, or after 900 seconds unready in total, unless the plane
+first stays ready for ten minutes in a row. An unready stretch counts as an
+episode in two cases:
 
 - the plane's `/readyz` stops answering, which counts at once; or
 - the plane answers with an unready cause for at least 60 seconds.
 
-A shorter answered drain, such as the brief one at a new block, does not
-count. The supervisor logs each one as `recovered after <n>s unready, too
-brief to count toward the recurrence budget`.
+A shorter answered drain is not an episode, but its time still counts toward
+the 900 seconds and it restarts the ten-minute clock. An occasional brief
+drain therefore never restarts the container, while a plane that is unready
+most of the time in short bursts still does. The supervisor logs each short
+drain as `recovered after <n>s unready, too brief to count as an episode`,
+with the unready total so far.
 
 For Testnet, configure Zebra with `ready_max_blocks_behind = 4` and
 `ready_max_tip_age = "5m"`. The four-block limit is the bounded correction for

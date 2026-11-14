@@ -44,12 +44,12 @@ entrypoint_setting() {
   sed -n "s/^$1=\"\\{0,1\\}\\([^\"]*\\)\"\\{0,1\\}\$/\\1/p" "$entrypoint"
 }
 
-# The section lists and recurrence budgets come from the entrypoint itself, so
-# this test exercises the values the image ships.
-ingest_sections="$(entrypoint_setting ingest_sections)"
-projector_sections="$(entrypoint_setting projector_sections)"
-query_sections="$(entrypoint_setting query_sections)"
-entrypoint_sections="$(entrypoint_setting entrypoint_sections)"
+# The configuration path lists and recurrence budgets come from the entrypoint
+# itself, so this test exercises the values the image ships.
+ingest_config_paths="$(entrypoint_setting ingest_config_paths)"
+projector_config_paths="$(entrypoint_setting projector_config_paths)"
+query_config_paths="$(entrypoint_setting query_config_paths)"
+entrypoint_config_paths="$(entrypoint_setting entrypoint_config_paths)"
 recurrence_clear_window_seconds="$(entrypoint_setting recurrence_clear_window_seconds)"
 recurrence_episode_budget="$(entrypoint_setting recurrence_episode_budget)"
 recurrence_cumulative_unready_seconds_budget="$(
@@ -59,7 +59,8 @@ recurrence_min_answered_episode_seconds="$(
   entrypoint_setting recurrence_min_answered_episode_seconds
 )"
 for shipped_setting in \
-  "$ingest_sections" "$projector_sections" "$query_sections" "$entrypoint_sections" \
+  "$ingest_config_paths" "$projector_config_paths" "$query_config_paths" \
+  "$entrypoint_config_paths" \
   "$recurrence_clear_window_seconds" "$recurrence_episode_budget" \
   "$recurrence_cumulative_unready_seconds_budget" \
   "$recurrence_min_answered_episode_seconds"; do
@@ -188,7 +189,7 @@ recurrence_episode_count() {
 }
 
 # A brief answered drain at every block, as JSON-RPC mempool polling produces
-# at the tip, never adds up to a restart.
+# at the tip, is not an episode and spends only the cumulative budget.
 reset_recurrence
 poll_epoch=1000
 for _ in $(seq 1 40); do
@@ -199,6 +200,26 @@ for _ in $(seq 1 40); do
 done
 [ "$(recurrence_episode_count)" -eq 0 ] \
   || test_failure "brief answered drains counted as episodes"
+
+# A plane that is unready most of the time in brief answered drains escalates
+# on cumulative unready time.
+reset_recurrence
+poll_epoch=1000
+drain_cycles=0
+while [ "$recurrence_escalate" -eq 0 ] && [ "$drain_cycles" -lt 100 ]; do
+  poll_recurrence 0 0 "$poll_epoch"
+  poll_recurrence 0 0 $((poll_epoch + 15))
+  poll_recurrence 0 0 $((poll_epoch + 30))
+  poll_recurrence 1 0 $((poll_epoch + 45))
+  poll_epoch=$((poll_epoch + 60))
+  drain_cycles=$((drain_cycles + 1))
+done
+[ "$recurrence_escalate" -eq 1 ] \
+  || test_failure "brief answered drains 75% of the time never escalated"
+[ "$(recurrence_episode_count)" -eq 0 ] \
+  || test_failure "drains shorter than the minimum episode length counted as episodes"
+[ "$drain_cycles" -eq $((recurrence_cumulative_unready_seconds_budget / 45)) ] \
+  || test_failure "brief answered drains escalated after $drain_cycles cycles"
 
 # An answered drain that lasts the minimum episode length counts.
 reset_recurrence
@@ -223,15 +244,19 @@ done
 [ "$recurrence_escalate" -eq 1 ] \
   || test_failure "repeated unreachable episodes did not escalate"
 
-# A brief answered drain does not restart the sustained-recovery clock.
+# A brief answered drain restarts the sustained-recovery clock, and a full
+# clear window afterwards clears the recorded episode and drain time.
 reset_recurrence
 poll_recurrence 0 1 4000
 poll_recurrence 1 0 4015
 poll_recurrence 0 0 4300
 poll_recurrence 1 0 4315
 poll_recurrence 1 0 $((4015 + recurrence_clear_window_seconds))
-[ "$(recurrence_episode_count)" -eq 0 ] \
-  || test_failure "a brief drain postponed clearing a recorded episode"
+[ "$(recurrence_episode_count)" -eq 1 ] \
+  || test_failure "a brief drain did not restart the sustained-recovery clock"
+poll_recurrence 1 0 $((4315 + recurrence_clear_window_seconds))
+[ "$recurrence_state" = "0 0 0 0 4315" ] \
+  || test_failure "a full clear window left recurrence state '$recurrence_state'"
 
 for invalid_seconds in "" 0 010 1.5 -1 soon; do
   fail_message=""
@@ -242,7 +267,7 @@ fail_message=""
 require_positive_seconds TEST_DEADLINE_SECONDS 86400 \
   || test_failure "a deadline of 86400 was rejected: $fail_message"
 
-# Each process starts with the sections its binary defines. A stub setpriv on
+# Each process starts with the variables its binary accepts. A stub setpriv on
 # PATH records the environment variable names each process receives.
 scoping_root="$(mktemp -d)"
 trap 'rm -rf "$scoping_root"' EXIT
@@ -261,6 +286,9 @@ chmod +x "$scoping_root/bin/setpriv"
   export ZINDER_NETWORK__NAME=zcash-testnet
   export ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:18232
   export ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES=64
+  export ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_OPEN_FILES=64
+  export ZINDER_STORAGE__SERVING_PAIR_STALENESS_CEILING_MS=300000
+  export ZINDER_WALLET__SECONDARY_PATH=/var/lib/zinder/query/wallet-secondary
   export ZINDER_INGEST__FOLLOW__POLL_INTERVAL_MS=500
   export ZINDER_RETENTION__CHAIN_EVENT_RETENTION_HOURS=48
   export ZINDER_PROJECTOR__BUILD__MAX_TEMPORARY_FILE_BYTES_PER_SORTER=128849018880
@@ -272,11 +300,11 @@ chmod +x "$scoping_root/bin/setpriv"
   export CHECKPOINT_BEARER_TOKEN=fixture-token
   stub_path="$scoping_root/bin:$PATH"
   PATH="$stub_path" start_runtime_process \
-    /usr/local/bin/zinder-ingest /etc/zinder/ingest.toml "$ingest_sections"
+    /usr/local/bin/zinder-ingest /etc/zinder/ingest.toml "$ingest_config_paths"
   PATH="$stub_path" start_runtime_process \
-    /usr/local/bin/zinder-projector /etc/zinder/projector.toml "$projector_sections"
+    /usr/local/bin/zinder-projector /etc/zinder/projector.toml "$projector_config_paths"
   PATH="$stub_path" start_runtime_process \
-    /usr/local/bin/zinder-query /etc/zinder/query.toml "$query_sections"
+    /usr/local/bin/zinder-query /etc/zinder/query.toml "$query_config_paths"
   wait
 )
 
@@ -303,6 +331,9 @@ assert_received_by ZINDER_NETWORK__NAME zinder-ingest zinder-projector zinder-qu
 assert_received_by ZINDER_NODE__JSON_RPC_ADDR zinder-ingest zinder-projector zinder-query
 assert_received_by ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES \
   zinder-ingest zinder-projector zinder-query
+assert_received_by ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_OPEN_FILES zinder-ingest
+assert_received_by ZINDER_STORAGE__SERVING_PAIR_STALENESS_CEILING_MS zinder-query
+assert_received_by ZINDER_WALLET__SECONDARY_PATH zinder-query
 assert_received_by ZINDER_INGEST__FOLLOW__POLL_INTERVAL_MS zinder-ingest
 assert_received_by ZINDER_RETENTION__CHAIN_EVENT_RETENTION_HOURS zinder-ingest
 assert_received_by ZINDER_PROJECTOR__BUILD__MAX_TEMPORARY_FILE_BYTES_PER_SORTER zinder-projector
@@ -317,10 +348,13 @@ unread_names="$(
   ZINDER_EXPLORER__LISTEN_ADDR=127.0.0.1:9068 \
     ZINDER_WALLET_SERVING__WALLET_CONSTRUCTION_DEADLINE_SECONDS=43200 \
     ZINDER_QUERY__PAIR_CONVERGENCE_ATTEMPTS=8 \
+    ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES=64 \
+    ZINDER_STORAGE__CANONICAL_PAHT=/misspelled \
     zinder_variables_outside \
-    "$ingest_sections $projector_sections $query_sections $entrypoint_sections"
+    "$ingest_config_paths $projector_config_paths $query_config_paths $entrypoint_config_paths" \
+    | sort | tr '\n' ' '
 )"
-[ "$unread_names" = "ZINDER_EXPLORER__LISTEN_ADDR" ] \
+[ "$unread_names" = "ZINDER_EXPLORER__LISTEN_ADDR ZINDER_STORAGE__CANONICAL_PAHT " ] \
   || test_failure "variables no process reads were reported as '$unread_names'"
 
 # The container healthcheck runs as its own process, so it is exercised with a

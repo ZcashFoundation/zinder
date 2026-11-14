@@ -2,7 +2,7 @@
 //! the `zinder-projector` loader accepts.
 
 use zinder_runtime::ENVIRONMENT_VARIABLES;
-use zinder_testkit::{EnvVarContractProbe, wallet_serving_entrypoint_sections};
+use zinder_testkit::EnvVarContractProbe;
 
 const BINARY: &str = "zinder-projector";
 
@@ -44,7 +44,9 @@ fn every_variable_the_loader_accepts_is_documented() -> eyre::Result<()> {
 }
 
 #[test]
-fn wallet_serving_entrypoint_passes_every_section_the_loader_defines() -> eyre::Result<()> {
-    EnvVarContractProbe::new(env!("CARGO_BIN_EXE_zinder-projector"))
-        .check_top_level_sections(wallet_serving_entrypoint_sections("projector")?)
+fn wallet_serving_entrypoint_routes_exactly_the_accepted_variables() -> eyre::Result<()> {
+    EnvVarContractProbe::new(env!("CARGO_BIN_EXE_zinder-projector")).check_wallet_serving_routing(
+        "projector",
+        ENVIRONMENT_VARIABLES.iter().map(|env_var| env_var.name),
+    )
 }

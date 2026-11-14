@@ -66,7 +66,7 @@ pub use commitment_tree_fixtures::{
     FIXTURE_NOTE_COMMITMENT, completed_sapling_subtree_frontier, completed_subtree_frontier,
     one_leaf_frontier, one_leaf_sapling_frontier,
 };
-pub use env_var_contract::{EnvVarContractProbe, wallet_serving_entrypoint_sections};
+pub use env_var_contract::EnvVarContractProbe;
 pub use ingest_control_fixture::{IngestControlFixture, IngestControlFixtureService};
 pub use json_rpc_test_server::{
     JsonRpcRequest, JsonRpcStub, JsonRpcStubBuilder, JsonRpcTestServer, RpcReply, method,

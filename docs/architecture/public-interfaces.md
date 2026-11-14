@@ -252,7 +252,7 @@ ZINDER_COMPAT__SERVING
 
 `ZINDER_WALLET_SERVING__*` variables configure the wallet-serving image
 entrypoint rather than a binary. The entrypoint reads them itself and passes
-each process only the `ZINDER_*` sections its binary defines, as
+each process only the `ZINDER_*` variables its binary accepts, as
 [Wallet-serving deployment](../runbooks/deploying-wallet-serving.md#service-configuration)
 describes.
 
