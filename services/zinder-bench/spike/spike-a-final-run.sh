@@ -84,18 +84,42 @@ arm2-density)
     --label arm2-density-x$K
   rm -rf "$WORK/arm2-density$K-$MODE" "$WORK/arm2-density$K-$MODE.secondary"
   ;;
+dense-prep)
+  # Combined store whose newest 1000 blocks are the densest 1000-block Testnet
+  # window of the fixture (4617272..4618271, 197.7 MB of raw blocks). The
+  # replay doubles as a repeat of Arm 1 combined over 48,149 blocks.
+  run dense-prep-combined $SPIKE replay --fixture "$FIX" --golden "$(golden combined)" \
+    --work "$WORK/dense-combined" --mode combined --through-height 4618271 \
+    --secondary-dir "$WORK/dense-combined.secondary" --secondary-poll-ms 1000 \
+    --samples "$OUT/arm1-repeat-to-4618271-combined.samples.jsonl" \
+    --report "$OUT/arm1-repeat-to-4618271-combined.json" --label arm1-repeat-partial
+  ;;
+arm2-dense)
+  K=${1:?multiplier}; COUNT=${2:-5}; shift 2 || true
+  run arm2-dense-x$K $SPIKE reorg --fixture "$FIX" --golden "$WORK/dense-combined" \
+    --work "$WORK/arm2-dense-x$K" --mode combined --count $COUNT --depth 1000 --density-multiplier $K \
+    --secondary-dir "$WORK/arm2-dense-x$K.secondary" --report "$OUT/arm2-dense-x$K-combined.json" \
+    --label arm2-dense-x$K "$@"
+  rm -rf "$WORK/arm2-dense-x$K" "$WORK/arm2-dense-x$K.secondary"
+  ;;
 density)
-  K=${1:?multiplier}
-  for MODE in canonical-only combined; do
-    run density$K-$MODE $SPIKE replay --fixture "$FIX" --golden "$(golden $MODE)" \
-      --work "$WORK/density$K-$MODE" --mode $MODE --density-multiplier $K \
-      --secondary-dir "$WORK/density$K-$MODE.secondary" --secondary-poll-ms 1000 \
-      --samples "$OUT/density$K-$MODE.samples.jsonl" --report "$OUT/density$K-$MODE.json" \
-      --label density-x$K
-    rm -rf "$WORK/density$K-$MODE" "$WORK/density$K-$MODE.secondary"
+  # Lanes per block are clamped so no scaled block exceeds the 2,000,000-byte
+  # consensus maximum (CLAMP=none disables the clamp; TAG names the reports).
+  K=${1:?multiplier}; CLAMP=${CLAMP:-2000000}; TAG=${TAG:-density$K}
+  CLAMP_ARGS=""; [ "$CLAMP" != none ] && CLAMP_ARGS="--density-max-block-bytes $CLAMP"
+  MODES=${MODES:-canonical-only combined}
+  for MODE in $MODES; do
+    run $TAG-$MODE $SPIKE replay --fixture "$FIX" --golden "$(golden $MODE)" \
+      --work "$WORK/$TAG-$MODE" --mode $MODE --density-multiplier $K $CLAMP_ARGS \
+      --secondary-dir "$WORK/$TAG-$MODE.secondary" --secondary-poll-ms 1000 \
+      --samples "$OUT/$TAG-$MODE.samples.jsonl" --report "$OUT/$TAG-$MODE.json" \
+      --label $TAG
+    rm -rf "$WORK/$TAG-$MODE" "$WORK/$TAG-$MODE.secondary" "$WORK/$TAG-$MODE.control"
   done
-  run compare-density$K $SPIKE compare --baseline "$OUT/density$K-canonical-only.json" \
-    --combined "$OUT/density$K-combined.json" --report "$OUT/compare-density$K.json"
+  if [ -f "$OUT/$TAG-canonical-only.json" ] && [ -f "$OUT/$TAG-combined.json" ]; then
+    run compare-$TAG $SPIKE compare --baseline "$OUT/$TAG-canonical-only.json" \
+      --combined "$OUT/$TAG-combined.json" --report "$OUT/compare-$TAG.json"
+  fi
   ;;
 arm3-one)
   MODE=${1:?mode}; LANES=${2:?lanes}; PROFILE=${3:-summed}; TAG=${4:-arm3}

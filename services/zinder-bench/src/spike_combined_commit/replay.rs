@@ -77,6 +77,10 @@ pub(crate) struct ReplayArgs {
     /// Per-block row volume multiplier for the synthetic density arm (1 = real rows only).
     #[arg(long, default_value_t = 1)]
     density_multiplier: u32,
+    /// Clamp each block's density lanes so the scaled block stays within this
+    /// many raw block bytes (the consensus maximum is 2,000,000).
+    #[arg(long)]
+    density_max_block_bytes: Option<u64>,
     /// Background mirror lanes written per committed block (Arm 3; 0 = off).
     #[arg(long, default_value_t = 0)]
     pressure_lanes: u32,
@@ -325,6 +329,11 @@ pub(crate) struct ReplayReport {
     /// Pressure writer bytes divided by the committed batches' bytes.
     pub(crate) pressure_to_commit_bytes_ratio: Option<f64>,
     pub(crate) density_mirror_counts: MirrorCounts,
+    pub(crate) density_max_block_bytes: Option<u64>,
+    /// Blocks whose lane count the block-size clamp reduced.
+    pub(crate) density_clamped_blocks: u64,
+    /// Mean lanes applied per block (density_multiplier - 1 without clamping).
+    pub(crate) density_mean_lanes_applied: f64,
     /// (canonical + wallet + mirror) batch bytes divided by (canonical + wallet).
     pub(crate) density_effective_byte_multiplier: f64,
     pub(crate) open_seconds: f64,
@@ -414,6 +423,9 @@ pub(crate) struct Committer {
     pub(crate) activations: Arc<NetworkUpgradeActivations>,
     pub(crate) wallet_max: NonZeroU64,
     pub(crate) density_lanes: u8,
+    pub(crate) density_max_block_bytes: Option<u64>,
+    pub(crate) density_clamped_blocks: u64,
+    pub(crate) density_lanes_applied_total: u64,
     pub(crate) mirror_names: MirrorFamilyNames,
     pub(crate) pressure: Option<PressureWriter>,
     pub(crate) pressure_families: MirrorFamilies,
@@ -451,6 +463,18 @@ impl Committer {
         mut perf: Option<&mut PerfProbe>,
     ) -> Result<CommitPhases, BenchError> {
         let mut phases = CommitPhases::default();
+        let block_lanes = match self.density_max_block_bytes {
+            Some(max_bytes) if derived.source_bytes > 0 => {
+                let fit = (max_bytes / derived.source_bytes).saturating_sub(1);
+                self.density_lanes
+                    .min(u8::try_from(fit).unwrap_or(u8::MAX))
+            }
+            _ => self.density_lanes,
+        };
+        if block_lanes < self.density_lanes {
+            self.density_clamped_blocks += 1;
+        }
+        self.density_lanes_applied_total += u64::from(block_lanes);
         let store = self
             .store
             .take()
@@ -517,7 +541,7 @@ impl Committer {
                 canonical_rows,
                 wallet: wallet_ops,
             };
-            if self.density_lanes > 0 {
+            if block_lanes > 0 {
                 let before = batch.size_in_bytes();
                 let overlay = mirror_overlay.insert(SpikeMirrorPlanOverlay::default());
                 let counts = apply_lanes(
@@ -525,7 +549,7 @@ impl Committer {
                     &self.mirror_names,
                     &mut batch,
                     &work,
-                    1..=self.density_lanes,
+                    1..=block_lanes,
                     MirrorFamilies::All,
                     true,
                     Some(&mut self.density_accumulator),
@@ -848,6 +872,9 @@ pub(crate) async fn run_replay(args: ReplayArgs) -> Result<ReplayReport, BenchEr
         wallet_max: NonZeroU64::new(args.wallet_max_transition_bytes)
             .ok_or_else(|| BenchError::invalid_argument("wallet ceiling must be non-zero"))?,
         density_lanes,
+        density_max_block_bytes: args.density_max_block_bytes,
+        density_clamped_blocks: 0,
+        density_lanes_applied_total: 0,
         mirror_names,
         pressure,
         pressure_families: args.pressure_families,
@@ -874,6 +901,8 @@ pub(crate) async fn run_replay(args: ReplayArgs) -> Result<ReplayReport, BenchEr
         wallet,
         pressure,
         density_counts,
+        density_clamped_blocks,
+        density_lanes_applied_total,
         ..
     } = committer;
     let store = store.ok_or_else(|| BenchError::spike("canonical store handle lost"))?;
@@ -1028,6 +1057,9 @@ pub(crate) async fn run_replay(args: ReplayArgs) -> Result<ReplayReport, BenchEr
         }),
         pressure: pressure_stats,
         density_mirror_counts: density_counts,
+        density_max_block_bytes: args.density_max_block_bytes,
+        density_clamped_blocks,
+        density_mean_lanes_applied: density_lanes_applied_total as f64 / (blocks.max(1) as f64),
         density_effective_byte_multiplier: {
             let real = summarize_values(&series.canonical_bytes).total
                 + summarize_values(&series.wallet_bytes).total;

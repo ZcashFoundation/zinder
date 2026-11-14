@@ -92,6 +92,10 @@ pub(crate) struct ReorgArgs {
     /// Per-block row volume multiplier: N - 1 mirror lanes ride in each replacement batch.
     #[arg(long, default_value_t = 1)]
     density_multiplier: u32,
+    /// After the last replacement, cold-recompute the combined wallet rows and
+    /// require them to equal the READY evidence.
+    #[arg(long, default_value_t = false)]
+    cold_readback: bool,
 }
 
 /// One measured replacement.
@@ -170,7 +174,10 @@ pub(crate) struct ReorgReport {
     pub(crate) stalls: StallSummary,
     pub(crate) properties: PropertySamples,
     pub(crate) final_fence: FenceView,
+    pub(crate) wallet_before: Option<WalletView>,
     pub(crate) wallet_final: Option<WalletView>,
+    /// Seconds of the cold readback that matched the READY evidence.
+    pub(crate) cold_readback_seconds: Option<f64>,
     pub(crate) ceilings: Vec<ThresholdCheck>,
 }
 
@@ -245,6 +252,9 @@ pub(crate) async fn run_reorg(args: ReorgArgs) -> Result<ReorgReport, BenchError
             .spike_bounded_open()
             .statistics,
     );
+    let wallet_before = wallet
+        .as_ref()
+        .map(|wallet| WalletView::from(wallet.ready_evidence()));
     let sampler = PropertySampler::spawn(
         Arc::clone(&db),
         db.cf_names(),
@@ -408,6 +418,11 @@ pub(crate) async fn run_reorg(args: ReorgArgs) -> Result<ReorgReport, BenchError
     let properties = sampler.finish();
     let tickers = ticker_delta(&tickers_before, &ticker_snapshot(&statistics));
     let peak = peak_rss_bytes();
+    let mut cold_readback_seconds = None;
+    if let (true, Some(wallet)) = (args.cold_readback, wallet.as_ref()) {
+        let readback = wallet.spike_cold_readback(512 * 1024 * 1024)?;
+        cold_readback_seconds = Some(readback.elapsed.as_secs_f64());
+    }
     let max_wallet_logical = replacements
         .iter()
         .map(|sample| sample.scaled_wallet_plan_logical_bytes)
@@ -518,9 +533,11 @@ pub(crate) async fn run_reorg(args: ReorgArgs) -> Result<ReorgReport, BenchError
         stalls: stalls.summary(),
         properties,
         final_fence: FenceView::from(store.event_fence()),
+        wallet_before,
         wallet_final: wallet
             .as_ref()
             .map(|wallet| WalletView::from(wallet.ready_evidence())),
+        cold_readback_seconds,
         ceilings,
     })
 }
