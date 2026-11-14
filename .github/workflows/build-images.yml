@@ -80,6 +80,23 @@ jobs:
         run: |
           set -euo pipefail
 
+          # The release verifies each image by exporting its filesystem to a
+          # local directory, which fails on directories the runner user
+          # cannot traverse, so the smoke build performs the same export.
+          export_image_root() {
+            local image_root="${RUNNER_TEMP}/image-root"
+            rm -rf "$image_root"
+            docker buildx build \
+              --file deploy/Dockerfile \
+              --target "$1" \
+              --platform "$PLATFORM_REF" \
+              --build-arg "ZINDER_BUILD_GIT_COMMIT=${SMOKE_BUILD_GIT_COMMIT}" \
+              --output "type=local,dest=${image_root}" \
+              --cache-from "type=gha,scope=${CACHE_SCOPE}" \
+              .
+            rm -rf "$image_root"
+          }
+
           image_names="$(
             jq -r '.[]' <<< "$RELEASE_IMAGES_JSON"
             printf '%s\n' zinder-explorer
@@ -100,6 +117,7 @@ jobs:
             docker image inspect "${image_name}:${PR_TAG}" \
               --format 'image={{.Id}} size_bytes={{.Size}}'
             docker run --rm --entrypoint="$image_name" "${image_name}:${PR_TAG}" --help
+            export_image_root "$image_name"
           done <<< "$image_names"
 
           # Single-volume host images wrap the runtime binaries in an
@@ -122,4 +140,5 @@ jobs:
             docker run --rm --entrypoint=zinder-ingest "${image_name}:${PR_TAG}" --help
             image_entrypoint="$(docker image inspect "${image_name}:${PR_TAG}" --format '{{index .Config.Entrypoint 0}}')"
             docker run --rm --entrypoint=sh "${image_name}:${PR_TAG}" -c 'test -x "$(command -v "$1")"' sh "$image_entrypoint"
+            export_image_root "$image_name"
           done <<< "$single_volume_image_names"
