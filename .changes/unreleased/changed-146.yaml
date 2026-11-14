@@ -1,6 +1,0 @@
-kind: changed
-body: "`zinder-ingest` now refuses to start when `ingest.construction.source_segment_max_blocks` (`ZINDER_INGEST__CONSTRUCTION__SOURCE_SEGMENT_MAX_BLOCKS`) is above 1000. Each block in a source segment is one JSON-RPC batch entry, and Zakura refuses batches with more than 1,000 entries. The default of 64 is unaffected. If you set a larger value, lower it to 1000 or less before upgrading."
-time: 2026-11-13T12:00:00Z
-custom:
-  Bump: minor
-  PR: "146"

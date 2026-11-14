@@ -1,6 +1,0 @@
-kind: added
-body: "Zinder now certifies Zakura 1.8.6 as a node runtime alongside Zebra 7.0.0. The live and lightwalletd parity suites run against both nodes on the same Regtest schedule through NU7, nightly and on pull requests that touch node-facing code, and a release requires both nodes to pass. `deploy/zakura/regtest.toml` starts a Zakura Regtest node on that schedule. `deploy/zebra/regtest.toml` now includes the same zero-value NU6.1 lockbox disbursement that Zakura requires, so both nodes use the same funding configuration."
-time: 2026-11-13T12:00:00Z
-custom:
-  Bump: minor
-  PR: "149"

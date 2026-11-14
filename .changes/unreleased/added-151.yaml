@@ -1,6 +1,0 @@
-kind: added
-body: "Compose deployments can now stream mempool events from a node whose indexer gRPC listener requires mutual TLS, such as a Zakura node in another container. Merge `deploy/docker-compose.indexer-tls.yml`, set `ZINDER_NODE__INDEXER_GRPC_ADDR` to the node's `https://` indexer URL, and set `ZINDER_INDEXER_TLS_DIR` to a directory that holds `ca.pem`, `client.pem`, and `client-key.pem`."
-time: 2026-11-13T12:00:00Z
-custom:
-  Bump: minor
-  PR: "151"

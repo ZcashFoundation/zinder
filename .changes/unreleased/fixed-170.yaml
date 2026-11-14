@@ -1,6 +1,0 @@
-kind: fixed
-body: "Explorer views now publish the transparent-address ranking, so `ExplorerQuery.ServerInfo` advertises `explorer.transparent_address.activity_v2` and `explorer.transparent_address.ranking_v1`, and `TransparentAddressActivity` returns address summaries. A fresh Explorer views build includes the ranking from genesis. A store built by Zinder 0.10.0 needs no rebuild: after the upgrade, `zinder-ingest` builds the ranking from canonical history while the other views keep following the tip, logs `transparent_address_ranking_activated` when it serves, and resumes the build after a restart."
-time: 2026-11-14T12:00:00Z
-custom:
-  Bump: patch
-  PR: "170"

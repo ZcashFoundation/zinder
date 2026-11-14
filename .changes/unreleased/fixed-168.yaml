@@ -1,6 +1,0 @@
-kind: fixed
-body: "`zinder-ingest` now stops within the wallet-serving supervisor's 20-second grace window when it is terminated while fresh canonical construction streams blocks. SST finalization and publication cannot be interrupted, so ingest finishes them before it exits. Construction stops without admitting a store, and the next start rebuilds it, or installs a staged READY store when publication had already finished. During construction, ingest no longer logs `mempool_durable_replay_failed` or `mempool_event_retention_failed` with `DeadlineExceeded`, because the mempool owner and mempool-event retention now start only after the writer admits a READY store."
-time: 2026-11-14T12:00:00Z
-custom:
-  Bump: patch
-  PR: "168"
