@@ -49,7 +49,7 @@ variant of it also runs `zinder-explorer`, and the Explorer has its own runtime
 image for hosts that share a volume across containers.
 
 Tagged releases also provide checksum-bound GNU/Linux bundles containing these
-same 4 executables for `x86_64-v3` and AArch64 hosts. The x86 archive
+same 4 executables plus `zinder-explorer` for `x86_64-v3` and AArch64 hosts. The x86 archive
 requires an x86-64-v3 CPU; both archives require glibc 2.34 or newer and
 dynamic `libstdc++.so.6` with `GLIBCXX_3.4.30`, with Debian 12 Bookworm as the
 certified runtime baseline. Each archive is accompanied by an SPDX 2.3 SBOM

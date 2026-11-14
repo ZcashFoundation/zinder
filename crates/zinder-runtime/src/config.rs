@@ -134,8 +134,9 @@ pub enum ConfigError {
     /// TLS material from files only.
     #[error(
         "environment variable `{original_name}` carries PEM text, which Zinder binaries do not \
-         read from the environment. Only the zinder-canonical-runtime and zinder-wallet-serving \
-         image entrypoints accept it, by writing the value to a file. Elsewhere, mount the PEM \
+         read from the environment. Only the zinder-canonical-runtime, zinder-wallet-serving, and \
+         zinder-wallet-serving-explorer image entrypoints accept it, by writing the value to a \
+         file. Elsewhere, mount the PEM \
          file and set `{path_name}` to its path."
     )]
     EntrypointOnlyEnvVar {

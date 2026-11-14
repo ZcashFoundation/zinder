@@ -228,9 +228,9 @@ platform that can deliver a secret as a file, including Kubernetes secret
 volumes, Docker and Compose secrets under `/run/secrets`, systemd
 `LoadCredential`, and Vault Agent.
 
-Some platforms deliver secrets only as environment variables. For them, the two
-single-volume images, `zinder-canonical-runtime` and `zinder-wallet-serving`,
-start as root and accept three entrypoint-only variables:
+Some platforms deliver secrets only as environment variables. For them, the
+three single-volume images, `zinder-canonical-runtime`, `zinder-wallet-serving`,
+and `zinder-wallet-serving-explorer`, start as root and accept three entrypoint-only variables:
 `ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM`,
 `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM`, and
 `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM`. The shared fragment
@@ -253,10 +253,13 @@ before any runtime process starts:
 No runtime process receives a `*_PEM` variable. The canonical image starts
 `zinder-ingest` through `exec env -u`. The wallet-serving image keeps a
 supervising shell, so after materializing it re-executes itself through
-`exec env -u`. The supervising shell's initial environment, which
+`exec env -u`. The wallet-serving Explorer image materializes and re-executes
+the same way before it starts either the wallet-serving entrypoint, which then
+finds no `*_PEM` variable, or `zinder-explorer`, which receives the same
+`*_PATH` variables. The supervising shell's initial environment, which
 `/proc/1/environ` exposes, and every process it starts then hold paths only. A
 Zinder binary that does receive a `*_PEM` variable refuses to start with an
-error that names the two images and the `*_PATH` variable to use instead. The
+error that names the three images and the `*_PATH` variable to use instead. The
 per-binary images have no root entrypoint and accept files only.
 
 The platform's own environment views, health checks, and `exec` sessions can
@@ -356,3 +359,7 @@ translations.
   entrypoints convert `*_PEM` variables into files for env-only platforms.
   Recorded why an egress proxy and in-process environment reads were not
   chosen, and that ADR-0006's exclusions cover IngestControl only.
+- 2026-11-14: Added `zinder-wallet-serving-explorer` as the third single-volume
+  image that accepts the entrypoint-only `*_PEM` variables, and described how
+  its entrypoint delivers the materialized paths to both the wallet-serving
+  processes and `zinder-explorer`.

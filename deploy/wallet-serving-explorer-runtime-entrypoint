@@ -6,9 +6,9 @@ set -eu
 # zinder-projector, and zinder-query over /var/lib/zinder, and starts
 # zinder-explorer once native wallet serving answers. The Explorer opens the
 # materialized-view store that ingest writes and composes its wallet reads
-# through zinder-query. When either side exits, the other is stopped and the
-# container ends, so the platform restarts a complete set instead of leaving
-# one half serving.
+# through zinder-query. A wallet-serving exit stops the Explorer and ends the
+# container. An Explorer exit restarts only the Explorer, with a growing delay,
+# because an Explorer view failure must not take wallet serving down.
 
 # Indexer TLS values delivered as *_PEM variables become root-prepared files
 # readable only by zinder before either side starts, so the Explorer receives
@@ -34,6 +34,11 @@ explorer_secondary_path="/var/lib/zinder/explorer/secondary"
 poll_interval_seconds=15
 nofile_limit=65536
 
+# An Explorer that keeps exiting is restarted after a delay that doubles up to
+# the maximum, and returns to the initial delay once a run lasts that long.
+explorer_restart_initial_seconds=15
+explorer_restart_max_seconds=300
+
 # Railway drains this container for 30 seconds, and the wallet-serving
 # entrypoint gives its own processes 20 of them.
 shutdown_grace_seconds=25
@@ -41,6 +46,9 @@ shutdown_grace_seconds=25
 wallet_serving_pid=""
 wallet_serving_status=0
 explorer_pid=""
+explorer_started_at=0
+explorer_restart_at=0
+explorer_restart_delay_seconds=0
 sleep_pid=""
 
 log() {
@@ -118,6 +126,28 @@ collect_wallet_serving_status() {
   fi
 }
 
+# Runs zinder-explorer as zinder with the given extra arguments. The Explorer
+# shares only [network] and [node] with the wallet-serving processes; its
+# storage, listeners, and bind policy come from its own config.
+run_explorer() {
+  for variable_name in $(env | sed -n 's/^\(ZINDER_[A-Z0-9_]*\)=.*/\1/p'); do
+    case "$variable_name" in
+      ZINDER_NETWORK__* | ZINDER_NODE__* | ZINDER_EXPLORER__*) ;;
+      *) unset "$variable_name" ;;
+    esac
+  done
+  unset INGEST_CONTROL_BEARER_TOKEN CHECKPOINT_BEARER_TOKEN
+  exec setpriv --reuid=zinder --regid=zinder --init-groups --no-new-privs \
+    "$explorer_binary" --config "$explorer_config_path" "$@"
+}
+
+start_explorer() {
+  log "starting zinder-explorer"
+  (run_explorer) &
+  explorer_pid="$!"
+  explorer_started_at="$(date +%s)"
+}
+
 # The runtime shell implements the open-file resource POSIX leaves undefined.
 # shellcheck disable=SC3045
 ulimit -n "$nofile_limit" \
@@ -125,6 +155,12 @@ ulimit -n "$nofile_limit" \
 
 mkdir -p "$explorer_secondary_path"
 chown -R zinder:zinder "$(dirname "$explorer_secondary_path")"
+
+# An invalid Explorer configuration fails the deployment here, before wallet
+# serving spends hours building readiness, instead of on every Explorer start.
+if ! (run_explorer --print-config) >/dev/null; then
+  fail "zinder-explorer rejected its configuration; wallet serving was not started"
+fi
 
 # Every Zinder binary rejects a ZINDER_* variable naming a section it does not
 # own, so ZINDER_EXPLORER__* overrides reach only the Explorer.
@@ -149,21 +185,7 @@ until "$wallet_serving_healthcheck" >/dev/null 2>&1; do
   sleep_interruptibly "$poll_interval_seconds"
 done
 
-# The Explorer shares only [network] and [node] with the wallet-serving
-# processes; its storage, listeners, and bind policy come from its own config.
-log "starting zinder-explorer"
-(
-  for variable_name in $(env | sed -n 's/^\(ZINDER_[A-Z0-9_]*\)=.*/\1/p'); do
-    case "$variable_name" in
-      ZINDER_NETWORK__* | ZINDER_NODE__* | ZINDER_EXPLORER__*) ;;
-      *) unset "$variable_name" ;;
-    esac
-  done
-  unset INGEST_CONTROL_BEARER_TOKEN CHECKPOINT_BEARER_TOKEN
-  exec setpriv --reuid=zinder --regid=zinder --init-groups --no-new-privs \
-    "$explorer_binary" --config "$explorer_config_path"
-) &
-explorer_pid="$!"
+start_explorer
 
 while true; do
   sleep_interruptibly "$poll_interval_seconds"
@@ -175,10 +197,25 @@ while true; do
     stop_and_exit "$wallet_serving_status"
   fi
 
-  if ! is_alive "$explorer_pid"; then
+  now="$(date +%s)"
+  if [ -n "$explorer_pid" ] && ! is_alive "$explorer_pid"; then
     explorer_status=0
     wait "$explorer_pid" || explorer_status="$?"
     explorer_pid=""
-    fail "zinder-explorer exited with status $explorer_status; stopping the wallet-serving processes"
+    explorer_uptime_seconds=$((now - explorer_started_at))
+    if [ "$explorer_uptime_seconds" -ge "$explorer_restart_max_seconds" ] \
+      || [ "$explorer_restart_delay_seconds" -eq 0 ]; then
+      explorer_restart_delay_seconds="$explorer_restart_initial_seconds"
+    fi
+    log "zinder-explorer exited with status $explorer_status after ${explorer_uptime_seconds}s; wallet serving continues; restarting zinder-explorer in ${explorer_restart_delay_seconds}s"
+    explorer_restart_at=$((now + explorer_restart_delay_seconds))
+    explorer_restart_delay_seconds=$((explorer_restart_delay_seconds * 2))
+    if [ "$explorer_restart_delay_seconds" -gt "$explorer_restart_max_seconds" ]; then
+      explorer_restart_delay_seconds="$explorer_restart_max_seconds"
+    fi
+  fi
+
+  if [ -z "$explorer_pid" ] && [ "$now" -ge "$explorer_restart_at" ]; then
+    start_explorer
   fi
 done

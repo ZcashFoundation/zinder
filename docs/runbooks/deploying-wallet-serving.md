@@ -472,7 +472,12 @@ processes.
 
 ### Explorer startup
 
-The entrypoint starts the wallet-serving entrypoint first. It starts
+The entrypoint first checks the Explorer configuration with
+`zinder-explorer --print-config`. A rejected configuration, such as an
+unreadable `ZINDER_EXPLORER__BEARER_TOKEN_PATH`, ends the container before
+wallet serving starts, so the deployment fails at once instead of hours later.
+
+The entrypoint then starts the wallet-serving entrypoint. It starts
 `zinder-explorer` once `zinder-wallet-serving-healthcheck` passes, which
 happens when query `/readyz` answers 200 or reports `reorg_window_exceeded`.
 The deploy log then shows `starting zinder-explorer`. The Explorer composes
@@ -486,12 +491,30 @@ beneath the canonical path and builds the views from canonical heights while it
 keeps following the chain. Each Explorer response reports how far the views
 trail the chain in `ExplorerFreshness`.
 
-A view store that another release built can fail admission. Ingest then
-reports `ConsumerNotDeclared` or `ExplorerViewManifestRequiresFreshStore` and
-leaves the store unchanged. Rebuild the Explorer views on a fresh
-materialized-view path, as
-[Materialized-view plane](../architecture/materialized-view-plane.md#runtime-selection)
-describes.
+### Rebuild the Explorer views
+
+A view store that another release built can fail admission. Ingest then logs
+`materialized_view_store_open_failed` with `ConsumerNotDeclared` or
+`ExplorerViewManifestRequiresFreshStore` and keeps serving wallets without
+Explorer views. The Explorer exits with the same error on every start, and
+the entrypoint keeps restarting it. Neither process changes the store.
+
+This image fixes the store path at
+`/var/lib/zinder/canonical/materialized-views`. To rebuild the views:
+
+1. Record the capabilities `ExplorerQuery.ServerInfo` advertised before the
+   upgrade. They are the coverage the rebuilt store must reach again.
+2. Open a shell in the running container, for example with `railway ssh`.
+   Neither process holds the refused store open.
+3. Move the store aside on the same volume:
+   `mv /var/lib/zinder/canonical/materialized-views /var/lib/zinder/materialized-views.previous`.
+4. Restart the deployment. Ingest creates a store with the current manifest and
+   rebuilds the views from canonical history while wallet serving continues.
+5. Delete `/var/lib/zinder/materialized-views.previous` only after
+   `ExplorerQuery.ServerInfo` reports zero `lag_blocks` and advertises every
+   capability recorded in step 1, as
+   [Rebuild Explorer views after a manifest change](deploying-on-a-vm.md#rebuild-explorer-views-after-a-manifest-change)
+   describes.
 
 ### Explorer ports
 
@@ -509,18 +532,20 @@ Both bind `[::]` because the Railway private network is IPv6-only. Clients reach
 Watch Explorer `/readyz` on port 9069 in monitoring. The Railway deploy-time
 healthcheck does not cover it.
 
-The container terminates with a non-zero status in two cases:
+An Explorer failure does not stop wallet serving. When `zinder-explorer`
+exits, the entrypoint logs its status and restarts it after 15 seconds. The
+delay doubles on each further exit, up to 5 minutes, and returns to 15 seconds
+after a run that lasts 5 minutes. The container's `HEALTHCHECK` reports
+unhealthy while the Explorer is down.
 
-- `zinder-explorer` exits. The entrypoint stops the wallet-serving processes
-  first.
-- The wallet-serving entrypoint exits for any reason in
-  [Failure handling](#failure-handling). The entrypoint stops the Explorer
-  first.
+The container terminates with a non-zero status when the wallet-serving
+entrypoint exits for any reason in [Failure handling](#failure-handling). The
+entrypoint stops the Explorer first, and the restart policy then restarts the
+complete set.
 
-The restart policy then restarts the complete set. On `SIGTERM`, the
-entrypoint forwards the signal to the Explorer and to the wallet-serving
-entrypoint. It waits up to twenty-five seconds for both to stop, inside
-Railway's thirty-second drain window.
+On `SIGTERM`, the entrypoint forwards the signal to the Explorer and to the
+wallet-serving entrypoint. It waits up to twenty-five seconds for both to stop,
+inside Railway's thirty-second drain window.
 
 ## Boundaries
 
