@@ -168,6 +168,9 @@ pub(crate) struct InProcessServingArgs {
     /// Copy the stores into --work-dir and exit (for running other tools on a private copy).
     #[arg(long = "prepare-only")]
     prepare_only: bool,
+    /// Replace the multiplier of every density phase (phases whose multiplier is above 1).
+    #[arg(long = "density-multiplier-override")]
+    density_multiplier_override: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -181,6 +184,10 @@ struct SpaceSummary {
     obsolete_sst_bytes_max: u64,
     disk_minus_live_files_bytes_max: Option<u64>,
     pending_compaction_bytes_max: u64,
+    /// Live SST bytes minus RocksDB's live-data estimate: versions and tombstones not yet dropped.
+    garbage_estimate_bytes_start: u64,
+    garbage_estimate_bytes_max: u64,
+    garbage_estimate_bytes_end: u64,
     max_l0_files: u64,
     num_snapshots_max: u64,
     num_live_versions_max: u64,
@@ -360,6 +367,14 @@ fn load_plan(args: &InProcessServingArgs) -> Result<Plan, BenchError> {
             }
         }
     };
+    let mut plan = plan;
+    if let Some(multiplier) = args.density_multiplier_override {
+        for phase in &mut plan.phases {
+            if phase.density_multiplier > 1.0 {
+                phase.density_multiplier = multiplier;
+            }
+        }
+    }
     for phase in &plan.phases {
         phase.validate().map_err(BenchError::invalid_argument)?;
     }
@@ -612,6 +627,17 @@ fn space_summary(
             .map(|s| s.pending_compaction_bytes)
             .max()
             .unwrap_or(0),
+        garbage_estimate_bytes_start: first
+            .live_sst_bytes
+            .saturating_sub(first.estimate_live_data_bytes),
+        garbage_estimate_bytes_max: series
+            .iter()
+            .map(|s| s.live_sst_bytes.saturating_sub(s.estimate_live_data_bytes))
+            .max()
+            .unwrap_or(0),
+        garbage_estimate_bytes_end: last
+            .live_sst_bytes
+            .saturating_sub(last.estimate_live_data_bytes),
         max_l0_files: series.iter().map(|s| s.max_l0_files).max().unwrap_or(0),
         num_snapshots_max: series.iter().map(|s| s.num_snapshots).max().unwrap_or(0),
         num_live_versions_max: series
@@ -1191,6 +1217,8 @@ fn run_phase<'db>(
         });
         drop(requests_tx);
         let writer = run_writer_phase_held(state, shared, phase, &requests_rx, &hold_open);
+        // Dropping the receiver fails any request still waiting on the writer.
+        drop(requests_rx);
         stop.store(true, Ordering::SeqCst);
         if let Some(handle) = attach_handle {
             attach_record = handle.join().ok();

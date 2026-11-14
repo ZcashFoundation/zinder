@@ -321,11 +321,26 @@ pub(crate) fn smoke_plan() -> Plan {
     }
 }
 
-/// Full plan for the measured Testnet run (about 3 h 40 min of wall time).
+/// Full plan for the measured Testnet run (about 3 h 30 min of wall time plus the
+/// index-attach extension; about 21,500 replayed blocks).
 pub(crate) fn measured_plan() -> Plan {
     let accelerated = 500;
     let mut baseline = base_phase("baseline-no-readers", accelerated);
     baseline.duration_seconds = Some(600);
+    let mut replacements_baseline = base_phase("replacements-no-readers", accelerated);
+    replacements_baseline.duration_seconds = Some(600);
+    replacements_baseline.replacements = vec![
+        ReplacementSpec {
+            at_seconds: 120.0,
+            displaced: 1_000,
+            kept: 1_000,
+        },
+        ReplacementSpec {
+            at_seconds: 420.0,
+            displaced: 1_000,
+            kept: 500,
+        },
+    ];
     let mut hold_1s = base_phase("hold-1s", accelerated);
     hold_1s.duration_seconds = Some(600);
     hold_1s.readers = hold_readers(8, 1.0, 10_000);
@@ -341,6 +356,13 @@ pub(crate) fn measured_plan() -> Plan {
         range_blocks: 2_000,
         chunk_blocks: 100,
         held_iterator: false,
+        snapshot: false,
+        paced_interval_ms: 250,
+    });
+    hold_5m.readers.push(ReaderSpec::WalletFamily {
+        count: 1,
+        hold_seconds: 300.0,
+        family: "transparent_unspent_output".to_owned(),
         snapshot: false,
         paced_interval_ms: 250,
     });
@@ -367,13 +389,23 @@ pub(crate) fn measured_plan() -> Plan {
     realtime.readers = hold_readers(8, 300.0, 10_000);
     let mut attach = base_phase("index-attach", accelerated);
     attach.duration_seconds = Some(1_800);
-    attach.readers = vec![ReaderSpec::WalletFamily {
-        count: 2,
-        hold_seconds: 120.0,
-        family: "transparent_spent_output".to_owned(),
-        snapshot: true,
-        paced_interval_ms: 250,
-    }];
+    attach.readers = vec![
+        ReaderSpec::WalletFamily {
+            count: 2,
+            hold_seconds: 120.0,
+            family: "transparent_spent_output".to_owned(),
+            snapshot: true,
+            paced_interval_ms: 250,
+        },
+        // Starts before the switch and still holds the old family when it is dropped.
+        ReaderSpec::WalletFamily {
+            count: 1,
+            hold_seconds: 1_500.0,
+            family: "transparent_spent_output".to_owned(),
+            snapshot: true,
+            paced_interval_ms: 250,
+        },
+    ];
     attach.index_attach = Some(IndexAttachSpec {
         at_seconds: 30.0,
         family: "transparent_spent_output".to_owned(),
@@ -404,6 +436,7 @@ pub(crate) fn measured_plan() -> Plan {
     Plan {
         phases: vec![
             baseline,
+            replacements_baseline,
             hold_1s,
             hold_30s,
             hold_5m,
