@@ -575,7 +575,14 @@ async fn run_continuous_wallet_following(
     mut canonical_lease: CanonicalRetentionLease,
 ) -> Result<(), ProjectorError> {
     let mut control = ProjectorControlTasks::start(&config.projector_control, &cancel).await?;
-    let mut following_readiness = FollowingReadiness::new(readiness);
+    let mut following_readiness = FollowingReadiness::for_wallet(
+        readiness,
+        WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence())
+            .source_position()
+            .tip
+            .height
+            .value(),
+    );
     loop {
         control.require_running(&cancel)?;
         if cancel.is_cancelled() {
@@ -709,6 +716,7 @@ async fn run_continuous_wallet_following(
         else {
             return Ok(());
         };
+        following_readiness.wallet_advanced(reconciled_source.source_position().tip.height.value());
         canonical_lease = advance_retention_lease_anchor(
             &mut canonical_control,
             canonical_lease,
@@ -939,7 +947,10 @@ async fn bootstrap_resumed_wallet_following(
     first_retained_event_sequence: u64,
 ) -> Result<(), ProjectorError> {
     let wallet_source = WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
-    let mut following_readiness = FollowingReadiness::new(readiness);
+    let mut following_readiness = FollowingReadiness::for_wallet(
+        readiness,
+        wallet_source.source_position().tip.height.value(),
+    );
     let mut bootstrap_lease = loop {
         if cancel.is_cancelled() {
             return Ok(());
@@ -1629,7 +1640,7 @@ fn report_writer_fence_lag(
     if elapsed < CANONICAL_FENCE_CONVERGENCE_SYNCING_AFTER {
         return;
     }
-    readiness.trailing(
+    readiness.writer_ahead(
         lag.secondary_visible_tip_height,
         lag.writer_visible_tip_height,
     );
@@ -2385,8 +2396,8 @@ mod tests {
         assert_eq!(report.target_height, Some(3));
     }
 
-    #[test]
-    fn writer_fence_lag_of_one_block_keeps_a_ready_projector_ready() {
+    #[tokio::test]
+    async fn writer_fence_lag_of_one_block_keeps_a_ready_projector_ready() {
         let readiness =
             zinder_runtime::Readiness::new(zinder_runtime::ReadinessState::ready(Some(1)));
         let lag = CanonicalFenceLag {
@@ -2395,12 +2406,36 @@ mod tests {
             writer_visible_tip_height: 2,
         };
 
-        let mut following_readiness = FollowingReadiness::new(&readiness);
+        let mut following_readiness = FollowingReadiness::for_wallet(&readiness, 1);
         report_writer_fence_lag(&mut following_readiness, lag, Duration::from_secs(1));
         let report = readiness.report();
         assert!(report.is_ready);
         assert_eq!(report.current_height, Some(1));
         assert_eq!(report.target_height, Some(2));
+    }
+
+    #[tokio::test]
+    async fn writer_fence_lag_reports_a_wallet_behind_the_secondary_as_syncing() {
+        let readiness =
+            zinder_runtime::Readiness::new(zinder_runtime::ReadinessState::ready(Some(10)));
+        let lag = CanonicalFenceLag {
+            lag_chain_epochs: 1,
+            secondary_visible_tip_height: 11,
+            writer_visible_tip_height: 12,
+        };
+
+        let mut following_readiness = FollowingReadiness::for_wallet(&readiness, 10);
+        report_writer_fence_lag(&mut following_readiness, lag, Duration::from_secs(1));
+        let report = readiness.report();
+        assert!(!report.is_ready);
+        assert!(matches!(
+            report.cause,
+            zinder_runtime::ReadinessCause::Syncing {
+                lag_blocks: Some(2)
+            }
+        ));
+        assert_eq!(report.current_height, Some(10));
+        assert_eq!(report.target_height, Some(12));
     }
 
     #[test]
