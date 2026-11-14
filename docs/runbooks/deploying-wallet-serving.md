@@ -443,14 +443,15 @@ ghcr.io/zcashfoundation/zinder-wallet-serving-explorer:vX.Y.Z
 ```
 
 The image is the `zinder-wallet-serving-explorer` target of
-`deploy/Dockerfile`. It differs from `zinder-wallet-serving` in three ways:
+`deploy/Dockerfile`. It differs from `zinder-wallet-serving` in two ways:
 
 - Its ingest configuration sets `ingest.explorer_views = true`, so ingest also
   writes the Explorer views.
 - Its entrypoint starts `zinder-explorer` with
   `deploy/config/wallet-serving/explorer.toml` after wallet serving is up.
-- Its `HEALTHCHECK` also requires Explorer `/readyz` on port 9069 to answer
-  200.
+
+Its `HEALTHCHECK` is the wallet-serving check alone and does not cover the
+Explorer.
 
 Configure the service exactly as described above, with the same volume,
 variables, and Railway settings. `PORT` stays `9106`, and the Railway
@@ -534,14 +535,15 @@ Both bind `[::]` because the Railway private network is IPv6-only. Clients reach
 
 ### Explorer failure handling
 
-Watch Explorer `/readyz` on port 9069 in monitoring. The Railway deploy-time
-healthcheck does not cover it.
+Watch Explorer `/readyz` on port 9069 in monitoring. Neither the Railway
+deploy-time healthcheck nor the container's `HEALTHCHECK` covers it, so a host
+that restarts unhealthy containers never restarts wallet serving because the
+Explorer is down.
 
 An Explorer failure does not stop wallet serving. When `zinder-explorer`
 exits, the entrypoint logs its status and restarts it after 15 seconds. The
 delay doubles on each further exit, up to 5 minutes, and returns to 15 seconds
-after a run that lasts 5 minutes. The container's `HEALTHCHECK` reports
-unhealthy while the Explorer is down.
+after a run that lasts 5 minutes.
 
 The container terminates with a non-zero status when the wallet-serving
 entrypoint exits for any reason in [Failure handling](#failure-handling). The
