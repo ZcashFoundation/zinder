@@ -117,7 +117,9 @@ process, while `ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES` applies to
 all three.
 
 No process receives the `ZINDER_WALLET_SERVING__*` variables, which configure
-the entrypoint itself, or the two bearer secrets. At startup the entrypoint
+the entrypoint itself, or the two bearer secrets. Any other
+`ZINDER_WALLET_SERVING__*` name, such as a misspelled deadline, stops the
+container at startup. At startup the entrypoint
 logs the names of any other `ZINDER_*` variables that no process reads, such
 as a misspelled section or storage key. Check that line after you add a
 variable.

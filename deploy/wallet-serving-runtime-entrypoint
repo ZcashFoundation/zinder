@@ -66,11 +66,12 @@ recurrence_min_answered_episode_seconds=60
 # `ZINDER_*` variable reaches a process only when it names one of that process's
 # paths or a key beneath one, because every binary rejects a key it does not
 # define. The `env_var_contract` tests of each service hold these lists to the
-# loaders. `wallet_serving` configures this entrypoint and reaches no process.
+# loaders. The `wallet_serving` settings configure this entrypoint and reach
+# no process.
 ingest_config_paths="network ops node security ingest_control ingest retention storage.path storage.canonical storage.materialized_views storage.raw_blob_policy"
 projector_config_paths="network ops node security ingest_control projector projector_control storage.canonical_path storage.canonical_secondary_path storage.canonical storage.raw_blob_policy wallet.path wallet.rocksdb"
 query_config_paths="network ops node security ingest_control query wallet storage.path storage.secondary_path storage.canonical storage.raw_blob_policy storage.initial_catchup_timeout_ms storage.secondary_catchup_interval_ms storage.secondary_replica_lag_threshold_chain_epochs storage.serving_pair_staleness_ceiling_ms"
-entrypoint_config_paths="wallet_serving"
+entrypoint_config_paths="wallet_serving.canonical_construction_deadline_seconds wallet_serving.wallet_construction_deadline_seconds"
 
 ingest_ops_addr="127.0.0.1:9105"
 projector_ops_addr="127.0.0.1:9110"
@@ -565,6 +566,18 @@ require_positive_seconds() {
   esac
 }
 
+# Fails on a `ZINDER_WALLET_SERVING__*` variable this entrypoint does not
+# read, so a misspelled deadline cannot silently keep its default.
+require_known_entrypoint_settings() {
+  unknown_settings="$(
+    zinder_variables_outside "$entrypoint_config_paths" \
+      | grep '^ZINDER_WALLET_SERVING__' | sort | tr '\n' ' '
+  )"
+  if [ -n "$unknown_settings" ]; then
+    fail "this entrypoint reads no such setting: ${unknown_settings% }"
+  fi
+}
+
 # Without the node indexer stream, ingest follows the node mempool by polling
 # JSON-RPC and rebuilds its live index from a full re-read after every block,
 # withholding readiness until the rebuild completes. At the tip that drain
@@ -572,6 +585,7 @@ require_positive_seconds() {
 if [ -z "${ZINDER_NODE__INDEXER_GRPC_ADDR:-}" ]; then
   fail "ZINDER_NODE__INDEXER_GRPC_ADDR is required: set it to the node's indexer gRPC URL. Without the indexer stream, ingest re-reads the node mempool over JSON-RPC after every block and withholds readiness while it does"
 fi
+require_known_entrypoint_settings
 require_positive_seconds ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE_SECONDS \
   "$canonical_construction_deadline_seconds"
 require_positive_seconds ZINDER_WALLET_SERVING__WALLET_CONSTRUCTION_DEADLINE_SECONDS \

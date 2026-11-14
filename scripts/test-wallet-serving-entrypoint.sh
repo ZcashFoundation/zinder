@@ -34,7 +34,8 @@ for function_name in \
   update_plane_recurrence \
   zinder_variables_outside \
   start_runtime_process \
-  require_positive_seconds; do
+  require_positive_seconds \
+  require_known_entrypoint_settings; do
   definition="$(entrypoint_function "$function_name")"
   [ -n "$definition" ] || test_failure "entrypoint no longer defines $function_name"
   eval "$definition"
@@ -274,6 +275,22 @@ done
 fail_message=""
 require_positive_seconds TEST_DEADLINE_SECONDS 86400 \
   || test_failure "a deadline of 86400 was rejected: $fail_message"
+
+# A misspelled entrypoint setting stops the container instead of leaving its
+# default in place.
+fail_message=""
+ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE=86400 \
+  require_known_entrypoint_settings || true
+case "$fail_message" in
+  *ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE) ;;
+  *) test_failure "a misspelled entrypoint setting was accepted: '$fail_message'" ;;
+esac
+fail_message=""
+ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE_SECONDS=86400 \
+  ZINDER_WALLET_SERVING__WALLET_CONSTRUCTION_DEADLINE_SECONDS=43200 \
+  require_known_entrypoint_settings || true
+[ -z "$fail_message" ] \
+  || test_failure "documented entrypoint settings were rejected: $fail_message"
 
 # Each process starts with the variables its binary accepts. A stub setpriv on
 # PATH records the environment variable names each process receives.
