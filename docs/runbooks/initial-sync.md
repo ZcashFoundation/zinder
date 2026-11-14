@@ -156,9 +156,17 @@ The restart does not wait for `projector.lease_duration_seconds` to elapse.
 
 A second projector cannot build the same wallet path concurrently:
 
-- While one projector holds the wallet primary open, another fails to open it.
+- While one projector builds or discards the wallet path, another fails with
+  `wallet projection build at <path> is in progress in another running process`.
+  The lock behind this error is the `<wallet>.build-lock` file beside the
+  wallet path. The operating system releases it when the process exits, so it
+  never outlives a crash. Do not delete the file.
 - A projector with a different owner value is refused until the live lease
   expires.
+
+A crash before the wallet store exists can leave
+`<wallet>.projection-load-staging` or `<wallet>.initializing` beside the absent
+wallet path. The next construction removes them before it starts.
 
 Give each concurrently running projector its own owner value. Projectors that
 share one value interrupt each other's builds instead of being refused.

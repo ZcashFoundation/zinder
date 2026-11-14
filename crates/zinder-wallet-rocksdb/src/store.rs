@@ -38,8 +38,14 @@ use zinder_wallet_projection::{
 
 use crate::{
     RocksDbWalletError, WalletBuildLeaseHeartbeat, WalletColdValidationPhaseDurations,
-    projection_load::PreparedWalletProjectionLoad,
+    build_lock::WalletBuildLock, projection_load::PreparedWalletProjectionLoad,
 };
+
+#[cfg(test)]
+use zinder_testkit::process_crash::crash_point;
+
+#[cfg(not(test))]
+const fn crash_point(_name: &str) {}
 
 /// Exact clean wallet-store schema supported by this adapter.
 pub const WALLET_ROCKSDB_SCHEMA_VERSION: u16 = WALLET_PROJECTION_SCHEMA_VERSION;
@@ -220,7 +226,10 @@ impl RocksDbWalletBuildStore {
     ///
     /// A caller must subsequently acquire a lease before writing or promoting
     /// projection state. Existing stores, including older pre-release control
-    /// layouts, are refused rather than migrated.
+    /// layouts, are refused rather than migrated. The store is initialized in a
+    /// sibling directory and renamed into place after its BUILDING control
+    /// record is durable, so an interrupted creation never leaves the wallet
+    /// path holding a store without one.
     pub fn create_fresh(
         path: impl AsRef<Path>,
         network: Network,
@@ -230,14 +239,18 @@ impl RocksDbWalletBuildStore {
     ) -> Result<Self, RocksDbWalletError> {
         validate_resource_budget(resource_budget)?;
         let path = path.as_ref();
-        create_fresh_directory(path)?;
-        let store_path =
-            fs::canonicalize(path).map_err(|source| RocksDbWalletError::PathUnavailable {
+        if path.symlink_metadata().is_ok() {
+            return Err(RocksDbWalletError::PathNotFresh {
                 path: path.to_path_buf(),
-                source,
-            })?;
+            });
+        }
+        let initialization_path = crate::build::store_initialization_path(path);
+        create_fresh_directory(&initialization_path)?;
+        crash_point("wallet_projection.build_store.after_initialization_directory");
         let bounded_open = open_bounded_rocksdb(
-            RocksDbOpenRole::Primary { path: &store_path },
+            RocksDbOpenRole::Primary {
+                path: &initialization_path,
+            },
             resource_budget,
             wallet_column_family_descriptors,
         )
@@ -253,6 +266,18 @@ impl RocksDbWalletBuildStore {
         };
         write_control_sync(&bounded_open, &control)?;
         drop(bounded_open);
+        crash_point("wallet_projection.build_store.before_wallet_path_rename");
+        fs::rename(&initialization_path, path).map_err(|source| {
+            RocksDbWalletError::PathUnavailable {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+        let store_path =
+            fs::canonicalize(path).map_err(|source| RocksDbWalletError::PathUnavailable {
+                path: path.to_path_buf(),
+                source,
+            })?;
         Ok(Self {
             store_path,
             resource_budget,
@@ -387,12 +412,14 @@ impl RocksDbWalletBuildStore {
     /// `owner` is the caller's build-owner identity. A live lease held by a
     /// different owner refuses the discard until it expires; the lease's own
     /// owner, typically a builder restarted after a crash, may discard
-    /// immediately.
+    /// immediately. A build of the same path still running in another process
+    /// refuses the discard whatever its owner.
     pub fn discard_unpublished(
         self,
         owner: WalletProjectionBuildOwner,
         now: UnixTimestampMillis,
     ) -> Result<(), RocksDbWalletError> {
+        let _build_lock = WalletBuildLock::acquire(&self.store_path)?;
         let (bounded_open, control) = self.open_building_control()?;
         require_building_control(&control, &self.store_path, self.network)?;
         require_no_live_lease_of_another_owner(&control, owner, now)?;
@@ -3455,6 +3482,94 @@ mod tests {
             ),
             Err(RocksDbWalletError::StoreNotReady { .. })
         ));
+        Ok(())
+    }
+
+    fn create_test_build_store(path: &Path) -> Result<RocksDbWalletBuildStore, RocksDbWalletError> {
+        RocksDbWalletBuildStore::create_fresh(
+            path,
+            Network::ZcashRegtest,
+            source_identity(),
+            0,
+            RocksDbResourceBudget::for_local_tests(),
+        )
+    }
+
+    #[cfg(unix)]
+    const BUILD_STORE_CREATION_CRASH_CHILD: &str = "store::tests::build_store_creation_crash_child";
+
+    #[test]
+    fn build_store_creation_crash_child() -> Result<(), Box<dyn std::error::Error>> {
+        let Some(child) = zinder_testkit::process_crash::crash_child() else {
+            return Ok(());
+        };
+        create_test_build_store(&child.store_path().join("wallet"))?;
+        Err("build-store creation returned without reaching its crash point".into())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_build_store_creation_leaves_the_wallet_path_absent_across_process_abort()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for crash_point in [
+            "wallet_projection.build_store.after_initialization_directory",
+            "wallet_projection.build_store.before_wallet_path_rename",
+        ] {
+            let temporary = TempDir::new()?;
+            let wallet_path = temporary.path().join("wallet");
+            zinder_testkit::process_crash::run_crash_child(
+                BUILD_STORE_CREATION_CRASH_CHILD,
+                temporary.path(),
+                crash_point,
+            )?;
+
+            assert!(!wallet_path.exists(), "{crash_point} exposed a wallet path");
+            assert!(crate::build::store_initialization_path(&wallet_path).is_dir());
+            assert!(matches!(
+                create_test_build_store(&wallet_path),
+                Err(RocksDbWalletError::PathNotFresh { .. })
+            ));
+            let build_lock = WalletBuildLock::acquire(&wallet_path)?;
+            crate::build::remove_abandoned_build_paths(&wallet_path, &build_lock)?;
+            drop(create_test_build_store(&wallet_path)?);
+            drop(RocksDbWalletBuildStore::open(
+                &wallet_path,
+                Network::ZcashRegtest,
+                RocksDbResourceBudget::for_local_tests(),
+            )?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_running_build_of_the_path_refuses_discard_for_any_owner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let wallet_path = temporary.path().join("wallet");
+        drop(create_test_build_store(&wallet_path)?);
+        let open_build = || {
+            RocksDbWalletBuildStore::open(
+                &wallet_path,
+                Network::ZcashRegtest,
+                RocksDbResourceBudget::for_local_tests(),
+            )
+        };
+        let running_build = WalletBuildLock::acquire(&wallet_path)?;
+
+        assert!(matches!(
+            open_build()?.discard_unpublished(
+                WalletProjectionBuildOwner::from_bytes([0x42; 16]),
+                UnixTimestampMillis::new(0),
+            ),
+            Err(RocksDbWalletError::WalletBuildInProgress { .. })
+        ));
+        assert!(wallet_path.exists());
+        drop(running_build);
+        open_build()?.discard_unpublished(
+            WalletProjectionBuildOwner::from_bytes([0x42; 16]),
+            UnixTimestampMillis::new(0),
+        )?;
+        assert!(!wallet_path.exists());
         Ok(())
     }
 

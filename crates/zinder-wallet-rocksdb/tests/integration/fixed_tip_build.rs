@@ -470,6 +470,34 @@ fn owner_checkpoint_cold_admission_refuses_a_replaced_same_plan_checkpoint()
 }
 
 #[test]
+fn build_removes_siblings_a_crash_left_before_the_wallet_path_existed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let fixture = wallet_baseline_fixture();
+    let canonical_store = build_ready_canonical_store(&temporary, &fixture)?;
+    let abandoned = [
+        temporary.path().join("wallet.projection-load-staging"),
+        temporary.path().join("wallet.initializing"),
+    ];
+    for path in &abandoned {
+        std::fs::create_dir(path)?;
+        std::fs::write(path.join("partial"), [0_u8])?;
+    }
+
+    let outcome = build_wallet_from_canonical(
+        &canonical_store,
+        temporary.path().join("wallet"),
+        RocksDbWalletBuildOptions::for_local_tests(),
+    )?;
+
+    assert_store(&outcome, &fixture)?;
+    for path in &abandoned {
+        assert!(!path.exists(), "{} survived the build", path.display());
+    }
+    Ok(())
+}
+
+#[test]
 fn fixed_tip_build_matches_exact_version_one_wallet_contract()
 -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;

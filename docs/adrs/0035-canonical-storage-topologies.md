@@ -88,6 +88,21 @@ the wallet store also compares it before READY publication. A process still
 holding a replaced generation therefore cannot renew, release, or publish
 under it.
 
+Lease ownership cannot tell a restarted owner from a second live process
+configured with the same identity. A non-blocking advisory lock on a
+`<wallet>.build-lock` file beside the wallet path does. A projector holds it
+for the whole of a wallet construction and while it discards an unpublished
+store, and the operating system releases it when the process exits, including
+on a kill. A restart therefore always acquires it, while a second live process
+building or discarding the same path is refused. The lock file is never
+removed, so every process locks the same file.
+
+A fresh wallet store is initialized in a `<wallet>.initializing` sibling and
+renamed to the wallet path after its BUILDING control record is durable. The
+wallet path therefore never holds a store without that record. Under the lock,
+a construction whose wallet path does not exist yet removes the staging and
+initialization siblings an interrupted build left behind.
+
 Serving admission catches canonical and wallet secondaries up independently and
 publishes a pair only when their identities and positions agree. In-flight
 requests retain their original immutable pair while later requests atomically
@@ -185,4 +200,7 @@ for all required stores and runtimes.
 
 - 2026-11-14: Construction leases belong to the build-owner identity. The same
   owner reclaims a live lease at a higher generation instead of waiting for it
-  to expire, and a different owner is still refused.
+  to expire, and a different owner is still refused. A process-lifetime lock
+  beside the wallet path refuses a concurrent build or discard of that path,
+  and a fresh store reaches the wallet path only by rename after its control
+  record is durable.

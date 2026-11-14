@@ -25,6 +25,7 @@ use zinder_wallet_projection::{
 
 use crate::{
     RocksDbWalletBuildStore, RocksDbWalletError, RocksDbWalletStore,
+    build_lock::WalletBuildLock,
     projection_load::{
         PreparedWalletProjectionLoad, WalletProjectionLoadConfig, write_projection_ssts,
     },
@@ -454,9 +455,11 @@ fn finish_failed_wallet_build<T>(
 
 /// Builds and publishes a fresh wallet store at one canonical fence.
 ///
-/// The target path and its deterministic sibling staging path must not exist.
-/// Any failure leaves only a non-queryable BUILDING target; staging artifacts
-/// owned by this invocation are removed on every return path.
+/// The target path must not exist. Staging and initialization siblings that a
+/// crashed build left beside an absent target are removed first, under a
+/// process-lifetime lock that refuses a concurrent build or discard of the same
+/// path. Any failure leaves only a non-queryable BUILDING target; staging
+/// artifacts owned by this invocation are removed on every return path.
 #[allow(
     clippy::too_many_lines,
     reason = "the public orchestrator keeps phase timing and publication evidence in one order"
@@ -545,6 +548,8 @@ where
     let now = execution.initial_now();
     let total_started = Instant::now();
     let wallet_path = wallet_path.as_ref();
+    let build_lock = WalletBuildLock::acquire(wallet_path)?;
+    remove_abandoned_build_paths(wallet_path, &build_lock)?;
     let staging = FreshWalletProjectionStaging::create(projection_staging_path(wallet_path))?;
     let canonical_ready = canonical_store.wallet_projection_ready_evidence();
     let source_position = WalletProjectionSourcePosition::new(
@@ -793,10 +798,50 @@ fn validate_canonical_fence(
 }
 
 pub(crate) fn projection_staging_path(wallet_path: &Path) -> PathBuf {
+    wallet_sibling_path(wallet_path, ".projection-load-staging")
+}
+
+/// Sibling directory in which a fresh store is initialized before it is
+/// renamed to the wallet path, so the wallet path never holds a store without
+/// its BUILDING control record.
+pub(crate) fn store_initialization_path(wallet_path: &Path) -> PathBuf {
+    wallet_sibling_path(wallet_path, ".initializing")
+}
+
+fn wallet_sibling_path(wallet_path: &Path, suffix: &str) -> PathBuf {
     let file_name = wallet_path.file_name().unwrap_or(wallet_path.as_os_str());
-    let mut staging_file_name = OsString::from(file_name);
-    staging_file_name.push(".projection-load-staging");
-    wallet_path.with_file_name(staging_file_name)
+    let mut sibling_file_name = OsString::from(file_name);
+    sibling_file_name.push(suffix);
+    wallet_path.with_file_name(sibling_file_name)
+}
+
+/// Removes the staging and initialization siblings a crashed build left before
+/// its store reached the wallet path.
+///
+/// The caller holds the path's [`WalletBuildLock`], so no live build owns them.
+/// Once the wallet path exists, its siblings are left to
+/// [`RocksDbWalletBuildStore::discard_unpublished`], which enforces the lease.
+pub(crate) fn remove_abandoned_build_paths(
+    wallet_path: &Path,
+    _build_lock: &WalletBuildLock,
+) -> Result<(), RocksDbWalletError> {
+    if wallet_path.exists() {
+        return Ok(());
+    }
+    for abandoned in [
+        projection_staging_path(wallet_path),
+        store_initialization_path(wallet_path),
+    ] {
+        if abandoned.exists() {
+            fs::remove_dir_all(&abandoned).map_err(|source| {
+                RocksDbWalletError::PathUnavailable {
+                    path: abandoned.clone(),
+                    source,
+                }
+            })?;
+        }
+    }
+    Ok(())
 }
 
 struct FreshWalletProjectionStaging {
