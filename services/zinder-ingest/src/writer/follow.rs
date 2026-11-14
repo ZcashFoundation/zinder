@@ -1688,7 +1688,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_ready_requires_a_mempool_generation_certified_at_its_exact_tip() {
+    fn canonical_ready_requires_a_certified_mempool_generation() {
         let (signal, gate) = mempool_ready_channel();
         let canonical_ready = ReadinessState::ready_with_target(Some(100), Some(100));
         let canonical_tip = block_id(100, 2);
@@ -1704,16 +1704,18 @@ mod tests {
         ));
         assert!(!while_hydrating.cause.permits_traffic());
 
+        // A block arrives: canonical ingest commits it before the owner
+        // certifies the replacement generation at the same tip.
         signal.certify_source_tip(block_id(99, 1));
-        let after_stale_marker = gate_canonical_readiness_on_mempool_hydration(
+        let during_tip_transition = gate_canonical_readiness_on_mempool_hydration(
             canonical_ready.clone(),
             canonical_tip,
             Some(&gate),
         );
-        assert!(matches!(
-            &after_stale_marker.cause,
-            ReadinessCause::Syncing { .. }
-        ));
+        assert!(
+            matches!(&during_tip_transition.cause, ReadinessCause::Ready),
+            "block arrival must not withdraw ingest readiness"
+        );
 
         signal.certify_source_tip(canonical_tip);
         let after_current_marker = gate_canonical_readiness_on_mempool_hydration(

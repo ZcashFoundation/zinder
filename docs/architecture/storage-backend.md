@@ -133,9 +133,13 @@ a secondary also does so when the intervening events are no longer retained or
 its incremental check fails. Per-transition cost therefore follows the rows a
 transition changes rather than the reorg window.
 
-`zinder-compat-lightwalletd` alternates secondary generations so it can catch up
-and validate a replacement pair before publishing it. In-flight requests keep
-their existing immutable pair.
+`zinder-query` and `zinder-compat-lightwalletd` rotate through four secondary
+generation slots so they can catch up and validate a replacement pair before
+publishing it. In-flight requests keep their existing immutable pair, which
+pins its generation until they finish; steady state alternates between two
+slots, and the others open only while a retired pair is still held. A
+transparent-output scan whose request is dropped stops at its next page and
+releases its pair.
 
 ## Resource bounds
 

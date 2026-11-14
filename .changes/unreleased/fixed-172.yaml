@@ -1,0 +1,6 @@
+kind: fixed
+body: "A new block no longer makes wallet serving briefly not ready. `zinder-ingest` keeps answering live mempool reads at the previous tip while it rebuilds the mempool view for the new one, so `MempoolSnapshot` no longer fails with \"live mempool index is hydrating\" after each block, and neither ingest (`syncing`) nor `zinder-query` (`ingest_control_unavailable`) withdraws readiness. A mempool read at the new tip waits up to five seconds for the rebuilt view. Ingest still reports `syncing` when its mempool view trails the canonical tip for 30 seconds. `zinder-query` and `zinder-compat-lightwalletd` also keep publishing new serving pairs while a long request, such as a transparent unspent-output read for an address with millions of outputs, holds an older one, so the reader no longer stalls at `replica_lagging` until a restart."
+time: 2026-11-14T12:00:00Z
+custom:
+  Bump: patch
+  PR: "172"

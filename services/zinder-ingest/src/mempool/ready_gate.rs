@@ -9,12 +9,15 @@
 //! backend emits it after a complete first poll. Opening a stream alone is
 //! not evidence that an empty index is safe to expose.
 //!
-//! [`MempoolReadyGate`] watches the source tip certified by the current
-//! hydrated generation. The tip-follow readiness state machine publishes
-//! [`zinder_runtime::ReadinessCause::Ready`] only when that source tip exactly
-//! matches its canonical fence. The certification is withdrawn on every
-//! source reconnect because a discarded in-memory index is not safe to serve
-//! until the replacement snapshot completes.
+//! [`MempoolReadyGate`] watches the source tip certified by the serving
+//! generation. The tip-follow readiness state machine publishes
+//! [`zinder_runtime::ReadinessCause::Ready`] when that source tip matches its
+//! canonical fence. A normal tip change keeps the previous generation
+//! certified while the owner hydrates its replacement, so the gate also
+//! admits a different certified tip for a bounded grace after the two first
+//! disagree. The certification is withdrawn only when no
+//! generation can serve: before the first snapshot completes, and while the
+//! index is rebuilt after a source failure.
 //!
 //! The same pair carries the opposite signal when the canonical writer parks
 //! on a reorg deeper than its window: the follower halts the owner, which
@@ -23,16 +26,33 @@
 //! [`MempoolSourceEvent::InitialSnapshotComplete`]:
 //! zinder_source::MempoolSourceEvent::InitialSnapshotComplete
 
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use parking_lot::Mutex;
 use tokio::sync::watch;
 use zinder_core::BlockId;
 
 use crate::writer::control::ParkedWriterHalt;
+
+/// Longest the canonical tip may disagree with the certified mempool source
+/// tip before ingest readiness is withdrawn.
+///
+/// Each block ends the serving source generation, and the owner certifies the
+/// replacement only once canonical ingest has committed the same tip. The
+/// streaming source does this within milliseconds; the polling source can
+/// take one poll interval plus a full mempool hydration.
+pub(crate) const MEMPOOL_TIP_TRANSITION_GRACE: Duration = Duration::from_secs(30);
 
 /// Read-side handle observed by the tip-follow state machine.
 #[derive(Clone, Debug)]
 pub struct MempoolReadyGate {
     certified_source_tip: watch::Receiver<Option<BlockId>>,
     writer_halt: watch::Sender<Option<ParkedWriterHalt>>,
+    /// When the certified source tip and the canonical tip began to disagree.
+    tip_disagreement_since: Arc<Mutex<Option<Instant>>>,
 }
 
 impl MempoolReadyGate {
@@ -51,11 +71,39 @@ impl MempoolReadyGate {
             .flatten()
     }
 
-    /// Returns whether the current source generation is certified against the
-    /// supplied canonical fence.
+    /// Returns whether the serving source generation admits the supplied
+    /// canonical fence.
+    ///
+    /// A generation certified at exactly `canonical_tip` always admits it. A
+    /// generation certified at another tip admits it only while the two have
+    /// disagreed for less than 30 seconds, which covers the replacement
+    /// generation a normal tip change starts.
     #[must_use]
     pub fn admits_canonical_tip(&self, canonical_tip: BlockId) -> bool {
-        self.certified_source_tip() == Some(canonical_tip)
+        self.admits_canonical_tip_at(canonical_tip, Instant::now())
+    }
+
+    fn admits_canonical_tip_at(&self, canonical_tip: BlockId, now: Instant) -> bool {
+        let certified_source_tip = self.certified_source_tip();
+        let disagreeing_since = {
+            let mut tip_disagreement_since = self.tip_disagreement_since.lock();
+            match certified_source_tip {
+                Some(certified_source_tip) if certified_source_tip != canonical_tip => {
+                    Some(*tip_disagreement_since.get_or_insert(now))
+                }
+                Some(_) | None => {
+                    *tip_disagreement_since = None;
+                    None
+                }
+            }
+        };
+        match (certified_source_tip, disagreeing_since) {
+            (None, _) => false,
+            (Some(_), None) => true,
+            (Some(_), Some(disagreeing_since)) => {
+                now.saturating_duration_since(disagreeing_since) < MEMPOOL_TIP_TRANSITION_GRACE
+            }
+        }
     }
 
     /// Waits until the source generation changes its hydration state.
@@ -81,7 +129,7 @@ pub struct MempoolReadySignal {
 }
 
 impl MempoolReadySignal {
-    /// Marks the current source generation as hydrated and certified against
+    /// Marks the serving source generation as hydrated and certified against
     /// `source_tip`.
     pub fn certify_source_tip(&self, source_tip: BlockId) {
         // `send_replace` ignores the "no receivers" condition that `send`
@@ -90,7 +138,7 @@ impl MempoolReadySignal {
         let _ = self.certified_source_tip.send_replace(Some(source_tip));
     }
 
-    /// Withdraws the gate while the current index is being rebuilt.
+    /// Withdraws the gate while no source generation can serve.
     pub fn withdraw_certification(&self) {
         let _ = self.certified_source_tip.send_replace(None);
     }
@@ -125,6 +173,7 @@ pub fn mempool_ready_channel() -> (MempoolReadySignal, MempoolReadyGate) {
         MempoolReadyGate {
             certified_source_tip: rx,
             writer_halt: halt_tx,
+            tip_disagreement_since: Arc::new(Mutex::new(None)),
         },
     )
 }
@@ -136,9 +185,11 @@ mod tests {
         reason = "Unit test names describe the behavior under test."
     )]
 
+    use std::time::{Duration, Instant};
+
     use zinder_core::{BlockHash, BlockHeight, BlockId};
 
-    use super::mempool_ready_channel;
+    use super::{MEMPOOL_TIP_TRANSITION_GRACE, mempool_ready_channel};
     use crate::writer::control::ParkedWriterHalt;
 
     fn source_tip(tag: u8) -> BlockId {
@@ -178,6 +229,44 @@ mod tests {
         signal.certify_source_tip(certified_tip);
         signal.withdraw_certification();
         assert!(!gate.admits_canonical_tip(certified_tip));
+    }
+
+    #[test]
+    fn a_previous_tip_stays_admitted_only_during_the_transition_grace() {
+        let (signal, gate) = mempool_ready_channel();
+        signal.certify_source_tip(source_tip(1));
+        let started_at = Instant::now();
+
+        assert!(gate.admits_canonical_tip_at(source_tip(2), started_at));
+        assert!(gate.admits_canonical_tip_at(
+            source_tip(3),
+            started_at + MEMPOOL_TIP_TRANSITION_GRACE.saturating_sub(Duration::from_millis(1))
+        ));
+        assert!(
+            !gate.admits_canonical_tip_at(source_tip(3), started_at + MEMPOOL_TIP_TRANSITION_GRACE),
+            "a later block must not restart the grace while the tips still disagree"
+        );
+
+        signal.certify_source_tip(source_tip(3));
+        let recertified_at = started_at + MEMPOOL_TIP_TRANSITION_GRACE;
+        assert!(gate.admits_canonical_tip_at(source_tip(3), recertified_at));
+        assert!(
+            gate.admits_canonical_tip_at(source_tip(4), recertified_at + Duration::from_secs(1)),
+            "agreement restarts the grace for the next block"
+        );
+    }
+
+    #[test]
+    fn a_withdrawn_generation_admits_no_tip_during_the_grace() {
+        let (signal, gate) = mempool_ready_channel();
+        signal.certify_source_tip(source_tip(1));
+        let started_at = Instant::now();
+        assert!(gate.admits_canonical_tip_at(source_tip(2), started_at));
+
+        signal.withdraw_certification();
+
+        assert!(!gate.admits_canonical_tip_at(source_tip(2), started_at));
+        assert!(!gate.admits_canonical_tip_at(source_tip(1), started_at));
     }
 
     #[tokio::test]

@@ -131,8 +131,11 @@ client.
 ### Ingest
 
 Ingest is ready when its canonical fence is within the configured source lag
-and the current mempool source generation has published a complete snapshot
-certified at that exact canonical tip.
+and a mempool source generation has published a complete snapshot certified at
+the canonical tip. A block does not withdraw readiness: the owner keeps the
+previous generation certified while its replacement hydrates, and the follower
+admits a certified tip that has trailed the canonical tip for less than 30
+seconds. A certified tip that trails for longer reports `syncing`.
 Fresh construction, source recovery, schema admission, and reorg refusal keep
 it unready.
 
@@ -206,7 +209,11 @@ and the five methods required by the native composition. The accepted
 identity and channel are then immutable. Health checks do not repeat structural
 admission: they call `WriterStatus` and a bounded
 `MempoolSnapshot(max_entries = 1)` through that same authenticated channel and
-validate coherent network and tip evidence. A transition into failure emits
+validate coherent network and tip evidence. Block arrival does not fail the
+check: the writer answers a mempool read at a new tip once its replacement
+generation is certified, waiting up to five seconds, and a snapshot that is
+still not coherent returns `CHAIN_EPOCH_PIN_UNAVAILABLE`, which the probe
+accepts as healthy. A transition into failure emits
 one classified warning and drains readiness with
 `ingest_control_unavailable`; recovery emits one event and restores only the
 ingest-control input. A `WriterStatus` that reports a parked writer instead
@@ -334,9 +341,14 @@ block-local boundary.
 ### Mempool owner
 
 - `zinder_mempool_lifecycle_state{status}` is a one-hot gauge over the closed
-  `hydrating`, `serving`, `rebuild_required`, and `halted` states. `halted`
-  means the canonical writer parked on a reorg deeper than its window and the
-  owner stopped following the node mempool until the process restarts.
+  `hydrating`, `serving`, `rebuild_required`, and `halted` states. A normal
+  tip change stays `serving`; `hydrating` means no generation has been
+  certified yet. `halted` means the canonical writer parked on a reorg deeper
+  than its window and the owner stopped following the node mempool until the
+  process restarts.
+- `zinder_mempool_source_tip_changes_total` counts source generations that
+  ended at a tip boundary, including a `Mined` change for a block other than
+  the serving tip.
 - `zinder_mempool_entries` reports the current process-local live entry count.
 - `zinder_mempool_source_errors_total{kind,failure_class}` and
   `zinder_mempool_hydration_failures_total{reason}` diagnose bounded source
@@ -418,13 +430,23 @@ balance request, records under `transparent_address_balance`.
 The `ZinderWalletQueryP95High` alert and the overview dashboard read these
 series.
 
-### Compatibility reader
+### Serving-pair publisher
 
-Compatibility metrics report writer-status availability, catch-up duration,
-retired-pair teardown duration, pair convergence attempts, published
-generation, replica lag, pair admission failure, and wallet-serving pair
-replacement. gRPC request metrics remain separate from pair-maintenance
-metrics.
+Native query and compatibility share the serving-pair publisher. Its metrics
+report writer-status availability, catch-up duration, retired-pair teardown
+duration, pair convergence attempts, published generation, replica lag, pair
+admission failure, and wallet-serving pair replacement. gRPC request metrics
+remain separate from pair-maintenance metrics.
+
+A request keeps the pair it captured open until it finishes, which pins that
+pair's secondary generation. The publisher rotates through four generation
+slots, so publication continues while up to two retired pairs are pinned.
+`zinder_wallet_serving_pair_publisher_pinned_retired_pairs` reports how many
+retired pairs requests still hold, and
+`zinder_wallet_serving_pair_publisher_generation_wait_total{reason="in_flight_requests"}`
+counts refreshes that found every unpublished slot pinned and published
+nothing. A steadily rising wait count means a request is holding pairs for
+minutes, and the reader stops advancing until it ends.
 
 ### RocksDB
 
