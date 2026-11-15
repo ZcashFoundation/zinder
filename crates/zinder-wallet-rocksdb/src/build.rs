@@ -589,11 +589,11 @@ where
         }
         lease_cleanup.arm(builder.lease(), initialized_heartbeat.now());
 
-        let data_options = builder.data_options();
+        let column_family_options = builder.column_family_options();
         let mut prepared = write_projection_ssts(
             WalletProjectionLoadConfig {
                 staging_path: staging.path(),
-                options: &data_options,
+                options: &column_family_options,
                 network,
                 first_retained_block: canonical_ready.first_retained_block,
                 settled_tip: canonical_ready.sequence_checkpoint.through(),

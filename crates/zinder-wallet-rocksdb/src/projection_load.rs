@@ -7,7 +7,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rust_rocksdb::Options;
 use zinder_core::wire::UtxoSetCommitmentElement;
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, CanonicalBlockFactsSequenceDigest,
@@ -33,7 +32,7 @@ use crate::{
         REORG_UNDO_COLUMN_FAMILY, TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY,
         TRANSPARENT_ADDRESS_TRANSACTION_COLUMN_FAMILY, TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY,
         TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
-        TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY,
+        TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY, WalletColumnFamilyOptions,
     },
 };
 
@@ -48,7 +47,7 @@ const SPEND_EVENT_TAG: u8 = 1;
 #[derive(Clone, Copy)]
 pub(crate) struct WalletProjectionLoadConfig<'options> {
     pub(crate) staging_path: &'options Path,
-    pub(crate) options: &'options Options,
+    pub(crate) options: &'options WalletColumnFamilyOptions,
     pub(crate) network: Network,
     pub(crate) first_retained_block: BlockId,
     pub(crate) settled_tip: BlockId,
@@ -458,8 +457,16 @@ pub(crate) fn write_projection_ssts(
         config.max_secondary_sort_memory_bytes_per_sorter,
         config.max_temporary_file_bytes_per_sorter,
     )?;
-    let mut unspent_writer = ordered_writer(config, "wallet-unspent-output")?;
-    let mut spent_writer = ordered_writer(config, "wallet-spent-output")?;
+    let mut unspent_writer = ordered_writer(
+        config,
+        WalletProjectionRowFamily::TransparentUnspentOutput,
+        "wallet-unspent-output",
+    )?;
+    let mut spent_writer = ordered_writer(
+        config,
+        WalletProjectionRowFamily::TransparentSpentOutput,
+        "wallet-spent-output",
+    )?;
     let mut digest = WalletProjectionDigestBuilder::new();
     let mut sst_evidence = WalletProjectionSstEvidence::default();
     let mut utxo_count = 0_u64;
@@ -485,8 +492,16 @@ pub(crate) fn write_projection_ssts(
     let phase_started = Instant::now();
     let mut sorted_address_index = address_index_sorter.finish()?;
     let address_index_sort_evidence = sorted_address_index.evidence();
-    let mut address_index_writer = ordered_writer(config, "wallet-address-unspent-index")?;
-    let mut address_balance_writer = ordered_writer(config, "wallet-address-balance")?;
+    let mut address_index_writer = ordered_writer(
+        config,
+        WalletProjectionRowFamily::TransparentUnspentOutputByAddress,
+        "wallet-address-unspent-index",
+    )?;
+    let mut address_balance_writer = ordered_writer(
+        config,
+        WalletProjectionRowFamily::TransparentAddressBalance,
+        "wallet-address-balance",
+    )?;
     drain_address_index(
         &mut sorted_address_index,
         &mut address_index_writer,
@@ -499,7 +514,11 @@ pub(crate) fn write_projection_ssts(
 
     let mut sorted_address_transactions = address_transaction_sorter.finish()?;
     let address_transaction_sort_evidence = sorted_address_transactions.evidence();
-    let mut address_transaction_writer = ordered_writer(config, "wallet-address-transaction")?;
+    let mut address_transaction_writer = ordered_writer(
+        config,
+        WalletProjectionRowFamily::TransparentAddressTransaction,
+        "wallet-address-transaction",
+    )?;
     drain_address_transactions(
         &mut sorted_address_transactions,
         &mut address_transaction_writer,
@@ -509,7 +528,11 @@ pub(crate) fn write_projection_ssts(
     )?;
     let address_transaction_files = address_transaction_writer.finish()?;
 
-    let mut reorg_undo_writer = ordered_writer(config, "wallet-reorg-undo")?;
+    let mut reorg_undo_writer = ordered_writer(
+        config,
+        WalletProjectionRowFamily::ReorgUndo,
+        "wallet-reorg-undo",
+    )?;
     for mut undo in retained_undo.records {
         undo.address_transaction_keys.sort_unstable();
         let key = undo.encode_key();
@@ -865,12 +888,13 @@ fn append_row(
 
 fn ordered_writer<'options>(
     config: WalletProjectionLoadConfig<'options>,
+    family: WalletProjectionRowFamily,
     artifact_label: &'static str,
 ) -> Result<OrderedSstWriter<'options>, RocksDbWalletError> {
     Ok(OrderedSstWriter::new(
         config.staging_path,
         artifact_label,
-        config.options,
+        config.options.for_family(family),
         config.sst_target_logical_bytes,
     )?)
 }
@@ -982,6 +1006,7 @@ fn increment(counter: u64) -> Result<u64, RocksDbWalletError> {
 mod tests {
     use std::{error::Error, path::Path};
 
+    use rust_rocksdb::Cache;
     use tempfile::TempDir;
     use zinder_core::{
         BlockHeaderArtifact, CanonicalBlockFacts, CanonicalBlockFactsDigestVersion,
@@ -992,6 +1017,7 @@ mod tests {
         decode_canonical_block_replay, encode_canonical_block_replay,
     };
     use zinder_rocksdb_bulk_load::BulkLoadError;
+    use zinder_store::RocksDbResourceBudget;
     use zinder_wallet_projection::WalletProjectionSerialOracle;
 
     use super::*;
@@ -1000,6 +1026,7 @@ mod tests {
     const TEST_TEMPORARY_FILE_BYTES: u64 = 16 * 1024 * 1024;
     const TEST_SST_LOGICAL_BYTES: u64 = 1024 * 1024;
     const TEST_REORG_UNDO_BYTES: u64 = 1024 * 1024;
+    const TEST_BLOCK_CACHE_BYTES: usize = 1024 * 1024;
 
     #[derive(Clone, Copy)]
     struct TestByteLimits {
@@ -1099,7 +1126,7 @@ mod tests {
     fn external_loader_accepts_an_authenticated_checkpoint_successor_as_its_first_block()
     -> Result<(), Box<dyn Error>> {
         let temporary = TempDir::new()?;
-        let options = Options::default();
+        let options = test_column_family_options();
         let first_retained = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([0xc2; 32]));
         let tip = BlockId::new(BlockHeight::new(3), BlockHash::from_bytes([0xc3; 32]));
         let blocks = vec![
@@ -1128,7 +1155,7 @@ mod tests {
     fn external_loader_rejects_a_first_block_outside_the_authenticated_retained_anchor()
     -> Result<(), Box<dyn Error>> {
         let temporary = TempDir::new()?;
-        let options = Options::default();
+        let options = test_column_family_options();
         let expected_first = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([0xd2; 32]));
         let observed_first = BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([0xc2; 32]));
         let blocks = vec![block_facts(2, [0xc1; 32], [0xc2; 32], Vec::new())];
@@ -1156,7 +1183,7 @@ mod tests {
     #[test]
     fn external_loader_rejects_duplicate_output_and_spend_keys() -> Result<(), Box<dyn Error>> {
         let temporary = TempDir::new()?;
-        let options = Options::default();
+        let options = test_column_family_options();
         let address = TransparentAddressScriptHash::from_bytes([0xa1; 32]);
         let transaction = TransactionId::from_bytes([0xb1; 32]);
         let outpoint = TransparentOutPoint::new(transaction, 0);
@@ -1236,7 +1263,7 @@ mod tests {
     #[test]
     fn external_loader_rejects_missing_and_future_predecessors() -> Result<(), Box<dyn Error>> {
         let temporary = TempDir::new()?;
-        let options = Options::default();
+        let options = test_column_family_options();
         let missing = TransparentOutPoint::new(TransactionId::from_bytes([0xee; 32]), 0);
         let missing_blocks = vec![block_facts(
             1,
@@ -1289,7 +1316,7 @@ mod tests {
     #[test]
     fn external_loader_preserves_zero_only_and_mixed_zero_balances() -> Result<(), Box<dyn Error>> {
         let temporary = TempDir::new()?;
-        let options = Options::default();
+        let options = test_column_family_options();
         let address = TransparentAddressScriptHash::from_bytes([0xa1; 32]);
         let zero_blocks = vec![block_facts(
             1,
@@ -1357,7 +1384,7 @@ mod tests {
     #[test]
     fn external_loader_merges_multiple_outpoint_runs() -> Result<(), Box<dyn Error>> {
         let temporary = TempDir::new()?;
-        let options = Options::default();
+        let options = test_column_family_options();
         let address = TransparentAddressScriptHash::from_bytes([0xa1; 32]);
         let blocks = vec![block_facts(
             1,
@@ -1396,7 +1423,7 @@ mod tests {
     fn external_loader_refuses_memory_and_temporary_file_limit_crossings()
     -> Result<(), Box<dyn Error>> {
         let temporary = TempDir::new()?;
-        let options = Options::default();
+        let options = test_column_family_options();
         let blocks = vec![block_facts(
             1,
             [0; 32],
@@ -1456,9 +1483,16 @@ mod tests {
         Ok(())
     }
 
+    fn test_column_family_options() -> WalletColumnFamilyOptions {
+        WalletColumnFamilyOptions::new(
+            &Cache::new_lru_cache(TEST_BLOCK_CACHE_BYTES),
+            RocksDbResourceBudget::for_local_tests(),
+        )
+    }
+
     fn test_config<'options>(
         staging_path: &'options Path,
-        options: &'options Options,
+        options: &'options WalletColumnFamilyOptions,
         limits: TestByteLimits,
     ) -> WalletProjectionLoadConfig<'options> {
         test_config_with_settled_tip(
@@ -1471,7 +1505,7 @@ mod tests {
 
     fn test_config_with_settled_tip<'options>(
         staging_path: &'options Path,
-        options: &'options Options,
+        options: &'options WalletColumnFamilyOptions,
         limits: TestByteLimits,
         settled_tip: BlockId,
     ) -> WalletProjectionLoadConfig<'options> {
@@ -1486,7 +1520,7 @@ mod tests {
 
     fn test_config_with_bounds<'options>(
         staging_path: &'options Path,
-        options: &'options Options,
+        options: &'options WalletColumnFamilyOptions,
         limits: TestByteLimits,
         first_retained_block: BlockId,
         settled_tip: BlockId,
@@ -1541,7 +1575,7 @@ mod tests {
 
     fn assert_missing_predecessor(
         staging_path: &Path,
-        options: &Options,
+        options: &WalletColumnFamilyOptions,
         replays: Vec<ValidatedCanonicalBlockReplay>,
     ) {
         assert!(matches!(

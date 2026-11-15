@@ -12,9 +12,10 @@ use std::{
 use zinder_rocksdb_bulk_load::{SortedVariableValues, VariableValueSorter};
 
 use rust_rocksdb::{
-    BoundColumnFamily, Cache, ColumnFamilyDescriptor, DBCompressionType,
-    DEFAULT_COLUMN_FAMILY_NAME, Direction, FlushOptions, IngestExternalFileOptions, IteratorMode,
-    Options, ReadOptions, WriteBatch, WriteOptions, checkpoint::Checkpoint,
+    BlockBasedIndexType, BlockBasedOptions, BoundColumnFamily, Cache, ColumnFamilyDescriptor,
+    DBCompressionType, DEFAULT_COLUMN_FAMILY_NAME, Direction, FlushOptions,
+    IngestExternalFileOptions, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions,
+    checkpoint::Checkpoint,
 };
 use zinder_core::{
     BlockHeight, BlockHeightRange, BlockId, CanonicalBlockFactsSequenceDigest, Network,
@@ -141,14 +142,38 @@ pub(crate) const TRANSPARENT_ADDRESS_TRANSACTION_COLUMN_FAMILY: &str =
 pub(crate) const TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY: &str = "transparent_address_balance";
 pub(crate) const REORG_UNDO_COLUMN_FAMILY: &str = "reorg_undo";
 
-const WALLET_DATA_COLUMN_FAMILIES: [&str; 6] = [
-    TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY,
-    TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
-    TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY,
-    TRANSPARENT_ADDRESS_TRANSACTION_COLUMN_FAMILY,
-    TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY,
-    REORG_UNDO_COLUMN_FAMILY,
+const WALLET_DATA_COLUMN_FAMILIES: [(&str, WalletProjectionRowFamily); 6] = [
+    (
+        TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY,
+        WalletProjectionRowFamily::TransparentUnspentOutput,
+    ),
+    (
+        TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
+        WalletProjectionRowFamily::TransparentUnspentOutputByAddress,
+    ),
+    (
+        TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY,
+        WalletProjectionRowFamily::TransparentSpentOutput,
+    ),
+    (
+        TRANSPARENT_ADDRESS_TRANSACTION_COLUMN_FAMILY,
+        WalletProjectionRowFamily::TransparentAddressTransaction,
+    ),
+    (
+        TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY,
+        WalletProjectionRowFamily::TransparentAddressBalance,
+    ),
+    (
+        REORG_UNDO_COLUMN_FAMILY,
+        WalletProjectionRowFamily::ReorgUndo,
+    ),
 ];
+/// Bloom-equivalent bits per key of the point-lookup filters, about a 1%
+/// false-positive rate.
+const POINT_LOOKUP_FILTER_BITS_PER_KEY: f64 = 10.0;
+/// Flushed and L0 files keep Bloom filters, which build faster; files below L0,
+/// including bulk-built ones, use Ribbon, which needs about 30% less memory.
+const POINT_LOOKUP_FILTER_BLOOM_BEFORE_LEVEL: i32 = 1;
 const ADDRESS_UNSPENT_KEY_BYTES: usize = 72;
 const ADDRESS_TRANSACTION_KEY_BYTES: usize = 40;
 
@@ -511,8 +536,8 @@ impl RocksDbWalletBuilder {
     }
 
     /// Returns column-family options identical to those used by the BUILDING store.
-    pub(crate) fn data_options(&self) -> Options {
-        wallet_data_options(&self.bounded_open.block_cache, self.resource_budget)
+    pub(crate) fn column_family_options(&self) -> WalletColumnFamilyOptions {
+        WalletColumnFamilyOptions::new(&self.bounded_open.block_cache, self.resource_budget)
     }
 
     pub(crate) const fn lease(&self) -> WalletProjectionBuildLease {
@@ -1555,18 +1580,66 @@ pub(crate) fn wallet_column_family_descriptors(
     block_cache: &Cache,
     resource_budget: RocksDbResourceBudget,
 ) -> Vec<ColumnFamilyDescriptor> {
+    let options = WalletColumnFamilyOptions::new(block_cache, resource_budget);
     WALLET_DATA_COLUMN_FAMILIES
         .into_iter()
-        .map(|name| {
-            ColumnFamilyDescriptor::new(name, wallet_data_options(block_cache, resource_budget))
-        })
+        .map(|(name, family)| ColumnFamilyDescriptor::new(name, options.for_family(family).clone()))
         .collect()
 }
 
-fn wallet_data_options(block_cache: &Cache, resource_budget: RocksDbResourceBudget) -> Options {
+/// `RocksDB` options for every wallet data family, all charged to one block cache.
+///
+/// Every open path and the bulk-build SST writer take a family's options from
+/// here, so a family's filter cannot differ between rebuilt and followed files.
+pub(crate) struct WalletColumnFamilyOptions {
+    point_lookup: Options,
+    unfiltered: Options,
+}
+
+impl WalletColumnFamilyOptions {
+    pub(crate) fn new(block_cache: &Cache, resource_budget: RocksDbResourceBudget) -> Self {
+        let mut point_lookup_table = build_block_based_table_factory(block_cache);
+        point_lookup_table.set_hybrid_ribbon_filter(
+            POINT_LOOKUP_FILTER_BITS_PER_KEY,
+            POINT_LOOKUP_FILTER_BLOOM_BEFORE_LEVEL,
+        );
+        // Partitioned filters require the two-level index. Together they cache
+        // filter and index data in small partitions instead of one block per file.
+        point_lookup_table.set_index_type(BlockBasedIndexType::TwoLevelIndexSearch);
+        point_lookup_table.set_partition_filters(true);
+        Self {
+            point_lookup: wallet_data_options(&point_lookup_table, resource_budget),
+            unfiltered: wallet_data_options(
+                &build_block_based_table_factory(block_cache),
+                resource_budget,
+            ),
+        }
+    }
+
+    /// Returns the options of the column family that stores `family`.
+    pub(crate) const fn for_family(&self, family: WalletProjectionRowFamily) -> &Options {
+        match family {
+            // The planner reads these hash-keyed families to prove that each
+            // created output, spend, address-index row, and history row is
+            // new, and those reads miss. Balance and undo reads usually find
+            // their row, so a filter there mostly adds a probe.
+            WalletProjectionRowFamily::TransparentUnspentOutput
+            | WalletProjectionRowFamily::TransparentUnspentOutputByAddress
+            | WalletProjectionRowFamily::TransparentSpentOutput
+            | WalletProjectionRowFamily::TransparentAddressTransaction => &self.point_lookup,
+            WalletProjectionRowFamily::TransparentAddressBalance
+            | WalletProjectionRowFamily::ReorgUndo => &self.unfiltered,
+        }
+    }
+}
+
+fn wallet_data_options(
+    table_options: &BlockBasedOptions,
+    resource_budget: RocksDbResourceBudget,
+) -> Options {
     let mut options = Options::default();
     options.set_compression_type(DBCompressionType::Snappy);
-    options.set_block_based_table_factory(&build_block_based_table_factory(block_cache));
+    options.set_block_based_table_factory(table_options);
     options.set_write_buffer_size(
         usize::try_from(resource_budget.write_buffer_bytes).unwrap_or(usize::MAX),
     );
@@ -1607,7 +1680,7 @@ fn create_fresh_directory(path: &Path) -> Result<(), RocksDbWalletError> {
 
 pub(crate) fn required_column_family_names() -> Vec<String> {
     std::iter::once(DEFAULT_COLUMN_FAMILY_NAME)
-        .chain(WALLET_DATA_COLUMN_FAMILIES)
+        .chain(WALLET_DATA_COLUMN_FAMILIES.map(|(name, _)| name))
         .map(str::to_owned)
         .collect()
 }
@@ -1812,8 +1885,8 @@ fn write_control_sync(
 
 fn flush_complete_build(bounded_open: &BoundedRocksDbOpen) -> Result<(), RocksDbWalletError> {
     let mut families = Vec::with_capacity(WALLET_DATA_COLUMN_FAMILIES.len() + 1);
-    for family_name in
-        std::iter::once(DEFAULT_COLUMN_FAMILY_NAME).chain(WALLET_DATA_COLUMN_FAMILIES)
+    for family_name in std::iter::once(DEFAULT_COLUMN_FAMILY_NAME)
+        .chain(WALLET_DATA_COLUMN_FAMILIES.map(|(name, _)| name))
     {
         families.push(column_family(bounded_open, family_name)?);
     }
@@ -2920,6 +2993,7 @@ fn validation_read_options() -> ReadOptions {
 
 #[cfg(test)]
 mod tests {
+    use rust_rocksdb::statistics::Ticker;
     use tempfile::TempDir;
     use zinder_core::wire::UtxoSetCommitmentElement;
     use zinder_core::{
@@ -4419,5 +4493,116 @@ mod tests {
         assert_eq!(evidence.row_counts.transparent_address_balance_count, 0);
         assert_eq!(store.utxo_summary().utxo_count, 1);
         Ok(())
+    }
+
+    #[test]
+    fn flushed_hash_keyed_families_carry_partitioned_filters_and_the_rest_do_not()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let bounded_open = open_bounded_rocksdb(
+            RocksDbOpenRole::Primary {
+                path: temporary.path(),
+            },
+            RocksDbResourceBudget::for_local_tests(),
+            wallet_column_family_descriptors,
+        )?;
+        bounded_open.db.put(b"control", b"row")?;
+        for (name, _) in WALLET_DATA_COLUMN_FAMILIES {
+            let family = column_family(&bounded_open, name)?;
+            bounded_open.db.put_cf(&family, [0x5a; 36], b"row")?;
+        }
+        flush_complete_build(&bounded_open)?;
+
+        for (name, filtered) in [
+            (TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY, true),
+            (TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY, true),
+            (TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY, true),
+            (TRANSPARENT_ADDRESS_TRANSACTION_COLUMN_FAMILY, true),
+            (TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY, false),
+            (REORG_UNDO_COLUMN_FAMILY, false),
+            (DEFAULT_COLUMN_FAMILY_NAME, false),
+        ] {
+            let property = |field| aggregated_table_property(&bounded_open, name, field);
+            assert_eq!(property("# entries")?, Some(1), "{name} was not flushed");
+            if filtered {
+                assert!(property("filter block size")? > Some(0), "{name}");
+                assert_eq!(property("# entries for filter")?, Some(1), "{name}");
+                assert!(property("# index partitions")? > Some(0), "{name}");
+            } else {
+                assert_eq!(property("filter block size")?, Some(0), "{name}");
+                assert_eq!(property("# entries for filter")?, Some(0), "{name}");
+                assert_eq!(property("# index partitions")?, None, "{name}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn absent_spent_output_reads_stop_at_the_filter_before_any_data_block()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let bounded_open = open_bounded_rocksdb(
+            RocksDbOpenRole::Primary {
+                path: temporary.path(),
+            },
+            RocksDbResourceBudget::for_local_tests(),
+            wallet_column_family_descriptors,
+        )?;
+        let spent_family = column_family(&bounded_open, TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY)?;
+        let outpoint_key = |transaction_byte| {
+            WalletOutpointKey::new(TransparentOutPoint::new(
+                TransactionId::from_bytes([transaction_byte; 32]),
+                0,
+            ))
+        };
+        // The absent key sorts between the stored keys, so RocksDB cannot skip
+        // the file on its key range and must consult the filter.
+        for transaction_byte in [0x11, 0xee] {
+            bounded_open.db.put_cf(
+                &spent_family,
+                outpoint_key(transaction_byte).as_bytes(),
+                b"spent",
+            )?;
+        }
+        flush_complete_build(&bounded_open)?;
+        let statistics = &bounded_open.statistics;
+        let useful_before = statistics.get_ticker_count(Ticker::BloomFilterUseful);
+        let data_misses_before = statistics.get_ticker_count(Ticker::BlockCacheDataMiss);
+
+        let observed = bounded_open
+            .db
+            .get_cf(&spent_family, outpoint_key(0x80).as_bytes())?;
+
+        assert_eq!(observed, None);
+        assert!(statistics.get_ticker_count(Ticker::BloomFilterUseful) > useful_before);
+        assert_eq!(
+            statistics.get_ticker_count(Ticker::BlockCacheDataMiss),
+            data_misses_before
+        );
+        Ok(())
+    }
+
+    /// Reads one numeric field of the family's `rocksdb.aggregated-table-properties`.
+    ///
+    /// The aggregate sums the family's live SST files and never carries a
+    /// filter policy name, and `# index partitions` appears only when nonzero.
+    fn aggregated_table_property(
+        bounded_open: &BoundedRocksDbOpen,
+        family_name: &'static str,
+        field: &str,
+    ) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+        let family = column_family(bounded_open, family_name)?;
+        let properties = bounded_open
+            .db
+            .property_value_cf(&family, "rocksdb.aggregated-table-properties")?
+            .ok_or("aggregated table properties are unavailable")?;
+        for entry in properties.split("; ") {
+            if let Some((name, number)) = entry.split_once('=')
+                && name.trim() == field
+            {
+                return Ok(Some(number.trim().parse()?));
+            }
+        }
+        Ok(None)
     }
 }
