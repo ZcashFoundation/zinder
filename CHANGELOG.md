@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A transparent-address ranking build that trails Explorer views still rebuilding from canonical history now catches up and joins them, instead of falling further behind until replay reaches the tip, so address detail and activity return far sooner on read-limited storage. View replay waits for such a build while `zinder_materialized_view_replay_waiting_for_ranking_build` is `1`, and stops waiting if the build applies no history for 5 minutes. Spend resolution also issues fewer device reads, the prevout resolution metrics gain a `cache` label that names the walker, and `zinder-ingest` exports its canonical reader's RocksDB gauges under the `canonical_secondary` store role. ([#209](https://github.com/ZcashFoundation/zinder/pull/209))
+- A transparent-address ranking build that trails Explorer views still rebuilding from canonical history now catches up and joins them, instead of falling further behind until replay reaches the tip, so address detail and activity return far sooner on read-limited storage. View replay waits for such a build while `zinder_materialized_view_replay_waiting_for_ranking_build` is `1`, and stops waiting once the build, outside pauses it shares with replay, neither applies a page nor warms its cache further for 5 minutes. Spend resolution also issues fewer device reads, the prevout resolution metrics gain a `cache` label that names the walker, and `zinder-ingest` exports its canonical reader's RocksDB gauges under the `canonical_secondary` store role. ([#209](https://github.com/ZcashFoundation/zinder/pull/209))
 
 
 ## [0.14.0] - 2026-11-15
