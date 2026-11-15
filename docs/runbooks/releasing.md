@@ -323,7 +323,7 @@ done
 ```
 
 The loop lists the 8 images that current releases publish. Releases through
-`v0.10.0`, including the `v0.9.0` example, publish only the first 6, and
+`v0.12.0`, including the `v0.9.0` example, publish only the first 6, and
 releases before `v0.9.0-rc.1` publish only the first 4. Drop the names a
 release does not publish when verifying it.
 

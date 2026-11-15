@@ -459,6 +459,16 @@ healthcheck path stays `/healthz` on the query process. Provision memory
 beyond the 8 GB minimum for the Explorer process. Its budget has not been
 measured.
 
+The Explorer views live on the same volume, beneath
+`/var/lib/zinder/canonical/materialized-views`, so size the volume for them on
+top of the wallet-serving needs. Their disk budget has not been measured.
+Ingest pauses view replay while the volume has less available space than
+`ZINDER_INGEST__EXPLORER_VIEWS_MIN_FREE_BYTES`, 10 GiB by default, and logs
+`materialized_view_replay_volume_space_low`. Wallet serving keeps running, but
+the Explorer views stop advancing until the volume grows or space is freed.
+Watch for that event, and see
+[Keep Explorer views from filling the volume](deploying-on-a-vm.md#keep-explorer-views-from-filling-the-volume).
+
 The Explorer reads only these variables:
 
 - `ZINDER_NETWORK__*` and `ZINDER_NODE__*`, which it shares with the
