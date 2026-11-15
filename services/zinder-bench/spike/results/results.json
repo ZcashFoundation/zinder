@@ -1,0 +1,1056 @@
+{
+  "spike": "A-combined-commit",
+  "network": "Testnet stores and blocks (T = 4620122, H0 = 4570122); Mainnet-like rows are synthetic density lanes",
+  "source_revision": "33fda1617037f6e27e4dcb98822cf373722dac45",
+  "overall": "fail",
+  "failed": [
+    {
+      "name": "tip commit p99 at most 2x canonical-only p99",
+      "threshold": "<= 2.0x",
+      "arm": "Arm 1 combined (H0+1..T)",
+      "scope": "Testnet",
+      "measured": "7.19x (combined 204.4 ms, canonical-only 28.4 ms)",
+      "pass": "fail",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/compare-arm1.json"
+    },
+    {
+      "name": "tip commit p99 at most 2x canonical-only p99",
+      "threshold": "<= 2.0x",
+      "arm": "density x4 combined (lanes clamped at 2,000,000-byte blocks)",
+      "scope": "Mainnet-like synthetic",
+      "measured": "12.64x (combined 467.6 ms, canonical-only 37.0 ms)",
+      "pass": "fail",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/compare-density4.json"
+    },
+    {
+      "name": "tip commit p99 at most 2x canonical-only p99",
+      "threshold": "<= 2.0x",
+      "arm": "density x7 combined (lanes clamped at 2,000,000-byte blocks)",
+      "scope": "Mainnet-like synthetic",
+      "measured": "16.12x (combined 641.8 ms, canonical-only 39.8 ms)",
+      "pass": "fail",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/compare-density7.json"
+    },
+    {
+      "name": "writer peak RSS during the replacement at most 6 GiB",
+      "threshold": "<= 6 GiB",
+      "arm": "Arm 2 combined over the densest Testnet window, density x2",
+      "scope": "synthetic; 1.7x the densest 2026 Mainnet day in bytes, 7.3x in transparent inputs plus outputs",
+      "measured": "6.069 GiB VmHWM; 6.292 GiB with unmirrored source bytes added (estimate)",
+      "pass": "fail",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x2-combined.json"
+    },
+    {
+      "name": "writer peak RSS during the replacement at most 6 GiB",
+      "threshold": "<= 6 GiB",
+      "arm": "Arm 2 combined over the densest Testnet window, density x4",
+      "scope": "synthetic; 3.4x the densest 2026 Mainnet day in bytes, 14.6x in transparent inputs plus outputs",
+      "measured": "10.681 GiB VmHWM; 11.350 GiB with unmirrored source bytes added (estimate)",
+      "pass": "fail",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x4-combined.json"
+    }
+  ],
+  "thresholds": [
+    {
+      "name": "wallet digest equals reference",
+      "threshold": "equal",
+      "arm": "Arm 1 combined at T vs build_wallet_from_canonical over the canonical-only result",
+      "scope": "Testnet",
+      "measured": "combined 07d21c53dd82b0caa9620b13910b7c5f6f256be4afd5b36b22ad93f663e219c8 vs reference 07d21c53dd82b0caa9620b13910b7c5f6f256be4afd5b36b22ad93f663e219c8; flags {'digest_equal': True, 'combined_rows_match_evidence': True, 'row_counts_equal': True, 'utxo_summary_equal': True, 'source_tip_equal': True, 'settled_tip_equal': True, 'source_sequence_digest_equal': True, 'baseline_canonical_sequence_equal': True}",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/verify-arm1.json"
+    },
+    {
+      "name": "wallet digest equals reference",
+      "threshold": "equal",
+      "arm": "Arm 1 combined at T vs data prep's projector-built and followed wallet",
+      "scope": "Testnet",
+      "measured": "combined 07d21c53dd82b0caa9620b13910b7c5f6f256be4afd5b36b22ad93f663e219c8 vs reference 07d21c53dd82b0caa9620b13910b7c5f6f256be4afd5b36b22ad93f663e219c8; flags {'digest_equal': True, 'combined_rows_match_evidence': True, 'row_counts_equal': True, 'utxo_summary_equal': True, 'source_tip_equal': True, 'settled_tip_equal': True, 'source_sequence_digest_equal': True, 'baseline_canonical_sequence_equal': None}",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/verify-arm1-dataprep.json"
+    },
+    {
+      "name": "wallet digest equals reference",
+      "threshold": "equal",
+      "arm": "after Arm 2 (5 x 1000-block replacements at T) vs the same reference",
+      "scope": "Testnet",
+      "measured": "combined 07d21c53dd82b0caa9620b13910b7c5f6f256be4afd5b36b22ad93f663e219c8 vs reference 07d21c53dd82b0caa9620b13910b7c5f6f256be4afd5b36b22ad93f663e219c8; flags {'digest_equal': True, 'combined_rows_match_evidence': True, 'row_counts_equal': True, 'utxo_summary_equal': True, 'source_tip_equal': True, 'settled_tip_equal': True, 'source_sequence_digest_equal': True, 'baseline_canonical_sequence_equal': True}",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/verify-arm2.json"
+    },
+    {
+      "name": "wallet rows equal READY evidence after dense replacements",
+      "threshold": "cold readback equal; digest unchanged",
+      "arm": "Arm 2 dense window x1",
+      "scope": "Testnet",
+      "measured": "cold readback 153.241631004 s; digest before c3b2cfb63f8e2b40d6e2a54a677c7674d20bb1e49f0fda84fb7701f1e74de7a3 after c3b2cfb63f8e2b40d6e2a54a677c7674d20bb1e49f0fda84fb7701f1e74de7a3",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x1-combined.json"
+    },
+    {
+      "name": "tip commit p99 at most 1 s",
+      "threshold": "<= 1000 ms",
+      "arm": "Arm 1 combined (H0+1..T)",
+      "scope": "Testnet",
+      "measured": "p99 204.4 ms (p50 19.9, p99.9 1123.6, max 4747.4)",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm1-combined.json"
+    },
+    {
+      "name": "tip commit p99 at most 2x canonical-only p99",
+      "threshold": "<= 2.0x",
+      "arm": "Arm 1 combined (H0+1..T)",
+      "scope": "Testnet",
+      "measured": "7.19x (combined 204.4 ms, canonical-only 28.4 ms)",
+      "pass": "fail",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/compare-arm1.json"
+    },
+    {
+      "name": "replay at least 10 blocks per second",
+      "threshold": ">= 10 blocks/s",
+      "arm": "Arm 1 combined (H0+1..T)",
+      "scope": "Testnet",
+      "measured": "35.88 blocks/s over 50000 blocks (1393 s)",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm1-combined.json"
+    },
+    {
+      "name": "writer peak RSS at most 6 GiB (replay)",
+      "threshold": "<= 6 GiB",
+      "arm": "Arm 1 combined (H0+1..T)",
+      "scope": "Testnet",
+      "measured": "1.300 GiB VmHWM",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm1-combined.json"
+    },
+    {
+      "name": "zero stop stalls",
+      "threshold": "0",
+      "arm": "Arm 1 combined (H0+1..T)",
+      "scope": "Testnet",
+      "measured": "0 stop entries, 0 stopped samples; 0 delay entries, 0.000 s stall.micros",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm1-combined.json"
+    },
+    {
+      "name": "tip commit p99 at most 1 s",
+      "threshold": "<= 1000 ms",
+      "arm": "Arm 1 canonical-only baseline",
+      "scope": "Testnet",
+      "measured": "p99 28.4 ms (p50 18.9, p99.9 53.9, max 405.9)",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm1-canonical-only.json"
+    },
+    {
+      "name": "replay at least 10 blocks per second",
+      "threshold": ">= 10 blocks/s",
+      "arm": "Arm 1 canonical-only baseline",
+      "scope": "Testnet",
+      "measured": "53.01 blocks/s over 50000 blocks (943 s)",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm1-canonical-only.json"
+    },
+    {
+      "name": "writer peak RSS at most 6 GiB (replay)",
+      "threshold": "<= 6 GiB",
+      "arm": "Arm 1 canonical-only baseline",
+      "scope": "Testnet",
+      "measured": "0.359 GiB VmHWM",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm1-canonical-only.json"
+    },
+    {
+      "name": "zero stop stalls",
+      "threshold": "0",
+      "arm": "Arm 1 canonical-only baseline",
+      "scope": "Testnet",
+      "measured": "0 stop entries, 0 stopped samples; 0 delay entries, 0.000 s stall.micros",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm1-canonical-only.json"
+    },
+    {
+      "name": "tip commit p99 at most 1 s",
+      "threshold": "<= 1000 ms",
+      "arm": "Arm 1 combined repeat (H0+1..4618271)",
+      "scope": "Testnet",
+      "measured": "p99 274.5 ms (p50 20.3, p99.9 1166.9, max 6094.6)",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm1-repeat-to-4618271-combined.json"
+    },
+    {
+      "name": "replay at least 10 blocks per second",
+      "threshold": ">= 10 blocks/s",
+      "arm": "Arm 1 combined repeat (H0+1..4618271)",
+      "scope": "Testnet",
+      "measured": "28.58 blocks/s over 48149 blocks (1685 s)",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm1-repeat-to-4618271-combined.json"
+    },
+    {
+      "name": "writer peak RSS at most 6 GiB (replay)",
+      "threshold": "<= 6 GiB",
+      "arm": "Arm 1 combined repeat (H0+1..4618271)",
+      "scope": "Testnet",
+      "measured": "1.181 GiB VmHWM",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm1-repeat-to-4618271-combined.json"
+    },
+    {
+      "name": "zero stop stalls",
+      "threshold": "0",
+      "arm": "Arm 1 combined repeat (H0+1..4618271)",
+      "scope": "Testnet",
+      "measured": "0 stop entries, 0 stopped samples; 0 delay entries, 0.000 s stall.micros",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm1-repeat-to-4618271-combined.json"
+    },
+    {
+      "name": "tip commit p99 at most 1 s",
+      "threshold": "<= 1000 ms",
+      "arm": "density x4 combined (lanes clamped at 2,000,000-byte blocks)",
+      "scope": "Mainnet-like synthetic",
+      "measured": "p99 467.6 ms (p50 22.6, p99.9 1402.0, max 4106.7)",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/density4-combined.json"
+    },
+    {
+      "name": "tip commit p99 at most 2x canonical-only p99",
+      "threshold": "<= 2.0x",
+      "arm": "density x4 combined (lanes clamped at 2,000,000-byte blocks)",
+      "scope": "Mainnet-like synthetic",
+      "measured": "12.64x (combined 467.6 ms, canonical-only 37.0 ms)",
+      "pass": "fail",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/compare-density4.json"
+    },
+    {
+      "name": "replay at least 10 blocks per second",
+      "threshold": ">= 10 blocks/s",
+      "arm": "density x4 combined (lanes clamped at 2,000,000-byte blocks)",
+      "scope": "Mainnet-like synthetic",
+      "measured": "28.19 blocks/s over 50000 blocks (1773 s)",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/density4-combined.json"
+    },
+    {
+      "name": "writer peak RSS at most 6 GiB (replay)",
+      "threshold": "<= 6 GiB",
+      "arm": "density x4 combined (lanes clamped at 2,000,000-byte blocks)",
+      "scope": "Mainnet-like synthetic",
+      "measured": "1.417 GiB VmHWM",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/density4-combined.json"
+    },
+    {
+      "name": "zero stop stalls",
+      "threshold": "0",
+      "arm": "density x4 combined (lanes clamped at 2,000,000-byte blocks)",
+      "scope": "Mainnet-like synthetic",
+      "measured": "0 stop entries, 0 stopped samples; 0 delay entries, 0.000 s stall.micros",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/density4-combined.json"
+    },
+    {
+      "name": "tip commit p99 at most 1 s",
+      "threshold": "<= 1000 ms",
+      "arm": "density x4 canonical-only baseline",
+      "scope": "Mainnet-like synthetic",
+      "measured": "p99 37.0 ms (p50 18.9, p99.9 86.3, max 404.0)",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/density4-canonical-only.json"
+    },
+    {
+      "name": "replay at least 10 blocks per second",
+      "threshold": ">= 10 blocks/s",
+      "arm": "density x4 canonical-only baseline",
+      "scope": "Mainnet-like synthetic",
+      "measured": "51.87 blocks/s over 50000 blocks (964 s)",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/density4-canonical-only.json"
+    },
+    {
+      "name": "writer peak RSS at most 6 GiB (replay)",
+      "threshold": "<= 6 GiB",
+      "arm": "density x4 canonical-only baseline",
+      "scope": "Mainnet-like synthetic",
+      "measured": "0.414 GiB VmHWM",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/density4-canonical-only.json"
+    },
+    {
+      "name": "zero stop stalls",
+      "threshold": "0",
+      "arm": "density x4 canonical-only baseline",
+      "scope": "Mainnet-like synthetic",
+      "measured": "0 stop entries, 0 stopped samples; 0 delay entries, 0.000 s stall.micros",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/density4-canonical-only.json"
+    },
+    {
+      "name": "tip commit p99 at most 1 s",
+      "threshold": "<= 1000 ms",
+      "arm": "density x7 combined (lanes clamped at 2,000,000-byte blocks)",
+      "scope": "Mainnet-like synthetic",
+      "measured": "p99 641.8 ms (p50 33.2, p99.9 1559.3, max 4276.3)",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/density7-combined.json"
+    },
+    {
+      "name": "tip commit p99 at most 2x canonical-only p99",
+      "threshold": "<= 2.0x",
+      "arm": "density x7 combined (lanes clamped at 2,000,000-byte blocks)",
+      "scope": "Mainnet-like synthetic",
+      "measured": "16.12x (combined 641.8 ms, canonical-only 39.8 ms)",
+      "pass": "fail",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/compare-density7.json"
+    },
+    {
+      "name": "replay at least 10 blocks per second",
+      "threshold": ">= 10 blocks/s",
+      "arm": "density x7 combined (lanes clamped at 2,000,000-byte blocks)",
+      "scope": "Mainnet-like synthetic",
+      "measured": "20.21 blocks/s over 50000 blocks (2474 s)",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/density7-combined.json"
+    },
+    {
+      "name": "writer peak RSS at most 6 GiB (replay)",
+      "threshold": "<= 6 GiB",
+      "arm": "density x7 combined (lanes clamped at 2,000,000-byte blocks)",
+      "scope": "Mainnet-like synthetic",
+      "measured": "1.524 GiB VmHWM",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/density7-combined.json"
+    },
+    {
+      "name": "zero stop stalls",
+      "threshold": "0",
+      "arm": "density x7 combined (lanes clamped at 2,000,000-byte blocks)",
+      "scope": "Mainnet-like synthetic",
+      "measured": "0 stop entries, 0 stopped samples; 0 delay entries, 0.000 s stall.micros",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/density7-combined.json"
+    },
+    {
+      "name": "tip commit p99 at most 1 s",
+      "threshold": "<= 1000 ms",
+      "arm": "density x7 canonical-only baseline",
+      "scope": "Mainnet-like synthetic",
+      "measured": "p99 39.8 ms (p50 25.3, p99.9 69.8, max 392.2)",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/density7-canonical-only.json"
+    },
+    {
+      "name": "replay at least 10 blocks per second",
+      "threshold": ">= 10 blocks/s",
+      "arm": "density x7 canonical-only baseline",
+      "scope": "Mainnet-like synthetic",
+      "measured": "39.74 blocks/s over 50000 blocks (1258 s)",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/density7-canonical-only.json"
+    },
+    {
+      "name": "writer peak RSS at most 6 GiB (replay)",
+      "threshold": "<= 6 GiB",
+      "arm": "density x7 canonical-only baseline",
+      "scope": "Mainnet-like synthetic",
+      "measured": "0.498 GiB VmHWM",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/density7-canonical-only.json"
+    },
+    {
+      "name": "zero stop stalls",
+      "threshold": "0",
+      "arm": "density x7 canonical-only baseline",
+      "scope": "Mainnet-like synthetic",
+      "measured": "0 stop entries, 0 stopped samples; 0 delay entries, 0.000 s stall.micros",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/density7-canonical-only.json"
+    },
+    {
+      "name": "1000-block replacement batch at most 2.5 GiB",
+      "threshold": "<= 2.5 GiB",
+      "arm": "Arm 2 combined at T (sparse window)",
+      "scope": "Testnet",
+      "measured": "10.4 MiB max over 5 replacements of 1000 blocks (4619123..4620122); density x1, effective byte multiplier 1.00",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-combined.json"
+    },
+    {
+      "name": "writer peak RSS during the replacement at most 6 GiB",
+      "threshold": "<= 6 GiB",
+      "arm": "Arm 2 combined at T (sparse window)",
+      "scope": "Testnet",
+      "measured": "0.186 GiB VmHWM",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-combined.json"
+    },
+    {
+      "name": "zero stop stalls",
+      "threshold": "0",
+      "arm": "Arm 2 combined at T (sparse window)",
+      "scope": "Testnet",
+      "measured": "0 stop entries, 0 stopped samples, 0 delay entries",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-combined.json"
+    },
+    {
+      "name": "secondary catch-up after the reorg batch under 30 s",
+      "threshold": "< 30 s",
+      "arm": "Arm 2 combined at T (sparse window)",
+      "scope": "Testnet",
+      "measured": "0.030 s max; fence matched primary after every batch: True",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-combined.json",
+      "context": {
+        "commit_seconds": [
+          6.582295322,
+          5.800658048,
+          5.841519018,
+          6.741212561,
+          6.375551553
+        ]
+      }
+    },
+    {
+      "name": "1000-block replacement batch at most 2.5 GiB",
+      "threshold": "<= 2.5 GiB",
+      "arm": "Arm 2 canonical-only at T",
+      "scope": "Testnet",
+      "measured": "9.9 MiB max over 5 replacements of 1000 blocks (4619123..4620122); density x1, effective byte multiplier 1.00",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-canonical-only.json"
+    },
+    {
+      "name": "writer peak RSS during the replacement at most 6 GiB",
+      "threshold": "<= 6 GiB",
+      "arm": "Arm 2 canonical-only at T",
+      "scope": "Testnet",
+      "measured": "0.152 GiB VmHWM",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-canonical-only.json"
+    },
+    {
+      "name": "zero stop stalls",
+      "threshold": "0",
+      "arm": "Arm 2 canonical-only at T",
+      "scope": "Testnet",
+      "measured": "0 stop entries, 0 stopped samples, 0 delay entries",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-canonical-only.json"
+    },
+    {
+      "name": "secondary catch-up after the reorg batch under 30 s",
+      "threshold": "< 30 s",
+      "arm": "Arm 2 canonical-only at T",
+      "scope": "Testnet",
+      "measured": "0.025 s max; fence matched primary after every batch: True",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-canonical-only.json",
+      "context": {
+        "commit_seconds": [
+          5.792090419,
+          5.700877198,
+          5.706695033,
+          5.82225436,
+          5.741403061
+        ]
+      }
+    },
+    {
+      "name": "1000-block replacement batch at most 2.5 GiB",
+      "threshold": "<= 2.5 GiB",
+      "arm": "Arm 2 combined at T, density x4",
+      "scope": "Testnet window scaled",
+      "measured": "41.6 MiB max over 5 replacements of 1000 blocks (4619123..4620122); density x4, effective byte multiplier 4.00",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-density4-combined.json"
+    },
+    {
+      "name": "writer peak RSS during the replacement at most 6 GiB",
+      "threshold": "<= 6 GiB",
+      "arm": "Arm 2 combined at T, density x4",
+      "scope": "Testnet window scaled",
+      "measured": "0.335 GiB VmHWM; 0.357 GiB with unmirrored source bytes added (estimate)",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-density4-combined.json"
+    },
+    {
+      "name": "zero stop stalls",
+      "threshold": "0",
+      "arm": "Arm 2 combined at T, density x4",
+      "scope": "Testnet window scaled",
+      "measured": "0 stop entries, 0 stopped samples, 0 delay entries",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-density4-combined.json"
+    },
+    {
+      "name": "secondary catch-up after the reorg batch under 30 s",
+      "threshold": "< 30 s",
+      "arm": "Arm 2 combined at T, density x4",
+      "scope": "Testnet window scaled",
+      "measured": "0.168 s max; fence matched primary after every batch: True",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-density4-combined.json",
+      "context": {
+        "commit_seconds": [
+          6.010539649,
+          6.374294622,
+          8.753466235,
+          10.500255466,
+          8.07064993
+        ]
+      }
+    },
+    {
+      "name": "1000-block replacement batch at most 2.5 GiB",
+      "threshold": "<= 2.5 GiB",
+      "arm": "Arm 2 combined at T, density x7",
+      "scope": "Testnet window scaled",
+      "measured": "72.7 MiB max over 5 replacements of 1000 blocks (4619123..4620122); density x7, effective byte multiplier 7.00",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-density7-combined.json"
+    },
+    {
+      "name": "writer peak RSS during the replacement at most 6 GiB",
+      "threshold": "<= 6 GiB",
+      "arm": "Arm 2 combined at T, density x7",
+      "scope": "Testnet window scaled",
+      "measured": "0.514 GiB VmHWM; 0.560 GiB with unmirrored source bytes added (estimate)",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-density7-combined.json"
+    },
+    {
+      "name": "zero stop stalls",
+      "threshold": "0",
+      "arm": "Arm 2 combined at T, density x7",
+      "scope": "Testnet window scaled",
+      "measured": "0 stop entries, 0 stopped samples, 0 delay entries",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-density7-combined.json"
+    },
+    {
+      "name": "secondary catch-up after the reorg batch under 30 s",
+      "threshold": "< 30 s",
+      "arm": "Arm 2 combined at T, density x7",
+      "scope": "Testnet window scaled",
+      "measured": "0.190 s max; fence matched primary after every batch: True",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-density7-combined.json",
+      "context": {
+        "commit_seconds": [
+          6.259111822,
+          6.151758867,
+          6.177360628,
+          6.192664416,
+          6.204346293
+        ]
+      }
+    },
+    {
+      "name": "1000-block replacement batch at most 2.5 GiB",
+      "threshold": "<= 2.5 GiB",
+      "arm": "Arm 2 combined over the densest Testnet window, density x1",
+      "scope": "Testnet; window 4617272..4618271 is 0.85x the densest 2026 Mainnet day in bytes and 3.6x its transparent inputs plus outputs",
+      "measured": "614.7 MiB max over 5 replacements of 1000 blocks (4617272..4618271); density x1, effective byte multiplier 1.00",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x1-combined.json"
+    },
+    {
+      "name": "writer peak RSS during the replacement at most 6 GiB",
+      "threshold": "<= 6 GiB",
+      "arm": "Arm 2 combined over the densest Testnet window, density x1",
+      "scope": "Testnet; window 4617272..4618271 is 0.85x the densest 2026 Mainnet day in bytes and 3.6x its transparent inputs plus outputs",
+      "measured": "2.825 GiB VmHWM",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x1-combined.json"
+    },
+    {
+      "name": "zero stop stalls",
+      "threshold": "0",
+      "arm": "Arm 2 combined over the densest Testnet window, density x1",
+      "scope": "Testnet; window 4617272..4618271 is 0.85x the densest 2026 Mainnet day in bytes and 3.6x its transparent inputs plus outputs",
+      "measured": "0 stop entries, 0 stopped samples, 0 delay entries",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x1-combined.json"
+    },
+    {
+      "name": "secondary catch-up after the reorg batch under 30 s",
+      "threshold": "< 30 s",
+      "arm": "Arm 2 combined over the densest Testnet window, density x1",
+      "scope": "Testnet; window 4617272..4618271 is 0.85x the densest 2026 Mainnet day in bytes and 3.6x its transparent inputs plus outputs",
+      "measured": "3.919 s max; fence matched primary after every batch: True",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x1-combined.json",
+      "context": {
+        "commit_seconds": [
+          58.701842448,
+          51.119456911,
+          50.71068156,
+          51.05079323,
+          56.77280215
+        ]
+      }
+    },
+    {
+      "name": "1000-block replacement batch at most 2.5 GiB",
+      "threshold": "<= 2.5 GiB",
+      "arm": "Arm 2 combined over the densest Testnet window, density x2",
+      "scope": "synthetic; 1.7x the densest 2026 Mainnet day in bytes, 7.3x in transparent inputs plus outputs",
+      "measured": "1229.5 MiB max over 5 replacements of 1000 blocks (4617272..4618271); density x2, effective byte multiplier 2.00",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x2-combined.json"
+    },
+    {
+      "name": "writer peak RSS during the replacement at most 6 GiB",
+      "threshold": "<= 6 GiB",
+      "arm": "Arm 2 combined over the densest Testnet window, density x2",
+      "scope": "synthetic; 1.7x the densest 2026 Mainnet day in bytes, 7.3x in transparent inputs plus outputs",
+      "measured": "6.069 GiB VmHWM; 6.292 GiB with unmirrored source bytes added (estimate)",
+      "pass": "fail",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x2-combined.json"
+    },
+    {
+      "name": "zero stop stalls",
+      "threshold": "0",
+      "arm": "Arm 2 combined over the densest Testnet window, density x2",
+      "scope": "synthetic; 1.7x the densest 2026 Mainnet day in bytes, 7.3x in transparent inputs plus outputs",
+      "measured": "0 stop entries, 0 stopped samples, 0 delay entries",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x2-combined.json"
+    },
+    {
+      "name": "secondary catch-up after the reorg batch under 30 s",
+      "threshold": "< 30 s",
+      "arm": "Arm 2 combined over the densest Testnet window, density x2",
+      "scope": "synthetic; 1.7x the densest 2026 Mainnet day in bytes, 7.3x in transparent inputs plus outputs",
+      "measured": "7.325 s max; fence matched primary after every batch: True",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x2-combined.json",
+      "context": {
+        "commit_seconds": [
+          96.882184064,
+          89.961611209,
+          90.544169706,
+          90.080581695,
+          89.89655339
+        ]
+      }
+    },
+    {
+      "name": "1000-block replacement batch at most 2.5 GiB",
+      "threshold": "<= 2.5 GiB",
+      "arm": "Arm 2 combined over the densest Testnet window, density x4",
+      "scope": "synthetic; 3.4x the densest 2026 Mainnet day in bytes, 14.6x in transparent inputs plus outputs",
+      "measured": "2459.0 MiB max over 3 replacements of 1000 blocks (4617272..4618271); density x4, effective byte multiplier 4.00",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x4-combined.json"
+    },
+    {
+      "name": "writer peak RSS during the replacement at most 6 GiB",
+      "threshold": "<= 6 GiB",
+      "arm": "Arm 2 combined over the densest Testnet window, density x4",
+      "scope": "synthetic; 3.4x the densest 2026 Mainnet day in bytes, 14.6x in transparent inputs plus outputs",
+      "measured": "10.681 GiB VmHWM; 11.350 GiB with unmirrored source bytes added (estimate)",
+      "pass": "fail",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x4-combined.json"
+    },
+    {
+      "name": "zero stop stalls",
+      "threshold": "0",
+      "arm": "Arm 2 combined over the densest Testnet window, density x4",
+      "scope": "synthetic; 3.4x the densest 2026 Mainnet day in bytes, 14.6x in transparent inputs plus outputs",
+      "measured": "0 stop entries, 0 stopped samples, 0 delay entries",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x4-combined.json"
+    },
+    {
+      "name": "secondary catch-up after the reorg batch under 30 s",
+      "threshold": "< 30 s",
+      "arm": "Arm 2 combined over the densest Testnet window, density x4",
+      "scope": "synthetic; 3.4x the densest 2026 Mainnet day in bytes, 14.6x in transparent inputs plus outputs",
+      "measured": "19.177 s max; fence matched primary after every batch: True",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x4-combined.json",
+      "context": {
+        "commit_seconds": [
+          170.073713599,
+          184.284662157,
+          168.749351449
+        ]
+      }
+    },
+    {
+      "name": "1000-block replacement batch at most 2.5 GiB",
+      "threshold": "<= 2.5 GiB",
+      "arm": "Arm 2 dense window x8 (ingest-cap probe)",
+      "scope": "probe, not a spec arm",
+      "measured": "Skipped to stay inside the 40 GB disk footprint on a shared host whose free space swung between 37 and 76 GB during the run. Multiplier 8 = floor(2 GiB / 239484660 bytes of ingest-held source plus prepared bytes at x1), the largest dense-window replacement ingest.follow.max_replacement_bytes would admit. Its batch size is extrapolated, not measured, from the measured x1, x2, and x4 runs.",
+      "pass": "skipped",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x8-combined.json"
+    },
+    {
+      "name": "delay stalls at most 1 s per hour (Arm 3)",
+      "threshold": "<= 1 s per replayed hour",
+      "arm": "Arm 3 combined",
+      "scope": "Testnet",
+      "measured": "0.1045 s per chain hour; 59.01 s per wall hour; 33.010 s stall.micros total; commit-thread write delay 3.076 s; pressure ratio 10.04x",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm3-combined.json"
+    },
+    {
+      "name": "stop stalls under compaction pressure (reported; spec gates Arms 1 and 2)",
+      "threshold": "0",
+      "arm": "Arm 3 combined",
+      "scope": "Testnet",
+      "measured": "102 stop entries, 121 stopped samples, 0 delay entries",
+      "pass": "fail",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm3-combined.json",
+      "context": {
+        "commit_p99_ms": 386.616698,
+        "commit_max_ms": 5636.500214,
+        "blocks_per_second": 24.8290236905547,
+        "committer_blocked_seconds": 0.067078232
+      }
+    },
+    {
+      "name": "delay stalls at most 1 s per hour (Arm 3)",
+      "threshold": "<= 1 s per replayed hour",
+      "arm": "Arm 3 canonical-only",
+      "scope": "Testnet",
+      "measured": "0.2622 s per chain hour; 218.02 s per wall hour; 82.872 s stall.micros total; commit-thread write delay 31.536 s; pressure ratio 10.74x",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm3-canonical-only.json"
+    },
+    {
+      "name": "stop stalls under compaction pressure (reported; spec gates Arms 1 and 2)",
+      "threshold": "0",
+      "arm": "Arm 3 canonical-only",
+      "scope": "Testnet",
+      "measured": "99 stop entries, 62 stopped samples, 11 delay entries",
+      "pass": "fail",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm3-canonical-only.json",
+      "context": {
+        "commit_p99_ms": 89.325922,
+        "commit_max_ms": 922.168468,
+        "blocks_per_second": 36.53918766747934,
+        "committer_blocked_seconds": 0.051185867
+      }
+    },
+    {
+      "name": "delay stalls at most 1 s per hour (Arm 3)",
+      "threshold": "<= 1 s per replayed hour",
+      "arm": "Arm 3 combined, canonical budget profile",
+      "scope": "Testnet",
+      "measured": "0.0414 s per chain hour; 23.56 s per wall hour; 13.095 s stall.micros total; commit-thread write delay 2.426 s; pressure ratio 10.04x",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm3-budget-canonical-combined.json"
+    },
+    {
+      "name": "stop stalls under compaction pressure (reported; spec gates Arms 1 and 2)",
+      "threshold": "0",
+      "arm": "Arm 3 combined, canonical budget profile",
+      "scope": "Testnet",
+      "measured": "67 stop entries, 23 stopped samples, 8 delay entries",
+      "pass": "fail",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm3-budget-canonical-combined.json",
+      "context": {
+        "commit_p99_ms": 386.371683,
+        "commit_max_ms": 5748.708578000001,
+        "blocks_per_second": 24.98945585969474,
+        "committer_blocked_seconds": 0.067222236
+      }
+    },
+    {
+      "name": "delay stalls at most 1 s per hour (Arm 3)",
+      "threshold": "<= 1 s per replayed hour",
+      "arm": "Arm 3 combined, wallet-family pressure only",
+      "scope": "Testnet",
+      "measured": "0.0024 s per chain hour; 1.46 s per wall hour; 0.772 s stall.micros total; commit-thread write delay 0.442 s; pressure ratio 8.66x",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm3-wallet-debt-combined.json"
+    },
+    {
+      "name": "stop stalls under compaction pressure (reported; spec gates Arms 1 and 2)",
+      "threshold": "0",
+      "arm": "Arm 3 combined, wallet-family pressure only",
+      "scope": "Testnet",
+      "measured": "13 stop entries, 2 stopped samples, 12 delay entries",
+      "pass": "fail",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm3-wallet-debt-combined.json",
+      "context": {
+        "commit_p99_ms": 357.672092,
+        "commit_max_ms": 5249.283568,
+        "blocks_per_second": 26.16991479782644,
+        "committer_blocked_seconds": 0.062721302
+      }
+    },
+    {
+      "name": "secondary catch-up after the replay",
+      "threshold": "< 30 s",
+      "arm": "Arm 1 combined (secondary in its own process, 1 s poll)",
+      "scope": "Testnet",
+      "measured": "final 0.0023 s; periodic p99 103.6 ms, max 372.5 ms; fence matched True; wallet control names the fence True",
+      "pass": "pass",
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm1-combined.json"
+    }
+  ],
+  "non_spec_ceilings": [
+    {
+      "arm": "arm2-canonical-only",
+      "check": "ingest replacement memory within ingest.follow.max_replacement_bytes",
+      "threshold": "<= 2147483648 bytes",
+      "observed": "8127180 bytes",
+      "passed": true,
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-canonical-only.json"
+    },
+    {
+      "arm": "arm2-combined",
+      "check": "ingest replacement memory within ingest.follow.max_replacement_bytes",
+      "threshold": "<= 2147483648 bytes",
+      "observed": "8127180 bytes",
+      "passed": true,
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-combined.json"
+    },
+    {
+      "arm": "arm2-combined",
+      "check": "wallet plan within MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES (1 GiB)",
+      "threshold": "<= 1073741824 bytes",
+      "observed": "764617 bytes",
+      "passed": true,
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-combined.json"
+    },
+    {
+      "arm": "arm2-combined",
+      "check": "wallet plan within projector default follow ceiling (512 MiB)",
+      "threshold": "<= 536870912 bytes",
+      "observed": "764617 bytes",
+      "passed": true,
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-combined.json"
+    },
+    {
+      "arm": "arm2-dense-x1-combined",
+      "check": "ingest replacement memory within ingest.follow.max_replacement_bytes",
+      "threshold": "<= 2147483648 bytes",
+      "observed": "239484660 bytes",
+      "passed": true,
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x1-combined.json"
+    },
+    {
+      "arm": "arm2-dense-x1-combined",
+      "check": "wallet plan within MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES (1 GiB)",
+      "threshold": "<= 1073741824 bytes",
+      "observed": "540305560 bytes",
+      "passed": true,
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x1-combined.json"
+    },
+    {
+      "arm": "arm2-dense-x1-combined",
+      "check": "wallet plan within projector default follow ceiling (512 MiB)",
+      "threshold": "<= 536870912 bytes",
+      "observed": "540305560 bytes",
+      "passed": false,
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x1-combined.json"
+    },
+    {
+      "arm": "arm2-dense-x2-combined",
+      "check": "ingest replacement memory within ingest.follow.max_replacement_bytes",
+      "threshold": "<= 2147483648 bytes",
+      "observed": "239484660 bytes real; 478969320 bytes scaled estimate",
+      "passed": true,
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x2-combined.json"
+    },
+    {
+      "arm": "arm2-dense-x2-combined",
+      "check": "writer RSS at most 6 GiB, adding unmirrored source bytes (estimate)",
+      "threshold": "<= 6 GiB",
+      "observed": "6756417268 bytes",
+      "passed": false,
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x2-combined.json"
+    },
+    {
+      "arm": "arm2-dense-x2-combined",
+      "check": "wallet plan within MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES (1 GiB)",
+      "threshold": "<= 1073741824 bytes",
+      "observed": "1080606764 bytes",
+      "passed": false,
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x2-combined.json"
+    },
+    {
+      "arm": "arm2-dense-x2-combined",
+      "check": "wallet plan within projector default follow ceiling (512 MiB)",
+      "threshold": "<= 536870912 bytes",
+      "observed": "1080606764 bytes",
+      "passed": false,
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x2-combined.json"
+    },
+    {
+      "arm": "arm2-dense-x4-combined",
+      "check": "ingest replacement memory within ingest.follow.max_replacement_bytes",
+      "threshold": "<= 2147483648 bytes",
+      "observed": "239484660 bytes real; 957938640 bytes scaled estimate",
+      "passed": true,
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x4-combined.json"
+    },
+    {
+      "arm": "arm2-dense-x4-combined",
+      "check": "writer RSS at most 6 GiB, adding unmirrored source bytes (estimate)",
+      "threshold": "<= 6 GiB",
+      "observed": "12186827996 bytes",
+      "passed": false,
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x4-combined.json"
+    },
+    {
+      "arm": "arm2-dense-x4-combined",
+      "check": "wallet plan within MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES (1 GiB)",
+      "threshold": "<= 1073741824 bytes",
+      "observed": "2161209172 bytes",
+      "passed": false,
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x4-combined.json"
+    },
+    {
+      "arm": "arm2-dense-x4-combined",
+      "check": "wallet plan within projector default follow ceiling (512 MiB)",
+      "threshold": "<= 536870912 bytes",
+      "observed": "2161209172 bytes",
+      "passed": false,
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x4-combined.json"
+    },
+    {
+      "arm": "arm2-density4-combined",
+      "check": "ingest replacement memory within ingest.follow.max_replacement_bytes",
+      "threshold": "<= 2147483648 bytes",
+      "observed": "8127180 bytes real; 32508720 bytes scaled estimate",
+      "passed": true,
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-density4-combined.json"
+    },
+    {
+      "arm": "arm2-density4-combined",
+      "check": "writer RSS at most 6 GiB, adding unmirrored source bytes (estimate)",
+      "threshold": "<= 6 GiB",
+      "observed": "383563876 bytes",
+      "passed": true,
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-density4-combined.json"
+    },
+    {
+      "arm": "arm2-density4-combined",
+      "check": "wallet plan within MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES (1 GiB)",
+      "threshold": "<= 1073741824 bytes",
+      "observed": "3045400 bytes",
+      "passed": true,
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-density4-combined.json"
+    },
+    {
+      "arm": "arm2-density4-combined",
+      "check": "wallet plan within projector default follow ceiling (512 MiB)",
+      "threshold": "<= 536870912 bytes",
+      "observed": "3045400 bytes",
+      "passed": true,
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-density4-combined.json"
+    },
+    {
+      "arm": "arm2-density7-combined",
+      "check": "ingest replacement memory within ingest.follow.max_replacement_bytes",
+      "threshold": "<= 2147483648 bytes",
+      "observed": "8127180 bytes real; 56890260 bytes scaled estimate",
+      "passed": true,
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-density7-combined.json"
+    },
+    {
+      "arm": "arm2-density7-combined",
+      "check": "writer RSS at most 6 GiB, adding unmirrored source bytes (estimate)",
+      "threshold": "<= 6 GiB",
+      "observed": "600957128 bytes",
+      "passed": true,
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-density7-combined.json"
+    },
+    {
+      "arm": "arm2-density7-combined",
+      "check": "wallet plan within MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES (1 GiB)",
+      "threshold": "<= 1073741824 bytes",
+      "observed": "5326183 bytes",
+      "passed": true,
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-density7-combined.json"
+    },
+    {
+      "arm": "arm2-density7-combined",
+      "check": "wallet plan within projector default follow ceiling (512 MiB)",
+      "threshold": "<= 536870912 bytes",
+      "observed": "5326183 bytes",
+      "passed": true,
+      "evidencePath": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-density7-combined.json"
+    }
+  ],
+  "derived_estimates": [
+    {
+      "name": "1000-block replacement at the densest 2026 Mainnet day (estimate, not measured)",
+      "method": "canonical batch bytes of the dense Testnet window scaled by raw bytes (2026-09-03, 231,594 B/block); wallet batch bytes scaled by transparent inputs plus outputs (2026-09-23, 131.7 per block)",
+      "canonical_batch_bytes": 307059868,
+      "wallet_batch_bytes": 104851517,
+      "batch_bytes": 411911385,
+      "within_2_5_gib": true,
+      "bounded_by_measured_run": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm2-dense-x1-combined.json (x1, 644604180 bytes, VmHWM 3033645056)"
+    },
+    {
+      "name": "largest dense-window replacement ingest admits (ingest.follow.max_replacement_bytes = 2 GiB)",
+      "method": "linear in the multiplier, from the measured x1, x2, x4 batch sizes (each exactly k times x1)",
+      "multiplier": 8.97,
+      "batch_bytes": 5780232170,
+      "within_2_5_gib": false,
+      "batch_to_held_ratio": 2.692,
+      "held_bytes_at_2_5_gib_batch": 997296882
+    },
+    {
+      "name": "measured writer VmHWM against replacement batch size (dense window)",
+      "points": {
+        "1": {
+          "batch_bytes": 644604180,
+          "peak_vmhwm_bytes": 3033645056
+        },
+        "2": {
+          "batch_bytes": 1289203264,
+          "peak_vmhwm_bytes": 6516932608
+        },
+        "4": {
+          "batch_bytes": 2578401432,
+          "peak_vmhwm_bytes": 11468374016
+        }
+      }
+    }
+  ],
+  "mainnet_reference": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/mainnet-density-reference.json",
+  "binary_provenance": {
+    "arm1-canonical-only, arm1-combined, compare-arm1": "35619739",
+    "reference, verify-*, arm2-*, arm2-density*, dense-prep (arm1-repeat), arm2-dense-*, density4-*": "91bb1f6c",
+    "density7-*, arm3-*": "33fda161 (secondary follower records and retries catch-up errors instead of exiting)"
+  },
+  "mainnet_targets": {
+    "arm1_density": "Bytes per block: September 2026 Mainnet mean 74,874 B vs this Testnet range's 23,159 B = 3.23x. Measured effective byte multipliers (combined): x4 -> 2.37, x7 -> 3.31; canonical-only: x4 -> 2.88, x7 -> 4.29. Transparent inputs plus outputs per block: September 2026 Mainnet 36.2 vs Testnet 51.8 = 0.70x, so wallet rows are already Mainnet-dense or denser at x1.",
+    "arm2_density": "Densest 1000-block Testnet window 4617272..4618271: 197.7 MB raw, 480.3k transparent inputs plus outputs. Densest 2026 Mainnet day by bytes (2026-09-03): 231.6 MB per 1000 blocks (window is 0.85x); densest by transparent rows (2026-09-23): 131.7k per 1000 blocks (window is 3.6x). The newest 1000 blocks at T (the spec's Arm 2 window) are sparse: 8.47 MB raw.",
+    "post_nu7_tip": "Mainnet week after NU7 (2026-11-07..13, 25 s blocks): 26,949 B per block, 9.4 transparent inputs plus outputs per block (1.16x and 0.18x this Testnet range).",
+    "source": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/mainnet-density-reference.json"
+  },
+  "observations": [
+    "The 2x p99 miss comes from the wallet planner on transparent-dense blocks: 448 Arm 1 blocks with >= 1000 transparent inputs plus outputs cost 0.114 ms of planning per input or output with 6.3 point reads each; 53 combined commits exceeded 1 s (max 4.75 s); the canonical-only maximum was 0.41 s. On blocks with <= 3 transparent inputs plus outputs the combined p99 is 39.5 ms against 26.2 ms (1.51x). Mainnet had 0.78% of September 2026 blocks with >= 300 transparent inputs and 0.42% with >= 300 outputs.",
+    "Arm 3 stops are memtable-limit stops (max_write_buffer_number 2, atomic_flush) entered by every family together, canonical families and the default family included. With pressure on the wallet mirror families only (21 lanes, 8.66x), canonical families recorded 13 memtable-limit stop entries and the commit thread waited 0.44 s in total: canonical commits do stall on wallet-family write load under the production options, before any per-family tuning.",
+    "Out-of-process canonical secondary catch-up hit transient errors under high write volume: 'canonical replay at height N is absent' and 'No such file or directory' for an SST the primary had compacted away. One error ended the first density x7 canonical-only attempt (evidence in failed-runs/); after the follower was changed to record and retry, Arm 3 runs logged 4, 4, 4, and 2 errors, each recovered on a later poll, and the final fences matched. The canonical secondary has no transient-error retry; the materialized-view secondary does (is_transient_secondary_missing_sst).",
+    "Writer VmHWM grows with the replacement batch: dense window x1 645 MB batch -> 2.83 GiB, x2 1.29 GB -> 6.07 GiB, x4 2.58 GB -> 10.68 GiB. VmHWM also rose across successive replacements in one process (x2: 5.15 to 6.07 GiB).",
+    "Wallet plan logical bytes (batch plus overlay) for the dense window: 540 MB at x1 (above the projector's 512 MiB default follow ceiling, within the 1 GiB planner maximum), 1.08 GB at x2 and 2.16 GB at x4 (above the 1 GiB maximum; the mirror lanes are charged outside the planner, so the real planner would have refused these).",
+    "ingest.follow.max_replacement_bytes (2 GiB) does not bound the combined batch: the measured batch-to-held ratio on the dense window is 2.69, so the 2.5 GiB batch ceiling corresponds to about 1.0 GB of ingest-held bytes."
+  ],
+  "limits": [
+    "Testnet only. No Mainnet store or node on the host; Mainnet-like rows are mirror lanes in separate mirror_* families, and Mainnet density comes from Blockchair third-party aggregates, not a node.",
+    "Mirror lanes scale every block uniformly (clamped so no scaled block exceeds 2,000,000 bytes), so Testnet's transparent stress blocks are scaled too; mirror point reads mostly miss; per-commit control, epoch, and event records and canonical prepare CPU are not scaled; Arm 2 lanes are not clamped per block.",
+    "Tip cadence means back-to-back synced commits, not 25 s spacing. Arm 3's per-hour figure is per replayed chain hour (347 chain hours replayed in about 33 minutes); per wall hour the same runs are 1.5 to 218 s.",
+    "Arm 2 re-commits identical blocks on the replacement parent; no real fork with different transactions was replayed.",
+    "Each arm ran once (Arm 1 combined also repeated over 48,149 blocks). The host was shared: other work raised the load average to about 10 and moved free disk between 28 and 76 GB during the run, so latencies may include interference.",
+    "The secondary runs out of process with a 1 s poll in replay arms (catch-up once per replacement in Arm 2), not after every block. In-process snapshot serving is not measured here.",
+    "The x8 ingest-cap probe was skipped for disk; its batch (about 5.78 GB) is a linear extrapolation.",
+    "RocksDB options are the production ones; no per-family tuning was tried. Bulk construction, the stage join, crash and truncation paths, and planner read batching (multi_get) were not tested."
+  ],
+  "disk": {
+    "peak_footprint_mib": 36388,
+    "footprint_scope": ".tmp (spike-a inputs plus spike-results) and target/",
+    "final_footprint": "about 14.5 GB in .tmp plus 3 GB target/",
+    "samples": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/logs/footprint-watch.txt"
+  }
+}

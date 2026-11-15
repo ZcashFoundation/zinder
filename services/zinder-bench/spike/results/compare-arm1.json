@@ -1,0 +1,109 @@
+{
+  "spike": "A-combined-commit",
+  "action": "compare",
+  "network_label": "Testnet",
+  "baseline": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm1-canonical-only.json",
+  "combined": "/home/ubuntu/.t3/worktrees/zinder/spike-combined-commit/.tmp/spike-results/reports/arm1-combined.json",
+  "same_range": true,
+  "same_density_and_pressure": true,
+  "ratios": [
+    {
+      "metric": "latency.commit_total.p50_ms",
+      "baseline": 18.917579,
+      "combined": 19.924174,
+      "ratio": 1.0532095042394167
+    },
+    {
+      "metric": "latency.commit_total.p99_ms",
+      "baseline": 28.425424,
+      "combined": 204.394571,
+      "ratio": 7.190554870878971
+    },
+    {
+      "metric": "latency.commit_total.p999_ms",
+      "baseline": 53.887922,
+      "combined": 1123.577674,
+      "ratio": 20.850269082559908
+    },
+    {
+      "metric": "latency.commit_total.max_ms",
+      "baseline": 405.93297,
+      "combined": 4747.429919,
+      "ratio": 11.695107985439074
+    },
+    {
+      "metric": "latency.synced_write.p50_ms",
+      "baseline": 0.113032,
+      "combined": 0.140583,
+      "ratio": 1.243745134121311
+    },
+    {
+      "metric": "latency.synced_write.p99_ms",
+      "baseline": 2.641372,
+      "combined": 8.496072,
+      "ratio": 3.2165374661350237
+    },
+    {
+      "metric": "blocks_per_second",
+      "baseline": 53.01291584572205,
+      "combined": 35.88221370814955,
+      "ratio": 0.6768579531179497
+    },
+    {
+      "metric": "commit_path_blocks_per_second",
+      "baseline": 53.03785982645611,
+      "combined": 35.892009427269755,
+      "ratio": 0.6767243162659866
+    },
+    {
+      "metric": "batch.total_bytes.p50",
+      "baseline": 9267.0,
+      "combined": 13804.0,
+      "ratio": 1.48958670551419
+    },
+    {
+      "metric": "batch.total_bytes.p99",
+      "baseline": 636390.0,
+      "combined": 1015614.0,
+      "ratio": 1.595898741337859
+    },
+    {
+      "metric": "batch.total_bytes.max",
+      "baseline": 6048923.0,
+      "combined": 26465950.0,
+      "ratio": 4.375316068662141
+    },
+    {
+      "metric": "rss.peak_vmhwm_bytes",
+      "baseline": 385015808.0,
+      "combined": 1396281344.0,
+      "ratio": 3.626555884167748
+    },
+    {
+      "metric": "write_amplification.user_bytes_written",
+      "baseline": 1502029523.0,
+      "combined": 2926241093.0,
+      "ratio": 1.9481914624124201
+    },
+    {
+      "metric": "stall_rates.ticker_stall_seconds",
+      "baseline": 0.0,
+      "combined": 0.0,
+      "ratio": null
+    }
+  ],
+  "thresholds": [
+    {
+      "check": "tip commit p99 with wallet rows at most 1 s",
+      "threshold": "<= 1000 ms",
+      "observed": "204.395 ms",
+      "passed": true
+    },
+    {
+      "check": "tip commit p99 with wallet rows at most 2x canonical-only p99",
+      "threshold": "<= 56.851 ms (2 x 28.425 ms)",
+      "observed": "204.395 ms (7.19x)",
+      "passed": false
+    }
+  ]
+}

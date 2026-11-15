@@ -1,0 +1,199 @@
+{
+  "purpose": "Mainnet per-block density used to choose the synthetic density multipliers. No Mainnet node or store exists on this host; these are third-party explorer aggregates, not Zinder measurements.",
+  "source": "Blockchair public API v2 (api.blockchair.com/zcash), fetched 2026-11-14 about 19:15 UTC. input_count and output_count are Blockchair's per-block transparent input and output counts; size is the serialized block size in bytes.",
+  "queries": [
+    {
+      "label": "chain totals",
+      "url": "https://api.blockchair.com/zcash/stats",
+      "values": {
+        "blocks": 3573280,
+        "transactions": 18944486,
+        "outputs": 191214484,
+        "blocks_24h": 3467,
+        "transactions_24h": 17757,
+        "blockchain_size_bytes": 278640676330,
+        "best_block_height": 3573274
+      }
+    },
+    {
+      "label": "post-NU7 week (25 s blocks)",
+      "url": "https://api.blockchair.com/zcash/blocks?a=count(),avg(size),avg(transaction_count),avg(input_count),avg(output_count),max(size),sum(size)&q=time(2026-11-07..2026-11-13)",
+      "values": {
+        "blocks": 24169,
+        "avg_size_bytes": 26948.87,
+        "avg_transactions": 3.796,
+        "avg_transparent_inputs": 4.563,
+        "avg_transparent_outputs": 4.845,
+        "max_size_bytes": 1526945
+      }
+    },
+    {
+      "label": "September 2026, peak month (75 s blocks)",
+      "url": "https://api.blockchair.com/zcash/blocks?a=count(),avg(size),avg(transaction_count),avg(input_count),avg(output_count),max(size),sum(size)&q=time(2026-09-01..2026-09-30)",
+      "values": {
+        "blocks": 34405,
+        "avg_size_bytes": 74873.87,
+        "avg_transactions": 11.556,
+        "avg_transparent_inputs": 20.799,
+        "avg_transparent_outputs": 15.407,
+        "max_size_bytes": 1999980,
+        "sum_size_bytes": 2576035482
+      }
+    },
+    {
+      "label": "2026-07-01 to 2026-11-04 (pre-NU7)",
+      "url": "https://api.blockchair.com/zcash/blocks?a=count(),avg(size),avg(transaction_count),avg(input_count),avg(output_count),max(size),sum(size)&q=time(2026-07-01..2026-11-04)",
+      "values": {
+        "blocks": 145630,
+        "avg_size_bytes": 43644.92,
+        "avg_transactions": 6.987,
+        "avg_transparent_inputs": 13.328,
+        "avg_transparent_outputs": 9.958,
+        "max_size_bytes": 1999980
+      }
+    },
+    {
+      "label": "densest days of the last year by mean block size",
+      "url": "https://api.blockchair.com/zcash/blocks?a=date,count(),avg(size),sum(size),avg(transaction_count),avg(input_count),avg(output_count)&q=time(2025-11-14..2026-11-13)&s=avg(size)(desc)&limit=10",
+      "values": [
+        {
+          "date": "2026-09-03",
+          "blocks": 1144,
+          "avg_size_bytes": 231594.37,
+          "sum_size_bytes": 264943963,
+          "avg_transactions": 26.06,
+          "avg_transparent_inputs": 36.87,
+          "avg_transparent_outputs": 20.08
+        },
+        {
+          "date": "2026-09-19",
+          "blocks": 1137,
+          "avg_size_bytes": 231574.0,
+          "sum_size_bytes": 263299640,
+          "avg_transactions": 24.84,
+          "avg_transparent_inputs": 24.96,
+          "avg_transparent_outputs": 19.91
+        },
+        {
+          "date": "2026-10-24",
+          "blocks": 1146,
+          "avg_size_bytes": 199920.49,
+          "sum_size_bytes": 229108885,
+          "avg_transactions": 17.49,
+          "avg_transparent_inputs": 9.37,
+          "avg_transparent_outputs": 9.72
+        },
+        {
+          "date": "2026-09-21",
+          "blocks": 1153,
+          "avg_size_bytes": 193602.43,
+          "sum_size_bytes": 223223604,
+          "avg_transactions": 25.6,
+          "avg_transparent_inputs": 29.34,
+          "avg_transparent_outputs": 20.86
+        },
+        {
+          "date": "2026-09-23",
+          "blocks": 1137,
+          "avg_size_bytes": 120533.78,
+          "sum_size_bytes": 137046908,
+          "avg_transactions": 31.91,
+          "avg_transparent_inputs": 47.12,
+          "avg_transparent_outputs": 84.57
+        }
+      ]
+    },
+    {
+      "label": "2026-07-01 to 2026-11-13 totals",
+      "url": "https://api.blockchair.com/zcash/blocks?a=count(),avg(size),avg(input_count),avg(output_count)&q=time(2026-07-01..2026-11-13)",
+      "values": {
+        "blocks": 173988,
+        "avg_size_bytes": 40798.08,
+        "avg_transparent_inputs": 11.957,
+        "avg_transparent_outputs": 9.169
+      }
+    }
+  ],
+  "consensus_bound": {
+    "max_block_bytes": 2000000,
+    "source": "zebra-chain 15.0.0 src/block/serialize.rs MAX_BLOCK_BYTES"
+  },
+  "ingest_bound": {
+    "default_max_replacement_bytes": 2147483648,
+    "source": "services/zinder-ingest/src/writer/follow.rs DEFAULT_MAX_REPLACEMENT_BYTES (source plus prepared bytes held for one replacement)"
+  },
+  "testnet_reference": {
+    "range": "4570123..4620122",
+    "source": "/home/ubuntu/.t3/worktrees/zinder/t3-c67a34ca-dd54fadf1533b1ea/.tmp/spike-data/MANIFEST.md",
+    "avg_size_bytes": 23159,
+    "avg_transactions": 1.77,
+    "avg_transparent_inputs": 23.08,
+    "avg_transparent_outputs": 28.73
+  },
+  "heavy_block_counts": [
+    {
+      "range": "2026-09-01..2026-09-30",
+      "field": "output_count",
+      "at_least": 150,
+      "blocks": 231,
+      "fraction": 0.0067141403865717195,
+      "url": "https://api.blockchair.com/zcash/blocks?a=count()&q=time(2026-09-01..2026-09-30),output_count(150..)"
+    },
+    {
+      "range": "2026-09-01..2026-09-30",
+      "field": "input_count",
+      "at_least": 150,
+      "blocks": 660,
+      "fraction": 0.01918325824734777,
+      "url": "https://api.blockchair.com/zcash/blocks?a=count()&q=time(2026-09-01..2026-09-30),input_count(150..)"
+    },
+    {
+      "range": "2026-09-01..2026-09-30",
+      "field": "input_count",
+      "at_least": 300,
+      "blocks": 269,
+      "fraction": 0.007818631012934167,
+      "url": "https://api.blockchair.com/zcash/blocks?a=count()&q=time(2026-09-01..2026-09-30),input_count(300..)"
+    },
+    {
+      "range": "2026-09-01..2026-09-30",
+      "field": "output_count",
+      "at_least": 300,
+      "blocks": 146,
+      "fraction": 0.004243569248655718,
+      "url": "https://api.blockchair.com/zcash/blocks?a=count()&q=time(2026-09-01..2026-09-30),output_count(300..)"
+    },
+    {
+      "range": "2026-07-01..2026-11-13",
+      "field": "input_count",
+      "at_least": 300,
+      "blocks": 535,
+      "fraction": 0.0030749247074510887,
+      "url": "https://api.blockchair.com/zcash/blocks?a=count()&q=time(2026-07-01..2026-11-13),input_count(300..)"
+    },
+    {
+      "range": "2026-07-01..2026-11-13",
+      "field": "output_count",
+      "at_least": 300,
+      "blocks": 358,
+      "fraction": 0.00205761316872428,
+      "url": "https://api.blockchair.com/zcash/blocks?a=count()&q=time(2026-07-01..2026-11-13),output_count(300..)"
+    },
+    {
+      "range": "2026-07-01..2026-11-13",
+      "field": "input_count",
+      "at_least": 1000,
+      "blocks": 107,
+      "fraction": 0.0006149849414902178,
+      "url": "https://api.blockchair.com/zcash/blocks?a=count()&q=time(2026-07-01..2026-11-13),input_count(1000..)"
+    },
+    {
+      "range": "2026-07-01..2026-11-13",
+      "field": "output_count",
+      "at_least": 1000,
+      "blocks": 26,
+      "fraction": 0.00014943559325930524,
+      "url": "https://api.blockchair.com/zcash/blocks?a=count()&q=time(2026-07-01..2026-11-13),output_count(1000..)"
+    }
+  ]
+}
