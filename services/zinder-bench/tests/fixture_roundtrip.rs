@@ -787,7 +787,7 @@ async fn canonical_fixture_replay_cli_emits_self_validating_zero_prohibited_read
         .path()
         .join("canonical-fixture-replay.json");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_zinder-bench"))
+    let output = Command::new(zinder_testkit::bin_exe!("zinder-bench"))
         .arg("rocksdb-canonical-fixture-replay")
         .arg("--fixture")
         .arg(fixture.directory.path())
@@ -845,7 +845,7 @@ async fn raw_blob_retention_comparison_replays_both_arms_and_admits_fresh_second
     let all_secondary = output_directory.path().join("all-secondary");
     let report_path = output_directory.path().join("comparison.json");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_zinder-bench"))
+    let output = Command::new(zinder_testkit::bin_exe!("zinder-bench"))
         .arg("rocksdb-raw-blob-retention-comparison")
         .arg("--fixture")
         .arg(fixture.directory.path())

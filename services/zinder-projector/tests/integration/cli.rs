@@ -324,7 +324,7 @@ json_rpc_addr = "http://127.0.0.1:18232"
 }
 
 fn projector_command() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_zinder-projector"))
+    Command::new(zinder_testkit::bin_exe!("zinder-projector"))
 }
 
 fn path_str(path: &Path) -> eyre::Result<&str> {

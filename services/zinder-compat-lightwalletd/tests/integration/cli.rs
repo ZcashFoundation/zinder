@@ -497,7 +497,7 @@ listen_addr = "127.0.0.1:9067"
 }
 
 fn zinder_compat_command() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_zinder-compat-lightwalletd"));
+    let mut command = Command::new(zinder_testkit::bin_exe!("zinder-compat-lightwalletd"));
     command.env_clear();
     command
 }

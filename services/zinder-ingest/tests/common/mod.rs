@@ -280,7 +280,7 @@ pub(crate) async fn rpc_block_hash_at_height(env: &LiveTestEnv, height: u32) -> 
 /// fully cleared environment, ready for env-var injection.
 #[must_use]
 pub(crate) fn zinder_ingest_command() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_zinder-ingest"));
+    let mut command = Command::new(zinder_testkit::bin_exe!("zinder-ingest"));
     command.env_clear();
     command
 }

@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use eyre::{Result, eyre};
+use eyre::{Result, ensure, eyre};
 
 const WIRE_BRANCH_ID_PATH: &str = "crates/zinder-core/src/wire/branch_id.rs";
 const WIRE_BLOCK_HASH_PATH: &str = "crates/zinder-core/src/wire/block_hash.rs";
@@ -15,6 +15,10 @@ const WIRE_TRANSACTION_ID_PATH: &str = "crates/zinder-core/src/wire/transaction_
 const BANNED_BRANCH_ID_FORMAT_FRAGMENT: &str = "format!(\"{:08x}\"";
 
 const SCANNED_DIRECTORIES: &[&str] = &["crates", "services"];
+
+/// Floor for the Rust sources one scan root must yield. The tree holds several
+/// times this many, so only a missing or emptied tree falls below it.
+const MINIMUM_SCANNED_FILES_PER_DIRECTORY: usize = 50;
 
 /// Files allowed to contain a `format!("{:08x}", ...)` call.
 ///
@@ -126,14 +130,12 @@ fn code_lines(source: &str) -> impl Iterator<Item = &str> {
 fn production_source_files(directory: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     collect_production_source_files(directory, &mut paths)?;
+    ensure_scan_saw_source_tree(directory, paths.len())?;
     paths.sort();
     Ok(paths)
 }
 
 fn collect_production_source_files(directory: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
-    if !directory.exists() {
-        return Ok(());
-    }
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
@@ -293,8 +295,15 @@ fn utxo_set_commitment_personal_lives_only_in_wire_module() -> Result<()> {
     Ok(())
 }
 
+/// Resolves the workspace root from the manifest directory of this test's crate.
+///
+/// Nextest sets `CARGO_MANIFEST_DIR` at run time, rewritten by
+/// `--workspace-remap` when the tests run from an archive. The compile-time
+/// value names the build machine's checkout, so it is only the fallback for
+/// runners that do not set the variable.
 fn workspace_root() -> Result<PathBuf> {
-    let manifest_directory = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest_directory = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from);
     manifest_directory
         .parent()
         .and_then(Path::parent)
@@ -302,17 +311,30 @@ fn workspace_root() -> Result<PathBuf> {
         .ok_or_else(|| eyre!("CARGO_MANIFEST_DIR has no grandparent: {manifest_directory:?}"))
 }
 
+/// Fails when a scan root holds too few Rust sources to be the workspace tree.
+///
+/// A scan that finds nothing would pass every invariant vacuously, for
+/// example when archived tests run without the checkout beside them.
+fn ensure_scan_saw_source_tree(directory: &Path, scanned_file_count: usize) -> Result<()> {
+    ensure!(
+        scanned_file_count >= MINIMUM_SCANNED_FILES_PER_DIRECTORY,
+        "scanned {scanned_file_count} Rust sources under {}, expected at least \
+         {MINIMUM_SCANNED_FILES_PER_DIRECTORY}; the invariant tests need the workspace source tree \
+         at the path nextest reports in CARGO_MANIFEST_DIR",
+        directory.display(),
+    );
+    Ok(())
+}
+
 fn rust_source_files(directory: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     collect_rust_source_files(directory, &mut paths)?;
+    ensure_scan_saw_source_tree(directory, paths.len())?;
     paths.sort();
     Ok(paths)
 }
 
 fn collect_rust_source_files(directory: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
-    if !directory.exists() {
-        return Ok(());
-    }
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();

@@ -7,7 +7,7 @@ use zinder_testkit::EnvVarContractProbe;
 const BINARY: &str = "zinder-compat-cipherscan";
 
 fn probe() -> EnvVarContractProbe {
-    EnvVarContractProbe::new(env!("CARGO_BIN_EXE_zinder-compat-cipherscan"))
+    EnvVarContractProbe::new(zinder_testkit::bin_exe!("zinder-compat-cipherscan"))
 }
 
 fn documented_variables() -> impl Iterator<Item = &'static str> {

@@ -39,7 +39,7 @@ pub struct EnvVarContractProbe {
 
 impl EnvVarContractProbe {
     /// Builds a probe for the binary at `executable`, usually
-    /// `env!("CARGO_BIN_EXE_<name>")`.
+    /// `zinder_testkit::bin_exe!("<name>")`.
     pub fn new(executable: impl Into<PathBuf>) -> Self {
         Self {
             executable: executable.into(),
