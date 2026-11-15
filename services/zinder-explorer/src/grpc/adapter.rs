@@ -1630,6 +1630,7 @@ mod tests {
                 consumers: MaterializedViewStore::bundled_consumers(),
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 sync_writes: false,
+                reorg_policy: None,
             },
         )?;
         if let Some(state) = state {
@@ -1860,6 +1861,7 @@ mod tests {
                 ],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 sync_writes: false,
+                reorg_policy: None,
             },
         )?;
         let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings::default())
@@ -1889,6 +1891,7 @@ mod tests {
                 consumers: MaterializedViewStore::bundled_consumers(),
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 sync_writes: false,
+                reorg_policy: None,
             },
         )?;
         let adapter = ExplorerQueryGrpcAdapter::new(ExplorerServerInfoSettings::default())

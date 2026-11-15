@@ -1809,6 +1809,7 @@ mod tests {
                 consumers: &[PAID_FEE_DISTRIBUTION_SCHEMA],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 sync_writes: false,
+                reorg_policy: None,
             },
         )?;
         Ok((tempdir, store))

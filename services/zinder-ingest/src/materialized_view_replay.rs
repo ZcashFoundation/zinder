@@ -41,9 +41,9 @@ use zinder_proto::v1::wallet::{MaterializedViewHealth, MaterializedViewStatus};
 use zinder_runtime::{ComposedReadiness, IngestPhase, Readiness, ReadinessCause};
 use zinder_store::{
     BlockHashLookup, CanonicalEventCursor, CanonicalEventHistoryRequest, CanonicalEventKind,
-    CanonicalRetainedEvent, CanonicalStoreError, ChainEpochCommitted, ChainEvent,
-    ChainRangeReverted, MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS, RocksDbCanonicalSecondary,
-    RocksDbResourceBudget,
+    CanonicalReorgPolicy, CanonicalRetainedEvent, CanonicalStoreError, ChainEpochCommitted,
+    ChainEvent, ChainRangeReverted, MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS,
+    RocksDbCanonicalSecondary, RocksDbResourceBudget,
 };
 
 use crate::{
@@ -349,18 +349,61 @@ fn effective_replay_batch_blocks(
 
 /// Opens the replay-host-owned Explorer view store nested under a canonical
 /// store path, admitting only this release's exact bundled consumer manifest.
+///
+/// `reorg_policy` is the canonical store's effective window. The store keeps
+/// each height undo index only for that many of its newest heights.
 pub fn open_primary_materialized_view_store(
     canonical_path: &Path,
     rocksdb_resource_budget: RocksDbResourceBudget,
+    reorg_policy: CanonicalReorgPolicy,
 ) -> Result<MaterializedViewStore, zinder_materialized_views::MaterializedViewStoreError> {
     MaterializedViewStore::open_explorer_views(
         MaterializedViewStore::path_for_canonical(canonical_path),
         MaterializedViewStoreOptions {
             sync_writes: false,
             rocksdb_resource_budget,
+            reorg_policy: Some(reorg_policy),
             ..MaterializedViewStoreOptions::default()
         },
     )
+}
+
+/// Prunes the view store's height undo indexes to the reorg window on a
+/// blocking thread, logging what each pass reclaimed.
+///
+/// A store written by an earlier release holds undo rows for every height. The
+/// pass removes the rows below the window and compacts their range, beside
+/// replay, which writes only heights above it.
+#[must_use = "dropping the handle lets the pruning pass run detached"]
+pub fn spawn_undo_index_pruning_task(
+    materialized_view_store: MaterializedViewStore,
+) -> JoinHandle<()> {
+    tokio::task::spawn_blocking(move || {
+        let started_at = Instant::now();
+        match materialized_view_store.prune_undo_indexes() {
+            Ok(prunings) => {
+                for pruning in prunings {
+                    tracing::info!(
+                        target: "zinder::ingest",
+                        event = "materialized_view_undo_index_pruned",
+                        column_family = pruning.column_family,
+                        pruned_through_height = pruning.pruned_through_height.value(),
+                        sst_bytes_before = pruning.sst_bytes_before,
+                        sst_bytes_after = pruning.sst_bytes_after,
+                        elapsed_ms = u64::try_from(started_at.elapsed().as_millis())
+                            .unwrap_or(u64::MAX),
+                        "deleted materialized-view undo rows below the reorg window"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(
+                target: "zinder::ingest",
+                event = "materialized_view_undo_index_prune_failed",
+                error = %error,
+                "failed to prune materialized-view undo rows below the reorg window; replay keeps pruning the heights it applies"
+            ),
+        }
+    })
 }
 
 /// One block-keyed chain-event consumer selected by the materialized-view store.

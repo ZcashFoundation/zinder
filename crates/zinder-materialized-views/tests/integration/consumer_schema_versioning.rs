@@ -59,6 +59,7 @@ fn options(consumers: &'static [MaterializedViewConsumerSchema]) -> Materialized
         sync_writes: false,
         consumers,
         rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+        reorg_policy: None,
     }
 }
 

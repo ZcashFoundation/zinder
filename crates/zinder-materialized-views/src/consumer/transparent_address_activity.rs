@@ -25,6 +25,8 @@
 //! ascending height; on revert it reads the persisted
 //! `(address, in_block_position)` list and deletes each primary key it
 //! actually wrote. The index entry is then deleted in the same batch.
+//! The index is the schema's height undo index, so a store opened with a
+//! reorg window keeps it only for that window's newest heights.
 
 use std::collections::HashMap;
 
@@ -71,7 +73,8 @@ pub const TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA: MaterializedViewConsumerSchema =
         TRANSPARENT_ADDRESS_ACTIVITY_CONSUMER_NAME,
         1,
         TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILIES,
-    );
+    )
+    .with_height_undo_index(TRANSPARENT_ADDRESS_ACTIVITY_INDEX_COLUMN_FAMILY);
 
 /// Length of one primary storage key: 32 address + 4 reverse-height + 4 position.
 pub const TRANSPARENT_ADDRESS_ACTIVITY_KEY_LEN: usize = 40;

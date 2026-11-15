@@ -26,6 +26,7 @@ fn open_store(path: &Path) -> Result<MaterializedViewStore> {
             sync_writes: false,
             consumers: TEST_CONSUMERS,
             rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+            reorg_policy: None,
         },
     )?)
 }

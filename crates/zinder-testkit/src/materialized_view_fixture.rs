@@ -39,6 +39,7 @@ pub fn open_test_materialized_view_store_for_canonical(
             sync_writes: false,
             consumers: MaterializedViewStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+            reorg_policy: None,
         },
     )?)
 }

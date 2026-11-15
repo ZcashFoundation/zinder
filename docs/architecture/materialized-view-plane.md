@@ -234,7 +234,9 @@ reorg window below the view's newest materialized height. For a missing cursor
 it skips that revert only when the block the view last checkpointed is still
 canonical, because every row below a canonical block is canonical too. When the
 view wrote its newest height, the settled tip was at least that height minus the
-reorg window, so no replacement reaches below that window.
+reorg window, so no replacement reaches below that window. The undo indexes keep
+exactly that window, so the revert deletes the same rows on a pruned store as on
+one that kept every undo row.
 
 Hydration resolves each transparent input's previous output from the hydrated
 range, then from an in-memory prevout cache of outputs that earlier ranges
@@ -303,6 +305,20 @@ reverted block. Height-prefixed layouts use bounded range deletes. Layouts
 whose primary key does not begin with height maintain a per-height index of the
 keys written by that block. Reorg deletion and replacement rows share the same
 batch as the cursor and materialized-view-state transition.
+
+No revert reaches a height more than one reorg window below the newest height
+a view applied, so the replay host keeps each such index for that window only.
+The transparent-address activity, deltas, and outpoint-spend views and the
+transaction-fee view declare their per-height index as a height undo index.
+Ingest opens the view store with the canonical store's effective window `W`.
+Applying height `h` deletes the index row at `h - W`, and each time ingest
+opens the store it deletes every older row on a blocking thread and compacts
+the range, so a store built by an earlier release shrinks in place. The newest
+row stays, so replay still reads its durable height from the outpoint-spend
+index. After an operator raises the window, recovery reverts heights the
+smaller window already pruned; they are settled, so re-applying them writes the
+rows an unpruned revert would have removed. The full retention rule is in
+[ADR-0017](../adrs/0017-materialized-view-consumer-and-key-codec.md#undo-index-retention).
 
 A reorg must leave the same bytes a fresh apply of the replacement chain
 writes, independent of how blocks were grouped into batches. Reorg

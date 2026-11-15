@@ -26,7 +26,7 @@ use zinder_ingest::{
     spawn_conventional_fee_distribution_backfill_task,
     spawn_materialized_view_replay_budget_metrics_task, spawn_materialized_view_tailer_task,
     spawn_runtime_memory_metrics_task, spawn_transaction_component_backfill_task,
-    spawn_upstream_health_probe_task,
+    spawn_undo_index_pruning_task, spawn_upstream_health_probe_task,
 };
 use zinder_materialized_views::MaterializedViewStore;
 use zinder_runtime::{
@@ -854,6 +854,10 @@ async fn run_materialized_view_plane(
         explorer_views = true,
         "Explorer views admitted after store open"
     );
+    // Pruning frees space, so it runs before the free-space wait below.
+    drop(spawn_undo_index_pruning_task(
+        materialized_view_store.clone(),
+    ));
     // Cursor seeding writes view rows before the tailer applies the guard.
     if let Some(guard) = &spec.volume_space_guard
         && !guard
@@ -912,6 +916,7 @@ fn open_and_admit_materialized_view_store(
     let materialized_view_store = match open_primary_materialized_view_store(
         &spec.storage_path,
         spec.materialized_view_rocksdb_budget,
+        spec.reorg_policy,
     ) {
         Ok(materialized_view_store) => materialized_view_store,
         Err(error) => {

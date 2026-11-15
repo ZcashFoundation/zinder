@@ -29,6 +29,8 @@
 //! height H replaces the canonical block, so re-fetching the block at H
 //! and using *its* txids to drive deletes would delete the WRONG txids.
 //! The persisted index captures what was actually written at apply time.
+//! The index is the schema's height undo index, so a store opened with a
+//! reorg window keeps it only for that window's newest heights.
 
 use std::collections::HashMap;
 
@@ -72,7 +74,8 @@ pub const TRANSACTION_FEES_SCHEMA: MaterializedViewConsumerSchema =
         TRANSACTION_FEES_CONSUMER_NAME,
         2,
         TRANSACTION_FEES_COLUMN_FAMILIES,
-    );
+    )
+    .with_height_undo_index(TRANSACTION_FEES_INDEX_COLUMN_FAMILY);
 
 const TXID_LEN: usize = 32;
 

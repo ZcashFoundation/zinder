@@ -185,6 +185,51 @@ the wallet would return the new block, not the one whose rows we
 actually wrote. The persisted index captures what was actually
 materialized at apply time.
 
+### Undo-index retention
+
+A per-height index exists only so that `revert_block` can delete what its
+height wrote, and no revert reaches a height at or below the canonical settled
+tip. The canonical writer keeps the settled tip within the reorg window of the
+visible tip and never moves it back
+([ADR-0041](0041-reorg-window-follows-the-node-bound.md)). So once a view has
+written height `h` under a window of `W` blocks, no later revert reaches
+`h - W` or below.
+
+A consumer declares such a family as its schema's `height_undo_index`. The
+family must be keyed by four-byte ascending height, and only the consumer's
+own `revert_block` may read a row below its newest height. A store opened with
+`MaterializedViewStoreOptions::reorg_policy` keeps only the newest `W` heights
+of each declared index:
+
+- Applying height `h` deletes the undo row at `h - W` in the same batch, after
+  the consumer's own writes.
+- `MaterializedViewStore::prune_undo_indexes` deletes every undo row at or
+  below the index's newest height minus `W` with one range delete, drops the
+  SST files that held only those rows, and compacts the rest of the range.
+  Ingest runs it on a blocking thread whenever it opens the view store, so a
+  store written without pruning shrinks in place, without a rebuild.
+
+The declaration is not part of the persisted manifest and the row encoding
+does not change, so declaring it needs no schema version change. A store that
+an earlier release opens again keeps working: that release's reverts and
+recoveries read only rows within the window.
+
+The newest row of an index is never pruned, so a reader that takes a
+consumer's newest height from its undo index keeps working, such as replay's
+durable height from `transparent_outpoint_spend_index`. Expired-cursor and
+uncursored recovery revert the `W` heights at and below that newest height,
+which are exactly the rows the index keeps. They therefore delete the same rows
+as on an unpruned store.
+
+An operator may raise the window from `W1` to `W2`. The index then still holds
+only the newest `W1` heights, while recovery reverts the newest `W2`. The
+heights between them lie at or below the settled tip, which holds through the
+raise, so the canonical chain still has the blocks the view wrote there. Their
+revert finds no undo row, and re-applying them writes the rows an unpruned
+revert would have deleted. The index grows back to `W2` heights as new blocks
+arrive. The canonical writer refuses to lower a window, so a store never needs
+an undo row it pruned.
+
 Revert is held to path independence rather than to restoring an earlier
 snapshot: after applying `A[1..n]` and reorging `A[k..n]` onto `B[k..m]`, every
 column family a consumer declares must hold the same bytes as a fresh store
@@ -194,6 +239,15 @@ entry through that check, and back onto `A`, with a declared list of
 path-dependent column families and the reason for each. Index payloads and undo
 journals therefore encode their entries in a deterministic order and never
 carry values that depend on batch grouping.
+
+A store that prunes its undo indexes is held to an unpruned store that applied
+the same events: after the same reorgs, an expired-cursor recovery, a raised
+window, or pruning on open, it must hold every row the unpruned store holds,
+except the undo rows at or below the newest height it has applied minus the
+window. A reorg onto a shorter branch is why the bound is the newest height
+ever applied rather than the current tip: the rows that branch's tip would
+still keep were pruned when the longer branch was applied, and they lie below
+the settled tip.
 
 ## Consequences
 
@@ -211,7 +265,8 @@ carry values that depend on batch grouping.
   as the consumer count grows.
 - Composite-key consumers that don't have a height prefix accept the
   index-CF overhead (a few dozen bytes per row at apply time) in
-  exchange for correct, single-batch rewinds.
+  exchange for correct, single-batch rewinds. Once declared as a height undo
+  index, the overhead covers only the reorg window's newest heights.
 
 ## Revision history
 
@@ -219,3 +274,5 @@ carry values that depend on batch grouping.
   also declares dispatch. The trait description now lists all six
   `BlockKeyedConsumer` methods and the store dispatch functions that supply the
   range loop. Revert is specified as reorg path independence.
+- 2026-11-15: Per-height undo indexes are kept only for the reorg window, and a
+  store written without pruning is pruned in place when ingest opens it.

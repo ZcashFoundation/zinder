@@ -551,6 +551,7 @@ fn seeded_reorg_history_materialized_view_store(
     let primary_materialized_view_store = zinder_ingest::open_primary_materialized_view_store(
         canonical_path,
         zinder_store::RocksDbResourceBudget::for_local_tests(),
+        zinder_store::CanonicalReorgPolicy::new(zinder_store::DEFAULT_REORG_WINDOW_BLOCKS)?,
     )?;
     record_reorg_incidents(&primary_materialized_view_store)?;
     let reorg_cursor = primary_materialized_view_store
@@ -566,6 +567,7 @@ fn seeded_reorg_history_materialized_view_store(
             sync_writes: false,
             consumers: MaterializedViewStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+            reorg_policy: None,
         },
     )?;
     materialized_view_store.try_catch_up()?;
@@ -781,6 +783,7 @@ fn seeded_block_summary_materialized_view_store_with_transaction_ids(
             sync_writes: false,
             consumers: MaterializedViewStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+            reorg_policy: None,
         },
     )?;
     seed_block_summary(&primary_store, chain_fixture, transaction_ids)?;
@@ -792,6 +795,7 @@ fn seeded_block_summary_materialized_view_store_with_transaction_ids(
             sync_writes: false,
             consumers: MaterializedViewStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+            reorg_policy: None,
         },
     )?;
     secondary_store.try_catch_up()?;
@@ -1102,6 +1106,7 @@ fn seeded_deltas_materialized_view_store(
             sync_writes: false,
             consumers: MaterializedViewStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+            reorg_policy: None,
         },
     )?;
     seed_transparent_address_deltas(&primary_store, address, deltas)?;
@@ -1113,6 +1118,7 @@ fn seeded_deltas_materialized_view_store(
             sync_writes: false,
             consumers: MaterializedViewStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+            reorg_policy: None,
         },
     )?;
     secondary_store.try_catch_up()?;

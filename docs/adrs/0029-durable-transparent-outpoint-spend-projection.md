@@ -45,6 +45,9 @@ output index) valued with the spending transaction id, spending block hash,
 spending height, and transparent input index. A per-height index column family,
 written for every applied block even when empty, drives reorg rewind and reports
 the projection's durable height through `last_materialized_height_ascending`.
+The replay host keeps that index only for the reorg window's newest heights
+([ADR-0017](0017-materialized-view-consumer-and-key-codec.md#undo-index-retention)),
+and the newest row, which carries the durable height, is never pruned.
 The consumer also persists `MaterializedViewState` in the same write batch as
 its rows and chain-event cursor. Its coverage starts at the first committed
 height actually materialized, advances only across a contiguous commit or

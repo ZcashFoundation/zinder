@@ -37,6 +37,7 @@ pub use materialized_view_replay::{
     MaterializedViewTailer, ReplayPrevoutCaches, TransparentAddressRankingBuildStep,
     VolumeSpaceGuard, open_primary_materialized_view_store, seed_backfill_owned_consumer_cursors,
     spawn_materialized_view_replay_budget_metrics_task, spawn_materialized_view_tailer_task,
+    spawn_undo_index_pruning_task,
 };
 pub use memory_pressure::{
     DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL, spawn_runtime_memory_metrics_task,

@@ -712,6 +712,7 @@ mod tests {
                 consumers: &[TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 sync_writes: false,
+                reorg_policy: None,
             },
         )?;
         let script_hash = TransparentAddressScriptHash::from_bytes([0x11; 32]);
@@ -802,6 +803,7 @@ mod tests {
                 ],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 sync_writes: false,
+                reorg_policy: None,
             },
         )?;
         TransparentAddressRankingConsumer::activate_genesis_generation(&store)?;

@@ -1677,6 +1677,7 @@ mod tests {
                 sync_writes: false,
                 consumers: &[VALUE_POOL_FLOW_HISTORY_SCHEMA],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                reorg_policy: None,
             },
         )?;
         let filter = FlowFilter {
@@ -1695,6 +1696,7 @@ mod tests {
                 sync_writes: false,
                 consumers: &[],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                reorg_policy: None,
             },
         )?;
         let history_error = read_history_page_blocking(&unconfigured_store, 1, None, filter)

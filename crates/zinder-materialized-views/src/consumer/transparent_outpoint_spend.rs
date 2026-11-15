@@ -37,6 +37,10 @@ use zinder_store::ChainEvent;
 pub const TRANSPARENT_OUTPOINT_SPEND_COLUMN_FAMILY: &str = "transparent_outpoint_spend";
 
 /// Per-height index used to delete the primary rows during reorg rewind.
+///
+/// It is the schema's height undo index: a store opened with a reorg window
+/// keeps it only for that window's newest heights, and its newest key is the
+/// projection's durable height.
 pub const TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY: &str = "transparent_outpoint_spend_index";
 
 /// Column families the consumer needs registered before its first write.
@@ -58,7 +62,8 @@ pub const TRANSPARENT_OUTPOINT_SPEND_SCHEMA: MaterializedViewConsumerSchema =
         TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
         1,
         TRANSPARENT_OUTPOINT_SPEND_COLUMN_FAMILIES,
-    );
+    )
+    .with_height_undo_index(TRANSPARENT_OUTPOINT_SPEND_INDEX_COLUMN_FAMILY);
 
 const TRANSACTION_ID_LEN: usize = 32;
 const BLOCK_HASH_LEN: usize = 32;
@@ -537,6 +542,7 @@ mod tests {
                 consumers: &[TRANSPARENT_OUTPOINT_SPEND_SCHEMA],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 sync_writes: false,
+                reorg_policy: None,
             },
         )?)
     }
