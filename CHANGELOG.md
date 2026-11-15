@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.14.0] - 2026-11-15
+
+### Fixed
+
+- Explorer view replay and the transparent-address ranking build no longer slow to a few dozen blocks per minute when a deployment caps glibc malloc arenas, as `MALLOC_ARENA_MAX=2` does; on a Mainnet-shaped fixture with that setting, replay ran about 24 times faster. Every service binary now allocates through jemalloc on Linux, including RocksDB's native allocations, so glibc malloc variables such as `MALLOC_ARENA_MAX` no longer apply. Remove them from the deployment and tune the allocator with `MALLOC_CONF` instead. Peak memory stayed within about 10% of glibc's on the same workload. ([#199](https://github.com/ZcashFoundation/zinder/pull/199))
+- `ExplorerQuery.TransactionDetail` no longer fails with `ARTIFACT_UNAVAILABLE` for mined transactions with transparent outputs while the Explorer's transparent-outpoint spend view does not cover the response's chain epoch, such as during view replay or while the view and the wallet reader are a block apart at the tip. The response carries the transaction's facts, location, inputs, and outputs, omits every `spent_by`, and lists `transparent_outputs.spent_by` in `freshness.unavailable` with `UNAVAILABLE_STALE`; clients must treat an absent `spent_by` as unknown, not unspent, when that entry is present. The Cipherscan adapter reports that output state as `spent: null`. The `zinder-wallet-serving-explorer` image now starts `zinder-explorer` as soon as wallet serving answers when `ZINDER_INGEST__EXPLORER_VIEWS` is false, instead of after a 10-minute wait for view admission. `zinder-query` and `zinder-compat-lightwalletd` log `wallet_serving_pair_publisher_refresh_failed` at debug level, not as a warning, when a refresh only found its secondaries an epoch apart within the replica lag threshold. ([#197](https://github.com/ZcashFoundation/zinder/pull/197))
+
+
 ## [0.13.0] - 2026-11-15
 
 ### Added
