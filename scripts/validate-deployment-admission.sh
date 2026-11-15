@@ -5,8 +5,8 @@ usage() {
   cat >&2 <<'EOF'
 Usage:
   validate-deployment-admission.sh --deployment-class CLASS --target TARGET
-  validate-deployment-admission.sh --release-workflow PATH [--release-images-catalog PATH] [--single-volume-images-catalog PATH]
-  validate-deployment-admission.sh --build-images-workflow PATH [--release-images-catalog PATH] [--single-volume-images-catalog PATH]
+  validate-deployment-admission.sh --release-workflow PATH [--release-images-catalog PATH] [--single-volume-images-catalog PATH] [--dockerfile PATH] [--image-packager PATH]
+  validate-deployment-admission.sh --build-images-workflow PATH [--release-images-catalog PATH] [--single-volume-images-catalog PATH] [--dockerfile PATH]
   validate-deployment-admission.sh --prometheus-config PATH
   validate-deployment-admission.sh --compose-contract RESOLVED_COMPOSE_JSON
 
@@ -22,7 +22,9 @@ release_workflow=""
 build_images_workflow=""
 release_images_catalog="$repository_root/deploy/release-images.json"
 single_volume_images_catalog="$repository_root/deploy/release-single-volume-images.json"
-release_images_catalog_explicit=false
+dockerfile="$repository_root/deploy/Dockerfile"
+image_packager="$repository_root/scripts/package-release-images.sh"
+release_inputs_explicit=false
 prometheus_config=""
 compose_contract=""
 
@@ -51,13 +53,25 @@ while [[ $# -gt 0 ]]; do
     --release-images-catalog)
       [[ $# -ge 2 ]] || usage
       release_images_catalog="$2"
-      release_images_catalog_explicit=true
+      release_inputs_explicit=true
       shift 2
       ;;
     --single-volume-images-catalog)
       [[ $# -ge 2 ]] || usage
       single_volume_images_catalog="$2"
-      release_images_catalog_explicit=true
+      release_inputs_explicit=true
+      shift 2
+      ;;
+    --dockerfile)
+      [[ $# -ge 2 ]] || usage
+      dockerfile="$2"
+      release_inputs_explicit=true
+      shift 2
+      ;;
+    --image-packager)
+      [[ $# -ge 2 ]] || usage
+      image_packager="$2"
+      release_inputs_explicit=true
       shift 2
       ;;
     --prometheus-config)
@@ -130,7 +144,7 @@ EOF
 
   local image_name
   while IFS= read -r image_name; do
-    grep -Eq "^FROM [a-z0-9-]+ AS ${image_name}\$" "$repository_root/deploy/Dockerfile" || {
+    grep -Eq "^FROM [a-z0-9-]+ AS ${image_name}\$" "$dockerfile" || {
       echo "release admission rejected: deploy/Dockerfile has no ${image_name} target" >&2
       exit 1
     }
@@ -138,7 +152,7 @@ EOF
 }
 
 if [[ -n "$compose_contract" ]]; then
-  [[ -z "$deployment_class" && -z "$target" && -z "$release_workflow" && -z "$build_images_workflow" && "$release_images_catalog_explicit" = false && -z "$prometheus_config" ]] || usage
+  [[ -z "$deployment_class" && -z "$target" && -z "$release_workflow" && -z "$build_images_workflow" && "$release_inputs_explicit" = false && -z "$prometheus_config" ]] || usage
   [[ -r "$compose_contract" ]] || {
     echo "release admission rejected: cannot read resolved Compose contract $compose_contract" >&2
     exit 1
@@ -368,7 +382,7 @@ EOF
 fi
 
 if [[ -n "$prometheus_config" ]]; then
-  [[ -z "$deployment_class" && -z "$target" && -z "$release_workflow" && -z "$build_images_workflow" && "$release_images_catalog_explicit" = false && -z "$compose_contract" ]] || usage
+  [[ -z "$deployment_class" && -z "$target" && -z "$release_workflow" && -z "$build_images_workflow" && "$release_inputs_explicit" = false && -z "$compose_contract" ]] || usage
   [[ -r "$prometheus_config" ]] || {
     echo "release admission rejected: cannot read Prometheus config $prometheus_config" >&2
     exit 1
@@ -402,6 +416,104 @@ if [[ -n "$release_workflow" ]]; then
   }
   validate_release_images_catalog
   validate_single_volume_images_catalog
+
+  release_job_body() {
+    awk -v heading="  $1:" '
+      $0 == heading { in_job = 1; next }
+      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
+      in_job { print }
+    ' "$release_workflow"
+  }
+
+  release_job_ids() {
+    awk '
+      /^jobs:[[:space:]]*$/ { in_jobs = 1; next }
+      in_jobs && /^  [a-zA-Z0-9_-]+:[[:space:]]*$/ { job = $1; sub(/:$/, "", job); print job }
+    ' "$release_workflow"
+  }
+
+  # One "job need" line per dependency edge, from scalar, flow, or block
+  # sequence needs.
+  release_need_edges="$(
+    awk '
+      /^jobs:[[:space:]]*$/ { in_jobs = 1; next }
+      !in_jobs { next }
+      /^  [a-zA-Z0-9_-]+:[[:space:]]*$/ {
+        job = $1
+        sub(/:$/, "", job)
+        in_needs = 0
+        next
+      }
+      /^    needs:/ {
+        line = $0
+        sub(/^    needs:[[:space:]]*/, "", line)
+        sub(/[[:space:]]*#.*$/, "", line)
+        in_needs = (line == "")
+        gsub(/[][,]/, " ", line)
+        count = split(line, needs, /[[:space:]]+/)
+        for (position = 1; position <= count; position++) {
+          if (needs[position] != "") { print job, needs[position] }
+        }
+        next
+      }
+      in_needs && /^      - / {
+        need = $0
+        sub(/^      - /, "", need)
+        sub(/[[:space:]]*#.*$/, "", need)
+        print job, need
+        next
+      }
+      in_needs && !/^[[:space:]]*$/ { in_needs = 0 }
+    ' "$release_workflow"
+  )"
+  declare -A release_job_needs=()
+  while read -r dependent_job needed_job; do
+    [[ -n "$dependent_job" ]] || continue
+    release_job_needs["$dependent_job"]+="${needed_job} "
+  done <<< "$release_need_edges"
+
+  release_job_direct_needs() {
+    local need
+    for need in ${release_job_needs[$1]:-}; do
+      printf '%s\n' "$need"
+    done | sort
+  }
+
+  release_job_has_ancestor() {
+    local ancestor="$2"
+    local -A visited=()
+    local -a pending=("$1")
+    local current need
+    while [[ "${#pending[@]}" -gt 0 ]]; do
+      current="${pending[0]}"
+      pending=("${pending[@]:1}")
+      for need in ${release_job_needs[$current]:-}; do
+        [[ "$need" != "$ancestor" ]] || return 0
+        [[ -z "${visited[$need]:-}" ]] || continue
+        visited["$need"]=1
+        pending+=("$need")
+      done
+    done
+    return 1
+  }
+
+  # Jobs that declare any write scope, write-all, or an OIDC token.
+  writing_release_jobs="$(
+    awk '
+      /^jobs:[[:space:]]*$/ { in_jobs = 1; next }
+      !in_jobs { next }
+      /^  [a-zA-Z0-9_-]+:[[:space:]]*$/ {
+        job = $1
+        sub(/:$/, "", job)
+        in_permissions = 0
+        next
+      }
+      /^    permissions:/ && /write/ { print job; next }
+      /^    permissions:[[:space:]]*$/ { in_permissions = 1; next }
+      in_permissions && /^      [a-z-]+:[[:space:]]*write[[:space:]]*$/ { print job; next }
+      in_permissions && /^    [^ ]/ { in_permissions = 0 }
+    ' "$release_workflow" | sort -u
+  )"
 
   if grep -Fq 'workflow_dispatch:' "$release_workflow"; then
     cat >&2 <<'EOF'
@@ -466,13 +578,7 @@ EOF
     exit 1
   fi
 
-  sdk_package_job="$(
-    awk '
-      $0 == "  sdk-packages:" { in_job = 1; next }
-      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
-      in_job { print }
-    ' "$release_workflow"
-  )"
+  sdk_package_job="$(release_job_body sdk-packages)"
   if [[ -z "$sdk_package_job" ]] \
     || ! grep -Fq 'needs: validate' <<< "$sdk_package_job" \
     || ! grep -Fq 'fetch-depth: 0' <<< "$sdk_package_job" \
@@ -500,13 +606,7 @@ EOF
     exit 1
   fi
 
-  crate_publication_job="$(
-    awk '
-      $0 == "  publish-sdk-crates:" { in_job = 1; next }
-      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
-      in_job { print }
-    ' "$release_workflow"
-  )"
+  crate_publication_job="$(release_job_body publish-sdk-crates)"
   auth_line="$(grep -nF 'uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5' <<< "$crate_publication_job" | cut -d: -f1)"
   publish_line="$(grep -nF 'uses: ZcashFoundation/cargo-release@34a37595755444456ce0e2d2b1258d9a29c14fac' <<< "$crate_publication_job" | cut -d: -f1)"
   consumer_line="$(grep -nF 'scripts/verify-published-sdk.sh "$SDK_VERSION"' <<< "$crate_publication_job" | cut -d: -f1)"
@@ -565,18 +665,12 @@ EOF
     exit 1
   fi
 
-  publishing_jobs=(build reproduce merge assemble-and-sign prepare-release publish-release verify-release promote-latest)
+  publishing_jobs=(images binary-archives merge assemble-and-sign prepare-release publish-release verify-release promote-latest)
   required_predecessors=(publish-sdk-crates publish-sdk-crates binary-archives merge assemble-and-sign prepare-release publish-release verify-release)
   for index in "${!publishing_jobs[@]}"; do
     publishing_job="${publishing_jobs[$index]}"
     required_predecessor="${required_predecessors[$index]}"
-    job_body="$(
-      awk -v heading="  ${publishing_job}:" '
-        $0 == heading { in_job = 1; next }
-        in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
-        in_job { print }
-      ' "$release_workflow"
-    )"
+    job_body="$(release_job_body "$publishing_job")"
     if [[ -z "$job_body" ]] \
       || ! grep -Eq "^[[:space:]]+- ${required_predecessor}$" <<< "$job_body"; then
       cat >&2 <<EOF
@@ -586,6 +680,60 @@ EOF
       exit 1
     fi
   done
+
+  while IFS= read -r writing_job; do
+    [[ -n "$writing_job" && "$writing_job" != publish-sdk-crates ]] || continue
+    if ! release_job_has_ancestor "$writing_job" publish-sdk-crates; then
+      cat >&2 <<EOF
+release admission rejected: job $writing_job receives a write permission or an
+OIDC token without depending on the approved publish-sdk-crates job.
+EOF
+      exit 1
+    fi
+  done <<< "$writing_release_jobs"
+
+  for binary_build_job in compile reproduce; do
+    if [[ "$(release_job_direct_needs "$binary_build_job")" != validate ]]; then
+      cat >&2 <<EOF
+release admission rejected: $binary_build_job must need only validate, so both
+release builds start right after tag validation, before approval and crate
+publication.
+EOF
+      exit 1
+    fi
+  done
+
+  comparison_needs="$(release_job_direct_needs compare-binaries)"
+  for proof_dependent_job in publish-sdk-crates images binary-archives; do
+    if ! grep -Fqx compare-binaries <<< "$(release_job_direct_needs "$proof_dependent_job")" \
+      || ! grep -Fqx compile <<< "$comparison_needs" \
+      || ! grep -Fqx reproduce <<< "$comparison_needs"; then
+      cat >&2 <<EOF
+release admission rejected: $proof_dependent_job must need compare-binaries,
+and compare-binaries must need compile and reproduce, so the release approval,
+archive attestation, and image publication wait until both builds of every
+platform match.
+EOF
+      exit 1
+    fi
+  done
+
+  while IFS= read -r release_job; do
+    [[ -n "$release_job" ]] || continue
+    job_timeout="$(sed -n 's/^    timeout-minutes: \([0-9]*\)$/\1/p' <<< "$(release_job_body "$release_job")")"
+    case "$release_job" in
+      compile|reproduce) required_timeout_pattern='^60$' ;;
+      *) required_timeout_pattern='^[1-9][0-9]*$' ;;
+    esac
+    if [[ ! "$job_timeout" =~ $required_timeout_pattern ]]; then
+      cat >&2 <<EOF
+release admission rejected: release job $release_job must declare a job-level
+timeout-minutes, 60 for each binary build, so a hung runner cannot hold the
+release-publication group.
+EOF
+      exit 1
+    fi
+  done < <(release_job_ids)
 
   stable_promotion_job="$(sed -n '/^  promote-latest:/,$p' "$release_workflow")"
   if ! grep -Fq "if: needs.validate.outputs.stable == 'true'" \
@@ -623,7 +771,6 @@ EOF
     exit 1
   fi
 
-  dockerfile="$repository_root/deploy/Dockerfile"
   binary_export_stage="$(
     awk '
       $0 == "FROM scratch AS release-binaries" { in_stage = 1; next }
@@ -657,76 +804,94 @@ EOF
     exit 1
   fi
 
-  build_job="$(
+  # "stage NAME BASE" for each named stage and "copy STAGE SOURCE" for each
+  # COPY --from inside it.
+  dockerfile_stages="$(
     awk '
-      $0 == "  build:" { in_job = 1; next }
-      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
-      in_job { print }
-    ' "$release_workflow"
+      /^FROM / {
+        stage = ""
+        if (NF >= 4 && toupper($3) == "AS") {
+          stage = $4
+          print "stage", stage, $2
+        }
+        next
+      }
+      stage != "" && /^COPY / {
+        for (position = 2; position <= NF; position++) {
+          if ($position ~ /^--from=/) {
+            source = $position
+            sub(/^--from=/, "", source)
+            print "copy", stage, source
+          }
+        }
+      }
+    ' "$dockerfile"
   )"
-  reproduction_job="$(
+  dockerfile_stage_base() {
+    awk -v stage="$1" '$1 == "stage" && $2 == stage { print $3 }' <<< "$dockerfile_stages"
+  }
+  compiled_binary_catalog="$(
     awk '
-      $0 == "  reproduce:" { in_job = 1; next }
-      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
-      in_job { print }
-    ' "$release_workflow"
+      /^FROM / { in_stage = ($NF == "zinder-binaries"); next }
+      in_stage {
+        for (position = 1; position < NF; position++) {
+          if ($position == "--bin") { print $(position + 1) }
+        }
+      }
+    ' "$dockerfile" | sort
   )"
-  binary_archive_job="$(
+  archived_binaries_stage="$(
     awk '
-      $0 == "  binary-archives:" { in_job = 1; next }
-      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
-      in_job { print }
-    ' "$release_workflow"
+      $0 == "FROM scratch AS zinder-archived-binaries" { in_stage = 1; found = 1; next }
+      in_stage && /^FROM / { exit }
+      in_stage && !/^[[:space:]]*(#.*)?$/ { print }
+      END { if (!found) { print "missing" } }
+    ' "$dockerfile"
   )"
-  collected_binary_job="$(
-    awk '
-      $0 == "  collect-binary-assets:" { in_job = 1; next }
-      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
-      in_job { print }
-    ' "$release_workflow"
-  )"
-  prepare_release_job="$(
-    awk '
-      $0 == "  prepare-release:" { in_job = 1; next }
-      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
-      in_job { print }
-    ' "$release_workflow"
-  )"
-  publish_release_job="$(
-    awk '
-      $0 == "  publish-release:" { in_job = 1; next }
-      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
-      in_job { print }
-    ' "$release_workflow"
-  )"
-  assemble_release_job="$(
-    awk '
-      $0 == "  assemble-and-sign:" { in_job = 1; next }
-      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
-      in_job { print }
-    ' "$release_workflow"
-  )"
-  merge_job="$(
-    awk '
-      $0 == "  merge:" { in_job = 1; next }
-      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
-      in_job { print }
-    ' "$release_workflow"
-  )"
-  verify_release_job="$(
-    awk '
-      $0 == "  verify-release:" { in_job = 1; next }
-      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
-      in_job { print }
-    ' "$release_workflow"
-  )"
-  promote_latest_job="$(
-    awk '
-      $0 == "  promote-latest:" { in_job = 1; next }
-      in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
-      in_job { print }
-    ' "$release_workflow"
-  )"
+  release_image_targets="$(jq -r '.[]' "$release_images_catalog" "$single_volume_images_catalog")"
+  image_targets_package_selected_binaries=true
+  while IFS= read -r image_target; do
+    image_target_base="$(dockerfile_stage_base "$image_target")"
+    image_target_sources="$(
+      awk -v stage="$image_target" '$1 == "copy" && $2 == stage { print $3 }' \
+        <<< "$dockerfile_stages" | sort -u
+    )"
+    if { [[ "$image_target_base" != zinder-runtime-base ]] \
+        && ! grep -Fqx -- "$image_target_base" <<< "$release_image_targets"; } \
+      || [[ -n "$image_target_sources" && "$image_target_sources" != zinder-binaries-selected ]]; then
+      image_targets_package_selected_binaries=false
+    fi
+  done <<< "$release_image_targets"
+  # The variable reference is the literal Dockerfile text being inspected.
+  # shellcheck disable=SC2016
+  if [[ "$compiled_binary_catalog" != "$configured_release_images" ]] \
+    || [[ "$(grep -c '^COPY --from=zinder-binaries ' "$dockerfile")" -ne "$(wc -l <<< "$configured_release_images")" ]] \
+    || ! sed '/^FROM /,$d' "$dockerfile" | grep -Fqx 'ARG ZINDER_BINARIES_SOURCE=zinder-binaries' \
+    || [[ -n "$archived_binaries_stage" ]] \
+    || [[ "$(dockerfile_stage_base zinder-binaries-selected)" != '${ZINDER_BINARIES_SOURCE}' ]] \
+    || [[ "$(dockerfile_stage_base zinder-runtime-base)" != debian:* ]] \
+    || [[ "$image_targets_package_selected_binaries" != true ]]; then
+    cat >&2 <<'EOF'
+release admission rejected: the zinder-binaries stage must compile exactly the
+runtime catalog, without the benchmark, and every release image target must
+take its binaries from zinder-binaries-selected, whose archived source is an
+empty stage that fails without its build context.
+EOF
+    exit 1
+  fi
+
+  compile_job="$(release_job_body compile)"
+  reproduction_job="$(release_job_body reproduce)"
+  comparison_job="$(release_job_body compare-binaries)"
+  image_job="$(release_job_body images)"
+  binary_archive_job="$(release_job_body binary-archives)"
+  collected_binary_job="$(release_job_body collect-binary-assets)"
+  prepare_release_job="$(release_job_body prepare-release)"
+  publish_release_job="$(release_job_body publish-release)"
+  assemble_release_job="$(release_job_body assemble-and-sign)"
+  merge_job="$(release_job_body merge)"
+  verify_release_job="$(release_job_body verify-release)"
+  promote_latest_job="$(release_job_body promote-latest)"
   image_attestation_verification="$(
     awk '
       /scripts\/verify-release-image-attestations\.sh/ { in_call = 1 }
@@ -734,43 +899,63 @@ EOF
       in_call && /--commit / { exit }
     ' <<< "$merge_job"
   )"
+  # The continued shell command that starts at the first line matching $1.
+  shell_invocation() {
+    awk -v start="$1" '
+      index($0, start) { in_call = 1 }
+      in_call { print }
+      in_call && !/\\$/ { exit }
+    '
+  }
+  image_push_invocation="$(shell_invocation 'scripts/package-release-images.sh push ' <<< "$image_job")"
+  image_smoke_invocation="$(shell_invocation 'scripts/package-release-images.sh check ' <<< "$reproduction_job")"
   # These literals are workflow expressions and shell variables being inspected.
   # shellcheck disable=SC2016
-  if [[ -z "$build_job" || -z "$reproduction_job" ]] \
-    || [[ -z "$binary_archive_job" || -z "$collected_binary_job" ]] \
-    || [[ "$(grep -Fc -- '--no-cache' <<< "$build_job")" -ne 1 ]] \
+  if [[ -z "$compile_job" || -z "$reproduction_job" || -z "$comparison_job" ]] \
+    || [[ -z "$image_job" || -z "$binary_archive_job" || -z "$collected_binary_job" ]] \
+    || [[ "$(grep -Fc -- '--no-cache' <<< "$compile_job")" -ne 1 ]] \
     || [[ "$(grep -Fc -- '--no-cache' <<< "$reproduction_job")" -ne 1 ]] \
-    || [[ "$(grep -Fc -- '--target release-binaries' <<< "$build_job")" -ne 1 ]] \
+    || [[ "$(grep -Fc -- '--target release-binaries' <<< "$compile_job")" -ne 1 ]] \
     || ! grep -Fq -- '--target release-binaries' <<< "$reproduction_job" \
     || ! grep -Fq 'RELEASE_CACHE_SCOPE: release-${{ needs.validate.outputs.commit }}-${{ matrix.platform.rust }}-1' \
-      <<< "$build_job" \
+      <<< "$compile_job" \
     || ! grep -Fq 'RELEASE_CACHE_SCOPE=release-${RELEASE_COMMIT}-${RUST_TARGET}-2' \
       <<< "$reproduction_job" \
-    || [[ "$(grep -Fc -- '--build-arg "RELEASE_CACHE_SCOPE=${RELEASE_CACHE_SCOPE}"' <<< "$build_job")" -ne 2 ]] \
-    || [[ "$(grep -Fc -- '--build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}"' <<< "$build_job")" -ne 2 ]] \
-    || [[ "$(grep -Fc -- '--build-arg "ZINDER_BUILD_GIT_COMMIT=${RELEASE_COMMIT}"' <<< "$build_job")" -ne 2 ]] \
-    || ! grep -Fq 'cmp -- "${binary_root}/${binary_name}" "$image_binary"' <<< "$build_job" \
+    || [[ "$(grep -Fc -- '--build-arg "RELEASE_CACHE_SCOPE=${RELEASE_CACHE_SCOPE}"' <<< "$compile_job")" -ne 1 ]] \
+    || [[ "$(grep -Fc -- '--build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}"' <<< "$compile_job")" -ne 1 ]] \
+    || [[ "$(grep -Fc -- '--build-arg "ZINDER_BUILD_GIT_COMMIT=${RELEASE_COMMIT}"' <<< "$compile_job")" -ne 1 ]] \
     || grep -Eq -- '--cache-(from|to)' "$release_workflow" \
-    || grep -Fq 'dist/' <<< "$build_job" \
-    || grep -Fq 'id-token: write' <<< "$build_job" \
-    || grep -Fq 'packages: write' <<< "$reproduction_job" \
-    || grep -Fq 'id-token: write' <<< "$reproduction_job" \
-    || ! grep -Fq 'scripts/check-release-binary-archive.sh' <<< "$build_job" \
+    || grep -Eq 'docker/login-action|docker login' <<< "$compile_job$comparison_job" \
+    || ! grep -Fq 'scripts/check-release-binary-archive.sh' <<< "$compile_job" \
     || ! grep -Fq 'scripts/check-release-binary-archive.sh' <<< "$reproduction_job" \
-    || ! grep -Fq 'x86_64-v3-unknown-linux-gnu' <<< "$build_job" \
-    || ! grep -Fq 'aarch64-unknown-linux-gnu' <<< "$build_job" \
+    || ! grep -Fq 'x86_64-v3-unknown-linux-gnu' <<< "$compile_job" \
+    || ! grep -Fq 'aarch64-unknown-linux-gnu' <<< "$compile_job" \
     || ! grep -Fq 'x86_64-v3-unknown-linux-gnu' <<< "$reproduction_job" \
     || ! grep -Fq 'aarch64-unknown-linux-gnu' <<< "$reproduction_job" \
-    || ! grep -Fq 'scripts/generate-release-sbom.sh' <<< "$build_job" \
-    || ! grep -Fq 'scripts/check-release-sbom.sh' <<< "$build_job" \
-    || ! grep -Eq '^[[:space:]]+- build$' <<< "$binary_archive_job" \
-    || ! grep -Eq '^[[:space:]]+- reproduce$' <<< "$binary_archive_job" \
+    || ! grep -Fq 'scripts/generate-release-sbom.sh' <<< "$compile_job" \
+    || ! grep -Fq 'scripts/check-release-sbom.sh' <<< "$compile_job" \
+    || ! grep -Fq 'name: release-build-${{ matrix.platform.name }}' <<< "$compile_job" \
+    || ! grep -Fq 'name: release-build-${{ matrix.platform }}' <<< "$comparison_job" \
+    || ! grep -Fq 'name: release-reproduction-${{ matrix.platform }}' <<< "$comparison_job" \
     || ! grep -Fq 'diff -u dist/build/binaries.sha256 dist/reproduction/binaries.sha256' \
-      <<< "$binary_archive_job" \
+      <<< "$comparison_job" \
     || ! grep -Fq 'cmp -- "dist/build/${archive_name}" "dist/reproduction/${archive_name}"' \
-      <<< "$binary_archive_job" \
+      <<< "$comparison_job" \
+    || ! grep -Fq 'name: release-build-${{ matrix.platform.name }}' <<< "$image_job" \
+    || ! grep -Fq 'path: ${{ runner.temp }}/release-candidate' <<< "$image_job" \
+    || ! grep -Fq 'RELEASE_IMAGES_JSON: ${{ needs.validate.outputs.release_images }}' <<< "$image_job" \
+    || [[ "$(grep -Fc 'scripts/package-release-images.sh' <<< "$image_job")" -ne 1 ]] \
+    || ! grep -Fq -- '--archive "${candidate_root}/zinder-${RELEASE_VERSION}-${PLATFORM_NAME}.tar.gz"' <<< "$image_push_invocation" \
+    || ! grep -Fq -- '--binary-hashes "${candidate_root}/binaries.sha256"' <<< "$image_push_invocation" \
+    || ! grep -Fq -- '--images-json "$RELEASE_IMAGES_JSON"' <<< "$image_push_invocation" \
+    || ! grep -Fq -- '--platform "$TARGET_PLATFORM"' <<< "$image_push_invocation" \
+    || ! grep -Fq -- '--digests /tmp/digests' <<< "$image_push_invocation" \
+    || grep -Fq 'docker buildx build' <<< "$image_job" \
+    || grep -Fq 'RELEASE_CACHE_SCOPE' <<< "$image_job" \
+    || grep -Fq -- '--target release-binaries' <<< "$image_job" \
+    || ! grep -Fq 'name: release-build-${{ matrix.platform }}' <<< "$binary_archive_job" \
     || [[ "$(grep -Fc 'uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0' <<< "$binary_archive_job")" -ne 2 ]] \
-    || ! grep -Eq '^[[:space:]]+- build$' <<< "$merge_job" \
+    || ! grep -Eq '^[[:space:]]+- images$' <<< "$merge_job" \
     || ! grep -Eq '^[[:space:]]+- binary-archives$' <<< "$collected_binary_job" \
     || ! grep -Fq 'spdx.json' <<< "$collected_binary_job" \
     || ! grep -Eq '^[[:space:]]+- collect-binary-assets$' <<< "$assemble_release_job" \
@@ -785,9 +970,91 @@ EOF
     || ! grep -Fq 'name: release-assets-final' <<< "$prepare_release_job"; then
     cat >&2 <<'EOF'
 release admission rejected: release binaries must build in 2 independent
-uncached jobs for both GNU platforms and compare identical, images must reuse
-the archived binaries, exact SBOMs must be generated and attested, and the
-archives must be assembled into the final draft GitHub Release assets.
+uncached jobs for both GNU platforms and compare identical before approval,
+images must package the proven archive binaries only through
+scripts/package-release-images.sh push, exact SBOMs must be generated and
+attested, and the archives must be assembled into the final draft GitHub
+Release assets.
+EOF
+    exit 1
+  fi
+
+  # These literals are workflow expressions and shell variables being inspected.
+  # shellcheck disable=SC2016
+  archive_build_line="$(grep -nF 'scripts/build-release-binary-archive.sh' <<< "$reproduction_job" | head -n 1 | cut -d: -f1 || true)"
+  image_smoke_line="$(grep -nF 'scripts/package-release-images.sh check ' <<< "$reproduction_job" | head -n 1 | cut -d: -f1 || true)"
+  reproduction_permissions="$(
+    awk '
+      /^    permissions:[[:space:]]*$/ { in_permissions = 1; next }
+      in_permissions && /^      / { print; next }
+      in_permissions { exit }
+    ' <<< "$reproduction_job"
+  )"
+  # shellcheck disable=SC2016
+  if [[ -z "$archive_build_line" || -z "$image_smoke_line" ]] \
+    || (( archive_build_line >= image_smoke_line )) \
+    || [[ "$(grep -Fc 'scripts/package-release-images.sh' <<< "$reproduction_job")" -ne 1 ]] \
+    || ! grep -Fq -- '--archive "dist/reproduction/zinder-${RELEASE_VERSION}-${PLATFORM_NAME}.tar.gz"' <<< "$image_smoke_invocation" \
+    || ! grep -Fq -- '--binary-hashes dist/reproduction/binaries.sha256' <<< "$image_smoke_invocation" \
+    || ! grep -Fq -- '--images-json "$RELEASE_IMAGES_JSON"' <<< "$image_smoke_invocation" \
+    || ! grep -Fq -- '--platform "$TARGET_PLATFORM"' <<< "$image_smoke_invocation" \
+    || grep -Eq -- '--(registry|digests)' <<< "$image_smoke_invocation" \
+    || ! grep -Fq 'RELEASE_IMAGES_JSON: ${{ needs.validate.outputs.release_images }}' <<< "$reproduction_job" \
+    || grep -Eq '^[[:space:]]+(-[[:space:]]+)?(continue-on-error|if):' <<< "$reproduction_job" \
+    || grep -Eq 'docker/login-action|docker login|secrets\.|github\.token' <<< "$reproduction_job" \
+    || [[ "$reproduction_permissions" != '      contents: read' ]]; then
+    cat >&2 <<'EOF'
+release admission rejected: the reproduce job must package every release image
+from its own archive with scripts/package-release-images.sh check after
+building it, with only a read-only repository token, no registry login, and no
+step that may skip or ignore the packaging smoke.
+EOF
+    exit 1
+  fi
+
+  # These literals are the shell text of the packager being inspected.
+  # shellcheck disable=SC2016
+  packager_hash_check_line="$(grep -nF '(cd "$binary_root" && sha256sum --check --strict "$binary_hashes")' "$image_packager" | head -n 1 | cut -d: -f1 || true)"
+  # shellcheck disable=SC2016
+  packager_mode_check_line="$(grep -nF 'require_archive_binary_mode "$binary_root/$binary_name" "archive binary $binary_name"' "$image_packager" | head -n 1 | cut -d: -f1 || true)"
+  # shellcheck disable=SC2016
+  packager_image_check_line="$(grep -nF 'require_archive_binary_mode "$image_binary" "${image_name} binary ${binary_name}"' "$image_packager" | head -n 1 | cut -d: -f1 || true)"
+  packager_first_build_line="$(grep -nF 'docker buildx build' "$image_packager" | head -n 1 | cut -d: -f1 || true)"
+  # shellcheck disable=SC2016
+  packager_publish_line="$(grep -nF -- '--output "$image_output"' "$image_packager" | head -n 1 | cut -d: -f1 || true)"
+  # shellcheck disable=SC1003,SC2016
+  if [[ ! -x "$image_packager" ]] \
+    || [[ -z "$packager_hash_check_line" || -z "$packager_mode_check_line" ]] \
+    || [[ -z "$packager_image_check_line" || -z "$packager_first_build_line" || -z "$packager_publish_line" ]] \
+    || (( packager_hash_check_line >= packager_first_build_line )) \
+    || (( packager_mode_check_line >= packager_first_build_line )) \
+    || (( packager_image_check_line >= packager_publish_line )) \
+    || ! grep -Fqx 'archive_binary_mode=755' "$image_packager" \
+    || ! grep -Fq 'tar --extract --gzip --same-permissions --no-same-owner \' "$image_packager" \
+    || ! grep -Fq 'if [[ -L "$binary_path" || ! -f "$binary_path" ]]; then' "$image_packager" \
+    || ! grep -Fq "binary_mode=\"\$(stat -c '%a' -- \"\$binary_path\")\"" "$image_packager" \
+    || ! grep -Fq 'if [[ "$binary_mode" != "$archive_binary_mode" ]]; then' "$image_packager" \
+    || ! grep -Fq 'cmp -- "${binary_root}/${binary_name}" "$image_binary"' "$image_packager" \
+    || ! grep -Fq -- "-c '%a %u:%g %F' \"/usr/local/bin/\${binary_name}\"" "$image_packager" \
+    || ! grep -Fq '[[ "$image_binary_stat" == "${archive_binary_mode} 0:0 regular file" ]]' "$image_packager" \
+    || ! grep -Fq -- '--entrypoint "$binary_name" "$smoke_image" --version' "$image_packager" \
+    || ! grep -Fq "jq -r '.[]' <<< \"\$images_json\"" "$image_packager" \
+    || ! grep -Fq -- '--build-context "zinder-archived-binaries=${binary_context}"' "$image_packager" \
+    || ! grep -Fq -- '--build-arg "ZINDER_BINARIES_SOURCE=zinder-archived-binaries"' "$image_packager" \
+    || ! grep -Fq -- '--build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}"' "$image_packager" \
+    || ! grep -Fq -- '--provenance=mode=max' "$image_packager" \
+    || ! grep -Fq -- '--sbom=true' "$image_packager" \
+    || ! grep -Fq 'push) image_output="type=image,name=${registry}/${image_name},push-by-digest=true,name-canonical=true,push=true" ;;' "$image_packager" \
+    || ! grep -Fq 'check) image_output="type=image,name=zinder-release-smoke/${image_name}:${platform_arch},push=false" ;;' "$image_packager" \
+    || [[ "$(grep -Fc 'push=true' "$image_packager")" -ne 1 ]] \
+    || grep -Eq -- 'RELEASE_CACHE_SCOPE|--target release-binaries|--cache-(from|to)|docker login|cargo ' "$image_packager"; then
+    cat >&2 <<'EOF'
+release admission rejected: the release image packager must check the archive
+binary hashes and their regular-file 0755 mode before any image build, package
+every image from the archived-binaries context without compiling or caching,
+compare every image binary with the archive byte for byte and by mode before
+publishing it, build with max-mode provenance and an SBOM, push only in push
+mode, and run each binary inside its image in check mode.
 EOF
     exit 1
   fi
@@ -795,11 +1062,12 @@ EOF
   workflow_before_approval="$(sed '/^  publish-sdk-crates:/,$d' "$release_workflow")"
   if [[ "$(grep -Ec '^    environment:' "$release_workflow")" -ne 1 ]] \
     || grep -Eq '(id-token|packages|attestations|contents): write' \
-      <<< "$workflow_before_approval"; then
+      <<< "$workflow_before_approval" \
+    || grep -Eq 'docker/login-action|docker login' <<< "$workflow_before_approval"; then
     cat >&2 <<'EOF'
 release admission rejected: the protected release environment must gate crate
 publication as the only reviewed job, and no earlier job may receive a write
-permission or an OIDC token.
+permission or an OIDC token or log in to a registry.
 EOF
     exit 1
   fi
@@ -810,8 +1078,6 @@ EOF
     || [[ "$(grep -Fc 'uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2' "$release_workflow")" -ne 3 ]] \
     || [[ "$(grep -Fc 'scripts/install-release-gh.sh' "$release_workflow")" -ne 4 ]] \
     || grep -Fq 'artifact-metadata:' "$release_workflow" \
-    || ! grep -Fq -- '--provenance=mode=max' "$release_workflow" \
-    || ! grep -Fq -- '--sbom=true' "$release_workflow" \
     || ! grep -Fq 'scripts/check-release-image-evidence.sh' "$release_workflow" \
     || ! grep -Fq 'cosign sign --yes' <<< "$merge_job" \
     || ! grep -Fq 'scripts/verify-release-image-attestations.sh' <<< "$image_attestation_verification" \
@@ -856,7 +1122,7 @@ EOF
   exit 0
 fi
 
-[[ "$release_images_catalog_explicit" = false ]] || usage
+[[ "$release_inputs_explicit" = false ]] || usage
 
 case "$deployment_class" in
   production|canary|diagnostic) ;;
