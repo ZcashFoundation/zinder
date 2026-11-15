@@ -17,7 +17,8 @@ on:
     # Keep this list identical in live-tests.yml and parity-compat.yml. It
     # covers every crate the live and parity tests exercise, the workspace
     # manifest and lockfile that pin the consensus cohort, the node
-    # configurations, the mining and indexer TLS scripts, and both workflows.
+    # configurations, the mining and indexer TLS scripts, the CI tool installer
+    # and its lock (which pins cargo-nextest), and both workflows.
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
@@ -33,6 +34,8 @@ on:
       - "deploy/zebra/**"
       - "scripts/mine-live-regtest.sh"
       - "scripts/generate-live-indexer-tls.sh"
+      - "scripts/install-ci-tool.sh"
+      - ".github/ci-tools.lock"
       - ".github/workflows/live-tests.yml"
       - ".github/workflows/parity-compat.yml"
 

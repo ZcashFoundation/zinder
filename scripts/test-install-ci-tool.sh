@@ -19,7 +19,10 @@ archive_url="file://${scratch}/fake-tool.tar.gz"
 
 run_installer() {
   local lock_file="$1" install_dir="$2" tool_name="$3"
-  CI_TOOLS_LOCK="$lock_file" \
+  # Unset GITHUB_PATH so the fake tool's directory never leaks into the CI job PATH.
+  env -u GITHUB_PATH \
+    CI_TOOL_PLATFORM=Linux-x86_64 \
+    CI_TOOLS_LOCK="$lock_file" \
     CI_TOOL_INSTALL_DIR="$install_dir" \
     CI_TOOL_ALLOWED_PROTOCOLS='=file' \
     "$installer" "$tool_name" 2> >(grep -v 'is not on PATH' >&2)

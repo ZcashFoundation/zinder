@@ -31,9 +31,11 @@ fail() {
 
 [[ -f "$lock_file" ]] || fail "lock file not found: $lock_file"
 
-case "$(uname -s)-$(uname -m)" in
+# CI_TOOL_PLATFORM exists only so the offline self-test can run on other hosts.
+platform="${CI_TOOL_PLATFORM:-$(uname -s)-$(uname -m)}"
+case "$platform" in
   Linux-x86_64) ;;
-  *) fail "the lock pins x86_64 Linux assets only, not $(uname -s)-$(uname -m)" ;;
+  *) fail "the lock pins x86_64 Linux assets only, not ${platform}" ;;
 esac
 
 tool_version=""

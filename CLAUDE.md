@@ -61,7 +61,7 @@ Single-test execution under nextest: `cargo nextest run -p <crate> -E 'test(<tes
 The pull request workflows cancel a superseded run when the pull request gets a
 new push, give every job a timeout, and write Rust caches only from `main`.
 Tools such as `cargo-nextest`, `cargo-deny`, `cargo-machete`, `cargo-llvm-cov`,
-and `cargo-mutants` are never compiled in CI. `scripts/install-ci-tool.sh <name>`
+and `cargo-mutants` are never compiled from source in CI. `scripts/install-ci-tool.sh <name>`
 installs the prebuilt release asset pinned in `.github/ci-tools.lock` after
 verifying its sha256; change a tool's version, URL, and checksum together
 there. Keep the workflow-level `env` block identical across jobs that share a

@@ -146,14 +146,17 @@ rules.
 event, and pull request number. A new push to a pull request cancels the
 previous run of the same workflow. Runs on `main`, scheduled runs, and manual
 dispatches have their own group per run and are never cancelled by a later
-one. `binary-archives` and `build-images` keep their own per-reference groups,
-which cancel superseded runs the same way.
+one. `binary-archives` and `build-images` keep their own groups keyed by pull
+request or reference with `cancel-in-progress: true`, so any newer run for the
+same pull request or reference, including a second manual dispatch, cancels the
+older one.
 
 **Every job has a timeout.** A hung job stops at its `timeout-minutes` limit
 instead of holding a runner for the GitHub default of six hours.
 
-**Tools are installed from checksum-pinned release assets.** No job compiles a
-tool from source. `scripts/install-ci-tool.sh <name>` reads
+**Tools are installed from checksum-pinned release assets.** No CI job compiles
+a Cargo test or lint tool from source. The release Docker build still installs
+`cargo-auditable` inside its pinned build image. `scripts/install-ci-tool.sh <name>` reads
 [`.github/ci-tools.lock`](../../.github/ci-tools.lock), which lists each tool's
 version, the upstream project's x86_64 Linux release URL, and the sha256 of the
 archive. The installer verifies the checksum before it extracts anything and
@@ -171,8 +174,10 @@ profile share a key: the `ci-pr` `rust` job and all `live-tests` jobs use
 `shared-key: test`, `parity-compat` builds release binaries as well and uses
 `parity`, and the other jobs use their own keys (`sdk`, `policy`, `coverage`,
 `mutation`, `proto-codegen`, and `capability-coverage`). Where a matrix would
-write one key from several legs, only the Zebra leg saves. Live and parity
-caches are written by their scheduled runs on the default branch.
+write one key from several legs, only the Zebra leg saves. The `test` key is
+normally written by the `ci-pr` push run on `main`, which compiles a superset
+of what the live jobs need; the `parity` key is written by the scheduled
+`parity-compat` run on the default branch.
 `rust-cache` hashes every `CARGO_*` and `RUST*` environment variable into the
 key, so the workflow-level `env` block of jobs that share a key must stay
 identical, and tool versions live in the lock rather than in `CARGO_*`
