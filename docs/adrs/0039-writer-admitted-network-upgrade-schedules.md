@@ -93,8 +93,12 @@ observation:
   `WalletQueryApi::network_upgrade_activations` in wallet-serving mode and
   from the served canonical reader in compact-block mode.
   `LightwalletdGrpcAdapter` takes no activation table of its own.
-- The projector converges on the writer's fence and schedule revision, and
-  binds the schedule identity into each format-3 state-bundle manifest.
+- The projector converges on the writer's fence and schedule revision before
+  it reports its wallet caught up, and binds the schedule identity into each
+  format-3 state-bundle manifest. While the writer is ahead, the projector
+  applies the retained events its secondary already holds. A newer revision
+  cannot change how those blocks are interpreted, because a revision changes
+  only entries above the tip it was admitted at.
 
 `CanonicalControl.WriterStatus` and `CanonicalControl.CreateOwnerCheckpoint`
 responses carry the admitted table, revision, and V1 fingerprint.

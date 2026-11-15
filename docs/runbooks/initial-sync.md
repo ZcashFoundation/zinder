@@ -115,9 +115,11 @@ its historical frontier artifact.
 ## Wallet construction
 
 Projector opens canonical storage through its own secondary, converges on the
-writer fence (retrying while the writer commits ahead of the secondary, and
-reporting `syncing` for lag longer than one second, until `projector.fence_convergence_timeout_seconds`
-elapses), and binds a wallet build plan to that source identity. It acquires
+writer fence, and binds a wallet build plan to that source identity. While the
+writer commits ahead of the secondary, it retries and reports `syncing` once
+the lag lasts longer than one second. An attempt that lasts
+`projector.fence_convergence_timeout_seconds` reports `replica_lagging` and
+starts another attempt; the projector does not exit for lag. It acquires
 a wallet projection build lease and a writer-owned canonical retention lease,
 then builds the wallet store in its owned path.
 

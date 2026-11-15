@@ -1108,14 +1108,16 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-projector"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Deadline for the projector's canonical secondary to authenticate the \
-                      writer's exact fence. A secondary behind the writer is retried with \
-                      capped backoff and reported as syncing once the lag lasts longer than one \
-                      second, unless the projector is ready and its wallet trails the writer by \
-                      at most one block, which keeps it ready within the tip-transition grace \
-                      described in [Service operations](service-operations.md#projector); a \
-                      same-sequence mismatch or a secondary ahead of the writer fails \
-                      immediately. Must be greater than zero. Defaults to 30.",
+        description: "Deadline for each attempt of the projector's canonical secondary to \
+                      reach the writer's fence while it holds no block the wallet has not \
+                      applied. A secondary that holds such blocks is followed at once, even \
+                      while the writer is ahead. An attempt that passes the deadline logs \
+                      `canonical_secondary_behind_writer`, reports `replica_lagging` until the \
+                      wallet catches up, and starts another attempt; the projector does not \
+                      exit. A same-sequence mismatch or a secondary ahead of the writer fails \
+                      immediately. Readiness while the wallet trails is described in [Service \
+                      operations](service-operations.md#projector). Must be greater than zero. \
+                      Defaults to 30.",
     },
     EnvVarDoc {
         name: "ZINDER_PROJECTOR__BUILD__MAX_OUTPOINT_SORT_MEMORY_BYTES",

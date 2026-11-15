@@ -175,9 +175,6 @@ pub(crate) enum ProjectorError {
     #[error("enabled projector owner control omitted its resolved bearer token")]
     ProjectorControlTokenMissing,
 
-    #[error("canonical secondary did not reach the writer fence before the convergence deadline")]
-    CanonicalFenceDidNotConverge,
-
     #[error(transparent)]
     CanonicalFenceDiverged(zinder_runtime::CanonicalFenceDivergence),
 

@@ -577,7 +577,7 @@ async fn converge_candidate(
             .candidate
             .map(|candidate| (candidate, *attesting_status))
             .ok_or_else(candidate_unavailable),
-        Ok(CanonicalFenceConvergence::Cancelled)
+        Ok(CanonicalFenceConvergence::Cancelled | CanonicalFenceConvergence::Trailing(_))
         | Err(CanonicalFenceConvergenceError::DidNotConverge) => {
             Err(ConvergenceFailure::WriterAhead)
         }
