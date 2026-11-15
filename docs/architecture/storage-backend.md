@@ -108,14 +108,20 @@ undo row to check this:
 - on every reconciliation.
 
 A transition that finds a missing, undecodable, or disconnected row fails
-without writing. Other appends on the handle read no undo row they keep. Each
-one reads the successor row that binds a newly settled tip, and reads each row
-it prunes once. The rows it writes come from the authenticated replay and
-continue from the verified tip. When each append settles one block, an append
-without transparent activity makes three point reads of the undo family,
-whatever the reorg window. Appends do not re-read untouched rows. A change made
-to one outside the wallet is found at the handle's next full check, or earlier
-when an append prunes a row that is missing or does not decode.
+without writing. Other appends on the handle do not re-read the rest of the
+retained suffix. Each one reads the successor row that binds a newly settled
+tip, which it keeps, and reads each row it prunes once. It checks that the
+pruned rows connect by source digest to that successor, or to the new source
+tip when every row settles. The rows it writes come from the authenticated
+replay and continue from the verified tip. When each append settles one block,
+an append without transparent activity makes three point reads of the undo
+family, whatever the reorg window.
+
+A retained row changed outside the wallet so that it is missing, does not
+decode, or breaks the digest chain is found no later than the handle's next
+full check or the append that prunes it, whichever comes first. Neither check
+compares the effects a row records with the rows they undo, so a change that
+leaves a row decodable and its digests connected is not found this way.
 
 ## Materialized-view RocksDB
 

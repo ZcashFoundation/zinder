@@ -102,10 +102,11 @@ fn take_undo_row_work() -> UndoRowWorkCounts {
 enum UndoSuffixCheck {
     /// Reads and fully decodes every retained undo row.
     Full,
-    /// Reads no row the plan keeps, which belong to the suffix this handle
+    /// Rechecks no row the plan keeps, which belong to the suffix this handle
     /// verified for the READY publication the plan starts from. The plan still
     /// reads each row it prunes and the successor that binds the new settled
-    /// tip, and every row it writes chains from the verified tip by
+    /// tip, and checks that the pruned rows' source digests connect to that
+    /// successor. Every row it writes chains from the verified tip by
     /// construction.
     Incremental,
 }
@@ -1289,9 +1290,12 @@ impl<'store> WalletTransitionPlanner<'store> {
             });
         }
 
-        if resulting_settled_tip == self.current_tip {
+        // Pruned rows leave the suffix a later full check reads, so their
+        // digest chain is checked here, up to where the kept suffix starts.
+        let pruned_digest_after = if resulting_settled_tip == self.current_tip {
             // The caller's resulting fence already authenticated the exact
             // visible tip, so no successor undo row exists to bind the floor.
+            self.source_sequence_digest
         } else {
             let successor_height = resulting_settled_tip.height.next().ok_or(
                 RocksDbWalletError::ProjectionTransitionRejected {
@@ -1310,13 +1314,15 @@ impl<'store> WalletTransitionPlanner<'store> {
                     reason: "canonical settled tip does not match the retained successor undo record",
                 });
             }
-        }
+            successor.source_sequence_digest_before
+        };
 
         let mut height = self.settled_tip.height.next().ok_or(
             RocksDbWalletError::ProjectionTransitionRejected {
                 reason: "wallet undo floor cannot advance beyond the height domain",
             },
         )?;
+        let mut previous_digest_after = None;
         loop {
             let (undo, encoded) = self.load_undo(height)?.ok_or(
                 RocksDbWalletError::WalletProjectionRebuildRequired {
@@ -1328,13 +1334,23 @@ impl<'store> WalletTransitionPlanner<'store> {
                     reason: "durable wallet undo floor has a height/key mismatch",
                 });
             }
+            let is_last_pruned = height == resulting_settled_tip.height;
+            if previous_digest_after
+                .is_some_and(|digest| digest != undo.source_sequence_digest_before)
+                || (is_last_pruned && undo.source_sequence_digest_after != pruned_digest_after)
+            {
+                return Err(RocksDbWalletError::ProjectionTransitionRejected {
+                    reason: "durable wallet undo suffix has disconnected source digests",
+                });
+            }
+            previous_digest_after = Some(undo.source_sequence_digest_after);
             self.remove_row_after_value_observed(
                 WalletProjectionRowFamily::ReorgUndo,
                 REORG_UNDO_COLUMN_FAMILY,
                 &height.value().to_be_bytes(),
                 &encoded,
             )?;
-            if height == resulting_settled_tip.height {
+            if is_last_pruned {
                 break;
             }
             height = height
@@ -2920,6 +2936,34 @@ mod tests {
             assert_damage_reported(damage, outcome)?;
             assert_eq!(fixture.wallet.ready_evidence(), &before);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn appends_on_a_verified_handle_reject_a_disconnected_undo_row_before_pruning_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let damage = UndoRowDamage::Disconnected;
+        let mut fixture = FollowedCoinbaseOnlyChain::follow()?;
+        damage.apply(&fixture.wallet, BlockHeight::new(DAMAGED_UNDO_HEIGHT))?;
+        let _chain = fixture
+            .chain
+            .append_through(DAMAGED_UNDO_HEIGHT + COINBASE_ONLY_DEPTH)?;
+        fixture.secondary.try_catch_up()?;
+
+        // This append prunes a row two below the damaged one.
+        apply_next_coinbase_only_event(&mut fixture.wallet, &fixture.secondary)?;
+        assert_eq!(
+            fixture.wallet.verified_undo_suffix_generation,
+            Some(fixture.wallet.control.writer_generation)
+        );
+        let before = fixture.wallet.ready_evidence().clone();
+        let outcome = apply_next_coinbase_only_event(&mut fixture.wallet, &fixture.secondary);
+        assert_damage_reported(damage, outcome)?;
+        assert_eq!(fixture.wallet.ready_evidence(), &before);
+        assert!(
+            before.source_position.tip.height
+                < BlockHeight::new(DAMAGED_UNDO_HEIGHT + COINBASE_ONLY_DEPTH)
+        );
         Ok(())
     }
 
