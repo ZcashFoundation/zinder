@@ -19,5 +19,6 @@ pub mod metrics_scrape;
 pub mod recorder;
 pub mod report;
 pub mod rss;
+pub mod tip_replay_checkpoints;
 
 pub use error::BenchError;

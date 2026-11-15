@@ -4,7 +4,9 @@ Fixed-range capture and storage benchmark harness for measuring Zinder against
 identical source bytes. It replays captured fixtures into a fresh production
 canonical `RocksDB` store and drives two backend-neutral canonical-replay round
 trips: one sorted external SST ingestion for `RocksDB` and binary `COPY` with
-deferred index construction for PostgreSQL.
+deferred index construction for PostgreSQL. It also replays captured tip blocks
+through the production canonical follower and wallet transition to measure
+per-block cost.
 
 The captured fixture is the common input for every fixture-driven command.
 Canonical storage arms create fresh candidate storage and compare every
@@ -277,6 +279,170 @@ The campaign summary's comparable high-water metrics are
 time-aligned client-plus-database `memory.current` samples, never the sum of
 independent component peaks. The exact cgroup `memory.peak` values remain
 component diagnostics in the external resource artifacts.
+
+## 4. Measure per-block cost at the tip
+
+`rocksdb-tip-replay` measures what each new block costs the canonical writer
+and the wallet projector. It copies a closed canonical store and a closed
+wallet store, both at a start height, into a scratch directory. For every
+block of a fixture that starts at the next height, it runs one production
+follow iteration of `zinder-ingest` (`follow_canonical_tip` stopping at that
+height), then catches up a canonical secondary and applies the block's
+retained event with the production wallet transition, as `zinder-projector`
+does. The canonical and wallet stores stay separate databases, as they are in
+production. The input stores and the fixture are never written.
+
+Use it to measure one change at a time: replay the same inputs before and
+after the change, then compare the two reports.
+
+### Prepare the inputs
+
+You need 3 inputs that line up at a start height `H`:
+
+1. A READY canonical store and a READY wallet store whose tip is `H`. Build
+   both with `rocksdb-storage-lifecycle --tip-height H`, or rebuild the wallet
+   for an existing canonical store at `H` with `rocksdb-wallet-rebuild`.
+2. A fixture of blocks `H+1` through `T`, captured with `capture`.
+3. The node's tree-state checkpoint after every fixture block. Live following
+   compares each derived checkpoint with the node's, so the fixture needs one
+   per height:
+
+   ```bash
+   zinder-bench capture-tip-replay-checkpoints \
+     --fixture ./fixtures/testnet-tip \
+     --network zcash-testnet \
+     --json-rpc-addr http://127.0.0.1:18232 \
+     --node-auth-cookie /var/run/zebra-auth/.cookie
+   ```
+
+   The command admits the manifest, segment digests, and block linkage before
+   it calls `z_gettreestate`, checks that each checkpoint names the captured
+   block, and writes `tip-replay-checkpoints.json` beside the manifest. It
+   refuses to replace an existing sidecar. `--fetch-concurrency` defaults to
+   16.
+
+### Run a replay
+
+```bash
+zinder-bench rocksdb-tip-replay \
+  --fixture ./fixtures/testnet-tip \
+  --canonical-store ./stores/canonical-at-h \
+  --wallet-store ./stores/wallet-at-h \
+  --scratch-dir ./scratch/tip-replay \
+  --report ./reports/tip-replay-baseline.json \
+  --software-revision "$(git rev-parse HEAD)" \
+  --repeat 3
+```
+
+Both stores must be closed. `--scratch-dir` and `--report` must not exist, and
+the command refuses to start when the scratch filesystem lacks room for one
+copy of both stores plus 2 GiB. Each repeat replays from fresh copies, and
+the command fails unless every repeat ends in the same canonical fence and
+wallet digest.
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `--repeat` | `1` | Replays, each from fresh scratch copies |
+| `--raw-blob-retention` | `transactions` | Retention persisted in the canonical store |
+| `--reorg-window-blocks` | `1000` | Canonical reorg window, as `zinder-ingest` passes it |
+| `--max-transition-logical-bytes` | `536870912` | Wallet transition ceiling, the projector default |
+| `--canonical-block-cache-bytes` | writer default | Canonical writer block cache |
+| `--canonical-secondary-block-cache-bytes` | reader default | Canonical secondary block cache |
+| `--wallet-block-cache-bytes` | wallet writer default | Wallet block cache |
+| `--keep-scratch` | off | Keeps the final repeat's scratch stores |
+| `--label` | none | Free-form label copied into the report |
+
+The budgets are resolved by the same functions the services use for their
+configuration, with only the block cache overridden. The stores always open
+with direct I/O and fall back to buffered I/O, so the I/O mode cannot be
+selected; the report records the mode each store resolved.
+
+To confirm that the replay produced the production result, run with
+`--keep-scratch` and rebuild a wallet from the kept canonical store with
+`rocksdb-wallet-rebuild`. Its `wallet_projection_digest_hex` must equal the
+report's `final_wallet.projection_digest_hex`.
+
+### What each block measures
+
+| Timer | Covers |
+| --- | --- |
+| `canonical_follow_step` | One follow iteration: fixture reads, settlement, preparation, subtree roots, commit, readiness |
+| `canonical_prepare` | The follower's `zinder_ingest_canonical_live_prepare_seconds` sample |
+| `canonical_commit` | The follower's `zinder_ingest_canonical_live_commit_seconds` sample, around `commit_live_append` |
+| `canonical_secondary_catch_up` | Secondary catch-up to the new writer fence |
+| `wallet_apply` | `apply_canonical_event_range`, including its replay-row reads from the secondary |
+| `wallet_step` | Catch-up, the retained-event and epoch reads, and the wallet transition |
+| `block_total` | `canonical_follow_step` plus `wallet_step` |
+
+Each block also records its height, transactions, non-coinbase transparent
+inputs, transparent outputs, and coinbase transparent outputs. The replay
+excludes the gRPC control plane between the writer and the projector
+(event pages, writer status, and retention leases), the mempool, query
+serving, and the writer's age-based event pruning. Source reads come from
+fixture files instead of JSON-RPC.
+
+Two differences from a deployment shape every number. Blocks run one at a
+time: each block's wallet transition finishes before the next canonical
+append starts, while in production the projector trails the writer
+concurrently. The writer, the secondary, and the wallet also share one
+process, so process CPU time and peak resident memory cover all three.
+
+### Read the report
+
+The report's `contract_identity` is `rocksdb-tip-replay`. It records:
+
+- `provenance`: the benchmark version, `--software-revision`, the label, the
+  build (Cargo profile directory and kind, opt-level, debug info, debug
+  assertions, every rustflag Cargo passed, the `rustc` version, and the target),
+  the host, and start and completion times.
+- `inputs`: the fixture identity, the checkpoint sidecar SHA-256, the
+  fixture's workload density, and each input store's path, size, and start
+  state.
+- `configuration`: the settings above, every resolved `RocksDB` budget, and
+  each store's resolved I/O mode.
+- `method`: the percentile method and the stratum thresholds.
+- `process`: whole-process wall time, CPU time across all threads, and peak
+  resident memory.
+- `aggregate`: timer summaries pooled over every block of every repeat.
+- `repeats`: for each repeat, the copy and open times, the block loop's wall
+  and CPU time, final canonical and wallet state, timer summaries, and every
+  block's record.
+- `unavailable_measurements`: measurements the stores do not expose. On this
+  revision that is point-read counts and `RocksDB` statistics deltas.
+
+Every timer summary reports `count`, `mean_ms`, `p50_ms`, `p99_ms`, `p999_ms`,
+`max_ms`, and `total_ms`. Percentiles use the nearest-rank method: the sample
+at 1-based rank `ceil(n * p)` of the `n` ascending samples. The summaries are
+repeated for each workload stratum. A block can be in more than one stratum,
+and a stratum with no blocks has `timers: null`.
+
+| Stratum | Blocks |
+| --- | --- |
+| `no_transparent_activity` | No non-coinbase transparent inputs or outputs |
+| `near_empty_after_dense` | At most 10 non-coinbase transparent inputs plus outputs, within 1,000 heights after a block with more than 1,000 transparent inputs or outputs |
+| `input_heavy` | At least 1,000 non-coinbase transparent inputs |
+| `fan_out` | At least 1,000 transparent outputs and no non-coinbase transparent inputs |
+
+Dense blocks among the 1,000 retained blocks before the fixture count for
+`near_empty_after_dense`.
+
+### Compare 2 reports
+
+```bash
+zinder-bench compare-tip-replay-reports \
+  --baseline ./reports/tip-replay-baseline.json \
+  --candidate ./reports/tip-replay-candidate.json \
+  --report ./reports/tip-replay-comparison.json
+```
+
+The comparison refuses reports of different fixtures or start states, and
+reports whose final canonical or wallet state differs, because a performance
+change must not change the result. It lists every build, host, and
+configuration setting that differs, so you can confirm that only the
+intended variable changed. For each stratum and timer it gives the baseline,
+the candidate, and the percent change of every summary statistic, plus the
+mean block-loop wall and CPU time and the peak resident memory. Without
+`--report`, it writes to stdout.
 
 ## Report fields
 

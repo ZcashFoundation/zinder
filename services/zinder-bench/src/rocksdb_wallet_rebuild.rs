@@ -185,7 +185,7 @@ fn rebuild_report(
     }
 }
 
-fn parse_raw_blob_retention(encoded: &str) -> Result<RawBlobRetention, String> {
+pub(crate) fn parse_raw_blob_retention(encoded: &str) -> Result<RawBlobRetention, String> {
     RawBlobRetention::from_kebab_case(encoded)
         .ok_or_else(|| "--raw-blob-retention must be one of none, transactions, or all".to_owned())
 }

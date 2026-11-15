@@ -57,7 +57,7 @@ pub(crate) fn write_regtest_fixture() -> Result<(TempDir, SourceBlock)> {
     Ok((fixture_directory, block))
 }
 
-fn regtest_activation_records() -> Vec<ActivationRecord> {
+pub(crate) fn regtest_activation_records() -> Vec<ActivationRecord> {
     sample_regtest_upgrade_activations()
         .activations()
         .iter()

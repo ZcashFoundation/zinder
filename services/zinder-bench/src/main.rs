@@ -19,6 +19,7 @@ use zinder_bench::{
     },
     capture::{CaptureConfig, capture_fixed_range},
     fixture::FixtureManifest,
+    tip_replay_checkpoints::capture_tip_replay_checkpoints,
 };
 use zinder_core::{BlockHeight, Network, wire::decode_zinder_native_chain_name};
 use zinder_source::{CookieSource, NodeAuth, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
@@ -29,6 +30,7 @@ mod rocksdb_canonical_fixture_replay;
 mod rocksdb_compact_block_range;
 mod rocksdb_raw_blob_retention_comparison;
 mod rocksdb_storage_lifecycle;
+mod rocksdb_tip_replay;
 mod rocksdb_wallet_rebuild;
 
 use canonical_replay_storage_command::{CanonicalReplayStorageArgs, run_canonical_replay_storage};
@@ -40,6 +42,10 @@ use rocksdb_raw_blob_retention_comparison::{
     RocksDbRawBlobRetentionComparisonArgs, run_rocksdb_raw_blob_retention_comparison,
 };
 use rocksdb_storage_lifecycle::{RocksDbStorageLifecycleArgs, run_rocksdb_storage_lifecycle};
+use rocksdb_tip_replay::{
+    CompareTipReplayReportsArgs, RocksDbTipReplayArgs, run_compare_tip_replay_reports,
+    run_rocksdb_tip_replay,
+};
 use rocksdb_wallet_rebuild::{RocksDbWalletRebuildArgs, run_rocksdb_wallet_rebuild};
 
 #[global_allocator]
@@ -90,6 +96,15 @@ enum Command {
     /// Measure version-1 compact-block ranges through an admitted secondary.
     #[command(name = "rocksdb-compact-block-range")]
     RocksDbCompactBlockRange(RocksDbCompactBlockRangeArgs),
+    /// Capture the node's tree-state checkpoint for every fixture height.
+    #[command(name = "capture-tip-replay-checkpoints")]
+    CaptureTipReplayCheckpoints(CaptureTipReplayCheckpointsArgs),
+    /// Replay a fixture through production canonical appends and wallet transitions.
+    #[command(name = "rocksdb-tip-replay")]
+    RocksDbTipReplay(RocksDbTipReplayArgs),
+    /// Compare a baseline and a candidate tip replay report.
+    #[command(name = "compare-tip-replay-reports")]
+    CompareTipReplayReports(CompareTipReplayReportsArgs),
 }
 
 #[derive(Args)]
@@ -176,6 +191,31 @@ struct CaptureCanonicalFixtureCheckpointsArgs {
     max_response_bytes: u64,
 }
 
+#[derive(Args)]
+struct CaptureTipReplayCheckpointsArgs {
+    /// Existing captured fixture directory to augment.
+    #[arg(long)]
+    fixture: PathBuf,
+    /// Network name, such as zcash-testnet.
+    #[arg(long)]
+    network: String,
+    /// Zebra JSON-RPC base URL.
+    #[arg(long = "json-rpc-addr")]
+    json_rpc_addr: String,
+    /// Optional node cookie file path.
+    #[arg(long = "node-auth-cookie")]
+    node_auth_cookie: Option<PathBuf>,
+    /// Concurrent `z_gettreestate` requests issued against the node.
+    #[arg(long = "fetch-concurrency", default_value_t = DEFAULT_FETCH_CONCURRENCY)]
+    fetch_concurrency: u32,
+    /// Per-request source timeout in seconds.
+    #[arg(long = "request-timeout-secs", default_value_t = DEFAULT_REQUEST_TIMEOUT_SECS)]
+    request_timeout_secs: u64,
+    /// Maximum JSON-RPC response body size in bytes.
+    #[arg(long = "max-response-bytes", default_value_t = DEFAULT_MAX_RESPONSE_BYTES)]
+    max_response_bytes: u64,
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let _ = tracing_subscriber::fmt()
@@ -252,7 +292,52 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
             let output = run_rocksdb_compact_block_range(args)?;
             emit_report(&output.report, output.report_path.as_deref())
         }
+        Command::CaptureTipReplayCheckpoints(args) => {
+            run_capture_tip_replay_checkpoints(args).await
+        }
+        Command::RocksDbTipReplay(args) => run_rocksdb_tip_replay(args).await,
+        Command::CompareTipReplayReports(args) => run_compare_tip_replay_reports(&args),
     }
+}
+
+async fn run_capture_tip_replay_checkpoints(
+    args: CaptureTipReplayCheckpointsArgs,
+) -> Result<(), BenchError> {
+    let network = parse_network(&args.network)?;
+    let manifest = FixtureManifest::read(&args.fixture)?;
+    if manifest.network_typed()? != network {
+        return Err(BenchError::invalid_argument(
+            "--network does not match the captured fixture network",
+        ));
+    }
+    let fetch_concurrency = require_nonzero_u32(args.fetch_concurrency, "fetch-concurrency")?;
+    let node_auth = args.node_auth_cookie.map_or(NodeAuth::None, |path| {
+        NodeAuth::Cookie(CookieSource::File(path))
+    });
+    let source = ZebraJsonRpcSource::with_options(
+        network,
+        &args.json_rpc_addr,
+        node_auth,
+        ZebraJsonRpcSourceOptions {
+            request_timeout: Duration::from_secs(args.request_timeout_secs),
+            max_response_bytes: require_nonzero_u64(args.max_response_bytes, "max-response-bytes")?,
+            broadcast_timeout: None,
+        },
+    )?;
+    let activations = source
+        .discover_network_upgrade_activations("zinder-bench")
+        .await?;
+    let checkpoints =
+        capture_tip_replay_checkpoints(&args.fixture, &source, &activations, fetch_concurrency)
+            .await?;
+    tracing::info!(
+        target: "zinder::bench",
+        event = "tip_replay_checkpoints_captured",
+        fixture_manifest_sha256 = checkpoints.fixture_manifest_sha256,
+        checkpoint_count = checkpoints.checkpoints.len(),
+        "tip replay checkpoints captured"
+    );
+    Ok(())
 }
 
 async fn run_capture_canonical_fixture_checkpoints(
@@ -512,6 +597,57 @@ mod tests {
         ])?;
 
         assert!(matches!(cli.command, Command::RocksDbCompactBlockRange(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn tip_replay_command_spellings_are_stable() -> Result<(), Box<dyn Error>> {
+        let replay = Cli::try_parse_from([
+            "zinder-bench",
+            "rocksdb-tip-replay",
+            "--fixture",
+            "fixture",
+            "--canonical-store",
+            "canonical",
+            "--wallet-store",
+            "wallet",
+            "--scratch-dir",
+            "scratch",
+            "--report",
+            "report.json",
+            "--software-revision",
+            "5079515",
+            "--repeat",
+            "3",
+        ])?;
+        let checkpoints = Cli::try_parse_from([
+            "zinder-bench",
+            "capture-tip-replay-checkpoints",
+            "--fixture",
+            "fixture",
+            "--network",
+            "zcash-testnet",
+            "--json-rpc-addr",
+            "http://zebra:18232",
+        ])?;
+        let compare = Cli::try_parse_from([
+            "zinder-bench",
+            "compare-tip-replay-reports",
+            "--baseline",
+            "baseline.json",
+            "--candidate",
+            "candidate.json",
+        ])?;
+
+        assert!(matches!(replay.command, Command::RocksDbTipReplay(_)));
+        assert!(matches!(
+            checkpoints.command,
+            Command::CaptureTipReplayCheckpoints(_)
+        ));
+        assert!(matches!(
+            compare.command,
+            Command::CompareTipReplayReports(_)
+        ));
         Ok(())
     }
 

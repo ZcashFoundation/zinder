@@ -148,6 +148,19 @@ pub enum BenchError {
         /// Human-readable mismatch between fixture and final canonical state.
         reason: String,
     },
+    /// The production canonical follower failed while replaying a fixture block.
+    #[error("canonical follow error: {source}")]
+    CanonicalFollow {
+        /// Underlying follower failure.
+        #[source]
+        source: Box<zinder_ingest::CanonicalFollowError>,
+    },
+    /// A tip replay stopped or observed state that differs from its inputs.
+    #[error("tip replay failed: {reason}")]
+    TipReplay {
+        /// Human-readable description of the failure.
+        reason: String,
+    },
 }
 
 impl From<serde_json::Error> for BenchError {
@@ -197,6 +210,14 @@ impl From<zinder_store::CanonicalStoreBuildPlanError> for BenchError {
 impl From<zinder_wallet_rocksdb::RocksDbWalletError> for BenchError {
     fn from(source: zinder_wallet_rocksdb::RocksDbWalletError) -> Self {
         Self::WalletStorage { source }
+    }
+}
+
+impl From<zinder_ingest::CanonicalFollowError> for BenchError {
+    fn from(source: zinder_ingest::CanonicalFollowError) -> Self {
+        Self::CanonicalFollow {
+            source: Box::new(source),
+        }
     }
 }
 
@@ -289,6 +310,14 @@ impl BenchError {
     #[must_use]
     pub fn acceptance_completion_mismatch(reason: impl Into<String>) -> Self {
         Self::AcceptanceCompletionMismatch {
+            reason: reason.into(),
+        }
+    }
+
+    /// Builds a tip-replay error from a reason string.
+    #[must_use]
+    pub fn tip_replay(reason: impl Into<String>) -> Self {
+        Self::TipReplay {
             reason: reason.into(),
         }
     }
