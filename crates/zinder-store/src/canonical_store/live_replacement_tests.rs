@@ -1773,6 +1773,27 @@ fn secondary_point_reads_agree_with_the_bounded_replay_range_scan()
 
     assert_eq!(secondary.block_replay_facts_at(BlockHeight::new(0))?, None);
     assert_eq!(secondary.block_replay_facts_at(BlockHeight::new(5))?, None);
+
+    let requested = [4, 0, 2, 5, 1, 2].map(BlockHeight::new);
+    let batched = secondary.block_replay_facts_at_heights(&requested)?;
+    assert_eq!(batched.len(), requested.len());
+    for (height, facts) in requested.iter().zip(&batched) {
+        assert_eq!(facts, &secondary.block_replay_facts_at(*height)?);
+    }
+
+    let two = transaction_location(BlockHeight::new(2), [2; 32], 102);
+    let four = transaction_location(BlockHeight::new(4), [4; 32], 104);
+    let unknown = TransactionId::from_bytes([0xee; 32]);
+    assert_eq!(
+        secondary.transaction_locations(&[
+            four.transaction_id,
+            unknown,
+            two.transaction_id,
+            four.transaction_id,
+        ])?,
+        vec![Some(four), None, Some(two), Some(four)]
+    );
+    assert_eq!(secondary.transaction_locations(&[])?, Vec::new());
     Ok(())
 }
 

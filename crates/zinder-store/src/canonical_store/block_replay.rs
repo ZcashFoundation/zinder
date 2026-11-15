@@ -468,6 +468,63 @@ pub(super) fn read_replay_facts_at(
     Ok(Some(read_persisted_replay(db, height)?.replay.into_facts()))
 }
 
+/// Reads the canonical facts at several heights in one batched lookup and
+/// returns them in input order.
+///
+/// Heights outside the admitted retained range answer `None`, as
+/// [`read_replay_facts_at`] does. The rows are read in height order without
+/// entering the block cache: a random historical row is rarely read twice, and
+/// admitting it would evict the smaller index and transaction-location blocks
+/// that every lookup reuses.
+pub(super) fn read_replay_facts_at_heights(
+    db: &DB,
+    ready_evidence: &CanonicalStoreReadyEvidence,
+    heights: &[BlockHeight],
+) -> Result<Vec<Option<CanonicalBlockFacts>>, CanonicalStoreError> {
+    let mut retained = heights
+        .iter()
+        .enumerate()
+        .filter(|(_, height)| {
+            **height >= ready_evidence.first_retained_block.height
+                && **height <= ready_evidence.visible_tip.height
+        })
+        .map(|(index, height)| (*height, index))
+        .collect::<Vec<_>>();
+    retained.sort_unstable();
+    let keys = retained
+        .iter()
+        .map(|(height, _)| encode_height_key_ascending(*height))
+        .collect::<Vec<_>>();
+    let mut read_options = ReadOptions::default();
+    read_options.fill_cache(false);
+    let family = block_replay_column_family(db)?;
+    let rows = db.batched_multi_get_cf_slice_opt(
+        &family,
+        keys.iter().map(<[u8; 4]>::as_slice),
+        true,
+        &read_options,
+    );
+    let mut facts = heights.iter().map(|_| None).collect::<Vec<_>>();
+    for ((key, (height, index)), row) in keys.iter().zip(&retained).zip(rows) {
+        let encoded_replay = row
+            .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                operation: "canonical replay batch read",
+                source,
+            })?
+            .ok_or_else(|| {
+                CanonicalStoreError::block_replay_sequence(format!(
+                    "canonical replay at height {} is absent",
+                    height.value()
+                ))
+            })?;
+        let (_, replay) = decode_persisted_replay(key, &encoded_replay)?;
+        if let Some(slot) = facts.get_mut(*index) {
+            *slot = Some(replay.into_facts());
+        }
+    }
+    Ok(facts)
+}
+
 pub(super) struct PersistedReplayStep {
     pub(super) replay: ValidatedCanonicalBlockReplay,
     pub(super) logical_replay_bytes: u64,

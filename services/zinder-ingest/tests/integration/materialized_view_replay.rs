@@ -391,6 +391,58 @@ async fn a_ranking_build_joins_views_that_are_still_rebuilding_below_the_tip()
 }
 
 #[tokio::test]
+async fn catching_up_joins_a_trailing_ranking_build_before_replay_moves_past_it()
+-> Result<(), Box<dyn Error>> {
+    let mut harness = CanonicalHarness::baseline().await?;
+    let (directory, view) = view_store()?;
+    harness.tailer(&view).catch_up()?;
+    harness.follow_to_tip().await?;
+    drop(view);
+    clear_transparent_address_ranking(directory.path())?;
+    delete_chain_event_cursors(
+        directory.path(),
+        MaterializedViewStore::bundled_chain_event_consumer_names()
+            .iter()
+            .copied(),
+    )?;
+    let view = open_view_store(directory.path())?;
+    let tailer = harness.tailer(&view);
+
+    let capture = LogCapture::install_for_target("zinder::ingest");
+    tailer.catch_up()?;
+
+    let baseline_height = BASELINE_TIP_HEIGHT.to_string();
+    assert!(
+        capture.any(|event| {
+            event.field("event") == Some(RANKING_JOINED_REPLAY_EVENT)
+                && event.field("through_height") == Some(baseline_height.as_str())
+        }),
+        "the build must join the views at the height they materialized before replay applies the newer tip"
+    );
+    assert!(!capture.any(|event| event.field("event") == Some(RANKING_ACTIVATED_EVENT)));
+    let (_rebuilt_directory, rebuilt) = view_store()?;
+    harness.tailer(&rebuilt).catch_up()?;
+    assert_eq!(
+        transparent_address_ranking(&view)?.0.coverage,
+        complete_ranking_coverage(CHAIN_TIP_HEIGHT)
+    );
+    assert_eq!(
+        transparent_address_ranking(&view)?,
+        transparent_address_ranking(&rebuilt)?
+    );
+    assert_eq!(chain_event_cursors(&view)?, chain_event_cursors(&rebuilt)?);
+
+    harness.replace_tip().await?;
+    tailer.catch_up()?;
+    harness.tailer(&rebuilt).catch_up()?;
+    assert_eq!(
+        transparent_address_ranking(&view)?,
+        transparent_address_ranking(&rebuilt)?
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn the_spawned_tailer_builds_the_ranking_beside_a_rebuilding_replay()
 -> Result<(), Box<dyn Error>> {
     let mut harness = CanonicalHarness::baseline().await?;

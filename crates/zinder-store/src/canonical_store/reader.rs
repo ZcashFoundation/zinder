@@ -174,6 +174,20 @@ macro_rules! impl_canonical_typed_reads {
                 read_transaction_location(self, transaction_id)
             }
 
+            /// Reads the canonical locations of several transactions in one
+            /// batched lookup.
+            ///
+            /// Returns one entry per requested id, in request order, each
+            /// `None` exactly when [`Self::transaction_location`] would return
+            /// `None`. The lookups run in key order, so ids whose rows share a
+            /// data block cost one block read.
+            pub fn transaction_locations(
+                &self,
+                transaction_ids: &[TransactionId],
+            ) -> Result<Vec<Option<TransactionLocation>>, CanonicalStoreError> {
+                read_transaction_locations(self, transaction_ids)
+            }
+
             /// Reads the canonical location of one transaction, answering
             /// `None` only for a proven absence.
             ///
@@ -433,6 +447,39 @@ fn read_transaction_location(
     )?
     .map(|encoded| decode_transaction_location(transaction_id, &encoded))
     .transpose()
+}
+
+fn read_transaction_locations(
+    store: &impl CanonicalServingRead,
+    transaction_ids: &[TransactionId],
+) -> Result<Vec<Option<TransactionLocation>>, CanonicalStoreError> {
+    let mut ordered = transaction_ids
+        .iter()
+        .enumerate()
+        .map(|(index, transaction_id)| (encode_internal_transaction_id(*transaction_id), index))
+        .collect::<Vec<_>>();
+    ordered.sort_unstable();
+    let family = column_family(&store.serving_open().db, TRANSACTION_LOCATION_COLUMN_FAMILY)?;
+    let rows = store.serving_open().db.batched_multi_get_cf_slice(
+        &family,
+        ordered.iter().map(|(key, _)| key.as_slice()),
+        true,
+    );
+    let mut locations = vec![None; transaction_ids.len()];
+    for ((_, index), row) in ordered.iter().zip(rows) {
+        let encoded = row.map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "transaction location batch read",
+            source,
+        })?;
+        if let (Some(encoded), Some(transaction_id), Some(slot)) = (
+            encoded,
+            transaction_ids.get(*index),
+            locations.get_mut(*index),
+        ) {
+            *slot = Some(decode_transaction_location(*transaction_id, &encoded)?);
+        }
+    }
+    Ok(locations)
 }
 
 fn read_transaction_location_or_proven_absence(

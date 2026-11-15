@@ -10,7 +10,7 @@ use zinder_core::{
 
 use crate::{
     BoundedRocksDbOpen, RawBlobRetention, RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget,
-    open_bounded_rocksdb,
+    RocksDbResourceGaugeInputs, StoreRole, open_bounded_rocksdb, record_rocksdb_resource_gauges,
 };
 
 use super::{
@@ -18,7 +18,10 @@ use super::{
     CanonicalSequenceCheckpoint, CanonicalStoreBuildState, CanonicalStoreError,
     CanonicalStoreReadyEvidence, CanonicalStoreWorkload, CanonicalSubtreeRootLoadCoverage,
     activation_schedule::CanonicalActivationSchedule,
-    block_replay::{CanonicalReplayRangeScan, CanonicalReplayScan, read_replay_facts_at},
+    block_replay::{
+        CanonicalReplayRangeScan, CanonicalReplayScan, read_replay_facts_at,
+        read_replay_facts_at_heights,
+    },
     construction_manifest::validate_ready_construction_manifest,
     event_lifecycle::{canonical_event_history_from_db, canonical_event_retention_floor_from_db},
     live_commit::event_fence_from_ready,
@@ -78,6 +81,7 @@ pub struct RocksDbCanonicalSecondary {
     pub(super) activation_schedule: Option<CanonicalActivationSchedule>,
     reorg_policy: super::CanonicalReorgPolicy,
     pub(super) replay_tail: AuthenticatedReplayTail,
+    resource_budget: RocksDbResourceBudget,
 }
 
 impl RocksDbCanonicalSecondary {
@@ -213,7 +217,27 @@ impl RocksDbCanonicalSecondary {
             activation_schedule,
             reorg_policy,
             replay_tail,
+            resource_budget,
         })
+    }
+
+    /// Publishes this secondary's `RocksDB` cache, ticker, and per-family
+    /// gauges under the `canonical_secondary` store role.
+    ///
+    /// A process that hydrates history through one secondary calls this
+    /// periodically, so its block-cache hit rate and device reads are
+    /// observable beside the walk they serve.
+    pub fn record_resource_gauges(&self) {
+        record_rocksdb_resource_gauges(&RocksDbResourceGaugeInputs {
+            db: &self.bounded_open.db,
+            store_role: StoreRole::CanonicalSecondary,
+            column_family_names: &CANONICAL_DATA_COLUMN_FAMILIES,
+            block_cache: &self.bounded_open.block_cache,
+            write_buffer_manager: &self.bounded_open.write_buffer_manager,
+            statistics: &self.bounded_open.statistics,
+            io_mode: self.bounded_open.io_mode,
+            resource_budget: self.resource_budget,
+        });
     }
 
     /// Catches up and authenticates the new visible replay tail.
@@ -402,6 +426,20 @@ impl RocksDbCanonicalSecondary {
         height: BlockHeight,
     ) -> Result<Option<CanonicalBlockFacts>, CanonicalStoreError> {
         read_replay_facts_at(&self.bounded_open.db, &self.ready_evidence, height)
+    }
+
+    /// Reads several retained blocks' canonical facts in one batched lookup.
+    ///
+    /// Returns one entry per requested height, in request order, each `None`
+    /// exactly when [`Self::block_replay_facts_at`] would return `None`. The
+    /// rows are read in height order and bypass the block cache, so a walk
+    /// that reads many unrelated historical blocks keeps the cache for the
+    /// index and transaction-location blocks it reuses.
+    pub fn block_replay_facts_at_heights(
+        &self,
+        heights: &[BlockHeight],
+    ) -> Result<Vec<Option<CanonicalBlockFacts>>, CanonicalStoreError> {
+        read_replay_facts_at_heights(&self.bounded_open.db, &self.ready_evidence, heights)
     }
 
     /// Reads retained canonical events from this secondary's admitted READY fence.

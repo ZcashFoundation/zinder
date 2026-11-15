@@ -473,24 +473,34 @@ fn with_prevout_metrics<T>(
         PrevoutReads {
             from_cache: counter_value(
                 &rendered,
-                "zinder_materialized_view_prevout_resolutions_total{source=\"cache\"}",
+                "zinder_materialized_view_prevout_resolutions_total",
+                "source=\"cache\"",
             ),
             from_canonical: counter_value(
                 &rendered,
-                "zinder_materialized_view_prevout_resolutions_total{source=\"canonical\"}",
+                "zinder_materialized_view_prevout_resolutions_total",
+                "source=\"canonical\"",
             ),
             producing_block_reads: counter_value(
                 &rendered,
                 "zinder_materialized_view_prevout_block_reads_total",
+                "",
             ),
         },
     ))
 }
 
-fn counter_value(rendered: &str, series: &str) -> u64 {
+/// Sums every rendered sample of `metric` whose labels contain `label`,
+/// whatever other labels the sample carries.
+fn counter_value(rendered: &str, metric: &str, label: &str) -> u64 {
     rendered
         .lines()
-        .filter_map(|line| line.strip_prefix(series)?.trim().parse::<u64>().ok())
+        .filter_map(|line| {
+            let (series, sample) = line.rsplit_once(' ')?;
+            let labels = series.strip_prefix(metric)?;
+            let matches = (labels.is_empty() || labels.starts_with('{')) && labels.contains(label);
+            matches.then(|| sample.parse::<u64>().ok()).flatten()
+        })
         .sum()
 }
 

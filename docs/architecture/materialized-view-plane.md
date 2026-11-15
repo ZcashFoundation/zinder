@@ -170,12 +170,11 @@ ways:
   block consumer and follows the tip at the shared cursor.
 - On a store whose views materialized heights without the ranking, the host
   builds an inactive generation from genesis on a worker of its own, beside
-  the replay tailer, so the build and the replay advance at the same time.
-  Each build step applies settled history for at most 10 seconds and never
-  passes the height the other views have materialized. The build resumes after
-  a restart, adopts each step's visible tip as its target, and pauses with
-  replay under the canonical-phase gate, memory pressure, and the free-space
-  floor.
+  the replay tailer. Each build step applies settled history for at most 10
+  seconds and never passes the height the other views have materialized. The
+  build resumes after a restart, adopts each step's visible tip as its target,
+  and pauses with replay under the canonical-phase gate, memory pressure, and
+  the free-space floor.
 
 The build activates in one of two ways:
 
@@ -190,6 +189,19 @@ The build activates in one of two ways:
   that reaches the settled tip reads the unsettled tail, at most one reorg
   window long. One write applies that tail, activates the generation, and
   adopts the shared cursor.
+
+While the other views rebuild without a shared cursor and the build trails
+their settled materialized height, replay dispatches no further page and
+waits for the build to join. Hydration reads dominate both walks, so a replay
+that kept advancing would only move the join point away, and the build would
+hydrate every height it passed a second time. After the join, one hydration
+per height serves every view. Replay stops waiting once the build applies no
+page or warm-up window for 5 minutes, so a failing build cannot hold the views
+back; such a build activates at the fence later. Views that follow a shared
+cursor never wait, and a page that carries a revert is dispatched before
+replay waits. `MaterializedViewTailer::catch_up` applies the same order on one
+thread: a trailing build first walks to the views' height and joins them, and
+replay runs after it.
 
 Settled heights never change, so the inactive build never holds a block that a
 reorg could replace. A step that pauses or is cancelled before an activating
@@ -243,8 +255,12 @@ range, then from an in-memory prevout cache of outputs that earlier ranges
 produced, and last from the producing block's canonical replay row. The cache
 answers only for a range that extends the last block it applied, so results
 never depend on it. The canonical reads of the last step are independent, so
-they run on up to 16 threads and their storage waits overlap. The threads
-allocate through jemalloc
+they run on up to 16 threads and their storage waits overlap. Each thread
+reads a contiguous run of sorted keys as one batched lookup, so keys that
+share a data block cost one device read. Producing replay rows bypass the
+canonical block cache: a historical row is rarely read twice, and admitting it
+would evict the transaction-location and index blocks that every later lookup
+reuses. The threads allocate through jemalloc
 ([ADR-0044](../adrs/0044-service-binaries-allocate-through-jemalloc.md)), so
 they do not queue on allocator locks between reads.
 
