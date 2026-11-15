@@ -312,9 +312,9 @@ pub async fn chain_events_response<Q: WalletQueryApi + ?Sized>(
         .and_then(|chain_events| build_chain_events_response(&chain_events))
 }
 
-/// Reads the complete unspent transparent output set for `request` at one
-/// pinned chain epoch. The gRPC adapter streams the returned set one
-/// message per output.
+/// Opens the unspent transparent output stream for `request` at one pinned
+/// chain epoch. The gRPC adapter forwards it one message per output as the
+/// client reads.
 pub async fn transparent_address_unspent_outputs_response<Q: WalletQueryApi + ?Sized>(
     query_api: &Q,
     request: TransparentAddressUnspentOutputsRequest,

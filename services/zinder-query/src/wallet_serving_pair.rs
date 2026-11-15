@@ -3,6 +3,7 @@
 use std::{fmt, io, num::NonZeroU16, sync::Arc};
 
 use thiserror::Error;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 use zinder_core::{
     BlockBlobArtifact, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
     CanonicalHistoryBounds, ChainEpoch, CommitmentTreeCheckpoint, CompactBlockArtifact, Network,
@@ -457,11 +458,17 @@ impl WalletProjectionReader for RocksDbWalletSecondary {
 /// Pair construction validates network, epoch, event cursor, visible tip,
 /// sequence digest, and settled tip. Callers can safely hold an `Arc` to this
 /// pair for an entire request while a different generation catches up.
+///
+/// A held pair keeps its secondary generation open. A read that spans many
+/// bounded steps checks between them whether the publisher has revoked reads
+/// on the pair, which it does once the pair has been released for longer than
+/// the released-pair read limit, and then fails and drops the pair.
 pub struct WalletServingReadPair {
     canonical: Arc<dyn CanonicalReader>,
     wallet: Arc<dyn WalletProjectionReader>,
     canonical_fence: CanonicalEventFence,
     wallet_source: WalletCanonicalSourceIdentity,
+    reads_revoked: CancellationToken,
 }
 
 impl WalletServingReadPair {
@@ -479,6 +486,7 @@ impl WalletServingReadPair {
             ),
             canonical,
             wallet,
+            reads_revoked: CancellationToken::new(),
         })
     }
 
@@ -556,6 +564,32 @@ impl WalletServingReadPair {
     #[must_use]
     pub const fn wallet_source(&self) -> WalletCanonicalSourceIdentity {
         self.wallet_source
+    }
+
+    /// Tells the reads still holding this pair to stop, returning `true` the
+    /// first time.
+    pub(crate) fn revoke_reads(&self) -> bool {
+        let first_revocation = !self.reads_revoked.is_cancelled();
+        self.reads_revoked.cancel();
+        first_revocation
+    }
+
+    /// Resolves once the publisher has revoked reads on this pair.
+    pub(crate) fn reads_revoked(&self) -> WaitForCancellationFuture<'_> {
+        self.reads_revoked.cancelled()
+    }
+
+    /// Reports whether the publisher has revoked reads on this pair.
+    pub(crate) fn are_reads_revoked(&self) -> bool {
+        self.reads_revoked.is_cancelled()
+    }
+
+    /// Returns the failure a revoked read ends with: its epoch is no longer
+    /// served, so the caller restarts at a newer one.
+    pub(crate) const fn revoked_read_error(&self) -> QueryError {
+        QueryError::ChainEpochPinUnavailable {
+            chain_epoch_id: self.canonical_fence.chain_epoch_id(),
+        }
     }
 }
 

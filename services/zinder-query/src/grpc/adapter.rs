@@ -649,11 +649,12 @@ where
         let header = Ok(build_transparent_unspent_outputs_header(
             response.chain_epoch,
         ));
-        let items = response
-            .outputs
-            .into_iter()
-            .map(|output| Ok(build_transparent_unspent_output_message(&output)));
-        let messages = stream::once(header).chain(stream::iter(items));
+        let items = response.map(|output| {
+            output
+                .map(|output| build_transparent_unspent_output_message(&output))
+                .map_err(|error| status_from_query_error(&error))
+        });
+        let messages = stream::once(header).chain(items);
 
         Ok(self.server_stream(Box::pin(messages)))
     }

@@ -1,0 +1,6 @@
+kind: fixed
+body: "Slow or abandoned `TransparentAddressUnspentOutputs` reads no longer stop `zinder-query` or `zinder-compat-lightwalletd` from publishing new chain epochs for every client. The read now sends outputs as it reads them, 1,024 at a time, reads storage only as fast as the client consumes, and stops when the client cancels or disconnects; the first outputs of a large address arrive after one page instead of after the whole set. A request may keep reading a serving pair for at most 30 seconds after a newer one replaces it and leaves retention. An unspent-output or full-block stream still reading past that limit ends with `FAILED_PRECONDITION` and `CHAIN_EPOCH_PIN_UNAVAILABLE`, which clients already treat as a signal to restart at a newer epoch. `zinder_wallet_serving_pair_publisher_revoked_pairs_total` and the `wallet_serving_pair_reads_revoked` warning report each such revocation."
+time: 2026-11-15T03:00:00Z
+custom:
+  Bump: patch
+  PR: "193"

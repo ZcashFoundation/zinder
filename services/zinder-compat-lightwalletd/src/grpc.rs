@@ -16,7 +16,8 @@ use zinder_core::{
     CompactBlockArtifact, CompactTransaction, CompactTransactionData, Network,
     NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex,
     SubtreeRootRange, TransactionBroadcastOutcome, TransactionId, TransactionLocation,
-    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TxStatus,
+    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentUnspentOutput,
+    TxStatus,
     wire::{
         decode_internal_transaction_id, encode_bip70_chain_name, encode_branch_id_hex,
         encode_internal_block_hash, encode_internal_transaction_id, encode_rpc_block_hash_hex,
@@ -29,9 +30,8 @@ use zinder_proto::compat::lightwalletd::{
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
     DEFAULT_MAX_COMPACT_BLOCK_RANGE, QueryError, SubtreeRoots,
-    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
-    TransparentAddressUnspentOutputsRequest, TreeState, WalletQueryApi, WalletServingQuery,
-    address_lookup_to_script_hash, status_from_query_error,
+    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest, TreeState,
+    WalletQueryApi, WalletServingQuery, address_lookup_to_script_hash, status_from_query_error,
 };
 use zinder_source::transparent_address_matches_network;
 use zinder_store::{MempoolEvent, RawBlobRetention};
@@ -335,6 +335,15 @@ where
             .visible_tip_block(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
+        let response_limit = u32_to_usize(self.response_limits.max_address_utxos.get());
+        let max_entries =
+            NonZeroU32::new(request.max_entries).map(|max_entries| u32_to_usize(max_entries.get()));
+        // Each address streams its outputs in response order, so it can
+        // contribute at most its first `maxEntries` outputs. Without a
+        // `maxEntries` at or below the response limit, a request that matched
+        // more outputs than one response returns fails, so the read stops
+        // there instead of reading the rest of a large address.
+        let address_output_cap = max_entries.filter(|max_entries| *max_entries <= response_limit);
         let mut replies = Vec::new();
 
         for address in request.addresses {
@@ -343,7 +352,7 @@ where
                 visible_tip_block.chain_epoch.network,
                 BlockHeight::new(start_height),
             )?;
-            let address_utxos = self
+            let mut address_utxos = self
                 .query_api
                 .transparent_address_unspent_outputs(
                     query_request,
@@ -351,7 +360,19 @@ where
                 )
                 .await
                 .map_err(|error| status_from_query_error(&error))?;
-            replies.extend(lightwalletd_address_utxos(&address, &address_utxos)?);
+            let mut address_output_count = 0;
+            while let Some(utxo) = address_utxos.next().await {
+                let utxo = utxo.map_err(|error| status_from_query_error(&error))?;
+                replies.push(lightwalletd_address_utxo(&address, &utxo)?);
+                address_output_count += 1;
+                match address_output_cap {
+                    Some(cap) if address_output_count == cap => break,
+                    None if replies.len() > response_limit => {
+                        return Err(address_utxo_limit_exceeded(response_limit));
+                    }
+                    Some(_) | None => {}
+                }
+            }
         }
 
         replies.sort_by(|left, right| {
@@ -361,15 +382,11 @@ where
                 .then_with(|| left.index.cmp(&right.index))
                 .then_with(|| left.address.cmp(&right.address))
         });
-        if let Some(max_entries) = NonZeroU32::new(request.max_entries) {
-            replies.truncate(u32_to_usize(max_entries.get()));
+        if let Some(max_entries) = max_entries {
+            replies.truncate(max_entries);
         }
-        let response_limit = self.response_limits.max_address_utxos.get();
-        if replies.len() > u32_to_usize(response_limit) {
-            return Err(Status::resource_exhausted(format!(
-                "{} unspent outputs match, more than the {response_limit} one response returns",
-                replies.len(),
-            )));
+        if replies.len() > response_limit {
+            return Err(address_utxo_limit_exceeded(response_limit));
         }
         Ok(replies)
     }
@@ -1558,26 +1575,26 @@ fn transparent_address_unspent_outputs_request(
     })
 }
 
-fn lightwalletd_address_utxos(
+fn lightwalletd_address_utxo(
     address: &str,
-    address_utxos: &TransparentAddressUnspentOutputs,
-) -> Result<Vec<lightwalletd::GetAddressUtxosReply>, Status> {
-    address_utxos
-        .outputs
-        .iter()
-        .map(|utxo| {
-            Ok(lightwalletd::GetAddressUtxosReply {
-                address: address.to_owned(),
-                txid: encode_internal_transaction_id(utxo.outpoint.transaction_id).to_vec(),
-                index: i32::try_from(utxo.outpoint.output_index)
-                    .map_err(|_| Status::data_loss("transparent output index exceeds i32"))?,
-                script: utxo.script_pub_key.clone(),
-                value_zat: i64::try_from(utxo.value_zat)
-                    .map_err(|_| Status::data_loss("transparent output value exceeds i64"))?,
-                height: u64::from(utxo.block_height.value()),
-            })
-        })
-        .collect()
+    utxo: &TransparentUnspentOutput,
+) -> Result<lightwalletd::GetAddressUtxosReply, Status> {
+    Ok(lightwalletd::GetAddressUtxosReply {
+        address: address.to_owned(),
+        txid: encode_internal_transaction_id(utxo.outpoint.transaction_id).to_vec(),
+        index: i32::try_from(utxo.outpoint.output_index)
+            .map_err(|_| Status::data_loss("transparent output index exceeds i32"))?,
+        script: utxo.script_pub_key.clone(),
+        value_zat: i64::try_from(utxo.value_zat)
+            .map_err(|_| Status::data_loss("transparent output value exceeds i64"))?,
+        height: u64::from(utxo.block_height.value()),
+    })
+}
+
+fn address_utxo_limit_exceeded(response_limit: usize) -> Status {
+    Status::resource_exhausted(format!(
+        "more unspent outputs match than the {response_limit} one response returns"
+    ))
 }
 
 fn lightwalletd_tree_state(tree_state: &TreeState) -> Result<lightwalletd::TreeState, Status> {

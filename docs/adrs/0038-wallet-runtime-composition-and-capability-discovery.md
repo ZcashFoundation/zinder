@@ -181,6 +181,19 @@ answered from the current pair, so a history walk that starts a new receiver
 after a publication still restarts. Consumer tests must prove that
 a retry does not commit a partial block batch.
 
+A request holds the pair it reads, and a held pair keeps its secondary
+generation open. Once the publisher releases a pair from retention, requests
+may keep reading it for at most 30 seconds more. Past that read limit the
+publisher revokes reads on the pair: the reads that keep a pair across several
+pages, the transparent unspent-output and full-block streams, stop at their
+next page or while they wait for a slow client and end with
+`CHAIN_EPOCH_PIN_UNAVAILABLE`, the same typed expiry as a released pin. A
+consumer treats the partial result as void and restarts at a newer epoch.
+These streams also read storage only as fast as the client consumes and stop
+reading when the client cancels or disconnects, so an abandoned read releases
+its pair at once. A slow or abandoned read therefore delays publication by at
+most the read limit and never stops it for other clients.
+
 ZODL continues to consume the separate lightwalletd-compatible
 `CompactTxStreamer` surface through trusted TLS at the deployment edge. Native
 capability strings and full-block requirements do not leak into that protocol.
@@ -237,6 +250,16 @@ retained pair keeps its own canonical and wallet secondaries open. Two pairs
 for at most one minute cover a multi-request workflow across a burst of
 blocks, and typed view expiry with whole-workflow retry covers the rest.
 
+### Let requests hold a released pair until they finish
+
+A read cannot be bounded by its request shape alone: an address can hold
+millions of unspent outputs, and a client can stop consuming a stream without
+cancelling it. Unbounded holds let three such reads occupy every spare
+generation, after which no pair is published for any client until the reads
+end or the process restarts. Revoking reads on a released pair after a fixed
+limit bounds that delay, and the typed expiry already tells consumers to
+restart.
+
 ### Serve only the current pair
 
 Expiring a pin at the next publication fails any workflow that spans a block.
@@ -250,6 +273,12 @@ controlled consumer cutover uses the current contract without shims.
 
 ## Revision history
 
+- 2026-11-15: Requests may keep reading a released serving pair for at most
+  30 seconds. The publisher then revokes reads on it, and the transparent
+  unspent-output and full-block streams end with
+  `CHAIN_EPOCH_PIN_UNAVAILABLE`. The unspent-output stream reads storage one
+  bounded page at a time as the client consumes it and stops when the client
+  goes away.
 - 2026-11-14: The two most recently replaced serving pairs keep answering
   reads pinned to their epochs, each for at most one minute after it was
   replaced, so a workflow whose reads carry `at_epoch_id` survives a new

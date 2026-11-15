@@ -875,6 +875,10 @@ impl RocksDbWalletStore {
 
     /// Returns one bounded page of current outputs for an address at or above
     /// `start_height`.
+    ///
+    /// The page walks the address index first and then reads every primary
+    /// row it names in one batched lookup, so a page costs one sequential
+    /// index scan plus one multi-get rather than one point read per output.
     pub fn address_unspent_outputs_page_from_height(
         &self,
         address_script_hash: TransparentAddressScriptHash,
@@ -887,6 +891,28 @@ impl RocksDbWalletStore {
                 index: TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
             });
         }
+        let (index_keys, more_rows) =
+            self.address_unspent_index_page(address_script_hash, start_height, after, page_size)?;
+        let outputs = self.unspent_outputs_for_index_keys(address_script_hash, &index_keys)?;
+        Ok(WalletAddressUnspentOutputsPage {
+            outputs,
+            next_page_after: if more_rows {
+                index_keys.last().copied()
+            } else {
+                None
+            },
+        })
+    }
+
+    /// Returns up to `page_size` address-index keys after `after`, and whether
+    /// the address has more rows beyond them.
+    fn address_unspent_index_page(
+        &self,
+        address_script_hash: TransparentAddressScriptHash,
+        start_height: BlockHeight,
+        after: Option<WalletAddressUnspentOutputKey>,
+        page_size: NonZeroU16,
+    ) -> Result<(Vec<WalletAddressUnspentOutputKey>, bool), RocksDbWalletError> {
         let family = column_family(
             &self.bounded_open,
             TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
@@ -899,13 +925,24 @@ impl RocksDbWalletStore {
             .map_or(lower_bound.as_bytes().as_slice(), |key| {
                 key.as_bytes().as_slice()
             });
-        let mut outputs = Vec::with_capacity(usize::from(page_size.get()));
-        let mut last_key = None;
-        for row in self
-            .bounded_open
-            .db
-            .iterator_cf(&family, IteratorMode::From(start, Direction::Forward))
-        {
+        // Every index key of the address sorts below its prefix followed by
+        // more 0xFF bytes than a key carries after the prefix, so the scan
+        // stops at the address boundary instead of stepping over the deleted
+        // rows of the addresses after it.
+        let mut read_options = ReadOptions::default();
+        read_options.set_iterate_upper_bound(
+            [
+                address_prefix.as_slice(),
+                &[u8::MAX; ADDRESS_UNSPENT_KEY_BYTES],
+            ]
+            .concat(),
+        );
+        let mut index_keys = Vec::with_capacity(usize::from(page_size.get()));
+        for row in self.bounded_open.db.iterator_cf_opt(
+            &family,
+            read_options,
+            IteratorMode::From(start, Direction::Forward),
+        ) {
             let (key_bytes, encoded_index) = row.map_err(|source| {
                 RocksDbWalletError::rocksdb("address unspent page scan", source)
             })?;
@@ -915,11 +952,8 @@ impl RocksDbWalletStore {
             if after.is_some_and(|key| key_bytes.as_ref() <= key.as_bytes().as_slice()) {
                 continue;
             }
-            if outputs.len() == usize::from(page_size.get()) {
-                return Ok(WalletAddressUnspentOutputsPage {
-                    outputs,
-                    next_page_after: last_key,
-                });
+            if index_keys.len() == usize::from(page_size.get()) {
+                return Ok((index_keys, true));
             }
             let key = WalletAddressUnspentOutputKey::decode(&key_bytes)?;
             if !encoded_index.is_empty() {
@@ -927,25 +961,53 @@ impl RocksDbWalletStore {
                     reason: "address unspent index values must be empty",
                 });
             }
-            let output = self.find_unspent_output(key.outpoint())?.ok_or(
-                RocksDbWalletError::AdmissionChanged {
-                    reason: "address unspent index references a missing primary output",
-                },
-            )?;
-            if output.address_script_hash != address_script_hash
-                || output.created_at.block.height != key.creation_height()
-            {
-                return Err(RocksDbWalletError::AdmissionChanged {
-                    reason: "address unspent index does not match its primary output",
-                });
-            }
-            outputs.push(output);
-            last_key = Some(key);
+            index_keys.push(key);
         }
-        Ok(WalletAddressUnspentOutputsPage {
-            outputs,
-            next_page_after: None,
-        })
+        Ok((index_keys, false))
+    }
+
+    /// Reads the primary output each address-index key names, in index order.
+    fn unspent_outputs_for_index_keys(
+        &self,
+        address_script_hash: TransparentAddressScriptHash,
+        index_keys: &[WalletAddressUnspentOutputKey],
+    ) -> Result<Vec<WalletUnspentOutput>, RocksDbWalletError> {
+        if index_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let family = column_family(&self.bounded_open, TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY)?;
+        let outpoint_keys: Vec<WalletOutpointKey> = index_keys
+            .iter()
+            .map(|key| WalletOutpointKey::new(key.outpoint()))
+            .collect();
+        let rows = self.bounded_open.db.batched_multi_get_cf(
+            &family,
+            outpoint_keys.iter().map(WalletOutpointKey::as_bytes),
+            false,
+        );
+        index_keys
+            .iter()
+            .zip(&outpoint_keys)
+            .zip(rows)
+            .map(|((index_key, outpoint_key), row)| {
+                let encoded = row
+                    .map_err(|source| {
+                        RocksDbWalletError::rocksdb("address unspent primary read", source)
+                    })?
+                    .ok_or(RocksDbWalletError::AdmissionChanged {
+                        reason: "address unspent index references a missing primary output",
+                    })?;
+                let output = WalletUnspentOutput::decode_value(*outpoint_key, &encoded)?;
+                if output.address_script_hash != address_script_hash
+                    || output.created_at.block.height != index_key.creation_height()
+                {
+                    return Err(RocksDbWalletError::AdmissionChanged {
+                        reason: "address unspent index does not match its primary output",
+                    });
+                }
+                Ok(output)
+            })
+            .collect()
     }
 
     /// Returns one exact address-transaction row.
