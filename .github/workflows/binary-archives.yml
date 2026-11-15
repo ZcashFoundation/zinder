@@ -41,10 +41,12 @@ jobs:
             docker: linux/amd64
             rust: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
+            jemalloc_page_size: 4096
           - name: aarch64-unknown-linux-gnu
             docker: linux/arm64
             rust: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
+            jemalloc_page_size: 65536
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -59,6 +61,7 @@ jobs:
 
       - name: Build and verify binary archive
         env:
+          JEMALLOC_PAGE_SIZE: ${{ matrix.platform.jemalloc_page_size }}
           RUST_TARGET: ${{ matrix.platform.rust }}
           TARGET_PLATFORM: ${{ matrix.platform.docker }}
         run: |
@@ -107,6 +110,7 @@ jobs:
             --commit "$commit"
           docker run --rm \
             --platform "$TARGET_PLATFORM" \
+            --env JEMALLOC_PAGE_SIZE \
             --volume "${RUNNER_TEMP}/binary-export/bin:/opt/zinder/bin:ro" \
             debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 \
             sh -ec '
@@ -115,6 +119,9 @@ jobs:
               for binary in /opt/zinder/bin/*; do
                 "$binary" --version
                 "$binary" --help >/dev/null
+                MALLOC_CONF=stats_print:true "$binary" --version 2>&1 >/dev/null \
+                  | grep -Fqx "Page size: ${JEMALLOC_PAGE_SIZE}" \
+                  || { echo "$binary: jemalloc page size is not ${JEMALLOC_PAGE_SIZE}" >&2; exit 1; }
               done
             '
 

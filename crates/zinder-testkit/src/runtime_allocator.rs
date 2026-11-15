@@ -1,10 +1,12 @@
-//! Probe that a service binary allocates through the runtime allocator.
+//! Probe that a service binary allocates through jemalloc.
 //!
-//! On Linux, service binaries install jemalloc with unprefixed symbols, so it
-//! also replaces the C library `malloc` that `RocksDB` allocates through.
-//! jemalloc reads `MALLOC_CONF` only when it owns those symbols, which makes
-//! its statistics report under `MALLOC_CONF=stats_print:true` evidence for
-//! both the Rust and the native allocations of the process.
+//! On Linux, `zinder-runtime` links jemalloc with unprefixed symbols, so it
+//! replaces the C library `malloc` that `RocksDB` allocates through. jemalloc
+//! reads `MALLOC_CONF` only when it owns those symbols, which makes its
+//! statistics report under `MALLOC_CONF=stats_print:true` evidence that the
+//! native allocations of the process use it. The probe cannot tell whether the
+//! binary also declares `zinder_runtime::RuntimeAllocator` as its global
+//! allocator, because linking `zinder-runtime` alone produces the same report.
 
 use std::{path::Path, process::Command};
 

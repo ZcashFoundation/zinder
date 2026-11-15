@@ -61,6 +61,10 @@ ARG RELEASE_CACHE_SCOPE=shared
 # baseline ISA. Runtime hosts are verified at startup before storage opens.
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq --remap-path-prefix=/workspace=/usr/src/zinder --remap-path-prefix=/usr/local/cargo=/cargo"
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="--remap-path-prefix=/workspace=/usr/src/zinder --remap-path-prefix=/usr/local/cargo=/cargo"
+# jemalloc fixes its page size at build time and aborts on a kernel with larger
+# pages. 64 KiB pages run on AArch64 kernels with 4, 16, or 64 KiB pages; the
+# build runners use 4 KiB, which jemalloc would otherwise measure and keep.
+ENV AARCH64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_PAGE=16
 ENV CARGO_PROFILE_RELEASE_STRIP=symbols
 ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 ENV ZINDER_BUILD_GIT_COMMIT=${ZINDER_BUILD_GIT_COMMIT}

@@ -40,12 +40,20 @@ not depend on it.
 
 ## Decision
 
-Every Zinder service binary installs `zinder_runtime::RuntimeAllocator` as its
-global allocator. On Linux, the allocator is jemalloc 5.3 through
-`tikv-jemallocator`, built with unprefixed symbols. jemalloc therefore also
-provides `malloc`, `free`, and the other C allocation functions for the whole
-process, so RocksDB's native allocations use it too. Other platforms keep the
-system allocator.
+On Linux, `zinder-runtime` links jemalloc 5.3 through `tikv-jemallocator`,
+built with unprefixed symbols. jemalloc therefore provides `malloc`, `free`, and
+the other C allocation functions for every process that links `zinder-runtime`,
+so RocksDB's native allocations use it too. Every Zinder service binary also
+installs `zinder_runtime::RuntimeAllocator` as its global allocator, which sends
+Rust allocations to jemalloc's sized allocation functions instead of through
+the C `malloc` and `free`. Other platforms keep the system allocator.
+
+jemalloc fixes its page size when it is built and aborts on a kernel whose page
+size is larger. The release Dockerfile builds AArch64 binaries with 64 KiB
+jemalloc pages, so they run on AArch64 kernels with 4, 16, or 64 KiB pages, as
+the Armv8-A baseline of
+[ADR-0036](0036-gnu-linux-binary-release-bundles.md) requires. x86-64 binaries use
+4 KiB pages, the only size x86-64 Linux uses.
 
 jemalloc gives each thread its own cache and spreads threads across many
 arenas, so concurrent readers do not queue on a shared lock. By default, a
@@ -60,7 +68,11 @@ Linux service binary.
 
 Each service crate tests that its binary prints jemalloc statistics when run
 with `MALLOC_CONF=stats_print:true`. jemalloc reads that variable only when it
-owns the C allocation functions, so the test also covers RocksDB's allocations.
+owns the C allocation functions, so the test shows that RocksDB's allocations
+use jemalloc in that binary. It does not detect a missing global allocator
+declaration, because linking `zinder-runtime` alone gives jemalloc the C
+allocation functions. The release workflows also run each archived binary with
+that setting and check the page size jemalloc reports for its architecture.
 
 ## Consequences
 
@@ -78,8 +90,11 @@ owns the C allocation functions, so the test also covers RocksDB's allocations.
   by about 0.5 MB and gains no shared-library dependency.
 - Glibc's own memory reports, such as `malloc_stats`, no longer describe a
   service binary. jemalloc's statistics do.
-- Test binaries, examples, and crates used as libraries keep the system
-  allocator unless they install one.
+- Every Linux binary that links `zinder-runtime`, including test binaries,
+  examples, and benchmarks, runs its C allocations on jemalloc, even without a
+  global allocator declaration.
+- AArch64 binaries manage jemalloc memory in 64 KiB pages, which can raise
+  resident memory on 4 KiB-page hosts compared with a 4 KiB build.
 
 ## Alternatives considered
 

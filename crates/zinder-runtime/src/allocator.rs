@@ -1,7 +1,9 @@
 //! Process allocator that every Zinder service binary installs.
 //!
-//! On Linux this is jemalloc with unprefixed symbols, so it also replaces the C
-//! library `malloc` that `RocksDB` allocates through. Glibc malloc makes
+//! On Linux this is jemalloc with unprefixed symbols. Linking this crate makes
+//! jemalloc the C library `malloc` that `RocksDB` allocates through, and the
+//! global allocator declaration sends Rust allocations to jemalloc's sized
+//! allocation functions. Glibc malloc makes
 //! concurrent threads share a few arena locks, and a deployment that caps the
 //! arena count serializes Zinder's parallel storage reads on them. See
 //! [ADR-0044](../../../docs/adrs/0044-service-binaries-allocate-through-jemalloc.md).
