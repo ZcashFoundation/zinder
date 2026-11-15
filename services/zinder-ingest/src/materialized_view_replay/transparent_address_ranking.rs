@@ -281,7 +281,16 @@ impl MaterializedViewTailer {
             .is_some()
         {
             let advances = progress.advances();
-            self.advance_ranking_build_step(&mut pass)?;
+            if let Err(error) = self.advance_ranking_build_step(&mut pass) {
+                // Replay still runs; the step after it reports the failure.
+                tracing::warn!(
+                    target: "zinder::ingest",
+                    event = "transparent_address_ranking_build_failed",
+                    error = %error,
+                    "transparent-address ranking build step failed before replay; replaying without it"
+                );
+                break;
+            }
             if progress.advances() == advances {
                 break;
             }
@@ -540,6 +549,7 @@ impl<'build> RankingBuild<'build> {
             if through == shared_height
                 && let Some(metadata) = self.join_shared_replay(through)?
             {
+                self.hand_prevouts_to_replay(through);
                 return Ok(activated(
                     &metadata,
                     "transparent_address_ranking_joined_replay",
@@ -594,6 +604,30 @@ impl<'build> RankingBuild<'build> {
             // reverts it before the build can join.
             Err(TransparentAddressRankingConsumerError::SnapshotTargetMismatch) => Ok(None),
             Err(error) => Err(ranking_error(error)),
+        }
+    }
+
+    /// Hands the cache this build walked to `joined` over to replay, which
+    /// resumes at the next height, so replay does not warm its own cache over
+    /// the same history again.
+    ///
+    /// Replay holds its cache only while it hydrates a transition, and a
+    /// replay that is hydrating keeps its own cache.
+    fn hand_prevouts_to_replay(&mut self, joined: BlockHeight) {
+        let Some(mut replay) = self.tailer.prevout_caches.replay.try_lock() else {
+            return;
+        };
+        let Some(build) = self.hydrator.prevout_cache_mut() else {
+            return;
+        };
+        if replay.take_over(build) {
+            tracing::info!(
+                target: "zinder::ingest",
+                event = "materialized_view_prevout_cache_handed_to_replay",
+                joined_height = joined.value(),
+                cached_outputs = replay.len(),
+                "Explorer view replay took over the prevout cache the transparent-address ranking build walked to the joined height"
+            );
         }
     }
 

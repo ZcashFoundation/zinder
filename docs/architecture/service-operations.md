@@ -455,7 +455,9 @@ block-local boundary.
 
 A replay or ranking build that resumes partway through history warms its empty
 prevout cache first and logs `materialized_view_prevout_cache_warmed` with the
-walked range and the time its last call took. A steady `canonical` share after
+walked range and the time its last call took. When a ranking build joins
+replay, replay takes over the build's cache instead and logs
+`materialized_view_prevout_cache_handed_to_replay`. A steady `canonical` share after
 the warm-up means the cache is evicting outputs that are still spent later,
 which the eviction counter confirms, and the producing-block reads set the
 replay speed. A walker that paused after its cache held outputs resumes cold

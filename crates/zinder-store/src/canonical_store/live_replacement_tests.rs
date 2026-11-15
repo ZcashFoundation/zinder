@@ -1775,9 +1775,21 @@ fn secondary_point_reads_agree_with_the_bounded_replay_range_scan()
     assert_eq!(secondary.block_replay_facts_at(BlockHeight::new(5))?, None);
 
     let requested = [4, 0, 2, 5, 1, 2].map(BlockHeight::new);
-    let batched = secondary.block_replay_facts_at_heights(&requested)?;
-    assert_eq!(batched.len(), requested.len());
-    for (height, facts) in requested.iter().zip(&batched) {
+    let mut visited = Vec::new();
+    secondary.visit_block_replay_facts_at_heights::<CanonicalStoreError>(
+        &requested,
+        |index, facts| {
+            visited.push((index, facts));
+            Ok(())
+        },
+    )?;
+    visited.sort_by_key(|(index, _)| *index);
+    assert_eq!(
+        visited.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+        (0..requested.len()).collect::<Vec<_>>(),
+        "every requested height is visited exactly once"
+    );
+    for (height, (_, facts)) in requested.iter().zip(&visited) {
         assert_eq!(facts, &secondary.block_replay_facts_at(*height)?);
     }
 

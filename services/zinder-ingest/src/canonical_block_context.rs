@@ -124,6 +124,11 @@ impl<'canonical> CanonicalBlockContextReader<'canonical> {
         }
     }
 
+    /// Returns the prevout cache this reader resolves through, if any.
+    pub(crate) fn prevout_cache_mut(&mut self) -> Option<&mut PrevoutCache> {
+        self.prevouts.as_deref_mut()
+    }
+
     /// Warms a prevout cache with the unspent outputs canonical history holds
     /// at `through`.
     ///
@@ -348,8 +353,8 @@ impl<'canonical> CanonicalBlockContextReader<'canonical> {
     /// Each distinct parent transaction costs one location read and each
     /// distinct producing height one replay-row read. Both sets of reads are
     /// independent, so they run on several threads. Each thread takes a
-    /// contiguous run of sorted keys and reads it as one batched lookup, so
-    /// rows that share a data block cost one device read.
+    /// contiguous run of sorted keys and reads it in batched lookups, so keys
+    /// in the same or adjacent data blocks cost one device read.
     fn read_produced_outputs_below_range(
         &self,
         requested: &HashSet<TransparentOutPoint>,
@@ -404,19 +409,23 @@ impl<'canonical> CanonicalBlockContextReader<'canonical> {
         let by_producing_height = by_producing_height.into_iter().collect::<Vec<_>>();
         let outputs = read_in_parallel(&by_producing_height, |chunk| {
             let heights = chunk.iter().map(|(height, _)| *height).collect::<Vec<_>>();
-            let blocks = self.secondary.block_replay_facts_at_heights(&heights)?;
             let mut outputs = Vec::new();
-            for ((_, outpoints), block) in chunk.iter().zip(blocks) {
-                for (outpoint, tx_index_in_block) in outpoints {
-                    let block = block.as_ref().ok_or_else(|| {
-                        prevout_unresolved(*outpoint, "producing block is not retained")
-                    })?;
-                    outputs.push((
-                        *outpoint,
-                        produced_output(block, *outpoint, *tx_index_in_block)?,
-                    ));
-                }
-            }
+            self.secondary
+                .visit_block_replay_facts_at_heights(&heights, |index, block| {
+                    let Some((_, outpoints)) = chunk.get(index) else {
+                        return Ok(());
+                    };
+                    for (outpoint, tx_index_in_block) in outpoints {
+                        let block = block.as_ref().ok_or_else(|| {
+                            prevout_unresolved(*outpoint, "producing block is not retained")
+                        })?;
+                        outputs.push((
+                            *outpoint,
+                            produced_output(block, *outpoint, *tx_index_in_block)?,
+                        ));
+                    }
+                    Ok::<_, IngestError>(())
+                })?;
             Ok(outputs)
         })?;
         produced.extend(outputs);

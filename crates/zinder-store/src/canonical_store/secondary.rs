@@ -20,7 +20,7 @@ use super::{
     activation_schedule::CanonicalActivationSchedule,
     block_replay::{
         CanonicalReplayRangeScan, CanonicalReplayScan, read_replay_facts_at,
-        read_replay_facts_at_heights,
+        visit_replay_facts_at_heights,
     },
     construction_manifest::validate_ready_construction_manifest,
     event_lifecycle::{canonical_event_history_from_db, canonical_event_retention_floor_from_db},
@@ -428,18 +428,23 @@ impl RocksDbCanonicalSecondary {
         read_replay_facts_at(&self.bounded_open.db, &self.ready_evidence, height)
     }
 
-    /// Reads several retained blocks' canonical facts in one batched lookup.
+    /// Visits several retained blocks' canonical facts in height order.
     ///
-    /// Returns one entry per requested height, in request order, each `None`
-    /// exactly when [`Self::block_replay_facts_at`] would return `None`. The
-    /// rows are read in height order and bypass the block cache, so a walk
-    /// that reads many unrelated historical blocks keeps the cache for the
-    /// index and transaction-location blocks it reuses.
-    pub fn block_replay_facts_at_heights(
+    /// `visit` receives each requested height's position in `heights` with
+    /// the facts [`Self::block_replay_facts_at`] would return for it. The
+    /// rows are read in small batched lookups that bypass the block cache, so
+    /// a walk that reads many unrelated historical blocks holds only a few
+    /// rows at once and keeps the cache for the index and transaction-location
+    /// blocks it reuses.
+    pub fn visit_block_replay_facts_at_heights<E>(
         &self,
         heights: &[BlockHeight],
-    ) -> Result<Vec<Option<CanonicalBlockFacts>>, CanonicalStoreError> {
-        read_replay_facts_at_heights(&self.bounded_open.db, &self.ready_evidence, heights)
+        visit: impl FnMut(usize, Option<CanonicalBlockFacts>) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        E: From<CanonicalStoreError>,
+    {
+        visit_replay_facts_at_heights(&self.bounded_open.db, &self.ready_evidence, heights, visit)
     }
 
     /// Reads retained canonical events from this secondary's admitted READY fence.
