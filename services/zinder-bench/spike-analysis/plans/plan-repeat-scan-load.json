@@ -1,0 +1,15 @@
+{"phases":[
+ {"name":"r-baseline-a","block_interval_ms":500,"duration_seconds":300},
+ {"name":"r-hold-1s-all","block_interval_ms":500,"duration_seconds":300,"baseline_phase":"r-baseline-a","after_baseline_phase":"r-baseline-b",
+  "readers":[{"kind":"compact-range","count":8,"hold_seconds":1.0,"range_blocks":10000},
+             {"kind":"wallet-family","count":1,"hold_seconds":1.0,"family":"transparent_unspent_output"},
+             {"kind":"wallet-family","count":1,"hold_seconds":1.0,"family":"transparent_address_transaction"}]},
+ {"name":"r-baseline-b","block_interval_ms":500,"duration_seconds":300},
+ {"name":"r-hold-1s-compact-only","block_interval_ms":500,"duration_seconds":300,"baseline_phase":"r-baseline-b","after_baseline_phase":"r-baseline-c",
+  "readers":[{"kind":"compact-range","count":8,"hold_seconds":1.0,"range_blocks":10000}]},
+ {"name":"r-baseline-c","block_interval_ms":500,"duration_seconds":300},
+ {"name":"r-hold-1s-wallet-scan-only","block_interval_ms":500,"duration_seconds":300,"baseline_phase":"r-baseline-c","after_baseline_phase":"r-baseline-d",
+  "readers":[{"kind":"wallet-family","count":1,"hold_seconds":1.0,"family":"transparent_unspent_output"},
+             {"kind":"wallet-family","count":1,"hold_seconds":1.0,"family":"transparent_address_transaction"}]},
+ {"name":"r-baseline-d","block_interval_ms":500,"duration_seconds":300}
+]}

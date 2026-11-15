@@ -1,0 +1,376 @@
+{
+  "phases": [
+    {
+      "name": "baseline-no-readers",
+      "block_interval_ms": 500,
+      "blocks": null,
+      "duration_seconds": 600,
+      "readers": [],
+      "load": null,
+      "replacements": [],
+      "index_attach": null,
+      "density_multiplier": 1.0,
+      "compact_all_at_end": false,
+      "baseline_phase": null,
+      "after_baseline_phase": null
+    },
+    {
+      "name": "replacements-no-readers",
+      "block_interval_ms": 500,
+      "blocks": null,
+      "duration_seconds": 600,
+      "readers": [],
+      "load": null,
+      "replacements": [
+        {
+          "at_seconds": 120.0,
+          "displaced": 1000,
+          "kept": 1000
+        },
+        {
+          "at_seconds": 420.0,
+          "displaced": 1000,
+          "kept": 500
+        }
+      ],
+      "index_attach": null,
+      "density_multiplier": 1.0,
+      "compact_all_at_end": false,
+      "baseline_phase": null,
+      "after_baseline_phase": null
+    },
+    {
+      "name": "hold-1s",
+      "block_interval_ms": 500,
+      "blocks": null,
+      "duration_seconds": 300,
+      "readers": [
+        {
+          "kind": "compact-range",
+          "count": 8,
+          "hold_seconds": 1.0,
+          "range_blocks": 10000,
+          "chunk_blocks": 100,
+          "held_iterator": true,
+          "snapshot": true,
+          "paced_interval_ms": 250
+        },
+        {
+          "kind": "wallet-family",
+          "count": 1,
+          "hold_seconds": 1.0,
+          "family": "transparent_unspent_output",
+          "snapshot": true,
+          "paced_interval_ms": 250
+        },
+        {
+          "kind": "wallet-family",
+          "count": 1,
+          "hold_seconds": 1.0,
+          "family": "transparent_address_transaction",
+          "snapshot": true,
+          "paced_interval_ms": 250
+        }
+      ],
+      "load": null,
+      "replacements": [],
+      "index_attach": null,
+      "density_multiplier": 1.0,
+      "compact_all_at_end": false,
+      "baseline_phase": "baseline-no-readers",
+      "after_baseline_phase": "post-30m-release"
+    },
+    {
+      "name": "hold-30s",
+      "block_interval_ms": 500,
+      "blocks": null,
+      "duration_seconds": 600,
+      "readers": [
+        {
+          "kind": "compact-range",
+          "count": 8,
+          "hold_seconds": 30.0,
+          "range_blocks": 10000,
+          "chunk_blocks": 100,
+          "held_iterator": true,
+          "snapshot": true,
+          "paced_interval_ms": 250
+        },
+        {
+          "kind": "wallet-family",
+          "count": 1,
+          "hold_seconds": 30.0,
+          "family": "transparent_unspent_output",
+          "snapshot": true,
+          "paced_interval_ms": 250
+        },
+        {
+          "kind": "wallet-family",
+          "count": 1,
+          "hold_seconds": 30.0,
+          "family": "transparent_address_transaction",
+          "snapshot": true,
+          "paced_interval_ms": 250
+        }
+      ],
+      "load": null,
+      "replacements": [],
+      "index_attach": null,
+      "density_multiplier": 1.0,
+      "compact_all_at_end": false,
+      "baseline_phase": "baseline-no-readers",
+      "after_baseline_phase": "post-30m-release"
+    },
+    {
+      "name": "hold-5m-with-replacements",
+      "block_interval_ms": 500,
+      "blocks": null,
+      "duration_seconds": 960,
+      "readers": [
+        {
+          "kind": "compact-range",
+          "count": 8,
+          "hold_seconds": 300.0,
+          "range_blocks": 10000,
+          "chunk_blocks": 100,
+          "held_iterator": true,
+          "snapshot": true,
+          "paced_interval_ms": 250
+        },
+        {
+          "kind": "wallet-family",
+          "count": 1,
+          "hold_seconds": 300.0,
+          "family": "transparent_unspent_output",
+          "snapshot": true,
+          "paced_interval_ms": 250
+        },
+        {
+          "kind": "wallet-family",
+          "count": 1,
+          "hold_seconds": 300.0,
+          "family": "transparent_address_transaction",
+          "snapshot": true,
+          "paced_interval_ms": 250
+        },
+        {
+          "kind": "compact-range",
+          "count": 1,
+          "hold_seconds": 300.0,
+          "range_blocks": 2000,
+          "chunk_blocks": 100,
+          "held_iterator": false,
+          "snapshot": false,
+          "paced_interval_ms": 250
+        },
+        {
+          "kind": "wallet-family",
+          "count": 1,
+          "hold_seconds": 300.0,
+          "family": "transparent_unspent_output",
+          "snapshot": false,
+          "paced_interval_ms": 250
+        }
+      ],
+      "load": null,
+      "replacements": [
+        {
+          "at_seconds": 120.0,
+          "displaced": 1000,
+          "kept": 1000
+        },
+        {
+          "at_seconds": 420.0,
+          "displaced": 1000,
+          "kept": 500
+        }
+      ],
+      "index_attach": null,
+      "density_multiplier": 1.0,
+      "compact_all_at_end": false,
+      "baseline_phase": "replacements-no-readers",
+      "after_baseline_phase": "post-30m-release"
+    },
+    {
+      "name": "hold-30m",
+      "block_interval_ms": 500,
+      "blocks": null,
+      "duration_seconds": 1860,
+      "readers": [
+        {
+          "kind": "compact-range",
+          "count": 8,
+          "hold_seconds": 1800.0,
+          "range_blocks": 10000,
+          "chunk_blocks": 100,
+          "held_iterator": true,
+          "snapshot": true,
+          "paced_interval_ms": 250
+        },
+        {
+          "kind": "wallet-family",
+          "count": 1,
+          "hold_seconds": 1800.0,
+          "family": "transparent_unspent_output",
+          "snapshot": true,
+          "paced_interval_ms": 250
+        },
+        {
+          "kind": "wallet-family",
+          "count": 1,
+          "hold_seconds": 1800.0,
+          "family": "transparent_address_transaction",
+          "snapshot": true,
+          "paced_interval_ms": 250
+        }
+      ],
+      "load": null,
+      "replacements": [],
+      "index_attach": null,
+      "density_multiplier": 1.0,
+      "compact_all_at_end": false,
+      "baseline_phase": "baseline-no-readers",
+      "after_baseline_phase": "post-30m-release"
+    },
+    {
+      "name": "post-30m-release",
+      "block_interval_ms": 500,
+      "blocks": null,
+      "duration_seconds": 900,
+      "readers": [],
+      "load": null,
+      "replacements": [],
+      "index_attach": null,
+      "density_multiplier": 1.0,
+      "compact_all_at_end": true,
+      "baseline_phase": "baseline-no-readers",
+      "after_baseline_phase": null
+    },
+    {
+      "name": "realtime-25s-hold-5m",
+      "block_interval_ms": 25000,
+      "blocks": null,
+      "duration_seconds": 1800,
+      "readers": [
+        {
+          "kind": "compact-range",
+          "count": 8,
+          "hold_seconds": 300.0,
+          "range_blocks": 10000,
+          "chunk_blocks": 100,
+          "held_iterator": true,
+          "snapshot": true,
+          "paced_interval_ms": 250
+        },
+        {
+          "kind": "wallet-family",
+          "count": 1,
+          "hold_seconds": 300.0,
+          "family": "transparent_unspent_output",
+          "snapshot": true,
+          "paced_interval_ms": 250
+        },
+        {
+          "kind": "wallet-family",
+          "count": 1,
+          "hold_seconds": 300.0,
+          "family": "transparent_address_transaction",
+          "snapshot": true,
+          "paced_interval_ms": 250
+        }
+      ],
+      "load": null,
+      "replacements": [],
+      "index_attach": null,
+      "density_multiplier": 1.0,
+      "compact_all_at_end": false,
+      "baseline_phase": "baseline-no-readers",
+      "after_baseline_phase": "post-30m-release"
+    },
+    {
+      "name": "index-attach",
+      "block_interval_ms": 500,
+      "blocks": null,
+      "duration_seconds": 960,
+      "readers": [
+        {
+          "kind": "wallet-family",
+          "count": 2,
+          "hold_seconds": 120.0,
+          "family": "transparent_spent_output",
+          "snapshot": true,
+          "paced_interval_ms": 250
+        },
+        {
+          "kind": "wallet-family",
+          "count": 2,
+          "hold_seconds": 900.0,
+          "family": "transparent_spent_output",
+          "snapshot": true,
+          "paced_interval_ms": 250
+        }
+      ],
+      "load": null,
+      "replacements": [],
+      "index_attach": {
+        "at_seconds": 30.0,
+        "family": "transparent_spent_output",
+        "drop_after_seconds": 30.0,
+        "final_gap_blocks": 2,
+        "wait_for_old_files_seconds": 1200.0
+      },
+      "density_multiplier": 1.0,
+      "compact_all_at_end": false,
+      "baseline_phase": "baseline-no-readers",
+      "after_baseline_phase": "load-baseline-no-readers"
+    },
+    {
+      "name": "load-baseline-no-readers",
+      "block_interval_ms": 500,
+      "blocks": null,
+      "duration_seconds": 300,
+      "readers": [],
+      "load": null,
+      "replacements": [],
+      "index_attach": null,
+      "density_multiplier": 1.0,
+      "compact_all_at_end": false,
+      "baseline_phase": null,
+      "after_baseline_phase": null
+    },
+    {
+      "name": "serving-load",
+      "block_interval_ms": 500,
+      "blocks": null,
+      "duration_seconds": 900,
+      "readers": [],
+      "load": {
+        "compact_workers": 8,
+        "wallet_workers": 8,
+        "lookup_workers": 8,
+        "compact_range_blocks": 1000,
+        "think_time_ms": 0
+      },
+      "replacements": [],
+      "index_attach": null,
+      "density_multiplier": 1.0,
+      "compact_all_at_end": false,
+      "baseline_phase": "load-baseline-no-readers",
+      "after_baseline_phase": "load-baseline-after"
+    },
+    {
+      "name": "load-baseline-after",
+      "block_interval_ms": 500,
+      "blocks": null,
+      "duration_seconds": 300,
+      "readers": [],
+      "load": null,
+      "replacements": [],
+      "index_attach": null,
+      "density_multiplier": 1.0,
+      "compact_all_at_end": false,
+      "baseline_phase": "load-baseline-no-readers",
+      "after_baseline_phase": null
+    }
+  ]
+}

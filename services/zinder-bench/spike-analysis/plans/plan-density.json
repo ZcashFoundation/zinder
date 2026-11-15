@@ -1,0 +1,73 @@
+{
+  "phases": [
+    {
+      "name": "density-no-readers",
+      "block_interval_ms": 500,
+      "blocks": null,
+      "duration_seconds": 1800,
+      "readers": [],
+      "load": null,
+      "replacements": [],
+      "index_attach": null,
+      "density_multiplier": 10.0,
+      "compact_all_at_end": false,
+      "baseline_phase": null,
+      "after_baseline_phase": null
+    },
+    {
+      "name": "density-hold-30m",
+      "block_interval_ms": 500,
+      "blocks": null,
+      "duration_seconds": 1860,
+      "readers": [
+        {
+          "kind": "compact-range",
+          "count": 8,
+          "hold_seconds": 1800.0,
+          "range_blocks": 10000,
+          "chunk_blocks": 100,
+          "held_iterator": true,
+          "snapshot": true,
+          "paced_interval_ms": 250
+        },
+        {
+          "kind": "wallet-family",
+          "count": 1,
+          "hold_seconds": 1800.0,
+          "family": "transparent_unspent_output",
+          "snapshot": true,
+          "paced_interval_ms": 250
+        },
+        {
+          "kind": "wallet-family",
+          "count": 1,
+          "hold_seconds": 1800.0,
+          "family": "transparent_address_transaction",
+          "snapshot": true,
+          "paced_interval_ms": 250
+        }
+      ],
+      "load": null,
+      "replacements": [],
+      "index_attach": null,
+      "density_multiplier": 10.0,
+      "compact_all_at_end": false,
+      "baseline_phase": "density-no-readers",
+      "after_baseline_phase": "density-post-release"
+    },
+    {
+      "name": "density-post-release",
+      "block_interval_ms": 500,
+      "blocks": null,
+      "duration_seconds": 900,
+      "readers": [],
+      "load": null,
+      "replacements": [],
+      "index_attach": null,
+      "density_multiplier": 10.0,
+      "compact_all_at_end": true,
+      "baseline_phase": "density-no-readers",
+      "after_baseline_phase": null
+    }
+  ]
+}

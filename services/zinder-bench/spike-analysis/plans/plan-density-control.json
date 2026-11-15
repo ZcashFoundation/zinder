@@ -1,0 +1,46 @@
+{
+ "phases": [
+  {
+   "name": "density-no-readers",
+   "block_interval_ms": 500,
+   "blocks": null,
+   "duration_seconds": 1800,
+   "readers": [],
+   "load": null,
+   "replacements": [],
+   "index_attach": null,
+   "density_multiplier": 10.0,
+   "compact_all_at_end": false,
+   "baseline_phase": null,
+   "after_baseline_phase": null
+  },
+  {
+   "name": "density-control-30m",
+   "block_interval_ms": 500,
+   "blocks": null,
+   "duration_seconds": 1860,
+   "readers": [],
+   "load": null,
+   "replacements": [],
+   "index_attach": null,
+   "density_multiplier": 10.0,
+   "compact_all_at_end": false,
+   "baseline_phase": "density-no-readers",
+   "after_baseline_phase": "density-post-release"
+  },
+  {
+   "name": "density-post-release",
+   "block_interval_ms": 500,
+   "blocks": null,
+   "duration_seconds": 900,
+   "readers": [],
+   "load": null,
+   "replacements": [],
+   "index_attach": null,
+   "density_multiplier": 10.0,
+   "compact_all_at_end": true,
+   "baseline_phase": "density-no-readers",
+   "after_baseline_phase": null
+  }
+ ]
+}
