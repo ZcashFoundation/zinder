@@ -1,10 +1,12 @@
 # Explorer Plane
 
-The explorer plane is implemented by the optional `zinder-explorer` workspace
-service. The service compiles and is tested with the workspace, but the release
-workflow does not build or publish an explorer image. Operators that need the
-native `ExplorerQuery` surface can build its local image through the optional
-Compose overlay.
+The explorer plane is implemented by the optional `zinder-explorer` runtime.
+Each release publishes it as the `zinder-explorer` image, which hosts that
+share a volume across containers run through the optional Compose overlay.
+Hosts that attach one volume to one container run the
+`zinder-wallet-serving-explorer` image, which supervises the Explorer beside
+wallet serving
+([Wallet-serving deployment](../runbooks/deploying-wallet-serving.md#serving-the-explorer-from-the-same-volume)).
 
 The explorer plane is the Zinder product surface for block explorers, dashboards, and analytics consumers. It serves UI-ready, API-ready, and agent-ready views over canonical chain artifacts and replayable event streams, with explicit freshness, typed unavailability, and capability-gated panels. It is owned by `zinder-explorer`.
 

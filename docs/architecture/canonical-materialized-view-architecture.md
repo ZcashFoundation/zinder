@@ -37,10 +37,10 @@ The release composition has four runtimes:
 
 `zinder-query` serves the native `zinder.v1.wallet.WalletQuery` protocol.
 `zinder-compat-lightwalletd` independently translates the compatibility
-protocol; neither replaces the other. `zinder-explorer` is available through
-the checked-in optional Compose overlay and local image target, while
-`zinder-compat-cipherscan` remains a workspace service. Neither is part of the
-published four-image release catalog.
+protocol; neither replaces the other. `zinder-explorer` is an optional
+runtime. Its release image runs through the checked-in Compose overlay, and the
+`zinder-wallet-serving-explorer` single-volume image runs it beside wallet
+serving. `zinder-compat-cipherscan` remains an unpublished workspace service.
 
 ## Canonical storage
 
@@ -166,9 +166,10 @@ The deployed `zinder-explorer` runtime reads materialized views through a
 process-owned secondary and federates wallet-owned facts through `WalletQuery`;
 it does not open the canonical store. It therefore never advertises a
 capability that requires retained canonical artifacts. The explorer schema must
-not duplicate wallet ownership. The optional Compose overlay provides the
-materialized-view plus wallet composition for Zexplorer without adding the
-explorer to the published four-image release catalog.
+not duplicate wallet ownership. The optional Compose overlay and the
+`zinder-wallet-serving-explorer` image provide the materialized-view plus
+wallet composition for Zexplorer without adding the explorer to the certified
+four-runtime topology.
 
 See [Materialized-view plane](materialized-view-plane.md) and
 [Explorer plane](explorer-plane.md) for those contracts.

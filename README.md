@@ -44,11 +44,12 @@ compatibility protocols over immutable exact-fence pairs. A separate
 [single-volume container target](docs/runbooks/deploying-wallet-serving.md)
 runs ingest, projector, and native query as supervised processes when a host
 can attach one volume to only one container; that image omits
-`zinder-compat-lightwalletd` and is published beside the four runtime images. Explorer
-images are also outside the release catalog.
+`zinder-compat-lightwalletd` and is published beside the runtime images. A
+variant of it also runs `zinder-explorer`, and the Explorer has its own runtime
+image for hosts that share a volume across containers.
 
 Tagged releases also provide checksum-bound GNU/Linux bundles containing these
-same 4 executables for `x86_64-v3` and AArch64 hosts. The x86 archive
+same 4 executables plus `zinder-explorer` for `x86_64-v3` and AArch64 hosts. The x86 archive
 requires an x86-64-v3 CPU; both archives require glibc 2.34 or newer and
 dynamic `libstdc++.so.6` with `GLIBCXX_3.4.30`, with Debian 12 Bookworm as the
 certified runtime baseline. Each archive is accompanied by an SPDX 2.3 SBOM
@@ -142,7 +143,7 @@ how canonical indexing, projection selection, and API serving fit together.
 - **Canonical storage** (`zinder-store`). RocksDB-backed `RocksDbCanonicalStore` and `RocksDbCanonicalSecondary` roles expose domain-shaped canonical operations. RocksDB types remain private, and readers bind to one `ChainEpoch` or `CanonicalEventFence` before reading. See [storage backend](docs/architecture/storage-backend.md) and [ADR-0003](docs/adrs/0003-canonical-storage-access-boundary.md).
 - **Wallet projection and query plane** (`zinder-projector`, `zinder-query`, `zinder-wallet-*`). The projector is the sole wallet-store writer. It constructs and continuously follows the current wallet-store format at authenticated canonical event fences; the query runtime serves the native WalletQuery protocol from process-owned secondary generations. See [wallet data plane](docs/architecture/wallet-data-plane.md).
 - **Compatibility plane** (`zinder-compat-lightwalletd`, optional `zinder-compat-cipherscan`). Protocol-edge adapters preserve consumer contracts without shaping Zinder's native APIs around a product. The lightwalletd adapter translates `CompactTxStreamer` onto `WalletQueryApi` through `WalletServingQuery`; the Cipherscan adapter translates REST and WebSocket contracts onto `ExplorerQuery` and `WalletQuery`. Neither owns canonical writes or parallel artifact construction. See [protocol boundary](docs/architecture/protocol-boundary.md) and the [Cipherscan adapter README](services/zinder-compat-cipherscan/README.md).
-- **Explorer plane** (`zinder-explorer`, optional). Serves block summaries, transaction details, typed search, mempool dashboards, and other explorer-shaped reads through `ExplorerQuery`. It opens, reads, and serves materialized views as a secondary. `zinder-materialized-views` owns the reusable store and consumers; no release runtime writes them unless a replay host is composed separately. See [explorer plane](docs/architecture/explorer-plane.md) and [materialized-view plane](docs/architecture/materialized-view-plane.md).
+- **Explorer plane** (`zinder-explorer`, optional). Serves block summaries, transaction details, typed search, mempool dashboards, and other explorer-shaped reads through `ExplorerQuery`. It opens, reads, and serves materialized views as a secondary. `zinder-materialized-views` owns the reusable store and consumers. `zinder-ingest` writes them only when `[ingest].explorer_views` is true, as in the Explorer Compose overlay and the `zinder-wallet-serving-explorer` image. See [explorer plane](docs/architecture/explorer-plane.md) and [materialized-view plane](docs/architecture/materialized-view-plane.md).
 
 Two foundation crates are shared across every plane: `zinder-core` (chain vocabulary: `ChainEpoch`, `BlockArtifact`, `Network`) and `zinder-proto` (`.proto` files and checked-in generated wire modules, including the pinned vendored lightwalletd schemas). The public Rust SDK adds the remote-first `zinder-client`; all three packages are prepared as one lockstep crates.io set, inherit the workspace Rust 1.95 MSRV, and do not require `protoc` in a consumer build. Every binary also exposes an operational HTTP surface (`/healthz`, `/readyz`, `/metrics`) with typed readiness causes; that contract is owned by `zinder-runtime`. See [service operations](docs/architecture/service-operations.md).
 
@@ -171,9 +172,9 @@ The release workflow builds these deployable services:
 The `zinder-query` crate also owns the internal `WalletQueryApi`,
 `WalletServingQuery`, request types, shared exact-fence serving-pair publisher,
 and native adapter.
-`zinder-explorer` and
-`zinder-compat-cipherscan` compile as optional services but are not release
-images.
+`zinder-explorer` is an optional runtime with its own release image.
+`zinder-compat-cipherscan` compiles as an optional service but is not a release
+image.
 
 ## Validation Gate
 

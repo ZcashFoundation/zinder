@@ -23,9 +23,10 @@ under the canonical path. The writer handle never serves these reads, so the
 canonical writer's cross-block read counters stay at zero.
 
 `zinder-explorer` reads those views as a RocksDB secondary. It is not part of
-the release composition: the checked release topology does not start it or
-expose its native query service. An operator who wants the explorer query
-surface runs it separately against the same storage path.
+the certified four-runtime topology, which does not start it or expose its
+native query service. An operator who wants the explorer query surface runs it
+against the same storage path, through the Compose overlay or the
+`zinder-wallet-serving-explorer` single-volume image.
 
 ## Runtime selection
 
@@ -47,7 +48,8 @@ projection and wallet-serving readiness remain owned by `zinder-projector`,
 When the field is true, the request is printed by `--print-config` and the
 admitted state is emitted in bounded ingest startup evidence. Wallet-serving
 deployment files set `explorer_views = false`; the Explorer Compose overlay
-sets `ZINDER_INGEST__EXPLORER_VIEWS=true`.
+sets `ZINDER_INGEST__EXPLORER_VIEWS=true`, and the
+`zinder-wallet-serving-explorer` image bakes `explorer_views = true`.
 
 An enabled store is admitted only after its persisted manifest matches this
 release's bundled consumer set exactly. `MaterializedViewStore::open_explorer_views`
