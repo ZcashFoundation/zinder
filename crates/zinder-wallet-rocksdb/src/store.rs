@@ -1590,7 +1590,7 @@ pub(crate) fn wallet_column_family_descriptors(
 /// `RocksDB` options for every wallet data family, all charged to one block cache.
 ///
 /// Every open path and the bulk-build SST writer take a family's options from
-/// here, so a family's filter cannot differ between rebuilt and followed files.
+/// here, so files written by a rebuild and by following carry the same filter.
 pub(crate) struct WalletColumnFamilyOptions {
     point_lookup: Options,
     unfiltered: Options,

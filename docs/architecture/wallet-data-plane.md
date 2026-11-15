@@ -916,8 +916,8 @@ The wallet projection's four hash-keyed families,
 `transparent_unspent_output_by_address`, and
 `transparent_address_transaction`, carry partitioned whole-key filters with
 about a 1% false-positive rate. A point read of a key that is not there
-usually returns after one filter probe, without reading an index or data
-block. Many projector reads are of this kind: each transition proves that
+usually returns after probing the filters of the files that could hold it,
+without reading an index or data block. Many projector reads are of this kind: each transition proves that
 every output, spend, address-index row, and history row it creates is new. A
 `TransparentOutpointSpendStatus` lookup of a spent or unknown outpoint misses
 `transparent_unspent_output` first. `transparent_address_balance` and
