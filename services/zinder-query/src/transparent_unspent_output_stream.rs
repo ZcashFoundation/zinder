@@ -352,6 +352,7 @@ mod tests {
     }
 
     /// Revocation releases the pair even though the caller is not reading.
+    ///
     /// The caller then receives the outputs already buffered and the epoch
     /// failure, never a stream that looks complete.
     #[tokio::test(flavor = "multi_thread")]

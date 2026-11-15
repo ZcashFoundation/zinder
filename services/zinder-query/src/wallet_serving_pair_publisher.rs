@@ -2629,9 +2629,11 @@ mod tests {
     }
 
     /// Unspent-output reads that clients abandon or stop consuming never stop
-    /// publication. An abandoned read releases its pair at once. A read whose
-    /// client stops consuming keeps its pair only until the publisher revokes
-    /// reads on it, and then ends with its epoch unavailable.
+    /// publication.
+    ///
+    /// An abandoned read releases its pair at once. A read whose client stops
+    /// consuming keeps its pair only until the publisher revokes reads on it,
+    /// and then ends with its epoch unavailable.
     #[tokio::test(flavor = "multi_thread")]
     #[expect(
         clippy::too_many_lines,
