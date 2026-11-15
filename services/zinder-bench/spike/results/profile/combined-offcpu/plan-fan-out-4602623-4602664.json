@@ -1,0 +1,331 @@
+{
+ "name": "plan-fan-out-4602623-4602664",
+ "phase": "wallet_plan",
+ "blocks": 26,
+ "height_min": 4602623,
+ "height_max": 4602664,
+ "commit_thread_samples": 36008,
+ "commit_thread_phase_pct": {
+  "wallet_plan": 91.19,
+  "write_and_readback": 4.67,
+  "canonical_prepare": 3.34,
+  "other_commit_thread": 0.74,
+  "canonical_put": 0.05,
+  "wallet_adopt": 0.01
+ },
+ "base_samples": 32835,
+ "base_on_cpu_seconds_at_999hz": 32.868,
+ "base_wall_seconds_from_block_samples": 36.23,
+ "partition_pct": {
+  "hashing: BLAKE2 (wallet accumulator, UTXO-set commitment)": 43.51,
+  "RocksDB point reads (get path, incl. value copy)": 31.66,
+  "wallet digest lane folds (u16 add/sub, outside BLAKE2)": 11.99,
+  "memcpy/memmove/memcmp (outside the above)": 4.04,
+  "allocation (malloc/free family)": 3.61,
+  "planner overlay maps (BTreeMap/HashMap)": 2.17,
+  "column-family handle lookup (cf_handle on every read)": 1.01,
+  "planner function self time (raw, load_undo, suffix loop)": 0.83,
+  "undo row decode and key-order validation": 0.7,
+  "RocksDB write batch build": 0.27,
+  "everything else": 0.14,
+  "hashing: SHA-256": 0.07,
+  "kernel (other)": 0.0
+ },
+ "groups_inclusive_pct": {
+  "hash: BLAKE2": 43.51,
+  "wallet: accumulator and digest folds": 48.46,
+  "rocksdb get: all": 31.66,
+  "libc: memcmp (key comparisons)": 8.06,
+  "wallet: overlay map (BTreeMap/HashMap ops)": 3.21,
+  "alloc: malloc/free family": 4.17,
+  "wallet: require_publishable_undo_suffix": 1.0,
+  "wallet: undo suffix, WalletReorgUndo::decode": 0.7,
+  "wallet: load_undo (all callers)": 1.01,
+  "wallet: WalletReorgUndo::decode (all callers)": 0.7,
+  "serialization: zinder codecs, excl. tree roots": 1.15,
+  "libc: memcpy/memmove": 2.19,
+  "hash: SHA-256": 0.07,
+  "rocksdb write batch build (put/delete)": 0.36,
+  "kernel: any": 0.81,
+  "wallet: undo suffix, RocksDB get": 0.2,
+  "libc: memset": 0.02,
+  "kernel: page faults": 0.03,
+  "wallet: advance_settled_tip": 0.02,
+  "libc: still unresolved leaf": 0.01
+ },
+ "rocksdb_get_breakdown_pct_of_base": {
+  "SST: index and data block seek": 14.93,
+  "SST: block cache (LRU lookup/insert/release)": 7.36,
+  "Version/TableCache/GetContext (incl. value save)": 3.85,
+  "memtable lookup": 3.43,
+  "Rust get_cf: copy of the pinned value into a Vec": 1.16,
+  "SST: block read (BlockFetcher, pread)": 0.61,
+  "SST: decompression (Snappy)": 0.26,
+  "SST: block checksum (XXH3)": 0.04,
+  "SST: filter": 0.01
+ },
+ "hash_call_sites_pct_of_base": {
+  "SHA-256": {
+   "zinder_wallet_rocksdb::transition::WalletTransitionPlanner::apply_replay": 0.07
+  },
+  "BLAKE2": {
+   "zinder_wallet_projection::digest::WalletProjectionAccumulator::combine_preimage": 36.12,
+   "zinder_core::utxo_set_commitment::TransparentUtxoSetCommitment::combine_lanes": 7.4
+  }
+ },
+ "crc32c_paths_samples": {},
+ "top_self": [
+  {
+   "frame": "blake2b_simd::avx2::compress1_loop",
+   "samples": 11008,
+   "pct": 33.53
+  },
+  {
+   "frame": "blake2b_simd::Params::hash",
+   "samples": 3253,
+   "pct": 9.91
+  },
+  {
+   "frame": "<u16>::wrapping_add",
+   "samples": 2945,
+   "pct": 8.97
+  },
+  {
+   "frame": "[libc] memcmp (IFUNC impl)",
+   "samples": 2640,
+   "pct": 8.04
+  },
+  {
+   "frame": "[libc] malloc internals",
+   "samples": 891,
+   "pct": 2.71
+  },
+  {
+   "frame": "pthread_mutex_lock",
+   "samples": 828,
+   "pct": 2.52
+  },
+  {
+   "frame": "bool rocksdb::BlockIter<rocksdb::Slice>::BinarySeekRestartPointIndex<rocksdb::DecodeKey>",
+   "samples": 760,
+   "pct": 2.31
+  },
+  {
+   "frame": "pthread_mutex_unlock",
+   "samples": 714,
+   "pct": 2.17
+  },
+  {
+   "frame": "[libc] memcpy/memmove (IFUNC impl)",
+   "samples": 714,
+   "pct": 2.17
+  },
+  {
+   "frame": "rocksdb::InlineSkipList<rocksdb::MemTableRep::KeyComparator const&>::FindGreaterOrEqual",
+   "samples": 656,
+   "pct": 2.0
+  },
+  {
+   "frame": "<u16>::wrapping_sub",
+   "samples": 621,
+   "pct": 1.89
+  },
+  {
+   "frame": "bool rocksdb::BlockIter<rocksdb::IndexValue>::GetRestartKey<rocksdb::DecodeKeyV4>",
+   "samples": 547,
+   "pct": 1.67
+  },
+  {
+   "frame": "alloc::collections::btree::search::<impl alloc::collections::btree::node::NodeRef<BorrowType,K,V,alloc::collections::btree::node::marker::LeafOrInternal>>::search_tree",
+   "samples": 466,
+   "pct": 1.42
+  },
+  {
+   "frame": "rocksdb::BlockBasedTable::Get",
+   "samples": 360,
+   "pct": 1.1
+  },
+  {
+   "frame": "std::enable_if<(rocksdb::Block_kData::kCacheEntryRole==((rocksdb::CacheEntryRole)13))||(true), rocksdb::Status>::type rocksdb::BlockBasedTable::RetrieveBlock<rocksdb::Block_kData>",
+   "samples": 324,
+   "pct": 0.99
+  },
+  {
+   "frame": "rust_rocksdb::db::DBCommon<rust_rocksdb::db::MultiThreaded,I>::cf_handle",
+   "samples": 323,
+   "pct": 0.98
+  },
+  {
+   "frame": "realloc",
+   "samples": 293,
+   "pct": 0.89
+  },
+  {
+   "frame": "rocksdb::IndexBlockIter::SeekImpl",
+   "samples": 285,
+   "pct": 0.87
+  },
+  {
+   "frame": "non-virtual thunk to rocksdb::(anonymous namespace)::BytewiseComparatorImpl::Compare",
+   "samples": 265,
+   "pct": 0.81
+  },
+  {
+   "frame": "rocksdb::DecodeEntry::operator()(char const*, char const*, unsigned int*, unsigned int*, unsigned int*, unsigned int*) [clone .isra.0]",
+   "samples": 256,
+   "pct": 0.78
+  },
+  {
+   "frame": "alloc::collections::btree::map::BTreeMap<K,V,A>::insert",
+   "samples": 226,
+   "pct": 0.69
+  },
+  {
+   "frame": "bool rocksdb::BlockIter<rocksdb::Slice>::ParseNextKey<rocksdb::DecodeEntry, false>",
+   "samples": 214,
+   "pct": 0.65
+  },
+  {
+   "frame": "zinder_wallet_projection::digest::WalletProjectionAccumulator::combine_preimage",
+   "samples": 202,
+   "pct": 0.62
+  },
+  {
+   "frame": "rocksdb::lru_cache::LRUHandleTable::FindPointer",
+   "samples": 190,
+   "pct": 0.58
+  },
+  {
+   "frame": "rocksdb::StatisticsImpl::recordTick",
+   "samples": 163,
+   "pct": 0.5
+  }
+ ],
+ "top_inclusive": [
+  {
+   "frame": "zinder_wallet_rocksdb::spike_combined::<impl zinder_wallet_rocksdb::store::RocksDbWalletStore>::spike_plan_canonical_event_range",
+   "samples": 32835,
+   "pct": 100.0
+  },
+  {
+   "frame": "zinder_wallet_rocksdb::transition::WalletTransitionPlanner::apply_replay_range",
+   "samples": 32255,
+   "pct": 98.23
+  },
+  {
+   "frame": "zinder_wallet_rocksdb::transition::WalletTransitionPlanner::apply_replay",
+   "samples": 32222,
+   "pct": 98.13
+  },
+  {
+   "frame": "zinder_wallet_rocksdb::transition::WalletTransitionPlanner::insert_unspent",
+   "samples": 23425,
+   "pct": 71.34
+  },
+  {
+   "frame": "blake2b_simd::Params::hash",
+   "samples": 14279,
+   "pct": 43.49
+  },
+  {
+   "frame": "zinder_wallet_rocksdb::transition::WalletTransitionPlanner::insert_row_after_absence_observed",
+   "samples": 13676,
+   "pct": 41.65
+  },
+  {
+   "frame": "zinder_wallet_projection::digest::WalletProjectionDigestBuilder::append_row",
+   "samples": 12790,
+   "pct": 38.95
+  },
+  {
+   "frame": "zinder_wallet_projection::digest::WalletProjectionAccumulator::combine_preimage",
+   "samples": 12064,
+   "pct": 36.74
+  },
+  {
+   "frame": "zinder_wallet_rocksdb::transition::WalletTransitionPlanner::raw",
+   "samples": 11661,
+   "pct": 35.51
+  },
+  {
+   "frame": "blake2b_simd::avx2::compress1_loop",
+   "samples": 11034,
+   "pct": 33.6
+  },
+  {
+   "frame": "rust_rocksdb::db::DBCommon<T,D>::get_cf_opt",
+   "samples": 10394,
+   "pct": 31.66
+  },
+  {
+   "frame": "rocksdb_get_pinned_cf",
+   "samples": 10358,
+   "pct": 31.55
+  },
+  {
+   "frame": "rocksdb::DBImpl::Get",
+   "samples": 10354,
+   "pct": 31.53
+  },
+  {
+   "frame": "rocksdb::DBImpl::GetImpl",
+   "samples": 10317,
+   "pct": 31.42
+  },
+  {
+   "frame": "rocksdb::Version::Get",
+   "samples": 8840,
+   "pct": 26.92
+  },
+  {
+   "frame": "rocksdb::TableCache::Get",
+   "samples": 8422,
+   "pct": 25.65
+  },
+  {
+   "frame": "rocksdb::BlockBasedTable::Get",
+   "samples": 7993,
+   "pct": 24.34
+  },
+  {
+   "frame": "zinder_wallet_rocksdb::transition::WalletTransitionPlanner::replace_balance",
+   "samples": 6831,
+   "pct": 20.8
+  },
+  {
+   "frame": "zinder_wallet_rocksdb::transition::WalletTransitionPlanner::insert_row",
+   "samples": 6590,
+   "pct": 20.07
+  },
+  {
+   "frame": "zinder_wallet_rocksdb::transition::WalletTransitionPlanner::remove_row",
+   "samples": 3445,
+   "pct": 10.49
+  },
+  {
+   "frame": "zinder_wallet_rocksdb::transition::WalletTransitionPlanner::remove_row_after_value_observed",
+   "samples": 3307,
+   "pct": 10.07
+  },
+  {
+   "frame": "zinder_wallet_rocksdb::transition::WalletTransitionPlanner::commit_add_unspent",
+   "samples": 3150,
+   "pct": 9.59
+  },
+  {
+   "frame": "zinder_wallet_projection::digest::WalletProjectionDigestBuilder::remove_row",
+   "samples": 3121,
+   "pct": 9.51
+  },
+  {
+   "frame": "<u16>::wrapping_add",
+   "samples": 2955,
+   "pct": 9.0
+  },
+  {
+   "frame": "rocksdb::DataBlockIter::SeekImpl",
+   "samples": 2949,
+   "pct": 8.98
+  }
+ ]
+}

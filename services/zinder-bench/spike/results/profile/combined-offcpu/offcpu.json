@@ -1,0 +1,266 @@
+{
+ "commit_tid": "38904",
+ "scenarios": [
+  {
+   "name": "plan-near-empty-clean",
+   "blocks": 11060,
+   "planner_wall_seconds_bench_timer": 8.818,
+   "planner_on_cpu_seconds": 7.327,
+   "planner_off_cpu_seconds": 1.383,
+   "accounted_pct_of_bench_timer": 98.8,
+   "off_cpu_switches": 19579,
+   "off_cpu_categories_seconds": {
+    "RocksDB get: SST block read wait (direct-I/O pread)": 1.381,
+    "preempted while runnable (CPU contention)": 0.002,
+    "other blocked": 0.0
+   },
+   "wall_share_pct_of_accounted": {
+    "on-CPU: RocksDB point reads (get path, incl. value copy)": 59.06,
+    "off-CPU: RocksDB get: SST block read wait (direct-I/O pread)": 15.86,
+    "on-CPU: planner function self time (raw, load_undo, suffix loop)": 5.4,
+    "on-CPU: hashing: BLAKE2 (wallet accumulator, UTXO-set commitment)": 5.4,
+    "on-CPU: column-family handle lookup (cf_handle on every read)": 3.3,
+    "on-CPU: undo row decode and key-order validation": 3.16,
+    "on-CPU: allocation (malloc/free family)": 2.46,
+    "on-CPU: memcpy/memmove/memcmp (outside the above)": 2.25,
+    "on-CPU: everything else": 1.42,
+    "on-CPU: wallet digest lane folds (u16 add/sub, outside BLAKE2)": 1.11,
+    "on-CPU: planner overlay maps (BTreeMap/HashMap)": 0.28,
+    "on-CPU: kernel (other)": 0.11,
+    "on-CPU: RocksDB write batch build": 0.08,
+    "on-CPU: hashing: SHA-256": 0.08,
+    "off-CPU: preempted while runnable (CPU contention)": 0.02,
+    "off-CPU: other blocked": 0.0
+   },
+   "planner_parts_wall_pct": {
+    "require_publishable_undo_suffix (undo-suffix walk)": 64.77,
+    "apply_replay / apply_block_rows (this block's rows)": 29.34,
+    "publication and control checks": 4.49,
+    "advance_settled_tip (prune settled undo row)": 1.22,
+    "other planner": 0.18
+   },
+   "rocksdb_reads_wall_pct": 74.91,
+   "hashing_wall_pct": 5.48
+  },
+  {
+   "name": "plan-near-empty-after-dense",
+   "blocks": 4936,
+   "planner_wall_seconds_bench_timer": 24.971,
+   "planner_on_cpu_seconds": 24.487,
+   "planner_off_cpu_seconds": 0.519,
+   "accounted_pct_of_bench_timer": 100.1,
+   "off_cpu_switches": 6664,
+   "off_cpu_categories_seconds": {
+    "RocksDB get: SST block read wait (direct-I/O pread)": 0.51,
+    "preempted while runnable (CPU contention)": 0.008,
+    "other blocked": 0.001,
+    "RocksDB get: other wait": 0.0,
+    "page fault wait": 0.0,
+    "lock wait (futex)": 0.0
+   },
+   "wall_share_pct_of_accounted": {
+    "on-CPU: undo row decode and key-order validation": 59.02,
+    "on-CPU: RocksDB point reads (get path, incl. value copy)": 23.07,
+    "on-CPU: memcpy/memmove/memcmp (outside the above)": 12.08,
+    "off-CPU: RocksDB get: SST block read wait (direct-I/O pread)": 2.04,
+    "on-CPU: hashing: BLAKE2 (wallet accumulator, UTXO-set commitment)": 1.2,
+    "on-CPU: planner function self time (raw, load_undo, suffix loop)": 0.79,
+    "on-CPU: allocation (malloc/free family)": 0.72,
+    "on-CPU: column-family handle lookup (cf_handle on every read)": 0.53,
+    "on-CPU: everything else": 0.31,
+    "on-CPU: wallet digest lane folds (u16 add/sub, outside BLAKE2)": 0.13,
+    "on-CPU: planner overlay maps (BTreeMap/HashMap)": 0.04,
+    "on-CPU: RocksDB write batch build": 0.03,
+    "off-CPU: preempted while runnable (CPU contention)": 0.03,
+    "on-CPU: kernel (other)": 0.01,
+    "on-CPU: hashing: SHA-256": 0.0,
+    "off-CPU: other blocked": 0.0,
+    "off-CPU: RocksDB get: other wait": 0.0,
+    "off-CPU: page fault wait": 0.0,
+    "off-CPU: lock wait (futex)": 0.0
+   },
+   "planner_parts_wall_pct": {
+    "require_publishable_undo_suffix (undo-suffix walk)": 94.3,
+    "apply_replay / apply_block_rows (this block's rows)": 3.74,
+    "publication and control checks": 1.07,
+    "advance_settled_tip (prune settled undo row)": 0.86,
+    "other planner": 0.03
+   },
+   "rocksdb_reads_wall_pct": 25.11,
+   "hashing_wall_pct": 1.2
+  },
+  {
+   "name": "plan-input-heavy",
+   "blocks": 374,
+   "planner_wall_seconds_bench_timer": 135.903,
+   "planner_on_cpu_seconds": 56.258,
+   "planner_off_cpu_seconds": 83.857,
+   "accounted_pct_of_bench_timer": 103.1,
+   "off_cpu_switches": 1167557,
+   "off_cpu_categories_seconds": {
+    "RocksDB get: SST block read wait (direct-I/O pread)": 83.805,
+    "preempted while runnable (CPU contention)": 0.037,
+    "RocksDB get: other wait": 0.011,
+    "page fault wait": 0.003,
+    "other blocked": 0.001,
+    "lock wait (futex)": 0.001
+   },
+   "wall_share_pct_of_accounted": {
+    "off-CPU: RocksDB get: SST block read wait (direct-I/O pread)": 59.81,
+    "on-CPU: RocksDB point reads (get path, incl. value copy)": 18.1,
+    "on-CPU: hashing: BLAKE2 (wallet accumulator, UTXO-set commitment)": 13.73,
+    "on-CPU: wallet digest lane folds (u16 add/sub, outside BLAKE2)": 3.7,
+    "on-CPU: allocation (malloc/free family)": 2.43,
+    "on-CPU: memcpy/memmove/memcmp (outside the above)": 0.97,
+    "on-CPU: planner overlay maps (BTreeMap/HashMap)": 0.34,
+    "on-CPU: column-family handle lookup (cf_handle on every read)": 0.25,
+    "on-CPU: undo row decode and key-order validation": 0.25,
+    "on-CPU: planner function self time (raw, load_undo, suffix loop)": 0.21,
+    "on-CPU: RocksDB write batch build": 0.09,
+    "on-CPU: everything else": 0.06,
+    "off-CPU: preempted while runnable (CPU contention)": 0.03,
+    "on-CPU: hashing: SHA-256": 0.02,
+    "off-CPU: RocksDB get: other wait": 0.01,
+    "off-CPU: page fault wait": 0.0,
+    "off-CPU: other blocked": 0.0,
+    "off-CPU: lock wait (futex)": 0.0
+   },
+   "planner_parts_wall_pct": {
+    "apply_replay / apply_block_rows (this block's rows)": 98.81,
+    "require_publishable_undo_suffix (undo-suffix walk)": 0.94,
+    "publication and control checks": 0.24,
+    "advance_settled_tip (prune settled undo row)": 0.01,
+    "other planner": 0.0
+   },
+   "rocksdb_reads_wall_pct": 77.92,
+   "hashing_wall_pct": 13.75
+  },
+  {
+   "name": "plan-input-heavy-named",
+   "blocks": 4,
+   "planner_wall_seconds_bench_timer": 4.541,
+   "planner_on_cpu_seconds": 1.516,
+   "planner_off_cpu_seconds": 3.009,
+   "accounted_pct_of_bench_timer": 99.6,
+   "off_cpu_switches": 43374,
+   "off_cpu_categories_seconds": {
+    "RocksDB get: SST block read wait (direct-I/O pread)": 3.008,
+    "preempted while runnable (CPU contention)": 0.001
+   },
+   "wall_share_pct_of_accounted": {
+    "off-CPU: RocksDB get: SST block read wait (direct-I/O pread)": 66.48,
+    "on-CPU: RocksDB point reads (get path, incl. value copy)": 14.54,
+    "on-CPU: hashing: BLAKE2 (wallet accumulator, UTXO-set commitment)": 12.32,
+    "on-CPU: wallet digest lane folds (u16 add/sub, outside BLAKE2)": 3.32,
+    "on-CPU: allocation (malloc/free family)": 1.7,
+    "on-CPU: memcpy/memmove/memcmp (outside the above)": 0.69,
+    "on-CPU: column-family handle lookup (cf_handle on every read)": 0.31,
+    "on-CPU: planner overlay maps (BTreeMap/HashMap)": 0.24,
+    "on-CPU: planner function self time (raw, load_undo, suffix loop)": 0.2,
+    "on-CPU: RocksDB write batch build": 0.13,
+    "off-CPU: preempted while runnable (CPU contention)": 0.02,
+    "on-CPU: hashing: SHA-256": 0.02,
+    "on-CPU: everything else": 0.02
+   },
+   "planner_parts_wall_pct": {
+    "apply_replay / apply_block_rows (this block's rows)": 99.62,
+    "require_publishable_undo_suffix (undo-suffix walk)": 0.2,
+    "publication and control checks": 0.18
+   },
+   "rocksdb_reads_wall_pct": 81.02,
+   "hashing_wall_pct": 12.35
+  },
+  {
+   "name": "plan-fan-out",
+   "blocks": 72,
+   "planner_wall_seconds_bench_timer": 87.131,
+   "planner_on_cpu_seconds": 79.118,
+   "planner_off_cpu_seconds": 7.877,
+   "accounted_pct_of_bench_timer": 99.8,
+   "off_cpu_switches": 105779,
+   "off_cpu_categories_seconds": {
+    "RocksDB get: SST block read wait (direct-I/O pread)": 7.85,
+    "preempted while runnable (CPU contention)": 0.025,
+    "other blocked": 0.001,
+    "RocksDB get: other wait": 0.001,
+    "lock wait (futex)": 0.0,
+    "page fault wait": 0.0
+   },
+   "wall_share_pct_of_accounted": {
+    "on-CPU: hashing: BLAKE2 (wallet accumulator, UTXO-set commitment)": 39.17,
+    "on-CPU: RocksDB point reads (get path, incl. value copy)": 29.69,
+    "on-CPU: wallet digest lane folds (u16 add/sub, outside BLAKE2)": 10.61,
+    "off-CPU: RocksDB get: SST block read wait (direct-I/O pread)": 9.02,
+    "on-CPU: memcpy/memmove/memcmp (outside the above)": 3.54,
+    "on-CPU: allocation (malloc/free family)": 3.42,
+    "on-CPU: planner overlay maps (BTreeMap/HashMap)": 1.97,
+    "on-CPU: column-family handle lookup (cf_handle on every read)": 0.9,
+    "on-CPU: planner function self time (raw, load_undo, suffix loop)": 0.72,
+    "on-CPU: undo row decode and key-order validation": 0.45,
+    "on-CPU: RocksDB write batch build": 0.26,
+    "on-CPU: everything else": 0.13,
+    "on-CPU: hashing: SHA-256": 0.07,
+    "off-CPU: preempted while runnable (CPU contention)": 0.03,
+    "on-CPU: kernel (other)": 0.0,
+    "off-CPU: other blocked": 0.0,
+    "off-CPU: RocksDB get: other wait": 0.0,
+    "off-CPU: lock wait (futex)": 0.0,
+    "off-CPU: page fault wait": 0.0
+   },
+   "planner_parts_wall_pct": {
+    "apply_replay / apply_block_rows (this block's rows)": 98.57,
+    "require_publishable_undo_suffix (undo-suffix walk)": 0.73,
+    "publication and control checks": 0.69,
+    "advance_settled_tip (prune settled undo row)": 0.01
+   },
+   "rocksdb_reads_wall_pct": 38.72,
+   "hashing_wall_pct": 39.24
+  },
+  {
+   "name": "plan-fan-out-4602623-4602664",
+   "blocks": 26,
+   "planner_wall_seconds_bench_timer": 36.23,
+   "planner_on_cpu_seconds": 32.868,
+   "planner_off_cpu_seconds": 3.374,
+   "accounted_pct_of_bench_timer": 100.0,
+   "off_cpu_switches": 45277,
+   "off_cpu_categories_seconds": {
+    "RocksDB get: SST block read wait (direct-I/O pread)": 3.362,
+    "preempted while runnable (CPU contention)": 0.011,
+    "other blocked": 0.0,
+    "RocksDB get: other wait": 0.0,
+    "page fault wait": 0.0,
+    "lock wait (futex)": 0.0
+   },
+   "wall_share_pct_of_accounted": {
+    "on-CPU: hashing: BLAKE2 (wallet accumulator, UTXO-set commitment)": 39.46,
+    "on-CPU: RocksDB point reads (get path, incl. value copy)": 28.71,
+    "on-CPU: wallet digest lane folds (u16 add/sub, outside BLAKE2)": 10.87,
+    "off-CPU: RocksDB get: SST block read wait (direct-I/O pread)": 9.28,
+    "on-CPU: memcpy/memmove/memcmp (outside the above)": 3.66,
+    "on-CPU: allocation (malloc/free family)": 3.27,
+    "on-CPU: planner overlay maps (BTreeMap/HashMap)": 1.97,
+    "on-CPU: column-family handle lookup (cf_handle on every read)": 0.91,
+    "on-CPU: planner function self time (raw, load_undo, suffix loop)": 0.75,
+    "on-CPU: undo row decode and key-order validation": 0.63,
+    "on-CPU: RocksDB write batch build": 0.25,
+    "on-CPU: everything else": 0.13,
+    "on-CPU: hashing: SHA-256": 0.06,
+    "off-CPU: preempted while runnable (CPU contention)": 0.03,
+    "on-CPU: kernel (other)": 0.0,
+    "off-CPU: other blocked": 0.0,
+    "off-CPU: RocksDB get: other wait": 0.0,
+    "off-CPU: page fault wait": 0.0,
+    "off-CPU: lock wait (futex)": 0.0
+   },
+   "planner_parts_wall_pct": {
+    "apply_replay / apply_block_rows (this block's rows)": 98.28,
+    "require_publishable_undo_suffix (undo-suffix walk)": 1.02,
+    "publication and control checks": 0.69,
+    "advance_settled_tip (prune settled undo row)": 0.02
+   },
+   "rocksdb_reads_wall_pct": 37.99,
+   "hashing_wall_pct": 39.52
+  }
+ ]
+}

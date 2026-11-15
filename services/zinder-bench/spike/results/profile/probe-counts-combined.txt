@@ -1,0 +1,16 @@
+blocks=990 window=(2434014.122,2434035.006]
+
+# hits per block by event and role
+append_anchor      commit       1980     2.000
+load_undo          commit     991980  1002.000
+undo_decode        commit     991980  1002.000
+undo_suffix        commit        990     1.000
+
+# hits per block by calling path (innermost four frames)
+append_anchor      commit     1.000  
+append_anchor      commit     1.000  store::live_commit::PreparedLiveAppendCommit::new
+load_undo          commit  1000.000  zinder_wallet_rocksdb::spike_combined::spike_plan_canonical_event_range > wallet::WalletTransitionPlanner::require_publishable_undo_suffix
+load_undo          commit     2.000  zinder_wallet_rocksdb::spike_combined::spike_plan_canonical_event_range > wallet::WalletTransitionPlanner::advance_settled_tip
+undo_decode        commit  1000.000  zinder_wallet_rocksdb::spike_combined::spike_plan_canonical_event_range > wallet::WalletTransitionPlanner::require_publishable_undo_suffix > wallet::WalletTransitionPlanner::load_undo
+undo_decode        commit     2.000  zinder_wallet_rocksdb::spike_combined::spike_plan_canonical_event_range > wallet::WalletTransitionPlanner::advance_settled_tip > wallet::WalletTransitionPlanner::load_undo
+undo_suffix        commit     1.000  zinder_wallet_rocksdb::spike_combined::spike_plan_canonical_event_range

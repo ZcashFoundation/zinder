@@ -1,0 +1,60 @@
+blocks=990 window=(2433816.851,2433834.939]
+
+# hits per block by event and role
+append_anchor      commit       1980     2.000
+orchard_combine    commit     275262   278.042
+orchard_combine    derive     148053   149.548
+pedersen_hash      commit     126720   128.000
+pedersen_hash      derive      63168    63.806
+root_0             commit       4571     4.617
+root_0             derive       4556     4.602
+root_3             commit       1980     2.000
+root_4             commit       1980     2.000
+root_4             derive       1974     1.994
+root_7             commit       3960     4.000
+seed_pool          commit       1980     2.000
+seed_pool          derive       1974     1.994
+snapshot_pool      commit       1980     2.000
+snapshot_pool      derive       1974     1.994
+validate_1         commit       2970     3.000
+validate_1         derive       2961     2.991
+validate_2         commit       5940     6.000
+
+# hits per block by calling path (innermost four frames)
+append_anchor      commit     1.000  
+append_anchor      commit     1.000  store::live_commit::PreparedLiveAppendCommit::new
+orchard_combine    commit   128.000  store::block_load::codec::decode_tree_state_checkpoint > store::block_load::codec::decode_frontier > codec::CommitmentTreeFrontier::from_canonical_final_state > Frontier<H,_>::root
+orchard_combine    commit    64.000  store::live_commit::PreparedLiveAppendCommit::new > codec::CommitmentTreeAccumulator::from_validated_frontiers > codec::seed_pool > Frontier<H,_>::root
+orchard_combine    commit    64.000  codec::CommitmentTreeAccumulator::validated_frontiers > codec::snapshot_pool > codec::CommitmentTreeFrontier::from_canonical_final_state > Frontier<H,_>::root
+orchard_combine    derive    63.806  zinder_ingest::writer::follow::spike_derive_live_block > codec::CommitmentTreeAccumulator::from_validated_frontiers > codec::seed_pool > Frontier<H,_>::root
+orchard_combine    derive    63.806  codec::CommitmentTreeAccumulator::validated_frontiers > codec::snapshot_pool > codec::CommitmentTreeFrontier::from_canonical_final_state > Frontier<H,_>::root
+orchard_combine    commit    19.749  store::live_commit::PreparedLiveAppendCommit::new > codec::CommitmentTreeAccumulator::validated_frontiers > codec::snapshot_pool > Frontier<H,_>::root
+orchard_combine    derive    19.653  zinder_ingest::writer::follow::spike_derive_live_block > codec::CommitmentTreeAccumulator::validated_frontiers > codec::snapshot_pool > Frontier<H,_>::root
+orchard_combine    commit     2.293  store::live_commit::PreparedLiveAppendCommit::new > codec::CommitmentTreeAccumulator::append_block_commitments > codec::apply_pool_update > Frontier<H,_>::append
+orchard_combine    derive     2.284  zinder_ingest::writer::follow::spike_derive_live_block > codec::CommitmentTreeAccumulator::append_block_commitments > codec::apply_pool_update > Frontier<H,_>::append
+pedersen_hash      commit    64.000  store::block_load::codec::decode_tree_state_checkpoint > store::block_load::codec::decode_frontier > codec::CommitmentTreeFrontier::from_canonical_final_state > Frontier<H,_>::root
+pedersen_hash      commit    32.000  store::live_commit::PreparedLiveAppendCommit::new > codec::CommitmentTreeAccumulator::from_validated_frontiers > Frontier<H,_>::root
+pedersen_hash      commit    32.000  store::live_commit::PreparedLiveAppendCommit::new > codec::CommitmentTreeAccumulator::validated_frontiers > codec::CommitmentTreeFrontier::from_canonical_final_state > Frontier<H,_>::root
+pedersen_hash      derive    31.903  zinder_ingest::writer::follow::spike_derive_live_block > codec::CommitmentTreeAccumulator::from_validated_frontiers > Frontier<H,_>::root
+pedersen_hash      derive    31.903  zinder_ingest::writer::follow::spike_derive_live_block > codec::CommitmentTreeAccumulator::validated_frontiers > codec::CommitmentTreeFrontier::from_canonical_final_state > Frontier<H,_>::root
+root_0             commit     2.000  store::live_commit::PreparedLiveAppendCommit::new > codec::CommitmentTreeAccumulator::from_validated_frontiers > codec::seed_pool
+root_0             commit     2.000  store::live_commit::PreparedLiveAppendCommit::new > codec::CommitmentTreeAccumulator::validated_frontiers > codec::snapshot_pool > codec::CommitmentTreeFrontier::from_canonical_final_state
+root_0             derive     1.994  zinder_ingest::writer::follow::spike_derive_live_block > codec::CommitmentTreeAccumulator::from_validated_frontiers > codec::seed_pool
+root_0             derive     1.994  zinder_ingest::writer::follow::spike_derive_live_block > codec::CommitmentTreeAccumulator::validated_frontiers > codec::snapshot_pool > codec::CommitmentTreeFrontier::from_canonical_final_state
+root_0             commit     0.617  store::live_commit::PreparedLiveAppendCommit::new > codec::CommitmentTreeAccumulator::validated_frontiers > codec::snapshot_pool
+root_0             derive     0.614  zinder_ingest::writer::follow::spike_derive_live_block > codec::CommitmentTreeAccumulator::validated_frontiers > codec::snapshot_pool
+root_3             commit     2.000  store::block_load::read_persisted_tip_checkpoint > store::block_load::codec::decode_tree_state_checkpoint > store::block_load::codec::decode_frontier > codec::CommitmentTreeFrontier::from_canonical_final_state
+root_4             commit     1.000  store::live_commit::PreparedLiveAppendCommit::new > codec::CommitmentTreeAccumulator::from_validated_frontiers
+root_4             commit     1.000  store::live_commit::PreparedLiveAppendCommit::new > codec::CommitmentTreeAccumulator::validated_frontiers > codec::CommitmentTreeFrontier::from_canonical_final_state
+root_4             derive     0.997  zinder_ingest::writer::follow::spike_derive_live_block > codec::CommitmentTreeAccumulator::from_validated_frontiers
+root_4             derive     0.997  zinder_ingest::writer::follow::spike_derive_live_block > codec::CommitmentTreeAccumulator::validated_frontiers > codec::CommitmentTreeFrontier::from_canonical_final_state
+root_7             commit     4.000  store::block_load::read_persisted_tip_checkpoint > store::block_load::codec::decode_tree_state_checkpoint > store::block_load::codec::decode_frontier > codec::CommitmentTreeFrontier::from_canonical_final_state
+seed_pool          commit     2.000  store::live_commit::PreparedLiveAppendCommit::new > codec::CommitmentTreeAccumulator::from_validated_frontiers
+seed_pool          derive     1.994  zinder_ingest::writer::follow::spike_derive_live_block > codec::CommitmentTreeAccumulator::from_validated_frontiers
+snapshot_pool      commit     2.000  store::live_commit::PreparedLiveAppendCommit::new > codec::CommitmentTreeAccumulator::validated_frontiers
+snapshot_pool      derive     1.994  zinder_ingest::writer::follow::spike_derive_live_block > codec::CommitmentTreeAccumulator::validated_frontiers
+validate_1         commit     2.000  store::live_commit::PreparedLiveAppendCommit::new > codec::CommitmentTreeAccumulator::validated_frontiers > codec::snapshot_pool
+validate_1         derive     1.994  zinder_ingest::writer::follow::spike_derive_live_block > codec::CommitmentTreeAccumulator::validated_frontiers > codec::snapshot_pool
+validate_1         commit     1.000  store::live_commit::PreparedLiveAppendCommit::new > codec::CommitmentTreeAccumulator::validated_frontiers
+validate_1         derive     0.997  zinder_ingest::writer::follow::spike_derive_live_block > codec::CommitmentTreeAccumulator::validated_frontiers
+validate_2         commit     6.000  store::live_commit::append_anchor > store::block_load::read_persisted_tip_checkpoint > store::block_load::codec::decode_tree_state_checkpoint > store::block_load::codec::decode_frontier

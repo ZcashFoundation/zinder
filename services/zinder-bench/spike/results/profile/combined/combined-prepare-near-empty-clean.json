@@ -1,0 +1,330 @@
+{
+ "name": "combined-prepare-near-empty-clean",
+ "phase": "canonical_prepare",
+ "blocks": 11838,
+ "height_min": 4600011,
+ "height_max": 4620122,
+ "commit_thread_samples": 215601,
+ "commit_thread_phase_pct": {
+  "canonical_prepare": 95.79,
+  "wallet_plan": 3.54,
+  "write_and_readback": 0.44,
+  "other_commit_thread": 0.1,
+  "wallet_adopt": 0.06,
+  "samples_and_log": 0.05,
+  "canonical_put": 0.02
+ },
+ "base_samples": 206520,
+ "base_on_cpu_seconds_at_999hz": 206.727,
+ "base_wall_seconds_from_block_samples": 206.224,
+ "partition_pct": {
+  "hashing: commitment-tree roots and appends": 99.56,
+  "allocation (malloc/free family)": 0.27,
+  "everything else": 0.11,
+  "RocksDB point reads (get path, incl. value copy)": 0.04,
+  "memcpy/memmove/memcmp (outside the above)": 0.01,
+  "hashing: SHA-256": 0.01,
+  "column-family handle lookup (cf_handle on every read)": 0.0,
+  "kernel (other)": 0.0
+ },
+ "groups_inclusive_pct": {
+  "tree: Frontier::root, all pools": 99.33,
+  "tree: Frontier::root, Orchard-type pools (Orchard, Ironwood)": 81.61,
+  "tree: Sinsemilla hashing (MerkleHashOrchard::combine)": 81.84,
+  "tree: validate_frontier, incl. its root": 71.76,
+  "tree: via validated_frontiers (snapshot)": 27.62,
+  "tree: via append_anchor (tip checkpoint decode)": 48.01,
+  "tree: via from_validated_frontiers (seed)": 23.7,
+  "tree: Frontier::root, Sapling": 17.72,
+  "tree: Pedersen hashing (sapling_crypto::pedersen_hash)": 13.51,
+  "alloc: malloc/free family": 1.49,
+  "tree: Frontier::append (new commitments)": 0.23,
+  "serialization: zinder codecs, excl. tree roots": 0.23,
+  "canonical replay record: decode": 0.06,
+  "tree: validate_frontier, excl. root": 0.12,
+  "kernel: any": 0.37,
+  "hash: SHA-256": 0.01,
+  "libc: memcpy/memmove": 0.02,
+  "libc: memcmp (key comparisons)": 0.01,
+  "serialization: prost": 0.03,
+  "rocksdb get: all": 0.04,
+  "compact block: decode": 0.02,
+  "compact block: build and encode": 0.0,
+  "canonical replay record: encode": 0.01
+ },
+ "rocksdb_get_breakdown_pct_of_base": {
+  "Rust get_cf: copy of the pinned value into a Vec": 0.01,
+  "memtable lookup": 0.01,
+  "Version/TableCache/GetContext (incl. value save)": 0.0,
+  "SST: index and data block seek": 0.0,
+  "SST: block read (BlockFetcher, pread)": 0.0,
+  "SST: block cache (LRU lookup/insert/release)": 0.0,
+  "SST: decompression (Snappy)": 0.0,
+  "SST: filter": 0.0
+ },
+ "hash_call_sites_pct_of_base": {
+  "SHA-256": {
+   "zinder_store::canonical_store::block_load::validate_transaction_blobs": 0.0,
+   "zinder_store::canonical_store::live_commit::advance_visible_sequence": 0.0,
+   "zinder_core::canonical_block_facts::CanonicalBlockFacts::digest": 0.0,
+   "zinder_store::canonical_store::block_load::validate_block": 0.0,
+   "zinder_core::canonical_block_facts::CanonicalBlockFactsSequenceDigestBuilder::try_append": 0.0
+  },
+  "BLAKE2": {}
+ },
+ "crc32c_paths_samples": {},
+ "top_self": [
+  {
+   "frame": "<pasta_curves::curves::Ep as subtle::ConstantTimeEq>::ct_eq",
+   "samples": 54425,
+   "pct": 26.35
+  },
+  {
+   "frame": "subtle::black_box",
+   "samples": 36916,
+   "pct": 17.88
+  },
+  {
+   "frame": "<&pasta_curves::curves::Ep as core::ops::arith::Add>::add",
+   "samples": 29749,
+   "pct": 14.4
+  },
+  {
+   "frame": "<&pasta_curves::curves::Ep as core::ops::arith::Add<&pasta_curves::curves::EpAffine>>::add",
+   "samples": 24096,
+   "pct": 11.67
+  },
+  {
+   "frame": "bls12_381::scalar::Scalar::mul",
+   "samples": 20465,
+   "pct": 9.91
+  },
+  {
+   "frame": "bls12_381::scalar::Scalar::square",
+   "samples": 5544,
+   "pct": 2.68
+  },
+  {
+   "frame": "sapling_crypto::pedersen_hash::pedersen_hash",
+   "samples": 5266,
+   "pct": 2.55
+  },
+  {
+   "frame": "<pasta_curves::curves::EpAffine as pasta_curves::arithmetic::curves::CurveAffine>::is_on_curve",
+   "samples": 5089,
+   "pct": 2.46
+  },
+  {
+   "frame": "pasta_curves::fields::fp::Fp::from_raw",
+   "samples": 3893,
+   "pct": 1.89
+  },
+  {
+   "frame": "<sinsemilla::Pad<I> as core::iter::traits::iterator::Iterator>::next",
+   "samples": 2350,
+   "pct": 1.14
+  },
+  {
+   "frame": "<pasta_curves::inversion::portable::Backend as pasta_curves::inversion::InvertBlocks>::divstep59",
+   "samples": 2248,
+   "pct": 1.09
+  },
+  {
+   "frame": "<&jubjub::ExtendedPoint as core::ops::arith::Add<&jubjub::ExtendedNielsPoint>>::add",
+   "samples": 2237,
+   "pct": 1.08
+  },
+  {
+   "frame": "<pasta_curves::curves::Ep as subtle::ConditionallySelectable>::conditional_select",
+   "samples": 1955,
+   "pct": 0.95
+  },
+  {
+   "frame": "realloc",
+   "samples": 1900,
+   "pct": 0.92
+  },
+  {
+   "frame": "bls12_381::scalar::Scalar::invert",
+   "samples": 1369,
+   "pct": 0.66
+  },
+  {
+   "frame": "<sinsemilla::addition::IncompletePoint as core::ops::arith::Add<pasta_curves::curves::EpAffine>>::add",
+   "samples": 1346,
+   "pct": 0.65
+  },
+  {
+   "frame": "<orchard::tree::MerkleHashOrchard as incrementalmerkletree::Hashable>::combine",
+   "samples": 1251,
+   "pct": 0.61
+  },
+  {
+   "frame": "<sinsemilla::addition::IncompletePoint as core::ops::arith::Add>::add",
+   "samples": 1037,
+   "pct": 0.5
+  },
+  {
+   "frame": "[libc] malloc internals",
+   "samples": 1014,
+   "pct": 0.49
+  },
+  {
+   "frame": "jubjub::ExtendedPoint::to_niels",
+   "samples": 852,
+   "pct": 0.41
+  },
+  {
+   "frame": "<pasta_curves::curves::EpAffine as group::CurveAffine>::to_curve",
+   "samples": 626,
+   "pct": 0.3
+  },
+  {
+   "frame": "<alloc::vec::Vec<T> as alloc::vec::spec_from_iter::SpecFromIter<T,I>>::from_iter",
+   "samples": 545,
+   "pct": 0.26
+  },
+  {
+   "frame": "<pasta_curves::fields::fp::Fp as ff::Field>::invert",
+   "samples": 519,
+   "pct": 0.25
+  },
+  {
+   "frame": "sapling_crypto::tree::merkle_hash_field",
+   "samples": 349,
+   "pct": 0.17
+  },
+  {
+   "frame": "<pasta_curves::curves::Ep as group::Curve>::to_affine",
+   "samples": 129,
+   "pct": 0.06
+  }
+ ],
+ "top_inclusive": [
+  {
+   "frame": "incrementalmerkletree::frontier::Frontier<H,_>::root",
+   "samples": 205141,
+   "pct": 99.33
+  },
+  {
+   "frame": "<orchard::tree::MerkleHashOrchard as incrementalmerkletree::Hashable>::combine",
+   "samples": 169016,
+   "pct": 81.84
+  },
+  {
+   "frame": "zinder_store::canonical_store::live_commit::PreparedLiveAppendCommit::new",
+   "samples": 156408,
+   "pct": 75.74
+  },
+  {
+   "frame": "zinder_core::commitment_tree_codec::CommitmentTreeFrontier::from_canonical_final_state",
+   "samples": 148201,
+   "pct": 71.76
+  },
+  {
+   "frame": "zinder_store::canonical_store::live_commit::<impl zinder_store::canonical_store::rocksdb::RocksDbCanonicalStore>::append_anchor",
+   "samples": 99428,
+   "pct": 48.14
+  },
+  {
+   "frame": "zinder_store::canonical_store::block_load::read_persisted_tip_checkpoint",
+   "samples": 99346,
+   "pct": 48.1
+  },
+  {
+   "frame": "zinder_store::canonical_store::block_load::codec::decode_frontier",
+   "samples": 99333,
+   "pct": 48.1
+  },
+  {
+   "frame": "zinder_store::canonical_store::block_load::codec::decode_tree_state_checkpoint",
+   "samples": 99332,
+   "pct": 48.1
+  },
+  {
+   "frame": "<sinsemilla::addition::IncompletePoint as core::ops::arith::Add>::add",
+   "samples": 75427,
+   "pct": 36.52
+  },
+  {
+   "frame": "<sinsemilla::addition::IncompletePoint as core::ops::arith::Add<pasta_curves::curves::EpAffine>>::add",
+   "samples": 71417,
+   "pct": 34.58
+  },
+  {
+   "frame": "<pasta_curves::curves::Ep as subtle::ConstantTimeEq>::ct_eq",
+   "samples": 64222,
+   "pct": 31.1
+  },
+  {
+   "frame": "zinder_core::commitment_tree_codec::CommitmentTreeAccumulator::validated_frontiers",
+   "samples": 57151,
+   "pct": 27.67
+  },
+  {
+   "frame": "zinder_core::commitment_tree_codec::CommitmentTreeAccumulator::from_validated_frontiers",
+   "samples": 49028,
+   "pct": 23.74
+  },
+  {
+   "frame": "zinder_core::commitment_tree_codec::snapshot_pool",
+   "samples": 48111,
+   "pct": 23.3
+  },
+  {
+   "frame": "zinder_core::commitment_tree_codec::seed_pool",
+   "samples": 40001,
+   "pct": 19.37
+  },
+  {
+   "frame": "subtle::black_box",
+   "samples": 37059,
+   "pct": 17.94
+  },
+  {
+   "frame": "sapling_crypto::tree::merkle_hash_field",
+   "samples": 36319,
+   "pct": 17.59
+  },
+  {
+   "frame": "<&pasta_curves::curves::Ep as core::ops::arith::Add>::add",
+   "samples": 31447,
+   "pct": 15.23
+  },
+  {
+   "frame": "sapling_crypto::pedersen_hash::pedersen_hash",
+   "samples": 27905,
+   "pct": 13.51
+  },
+  {
+   "frame": "<&pasta_curves::curves::Ep as core::ops::arith::Add<&pasta_curves::curves::EpAffine>>::add",
+   "samples": 26291,
+   "pct": 12.73
+  },
+  {
+   "frame": "bls12_381::scalar::Scalar::mul",
+   "samples": 20565,
+   "pct": 9.96
+  },
+  {
+   "frame": "<&jubjub::ExtendedPoint as core::ops::arith::Add<&jubjub::ExtendedNielsPoint>>::add",
+   "samples": 17707,
+   "pct": 8.57
+  },
+  {
+   "frame": "<pasta_curves::curves::EpAffine as pasta_curves::arithmetic::curves::CurveAffine>::is_on_curve",
+   "samples": 10975,
+   "pct": 5.31
+  },
+  {
+   "frame": "bls12_381::scalar::Scalar::invert",
+   "samples": 7934,
+   "pct": 3.84
+  },
+  {
+   "frame": "bls12_381::scalar::Scalar::square",
+   "samples": 5566,
+   "pct": 2.7
+  }
+ ]
+}
