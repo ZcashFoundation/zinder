@@ -47,7 +47,7 @@ those results.
 ## Default validation gate (T0 + T1 + T2 + format/lint/docs)
 
 Run before considering any change complete. This is the canonical gate; CI
-mirrors it.
+mirrors it (see [Continuous integration](#continuous-integration)).
 
 ```bash
 cargo fmt --all --check
@@ -62,6 +62,7 @@ scripts/test-container-resource-evidence.sh
 scripts/test-storage-benchmark-campaign-validator.sh
 scripts/test-observability-smoke-safety.sh
 scripts/runbook-lint.sh docs/runbooks/testing.md
+scripts/test-install-ci-tool.sh
 git diff --check
 ```
 
@@ -132,6 +133,62 @@ fail when the tree is missing or nearly empty, and never treat a missing
 directory as a clean scan. The workspace invariant scans in `zinder-core`,
 `zinder-source`, and `zinder-proto` do this and assert a minimum number of
 scanned files.
+||||||| parent of 517cf6ea (docs: describe CI cancellation, tool installs, and cache policy)
+
+## Continuous integration
+
+The pull request workflows (`ci-pr`, `protocol-contracts`, `live-tests`,
+`parity-compat`, `binary-archives`, and `build-images`) share a few operating
+rules.
+
+**Superseded runs are cancelled.** `ci-pr`, `protocol-contracts`,
+`live-tests`, and `parity-compat` use one concurrency group per workflow,
+event, and pull request number. A new push to a pull request cancels the
+previous run of the same workflow. Runs on `main`, scheduled runs, and manual
+dispatches have their own group per run and are never cancelled by a later
+one. `binary-archives` and `build-images` keep their own per-reference groups,
+which cancel superseded runs the same way.
+
+**Every job has a timeout.** A hung job stops at its `timeout-minutes` limit
+instead of holding a runner for the GitHub default of six hours.
+
+**Tools are installed from checksum-pinned release assets.** No job compiles a
+tool from source. `scripts/install-ci-tool.sh <name>` reads
+[`.github/ci-tools.lock`](../../.github/ci-tools.lock), which lists each tool's
+version, the upstream project's x86_64 Linux release URL, and the sha256 of the
+archive. The installer verifies the checksum before it extracts anything and
+installs only the tool's executable into `~/.cargo/bin`. It covers
+`cargo-nextest`, `cargo-deny`, `cargo-machete`, `cargo-llvm-cov`, and
+`cargo-mutants`. To bump a tool, change its version, URL, and checksum together
+in the lock; the `dependency hygiene` job runs `scripts/test-install-ci-tool.sh`
+to keep the installer and the lock well formed. The lock has no aarch64
+assets, because no job that installs a tool runs on an arm64 runner.
+
+**Rust caches are written from `main` only.** Every `Swatinem/rust-cache` step
+sets `save-if: ${{ github.ref == 'refs/heads/main' }}`, so pull request runs
+restore from the default branch and never write. Jobs that compile the same
+profile share a key: the `ci-pr` `rust` job and all `live-tests` jobs use
+`shared-key: test`, `parity-compat` builds release binaries as well and uses
+`parity`, and the other jobs use their own keys (`sdk`, `policy`, `coverage`,
+`mutation`, `proto-codegen`, and `capability-coverage`). Where a matrix would
+write one key from several legs, only the Zebra leg saves. Live and parity
+caches are written by their scheduled runs on the default branch.
+`rust-cache` hashes every `CARGO_*` and `RUST*` environment variable into the
+key, so the workflow-level `env` block of jobs that share a key must stay
+identical, and tool versions live in the lock rather than in `CARGO_*`
+variables.
+
+**Live and parity share one path filter.** Both list `rust-toolchain.toml` and
+`.config/nextest.toml` next to the manifest and lockfile, so a toolchain or
+profile change runs them. Keep the two lists identical. `binary-archives` and
+`build-images` list `tools/**` and `.dockerignore` because the Docker build
+context copies them.
+
+**Cargo commands in the live and parity workflows use `--locked`**, so a stale
+lockfile fails the job instead of silently resolving new versions.
+
+**`proto breaking` runs on pull requests only.** On `main` it would compare the
+branch with itself.
 
 ## Public SDK package gate
 
@@ -201,8 +258,8 @@ The most valuable automated check that exercises a real node. CI runs it
 against both certified nodes, Zebra 7.0.0 and Zakura 1.8.6, every night and on
 pull requests. The live and parity workflows share one pull request path
 filter: a crate the live or parity tests exercise, the workspace manifest or
-lockfile, the nextest configuration, either node TOML, the mining or indexer
-TLS script, or either workflow.
+lockfile, the Rust toolchain pin, the nextest configuration, either node TOML,
+the mining or indexer TLS script, or either workflow.
 
 ### Prerequisites
 
@@ -1625,7 +1682,7 @@ standard validation gate.
 
 | Drift class | How it's caught | Where |
 | ----------- | --------------- | ----- |
-| Bash syntax in a fenced `bash` block | `scripts/runbook-lint.sh` runs every block through `bash -n`. Wired into the default validation gate above. | [`scripts/runbook-lint.sh`](../../scripts/runbook-lint.sh) |
+| Bash syntax in a fenced `bash` block | `scripts/runbook-lint.sh` runs every block through `bash -n`. Wired into the default validation gate above and into the `dependency hygiene` CI job. | [`scripts/runbook-lint.sh`](../../scripts/runbook-lint.sh) |
 | Profile-name drift between this runbook and `.config/nextest.toml` | `testing_runbook_profile_names_exist_in_nextest_toml` asserts every `--profile=<name>` quoted in this file resolves to a real `[profile.<name>]` section. | [`crates/zinder-proto/tests/integration/capability_docs.rs`](../../crates/zinder-proto/tests/integration/capability_docs.rs) |
 | Default-filter drift between this runbook and `.config/nextest.toml` | `testing_runbook_default_filter_mirrors_nextest_toml` asserts the quoted expression matches the canonical one. | Same file. |
 | Capability-list drift between this runbook and the `CAPABILITIES` table | `testing_runbook_capability_list_mirrors_zinder_capabilities` asserts the list under the `<!-- capability-list:testing-runbook -->` markers matches the wallet and explorer rows of the table. | Same file. |
