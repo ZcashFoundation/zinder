@@ -154,7 +154,8 @@ pub(super) struct BlockTimings {
     pub(super) canonical_commit: f64,
     /// Canonical secondary catch-up to the new writer fence.
     pub(super) canonical_secondary_catch_up: f64,
-    /// The production wallet transition, including its replay-row reads.
+    /// The production wallet transition, including its replay-row reads and
+    /// the predecessor row read that seeds linkage checking.
     pub(super) wallet_apply: f64,
     /// Catch-up, retained-event and epoch reads, and the wallet transition.
     pub(super) wallet_step: f64,

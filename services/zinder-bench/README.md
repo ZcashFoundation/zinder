@@ -370,7 +370,7 @@ report's `final_wallet.projection_digest_hex`.
 | `canonical_prepare` | The follower's `zinder_ingest_canonical_live_prepare_seconds` sample |
 | `canonical_commit` | The follower's `zinder_ingest_canonical_live_commit_seconds` sample, around `commit_live_append` |
 | `canonical_secondary_catch_up` | Secondary catch-up to the new writer fence |
-| `wallet_apply` | `apply_canonical_event_range`, including its replay-row reads from the secondary |
+| `wallet_apply` | `apply_canonical_event_range`, including its replay-row reads from the secondary and the predecessor row that seeds linkage checking |
 | `wallet_step` | Catch-up, the retained-event and epoch reads, and the wallet transition |
 | `block_total` | `canonical_follow_step` plus `wallet_step` |
 

@@ -252,8 +252,8 @@ impl ReplayStores {
             fence,
             settled_tip: BlockId::new(epoch.settled_tip_height, epoch.settled_tip_hash),
         };
-        let replay_rows = self.secondary.scan_canonical_replay_range(committed)?;
         let apply_started = Instant::now();
+        let replay_rows = self.secondary.scan_canonical_replay_range(committed)?;
         self.wallet.apply_canonical_event_range(
             wallet_source,
             *event,
