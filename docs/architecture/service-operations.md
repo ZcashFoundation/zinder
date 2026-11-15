@@ -126,7 +126,10 @@ An attempt that lasts `projector.fence_convergence_timeout_seconds` without
 converging logs `canonical_secondary_behind_writer`, reports `replica_lagging`
 with the last lag it observed, or `writer_status_unavailable` when no writer
 status classified the secondary in that attempt, and starts another attempt.
-Lag never stops the projector; divergence still does.
+Each such attempt also renews the wallet's canonical retention lease to its
+full duration, so a long wait neither lets the lease expire nor lets the
+writer prune the events the wallet still needs. Lag never stops the projector;
+divergence still does.
 
 A parked writer and a writer that has not confirmed its tip since it reopened
 keep attesting their frozen fence, so convergence still succeeds. The

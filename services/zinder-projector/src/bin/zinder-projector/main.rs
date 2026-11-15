@@ -286,6 +286,7 @@ async fn run_owned_projector(
         &mut canonical_control,
         &mut startup_readiness,
         resumable_source.map(|wallet_source| wallet_source.source_position().event_sequence),
+        None,
         &cancel,
         config.fence_convergence_timeout,
     )
@@ -586,6 +587,10 @@ async fn run_continuous_wallet_following(
             &mut canonical_control,
             &mut following_readiness,
             Some(wallet_event_sequence),
+            Some(ConvergenceLease {
+                lease: &mut canonical_lease,
+                duration: config.lease_duration,
+            }),
             &cancel,
             config.fence_convergence_timeout,
         )
@@ -611,6 +616,10 @@ async fn run_continuous_wallet_following(
                     &mut canonical_control,
                     &mut following_readiness,
                     Some(wallet_event_sequence),
+                    Some(ConvergenceLease {
+                        lease: &mut canonical_lease,
+                        duration: config.lease_duration,
+                    }),
                     &cancel,
                     config.fence_convergence_timeout,
                 )
@@ -949,6 +958,7 @@ async fn bootstrap_resumed_wallet_following(
             &mut canonical_control,
             &mut following_readiness,
             Some(wallet_source.source_position().event_sequence),
+            None,
             &cancel,
             config.fence_convergence_timeout,
         )
@@ -1009,6 +1019,10 @@ async fn bootstrap_resumed_wallet_following(
             &mut canonical_control,
             &mut following_readiness,
             Some(wallet_source.source_position().event_sequence),
+            Some(ConvergenceLease {
+                lease: &mut bootstrap_lease,
+                duration: config.lease_duration,
+            }),
             &cancel,
             config.fence_convergence_timeout,
         )
@@ -1624,16 +1638,18 @@ impl WriterFence {
 /// events past the wallet ends convergence even while the writer is ahead,
 /// so a burst of blocks cannot keep the wallet from advancing. Without it the
 /// writer must attest the secondary's exact fence. A deadline that passes
-/// first reports the secondary as stale and starts another attempt.
+/// first reports the secondary as stale, renews `lease`, and
+/// starts another attempt.
 #[allow(
     clippy::too_many_arguments,
-    reason = "convergence keeps the secondary, writer client, readiness owner, wallet position, cancellation, and deadline explicit"
+    reason = "convergence keeps the secondary, writer client, readiness owner, wallet position, retention lease, cancellation, and deadline explicit"
 )]
 async fn converge_on_writer_fence(
     canonical: &mut RocksDbCanonicalSecondary,
     control: &mut CanonicalWriterControlClient,
     readiness: &mut FollowingReadiness<'_>,
     wallet_event_sequence: Option<u64>,
+    lease: Option<ConvergenceLease<'_>>,
     cancel: &CancellationToken,
     timeout: Duration,
 ) -> Result<Option<WriterFence>, ProjectorError> {
@@ -1643,6 +1659,8 @@ async fn converge_on_writer_fence(
         control,
         readiness,
         wallet_event_sequence,
+        lease,
+        timeout,
         last_lag: None,
     };
     let outcome = converge_without_deadline_exit(
@@ -1655,7 +1673,6 @@ async fn converge_on_writer_fence(
             max_delay: CANONICAL_FENCE_CONVERGENCE_MAX_DELAY,
         },
         cancel,
-        |probe| probe.report_unreached_writer(timeout),
     )
     .await?;
     let secondary = canonical.ready_evidence();
@@ -1682,17 +1699,17 @@ enum FollowingConvergence {
 /// `cancel` fires first.
 ///
 /// A secondary that trails the writer is ordinary replication lag, never a
-/// reason to stop following: each deadline that passes calls `on_deadline`
-/// and starts a new attempt. Divergence and probe failures still end it.
+/// reason to stop following: each deadline that passes calls
+/// [`FollowingFenceProbe::deadline_passed`] and starts a new attempt.
+/// Divergence and probe failures still end it.
 async fn converge_without_deadline_exit<Probe>(
     probe: &mut Probe,
     network: zinder_core::Network,
     policy: CanonicalFenceConvergencePolicy,
     cancel: &CancellationToken,
-    mut on_deadline: impl FnMut(&mut Probe),
 ) -> Result<Option<FollowingConvergence>, ProjectorError>
 where
-    Probe: CanonicalFenceProbe<Error = ProjectorError>,
+    Probe: FollowingFenceProbe,
 {
     loop {
         match converge_on_canonical_writer_fence(probe, network, policy, cancel).await {
@@ -1703,13 +1720,27 @@ where
                 return Ok(Some(FollowingConvergence::Trailing(lag)));
             }
             Ok(CanonicalFenceConvergence::Cancelled) => return Ok(None),
-            Err(CanonicalFenceConvergenceError::DidNotConverge) => on_deadline(probe),
+            Err(CanonicalFenceConvergenceError::DidNotConverge) => probe.deadline_passed().await?,
             Err(CanonicalFenceConvergenceError::Probe(error)) => return Err(error),
             Err(CanonicalFenceConvergenceError::Diverged(divergence)) => {
                 return Err(ProjectorError::CanonicalFenceDiverged(divergence));
             }
         }
     }
+}
+
+/// A probe that keeps converging after a convergence deadline passes.
+trait FollowingFenceProbe: CanonicalFenceProbe<Error = ProjectorError> {
+    /// Handles an attempt whose deadline passed before the secondary reached
+    /// the writer, before the next attempt starts.
+    fn deadline_passed(&mut self) -> impl Future<Output = Result<(), ProjectorError>> + Send;
+}
+
+/// The retention lease that protects a wallet's backlog while convergence
+/// waits, renewed to a full `duration` whenever a deadline passes.
+struct ConvergenceLease<'a> {
+    lease: &'a mut CanonicalRetentionLease,
+    duration: Duration,
 }
 
 struct LiveWriterFenceProbe<'a, 'readiness> {
@@ -1719,20 +1750,43 @@ struct LiveWriterFenceProbe<'a, 'readiness> {
     /// Event sequence of the wallet the secondary feeds, when convergence may
     /// end on a secondary that trails the writer.
     wallet_event_sequence: Option<u64>,
+    lease: Option<ConvergenceLease<'a>>,
+    timeout: Duration,
     /// Lag of the last round in this attempt whose secondary trailed the
     /// writer.
     last_lag: Option<CanonicalFenceLag>,
 }
 
+impl FollowingFenceProbe for LiveWriterFenceProbe<'_, '_> {
+    async fn deadline_passed(&mut self) -> Result<(), ProjectorError> {
+        self.report_unreached_writer();
+        // A deadline may be longer than the idle renewal headroom, so each
+        // passed attempt renews to a full lease duration.
+        if let Some(lease) = self.lease.as_mut()
+            && let Some(renewed_expiry) = following_retention_lease_transition_expiry(
+                UnixTimestampMillis::now(),
+                lease.lease.expires_at(),
+                lease.duration,
+            )
+        {
+            *lease.lease = self
+                .control
+                .renew(lease.lease.renewed(renewed_expiry))
+                .await?;
+        }
+        Ok(())
+    }
+}
+
 impl LiveWriterFenceProbe<'_, '_> {
-    fn report_unreached_writer(&mut self, timeout: Duration) {
+    fn report_unreached_writer(&mut self) {
         tracing::warn!(
             target: "zinder::projector",
             event = "canonical_secondary_behind_writer",
             secondary_height = self.canonical.event_fence().visible_tip().height.value(),
             writer_height = ?self.last_lag.map(|lag| lag.writer_visible_tip_height),
             lag_chain_epochs = ?self.last_lag.map(|lag| lag.lag_chain_epochs),
-            timeout_seconds = timeout.as_secs(),
+            timeout_seconds = self.timeout.as_secs(),
             "canonical secondary did not reach the writer fence within the convergence timeout; retrying"
         );
         self.readiness.writer_unreached(self.last_lag.take());
@@ -2275,8 +2329,8 @@ mod tests {
     use super::{
         CANONICAL_CONTROL_EVENT_PAGE_EVENTS, CanonicalBlockFactsSequenceDigest,
         CanonicalFenceConvergencePolicy, CanonicalFenceLag, CanonicalFenceProbe,
-        CanonicalRetentionLease, FollowingConvergence, FollowingReadiness, NextWalletTransition,
-        ProjectorControlTasks, ProjectorError, ResumedFollowingRetentionPlan,
+        CanonicalRetentionLease, FollowingConvergence, FollowingFenceProbe, FollowingReadiness,
+        NextWalletTransition, ProjectorControlTasks, ProjectorError, ResumedFollowingRetentionPlan,
         RetainedEventPageValidation, WalletCanonicalSourceIdentity, WalletProjectionSourcePosition,
         classify_resumed_following_retention, converge_without_deadline_exit,
         encode_zinder_native_chain_name, expected_writer_fence,
@@ -2620,19 +2674,20 @@ mod tests {
         // The writer commits on each of its first 64 status reads, as during
         // a long burst, so several attempts pass their deadline first.
         let mut probe = BurstProbe::new(64, None);
-        let mut deadlines = 0_u32;
 
         let outcome = converge_without_deadline_exit(
             &mut probe,
             test_network(),
             short_convergence_policy(),
             &CancellationToken::new(),
-            |_| deadlines += 1,
         )
         .await?;
 
         assert_eq!(outcome, Some(FollowingConvergence::Attested));
-        assert!(deadlines >= 1, "expected at least one passed deadline");
+        assert!(
+            probe.deadlines >= 1,
+            "expected at least one passed deadline"
+        );
         assert_eq!(probe.secondary_sequence, probe.writer_sequence);
         Ok(())
     }
@@ -2641,14 +2696,12 @@ mod tests {
     async fn a_secondary_past_the_wallet_ends_convergence_during_a_burst()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut probe = BurstProbe::new(u32::MAX, Some(4));
-        let mut deadlines = 0_u32;
 
         let outcome = converge_without_deadline_exit(
             &mut probe,
             test_network(),
             short_convergence_policy(),
             &CancellationToken::new(),
-            |_| deadlines += 1,
         )
         .await?;
 
@@ -2659,7 +2712,7 @@ mod tests {
                 ..
             }))
         ));
-        assert_eq!(deadlines, 0);
+        assert_eq!(probe.deadlines, 0);
         assert_eq!(probe.catch_ups, 1);
         Ok(())
     }
@@ -2670,19 +2723,17 @@ mod tests {
         // A projector that restarts during a burst resumes a wallet that
         // already holds every event its secondary holds.
         let mut probe = BurstProbe::new(u32::MAX, Some(5));
-        let mut deadlines = 0_u32;
 
         let outcome = converge_without_deadline_exit(
             &mut probe,
             test_network(),
             short_convergence_policy(),
             &CancellationToken::new(),
-            |_| deadlines += 1,
         )
         .await?;
 
         assert!(matches!(outcome, Some(FollowingConvergence::Trailing(_))));
-        assert_eq!(deadlines, 0);
+        assert_eq!(probe.deadlines, 0);
         assert_eq!(probe.catch_ups, 2);
         assert!(probe.secondary_sequence > 5);
         Ok(())
@@ -2698,7 +2749,6 @@ mod tests {
             test_network(),
             short_convergence_policy(),
             &CancellationToken::new(),
-            |_| {},
         )
         .await?;
 
@@ -2718,7 +2768,6 @@ mod tests {
             test_network(),
             short_convergence_policy(),
             &CancellationToken::new(),
-            |_| {},
         )
         .await;
 
@@ -3005,6 +3054,7 @@ mod tests {
         wallet_sequence: Option<u64>,
         writer_sequence_override: Option<u64>,
         catch_ups: u32,
+        deadlines: u32,
     }
 
     impl BurstProbe {
@@ -3016,6 +3066,7 @@ mod tests {
                 wallet_sequence,
                 writer_sequence_override: None,
                 catch_ups: 0,
+                deadlines: 0,
             }
         }
     }
@@ -3047,6 +3098,13 @@ mod tests {
 
         fn accepts_trailing(&self, _lag: CanonicalFenceLag) -> bool {
             secondary_holds_unapplied_events(self.secondary_sequence, self.wallet_sequence)
+        }
+    }
+
+    impl FollowingFenceProbe for BurstProbe {
+        async fn deadline_passed(&mut self) -> Result<(), ProjectorError> {
+            self.deadlines += 1;
+            Ok(())
         }
     }
 
