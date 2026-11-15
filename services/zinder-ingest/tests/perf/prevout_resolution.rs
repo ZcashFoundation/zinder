@@ -11,8 +11,11 @@
 //! anywhere in history. Hydrating it page by page, as replay does, must
 //! resolve every spend from the prevout cache instead of reading producing
 //! blocks, and must derive exactly the spend facts the uncached path derives.
-//! The assertions count reads rather than time them, so they hold on any CI
-//! worker.
+//! A replay that resumes partway through the chain, as after a restart, must
+//! warm its empty cache from canonical history before it hydrates, so spends
+//! of outputs produced before the resume height do not read producing blocks
+//! either. The assertions count reads rather than time them, so they hold on
+//! any CI worker.
 
 use std::collections::BTreeMap;
 
@@ -43,6 +46,8 @@ const PAGE_BLOCKS: u32 = 100;
 const RECENT_SPEND_PERCENT: u64 = 60;
 const RECENT_WINDOW_BLOCKS: u64 = 50;
 const FIXTURE_REORG_WINDOW_BLOCKS: u32 = 100;
+/// Height a restarted replay resumes at.
+const RESUME_HEIGHT: u32 = 601;
 
 #[test]
 fn replay_resolves_transparent_dense_history_without_producing_block_reads() -> eyre::Result<()> {
@@ -91,14 +96,100 @@ fn replay_resolves_transparent_dense_history_without_producing_block_reads() -> 
     Ok(())
 }
 
+#[test]
+fn a_resumed_replay_warms_its_cache_instead_of_reading_producing_blocks() -> eyre::Result<()> {
+    let activations = sample_regtest_upgrade_activations();
+    let chain = transparent_dense_chain();
+    let writer = CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &activations)?;
+    let secondary_directory = TempDir::new()?;
+    let secondary = RocksDbCanonicalSecondary::open_ready(
+        writer.canonical_primary_path(),
+        secondary_directory.path().join("canonical-secondary"),
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::None,
+        CanonicalReorgPolicy::new(FIXTURE_REORG_WINDOW_BLOCKS)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    let resume = BlockHeight::new(RESUME_HEIGHT);
+    let below_resume = BlockHeight::new(RESUME_HEIGHT - 1);
+
+    let (uncached_spends, _) = with_prevout_metrics(|| {
+        hydrate_pages_from(
+            &mut CanonicalBlockContextReader::new(&secondary, &activations),
+            resume,
+        )
+    })?;
+    let mut cold = PrevoutCache::new(1 << 20);
+    let (cold_spends, cold_reads) = with_prevout_metrics(|| {
+        hydrate_pages_from(
+            &mut CanonicalBlockContextReader::with_prevout_cache(
+                &secondary,
+                &activations,
+                &mut cold,
+            ),
+            resume,
+        )
+    })?;
+    let mut warmed = PrevoutCache::new(1 << 20);
+    let (warmed_spends, warmed_reads) = with_prevout_metrics(|| {
+        let mut reader =
+            CanonicalBlockContextReader::with_prevout_cache(&secondary, &activations, &mut warmed);
+        assert!(reader.warm_prevout_cache(below_resume, &mut || false)?);
+        hydrate_pages_from(&mut reader, resume)
+    })?;
+
+    assert_eq!(cold_spends, uncached_spends);
+    assert_eq!(warmed_spends, uncached_spends);
+    assert!(
+        cold_reads.producing_block_reads > 0,
+        "a cold cache reads the blocks that produced pre-resume outputs: {cold_reads:?}"
+    );
+    assert_eq!(warmed_reads.producing_block_reads, 0, "{warmed_reads:?}");
+    assert_eq!(warmed_reads.from_canonical, 0, "{warmed_reads:?}");
+    Ok(())
+}
+
+#[test]
+fn an_interrupted_warm_up_leaves_the_cache_empty() -> eyre::Result<()> {
+    let activations = sample_regtest_upgrade_activations();
+    let chain = transparent_dense_chain();
+    let writer = CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &activations)?;
+    let secondary_directory = TempDir::new()?;
+    let secondary = RocksDbCanonicalSecondary::open_ready(
+        writer.canonical_primary_path(),
+        secondary_directory.path().join("canonical-secondary"),
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::None,
+        CanonicalReorgPolicy::new(FIXTURE_REORG_WINDOW_BLOCKS)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    let mut prevouts = PrevoutCache::new(1 << 20);
+    let mut reader =
+        CanonicalBlockContextReader::with_prevout_cache(&secondary, &activations, &mut prevouts);
+
+    assert!(!reader.warm_prevout_cache(BlockHeight::new(RESUME_HEIGHT - 1), &mut || true)?);
+    drop(reader);
+    assert!(prevouts.is_empty());
+    Ok(())
+}
+
 /// Spend facts per block, in input order.
 type BlockSpends = BTreeMap<BlockHeight, Vec<TransparentSpendFact>>;
 
 fn hydrate_in_pages(
     reader: &mut CanonicalBlockContextReader<'_>,
 ) -> Result<BlockSpends, IngestError> {
+    hydrate_pages_from(reader, BlockHeight::new(1))
+}
+
+fn hydrate_pages_from(
+    reader: &mut CanonicalBlockContextReader<'_>,
+    first_height: BlockHeight,
+) -> Result<BlockSpends, IngestError> {
     let mut spends = BlockSpends::new();
-    let mut start = 1_u32;
+    let mut start = first_height.value();
     while start <= BLOCK_COUNT {
         let end = start.saturating_add(PAGE_BLOCKS - 1).min(BLOCK_COUNT);
         let page = BlockHeightRange::inclusive(BlockHeight::new(start), BlockHeight::new(end));

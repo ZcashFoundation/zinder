@@ -169,26 +169,43 @@ ways:
   starts at height 1. The ranking then replays from height 1 with every other
   block consumer and follows the tip at the shared cursor.
 - On a store whose views materialized heights without the ranking, the host
-  builds an inactive generation from genesis. It starts only while the shared
-  replay sits at the canonical fence. Each replay pass extends the build over
-  settled history for at most 10 seconds, so the other views keep following
-  the tip. The build resumes after a restart and adopts each pass's visible tip
-  as its target.
+  builds an inactive generation from genesis on a worker of its own, beside
+  the replay tailer, so the build and the replay advance at the same time.
+  Each build step applies settled history for at most 10 seconds and never
+  passes the height the other views have materialized. The build resumes after
+  a restart, adopts each step's visible tip as its target, and pauses with
+  replay under the canonical-phase gate, memory pressure, and the free-space
+  floor.
 
-The pass that reaches the settled tip reads the unsettled tail, at most one
-reorg window long. One write applies that tail, activates the generation, and
-adopts the shared cursor. Settled heights never change, so the inactive build
-never holds a block that a reorg could replace. A pass that pauses or is
-cancelled before that write leaves only settled progress behind. The ranking
-store also checks that every tail block extends the block applied below it, so
-a build left on a replaced branch fails instead of activating.
+The build activates in one of two ways:
+
+- While the other views rebuild from canonical heights without a shared
+  cursor, a build that reaches their materialized height joins them there. The
+  height must be settled, and the views must hold the same block at it. The
+  join writes no cursor. The shared replay then applies every later height to
+  the ranking together with the other views, and its next cursor advance
+  includes the ranking. A store that is still far behind the tip therefore
+  serves the ranking long before its replay finishes, as a fresh store does.
+- Once the views sit at the canonical fence with a shared cursor, the step
+  that reaches the settled tip reads the unsettled tail, at most one reorg
+  window long. One write applies that tail, activates the generation, and
+  adopts the shared cursor.
+
+Settled heights never change, so the inactive build never holds a block that a
+reorg could replace. A step that pauses or is cancelled before an activating
+write leaves only settled progress behind. The ranking store also checks that
+every tail block extends the block applied below it, so a build left on a
+replaced branch fails instead of activating.
 
 ## Store contract
 
 `MaterializedViewStore` is a separate RocksDB instance located under
 `MATERIALIZED_VIEW_STORE_SUBDIR`, currently `materialized-views`, beneath the
 configured canonical path. Writer and reader processes resolve that path
-through `MaterializedViewStore::path_for_canonical`.
+through `MaterializedViewStore::path_for_canonical`. Its column families
+compress every level with ZSTD;
+[ADR-0034](../adrs/0034-exclusive-index-build-stages-and-block-local-spend-replay.md)
+records the writer's RocksDB settings.
 
 The primary stages consumer rows, materialized-view state, and cursor advances in one
 write batch. A crash cannot publish a cursor beyond the rows it describes. A
@@ -223,7 +240,16 @@ Hydration resolves each transparent input's previous output from the hydrated
 range, then from an in-memory prevout cache of outputs that earlier ranges
 produced, and last from the producing block's canonical replay row. The cache
 answers only for a range that extends the last block it applied, so results
-never depend on it.
+never depend on it. The canonical reads of the last step are independent, so
+they run on up to 16 threads and their storage waits overlap.
+
+The cache lives in process memory. When replay or the ranking build resumes
+partway through history with an empty cache and at least 10,000 heights left to
+walk, the host first warms the cache: it applies every retained block below the
+resume height in order, reading and decoding the rows on the same threads, so
+the cache holds what an uninterrupted walk from genesis would have held, up to
+its bound. Spends of outputs produced before a restart then resolve from memory
+instead of from their producing blocks.
 
 Replay pauses while the volume that holds the canonical store, and therefore
 the view store, has less available space than

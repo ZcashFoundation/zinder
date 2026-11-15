@@ -631,6 +631,51 @@ impl TransparentAddressRankingConsumer {
         Ok(metadata)
     }
 
+    /// Activates a built generation at the block the other views last applied.
+    ///
+    /// The ingest replay host uses this while the other views rebuild from
+    /// canonical heights without a shared chain-event cursor. The build must
+    /// cover exactly `joined.height` with the block `joined` names, so the
+    /// generation continues at the next height the shared replay dispatches.
+    /// The generation joins without a cursor; the replay page that advances
+    /// the shared cursor supplies it. Repeating a join that already happened
+    /// returns the active metadata while its coverage still ends at `joined`.
+    pub fn activate_snapshot_generation_at_block(
+        store: &MaterializedViewStore,
+        generation: u64,
+        joined: BlockId,
+    ) -> Result<TransparentAddressRankingMetadata, TransparentAddressRankingConsumerError> {
+        if let Some(active) = Self::active_metadata(store)? {
+            if active.generation == generation
+                && active.coverage.balance_complete_through_height == joined.height
+            {
+                return Ok(active);
+            }
+            return Err(
+                TransparentAddressRankingConsumerError::GenerationAlreadyActive {
+                    generation: active.generation,
+                },
+            );
+        }
+        let (manifest, metadata) = sealed_snapshot_build(store, generation)?;
+        if metadata.coverage.balance_complete_through_height != joined.height
+            || metadata.coverage.history_complete_through_height != Some(joined.height)
+        {
+            return Err(TransparentAddressRankingConsumerError::SnapshotTailIncomplete);
+        }
+        if snapshot_build_tip_hash(store, &manifest, joined.height)? != joined.hash {
+            return Err(TransparentAddressRankingConsumerError::SnapshotTargetMismatch);
+        }
+        let mut batch = WriteBatch::default();
+        let metadata_cf =
+            store.consumer_column_family(TRANSPARENT_ADDRESS_RANKING_METADATA_COLUMN_FAMILY)?;
+        batch.put_cf(&metadata_cf, ACTIVE_METADATA_KEY, encode_metadata(metadata));
+        batch.delete_cf(&metadata_cf, BUILD_METADATA_KEY);
+        batch.delete_cf(&metadata_cf, BUILD_MANIFEST_KEY);
+        store.write_consumer_batch(TRANSPARENT_ADDRESS_RANKING_SCHEMA.name, &batch)?;
+        Ok(metadata)
+    }
+
     /// Activates an empty generation that has applied no block above genesis.
     ///
     /// A view store that has not materialized any height uses this so the
@@ -3409,6 +3454,73 @@ mod tests {
         ));
         assert!(TransparentAddressRankingConsumer::active_metadata(&store)?.is_none());
         assert_eq!(build_coverage_height(&store)?, BlockHeight::new(0));
+        Ok(())
+    }
+
+    #[test]
+    fn a_build_joins_at_the_block_it_covers_and_continues_with_the_next_height() -> TestResult {
+        let (_tempdir, store) = open_store()?;
+        let script = p2pkh(17);
+        let address_script_hash = TransparentAddressScriptHash::of_script_pub_key(&script);
+        let built = (1..=2)
+            .map(|height| receive_block(height, script.clone(), 5))
+            .collect::<Vec<_>>();
+        let target = receive_block(4, script.clone(), 5);
+        TransparentAddressRankingConsumer::initialize_snapshot_generation(
+            &store,
+            genesis_plan(1, &target),
+        )?;
+        TransparentAddressRankingConsumer::finalize_snapshot_base(&store, 1)?;
+        TransparentAddressRankingConsumer::write_snapshot_tail_blocks(&store, 1, &built)?;
+
+        assert!(matches!(
+            TransparentAddressRankingConsumer::activate_snapshot_generation_at_block(
+                &store,
+                1,
+                BlockId::new(BlockHeight::new(1), built[0].block_hash),
+            ),
+            Err(super::TransparentAddressRankingConsumerError::SnapshotTailIncomplete)
+        ));
+        assert!(matches!(
+            TransparentAddressRankingConsumer::activate_snapshot_generation_at_block(
+                &store,
+                1,
+                BlockId::new(BlockHeight::new(2), BlockHash::from_bytes([0xee; 32])),
+            ),
+            Err(super::TransparentAddressRankingConsumerError::SnapshotTargetMismatch)
+        ));
+        assert!(TransparentAddressRankingConsumer::active_metadata(&store)?.is_none());
+
+        let joined = BlockId::new(BlockHeight::new(2), built[1].block_hash);
+        let activated = TransparentAddressRankingConsumer::activate_snapshot_generation_at_block(
+            &store, 1, joined,
+        )?;
+        assert_eq!(activated.coverage, coverage(2));
+        assert!(TransparentAddressRankingConsumer::build_metadata(&store)?.is_none());
+        assert!(
+            store
+                .get_chain_event_cursor(super::TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)?
+                .is_none(),
+            "the shared replay supplies the cursor after the join"
+        );
+        assert_eq!(
+            TransparentAddressRankingConsumer::activate_snapshot_generation_at_block(
+                &store, 1, joined,
+            )?,
+            activated
+        );
+
+        let mut consumer = TransparentAddressRankingConsumer::new();
+        apply_and_commit(&store, &mut consumer, &built[1])?;
+        apply_and_commit(&store, &mut consumer, &receive_block(3, script, 5))?;
+        let summary = TransparentAddressRankingConsumer::summary(&store, address_script_hash)?
+            .ok_or("summary missing after the joined generation applied height 3")?;
+        assert_eq!(summary.balance_zat, 15);
+        assert_eq!(
+            TransparentAddressRankingConsumer::active_metadata(&store)?
+                .map(|active| active.coverage),
+            Some(coverage(3))
+        );
         Ok(())
     }
 

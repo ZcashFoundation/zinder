@@ -379,10 +379,23 @@ block-local boundary.
   found: `range`, `cache`, or `canonical`.
 - `zinder_materialized_view_prevout_block_reads_total` counts the producing
   blocks read from canonical storage to resolve the `canonical` share.
+- `zinder_materialized_view_prevout_cache_outputs{cache}` reports how many
+  unspent outputs the `replay` and `ranking_build` prevout caches hold, and
+  `zinder_materialized_view_prevout_cache_evicted_outputs_total{cache}` counts
+  the outputs each dropped to stay within its bound.
+- `zinder_materialized_view_transparent_address_ranking_build_pending` is `1`
+  while an inactive transparent-address ranking build is pending.
+  `zinder_materialized_view_transparent_address_ranking_build_height` reports
+  the height through which it has applied history, and
+  `zinder_materialized_view_transparent_address_ranking_build_target_height`
+  the height it is walking toward: the other views' materialized height,
+  capped at the settled tip.
 
-A steady `canonical` share while replay walks history means the prevout cache
-is missing outputs, for example after a restart, and the producing-block reads
-set the replay speed.
+A replay or ranking build that resumes partway through history warms its empty
+prevout cache first and logs `materialized_view_prevout_cache_warmed` with the
+walked range and the time it took. A steady `canonical` share after that means
+the cache is evicting outputs that are still spent later, which the eviction
+counter confirms, and the producing-block reads set the replay speed.
 
 ### Mempool owner
 

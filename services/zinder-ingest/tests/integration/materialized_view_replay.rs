@@ -17,8 +17,9 @@ use zinder_core::{
 };
 use zinder_ingest::{
     CanonicalConstructionConfig, CanonicalFollowConfig, CanonicalFollower, IngestError,
-    MaterializedViewReplayConfig, MaterializedViewTailer, ReplayPrevoutCaches, VolumeSpaceGuard,
-    follow_canonical_tip, load_fresh_canonical, spawn_materialized_view_tailer_task,
+    MaterializedViewReplayConfig, MaterializedViewTailer, ReplayPrevoutCaches,
+    TransparentAddressRankingBuildStep, VolumeSpaceGuard, follow_canonical_tip,
+    load_fresh_canonical, spawn_materialized_view_tailer_task,
 };
 use zinder_materialized_views::{
     BLOCK_SUMMARY_COLUMN_FAMILY, BLOCK_SUMMARY_CONSUMER_NAME, BlockSummaryConsumer,
@@ -55,6 +56,7 @@ const REPLACEMENT_TIP_HEIGHT: u32 = 5;
 const REORG_WINDOW_BLOCKS: u32 = 2;
 const UNCURSORED_HEAD_REPLACED_EVENT: &str = "materialized_view_replay_uncursored_head_replaced";
 const RANKING_ACTIVATED_EVENT: &str = "transparent_address_ranking_activated";
+const RANKING_JOINED_REPLAY_EVENT: &str = "transparent_address_ranking_joined_replay";
 
 #[tokio::test]
 async fn a_fresh_view_store_rebuilds_the_rows_event_replay_would_have_written()
@@ -319,6 +321,120 @@ async fn a_view_store_built_without_the_ranking_builds_and_activates_it_in_place
         transparent_address_ranking(&view)?,
         transparent_address_ranking(&rebuilt)?
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_ranking_build_joins_views_that_are_still_rebuilding_below_the_tip()
+-> Result<(), Box<dyn Error>> {
+    let mut harness = CanonicalHarness::baseline().await?;
+    let (directory, view) = view_store()?;
+    harness.tailer(&view).catch_up()?;
+    harness.follow_to_tip().await?;
+    drop(view);
+    clear_transparent_address_ranking(directory.path())?;
+    delete_chain_event_cursors(
+        directory.path(),
+        MaterializedViewStore::bundled_chain_event_consumer_names()
+            .iter()
+            .copied(),
+    )?;
+    let view = open_view_store(directory.path())?;
+    harness.canonical.write().try_catch_up()?;
+    let tailer = harness.tailer(&view);
+
+    let capture = LogCapture::install_for_target("zinder::ingest");
+    let step = tailer.advance_transparent_address_ranking_build()?;
+
+    assert_eq!(
+        step,
+        TransparentAddressRankingBuildStep::Activated {
+            height: BlockHeight::new(BASELINE_TIP_HEIGHT)
+        },
+        "the build must join the views at the height they materialized, below the tip"
+    );
+    assert!(capture.any(|event| event.field("event") == Some(RANKING_JOINED_REPLAY_EVENT)));
+    let (joined, _) = transparent_address_ranking(&view)?;
+    assert_eq!(
+        joined.coverage,
+        complete_ranking_coverage(BASELINE_TIP_HEIGHT)
+    );
+    assert!(
+        view.get_chain_event_cursor(TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME)?
+            .is_none(),
+        "the shared replay supplies the joined ranking's cursor"
+    );
+
+    tailer.catch_up()?;
+    let (_rebuilt_directory, rebuilt) = view_store()?;
+    harness.tailer(&rebuilt).catch_up()?;
+    assert_eq!(
+        transparent_address_ranking(&view)?.0.coverage,
+        complete_ranking_coverage(CHAIN_TIP_HEIGHT)
+    );
+    assert_eq!(
+        transparent_address_ranking(&view)?,
+        transparent_address_ranking(&rebuilt)?
+    );
+    assert_eq!(chain_event_cursors(&view)?, chain_event_cursors(&rebuilt)?);
+
+    harness.replace_tip().await?;
+    tailer.catch_up()?;
+    harness.tailer(&rebuilt).catch_up()?;
+    assert_eq!(
+        transparent_address_ranking(&view)?,
+        transparent_address_ranking(&rebuilt)?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_spawned_tailer_builds_the_ranking_beside_a_rebuilding_replay()
+-> Result<(), Box<dyn Error>> {
+    let mut harness = CanonicalHarness::baseline().await?;
+    let (directory, view) = view_store()?;
+    harness.tailer(&view).catch_up()?;
+    harness.follow_to_tip().await?;
+    drop(view);
+    clear_transparent_address_ranking(directory.path())?;
+    delete_chain_event_cursors(
+        directory.path(),
+        MaterializedViewStore::bundled_chain_event_consumer_names()
+            .iter()
+            .copied(),
+    )?;
+    let view = open_view_store(directory.path())?;
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    readiness.update_admission(|admission| admission.phase = Some(IngestPhase::FollowingTip));
+    let gate = zinder_ingest::HistoricalWorkGate::new(readiness);
+    let cancel = CancellationToken::new();
+    let handle = spawn_materialized_view_tailer_task(
+        harness.tailer(&view),
+        Duration::from_millis(10),
+        gate.clone(),
+        cancel.clone(),
+    );
+    let built = wait_until(|| {
+        gate.is_open()
+            && TransparentAddressRankingConsumer::active_metadata(&view)
+                .ok()
+                .flatten()
+                .is_some_and(|active| {
+                    active.coverage == complete_ranking_coverage(CHAIN_TIP_HEIGHT)
+                })
+    })
+    .await;
+    cancel.cancel();
+    handle.await?;
+    built?;
+
+    let (_rebuilt_directory, rebuilt) = view_store()?;
+    harness.tailer(&rebuilt).catch_up()?;
+    assert_eq!(
+        transparent_address_ranking(&view)?,
+        transparent_address_ranking(&rebuilt)?
+    );
+    assert_eq!(chain_event_cursors(&view)?, chain_event_cursors(&rebuilt)?);
     Ok(())
 }
 
