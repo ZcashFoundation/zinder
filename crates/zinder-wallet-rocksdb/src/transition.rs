@@ -2046,6 +2046,7 @@ mod tests {
     #[cfg(unix)]
     use std::num::NonZeroU16;
 
+    use rust_rocksdb::statistics::Ticker;
     use tempfile::TempDir;
     use zinder_core::{
         BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
@@ -2057,12 +2058,10 @@ mod tests {
         NetworkUpgradeActivation, NetworkUpgradeActivations, PrivacyShape, SerializedBytesDigest,
         TransactionBlobArtifact, TransactionComponentCounts, TransactionId,
         TransactionIntrinsicValueBalances, TransactionLocation, TransactionPublicFacts,
-        TransactionVersion, TransparentInputFact, TransparentOutPoint,
-        TransparentUtxoSetCommitment, UnixTimestampMillis, UnsupportedSection,
-        encode_canonical_block_replay,
+        TransactionVersion, TransparentAddressScriptHash, TransparentInputFact,
+        TransparentOutPoint, TransparentOutputFact, TransparentUtxoSetCommitment,
+        UnixTimestampMillis, UnsupportedSection, encode_canonical_block_replay,
     };
-    #[cfg(unix)]
-    use zinder_core::{TransparentAddressScriptHash, TransparentOutputFact};
     use zinder_store::{
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence,
         CanonicalEventHistoryRequest, CanonicalLiveAppend, CanonicalLiveReplacement,
@@ -2428,7 +2427,12 @@ mod tests {
                 [0xa1; 32],
                 vec![coinbase_output_transaction(
                     crash_transaction_id,
-                    TransparentOutputFact::new(0, CRASH_OUTPUT_VALUE_ZAT, [0xc9], address),
+                    vec![TransparentOutputFact::new(
+                        0,
+                        CRASH_OUTPUT_VALUE_ZAT,
+                        [0xc9],
+                        address,
+                    )],
                 )],
             )?;
             let (canonical_store, append_fence) = published.canonical_store.commit_live_append(
@@ -2788,25 +2792,40 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     fn coinbase_output_transaction(
         transaction_id: TransactionId,
-        output: TransparentOutputFact,
+        outputs: Vec<TransparentOutputFact>,
+    ) -> CanonicalTransactionFacts {
+        let mut coinbase = transparent_spend_transaction(
+            transaction_id,
+            vec![TransparentInputFact::new(
+                0,
+                TransparentOutPoint::COINBASE_SENTINEL,
+            )],
+            outputs,
+        );
+        coinbase.public_facts.version = TransactionVersion::V4;
+        coinbase.public_facts.is_coinbase = true;
+        coinbase.public_facts.unsupported_sections = Vec::new();
+        coinbase
+    }
+
+    fn transparent_spend_transaction(
+        transaction_id: TransactionId,
+        transparent_inputs: Vec<TransparentInputFact>,
+        transparent_outputs: Vec<TransparentOutputFact>,
     ) -> CanonicalTransactionFacts {
         let mut public_facts = transparent_spend_public_facts(transaction_id);
-        public_facts.version = TransactionVersion::V4;
-        public_facts.is_coinbase = true;
-        public_facts.unsupported_sections = Vec::new();
-        public_facts.counts.transparent_output_count = 1;
+        public_facts.counts.transparent_input_count =
+            u32::try_from(transparent_inputs.len()).unwrap_or(u32::MAX);
+        public_facts.counts.transparent_output_count =
+            u32::try_from(transparent_outputs.len()).unwrap_or(u32::MAX);
         CanonicalTransactionFacts {
             public_facts,
             serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(&[0x66]),
             intrinsic_value_balances: TransactionIntrinsicValueBalances::default(),
-            transparent_inputs: vec![TransparentInputFact::new(
-                0,
-                TransparentOutPoint::COINBASE_SENTINEL,
-            )],
-            transparent_outputs: vec![output],
+            transparent_inputs,
+            transparent_outputs,
         }
     }
 
@@ -2900,6 +2919,133 @@ mod tests {
         }
     }
 
+    /// Durable outputs the read-gate transition spends, each at its own address.
+    const READ_GATE_SPENDS: u8 = 3;
+
+    /// Outputs the read-gate transition creates, each at a new address.
+    const READ_GATE_CREATED_OUTPUTS: u8 = 2;
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one proof keeps the funded wallet, the measured transition, and its cold comparison together"
+    )]
+    fn spends_and_created_outputs_read_each_durable_row_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let PublishedCheckpointedWallet {
+            activations,
+            canonical_store,
+            initial_fence,
+        } = publish_checkpointed_wallet(temporary.path())?;
+        let mut accumulator = checkpoint_accumulator(&activations, initial_fence)?;
+        let funding_id = TransactionId::from_bytes([0x71; 32]);
+        let spending_id = TransactionId::from_bytes([0x72; 32]);
+        let funding = coinbase_output_transaction(
+            funding_id,
+            (0..READ_GATE_SPENDS)
+                .map(|lane| read_gate_output(lane, lane))
+                .collect(),
+        );
+        let spending = transparent_spend_transaction(
+            spending_id,
+            (0..READ_GATE_SPENDS)
+                .map(|lane| {
+                    TransparentInputFact::new(
+                        u32::from(lane),
+                        TransparentOutPoint::new(funding_id, u32::from(lane)),
+                    )
+                })
+                .collect(),
+            (0..READ_GATE_CREATED_OUTPUTS)
+                .map(|lane| read_gate_output(lane, READ_GATE_SPENDS + lane))
+                .collect(),
+        );
+        let same_block_spend = transparent_spend_transaction(
+            TransactionId::from_bytes([0x73; 32]),
+            vec![TransparentInputFact::new(
+                0,
+                TransparentOutPoint::new(spending_id, 0),
+            )],
+            Vec::new(),
+        );
+
+        let funded_block = checkpointed_append_block(
+            &mut accumulator,
+            101,
+            [0xa0; 32],
+            [0xa1; 32],
+            vec![funding],
+        )?;
+        let (canonical_store, funded_fence) = canonical_store.commit_live_append(
+            CanonicalLiveAppend::new(
+                initial_fence,
+                funded_block,
+                Vec::new(),
+                initial_fence.visible_tip(),
+                UnixTimestampMillis::new(1_750_000_100_101),
+            ),
+            &activations,
+        )?;
+        let spending_block = checkpointed_append_block(
+            &mut accumulator,
+            102,
+            [0xa1; 32],
+            [0xa2; 32],
+            vec![spending, same_block_spend],
+        )?;
+        let (_canonical_store, _) = canonical_store.commit_live_append(
+            CanonicalLiveAppend::new(
+                funded_fence,
+                spending_block,
+                Vec::new(),
+                funded_fence.visible_tip(),
+                UnixTimestampMillis::new(1_750_000_100_102),
+            ),
+            &activations,
+        )?;
+
+        let secondary = open_checkpointed_secondary(temporary.path(), "canonical-secondary")?;
+        let following = RocksDbWalletStore::open_ready_for_following(
+            temporary.path().join("wallet"),
+            Network::ZcashRegtest,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let source = WalletCanonicalSourceIdentity::from_ready_evidence(following.ready_evidence());
+        let mut wallet = following.into_ready_store(source)?;
+        apply_next_event_settling_at(&mut wallet, &secondary, initial_fence.visible_tip())?;
+        let keys_read_before = wallet_keys_read(&wallet);
+        apply_next_event_settling_at(&mut wallet, &secondary, funded_fence.visible_tip())?;
+        let keys_read = wallet_keys_read(&wallet) - keys_read_before;
+
+        // Each spend of a durable output reads its unspent, address-index,
+        // and balance rows and proves its spent row absent. Each created
+        // output proves its unspent, spent, and address-index rows and its
+        // new address's balance absent. The same-block spend finds its rows
+        // among the plan's writes, and its spent row among the absences the
+        // plan already observed. Each touched address proves one
+        // address-transaction row absent, and the block proves its new undo
+        // row absent and reads the one undo row it prunes.
+        let spends = u64::from(READ_GATE_SPENDS);
+        let created_outputs = u64::from(READ_GATE_CREATED_OUTPUTS);
+        let touched_addresses = spends + created_outputs + 1;
+        assert_eq!(
+            keys_read,
+            4 * spends + 4 * created_outputs + touched_addresses + 2
+        );
+
+        let cold = build_wallet_from_canonical(
+            &secondary,
+            temporary.path().join("wallet-cold"),
+            RocksDbWalletBuildOptions {
+                supported_reorg_depth: 1,
+                ..RocksDbWalletBuildOptions::for_local_tests()
+            },
+        )?;
+        assert_eq!(wallet.ready_evidence(), cold.store.ready_evidence());
+        Ok(())
+    }
+
     #[test]
     fn durable_read_memo_keeps_only_the_bytes_the_plan_leaves_it() -> Result<(), RocksDbWalletError>
     {
@@ -2918,6 +3064,43 @@ mod tests {
         memo.release_for_write(&key(4), 7)?;
         assert!(memo.get(&key(1)).is_none());
         assert_eq!(memo.logical_bytes, 0);
+        Ok(())
+    }
+
+    /// One output of the read-gate fixture, paying the address of `lane`.
+    fn read_gate_output(output_index: u8, lane: u8) -> TransparentOutputFact {
+        let mut address = [0x7a; 32];
+        address[0] = lane;
+        TransparentOutputFact::new(
+            u32::from(output_index),
+            5,
+            [0x76, lane],
+            TransparentAddressScriptHash::from_bytes(address),
+        )
+    }
+
+    fn wallet_keys_read(wallet: &RocksDbWalletStore) -> u64 {
+        wallet
+            .bounded_open
+            .statistics
+            .get_ticker_count(Ticker::NumberKeysRead)
+    }
+
+    fn apply_next_event_settling_at(
+        wallet: &mut RocksDbWalletStore,
+        secondary: &RocksDbCanonicalSecondary,
+        settled_tip: BlockId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let event = next_retained_event(secondary, wallet)?;
+        let source = WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
+        wallet.apply_canonical_event_range(
+            source,
+            event,
+            event.resulting_fence(),
+            settled_tip,
+            test_transition_logical_byte_limit(),
+            secondary.scan_canonical_replay_range(event.committed_range())?,
+        )?;
         Ok(())
     }
 
