@@ -241,7 +241,10 @@ range, then from an in-memory prevout cache of outputs that earlier ranges
 produced, and last from the producing block's canonical replay row. The cache
 answers only for a range that extends the last block it applied, so results
 never depend on it. The canonical reads of the last step are independent, so
-they run on up to 16 threads and their storage waits overlap.
+they run on up to 16 threads and their storage waits overlap. The threads
+allocate through jemalloc
+([ADR-0044](../adrs/0044-service-binaries-allocate-through-jemalloc.md)), so
+they do not queue on allocator locks between reads.
 
 The cache lives in process memory. When replay or the ranking build resumes
 partway through history with an empty cache and at least 10,000 heights left to

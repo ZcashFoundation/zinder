@@ -34,6 +34,9 @@ zinder-proto.workspace = true
 zinder-source.workspace = true
 zinder-store.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator.workspace = true
+
 [dev-dependencies]
 eyre.workspace = true
 http-body-util.workspace = true

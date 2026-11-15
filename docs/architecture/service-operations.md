@@ -377,6 +377,16 @@ cancels background tasks, waits for owned tasks and servers, and closes the
 operational endpoint. Primary stores are closed only by their owner. Readers do
 not attempt a final write or migration.
 
+## Memory allocator
+
+On Linux, every service binary allocates through jemalloc, which also replaces
+the C library `malloc` that RocksDB uses. Concurrent storage reads therefore do
+not wait on shared allocator locks. Tune the allocator with `MALLOC_CONF`.
+Glibc malloc variables, such as `MALLOC_ARENA_MAX`, have no effect.
+`MALLOC_CONF=stats_print:true` prints allocator statistics when the process
+exits. [ADR-0044](../adrs/0044-service-binaries-allocate-through-jemalloc.md)
+records the decision.
+
 ## Metrics
 
 Every runtime exports build information and readiness state.

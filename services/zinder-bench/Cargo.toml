@@ -36,6 +36,7 @@ zinder-materialized-views.workspace = true
 zinder-ingest.workspace = true
 zinder-proto.workspace = true
 zinder-rocksdb-bulk-load.workspace = true
+zinder-runtime.workspace = true
 zinder-source.workspace = true
 zinder-store.workspace = true
 zinder-wallet-projection.workspace = true

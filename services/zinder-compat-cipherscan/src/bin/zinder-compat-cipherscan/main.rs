@@ -17,6 +17,9 @@ mod config;
 
 use config::{CipherscanConfigError, CipherscanConfigOverrides};
 
+#[global_allocator]
+static GLOBAL_ALLOCATOR: zinder_runtime::RuntimeAllocator = zinder_runtime::RuntimeAllocator;
+
 #[derive(Parser)]
 #[command(name = "zinder-compat-cipherscan")]
 #[command(about = "Cipherscan-compatible REST adapter over Zinder native gRPC services")]
