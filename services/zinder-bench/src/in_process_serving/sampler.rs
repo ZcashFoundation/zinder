@@ -14,9 +14,57 @@ use rust_rocksdb::{DB, Options, statistics::Ticker};
 use serde::Serialize;
 
 use super::{
+    observer::{BALLAST_COLUMN_FAMILY, BallastCounts},
     stats::{process_memory, sst_files_on_disk},
     writer::Shared,
 };
+
+/// Ballast column family shape: entries stored versus keys that must be live.
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct BallastCfSample {
+    pub(crate) sst_bytes: u64,
+    pub(crate) sst_files: u64,
+    pub(crate) l0_files: u64,
+    pub(crate) max_level: i32,
+    pub(crate) sst_entries: u64,
+    pub(crate) sst_deletions: u64,
+    pub(crate) mem_entries: u64,
+    pub(crate) mem_deletes: u64,
+    pub(crate) pending_compaction_bytes: u64,
+}
+
+/// Host load around the process, for attributing latency outliers.
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct HostSample {
+    pub(crate) loadavg_1m: f64,
+    pub(crate) cpu_some_avg10: Option<f64>,
+    pub(crate) io_some_avg10: Option<f64>,
+    pub(crate) io_full_avg10: Option<f64>,
+    pub(crate) mem_some_avg10: Option<f64>,
+}
+
+fn psi(resource: &str, kind: &str) -> Option<f64> {
+    let text = std::fs::read_to_string(format!("/proc/pressure/{resource}")).ok()?;
+    let line = text.lines().find(|line| line.starts_with(kind))?;
+    line.split_whitespace()
+        .find_map(|field| field.strip_prefix("avg10="))?
+        .parse()
+        .ok()
+}
+
+pub(crate) fn host_sample() -> HostSample {
+    let loadavg_1m = std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|text| text.split_whitespace().next()?.parse().ok())
+        .unwrap_or(0.0);
+    HostSample {
+        loadavg_1m,
+        cpu_some_avg10: psi("cpu", "some"),
+        io_some_avg10: psi("io", "some"),
+        io_full_avg10: psi("io", "full"),
+        mem_some_avg10: psi("memory", "some"),
+    }
+}
 
 /// One database the sampler watches.
 pub(crate) struct DbProbe<'db> {
@@ -54,6 +102,7 @@ pub(crate) struct DbSample {
     pub(crate) cf_total_stops: u64,
     pub(crate) cf_total_delays: u64,
     pub(crate) db_stall_counts: BTreeMap<String, u64>,
+    pub(crate) ballast: Option<BallastCfSample>,
 }
 
 #[derive(Serialize)]
@@ -68,6 +117,10 @@ pub(crate) struct SampleRecord {
     pub(crate) attach_stage: u32,
     pub(crate) source_revealed_height: u32,
     pub(crate) source_cached_blocks: usize,
+    pub(crate) ballast_counts: BallastCounts,
+    /// Wallet ballast entries stored (SST plus memtable) minus keys that must be live.
+    pub(crate) wallet_ballast_dead_entries: Option<i64>,
+    pub(crate) host: HostSample,
 }
 
 /// Parses `Write Stall (count): key: value, key: value` property text.
@@ -141,9 +194,37 @@ pub(crate) fn sample_db(probe: &DbProbe<'_>, include_live_files: bool) -> DbSamp
     let (disk_bytes, disk_files) = sst_files_on_disk(&probe.dir);
     sample.disk_sst_bytes = disk_bytes;
     sample.disk_sst_files = disk_files;
-    if include_live_files && let Ok(files) = db.live_files() {
-        sample.live_files_count = Some(files.len() as u64);
-        sample.live_files_bytes = Some(files.iter().map(|file| file.size as u64).sum());
+    if let Ok(files) = db.live_files() {
+        if include_live_files {
+            sample.live_files_count = Some(files.len() as u64);
+            sample.live_files_bytes = Some(files.iter().map(|file| file.size as u64).sum());
+        }
+        if let Some(family) = db.cf_handle(BALLAST_COLUMN_FAMILY) {
+            let mut ballast = BallastCfSample::default();
+            for file in files
+                .iter()
+                .filter(|file| file.column_family_name == BALLAST_COLUMN_FAMILY)
+            {
+                ballast.sst_bytes += file.size as u64;
+                ballast.sst_files += 1;
+                ballast.l0_files += u64::from(file.level == 0);
+                ballast.max_level = ballast.max_level.max(file.level);
+                ballast.sst_entries += file.num_entries;
+                ballast.sst_deletions += file.num_deletions;
+            }
+            let cf_int = |property: &str| {
+                db.property_int_value_cf(&family, property)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0)
+            };
+            ballast.mem_entries = cf_int("rocksdb.num-entries-active-mem-table")
+                + cf_int("rocksdb.num-entries-imm-mem-tables");
+            ballast.mem_deletes = cf_int("rocksdb.num-deletes-active-mem-table")
+                + cf_int("rocksdb.num-deletes-imm-mem-tables");
+            ballast.pending_compaction_bytes = cf_int("rocksdb.estimate-pending-compaction-bytes");
+            sample.ballast = Some(ballast);
+        }
     }
     sample.num_snapshots = int(db, "rocksdb.num-snapshots");
     sample.oldest_snapshot_time = int(db, "rocksdb.oldest-snapshot-time");
@@ -172,17 +253,29 @@ pub(crate) fn take_sample(
     include_live_files: bool,
 ) -> SampleRecord {
     let memory = process_memory();
+    let ballast_counts = shared.observer.counts();
+    let wallet_sample = wallet.map(|probe| sample_db(probe, include_live_files));
+    let wallet_ballast_dead_entries = wallet_sample
+        .as_ref()
+        .and_then(|sample| sample.ballast.as_ref())
+        .map(|ballast| {
+            (ballast.sst_entries + ballast.mem_entries) as i64
+                - ballast_counts.wallet_live_keys() as i64
+        });
     SampleRecord {
         t: shared.clock.t(),
         phase: shared.clock.phase().to_owned(),
         canonical: sample_db(canonical, include_live_files),
-        wallet: wallet.map(|probe| sample_db(probe, include_live_files)),
+        wallet: wallet_sample,
         rss_bytes: memory.rss_bytes,
         peak_rss_bytes: memory.peak_rss_bytes,
         active_readers: shared.active_readers.load(Ordering::SeqCst),
         attach_stage: shared.attach_stage.load(Ordering::SeqCst),
         source_revealed_height: shared.source.revealed_height(),
         source_cached_blocks: shared.source.cached_blocks(),
+        ballast_counts,
+        wallet_ballast_dead_entries,
+        host: host_sample(),
     }
 }
 

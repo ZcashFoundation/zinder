@@ -68,8 +68,10 @@ use zinder_store::{
 use zinder_wallet_rocksdb::{RocksDbWalletBuildOptions, RocksDbWalletStore};
 
 use self::{
-    index_attach::{AttachContext, IndexAttachRecord, run_index_attach},
-    observer::{BALLAST_COLUMN_FAMILY, SpikeObserver},
+    index_attach::{AttachContext, IndexAttachRecord, OldFamilyHolder, run_index_attach},
+    observer::{
+        BALLAST_COLUMN_FAMILY, DEFAULT_LONG_DELETE_LAG_WRITES, PreseedRecord, SpikeObserver,
+    },
     output::{Outputs, RunClock},
     plan::{Phase, Plan, ReaderSpec},
     readers::{
@@ -171,6 +173,15 @@ pub(crate) struct InProcessServingArgs {
     /// Replace the multiplier of every density phase (phases whose multiplier is above 1).
     #[arg(long = "density-multiplier-override")]
     density_multiplier_override: Option<f64>,
+    /// Wallet ballast writes between a key's insert and its long-lag delete.
+    #[arg(long = "ballast-long-delete-lag-writes", default_value_t = DEFAULT_LONG_DELETE_LAG_WRITES)]
+    ballast_long_delete_lag_writes: usize,
+    /// Wallet ballast writes made at setup; defaults to the long lag when the plan has density phases.
+    #[arg(long = "ballast-preseed-writes")]
+    ballast_preseed_writes: Option<usize>,
+    /// Real wallet bytes per write the preseed assumes (the smoke runs measured about 5,000).
+    #[arg(long = "ballast-preseed-wallet-base-bytes", default_value_t = 5_000)]
+    ballast_preseed_wallet_base_bytes: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -194,6 +205,32 @@ struct SpaceSummary {
     write_stopped_samples: u64,
     delayed_write_rate_max: u64,
     stall_micros_delta: u64,
+    ballast_sst_bytes_start: Option<u64>,
+    ballast_sst_bytes_max: Option<u64>,
+    ballast_sst_bytes_end: Option<u64>,
+    ballast_l0_files_max: Option<u64>,
+    ballast_sst_files_end: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct BallastPhaseSummary {
+    wallet_live_keys_start: u64,
+    wallet_live_keys_end: u64,
+    wallet_dead_entries_start: Option<i64>,
+    wallet_dead_entries_max: Option<i64>,
+    wallet_dead_entries_end: Option<i64>,
+    wallet_ballast_bytes_written: u64,
+    canonical_ballast_bytes_written: u64,
+    wallet_long_lag_deleted_keys: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct HostSummary {
+    loadavg_1m_max: f64,
+    loadavg_1m_mean: f64,
+    cpu_some_avg10_max: Option<f64>,
+    io_some_avg10_max: Option<f64>,
+    io_full_avg10_max: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -238,6 +275,7 @@ struct CompactionAtEnd {
 struct PhaseSummary {
     name: String,
     baseline_name: Option<String>,
+    after_baseline_name: Option<String>,
     pacing: String,
     block_interval_ms: u64,
     density_multiplier: f64,
@@ -269,6 +307,8 @@ struct PhaseSummary {
     compaction_at_end: Option<CompactionAtEnd>,
     wallet_detached: Option<String>,
     peak_rss_bytes_end: Option<u64>,
+    ballast: BallastPhaseSummary,
+    host: HostSummary,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -281,6 +321,10 @@ struct PhaseCheck {
     canonical_p99_ratio_to_baseline: Option<f64>,
     p99_over_1s: bool,
     p99_over_2x_baseline: bool,
+    after_baseline_phase: Option<String>,
+    total_p99_ratio_to_after_baseline: Option<f64>,
+    /// Over 2x both the before and the after baseline (A-B-A attribution).
+    p99_over_2x_both_baselines: Option<bool>,
     stop_stalls: u64,
     write_stopped_samples: u64,
     snapshot_reader_violations: u64,
@@ -289,6 +333,14 @@ struct PhaseCheck {
     max_replacement_writer_blocked_s: Option<f64>,
     /// Longest writer block for the index-attach final switch.
     attach_switch_writer_blocked_s: Option<f64>,
+    /// Longest tiny synced write to the wallet database that overlapped the ingest call.
+    attach_ingest_probe_max_write_s: Option<f64>,
+    reader_errors: usize,
+    /// Snapshot-reader cycles that released before their hold target without being truncated.
+    holds_short_of_target: usize,
+    /// Shortest hold among untruncated snapshot cycles, per group target.
+    min_untruncated_hold_s: Option<f64>,
+    wallet_detached: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -301,6 +353,10 @@ struct FailConditionChecks {
     control_readers_detected_changes: bool,
     any_p99_over_1s: bool,
     any_p99_over_2x_baseline: bool,
+    any_p99_over_2x_both_baselines: bool,
+    any_reader_errors: bool,
+    any_hold_short_of_target: bool,
+    any_wallet_detached: bool,
     phases: Vec<PhaseCheck>,
     note: &'static str,
 }
@@ -324,6 +380,10 @@ struct StoreSetup {
     ballast_pool_rows: (usize, usize),
     sampled_addresses: usize,
     sampled_transaction_ids: usize,
+    canonical_cf_sst_bytes: BTreeMap<String, u64>,
+    wallet_cf_sst_bytes: BTreeMap<String, u64>,
+    ballast_long_delete_lag_writes: usize,
+    ballast_preseed: Option<PreseedRecord>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -359,6 +419,7 @@ fn load_plan(args: &InProcessServingArgs) -> Result<Plan, BenchError> {
     } else {
         match args.plan_preset.as_str() {
             "measured" => plan::measured_plan(),
+            "density" => plan::density_plan(),
             "smoke" => plan::smoke_plan(),
             other => {
                 return Err(BenchError::invalid_argument(format!(
@@ -652,7 +713,63 @@ fn space_summary(
             .max()
             .unwrap_or(0),
         stall_micros_delta: last.stall_micros.saturating_sub(first.stall_micros),
+        ballast_sst_bytes_start: first.ballast.as_ref().map(|b| b.sst_bytes),
+        ballast_sst_bytes_max: series
+            .iter()
+            .filter_map(|s| s.ballast.as_ref().map(|b| b.sst_bytes))
+            .max(),
+        ballast_sst_bytes_end: last.ballast.as_ref().map(|b| b.sst_bytes),
+        ballast_l0_files_max: series
+            .iter()
+            .filter_map(|s| s.ballast.as_ref().map(|b| b.l0_files))
+            .max(),
+        ballast_sst_files_end: last.ballast.as_ref().map(|b| b.sst_files),
     })
+}
+
+fn ballast_summary(samples: &[&SampleRecord]) -> BallastPhaseSummary {
+    let (Some(first), Some(last)) = (samples.first(), samples.last()) else {
+        return BallastPhaseSummary::default();
+    };
+    BallastPhaseSummary {
+        wallet_live_keys_start: first.ballast_counts.wallet_live_keys(),
+        wallet_live_keys_end: last.ballast_counts.wallet_live_keys(),
+        wallet_dead_entries_start: first.wallet_ballast_dead_entries,
+        wallet_dead_entries_max: samples
+            .iter()
+            .filter_map(|s| s.wallet_ballast_dead_entries)
+            .max(),
+        wallet_dead_entries_end: last.wallet_ballast_dead_entries,
+        wallet_ballast_bytes_written: last
+            .ballast_counts
+            .wallet_ballast_bytes
+            .saturating_sub(first.ballast_counts.wallet_ballast_bytes),
+        canonical_ballast_bytes_written: last
+            .ballast_counts
+            .canonical_ballast_bytes
+            .saturating_sub(first.ballast_counts.canonical_ballast_bytes),
+        wallet_long_lag_deleted_keys: last
+            .ballast_counts
+            .wallet_long_lag_deleted_keys
+            .saturating_sub(first.ballast_counts.wallet_long_lag_deleted_keys),
+    }
+}
+
+fn host_summary(samples: &[&SampleRecord]) -> HostSummary {
+    let max_opt = |pick: fn(&SampleRecord) -> Option<f64>| {
+        samples.iter().filter_map(|s| pick(s)).reduce(f64::max)
+    };
+    HostSummary {
+        loadavg_1m_max: samples.iter().map(|s| s.host.loadavg_1m).fold(0.0, f64::max),
+        loadavg_1m_mean: if samples.is_empty() {
+            0.0
+        } else {
+            samples.iter().map(|s| s.host.loadavg_1m).sum::<f64>() / samples.len() as f64
+        },
+        cpu_some_avg10_max: max_opt(|s| s.host.cpu_some_avg10),
+        io_some_avg10_max: max_opt(|s| s.host.io_some_avg10),
+        io_full_avg10_max: max_opt(|s| s.host.io_full_avg10),
+    }
 }
 
 fn reader_groups(cycles: &[ReaderCycleRecord]) -> Vec<ReaderGroupSummary> {
@@ -860,6 +977,7 @@ fn run_blocking(
     let observer = Arc::new(SpikeObserver::new(
         canonical_pool(canonical_db, canonical_tip_start),
         wallet_db.map(wallet_pool).unwrap_or_default(),
+        args.ballast_long_delete_lag_writes,
     ));
     let samples = load_samples(
         canonical_db,
@@ -929,6 +1047,45 @@ fn run_blocking(
         }
     }
 
+    let max_density = plan
+        .phases
+        .iter()
+        .map(|phase| phase.density_multiplier)
+        .fold(1.0, f64::max);
+    let preseed_writes = args
+        .ballast_preseed_writes
+        .unwrap_or(if max_density > 1.0 {
+            observer.long_delete_lag_writes()
+        } else {
+            0
+        });
+    let ballast_preseed = match wallet_db {
+        Some(db) if preseed_writes > 0 && max_density > 1.0 => {
+            let bytes_per_write =
+                ((max_density - 1.0) * args.ballast_preseed_wallet_base_bytes as f64) as usize;
+            let record = observer
+                .preseed_wallet(db, preseed_writes, bytes_per_write)
+                .map_err(BenchError::invalid_argument)?;
+            tracing::info!(
+                target: "zinder::bench::spike",
+                writes = record.writes,
+                bytes_per_write = record.bytes_per_write,
+                seconds = record.seconds,
+                "wallet ballast preseeded"
+            );
+            Some(record)
+        }
+        _ => None,
+    };
+    let cf_sizes = |db: &DB| {
+        let mut sizes = BTreeMap::new();
+        if let Ok(files) = db.live_files() {
+            for file in files {
+                *sizes.entry(file.column_family_name).or_insert(0) += file.size as u64;
+            }
+        }
+        sizes
+    };
     let store_setup = StoreSetup {
         canonical_source: args.canonical_source.display().to_string(),
         wallet_source: args
@@ -950,6 +1107,10 @@ fn run_blocking(
         ballast_pool_rows: observer.pool_sizes(),
         sampled_addresses: samples.addresses.len(),
         sampled_transaction_ids: samples.transaction_ids.len(),
+        canonical_cf_sst_bytes: cf_sizes(canonical_db),
+        wallet_cf_sst_bytes: wallet_db.map(cf_sizes).unwrap_or_default(),
+        ballast_long_delete_lag_writes: observer.long_delete_lag_writes(),
+        ballast_preseed,
     };
     clock.event(
         &outputs,
@@ -1267,7 +1428,41 @@ fn run_phase<'db>(
     let canonical_space =
         space_summary(&window, |sample| Some(&sample.canonical)).unwrap_or_default();
     let wallet_space = space_summary(&window, |sample| sample.wallet.as_ref());
+    let ballast = ballast_summary(&window);
+    let host = host_summary(&window);
     drop(kept);
+    if let Some(record) = attach_record.as_mut()
+        && record.drop_t > 0.0
+    {
+        record.old_family_holders_at_drop = cycles
+            .iter()
+            .filter(|cycle: &&ReaderCycleRecord| {
+                cycle.physical_family.as_deref() == Some(record.old_column_family.as_str())
+                    && cycle.t_start < record.drop_t
+                    && cycle.t_end > record.drop_t
+            })
+            .map(|cycle| OldFamilyHolder {
+                reader: cycle.reader.clone(),
+                t_start: cycle.t_start,
+                t_release: cycle.t_end,
+                violation_count: cycle.violation_count,
+                error: cycle.error.clone(),
+                family_dropped_before_release: cycle.family_dropped_before_release,
+            })
+            .collect();
+        record.last_old_family_holder_release_t = record
+            .old_family_holders_at_drop
+            .iter()
+            .map(|holder| holder.t_release)
+            .reduce(f64::max);
+        record.files_deleted_after_last_holder_release_s = match (
+            record.old_family_files_deleted_t,
+            record.last_old_family_holder_release_t,
+        ) {
+            (Some(deleted), Some(released)) => Some(deleted - released),
+            _ => None,
+        };
+    }
 
     let commits = &writer_outcome.commits;
     let paced = commits
@@ -1305,6 +1500,7 @@ fn run_phase<'db>(
     let summary = PhaseSummary {
         name: phase.name.clone(),
         baseline_name: phase.baseline_phase.clone(),
+        after_baseline_name: phase.after_baseline_phase.clone(),
         pacing: phase.pacing_label(),
         block_interval_ms: phase.block_interval_ms,
         density_multiplier: phase.density_multiplier,
@@ -1359,6 +1555,8 @@ fn run_phase<'db>(
         compaction_at_end,
         wallet_detached: writer_outcome.wallet_detached.clone(),
         peak_rss_bytes_end: process_memory().peak_rss_bytes,
+        ballast,
+        host,
     };
     shared.clock.event(
         shared.outputs,
@@ -1483,6 +1681,33 @@ fn fail_checks(
                 },
             );
         let total_ratio = ratio(phase.total_commit_s.p99, phase_baseline_total);
+        let after_baseline = phase
+            .after_baseline_name
+            .as_deref()
+            .and_then(|name| phases.iter().find(|candidate| candidate.name == name));
+        let after_ratio =
+            after_baseline.and_then(|base| ratio(phase.total_commit_s.p99, base.total_commit_s.p99));
+        let phase_cycles = cycles
+            .iter()
+            .filter(|cycle| cycle.phase == phase.name)
+            .collect::<Vec<_>>();
+        let reader_errors = phase_cycles
+            .iter()
+            .filter(|cycle| cycle.error.is_some())
+            .count();
+        let untruncated_snapshot = phase_cycles
+            .iter()
+            .filter(|cycle| cycle.snapshot && !cycle.hold_truncated && cycle.error.is_none())
+            .collect::<Vec<_>>();
+        let holds_short_of_target = untruncated_snapshot
+            .iter()
+            .filter(|cycle| cycle.hold_actual_s + 0.05 < cycle.hold_target_s)
+            .count();
+        let min_untruncated_hold_s = untruncated_snapshot
+            .iter()
+            .filter(|cycle| cycle.hold_target_s >= 1.0)
+            .map(|cycle| cycle.hold_actual_s)
+            .reduce(f64::min);
         let canonical_ratio = ratio(phase.canonical_commit_s.p99, phase_baseline_canonical);
         let snapshot_reader_violations = cycles
             .iter()
@@ -1503,6 +1728,11 @@ fn fail_checks(
             canonical_p99_ratio_to_baseline: canonical_ratio,
             p99_over_1s: phase.total_commit_s.p99 > 1.0,
             p99_over_2x_baseline: total_ratio.is_some_and(|ratio| ratio > 2.0),
+            after_baseline_phase: after_baseline.map(|base| base.name.clone()),
+            total_p99_ratio_to_after_baseline: after_ratio,
+            p99_over_2x_both_baselines: after_ratio.map(|after| {
+                after > 2.0 && total_ratio.is_some_and(|before| before > 2.0)
+            }),
             stop_stalls,
             write_stopped_samples,
             snapshot_reader_violations,
@@ -1518,12 +1748,29 @@ fn fail_checks(
                 .index_attach
                 .as_ref()
                 .map(|attach| attach.final_switch_writer_blocked_seconds),
+            attach_ingest_probe_max_write_s: phase
+                .index_attach
+                .as_ref()
+                .and_then(|attach| attach.ingest_probe.as_ref())
+                .map(|probe| probe.max_overlapping_write_s),
+            reader_errors,
+            holds_short_of_target,
+            min_untruncated_hold_s,
+            wallet_detached: phase.wallet_detached.is_some()
+                || phase
+                    .replacements
+                    .iter()
+                    .any(|replacement| replacement.wallet_error.is_some()),
         };
         checks.any_stop_stall |= stop_stalls > 0 || write_stopped_samples > 0;
         checks.any_snapshot_reader_torn_view |= snapshot_reader_violations > 0;
         checks.control_readers_detected_changes |= control_reader_violations > 0;
         checks.any_p99_over_1s |= check.p99_over_1s;
         checks.any_p99_over_2x_baseline |= check.p99_over_2x_baseline;
+        checks.any_p99_over_2x_both_baselines |= check.p99_over_2x_both_baselines == Some(true);
+        checks.any_reader_errors |= check.reader_errors > 0;
+        checks.any_hold_short_of_target |= check.holds_short_of_target > 0;
+        checks.any_wallet_detached |= check.wallet_detached;
         checks.phases.push(check);
     }
     checks

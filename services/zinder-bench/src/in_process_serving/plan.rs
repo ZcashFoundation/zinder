@@ -38,6 +38,9 @@ pub(crate) struct Phase {
     /// Phase whose commit p99 this phase is compared with; defaults to the run baseline.
     #[serde(default)]
     pub(crate) baseline_phase: Option<String>,
+    /// No-reader phase after the treatment, for an A-B-A comparison.
+    #[serde(default)]
+    pub(crate) after_baseline_phase: Option<String>,
 }
 
 fn one() -> f64 {
@@ -226,6 +229,7 @@ fn base_phase(name: &str, block_interval_ms: u64) -> Phase {
         density_multiplier: 1.0,
         compact_all_at_end: false,
         baseline_phase: None,
+        after_baseline_phase: None,
     }
 }
 
@@ -321,8 +325,9 @@ pub(crate) fn smoke_plan() -> Plan {
     }
 }
 
-/// Full plan for the measured Testnet run (about 3 h 30 min of wall time plus the
-/// index-attach extension; about 21,500 replayed blocks).
+/// Full plan for the measured 1x Testnet run: Arms 1, 2, and 4 (about 2 h 50 min
+/// and about 16,700 replayed blocks). Every treatment phase names the no-reader
+/// phase before it and, where one exists, a no-reader phase after it.
 pub(crate) fn measured_plan() -> Plan {
     let accelerated = 500;
     let mut baseline = base_phase("baseline-no-readers", accelerated);
@@ -341,12 +346,17 @@ pub(crate) fn measured_plan() -> Plan {
             kept: 500,
         },
     ];
+    let after = Some("post-30m-release".to_owned());
     let mut hold_1s = base_phase("hold-1s", accelerated);
-    hold_1s.duration_seconds = Some(600);
+    hold_1s.duration_seconds = Some(300);
     hold_1s.readers = hold_readers(8, 1.0, 10_000);
+    hold_1s.baseline_phase = Some("baseline-no-readers".to_owned());
+    hold_1s.after_baseline_phase = after.clone();
     let mut hold_30s = base_phase("hold-30s", accelerated);
     hold_30s.duration_seconds = Some(600);
     hold_30s.readers = hold_readers(8, 30.0, 10_000);
+    hold_30s.baseline_phase = Some("baseline-no-readers".to_owned());
+    hold_30s.after_baseline_phase = after.clone();
     let mut hold_5m = base_phase("hold-5m-with-replacements", accelerated);
     hold_5m.duration_seconds = Some(960);
     hold_5m.readers = hold_readers(8, 300.0, 10_000);
@@ -378,17 +388,24 @@ pub(crate) fn measured_plan() -> Plan {
             kept: 500,
         },
     ];
+    hold_5m.baseline_phase = Some("replacements-no-readers".to_owned());
+    hold_5m.after_baseline_phase = after.clone();
     let mut hold_30m = base_phase("hold-30m", accelerated);
     hold_30m.duration_seconds = Some(1_860);
     hold_30m.readers = hold_readers(8, 1_800.0, 10_000);
+    hold_30m.baseline_phase = Some("baseline-no-readers".to_owned());
+    hold_30m.after_baseline_phase = after;
     let mut post = base_phase("post-30m-release", accelerated);
     post.duration_seconds = Some(900);
     post.compact_all_at_end = true;
+    post.baseline_phase = Some("baseline-no-readers".to_owned());
     let mut realtime = base_phase("realtime-25s-hold-5m", 25_000);
     realtime.duration_seconds = Some(1_800);
     realtime.readers = hold_readers(8, 300.0, 10_000);
+    realtime.baseline_phase = Some("baseline-no-readers".to_owned());
+    realtime.after_baseline_phase = Some("post-30m-release".to_owned());
     let mut attach = base_phase("index-attach", accelerated);
-    attach.duration_seconds = Some(1_800);
+    attach.duration_seconds = Some(960);
     attach.readers = vec![
         ReaderSpec::WalletFamily {
             count: 2,
@@ -397,10 +414,11 @@ pub(crate) fn measured_plan() -> Plan {
             snapshot: true,
             paced_interval_ms: 250,
         },
-        // Starts before the switch and still holds the old family when it is dropped.
+        // Start before the switch and still hold the old family when it is dropped
+        // (drop at about 500 s: 30 s start, about 420 s of SST build, verify, 30 s).
         ReaderSpec::WalletFamily {
-            count: 1,
-            hold_seconds: 1_500.0,
+            count: 2,
+            hold_seconds: 900.0,
             family: "transparent_spent_output".to_owned(),
             snapshot: true,
             paced_interval_ms: 250,
@@ -411,13 +429,17 @@ pub(crate) fn measured_plan() -> Plan {
         family: "transparent_spent_output".to_owned(),
         drop_after_seconds: 30.0,
         final_gap_blocks: 2,
-        wait_for_old_files_seconds: 600.0,
+        // Longer than the 900 s holders' remaining hold after the drop, plus margin.
+        wait_for_old_files_seconds: 1_200.0,
     });
+    attach.baseline_phase = Some("baseline-no-readers".to_owned());
+    attach.after_baseline_phase = Some("load-baseline-no-readers".to_owned());
     let mut load_baseline = base_phase("load-baseline-no-readers", accelerated);
     load_baseline.duration_seconds = Some(300);
     let mut load = base_phase("serving-load", accelerated);
     load.duration_seconds = Some(900);
     load.baseline_phase = Some("load-baseline-no-readers".to_owned());
+    load.after_baseline_phase = Some("load-baseline-after".to_owned());
     load.load = Some(LoadSpec {
         compact_workers: 8,
         wallet_workers: 8,
@@ -425,14 +447,9 @@ pub(crate) fn measured_plan() -> Plan {
         compact_range_blocks: 1_000,
         think_time_ms: 0,
     });
-    let mut density_baseline = base_phase("density-x10-no-readers", accelerated);
-    density_baseline.duration_seconds = Some(600);
-    density_baseline.density_multiplier = 10.0;
-    let mut density = base_phase("density-x10-hold-5m", accelerated);
-    density.duration_seconds = Some(960);
-    density.density_multiplier = 10.0;
-    density.readers = hold_readers(8, 300.0, 10_000);
-    density.baseline_phase = Some("density-x10-no-readers".to_owned());
+    let mut load_after = base_phase("load-baseline-after", accelerated);
+    load_after.duration_seconds = Some(300);
+    load_after.baseline_phase = Some("load-baseline-no-readers".to_owned());
     Plan {
         phases: vec![
             baseline,
@@ -446,8 +463,32 @@ pub(crate) fn measured_plan() -> Plan {
             attach,
             load_baseline,
             load,
-            density_baseline,
-            density,
+            load_after,
         ],
+    }
+}
+
+/// Density arm, run as its own process from the same input stores: a 30-minute
+/// no-reader segment, a 30-minute hold, and 15 minutes of natural compaction after
+/// release before a full manual compaction. The multiplier is set with
+/// `--density-multiplier-override` (default 10).
+pub(crate) fn density_plan() -> Plan {
+    let accelerated = 500;
+    let mut before = base_phase("density-no-readers", accelerated);
+    before.duration_seconds = Some(1_800);
+    before.density_multiplier = 10.0;
+    let mut hold = base_phase("density-hold-30m", accelerated);
+    hold.duration_seconds = Some(1_860);
+    hold.density_multiplier = 10.0;
+    hold.readers = hold_readers(8, 1_800.0, 10_000);
+    hold.baseline_phase = Some("density-no-readers".to_owned());
+    hold.after_baseline_phase = Some("density-post-release".to_owned());
+    let mut post = base_phase("density-post-release", accelerated);
+    post.duration_seconds = Some(900);
+    post.density_multiplier = 10.0;
+    post.compact_all_at_end = true;
+    post.baseline_phase = Some("density-no-readers".to_owned());
+    Plan {
+        phases: vec![before, hold, post],
     }
 }

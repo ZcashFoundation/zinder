@@ -5,7 +5,10 @@
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
-    sync::{atomic::Ordering, mpsc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -25,6 +28,7 @@ use zinder_wallet_rocksdb::{
 };
 
 use super::{
+    observer::BALLAST_COLUMN_FAMILY,
     plan::IndexAttachSpec,
     readers::MANIFEST_COLUMN_FAMILY,
     stats::{process_memory, sst_files_on_disk},
@@ -108,7 +112,117 @@ pub(crate) struct IndexAttachRecord {
     /// Seconds after `drop_cf` until every old-family SST file was deleted, if observed.
     pub(crate) old_family_files_deleted_after_s: Option<f64>,
     pub(crate) wallet_disk_sst_bytes_after_old_files_deleted: Option<u64>,
+    /// Run-clock time when every old-family SST file was gone, if observed.
+    pub(crate) old_family_files_deleted_t: Option<f64>,
+    /// Synced-write probe of the wallet database around the ingest call.
+    pub(crate) ingest_probe: Option<IngestProbe>,
+    /// Filled after the phase from reader cycles that held the old family at the drop.
+    pub(crate) old_family_holders_at_drop: Vec<OldFamilyHolder>,
+    pub(crate) last_old_family_holder_release_t: Option<f64>,
+    /// Seconds from the last holder's release to the old files leaving disk.
+    pub(crate) files_deleted_after_last_holder_release_s: Option<f64>,
     pub(crate) error: Option<String>,
+}
+
+/// Latency of tiny synced writes to the same wallet database around the ingest.
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct IngestProbeWindow {
+    pub(crate) writes: usize,
+    pub(crate) p50_s: f64,
+    pub(crate) p99_s: f64,
+    pub(crate) max_s: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct IngestProbe {
+    /// Writes that finished before the ingest call started.
+    pub(crate) before: IngestProbeWindow,
+    /// Writes whose interval overlapped the ingest call.
+    pub(crate) overlapping: IngestProbeWindow,
+    /// Writes that started after the ingest call returned.
+    pub(crate) after: IngestProbeWindow,
+    /// Longest single probe write that overlapped the ingest call.
+    pub(crate) max_overlapping_write_s: f64,
+}
+
+/// A reader that held the old family when it was dropped.
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct OldFamilyHolder {
+    pub(crate) reader: String,
+    pub(crate) t_start: f64,
+    pub(crate) t_release: f64,
+    pub(crate) violation_count: u64,
+    pub(crate) error: Option<String>,
+    pub(crate) family_dropped_before_release: Option<bool>,
+}
+
+fn probe_window(values: &[f64]) -> IngestProbeWindow {
+    let summary = super::stats::LatencySummary::from_values(values);
+    IngestProbeWindow {
+        writes: summary.count,
+        p50_s: summary.p50,
+        p99_s: summary.p99,
+        max_s: summary.max,
+    }
+}
+
+/// Runs `ingest` while a probe thread issues tiny synced writes to `db`, one
+/// second before and after it, and classifies each probe write by overlap.
+fn probe_ingest<T>(db: &DB, ingest: impl FnOnce() -> T) -> (T, IngestProbe) {
+    let stop = AtomicBool::new(false);
+    let origin = Instant::now();
+    std::thread::scope(|scope| {
+        let probe = scope.spawn(|| {
+            let mut writes = Vec::new();
+            let Some(family) = db.cf_handle(BALLAST_COLUMN_FAMILY) else {
+                return writes;
+            };
+            let mut options = WriteOptions::default();
+            options.set_sync(true);
+            let mut counter = 0_u64;
+            while !stop.load(Ordering::SeqCst) {
+                counter += 1;
+                let mut key = b"probe/".to_vec();
+                key.extend_from_slice(&counter.to_be_bytes());
+                let started = origin.elapsed().as_secs_f64();
+                let mut batch = WriteBatch::default();
+                batch.put_cf(&family, &key, b"p");
+                let _ = db.write_opt(&batch, &options);
+                writes.push((started, origin.elapsed().as_secs_f64()));
+            }
+            writes
+        });
+        std::thread::sleep(Duration::from_secs(1));
+        let ingest_started = origin.elapsed().as_secs_f64();
+        let output = ingest();
+        let ingest_ended = origin.elapsed().as_secs_f64();
+        std::thread::sleep(Duration::from_secs(1));
+        stop.store(true, Ordering::SeqCst);
+        let writes = probe.join().unwrap_or_default();
+        let latency = |(start, end): &(f64, f64)| end - start;
+        let before = writes
+            .iter()
+            .filter(|(_, end)| *end <= ingest_started)
+            .map(latency)
+            .collect::<Vec<_>>();
+        let overlapping = writes
+            .iter()
+            .filter(|(start, end)| *start < ingest_ended && *end > ingest_started)
+            .map(latency)
+            .collect::<Vec<_>>();
+        let after = writes
+            .iter()
+            .filter(|(start, _)| *start >= ingest_ended)
+            .map(latency)
+            .collect::<Vec<_>>();
+        let probe = IngestProbe {
+            before: probe_window(&before),
+            max_overlapping_write_s: overlapping.iter().copied().fold(0.0, f64::max),
+            overlapping: probe_window(&overlapping),
+            after: probe_window(&after),
+        };
+        (output, probe)
+    })
 }
 
 pub(crate) struct AttachContext<'run> {
@@ -290,15 +404,25 @@ fn attach_body<'db>(
     ingest.set_snapshot_consistency(true);
     ingest.set_allow_global_seqno(true);
     ingest.set_allow_blocking_flush(false);
-    record.ingest_started_t = shared.clock.t();
-    let started = Instant::now();
-    if !paths.is_empty() {
-        wallet_db
-            .ingest_external_file_cf_opts(&new_handle, &ingest, paths)
-            .map_err(|error| format!("ingest failed: {error}"))?;
-    }
-    record.ingest_seconds = started.elapsed().as_secs_f64();
-    record.ingest_ended_t = shared.clock.t();
+    let mut ingest_timing = (0.0, 0.0, 0.0);
+    let (ingested, probe) = probe_ingest(wallet_db, || {
+        let started_t = shared.clock.t();
+        let started = Instant::now();
+        let outcome = if paths.is_empty() {
+            Ok(())
+        } else {
+            wallet_db
+                .ingest_external_file_cf_opts(&new_handle, &ingest, paths)
+                .map_err(|error| format!("ingest failed: {error}"))
+        };
+        ingest_timing = (started_t, started.elapsed().as_secs_f64(), shared.clock.t());
+        outcome
+    });
+    record.ingest_started_t = ingest_timing.0;
+    record.ingest_seconds = ingest_timing.1;
+    record.ingest_ended_t = ingest_timing.2;
+    record.ingest_probe = Some(probe);
+    ingested?;
     drop(new_handle);
     let _ = std::fs::remove_dir_all(&staging);
 
@@ -474,6 +598,7 @@ fn attach_body<'db>(
     while wait_started.elapsed() < wait_limit {
         if old_files.iter().all(|path| !path.exists()) {
             record.old_family_files_deleted_after_s = Some(wait_started.elapsed().as_secs_f64());
+            record.old_family_files_deleted_t = Some(shared.clock.t());
             record.wallet_disk_sst_bytes_after_old_files_deleted =
                 Some(sst_files_on_disk(&wallet_dir).0);
             break;
