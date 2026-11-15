@@ -4,3 +4,4 @@
 )]
 
 mod env_var_contract;
+mod runtime_allocator;

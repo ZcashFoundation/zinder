@@ -5,7 +5,7 @@
 | Status | Accepted |
 | Product | Zinder |
 | Domain | Initial sync scheduling, materialized-view replay, RocksDB resource and volume space ownership |
-| Related | [ADR-0015](0015-phase-driven-ingest.md), [ADR-0017](0017-materialized-view-consumer-and-key-codec.md), [ADR-0020](0020-bounded-rocksdb-resource-budget.md), [ADR-0029](0029-durable-transparent-outpoint-spend-projection.md) |
+| Related | [ADR-0015](0015-phase-driven-ingest.md), [ADR-0017](0017-materialized-view-consumer-and-key-codec.md), [ADR-0020](0020-bounded-rocksdb-resource-budget.md), [ADR-0029](0029-durable-transparent-outpoint-spend-projection.md), [ADR-0044](0044-service-binaries-allocate-through-jemalloc.md) |
 
 ## Context
 
@@ -35,7 +35,7 @@ Materialized-view replay derives transparent spend facts from block-local canoni
 
 1. Outputs produced inside the range.
 2. The replay host's in-memory prevout cache, which holds the unspent outputs that earlier ranges produced.
-3. The transaction-location index and the producing block's replay row, with one location read per distinct parent transaction and one row read per distinct producing height. These reads are independent, so they run on up to 16 threads, bounded by the process's available parallelism.
+3. The transaction-location index and the producing block's replay row, with one location read per distinct parent transaction and one row read per distinct producing height. These reads are independent, so they run on up to 16 threads, bounded by the process's available parallelism. Each thread allocates through jemalloc ([ADR-0044](0044-service-binaries-allocate-through-jemalloc.md)). Under glibc malloc with a capped arena count, the threads serialized on the allocator's locks.
 
 An input whose previous output cannot be resolved is a replay error, not an unresolved fact. Building or recovering a materialized-view store requires canonical history that is complete from height 1, so every previous output is retained.
 
@@ -89,3 +89,4 @@ Neither canonical nor materialized-view layouts migrate in place. A store whose 
 
 - 2026-11-14: Added the prevout cache as the second step of spend resolution, with its continuity rule, memory bound, and release points. Added the volume free-space guard for Explorer view replay and `ingest.explorer_views_min_free_bytes`.
 - 2026-11-15: Canonical prevout reads run on up to 16 threads, and a walk that resumes partway through history warms its empty prevout cache from canonical history first. The transparent-address ranking build moved into stage 2: it runs beside replay and joins views that are still rebuilding at their materialized height. View column families compress with ZSTD.
+- 2026-11-15: Canonical read threads allocate through jemalloc, which ADR-0044 installs in every service binary.

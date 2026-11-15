@@ -53,6 +53,7 @@ pub mod mock_transaction_broadcaster;
 pub mod network_upgrade_fixtures;
 pub mod orchard_test_key;
 pub mod process_crash;
+pub mod runtime_allocator;
 pub mod transparent_signer;
 pub mod wallet_serving_store_fixture;
 
@@ -84,6 +85,7 @@ pub use network_upgrade_fixtures::{
     local_network_from_activations, sample_regtest_upgrade_activations,
 };
 pub use orchard_test_key::{OrchardAddress, OrchardTestKey, regtest_unified_address};
+pub use runtime_allocator::check_binary_allocates_through_jemalloc;
 pub use transparent_signer::{
     LocalNetwork, P2pkhShieldingSpendArgs, P2pkhSpendArgs, ShieldedOutputPool,
     TRANSPARENT_BROADCAST_TEST_SEED, TransparentAddress, TransparentSignerError,

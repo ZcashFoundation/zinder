@@ -22,6 +22,9 @@ mod config;
 
 use config::{ExplorerConfig, ExplorerConfigError, ExplorerConfigOverrides};
 
+#[global_allocator]
+static GLOBAL_ALLOCATOR: zinder_runtime::RuntimeAllocator = zinder_runtime::RuntimeAllocator;
+
 /// Cadence the background task uses to advance the secondary's view to the
 /// primary's latest durable state.
 const MATERIALIZED_VIEW_CATCHUP_INTERVAL: Duration = Duration::from_secs(1);

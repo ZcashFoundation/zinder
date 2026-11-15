@@ -1,0 +1,6 @@
+kind: fixed
+body: "Explorer view replay and the transparent-address ranking build no longer slow to a few dozen blocks per minute when a deployment caps glibc malloc arenas, as `MALLOC_ARENA_MAX=2` does; on a Mainnet-shaped fixture with that setting, replay ran about 24 times faster. Every service binary now allocates through jemalloc on Linux, including RocksDB's native allocations, so glibc malloc variables such as `MALLOC_ARENA_MAX` no longer apply. Remove them from the deployment and tune the allocator with `MALLOC_CONF` instead. Peak memory stayed within about 10% of glibc's on the same workload."
+time: 2026-11-15T08:38:41Z
+custom:
+  Bump: minor
+  PR: "199"

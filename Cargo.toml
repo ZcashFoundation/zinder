@@ -74,6 +74,9 @@ sapling = { package = "sapling-crypto", version = "0.9.0", default-features = fa
 subtle = "2.6.1"
 tempfile = "3.27.0"
 thiserror = "2.0.19"
+# Unprefixed symbols replace the C library `malloc`, so RocksDB's native
+# allocations share jemalloc with Rust code instead of glibc's arena locks.
+tikv-jemallocator = { version = "0.7.0", features = ["unprefixed_malloc_on_supported_platforms"] }
 time = { version = "0.3.54", features = ["formatting"] }
 tokio = { version = "1.53.1", features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-postgres = { version = "=0.7.18", default-features = false, features = ["runtime"] }

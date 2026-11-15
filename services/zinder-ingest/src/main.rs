@@ -52,6 +52,9 @@ use crate::config::{
 mod cli;
 mod config;
 
+#[global_allocator]
+static GLOBAL_ALLOCATOR: zinder_runtime::RuntimeAllocator = zinder_runtime::RuntimeAllocator;
+
 const REQUIRED_INGEST_NODE_CAPABILITIES: &[NodeCapability] = &[
     NodeCapability::JsonRpc,
     NodeCapability::BestChainBlocks,

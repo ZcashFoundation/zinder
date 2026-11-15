@@ -6,6 +6,7 @@ mod native_grpc;
 mod node_backed_capabilities;
 mod query_request_metrics;
 mod reflection;
+mod runtime_allocator;
 mod single_artifact_lookup;
 mod stream_cancellation;
 mod transaction_broadcast;

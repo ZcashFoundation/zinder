@@ -308,12 +308,15 @@ jobs:
             docker: linux/amd64
             rust: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
+            jemalloc_page_size: 4096
           - name: aarch64-unknown-linux-gnu
             arch: arm64
             docker: linux/arm64
             rust: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
+            jemalloc_page_size: 65536
     env:
+      JEMALLOC_PAGE_SIZE: ${{ matrix.platform.jemalloc_page_size }}
       RELEASE_CACHE_SCOPE: release-${{ needs.validate.outputs.commit }}-${{ matrix.platform.rust }}-1
       RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
       RELEASE_TAG: ${{ github.ref_name }}
@@ -369,6 +372,7 @@ jobs:
 
           docker run --rm \
             --platform "$TARGET_PLATFORM" \
+            --env JEMALLOC_PAGE_SIZE \
             --volume "${export_root}/bin:/opt/zinder/bin:ro" \
             debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 \
             sh -ec '
@@ -377,6 +381,9 @@ jobs:
               for binary in /opt/zinder/bin/*; do
                 "$binary" --version
                 "$binary" --help >/dev/null
+                MALLOC_CONF=stats_print:true "$binary" --version 2>&1 >/dev/null \
+                  | grep -Fqx "Page size: ${JEMALLOC_PAGE_SIZE}" \
+                  || { echo "$binary: jemalloc page size is not ${JEMALLOC_PAGE_SIZE}" >&2; exit 1; }
               done
             '
 

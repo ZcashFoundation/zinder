@@ -16,6 +16,8 @@
 //!   `defaults -> file -> ZINDER_* env -> CLI overrides` precedence.
 //! - Two thin lifecycle helpers used by every binary entry point:
 //!   [`cancel_on_terminating_signal`] and [`install_tracing_subscriber`].
+//! - The process allocator every binary entry point installs
+//!   ([`RuntimeAllocator`]).
 //! - The process-wide Prometheus metrics recorder
 //!   ([`install_metrics_recorder`], [`install_metrics_recorder_for_service`]).
 //! - Canonical secondary attestation against `CanonicalControl.WriterStatus`
@@ -26,6 +28,7 @@
 //! It deliberately defines no storage or protocol types of its own; it
 //! composes those owned by `zinder-core`, `zinder-proto`, and `zinder-store`.
 
+mod allocator;
 mod auth;
 mod bind_guard;
 mod canonical_fence_attestation;
@@ -42,6 +45,7 @@ mod sections;
 mod startup_phase;
 mod transport;
 
+pub use allocator::RuntimeAllocator;
 pub use auth::{
     AuthenticatedChannel, BearerToken, BearerTokenClientInterceptor, BearerTokenConnectError,
     BearerTokenError, BearerTokenServerInterceptor, bearer_metadata,

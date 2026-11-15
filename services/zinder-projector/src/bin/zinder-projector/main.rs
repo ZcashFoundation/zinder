@@ -52,6 +52,9 @@ use zinder_projector::state_bundle::{
     prepare_state_bundle_capture,
 };
 
+#[global_allocator]
+static GLOBAL_ALLOCATOR: zinder_runtime::RuntimeAllocator = zinder_runtime::RuntimeAllocator;
+
 const CANONICAL_FENCE_CONVERGENCE_INITIAL_DELAY: Duration = Duration::from_millis(50);
 const CANONICAL_FENCE_CONVERGENCE_SYNCING_AFTER: Duration = Duration::from_secs(1);
 const CANONICAL_FENCE_CONVERGENCE_MAX_DELAY: Duration = Duration::from_secs(1);

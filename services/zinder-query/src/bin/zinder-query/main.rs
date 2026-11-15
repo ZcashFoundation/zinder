@@ -27,6 +27,9 @@ mod config;
 
 use config::{QueryConfigError, QueryConfigOverrides};
 
+#[global_allocator]
+static GLOBAL_ALLOCATOR: zinder_runtime::RuntimeAllocator = zinder_runtime::RuntimeAllocator;
+
 /// Longest the gRPC server may drain after shutdown starts before open calls
 /// are abandoned.
 ///

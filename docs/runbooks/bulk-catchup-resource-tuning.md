@@ -75,6 +75,16 @@ metrics prove that compaction is the bottleneck and the host has spare CPU and
 I/O. Raising caches or memtables to hide an undersized container merely moves
 the failure boundary.
 
+## Allocator
+
+Linux service binaries allocate through jemalloc, including RocksDB's native
+allocations. Remove glibc malloc settings, such as `MALLOC_ARENA_MAX`, from the
+deployment. They no longer apply. Tune jemalloc through `MALLOC_CONF` instead.
+For example, `MALLOC_CONF=background_thread:true` returns freed memory to the
+kernel even while the process is idle. As with other limits, compare peak memory
+and throughput on the same chain range before and after a change. See
+[ADR-0044](../adrs/0044-service-binaries-allocate-through-jemalloc.md).
+
 ## Recover after resource exhaustion
 
 Stop the restart loop, correct the container limit or the pressured stage's
@@ -91,5 +101,6 @@ replacement is ready.
 
 - [ADR-0020: Bounded RocksDB resource budget](../adrs/0020-bounded-rocksdb-resource-budget.md)
 - [ADR-0022: Resource-budgeted bulk catchup](../adrs/0022-resource-budgeted-bulk-catchup.md)
+- [ADR-0044: Service binaries allocate through jemalloc](../adrs/0044-service-binaries-allocate-through-jemalloc.md)
 - [Initial sync](initial-sync.md)
 - [Storage backend](../architecture/storage-backend.md)

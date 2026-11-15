@@ -5,3 +5,4 @@ mod cli;
 mod env_var_contract;
 mod fixture_block;
 mod materialized_view_replay;
+mod runtime_allocator;
