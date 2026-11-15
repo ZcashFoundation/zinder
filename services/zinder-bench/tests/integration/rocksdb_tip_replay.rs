@@ -584,6 +584,62 @@ async fn tip_replay_reports_compare_and_name_their_setting_differences() -> Resu
 }
 
 #[tokio::test]
+async fn tip_replay_comparison_refuses_reports_summarized_by_different_methods() -> Result<()> {
+    let inputs = prepare_inputs().await?;
+    let scratch = inputs.directory.path().join("scratch");
+    let report = inputs.directory.path().join("report.json");
+    let output = run_tip_replay(
+        &inputs,
+        &inputs.fixture(),
+        &[
+            "--scratch-dir",
+            &scratch.to_string_lossy(),
+            "--report",
+            &report.to_string_lossy(),
+        ],
+    )?;
+    require_success(&output, "tip replay")?;
+
+    for (field, replacement, expected) in [
+        (
+            "stratum_rules",
+            None,
+            "the baseline and candidate stratum rules differ",
+        ),
+        (
+            "percentile_method",
+            Some(Value::from("linear-interpolation")),
+            "the candidate percentile method linear-interpolation is not the supported nearest-rank method",
+        ),
+    ] {
+        let mut candidate = read_json(&report)?;
+        let method = &mut candidate["method"][field];
+        *method = replacement.unwrap_or_else(|| {
+            let mut rules = method.clone();
+            rules["after_dense_window_heights"] = Value::from(1);
+            rules
+        });
+        let mutated_path = inputs
+            .directory
+            .path()
+            .join(format!("mutated-{field}.json"));
+        std::fs::write(&mutated_path, serde_json::to_vec_pretty(&candidate)?)?;
+        let refused_path = inputs
+            .directory
+            .path()
+            .join(format!("refused-{field}.json"));
+
+        let refused = compare_reports(&report, &mutated_path, &refused_path)?;
+
+        assert!(!refused.status.success());
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(stderr.contains(expected), "{stderr}");
+        assert!(!refused_path.exists());
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn tip_replay_fails_with_the_source_error_when_a_fixture_segment_becomes_unreadable()
 -> Result<()> {
     let inputs = prepare_inputs().await?;
@@ -706,6 +762,33 @@ async fn tip_replay_refuses_a_fixture_that_does_not_extend_the_canonical_tip() -
     assert!(String::from_utf8_lossy(&output.stderr).contains("is not the parent"));
     assert!(!report.exists());
     assert!(!scratch.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn tip_replay_refuses_a_report_path_that_is_the_scratch_dir() -> Result<()> {
+    let inputs = prepare_inputs().await?;
+    let output_path = inputs.directory.path().join("shared-output");
+
+    let output = run_tip_replay(
+        &inputs,
+        &inputs.fixture(),
+        &[
+            "--scratch-dir",
+            &output_path.to_string_lossy(),
+            "--report",
+            &output_path.to_string_lossy(),
+            "--keep-scratch",
+        ],
+    )?;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--scratch-dir and --report must not contain each other"),
+        "{stderr}"
+    );
+    assert!(!output_path.exists());
     Ok(())
 }
 

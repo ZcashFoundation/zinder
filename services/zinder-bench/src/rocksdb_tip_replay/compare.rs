@@ -163,15 +163,30 @@ fn read_report(path: &std::path::Path) -> Result<TipReplayReport, BenchError> {
 }
 
 /// Timings are comparable only for the same blocks, replayed as many times,
-/// from the same start state.
+/// from the same start state, and summarized by the same method.
 ///
 /// The pooled summaries count every block of every repeat, so their totals
-/// and block counts scale with the repeat count. A change that alters the
+/// and block counts scale with the repeat count. Stratum rules decide which
+/// blocks each stratum holds, and the comparison names [`PERCENTILE_METHOD`]
+/// as the method of every percentile it compares. A change that alters the
 /// final state is a correctness failure.
 fn require_same_workload(
     baseline: &TipReplayReport,
     candidate: &TipReplayReport,
 ) -> Result<(), BenchError> {
+    for (role, report) in [("baseline", baseline), ("candidate", candidate)] {
+        let method = &report.method.percentile_method;
+        if method != PERCENTILE_METHOD {
+            return Err(BenchError::report_format(format!(
+                "the {role} percentile method {method} is not the supported {PERCENTILE_METHOD} method"
+            )));
+        }
+    }
+    if baseline.method.stratum_rules != candidate.method.stratum_rules {
+        return Err(BenchError::report_format(
+            "the baseline and candidate stratum rules differ, so their strata hold different blocks",
+        ));
+    }
     let (baseline_repeats, candidate_repeats) = (
         baseline.configuration.repeat_count,
         candidate.configuration.repeat_count,

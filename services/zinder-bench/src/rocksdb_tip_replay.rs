@@ -217,6 +217,7 @@ impl TipReplayPlan {
             scratch::require_disjoint((&scratch_dir, "scratch-dir"), (input, flag))?;
             scratch::require_disjoint((&report, "report"), (input, flag))?;
         }
+        scratch::require_disjoint((&scratch_dir, "scratch-dir"), (&report, "report"))?;
         scratch::require_disjoint(
             (&canonical_store, "canonical-store"),
             (&wallet_store, "wallet-store"),

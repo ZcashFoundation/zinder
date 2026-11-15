@@ -441,9 +441,11 @@ The comparison refuses reports of different fixtures or start states, and
 reports whose final canonical or wallet state differs, because a performance
 change must not change the result. It also refuses reports with different
 `--repeat` counts, because the pooled summaries count every block of every
-repeat, so their totals and block counts grow with the repeat count. It lists
-every build, host, and configuration setting that differs, so you can confirm
-that only the intended variable changed. For each stratum and timer it gives
+repeat, so their totals and block counts grow with the repeat count. It
+refuses reports whose stratum rules differ, because those rules decide which
+blocks each stratum holds, and reports whose percentile method is not
+`nearest-rank`. It lists every build, host, and configuration setting that
+differs, so you can confirm that only the intended variable changed. For each stratum and timer it gives
 the baseline, the candidate, and the percent change of every summary
 statistic, plus the mean block-loop wall and CPU time and the peak resident
 memory. Without `--report`, it writes to stdout.
