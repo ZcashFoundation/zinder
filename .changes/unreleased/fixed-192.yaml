@@ -1,0 +1,6 @@
+kind: fixed
+body: "`zinder-projector` no longer exits with `canonical secondary did not reach the writer fence before the convergence deadline` when a burst of blocks keeps the canonical writer committing ahead of it, which restarted every process in the single-volume wallet-serving runtime. It keeps applying the blocks its canonical secondary already holds while the writer is ahead, each still authenticated against the writer's retained events, and when an attempt to reach the writer lasts `projector.fence_convergence_timeout_seconds` it logs `canonical_secondary_behind_writer`, reports `replica_lagging`, and tries again. A ready projector also stays `ready` while its wallet trails the writer by any number of blocks, as long as it applies a block at least every 30 seconds and the trail lasts less than 2 minutes; it previously reported `syncing` whenever it trailed by two or more blocks."
+time: 2026-11-15T03:00:00Z
+custom:
+  Bump: patch
+  PR: "192"
