@@ -33,8 +33,9 @@ pub(super) fn canonical_read_workers() -> usize {
 /// Reads `items` in contiguous chunks on up to [`canonical_read_workers`]
 /// scoped threads and returns the chunk results in item order.
 ///
-/// Small inputs run on the calling thread. The first failing chunk's error is
-/// returned; the other chunks still run to completion first.
+/// Fewer than [`MIN_PARALLEL_READS`] point reads run on the calling thread.
+/// The first failing chunk's error is returned; the other chunks still run to
+/// completion first.
 pub(super) fn read_in_parallel<T, R>(
     items: &[T],
     read_chunk: impl Fn(&[T]) -> Result<Vec<R>, IngestError> + Sync,
@@ -43,8 +44,34 @@ where
     T: Sync,
     R: Send,
 {
+    read_chunks_in_parallel(items, MIN_PARALLEL_READS, read_chunk)
+}
+
+/// Reads each of `slices`, which are already sized as one worker's share of a
+/// larger read, on its own scoped thread when there are at least two, and
+/// returns the results in slice order.
+pub(super) fn read_slices_in_parallel<T, R>(
+    slices: &[T],
+    read_slice: impl Fn(&[T]) -> Result<Vec<R>, IngestError> + Sync,
+) -> Result<Vec<R>, IngestError>
+where
+    T: Sync,
+    R: Send,
+{
+    read_chunks_in_parallel(slices, 2, read_slice)
+}
+
+fn read_chunks_in_parallel<T, R>(
+    items: &[T],
+    min_parallel_items: usize,
+    read_chunk: impl Fn(&[T]) -> Result<Vec<R>, IngestError> + Sync,
+) -> Result<Vec<R>, IngestError>
+where
+    T: Sync,
+    R: Send,
+{
     let workers = canonical_read_workers();
-    if workers <= 1 || items.len() < MIN_PARALLEL_READS {
+    if workers <= 1 || items.len() < min_parallel_items {
         return read_chunk(items);
     }
     let chunk_len = items.len().div_ceil(workers);
@@ -87,6 +114,19 @@ mod tests {
             doubled,
             items.iter().map(|item| item * 2).collect::<Vec<_>>()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn worker_sized_slices_each_get_a_thread() -> Result<(), IngestError> {
+        let slices = (0..canonical_read_workers()).collect::<Vec<_>>();
+        let threads = read_slices_in_parallel(&slices, |chunk| {
+            Ok(chunk.iter().map(|_| thread::current().id()).collect())
+        })?;
+        assert_eq!(threads.len(), slices.len());
+        if slices.len() > 1 {
+            assert!(threads.iter().all(|id| *id != thread::current().id()));
+        }
         Ok(())
     }
 

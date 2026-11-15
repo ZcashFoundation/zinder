@@ -39,6 +39,7 @@ pub struct PrevoutCache {
     outputs: HashMap<TransparentOutPoint, CachedOutput>,
     heights: BTreeMap<BlockHeight, CachedHeight>,
     applied_through: Option<BlockId>,
+    warm_up_allowed: bool,
     metrics_label: Option<&'static str>,
 }
 
@@ -58,6 +59,7 @@ struct CachedOutput {
 #[derive(Debug)]
 pub(super) struct BlockPrevoutDelta {
     block: BlockId,
+    parent_hash: BlockHash,
     produced: Vec<(TransparentOutPoint, CachedOutput)>,
     spent: Vec<TransparentOutPoint>,
 }
@@ -91,6 +93,7 @@ impl BlockPrevoutDelta {
             .collect();
         Self {
             block: BlockId::new(header.height, header.block_hash),
+            parent_hash: header.parent_hash,
             produced,
             spent,
         }
@@ -119,6 +122,7 @@ impl PrevoutCache {
             outputs: HashMap::new(),
             heights: BTreeMap::new(),
             applied_through: None,
+            warm_up_allowed: true,
             metrics_label: None,
         }
     }
@@ -155,6 +159,34 @@ impl PrevoutCache {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.outputs.is_empty()
+    }
+
+    /// Returns whether a walker may still warm this cache from canonical
+    /// history.
+    pub(super) const fn warm_up_allowed(&self) -> bool {
+        self.warm_up_allowed
+    }
+
+    /// Returns whether `first` is the block right after the last one the cache
+    /// applied, or the cache has applied nothing.
+    pub(super) fn extends_to(&self, first: &BlockPrevoutDelta) -> bool {
+        self.applied_through.is_none_or(|applied| {
+            applied.height.next() == Some(first.block.height) && applied.hash == first.parent_hash
+        })
+    }
+
+    /// Empties the cache because its walker paused.
+    ///
+    /// A cache that held anything also stops being warmed for the rest of the
+    /// process. Memory pressure is one reason to pause, and a warm-up after
+    /// every such pause would refill the same memory before the walk advanced
+    /// a height. The walker resumes cold instead and the cache fills as it
+    /// walks.
+    pub fn release_for_pause(&mut self) {
+        if self.applied_through.is_some() || !self.outputs.is_empty() {
+            self.warm_up_allowed = false;
+        }
+        self.clear();
     }
 
     /// Drops every cached output and the applied chain position.

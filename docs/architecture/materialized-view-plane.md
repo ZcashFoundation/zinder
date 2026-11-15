@@ -249,7 +249,11 @@ walk, the host first warms the cache: it applies every retained block below the
 resume height in order, reading and decoding the rows on the same threads, so
 the cache holds what an uninterrupted walk from genesis would have held, up to
 its bound. Spends of outputs produced before a restart then resolve from memory
-instead of from their producing blocks.
+instead of from their producing blocks. The ranking build warms in bounded
+steps, so it never holds the shared canonical secondary longer than one build
+step. A pause empties the cache, and the walker then resumes cold for the rest
+of the process instead of warming again, so repeated memory-pressure pauses
+cannot stop it from advancing.
 
 Replay pauses while the volume that holds the canonical store, and therefore
 the view store, has less available space than

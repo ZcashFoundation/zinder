@@ -771,9 +771,9 @@ pub struct MaterializedViewTailer {
 /// Replay and the transparent-address ranking build walk different heights, so
 /// each has its own [`PrevoutCache`]. A cache holds memory only while there is
 /// history to walk. Each empties while its walker is paused, which returns its
-/// memory under memory pressure. The replay cache also empties once replay
-/// reaches the canonical fence, and the ranking cache once no ranking build is
-/// pending.
+/// memory under memory pressure, and is not warmed again afterwards. The
+/// replay cache also empties once replay reaches the canonical fence, and the
+/// ranking cache once no ranking build is pending.
 #[derive(Debug)]
 pub struct ReplayPrevoutCaches {
     replay: Mutex<PrevoutCache>,
@@ -795,7 +795,11 @@ impl ReplayPrevoutCaches {
     }
 
     fn release_replay(&self) {
-        self.replay.lock().clear();
+        self.replay.lock().release_for_pause();
+    }
+
+    fn release_ranking_build(&self) {
+        self.ranking_build.lock().release_for_pause();
     }
 }
 
@@ -835,9 +839,9 @@ impl MaterializedViewTailer {
         self.replay_event_only_consumers(&canonical)?;
         self.join_transparent_address_ranking_at_genesis(&canonical)?;
         self.replay_block_consumers(&canonical, pass)?;
-        if pass.budget.applied_state.is_paused()
-            || matches!(self.replay_caught_up(&canonical), Ok(true))
-        {
+        if pass.budget.applied_state.is_paused() {
+            self.prevout_caches.release_replay();
+        } else if matches!(self.replay_caught_up(&canonical), Ok(true)) {
             self.prevout_caches.replay.lock().clear();
         }
         Ok(())
@@ -1115,7 +1119,12 @@ impl MaterializedViewTailer {
         if transition.reverted.is_none()
             && block_count(committed) >= PREVOUT_CACHE_WARMUP_MIN_REMAINING_BLOCKS
             && let Some(below) = committed.start.value().checked_sub(1)
-            && !hydrator.warm_prevout_cache(BlockHeight::new(below), &mut || pass.yields())?
+            && !hydrator.warm_prevout_cache(BlockHeight::new(below), &mut || {
+                if pass.status_persist_is_due() {
+                    self.persist_status(canonical, pass.budget.applied_state);
+                }
+                pass.warm_up_window()
+            })?
         {
             return Ok(());
         }
@@ -1833,6 +1842,17 @@ impl ReplayPass {
 
     fn yields(&mut self) -> bool {
         self.budget.is_cancelled() || self.evaluate().state.is_paused()
+    }
+
+    /// Returns how many heights the next prevout-cache warm-up window may
+    /// span, which is one replay page under the current limits, or `None`
+    /// when the pass yields.
+    fn warm_up_window(&mut self) -> Option<u32> {
+        if self.budget.is_cancelled() {
+            return None;
+        }
+        let limits = self.evaluate();
+        (!limits.state.is_paused()).then_some(limits.batch_blocks)
     }
 
     /// Throttles the in-pass status refresh so a from-genesis rebuild keeps the

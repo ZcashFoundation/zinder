@@ -14,7 +14,7 @@
 //! A replay that resumes partway through the chain, as after a restart, must
 //! warm its empty cache from canonical history before it hydrates, so spends
 //! of outputs produced before the resume height do not read producing blocks
-//! either. The assertions count reads rather than time them, so they hold on
+//! either, also when the warm-up is interrupted and continued. The assertions count reads rather than time them, so they hold on
 //! any CI worker.
 
 use std::collections::BTreeMap;
@@ -135,7 +135,7 @@ fn a_resumed_replay_warms_its_cache_instead_of_reading_producing_blocks() -> eyr
     let (warmed_spends, warmed_reads) = with_prevout_metrics(|| {
         let mut reader =
             CanonicalBlockContextReader::with_prevout_cache(&secondary, &activations, &mut warmed);
-        assert!(reader.warm_prevout_cache(below_resume, &mut || false)?);
+        assert!(reader.warm_prevout_cache(below_resume, &mut || Some(u32::MAX))?);
         hydrate_pages_from(&mut reader, resume)
     })?;
 
@@ -151,28 +151,87 @@ fn a_resumed_replay_warms_its_cache_instead_of_reading_producing_blocks() -> eyr
 }
 
 #[test]
-fn an_interrupted_warm_up_leaves_the_cache_empty() -> eyre::Result<()> {
+fn an_interrupted_warm_up_continues_where_it_stopped() -> eyre::Result<()> {
     let activations = sample_regtest_upgrade_activations();
     let chain = transparent_dense_chain();
     let writer = CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &activations)?;
     let secondary_directory = TempDir::new()?;
-    let secondary = RocksDbCanonicalSecondary::open_ready(
-        writer.canonical_primary_path(),
-        secondary_directory.path().join("canonical-secondary"),
-        &activations,
-        CanonicalStoreWorkload::Wallet,
-        RawBlobRetention::None,
-        CanonicalReorgPolicy::new(FIXTURE_REORG_WINDOW_BLOCKS)?,
-        RocksDbResourceBudget::for_local_tests(),
-    )?;
+    let secondary = open_fixture_secondary(&writer, &secondary_directory, &activations)?;
+    let resume = BlockHeight::new(RESUME_HEIGHT);
+    let below_resume = BlockHeight::new(RESUME_HEIGHT - 1);
     let mut prevouts = PrevoutCache::new(1 << 20);
     let mut reader =
         CanonicalBlockContextReader::with_prevout_cache(&secondary, &activations, &mut prevouts);
 
-    assert!(!reader.warm_prevout_cache(BlockHeight::new(RESUME_HEIGHT - 1), &mut || true)?);
-    drop(reader);
+    let mut windows_allowed = 1_u32;
+    let interrupted_once = reader.warm_prevout_cache(below_resume, &mut || {
+        let window = (windows_allowed > 0).then_some(u32::MAX);
+        windows_allowed = windows_allowed.saturating_sub(1);
+        window
+    })?;
+    let (spends, reads) = with_prevout_metrics(|| {
+        assert!(reader.warm_prevout_cache(below_resume, &mut || Some(u32::MAX))?);
+        hydrate_pages_from(&mut reader, resume)
+    })?;
+    let (uncached_spends, _) = with_prevout_metrics(|| {
+        hydrate_pages_from(
+            &mut CanonicalBlockContextReader::new(&secondary, &activations),
+            resume,
+        )
+    })?;
+
+    assert!(
+        !interrupted_once,
+        "the fixture spans more than one warm-up window"
+    );
+    assert_eq!(spends, uncached_spends);
+    assert_eq!(reads.producing_block_reads, 0, "{reads:?}");
+    assert_eq!(reads.from_canonical, 0, "{reads:?}");
+    Ok(())
+}
+
+#[test]
+fn a_cache_released_for_a_pause_resumes_cold() -> eyre::Result<()> {
+    let activations = sample_regtest_upgrade_activations();
+    let chain = transparent_dense_chain();
+    let writer = CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &activations)?;
+    let secondary_directory = TempDir::new()?;
+    let secondary = open_fixture_secondary(&writer, &secondary_directory, &activations)?;
+    let below_resume = BlockHeight::new(RESUME_HEIGHT - 1);
+    let mut prevouts = PrevoutCache::new(1 << 20);
+    let mut warmed = 0_u32;
+    assert!(
+        !CanonicalBlockContextReader::with_prevout_cache(&secondary, &activations, &mut prevouts)
+            .warm_prevout_cache(below_resume, &mut || {
+            warmed = warmed.saturating_add(1);
+            (warmed == 1).then_some(u32::MAX)
+        })?
+    );
+    assert!(!prevouts.is_empty());
+
+    prevouts.release_for_pause();
+    assert!(
+        CanonicalBlockContextReader::with_prevout_cache(&secondary, &activations, &mut prevouts)
+            .warm_prevout_cache(below_resume, &mut || Some(u32::MAX))?
+    );
     assert!(prevouts.is_empty());
     Ok(())
+}
+
+fn open_fixture_secondary(
+    writer: &CanonicalWriterFixture,
+    secondary_directory: &TempDir,
+    activations: &zinder_core::NetworkUpgradeActivations,
+) -> eyre::Result<RocksDbCanonicalSecondary> {
+    Ok(RocksDbCanonicalSecondary::open_ready(
+        writer.canonical_primary_path(),
+        secondary_directory.path().join("canonical-secondary"),
+        activations,
+        CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::None,
+        CanonicalReorgPolicy::new(FIXTURE_REORG_WINDOW_BLOCKS)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?)
 }
 
 /// Spend facts per block, in input order.

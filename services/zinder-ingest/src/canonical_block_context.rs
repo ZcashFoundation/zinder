@@ -35,7 +35,7 @@ use zinder_store::{MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS, RocksDbCanonicalSeco
 
 use crate::{CanonicalBlockConstructionError, IngestError};
 
-use parallel_reads::{canonical_read_workers, read_in_parallel};
+use parallel_reads::{canonical_read_workers, read_in_parallel, read_slices_in_parallel};
 use prevout_cache::BlockPrevoutDelta;
 pub(crate) use prevout_cache::DEFAULT_PREVOUT_CACHE_MAX_OUTPUTS;
 pub use prevout_cache::PrevoutCache;
@@ -48,11 +48,12 @@ pub use prevout_cache::PrevoutCache;
 /// outputs through random canonical reads.
 pub(crate) const PREVOUT_CACHE_WARMUP_MIN_REMAINING_BLOCKS: u32 = 10_000;
 
-/// Heights one warm-up step decodes before it applies them to the cache.
+/// Most heights one warm-up step decodes before it applies them to the cache.
 ///
 /// The step's decoded deltas are held in memory until they are applied, so
-/// the window bounds that transient memory in transparent-dense history.
-const PREVOUT_CACHE_WARMUP_WINDOW_BLOCKS: u32 = 2_048;
+/// the window bounds that transient memory in transparent-dense history. The
+/// caller's window, normally its current replay page size, is capped here.
+const PREVOUT_CACHE_WARMUP_WINDOW_BLOCKS: u32 = 512;
 
 /// First height a canonical store retains when its history is complete.
 const GENESIS_COMPLETE_FIRST_HEIGHT: BlockHeight = BlockHeight::new(1);
@@ -123,47 +124,67 @@ impl<'canonical> CanonicalBlockContextReader<'canonical> {
         }
     }
 
-    /// Warms an empty or repositioned prevout cache with the unspent outputs
-    /// canonical history holds at `through`.
+    /// Warms a prevout cache with the unspent outputs canonical history holds
+    /// at `through`.
     ///
     /// The cache is rebuilt by applying every retained block from the first
     /// retained height through `through` in order, as an uninterrupted walk
     /// from genesis would have left it, up to its bound. Rows are read and
-    /// decoded on several threads one window at a time. `interrupted` is
-    /// sampled before each window; when it returns `true` the cache is emptied
-    /// and the warm-up reports `false`. A reader without a cache, a cache that
-    /// already ends at `through`, or a height below retained history needs no
-    /// walk.
+    /// decoded on several threads one window at a time. `next_window` is
+    /// sampled before each window and returns how many heights the window may
+    /// span, capped at 512. When it returns `None` the warm-up stops and
+    /// reports `false`, and the cache keeps the windows it applied, so a later
+    /// call with the same `through` continues from there. A cache that
+    /// ends above `through` or off its chain is emptied and warmed from the
+    /// first retained height.
+    ///
+    /// A reader without a cache, a cache that already ends at `through`, a
+    /// cache a pause released (see [`PrevoutCache::release_for_pause`]), or a
+    /// height below retained history needs no walk.
     pub fn warm_prevout_cache(
         &mut self,
         through: BlockHeight,
-        interrupted: &mut dyn FnMut() -> bool,
+        next_window: &mut dyn FnMut() -> Option<u32>,
     ) -> Result<bool, IngestError> {
         let first_height = self.secondary.history_bounds().first_available_height();
         let Some(prevouts) = self.prevouts.as_deref_mut() else {
             return Ok(true);
         };
         if !prevouts.retains_outputs()
+            || !prevouts.warm_up_allowed()
             || prevouts.applied_height() == Some(through)
             || through < first_height
         {
             return Ok(true);
         }
-        prevouts.clear();
-        let started_at = Instant::now();
-        let mut next = first_height;
-        while next <= through {
-            if interrupted() {
+        let mut next = match prevouts.applied_height().and_then(BlockHeight::next) {
+            Some(resume) if resume > first_height && resume <= through => resume,
+            _ => {
                 prevouts.clear();
-                return Ok(false);
+                first_height
             }
+        };
+        let started_at = Instant::now();
+        while next <= through {
+            let Some(window_blocks) = next_window() else {
+                return Ok(false);
+            };
+            let window_blocks = window_blocks.clamp(1, PREVOUT_CACHE_WARMUP_WINDOW_BLOCKS);
             let end = BlockHeight::new(
                 next.value()
-                    .saturating_add(PREVOUT_CACHE_WARMUP_WINDOW_BLOCKS - 1)
+                    .saturating_add(window_blocks - 1)
                     .min(through.value()),
             );
             let deltas =
                 read_prevout_deltas(self.secondary, BlockHeightRange::inclusive(next, end))?;
+            if deltas
+                .first()
+                .is_some_and(|first| !prevouts.extends_to(first))
+            {
+                prevouts.clear();
+                next = first_height;
+                continue;
+            }
             prevouts.apply_deltas(&deltas);
             let Some(after) = end.next() else {
                 break;
@@ -425,7 +446,7 @@ fn read_prevout_deltas(
             break;
         }
     }
-    let deltas = read_in_parallel(&slices, |chunk| {
+    let deltas = read_slices_in_parallel(&slices, |chunk| {
         let mut deltas = Vec::new();
         for slice in chunk {
             for replay in secondary.scan_canonical_replay_range(*slice)? {

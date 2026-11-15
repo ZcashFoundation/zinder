@@ -166,7 +166,7 @@ pub(super) async fn run_transparent_address_ranking_builder(
     let mut budget = fresh_budget();
     loop {
         if budget.evaluate_current().state.is_paused() {
-            tailer.prevout_caches.ranking_build.lock().clear();
+            tailer.prevout_caches.release_ranking_build();
         } else {
             let step_tailer = std::sync::Arc::clone(&tailer);
             let joined = tokio::task::spawn_blocking(move || {
@@ -304,9 +304,11 @@ impl<'build> RankingBuild<'build> {
                 if through > BlockHeight::new(0)
                     && goal.value().saturating_sub(through.value())
                         >= PREVOUT_CACHE_WARMUP_MIN_REMAINING_BLOCKS
-                    && !self
-                        .hydrator
-                        .warm_prevout_cache(through, &mut || pass.yields())?
+                    && !self.hydrator.warm_prevout_cache(through, &mut || {
+                        (started_at.elapsed() < RANKING_BUILD_STEP_BUDGET)
+                            .then(|| pass.warm_up_window())
+                            .flatten()
+                    })?
                 {
                     return Ok(self.paused_at(through));
                 }
