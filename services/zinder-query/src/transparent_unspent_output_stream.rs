@@ -63,12 +63,27 @@ impl TransparentAddressUnspentOutputs {
         request: &TransparentAddressUnspentOutputsRequest,
         chain_epoch: ChainEpoch,
     ) -> Self {
+        Self::spawn_paged(
+            pair,
+            request,
+            chain_epoch,
+            TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE,
+        )
+    }
+
+    fn spawn_paged(
+        pair: Arc<WalletServingReadPair>,
+        request: &TransparentAddressUnspentOutputsRequest,
+        chain_epoch: ChainEpoch,
+        page_size: NonZeroU16,
+    ) -> Self {
         let (pages, receiver) = mpsc::channel(BUFFERED_PAGES);
         tokio::spawn(
             produce_pages(
                 pair,
                 request.address_script_hash,
                 request.start_height,
+                page_size,
                 pages,
             )
             .in_current_span(),
@@ -134,6 +149,7 @@ async fn produce_pages(
     pair: Arc<WalletServingReadPair>,
     address_script_hash: TransparentAddressScriptHash,
     start_height: BlockHeight,
+    page_size: NonZeroU16,
     pages: mpsc::Sender<Result<UnspentOutputPage, QueryError>>,
 ) {
     let mut after = None;
@@ -142,7 +158,7 @@ async fn produce_pages(
             return fail(pair, &pages, None).await;
         }
         let page_read = serving_read::off_reactor(Arc::clone(&pair), move |pair| {
-            read_page(&pair, address_script_hash, start_height, after)
+            read_page(&pair, address_script_hash, start_height, after, page_size)
         });
         // The blocking read cannot be interrupted, but a caller that leaves
         // while it runs should not have to wait for this task to notice.
@@ -191,6 +207,7 @@ fn read_page(
     address_script_hash: TransparentAddressScriptHash,
     start_height: BlockHeight,
     after: Option<WalletAddressUnspentOutputKey>,
+    page_size: NonZeroU16,
 ) -> Result<
     (
         Vec<TransparentUnspentOutput>,
@@ -202,7 +219,7 @@ fn read_page(
         address_script_hash,
         start_height,
         after,
-        TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE,
+        page_size,
     )?;
     let outputs = page
         .outputs
@@ -249,13 +266,16 @@ mod tests {
         RocksDbWalletError, WalletAddressTransactionHistoryPage, WalletAddressUnspentOutputsPage,
     };
 
-    use super::TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE;
+    use super::TransparentAddressUnspentOutputs;
     use crate::{
         QueryError, TransparentAddressUnspentOutputsRequest, WalletProjectionReader,
         WalletQueryApi, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
     };
 
     const SCRIPT_PUB_KEY: &[u8] = &[0x51];
+    /// Page size the paged tests read with, so a few dozen outputs span
+    /// several pages.
+    const TEST_PAGE_SIZE: NonZeroU16 = NonZeroU16::MIN.saturating_add(7);
     const OTHER_SCRIPT_PUB_KEY: &[u8] = &[0x52];
     const WAIT_LIMIT: Duration = Duration::from_secs(10);
     /// Holders of a pair no read holds: the test and the query's slot.
@@ -265,7 +285,7 @@ mod tests {
     async fn a_stream_delivers_every_page_in_address_index_order() -> Result<(), Box<dyn Error>> {
         let output_count = 2 * page_size() + 7;
         let fixture = CountedPair::with_outputs(output_count)?;
-        let stream = fixture.open(fixture.address).await?;
+        let stream = fixture.open_paged()?;
         assert_eq!(
             stream.chain_epoch.id,
             fixture.pair.canonical_fence().chain_epoch_id()
@@ -309,7 +329,7 @@ mod tests {
     async fn a_stream_reads_storage_only_as_fast_as_its_caller_consumes()
     -> Result<(), Box<dyn Error>> {
         let fixture = CountedPair::with_outputs(4 * page_size())?;
-        let mut stream = fixture.open(fixture.address).await?;
+        let mut stream = fixture.open_paged()?;
 
         stream
             .next()
@@ -332,7 +352,7 @@ mod tests {
     async fn dropping_a_stream_mid_read_stops_its_storage_reads_and_releases_its_pair()
     -> Result<(), Box<dyn Error>> {
         let fixture = CountedPair::with_outputs(4 * page_size())?;
-        let mut stream = fixture.open(fixture.address).await?;
+        let mut stream = fixture.open_paged()?;
         stream
             .next()
             .await
@@ -360,7 +380,7 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let output_count = 4 * page_size();
         let fixture = CountedPair::with_outputs(output_count)?;
-        let mut stream = fixture.open(fixture.address).await?;
+        let mut stream = fixture.open_paged()?;
         let epoch = stream.chain_epoch.id;
         stream
             .next()
@@ -409,7 +429,7 @@ mod tests {
     }
 
     fn page_size() -> usize {
-        usize::from(TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE.get())
+        usize::from(TEST_PAGE_SIZE.get())
     }
 
     /// A pair over `output_count` outputs of one address, all created at
@@ -471,7 +491,7 @@ mod tests {
         async fn open(
             &self,
             address_script_hash: TransparentAddressScriptHash,
-        ) -> Result<super::TransparentAddressUnspentOutputs, QueryError> {
+        ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
             self.query
                 .transparent_address_unspent_outputs(
                     TransparentAddressUnspentOutputsRequest {
@@ -481,6 +501,20 @@ mod tests {
                     None,
                 )
                 .await
+        }
+
+        /// Opens a stream of the fixture address that reads
+        /// [`TEST_PAGE_SIZE`] outputs per page.
+        fn open_paged(&self) -> Result<TransparentAddressUnspentOutputs, Box<dyn Error>> {
+            Ok(TransparentAddressUnspentOutputs::spawn_paged(
+                Arc::clone(&self.pair),
+                &TransparentAddressUnspentOutputsRequest {
+                    address_script_hash: self.address,
+                    start_height: BlockHeight::new(0),
+                },
+                self.pair.canonical().chain_epoch()?,
+                TEST_PAGE_SIZE,
+            ))
         }
 
         fn page_reads(&self) -> usize {

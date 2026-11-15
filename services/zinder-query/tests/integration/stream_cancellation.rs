@@ -308,6 +308,8 @@ async fn cancelling_an_unspent_output_stream_stops_its_storage_reads_and_release
 -> Result<()> {
     let address = TransparentAddressScriptHash::of_script_pub_key(&[0x51]);
     let page_size = u32::from(TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE.get());
+    // More pages than the client's flow-control window, the server's send
+    // buffer, and the stream's own buffer can absorb together.
     let page_count = 6;
     let (server_addr, served) =
         spawn_unspent_output_server(address, page_count * page_size).await?;
