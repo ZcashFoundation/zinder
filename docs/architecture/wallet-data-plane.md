@@ -949,13 +949,15 @@ materialize every retained subtree root.
 lightwalletd blocks without a second full-range allocation. True per-item store
 back-pressure requires an owned snapshot streaming read API; until then the
 range cap is the memory bound.
-`GetAddressUtxos` and `GetAddressUtxosStream` are not bounded at the read yet.
-They read each address through `TransparentAddressUnspentOutputs`, which
-returns the complete unspent set in memory with no row bound, and then apply
-`maxEntries` and the response bound. The bound limits the response size but
-not the read. A paged unspent-output read that stops at the response bound is
-follow-up work.
+`GetAddressUtxos` and `GetAddressUtxosStream` bound each address at the read.
+They consume each address's `TransparentAddressUnspentOutputs` stream in
+address-index order and stop it once its later outputs cannot change the
+response: after that address's first `maxEntries` outputs when `maxEntries` is
+at or below the response limit, and otherwise as soon as the collected replies
+pass the response limit, which fails the request with the address-UTXO limit
+error. The adapter then sorts the collected replies into response order and
+applies `maxEntries`.
 
-Every other compatibility read keeps the bound at the read: it does not
-materialize an unbounded list and truncate it after the fact, and its storage
-and protocol signatures make that shape impossible.
+The other compatibility reads also keep the bound at the read: none of them
+materializes an unbounded list and truncates it after the fact, and their
+storage and protocol signatures make that shape impossible.

@@ -1067,6 +1067,11 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// preflight `wallet.read.full_block_range_v1`; an admitted
     /// wallet-serving endpoint advertises it only for `all` retention.
     ///
+    /// A stream that is still open when the server stops serving its epoch
+    /// ends with [`IndexerError::ChainEpochPinUnavailable`] after the blocks
+    /// already delivered. Those blocks are not the complete range: discard
+    /// them and read the range again at a fresh epoch.
+    ///
     /// # Examples
     ///
     /// ```no_run
