@@ -2108,6 +2108,7 @@ impl<'store> WalletTransitionPlanner<'store> {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::{BTreeMap, BTreeSet},
         num::{NonZeroU32, NonZeroU64},
         path::Path,
     };
@@ -2115,7 +2116,7 @@ mod tests {
     #[cfg(unix)]
     use std::num::NonZeroU16;
 
-    use rust_rocksdb::statistics::Ticker;
+    use rust_rocksdb::{IteratorMode, statistics::Ticker};
     use tempfile::TempDir;
     use zinder_core::{
         BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
@@ -2139,17 +2140,17 @@ mod tests {
         RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
     };
     use zinder_testkit::process_crash;
-    #[cfg(unix)]
-    use zinder_wallet_projection::WalletOutpointKey;
     use zinder_wallet_projection::{
-        WALLET_STORE_CONTROL_KEY, WalletCanonicalSourceIdentity, WalletProjectionBuildLeaseRequest,
-        WalletProjectionBuildOwner, WalletProjectionContractError, WalletProjectionDigestBuilder,
+        WALLET_STORE_CONTROL_KEY, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
+        WalletOutpointKey, WalletProjectionBuildLeaseRequest, WalletProjectionBuildOwner,
+        WalletProjectionBuildState, WalletProjectionContractError, WalletProjectionDigestBuilder,
         WalletProjectionReadyEvidence, WalletProjectionRetainedEventAnchor,
-        WalletProjectionSourcePosition, WalletReorgUndo, WalletUtxoSetSummary,
+        WalletProjectionSourcePosition, WalletReorgUndo, WalletSpentOutput,
+        WalletStoreControlRecord, WalletUtxoSetSummary,
     };
 
     use super::{
-        DurableReadMemo, MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES,
+        DurableReadMemo, MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES, OverlayKey,
         TransitionLogicalByteAccounting, UndoRowWorkCounts, WalletTransitionPlanner,
         coalesced_write_batch, coalesced_write_batch_capacity, extend_source_sequence_digest,
         source_identity_from_fence, take_undo_row_work,
@@ -2160,7 +2161,9 @@ mod tests {
         store::{
             REORG_UNDO_COLUMN_FAMILY, RocksDbWalletBuilder,
             TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY, TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY,
-            TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY, WalletColdValidationConfig, column_family,
+            TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
+            TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY, WALLET_DATA_COLUMN_FAMILIES,
+            WalletColdValidationConfig, column_family, decode_only_control,
         },
     };
 
@@ -3741,5 +3744,361 @@ mod tests {
             batch.size_in_bytes()
         );
         Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one proof keeps the derived row set, the refused and admitted limits, and the cold comparison together"
+    )]
+    fn hot_address_reorg_publishes_each_touched_row_once_within_twice_its_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for replacement in [
+            HotAddressBranch::SameTransactions,
+            HotAddressBranch::DistinctCoinbases,
+        ] {
+            let mut fixture = HotAddressReorg::publish(replacement)?;
+            let cold = build_wallet_from_canonical(
+                &fixture.secondary,
+                fixture.temporary.path().join("wallet-cold"),
+                RocksDbWalletBuildOptions {
+                    supported_reorg_depth: HOT_ADDRESS_BLOCKS,
+                    ..RocksDbWalletBuildOptions::for_local_tests()
+                },
+            )?;
+            let before = wallet_rows(&fixture.wallet)?;
+            let after = wallet_rows(&cold.store)?;
+            assert_ne!(before, after, "{replacement:?}");
+
+            // The reorg rolls back every row of the followed wallet and
+            // replays every row of the cold build, so its plan holds the final
+            // entry of each of their keys and of each unspent and address-index
+            // row it restores or creates for an output that it then spends.
+            let touched = rewritten_row_keys(&before, &after)?;
+            let final_entry_bytes: usize = touched
+                .iter()
+                .map(|key| key.1.len() + after.get(key).map_or(0, Vec::len))
+                .sum();
+            let next_control = WalletStoreControlRecord {
+                writer_generation: fixture.wallet.control.writer_generation + 1,
+                build_state: WalletProjectionBuildState::Ready(cold.store.ready_evidence().clone()),
+                ..fixture.wallet.control.clone()
+            }
+            .encode()?;
+            let required = u64::try_from(
+                2 * final_entry_bytes + WALLET_STORE_CONTROL_KEY.len() + next_control.len(),
+            )?;
+
+            let control_before = decode_only_control(&fixture.wallet.bounded_open)?;
+            let evidence_before = fixture.wallet.ready_evidence().clone();
+            let refused = fixture.apply_reorg(required - 1)?;
+            assert!(
+                matches!(
+                    refused,
+                    Err(RocksDbWalletError::TransitionLogicalByteLimit {
+                        limit_bytes,
+                        required_bytes,
+                    }) if limit_bytes == required - 1 && required_bytes == required
+                ),
+                "{replacement:?}: {refused:?}"
+            );
+            assert_eq!(fixture.wallet.ready_evidence(), &evidence_before);
+            assert_eq!(
+                decode_only_control(&fixture.wallet.bounded_open)?,
+                control_before
+            );
+            assert_eq!(wallet_rows(&fixture.wallet)?, before);
+
+            let keys_written_before = wallet_keys_written(&fixture.wallet);
+            fixture.apply_reorg(required)??;
+            assert_eq!(
+                wallet_keys_written(&fixture.wallet) - keys_written_before,
+                u64::try_from(touched.len() + 1)?,
+                "{replacement:?}"
+            );
+            assert_eq!(wallet_rows(&fixture.wallet)?, after, "{replacement:?}");
+            assert_eq!(
+                fixture.wallet.ready_evidence().projection_digest,
+                cold.store.ready_evidence().projection_digest
+            );
+            assert_eq!(
+                fixture.wallet.ready_evidence().row_counts,
+                cold.store.ready_evidence().row_counts
+            );
+            assert_eq!(fixture.wallet.ready_evidence(), cold.store.ready_evidence());
+            assert_eq!(
+                decode_only_control(&fixture.wallet.bounded_open)?.encode()?,
+                next_control
+            );
+        }
+        Ok(())
+    }
+
+    /// Blocks above the checkpoint that the hot-address chain holds and its
+    /// reorg replaces.
+    const HOT_ADDRESS_BLOCKS: u32 = 3;
+
+    /// Outputs each hot-address coinbase pays to the hot address.
+    const HOT_ADDRESS_OUTPUTS_PER_BLOCK: u32 = 4;
+
+    /// Hot-address outputs each hot-address block spends.
+    const HOT_ADDRESS_SPENDS_PER_BLOCK: u32 = 2;
+
+    /// Which chain a hot-address block belongs to.
+    #[derive(Clone, Copy, Debug)]
+    enum HotAddressBranch {
+        /// The blocks the wallet follows before the reorg.
+        Original,
+        /// Replacements that keep every transaction under new block hashes.
+        SameTransactions,
+        /// Replacements whose coinbases, and so every outpoint, differ.
+        DistinctCoinbases,
+    }
+
+    impl HotAddressBranch {
+        const fn block_tag(self) -> u8 {
+            match self {
+                Self::Original => 0xd0,
+                Self::SameTransactions | Self::DistinctCoinbases => 0xd1,
+            }
+        }
+
+        const fn transaction_tag(self) -> u8 {
+            match self {
+                Self::Original | Self::SameTransactions => 0xe0,
+                Self::DistinctCoinbases => 0xe1,
+            }
+        }
+    }
+
+    /// A wallet that followed [`HOT_ADDRESS_BLOCKS`] blocks paying and
+    /// spending one address, whose canonical store then replaced all of them.
+    struct HotAddressReorg {
+        secondary: RocksDbCanonicalSecondary,
+        wallet: RocksDbWalletStore,
+        settled_tip: BlockId,
+        temporary: TempDir,
+    }
+
+    impl HotAddressReorg {
+        fn publish(replacement: HotAddressBranch) -> Result<Self, Box<dyn std::error::Error>> {
+            let temporary = TempDir::new()?;
+            let published = publish_checkpointed_wallet(temporary.path())?;
+            let settled_tip = published.initial_fence.visible_tip();
+            let base_accumulator =
+                checkpoint_accumulator(&published.activations, published.initial_fence)?;
+            let mut accumulator = base_accumulator.clone();
+            let mut canonical_store = published.canonical_store;
+            let mut fence = published.initial_fence;
+            for height in hot_address_heights() {
+                let block =
+                    hot_address_block(&mut accumulator, height, HotAddressBranch::Original)?;
+                (canonical_store, fence) = canonical_store.commit_live_append(
+                    CanonicalLiveAppend::new(
+                        fence,
+                        block,
+                        Vec::new(),
+                        settled_tip,
+                        UnixTimestampMillis::new(1_750_000_300_000 + u64::from(height)),
+                    ),
+                    &published.activations,
+                )?;
+            }
+            let mut secondary =
+                open_checkpointed_secondary(temporary.path(), "canonical-secondary")?;
+            let mut wallet = open_wallet_at_depth(temporary.path(), HOT_ADDRESS_BLOCKS)?;
+            for _ in hot_address_heights() {
+                apply_next_event_settling_at(&mut wallet, &secondary, settled_tip)?;
+            }
+
+            let mut accumulator = base_accumulator;
+            let mut replacement_blocks = Vec::new();
+            for height in hot_address_heights() {
+                replacement_blocks.push(CanonicalReplacementBlock::new(
+                    hot_address_block(&mut accumulator, height, replacement)?,
+                    Vec::new(),
+                ));
+            }
+            canonical_store.commit_live_replacement(
+                CanonicalLiveReplacement::new(
+                    fence,
+                    replacement_blocks,
+                    UnixTimestampMillis::new(1_750_000_400_000),
+                ),
+                &published.activations,
+            )?;
+            secondary.try_catch_up()?;
+            Ok(Self {
+                secondary,
+                wallet,
+                settled_tip,
+                temporary,
+            })
+        }
+
+        /// Applies the retained replacement event under `max_logical_bytes`,
+        /// returning the transition's own outcome.
+        fn apply_reorg(
+            &mut self,
+            max_logical_bytes: u64,
+        ) -> Result<Result<(), RocksDbWalletError>, Box<dyn std::error::Error>> {
+            let event = next_retained_event(&self.secondary, &self.wallet)?;
+            if event.reverted_range().is_none() {
+                return Err(format!("expected the replacement event, found {event:?}").into());
+            }
+            let source =
+                WalletCanonicalSourceIdentity::from_ready_evidence(self.wallet.ready_evidence());
+            let limit =
+                NonZeroU64::new(max_logical_bytes).ok_or("transition limit must be nonzero")?;
+            let replay_rows = self
+                .secondary
+                .scan_canonical_replay_range(event.committed_range())?;
+            Ok(self.wallet.apply_canonical_event_range(
+                source,
+                event,
+                event.resulting_fence(),
+                self.settled_tip,
+                limit,
+                replay_rows,
+            ))
+        }
+    }
+
+    fn hot_address_heights() -> std::ops::RangeInclusive<u32> {
+        101..=100 + HOT_ADDRESS_BLOCKS
+    }
+
+    /// Builds the hot-address block at `height` on `branch`, advancing
+    /// `accumulator`.
+    ///
+    /// Its coinbase pays [`HOT_ADDRESS_OUTPUTS_PER_BLOCK`] outputs to the hot
+    /// address, and a second transaction spends
+    /// [`HOT_ADDRESS_SPENDS_PER_BLOCK`] of them and returns change to it. The
+    /// first block spends outputs of its own coinbase, and each later block
+    /// spends the outputs that the previous coinbase left unspent.
+    fn hot_address_block(
+        accumulator: &mut CommitmentTreeAccumulator,
+        height: u32,
+        branch: HotAddressBranch,
+    ) -> Result<CanonicalBuildBlock, Box<dyn std::error::Error>> {
+        let address = TransparentAddressScriptHash::from_bytes([0xd7; 32]);
+        let coinbase_id = hot_address_transaction_id(height, branch, false);
+        let coinbase = coinbase_output_transaction(
+            coinbase_id,
+            (0..HOT_ADDRESS_OUTPUTS_PER_BLOCK)
+                .map(|index| {
+                    TransparentOutputFact::new(index, 100 + u64::from(index), [0x76, 0xd7], address)
+                })
+                .collect(),
+        );
+        let (funding_id, first_spent_index) = if height == 101 {
+            (coinbase_id, 0)
+        } else {
+            (
+                hot_address_transaction_id(height - 1, branch, false),
+                HOT_ADDRESS_OUTPUTS_PER_BLOCK - HOT_ADDRESS_SPENDS_PER_BLOCK,
+            )
+        };
+        let spending = transparent_spend_transaction(
+            hot_address_transaction_id(height, branch, true),
+            (0..HOT_ADDRESS_SPENDS_PER_BLOCK)
+                .map(|input| {
+                    TransparentInputFact::new(
+                        input,
+                        TransparentOutPoint::new(funding_id, first_spent_index + input),
+                    )
+                })
+                .collect(),
+            vec![TransparentOutputFact::new(0, 1, [0x76, 0xd7], address)],
+        );
+        checkpointed_append_block(
+            accumulator,
+            height,
+            hot_address_block_hash(height - 1, branch),
+            hot_address_block_hash(height, branch),
+            vec![coinbase, spending],
+        )
+    }
+
+    fn hot_address_block_hash(height: u32, branch: HotAddressBranch) -> [u8; 32] {
+        if height == 100 {
+            return [0xa0; 32];
+        }
+        let mut hash = [branch.block_tag(); 32];
+        hash[..4].copy_from_slice(&height.to_be_bytes());
+        hash
+    }
+
+    fn hot_address_transaction_id(
+        height: u32,
+        branch: HotAddressBranch,
+        spending: bool,
+    ) -> TransactionId {
+        let mut id = [branch.transaction_tag(); 32];
+        id[..4].copy_from_slice(&height.to_be_bytes());
+        id[4] = u8::from(spending);
+        TransactionId::from_bytes(id)
+    }
+
+    /// Every row of a wallet's data column families, by family and key.
+    type WalletRows = BTreeMap<OverlayKey, Vec<u8>>;
+
+    fn wallet_rows(wallet: &RocksDbWalletStore) -> Result<WalletRows, Box<dyn std::error::Error>> {
+        let mut rows = BTreeMap::new();
+        for (family_name, _) in WALLET_DATA_COLUMN_FAMILIES {
+            let family = column_family(&wallet.bounded_open, family_name)?;
+            for row in wallet
+                .bounded_open
+                .db
+                .iterator_cf(&family, IteratorMode::Start)
+            {
+                let (key, value) = row?;
+                rows.insert((family_name, key.to_vec()), value.to_vec());
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Keys of every row that a transition from `before` to `after` touches
+    /// when it rolls back every block of `before` and replays every block of
+    /// `after`.
+    ///
+    /// Besides the rows of either state, the rollback restores and then
+    /// removes the unspent-output and address-index rows of each output that
+    /// `before` holds as spent by a later block, and the replay creates and
+    /// then spends those rows of each output that `after` holds as spent.
+    fn rewritten_row_keys(
+        before: &WalletRows,
+        after: &WalletRows,
+    ) -> Result<BTreeSet<OverlayKey>, Box<dyn std::error::Error>> {
+        let mut keys: BTreeSet<_> = before.keys().chain(after.keys()).cloned().collect();
+        let spent_rows = before
+            .iter()
+            .map(|row| (row, false))
+            .chain(after.iter().map(|row| (row, true)));
+        for (((family_name, key), encoded), replayed) in spent_rows {
+            if *family_name != TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY {
+                continue;
+            }
+            let spent = WalletSpentOutput::decode_value(WalletOutpointKey::decode(key)?, encoded)?;
+            if !replayed && spent.spent_at.block == spent.output.created_at.block {
+                continue;
+            }
+            keys.insert((TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY, key.clone()));
+            keys.insert((
+                TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
+                WalletAddressUnspentOutputKey::new(&spent.output)
+                    .as_bytes()
+                    .to_vec(),
+            ));
+        }
+        Ok(keys)
+    }
+
+    fn wallet_keys_written(wallet: &RocksDbWalletStore) -> u64 {
+        wallet
+            .bounded_open
+            .statistics
+            .get_ticker_count(Ticker::NumberKeysWritten)
     }
 }
