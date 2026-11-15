@@ -133,7 +133,6 @@ fail when the tree is missing or nearly empty, and never treat a missing
 directory as a clean scan. The workspace invariant scans in `zinder-core`,
 `zinder-source`, and `zinder-proto` do this and assert a minimum number of
 scanned files.
-||||||| parent of 517cf6ea (docs: describe CI cancellation, tool installs, and cache policy)
 
 ## Continuous integration
 
