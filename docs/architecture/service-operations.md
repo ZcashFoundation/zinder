@@ -503,9 +503,8 @@ canonical source turn between consecutive maintenance commands.
 ### Projector and wallet store
 
 Projector metrics report build phase, lease renewal, canonical event position,
-wallet source position, projection lag, transition bytes, digest validation,
-and checkpoint operations. Store metrics use explicit canonical or wallet role
-labels.
+wallet source position, projection lag, digest validation, and checkpoint
+operations. Store metrics use explicit canonical or wallet role labels.
 
 ### Wallet query requests
 
