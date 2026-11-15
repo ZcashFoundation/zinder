@@ -97,6 +97,26 @@ the stored rows.
 Following applies one canonical event transition atomically with the
 new source position. Ready readers never repair or advance the store.
 
+Reorg-undo rows cover exactly the unsettled suffix. Each row's starting source
+digest equals the resulting digest of the row below it, and the top row matches
+the wallet's source tip. A following handle reads and decodes every retained
+undo row to check this:
+
+- on its first transition after it opens, or after a transition that failed
+  during or after its write;
+- on every transition that rolls back a reorg; and
+- on every reconciliation.
+
+A transition that finds a missing, undecodable, or disconnected row fails
+without writing. Other appends on the handle read no undo row they keep. Each
+one reads the successor row that binds a newly settled tip, and reads each row
+it prunes once. The rows it writes come from the authenticated replay and
+continue from the verified tip. When each append settles one block, an append
+without transparent activity makes three point reads of the undo family,
+whatever the reorg window. Appends do not re-read untouched rows. A change made
+to one outside the wallet is found at the handle's next full check, or earlier
+when an append prunes a row that is missing or does not decode.
+
 ## Materialized-view RocksDB
 
 `MaterializedViewStore` is stored under the `materialized-views` subdirectory of
