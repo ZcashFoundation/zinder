@@ -457,7 +457,6 @@ const EXPORTED_TICKERS: &[Ticker] = &[
     Ticker::WalFileBytes,
     Ticker::FlushWriteBytes,
     Ticker::StallMicros,
-    Ticker::FlushWriteBytes,
     Ticker::MemtablePayloadBytesAtFlush,
     Ticker::MemtableGarbageBytesAtFlush,
     Ticker::CompactReadBytes,
@@ -699,6 +698,17 @@ mod tests {
         ] {
             assert!(EXPORTED_TICKERS.contains(&ticker));
         }
+    }
+
+    #[test]
+    fn ticker_export_names_each_ticker_once() {
+        let mut names = EXPORTED_TICKERS
+            .iter()
+            .map(Ticker::name)
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), EXPORTED_TICKERS.len());
     }
 
     #[test]
