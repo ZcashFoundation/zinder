@@ -497,9 +497,10 @@ upstream node call, such as the tree-state fill or transaction broadcast. A
 request rejected by validation is still recorded with its error class. A read
 the serving pair cannot answer still records, with an error class such as
 `endpoint_capability_unavailable` or `materialized_view_unavailable`, and so
-does `network_upgrade_activations`, which reads no storage. A streaming read
+does `network_upgrade_activations`, which reads no storage. A streaming read,
+such as `full_blocks_in_range` or `transparent_address_unspent_outputs`,
 records when the stream is established. Later sub-reads of the stream do not
-record. One protocol request can produce several samples when it composes
+record, and neither does a failure that ends the stream later. One protocol request can produce several samples when it composes
 several domain reads. For example, a compatibility request that pins the
 visible tip first records a `visible_tip_block` sample.
 
@@ -532,19 +533,35 @@ pairs retained for pinned reads
 (`zinder_wallet_serving_pair_publisher_retained_pairs`). gRPC request metrics
 remain separate from pair-maintenance metrics.
 
-A request keeps the pair it captured open until it finishes, which pins that
+A request keeps the pair it captured open while it reads, which pins that
 pair's secondary generation. The publisher rotates through four generation
 slots: the current pair, the candidate, and two for replaced pairs, which are
 either retained for pinned reads or retired but still held by a request. When
 a held retired pair leaves no slot free, the publisher releases a retained
 pair that no request holds, so publication continues while up to two retired
 pairs are pinned.
+
+A request may keep reading a retired pair for at most 30 seconds after the
+publisher retired it. Past that read limit the publisher revokes reads on the
+pair. The `TransparentAddressUnspentOutputs` and `FullBlocksInRange` streams,
+the only reads that keep a pair across several page reads, stop at their next
+page or while they wait for a slow client, end with
+`CHAIN_EPOCH_PIN_UNAVAILABLE`, and drop the pair. Every other read is one
+bounded blocking read that finishes on its own. A stream whose client cancels or disconnects stops after
+the page in progress. A slow or abandoned stream can therefore hold
+publication for at most the read limit plus one page read.
+
 `zinder_wallet_serving_pair_publisher_pinned_retired_pairs` reports how many
 retired pairs requests still hold, and
 `zinder_wallet_serving_pair_publisher_generation_wait_total{reason="in_flight_requests"}`
 counts refreshes that found every unpublished slot pinned and published
-nothing. A steadily rising wait count means a request is holding pairs for
-minutes, and the reader stops advancing until it ends.
+nothing. `zinder_wallet_serving_pair_publisher_revoked_pairs_total` counts the
+retired pairs whose reads the publisher revoked, and each revocation logs a
+`wallet_serving_pair_reads_revoked` warning with the pair's chain epoch. Waits
+that keep rising while revocations stay flat point at reads that never check
+for revocation; revocations that keep rising point at clients whose streams
+outlast the read limit, such as a client that stops consuming an unspent-output
+stream without cancelling it.
 
 ### RocksDB
 

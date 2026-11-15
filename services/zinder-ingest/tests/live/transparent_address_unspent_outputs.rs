@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use eyre::{Result, eyre};
 use sha2::{Digest, Sha256};
+use tokio_stream::StreamExt as _;
 use zinder_core::TransparentAddressScriptHash;
 use zinder_core::{BlockHeight, Network};
 use zinder_query::{TransparentAddressUnspentOutputsRequest, WalletQueryApi, WalletServingQuery};
@@ -63,7 +64,7 @@ async fn transparent_address_unspent_outputs_surface_through_typed_wallet_query(
     let mut hasher = Sha256::new();
     hasher.update(test_key.address_script_bytes());
     let address_script_hash = TransparentAddressScriptHash::from_bytes(hasher.finalize().into());
-    let response = wallet_query
+    let outputs: Vec<_> = wallet_query
         .transparent_address_unspent_outputs(
             TransparentAddressUnspentOutputsRequest {
                 address_script_hash,
@@ -71,13 +72,15 @@ async fn transparent_address_unspent_outputs_surface_through_typed_wallet_query(
             },
             None,
         )
+        .await?
+        .collect::<Result<_, _>>()
         .await?;
 
     assert!(
-        !response.outputs.is_empty(),
+        !outputs.is_empty(),
         "expected at least one UTXO paid to {test_address}; ensure Zebra mines its coinbase to that address"
     );
-    for utxo in &response.outputs {
+    for utxo in &outputs {
         assert_eq!(utxo.address_script_hash, address_script_hash);
     }
     drop(live.store_fixture);

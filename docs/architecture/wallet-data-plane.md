@@ -511,11 +511,32 @@ reads. The Rust `ChainIndex` trait carries the same surface:
 Option<ChainEpochId>` threading the pin. The release `zinder-query` composition
 advertises `wallet.address.transparent_unspent_outputs_v1`: its admitted wallet
 projection serves the complete ascending set from the same immutable
-`WalletServingReadPair` as the canonical epoch header. The current query
-materializes that complete set before gRPC emission; end-to-end incremental
-delivery remains tracked in
-[#62](https://github.com/ZcashFoundation/zinder/issues/62). Compatibility
+`WalletServingReadPair` as the canonical epoch header. Compatibility
 runtimes own their separate lightwalletd admission and resource bounds.
+
+The query delivers the set incrementally. It walks the address's
+`transparent_unspent_output_by_address` index in pages of at most 1,024
+outputs (`TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE`), reads each page's primary
+rows in one batched lookup, and reads the next page only after the previous
+one has been handed to the stream. Each stream therefore holds at most three
+pages in the query process, whatever the address's unspent set size: the page
+being sent, one buffered page, and one page waiting for room. A client that
+stops reading stalls the storage reads instead of letting them run ahead, and
+the first output reaches the client after one page read rather than after the
+whole set.
+
+When the client cancels the stream or disconnects, the query stops reading
+storage for it after at most the page in progress and releases the serving
+pair the stream holds. A stream is bound to one serving pair from its header
+to its last output, so its epoch can be released while it is still running.
+The stream then ends with `FAILED_PRECONDITION` and
+`CHAIN_EPOCH_PIN_UNAVAILABLE` for the header's epoch, after the outputs
+already sent; [Query Consistency](#query-consistency) defines when that
+happens. The outputs a failed stream delivered are not a complete set. The
+client discards them and reads the address again at a newer epoch, which the
+typed client reports as `IndexerError::ChainEpochPinUnavailable` with
+`RetryPolicy::RefreshChainEpoch`. A stream ends without an error only after
+the address's last output.
 
 `TransparentAddressTxIdsInRange` streams `TransparentAddressTxIdsChunk`
 messages with the same one-shot header shape: one leading `ChainView` header
@@ -854,8 +875,19 @@ receiver's continuation pages resume on the retained pair.
 Retention is bounded in both count and time, and on its own it never delays
 tip following: a publication beyond the limit releases the oldest retained pair,
 and a retained pair that no request holds gives up its generation when a
-request still reading a released pair leaves no other slot free. A request
-still reading a released pair keeps its generation open until it finishes.
+request still reading a released pair leaves no other slot free.
+
+A request that is still reading when its pair is released keeps the pair's
+generation open for at most 30 seconds more (`RELEASED_PAIR_READ_LIMIT`).
+After that the publisher revokes reads on the pair. The
+`TransparentAddressUnspentOutputs` and `FullBlocksInRange` streams, the only
+reads that keep a pair across several page reads, check for revocation between
+pages and while they wait for a slow client, then fail with
+`CHAIN_EPOCH_PIN_UNAVAILABLE` and drop the pair. Every other read is one
+bounded blocking read that finishes on its own. A slow or abandoned read can
+therefore delay publication by at most the read limit plus one page read,
+and it never stops publication for other clients.
+
 A pin on a released or never-served epoch receives
 `CHAIN_EPOCH_PIN_UNAVAILABLE`, and the client captures a new snapshot and
 restarts the whole workflow; it must not silently read replacement-branch
@@ -868,7 +900,10 @@ own block caches and memtables, so a wallet-serving reader holds up to four
 secondary pairs at once: the current pair, the candidate it is catching up,
 and two replaced pairs, either retained or still held by a request. The
 `zinder_wallet_serving_pair_publisher_retained_pairs` gauge reports the
-retained count.
+retained count, `zinder_wallet_serving_pair_publisher_pinned_retired_pairs`
+reports the released pairs that requests still hold, and
+`zinder_wallet_serving_pair_publisher_revoked_pairs_total` counts the released
+pairs whose reads the publisher revoked at the read limit.
 
 ## Performance and Pagination
 

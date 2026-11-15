@@ -54,6 +54,12 @@ use zinder_wallet_rocksdb::{RocksDbWalletError, RocksDbWalletSecondary};
 const RETAINED_PAIR_LIMIT: usize = 2;
 /// Longest a replaced pair keeps answering reads pinned to its epoch.
 const RETAINED_PAIR_WINDOW: Duration = Duration::from_mins(1);
+/// Longest a request may keep reading a pair after the publisher released it.
+///
+/// Past this bound the publisher revokes reads on the pair, so a slow or
+/// abandoned read delays publication by at most this long instead of holding
+/// a generation slot until it ends.
+pub(crate) const RELEASED_PAIR_READ_LIMIT: Duration = Duration::from_secs(30);
 /// Secondary generation slots.
 ///
 /// The current pair and a candidate take one each. The other two hold
@@ -617,7 +623,7 @@ pub struct WalletServingPairPublisher {
     /// pair, so the direct-I/O `RocksDB` close never runs on a request task's
     /// reactor thread. Reusing a generation requires its lease to have
     /// drained, which cannot happen while its reference is here.
-    retired_pairs: Vec<Arc<WalletServingReadPair>>,
+    retired_pairs: Vec<RetiredPair>,
     /// Last attestation of the published pair by a following writer with a
     /// confirmed tip, and the halt the writer last reported, which refresh
     /// failures republish so a writer-status outage or a writer restart cannot
@@ -741,8 +747,9 @@ impl WalletServingPairPublisher {
     }
 
     async fn refresh_once(&mut self) -> Result<(), WalletServingPairError> {
-        self.release_expired_pairs(Instant::now());
-        self.reap_retired_pairs().await;
+        let now = Instant::now();
+        self.release_expired_pairs(now);
+        self.reap_retired_pairs(now).await;
         let serving_pair_slot = self
             .serving_pair_slot
             .as_ref()
@@ -782,8 +789,9 @@ impl WalletServingPairPublisher {
         let slot = self.serving_pair_slot.as_ref()?;
         let yielded = slot.release_oldest_unheld()?;
         record_retained_pair_count(slot);
-        self.retired_pairs.push(yielded);
-        self.reap_retired_pairs().await;
+        let now = Instant::now();
+        self.retire_pairs([yielded], now);
+        self.reap_retired_pairs(now).await;
         self.inactive_generation()
     }
 
@@ -797,8 +805,44 @@ impl WalletServingPairPublisher {
         if expired.is_empty() {
             return;
         }
-        self.retired_pairs.extend(expired);
         record_retained_pair_count(slot);
+        self.retire_pairs(expired, now);
+    }
+
+    /// Takes ownership of pairs that just left the slot.
+    fn retire_pairs(
+        &mut self,
+        pairs: impl IntoIterator<Item = Arc<WalletServingReadPair>>,
+        retired_at: Instant,
+    ) {
+        self.retired_pairs.extend(
+            pairs
+                .into_iter()
+                .map(|pair| RetiredPair { pair, retired_at }),
+        );
+    }
+
+    /// Revokes reads on every retired pair that requests have held for at
+    /// least [`RELEASED_PAIR_READ_LIMIT`] since it left the slot.
+    ///
+    /// A revoked read fails at its next bounded step and drops the pair, so a
+    /// later refresh can close the pair and reuse its generation.
+    fn revoke_overdue_reads(&self, now: Instant) {
+        for retired in &self.retired_pairs {
+            let overdue =
+                now.saturating_duration_since(retired.retired_at) >= RELEASED_PAIR_READ_LIMIT;
+            if overdue && Arc::strong_count(&retired.pair) > 1 && retired.pair.revoke_reads() {
+                metrics::counter!("zinder_wallet_serving_pair_publisher_revoked_pairs_total")
+                    .increment(1);
+                tracing::warn!(
+                    target: "zinder::wallet_serving",
+                    event = "wallet_serving_pair_reads_revoked",
+                    chain_epoch = retired.pair.canonical_fence().chain_epoch_id().value(),
+                    read_limit_seconds = RELEASED_PAIR_READ_LIMIT.as_secs(),
+                    "requests held a released wallet-serving pair past the read limit; stopping them"
+                );
+            }
+        }
     }
 
     /// Closes every released pair that no request still holds, on the
@@ -808,11 +852,12 @@ impl WalletServingPairPublisher {
     /// runs the destructors is moved off the reactor. A pair stays open
     /// until the last request that captured it has released it; that is the
     /// same condition [`Self::inactive_generation`] waits on before reopening
-    /// its generation.
-    async fn reap_retired_pairs(&mut self) {
+    /// its generation. Reads that held a pair too long are revoked first.
+    async fn reap_retired_pairs(&mut self, now: Instant) {
+        self.revoke_overdue_reads(now);
         let (released, pinned): (Vec<_>, Vec<_>) = std::mem::take(&mut self.retired_pairs)
             .into_iter()
-            .partition(|retired_pair| Arc::strong_count(retired_pair) == 1);
+            .partition(|retired| Arc::strong_count(&retired.pair) == 1);
         self.retired_pairs = pinned;
         metrics::gauge!("zinder_wallet_serving_pair_publisher_pinned_retired_pairs").set(
             f64::from(u32::try_from(self.retired_pairs.len()).unwrap_or(u32::MAX)),
@@ -1071,9 +1116,10 @@ impl WalletServingPairPublisher {
         .await
         .map_err(WalletServingPairError::CandidateTask)??;
         if let Some(slot) = &self.serving_pair_slot {
-            self.retired_pairs
-                .extend(slot.publish(Arc::clone(&pair), Instant::now()));
+            let now = Instant::now();
+            let released = slot.publish(Arc::clone(&pair), now);
             record_retained_pair_count(slot);
+            self.retire_pairs(released, now);
         } else {
             self.serving_pair_slot = Some(WalletServingPairSlot::new(Arc::clone(&pair)));
         }
@@ -1285,6 +1331,12 @@ enum SecondaryGenerationState {
 struct SecondaryPairCandidate {
     canonical: RocksDbCanonicalSecondary,
     wallet: RocksDbWalletSecondary,
+}
+
+/// A pair released from the slot, kept until no request holds it.
+struct RetiredPair {
+    pair: Arc<WalletServingReadPair>,
+    retired_at: Instant,
 }
 
 /// Weak ownership token used to prove a path has no active request readers.
@@ -1566,7 +1618,8 @@ mod tests {
         CanonicalBlockFactsSequenceDigestVersion, CanonicalBlockReplayFormatVersion, ChainEpochId,
         ChainTipMetadata, CommitmentTreeCheckpoint, CommitmentTreeFrontiers, ConsensusBranchId,
         Network, NetworkUpgradeActivation, NetworkUpgradeActivations, SerializedBytesDigest,
-        UnixTimestampMillis, encode_canonical_block_replay, wire::encode_zinder_native_chain_name,
+        TransparentAddressScriptHash, UnixTimestampMillis, encode_canonical_block_replay,
+        wire::encode_zinder_native_chain_name,
     };
     use zinder_proto::{
         capabilities::{
@@ -1628,7 +1681,10 @@ mod tests {
         AdmittedIngestControl, NativeWalletEndpointCapabilities, WalletEndpointMetadata,
         WalletQueryApi, WalletQueryGrpcAdapter, WalletServingQuery,
     };
-    use zinder_testkit::{IngestControlFixture, IngestControlFixtureService, LogCapture};
+    use zinder_testkit::{
+        CanonicalBaseline, CanonicalWriterFixture, ChainFixture, IngestControlFixture,
+        IngestControlFixtureService, LogCapture, sample_regtest_upgrade_activations,
+    };
 
     #[test]
     fn wallet_serving_readiness_retains_pair_node_and_ingest_failures_independently() {
@@ -2570,6 +2626,255 @@ mod tests {
         cancel.cancel();
         server_task.await??;
         Ok(())
+    }
+
+    /// Unspent-output reads that clients abandon or stop consuming never stop
+    /// publication. An abandoned read releases its pair at once. A read whose
+    /// client stops consuming keeps its pair only until the publisher revokes
+    /// reads on it, and then ends with its epoch unavailable.
+    #[tokio::test(flavor = "multi_thread")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the scenario fills every spare generation twice, once with abandoned reads and once with stalled ones"
+    )]
+    async fn abandoned_and_stalled_unspent_output_reads_do_not_stop_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The writer starts without NU7, so each revision can append it at a
+        // new height and still extend the table the store was built with.
+        let activations = NetworkUpgradeActivations::new(
+            Network::ZcashRegtest,
+            sample_regtest_upgrade_activations()
+                .activations()
+                .iter()
+                .filter(|activation| activation.name != "NU7")
+                .cloned()
+                .collect(),
+        )?;
+        let (chain, address) = address_with_unspent_outputs(
+            3 * usize::from(crate::TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE.get()) + 1,
+        )?;
+        let mut writer =
+            CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &activations)?;
+        let temporary = TempDir::new()?;
+        let wallet_primary_path = temporary.path().join("wallet-primary");
+        build_wallet_from_canonical(
+            writer.canonical_primary()?,
+            &wallet_primary_path,
+            RocksDbWalletBuildOptions {
+                supported_reorg_depth: 100,
+                ..RocksDbWalletBuildOptions::for_local_tests()
+            },
+        )?;
+        let control =
+            MutableCanonicalControl::new(writer_status_for_store(writer.canonical_primary()?));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server_task = tokio::spawn({
+            let control = control.clone();
+            async move {
+                Server::builder()
+                    .add_service(CanonicalControlServer::new(control))
+                    .serve_with_incoming_shutdown(
+                        TcpListenerStream::new(listener),
+                        server_cancel.cancelled_owned(),
+                    )
+                    .await
+            }
+        });
+        let config = WalletServingPairConfig {
+            expected_raw_blob_retention: writer.canonical_primary()?.raw_blob_retention(),
+            ..wallet_serving_pair_config(
+                writer.canonical_primary_path().to_path_buf(),
+                temporary.path().join("canonical-secondaries"),
+                wallet_primary_path,
+                temporary.path().join("wallet-secondaries"),
+                Arc::new(activations.clone()),
+            )?
+        };
+        let (mut publisher, slot) =
+            WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
+                config,
+                WalletServingReadiness::without_node_source(zinder_runtime::Readiness::default()),
+                &endpoint,
+                None,
+            )
+            .await?;
+        let query = WalletServingQuery::from_serving_pair_slot(
+            slot.clone(),
+            (),
+            Arc::new(activations.clone()),
+        );
+        let mut revision = 0_u32;
+        let mut publish_next = async |publisher: &mut WalletServingPairPublisher| {
+            revision += 1;
+            let mut entries = activations.activations().to_vec();
+            entries.push(NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x7719_0ad9),
+                activation_height: BlockHeight::new(700 + revision),
+                name: "NU7".to_owned(),
+            });
+            writer.admit_network_upgrade_schedule(&NetworkUpgradeActivations::new(
+                Network::ZcashRegtest,
+                entries,
+            )?)?;
+            control.set_writer_status(writer_status_for_store(writer.canonical_primary()?));
+            let before = slot.capture();
+            publisher.refresh_once().await?;
+            Ok::<_, Box<dyn std::error::Error>>(!Arc::ptr_eq(&before, &slot.capture()))
+        };
+        // Each read takes its first output and stops, so it holds the pair it
+        // started on, and a publication follows each one.
+        let mut abandoned = Vec::new();
+        for _ in 1..super::SECONDARY_GENERATION_COUNT {
+            let pair = Arc::downgrade(&slot.capture());
+            let read = started_unspent_output_read(&query, address).await?;
+            abandoned.push((pair, read));
+            assert!(
+                publish_next(&mut publisher).await?,
+                "a read that holds an older pair must not stop publication"
+            );
+        }
+        assert!(
+            !publish_next(&mut publisher).await?,
+            "with every spare generation held by a read, the publisher waits"
+        );
+
+        // Abandoning the reads mid-stream releases their pairs without any
+        // further publisher action.
+        let abandoned_pairs: Vec<_> = abandoned.into_iter().map(|(pair, _read)| pair).collect();
+        wait_for_released_pairs(&abandoned_pairs).await?;
+        assert!(
+            publish_next(&mut publisher).await?,
+            "publication resumes once abandoned reads release their pairs"
+        );
+
+        // Reads whose clients stop consuming fill the spare generations again.
+        let mut stalled = Vec::new();
+        for _ in 0..2 * super::SECONDARY_GENERATION_COUNT {
+            let pair = slot.capture();
+            let chain_epoch_id = pair.canonical_fence().chain_epoch_id();
+            stalled.push((
+                Arc::downgrade(&pair),
+                chain_epoch_id,
+                started_unspent_output_read(&query, address).await?,
+            ));
+            drop(pair);
+            if !publish_next(&mut publisher).await? {
+                break;
+            }
+        }
+        assert!(
+            !publish_next(&mut publisher).await?,
+            "stalled reads hold every spare generation"
+        );
+
+        // Once the retention window and the read limit pass, the publisher
+        // revokes the stalled reads and publishes again.
+        let now = tokio::time::Instant::now() + RETAINED_PAIR_WINDOW;
+        publisher.release_expired_pairs(now);
+        publisher
+            .reap_retired_pairs(now + super::RELEASED_PAIR_READ_LIMIT)
+            .await;
+        let current_pair = Arc::downgrade(&slot.capture());
+        let stalled_pairs: Vec<_> = stalled
+            .iter()
+            .map(|(pair, _, _)| pair.clone())
+            .filter(|pair| !pair.ptr_eq(&current_pair))
+            .collect();
+        wait_for_released_pairs(&stalled_pairs).await?;
+        assert!(
+            publish_next(&mut publisher).await?,
+            "publication resumes once revoked reads release their pairs"
+        );
+        for (pair, chain_epoch_id, mut read) in stalled {
+            if pair.ptr_eq(&current_pair) {
+                continue;
+            }
+            let failure = loop {
+                match read.next().await {
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => break error,
+                    None => return Err("a revoked read ended as if complete".into()),
+                }
+            };
+            assert!(
+                matches!(
+                    failure,
+                    crate::QueryError::ChainEpochPinUnavailable { chain_epoch_id: failed }
+                        if failed == chain_epoch_id
+                ),
+                "unexpected failure {failure:?}"
+            );
+        }
+
+        drop(query);
+        drop(publisher);
+        drop(slot);
+        cancel.cancel();
+        server_task.await??;
+        Ok(())
+    }
+
+    /// Opens an unspent-output read for `address` and consumes its first
+    /// output only, leaving the read mid-stream.
+    async fn started_unspent_output_read(
+        query: &WalletServingQuery<()>,
+        address: TransparentAddressScriptHash,
+    ) -> Result<crate::TransparentAddressUnspentOutputs, Box<dyn std::error::Error>> {
+        let mut read = query
+            .transparent_address_unspent_outputs(
+                crate::TransparentAddressUnspentOutputsRequest {
+                    address_script_hash: address,
+                    start_height: BlockHeight::new(0),
+                },
+                None,
+            )
+            .await?;
+        read.next()
+            .await
+            .ok_or("the read ended before its first output")??;
+        Ok(read)
+    }
+
+    /// Waits until only the publisher or the slot still holds each pair.
+    async fn wait_for_released_pairs(
+        pairs: &[std::sync::Weak<crate::WalletServingReadPair>],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while pairs.iter().any(|pair| pair.strong_count() > 1) {
+            if tokio::time::Instant::now() > deadline {
+                return Err("a read kept its pair".into());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok(())
+    }
+
+    /// A chain whose block 1 creates `output_count` outputs for one address.
+    fn address_with_unspent_outputs(
+        output_count: usize,
+    ) -> Result<(ChainFixture, TransparentAddressScriptHash), Box<dyn std::error::Error>> {
+        const SCRIPT_PUB_KEY: &[u8] = &[0x51];
+        let mut chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+        let block = chain
+            .block_at(BlockHeight::new(1))
+            .cloned()
+            .ok_or("fixture must contain height 1")?;
+        let address = TransparentAddressScriptHash::of_script_pub_key(SCRIPT_PUB_KEY);
+        let creator = zinder_core::TransactionId::from_bytes([0x10; 32]);
+        for output_index in 0..u32::try_from(output_count)? {
+            chain = chain.with_address_output_index(zinder_core::TransparentUnspentOutput::new(
+                address,
+                SCRIPT_PUB_KEY.to_vec(),
+                zinder_core::TransparentOutPoint::new(creator, output_index),
+                1_000,
+                block.height,
+                block.hash,
+            ));
+        }
+        Ok((chain, address))
     }
 
     /// A publisher that started with the node's pre-upgrade table must keep
@@ -3749,7 +4054,9 @@ mod tests {
         );
 
         drop(old_pair);
-        publisher.reap_retired_pairs().await;
+        publisher
+            .reap_retired_pairs(tokio::time::Instant::now())
+            .await;
         assert_eq!(
             published_generation_is_reusable(&publisher, 0),
             Some(false),
@@ -3764,7 +4071,9 @@ mod tests {
             Err(crate::QueryError::ChainEpochPinUnavailable { .. })
         ));
         assert_eq!(published_generation_is_reusable(&publisher, 0), Some(false));
-        publisher.reap_retired_pairs().await;
+        publisher
+            .reap_retired_pairs(tokio::time::Instant::now())
+            .await;
         assert_eq!(published_generation_is_reusable(&publisher, 0), Some(true));
         drop(live_chain_events);
         drop(resumed_chain_events);
@@ -4418,13 +4727,11 @@ mod retention_tests {
                 at_epoch_id,
             )
             .await?;
+        let chain_epoch_id = unspent.chain_epoch.id;
+        let outputs: Vec<_> = tokio_stream::StreamExt::collect::<Result<_, _>>(unspent).await?;
         Ok((
-            unspent.chain_epoch.id,
-            unspent
-                .outputs
-                .iter()
-                .map(|output| output.outpoint)
-                .collect(),
+            chain_epoch_id,
+            outputs.iter().map(|output| output.outpoint).collect(),
         ))
     }
 

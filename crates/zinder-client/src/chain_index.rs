@@ -287,8 +287,9 @@ pub struct TransparentAddressUnspentOutputsQuery {
 }
 
 /// Stream of unspent transparent outputs returned by
-/// [`ChainIndex::transparent_address_unspent_outputs`]. The stream always
-/// carries the complete unspent set at one pinned chain epoch.
+/// [`ChainIndex::transparent_address_unspent_outputs`]. A stream that ends
+/// without an error carried the complete unspent set at one pinned chain
+/// epoch.
 pub type TransparentAddressUnspentOutputsStream = IndexStream<TransparentUnspentOutputChunk>;
 
 /// Opaque transparent-address tx-history cursor bound to one visible-chain fence.
@@ -1208,8 +1209,15 @@ pub trait ChainIndex: Send + Sync + 'static {
     /// transparent address at a single pinned chain epoch.
     ///
     /// The stream cannot be truncated: there is no cursor and no entry
-    /// cap. Client memory for a drained stream is proportional to the
-    /// address's unspent set.
+    /// cap. Zinder reads the set as the stream is consumed, so a consumer
+    /// that processes each output as it arrives keeps memory bounded;
+    /// collecting the stream costs memory proportional to the address's
+    /// unspent set. Dropping the stream stops the server's reads.
+    ///
+    /// A stream that is still open when the server stops serving its epoch
+    /// ends with [`IndexerError::ChainEpochPinUnavailable`] after the outputs
+    /// already delivered. Those outputs are not a complete set: discard them
+    /// and read the address again at a fresh epoch.
     ///
     /// # Examples
     ///

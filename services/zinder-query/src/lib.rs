@@ -17,7 +17,7 @@ use zinder_core::{
     ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange,
     TransactionBlobArtifact, TransactionBroadcastOutcome, TransactionId, TransactionLocation,
     TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TransparentOutPoint, TransparentOutpointSpendStatus, TransparentUnspentOutput, TxStatus,
+    TransparentOutPoint, TransparentOutpointSpendStatus, TxStatus,
 };
 use zinder_proto::capabilities::WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1;
 use zinder_source::SourceError;
@@ -31,6 +31,7 @@ mod grpc;
 mod ingest_control;
 mod native_wallet_endpoint_capabilities;
 mod serving_read;
+mod transparent_unspent_output_stream;
 mod wallet_serving_pair;
 mod wallet_serving_pair_publisher;
 mod wallet_serving_query;
@@ -54,6 +55,9 @@ pub use ingest_control::{
 };
 pub use native_wallet_endpoint_capabilities::{
     NativeWalletEndpointCapabilities, UpstreamNodeCapabilities,
+};
+pub use transparent_unspent_output_stream::{
+    TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE, TransparentAddressUnspentOutputs,
 };
 pub use wallet_serving_pair::{
     CanonicalReader, WalletProjectionReader, WalletServingAdmissionError, WalletServingReadPair,
@@ -196,8 +200,13 @@ pub trait WalletQueryApi: Send + Sync + 'static {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<RawTransaction, QueryError>;
 
-    /// Reads the complete unspent transparent output set for one transparent
-    /// address script at a single pinned chain epoch.
+    /// Streams the complete unspent transparent output set for one
+    /// transparent address script at a single pinned chain epoch.
+    ///
+    /// The epoch is resolved before this call returns, so an epoch-pin
+    /// failure surfaces as the returned error. Outputs are then read in pages
+    /// of at most [`TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE`] as the caller
+    /// consumes them.
     async fn transparent_address_unspent_outputs(
         &self,
         request: TransparentAddressUnspentOutputsRequest,
@@ -623,15 +632,6 @@ pub struct TransparentAddressUnspentOutputsRequest {
     /// Wallet-birthday floor: minimum mined height to include.
     /// `BlockHeight::new(0)` means scan from genesis.
     pub start_height: BlockHeight,
-}
-
-/// Complete unspent transparent output set bound to one chain epoch.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TransparentAddressUnspentOutputs {
-    /// Chain epoch used to answer the query.
-    pub chain_epoch: ChainEpoch,
-    /// Unspent outputs in ascending `(block_height, outpoint)` order.
-    pub outputs: Vec<TransparentUnspentOutput>,
 }
 
 /// Spend status of a batch of transparent outpoints, read at one chain epoch.

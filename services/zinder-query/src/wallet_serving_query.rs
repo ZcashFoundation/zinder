@@ -18,7 +18,7 @@ use zinder_core::{
     MAX_OUTPOINTS_PER_SPEND_STATUS_REQUEST, MinedTransaction, MinedTransactionChainContext,
     NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, TransactionId,
     TransparentAddressBalance, TransparentAddressScriptHash, TransparentAddressTxIndexArtifact,
-    TransparentOutPoint, TransparentOutpointSpendStatus, TransparentUnspentOutput, TxStatus,
+    TransparentOutPoint, TransparentOutpointSpendStatus, TxStatus,
 };
 use zinder_proto::capabilities::{
     WALLET_BROADCAST_TRANSACTION_V1, WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1,
@@ -32,8 +32,7 @@ use zinder_store::{
     StreamCursorTokenV1,
 };
 use zinder_wallet_projection::{
-    WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
-    WalletProjectionSourcePosition,
+    WalletAddressTransactionKey, WalletCanonicalSourceIdentity, WalletProjectionSourcePosition,
 };
 
 use crate::{
@@ -49,7 +48,6 @@ use crate::{
     validate_subtree_root_range,
 };
 
-const WALLET_READ_PAGE_SIZE: NonZeroU16 = NonZeroU16::MAX;
 const TRANSPARENT_HISTORY_CURSOR_MAGIC: [u8; 4] = *b"zth1";
 const TRANSPARENT_HISTORY_CURSOR_LEN: usize = 174;
 
@@ -953,45 +951,19 @@ where
         request: TransparentAddressUnspentOutputsRequest,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransparentAddressUnspentOutputs, QueryError> {
-        let pair = self.capture_pair_at(at_epoch_id);
-        // An address can hold millions of outputs. Checking for a dropped
-        // request between pages lets an abandoned scan release its pair.
-        serving_read::run_until_dropped(
-            "transparent_address_unspent_outputs",
-            pair,
-            move |pair, request_dropped| {
+        serving_read::record("transparent_address_unspent_outputs", None, async {
+            let pair = self.capture_pair_at(at_epoch_id);
+            let (pair, chain_epoch) = serving_read::off_reactor(pair, move |pair| {
                 let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-                let mut outputs = Vec::new();
-                let mut after: Option<WalletAddressUnspentOutputKey> = None;
-                loop {
-                    request_dropped.check()?;
-                    let page = pair.wallet().address_unspent_outputs_page_from_height(
-                        request.address_script_hash,
-                        request.start_height,
-                        after,
-                        WALLET_READ_PAGE_SIZE,
-                    )?;
-                    outputs.extend(page.outputs.into_iter().map(|output| {
-                        TransparentUnspentOutput::new(
-                            output.address_script_hash,
-                            output.script_pub_key,
-                            output.outpoint,
-                            output.value_zat,
-                            output.created_at.block.height,
-                            output.created_at.block.hash,
-                        )
-                    }));
-                    let Some(next) = page.next_page_after else {
-                        break;
-                    };
-                    after = Some(next);
-                }
-                Ok(TransparentAddressUnspentOutputs {
-                    chain_epoch,
-                    outputs,
-                })
-            },
-        )
+                Ok((pair, chain_epoch))
+            })
+            .await?;
+            Ok(TransparentAddressUnspentOutputs::spawn(
+                pair,
+                &request,
+                chain_epoch,
+            ))
+        })
         .await
     }
 
@@ -1349,6 +1321,9 @@ async fn drive_serving_pair_full_block_range(
     let last_height = block_range.end.value();
     let mut sub_read_start = block_range.start.value();
     loop {
+        if pair.are_reads_revoked() {
+            return fail_revoked_full_block_range(pair, &block_sender).await;
+        }
         let sub_read_end = sub_read_start
             .saturating_add(FULL_BLOCK_STREAM_SUB_READ_BLOCKS - 1)
             .min(last_height);
@@ -1367,14 +1342,34 @@ async fn drive_serving_pair_full_block_range(
                 return;
             }
         };
-        if !forward_serving_pair_full_block_sub_range(&block_sender, sub_range, block_blobs).await {
-            return;
+        // A consumer that stops reading blocks this send. Revocation ends the
+        // range so the stalled stream cannot keep a released pair open.
+        let forwarded = tokio::select! {
+            biased;
+            () = pair.reads_revoked() => None,
+            forwarded = forward_serving_pair_full_block_sub_range(
+                &block_sender,
+                sub_range,
+                block_blobs,
+            ) => Some(forwarded),
+        };
+        match forwarded {
+            Some(true) if sub_read_end == last_height => return,
+            Some(true) => sub_read_start = sub_read_end.saturating_add(1),
+            Some(false) => return,
+            None => return fail_revoked_full_block_range(pair, &block_sender).await,
         }
-        if sub_read_end == last_height {
-            return;
-        }
-        sub_read_start = sub_read_end.saturating_add(1);
     }
+}
+
+/// Releases `pair` and then ends a full-block range whose reads were revoked.
+async fn fail_revoked_full_block_range(
+    pair: Arc<WalletServingReadPair>,
+    block_sender: &mpsc::Sender<Result<zinder_core::BlockBlobArtifact, QueryError>>,
+) {
+    let error = pair.revoked_read_error();
+    drop(pair);
+    let _ = block_sender.send(Err(error)).await;
 }
 
 async fn forward_serving_pair_full_block_sub_range(
