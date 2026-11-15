@@ -716,13 +716,29 @@ impl WalletServingPairPublisher {
                     () = cancel.cancelled() => break,
                     () = tokio::time::sleep(self.config.catchup_interval) => {
                         if let Err(error) = self.refresh_once().await {
-                            self.record_refresh_failure(&error);
-                            tracing::warn!(
-                                target: "zinder::wallet_serving",
-                                event = "wallet_serving_pair_publisher_refresh_failed",
-                                error = %error,
-                                "inactive wallet-serving pair refresh failed; retaining the prior pair"
-                            );
+                            let still_admitted = self.record_refresh_failure(&error);
+                            if refresh_failure_is_routine_lag(
+                                &error,
+                                self.observed_lag_chain_epochs,
+                                self.config.replica_lag_threshold_chain_epochs,
+                                still_admitted,
+                            ) {
+                                tracing::debug!(
+                                    target: "zinder::wallet_serving",
+                                    event = "wallet_serving_pair_publisher_refresh_failed",
+                                    error = %error,
+                                    lag_chain_epochs = self.observed_lag_chain_epochs,
+                                    "inactive wallet-serving pair has not caught up yet; retaining the prior pair"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    target: "zinder::wallet_serving",
+                                    event = "wallet_serving_pair_publisher_refresh_failed",
+                                    error = %error,
+                                    lag_chain_epochs = self.observed_lag_chain_epochs,
+                                    "inactive wallet-serving pair refresh failed; retaining the prior pair"
+                                );
+                            }
                         }
                     }
                 }
@@ -1238,7 +1254,9 @@ impl WalletServingPairPublisher {
         ))
     }
 
-    fn record_refresh_failure(&self, error: &WalletServingPairError) {
+    /// Publishes the readiness a failed refresh leaves behind and returns
+    /// whether that readiness still admits traffic on the published pair.
+    fn record_refresh_failure(&self, error: &WalletServingPairError) -> bool {
         let visible_height = self.serving_pair_slot.as_ref().map(|serving_pair_slot| {
             serving_pair_slot
                 .capture()
@@ -1255,9 +1273,8 @@ impl WalletServingPairPublisher {
         let failure_state = self
             .writer_attestation
             .remembered_halt()
-            .or(admitted_while_stale);
-        self.readiness
-            .publish_pair_state(failure_state.unwrap_or_else(|| {
+            .or(admitted_while_stale)
+            .unwrap_or_else(|| {
                 refresh_failure_not_ready_cause(error).map_or_else(
                     || {
                         ReadinessState::replica_lagging(
@@ -1269,13 +1286,16 @@ impl WalletServingPairPublisher {
                     },
                     ReadinessState::not_ready,
                 )
-            }));
+            });
+        let still_admitted = failure_state.cause.permits_traffic();
+        self.readiness.publish_pair_state(failure_state);
         metrics::counter!(
             "zinder_wallet_serving_pair_publisher_refresh_total",
             "status" => "error",
             "error_class" => wallet_serving_pair_error_class(error)
         )
         .increment(1);
+        still_admitted
     }
 }
 
@@ -1528,6 +1548,31 @@ fn refresh_failure_retains_attested_pair(error: &WalletServingPairError) -> bool
     )
 }
 
+/// Returns whether a refresh failure is routine lag that a later refresh is
+/// expected to clear.
+///
+/// The projector applies each block after the canonical writer commits it, so
+/// a candidate regularly catches its two secondaries up to different epochs
+/// while blocks arrive. Such a failure is routine while the writer lag stays
+/// within `secondary_replica_lag_threshold_chain_epochs` and the published pair
+/// still admits traffic.
+fn refresh_failure_is_routine_lag(
+    error: &WalletServingPairError,
+    lag_chain_epochs: u64,
+    lag_threshold_chain_epochs: u64,
+    still_admitted: bool,
+) -> bool {
+    still_admitted
+        && lag_chain_epochs <= lag_threshold_chain_epochs
+        && matches!(
+            error,
+            WalletServingPairError::ConvergenceTimedOut {
+                last_outcome: WalletServingConvergence::ReplicaBehind
+                    | WalletServingConvergence::ProjectionBehind,
+            }
+        )
+}
+
 /// Returns the fail-closed readiness cause for a refresh error. `None` is
 /// reserved for the convergence-lag outcomes, which the caller reports as
 /// replica lag rather than as a storage failure.
@@ -1672,7 +1717,7 @@ mod tests {
         CanonicalFenceRelation, RETAINED_PAIR_WINDOW, SecondaryGenerationState,
         WalletServingConvergence, WalletServingPairConfig, WalletServingPairError,
         WalletServingPairPublisher, WalletServingReadiness, classify_canonical_writer_fence,
-        classify_pair_admission, refresh_failure_not_ready_cause,
+        classify_pair_admission, refresh_failure_is_routine_lag, refresh_failure_not_ready_cause,
         refresh_failure_retains_attested_pair, spawn_wallet_ingest_control_readiness_probe,
         spawn_wallet_node_readiness_probe, wallet_ingest_control_request,
         wallet_source_writer_fence,
@@ -2358,6 +2403,44 @@ mod tests {
             }),
             Some(zinder_runtime::ReadinessCause::SchemaMismatch)
         );
+    }
+
+    #[test]
+    fn only_bounded_lag_on_an_admitted_pair_is_routine() {
+        let projection_behind = WalletServingPairError::ConvergenceTimedOut {
+            last_outcome: WalletServingConvergence::ProjectionBehind,
+        };
+        let replica_behind = WalletServingPairError::ConvergenceTimedOut {
+            last_outcome: WalletServingConvergence::ReplicaBehind,
+        };
+        assert!(refresh_failure_is_routine_lag(
+            &projection_behind,
+            1,
+            4,
+            true
+        ));
+        assert!(refresh_failure_is_routine_lag(&replica_behind, 4, 4, true));
+
+        assert!(
+            !refresh_failure_is_routine_lag(&projection_behind, 5, 4, true),
+            "lag past the warning threshold is not routine"
+        );
+        assert!(
+            !refresh_failure_is_routine_lag(&projection_behind, 1, 4, false),
+            "a refresh failure that stops traffic is not routine"
+        );
+        for not_lag in [
+            WalletServingPairError::WriterStatusRpc(Status::unavailable("writer status")),
+            WalletServingPairError::WriterFenceMismatch,
+            WalletServingPairError::ConvergenceTimedOut {
+                last_outcome: WalletServingConvergence::SchemaOrFenceMismatch,
+            },
+        ] {
+            assert!(
+                !refresh_failure_is_routine_lag(&not_lag, 0, 4, true),
+                "{not_lag} is not routine lag"
+            );
+        }
     }
 
     #[test]
