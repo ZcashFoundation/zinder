@@ -190,9 +190,9 @@ The build activates in one of two ways:
   window long. One write applies that tail, activates the generation, and
   adopts the shared cursor.
 
-While the other views rebuild without a shared cursor and the build trails
-their settled materialized height, replay dispatches no further page and
-waits for the build to join. Hydration reads dominate both walks, so a replay
+While the other views rebuild without a shared cursor and their materialized
+height is settled, replay dispatches no further page until the build reaches
+that height and joins them. Hydration reads dominate both walks, so a replay
 that kept advancing would only move the join point away, and the build would
 hydrate every height it passed a second time. After the join, one hydration
 per height serves every view, and replay takes over the prevout cache the

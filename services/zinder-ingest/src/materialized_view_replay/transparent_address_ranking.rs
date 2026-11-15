@@ -77,13 +77,47 @@ pub(super) struct RankingBuildProgress {
     stall_reported: AtomicBool,
 }
 
-/// A pending ranking build that trails the views replay rebuilds.
+/// A pending ranking build that has not yet joined the views replay rebuilds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct TrailingRankingBuild {
     /// Height through which the inactive build has applied blocks.
     built_through: BlockHeight,
-    /// Settled height the views materialized, where the build joins them.
+    /// Height the build walks toward: the views' materialized height, capped
+    /// at the settled tip.
     join_height: BlockHeight,
+}
+
+impl TrailingRankingBuild {
+    /// Returns the build at `built_through` when replay should wait for it.
+    ///
+    /// The build walks toward the views' materialized height, capped at the
+    /// settled tip. Below that height it still has history to apply. At the
+    /// views' own settled height it has applied everything and joins them on
+    /// its next step, which may follow the step that applied the last page,
+    /// so replay keeps waiting. A build stopped at a settled tip below the
+    /// views cannot join them there, so replay does not wait for it.
+    const fn behind(
+        built_through: BlockHeight,
+        materialized_height: BlockHeight,
+        settled_tip_height: BlockHeight,
+    ) -> Option<Self> {
+        let join_height = if materialized_height.value() < settled_tip_height.value() {
+            materialized_height
+        } else {
+            settled_tip_height
+        };
+        let waits = built_through.value() < join_height.value()
+            || (built_through.value() == join_height.value()
+                && join_height.value() == materialized_height.value());
+        if waits {
+            Some(Self {
+                built_through,
+                join_height,
+            })
+        } else {
+            None
+        }
+    }
 }
 
 impl RankingBuildProgress {
@@ -252,19 +286,17 @@ impl MaterializedViewTailer {
             return Ok(None);
         }
         let chain_epoch = canonical.chain_epoch()?;
-        let join_height = materialized_height
-            .min(chain_epoch.settled_tip_height)
-            .min(chain_epoch.visible_tip_height);
         let built_through = TransparentAddressRankingConsumer::build_metadata(store)?
             .map_or(BlockHeight::new(0), |build| {
                 build.coverage.balance_complete_through_height
             });
-        Ok(
-            (built_through < join_height).then_some(TrailingRankingBuild {
-                built_through,
-                join_height,
-            }),
-        )
+        Ok(TrailingRankingBuild::behind(
+            built_through,
+            materialized_height,
+            chain_epoch
+                .settled_tip_height
+                .min(chain_epoch.visible_tip_height),
+        ))
     }
 
     /// Advances a ranking build that trails rebuilding views until it joins
@@ -519,15 +551,7 @@ impl<'build> RankingBuild<'build> {
                 if through > BlockHeight::new(0)
                     && goal.value().saturating_sub(through.value())
                         >= PREVOUT_CACHE_WARMUP_MIN_REMAINING_BLOCKS
-                    && !self.hydrator.warm_prevout_cache(through, &mut || {
-                        let window = (started_at.elapsed() < RANKING_BUILD_STEP_BUDGET)
-                            .then(|| pass.warm_up_window())
-                            .flatten();
-                        if window.is_some() {
-                            pass.record_ranking_build_advance();
-                        }
-                        window
-                    })?
+                    && !self.warm_prevout_cache(through, started_at, pass)?
                 {
                     return Ok(self.paused_at(through));
                 }
@@ -605,6 +629,34 @@ impl<'build> RankingBuild<'build> {
             Err(TransparentAddressRankingConsumerError::SnapshotTargetMismatch) => Ok(None),
             Err(error) => Err(ranking_error(error)),
         }
+    }
+
+    /// Warms the build's empty prevout cache through `through` within the
+    /// step budget, recording each window it applies as build progress.
+    ///
+    /// A window counts only once the next one is requested or the warm-up
+    /// returns, so a window whose read fails never refreshes the stall clock.
+    fn warm_prevout_cache(
+        &mut self,
+        through: BlockHeight,
+        started_at: Instant,
+        pass: &mut ReplayPass,
+    ) -> Result<bool, IngestError> {
+        let mut window_open = false;
+        let warmed = self.hydrator.warm_prevout_cache(through, &mut || {
+            if window_open {
+                pass.record_ranking_build_advance();
+            }
+            let window = (started_at.elapsed() < RANKING_BUILD_STEP_BUDGET)
+                .then(|| pass.warm_up_window())
+                .flatten();
+            window_open = window.is_some();
+            window
+        })?;
+        if window_open {
+            pass.record_ranking_build_advance();
+        }
+        Ok(warmed)
     }
 
     /// Hands the cache this build walked to `joined` over to replay, which
@@ -806,6 +858,36 @@ mod tests {
         built_through: BlockHeight::new(10),
         join_height: BlockHeight::new(500),
     });
+
+    #[test]
+    fn replay_waits_for_a_build_below_or_at_the_views_settled_height() {
+        let height = BlockHeight::new;
+        assert_eq!(
+            TrailingRankingBuild::behind(height(10), height(500), height(900)),
+            TRAILING,
+            "a build below the views has history left to apply"
+        );
+        assert_eq!(
+            TrailingRankingBuild::behind(height(500), height(500), height(900)),
+            Some(TrailingRankingBuild {
+                built_through: height(500),
+                join_height: height(500),
+            }),
+            "a build at the views' settled height joins them on its next step"
+        );
+        assert_eq!(
+            TrailingRankingBuild::behind(height(400), height(500), height(400)),
+            None,
+            "a build at a settled tip below the views cannot join them there"
+        );
+        assert_eq!(
+            TrailingRankingBuild::behind(height(300), height(500), height(400)),
+            Some(TrailingRankingBuild {
+                built_through: height(300),
+                join_height: height(400),
+            })
+        );
+    }
 
     #[test]
     fn replay_waits_only_while_a_build_trails_it() {
