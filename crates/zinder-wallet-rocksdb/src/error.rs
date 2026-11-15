@@ -228,14 +228,20 @@ pub enum RocksDbWalletError {
         /// Hard implementation maximum.
         maximum_bytes: u64,
     },
-    /// A planned transition would exceed its accounted batch-and-overlay ceiling.
+    /// A planned transition would exceed its logical-byte ceiling, and the
+    /// wallet is unchanged.
+    ///
+    /// The planner stops at the first change that exceeds the ceiling, so the
+    /// complete transition needs a ceiling of at least `required_bytes` and
+    /// possibly more.
     #[error(
-        "wallet projection transition requires at least {required_bytes} accounted logical bytes, limit is {limit_bytes}"
+        "wallet projection transition requires at least {required_bytes} accounted logical bytes, limit is {limit_bytes}; the wallet is unchanged"
     )]
     TransitionLogicalByteLimit {
         /// Caller-supplied hard ceiling.
         limit_bytes: u64,
-        /// Minimum logical bytes required by the refused planned mutation.
+        /// Accounted logical bytes when the plan stopped, a lower bound on
+        /// the ceiling the complete transition needs.
         required_bytes: u64,
     },
     /// Checked logical-byte accounting exceeded the `u64` domain.

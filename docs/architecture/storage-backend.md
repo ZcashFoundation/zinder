@@ -97,18 +97,30 @@ the stored rows.
 Following applies one canonical event transition atomically with the
 new source position. Ready readers never repair or advance the store.
 
+A transition plans its changes in memory and keeps only the final value, or
+the deletion, of each row it touches. It then publishes exactly those rows,
+followed by the READY control record, in one synchronous write batch. A row
+that a reorg rolls back and replays, or a balance that changes many times,
+therefore appears in the batch once. The transition's logical-byte limit
+(`projector.follow.max_transition_logical_bytes`) counts each touched row's
+key and final value twice, once for the plan and once for the batch, and the
+control record once. The planner refuses a transition at the first change that
+would exceed the limit, before it writes anything, so the wallet stays
+unchanged.
+
 Within one transition, the planner remembers each output, address-index,
 balance, and address-transaction row it reads, including a row it finds
 missing, and reuses that answer until the transition writes the row. The
-remembered rows count toward the transition's logical-byte limit
-(`projector.follow.max_transition_logical_bytes`), but only in the room that
-the write batch and pending writes leave. They are dropped when those need
-the room, so the limit refuses the same transitions as it would without them.
-While the limit leaves room for the remembered rows, spending an output or
-creating one makes at most four point reads: its unspent-output, spent-output,
-address-index, and balance rows. Each address a transaction touches adds one
-read of its address-transaction row. A transition close to its limit may read
-a row again after the planner drops what it remembered.
+remembered rows count toward the same limit, but only in the room that the
+planned rows and their batch leave. They are dropped when the plan needs that
+room, so the limit refuses the same transitions as it would without them. The
+planner also drops them before it builds the batch, so the plan, the
+remembered rows, and the batch never hold more logical bytes than the limit
+together. While the limit leaves room for the remembered rows, spending an
+output or creating one makes at most four point reads: its unspent-output,
+spent-output, address-index, and balance rows. Each address a transaction
+touches adds one read of its address-transaction row. A transition close to
+its limit may read a row again after the planner drops what it remembered.
 
 Reorg-undo rows cover exactly the unsettled suffix. Each row's starting source
 digest equals the resulting digest of the row below it, and the top row matches
