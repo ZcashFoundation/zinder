@@ -9,8 +9,9 @@
 //! on an idle host:
 //!
 //! ```text
-//! cargo nextest run -p zinder-wallet-projection --cargo-profile release \
-//!   --run-ignored=all --no-capture -E 'test(/^perf::digest_hashing::/)'
+//! cargo nextest run -p zinder-wallet-projection --profile=ci-perf \
+//!   --cargo-profile release --run-ignored=all --no-capture \
+//!   -E 'test(/^perf::digest_hashing::/)'
 //! ```
 
 use std::hint::black_box;
