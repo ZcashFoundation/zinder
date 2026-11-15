@@ -1265,8 +1265,9 @@ jq -r '.repeats[-1].final_wallet.projection_digest_hex' "$work/check.json"
 rm -rf "$work/scratch-check" "$work/rebuilt-wallet"
 ```
 
-Measure the baseline and the candidate from the same inputs, with at least 3
-repeats each, on a quiet host. Build each binary from its own revision, give
+Measure the baseline and the candidate from the same inputs, with the same
+`--repeat` count of at least 3, on a quiet host. The comparison refuses reports
+with different repeat counts. Build each binary from its own revision, give
 each run its own `--scratch-dir` and `--report`, then compare:
 
 ```bash

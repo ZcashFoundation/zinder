@@ -364,6 +364,7 @@ fn run_repeat(
             wallet: &wallet_path,
         },
         &plan.settings,
+        &plan.source,
     )?;
     let start = stores.start_position()?;
     require_fixture_extends(plan, start)?;
@@ -374,7 +375,7 @@ fn run_repeat(
     let replay_clock = ProcessClock::start();
     let mut timings = Vec::with_capacity(plan.fixture_blocks.len());
     for (replayed, expected_tip) in (1_u32..).zip(&plan.fixture_blocks) {
-        timings.push(stores.replay_block(runtime, &plan.source, recorder, *expected_tip)?);
+        timings.push(stores.replay_block(runtime, recorder, *expected_tip)?);
         if replayed % PROGRESS_INTERVAL_BLOCKS == 0 {
             tracing::info!(
                 target: "zinder::bench",

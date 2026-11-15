@@ -162,12 +162,25 @@ fn read_report(path: &std::path::Path) -> Result<TipReplayReport, BenchError> {
     Ok(report)
 }
 
-/// Timings are comparable only for the same blocks from the same start state,
-/// and a change that alters the final state is a correctness failure.
+/// Timings are comparable only for the same blocks, replayed as many times,
+/// from the same start state.
+///
+/// The pooled summaries count every block of every repeat, so their totals
+/// and block counts scale with the repeat count. A change that alters the
+/// final state is a correctness failure.
 fn require_same_workload(
     baseline: &TipReplayReport,
     candidate: &TipReplayReport,
 ) -> Result<(), BenchError> {
+    let (baseline_repeats, candidate_repeats) = (
+        baseline.configuration.repeat_count,
+        candidate.configuration.repeat_count,
+    );
+    if baseline_repeats != candidate_repeats {
+        return Err(BenchError::report_format(format!(
+            "the baseline repeat count {baseline_repeats} differs from the candidate repeat count {candidate_repeats}; pooled totals and block counts scale with --repeat"
+        )));
+    }
     let (baseline_inputs, candidate_inputs) = (&baseline.inputs, &candidate.inputs);
     if baseline_inputs.fixture.manifest_sha256 != candidate_inputs.fixture.manifest_sha256
         || baseline_inputs.fixture.tip_replay_checkpoints_sha256

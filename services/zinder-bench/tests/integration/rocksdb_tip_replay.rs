@@ -5,11 +5,15 @@
 
 use std::{
     collections::BTreeMap,
+    io::{BufRead, BufReader},
     num::NonZeroU32,
     path::{Path, PathBuf},
-    process::{Command, Output},
-    sync::Arc,
-    time::Duration,
+    process::{Child, Command, Output, Stdio},
+    sync::{
+        Arc,
+        mpsc::{self, RecvTimeoutError},
+    },
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -56,6 +60,8 @@ const COINBASE_HEIGHT_OPCODE_OFFSET: usize = 1_534;
 const REORG_WINDOW_BLOCKS: u32 = 2;
 const START_HEIGHT: u32 = 4;
 const CHAIN_TIP_HEIGHT: u32 = 8;
+/// Bounds a replay that must fail, so one that retries forever fails the test.
+const REPLAY_FAILURE_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Test-local source serving a parseable Regtest chain and its checkpoints.
 #[derive(Clone)]
@@ -303,7 +309,12 @@ fn block_id(source: &ParseableChainSource, height: u32) -> Result<BlockId> {
 }
 
 fn run_tip_replay(inputs: &TipReplayInputs, fixture: &Path, extra: &[&str]) -> Result<Output> {
-    Ok(Command::new(env!("CARGO_BIN_EXE_zinder-bench"))
+    Ok(tip_replay_command(inputs, fixture, extra).output()?)
+}
+
+fn tip_replay_command(inputs: &TipReplayInputs, fixture: &Path, extra: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_zinder-bench"));
+    command
         .arg("rocksdb-tip-replay")
         .arg("--fixture")
         .arg(fixture)
@@ -316,8 +327,30 @@ fn run_tip_replay(inputs: &TipReplayInputs, fixture: &Path, extra: &[&str]) -> R
         .args(["--canonical-block-cache-bytes", "8388608"])
         .args(["--canonical-secondary-block-cache-bytes", "8388608"])
         .args(["--wallet-block-cache-bytes", "8388608"])
-        .args(extra)
+        .args(extra);
+    command
+}
+
+fn compare_reports(baseline: &Path, candidate: &Path, comparison: &Path) -> Result<Output> {
+    Ok(Command::new(env!("CARGO_BIN_EXE_zinder-bench"))
+        .arg("compare-tip-replay-reports")
+        .arg("--baseline")
+        .arg(baseline)
+        .arg("--candidate")
+        .arg(candidate)
+        .arg("--report")
+        .arg(comparison)
         .output()?)
+}
+
+/// Kills the child process if the test returns before it exits.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 fn require_success(output: &Output, action: &str) -> Result<()> {
@@ -481,7 +514,14 @@ async fn tip_replay_cli_replays_fixture_blocks_and_matches_a_rebuilt_wallet() ->
 async fn tip_replay_reports_compare_and_name_their_setting_differences() -> Result<()> {
     let inputs = prepare_inputs().await?;
     let mut reports = Vec::new();
-    for (index, repeat) in ["1", "2"].into_iter().enumerate() {
+    for (index, setting) in [
+        ["--repeat", "1"],
+        ["--max-transition-logical-bytes", "268435456"],
+        ["--repeat", "2"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let scratch = inputs.directory.path().join(format!("scratch-{index}"));
         let report = inputs.directory.path().join(format!("report-{index}.json"));
         let output = run_tip_replay(
@@ -492,8 +532,8 @@ async fn tip_replay_reports_compare_and_name_their_setting_differences() -> Resu
                 &scratch.to_string_lossy(),
                 "--report",
                 &report.to_string_lossy(),
-                "--repeat",
-                repeat,
+                setting[0],
+                setting[1],
             ],
         )?;
         require_success(&output, "tip replay")?;
@@ -502,15 +542,7 @@ async fn tip_replay_reports_compare_and_name_their_setting_differences() -> Resu
     }
     let comparison_path = inputs.directory.path().join("comparison.json");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_zinder-bench"))
-        .arg("compare-tip-replay-reports")
-        .arg("--baseline")
-        .arg(&reports[0])
-        .arg("--candidate")
-        .arg(&reports[1])
-        .arg("--report")
-        .arg(&comparison_path)
-        .output()?;
+    let output = compare_reports(&reports[0], &reports[1], &comparison_path)?;
     require_success(&output, "report comparison")?;
 
     let comparison = read_json(&comparison_path)?;
@@ -521,15 +553,116 @@ async fn tip_replay_reports_compare_and_name_their_setting_differences() -> Resu
     assert_eq!(comparison["workload"]["block_count"], 4);
     assert_eq!(
         comparison["setting_differences"][0]["setting"],
-        "configuration.repeat_count"
+        "configuration.max_transition_logical_bytes"
+    );
+    assert_eq!(
+        comparison["setting_differences"][0]["candidate"],
+        268_435_456
+    );
+    assert_eq!(
+        comparison["timers"]["all_blocks"]["baseline_block_count"],
+        4
     );
     assert_eq!(
         comparison["timers"]["all_blocks"]["candidate_block_count"],
-        8
+        4
     );
     assert!(
         comparison["timers"]["all_blocks"]["timers"]["wallet_apply"]["p99"]["baseline"].is_number()
     );
+
+    let refused_path = inputs.directory.path().join("refused-comparison.json");
+    let refused = compare_reports(&reports[0], &reports[2], &refused_path)?;
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("baseline repeat count 1 differs from the candidate repeat count 2"),
+        "{stderr}"
+    );
+    assert!(!refused_path.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn tip_replay_fails_with_the_source_error_when_a_fixture_segment_becomes_unreadable()
+-> Result<()> {
+    let inputs = prepare_inputs().await?;
+    let manifest = FixtureManifest::read(&inputs.fixture())?;
+    let segment = inputs.fixture().join(
+        &manifest
+            .segments
+            .first()
+            .ok_or_else(|| eyre!("fixture needs a segment"))?
+            .file,
+    );
+    let scratch = inputs.directory.path().join("scratch");
+    let report = inputs.directory.path().join("report.json");
+    // Enough repeats that the replay is still running when the segment goes.
+    let mut child = KillOnDrop(
+        tip_replay_command(
+            &inputs,
+            &inputs.fixture(),
+            &[
+                "--scratch-dir",
+                &scratch.to_string_lossy(),
+                "--report",
+                &report.to_string_lossy(),
+                "--repeat",
+                "1000",
+            ],
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?,
+    );
+    let stderr = child
+        .0
+        .stderr
+        .take()
+        .ok_or_else(|| eyre!("tip replay stderr must be piped"))?;
+    let (line_sender, lines) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stderr)
+            .lines()
+            .map_while(std::io::Result::ok)
+        {
+            if line_sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + REPLAY_FAILURE_DEADLINE;
+    let mut stderr_lines = Vec::new();
+    loop {
+        match lines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(line) => {
+                // Admission has read the segment; only the follower reads it after this.
+                if line.contains("tip_replay_admitted") {
+                    std::fs::remove_file(&segment)?;
+                }
+                stderr_lines.push(line);
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(eyre!(
+                    "tip replay still ran {REPLAY_FAILURE_DEADLINE:?} after it started:\n{}",
+                    stderr_lines.join("\n")
+                ));
+            }
+        }
+    }
+    let status = child.0.wait()?;
+    reader
+        .join()
+        .map_err(|_| eyre!("the stderr reader thread panicked"))?;
+
+    let stderr = stderr_lines.join("\n");
+    assert!(!status.success(), "{stderr}");
+    assert!(stderr.contains("source error"), "{stderr}");
+    assert!(stderr.contains("fixture read failed"), "{stderr}");
+    assert!(!report.exists());
+    assert!(!scratch.exists());
     Ok(())
 }
 

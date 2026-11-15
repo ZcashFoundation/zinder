@@ -8,15 +8,23 @@ use std::{
     time::{Duration, Instant},
 };
 
+use async_trait::async_trait;
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 use zinder_bench::{BenchError, tip_replay_checkpoints::TipReplayNodeSource};
-use zinder_core::{BlockHeight, BlockId, Network, NetworkUpgradeActivations};
+use zinder_core::{
+    BlockHeight, BlockId, CommitmentTreeCheckpoint, Network, NetworkUpgradeActivations,
+    ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange,
+};
 use zinder_ingest::{
     CanonicalFollowConfig, CanonicalFollower, DEFAULT_MAX_REPLACEMENT_BYTES,
     DEFAULT_TIP_FOLLOW_LAG_THRESHOLD_BLOCKS, follow_canonical_tip,
 };
 use zinder_runtime::{ComposedReadiness, Readiness};
+use zinder_source::{
+    NodeCapabilities, NodeSource, SourceBlock, SourceChainSegment, SourceChainSegmentLimits,
+    SourceError, SourceSubtreeRoots,
+};
 use zinder_store::{
     CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalEventKind, CanonicalReorgPolicy,
     CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
@@ -85,7 +93,7 @@ pub(super) struct ReplayStores {
     follow_activations: Arc<NetworkUpgradeActivations>,
     max_transition_logical_bytes: NonZeroU64,
     readiness: ComposedReadiness,
-    cancel: CancellationToken,
+    source: ReplayFixtureSource,
 }
 
 impl ReplayStores {
@@ -93,6 +101,7 @@ impl ReplayStores {
     pub(super) fn open(
         paths: &StorePaths<'_>,
         settings: &StoreSettings,
+        fixture: &TipReplayNodeSource,
     ) -> Result<Self, BenchError> {
         let canonical = RocksDbCanonicalStore::open_ready_with_network_upgrade_schedule(
             paths.canonical,
@@ -135,7 +144,11 @@ impl ReplayStores {
             follow_activations,
             max_transition_logical_bytes: settings.max_transition_logical_bytes,
             readiness: ComposedReadiness::new(Readiness::default(), &[]),
-            cancel: CancellationToken::new(),
+            source: ReplayFixtureSource {
+                fixture: fixture.clone(),
+                cancel: CancellationToken::new(),
+                first_failure: Mutex::new(None),
+            },
         })
     }
 
@@ -163,10 +176,11 @@ impl ReplayStores {
     }
 
     /// Appends one fixture block, then applies its wallet transition.
+    ///
+    /// Fails with the fixture source's first error, if it returned one.
     pub(super) fn replay_block(
         &mut self,
         runtime: &tokio::runtime::Runtime,
-        source: &TipReplayNodeSource,
         recorder: &FollowStepRecorder,
         expected_tip: BlockId,
     ) -> Result<BlockTimings, BenchError> {
@@ -175,15 +189,20 @@ impl ReplayStores {
         })?;
         recorder.clear();
         let follower = CanonicalFollower::new(
-            source,
+            &self.source,
             Arc::clone(&self.follow_activations),
             single_append_follow_config(expected_tip.height),
             &self.readiness,
-            &self.cancel,
+            &self.source.cancel,
         );
         let follow_started = Instant::now();
-        let store = runtime.block_on(follow_canonical_tip(store, follower))?;
+        let follow_outcome = runtime.block_on(follow_canonical_tip(store, follower));
         let canonical_follow_step = follow_started.elapsed();
+        let source_failure = self.source.first_failure.lock().take();
+        if let Some(failure) = source_failure {
+            return Err(failure.into());
+        }
+        let store = follow_outcome?;
         let fence = store.event_fence();
         self.canonical = Some(store);
         if fence.visible_tip() != expected_tip {
@@ -324,6 +343,96 @@ impl ReplayStores {
             fence: store.event_fence(),
             settled_tip: BlockId::new(epoch.settled_tip_height, epoch.settled_tip_hash),
         })
+    }
+}
+
+/// The fixture source as the canonical follower sees it.
+///
+/// The follower backs off and retries every source failure until it is
+/// cancelled, as a node outage warrants. A fixture read failure does not heal,
+/// so the first one is kept for the replay to report and cancels the follower.
+struct ReplayFixtureSource {
+    fixture: TipReplayNodeSource,
+    cancel: CancellationToken,
+    first_failure: Mutex<Option<SourceError>>,
+}
+
+impl ReplayFixtureSource {
+    /// Keeps `failure` if it is the first, cancels the follower, and returns
+    /// the failure's description for the follower to observe.
+    fn stop_on(&self, failure: SourceError) -> SourceError {
+        let reason = failure.to_string();
+        let mut first_failure = self.first_failure.lock();
+        if first_failure.is_none() {
+            *first_failure = Some(failure);
+        }
+        drop(first_failure);
+        self.cancel.cancel();
+        SourceError::NodeUnavailable { reason }
+    }
+}
+
+#[async_trait]
+impl NodeSource for ReplayFixtureSource {
+    fn capabilities(&self) -> NodeCapabilities {
+        self.fixture.capabilities()
+    }
+
+    async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+        self.fixture
+            .fetch_block_at(height)
+            .await
+            .map_err(|failure| self.stop_on(failure))
+    }
+
+    async fn fetch_chain_segment(
+        &self,
+        limits: SourceChainSegmentLimits,
+    ) -> Result<SourceChainSegment, SourceError> {
+        self.fixture
+            .fetch_chain_segment(limits)
+            .await
+            .map_err(|failure| self.stop_on(failure))
+    }
+
+    async fn fetch_chain_checkpoint(
+        &self,
+        height: BlockHeight,
+        network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> Result<CommitmentTreeCheckpoint, SourceError> {
+        self.fixture
+            .fetch_chain_checkpoint(height, network_upgrade_activations)
+            .await
+            .map_err(|failure| self.stop_on(failure))
+    }
+
+    async fn tip_id(&self) -> Result<BlockId, SourceError> {
+        self.fixture
+            .tip_id()
+            .await
+            .map_err(|failure| self.stop_on(failure))
+    }
+
+    async fn fetch_subtree_roots(
+        &self,
+        protocol: ShieldedProtocol,
+        start_index: SubtreeRootIndex,
+        max_entries: NonZeroU32,
+    ) -> Result<SourceSubtreeRoots, SourceError> {
+        self.fixture
+            .fetch_subtree_roots(protocol, start_index, max_entries)
+            .await
+            .map_err(|failure| self.stop_on(failure))
+    }
+
+    async fn fetch_subtree_root_range(
+        &self,
+        range: SubtreeRootRange,
+    ) -> Result<SourceSubtreeRoots, SourceError> {
+        self.fixture
+            .fetch_subtree_root_range(range)
+            .await
+            .map_err(|failure| self.stop_on(failure))
     }
 }
 

@@ -36,7 +36,7 @@ pub enum BenchError {
         /// Human-readable description of the mismatch.
         reason: String,
     },
-    /// An upstream source call failed during capture.
+    /// A node or fixture source call failed during capture or replay.
     #[error("source error: {source}")]
     Source {
         /// Underlying source failure.

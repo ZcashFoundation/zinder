@@ -338,7 +338,9 @@ Both stores must be closed. `--scratch-dir` and `--report` must not exist, and
 the command refuses to start when the scratch filesystem lacks room for one
 copy of both stores plus 2 GiB. Each repeat replays from fresh copies, and
 the command fails unless every repeat ends in the same canonical fence and
-wallet digest.
+wallet digest. If a fixture read fails during the replay, for example because
+a segment file was removed, the run ends with that source error and writes no
+report. The replay does not retry it the way the writer retries a node outage.
 
 | Option | Default | Effect |
 | --- | --- | --- |
@@ -437,12 +439,14 @@ zinder-bench compare-tip-replay-reports \
 
 The comparison refuses reports of different fixtures or start states, and
 reports whose final canonical or wallet state differs, because a performance
-change must not change the result. It lists every build, host, and
-configuration setting that differs, so you can confirm that only the
-intended variable changed. For each stratum and timer it gives the baseline,
-the candidate, and the percent change of every summary statistic, plus the
-mean block-loop wall and CPU time and the peak resident memory. Without
-`--report`, it writes to stdout.
+change must not change the result. It also refuses reports with different
+`--repeat` counts, because the pooled summaries count every block of every
+repeat, so their totals and block counts grow with the repeat count. It lists
+every build, host, and configuration setting that differs, so you can confirm
+that only the intended variable changed. For each stratum and timer it gives
+the baseline, the candidate, and the percent change of every summary
+statistic, plus the mean block-loop wall and CPU time and the peak resident
+memory. Without `--report`, it writes to stdout.
 
 ## Report fields
 
