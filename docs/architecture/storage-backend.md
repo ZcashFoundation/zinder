@@ -97,6 +97,17 @@ the stored rows.
 Following applies one canonical event transition atomically with the
 new source position. Ready readers never repair or advance the store.
 
+Within one transition, the planner remembers each output, address-index,
+balance, and address-transaction row it reads, including a row it finds
+missing, and reuses that answer until the transition writes the row. Spending
+an output or creating one therefore makes at most four point reads: its
+unspent-output, spent-output, address-index, and balance rows. Each address a
+transaction touches adds one read of its address-transaction row. The
+remembered rows count toward the transition's logical-byte limit
+(`projector.follow.max_transition_logical_bytes`), but only in the room that
+the write batch and pending writes leave. They are dropped when those need
+the room, so the limit refuses the same transitions as it would without them.
+
 Reorg-undo rows cover exactly the unsettled suffix. Each row's starting source
 digest equals the resulting digest of the row below it, and the top row matches
 the wallet's source tip. A following handle reads and decodes every retained

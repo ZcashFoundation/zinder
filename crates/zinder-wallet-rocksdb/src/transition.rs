@@ -115,7 +115,8 @@ enum UndoSuffixCheck {
 ///
 /// Each caller must select a smaller nonzero ceiling. The planner accounts
 /// duplicated key/value payloads held by its `WriteBatch` and overlay before
-/// the synchronous publication point.
+/// the synchronous publication point. The rows it remembers from durable
+/// reads use only what those leave of the ceiling.
 pub const MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES: u64 = 1024 * 1024 * 1024;
 
 impl RocksDbWalletStore {
@@ -939,6 +940,12 @@ impl TransitionLogicalByteAccounting {
         }
         Ok(())
     }
+
+    /// Bytes of the limit that the planned batch and overlay leave unused.
+    const fn unused_bytes(&self) -> u64 {
+        self.limit
+            .saturating_sub(self.batch.saturating_add(self.overlay))
+    }
 }
 
 fn logical_entry_bytes(
@@ -966,10 +973,67 @@ fn decode_undo(key: &[u8], encoded: &[u8]) -> Result<WalletReorgUndo, RocksDbWal
 
 type OverlayKey = (&'static str, Vec<u8>);
 
+/// Durable rows, or their absence, that one plan has read and not yet written.
+///
+/// A plan runs under an exclusive borrow of the store's only writer handle,
+/// so its durable rows cannot change between two of its reads, and a later
+/// read of the same key reuses the first observation. The memo holds only the
+/// bytes that the plan's batch and overlay leave of its logical-byte limit,
+/// and forgets every read when they need that room, so it never changes
+/// which plans the limit refuses.
+#[derive(Default)]
+struct DurableReadMemo {
+    rows: BTreeMap<OverlayKey, Option<Vec<u8>>>,
+    logical_bytes: u64,
+}
+
+impl DurableReadMemo {
+    fn get(&self, key: &OverlayKey) -> Option<&Option<Vec<u8>>> {
+        self.rows.get(key)
+    }
+
+    /// Remembers one durable read if the memo still fits in `available_bytes`.
+    fn remember(
+        &mut self,
+        key: OverlayKey,
+        encoded: Option<&[u8]>,
+        available_bytes: u64,
+    ) -> Result<(), RocksDbWalletError> {
+        let entry_bytes = logical_entry_bytes(&key.1, encoded)?;
+        let next_bytes = checked_transition_bytes(self.logical_bytes, entry_bytes)?;
+        if next_bytes <= available_bytes {
+            self.rows.insert(key, encoded.map(<[u8]>::to_vec));
+            self.logical_bytes = next_bytes;
+        }
+        Ok(())
+    }
+
+    /// Forgets the read of `key`, which the plan now writes, and forgets every
+    /// read if the memo still does not fit in `available_bytes`.
+    fn release_for_write(
+        &mut self,
+        key: &OverlayKey,
+        available_bytes: u64,
+    ) -> Result<(), RocksDbWalletError> {
+        if let Some(encoded) = self.rows.remove(key) {
+            let entry_bytes = logical_entry_bytes(&key.1, encoded.as_deref())?;
+            self.logical_bytes = self
+                .logical_bytes
+                .checked_sub(entry_bytes)
+                .ok_or(RocksDbWalletError::TransitionLogicalByteAccountingOverflow)?;
+        }
+        if self.logical_bytes > available_bytes {
+            *self = Self::default();
+        }
+        Ok(())
+    }
+}
+
 struct WalletTransitionPlanner<'store> {
     store: &'store RocksDbWalletStore,
     batch: WriteBatch,
     overlay: BTreeMap<OverlayKey, Option<Vec<u8>>>,
+    durable_reads: DurableReadMemo,
     logical_bytes: TransitionLogicalByteAccounting,
     accumulator: WalletProjectionDigestBuilder,
     accumulator_row_counts: zinder_wallet_projection::WalletProjectionFamilyRowCounts,
@@ -987,6 +1051,7 @@ impl<'store> WalletTransitionPlanner<'store> {
             store,
             batch: WriteBatch::default(),
             overlay: BTreeMap::new(),
+            durable_reads: DurableReadMemo::default(),
             logical_bytes: TransitionLogicalByteAccounting::new(max_logical_bytes),
             accumulator: WalletProjectionDigestBuilder::from_parts(
                 store.ready_evidence.projection_accumulator.clone(),
@@ -1490,7 +1555,7 @@ impl<'store> WalletTransitionPlanner<'store> {
     }
 
     fn read_unspent(
-        &self,
+        &mut self,
         key: WalletOutpointKey,
     ) -> Result<Option<WalletUnspentOutput>, RocksDbWalletError> {
         self.raw(TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY, key.as_bytes())?
@@ -1499,7 +1564,7 @@ impl<'store> WalletTransitionPlanner<'store> {
     }
 
     fn read_spent(
-        &self,
+        &mut self,
         key: WalletOutpointKey,
     ) -> Result<Option<WalletSpentOutput>, RocksDbWalletError> {
         self.raw(TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY, key.as_bytes())?
@@ -1656,7 +1721,7 @@ impl<'store> WalletTransitionPlanner<'store> {
 
     /// Reads one retained undo row with the bytes a plan needs to remove it.
     fn load_undo(
-        &self,
+        &mut self,
         height: BlockHeight,
     ) -> Result<Option<(WalletReorgUndo, Vec<u8>)>, RocksDbWalletError> {
         let key = height.value().to_be_bytes();
@@ -1689,7 +1754,10 @@ impl<'store> WalletTransitionPlanner<'store> {
             .transpose()
     }
 
-    fn validate_add_unspent(&self, output: &WalletUnspentOutput) -> Result<(), RocksDbWalletError> {
+    fn validate_add_unspent(
+        &mut self,
+        output: &WalletUnspentOutput,
+    ) -> Result<(), RocksDbWalletError> {
         self.utxo_summary
             .utxo_count
             .checked_add(1)
@@ -1709,7 +1777,7 @@ impl<'store> WalletTransitionPlanner<'store> {
     }
 
     fn validate_remove_unspent(
-        &self,
+        &mut self,
         output: &WalletUnspentOutput,
     ) -> Result<(), RocksDbWalletError> {
         self.utxo_summary
@@ -1787,7 +1855,7 @@ impl<'store> WalletTransitionPlanner<'store> {
     }
 
     fn current_balance(
-        &self,
+        &mut self,
         address: TransparentAddressScriptHash,
     ) -> Result<u64, RocksDbWalletError> {
         let key = address.as_bytes();
@@ -1897,23 +1965,36 @@ impl<'store> WalletTransitionPlanner<'store> {
     }
 
     fn raw(
-        &self,
+        &mut self,
         column_family_name: &'static str,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, RocksDbWalletError> {
         let overlay_key = (column_family_name, key.to_vec());
         let encoded = if let Some(overlay_value) = self.overlay.get(&overlay_key) {
             overlay_value.clone()
+        } else if let Some(observed) = self.durable_reads.get(&overlay_key) {
+            observed.clone()
         } else {
             let column_family = column_family(&self.store.bounded_open, column_family_name)?;
             count_undo_row_work(column_family_name, UndoRowWork::DurableRead);
-            self.store
+            let encoded = self
+                .store
                 .bounded_open
                 .db
                 .get_cf(&column_family, key)
                 .map_err(|source| {
                     RocksDbWalletError::rocksdb("wallet transition point read", source)
-                })?
+                })?;
+            // The plan writes or deletes every undo row it reads, so
+            // remembering one would only copy it.
+            if column_family_name != REORG_UNDO_COLUMN_FAMILY {
+                self.durable_reads.remember(
+                    overlay_key,
+                    encoded.as_deref(),
+                    self.logical_bytes.unused_bytes(),
+                )?;
+            }
+            encoded
         };
         if encoded.is_some() {
             count_undo_row_work(column_family_name, UndoRowWork::ValueCopy);
@@ -1931,6 +2012,8 @@ impl<'store> WalletTransitionPlanner<'store> {
         let overlay_key = (column_family_name, key.to_vec());
         self.logical_bytes
             .reserve_put(key, &encoded_value, self.overlay.get(&overlay_key))?;
+        self.durable_reads
+            .release_for_write(&overlay_key, self.logical_bytes.unused_bytes())?;
         self.batch.put_cf(&column_family, key, &encoded_value);
         self.overlay.insert(overlay_key, Some(encoded_value));
         Ok(())
@@ -1945,6 +2028,8 @@ impl<'store> WalletTransitionPlanner<'store> {
         let overlay_key = (column_family_name, key.to_vec());
         self.logical_bytes
             .reserve_delete(key, self.overlay.get(&overlay_key))?;
+        self.durable_reads
+            .release_for_write(&overlay_key, self.logical_bytes.unused_bytes())?;
         self.batch.delete_cf(&column_family, key);
         self.overlay.insert(overlay_key, None);
         Ok(())
@@ -1996,15 +2081,15 @@ mod tests {
     };
 
     use super::{
-        UndoRowWorkCounts, extend_source_sequence_digest, source_identity_from_fence,
-        take_undo_row_work,
+        DurableReadMemo, UndoRowWorkCounts, extend_source_sequence_digest,
+        source_identity_from_fence, take_undo_row_work,
     };
     use crate::{
         RocksDbWalletBuildOptions, RocksDbWalletBuildStore, RocksDbWalletError,
         RocksDbWalletFollowingStore, RocksDbWalletStore, build_wallet_from_canonical,
         store::{
-            REORG_UNDO_COLUMN_FAMILY, RocksDbWalletBuilder, WalletColdValidationConfig,
-            column_family,
+            REORG_UNDO_COLUMN_FAMILY, RocksDbWalletBuilder, TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY,
+            WalletColdValidationConfig, column_family,
         },
     };
 
@@ -2813,6 +2898,27 @@ mod tests {
             transaction_blobs,
             block_blob: None,
         }
+    }
+
+    #[test]
+    fn durable_read_memo_keeps_only_the_bytes_the_plan_leaves_it() -> Result<(), RocksDbWalletError>
+    {
+        let key = |byte| (TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY, vec![byte; 4]);
+        let mut memo = DurableReadMemo::default();
+        memo.remember(key(1), Some([0; 4].as_slice()), 8)?;
+        memo.remember(key(2), None, 11)?;
+        assert!(memo.get(&key(1)).is_some());
+        assert!(memo.get(&key(2)).is_none());
+
+        memo.remember(key(3), None, 12)?;
+        memo.release_for_write(&key(3), 8)?;
+        assert!(memo.get(&key(3)).is_none());
+        assert!(memo.get(&key(1)).is_some());
+
+        memo.release_for_write(&key(4), 7)?;
+        assert!(memo.get(&key(1)).is_none());
+        assert_eq!(memo.logical_bytes, 0);
+        Ok(())
     }
 
     /// Settlement lag of the coinbase-only chains below, and the reorg depth
