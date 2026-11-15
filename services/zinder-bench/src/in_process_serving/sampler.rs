@@ -99,6 +99,13 @@ pub(crate) struct DbSample {
     pub(crate) running_flushes: u64,
     pub(crate) background_errors: u64,
     pub(crate) stall_micros: u64,
+    /// Cumulative compaction tickers: entries dropped because a newer entry or a
+    /// tombstone made them obsolete. Held snapshots suppress these drops.
+    pub(crate) compaction_key_drop_newer: u64,
+    pub(crate) compaction_key_drop_obsolete: u64,
+    pub(crate) compact_read_bytes: u64,
+    pub(crate) compact_write_bytes: u64,
+    pub(crate) flush_write_bytes: u64,
     pub(crate) cf_total_stops: u64,
     pub(crate) cf_total_delays: u64,
     pub(crate) db_stall_counts: BTreeMap<String, u64>,
@@ -240,6 +247,15 @@ pub(crate) fn sample_db(probe: &DbProbe<'_>, include_live_files: bool) -> DbSamp
     sample.running_flushes = int(db, "rocksdb.num-running-flushes");
     sample.background_errors = int(db, "rocksdb.background-errors");
     sample.stall_micros = probe.statistics.get_ticker_count(Ticker::StallMicros);
+    sample.compaction_key_drop_newer = probe
+        .statistics
+        .get_ticker_count(Ticker::CompactionKeyDropNewerEntry);
+    sample.compaction_key_drop_obsolete = probe
+        .statistics
+        .get_ticker_count(Ticker::CompactionKeyDropObsolete);
+    sample.compact_read_bytes = probe.statistics.get_ticker_count(Ticker::CompactReadBytes);
+    sample.compact_write_bytes = probe.statistics.get_ticker_count(Ticker::CompactWriteBytes);
+    sample.flush_write_bytes = probe.statistics.get_ticker_count(Ticker::FlushWriteBytes);
     if let Ok(Some(text)) = db.property_value("rocksdb.db-write-stall-stats") {
         sample.db_stall_counts = parse_stall_counts(&text);
     }

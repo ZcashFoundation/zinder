@@ -124,7 +124,7 @@ pub(crate) struct IndexAttachRecord {
     pub(crate) error: Option<String>,
 }
 
-/// Latency of tiny synced writes to the same wallet database around the ingest.
+/// Latency of tiny unsynced writes to the same wallet database around the ingest.
 #[derive(Clone, Debug, Default, Serialize)]
 pub(crate) struct IngestProbeWindow {
     pub(crate) writes: usize,
@@ -177,8 +177,10 @@ fn probe_ingest<T>(db: &DB, ingest: impl FnOnce() -> T) -> (T, IngestProbe) {
             let Some(family) = db.cf_handle(BALLAST_COLUMN_FAMILY) else {
                 return writes;
             };
+            // Unsynced and paced: a synced tight loop would itself slow the writer's
+            // WAL syncs. A write blocked by the ingest still waits for the write thread.
             let mut options = WriteOptions::default();
-            options.set_sync(true);
+            options.set_sync(false);
             let mut counter = 0_u64;
             while !stop.load(Ordering::SeqCst) {
                 counter += 1;
@@ -189,6 +191,7 @@ fn probe_ingest<T>(db: &DB, ingest: impl FnOnce() -> T) -> (T, IngestProbe) {
                 batch.put_cf(&family, &key, b"p");
                 let _ = db.write_opt(&batch, &options);
                 writes.push((started, origin.elapsed().as_secs_f64()));
+                std::thread::sleep(Duration::from_micros(500));
             }
             writes
         });
