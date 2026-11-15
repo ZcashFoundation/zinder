@@ -203,6 +203,8 @@ wallet_mode=serve explorer_mode=serve start_entrypoint \
   ZINDER_NODE__JSON_RPC_ADDR=http://node:18232 \
   ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM="$key_pem" \
   ZINDER_INGEST__REORG_WINDOW_BLOCKS=1000 \
+  ZINDER_INGEST__explorer_views_min_free_bytes=0 \
+  ZINDER_explorer__ops_listen_addr=127.0.0.1:9069 \
   ZINDER_PROJECTOR__BUILD_OWNER_HEX=00112233445566778899aabbccddeeff \
   ZINDER_EXPLORER__BEARER_TOKEN_PATH=/run/secrets/explorer.token \
   INGEST_CONTROL_BEARER_TOKEN=control-secret \
@@ -218,18 +220,20 @@ await_file "$work/case/explorer.env"
 wallet_env="$work/case/wallet.env"
 explorer_env="$work/case/explorer.env"
 for expected in ZINDER_NETWORK__NAME ZINDER_NODE__JSON_RPC_ADDR ZINDER_INGEST__REORG_WINDOW_BLOCKS \
-  ZINDER_PROJECTOR__BUILD_OWNER_HEX INGEST_CONTROL_BEARER_TOKEN CHECKPOINT_BEARER_TOKEN; do
+  ZINDER_INGEST__explorer_views_min_free_bytes ZINDER_PROJECTOR__BUILD_OWNER_HEX \
+  INGEST_CONTROL_BEARER_TOKEN CHECKPOINT_BEARER_TOKEN; do
   grep -q "^${expected}=" "$wallet_env" || test_failure "wallet serving did not receive $expected"
 done
-if grep -q '^ZINDER_EXPLORER__' "$wallet_env"; then
+if grep -qi '^ZINDER_EXPLORER__' "$wallet_env"; then
   test_failure "an Explorer variable reached the wallet-serving processes"
 fi
-for expected in ZINDER_NETWORK__NAME ZINDER_NODE__JSON_RPC_ADDR ZINDER_EXPLORER__BEARER_TOKEN_PATH RUST_LOG; do
+for expected in ZINDER_NETWORK__NAME ZINDER_NODE__JSON_RPC_ADDR ZINDER_EXPLORER__BEARER_TOKEN_PATH \
+  ZINDER_explorer__ops_listen_addr RUST_LOG; do
   grep -q "^${expected}=" "$explorer_env" || test_failure "the Explorer did not receive $expected"
 done
 for unexpected in ZINDER_INGEST__ ZINDER_PROJECTOR__ INGEST_CONTROL_BEARER_TOKEN CHECKPOINT_BEARER_TOKEN; do
   for runtime_env in "$explorer_env" "$work/case/explorer-preflight.env"; do
-    if grep -q "^${unexpected}" "$runtime_env"; then
+    if grep -qi "^${unexpected}" "$runtime_env"; then
       test_failure "$unexpected reached $runtime_env"
     fi
   done

@@ -154,12 +154,24 @@ collect_wallet_serving_status() {
   fi
 }
 
+# Prints each ZINDER_ variable name. The config loader matches the prefix
+# exactly but lowercases the rest of the name, so mixed-case names configure
+# sections too.
+zinder_variable_names() {
+  env | sed -n 's/^\(ZINDER_[A-Za-z0-9_]*\)=.*/\1/p'
+}
+
+# Prints the name in the case-insensitive form section routing compares.
+section_routing_name() {
+  printf '%s\n' "$1" | tr '[:lower:]' '[:upper:]'
+}
+
 # Runs zinder-explorer as zinder with the given extra arguments. The Explorer
 # shares only [network] and [node] with the wallet-serving processes; its
 # storage, listeners, and bind policy come from its own config.
 run_explorer() {
-  for variable_name in $(env | sed -n 's/^\(ZINDER_[A-Z0-9_]*\)=.*/\1/p'); do
-    case "$variable_name" in
+  for variable_name in $(zinder_variable_names); do
+    case "$(section_routing_name "$variable_name")" in
       ZINDER_NETWORK__* | ZINDER_NODE__* | ZINDER_EXPLORER__*) ;;
       *) unset "$variable_name" ;;
     esac
@@ -201,8 +213,11 @@ fi
 # own, so ZINDER_EXPLORER__* overrides reach only the Explorer.
 log "starting wallet serving"
 (
-  for variable_name in $(env | sed -n 's/^\(ZINDER_EXPLORER__[A-Z0-9_]*\)=.*/\1/p'); do
-    unset "$variable_name"
+  for variable_name in $(zinder_variable_names); do
+    case "$(section_routing_name "$variable_name")" in
+      ZINDER_EXPLORER__*) unset "$variable_name" ;;
+      *) ;;
+    esac
   done
   exec "$wallet_serving_entrypoint"
 ) &
