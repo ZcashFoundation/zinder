@@ -60,6 +60,16 @@ pub enum MaterializedViewStoreError {
         /// Column family name that collided.
         name: &'static str,
     },
+    /// A consumer declared a height undo index it does not own.
+    #[error(
+        "materialized-view consumer `{consumer}` declares height undo index `{name}` outside its column families"
+    )]
+    UndeclaredHeightUndoIndex {
+        /// Consumer whose schema declared the index.
+        consumer: &'static str,
+        /// Column family named as the undo index.
+        name: &'static str,
+    },
     /// `RocksDB` could not open the database at the configured path.
     #[error("materialized-view store could not open RocksDB at {path:?}: {source}")]
     Open {

@@ -17,7 +17,11 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Endpoint};
 use zinder_core::{
     BlockHeight, BlockId, ChainEpoch, Network, TransactionId, TransparentAddressScriptHash,
-    explorer_reasons::WALLET_QUERY_CAPABILITY_NOT_SUPPORTED, wire::encode_rpc_block_hash_hex,
+    explorer_reasons::WALLET_QUERY_CAPABILITY_NOT_SUPPORTED,
+    wire::{
+        decode_rpc_transaction_id_hex, encode_internal_transaction_id, encode_rpc_block_hash_hex,
+        encode_rpc_transaction_id_hex,
+    },
 };
 use zinder_explorer::{ExplorerQueryGrpcAdapter, ExplorerServerInfoSettings};
 use zinder_materialized_views::{
@@ -551,6 +555,7 @@ fn seeded_reorg_history_materialized_view_store(
     let primary_materialized_view_store = zinder_ingest::open_primary_materialized_view_store(
         canonical_path,
         zinder_store::RocksDbResourceBudget::for_local_tests(),
+        zinder_store::CanonicalReorgPolicy::new(zinder_store::DEFAULT_REORG_WINDOW_BLOCKS)?,
     )?;
     record_reorg_incidents(&primary_materialized_view_store)?;
     let reorg_cursor = primary_materialized_view_store
@@ -566,6 +571,7 @@ fn seeded_reorg_history_materialized_view_store(
             sync_writes: false,
             consumers: MaterializedViewStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+            reorg_policy: None,
         },
     )?;
     materialized_view_store.try_catch_up()?;
@@ -781,6 +787,7 @@ fn seeded_block_summary_materialized_view_store_with_transaction_ids(
             sync_writes: false,
             consumers: MaterializedViewStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+            reorg_policy: None,
         },
     )?;
     seed_block_summary(&primary_store, chain_fixture, transaction_ids)?;
@@ -792,6 +799,7 @@ fn seeded_block_summary_materialized_view_store_with_transaction_ids(
             sync_writes: false,
             consumers: MaterializedViewStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+            reorg_policy: None,
         },
     )?;
     secondary_store.try_catch_up()?;
@@ -1058,12 +1066,15 @@ struct SeedDelta {
 /// Seeds the `transparent_address_deltas` column family for one address with
 /// the given events, mirroring what `TransparentAddressDeltasConsumer` writes
 /// at commit time.
+///
+/// Every other row stores its transaction id in the RPC hex form earlier
+/// releases wrote, so reads cover both stored encodings.
 fn seed_transparent_address_deltas(
     materialized_view_store: &MaterializedViewStore,
     address: TransparentAddressScriptHash,
     deltas: &[SeedDelta],
 ) -> Result<()> {
-    for delta in deltas {
+    for (row_index, delta) in deltas.iter().enumerate() {
         let key = TransparentAddressDeltasConsumer::key_for_event(
             address,
             BlockHeight::new(delta.height),
@@ -1071,10 +1082,21 @@ fn seed_transparent_address_deltas(
             delta.kind_byte,
             delta.event_index,
         );
-        let record = TransparentAddressDeltasRecord {
-            transaction_id: delta.transaction_id.clone(),
-            block_time_unix_seconds: 1_700_000_000 + i64::from(delta.height),
-            value_zat: delta.value_zat,
+        let transaction_id = decode_rpc_transaction_id_hex(&delta.transaction_id)?;
+        let record = if row_index % 2 == 0 {
+            TransparentAddressDeltasRecord {
+                internal_transaction_id: encode_internal_transaction_id(transaction_id).to_vec(),
+                block_time_unix_seconds: 1_700_000_000 + i64::from(delta.height),
+                value_zat: delta.value_zat,
+                ..TransparentAddressDeltasRecord::default()
+            }
+        } else {
+            TransparentAddressDeltasRecord {
+                transaction_id: encode_rpc_transaction_id_hex(transaction_id),
+                block_time_unix_seconds: 1_700_000_000 + i64::from(delta.height),
+                value_zat: delta.value_zat,
+                ..TransparentAddressDeltasRecord::default()
+            }
         };
         materialized_view_store.put_consumer(
             TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY,
@@ -1102,6 +1124,7 @@ fn seeded_deltas_materialized_view_store(
             sync_writes: false,
             consumers: MaterializedViewStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+            reorg_policy: None,
         },
     )?;
     seed_transparent_address_deltas(&primary_store, address, deltas)?;
@@ -1113,6 +1136,7 @@ fn seeded_deltas_materialized_view_store(
             sync_writes: false,
             consumers: MaterializedViewStore::bundled_consumers(),
             rocksdb_resource_budget: zinder_store::RocksDbResourceBudget::for_local_tests(),
+            reorg_policy: None,
         },
     )?;
     secondary_store.try_catch_up()?;

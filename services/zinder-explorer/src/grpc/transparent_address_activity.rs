@@ -12,7 +12,7 @@ use tonic::{Request, Response, Status};
 use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_core::wire::{
     decode_address_script_hash, decode_height_key_descending, decode_rpc_block_hash_hex,
-    encode_address_script_hash,
+    encode_address_script_hash, encode_rpc_transaction_id_hex,
 };
 use zinder_core::{BlockHeight, BlockId, Network, TransparentAddressScriptHash};
 use zinder_proto::capabilities::EXPLORER_TRANSPARENT_ADDRESS_ACTIVITY_V2;
@@ -36,7 +36,8 @@ use super::freshness::{
 use zinder_materialized_views::{
     MaterializedViewStore, MaterializedViewStoreReadSnapshot,
     TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY, TRANSPARENT_ADDRESS_ACTIVITY_KEY_LEN,
-    TransparentAddressRankingConsumer, TransparentAddressRankingConsumerError,
+    TransparentAddressActivityConsumer, TransparentAddressRankingConsumer,
+    TransparentAddressRankingConsumerError,
     TransparentAddressSummary as ProjectedTransparentAddressSummary,
 };
 
@@ -335,7 +336,7 @@ fn scan_address_activity(
             }
             let record = TransparentAddressActivityRecord::decode(payload.as_slice())
                 .map_err(|error| ExplorerError::internal(error.to_string()))?;
-            entries.push(activity_entry_from_record(record, height));
+            entries.push(activity_entry_from_record(&record, height)?);
             last_key = Some(key_array);
             if u32::try_from(entries.len()).unwrap_or(u32::MAX) >= parameters.max_entries {
                 break 'scan;
@@ -361,11 +362,13 @@ fn scan_address_activity(
 }
 
 fn activity_entry_from_record(
-    record: TransparentAddressActivityRecord,
+    record: &TransparentAddressActivityRecord,
     block_height: u32,
-) -> TransparentAddressActivityEntry {
-    TransparentAddressActivityEntry {
-        transaction_id: record.transaction_id,
+) -> Result<TransparentAddressActivityEntry, ExplorerError> {
+    let transaction_id = TransparentAddressActivityConsumer::stored_transaction_id(record)
+        .map_err(|error| ExplorerError::internal(error.to_string()))?;
+    Ok(TransparentAddressActivityEntry {
+        transaction_id: encode_rpc_transaction_id_hex(transaction_id),
         block_height,
         block_time_unix_seconds: record.block_time_unix_seconds,
         net_value_zat: record.net_value_zat,
@@ -380,7 +383,7 @@ fn activity_entry_from_record(
         other_input_script_pub_keys: Vec::new(),
         other_output_script_pub_keys: Vec::new(),
         input_facts_complete: false,
-    }
+    })
 }
 
 fn encode_address_summary(
@@ -577,7 +580,7 @@ mod tests {
     use prost::Message as _;
     use tempfile::{TempDir, tempdir};
     use tonic::Code;
-    use zinder_core::wire::encode_rpc_block_hash_hex;
+    use zinder_core::wire::{encode_internal_transaction_id, encode_rpc_block_hash_hex};
     use zinder_core::{
         ArtifactSchemaVersion, BlockHash, BlockHeightRange, ChainEpoch, ChainEpochId,
         ChainTipMetadata, TransactionFactsArtifact, TransactionId, TransactionLocation,
@@ -586,8 +589,7 @@ mod tests {
     use zinder_materialized_views::{
         BlockCommitContext, BlockCommitInput, BlockKeyedConsumer, ChainEventDispatchInputs,
         MaterializedViewStoreOptions, TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA,
-        TRANSPARENT_ADDRESS_RANKING_SCHEMA, TransparentAddressActivityConsumer,
-        TransparentSpendFacts,
+        TRANSPARENT_ADDRESS_RANKING_SCHEMA, TransparentSpendFacts,
     };
     use zinder_store::{ChainEpochCommitted, ChainEvent, RocksDbResourceBudget};
     use zinder_testkit::synthetic_transaction_public_facts;
@@ -712,6 +714,7 @@ mod tests {
                 consumers: &[TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 sync_writes: false,
+                reorg_policy: None,
             },
         )?;
         let script_hash = TransparentAddressScriptHash::from_bytes([0x11; 32]);
@@ -724,6 +727,7 @@ mod tests {
                 output_count: 1,
                 prevout_resolution_status:
                     zinder_proto::v1::explorer::PrevoutResolutionStatus::Resolved as i32,
+                internal_transaction_id: Vec::new(),
             };
             store.put_consumer(
                 TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY,
@@ -751,6 +755,75 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].block_height, 102);
         assert_eq!(next_cursor.len(), TRANSPARENT_ADDRESS_ACTIVITY_KEY_LEN);
+        Ok(())
+    }
+
+    #[test]
+    fn activity_reads_transaction_ids_in_either_stored_encoding() -> TestResult {
+        let tempdir = tempdir()?;
+        let store = MaterializedViewStore::open(
+            tempdir.path(),
+            MaterializedViewStoreOptions {
+                consumers: &[TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA],
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                sync_writes: false,
+                reorg_policy: None,
+            },
+        )?;
+        let script_hash = TransparentAddressScriptHash::from_bytes([0x11; 32]);
+        let mut internal_bytes = [0x44; 32];
+        internal_bytes[0] = 0x01;
+        let internal = TransactionId::from_bytes(internal_bytes);
+        let legacy = TransactionId::from_bytes([0x22; 32]);
+        for (height, record) in [
+            (
+                102,
+                TransparentAddressActivityRecord {
+                    internal_transaction_id: encode_internal_transaction_id(internal).to_vec(),
+                    ..TransparentAddressActivityRecord::default()
+                },
+            ),
+            (
+                101,
+                TransparentAddressActivityRecord {
+                    transaction_id: encode_rpc_transaction_id_hex(legacy),
+                    ..TransparentAddressActivityRecord::default()
+                },
+            ),
+        ] {
+            store.put_consumer(
+                TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY,
+                &TransparentAddressActivityConsumer::key_for_row(
+                    script_hash,
+                    BlockHeight::new(height),
+                    0,
+                ),
+                &record.encode_to_vec(),
+            )?;
+        }
+
+        let (entries, _next_cursor) = scan_address_activity(
+            &store.read_snapshot(),
+            &ActivityScanParameters {
+                script_hash,
+                offset: 0,
+                start_height: 0,
+                end_height: u32::MAX,
+                max_entries: 2,
+                from_cursor: &[],
+            },
+        )?;
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.transaction_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                encode_rpc_transaction_id_hex(internal).as_str(),
+                encode_rpc_transaction_id_hex(legacy).as_str(),
+            ]
+        );
         Ok(())
     }
 
@@ -802,6 +875,7 @@ mod tests {
                 ],
                 rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
                 sync_writes: false,
+                reorg_policy: None,
             },
         )?;
         TransparentAddressRankingConsumer::activate_genesis_generation(&store)?;

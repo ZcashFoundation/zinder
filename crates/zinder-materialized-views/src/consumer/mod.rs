@@ -102,6 +102,13 @@ pub struct MaterializedViewConsumerSchema {
     pub schema_version: u16,
     /// Column families this consumer reads and writes.
     pub column_families: &'static [&'static str],
+    /// Owned column family that holds only per-height undo rows, if any.
+    ///
+    /// Its keys are four-byte ascending heights, and nothing but the
+    /// consumer's own `revert_block` reads a row below its newest height. A
+    /// store opened with a reorg window keeps only the window's newest heights
+    /// of it; see [`crate::MaterializedViewStoreOptions::reorg_policy`].
+    pub height_undo_index: Option<&'static str>,
 }
 
 impl MaterializedViewConsumerSchema {
@@ -118,6 +125,20 @@ impl MaterializedViewConsumerSchema {
             name,
             schema_version,
             column_families,
+            height_undo_index: None,
+        }
+    }
+
+    /// Declares one owned column family as the consumer's per-height undo
+    /// index.
+    ///
+    /// The declaration is not part of the persisted manifest, so a consumer
+    /// can declare it without a schema version change.
+    #[must_use]
+    pub const fn with_height_undo_index(self, column_family: &'static str) -> Self {
+        Self {
+            height_undo_index: Some(column_family),
+            ..self
         }
     }
 }

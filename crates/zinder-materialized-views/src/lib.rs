@@ -119,8 +119,6 @@ pub use consumer::transparent_address_deltas::{
     TRANSPARENT_ADDRESS_DELTAS_CONSUMER_NAME, TRANSPARENT_ADDRESS_DELTAS_INDEX_COLUMN_FAMILY,
     TRANSPARENT_ADDRESS_DELTAS_KEY_LEN, TRANSPARENT_ADDRESS_DELTAS_SCHEMA,
     TransparentAddressDeltasConsumer, TransparentAddressDeltasConsumerError,
-    TransparentAddressDeltasLifetimeBootstrap, TransparentAddressDeltasSourceCoverage,
-    TransparentAddressLifetimeSummary,
 };
 pub use consumer::transparent_address_ranking::{
     TRANSPARENT_ADDRESS_RANKING_COLUMN_FAMILIES, TRANSPARENT_ADDRESS_RANKING_CONSUMER_NAME,
@@ -178,5 +176,5 @@ pub use store::{
     MATERIALIZED_VIEW_STORE_FORMAT_VERSION, MATERIALIZED_VIEW_STORE_SUBDIR,
     MaterializedViewCoverage, MaterializedViewCursorEntry, MaterializedViewState,
     MaterializedViewStore, MaterializedViewStoreOptions, MaterializedViewStoreReadSnapshot,
-    MaterializedViewStoreTable, MaterializedViewWriteMeasurement,
+    MaterializedViewStoreTable, MaterializedViewWriteMeasurement, UndoIndexPruning,
 };

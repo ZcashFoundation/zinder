@@ -92,6 +92,7 @@ fn open_store() -> TestResult<(tempfile::TempDir, MaterializedViewStore)> {
             sync_writes: false,
             consumers: &[VALUE_POOL_FLOW_HISTORY_SCHEMA],
             rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+            reorg_policy: None,
         },
     )?;
     Ok((tempdir, store))
@@ -434,6 +435,7 @@ fn lifecycle_persists_coverage_without_advancing_cursor_and_rewinds_tail() -> Te
             sync_writes: false,
             consumers: &[VALUE_POOL_FLOW_HISTORY_SCHEMA],
             rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+            reorg_policy: None,
         },
     )?;
     assert_eq!(

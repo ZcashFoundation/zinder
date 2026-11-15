@@ -10,6 +10,7 @@ use parking_lot::{Mutex, RwLock};
 use prost::Message as _;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
+use zinder_core::wire::decode_height_key_ascending;
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, CommitmentTreeAccumulator, CommitmentTreeCheckpoint,
     CommitmentTreeFrontiers, Network, NetworkUpgradeActivations, SubtreeRootRange,
@@ -55,6 +56,7 @@ const CHAIN_TIP_HEIGHT: u32 = 4;
 const REPLACEMENT_TIP_HEIGHT: u32 = 5;
 const REORG_WINDOW_BLOCKS: u32 = 2;
 const UNCURSORED_HEAD_REPLACED_EVENT: &str = "materialized_view_replay_uncursored_head_replaced";
+const CURSOR_EXPIRED_EVENT: &str = "materialized_view_replay_cursor_expired";
 const RANKING_ACTIVATED_EVENT: &str = "transparent_address_ranking_activated";
 const RANKING_JOINED_REPLAY_EVENT: &str = "transparent_address_ranking_joined_replay";
 
@@ -464,6 +466,58 @@ async fn an_expired_cursor_recovers_onto_the_rows_a_clean_rebuild_produces()
 }
 
 #[tokio::test]
+async fn an_expired_cursor_recovers_a_pruned_view_store_onto_the_rows_of_an_unpruned_one()
+-> Result<(), Box<dyn Error>> {
+    let mut harness = CanonicalHarness::baseline().await?;
+    let (_pruned_directory, pruned) = pruned_view_store()?;
+    let (_unpruned_directory, unpruned) = view_store()?;
+    for view in [&pruned, &unpruned] {
+        harness.tailer(view).catch_up()?;
+    }
+
+    harness.follow_to_tip().await?;
+    harness.prune_events_to_fence()?;
+    let capture = LogCapture::install_for_target("zinder::ingest");
+    for view in [&pruned, &unpruned] {
+        harness.tailer(view).catch_up()?;
+    }
+
+    assert!(
+        capture.any(|event| event.field("event") == Some(CURSOR_EXPIRED_EVENT)),
+        "both views must recover from an expired cursor"
+    );
+    assert_view_rows_match(&pruned, &unpruned, CHAIN_TIP_HEIGHT - REORG_WINDOW_BLOCKS)
+}
+
+#[tokio::test]
+async fn a_reorg_reverts_a_pruned_view_store_onto_the_rows_of_an_unpruned_one()
+-> Result<(), Box<dyn Error>> {
+    let mut harness = CanonicalHarness::baseline().await?;
+    harness.follow_to_tip().await?;
+    let (_pruned_directory, pruned) = pruned_view_store()?;
+    let (_unpruned_directory, unpruned) = view_store()?;
+    for view in [&pruned, &unpruned] {
+        harness.tailer(view).catch_up()?;
+    }
+    assert_view_rows_match(&pruned, &unpruned, CHAIN_TIP_HEIGHT - REORG_WINDOW_BLOCKS)?;
+
+    harness.replace_tip().await?;
+    for view in [&pruned, &unpruned] {
+        harness.tailer(view).catch_up()?;
+    }
+
+    assert_eq!(
+        block_summary_hashes(&pruned, REPLACEMENT_TIP_HEIGHT)?,
+        harness.canonical_hashes(REPLACEMENT_TIP_HEIGHT)
+    );
+    assert_view_rows_match(
+        &pruned,
+        &unpruned,
+        REPLACEMENT_TIP_HEIGHT - REORG_WINDOW_BLOCKS,
+    )
+}
+
+#[tokio::test]
 async fn an_undecodable_persisted_cursor_names_the_view_store_for_rebuild()
 -> Result<(), Box<dyn Error>> {
     let harness = CanonicalHarness::baseline().await?;
@@ -591,8 +645,70 @@ fn open_view_store(path: &Path) -> Result<MaterializedViewStore, Box<dyn Error>>
             sync_writes: false,
             consumers: MaterializedViewStore::bundled_consumers(),
             rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+            reorg_policy: None,
         },
     )?)
+}
+
+/// Opens a view store that keeps its height undo indexes to the harness's
+/// reorg window, as ingest opens it.
+fn pruned_view_store() -> Result<(TempDir, MaterializedViewStore), Box<dyn Error>> {
+    let directory = TempDir::new()?;
+    let store = MaterializedViewStore::open(
+        directory.path(),
+        MaterializedViewStoreOptions {
+            sync_writes: false,
+            consumers: MaterializedViewStore::bundled_consumers(),
+            rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+            reorg_policy: Some(CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?),
+        },
+    )?;
+    Ok((directory, store))
+}
+
+/// Requires a pruned view to hold every row of an unpruned view that followed
+/// the same chain, except the height undo rows at or below `pruned_through`.
+fn assert_view_rows_match(
+    pruned: &MaterializedViewStore,
+    unpruned: &MaterializedViewStore,
+    pruned_through: u32,
+) -> Result<(), Box<dyn Error>> {
+    let mut pruned_undo_rows = 0;
+    for definition in bundled_materialized_view_consumer_definitions() {
+        for &column_family in definition.schema.column_families {
+            let mut expected = view_rows(unpruned, column_family)?;
+            if definition.schema.height_undo_index == Some(column_family) {
+                let held = expected.len();
+                expected.retain(|key, _payload| {
+                    decode_height_key_ascending(key)
+                        .map_or(true, |height| height.value() > pruned_through)
+                });
+                pruned_undo_rows += held - expected.len();
+            }
+            assert_eq!(
+                view_rows(pruned, column_family)?,
+                expected,
+                "{column_family} must hold the unpruned rows the reorg window reaches"
+            );
+        }
+    }
+    assert!(
+        pruned_undo_rows > 0,
+        "the fixture chain must outgrow the reorg window"
+    );
+    Ok(())
+}
+
+fn view_rows(
+    view: &MaterializedViewStore,
+    column_family: &'static str,
+) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, Box<dyn Error>> {
+    let mut rows = BTreeMap::new();
+    view.visit_consumer_rows(column_family, |key, payload| {
+        rows.insert(key.to_vec(), payload.to_vec());
+        Ok(())
+    })?;
+    Ok(rows)
 }
 
 /// Removes chain-event cursors from a closed view store, leaving the rows they

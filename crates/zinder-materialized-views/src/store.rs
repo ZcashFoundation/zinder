@@ -25,14 +25,16 @@ use std::{
 
 use parking_lot::{RwLock, RwLockReadGuard};
 use rust_rocksdb::{
-    Cache, ColumnFamilyDescriptor, DB, DBCompressionType, IteratorMode, Options, ReadOptions,
-    Snapshot, WriteBatch, WriteOptions, checkpoint::Checkpoint,
+    BottommostLevelCompaction, Cache, ColumnFamilyDescriptor, CompactOptions, DB,
+    DBCompressionType, IteratorMode, Options, ReadOptions, Snapshot, WriteBatch, WriteOptions,
+    checkpoint::Checkpoint,
 };
+use zinder_core::wire::encode_height_key_ascending;
 use zinder_core::{BlockHash, BlockHeight, ChainEpoch, ChainEpochId};
 use zinder_store::{
-    ChainEvent, ResourceGaugeThrottle, RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget,
-    RocksDbResourceGaugeInputs, StoreRole, build_block_based_table_factory, open_bounded_rocksdb,
-    record_rocksdb_resource_gauges,
+    CanonicalReorgPolicy, ChainEvent, ResourceGaugeThrottle, RocksDbIoMode, RocksDbOpenRole,
+    RocksDbResourceBudget, RocksDbResourceGaugeInputs, StoreRole, build_block_based_table_factory,
+    open_bounded_rocksdb, record_rocksdb_resource_gauges,
 };
 
 use crate::{
@@ -295,6 +297,14 @@ fn validate_consumer_declarations(
                 return Err(MaterializedViewStoreError::ConsumerColumnFamilyConflict { name });
             }
         }
+        if let Some(name) = consumer.height_undo_index
+            && !consumer.column_families.contains(&name)
+        {
+            return Err(MaterializedViewStoreError::UndeclaredHeightUndoIndex {
+                consumer: consumer.name.as_str(),
+                name,
+            });
+        }
     }
     Ok(())
 }
@@ -362,6 +372,17 @@ pub struct MaterializedViewStoreOptions {
     pub consumers: &'static [MaterializedViewConsumerSchema],
     /// Bounded `RocksDB` resource budget applied at open time.
     pub rocksdb_resource_budget: RocksDbResourceBudget,
+    /// Reorg window of the canonical store whose chain events the primary
+    /// applies, or `None` to keep every undo row.
+    ///
+    /// With a window of `W` blocks, applying height `h` deletes the row at
+    /// `h - W` from each declared
+    /// [`height_undo_index`](MaterializedViewConsumerSchema::height_undo_index),
+    /// and [`MaterializedViewStore::prune_undo_indexes`] deletes every row at or
+    /// below the newest height minus `W`. The canonical settled tip trails the
+    /// visible tip by at most the window and never moves back, so no revert
+    /// reaches a pruned row. Secondary opens ignore the field.
+    pub reorg_policy: Option<CanonicalReorgPolicy>,
 }
 
 impl Default for MaterializedViewStoreOptions {
@@ -370,6 +391,7 @@ impl Default for MaterializedViewStoreOptions {
             sync_writes: false,
             consumers: &[],
             rocksdb_resource_budget: RocksDbResourceBudget::materialized_view_writer_defaults(),
+            reorg_policy: None,
         }
     }
 }
@@ -405,6 +427,21 @@ pub struct ChainEventDispatchInputs<'event> {
     pub event_sequence: u64,
     /// Settled tip height observed at commit time.
     pub settled_tip_height: BlockHeight,
+}
+
+/// Rows one [`MaterializedViewStore::prune_undo_indexes`] pass removed from a
+/// height undo index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UndoIndexPruning {
+    /// Height undo index the pass pruned.
+    pub column_family: &'static str,
+    /// Highest height whose undo row the pass deleted; every lower row is
+    /// deleted too.
+    pub pruned_through_height: BlockHeight,
+    /// SST bytes the column family held before the pass.
+    pub sst_bytes_before: u64,
+    /// SST bytes the column family holds after the pass.
+    pub sst_bytes_after: u64,
 }
 
 /// One verified contiguous range within a materialized-view consumer.
@@ -459,6 +496,7 @@ pub struct MaterializedViewStore {
     storage_path: PathBuf,
     consumers: &'static [MaterializedViewConsumerSchema],
     rocksdb_resource_budget: RocksDbResourceBudget,
+    reorg_policy: Option<CanonicalReorgPolicy>,
     is_secondary: bool,
     catch_up_barrier: Arc<RwLock<()>>,
     block_cache: Cache,
@@ -1035,6 +1073,7 @@ impl MaterializedViewStore {
             storage_path: path.to_path_buf(),
             consumers: options.consumers,
             rocksdb_resource_budget: options.rocksdb_resource_budget,
+            reorg_policy: options.reorg_policy,
             is_secondary: false,
             catch_up_barrier: Arc::new(RwLock::new(())),
             block_cache: bounded_open.block_cache,
@@ -1151,6 +1190,7 @@ impl MaterializedViewStore {
             storage_path: primary_path.to_path_buf(),
             consumers: options.consumers,
             rocksdb_resource_budget: options.rocksdb_resource_budget,
+            reorg_policy: None,
             is_secondary: true,
             catch_up_barrier: Arc::new(RwLock::new(())),
             block_cache: bounded_open.block_cache,
@@ -1407,6 +1447,12 @@ impl MaterializedViewStore {
             consumer
                 .stage_chain_event_checkpoint(block_checkpoint, &mut ctx)
                 .map_err(MaterializedViewError::Consumer)?;
+            self.stage_height_undo_index_pruning(
+                consumer_name,
+                inputs.chain_event,
+                blocks,
+                ctx.batch,
+            )?;
             measurements.push(MaterializedViewWriteMeasurement::from_batch_delta(
                 consumer_name,
                 before,
@@ -1454,6 +1500,213 @@ impl MaterializedViewStore {
         crash_point("materialized_view.chain_event_chunk.after_write");
         record_materialized_view_write_measurements(&measurements);
         Ok(measurements)
+    }
+
+    /// Stages the deletes that keep one consumer's height undo index within
+    /// the reorg window: applying height `h` deletes the row at `h - W`.
+    ///
+    /// The deletes follow the consumer's own writes in the batch, so a batch
+    /// longer than the window still ends without the rows it moved out.
+    fn stage_height_undo_index_pruning<S>(
+        &self,
+        consumer: MaterializedViewConsumerName,
+        chain_event: &ChainEvent,
+        blocks: &HashMap<BlockHeight, Arc<BlockCommitContext>, S>,
+        batch: &mut WriteBatch,
+    ) -> Result<(), MaterializedViewStoreError>
+    where
+        S: BuildHasher,
+    {
+        let (Some(reorg_policy), Some(column_family)) =
+            (self.reorg_policy, self.height_undo_index_of(consumer))
+        else {
+            return Ok(());
+        };
+        let committed = match chain_event {
+            ChainEvent::ChainCommitted { committed }
+            | ChainEvent::ChainReorged { committed, .. } => committed.block_range,
+            _ => return Ok(()),
+        };
+        let handle = self.consumer_column_family(column_family)?;
+        for height in committed {
+            if !blocks.contains_key(&height) {
+                continue;
+            }
+            if let Some(leaving) = height
+                .value()
+                .checked_sub(reorg_policy.reorg_window_blocks())
+                .filter(|leaving| *leaving > 0)
+            {
+                batch.delete_cf(
+                    &handle,
+                    encode_height_key_ascending(BlockHeight::new(leaving)),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn height_undo_index_of(&self, consumer: MaterializedViewConsumerName) -> Option<&'static str> {
+        self.consumers
+            .iter()
+            .find(|schema| schema.name == consumer)
+            .and_then(|schema| schema.height_undo_index)
+    }
+
+    /// Deletes every height undo row the reorg window no longer reaches and
+    /// reclaims the disk space it held.
+    ///
+    /// For each declared
+    /// [`height_undo_index`](MaterializedViewConsumerSchema::height_undo_index),
+    /// a pass covers the rows at or below the index's newest height minus the
+    /// window. One range delete hides any such row still visible, the SST
+    /// files that hold only rows in that range are dropped, and a compaction
+    /// rewrites the files that still reach into it. Rows within the window, and
+    /// so the newest height a reader takes from the index, are untouched. A
+    /// store opened without [`MaterializedViewStoreOptions::reorg_policy`], or
+    /// as a secondary, prunes nothing.
+    ///
+    /// The pass decides from the SST files, not the visible rows, so a pass
+    /// interrupted after its range delete reclaims the files on the next call.
+    /// `should_stop` is checked before each index and between the steps of one,
+    /// so a stopped pass leaves the rest for a later call. Only the compaction
+    /// runs uninterrupted; dropping whole files first leaves it the files that
+    /// straddle the end of the range and recent unsorted files.
+    ///
+    /// Hosts call this after opening a store, off any latency-sensitive path.
+    /// It is safe beside chain-event writes, which touch only heights above
+    /// the pruned range.
+    pub fn prune_undo_indexes(
+        &self,
+        should_stop: impl Fn() -> bool,
+    ) -> Result<Vec<UndoIndexPruning>, MaterializedViewStoreError> {
+        let Some(reorg_policy) = self.reorg_policy else {
+            return Ok(Vec::new());
+        };
+        let mut prunings = Vec::new();
+        for column_family in self
+            .consumers
+            .iter()
+            .filter_map(|schema| schema.height_undo_index)
+        {
+            if should_stop() {
+                break;
+            }
+            if let Some(pruning) =
+                self.prune_undo_index(column_family, reorg_policy, &should_stop)?
+            {
+                prunings.push(pruning);
+            }
+        }
+        Ok(prunings)
+    }
+
+    fn prune_undo_index(
+        &self,
+        column_family: &'static str,
+        reorg_policy: CanonicalReorgPolicy,
+        should_stop: &impl Fn() -> bool,
+    ) -> Result<Option<UndoIndexPruning>, MaterializedViewStoreError> {
+        let Some(newest_height) = self.last_materialized_height_ascending(column_family)? else {
+            return Ok(None);
+        };
+        let Some(pruned_through) = newest_height
+            .value()
+            .checked_sub(reorg_policy.reorg_window_blocks())
+            .filter(|pruned_through| *pruned_through > 0)
+            .map(BlockHeight::new)
+        else {
+            return Ok(None);
+        };
+        let first_key = encode_height_key_ascending(BlockHeight::new(0));
+        let last_pruned_key = encode_height_key_ascending(pruned_through);
+        let handle = self.consumer_column_family(column_family)?;
+        let operation_error = |operation| {
+            move |source| MaterializedViewStoreError::ConsumerOperation {
+                operation,
+                name: column_family,
+                source,
+            }
+        };
+        let sst_bytes_before = self.total_sst_file_bytes(&handle);
+        let oldest_key = self
+            .db
+            .iterator_cf(&handle, IteratorMode::Start)
+            .next()
+            .transpose()
+            .map_err(operation_error("first_key"))?
+            .map(|(key, _payload)| key);
+        if oldest_key.is_some_and(|key| key.as_ref() <= last_pruned_key.as_slice()) {
+            let mut batch = WriteBatch::default();
+            // The range end is exclusive, so it names the first retained height.
+            batch.delete_range_cf(
+                &handle,
+                first_key,
+                encode_height_key_ascending(pruned_through.next().unwrap_or(pruned_through)),
+            );
+            self.write(&batch).map_err(operation_error("prune_range"))?;
+        }
+        // Flushing keeps every tombstone in the range durable while whole
+        // files below it are dropped, so no older row version can resurface.
+        self.db
+            .flush_cf(&handle)
+            .map_err(operation_error("prune_flush"))?;
+        if !self.has_sst_file_reaching(column_family, &last_pruned_key)? || should_stop() {
+            return Ok(None);
+        }
+        // `DeleteFilesInRange` treats its end key as inclusive.
+        self.db
+            .delete_file_in_range_cf(&handle, first_key, last_pruned_key)
+            .map_err(operation_error("prune_files"))?;
+        if should_stop() {
+            return Ok(None);
+        }
+        let mut compact_options = CompactOptions::default();
+        compact_options.set_exclusive_manual_compaction(false);
+        compact_options.set_bottommost_level_compaction(BottommostLevelCompaction::ForceOptimized);
+        self.db.compact_range_cf_opt(
+            &handle,
+            Some(first_key),
+            Some(last_pruned_key),
+            &compact_options,
+        );
+        Ok(Some(UndoIndexPruning {
+            column_family,
+            pruned_through_height: pruned_through,
+            sst_bytes_before,
+            sst_bytes_after: self.total_sst_file_bytes(&handle),
+        }))
+    }
+
+    /// Returns whether an SST file of `column_family` holds a key at or below
+    /// `last_key`, including deleted keys a compaction has not dropped yet.
+    fn has_sst_file_reaching(
+        &self,
+        column_family: &'static str,
+        last_key: &[u8],
+    ) -> Result<bool, MaterializedViewStoreError> {
+        let live_files = self.db.live_files().map_err(|source| {
+            MaterializedViewStoreError::ConsumerOperation {
+                operation: "live_files",
+                name: column_family,
+                source,
+            }
+        })?;
+        Ok(live_files.iter().any(|file| {
+            file.column_family_name == column_family
+                && file
+                    .start_key
+                    .as_deref()
+                    .is_some_and(|start_key| start_key <= last_key)
+        }))
+    }
+
+    fn total_sst_file_bytes(&self, handle: &Arc<rust_rocksdb::BoundColumnFamily<'_>>) -> u64 {
+        self.db
+            .property_int_value_cf(handle, "rocksdb.total-sst-files-size")
+            .ok()
+            .flatten()
+            .unwrap_or(0)
     }
 
     /// Dispatches one mempool consumer and atomically writes its rows plus

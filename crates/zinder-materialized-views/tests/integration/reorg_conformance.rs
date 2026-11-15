@@ -6,8 +6,14 @@
 //! [`MaterializedViewStore::write_chain_event_chunk_with_event_consumers`]
 //! with the consumer set the registry selects, so the harness exercises the
 //! same batch boundary, checkpoint, and cursor staging as replay.
+//!
+//! A store opened with a reorg window prunes each height undo index to that
+//! window. The same reorgs, an expired-cursor recovery, a raised window, and
+//! pruning a store written without a window must leave it with every row an
+//! unpruned store holds, except the undo rows the window no longer reaches.
 
 use std::{
+    cell::Cell,
     collections::{BTreeMap, HashMap},
     error::Error,
     fmt,
@@ -19,6 +25,7 @@ use proptest::{
     test_runner::{Config, TestCaseError, TestRng, TestRunner},
 };
 use tempfile::TempDir;
+use zinder_core::wire::decode_height_key_ascending;
 use zinder_core::{
     ArtifactSchemaVersion, BlockFinalNoteCommitmentRoots, BlockHash, BlockHeight, BlockHeightRange,
     ChainEpoch, ChainEpochId, ChainTipMetadata, FinalNoteCommitmentRoot, LockTime, Network,
@@ -37,7 +44,10 @@ use zinder_materialized_views::{
     TransparentAddressRankingSnapshotRow, TransparentAddressSummary, TransparentSpendFacts,
     bundled_materialized_view_consumer_definitions,
 };
-use zinder_store::{ChainEpochCommitted, ChainEvent, ChainRangeReverted, RocksDbResourceBudget};
+use zinder_store::{
+    CanonicalReorgPolicy, ChainEpochCommitted, ChainEvent, ChainRangeReverted,
+    RocksDbResourceBudget,
+};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 type ColumnFamilyRows = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -49,6 +59,12 @@ const FIRST_BLOCK_TIME: i64 = 1_700_006_400;
 const BLOCK_SPACING_SECONDS: i64 = 28_800;
 const BRANCH_TIME_SHIFT_SECONDS: i64 = 30_000;
 const RANKING_GENERATION: u64 = 1;
+/// Blocks the fixture's settled tip trails its visible tip by.
+///
+/// No chain shape replaces more blocks than this, so every fixture reorg
+/// starts above the settled tip of the chain it replaces, as the canonical
+/// writer guarantees.
+const FIXTURE_REORG_WINDOW_BLOCKS: u32 = 5;
 
 /// Column families whose contents legitimately depend on the event path.
 const PATH_DEPENDENT_COLUMN_FAMILIES: &[(&str, &str)] = &[(
@@ -149,6 +165,145 @@ fn a_reorg_onto_a_longer_branch_that_crosses_a_day_boundary_is_path_independent(
 }
 
 #[test]
+fn every_bundled_consumer_reorgs_a_pruned_store_onto_the_rows_of_an_unpruned_store() -> TestResult {
+    let config = Config {
+        cases: 16,
+        failure_persistence: None,
+        ..Config::default()
+    };
+    let rng = TestRng::deterministic_rng(config.rng_algorithm);
+    let mut runner = TestRunner::new_with_rng(config, rng);
+    runner
+        .run(&chain_shapes(), |shape| {
+            assert_pruned_reorgs_match(shape)
+                .map_err(|error| TestCaseError::fail(error.to_string()))
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[test]
+fn an_expired_cursor_recovery_on_a_pruned_store_leaves_the_rows_of_an_unpruned_store() -> TestResult
+{
+    const WINDOW: u32 = 3;
+    let prefix = Chain::build(9, PREFIX_BRANCH, &Chain::default());
+    let stale = Chain::build(12, REPLACED_BRANCH, &prefix);
+    let canonical = Chain::build(14, REPLACEMENT_BRANCH, &prefix);
+    let pruned = ReplayStore::open(WINDOW, UndoRows::Pruned)?;
+    let unpruned = ReplayStore::open(WINDOW, UndoRows::Kept)?;
+    for store in [&pruned, &unpruned] {
+        store.commit_in_chunks(&stale, 4)?;
+    }
+    assert_no_divergence(&pruned, &unpruned, 12 - WINDOW)?;
+
+    for store in [&pruned, &unpruned] {
+        store.recover_expired_cursor(&stale, &canonical)?;
+    }
+    assert_no_divergence(&pruned, &unpruned, 14 - WINDOW)
+}
+
+#[test]
+fn a_store_pruned_under_a_smaller_window_recovers_under_a_raised_one() -> TestResult {
+    const CONSTRUCTION_WINDOW: u32 = 2;
+    const RAISED_WINDOW: u32 = 5;
+    let prefix = Chain::build(10, PREFIX_BRANCH, &Chain::default());
+    let stale = Chain::build(12, REPLACED_BRANCH, &prefix);
+    let canonical = Chain::build(14, REPLACEMENT_BRANCH, &prefix);
+    let pruned = ReplayStore::open(CONSTRUCTION_WINDOW, UndoRows::Pruned)?;
+    let unpruned = ReplayStore::open(CONSTRUCTION_WINDOW, UndoRows::Kept)?;
+    for store in [&pruned, &unpruned] {
+        store.commit_in_chunks(&stale, 3)?;
+    }
+    assert_no_divergence(&pruned, &unpruned, 12 - CONSTRUCTION_WINDOW)?;
+
+    // The raised recovery also reverts heights the smaller window already
+    // pruned. They lie at or below the held settled tip, so the replacement
+    // shares them and re-applying them writes the rows an unpruned revert
+    // removed.
+    let pruned = pruned.reopen(RAISED_WINDOW, UndoRows::Pruned)?;
+    let unpruned = unpruned.reopen(RAISED_WINDOW, UndoRows::Kept)?;
+    for store in [&pruned, &unpruned] {
+        store.recover_expired_cursor(&stale, &canonical)?;
+    }
+    assert_no_divergence(&pruned, &unpruned, 14 - RAISED_WINDOW)
+}
+
+#[test]
+fn pruning_a_store_written_without_a_window_keeps_only_the_rows_the_window_reaches() -> TestResult {
+    const WINDOW: u32 = 3;
+    let prefix = Chain::build(9, PREFIX_BRANCH, &Chain::default());
+    let chain = Chain::build(15, REPLACED_BRANCH, &prefix);
+    let written_unpruned = ReplayStore::open(WINDOW, UndoRows::Kept)?;
+    let unpruned = ReplayStore::open(WINDOW, UndoRows::Kept)?;
+    for store in [&written_unpruned, &unpruned] {
+        store.commit_in_chunks(&prefix, 4)?;
+    }
+    let pruned = written_unpruned.reopen(WINDOW, UndoRows::Pruned)?;
+
+    let prunings = pruned.store.prune_undo_indexes(|| false)?;
+    let mut pruned_families = prunings
+        .iter()
+        .map(|pruning| pruning.column_family)
+        .collect::<Vec<_>>();
+    pruned_families.sort_unstable();
+    let mut declared_families = bundled_materialized_view_consumer_definitions()
+        .iter()
+        .filter_map(|definition| definition.schema.height_undo_index)
+        .collect::<Vec<_>>();
+    declared_families.sort_unstable();
+    assert_eq!(pruned_families, declared_families);
+    assert!(
+        prunings
+            .iter()
+            .all(|pruning| pruning.pruned_through_height == BlockHeight::new(9 - WINDOW))
+    );
+    assert_no_divergence(&pruned, &unpruned, 9 - WINDOW)?;
+    assert!(
+        pruned.store.prune_undo_indexes(|| false)?.is_empty(),
+        "a store already within its window has nothing left to prune"
+    );
+
+    for store in [&pruned, &unpruned] {
+        store.commit(&chain, 10, 15)?;
+    }
+    assert_no_divergence(&pruned, &unpruned, 15 - WINDOW)
+}
+
+#[test]
+fn pruning_stopped_after_its_range_delete_reclaims_the_files_after_a_restart() -> TestResult {
+    const WINDOW: u32 = 3;
+    let chain = Chain::build(12, PREFIX_BRANCH, &Chain::default());
+    let written_unpruned = ReplayStore::open(WINDOW, UndoRows::Kept)?;
+    let unpruned = ReplayStore::open(WINDOW, UndoRows::Kept)?;
+    for store in [&written_unpruned, &unpruned] {
+        store.commit_in_chunks(&chain, 4)?;
+    }
+    let pruned = written_unpruned.reopen(WINDOW, UndoRows::Pruned)?;
+    // The first check lets one index start; the next stops it right after its
+    // range delete hides the rows, before any file is dropped.
+    let checks = Cell::new(0);
+    let stopped = pruned.store.prune_undo_indexes(|| {
+        checks.set(checks.get() + 1);
+        checks.get() > 1
+    })?;
+    assert!(stopped.is_empty());
+
+    let pruned = pruned.reopen(WINDOW, UndoRows::Pruned)?;
+    let resumed = pruned.store.prune_undo_indexes(|| false)?;
+    let declared_families = bundled_materialized_view_consumer_definitions()
+        .iter()
+        .filter_map(|definition| definition.schema.height_undo_index)
+        .count();
+    assert_eq!(
+        resumed.len(),
+        declared_families,
+        "the restarted pass must reclaim the index whose rows were already hidden"
+    );
+    assert!(pruned.store.prune_undo_indexes(|| false)?.is_empty());
+    assert_no_divergence(&pruned, &unpruned, 12 - WINDOW)
+}
+
+#[test]
 fn every_registry_entry_declares_how_it_conforms_to_reorgs() {
     for definition in bundled_materialized_view_consumer_definitions() {
         let declared_column_families = definition.schema.column_families;
@@ -175,15 +330,15 @@ fn assert_path_independent(shape: ChainShape) -> TestResult {
     let replaced = Chain::build(shape.replaced_tip(), REPLACED_BRANCH, &prefix);
     let replacement = Chain::build(shape.replacement_tip(), REPLACEMENT_BRANCH, &prefix);
 
-    let reorged = ReplayStore::open()?;
+    let reorged = ReplayStore::open(FIXTURE_REORG_WINDOW_BLOCKS, UndoRows::Kept)?;
     reorged.commit_in_chunks(&replaced, shape.replaced_chunk)?;
     reorged.reorg(shape.fork_height(), &replaced, &replacement)?;
-    let fresh_replacement = ReplayStore::open()?;
+    let fresh_replacement = ReplayStore::open(FIXTURE_REORG_WINDOW_BLOCKS, UndoRows::Kept)?;
     fresh_replacement.commit_in_chunks(&replacement, shape.replacement_chunk)?;
     let mut divergences = diverging_column_families(&reorged, &fresh_replacement)?;
 
     reorged.reorg(shape.fork_height(), &replacement, &replaced)?;
-    let fresh_replaced = ReplayStore::open()?;
+    let fresh_replaced = ReplayStore::open(FIXTURE_REORG_WINDOW_BLOCKS, UndoRows::Kept)?;
     fresh_replaced.commit_in_chunks(&replaced, shape.replacement_chunk)?;
     divergences.extend(diverging_column_families(&reorged, &fresh_replaced)?);
 
@@ -191,6 +346,107 @@ fn assert_path_independent(shape: ChainShape) -> TestResult {
         return Ok(());
     }
     Err(format!("{shape:?} diverged: {divergences:#?}").into())
+}
+
+/// Applies the same events to a pruned and an unpruned store, comparing them
+/// after the first apply and after each reorg.
+fn assert_pruned_reorgs_match(shape: ChainShape) -> TestResult {
+    let prefix = Chain::build(shape.prefix_len, PREFIX_BRANCH, &Chain::default());
+    let replaced = Chain::build(shape.replaced_tip(), REPLACED_BRANCH, &prefix);
+    let replacement = Chain::build(shape.replacement_tip(), REPLACEMENT_BRANCH, &prefix);
+    let pruned = ReplayStore::open(FIXTURE_REORG_WINDOW_BLOCKS, UndoRows::Pruned)?;
+    let unpruned = ReplayStore::open(FIXTURE_REORG_WINDOW_BLOCKS, UndoRows::Kept)?;
+    let highest_height = shape.replaced_tip().max(shape.replacement_tip());
+
+    let mut divergences = Vec::new();
+    for store in [&pruned, &unpruned] {
+        store.commit_in_chunks(&replaced, shape.replaced_chunk)?;
+    }
+    divergences.extend(diverging_pruned_column_families(
+        &pruned,
+        &unpruned,
+        shape
+            .replaced_tip()
+            .saturating_sub(FIXTURE_REORG_WINDOW_BLOCKS),
+    )?);
+    for store in [&pruned, &unpruned] {
+        store.reorg(shape.fork_height(), &replaced, &replacement)?;
+    }
+    divergences.extend(diverging_pruned_column_families(
+        &pruned,
+        &unpruned,
+        highest_height.saturating_sub(FIXTURE_REORG_WINDOW_BLOCKS),
+    )?);
+    for store in [&pruned, &unpruned] {
+        store.reorg(shape.fork_height(), &replacement, &replaced)?;
+    }
+    divergences.extend(diverging_pruned_column_families(
+        &pruned,
+        &unpruned,
+        highest_height.saturating_sub(FIXTURE_REORG_WINDOW_BLOCKS),
+    )?);
+
+    if divergences.is_empty() {
+        return Ok(());
+    }
+    Err(format!("{shape:?} diverged: {divergences:#?}").into())
+}
+
+fn assert_no_divergence(
+    pruned: &ReplayStore,
+    unpruned: &ReplayStore,
+    pruned_through: u32,
+) -> TestResult {
+    let divergences = diverging_pruned_column_families(pruned, unpruned, pruned_through)?;
+    if divergences.is_empty() {
+        return Ok(());
+    }
+    Err(format!("the pruned store diverged: {divergences:#?}").into())
+}
+
+/// Compares a pruned store with an unpruned store that applied the same events.
+///
+/// Every column family must match, except that a height undo index holds only
+/// the unpruned rows above `pruned_through`.
+fn diverging_pruned_column_families(
+    pruned: &ReplayStore,
+    unpruned: &ReplayStore,
+    pruned_through: u32,
+) -> TestResult<Vec<Divergence>> {
+    let mut divergences = Vec::new();
+    for definition in bundled_materialized_view_consumer_definitions() {
+        if reorg_exemption(definition).is_some() {
+            continue;
+        }
+        for &column_family in definition.schema.column_families {
+            if is_path_dependent(column_family) {
+                continue;
+            }
+            let mut expected = unpruned.rows(column_family)?;
+            if definition.schema.height_undo_index == Some(column_family) {
+                expected.retain(|key, _payload| {
+                    decode_height_key_ascending(key)
+                        .map_or(true, |height| height.value() > pruned_through)
+                });
+            }
+            let observed = pruned.rows(column_family)?;
+            if observed != expected {
+                divergences.push(Divergence {
+                    consumer: definition.schema.name.as_str(),
+                    column_family,
+                    observed,
+                    expected,
+                });
+            }
+        }
+    }
+    Ok(divergences)
+}
+
+fn is_path_dependent(column_family: &str) -> bool {
+    PATH_DEPENDENT_COLUMN_FAMILIES
+        .iter()
+        .any(|(excluded, _reason)| *excluded == column_family)
 }
 
 fn diverging_column_families(
@@ -204,10 +460,7 @@ fn diverging_column_families(
         }
         let mut compared_rows = 0;
         for &column_family in definition.schema.column_families {
-            if PATH_DEPENDENT_COLUMN_FAMILIES
-                .iter()
-                .any(|(excluded, _reason)| *excluded == column_family)
-            {
+            if is_path_dependent(column_family) {
                 continue;
             }
             let reorged_rows = reorged.rows(column_family)?;
@@ -217,8 +470,8 @@ fn diverging_column_families(
                 divergences.push(Divergence {
                     consumer: definition.schema.name.as_str(),
                     column_family,
-                    reorged: reorged_rows,
-                    fresh: fresh_rows,
+                    observed: reorged_rows,
+                    expected: fresh_rows,
                 });
             }
         }
@@ -226,11 +479,7 @@ fn diverging_column_families(
             .schema
             .column_families
             .iter()
-            .all(|column_family| {
-                PATH_DEPENDENT_COLUMN_FAMILIES
-                    .iter()
-                    .any(|(excluded, _reason)| excluded == column_family)
-            });
+            .all(|column_family| is_path_dependent(column_family));
         if compared_rows == 0 && !fully_excluded {
             return Err(format!(
                 "the fixture chain wrote no comparable rows for {}",
@@ -242,33 +491,34 @@ fn diverging_column_families(
     Ok(divergences)
 }
 
+/// Rows a store under test holds that differ from the rows it must hold.
 struct Divergence {
     consumer: &'static str,
     column_family: &'static str,
-    reorged: ColumnFamilyRows,
-    fresh: ColumnFamilyRows,
+    observed: ColumnFamilyRows,
+    expected: ColumnFamilyRows,
 }
 
 impl fmt::Debug for Divergence {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let only_reorged = self
-            .reorged
+        let only_observed = self
+            .observed
             .iter()
-            .filter(|(key, payload)| self.fresh.get(*key) != Some(*payload))
+            .filter(|(key, payload)| self.expected.get(*key) != Some(*payload))
             .map(|(key, payload)| (hex(key), hex(payload)))
             .collect::<Vec<_>>();
-        let only_fresh = self
-            .fresh
+        let only_expected = self
+            .expected
             .iter()
-            .filter(|(key, payload)| self.reorged.get(*key) != Some(*payload))
+            .filter(|(key, payload)| self.observed.get(*key) != Some(*payload))
             .map(|(key, payload)| (hex(key), hex(payload)))
             .collect::<Vec<_>>();
         formatter
             .debug_struct("Divergence")
             .field("consumer", &self.consumer)
             .field("column_family", &self.column_family)
-            .field("only_after_reorg", &only_reorged)
-            .field("only_after_fresh_apply", &only_fresh)
+            .field("only_observed", &only_observed)
+            .field("only_expected", &only_expected)
             .finish()
     }
 }
@@ -614,29 +864,82 @@ fn output(index: u32, value_zat: u64, script: Vec<u8>) -> TransparentOutputFact 
     TransparentOutputFact::new(index, value_zat, script, address_script_hash)
 }
 
+/// Whether a [`ReplayStore`] prunes its height undo indexes to its window.
+#[derive(Clone, Copy)]
+enum UndoRows {
+    Kept,
+    Pruned,
+}
+
 /// A bundled materialized-view store driven by synthetic chain events.
+///
+/// Its epochs place the settled tip `window` blocks below the visible tip,
+/// and the settled tip never moves back, as on a canonical store.
 struct ReplayStore {
-    _directory: TempDir,
+    // Declared before its directory so the database closes before the
+    // directory is removed.
     store: MaterializedViewStore,
-    next_event_sequence: std::cell::Cell<u64>,
+    directory: TempDir,
+    next_event_sequence: Cell<u64>,
+    window: u32,
+    settled_height: Cell<u32>,
 }
 
 impl ReplayStore {
-    fn open() -> TestResult<Self> {
+    fn open(window: u32, undo_rows: UndoRows) -> TestResult<Self> {
         let directory = TempDir::new()?;
-        let store = MaterializedViewStore::open(
-            directory.path(),
-            MaterializedViewStoreOptions {
-                sync_writes: false,
-                consumers: MaterializedViewStore::bundled_consumers(),
-                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
-            },
-        )?;
+        let store = open_bundled_store(&directory, window, undo_rows)?;
         Ok(Self {
-            _directory: directory,
             store,
-            next_event_sequence: std::cell::Cell::new(1),
+            directory,
+            next_event_sequence: Cell::new(1),
+            window,
+            settled_height: Cell::new(1),
         })
+    }
+
+    /// Reopens the same store, as a restart with a new window does. The settled
+    /// tip holds across a raise.
+    fn reopen(self, window: u32, undo_rows: UndoRows) -> TestResult<Self> {
+        let Self {
+            store,
+            directory,
+            next_event_sequence,
+            settled_height,
+            ..
+        } = self;
+        drop(store);
+        let store = open_bundled_store(&directory, window, undo_rows)?;
+        Ok(Self {
+            store,
+            directory,
+            next_event_sequence,
+            window,
+            settled_height,
+        })
+    }
+
+    /// Recovers an expired cursor as the replay host does: one transition
+    /// reverts the window below `stale`'s tip and applies `canonical` from the
+    /// start of that window through its tip.
+    fn recover_expired_cursor(&self, stale: &Chain, canonical: &Chain) -> TestResult {
+        let start = stale
+            .tip()
+            .saturating_sub(self.window)
+            .saturating_add(1)
+            .max(1);
+        let chain_epoch = self.epoch(canonical, canonical.tip())?;
+        let event = ChainEvent::ChainReorged {
+            reverted: ChainRangeReverted {
+                chain_epoch,
+                block_range: range(start, stale.tip()),
+            },
+            committed: ChainEpochCommitted {
+                chain_epoch,
+                block_range: range(start, canonical.tip()),
+            },
+        };
+        self.dispatch(&event, chain_epoch, canonical, (start, canonical.tip()))
     }
 
     /// Commits `chain` with the first block alone, then in `chunk_blocks` ranges.
@@ -805,7 +1108,13 @@ impl ReplayStore {
 
     fn epoch(&self, chain: &Chain, tip: u32) -> TestResult<ChainEpoch> {
         let tip_block = chain.block(tip)?;
-        let settled = chain.block(1)?;
+        let settled_height = self
+            .settled_height
+            .get()
+            .max(tip.saturating_sub(self.window))
+            .max(1);
+        self.settled_height.set(settled_height);
+        let settled = chain.block(settled_height)?;
         Ok(ChainEpoch {
             id: ChainEpochId::new(self.next_event_sequence.get()),
             network: Network::ZcashRegtest,
@@ -828,6 +1137,26 @@ impl ReplayStore {
             })?;
         Ok(rows)
     }
+}
+
+fn open_bundled_store(
+    directory: &TempDir,
+    window: u32,
+    undo_rows: UndoRows,
+) -> TestResult<MaterializedViewStore> {
+    let reorg_policy = match undo_rows {
+        UndoRows::Kept => None,
+        UndoRows::Pruned => Some(CanonicalReorgPolicy::new(window)?),
+    };
+    Ok(MaterializedViewStore::open(
+        directory.path(),
+        MaterializedViewStoreOptions {
+            sync_writes: false,
+            consumers: MaterializedViewStore::bundled_consumers(),
+            rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+            reorg_policy,
+        },
+    )?)
 }
 
 /// Address summaries for the outputs one block creates, used as the settled

@@ -26,7 +26,7 @@ use zinder_ingest::{
     spawn_conventional_fee_distribution_backfill_task,
     spawn_materialized_view_replay_budget_metrics_task, spawn_materialized_view_tailer_task,
     spawn_runtime_memory_metrics_task, spawn_transaction_component_backfill_task,
-    spawn_upstream_health_probe_task,
+    spawn_undo_index_pruning_task, spawn_upstream_health_probe_task,
 };
 use zinder_materialized_views::MaterializedViewStore;
 use zinder_runtime::{
@@ -854,12 +854,16 @@ async fn run_materialized_view_plane(
         explorer_views = true,
         "Explorer views admitted after store open"
     );
+    // Pruning frees space, so it starts before the free-space wait below.
+    let undo_index_pruning =
+        spawn_undo_index_pruning_task(materialized_view_store.clone(), cancel.clone());
     // Cursor seeding writes view rows before the tailer applies the guard.
     if let Some(guard) = &spec.volume_space_guard
         && !guard
             .wait_for_room(DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL, &cancel)
             .await
     {
+        await_worker_task(UNDO_INDEX_PRUNING_WORKER, undo_index_pruning).await;
         return;
     }
     if let Err(error) = seed_backfill_owned_consumer_cursors(
@@ -897,6 +901,7 @@ async fn run_materialized_view_plane(
             canonical,
             activations: spec.activations,
             materialized_view_store,
+            undo_index_pruning,
         },
         tailer,
         historical_work_gate,
@@ -912,6 +917,7 @@ fn open_and_admit_materialized_view_store(
     let materialized_view_store = match open_primary_materialized_view_store(
         &spec.storage_path,
         spec.materialized_view_rocksdb_budget,
+        spec.reorg_policy,
     ) {
         Ok(materialized_view_store) => materialized_view_store,
         Err(error) => {
@@ -939,7 +945,10 @@ struct MaterializedViewWorkerContext {
     canonical: Arc<RwLock<RocksDbCanonicalSecondary>>,
     activations: Arc<NetworkUpgradeActivations>,
     materialized_view_store: MaterializedViewStore,
+    undo_index_pruning: JoinHandle<()>,
 }
+
+const UNDO_INDEX_PRUNING_WORKER: &str = "materialized_view_undo_index_pruning";
 
 async fn await_materialized_view_workers(
     context: MaterializedViewWorkerContext,
@@ -947,15 +956,22 @@ async fn await_materialized_view_workers(
     historical_work_gate: HistoricalWorkGate,
     cancel: CancellationToken,
 ) {
+    let MaterializedViewWorkerContext {
+        explorer_views,
+        canonical,
+        activations,
+        materialized_view_store,
+        undo_index_pruning,
+    } = context;
     let (conventional_fee_distribution_backfill, transaction_component_backfill) =
-        if explorer_views_start_backfills(context.explorer_views) {
+        if explorer_views_start_backfills(explorer_views) {
             (
                 Some(spawn_conventional_fee_distribution_backfill_task(
                     ConventionalFeeDistributionBackfillConfig::DEFAULT,
                     ConventionalFeeDistributionBackfillContext::new(
-                        Arc::clone(&context.canonical),
-                        Arc::clone(&context.activations),
-                        context.materialized_view_store.clone(),
+                        Arc::clone(&canonical),
+                        Arc::clone(&activations),
+                        materialized_view_store.clone(),
                     ),
                     historical_work_gate.clone(),
                     cancel.clone(),
@@ -963,9 +979,9 @@ async fn await_materialized_view_workers(
                 Some(spawn_transaction_component_backfill_task(
                     TransactionComponentBackfillConfig::DEFAULT,
                     TransactionComponentBackfillContext::new(
-                        context.canonical,
-                        context.activations,
-                        context.materialized_view_store,
+                        canonical,
+                        activations,
+                        materialized_view_store,
                     ),
                     historical_work_gate,
                     cancel,
@@ -975,6 +991,7 @@ async fn await_materialized_view_workers(
             (None, None)
         };
     await_worker_task("materialized_view_tailer", tailer).await;
+    await_worker_task(UNDO_INDEX_PRUNING_WORKER, undo_index_pruning).await;
     if let Some(conventional_fee_distribution_backfill) = conventional_fee_distribution_backfill {
         await_worker_task(
             "conventional_fee_distribution_backfill",

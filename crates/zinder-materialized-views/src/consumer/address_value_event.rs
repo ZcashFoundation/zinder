@@ -18,8 +18,13 @@
 
 use std::collections::HashMap;
 
-use zinder_core::wire::encode_rpc_transaction_id_hex;
-use zinder_core::{TransparentAddressScriptHash, TransparentOutPoint, TransparentSpendFact};
+use zinder_core::wire::{
+    WireDecodeError, decode_internal_transaction_id, decode_rpc_transaction_id_hex,
+    encode_internal_transaction_id,
+};
+use zinder_core::{
+    TransactionId, TransparentAddressScriptHash, TransparentOutPoint, TransparentSpendFact,
+};
 use zinder_proto::wire::{TRANSPARENT_DELTA_KIND_RECEIVED_BYTE, TRANSPARENT_DELTA_KIND_SPENT_BYTE};
 
 use crate::consumer::BlockCommitContext;
@@ -131,19 +136,35 @@ pub(crate) fn address_value_events(
     events
 }
 
-/// Maps each block-local transaction position to its RPC-hex transaction id.
+/// Returns each transaction's id as 32 internal-order bytes, indexed by the
+/// transaction's position in the block.
 ///
-/// Indexed by `in_block_position`; absent positions hold an empty string.
-#[must_use]
-pub(crate) fn transaction_ids_by_position(block: &BlockCommitContext) -> Vec<String> {
-    let mut transaction_ids = vec![String::new(); block.transactions.len()];
+/// Delta and activity rows store this form rather than the 64-character RPC
+/// hex form, which takes 32 more bytes per row and compresses poorly.
+pub(crate) fn internal_transaction_ids_by_position(block: &BlockCommitContext) -> Vec<Vec<u8>> {
+    let mut transaction_ids = vec![Vec::new(); block.transactions.len()];
     for transaction in &block.transactions {
         if let Some(slot) = transaction_ids.get_mut(transaction.location.tx_index_in_block as usize)
         {
-            *slot = encode_rpc_transaction_id_hex(transaction.location.transaction_id);
+            *slot = encode_internal_transaction_id(transaction.location.transaction_id).to_vec();
         }
     }
     transaction_ids
+}
+
+/// Decodes the transaction id a delta or activity row stores.
+///
+/// A row written by this release carries 32 internal-order bytes. A row an
+/// earlier release wrote carries only the RPC hex form, which still decodes.
+pub(crate) fn decode_stored_transaction_id(
+    internal_transaction_id: &[u8],
+    rpc_transaction_id_hex: &str,
+) -> Result<TransactionId, WireDecodeError> {
+    if internal_transaction_id.is_empty() {
+        decode_rpc_transaction_id_hex(rpc_transaction_id_hex)
+    } else {
+        decode_internal_transaction_id(internal_transaction_id)
+    }
 }
 
 #[cfg(test)]

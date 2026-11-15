@@ -48,6 +48,7 @@ fn open_store() -> TestResult<(tempfile::TempDir, MaterializedViewStore)> {
             sync_writes: false,
             consumers: &[VALUE_POOL_BALANCE_HISTORY_SCHEMA],
             rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+            reorg_policy: None,
         },
     )?;
     Ok((tempdir, store))
@@ -273,6 +274,7 @@ fn historical_and_live_tail_coverage_are_independent_atomic_and_restartable() ->
             sync_writes: false,
             consumers: &[VALUE_POOL_BALANCE_HISTORY_SCHEMA],
             rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+            reorg_policy: None,
         },
     )?;
     assert_eq!(
