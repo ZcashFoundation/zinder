@@ -681,6 +681,49 @@ fn transparent_address_deltas_response_carries_freshness_and_cursor() -> eyre::R
 }
 
 #[test]
+fn transparent_address_records_round_trip_an_internal_transaction_id() -> eyre::Result<()> {
+    let internal_transaction_id = (0_u8..32).collect::<Vec<_>>();
+    let deltas = round_trip(&explorer::TransparentAddressDeltasRecord {
+        block_time_unix_seconds: 1_700_000_000,
+        value_zat: -9_000,
+        internal_transaction_id: internal_transaction_id.clone(),
+        ..Default::default()
+    })?;
+    let activity = round_trip(&explorer::TransparentAddressActivityRecord {
+        net_value_zat: Some(4_000),
+        output_count: 1,
+        internal_transaction_id: internal_transaction_id.clone(),
+        ..Default::default()
+    })?;
+
+    assert_eq!(deltas.internal_transaction_id, internal_transaction_id);
+    assert!(deltas.transaction_id.is_empty());
+    assert_eq!(deltas.value_zat, -9_000);
+    assert_eq!(activity.internal_transaction_id, internal_transaction_id);
+    assert!(activity.transaction_id.is_empty());
+    assert_eq!(activity.net_value_zat, Some(4_000));
+    Ok(())
+}
+
+#[test]
+fn transparent_address_records_written_with_rpc_hex_decode_without_internal_bytes()
+-> eyre::Result<()> {
+    let transaction_id = "ab".repeat(32);
+    let encoded = explorer::TransparentAddressDeltasRecord {
+        transaction_id: transaction_id.clone(),
+        block_time_unix_seconds: 1_700_000_000,
+        value_zat: 5_000,
+        ..Default::default()
+    }
+    .encode_to_vec();
+    let decoded = explorer::TransparentAddressDeltasRecord::decode(encoded.as_slice())?;
+
+    assert_eq!(decoded.transaction_id, transaction_id);
+    assert!(decoded.internal_transaction_id.is_empty());
+    Ok(())
+}
+
+#[test]
 fn explorer_server_info_round_trips_materialized_view_identities() -> eyre::Result<()> {
     let server_info = explorer::ExplorerServerInfo {
         common: None,

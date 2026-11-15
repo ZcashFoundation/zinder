@@ -11,6 +11,7 @@ use prost::Message as _;
 use tonic::{Request, Response, Status};
 use zinder_core::wire::{
     decode_address_script_hash, decode_height_key_ascending, encode_address_script_hash,
+    encode_rpc_transaction_id_hex,
 };
 use zinder_core::{Network, TransparentAddressScriptHash};
 use zinder_proto::capabilities::EXPLORER_TRANSPARENT_ADDRESS_DELTAS_V1;
@@ -28,7 +29,10 @@ use super::freshness::{
     UpstreamObservationCache, attach_upstream_observation, build_explorer_freshness,
 };
 use super::transparent_address_activity::address_lookup_to_script_hash;
-use zinder_materialized_views::{MaterializedViewStore, TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY};
+use zinder_materialized_views::{
+    MaterializedViewStore, TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY,
+    TransparentAddressDeltasConsumer,
+};
 
 /// Hard cap on the delta rows one page returns.
 const MAX_TRANSPARENT_ADDRESS_DELTAS_ENTRIES_PER_REQUEST: u32 = 256;
@@ -155,8 +159,10 @@ fn scan_address_deltas(
         let event_index = decode_event_index(&key_array)?;
         let record = TransparentAddressDeltasRecord::decode(payload.as_slice())
             .map_err(|error| ExplorerError::internal(error.to_string()))?;
+        let transaction_id = TransparentAddressDeltasConsumer::stored_transaction_id(&record)
+            .map_err(|error| ExplorerError::internal(error.to_string()))?;
         entries.push(TransparentAddressDeltasEntry {
-            transaction_id: record.transaction_id,
+            transaction_id: encode_rpc_transaction_id_hex(transaction_id),
             block_height: height,
             block_time_unix_seconds: record.block_time_unix_seconds,
             index: event_index,

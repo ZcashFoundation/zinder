@@ -42,6 +42,13 @@ const CONSUMER_A_ON_RESERVED_CF: MaterializedViewConsumerSchema =
         &[MaterializedViewStoreTable::ChainEventCursor.column_family_name()],
     );
 
+const CONSUMER_A_FOREIGN_UNDO_INDEX: MaterializedViewConsumerSchema =
+    MaterializedViewConsumerSchema::new(CONSUMER_A, 1, &[CONSUMER_A_CF])
+        .with_height_undo_index(CONSUMER_B_CF);
+const CONSUMER_A_OWN_UNDO_INDEX: MaterializedViewConsumerSchema =
+    MaterializedViewConsumerSchema::new(CONSUMER_A, 1, &[CONSUMER_A_CF])
+        .with_height_undo_index(CONSUMER_A_CF);
+
 const BOTH_V1: &[MaterializedViewConsumerSchema] = &[CONSUMER_A_V1, CONSUMER_B_V1];
 const A_AND_EMPTY_B_V1: &[MaterializedViewConsumerSchema] = &[CONSUMER_A_V1, CONSUMER_B_EMPTY_V1];
 const A_V2_B_V1: &[MaterializedViewConsumerSchema] = &[CONSUMER_A_V2, CONSUMER_B_V1];
@@ -364,6 +371,32 @@ fn declaring_a_reserved_store_table_column_family_is_rejected() -> Result<()> {
         Err(MaterializedViewStoreError::ConsumerColumnFamilyConflict { name })
             if name == MaterializedViewStoreTable::ChainEventCursor.column_family_name()
     ));
+    Ok(())
+}
+
+#[test]
+fn declaring_an_undo_index_the_consumer_does_not_own_is_rejected() -> Result<()> {
+    let tempdir = TempDir::new()?;
+    let outcome = MaterializedViewStore::open(
+        tempdir.path(),
+        options(&[CONSUMER_A_FOREIGN_UNDO_INDEX, CONSUMER_B_V1]),
+    );
+    assert!(matches!(
+        outcome,
+        Err(MaterializedViewStoreError::UndeclaredHeightUndoIndex { consumer, name })
+            if consumer == CONSUMER_A.as_str() && name == CONSUMER_B_CF
+    ));
+    Ok(())
+}
+
+#[test]
+fn declaring_an_undo_index_keeps_the_persisted_manifest() -> Result<()> {
+    let tempdir = TempDir::new()?;
+    drop(open(tempdir.path(), ONLY_A_V1)?);
+    let store = open(tempdir.path(), &[CONSUMER_A_OWN_UNDO_INDEX])?;
+    store.put_consumer(CONSUMER_A_CF, b"key-a", b"value-a")?;
+    drop(store);
+    open(tempdir.path(), ONLY_A_V1)?;
     Ok(())
 }
 

@@ -32,16 +32,18 @@ use std::collections::HashMap;
 
 use prost::Message as _;
 use zinder_core::wire::{
-    encode_address_script_hash, encode_height_key_ascending, encode_height_key_descending,
-    encode_in_block_position,
+    WireDecodeError, encode_address_script_hash, encode_height_key_ascending,
+    encode_height_key_descending, encode_in_block_position,
 };
 use zinder_core::{
-    BlockHeight, TransparentAddressScriptHash, TransparentOutPoint, TransparentSpendFact,
+    BlockHeight, TransactionId, TransparentAddressScriptHash, TransparentOutPoint,
+    TransparentSpendFact,
 };
 use zinder_proto::v1::explorer::{PrevoutResolutionStatus, TransparentAddressActivityRecord};
 
 use crate::consumer::address_value_event::{
-    AddressValueEventKind, address_value_events, transaction_ids_by_position,
+    AddressValueEventKind, address_value_events, decode_stored_transaction_id,
+    internal_transaction_ids_by_position,
 };
 use crate::consumer::{
     BlockCommitContext, BlockKeyedConsumer, MaterializedViewConsumerCtx,
@@ -114,6 +116,16 @@ impl TransparentAddressActivityConsumer {
         address: TransparentAddressScriptHash,
     ) -> [u8; ADDRESS_HASH_LEN] {
         encode_address_script_hash(address)
+    }
+
+    /// Returns the transaction id one stored activity row names.
+    ///
+    /// Rows this release writes store the id as 32 internal-order bytes; rows
+    /// an earlier release wrote store its RPC hex form, which still decodes.
+    pub fn stored_transaction_id(
+        record: &TransparentAddressActivityRecord,
+    ) -> Result<TransactionId, WireDecodeError> {
+        decode_stored_transaction_id(&record.internal_transaction_id, &record.transaction_id)
     }
 }
 
@@ -203,7 +215,7 @@ impl BlockKeyedConsumer for TransparentAddressActivityConsumer {
 
 /// Per-row accumulator the apply path builds before encoding.
 struct RowAccumulator {
-    transaction_id: String,
+    internal_transaction_id: Vec<u8>,
     input_count: u32,
     output_count: u32,
     output_value_zat: i128,
@@ -215,9 +227,9 @@ struct RowAccumulator {
 }
 
 impl RowAccumulator {
-    fn new(transaction_id: String) -> Self {
+    fn new(internal_transaction_id: Vec<u8>) -> Self {
         Self {
-            transaction_id,
+            internal_transaction_id,
             input_count: 0,
             output_count: 0,
             output_value_zat: 0,
@@ -242,12 +254,13 @@ impl RowAccumulator {
             | PrevoutResolutionStatus::Unspecified => None,
         };
         TransparentAddressActivityRecord {
-            transaction_id: self.transaction_id,
+            internal_transaction_id: self.internal_transaction_id,
             block_time_unix_seconds,
             net_value_zat,
             input_count: self.input_count,
             output_count: self.output_count,
             prevout_resolution_status: prevout_resolution_status as i32,
+            ..TransparentAddressActivityRecord::default()
         }
     }
 }
@@ -259,17 +272,18 @@ fn aggregate_address_rows(
     let mut accumulators: HashMap<(TransparentAddressScriptHash, u32), RowAccumulator> =
         HashMap::new();
     let block_time_unix_seconds = block.block_time_unix_seconds;
-    let transaction_ids = transaction_ids_by_position(block);
+    let transaction_ids = internal_transaction_ids_by_position(block);
 
     let value_events = address_value_events(block, transparent_spends);
     for event in &value_events {
         let key = (event.address_script_hash, event.in_block_position);
         let entry = accumulators.entry(key).or_insert_with(|| {
-            let transaction_id = transaction_ids
-                .get(event.in_block_position as usize)
-                .cloned()
-                .unwrap_or_default();
-            RowAccumulator::new(transaction_id)
+            RowAccumulator::new(
+                transaction_ids
+                    .get(event.in_block_position as usize)
+                    .cloned()
+                    .unwrap_or_default(),
+            )
         });
         match event.kind {
             AddressValueEventKind::Received => {
@@ -374,4 +388,103 @@ pub enum TransparentAddressActivityConsumerError {
         /// Byte length actually persisted.
         bytes: usize,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use prost::Message as _;
+    use rust_rocksdb::WriteBatch;
+    use tempfile::tempdir;
+    use zinder_core::wire::{encode_internal_transaction_id, encode_rpc_transaction_id_hex};
+    use zinder_core::{
+        BlockHash, TransactionFactsArtifact, TransactionId, TransactionLocation,
+        TransparentOutputFact,
+    };
+    use zinder_store::RocksDbResourceBudget;
+    use zinder_testkit::synthetic_transaction_public_facts;
+
+    use super::*;
+    use crate::consumer::{BlockCommitInput, TransparentSpendFacts};
+    use crate::{MaterializedViewStore, MaterializedViewStoreOptions};
+
+    type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
+
+    #[test]
+    fn activity_rows_store_the_transaction_id_as_internal_bytes() -> TestResult {
+        let directory = tempdir()?;
+        let store = MaterializedViewStore::open(
+            directory.path(),
+            MaterializedViewStoreOptions {
+                consumers: &[TRANSPARENT_ADDRESS_ACTIVITY_SCHEMA],
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                ..MaterializedViewStoreOptions::default()
+            },
+        )?;
+        let mut transaction_bytes = [0x5c; 32];
+        transaction_bytes[0] = 0x01;
+        let transaction_id = TransactionId::from_bytes(transaction_bytes);
+        let address = TransparentAddressScriptHash::from_bytes([0x03; 32]);
+        let height = BlockHeight::new(7);
+        let block_hash = BlockHash::from_bytes([0x07; 32]);
+        let block = BlockCommitContext::new(
+            BlockCommitInput {
+                height,
+                block_hash,
+                previous_block_hash: BlockHash::from_bytes([0x06; 32]),
+                block_time_unix_seconds: 1_700_000_000,
+                block_size_bytes: 0,
+                transactions: vec![
+                    TransactionFactsArtifact::new(
+                        TransactionLocation::new(transaction_id, height, block_hash, 0),
+                        synthetic_transaction_public_facts(transaction_id, 0),
+                    )
+                    .with_transparent_facts(
+                        Vec::new(),
+                        vec![TransparentOutputFact::new(0, 5_000, Vec::new(), address)],
+                    ),
+                ],
+                final_note_commitment_roots: None,
+            },
+            TransparentSpendFacts::Offline,
+        );
+        let mut batch = WriteBatch::default();
+        TransparentAddressActivityConsumer::new().apply_block(
+            &block,
+            &mut MaterializedViewConsumerCtx {
+                store: &store,
+                batch: &mut batch,
+            },
+        )?;
+        store.write_batch(&batch)?;
+
+        let payload = store
+            .get_consumer(
+                TRANSPARENT_ADDRESS_ACTIVITY_COLUMN_FAMILY,
+                &TransparentAddressActivityConsumer::key_for_row(address, height, 0),
+            )?
+            .ok_or("the received output must write an activity row")?;
+        let record = TransparentAddressActivityRecord::decode(payload.as_slice())?;
+        assert_eq!(
+            record.internal_transaction_id,
+            encode_internal_transaction_id(transaction_id)
+        );
+        assert!(record.transaction_id.is_empty());
+        assert_eq!(
+            TransparentAddressActivityConsumer::stored_transaction_id(&record)?,
+            transaction_id
+        );
+
+        let legacy = TransparentAddressActivityRecord {
+            transaction_id: encode_rpc_transaction_id_hex(transaction_id),
+            internal_transaction_id: Vec::new(),
+            ..record
+        };
+        assert_eq!(
+            TransparentAddressActivityConsumer::stored_transaction_id(&legacy)?,
+            transaction_id
+        );
+        Ok(())
+    }
 }

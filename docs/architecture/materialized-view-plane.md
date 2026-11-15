@@ -294,6 +294,13 @@ column-family set. Any divergence fails without mutation and requires a fresh
 store rebuilt from a certified recovery source. The full decision is recorded
 in [ADR-0028](../adrs/0028-materialized-view-schema-versioning.md).
 
+A consumer may still add a payload field within one version when its reader
+decodes every earlier row. The transparent-address delta and activity rows
+store their transaction id as 32 internal-order bytes; rows an earlier release
+wrote keep the 64-character RPC hex form, and readers accept both. An earlier
+release reads the new rows with an empty transaction id, so rolling back to it
+requires rebuilding the Explorer views.
+
 ## Key codecs and reorgs
 
 Persisted keys use codecs from `zinder-core::wire`. Heights, positions,

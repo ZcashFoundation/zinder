@@ -36,12 +36,15 @@
 
 use prost::Message as _;
 use zinder_core::wire::{
-    encode_address_script_hash, encode_height_key_ascending, encode_in_block_position,
+    WireDecodeError, encode_address_script_hash, encode_height_key_ascending,
+    encode_in_block_position,
 };
-use zinder_core::{BlockHeight, TransparentAddressScriptHash};
+use zinder_core::{BlockHeight, TransactionId, TransparentAddressScriptHash};
 use zinder_proto::v1::explorer::TransparentAddressDeltasRecord;
 
-use crate::consumer::address_value_event::{address_value_events, transaction_ids_by_position};
+use crate::consumer::address_value_event::{
+    address_value_events, decode_stored_transaction_id, internal_transaction_ids_by_position,
+};
 use crate::consumer::{
     BlockCommitContext, BlockKeyedConsumer, MaterializedViewConsumerCtx,
     MaterializedViewConsumerError, MaterializedViewConsumerName, MaterializedViewConsumerSchema,
@@ -130,6 +133,16 @@ impl TransparentAddressDeltasConsumer {
     ) -> [u8; ADDRESS_HASH_LEN] {
         encode_address_script_hash(address)
     }
+
+    /// Returns the transaction id one stored delta row names.
+    ///
+    /// Rows this release writes store the id as 32 internal-order bytes; rows
+    /// an earlier release wrote store its RPC hex form, which still decodes.
+    pub fn stored_transaction_id(
+        record: &TransparentAddressDeltasRecord,
+    ) -> Result<TransactionId, WireDecodeError> {
+        decode_stored_transaction_id(&record.internal_transaction_id, &record.transaction_id)
+    }
 }
 
 impl BlockKeyedConsumer for TransparentAddressDeltasConsumer {
@@ -151,7 +164,7 @@ impl BlockKeyedConsumer for TransparentAddressDeltasConsumer {
             .store
             .consumer_column_family(TRANSPARENT_ADDRESS_DELTAS_INDEX_COLUMN_FAMILY)?;
 
-        let transaction_ids = transaction_ids_by_position(block);
+        let transaction_ids = internal_transaction_ids_by_position(block);
         let mut index_payload: Vec<u8> = Vec::with_capacity(value_events.len() * INDEX_ENTRY_LEN);
         for event in &value_events {
             let Some(value_zat) = event.signed_value_zat() else {
@@ -171,12 +184,13 @@ impl BlockKeyedConsumer for TransparentAddressDeltasConsumer {
                 event.event_index,
             );
             let record = TransparentAddressDeltasRecord {
-                transaction_id: transaction_ids
+                internal_transaction_id: transaction_ids
                     .get(event.in_block_position as usize)
                     .cloned()
                     .unwrap_or_default(),
                 block_time_unix_seconds: block.block_time_unix_seconds,
                 value_zat,
+                ..TransparentAddressDeltasRecord::default()
             };
             let mut payload = Vec::with_capacity(record.encoded_len());
             record.encode(&mut payload).map_err(|error| {
@@ -276,4 +290,121 @@ pub enum TransparentAddressDeltasConsumerError {
         /// Byte length actually persisted.
         bytes: usize,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use prost::Message as _;
+    use rust_rocksdb::WriteBatch;
+    use tempfile::tempdir;
+    use zinder_core::wire::{encode_internal_transaction_id, encode_rpc_transaction_id_hex};
+    use zinder_core::{
+        BlockHash, TransactionFactsArtifact, TransactionId, TransactionLocation,
+        TransparentOutputFact,
+    };
+    use zinder_proto::wire::TRANSPARENT_DELTA_KIND_RECEIVED_BYTE;
+    use zinder_store::RocksDbResourceBudget;
+    use zinder_testkit::synthetic_transaction_public_facts;
+
+    use super::*;
+    use crate::consumer::{BlockCommitInput, TransparentSpendFacts};
+    use crate::{MaterializedViewStore, MaterializedViewStoreOptions};
+
+    type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
+
+    #[test]
+    fn delta_rows_store_the_transaction_id_as_internal_bytes() -> TestResult {
+        let directory = tempdir()?;
+        let store = MaterializedViewStore::open(
+            directory.path(),
+            MaterializedViewStoreOptions {
+                consumers: &[TRANSPARENT_ADDRESS_DELTAS_SCHEMA],
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                ..MaterializedViewStoreOptions::default()
+            },
+        )?;
+        let mut transaction_bytes = [0x5c; 32];
+        transaction_bytes[0] = 0x01;
+        let transaction_id = TransactionId::from_bytes(transaction_bytes);
+        let address = TransparentAddressScriptHash::from_bytes([0x03; 32]);
+        let height = BlockHeight::new(7);
+        let block_hash = BlockHash::from_bytes([0x07; 32]);
+        let block = BlockCommitContext::new(
+            BlockCommitInput {
+                height,
+                block_hash,
+                previous_block_hash: BlockHash::from_bytes([0x06; 32]),
+                block_time_unix_seconds: 1_700_000_000,
+                block_size_bytes: 0,
+                transactions: vec![
+                    TransactionFactsArtifact::new(
+                        TransactionLocation::new(transaction_id, height, block_hash, 0),
+                        synthetic_transaction_public_facts(transaction_id, 0),
+                    )
+                    .with_transparent_facts(
+                        Vec::new(),
+                        vec![TransparentOutputFact::new(0, 5_000, Vec::new(), address)],
+                    ),
+                ],
+                final_note_commitment_roots: None,
+            },
+            TransparentSpendFacts::Offline,
+        );
+        let mut batch = WriteBatch::default();
+        TransparentAddressDeltasConsumer::new().apply_block(
+            &block,
+            &mut MaterializedViewConsumerCtx {
+                store: &store,
+                batch: &mut batch,
+            },
+        )?;
+        store.write_batch(&batch)?;
+
+        let payload = store
+            .get_consumer(
+                TRANSPARENT_ADDRESS_DELTAS_COLUMN_FAMILY,
+                &TransparentAddressDeltasConsumer::key_for_event(
+                    address,
+                    height,
+                    0,
+                    TRANSPARENT_DELTA_KIND_RECEIVED_BYTE,
+                    0,
+                ),
+            )?
+            .ok_or("the received output must write a delta row")?;
+        let record = TransparentAddressDeltasRecord::decode(payload.as_slice())?;
+        assert_eq!(
+            record.internal_transaction_id,
+            encode_internal_transaction_id(transaction_id)
+        );
+        assert!(record.transaction_id.is_empty());
+        assert_eq!(
+            TransparentAddressDeltasConsumer::stored_transaction_id(&record)?,
+            transaction_id
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn delta_rows_written_in_rpc_hex_still_name_their_transaction() -> TestResult {
+        let transaction_id = TransactionId::from_bytes([0x2a; 32]);
+        let legacy = TransparentAddressDeltasRecord {
+            transaction_id: encode_rpc_transaction_id_hex(transaction_id),
+            ..TransparentAddressDeltasRecord::default()
+        };
+        assert_eq!(
+            TransparentAddressDeltasConsumer::stored_transaction_id(&legacy)?,
+            transaction_id
+        );
+        assert!(
+            TransparentAddressDeltasConsumer::stored_transaction_id(
+                &TransparentAddressDeltasRecord::default()
+            )
+            .is_err(),
+            "a row with neither encoding names no transaction"
+        );
+        Ok(())
+    }
 }
