@@ -289,8 +289,10 @@ message TransparentInput {
 // `output` contains the intrinsic value and scriptPubKey created by this
 // transaction. `spent_by` is populated only when a canonical transaction has
 // consumed the outpoint at the response's chain epoch; absence means unspent
-// on that canonical chain. Mempool spends remain a separate wallet-plane
-// relation and do not change this field.
+// on that canonical chain, unless the response's `ExplorerFreshness.unavailable`
+// lists `transparent_outputs.spent_by`, in which case spent state is unknown.
+// Mempool spends remain a separate wallet-plane relation and do not change
+// this field.
 message TransparentOutput {
   uint32 output_index = 1;
   zinder.v1.wallet.TransparentOutput output = 2;
@@ -340,6 +342,13 @@ message TransactionDetailRequest {
 // value and script. Only mined outputs may carry a canonical `spent_by` relation;
 // mempool-spend state remains a separate wallet-plane relation. Addresses remain
 // an edge concern derived from standard scripts; Zinder returns scriptPubKey bytes.
+//
+// Output spent state comes from the Explorer's transparent-outpoint spend view,
+// which answers only when it covers exactly the response's chain epoch. While it
+// does not, such as during view replay or while the view and the wallet reader
+// are a block apart, the response still carries facts, location, inputs, and
+// outputs, omits every `spent_by`, and lists `transparent_outputs.spent_by` in
+// `freshness.unavailable` with `UNAVAILABLE_STALE`.
 //
 // `intrinsic_value_balances` is populated only for mined transactions when
 // the canonical artifact or retained transaction blob is available at the

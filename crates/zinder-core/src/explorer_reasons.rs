@@ -59,3 +59,12 @@ pub const UNIFIED_ADDRESS_NO_TRANSPARENT_RECEIVER: &str =
 /// accompanying `UnavailableField.field_path` identifies the affected field.
 pub const WALLET_QUERY_CAPABILITY_NOT_SUPPORTED: &str =
     "The wallet query does not support this field.";
+
+/// Transparent output spend status the spend index cannot answer at the
+/// response's chain epoch.
+///
+/// Used with `UnavailableReason::UNAVAILABLE_STALE` while the Explorer's
+/// transparent-outpoint spend view does not cover the epoch the wallet plane
+/// resolved, such as during view replay or while the view and the wallet
+/// reader are one block apart at the tip.
+pub const TRANSPARENT_OUTPUT_SPEND_STATUS_NOT_INDEXED: &str = "Transparent output spend status is unknown because the spend index does not cover this chain epoch.";

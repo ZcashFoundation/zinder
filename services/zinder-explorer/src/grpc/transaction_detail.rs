@@ -11,28 +11,29 @@ use std::collections::{HashMap, HashSet};
 
 use tonic::{Request, Response, Status};
 use zinder_core::{
-    BlockHeight, ConsensusBranchId, LockTime as CoreLockTime, NetworkUpgradeActivations,
-    TransactionId, TransactionPublicFacts as CoreFacts,
+    BlockHeight, ChainEpoch, ConsensusBranchId, LockTime as CoreLockTime,
+    NetworkUpgradeActivations, TransactionId, TransactionPublicFacts as CoreFacts,
     TransactionVersion as CoreTransactionVersion, TransparentOutPoint, TransparentOutputFact,
+    explorer_reasons::TRANSPARENT_OUTPUT_SPEND_STATUS_NOT_INDEXED,
     wire::{
         decode_rpc_transaction_id_hex, encode_branch_id_hex, encode_rpc_auth_digest_hex,
         encode_rpc_transaction_id_hex, encode_rpc_wtxid_hex,
     },
 };
 use zinder_proto::capabilities::EXPLORER_TRANSACTION_DETAIL_V4;
-use zinder_proto::wire::encode_privacy_shape;
+use zinder_proto::wire::{TRANSPARENT_OUTPUT_SPENT_BY_FIELD_PATH, encode_privacy_shape};
 
 use zinder_materialized_views::{
-    MaterializedViewStore, TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, TransactionFeesConsumer,
-    TransparentOutpointSpendConsumer,
+    MaterializedViewState, MaterializedViewStore, TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
+    TransactionFeesConsumer, TransparentOutpointSpendConsumer,
 };
 use zinder_proto::v1::{
     explorer::{
         LockTime as WireLockTime, LockTimeUnlocked, TransactionComponentCounts,
         TransactionDetailRequest, TransactionDetailResponse, TransactionFeesRecord,
         TransactionPublicFacts as WireFacts, TransactionVersion as WireVersion,
-        TransactionVersionKind, TransparentOutput as WireTransparentOutput,
-        lock_time as wire_lock_time,
+        TransactionVersionKind, TransparentOutput as WireTransparentOutput, UnavailableField,
+        UnavailableReason, lock_time as wire_lock_time,
     },
     wallet::{
         self, TransactionLocation as WireTransactionLocation,
@@ -96,16 +97,12 @@ pub(crate) async fn query_transaction_detail(
     let transaction =
         resolve_facts_and_location(network_upgrade_activations, transaction_id, location)?;
 
-    let freshness = attach_upstream_observation(
-        upstream_observation_cache,
-        build_explorer_freshness(
-            materialized_view_store,
-            EXPLORER_TRANSACTION_DETAIL_V4,
-            Some(chain_epoch.clone()),
-            0,
-        )?,
-    )
-    .await;
+    let mut freshness = build_explorer_freshness(
+        materialized_view_store,
+        EXPLORER_TRANSACTION_DETAIL_V4,
+        Some(chain_epoch.clone()),
+        0,
+    )?;
 
     let fees = resolve_fee_record(materialized_view_store, &transaction)?;
     let transparent_rows = resolve_transparent_rows(
@@ -114,6 +111,12 @@ pub(crate) async fn query_transaction_detail(
         fees.as_ref(),
         materialized_view_store,
     )?;
+    if !transparent_rows.output_spends_known {
+        freshness
+            .unavailable
+            .push(transparent_output_spend_status_unavailable());
+    }
+    let freshness = attach_upstream_observation(upstream_observation_cache, freshness).await;
     let (paid_fee_zat, prevout_resolution_status) = fees.as_ref().map_or((None, 0), |record| {
         (record.paid_fee_zat, record.prevout_resolution_status)
     });
@@ -138,7 +141,14 @@ struct ResolvedTransactionDetail {
 struct ResolvedTransparentRows {
     inputs: Vec<zinder_proto::v1::explorer::TransparentInput>,
     outputs: Vec<WireTransparentOutput>,
+    /// `false` when the outputs' `spent_by` relations are unknown rather than
+    /// absent because unspent.
+    output_spends_known: bool,
 }
+
+/// Canonical spend relations of a transaction's transparent outputs, keyed by
+/// outpoint, or `None` when the spend view does not cover the response epoch.
+type TransparentOutputSpends = Option<HashMap<TransparentOutPoint, wallet::TransparentSpend>>;
 
 fn resolve_transparent_rows(
     transaction: &ResolvedTransactionDetail,
@@ -150,12 +160,25 @@ fn resolve_transparent_rows(
     let inputs = encode_unresolved_transparent_inputs(&fact_set.transparent_inputs, fees);
     let output_spends =
         resolve_transparent_output_spends(chain_epoch, transaction, materialized_view_store)?;
+    let output_spends_known = output_spends.is_some();
     let outputs = encode_transparent_output_facts(
         fact_set.public_facts.transaction_id,
         &fact_set.transparent_outputs,
-        &output_spends,
+        &output_spends.unwrap_or_default(),
     );
-    Ok(ResolvedTransparentRows { inputs, outputs })
+    Ok(ResolvedTransparentRows {
+        inputs,
+        outputs,
+        output_spends_known,
+    })
+}
+
+fn transparent_output_spend_status_unavailable() -> UnavailableField {
+    UnavailableField {
+        field_path: TRANSPARENT_OUTPUT_SPENT_BY_FIELD_PATH.to_owned(),
+        reason: UnavailableReason::UnavailableStale as i32,
+        human_reason: TRANSPARENT_OUTPUT_SPEND_STATUS_NOT_INDEXED.to_owned(),
+    }
 }
 
 /// Resolves the parsed public facts and the wire location for one transaction.
@@ -253,12 +276,12 @@ fn resolve_transparent_output_spends(
     chain_epoch: &wallet::ChainEpoch,
     transaction: &ResolvedTransactionDetail,
     materialized_view_store: Option<&MaterializedViewStore>,
-) -> Result<HashMap<TransparentOutPoint, wallet::TransparentSpend>, Status> {
+) -> Result<TransparentOutputSpends, Status> {
     if matches!(
         transaction.location.location,
         Some(wire_location::Location::InMempool(_))
     ) {
-        return Ok(HashMap::new());
+        return Ok(Some(HashMap::new()));
     }
     let requested_outpoints: Vec<TransparentOutPoint> = transaction
         .fact_set
@@ -269,7 +292,7 @@ fn resolve_transparent_output_spends(
         })
         .collect();
     if requested_outpoints.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(Some(HashMap::new()));
     }
     let requested_outpoint_set: HashSet<TransparentOutPoint> =
         requested_outpoints.iter().copied().collect();
@@ -298,7 +321,7 @@ fn resolve_materialized_transparent_output_spends(
     chain_epoch: &wallet::ChainEpoch,
     transaction: &ResolvedTransactionDetail,
     requested_outpoints: &[TransparentOutPoint],
-) -> Result<HashMap<TransparentOutPoint, wallet::TransparentSpend>, Status> {
+) -> Result<TransparentOutputSpends, Status> {
     materialized_view_store
         .try_catch_up()
         .map_err(|error| ExplorerError::internal(error.to_string()))?;
@@ -321,25 +344,9 @@ fn resolve_materialized_transparent_output_spends(
         let snapshot = materialized_view_store.read_snapshot();
         let state = snapshot
             .consumer_state(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME)
-            .map_err(|error| ExplorerError::internal(error.to_string()))?
-            .ok_or_else(|| {
-                ExplorerError::not_materialized(
-                    "transparent outpoint spend materialized-view state is unavailable",
-                )
-            })?;
-        let state_matches_epoch = state.chain_epoch_id == expected_epoch.id
-            && state.tip_height == expected_epoch.visible_tip_height
-            && state.tip_hash == expected_epoch.visible_tip_hash;
-        let coverage_is_complete = state.coverage.is_some_and(|coverage| {
-            coverage.complete_from_height <= mined_height
-                && coverage.complete_through_height >= expected_epoch.visible_tip_height
-                && coverage.complete_through_hash == expected_epoch.visible_tip_hash
-        });
-        if !state_matches_epoch || !coverage_is_complete {
-            return Err(ExplorerError::not_materialized(
-                "transparent outpoint spend materialized view does not cover the requested chain epoch",
-            )
-            .into());
+            .map_err(|error| ExplorerError::internal(error.to_string()))?;
+        if !state.is_some_and(|state| spend_view_covers(&state, &expected_epoch, mined_height)) {
+            return Ok(None);
         }
         let spends = TransparentOutpointSpendConsumer::read_spends_by_outpoints_snapshot(
             &snapshot,
@@ -349,10 +356,33 @@ fn resolve_materialized_transparent_output_spends(
         drop(snapshot);
         spends
     };
-    Ok(spends
-        .into_iter()
-        .map(|(outpoint, spend)| (outpoint, transparent_spend_message(&spend)))
-        .collect())
+    Ok(Some(
+        spends
+            .into_iter()
+            .map(|(outpoint, spend)| (outpoint, transparent_spend_message(&spend)))
+            .collect(),
+    ))
+}
+
+/// Returns whether the spend view has recorded every spend of an output mined
+/// at `mined_height`, through exactly the epoch's visible tip.
+///
+/// Only then does an absent spend row mean unspent at that epoch. A view that
+/// trails, leads, or sits on another branch than the epoch answers nothing.
+fn spend_view_covers(
+    state: &MaterializedViewState,
+    epoch: &ChainEpoch,
+    mined_height: BlockHeight,
+) -> bool {
+    let state_matches_epoch = state.chain_epoch_id == epoch.id
+        && state.tip_height == epoch.visible_tip_height
+        && state.tip_hash == epoch.visible_tip_hash;
+    state_matches_epoch
+        && state.coverage.is_some_and(|coverage| {
+            coverage.complete_from_height <= mined_height
+                && coverage.complete_through_height >= epoch.visible_tip_height
+                && coverage.complete_through_hash == epoch.visible_tip_hash
+        })
 }
 
 fn encode_transparent_output_facts(
@@ -453,10 +483,134 @@ fn encode_lock_time(lock_time: CoreLockTime) -> WireLockTime {
 
 #[cfg(test)]
 mod tests {
-    use zinder_core::{Network, TransactionId, TransparentInputFact, TransparentOutPoint};
+    use zinder_core::{
+        ArtifactSchemaVersion, BlockHash, ChainEpochId, ChainTipMetadata, Network, TransactionId,
+        TransparentInputFact, TransparentOutPoint, UnixTimestampMillis,
+    };
+    use zinder_materialized_views::{MaterializedViewCoverage, MaterializedViewStoreOptions};
     use zinder_proto::v1::explorer::TransparentInputValueRecord;
+    use zinder_store::{RocksDbResourceBudget, chain_epoch_message};
 
     use super::*;
+
+    #[test]
+    fn spend_view_covers_only_the_exact_epoch_from_the_mined_height() {
+        let epoch = chain_epoch_at(100);
+        let current = spend_view_state(100, 1, 100);
+        assert!(spend_view_covers(&current, &epoch, BlockHeight::new(50)));
+        assert!(
+            !spend_view_covers(&current, &epoch, BlockHeight::new(0)),
+            "an output mined below the verified coverage has unrecorded spends"
+        );
+
+        let trailing = spend_view_state(99, 1, 99);
+        assert!(!spend_view_covers(&trailing, &epoch, BlockHeight::new(50)));
+        let leading = spend_view_state(101, 1, 101);
+        assert!(!spend_view_covers(&leading, &epoch, BlockHeight::new(50)));
+        let replaying = spend_view_state(100, 1, 40);
+        assert!(!spend_view_covers(&replaying, &epoch, BlockHeight::new(50)));
+        let other_branch = MaterializedViewState {
+            tip_hash: block_hash(7),
+            ..current
+        };
+        assert!(!spend_view_covers(
+            &other_branch,
+            &epoch,
+            BlockHeight::new(50)
+        ));
+        let unverified = MaterializedViewState {
+            coverage: None,
+            ..current
+        };
+        assert!(!spend_view_covers(
+            &unverified,
+            &epoch,
+            BlockHeight::new(50)
+        ));
+    }
+
+    #[test]
+    fn mined_outputs_are_served_with_unknown_spends_before_the_spend_view_covers_the_epoch()
+    -> eyre::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let materialized_view_store = MaterializedViewStore::open_explorer_views(
+            tempdir.path(),
+            MaterializedViewStoreOptions {
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                ..MaterializedViewStoreOptions::default()
+            },
+        )?;
+        let transaction = resolve_mined_transparent_transaction()?;
+        let chain_epoch = chain_epoch_message(chain_epoch_at(1));
+
+        let rows = resolve_transparent_rows(
+            &transaction,
+            &chain_epoch,
+            None,
+            Some(&materialized_view_store),
+        )?;
+
+        assert!(!rows.output_spends_known);
+        assert_eq!(rows.inputs.len(), 1);
+        assert_eq!(rows.outputs.len(), 2);
+        assert!(rows.outputs.iter().all(|output| output.spent_by.is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_output_spend_status_names_the_spent_by_field_as_stale() {
+        let unavailable = transparent_output_spend_status_unavailable();
+
+        assert_eq!(unavailable.field_path, "transparent_outputs.spent_by");
+        assert_eq!(
+            unavailable.reason,
+            UnavailableReason::UnavailableStale as i32
+        );
+        assert_eq!(
+            unavailable.human_reason,
+            TRANSPARENT_OUTPUT_SPEND_STATUS_NOT_INDEXED
+        );
+    }
+
+    fn chain_epoch_at(height: u32) -> ChainEpoch {
+        ChainEpoch {
+            id: ChainEpochId::new(u64::from(height)),
+            network: Network::ZcashRegtest,
+            visible_tip_height: BlockHeight::new(height),
+            visible_tip_hash: block_hash(height),
+            settled_tip_height: BlockHeight::new(0),
+            settled_tip_hash: Network::ZcashRegtest.genesis_hash(),
+            artifact_schema_version: ArtifactSchemaVersion::new(1),
+            tip_metadata: ChainTipMetadata::empty(),
+            created_at: UnixTimestampMillis::new(u64::from(height)),
+        }
+    }
+
+    /// Spend-view state at `tip_height`, with verified coverage from
+    /// `complete_from` through `complete_through`.
+    fn spend_view_state(
+        tip_height: u32,
+        complete_from: u32,
+        complete_through: u32,
+    ) -> MaterializedViewState {
+        MaterializedViewState {
+            chain_epoch_id: ChainEpochId::new(u64::from(tip_height)),
+            tip_height: BlockHeight::new(tip_height),
+            tip_hash: block_hash(tip_height),
+            revision: 1,
+            coverage: Some(MaterializedViewCoverage {
+                complete_from_height: BlockHeight::new(complete_from),
+                complete_through_height: BlockHeight::new(complete_through),
+                complete_through_hash: block_hash(complete_through),
+            }),
+        }
+    }
+
+    fn block_hash(height: u32) -> BlockHash {
+        let mut bytes = [0xC3; 32];
+        bytes[..4].copy_from_slice(&height.to_be_bytes());
+        BlockHash::from_bytes(bytes)
+    }
 
     #[test]
     fn mempool_detail_preserves_ordered_transparent_rows_from_payload() -> eyre::Result<()> {

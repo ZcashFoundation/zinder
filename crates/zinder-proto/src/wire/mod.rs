@@ -13,6 +13,7 @@
 
 mod activation_schedule;
 mod canonical_writer_fence;
+mod explorer_field_path;
 mod privacy_shape;
 mod reorg_window_exceeded;
 mod transaction_lookup;
@@ -24,6 +25,7 @@ pub use activation_schedule::{
     encode_canonical_network_upgrade_schedule,
 };
 pub use canonical_writer_fence::canonical_writer_fence_message;
+pub use explorer_field_path::TRANSPARENT_OUTPUT_SPENT_BY_FIELD_PATH;
 pub use privacy_shape::{decode_privacy_shape, encode_privacy_shape};
 pub use reorg_window_exceeded::{
     ReorgWindowExceededMetadata, decode_reorg_window_exceeded_metadata,

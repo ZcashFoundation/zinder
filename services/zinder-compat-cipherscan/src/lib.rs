@@ -107,6 +107,7 @@ use zinder_proto::v1::{
         mempool_event_envelope, transaction_location, wallet_query_client::WalletQueryClient,
     },
 };
+use zinder_proto::wire::TRANSPARENT_OUTPUT_SPENT_BY_FIELD_PATH;
 use zinder_runtime::AuthenticatedChannel;
 
 use crate::blend_check::{
@@ -7204,6 +7205,7 @@ fn cipherscan_transaction_detail_outputs(
     network: Network,
     response: &explorer::TransactionDetailResponse,
 ) -> Vec<Value> {
+    let spends_known = !transparent_output_spends_unknown(response);
     response
         .transparent_outputs
         .iter()
@@ -7216,10 +7218,21 @@ fn cipherscan_transaction_detail_outputs(
                 "address": intrinsic.and_then(|output| {
                     cipherscan_transparent_address(network, &output.script_pub_key)
                 }),
-                "spent": output.spent_by.is_some(),
+                "spent": spends_known.then_some(output.spent_by.is_some()),
             })
         })
         .collect()
+}
+
+/// Returns whether the detail marks every output's spend relation unknown, so
+/// an absent `spent_by` must not be shown as unspent.
+fn transparent_output_spends_unknown(response: &explorer::TransactionDetailResponse) -> bool {
+    response.freshness.as_ref().is_some_and(|freshness| {
+        freshness
+            .unavailable
+            .iter()
+            .any(|field| field.field_path == TRANSPARENT_OUTPUT_SPENT_BY_FIELD_PATH)
+    })
 }
 
 fn cipherscan_transaction_detail_unavailable(
@@ -7282,6 +7295,11 @@ fn cipherscan_transaction_detail_unavailable(
     {
         unavailable.push(
             "Transparent outputs are unavailable because this transaction has no canonical facts artifact.",
+        );
+    }
+    if transparent_output_spends_unknown(response) {
+        unavailable.push(
+            "Transparent output spent state is unavailable because the spend index does not cover this chain epoch.",
         );
     }
     if cipherscan_transaction_detail_fee(facts, response.paid_fee_zat).source
@@ -15625,6 +15643,48 @@ mod tests {
             coinbase_miner_fields: None,
         });
         assert_eq!(transaction["outputs"][0]["spent"], json!(false));
+    }
+
+    #[test]
+    fn transaction_detail_json_leaves_spent_state_unknown_when_the_spend_index_trails() {
+        let script_pub_key = [0x51];
+        let mut response = canonical_spent_transaction_detail_response(&script_pub_key);
+        response.transparent_outputs[0].spent_by = None;
+        response.freshness = Some(explorer::ExplorerFreshness {
+            unavailable: vec![explorer::UnavailableField {
+                field_path: TRANSPARENT_OUTPUT_SPENT_BY_FIELD_PATH.to_owned(),
+                reason: explorer::UnavailableReason::UnavailableStale as i32,
+                human_reason: String::new(),
+            }],
+            ..Default::default()
+        });
+        let facts = explorer::TransactionPublicFacts {
+            transaction_id: SAMPLE_TRANSACTION_ID.to_owned(),
+            counts: Some(explorer::TransactionComponentCounts {
+                transparent_output_count: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(validate_transaction_detail_outputs(&facts, &response).is_ok());
+        let transaction = transaction_detail_json(CipherscanTransactionDetailJsonInput {
+            network: Network::ZcashTestnet,
+            facts: &facts,
+            location: None,
+            response: &response,
+            coinbase_total_output_zat: None,
+            coinbase_miner_fields: None,
+        });
+        assert_eq!(transaction["outputs"][0]["spent"], Value::Null);
+        assert!(
+            transaction["zinderUnavailable"]
+                .as_array()
+                .is_some_and(|notes| notes.iter().any(|note| note
+                    .as_str()
+                    .is_some_and(|note| note.starts_with("Transparent output spent state")))),
+            "the unknown spent state must be explained: {transaction}"
+        );
     }
 
     #[test]
