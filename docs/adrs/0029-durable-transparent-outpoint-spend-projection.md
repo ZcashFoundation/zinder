@@ -5,7 +5,7 @@
 | Status | Accepted |
 | Product | Zinder |
 | Domain | Materialized-view plane, transparent spend resolution |
-| Related | [ADR-0003](0003-canonical-storage-access-boundary.md), [ADR-0017](0017-materialized-view-consumer-and-key-codec.md), [ADR-0026](0026-utxo-set-commitment.md), [ADR-0028](0028-materialized-view-schema-versioning.md), [ADR-0034](0034-exclusive-index-build-stages-and-block-local-spend-replay.md), [ADR-0043](0043-owned-transparent-wallet-query-surface.md) |
+| Related | [ADR-0003](0003-canonical-storage-access-boundary.md), [ADR-0011](0011-explorer-freshness-envelope.md), [ADR-0017](0017-materialized-view-consumer-and-key-codec.md), [ADR-0026](0026-utxo-set-commitment.md), [ADR-0028](0028-materialized-view-schema-versioning.md), [ADR-0034](0034-exclusive-index-build-stages-and-block-local-spend-replay.md), [ADR-0043](0043-owned-transparent-wallet-query-surface.md) |
 
 ## Context
 
@@ -77,10 +77,20 @@ orders the two stores.
 `ExplorerQuery.TransactionDetail` is the only reader. It reads the projection
 from one materialized-view snapshot. It answers only when the consumer state matches the
 requested chain epoch's visible tip and the verified coverage spans from the
-transaction's mined height through that tip with a matching hash; otherwise it
-refuses with `ARTIFACT_UNAVAILABLE`. Under that coverage the projection has
-recorded every spend since the output was created, so the handler may treat an
-absent row for an output it already holds as unspent at that epoch.
+transaction's mined height through that tip with a matching hash. Under that
+coverage the projection has recorded every spend since the output was created,
+so the handler may treat an absent row for an output it already holds as
+unspent at that epoch.
+
+Otherwise the handler still answers with the transaction's facts, location,
+inputs, and outputs. It omits every output's `spent_by` and lists
+`transparent_outputs.spent_by` in `ExplorerFreshness.unavailable` with
+`UNAVAILABLE_STALE`
+([ADR-0011](0011-explorer-freshness-envelope.md)), so unknown spent state is
+never read as unspent. A projection that trails the epoch during replay, or
+that sits one block ahead of or behind the wallet reader at the tip, therefore
+withholds only the spend relation. `explorer.transaction.detail_v4` still tells
+clients whether the response can carry `spent_by` at all.
 
 The ingest replay host also uses the projection's coverage as the replay
 progress anchor: materialized-view replay has caught up when this consumer
@@ -116,3 +126,6 @@ That is a progress signal, not a retention authority.
   `WalletQuery.TransparentOutpointSpendStatus`, served from the wallet
   projection rather than from this view. This projection stays the Explorer's
   reverse-spend index.
+- 2026-11-15: `TransactionDetail` answers with spent state marked unavailable,
+  instead of refusing with `ARTIFACT_UNAVAILABLE`, while the projection does
+  not cover the requested chain epoch.

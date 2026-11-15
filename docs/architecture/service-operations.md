@@ -320,6 +320,15 @@ The ceiling governs admission on its own. `storage.secondary_replica_lag_thresho
 decides when lag stops being routine and becomes a reported warning, not how
 long a warned reader may keep answering.
 
+The projector applies each block after the writer commits it, so a refresh
+regularly finds the candidate's canonical and wallet secondaries at different
+epochs and retries on the next interval. While the writer lag stays within that
+threshold and the published pair still admits traffic, the publisher logs such
+a `wallet_serving_pair_publisher_refresh_failed` event at debug level. It logs
+every other refresh failure as a warning. Both increment
+`zinder_wallet_serving_pair_publisher_refresh_total{status="error"}` with their
+`error_class`, such as `projection_behind`.
+
 ### Explorer
 
 Explorer is ready after its API has started and, when a materialized-view store

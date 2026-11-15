@@ -1,0 +1,6 @@
+kind: fixed
+body: "`ExplorerQuery.TransactionDetail` no longer fails with `ARTIFACT_UNAVAILABLE` for mined transactions with transparent outputs while the Explorer's transparent-outpoint spend view does not cover the response's chain epoch, such as during view replay or while the view and the wallet reader are a block apart at the tip. The response carries the transaction's facts, location, inputs, and outputs, omits every `spent_by`, and lists `transparent_outputs.spent_by` in `freshness.unavailable` with `UNAVAILABLE_STALE`; clients must treat an absent `spent_by` as unknown, not unspent, when that entry is present. The Cipherscan adapter reports that output state as `spent: null`. The `zinder-wallet-serving-explorer` image now starts `zinder-explorer` as soon as wallet serving answers when `ZINDER_INGEST__EXPLORER_VIEWS` is false, instead of after a 10-minute wait for view admission. `zinder-query` and `zinder-compat-lightwalletd` log `wallet_serving_pair_publisher_refresh_failed` at debug level, not as a warning, when a refresh only found its secondaries an epoch apart within the replica lag threshold."
+time: 2026-11-15T09:00:00Z
+custom:
+  Bump: patch
+  PR: "197"
