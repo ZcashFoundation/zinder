@@ -311,17 +311,25 @@ withhold `explorer.transparent_address.activity_v2` and
 `explorer.transparent_address.ranking_v1`.
 
 You do not need to rebuild those views. After the upgrade, `zinder-ingest`
-builds the ranking from canonical history while the other views keep following
-the tip. It logs these events:
+builds the ranking from canonical history beside the other views, even while
+their replay is still far behind the tip. It logs these events:
 
 - `transparent_address_ranking_build_started` when the build begins.
 - `transparent_address_ranking_build_progress` as it passes each
   100000-height mark.
-- `transparent_address_ranking_activated` when the ranking serves.
+- `transparent_address_ranking_joined_replay` when the build reaches the
+  height the other views are rebuilding at and joins their replay there.
+- `transparent_address_ranking_activated` when the build activates at the
+  shared cursor of views that already follow the tip.
 
 The build reads every canonical block from height 1 and resumes after a
-restart. `ExplorerQuery.ServerInfo` advertises both capabilities once the
-ranking activates.
+restart. Follow it with
+`zinder_materialized_view_transparent_address_ranking_build_height` and
+`zinder_materialized_view_transparent_address_ranking_build_target_height`.
+`ExplorerQuery.ServerInfo` advertises both capabilities once the ranking
+activates. A ranking that joined a replay still behind the tip answers address
+reads with the same catching-up freshness as the other views until replay
+reaches the tip.
 
 ### Keep Explorer views from filling the volume
 

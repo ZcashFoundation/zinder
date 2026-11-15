@@ -34,8 +34,8 @@ pub use conventional_fee_distribution_backfill::{
 };
 pub use materialized_view_replay::{
     DEFAULT_EXPLORER_VIEWS_MIN_FREE_BYTES, DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL,
-    MaterializedViewTailer, ReplayPrevoutCaches, VolumeSpaceGuard,
-    open_primary_materialized_view_store, seed_backfill_owned_consumer_cursors,
+    MaterializedViewTailer, ReplayPrevoutCaches, TransparentAddressRankingBuildStep,
+    VolumeSpaceGuard, open_primary_materialized_view_store, seed_backfill_owned_consumer_cursors,
     spawn_materialized_view_replay_budget_metrics_task, spawn_materialized_view_tailer_task,
 };
 pub use memory_pressure::{

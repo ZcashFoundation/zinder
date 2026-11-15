@@ -49,7 +49,9 @@ use zinder_store::{
 use crate::{
     CanonicalBlockContextReader, IngestError, MaterializedViewReplayConfig,
     MaterializedViewReplayPolicy, PrevoutCache,
-    canonical_block_context::DEFAULT_PREVOUT_CACHE_MAX_OUTPUTS,
+    canonical_block_context::{
+        DEFAULT_PREVOUT_CACHE_MAX_OUTPUTS, PREVOUT_CACHE_WARMUP_MIN_REMAINING_BLOCKS,
+    },
     chain_ingest::{ingest_error_class, outcome_status},
     conventional_fee_distribution_backfill::seed_conventional_fee_distribution_visible_tail,
     memory_pressure::RuntimeMemorySnapshot,
@@ -61,6 +63,7 @@ use crate::{
 mod transparent_address_ranking;
 mod volume_space;
 
+pub use transparent_address_ranking::TransparentAddressRankingBuildStep;
 pub use volume_space::{DEFAULT_EXPLORER_VIEWS_MIN_FREE_BYTES, VolumeSpaceGuard};
 
 const MATERIALIZED_VIEW_REPLAY_STAGE_READ_EVENTS: &str = "read_events";
@@ -767,10 +770,10 @@ pub struct MaterializedViewTailer {
 ///
 /// Replay and the transparent-address ranking build walk different heights, so
 /// each has its own [`PrevoutCache`]. A cache holds memory only while there is
-/// history to walk. Both empty while replay is paused, which returns their
-/// memory under memory pressure. The replay cache also empties once replay
-/// reaches the canonical fence, and the ranking cache once no ranking build is
-/// pending.
+/// history to walk. Each empties while its walker is paused, which returns its
+/// memory under memory pressure, and is not warmed again afterwards. The
+/// replay cache also empties once replay reaches the canonical fence, and the
+/// ranking cache once no ranking build is pending.
 #[derive(Debug)]
 pub struct ReplayPrevoutCaches {
     replay: Mutex<PrevoutCache>,
@@ -782,14 +785,21 @@ impl ReplayPrevoutCaches {
     #[must_use]
     pub fn new(max_outputs_per_cache: usize) -> Self {
         Self {
-            replay: Mutex::new(PrevoutCache::new(max_outputs_per_cache)),
-            ranking_build: Mutex::new(PrevoutCache::new(max_outputs_per_cache)),
+            replay: Mutex::new(
+                PrevoutCache::new(max_outputs_per_cache).with_metrics_label("replay"),
+            ),
+            ranking_build: Mutex::new(
+                PrevoutCache::new(max_outputs_per_cache).with_metrics_label("ranking_build"),
+            ),
         }
     }
 
-    fn release(&self) {
-        self.replay.lock().clear();
-        self.ranking_build.lock().clear();
+    fn release_replay(&self) {
+        self.replay.lock().release_for_pause();
+    }
+
+    fn release_ranking_build(&self) {
+        self.ranking_build.lock().release_for_pause();
     }
 }
 
@@ -801,12 +811,23 @@ impl Default for ReplayPrevoutCaches {
 }
 
 impl MaterializedViewTailer {
-    /// Replays every retained canonical transition into the materialized-view store.
+    /// Replays every retained canonical transition into the materialized-view
+    /// store, then advances a pending transparent-address ranking build by one
+    /// step.
+    ///
+    /// The spawned tailer task runs the same replay but leaves the ranking
+    /// build to its own worker, so the build advances while replay walks
+    /// history.
     pub fn catch_up(&self) -> Result<(), IngestError> {
-        self.catch_up_with_pass(&mut ReplayPass::new(
+        let mut pass = ReplayPass::new(
             MaterializedViewReplayBudget::new(self.config)
                 .with_volume_space_guard(self.volume_space_guard.clone()),
-        ))
+        );
+        self.catch_up_with_pass(&mut pass)?;
+        if self.materialized_view_store.has_consumer_column_families() {
+            self.advance_ranking_build_step(&mut pass)?;
+        }
+        Ok(())
     }
 
     fn catch_up_with_pass(&self, pass: &mut ReplayPass) -> Result<(), IngestError> {
@@ -818,12 +839,12 @@ impl MaterializedViewTailer {
         self.replay_event_only_consumers(&canonical)?;
         self.join_transparent_address_ranking_at_genesis(&canonical)?;
         self.replay_block_consumers(&canonical, pass)?;
-        if pass.budget.applied_state.is_paused()
-            || matches!(self.replay_caught_up(&canonical), Ok(true))
-        {
+        if pass.budget.applied_state.is_paused() {
+            self.prevout_caches.release_replay();
+        } else if matches!(self.replay_caught_up(&canonical), Ok(true)) {
             self.prevout_caches.replay.lock().clear();
         }
-        self.build_transparent_address_ranking(&canonical, pass)
+        Ok(())
     }
 
     /// Replays retained transitions into the block-keyed consumers, then
@@ -1095,6 +1116,18 @@ impl MaterializedViewTailer {
             &self.activations,
             &mut prevouts,
         );
+        if transition.reverted.is_none()
+            && block_count(committed) >= PREVOUT_CACHE_WARMUP_MIN_REMAINING_BLOCKS
+            && let Some(below) = committed.start.value().checked_sub(1)
+            && !hydrator.warm_prevout_cache(BlockHeight::new(below), &mut || {
+                if pass.status_persist_is_due() {
+                    self.persist_status(canonical, pass.budget.applied_state);
+                }
+                pass.warm_up_window()
+            })?
+        {
+            return Ok(());
+        }
         let mut next_height = committed.start;
         let mut first_page = true;
         while next_height <= committed.end {
@@ -1418,6 +1451,14 @@ fn reverted_epoch(
     }
 }
 
+/// Returns how many heights `range` spans, or zero for an empty range.
+const fn block_count(range: BlockHeightRange) -> u32 {
+    match range.end.value().checked_sub(range.start.value()) {
+        Some(distance) => distance.saturating_add(1),
+        None => 0,
+    }
+}
+
 fn replay_page(
     start: BlockHeight,
     end: BlockHeight,
@@ -1512,6 +1553,14 @@ async fn run_materialized_view_tailer(
     )
     .with_volume_space_guard(tailer.volume_space_guard.clone());
     let mut cursor_risk = CursorRiskWatch::new(&tailer, historical_work_gate.readiness());
+    let ranking_builder = tokio::spawn(
+        transparent_address_ranking::run_transparent_address_ranking_builder(
+            Arc::clone(&tailer),
+            poll_interval,
+            historical_work_gate.readiness().runtime_readiness(),
+            cancel.clone(),
+        ),
+    );
     loop {
         let effective_limits = budget.evaluate_current();
         record_materialized_view_replay_budget(
@@ -1529,7 +1578,7 @@ async fn run_materialized_view_tailer(
             tailer.persist_status(&canonical, effective_limits.state);
         }
         if effective_limits.state.is_paused() {
-            tailer.prevout_caches.release();
+            tailer.prevout_caches.release_replay();
         } else {
             budget = run_materialized_view_tailer_pass(&tailer, budget).await;
         }
@@ -1537,6 +1586,14 @@ async fn run_materialized_view_tailer(
             cursor_risk.observe(&tailer.materialized_view_store);
         }
         if sleep_or_cancel(poll_interval, &cancel).await {
+            if let Err(join_error) = ranking_builder.await {
+                tracing::warn!(
+                    target: "zinder::ingest",
+                    event = "transparent_address_ranking_build_failed",
+                    error = %join_error,
+                    "transparent-address ranking build worker stopped abnormally"
+                );
+            }
             tracing::info!(
                 target: "zinder::ingest",
                 event = "materialized_view_tailer_cancelled",
@@ -1785,6 +1842,17 @@ impl ReplayPass {
 
     fn yields(&mut self) -> bool {
         self.budget.is_cancelled() || self.evaluate().state.is_paused()
+    }
+
+    /// Returns how many heights the next prevout-cache warm-up window may
+    /// span, which is one replay page under the current limits, or `None`
+    /// when the pass yields.
+    fn warm_up_window(&mut self) -> Option<u32> {
+        if self.budget.is_cancelled() {
+            return None;
+        }
+        let limits = self.evaluate();
+        (!limits.state.is_paused()).then_some(limits.batch_blocks)
     }
 
     /// Throttles the in-pass status refresh so a from-genesis rebuild keeps the

@@ -39,6 +39,8 @@ pub struct PrevoutCache {
     outputs: HashMap<TransparentOutPoint, CachedOutput>,
     heights: BTreeMap<BlockHeight, CachedHeight>,
     applied_through: Option<BlockId>,
+    warm_up_allowed: bool,
+    metrics_label: Option<&'static str>,
 }
 
 /// One cached output; its block hash lives once per height in `heights`.
@@ -47,6 +49,59 @@ struct CachedOutput {
     value_zat: u64,
     address_script_hash: TransparentAddressScriptHash,
     block_height: BlockHeight,
+}
+
+/// The outputs one block produced and the outpoints it spent, in the shape the
+/// cache applies.
+///
+/// Warming a cache decodes many blocks in parallel and keeps only this much of
+/// each until the blocks are applied in height order.
+#[derive(Debug)]
+pub(super) struct BlockPrevoutDelta {
+    block: BlockId,
+    parent_hash: BlockHash,
+    produced: Vec<(TransparentOutPoint, CachedOutput)>,
+    spent: Vec<TransparentOutPoint>,
+}
+
+impl BlockPrevoutDelta {
+    pub(super) fn of_block(block: &CanonicalBlockFacts) -> Self {
+        let header = &block.block_header;
+        let produced = block
+            .transactions
+            .iter()
+            .flat_map(|transaction| {
+                let transaction_id = transaction.public_facts.transaction_id;
+                transaction.transparent_outputs.iter().map(move |output| {
+                    (
+                        TransparentOutPoint::new(transaction_id, output.output_index),
+                        CachedOutput {
+                            value_zat: output.value_zat,
+                            address_script_hash: output.address_script_hash,
+                            block_height: header.height,
+                        },
+                    )
+                })
+            })
+            .collect();
+        let spent = block
+            .transactions
+            .iter()
+            .flat_map(|transaction| &transaction.transparent_inputs)
+            .filter(|input| !input.spent_outpoint.is_coinbase_sentinel())
+            .map(|input| input.spent_outpoint)
+            .collect();
+        Self {
+            block: BlockId::new(header.height, header.block_hash),
+            parent_hash: header.parent_hash,
+            produced,
+            spent,
+        }
+    }
+
+    pub(super) const fn height(&self) -> BlockHeight {
+        self.block.height
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -67,7 +122,31 @@ impl PrevoutCache {
             outputs: HashMap::new(),
             heights: BTreeMap::new(),
             applied_through: None,
+            warm_up_allowed: true,
+            metrics_label: None,
         }
+    }
+
+    /// Reports this cache's size and evictions under the `cache` metric label.
+    #[must_use]
+    pub fn with_metrics_label(mut self, label: &'static str) -> Self {
+        self.metrics_label = Some(label);
+        self.record_size();
+        self
+    }
+
+    pub(super) const fn metrics_label(&self) -> Option<&'static str> {
+        self.metrics_label
+    }
+
+    /// Returns whether the cache keeps any output at all.
+    pub(super) const fn retains_outputs(&self) -> bool {
+        self.max_outputs > 0
+    }
+
+    /// Returns the height of the last block the cache applied.
+    pub(super) fn applied_height(&self) -> Option<BlockHeight> {
+        self.applied_through.map(|block| block.height)
     }
 
     /// Returns the number of outputs the cache currently holds.
@@ -82,11 +161,40 @@ impl PrevoutCache {
         self.outputs.is_empty()
     }
 
+    /// Returns whether a walker may still warm this cache from canonical
+    /// history.
+    pub(super) const fn warm_up_allowed(&self) -> bool {
+        self.warm_up_allowed
+    }
+
+    /// Returns whether `first` is the block right after the last one the cache
+    /// applied, or the cache has applied nothing.
+    pub(super) fn extends_to(&self, first: &BlockPrevoutDelta) -> bool {
+        self.applied_through.is_none_or(|applied| {
+            applied.height.next() == Some(first.block.height) && applied.hash == first.parent_hash
+        })
+    }
+
+    /// Empties the cache because its walker paused.
+    ///
+    /// A cache that held anything also stops being warmed for the rest of the
+    /// process. Memory pressure is one reason to pause, and a warm-up after
+    /// every such pause would refill the same memory before the walk advanced
+    /// a height. The walker resumes cold instead and the cache fills as it
+    /// walks.
+    pub fn release_for_pause(&mut self) {
+        if self.applied_through.is_some() || !self.outputs.is_empty() {
+            self.warm_up_allowed = false;
+        }
+        self.clear();
+    }
+
     /// Drops every cached output and the applied chain position.
     pub fn clear(&mut self) {
         self.outputs = HashMap::new();
         self.heights.clear();
         self.applied_through = None;
+        self.record_size();
     }
 
     /// Empties the cache unless `first_block` extends the last applied block.
@@ -129,38 +237,51 @@ impl PrevoutCache {
     /// after every block, so the bound is exceeded by at most one block.
     pub(super) fn apply(&mut self, blocks: &[CanonicalBlockFacts]) {
         for block in blocks {
-            self.apply_block(block);
-            self.evict_oldest_heights();
+            self.apply_delta(&BlockPrevoutDelta::of_block(block));
+        }
+        self.record_size();
+    }
+
+    /// Applies the deltas of one connected, ascending run of blocks whose
+    /// parent links the caller has already verified.
+    pub(super) fn apply_deltas(&mut self, deltas: &[BlockPrevoutDelta]) {
+        for delta in deltas {
+            self.apply_delta(delta);
+        }
+        self.record_size();
+    }
+
+    fn apply_delta(&mut self, delta: &BlockPrevoutDelta) {
+        if self.max_outputs > 0 {
+            for (outpoint, output) in &delta.produced {
+                self.insert(*outpoint, *output, delta.block.hash);
+            }
+        }
+        for outpoint in &delta.spent {
+            self.remove(outpoint);
+        }
+        self.applied_through = Some(delta.block);
+        self.evict_oldest_heights();
+    }
+
+    fn record_size(&self) {
+        if let Some(label) = self.metrics_label {
+            metrics::gauge!("zinder_materialized_view_prevout_cache_outputs", "cache" => label)
+                .set(
+                    u32::try_from(self.outputs.len())
+                        .map_or_else(|_| f64::from(u32::MAX), f64::from),
+                );
         }
     }
 
-    fn apply_block(&mut self, block: &CanonicalBlockFacts) {
-        let header = &block.block_header;
-        if self.max_outputs > 0 {
-            for transaction in &block.transactions {
-                let transaction_id = transaction.public_facts.transaction_id;
-                for output in &transaction.transparent_outputs {
-                    self.insert(
-                        TransparentOutPoint::new(transaction_id, output.output_index),
-                        CachedOutput {
-                            value_zat: output.value_zat,
-                            address_script_hash: output.address_script_hash,
-                            block_height: header.height,
-                        },
-                        header.block_hash,
-                    );
-                }
-            }
+    fn record_evicted(&self, evicted: usize) {
+        if let Some(label) = self.metrics_label {
+            metrics::counter!(
+                "zinder_materialized_view_prevout_cache_evicted_outputs_total",
+                "cache" => label
+            )
+            .increment(u64::try_from(evicted).unwrap_or(u64::MAX));
         }
-        for input in block
-            .transactions
-            .iter()
-            .flat_map(|transaction| &transaction.transparent_inputs)
-            .filter(|input| !input.spent_outpoint.is_coinbase_sentinel())
-        {
-            self.remove(&input.spent_outpoint);
-        }
-        self.applied_through = Some(BlockId::new(header.height, header.block_hash));
     }
 
     fn produced_output(&self, outpoint: &TransparentOutPoint) -> Option<ProducedOutput> {
@@ -221,14 +342,17 @@ impl PrevoutCache {
             }
             remaining = remaining.saturating_sub(cached.cached_outputs);
         }
+        let before = self.outputs.len();
         let Some(first_kept) = first_kept else {
             self.outputs.clear();
             self.heights.clear();
+            self.record_evicted(before);
             return;
         };
         self.heights = self.heights.split_off(&first_kept);
         self.outputs
             .retain(|_, output| output.block_height >= first_kept);
+        self.record_evicted(before.saturating_sub(self.outputs.len()));
     }
 }
 

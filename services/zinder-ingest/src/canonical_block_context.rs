@@ -7,13 +7,16 @@
 //! transparent spend facts come from the output the spend names. That output
 //! is found in the hydrated range, then in an optional [`PrevoutCache`] of
 //! outputs earlier ranges produced, and last in the producing block's replay
-//! row.
+//! row. Canonical reads for the last step, and for warming an empty cache,
+//! run on several threads so their storage waits overlap.
 
+mod parallel_reads;
 mod prevout_cache;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
+    time::Instant,
 };
 
 use zinder_core::{
@@ -28,12 +31,29 @@ use zinder_materialized_views::{
     BlockCommitContext, BlockCommitInput, TransactionIntrinsicValueBalanceFacts,
     TransparentSpendFacts,
 };
-use zinder_store::RocksDbCanonicalSecondary;
+use zinder_store::{MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS, RocksDbCanonicalSecondary};
 
 use crate::{CanonicalBlockConstructionError, IngestError};
 
+use parallel_reads::{canonical_read_workers, read_in_parallel, read_slices_in_parallel};
+use prevout_cache::BlockPrevoutDelta;
 pub(crate) use prevout_cache::DEFAULT_PREVOUT_CACHE_MAX_OUTPUTS;
 pub use prevout_cache::PrevoutCache;
+
+/// Fewest heights a walk must have left before an empty prevout cache is
+/// warmed from canonical history first.
+///
+/// Warming costs one sequential pass over the history below the walk, so it
+/// pays off only when the walk would otherwise resolve many spends of older
+/// outputs through random canonical reads.
+pub(crate) const PREVOUT_CACHE_WARMUP_MIN_REMAINING_BLOCKS: u32 = 10_000;
+
+/// Most heights one warm-up step decodes before it applies them to the cache.
+///
+/// The step's decoded deltas are held in memory until they are applied, so
+/// the window bounds that transient memory in transparent-dense history. The
+/// caller's window, normally its current replay page size, is capped here.
+const PREVOUT_CACHE_WARMUP_WINDOW_BLOCKS: u32 = 512;
 
 /// First height a canonical store retains when its history is complete.
 const GENESIS_COMPLETE_FIRST_HEIGHT: BlockHeight = BlockHeight::new(1);
@@ -102,6 +122,86 @@ impl<'canonical> CanonicalBlockContextReader<'canonical> {
             roots: FinalRootsCursor { accumulator: None },
             prevouts: Some(prevouts),
         }
+    }
+
+    /// Warms a prevout cache with the unspent outputs canonical history holds
+    /// at `through`.
+    ///
+    /// The cache is rebuilt by applying every retained block from the first
+    /// retained height through `through` in order, as an uninterrupted walk
+    /// from genesis would have left it, up to its bound. Rows are read and
+    /// decoded on several threads one window at a time. `next_window` is
+    /// sampled before each window and returns how many heights the window may
+    /// span, capped at 512. When it returns `None` the warm-up stops and
+    /// reports `false`, and the cache keeps the windows it applied, so a later
+    /// call with the same `through` continues from there. A cache that
+    /// ends above `through` or off its chain is emptied and warmed from the
+    /// first retained height.
+    ///
+    /// A reader without a cache, a cache that already ends at `through`, a
+    /// cache a pause released (see [`PrevoutCache::release_for_pause`]), or a
+    /// height below retained history needs no walk.
+    pub fn warm_prevout_cache(
+        &mut self,
+        through: BlockHeight,
+        next_window: &mut dyn FnMut() -> Option<u32>,
+    ) -> Result<bool, IngestError> {
+        let first_height = self.secondary.history_bounds().first_available_height();
+        let Some(prevouts) = self.prevouts.as_deref_mut() else {
+            return Ok(true);
+        };
+        if !prevouts.retains_outputs()
+            || !prevouts.warm_up_allowed()
+            || prevouts.applied_height() == Some(through)
+            || through < first_height
+        {
+            return Ok(true);
+        }
+        let mut next = match prevouts.applied_height().and_then(BlockHeight::next) {
+            Some(resume) if resume > first_height && resume <= through => resume,
+            _ => {
+                prevouts.clear();
+                first_height
+            }
+        };
+        let started_at = Instant::now();
+        while next <= through {
+            let Some(window_blocks) = next_window() else {
+                return Ok(false);
+            };
+            let window_blocks = window_blocks.clamp(1, PREVOUT_CACHE_WARMUP_WINDOW_BLOCKS);
+            let end = BlockHeight::new(
+                next.value()
+                    .saturating_add(window_blocks - 1)
+                    .min(through.value()),
+            );
+            let deltas =
+                read_prevout_deltas(self.secondary, BlockHeightRange::inclusive(next, end))?;
+            if deltas
+                .first()
+                .is_some_and(|first| !prevouts.extends_to(first))
+            {
+                prevouts.clear();
+                next = first_height;
+                continue;
+            }
+            prevouts.apply_deltas(&deltas);
+            let Some(after) = end.next() else {
+                break;
+            };
+            next = after;
+        }
+        tracing::info!(
+            target: "zinder::ingest",
+            event = "materialized_view_prevout_cache_warmed",
+            cache = prevouts.metrics_label().unwrap_or("unlabeled"),
+            from_height = first_height.value(),
+            through_height = through.value(),
+            cached_outputs = prevouts.len(),
+            elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "prevout cache warmed from canonical history before resuming a walk partway through it"
+        );
+        Ok(true)
     }
 
     /// Hydrates one connected height range into dispatch-ready contexts.
@@ -239,57 +339,133 @@ impl<'canonical> CanonicalBlockContextReader<'canonical> {
 
     /// Reads the outputs `produced` still lacks from their producing blocks and
     /// returns how many producing blocks it read.
+    ///
+    /// Each distinct parent transaction costs one location read and each
+    /// distinct producing height one replay-row read. Both sets of reads are
+    /// independent, so they run on several threads.
     fn read_produced_outputs_below_range(
         &self,
         requested: &HashSet<TransparentOutPoint>,
         produced: &mut HashMap<TransparentOutPoint, ProducedOutput>,
     ) -> Result<usize, IngestError> {
-        let mut locations = HashMap::new();
-        let mut by_producing_height =
-            BTreeMap::<BlockHeight, Vec<(TransparentOutPoint, u32)>>::new();
+        let mut missing_by_transaction = BTreeMap::<TransactionId, Vec<TransparentOutPoint>>::new();
         for outpoint in requested
             .iter()
             .filter(|outpoint| !produced.contains_key(*outpoint))
         {
-            let location = self.transaction_location(&mut locations, *outpoint)?;
+            missing_by_transaction
+                .entry(outpoint.transaction_id)
+                .or_default()
+                .push(*outpoint);
+        }
+        if missing_by_transaction.is_empty() {
+            return Ok(0);
+        }
+        let missing_by_transaction = missing_by_transaction.into_iter().collect::<Vec<_>>();
+        let locations = read_in_parallel(&missing_by_transaction, |chunk| {
+            chunk
+                .iter()
+                .map(|(transaction_id, outpoints)| {
+                    self.secondary
+                        .transaction_location(*transaction_id)?
+                        .ok_or_else(|| {
+                            prevout_unresolved(
+                                outpoints[0],
+                                "producing transaction has no canonical location",
+                            )
+                        })
+                })
+                .collect()
+        })?;
+        let mut by_producing_height =
+            BTreeMap::<BlockHeight, Vec<(TransparentOutPoint, u32)>>::new();
+        for ((_, outpoints), location) in missing_by_transaction.iter().zip(&locations) {
             by_producing_height
                 .entry(location.block_height)
                 .or_default()
-                .push((*outpoint, location.tx_index_in_block));
+                .extend(
+                    outpoints
+                        .iter()
+                        .map(|outpoint| (*outpoint, location.tx_index_in_block)),
+                );
         }
         let producing_block_reads = by_producing_height.len();
-        for (height, outpoints) in by_producing_height {
-            let block = self.secondary.block_replay_facts_at(height)?;
-            for (outpoint, tx_index_in_block) in outpoints {
-                let block = block.as_ref().ok_or_else(|| {
-                    prevout_unresolved(outpoint, "producing block is not retained")
-                })?;
-                produced.insert(
-                    outpoint,
-                    produced_output(block, outpoint, tx_index_in_block)?,
-                );
+        let by_producing_height = by_producing_height.into_iter().collect::<Vec<_>>();
+        let outputs = read_in_parallel(&by_producing_height, |chunk| {
+            let mut outputs = Vec::new();
+            for (height, outpoints) in chunk {
+                let block = self.secondary.block_replay_facts_at(*height)?;
+                for (outpoint, tx_index_in_block) in outpoints {
+                    let block = block.as_ref().ok_or_else(|| {
+                        prevout_unresolved(*outpoint, "producing block is not retained")
+                    })?;
+                    outputs.push((
+                        *outpoint,
+                        produced_output(block, *outpoint, *tx_index_in_block)?,
+                    ));
+                }
             }
-        }
+            Ok(outputs)
+        })?;
+        produced.extend(outputs);
         Ok(producing_block_reads)
     }
+}
 
-    fn transaction_location(
-        &self,
-        locations: &mut HashMap<TransactionId, TransactionLocation>,
-        outpoint: TransparentOutPoint,
-    ) -> Result<TransactionLocation, IngestError> {
-        if let Some(location) = locations.get(&outpoint.transaction_id) {
-            return Ok(*location);
+/// Reads the prevout deltas of the connected range `range` in height order.
+///
+/// The range is split into one contiguous slice per read worker. Each slice is
+/// read through the bounded replay-range scan, which proves that every block
+/// extends the canonical row below it, so the concatenated deltas form one
+/// connected run.
+fn read_prevout_deltas(
+    secondary: &RocksDbCanonicalSecondary,
+    range: BlockHeightRange,
+) -> Result<Vec<BlockPrevoutDelta>, IngestError> {
+    let block_count = range
+        .end
+        .value()
+        .saturating_sub(range.start.value())
+        .saturating_add(1);
+    let worker_count = u32::try_from(canonical_read_workers()).unwrap_or(1).max(1);
+    let slice_blocks = block_count
+        .div_ceil(worker_count)
+        .clamp(1, MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS);
+    let mut slices = Vec::new();
+    let mut start = range.start.value();
+    while start <= range.end.value() {
+        let end = start
+            .saturating_add(slice_blocks - 1)
+            .min(range.end.value());
+        slices.push(BlockHeightRange::inclusive(
+            BlockHeight::new(start),
+            BlockHeight::new(end),
+        ));
+        start = end.saturating_add(1);
+        if end == u32::MAX {
+            break;
         }
-        let location = self
-            .secondary
-            .transaction_location(outpoint.transaction_id)?
-            .ok_or_else(|| {
-                prevout_unresolved(outpoint, "producing transaction has no canonical location")
-            })?;
-        locations.insert(outpoint.transaction_id, location);
-        Ok(location)
     }
+    let deltas = read_slices_in_parallel(&slices, |chunk| {
+        let mut deltas = Vec::new();
+        for slice in chunk {
+            for replay in secondary.scan_canonical_replay_range(*slice)? {
+                deltas.push(BlockPrevoutDelta::of_block(replay?.facts()));
+            }
+        }
+        Ok(deltas)
+    })?;
+    if deltas.len() != usize::try_from(block_count).unwrap_or(usize::MAX)
+        || deltas.first().map(BlockPrevoutDelta::height) != Some(range.start)
+    {
+        return Err(IngestError::MaterializedViewDispatch(format!(
+            "canonical heights {}..={} returned {} blocks while warming the prevout cache",
+            range.start.value(),
+            range.end.value(),
+            deltas.len(),
+        )));
+    }
+    Ok(deltas)
 }
 
 /// Commitment-tree state carried across sequential hydration ranges.

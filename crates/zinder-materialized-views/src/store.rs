@@ -25,8 +25,8 @@ use std::{
 
 use parking_lot::{RwLock, RwLockReadGuard};
 use rust_rocksdb::{
-    Cache, ColumnFamilyDescriptor, DB, IteratorMode, Options, ReadOptions, Snapshot, WriteBatch,
-    WriteOptions, checkpoint::Checkpoint,
+    Cache, ColumnFamilyDescriptor, DB, DBCompressionType, IteratorMode, Options, ReadOptions,
+    Snapshot, WriteBatch, WriteOptions, checkpoint::Checkpoint,
 };
 use zinder_core::{BlockHash, BlockHeight, ChainEpoch, ChainEpochId};
 use zinder_store::{
@@ -182,10 +182,18 @@ enum ManifestAdmission {
 
 /// Per-column-family options the materialized-view plane tunes at open time.
 ///
-/// Adds `max_write_buffer_number = 2` on top of the canonical-store CF
-/// defaults (one block-based table factory bound to the shared block
-/// cache). Two write buffers let one rotate to immutable while another
-/// keeps absorbing puts during compaction.
+/// Every family shares one block-based table factory bound to the shared
+/// block cache, and takes its write-buffer size and count from the resource
+/// budget so one buffer can rotate to immutable while another keeps absorbing
+/// puts during compaction.
+///
+/// Every level compresses with ZSTD. View rows carry hex transaction ids and
+/// repeated address prefixes that ZSTD's entropy coding shrinks and the
+/// earlier Snappy default did not, and smaller files also cut the bytes each
+/// compaction rewrites. View writes are a small share of replay time, so the
+/// extra compression CPU does not slow replay. Each SST file records its own
+/// compression, so a store written under other settings opens unchanged and
+/// adopts this one as compaction rewrites its files.
 fn column_family_options(cache: &Cache, rocksdb_resource_budget: RocksDbResourceBudget) -> Options {
     let mut options = Options::default();
     options.set_block_based_table_factory(&build_block_based_table_factory(cache));
@@ -193,6 +201,7 @@ fn column_family_options(cache: &Cache, rocksdb_resource_budget: RocksDbResource
         usize::try_from(rocksdb_resource_budget.write_buffer_bytes).unwrap_or(usize::MAX),
     );
     options.set_max_write_buffer_number(rocksdb_resource_budget.max_write_buffer_count);
+    options.set_compression_type(DBCompressionType::Zstd);
     options
 }
 
