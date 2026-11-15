@@ -22,6 +22,7 @@ on:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
+      - "rust-toolchain.toml"
       - ".config/nextest.toml"
       - "crates/**"
       - "services/zinder-bench/**"
@@ -55,9 +56,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Swatinem/rust-cache hashes every CARGO_* and RUST* variable into its key.
+# The test cache is shared with ci-pr.yml, so keep this block identical there.
 env:
   CARGO_TERM_COLOR: always
-  CARGO_NEXTEST_VERSION: "0.9.116"
   PROTOC: /does/not/exist
 
 jobs:
@@ -96,11 +102,16 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@f133eefe930d61f0d9371efd474daf0125ed3dd1 # 1.95.0
 
+      # Both legs restore the shared test cache. Only the Zebra leg saves it,
+      # and only from the default branch (the scheduled nightly run).
       - name: Cache Cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.node == 'zebra' }}
 
       - name: Install cargo-nextest
-        run: cargo install cargo-nextest --locked --version "${CARGO_NEXTEST_VERSION}"
+        run: scripts/install-ci-tool.sh cargo-nextest
 
       # Zebra runs as a step rather than a service container because its
       # Regtest activation heights and funding streams come from a mounted
@@ -222,7 +233,7 @@ jobs:
       # the pre-NU7 tip that the rest of the suite would otherwise mine past.
       - name: Run the NU7 activation test against regtest
         run: |
-          cargo nextest run --workspace --profile=ci-live --run-ignored=all \
+          cargo nextest run --locked --workspace --profile=ci-live --run-ignored=all \
             -E 'test(/^live::nu7_activation::/)'
 
       - name: Run T3 live tests against regtest
@@ -238,7 +249,7 @@ jobs:
         # because live test names avoid network labels unless the behavior
         # itself is network-specific.
         run: |
-          cargo nextest run --workspace --profile=ci-live --run-ignored=all \
+          cargo nextest run --locked --workspace --profile=ci-live --run-ignored=all \
             -E 'test(/^live::/) and not test(/^live::nu7_activation::/) and not test(mainnet) and not test(backfills_last_1000_blocks_from_checkpoint) and not test(streaming_source_recovers_after_zebra_indexer_restart)'
 
       - name: Run the node restart test against regtest
@@ -256,7 +267,7 @@ jobs:
         # before the restart.
         run: |
           sleep 6
-          cargo nextest run --workspace --profile=ci-live --run-ignored=all \
+          cargo nextest run --locked --workspace --profile=ci-live --run-ignored=all \
             -E 'test(streaming_source_recovers_after_zebra_indexer_restart)'
 
       - name: Dump node logs on failure
@@ -279,9 +290,12 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-nextest
-        run: cargo install cargo-nextest --locked --version "${CARGO_NEXTEST_VERSION}"
+        run: scripts/install-ci-tool.sh cargo-nextest
 
       - name: Run T3 live tests against testnet
         env:
@@ -297,7 +311,7 @@ jobs:
         # explicit behavior name because live test names avoid network labels
         # unless the behavior itself is network-specific.
         run: |
-          cargo nextest run --workspace --profile=ci-live --run-ignored=all \
+          cargo nextest run --locked --workspace --profile=ci-live --run-ignored=all \
             -E 'test(/^live::/) and not test(_on_regtest) and not test(mainnet) and not test(backfills_from_checkpoint) and not test(backfills_last_1000_blocks_from_checkpoint) and not test(deep_chain) and not test(latency)'
 
   mainnet:
@@ -318,9 +332,12 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-nextest
-        run: cargo install cargo-nextest --locked --version "${CARGO_NEXTEST_VERSION}"
+        run: scripts/install-ci-tool.sh cargo-nextest
 
       - name: Run T3 live tests against mainnet
         env:
@@ -335,5 +352,5 @@ jobs:
         # Keep this allowlist explicit because live test names avoid network
         # names unless the behavior itself is network-specific.
         run: |
-          cargo nextest run --workspace --profile=ci-live --run-ignored=all \
+          cargo nextest run --locked --workspace --profile=ci-live --run-ignored=all \
             -E 'test(mainnet) or test(backfills_last_1000_blocks_from_checkpoint) or test(canonical_blocks_load_requested_range_from_fixed_checkpoint) or test(upgrade_activations_keep_advertised_order)'

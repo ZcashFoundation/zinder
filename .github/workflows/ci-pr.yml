@@ -12,13 +12,15 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Swatinem/rust-cache hashes every CARGO_* and RUST* variable into its key, so
+# jobs that share a cache key must keep this block identical, and tool versions
+# live in .github/ci-tools.lock rather than in CARGO_-prefixed variables.
 env:
   CARGO_TERM_COLOR: always
-  CARGO_DENY_VERSION: "0.19.4"
-  CARGO_LLVM_COV_VERSION: "0.8.5"
-  CARGO_MACHETE_VERSION: "0.9.2"
-  CARGO_MUTANTS_VERSION: "27.0.0"
-  CARGO_NEXTEST_VERSION: "0.9.116"
   PROTOC: /does/not/exist
   PROTOC_VERSION: "29.3"
 
@@ -53,9 +55,12 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-nextest
-        run: cargo install cargo-nextest --locked --version "${CARGO_NEXTEST_VERSION}"
+        run: scripts/install-ci-tool.sh cargo-nextest
 
       - name: Format
         run: cargo fmt --all --check
@@ -117,6 +122,12 @@ jobs:
       - name: Test changelog policy
         run: scripts/test-changelog.sh
 
+      - name: Test CI tool installer
+        run: scripts/test-install-ci-tool.sh
+
+      - name: Lint runbook shell blocks
+        run: scripts/runbook-lint.sh docs/runbooks/testing.md
+
       - name: Require release note fragment or waiver
         if: github.event_name == 'pull_request'
         env:
@@ -138,6 +149,9 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: policy
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Verify Zcash upstream alignment
         run: scripts/check-zcash-upstream-alignment.sh
@@ -283,10 +297,10 @@ jobs:
           ' "$evidence_path" >/dev/null
 
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked --version "${CARGO_DENY_VERSION}"
+        run: scripts/install-ci-tool.sh cargo-deny
 
       - name: Install cargo-machete
-        run: cargo install cargo-machete --locked --version "${CARGO_MACHETE_VERSION}"
+        run: scripts/install-ci-tool.sh cargo-machete
 
       - name: Deny
         run: cargo deny check
@@ -309,6 +323,9 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: sdk
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Verify registry packages and extracted consumer
         env:
@@ -383,9 +400,12 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: coverage
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --locked --version "${CARGO_LLVM_COV_VERSION}"
+        run: scripts/install-ci-tool.sh cargo-llvm-cov
 
       - name: Coverage
         run: cargo llvm-cov --workspace --all-features --no-report
@@ -404,9 +424,12 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: mutation
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-mutants
-        run: cargo install cargo-mutants --locked --version "${CARGO_MUTANTS_VERSION}"
+        run: scripts/install-ci-tool.sh cargo-mutants
 
       - name: Mutate critical contracts
         run: |

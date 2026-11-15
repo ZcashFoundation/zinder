@@ -12,6 +12,7 @@ on:
       - ".dockerignore"
       - "crates/**"
       - "services/**"
+      - "tools/**"
       - "deploy/Dockerfile"
       - "deploy/docker-compose.yml"
       - "deploy/release-images.json"
@@ -39,6 +40,7 @@ jobs:
   verify:
     name: verify deployment admission
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       release_images: ${{ steps.images.outputs.release_images }}
     steps:
@@ -55,6 +57,7 @@ jobs:
     name: build runtime images (${{ matrix.platform.name }})
     needs: verify
     runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:

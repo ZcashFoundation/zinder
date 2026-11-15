@@ -21,6 +21,7 @@ on:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
+      - "rust-toolchain.toml"
       - ".config/nextest.toml"
       - "crates/**"
       - "services/zinder-bench/**"
@@ -38,9 +39,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Swatinem/rust-cache hashes every CARGO_* and RUST* variable into its key, so
+# keep this block identical to the other Rust workflows.
 env:
   CARGO_TERM_COLOR: always
-  CARGO_NEXTEST_VERSION: "0.9.116"
   PROTOC: /does/not/exist
   # The reference must parse the version-6 (NU6.3 and later) transactions that
   # every block from height 6 carries on the shared Regtest schedule in
@@ -75,14 +81,20 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@f133eefe930d61f0d9371efd474daf0125ed3dd1 # 1.95.0
 
+      # This job builds the release profile as well as the test profile, so it
+      # keeps its own cache. Only the Zebra leg saves it, and only from the
+      # default branch (the scheduled nightly run).
       - name: Cache Cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: parity
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.node == 'zebra' }}
 
       - name: Install cargo-nextest
-        run: cargo install cargo-nextest --locked --version "${CARGO_NEXTEST_VERSION}"
+        run: scripts/install-ci-tool.sh cargo-nextest
 
       - name: Build Zinder binaries
-        run: cargo build --release -p zinder-ingest -p zinder-compat-lightwalletd -p zinder-bench
+        run: cargo build --locked --release -p zinder-ingest -p zinder-compat-lightwalletd -p zinder-bench
 
       # Zebra runs as a step rather than a service container because its
       # Regtest activation heights and funding streams come from a mounted
@@ -273,7 +285,7 @@ jobs:
           ZINDER_TEST_PARITY_LIGHTWALLETD_ADDR: http://127.0.0.1:9088
           ZINDER_TEST_PARITY_TRANSPARENT_ADDRESS: ${{ env.PARITY_TRANSPARENT_ADDRESS }}
         run: |
-          cargo nextest run -p zinder-compat-lightwalletd --profile=ci-live --run-ignored=all \
+          cargo nextest run --locked -p zinder-compat-lightwalletd --profile=ci-live --run-ignored=all \
             -E 'test(/^live::parity_against_lightwalletd::/) and not test(/mempool/)'
 
       - name: Dump pipeline logs on failure
