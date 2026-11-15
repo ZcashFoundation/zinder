@@ -1,0 +1,6 @@
+kind: changed
+body: A wallet store that follows the canonical chain no longer re-reads its whole reorg-undo window on every block. After one full check when it opens, each append reads only the undo rows it changes, which lowers `zinder-projector` read load per block, most noticeably on read-limited storage. The full check still runs after a failed write, on every reorg, and on every reconciliation.
+time: 2026-11-15T19:45:57.11454865Z
+custom:
+    Bump: patch
+    PR: "212"
