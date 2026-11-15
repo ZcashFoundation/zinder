@@ -169,13 +169,47 @@ with the workspace Rust 1.95 toolchain, compiles an extracted consumer without
 publication plan. Missing crate versions and package tags are expected during
 this read-only check. The package and Cargo Release checks run independently,
 then one final gate reports both outcomes and includes the complete plan and
-observed state in the job summary. These credential-free jobs must succeed
-before the protected `release` environment authorizes all trusted publication
-and attestation work.
+observed state in the job summary.
+
+At the same time, the workflow builds each GNU/Linux binary platform twice.
+The two builds run side by side in independent uncached jobs that hold only a
+read-only repository token, and a third job compares them:
+
+1. `compile release binaries` validates the catalog, embedded commit, ELF
+   machine, dynamic libraries, symbol ceilings, and clean Debian runtime
+   probes, and generates one SPDX 2.3 SBOM from the auditable archive.
+2. `reproduce release binaries` builds the same archive again with a separate
+   Cargo target cache.
+3. `compare independent release builds` requires identical binary and archive
+   hashes for the platform and lists them in its job summary.
+
+A build that fails or does not reproduce stops the release before anything is
+published. These credential-free jobs must succeed before the protected
+`release` environment authorizes all trusted publication and attestation work.
+
+### Approve the release
 
 A release asks for one approval. `publish public SDK crates` is the only job
 in the protected `release` environment, and every later job depends on it.
+GitHub requests the approval only after both builds of every platform match.
+With the v0.13.0 build times, that is about 17 minutes after the tag push.
 Rerunning only the failed jobs after approval does not ask again.
+
+Before you approve, confirm in the workflow run:
+
+- [ ] The run belongs to the tag you pushed, and its commit is the
+      release-preparation commit.
+- [ ] Both `compare independent release builds` jobs passed. Each job summary
+      lists the archive hash and every binary hash that the two builds share.
+- [ ] The `verify public SDK packages` summary shows the Cargo Release plan
+      you expect for `zinder-core`, `zinder-proto`, and `zinder-client`.
+- [ ] The live and parity jobs from the checklist above passed on that commit.
+
+Approve within 7 days of the tag push. The release notes, API artifacts, and
+binary archives that later jobs download expire after 7 days. If they expire,
+rerun all jobs, which requests a new approval.
+
+### After approval
 
 After approval, the workflow performs these operations in order:
 
@@ -184,24 +218,20 @@ After approval, the workflow performs these operations in order:
    source provenance.
 2. Compile a fresh registry-only consumer against the exact published
    `zinder-client` version after sparse-index propagation.
-3. Build each GNU/Linux binary platform in 2 independent uncached jobs that run
-   side by side. The primary job validates the catalog, embedded commit, ELF
-   machine, dynamic libraries, symbol ceilings, and clean Debian runtime
-   probes, and generates one SPDX 2.3 SBOM from the auditable archive.
-4. In the primary job, build the 5 runtime images and 3 single-volume host
-   images natively for Linux amd64 and arm64 from the same binary stage with
-   BuildKit max-mode provenance and SBOMs, and confirm each image carries the
-   archived binaries byte for byte.
-5. Confirm the 2 builds produced identical binary and archive hashes, then
-   attest both SLSA provenance and the SBOM for each archive.
-6. Publish exact `vX.Y.Z` and `sha-<commit>` manifests, attest each child SBOM
+3. Package the 5 runtime images and 3 single-volume host images natively for
+   Linux amd64 and arm64 from the binaries in the compared archive, without
+   compiling again. Each image build publishes BuildKit max-mode provenance and
+   an SBOM, and each image must carry the archived binaries byte for byte.
+   Alongside the images, attest both SLSA provenance and the SBOM for each
+   archive.
+4. Publish exact `vX.Y.Z` and `sha-<commit>` manifests, attest each child SBOM
    and the root provenance, sign only the root digest, and verify the exact
    two-platform topology and producer identity.
-7. Assemble the exact 6 payload assets, create their sorted `SHA256SUMS`, and
+5. Assemble the exact 6 payload assets, create their sorted `SHA256SUMS`, and
    keyless-sign that checksum file into `SHA256SUMS.sigstore.json`.
-8. Publish the draft GitHub Release, then verify its immutable release
+6. Publish the draft GitHub Release, then verify its immutable release
    attestation and every asset.
-9. For a stable release, promote the 8 `latest` tags only after immutable
+7. For a stable release, promote the 8 `latest` tags only after immutable
    release verification succeeds.
 
 Stable and prerelease tags publish the same three-crate SDK catalog.
@@ -217,9 +247,9 @@ Release.
 Do not publish the historical `v0.4.0` tag to crates.io. The first public SDK
 publication starts from an exact, clean `v0.5.0-rc.1` tag after its release
 preparation change has merged to `main`. Create and push the tag, then let the
-credential-free validation, API artifact, and SDK package jobs pass. Keep the
-protected `release` environment unapproved so no workflow requests registry
-credentials or writes release artifacts:
+credential-free validation, API artifact, SDK package, and binary build jobs
+pass. Keep the protected `release` environment unapproved so no workflow
+requests registry credentials or writes release artifacts:
 
 ```console
 git switch main
@@ -374,10 +404,11 @@ Cargo Release's reconciliation model. Zinder invokes only the action's `check`
 and `publish` phases: the existing product tag, artifact-rich GitHub Release,
 and `latest` image promotion remain owned by the Zinder workflow.
 
-Crates are published before the binaries and images are built. If a later job
-fails, rerun the failed jobs: published crates are verified and skipped. If the
-tagged commit cannot build at all, the published crate versions stay, and the
-fix ships as the next version.
+Binaries are built and compared before the approval, so a tag whose binaries
+do not build or reproduce publishes nothing. Rerun the failed jobs when the
+failure is transient, such as a lost runner. Otherwise, merge the fix and
+release it as the next version. If a job after crate publication fails, rerun
+the failed jobs: published crates are verified and skipped.
 
 The workflow creates the public GitHub Release only after all exact image tags
 and trust evidence exist. A failure before publication may leave untagged

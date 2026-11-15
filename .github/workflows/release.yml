@@ -1,10 +1,15 @@
 name: release
 
 # A release tag names the product version already present in Cargo metadata.
-# One review of the release environment gates crate publication, the first
-# credentialed job; every later job depends on it. Exact image tags and
-# API assets are prepared before the GitHub Release is published, and stable
-# `latest` image tags move only after every required artifact succeeds.
+# Credential-free jobs start as soon as the tag validates: API artifacts, SDK
+# readiness, and two independent uncached binary builds per platform. The
+# protected release environment is requested only after both builds of every
+# platform match byte for byte. Its one review gates crate publication, the
+# first credentialed job, and every job that receives an OIDC token or writes
+# to a registry depends on it. Images package the proven archive binaries
+# without compiling again. Exact image tags and API assets are prepared before
+# the GitHub Release is published, and stable `latest` image tags move only
+# after every required artifact succeeds.
 
 on:
   push:
@@ -27,6 +32,7 @@ jobs:
   validate:
     name: validate release identity
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       base_commit: ${{ steps.identity.outputs.base_commit }}
       commit: ${{ steps.identity.outputs.commit }}
@@ -126,6 +132,7 @@ jobs:
     name: build API release artifacts
     needs: validate
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Checkout validated commit
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -172,6 +179,7 @@ jobs:
     name: verify public SDK packages
     needs: validate
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Checkout validated commit
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -244,73 +252,23 @@ jobs:
             exit 1
           fi
 
-  publish-sdk-crates:
-    name: publish public SDK crates
-    needs:
-      - validate
-      - api-docs
-      - sdk-packages
-    environment: release
+  compile:
+    name: compile release binaries (${{ matrix.platform.name }})
+    needs: validate
     permissions:
       contents: read
-      id-token: write
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout validated commit
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          ref: ${{ needs.validate.outputs.commit }}
-
-      - name: Install Rust 1.95
-        uses: dtolnay/rust-toolchain@f133eefe930d61f0d9371efd474daf0125ed3dd1 # 1.95.0
-        with:
-          toolchain: 1.95.0
-
-      - name: Authenticate to crates.io
-        id: crates-io-auth
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
-
-      - name: Publish and verify missing SDK crates
-        uses: ZcashFoundation/cargo-release@34a37595755444456ce0e2d2b1258d9a29c14fac
-        with:
-          phase: publish
-          base-sha: ${{ needs.validate.outputs.base_commit }}
-          target-sha: ${{ needs.validate.outputs.commit }}
-          github-token: ${{ github.token }}
-        env:
-          CARGO_INCREMENTAL: "0"
-          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
-          PROTOC: /does/not/exist
-
-      - name: Verify the published SDK from crates.io
-        timeout-minutes: 30
-        env:
-          SDK_VERSION: ${{ needs.validate.outputs.version }}
-        run: scripts/verify-published-sdk.sh "$SDK_VERSION"
-
-  build:
-    name: build release binaries and image digests (${{ matrix.platform.name }})
-    needs:
-      - validate
-      - publish-sdk-crates
-    permissions:
-      contents: read
-      packages: write
     runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         platform:
           - name: x86_64-v3-unknown-linux-gnu
-            arch: amd64
             docker: linux/amd64
             rust: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             jemalloc_page_size: 4096
           - name: aarch64-unknown-linux-gnu
-            arch: arm64
             docker: linux/arm64
             rust: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
@@ -327,6 +285,7 @@ jobs:
       - name: Checkout validated commit
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          persist-credentials: false
           ref: ${{ needs.validate.outputs.commit }}
 
       - name: Set up Docker Buildx
@@ -387,8 +346,6 @@ jobs:
               done
             '
 
-          # The candidate stays outside the checkout: a file added to the build
-          # context would invalidate the binary stage the image targets reuse.
           candidate_root="${RUNNER_TEMP}/release-candidate"
           mkdir -p "$candidate_root"
           cp "$archive_path" "$candidate_root/"
@@ -416,103 +373,13 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Log in to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # The image targets reuse the binary stage built above: identical build
-      # arguments keep one compilation per platform, and each image is checked
-      # against the archived binaries before its digest is recorded.
-      - name: Build and push image digests
-        env:
-          OWNER_RAW: ${{ github.repository_owner }}
-          PLATFORM_ARCH: ${{ matrix.platform.arch }}
-          RELEASE_IMAGES_JSON: ${{ needs.validate.outputs.release_images }}
-        run: |
-          set -euo pipefail
-
-          source_date_epoch="$(git show -s --format=%ct "$RELEASE_COMMIT")"
-          binary_root="${RUNNER_TEMP}/binary-export/bin"
-          owner_lc="$(printf '%s' "$OWNER_RAW" | tr '[:upper:]' '[:lower:]')"
-          mkdir -p /tmp/digests
-          image_names="$(jq -r '.[]' <<< "$RELEASE_IMAGES_JSON")"
-          while IFS= read -r image_name; do
-            image_ref="ghcr.io/${owner_lc}/${image_name}"
-            metadata_file="/tmp/metadata-${image_name}.json"
-            image_root="${RUNNER_TEMP}/image-root"
-            image_build_args=(
-              --file deploy/Dockerfile
-              --target "$image_name"
-              --platform "$TARGET_PLATFORM"
-              --build-arg "RELEASE_CACHE_SCOPE=${RELEASE_CACHE_SCOPE}"
-              --build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}"
-              --build-arg "ZINDER_BUILD_GIT_COMMIT=${RELEASE_COMMIT}"
-            )
-
-            docker buildx build \
-              "${image_build_args[@]}" \
-              --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
-              --label "org.opencontainers.image.revision=${RELEASE_COMMIT}" \
-              --label "org.opencontainers.image.version=${RELEASE_TAG}" \
-              --label "org.opencontainers.image.licenses=MIT" \
-              --provenance=mode=max \
-              --sbom=true \
-              --output "type=image,name=${image_ref},push-by-digest=true,name-canonical=true,push=true" \
-              --metadata-file "$metadata_file" \
-              .
-
-            digest="$(jq -r '."containerimage.digest"' "$metadata_file")"
-            if [[ -z "$digest" || "$digest" == null ]]; then
-              echo "missing digest for ${image_name}" >&2
-              exit 1
-            fi
-
-            rm -rf "$image_root"
-            docker buildx build \
-              "${image_build_args[@]}" \
-              --provenance=false \
-              --sbom=false \
-              --output "type=local,dest=${image_root}" \
-              .
-            matched_binaries=0
-            while IFS= read -r binary_name; do
-              image_binary="${image_root}/usr/local/bin/${binary_name}"
-              [[ -f "$image_binary" ]] || continue
-              cmp -- "${binary_root}/${binary_name}" "$image_binary" || {
-                echo "${image_name} carries a ${binary_name} that differs from the binary archive" >&2
-                exit 1
-              }
-              matched_binaries=$((matched_binaries + 1))
-            done < <(find "$binary_root" -maxdepth 1 -type f -printf '%f\n' | sort)
-            (( matched_binaries > 0 )) || {
-              echo "${image_name} carries no binary from the binary archive" >&2
-              exit 1
-            }
-            rm -rf "$image_root"
-
-            mkdir -p "/tmp/digests/${image_name}"
-            touch "/tmp/digests/${image_name}/${PLATFORM_ARCH}-${digest#sha256:}"
-          done <<< "$image_names"
-
-      - name: Upload image digests
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: digests-${{ matrix.platform.arch }}
-          path: /tmp/digests/**
-          if-no-files-found: error
-          retention-days: 1
-
   reproduce:
     name: reproduce release binaries (${{ matrix.platform.name }})
-    needs:
-      - validate
-      - publish-sdk-crates
+    needs: validate
     permissions:
       contents: read
     runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -529,6 +396,7 @@ jobs:
       - name: Checkout validated commit
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          persist-credentials: false
           ref: ${{ needs.validate.outputs.commit }}
 
       - name: Set up Docker Buildx
@@ -582,17 +450,16 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  binary-archives:
-    name: verify and attest binary archive (${{ matrix.platform }})
+  compare-binaries:
+    name: compare independent release builds (${{ matrix.platform }})
     needs:
       - validate
-      - build
+      - compile
       - reproduce
     permissions:
-      attestations: write
       contents: read
-      id-token: write
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     strategy:
       fail-fast: false
       matrix:
@@ -623,8 +490,244 @@ jobs:
           diff -u dist/build/binaries.sha256 dist/reproduction/binaries.sha256
           cmp -- "dist/build/${archive_name}" "dist/reproduction/${archive_name}"
 
+          {
+            echo "### Identical ${{ matrix.platform }} builds"
+            echo
+            echo "\`${archive_name}\`: \`$(sha256sum -- "dist/build/${archive_name}" | awk '{print $1}')\`"
+            echo
+            echo '| Binary | SHA-256 |'
+            echo '| --- | --- |'
+            awk '{ printf "| `%s` | `%s` |\n", $2, $1 }' dist/build/binaries.sha256
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish-sdk-crates:
+    name: publish public SDK crates
+    needs:
+      - validate
+      - api-docs
+      - sdk-packages
+      - compare-binaries
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout validated commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@f133eefe930d61f0d9371efd474daf0125ed3dd1 # 1.95.0
+        with:
+          toolchain: 1.95.0
+
+      - name: Authenticate to crates.io
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish and verify missing SDK crates
+        uses: ZcashFoundation/cargo-release@34a37595755444456ce0e2d2b1258d9a29c14fac
+        with:
+          phase: publish
+          base-sha: ${{ needs.validate.outputs.base_commit }}
+          target-sha: ${{ needs.validate.outputs.commit }}
+          github-token: ${{ github.token }}
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+          PROTOC: /does/not/exist
+
+      - name: Verify the published SDK from crates.io
+        timeout-minutes: 30
+        env:
+          SDK_VERSION: ${{ needs.validate.outputs.version }}
+        run: scripts/verify-published-sdk.sh "$SDK_VERSION"
+
+  images:
+    name: package and push release images (${{ matrix.platform.name }})
+    needs:
+      - validate
+      - compare-binaries
+      - publish-sdk-crates
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: x86_64-v3-unknown-linux-gnu
+            arch: amd64
+            docker: linux/amd64
+            runner: ubuntu-latest
+          - name: aarch64-unknown-linux-gnu
+            arch: arm64
+            docker: linux/arm64
+            runner: ubuntu-24.04-arm
+    env:
+      PLATFORM_NAME: ${{ matrix.platform.name }}
+      RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      TARGET_PLATFORM: ${{ matrix.platform.docker }}
+    steps:
+      - name: Checkout validated commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Download proven binary archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-build-${{ matrix.platform.name }}
+          path: ${{ runner.temp }}/release-candidate
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Every image target takes its binaries from the archive that
+      # compare-binaries proved identical to the reproduction, so no image build
+      # compiles, and each image is checked against those binaries before its
+      # digest is recorded.
+      - name: Build and push image digests
+        env:
+          OWNER_RAW: ${{ github.repository_owner }}
+          PLATFORM_ARCH: ${{ matrix.platform.arch }}
+          RELEASE_IMAGES_JSON: ${{ needs.validate.outputs.release_images }}
+        run: |
+          set -euo pipefail
+
+          source_date_epoch="$(git show -s --format=%ct "$RELEASE_COMMIT")"
+          candidate_root="${RUNNER_TEMP}/release-candidate"
+          archive_root="zinder-${RELEASE_VERSION}-${PLATFORM_NAME}"
+          binary_context="${RUNNER_TEMP}/archived-binaries"
+          binary_root="${binary_context}/zinder-binaries"
+          mkdir -p "$binary_root"
+          tar -xzf "${candidate_root}/${archive_root}.tar.gz" \
+            --directory "$binary_root" \
+            --strip-components=2 \
+            "${archive_root}/bin"
+          (cd "$binary_root" && sha256sum --check --strict "${candidate_root}/binaries.sha256")
+          diff -u \
+            <(awk '{print $2}' "${candidate_root}/binaries.sha256" | sort) \
+            <(find "$binary_root" -maxdepth 1 -type f -printf '%f\n' | sort)
+
+          owner_lc="$(printf '%s' "$OWNER_RAW" | tr '[:upper:]' '[:lower:]')"
+          mkdir -p /tmp/digests
+          image_names="$(jq -r '.[]' <<< "$RELEASE_IMAGES_JSON")"
+          while IFS= read -r image_name; do
+            image_ref="ghcr.io/${owner_lc}/${image_name}"
+            metadata_file="/tmp/metadata-${image_name}.json"
+            image_root="${RUNNER_TEMP}/image-root"
+            image_build_args=(
+              --file deploy/Dockerfile
+              --target "$image_name"
+              --platform "$TARGET_PLATFORM"
+              --build-context "zinder-archived-binaries=${binary_context}"
+              --build-arg "ZINDER_BINARIES_SOURCE=zinder-archived-binaries"
+              --build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}"
+            )
+            docker buildx build \
+              "${image_build_args[@]}" \
+              --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+              --label "org.opencontainers.image.revision=${RELEASE_COMMIT}" \
+              --label "org.opencontainers.image.version=${RELEASE_TAG}" \
+              --label "org.opencontainers.image.licenses=MIT" \
+              --provenance=mode=max \
+              --sbom=true \
+              --output "type=image,name=${image_ref},push-by-digest=true,name-canonical=true,push=true" \
+              --metadata-file "$metadata_file" \
+              .
+
+            digest="$(jq -r '."containerimage.digest"' "$metadata_file")"
+            if [[ -z "$digest" || "$digest" == null ]]; then
+              echo "missing digest for ${image_name}" >&2
+              exit 1
+            fi
+
+            rm -rf "$image_root"
+            docker buildx build \
+              "${image_build_args[@]}" \
+              --provenance=false \
+              --sbom=false \
+              --output "type=local,dest=${image_root}" \
+              .
+            matched_binaries=0
+            while IFS= read -r binary_name; do
+              image_binary="${image_root}/usr/local/bin/${binary_name}"
+              [[ -f "$image_binary" ]] || continue
+              cmp -- "${binary_root}/${binary_name}" "$image_binary" || {
+                echo "${image_name} carries a ${binary_name} that differs from the binary archive" >&2
+                exit 1
+              }
+              matched_binaries=$((matched_binaries + 1))
+            done < <(find "$binary_root" -maxdepth 1 -type f -printf '%f\n' | sort)
+            (( matched_binaries > 0 )) || {
+              echo "${image_name} carries no binary from the binary archive" >&2
+              exit 1
+            }
+            rm -rf "$image_root"
+
+            mkdir -p "/tmp/digests/${image_name}"
+            touch "/tmp/digests/${image_name}/${PLATFORM_ARCH}-${digest#sha256:}"
+          done <<< "$image_names"
+
+      - name: Upload image digests
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: digests-${{ matrix.platform.arch }}
+          path: /tmp/digests/**
+          if-no-files-found: error
+          retention-days: 1
+
+  binary-archives:
+    name: attest binary archive (${{ matrix.platform }})
+    needs:
+      - validate
+      - compare-binaries
+      - publish-sdk-crates
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - x86_64-v3-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - name: Download binary archive candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-build-${{ matrix.platform }}
+          path: dist/build
+
+      - name: Select the proven archive and SBOM
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+
           mkdir -p dist/binary-archive
-          cp "dist/build/${archive_name}" \
+          cp "dist/build/zinder-${RELEASE_VERSION}-${{ matrix.platform }}.tar.gz" \
             "dist/build/zinder-${RELEASE_VERSION}-${{ matrix.platform }}.spdx.json" \
             dist/binary-archive/
 
@@ -657,6 +760,7 @@ jobs:
       - validate
       - binary-archives
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Download binary archives
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -693,7 +797,7 @@ jobs:
     name: attest and publish exact ${{ matrix.image }} manifest
     needs:
       - validate
-      - build
+      - images
       - binary-archives
     permissions:
       attestations: write
@@ -701,6 +805,7 @@ jobs:
       id-token: write
       packages: write
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -880,6 +985,7 @@ jobs:
       contents: read
       id-token: write
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Checkout validated commit
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -987,6 +1093,7 @@ jobs:
     permissions:
       contents: write
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Checkout validated commit
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -1051,6 +1158,7 @@ jobs:
     permissions:
       contents: write
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Publish prepared release
         env:
@@ -1078,6 +1186,7 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout validated commit
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -1142,6 +1251,7 @@ jobs:
       contents: read
       packages: write
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout validated commit
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
