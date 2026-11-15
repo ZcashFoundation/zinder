@@ -1322,7 +1322,8 @@ async fn drive_serving_pair_full_block_range(
     let mut sub_read_start = block_range.start.value();
     loop {
         if pair.are_reads_revoked() {
-            return fail_revoked_full_block_range(pair, &block_sender).await;
+            let error = pair.revoked_read_error();
+            return fail_full_block_range(pair, &block_sender, error).await;
         }
         let sub_read_end = sub_read_start
             .saturating_add(FULL_BLOCK_STREAM_SUB_READ_BLOCKS - 1)
@@ -1337,10 +1338,7 @@ async fn drive_serving_pair_full_block_range(
         .await;
         let block_blobs = match sub_read {
             Ok(block_blobs) => block_blobs,
-            Err(error) => {
-                let _ = block_sender.send(Err(error)).await;
-                return;
-            }
+            Err(error) => return fail_full_block_range(pair, &block_sender, error).await,
         };
         // A consumer that stops reading blocks this send. Revocation ends the
         // range so the stalled stream cannot keep a released pair open.
@@ -1354,54 +1352,58 @@ async fn drive_serving_pair_full_block_range(
             ) => Some(forwarded),
         };
         match forwarded {
-            Some(true) if sub_read_end == last_height => return,
-            Some(true) => sub_read_start = sub_read_end.saturating_add(1),
-            Some(false) => return,
-            None => return fail_revoked_full_block_range(pair, &block_sender).await,
+            Some(Ok(true)) if sub_read_end == last_height => return,
+            Some(Ok(true)) => sub_read_start = sub_read_end.saturating_add(1),
+            Some(Ok(false)) => return,
+            Some(Err(error)) => return fail_full_block_range(pair, &block_sender, error).await,
+            None => {
+                let error = pair.revoked_read_error();
+                return fail_full_block_range(pair, &block_sender, error).await;
+            }
         }
     }
 }
 
-/// Releases `pair` and then ends a full-block range whose reads were revoked.
-async fn fail_revoked_full_block_range(
+/// Releases `pair` and then ends a full-block range with `error`.
+///
+/// The pair is dropped first because the send can wait on a stalled client.
+async fn fail_full_block_range(
     pair: Arc<WalletServingReadPair>,
     block_sender: &mpsc::Sender<Result<zinder_core::BlockBlobArtifact, QueryError>>,
+    error: QueryError,
 ) {
-    let error = pair.revoked_read_error();
     drop(pair);
     let _ = block_sender.send(Err(error)).await;
 }
 
+/// Sends the blocks of one sub-read in height order.
+///
+/// Returns `Ok(false)` once the client has gone away, and the failure that
+/// ends the range when the sub-read is short or a block is missing.
 async fn forward_serving_pair_full_block_sub_range(
     block_sender: &mpsc::Sender<Result<zinder_core::BlockBlobArtifact, QueryError>>,
     sub_range: BlockHeightRange,
     block_blobs: Vec<Option<zinder_core::BlockBlobArtifact>>,
-) -> bool {
+) -> Result<bool, QueryError> {
     let expected_count = sub_range.into_iter().len();
     if block_blobs.len() != expected_count {
-        let _ = block_sender
-            .send(Err(QueryError::ArtifactCorrupt {
-                family: ArtifactFamily::BlockBlob,
-                reason: format!(
-                    "full-block range returned {} rows for {expected_count} requested heights",
-                    block_blobs.len()
-                ),
-            }))
-            .await;
-        return false;
+        return Err(QueryError::ArtifactCorrupt {
+            family: ArtifactFamily::BlockBlob,
+            reason: format!(
+                "full-block range returned {} rows for {expected_count} requested heights",
+                block_blobs.len()
+            ),
+        });
     }
     for (height, block_blob) in sub_range.into_iter().zip(block_blobs) {
         let Some(block_blob) = block_blob else {
-            let _ = block_sender
-                .send(Err(artifact_unavailable(ArtifactFamily::BlockBlob, height)))
-                .await;
-            return false;
+            return Err(artifact_unavailable(ArtifactFamily::BlockBlob, height));
         };
         if block_sender.send(Ok(block_blob)).await.is_err() {
-            return false;
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
 }
 
 /// Classifies one outpoint from the wallet projection's output families.
@@ -1523,4 +1525,133 @@ fn tree_state_from_checkpoint(
         block_time_seconds: checkpoint.block_time_seconds,
         payload_bytes,
     })
+}
+
+#[cfg(test)]
+mod full_block_range_tests {
+    use std::{error::Error, sync::Arc, time::Duration};
+
+    use zinder_core::{BlockHeight, BlockHeightRange, Network};
+    use zinder_store::RawBlobRetention;
+    use zinder_testkit::{
+        ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations,
+    };
+
+    use crate::{
+        FULL_BLOCK_STREAM_CHANNEL_CAPACITY, QueryError, WalletQueryApi, WalletServingPairSlot,
+        WalletServingQuery, WalletServingReadPair,
+    };
+
+    /// Holders of a test pair while no read holds it: the test and the slot.
+    const IDLE_PAIR_HOLDERS: usize = 2;
+
+    /// A missing-block failure must not keep the pair while it waits for room.
+    ///
+    /// The range runs past the retained blocks, which fill the channel of a
+    /// client that reads nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failing_full_block_range_releases_its_pair_before_a_stalled_client_reads()
+    -> Result<(), Box<dyn Error>> {
+        let retained_blocks = u32::try_from(FULL_BLOCK_STREAM_CHANNEL_CAPACITY)?;
+        let fixture = FullBlockPair::with_blocks(retained_blocks)?;
+        let mut stream = fixture
+            .query
+            .full_blocks_in_range(
+                BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(8)),
+                None,
+            )
+            .await?;
+
+        fixture.wait_until_released().await?;
+
+        for _ in 0..retained_blocks {
+            stream
+                .blocks
+                .recv()
+                .await
+                .ok_or("the range ended early")??;
+        }
+        assert!(matches!(
+            stream.blocks.recv().await,
+            Some(Err(QueryError::ArtifactUnavailable { .. }))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revoking_reads_releases_a_stalled_full_block_range() -> Result<(), Box<dyn Error>> {
+        let block_count = 16;
+        let fixture = FullBlockPair::with_blocks(block_count)?;
+        let mut stream = fixture
+            .query
+            .full_blocks_in_range(
+                BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(block_count)),
+                None,
+            )
+            .await?;
+        let epoch = stream.chain_epoch.id;
+
+        assert!(fixture.pair.revoke_reads());
+        fixture.wait_until_released().await?;
+
+        let mut delivered = 0;
+        let failure = loop {
+            match stream.blocks.recv().await {
+                Some(Ok(_)) => delivered += 1,
+                Some(Err(error)) => break error,
+                None => return Err("a revoked range ended as if complete".into()),
+            }
+        };
+        assert!(
+            matches!(
+                failure,
+                QueryError::ChainEpochPinUnavailable { chain_epoch_id } if chain_epoch_id == epoch
+            ),
+            "unexpected failure {failure:?}"
+        );
+        assert!(delivered < block_count);
+        Ok(())
+    }
+
+    struct FullBlockPair {
+        pair: Arc<WalletServingReadPair>,
+        query: WalletServingQuery<()>,
+        _store: WalletServingStoreFixture,
+    }
+
+    impl FullBlockPair {
+        fn with_blocks(block_count: u32) -> Result<Self, Box<dyn Error>> {
+            let activations = sample_regtest_upgrade_activations();
+            let chain = ChainFixture::new(Network::ZcashRegtest)
+                .with_raw_blob_retention(RawBlobRetention::All)
+                .extend_blocks(block_count);
+            let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+            let (canonical, wallet) = store.take_readers()?;
+            let pair = Arc::new(WalletServingReadPair::new(
+                Arc::new(canonical),
+                Arc::new(wallet),
+            )?);
+            let query = WalletServingQuery::from_serving_pair_slot(
+                WalletServingPairSlot::new(Arc::clone(&pair)),
+                (),
+                Arc::new(activations),
+            );
+            Ok(Self {
+                pair,
+                query,
+                _store: store,
+            })
+        }
+
+        async fn wait_until_released(&self) -> Result<(), Box<dyn Error>> {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while Arc::strong_count(&self.pair) > IDLE_PAIR_HOLDERS {
+                if tokio::time::Instant::now() > deadline {
+                    return Err("the full-block range kept its pair".into());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Ok(())
+        }
+    }
 }
