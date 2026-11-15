@@ -96,6 +96,20 @@ pub fn classify_canonical_writer_fence(
     if status.network_name != encode_zinder_native_chain_name(network) {
         return CanonicalFenceRelation::Diverged(CanonicalFenceDivergence::NetworkMismatch);
     }
+    compare_canonical_writer_fences(writer, local)
+}
+
+/// Compares a fence the writer attests with a local secondary fence, both in
+/// wire form, under the ordering rules of [`classify_canonical_writer_fence`].
+///
+/// Use this for a writer fence that carries no network of its own, such as
+/// the bound of a retained-event page; [`classify_canonical_writer_fence`]
+/// checks the network of a writer-status response first.
+#[must_use]
+pub fn compare_canonical_writer_fences(
+    writer: &CanonicalWriterFence,
+    local: &CanonicalWriterFence,
+) -> CanonicalFenceRelation {
     if writer == local {
         return CanonicalFenceRelation::Matches;
     }
@@ -173,6 +187,18 @@ pub trait CanonicalFenceProbe {
     /// Observes one round in which the secondary trailed the writer, `elapsed`
     /// after convergence started.
     fn secondary_behind(&mut self, _lag: CanonicalFenceLag, _elapsed: Duration) {}
+
+    /// Returns whether convergence may end on a round in which the caught-up
+    /// secondary trails the writer by `lag`, with
+    /// [`CanonicalFenceConvergence::Trailing`].
+    ///
+    /// A reader that authenticates each retained event against the writer
+    /// before it uses that event can work from a secondary the writer has
+    /// moved past. The default requires the writer to attest the secondary's
+    /// exact fence.
+    fn accepts_trailing(&self, _lag: CanonicalFenceLag) -> bool {
+        false
+    }
 }
 
 /// Successful end of [`converge_on_canonical_writer_fence`].
@@ -184,6 +210,10 @@ pub enum CanonicalFenceConvergence {
     /// Convergence does not interpret a halt or an unconfirmed tip in that
     /// status; a serving reader passes it to [`WriterAttestation::observe`].
     Converged(Box<CanonicalWriterStatusResponse>),
+    /// The probe accepted a round in which the caught-up secondary trailed
+    /// the writer by this lag. The writer has not attested the secondary's
+    /// fence.
+    Trailing(CanonicalFenceLag),
     /// Cancellation fired while the secondary was still behind.
     Cancelled,
 }
@@ -206,9 +236,10 @@ pub enum CanonicalFenceConvergenceError<ProbeError> {
 ///
 /// The writer keeps committing while a secondary converges, so lag is retried
 /// with capped exponential backoff until the policy's deadline or attempt
-/// bound. A matching fence whose network-upgrade schedule revision the probe
-/// has not caught up to is retried the same way. Divergence fails on the
-/// round that observes it.
+/// bound, unless the probe accepts the lag of a round, which ends convergence
+/// with [`CanonicalFenceConvergence::Trailing`]. A matching fence whose
+/// network-upgrade schedule revision the probe has not caught up to is
+/// retried like lag. Divergence fails on the round that observes it.
 ///
 /// Each writer-status read races the deadline and `cancel`: a read still
 /// pending when either fires is dropped, so a stalled writer cannot hold the
@@ -263,6 +294,9 @@ where
                 }
                 CanonicalFenceRelation::SecondaryBehind(lag) => {
                     probe.secondary_behind(lag, started.elapsed());
+                    if probe.accepts_trailing(lag) {
+                        return Ok(CanonicalFenceConvergence::Trailing(lag));
+                    }
                 }
             }
         }
@@ -410,8 +444,8 @@ mod tests {
     use super::{
         CanonicalFenceConvergence, CanonicalFenceConvergenceError, CanonicalFenceConvergencePolicy,
         CanonicalFenceDivergence, CanonicalFenceLag, CanonicalFenceProbe, CanonicalFenceRelation,
-        WriterAttestation, classify_canonical_writer_fence, converge_on_canonical_writer_fence,
-        writer_attests_network_upgrade_schedule,
+        WriterAttestation, classify_canonical_writer_fence, compare_canonical_writer_fences,
+        converge_on_canonical_writer_fence, writer_attests_network_upgrade_schedule,
     };
     use crate::{ReadinessCause, ReadinessState};
 
@@ -464,6 +498,7 @@ mod tests {
         catch_ups: u32,
         schedule_lag_catch_ups: u32,
         behind_rounds: Vec<CanonicalFenceLag>,
+        accepts_trailing: bool,
     }
 
     impl ScriptedProbe {
@@ -475,6 +510,7 @@ mod tests {
                 catch_ups: 0,
                 schedule_lag_catch_ups: 0,
                 behind_rounds: Vec::new(),
+                accepts_trailing: false,
             }
         }
     }
@@ -506,6 +542,10 @@ mod tests {
 
         fn secondary_behind(&mut self, lag: CanonicalFenceLag, _elapsed: Duration) {
             self.behind_rounds.push(lag);
+        }
+
+        fn accepts_trailing(&self, _lag: CanonicalFenceLag) -> bool {
+            self.accepts_trailing
         }
     }
 
@@ -750,6 +790,69 @@ mod tests {
             Err(CanonicalFenceConvergenceError::DidNotConverge)
         ));
         assert!(probe.catch_ups > 1);
+    }
+
+    #[tokio::test]
+    async fn an_accepted_trailing_round_ends_convergence_during_a_block_burst() {
+        let mut probe = ScriptedProbe::new(None);
+        probe.accepts_trailing = true;
+
+        let outcome = converge_on_canonical_writer_fence(
+            &mut probe,
+            NETWORK,
+            fast_policy(Duration::from_millis(30)),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            Ok(CanonicalFenceConvergence::Trailing(CanonicalFenceLag {
+                lag_chain_epochs: 1,
+                secondary_visible_tip_height: 1,
+                writer_visible_tip_height: 2,
+            }))
+        ));
+        assert_eq!(probe.catch_ups, 1);
+    }
+
+    #[tokio::test]
+    async fn accepting_trailing_still_waits_for_the_writer_admitted_schedule_revision() {
+        let mut probe = ScriptedProbe::new(Some(0));
+        probe.schedule_lag_catch_ups = 2;
+        probe.accepts_trailing = true;
+
+        let outcome = converge_on_canonical_writer_fence(
+            &mut probe,
+            NETWORK,
+            fast_policy(Duration::from_secs(5)),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            Ok(CanonicalFenceConvergence::Converged(_))
+        ));
+        assert_eq!(probe.catch_ups, 3);
+    }
+
+    #[test]
+    fn writer_fence_comparison_applies_the_status_ordering_rules() {
+        let local = fence(5, 1);
+
+        assert_eq!(
+            compare_canonical_writer_fences(&local, &local),
+            CanonicalFenceRelation::Matches
+        );
+        assert_eq!(
+            compare_canonical_writer_fences(&fence(8, 2), &local),
+            classify_canonical_writer_fence(&status(fence(8, 2)), NETWORK, &local)
+        );
+        assert!(matches!(
+            compare_canonical_writer_fences(&fence(4, 1), &local),
+            CanonicalFenceRelation::Diverged(CanonicalFenceDivergence::FenceMismatch { .. })
+        ));
     }
 
     #[tokio::test]

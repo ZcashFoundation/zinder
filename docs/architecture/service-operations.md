@@ -101,14 +101,35 @@ revision without moving its fence, so a matching fence with an older revision
 is retried like lag. Compatibility accepts the matching fence and opens its
 next generation with the schedule the writer reports.
 
-The runtimes differ in their bounds. Projector retries until
-`projector.fence_convergence_timeout_seconds`, starting at 50 ms and doubling
-to 1 s, and reports `syncing` once lag lasts longer than one second, except
-that a ready projector whose wallet trails the writer by at most one block stays
-`ready` as described in [Projector](#projector). Query and
-compatibility stop at their configured pair-convergence attempts or timeout,
-whichever comes first, and wait the smaller of the catch-up interval and
-100 ms between attempts.
+The runtimes differ in their bounds. Query and compatibility need the
+writer's exact fence for every serving pair they publish. They stop at their
+configured pair-convergence attempts or timeout, whichever comes first, and
+wait the smaller of the catch-up interval and 100 ms between attempts.
+
+The projector needs only the retained events its wallet has not applied yet.
+Once its caught-up secondary holds such events, it stops converging even while
+the writer is ahead. A writer that keeps committing, as it does during a burst
+of blocks, would otherwise keep the wallet from advancing until the burst ends.
+This applies from startup whenever a published wallet resumes following, so a
+restart during a burst resumes at once. Only a fresh wallet build waits for the
+writer to attest the secondary's exact fence, because it binds its build plan
+to that fence.
+The writer's retained-event page still authenticates every event before the
+wallet applies it: the page's bounding fence must equal the secondary's fence
+or be strictly ahead of it in both event sequence and chain epoch, and the
+secondary's events must match the first events of the page field for field.
+
+While the secondary holds nothing new for the wallet, the projector retries
+with backoff from 50 ms, doubling to 1 s, and treats lag that lasts longer than
+one second as trailing the writer, as described in [Projector](#projector).
+An attempt that lasts `projector.fence_convergence_timeout_seconds` without
+converging logs `canonical_secondary_behind_writer`, reports `replica_lagging`
+with the last lag it observed, or `writer_status_unavailable` when no writer
+status classified the secondary in that attempt, and starts another attempt.
+Each such attempt also renews the wallet's canonical retention lease to its
+full duration, so a long wait neither lets the lease expire nor lets the
+writer prune the events the wallet still needs. Lag never stops the projector;
+divergence still does.
 
 A parked writer and a writer that has not confirmed its tip since it reopened
 keep attesting their frozen fence, so convergence still succeeds. The
@@ -196,17 +217,26 @@ continuous following at an authenticated source position. An individually
 healthy canonical or wallet store is insufficient if their source identities
 do not agree.
 
-A block does not withdraw readiness. Each new block leaves the wallet one block
-behind the canonical fence until the projector applies it, so a ready projector
-whose wallet trails the fence by at most one block, or follows a replacement at
-the same height, stays `ready` and reports the fence height as its target. The
-grace lasts 30 seconds and restarts whenever the wallet applies a block, so a
-projector that stays one block behind while it keeps applying blocks remains
-`ready`. The projector reports `syncing` when its wallet trails by more than one
-block, when 30 seconds pass without the wallet applying a block, or when it was
-not ready as the trail began. The grace expires on its own deadline, even while
-the projector waits on a slow request or a large transition. Every height it
-reports is the wallet's authenticated height, never the canonical secondary's.
+Block arrival does not withdraw readiness. Each new block leaves the wallet
+behind the writer until the projector applies it, and a burst of blocks keeps
+it behind until the projector has applied the last of them. A ready projector
+whose wallet trails the writer, by any number of blocks or by a replacement at
+the same height, stays `ready` and reports the writer's height as its target
+while both of these hold:
+
+- the wallet applies a block at least every 30 seconds; and
+- less than 2 minutes have passed since the wallet fell behind.
+
+The projector reports `syncing` once either bound passes, or when it was not
+ready as the trail began, and stays unready until its wallet matches a fence
+the writer attests. Catching up ends the trail, so the next block starts a new
+one. Both bounds expire on their own deadlines, even while the projector waits
+on a slow request or a large transition. A canonical secondary that cannot
+reach the writer within a convergence attempt reports `replica_lagging`
+instead, until it gives the wallet a block to apply, as described in
+[Canonical fence attestation](#canonical-fence-attestation). Every height the
+projector reports is the wallet's authenticated height, never the canonical
+secondary's.
 
 ### Native wallet query
 

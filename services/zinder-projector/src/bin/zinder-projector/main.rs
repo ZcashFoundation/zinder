@@ -14,10 +14,10 @@ use zinder_core::{
 };
 use zinder_runtime::{
     CanonicalFenceConvergence, CanonicalFenceConvergenceError, CanonicalFenceConvergencePolicy,
-    CanonicalFenceLag, CanonicalFenceProbe, OpsServer, Readiness, ReadinessState,
-    cancel_on_terminating_signal, converge_on_canonical_writer_fence, expected_writer_fence,
-    host_cpu_meets_compiled_baseline, install_tracing_subscriber, spawn_ops_endpoint,
-    writer_attests_network_upgrade_schedule,
+    CanonicalFenceLag, CanonicalFenceProbe, CanonicalFenceRelation, OpsServer, Readiness,
+    ReadinessState, cancel_on_terminating_signal, compare_canonical_writer_fences,
+    converge_on_canonical_writer_fence, expected_writer_fence, host_cpu_meets_compiled_baseline,
+    install_tracing_subscriber, spawn_ops_endpoint, writer_attests_network_upgrade_schedule,
 };
 use zinder_source::{ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::{
@@ -266,10 +266,27 @@ async fn run_owned_projector(
         config.projector_control.bearer_token.as_ref(),
     )
     .await?;
-    let Some(canonical_ready) = converge_on_writer_fence(
+    let resumable_wallet = open_resumable_wallet(config, canonical.reorg_policy())?;
+    let resumable_source = resumable_wallet
+        .as_ref()
+        .map(|wallet| WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence()));
+    let mut startup_readiness = resumable_source.map_or_else(
+        || FollowingReadiness::new(readiness),
+        |wallet_source| {
+            FollowingReadiness::for_wallet(
+                readiness,
+                wallet_source.source_position().tip.height.value(),
+            )
+        },
+    );
+    // Following authenticates every event past a resumed wallet against the
+    // writer's page, so only a fresh build needs the writer's exact fence.
+    let Some(writer_fence) = converge_on_writer_fence(
         &mut canonical,
         &mut canonical_control,
-        &mut FollowingReadiness::new(readiness),
+        &mut startup_readiness,
+        resumable_source.map(|wallet_source| wallet_source.source_position().event_sequence),
+        None,
         &cancel,
         config.fence_convergence_timeout,
     )
@@ -277,90 +294,58 @@ async fn run_owned_projector(
     else {
         return Ok(());
     };
-    let expected_wallet_source = canonical_source_identity(&canonical_ready);
 
-    if config.wallet_path.exists() {
-        match RocksDbWalletStore::open_ready_for_following(
-            &config.wallet_path,
-            config.network,
-            config.wallet_rocksdb_budget,
-        ) {
-            Ok(mut wallet) => {
-                raise_wallet_reorg_depth(&mut wallet, canonical.reorg_policy())?;
-                let wallet_source =
-                    WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
-                match admit_resumed_following(
-                    &mut canonical_control,
-                    wallet_source,
-                    config.lease_duration,
-                )
-                .await?
-                {
-                    ResumedFollowingAdmission::Anchored(canonical_lease) => {
-                        tracing::info!(
-                            target: "zinder::projector",
-                            event = "wallet_projection_following_resumed",
-                            height = wallet_source.source_position().tip.height.value(),
-                            event_sequence = wallet_source.source_position().event_sequence,
-                            "resuming wallet projection from its persisted authenticated cursor"
-                        );
-                        return run_continuous_wallet_following(
-                            config,
-                            readiness,
-                            cancel,
-                            canonical,
-                            canonical_control,
-                            wallet,
-                            canonical_lease,
-                        )
-                        .await;
-                    }
-                    ResumedFollowingAdmission::BootstrapFirstRetainedEvent {
-                        first_retained_event_sequence,
-                    } => {
-                        tracing::info!(
-                            target: "zinder::projector",
-                            event = "wallet_projection_following_bootstrap",
-                            height = wallet_source.source_position().tip.height.value(),
-                            event_sequence = wallet_source.source_position().event_sequence,
-                            first_retained_event_sequence,
-                            "bootstrapping following from the one retained event after the persisted wallet cursor"
-                        );
-                        return bootstrap_resumed_wallet_following(
-                            config,
-                            readiness,
-                            cancel,
-                            canonical,
-                            canonical_control,
-                            wallet,
-                            first_retained_event_sequence,
-                        )
-                        .await;
-                    }
-                }
-            }
-            Err(zinder_wallet_rocksdb::RocksDbWalletError::StoreNotReady { .. }) => {
-                // A crashed build still holds its lease under this owner,
-                // which may discard it at once; another owner must wait for
-                // the lease to expire.
-                RocksDbWalletBuildStore::open(
-                    &config.wallet_path,
-                    config.network,
-                    config.wallet_rocksdb_budget,
-                )?
-                .discard_unpublished(
-                    WalletProjectionBuildOwner::from_bytes(config.build_owner),
-                    UnixTimestampMillis::now(),
-                )?;
+    if let Some(wallet) = resumable_wallet {
+        let wallet_source =
+            WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
+        match admit_resumed_following(&mut canonical_control, wallet_source, config.lease_duration)
+            .await?
+        {
+            ResumedFollowingAdmission::Anchored(canonical_lease) => {
                 tracing::info!(
                     target: "zinder::projector",
-                    event = "wallet_projection_unpublished_build_discarded",
-                    "discarded an unpublished wallet build; constructing again from the current canonical fence"
+                    event = "wallet_projection_following_resumed",
+                    height = wallet_source.source_position().tip.height.value(),
+                    event_sequence = wallet_source.source_position().event_sequence,
+                    "resuming wallet projection from its persisted authenticated cursor"
                 );
+                return run_continuous_wallet_following(
+                    config,
+                    readiness,
+                    cancel,
+                    canonical,
+                    canonical_control,
+                    wallet,
+                    canonical_lease,
+                )
+                .await;
             }
-            Err(error) => return Err(error.into()),
+            ResumedFollowingAdmission::BootstrapFirstRetainedEvent {
+                first_retained_event_sequence,
+            } => {
+                tracing::info!(
+                    target: "zinder::projector",
+                    event = "wallet_projection_following_bootstrap",
+                    height = wallet_source.source_position().tip.height.value(),
+                    event_sequence = wallet_source.source_position().event_sequence,
+                    first_retained_event_sequence,
+                    "bootstrapping following from the one retained event after the persisted wallet cursor"
+                );
+                return bootstrap_resumed_wallet_following(
+                    config,
+                    readiness,
+                    cancel,
+                    canonical,
+                    canonical_control,
+                    wallet,
+                    first_retained_event_sequence,
+                )
+                .await;
+            }
         }
     }
+    let canonical_ready = *writer_fence.secondary();
+    let expected_wallet_source = canonical_source_identity(&canonical_ready);
 
     readiness.set(ReadinessState::syncing(
         Some(canonical_ready.visible_block_count),
@@ -594,10 +579,18 @@ async fn run_continuous_wallet_following(
             return Ok(());
         }
 
-        let Some(canonical_ready) = converge_on_writer_fence(
+        let wallet_source =
+            WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
+        let wallet_event_sequence = wallet_source.source_position().event_sequence;
+        let Some(writer_fence) = converge_on_writer_fence(
             &mut canonical,
             &mut canonical_control,
             &mut following_readiness,
+            Some(wallet_event_sequence),
+            Some(ConvergenceLease {
+                lease: &mut canonical_lease,
+                duration: config.lease_duration,
+            }),
             &cancel,
             config.fence_convergence_timeout,
         )
@@ -605,10 +598,10 @@ async fn run_continuous_wallet_following(
         else {
             return Ok(());
         };
-        let target_source = canonical_source_identity(&canonical_ready);
+        let target_source = canonical_source_identity(writer_fence.secondary());
         let target_fence = canonical.event_fence();
-        let wallet_source =
-            WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
+        // A trailing secondary always holds events past the wallet, so only
+        // an attested fence can equal the wallet's.
         if wallet_source == target_source {
             let renewed = renew_following_retention_lease_if_due(
                 &mut canonical_control,
@@ -618,10 +611,15 @@ async fn run_continuous_wallet_following(
             )
             .await?;
             if renewed {
-                let Some(post_renewal_canonical) = converge_on_writer_fence(
+                let Some(post_renewal_fence) = converge_on_writer_fence(
                     &mut canonical,
                     &mut canonical_control,
                     &mut following_readiness,
+                    Some(wallet_event_sequence),
+                    Some(ConvergenceLease {
+                        lease: &mut canonical_lease,
+                        duration: config.lease_duration,
+                    }),
                     &cancel,
                     config.fence_convergence_timeout,
                 )
@@ -629,7 +627,7 @@ async fn run_continuous_wallet_following(
                 else {
                     return Ok(());
                 };
-                if wallet_source != canonical_source_identity(&post_renewal_canonical) {
+                if wallet_source != canonical_source_identity(post_renewal_fence.secondary()) {
                     continue;
                 }
             }
@@ -660,7 +658,7 @@ async fn run_continuous_wallet_following(
 
         following_readiness.trailing(
             wallet_source.source_position().tip.height.value(),
-            target_source.source_position().tip.height.value(),
+            writer_fence.writer_tip_height(),
         );
         let _renewed = renew_following_retention_lease_if_due(
             &mut canonical_control,
@@ -678,7 +676,7 @@ async fn run_continuous_wallet_following(
         )
         .await
         {
-            Ok(RetainedEventPageValidation::RetryAfterWriterAdvance) => {
+            Ok(RetainedEventPageValidation::Reconverge) => {
                 if wait_for_follow_poll(&cancel).await {
                     return Ok(());
                 }
@@ -955,10 +953,12 @@ async fn bootstrap_resumed_wallet_following(
         if cancel.is_cancelled() {
             return Ok(());
         }
-        let Some(canonical_ready) = converge_on_writer_fence(
+        let Some(writer_fence) = converge_on_writer_fence(
             &mut canonical,
             &mut canonical_control,
             &mut following_readiness,
+            Some(wallet_source.source_position().event_sequence),
+            None,
             &cancel,
             config.fence_convergence_timeout,
         )
@@ -966,8 +966,7 @@ async fn bootstrap_resumed_wallet_following(
         else {
             return Ok(());
         };
-        let target_source = canonical_source_identity(&canonical_ready);
-        set_following_syncing(readiness, wallet_source, target_source);
+        set_following_syncing(readiness, wallet_source, writer_fence.writer_tip_height());
         let retained_events = match fetch_retained_event_page_to_target(
             &mut canonical_control,
             &canonical,
@@ -976,7 +975,7 @@ async fn bootstrap_resumed_wallet_following(
         )
         .await
         {
-            Ok(RetainedEventPageValidation::RetryAfterWriterAdvance) => {
+            Ok(RetainedEventPageValidation::Reconverge) => {
                 if wait_for_follow_poll(&cancel).await {
                     return Ok(());
                 }
@@ -1015,10 +1014,15 @@ async fn bootstrap_resumed_wallet_following(
         if cancel.is_cancelled() {
             return Ok(());
         }
-        let Some(canonical_ready) = converge_on_writer_fence(
+        let Some(writer_fence) = converge_on_writer_fence(
             &mut canonical,
             &mut canonical_control,
             &mut following_readiness,
+            Some(wallet_source.source_position().event_sequence),
+            Some(ConvergenceLease {
+                lease: &mut bootstrap_lease,
+                duration: config.lease_duration,
+            }),
             &cancel,
             config.fence_convergence_timeout,
         )
@@ -1026,8 +1030,7 @@ async fn bootstrap_resumed_wallet_following(
         else {
             return Ok(());
         };
-        let target_source = canonical_source_identity(&canonical_ready);
-        set_following_syncing(readiness, wallet_source, target_source);
+        set_following_syncing(readiness, wallet_source, writer_fence.writer_tip_height());
         let retained_events = match fetch_retained_event_page_to_target(
             &mut canonical_control,
             &canonical,
@@ -1036,7 +1039,7 @@ async fn bootstrap_resumed_wallet_following(
         )
         .await
         {
-            Ok(RetainedEventPageValidation::RetryAfterWriterAdvance) => {
+            Ok(RetainedEventPageValidation::Reconverge) => {
                 if wait_for_follow_poll(&cancel).await {
                     return Ok(());
                 }
@@ -1134,15 +1137,56 @@ fn bootstrap_first_retained_event_source(
 fn set_following_syncing(
     readiness: &Readiness,
     wallet_source: WalletCanonicalSourceIdentity,
-    target_source: WalletCanonicalSourceIdentity,
+    target_height: u32,
 ) {
     let wallet_height = wallet_source.source_position().tip.height.value();
-    let target_height = target_source.source_position().tip.height.value();
     readiness.set(ReadinessState::syncing(
         target_height.checked_sub(wallet_height).map(u64::from),
         Some(wallet_height),
         Some(target_height),
     ));
+}
+
+/// Opens the published wallet the projector resumes following, or returns
+/// `None` when the projector must construct one.
+fn open_resumable_wallet(
+    config: &config::ProjectorConfig,
+    canonical_reorg_policy: CanonicalReorgPolicy,
+) -> Result<Option<RocksDbWalletFollowingStore>, ProjectorError> {
+    if !config.wallet_path.exists() {
+        return Ok(None);
+    }
+    match RocksDbWalletStore::open_ready_for_following(
+        &config.wallet_path,
+        config.network,
+        config.wallet_rocksdb_budget,
+    ) {
+        Ok(mut wallet) => {
+            raise_wallet_reorg_depth(&mut wallet, canonical_reorg_policy)?;
+            Ok(Some(wallet))
+        }
+        Err(zinder_wallet_rocksdb::RocksDbWalletError::StoreNotReady { .. }) => {
+            // A crashed build still holds its lease under this owner, which
+            // may discard it at once; another owner must wait for the lease
+            // to expire.
+            RocksDbWalletBuildStore::open(
+                &config.wallet_path,
+                config.network,
+                config.wallet_rocksdb_budget,
+            )?
+            .discard_unpublished(
+                WalletProjectionBuildOwner::from_bytes(config.build_owner),
+                UnixTimestampMillis::now(),
+            )?;
+            tracing::info!(
+                target: "zinder::projector",
+                event = "wallet_projection_unpublished_build_discarded",
+                "discarded an unpublished wallet build; constructing again from the current canonical fence"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Binds a resumed wallet's undo depth to the canonical effective window,
@@ -1555,21 +1599,72 @@ fn require_pre_promotion_follower_admission(
     Ok(())
 }
 
-/// Returns `None` when `cancel` fires before the fence converges.
+/// Where the canonical secondary stands against the writer after
+/// convergence.
+#[derive(Clone, Copy, Debug)]
+enum WriterFence {
+    /// The writer attests the secondary's exact fence.
+    Attested(CanonicalStoreReadyEvidence),
+    /// The writer has moved past the secondary, which still holds retained
+    /// events past the wallet. Each of them is authenticated against the
+    /// writer's retained-event page before the wallet applies it.
+    Trailing {
+        secondary: CanonicalStoreReadyEvidence,
+        writer_tip_height: u32,
+    },
+}
+
+impl WriterFence {
+    const fn secondary(&self) -> &CanonicalStoreReadyEvidence {
+        match self {
+            Self::Attested(secondary) | Self::Trailing { secondary, .. } => secondary,
+        }
+    }
+
+    const fn writer_tip_height(&self) -> u32 {
+        match self {
+            Self::Attested(secondary) => secondary.visible_tip.height.value(),
+            Self::Trailing {
+                writer_tip_height, ..
+            } => *writer_tip_height,
+        }
+    }
+}
+
+/// Converges the canonical secondary on the writer, returning `None` when
+/// `cancel` fires first.
+///
+/// With `wallet_event_sequence`, a round whose caught-up secondary holds
+/// events past the wallet ends convergence even while the writer is ahead,
+/// so a burst of blocks cannot keep the wallet from advancing. Without it the
+/// writer must attest the secondary's exact fence. A deadline that passes
+/// first reports the secondary as stale, renews `lease`, and
+/// starts another attempt.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "convergence keeps the secondary, writer client, readiness owner, wallet position, retention lease, cancellation, and deadline explicit"
+)]
 async fn converge_on_writer_fence(
     canonical: &mut RocksDbCanonicalSecondary,
     control: &mut CanonicalWriterControlClient,
     readiness: &mut FollowingReadiness<'_>,
+    wallet_event_sequence: Option<u64>,
+    lease: Option<ConvergenceLease<'_>>,
     cancel: &CancellationToken,
     timeout: Duration,
-) -> Result<Option<CanonicalStoreReadyEvidence>, ProjectorError> {
+) -> Result<Option<WriterFence>, ProjectorError> {
     let network = canonical.network();
-    let outcome = converge_on_canonical_writer_fence(
-        &mut LiveWriterFenceProbe {
-            canonical,
-            control,
-            readiness,
-        },
+    let mut probe = LiveWriterFenceProbe {
+        canonical,
+        control,
+        readiness,
+        wallet_event_sequence,
+        lease,
+        timeout,
+        last_lag: None,
+    };
+    let outcome = converge_without_deadline_exit(
+        &mut probe,
         network,
         CanonicalFenceConvergencePolicy {
             timeout,
@@ -1579,24 +1674,123 @@ async fn converge_on_writer_fence(
         },
         cancel,
     )
-    .await;
-    match outcome {
-        Ok(CanonicalFenceConvergence::Converged(_)) => Ok(Some(canonical.ready_evidence())),
-        Ok(CanonicalFenceConvergence::Cancelled) => Ok(None),
-        Err(CanonicalFenceConvergenceError::Probe(error)) => Err(error),
-        Err(CanonicalFenceConvergenceError::Diverged(divergence)) => {
-            Err(ProjectorError::CanonicalFenceDiverged(divergence))
-        }
-        Err(CanonicalFenceConvergenceError::DidNotConverge) => {
-            Err(ProjectorError::CanonicalFenceDidNotConverge)
+    .await?;
+    let secondary = canonical.ready_evidence();
+    Ok(outcome.map(|outcome| match outcome {
+        FollowingConvergence::Attested => WriterFence::Attested(secondary),
+        FollowingConvergence::Trailing(lag) => WriterFence::Trailing {
+            secondary,
+            writer_tip_height: lag.writer_visible_tip_height,
+        },
+    }))
+}
+
+/// How [`converge_without_deadline_exit`] ended a convergence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FollowingConvergence {
+    /// The writer attested the secondary's exact fence.
+    Attested,
+    /// The probe accepted a round in which the secondary trailed the writer.
+    Trailing(CanonicalFenceLag),
+}
+
+/// Runs [`converge_on_canonical_writer_fence`] until the writer attests the
+/// secondary or the probe accepts a trailing round, or returns `None` when
+/// `cancel` fires first.
+///
+/// A secondary that trails the writer is ordinary replication lag, never a
+/// reason to stop following: each deadline that passes calls
+/// [`FollowingFenceProbe::deadline_passed`] and starts a new attempt.
+/// Divergence and probe failures still end it.
+async fn converge_without_deadline_exit<Probe>(
+    probe: &mut Probe,
+    network: zinder_core::Network,
+    policy: CanonicalFenceConvergencePolicy,
+    cancel: &CancellationToken,
+) -> Result<Option<FollowingConvergence>, ProjectorError>
+where
+    Probe: FollowingFenceProbe,
+{
+    loop {
+        match converge_on_canonical_writer_fence(probe, network, policy, cancel).await {
+            Ok(CanonicalFenceConvergence::Converged(_)) => {
+                return Ok(Some(FollowingConvergence::Attested));
+            }
+            Ok(CanonicalFenceConvergence::Trailing(lag)) => {
+                return Ok(Some(FollowingConvergence::Trailing(lag)));
+            }
+            Ok(CanonicalFenceConvergence::Cancelled) => return Ok(None),
+            Err(CanonicalFenceConvergenceError::DidNotConverge) => probe.deadline_passed().await?,
+            Err(CanonicalFenceConvergenceError::Probe(error)) => return Err(error),
+            Err(CanonicalFenceConvergenceError::Diverged(divergence)) => {
+                return Err(ProjectorError::CanonicalFenceDiverged(divergence));
+            }
         }
     }
+}
+
+/// A probe that keeps converging after a convergence deadline passes.
+trait FollowingFenceProbe: CanonicalFenceProbe<Error = ProjectorError> {
+    /// Handles an attempt whose deadline passed before the secondary reached
+    /// the writer, before the next attempt starts.
+    fn deadline_passed(&mut self) -> impl Future<Output = Result<(), ProjectorError>> + Send;
+}
+
+/// The retention lease that protects a wallet's backlog while convergence
+/// waits, renewed to a full `duration` whenever a deadline passes.
+struct ConvergenceLease<'a> {
+    lease: &'a mut CanonicalRetentionLease,
+    duration: Duration,
 }
 
 struct LiveWriterFenceProbe<'a, 'readiness> {
     canonical: &'a mut RocksDbCanonicalSecondary,
     control: &'a mut CanonicalWriterControlClient,
     readiness: &'a mut FollowingReadiness<'readiness>,
+    /// Event sequence of the wallet the secondary feeds, when convergence may
+    /// end on a secondary that trails the writer.
+    wallet_event_sequence: Option<u64>,
+    lease: Option<ConvergenceLease<'a>>,
+    timeout: Duration,
+    /// Lag of the last round in this attempt whose secondary trailed the
+    /// writer.
+    last_lag: Option<CanonicalFenceLag>,
+}
+
+impl FollowingFenceProbe for LiveWriterFenceProbe<'_, '_> {
+    async fn deadline_passed(&mut self) -> Result<(), ProjectorError> {
+        self.report_unreached_writer();
+        // A deadline may be longer than the idle renewal headroom, so each
+        // passed attempt renews to a full lease duration.
+        if let Some(lease) = self.lease.as_mut()
+            && let Some(renewed_expiry) = following_retention_lease_transition_expiry(
+                UnixTimestampMillis::now(),
+                lease.lease.expires_at(),
+                lease.duration,
+            )
+        {
+            *lease.lease = self
+                .control
+                .renew(lease.lease.renewed(renewed_expiry))
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+impl LiveWriterFenceProbe<'_, '_> {
+    fn report_unreached_writer(&mut self) {
+        tracing::warn!(
+            target: "zinder::projector",
+            event = "canonical_secondary_behind_writer",
+            secondary_height = self.canonical.event_fence().visible_tip().height.value(),
+            writer_height = ?self.last_lag.map(|lag| lag.writer_visible_tip_height),
+            lag_chain_epochs = ?self.last_lag.map(|lag| lag.lag_chain_epochs),
+            timeout_seconds = self.timeout.as_secs(),
+            "canonical secondary did not reach the writer fence within the convergence timeout; retrying"
+        );
+        self.readiness.writer_unreached(self.last_lag.take());
+    }
 }
 
 impl CanonicalFenceProbe for LiveWriterFenceProbe<'_, '_> {
@@ -1626,8 +1820,26 @@ impl CanonicalFenceProbe for LiveWriterFenceProbe<'_, '_> {
     }
 
     fn secondary_behind(&mut self, lag: CanonicalFenceLag, elapsed: Duration) {
+        self.last_lag = Some(lag);
         report_writer_fence_lag(self.readiness, lag, elapsed);
     }
+
+    fn accepts_trailing(&self, _lag: CanonicalFenceLag) -> bool {
+        secondary_holds_unapplied_events(
+            self.canonical.event_fence().chain_event_sequence(),
+            self.wallet_event_sequence,
+        )
+    }
+}
+
+/// Whether a secondary at `secondary_event_sequence` holds events that the
+/// wallet at `wallet_event_sequence`, if one is open, has not applied.
+fn secondary_holds_unapplied_events(
+    secondary_event_sequence: u64,
+    wallet_event_sequence: Option<u64>,
+) -> bool {
+    wallet_event_sequence
+        .is_some_and(|wallet_event_sequence| secondary_event_sequence > wallet_event_sequence)
 }
 
 /// Reports lag that outlasts `CANONICAL_FENCE_CONVERGENCE_SYNCING_AFTER` as
@@ -1690,10 +1902,11 @@ fn settled_tip_for_event(
 
 /// One authenticated `EventPage` covers the local secondary fence.
 ///
-/// Otherwise, the caller must catch the secondary up after the writer advanced.
+/// Otherwise, the caller must classify the writer again.
 enum RetainedEventPageValidation {
-    /// The writer moved between secondary convergence and the `EventPage` request.
-    RetryAfterWriterAdvance,
+    /// The page's writer fence neither matches nor extends the local
+    /// secondary fence.
+    Reconverge,
     /// Local retained events verified against the authenticated remote page.
     Events(Vec<CanonicalRetainedEvent>),
 }
@@ -1724,7 +1937,10 @@ async fn fetch_retained_event_page_to_target(
 /// Validates one remote `EventPage` against retained local-secondary rows.
 ///
 /// This deliberately does not require the page to end at the current writer
-/// fence because a bounded reconciliation may span several writer pages.
+/// fence because a bounded reconciliation may span several writer pages. A
+/// writer that has committed past the secondary also returns those later
+/// events, so the secondary's events must then be an exact prefix of the
+/// page; the wallet only ever applies events the writer's page attests.
 fn validate_one_retained_event_page(
     page: &zinder_proto::v1::ingest::CanonicalEventPageResponse,
     local_events: Vec<CanonicalRetainedEvent>,
@@ -1753,15 +1969,27 @@ fn validate_one_retained_event_page(
             reason: "writer EventPage omitted its bounding fence",
         });
     };
-    if !writer_fence_matches(page_writer_fence, target_fence) {
-        return Ok(RetainedEventPageValidation::RetryAfterWriterAdvance);
-    }
+    let writer_extends_secondary = match compare_canonical_writer_fences(
+        page_writer_fence,
+        &expected_writer_fence(target_fence),
+    ) {
+        CanonicalFenceRelation::Matches => false,
+        CanonicalFenceRelation::SecondaryBehind(_) => true,
+        CanonicalFenceRelation::Diverged(_) => {
+            return Ok(RetainedEventPageValidation::Reconverge);
+        }
+    };
     if page.events.len() > CANONICAL_CONTROL_EVENT_PAGE_EVENTS_USIZE {
         return Err(ProjectorError::CanonicalEventPageInvalid {
             reason: "writer returned more events than the canonical-control page ceiling",
         });
     }
-    if page.events.len() != local_events.len() {
+    let lengths_agree = if writer_extends_secondary {
+        page.events.len() >= local_events.len()
+    } else {
+        page.events.len() == local_events.len()
+    };
+    if !lengths_agree {
         return Err(ProjectorError::CanonicalEventPageInvalid {
             reason: "writer and secondary retained-event page lengths differ",
         });
@@ -2099,22 +2327,30 @@ mod tests {
     };
 
     use super::{
-        CanonicalBlockFactsSequenceDigest, CanonicalFenceLag, CanonicalRetentionLease,
-        FollowingReadiness, NextWalletTransition, ProjectorControlTasks, ProjectorError,
-        ResumedFollowingRetentionPlan, WalletCanonicalSourceIdentity,
-        WalletProjectionSourcePosition, classify_resumed_following_retention,
-        encode_zinder_native_chain_name, following_retention_lease_renewal_expiry,
-        following_retention_lease_transition_expiry, lease_expiry, reconciliation_ranges,
-        report_writer_fence_lag, require_bounded_reconciliation_replay,
-        require_built_wallet_source, require_pre_promotion_follower_admission,
-        require_retention_lease_anchor, settled_tip_for_transition,
+        CANONICAL_CONTROL_EVENT_PAGE_EVENTS, CanonicalBlockFactsSequenceDigest,
+        CanonicalFenceConvergencePolicy, CanonicalFenceLag, CanonicalFenceProbe,
+        CanonicalRetentionLease, FollowingConvergence, FollowingFenceProbe, FollowingReadiness,
+        NextWalletTransition, ProjectorControlTasks, ProjectorError, ResumedFollowingRetentionPlan,
+        RetainedEventPageValidation, WalletCanonicalSourceIdentity, WalletProjectionSourcePosition,
+        classify_resumed_following_retention, converge_without_deadline_exit,
+        encode_zinder_native_chain_name, expected_writer_fence,
+        following_retention_lease_renewal_expiry, following_retention_lease_transition_expiry,
+        lease_expiry, plan_next_wallet_transition, reconciliation_ranges, report_writer_fence_lag,
+        require_bounded_reconciliation_replay, require_built_wallet_source,
+        require_pre_promotion_follower_admission, require_retention_lease_anchor,
+        secondary_holds_unapplied_events, settled_tip_for_transition,
+        validate_one_retained_event_page, wallet_source_identity_from_fence,
     };
-    use zinder_proto::v1::ingest::{CanonicalWriterFence, CanonicalWriterStatusResponse};
+    use zinder_proto::v1::ingest::{
+        CanonicalEventBlockRange, CanonicalEventPageResponse, CanonicalRetainedEventKind,
+        CanonicalWriterFence, CanonicalWriterStatusResponse,
+    };
     use zinder_store::{
-        CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventHistoryRequest,
-        CanonicalLiveAppend, CanonicalLiveReplacement, CanonicalReorgPolicy,
-        CanonicalReplacementBlock, CanonicalStoreBuildPlan, CanonicalStoreWorkload,
-        RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
+        CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence,
+        CanonicalEventHistoryRequest, CanonicalEventKind, CanonicalLiveAppend,
+        CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,
+        CanonicalRetainedEvent, CanonicalStoreBuildPlan, CanonicalStoreWorkload, RawBlobRetention,
+        RocksDbCanonicalBuilder, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
         RocksDbResourceBudget,
     };
 
@@ -2415,7 +2651,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writer_fence_lag_reports_a_wallet_behind_the_secondary_as_syncing() {
+    async fn writer_fence_lag_keeps_a_ready_wallet_behind_the_secondary_ready_at_its_height() {
         let readiness =
             zinder_runtime::Readiness::new(zinder_runtime::ReadinessState::ready(Some(10)));
         let lag = CanonicalFenceLag {
@@ -2427,15 +2663,216 @@ mod tests {
         let mut following_readiness = FollowingReadiness::for_wallet(&readiness, 10);
         report_writer_fence_lag(&mut following_readiness, lag, Duration::from_secs(1));
         let report = readiness.report();
-        assert!(!report.is_ready);
-        assert!(matches!(
-            report.cause,
-            zinder_runtime::ReadinessCause::Syncing {
-                lag_blocks: Some(2)
-            }
-        ));
+        assert!(report.is_ready);
         assert_eq!(report.current_height, Some(10));
         assert_eq!(report.target_height, Some(12));
+    }
+
+    #[tokio::test]
+    async fn a_convergence_deadline_reports_the_lagging_secondary_and_keeps_converging()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The writer commits on each of its first 64 status reads, as during
+        // a long burst, so several attempts pass their deadline first.
+        let mut probe = BurstProbe::new(64, None);
+
+        let outcome = converge_without_deadline_exit(
+            &mut probe,
+            test_network(),
+            short_convergence_policy(),
+            &CancellationToken::new(),
+        )
+        .await?;
+
+        assert_eq!(outcome, Some(FollowingConvergence::Attested));
+        assert!(
+            probe.deadlines >= 1,
+            "expected at least one passed deadline"
+        );
+        assert_eq!(probe.secondary_sequence, probe.writer_sequence);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_secondary_past_the_wallet_ends_convergence_during_a_burst()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut probe = BurstProbe::new(u32::MAX, Some(4));
+
+        let outcome = converge_without_deadline_exit(
+            &mut probe,
+            test_network(),
+            short_convergence_policy(),
+            &CancellationToken::new(),
+        )
+        .await?;
+
+        assert!(matches!(
+            outcome,
+            Some(FollowingConvergence::Trailing(CanonicalFenceLag {
+                lag_chain_epochs: 1,
+                ..
+            }))
+        ));
+        assert_eq!(probe.deadlines, 0);
+        assert_eq!(probe.catch_ups, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_resumed_wallet_at_the_secondary_follows_the_next_catch_up_during_a_burst()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A projector that restarts during a burst resumes a wallet that
+        // already holds every event its secondary holds.
+        let mut probe = BurstProbe::new(u32::MAX, Some(5));
+
+        let outcome = converge_without_deadline_exit(
+            &mut probe,
+            test_network(),
+            short_convergence_policy(),
+            &CancellationToken::new(),
+        )
+        .await?;
+
+        assert!(matches!(outcome, Some(FollowingConvergence::Trailing(_))));
+        assert_eq!(probe.deadlines, 0);
+        assert_eq!(probe.catch_ups, 2);
+        assert!(probe.secondary_sequence > 5);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_fresh_build_waits_for_the_writer_to_attest_its_fence_after_a_burst()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut probe = BurstProbe::new(3, None);
+
+        let outcome = converge_without_deadline_exit(
+            &mut probe,
+            test_network(),
+            short_convergence_policy(),
+            &CancellationToken::new(),
+        )
+        .await?;
+
+        assert_eq!(outcome, Some(FollowingConvergence::Attested));
+        assert_eq!(probe.secondary_sequence, 8);
+        assert_eq!(probe.writer_sequence, 8);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_diverged_writer_still_ends_following() {
+        let mut probe = BurstProbe::new(0, Some(4));
+        probe.writer_sequence_override = Some(0);
+
+        let outcome = converge_without_deadline_exit(
+            &mut probe,
+            test_network(),
+            short_convergence_policy(),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            Err(ProjectorError::CanonicalFenceDiverged(
+                zinder_runtime::CanonicalFenceDivergence::FenceMismatch { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn a_page_from_a_writer_past_the_secondary_authenticates_the_secondary_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let burst = BurstFixture::build(3, 3)?;
+        let page = burst.writer_page(burst.writer.event_fence(), |_| {})?;
+
+        let RetainedEventPageValidation::Events(events) = validate_one_retained_event_page(
+            &page,
+            burst.secondary_events()?,
+            burst.wallet_source,
+            burst.secondary.event_fence(),
+        )?
+        else {
+            return Err("a page from an advanced writer asked to reconverge".into());
+        };
+
+        assert_eq!(page.events.len(), 6);
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events.last().map(|event| event.resulting_fence()),
+            Some(burst.secondary.event_fence())
+        );
+        let NextWalletTransition::ApplyOne(next) =
+            plan_next_wallet_transition(&burst.secondary, &events)?
+        else {
+            return Err("an append-only burst planned a reconciliation".into());
+        };
+        assert_eq!(next.committed_range().start, BlockHeight::new(2));
+        Ok(())
+    }
+
+    #[test]
+    fn a_page_from_a_writer_past_the_secondary_refuses_a_different_prefix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let burst = BurstFixture::build(3, 3)?;
+        let page = burst.writer_page(burst.writer.event_fence(), |events| {
+            if let Some(fence) = events
+                .first_mut()
+                .and_then(|event| event.resulting_fence.as_mut())
+            {
+                fence.visible_tip_hash = vec![0xee; 32];
+            }
+        })?;
+
+        assert!(matches!(
+            validate_one_retained_event_page(
+                &page,
+                burst.secondary_events()?,
+                burst.wallet_source,
+                burst.secondary.event_fence(),
+            ),
+            Err(ProjectorError::CanonicalEventPageInvalid {
+                reason: "writer and secondary retained-event bytes differ"
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_page_at_the_secondary_fence_must_hold_exactly_its_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let burst = BurstFixture::build(3, 3)?;
+        let page = burst.writer_page(burst.secondary.event_fence(), |_| {})?;
+
+        assert!(matches!(
+            validate_one_retained_event_page(
+                &page,
+                burst.secondary_events()?,
+                burst.wallet_source,
+                burst.secondary.event_fence(),
+            ),
+            Err(ProjectorError::CanonicalEventPageInvalid {
+                reason: "writer and secondary retained-event page lengths differ"
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_page_from_a_writer_behind_the_secondary_reconverges()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let burst = BurstFixture::build(3, 3)?;
+        let page = burst.writer_page(burst.baseline_fence, |_| {})?;
+
+        assert!(matches!(
+            validate_one_retained_event_page(
+                &page,
+                burst.secondary_events()?,
+                burst.wallet_source,
+                burst.secondary.event_fence(),
+            )?,
+            RetainedEventPageValidation::Reconverge
+        ));
+        Ok(())
     }
 
     #[test]
@@ -2582,6 +3019,266 @@ mod tests {
             following_retention_lease_transition_expiry(now, current_expiry, configured_duration,),
             Some(lease_expiry(now, configured_duration))
         );
+    }
+
+    fn short_convergence_policy() -> CanonicalFenceConvergencePolicy {
+        CanonicalFenceConvergencePolicy {
+            timeout: Duration::from_millis(30),
+            max_attempts: None,
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(4),
+        }
+    }
+
+    fn scripted_writer_fence(event_sequence: u64) -> CanonicalWriterFence {
+        let height = u32::try_from(event_sequence).unwrap_or(u32::MAX);
+        zinder_proto::wire::canonical_writer_fence_message(
+            ChainEpochId::new(event_sequence),
+            event_sequence,
+            block_id(height, 0x44),
+            CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+                CanonicalBlockFactsSequenceDigestVersion::V1,
+                event_sequence,
+                [0x44; 32],
+            ),
+        )
+    }
+
+    /// A writer that commits once on each status read while its burst lasts,
+    /// so the secondary it feeds trails it after every catch-up.
+    struct BurstProbe {
+        secondary_sequence: u64,
+        writer_sequence: u64,
+        burst_commits_remaining: u32,
+        /// Event sequence of the open wallet; `None` for a fresh build.
+        wallet_sequence: Option<u64>,
+        writer_sequence_override: Option<u64>,
+        catch_ups: u32,
+        deadlines: u32,
+    }
+
+    impl BurstProbe {
+        fn new(burst_commits: u32, wallet_sequence: Option<u64>) -> Self {
+            Self {
+                secondary_sequence: 5,
+                writer_sequence: 5,
+                burst_commits_remaining: burst_commits,
+                wallet_sequence,
+                writer_sequence_override: None,
+                catch_ups: 0,
+                deadlines: 0,
+            }
+        }
+    }
+
+    impl CanonicalFenceProbe for BurstProbe {
+        type Error = ProjectorError;
+
+        async fn catch_up(&mut self) -> Result<Option<CanonicalWriterFence>, ProjectorError> {
+            self.catch_ups += 1;
+            self.secondary_sequence = self.writer_sequence;
+            Ok(Some(scripted_writer_fence(self.secondary_sequence)))
+        }
+
+        async fn writer_status(&mut self) -> Result<CanonicalWriterStatusResponse, ProjectorError> {
+            if self.burst_commits_remaining > 0 {
+                self.burst_commits_remaining -= 1;
+                self.writer_sequence += 1;
+            }
+            let writer_sequence = self
+                .writer_sequence_override
+                .unwrap_or(self.writer_sequence);
+            Ok(CanonicalWriterStatusResponse {
+                network_name: encode_zinder_native_chain_name(test_network()).to_owned(),
+                fence: Some(scripted_writer_fence(writer_sequence)),
+                oldest_retained_event_sequence: 1,
+                ..CanonicalWriterStatusResponse::default()
+            })
+        }
+
+        fn accepts_trailing(&self, _lag: CanonicalFenceLag) -> bool {
+            secondary_holds_unapplied_events(self.secondary_sequence, self.wallet_sequence)
+        }
+    }
+
+    impl FollowingFenceProbe for BurstProbe {
+        async fn deadline_passed(&mut self) -> Result<(), ProjectorError> {
+            self.deadlines += 1;
+            Ok(())
+        }
+    }
+
+    /// A canonical writer that committed a burst of blocks after its
+    /// secondary last caught up, with a wallet still at the baseline block.
+    struct BurstFixture {
+        _temporary: TempDir,
+        writer: RocksDbCanonicalStore,
+        secondary: RocksDbCanonicalSecondary,
+        baseline_fence: CanonicalEventFence,
+        wallet_source: WalletCanonicalSourceIdentity,
+    }
+
+    impl BurstFixture {
+        /// Appends `caught_up_blocks` blocks before the secondary catches up
+        /// and `burst_blocks` more after it.
+        fn build(
+            caught_up_blocks: u32,
+            burst_blocks: u32,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
+            let temporary = TempDir::new()?;
+            let activations = zinder_testkit::sample_regtest_upgrade_activations();
+            let canonical_path = temporary.path().join("canonical");
+            // Wide enough to keep the baseline block settled across the burst.
+            let reorg_policy = CanonicalReorgPolicy::new(16)?;
+            let block_one = empty_canonical_block(
+                1,
+                zinder_core::Network::ZcashRegtest.genesis_hash().as_bytes(),
+                [0x11; 32],
+            );
+            let block_one_id = BlockId::new(
+                block_one.facts.block_header.height,
+                block_one.facts.block_header.block_hash,
+            );
+            let mut builder = RocksDbCanonicalBuilder::create_fresh(
+                &canonical_path,
+                CanonicalStoreWorkload::Wallet,
+                CanonicalStoreBuildPlan::complete(
+                    &activations,
+                    0,
+                    block_one_id,
+                    RawBlobRetention::Transactions,
+                    reorg_policy,
+                )?,
+                RocksDbResourceBudget::for_local_tests(),
+            )?;
+            builder.bulk_load_blocks([Ok::<_, std::convert::Infallible>(block_one)])?;
+            builder.load_subtree_roots(std::iter::empty())?;
+            builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
+                block_one_id,
+                1,
+                regtest_checkpoint_frontiers_at(BlockHeight::new(1)),
+            ))?;
+            let validated = builder.prepare_cold_certified_publication()?;
+            let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
+                block_one_id,
+                UnixTimestampMillis::new(1),
+            ))?;
+            let mut writer = validated.publish_baseline(publication)?;
+            let baseline_fence = writer.event_fence();
+            let mut next_height = 2;
+            writer = append_empty_blocks(writer, &mut next_height, caught_up_blocks, block_one_id)?;
+            let secondary = RocksDbCanonicalSecondary::open_ready(
+                &canonical_path,
+                temporary.path().join("canonical-secondary"),
+                &activations,
+                CanonicalStoreWorkload::Wallet,
+                RawBlobRetention::Transactions,
+                reorg_policy,
+                RocksDbResourceBudget::for_local_tests(),
+            )?;
+            writer = append_empty_blocks(writer, &mut next_height, burst_blocks, block_one_id)?;
+            Ok(Self {
+                _temporary: temporary,
+                writer,
+                secondary,
+                baseline_fence,
+                wallet_source: wallet_source_identity_from_fence(baseline_fence, block_one_id),
+            })
+        }
+
+        fn secondary_events(
+            &self,
+        ) -> Result<Vec<CanonicalRetainedEvent>, Box<dyn std::error::Error>> {
+            let cursor = self.wallet_source.source_position().event_cursor.as_bytes();
+            Ok(self
+                .secondary
+                .canonical_event_history(CanonicalEventHistoryRequest::new(
+                    Some(&cursor),
+                    NonZeroU32::new(CANONICAL_CONTROL_EVENT_PAGE_EVENTS)
+                        .ok_or("zero event page limit")?,
+                ))?)
+        }
+
+        /// Returns the writer's page from the wallet cursor, bounded by
+        /// `writer_fence`, after `tamper` edits its events.
+        fn writer_page(
+            &self,
+            writer_fence: CanonicalEventFence,
+            tamper: impl FnOnce(&mut Vec<zinder_proto::v1::ingest::CanonicalRetainedEvent>),
+        ) -> Result<CanonicalEventPageResponse, Box<dyn std::error::Error>> {
+            let cursor = self.wallet_source.source_position().event_cursor.as_bytes();
+            let mut events = self
+                .writer
+                .canonical_event_history(CanonicalEventHistoryRequest::new(
+                    Some(&cursor),
+                    NonZeroU32::new(CANONICAL_CONTROL_EVENT_PAGE_EVENTS)
+                        .ok_or("zero event page limit")?,
+                ))?
+                .into_iter()
+                .map(writer_retained_event)
+                .collect();
+            tamper(&mut events);
+            Ok(CanonicalEventPageResponse {
+                events,
+                writer_fence: Some(expected_writer_fence(writer_fence)),
+                oldest_retained_event_sequence: self.writer.canonical_event_retention_floor()?,
+            })
+        }
+    }
+
+    fn append_empty_blocks(
+        mut writer: RocksDbCanonicalStore,
+        next_height: &mut u32,
+        count: u32,
+        settled_tip: BlockId,
+    ) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+        let activations = zinder_testkit::sample_regtest_upgrade_activations();
+        for _ in 0..count {
+            let height = *next_height;
+            let parent_byte = u8::try_from(0x10 + height - 1)?;
+            let block_byte = u8::try_from(0x10 + height)?;
+            let parent_hash = if height == 2 {
+                [0x11; 32]
+            } else {
+                [parent_byte; 32]
+            };
+            let fence = writer.event_fence();
+            let (next, _) = writer.commit_live_append(
+                CanonicalLiveAppend::new(
+                    fence,
+                    empty_canonical_block(height, parent_hash, [block_byte; 32]),
+                    Vec::new(),
+                    settled_tip,
+                    UnixTimestampMillis::new(u64::from(height)),
+                ),
+                &activations,
+            )?;
+            writer = next;
+            *next_height += 1;
+        }
+        Ok(writer)
+    }
+
+    /// Encodes a retained event the way the writer's `EventPage` does.
+    fn writer_retained_event(
+        event: CanonicalRetainedEvent,
+    ) -> zinder_proto::v1::ingest::CanonicalRetainedEvent {
+        let range = |range: BlockHeightRange| CanonicalEventBlockRange {
+            start_height: range.start.value(),
+            end_height: range.end.value(),
+        };
+        zinder_proto::v1::ingest::CanonicalRetainedEvent {
+            cursor: event.cursor().as_bytes().to_vec(),
+            resulting_epoch_id: event.resulting_epoch_id().value(),
+            previous_epoch_id: event.previous_epoch_id().map(ChainEpochId::value),
+            kind: match event.kind() {
+                CanonicalEventKind::Committed => CanonicalRetainedEventKind::Committed as i32,
+                CanonicalEventKind::Reorged => CanonicalRetainedEventKind::Reorged as i32,
+            },
+            reverted_range: event.reverted_range().map(range),
+            committed_range: Some(range(event.committed_range())),
+            resulting_fence: Some(expected_writer_fence(event.resulting_fence())),
+        }
     }
 
     fn empty_canonical_block(

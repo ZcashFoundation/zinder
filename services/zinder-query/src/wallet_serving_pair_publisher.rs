@@ -966,7 +966,7 @@ impl WalletServingPairPublisher {
             Ok(CanonicalFenceConvergence::Converged(attesting_status)) => {
                 self.publish_candidate(generation, &attesting_status).await
             }
-            Ok(CanonicalFenceConvergence::Cancelled)
+            Ok(CanonicalFenceConvergence::Cancelled | CanonicalFenceConvergence::Trailing(_))
             | Err(CanonicalFenceConvergenceError::DidNotConverge) => {
                 Err(WalletServingPairError::ConvergenceTimedOut { last_outcome })
             }
