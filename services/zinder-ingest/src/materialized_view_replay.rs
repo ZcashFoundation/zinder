@@ -1908,10 +1908,18 @@ impl ReplayPass {
         self
     }
 
-    /// Records that the ranking build applied a page or a warm-up window.
+    /// Records that the ranking build applied a page.
     fn record_ranking_build_advance(&self) {
         if let Some(progress) = &self.ranking_build {
             progress.record_advance();
+        }
+    }
+
+    /// Records that a ranking build warm-up toward `target` left its cache at
+    /// `reached`.
+    fn record_ranking_build_warm_up(&self, target: BlockHeight, reached: BlockHeight) {
+        if let Some(progress) = &self.ranking_build {
+            progress.record_warm_up(target, reached);
         }
     }
 

@@ -57,22 +57,30 @@ const RANKING_BUILD_PROGRESS_INTERVAL: u32 = 100_000;
 /// Longest a trailing ranking build may go without applying history before
 /// replay stops waiting for it.
 ///
-/// A healthy build applies a page or a warm-up window every few seconds, and
-/// a step never holds work for much longer than its 10-second budget plus one
-/// page, so a build this quiet has failed or stopped. Replay then continues
-/// without it, and the build activates at the fence later instead.
+/// A healthy build applies a page or warms its cache further every few
+/// seconds, and a step never holds work for much longer than its 10-second
+/// budget plus one page, so a build this quiet has failed or stopped. Time
+/// the build spends paused with replay does not count. Replay then continues
+/// without it until the build applies history again.
 const RANKING_BUILD_STALL_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Ranking build progress the build worker shares with the replay tailer.
 ///
-/// The build records every page and warm-up window it applies. Replay waits
-/// for a build that trails the other views only while the build keeps
-/// recording progress, so a failing build cannot hold replay back.
+/// The build records every page it applies and every step that warms its
+/// cache further toward a height. Replay waits for a build that trails the
+/// other views only while the build keeps recording progress, so a failing
+/// build cannot hold replay back.
 #[derive(Debug)]
 pub(super) struct RankingBuildProgress {
     stall_timeout: Duration,
     last_advance: Mutex<Instant>,
     advances: AtomicU64,
+    /// The height the last counted warm-up walked toward and how far it got.
+    ///
+    /// A step whose page write fails leaves the cache past the stored build
+    /// height, so the next step warms the cache from the first height again.
+    /// Only a warm-up that passes this mark counts, so that loop stalls.
+    warm_up_mark: Mutex<Option<(BlockHeight, BlockHeight)>>,
     replay_waiting: AtomicBool,
     stall_reported: AtomicBool,
 }
@@ -90,33 +98,26 @@ pub(super) struct TrailingRankingBuild {
 impl TrailingRankingBuild {
     /// Returns the build at `built_through` when replay should wait for it.
     ///
-    /// The build walks toward the views' materialized height, capped at the
-    /// settled tip. Below that height it still has history to apply. At the
-    /// views' own settled height it has applied everything and joins them on
-    /// its next step, which may follow the step that applied the last page,
-    /// so replay keeps waiting. A build stopped at a settled tip below the
-    /// views cannot join them there, so replay does not wait for it.
+    /// The build can join the views only at a settled materialized height.
+    /// Below that height it still has history to apply. At it the build has
+    /// applied everything and joins them on its next step, which may follow
+    /// the step that applied the last page, so replay keeps waiting. Views
+    /// above the settled tip never wait: the build could only stop below
+    /// them, and activates at the fence once they follow the tip.
     const fn behind(
         built_through: BlockHeight,
         materialized_height: BlockHeight,
         settled_tip_height: BlockHeight,
     ) -> Option<Self> {
-        let join_height = if materialized_height.value() < settled_tip_height.value() {
-            materialized_height
-        } else {
-            settled_tip_height
-        };
-        let waits = built_through.value() < join_height.value()
-            || (built_through.value() == join_height.value()
-                && join_height.value() == materialized_height.value());
-        if waits {
-            Some(Self {
-                built_through,
-                join_height,
-            })
-        } else {
-            None
+        if materialized_height.value() > settled_tip_height.value()
+            || built_through.value() > materialized_height.value()
+        {
+            return None;
         }
+        Some(Self {
+            built_through,
+            join_height: materialized_height,
+        })
     }
 }
 
@@ -135,19 +136,47 @@ impl RankingBuildProgress {
             stall_timeout,
             last_advance: Mutex::new(Instant::now()),
             advances: AtomicU64::new(0),
+            warm_up_mark: Mutex::new(None),
             replay_waiting: AtomicBool::new(false),
             stall_reported: AtomicBool::new(false),
         }
     }
 
-    /// Records that the build applied a page or a warm-up window.
+    /// Records that the build applied a page.
     pub(super) fn record_advance(&self) {
         *self.last_advance.lock() = Instant::now();
         self.advances.fetch_add(1, Ordering::Relaxed);
         self.stall_reported.store(false, Ordering::Relaxed);
     }
 
-    /// Returns how many pages and warm-up windows the build has applied.
+    /// Records that a warm-up toward `target` left the build's cache at
+    /// `reached`, counting it only past the furthest earlier warm-up toward
+    /// the same height.
+    pub(super) fn record_warm_up(&self, target: BlockHeight, reached: BlockHeight) {
+        {
+            let mut mark = self.warm_up_mark.lock();
+            if let Some((marked_target, furthest)) = *mark
+                && marked_target == target
+                && reached <= furthest
+            {
+                return;
+            }
+            *mark = Some((target, reached));
+        }
+        self.record_advance();
+    }
+
+    /// Restarts the stall clock while the build pauses with replay.
+    ///
+    /// A pause empties the build's cache, so the warm-up after it counts
+    /// again.
+    pub(super) fn hold(&self) {
+        *self.last_advance.lock() = Instant::now();
+        *self.warm_up_mark.lock() = None;
+        self.stall_reported.store(false, Ordering::Relaxed);
+    }
+
+    /// Returns how many pages and warm-up steps the build has recorded.
     pub(super) fn advances(&self) -> u64 {
         self.advances.load(Ordering::Relaxed)
     }
@@ -390,8 +419,8 @@ pub(super) fn spawn_transparent_address_ranking_builder(
 /// Every step evaluates the same replay budget the tailer does, so the build
 /// pauses with replay under the canonical-phase gate, memory pressure, and the
 /// free-space floor, and empties its prevout cache while paused. A step that
-/// applied history is followed by the next one at once; the worker sleeps only
-/// after a step that found nothing to apply.
+/// applied history is followed by the next one at once; the worker sleeps
+/// after a step that failed or found nothing to apply.
 async fn run_transparent_address_ranking_builder(
     tailer: std::sync::Arc<MaterializedViewTailer>,
     poll_interval: Duration,
@@ -410,8 +439,10 @@ async fn run_transparent_address_ranking_builder(
     let mut budget = fresh_budget();
     loop {
         let advances_before = progress.advances();
+        let mut failed = false;
         if budget.evaluate_current().state.is_paused() {
             tailer.prevout_caches.release_ranking_build();
+            progress.hold();
         } else {
             let step_tailer = std::sync::Arc::clone(&tailer);
             let step_progress = std::sync::Arc::clone(&progress);
@@ -426,6 +457,7 @@ async fn run_transparent_address_ranking_builder(
                 Ok((returned, outcome)) => {
                     budget = returned;
                     if let Err(error) = outcome {
+                        failed = true;
                         tracing::warn!(
                             target: "zinder::ingest",
                             event = "transparent_address_ranking_build_failed",
@@ -441,11 +473,12 @@ async fn run_transparent_address_ranking_builder(
                         error = %join_error,
                         "transparent-address ranking build step did not complete; retrying"
                     );
+                    failed = true;
                     budget = fresh_budget();
                 }
             }
         }
-        let idle = progress.advances() == advances_before;
+        let idle = failed || progress.advances() == advances_before;
         if cancel.is_cancelled() || (idle && sleep_or_cancel(poll_interval, &cancel).await) {
             return;
         }
@@ -632,31 +665,36 @@ impl<'build> RankingBuild<'build> {
     }
 
     /// Warms the build's empty prevout cache through `through` within the
-    /// step budget, recording each window it applies as build progress.
+    /// step budget, recording how far it got as build progress.
     ///
-    /// A window counts only once the next one is requested or the warm-up
-    /// returns, so a window whose read fails never refreshes the stall clock.
+    /// A warm-up whose read fails records nothing, and one that only walks
+    /// history an earlier warm-up toward `through` already walked does not
+    /// count, so neither refreshes the stall clock.
     fn warm_prevout_cache(
         &mut self,
         through: BlockHeight,
         started_at: Instant,
         pass: &mut ReplayPass,
     ) -> Result<bool, IngestError> {
-        let mut window_open = false;
+        let before = self.cache_height();
         let warmed = self.hydrator.warm_prevout_cache(through, &mut || {
-            if window_open {
-                pass.record_ranking_build_advance();
-            }
-            let window = (started_at.elapsed() < RANKING_BUILD_STEP_BUDGET)
+            (started_at.elapsed() < RANKING_BUILD_STEP_BUDGET)
                 .then(|| pass.warm_up_window())
-                .flatten();
-            window_open = window.is_some();
-            window
+                .flatten()
         })?;
-        if window_open {
-            pass.record_ranking_build_advance();
+        let reached = self.cache_height();
+        if reached != before
+            && let Some(reached) = reached
+        {
+            pass.record_ranking_build_warm_up(through, reached);
         }
         Ok(warmed)
+    }
+
+    fn cache_height(&mut self) -> Option<BlockHeight> {
+        self.hydrator
+            .prevout_cache_mut()
+            .and_then(|cache| cache.applied_height())
     }
 
     /// Hands the cache this build walked to `joined` over to replay, which
@@ -882,10 +920,52 @@ mod tests {
         );
         assert_eq!(
             TrailingRankingBuild::behind(height(300), height(500), height(400)),
-            Some(TrailingRankingBuild {
-                built_through: height(300),
-                join_height: height(400),
-            })
+            None,
+            "views above the settled tip follow it and never wait"
+        );
+        assert_eq!(
+            TrailingRankingBuild::behind(height(600), height(500), height(900)),
+            None,
+            "a build past the views has nothing to join"
+        );
+    }
+
+    #[test]
+    fn only_a_warm_up_past_the_furthest_earlier_one_counts_as_progress() {
+        let height = BlockHeight::new;
+        let progress = RankingBuildProgress::with_stall_timeout(Duration::from_hours(1));
+        progress.record_warm_up(height(500), height(100));
+        assert_eq!(progress.advances(), 1);
+        progress.record_warm_up(height(500), height(100));
+        progress.record_warm_up(height(500), height(80));
+        assert_eq!(
+            progress.advances(),
+            1,
+            "re-walking history already warmed toward the same height is not progress"
+        );
+        progress.record_warm_up(height(500), height(200));
+        progress.record_warm_up(height(600), height(50));
+        assert_eq!(progress.advances(), 3);
+    }
+
+    #[test]
+    fn a_paused_build_restarts_the_stall_clock_and_its_warm_up_mark() {
+        let height = BlockHeight::new;
+        let progress = RankingBuildProgress::with_stall_timeout(Duration::from_hours(1));
+        progress.record_warm_up(height(500), height(100));
+        progress.backdate_last_advance(Duration::from_hours(2));
+        assert!(!progress.replay_waits_for(TRAILING));
+
+        progress.hold();
+        assert!(
+            progress.replay_waits_for(TRAILING),
+            "time paused with replay does not count as a stall"
+        );
+        progress.record_warm_up(height(500), height(100));
+        assert_eq!(
+            progress.advances(),
+            2,
+            "the warm-up after a pause refills an emptied cache and counts again"
         );
     }
 

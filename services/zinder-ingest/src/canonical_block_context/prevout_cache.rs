@@ -145,7 +145,7 @@ impl PrevoutCache {
     }
 
     /// Returns the height of the last block the cache applied.
-    pub(super) fn applied_height(&self) -> Option<BlockHeight> {
+    pub(crate) fn applied_height(&self) -> Option<BlockHeight> {
         self.applied_through.map(|block| block.height)
     }
 

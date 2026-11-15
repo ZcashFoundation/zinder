@@ -197,9 +197,10 @@ that kept advancing would only move the join point away, and the build would
 hydrate every height it passed a second time. After the join, one hydration
 per height serves every view, and replay takes over the prevout cache the
 build walked to the joined height instead of warming its own over the same
-history. Replay stops waiting once the build applies no
-page or warm-up window for 5 minutes, so a failing build cannot hold the views
-back; such a build activates at the fence later. Views that follow a shared
+history. Replay stops waiting once the build, outside its pauses, neither
+applies a page nor warms its cache past an earlier warm-up for 5 minutes, so a
+failing build cannot hold the views back. Replay waits again once that build
+applies history; otherwise it activates at the fence later. Views that follow a shared
 cursor never wait, and a page that carries a revert is dispatched before
 replay waits. `MaterializedViewTailer::catch_up` applies the same order on one
 thread: a trailing build first walks to the views' height and joins them, and
