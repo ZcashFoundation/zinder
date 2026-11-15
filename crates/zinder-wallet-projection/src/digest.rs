@@ -1,6 +1,7 @@
 //! Order-independent, deletion-capable wallet projection row accumulator.
 
 use blake2b_simd::Params;
+use blake2b_simd::many::{HashManyJob, hash_many};
 
 use crate::contract_error::encoded_len;
 use crate::{
@@ -34,6 +35,9 @@ const BLAKE2B_OUTPUT_LEN_U32: u32 = 64;
 
 /// Full accumulator length in the BLAKE2X parameter encoding.
 const WALLET_PROJECTION_ACCUMULATOR_LEN_U32: u32 = 2048;
+
+/// Number of 64-byte BLAKE2X blocks in one row expansion.
+const EXPANSION_BLOCK_COUNT: usize = WALLET_PROJECTION_ACCUMULATOR_LEN / BLAKE2B_OUTPUT_LEN;
 
 /// Durable row families committed by the wallet projection accumulator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -338,7 +342,6 @@ fn row_preimage(
 }
 
 fn blake2x_expand(message: &[u8]) -> [u8; WALLET_PROJECTION_ACCUMULATOR_LEN] {
-    let mut output = [0; WALLET_PROJECTION_ACCUMULATOR_LEN];
     let xof_length = WALLET_PROJECTION_ACCUMULATOR_LEN_U32;
     let root = Params::new()
         .hash_length(BLAKE2B_OUTPUT_LEN)
@@ -346,22 +349,28 @@ fn blake2x_expand(message: &[u8]) -> [u8; WALLET_PROJECTION_ACCUMULATOR_LEN] {
         .personal(&PROJECTION_ACCUMULATOR_PERSONAL)
         .hash(message);
 
-    let mut produced = 0usize;
-    let mut block_index = 0u32;
-    while produced < output.len() {
-        let block_length = (output.len() - produced).min(BLAKE2B_OUTPUT_LEN);
-        let block = Params::new()
-            .hash_length(block_length)
-            .fanout(0)
-            .max_depth(0)
-            .max_leaf_length(BLAKE2B_OUTPUT_LEN_U32)
-            .node_offset(u64::from(block_index) | (u64::from(xof_length) << 32))
-            .inner_hash_length(BLAKE2B_OUTPUT_LEN)
-            .personal(&PROJECTION_ACCUMULATOR_PERSONAL)
-            .hash(root.as_bytes());
-        output[produced..produced + block_length].copy_from_slice(block.as_bytes());
-        produced += block_length;
-        block_index = block_index.wrapping_add(1);
+    // Each expansion block hashes the same root under its own node offset, so
+    // the blocks are independent and hash together as one SIMD batch.
+    let mut blocks: [HashManyJob<'_>; EXPANSION_BLOCK_COUNT] =
+        core::array::from_fn(|block_index| {
+            let block_index = u64::try_from(block_index).unwrap_or(u64::MAX);
+            HashManyJob::new(
+                Params::new()
+                    .hash_length(BLAKE2B_OUTPUT_LEN)
+                    .fanout(0)
+                    .max_depth(0)
+                    .max_leaf_length(BLAKE2B_OUTPUT_LEN_U32)
+                    .node_offset(block_index | (u64::from(xof_length) << 32))
+                    .inner_hash_length(BLAKE2B_OUTPUT_LEN)
+                    .personal(&PROJECTION_ACCUMULATOR_PERSONAL),
+                root.as_bytes(),
+            )
+        });
+    hash_many(blocks.iter_mut());
+
+    let mut output = [0; WALLET_PROJECTION_ACCUMULATOR_LEN];
+    for (output_block, block) in output.chunks_exact_mut(BLAKE2B_OUTPUT_LEN).zip(&blocks) {
+        output_block.copy_from_slice(block.to_hash().as_bytes());
     }
     output
 }

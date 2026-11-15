@@ -17,6 +17,7 @@
 //! [`encode_utxo_set_commitment_element`].
 
 use blake2b_simd::Params;
+use blake2b_simd::many::{HashManyJob, hash_many};
 
 use crate::wire::{
     UTXO_SET_COMMITMENT_PERSONAL, UtxoSetCommitmentElement, encode_utxo_set_commitment_element,
@@ -33,6 +34,10 @@ pub const UTXO_SET_COMMITMENT_DIGEST_LEN: usize = 32;
 
 /// Length in bytes of a full `BLAKE2b` output block.
 const BLAKE2B_OUTPUT_LEN: usize = 64;
+
+/// Number of BLAKE2X expansion blocks hashed in one batch, enough for a full
+/// commitment expansion.
+const EXPANSION_BATCH_BLOCKS: usize = UTXO_SET_COMMITMENT_LEN / BLAKE2B_OUTPUT_LEN;
 
 /// Snapshot scheme identifying how a [`TransparentUtxoSetCommitment`] was built.
 ///
@@ -198,14 +203,31 @@ fn blake2x_expand_into(message: &[u8], personal: &[u8; 16], output: &mut [u8]) {
     let xof_length = u32::try_from(output.len()).unwrap_or(u32::MAX);
     let root = blake2x_root_hash(message, personal, xof_length);
 
-    let mut produced = 0usize;
-    let mut block_index = 0u32;
-    while produced < output.len() {
-        let block_length = (output.len() - produced).min(BLAKE2B_OUTPUT_LEN);
-        let block = blake2x_expansion_block(&root, personal, block_index, block_length, xof_length);
-        output[produced..produced + block_length].copy_from_slice(block.as_bytes());
-        produced += block_length;
-        block_index = block_index.wrapping_add(1);
+    // Each expansion block hashes the same root under its own node offset, so
+    // the blocks are independent and hash together in SIMD batches.
+    let batch_output_len = EXPANSION_BATCH_BLOCKS * BLAKE2B_OUTPUT_LEN;
+    for (batch_index, batch) in output.chunks_mut(batch_output_len).enumerate() {
+        let batch_len = batch.len();
+        let mut blocks: [Option<HashManyJob<'_>>; EXPANSION_BATCH_BLOCKS] =
+            core::array::from_fn(|slot| {
+                let block_start = slot * BLAKE2B_OUTPUT_LEN;
+                (block_start < batch_len).then(|| {
+                    let block_index = u32::try_from(batch_index * EXPANSION_BATCH_BLOCKS + slot)
+                        .unwrap_or(u32::MAX);
+                    let block_length = (batch_len - block_start).min(BLAKE2B_OUTPUT_LEN);
+                    HashManyJob::new(
+                        &blake2x_expansion_params(personal, block_index, block_length, xof_length),
+                        root.as_bytes(),
+                    )
+                })
+            });
+        hash_many(blocks.iter_mut().flatten());
+        for (output_block, block) in batch
+            .chunks_mut(BLAKE2B_OUTPUT_LEN)
+            .zip(blocks.iter().flatten())
+        {
+            output_block.copy_from_slice(block.to_hash().as_bytes());
+        }
     }
 }
 
@@ -222,27 +244,28 @@ fn blake2x_root_hash(message: &[u8], personal: &[u8; 16], xof_length: u32) -> bl
         .hash(message)
 }
 
-/// Computes one BLAKE2X expansion block `B_i` over the root hash.
+/// Returns the parameters of one BLAKE2X expansion block `B_i` over the root
+/// hash.
 ///
 /// The parameter block sets `digest_length` to this block's length,
 /// `leaf_length` to 64, `node_offset` to the block index with the XOF length in
 /// the high 32 bits, `inner_length` to 64, and `fanout`/`depth` to 0.
-fn blake2x_expansion_block(
-    root: &blake2b_simd::Hash,
+fn blake2x_expansion_params(
     personal: &[u8; 16],
     block_index: u32,
     block_length: usize,
     xof_length: u32,
-) -> blake2b_simd::Hash {
-    Params::new()
+) -> Params {
+    let mut params = Params::new();
+    params
         .hash_length(block_length)
         .fanout(0)
         .max_depth(0)
         .max_leaf_length(u32::try_from(BLAKE2B_OUTPUT_LEN).unwrap_or(u32::MAX))
         .node_offset(u64::from(block_index) | (u64::from(xof_length) << 32))
         .inner_hash_length(BLAKE2B_OUTPUT_LEN)
-        .personal(personal)
-        .hash(root.as_bytes())
+        .personal(personal);
+    params
 }
 
 #[cfg(test)]
