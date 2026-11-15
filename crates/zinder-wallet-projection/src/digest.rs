@@ -111,25 +111,19 @@ impl WalletProjectionAccumulator {
     }
 
     fn add_accumulator(&mut self, other: &Self) {
-        for lane_index in 0..ACCUMULATOR_LANE_COUNT {
-            let byte_index = lane_index * 2;
-            let accumulated = u16::from_le_bytes([self.0[byte_index], self.0[byte_index + 1]]);
-            let other_lane = u16::from_le_bytes([other.0[byte_index], other.0[byte_index + 1]]);
-            let combined = accumulated.wrapping_add(other_lane).to_le_bytes();
-            self.0[byte_index] = combined[0];
-            self.0[byte_index + 1] = combined[1];
-        }
+        self.fold_lanes(&other.0, u16::wrapping_add);
     }
 
-    fn combine_preimage(&mut self, preimage: &[u8], combine: fn(u16, u16) -> u16) {
-        let expansion = blake2x_expand(preimage);
-        for lane_index in 0..ACCUMULATOR_LANE_COUNT {
-            let byte_index = lane_index * 2;
-            let accumulated = u16::from_le_bytes([self.0[byte_index], self.0[byte_index + 1]]);
-            let row_lane = u16::from_le_bytes([expansion[byte_index], expansion[byte_index + 1]]);
-            let combined = combine(accumulated, row_lane).to_le_bytes();
-            self.0[byte_index] = combined[0];
-            self.0[byte_index + 1] = combined[1];
+    fn fold_lanes(
+        &mut self,
+        lanes: &[u8; WALLET_PROJECTION_ACCUMULATOR_LEN],
+        fold: impl Fn(u16, u16) -> u16,
+    ) {
+        let (accumulated_lanes, _) = self.0.as_chunks_mut::<2>();
+        let (other_lanes, _) = lanes.as_chunks::<2>();
+        for (accumulated, other) in accumulated_lanes.iter_mut().zip(other_lanes) {
+            *accumulated =
+                fold(u16::from_le_bytes(*accumulated), u16::from_le_bytes(*other)).to_le_bytes();
         }
     }
 }
@@ -182,7 +176,7 @@ impl WalletProjectionDigestBuilder {
             .checked_add(1)
             .ok_or(WalletProjectionContractError::ProjectionDigestRowCountOverflow)?;
         self.accumulator
-            .combine_preimage(&preimage, u16::wrapping_add);
+            .fold_lanes(&blake2x_expand(&preimage), u16::wrapping_add);
         *self.row_count_mut(family) = next_count;
         Ok(())
     }
@@ -202,7 +196,7 @@ impl WalletProjectionDigestBuilder {
             .checked_sub(1)
             .ok_or(WalletProjectionContractError::ProjectionDigestRowCountUnderflow)?;
         self.accumulator
-            .combine_preimage(&preimage, u16::wrapping_sub);
+            .fold_lanes(&blake2x_expand(&preimage), u16::wrapping_sub);
         *self.row_count_mut(family) = next_count;
         Ok(())
     }

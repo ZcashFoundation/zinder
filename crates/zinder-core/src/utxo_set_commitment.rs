@@ -161,21 +161,18 @@ impl TransparentUtxoSetCommitment {
     fn combine_lanes(
         &mut self,
         element: &UtxoSetCommitmentElement<'_>,
-        combine: fn(u16, u16) -> u16,
+        combine: impl Fn(u16, u16) -> u16,
     ) {
         let preimage = encode_utxo_set_commitment_element(element);
         let expansion = blake2x_expand(&preimage);
-        for lane_index in 0..COMMITMENT_LANE_COUNT {
-            let byte_index = lane_index * 2;
-            let accumulator_lane = u16::from_le_bytes([
-                self.accumulator[byte_index],
-                self.accumulator[byte_index + 1],
-            ]);
-            let element_lane =
-                u16::from_le_bytes([expansion[byte_index], expansion[byte_index + 1]]);
-            let combined = combine(accumulator_lane, element_lane).to_le_bytes();
-            self.accumulator[byte_index] = combined[0];
-            self.accumulator[byte_index + 1] = combined[1];
+        let (accumulator_lanes, _) = self.accumulator.as_chunks_mut::<2>();
+        let (element_lanes, _) = expansion.as_chunks::<2>();
+        for (accumulator_lane, element_lane) in accumulator_lanes.iter_mut().zip(element_lanes) {
+            *accumulator_lane = combine(
+                u16::from_le_bytes(*accumulator_lane),
+                u16::from_le_bytes(*element_lane),
+            )
+            .to_le_bytes();
         }
     }
 }
