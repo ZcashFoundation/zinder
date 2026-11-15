@@ -207,7 +207,12 @@ of each declared index:
   below the index's newest height minus `W` with one range delete, drops the
   SST files that held only those rows, and compacts the rest of the range.
   Ingest runs it on a blocking thread whenever it opens the view store, so a
-  store written without pruning shrinks in place, without a rebuild.
+  store written without pruning shrinks in place, without a rebuild. The pass
+  decides from the SST files rather than the visible rows, so a pass stopped
+  after its range delete still reclaims the files on the next start. Shutdown
+  stops it between indexes and between steps, and waits only for a running
+  compaction, which by then covers just the files that straddle the end of the
+  range and recent unsorted files.
 
 The declaration is not part of the persisted manifest and the row encoding
 does not change, so declaring it needs no schema version change. A store that

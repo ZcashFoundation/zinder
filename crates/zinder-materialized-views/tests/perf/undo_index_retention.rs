@@ -9,6 +9,7 @@
 //! full compaction of both stores, so they hold on any CI worker.
 
 use std::{
+    cell::Cell,
     collections::{BTreeMap, HashMap},
     error::Error,
     path::Path,
@@ -75,8 +76,18 @@ fn pruned_views_keep_only_the_undo_rows_the_reorg_window_reaches() -> TestResult
     assert!(total(&pruned_bytes) < total(&unpruned_bytes));
 
     {
+        // A restart can stop the pass right after its first range delete hides
+        // that index's rows; the next pass must still reclaim their files.
+        let interrupted = open_store(unpruned_directory.path(), Some(reorg_policy))?;
+        let checks = Cell::new(0);
+        interrupted.prune_undo_indexes(|| {
+            checks.set(checks.get() + 1);
+            checks.get() > 1
+        })?;
+    }
+    {
         let reopened = open_store(unpruned_directory.path(), Some(reorg_policy))?;
-        let prunings = reopened.prune_undo_indexes()?;
+        let prunings = reopened.prune_undo_indexes(|| false)?;
         assert_eq!(prunings.len(), undo_index_column_families().len());
         let pruned = open_store(pruned_directory.path(), None)?;
         assert_rows_match(&reopened, &pruned)?;

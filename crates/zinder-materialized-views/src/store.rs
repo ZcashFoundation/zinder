@@ -1557,20 +1557,29 @@ impl MaterializedViewStore {
     /// reclaims the disk space it held.
     ///
     /// For each declared
-    /// [`height_undo_index`](MaterializedViewConsumerSchema::height_undo_index)
-    /// that still holds a row at or below its newest height minus the window,
-    /// one range delete removes those rows, the SST files that held only them
-    /// are dropped, and a compaction rewrites the files at the range's edge.
-    /// Rows within the window, and so the newest height a reader takes from
-    /// the index, are untouched. A store opened without
-    /// [`MaterializedViewStoreOptions::reorg_policy`], or as a secondary,
-    /// prunes nothing.
+    /// [`height_undo_index`](MaterializedViewConsumerSchema::height_undo_index),
+    /// a pass covers the rows at or below the index's newest height minus the
+    /// window. One range delete hides any such row still visible, the SST
+    /// files that hold only rows in that range are dropped, and a compaction
+    /// rewrites the files that still reach into it. Rows within the window, and
+    /// so the newest height a reader takes from the index, are untouched. A
+    /// store opened without [`MaterializedViewStoreOptions::reorg_policy`], or
+    /// as a secondary, prunes nothing.
     ///
-    /// Hosts call this once after opening a store written without pruning, off
-    /// any latency-sensitive path: the compaction reads and rewrites the files
-    /// at the edge of each pruned range. It is safe beside chain-event writes,
-    /// which touch only heights above the pruned range.
-    pub fn prune_undo_indexes(&self) -> Result<Vec<UndoIndexPruning>, MaterializedViewStoreError> {
+    /// The pass decides from the SST files, not the visible rows, so a pass
+    /// interrupted after its range delete reclaims the files on the next call.
+    /// `should_stop` is checked before each index and between the steps of one,
+    /// so a stopped pass leaves the rest for a later call. Only the compaction
+    /// runs uninterrupted; dropping whole files first leaves it the files that
+    /// straddle the end of the range and recent unsorted files.
+    ///
+    /// Hosts call this after opening a store, off any latency-sensitive path.
+    /// It is safe beside chain-event writes, which touch only heights above
+    /// the pruned range.
+    pub fn prune_undo_indexes(
+        &self,
+        should_stop: impl Fn() -> bool,
+    ) -> Result<Vec<UndoIndexPruning>, MaterializedViewStoreError> {
         let Some(reorg_policy) = self.reorg_policy else {
             return Ok(Vec::new());
         };
@@ -1580,7 +1589,12 @@ impl MaterializedViewStore {
             .iter()
             .filter_map(|schema| schema.height_undo_index)
         {
-            if let Some(pruning) = self.prune_undo_index(column_family, reorg_policy)? {
+            if should_stop() {
+                break;
+            }
+            if let Some(pruning) =
+                self.prune_undo_index(column_family, reorg_policy, &should_stop)?
+            {
                 prunings.push(pruning);
             }
         }
@@ -1591,6 +1605,7 @@ impl MaterializedViewStore {
         &self,
         column_family: &'static str,
         reorg_policy: CanonicalReorgPolicy,
+        should_stop: &impl Fn() -> bool,
     ) -> Result<Option<UndoIndexPruning>, MaterializedViewStoreError> {
         let Some(newest_height) = self.last_materialized_height_ascending(column_family)? else {
             return Ok(None);
@@ -1613,6 +1628,7 @@ impl MaterializedViewStore {
                 source,
             }
         };
+        let sst_bytes_before = self.total_sst_file_bytes(&handle);
         let oldest_key = self
             .db
             .iterator_cf(&handle, IteratorMode::Start)
@@ -1620,27 +1636,31 @@ impl MaterializedViewStore {
             .transpose()
             .map_err(operation_error("first_key"))?
             .map(|(key, _payload)| key);
-        if oldest_key.is_none_or(|key| key.as_ref() > last_pruned_key.as_slice()) {
-            return Ok(None);
+        if oldest_key.is_some_and(|key| key.as_ref() <= last_pruned_key.as_slice()) {
+            let mut batch = WriteBatch::default();
+            // The range end is exclusive, so it names the first retained height.
+            batch.delete_range_cf(
+                &handle,
+                first_key,
+                encode_height_key_ascending(pruned_through.next().unwrap_or(pruned_through)),
+            );
+            self.write(&batch).map_err(operation_error("prune_range"))?;
         }
-        let sst_bytes_before = self.total_sst_file_bytes(&handle);
-        let mut batch = WriteBatch::default();
-        // The range end is exclusive, so it names the first retained height.
-        batch.delete_range_cf(
-            &handle,
-            first_key,
-            encode_height_key_ascending(pruned_through.next().unwrap_or(pruned_through)),
-        );
-        self.write(&batch).map_err(operation_error("prune_range"))?;
-        // Flushing first keeps the range tombstone durable while whole files
-        // below it are dropped, so no older row version can resurface.
+        // Flushing keeps every tombstone in the range durable while whole
+        // files below it are dropped, so no older row version can resurface.
         self.db
             .flush_cf(&handle)
             .map_err(operation_error("prune_flush"))?;
+        if !self.has_sst_file_reaching(column_family, &last_pruned_key)? || should_stop() {
+            return Ok(None);
+        }
         // `DeleteFilesInRange` treats its end key as inclusive.
         self.db
             .delete_file_in_range_cf(&handle, first_key, last_pruned_key)
             .map_err(operation_error("prune_files"))?;
+        if should_stop() {
+            return Ok(None);
+        }
         let mut compact_options = CompactOptions::default();
         compact_options.set_exclusive_manual_compaction(false);
         compact_options.set_bottommost_level_compaction(BottommostLevelCompaction::ForceOptimized);
@@ -1655,6 +1675,29 @@ impl MaterializedViewStore {
             pruned_through_height: pruned_through,
             sst_bytes_before,
             sst_bytes_after: self.total_sst_file_bytes(&handle),
+        }))
+    }
+
+    /// Returns whether an SST file of `column_family` holds a key at or below
+    /// `last_key`, including deleted keys a compaction has not dropped yet.
+    fn has_sst_file_reaching(
+        &self,
+        column_family: &'static str,
+        last_key: &[u8],
+    ) -> Result<bool, MaterializedViewStoreError> {
+        let live_files = self.db.live_files().map_err(|source| {
+            MaterializedViewStoreError::ConsumerOperation {
+                operation: "live_files",
+                name: column_family,
+                source,
+            }
+        })?;
+        Ok(live_files.iter().any(|file| {
+            file.column_family_name == column_family
+                && file
+                    .start_key
+                    .as_deref()
+                    .is_some_and(|start_key| start_key <= last_key)
         }))
     }
 

@@ -240,7 +240,7 @@ fn pruning_a_store_written_without_a_window_keeps_only_the_rows_the_window_reach
     }
     let pruned = written_unpruned.reopen(WINDOW, UndoRows::Pruned)?;
 
-    let prunings = pruned.store.prune_undo_indexes()?;
+    let prunings = pruned.store.prune_undo_indexes(|| false)?;
     let mut pruned_families = prunings
         .iter()
         .map(|pruning| pruning.column_family)
@@ -259,7 +259,7 @@ fn pruning_a_store_written_without_a_window_keeps_only_the_rows_the_window_reach
     );
     assert_no_divergence(&pruned, &unpruned, 9 - WINDOW)?;
     assert!(
-        pruned.store.prune_undo_indexes()?.is_empty(),
+        pruned.store.prune_undo_indexes(|| false)?.is_empty(),
         "a store already within its window has nothing left to prune"
     );
 
@@ -267,6 +267,40 @@ fn pruning_a_store_written_without_a_window_keeps_only_the_rows_the_window_reach
         store.commit(&chain, 10, 15)?;
     }
     assert_no_divergence(&pruned, &unpruned, 15 - WINDOW)
+}
+
+#[test]
+fn pruning_stopped_after_its_range_delete_reclaims_the_files_after_a_restart() -> TestResult {
+    const WINDOW: u32 = 3;
+    let chain = Chain::build(12, PREFIX_BRANCH, &Chain::default());
+    let written_unpruned = ReplayStore::open(WINDOW, UndoRows::Kept)?;
+    let unpruned = ReplayStore::open(WINDOW, UndoRows::Kept)?;
+    for store in [&written_unpruned, &unpruned] {
+        store.commit_in_chunks(&chain, 4)?;
+    }
+    let pruned = written_unpruned.reopen(WINDOW, UndoRows::Pruned)?;
+    // The first check lets one index start; the next stops it right after its
+    // range delete hides the rows, before any file is dropped.
+    let checks = Cell::new(0);
+    let stopped = pruned.store.prune_undo_indexes(|| {
+        checks.set(checks.get() + 1);
+        checks.get() > 1
+    })?;
+    assert!(stopped.is_empty());
+
+    let pruned = pruned.reopen(WINDOW, UndoRows::Pruned)?;
+    let resumed = pruned.store.prune_undo_indexes(|| false)?;
+    let declared_families = bundled_materialized_view_consumer_definitions()
+        .iter()
+        .filter_map(|definition| definition.schema.height_undo_index)
+        .count();
+    assert_eq!(
+        resumed.len(),
+        declared_families,
+        "the restarted pass must reclaim the index whose rows were already hidden"
+    );
+    assert!(pruned.store.prune_undo_indexes(|| false)?.is_empty());
+    assert_no_divergence(&pruned, &unpruned, 12 - WINDOW)
 }
 
 #[test]

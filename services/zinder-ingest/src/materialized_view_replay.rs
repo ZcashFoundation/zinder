@@ -369,18 +369,22 @@ pub fn open_primary_materialized_view_store(
 }
 
 /// Prunes the view store's height undo indexes to the reorg window on a
-/// blocking thread, logging what each pass reclaimed.
+/// blocking thread, logging what each index reclaimed.
 ///
 /// A store written by an earlier release holds undo rows for every height. The
-/// pass removes the rows below the window and compacts their range, beside
-/// replay, which writes only heights above it.
-#[must_use = "dropping the handle lets the pruning pass run detached"]
+/// pass removes the rows below the window and compacts their range beside
+/// replay, which writes only heights above it. Cancellation stops the pass
+/// between indexes and between the steps of one; the next start resumes it.
+/// Await the handle before shutdown completes, because a running compaction
+/// finishes before the task returns.
+#[must_use = "the pruning task must be awaited before shutdown completes"]
 pub fn spawn_undo_index_pruning_task(
     materialized_view_store: MaterializedViewStore,
+    cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         let started_at = Instant::now();
-        match materialized_view_store.prune_undo_indexes() {
+        match materialized_view_store.prune_undo_indexes(|| cancel.is_cancelled()) {
             Ok(prunings) => {
                 for pruning in prunings {
                     tracing::info!(
@@ -392,7 +396,7 @@ pub fn spawn_undo_index_pruning_task(
                         sst_bytes_after = pruning.sst_bytes_after,
                         elapsed_ms = u64::try_from(started_at.elapsed().as_millis())
                             .unwrap_or(u64::MAX),
-                        "deleted materialized-view undo rows below the reorg window"
+                        "reclaimed materialized-view undo rows below the reorg window"
                     );
                 }
             }

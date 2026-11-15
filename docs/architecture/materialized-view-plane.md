@@ -320,7 +320,9 @@ transaction-fee view declare their per-height index as a height undo index.
 Ingest opens the view store with the canonical store's effective window `W`.
 Applying height `h` deletes the index row at `h - W`, and each time ingest
 opens the store it deletes every older row on a blocking thread and compacts
-the range, so a store built by an earlier release shrinks in place. The newest
+the range, so a store built by an earlier release shrinks in place. A pass that
+shutdown interrupts resumes on the next start, including one stopped after its
+rows were hidden but before their files were reclaimed. The newest
 row stays, so replay still reads its durable height from the outpoint-spend
 index. After an operator raises the window, recovery reverts heights the
 smaller window already pruned; they are settled, so re-applying them writes the
