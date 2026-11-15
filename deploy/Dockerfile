@@ -15,15 +15,26 @@
 #     docker build -f deploy/Dockerfile --target zinder-bench -t zinder-bench .
 #     docker build -f deploy/Dockerfile --target zinder-ingest-live-tests -t zinder-ingest-live-tests .
 #
-# Every runtime target depends on the same `zinder-binaries` stage. That stage
-# compiles all shipped binaries in one Cargo invocation and keeps Cargo registry,
-# git, and target artifacts in BuildKit cache mounts. Rebuilding one service
-# warms the shared cache for every other service image.
+# Every runtime target copies its binaries from the `zinder-binaries-selected`
+# stage, which `ZINDER_BINARIES_SOURCE` names. By default it is
+# `zinder-binaries`, which compiles all shipped binaries in one Cargo
+# invocation and keeps Cargo registry, git, and target artifacts in BuildKit
+# cache mounts, so rebuilding one service warms the shared cache for every
+# other service image. The benchmark compiles in its own stage against the
+# same cache and is not part of that invocation.
+#
+# The release packages its images from the reproduced binary archive instead
+# of compiling again. DIR/zinder-binaries/ holds the extracted archive binaries:
+#
+#     docker buildx build -f deploy/Dockerfile --target zinder-ingest \
+#       --build-arg ZINDER_BINARIES_SOURCE=zinder-archived-binaries \
+#       --build-context zinder-archived-binaries=DIR .
 
 ARG RUST_VERSION=1.95.0
 ARG DEBIAN_RELEASE=bookworm
 ARG RUST_IMAGE_DIGEST=sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
 ARG DEBIAN_IMAGE_DIGEST=sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+ARG ZINDER_BINARIES_SOURCE=zinder-binaries
 
 FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE}@${RUST_IMAGE_DIGEST} AS zinder-build-base
 
@@ -47,14 +58,10 @@ COPY rust-toolchain.toml ./
 RUN rustup show active-toolchain >/dev/null
 RUN cargo install cargo-auditable --version 0.7.4 --locked
 
-FROM zinder-build-base AS zinder-binaries
+FROM zinder-build-base AS zinder-release-source
 
-ARG RUST_VERSION
-ARG TARGETARCH
-ARG TARGETVARIANT
 ARG ZINDER_BUILD_GIT_COMMIT="unknown"
 ARG SOURCE_DATE_EPOCH=0
-ARG RELEASE_CACHE_SCOPE=shared
 
 # x86-64-v3 also reaches the vendored RocksDB C++ (hardware CRC32c, AVX2);
 # scoping to the target triple keeps build scripts and non-x86 images on the
@@ -71,6 +78,13 @@ ENV ZINDER_BUILD_GIT_COMMIT=${ZINDER_BUILD_GIT_COMMIT}
 
 COPY . .
 
+FROM zinder-release-source AS zinder-binaries
+
+ARG RUST_VERSION
+ARG TARGETARCH
+ARG TARGETVARIANT
+ARG RELEASE_CACHE_SCOPE=shared
+
 RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zinder-cargo-git-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zinder-cargo-target-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT}-${RELEASE_CACHE_SCOPE},target=/workspace/target,sharing=locked \
@@ -82,14 +96,28 @@ RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${T
         --bin zinder-query \
         --bin zinder-compat-lightwalletd \
         --bin zinder-explorer \
-        --bin zinder-bench \
     && mkdir -p /zinder-binaries \
     && cp "/workspace/target/${rust_target}/release/zinder-ingest" /zinder-binaries/zinder-ingest \
     && cp "/workspace/target/${rust_target}/release/zinder-projector" /zinder-binaries/zinder-projector \
     && cp "/workspace/target/${rust_target}/release/zinder-query" /zinder-binaries/zinder-query \
     && cp "/workspace/target/${rust_target}/release/zinder-compat-lightwalletd" /zinder-binaries/zinder-compat-lightwalletd \
-    && cp "/workspace/target/${rust_target}/release/zinder-explorer" /zinder-binaries/zinder-explorer \
-    && cp "/workspace/target/${rust_target}/release/zinder-bench" /zinder-binaries/zinder-bench
+    && cp "/workspace/target/${rust_target}/release/zinder-explorer" /zinder-binaries/zinder-explorer
+
+FROM zinder-release-source AS zinder-bench-binary
+
+ARG RUST_VERSION
+ARG TARGETARCH
+ARG TARGETVARIANT
+ARG RELEASE_CACHE_SCOPE=shared
+
+RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=zinder-cargo-git-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT},target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=zinder-cargo-target-${RUST_VERSION}-${TARGETARCH}${TARGETVARIANT}-${RELEASE_CACHE_SCOPE},target=/workspace/target,sharing=locked \
+    rust_target="$(case "$TARGETARCH" in amd64) printf '%s' x86_64-unknown-linux-gnu ;; arm64) printf '%s' aarch64-unknown-linux-gnu ;; *) exit 1 ;; esac)" \
+    && rustup target add "$rust_target" \
+    && cargo auditable build --locked --release --target "$rust_target" --bin zinder-bench \
+    && mkdir -p /zinder-bench \
+    && cp "/workspace/target/${rust_target}/release/zinder-bench" /zinder-bench/zinder-bench
 
 FROM scratch AS release-binaries
 
@@ -98,6 +126,13 @@ COPY --from=zinder-binaries /zinder-binaries/zinder-projector /bin/zinder-projec
 COPY --from=zinder-binaries /zinder-binaries/zinder-query /bin/zinder-query
 COPY --from=zinder-binaries /zinder-binaries/zinder-compat-lightwalletd /bin/zinder-compat-lightwalletd
 COPY --from=zinder-binaries /zinder-binaries/zinder-explorer /bin/zinder-explorer
+
+# Release image packaging replaces this empty stage with a build context of
+# archived binaries. A build that selects it without that context fails at the
+# first binary copy instead of compiling.
+FROM scratch AS zinder-archived-binaries
+
+FROM ${ZINDER_BINARIES_SOURCE} AS zinder-binaries-selected
 
 FROM zinder-build-base AS zinder-ingest-live-test-binary
 
@@ -133,7 +168,7 @@ RUN groupadd --system --gid 1000 zinder \
 
 FROM zinder-runtime-base AS zinder-ingest
 
-COPY --from=zinder-binaries /zinder-binaries/zinder-ingest /usr/local/bin/zinder-ingest
+COPY --from=zinder-binaries-selected /zinder-binaries/zinder-ingest /usr/local/bin/zinder-ingest
 
 USER zinder:zinder
 WORKDIR /var/lib/zinder
@@ -147,7 +182,7 @@ ENTRYPOINT ["zinder-ingest"]
 
 FROM zinder-runtime-base AS zinder-projector
 
-COPY --from=zinder-binaries /zinder-binaries/zinder-projector /usr/local/bin/zinder-projector
+COPY --from=zinder-binaries-selected /zinder-binaries/zinder-projector /usr/local/bin/zinder-projector
 
 USER zinder:zinder
 WORKDIR /var/lib/zinder
@@ -170,7 +205,7 @@ ENTRYPOINT ["zinder-ingest-acceptance"]
 
 FROM zinder-runtime-base AS zinder-query
 
-COPY --from=zinder-binaries /zinder-binaries/zinder-query /usr/local/bin/zinder-query
+COPY --from=zinder-binaries-selected /zinder-binaries/zinder-query /usr/local/bin/zinder-query
 
 USER zinder:zinder
 WORKDIR /var/lib/zinder
@@ -184,7 +219,7 @@ ENTRYPOINT ["zinder-query"]
 
 FROM zinder-runtime-base AS zinder-compat-lightwalletd
 
-COPY --from=zinder-binaries /zinder-binaries/zinder-compat-lightwalletd /usr/local/bin/zinder-compat-lightwalletd
+COPY --from=zinder-binaries-selected /zinder-binaries/zinder-compat-lightwalletd /usr/local/bin/zinder-compat-lightwalletd
 
 USER zinder:zinder
 WORKDIR /var/lib/zinder
@@ -198,7 +233,7 @@ ENTRYPOINT ["zinder-compat-lightwalletd"]
 
 FROM zinder-runtime-base AS zinder-explorer
 
-COPY --from=zinder-binaries /zinder-binaries/zinder-explorer /usr/local/bin/zinder-explorer
+COPY --from=zinder-binaries-selected /zinder-binaries/zinder-explorer /usr/local/bin/zinder-explorer
 
 USER zinder:zinder
 WORKDIR /var/lib/zinder
@@ -237,9 +272,9 @@ ENTRYPOINT ["zinder-canonical-runtime-entrypoint"]
 # Hosts with shared volumes across containers use deploy/docker-compose.yml.
 FROM zinder-runtime-base AS zinder-wallet-serving
 
-COPY --from=zinder-binaries /zinder-binaries/zinder-ingest /usr/local/bin/zinder-ingest
-COPY --from=zinder-binaries /zinder-binaries/zinder-projector /usr/local/bin/zinder-projector
-COPY --from=zinder-binaries /zinder-binaries/zinder-query /usr/local/bin/zinder-query
+COPY --from=zinder-binaries-selected /zinder-binaries/zinder-ingest /usr/local/bin/zinder-ingest
+COPY --from=zinder-binaries-selected /zinder-binaries/zinder-projector /usr/local/bin/zinder-projector
+COPY --from=zinder-binaries-selected /zinder-binaries/zinder-query /usr/local/bin/zinder-query
 
 COPY deploy/config/wallet-serving/ingest.toml /etc/zinder/ingest.toml
 COPY deploy/config/wallet-serving/projector.toml /etc/zinder/projector.toml
@@ -275,7 +310,7 @@ ENTRYPOINT ["zinder-wallet-serving-runtime-entrypoint"]
 # zinder-wallet-serving in one setting: ingest also writes the Explorer views.
 FROM zinder-wallet-serving AS zinder-wallet-serving-explorer
 
-COPY --from=zinder-binaries /zinder-binaries/zinder-explorer /usr/local/bin/zinder-explorer
+COPY --from=zinder-binaries-selected /zinder-binaries/zinder-explorer /usr/local/bin/zinder-explorer
 
 COPY deploy/config/wallet-serving/explorer.toml /etc/zinder/explorer.toml
 
@@ -294,7 +329,7 @@ ENTRYPOINT ["zinder-wallet-serving-explorer-runtime-entrypoint"]
 
 FROM zinder-runtime-base AS zinder-bench
 
-COPY --from=zinder-binaries /zinder-binaries/zinder-bench /usr/local/bin/zinder-bench
+COPY --from=zinder-bench-binary /zinder-bench/zinder-bench /usr/local/bin/zinder-bench
 COPY --chmod=0755 deploy/capture-container-resource-evidence.sh /usr/local/bin/zinder-capture-container-resource-evidence
 
 USER zinder:zinder
