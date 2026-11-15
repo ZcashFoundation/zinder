@@ -2631,9 +2631,11 @@ mod tests {
     /// Unspent-output reads that clients abandon or stop consuming never stop
     /// publication.
     ///
-    /// An abandoned read releases its pair at once. A read whose client stops
-    /// consuming keeps its pair only until the publisher revokes reads on it,
-    /// and then ends with its epoch unavailable.
+    /// An abandoned read releases its pair at once. A read that is consumed
+    /// while a newer pair is published finishes the complete set at the epoch
+    /// it started on. A read whose client stops consuming keeps its pair only
+    /// until the publisher revokes reads on it, and then ends with its epoch
+    /// unavailable.
     #[tokio::test(flavor = "multi_thread")]
     #[expect(
         clippy::too_many_lines,
@@ -2751,6 +2753,33 @@ mod tests {
             publish_next(&mut publisher).await?,
             "publication resumes once abandoned reads release their pairs"
         );
+
+        // A read that a newer publication overtakes mid-stream still delivers
+        // the complete set at the epoch it started on.
+        let replaced_pair = slot.capture();
+        let replaced_epoch_id = replaced_pair.canonical_fence().chain_epoch_id();
+        let replaced = Arc::downgrade(&replaced_pair);
+        drop(replaced_pair);
+        let mut overtaken = started_unspent_output_read(&query, address).await?;
+        assert!(
+            publish_next(&mut publisher).await?,
+            "a read in progress must not stop publication"
+        );
+        assert!(!replaced.ptr_eq(&Arc::downgrade(&slot.capture())));
+        let mut remaining_output_indexes = Vec::new();
+        while let Some(output) = overtaken.next().await {
+            remaining_output_indexes.push(output?.outpoint.output_index);
+        }
+        assert_eq!(overtaken.chain_epoch.id, replaced_epoch_id);
+        assert_eq!(
+            remaining_output_indexes,
+            (1..=u32::try_from(
+                3 * usize::from(crate::TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE.get())
+            )?)
+                .collect::<Vec<_>>()
+        );
+        drop(overtaken);
+        wait_for_released_pairs(&[replaced]).await?;
 
         // Reads whose clients stop consuming fill the spare generations again.
         let mut stalled = Vec::new();
