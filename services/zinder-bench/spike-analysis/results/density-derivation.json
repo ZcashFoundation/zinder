@@ -1,0 +1,63 @@
+{
+ "label": "synthetic, derived (Testnet replay scaled toward Mainnet); not a Mainnet measurement",
+ "testnet_replay_range": {
+  "heights": [
+   4580001,
+   4599999
+  ],
+  "mean_block_bytes": 11875.6,
+  "mean_transactions_per_block": 1.7277,
+  "blocks_over_100KB": 25,
+  "max_block_bytes": 183694,
+  "source": "getblock verbosity 1 against the Testnet node, .tmp/spike-results/tools/block-sizes.txt"
+ },
+ "measured_testnet_base_bytes_per_commit": {
+  "phase": "baseline-no-readers (Run 1, 1x)",
+  "canonical_base_bytes_mean": 14212.011666666667,
+  "wallet_base_bytes_mean": 4998.285833333333,
+  "source": "run1-1x/out/report.json phases[0]"
+ },
+ "mainnet_targets": {
+  "recent_tip_by_transaction_count": {
+   "inputs": {
+    "mainnet_q3_2026_transactions": 710047,
+    "mainnet_q3_2026_blocks": 105487,
+    "mainnet_q3_2026_mean_block_interval_s": 75.3,
+    "source": "Blockworks Zcash token holder report Q3 2026, as quoted by https://www.aicoin.com/en/article/555009"
+   },
+   "mainnet_transactions_per_block": 6.731,
+   "testnet_replay_transactions_per_block": 1.7277,
+   "multiplier_all_transactions": 3.9,
+   "multiplier_non_coinbase_transactions": 7.88,
+   "post_nu7_note": "NU7 activated on Mainnet at height 3,543,405 on 2026-11-05 with a 25-second target (https://theblock.co/news/defi/2026-11-06-zcashs-nu7-goes-live-435807); at the Q3 transaction rate a 25-second block carries one third of a 75-second block, so the per-block multiplier falls to about 1.3x (all) or 2.6x (non-coinbase)",
+   "caveat": "transaction count is a proxy for row volume; Mainnet transactions carry more transparent inputs and outputs than Testnet's mostly coinbase-only blocks, so byte volume per transaction is not measured"
+  },
+  "whole_chain_average_by_transparent_outpoint_volume": {
+   "inputs": {
+    "mainnet_outpoint_sorter_bytes": 99000000000.0,
+    "mainnet_source": "docs/runbooks/initial-sync.md (Wallet construction: the outpoint sorter of a late-2026 Mainnet build from genesis needed about 99 GB)",
+    "testnet_outpoint_sorter_bytes_at_4597000": 2255869374,
+    "testnet_outpoint_records_at_4597000": 15147877,
+    "testnet_outpoint_sorter_bytes_at_4620122": 2600446123,
+    "testnet_outpoint_records_at_4620122": 17636328,
+    "mainnet_height_estimate": 3550000,
+    "mainnet_height_source": "NU7 activation height 3,543,405 on 2026-11-05 (theblock.co)"
+   },
+   "whole_chain_ratio_range": [
+    19.0,
+    38.1
+   ],
+   "per_block_ratio_range": [
+    24.8,
+    49.5
+   ],
+   "range_note": "the low end assumes the documented 99 GB counts the merge's double footprint (the doc says a multi-run sorter needs about twice its spilled bytes); the Testnet sorter used one run, so its bytes are the spilled bytes",
+   "caveat": "a whole-chain average includes historical transparent-heavy periods and is not the density of recent tip blocks"
+  }
+ },
+ "multipliers_run": {
+  "10x": "above the recent-tip estimate (3.9x by all transactions, 7.9x by non-coinbase transactions, at 75-second spacing; about a third of that at the 25-second spacing since NU7)",
+  "60x": "above the whole-chain per-block estimate (about 25x to 50x)"
+ },
+ "what_the_multiplier_scales": "each synced batch gets (multiplier - 1) x its real byte size of extra rows in a spike_density_ballast column family of the same database; canonical ballast keys are append-only, wallet ballast keys are hash-distributed with 25% deleted 100 writes later and 25% deleted 3,600 writes later; values are real rows sampled from the stores; per-commit CPU (prepare, validation, readback, wallet derivation) is not scaled"
+}

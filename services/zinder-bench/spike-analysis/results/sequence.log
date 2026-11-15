@@ -1,0 +1,16 @@
+2026-11-15T01:58:48Z sequence start rev=00ac60d1cfcdbd369d248460dcbc127d8f6b670b
+2026-11-15T01:58:48Z arm3 start
+2026-11-15T02:09:51Z arm3 exit 0
+2026-11-15T02:09:51Z run1-1x start
+2026-11-15T04:58:19Z run1-1x exit (process ended; observed by run_rest.sh)
+2026-11-15T04:58:19Z density-x10 start (free 24 GiB)
+2026-11-15T06:14:35Z density-x10 exit 0
+2026-11-15T06:14:35Z density-x60 start (free 24 GiB)
+2026-11-15T07:31:07Z density-x60 exit 0
+2026-11-15T07:31:07Z repeat-scan-load start (free 24 GiB)
+2026-11-15T08:06:12Z repeat-scan-load exit 0
+2026-11-15T08:06:12Z sequence done
+2026-11-15T08:06:20Z density-x60-control start (free 22 GiB)
+2026-11-15T09:08:45Z density-x60-control exit 1
+2026-11-15T09:08:45Z density-x10-control skipped: free 7 GiB < 8 GiB
+2026-11-15T09:08:45Z controls done
