@@ -566,6 +566,59 @@ lane A serving and rebuild lane B from a newly captured canonical fence. Do not
 copy READY markers, rename a live RocksDB directory, or reuse a drained
 secondary path before every request holding its generation has released it.
 
+### Wallet transition exceeds its logical-byte limit
+
+The projector logs `projector failed` with an error that begins:
+
+```text
+wallet following stopped planning a transition that already needs <n> logical bytes, more than projector.follow.max_transition_logical_bytes (ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES) allows (<limit>)
+```
+
+The projector exits, and its `on-failure` restart policy brings it back into
+the same failure. One wallet transition, typically a deep reorg that rolls back
+and replays many blocks of a busy address, touches more wallet rows than the
+limit allows. The limit counts each row the transition touches twice, once for
+the plan in memory and once for the write batch that publishes it. The
+projector refuses the transition before it writes anything, so the wallet is
+unchanged, and `<n>` is a lower bound on what the whole transition needs.
+
+The restart loop does not end on its own. Each restart plans the same
+transition from the same wallet cursor, repeats its canonical replay and wallet
+reads up to the refusal, and leases canonical retention at the wallet cursor
+again, so the canonical writer keeps every retained event from that cursor on.
+Waiting for the chain to move on does not help either: if later canonical
+events overwrite the refused range, the projector reconciles instead, but a
+reconciliation is also one transition under the same limit.
+
+To recover, stop the projector, raise the limit, and start it again:
+
+```bash
+docker compose --env-file /etc/zinder/env \
+  -f /opt/zinder/deploy/docker-compose.yml stop zinder-projector
+```
+
+Add the setting to `/opt/zinder/deploy/config/projector.toml`, well above
+`<n>` and at most `1073741824`. The default is `536870912`.
+
+```toml
+[projector.follow]
+max_transition_logical_bytes = 1073741824
+```
+
+```bash
+docker compose --env-file /etc/zinder/env \
+  -f /opt/zinder/deploy/docker-compose.yml up -d zinder-projector
+```
+
+The projector can hold up to the limit in memory while it plans and publishes
+one transition, so keep at least the bytes you add to the limit free under its
+memory limit, `ZINDER_PROJECTOR_MEMORY_LIMIT`, which defaults to `10g`. Memory
+use at the maximum has not been measured.
+
+If `<n>` already exceeds `1073741824`, or the failure repeats at the maximum,
+no setting admits the transition. Rebuild the wallet in lane B as described
+above, then move traffic to it.
+
 ## Restart and rollback
 
 Restart one owner at a time in dependency order:

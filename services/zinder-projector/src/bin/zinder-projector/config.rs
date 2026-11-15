@@ -41,8 +41,11 @@ const DEFAULT_SECONDARY_SORT_MEMORY_BYTES_PER_SORTER: u64 = 1024 * 1024 * 1024;
 const DEFAULT_TEMPORARY_FILE_BYTES_PER_SORTER: u64 = 192 * 1024 * 1024 * 1024;
 const DEFAULT_SST_TARGET_LOGICAL_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_ACCOUNTED_REORG_UNDO_BYTES: u64 = 512 * 1024 * 1024;
-/// One following transition may account for at most this many logical bytes
-/// across its planner overlay and durable write batch.
+/// One following transition may account for at most this many logical bytes.
+///
+/// Each distinct row the transition touches counts twice, as its key and final
+/// value in the plan and again in the write batch, and the control record
+/// counts once.
 const DEFAULT_FOLLOW_MAX_TRANSITION_LOGICAL_BYTES: u64 = 512 * 1024 * 1024;
 /// The single-host production envelope reserves the rest of its 10 GiB budget
 /// for canonical/wallet `RocksDB`, replay rows, and builder spill files.
@@ -151,6 +154,17 @@ pub(crate) enum ProjectorError {
         required_bytes: u64,
     },
 
+    #[error(
+        "wallet following stopped planning a transition that already needs {required_bytes} logical bytes, more than projector.follow.max_transition_logical_bytes (ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES) allows ({limit_bytes}), and the complete transition may need more; the wallet is unchanged and restarting with the same setting fails again, so raise it well above {required_bytes}, up to the maximum of {MAX_FOLLOW_MAX_TRANSITION_LOGICAL_BYTES} bytes, with matching memory headroom for the projector, or, if it is already at the maximum, rebuild the wallet in a separately provisioned side-by-side lane"
+    )]
+    WalletTransitionLogicalByteLimit {
+        /// Configured logical-byte ceiling for one following transition.
+        limit_bytes: u64,
+        /// Accounted logical bytes when the transition stopped, a lower bound
+        /// on the ceiling the complete transition needs.
+        required_bytes: u64,
+    },
+
     #[error(transparent)]
     CanonicalControl(#[from] crate::canonical_writer_control::CanonicalWriterControlError),
 
@@ -239,8 +253,9 @@ impl From<zinder_wallet_rocksdb::RocksDbWalletError> for ProjectorError {
         use zinder_rocksdb_bulk_load::BulkLoadError;
         use zinder_wallet_rocksdb::RocksDbWalletError;
 
-        // An undersized spill ceiling is an operator setting, not a storage
-        // fault, and every restart with the same value fails the same way.
+        // An undersized spill or transition ceiling is an operator setting,
+        // not a storage fault, and every restart with the same value fails the
+        // same way.
         if let RocksDbWalletError::BulkLoad(BulkLoadError::TemporaryFileLimit {
             limit_bytes,
             required_bytes,
@@ -257,6 +272,16 @@ impl From<zinder_wallet_rocksdb::RocksDbWalletError> for ProjectorError {
         }) = error
         {
             return Self::WalletBuildTemporaryFileLimitBeforeFinish {
+                limit_bytes,
+                required_bytes,
+            };
+        }
+        if let RocksDbWalletError::TransitionLogicalByteLimit {
+            limit_bytes,
+            required_bytes,
+        } = error
+        {
+            return Self::WalletTransitionLogicalByteLimit {
                 limit_bytes,
                 required_bytes,
             };
@@ -852,6 +877,29 @@ mod tests {
         assert!(message.contains("projector.build.max_temporary_file_bytes_per_sorter"));
         assert!(message.contains("ZINDER_PROJECTOR__BUILD__MAX_TEMPORARY_FILE_BYTES_PER_SORTER"));
         assert!(message.contains("98524054494"));
+    }
+
+    #[test]
+    fn oversized_following_transition_names_the_setting_and_its_maximum() {
+        let error = ProjectorError::from(RocksDbWalletError::TransitionLogicalByteLimit {
+            limit_bytes: DEFAULT_FOLLOW_MAX_TRANSITION_LOGICAL_BYTES,
+            required_bytes: 536_870_913,
+        });
+        let message = error.to_string();
+
+        assert!(matches!(
+            error,
+            ProjectorError::WalletTransitionLogicalByteLimit {
+                limit_bytes: DEFAULT_FOLLOW_MAX_TRANSITION_LOGICAL_BYTES,
+                required_bytes: 536_870_913,
+            }
+        ));
+        assert!(message.contains("projector.follow.max_transition_logical_bytes"));
+        assert!(message.contains("ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES"));
+        assert!(message.contains("536870913"));
+        assert!(message.contains("1073741824"));
+        assert!(message.contains("the wallet is unchanged"));
+        assert!(message.contains("side-by-side"));
     }
 
     #[test]
