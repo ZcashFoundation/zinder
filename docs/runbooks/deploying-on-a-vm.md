@@ -328,8 +328,11 @@ build. It logs these events:
 - `transparent_address_ranking_activated` when the build activates at the
   shared cursor of views that already follow the tip.
 - `materialized_view_replay_ranking_build_stalled`, a warning, when the build
-  applied no history for 5 minutes. View replay then continues without it, and
-  the build activates once the views follow the tip.
+  applied no history for 5 minutes outside its pauses. View replay then
+  continues without it, and the build activates once the views follow the tip.
+- `materialized_view_replay_ranking_build_state_unreadable`, a warning, when
+  replay cannot read the build's state. Replay continues without waiting for
+  the build.
 
 The build reads every canonical block from height 1 and resumes after a
 restart. Follow it with

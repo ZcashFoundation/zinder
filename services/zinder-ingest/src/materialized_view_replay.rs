@@ -1168,7 +1168,7 @@ impl MaterializedViewTailer {
         }
         // A revert applies on the first page, so a reverting transition
         // dispatches that page before it may wait.
-        if transition.reverted.is_none() && pass.waits_for_ranking_build(self, canonical)? {
+        if transition.reverted.is_none() && pass.waits_for_ranking_build(self, canonical) {
             return Ok(());
         }
         let mut prevouts = self.prevout_caches.replay.lock();
@@ -1195,7 +1195,7 @@ impl MaterializedViewTailer {
             let effective_limits = pass.evaluate();
             if effective_limits.state.is_paused()
                 || pass.budget.is_cancelled()
-                || (!first_page && pass.waits_for_ranking_build(self, canonical)?)
+                || (!first_page && pass.waits_for_ranking_build(self, canonical))
             {
                 return Ok(());
             }
@@ -1932,11 +1932,22 @@ impl ReplayPass {
         &self,
         tailer: &MaterializedViewTailer,
         canonical: &RocksDbCanonicalSecondary,
-    ) -> Result<bool, IngestError> {
+    ) -> bool {
         let Some(progress) = &self.ranking_build else {
-            return Ok(false);
+            return false;
         };
-        Ok(progress.replay_waits_for(tailer.trailing_ranking_build(canonical)?))
+        let trailing = tailer
+            .trailing_ranking_build(canonical)
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    target: "zinder::ingest",
+                    event = "materialized_view_replay_ranking_build_state_unreadable",
+                    error = %error,
+                    "could not read the transparent-address ranking build state; Explorer view replay continues without waiting for it"
+                );
+                None
+            });
+        progress.replay_waits_for(trailing)
     }
 
     fn evaluate(&mut self) -> EffectiveMaterializedViewReplayLimits {

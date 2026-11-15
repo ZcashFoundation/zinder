@@ -81,6 +81,8 @@ pub(super) struct RankingBuildProgress {
     /// height, so the next step warms the cache from the first height again.
     /// Only a warm-up that passes this mark counts, so that loop stalls.
     warm_up_mark: Mutex<Option<(BlockHeight, BlockHeight)>>,
+    /// When the current pause began, while the build is paused with replay.
+    paused_since: Mutex<Option<Instant>>,
     replay_waiting: AtomicBool,
     stall_reported: AtomicBool,
 }
@@ -137,6 +139,7 @@ impl RankingBuildProgress {
             last_advance: Mutex::new(Instant::now()),
             advances: AtomicU64::new(0),
             warm_up_mark: Mutex::new(None),
+            paused_since: Mutex::new(None),
             replay_waiting: AtomicBool::new(false),
             stall_reported: AtomicBool::new(false),
         }
@@ -166,14 +169,26 @@ impl RankingBuildProgress {
         self.record_advance();
     }
 
-    /// Restarts the stall clock while the build pauses with replay.
+    /// Stops the stall clock while the build pauses with replay.
     ///
     /// A pause empties the build's cache, so the warm-up after it counts
     /// again.
     pub(super) fn hold(&self) {
-        *self.last_advance.lock() = Instant::now();
+        self.paused_since.lock().get_or_insert_with(Instant::now);
         *self.warm_up_mark.lock() = None;
-        self.stall_reported.store(false, Ordering::Relaxed);
+    }
+
+    /// Restarts the stall clock after a pause, excluding the time paused, so
+    /// pauses neither count toward a stall nor grant a failing build a fresh
+    /// timeout.
+    pub(super) fn resume(&self) {
+        let paused_at = self.paused_since.lock().take();
+        if let Some(paused_at) = paused_at {
+            let mut last_advance = self.last_advance.lock();
+            *last_advance = last_advance
+                .checked_add(paused_at.elapsed())
+                .unwrap_or(*last_advance);
+        }
     }
 
     /// Returns how many pages and warm-up steps the build has recorded.
@@ -182,7 +197,15 @@ impl RankingBuildProgress {
     }
 
     fn stalled(&self) -> bool {
-        self.last_advance.lock().elapsed() >= self.stall_timeout
+        self.paused_since.lock().is_none()
+            && self.last_advance.lock().elapsed() >= self.stall_timeout
+    }
+
+    #[cfg(test)]
+    fn backdate_pause(&self, by: Duration) {
+        if let Some(paused_at) = self.paused_since.lock().as_mut() {
+            *paused_at = paused_at.checked_sub(by).unwrap_or(*paused_at);
+        }
     }
 
     #[cfg(test)]
@@ -444,6 +467,7 @@ async fn run_transparent_address_ranking_builder(
             tailer.prevout_caches.release_ranking_build();
             progress.hold();
         } else {
+            progress.resume();
             let step_tailer = std::sync::Arc::clone(&tailer);
             let step_progress = std::sync::Arc::clone(&progress);
             let joined = tokio::task::spawn_blocking(move || {
@@ -949,18 +973,27 @@ mod tests {
     }
 
     #[test]
-    fn a_paused_build_restarts_the_stall_clock_and_its_warm_up_mark() {
+    fn a_pause_stops_the_stall_clock_without_resetting_it() {
         let height = BlockHeight::new;
         let progress = RankingBuildProgress::with_stall_timeout(Duration::from_hours(1));
         progress.record_warm_up(height(500), height(100));
-        progress.backdate_last_advance(Duration::from_hours(2));
-        assert!(!progress.replay_waits_for(TRAILING));
-
         progress.hold();
+        progress.backdate_pause(Duration::from_hours(2));
+        progress.resume();
         assert!(
             progress.replay_waits_for(TRAILING),
             "time paused with replay does not count as a stall"
         );
+
+        progress.backdate_last_advance(Duration::from_hours(4));
+        progress.hold();
+        progress.resume();
+        assert!(
+            !progress.replay_waits_for(TRAILING),
+            "a pause does not grant a build that already stalled a fresh timeout"
+        );
+
+        progress.hold();
         progress.record_warm_up(height(500), height(100));
         assert_eq!(
             progress.advances(),
