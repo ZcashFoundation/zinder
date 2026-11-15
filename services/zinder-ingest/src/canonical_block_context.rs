@@ -124,6 +124,11 @@ impl<'canonical> CanonicalBlockContextReader<'canonical> {
         }
     }
 
+    /// Returns the prevout cache this reader resolves through, if any.
+    pub(crate) fn prevout_cache_mut(&mut self) -> Option<&mut PrevoutCache> {
+        self.prevouts.as_deref_mut()
+    }
+
     /// Warms a prevout cache with the unspent outputs canonical history holds
     /// at `through`.
     ///
@@ -318,6 +323,11 @@ impl<'canonical> CanonicalBlockContextReader<'canonical> {
         let producing_block_reads =
             self.read_produced_outputs_below_range(&requested, &mut produced)?;
         record_prevout_resolutions(PrevoutResolutionCounts {
+            walker: self
+                .prevouts
+                .as_deref()
+                .and_then(PrevoutCache::metrics_label)
+                .unwrap_or(UNCACHED_WALKER_LABEL),
             in_range: resolved_in_range,
             from_cache: resolved_from_cache,
             from_canonical: requested
@@ -342,7 +352,9 @@ impl<'canonical> CanonicalBlockContextReader<'canonical> {
     ///
     /// Each distinct parent transaction costs one location read and each
     /// distinct producing height one replay-row read. Both sets of reads are
-    /// independent, so they run on several threads.
+    /// independent, so they run on several threads. Each thread takes a
+    /// contiguous run of sorted keys and reads it in batched lookups, so keys
+    /// in the same or adjacent data blocks cost one device read.
     fn read_produced_outputs_below_range(
         &self,
         requested: &HashSet<TransparentOutPoint>,
@@ -363,17 +375,21 @@ impl<'canonical> CanonicalBlockContextReader<'canonical> {
         }
         let missing_by_transaction = missing_by_transaction.into_iter().collect::<Vec<_>>();
         let locations = read_in_parallel(&missing_by_transaction, |chunk| {
-            chunk
+            let transaction_ids = chunk
                 .iter()
-                .map(|(transaction_id, outpoints)| {
-                    self.secondary
-                        .transaction_location(*transaction_id)?
-                        .ok_or_else(|| {
-                            prevout_unresolved(
-                                outpoints[0],
-                                "producing transaction has no canonical location",
-                            )
-                        })
+                .map(|(transaction_id, _)| *transaction_id)
+                .collect::<Vec<_>>();
+            self.secondary
+                .transaction_locations(&transaction_ids)?
+                .into_iter()
+                .zip(chunk)
+                .map(|(location, (_, outpoints))| {
+                    location.ok_or_else(|| {
+                        prevout_unresolved(
+                            outpoints[0],
+                            "producing transaction has no canonical location",
+                        )
+                    })
                 })
                 .collect()
         })?;
@@ -392,19 +408,24 @@ impl<'canonical> CanonicalBlockContextReader<'canonical> {
         let producing_block_reads = by_producing_height.len();
         let by_producing_height = by_producing_height.into_iter().collect::<Vec<_>>();
         let outputs = read_in_parallel(&by_producing_height, |chunk| {
+            let heights = chunk.iter().map(|(height, _)| *height).collect::<Vec<_>>();
             let mut outputs = Vec::new();
-            for (height, outpoints) in chunk {
-                let block = self.secondary.block_replay_facts_at(*height)?;
-                for (outpoint, tx_index_in_block) in outpoints {
-                    let block = block.as_ref().ok_or_else(|| {
-                        prevout_unresolved(*outpoint, "producing block is not retained")
-                    })?;
-                    outputs.push((
-                        *outpoint,
-                        produced_output(block, *outpoint, *tx_index_in_block)?,
-                    ));
-                }
-            }
+            self.secondary
+                .visit_block_replay_facts_at_heights(&heights, |index, block| {
+                    let Some((_, outpoints)) = chunk.get(index) else {
+                        return Ok(());
+                    };
+                    for (outpoint, tx_index_in_block) in outpoints {
+                        let block = block.as_ref().ok_or_else(|| {
+                            prevout_unresolved(*outpoint, "producing block is not retained")
+                        })?;
+                        outputs.push((
+                            *outpoint,
+                            produced_output(block, *outpoint, *tx_index_in_block)?,
+                        ));
+                    }
+                    Ok::<_, IngestError>(())
+                })?;
             Ok(outputs)
         })?;
         produced.extend(outputs);
@@ -731,9 +752,14 @@ const fn prevout_unresolved(outpoint: TransparentOutPoint, reason: &'static str)
     }
 }
 
+/// `cache` label for spends resolved by a reader without a prevout cache.
+const UNCACHED_WALKER_LABEL: &str = "none";
+
 /// Where one hydrated range's distinct spent outputs were found.
 #[derive(Clone, Copy)]
 struct PrevoutResolutionCounts {
+    /// The resolving reader's prevout-cache label, which names its walker.
+    walker: &'static str,
     in_range: usize,
     from_cache: usize,
     from_canonical: usize,
@@ -748,12 +774,16 @@ fn record_prevout_resolutions(counts: PrevoutResolutionCounts) {
     ] {
         metrics::counter!(
             "zinder_materialized_view_prevout_resolutions_total",
-            "source" => source
+            "source" => source,
+            "cache" => counts.walker
         )
         .increment(u64::try_from(resolved).unwrap_or(u64::MAX));
     }
-    metrics::counter!("zinder_materialized_view_prevout_block_reads_total")
-        .increment(u64::try_from(counts.producing_block_reads).unwrap_or(u64::MAX));
+    metrics::counter!(
+        "zinder_materialized_view_prevout_block_reads_total",
+        "cache" => counts.walker
+    )
+    .increment(u64::try_from(counts.producing_block_reads).unwrap_or(u64::MAX));
 }
 
 fn intrinsic_value_balances(

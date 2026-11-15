@@ -312,20 +312,35 @@ withhold `explorer.transparent_address.activity_v2` and
 
 You do not need to rebuild those views. After the upgrade, `zinder-ingest`
 builds the ranking from canonical history beside the other views, even while
-their replay is still far behind the tip. It logs these events:
+their replay is still far behind the tip. While those views are rebuilding,
+their replay waits until the build reaches their height, so each later height
+is read once for every view instead of once for the views and again for the
+build. It logs these events:
 
 - `transparent_address_ranking_build_started` when the build begins.
 - `transparent_address_ranking_build_progress` as it passes each
   100000-height mark.
+- `materialized_view_replay_waiting_for_ranking_build` when view replay starts
+  waiting for the build, and
+  `materialized_view_replay_resumed_after_ranking_build` when it continues.
 - `transparent_address_ranking_joined_replay` when the build reaches the
   height the other views are rebuilding at and joins their replay there.
 - `transparent_address_ranking_activated` when the build activates at the
   shared cursor of views that already follow the tip.
+- `materialized_view_replay_ranking_build_stalled`, a warning, when the build
+  applied no history for 5 minutes outside its pauses. View replay then
+  continues without it, and the build activates once the views follow the tip.
+- `materialized_view_replay_ranking_build_state_unreadable`, a warning, when
+  replay cannot read the build's state. Replay continues without waiting for
+  the build.
 
 The build reads every canonical block from height 1 and resumes after a
 restart. Follow it with
 `zinder_materialized_view_transparent_address_ranking_build_height` and
 `zinder_materialized_view_transparent_address_ranking_build_target_height`.
+`zinder_materialized_view_replay_waiting_for_ranking_build` is `1` while view
+replay waits for it, so `zinder_materialized_view_replay_height` stays flat
+until the build joins.
 `ExplorerQuery.ServerInfo` advertises both capabilities once the ranking
 activates. A ranking that joined a replay still behind the tip answers address
 reads with the same catching-up freshness as the other views until replay

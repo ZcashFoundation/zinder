@@ -258,9 +258,9 @@ Ingest publishes the generation without an operator step. A fresh Explorer
 views build activates it at genesis, and its coverage then advances with the
 shared replay like every other view's. A store whose views were built without
 the ranking builds it from genesis in the background, beside the shared
-replay. The build joins the replay at the height the other views have reached
-while they are still rebuilding, or activates at the shared replay cursor once
-they follow the tip. [Publishing the canonical
+replay. While the other views are still rebuilding, their replay waits for the
+build to reach their height, and the build joins the replay there. Once the
+views follow the tip, the build activates at the shared replay cursor instead. [Publishing the canonical
 snapshot](materialized-view-plane.md#publishing-the-canonical-snapshot)
 describes both paths.
 

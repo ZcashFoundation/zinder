@@ -423,11 +423,19 @@ block-local boundary.
   `zinder_materialized_view_replay_volume_min_free_bytes` report the last
   sample of the store volume and the configured
   `ingest.explorer_views_min_free_bytes`.
-- `zinder_materialized_view_prevout_resolutions_total{source}` counts the
-  distinct spent outputs each hydrated range resolved, by where they were
-  found: `range`, `cache`, or `canonical`.
-- `zinder_materialized_view_prevout_block_reads_total` counts the producing
-  blocks read from canonical storage to resolve the `canonical` share.
+- `zinder_materialized_view_prevout_resolutions_total{source,cache}` counts
+  the distinct spent outputs each hydrated range resolved, by where they were
+  found: `range`, `cache`, or `canonical`. `cache` names the walker: `replay`,
+  `ranking_build`, or `none` for a backfill that hydrates without a prevout
+  cache.
+- `zinder_materialized_view_prevout_block_reads_total{cache}` counts the
+  producing blocks each walker read from canonical storage to resolve its
+  `canonical` share.
+- The `zinder_store_*` gauges with `store_role="canonical_secondary"` describe
+  the canonical secondary that hydration reads through. Producing replay rows
+  bypass its block cache, so `rocksdb.block.cache.data.miss` against
+  `rocksdb.block.cache.data.hit` in `zinder_store_rocksdb_ticker` shows how
+  often a transaction-location lookup reached the volume.
 - `zinder_materialized_view_prevout_cache_outputs{cache}` reports how many
   unspent outputs the `replay` and `ranking_build` prevout caches hold, and
   `zinder_materialized_view_prevout_cache_evicted_outputs_total{cache}` counts
@@ -439,10 +447,17 @@ block-local boundary.
   `zinder_materialized_view_transparent_address_ranking_build_target_height`
   the height it is walking toward: the other views' materialized height,
   capped at the settled tip.
+- `zinder_materialized_view_replay_waiting_for_ranking_build` is `1` while
+  replay dispatches no page because a ranking build trails views that rebuild
+  without a shared cursor. Replay stops waiting when the build joins, or when it
+  applies no history for 5 minutes and logs
+  `materialized_view_replay_ranking_build_stalled`.
 
 A replay or ranking build that resumes partway through history warms its empty
 prevout cache first and logs `materialized_view_prevout_cache_warmed` with the
-walked range and the time its last call took. A steady `canonical` share after
+walked range and the time its last call took. When a ranking build joins
+replay, replay takes over the build's cache instead and logs
+`materialized_view_prevout_cache_handed_to_replay`. A steady `canonical` share after
 the warm-up means the cache is evicting outputs that are still spent later,
 which the eviction counter confirms, and the producing-block reads set the
 replay speed. A walker that paused after its cache held outputs resumes cold

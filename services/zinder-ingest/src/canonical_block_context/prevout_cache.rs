@@ -145,7 +145,7 @@ impl PrevoutCache {
     }
 
     /// Returns the height of the last block the cache applied.
-    pub(super) fn applied_height(&self) -> Option<BlockHeight> {
+    pub(crate) fn applied_height(&self) -> Option<BlockHeight> {
         self.applied_through.map(|block| block.height)
     }
 
@@ -195,6 +195,26 @@ impl PrevoutCache {
         self.heights.clear();
         self.applied_through = None;
         self.record_size();
+    }
+
+    /// Takes over the outputs and chain position of `source`, another walker's
+    /// cache, and leaves `source` empty. Returns whether it took them.
+    ///
+    /// A cache that already applied the same block keeps its own outputs.
+    /// Either cache holds the unspent outputs of the same chain prefix within
+    /// the same bound, so both answer every later spend alike, and taking over
+    /// the other walker's cache spares a warm-up pass over that prefix.
+    pub(crate) fn take_over(&mut self, source: &mut Self) -> bool {
+        let adopted = self.applied_through != source.applied_through;
+        if adopted {
+            self.outputs = std::mem::take(&mut source.outputs);
+            self.heights = std::mem::take(&mut source.heights);
+            self.applied_through = source.applied_through;
+            self.evict_oldest_heights();
+        }
+        source.clear();
+        self.record_size();
+        adopted
     }
 
     /// Empties the cache unless `first_block` extends the last applied block.
@@ -510,6 +530,42 @@ mod tests {
         assert!(lookup(&cache, TransparentOutPoint::new(txid(2), 0)).is_none());
         assert!(lookup(&cache, TransparentOutPoint::new(txid(3), 0)).is_some());
         assert!(lookup(&cache, TransparentOutPoint::new(txid(5), 1)).is_some());
+    }
+
+    #[test]
+    fn a_cache_takes_over_another_walkers_position_and_outputs() {
+        let mut parent = hash(0);
+        let mut blocks = Vec::new();
+        for height in 1..=3 {
+            blocks.push(block(height, parent, &[], 2));
+            parent = hash(height);
+        }
+        let mut walked = PrevoutCache::new(16);
+        walked.apply(&blocks);
+        let mut idle = PrevoutCache::new(16);
+
+        assert!(idle.take_over(&mut walked));
+        assert!(walked.is_empty());
+        assert_eq!(walked.applied_height(), None);
+        assert_eq!(idle.applied_height(), Some(BlockHeight::new(3)));
+        assert_eq!(idle.len(), 6);
+        assert_eq!(
+            lookup(&idle, TransparentOutPoint::new(txid(2), 1)).map(|output| output.block_hash),
+            Some(hash(2))
+        );
+
+        let mut same_position = PrevoutCache::new(16);
+        same_position.apply(&blocks);
+        same_position.clear();
+        same_position.apply(&blocks);
+        let mut other = PrevoutCache::new(16);
+        other.apply(&blocks);
+        assert!(
+            !same_position.take_over(&mut other),
+            "a cache at the same block keeps its own outputs"
+        );
+        assert!(other.is_empty());
+        assert_eq!(same_position.len(), 6);
     }
 
     #[test]

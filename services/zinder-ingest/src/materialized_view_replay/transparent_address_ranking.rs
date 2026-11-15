@@ -15,9 +15,17 @@
 //! later height to the ranking too. Once the views sit at the canonical fence
 //! instead, the step that reaches the settled tip applies the unsettled tail
 //! and activates the generation at the shared replay cursor in one write.
+//!
+//! While the other views rebuild without a shared cursor, the spawned replay
+//! tailer waits for a build that trails them, so the build catches up and
+//! joins instead of walking the same history a second time behind replay.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    time::{Duration, Instant},
+};
 
+use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{BlockHeight, BlockHeightRange, BlockId, ChainEpoch};
 use zinder_materialized_views::{
@@ -45,6 +53,203 @@ const RANKING_BUILD_STEP_BUDGET: Duration = Duration::from_secs(10);
 
 /// Height interval between ranking build progress log lines.
 const RANKING_BUILD_PROGRESS_INTERVAL: u32 = 100_000;
+
+/// Longest a trailing ranking build may go without applying history before
+/// replay stops waiting for it.
+///
+/// A healthy build applies a page or warms its cache further every few
+/// seconds, and a step never holds work for much longer than its 10-second
+/// budget plus one page, so a build this quiet has failed or stopped. Time
+/// the build spends paused with replay does not count. Replay then continues
+/// without it until the build applies history again.
+const RANKING_BUILD_STALL_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// Ranking build progress the build worker shares with the replay tailer.
+///
+/// The build records every page it applies and every step that warms its
+/// cache further toward a height. Replay waits for a build that trails the
+/// other views only while the build keeps recording progress, so a failing
+/// build cannot hold replay back.
+#[derive(Debug)]
+pub(super) struct RankingBuildProgress {
+    stall_timeout: Duration,
+    last_advance: Mutex<Instant>,
+    advances: AtomicU64,
+    /// The height the last counted warm-up walked toward and how far it got.
+    ///
+    /// A step whose page write fails leaves the cache past the stored build
+    /// height, so the next step warms the cache from the first height again.
+    /// Only a warm-up that passes this mark counts, so that loop stalls.
+    warm_up_mark: Mutex<Option<(BlockHeight, BlockHeight)>>,
+    /// When the current pause began, while the build is paused with replay.
+    paused_since: Mutex<Option<Instant>>,
+    replay_waiting: AtomicBool,
+    stall_reported: AtomicBool,
+}
+
+/// A pending ranking build that has not yet joined the views replay rebuilds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct TrailingRankingBuild {
+    /// Height through which the inactive build has applied blocks.
+    built_through: BlockHeight,
+    /// Height the build walks toward: the views' materialized height, capped
+    /// at the settled tip.
+    join_height: BlockHeight,
+}
+
+impl TrailingRankingBuild {
+    /// Returns the build at `built_through` when replay should wait for it.
+    ///
+    /// The build can join the views only at a settled materialized height.
+    /// Below that height it still has history to apply. At it the build has
+    /// applied everything and joins them on its next step, which may follow
+    /// the step that applied the last page, so replay keeps waiting. Views
+    /// above the settled tip never wait: the build could only stop below
+    /// them, and activates at the fence once they follow the tip.
+    const fn behind(
+        built_through: BlockHeight,
+        materialized_height: BlockHeight,
+        settled_tip_height: BlockHeight,
+    ) -> Option<Self> {
+        if materialized_height.value() > settled_tip_height.value()
+            || built_through.value() > materialized_height.value()
+        {
+            return None;
+        }
+        Some(Self {
+            built_through,
+            join_height: materialized_height,
+        })
+    }
+}
+
+impl RankingBuildProgress {
+    /// Starts tracking a build worker that has not reported yet.
+    ///
+    /// The stall clock starts now, so replay gives a newly started worker
+    /// the full timeout to warm its cache and apply its first page.
+    pub(super) fn new() -> Self {
+        Self::with_stall_timeout(RANKING_BUILD_STALL_TIMEOUT)
+    }
+
+    fn with_stall_timeout(stall_timeout: Duration) -> Self {
+        metrics::gauge!("zinder_materialized_view_replay_waiting_for_ranking_build").set(0.0);
+        Self {
+            stall_timeout,
+            last_advance: Mutex::new(Instant::now()),
+            advances: AtomicU64::new(0),
+            warm_up_mark: Mutex::new(None),
+            paused_since: Mutex::new(None),
+            replay_waiting: AtomicBool::new(false),
+            stall_reported: AtomicBool::new(false),
+        }
+    }
+
+    /// Records that the build applied a page.
+    pub(super) fn record_advance(&self) {
+        *self.last_advance.lock() = Instant::now();
+        self.advances.fetch_add(1, Ordering::Relaxed);
+        self.stall_reported.store(false, Ordering::Relaxed);
+    }
+
+    /// Records that a warm-up toward `target` left the build's cache at
+    /// `reached`, counting it only past the furthest earlier warm-up toward
+    /// the same height.
+    pub(super) fn record_warm_up(&self, target: BlockHeight, reached: BlockHeight) {
+        {
+            let mut mark = self.warm_up_mark.lock();
+            if let Some((marked_target, furthest)) = *mark
+                && marked_target == target
+                && reached <= furthest
+            {
+                return;
+            }
+            *mark = Some((target, reached));
+        }
+        self.record_advance();
+    }
+
+    /// Stops the stall clock while the build pauses with replay.
+    ///
+    /// A pause empties the build's cache, so the warm-up after it counts
+    /// again.
+    pub(super) fn hold(&self) {
+        self.paused_since.lock().get_or_insert_with(Instant::now);
+        *self.warm_up_mark.lock() = None;
+    }
+
+    /// Restarts the stall clock after a pause, excluding the time paused, so
+    /// pauses neither count toward a stall nor grant a failing build a fresh
+    /// timeout.
+    pub(super) fn resume(&self) {
+        let paused_at = self.paused_since.lock().take();
+        if let Some(paused_at) = paused_at {
+            let mut last_advance = self.last_advance.lock();
+            *last_advance = last_advance
+                .checked_add(paused_at.elapsed())
+                .unwrap_or(*last_advance);
+        }
+    }
+
+    /// Returns how many pages and warm-up steps the build has recorded.
+    pub(super) fn advances(&self) -> u64 {
+        self.advances.load(Ordering::Relaxed)
+    }
+
+    fn stalled(&self) -> bool {
+        self.paused_since.lock().is_none()
+            && self.last_advance.lock().elapsed() >= self.stall_timeout
+    }
+
+    #[cfg(test)]
+    fn backdate_pause(&self, by: Duration) {
+        if let Some(paused_at) = self.paused_since.lock().as_mut() {
+            *paused_at = paused_at.checked_sub(by).unwrap_or(*paused_at);
+        }
+    }
+
+    #[cfg(test)]
+    fn backdate_last_advance(&self, by: Duration) {
+        let mut last_advance = self.last_advance.lock();
+        *last_advance = last_advance.checked_sub(by).unwrap_or(*last_advance);
+    }
+
+    /// Returns whether replay waits for `trailing`, logging each change.
+    pub(super) fn replay_waits_for(&self, trailing: Option<TrailingRankingBuild>) -> bool {
+        let stalled = trailing.is_some() && self.stalled();
+        let waits = trailing.is_some() && !stalled;
+        if stalled && !self.stall_reported.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                target: "zinder::ingest",
+                event = "materialized_view_replay_ranking_build_stalled",
+                stalled_seconds = self.stall_timeout.as_secs(),
+                built_through_height = trailing.map_or(0, |build| build.built_through.value()),
+                "transparent-address ranking build applied no history within the stall timeout; Explorer view replay continues without waiting for it"
+            );
+        }
+        if self.replay_waiting.swap(waits, Ordering::Relaxed) == waits {
+            return waits;
+        }
+        metrics::gauge!("zinder_materialized_view_replay_waiting_for_ranking_build")
+            .set(if waits { 1.0 } else { 0.0 });
+        if let Some(build) = trailing.filter(|_| waits) {
+            tracing::info!(
+                target: "zinder::ingest",
+                event = "materialized_view_replay_waiting_for_ranking_build",
+                built_through_height = build.built_through.value(),
+                join_height = build.join_height.value(),
+                "Explorer view replay waits for the transparent-address ranking build to join it, so later heights are hydrated once for every view"
+            );
+        } else {
+            tracing::info!(
+                target: "zinder::ingest",
+                event = "materialized_view_replay_resumed_after_ranking_build",
+                "Explorer view replay resumed after waiting for the transparent-address ranking build"
+            );
+        }
+        waits
+    }
+}
 
 /// What one transparent-address ranking build step did.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,6 +316,72 @@ impl MaterializedViewTailer {
         self.advance_ranking_build_step(&mut pass)
     }
 
+    /// Returns the pending ranking build when it trails views that rebuild
+    /// from canonical heights without a shared cursor.
+    ///
+    /// Such a build can still join the views at their materialized height, so
+    /// replay that keeps advancing only moves the join point away and leaves
+    /// the build to hydrate every height a second time. Views that follow a
+    /// shared cursor never wait: the build activates at the fence instead.
+    pub(super) fn trailing_ranking_build(
+        &self,
+        canonical: &RocksDbCanonicalSecondary,
+    ) -> Result<Option<TrailingRankingBuild>, IngestError> {
+        let store = &self.materialized_view_store;
+        if !transparent_address_ranking_is_unpublished(store)? {
+            return Ok(None);
+        }
+        let Some(materialized_height) = self.materialized_height()? else {
+            return Ok(None);
+        };
+        if persisted_chain_event_cursor(store)?.is_some() {
+            return Ok(None);
+        }
+        let chain_epoch = canonical.chain_epoch()?;
+        let built_through = TransparentAddressRankingConsumer::build_metadata(store)?
+            .map_or(BlockHeight::new(0), |build| {
+                build.coverage.balance_complete_through_height
+            });
+        Ok(TrailingRankingBuild::behind(
+            built_through,
+            materialized_height,
+            chain_epoch
+                .settled_tip_height
+                .min(chain_epoch.visible_tip_height),
+        ))
+    }
+
+    /// Advances a ranking build that trails rebuilding views until it joins
+    /// them or a step applies no history.
+    pub(super) fn join_trailing_ranking_build(
+        &self,
+        budget: MaterializedViewReplayBudget,
+    ) -> Result<(), IngestError> {
+        self.canonical.write().try_catch_up()?;
+        let progress = std::sync::Arc::new(RankingBuildProgress::new());
+        let mut pass = ReplayPass::new(budget).with_ranking_build(std::sync::Arc::clone(&progress));
+        while self
+            .trailing_ranking_build(&self.canonical.read())?
+            .is_some()
+        {
+            let advances = progress.advances();
+            if let Err(error) = self.advance_ranking_build_step(&mut pass) {
+                // Replay still runs; the step after it reports the failure.
+                tracing::warn!(
+                    target: "zinder::ingest",
+                    event = "transparent_address_ranking_build_failed",
+                    error = %error,
+                    "transparent-address ranking build step failed before replay; replaying without it"
+                );
+                break;
+            }
+            if progress.advances() == advances {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn advance_ranking_build_step(
         &self,
         pass: &mut ReplayPass,
@@ -143,16 +414,41 @@ impl MaterializedViewTailer {
     }
 }
 
+/// Starts the ranking build worker beside the spawned replay tailer and
+/// returns the progress it shares with replay.
+pub(super) fn spawn_transparent_address_ranking_builder(
+    tailer: &std::sync::Arc<MaterializedViewTailer>,
+    poll_interval: Duration,
+    readiness: Readiness,
+    cancel: CancellationToken,
+) -> (
+    std::sync::Arc<RankingBuildProgress>,
+    tokio::task::JoinHandle<()>,
+) {
+    let progress = std::sync::Arc::new(RankingBuildProgress::new());
+    let worker = tokio::spawn(run_transparent_address_ranking_builder(
+        std::sync::Arc::clone(tailer),
+        poll_interval,
+        readiness,
+        std::sync::Arc::clone(&progress),
+        cancel,
+    ));
+    (progress, worker)
+}
+
 /// Builds the transparent-address ranking beside the replay tailer until the
 /// store holds no pending build.
 ///
 /// Every step evaluates the same replay budget the tailer does, so the build
 /// pauses with replay under the canonical-phase gate, memory pressure, and the
-/// free-space floor, and empties its prevout cache while paused.
-pub(super) async fn run_transparent_address_ranking_builder(
+/// free-space floor, and empties its prevout cache while paused. A step that
+/// applied history is followed by the next one at once; the worker sleeps
+/// after a step that failed or found nothing to apply.
+async fn run_transparent_address_ranking_builder(
     tailer: std::sync::Arc<MaterializedViewTailer>,
     poll_interval: Duration,
     readiness: Readiness,
+    progress: std::sync::Arc<RankingBuildProgress>,
     cancel: CancellationToken,
 ) {
     let fresh_budget = || {
@@ -165,12 +461,17 @@ pub(super) async fn run_transparent_address_ranking_builder(
     };
     let mut budget = fresh_budget();
     loop {
+        let advances_before = progress.advances();
+        let mut failed = false;
         if budget.evaluate_current().state.is_paused() {
             tailer.prevout_caches.release_ranking_build();
+            progress.hold();
         } else {
+            progress.resume();
             let step_tailer = std::sync::Arc::clone(&tailer);
+            let step_progress = std::sync::Arc::clone(&progress);
             let joined = tokio::task::spawn_blocking(move || {
-                let mut pass = ReplayPass::new(budget);
+                let mut pass = ReplayPass::new(budget).with_ranking_build(step_progress);
                 let outcome = step_tailer.advance_ranking_build_step(&mut pass);
                 (pass.budget, outcome)
             })
@@ -180,6 +481,7 @@ pub(super) async fn run_transparent_address_ranking_builder(
                 Ok((returned, outcome)) => {
                     budget = returned;
                     if let Err(error) = outcome {
+                        failed = true;
                         tracing::warn!(
                             target: "zinder::ingest",
                             event = "transparent_address_ranking_build_failed",
@@ -195,11 +497,13 @@ pub(super) async fn run_transparent_address_ranking_builder(
                         error = %join_error,
                         "transparent-address ranking build step did not complete; retrying"
                     );
+                    failed = true;
                     budget = fresh_budget();
                 }
             }
         }
-        if sleep_or_cancel(poll_interval, &cancel).await {
+        let idle = failed || progress.advances() == advances_before;
+        if cancel.is_cancelled() || (idle && sleep_or_cancel(poll_interval, &cancel).await) {
             return;
         }
     }
@@ -304,11 +608,7 @@ impl<'build> RankingBuild<'build> {
                 if through > BlockHeight::new(0)
                     && goal.value().saturating_sub(through.value())
                         >= PREVOUT_CACHE_WARMUP_MIN_REMAINING_BLOCKS
-                    && !self.hydrator.warm_prevout_cache(through, &mut || {
-                        (started_at.elapsed() < RANKING_BUILD_STEP_BUDGET)
-                            .then(|| pass.warm_up_window())
-                            .flatten()
-                    })?
+                    && !self.warm_prevout_cache(through, started_at, pass)?
                 {
                     return Ok(self.paused_at(through));
                 }
@@ -324,11 +624,13 @@ impl<'build> RankingBuild<'build> {
                 )
                 .map_err(ranking_error)?;
                 through = page.end;
+                pass.record_ranking_build_advance();
                 continue;
             }
             if through == shared_height
                 && let Some(metadata) = self.join_shared_replay(through)?
             {
+                self.hand_prevouts_to_replay(through);
                 return Ok(activated(
                     &metadata,
                     "transparent_address_ranking_joined_replay",
@@ -383,6 +685,63 @@ impl<'build> RankingBuild<'build> {
             // reverts it before the build can join.
             Err(TransparentAddressRankingConsumerError::SnapshotTargetMismatch) => Ok(None),
             Err(error) => Err(ranking_error(error)),
+        }
+    }
+
+    /// Warms the build's empty prevout cache through `through` within the
+    /// step budget, recording how far it got as build progress.
+    ///
+    /// A warm-up whose read fails records nothing, and one that only walks
+    /// history an earlier warm-up toward `through` already walked does not
+    /// count, so neither refreshes the stall clock.
+    fn warm_prevout_cache(
+        &mut self,
+        through: BlockHeight,
+        started_at: Instant,
+        pass: &mut ReplayPass,
+    ) -> Result<bool, IngestError> {
+        let before = self.cache_height();
+        let warmed = self.hydrator.warm_prevout_cache(through, &mut || {
+            (started_at.elapsed() < RANKING_BUILD_STEP_BUDGET)
+                .then(|| pass.warm_up_window())
+                .flatten()
+        })?;
+        let reached = self.cache_height();
+        if reached != before
+            && let Some(reached) = reached
+        {
+            pass.record_ranking_build_warm_up(through, reached);
+        }
+        Ok(warmed)
+    }
+
+    fn cache_height(&mut self) -> Option<BlockHeight> {
+        self.hydrator
+            .prevout_cache_mut()
+            .and_then(|cache| cache.applied_height())
+    }
+
+    /// Hands the cache this build walked to `joined` over to replay, which
+    /// resumes at the next height, so replay does not warm its own cache over
+    /// the same history again.
+    ///
+    /// Replay holds its cache only while it hydrates a transition, and a
+    /// replay that is hydrating keeps its own cache.
+    fn hand_prevouts_to_replay(&mut self, joined: BlockHeight) {
+        let Some(mut replay) = self.tailer.prevout_caches.replay.try_lock() else {
+            return;
+        };
+        let Some(build) = self.hydrator.prevout_cache_mut() else {
+            return;
+        };
+        if replay.take_over(build) {
+            tracing::info!(
+                target: "zinder::ingest",
+                event = "materialized_view_prevout_cache_handed_to_replay",
+                joined_height = joined.value(),
+                cached_outputs = replay.len(),
+                "Explorer view replay took over the prevout cache the transparent-address ranking build walked to the joined height"
+            );
         }
     }
 
@@ -551,4 +910,124 @@ fn next_height(height: BlockHeight) -> Result<BlockHeight, IngestError> {
 )]
 fn ranking_error(error: TransparentAddressRankingConsumerError) -> IngestError {
     IngestError::MaterializedViewDispatch(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TRAILING: Option<TrailingRankingBuild> = Some(TrailingRankingBuild {
+        built_through: BlockHeight::new(10),
+        join_height: BlockHeight::new(500),
+    });
+
+    #[test]
+    fn replay_waits_for_a_build_below_or_at_the_views_settled_height() {
+        let height = BlockHeight::new;
+        assert_eq!(
+            TrailingRankingBuild::behind(height(10), height(500), height(900)),
+            TRAILING,
+            "a build below the views has history left to apply"
+        );
+        assert_eq!(
+            TrailingRankingBuild::behind(height(500), height(500), height(900)),
+            Some(TrailingRankingBuild {
+                built_through: height(500),
+                join_height: height(500),
+            }),
+            "a build at the views' settled height joins them on its next step"
+        );
+        assert_eq!(
+            TrailingRankingBuild::behind(height(400), height(500), height(400)),
+            None,
+            "a build at a settled tip below the views cannot join them there"
+        );
+        assert_eq!(
+            TrailingRankingBuild::behind(height(300), height(500), height(400)),
+            None,
+            "views above the settled tip follow it and never wait"
+        );
+        assert_eq!(
+            TrailingRankingBuild::behind(height(600), height(500), height(900)),
+            None,
+            "a build past the views has nothing to join"
+        );
+    }
+
+    #[test]
+    fn only_a_warm_up_past_the_furthest_earlier_one_counts_as_progress() {
+        let height = BlockHeight::new;
+        let progress = RankingBuildProgress::with_stall_timeout(Duration::from_hours(1));
+        progress.record_warm_up(height(500), height(100));
+        assert_eq!(progress.advances(), 1);
+        progress.record_warm_up(height(500), height(100));
+        progress.record_warm_up(height(500), height(80));
+        assert_eq!(
+            progress.advances(),
+            1,
+            "re-walking history already warmed toward the same height is not progress"
+        );
+        progress.record_warm_up(height(500), height(200));
+        progress.record_warm_up(height(600), height(50));
+        assert_eq!(progress.advances(), 3);
+    }
+
+    #[test]
+    fn a_pause_stops_the_stall_clock_without_resetting_it() {
+        let height = BlockHeight::new;
+        let progress = RankingBuildProgress::with_stall_timeout(Duration::from_hours(1));
+        progress.record_warm_up(height(500), height(100));
+        progress.hold();
+        progress.backdate_pause(Duration::from_hours(2));
+        progress.resume();
+        assert!(
+            progress.replay_waits_for(TRAILING),
+            "time paused with replay does not count as a stall"
+        );
+
+        progress.backdate_last_advance(Duration::from_hours(4));
+        progress.hold();
+        progress.resume();
+        assert!(
+            !progress.replay_waits_for(TRAILING),
+            "a pause does not grant a build that already stalled a fresh timeout"
+        );
+
+        progress.hold();
+        progress.record_warm_up(height(500), height(100));
+        assert_eq!(
+            progress.advances(),
+            2,
+            "the warm-up after a pause refills an emptied cache and counts again"
+        );
+    }
+
+    #[test]
+    fn replay_waits_only_while_a_build_trails_it() {
+        let progress = RankingBuildProgress::with_stall_timeout(Duration::from_hours(1));
+        assert!(progress.replay_waits_for(TRAILING));
+        assert!(progress.replay_waits_for(TRAILING));
+        assert!(
+            !progress.replay_waits_for(None),
+            "a build that reached the views' height releases replay"
+        );
+    }
+
+    #[test]
+    fn a_build_that_applies_nothing_within_the_timeout_releases_replay() {
+        let progress = RankingBuildProgress::with_stall_timeout(Duration::from_hours(1));
+        assert!(progress.replay_waits_for(TRAILING));
+        progress.backdate_last_advance(Duration::from_hours(2));
+        assert!(
+            !progress.replay_waits_for(TRAILING),
+            "a stalled build must not hold replay back"
+        );
+
+        progress.record_advance();
+        assert_eq!(progress.advances(), 1);
+        assert!(
+            progress.replay_waits_for(TRAILING),
+            "a build that applies history again resumes the wait"
+        );
+    }
 }

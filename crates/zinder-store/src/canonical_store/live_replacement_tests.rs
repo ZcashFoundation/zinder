@@ -1773,6 +1773,39 @@ fn secondary_point_reads_agree_with_the_bounded_replay_range_scan()
 
     assert_eq!(secondary.block_replay_facts_at(BlockHeight::new(0))?, None);
     assert_eq!(secondary.block_replay_facts_at(BlockHeight::new(5))?, None);
+
+    let requested = [4, 0, 2, 5, 1, 2].map(BlockHeight::new);
+    let mut visited = Vec::new();
+    secondary.visit_block_replay_facts_at_heights::<CanonicalStoreError>(
+        &requested,
+        |index, facts| {
+            visited.push((index, facts));
+            Ok(())
+        },
+    )?;
+    visited.sort_by_key(|(index, _)| *index);
+    assert_eq!(
+        visited.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+        (0..requested.len()).collect::<Vec<_>>(),
+        "every requested height is visited exactly once"
+    );
+    for (height, (_, facts)) in requested.iter().zip(&visited) {
+        assert_eq!(facts, &secondary.block_replay_facts_at(*height)?);
+    }
+
+    let two = transaction_location(BlockHeight::new(2), [2; 32], 102);
+    let four = transaction_location(BlockHeight::new(4), [4; 32], 104);
+    let unknown = TransactionId::from_bytes([0xee; 32]);
+    assert_eq!(
+        secondary.transaction_locations(&[
+            four.transaction_id,
+            unknown,
+            two.transaction_id,
+            four.transaction_id,
+        ])?,
+        vec![Some(four), None, Some(two), Some(four)]
+    );
+    assert_eq!(secondary.transaction_locations(&[])?, Vec::new());
     Ok(())
 }
 

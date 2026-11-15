@@ -63,6 +63,7 @@ use crate::{
 mod transparent_address_ranking;
 mod volume_space;
 
+use transparent_address_ranking::RankingBuildProgress;
 pub use transparent_address_ranking::TransparentAddressRankingBuildStep;
 pub use volume_space::{DEFAULT_EXPLORER_VIEWS_MIN_FREE_BYTES, VolumeSpaceGuard};
 
@@ -859,19 +860,27 @@ impl Default for ReplayPrevoutCaches {
 
 impl MaterializedViewTailer {
     /// Replays every retained canonical transition into the materialized-view
-    /// store, then advances a pending transparent-address ranking build by one
-    /// step.
+    /// store and advances a pending transparent-address ranking build.
     ///
-    /// The spawned tailer task runs the same replay but leaves the ranking
-    /// build to its own worker, so the build advances while replay walks
-    /// history.
+    /// The build is scheduled as the spawned tailer schedules it. A build that
+    /// trails views rebuilding from canonical heights without a shared cursor
+    /// first walks to their height and joins them, so the replay that follows
+    /// applies every later height to the ranking with the other views. Any
+    /// other pending build advances by one step after replay. The spawned
+    /// tailer runs the build on its own worker instead, and its replay waits
+    /// while such a build trails it.
     pub fn catch_up(&self) -> Result<(), IngestError> {
-        let mut pass = ReplayPass::new(
+        let budget = || {
             MaterializedViewReplayBudget::new(self.config)
-                .with_volume_space_guard(self.volume_space_guard.clone()),
-        );
+                .with_volume_space_guard(self.volume_space_guard.clone())
+        };
+        let has_views = self.materialized_view_store.has_consumer_column_families();
+        if has_views {
+            self.join_trailing_ranking_build(budget())?;
+        }
+        let mut pass = ReplayPass::new(budget());
         self.catch_up_with_pass(&mut pass)?;
-        if self.materialized_view_store.has_consumer_column_families() {
+        if has_views {
             self.advance_ranking_build_step(&mut pass)?;
         }
         Ok(())
@@ -1157,6 +1166,11 @@ impl MaterializedViewTailer {
         if committed.start > committed.end {
             return self.dispatch_page(transition, committed, &HashMap::new(), true);
         }
+        // A revert applies on the first page, so a reverting transition
+        // dispatches that page before it may wait.
+        if transition.reverted.is_none() && pass.waits_for_ranking_build(self, canonical) {
+            return Ok(());
+        }
         let mut prevouts = self.prevout_caches.replay.lock();
         let mut hydrator = CanonicalBlockContextReader::with_prevout_cache(
             canonical,
@@ -1179,7 +1193,10 @@ impl MaterializedViewTailer {
         let mut first_page = true;
         while next_height <= committed.end {
             let effective_limits = pass.evaluate();
-            if effective_limits.state.is_paused() || pass.budget.is_cancelled() {
+            if effective_limits.state.is_paused()
+                || pass.budget.is_cancelled()
+                || (!first_page && pass.waits_for_ranking_build(self, canonical))
+            {
                 return Ok(());
             }
             let page = replay_page(next_height, committed.end, effective_limits.batch_blocks)?;
@@ -1343,11 +1360,14 @@ impl MaterializedViewTailer {
     /// The explorer plane surfaces it on `ServerInfo`. Written on the paused
     /// branch too, so a stalled materialized-view plane is observable on the
     /// wire instead of silent. Best-effort: a write failure is logged, never fatal.
+    /// The same cadence refreshes the canonical secondary's `RocksDB` gauges,
+    /// so the reads that hydration issues stay observable during a rebuild.
     fn persist_status(
         &self,
         canonical: &RocksDbCanonicalSecondary,
         budget_state: MaterializedViewReplayBudgetState,
     ) {
+        canonical.record_resource_gauges();
         let indexed_height = match self.materialized_height() {
             Ok(indexed_height) => indexed_height.map(BlockHeight::value),
             Err(error) => {
@@ -1600,14 +1620,13 @@ async fn run_materialized_view_tailer(
     )
     .with_volume_space_guard(tailer.volume_space_guard.clone());
     let mut cursor_risk = CursorRiskWatch::new(&tailer, historical_work_gate.readiness());
-    let ranking_builder = tokio::spawn(
-        transparent_address_ranking::run_transparent_address_ranking_builder(
-            Arc::clone(&tailer),
+    let (ranking_build, ranking_builder) =
+        transparent_address_ranking::spawn_transparent_address_ranking_builder(
+            &tailer,
             poll_interval,
             historical_work_gate.readiness().runtime_readiness(),
             cancel.clone(),
-        ),
-    );
+        );
     loop {
         let effective_limits = budget.evaluate_current();
         record_materialized_view_replay_budget(
@@ -1627,7 +1646,7 @@ async fn run_materialized_view_tailer(
         if effective_limits.state.is_paused() {
             tailer.prevout_caches.release_replay();
         } else {
-            budget = run_materialized_view_tailer_pass(&tailer, budget).await;
+            budget = run_materialized_view_tailer_pass(&tailer, budget, &ranking_build).await;
         }
         if let Some(cursor_risk) = cursor_risk.as_mut() {
             cursor_risk.observe(&tailer.materialized_view_store);
@@ -1654,11 +1673,13 @@ async fn run_materialized_view_tailer(
 async fn run_materialized_view_tailer_pass(
     tailer: &Arc<MaterializedViewTailer>,
     budget: MaterializedViewReplayBudget,
+    ranking_build: &Arc<RankingBuildProgress>,
 ) -> MaterializedViewReplayBudget {
     let started_at = Instant::now();
     let pass_tailer = Arc::clone(tailer);
+    let ranking_build = Arc::clone(ranking_build);
     let joined = tokio::task::spawn_blocking(move || {
-        let mut pass = ReplayPass::new(budget);
+        let mut pass = ReplayPass::new(budget).with_ranking_build(ranking_build);
         let outcome = pass_tailer.catch_up_with_pass(&mut pass);
         (pass.budget, outcome)
     })
@@ -1867,6 +1888,9 @@ pub fn spawn_materialized_view_replay_budget_metrics_task(
 struct ReplayPass {
     budget: MaterializedViewReplayBudget,
     last_status_persist: Option<Instant>,
+    /// Progress shared between the spawned tailer's replay and its ranking
+    /// build worker, absent when no build worker runs beside replay.
+    ranking_build: Option<Arc<RankingBuildProgress>>,
 }
 
 impl ReplayPass {
@@ -1874,7 +1898,56 @@ impl ReplayPass {
         Self {
             budget,
             last_status_persist: None,
+            ranking_build: None,
         }
+    }
+
+    /// Shares `progress` with the ranking build worker running beside replay.
+    fn with_ranking_build(mut self, progress: Arc<RankingBuildProgress>) -> Self {
+        self.ranking_build = Some(progress);
+        self
+    }
+
+    /// Records that the ranking build applied a page.
+    fn record_ranking_build_advance(&self) {
+        if let Some(progress) = &self.ranking_build {
+            progress.record_advance();
+        }
+    }
+
+    /// Records that a ranking build warm-up toward `target` left its cache at
+    /// `reached`.
+    fn record_ranking_build_warm_up(&self, target: BlockHeight, reached: BlockHeight) {
+        if let Some(progress) = &self.ranking_build {
+            progress.record_warm_up(target, reached);
+        }
+    }
+
+    /// Returns whether replay leaves the next page to a ranking build that
+    /// trails it, so the build can join the views instead of chasing them.
+    ///
+    /// Only a pass that shares progress with a running build worker waits,
+    /// and only while that build keeps applying history.
+    fn waits_for_ranking_build(
+        &self,
+        tailer: &MaterializedViewTailer,
+        canonical: &RocksDbCanonicalSecondary,
+    ) -> bool {
+        let Some(progress) = &self.ranking_build else {
+            return false;
+        };
+        let trailing = tailer
+            .trailing_ranking_build(canonical)
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    target: "zinder::ingest",
+                    event = "materialized_view_replay_ranking_build_state_unreadable",
+                    error = %error,
+                    "could not read the transparent-address ranking build state; Explorer view replay continues without waiting for it"
+                );
+                None
+            });
+        progress.replay_waits_for(trailing)
     }
 
     fn evaluate(&mut self) -> EffectiveMaterializedViewReplayLimits {
