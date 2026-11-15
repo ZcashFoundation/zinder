@@ -255,20 +255,42 @@ await_entrypoint_exit
 [[ -e "$work/case/explorer.stopped" ]] || test_failure "SIGTERM did not reach the Explorer"
 
 # A view store that ingest never admits delays the Explorer only until the
-# deadline, and a wallet-serving entrypoint that stops non-zero on SIGTERM
-# fails the container.
+# deadline, even with the views explicitly enabled, and a wallet-serving
+# entrypoint that stops non-zero on SIGTERM fails the container.
 reset_case
 wallet_mode=serve explorer_mode=serve start_entrypoint \
-  STUB_ADMISSION=never STUB_WALLET_STOP_STATUS=1
+  STUB_ADMISSION=never STUB_WALLET_STOP_STATUS=1 ZINDER_INGEST__EXPLORER_VIEWS=true
 await_file "$work/case/explorer.env"
 [[ -e "$work/case/explorer.unadmitted" ]] || test_failure "the Explorer started before the admission deadline"
 grep -q 'ingest has not admitted the Explorer views after' "$work/case/stderr" \
   || test_failure "the admission deadline was not logged"
+if grep -q 'Explorer views are disabled' "$work/case/stderr"; then
+  test_failure "enabled Explorer views were reported as disabled"
+fi
 kill -s TERM "$wrapper_pid"
 await_entrypoint_exit
 [[ "$wrapper_status" -eq 1 ]] || test_failure "a failed wallet-serving stop exited $wrapper_status, expected 1"
 grep -q 'the wallet-serving entrypoint stopped with status 1' "$work/case/stderr" \
   || test_failure "the failed wallet-serving stop was not logged"
+
+# With ingest's Explorer views disabled, which ingest never admits, the
+# Explorer starts once wallet serving answers instead of after the deadline.
+# The loader matches the variable name and value in any case.
+reset_case
+wallet_mode=serve explorer_mode=serve start_entrypoint \
+  STUB_ADMISSION=never ZINDER_INGEST__explorer_views=False
+await_file "$work/case/explorer.env"
+[[ ! -e "$work/case/explorer.early" ]] || test_failure "the Explorer started before wallet serving was ready"
+grep -q 'ingest Explorer views are disabled; starting zinder-explorer without waiting' \
+  "$work/case/stderr" || test_failure "the disabled Explorer views were not logged"
+if grep -q 'ingest has not admitted the Explorer views after' "$work/case/stderr"; then
+  test_failure "the Explorer waited for the admission deadline with its views disabled"
+fi
+grep -qi '^ZINDER_INGEST__EXPLORER_VIEWS=False$' "$work/case/wallet.env" \
+  || test_failure "wallet serving did not receive the Explorer views setting"
+kill -s TERM "$wrapper_pid"
+await_entrypoint_exit
+[[ "$wrapper_status" -eq 0 ]] || test_failure "SIGTERM with disabled views exited $wrapper_status"
 
 # A wallet-serving topology that fails before serving ends the container with
 # its status and never starts the Explorer.

@@ -488,14 +488,24 @@ The entrypoint first checks the Explorer configuration with
 unreadable `ZINDER_EXPLORER__BEARER_TOKEN_PATH`, ends the container before
 wallet serving starts, so the deployment fails at once instead of hours later.
 
-The entrypoint then starts the wallet-serving entrypoint. It starts
-`zinder-explorer` once `zinder-wallet-serving-healthcheck` passes, which
-happens when query `/readyz` answers 200 or reports `reorg_window_exceeded`.
-It then waits until ingest `/readyz` on port 9105 lists
-`materialized_view_identities`, which ingest reports once it admits the
-Explorer view store. The Explorer opens that store only when it starts, so it
-would otherwise serve without its view-backed capabilities. After 10 minutes
-without admission, the entrypoint logs the wait and starts the Explorer anyway.
+The entrypoint then starts the wallet-serving entrypoint and waits until
+`zinder-wallet-serving-healthcheck` passes, which happens when query `/readyz`
+answers 200 or reports `reorg_window_exceeded`. What happens next depends on
+whether ingest writes the Explorer views:
+
+- With the views enabled, as this image configures them, the entrypoint waits
+  until ingest `/readyz` on port 9105 lists `materialized_view_identities`,
+  which ingest reports once it admits the Explorer view store. The Explorer
+  opens that store only when it starts, so it would otherwise serve without
+  its view-backed capabilities. After 10 minutes without admission, the
+  entrypoint logs the wait and starts the Explorer anyway.
+- With `ZINDER_INGEST__EXPLORER_VIEWS=false`, ingest never admits the view
+  store, so the entrypoint logs `ingest Explorer views are disabled` and starts
+  the Explorer at once. The Explorer serves an existing view store as it last
+  stood, and `ExplorerFreshness` reports how far it trails the chain. Disable
+  the views this way to stop them from growing, for example while the volume
+  is grown.
+
 The deploy log then shows `starting zinder-explorer`. The Explorer composes
 transaction, block, search, and mempool reads through the container's own
 query endpoint at `127.0.0.1:9102`.

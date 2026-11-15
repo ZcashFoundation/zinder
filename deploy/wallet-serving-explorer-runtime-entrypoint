@@ -37,7 +37,8 @@ nofile_limit=65536
 # Ingest admits the Explorer view store on its own task after wallet serving
 # may already answer. The Explorer opens the store only at startup, so it waits
 # for that admission, and starts anyway after the deadline so an admission
-# failure surfaces in its own log.
+# failure surfaces in its own log. Ingest never admits the store while its
+# Explorer views are disabled, so the Explorer then starts without waiting.
 ingest_readyz_url="http://127.0.0.1:9105/readyz"
 explorer_view_admission_deadline_seconds=600
 
@@ -188,6 +189,21 @@ explorer_views_admitted() {
     | grep -q '"materialized_view_identities":\['
 }
 
+# Succeeds when ZINDER_INGEST__EXPLORER_VIEWS turns ingest's Explorer views off.
+# The config loader matches the name case-insensitively and reads 0, false,
+# off, and no in any case as false.
+explorer_views_disabled() {
+  for variable_name in $(zinder_variable_names); do
+    if [ "$(section_routing_name "$variable_name")" = ZINDER_INGEST__EXPLORER_VIEWS ]; then
+      case "$(printenv "$variable_name" | tr '[:upper:]' '[:lower:]')" in
+        0 | false | off | no) return 0 ;;
+        *) ;;
+      esac
+    fi
+  done
+  return 1
+}
+
 start_explorer() {
   log "starting zinder-explorer"
   (run_explorer) &
@@ -236,7 +252,10 @@ until "$wallet_serving_healthcheck" >/dev/null 2>&1; do
 done
 
 admission_waited_seconds=0
-until explorer_views_admitted; do
+if explorer_views_disabled; then
+  log "ingest Explorer views are disabled; starting zinder-explorer without waiting for view admission"
+fi
+until explorer_views_disabled || explorer_views_admitted; do
   if [ "$admission_waited_seconds" -ge "$explorer_view_admission_deadline_seconds" ]; then
     log "ingest has not admitted the Explorer views after ${admission_waited_seconds}s; starting zinder-explorer anyway"
     break
