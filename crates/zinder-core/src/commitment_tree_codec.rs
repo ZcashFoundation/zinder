@@ -1,7 +1,10 @@
 //! Durable commitment tree-state artifact values.
 
 #[cfg(feature = "commitment-tree-codec")]
-use std::io::{self, Cursor};
+use std::{
+    collections::VecDeque,
+    io::{self, Cursor},
+};
 
 #[cfg(feature = "commitment-tree-codec")]
 use incrementalmerkletree::{
@@ -25,6 +28,13 @@ use crate::{
 pub const MAX_COMMITMENT_TREE_FRONTIER_FINAL_STATE_BYTES: usize = 1_090;
 #[cfg(feature = "commitment-tree-codec")]
 const NOTE_COMMITMENT_TREE_DEPTH: u8 = 32;
+/// Number of recently derived frontier roots kept for reuse.
+///
+/// Following one block validates the visible-tip frontier and the next
+/// frontier of each of the three pools, so the bound covers that working set
+/// with room for a replacement parent or a served tree state.
+#[cfg(feature = "commitment-tree-codec")]
+const FRONTIER_ROOT_MEMO_CAPACITY: usize = 16;
 
 /// A validated note-commitment-tree frontier returned by Zebra.
 ///
@@ -62,22 +72,39 @@ impl CommitmentTreeFrontier {
     /// The official Zcash codecs must accept the legacy `finalState` bytes,
     /// their canonical re-encoding must be byte-identical, and the derived
     /// root must equal `final_root` in Zebra RPC display order.
+    ///
+    /// The encoding checks and the root comparison run on every call. The
+    /// root derivation itself is reused from a small process-wide memo when
+    /// the same protocol and exact bytes were derived recently, because the
+    /// root is a pure function of them.
     #[cfg(feature = "commitment-tree-codec")]
     pub fn from_canonical_final_state(
         protocol: ShieldedProtocol,
         final_root: FinalNoteCommitmentRoot,
         final_state_bytes: impl Into<Box<[u8]>>,
     ) -> Result<Self, CommitmentTreeFrontierValidationError> {
-        let final_state_bytes = final_state_bytes.into();
+        let frontier = Self::from_canonical_encoding(protocol, final_state_bytes.into())?;
+        if frontier.final_root != final_root {
+            return Err(CommitmentTreeFrontierValidationError::RootMismatch);
+        }
+        Ok(frontier)
+    }
+
+    /// Validates canonical `finalState` bytes and derives their root.
+    #[cfg(feature = "commitment-tree-codec")]
+    fn from_canonical_encoding(
+        protocol: ShieldedProtocol,
+        final_state_bytes: Box<[u8]>,
+    ) -> Result<Self, CommitmentTreeFrontierValidationError> {
         match protocol {
-            ShieldedProtocol::Sapling => validate_frontier::<SaplingNode>(
-                final_root,
+            ShieldedProtocol::Sapling => canonical_frontier::<SaplingNode>(
+                protocol,
                 final_state_bytes,
                 sapling_root_bytes_in_rpc_order,
             ),
             ShieldedProtocol::Orchard | ShieldedProtocol::Ironwood => {
-                validate_frontier::<MerkleHashOrchard>(
-                    final_root,
+                canonical_frontier::<MerkleHashOrchard>(
+                    protocol,
                     final_state_bytes,
                     orchard_root_bytes_in_rpc_order,
                 )
@@ -123,7 +150,7 @@ fn empty_frontier<Node>(
 where
     Node: Clone + Hashable,
 {
-    let root = Frontier::<Node, NOTE_COMMITMENT_TREE_DEPTH>::empty().root();
+    let root = frontier_root(&Frontier::<Node, NOTE_COMMITMENT_TREE_DEPTH>::empty());
     CommitmentTreeFrontier {
         tree_size: 0,
         final_root: FinalNoteCommitmentRoot::from_bytes(root_bytes_in_rpc_order(&root)),
@@ -160,8 +187,8 @@ pub enum CommitmentTreeFrontierValidationError {
 }
 
 #[cfg(feature = "commitment-tree-codec")]
-fn validate_frontier<Node>(
-    final_root: FinalNoteCommitmentRoot,
+fn canonical_frontier<Node>(
+    protocol: ShieldedProtocol,
     final_state_bytes: Box<[u8]>,
     root_bytes_in_rpc_order: impl Fn(&Node) -> [u8; 32],
 ) -> Result<CommitmentTreeFrontier, CommitmentTreeFrontierValidationError>
@@ -201,14 +228,126 @@ where
             reason: "finalState is not the canonical Zebra RPC encoding",
         });
     }
-    if root_bytes_in_rpc_order(&frontier.root()) != final_root.as_bytes() {
-        return Err(CommitmentTreeFrontierValidationError::RootMismatch);
-    }
+    let final_root = memoized_frontier_root(protocol, &final_state_bytes, || {
+        root_bytes_in_rpc_order(&frontier_root(&frontier))
+    });
     Ok(CommitmentTreeFrontier {
         tree_size,
         final_root,
         final_state_bytes,
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROOT_COMPUTATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(feature = "commitment-tree-codec")]
+fn frontier_root<Node>(frontier: &Frontier<Node, NOTE_COMMITMENT_TREE_DEPTH>) -> Node
+where
+    Node: Clone + Hashable,
+{
+    #[cfg(test)]
+    ROOT_COMPUTATIONS.set(ROOT_COMPUTATIONS.get().saturating_add(1));
+    frontier.root()
+}
+
+/// Returns the root of canonical `final_state_bytes`, deriving it only when
+/// the memo does not hold it.
+///
+/// `derive_root` must compute the root of the frontier decoded from exactly
+/// `final_state_bytes`, so every memo entry is that pure function's value.
+#[cfg(feature = "commitment-tree-codec")]
+fn memoized_frontier_root(
+    protocol: ShieldedProtocol,
+    final_state_bytes: &[u8],
+    derive_root: impl FnOnce() -> [u8; 32],
+) -> FinalNoteCommitmentRoot {
+    if let Some(final_root) = with_frontier_root_memo(|memo| memo.get(protocol, final_state_bytes))
+    {
+        return final_root;
+    }
+    let final_root = FinalNoteCommitmentRoot::from_bytes(derive_root());
+    with_frontier_root_memo(|memo| memo.insert(protocol, final_state_bytes, final_root));
+    final_root
+}
+
+#[cfg(all(feature = "commitment-tree-codec", not(test)))]
+fn with_frontier_root_memo<T>(access: impl FnOnce(&mut FrontierRootMemo) -> T) -> T {
+    static FRONTIER_ROOT_MEMO: parking_lot::Mutex<FrontierRootMemo> =
+        parking_lot::Mutex::new(FrontierRootMemo::new());
+    access(&mut FRONTIER_ROOT_MEMO.lock())
+}
+
+// Unit tests run concurrently and count the roots their own thread derives,
+// so each test thread keeps a private memo that other tests cannot evict.
+#[cfg(all(feature = "commitment-tree-codec", test))]
+fn with_frontier_root_memo<T>(access: impl FnOnce(&mut FrontierRootMemo) -> T) -> T {
+    thread_local! {
+        static FRONTIER_ROOT_MEMO: std::cell::RefCell<FrontierRootMemo> =
+            const { std::cell::RefCell::new(FrontierRootMemo::new()) };
+    }
+    FRONTIER_ROOT_MEMO.with_borrow_mut(access)
+}
+
+/// Recently derived roots of canonical `finalState` encodings, least recently
+/// used first.
+///
+/// Entries match on the protocol and the complete byte string. The memo only
+/// replaces a root derivation; callers still compare the root they were given.
+#[cfg(feature = "commitment-tree-codec")]
+struct FrontierRootMemo {
+    entries: VecDeque<FrontierRootMemoEntry>,
+}
+
+#[cfg(feature = "commitment-tree-codec")]
+struct FrontierRootMemoEntry {
+    protocol: ShieldedProtocol,
+    final_state_bytes: Box<[u8]>,
+    final_root: FinalNoteCommitmentRoot,
+}
+
+#[cfg(feature = "commitment-tree-codec")]
+impl FrontierRootMemo {
+    const fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+        }
+    }
+
+    fn get(
+        &mut self,
+        protocol: ShieldedProtocol,
+        final_state_bytes: &[u8],
+    ) -> Option<FinalNoteCommitmentRoot> {
+        let index = self.entries.iter().position(|entry| {
+            entry.protocol == protocol && *entry.final_state_bytes == *final_state_bytes
+        })?;
+        let entry = self.entries.remove(index)?;
+        let final_root = entry.final_root;
+        self.entries.push_back(entry);
+        Some(final_root)
+    }
+
+    fn insert(
+        &mut self,
+        protocol: ShieldedProtocol,
+        final_state_bytes: &[u8],
+        final_root: FinalNoteCommitmentRoot,
+    ) {
+        if self.get(protocol, final_state_bytes).is_some() {
+            return;
+        }
+        if self.entries.len() == FRONTIER_ROOT_MEMO_CAPACITY {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(FrontierRootMemoEntry {
+            protocol,
+            final_state_bytes: Box::from(final_state_bytes),
+            final_root,
+        });
+    }
 }
 
 #[cfg(feature = "commitment-tree-codec")]
@@ -401,8 +540,9 @@ pub struct CommitmentTreeAccumulator {
 struct PoolAccumulator<Node> {
     frontier: Frontier<Node, NOTE_COMMITMENT_TREE_DEPTH>,
     tree_size: u32,
-    root: Node,
-    root_dirty: bool,
+    /// Root of `frontier` in Zebra RPC display order, or `None` until it is
+    /// derived after the pool activates or receives commitments.
+    root: Option<FinalNoteCommitmentRoot>,
 }
 
 impl CommitmentTreeAccumulator {
@@ -521,6 +661,10 @@ impl CommitmentTreeAccumulator {
     }
 
     /// Produces canonical, revalidated Zebra `finalState` checkpoints.
+    ///
+    /// Each pool's frontier is encoded with the official codec and validated
+    /// again, and its root is derived from those canonical bytes. A pool that
+    /// received no commitments since seeding keeps its validated root.
     pub fn validated_frontiers(
         &mut self,
     ) -> Result<CommitmentTreeFrontiers, CommitmentTreeAccumulatorError> {
@@ -567,21 +711,15 @@ impl CommitmentTreeAccumulator {
         BlockFinalNoteCommitmentRoots::new(
             self.tip_height,
             block_hash,
-            self.sapling.as_mut().map(|pool| {
-                FinalNoteCommitmentRoot::from_bytes(sapling_root_bytes_in_rpc_order(
-                    current_pool_root(pool),
-                ))
-            }),
-            self.orchard.as_mut().map(|pool| {
-                FinalNoteCommitmentRoot::from_bytes(orchard_root_bytes_in_rpc_order(
-                    current_pool_root(pool),
-                ))
-            }),
-            self.ironwood.as_mut().map(|pool| {
-                FinalNoteCommitmentRoot::from_bytes(orchard_root_bytes_in_rpc_order(
-                    current_pool_root(pool),
-                ))
-            }),
+            self.sapling
+                .as_mut()
+                .map(|pool| current_pool_root(pool, sapling_root_bytes_in_rpc_order)),
+            self.orchard
+                .as_mut()
+                .map(|pool| current_pool_root(pool, orchard_root_bytes_in_rpc_order)),
+            self.ironwood
+                .as_mut()
+                .map(|pool| current_pool_root(pool, orchard_root_bytes_in_rpc_order)),
         )
     }
 }
@@ -746,12 +884,10 @@ where
             },
         );
     }
-    let root = frontier.root();
     Ok(PoolAccumulator {
         frontier,
         tree_size: validated_frontier.tree_size(),
-        root,
-        root_dirty: false,
+        root: Some(validated_frontier.final_root()),
     })
 }
 
@@ -865,15 +1001,10 @@ fn apply_pool_update<Node>(
     if !update.pool_active {
         return;
     }
-    let pool = current.get_or_insert_with(|| {
-        let frontier = Frontier::empty();
-        let root = frontier.root();
-        PoolAccumulator {
-            frontier,
-            tree_size: 0,
-            root,
-            root_dirty: false,
-        }
+    let pool = current.get_or_insert_with(|| PoolAccumulator {
+        frontier: Frontier::empty(),
+        tree_size: 0,
+        root: None,
     });
     let has_commitments = !update.commitments.is_empty();
     for commitment in update.commitments {
@@ -882,20 +1013,21 @@ fn apply_pool_update<Node>(
         let _appended_within_prevalidated_capacity = pool.frontier.append(commitment);
     }
     if has_commitments {
-        pool.root_dirty = true;
+        pool.root = None;
     }
     pool.tree_size = update.next_tree_size;
 }
 
-fn current_pool_root<Node>(pool: &mut PoolAccumulator<Node>) -> &Node
+fn current_pool_root<Node>(
+    pool: &mut PoolAccumulator<Node>,
+    root_bytes_in_rpc_order: impl Fn(&Node) -> [u8; 32],
+) -> FinalNoteCommitmentRoot
 where
     Node: Clone + Hashable,
 {
-    if pool.root_dirty {
-        pool.root = pool.frontier.root();
-        pool.root_dirty = false;
-    }
-    &pool.root
+    *pool.root.get_or_insert_with(|| {
+        FinalNoteCommitmentRoot::from_bytes(root_bytes_in_rpc_order(&frontier_root(&pool.frontier)))
+    })
 }
 
 fn snapshot_pool<Node>(
@@ -911,17 +1043,20 @@ where
     write_commitment_tree(&legacy_tree, &mut final_state_bytes).map_err(|source| {
         CommitmentTreeAccumulatorError::FrontierSnapshotEncodingFailed { protocol, source }
     })?;
-    CommitmentTreeFrontier::from_canonical_final_state(
-        protocol,
-        FinalNoteCommitmentRoot::from_bytes(root_bytes_in_rpc_order(current_pool_root(pool))),
-        final_state_bytes,
-    )
-    .map_err(
-        |source| CommitmentTreeAccumulatorError::FrontierSnapshotValidationFailed {
-            protocol,
-            source,
-        },
-    )
+    let validation_failed = |source| {
+        CommitmentTreeAccumulatorError::FrontierSnapshotValidationFailed { protocol, source }
+    };
+    let snapshot = canonical_frontier(protocol, final_state_bytes.into(), root_bytes_in_rpc_order)
+        .map_err(validation_failed)?;
+    // A root already derived from the in-memory frontier must agree with the
+    // root of its canonical encoding.
+    if pool.root.is_some_and(|root| root != snapshot.final_root()) {
+        return Err(validation_failed(
+            CommitmentTreeFrontierValidationError::RootMismatch,
+        ));
+    }
+    pool.root = Some(snapshot.final_root());
+    Ok(snapshot)
 }
 
 #[cfg(test)]
@@ -1297,6 +1432,378 @@ mod tests {
             accumulator.tip_metadata().sapling_commitment_tree_size,
             u32::MAX
         );
+        Ok(())
+    }
+
+    fn root_computations() -> u64 {
+        ROOT_COMPUTATIONS.get()
+    }
+
+    /// Empties this thread's memo, as a restarted process starts without one.
+    fn forget_derived_roots() {
+        with_frontier_root_memo(|memo| *memo = FrontierRootMemo::new());
+    }
+
+    /// Note commitments of one block, in wire order.
+    #[derive(Default)]
+    struct BlockCommitments {
+        sapling: Vec<[u8; 32]>,
+        orchard: Vec<[u8; 32]>,
+        ironwood: Vec<[u8; 32]>,
+    }
+
+    /// The node's note-commitment trees. Their roots are computed directly,
+    /// as the node computes them, outside the counted and memoized path.
+    struct NodeTrees {
+        sapling: Frontier<SaplingNode, NOTE_COMMITMENT_TREE_DEPTH>,
+        orchard: Frontier<MerkleHashOrchard, NOTE_COMMITMENT_TREE_DEPTH>,
+        ironwood: Frontier<MerkleHashOrchard, NOTE_COMMITMENT_TREE_DEPTH>,
+    }
+
+    impl NodeTrees {
+        fn after(block: &BlockCommitments) -> TestResultWith<Self> {
+            let mut trees = Self {
+                sapling: Frontier::empty(),
+                orchard: Frontier::empty(),
+                ironwood: Frontier::empty(),
+            };
+            trees.append(block)?;
+            Ok(trees)
+        }
+
+        fn append(&mut self, block: &BlockCommitments) -> TestResult {
+            for bytes in &block.sapling {
+                let node = Option::<SaplingNode>::from(SaplingNode::from_bytes(*bytes))
+                    .ok_or("fixture Sapling commitment must be canonical")?;
+                if !self.sapling.append(node) {
+                    return Err("fixture Sapling tree must have capacity".into());
+                }
+            }
+            for (frontier, commitments) in [
+                (&mut self.orchard, &block.orchard),
+                (&mut self.ironwood, &block.ironwood),
+            ] {
+                for bytes in commitments {
+                    let node =
+                        Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(bytes))
+                            .ok_or("fixture Orchard commitment must be canonical")?;
+                    if !frontier.append(node) {
+                        return Err("fixture Orchard tree must have capacity".into());
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        /// Decodes the node's tree state as the JSON-RPC source decodes
+        /// `z_gettreestate`.
+        fn checkpoint(&self) -> TestResultWith<CommitmentTreeFrontiers> {
+            Ok(CommitmentTreeFrontiers::from_validated_parts(
+                Some(node_frontier(
+                    ShieldedProtocol::Sapling,
+                    &self.sapling,
+                    sapling_root_bytes_in_rpc_order,
+                )?),
+                Some(node_frontier(
+                    ShieldedProtocol::Orchard,
+                    &self.orchard,
+                    orchard_root_bytes_in_rpc_order,
+                )?),
+                Some(node_frontier(
+                    ShieldedProtocol::Ironwood,
+                    &self.ironwood,
+                    orchard_root_bytes_in_rpc_order,
+                )?),
+            ))
+        }
+    }
+
+    fn node_frontier<Node>(
+        protocol: ShieldedProtocol,
+        frontier: &Frontier<Node, NOTE_COMMITMENT_TREE_DEPTH>,
+        root_bytes_in_rpc_order: impl Fn(&Node) -> [u8; 32],
+    ) -> TestResultWith<CommitmentTreeFrontier>
+    where
+        Node: Clone + Hashable + HashSer,
+    {
+        let mut final_state_bytes = Vec::new();
+        write_commitment_tree(
+            &CommitmentTree::from_frontier(frontier),
+            &mut final_state_bytes,
+        )?;
+        Ok(CommitmentTreeFrontier::from_canonical_final_state(
+            protocol,
+            FinalNoteCommitmentRoot::from_bytes(root_bytes_in_rpc_order(&frontier.root())),
+            final_state_bytes,
+        )?)
+    }
+
+    /// Decodes persisted frontiers as the canonical store reads its
+    /// visible-tip tree-state checkpoint row.
+    fn reread(persisted: &CommitmentTreeFrontiers) -> TestResultWith<CommitmentTreeFrontiers> {
+        let reread = |protocol| {
+            persisted
+                .get(protocol)
+                .map(|frontier| {
+                    CommitmentTreeFrontier::from_canonical_final_state(
+                        protocol,
+                        frontier.final_root(),
+                        frontier.final_state_bytes(),
+                    )
+                })
+                .transpose()
+        };
+        Ok(CommitmentTreeFrontiers::from_validated_parts(
+            reread(ShieldedProtocol::Sapling)?,
+            reread(ShieldedProtocol::Orchard)?,
+            reread(ShieldedProtocol::Ironwood)?,
+        ))
+    }
+
+    fn derive(
+        tip_height: BlockHeight,
+        anchor: &CommitmentTreeFrontiers,
+        block: &BlockCommitments,
+        activations: &NetworkUpgradeActivations,
+    ) -> TestResultWith<CommitmentTreeFrontiers> {
+        let mut accumulator =
+            CommitmentTreeAccumulator::from_validated_frontiers(tip_height, anchor, activations)?;
+        accumulator.append_block_commitments(
+            tip_height.next().ok_or("fixture height must advance")?,
+            &block.sapling,
+            &block.orchard,
+            &block.ironwood,
+        )?;
+        Ok(accumulator.validated_frontiers()?)
+    }
+
+    /// A writer following a node, reduced to its commitment-tree work.
+    struct FollowedChain {
+        activations: NetworkUpgradeActivations,
+        tip_height: BlockHeight,
+        persisted: CommitmentTreeFrontiers,
+        node: NodeTrees,
+    }
+
+    impl FollowedChain {
+        /// Appends one block in production order and returns the roots it
+        /// derived. The follow iteration reads the store's append anchor,
+        /// decodes the node's tree state for the next block, and derives the
+        /// next frontiers from the anchor. The store then reads its anchor
+        /// again and re-derives the frontiers before it commits them.
+        fn append(&mut self, block: &BlockCommitments) -> TestResultWith<u64> {
+            let before = root_computations();
+            let follow_anchor = reread(&self.persisted)?;
+            self.node.append(block)?;
+            let source = self.node.checkpoint()?;
+            let derived = derive(self.tip_height, &follow_anchor, block, &self.activations)?;
+            assert_eq!(derived, source, "ingest derives the node's frontiers");
+            let store_anchor = reread(&self.persisted)?;
+            let committed = derive(self.tip_height, &store_anchor, block, &self.activations)?;
+            assert_eq!(
+                committed, derived,
+                "the store re-derives the same frontiers"
+            );
+            self.persisted = committed;
+            self.tip_height = self
+                .tip_height
+                .next()
+                .ok_or("fixture height must advance")?;
+            Ok(root_computations() - before)
+        }
+    }
+
+    #[test]
+    fn following_a_block_derives_one_root_per_changed_pool() -> TestResult {
+        let first_leaves = BlockCommitments {
+            sapling: vec![commitment(1)],
+            orchard: vec![commitment(2)],
+            ironwood: vec![commitment(3)],
+        };
+        let node = NodeTrees::after(&first_leaves)?;
+        let mut chain = FollowedChain {
+            activations: pool_activations(1, 1, 1)?,
+            tip_height: BlockHeight::new(1),
+            persisted: node.checkpoint()?,
+            node,
+        };
+        forget_derived_roots();
+
+        // The first block derives the persisted root of each pool once.
+        assert_eq!(chain.append(&BlockCommitments::default())?, 3);
+        assert_eq!(chain.append(&BlockCommitments::default())?, 0);
+        let sapling_only = BlockCommitments {
+            sapling: vec![commitment(4), commitment(5)],
+            ..BlockCommitments::default()
+        };
+        assert_eq!(chain.append(&sapling_only)?, 1);
+        let orchard_only = BlockCommitments {
+            orchard: vec![commitment(6)],
+            ..BlockCommitments::default()
+        };
+        assert_eq!(chain.append(&orchard_only)?, 1);
+        let sapling_and_ironwood = BlockCommitments {
+            sapling: vec![commitment(7)],
+            ironwood: vec![commitment(8)],
+            ..BlockCommitments::default()
+        };
+        assert_eq!(chain.append(&sapling_and_ironwood)?, 2);
+        // Unchanged pools stay memoized while another pool changes every block
+        // for longer than the memo holds entries.
+        for value in (9_u8..).take(2 * FRONTIER_ROOT_MEMO_CAPACITY) {
+            let sapling_only = BlockCommitments {
+                sapling: vec![commitment(value)],
+                ..BlockCommitments::default()
+            };
+            assert_eq!(chain.append(&sapling_only)?, 1);
+        }
+        assert_eq!(chain.append(&BlockCommitments::default())?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_derived_frontier_that_differs_from_the_node_keeps_its_own_root() -> TestResult {
+        let activations = pool_activations(1, 1, 1)?;
+        let first_leaves = BlockCommitments {
+            sapling: vec![commitment(1)],
+            ..BlockCommitments::default()
+        };
+        let mut node = NodeTrees::after(&first_leaves)?;
+        let persisted = node.checkpoint()?;
+        node.append(&BlockCommitments {
+            sapling: vec![commitment(9)],
+            ..BlockCommitments::default()
+        })?;
+        let source = node.checkpoint()?;
+
+        let derived = derive(
+            BlockHeight::new(1),
+            &reread(&persisted)?,
+            &BlockCommitments {
+                sapling: vec![commitment(8)],
+                ..BlockCommitments::default()
+            },
+            &activations,
+        )?;
+
+        let derived_sapling = derived.sapling().ok_or("Sapling must be active")?;
+        let source_sapling = source.sapling().ok_or("Sapling must be active")?;
+        assert_ne!(
+            derived_sapling.final_state_bytes(),
+            source_sapling.final_state_bytes()
+        );
+        assert_ne!(derived_sapling.final_root(), source_sapling.final_root());
+        assert_ne!(derived, source);
+        Ok(())
+    }
+
+    #[test]
+    fn frontier_validation_reuses_a_derived_root_but_checks_every_input() -> TestResult {
+        // Orchard's uncommitted leaf is two, so appending another two would
+        // leave the root unchanged.
+        let leaf = Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(&commitment(5)))
+            .ok_or("five is a canonical Pallas base field element")?;
+        let mut frontier = Frontier::<MerkleHashOrchard, NOTE_COMMITMENT_TREE_DEPTH>::empty();
+        if !frontier.append(leaf) {
+            return Err("an empty tree must accept a leaf".into());
+        }
+        let validated = node_frontier(
+            ShieldedProtocol::Orchard,
+            &frontier,
+            orchard_root_bytes_in_rpc_order,
+        )?;
+        let final_root = validated.final_root();
+        let final_state_bytes = validated.final_state_bytes().to_vec();
+        forget_derived_roots();
+        let before = root_computations();
+
+        assert_eq!(
+            CommitmentTreeFrontier::from_canonical_final_state(
+                ShieldedProtocol::Orchard,
+                final_root,
+                final_state_bytes.clone(),
+            )?,
+            validated
+        );
+        assert_eq!(root_computations() - before, 1);
+        assert_eq!(
+            CommitmentTreeFrontier::from_canonical_final_state(
+                ShieldedProtocol::Orchard,
+                final_root,
+                final_state_bytes.clone(),
+            )?,
+            validated
+        );
+        assert_eq!(root_computations() - before, 1);
+
+        // A memoized root still has to match the claimed root.
+        assert_eq!(
+            CommitmentTreeFrontier::from_canonical_final_state(
+                ShieldedProtocol::Orchard,
+                FinalNoteCommitmentRoot::from_bytes([0xff; 32]),
+                final_state_bytes.clone(),
+            ),
+            Err(CommitmentTreeFrontierValidationError::RootMismatch)
+        );
+        let mut trailing = final_state_bytes.clone();
+        trailing.push(0);
+        assert!(matches!(
+            CommitmentTreeFrontier::from_canonical_final_state(
+                ShieldedProtocol::Orchard,
+                final_root,
+                trailing,
+            ),
+            Err(CommitmentTreeFrontierValidationError::InvalidEncoding { .. })
+        ));
+        assert_eq!(root_computations() - before, 1);
+
+        // The same bytes under another pool are derived independently.
+        CommitmentTreeFrontier::from_canonical_final_state(
+            ShieldedProtocol::Ironwood,
+            final_root,
+            final_state_bytes,
+        )?;
+        assert_eq!(root_computations() - before, 2);
+
+        // Unseen bytes are derived in full, and a stale root is rejected.
+        if !frontier.append(leaf) {
+            return Err("a one-leaf tree must accept a leaf".into());
+        }
+        let mut grown_bytes = Vec::new();
+        write_commitment_tree(&CommitmentTree::from_frontier(&frontier), &mut grown_bytes)?;
+        assert_eq!(
+            CommitmentTreeFrontier::from_canonical_final_state(
+                ShieldedProtocol::Orchard,
+                final_root,
+                grown_bytes,
+            ),
+            Err(CommitmentTreeFrontierValidationError::RootMismatch)
+        );
+        assert_eq!(root_computations() - before, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn frontier_root_memo_keeps_only_its_most_recently_used_roots() -> TestResult {
+        let root = |tag: u8| FinalNoteCommitmentRoot::from_bytes([tag; 32]);
+        let mut memo = FrontierRootMemo::new();
+        for tag in 0..=u8::try_from(FRONTIER_ROOT_MEMO_CAPACITY)? {
+            memo.insert(ShieldedProtocol::Sapling, &[tag], root(tag));
+        }
+
+        assert_eq!(memo.entries.len(), FRONTIER_ROOT_MEMO_CAPACITY);
+        assert_eq!(memo.get(ShieldedProtocol::Sapling, &[0]), None);
+        assert_eq!(memo.get(ShieldedProtocol::Sapling, &[1]), Some(root(1)));
+        memo.insert(ShieldedProtocol::Sapling, &[0xfe], root(0xfe));
+        assert_eq!(
+            memo.get(ShieldedProtocol::Sapling, &[1]),
+            Some(root(1)),
+            "a hit keeps its entry"
+        );
+        assert_eq!(memo.get(ShieldedProtocol::Sapling, &[2]), None);
+        assert_eq!(memo.get(ShieldedProtocol::Orchard, &[1]), None);
+        assert_eq!(memo.get(ShieldedProtocol::Sapling, &[1, 0]), None);
+        assert_eq!(memo.entries.len(), FRONTIER_ROOT_MEMO_CAPACITY);
         Ok(())
     }
 }
