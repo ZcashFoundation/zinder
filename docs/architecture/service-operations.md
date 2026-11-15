@@ -110,6 +110,10 @@ The projector needs only the retained events its wallet has not applied yet.
 Once its caught-up secondary holds such events, it stops converging even while
 the writer is ahead. A writer that keeps committing, as it does during a burst
 of blocks, would otherwise keep the wallet from advancing until the burst ends.
+This applies from startup whenever a published wallet resumes following, so a
+restart during a burst resumes at once. Only a fresh wallet build waits for the
+writer to attest the secondary's exact fence, because it binds its build plan
+to that fence.
 The writer's retained-event page still authenticates every event before the
 wallet applies it: the page's bounding fence must equal the secondary's fence
 or be strictly ahead of it in both event sequence and chain epoch, and the
