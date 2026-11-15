@@ -797,7 +797,7 @@ async fn compact_blocks_process_refreshes_after_shallow_reorg() -> Result<()> {
 fn selected_binary() -> Result<SelectedBinary> {
     let Some(path_text) = optional_env(BINARY_PATH_ENV)? else {
         return Ok(SelectedBinary {
-            path: PathBuf::from(env!("CARGO_BIN_EXE_zinder-compat-lightwalletd")),
+            path: zinder_testkit::bin_exe!("zinder-compat-lightwalletd"),
             source: "Cargo-provided test binary",
             evidence_boundary: "The binary was the Cargo-provided test binary, not a separately built release artifact.",
         });

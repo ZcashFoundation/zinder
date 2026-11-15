@@ -210,13 +210,13 @@ async fn runtime_starts_without_materialized_view_store_and_omits_materialized_v
 }
 
 fn zinder_explorer_command() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_zinder-explorer"));
+    let mut command = Command::new(zinder_testkit::bin_exe!("zinder-explorer"));
     command.env_clear();
     command
 }
 
 fn zinder_explorer_tokio_command() -> TokioCommand {
-    let mut command = TokioCommand::new(env!("CARGO_BIN_EXE_zinder-explorer"));
+    let mut command = TokioCommand::new(zinder_testkit::bin_exe!("zinder-explorer"));
     command.env_clear();
     command.stdout(Stdio::null()).stderr(Stdio::null());
     command

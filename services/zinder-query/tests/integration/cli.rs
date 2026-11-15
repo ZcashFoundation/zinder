@@ -6,7 +6,7 @@ use tempfile::TempDir;
 
 #[test]
 fn version_reports_the_product_version() -> eyre::Result<()> {
-    let output = Command::new(env!("CARGO_BIN_EXE_zinder-query"))
+    let output = Command::new(zinder_testkit::bin_exe!("zinder-query"))
         .arg("--version")
         .output()?;
 
@@ -20,7 +20,7 @@ fn version_reports_the_product_version() -> eyre::Result<()> {
 }
 
 fn query_command(temporary: &TempDir, canonical_secondary_root: &std::path::Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_zinder-query"));
+    let mut command = Command::new(zinder_testkit::bin_exe!("zinder-query"));
     command.args([
         "--print-config",
         "--network",

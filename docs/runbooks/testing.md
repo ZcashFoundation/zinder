@@ -108,6 +108,31 @@ engineer. It does not execute the blocks; running them still requires the
 documented prerequisites. See [Runbook self-test](#runbook-self-test)
 below for the full contract.
 
+### Archive-safe test conventions
+
+Tests may run from a `cargo nextest archive` on a machine that did not build
+them, so they must not depend on the build machine's paths.
+
+An integration test that starts a service binary resolves it with
+`zinder_testkit::bin_exe!`, never with `env!("CARGO_BIN_EXE_<name>")`. The
+macro prefers the `NEXTEST_BIN_EXE_<name>` path that nextest sets at run time
+and falls back to the compile-time Cargo path, so the same call works under
+`cargo nextest run`, `cargo test`, and an extracted archive. The name is the
+binary target name with hyphens, as in `bin_exe!("zinder-query")`.
+
+```rust
+let output = Command::new(zinder_testkit::bin_exe!("zinder-query"))
+    .arg("--version")
+    .output()?;
+```
+
+A test that reads the source tree resolves the workspace from the run-time
+`CARGO_MANIFEST_DIR`, which nextest rewrites under `--workspace-remap`. It must
+fail when the tree is missing or nearly empty, and never treat a missing
+directory as a clean scan. The workspace invariant scans in `zinder-core`,
+`zinder-source`, and `zinder-proto` do this and assert a minimum number of
+scanned files.
+
 ## Public SDK package gate
 
 Run after changing `zinder-core`, `zinder-proto`, `zinder-client`, their

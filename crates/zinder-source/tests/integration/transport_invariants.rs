@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use eyre::{Result, eyre};
+use eyre::{Result, ensure, eyre};
 
 /// The two files that own Zebra and intra-Zinder transport construction.
 ///
@@ -23,6 +23,10 @@ const EXTERNAL_PRODUCT_HTTP_TRANSPORT_OWNERSHIP: &[&str] =
     &["services/zinder-compat-cipherscan/src/market_price.rs"];
 
 const SCANNED_DIRECTORIES: &[&str] = &["crates", "services"];
+
+/// Floor for the Rust sources one scan root must yield. The tree holds several
+/// times this many, so only a missing or emptied tree falls below it.
+const MINIMUM_SCANNED_FILES_PER_DIRECTORY: usize = 50;
 
 /// Patterns that may only appear inside the transport modules.
 ///
@@ -70,14 +74,12 @@ const BANNED_TRANSPORT_PATTERNS: &[BannedPattern] = &[
 fn production_source_files(directory: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     collect_production_source_files(directory, &mut paths)?;
+    ensure_scan_saw_source_tree(directory, paths.len())?;
     paths.sort();
     Ok(paths)
 }
 
 fn collect_production_source_files(directory: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
-    if !directory.exists() {
-        return Ok(());
-    }
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
@@ -153,11 +155,33 @@ fn transport_construction_lives_only_in_transport_modules() -> Result<()> {
     ))
 }
 
+/// Resolves the workspace root from the manifest directory of this test's crate.
+///
+/// Nextest sets `CARGO_MANIFEST_DIR` at run time, rewritten by
+/// `--workspace-remap` when the tests run from an archive. The compile-time
+/// value names the build machine's checkout, so it is only the fallback for
+/// runners that do not set the variable.
 fn workspace_root() -> Result<PathBuf> {
-    let manifest_directory = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest_directory = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from);
     manifest_directory
         .parent()
         .and_then(Path::parent)
         .map(Path::to_path_buf)
         .ok_or_else(|| eyre!("CARGO_MANIFEST_DIR has no grandparent: {manifest_directory:?}"))
+}
+
+/// Fails when a scan root holds too few Rust sources to be the workspace tree.
+///
+/// A scan that finds nothing would pass every invariant vacuously, for
+/// example when archived tests run without the checkout beside them.
+fn ensure_scan_saw_source_tree(directory: &Path, scanned_file_count: usize) -> Result<()> {
+    ensure!(
+        scanned_file_count >= MINIMUM_SCANNED_FILES_PER_DIRECTORY,
+        "scanned {scanned_file_count} Rust sources under {}, expected at least \
+         {MINIMUM_SCANNED_FILES_PER_DIRECTORY}; the invariant tests need the workspace source tree \
+         at the path nextest reports in CARGO_MANIFEST_DIR",
+        directory.display(),
+    );
+    Ok(())
 }

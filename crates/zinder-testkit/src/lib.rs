@@ -39,6 +39,7 @@
 //! workspace gate (`cargo deny check`) enforces no production crate links
 //! against this one.
 
+pub mod binary_path;
 pub mod canonical_writer_fixture;
 pub mod chain_fixture;
 pub mod commitment_tree_fixtures;
