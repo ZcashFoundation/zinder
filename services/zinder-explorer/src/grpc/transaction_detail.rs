@@ -94,15 +94,30 @@ pub(crate) async fn query_transaction_detail(
             ExplorerError::internal("WalletQuery.Transaction response missing location")
         })?;
 
+    let mut response = transaction_detail_response(
+        materialized_view_store,
+        network_upgrade_activations,
+        transaction_id,
+        chain_epoch,
+        location,
+    )?;
+    let freshness = response.freshness.take().unwrap_or_default();
+    response.freshness =
+        Some(attach_upstream_observation(upstream_observation_cache, freshness).await);
+    Ok(Response::new(response))
+}
+
+/// Builds the detail response for one wallet-plane transaction, before the
+/// upstream observation is attached to its freshness envelope.
+fn transaction_detail_response(
+    materialized_view_store: Option<&MaterializedViewStore>,
+    network_upgrade_activations: &NetworkUpgradeActivations,
+    transaction_id: TransactionId,
+    chain_epoch: wallet::ChainEpoch,
+    location: wire_location::Location,
+) -> Result<TransactionDetailResponse, Status> {
     let transaction =
         resolve_facts_and_location(network_upgrade_activations, transaction_id, location)?;
-
-    let mut freshness = build_explorer_freshness(
-        materialized_view_store,
-        EXPLORER_TRANSACTION_DETAIL_V4,
-        Some(chain_epoch.clone()),
-        0,
-    )?;
 
     let fees = resolve_fee_record(materialized_view_store, &transaction)?;
     let transparent_rows = resolve_transparent_rows(
@@ -111,16 +126,21 @@ pub(crate) async fn query_transaction_detail(
         fees.as_ref(),
         materialized_view_store,
     )?;
+    let mut freshness = build_explorer_freshness(
+        materialized_view_store,
+        EXPLORER_TRANSACTION_DETAIL_V4,
+        Some(chain_epoch),
+        0,
+    )?;
     if !transparent_rows.output_spends_known {
         freshness
             .unavailable
             .push(transparent_output_spend_status_unavailable());
     }
-    let freshness = attach_upstream_observation(upstream_observation_cache, freshness).await;
     let (paid_fee_zat, prevout_resolution_status) = fees.as_ref().map_or((None, 0), |record| {
         (record.paid_fee_zat, record.prevout_resolution_status)
     });
-    Ok(Response::new(TransactionDetailResponse {
+    Ok(TransactionDetailResponse {
         freshness: Some(freshness),
         facts: Some(encode_public_facts(&transaction.facts)),
         location: Some(transaction.location),
@@ -129,7 +149,7 @@ pub(crate) async fn query_transaction_detail(
         transparent_inputs: transparent_rows.inputs,
         transparent_outputs: transparent_rows.outputs,
         intrinsic_value_balances: None,
-    }))
+    })
 }
 
 struct ResolvedTransactionDetail {
@@ -483,13 +503,17 @@ fn encode_lock_time(lock_time: CoreLockTime) -> WireLockTime {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use zinder_core::{
         ArtifactSchemaVersion, BlockHash, ChainEpochId, ChainTipMetadata, Network, TransactionId,
-        TransparentInputFact, TransparentOutPoint, UnixTimestampMillis,
+        TransparentAddressScriptHash, TransparentInputFact, TransparentOutPoint,
+        TransparentSpendFact, UnixTimestampMillis,
     };
     use zinder_materialized_views::{MaterializedViewCoverage, MaterializedViewStoreOptions};
     use zinder_proto::v1::explorer::TransparentInputValueRecord;
     use zinder_store::{RocksDbResourceBudget, chain_epoch_message};
+    use zinder_testkit::seed_transparent_outpoint_spends;
 
     use super::*;
 
@@ -533,13 +557,7 @@ mod tests {
     fn mined_outputs_are_served_with_unknown_spends_before_the_spend_view_covers_the_epoch()
     -> eyre::Result<()> {
         let tempdir = tempfile::tempdir()?;
-        let materialized_view_store = MaterializedViewStore::open_explorer_views(
-            tempdir.path(),
-            MaterializedViewStoreOptions {
-                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
-                ..MaterializedViewStoreOptions::default()
-            },
-        )?;
+        let materialized_view_store = open_spend_view_store(tempdir.path())?;
         let transaction = resolve_mined_transparent_transaction()?;
         let chain_epoch = chain_epoch_message(chain_epoch_at(1));
 
@@ -570,6 +588,129 @@ mod tests {
             unavailable.human_reason,
             TRANSPARENT_OUTPUT_SPEND_STATUS_NOT_INDEXED
         );
+    }
+
+    #[test]
+    fn detail_withholds_recorded_spends_while_the_spend_view_misses_the_epoch() -> eyre::Result<()>
+    {
+        let not_started = None;
+        let trailing = Some(spend_view_state(1, 1, 1));
+        let leading = Some(spend_view_state(3, 1, 3));
+        for spend_view in [not_started, trailing, leading] {
+            let tempdir = tempfile::tempdir()?;
+            let materialized_view_store = open_spend_view_store(tempdir.path())?;
+            if let Some(state) = spend_view {
+                materialized_view_store
+                    .put_consumer_state(TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME, state)?;
+            }
+            let (transaction_id, location) = mined_transparent_location()?;
+            seed_transparent_outpoint_spends(
+                &materialized_view_store,
+                &[spend_of_first_output(transaction_id)],
+            )?;
+
+            let response = transaction_detail_response(
+                Some(&materialized_view_store),
+                &NetworkUpgradeActivations::empty(Network::ZcashRegtest),
+                transaction_id,
+                chain_epoch_message(chain_epoch_at(2)),
+                location,
+            )?;
+
+            assert!(response.facts.is_some());
+            assert!(response.location.is_some());
+            assert_eq!(response.transparent_inputs.len(), 1);
+            assert_eq!(response.transparent_outputs.len(), 2);
+            assert!(
+                response
+                    .transparent_outputs
+                    .iter()
+                    .all(|output| output.spent_by.is_none()),
+                "{spend_view:?}: a spend view off the epoch must not report spend relations"
+            );
+            assert_eq!(
+                spent_by_markers(&response),
+                vec![transparent_output_spend_status_unavailable()],
+                "{spend_view:?}: unknown spend status must be marked stale"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn detail_reports_spent_and_unspent_outputs_when_the_spend_view_covers_the_epoch()
+    -> eyre::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let materialized_view_store = open_spend_view_store(tempdir.path())?;
+        materialized_view_store.put_consumer_state(
+            TRANSPARENT_OUTPOINT_SPEND_CONSUMER_NAME,
+            spend_view_state(2, 1, 2),
+        )?;
+        let (transaction_id, location) = mined_transparent_location()?;
+        seed_transparent_outpoint_spends(
+            &materialized_view_store,
+            &[spend_of_first_output(transaction_id)],
+        )?;
+
+        let response = transaction_detail_response(
+            Some(&materialized_view_store),
+            &NetworkUpgradeActivations::empty(Network::ZcashRegtest),
+            transaction_id,
+            chain_epoch_message(chain_epoch_at(2)),
+            location,
+        )?;
+
+        assert_eq!(response.transparent_outputs.len(), 2);
+        assert_eq!(
+            response.transparent_outputs[0]
+                .spent_by
+                .as_ref()
+                .map(|spend| spend.spending_transaction_id.clone()),
+            Some(encode_rpc_transaction_id_hex(spending_transaction_id()))
+        );
+        assert!(response.transparent_outputs[1].spent_by.is_none());
+        assert!(spent_by_markers(&response).is_empty());
+        Ok(())
+    }
+
+    fn spent_by_markers(response: &TransactionDetailResponse) -> Vec<UnavailableField> {
+        response
+            .freshness
+            .iter()
+            .flat_map(|freshness| freshness.unavailable.iter())
+            .filter(|unavailable| unavailable.field_path == TRANSPARENT_OUTPUT_SPENT_BY_FIELD_PATH)
+            .cloned()
+            .collect()
+    }
+
+    fn open_spend_view_store(path: &Path) -> eyre::Result<MaterializedViewStore> {
+        Ok(MaterializedViewStore::open_explorer_views(
+            path,
+            MaterializedViewStoreOptions {
+                rocksdb_resource_budget: RocksDbResourceBudget::for_local_tests(),
+                ..MaterializedViewStoreOptions::default()
+            },
+        )?)
+    }
+
+    fn spending_transaction_id() -> TransactionId {
+        TransactionId::from_bytes([9; 32])
+    }
+
+    /// Spend of output 0 mined at height 2 by [`spending_transaction_id`].
+    fn spend_of_first_output(transaction_id: TransactionId) -> TransparentSpendFact {
+        TransparentSpendFact::new(
+            TransparentOutPoint::new(transaction_id, 0),
+            0,
+            spending_transaction_id(),
+            1,
+            BlockHeight::new(2),
+            block_hash(2),
+            1_000,
+            TransparentAddressScriptHash::of_script_pub_key(&[0x51]),
+            BlockHeight::new(1),
+            block_hash(1),
+        )
     }
 
     fn chain_epoch_at(height: u32) -> ChainEpoch {
@@ -714,6 +855,16 @@ mod tests {
     }
 
     fn resolve_mined_transparent_transaction() -> eyre::Result<ResolvedTransactionDetail> {
+        let (transaction_id, location) = mined_transparent_location()?;
+        Ok(resolve_facts_and_location(
+            &NetworkUpgradeActivations::empty(Network::ZcashRegtest),
+            transaction_id,
+            location,
+        )?)
+    }
+
+    /// The two-output transparent transaction mined at height 1.
+    fn mined_transparent_location() -> eyre::Result<(TransactionId, wire_location::Location)> {
         let payload_bytes = transparent_transaction_bytes();
         let activations = NetworkUpgradeActivations::empty(Network::ZcashRegtest);
         let parsed = zinder_source::parse_transaction_public_fact_set(
@@ -723,8 +874,7 @@ mod tests {
         )?;
         let transaction_id = parsed.public_facts.transaction_id;
 
-        Ok(resolve_facts_and_location(
-            &activations,
+        Ok((
             transaction_id,
             wire_location::Location::Mined(wallet::MinedTransaction {
                 location: Some(wallet::MinedBlockLocation {
@@ -740,7 +890,7 @@ mod tests {
                 }),
                 raw_transaction_bytes: Some(payload_bytes),
             }),
-        )?)
+        ))
     }
 
     fn transparent_transaction_bytes() -> Vec<u8> {
