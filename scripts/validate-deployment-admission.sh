@@ -5,7 +5,7 @@ usage() {
   cat >&2 <<'EOF'
 Usage:
   validate-deployment-admission.sh --deployment-class CLASS --target TARGET
-  validate-deployment-admission.sh --release-workflow PATH [--release-images-catalog PATH] [--single-volume-images-catalog PATH] [--dockerfile PATH]
+  validate-deployment-admission.sh --release-workflow PATH [--release-images-catalog PATH] [--single-volume-images-catalog PATH] [--dockerfile PATH] [--image-packager PATH]
   validate-deployment-admission.sh --build-images-workflow PATH [--release-images-catalog PATH] [--single-volume-images-catalog PATH] [--dockerfile PATH]
   validate-deployment-admission.sh --prometheus-config PATH
   validate-deployment-admission.sh --compose-contract RESOLVED_COMPOSE_JSON
@@ -23,6 +23,7 @@ build_images_workflow=""
 release_images_catalog="$repository_root/deploy/release-images.json"
 single_volume_images_catalog="$repository_root/deploy/release-single-volume-images.json"
 dockerfile="$repository_root/deploy/Dockerfile"
+image_packager="$repository_root/scripts/package-release-images.sh"
 release_inputs_explicit=false
 prometheus_config=""
 compose_contract=""
@@ -64,6 +65,12 @@ while [[ $# -gt 0 ]]; do
     --dockerfile)
       [[ $# -ge 2 ]] || usage
       dockerfile="$2"
+      release_inputs_explicit=true
+      shift 2
+      ;;
+    --image-packager)
+      [[ $# -ge 2 ]] || usage
+      image_packager="$2"
       release_inputs_explicit=true
       shift 2
       ;;
@@ -892,6 +899,16 @@ EOF
       in_call && /--commit / { exit }
     ' <<< "$merge_job"
   )"
+  # The continued shell command that starts at the first line matching $1.
+  shell_invocation() {
+    awk -v start="$1" '
+      index($0, start) { in_call = 1 }
+      in_call { print }
+      in_call && !/\\$/ { exit }
+    '
+  }
+  image_push_invocation="$(shell_invocation 'scripts/package-release-images.sh push ' <<< "$image_job")"
+  image_smoke_invocation="$(shell_invocation 'scripts/package-release-images.sh check ' <<< "$reproduction_job")"
   # These literals are workflow expressions and shell variables being inspected.
   # shellcheck disable=SC2016
   if [[ -z "$compile_job" || -z "$reproduction_job" || -z "$comparison_job" ]] \
@@ -908,7 +925,7 @@ EOF
     || [[ "$(grep -Fc -- '--build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}"' <<< "$compile_job")" -ne 1 ]] \
     || [[ "$(grep -Fc -- '--build-arg "ZINDER_BUILD_GIT_COMMIT=${RELEASE_COMMIT}"' <<< "$compile_job")" -ne 1 ]] \
     || grep -Eq -- '--cache-(from|to)' "$release_workflow" \
-    || grep -Fq 'docker/login-action' <<< "$compile_job$reproduction_job$comparison_job" \
+    || grep -Eq 'docker/login-action|docker login' <<< "$compile_job$comparison_job" \
     || ! grep -Fq 'scripts/check-release-binary-archive.sh' <<< "$compile_job" \
     || ! grep -Fq 'scripts/check-release-binary-archive.sh' <<< "$reproduction_job" \
     || ! grep -Fq 'x86_64-v3-unknown-linux-gnu' <<< "$compile_job" \
@@ -925,13 +942,17 @@ EOF
     || ! grep -Fq 'cmp -- "dist/build/${archive_name}" "dist/reproduction/${archive_name}"' \
       <<< "$comparison_job" \
     || ! grep -Fq 'name: release-build-${{ matrix.platform.name }}' <<< "$image_job" \
-    || ! grep -Fq 'sha256sum --check --strict "${candidate_root}/binaries.sha256"' <<< "$image_job" \
-    || ! grep -Fq -- '--build-context "zinder-archived-binaries=${binary_context}"' <<< "$image_job" \
-    || ! grep -Fq -- '--build-arg "ZINDER_BINARIES_SOURCE=zinder-archived-binaries"' <<< "$image_job" \
-    || ! grep -Fq -- '--build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}"' <<< "$image_job" \
+    || ! grep -Fq 'path: ${{ runner.temp }}/release-candidate' <<< "$image_job" \
+    || ! grep -Fq 'RELEASE_IMAGES_JSON: ${{ needs.validate.outputs.release_images }}' <<< "$image_job" \
+    || [[ "$(grep -Fc 'scripts/package-release-images.sh' <<< "$image_job")" -ne 1 ]] \
+    || ! grep -Fq -- '--archive "${candidate_root}/zinder-${RELEASE_VERSION}-${PLATFORM_NAME}.tar.gz"' <<< "$image_push_invocation" \
+    || ! grep -Fq -- '--binary-hashes "${candidate_root}/binaries.sha256"' <<< "$image_push_invocation" \
+    || ! grep -Fq -- '--images-json "$RELEASE_IMAGES_JSON"' <<< "$image_push_invocation" \
+    || ! grep -Fq -- '--platform "$TARGET_PLATFORM"' <<< "$image_push_invocation" \
+    || ! grep -Fq -- '--digests /tmp/digests' <<< "$image_push_invocation" \
+    || grep -Fq 'docker buildx build' <<< "$image_job" \
     || grep -Fq 'RELEASE_CACHE_SCOPE' <<< "$image_job" \
     || grep -Fq -- '--target release-binaries' <<< "$image_job" \
-    || ! grep -Fq 'cmp -- "${binary_root}/${binary_name}" "$image_binary"' <<< "$image_job" \
     || ! grep -Fq 'name: release-build-${{ matrix.platform }}' <<< "$binary_archive_job" \
     || [[ "$(grep -Fc 'uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0' <<< "$binary_archive_job")" -ne 2 ]] \
     || ! grep -Eq '^[[:space:]]+- images$' <<< "$merge_job" \
@@ -950,9 +971,90 @@ EOF
     cat >&2 <<'EOF'
 release admission rejected: release binaries must build in 2 independent
 uncached jobs for both GNU platforms and compare identical before approval,
-images must package the proven archive binaries without compiling, exact SBOMs
-must be generated and attested, and the archives must be assembled into the
-final draft GitHub Release assets.
+images must package the proven archive binaries only through
+scripts/package-release-images.sh push, exact SBOMs must be generated and
+attested, and the archives must be assembled into the final draft GitHub
+Release assets.
+EOF
+    exit 1
+  fi
+
+  # These literals are workflow expressions and shell variables being inspected.
+  # shellcheck disable=SC2016
+  archive_build_line="$(grep -nF 'scripts/build-release-binary-archive.sh' <<< "$reproduction_job" | head -n 1 | cut -d: -f1 || true)"
+  image_smoke_line="$(grep -nF 'scripts/package-release-images.sh check ' <<< "$reproduction_job" | head -n 1 | cut -d: -f1 || true)"
+  reproduction_permissions="$(
+    awk '
+      /^    permissions:[[:space:]]*$/ { in_permissions = 1; next }
+      in_permissions && /^      / { print; next }
+      in_permissions { exit }
+    ' <<< "$reproduction_job"
+  )"
+  # shellcheck disable=SC2016
+  if [[ -z "$archive_build_line" || -z "$image_smoke_line" ]] \
+    || (( archive_build_line >= image_smoke_line )) \
+    || [[ "$(grep -Fc 'scripts/package-release-images.sh' <<< "$reproduction_job")" -ne 1 ]] \
+    || ! grep -Fq -- '--archive "dist/reproduction/zinder-${RELEASE_VERSION}-${PLATFORM_NAME}.tar.gz"' <<< "$image_smoke_invocation" \
+    || ! grep -Fq -- '--binary-hashes dist/reproduction/binaries.sha256' <<< "$image_smoke_invocation" \
+    || ! grep -Fq -- '--images-json "$RELEASE_IMAGES_JSON"' <<< "$image_smoke_invocation" \
+    || ! grep -Fq -- '--platform "$TARGET_PLATFORM"' <<< "$image_smoke_invocation" \
+    || grep -Eq -- '--(registry|digests)' <<< "$image_smoke_invocation" \
+    || ! grep -Fq 'RELEASE_IMAGES_JSON: ${{ needs.validate.outputs.release_images }}' <<< "$reproduction_job" \
+    || grep -Eq '^[[:space:]]+(-[[:space:]]+)?(continue-on-error|if):' <<< "$reproduction_job" \
+    || grep -Eq 'docker/login-action|docker login|secrets\.|github\.token' <<< "$reproduction_job" \
+    || [[ "$reproduction_permissions" != '      contents: read' ]]; then
+    cat >&2 <<'EOF'
+release admission rejected: the reproduce job must package every release image
+from its own archive with scripts/package-release-images.sh check after
+building it, with only a read-only repository token, no registry login, and no
+step that may skip or ignore the packaging smoke.
+EOF
+    exit 1
+  fi
+
+  # These literals are the shell text of the packager being inspected.
+  # shellcheck disable=SC2016
+  packager_hash_check_line="$(grep -nF '(cd "$binary_root" && sha256sum --check --strict "$binary_hashes")' "$image_packager" | head -n 1 | cut -d: -f1 || true)"
+  # shellcheck disable=SC2016
+  packager_mode_check_line="$(grep -nF 'require_archive_binary_mode "$binary_root/$binary_name" "archive binary $binary_name"' "$image_packager" | head -n 1 | cut -d: -f1 || true)"
+  # shellcheck disable=SC2016
+  packager_image_check_line="$(grep -nF 'require_archive_binary_mode "$image_binary" "${image_name} binary ${binary_name}"' "$image_packager" | head -n 1 | cut -d: -f1 || true)"
+  packager_first_build_line="$(grep -nF 'docker buildx build' "$image_packager" | head -n 1 | cut -d: -f1 || true)"
+  # shellcheck disable=SC2016
+  packager_publish_line="$(grep -nF -- '--output "$image_output"' "$image_packager" | head -n 1 | cut -d: -f1 || true)"
+  # shellcheck disable=SC1003,SC2016
+  if [[ ! -x "$image_packager" ]] \
+    || [[ -z "$packager_hash_check_line" || -z "$packager_mode_check_line" ]] \
+    || [[ -z "$packager_image_check_line" || -z "$packager_first_build_line" || -z "$packager_publish_line" ]] \
+    || (( packager_hash_check_line >= packager_first_build_line )) \
+    || (( packager_mode_check_line >= packager_first_build_line )) \
+    || (( packager_image_check_line >= packager_publish_line )) \
+    || ! grep -Fqx 'archive_binary_mode=755' "$image_packager" \
+    || ! grep -Fq 'tar --extract --gzip --same-permissions --no-same-owner \' "$image_packager" \
+    || ! grep -Fq 'if [[ -L "$binary_path" || ! -f "$binary_path" ]]; then' "$image_packager" \
+    || ! grep -Fq "binary_mode=\"\$(stat -c '%a' -- \"\$binary_path\")\"" "$image_packager" \
+    || ! grep -Fq 'if [[ "$binary_mode" != "$archive_binary_mode" ]]; then' "$image_packager" \
+    || ! grep -Fq 'cmp -- "${binary_root}/${binary_name}" "$image_binary"' "$image_packager" \
+    || ! grep -Fq -- "-c '%a %u:%g %F' \"/usr/local/bin/\${binary_name}\"" "$image_packager" \
+    || ! grep -Fq '[[ "$image_binary_stat" == "${archive_binary_mode} 0:0 regular file" ]]' "$image_packager" \
+    || ! grep -Fq -- '--entrypoint "$binary_name" "$smoke_image" --version' "$image_packager" \
+    || ! grep -Fq "jq -r '.[]' <<< \"\$images_json\"" "$image_packager" \
+    || ! grep -Fq -- '--build-context "zinder-archived-binaries=${binary_context}"' "$image_packager" \
+    || ! grep -Fq -- '--build-arg "ZINDER_BINARIES_SOURCE=zinder-archived-binaries"' "$image_packager" \
+    || ! grep -Fq -- '--build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}"' "$image_packager" \
+    || ! grep -Fq -- '--provenance=mode=max' "$image_packager" \
+    || ! grep -Fq -- '--sbom=true' "$image_packager" \
+    || ! grep -Fq 'push) image_output="type=image,name=${registry}/${image_name},push-by-digest=true,name-canonical=true,push=true" ;;' "$image_packager" \
+    || ! grep -Fq 'check) image_output="type=image,name=zinder-release-smoke/${image_name}:${platform_arch},push=false" ;;' "$image_packager" \
+    || [[ "$(grep -Fc 'push=true' "$image_packager")" -ne 1 ]] \
+    || grep -Eq -- 'RELEASE_CACHE_SCOPE|--target release-binaries|--cache-(from|to)|docker login|cargo ' "$image_packager"; then
+    cat >&2 <<'EOF'
+release admission rejected: the release image packager must check the archive
+binary hashes and their regular-file 0755 mode before any image build, package
+every image from the archived-binaries context without compiling or caching,
+compare every image binary with the archive byte for byte and by mode before
+publishing it, build with max-mode provenance and an SBOM, push only in push
+mode, and run each binary inside its image in check mode.
 EOF
     exit 1
   fi
@@ -960,11 +1062,12 @@ EOF
   workflow_before_approval="$(sed '/^  publish-sdk-crates:/,$d' "$release_workflow")"
   if [[ "$(grep -Ec '^    environment:' "$release_workflow")" -ne 1 ]] \
     || grep -Eq '(id-token|packages|attestations|contents): write' \
-      <<< "$workflow_before_approval"; then
+      <<< "$workflow_before_approval" \
+    || grep -Eq 'docker/login-action|docker login' <<< "$workflow_before_approval"; then
     cat >&2 <<'EOF'
 release admission rejected: the protected release environment must gate crate
 publication as the only reviewed job, and no earlier job may receive a write
-permission or an OIDC token.
+permission or an OIDC token or log in to a registry.
 EOF
     exit 1
   fi
@@ -975,8 +1078,6 @@ EOF
     || [[ "$(grep -Fc 'uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2' "$release_workflow")" -ne 3 ]] \
     || [[ "$(grep -Fc 'scripts/install-release-gh.sh' "$release_workflow")" -ne 4 ]] \
     || grep -Fq 'artifact-metadata:' "$release_workflow" \
-    || ! grep -Fq -- '--provenance=mode=max' "$release_workflow" \
-    || ! grep -Fq -- '--sbom=true' "$release_workflow" \
     || ! grep -Fq 'scripts/check-release-image-evidence.sh' "$release_workflow" \
     || ! grep -Fq 'cosign sign --yes' <<< "$merge_job" \
     || ! grep -Fq 'scripts/verify-release-image-attestations.sh' <<< "$image_attestation_verification" \

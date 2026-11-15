@@ -43,7 +43,9 @@ environment is requested. The approval, crate publication, archive
 attestation, and every image build therefore wait for that comparison.
 Release images do not compile: they copy the binaries extracted from the
 compared archive, and each image binary must match its archive binary byte for
-byte.
+byte and keep its `0755` mode. Before the approval, the reproduction job
+packages every release image the same way from its own archive, without
+pushing, and runs each binary inside its image.
 
 RocksDB and its compression dependencies retain the existing static-link
 policy. GNU libc and `libstdc++.so.6` remain dynamic runtime dependencies. The
@@ -60,8 +62,8 @@ epoch, and every binary hash and size.
 - x86 hosts must support x86-64-v3; the filename makes that requirement
   visible before execution.
 - Binary release failure blocks crates.io authentication and every image
-  registry write. A tag whose binaries do not build or reproduce publishes no
-  crate, image, or GitHub Release.
+  registry write. A tag whose binaries do not build, reproduce, or package
+  into the release images publishes no crate, image, or GitHub Release.
 - The release approval is requested only after the slowest build finishes.
   With the v0.13.0 build times on GitHub-hosted runners, that is about 17
   minutes after the tag push. Approval latency adds to release time after that
@@ -84,4 +86,6 @@ by [ADR-0037](0037-release-artifact-provenance-and-sboms.md).
   validation, and the release approval waits for their byte comparison, so a
   binary failure stops the release before crate publication. Release images
   package the binaries extracted from the compared archive instead of reusing
-  the compile stage, and the benchmark left the shared release compile.
+  the compile stage, and the benchmark left the shared release compile. The
+  reproduction job packages every release image from its archive without
+  pushing, and image binaries must keep the archive's `0755` mode.

@@ -3,13 +3,14 @@ name: release
 # A release tag names the product version already present in Cargo metadata.
 # Credential-free jobs start as soon as the tag validates: API artifacts, SDK
 # readiness, and two independent uncached binary builds per platform. The
-# protected release environment is requested only after both builds of every
-# platform match byte for byte. Its one review gates crate publication, the
-# first credentialed job, and every job that receives an OIDC token or writes
-# to a registry depends on it. Images package the proven archive binaries
-# without compiling again. Exact image tags and API assets are prepared before
-# the GitHub Release is published, and stable `latest` image tags move only
-# after every required artifact succeeds.
+# reproduction also packages every release image from its archive without
+# pushing. The protected release environment is requested only after both
+# builds of every platform match byte for byte. Its one review gates crate
+# publication, the first credentialed job, and every job that receives an OIDC
+# token or writes to a registry depends on it. Images package the proven
+# archive binaries without compiling again. Exact image tags and API assets are
+# prepared before the GitHub Release is published, and stable `latest` image
+# tags move only after every required artifact succeeds.
 
 on:
   push:
@@ -392,6 +393,13 @@ jobs:
             docker: linux/arm64
             rust: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
+    env:
+      PLATFORM_NAME: ${{ matrix.platform.name }}
+      RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      RUST_TARGET: ${{ matrix.platform.rust }}
+      TARGET_PLATFORM: ${{ matrix.platform.docker }}
     steps:
       - name: Checkout validated commit
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -403,12 +411,6 @@ jobs:
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Build the independent reproduction archive
-        env:
-          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
-          RELEASE_TAG: ${{ github.ref_name }}
-          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
-          RUST_TARGET: ${{ matrix.platform.rust }}
-          TARGET_PLATFORM: ${{ matrix.platform.docker }}
         run: |
           set -euo pipefail
 
@@ -441,6 +443,26 @@ jobs:
             --source-date-epoch "$source_date_epoch"
           (cd "${export_root}/bin" && sha256sum -- * | sort -k2) \
             > dist/reproduction/binaries.sha256
+
+      # compare-binaries proves this archive identical to the one the images
+      # job packages after approval, so this no-push run of the same packaging
+      # catches an image defect before approval and before any crate publishes.
+      - name: Package every release image without pushing
+        env:
+          RELEASE_IMAGES_JSON: ${{ needs.validate.outputs.release_images }}
+        run: |
+          set -euo pipefail
+
+          source_date_epoch="$(git show -s --format=%ct "$RELEASE_COMMIT")"
+          scripts/package-release-images.sh check \
+            --archive "dist/reproduction/zinder-${RELEASE_VERSION}-${PLATFORM_NAME}.tar.gz" \
+            --binary-hashes dist/reproduction/binaries.sha256 \
+            --images-json "$RELEASE_IMAGES_JSON" \
+            --platform "$TARGET_PLATFORM" \
+            --source-date-epoch "$source_date_epoch" \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT"
 
       - name: Upload reproduction archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -602,90 +624,29 @@ jobs:
 
       # Every image target takes its binaries from the archive that
       # compare-binaries proved identical to the reproduction, so no image build
-      # compiles, and each image is checked against those binaries before its
-      # digest is recorded.
+      # compiles, and each image is checked against those binaries before it is
+      # pushed and its digest is recorded.
       - name: Build and push image digests
         env:
           OWNER_RAW: ${{ github.repository_owner }}
-          PLATFORM_ARCH: ${{ matrix.platform.arch }}
           RELEASE_IMAGES_JSON: ${{ needs.validate.outputs.release_images }}
         run: |
           set -euo pipefail
 
           source_date_epoch="$(git show -s --format=%ct "$RELEASE_COMMIT")"
           candidate_root="${RUNNER_TEMP}/release-candidate"
-          archive_root="zinder-${RELEASE_VERSION}-${PLATFORM_NAME}"
-          binary_context="${RUNNER_TEMP}/archived-binaries"
-          binary_root="${binary_context}/zinder-binaries"
-          mkdir -p "$binary_root"
-          tar -xzf "${candidate_root}/${archive_root}.tar.gz" \
-            --directory "$binary_root" \
-            --strip-components=2 \
-            "${archive_root}/bin"
-          (cd "$binary_root" && sha256sum --check --strict "${candidate_root}/binaries.sha256")
-          diff -u \
-            <(awk '{print $2}' "${candidate_root}/binaries.sha256" | sort) \
-            <(find "$binary_root" -maxdepth 1 -type f -printf '%f\n' | sort)
-
           owner_lc="$(printf '%s' "$OWNER_RAW" | tr '[:upper:]' '[:lower:]')"
-          mkdir -p /tmp/digests
-          image_names="$(jq -r '.[]' <<< "$RELEASE_IMAGES_JSON")"
-          while IFS= read -r image_name; do
-            image_ref="ghcr.io/${owner_lc}/${image_name}"
-            metadata_file="/tmp/metadata-${image_name}.json"
-            image_root="${RUNNER_TEMP}/image-root"
-            image_build_args=(
-              --file deploy/Dockerfile
-              --target "$image_name"
-              --platform "$TARGET_PLATFORM"
-              --build-context "zinder-archived-binaries=${binary_context}"
-              --build-arg "ZINDER_BINARIES_SOURCE=zinder-archived-binaries"
-              --build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}"
-            )
-            docker buildx build \
-              "${image_build_args[@]}" \
-              --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
-              --label "org.opencontainers.image.revision=${RELEASE_COMMIT}" \
-              --label "org.opencontainers.image.version=${RELEASE_TAG}" \
-              --label "org.opencontainers.image.licenses=MIT" \
-              --provenance=mode=max \
-              --sbom=true \
-              --output "type=image,name=${image_ref},push-by-digest=true,name-canonical=true,push=true" \
-              --metadata-file "$metadata_file" \
-              .
-
-            digest="$(jq -r '."containerimage.digest"' "$metadata_file")"
-            if [[ -z "$digest" || "$digest" == null ]]; then
-              echo "missing digest for ${image_name}" >&2
-              exit 1
-            fi
-
-            rm -rf "$image_root"
-            docker buildx build \
-              "${image_build_args[@]}" \
-              --provenance=false \
-              --sbom=false \
-              --output "type=local,dest=${image_root}" \
-              .
-            matched_binaries=0
-            while IFS= read -r binary_name; do
-              image_binary="${image_root}/usr/local/bin/${binary_name}"
-              [[ -f "$image_binary" ]] || continue
-              cmp -- "${binary_root}/${binary_name}" "$image_binary" || {
-                echo "${image_name} carries a ${binary_name} that differs from the binary archive" >&2
-                exit 1
-              }
-              matched_binaries=$((matched_binaries + 1))
-            done < <(find "$binary_root" -maxdepth 1 -type f -printf '%f\n' | sort)
-            (( matched_binaries > 0 )) || {
-              echo "${image_name} carries no binary from the binary archive" >&2
-              exit 1
-            }
-            rm -rf "$image_root"
-
-            mkdir -p "/tmp/digests/${image_name}"
-            touch "/tmp/digests/${image_name}/${PLATFORM_ARCH}-${digest#sha256:}"
-          done <<< "$image_names"
+          scripts/package-release-images.sh push \
+            --archive "${candidate_root}/zinder-${RELEASE_VERSION}-${PLATFORM_NAME}.tar.gz" \
+            --binary-hashes "${candidate_root}/binaries.sha256" \
+            --images-json "$RELEASE_IMAGES_JSON" \
+            --platform "$TARGET_PLATFORM" \
+            --source-date-epoch "$source_date_epoch" \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" \
+            --registry "ghcr.io/${owner_lc}" \
+            --digests /tmp/digests
 
       - name: Upload image digests
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

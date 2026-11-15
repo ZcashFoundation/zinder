@@ -3,6 +3,7 @@ set -euo pipefail
 
 repository_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 validator="$repository_root/scripts/validate-deployment-admission.sh"
+image_packager="$repository_root/scripts/package-release-images.sh"
 release_images_catalog="$repository_root/deploy/release-images.json"
 temporary_directory="$(mktemp -d "${TMPDIR:-/tmp}/zinder-deployment-admission.XXXXXX")"
 trap 'rm -rf -- "$temporary_directory"' EXIT
@@ -593,15 +594,120 @@ expect_rejected \
   "a release workflow that asks for a second environment review" \
   --release-workflow "$twice_reviewed_workflow"
 
-unverified_image_binaries_workflow="$temporary_directory/unverified-image-binaries-release.yml"
+mutate_image_packager() {
+  local mutated_packager="$1"
+  shift
+  "$@" "$image_packager" > "$mutated_packager"
+  chmod 0755 "$mutated_packager"
+}
+
+unverified_image_binaries_packager="$temporary_directory/unverified-image-binaries-packager.sh"
 # The literal shell variables are the fixture removal target.
 # shellcheck disable=SC2016
-sed '/cmp -- "\${binary_root}\/\${binary_name}" "\$image_binary"/d' \
+mutate_image_packager "$unverified_image_binaries_packager" \
+  sed '/cmp -- "\${binary_root}\/\${binary_name}" "\$image_binary"/d'
+expect_rejected_because \
+  "an image packager that does not compare image binaries with the archive" \
+  'release admission rejected: the release image packager must' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --image-packager "$unverified_image_binaries_packager"
+
+modeless_archive_packager="$temporary_directory/modeless-archive-packager.sh"
+# The literal shell variables are the fixture removal target.
+# shellcheck disable=SC2016
+mutate_image_packager "$modeless_archive_packager" \
+  sed '/require_archive_binary_mode "\$binary_root\/\$binary_name" "archive binary \$binary_name"/d'
+expect_rejected_because \
+  "an image packager that does not check the extracted archive binary modes" \
+  'release admission rejected: the release image packager must' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --image-packager "$modeless_archive_packager"
+
+modeless_image_packager="$temporary_directory/modeless-image-packager.sh"
+# The literal shell variables are the fixture removal target.
+# shellcheck disable=SC2016
+mutate_image_packager "$modeless_image_packager" \
+  sed '/require_archive_binary_mode "\$image_binary"/d'
+expect_rejected_because \
+  "an image packager that does not check the image binary modes" \
+  'release admission rejected: the release image packager must' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --image-packager "$modeless_image_packager"
+
+unchecked_installed_mode_packager="$temporary_directory/unchecked-installed-mode-packager.sh"
+# The literal shell variables are the fixture removal target.
+# shellcheck disable=SC2016
+mutate_image_packager "$unchecked_installed_mode_packager" \
+  sed '/\[\[ "\$image_binary_stat" == /d'
+expect_rejected_because \
+  "an image packager that ignores the mode installed inside the image" \
+  'release admission rejected: the release image packager must' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --image-packager "$unchecked_installed_mode_packager"
+
+pushing_check_packager="$temporary_directory/pushing-check-packager.sh"
+mutate_image_packager "$pushing_check_packager" \
+  sed 's/,push=false" ;;$/,push=true" ;;/'
+expect_rejected_because \
+  "an image packager whose check mode pushes" \
+  'release admission rejected: the release image packager must' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --image-packager "$pushing_check_packager"
+
+smokeless_reproduction_workflow="$temporary_directory/smokeless-reproduction-release.yml"
+awk '
+  /^  reproduce:/ { in_reproduction = 1 }
+  /^  compare-binaries:/ { in_reproduction = 0 }
+  in_reproduction && $0 == "      - name: Package every release image without pushing" { skipping = 1 }
+  skipping && $0 == "      - name: Upload reproduction archive" { skipping = 0 }
+  !skipping { print }
+' "$repository_root/.github/workflows/release.yml" \
+  > "$smokeless_reproduction_workflow"
+expect_rejected_because \
+  "a release workflow whose reproduction does not package the release images" \
+  'release admission rejected: the reproduce job must package every release image' \
+  --release-workflow "$smokeless_reproduction_workflow"
+
+ignored_smoke_workflow="$temporary_directory/ignored-smoke-release.yml"
+sed '/^      - name: Package every release image without pushing$/a\        continue-on-error: true' \
   "$repository_root/.github/workflows/release.yml" \
-  > "$unverified_image_binaries_workflow"
-expect_rejected \
-  "a release workflow whose images are not checked against the archived binaries" \
-  --release-workflow "$unverified_image_binaries_workflow"
+  > "$ignored_smoke_workflow"
+expect_rejected_because \
+  "a release workflow that ignores a failed image packaging smoke" \
+  'release admission rejected: the reproduce job must package every release image' \
+  --release-workflow "$ignored_smoke_workflow"
+
+logged_in_reproduction_workflow="$temporary_directory/logged-in-reproduction-release.yml"
+# The literal workflow expressions are the fixture insertion text.
+# shellcheck disable=SC2016
+awk '
+  /^  reproduce:/ { in_reproduction = 1 }
+  /^  compare-binaries:/ { in_reproduction = 0 }
+  in_reproduction && $0 == "      - name: Set up Docker Buildx" {
+    print "      - name: Log in to GHCR"
+    print "        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3"
+    print "        with:"
+    print "          registry: ghcr.io"
+    print "          username: ${{ github.actor }}"
+    print "          password: ${{ secrets.GITHUB_TOKEN }}"
+    print ""
+  }
+  { print }
+' "$repository_root/.github/workflows/release.yml" \
+  > "$logged_in_reproduction_workflow"
+expect_rejected_because \
+  "a release workflow whose image packaging smoke logs in to a registry" \
+  'release admission rejected: the reproduce job must package every release image' \
+  --release-workflow "$logged_in_reproduction_workflow"
+
+writing_reproduction_workflow="$temporary_directory/writing-reproduction-release.yml"
+sed '/^  reproduce:/,/^  compare-binaries:/ s/^      contents: read$/      contents: read\n      packages: write/' \
+  "$repository_root/.github/workflows/release.yml" \
+  > "$writing_reproduction_workflow"
+expect_rejected_because \
+  "a release workflow whose image packaging smoke may write packages" \
+  'release admission rejected: job reproduce receives a write permission' \
+  --release-workflow "$writing_reproduction_workflow"
 
 rescoped_compile_workflow="$temporary_directory/rescoped-compile-release.yml"
 sed '/^  compile:/,/^  reproduce:/ s/RELEASE_CACHE_SCOPE: release-\(.*\)-1$/RELEASE_CACHE_SCOPE: release-\1-3/' \
@@ -647,25 +753,44 @@ expect_rejected_because \
   'release admission rejected: binary-archives must need compare-binaries' \
   --release-workflow "$unproven_attestation_workflow"
 
-recompiling_image_workflow="$temporary_directory/recompiling-image-release.yml"
-sed '/--build-arg "ZINDER_BINARIES_SOURCE=zinder-archived-binaries"/d' \
-  "$repository_root/.github/workflows/release.yml" \
-  > "$recompiling_image_workflow"
-expect_rejected \
-  "a release workflow whose images compile instead of packaging the archive" \
-  --release-workflow "$recompiling_image_workflow"
+recompiling_image_packager="$temporary_directory/recompiling-image-packager.sh"
+mutate_image_packager "$recompiling_image_packager" \
+  sed '/--build-arg "ZINDER_BINARIES_SOURCE=zinder-archived-binaries"/d'
+expect_rejected_because \
+  "an image packager that compiles instead of packaging the archive" \
+  'release admission rejected: the release image packager must' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --image-packager "$recompiling_image_packager"
 
-cached_image_workflow="$temporary_directory/cached-image-release.yml"
+cached_image_packager="$temporary_directory/cached-image-packager.sh"
+# The awk field reference is the fixture insertion program.
+# shellcheck disable=SC2016
+mutate_image_packager "$cached_image_packager" \
+  awk '
+    { print }
+    $0 == "    --sbom=true \\" {
+      print "    --cache-from \"type=gha,scope=release\" \\"
+    }
+  '
+expect_rejected_because \
+  "an image packager that reads a CI cache" \
+  'release admission rejected: the release image packager must' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --image-packager "$cached_image_packager"
+
+inline_image_build_workflow="$temporary_directory/inline-image-build-release.yml"
 awk '
-  { print }
-  $0 == "              --sbom=true \\" {
-    print "              --cache-from \"type=gha,scope=release\" \\"
+  /^  images:/ { in_images = 1 }
+  /^  binary-archives:/ { in_images = 0 }
+  in_images && $0 == "          scripts/package-release-images.sh push \\" {
+    print "          docker buildx build --file deploy/Dockerfile --target zinder-ingest ."
   }
+  { print }
 ' "$repository_root/.github/workflows/release.yml" \
-  > "$cached_image_workflow"
+  > "$inline_image_build_workflow"
 expect_rejected \
-  "a release workflow whose image packaging reads a CI cache" \
-  --release-workflow "$cached_image_workflow"
+  "a release workflow whose images job builds outside the image packager" \
+  --release-workflow "$inline_image_build_workflow"
 
 early_registry_login_workflow="$temporary_directory/early-registry-login-release.yml"
 awk '

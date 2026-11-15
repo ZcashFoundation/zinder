@@ -179,13 +179,22 @@ read-only repository token, and a third job compares them:
    machine, dynamic libraries, symbol ceilings, and clean Debian runtime
    probes, and generates one SPDX 2.3 SBOM from the auditable archive.
 2. `reproduce release binaries` builds the same archive again with a separate
-   Cargo target cache.
+   Cargo target cache. It then packages the 5 runtime images and 3
+   single-volume host images from that archive with
+   `scripts/package-release-images.sh check`, without logging in to a registry
+   or pushing. Every image binary must match its archive binary byte for byte,
+   be a root-owned regular file with mode `0755`, and run `--version` and
+   `--help` as the `zinder` user inside its image.
 3. `compare independent release builds` requires identical binary and archive
    hashes for the platform and lists them in its job summary.
 
-A build that fails or does not reproduce stops the release before anything is
-published. These credential-free jobs must succeed before the protected
-`release` environment authorizes all trusted publication and attestation work.
+The comparison proves the reproduction archive identical to the compiled
+archive, so the packaging check covers the exact binaries that the release
+images ship, through the same script that packages them after approval. A
+build that fails, does not reproduce, or cannot be packaged into an image stops
+the release before anything is published. These credential-free jobs must
+succeed before the protected `release` environment authorizes all trusted
+publication and attestation work.
 
 ### Approve the release
 
@@ -199,8 +208,10 @@ Before you approve, confirm in the workflow run:
 
 - [ ] The run belongs to the tag you pushed, and its commit is the
       release-preparation commit.
-- [ ] Both `compare independent release builds` jobs passed. Each job summary
-      lists the archive hash and every binary hash that the two builds share.
+- [ ] Both `compare independent release builds` jobs passed. They start only
+      after both builds, including the image packaging check, succeed. Each
+      job summary lists the archive hash and every binary hash that the two
+      builds share.
 - [ ] The `verify public SDK packages` summary shows the Cargo Release plan
       you expect for `zinder-core`, `zinder-proto`, and `zinder-client`.
 - [ ] The live and parity jobs from the checklist above passed on that commit.
@@ -219,11 +230,12 @@ After approval, the workflow performs these operations in order:
 2. Compile a fresh registry-only consumer against the exact published
    `zinder-client` version after sparse-index propagation.
 3. Package the 5 runtime images and 3 single-volume host images natively for
-   Linux amd64 and arm64 from the binaries in the compared archive, without
-   compiling again. Each image build publishes BuildKit max-mode provenance and
-   an SBOM, and each image must carry the archived binaries byte for byte.
-   Alongside the images, attest both SLSA provenance and the SBOM for each
-   archive.
+   Linux amd64 and arm64 from the binaries in the compared archive with
+   `scripts/package-release-images.sh push`, without compiling again. Each
+   image must carry the archived binaries byte for byte, with mode `0755`,
+   before it is pushed, and each image build publishes BuildKit max-mode
+   provenance and an SBOM. Alongside the images, attest both SLSA provenance
+   and the SBOM for each archive.
 4. Publish exact `vX.Y.Z` and `sha-<commit>` manifests, attest each child SBOM
    and the root provenance, sign only the root digest, and verify the exact
    two-platform topology and producer identity.
@@ -404,11 +416,15 @@ Cargo Release's reconciliation model. Zinder invokes only the action's `check`
 and `publish` phases: the existing product tag, artifact-rich GitHub Release,
 and `latest` image promotion remain owned by the Zinder workflow.
 
-Binaries are built and compared before the approval, so a tag whose binaries
-do not build or reproduce publishes nothing. Rerun the failed jobs when the
-failure is transient, such as a lost runner. Otherwise, merge the fix and
-release it as the next version. If a job after crate publication fails, rerun
-the failed jobs: published crates are verified and skipped.
+Binaries are built, packaged into images, and compared before the approval,
+so a tag whose binaries do not build, reproduce, or package publishes nothing.
+Rerun the failed jobs when the failure is transient, such as a lost runner.
+Otherwise, merge the fix and release it as the next version. To reproduce a
+packaging failure locally, build the archive with
+`scripts/build-release-binary-archive.sh`, then run
+`scripts/package-release-images.sh check` against it; the script prints its
+usage when an argument is missing. If a job after crate publication fails,
+rerun the failed jobs: published crates are verified and skipped.
 
 The workflow creates the public GitHub Release only after all exact image tags
 and trust evidence exist. A failure before publication may leave untagged
