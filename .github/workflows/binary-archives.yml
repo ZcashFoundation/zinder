@@ -5,6 +5,7 @@ on:
     paths:
       - ".github/workflows/binary-archives.yml"
       - ".github/workflows/release.yml"
+      - ".dockerignore"
       - "Cargo.lock"
       - "Cargo.toml"
       - "LICENSE"
@@ -20,6 +21,7 @@ on:
       - "scripts/test-release-binary-archive.sh"
       - "scripts/test-release-sbom.sh"
       - "services/**"
+      - "tools/**"
   workflow_dispatch:
 
 permissions:
@@ -33,6 +35,7 @@ jobs:
   archive:
     name: binary archive (${{ matrix.platform.name }})
     runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:

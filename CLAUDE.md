@@ -31,6 +31,8 @@ cargo deny check
 cargo machete
 scripts/test-changelog.sh
 scripts/validate-changelog.sh fragments
+scripts/runbook-lint.sh docs/runbooks/testing.md
+scripts/test-install-ci-tool.sh
 git diff --check
 ```
 
@@ -53,6 +55,19 @@ cargo mutants --workspace --all-features \
 ```
 
 Single-test execution under nextest: `cargo nextest run -p <crate> -E 'test(<test_name>)'`. Tier filter: `-E 'test(/^integration::cli::/)'`. Integration tests live in each crate's `tests/{integration,live,perf}/` submodules; the per-crate binary is `tests/acceptance.rs`.
+
+## CI Behavior
+
+The pull request workflows cancel a superseded run when the pull request gets a
+new push, give every job a timeout, and write Rust caches only from `main`.
+Tools such as `cargo-nextest`, `cargo-deny`, `cargo-machete`, `cargo-llvm-cov`,
+and `cargo-mutants` are never compiled from source in CI. `scripts/install-ci-tool.sh <name>`
+installs the prebuilt release asset pinned in `.github/ci-tools.lock` after
+verifying its sha256; change a tool's version, URL, and checksum together
+there. Keep the workflow-level `env` block identical across jobs that share a
+`Swatinem/rust-cache` key, because the action hashes `CARGO_*` and `RUST*`
+variables into it. The [Testing Runbook](docs/runbooks/testing.md#continuous-integration)
+describes the full policy.
 
 ## Pull Request Release Notes
 

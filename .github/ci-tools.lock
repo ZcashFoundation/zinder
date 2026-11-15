@@ -1,0 +1,16 @@
+# Prebuilt CI tools installed by scripts/install-ci-tool.sh.
+#
+# One tool per line: name, version, url, sha256 of the downloaded archive.
+# Every URL is the upstream project's own GitHub release asset for an x86_64
+# Linux runner. The sha256 is checked before anything is extracted, so bumping
+# a version means updating the URL and the checksum together.
+#
+# cargo-deny and cargo-machete publish only statically linked musl builds for
+# x86_64 Linux. No job that installs a tool runs on arm64.
+#
+# name            version  url                                                                                                                                       sha256
+cargo-nextest     0.9.116  https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.116/cargo-nextest-0.9.116-x86_64-unknown-linux-gnu.tar.gz        091d5a09af17fba9df5d3aebc5964d731c3a044525c963a98c31d6d4506a7ee3
+cargo-deny        0.19.4   https://github.com/EmbarkStudios/cargo-deny/releases/download/0.19.4/cargo-deny-0.19.4-x86_64-unknown-linux-musl.tar.gz                   3bd58b784e83715b86ddbc9deac591890372ec77fda5741bb0826970b958506f
+cargo-machete     0.9.2    https://github.com/bnjbvr/cargo-machete/releases/download/v0.9.2/cargo-machete-v0.9.2-x86_64-unknown-linux-musl.tar.gz                    48200087f54c55aabcd4db4af1e25742b49846c02a1b1bfa134711945b35b2e9
+cargo-llvm-cov    0.8.5    https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.8.5/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz                        7e62d664f5133d43d33a3b11138c93feff98bd71e953ddc260ea8ddf360a37c6
+cargo-mutants     27.0.0   https://github.com/sourcefrog/cargo-mutants/releases/download/v27.0.0/cargo-mutants-x86_64-unknown-linux-gnu.tar.gz                      5083ce59bf9195ce9bb218278b609bbd183be897ca53671bad4df588fc7a9d7d
