@@ -66,7 +66,7 @@ stores. It carries:
 
 | Knob | Canonical writer | Materialized-view writer | Canonical reader | Materialized-view reader | Effect |
 | --- | --- | --- | --- | --- | --- |
-| `block_cache_bytes` | 512 MiB | 256 MiB | 128 MiB | 64 MiB | Bounded LRU cache shared by data, index, and bloom blocks. |
+| `block_cache_bytes` | 512 MiB | 256 MiB | 128 MiB | 64 MiB | Bounded LRU cache shared by data and index blocks, and by filter blocks in families that configure a filter. |
 | `max_wal_bytes` | 256 MiB | 256 MiB | 32 MiB | 16 MiB | Live WAL ceiling. Writer stores flush once the WAL crosses this limit. |
 | `max_open_files` | 512 | 512 | 128 | 64 | Open SST handle cap so RocksDB does not pin metadata for every file. |
 | `write_buffer_bytes` | 16 MiB | 16 MiB | 8 MiB | 4 MiB | Per-column-family mutable memtable size. |
@@ -121,11 +121,30 @@ These options are storage-layer contracts and are not operator-configurable:
 - Point-in-time recovery stays enabled through RocksDB's default recovery mode.
 - Atomic cross-CF flush stays enabled on primary stores.
 - Ordered writes stay enabled.
-- Index and bloom filter blocks are charged to the bounded block cache through
+- Index blocks, and filter blocks where a family configures a filter, are
+  charged to the bounded block cache through
   `cache_index_and_filter_blocks = true` and
   `pin_l0_filter_and_index_blocks_in_cache = true`.
+- The shared `build_block_based_table_factory` sets no filter policy, so the
+  canonical and materialized-view stores have no filter blocks. The wallet
+  store adds partitioned whole-key hybrid-Ribbon filters, about 10 bits per
+  key with a two-level index, to its four hash-keyed families:
+  `transparent_unspent_output`, `transparent_spent_output`,
+  `transparent_unspent_output_by_address`, and
+  `transparent_address_transaction`. Their filter and index partitions are
+  charged to the same bounded cache.
 - The write-buffer manager handle is retained for the lifetime of the DB
   handle, alongside the block cache.
+
+Filter blocks stay inside the memory bound, but a filter working set larger
+than the block cache turns rejected point reads back into disk reads. When
+sizing the wallet `block_cache_bytes`, add the `filter block size` that
+`rocksdb.aggregated-table-properties` reports for each filtered family to the
+hot index and data blocks. The planner's keys are uniformly distributed
+hashes, so a following wallet reads every filter partition over time. Plan for
+the whole sum: about 0.9 bytes per row in those families, and 1.25 bytes for
+rows still in L0. A rising `rocksdb.block.cache.filter.miss` count in the
+wallet store's RocksDB statistics shows that the partitions no longer fit.
 
 ### Memory Pressure
 
@@ -182,3 +201,11 @@ RocksDB-owned memory is bounded by `RocksDbResourceBudget`, store
 reads prefer direct I/O with buffered fallback, total memtable memory is bounded
 by `WriteBufferManager`, and memory pressure is based on non-reclaimable
 anonymous memory.
+
+## Revision history
+
+- 2026-11-15: The shared table factory sets no filter policy, so the canonical
+  and materialized-view stores have no filter blocks. The wallet store's four
+  hash-keyed families carry partitioned hybrid-Ribbon whole-key filters charged
+  to the bounded cache, and wallet cache sizing counts their filter working
+  set.

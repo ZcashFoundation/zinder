@@ -436,9 +436,10 @@ pub fn record_rocksdb_resource_gauges(inputs: &RocksDbResourceGaugeInputs<'_>) {
 
 /// DB-wide `RocksDB` statistics tickers exported as monotonic gauges.
 ///
-/// Every ticker is aggregated across all column families of one store; the
-/// bloom entries reflect the transparent point-lookup families, which share
-/// the filter policy used by batched outpoint reads.
+/// Every ticker is aggregated across all column families of one store. The
+/// canonical and materialized-view stores that export these series configure
+/// no filter, so their `BloomFilter*` entries read zero. The wallet store,
+/// whose hash-keyed families carry filters, does not export its tickers here.
 const EXPORTED_TICKERS: &[Ticker] = &[
     Ticker::BloomFilterUseful,
     Ticker::BloomFilterFullPositive,
@@ -597,11 +598,12 @@ fn build_secondary_db_options(
 
 /// Allocates the bounded LRU block cache shared by every column family.
 ///
-/// The cache holds data, index, and bloom-filter blocks together so total
-/// resident metadata stays bounded by `capacity_bytes`. Cloning the
-/// returned handle shares the underlying allocation (`RocksDB`'s `Cache`
-/// is reference counted), so callers needing the same cache across
-/// multiple open paths pass `&` references rather than reconstructing.
+/// The cache holds data and index blocks, plus filter blocks for any family
+/// that configures a filter, so total resident metadata stays bounded by
+/// `capacity_bytes`. Cloning the returned handle shares the underlying
+/// allocation (`RocksDB`'s `Cache` is reference counted), so callers needing
+/// the same cache across multiple open paths pass `&` references rather than
+/// reconstructing.
 #[must_use]
 fn build_block_cache(capacity_bytes: u64) -> Cache {
     let capacity = usize::try_from(capacity_bytes).unwrap_or(usize::MAX);
@@ -617,7 +619,10 @@ fn build_write_buffer_manager(memtable_budget_bytes: u64) -> WriteBufferManager 
 ///
 /// Index and filter blocks are accounted to `cache` so the at-rest
 /// metadata budget stays bounded by [`RocksDbResourceBudget::block_cache_bytes`].
-/// Public because the materialized-view store re-uses the same factory; see
+/// The factory sets no filter policy; a store that filters a family adds one
+/// to the returned options, as the wallet store does for its hash-keyed
+/// families. Public because the materialized-view and wallet stores re-use the
+/// same factory; see
 /// [ADR-0020](../../../docs/adrs/0020-bounded-rocksdb-resource-budget.md).
 #[must_use]
 pub fn build_block_based_table_factory(cache: &Cache) -> BlockBasedOptions {
