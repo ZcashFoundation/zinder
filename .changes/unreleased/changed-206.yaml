@@ -1,6 +1,0 @@
-kind: changed
-body: "Releases now prove their binaries before publishing anything. Both builds of each platform start as soon as the tag is validated, and every release image is packaged from those binaries before the release is approved. Public SDK crates, container images, and the GitHub Release are published only after both builds match. A build, reproduction, or packaging failure no longer leaves a published crate version without matching binaries."
-time: 2026-11-15T16:00:00Z
-custom:
-  Bump: patch
-  PR: "206"

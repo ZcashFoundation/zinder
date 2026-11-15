@@ -1,6 +1,0 @@
-kind: changed
-body: "Explorer views now keep per-height undo rows only for the reorg window, and ingest deletes older undo rows from an existing view store when it opens it, without a rebuild. New transparent-address delta and activity rows store each transaction id as 32 bytes instead of 64 hex characters, while rows already written keep reading. On a transparent-heavy fixture the two changes cut view storage by 41%. Rolling back to an earlier release requires rebuilding the Explorer views, because earlier releases read the rows this release writes with an empty transaction id."
-time: 2026-11-15T16:30:00Z
-custom:
-  Bump: minor
-  PR: "208"

@@ -1,6 +1,0 @@
-kind: fixed
-body: "A transparent-address ranking build that trails Explorer views still rebuilding from canonical history now catches up and joins them, instead of falling further behind until replay reaches the tip, so address detail and activity return far sooner on read-limited storage. View replay waits for such a build while `zinder_materialized_view_replay_waiting_for_ranking_build` is `1`, and stops waiting if the build applies no history for 5 minutes. Spend resolution also issues fewer device reads, the prevout resolution metrics gain a `cache` label that names the walker, and `zinder-ingest` exports its canonical reader's RocksDB gauges under the `canonical_secondary` store role."
-time: 2026-11-15T16:36:15Z
-custom:
-  Bump: minor
-  PR: "209"
