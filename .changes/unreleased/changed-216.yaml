@@ -1,6 +1,0 @@
-kind: changed
-body: 'Within one wallet transition, `zinder-projector` now reads each wallet row from RocksDB once instead of several times: at most four point reads for each spent or created transparent output, down from about seven and eight, while the transition stays within `projector.follow.max_transition_logical_bytes`.'
-time: 2026-11-15T22:10:30.071717908Z
-custom:
-    Bump: patch
-    PR: "216"

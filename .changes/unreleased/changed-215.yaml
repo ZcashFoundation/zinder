@@ -1,6 +1,0 @@
-kind: changed
-body: The four hash-keyed wallet column families now carry lookup filters, so `zinder-projector` answers its checks that an output is not already recorded without reading a data block. Existing wallet stores keep working and gain filters as RocksDB rewrites their files; rebuild the wallet projection side by side to get the full effect at once. Filter blocks share the wallet block cache at about 0.9 bytes per row, so size `block_cache_bytes` for them as ADR-0020 describes. Rolling back to an earlier release is safe.
-time: 2026-11-15T22:10:30.048037128Z
-custom:
-    Bump: patch
-    PR: "215"
