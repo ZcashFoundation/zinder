@@ -574,31 +574,46 @@ a held retired pair leaves no slot free, the publisher releases a retained
 pair that no request holds, so publication continues while up to two retired
 pairs are pinned.
 
-The publisher opens each generation slot cold once: it opens both secondaries
-and runs their full admission, which takes about 25 seconds on a Testnet
-store. Once a slot's pair drains, the publisher catches the same open
-secondaries up in place for a later block, which takes milliseconds. A slot is
-opened cold again only after its catch-up fails.
+The publisher opens a generation slot cold the first time it uses it: it opens
+both secondaries and runs their full admission, which takes about 25 seconds
+on a Testnet store. Once a slot's pair drains, the publisher catches the same
+open secondaries up in place for a later block, which takes milliseconds. It
+uses a slot it has not opened yet only when no opened slot has drained. Startup
+opens the first slot, and the first block after it opens the second. The third
+opens on the first block that arrives within one minute of the previous
+publication, because the pair that publication replaced is still retained. The
+fourth opens the first time three publications fall within one minute, or when
+a request still holds a released pair. With 75-second blocks, these opens can
+come long after startup. A slot whose catch-up or publication fails is closed
+and opened cold again when it is next used.
+
 `zinder_wallet_serving_pair_publisher_candidate_prepared_total{kind}` counts
 candidates by `kind`: `cold` for a slot opened from the primaries, and
 `recycled` for a drained generation caught up in place.
 `zinder_wallet_serving_pair_publisher_cold_open_duration_seconds{status}`
 records each cold open, and each successful one logs
 `wallet_serving_pair_publisher_generation_opened` with its `generation` and
-`elapsed_ms`. After startup the `cold` count stays at four or fewer, and
-`recycled` rises by one for each published block. A `cold` count that keeps
-rising means refreshes keep failing and closing their generations. The
-`wallet_serving_pair_publisher_refresh_failed` warning before each extra cold
-open names the error.
+`elapsed_ms`. Without refresh failures, the `cold` count stays at four or
+fewer, one for each slot, and every later candidate is `recycled`. A
+`generation_opened` event that repeats a `generation` already opened since
+startup means a failed refresh closed that slot, and the
+`wallet_serving_pair_publisher_refresh_failed` warning before it names the
+error. A `cold` count that keeps rising means refreshes keep failing and
+closing their generations.
 
-A new block reaches wallet serving within about one publisher refresh of its
-canonical commit, and every block is published. The publisher refreshes every
-`storage.secondary_catchup_interval_ms` (1,000 ms by default), and the
-projector applies a block within one 250 ms follow poll. The time from
-`canonical_live_append_committed` to `wallet_serving_pair_publisher_published`
-for the same height is therefore at most about 1.25 seconds plus catch-up.
-After a restart, the first blocks wait for a cold open instead, one for each
-slot not yet opened.
+Each refresh publishes the writer's fence at the moment its candidate
+converges, not one pair for each height. Blocks that commit closer together
+than one refresh share one publication at the later height, and the earlier
+heights get no publication of their own. This happens while ingest catches up
+after a stall, when a reorg replaces several blocks, and on Regtest. The
+publisher refreshes every `storage.secondary_catchup_interval_ms` (1,000 ms by
+default), and the projector applies a block within one 250 ms follow poll. A
+block therefore reaches wallet serving within about 1.25 seconds plus catch-up
+of its canonical commit. To measure that delay, match each
+`canonical_live_append_committed` with the first later
+`wallet_serving_pair_publisher_published` whose `event_sequence` is at least
+the commit's `chain_event_sequence`. A block that needs a slot not yet opened
+waits for that cold open instead.
 
 A request may keep reading a retired pair for at most 30 seconds after the
 publisher retired it. Past that read limit the publisher revokes reads on the

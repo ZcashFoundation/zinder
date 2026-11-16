@@ -4382,9 +4382,11 @@ mod tests {
         Ok(())
     }
 
-    /// Every block is published. Once each generation slot has been opened,
-    /// the next block's candidate is a drained generation caught up in place,
-    /// and the publisher opens no further secondaries.
+    /// A block followed by its own refresh is published by its own pair.
+    ///
+    /// Once each generation slot has been opened, the next block's candidate
+    /// is a drained generation caught up in place, and the publisher opens no
+    /// further secondaries.
     #[tokio::test(flavor = "multi_thread")]
     async fn steady_state_publication_recycles_drained_generations()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -4424,6 +4426,109 @@ mod tests {
             assert_eq!(
                 publisher.candidate_preparations, expected,
                 "candidate preparations after block {block}"
+            );
+        }
+
+        drop(slot);
+        drop(publisher);
+        primaries.shutdown().await
+    }
+
+    /// A refresh publishes the writer's latest fence, so blocks committed
+    /// before one refresh share one publication and the earlier height gets
+    /// no pair of its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocks_committed_within_one_refresh_share_one_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut primaries = AdvancingPrimaries::start().await?;
+        let (mut publisher, slot) = primaries
+            .bootstrap_publisher(zinder_runtime::Readiness::default())
+            .await?;
+        let bootstrap_pair = slot.capture();
+        let earlier = primaries.append_block()?;
+        let latest = primaries.append_block()?;
+        assert_ne!(earlier.chain_epoch_id(), latest.chain_epoch_id());
+
+        publisher.refresh_once().await?;
+        assert_eq!(slot.capture().canonical_fence(), latest);
+        assert_eq!(
+            slot.retained_pair_count(),
+            1,
+            "only the bootstrap pair was replaced"
+        );
+        assert!(Arc::ptr_eq(
+            &slot.capture_at(Some(bootstrap_pair.canonical_fence().chain_epoch_id())),
+            &bootstrap_pair
+        ));
+        assert_eq!(
+            slot.capture_at(Some(earlier.chain_epoch_id()))
+                .canonical_fence(),
+            latest,
+            "no pair serves the earlier block's epoch"
+        );
+        assert_eq!(
+            publisher.candidate_preparations,
+            CandidatePreparationCounts {
+                cold: 2,
+                recycled: 0
+            }
+        );
+
+        drop(bootstrap_pair);
+        drop(slot);
+        drop(publisher);
+        primaries.shutdown().await
+    }
+
+    /// The publisher opens a slot it has not used only when every opened slot
+    /// still holds a retained pair, so the block spacing, not the start,
+    /// decides when the last slots open.
+    ///
+    /// Blocks more than one retention window apart alternate between two
+    /// slots. The first block within a window of the previous publication
+    /// opens the third, and a third publication within one window opens the
+    /// fourth.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_block_burst_opens_the_remaining_slots_after_spaced_blocks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut primaries = AdvancingPrimaries::start().await?;
+        let (mut publisher, slot) = primaries
+            .bootstrap_publisher(zinder_runtime::Readiness::default())
+            .await?;
+        let counts = |cold, recycled| CandidatePreparationCounts { cold, recycled };
+
+        let spaced_blocks = 2 * SECONDARY_GENERATION_COUNT;
+        for block in 1..=spaced_blocks {
+            publisher.release_expired_pairs(tokio::time::Instant::now() + RETAINED_PAIR_WINDOW);
+            let fence = primaries.append_block()?;
+            publisher.refresh_once().await?;
+            assert_eq!(slot.capture().canonical_fence(), fence);
+            assert_eq!(
+                publisher.candidate_preparations,
+                counts(2, block - 1),
+                "spaced block {block} reuses one of the first two slots"
+            );
+        }
+        let spaced_recycled = spaced_blocks - 1;
+
+        for (block, opened) in [(1, 3), (2, SECONDARY_GENERATION_COUNT)] {
+            let fence = primaries.append_block()?;
+            publisher.refresh_once().await?;
+            assert_eq!(slot.capture().canonical_fence(), fence);
+            assert_eq!(
+                publisher.candidate_preparations,
+                counts(opened, spaced_recycled),
+                "burst block {block} opens slot {opened}"
+            );
+        }
+        for block in 1..=SECONDARY_GENERATION_COUNT {
+            let fence = primaries.append_block()?;
+            publisher.refresh_once().await?;
+            assert_eq!(slot.capture().canonical_fence(), fence);
+            assert_eq!(
+                publisher.candidate_preparations,
+                counts(SECONDARY_GENERATION_COUNT, spaced_recycled + block),
+                "later burst block {block} reuses a drained slot"
             );
         }
 
