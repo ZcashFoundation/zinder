@@ -17,6 +17,7 @@
 //! [`encode_utxo_set_commitment_element`].
 
 use blake2b_simd::Params;
+use blake2b_simd::many::{HashManyJob, hash_many};
 
 use crate::wire::{
     UTXO_SET_COMMITMENT_PERSONAL, UtxoSetCommitmentElement, encode_utxo_set_commitment_element,
@@ -33,6 +34,10 @@ pub const UTXO_SET_COMMITMENT_DIGEST_LEN: usize = 32;
 
 /// Length in bytes of a full `BLAKE2b` output block.
 const BLAKE2B_OUTPUT_LEN: usize = 64;
+
+/// Number of BLAKE2X expansion blocks hashed in one batch, enough for a full
+/// commitment expansion.
+const EXPANSION_BATCH_BLOCKS: usize = UTXO_SET_COMMITMENT_LEN / BLAKE2B_OUTPUT_LEN;
 
 /// Snapshot scheme identifying how a [`TransparentUtxoSetCommitment`] was built.
 ///
@@ -161,21 +166,18 @@ impl TransparentUtxoSetCommitment {
     fn combine_lanes(
         &mut self,
         element: &UtxoSetCommitmentElement<'_>,
-        combine: fn(u16, u16) -> u16,
+        combine: impl Fn(u16, u16) -> u16,
     ) {
         let preimage = encode_utxo_set_commitment_element(element);
         let expansion = blake2x_expand(&preimage);
-        for lane_index in 0..COMMITMENT_LANE_COUNT {
-            let byte_index = lane_index * 2;
-            let accumulator_lane = u16::from_le_bytes([
-                self.accumulator[byte_index],
-                self.accumulator[byte_index + 1],
-            ]);
-            let element_lane =
-                u16::from_le_bytes([expansion[byte_index], expansion[byte_index + 1]]);
-            let combined = combine(accumulator_lane, element_lane).to_le_bytes();
-            self.accumulator[byte_index] = combined[0];
-            self.accumulator[byte_index + 1] = combined[1];
+        let (accumulator_lanes, _) = self.accumulator.as_chunks_mut::<2>();
+        let (element_lanes, _) = expansion.as_chunks::<2>();
+        for (accumulator_lane, element_lane) in accumulator_lanes.iter_mut().zip(element_lanes) {
+            *accumulator_lane = combine(
+                u16::from_le_bytes(*accumulator_lane),
+                u16::from_le_bytes(*element_lane),
+            )
+            .to_le_bytes();
         }
     }
 }
@@ -201,14 +203,31 @@ fn blake2x_expand_into(message: &[u8], personal: &[u8; 16], output: &mut [u8]) {
     let xof_length = u32::try_from(output.len()).unwrap_or(u32::MAX);
     let root = blake2x_root_hash(message, personal, xof_length);
 
-    let mut produced = 0usize;
-    let mut block_index = 0u32;
-    while produced < output.len() {
-        let block_length = (output.len() - produced).min(BLAKE2B_OUTPUT_LEN);
-        let block = blake2x_expansion_block(&root, personal, block_index, block_length, xof_length);
-        output[produced..produced + block_length].copy_from_slice(block.as_bytes());
-        produced += block_length;
-        block_index = block_index.wrapping_add(1);
+    // Each expansion block hashes the same root under its own node offset, so
+    // the blocks are independent and hash together in SIMD batches.
+    let batch_output_len = EXPANSION_BATCH_BLOCKS * BLAKE2B_OUTPUT_LEN;
+    for (batch_index, batch) in output.chunks_mut(batch_output_len).enumerate() {
+        let batch_len = batch.len();
+        let mut blocks: [Option<HashManyJob<'_>>; EXPANSION_BATCH_BLOCKS] =
+            core::array::from_fn(|slot| {
+                let block_start = slot * BLAKE2B_OUTPUT_LEN;
+                (block_start < batch_len).then(|| {
+                    let block_index = u32::try_from(batch_index * EXPANSION_BATCH_BLOCKS + slot)
+                        .unwrap_or(u32::MAX);
+                    let block_length = (batch_len - block_start).min(BLAKE2B_OUTPUT_LEN);
+                    HashManyJob::new(
+                        &blake2x_expansion_params(personal, block_index, block_length, xof_length),
+                        root.as_bytes(),
+                    )
+                })
+            });
+        hash_many(blocks.iter_mut().flatten());
+        for (output_block, block) in batch
+            .chunks_mut(BLAKE2B_OUTPUT_LEN)
+            .zip(blocks.iter().flatten())
+        {
+            output_block.copy_from_slice(block.to_hash().as_bytes());
+        }
     }
 }
 
@@ -225,31 +244,34 @@ fn blake2x_root_hash(message: &[u8], personal: &[u8; 16], xof_length: u32) -> bl
         .hash(message)
 }
 
-/// Computes one BLAKE2X expansion block `B_i` over the root hash.
+/// Returns the parameters of one BLAKE2X expansion block `B_i` over the root
+/// hash.
 ///
 /// The parameter block sets `digest_length` to this block's length,
 /// `leaf_length` to 64, `node_offset` to the block index with the XOF length in
 /// the high 32 bits, `inner_length` to 64, and `fanout`/`depth` to 0.
-fn blake2x_expansion_block(
-    root: &blake2b_simd::Hash,
+fn blake2x_expansion_params(
     personal: &[u8; 16],
     block_index: u32,
     block_length: usize,
     xof_length: u32,
-) -> blake2b_simd::Hash {
-    Params::new()
+) -> Params {
+    let mut params = Params::new();
+    params
         .hash_length(block_length)
         .fanout(0)
         .max_depth(0)
         .max_leaf_length(u32::try_from(BLAKE2B_OUTPUT_LEN).unwrap_or(u32::MAX))
         .node_offset(u64::from(block_index) | (u64::from(xof_length) << 32))
         .inner_hash_length(BLAKE2B_OUTPUT_LEN)
-        .personal(personal)
-        .hash(root.as_bytes())
+        .personal(personal);
+    params
 }
 
 #[cfg(test)]
 mod tests {
+    use sha2::{Digest, Sha256};
+
     use super::*;
     use crate::{BlockHeight, TransactionId, TransparentOutPoint};
 
@@ -453,6 +475,96 @@ mod tests {
             hex::decode("3d0af8cb33b27778f2c14fc34b4bbecf4e968018a7424e60dc0d6b64d384f9e6")
                 .unwrap_or_default();
         assert_eq!(commitment.display_digest().to_vec(), expected);
+    }
+
+    /// Serial BLAKE2X expansion that every faster path must reproduce byte
+    /// for byte: one `Params::hash` call per 64-byte block, in block order.
+    fn serial_reference_expand_into(message: &[u8], personal: &[u8; 16], output: &mut [u8]) {
+        let xof_length = u32::try_from(output.len()).unwrap_or(u32::MAX);
+        let root = Params::new()
+            .hash_length(BLAKE2B_OUTPUT_LEN)
+            .node_offset(u64::from(xof_length) << 32)
+            .personal(personal)
+            .hash(message);
+
+        let mut produced = 0usize;
+        let mut block_index = 0u32;
+        while produced < output.len() {
+            let block_length = (output.len() - produced).min(BLAKE2B_OUTPUT_LEN);
+            let block = Params::new()
+                .hash_length(block_length)
+                .fanout(0)
+                .max_depth(0)
+                .max_leaf_length(u32::try_from(BLAKE2B_OUTPUT_LEN).unwrap_or(u32::MAX))
+                .node_offset(u64::from(block_index) | (u64::from(xof_length) << 32))
+                .inner_hash_length(BLAKE2B_OUTPUT_LEN)
+                .personal(personal)
+                .hash(root.as_bytes());
+            output[produced..produced + block_length].copy_from_slice(block.as_bytes());
+            produced += block_length;
+            block_index = block_index.wrapping_add(1);
+        }
+    }
+
+    #[test]
+    fn blake2xb_matches_official_kat_at_100_bytes() {
+        // The only official vector here whose final block is partial.
+        let mut out = [0u8; 100];
+        blake2x_expand_into(&kat_input(), &NO_PERSONALIZATION, &mut out);
+        let expected = hex::decode(concat!(
+            "726ead16f67729ba596654a551eb126e99457962286fc54bb6baf50d93c28340",
+            "9694db0142264b697e6d9be81bd7f63e4965c784ef0af12529294ef7795e9d64",
+            "c371b15c1a5701c48dae9e2a3d908602c4a82bbeddb9a20eca30b591140f76fb",
+            "c11a3df2",
+        ))
+        .unwrap_or_default();
+        assert_eq!(out.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn commitment_expansion_keeps_its_pinned_bytes() {
+        let expansion = blake2x_expand(&kat_input());
+        assert_eq!(
+            hex::encode(Sha256::digest(expansion)),
+            "47c77b84583269e36c758c8853b7403f0ba9f6947b9bd894280d10e6acf717ba"
+        );
+    }
+
+    #[test]
+    fn expansion_matches_the_serial_reference_in_every_block() {
+        let messages = [Vec::new(), vec![1, 2, 3], kat_input()];
+        let personalizations = [
+            NO_PERSONALIZATION,
+            UTXO_SET_COMMITMENT_PERSONAL,
+            *b"ZinderWalletProj",
+        ];
+        // One block, a partial final block, the official 256-byte vector, the
+        // production length, and a length past it with a partial final block.
+        let output_lengths = [64, 100, 256, UTXO_SET_COMMITMENT_LEN, 2148];
+        for message in &messages {
+            for personal in &personalizations {
+                for output_length in output_lengths {
+                    let mut expanded = vec![0u8; output_length];
+                    blake2x_expand_into(message, personal, &mut expanded);
+                    let mut reference = vec![0u8; output_length];
+                    serial_reference_expand_into(message, personal, &mut reference);
+                    for (block_index, (block, reference_block)) in expanded
+                        .chunks(BLAKE2B_OUTPUT_LEN)
+                        .zip(reference.chunks(BLAKE2B_OUTPUT_LEN))
+                        .enumerate()
+                    {
+                        assert_eq!(
+                            block,
+                            reference_block,
+                            "block {block_index} of {output_length} bytes over a {}-byte \
+                             message, personalization {}",
+                            message.len(),
+                            hex::encode(personal)
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
