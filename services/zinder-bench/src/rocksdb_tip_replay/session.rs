@@ -439,6 +439,12 @@ impl ReplayStores {
         self.apply_wallet_transition(fence).map(|_| ())
     }
 
+    /// The wallet store's statistics tickers, when the run collects them.
+    pub(super) fn wallet_tickers(&self) -> Option<TickerSnapshot> {
+        self.collect_wallet_tickers
+            .then(|| TickerSnapshot::read(&self.wallet))
+    }
+
     /// The size of the last transition the wallet published.
     pub(super) fn wallet_footprint(&self) -> Option<WalletTransitionFootprint> {
         self.wallet.last_transition_footprint()

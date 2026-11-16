@@ -39,10 +39,11 @@ use super::{
     measurement::BlockWorkload,
     report::{
         BudgetRecord, FenceRecord, FixtureInput, IoModes, KeptScratch, ProcessResources,
-        Provenance, StoreInput, WalletRecord,
+        Provenance, RequestedIoModes, StoreInput, WalletRecord, WalletStatisticsConfiguration,
     },
     scratch::{self, RepeatScratch, ScratchRoot},
     session::{FollowStepRecorder, ForkFollowSamples, ReplayStores, StorePaths},
+    statistics::TickerDeltas,
     store_settings, validate_max_transition_logical_bytes,
 };
 
@@ -301,6 +302,8 @@ impl TipReorgPlan {
                 self.settings.canonical_secondary_budget,
             ),
             wallet_budget: BudgetRecord::from(self.settings.wallet_budget),
+            requested_io_modes: self.args.stores.requested_io_modes(),
+            wallet_statistics: self.args.stores.wallet_statistics(),
             event_retention_pruning: "disabled".to_owned(),
         }
     }
@@ -472,12 +475,16 @@ fn apply_wallet_reorg(
 ) -> Result<(WalletTransitionReport, Option<IoModes>), BenchError> {
     let reorg = stores.next_retained_reorg(plan.reverted)?;
     let evidence_before = stores.wallet_evidence().clone();
+    let tickers_before = stores.wallet_tickers();
     let memory = MemoryProbe::start();
     let transition_started = Instant::now();
     let outcome =
         stores.apply_retained_reorg(&reorg, plan.settings.max_transition_logical_bytes)?;
     let elapsed = transition_started.elapsed();
     let memory = memory.finish();
+    let wallet_ticker_deltas = tickers_before
+        .zip(stores.wallet_tickers())
+        .map(|(before, after)| after.delta_since(&before));
     tracing::info!(
         target: "zinder::bench",
         event = "tip_reorg_wallet_transition",
@@ -485,14 +492,14 @@ fn apply_wallet_reorg(
         elapsed_seconds = elapsed.as_secs_f64(),
         "wallet reorg transition finished"
     );
-    match outcome {
+    let (report, io_modes) = match outcome {
         Ok(()) => {
             let footprint = stores.wallet_footprint().ok_or_else(|| {
                 BenchError::tip_replay("the admitted reorg recorded no footprint")
             })?;
             stores.apply_appended_block()?;
             let finished = stores.finish()?;
-            Ok((
+            (
                 WalletTransitionReport::admitted(
                     plan.settings.max_transition_logical_bytes.get(),
                     elapsed,
@@ -501,7 +508,7 @@ fn apply_wallet_reorg(
                     WalletRecord::from(&finished.wallet),
                 ),
                 Some(IoModes::from(&finished.io_modes)),
-            ))
+            )
         }
         Err(RocksDbWalletError::TransitionLogicalByteLimit {
             limit_bytes,
@@ -509,7 +516,7 @@ fn apply_wallet_reorg(
         }) => {
             let wallet_unchanged = stores.wallet_evidence() == &evidence_before;
             drop(stores);
-            Ok((
+            (
                 WalletTransitionReport::refused(
                     limit_bytes,
                     required_bytes,
@@ -518,10 +525,17 @@ fn apply_wallet_reorg(
                     wallet_unchanged,
                 ),
                 None,
-            ))
+            )
         }
-        Err(error) => Err(error.into()),
-    }
+        Err(error) => return Err(error.into()),
+    };
+    Ok((
+        WalletTransitionReport {
+            wallet_ticker_deltas,
+            ..report
+        },
+        io_modes,
+    ))
 }
 
 /// Replays every fixture block through the reorg tip, as a tip replay does.
@@ -684,6 +698,8 @@ struct ReorgConfiguration {
     canonical_writer_budget: BudgetRecord,
     canonical_secondary_budget: BudgetRecord,
     wallet_budget: BudgetRecord,
+    requested_io_modes: RequestedIoModes,
+    wallet_statistics: WalletStatisticsConfiguration,
     event_retention_pruning: String,
 }
 
@@ -731,6 +747,8 @@ struct WalletTransitionReport {
     /// The call from the replay-row scan through the synchronous write or the refusal.
     elapsed_seconds: f64,
     memory: MemoryObservation,
+    /// What each wallet statistics ticker counted across the call, when collected.
+    wallet_ticker_deltas: Option<TickerDeltas>,
     /// READY evidence after the reorg and the one-block append that follows it.
     final_wallet: Option<WalletRecord>,
 }
@@ -789,6 +807,7 @@ impl WalletTransitionReport {
             }),
             elapsed_seconds: elapsed.as_secs_f64(),
             memory,
+            wallet_ticker_deltas: None,
             final_wallet: Some(final_wallet),
         }
     }
@@ -808,6 +827,7 @@ impl WalletTransitionReport {
             footprint: None,
             elapsed_seconds: elapsed.as_secs_f64(),
             memory,
+            wallet_ticker_deltas: None,
             final_wallet: None,
         }
     }

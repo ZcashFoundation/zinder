@@ -137,10 +137,31 @@ pub(crate) struct ReplayStoreArgs {
     )]
     wallet_io_mode: RocksDbIoMode,
     /// Collect the wallet store's `RocksDB` statistics tickers and report their
-    /// per-block deltas. Off by default, which also opens the wallet store with
-    /// statistics collection off, because collection can perturb timings.
+    /// deltas for each wallet transition the report times. Off by default, which
+    /// also opens the wallet store with statistics collection off, because
+    /// collection can perturb timings.
     #[arg(long = "wallet-rocksdb-statistics")]
     wallet_rocksdb_statistics: bool,
+}
+
+impl ReplayStoreArgs {
+    fn requested_io_modes(&self) -> RequestedIoModes {
+        RequestedIoModes {
+            canonical: self.canonical_io_mode.as_str().to_owned(),
+            wallet: self.wallet_io_mode.as_str().to_owned(),
+        }
+    }
+
+    fn wallet_statistics(&self) -> WalletStatisticsConfiguration {
+        WalletStatisticsConfiguration {
+            collected: self.wallet_rocksdb_statistics,
+            tickers: if self.wallet_rocksdb_statistics {
+                statistics::reported_ticker_names()
+            } else {
+                Vec::new()
+            },
+        }
+    }
 }
 
 /// Validated inputs and settings for every repeat.
@@ -656,20 +677,10 @@ fn report_configuration(plan: &TipReplayPlan, first: &RepeatOutcome) -> Configur
         wallet_budget: BudgetRecord::from(plan.settings.wallet_budget),
         rocksdb_io_mode: IoModeConfiguration {
             policy: "direct opens with direct I/O and falls back to buffered I/O when direct I/O cannot open; buffered skips the direct attempt".to_owned(),
-            requested: RequestedIoModes {
-                canonical: plan.args.stores.canonical_io_mode.as_str().to_owned(),
-                wallet: plan.args.stores.wallet_io_mode.as_str().to_owned(),
-            },
+            requested: plan.args.stores.requested_io_modes(),
             resolved: IoModes::from(&first.finished.io_modes),
         },
-        wallet_statistics: WalletStatisticsConfiguration {
-            collected: plan.args.stores.wallet_rocksdb_statistics,
-            tickers: if plan.args.stores.wallet_rocksdb_statistics {
-                statistics::reported_ticker_names()
-            } else {
-                Vec::new()
-            },
-        },
+        wallet_statistics: plan.args.stores.wallet_statistics(),
         event_retention_pruning: "disabled".to_owned(),
     }
 }

@@ -1394,7 +1394,23 @@ async fn tip_reorg_switches_to_a_fork_and_matches_a_rebuilt_wallet() -> Result<(
 #[tokio::test]
 async fn tip_reorg_reports_a_refused_transition_with_the_wallet_unchanged() -> Result<()> {
     let inputs = prepare_inputs().await?;
-    let (admitted, _) = run_tip_reorg(&inputs, "admitted", &[])?;
+    let (admitted, _) = run_tip_reorg(
+        &inputs,
+        "admitted",
+        &[
+            "--wallet-io-mode",
+            "buffered",
+            "--wallet-rocksdb-statistics",
+        ],
+    )?;
+    let configuration = &admitted["configuration"];
+    assert_eq!(configuration["requested_io_modes"]["canonical"], "direct");
+    assert_eq!(configuration["requested_io_modes"]["wallet"], "buffered");
+    assert_eq!(admitted["io_modes"]["wallet"], "buffered");
+    assert_eq!(configuration["wallet_statistics"]["collected"], true);
+    let keys_read =
+        admitted["wallet_transition"]["wallet_ticker_deltas"]["rocksdb.number.keys.read"].as_u64();
+    assert!(keys_read > Some(0), "{keys_read:?}");
     let accounted = admitted["wallet_transition"]["footprint"]["accounted_logical_bytes"]
         .as_u64()
         .ok_or_else(|| eyre!("an admitted reorg reports its accounted bytes"))?;
@@ -1412,6 +1428,15 @@ async fn tip_reorg_reports_a_refused_transition_with_the_wallet_unchanged() -> R
     assert_eq!(transition["wallet_unchanged"], true);
     assert!(transition["footprint"].is_null());
     assert!(transition["final_wallet"].is_null());
+    assert!(transition["wallet_ticker_deltas"].is_null());
+    assert_eq!(
+        refused["configuration"]["wallet_statistics"]["collected"],
+        false
+    );
+    assert_eq!(
+        refused["configuration"]["requested_io_modes"]["wallet"],
+        "direct"
+    );
     Ok(())
 }
 

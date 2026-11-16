@@ -586,9 +586,13 @@ zinder-bench rocksdb-tip-reorg \
 | `--max-transition-logical-bytes` | `536870912` | Ceiling for every wallet transition, the reorg included |
 | `--keep-scratch` | off | Keeps the scratch stores after the run |
 
-The store options of `rocksdb-tip-replay` (`--raw-blob-retention`,
-`--reorg-window-blocks`, and the three block-cache settings) work the same
-way here.
+The store options of `rocksdb-tip-replay` work the same way here:
+`--raw-blob-retention`, `--reorg-window-blocks`, the three block-cache
+settings, `--canonical-io-mode`, `--wallet-io-mode`, and
+`--wallet-rocksdb-statistics`. The report's `configuration` records the
+requested I/O modes in `requested_io_modes` and the statistics setting in
+`wallet_statistics`. The top-level `io_modes` records the modes the stores
+resolved, and is `null` after a refusal, which closes the stores early.
 
 The two branch kinds bracket a real fork:
 
@@ -619,6 +623,10 @@ report. The report's `wallet_transition` object records:
   read after it (`peak_rss_bytes`), a 20 ms `VmRSS` sampler's peak, and
   resident memory after it. The process also holds the canonical writer, the
   secondary, and the fixture, so these numbers cover all of them.
+- `wallet_ticker_deltas`, with `--wallet-rocksdb-statistics`: what each
+  ticker of [Wallet statistics](#wallet-statistics) counted across the call,
+  admitted or refused, with the same background-work caveats. It is `null`
+  without the option.
 
 The report also records the catch-up time, the replaced range's transparent
 workload, what the branch rewrote, and the follower's replacement timings.
