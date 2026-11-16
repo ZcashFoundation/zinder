@@ -63,6 +63,11 @@ enum ReadinessCause {
   // its node since it opened the store, so its fence may sit on a branch the
   // node abandoned. Wallet-serving readers refuse traffic until it does.
   READINESS_CAUSE_CANONICAL_TIP_UNCONFIRMED = 19;
+  // The wallet projector refused its next following transition because the
+  // transition needs more logical bytes than its configured limit allows. It
+  // stays parked with the wallet unchanged until it restarts with a larger
+  // limit or a later canonical event changes the transition.
+  READINESS_CAUSE_WALLET_TRANSITION_LIMIT_EXCEEDED = 20;
 }
 
 // Snapshot of the current readiness state surfaced to operators and orchestrators.
@@ -101,6 +106,7 @@ message ReadinessCauseDetail {
     NodeUnavailableDetail node_unavailable = 8;
     UpstreamNotReadyDetail upstream_not_ready = 9;
     ServingPairStaleDetail serving_pair_stale = 10;
+    WalletTransitionLimitExceededDetail wallet_transition_limit_exceeded = 11;
   }
 }
 
@@ -155,6 +161,19 @@ message ServingPairStaleDetail {
   uint64 lag_chain_epochs = 1;
   // Seconds since the writer last attested the published pair.
   uint64 staleness_seconds = 2;
+}
+
+// Detail for READINESS_CAUSE_WALLET_TRANSITION_LIMIT_EXCEEDED.
+//
+// Carries the two numbers an operator needs to choose a new limit.
+message WalletTransitionLimitExceededDetail {
+  // Logical bytes the refused transition had already accounted when the
+  // projector stopped planning it. This is a lower bound: the complete
+  // transition needs at least this many bytes and may need more.
+  uint64 required_bytes = 1;
+  // Configured logical-byte limit for one following transition,
+  // `projector.follow.max_transition_logical_bytes`.
+  uint64 configured_bytes = 2;
 }
 
 // Detail for READINESS_CAUSE_NODE_UNAVAILABLE.

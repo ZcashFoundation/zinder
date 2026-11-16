@@ -1439,6 +1439,39 @@ fn ops_readiness_report_round_trips_explorer_view_identities() -> eyre::Result<(
     Ok(())
 }
 
+#[test]
+fn ops_readiness_report_round_trips_a_wallet_transition_limit_park() -> eyre::Result<()> {
+    let report = ops::ReadinessReport {
+        cause: ops::ReadinessCause::WalletTransitionLimitExceeded as i32,
+        current_height: Some(4_602_673),
+        target_height: Some(4_602_680),
+        detail: Some(ops::ReadinessCauseDetail {
+            payload: Some(
+                ops::readiness_cause_detail::Payload::WalletTransitionLimitExceeded(
+                    ops::WalletTransitionLimitExceededDetail {
+                        required_bytes: 541_122_672,
+                        configured_bytes: 536_870_912,
+                    },
+                ),
+            ),
+        }),
+        materialized_view_identities: Vec::new(),
+    };
+
+    let decoded = round_trip(&report)?;
+
+    assert_eq!(decoded, report);
+    assert_eq!(
+        ops::ReadinessCause::try_from(20)?,
+        ops::ReadinessCause::WalletTransitionLimitExceeded
+    );
+    assert_eq!(
+        ops::ReadinessCause::WalletTransitionLimitExceeded.as_str_name(),
+        "READINESS_CAUSE_WALLET_TRANSITION_LIMIT_EXCEEDED"
+    );
+    Ok(())
+}
+
 fn round_trip<MessageType>(message: &MessageType) -> Result<MessageType, prost::DecodeError>
 where
     MessageType: Message + Default,

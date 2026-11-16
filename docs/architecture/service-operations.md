@@ -34,6 +34,7 @@ version and commit appear in the `zinder_build_info` metric and native
 | `storage_unavailable` | Required local storage cannot be opened or read. |
 | `schema_mismatch` | Persisted identity or schema differs from the binary. |
 | `reorg_window_exceeded` | A replacement crosses the persisted reorg policy. The detail carries the replacement depth, the window, and the depth the window covered, which is smaller than the window while a raised window is still growing. |
+| `wallet_transition_limit_exceeded` | The projector refused its next wallet transition because it needs more logical bytes than `projector.follow.max_transition_logical_bytes` allows, and stays parked. The detail carries the bytes the transition had accounted when it was refused, a lower bound on what it needs, and the configured limit. |
 | `replica_lagging` | A RocksDB secondary exceeds the admitted epoch lag. |
 | `serving_pair_stale` | A wallet-serving reader cannot refresh its published pair, which is still within its staleness ceiling. |
 | `writer_status_unavailable` | A trusted reader cannot reach the writer control API. |
@@ -48,8 +49,8 @@ cause refuses it.
 Payload-bearing causes include structured detail. `node_unavailable` carries a
 bounded failure class, sanitized reason, consecutive-failure count, and outage
 duration. `upstream_not_ready` carries source heights, verification progress,
-and the health-probe source. Reorg, replica, serving-pair, and
-canonical-retention causes carry the numeric boundary that failed.
+and the health-probe source. Reorg, wallet-transition, replica, serving-pair,
+and canonical-retention causes carry the numeric boundary that failed.
 
 Readiness detail is operational data, not a place for raw node responses,
 authorization material, filesystem paths, transaction identifiers, or other
