@@ -926,10 +926,16 @@ impl WalletServingPairPublisher {
     /// An open candidate is reused first. A drained published slot is
     /// preferred over a vacant one because it is caught up in place instead
     /// of opened cold, so the extra slots open only while older pairs are
-    /// retained or pinned.
+    /// retained or pinned. Each search starts after the published slot, so
+    /// drained slots are reused in turn and none keeps the primary files of
+    /// an old catch-up open while the others advance.
     fn inactive_generation(&self) -> Option<usize> {
+        let first = self
+            .published_generation
+            .map_or(0, |published| published + 1);
         let unpublished = || {
-            (0..SECONDARY_GENERATION_COUNT)
+            (first..first + SECONDARY_GENERATION_COUNT)
+                .map(|position| position % SECONDARY_GENERATION_COUNT)
                 .filter(|generation| Some(*generation) != self.published_generation)
         };
         let state = |generation: usize| &self.generations[generation].state;
@@ -4531,6 +4537,78 @@ mod tests {
                 "later burst block {block} reuses a drained slot"
             );
         }
+
+        drop(slot);
+        drop(publisher);
+        primaries.shutdown().await
+    }
+
+    /// Spaced blocks after a burst reuse every drained slot in turn.
+    ///
+    /// Once a burst has opened every slot, blocks spaced beyond the retention
+    /// window keep every open generation within the last few publications
+    /// instead of leaving some with the primary files of an old fence.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spaced_blocks_after_a_burst_catch_every_drained_generation_up()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut primaries = AdvancingPrimaries::start().await?;
+        let (mut publisher, slot) = primaries
+            .bootstrap_publisher(zinder_runtime::Readiness::default())
+            .await?;
+        for _ in 1..SECONDARY_GENERATION_COUNT {
+            primaries.append_block()?;
+            publisher.refresh_once().await?;
+        }
+        assert_eq!(
+            publisher.candidate_preparations.cold,
+            SECONDARY_GENERATION_COUNT
+        );
+
+        let mut spaced_fences = Vec::new();
+        for block in 1..=2 * SECONDARY_GENERATION_COUNT {
+            publisher.release_expired_pairs(tokio::time::Instant::now() + RETAINED_PAIR_WINDOW);
+            let fence = primaries.append_block()?;
+            publisher.refresh_once().await?;
+            assert_eq!(
+                slot.capture().canonical_fence(),
+                fence,
+                "spaced block {block} must be published"
+            );
+            spaced_fences.push(fence);
+        }
+        let recent_fences = spaced_fences
+            .iter()
+            .rev()
+            .take(SECONDARY_GENERATION_COUNT)
+            .collect::<Vec<_>>();
+        for generation in 0..SECONDARY_GENERATION_COUNT {
+            let SecondaryGenerationState::Published { readers, .. } =
+                &publisher.generations[generation].state
+            else {
+                return Err(format!("generation {generation} must stay open").into());
+            };
+            let canonical_fence = readers.canonical.event_fence();
+            assert!(
+                recent_fences.contains(&&canonical_fence),
+                "generation {generation} must be caught up within the last \
+                 {SECONDARY_GENERATION_COUNT} publications, but holds {canonical_fence:?}"
+            );
+            assert_eq!(
+                WalletCanonicalSourceIdentity::from_ready_evidence(readers.wallet.ready_evidence())
+                    .source_position()
+                    .event_sequence,
+                canonical_fence.chain_event_sequence(),
+                "generation {generation} wallet secondary must match its canonical secondary"
+            );
+        }
+        assert_eq!(
+            publisher.candidate_preparations,
+            CandidatePreparationCounts {
+                cold: SECONDARY_GENERATION_COUNT,
+                recycled: 2 * SECONDARY_GENERATION_COUNT
+            },
+            "spaced blocks reuse opened slots without another cold open"
+        );
 
         drop(slot);
         drop(publisher);

@@ -1,5 +1,5 @@
 kind: changed
-body: Wallet serving now publishes a new block within about 1.25 seconds of its canonical commit instead of 10 to 28 seconds, because `zinder-query` reuses a serving generation that no request holds instead of opening new secondaries for every publication. Drained generations stay open, so they keep the primary files they reference until they are reused. New metrics `zinder_wallet_serving_pair_publisher_candidate_prepared_total` and `zinder_wallet_serving_pair_publisher_cold_open_duration_seconds` show how often a cold open still happens.
+body: Wallet serving now publishes a new block within about 1.25 seconds of its canonical commit instead of 10 to 28 seconds, because `zinder-query` reuses a serving generation that no request holds instead of opening new secondaries for every publication. Drained generations stay open and are reused in turn, so each keeps the primary files it references for only a few blocks after compaction replaces them. New metrics `zinder_wallet_serving_pair_publisher_candidate_prepared_total` and `zinder_wallet_serving_pair_publisher_cold_open_duration_seconds` show how often a cold open still happens.
 time: 2026-11-16T12:20:51.173128407Z
 custom:
     Bump: patch

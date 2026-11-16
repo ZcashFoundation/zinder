@@ -587,6 +587,14 @@ a request still holds a released pair. With 75-second blocks, these opens can
 come long after startup. A slot whose catch-up or publication fails is closed
 and opened cold again when it is next used.
 
+An opened slot stays open after its pair drains, and its secondaries keep the
+primary files of their last catch-up, including files the primaries have
+since compacted away. The publisher takes drained slots in turn, starting
+after the slot it last published, so each opened slot is caught up again
+within a few publications and releases the files it no longer references.
+The disk a drained slot holds beyond the primaries is therefore limited to
+what the last few publications compacted away.
+
 `zinder_wallet_serving_pair_publisher_candidate_prepared_total{kind}` counts
 candidates by `kind`: `cold` for a slot opened from the primaries, and
 `recycled` for a drained generation caught up in place.

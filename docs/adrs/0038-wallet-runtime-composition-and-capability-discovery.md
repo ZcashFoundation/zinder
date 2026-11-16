@@ -176,6 +176,14 @@ changed. It does not repeat the cold scan of retained history. A generation
 whose pair is still held is never caught up. A generation whose catch-up or
 publication fails is closed, and its slot is opened cold when it is next used.
 
+A drained generation stays open, and an open secondary keeps the primary
+files of its last catch-up, including files the primary has since compacted
+away. The publisher therefore reuses drained generations in turn, starting
+after the generation it last published, so every opened generation is caught
+up again within a few publications and releases the files it no longer
+references. It opens a slot it has not used only when no opened generation
+has drained, so the number of cold opens stays fixed once every slot is open.
+
 Each publication carries the writer's fence at the moment its candidate
 converges. The publisher does not publish one pair for each height, so blocks
 that commit within one refresh share one publication at the later height.
@@ -294,6 +302,23 @@ admission per block in reader I/O and memory, and a block that arrives before
 the open finishes still waits for it. Reusing a drained generation removes the
 cold open from the steady state instead.
 
+### Reuse the lowest-numbered drained generation
+
+Once a burst of blocks has opened all four slots, a search that always starts
+at the first slot finds the first or second slot drained at every
+publication spaced more than one retention window apart, and alternates
+between them. The other two stay open without being caught up, and they keep
+their compacted-away primary files for as long as the blocks stay spaced.
+
+### Close a drained generation after an idle window
+
+Closing a generation that stays drained past a fixed window also releases its
+files, but block intervals vary. With 75-second blocks, the generation the
+next block would reuse regularly sits drained longer than any window short
+enough to matter, and that block waits for a cold open again. Reusing drained
+generations in turn bounds the files they keep by publications and adds no
+cold open.
+
 ### Serve only the current pair
 
 Expiring a pin at the next publication fails any workflow that spans a block.
@@ -310,8 +335,10 @@ controlled consumer cutover uses the current contract without shims.
 - 2026-11-16: The serving-pair publisher catches a drained generation up in
   place for its next publication, instead of opening new secondaries for every
   block. Cold admission runs when a slot is first used and after a failed
-  catch-up or publication. Each publication still carries the writer's latest
-  fence, so blocks that commit within one refresh share it.
+  catch-up or publication. Drained generations are reused in turn, so each
+  one releases its compacted-away primary files within a few publications.
+  Each publication still carries the writer's latest fence, so blocks that
+  commit within one refresh share it.
 - 2026-11-15: Requests may keep reading a released serving pair for at most
   30 seconds. The publisher then revokes reads on it, and the transparent
   unspent-output and full-block streams end with

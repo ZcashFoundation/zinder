@@ -63,8 +63,10 @@ current pair, the candidate it is catching up, and two replaced pairs that
 either still answer pinned reads or are held by a long request. A generation
 stays open after its pair drains so a later block can reuse it, so once three
 blocks arrive within one minute, or a long request holds a released pair, all
-four stay open until query restarts. The remainder covers allocator
-overhead, gRPC buffers, and task stacks. In a
+four stay open until query restarts. Query catches drained generations up in
+turn, so a primary file that compaction replaces stays on disk for only a few
+blocks while a drained generation still references it. The remainder covers
+allocator overhead, gRPC buffers, and task stacks. In a
 smaller container the cgroup OOM-killer takes one process during construction.
 That terminates the whole container, and the restart resumes construction from
 the last durable fence only to be killed again.
