@@ -538,6 +538,112 @@ fn fixed_tip_build_matches_exact_version_one_wallet_contract()
 }
 
 #[test]
+fn bulk_built_hash_keyed_families_carry_partitioned_filters_and_the_rest_do_not()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let fixture = wallet_baseline_fixture();
+    let activations = inactive_upgrade_activations()?;
+    let canonical_store = build_ready_canonical_store(&temporary, &fixture)?;
+    // One unsettled block above the baseline gives the build a reorg-undo row,
+    // so every data family is written as an ingested SST.
+    let initial_fence = canonical_store.event_fence();
+    let unsettled_block = block_facts(
+        4,
+        [0xc3; 32],
+        [0xc4; 32],
+        vec![transaction_facts(
+            TransactionId::from_bytes([0x70; 32]),
+            true,
+            vec![TransparentInputFact::new(
+                0,
+                TransparentOutPoint::COINBASE_SENTINEL,
+            )],
+            vec![TransparentOutputFact::new(0, 4, [0x70], fixture.address_a)],
+        )],
+    );
+    let (_canonical_store, _) = canonical_store.commit_live_append(
+        CanonicalLiveAppend::new(
+            initial_fence,
+            canonical_build_block(unsettled_block, true),
+            Vec::new(),
+            initial_fence.visible_tip(),
+            UnixTimestampMillis::new(1_750_000_000_010),
+        ),
+        &activations,
+    )?;
+    let secondary = open_incremental_secondary(&temporary, "canonical-secondary", &activations)?;
+    let wallet_path = temporary.path().join("wallet");
+    let outcome = build_wallet_from_canonical(
+        &secondary,
+        &wallet_path,
+        RocksDbWalletBuildOptions {
+            supported_reorg_depth: 2,
+            ..RocksDbWalletBuildOptions::for_local_tests()
+        },
+    )?;
+    assert_eq!(outcome.report.row_counts.reorg_undo_count, 1);
+    drop(outcome.store);
+
+    let families = rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), &wallet_path)?;
+    let wallet = rust_rocksdb::DB::open_cf_for_read_only(
+        &rust_rocksdb::Options::default(),
+        &wallet_path,
+        &families,
+        false,
+    )?;
+    for (name, filtered) in [
+        ("transparent_unspent_output", true),
+        ("transparent_unspent_output_by_address", true),
+        ("transparent_spent_output", true),
+        ("transparent_address_transaction", true),
+        ("transparent_address_balance", false),
+        ("reorg_undo", false),
+    ] {
+        let property = |field| aggregated_table_property(&wallet, name, field);
+        assert!(property("# entries")? > Some(0), "{name} has no SST rows");
+        if filtered {
+            assert!(property("filter block size")? > Some(0), "{name}");
+            assert_eq!(
+                property("# entries for filter")?,
+                property("# entries")?,
+                "{name}"
+            );
+            assert!(property("# index partitions")? > Some(0), "{name}");
+        } else {
+            assert_eq!(property("filter block size")?, Some(0), "{name}");
+            assert_eq!(property("# entries for filter")?, Some(0), "{name}");
+            assert_eq!(property("# index partitions")?, None, "{name}");
+        }
+    }
+    Ok(())
+}
+
+/// Reads one numeric field of the family's `rocksdb.aggregated-table-properties`.
+///
+/// The aggregate sums the family's live SST files and never carries a filter
+/// policy name, and `# index partitions` appears only when nonzero.
+fn aggregated_table_property(
+    wallet: &rust_rocksdb::DB,
+    family_name: &str,
+    field: &str,
+) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+    let family = wallet
+        .cf_handle(family_name)
+        .ok_or("wallet column family is absent")?;
+    let properties = wallet
+        .property_value_cf(&family, "rocksdb.aggregated-table-properties")?
+        .ok_or("aggregated table properties are unavailable")?;
+    for entry in properties.split("; ") {
+        if let Some((name, number)) = entry.split_once('=')
+            && name.trim() == field
+        {
+            return Ok(Some(number.trim().parse()?));
+        }
+    }
+    Ok(None)
+}
+
+#[test]
 fn built_wallet_passes_independent_semantic_rederivation_after_digest_readback()
 -> Result<(), Box<dyn std::error::Error>> {
     let temporary = TempDir::new()?;

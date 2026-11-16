@@ -177,11 +177,40 @@ All RocksDB opens use `RocksDbResourceBudget` and shared helpers from
 background jobs, open files, direct-I/O policy, statistics collection, and
 flush behavior. Store size must not make process RSS unbounded.
 
-Canonical primary, canonical secondary, wallet primary, wallet secondary,
-materialized-view primary, and materialized-view secondary metrics use distinct
-`store_role` labels. Operators should alert on memory pressure, live WAL bytes,
-pending compaction, write stops, catch-up failure, and replica lag rather than
-infer health from directory size.
+The canonical secondary, materialized-view primary, and materialized-view
+secondary export `zinder_store_*` resource metrics under distinct `store_role`
+labels; the canonical primary and the wallet stores do not export them.
+Operators should alert on memory pressure, live WAL bytes, pending compaction,
+write stops, catch-up failure, and replica lag rather than infer health from
+directory size.
+
+Only the wallet store configures filters. Its four hash-keyed families answer
+the projector's reads that prove a created output, spend, address-index row,
+or history row is new, and those reads stop at the filter unless it reports a
+false positive. Every open path and the bulk-build SST writer use the same
+per-family options.
+
+| Store | Family | Key layout | Filter |
+| --- | --- | --- | --- |
+| Wallet | `transparent_unspent_output`, `transparent_spent_output` | `txid ‖ output_index_be` (36 bytes) | Partitioned hybrid Ribbon |
+| Wallet | `transparent_unspent_output_by_address` | `address_script_hash ‖ height_be ‖ txid ‖ output_index_be` (72 bytes) | Partitioned hybrid Ribbon |
+| Wallet | `transparent_address_transaction` | `address_script_hash ‖ height_be ‖ tx_index_be` (40 bytes) | Partitioned hybrid Ribbon |
+| Wallet | `transparent_address_balance` | `address_script_hash` (32 bytes) | None |
+| Wallet | `reorg_undo` | `height_be` (4 bytes) | None |
+| Wallet | default | Singleton control record | None |
+| Canonical | Every family | Per family, private to `zinder-store` | None |
+| Materialized views | Every family | Owned by each consumer | None |
+
+The filters are whole-key filters at about 10 bits per key, about a 1%
+false-positive rate. Flushed and L0 files use Bloom filters, and deeper files,
+including bulk-built ones, use Ribbon filters, which are about 30% smaller.
+Filter and index partitions share the store's bounded block cache. An existing
+store gains filters only as RocksDB rewrites its files, so the full effect on a
+store built by an earlier release needs a
+[side-by-side wallet rebuild](../runbooks/deploying-on-a-vm.md#side-by-side-wallet-rebuild-and-cutover).
+Files without filters stay readable, and a release without filters ignores
+them. [ADR-0020](../adrs/0020-bounded-rocksdb-resource-budget.md) explains how
+to count the filter working set when sizing the wallet block cache.
 
 See [ADR-0020](../adrs/0020-bounded-rocksdb-resource-budget.md) for the memory
 contract and [Service operations](service-operations.md) for metrics.

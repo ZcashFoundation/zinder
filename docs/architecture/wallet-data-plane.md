@@ -909,6 +909,22 @@ pairs whose reads the publisher revoked at the read limit.
 
 `lightwalletd` compatibility is the floor for wallet-sync performance, not the target. Zinder publishes P50, P99, and worst-case budgets for hot wallet endpoints and gates `GetBlockRange`-equivalent behavior in CI.
 
+### Wallet Point Reads
+
+The wallet projection's four hash-keyed families,
+`transparent_unspent_output`, `transparent_spent_output`,
+`transparent_unspent_output_by_address`, and
+`transparent_address_transaction`, carry partitioned whole-key filters with
+about a 1% false-positive rate. A point read of a key that is not there
+usually returns after probing the filters of the files that could hold it,
+without reading an index or data block. Many projector reads are of this kind: each transition proves that
+every output, spend, address-index row, and history row it creates is new. A
+`TransparentOutpointSpendStatus` lookup of a spent or unknown outpoint misses
+`transparent_unspent_output` first. `transparent_address_balance` and
+`reorg_undo` have no filter, because their reads usually find a row. The
+per-family key layouts are in
+[Storage backend](storage-backend.md#resource-bounds).
+
 ### Enforced Regression Budgets
 
 The `ci-perf` profile runs deterministic regression checks from

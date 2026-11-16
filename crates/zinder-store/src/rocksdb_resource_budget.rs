@@ -27,9 +27,10 @@
 /// store size. Each field has a single concrete effect:
 ///
 /// - `block_cache_bytes` is the size of the bounded LRU cache shared by
-///   data blocks, index blocks, and bloom filter blocks. Without a bounded
-///   cache, `RocksDB` pins index and bloom blocks per-SST in resident memory,
-///   which scales with store size.
+///   data blocks, index blocks, and the filter blocks of any column family
+///   that configures a filter. Without a bounded cache, `RocksDB` pins index
+///   and filter blocks per-SST in resident memory, which scales with store
+///   size.
 /// - `max_wal_bytes` is the ceiling for the live WAL across all column
 ///   families. Crossing it triggers a memtable flush so the WAL truncates.
 ///   The default of 0 (`RocksDB`'s own) means "never trigger from WAL size",
@@ -270,8 +271,8 @@ impl RocksDbResourceBudget {
 /// series away for that headroom without a code change.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RocksDbStatisticsLevel {
-    /// No `enable_statistics()` call at all. The bounded LRU cache and
-    /// bloom filters still run; only their counters stop being collected.
+    /// No `enable_statistics()` call at all. The bounded LRU cache and any
+    /// configured filters still run; only their counters stop being collected.
     /// `zinder_store_rocksdb_ticker` exports nothing at this level.
     Off,
     /// Ticker counters only (`StatsLevel::ExceptHistogramOrTimers`), the

@@ -601,8 +601,26 @@ stream without cancelling it.
 
 `zinder-store` exports bounded role-labelled metrics for block-cache capacity
 and use, memtables, WAL bytes and limits, pending compaction, active
-compactions, write stops, bytes read and written, MultiGet behavior, Bloom
-filters, read latency, and startup open duration.
+compactions, write stops, bytes read and written, MultiGet behavior, filter
+tickers, read latency, and startup open duration.
+
+The `canonical_secondary`, `materialized_view_primary`, and
+`materialized_view_secondary` roles export these series. None of those stores
+configures a filter, so their `rocksdb.bloom.filter.*` tickers stay at zero.
+The wallet store, whose four hash-keyed families carry filters, does not
+export `zinder_store_*` series. While `wallet.rocksdb.statistics_level` is
+`tickers` or `full`, RocksDB writes the projector's wallet primary statistics
+to the `LOG` file in the wallet store directory every 10 minutes; wallet
+secondaries do not write them. Read the filters there:
+
+- The false-positive rate is `(full.positive - full.true.positive) /
+  (full.positive - full.true.positive + useful)`, from the
+  `rocksdb.bloom.filter.*` counters. Expect about 1% for the wallet filters.
+- `rocksdb.block.cache.filter.miss` shows whether the filter working set fits
+  the wallet block cache. A count that keeps rising against
+  `rocksdb.block.cache.filter.hit` means filter partitions are evicted and
+  re-read; size `wallet.rocksdb.block_cache_bytes` as
+  [ADR-0020](../adrs/0020-bounded-rocksdb-resource-budget.md) describes.
 
 Metric labels must be closed enumerations. Never use paths, addresses, hashes,
 transaction identifiers, exception text, or user input as labels.
