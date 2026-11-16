@@ -1563,7 +1563,7 @@ impl<'store> WalletTransitionPlanner<'store> {
     }
 
     fn require_publishable_undo_suffix(
-        &self,
+        &mut self,
         check: UndoSuffixCheck,
     ) -> Result<(), RocksDbWalletError> {
         let undo_count = self.accumulator_row_counts.reorg_undo_count;
@@ -1867,7 +1867,7 @@ impl<'store> WalletTransitionPlanner<'store> {
     /// Decodes one retained undo row in place, from the plan's overlay or a
     /// pinned durable value, for a plan that keeps the row.
     fn inspect_undo(
-        &self,
+        &mut self,
         height: BlockHeight,
     ) -> Result<Option<WalletReorgUndo>, RocksDbWalletError> {
         let key = height.value().to_be_bytes();
@@ -1879,6 +1879,7 @@ impl<'store> WalletTransitionPlanner<'store> {
         }
         let column_family = column_family(&self.store.bounded_open, REORG_UNDO_COLUMN_FAMILY)?;
         count_undo_row_work(REORG_UNDO_COLUMN_FAMILY, UndoRowWork::DurableRead);
+        self.durable_point_reads = self.durable_point_reads.saturating_add(1);
         self.store
             .bounded_open
             .db
@@ -3875,11 +3876,18 @@ mod tests {
             take_undo_row_work();
             let keys_read_before = wallet_keys_read(&wallet);
             apply_next_coinbase_only_event_at_depth(&mut wallet, &secondary, depth)?;
+            let keys_read = wallet_keys_read(&wallet) - keys_read_before;
+            // The control record is read by a scan, so the store's point-read
+            // ticker counts exactly the plan's point reads.
+            let footprint = wallet
+                .last_transition_footprint()
+                .ok_or("a published append records its footprint")?;
+            assert_eq!(footprint.durable_point_reads, keys_read, "height {height}");
             observed.push((
                 height,
                 AppendWork {
                     undo_rows: take_undo_row_work(),
-                    keys_read: wallet_keys_read(&wallet) - keys_read_before,
+                    keys_read,
                 },
             ));
             // Every append reads its new undo key once to prove it absent.
@@ -4527,6 +4535,7 @@ mod tests {
             assert_eq!(fixture.wallet.last_transition_footprint(), footprint_before);
 
             let keys_written_before = wallet_keys_written(&fixture.wallet);
+            let keys_read_before = wallet_keys_read(&fixture.wallet);
             fixture.apply_reorg(required)??;
             assert_eq!(
                 wallet_keys_written(&fixture.wallet) - keys_written_before,
@@ -4541,7 +4550,10 @@ mod tests {
             assert_eq!(footprint.planned_rows, u64::try_from(touched.len())?);
             assert_eq!(footprint.batch_records, footprint.planned_rows + 1);
             assert!(footprint.batch_bytes > u64::try_from(final_entry_bytes)?);
-            assert!(footprint.durable_point_reads > 0);
+            assert_eq!(
+                footprint.durable_point_reads,
+                wallet_keys_read(&fixture.wallet) - keys_read_before
+            );
             assert_eq!(wallet_rows(&fixture.wallet)?, after, "{replacement:?}");
             assert_eq!(
                 fixture.wallet.ready_evidence().projection_digest,
