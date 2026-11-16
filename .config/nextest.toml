@@ -41,6 +41,14 @@ filter = "test(abandoned_and_stalled_unspent_output_reads_do_not_stop_publicatio
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]
+# This test plans a rollback of a 200-output block about 25 times, 20 of them
+# to search for its tightest logical-byte limit, and then builds the wallet
+# cold. It takes 8-11s alone in a debug build and more under full-workspace
+# parallelism, which crosses the 20s default kill window.
+filter = "test(a_rollback_near_its_limit_rereads_rows_it_could_not_remember)"
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[[profile.default.overrides]]
 # Each of the 24 seeded cases opens four RocksDB stores with every bundled
 # consumer's column families and applies two reorgs. The fixed case set takes
 # 13-20s on a 4-vCPU runner, which crosses the 20s default kill window.
