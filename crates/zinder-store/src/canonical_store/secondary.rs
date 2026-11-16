@@ -72,7 +72,7 @@ impl CanonicalSecondaryCatchupOutcome {
 pub struct RocksDbCanonicalSecondary {
     pub(super) bounded_open: BoundedRocksDbOpen,
     primary_path: PathBuf,
-    expectation: CanonicalStoreAdmissionExpectation,
+    pub(super) expectation: CanonicalStoreAdmissionExpectation,
     workload: CanonicalStoreWorkload,
     pub(super) build_plan: super::CanonicalStoreBuildPlan,
     pub(super) ready_evidence: CanonicalStoreReadyEvidence,

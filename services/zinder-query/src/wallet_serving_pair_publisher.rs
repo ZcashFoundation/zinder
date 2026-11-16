@@ -1246,7 +1246,7 @@ impl WalletServingPairPublisher {
                 &candidate.wallet,
             ) {
                 Ok(()) => Ok(()),
-                Err(error) => Err(classify_pair_admission(&error)),
+                Err(error) => Err(candidate_admission_outcome(error)?),
             };
             Ok::<_, WalletServingPairError>((candidate, convergence))
         })
@@ -1719,6 +1719,28 @@ impl CanonicalWriterStatusClient {
     }
 }
 
+/// Returns how a caught-up candidate that failed pair admission converges.
+///
+/// A canonical read that failed only because the writer's compaction deleted
+/// a table file after the catch-up is the candidate's own storage failure,
+/// as it is during the catch-up, so it fails the refresh with its typed
+/// source instead of reading as a schema or fence mismatch.
+fn candidate_admission_outcome(
+    error: WalletServingAdmissionError,
+) -> Result<WalletServingConvergence, WalletServingPairError> {
+    match error {
+        WalletServingAdmissionError::CanonicalRead { source } if source.is_missing_table_file() => {
+            Err(WalletServingPairError::Canonical(source))
+        }
+        error @ (WalletServingAdmissionError::NetworkMismatch { .. }
+        | WalletServingAdmissionError::CanonicalRead { .. }
+        | WalletServingAdmissionError::CanonicalFenceMismatch
+        | WalletServingAdmissionError::WalletSourceMismatch { .. }) => {
+            Ok(classify_pair_admission(&error))
+        }
+    }
+}
+
 fn classify_pair_admission(error: &WalletServingAdmissionError) -> WalletServingConvergence {
     match error {
         WalletServingAdmissionError::WalletSourceMismatch { canonical, wallet } => {
@@ -1823,14 +1845,13 @@ fn record_replica_lag(lag_chain_epochs: u64) {
 /// Returns whether a refresh failure leaves the published pair exactly as the
 /// writer last attested it.
 ///
-/// Only lag, control-plane transport failures, and a candidate that opened or
-/// caught up while the writer's compaction deleted a table file it had just
-/// listed qualify: they describe the candidate generation or the status RPC,
-/// never the published pair. Every failure that impugns the pair itself, its
-/// schema, or the slot holding it is excluded, so those keep failing closed
-/// the moment they occur. So is a deleted file that the canonical
-/// store-control check reports, because that check keeps only the `RocksDB`
-/// status text.
+/// Only lag, control-plane transport failures, and a candidate that opened,
+/// caught up, or checked its admission evidence while the writer's or the
+/// projector's compaction deleted a table file it had just listed qualify:
+/// they describe the candidate generation or the status RPC, never the
+/// published pair. Every failure that impugns the pair itself, its schema, or
+/// the slot holding it is excluded, so those keep failing closed the moment
+/// they occur.
 fn refresh_failure_retains_attested_pair(error: &WalletServingPairError) -> bool {
     matches!(
         error,
@@ -2014,12 +2035,12 @@ mod tests {
         CandidatePreparationCounts, CanonicalFenceRelation, RETAINED_PAIR_WINDOW,
         SECONDARY_GENERATION_COUNT, SecondaryGenerationState, WalletServingConvergence,
         WalletServingPairConfig, WalletServingPairError, WalletServingPairPublisher,
-        WalletServingPairSlot, WalletServingReadiness, classify_canonical_writer_fence,
-        classify_pair_admission, error_with_sources, missing_table_file_reported,
-        refresh_failure_is_routine_lag, refresh_failure_not_ready_cause,
-        refresh_failure_retains_attested_pair, spawn_wallet_ingest_control_readiness_probe,
-        spawn_wallet_node_readiness_probe, wallet_ingest_control_request,
-        wallet_source_writer_fence,
+        WalletServingPairSlot, WalletServingReadiness, candidate_admission_outcome,
+        classify_canonical_writer_fence, classify_pair_admission, error_with_sources,
+        missing_table_file_reported, refresh_failure_is_routine_lag,
+        refresh_failure_not_ready_cause, refresh_failure_retains_attested_pair,
+        spawn_wallet_ingest_control_readiness_probe, spawn_wallet_node_readiness_probe,
+        wallet_ingest_control_request, wallet_source_writer_fence,
     };
     use crate::{
         AdmittedIngestControl, NativeWalletEndpointCapabilities, WalletEndpointMetadata,
@@ -2775,7 +2796,8 @@ mod tests {
             },
             WalletServingPairError::PairSlotUnavailable,
             WalletServingPairError::CandidateUnavailable { generation: 0 },
-            // The store-control check keeps only a deleted file's status text.
+            // An admission refusal fails closed even when it quotes a missing
+            // table file's status.
             WalletServingPairError::Canonical(CanonicalStoreError::AdmissionRefused {
                 path: PathBuf::from("/canonical"),
                 reason: "store-control iteration failed: IO error: No such file or directory: \
@@ -5369,9 +5391,12 @@ mod tests {
         Ok(())
     }
 
-    /// A candidate that opens or catches up while the writer deletes a table
-    /// file it just listed leaves the published pair serving, and the logged
-    /// failure names that file.
+    /// A candidate that finds a table file it just listed deleted leaves the
+    /// published pair serving.
+    ///
+    /// That holds whether the file goes missing during the candidate's open
+    /// or catch-up or during its admission read after the catch-up, and the
+    /// logged failure names the file.
     #[test]
     fn a_candidate_missing_a_table_file_keeps_the_attested_pair_serving()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -5400,7 +5425,27 @@ mod tests {
             .ok_or("a stale secondary must reopen a compacted-away table file")?;
         assert!(missing.is_missing_table_file(), "{missing:?}");
 
-        let failure = WalletServingPairError::Canonical(missing);
+        let failure =
+            match candidate_admission_outcome(crate::WalletServingAdmissionError::CanonicalRead {
+                source: missing,
+            }) {
+                Err(failure @ WalletServingPairError::Canonical(_)) => failure,
+                other => {
+                    return Err(
+                        format!("the refresh must fail with its source, got {other:?}").into(),
+                    );
+                }
+            };
+        assert_eq!(
+            candidate_admission_outcome(crate::WalletServingAdmissionError::CanonicalRead {
+                source: CanonicalStoreError::StoreNotReady {
+                    path: canonical_primary_path.clone(),
+                },
+            })
+            .ok(),
+            Some(WalletServingConvergence::SchemaOrFenceMismatch),
+            "every other admission read failure stays a schema or fence mismatch"
+        );
         let logged_error = error_with_sources(&failure);
         assert!(
             logged_error.contains(&canonical_primary_path.display().to_string())

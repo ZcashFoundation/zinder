@@ -216,10 +216,10 @@ without marking the pair. A marked generation drains and is recycled like any
 released one, and its catch-up drops the deleted files from its view. A
 candidate whose RocksDB open or catch-up fails because the primary deleted a
 file it had just listed is a candidate failure: like replica lag, it leaves
-the published pair serving until the staleness ceiling. The canonical
-store-control check that follows each open and catch-up reports such a
-deletion as an admission refusal, so that refresh fails closed like any other
-admission failure.
+the published pair serving until the staleness ceiling. So is a candidate
+whose canonical store-control check, or whose canonical read during pair
+admission, finds such a file gone after the catch-up. Any other failure of
+either check still refuses the candidate.
 
 Marking a pair does not change readiness. The refresh that replaces it reports
 readiness as any refresh does, so a candidate failure that does not leave the
@@ -451,8 +451,9 @@ controlled consumer cutover uses the current contract without shims.
   the writer's fence even when the fence has not moved, and the read runs once
   more on the replacement when that pair answers the read's epoch. A pinned
   read whose epoch only the marked pair served fails with
-  `CHAIN_EPOCH_PIN_UNAVAILABLE`. A candidate whose RocksDB open or catch-up
-  fails on such a file keeps the published pair serving.
+  `CHAIN_EPOCH_PIN_UNAVAILABLE`. A candidate whose RocksDB open, catch-up,
+  store-control check, or admission read fails on such a file keeps the
+  published pair serving.
 - 2026-11-16: Each replaced serving pair answers reads pinned to its epoch for
   one minute after it was replaced, however fast later blocks arrive.
   Publication no longer releases the oldest retained pair, and a retained pair

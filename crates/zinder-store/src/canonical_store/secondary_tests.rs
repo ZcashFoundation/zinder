@@ -1,15 +1,19 @@
+use std::num::NonZeroU32;
+
+use rust_rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
 use tempfile::TempDir;
 use zinder_core::{BlockHash, BlockHeight, BlockId, Network, UnixTimestampMillis};
 
 use super::{
-    CanonicalLiveAppend, CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload,
+    CanonicalEventHistoryRequest, CanonicalLiveAppend, CanonicalReorgPolicy, CanonicalStoreError,
+    CanonicalStoreWorkload, ProjectionBuildLease, ProjectionBuildLeaseId,
     RocksDbCanonicalSecondary, RocksDbCanonicalStore,
     block_load::encode_block_position,
     live_replacement_tests::{
         open_store, open_store_with_retention, published_store, published_store_with_retention,
         replacement_block,
     },
-    rocksdb::COMPACT_BLOCK_COLUMN_FAMILY,
+    rocksdb::{COMPACT_BLOCK_COLUMN_FAMILY, validate_open_store_control},
 };
 use crate::{RawBlobRetention, RocksDbResourceBudget};
 
@@ -218,6 +222,125 @@ fn a_corrupt_table_file_is_not_a_missing_table_file() -> Result<(), Box<dyn std:
             &failure,
             CanonicalStoreError::RocksDbOperation { source, .. }
                 if source.kind() == rust_rocksdb::ErrorKind::Corruption
+        ),
+        "unexpected failure: {failure:?}"
+    );
+    assert!(!failure.is_missing_table_file());
+    Ok(())
+}
+
+/// Live projection-build leases that give the default family more rows than a
+/// secondary keeps table files open once each row has a file of its own.
+const SPLIT_LEASES: u8 = 96;
+
+/// A store-control scan reports a deleted table file as missing.
+///
+/// The writer's compaction can delete a default-family table file between a
+/// secondary's catch-up and the store-control scan that follows it. The scan
+/// then reports the deleted file with its typed source, as every other read
+/// does, instead of as an admission refusal, and the next catch-up clears it.
+#[test]
+fn a_store_control_scan_reports_a_compacted_away_table_file_as_missing()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let store = append_block_five(
+        published_store(
+            &store_path,
+            REORG_WINDOW,
+            BlockHeight::new(4),
+            BlockHeight::new(2),
+        )?,
+        &activations,
+    )?;
+    let anchor = store
+        .canonical_event_history(CanonicalEventHistoryRequest::new(None, NonZeroU32::MIN))?
+        .first()
+        .ok_or("the append must leave a canonical event")?
+        .projection_build_anchor();
+    let now = UnixTimestampMillis::now();
+    let expires_at = UnixTimestampMillis::new(now.value().saturating_add(60_000));
+    for lease_byte in 0..SPLIT_LEASES {
+        store.acquire_projection_build_lease(
+            ProjectionBuildLease::new(
+                ProjectionBuildLeaseId::from_bytes([lease_byte; 16]),
+                anchor,
+                expires_at,
+            ),
+            now,
+        )?;
+    }
+    split_rows_into_table_files(&store.bounded_open.db, DEFAULT_COLUMN_FAMILY_NAME)?;
+    let mut secondary = open_secondary(
+        &store_path,
+        temporary.path().join("secondary"),
+        &activations,
+        RawBlobRetention::Transactions,
+    )??;
+
+    compact_away_table_files(&store.bounded_open.db, DEFAULT_COLUMN_FAMILY_NAME)?;
+    let failure = validate_open_store_control(
+        &secondary.bounded_open.db,
+        &store_path,
+        &secondary.expectation,
+    )
+    .err()
+    .ok_or("a scan over the compacted-away default family must fail")?;
+    assert!(
+        failure.is_missing_table_file(),
+        "the scan must report the missing table file, got {failure:?}"
+    );
+
+    secondary.try_catch_up()?;
+    assert_eq!(secondary.event_fence(), store.event_fence());
+    Ok(())
+}
+
+/// A corrupt default-family table file still refuses admission.
+#[test]
+fn a_corrupt_store_control_row_refuses_admission() -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let store = published_store(
+        &store_path,
+        REORG_WINDOW,
+        BlockHeight::new(4),
+        BlockHeight::new(2),
+    )?;
+    split_rows_into_table_files(&store.bounded_open.db, DEFAULT_COLUMN_FAMILY_NAME)?;
+    for file in store
+        .bounded_open
+        .db
+        .live_files()?
+        .into_iter()
+        .filter(|file| file.column_family_name == DEFAULT_COLUMN_FAMILY_NAME && file.level == 0)
+    {
+        // Flipping the first byte breaks the first data block's checksum
+        // without touching the footer or index.
+        let corrupted_file = table_file_path(&file);
+        let mut table_bytes = std::fs::read(&corrupted_file)?;
+        let first_byte = table_bytes
+            .first_mut()
+            .ok_or("a table file is never empty")?;
+        *first_byte ^= 0xff;
+        std::fs::write(&corrupted_file, table_bytes)?;
+    }
+
+    let failure = open_secondary(
+        &store_path,
+        temporary.path().join("secondary"),
+        &activations,
+        RawBlobRetention::Transactions,
+    )?
+    .err()
+    .ok_or("a corrupt store-control row must refuse admission")?;
+    assert!(
+        matches!(
+            &failure,
+            CanonicalStoreError::AdmissionRefused { reason, .. }
+                if reason.starts_with("store-control iteration failed: Corruption")
         ),
         "unexpected failure: {failure:?}"
     );

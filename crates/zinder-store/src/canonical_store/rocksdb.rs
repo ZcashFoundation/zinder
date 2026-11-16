@@ -1025,12 +1025,8 @@ pub(super) fn validate_open_store_control(
     let mut control = None;
     let mut schedule_keys = Vec::new();
     for row in db.iterator(IteratorMode::Start) {
-        let (key, encoded_control) = row.map_err(|source| {
-            CanonicalStoreError::admission(
-                path,
-                format!("store-control iteration failed: {source}"),
-            )
-        })?;
+        let (key, encoded_control) =
+            row.map_err(|source| store_control_iteration_error(path, source))?;
         match key.as_ref() {
             STORE_CONTROL_KEY => control = Some(encoded_control),
             RETENTION_FLOOR_KEY
@@ -1130,6 +1126,22 @@ pub(super) fn validate_open_store_control(
         ReorgPolicyAdmission::Exact(_) | ReorgPolicyAdmission::RaiseTo(_) => {}
     }
     Ok(persisted)
+}
+
+/// Classifies a failed read of the store-control scan.
+///
+/// A table file deleted under a secondary's view, which the primary's
+/// compaction does between a catch-up and this scan, keeps its typed
+/// `RocksDB` source, so a reader can catch up and try again. Every other
+/// failure refuses admission.
+fn store_control_iteration_error(path: &Path, source: rust_rocksdb::Error) -> CanonicalStoreError {
+    if crate::is_missing_table_file_error(&source) {
+        return CanonicalStoreError::RocksDbOperation {
+            operation: "store-control iteration",
+            source,
+        };
+    }
+    CanonicalStoreError::admission(path, format!("store-control iteration failed: {source}"))
 }
 
 fn read_admitted_schedule(

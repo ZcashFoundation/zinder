@@ -487,12 +487,11 @@ You do not need to act on an occasional warning. Query has already handled it:
   once.
 
 The container does not restart, and readiness stays ready unless the refresh
-that prepares the replacement fails. When the RocksDB open or catch-up of
-that candidate hits another deleted file, readiness reports
-`serving_pair_stale`, which still admits traffic. Any other candidate failure,
-including a deleted file that the canonical store-control check reaches after
-the catch-up, refuses traffic until a later refresh succeeds. Both log
-`wallet_serving_pair_publisher_refresh_failed`.
+that prepares the replacement fails. When that candidate hits another deleted
+file, during its RocksDB open or catch-up or during the admission checks that
+follow them, readiness reports `serving_pair_stale`, which still admits
+traffic. Any other candidate failure refuses traffic until a later refresh
+succeeds. Both log `wallet_serving_pair_publisher_refresh_failed`.
 
 Investigate when the warnings follow most publications, or when clients keep
 receiving `STORAGE_UNAVAILABLE` for minutes after one. Both mean the primary

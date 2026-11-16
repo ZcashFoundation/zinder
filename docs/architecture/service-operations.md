@@ -668,16 +668,16 @@ manual compaction or a bulk rewrite of the primary. If query still logs
 `wallet_serving_pair_publisher_refresh_failed` warnings: a replacement that
 cannot find a free slot, or keeps failing, leaves the marked pair current.
 
-A candidate's RocksDB open or catch-up can also fail with the same
-missing-file error, when the primary deletes a file between listing and
-opening it. That refresh failure reports `serving_pair_stale` and keeps the
-published pair serving until the staleness ceiling, as a writer-status outage
-does. It counts under `zinder_wallet_serving_pair_publisher_refresh_total`
-with the `canonical_secondary` or `wallet_secondary` `error_class`, and the
-next refresh tries again. The canonical candidate's store-control check, which
-scans the store's default family right after each open and catch-up, reports
-a deleted file it reaches as an admission refusal instead. That refresh fails
-closed with `storage_unavailable` until a later refresh succeeds.
+A candidate can also fail with the same missing-file error when the primary
+deletes a file between listing and opening it. That happens during the
+candidate's RocksDB open or catch-up, during the canonical store-control check
+that scans the store's default family right after each of them, or during the
+canonical read that admits the candidate as a pair. That refresh failure
+reports `serving_pair_stale` and keeps the published pair serving until the
+staleness ceiling, as a writer-status outage does. It counts under
+`zinder_wallet_serving_pair_publisher_refresh_total` with the
+`canonical_secondary` or `wallet_secondary` `error_class`, and the next refresh
+tries again. Any other failure of those checks fails closed as before.
 
 `zinder_wallet_serving_pair_publisher_candidate_prepared_total{kind}` counts
 candidates by `kind`: `cold` for a slot opened from the primaries, and
