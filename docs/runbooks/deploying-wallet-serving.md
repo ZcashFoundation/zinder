@@ -59,8 +59,8 @@ so the baked configs pin every budget that would otherwise be derived from it:
 | `zinder-query` | ~0.4 GiB per open serving pair, up to ~1.4 GiB | canonical secondary block cache |
 
 Query keeps up to four serving pairs open, each with its own block caches: the
-current pair, the candidate it is catching up, and two replaced pairs that
-either still answer pinned reads or are held by a long request. A generation
+current pair and three more, each the candidate it is catching up, a replaced
+pair that still answers pinned reads, or one a long request holds. A generation
 stays open after its pair drains so a later block can reuse it, so once three
 blocks arrive within one minute, or a long request holds a released pair, all
 four stay open until query restarts. Query catches drained generations up in
@@ -323,6 +323,18 @@ replaces several blocks, and on Regtest. To measure the delay, match each
 `wallet_serving_pair_publisher_published` in the query log whose
 `event_sequence` is at least the commit's `chain_event_sequence`. A height
 with no publication of its own is expected.
+
+Query keeps each replaced epoch answering pinned reads for one minute, so a
+wallet that pins an epoch for a multi-request walk finishes it across new
+blocks. When more than three blocks arrive within one minute, no generation is
+free for the next one. That block waits until the oldest replaced epoch's
+minute ends, and it is then published together with every block that arrived
+during the wait. On Testnet this happens during bursts of blocks seconds
+apart, and on any network while ingest catches up after a stall. The wait
+lasts at most a minute, or about 90 seconds while a long request holds a
+released pair. Readiness keeps admitting traffic, and
+`zinder_wallet_serving_pair_publisher_generation_wait_total{reason="retention_window"}`
+counts each refresh that waited.
 
 A block waits longer when query must first open and admit a serving-pair
 generation, which takes about 25 seconds on Testnet. Query opens the first of

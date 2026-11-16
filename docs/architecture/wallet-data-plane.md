@@ -856,14 +856,13 @@ For example, a compact block range response should bind:
 If the chain tip changes while the request is executing, the response should still finish from the epoch it started with or restart from a new epoch. It should not mix both.
 
 The production `WalletServingQuery` answers unpinned reads from its current
-exact read pair. The two most recently replaced pairs keep answering reads
-pinned to their epochs, each for at most one minute after it was replaced. The
-publisher publishes a new pair when the writer's fence advances, normally once
-per new block, so a workflow pinned to the current epoch survives the next two
-publications for up to one minute after its epoch is replaced. A wallet that
-pins one epoch and then reads the unspent outputs of each of its transparent
-receivers in turn therefore completes across a new block instead of
-restarting.
+exact read pair. Each replaced pair keeps answering reads pinned to its epoch
+for one minute after it was replaced, however fast later blocks arrive. A
+workflow pinned to the current epoch therefore keeps its epoch until one
+minute after the next publication. A wallet that pins one epoch and then reads
+the unspent outputs of each of its transparent receivers in turn completes
+across new blocks instead of restarting, as long as it finishes within that
+minute.
 
 Retention covers reads that carry `at_epoch_id` on the wire. The first page of
 `TransparentAddressTxIdsInRange` carries no wire pin, so the current pair
@@ -872,10 +871,15 @@ answers it and a client expecting a replaced epoch rejects its header with
 an old snapshot therefore still restarts after a new block; only that
 receiver's continuation pages resume on the retained pair.
 
-Retention is bounded in both count and time, and on its own it never delays
-tip following: a publication beyond the limit releases the oldest retained pair,
-and a retained pair that no request holds gives up its generation when a
-request still reading a released pair leaves no other slot free.
+Retention is bounded by time, and it can delay tip following. A
+wallet-serving reader has four secondary generations, so it retains at most
+three replaced pairs. While every generation other than the current one holds
+a retained pair or a released pair that a request still holds, the publisher
+publishes nothing. The first refresh after a generation frees publishes the
+writer's latest fence, and the blocks committed in the meantime share that
+publication. A pair republished at its own epoch, as a schedule revision does,
+leaves retention at once, because the pair that replaced it answers the same
+epoch.
 
 A request that is still reading when its pair is released keeps the pair's
 generation open for at most 30 seconds more (`RELEASED_PAIR_READ_LIMIT`).
@@ -885,8 +889,10 @@ reads that keep a pair across several page reads, check for revocation between
 pages and while they wait for a slow client, then fail with
 `CHAIN_EPOCH_PIN_UNAVAILABLE` and drop the pair. Every other read is one
 bounded blocking read that finishes on its own. A slow or abandoned read can
-therefore delay publication by at most the read limit plus one page read,
-and it never stops publication for other clients.
+therefore delay publication by at most the read limit plus one page read after
+its pair leaves retention. Retention and slow reads together delay a
+publication by at most about 90 seconds, and they never stop publication for
+other clients.
 
 A pin on a released or never-served epoch receives
 `CHAIN_EPOCH_PIN_UNAVAILABLE`, and the client captures a new snapshot and
@@ -897,8 +903,8 @@ current best chain.
 
 Each retained pair keeps its canonical and wallet secondaries open, with their
 own block caches and memtables, so a wallet-serving reader holds up to four
-secondary pairs at once: the current pair, the candidate it is catching up,
-and two replaced pairs, either retained or still held by a request. A
+secondary pairs at once: the current pair and three more, each the candidate
+it is catching up, a retained pair, or a released pair a request still holds. A
 generation also stays open after its pair drains, so the reader catches it up
 for a later block instead of opening it again. The reader reuses drained
 generations in turn, so none keeps primary files that compaction replaced for
@@ -908,6 +914,9 @@ retained count, `zinder_wallet_serving_pair_publisher_pinned_retired_pairs`
 reports the released pairs that requests still hold, and
 `zinder_wallet_serving_pair_publisher_revoked_pairs_total` counts the released
 pairs whose reads the publisher revoked at the read limit.
+`zinder_wallet_serving_pair_publisher_generation_wait_total` counts refreshes
+that published nothing because no generation was free, with
+`reason="retention_window"` while a retained pair takes a generation.
 
 ## Performance and Pagination
 

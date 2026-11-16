@@ -4,7 +4,10 @@
 //! up only an inactive generation, authenticates that generation against the
 //! canonical writer control plane, and atomically publishes it as one
 //! immutable canonical/wallet pair. A replaced pair keeps answering reads
-//! pinned to its chain epoch for a bounded window. Each generation stays
+//! pinned to its chain epoch for one retention window, however fast later
+//! blocks arrive: while every spare generation still holds such a pair, the
+//! publisher publishes nothing and then publishes the writer's latest fence,
+//! so blocks in a burst share one publication. Each generation stays
 //! frozen until every in-flight request has dropped its captured pair `Arc`;
 //! the publisher then catches that same open generation up for a later
 //! publication, so a slot is opened cold only on its first use or after a
@@ -53,9 +56,12 @@ use zinder_store::{
 use zinder_wallet_projection::WalletCanonicalSourceIdentity;
 use zinder_wallet_rocksdb::{RocksDbWalletError, RocksDbWalletSecondary};
 
-/// Most replaced pairs that keep answering reads pinned to their epoch.
-const RETAINED_PAIR_LIMIT: usize = 2;
-/// Longest a replaced pair keeps answering reads pinned to its epoch.
+/// How long a replaced pair keeps answering reads pinned to its epoch.
+///
+/// The window is a guarantee as well as a bound. Publication never releases
+/// a replaced pair before its window ends, so a pin on its epoch is answered
+/// for exactly this long after the pair was replaced, however many blocks
+/// arrive meanwhile.
 const RETAINED_PAIR_WINDOW: Duration = Duration::from_mins(1);
 /// Longest a request may keep reading a pair after the publisher released it.
 ///
@@ -65,11 +71,14 @@ const RETAINED_PAIR_WINDOW: Duration = Duration::from_mins(1);
 pub(crate) const RELEASED_PAIR_READ_LIMIT: Duration = Duration::from_secs(30);
 /// Secondary generation slots.
 ///
-/// The current pair and a candidate take one each. The other two hold
-/// retained pairs or retired pairs that requests still hold, and a retained
-/// pair yields its slot to a held retired pair, so one or two long-lived
-/// readers cannot stop publication.
-const SECONDARY_GENERATION_COUNT: usize = RETAINED_PAIR_LIMIT + 2;
+/// The current pair takes one. Each other slot holds the candidate, a
+/// replaced pair inside its retention window, or a released pair that a
+/// request still holds, so at most three replaced pairs are retained. While
+/// no slot is free, the publisher waits. A retained pair frees its slot when
+/// its window ends. A released pair that a request holds frees it at most one
+/// page read after [`RELEASED_PAIR_READ_LIMIT`]. A publication therefore
+/// follows the previous one within about the window plus the read limit.
+const SECONDARY_GENERATION_COUNT: usize = 4;
 const CONVERGENCE_RETRY_DELAY_CAP: Duration = Duration::from_millis(100);
 const READINESS_REASON_MAX_BYTES: usize = 256;
 
@@ -117,8 +126,8 @@ pub struct WalletServingPairConfig {
 /// the storage evidence used to derive endpoint capabilities stable for the
 /// lifetime of a composed query.
 ///
-/// The two most recently replaced pairs keep answering reads pinned to their
-/// chain epochs, each for at most one minute after it was replaced.
+/// Each replaced pair keeps answering reads pinned to its chain epoch for one
+/// minute after it was replaced, however many pairs are published meanwhile.
 #[derive(Clone)]
 pub struct WalletServingPairSlot {
     published: Arc<ArcSwap<PublishedPairs>>,
@@ -127,7 +136,8 @@ pub struct WalletServingPairSlot {
 /// The current pair and the replaced pairs that still answer pinned reads.
 struct PublishedPairs {
     current: Arc<WalletServingReadPair>,
-    /// Newest first, at most [`RETAINED_PAIR_LIMIT`] entries.
+    /// Newest first. No two entries share an epoch, and none shares the
+    /// current pair's epoch.
     retained: Vec<RetainedPair>,
 }
 
@@ -191,8 +201,6 @@ impl WalletServingPairSlot {
         let serves = |pair: &WalletServingReadPair| {
             chain_epoch_id.is_some_and(|id| pair.canonical_fence().chain_epoch_id() == id)
         };
-        // A schedule revision republishes the current epoch, so the current
-        // pair wins over a retained pair at the same epoch.
         if serves(&published.current) {
             return Arc::clone(&published.current);
         }
@@ -213,47 +221,30 @@ impl WalletServingPairSlot {
 
     /// Makes `pair` current and retains the pair it replaces.
     ///
-    /// Returns the pairs that leave the slot. Only the publisher writes the
-    /// slot, so the load and store below cannot race another publication.
+    /// Returns the pairs that leave the slot: only retained pairs at `pair`'s
+    /// epoch, which `pair` now answers. A schedule revision republishes the
+    /// current epoch, so the pair it replaces leaves at once instead of
+    /// keeping a generation that no pin can reach. Every other retained pair
+    /// stays until its window ends. Only the publisher writes the slot, so
+    /// the load and store below cannot race another publication.
     fn publish(
         &self,
         pair: Arc<WalletServingReadPair>,
         replaced_at: Instant,
     ) -> Vec<Arc<WalletServingReadPair>> {
         let previous = self.published.load_full();
-        let mut retained = Vec::with_capacity(RETAINED_PAIR_LIMIT + 1);
-        retained.push(RetainedPair {
+        let chain_epoch_id = pair.canonical_fence().chain_epoch_id();
+        let (released, retained): (Vec<_>, Vec<_>) = std::iter::once(RetainedPair {
             pair: Arc::clone(&previous.current),
             replaced_at,
-        });
-        retained.extend(previous.retained.iter().cloned());
-        let released = retained
-            .split_off(RETAINED_PAIR_LIMIT.min(retained.len()))
-            .into_iter()
-            .map(|released| released.pair)
-            .collect();
+        })
+        .chain(previous.retained.iter().cloned())
+        .partition(|retained| retained.pair.canonical_fence().chain_epoch_id() == chain_epoch_id);
         self.published.store(Arc::new(PublishedPairs {
             current: pair,
             retained,
         }));
-        released
-    }
-
-    /// Releases the oldest retained pair that only the slot holds, returning
-    /// it.
-    fn release_oldest_unheld(&self) -> Option<Arc<WalletServingReadPair>> {
-        let previous = self.published.load_full();
-        let index = previous
-            .retained
-            .iter()
-            .rposition(|retained| Arc::strong_count(&retained.pair) == 1)?;
-        let mut retained = previous.retained.clone();
-        let released = retained.remove(index);
-        self.published.store(Arc::new(PublishedPairs {
-            current: Arc::clone(&previous.current),
-            retained,
-        }));
-        Some(released.pair)
+        released.into_iter().map(|released| released.pair).collect()
     }
 
     /// Releases the retained pairs replaced at least [`RETAINED_PAIR_WINDOW`]
@@ -789,34 +780,39 @@ impl WalletServingPairPublisher {
         }
         self.follow_writer_schedule(&writer_status)?;
 
-        let Some(generation) = self.inactive_generation_yielding_retention().await else {
-            metrics::counter!(
-                "zinder_wallet_serving_pair_publisher_generation_wait_total",
-                "reason" => "in_flight_requests"
-            )
-            .increment(1);
+        // Waiting keeps every retained pair pinnable for its whole window. A
+        // later refresh publishes the writer's fence at that time, so the
+        // blocks that arrive meanwhile share one publication.
+        let Some(generation) = self.inactive_generation() else {
+            self.record_generation_wait();
             return Ok(());
         };
         self.prepare_candidate(generation).await?;
         self.converge_and_publish(generation).await
     }
 
-    /// Chooses the next candidate's generation, releasing one retained pair
-    /// that no request holds when every unpublished slot is taken.
+    /// Counts a refresh that found every unpublished slot taken and published
+    /// nothing.
     ///
-    /// Retention is best effort: tip following takes priority over keeping a
-    /// replaced epoch pinnable.
-    async fn inactive_generation_yielding_retention(&mut self) -> Option<usize> {
-        if let Some(generation) = self.inactive_generation() {
-            return Some(generation);
-        }
-        let slot = self.serving_pair_slot.as_ref()?;
-        let yielded = slot.release_oldest_unheld()?;
-        record_retained_pair_count(slot);
-        let now = Instant::now();
-        self.retire_pairs([yielded], now);
-        self.reap_retired_pairs(now).await;
-        self.inactive_generation()
+    /// `retention_window` means a slot holds a replaced pair whose window has
+    /// not ended, so the wait ends by the time that window does at the latest.
+    /// `in_flight_requests` means only released pairs that requests still
+    /// hold take the slots.
+    fn record_generation_wait(&self) {
+        let reason = if self
+            .serving_pair_slot
+            .as_ref()
+            .is_some_and(|slot| slot.retained_pair_count() > 0)
+        {
+            "retention_window"
+        } else {
+            "in_flight_requests"
+        };
+        metrics::counter!(
+            "zinder_wallet_serving_pair_publisher_generation_wait_total",
+            "reason" => reason
+        )
+        .increment(1);
     }
 
     /// Stops serving pins on retained pairs replaced longer ago than the
@@ -921,7 +917,8 @@ impl WalletServingPairPublisher {
     }
 
     /// Chooses the generation slot for the next candidate, or `None` while
-    /// requests still hold the pair of every slot but the published one.
+    /// the slot retains, or requests still hold, the pair of every slot but
+    /// the published one.
     ///
     /// An open candidate is reused first. A drained published slot is
     /// preferred over a vacant one because it is caught up in place instead
@@ -1796,6 +1793,7 @@ mod tests {
     };
 
     use async_trait::async_trait;
+    use metrics_exporter_prometheus::PrometheusBuilder;
     use parking_lot::Mutex;
     use tempfile::TempDir;
     use tokio::net::TcpListener;
@@ -4390,9 +4388,12 @@ mod tests {
 
     /// A block followed by its own refresh is published by its own pair.
     ///
-    /// Once each generation slot has been opened, the next block's candidate
-    /// is a drained generation caught up in place, and the publisher opens no
-    /// further secondaries.
+    /// The blocks arrive at least a third of a retention window apart, so
+    /// three publications span one window and the oldest retained pair ages
+    /// out before the publication that needs its slot. Once each generation
+    /// slot has been opened, the next block's candidate is a drained
+    /// generation caught up in place, and the publisher opens no further
+    /// secondaries.
     #[tokio::test(flavor = "multi_thread")]
     async fn steady_state_publication_recycles_drained_generations()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -4407,10 +4408,11 @@ mod tests {
                 recycled: 0
             }
         );
-        // The two retained pairs keep their generations for a minute, so the
-        // first blocks open the remaining slots before any pair drains.
+        // Each replaced pair keeps its generation for a minute, so the first
+        // blocks open the remaining slots before any pair drains.
         let warm_up_blocks = SECONDARY_GENERATION_COUNT - 1;
         for block in 1..=3 * SECONDARY_GENERATION_COUNT {
+            age_out_retained_pairs(&mut publisher, 2);
             let fence = primaries.append_block()?;
             publisher.refresh_once().await?;
             assert_eq!(
@@ -4486,6 +4488,133 @@ mod tests {
         primaries.shutdown().await
     }
 
+    /// A burst of blocks keeps an epoch pinned before it answering until its
+    /// retention window ends.
+    ///
+    /// Blocks are published until every spare slot holds a pair inside its
+    /// window. Later blocks wait for a slot instead of releasing a pair early,
+    /// while readiness keeps admitting traffic. Once the oldest window ends,
+    /// one refresh publishes the writer's latest fence in the freed slot
+    /// without opening a new one, and the blocks before it get no
+    /// publication of their own.
+    #[tokio::test(flavor = "multi_thread")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the scenario keeps the burst, the coalesced wait, and the release of the pinned pair in one causal sequence"
+    )]
+    async fn a_block_burst_keeps_a_pinned_epoch_and_coalesces_later_blocks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let rendered_metrics = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let mut primaries = AdvancingPrimaries::start().await?;
+        let readiness = zinder_runtime::Readiness::default();
+        let (mut publisher, slot) = primaries.bootstrap_publisher(readiness.clone()).await?;
+        let query = WalletServingQuery::from_serving_pair_slot(
+            slot.clone(),
+            (),
+            Arc::new(primaries.activations.clone()),
+        );
+        let pinned = query.visible_tip_block(None).await?.chain_epoch;
+
+        for block in 1..SECONDARY_GENERATION_COUNT {
+            let fence = primaries.append_block()?;
+            publisher.refresh_once().await?;
+            assert_eq!(slot.capture().canonical_fence(), fence);
+            assert_eq!(
+                query.visible_tip_block(Some(pinned.id)).await?.chain_epoch,
+                pinned,
+                "burst block {block} must keep the pinned epoch"
+            );
+        }
+        let last_published = slot.capture();
+        let mut coalesced = Vec::new();
+        for block in 1..=2 {
+            coalesced.push(primaries.append_block()?);
+            publisher.refresh_once().await?;
+            assert!(
+                Arc::ptr_eq(&slot.capture(), &last_published),
+                "coalesced block {block} must wait for a slot"
+            );
+            assert!(readiness.report().is_ready);
+            assert_eq!(
+                query.visible_tip_block(Some(pinned.id)).await?.chain_epoch,
+                pinned
+            );
+        }
+        assert_eq!(
+            publisher.candidate_preparations,
+            CandidatePreparationCounts {
+                cold: SECONDARY_GENERATION_COUNT,
+                recycled: 0
+            }
+        );
+        assert_eq!(
+            generation_waits(&rendered_metrics.render(), "retention_window"),
+            2
+        );
+
+        let replaced_at = slot
+            .published
+            .load()
+            .retained
+            .iter()
+            .find(|retained| retained.pair.canonical_fence().chain_epoch_id() == pinned.id)
+            .map(|retained| retained.replaced_at)
+            .ok_or("the pinned pair must still be retained")?;
+        publisher
+            .release_expired_pairs(replaced_at + RETAINED_PAIR_WINDOW - Duration::from_millis(1));
+        assert_eq!(slot.retained_pair_count(), SECONDARY_GENERATION_COUNT - 1);
+        publisher.release_expired_pairs(replaced_at + RETAINED_PAIR_WINDOW);
+        assert_eq!(slot.retained_pair_count(), SECONDARY_GENERATION_COUNT - 2);
+        assert!(matches!(
+            query.visible_tip_block(Some(pinned.id)).await,
+            Err(crate::QueryError::ChainEpochPinUnavailable { .. })
+        ));
+
+        publisher.refresh_once().await?;
+        let latest = *coalesced.last().ok_or("the burst must coalesce blocks")?;
+        assert_eq!(slot.capture().canonical_fence(), latest);
+        assert_eq!(
+            publisher.published_generation,
+            Some(0),
+            "the pinned pair's slot is caught up for the latest fence"
+        );
+        assert_eq!(
+            publisher.candidate_preparations,
+            CandidatePreparationCounts {
+                cold: SECONDARY_GENERATION_COUNT,
+                recycled: 1
+            }
+        );
+        for skipped in &coalesced[..coalesced.len() - 1] {
+            assert_eq!(
+                slot.capture_at(Some(skipped.chain_epoch_id()))
+                    .canonical_fence(),
+                latest,
+                "a coalesced block has no pair of its own"
+            );
+        }
+
+        drop(last_published);
+        drop(query);
+        drop(slot);
+        drop(publisher);
+        primaries.shutdown().await
+    }
+
+    /// Reads one `generation_wait_total` series from a Prometheus exposition.
+    fn generation_waits(exposition: &str, reason: &str) -> u64 {
+        let series = format!(
+            "zinder_wallet_serving_pair_publisher_generation_wait_total{{reason=\"{reason}\"}} "
+        );
+        exposition
+            .lines()
+            .find_map(|line| line.strip_prefix(series.as_str()))
+            .and_then(|count| count.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
     /// The publisher opens a slot it has not used only when every opened slot
     /// still holds a retained pair, so the block spacing, not the start,
     /// decides when the last slots open.
@@ -4493,7 +4622,8 @@ mod tests {
     /// Blocks more than one retention window apart alternate between two
     /// slots. The first block within a window of the previous publication
     /// opens the third, and a third publication within one window opens the
-    /// fourth.
+    /// fourth. After that, each block a third of a window after the one before
+    /// reuses the slot whose pair aged out.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_block_burst_opens_the_remaining_slots_after_spaced_blocks()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -4528,13 +4658,14 @@ mod tests {
             );
         }
         for block in 1..=SECONDARY_GENERATION_COUNT {
+            age_out_retained_pairs(&mut publisher, 2);
             let fence = primaries.append_block()?;
             publisher.refresh_once().await?;
             assert_eq!(slot.capture().canonical_fence(), fence);
             assert_eq!(
                 publisher.candidate_preparations,
                 counts(SECONDARY_GENERATION_COUNT, spaced_recycled + block),
-                "later burst block {block} reuses a drained slot"
+                "later block {block} reuses a drained slot"
             );
         }
 
@@ -4618,6 +4749,10 @@ mod tests {
     /// A request that holds a pair freezes its generation: the publisher
     /// publishes every block from the other generations, never catches the
     /// held one up, and recycles it once the request releases it.
+    ///
+    /// The other three slots hold the current pair, the candidate, and one
+    /// retained pair, so the blocks arrive at least half a retention window
+    /// apart.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_held_pair_keeps_its_generation_frozen_while_publication_continues()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -4631,6 +4766,7 @@ mod tests {
             .ok_or("bootstrap must publish a generation")?;
         let held_fence = held.canonical_fence();
         for block in 1..=2 * SECONDARY_GENERATION_COUNT {
+            age_out_retained_pairs(&mut publisher, 1);
             let fence = primaries.append_block()?;
             publisher.refresh_once().await?;
             assert_eq!(
@@ -4683,6 +4819,7 @@ mod tests {
         let readiness = zinder_runtime::Readiness::default();
         let (mut publisher, slot) = primaries.bootstrap_publisher(readiness.clone()).await?;
         for _ in 0..SECONDARY_GENERATION_COUNT {
+            age_out_retained_pairs(&mut publisher, 2);
             primaries.append_block()?;
             publisher.refresh_once().await?;
         }
@@ -4697,6 +4834,7 @@ mod tests {
 
         let fence_before_revision = slot.capture().canonical_fence();
         let extended = primaries.admit_schedule_revision()?;
+        age_out_retained_pairs(&mut publisher, 2);
         publisher.refresh_once().await?;
         let revised_pair = slot.capture();
         assert_eq!(revised_pair.canonical_fence(), fence_before_revision);
@@ -4776,11 +4914,13 @@ mod tests {
         };
         let shared_canonical = Arc::clone(&readers.canonical);
         let bootstrap_fence = shared_canonical.event_fence();
-        // These blocks fill the other slots and release generation 0's pair.
+        // These blocks fill the other slots. The bootstrap pair's window then
+        // ends, which releases generation 0's pair.
         for _ in 1..SECONDARY_GENERATION_COUNT {
             primaries.append_block()?;
             publisher.refresh_once().await?;
         }
+        age_out_retained_pairs(&mut publisher, 2);
 
         let fence = primaries.append_block()?;
         let failure = publisher
@@ -5067,6 +5207,25 @@ mod tests {
         match &publisher.generations[generation].state {
             SecondaryGenerationState::Published { lease, .. } => Some(lease.is_reusable()),
             SecondaryGenerationState::Vacant | SecondaryGenerationState::Candidate { .. } => None,
+        }
+    }
+
+    /// Ends the retention window of every retained pair except the `kept`
+    /// most recently replaced ones, as blocks spaced far enough apart would.
+    ///
+    /// Keeping two models blocks at least a third of a window apart, so three
+    /// publications span the window. Keeping one models blocks at least half
+    /// a window apart, and keeping none models blocks a whole window apart.
+    fn age_out_retained_pairs(publisher: &mut WalletServingPairPublisher, kept: usize) {
+        let newest_aged_out = publisher.serving_pair_slot.as_ref().and_then(|slot| {
+            slot.published
+                .load()
+                .retained
+                .get(kept)
+                .map(|retained| retained.replaced_at)
+        });
+        if let Some(replaced_at) = newest_aged_out {
+            publisher.release_expired_pairs(replaced_at + RETAINED_PAIR_WINDOW);
         }
     }
 
@@ -5365,7 +5524,7 @@ mod retention_tests {
         sample_regtest_upgrade_activations,
     };
 
-    use super::{RETAINED_PAIR_LIMIT, RETAINED_PAIR_WINDOW, WalletServingPairSlot};
+    use super::{RETAINED_PAIR_WINDOW, WalletServingPairSlot};
     use crate::{
         QueryError, TransparentAddressUnspentOutputsRequest, WalletQueryApi, WalletServingQuery,
         WalletServingReadPair,
@@ -5414,27 +5573,28 @@ mod retention_tests {
             (epochs[1], HashSet::from([history.kept, history.created]))
         );
 
-        assert!(
-            slot.publish(
-                Arc::clone(&pairs[2]),
-                first_replaced_at + Duration::from_secs(1)
-            )
-            .is_empty()
-        );
-        assert_eq!(slot.retained_pair_count(), RETAINED_PAIR_LIMIT);
-        assert_eq!(
-            unspent_outpoints(&query, &history, Some(epochs[0]))
-                .await?
-                .0,
-            epochs[0]
-        );
+        // Later publications retain every replaced pair instead of releasing
+        // the oldest one.
+        for (offset_seconds, pair) in [(1, &pairs[2]), (2, &pairs[3])] {
+            assert!(
+                slot.publish(
+                    Arc::clone(pair),
+                    first_replaced_at + Duration::from_secs(offset_seconds)
+                )
+                .is_empty()
+            );
+        }
+        assert_eq!(slot.retained_pair_count(), 3);
+        for epoch in &epochs {
+            assert_eq!(
+                unspent_outpoints(&query, &history, Some(*epoch)).await?.0,
+                *epoch
+            );
+        }
 
-        let released = slot.publish(
-            Arc::clone(&pairs[3]),
-            first_replaced_at + Duration::from_secs(2),
-        );
-        assert_eq!(released.len(), 1);
-        assert!(released.iter().all(|pair| Arc::ptr_eq(pair, &pairs[0])));
+        let expired = slot.release_expired(first_replaced_at + RETAINED_PAIR_WINDOW);
+        assert_eq!(expired.len(), 1);
+        assert!(expired.iter().all(|pair| Arc::ptr_eq(pair, &pairs[0])));
         assert_pin_unavailable(&query, &history, epochs[0]).await?;
         assert_eq!(
             unspent_outpoints(&query, &history, Some(epochs[1]))
@@ -5522,35 +5682,77 @@ mod retention_tests {
         Ok(())
     }
 
-    #[test]
-    fn a_retained_pair_no_request_holds_yields_oldest_first() -> Result<(), Box<dyn Error>> {
+    /// A burst of publications seconds apart keeps a replaced pair answering
+    /// its epoch's pins for exactly one retention window after it was
+    /// replaced.
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_keeps_a_replaced_epoch_pinnable_for_its_whole_window()
+    -> Result<(), Box<dyn Error>> {
+        const BLOCK_INTERVAL: Duration = Duration::from_secs(2);
         let history = address_history()?;
-        let pairs = serving_pairs_through_live_appends(&history.chain, 2)?;
+        let pairs = serving_pairs_through_live_appends(&history.chain, 3)?;
         let epochs: Vec<ChainEpochId> = pairs
             .iter()
             .map(|pair| pair.canonical_fence().chain_epoch_id())
             .collect();
-        let [first, second, third]: [Arc<WalletServingReadPair>; 3] = pairs
-            .try_into()
-            .map_err(|_| "the fixture must build three pairs")?;
-        let slot = WalletServingPairSlot::new(first);
-        assert!(slot.publish(second, Instant::now()).is_empty());
-        assert!(slot.publish(third, Instant::now()).is_empty());
-        let held = slot.capture_at(Some(epochs[0]));
-        assert_eq!(held.canonical_fence().chain_epoch_id(), epochs[0]);
+        let slot = WalletServingPairSlot::new(Arc::clone(&pairs[0]));
+        let replaced_at = Instant::now();
+        for pair in &pairs[1..] {
+            assert!(slot.publish(Arc::clone(pair), Instant::now()).is_empty());
+            tokio::time::advance(BLOCK_INTERVAL).await;
+        }
+        assert!(Arc::ptr_eq(&slot.capture_at(Some(epochs[0])), &pairs[0]));
 
-        let yielded = slot
-            .release_oldest_unheld()
-            .ok_or("the unheld retained pair must yield")?;
-        assert_eq!(yielded.canonical_fence().chain_epoch_id(), epochs[1]);
-        assert!(slot.release_oldest_unheld().is_none());
+        let just_inside_window = RETAINED_PAIR_WINDOW
+            .saturating_sub(replaced_at.elapsed())
+            .saturating_sub(Duration::from_millis(1));
+        tokio::time::advance(just_inside_window).await;
+        assert!(
+            Arc::ptr_eq(&slot.capture_at(Some(epochs[0])), &pairs[0]),
+            "the pin answers until its window ends"
+        );
+        assert!(slot.release_expired(Instant::now()).is_empty());
 
-        drop(held);
-        let yielded = slot
-            .release_oldest_unheld()
-            .ok_or("the released hold must let the oldest pair yield")?;
-        assert_eq!(yielded.canonical_fence().chain_epoch_id(), epochs[0]);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(
+            Arc::ptr_eq(&slot.capture_at(Some(epochs[0])), &pairs[3]),
+            "a pin past its window falls through to the current pair"
+        );
+        let expired = slot.release_expired(Instant::now());
+        assert_eq!(expired.len(), 1);
+        assert!(expired.iter().all(|pair| Arc::ptr_eq(pair, &pairs[0])));
+        assert!(Arc::ptr_eq(&slot.capture_at(Some(epochs[1])), &pairs[1]));
+        Ok(())
+    }
+
+    #[test]
+    fn a_pair_republished_at_its_own_epoch_leaves_the_slot_at_once() -> Result<(), Box<dyn Error>> {
+        let history = address_history()?;
+        let mut writer = CanonicalWriterFixture::publish(
+            &CanonicalBaseline::new(&history.chain).through(BlockHeight::new(1)),
+            &sample_regtest_upgrade_activations(),
+        )?;
+        let first = serving_pair(&mut writer)?;
+        let republished = serving_pair(&mut writer)?;
+        let epoch = first.canonical_fence().chain_epoch_id();
+        assert_eq!(republished.canonical_fence().chain_epoch_id(), epoch);
+        let slot = WalletServingPairSlot::new(Arc::clone(&first));
+
+        let released = slot.publish(Arc::clone(&republished), Instant::now());
+        assert_eq!(released.len(), 1);
+        assert!(released.iter().all(|pair| Arc::ptr_eq(pair, &first)));
         assert_eq!(slot.retained_pair_count(), 0);
+        assert!(Arc::ptr_eq(&slot.capture_at(Some(epoch)), &republished));
+
+        writer.append_live_block(&history.chain)?;
+        assert!(
+            slot.publish(serving_pair(&mut writer)?, Instant::now())
+                .is_empty()
+        );
+        assert!(
+            Arc::ptr_eq(&slot.capture_at(Some(epoch)), &republished),
+            "the republished pair answers its epoch once it is replaced"
+        );
         Ok(())
     }
 

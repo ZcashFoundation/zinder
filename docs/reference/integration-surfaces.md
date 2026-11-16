@@ -104,10 +104,11 @@ creating spends against it until an operator reconciles the indexer.
 Capture calls `current_epoch` once. A remote that no longer serves the
 captured epoch returns `IndexerError::ChainEpochPinUnavailable`; its retry
 policy is `RefreshChainEpoch`. The released wallet-serving runtime keeps
-serving its two most recently replaced epochs, each for at most one minute
-after it was replaced, so a snapshot workflow whose reads send the pinned
-epoch id normally finishes across a new block. A transparent-history first
-page sends no epoch id and is answered from the current epoch, so it fails
+serving each replaced epoch for one minute after it was replaced, however fast
+later blocks arrive. A snapshot workflow whose reads send the pinned epoch id
+therefore finishes across new blocks when it ends within that minute. A
+transparent-history first page sends no epoch id and is answered from the
+current epoch, so it fails
 after a new block even while the old epoch is retained. Consumers must still refresh and restart the workflow on this error
 rather than assume longer retention. Implementations may retain older epochs,
 but may serve a pin only when they can answer that exact canonical epoch.

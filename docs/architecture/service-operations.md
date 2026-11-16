@@ -592,11 +592,11 @@ remain separate from pair-maintenance metrics.
 
 A request keeps the pair it captured open while it reads, which pins that
 pair's secondary generation. The publisher rotates through four generation
-slots: the current pair, the candidate, and two for replaced pairs, which are
-either retained for pinned reads or retired but still held by a request. When
-a held retired pair leaves no slot free, the publisher releases a retained
-pair that no request holds, so publication continues while up to two retired
-pairs are pinned.
+slots. The current pair takes one. Each of the other three holds the
+candidate, a replaced pair retained for pinned reads, or a retired pair that a
+request still holds. A replaced pair stays retained for one minute after it
+was replaced, so a pin on its epoch is answered for that minute however fast
+blocks arrive. While no slot is free, the publisher publishes nothing.
 
 The publisher opens a generation slot cold the first time it uses it: it opens
 both secondaries and runs their full admission, which takes about 25 seconds
@@ -608,8 +608,9 @@ opens on the first block that arrives within one minute of the previous
 publication, because the pair that publication replaced is still retained. The
 fourth opens the first time three publications fall within one minute, or when
 a request still holds a released pair. With 75-second blocks, these opens can
-come long after startup. A slot whose catch-up or publication fails is closed
-and opened cold again when it is next used.
+come long after startup. Once all four are open, the publisher never opens
+another slot to keep up with blocks. A slot whose catch-up or publication
+fails is closed and opened cold again when it is next used.
 
 An opened slot stays open after its pair drains, and its secondaries keep the
 primary files of their last catch-up, including files the primaries have
@@ -647,6 +648,21 @@ of its canonical commit. To measure that delay, match each
 the commit's `chain_event_sequence`. A block that needs a slot not yet opened
 waits for that cold open instead.
 
+Blocks also share a publication when more than three arrive within one
+minute. The three replaced pairs are then all inside their retention minute,
+so no slot is free, and the next block waits until the oldest pair's minute
+ends. The first refresh after that publishes the writer's latest fence, and
+every block committed during the wait shares that publication. Each such
+refresh counts as a wait with `reason="retention_window"`. With 75-second
+blocks this happens only in bursts. It also happens while ingest catches up
+after a stall, when the publisher would otherwise publish once per refresh.
+Readiness keeps admitting traffic during the wait, and reports
+`serving_pair_stale` once the writer is more than
+`storage.secondary_replica_lag_threshold_chain_epochs` ahead. A wait ends
+within about 90 seconds of the previous publication, well inside the
+five-minute default of `storage.serving_pair_staleness_ceiling_ms`. A ceiling
+set below 90 seconds can stop traffic during a long burst.
+
 A request may keep reading a retired pair for at most 30 seconds after the
 publisher retired it. Past that read limit the publisher revokes reads on the
 pair. The `TransparentAddressUnspentOutputs` and `FullBlocksInRange` streams,
@@ -655,16 +671,21 @@ page or while they wait for a slow client, end with
 `CHAIN_EPOCH_PIN_UNAVAILABLE`, and drop the pair. Every other read is one
 bounded blocking read that finishes on its own. A stream whose client cancels or disconnects stops after
 the page in progress. A slow or abandoned stream can therefore hold
-publication for at most the read limit plus one page read.
+publication for at most the read limit plus one page read after its pair
+leaves retention. Retention and slow streams together hold a publication for
+at most about 90 seconds.
 
 `zinder_wallet_serving_pair_publisher_pinned_retired_pairs` reports how many
-retired pairs requests still hold, and
-`zinder_wallet_serving_pair_publisher_generation_wait_total{reason="in_flight_requests"}`
-counts refreshes that found every unpublished slot pinned and published
-nothing. `zinder_wallet_serving_pair_publisher_revoked_pairs_total` counts the
+retired pairs requests still hold.
+`zinder_wallet_serving_pair_publisher_generation_wait_total{reason}` counts
+refreshes that found every unpublished slot taken and published nothing:
+`retention_window` while a retained pair takes a slot, and
+`in_flight_requests` while only retired pairs that requests hold take them.
+`zinder_wallet_serving_pair_publisher_revoked_pairs_total` counts the
 retired pairs whose reads the publisher revoked, and each revocation logs a
-`wallet_serving_pair_reads_revoked` warning with the pair's chain epoch. Waits
-that keep rising while revocations stay flat point at reads that never check
+`wallet_serving_pair_reads_revoked` warning with the pair's chain epoch.
+`in_flight_requests` waits that keep rising while revocations stay flat point
+at reads that never check
 for revocation; revocations that keep rising point at clients whose streams
 outlast the read limit, such as a client that stops consuming an unspent-output
 stream without cancelling it.

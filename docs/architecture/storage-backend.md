@@ -190,12 +190,14 @@ its incremental check fails. Per-transition cost therefore follows the rows a
 transition changes rather than the reorg window.
 
 `zinder-query` and the transparent-serving `zinder-compat-lightwalletd` rotate
-through four secondary generation slots: the current pair, the candidate the
-reader catches up and validates before publishing it, and two for replaced
-pairs. A replaced pair is either retained, still answering reads pinned to its
-epoch, or retired but held by an in-flight request; a retained pair gives up
-its slot when a held retired pair needs it. In-flight requests keep their
-existing immutable pair, which pins its generation until they finish. A
+through four secondary generation slots. The current pair takes one. Each of
+the others holds the candidate the reader catches up and validates before
+publishing it, or a replaced pair. A replaced pair is either retained, still
+answering reads pinned to its epoch for one minute after it was replaced, or
+retired but held by an in-flight request. While no slot is free, the reader
+publishes nothing, and its next publication carries the writer's latest fence.
+In-flight requests keep their existing immutable pair, which pins its
+generation until they finish. A
 transparent-output scan whose request is dropped stops at its next page and
 releases its pair. A slot is opened and cold-admitted the first time the
 reader uses it, and again only after a failed catch-up or publication closes
