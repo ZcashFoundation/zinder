@@ -619,10 +619,14 @@ docker compose --env-file /etc/zinder/env \
   -f /opt/zinder/deploy/docker-compose.yml up -d zinder-projector
 ```
 
-The projector can hold up to the limit in memory while it plans and publishes
-one transition, so keep at least the bytes you add to the limit free under its
-memory limit, `ZINDER_PROJECTOR_MEMORY_LIMIT`, which defaults to `10g`. Memory
-use at the maximum has not been measured.
+While the projector plans and publishes one transition, its resident memory
+grows by about 0.7 to 1.5 times the bytes the transition accounts, depending
+on the blocks it replaces. Measured on Testnet with
+`zinder-bench rocksdb-tip-reorg`, a 1,000-block reorg that accounted 350 MB
+grew resident memory by 0.24 to 0.33 GB, and one that accounted 796 MB grew it
+by 1.09 to 1.18 GB. Keep at least 1.5 times the bytes you add to the limit free
+under the projector's memory limit, `ZINDER_PROJECTOR_MEMORY_LIMIT`, which
+defaults to `10g`.
 
 If `<n>` already exceeds `1073741824`, or the failure repeats at the maximum,
 no setting admits the transition. Rebuild the wallet in lane B as described

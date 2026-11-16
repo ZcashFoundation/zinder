@@ -5814,6 +5814,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "zebra-chain",
  "zinder-core",
  "zinder-ingest",
  "zinder-materialized-views",

@@ -8,7 +8,9 @@
 //! stores stay separate databases, as they are in production.
 
 mod compare;
+mod fork;
 mod measurement;
+mod reorg;
 mod report;
 mod scratch;
 mod session;
@@ -41,6 +43,7 @@ use zinder_wallet_rocksdb::MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES;
 
 pub(crate) use compare::{CompareTipReplayReportsArgs, run_compare_tip_replay_reports};
 use measurement::{BlockSample, BlockWorkload, PERCENTILE_METHOD, STRATUM_RULES};
+pub(crate) use reorg::{RocksDbTipReorgArgs, run_rocksdb_tip_reorg};
 use report::{
     BudgetRecord, Configuration, FenceRecord, FixtureInput, Inputs, IoModeConfiguration, IoModes,
     KeptScratch, Method, ProcessResources, Provenance, RepeatReport, RequestedIoModes, StoreInput,
@@ -82,6 +85,19 @@ pub(crate) struct RocksDbTipReplayArgs {
     /// Replays to run, each from fresh scratch copies.
     #[arg(long, default_value_t = 1)]
     repeat: u32,
+    #[command(flatten)]
+    stores: ReplayStoreArgs,
+    /// Keep the final repeat's scratch stores instead of deleting them.
+    #[arg(long)]
+    keep_scratch: bool,
+    /// Free-form label copied into the report.
+    #[arg(long)]
+    label: Option<String>,
+}
+
+/// Store settings shared by the replay commands.
+#[derive(Args)]
+pub(crate) struct ReplayStoreArgs {
     /// Raw-blob retention persisted in the canonical store.
     #[arg(
         long = "raw-blob-retention",
@@ -121,16 +137,31 @@ pub(crate) struct RocksDbTipReplayArgs {
     )]
     wallet_io_mode: RocksDbIoMode,
     /// Collect the wallet store's `RocksDB` statistics tickers and report their
-    /// per-block deltas. Off by default, which also opens the wallet store with
-    /// statistics collection off, because collection can perturb timings.
+    /// deltas for each wallet transition the report times. Off by default, which
+    /// also opens the wallet store with statistics collection off, because
+    /// collection can perturb timings.
     #[arg(long = "wallet-rocksdb-statistics")]
     wallet_rocksdb_statistics: bool,
-    /// Keep the final repeat's scratch stores instead of deleting them.
-    #[arg(long)]
-    keep_scratch: bool,
-    /// Free-form label copied into the report.
-    #[arg(long)]
-    label: Option<String>,
+}
+
+impl ReplayStoreArgs {
+    fn requested_io_modes(&self) -> RequestedIoModes {
+        RequestedIoModes {
+            canonical: self.canonical_io_mode.as_str().to_owned(),
+            wallet: self.wallet_io_mode.as_str().to_owned(),
+        }
+    }
+
+    fn wallet_statistics(&self) -> WalletStatisticsConfiguration {
+        WalletStatisticsConfiguration {
+            collected: self.wallet_rocksdb_statistics,
+            tickers: if self.wallet_rocksdb_statistics {
+                statistics::reported_ticker_names()
+            } else {
+                Vec::new()
+            },
+        }
+    }
 }
 
 /// Validated inputs and settings for every repeat.
@@ -265,7 +296,7 @@ impl TipReplayPlan {
             scratch_parent,
             canonical_store_bytes.saturating_add(wallet_store_bytes),
         )?;
-        let settings = store_settings(&args, &manifest)?;
+        let settings = store_settings(&args.stores, &manifest)?;
         tracing::info!(
             target: "zinder::bench",
             event = "tip_replay_admitted",
@@ -303,6 +334,10 @@ fn validate_scalar_args(args: &RocksDbTipReplayArgs) -> Result<(), BenchError> {
             "--repeat must be greater than zero",
         ));
     }
+    validate_max_transition_logical_bytes(&args.stores)
+}
+
+fn validate_max_transition_logical_bytes(args: &ReplayStoreArgs) -> Result<(), BenchError> {
     if args.max_transition_logical_bytes == 0
         || args.max_transition_logical_bytes > MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES
     {
@@ -314,7 +349,7 @@ fn validate_scalar_args(args: &RocksDbTipReplayArgs) -> Result<(), BenchError> {
 }
 
 fn store_settings(
-    args: &RocksDbTipReplayArgs,
+    args: &ReplayStoreArgs,
     manifest: &FixtureManifest,
 ) -> Result<StoreSettings, BenchError> {
     let budget_override =
@@ -569,7 +604,7 @@ fn build_report(
         },
         aggregate,
         unavailable_measurements: report::unavailable_measurements(
-            plan.args.wallet_rocksdb_statistics,
+            plan.args.stores.wallet_rocksdb_statistics,
         ),
         repeats,
     })
@@ -634,7 +669,7 @@ fn report_configuration(plan: &TipReplayPlan, first: &RepeatOutcome) -> Configur
         scratch_directory: plan.scratch_dir.display().to_string(),
         keep_scratch: plan.args.keep_scratch,
         raw_blob_retention: plan.settings.raw_blob_retention.as_kebab_case().to_owned(),
-        requested_reorg_window_blocks: plan.args.reorg_window_blocks,
+        requested_reorg_window_blocks: plan.args.stores.reorg_window_blocks,
         effective_reorg_window_blocks: first.effective_reorg_window_blocks,
         max_transition_logical_bytes: plan.settings.max_transition_logical_bytes.get(),
         canonical_writer_budget: BudgetRecord::from(plan.settings.canonical_writer_budget),
@@ -642,20 +677,10 @@ fn report_configuration(plan: &TipReplayPlan, first: &RepeatOutcome) -> Configur
         wallet_budget: BudgetRecord::from(plan.settings.wallet_budget),
         rocksdb_io_mode: IoModeConfiguration {
             policy: "direct opens with direct I/O and falls back to buffered I/O when direct I/O cannot open; buffered skips the direct attempt".to_owned(),
-            requested: RequestedIoModes {
-                canonical: plan.args.canonical_io_mode.as_str().to_owned(),
-                wallet: plan.args.wallet_io_mode.as_str().to_owned(),
-            },
+            requested: plan.args.stores.requested_io_modes(),
             resolved: IoModes::from(&first.finished.io_modes),
         },
-        wallet_statistics: WalletStatisticsConfiguration {
-            collected: plan.args.wallet_rocksdb_statistics,
-            tickers: if plan.args.wallet_rocksdb_statistics {
-                statistics::reported_ticker_names()
-            } else {
-                Vec::new()
-            },
-        },
+        wallet_statistics: plan.args.stores.wallet_statistics(),
         event_retention_pruning: "disabled".to_owned(),
     }
 }

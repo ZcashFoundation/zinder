@@ -39,7 +39,8 @@ use zinder_wallet_projection::{
 
 use crate::{
     RocksDbWalletError, WalletBuildLeaseHeartbeat, WalletColdValidationPhaseDurations,
-    build_lock::WalletBuildLock, projection_load::PreparedWalletProjectionLoad,
+    WalletTransitionFootprint, build_lock::WalletBuildLock,
+    projection_load::PreparedWalletProjectionLoad,
 };
 
 #[cfg(test)]
@@ -239,6 +240,7 @@ pub struct RocksDbWalletStore {
     /// append planned on a verified suffix. `None` until the handle's first
     /// transition reads the whole suffix.
     pub(crate) verified_undo_suffix_generation: Option<u64>,
+    pub(crate) last_transition_footprint: Option<WalletTransitionFootprint>,
 }
 
 /// A cold-admitted READY wallet held only for canonical following.
@@ -742,6 +744,7 @@ impl ValidatedRocksDbWalletBuild {
             control: ready_control,
             ready_evidence,
             verified_undo_suffix_generation: None,
+            last_transition_footprint: None,
         })
     }
 }
@@ -809,6 +812,7 @@ impl RocksDbWalletStore {
                 ready_evidence: ready_evidence.clone(),
                 control,
                 verified_undo_suffix_generation: None,
+                last_transition_footprint: None,
             },
         })
     }
@@ -817,6 +821,13 @@ impl RocksDbWalletStore {
     #[must_use]
     pub const fn ready_evidence(&self) -> &WalletProjectionReadyEvidence {
         &self.ready_evidence
+    }
+
+    /// Returns the size of the last transition this handle published, or
+    /// `None` before its first.
+    #[must_use]
+    pub const fn last_transition_footprint(&self) -> Option<WalletTransitionFootprint> {
+        self.last_transition_footprint
     }
 
     /// Returns the store's immutable network.
@@ -1368,6 +1379,13 @@ impl RocksDbWalletFollowingStore {
     #[must_use]
     pub const fn ready_evidence(&self) -> &WalletProjectionReadyEvidence {
         self.store.ready_evidence()
+    }
+
+    /// Returns the size of the last transition this handle published, or
+    /// `None` before its first.
+    #[must_use]
+    pub const fn last_transition_footprint(&self) -> Option<WalletTransitionFootprint> {
+        self.store.last_transition_footprint()
     }
 
     /// Returns the immutable network admitted from the persisted wallet control.

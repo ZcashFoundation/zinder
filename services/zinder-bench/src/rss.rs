@@ -32,31 +32,57 @@ pub fn peak_rss() -> PeakRss {
     }
 }
 
+/// Reads the process's current resident set size, or `None` off Linux.
+#[must_use]
+pub fn current_rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        proc_status_bytes("VmRSS:")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Resets the process peak resident set size to its current size, so a later
+/// [`peak_rss`] covers only what follows. Returns whether the reset happened;
+/// it needs Linux 4.0 or later.
+#[must_use]
+pub fn reset_peak_rss() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::write("/proc/self/clear_refs", b"5").is_ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn linux_peak_rss() -> PeakRss {
-    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
-        return PeakRss {
-            bytes: None,
-            source: PEAK_RSS_SOURCE_UNAVAILABLE,
-        };
-    };
-    for line in status.lines() {
-        let Some(rest) = line.strip_prefix("VmHWM:") else {
-            continue;
-        };
-        let kib = rest
-            .split_whitespace()
-            .next()
-            .and_then(|field| field.parse::<u64>().ok());
-        if let Some(kib) = kib {
-            return PeakRss {
-                bytes: Some(kib.saturating_mul(1024)),
-                source: PEAK_RSS_SOURCE_PROC_VMHWM,
-            };
-        }
-    }
+    let bytes = proc_status_bytes("VmHWM:");
     PeakRss {
-        bytes: None,
-        source: PEAK_RSS_SOURCE_UNAVAILABLE,
+        bytes,
+        source: if bytes.is_some() {
+            PEAK_RSS_SOURCE_PROC_VMHWM
+        } else {
+            PEAK_RSS_SOURCE_UNAVAILABLE
+        },
     }
+}
+
+/// Reads one kibibyte field of `/proc/self/status`, in bytes.
+#[cfg(target_os = "linux")]
+fn proc_status_bytes(field: &str) -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|line| {
+        line.strip_prefix(field)?
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()
+            .map(|kib| kib.saturating_mul(1024))
+    })
 }

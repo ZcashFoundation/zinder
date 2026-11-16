@@ -106,7 +106,12 @@ therefore appears in the batch once. The transition's logical-byte limit
 key and final value twice, once for the plan and once for the batch, and the
 control record once. The planner refuses a transition at the first change that
 would exceed the limit, before it writes anything, so the wallet stays
-unchanged.
+unchanged. After each publication, the store handle keeps a
+`WalletTransitionFootprint` for that transition. It records the bytes the
+transition held against the limit, its distinct planned rows, the records and
+encoded bytes of its write batch, its durable point reads, and the time of the
+synchronous write. A refusal leaves the previous footprint in place.
+`zinder-bench rocksdb-tip-reorg` reports it for a deep reorg.
 
 Within one transition, the planner remembers each output, address-index,
 balance, and address-transaction row it reads, including a row it finds

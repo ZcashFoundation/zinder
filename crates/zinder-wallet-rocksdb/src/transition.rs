@@ -9,6 +9,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     num::NonZeroU64,
+    time::{Duration, Instant},
 };
 
 use rust_rocksdb::{WriteBatch, WriteOptions};
@@ -144,6 +145,26 @@ enum UndoSuffixCheck {
 /// dropped before the batch is built.
 pub const MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// What one published wallet transition planned, read, and wrote.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct WalletTransitionFootprint {
+    /// Logical bytes the transition held against its ceiling, under the rule
+    /// [`MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES`] describes.
+    pub accounted_logical_bytes: u64,
+    /// Distinct rows the transition wrote or deleted, not counting the
+    /// control record.
+    pub planned_rows: u64,
+    /// Records in the published write batch, including the control record.
+    pub batch_records: u64,
+    /// Encoded size of the published write batch.
+    pub batch_bytes: u64,
+    /// Point reads the plan made against the store.
+    pub durable_point_reads: u64,
+    /// Time the synchronous batch write took.
+    pub write_duration: Duration,
+}
+
 impl RocksDbWalletStore {
     /// Applies one exact retained canonical event and its bounded replay rows atomically.
     ///
@@ -268,12 +289,8 @@ impl RocksDbWalletStore {
             resulting_fence.chain_event_sequence(),
             event_cursor,
         )?;
-        let (planned_rows, ready_evidence, logical_bytes) =
-            planner.into_publication(source_position);
         self.publish_planned_transition(
-            planned_rows,
-            ready_evidence,
-            logical_bytes,
+            planner.into_publication(source_position),
             cancelled_before_write,
         )
     }
@@ -409,26 +426,26 @@ impl RocksDbWalletStore {
             target_fence.chain_event_sequence(),
             event_cursor,
         )?;
-        let (planned_rows, ready_evidence, logical_bytes) =
-            planner.into_publication(source_position);
         self.publish_planned_transition(
-            planned_rows,
-            ready_evidence,
-            logical_bytes,
+            planner.into_publication(source_position),
             cancelled_before_write,
         )
     }
 
     fn publish_planned_transition<Cancel>(
         &mut self,
-        planned_rows: PlannedRows,
-        ready_evidence: WalletProjectionReadyEvidence,
-        mut logical_bytes: TransitionLogicalByteAccounting,
+        publication: PlannedPublication,
         cancelled_before_write: Cancel,
     ) -> Result<(), RocksDbWalletError>
     where
         Cancel: FnOnce() -> bool,
     {
+        let PlannedPublication {
+            rows: planned_rows,
+            ready_evidence,
+            mut logical_bytes,
+            durable_point_reads,
+        } = publication;
         let writer_generation = self
             .control
             .writer_generation
@@ -446,6 +463,7 @@ impl RocksDbWalletStore {
             zinder_wallet_projection::WALLET_STORE_CONTROL_KEY,
             &encoded_control,
         )?;
+        let planned_row_count = u64::try_from(planned_rows.len()).unwrap_or(u64::MAX);
         let batch = coalesced_write_batch(
             &self.bounded_open,
             planned_rows,
@@ -465,12 +483,14 @@ impl RocksDbWalletStore {
         // transition reads the whole suffix again.
         self.verified_undo_suffix_generation = None;
         crash_point("wallet_projection.transition.before_atomic_write");
+        let write_started = Instant::now();
         self.bounded_open
             .db
             .write_opt(&batch, &write_options)
             .map_err(|source| {
                 RocksDbWalletError::rocksdb("atomic wallet projection transition", source)
             })?;
+        let write_duration = write_started.elapsed();
         crash_point("wallet_projection.transition.after_atomic_write");
 
         self.control = next_control;
@@ -482,6 +502,14 @@ impl RocksDbWalletStore {
             });
         }
         self.verified_undo_suffix_generation = Some(self.control.writer_generation);
+        self.last_transition_footprint = Some(WalletTransitionFootprint {
+            accounted_logical_bytes: logical_bytes.accounted_bytes(),
+            planned_rows: planned_row_count,
+            batch_records: u64::try_from(batch.len()).unwrap_or(u64::MAX),
+            batch_bytes: u64::try_from(batch.size_in_bytes()).unwrap_or(u64::MAX),
+            durable_point_reads,
+            write_duration,
+        });
         Ok(())
     }
 
@@ -968,11 +996,15 @@ impl TransitionLogicalByteAccounting {
         Ok(())
     }
 
+    /// Bytes the planned rows and their write batch hold against the limit.
+    const fn accounted_bytes(&self) -> u64 {
+        self.overlay.saturating_mul(2).saturating_add(self.control)
+    }
+
     /// Bytes of the limit that the planned rows and their write batch leave
     /// unused.
     const fn unused_bytes(&self) -> u64 {
-        self.limit
-            .saturating_sub(self.overlay.saturating_mul(2).saturating_add(self.control))
+        self.limit.saturating_sub(self.accounted_bytes())
     }
 }
 
@@ -1004,6 +1036,14 @@ type OverlayKey = (&'static str, Vec<u8>);
 /// The final value of every row one plan touches, or `None` for a row it
 /// deletes.
 type PlannedRows = BTreeMap<OverlayKey, Option<Vec<u8>>>;
+
+/// A finished plan, ready to publish.
+struct PlannedPublication {
+    rows: PlannedRows,
+    ready_evidence: WalletProjectionReadyEvidence,
+    logical_bytes: TransitionLogicalByteAccounting,
+    durable_point_reads: u64,
+}
 
 /// Write-batch header bytes: an 8-byte sequence number and a 4-byte count.
 const WRITE_BATCH_HEADER_BYTES: usize = 12;
@@ -1128,6 +1168,7 @@ struct WalletTransitionPlanner<'store> {
     store: &'store RocksDbWalletStore,
     overlay: PlannedRows,
     durable_reads: DurableReadMemo,
+    durable_point_reads: u64,
     logical_bytes: TransitionLogicalByteAccounting,
     accumulator: WalletProjectionDigestBuilder,
     accumulator_row_counts: zinder_wallet_projection::WalletProjectionFamilyRowCounts,
@@ -1145,6 +1186,7 @@ impl<'store> WalletTransitionPlanner<'store> {
             store,
             overlay: BTreeMap::new(),
             durable_reads: DurableReadMemo::default(),
+            durable_point_reads: 0,
             logical_bytes: TransitionLogicalByteAccounting::new(max_logical_bytes),
             accumulator: WalletProjectionDigestBuilder::from_parts(
                 store.ready_evidence.projection_accumulator.clone(),
@@ -1197,16 +1239,12 @@ impl<'store> WalletTransitionPlanner<'store> {
     fn into_publication(
         self,
         source_position: WalletProjectionSourcePosition,
-    ) -> (
-        PlannedRows,
-        WalletProjectionReadyEvidence,
-        TransitionLogicalByteAccounting,
-    ) {
+    ) -> PlannedPublication {
         let (projection_accumulator, projection_digest) =
             self.accumulator.finish_with_accumulator();
-        (
-            self.overlay,
-            WalletProjectionReadyEvidence {
+        PlannedPublication {
+            rows: self.overlay,
+            ready_evidence: WalletProjectionReadyEvidence {
                 source_position,
                 source_sequence_digest: self.source_sequence_digest,
                 settled_tip: self.settled_tip,
@@ -1215,8 +1253,9 @@ impl<'store> WalletTransitionPlanner<'store> {
                 row_counts: self.accumulator_row_counts,
                 utxo_summary: self.utxo_summary,
             },
-            self.logical_bytes,
-        )
+            logical_bytes: self.logical_bytes,
+            durable_point_reads: self.durable_point_reads,
+        }
     }
 
     fn apply_replay(
@@ -1524,7 +1563,7 @@ impl<'store> WalletTransitionPlanner<'store> {
     }
 
     fn require_publishable_undo_suffix(
-        &self,
+        &mut self,
         check: UndoSuffixCheck,
     ) -> Result<(), RocksDbWalletError> {
         let undo_count = self.accumulator_row_counts.reorg_undo_count;
@@ -1828,7 +1867,7 @@ impl<'store> WalletTransitionPlanner<'store> {
     /// Decodes one retained undo row in place, from the plan's overlay or a
     /// pinned durable value, for a plan that keeps the row.
     fn inspect_undo(
-        &self,
+        &mut self,
         height: BlockHeight,
     ) -> Result<Option<WalletReorgUndo>, RocksDbWalletError> {
         let key = height.value().to_be_bytes();
@@ -1840,6 +1879,7 @@ impl<'store> WalletTransitionPlanner<'store> {
         }
         let column_family = column_family(&self.store.bounded_open, REORG_UNDO_COLUMN_FAMILY)?;
         count_undo_row_work(REORG_UNDO_COLUMN_FAMILY, UndoRowWork::DurableRead);
+        self.durable_point_reads = self.durable_point_reads.saturating_add(1);
         self.store
             .bounded_open
             .db
@@ -2072,6 +2112,7 @@ impl<'store> WalletTransitionPlanner<'store> {
         } else {
             let column_family = column_family(&self.store.bounded_open, column_family_name)?;
             count_undo_row_work(column_family_name, UndoRowWork::DurableRead);
+            self.durable_point_reads = self.durable_point_reads.saturating_add(1);
             let encoded = self
                 .store
                 .bounded_open
@@ -3594,6 +3635,7 @@ mod tests {
             bounded_open,
             control,
             verified_undo_suffix_generation: None,
+            last_transition_footprint: None,
         })
     }
 
@@ -3834,11 +3876,18 @@ mod tests {
             take_undo_row_work();
             let keys_read_before = wallet_keys_read(&wallet);
             apply_next_coinbase_only_event_at_depth(&mut wallet, &secondary, depth)?;
+            let keys_read = wallet_keys_read(&wallet) - keys_read_before;
+            // The control record is read by a scan, so the store's point-read
+            // ticker counts exactly the plan's point reads.
+            let footprint = wallet
+                .last_transition_footprint()
+                .ok_or("a published append records its footprint")?;
+            assert_eq!(footprint.durable_point_reads, keys_read, "height {height}");
             observed.push((
                 height,
                 AppendWork {
                     undo_rows: take_undo_row_work(),
-                    keys_read: wallet_keys_read(&wallet) - keys_read_before,
+                    keys_read,
                 },
             ));
             // Every append reads its new undo key once to prove it absent.
@@ -4397,8 +4446,9 @@ mod tests {
             vec![3; 8],
         )?;
         planner.delete_raw(TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY, &address_key)?;
-        let (planned_rows, _, _) =
-            planner.into_publication(wallet.ready_evidence().source_position);
+        let planned_rows = planner
+            .into_publication(wallet.ready_evidence().source_position)
+            .rows;
         assert_eq!(planned_rows.len(), 3);
 
         let control = wallet.control.encode()?;
@@ -4464,6 +4514,7 @@ mod tests {
 
             let control_before = decode_only_control(&fixture.wallet.bounded_open)?;
             let evidence_before = fixture.wallet.ready_evidence().clone();
+            let footprint_before = fixture.wallet.last_transition_footprint();
             let refused = fixture.apply_reorg(required - 1)?;
             assert!(
                 matches!(
@@ -4481,13 +4532,27 @@ mod tests {
                 control_before
             );
             assert_eq!(wallet_rows(&fixture.wallet)?, before);
+            assert_eq!(fixture.wallet.last_transition_footprint(), footprint_before);
 
             let keys_written_before = wallet_keys_written(&fixture.wallet);
+            let keys_read_before = wallet_keys_read(&fixture.wallet);
             fixture.apply_reorg(required)??;
             assert_eq!(
                 wallet_keys_written(&fixture.wallet) - keys_written_before,
                 u64::try_from(touched.len() + 1)?,
                 "{replacement:?}"
+            );
+            let footprint = fixture
+                .wallet
+                .last_transition_footprint()
+                .ok_or("a published reorg records its footprint")?;
+            assert_eq!(footprint.accounted_logical_bytes, required);
+            assert_eq!(footprint.planned_rows, u64::try_from(touched.len())?);
+            assert_eq!(footprint.batch_records, footprint.planned_rows + 1);
+            assert!(footprint.batch_bytes > u64::try_from(final_entry_bytes)?);
+            assert_eq!(
+                footprint.durable_point_reads,
+                wallet_keys_read(&fixture.wallet) - keys_read_before
             );
             assert_eq!(wallet_rows(&fixture.wallet)?, after, "{replacement:?}");
             assert_eq!(

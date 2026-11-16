@@ -13,8 +13,8 @@ use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 use zinder_bench::{BenchError, tip_replay_checkpoints::TipReplayNodeSource};
 use zinder_core::{
-    BlockHeight, BlockId, CommitmentTreeCheckpoint, Network, NetworkUpgradeActivations,
-    ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange,
+    BlockHeight, BlockHeightRange, BlockId, CommitmentTreeCheckpoint, Network,
+    NetworkUpgradeActivations, ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange,
 };
 use zinder_ingest::{
     CanonicalFollowConfig, CanonicalFollower, DEFAULT_MAX_REPLACEMENT_BYTES,
@@ -27,15 +27,18 @@ use zinder_source::{
 };
 use zinder_store::{
     CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalEventKind, CanonicalReorgPolicy,
-    CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalSecondary, RocksDbCanonicalStore,
-    RocksDbResourceBudget,
+    CanonicalRetainedEvent, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalSecondary,
+    RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 use zinder_wallet_projection::{
     WalletCanonicalSourceIdentity, WalletProjectionReadyEvidence, WalletProjectionSourcePosition,
 };
-use zinder_wallet_rocksdb::{RocksDbWalletFollowingStore, RocksDbWalletStore};
+use zinder_wallet_rocksdb::{
+    RocksDbWalletError, RocksDbWalletFollowingStore, RocksDbWalletStore, WalletTransitionFootprint,
+};
 
 use super::{
+    fork::ForkedFixtureSource,
     measurement::{BlockTimings, BlockWorkload},
     statistics::{TickerDeltas, TickerSnapshot},
 };
@@ -46,6 +49,9 @@ const LIVE_COMMIT_HISTOGRAM: &str = "zinder_ingest_canonical_live_commit_seconds
 const LIVE_PREPARE_HISTOGRAM: &str = "zinder_ingest_canonical_live_prepare_seconds";
 /// Production histogram recorded around a live suffix replacement.
 const LIVE_REPLACEMENT_HISTOGRAM: &str = "zinder_ingest_canonical_live_replacement_commit_seconds";
+/// Production histogram recorded around each replacement block's preparation.
+const LIVE_REPLACEMENT_PREPARE_HISTOGRAM: &str =
+    "zinder_ingest_canonical_live_replacement_prepare_seconds";
 const SOURCE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Store settings shared by every repeat.
@@ -163,11 +169,7 @@ impl ReplayStores {
             collect_wallet_tickers: settings.collect_wallet_tickers,
             max_transition_logical_bytes: settings.max_transition_logical_bytes,
             readiness: ComposedReadiness::new(Readiness::default(), &[]),
-            source: ReplayFixtureSource {
-                fixture: fixture.clone(),
-                cancel: CancellationToken::new(),
-                first_failure: Mutex::new(None),
-            },
+            source: ReplayFixtureSource::new(fixture.clone()),
         })
     }
 
@@ -322,6 +324,137 @@ impl ReplayStores {
         Ok(WalletApply { elapsed, tickers })
     }
 
+    /// Follows `fork` to its tip with one production follow loop, which
+    /// replaces the canonical suffix the fork rewrote and then appends the
+    /// fork's last block, and catches the secondary up to the result.
+    pub(super) fn follow_fork(
+        &mut self,
+        runtime: &tokio::runtime::Runtime,
+        recorder: &FollowStepRecorder,
+        fork: ForkedFixtureSource,
+    ) -> Result<ForkFollowSamples, BenchError> {
+        let fork_tip = fork.tip()?;
+        let store = self.canonical.take().ok_or_else(|| {
+            BenchError::tip_replay("the canonical writer was lost by an earlier step")
+        })?;
+        recorder.clear();
+        let source = ReplayFixtureSource::new(fork);
+        let follower = CanonicalFollower::new(
+            &source,
+            Arc::clone(&self.follow_activations),
+            single_append_follow_config(fork_tip.height),
+            &self.readiness,
+            &source.cancel,
+        );
+        let follow_started = Instant::now();
+        let follow_outcome = runtime.block_on(follow_canonical_tip(store, follower));
+        let follow = follow_started.elapsed();
+        let source_failure = source.first_failure.lock().take();
+        if let Some(failure) = source_failure {
+            return Err(failure.into());
+        }
+        let store = follow_outcome?;
+        let fence = store.event_fence();
+        self.canonical = Some(store);
+        if fence.visible_tip() != fork_tip {
+            return Err(BenchError::tip_replay(format!(
+                "the canonical follower stopped at {:?} instead of the fork tip {fork_tip:?}",
+                fence.visible_tip()
+            )));
+        }
+        let samples = recorder.take_replacement_then_append()?;
+        let catch_up_started = Instant::now();
+        self.secondary.try_catch_up()?;
+        Ok(ForkFollowSamples {
+            follow_seconds: follow.as_secs_f64(),
+            replacement_prepare_seconds: samples.prepare_seconds,
+            replacement_prepared_blocks: samples.prepared_blocks,
+            replacement_commit_seconds: samples.commit_seconds,
+            secondary_catch_up_seconds: catch_up_started.elapsed().as_secs_f64(),
+        })
+    }
+
+    /// Returns the retained event after the wallet cursor, after checking it
+    /// is the reorg that replaced `reverted` with blocks of the same heights.
+    pub(super) fn next_retained_reorg(
+        &self,
+        reverted: BlockHeightRange,
+    ) -> Result<RetainedReorg, BenchError> {
+        let wallet_source =
+            WalletCanonicalSourceIdentity::from_ready_evidence(self.wallet.ready_evidence());
+        let cursor = wallet_source.source_position().event_cursor.as_bytes();
+        let events = self
+            .secondary
+            .canonical_event_history(CanonicalEventHistoryRequest::new(
+                Some(&cursor),
+                NonZeroU32::MIN,
+            ))?;
+        let [event] = events.as_slice() else {
+            return Err(BenchError::tip_replay(
+                "no retained event follows the wallet cursor",
+            ));
+        };
+        if !matches!(event.kind(), CanonicalEventKind::Reorged)
+            || event.reverted_range() != Some(reverted)
+            || event.committed_range() != reverted
+        {
+            return Err(BenchError::tip_replay(format!(
+                "the next retained event is not the reorg of heights {}..={}",
+                reverted.start.value(),
+                reverted.end.value()
+            )));
+        }
+        let epoch = self.secondary.chain_epoch_at(event.resulting_epoch_id())?;
+        Ok(RetainedReorg {
+            wallet_source,
+            event: *event,
+            settled_tip: BlockId::new(epoch.settled_tip_height, epoch.settled_tip_hash),
+        })
+    }
+
+    /// Applies `reorg` the way `zinder-projector` applies one retained event,
+    /// returning the wallet transition's own outcome.
+    pub(super) fn apply_retained_reorg(
+        &mut self,
+        reorg: &RetainedReorg,
+        max_logical_bytes: NonZeroU64,
+    ) -> Result<Result<(), RocksDbWalletError>, BenchError> {
+        let replay_rows = self
+            .secondary
+            .scan_canonical_replay_range(reorg.event.committed_range())?;
+        Ok(self.wallet.apply_canonical_event_range_cancellable(
+            reorg.wallet_source,
+            reorg.event,
+            reorg.event.resulting_fence(),
+            reorg.settled_tip,
+            max_logical_bytes,
+            replay_rows,
+            || false,
+        ))
+    }
+
+    /// Applies the one-block append that follows the applied reorg.
+    pub(super) fn apply_appended_block(&mut self) -> Result<(), BenchError> {
+        let fence = self.canonical_store()?.event_fence();
+        self.apply_wallet_transition(fence).map(|_| ())
+    }
+
+    /// The wallet store's statistics tickers, when the run collects them.
+    pub(super) fn wallet_tickers(&self) -> Option<TickerSnapshot> {
+        self.collect_wallet_tickers
+            .then(|| TickerSnapshot::read(&self.wallet))
+    }
+
+    /// The size of the last transition the wallet published.
+    pub(super) fn wallet_footprint(&self) -> Option<WalletTransitionFootprint> {
+        self.wallet.last_transition_footprint()
+    }
+
+    /// The canonical position the writer holds now.
+    pub(super) fn position(&self) -> Result<CanonicalPosition, BenchError> {
+        self.canonical_position()
+    }
+
     /// Counts the transparent workload of retained blocks at `heights`.
     ///
     /// Heights outside the retained canonical range are skipped.
@@ -376,18 +509,50 @@ impl ReplayStores {
     }
 }
 
+/// The retained reorg event the wallet applies next, with the inputs the
+/// projector passes alongside it.
+#[derive(Clone, Copy)]
+pub(super) struct RetainedReorg {
+    wallet_source: WalletCanonicalSourceIdentity,
+    event: CanonicalRetainedEvent,
+    settled_tip: BlockId,
+}
+
+/// Production timings of the follow loop that switched to a fork.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub(super) struct ForkFollowSamples {
+    /// The whole follow loop: fork discovery, preparation, replacement, and the append.
+    pub(super) follow_seconds: f64,
+    /// Summed `zinder_ingest_canonical_live_replacement_prepare_seconds` samples.
+    pub(super) replacement_prepare_seconds: f64,
+    /// Replacement blocks the follower prepared.
+    pub(super) replacement_prepared_blocks: usize,
+    /// The `zinder_ingest_canonical_live_replacement_commit_seconds` sample.
+    pub(super) replacement_commit_seconds: f64,
+    /// Secondary catch-up to the fork tip.
+    pub(super) secondary_catch_up_seconds: f64,
+}
+
 /// The fixture source as the canonical follower sees it.
 ///
 /// The follower backs off and retries every source failure until it is
 /// cancelled, as a node outage warrants. A fixture read failure does not heal,
 /// so the first one is kept for the replay to report and cancels the follower.
-struct ReplayFixtureSource {
-    fixture: TipReplayNodeSource,
+struct ReplayFixtureSource<Source = TipReplayNodeSource> {
+    fixture: Source,
     cancel: CancellationToken,
     first_failure: Mutex<Option<SourceError>>,
 }
 
-impl ReplayFixtureSource {
+impl<Source> ReplayFixtureSource<Source> {
+    fn new(fixture: Source) -> Self {
+        Self {
+            fixture,
+            cancel: CancellationToken::new(),
+            first_failure: Mutex::new(None),
+        }
+    }
+
     /// Keeps `failure` if it is the first, cancels the follower, and returns
     /// the failure's description for the follower to observe.
     fn stop_on(&self, failure: SourceError) -> SourceError {
@@ -403,7 +568,7 @@ impl ReplayFixtureSource {
 }
 
 #[async_trait]
-impl NodeSource for ReplayFixtureSource {
+impl<Source: NodeSource> NodeSource for ReplayFixtureSource<Source> {
     fn capabilities(&self) -> NodeCapabilities {
         self.fixture.capabilities()
     }
@@ -510,6 +675,15 @@ struct RecordedHistograms {
     commits: Vec<f64>,
     preparations: Vec<f64>,
     replacements: Vec<f64>,
+    replacement_preparations: Vec<f64>,
+}
+
+/// The production timings of a follow loop that replaced a suffix once and
+/// then appended one block.
+struct ReplacementThenAppendSamples {
+    prepare_seconds: f64,
+    prepared_blocks: usize,
+    commit_seconds: f64,
 }
 
 /// Thread-local metrics recorder that keeps the follower's commit and
@@ -546,6 +720,27 @@ impl FollowStepRecorder {
             ))),
         }
     }
+
+    fn take_replacement_then_append(&self) -> Result<ReplacementThenAppendSamples, BenchError> {
+        let recorded = std::mem::take(&mut *self.histograms.lock());
+        match (
+            recorded.replacements.as_slice(),
+            recorded.commits.len(),
+            recorded.preparations.len(),
+        ) {
+            ([replacement], 1, 1) => Ok(ReplacementThenAppendSamples {
+                prepare_seconds: recorded.replacement_preparations.iter().sum(),
+                prepared_blocks: recorded.replacement_preparations.len(),
+                commit_seconds: *replacement,
+            }),
+            _ => Err(BenchError::tip_replay(format!(
+                "following a fork must record one replacement and then one append; it recorded {} replacements, {} commits, and {} preparations",
+                recorded.replacements.len(),
+                recorded.commits.len(),
+                recorded.preparations.len()
+            ))),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -553,6 +748,7 @@ enum FollowHistogram {
     Commit,
     Prepare,
     Replacement,
+    ReplacementPrepare,
 }
 
 struct RecordedHistogram {
@@ -567,6 +763,9 @@ impl metrics::HistogramFn for RecordedHistogram {
             FollowHistogram::Commit => histograms.commits.push(sample),
             FollowHistogram::Prepare => histograms.preparations.push(sample),
             FollowHistogram::Replacement => histograms.replacements.push(sample),
+            FollowHistogram::ReplacementPrepare => {
+                histograms.replacement_preparations.push(sample);
+            }
         }
     }
 }
@@ -621,6 +820,7 @@ impl metrics::Recorder for FollowStepRecorder {
             LIVE_COMMIT_HISTOGRAM => FollowHistogram::Commit,
             LIVE_PREPARE_HISTOGRAM => FollowHistogram::Prepare,
             LIVE_REPLACEMENT_HISTOGRAM => FollowHistogram::Replacement,
+            LIVE_REPLACEMENT_PREPARE_HISTOGRAM => FollowHistogram::ReplacementPrepare,
             _ => return metrics::Histogram::noop(),
         };
         metrics::Histogram::from_arc(Arc::new(RecordedHistogram {
