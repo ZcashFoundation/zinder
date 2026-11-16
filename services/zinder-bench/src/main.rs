@@ -43,8 +43,8 @@ use rocksdb_raw_blob_retention_comparison::{
 };
 use rocksdb_storage_lifecycle::{RocksDbStorageLifecycleArgs, run_rocksdb_storage_lifecycle};
 use rocksdb_tip_replay::{
-    CompareTipReplayReportsArgs, RocksDbTipReplayArgs, run_compare_tip_replay_reports,
-    run_rocksdb_tip_replay,
+    CompareTipReplayReportsArgs, RocksDbTipReorgArgs, RocksDbTipReplayArgs,
+    run_compare_tip_replay_reports, run_rocksdb_tip_reorg, run_rocksdb_tip_replay,
 };
 use rocksdb_wallet_rebuild::{RocksDbWalletRebuildArgs, run_rocksdb_wallet_rebuild};
 
@@ -105,6 +105,9 @@ enum Command {
     /// Compare a baseline and a candidate tip replay report.
     #[command(name = "compare-tip-replay-reports")]
     CompareTipReplayReports(CompareTipReplayReportsArgs),
+    /// Replay a deep reorg at the tip through production following and the wallet transition.
+    #[command(name = "rocksdb-tip-reorg")]
+    RocksDbTipReorg(RocksDbTipReorgArgs),
 }
 
 #[derive(Args)]
@@ -297,6 +300,7 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
         }
         Command::RocksDbTipReplay(args) => run_rocksdb_tip_replay(args).await,
         Command::CompareTipReplayReports(args) => run_compare_tip_replay_reports(&args),
+        Command::RocksDbTipReorg(args) => run_rocksdb_tip_reorg(args).await,
     }
 }
 

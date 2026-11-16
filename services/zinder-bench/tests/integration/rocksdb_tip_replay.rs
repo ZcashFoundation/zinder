@@ -1076,3 +1076,117 @@ async fn tip_replay_checkpoints_refuse_replacement_and_a_different_manifest() ->
     assert!(mismatch.to_string().contains("different fixture manifest"));
     Ok(())
 }
+
+/// Newest block the integration reorg replaces, and how many blocks it replaces.
+const REORG_TIP_HEIGHT: u32 = CHAIN_TIP_HEIGHT - 1;
+const REORG_DEPTH: u32 = REORG_WINDOW_BLOCKS;
+
+fn run_tip_reorg(inputs: &TipReplayInputs, name: &str, extra: &[&str]) -> Result<(Value, Output)> {
+    let report_path = inputs.directory.path().join(format!("{name}.json"));
+    let output = Command::new(env!("CARGO_BIN_EXE_zinder-bench"))
+        .arg("rocksdb-tip-reorg")
+        .arg("--fixture")
+        .arg(inputs.fixture())
+        .arg("--canonical-store")
+        .arg(inputs.canonical_store())
+        .arg("--wallet-store")
+        .arg(inputs.wallet_store())
+        .arg("--scratch-dir")
+        .arg(inputs.directory.path().join(format!("{name}-scratch")))
+        .arg("--report")
+        .arg(&report_path)
+        .args(["--software-revision", "integration-test"])
+        .args(["--reorg-tip-height", &REORG_TIP_HEIGHT.to_string()])
+        .args(["--depth", &REORG_DEPTH.to_string()])
+        .args(["--reorg-window-blocks", &REORG_WINDOW_BLOCKS.to_string()])
+        .args(["--canonical-block-cache-bytes", "8388608"])
+        .args(["--canonical-secondary-block-cache-bytes", "8388608"])
+        .args(["--wallet-block-cache-bytes", "8388608"])
+        .args(extra)
+        .output()?;
+    require_success(&output, "tip reorg")?;
+    Ok((read_json(&report_path)?, output))
+}
+
+#[tokio::test]
+async fn tip_reorg_switches_to_a_fork_and_matches_a_rebuilt_wallet() -> Result<()> {
+    let inputs = prepare_inputs().await?;
+    let canonical_before = tree_digest(&inputs.canonical_store())?;
+    let wallet_before = tree_digest(&inputs.wallet_store())?;
+    for (fork, rewritten_coinbases) in [("same-transactions", 0), ("distinct-coinbases", 3)] {
+        let (report, _) = run_tip_reorg(&inputs, fork, &["--fork", fork, "--keep-scratch"])?;
+
+        assert_eq!(report["contract_identity"], "rocksdb-tip-reorg");
+        assert_eq!(
+            report["catch_up"]["blocks"],
+            REORG_TIP_HEIGHT - START_HEIGHT
+        );
+        assert_eq!(report["fork"]["kind"], fork);
+        assert_eq!(report["fork"]["first_height"], REORG_TIP_HEIGHT - 1);
+        assert_eq!(report["fork"]["rewrite"]["blocks"], REORG_DEPTH + 1);
+        assert_eq!(report["fork"]["rewrite"]["coinbases"], rewritten_coinbases);
+        let replacement = &report["canonical_replacement"];
+        assert_eq!(replacement["replacement_prepared_blocks"], REORG_DEPTH);
+        assert_eq!(replacement["before"]["tip_height"], REORG_TIP_HEIGHT);
+        assert_eq!(replacement["after"]["tip_height"], CHAIN_TIP_HEIGHT);
+        assert_ne!(
+            replacement["after"]["sequence_digest_hex"],
+            replacement["before"]["sequence_digest_hex"]
+        );
+
+        let transition = &report["wallet_transition"];
+        assert_eq!(transition["outcome"], "admitted");
+        let footprint = &transition["footprint"];
+        let accounted = footprint["accounted_logical_bytes"].as_u64();
+        assert!(accounted > Some(0) && accounted <= transition["limit_bytes"].as_u64());
+        assert_eq!(
+            footprint["batch_records"].as_u64(),
+            footprint["planned_rows"].as_u64().map(|rows| rows + 1)
+        );
+        assert!(transition["memory"]["peak_rss_bytes"].as_u64() > Some(0));
+        assert_eq!(
+            transition["final_wallet"]["source_tip_height"],
+            CHAIN_TIP_HEIGHT
+        );
+
+        let kept_canonical = report["kept_scratch"]["canonical_store"]
+            .as_str()
+            .ok_or_else(|| eyre!("--keep-scratch must name the kept canonical store"))?;
+        let rebuilt = inputs.directory.path().join("rebuilt-wallet");
+        if rebuilt.exists() {
+            std::fs::remove_dir_all(&rebuilt)?;
+        }
+        assert_eq!(
+            Some(rebuilt_wallet_digest(&inputs, Path::new(kept_canonical))?.as_str()),
+            transition["final_wallet"]["projection_digest_hex"].as_str(),
+            "{fork}"
+        );
+    }
+    assert_eq!(tree_digest(&inputs.canonical_store())?, canonical_before);
+    assert_eq!(tree_digest(&inputs.wallet_store())?, wallet_before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn tip_reorg_reports_a_refused_transition_with_the_wallet_unchanged() -> Result<()> {
+    let inputs = prepare_inputs().await?;
+    let (admitted, _) = run_tip_reorg(&inputs, "admitted", &[])?;
+    let accounted = admitted["wallet_transition"]["footprint"]["accounted_logical_bytes"]
+        .as_u64()
+        .ok_or_else(|| eyre!("an admitted reorg reports its accounted bytes"))?;
+
+    let limit = (accounted - 1).to_string();
+    let (refused, _) = run_tip_reorg(
+        &inputs,
+        "refused",
+        &["--max-transition-logical-bytes", &limit],
+    )?;
+    let transition = &refused["wallet_transition"];
+    assert_eq!(transition["outcome"], "refused");
+    assert_eq!(transition["limit_bytes"], accounted - 1);
+    assert!(transition["refused_required_bytes"].as_u64() >= Some(accounted));
+    assert_eq!(transition["wallet_unchanged"], true);
+    assert!(transition["footprint"].is_null());
+    assert!(transition["final_wallet"].is_null());
+    Ok(())
+}

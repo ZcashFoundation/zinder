@@ -6,7 +6,8 @@ canonical `RocksDB` store and drives two backend-neutral canonical-replay round
 trips: one sorted external SST ingestion for `RocksDB` and binary `COPY` with
 deferred index construction for PostgreSQL. It also replays captured tip blocks
 through the production canonical follower and wallet transition to measure
-per-block cost.
+per-block cost, and replays a deep reorg at the tip to measure one wallet
+transition against its logical-byte ceiling.
 
 The captured fixture is the common input for every fixture-driven command.
 Canonical storage arms create fresh candidate storage and compare every
@@ -531,6 +532,92 @@ statistic, plus the mean block-loop wall and CPU time and the peak resident
 memory. When both reports collected wallet statistics, it also gives each
 stratum's mean per-block delta of every ticker. Without `--report`, it writes
 to stdout.
+
+## 5. Measure a deep reorg at the tip
+
+`rocksdb-tip-reorg` tells you whether a reorg of the newest blocks fits the
+wallet transition ceiling, `projector.follow.max_transition_logical_bytes`,
+and how much memory the transition takes. It uses the same inputs as
+`rocksdb-tip-replay` and runs these steps:
+
+1. It copies both stores into a scratch directory and replays the fixture
+   through `--reorg-tip-height`, one block at a time, as a tip replay does.
+2. It builds a competing branch. The branch rewrites the `--depth` newest
+   blocks and adds one block on top, so it is longer than the stored chain.
+3. The production canonical follower switches to that branch in one suffix
+   replacement, then appends the extra block. This records one `Reorged`
+   event and one `Committed` event.
+4. The wallet applies the `Reorged` event the way `zinder-projector` applies
+   one retained event. It calls `apply_canonical_event_range_cancellable`
+   with the replay rows of the event's committed range and the ceiling you
+   set.
+
+The fixture must hold every block from the store tip through one block past
+`--reorg-tip-height`, with its tip replay checkpoints. The reorg must start
+above the canonical settled tip. With the default 1,000-block window, the
+store tip must therefore be at least `--depth` blocks below
+`--reorg-tip-height`.
+
+```bash
+zinder-bench rocksdb-tip-reorg \
+  --fixture ./fixtures/testnet-tip \
+  --canonical-store ./stores/canonical-at-h \
+  --wallet-store ./stores/wallet-at-h \
+  --scratch-dir ./scratch/tip-reorg \
+  --report ./reports/tip-reorg.json \
+  --software-revision "$(git rev-parse HEAD)" \
+  --reorg-tip-height 4618271 \
+  --depth 1000 \
+  --fork distinct-coinbases
+```
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `--reorg-tip-height` | required | Newest block the reorg replaces |
+| `--depth` | `1000` | Blocks the reorg replaces, ending at `--reorg-tip-height` |
+| `--fork` | `distinct-coinbases` | How the branch differs from the blocks it replaces |
+| `--max-transition-logical-bytes` | `536870912` | Ceiling for every wallet transition, the reorg included |
+| `--keep-scratch` | off | Keeps the scratch stores after the run |
+
+The store options of `rocksdb-tip-replay` (`--raw-blob-retention`,
+`--reorg-window-blocks`, and the three block-cache settings) work the same
+way here.
+
+The two branch kinds bracket a real fork:
+
+- `same-transactions` keeps every transaction and changes only block
+  identities. The wallet plan then rewrites the same outpoints it rolls back.
+- `distinct-coinbases` changes each coinbase's lock time, so every coinbase
+  gets a new txid. A transaction that spends a renamed output gets the new
+  txid in its input, and so a new txid of its own.
+
+Both kinds leave shielded data unchanged, so every rewritten block keeps the
+node's tree state. They do not update the block commitments field, and the
+rewritten headers carry no valid proof of work. Zinder checks neither.
+
+A refused transition is a result, not a failure: the command still writes its
+report. The report's `wallet_transition` object records:
+
+- `outcome`: `admitted` or `refused`.
+- `refused_required_bytes`: the refusal's `required_bytes`, which is a lower
+  bound on the whole plan, and `wallet_unchanged`, which checks that READY
+  evidence did not move.
+- `footprint`, for an admitted transition: the planner's
+  `accounted_logical_bytes`, its distinct `planned_rows`, the published
+  batch's `batch_records` and `batch_bytes`, its `durable_point_reads`, and
+  the synchronous `write_seconds`. `plan_seconds` is the rest of the call.
+- `elapsed_seconds`: the whole call, from the replay-row scan through the
+  write or the refusal.
+- `memory`: resident memory before the call, `VmHWM` reset just before it and
+  read after it (`peak_rss_bytes`), a 20 ms `VmRSS` sampler's peak, and
+  resident memory after it. The process also holds the canonical writer, the
+  secondary, and the fixture, so these numbers cover all of them.
+
+The report also records the catch-up time, the replaced range's transparent
+workload, what the branch rewrote, and the follower's replacement timings.
+An admitted run ends with the wallet at the branch tip. Check it against a
+cold rebuild as you would a tip replay: run with `--keep-scratch`, then
+rebuild a wallet from the kept canonical store with `rocksdb-wallet-rebuild`.
 
 ## Report fields
 

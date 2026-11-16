@@ -34,6 +34,7 @@ tokio-util.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zebra-chain.workspace = true
 zinder-core.workspace = true
 zinder-materialized-views.workspace = true
 zinder-ingest.workspace = true
