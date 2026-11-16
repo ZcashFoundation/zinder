@@ -7,7 +7,10 @@
 //! - **Architectural invariants** (WAL on, point-in-time recovery, atomic
 //!   flush, ordered writes, and direct-I/O fallback) live in the bounded
 //!   `RocksDB` open path. They are not tunable; touching them breaks the
-//!   per-epoch commit contract.
+//!   per-epoch commit contract. The one exception is
+//!   [`RocksDbResourceBudget::preferred_io_mode`], which the benchmark harness
+//!   sets to buffered to skip the direct attempt; no configuration section
+//!   exposes it.
 //! - **Bounded resource budget** lives here. The numbers below cap the
 //!   block-cache, table-cache, WAL, primary-writer background jobs,
 //!   per-column-family write buffers, and total memtable memory surfaces so a

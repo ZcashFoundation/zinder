@@ -1295,12 +1295,22 @@ resolved:
   --wallet-io-mode buffered
 ```
 
+Run the pair on Linux. Each repeat evicts its scratch copies from the page
+cache after copying them, so both modes start cold, and the report records
+`method.scratch_page_cache` as `evicted-after-copy`. On other platforms the
+copies stay cached and the buffered run starts warm, so the pair does not
+measure the I/O mode.
+
 To see why a wallet read costs what it does, add `--wallet-rocksdb-statistics`
 to both runs of a pair. The report then carries the wallet store's `RocksDB`
 ticker deltas per block and per workload stratum: point reads, Bloom filter
-outcomes, and block-cache misses. Collection can change timings, so measure
-timings on runs without it, and note that the comparison refuses a run that
-collected statistics against one that did not.
+outcomes, block-cache misses, and the bytes background flushes and compactions
+moved. A block's deltas include the reads of any flush or compaction that ran
+during its transition, so set aside blocks with a nonzero
+`rocksdb.compact.read.bytes` or `rocksdb.flush.write.bytes` before reading
+their miss counts as the transition's own. Collection can change timings, so
+measure timings on runs without it, and note that the comparison refuses a run
+that collected statistics against one that did not.
 
 Each repeat copies both stores, so the scratch filesystem needs room for the
 inputs twice over; at a Testnet tip near height 4.6 million that is about

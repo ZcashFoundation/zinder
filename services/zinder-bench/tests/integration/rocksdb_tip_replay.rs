@@ -416,6 +416,14 @@ fn assert_two_repeat_report(report: &Value) -> Result<&Value> {
     assert_eq!(report["contract_identity"], "rocksdb-tip-replay");
     assert_eq!(report["method"]["percentile_method"], "nearest-rank");
     assert_eq!(
+        report["method"]["scratch_page_cache"],
+        if cfg!(target_os = "linux") {
+            "evicted-after-copy"
+        } else {
+            "not-evicted"
+        }
+    );
+    assert_eq!(
         report["provenance"]["software_revision"],
         "integration-test"
     );
@@ -647,6 +655,9 @@ async fn tip_replay_reports_the_requested_io_modes_and_wallet_statistics_deltas(
         "rocksdb.block.cache.filter.miss",
         "rocksdb.block.cache.index.miss",
         "rocksdb.bytes.read",
+        "rocksdb.compact.read.bytes",
+        "rocksdb.compact.write.bytes",
+        "rocksdb.flush.write.bytes",
     ] {
         assert!(reported_tickers.contains(&Value::from(ticker)), "{ticker}");
     }
@@ -660,7 +671,11 @@ async fn tip_replay_reports_the_requested_io_modes_and_wallet_statistics_deltas(
         unavailable,
         [&Value::from("canonical_store_read_statistics")]
     );
+    assert_wallet_ticker_deltas(&report)
+}
 
+/// Checks the per-block and per-stratum ticker deltas of a collecting replay.
+fn assert_wallet_ticker_deltas(report: &Value) -> Result<()> {
     let blocks = report["repeats"][0]["blocks"]
         .as_array()
         .ok_or_else(|| eyre!("report must list blocks"))?;
@@ -673,7 +688,13 @@ async fn tip_replay_reports_the_requested_io_modes_and_wallet_statistics_deltas(
             "height {}: {deltas}",
             block["height"]
         );
-        assert!(deltas["rocksdb.bytes.read"].is_u64());
+        for ticker in [
+            "rocksdb.bytes.read",
+            "rocksdb.compact.read.bytes",
+            "rocksdb.flush.write.bytes",
+        ] {
+            assert!(deltas[ticker].is_u64(), "{ticker}: {deltas}");
+        }
     }
     for stratum in ["all_blocks", "no_transparent_activity"] {
         let summary = &report["aggregate"][stratum]["wallet_tickers"]["rocksdb.number.keys.read"];
@@ -783,7 +804,8 @@ async fn tip_replay_comparison_names_io_mode_differences_and_refuses_mixed_stati
 }
 
 #[tokio::test]
-async fn tip_replay_comparison_refuses_reports_summarized_by_different_methods() -> Result<()> {
+async fn tip_replay_comparison_refuses_other_summary_methods_and_lists_page_cache_state()
+-> Result<()> {
     let inputs = prepare_inputs().await?;
     let scratch = inputs.directory.path().join("scratch");
     let report = inputs.directory.path().join("report.json");
@@ -835,6 +857,31 @@ async fn tip_replay_comparison_refuses_reports_summarized_by_different_methods()
         assert!(stderr.contains(expected), "{stderr}");
         assert!(!refused_path.exists());
     }
+
+    let mut other_cache_state = read_json(&report)?;
+    let measured_state = other_cache_state["method"]["scratch_page_cache"].clone();
+    let other_state = if measured_state == "evicted-after-copy" {
+        "not-evicted"
+    } else {
+        "evicted-after-copy"
+    };
+    other_cache_state["method"]["scratch_page_cache"] = Value::from(other_state);
+    let other_path = inputs.directory.path().join("other-page-cache.json");
+    std::fs::write(&other_path, serde_json::to_vec_pretty(&other_cache_state)?)?;
+    let comparison_path = inputs.directory.path().join("page-cache-comparison.json");
+    require_success(
+        &compare_reports(&report, &other_path, &comparison_path)?,
+        "page-cache comparison",
+    )?;
+    let comparison = read_json(&comparison_path)?;
+    assert_eq!(
+        comparison["setting_differences"],
+        serde_json::json!([{
+            "setting": "method.scratch_page_cache",
+            "baseline": measured_state,
+            "candidate": other_state,
+        }])
+    );
     Ok(())
 }
 

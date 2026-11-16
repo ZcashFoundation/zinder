@@ -43,7 +43,7 @@ I/O resolution, and open retry policy.
 
 ### Direct I/O With Buffered Fallback
 
-Every RocksDB open first attempts direct I/O:
+Every production RocksDB open first attempts direct I/O:
 
 - Primary and secondary opens set `use_direct_reads = true`.
 - Primary opens also set `use_direct_io_for_flush_and_compaction = true` and

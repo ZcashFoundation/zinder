@@ -97,8 +97,20 @@ fn remove_scratch(path: &Path) {
     }
 }
 
+/// How [`copy_store`] leaves the copied files in the page cache, as the report
+/// names it.
+pub(super) const SCRATCH_PAGE_CACHE: &str = if cfg!(target_os = "linux") {
+    "evicted-after-copy"
+} else {
+    "not-evicted"
+};
+
 /// Copies one closed store directory and syncs every copied file, so a replay
 /// does not start while the copy is still being written back.
+///
+/// On Linux it then evicts each copy from the page cache. Writing the copy
+/// leaves its pages cached, so without eviction a buffered store would serve
+/// its first reads from memory while a direct store reads from the device.
 pub(super) fn copy_store(source: &Path, destination: &Path) -> Result<(), BenchError> {
     fs::create_dir(destination).map_err(|error| BenchError::io(destination, error))?;
     for entry in fs::read_dir(source).map_err(|error| BenchError::io(source, error))? {
@@ -113,9 +125,14 @@ pub(super) fn copy_store(source: &Path, destination: &Path) -> Result<(), BenchE
         } else if file_type.is_file() {
             fs::copy(&entry_path, &target_path)
                 .map_err(|error| BenchError::io(&entry_path, error))?;
-            File::open(&target_path)
-                .and_then(|copied| copied.sync_all())
+            let copied =
+                File::open(&target_path).map_err(|error| BenchError::io(&target_path, error))?;
+            copied
+                .sync_all()
                 .map_err(|error| BenchError::io(&target_path, error))?;
+            #[cfg(target_os = "linux")]
+            rustix::fs::fadvise(&copied, 0, None, rustix::fs::Advice::DontNeed)
+                .map_err(|error| BenchError::io(&target_path, error.into()))?;
         } else {
             return Err(BenchError::invalid_argument(format!(
                 "store input {} holds {}, which is neither a file nor a directory",

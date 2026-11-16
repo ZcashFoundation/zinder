@@ -1,9 +1,11 @@
 //! `RocksDB` statistics ticker deltas of the wallet store, per block and per stratum.
 //!
 //! Tickers count DB-wide, so a delta covers every column family of the wallet
-//! store. `rocksdb.block.cache.data.miss` is the number of data blocks the
-//! store had to read from its files; `RocksDB` has no separate data-block-read
-//! ticker.
+//! store and every background flush or compaction that ran during the block's
+//! window. `rocksdb.block.cache.data.miss` is the number of data blocks read
+//! from the store's files, by the transition or by a concurrent compaction;
+//! `RocksDB` has no separate data-block-read ticker. The flush and compaction
+//! byte tickers mark the blocks whose read counts include background work.
 
 use std::collections::BTreeMap;
 
@@ -14,7 +16,7 @@ use zinder_wallet_rocksdb::RocksDbWalletFollowingStore;
 use super::measurement::nearest_rank;
 
 /// Tickers the report keeps, named by `RocksDB` in the report.
-pub(super) const REPORTED_TICKERS: [Ticker; 13] = [
+pub(super) const REPORTED_TICKERS: [Ticker; 16] = [
     Ticker::NumberKeysRead,
     Ticker::NumberMultigetKeysRead,
     Ticker::NumberDbSeek,
@@ -28,6 +30,9 @@ pub(super) const REPORTED_TICKERS: [Ticker; 13] = [
     Ticker::BlockCacheIndexMiss,
     Ticker::BlockCacheIndexHit,
     Ticker::BytesRead,
+    Ticker::CompactReadBytes,
+    Ticker::CompactWriteBytes,
+    Ticker::FlushWriteBytes,
 ];
 
 /// Names of [`REPORTED_TICKERS`], as they appear in the report.
@@ -60,7 +65,10 @@ impl TickerSnapshot {
     }
 }
 
-/// What each ticker counted during one block's wallet transition.
+/// What each ticker counted while one block's wallet transition ran.
+///
+/// The counts include reads by flushes and compactions that ran on background
+/// threads at the same time, not only the transition's own reads.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(super) struct TickerDeltas(pub(super) BTreeMap<String, u64>);

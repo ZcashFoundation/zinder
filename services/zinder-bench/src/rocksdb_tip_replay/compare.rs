@@ -37,7 +37,7 @@ struct TipReplayComparison {
     baseline: ComparedReport,
     candidate: ComparedReport,
     workload: ComparedWorkload,
-    /// Every build, host, and configuration setting that differs between the reports.
+    /// Every build, host, configuration, and method setting that differs between the reports.
     setting_differences: Vec<SettingDifference>,
     process: BTreeMap<&'static str, MetricChange>,
     /// Pooled timers by stratum, then by timer name.
@@ -271,6 +271,11 @@ fn setting_differences(
         flatten(
             "configuration",
             &serde_json::to_value(&report.configuration)?,
+            &mut flattened,
+        );
+        flatten(
+            "method",
+            &serde_json::to_value(&report.method)?,
             &mut flattened,
         );
         flattened.remove("configuration.scratch_directory");

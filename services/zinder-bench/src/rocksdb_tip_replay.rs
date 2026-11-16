@@ -559,6 +559,7 @@ fn build_report(
         method: Method {
             percentile_method: PERCENTILE_METHOD.to_owned(),
             stratum_rules: STRATUM_RULES,
+            scratch_page_cache: scratch::SCRATCH_PAGE_CACHE.to_owned(),
         },
         process: ProcessResources {
             wall_seconds: process.wall.as_secs_f64(),

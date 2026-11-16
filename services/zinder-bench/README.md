@@ -369,6 +369,16 @@ requested and the mode it resolved, so a `direct` request that fell back shows
 as `buffered` in `resolved`. To measure the read path, run the same inputs once
 per mode with every other option unchanged, and compare the reports.
 
+Writing a scratch copy leaves its pages in the page cache, where a buffered
+store would serve its first reads from memory while a direct store reads from
+the device. On Linux, each repeat therefore evicts its copies from the page
+cache after syncing them, so both modes open cold stores, and the report's
+`method.scratch_page_cache` is `evicted-after-copy`. Other platforms record
+`not-evicted`; do not compare I/O modes there. A buffered store still caches
+what it reads during the replay, as much as the host's free memory allows, so
+a buffered result on a host with spare memory describes an uncontended page
+cache rather than a memory-limited container.
+
 ### Wallet statistics
 
 `--wallet-rocksdb-statistics` reads the wallet store's `RocksDB` statistics
@@ -379,8 +389,17 @@ wallet store with `statistics_level` `off`. The production default is
 `tickers`. A run with the option on opens it with `tickers`, so the difference
 between an off run and an on run includes the cost of collection.
 
-Tickers count DB-wide across every column family of the wallet store. The
-report keeps these, named as `RocksDB` names them:
+Tickers count DB-wide across every column family of the wallet store, and they
+also count its background work. A flush or compaction that runs while a block's
+transition runs adds its own block reads and cache misses to that block's
+deltas, so a block's counts can reflect when a compaction ran rather than what
+the transition read. A nonzero `rocksdb.compact.read.bytes` or
+`rocksdb.flush.write.bytes` marks such a block. `RocksDB` records compaction
+bytes periodically while the compaction runs and flush bytes when the flush
+ends, so a block with zero in both can still overlap the first moments of a
+job. Background work that runs between two transitions is not counted.
+
+The report keeps these tickers, named as `RocksDB` names them:
 
 | Ticker | Reading |
 | --- | --- |
@@ -390,11 +409,13 @@ report keeps these, named as `RocksDB` names them:
 | `rocksdb.bloom.filter.useful` | Reads a filter answered without touching a data block |
 | `rocksdb.bloom.filter.full.positive` | Filter probes that answered "maybe present" |
 | `rocksdb.bloom.filter.full.true.positive` | Filter probes whose key was present |
-| `rocksdb.block.cache.data.miss` | Data blocks read from the store's files; `RocksDB` has no separate data-block-read ticker |
+| `rocksdb.block.cache.data.miss` | Data blocks read from the store's files, by the transition or a concurrent compaction; `RocksDB` has no separate data-block-read ticker |
 | `rocksdb.block.cache.data.hit` | Data blocks served from the block cache |
 | `rocksdb.block.cache.filter.miss`, `.filter.hit` | Filter partitions read from files or the cache |
 | `rocksdb.block.cache.index.miss`, `.index.hit` | Index partitions read from files or the cache |
 | `rocksdb.bytes.read` | Bytes returned by point reads |
+| `rocksdb.compact.read.bytes`, `.compact.write.bytes` | Bytes background compactions read and wrote |
+| `rocksdb.flush.write.bytes` | Bytes background flushes wrote |
 
 The canonical stores expose no statistics, so the report lists them under
 `unavailable_measurements` when the option is on.
@@ -443,7 +464,9 @@ The report's `contract_identity` is `rocksdb-tip-replay`. It records:
 - `configuration`: the settings above, every resolved `RocksDB` budget, the
   requested and resolved I/O mode of each store, and `wallet_statistics`
   (whether tickers were collected, and which).
-- `method`: the percentile method and the stratum thresholds.
+- `method`: the percentile method, the stratum thresholds, and
+  `scratch_page_cache`, the page-cache state of the scratch copies when each
+  repeat opens them.
 - `process`: whole-process wall time, CPU time across all threads, and peak
   resident memory.
 - `aggregate`: timer summaries pooled over every block of every repeat.
@@ -469,8 +492,9 @@ absent and `wallet_tickers` is `null`.
 
 The report format is version 2. Version 2 replaced
 `configuration.rocksdb_io_mode.selectable` with `requested`, added
-`configuration.wallet_statistics`, and added the per-block and per-stratum
-ticker fields. `compare-tip-replay-reports` refuses version 1 reports.
+`configuration.wallet_statistics` and `method.scratch_page_cache`, and added
+the per-block and per-stratum ticker fields. `compare-tip-replay-reports`
+refuses version 1 reports.
 
 | Stratum | Blocks |
 | --- | --- |
@@ -500,8 +524,8 @@ refuses a report that collected wallet statistics against one that did not,
 because collection changes the wallet store's options and can change timings. It
 refuses reports whose stratum rules differ, because those rules decide which
 blocks each stratum holds, and reports whose percentile method is not
-`nearest-rank`. It lists every build, host, and configuration setting that
-differs, so you can confirm that only the intended variable changed. For each stratum and timer it gives
+`nearest-rank`. It lists every build, host, configuration, and method setting
+that differs, so you can confirm that only the intended variable changed. For each stratum and timer it gives
 the baseline, the candidate, and the percent change of every summary
 statistic, plus the mean block-loop wall and CPU time and the peak resident
 memory. When both reports collected wallet statistics, it also gives each

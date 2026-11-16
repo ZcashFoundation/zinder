@@ -16,14 +16,16 @@ use crate::{RocksDbResourceBudget, RocksDbStatisticsLevel};
 const DIRECT_IO_COMPACTION_READAHEAD_BYTES: usize = 2 * 1024 * 1024;
 const SECONDARY_MAX_FILE_OPENING_THREADS: i32 = 1;
 
-/// Filesystem I/O mode resolved while opening a `RocksDB` instance.
+/// Filesystem I/O mode of a `RocksDB` instance: the mode a resource budget
+/// requests, or the mode an open resolved to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RocksDbIoMode {
-    /// `RocksDB` opened with direct reads, and primary stores also opened
-    /// flush and compaction work with direct I/O.
+    /// Direct reads, and for primary stores direct flush and compaction I/O.
+    /// An open that requests it falls back to [`Self::Buffered`] when the
+    /// filesystem or platform rejects direct I/O.
     Direct,
-    /// `RocksDB` opened with buffered filesystem I/O after direct I/O was
-    /// rejected by the filesystem or platform.
+    /// Buffered filesystem I/O through the page cache. An open resolves to it
+    /// when the budget requests it or when direct I/O was rejected.
     Buffered,
 }
 

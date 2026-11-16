@@ -297,11 +297,19 @@ impl From<&ResolvedIoModes> for IoModes {
     }
 }
 
-/// How the summaries were computed.
+/// How the stores were prepared and the summaries computed.
 #[derive(Debug, Serialize, Deserialize)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "`percentile_method` is a stable report field name"
+)]
 pub(super) struct Method {
     pub(super) percentile_method: String,
     pub(super) stratum_rules: StratumRules,
+    /// Page-cache state of each repeat's scratch copies when its stores open:
+    /// `evicted-after-copy`, or `not-evicted` on a platform without
+    /// `posix_fadvise`, where buffered stores start with their files cached.
+    pub(super) scratch_page_cache: String,
 }
 
 /// Whole-process resources.
