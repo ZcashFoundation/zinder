@@ -511,10 +511,20 @@ restart starts query behind the moving wallet.
 
 To recover, set `ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES` on
 the service well above `<n>`, up to the maximum of `1073741824`, and redeploy.
-The default is `536870912`. The projector can hold up to the limit in memory
-while it plans and publishes one transition, so raise the container's memory
-by at least the bytes you add to the limit. Memory use at the maximum has not
-been measured.
+The default is `536870912`. While the projector plans and publishes one
+transition, its resident memory grows by more than the bytes the transition
+accounts. Raise the container's memory by at least 1.5 times the bytes you add
+to the limit.
+
+Measured on Testnet with `zinder-bench rocksdb-tip-reorg`, a 1,000-block reorg
+needs:
+
+- 350 MB of the limit over heights 4,617,272 to 4,618,271, which spend about
+  480,000 transparent outputs, and the transition grows resident memory by
+  0.24 to 0.33 GB;
+- 796 MB over heights 4,601,674 to 4,602,673, which create about one million
+  transparent outputs, so the default refuses it, and the transition grows
+  resident memory by 1.09 to 1.18 GB, up to 1.5 times the accounted bytes.
 
 If the new limit is still too small, the projector parks again and query never
 starts, so `/healthz` never answers. Railway then marks the deployment failed

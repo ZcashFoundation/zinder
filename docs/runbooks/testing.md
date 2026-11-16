@@ -1318,6 +1318,32 @@ inputs twice over; at a Testnet tip near height 4.6 million that is about
 start when the copy would leave less than 2 GiB free, and it deletes each
 repeat's copy unless `--keep-scratch` is set. Delete `$work` when you are done.
 
+### Deep-reorg benchmark
+
+Use this to check whether a deep reorg fits the wallet transition ceiling,
+`projector.follow.max_transition_logical_bytes`, and how much memory the
+transition takes. `zinder-bench rocksdb-tip-reorg` takes the same inputs as the
+tip replay. It replays the fixture to `--reorg-tip-height`, makes the
+production canonical follower switch to a branch that rewrites the newest
+`--depth` blocks, and applies the resulting `Reorged` event to the wallet as
+`zinder-projector` does:
+
+```bash
+"$bench" rocksdb-tip-reorg \
+  --fixture "$work/fixture" \
+  --canonical-store "$work/canonical" --wallet-store "$work/wallet" \
+  --scratch-dir "$work/scratch-reorg" --report "$work/reorg.json" \
+  --software-revision "$(git rev-parse HEAD)" \
+  --reorg-tip-height "$((end - 1))" --depth 1000 --fork distinct-coinbases
+jq '.wallet_transition | {outcome, refused_required_bytes, footprint, memory}' "$work/reorg.json"
+```
+
+The fixture must start at least `--depth` blocks below `--reorg-tip-height`.
+It must also hold one block past it. A refused transition still produces a
+report. The
+[zinder-bench README](../../services/zinder-bench/README.md#5-measure-a-deep-reorg-at-the-tip)
+describes the branch kinds and the report fields.
+
 ### Heavy probes (trust-sensitive code only)
 
 Run on demand for changes to storage commit paths, parser code, or the

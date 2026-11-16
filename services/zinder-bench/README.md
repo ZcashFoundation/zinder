@@ -553,10 +553,10 @@ and how much memory the transition takes. It uses the same inputs as
    set.
 
 The fixture must hold every block from the store tip through one block past
-`--reorg-tip-height`, with its tip replay checkpoints. The reorg must start
-above the canonical settled tip. With the default 1,000-block window, the
-store tip must therefore be at least `--depth` blocks below
-`--reorg-tip-height`.
+`--reorg-tip-height`, with its tip replay checkpoints. The branch rewrites
+fixture blocks, so the store tip must be at least `--depth` blocks below
+`--reorg-tip-height`. The reorg must also start above the canonical settled
+tip, so `--depth` can be at most `--reorg-window-blocks`.
 
 ```bash
 zinder-bench rocksdb-tip-reorg \
