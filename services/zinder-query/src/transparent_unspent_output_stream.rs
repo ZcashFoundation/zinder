@@ -77,7 +77,9 @@ impl TransparentAddressUnspentOutputs {
         )
     }
 
-    fn spawn_paged(
+    /// Starts reading as [`Self::spawn`] does, `page_size` outputs per
+    /// storage read.
+    pub(crate) fn spawn_paged(
         slot: WalletServingPairSlot,
         pair: Arc<WalletServingReadPair>,
         request: &TransparentAddressUnspentOutputsRequest,

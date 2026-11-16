@@ -5416,13 +5416,164 @@ mod tests {
         Ok(())
     }
 
+    /// Outputs of the address the stream tests read, all created in block 1.
+    ///
+    /// With every address-index row in a table file of its own, the scan of a
+    /// page read from the fourth page on opens at least the 88 index files at
+    /// or after its start. That is more than the 77 a secondary keeps open
+    /// (see [`SPLIT_TIP_HEIGHT`]), so such a read must reopen a file whatever
+    /// the cache's hash seed. A stream whose caller has taken only its first
+    /// output has read at most three pages, so it reads the fourth only after
+    /// a test that then deletes the files resumes reading.
+    const SPLIT_OUTPUT_COUNT: usize = 112;
+
+    /// Outputs each page read of the stream tests returns.
+    const SPLIT_PAGE_SIZE: std::num::NonZeroU16 = std::num::NonZeroU16::MIN.saturating_add(7);
+
+    /// A stream continues at its epoch after its pair loses a wallet table
+    /// file.
+    ///
+    /// The projector's compaction deletes the file after the stream delivered
+    /// a page. The stream continues on the pair the publisher publishes in
+    /// its place at the same epoch, and delivers every output exactly once.
+    ///
+    /// The publisher's catch-up interval is an hour, so only the page read's
+    /// report can wake it. The warning names a missing wallet table file, so
+    /// the wallet secondary reports the deletion with the same status as the
+    /// canonical one.
+    #[tokio::test]
+    async fn a_stream_continues_at_its_epoch_after_its_pair_loses_a_wallet_table_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let primaries = UnspentOutputPrimaries::start().await?;
+        split_wallet_address_index_into_table_files(&primaries.wallet_primary_path)?;
+        let (publisher, slot) = primaries
+            .bootstrap_publisher_every(Duration::from_hours(1))
+            .await?;
+        let stale_pair = slot.capture();
+        let cancel = CancellationToken::new();
+        let serving_runtime_drained = CancellationToken::new();
+        let publisher_task = publisher.spawn(cancel.clone(), serving_runtime_drained.clone());
+        let log_capture = LogCapture::install_for_target("zinder::wallet_serving");
+        let mut stream = primaries.open_stream(&slot)?;
+        let first = stream
+            .next()
+            .await
+            .ok_or("the stream ended before its first output")??;
+
+        compact_away_table_files(&primaries.wallet_primary_path)?;
+        let mut output_indexes = vec![first.outpoint.output_index];
+        while let Some(output) = stream.next().await {
+            output_indexes.push(output?.outpoint.output_index);
+        }
+
+        assert_eq!(
+            stream.chain_epoch.id,
+            stale_pair.canonical_fence().chain_epoch_id()
+        );
+        assert_eq!(
+            output_indexes,
+            (0..u32::try_from(SPLIT_OUTPUT_COUNT)?).collect::<Vec<_>>()
+        );
+        assert!(
+            stale_pair.has_missing_table_file(),
+            "a page read must have found a wallet table file of the stream's pair deleted"
+        );
+        let replacement = slot.capture();
+        assert!(!Arc::ptr_eq(&replacement, &stale_pair));
+        assert_eq!(replacement.canonical_fence(), stale_pair.canonical_fence());
+        let warnings = log_capture
+            .events()
+            .into_iter()
+            .filter(|event| event.field("event") == Some("wallet_serving_pair_table_file_missing"))
+            .collect::<Vec<_>>();
+        let [warning] = warnings.as_slice() else {
+            return Err(format!("expected one missing-file warning, got {warnings:?}").into());
+        };
+        let logged_error = warning.field("error").unwrap_or_default();
+        assert!(
+            logged_error.contains(&primaries.wallet_primary_path.display().to_string())
+                && logged_error.contains(".sst"),
+            "the warning must name the missing wallet table file, got {logged_error:?}"
+        );
+
+        drop((log_capture, stream, stale_pair, replacement, slot));
+        cancel.cancel();
+        serving_runtime_drained.cancel();
+        publisher_task.await?;
+        primaries.shutdown().await
+    }
+
+    /// A stream ends with its own epoch unavailable when the pair that
+    /// replaces its pair serves a newer epoch.
+    ///
+    /// The pair loses a wallet table file after the stream delivered a page,
+    /// and the stream never ends as if complete.
+    ///
+    /// The writer and the projector commit the next block before the
+    /// projector's compaction deletes the file, so the replacement the read's
+    /// report asks for is published at the newer epoch. The test runtime has
+    /// one thread, so the publisher and the stream's producer act only while
+    /// the test awaits the stream.
+    #[tokio::test]
+    async fn a_stream_ends_with_its_epoch_unavailable_when_its_replacement_serves_a_newer_epoch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut primaries = UnspentOutputPrimaries::start().await?;
+        split_wallet_address_index_into_table_files(&primaries.wallet_primary_path)?;
+        let (publisher, slot) = primaries
+            .bootstrap_publisher_every(Duration::from_hours(1))
+            .await?;
+        let stale_pair = slot.capture();
+        let stale_epoch = stale_pair.canonical_fence().chain_epoch_id();
+        let cancel = CancellationToken::new();
+        let serving_runtime_drained = CancellationToken::new();
+        let publisher_task = publisher.spawn(cancel.clone(), serving_runtime_drained.clone());
+        let mut stream = primaries.open_stream(&slot)?;
+        stream
+            .next()
+            .await
+            .ok_or("the stream ended before its first output")??;
+
+        let moved = primaries.append_block()?;
+        compact_away_table_files(&primaries.wallet_primary_path)?;
+        let mut delivered = 1;
+        let failure = loop {
+            match stream.next().await {
+                Some(Ok(_)) => delivered += 1,
+                Some(Err(error)) => break error,
+                None => {
+                    return Err("a stream whose pair lost a table file ended as if complete".into());
+                }
+            }
+        };
+
+        assert!(
+            matches!(
+                failure,
+                crate::QueryError::ChainEpochPinUnavailable { chain_epoch_id }
+                    if chain_epoch_id == stale_epoch
+            ),
+            "the stream must end with its own epoch unavailable, got {failure:?}"
+        );
+        assert!(delivered < SPLIT_OUTPUT_COUNT);
+        assert!(stream.next().await.is_none());
+        assert!(stale_pair.has_missing_table_file());
+        assert_eq!(slot.capture().canonical_fence(), moved);
+
+        drop((stream, stale_pair, slot));
+        cancel.cancel();
+        serving_runtime_drained.cancel();
+        publisher_task.await?;
+        primaries.shutdown().await
+    }
+
     fn split_block_range() -> BlockHeightRange {
         BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(SPLIT_TIP_HEIGHT))
     }
 
-    /// Opens a closed canonical primary directly, with automatic compaction
-    /// off in every family so only the test replaces its table files.
-    fn open_raw_canonical_primary(
+    /// Opens a closed canonical or wallet primary directly, with automatic
+    /// compaction off in every family so only the test replaces its table
+    /// files.
+    fn open_raw_primary(
         path: &Path,
     ) -> Result<(rust_rocksdb::DB, Vec<String>), Box<dyn std::error::Error>> {
         let families = rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), path)?;
@@ -5434,33 +5585,55 @@ mod tests {
         Ok((db, families))
     }
 
-    /// Rewrites every row of a closed canonical primary unchanged, flushing
-    /// after each, so each row's newest version sits in an L0 table file of
-    /// its own. Returns those files.
+    /// Rewrites every row of a closed canonical or wallet primary unchanged,
+    /// flushing after each, so each row's newest version sits in an L0 table
+    /// file of its own. Returns those files.
     fn split_rows_into_table_files(
         path: &Path,
     ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
-        let (db, families) = open_raw_canonical_primary(path)?;
+        let (db, families) = open_raw_primary(path)?;
         for family in &families {
-            let handle = db.cf_handle(family).ok_or("a listed family must open")?;
-            let rows = db
-                .iterator_cf(&handle, rust_rocksdb::IteratorMode::Start)
-                .collect::<Result<Vec<_>, _>>()?;
-            for (key, row) in rows {
-                db.put_cf(&handle, key, row)?;
-                db.flush_cf(&handle)?;
-            }
+            split_family_rows(&db, family)?;
         }
         level_zero_table_files(&db)
     }
 
-    /// Compacts every family of a closed canonical primary, as the writer's
-    /// compaction does, and waits until its L0 table files are deleted.
+    /// Splits only the address index of a closed wallet primary as
+    /// [`split_rows_into_table_files`] splits every family.
+    ///
+    /// The index is the family a page read of an unspent-output stream scans,
+    /// and splitting nothing else keeps the flushes, and the files each
+    /// secondary opens, to one per output.
+    fn split_wallet_address_index_into_table_files(
+        path: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (db, _families) = open_raw_primary(path)?;
+        split_family_rows(&db, "transparent_unspent_output_by_address")
+    }
+
+    fn split_family_rows(
+        db: &rust_rocksdb::DB,
+        family: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let handle = db.cf_handle(family).ok_or("the family must exist")?;
+        let rows = db
+            .iterator_cf(&handle, rust_rocksdb::IteratorMode::Start)
+            .collect::<Result<Vec<_>, _>>()?;
+        for (key, row) in rows {
+            db.put_cf(&handle, key, row)?;
+            db.flush_cf(&handle)?;
+        }
+        Ok(())
+    }
+
+    /// Compacts every family of a closed canonical or wallet primary, as the
+    /// writer's or the projector's compaction does, and waits until its L0
+    /// table files are deleted.
     ///
     /// Rewriting the bottommost level too keeps a file that a compaction
     /// would only move from surviving under its old number.
     fn compact_away_table_files(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        let (db, families) = open_raw_canonical_primary(path)?;
+        let (db, families) = open_raw_primary(path)?;
         let replaced = level_zero_table_files(&db)?;
         let mut options = rust_rocksdb::CompactOptions::default();
         options.set_bottommost_level_compaction(rust_rocksdb::BottommostLevelCompaction::Force);
@@ -6061,6 +6234,170 @@ mod tests {
             self.control
                 .set_writer_status(writer_status_for_store(self.canonical_primary()?));
             Ok(())
+        }
+
+        async fn shutdown(self) -> Result<(), Box<dyn std::error::Error>> {
+            self.cancel.cancel();
+            self.server_task.await??;
+            Ok(())
+        }
+    }
+
+    /// A canonical writer whose block 1 creates [`SPLIT_OUTPUT_COUNT`]
+    /// outputs for one address, its wallet projection, and the writer-status
+    /// endpoint a publisher attests against.
+    ///
+    /// The wallet primary stays closed between steps, so a test can act on
+    /// its table files as only the projector may.
+    struct UnspentOutputPrimaries {
+        activations: NetworkUpgradeActivations,
+        chain: ChainFixture,
+        address: TransparentAddressScriptHash,
+        writer: CanonicalWriterFixture,
+        wallet_primary_path: PathBuf,
+        wallet_source: WalletCanonicalSourceIdentity,
+        control: MutableCanonicalControl,
+        endpoint: String,
+        cancel: CancellationToken,
+        server_task: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+        // Declared last so the stores close before their directory is removed.
+        temporary: TempDir,
+    }
+
+    impl UnspentOutputPrimaries {
+        /// Publishes blocks 1 and 2 and projects them, leaving block 3 for
+        /// [`Self::append_block`].
+        async fn start() -> Result<Self, Box<dyn std::error::Error>> {
+            let activations = sample_regtest_upgrade_activations();
+            let (chain, address) = address_with_unspent_outputs(SPLIT_OUTPUT_COUNT)?;
+            let chain = chain.extend_blocks(1);
+            let writer = CanonicalWriterFixture::publish(
+                &CanonicalBaseline::new(&chain).through(BlockHeight::new(2)),
+                &activations,
+            )?;
+            let temporary = TempDir::new()?;
+            let wallet_primary_path = temporary.path().join("wallet-primary");
+            let wallet_source = build_wallet_from_canonical(
+                writer.canonical_primary()?,
+                &wallet_primary_path,
+                RocksDbWalletBuildOptions {
+                    supported_reorg_depth: 100,
+                    ..RocksDbWalletBuildOptions::for_local_tests()
+                },
+            )?
+            .report
+            .canonical_source_identity();
+            let control =
+                MutableCanonicalControl::new(writer_status_for_store(writer.canonical_primary()?));
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = format!("http://{}", listener.local_addr()?);
+            let cancel = CancellationToken::new();
+            let server_task = tokio::spawn({
+                let control = control.clone();
+                let shutdown = cancel.clone().cancelled_owned();
+                async move {
+                    Server::builder()
+                        .add_service(CanonicalControlServer::new(control))
+                        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
+                        .await
+                }
+            });
+            Ok(Self {
+                activations,
+                chain,
+                address,
+                writer,
+                wallet_primary_path,
+                wallet_source,
+                control,
+                endpoint,
+                cancel,
+                server_task,
+                temporary,
+            })
+        }
+
+        async fn bootstrap_publisher_every(
+            &self,
+            catchup_interval: Duration,
+        ) -> Result<(WalletServingPairPublisher, WalletServingPairSlot), Box<dyn std::error::Error>>
+        {
+            let config = WalletServingPairConfig {
+                catchup_interval,
+                expected_raw_blob_retention: self.writer.canonical_primary()?.raw_blob_retention(),
+                ..wallet_serving_pair_config(
+                    self.writer.canonical_primary_path().to_path_buf(),
+                    self.temporary.path().join("canonical-secondaries"),
+                    self.wallet_primary_path.clone(),
+                    self.temporary.path().join("wallet-secondaries"),
+                    Arc::new(self.activations.clone()),
+                )?
+            };
+            Ok(
+                WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
+                    config,
+                    WalletServingReadiness::without_node_source(
+                        zinder_runtime::Readiness::default(),
+                    ),
+                    &self.endpoint,
+                    None,
+                )
+                .await?,
+            )
+        }
+
+        /// Streams the address's outputs from the current pair of `slot`,
+        /// [`SPLIT_PAGE_SIZE`] outputs per page read.
+        fn open_stream(
+            &self,
+            slot: &WalletServingPairSlot,
+        ) -> Result<crate::TransparentAddressUnspentOutputs, Box<dyn std::error::Error>> {
+            let pair = slot.capture();
+            let chain_epoch = pair.canonical().chain_epoch()?;
+            Ok(crate::TransparentAddressUnspentOutputs::spawn_paged(
+                slot.clone(),
+                pair,
+                &crate::TransparentAddressUnspentOutputsRequest {
+                    address_script_hash: self.address,
+                    start_height: BlockHeight::new(0),
+                },
+                chain_epoch,
+                SPLIT_PAGE_SIZE,
+            ))
+        }
+
+        /// Commits block 3 and serves the writer status that attests it, then
+        /// projects the block into the wallet primary, as the projector
+        /// follows the writer.
+        fn append_block(&mut self) -> Result<CanonicalEventFence, Box<dyn std::error::Error>> {
+            let settled = self.writer.canonical_primary()?.chain_epoch()?;
+            let settled_tip = BlockId::new(settled.settled_tip_height, settled.settled_tip_hash);
+            let fence = self.writer.append_live_block(&self.chain)?;
+            self.control
+                .set_writer_status(writer_status_for_store(self.writer.canonical_primary()?));
+            let projector_secondary = RocksDbCanonicalSecondary::open_ready(
+                self.writer.canonical_primary_path(),
+                self.temporary.path().join("projector-canonical-secondary"),
+                &self.activations,
+                CanonicalStoreWorkload::Wallet,
+                self.writer.canonical_primary()?.raw_blob_retention(),
+                CanonicalReorgPolicy::new(100)?,
+                RocksDbResourceBudget::for_local_tests(),
+            )?;
+            let mut wallet_primary = RocksDbWalletStore::open_ready(
+                &self.wallet_primary_path,
+                Network::ZcashRegtest,
+                self.wallet_source,
+                RocksDbResourceBudget::for_local_tests(),
+            )?;
+            self.wallet_source = reconcile_wallet_primary(
+                &mut wallet_primary,
+                &projector_secondary,
+                self.wallet_source,
+                fence,
+                settled_tip,
+            )?;
+            Ok(fence)
         }
 
         async fn shutdown(self) -> Result<(), Box<dyn std::error::Error>> {

@@ -206,9 +206,10 @@ the writer's fence moved. A read that fails this way therefore marks its pair:
   more on the pair that answers its epoch. An unpinned read uses the new
   current pair. A pinned read, and a stream that continues at its own epoch,
   uses only a pair at that epoch.
-- A pinned read whose epoch only the marked pair served fails with
-  `CHAIN_EPOCH_PIN_UNAVAILABLE`. A read whose replacement is not published in
-  time fails with its storage error, which clients retry.
+- A pinned read whose epoch only the marked pair served, and a stream whose
+  replacement serves a newer epoch, fail with `CHAIN_EPOCH_PIN_UNAVAILABLE`.
+  A read whose replacement is not published in time fails with its storage
+  error, which clients retry.
 
 Corruption, admission, and every other storage failure still fail the read
 without marking the pair. A marked generation drains and is recycled like any
