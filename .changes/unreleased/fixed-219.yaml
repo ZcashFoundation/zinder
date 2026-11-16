@@ -1,6 +1,0 @@
-kind: fixed
-body: 'Canonical construction again cross-checks every tree-state checkpoint it writes: if a checkpoint''s encoding does not match the note-commitment tree that construction built, `zinder-ingest` stops before publishing the store. Since v0.15.1 only the build-tip checkpoint was compared. Live following is unchanged.'
-time: 2026-11-16T11:21:41.401128766Z
-custom:
-    Bump: patch
-    PR: "219"

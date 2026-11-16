@@ -1,6 +1,0 @@
-kind: changed
-body: Zinder now bundles RocksDB 11.12 through rust-rocksdb 0.54, which fixes a secondary reader serving stale values from write-ahead log entries the primary already flushed and secondary catch-up that slowed with file count. Stores written by v0.15.1 open unchanged and v0.15.1 reads canonical and wallet stores written by this version. The `tickers` statistics level now collects tickers only and no longer records size histograms.
-time: 2026-11-16T12:20:55.743762709Z
-custom:
-    Bump: patch
-    PR: "225"

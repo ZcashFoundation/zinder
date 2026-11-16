@@ -1,6 +1,0 @@
-kind: fixed
-body: A wallet transition over `projector.follow.max_transition_logical_bytes` no longer makes `zinder-projector` exit and restart in a loop. The projector stays up and reports the new readiness cause `wallet_transition_limit_exceeded` with the configured limit and a lower bound on the bytes required, keeps its retention lease, and retries only when the transition changes. The single-volume images keep the container running and their healthcheck passing while it is parked; raise the setting and restart to resume. The readiness protocol gains the cause and its detail message.
-time: 2026-11-16T12:20:53.362750192Z
-custom:
-    Bump: minor
-    PR: "224"
