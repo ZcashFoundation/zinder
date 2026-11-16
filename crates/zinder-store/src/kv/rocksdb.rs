@@ -661,6 +661,28 @@ pub fn build_block_based_table_factory(cache: &Cache) -> BlockBasedOptions {
     bbt
 }
 
+/// Reports whether `error` says a table file the failing handle still names is
+/// absent from disk.
+///
+/// A secondary instance does not keep the primary's table files alive. Once
+/// the primary's compaction deletes a file, a secondary read that has to
+/// reopen it fails this way until the secondary catches up past the deletion
+/// or is reopened. Corruption, a missing MANIFEST or WAL, and every other
+/// failure return `false`. `rust-rocksdb` exposes only the status text, so
+/// the check matches the I/O status `RocksDB` builds for an absent `.sst`.
+#[must_use]
+pub fn is_missing_table_file_error(error: &rust_rocksdb::Error) -> bool {
+    is_missing_table_file_status(&error.kind(), error.as_ref())
+}
+
+fn is_missing_table_file_status(kind: &rust_rocksdb::ErrorKind, message: &str) -> bool {
+    matches!(
+        kind,
+        rust_rocksdb::ErrorKind::IOError | rust_rocksdb::ErrorKind::NotFound
+    ) && message.contains("No such file or directory")
+        && message.contains(".sst")
+}
+
 const PER_CF_INT_PROPERTIES: [&str; 13] = [
     "rocksdb.estimate-live-data-size",
     "rocksdb.total-sst-files-size",
@@ -715,6 +737,28 @@ mod tests {
         assert!(throttle.should_sample());
         assert!(!throttle.should_sample());
         assert!(!throttle.should_sample());
+    }
+
+    #[test]
+    fn only_an_absent_table_file_is_a_missing_table_file() {
+        assert!(is_missing_table_file_status(
+            &rust_rocksdb::ErrorKind::IOError,
+            "IO error: No such file or directory: While open a file for random read: \
+             /canonical/000199.sst: No such file or directory"
+        ));
+        assert!(!is_missing_table_file_status(
+            &rust_rocksdb::ErrorKind::IOError,
+            "IO error: No such file or directory: /canonical/MANIFEST-000123"
+        ));
+        assert!(!is_missing_table_file_status(
+            &rust_rocksdb::ErrorKind::Corruption,
+            "Corruption: block checksum mismatch: stored = 1, computed = 2 \
+             in /canonical/000199.sst offset 0 size 64"
+        ));
+        assert!(!is_missing_table_file_status(
+            &rust_rocksdb::ErrorKind::IOError,
+            "IO error: Input/output error: While pread offset 0 len 64: /canonical/000199.sst"
+        ));
     }
 
     #[test]

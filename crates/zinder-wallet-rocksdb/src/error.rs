@@ -288,6 +288,23 @@ pub enum RocksDbWalletError {
 }
 
 impl RocksDbWalletError {
+    /// Reports whether this failure is only a table file that the handle
+    /// still names and the projector has since deleted.
+    ///
+    /// On a [`crate::RocksDbWalletSecondary`] this is the projector's
+    /// compaction overtaking the secondary's frozen view, not damage:
+    /// catching the secondary up or reopening it clears it. Corruption and
+    /// every other failure return `false`. See
+    /// [`zinder_store::is_missing_table_file_error`].
+    #[must_use]
+    pub fn is_missing_table_file(&self) -> bool {
+        matches!(
+            self,
+            Self::RocksDbOperation { source, .. }
+                if zinder_store::is_missing_table_file_error(source)
+        )
+    }
+
     pub(crate) fn rocksdb(operation: &'static str, source: rust_rocksdb::Error) -> Self {
         Self::RocksDbOperation { operation, source }
     }
