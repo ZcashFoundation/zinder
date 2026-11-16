@@ -1160,7 +1160,8 @@ Expected: every reader receives a non-zero number of lines, no
 
 ## Performance calibration (T2 + live latency)
 
-Two layers, both useful.
+Three layers, each answering a different question: synthetic budgets, live
+read latency, and per-block cost at the tip.
 
 ### T2 perf budgets
 
@@ -1206,6 +1207,85 @@ operator-facing telemetry. Compare across changes to spot regressions in
 the read path. The baseline does not exercise `transaction()` — that path
 goes through `mempool_broadcast_cycle` (broadcast then look up the mined
 txid) and `deep_chain` (high-volume canonical construction).
+
+### Tip-replay benchmark
+
+Use this to measure a performance change to the canonical writer or the wallet
+projector, one variable at a time. `zinder-bench rocksdb-tip-replay` replays a
+captured block range through the production canonical follower and the
+production wallet transition, on scratch copies of a canonical store and a
+wallet store that end just before the range. The
+[zinder-bench README](../../services/zinder-bench/README.md#4-measure-per-block-cost-at-the-tip)
+defines the timers, workload strata, and report fields.
+
+Prepare the inputs once per start height. Pick a range well below the node tip
+so no block in it can be reorged. This example uses a local Testnet node with
+cookie authentication:
+
+```bash
+cargo build --release -p zinder-bench
+bench=target/release/zinder-bench
+node=http://127.0.0.1:18232
+cookie=/var/run/zebra-auth/.cookie
+start=4618499
+end=4620999
+work=.tmp/tip-replay
+
+mkdir -p "$work"
+"$bench" rocksdb-storage-lifecycle \
+  --network zcash-testnet --json-rpc-addr "$node" --node-auth-cookie "$cookie" \
+  --canonical-store "$work/canonical" --wallet-store "$work/wallet" \
+  --tip-height "$start" --cpu-limit-cores 8 --memory-limit-bytes 17179869184 \
+  --report "$work/lifecycle.json"
+"$bench" capture \
+  --network zcash-testnet --json-rpc-addr "$node" --node-auth-cookie "$cookie" \
+  --from-height "$((start + 1))" --to-height "$end" --out "$work/fixture"
+"$bench" capture-tip-replay-checkpoints \
+  --network zcash-testnet --json-rpc-addr "$node" --node-auth-cookie "$cookie" \
+  --fixture "$work/fixture"
+```
+
+Before relying on a new set of inputs, check the replay against an
+independent wallet rebuild. Keep the scratch stores of one replay, rebuild a
+wallet from its canonical store, and compare the two digests, which must
+match:
+
+```bash
+"$bench" rocksdb-tip-replay \
+  --fixture "$work/fixture" \
+  --canonical-store "$work/canonical" --wallet-store "$work/wallet" \
+  --scratch-dir "$work/scratch-check" --report "$work/check.json" \
+  --software-revision "$(git rev-parse HEAD)" --keep-scratch
+"$bench" rocksdb-wallet-rebuild \
+  --network zcash-testnet --json-rpc-addr "$node" --node-auth-cookie "$cookie" \
+  --canonical-store "$work/scratch-check/repeat-0/canonical" \
+  --wallet-store "$work/rebuilt-wallet" > "$work/rebuild.json"
+jq -r '.wallet_projection_digest_hex' "$work/rebuild.json"
+jq -r '.repeats[-1].final_wallet.projection_digest_hex' "$work/check.json"
+rm -rf "$work/scratch-check" "$work/rebuilt-wallet"
+```
+
+Measure the baseline and the candidate from the same inputs, with the same
+`--repeat` count of at least 3, on a quiet host. The comparison refuses reports
+with different repeat counts. Build each binary from its own revision, give
+each run its own `--scratch-dir` and `--report`, then compare:
+
+```bash
+"$bench" rocksdb-tip-replay \
+  --fixture "$work/fixture" \
+  --canonical-store "$work/canonical" --wallet-store "$work/wallet" \
+  --scratch-dir "$work/scratch-baseline" --report "$work/baseline.json" \
+  --software-revision "$(git rev-parse HEAD)" --repeat 3
+"$bench" compare-tip-replay-reports \
+  --baseline "$work/baseline.json" --candidate "$work/candidate.json" \
+  --report "$work/comparison.json"
+```
+
+Each repeat copies both stores, so the scratch filesystem needs room for the
+inputs twice over; at a Testnet tip near height 4.6 million that is about
+11 GiB of canonical store and 3 GiB of wallet store each. The replay refuses to
+start when the copy would leave less than 2 GiB free, and it deletes each
+repeat's copy unless `--keep-scratch` is set. Delete `$work` when you are done.
 
 ### Heavy probes (trust-sensitive code only)
 

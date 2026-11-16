@@ -967,7 +967,7 @@ impl CanonicalFixtureReplayPlan {
 }
 
 impl CanonicalFixtureReplayCheckpointRecord {
-    fn decode(&self, field: &str) -> Result<CommitmentTreeCheckpoint, BenchError> {
+    pub(crate) fn decode(&self, field: &str) -> Result<CommitmentTreeCheckpoint, BenchError> {
         let block_hash = decode_lowercase_32_byte_hex(&self.block_id.hash_hex, field)?;
         let sapling = decode_frontier(
             ShieldedProtocol::Sapling,
@@ -1102,7 +1102,7 @@ fn decode_frontier(
         .transpose()
 }
 
-fn validate_fixture_activations(
+pub(crate) fn validate_fixture_activations(
     manifest: &FixtureManifest,
     activations: &NetworkUpgradeActivations,
 ) -> Result<(), BenchError> {
@@ -1153,7 +1153,7 @@ fn existing_plan_error(final_path: &Path) -> BenchError {
     ))
 }
 
-fn validate_digest_hex(encoded: &str, field: &str) -> Result<(), BenchError> {
+pub(crate) fn validate_digest_hex(encoded: &str, field: &str) -> Result<(), BenchError> {
     let bytes = decode_lowercase_hex(encoded, field)?;
     if bytes.len() != 32 {
         return Err(BenchError::fixture_format(format!(

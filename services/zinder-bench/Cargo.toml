@@ -17,10 +17,12 @@ clap = { workspace = true, features = ["derive"] }
 futures-util.workspace = true
 hex.workspace = true
 jsonrpsee.workspace = true
+metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 parking_lot.workspace = true
 prost.workspace = true
 rust-rocksdb.workspace = true
+rustix = { workspace = true, features = ["time"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
@@ -28,6 +30,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "signal", "time"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tokio-postgres.workspace = true
+tokio-util.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
