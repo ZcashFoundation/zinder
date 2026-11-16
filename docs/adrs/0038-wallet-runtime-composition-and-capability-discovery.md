@@ -176,13 +176,55 @@ changed. It does not repeat the cold scan of retained history. A generation
 whose pair is still held is never caught up. A generation whose catch-up or
 publication fails is closed, and its slot is opened cold when it is next used.
 
-A drained generation stays open, and an open secondary keeps the primary
-files of its last catch-up, including files the primary has since compacted
-away. The publisher therefore reuses drained generations in turn, starting
-after the generation it last published, so every opened generation is caught
-up again within a few publications and releases the files it no longer
+A drained generation stays open, and an open secondary keeps open the
+primary files its table cache holds, including files the primary has since
+compacted away. The publisher therefore reuses drained generations in turn,
+starting after the generation it last published, so every opened generation is
+caught up again within a few publications and releases the files it no longer
 references. It opens a slot it has not used only when no opened generation
 has drained, so the number of cold opens stays fixed once every slot is open.
+
+A secondary holds at most its budget's `max_open_files` table files open, so
+its view can also name a file it does not hold. When the canonical writer's or
+the wallet projector's compaction deletes such a file, a read through that
+generation that needs the file fails with a missing-file I/O error. The error
+lasts until the secondary catches up past the deletion or is reopened. A
+published pair is never caught up, so it would keep failing those reads until
+the writer's fence moved. A read that fails this way therefore marks its pair:
+
+- The marked pair leaves retention at once. A pin no longer captures it, and
+  a capture returns it only while it is still the current pair.
+- The read that marks the pair wakes the publisher. The publisher prepares a
+  candidate as it does for a new block, even when the writer's fence has not
+  moved, and publishes it at the writer's fence. It prepares none while the
+  writer is parked, because readiness already refuses traffic then. Later
+  reads that find the marked pair missing a file wait for the same
+  publication without waking the publisher again. When the replacement cannot
+  be published yet, such as while every inactive generation is taken, the
+  periodic refresh retries it.
+- The read waits up to five seconds for that publication. It then runs once
+  more on the pair that answers its epoch. An unpinned read uses the new
+  current pair. A pinned read, and a stream that continues at its own epoch,
+  uses only a pair at that epoch.
+- A pinned read whose epoch only the marked pair served, and a stream whose
+  replacement serves a newer epoch, fail with `CHAIN_EPOCH_PIN_UNAVAILABLE`.
+  A read whose replacement is not published in time fails with its storage
+  error, which clients retry.
+
+Corruption, admission, and every other storage failure still fail the read
+without marking the pair. A marked generation drains and is recycled like any
+released one, and its catch-up drops the deleted files from its view. A
+candidate whose RocksDB open or catch-up fails because the primary deleted a
+file it had just listed is a candidate failure: like replica lag, it leaves
+the published pair serving until the staleness ceiling. So is a candidate
+whose canonical store-control check, or whose canonical read during pair
+admission, finds such a file gone after the catch-up. Any other failure of
+either check still refuses the candidate.
+
+Marking a pair does not change readiness. The refresh that replaces it reports
+readiness as any refresh does, so a candidate failure that does not leave the
+published pair serving fails closed even when the writer's fence has not
+moved.
 
 Each publication carries the writer's fence at the moment its candidate
 converges. The publisher does not publish one pair for each height, so blocks
@@ -375,6 +417,28 @@ Expiring a pin at the next publication fails any workflow that spans a block.
 On a chain with 25-second blocks, a wallet that reads its transparent
 receivers under one pin in about 20 seconds fails about half of its walks.
 
+### Keep every table file of a secondary open
+
+A secondary opened with `max_open_files = -1` holds every table file open, so
+a file the primary deletes stays readable through its descriptor. It also
+keeps every table's metadata resident and every compacted-away file on disk
+for as long as the generation is open, for four generations at once. The
+bounded resource budget
+([ADR-0020](0020-bounded-rocksdb-resource-budget.md)) refuses negative values
+for that reason.
+
+### Catch the published pair up in place
+
+Catching the current pair up would drop the deleted file from its view, but
+it would also move the fence that in-flight reads and pins on that pair rely
+on. A replacement pair at the writer's fence costs one recycled catch-up and
+keeps every published pair immutable.
+
+### Retry on the current pair regardless of the pin
+
+A pinned read retried on a pair at another epoch would mix two epochs, which a
+pin forbids. The pin error tells the client to restart the workflow instead.
+
 ### Add compatibility aliases
 
 Aliases keep obsolete names and constructors available for new code. The
@@ -382,6 +446,14 @@ controlled consumer cutover uses the current contract without shims.
 
 ## Revision history
 
+- 2026-11-16: A read that finds a table file of its serving pair deleted by
+  the primary's compaction marks the pair. The publisher replaces the pair at
+  the writer's fence even when the fence has not moved, and the read runs once
+  more on the replacement when that pair answers the read's epoch. A pinned
+  read whose epoch only the marked pair served fails with
+  `CHAIN_EPOCH_PIN_UNAVAILABLE`. A candidate whose RocksDB open, catch-up,
+  store-control check, or admission read fails on such a file keeps the
+  published pair serving.
 - 2026-11-16: Each replaced serving pair answers reads pinned to its epoch for
   one minute after it was replaced, however fast later blocks arrive.
   Publication no longer releases the oldest retained pair, and a retained pair

@@ -984,6 +984,16 @@ pub enum QueryError {
     Node(#[from] SourceError),
 }
 
+impl QueryError {
+    /// Reports whether this read failed only because a table file its serving
+    /// pair still names was deleted by the canonical writer's or the wallet
+    /// projector's compaction.
+    pub(crate) fn is_missing_table_file(&self) -> bool {
+        matches!(self, Self::CanonicalStore(error) if error.is_missing_table_file())
+            || matches!(self, Self::WalletStore(error) if error.is_missing_table_file())
+    }
+}
+
 #[allow(
     clippy::wildcard_enum_match_arm,
     reason = "CanonicalStoreError is non-exhaustive; every other store failure keeps its typed source"

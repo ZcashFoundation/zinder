@@ -4,7 +4,9 @@
 //! time and hands each page to the caller before it reads the next, so the
 //! outputs one stream holds stay near a few pages however many outputs the
 //! address has. The producer stops when the caller drops the stream, and it
-//! fails the stream when the publisher revokes reads on the stream's pair.
+//! fails the stream when the publisher revokes reads on the stream's pair. A
+//! page read that finds a table file of the pair deleted continues on the
+//! pair that replaces it only at the stream's epoch.
 
 use std::{
     num::NonZeroU16,
@@ -22,7 +24,8 @@ use zinder_core::{
 use zinder_wallet_projection::WalletAddressUnspentOutputKey;
 
 use crate::{
-    QueryError, TransparentAddressUnspentOutputsRequest, WalletServingReadPair, serving_read,
+    QueryError, TransparentAddressUnspentOutputsRequest, WalletServingPairSlot,
+    WalletServingReadPair, serving_read,
 };
 
 /// Most outputs one storage read of a transparent unspent-output stream
@@ -43,9 +46,10 @@ const BUFFERED_PAGES: usize = 1;
 ///
 /// A stream that keeps reading after its pair has been released for longer
 /// than the released-pair read limit fails with
-/// [`QueryError::ChainEpochPinUnavailable`] for [`Self::chain_epoch`]. The
-/// caller discards the outputs it received and restarts the read at a newer
-/// epoch.
+/// [`QueryError::ChainEpochPinUnavailable`] for [`Self::chain_epoch`]. So
+/// does a stream whose pair lost a table file to compaction when the pair
+/// that replaces it serves a newer epoch. The caller discards the outputs it
+/// received and restarts the read at a newer epoch.
 #[derive(Debug)]
 pub struct TransparentAddressUnspentOutputs {
     /// Chain epoch every output is read at.
@@ -57,13 +61,15 @@ pub struct TransparentAddressUnspentOutputs {
 
 impl TransparentAddressUnspentOutputs {
     /// Starts reading the outputs `request` selects from `pair`, whose visible
-    /// epoch is `chain_epoch`.
+    /// epoch is `chain_epoch`, and which `slot` published.
     pub(crate) fn spawn(
+        slot: WalletServingPairSlot,
         pair: Arc<WalletServingReadPair>,
         request: &TransparentAddressUnspentOutputsRequest,
         chain_epoch: ChainEpoch,
     ) -> Self {
         Self::spawn_paged(
+            slot,
             pair,
             request,
             chain_epoch,
@@ -71,7 +77,10 @@ impl TransparentAddressUnspentOutputs {
         )
     }
 
-    fn spawn_paged(
+    /// Starts reading as [`Self::spawn`] does, `page_size` outputs per
+    /// storage read.
+    pub(crate) fn spawn_paged(
+        slot: WalletServingPairSlot,
         pair: Arc<WalletServingReadPair>,
         request: &TransparentAddressUnspentOutputsRequest,
         chain_epoch: ChainEpoch,
@@ -79,14 +88,7 @@ impl TransparentAddressUnspentOutputs {
     ) -> Self {
         let (pages, receiver) = mpsc::channel(BUFFERED_PAGES);
         tokio::spawn(
-            produce_pages(
-                pair,
-                request.address_script_hash,
-                request.start_height,
-                page_size,
-                pages,
-            )
-            .in_current_span(),
+            produce_pages(slot, pair, request.clone(), page_size, pages).in_current_span(),
         );
         Self {
             chain_epoch,
@@ -146,19 +148,25 @@ enum PageDelivery {
 /// Reads and sends pages until the set is complete, the caller drops the
 /// stream, a read fails, or the publisher revokes reads on `pair`.
 async fn produce_pages(
-    pair: Arc<WalletServingReadPair>,
-    address_script_hash: TransparentAddressScriptHash,
-    start_height: BlockHeight,
+    slot: WalletServingPairSlot,
+    mut pair: Arc<WalletServingReadPair>,
+    request: TransparentAddressUnspentOutputsRequest,
     page_size: NonZeroU16,
     pages: mpsc::Sender<Result<UnspentOutputPage, QueryError>>,
 ) {
+    let chain_epoch_id = pair.canonical_fence().chain_epoch_id();
+    let TransparentAddressUnspentOutputsRequest {
+        address_script_hash,
+        start_height,
+    } = request;
     let mut after = None;
     loop {
         if pair.are_reads_revoked() {
-            return fail(pair, &pages, None).await;
+            return fail(pair, &pages).await;
         }
-        let page_read = serving_read::off_reactor(Arc::clone(&pair), move |pair| {
-            read_page(&pair, address_script_hash, start_height, after, page_size)
+        let page_read = serving_read::read_pair(&slot, pair, Some(chain_epoch_id), move |pair| {
+            let page = read_page(&pair, address_script_hash, start_height, after, page_size)?;
+            Ok((pair, page))
         });
         // The blocking read cannot be interrupted, but a caller that leaves
         // while it runs should not have to wait for this task to notice.
@@ -168,8 +176,15 @@ async fn produce_pages(
             page_read = page_read => page_read,
         };
         let (outputs, next_page_after) = match page_read {
-            Ok(page) => page,
-            Err(error) => return fail(pair, &pages, Some(error)).await,
+            Ok((read_pair, page)) => {
+                pair = read_pair;
+                page
+            }
+            Err(error) => {
+                // The failed read has already released the pair.
+                let _ = pages.send(Err(error)).await;
+                return;
+            }
         };
         let last = next_page_after.is_none();
         let delivery = tokio::select! {
@@ -183,21 +198,19 @@ async fn produce_pages(
             PageDelivery::Sent if last => return,
             PageDelivery::Sent => after = next_page_after,
             PageDelivery::ReceiverDropped => return,
-            PageDelivery::ReadsRevoked => return fail(pair, &pages, None).await,
+            PageDelivery::ReadsRevoked => return fail(pair, &pages).await,
         }
     }
 }
 
-/// Releases `pair`, then ends the stream with `error`, or with the revoked
-/// pair's epoch when `error` is `None`.
+/// Releases `pair`, then ends the stream with the revoked pair's epoch.
 ///
 /// The pair is dropped before the send, which can wait on a stalled caller.
 async fn fail(
     pair: Arc<WalletServingReadPair>,
     pages: &mpsc::Sender<Result<UnspentOutputPage, QueryError>>,
-    error: Option<QueryError>,
 ) {
-    let error = error.unwrap_or_else(|| pair.revoked_read_error());
+    let error = pair.revoked_read_error();
     drop(pair);
     let _ = pages.send(Err(error)).await;
 }
@@ -436,6 +449,7 @@ mod tests {
     /// height 1, whose wallet reader counts unspent-output page reads.
     struct CountedPair {
         pair: Arc<WalletServingReadPair>,
+        slot: WalletServingPairSlot,
         query: WalletServingQuery<()>,
         address: TransparentAddressScriptHash,
         page_reads: Arc<AtomicUsize>,
@@ -474,13 +488,12 @@ mod tests {
                 Arc::new(canonical),
                 Arc::new(wallet),
             )?);
-            let query = WalletServingQuery::from_serving_pair_slot(
-                WalletServingPairSlot::new(Arc::clone(&pair)),
-                (),
-                Arc::new(activations),
-            );
+            let slot = WalletServingPairSlot::new(Arc::clone(&pair));
+            let query =
+                WalletServingQuery::from_serving_pair_slot(slot.clone(), (), Arc::new(activations));
             Ok(Self {
                 pair,
+                slot,
                 query,
                 address,
                 page_reads,
@@ -507,6 +520,7 @@ mod tests {
         /// [`TEST_PAGE_SIZE`] outputs per page.
         fn open_paged(&self) -> Result<TransparentAddressUnspentOutputs, Box<dyn Error>> {
             Ok(TransparentAddressUnspentOutputs::spawn_paged(
+                self.slot.clone(),
                 Arc::clone(&self.pair),
                 &TransparentAddressUnspentOutputsRequest {
                     address_script_hash: self.address,

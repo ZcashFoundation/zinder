@@ -935,6 +935,21 @@ pub enum CanonicalStoreError {
 }
 
 impl CanonicalStoreError {
+    /// Reports whether this failure is only a table file that the handle
+    /// still names and the primary has since deleted.
+    ///
+    /// On a [`RocksDbCanonicalSecondary`] this is the primary's compaction
+    /// overtaking the secondary's frozen view, not damage: catching the
+    /// secondary up or reopening it clears it. Corruption and every other
+    /// failure return `false`. See [`crate::is_missing_table_file_error`].
+    #[must_use]
+    pub fn is_missing_table_file(&self) -> bool {
+        matches!(
+            self,
+            Self::RocksDbOperation { source, .. } if crate::is_missing_table_file_error(source)
+        )
+    }
+
     fn admission(path: &std::path::Path, reason: impl Into<String>) -> Self {
         Self::AdmissionRefused {
             path: path.to_path_buf(),

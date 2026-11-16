@@ -3199,20 +3199,9 @@ fn read_manifest_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {
 }
 
 fn is_transient_secondary_missing_sst(error: &MaterializedViewStoreError) -> bool {
-    let Some(source) = std::error::Error::source(error)
+    std::error::Error::source(error)
         .and_then(|source| source.downcast_ref::<rust_rocksdb::Error>())
-    else {
-        return false;
-    };
-    is_missing_sst_error(&source.kind(), source.as_ref())
-}
-
-fn is_missing_sst_error(kind: &rust_rocksdb::ErrorKind, message: &str) -> bool {
-    matches!(
-        kind,
-        rust_rocksdb::ErrorKind::IOError | rust_rocksdb::ErrorKind::NotFound
-    ) && message.contains("No such file or directory")
-        && message.contains(".sst")
+        .is_some_and(zinder_store::is_missing_table_file_error)
 }
 
 #[cfg(test)]
@@ -3234,22 +3223,6 @@ mod tests {
             1,
             &[TEST_CONSUMER_CF],
         );
-
-    #[test]
-    fn secondary_catchup_retries_only_missing_sst_file_races() {
-        assert!(is_missing_sst_error(
-            &rust_rocksdb::ErrorKind::IOError,
-            "IO error: No such file or directory: /materialized-views/199308.sst"
-        ));
-        assert!(!is_missing_sst_error(
-            &rust_rocksdb::ErrorKind::IOError,
-            "IO error: No such file or directory: /materialized-views/MANIFEST-000123"
-        ));
-        assert!(!is_missing_sst_error(
-            &rust_rocksdb::ErrorKind::Corruption,
-            "Corruption: No such file or directory: /materialized-views/199308.sst"
-        ));
-    }
 
     #[test]
     fn reorg_incidents_cursor_is_event_only() {

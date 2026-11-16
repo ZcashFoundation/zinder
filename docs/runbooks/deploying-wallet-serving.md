@@ -473,6 +473,37 @@ inside Railway's thirty-second drain window. It exits zero once all three stop,
 and non-zero naming the survivors if any still holds a RocksDB instance open
 when the window expires.
 
+### Serving pair missing a table file
+
+Query logs `wallet_serving_pair_table_file_missing` at warning level when a
+read finds that the writer's or projector's compaction deleted a table file
+of its serving pair. The warning's `error` field includes the RocksDB status,
+which names the missing `.sst` path under the canonical or the wallet store.
+You do not need to act on an occasional warning. Query has already handled it:
+
+- it marked the pair and published a replacement at the writer's fence;
+- the read ran once more on the replacement; and
+- `zinder_wallet_serving_missing_table_file_pairs_total` counted the pair
+  once.
+
+The container does not restart, and readiness stays ready unless the refresh
+that prepares the replacement fails. When that candidate hits another deleted
+file, during its RocksDB open or catch-up or during the admission checks that
+follow them, readiness reports `serving_pair_stale`, which still admits
+traffic. Any other candidate failure refuses traffic until a later refresh
+succeeds. Both log `wallet_serving_pair_publisher_refresh_failed`.
+
+Investigate when the warnings follow most publications, or when clients keep
+receiving `STORAGE_UNAVAILABLE` for minutes after one. Both mean the primary
+replaces files faster than query replaces pairs, or the replacement cannot be
+published. Check the query log for `wallet_serving_pair_publisher_refresh_failed`
+warnings, and check
+`zinder_wallet_serving_pair_publisher_generation_wait_total` for refreshes
+that found no free generation. Then look for anything that rewrites the
+primary's files in bulk, such as a manual compaction. Restarting the service
+also clears the condition, because query reopens every generation, but query
+replaces the pair on its own once a generation is free.
+
 ### Wallet transition exceeds its logical-byte limit
 
 The projector logs `wallet_projection_following_parked` once, at error level,
