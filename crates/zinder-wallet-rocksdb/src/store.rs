@@ -1382,6 +1382,13 @@ impl RocksDbWalletFollowingStore {
         self.store.control.supported_reorg_depth
     }
 
+    /// Returns the DB-wide `RocksDB` statistics ticker count since this
+    /// handle opened, or zero when the resource budget turned statistics off.
+    #[must_use]
+    pub fn rocksdb_ticker_count(&self, ticker: rust_rocksdb::statistics::Ticker) -> u64 {
+        self.store.bounded_open.statistics.get_ticker_count(ticker)
+    }
+
     /// Durably raises the supported rollback depth to the canonical store's
     /// effective reorg window.
     ///

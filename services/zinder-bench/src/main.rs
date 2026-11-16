@@ -640,6 +640,32 @@ mod tests {
         ])?;
 
         assert!(matches!(replay.command, Command::RocksDbTipReplay(_)));
+        let tip_replay_with = |extra: [&str; 2]| {
+            Cli::try_parse_from(
+                [
+                    "zinder-bench",
+                    "rocksdb-tip-replay",
+                    "--fixture",
+                    "fixture",
+                    "--canonical-store",
+                    "canonical",
+                    "--wallet-store",
+                    "wallet",
+                    "--scratch-dir",
+                    "scratch",
+                    "--report",
+                    "report.json",
+                    "--software-revision",
+                    "5079515",
+                ]
+                .into_iter()
+                .chain(extra),
+            )
+        };
+        assert!(tip_replay_with(["--wallet-io-mode", "buffered"]).is_ok());
+        assert!(tip_replay_with(["--canonical-io-mode", "direct"]).is_ok());
+        assert!(tip_replay_with(["--wallet-io-mode", "mmap"]).is_err());
+        assert!(tip_replay_with(["--wallet-rocksdb-statistics", "--keep-scratch"]).is_ok());
         assert!(matches!(
             checkpoints.command,
             Command::CaptureTipReplayCheckpoints(_)

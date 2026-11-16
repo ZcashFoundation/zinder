@@ -12,6 +12,7 @@ mod measurement;
 mod report;
 mod scratch;
 mod session;
+mod statistics;
 
 use std::{
     num::NonZeroU64,
@@ -34,20 +35,21 @@ use zinder_runtime::{
     resolve_canonical_writer_rocksdb_budget, resolve_wallet_projection_writer_rocksdb_budget,
 };
 use zinder_source::NodeSource;
-use zinder_store::{CanonicalReorgPolicy, RawBlobRetention};
+use zinder_store::{CanonicalReorgPolicy, RawBlobRetention, RocksDbIoMode, RocksDbResourceBudget};
 use zinder_wallet_projection::WalletProjectionReadyEvidence;
 use zinder_wallet_rocksdb::MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES;
 
 pub(crate) use compare::{CompareTipReplayReportsArgs, run_compare_tip_replay_reports};
-use measurement::{BlockSample, BlockTimings, BlockWorkload, PERCENTILE_METHOD, STRATUM_RULES};
+use measurement::{BlockSample, BlockWorkload, PERCENTILE_METHOD, STRATUM_RULES};
 use report::{
     BudgetRecord, Configuration, FenceRecord, FixtureInput, Inputs, IoModeConfiguration, IoModes,
-    KeptScratch, Method, ProcessResources, Provenance, RepeatReport, StoreInput, TipReplayReport,
-    WalletRecord,
+    KeptScratch, Method, ProcessResources, Provenance, RepeatReport, RequestedIoModes, StoreInput,
+    TipReplayReport, WalletRecord, WalletStatisticsConfiguration,
 };
 use scratch::{RepeatScratch, ScratchRoot};
 use session::{
-    CanonicalPosition, FinishedStores, FollowStepRecorder, ReplayStores, StorePaths, StoreSettings,
+    CanonicalPosition, FinishedStores, FollowStepRecorder, ReplayStores, ReplayedBlock, StorePaths,
+    StoreSettings,
 };
 
 /// The projector's default ceiling on one wallet transition's logical bytes.
@@ -102,6 +104,27 @@ pub(crate) struct RocksDbTipReplayArgs {
     /// Block cache of the wallet store (default: the production wallet writer budget).
     #[arg(long)]
     wallet_block_cache_bytes: Option<u64>,
+    /// I/O mode of the canonical writer and its secondary: `direct` tries direct
+    /// reads, as production does, and falls back to buffered reads when the
+    /// filesystem rejects them; `buffered` skips the direct attempt.
+    #[arg(
+        long = "canonical-io-mode",
+        default_value = "direct",
+        value_parser = parse_io_mode
+    )]
+    canonical_io_mode: RocksDbIoMode,
+    /// I/O mode of the wallet store, with the same choices as `--canonical-io-mode`.
+    #[arg(
+        long = "wallet-io-mode",
+        default_value = "direct",
+        value_parser = parse_io_mode
+    )]
+    wallet_io_mode: RocksDbIoMode,
+    /// Collect the wallet store's `RocksDB` statistics tickers and report their
+    /// per-block deltas. Off by default, which also opens the wallet store with
+    /// statistics collection off, because collection can perturb timings.
+    #[arg(long = "wallet-rocksdb-statistics")]
+    wallet_rocksdb_statistics: bool,
     /// Keep the final repeat's scratch stores instead of deleting them.
     #[arg(long)]
     keep_scratch: bool,
@@ -139,7 +162,7 @@ struct RepeatOutcome {
     start_wallet: WalletProjectionReadyEvidence,
     effective_reorg_window_blocks: u32,
     finished: FinishedStores,
-    timings: Vec<BlockTimings>,
+    blocks: Vec<ReplayedBlock>,
     history: Vec<(u32, BlockWorkload)>,
     replayed: Vec<(u32, BlockWorkload)>,
     peak_rss_bytes: Option<u64>,
@@ -294,10 +317,12 @@ fn store_settings(
     args: &RocksDbTipReplayArgs,
     manifest: &FixtureManifest,
 ) -> Result<StoreSettings, BenchError> {
-    let budget_override = |block_cache_bytes| RocksDbResourceBudgetSection {
-        block_cache_bytes,
-        ..RocksDbResourceBudgetSection::default()
-    };
+    let budget_override =
+        |block_cache_bytes, statistics_level: Option<&str>| RocksDbResourceBudgetSection {
+            block_cache_bytes,
+            statistics_level: statistics_level.map(str::to_owned),
+            ..RocksDbResourceBudgetSection::default()
+        };
     let invalid_budget =
         |error: zinder_runtime::ConfigError| BenchError::invalid_argument(error.to_string());
     Ok(StoreSettings {
@@ -305,23 +330,47 @@ fn store_settings(
         fixture_activations: manifest.activations_typed()?,
         raw_blob_retention: args.raw_blob_retention,
         reorg_policy: CanonicalReorgPolicy::new(args.reorg_window_blocks)?,
-        canonical_writer_budget: resolve_canonical_writer_rocksdb_budget(budget_override(
-            args.canonical_block_cache_bytes,
-        ))
-        .map_err(invalid_budget)?,
-        canonical_secondary_budget: resolve_canonical_reader_rocksdb_budget(budget_override(
-            args.canonical_secondary_block_cache_bytes,
-        ))
-        .map_err(invalid_budget)?,
-        wallet_budget: resolve_wallet_projection_writer_rocksdb_budget(budget_override(
-            args.wallet_block_cache_bytes,
-        ))
-        .map_err(invalid_budget)?,
+        canonical_writer_budget: RocksDbResourceBudget {
+            preferred_io_mode: args.canonical_io_mode,
+            ..resolve_canonical_writer_rocksdb_budget(budget_override(
+                args.canonical_block_cache_bytes,
+                None,
+            ))
+            .map_err(invalid_budget)?
+        },
+        canonical_secondary_budget: RocksDbResourceBudget {
+            preferred_io_mode: args.canonical_io_mode,
+            ..resolve_canonical_reader_rocksdb_budget(budget_override(
+                args.canonical_secondary_block_cache_bytes,
+                None,
+            ))
+            .map_err(invalid_budget)?
+        },
+        wallet_budget: RocksDbResourceBudget {
+            preferred_io_mode: args.wallet_io_mode,
+            ..resolve_wallet_projection_writer_rocksdb_budget(budget_override(
+                args.wallet_block_cache_bytes,
+                Some(if args.wallet_rocksdb_statistics {
+                    "tickers"
+                } else {
+                    "off"
+                }),
+            ))
+            .map_err(invalid_budget)?
+        },
+        collect_wallet_tickers: args.wallet_rocksdb_statistics,
         max_transition_logical_bytes: NonZeroU64::new(args.max_transition_logical_bytes)
             .ok_or_else(|| {
                 BenchError::invalid_argument("--max-transition-logical-bytes must be non-zero")
             })?,
     })
+}
+
+fn parse_io_mode(text: &str) -> Result<RocksDbIoMode, String> {
+    [RocksDbIoMode::Direct, RocksDbIoMode::Buffered]
+        .into_iter()
+        .find(|mode| mode.as_str() == text)
+        .ok_or_else(|| format!("expected `direct` or `buffered`, found `{text}`"))
 }
 
 fn fixture_block_ids(
@@ -374,9 +423,9 @@ fn run_repeat(
     let store_open = open_started.elapsed();
 
     let replay_clock = ProcessClock::start();
-    let mut timings = Vec::with_capacity(plan.fixture_blocks.len());
+    let mut blocks = Vec::with_capacity(plan.fixture_blocks.len());
     for (replayed, expected_tip) in (1_u32..).zip(&plan.fixture_blocks) {
-        timings.push(stores.replay_block(runtime, recorder, *expected_tip)?);
+        blocks.push(stores.replay_block(runtime, recorder, *expected_tip)?);
         if replayed % PROGRESS_INTERVAL_BLOCKS == 0 {
             tracing::info!(
                 target: "zinder::bench",
@@ -410,7 +459,7 @@ fn run_repeat(
         start_wallet,
         effective_reorg_window_blocks,
         finished,
-        timings,
+        blocks,
         history,
         replayed,
         peak_rss_bytes: peak_rss().bytes,
@@ -518,7 +567,9 @@ fn build_report(
             peak_rss_source: peak.source.to_owned(),
         },
         aggregate,
-        unavailable_measurements: report::unavailable_measurements(),
+        unavailable_measurements: report::unavailable_measurements(
+            plan.args.wallet_rocksdb_statistics,
+        ),
         repeats,
     })
 }
@@ -589,9 +640,20 @@ fn report_configuration(plan: &TipReplayPlan, first: &RepeatOutcome) -> Configur
         canonical_secondary_budget: BudgetRecord::from(plan.settings.canonical_secondary_budget),
         wallet_budget: BudgetRecord::from(plan.settings.wallet_budget),
         rocksdb_io_mode: IoModeConfiguration {
-            selectable: false,
-            policy: "every store opens with direct I/O and falls back to buffered I/O when direct I/O cannot open".to_owned(),
+            policy: "direct opens with direct I/O and falls back to buffered I/O when direct I/O cannot open; buffered skips the direct attempt".to_owned(),
+            requested: RequestedIoModes {
+                canonical: plan.args.canonical_io_mode.as_str().to_owned(),
+                wallet: plan.args.wallet_io_mode.as_str().to_owned(),
+            },
             resolved: IoModes::from(&first.finished.io_modes),
+        },
+        wallet_statistics: WalletStatisticsConfiguration {
+            collected: plan.args.wallet_rocksdb_statistics,
+            tickers: if plan.args.wallet_rocksdb_statistics {
+                statistics::reported_ticker_names()
+            } else {
+                Vec::new()
+            },
         },
         event_retention_pruning: "disabled".to_owned(),
     }
@@ -601,13 +663,14 @@ fn repeat_report(outcome: RepeatOutcome, strata: &[Vec<measurement::Stratum>]) -
     let blocks: Vec<BlockSample> = outcome
         .replayed
         .iter()
-        .zip(&outcome.timings)
+        .zip(&outcome.blocks)
         .zip(strata)
-        .map(|(((height, workload), timings), strata)| BlockSample {
+        .map(|(((height, workload), replayed), strata)| BlockSample {
             height: *height,
             workload: *workload,
             strata: strata.clone(),
-            timings_ms: *timings,
+            timings_ms: replayed.timings,
+            wallet_ticker_deltas: replayed.wallet_tickers.clone(),
         })
         .collect();
     let replay_wall_seconds = outcome.replay.wall.as_secs_f64();

@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use zinder_core::CanonicalBlockFacts;
 
+use super::statistics::{TickerDeltas, TickerSummaries};
+
 /// Percentile method named in every report and comparison.
 pub(super) const PERCENTILE_METHOD: &str = "nearest-rank";
 
@@ -168,6 +170,10 @@ pub(super) struct BlockSample {
     pub(super) workload: BlockWorkload,
     pub(super) strata: Vec<Stratum>,
     pub(super) timings_ms: BlockTimings,
+    /// Wallet-store ticker deltas of the block's transition; present only when
+    /// the replay collected statistics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) wallet_ticker_deltas: Option<TickerDeltas>,
 }
 
 /// Nearest-rank summary of one timer, in milliseconds.
@@ -203,7 +209,10 @@ impl LatencySummary {
 }
 
 /// Returns the sample at 1-based rank `ceil(n * q / 10,000)` of ascending samples.
-fn nearest_rank(sorted: &[f64], quantile_per_ten_thousand: u64) -> Option<f64> {
+pub(super) fn nearest_rank<Sample: Copy>(
+    sorted: &[Sample],
+    quantile_per_ten_thousand: u64,
+) -> Option<Sample> {
     let sample_count = u64::try_from(sorted.len()).ok()?;
     let rank = sample_count
         .checked_mul(quantile_per_ten_thousand)?
@@ -250,11 +259,14 @@ impl TimerSummaries {
     }
 }
 
-/// Block count and timer summaries for one stratum; `timers` is `null` when empty.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// Block count and summaries for one stratum; `timers` is `null` when empty.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(super) struct StratumSummary {
     pub(super) block_count: u32,
     pub(super) timers: Option<TimerSummaries>,
+    /// Wallet-store ticker deltas per block; `null` unless the replay
+    /// collected statistics and the stratum holds blocks.
+    pub(super) wallet_tickers: Option<TickerSummaries>,
 }
 
 impl StratumSummary {
@@ -262,12 +274,18 @@ impl StratumSummary {
         Self {
             block_count: u32::try_from(samples.len()).unwrap_or(u32::MAX),
             timers: TimerSummaries::from_samples(samples),
+            wallet_tickers: TickerSummaries::from_deltas(
+                &samples
+                    .iter()
+                    .filter_map(|sample| sample.wallet_ticker_deltas.as_ref())
+                    .collect::<Vec<_>>(),
+            ),
         }
     }
 }
 
-/// Timer summaries over all blocks and over each workload stratum.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// Summaries over all blocks and over each workload stratum.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(super) struct TimerReport {
     pub(super) all_blocks: StratumSummary,
     pub(super) no_transparent_activity: StratumSummary,
@@ -355,7 +373,7 @@ mod tests {
         assert_eq!(bits(nearest_rank(&sorted, 9_900)), bits(Some(990.0)));
         assert_eq!(bits(nearest_rank(&sorted, 9_990)), bits(Some(999.0)));
         assert_eq!(bits(nearest_rank(&[7.0], 9_990)), bits(Some(7.0)));
-        assert_eq!(nearest_rank(&[], 5_000), None);
+        assert_eq!(nearest_rank::<f64>(&[], 5_000), None);
     }
 
     #[test]

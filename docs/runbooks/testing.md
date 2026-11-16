@@ -1281,6 +1281,27 @@ each run its own `--scratch-dir` and `--report`, then compare:
   --report "$work/comparison.json"
 ```
 
+To measure the read path, replay the same inputs once per I/O mode and compare
+the reports. `--wallet-io-mode` and `--canonical-io-mode` take `direct` (the
+production policy) or `buffered`, and the report records the mode each store
+resolved:
+
+```bash
+"$bench" rocksdb-tip-replay \
+  --fixture "$work/fixture" \
+  --canonical-store "$work/canonical" --wallet-store "$work/wallet" \
+  --scratch-dir "$work/scratch-buffered" --report "$work/buffered.json" \
+  --software-revision "$(git rev-parse HEAD)" --repeat 3 \
+  --wallet-io-mode buffered
+```
+
+To see why a wallet read costs what it does, add `--wallet-rocksdb-statistics`
+to both runs of a pair. The report then carries the wallet store's `RocksDB`
+ticker deltas per block and per workload stratum: point reads, Bloom filter
+outcomes, and block-cache misses. Collection can change timings, so measure
+timings on runs without it, and note that the comparison refuses a run that
+collected statistics against one that did not.
+
 Each repeat copies both stores, so the scratch filesystem needs room for the
 inputs twice over; at a Testnet tip near height 4.6 million that is about
 11 GiB of canonical store and 3 GiB of wallet store each. The replay refuses to

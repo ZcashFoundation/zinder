@@ -14,7 +14,7 @@ use super::{
 /// Contract identity of a tip replay report.
 pub(super) const REPORT_CONTRACT_IDENTITY: &str = "rocksdb-tip-replay";
 /// Version of the tip replay report shape.
-pub(super) const REPORT_FORMAT_VERSION: u32 = 1;
+pub(super) const REPORT_FORMAT_VERSION: u32 = 2;
 
 /// Complete evidence from one tip replay run.
 #[derive(Debug, Serialize, Deserialize)]
@@ -218,6 +218,7 @@ pub(super) struct Configuration {
     pub(super) canonical_secondary_budget: BudgetRecord,
     pub(super) wallet_budget: BudgetRecord,
     pub(super) rocksdb_io_mode: IoModeConfiguration,
+    pub(super) wallet_statistics: WalletStatisticsConfiguration,
     /// The writer's age-based event pruning, which never runs in a replay.
     pub(super) event_retention_pruning: String,
 }
@@ -250,13 +251,32 @@ impl From<RocksDbResourceBudget> for BudgetRecord {
     }
 }
 
-/// How the stores chose their I/O mode, and what they resolved to.
+/// How the stores chose their I/O mode, what the run requested, and what they resolved to.
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct IoModeConfiguration {
-    /// Whether the replay could select the mode; the stores fix the policy.
-    pub(super) selectable: bool,
     pub(super) policy: String,
+    pub(super) requested: RequestedIoModes,
     pub(super) resolved: IoModes,
+}
+
+/// The I/O mode requested for each store group.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct RequestedIoModes {
+    /// The canonical writer and its secondary.
+    pub(super) canonical: String,
+    pub(super) wallet: String,
+}
+
+/// Whether the wallet store's statistics tickers were collected.
+///
+/// Collection changes the wallet store's `RocksDB` options and can change
+/// timings, so a report of a collecting run is not comparable with one that
+/// did not collect.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct WalletStatisticsConfiguration {
+    pub(super) collected: bool,
+    /// `RocksDB` ticker names reported per block; empty when not collected.
+    pub(super) tickers: Vec<String>,
 }
 
 /// The I/O mode each store open resolved to.
@@ -328,16 +348,27 @@ pub(super) struct RepeatReport {
     pub(super) blocks: Vec<BlockSample>,
 }
 
-/// Measurements the stores do not expose on this revision.
-pub(super) fn unavailable_measurements() -> Vec<UnavailableMeasurement> {
+/// Measurements the report cannot provide on this run.
+///
+/// Wallet-store point-read counts and statistics deltas are available only
+/// when the replay collected them; the canonical stores expose neither.
+pub(super) fn unavailable_measurements(
+    wallet_statistics_collected: bool,
+) -> Vec<UnavailableMeasurement> {
+    if wallet_statistics_collected {
+        return vec![UnavailableMeasurement {
+            measurement: "canonical_store_read_statistics".to_owned(),
+            reason: "RocksDbCanonicalStore and RocksDbCanonicalSecondary expose no per-operation read counts or statistics tickers".to_owned(),
+        }];
+    }
     vec![
         UnavailableMeasurement {
             measurement: "point_read_counts".to_owned(),
-            reason: "RocksDbCanonicalStore, RocksDbCanonicalSecondary, and RocksDbWalletFollowingStore expose no per-operation read counts".to_owned(),
+            reason: "not collected; pass --wallet-rocksdb-statistics for the wallet store, and the canonical stores expose none".to_owned(),
         },
         UnavailableMeasurement {
             measurement: "rocksdb_statistics_deltas".to_owned(),
-            reason: "the canonical and wallet stores keep their RocksDB statistics private and export no ticker values".to_owned(),
+            reason: "not collected; pass --wallet-rocksdb-statistics for the wallet store, and the canonical stores expose none".to_owned(),
         },
     ]
 }
