@@ -125,9 +125,10 @@ An absent wallet store is built at a pinned canonical fence under two leases:
 The builder constructs an inactive wallet store, validates its source position
 and digest, catches up to the admitted fence, and publishes ready evidence.
 Following then applies each retained canonical event atomically, including
-bounded reorg replacement. The wallet store remains unavailable until its
-persisted position and digest authenticate the same source history admitted by
-the canonical reader.
+bounded reorg replacement. Each atomic transition publishes one write batch
+that holds the final value of every wallet row it touches. The wallet store
+remains unavailable until its persisted position and digest authenticate the
+same source history admitted by the canonical reader.
 
 ## Exact-fence serving
 

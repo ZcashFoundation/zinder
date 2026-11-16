@@ -19,8 +19,8 @@ use zinder_core::{
     ValidatedCanonicalBlockReplay, wire::UtxoSetCommitmentElement,
 };
 use zinder_store::{
-    CanonicalEventFence, CanonicalEventKind, CanonicalRetainedEvent, CanonicalStoreError,
-    MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS,
+    BoundedRocksDbOpen, CanonicalEventFence, CanonicalEventKind, CanonicalRetainedEvent,
+    CanonicalStoreError, MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS,
 };
 use zinder_wallet_projection::{
     WalletAddressBalance, WalletAddressTransaction, WalletAddressTransactionKey,
@@ -113,10 +113,13 @@ enum UndoSuffixCheck {
 
 /// Largest permitted in-process logical-byte plan for one wallet transition.
 ///
-/// Each caller must select a smaller nonzero ceiling. The planner accounts
-/// duplicated key/value payloads held by its `WriteBatch` and overlay before
-/// the synchronous publication point. The rows it remembers from durable
-/// reads use only what those leave of the ceiling.
+/// Each caller selects a nonzero ceiling no larger than this. A transition
+/// keeps the final key and value of each distinct row it touches and
+/// publishes exactly those rows, followed by the control record, in one
+/// write batch. The planner accounts each such row twice, once in its plan
+/// and once in that batch, plus the control record. The rows it remembers
+/// from durable reads use only what that leaves of the ceiling, and are
+/// dropped before the batch is built.
 pub const MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES: u64 = 1024 * 1024 * 1024;
 
 impl RocksDbWalletStore {
@@ -243,9 +246,10 @@ impl RocksDbWalletStore {
             resulting_fence.chain_event_sequence(),
             event_cursor,
         )?;
-        let (batch, ready_evidence, logical_bytes) = planner.into_publication(source_position);
+        let (planned_rows, ready_evidence, logical_bytes) =
+            planner.into_publication(source_position);
         self.publish_planned_transition(
-            batch,
+            planned_rows,
             ready_evidence,
             logical_bytes,
             cancelled_before_write,
@@ -383,9 +387,10 @@ impl RocksDbWalletStore {
             target_fence.chain_event_sequence(),
             event_cursor,
         )?;
-        let (batch, ready_evidence, logical_bytes) = planner.into_publication(source_position);
+        let (planned_rows, ready_evidence, logical_bytes) =
+            planner.into_publication(source_position);
         self.publish_planned_transition(
-            batch,
+            planned_rows,
             ready_evidence,
             logical_bytes,
             cancelled_before_write,
@@ -394,7 +399,7 @@ impl RocksDbWalletStore {
 
     fn publish_planned_transition<Cancel>(
         &mut self,
-        mut batch: WriteBatch,
+        planned_rows: PlannedRows,
         ready_evidence: WalletProjectionReadyEvidence,
         mut logical_bytes: TransitionLogicalByteAccounting,
         cancelled_before_write: Cancel,
@@ -419,6 +424,12 @@ impl RocksDbWalletStore {
             zinder_wallet_projection::WALLET_STORE_CONTROL_KEY,
             &encoded_control,
         )?;
+        let batch = coalesced_write_batch(
+            &self.bounded_open,
+            planned_rows,
+            zinder_wallet_projection::WALLET_STORE_CONTROL_KEY,
+            &encoded_control,
+        )?;
 
         // Re-admit immediately before publication so a sequential second
         // handle cannot overwrite a newer READY control it did not observe.
@@ -426,10 +437,6 @@ impl RocksDbWalletStore {
         if cancelled_before_write() {
             return Err(RocksDbWalletError::ProjectionTransitionCancelled);
         }
-        batch.put(
-            zinder_wallet_projection::WALLET_STORE_CONTROL_KEY,
-            encoded_control,
-        );
         let mut write_options = WriteOptions::default();
         write_options.set_sync(true);
         // A failed or unconfirmed write leaves no verified suffix, so the next
@@ -849,19 +856,25 @@ fn validate_transition_logical_byte_limit(
     Ok(requested_bytes)
 }
 
+/// Logical bytes that one transition holds against its limit before its write.
+///
+/// The plan keeps one final entry per distinct row it touches, and the write
+/// batch that publishes it copies exactly those entries, so each entry counts
+/// twice. The control record joins the batch last and counts once.
 #[derive(Debug)]
 struct TransitionLogicalByteAccounting {
     limit: u64,
-    batch: u64,
+    /// Key and final value bytes of every distinct row the plan touches.
     overlay: u64,
+    control: u64,
 }
 
 impl TransitionLogicalByteAccounting {
     const fn new(limit: u64) -> Self {
         Self {
             limit,
-            batch: 0,
             overlay: 0,
+            control: 0,
         }
     }
 
@@ -871,13 +884,7 @@ impl TransitionLogicalByteAccounting {
         encoded_value: &[u8],
         previous_overlay: Option<&Option<Vec<u8>>>,
     ) -> Result<(), RocksDbWalletError> {
-        let entry_bytes = logical_entry_bytes(key, Some(encoded_value))?;
-        self.reserve_batch_and_replace_overlay(
-            key,
-            entry_bytes,
-            previous_overlay,
-            Some(encoded_value),
-        )
+        self.replace_overlay_entry(key, previous_overlay, Some(encoded_value))
     }
 
     fn reserve_delete(
@@ -885,8 +892,7 @@ impl TransitionLogicalByteAccounting {
         key: &[u8],
         previous_overlay: Option<&Option<Vec<u8>>>,
     ) -> Result<(), RocksDbWalletError> {
-        let bytes = logical_entry_bytes(key, None)?;
-        self.reserve_batch_and_replace_overlay(key, bytes, previous_overlay, None)
+        self.replace_overlay_entry(key, previous_overlay, None)
     }
 
     fn reserve_control(
@@ -894,17 +900,15 @@ impl TransitionLogicalByteAccounting {
         key: &[u8],
         encoded_control: &[u8],
     ) -> Result<(), RocksDbWalletError> {
-        let batch_entry_bytes = logical_entry_bytes(key, Some(encoded_control))?;
-        let next_batch_bytes = checked_transition_bytes(self.batch, batch_entry_bytes)?;
-        self.ensure_within_limit(next_batch_bytes, self.overlay)?;
-        self.batch = next_batch_bytes;
+        let control_bytes = logical_entry_bytes(key, Some(encoded_control))?;
+        self.ensure_within_limit(self.overlay, control_bytes)?;
+        self.control = control_bytes;
         Ok(())
     }
 
-    fn reserve_batch_and_replace_overlay(
+    fn replace_overlay_entry(
         &mut self,
         key: &[u8],
-        batch_entry_bytes: u64,
         previous_overlay: Option<&Option<Vec<u8>>>,
         next_overlay_value: Option<&[u8]>,
     ) -> Result<(), RocksDbWalletError> {
@@ -913,25 +917,26 @@ impl TransitionLogicalByteAccounting {
             None => 0,
         };
         let next_overlay_entry_bytes = logical_entry_bytes(key, next_overlay_value)?;
-        let next_batch_bytes = checked_transition_bytes(self.batch, batch_entry_bytes)?;
         let next_overlay_bytes = self
             .overlay
             .checked_sub(previous_overlay_bytes)
             .ok_or(RocksDbWalletError::TransitionLogicalByteAccountingOverflow)?;
         let next_overlay_bytes =
             checked_transition_bytes(next_overlay_bytes, next_overlay_entry_bytes)?;
-        self.ensure_within_limit(next_batch_bytes, next_overlay_bytes)?;
-        self.batch = next_batch_bytes;
+        self.ensure_within_limit(next_overlay_bytes, self.control)?;
         self.overlay = next_overlay_bytes;
         Ok(())
     }
 
     fn ensure_within_limit(
         &self,
-        batch_bytes: u64,
         overlay_bytes: u64,
+        control_bytes: u64,
     ) -> Result<(), RocksDbWalletError> {
-        let required_bytes = checked_transition_bytes(batch_bytes, overlay_bytes)?;
+        let planned_and_batched_bytes = overlay_bytes
+            .checked_mul(2)
+            .ok_or(RocksDbWalletError::TransitionLogicalByteAccountingOverflow)?;
+        let required_bytes = checked_transition_bytes(planned_and_batched_bytes, control_bytes)?;
         if required_bytes > self.limit {
             return Err(RocksDbWalletError::TransitionLogicalByteLimit {
                 limit_bytes: self.limit,
@@ -941,10 +946,11 @@ impl TransitionLogicalByteAccounting {
         Ok(())
     }
 
-    /// Bytes of the limit that the planned batch and overlay leave unused.
+    /// Bytes of the limit that the planned rows and their write batch leave
+    /// unused.
     const fn unused_bytes(&self) -> u64 {
         self.limit
-            .saturating_sub(self.batch.saturating_add(self.overlay))
+            .saturating_sub(self.overlay.saturating_mul(2).saturating_add(self.control))
     }
 }
 
@@ -973,14 +979,81 @@ fn decode_undo(key: &[u8], encoded: &[u8]) -> Result<WalletReorgUndo, RocksDbWal
 
 type OverlayKey = (&'static str, Vec<u8>);
 
+/// The final value of every row one plan touches, or `None` for a row it
+/// deletes.
+type PlannedRows = BTreeMap<OverlayKey, Option<Vec<u8>>>;
+
+/// Write-batch header bytes: an 8-byte sequence number and a 4-byte count.
+const WRITE_BATCH_HEADER_BYTES: usize = 12;
+
+/// Largest framing of one write-batch record: a type tag, a column-family id,
+/// and the key and value lengths, each id or length a varint32 of at most five
+/// bytes.
+const WRITE_BATCH_RECORD_FRAMING_BYTES: usize = 16;
+
+/// Builds the one write batch that publishes a plan: the final value of each
+/// planned row in key order, followed by the control record.
+///
+/// The batch reserves its whole size up front, so building it never
+/// reallocates.
+fn coalesced_write_batch(
+    bounded_open: &BoundedRocksDbOpen,
+    planned_rows: PlannedRows,
+    control_key: &[u8],
+    encoded_control: &[u8],
+) -> Result<WriteBatch, RocksDbWalletError> {
+    let mut batch = WriteBatch::with_capacity_bytes(coalesced_write_batch_capacity(
+        &planned_rows,
+        control_key,
+        encoded_control,
+    ));
+    let mut family = None;
+    for ((family_name, key), planned) in planned_rows {
+        let handle = match family.take() {
+            Some((name, handle)) if name == family_name => handle,
+            Some(_) | None => column_family(bounded_open, family_name)?,
+        };
+        match planned {
+            Some(encoded) => batch.put_cf(&handle, key, encoded),
+            None => batch.delete_cf(&handle, key),
+        }
+        family = Some((family_name, handle));
+    }
+    batch.put(control_key, encoded_control);
+    Ok(batch)
+}
+
+/// Upper bound on the size of the write batch that publishes `planned_rows`
+/// and the control record.
+fn coalesced_write_batch_capacity(
+    planned_rows: &PlannedRows,
+    control_key: &[u8],
+    encoded_control: &[u8],
+) -> usize {
+    planned_rows.iter().fold(
+        WRITE_BATCH_HEADER_BYTES
+            .saturating_add(WRITE_BATCH_RECORD_FRAMING_BYTES)
+            .saturating_add(control_key.len())
+            .saturating_add(encoded_control.len()),
+        |capacity, ((_, key), planned)| {
+            capacity
+                .saturating_add(WRITE_BATCH_RECORD_FRAMING_BYTES)
+                .saturating_add(key.len())
+                .saturating_add(planned.as_ref().map_or(0, Vec::len))
+        },
+    )
+}
+
 /// Durable rows, or their absence, that one plan has read and not yet written.
 ///
 /// A plan runs under an exclusive borrow of the store's only writer handle,
 /// so its durable rows cannot change between two of its reads, and a later
 /// read of the same key reuses the first observation. The memo holds only the
-/// bytes that the plan's batch and overlay leave of its logical-byte limit,
-/// and forgets every read when they need that room, so it never changes
-/// which plans the limit refuses.
+/// bytes that the plan's rows and their write batch leave of its logical-byte
+/// limit, and forgets every read when they need that room, so it never
+/// changes which plans the limit refuses. The plan drops the memo before it
+/// builds that batch, so the memo, the planned rows, and the batch never hold
+/// more than the limit together.
 #[derive(Default)]
 struct DurableReadMemo {
     rows: BTreeMap<OverlayKey, Option<Vec<u8>>>,
@@ -1031,8 +1104,7 @@ impl DurableReadMemo {
 
 struct WalletTransitionPlanner<'store> {
     store: &'store RocksDbWalletStore,
-    batch: WriteBatch,
-    overlay: BTreeMap<OverlayKey, Option<Vec<u8>>>,
+    overlay: PlannedRows,
     durable_reads: DurableReadMemo,
     logical_bytes: TransitionLogicalByteAccounting,
     accumulator: WalletProjectionDigestBuilder,
@@ -1049,7 +1121,6 @@ impl<'store> WalletTransitionPlanner<'store> {
     fn new(store: &'store RocksDbWalletStore, max_logical_bytes: u64) -> Self {
         Self {
             store,
-            batch: WriteBatch::default(),
             overlay: BTreeMap::new(),
             durable_reads: DurableReadMemo::default(),
             logical_bytes: TransitionLogicalByteAccounting::new(max_logical_bytes),
@@ -1099,18 +1170,20 @@ impl<'store> WalletTransitionPlanner<'store> {
         Ok(())
     }
 
+    /// Ends the plan with its planned rows, the READY evidence they publish,
+    /// and their accounting, dropping the remembered durable reads.
     fn into_publication(
         self,
         source_position: WalletProjectionSourcePosition,
     ) -> (
-        WriteBatch,
+        PlannedRows,
         WalletProjectionReadyEvidence,
         TransitionLogicalByteAccounting,
     ) {
         let (projection_accumulator, projection_digest) =
             self.accumulator.finish_with_accumulator();
         (
-            self.batch,
+            self.overlay,
             WalletProjectionReadyEvidence {
                 source_position,
                 source_sequence_digest: self.source_sequence_digest,
@@ -2008,13 +2081,11 @@ impl<'store> WalletTransitionPlanner<'store> {
         key: &[u8],
         encoded_value: Vec<u8>,
     ) -> Result<(), RocksDbWalletError> {
-        let column_family = column_family(&self.store.bounded_open, column_family_name)?;
         let overlay_key = (column_family_name, key.to_vec());
         self.logical_bytes
             .reserve_put(key, &encoded_value, self.overlay.get(&overlay_key))?;
         self.durable_reads
             .release_for_write(&overlay_key, self.logical_bytes.unused_bytes())?;
-        self.batch.put_cf(&column_family, key, &encoded_value);
         self.overlay.insert(overlay_key, Some(encoded_value));
         Ok(())
     }
@@ -2024,13 +2095,11 @@ impl<'store> WalletTransitionPlanner<'store> {
         column_family_name: &'static str,
         key: &[u8],
     ) -> Result<(), RocksDbWalletError> {
-        let column_family = column_family(&self.store.bounded_open, column_family_name)?;
         let overlay_key = (column_family_name, key.to_vec());
         self.logical_bytes
             .reserve_delete(key, self.overlay.get(&overlay_key))?;
         self.durable_reads
             .release_for_write(&overlay_key, self.logical_bytes.unused_bytes())?;
-        self.batch.delete_cf(&column_family, key);
         self.overlay.insert(overlay_key, None);
         Ok(())
     }
@@ -2039,6 +2108,7 @@ impl<'store> WalletTransitionPlanner<'store> {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::{BTreeMap, BTreeSet},
         num::{NonZeroU32, NonZeroU64},
         path::Path,
     };
@@ -2046,7 +2116,7 @@ mod tests {
     #[cfg(unix)]
     use std::num::NonZeroU16;
 
-    use rust_rocksdb::statistics::Ticker;
+    use rust_rocksdb::{IteratorMode, statistics::Ticker};
     use tempfile::TempDir;
     use zinder_core::{
         BlockHash, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
@@ -2070,25 +2140,30 @@ mod tests {
         RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
     };
     use zinder_testkit::process_crash;
-    #[cfg(unix)]
-    use zinder_wallet_projection::WalletOutpointKey;
     use zinder_wallet_projection::{
-        WalletCanonicalSourceIdentity, WalletProjectionBuildLeaseRequest,
-        WalletProjectionBuildOwner, WalletProjectionContractError, WalletProjectionDigestBuilder,
+        WALLET_STORE_CONTROL_KEY, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
+        WalletOutpointKey, WalletProjectionBuildLeaseRequest, WalletProjectionBuildOwner,
+        WalletProjectionBuildState, WalletProjectionContractError, WalletProjectionDigestBuilder,
         WalletProjectionReadyEvidence, WalletProjectionRetainedEventAnchor,
-        WalletProjectionSourcePosition, WalletReorgUndo, WalletUtxoSetSummary,
+        WalletProjectionSourcePosition, WalletReorgUndo, WalletSpentOutput,
+        WalletStoreControlRecord, WalletUtxoSetSummary,
     };
 
     use super::{
-        DurableReadMemo, UndoRowWorkCounts, extend_source_sequence_digest,
+        DurableReadMemo, MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES, OverlayKey,
+        TransitionLogicalByteAccounting, UndoRowWorkCounts, WalletTransitionPlanner,
+        coalesced_write_batch, coalesced_write_batch_capacity, extend_source_sequence_digest,
         source_identity_from_fence, take_undo_row_work,
     };
     use crate::{
         RocksDbWalletBuildOptions, RocksDbWalletBuildStore, RocksDbWalletError,
         RocksDbWalletFollowingStore, RocksDbWalletStore, build_wallet_from_canonical,
         store::{
-            REORG_UNDO_COLUMN_FAMILY, RocksDbWalletBuilder, TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY,
-            WalletColdValidationConfig, column_family,
+            REORG_UNDO_COLUMN_FAMILY, RocksDbWalletBuilder,
+            TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY, TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY,
+            TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
+            TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY, WALLET_DATA_COLUMN_FAMILIES,
+            WalletColdValidationConfig, column_family, decode_only_control,
         },
     };
 
@@ -3502,12 +3577,20 @@ mod tests {
     fn open_coinbase_only_wallet(
         root: &Path,
     ) -> Result<RocksDbWalletStore, Box<dyn std::error::Error>> {
+        open_wallet_at_depth(root, COINBASE_ONLY_DEPTH)
+    }
+
+    /// Opens the wallet under `root` for following, raised to `depth`.
+    fn open_wallet_at_depth(
+        root: &Path,
+        depth: u32,
+    ) -> Result<RocksDbWalletStore, Box<dyn std::error::Error>> {
         let mut following = RocksDbWalletStore::open_ready_for_following(
             root.join("wallet"),
             Network::ZcashRegtest,
             RocksDbResourceBudget::for_local_tests(),
         )?;
-        following.raise_supported_reorg_depth(COINBASE_ONLY_DEPTH)?;
+        following.raise_supported_reorg_depth(depth)?;
         let source = WalletCanonicalSourceIdentity::from_ready_evidence(following.ready_evidence());
         Ok(following.into_ready_store(source)?)
     }
@@ -3564,5 +3647,458 @@ mod tests {
             secondary.scan_canonical_replay_range(replay_range)?,
         )?;
         Ok(())
+    }
+
+    #[test]
+    fn transition_accounting_charges_each_final_row_twice_and_control_once()
+    -> Result<(), RocksDbWalletError> {
+        const KEY: [u8; 4] = [0x11; 4];
+        const VALUE: [u8; 6] = [0x22; 6];
+        const CONTROL_KEY: &[u8] = b"ctl";
+        let refused_at = |outcome: Result<(), RocksDbWalletError>, limit: u64, required: u64| {
+            assert!(
+                matches!(
+                    outcome,
+                    Err(RocksDbWalletError::TransitionLogicalByteLimit {
+                        limit_bytes,
+                        required_bytes,
+                    }) if limit_bytes == limit && required_bytes == required
+                ),
+                "{outcome:?}"
+            );
+        };
+
+        // A delete that a put then replaces leaves the key and value, twice,
+        // and the control record once.
+        let delete_then_put = |limit| {
+            let mut accounting = TransitionLogicalByteAccounting::new(limit);
+            accounting.reserve_delete(&KEY, None)?;
+            accounting.reserve_put(&KEY, &VALUE, Some(&None))?;
+            accounting.reserve_control(CONTROL_KEY, &[0x33; 5])
+        };
+        let required = 2 * (4 + 6) + (3 + 5);
+        delete_then_put(required)?;
+        refused_at(delete_then_put(required - 1), required - 1, required);
+
+        // A put that a delete then replaces leaves only the key, twice, so the
+        // room the put needed is free again for the control record.
+        let put_then_delete = |control: &[u8]| {
+            let mut accounting = TransitionLogicalByteAccounting::new(2 * (4 + 6));
+            accounting.reserve_put(&KEY, &VALUE, None)?;
+            accounting.reserve_delete(&KEY, Some(&Some(VALUE.to_vec())))?;
+            accounting.reserve_control(CONTROL_KEY, control)
+        };
+        put_then_delete(&[0x33; 2 * 6 - 3])?;
+        refused_at(
+            put_then_delete(&[0x33; 2 * 6 - 2]),
+            2 * (4 + 6),
+            2 * 4 + 2 * 6 + 1,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn coalesced_batch_holds_one_record_per_planned_row() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = TempDir::new()?;
+        publish_checkpointed_wallet(temporary.path())?;
+        let wallet = open_wallet_at_depth(temporary.path(), 1)?;
+        let outpoint_key = [0x31; 36];
+        let address_key = [0x32; 32];
+        let mut planner =
+            WalletTransitionPlanner::new(&wallet, MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES);
+        planner.put_raw(
+            TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY,
+            &outpoint_key,
+            vec![1; 8],
+        )?;
+        planner.put_raw(
+            TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY,
+            &outpoint_key,
+            vec![2; 9],
+        )?;
+        planner.delete_raw(TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY, &outpoint_key)?;
+        planner.put_raw(
+            TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY,
+            &address_key,
+            vec![3; 8],
+        )?;
+        planner.delete_raw(TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY, &address_key)?;
+        let (planned_rows, _, _) =
+            planner.into_publication(wallet.ready_evidence().source_position);
+        assert_eq!(planned_rows.len(), 3);
+
+        let control = wallet.control.encode()?;
+        let capacity =
+            coalesced_write_batch_capacity(&planned_rows, WALLET_STORE_CONTROL_KEY, &control);
+        let batch = coalesced_write_batch(
+            &wallet.bounded_open,
+            planned_rows,
+            WALLET_STORE_CONTROL_KEY,
+            &control,
+        )?;
+        assert_eq!(batch.len(), 3 + 1);
+        assert!(
+            batch.size_in_bytes() <= capacity,
+            "batch of {} bytes exceeds its reserved {capacity}",
+            batch.size_in_bytes()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one proof keeps the derived row set, the refused and admitted limits, and the cold comparison together"
+    )]
+    fn hot_address_reorg_publishes_each_touched_row_once_within_twice_its_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for replacement in [
+            HotAddressBranch::SameTransactions,
+            HotAddressBranch::DistinctCoinbases,
+        ] {
+            let mut fixture = HotAddressReorg::publish(replacement)?;
+            let cold = build_wallet_from_canonical(
+                &fixture.secondary,
+                fixture.temporary.path().join("wallet-cold"),
+                RocksDbWalletBuildOptions {
+                    supported_reorg_depth: HOT_ADDRESS_BLOCKS,
+                    ..RocksDbWalletBuildOptions::for_local_tests()
+                },
+            )?;
+            let before = wallet_rows(&fixture.wallet)?;
+            let after = wallet_rows(&cold.store)?;
+            assert_ne!(before, after, "{replacement:?}");
+
+            // The reorg rolls back every row of the followed wallet and
+            // replays every row of the cold build, so its plan holds the final
+            // entry of each of their keys and of each unspent and address-index
+            // row it restores or creates for an output that it then spends.
+            let touched = rewritten_row_keys(&before, &after)?;
+            let final_entry_bytes: usize = touched
+                .iter()
+                .map(|key| key.1.len() + after.get(key).map_or(0, Vec::len))
+                .sum();
+            let next_control = WalletStoreControlRecord {
+                writer_generation: fixture.wallet.control.writer_generation + 1,
+                build_state: WalletProjectionBuildState::Ready(cold.store.ready_evidence().clone()),
+                ..fixture.wallet.control.clone()
+            }
+            .encode()?;
+            let required = u64::try_from(
+                2 * final_entry_bytes + WALLET_STORE_CONTROL_KEY.len() + next_control.len(),
+            )?;
+
+            let control_before = decode_only_control(&fixture.wallet.bounded_open)?;
+            let evidence_before = fixture.wallet.ready_evidence().clone();
+            let refused = fixture.apply_reorg(required - 1)?;
+            assert!(
+                matches!(
+                    refused,
+                    Err(RocksDbWalletError::TransitionLogicalByteLimit {
+                        limit_bytes,
+                        required_bytes,
+                    }) if limit_bytes == required - 1 && required_bytes == required
+                ),
+                "{replacement:?}: {refused:?}"
+            );
+            assert_eq!(fixture.wallet.ready_evidence(), &evidence_before);
+            assert_eq!(
+                decode_only_control(&fixture.wallet.bounded_open)?,
+                control_before
+            );
+            assert_eq!(wallet_rows(&fixture.wallet)?, before);
+
+            let keys_written_before = wallet_keys_written(&fixture.wallet);
+            fixture.apply_reorg(required)??;
+            assert_eq!(
+                wallet_keys_written(&fixture.wallet) - keys_written_before,
+                u64::try_from(touched.len() + 1)?,
+                "{replacement:?}"
+            );
+            assert_eq!(wallet_rows(&fixture.wallet)?, after, "{replacement:?}");
+            assert_eq!(
+                fixture.wallet.ready_evidence().projection_digest,
+                cold.store.ready_evidence().projection_digest
+            );
+            assert_eq!(
+                fixture.wallet.ready_evidence().row_counts,
+                cold.store.ready_evidence().row_counts
+            );
+            assert_eq!(fixture.wallet.ready_evidence(), cold.store.ready_evidence());
+            assert_eq!(
+                decode_only_control(&fixture.wallet.bounded_open)?.encode()?,
+                next_control
+            );
+        }
+        Ok(())
+    }
+
+    /// Blocks above the checkpoint that the hot-address chain holds and its
+    /// reorg replaces.
+    const HOT_ADDRESS_BLOCKS: u32 = 3;
+
+    /// Outputs each hot-address coinbase pays to the hot address.
+    const HOT_ADDRESS_OUTPUTS_PER_BLOCK: u32 = 4;
+
+    /// Hot-address outputs each hot-address block spends.
+    const HOT_ADDRESS_SPENDS_PER_BLOCK: u32 = 2;
+
+    /// Which chain a hot-address block belongs to.
+    #[derive(Clone, Copy, Debug)]
+    enum HotAddressBranch {
+        /// The blocks the wallet follows before the reorg.
+        Original,
+        /// Replacements that keep every transaction under new block hashes.
+        SameTransactions,
+        /// Replacements whose coinbases, and so every outpoint, differ.
+        DistinctCoinbases,
+    }
+
+    impl HotAddressBranch {
+        const fn block_tag(self) -> u8 {
+            match self {
+                Self::Original => 0xd0,
+                Self::SameTransactions | Self::DistinctCoinbases => 0xd1,
+            }
+        }
+
+        const fn transaction_tag(self) -> u8 {
+            match self {
+                Self::Original | Self::SameTransactions => 0xe0,
+                Self::DistinctCoinbases => 0xe1,
+            }
+        }
+    }
+
+    /// A wallet that followed [`HOT_ADDRESS_BLOCKS`] blocks paying and
+    /// spending one address, whose canonical store then replaced all of them.
+    struct HotAddressReorg {
+        secondary: RocksDbCanonicalSecondary,
+        wallet: RocksDbWalletStore,
+        settled_tip: BlockId,
+        temporary: TempDir,
+    }
+
+    impl HotAddressReorg {
+        fn publish(replacement: HotAddressBranch) -> Result<Self, Box<dyn std::error::Error>> {
+            let temporary = TempDir::new()?;
+            let published = publish_checkpointed_wallet(temporary.path())?;
+            let settled_tip = published.initial_fence.visible_tip();
+            let base_accumulator =
+                checkpoint_accumulator(&published.activations, published.initial_fence)?;
+            let mut accumulator = base_accumulator.clone();
+            let mut canonical_store = published.canonical_store;
+            let mut fence = published.initial_fence;
+            for height in hot_address_heights() {
+                let block =
+                    hot_address_block(&mut accumulator, height, HotAddressBranch::Original)?;
+                (canonical_store, fence) = canonical_store.commit_live_append(
+                    CanonicalLiveAppend::new(
+                        fence,
+                        block,
+                        Vec::new(),
+                        settled_tip,
+                        UnixTimestampMillis::new(1_750_000_300_000 + u64::from(height)),
+                    ),
+                    &published.activations,
+                )?;
+            }
+            let mut secondary =
+                open_checkpointed_secondary(temporary.path(), "canonical-secondary")?;
+            let mut wallet = open_wallet_at_depth(temporary.path(), HOT_ADDRESS_BLOCKS)?;
+            for _ in hot_address_heights() {
+                apply_next_event_settling_at(&mut wallet, &secondary, settled_tip)?;
+            }
+
+            let mut accumulator = base_accumulator;
+            let mut replacement_blocks = Vec::new();
+            for height in hot_address_heights() {
+                replacement_blocks.push(CanonicalReplacementBlock::new(
+                    hot_address_block(&mut accumulator, height, replacement)?,
+                    Vec::new(),
+                ));
+            }
+            canonical_store.commit_live_replacement(
+                CanonicalLiveReplacement::new(
+                    fence,
+                    replacement_blocks,
+                    UnixTimestampMillis::new(1_750_000_400_000),
+                ),
+                &published.activations,
+            )?;
+            secondary.try_catch_up()?;
+            Ok(Self {
+                secondary,
+                wallet,
+                settled_tip,
+                temporary,
+            })
+        }
+
+        /// Applies the retained replacement event under `max_logical_bytes`,
+        /// returning the transition's own outcome.
+        fn apply_reorg(
+            &mut self,
+            max_logical_bytes: u64,
+        ) -> Result<Result<(), RocksDbWalletError>, Box<dyn std::error::Error>> {
+            let event = next_retained_event(&self.secondary, &self.wallet)?;
+            if event.reverted_range().is_none() {
+                return Err(format!("expected the replacement event, found {event:?}").into());
+            }
+            let source =
+                WalletCanonicalSourceIdentity::from_ready_evidence(self.wallet.ready_evidence());
+            let limit =
+                NonZeroU64::new(max_logical_bytes).ok_or("transition limit must be nonzero")?;
+            let replay_rows = self
+                .secondary
+                .scan_canonical_replay_range(event.committed_range())?;
+            Ok(self.wallet.apply_canonical_event_range(
+                source,
+                event,
+                event.resulting_fence(),
+                self.settled_tip,
+                limit,
+                replay_rows,
+            ))
+        }
+    }
+
+    fn hot_address_heights() -> std::ops::RangeInclusive<u32> {
+        101..=100 + HOT_ADDRESS_BLOCKS
+    }
+
+    /// Builds the hot-address block at `height` on `branch`, advancing
+    /// `accumulator`.
+    ///
+    /// Its coinbase pays [`HOT_ADDRESS_OUTPUTS_PER_BLOCK`] outputs to the hot
+    /// address, and a second transaction spends
+    /// [`HOT_ADDRESS_SPENDS_PER_BLOCK`] of them and returns change to it. The
+    /// first block spends outputs of its own coinbase, and each later block
+    /// spends the outputs that the previous coinbase left unspent.
+    fn hot_address_block(
+        accumulator: &mut CommitmentTreeAccumulator,
+        height: u32,
+        branch: HotAddressBranch,
+    ) -> Result<CanonicalBuildBlock, Box<dyn std::error::Error>> {
+        let address = TransparentAddressScriptHash::from_bytes([0xd7; 32]);
+        let coinbase_id = hot_address_transaction_id(height, branch, false);
+        let coinbase = coinbase_output_transaction(
+            coinbase_id,
+            (0..HOT_ADDRESS_OUTPUTS_PER_BLOCK)
+                .map(|index| {
+                    TransparentOutputFact::new(index, 100 + u64::from(index), [0x76, 0xd7], address)
+                })
+                .collect(),
+        );
+        let (funding_id, first_spent_index) = if height == 101 {
+            (coinbase_id, 0)
+        } else {
+            (
+                hot_address_transaction_id(height - 1, branch, false),
+                HOT_ADDRESS_OUTPUTS_PER_BLOCK - HOT_ADDRESS_SPENDS_PER_BLOCK,
+            )
+        };
+        let spending = transparent_spend_transaction(
+            hot_address_transaction_id(height, branch, true),
+            (0..HOT_ADDRESS_SPENDS_PER_BLOCK)
+                .map(|input| {
+                    TransparentInputFact::new(
+                        input,
+                        TransparentOutPoint::new(funding_id, first_spent_index + input),
+                    )
+                })
+                .collect(),
+            vec![TransparentOutputFact::new(0, 1, [0x76, 0xd7], address)],
+        );
+        checkpointed_append_block(
+            accumulator,
+            height,
+            hot_address_block_hash(height - 1, branch),
+            hot_address_block_hash(height, branch),
+            vec![coinbase, spending],
+        )
+    }
+
+    fn hot_address_block_hash(height: u32, branch: HotAddressBranch) -> [u8; 32] {
+        if height == 100 {
+            return [0xa0; 32];
+        }
+        let mut hash = [branch.block_tag(); 32];
+        hash[..4].copy_from_slice(&height.to_be_bytes());
+        hash
+    }
+
+    fn hot_address_transaction_id(
+        height: u32,
+        branch: HotAddressBranch,
+        spending: bool,
+    ) -> TransactionId {
+        let mut id = [branch.transaction_tag(); 32];
+        id[..4].copy_from_slice(&height.to_be_bytes());
+        id[4] = u8::from(spending);
+        TransactionId::from_bytes(id)
+    }
+
+    /// Every row of a wallet's data column families, by family and key.
+    type WalletRows = BTreeMap<OverlayKey, Vec<u8>>;
+
+    fn wallet_rows(wallet: &RocksDbWalletStore) -> Result<WalletRows, Box<dyn std::error::Error>> {
+        let mut rows = BTreeMap::new();
+        for (family_name, _) in WALLET_DATA_COLUMN_FAMILIES {
+            let family = column_family(&wallet.bounded_open, family_name)?;
+            for row in wallet
+                .bounded_open
+                .db
+                .iterator_cf(&family, IteratorMode::Start)
+            {
+                let (key, value) = row?;
+                rows.insert((family_name, key.to_vec()), value.to_vec());
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Keys of every row that a transition from `before` to `after` touches
+    /// when it rolls back every block of `before` and replays every block of
+    /// `after`.
+    ///
+    /// Besides the rows of either state, the rollback restores and then
+    /// removes the unspent-output and address-index rows of each output that
+    /// `before` holds as spent by a later block, and the replay creates and
+    /// then spends those rows of each output that `after` holds as spent.
+    fn rewritten_row_keys(
+        before: &WalletRows,
+        after: &WalletRows,
+    ) -> Result<BTreeSet<OverlayKey>, Box<dyn std::error::Error>> {
+        let mut keys: BTreeSet<_> = before.keys().chain(after.keys()).cloned().collect();
+        let spent_rows = before
+            .iter()
+            .map(|row| (row, false))
+            .chain(after.iter().map(|row| (row, true)));
+        for (((family_name, key), encoded), replayed) in spent_rows {
+            if *family_name != TRANSPARENT_SPENT_OUTPUT_COLUMN_FAMILY {
+                continue;
+            }
+            let spent = WalletSpentOutput::decode_value(WalletOutpointKey::decode(key)?, encoded)?;
+            if !replayed && spent.spent_at.block == spent.output.created_at.block {
+                continue;
+            }
+            keys.insert((TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY, key.clone()));
+            keys.insert((
+                TRANSPARENT_UNSPENT_OUTPUT_BY_ADDRESS_COLUMN_FAMILY,
+                WalletAddressUnspentOutputKey::new(&spent.output)
+                    .as_bytes()
+                    .to_vec(),
+            ));
+        }
+        Ok(keys)
+    }
+
+    fn wallet_keys_written(wallet: &RocksDbWalletStore) -> u64 {
+        wallet
+            .bounded_open
+            .statistics
+            .get_ticker_count(Ticker::NumberKeysWritten)
     }
 }

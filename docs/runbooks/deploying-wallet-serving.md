@@ -427,6 +427,47 @@ inside Railway's thirty-second drain window. It exits zero once all three stop,
 and non-zero naming the survivors if any still holds a RocksDB instance open
 when the window expires.
 
+### Wallet transition exceeds its logical-byte limit
+
+The projector logs `projector failed` with an error that begins:
+
+```text
+wallet following stopped planning a transition that already needs <n> logical bytes, more than projector.follow.max_transition_logical_bytes (ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES) allows (<limit>)
+```
+
+The container then terminates, and the `ALWAYS` restart policy brings it back
+into the same failure. One wallet transition, typically a deep reorg that rolls
+back and replays many blocks of a busy address, touches more wallet rows than
+the limit allows. The limit counts each row the transition touches twice, once
+for the plan in memory and once for the write batch that publishes it. The
+projector refuses the transition before it writes anything, so the wallet is
+unchanged, and `<n>` is a lower bound on what the whole transition needs.
+
+The loop does not end on its own:
+
+- each restart plans the same transition from the same wallet cursor and
+  refuses it at the same point;
+- each attempt repeats that transition's canonical replay and wallet reads up
+  to the refusal; and
+- each restart leases canonical retention at the wallet cursor again, so the
+  canonical writer keeps every retained event from that cursor on.
+
+Waiting for the chain to move on does not help. If later canonical events
+overwrite the refused range, the projector reconciles instead, but a
+reconciliation is also one transition under the same limit.
+
+To recover, set `ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES` on
+the service well above `<n>`, up to the maximum of `1073741824`, and redeploy.
+The default is `536870912`. The projector can hold up to the limit in memory
+while it plans and publishes one transition, so raise the container's memory
+by at least the bytes you add to the limit. Memory use at the maximum has not
+been measured.
+
+If `<n>` already exceeds `1073741824`, or the failure repeats at the maximum,
+no setting admits the transition. Rebuild the wallet in a second wallet-serving
+service with its own volume, wait for its `/readyz`, move traffic to it, and
+then retire this service. Do not attach the second service to this volume.
+
 ## Serving the Explorer from the same volume
 
 The `zinder-wallet-serving-explorer` image runs this topology plus

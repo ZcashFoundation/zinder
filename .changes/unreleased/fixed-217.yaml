@@ -1,0 +1,6 @@
+kind: fixed
+body: A wallet transition now publishes one write batch with the final value of each row it touches, so reorg and reconciliation transitions plan fewer bytes against `projector.follow.max_transition_logical_bytes`, which now counts each distinct touched row twice plus the control record. A transition that still exceeds the limit stops `zinder-projector` with an error that names the setting, `ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES`, and the recovery; the wallet-serving and VM runbooks describe the steps.
+time: 2026-11-15T22:10:30.125980131Z
+custom:
+    Bump: patch
+    PR: "217"

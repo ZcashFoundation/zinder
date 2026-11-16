@@ -1173,8 +1173,14 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-projector"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Maximum logical planner and write-batch bytes for one atomic wallet \
-                      following transition. Defaults to 536870912.",
+        description: "Maximum logical bytes one atomic wallet following transition may plan. \
+                      Each distinct wallet row the transition touches counts twice, as its key \
+                      and final value in the plan and again in the write batch, and the \
+                      control record counts once. Must be greater than zero and at most \
+                      1073741824. Defaults to 536870912. A transition that needs more leaves \
+                      the wallet unchanged and stops the projector with an error that names \
+                      this setting; see [Wallet transition exceeds its logical-byte \
+                      limit](../runbooks/deploying-wallet-serving.md#wallet-transition-exceeds-its-logical-byte-limit).",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__PHASE_CLASSIFICATION__CATCHUP_THRESHOLD_BLOCKS",

@@ -142,7 +142,7 @@ pub(crate) const TRANSPARENT_ADDRESS_TRANSACTION_COLUMN_FAMILY: &str =
 pub(crate) const TRANSPARENT_ADDRESS_BALANCE_COLUMN_FAMILY: &str = "transparent_address_balance";
 pub(crate) const REORG_UNDO_COLUMN_FAMILY: &str = "reorg_undo";
 
-const WALLET_DATA_COLUMN_FAMILIES: [(&str, WalletProjectionRowFamily); 6] = [
+pub(crate) const WALLET_DATA_COLUMN_FAMILIES: [(&str, WalletProjectionRowFamily); 6] = [
     (
         TRANSPARENT_UNSPENT_OUTPUT_COLUMN_FAMILY,
         WalletProjectionRowFamily::TransparentUnspentOutput,
