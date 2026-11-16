@@ -60,8 +60,13 @@ so the baked configs pin every budget that would otherwise be derived from it:
 
 Query keeps up to four serving pairs open, each with its own block caches: the
 current pair, the candidate it is catching up, and two replaced pairs that
-either still answer pinned reads or are held by a long request. The remainder covers allocator
-overhead, gRPC buffers, and task stacks. In a
+either still answer pinned reads or are held by a long request. A generation
+stays open after its pair drains so a later block can reuse it, so once three
+blocks arrive within one minute, or a long request holds a released pair, all
+four stay open until query restarts. Query catches drained generations up in
+turn, so a primary file that compaction replaces stays on disk for only a few
+blocks while a drained generation still references it. The remainder covers
+allocator overhead, gRPC buffers, and task stacks. In a
 smaller container the cgroup OOM-killer takes one process during construction.
 That terminates the whole container, and the restart resumes construction from
 the last durable fence only to be killed again.
@@ -306,6 +311,30 @@ Canonical readiness proves the writer and mempool contract only. Wallet
 readiness proves the projection. Serving readiness proves an admitted
 canonical and wallet pair at an exact fence, and it is the only one that
 proves a client can be answered.
+
+Once serving is ready, each new block reaches wallets within about 1.25
+seconds of the canonical commit: one query refresh
+(`ZINDER_STORAGE__SECONDARY_CATCHUP_INTERVAL_MS`, 1,000 ms by default) plus
+one 250 ms projector poll. Each refresh publishes the writer's latest fence,
+so blocks that commit closer together than that share one publication at the
+later height. That happens while ingest catches up after a stall, when a reorg
+replaces several blocks, and on Regtest. To measure the delay, match each
+`canonical_live_append_committed` in the ingest log with the first later
+`wallet_serving_pair_publisher_published` in the query log whose
+`event_sequence` is at least the commit's `chain_event_sequence`. A height
+with no publication of its own is expected.
+
+A block waits longer when query must first open and admit a serving-pair
+generation, which takes about 25 seconds on Testnet. Query opens the first of
+its four generations at startup and the second on the first block after it.
+It opens the third the first time a block arrives within one minute of the
+previous publication, and the fourth the first time three publications fall
+within one minute or a long request holds a released pair. With 75-second
+blocks, these opens can come long after the start. Each logs
+`wallet_serving_pair_publisher_generation_opened` with a `generation` that has
+not opened before. An event that repeats an earlier `generation` means a
+failed refresh closed it, and the `wallet_serving_pair_publisher_refresh_failed`
+warning before it names the error.
 
 ### Construction deadlines
 

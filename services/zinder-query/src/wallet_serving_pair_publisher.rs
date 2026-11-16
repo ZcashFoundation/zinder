@@ -4,10 +4,13 @@
 //! up only an inactive generation, authenticates that generation against the
 //! canonical writer control plane, and atomically publishes it as one
 //! immutable canonical/wallet pair. A replaced pair keeps answering reads
-//! pinned to its chain epoch for a bounded window. Each generation stays open
-//! until every in-flight request has dropped its captured pair `Arc`. A
-//! request that holds an old pair for a long time pins only that generation:
-//! the publisher keeps refreshing into the other bounded generation slots.
+//! pinned to its chain epoch for a bounded window. Each generation stays
+//! frozen until every in-flight request has dropped its captured pair `Arc`;
+//! the publisher then catches that same open generation up for a later
+//! publication, so a slot is opened cold only on its first use or after a
+//! failed catch-up. A request that holds an old pair for a long time pins
+//! only that generation: the publisher keeps refreshing into the other
+//! bounded generation slots.
 
 use std::{
     borrow::Cow,
@@ -620,9 +623,10 @@ pub struct WalletServingPairPublisher {
     /// Trailing references to the pairs released from the slot.
     ///
     /// Holding them makes the publisher the last owner of every released
-    /// pair, so the direct-I/O `RocksDB` close never runs on a request task's
-    /// reactor thread. Reusing a generation requires its lease to have
-    /// drained, which cannot happen while its reference is here.
+    /// pair, so a pair drains only when the publisher drops it, and the
+    /// generation's secondaries then have no other owner. Reusing a
+    /// generation requires its lease to have drained, which cannot happen
+    /// while its reference is here.
     retired_pairs: Vec<RetiredPair>,
     /// Last attestation of the published pair by a following writer with a
     /// confirmed tip, and the halt the writer last reported, which refresh
@@ -637,6 +641,8 @@ pub struct WalletServingPairPublisher {
     /// reports, so a publisher started before a schedule admission keeps
     /// opening generations after the chain crosses the admitted activation.
     secondary_activations: Arc<NetworkUpgradeActivations>,
+    #[cfg(test)]
+    candidate_preparations: CandidatePreparationCounts,
 }
 
 impl WalletServingPairPublisher {
@@ -689,6 +695,8 @@ impl WalletServingPairPublisher {
             writer_attestation,
             observed_lag_chain_epochs: 0,
             secondary_activations,
+            #[cfg(test)]
+            candidate_preparations: CandidatePreparationCounts::default(),
         };
         publisher.prepare_candidate(0).await?;
         publisher.converge_and_publish(0).await?;
@@ -861,14 +869,16 @@ impl WalletServingPairPublisher {
         }
     }
 
-    /// Closes every released pair that no request still holds, on the
+    /// Drops every released pair that no request still holds, on the
     /// blocking pool.
     ///
-    /// Closing a direct-I/O instance is expensive, so the drop that actually
-    /// runs the destructors is moved off the reactor. A pair stays open
-    /// until the last request that captured it has released it; that is the
-    /// same condition [`Self::inactive_generation`] waits on before reopening
-    /// its generation. Reads that held a pair too long are revoked first.
+    /// A pair stays alive until the last request that captured it has
+    /// released it; that is the same condition [`Self::inactive_generation`]
+    /// waits on before reusing its generation. The generation keeps its
+    /// secondaries for the next candidate, and the drop stays off the reactor
+    /// like every other release of a secondary handle, because the last owner
+    /// of a direct-I/O instance pays its close. Reads that held a pair too
+    /// long are revoked first.
     async fn reap_retired_pairs(&mut self, now: Instant) {
         self.revoke_overdue_reads(now);
         let (released, pinned): (Vec<_>, Vec<_>) = std::mem::take(&mut self.retired_pairs)
@@ -914,12 +924,18 @@ impl WalletServingPairPublisher {
     /// requests still hold the pair of every slot but the published one.
     ///
     /// An open candidate is reused first. A drained published slot is
-    /// preferred over a vacant one, so steady state alternates between two
-    /// directories and the extra slots open only while an older pair is
-    /// pinned.
+    /// preferred over a vacant one because it is caught up in place instead
+    /// of opened cold, so the extra slots open only while older pairs are
+    /// retained or pinned. Each search starts after the published slot, so
+    /// drained slots are reused in turn and none keeps the primary files of
+    /// an old catch-up open while the others advance.
     fn inactive_generation(&self) -> Option<usize> {
+        let first = self
+            .published_generation
+            .map_or(0, |published| published + 1);
         let unpublished = || {
-            (0..SECONDARY_GENERATION_COUNT)
+            (first..first + SECONDARY_GENERATION_COUNT)
+                .map(|position| position % SECONDARY_GENERATION_COUNT)
                 .filter(|generation| Some(*generation) != self.published_generation)
         };
         let state = |generation: usize| &self.generations[generation].state;
@@ -927,7 +943,7 @@ impl WalletServingPairPublisher {
             .find(|generation| matches!(state(*generation), SecondaryGenerationState::Candidate { .. }))
             .or_else(|| {
                 unpublished().find(|generation| {
-                    matches!(state(*generation), SecondaryGenerationState::Published { lease } if lease.is_reusable())
+                    matches!(state(*generation), SecondaryGenerationState::Published { lease, .. } if lease.is_reusable())
                 })
             })
             .or_else(|| {
@@ -936,18 +952,62 @@ impl WalletServingPairPublisher {
             })
     }
 
-    /// Opens a candidate in `generation` unless one is already open there.
+    /// Makes `generation` hold a candidate unless it already does.
     ///
     /// The caller chooses a slot whose prior pair has no strong references.
+    /// A drained published generation becomes the candidate with its
+    /// secondaries still open, and convergence catches them up in place.
+    /// Only a vacant slot is opened cold. A generation whose secondaries are
+    /// still shared stays published and frozen, and the refresh fails instead
+    /// of opening a second instance over the same metadata paths.
+    async fn prepare_candidate(&mut self, generation: usize) -> Result<(), WalletServingPairError> {
+        let state = std::mem::replace(
+            &mut self.generations[generation].state,
+            SecondaryGenerationState::Vacant,
+        );
+        let (candidate, preparation) = match state {
+            SecondaryGenerationState::Candidate { candidate } => {
+                self.generations[generation].state =
+                    SecondaryGenerationState::Candidate { candidate };
+                return Ok(());
+            }
+            SecondaryGenerationState::Published { lease, readers } => {
+                match readers.into_candidate() {
+                    Ok(candidate) => (Box::new(candidate), CandidatePreparation::Recycled),
+                    Err(readers) => {
+                        self.generations[generation].state =
+                            SecondaryGenerationState::Published { lease, readers };
+                        return Err(WalletServingPairError::CandidateUnavailable { generation });
+                    }
+                }
+            }
+            SecondaryGenerationState::Vacant => (
+                self.open_cold_candidate(generation).await?,
+                CandidatePreparation::Cold,
+            ),
+        };
+        metrics::counter!(
+            "zinder_wallet_serving_pair_publisher_candidate_prepared_total",
+            "kind" => preparation.label()
+        )
+        .increment(1);
+        #[cfg(test)]
+        self.candidate_preparations.record(preparation);
+        self.generations[generation].state = SecondaryGenerationState::Candidate { candidate };
+        Ok(())
+    }
+
+    /// Opens both secondaries of `generation` and runs their full cold
+    /// admission against the primaries.
+    ///
     /// This deliberately does not delete the metadata path: opening an
     /// inactive path is safe and bounded, while deleting it would widen the
     /// failure surface without improving correctness.
-    async fn prepare_candidate(&mut self, generation: usize) -> Result<(), WalletServingPairError> {
-        let secondary_generation = &mut self.generations[generation];
-        if let SecondaryGenerationState::Candidate { .. } = secondary_generation.state {
-            return Ok(());
-        }
-        secondary_generation.state = SecondaryGenerationState::Vacant;
+    async fn open_cold_candidate(
+        &self,
+        generation: usize,
+    ) -> Result<Box<SecondaryPairCandidate>, WalletServingPairError> {
+        let secondary_generation = &self.generations[generation];
         let canonical_primary_path = self.config.canonical_primary_path.clone();
         let canonical_generation_path = secondary_generation.canonical_generation_path.clone();
         let canonical_secondary_path = secondary_generation.canonical_secondary_path.clone();
@@ -960,7 +1020,8 @@ impl WalletServingPairPublisher {
         let canonical_resource_budget = self.config.canonical_resource_budget;
         let wallet_resource_budget = self.config.wallet_resource_budget;
         let network = self.config.network;
-        let candidate = tokio::task::spawn_blocking(move || {
+        let started_at = Instant::now();
+        let opened = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&canonical_generation_path).map_err(|source| {
                 WalletServingPairError::SecondaryGenerationDirectoryCreate {
                     path: canonical_generation_path.clone(),
@@ -990,9 +1051,24 @@ impl WalletServingPairPublisher {
             )?;
             Ok::<_, WalletServingPairError>(Box::new(SecondaryPairCandidate { canonical, wallet }))
         })
-        .await??;
-        self.generations[generation].state = SecondaryGenerationState::Candidate { candidate };
-        Ok(())
+        .await
+        .unwrap_or_else(|error| Err(WalletServingPairError::CandidateTask(error)));
+        let elapsed = started_at.elapsed();
+        metrics::histogram!(
+            "zinder_wallet_serving_pair_publisher_cold_open_duration_seconds",
+            "status" => if opened.is_ok() { "ok" } else { "error" }
+        )
+        .record(elapsed);
+        if opened.is_ok() {
+            tracing::info!(
+                target: "zinder::wallet_serving",
+                event = "wallet_serving_pair_publisher_generation_opened",
+                generation,
+                elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                "opened and cold-admitted a wallet-serving secondary generation"
+            );
+        }
+        opened
     }
 
     async fn converge_and_publish(
@@ -1122,11 +1198,12 @@ impl WalletServingPairPublisher {
         let SecondaryGenerationState::Candidate { candidate } = state else {
             return Err(WalletServingPairError::CandidateUnavailable { generation });
         };
-        let pair = tokio::task::spawn_blocking(move || {
-            let canonical: Arc<dyn CanonicalReader> = Arc::new(candidate.canonical);
-            let wallet: Arc<dyn WalletProjectionReader> = Arc::new(candidate.wallet);
+        let (pair, readers) = tokio::task::spawn_blocking(move || {
+            let readers = PublishedReaders::new(*candidate);
+            let canonical: Arc<dyn CanonicalReader> = readers.canonical.clone();
+            let wallet: Arc<dyn WalletProjectionReader> = readers.wallet.clone();
             WalletServingReadPair::new(canonical, wallet)
-                .map(Arc::new)
+                .map(|pair| (Arc::new(pair), readers))
                 .map_err(WalletServingPairError::PairPublication)
         })
         .await
@@ -1141,6 +1218,7 @@ impl WalletServingPairPublisher {
         }
         self.generations[generation].state = SecondaryGenerationState::Published {
             lease: GenerationLease::new(&pair),
+            readers,
         };
         self.published_generation = Some(generation);
         self.observed_lag_chain_epochs = 0;
@@ -1345,12 +1423,85 @@ enum SecondaryGenerationState {
     },
     Published {
         lease: GenerationLease<WalletServingReadPair>,
+        readers: PublishedReaders,
     },
 }
 
 struct SecondaryPairCandidate {
     canonical: RocksDbCanonicalSecondary,
     wallet: RocksDbWalletSecondary,
+}
+
+/// The secondaries behind a published pair.
+///
+/// The pair reads through unsized clones of these handles. Keeping them here
+/// lets the publisher take back sole ownership once the pair drains, and only
+/// then catch the same open secondaries up for a later candidate.
+struct PublishedReaders {
+    canonical: Arc<RocksDbCanonicalSecondary>,
+    wallet: Arc<RocksDbWalletSecondary>,
+}
+
+impl PublishedReaders {
+    fn new(candidate: SecondaryPairCandidate) -> Self {
+        Self {
+            canonical: Arc::new(candidate.canonical),
+            wallet: Arc::new(candidate.wallet),
+        }
+    }
+
+    /// Returns both secondaries as a candidate, or `self` while anything
+    /// else, such as a pair a request still holds, shares either of them.
+    fn into_candidate(self) -> Result<SecondaryPairCandidate, Self> {
+        match (
+            Arc::try_unwrap(self.canonical),
+            Arc::try_unwrap(self.wallet),
+        ) {
+            (Ok(canonical), Ok(wallet)) => Ok(SecondaryPairCandidate { canonical, wallet }),
+            (canonical, wallet) => Err(Self {
+                canonical: canonical.map_or_else(std::convert::identity, Arc::new),
+                wallet: wallet.map_or_else(std::convert::identity, Arc::new),
+            }),
+        }
+    }
+}
+
+/// How a generation came to hold its candidate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CandidatePreparation {
+    /// Opened and cold-admitted from the primaries.
+    Cold,
+    /// Taken back from a drained published generation, still open, for
+    /// convergence to catch up in place.
+    Recycled,
+}
+
+impl CandidatePreparation {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Cold => "cold",
+            Self::Recycled => "recycled",
+        }
+    }
+}
+
+/// Candidate preparations by kind, which tests read to prove that publication
+/// recycles drained generations instead of opening new ones.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CandidatePreparationCounts {
+    cold: usize,
+    recycled: usize,
+}
+
+#[cfg(test)]
+impl CandidatePreparationCounts {
+    fn record(&mut self, preparation: CandidatePreparation) {
+        match preparation {
+            CandidatePreparation::Cold => self.cold = self.cold.saturating_add(1),
+            CandidatePreparation::Recycled => self.recycled = self.recycled.saturating_add(1),
+        }
+    }
 }
 
 /// A pair released from the slot, kept until no request holds it.
@@ -1714,9 +1865,10 @@ mod tests {
     };
 
     use super::{
-        CanonicalFenceRelation, RETAINED_PAIR_WINDOW, SecondaryGenerationState,
-        WalletServingConvergence, WalletServingPairConfig, WalletServingPairError,
-        WalletServingPairPublisher, WalletServingReadiness, classify_canonical_writer_fence,
+        CandidatePreparationCounts, CanonicalFenceRelation, RETAINED_PAIR_WINDOW,
+        SECONDARY_GENERATION_COUNT, SecondaryGenerationState, WalletServingConvergence,
+        WalletServingPairConfig, WalletServingPairError, WalletServingPairPublisher,
+        WalletServingPairSlot, WalletServingReadiness, classify_canonical_writer_fence,
         classify_pair_admission, refresh_failure_is_routine_lag, refresh_failure_not_ready_cause,
         refresh_failure_retains_attested_pair, spawn_wallet_ingest_control_readiness_probe,
         spawn_wallet_node_readiness_probe, wallet_ingest_control_request,
@@ -4236,6 +4388,434 @@ mod tests {
         Ok(())
     }
 
+    /// A block followed by its own refresh is published by its own pair.
+    ///
+    /// Once each generation slot has been opened, the next block's candidate
+    /// is a drained generation caught up in place, and the publisher opens no
+    /// further secondaries.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn steady_state_publication_recycles_drained_generations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut primaries = AdvancingPrimaries::start().await?;
+        let (mut publisher, slot) = primaries
+            .bootstrap_publisher(zinder_runtime::Readiness::default())
+            .await?;
+        assert_eq!(
+            publisher.candidate_preparations,
+            CandidatePreparationCounts {
+                cold: 1,
+                recycled: 0
+            }
+        );
+        // The two retained pairs keep their generations for a minute, so the
+        // first blocks open the remaining slots before any pair drains.
+        let warm_up_blocks = SECONDARY_GENERATION_COUNT - 1;
+        for block in 1..=3 * SECONDARY_GENERATION_COUNT {
+            let fence = primaries.append_block()?;
+            publisher.refresh_once().await?;
+            assert_eq!(
+                slot.capture().canonical_fence(),
+                fence,
+                "block {block} must be published"
+            );
+            let expected = if block <= warm_up_blocks {
+                CandidatePreparationCounts {
+                    cold: 1 + block,
+                    recycled: 0,
+                }
+            } else {
+                CandidatePreparationCounts {
+                    cold: SECONDARY_GENERATION_COUNT,
+                    recycled: block - warm_up_blocks,
+                }
+            };
+            assert_eq!(
+                publisher.candidate_preparations, expected,
+                "candidate preparations after block {block}"
+            );
+        }
+
+        drop(slot);
+        drop(publisher);
+        primaries.shutdown().await
+    }
+
+    /// A refresh publishes the writer's latest fence, so blocks committed
+    /// before one refresh share one publication and the earlier height gets
+    /// no pair of its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocks_committed_within_one_refresh_share_one_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut primaries = AdvancingPrimaries::start().await?;
+        let (mut publisher, slot) = primaries
+            .bootstrap_publisher(zinder_runtime::Readiness::default())
+            .await?;
+        let bootstrap_pair = slot.capture();
+        let earlier = primaries.append_block()?;
+        let latest = primaries.append_block()?;
+        assert_ne!(earlier.chain_epoch_id(), latest.chain_epoch_id());
+
+        publisher.refresh_once().await?;
+        assert_eq!(slot.capture().canonical_fence(), latest);
+        assert_eq!(
+            slot.retained_pair_count(),
+            1,
+            "only the bootstrap pair was replaced"
+        );
+        assert!(Arc::ptr_eq(
+            &slot.capture_at(Some(bootstrap_pair.canonical_fence().chain_epoch_id())),
+            &bootstrap_pair
+        ));
+        assert_eq!(
+            slot.capture_at(Some(earlier.chain_epoch_id()))
+                .canonical_fence(),
+            latest,
+            "no pair serves the earlier block's epoch"
+        );
+        assert_eq!(
+            publisher.candidate_preparations,
+            CandidatePreparationCounts {
+                cold: 2,
+                recycled: 0
+            }
+        );
+
+        drop(bootstrap_pair);
+        drop(slot);
+        drop(publisher);
+        primaries.shutdown().await
+    }
+
+    /// The publisher opens a slot it has not used only when every opened slot
+    /// still holds a retained pair, so the block spacing, not the start,
+    /// decides when the last slots open.
+    ///
+    /// Blocks more than one retention window apart alternate between two
+    /// slots. The first block within a window of the previous publication
+    /// opens the third, and a third publication within one window opens the
+    /// fourth.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_block_burst_opens_the_remaining_slots_after_spaced_blocks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut primaries = AdvancingPrimaries::start().await?;
+        let (mut publisher, slot) = primaries
+            .bootstrap_publisher(zinder_runtime::Readiness::default())
+            .await?;
+        let counts = |cold, recycled| CandidatePreparationCounts { cold, recycled };
+
+        let spaced_blocks = 2 * SECONDARY_GENERATION_COUNT;
+        for block in 1..=spaced_blocks {
+            publisher.release_expired_pairs(tokio::time::Instant::now() + RETAINED_PAIR_WINDOW);
+            let fence = primaries.append_block()?;
+            publisher.refresh_once().await?;
+            assert_eq!(slot.capture().canonical_fence(), fence);
+            assert_eq!(
+                publisher.candidate_preparations,
+                counts(2, block - 1),
+                "spaced block {block} reuses one of the first two slots"
+            );
+        }
+        let spaced_recycled = spaced_blocks - 1;
+
+        for (block, opened) in [(1, 3), (2, SECONDARY_GENERATION_COUNT)] {
+            let fence = primaries.append_block()?;
+            publisher.refresh_once().await?;
+            assert_eq!(slot.capture().canonical_fence(), fence);
+            assert_eq!(
+                publisher.candidate_preparations,
+                counts(opened, spaced_recycled),
+                "burst block {block} opens slot {opened}"
+            );
+        }
+        for block in 1..=SECONDARY_GENERATION_COUNT {
+            let fence = primaries.append_block()?;
+            publisher.refresh_once().await?;
+            assert_eq!(slot.capture().canonical_fence(), fence);
+            assert_eq!(
+                publisher.candidate_preparations,
+                counts(SECONDARY_GENERATION_COUNT, spaced_recycled + block),
+                "later burst block {block} reuses a drained slot"
+            );
+        }
+
+        drop(slot);
+        drop(publisher);
+        primaries.shutdown().await
+    }
+
+    /// Spaced blocks after a burst reuse every drained slot in turn.
+    ///
+    /// Once a burst has opened every slot, blocks spaced beyond the retention
+    /// window keep every open generation within the last few publications
+    /// instead of leaving some with the primary files of an old fence.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spaced_blocks_after_a_burst_catch_every_drained_generation_up()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut primaries = AdvancingPrimaries::start().await?;
+        let (mut publisher, slot) = primaries
+            .bootstrap_publisher(zinder_runtime::Readiness::default())
+            .await?;
+        for _ in 1..SECONDARY_GENERATION_COUNT {
+            primaries.append_block()?;
+            publisher.refresh_once().await?;
+        }
+        assert_eq!(
+            publisher.candidate_preparations.cold,
+            SECONDARY_GENERATION_COUNT
+        );
+
+        let mut spaced_fences = Vec::new();
+        for block in 1..=2 * SECONDARY_GENERATION_COUNT {
+            publisher.release_expired_pairs(tokio::time::Instant::now() + RETAINED_PAIR_WINDOW);
+            let fence = primaries.append_block()?;
+            publisher.refresh_once().await?;
+            assert_eq!(
+                slot.capture().canonical_fence(),
+                fence,
+                "spaced block {block} must be published"
+            );
+            spaced_fences.push(fence);
+        }
+        let recent_fences = spaced_fences
+            .iter()
+            .rev()
+            .take(SECONDARY_GENERATION_COUNT)
+            .collect::<Vec<_>>();
+        for generation in 0..SECONDARY_GENERATION_COUNT {
+            let SecondaryGenerationState::Published { readers, .. } =
+                &publisher.generations[generation].state
+            else {
+                return Err(format!("generation {generation} must stay open").into());
+            };
+            let canonical_fence = readers.canonical.event_fence();
+            assert!(
+                recent_fences.contains(&&canonical_fence),
+                "generation {generation} must be caught up within the last \
+                 {SECONDARY_GENERATION_COUNT} publications, but holds {canonical_fence:?}"
+            );
+            assert_eq!(
+                WalletCanonicalSourceIdentity::from_ready_evidence(readers.wallet.ready_evidence())
+                    .source_position()
+                    .event_sequence,
+                canonical_fence.chain_event_sequence(),
+                "generation {generation} wallet secondary must match its canonical secondary"
+            );
+        }
+        assert_eq!(
+            publisher.candidate_preparations,
+            CandidatePreparationCounts {
+                cold: SECONDARY_GENERATION_COUNT,
+                recycled: 2 * SECONDARY_GENERATION_COUNT
+            },
+            "spaced blocks reuse opened slots without another cold open"
+        );
+
+        drop(slot);
+        drop(publisher);
+        primaries.shutdown().await
+    }
+
+    /// A request that holds a pair freezes its generation: the publisher
+    /// publishes every block from the other generations, never catches the
+    /// held one up, and recycles it once the request releases it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_pair_keeps_its_generation_frozen_while_publication_continues()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut primaries = AdvancingPrimaries::start().await?;
+        let (mut publisher, slot) = primaries
+            .bootstrap_publisher(zinder_runtime::Readiness::default())
+            .await?;
+        let held = slot.capture();
+        let held_generation = publisher
+            .published_generation
+            .ok_or("bootstrap must publish a generation")?;
+        let held_fence = held.canonical_fence();
+        for block in 1..=2 * SECONDARY_GENERATION_COUNT {
+            let fence = primaries.append_block()?;
+            publisher.refresh_once().await?;
+            assert_eq!(
+                slot.capture().canonical_fence(),
+                fence,
+                "block {block} must be published while a request holds an older pair"
+            );
+            assert_ne!(publisher.published_generation, Some(held_generation));
+            assert_eq!(held.canonical().event_fence(), held_fence);
+            assert_eq!(
+                held.canonical().chain_epoch()?.id,
+                held_fence.chain_epoch_id()
+            );
+            assert_eq!(
+                WalletCanonicalSourceIdentity::from_ready_evidence(held.wallet().ready_evidence()),
+                held.wallet_source()
+            );
+        }
+        assert_eq!(
+            publisher.candidate_preparations.cold,
+            SECONDARY_GENERATION_COUNT
+        );
+
+        drop(held);
+        let fence = primaries.append_block()?;
+        publisher.refresh_once().await?;
+        assert_eq!(slot.capture().canonical_fence(), fence);
+        assert_eq!(
+            publisher.published_generation,
+            Some(held_generation),
+            "the released generation is caught up and published again"
+        );
+        assert_eq!(
+            publisher.candidate_preparations.cold,
+            SECONDARY_GENERATION_COUNT
+        );
+
+        drop(slot);
+        drop(publisher);
+        primaries.shutdown().await
+    }
+
+    /// A recycled generation follows a schedule revision the writer admits
+    /// without moving its fence, and a writer fence it cannot reach fails the
+    /// refresh closed exactly as it does for a cold candidate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recycled_generation_follows_the_schedule_and_refuses_a_mutated_writer_fence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut primaries = AdvancingPrimaries::start().await?;
+        let readiness = zinder_runtime::Readiness::default();
+        let (mut publisher, slot) = primaries.bootstrap_publisher(readiness.clone()).await?;
+        for _ in 0..SECONDARY_GENERATION_COUNT {
+            primaries.append_block()?;
+            publisher.refresh_once().await?;
+        }
+        let warmed = publisher.candidate_preparations;
+        assert_eq!(
+            warmed,
+            CandidatePreparationCounts {
+                cold: SECONDARY_GENERATION_COUNT,
+                recycled: 1
+            }
+        );
+
+        let fence_before_revision = slot.capture().canonical_fence();
+        let extended = primaries.admit_schedule_revision()?;
+        publisher.refresh_once().await?;
+        let revised_pair = slot.capture();
+        assert_eq!(revised_pair.canonical_fence(), fence_before_revision);
+        assert_eq!(
+            revised_pair
+                .canonical()
+                .network_upgrade_schedule()
+                .map(super::CanonicalActivationSchedule::activations),
+            Some(&extended)
+        );
+        assert_eq!(
+            publisher.candidate_preparations,
+            CandidatePreparationCounts {
+                cold: warmed.cold,
+                recycled: warmed.recycled + 1
+            }
+        );
+
+        let appended_fence = primaries.append_block()?;
+        let mut mutated_status = writer_status_for_store(primaries.canonical_primary()?);
+        let digest_byte = mutated_status
+            .fence
+            .as_mut()
+            .and_then(|fence| fence.canonical_sequence_digest.first_mut())
+            .ok_or("writer status fixture must contain a digest")?;
+        *digest_byte ^= 0xff;
+        primaries.control.set_writer_status(mutated_status);
+        let failure = publisher
+            .refresh_once()
+            .await
+            .err()
+            .ok_or("a writer fence the recycled candidate cannot reach must fail refresh")?;
+        assert!(matches!(
+            failure,
+            WalletServingPairError::WriterFenceMismatch
+        ));
+        publisher.record_refresh_failure(&failure);
+        assert!(Arc::ptr_eq(&revised_pair, &slot.capture()));
+        assert!(matches!(
+            readiness.report().cause,
+            zinder_runtime::ReadinessCause::SchemaMismatch
+        ));
+
+        primaries.publish_writer_status()?;
+        publisher.refresh_once().await?;
+        assert_eq!(slot.capture().canonical_fence(), appended_fence);
+        assert!(readiness.report().is_ready);
+        assert_eq!(
+            publisher.candidate_preparations,
+            CandidatePreparationCounts {
+                cold: warmed.cold,
+                recycled: warmed.recycled + 2
+            },
+            "the refused candidate is kept and published without another open"
+        );
+
+        drop(revised_pair);
+        drop(slot);
+        drop(publisher);
+        primaries.shutdown().await
+    }
+
+    /// A drained generation whose secondaries are still shared stays frozen.
+    ///
+    /// The refresh fails instead of catching the shared secondaries up or
+    /// opening a second instance over their metadata paths.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_generation_with_shared_secondaries_is_neither_caught_up_nor_reopened()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut primaries = AdvancingPrimaries::start().await?;
+        let (mut publisher, slot) = primaries
+            .bootstrap_publisher(zinder_runtime::Readiness::default())
+            .await?;
+        let SecondaryGenerationState::Published { readers, .. } = &publisher.generations[0].state
+        else {
+            return Err("bootstrap must publish generation 0".into());
+        };
+        let shared_canonical = Arc::clone(&readers.canonical);
+        let bootstrap_fence = shared_canonical.event_fence();
+        // These blocks fill the other slots and release generation 0's pair.
+        for _ in 1..SECONDARY_GENERATION_COUNT {
+            primaries.append_block()?;
+            publisher.refresh_once().await?;
+        }
+
+        let fence = primaries.append_block()?;
+        let failure = publisher
+            .refresh_once()
+            .await
+            .err()
+            .ok_or("a shared generation must not become a candidate")?;
+        assert!(matches!(
+            failure,
+            WalletServingPairError::CandidateUnavailable { generation: 0 }
+        ));
+        assert_eq!(shared_canonical.event_fence(), bootstrap_fence);
+        assert_eq!(published_generation_is_reusable(&publisher, 0), Some(true));
+        assert_eq!(
+            publisher.candidate_preparations.cold,
+            SECONDARY_GENERATION_COUNT
+        );
+
+        drop(shared_canonical);
+        publisher.refresh_once().await?;
+        assert_eq!(slot.capture().canonical_fence(), fence);
+        assert_eq!(publisher.published_generation, Some(0));
+        assert_eq!(
+            publisher.candidate_preparations,
+            CandidatePreparationCounts {
+                cold: SECONDARY_GENERATION_COUNT,
+                recycled: 1
+            }
+        );
+
+        drop(slot);
+        drop(publisher);
+        primaries.shutdown().await
+    }
+
     fn fetch_operations_json(
         address: std::net::SocketAddr,
         path: &str,
@@ -4426,8 +5006,14 @@ mod tests {
                 Some(&source_cursor),
                 NonZeroU32::new(16).ok_or("canonical event page limit must be non-zero")?,
             ))?;
+        let first_replayed_height = initial_source
+            .source_position()
+            .tip
+            .height
+            .next()
+            .ok_or("the wallet source tip cannot advance")?;
         let replay_range =
-            BlockHeightRange::inclusive(BlockHeight::new(2), target_fence.visible_tip().height);
+            BlockHeightRange::inclusive(first_replayed_height, target_fence.visible_tip().height);
         wallet_primary.reconcile_canonical_event_sequence(
             initial_source,
             &retained_events,
@@ -4479,7 +5065,7 @@ mod tests {
         generation: usize,
     ) -> Option<bool> {
         match &publisher.generations[generation].state {
-            SecondaryGenerationState::Published { lease } => Some(lease.is_reusable()),
+            SecondaryGenerationState::Published { lease, .. } => Some(lease.is_reusable()),
             SecondaryGenerationState::Vacant | SecondaryGenerationState::Candidate { .. } => None,
         }
     }
@@ -4509,6 +5095,180 @@ mod tests {
             Network::ZcashRegtest,
             activations,
         )?)
+    }
+
+    /// A canonical writer whose wallet projection follows it one block at a
+    /// time, behind the writer-status endpoint a publisher attests against.
+    struct AdvancingPrimaries {
+        activations: NetworkUpgradeActivations,
+        canonical_primary: Option<RocksDbCanonicalStore>,
+        wallet_primary: RocksDbWalletStore,
+        projector_secondary: RocksDbCanonicalSecondary,
+        wallet_source: WalletCanonicalSourceIdentity,
+        settled_tip: BlockId,
+        control: MutableCanonicalControl,
+        endpoint: String,
+        cancel: CancellationToken,
+        server_task: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+        // Declared last so the stores close before their directory is removed.
+        temporary: TempDir,
+    }
+
+    impl AdvancingPrimaries {
+        async fn start() -> Result<Self, Box<dyn std::error::Error>> {
+            let temporary = TempDir::new()?;
+            let activations = lifecycle_upgrade_activations()?;
+            let canonical_primary_path = temporary.path().join("canonical-primary");
+            let canonical_primary =
+                build_lifecycle_canonical_primary(&canonical_primary_path, &activations)?;
+            let wallet_outcome = build_wallet_from_canonical(
+                &canonical_primary,
+                temporary.path().join("wallet-primary"),
+                RocksDbWalletBuildOptions {
+                    supported_reorg_depth: 100,
+                    ..RocksDbWalletBuildOptions::for_local_tests()
+                },
+            )?;
+            let projector_secondary = RocksDbCanonicalSecondary::open_ready(
+                &canonical_primary_path,
+                temporary.path().join("projector-canonical-secondary"),
+                &activations,
+                CanonicalStoreWorkload::Wallet,
+                RawBlobRetention::Transactions,
+                CanonicalReorgPolicy::new(100)?,
+                RocksDbResourceBudget::for_local_tests(),
+            )?;
+            let control = MutableCanonicalControl::new(writer_status_for_store(&canonical_primary));
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = format!("http://{}", listener.local_addr()?);
+            let cancel = CancellationToken::new();
+            let server_task = tokio::spawn({
+                let control = control.clone();
+                let shutdown = cancel.clone().cancelled_owned();
+                async move {
+                    Server::builder()
+                        .add_service(CanonicalControlServer::new(control))
+                        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
+                        .await
+                }
+            });
+            Ok(Self {
+                activations,
+                settled_tip: canonical_primary.event_fence().visible_tip(),
+                canonical_primary: Some(canonical_primary),
+                wallet_source: wallet_outcome.report.canonical_source_identity(),
+                wallet_primary: wallet_outcome.store,
+                projector_secondary,
+                control,
+                endpoint,
+                cancel,
+                server_task,
+                temporary,
+            })
+        }
+
+        async fn bootstrap_publisher(
+            &self,
+            readiness: zinder_runtime::Readiness,
+        ) -> Result<(WalletServingPairPublisher, WalletServingPairSlot), Box<dyn std::error::Error>>
+        {
+            let config = wallet_serving_pair_config(
+                self.temporary.path().join("canonical-primary"),
+                self.temporary.path().join("canonical-secondaries"),
+                self.temporary.path().join("wallet-primary"),
+                self.temporary.path().join("wallet-secondaries"),
+                Arc::new(self.activations.clone()),
+            )?;
+            Ok(
+                WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
+                    config,
+                    WalletServingReadiness::without_node_source(readiness),
+                    &self.endpoint,
+                    None,
+                )
+                .await?,
+            )
+        }
+
+        fn canonical_primary(&self) -> Result<&RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+            Ok(self
+                .canonical_primary
+                .as_ref()
+                .ok_or("an earlier append closed the canonical primary")?)
+        }
+
+        /// Commits the next block, projects it into the wallet primary, and
+        /// serves the writer status that attests it.
+        fn append_block(&mut self) -> Result<CanonicalEventFence, Box<dyn std::error::Error>> {
+            let canonical_primary = self
+                .canonical_primary
+                .take()
+                .ok_or("an earlier append closed the canonical primary")?;
+            let parent = canonical_primary.event_fence();
+            let height = parent
+                .visible_tip()
+                .height
+                .next()
+                .ok_or("the visible tip cannot advance")?;
+            let hash_byte = u8::try_from(height.value())?.wrapping_add(0x40);
+            let (canonical_primary, fence) = canonical_primary.commit_live_append(
+                CanonicalLiveAppend::new(
+                    parent,
+                    lifecycle_build_block(
+                        height,
+                        BlockHash::from_bytes([hash_byte; 32]),
+                        parent.visible_tip().hash,
+                    ),
+                    Vec::new(),
+                    self.settled_tip,
+                    UnixTimestampMillis::new(1_750_000_000_000 + u64::from(height.value())),
+                ),
+                &self.activations,
+            )?;
+            self.canonical_primary = Some(canonical_primary);
+            self.projector_secondary.try_catch_up()?;
+            self.wallet_source = reconcile_wallet_primary(
+                &mut self.wallet_primary,
+                &self.projector_secondary,
+                self.wallet_source,
+                fence,
+                self.settled_tip,
+            )?;
+            self.publish_writer_status()?;
+            Ok(fence)
+        }
+
+        /// Admits a schedule revision that adds NU7 without moving the fence.
+        fn admit_schedule_revision(
+            &mut self,
+        ) -> Result<NetworkUpgradeActivations, Box<dyn std::error::Error>> {
+            let mut entries = self.activations.activations().to_vec();
+            entries.push(NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(0x7719_0ad9),
+                activation_height: BlockHeight::new(200),
+                name: "NU7".to_owned(),
+            });
+            let extended = NetworkUpgradeActivations::new(Network::ZcashRegtest, entries)?;
+            self.canonical_primary
+                .as_mut()
+                .ok_or("an earlier append closed the canonical primary")?
+                .admit_network_upgrade_schedule(&extended)?;
+            self.activations = extended.clone();
+            self.publish_writer_status()?;
+            Ok(extended)
+        }
+
+        fn publish_writer_status(&self) -> Result<(), Box<dyn std::error::Error>> {
+            self.control
+                .set_writer_status(writer_status_for_store(self.canonical_primary()?));
+            Ok(())
+        }
+
+        async fn shutdown(self) -> Result<(), Box<dyn std::error::Error>> {
+            self.cancel.cancel();
+            self.server_task.await??;
+            Ok(())
+        }
     }
 
     #[derive(Clone)]

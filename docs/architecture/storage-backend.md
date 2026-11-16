@@ -192,8 +192,16 @@ epoch, or retired but held by an in-flight request; a retained pair gives up
 its slot when a held retired pair needs it. In-flight requests keep their
 existing immutable pair, which pins its generation until they finish. A
 transparent-output scan whose request is dropped stops at its next page and
-releases its pair. The compact-blocks-only `zinder-compat-lightwalletd`
-alternates two canonical secondary generations and retains no replaced pair.
+releases its pair. A slot is opened and cold-admitted the first time the
+reader uses it, and again only after a failed catch-up or publication closes
+it. After a slot's pair drains, the reader catches the same open secondaries
+up for its next candidate, so steady-state publication pays only the
+incremental catch-up above. The reader takes drained slots in turn, so a
+drained secondary keeps the primary files that compaction replaced for at most
+a few publications. The compact-blocks-only
+`zinder-compat-lightwalletd` alternates two canonical secondary generations,
+opens the inactive one cold on every refresh that finds the writer ahead, and
+retains no replaced pair.
 
 ## Resource bounds
 
