@@ -316,6 +316,8 @@ async fn run_owned_projector(
                     event_sequence = wallet_source.source_position().event_sequence,
                     "resuming wallet projection from its persisted authenticated cursor"
                 );
+                let control =
+                    ProjectorControlTasks::start(&config.projector_control, &cancel).await?;
                 return run_continuous_wallet_following(
                     config,
                     readiness,
@@ -324,6 +326,7 @@ async fn run_owned_projector(
                     canonical_control,
                     wallet,
                     canonical_lease,
+                    control,
                 )
                 .await;
             }
@@ -536,6 +539,7 @@ async fn run_owned_projector(
         build_seconds = report.phase_durations.total.as_secs_f64(),
         "wallet projection constructed, cold-validated, and entering continuous following"
     );
+    let control = ProjectorControlTasks::start(&config.projector_control, &cancel).await?;
     run_continuous_wallet_following(
         config,
         readiness,
@@ -544,6 +548,7 @@ async fn run_owned_projector(
         canonical_control,
         wallet,
         canonical_lease,
+        control,
     )
     .await
 }
@@ -565,8 +570,8 @@ async fn run_continuous_wallet_following(
     mut canonical_control: CanonicalWriterControlClient,
     mut wallet: RocksDbWalletFollowingStore,
     mut canonical_lease: CanonicalRetentionLease,
+    mut control: ProjectorControlTasks,
 ) -> Result<(), ProjectorError> {
-    let mut control = ProjectorControlTasks::start(&config.projector_control, &cancel).await?;
     let mut following_readiness = FollowingReadiness::for_wallet(
         readiness,
         WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence())
@@ -1036,8 +1041,9 @@ async fn bootstrap_resumed_wallet_following(
         }
     };
 
-    // Owner control starts only once continuous following owns the wallet.
-    let mut control = ProjectorControlTasks::disabled();
+    // Bound before the bootstrap can park, so a parked bootstrap refuses
+    // captures; continuous following inherits this listener.
+    let mut control = ProjectorControlTasks::start(&config.projector_control, &cancel).await?;
     loop {
         if cancel.is_cancelled() {
             return Ok(());
@@ -1149,6 +1155,7 @@ async fn bootstrap_resumed_wallet_following(
             canonical_control,
             wallet,
             canonical_lease,
+            control,
         )
         .await;
     }

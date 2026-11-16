@@ -1,5 +1,6 @@
-//! A follower that parks on a refused transition and resumes once a reorg
-//! changes it, against a real canonical writer, secondary, and wallet store.
+//! Following and bootstrap that park on a refused transition and resume once
+//! a reorg changes it, against a real canonical writer, secondary, and wallet
+//! store.
 
 use std::{
     net::SocketAddr,
@@ -52,7 +53,7 @@ use zinder_wallet_rocksdb::{
 };
 
 use crate::{
-    acquire_following_retention_lease,
+    ProjectorControlTasks, acquire_following_retention_lease, bootstrap_resumed_wallet_following,
     canonical_writer_control::CanonicalWriterControlClient,
     config::{ProjectorBuildConfig, ProjectorConfig, ProjectorFollowConfig},
     run_continuous_wallet_following,
@@ -102,6 +103,7 @@ async fn a_refused_transition_parks_following_until_a_reorg_changes_it() -> Test
     let config = park_config(temporary.path(), &endpoint, projector_control_addr)?;
     let readiness = Readiness::default();
     let cancel = CancellationToken::new();
+    let owner_control = ProjectorControlTasks::start(&config.projector_control, &cancel).await?;
 
     let following = run_continuous_wallet_following(
         &config,
@@ -111,6 +113,7 @@ async fn a_refused_transition_parks_following_until_a_reorg_changes_it() -> Test
         canonical_control,
         chain.wallet,
         lease,
+        owner_control,
     );
     tokio::pin!(following);
     let script = drive_park_and_resume(&control, &readiness, projector_control_addr, &cancel);
@@ -216,6 +219,119 @@ async fn drive_park_and_resume(
     let after_resume = control.calls.snapshot();
     assert_eq!(after_resume.acquires, 2);
     assert_eq!(after_resume.releases, 1);
+
+    cancel.cancel();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_bootstrap_transition_parks_behind_the_owner_control_endpoint() -> TestResult {
+    let Some(canonical_control_listener) = bind_loopback().await? else {
+        return Ok(());
+    };
+    let Some(projector_control_addr) = free_loopback_addr().await? else {
+        return Ok(());
+    };
+    let temporary = TempDir::new()?;
+    let chain = ParkFixture::build(temporary.path())?;
+    // Admission bootstraps when the writer retains only the wallet cursor's
+    // successor, which here is the dense block the limit refuses.
+    let first_retained_event_sequence =
+        WalletCanonicalSourceIdentity::from_ready_evidence(chain.wallet.ready_evidence())
+            .source_position()
+            .event_sequence
+            .checked_add(1)
+            .ok_or("the wallet event sequence must advance")?;
+    let control = RecordingCanonicalControl::new(chain.writer);
+    let server_cancel = CancellationToken::new();
+    let endpoint = spawn_canonical_control(
+        canonical_control_listener,
+        control.clone(),
+        server_cancel.clone(),
+    )?;
+
+    let canonical_control = CanonicalWriterControlClient::connect(&endpoint, None, None).await?;
+    let config = park_config(temporary.path(), &endpoint, projector_control_addr)?;
+    let readiness = Readiness::default();
+    let cancel = CancellationToken::new();
+
+    let mut following = Box::pin(bootstrap_resumed_wallet_following(
+        &config,
+        &readiness,
+        cancel.clone(),
+        chain.secondary,
+        canonical_control,
+        chain.wallet,
+        first_retained_event_sequence,
+    ));
+    let script =
+        drive_bootstrap_park_and_resume(&control, &readiness, projector_control_addr, &cancel);
+    tokio::pin!(script);
+    tokio::select! {
+        outcome = &mut following => {
+            return Err(format!("the bootstrap ended before the scenario cancelled it: {outcome:?}").into());
+        }
+        outcome = &mut script => outcome?,
+    }
+    following.await?;
+    server_cancel.cancel();
+    Ok(())
+}
+
+/// Drives a parked bootstrap through a refused capture and a resuming reorg.
+///
+/// Continuous following must then answer captures on the same owner-control
+/// connection.
+async fn drive_bootstrap_park_and_resume(
+    control: &RecordingCanonicalControl,
+    readiness: &Readiness,
+    projector_control_addr: SocketAddr,
+    cancel: &CancellationToken,
+) -> TestResult {
+    let parked = wait_for_report(readiness, "the bootstrap park", |report| {
+        matches!(
+            report.cause,
+            ReadinessCause::WalletTransitionLimitExceeded { .. }
+        )
+    })
+    .await?;
+    assert!(!parked.is_ready);
+    assert_eq!(parked.current_height, Some(1));
+    assert_eq!(parked.target_height, Some(2));
+
+    let mut owner_control = connect_projector_control(projector_control_addr).await?;
+    let refused_capture = capture_state_bundle(&mut owner_control).await?;
+    assert_eq!(refused_capture.code(), tonic::Code::FailedPrecondition);
+    assert!(refused_capture.message().contains("parked"));
+
+    control.append(empty_canonical_block(3, [0x22; 32], [0x23; 32]))?;
+    let still_parked = wait_for_report(
+        readiness,
+        "the bootstrap park at the new target",
+        |report| report.target_height == Some(3),
+    )
+    .await?;
+    assert_eq!(still_parked.cause, parked.cause);
+    control.replace_from_height_two(vec![
+        empty_canonical_block(2, [0x11; 32], [0x32; 32]),
+        empty_canonical_block(3, [0x32; 32], [0x33; 32]),
+    ])?;
+    let resumed = wait_for_report(
+        readiness,
+        "following to catch up after the reorg",
+        |report| report.is_ready && report.current_height == Some(3),
+    )
+    .await?;
+    assert_eq!(resumed.cause, ReadinessCause::Ready);
+    let after_resume = control.calls.snapshot();
+    assert_eq!(after_resume.acquires, 2);
+    assert_eq!(after_resume.releases, 1);
+
+    // Continuous following now owns the capture; the fixture has no staging
+    // root, so the capture itself fails, but not as a parked refusal.
+    let following_capture = capture_state_bundle(&mut owner_control).await?;
+    assert_eq!(following_capture.code(), tonic::Code::FailedPrecondition);
+    assert!(!following_capture.message().contains("parked"));
 
     cancel.cancel();
     Ok(())
