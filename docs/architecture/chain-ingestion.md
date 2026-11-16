@@ -53,6 +53,15 @@ transaction and block bytes are written only when the build plan retains them.
 CPU-heavy preparation may run in parallel; commitment-tree positioning and
 publication remain ordered.
 
+The ordered loader appends each block's note commitments to one in-memory
+frontier per active pool. It writes a tree-state checkpoint every 100 blocks
+and at the build tip. Before publication, only the build-tip checkpoint is
+compared with the node's tree state. The loader therefore cross-checks each
+checkpoint as it writes it: the root of the in-memory frontier must equal the
+root of the checkpoint's canonical `finalState` encoding. A mismatch stops
+construction, and nothing is published. The check costs at most one more root
+computation for each pool that changed since the previous checkpoint.
+
 `CanonicalConstructionSettings` and `CanonicalPipelineLimits` bound:
 
 - source segment size and target response bytes;
@@ -125,11 +134,14 @@ Each append also authenticates the note-commitment trees. Ingest appends the
 block's note commitments to the visible-tip frontier of every active pool. The
 result must equal the node's validated tree state for that block, byte for
 byte. The canonical store repeats the derivation from its own persisted
-checkpoint before it commits. Frontier validation reuses the roots of the 16
-most recently validated encodings from a process-wide memo, keyed by pool and
-exact `finalState` bytes. After the first append in a writer process, a pool
-that the block leaves unchanged costs no root computation. A pool that the
-block changes costs one, for the node's new tree state.
+checkpoint before it commits. Because the result is compared with the node's
+tree state, the append takes each changed pool's root from its canonical
+encoding and skips the cross-check that construction checkpoints run. Frontier
+validation reuses the roots of the 16 most recently validated encodings from a
+process-wide memo, keyed by pool and exact `finalState` bytes. After the first
+append in a writer process, a pool that the block leaves unchanged costs no
+root computation. A pool that the block changes costs one, for the node's new
+tree state.
 
 Readiness becomes ready only when canonical lag is within
 `ingest.follow.lag_threshold_blocks` and the live mempool gate, when configured,

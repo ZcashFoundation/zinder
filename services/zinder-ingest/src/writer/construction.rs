@@ -919,10 +919,12 @@ impl CanonicalBuildBlockReceiver {
         }
         let checkpoint_required = height == self.build_tip_height
             || height.value().is_multiple_of(TREE_STATE_CHECKPOINT_STRIDE);
+        // Only the build-tip checkpoint is later compared with the node's tree
+        // state, so each checkpoint cross-checks its encoding here.
         let tree_state_checkpoint = checkpoint_required
             .then(|| {
                 self.commitment_tree_accumulator
-                    .validated_frontiers()
+                    .cross_checked_frontiers()
                     .map(|frontiers| {
                         CommitmentTreeCheckpoint::new(
                             BlockId::new(height, block_hash),
