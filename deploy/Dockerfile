@@ -72,6 +72,11 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="--remap-path-prefix=/works
 # pages. 64 KiB pages run on AArch64 kernels with 4, 16, or 64 KiB pages; the
 # build runners use 4 KiB, which jemalloc would otherwise measure and keep.
 ENV AARCH64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_PAGE=16
+# On x86-64, jemalloc otherwise takes its virtual address width from the build
+# CPU (48 or 57 bits), so builds on different runners would differ. Linux keeps
+# user addresses below 2^47 unless a program asks for higher ones, so 48 bits
+# is also correct on 57-bit hosts. AArch64 jemalloc always uses 48.
+ENV X86_64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_VADDR=48
 ENV CARGO_PROFILE_RELEASE_STRIP=symbols
 ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 ENV ZINDER_BUILD_GIT_COMMIT=${ZINDER_BUILD_GIT_COMMIT}

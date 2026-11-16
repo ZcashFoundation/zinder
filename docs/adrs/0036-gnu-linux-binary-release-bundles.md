@@ -31,10 +31,10 @@ root also contains `BUILD-INFO.json`, `LICENSE`, `README.md`, and an internal
 `SHA256SUMS`.
 
 The release build uses Rust 1.95.0, explicit GNU target triples, an embedded
-full commit, `SOURCE_DATE_EPOCH`, disabled Cargo incremental state, and remapped
-source paths. Files are sorted with the C locale, owned numerically by UID/GID
-0, assigned fixed modes, timestamped with the tag commit time, and compressed
-with `gzip -n`. Each platform is built twice, in separate jobs with
+full commit, `SOURCE_DATE_EPOCH`, disabled Cargo incremental state, remapped
+source paths, and a fixed jemalloc virtual address width. Files are sorted
+with the C locale, owned numerically by UID/GID 0, assigned fixed modes,
+timestamped with the tag commit time, and compressed with `gzip -n`. Each platform is built twice, in separate jobs with
 independent Cargo target cache scopes, no Docker layer cache, and no CI cache.
 Both builds start as soon as the tag is validated, with a read-only repository
 token and no OIDC token.
@@ -89,3 +89,6 @@ by [ADR-0037](0037-release-artifact-provenance-and-sboms.md).
   the compile stage, and the benchmark left the shared release compile. The
   reproduction job packages every release image from its archive without
   pushing, and image binaries must keep the archive's `0755` mode.
+- 2026-11-16: The release build fixes jemalloc's x86-64 virtual address width
+  at 48 bits. jemalloc otherwise reads the width from the build machine's CPU,
+  and two builds on runners with different CPUs produced different binaries.

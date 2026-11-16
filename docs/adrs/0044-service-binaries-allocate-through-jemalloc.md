@@ -55,6 +55,15 @@ the Armv8-A baseline of
 [ADR-0036](0036-gnu-linux-binary-release-bundles.md) requires. x86-64 binaries use
 4 KiB pages, the only size x86-64 Linux uses.
 
+jemalloc also fixes, when it is built, the virtual address width of the memory
+it tracks. On x86-64, its build reads that width from the build machine's CPU,
+which reports 48 or 57 bits. The release Dockerfile sets 48 bits instead, and
+builds on different machines produce the same binary. Linux gives a process
+addresses below 2^47 unless the process asks for a higher address. jemalloc
+asks only for addresses next to memory it already holds. 48 bits is therefore
+also correct on hosts with 57-bit addressing. AArch64 builds always use 48
+bits.
+
 jemalloc gives each thread its own cache and spreads threads across many
 arenas, so concurrent readers do not queue on a shared lock. By default, a
 process that keeps allocating returns freed pages to the kernel within about
