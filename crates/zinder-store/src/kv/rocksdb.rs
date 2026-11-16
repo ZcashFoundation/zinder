@@ -174,7 +174,9 @@ pub struct BoundedRocksDbOpen {
 /// The column-family descriptors are rebuilt for each open attempt because
 /// their options hold references to the helper-owned block cache. On direct
 /// I/O failure, the function logs the unsupported mode and retries with the
-/// same bounded resource budget under buffered I/O.
+/// same bounded resource budget under buffered I/O. A budget whose
+/// [`RocksDbResourceBudget::preferred_io_mode`] is [`RocksDbIoMode::Buffered`]
+/// skips the direct attempt.
 pub fn open_bounded_rocksdb(
     role: RocksDbOpenRole<'_>,
     rocksdb_resource_budget: RocksDbResourceBudget,
@@ -193,39 +195,40 @@ pub fn open_bounded_rocksdb(
         write_buffer_manager: &write_buffer_manager,
         build_column_families: &build_column_families,
     };
+    let (db, statistics, io_mode) = open_with_preferred_io_mode(&open_attempt)?;
+    record_rocksdb_io_mode(role, io_mode);
+    Ok(BoundedRocksDbOpen {
+        db,
+        block_cache,
+        write_buffer_manager,
+        io_mode,
+        statistics: Arc::new(statistics),
+    })
+}
 
-    match open_bounded_rocksdb_once(&open_attempt, RocksDbIoMode::Direct) {
-        Ok((db, statistics)) => {
-            record_rocksdb_io_mode(role, RocksDbIoMode::Direct);
-            Ok(BoundedRocksDbOpen {
-                db,
-                block_cache,
-                write_buffer_manager,
-                io_mode: RocksDbIoMode::Direct,
-                statistics: Arc::new(statistics),
-            })
-        }
-        Err(direct_error) => {
-            tracing::warn!(
-                target: "zinder::store",
-                event = "rocksdb_direct_io_unsupported",
-                store_path = %role.store_path().display(),
-                role = role.as_str(),
-                error = %direct_error,
-                "RocksDB direct I/O open failed; retrying with buffered I/O"
-            );
-            let (db, statistics) =
-                open_bounded_rocksdb_once(&open_attempt, RocksDbIoMode::Buffered)?;
-            record_rocksdb_io_mode(role, RocksDbIoMode::Buffered);
-            Ok(BoundedRocksDbOpen {
-                db,
-                block_cache,
-                write_buffer_manager,
-                io_mode: RocksDbIoMode::Buffered,
-                statistics: Arc::new(statistics),
-            })
+fn open_with_preferred_io_mode<BuildColumnFamilies>(
+    open_attempt: &BoundedRocksDbOpenAttempt<'_, '_, BuildColumnFamilies>,
+) -> Result<(DB, Options, RocksDbIoMode), rust_rocksdb::Error>
+where
+    BuildColumnFamilies: Fn(&Cache, RocksDbResourceBudget) -> Vec<ColumnFamilyDescriptor>,
+{
+    if open_attempt.rocksdb_resource_budget.preferred_io_mode == RocksDbIoMode::Direct {
+        match open_bounded_rocksdb_once(open_attempt, RocksDbIoMode::Direct) {
+            Ok((db, statistics)) => return Ok((db, statistics, RocksDbIoMode::Direct)),
+            Err(direct_error) => {
+                tracing::warn!(
+                    target: "zinder::store",
+                    event = "rocksdb_direct_io_unsupported",
+                    store_path = %open_attempt.role.store_path().display(),
+                    role = open_attempt.role.as_str(),
+                    error = %direct_error,
+                    "RocksDB direct I/O open failed; retrying with buffered I/O"
+                );
+            }
         }
     }
+    let (db, statistics) = open_bounded_rocksdb_once(open_attempt, RocksDbIoMode::Buffered)?;
+    Ok((db, statistics, RocksDbIoMode::Buffered))
 }
 
 struct BoundedRocksDbOpenAttempt<'attempt, 'path, BuildColumnFamilies>
@@ -830,6 +833,22 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(!path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn buffered_preference_skips_the_direct_attempt() -> Result<(), Box<dyn std::error::Error>> {
+        let store_dir = tempfile::tempdir()?;
+        let mut budget = RocksDbResourceBudget::for_local_tests();
+        budget.preferred_io_mode = RocksDbIoMode::Buffered;
+        let bounded_open = open_bounded_rocksdb(
+            RocksDbOpenRole::Primary {
+                path: store_dir.path(),
+            },
+            budget,
+            |_, _| Vec::new(),
+        )?;
+        assert_eq!(bounded_open.io_mode, RocksDbIoMode::Buffered);
         Ok(())
     }
 
