@@ -568,27 +568,30 @@ secondary path before every request holding its generation has released it.
 
 ### Wallet transition exceeds its logical-byte limit
 
-The projector logs `projector failed` with an error that begins:
+The projector logs `wallet_projection_following_parked` once, at error level,
+with an error that begins:
 
 ```text
 wallet following stopped planning a transition that already needs <n> logical bytes, more than projector.follow.max_transition_logical_bytes (ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES) allows (<limit>)
 ```
 
-The projector exits, and its `on-failure` restart policy brings it back into
-the same failure. One wallet transition, typically a deep reorg that rolls back
-and replays many blocks of a busy address, touches more wallet rows than the
-limit allows. The limit counts each row the transition touches twice, once for
-the plan in memory and once for the write batch that publishes it. The
-projector refuses the transition before it writes anything, so the wallet is
-unchanged, and `<n>` is a lower bound on what the whole transition needs.
+One wallet transition, typically a deep reorg that rolls back and replays many
+blocks of a busy address, touches more wallet rows than the limit allows. The
+limit counts each row the transition touches twice, once for the plan in memory
+and once for the write batch that publishes it. The projector refuses the
+transition before it writes anything, so the wallet is unchanged, and `<n>` is
+a lower bound on what the whole transition needs.
 
-The restart loop does not end on its own. Each restart plans the same
-transition from the same wallet cursor, repeats its canonical replay and wallet
-reads up to the refusal, and leases canonical retention at the wallet cursor
-again, so the canonical writer keeps every retained event from that cursor on.
-Waiting for the chain to move on does not help either: if later canonical
-events overwrite the refused range, the projector reconciles instead, but a
-reconciliation is also one transition under the same limit.
+The projector does not exit. It parks, and Compose reports it unhealthy because
+its `/readyz` answers 503 with cause `wallet_transition_limit_exceeded`, which
+carries `<n>` as `required_bytes` and the limit as `configured_bytes`. While
+parked, it keeps renewing its one canonical retention lease, so the wallet
+later resumes from its cursor without a rebuild, and it plans the transition
+again only after the writer commits. It resumes on its own only if a later
+reorg replaces the refused blocks, and that reconciliation is also one
+transition under the same limit. Native query and compatibility keep answering
+from their last serving pair until it goes stale, then refuse wallets with
+`SERVICE_NOT_READY`.
 
 To recover, stop the projector, raise the limit, and start it again:
 

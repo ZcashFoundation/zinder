@@ -373,7 +373,9 @@ Health checks follow the same rule. The image `HEALTHCHECK` runs
 `zinder-wallet-serving-healthcheck`, which passes when query `/readyz` answers
 200 or reports `reorg_window_exceeded`, so a Docker or Compose host that
 restarts unhealthy containers keeps the typed refusal up instead of restarting
-into the same park.
+into the same park. It also passes while the projector reports the
+`wallet_transition_limit_exceeded` park described in
+[Wallet transition exceeds its logical-byte limit](#wallet-transition-exceeds-its-logical-byte-limit).
 
 Railway's deploy-time healthcheck is different. It uses `/healthz`, which
 passes once the query endpoint listens, so a parked writer does not fail a
@@ -429,32 +431,42 @@ when the window expires.
 
 ### Wallet transition exceeds its logical-byte limit
 
-The projector logs `projector failed` with an error that begins:
+The projector logs `wallet_projection_following_parked` once, at error level,
+with an error that begins:
 
 ```text
 wallet following stopped planning a transition that already needs <n> logical bytes, more than projector.follow.max_transition_logical_bytes (ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES) allows (<limit>)
 ```
 
-The container then terminates, and the `ALWAYS` restart policy brings it back
-into the same failure. One wallet transition, typically a deep reorg that rolls
-back and replays many blocks of a busy address, touches more wallet rows than
-the limit allows. The limit counts each row the transition touches twice, once
-for the plan in memory and once for the write batch that publishes it. The
-projector refuses the transition before it writes anything, so the wallet is
-unchanged, and `<n>` is a lower bound on what the whole transition needs.
+One wallet transition, typically a deep reorg that rolls back and replays many
+blocks of a busy address, touches more wallet rows than the limit allows. The
+limit counts each row the transition touches twice, once for the plan in memory
+and once for the write batch that publishes it. The projector refuses the
+transition before it writes anything, so the wallet is unchanged, and `<n>` is
+a lower bound on what the whole transition needs.
 
-The loop does not end on its own:
+The projector stays up, parked, and its `/readyz` reports both numbers:
 
-- each restart plans the same transition from the same wallet cursor and
-  refuses it at the same point;
-- each attempt repeats that transition's canonical replay and wallet reads up
-  to the refusal; and
-- each restart leases canonical retention at the wallet cursor again, so the
-  canonical writer keeps every retained event from that cursor on.
+```text
+{"status":"not_ready","cause":{"wallet_transition_limit_exceeded":{"required_bytes":<n>,"configured_bytes":<limit>}},"current_height":<wallet height>,"target_height":<writer height>}
+```
 
-Waiting for the chain to move on does not help. If later canonical events
-overwrite the refused range, the projector reconciles instead, but a
-reconciliation is also one transition under the same limit.
+While it is parked:
+
+- it keeps renewing its one canonical retention lease, so the canonical writer
+  keeps every retained event from the wallet cursor on, and the wallet later
+  resumes from that cursor without a rebuild;
+- it plans the transition again only after the writer commits, and never
+  repeats the refused transition's canonical replay and wallet reads;
+- it resumes on its own only if a later reorg replaces the refused blocks, and
+  that reconciliation is also one transition under the same limit; and
+- query keeps answering wallets from its last serving pair for a few blocks,
+  reports `serving_pair_stale`, and once its staleness ceiling passes refuses
+  them with `SERVICE_NOT_READY` and readiness cause `replica_lagging`.
+
+The container stays up in this state, and the supervisor logs the park once.
+Restarting with the same setting only parks the projector on the same
+transition again.
 
 To recover, set `ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES` on
 the service well above `<n>`, up to the maximum of `1073741824`, and redeploy.

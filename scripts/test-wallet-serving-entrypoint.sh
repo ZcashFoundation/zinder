@@ -27,6 +27,9 @@ entrypoint_function() {
 for function_name in \
   readiness_cause_is_terminal \
   readiness_cause_is_writer_halt \
+  readiness_cause_is_projector_park \
+  plane_reports_projector_park \
+  query_unready_behind_projector_park \
   classify_probe_failure \
   probe_readiness \
   observe_plane_readiness \
@@ -74,17 +77,35 @@ probe_max_time_seconds=5
 poll_interval_seconds=15
 unready_report_interval_seconds=300
 probe_halted=0
+probe_parked=0
 response_separator='
 '
 
 fake_status=""
 fake_body=""
+fake_projector_status=""
+fake_projector_body=""
 fail_message=""
 sleep_count=0
+projector_ops_fixture_addr=127.0.0.1:9110
 
 # Stands in for curl's `-w` output: the body, the separator, then the status
-# code and connect time.
+# code and connect time. The projector's ops address serves its own fixture
+# once one is set, and every other address serves the shared one.
 curl() {
+  for curl_argument in "$@"; do
+    curl_url="$curl_argument"
+  done
+  case "$curl_url" in
+    *"$projector_ops_fixture_addr"*)
+      if [ -n "$fake_projector_body" ]; then
+        printf '%s%s%s 0.001' "$fake_projector_body" "$response_separator" \
+          "$fake_projector_status"
+        return 0
+      fi
+      ;;
+    *) ;;
+  esac
   printf '%s%s%s 0.001' "$fake_body" "$response_separator" "$fake_status"
 }
 
@@ -111,10 +132,17 @@ serve() {
   fake_body="$2"
 }
 
+serve_projector() {
+  fake_projector_status="$1"
+  fake_projector_body="$2"
+}
+
 halted_body='{"ready":false,"cause":{"reorg_window_exceeded":{"depth":1001,"configured":1000}},"current_height":4200}'
 schema_body='{"ready":false,"cause":"schema_mismatch"}'
 syncing_body='{"ready":false,"cause":{"syncing":{"lag_blocks":12}}}'
 ready_body='{"ready":true,"cause":"ready"}'
+parked_body='{"ready":false,"cause":{"wallet_transition_limit_exceeded":{"required_bytes":541122672,"configured_bytes":536870912}},"current_height":4602673,"target_height":4602680}'
+lagging_body='{"ready":false,"cause":{"replica_lagging":{"lag_chain_epochs":5}},"current_height":4602673}'
 
 readiness_cause_is_terminal schema_mismatch \
   || test_failure "schema_mismatch must stay terminal"
@@ -127,6 +155,17 @@ readiness_cause_is_writer_halt reorg_window_exceeded \
   || test_failure "reorg_window_exceeded must be served as a writer halt"
 if readiness_cause_is_writer_halt syncing; then
   test_failure "syncing is not a writer halt"
+fi
+if readiness_cause_is_terminal wallet_transition_limit_exceeded; then
+  test_failure "a parked projector must not terminate the container"
+fi
+readiness_cause_is_projector_park wallet_transition_limit_exceeded \
+  || test_failure "wallet_transition_limit_exceeded must be served as a projector park"
+if readiness_cause_is_projector_park reorg_window_exceeded; then
+  test_failure "a writer halt is not a projector park"
+fi
+if readiness_cause_is_writer_halt wallet_transition_limit_exceeded; then
+  test_failure "a projector park is not a writer halt"
 fi
 
 serve 503 "$halted_body"
@@ -166,6 +205,82 @@ await_readiness zinder-ingest 127.0.0.1:9105 60 \
   || test_failure "startup must continue past a parked writer"
 [ -z "$fail_message" ] || test_failure "startup failed on a parked writer: $fail_message"
 [ "$sleep_count" -eq 0 ] || test_failure "startup waited on a parked writer"
+
+serve 503 "$parked_body"
+probe_readiness 127.0.0.1:9110
+[ "$probe_cause" = "wallet_transition_limit_exceeded" ] \
+  || test_failure "probe parsed cause '$probe_cause' from a parked projector's readiness"
+
+serve 503 "$parked_body"
+observe_plane_readiness zinder-projector 127.0.0.1:9110 \
+  || test_failure "a parked projector must count as serving"
+[ "$probe_parked" -eq 1 ] || test_failure "a projector park must be reported"
+[ "$probe_halted" -eq 0 ] || test_failure "a projector park is not a writer halt"
+
+serve 503 "$syncing_body"
+observe_plane_readiness zinder-projector 127.0.0.1:9110 || true
+[ "$probe_parked" -eq 0 ] || test_failure "a syncing projector is not parked"
+
+serve 503 "$parked_body"
+sleep_count=0
+fail_message=""
+await_readiness zinder-projector 127.0.0.1:9110 60 \
+  || test_failure "startup must continue past a parked projector"
+[ -z "$fail_message" ] || test_failure "startup failed on a parked projector: $fail_message"
+[ "$sleep_count" -eq 0 ] || test_failure "startup waited on a parked projector"
+
+# Query behind a parked projector never publishes a newer pair, so startup
+# continues once its answered refusal is the park's.
+serve 503 "$lagging_body"
+serve_projector 503 "$parked_body"
+sleep_count=0
+fail_message=""
+await_readiness zinder-query 127.0.0.1:9106 60 127.0.0.1:9110 \
+  || test_failure "startup must continue past query behind a parked projector"
+[ -z "$fail_message" ] \
+  || test_failure "startup failed on query behind a parked projector: $fail_message"
+[ "$sleep_count" -eq 0 ] || test_failure "startup waited on query behind a parked projector"
+
+# Without the park, a lagging query still has to admit traffic in time.
+serve 503 "$lagging_body"
+serve_projector 503 "$syncing_body"
+unexcused_query_message="$(
+  # The evaluated await_readiness calls this stand-in, which ends the subshell.
+  # shellcheck disable=SC2329
+  fail() {
+    printf '%s' "$*"
+    exit 1
+  }
+  await_readiness zinder-query 127.0.0.1:9106 0 127.0.0.1:9110
+)" || true
+case "$unexcused_query_message" in
+  *"zinder-query stayed unready"*replica_lagging*) ;;
+  *) test_failure "query behind a syncing projector ended the wait: '$unexcused_query_message'" ;;
+esac
+serve_projector "" ""
+
+# In the serving loop, an answered query refusal counts as serving while the
+# projector is parked, and only then.
+serve 503 "$lagging_body"
+if observe_plane_readiness zinder-query 127.0.0.1:9106; then
+  test_failure "a lagging query plane must count as unready on its own"
+fi
+query_unready_behind_projector_park 1 \
+  || test_failure "an answered query refusal behind a parked projector must count as serving"
+if query_unready_behind_projector_park 0; then
+  test_failure "a query refusal without a parked projector must stay unready"
+fi
+probe_http_status=""
+if query_unready_behind_projector_park 1; then
+  test_failure "an unreachable query plane must stay unready behind a parked projector"
+fi
+
+# The park excuses only query: an unready ingest plane observed while the
+# projector is parked still counts as unready.
+serve 503 "$syncing_body"
+if observe_plane_readiness zinder-ingest 127.0.0.1:9105; then
+  test_failure "a syncing ingest plane must count as unready while the projector is parked"
+fi
 
 # Recurrence counters as "<episode_count> <flap_unready_since_epoch>
 # <flap_episode_counted> <cumulative_unready_seconds> <flap_ready_since_epoch>".
@@ -390,13 +505,27 @@ trap 'rm -rf "$scoping_root" "$stub_bin"' EXIT
 cat >"$stub_bin/curl" <<'STUB'
 #!/bin/sh
 [ "${HEALTHCHECK_STUB_UNREACHABLE:-0}" -eq 0 ] || exit 7
+for argument in "$@"; do
+  url="$argument"
+done
+case "$url" in
+  *:9110/readyz)
+    printf '%s' "$HEALTHCHECK_STUB_PROJECTOR_BODY"
+    exit 0
+    ;;
+  *) ;;
+esac
 printf '%s\n%s' "$HEALTHCHECK_STUB_BODY" "$HEALTHCHECK_STUB_STATUS"
 STUB
 chmod +x "$stub_bin/curl"
 
+# Serves the query status and body, whether query is unreachable, and the
+# projector body.
 run_healthcheck() {
   HEALTHCHECK_STUB_STATUS="$1" HEALTHCHECK_STUB_BODY="$2" \
-    HEALTHCHECK_STUB_UNREACHABLE="${3:-0}" PATH="$stub_bin:$PATH" sh "$healthcheck"
+    HEALTHCHECK_STUB_UNREACHABLE="${3:-0}" \
+    HEALTHCHECK_STUB_PROJECTOR_BODY="${4:-$ready_body}" \
+    PATH="$stub_bin:$PATH" sh "$healthcheck"
 }
 
 run_healthcheck 200 "$ready_body" \
@@ -411,6 +540,14 @@ if run_healthcheck 503 "$schema_body"; then
 fi
 if run_healthcheck 200 "$ready_body" 1; then
   test_failure "the healthcheck must fail an unreachable query plane"
+fi
+run_healthcheck 503 "$lagging_body" 0 "$parked_body" \
+  || test_failure "the healthcheck must pass a query plane behind a parked projector"
+if run_healthcheck 503 "$lagging_body" 0 "$syncing_body"; then
+  test_failure "the healthcheck must fail a lagging query plane behind a syncing projector"
+fi
+if run_healthcheck 503 "$lagging_body" 1 "$parked_body"; then
+  test_failure "the healthcheck must fail an unreachable query plane behind a parked projector"
 fi
 
 printf 'wallet-serving entrypoint tests passed\n'
