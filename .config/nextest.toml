@@ -41,6 +41,14 @@ filter = "test(abandoned_and_stalled_unspent_output_reads_do_not_stop_publicatio
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]
+# These tests give store rows table files of their own, one flush per row, and
+# then compact the files away under a secondary. Each takes about a second
+# alone, but under full-workspace parallelism every flush waits on a contended
+# disk, and they take 10-20s, which reaches the 20s default kill window.
+filter = "test(/table_file/) | test(a_stream_ends_with_its_epoch_unavailable_when_its_replacement_serves_a_newer_epoch) | test(a_corrupt_store_control_row_refuses_admission)"
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[[profile.default.overrides]]
 # This test plans a rollback of a 200-output block about 25 times, 20 of them
 # to search for its tightest logical-byte limit, and then builds the wallet
 # cold. It takes 8-11s alone in a debug build and more under full-workspace
