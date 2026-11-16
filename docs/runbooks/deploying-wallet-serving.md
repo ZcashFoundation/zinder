@@ -477,16 +477,22 @@ when the window expires.
 
 Query logs `wallet_serving_pair_table_file_missing` at warning level when a
 read finds that the writer's or projector's compaction deleted a table file
-of its serving pair. The error names the missing `.sst` path under the
-canonical or the wallet store. You do not need to act on an occasional
-warning. Query has already handled it:
+of its serving pair. The warning's `error` field includes the RocksDB status,
+which names the missing `.sst` path under the canonical or the wallet store.
+You do not need to act on an occasional warning. Query has already handled it:
 
 - it marked the pair and published a replacement at the writer's fence;
 - the read ran once more on the replacement; and
 - `zinder_wallet_serving_missing_table_file_pairs_total` counted the pair
   once.
 
-Readiness stays ready throughout, and the container does not restart.
+The container does not restart, and readiness stays ready unless the refresh
+that prepares the replacement fails. When the RocksDB open or catch-up of
+that candidate hits another deleted file, readiness reports
+`serving_pair_stale`, which still admits traffic. Any other candidate failure,
+including a deleted file that the canonical store-control check reaches after
+the catch-up, refuses traffic until a later refresh succeeds. Both log
+`wallet_serving_pair_publisher_refresh_failed`.
 
 Investigate when the warnings follow most publications, or when clients keep
 receiving `STORAGE_UNAVAILABLE` for minutes after one. Both mean the primary

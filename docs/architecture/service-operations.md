@@ -332,9 +332,9 @@ native capabilities. Consumer support additionally requires the selected
 lightwalletd client to pass its complete lifecycle through a trusted edge.
 
 Writer-status transport failures, replica or projection lag, and a candidate
-that fails on a table file the primary just deleted report
-`serving_pair_stale` and keep serving the published pair, because that pair is
-still exactly what the writer attested. `storage.serving_pair_staleness_ceiling_ms`
+whose RocksDB open or catch-up fails on a table file the primary just deleted
+report `serving_pair_stale` and keep serving the published pair, because that
+pair is still exactly what the writer attested. `storage.serving_pair_staleness_ceiling_ms`
 bounds how long that lasts, measured from the last writer attestation and
 defaulting to five minutes; past it the underlying cause takes over and traffic
 stops. A writer fence that disagrees with the pair, a schema mismatch, and an
@@ -642,16 +642,21 @@ The client sees one of three outcomes:
   seconds, for example while every slot is taken or the replacement needs a
   cold open.
 
-Readiness does not change. Corruption and every other storage failure fail the
-read as before and leave the pair published.
+Marking the pair does not change readiness. The refresh that prepares the
+replacement reports readiness as every refresh does, even when the writer's
+fence has not moved: a candidate failure other than those that report
+`serving_pair_stale` fails closed until a later refresh succeeds. Corruption
+and every other storage failure fail the read as before and leave the pair
+published.
 
 `zinder_wallet_serving_missing_table_file_pairs_total` counts the pairs marked
 this way, once per pair however many reads hit the file. Each mark also logs
 one `wallet_serving_pair_table_file_missing` warning with the pair's
-`chain_epoch` and the error, which names the missing file. The path shows
-which primary deleted it: the canonical store or the wallet store. An
-occasional increment is routine compaction overtaking a published pair, and
-the replacement publication follows it. A count that rises with most
+`chain_epoch` and an `error` that includes the RocksDB status naming the
+missing file. The path shows which primary deleted it: the canonical store or
+the wallet store. An occasional increment is routine compaction overtaking a
+published pair, and the replacement publication follows it. A count that
+rises with most
 publications means files are replaced faster than pairs are, such as during a
 manual compaction or a bulk rewrite of the primary. If query still logs
 `STORAGE_UNAVAILABLE` for those reads, compare the warnings with
@@ -659,13 +664,16 @@ manual compaction or a bulk rewrite of the primary. If query still logs
 `wallet_serving_pair_publisher_refresh_failed` warnings: a replacement that
 cannot find a free slot, or keeps failing, leaves the marked pair current.
 
-A candidate can also fail its open or catch-up with the same missing-file
-error, when the primary deletes a file between listing and opening it. That
-refresh failure reports `serving_pair_stale` and keeps the published pair
-serving until the staleness ceiling, as a writer-status outage does. It counts
-under `zinder_wallet_serving_pair_publisher_refresh_total` with the
-`canonical_secondary` or `wallet_secondary` `error_class`, and the next
-refresh tries again.
+A candidate's RocksDB open or catch-up can also fail with the same
+missing-file error, when the primary deletes a file between listing and
+opening it. That refresh failure reports `serving_pair_stale` and keeps the
+published pair serving until the staleness ceiling, as a writer-status outage
+does. It counts under `zinder_wallet_serving_pair_publisher_refresh_total`
+with the `canonical_secondary` or `wallet_secondary` `error_class`, and the
+next refresh tries again. The canonical candidate's store-control check, which
+scans the store's default family right after each open and catch-up, reports
+a deleted file it reaches as an admission refusal instead. That refresh fails
+closed with `storage_unavailable` until a later refresh succeeds.
 
 `zinder_wallet_serving_pair_publisher_candidate_prepared_total{kind}` counts
 candidates by `kind`: `cold` for a slot opened from the primaries, and

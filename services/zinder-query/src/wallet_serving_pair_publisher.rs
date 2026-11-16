@@ -323,7 +323,7 @@ impl WalletServingPairSlot {
                 target: "zinder::wallet_serving",
                 event = "wallet_serving_pair_table_file_missing",
                 chain_epoch = pair.canonical_fence().chain_epoch_id().value(),
-                error = %error,
+                error = %error_with_sources(error),
                 "a read found a table file of the wallet-serving pair deleted by the writer's compaction; replacing the pair"
             );
         }
@@ -860,7 +860,7 @@ impl WalletServingPairPublisher {
             tracing::warn!(
                 target: "zinder::wallet_serving",
                 event = "wallet_serving_pair_publisher_refresh_failed",
-                error = %error,
+                error = %error_with_sources(&error),
                 lag_chain_epochs = self.observed_lag_chain_epochs,
                 "inactive wallet-serving pair refresh failed; retaining the prior pair"
             );
@@ -1492,6 +1492,25 @@ async fn missing_table_file_reported(signals: Option<&SlotSignals>) {
     }
 }
 
+/// Renders `error` followed by each source its message does not already end
+/// with.
+///
+/// The canonical store's `RocksDB` failure leaves the driver status, which
+/// names the missing `.sst` path, to its source.
+fn error_with_sources(error: &dyn std::error::Error) -> String {
+    let mut rendered = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let message = cause.to_string();
+        if !rendered.ends_with(&message) {
+            rendered.push_str(": ");
+            rendered.push_str(&message);
+        }
+        source = cause.source();
+    }
+    rendered
+}
+
 fn record_retained_pair_count(slot: &WalletServingPairSlot) {
     let retained_pairs = u32::try_from(slot.retained_pair_count()).unwrap_or(u32::MAX);
     metrics::gauge!("zinder_wallet_serving_pair_publisher_retained_pairs")
@@ -1803,7 +1822,9 @@ fn record_replica_lag(lag_chain_epochs: u64) {
 /// listed qualify: they describe the candidate generation or the status RPC,
 /// never the published pair. Every failure that impugns the pair itself, its
 /// schema, or the slot holding it is excluded, so those keep failing closed
-/// the moment they occur.
+/// the moment they occur. So is a deleted file that the canonical
+/// store-control check reports, because that check keeps only the `RocksDB`
+/// status text.
 fn refresh_failure_retains_attested_pair(error: &WalletServingPairError) -> bool {
     matches!(
         error,
@@ -1973,10 +1994,10 @@ mod tests {
     use zinder_store::{
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence,
         CanonicalEventHistoryRequest, CanonicalLiveAppend, CanonicalReorgPolicy,
-        CanonicalStoreBuildPlan, CanonicalStoreWorkload, EventStreamStartPosition,
-        RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
-        RocksDbCanonicalStore, RocksDbResourceBudget, StreamCursorTokenV1,
-        event_stream_start_message,
+        CanonicalStoreBuildPlan, CanonicalStoreError, CanonicalStoreWorkload,
+        EventStreamStartPosition, RawBlobRetention, RocksDbCanonicalBuilder,
+        RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
+        StreamCursorTokenV1, event_stream_start_message,
     };
     use zinder_wallet_projection::{WalletCanonicalSourceIdentity, WalletProjectionSourcePosition};
     use zinder_wallet_rocksdb::{
@@ -1988,10 +2009,10 @@ mod tests {
         SECONDARY_GENERATION_COUNT, SecondaryGenerationState, WalletServingConvergence,
         WalletServingPairConfig, WalletServingPairError, WalletServingPairPublisher,
         WalletServingPairSlot, WalletServingReadiness, classify_canonical_writer_fence,
-        classify_pair_admission, refresh_failure_is_routine_lag, refresh_failure_not_ready_cause,
-        refresh_failure_retains_attested_pair, spawn_wallet_ingest_control_readiness_probe,
-        spawn_wallet_node_readiness_probe, wallet_ingest_control_request,
-        wallet_source_writer_fence,
+        classify_pair_admission, error_with_sources, refresh_failure_is_routine_lag,
+        refresh_failure_not_ready_cause, refresh_failure_retains_attested_pair,
+        spawn_wallet_ingest_control_readiness_probe, spawn_wallet_node_readiness_probe,
+        wallet_ingest_control_request, wallet_source_writer_fence,
     };
     use crate::{
         AdmittedIngestControl, NativeWalletEndpointCapabilities, WalletEndpointMetadata,
@@ -2746,6 +2767,14 @@ mod tests {
             },
             WalletServingPairError::PairSlotUnavailable,
             WalletServingPairError::CandidateUnavailable { generation: 0 },
+            // The store-control check keeps only a deleted file's status text.
+            WalletServingPairError::Canonical(CanonicalStoreError::AdmissionRefused {
+                path: PathBuf::from("/canonical"),
+                reason: "store-control iteration failed: IO error: No such file or directory: \
+                         While open a file for random read: /canonical/000199.sst: \
+                         No such file or directory"
+                    .to_owned(),
+            }),
         ] {
             assert!(
                 !refresh_failure_retains_attested_pair(&fail_closed),
@@ -5093,7 +5122,7 @@ mod tests {
     ///
     /// The publisher's catch-up interval is an hour, so only the reads'
     /// report can wake it. Both concurrent reads capture the stale pair, and
-    /// the pair is counted once.
+    /// the pair is counted and logged once, with the missing file's path.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_read_missing_a_table_file_is_answered_by_a_replacement_pair()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -5122,6 +5151,7 @@ mod tests {
         let publisher_task = publisher.spawn(cancel.clone(), serving_runtime_drained.clone());
         compact_away_table_files(&canonical_primary_path)?;
 
+        let log_capture = LogCapture::install_for_target("zinder::wallet_serving");
         let range = split_block_range();
         let (first, second) = tokio::join!(
             query.compact_blocks_in_range(range, None),
@@ -5141,6 +5171,21 @@ mod tests {
         );
         assert_eq!(replacement.canonical_fence(), stale_pair.canonical_fence());
         assert_eq!(missing_table_file_pairs(&rendered_metrics.render()), 1);
+        let warnings = log_capture
+            .events()
+            .into_iter()
+            .filter(|event| event.field("event") == Some("wallet_serving_pair_table_file_missing"))
+            .collect::<Vec<_>>();
+        let [warning] = warnings.as_slice() else {
+            return Err(format!("expected one missing-file warning, got {warnings:?}").into());
+        };
+        let logged_error = warning.field("error").unwrap_or_default();
+        assert!(
+            logged_error.contains(&canonical_primary_path.display().to_string())
+                && logged_error.contains(".sst"),
+            "the warning must name the missing canonical table file, got {logged_error:?}"
+        );
+        drop(log_capture);
         let pinned = query
             .compact_blocks_in_range(range, Some(stale_epoch))
             .await?;
@@ -5275,7 +5320,8 @@ mod tests {
     }
 
     /// A candidate that opens or catches up while the writer deletes a table
-    /// file it just listed leaves the published pair serving.
+    /// file it just listed leaves the published pair serving, and the logged
+    /// failure names that file.
     #[test]
     fn a_candidate_missing_a_table_file_keeps_the_attested_pair_serving()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -5305,6 +5351,12 @@ mod tests {
         assert!(missing.is_missing_table_file(), "{missing:?}");
 
         let failure = WalletServingPairError::Canonical(missing);
+        let logged_error = error_with_sources(&failure);
+        assert!(
+            logged_error.contains(&canonical_primary_path.display().to_string())
+                && logged_error.contains(".sst"),
+            "the refresh failure must name the missing table file, got {logged_error:?}"
+        );
         assert!(refresh_failure_retains_attested_pair(&failure));
         assert_eq!(
             refresh_failure_not_ready_cause(&failure),
