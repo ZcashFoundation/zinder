@@ -194,10 +194,14 @@ the writer's fence moved. A read that fails this way therefore marks its pair:
 
 - The marked pair leaves retention at once. A pin no longer captures it, and
   a capture returns it only while it is still the current pair.
-- The read wakes the publisher. The publisher prepares a candidate as it does
-  for a new block, even when the writer's fence has not moved, and publishes it
-  at the writer's fence. It prepares none while the writer is parked, because
-  readiness already refuses traffic then.
+- The read that marks the pair wakes the publisher. The publisher prepares a
+  candidate as it does for a new block, even when the writer's fence has not
+  moved, and publishes it at the writer's fence. It prepares none while the
+  writer is parked, because readiness already refuses traffic then. Later
+  reads that find the marked pair missing a file wait for the same
+  publication without waking the publisher again. When the replacement cannot
+  be published yet, such as while every inactive generation is taken, the
+  periodic refresh retries it.
 - The read waits up to five seconds for that publication. It then runs once
   more on the pair that answers its epoch. An unpinned read uses the new
   current pair. A pinned read, and a stream that continues at its own epoch,

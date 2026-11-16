@@ -627,9 +627,13 @@ compaction deletes that file, a read that needs it fails with an I/O error
 that names the missing `.sst` path. Query then handles the read this way:
 
 1. It marks the pair, which leaves retention at once.
-2. It wakes the publisher, which publishes a replacement at the writer's
-   fence, even when the writer has not moved. A recycled slot makes the
-   replacement in about the time of one catch-up.
+2. The read that marks the pair wakes the publisher, which publishes a
+   replacement at the writer's fence, even when the writer has not moved. A
+   recycled slot makes the replacement in about the time of one catch-up.
+   Later reads that hit the marked pair wait for the same publication without
+   waking the publisher again. When the replacement cannot be published yet,
+   the next periodic refresh, every `storage.secondary_catchup_interval_ms`,
+   tries again.
 3. It waits up to five seconds for the replacement and reads once more there
    when that pair answers its epoch.
 

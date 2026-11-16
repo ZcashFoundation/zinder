@@ -18,9 +18,9 @@
 //! A secondary does not keep the primary's table files alive, so a frozen
 //! generation can name a file the writer's compaction has since deleted. A
 //! read that finds such a file gone marks its pair, which then leaves the
-//! slot, and wakes the publisher, which publishes a fresh generation even when
-//! the writer has not moved. The read then runs once more on the fresh pair
-//! when that pair answers the read's epoch.
+//! slot. The read that marks the pair wakes the publisher, which publishes a
+//! fresh generation even when the writer has not moved. The read then runs
+//! once more on the fresh pair when that pair answers the read's epoch.
 
 use std::{
     borrow::Cow,
@@ -154,7 +154,8 @@ pub struct WalletServingPairSlot {
 
 /// Wake-ups exchanged between the requests reading a slot and its publisher.
 struct SlotSignals {
-    /// Wakes the publisher once a read finds a pair missing a table file.
+    /// Wakes the publisher when a read first finds a pair missing a table
+    /// file.
     missing_table_file: Notify,
     /// Changes on every publication, so a read can wait for a replacement.
     publication: watch::Sender<()>,
@@ -307,26 +308,31 @@ impl WalletServingPairSlot {
     }
 
     /// Marks `pair` after a read through it failed with `error` because one
-    /// of its table files was deleted, and wakes the publisher to replace it.
+    /// of its table files was deleted.
     ///
-    /// The first report for a pair counts and logs it. The marked pair
-    /// answers no new capture except as the current pair, which it stays
-    /// until the publisher publishes its replacement.
+    /// The first report for a pair counts and logs it and wakes the publisher
+    /// to replace it. Later reports change nothing: when no replacement can be
+    /// published yet, such as while every inactive generation is taken, the
+    /// publisher's periodic refresh retries, so sustained reads on the marked
+    /// pair cannot drive back-to-back refreshes. The marked pair answers no
+    /// new capture except as the current pair, which it stays until the
+    /// publisher publishes its replacement.
     pub(crate) fn report_missing_table_file(
         &self,
         pair: &WalletServingReadPair,
         error: &crate::QueryError,
     ) {
-        if pair.mark_table_file_missing() {
-            metrics::counter!("zinder_wallet_serving_missing_table_file_pairs_total").increment(1);
-            tracing::warn!(
-                target: "zinder::wallet_serving",
-                event = "wallet_serving_pair_table_file_missing",
-                chain_epoch = pair.canonical_fence().chain_epoch_id().value(),
-                error = %error_with_sources(error),
-                "a read found a table file of the wallet-serving pair deleted by the writer's compaction; replacing the pair"
-            );
+        if !pair.mark_table_file_missing() {
+            return;
         }
+        metrics::counter!("zinder_wallet_serving_missing_table_file_pairs_total").increment(1);
+        tracing::warn!(
+            target: "zinder::wallet_serving",
+            event = "wallet_serving_pair_table_file_missing",
+            chain_epoch = pair.canonical_fence().chain_epoch_id().value(),
+            error = %error_with_sources(error),
+            "a read found a table file of the wallet-serving pair deleted by the writer's compaction; replacing the pair"
+        );
         self.signals.missing_table_file.notify_one();
     }
 
@@ -796,10 +802,10 @@ impl WalletServingPairPublisher {
     /// Runs bounded refreshes until shutdown, then retains reader ownership
     /// until the serving runtime confirms its request paths have drained.
     ///
-    /// A refresh runs every catch-up interval, and at once when a read finds
-    /// a pair missing a table file. Every refresh failure leaves the current
-    /// immutable pair untouched and updates readiness with its typed cause;
-    /// it never falls back to a primary store.
+    /// A refresh runs every catch-up interval, and at once when a read first
+    /// finds a pair missing a table file. Every refresh failure leaves the
+    /// current immutable pair untouched and updates readiness with its typed
+    /// cause; it never falls back to a primary store.
     #[must_use = "await the publisher on shutdown so secondary handles close before process exit"]
     pub fn spawn(
         mut self,
@@ -2009,10 +2015,11 @@ mod tests {
         SECONDARY_GENERATION_COUNT, SecondaryGenerationState, WalletServingConvergence,
         WalletServingPairConfig, WalletServingPairError, WalletServingPairPublisher,
         WalletServingPairSlot, WalletServingReadiness, classify_canonical_writer_fence,
-        classify_pair_admission, error_with_sources, refresh_failure_is_routine_lag,
-        refresh_failure_not_ready_cause, refresh_failure_retains_attested_pair,
-        spawn_wallet_ingest_control_readiness_probe, spawn_wallet_node_readiness_probe,
-        wallet_ingest_control_request, wallet_source_writer_fence,
+        classify_pair_admission, error_with_sources, missing_table_file_reported,
+        refresh_failure_is_routine_lag, refresh_failure_not_ready_cause,
+        refresh_failure_retains_attested_pair, spawn_wallet_ingest_control_readiness_probe,
+        spawn_wallet_node_readiness_probe, wallet_ingest_control_request,
+        wallet_source_writer_fence,
     };
     use crate::{
         AdmittedIngestControl, NativeWalletEndpointCapabilities, WalletEndpointMetadata,
@@ -2020,7 +2027,8 @@ mod tests {
     };
     use zinder_testkit::{
         CanonicalBaseline, CanonicalWriterFixture, ChainFixture, IngestControlFixture,
-        IngestControlFixtureService, LogCapture, sample_regtest_upgrade_activations,
+        IngestControlFixtureService, LogCapture, WalletServingStoreFixture,
+        sample_regtest_upgrade_activations,
     };
 
     #[test]
@@ -5317,6 +5325,48 @@ mod tests {
 
         drop((pair, query, slot, publisher));
         primaries.shutdown().await
+    }
+
+    /// Only the report that marks a pair wakes the publisher.
+    ///
+    /// Every read on the marked pair that finds the file gone reports it
+    /// again while the replacement is pending. A wake for each would run
+    /// back-to-back refreshes whenever no generation is free, instead of
+    /// leaving the retry to the periodic refresh.
+    #[tokio::test]
+    async fn reports_on_a_marked_pair_wake_the_publisher_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let activations = sample_regtest_upgrade_activations();
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
+        let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+        let (canonical, wallet) = store.take_readers()?;
+        let pair = Arc::new(crate::WalletServingReadPair::new(
+            Arc::new(canonical),
+            Arc::new(wallet),
+        )?);
+        let slot = WalletServingPairSlot::new(Arc::clone(&pair));
+        // The report only logs the read's failure.
+        let failure = crate::QueryError::BlockingTaskFailed {
+            reason: "a table file of the pair is missing".to_owned(),
+        };
+
+        let mut wakes = 0;
+        for _ in 0..8 {
+            slot.report_missing_table_file(&pair, &failure);
+            if tokio::time::timeout(
+                Duration::ZERO,
+                missing_table_file_reported(Some(&slot.signals)),
+            )
+            .await
+            .is_ok()
+            {
+                wakes += 1;
+            }
+        }
+
+        assert_eq!(wakes, 1);
+        assert!(pair.has_missing_table_file());
+        Ok(())
     }
 
     /// A candidate that opens or catches up while the writer deletes a table
