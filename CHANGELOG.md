@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.16.1] - 2026-11-16
+
+### Fixed
+
+- A read pinned to a chain epoch no longer fails with `CHAIN_EPOCH_PIN_UNAVAILABLE` seconds after its epoch is replaced when blocks arrive quickly, a regression in v0.16.0. A replaced serving pair now answers pinned reads for one full minute after it is replaced, including block-range streams in the lightwalletd compatibility surface. To keep that guarantee, wallet serving publishes at most three blocks per minute as separate pairs: during a faster burst it waits, up to about 90 seconds, and then publishes the latest block. `zinder_wallet_serving_pair_publisher_generation_wait_total` reports these waits with reason `retention_window`. ([#227](https://github.com/ZcashFoundation/zinder/pull/227))
+
+
 ## [0.16.0] - 2026-11-16
 
 ### Changed
