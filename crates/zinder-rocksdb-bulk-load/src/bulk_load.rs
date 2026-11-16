@@ -418,7 +418,7 @@ impl<'options> OrderedSstWriter<'options> {
         self.next_file_index = ordinal
             .checked_add(1)
             .ok_or_else(|| BulkLoadError::invalid("SST file count exceeds u64::MAX"))?;
-        let writer = SstFileWriter::create(self.options);
+        let mut writer = SstFileWriter::create(self.options);
         writer
             .open(&path)
             .map_err(|source| BulkLoadError::RocksDbOperation {

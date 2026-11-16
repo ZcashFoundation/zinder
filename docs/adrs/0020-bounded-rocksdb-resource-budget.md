@@ -84,6 +84,13 @@ Local tests use the same bounded path with a smaller profile: 32 MiB block
 cache, 16 MiB WAL ceiling, 64 open files, 4 MiB write buffers, two write
 buffers, a two-job primary limit, and an 8 MiB total memtable budget.
 
+The budget also carries `statistics_level`, which selects RocksDB statistics
+collection. `off` installs no statistics object. `tickers`, the default,
+collects ticker counters only (RocksDB's `kExceptHistogramOrTimers`). `full`
+uses RocksDB's default level, which adds histograms and operation timers.
+Zinder exports tickers only; histograms appear in RocksDB's periodic `LOG`
+statistics dump.
+
 The validation gate rejects values below the minimums:
 
 - `MIN_BLOCK_CACHE_BYTES = 4 MiB`
@@ -133,6 +140,13 @@ These options are storage-layer contracts and are not operator-configurable:
   `transparent_unspent_output_by_address`, and
   `transparent_address_transaction`. Their filter and index partitions are
   charged to the same bounded cache.
+- Compression is fixed per family: Snappy for the canonical and wallet data
+  families, ZSTD for every materialized-view family
+  ([ADR-0034](0034-exclusive-index-build-stages-and-block-local-spend-replay.md)),
+  and Snappy for each store's `default` family, which holds the canonical and
+  wallet control rows. The open path gives the `default` family explicit
+  options, so a change in RocksDB's default compression does not change the
+  codec of newly written files.
 - The write-buffer manager handle is retained for the lifetime of the DB
   handle, alongside the block cache.
 
@@ -209,3 +223,8 @@ anonymous memory.
   hash-keyed families carry partitioned hybrid-Ribbon whole-key filters charged
   to the bounded cache, and wallet cache sizing counts their filter working
   set.
+- 2026-11-16: RocksDB 11.12 through `rust-rocksdb` 0.54. RocksDB 11.5 made LZ4
+  the default compression, so the `default` family now pins Snappy. The
+  `tickers` statistics level collects tickers only; earlier bindings mapped it
+  to RocksDB's `kExceptTimers` level, which also recorded size histograms such
+  as `rocksdb.bytes.per.write`.

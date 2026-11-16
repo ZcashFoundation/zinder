@@ -7,7 +7,8 @@ use std::{
 
 use parking_lot::Mutex;
 use rust_rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, Options, WriteBufferManager,
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DBCompressionType,
+    DEFAULT_COLUMN_FAMILY_NAME, Options, WriteBufferManager,
     statistics::{StatsLevel, Ticker},
 };
 
@@ -284,10 +285,19 @@ where
             db_options.set_compaction_readahead_size(DIRECT_IO_COMPACTION_READAHEAD_BYTES);
         }
     }
-    let column_families = (open_attempt.build_column_families)(
+    let mut column_families = (open_attempt.build_column_families)(
         open_attempt.block_cache,
         open_attempt.rocksdb_resource_budget,
     );
+    if !column_families
+        .iter()
+        .any(|family| family.name() == DEFAULT_COLUMN_FAMILY_NAME)
+    {
+        column_families.push(ColumnFamilyDescriptor::new(
+            DEFAULT_COLUMN_FAMILY_NAME,
+            default_column_family_options(),
+        ));
+    }
 
     let db = match open_attempt.role {
         RocksDbOpenRole::Primary { path } | RocksDbOpenRole::ExistingPrimary { path } => {
@@ -304,6 +314,19 @@ where
         ),
     }?;
     Ok((db, db_options))
+}
+
+/// Options for the `default` family, which holds the canonical and wallet
+/// control rows.
+///
+/// Without a descriptor of its own, `rust-rocksdb` opens this family with
+/// `Options::default()`, whose compression `RocksDB` 11.5 changed from Snappy
+/// to LZ4. Pinning Snappy keeps new control-row files in the codec that
+/// existing stores already hold; every other option keeps `RocksDB`'s default.
+fn default_column_family_options() -> Options {
+    let mut options = Options::default();
+    options.set_compression_type(DBCompressionType::Snappy);
+    options
 }
 
 fn record_rocksdb_io_mode(role: RocksDbOpenRole<'_>, io_mode: RocksDbIoMode) {
@@ -677,6 +700,8 @@ fn usize_to_f64(sample: usize) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use rust_rocksdb::statistics::Histogram;
+
     use super::*;
 
     #[test]
@@ -844,6 +869,96 @@ mod tests {
         let mut budget = RocksDbResourceBudget::for_local_tests();
         budget.statistics_level = RocksDbStatisticsLevel::Off;
         record_gauges_on_fresh_store(budget)
+    }
+
+    #[test]
+    fn tickers_statistics_level_collects_no_histograms() -> Result<(), Box<dyn std::error::Error>> {
+        let mut budget = RocksDbResourceBudget::for_local_tests();
+        budget.statistics_level = RocksDbStatisticsLevel::Tickers;
+        assert_eq!(write_one_key_and_count_statistics(budget)?, (1, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn full_statistics_level_collects_histograms() -> Result<(), Box<dyn std::error::Error>> {
+        let mut budget = RocksDbResourceBudget::for_local_tests();
+        budget.statistics_level = RocksDbStatisticsLevel::Full;
+        assert_eq!(write_one_key_and_count_statistics(budget)?, (1, 1));
+        Ok(())
+    }
+
+    /// Writes one key and returns the keys-written ticker and the number of
+    /// samples in the bytes-per-write histogram.
+    fn write_one_key_and_count_statistics(
+        budget: RocksDbResourceBudget,
+    ) -> Result<(u64, u64), Box<dyn std::error::Error>> {
+        let store_dir = tempfile::tempdir()?;
+        let bounded_open = open_bounded_rocksdb(
+            RocksDbOpenRole::Primary {
+                path: store_dir.path(),
+            },
+            budget,
+            |_, _| Vec::new(),
+        )?;
+        bounded_open.db.put(b"key", b"row")?;
+        let statistics = &bounded_open.statistics;
+        Ok((
+            statistics.get_ticker_count(Ticker::NumberKeysWritten),
+            statistics
+                .get_histogram_data(Histogram::BytesPerWrite)
+                .count(),
+        ))
+    }
+
+    #[test]
+    fn default_family_compresses_with_snappy() -> Result<(), Box<dyn std::error::Error>> {
+        let store_dir = tempfile::tempdir()?;
+        let _bounded_open = open_bounded_rocksdb(
+            RocksDbOpenRole::Primary {
+                path: store_dir.path(),
+            },
+            RocksDbResourceBudget::for_local_tests(),
+            |_, _| vec![ColumnFamilyDescriptor::new("rows", Options::default())],
+        )?;
+        assert_eq!(
+            persisted_compression(store_dir.path(), DEFAULT_COLUMN_FAMILY_NAME)?,
+            Some("kSnappyCompression".to_owned())
+        );
+        Ok(())
+    }
+
+    /// Reads `compression` for `family` from the newest `OPTIONS-*` file, which
+    /// `RocksDB` writes on every open from the options it applied.
+    fn persisted_compression(
+        store: &Path,
+        family: &str,
+    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        let mut newest: Option<(u64, String)> = None;
+        for entry in fs::read_dir(store)? {
+            let file_name = entry?
+                .file_name()
+                .into_string()
+                .map_err(|_| "store file name is not UTF-8")?;
+            let Some(number) = file_name.strip_prefix("OPTIONS-") else {
+                continue;
+            };
+            let number = number.parse::<u64>()?;
+            if newest
+                .as_ref()
+                .is_none_or(|(newest_number, _)| number > *newest_number)
+            {
+                newest = Some((number, file_name));
+            }
+        }
+        let (_, file_name) = newest.ok_or("store has no OPTIONS file")?;
+        let options_text = fs::read_to_string(store.join(file_name))?;
+        let section = format!("[CFOptions \"{family}\"]");
+        Ok(options_text
+            .lines()
+            .skip_while(|line| *line != section)
+            .skip(1)
+            .take_while(|line| !line.starts_with('['))
+            .find_map(|line| line.trim().strip_prefix("compression=").map(str::to_owned)))
     }
 
     fn record_gauges_on_fresh_store(
