@@ -241,6 +241,11 @@ where
 #[cfg(test)]
 thread_local! {
     static ROOT_COMPUTATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Bytes the next accumulator snapshot on this thread encodes in place of
+    /// its frontier, so a test can model a codec whose round trip changes the
+    /// tree.
+    static SNAPSHOT_ENCODING_OVERRIDE: std::cell::Cell<Option<Vec<u8>>> =
+        const { std::cell::Cell::new(None) };
 }
 
 #[cfg(feature = "commitment-tree-codec")]
@@ -542,6 +547,10 @@ struct PoolAccumulator<Node> {
     tree_size: u32,
     /// Root of `frontier` in Zebra RPC display order, or `None` until it is
     /// derived after the pool activates or receives commitments.
+    ///
+    /// It comes from the validated seed checkpoint or from `frontier` itself,
+    /// never from a snapshot's encoding, so a snapshot can be checked against
+    /// it.
     root: Option<FinalNoteCommitmentRoot>,
 }
 
@@ -663,14 +672,18 @@ impl CommitmentTreeAccumulator {
     /// Produces canonical, revalidated Zebra `finalState` checkpoints.
     ///
     /// Each pool's frontier is encoded with the official codec and validated
-    /// again, and its root is derived from those canonical bytes. A pool that
-    /// received no commitments since seeding keeps its validated root.
+    /// again, and its root is derived from those canonical bytes. That root is
+    /// compared with the in-memory frontier's root only when the accumulator
+    /// already holds it, as it does for a pool that received no commitments
+    /// since seeding. Use this when the caller compares the result with the
+    /// node's tree state, as live following does, and
+    /// [`Self::cross_checked_frontiers`] when nothing else checks it.
     pub fn validated_frontiers(
         &mut self,
     ) -> Result<CommitmentTreeFrontiers, CommitmentTreeAccumulatorError> {
         Ok(CommitmentTreeFrontiers::from_validated_parts(
             self.sapling
-                .as_mut()
+                .as_ref()
                 .map(|pool| {
                     snapshot_pool(
                         ShieldedProtocol::Sapling,
@@ -680,7 +693,7 @@ impl CommitmentTreeAccumulator {
                 })
                 .transpose()?,
             self.orchard
-                .as_mut()
+                .as_ref()
                 .map(|pool| {
                     snapshot_pool(
                         ShieldedProtocol::Orchard,
@@ -690,7 +703,7 @@ impl CommitmentTreeAccumulator {
                 })
                 .transpose()?,
             self.ironwood
-                .as_mut()
+                .as_ref()
                 .map(|pool| {
                     snapshot_pool(
                         ShieldedProtocol::Ironwood,
@@ -700,6 +713,34 @@ impl CommitmentTreeAccumulator {
                 })
                 .transpose()?,
         ))
+    }
+
+    /// Produces the checkpoints of [`Self::validated_frontiers`] after
+    /// requiring each pool's canonical encoding to have the same root as its
+    /// in-memory frontier.
+    ///
+    /// The comparison rejects an encoding that does not round-trip to the
+    /// appended tree. Use it when no node tree state is compared with the
+    /// result, as for the checkpoints that canonical construction persists. It
+    /// costs one more root derivation for each pool that received commitments
+    /// since its root was last derived.
+    ///
+    /// A mismatch returns
+    /// [`CommitmentTreeAccumulatorError::FrontierSnapshotValidationFailed`]
+    /// with [`CommitmentTreeFrontierValidationError::RootMismatch`].
+    pub fn cross_checked_frontiers(
+        &mut self,
+    ) -> Result<CommitmentTreeFrontiers, CommitmentTreeAccumulatorError> {
+        if let Some(pool) = self.sapling.as_mut() {
+            current_pool_root(pool, sapling_root_bytes_in_rpc_order);
+        }
+        if let Some(pool) = self.orchard.as_mut() {
+            current_pool_root(pool, orchard_root_bytes_in_rpc_order);
+        }
+        if let Some(pool) = self.ironwood.as_mut() {
+            current_pool_root(pool, orchard_root_bytes_in_rpc_order);
+        }
+        self.validated_frontiers()
     }
 
     /// Produces final roots for the current accumulator tip.
@@ -1032,7 +1073,7 @@ where
 
 fn snapshot_pool<Node>(
     protocol: ShieldedProtocol,
-    pool: &mut PoolAccumulator<Node>,
+    pool: &PoolAccumulator<Node>,
     root_bytes_in_rpc_order: impl Fn(&Node) -> [u8; 32],
 ) -> Result<CommitmentTreeFrontier, CommitmentTreeAccumulatorError>
 where
@@ -1043,6 +1084,10 @@ where
     write_commitment_tree(&legacy_tree, &mut final_state_bytes).map_err(|source| {
         CommitmentTreeAccumulatorError::FrontierSnapshotEncodingFailed { protocol, source }
     })?;
+    #[cfg(test)]
+    let final_state_bytes = SNAPSHOT_ENCODING_OVERRIDE
+        .take()
+        .unwrap_or(final_state_bytes);
     let validation_failed = |source| {
         CommitmentTreeAccumulatorError::FrontierSnapshotValidationFailed { protocol, source }
     };
@@ -1055,7 +1100,6 @@ where
             CommitmentTreeFrontierValidationError::RootMismatch,
         ));
     }
-    pool.root = Some(snapshot.final_root());
     Ok(snapshot)
 }
 
@@ -1694,6 +1738,160 @@ mod tests {
         );
         assert_ne!(derived_sapling.final_root(), source_sapling.final_root());
         assert_ne!(derived, source);
+        Ok(())
+    }
+
+    /// Makes the next accumulator snapshot on this thread encode `frontier`
+    /// in place of its own tree.
+    fn encode_next_snapshot_as(frontier: &CommitmentTreeFrontier) {
+        SNAPSHOT_ENCODING_OVERRIDE.set(Some(frontier.final_state_bytes().to_vec()));
+    }
+
+    fn append_block(
+        accumulator: &mut CommitmentTreeAccumulator,
+        block: &BlockCommitments,
+    ) -> TestResult {
+        let height = accumulator
+            .tip_height()
+            .next()
+            .ok_or("fixture height must advance")?;
+        accumulator.append_block_commitments(
+            height,
+            &block.sapling,
+            &block.orchard,
+            &block.ironwood,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_construction_checkpoint_rejects_an_encoding_that_differs_from_its_frontier() -> TestResult
+    {
+        let first_leaves = BlockCommitments {
+            sapling: vec![commitment(1)],
+            ..BlockCommitments::default()
+        };
+        let mut node = NodeTrees::after(&first_leaves)?;
+        let predecessor = node.checkpoint()?;
+        let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
+            BlockHeight::new(1),
+            &predecessor,
+            &pool_activations(1, 1, 1)?,
+        )?;
+        let block = BlockCommitments {
+            sapling: vec![commitment(2)],
+            ..BlockCommitments::default()
+        };
+        append_block(&mut accumulator, &block)?;
+        node.append(&block)?;
+        let source = node.checkpoint()?;
+        // A codec that lost the block's commitment would encode the
+        // predecessor tree, which is itself a valid canonical encoding.
+        let lost_commitment = predecessor.sapling().ok_or("Sapling must be active")?;
+
+        encode_next_snapshot_as(lost_commitment);
+        let unchecked = accumulator.validated_frontiers()?;
+        assert_eq!(unchecked.sapling(), Some(lost_commitment));
+        assert_ne!(unchecked, source, "live following compares with the node");
+
+        encode_next_snapshot_as(lost_commitment);
+        assert!(matches!(
+            accumulator.cross_checked_frontiers(),
+            Err(
+                CommitmentTreeAccumulatorError::FrontierSnapshotValidationFailed {
+                    protocol: ShieldedProtocol::Sapling,
+                    source: CommitmentTreeFrontierValidationError::RootMismatch,
+                }
+            )
+        ));
+        assert_eq!(accumulator.cross_checked_frontiers()?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn a_construction_checkpoint_rejects_a_memoized_root_that_differs_from_its_frontier()
+    -> TestResult {
+        let block = BlockCommitments {
+            sapling: vec![commitment(1)],
+            ..BlockCommitments::default()
+        };
+        let source = NodeTrees::after(&block)?.checkpoint()?;
+        let source_sapling = source.sapling().ok_or("Sapling must be active")?;
+        let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
+            BlockHeight::new(0),
+            &CommitmentTreeFrontiers::default(),
+            &pool_activations(1, 1, 1)?,
+        )?;
+        append_block(&mut accumulator, &block)?;
+        forget_derived_roots();
+        let wrong_root = FinalNoteCommitmentRoot::from_bytes([0xff; 32]);
+        with_frontier_root_memo(|memo| {
+            memo.insert(
+                ShieldedProtocol::Sapling,
+                source_sapling.final_state_bytes(),
+                wrong_root,
+            );
+        });
+
+        assert_eq!(
+            accumulator
+                .validated_frontiers()?
+                .sapling()
+                .map(CommitmentTreeFrontier::final_root),
+            Some(wrong_root)
+        );
+        assert!(matches!(
+            accumulator.cross_checked_frontiers(),
+            Err(
+                CommitmentTreeAccumulatorError::FrontierSnapshotValidationFailed {
+                    protocol: ShieldedProtocol::Sapling,
+                    source: CommitmentTreeFrontierValidationError::RootMismatch,
+                }
+            )
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_construction_checkpoint_derives_two_roots_per_changed_pool() -> TestResult {
+        forget_derived_roots();
+        let first_leaves = BlockCommitments {
+            sapling: vec![commitment(1)],
+            orchard: vec![commitment(2)],
+            ironwood: vec![commitment(3)],
+        };
+        let mut node = NodeTrees::after(&first_leaves)?;
+        let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
+            BlockHeight::new(1),
+            &node.checkpoint()?,
+            &pool_activations(1, 1, 1)?,
+        )?;
+        let before = root_computations();
+
+        for value in 4_u8..14 {
+            let block = BlockCommitments {
+                sapling: vec![commitment(value)],
+                ..BlockCommitments::default()
+            };
+            append_block(&mut accumulator, &block)?;
+            node.append(&block)?;
+        }
+        assert_eq!(root_computations() - before, 0);
+        // The changed pool derives its root from its frontier and from its
+        // encoding, and the unchanged pools derive none.
+        let checkpoint = accumulator.cross_checked_frontiers()?;
+        assert_eq!(root_computations() - before, 2);
+        // Explorer final roots and an unchanged checkpoint reuse those roots.
+        assert_eq!(
+            accumulator.final_note_commitment_roots(BlockHash::from_bytes([7; 32])),
+            checkpoint.final_note_commitment_roots(BlockId::new(
+                accumulator.tip_height(),
+                BlockHash::from_bytes([7; 32]),
+            ))
+        );
+        assert_eq!(accumulator.cross_checked_frontiers()?, checkpoint);
+        assert_eq!(root_computations() - before, 2);
+        assert_eq!(checkpoint, node.checkpoint()?);
         Ok(())
     }
 
