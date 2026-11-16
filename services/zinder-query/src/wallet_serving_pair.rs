@@ -1,6 +1,13 @@
 //! Immutable, exact-fence read pairs for wallet serving.
 
-use std::{fmt, io, num::NonZeroU16, sync::Arc};
+use std::{
+    fmt, io,
+    num::NonZeroU16,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use thiserror::Error;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
@@ -463,12 +470,17 @@ impl WalletProjectionReader for RocksDbWalletSecondary {
 /// bounded steps checks between them whether the publisher has revoked reads
 /// on the pair, which it does once the pair has been released for longer than
 /// the released-pair read limit, and then fails and drops the pair.
+///
+/// A pair whose read found one of its table files deleted by a primary's
+/// compaction is marked. A marked pair answers no pin, and it stays the
+/// current pair only until the publisher publishes its replacement.
 pub struct WalletServingReadPair {
     canonical: Arc<dyn CanonicalReader>,
     wallet: Arc<dyn WalletProjectionReader>,
     canonical_fence: CanonicalEventFence,
     wallet_source: WalletCanonicalSourceIdentity,
     reads_revoked: CancellationToken,
+    table_file_missing: AtomicBool,
 }
 
 impl WalletServingReadPair {
@@ -487,6 +499,7 @@ impl WalletServingReadPair {
             canonical,
             wallet,
             reads_revoked: CancellationToken::new(),
+            table_file_missing: AtomicBool::new(false),
         })
     }
 
@@ -582,6 +595,17 @@ impl WalletServingReadPair {
     /// Reports whether the publisher has revoked reads on this pair.
     pub(crate) fn are_reads_revoked(&self) -> bool {
         self.reads_revoked.is_cancelled()
+    }
+
+    /// Marks this pair as missing a table file, returning `true` the first
+    /// time.
+    pub(crate) fn mark_table_file_missing(&self) -> bool {
+        !self.table_file_missing.swap(true, Ordering::AcqRel)
+    }
+
+    /// Reports whether a read found one of this pair's table files deleted.
+    pub(crate) fn has_missing_table_file(&self) -> bool {
+        self.table_file_missing.load(Ordering::Acquire)
     }
 
     /// Returns the failure a revoked read ends with: its epoch is no longer

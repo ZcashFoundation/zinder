@@ -14,6 +14,13 @@
 //! failed catch-up. A request that holds an old pair for a long time pins
 //! only that generation: the publisher keeps refreshing into the other
 //! bounded generation slots.
+//!
+//! A secondary does not keep the primary's table files alive, so a frozen
+//! generation can name a file the writer's compaction has since deleted. A
+//! read that finds such a file gone marks its pair, which then leaves the
+//! slot, and wakes the publisher, which publishes a fresh generation even when
+//! the writer has not moved. The read then runs once more on the fresh pair
+//! when that pair answers the read's epoch.
 
 use std::{
     borrow::Cow,
@@ -29,7 +36,11 @@ use crate::{
 };
 use arc_swap::ArcSwap;
 use thiserror::Error;
-use tokio::{task::JoinHandle, time::Instant};
+use tokio::{
+    sync::{Notify, watch},
+    task::JoinHandle,
+    time::Instant,
+};
 use tokio_util::sync::CancellationToken;
 use zinder_core::{ChainEpochId, Network, NetworkUpgradeActivations};
 use zinder_proto::{
@@ -79,6 +90,13 @@ pub(crate) const RELEASED_PAIR_READ_LIMIT: Duration = Duration::from_secs(30);
 /// page read after [`RELEASED_PAIR_READ_LIMIT`]. A publication therefore
 /// follows the previous one within about the window plus the read limit.
 const SECONDARY_GENERATION_COUNT: usize = 4;
+/// Longest a read waits for the publisher to replace a pair whose table file
+/// the writer's compaction deleted, before it fails with its storage error.
+///
+/// A replacement recycled from a drained generation is caught up well within
+/// this bound. One that needs a cold open can take longer on a large store;
+/// the read then fails, retryably, and later reads use the replacement.
+const MISSING_TABLE_FILE_REPLACEMENT_WAIT: Duration = Duration::from_secs(5);
 const CONVERGENCE_RETRY_DELAY_CAP: Duration = Duration::from_millis(100);
 const READINESS_REASON_MAX_BYTES: usize = 256;
 
@@ -131,6 +149,15 @@ pub struct WalletServingPairConfig {
 #[derive(Clone)]
 pub struct WalletServingPairSlot {
     published: Arc<ArcSwap<PublishedPairs>>,
+    signals: Arc<SlotSignals>,
+}
+
+/// Wake-ups exchanged between the requests reading a slot and its publisher.
+struct SlotSignals {
+    /// Wakes the publisher once a read finds a pair missing a table file.
+    missing_table_file: Notify,
+    /// Changes on every publication, so a read can wait for a replacement.
+    publication: watch::Sender<()>,
 }
 
 /// The current pair and the replaced pairs that still answer pinned reads.
@@ -177,6 +204,10 @@ impl WalletServingPairSlot {
                 current: initial_pair,
                 retained: Vec::new(),
             })),
+            signals: Arc::new(SlotSignals {
+                missing_table_file: Notify::new(),
+                publication: watch::Sender::new(()),
+            }),
         }
     }
 
@@ -189,9 +220,10 @@ impl WalletServingPairSlot {
     /// Captures the pair that answers a read pinned to `chain_epoch_id`.
     ///
     /// A retained pair answers a pin that names its epoch until its retention
-    /// window ends, even before the publisher releases it. Every other pin,
-    /// and an absent one, captures the current pair, so the caller's epoch
-    /// check still reports a pin that no pair serves.
+    /// window ends, even before the publisher releases it, unless a read
+    /// found one of its table files missing. Every other pin, and an absent
+    /// one, captures the current pair, so the caller's epoch check still
+    /// reports a pin that no pair serves.
     #[must_use]
     pub(crate) fn capture_at(
         &self,
@@ -208,7 +240,11 @@ impl WalletServingPairSlot {
         published
             .retained
             .iter()
-            .find(|retained| retained.is_within_window(now) && serves(&retained.pair))
+            .find(|retained| {
+                retained.is_within_window(now)
+                    && !retained.pair.has_missing_table_file()
+                    && serves(&retained.pair)
+            })
             .map_or_else(
                 || Arc::clone(&published.current),
                 |retained| Arc::clone(&retained.pair),
@@ -221,12 +257,13 @@ impl WalletServingPairSlot {
 
     /// Makes `pair` current and retains the pair it replaces.
     ///
-    /// Returns the pairs that leave the slot: only retained pairs at `pair`'s
-    /// epoch, which `pair` now answers. A schedule revision republishes the
-    /// current epoch, so the pair it replaces leaves at once instead of
-    /// keeping a generation that no pin can reach. Every other retained pair
-    /// stays until its window ends. Only the publisher writes the slot, so
-    /// the load and store below cannot race another publication.
+    /// Returns the pairs that leave the slot: retained pairs at `pair`'s
+    /// epoch, which `pair` now answers, and pairs missing a table file. A
+    /// schedule revision or a replacement for a pair missing a table file
+    /// republishes the current epoch, so the pair it replaces leaves at once
+    /// instead of keeping a generation that no pin can reach. Every other
+    /// retained pair stays until its window ends. Only the publisher writes
+    /// the slot, so the load and store below cannot race another publication.
     fn publish(
         &self,
         pair: Arc<WalletServingReadPair>,
@@ -239,23 +276,26 @@ impl WalletServingPairSlot {
             replaced_at,
         })
         .chain(previous.retained.iter().cloned())
-        .partition(|retained| retained.pair.canonical_fence().chain_epoch_id() == chain_epoch_id);
+        .partition(|retained| {
+            retained.pair.canonical_fence().chain_epoch_id() == chain_epoch_id
+                || retained.pair.has_missing_table_file()
+        });
         self.published.store(Arc::new(PublishedPairs {
             current: pair,
             retained,
         }));
+        self.signals.publication.send_replace(());
         released.into_iter().map(|released| released.pair).collect()
     }
 
     /// Releases the retained pairs replaced at least [`RETAINED_PAIR_WINDOW`]
-    /// before `now`, returning them.
+    /// before `now`, and those missing a table file, returning them.
     fn release_expired(&self, now: Instant) -> Vec<Arc<WalletServingReadPair>> {
         let previous = self.published.load_full();
-        let (retained, expired): (Vec<_>, Vec<_>) = previous
-            .retained
-            .iter()
-            .cloned()
-            .partition(|retained| retained.is_within_window(now));
+        let (retained, expired): (Vec<_>, Vec<_>) =
+            previous.retained.iter().cloned().partition(|retained| {
+                retained.is_within_window(now) && !retained.pair.has_missing_table_file()
+            });
         if expired.is_empty() {
             return Vec::new();
         }
@@ -264,6 +304,62 @@ impl WalletServingPairSlot {
             retained,
         }));
         expired.into_iter().map(|expired| expired.pair).collect()
+    }
+
+    /// Marks `pair` after a read through it failed with `error` because one
+    /// of its table files was deleted, and wakes the publisher to replace it.
+    ///
+    /// The first report for a pair counts and logs it. The marked pair
+    /// answers no new capture except as the current pair, which it stays
+    /// until the publisher publishes its replacement.
+    pub(crate) fn report_missing_table_file(
+        &self,
+        pair: &WalletServingReadPair,
+        error: &crate::QueryError,
+    ) {
+        if pair.mark_table_file_missing() {
+            metrics::counter!("zinder_wallet_serving_missing_table_file_pairs_total").increment(1);
+            tracing::warn!(
+                target: "zinder::wallet_serving",
+                event = "wallet_serving_pair_table_file_missing",
+                chain_epoch = pair.canonical_fence().chain_epoch_id().value(),
+                error = %error,
+                "a read found a table file of the wallet-serving pair deleted by the writer's compaction; replacing the pair"
+            );
+        }
+        self.signals.missing_table_file.notify_one();
+    }
+
+    /// Reports `pair` as missing a table file and waits, for at most
+    /// [`MISSING_TABLE_FILE_REPLACEMENT_WAIT`], for a pair that answers
+    /// `chain_epoch_id` without that mark.
+    ///
+    /// Returns `None` when no such pair is published in time. A pin whose
+    /// epoch only the marked pair served gets the current pair, at another
+    /// epoch, so the caller's epoch check refuses it.
+    pub(crate) async fn replace_missing_table_file_pair(
+        &self,
+        pair: Arc<WalletServingReadPair>,
+        error: &crate::QueryError,
+        chain_epoch_id: Option<ChainEpochId>,
+    ) -> Option<Arc<WalletServingReadPair>> {
+        let mut publications = self.signals.publication.subscribe();
+        self.report_missing_table_file(&pair, error);
+        drop(pair);
+        let deadline = Instant::now() + MISSING_TABLE_FILE_REPLACEMENT_WAIT;
+        loop {
+            let replacement = self.capture_at(chain_epoch_id);
+            if !replacement.has_missing_table_file() {
+                return Some(replacement);
+            }
+            drop(replacement);
+            if !matches!(
+                tokio::time::timeout_at(deadline, publications.changed()).await,
+                Ok(Ok(()))
+            ) {
+                return None;
+            }
+        }
     }
 }
 
@@ -700,9 +796,10 @@ impl WalletServingPairPublisher {
     /// Runs bounded refreshes until shutdown, then retains reader ownership
     /// until the serving runtime confirms its request paths have drained.
     ///
-    /// Every refresh failure leaves the current immutable pair untouched and
-    /// updates readiness with its typed cause; it never falls back to a
-    /// primary store.
+    /// A refresh runs every catch-up interval, and at once when a read finds
+    /// a pair missing a table file. Every refresh failure leaves the current
+    /// immutable pair untouched and updates readiness with its typed cause;
+    /// it never falls back to a primary store.
     #[must_use = "await the publisher on shutdown so secondary handles close before process exit"]
     pub fn spawn(
         mut self,
@@ -710,37 +807,17 @@ impl WalletServingPairPublisher {
         serving_runtime_drained: CancellationToken,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
+            let signals = self
+                .serving_pair_slot
+                .as_ref()
+                .map(|slot| Arc::clone(&slot.signals));
             loop {
                 tokio::select! {
                     () = cancel.cancelled() => break,
-                    () = tokio::time::sleep(self.config.catchup_interval) => {
-                        if let Err(error) = self.refresh_once().await {
-                            let still_admitted = self.record_refresh_failure(&error);
-                            if refresh_failure_is_routine_lag(
-                                &error,
-                                self.observed_lag_chain_epochs,
-                                self.config.replica_lag_threshold_chain_epochs,
-                                still_admitted,
-                            ) {
-                                tracing::debug!(
-                                    target: "zinder::wallet_serving",
-                                    event = "wallet_serving_pair_publisher_refresh_failed",
-                                    error = %error,
-                                    lag_chain_epochs = self.observed_lag_chain_epochs,
-                                    "inactive wallet-serving pair has not caught up yet; retaining the prior pair"
-                                );
-                            } else {
-                                tracing::warn!(
-                                    target: "zinder::wallet_serving",
-                                    event = "wallet_serving_pair_publisher_refresh_failed",
-                                    error = %error,
-                                    lag_chain_epochs = self.observed_lag_chain_epochs,
-                                    "inactive wallet-serving pair refresh failed; retaining the prior pair"
-                                );
-                            }
-                        }
-                    }
+                    () = tokio::time::sleep(self.config.catchup_interval) => {}
+                    () = missing_table_file_reported(signals.as_deref()) => {}
                 }
+                self.refresh_and_record().await;
             }
             serving_runtime_drained.cancelled().await;
             let started_at = Instant::now();
@@ -761,6 +838,35 @@ impl WalletServingPairPublisher {
         })
     }
 
+    async fn refresh_and_record(&mut self) {
+        let Err(error) = self.refresh_once().await else {
+            return;
+        };
+        let still_admitted = self.record_refresh_failure(&error);
+        if refresh_failure_is_routine_lag(
+            &error,
+            self.observed_lag_chain_epochs,
+            self.config.replica_lag_threshold_chain_epochs,
+            still_admitted,
+        ) {
+            tracing::debug!(
+                target: "zinder::wallet_serving",
+                event = "wallet_serving_pair_publisher_refresh_failed",
+                error = %error,
+                lag_chain_epochs = self.observed_lag_chain_epochs,
+                "inactive wallet-serving pair has not caught up yet; retaining the prior pair"
+            );
+        } else {
+            tracing::warn!(
+                target: "zinder::wallet_serving",
+                event = "wallet_serving_pair_publisher_refresh_failed",
+                error = %error,
+                lag_chain_epochs = self.observed_lag_chain_epochs,
+                "inactive wallet-serving pair refresh failed; retaining the prior pair"
+            );
+        }
+    }
+
     async fn refresh_once(&mut self) -> Result<(), WalletServingPairError> {
         let now = Instant::now();
         self.release_expired_pairs(now);
@@ -772,11 +878,14 @@ impl WalletServingPairPublisher {
         let active_pair = serving_pair_slot.capture();
         let writer_status = self.writer_status.fetch().await?;
         let relation = self.update_active_readiness(&active_pair, &writer_status)?;
-        if matches!(
-            relation,
-            ActiveWriterRelation::Exact | ActiveWriterRelation::Refusing
-        ) {
-            return Ok(());
+        // A pair missing a table file is replaced at the writer's fence even
+        // when that fence has not moved.
+        let replaces_active_pair = active_pair.has_missing_table_file();
+        drop(active_pair);
+        match relation {
+            ActiveWriterRelation::Exact if !replaces_active_pair => return Ok(()),
+            ActiveWriterRelation::Refusing => return Ok(()),
+            ActiveWriterRelation::Exact | ActiveWriterRelation::Behind => {}
         }
         self.follow_writer_schedule(&writer_status)?;
 
@@ -1374,6 +1483,15 @@ impl WalletServingPairPublisher {
     }
 }
 
+/// Resolves once a read reports a pair missing a table file, and never when
+/// the publisher has no slot yet.
+async fn missing_table_file_reported(signals: Option<&SlotSignals>) {
+    match signals {
+        Some(signals) => signals.missing_table_file.notified().await,
+        None => std::future::pending().await,
+    }
+}
+
 fn record_retained_pair_count(slot: &WalletServingPairSlot) {
     let retained_pairs = u32::try_from(slot.retained_pair_count()).unwrap_or(u32::MAX);
     metrics::gauge!("zinder_wallet_serving_pair_publisher_retained_pairs")
@@ -1680,10 +1798,12 @@ fn record_replica_lag(lag_chain_epochs: u64) {
 /// Returns whether a refresh failure leaves the published pair exactly as the
 /// writer last attested it.
 ///
-/// Only lag and control-plane transport failures qualify: they describe the
-/// candidate generation or the status RPC, never the published pair. Every
-/// failure that impugns the pair itself, its schema, or the slot holding it is
-/// excluded, so those keep failing closed the moment they occur.
+/// Only lag, control-plane transport failures, and a candidate that opened or
+/// caught up while the writer's compaction deleted a table file it had just
+/// listed qualify: they describe the candidate generation or the status RPC,
+/// never the published pair. Every failure that impugns the pair itself, its
+/// schema, or the slot holding it is excluded, so those keep failing closed
+/// the moment they occur.
 fn refresh_failure_retains_attested_pair(error: &WalletServingPairError) -> bool {
     matches!(
         error,
@@ -1693,7 +1813,8 @@ fn refresh_failure_retains_attested_pair(error: &WalletServingPairError) -> bool
                 last_outcome: WalletServingConvergence::ReplicaBehind
                     | WalletServingConvergence::ProjectionBehind,
             }
-    )
+    ) || matches!(error, WalletServingPairError::Canonical(source) if source.is_missing_table_file())
+        || matches!(error, WalletServingPairError::Wallet(source) if source.is_missing_table_file())
 }
 
 /// Returns whether a refresh failure is routine lag that a later refresh is
@@ -1784,7 +1905,7 @@ mod tests {
         io::{Read as _, Write as _},
         net::TcpStream,
         num::{NonZeroU32, NonZeroU64},
-        path::Path,
+        path::{Path, PathBuf},
         sync::{
             Arc, Barrier,
             atomic::{AtomicBool, Ordering},
@@ -4956,6 +5077,343 @@ mod tests {
         primaries.shutdown().await
     }
 
+    /// Canonical blocks the table-file tests build before giving each
+    /// canonical row a table file of its own.
+    ///
+    /// With the test budget's 64 open files, a secondary keeps at most 77
+    /// table files open: a 54-entry table cache over 64 one-entry shards, plus
+    /// up to 13 handles pinned at open. A range read over these blocks touches
+    /// a compact-block and a header row per block, 96 files in all, so it must
+    /// reopen a file whatever the cache's hash seed.
+    const SPLIT_TIP_HEIGHT: u32 = 48;
+
+    /// A read that finds a table file of its pair deleted by the writer's
+    /// compaction is answered by a replacement pair the publisher publishes
+    /// at the writer's unchanged fence.
+    ///
+    /// The publisher's catch-up interval is an hour, so only the reads'
+    /// report can wake it. Both concurrent reads capture the stale pair, and
+    /// the pair is counted once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_missing_a_table_file_is_answered_by_a_replacement_pair()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let rendered_metrics = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let mut primaries =
+            AdvancingPrimaries::start_through(BlockHeight::new(SPLIT_TIP_HEIGHT)).await?;
+        let canonical_primary_path = primaries.close_canonical_primary()?;
+        split_rows_into_table_files(&canonical_primary_path)?;
+        let (publisher, slot) = primaries
+            .bootstrap_publisher_every(
+                zinder_runtime::Readiness::default(),
+                Duration::from_hours(1),
+            )
+            .await?;
+        let stale_pair = slot.capture();
+        let stale_epoch = stale_pair.canonical_fence().chain_epoch_id();
+        let query = WalletServingQuery::from_serving_pair_slot(
+            slot.clone(),
+            (),
+            Arc::new(primaries.activations.clone()),
+        );
+        let cancel = CancellationToken::new();
+        let serving_runtime_drained = CancellationToken::new();
+        let publisher_task = publisher.spawn(cancel.clone(), serving_runtime_drained.clone());
+        compact_away_table_files(&canonical_primary_path)?;
+
+        let range = split_block_range();
+        let (first, second) = tokio::join!(
+            query.compact_blocks_in_range(range, None),
+            query.compact_blocks_in_range(range, None),
+        );
+        for blocks in [first?, second?] {
+            assert_eq!(blocks.chain_epoch.id, stale_epoch);
+            assert_eq!(
+                blocks.compact_blocks.len(),
+                usize::try_from(SPLIT_TIP_HEIGHT)?
+            );
+        }
+        let replacement = slot.capture();
+        assert!(
+            !Arc::ptr_eq(&replacement, &stale_pair),
+            "the pair missing a table file must be replaced"
+        );
+        assert_eq!(replacement.canonical_fence(), stale_pair.canonical_fence());
+        assert_eq!(missing_table_file_pairs(&rendered_metrics.render()), 1);
+        let pinned = query
+            .compact_blocks_in_range(range, Some(stale_epoch))
+            .await?;
+        assert_eq!(pinned.chain_epoch.id, stale_epoch);
+
+        drop((stale_pair, replacement, query, slot));
+        cancel.cancel();
+        serving_runtime_drained.cancel();
+        publisher_task.await?;
+        primaries.shutdown().await
+    }
+
+    /// A read pinned to the epoch of a pair missing a table file is refused
+    /// with the pin error once the replacement serves the writer's newer
+    /// fence, and an unpinned read is answered there.
+    ///
+    /// A stream's next page, which carries no epoch check of its own, stops
+    /// at its own epoch the same way instead of continuing at the newer one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pin_only_the_pair_missing_a_table_file_served_is_refused()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut primaries =
+            AdvancingPrimaries::start_through(BlockHeight::new(SPLIT_TIP_HEIGHT)).await?;
+        let canonical_primary_path = primaries.close_canonical_primary()?;
+        split_rows_into_table_files(&canonical_primary_path)?;
+        let (publisher, slot) = primaries
+            .bootstrap_publisher_every(
+                zinder_runtime::Readiness::default(),
+                Duration::from_hours(1),
+            )
+            .await?;
+        let stale_pair = slot.capture();
+        let stale_epoch = stale_pair.canonical_fence().chain_epoch_id();
+        let query = WalletServingQuery::from_serving_pair_slot(
+            slot.clone(),
+            (),
+            Arc::new(primaries.activations.clone()),
+        );
+        let cancel = CancellationToken::new();
+        let serving_runtime_drained = CancellationToken::new();
+        let publisher_task = publisher.spawn(cancel.clone(), serving_runtime_drained.clone());
+        compact_away_table_files(&canonical_primary_path)?;
+        primaries.reopen_canonical_primary()?;
+        let moved = primaries.append_block()?;
+
+        match query
+            .compact_blocks_in_range(split_block_range(), Some(stale_epoch))
+            .await
+        {
+            Err(crate::QueryError::ChainEpochPinUnavailable { chain_epoch_id })
+                if chain_epoch_id == stale_epoch => {}
+            other => {
+                return Err(format!("pin {stale_epoch:?} must be refused, got {other:?}").into());
+            }
+        }
+        assert_eq!(slot.capture().canonical_fence(), moved);
+        let current = query
+            .compact_blocks_in_range(split_block_range(), None)
+            .await?;
+        assert_eq!(current.chain_epoch.id, moved.chain_epoch_id());
+        let next_page = crate::serving_read::read_pair(
+            &slot,
+            Arc::clone(&stale_pair),
+            Some(stale_epoch),
+            |pair| {
+                Ok(pair
+                    .canonical()
+                    .compact_blocks_in_range(split_block_range())?)
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                next_page,
+                Err(crate::QueryError::ChainEpochPinUnavailable { chain_epoch_id })
+                    if chain_epoch_id == stale_epoch
+            ),
+            "a stream page must stop at its own epoch, got {:?}",
+            next_page.map(|blocks| blocks.len())
+        );
+
+        drop((stale_pair, query, slot));
+        cancel.cancel();
+        serving_runtime_drained.cancel();
+        publisher_task.await?;
+        primaries.shutdown().await
+    }
+
+    /// A read that fails on a corrupt table file fails closed as before: its
+    /// pair is neither marked nor replaced.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_corrupt_table_file_fails_the_read_without_replacing_the_pair()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut primaries =
+            AdvancingPrimaries::start_through(BlockHeight::new(SPLIT_TIP_HEIGHT)).await?;
+        let canonical_primary_path = primaries.close_canonical_primary()?;
+        let split_files = split_rows_into_table_files(&canonical_primary_path)?;
+        let (mut publisher, slot) = primaries
+            .bootstrap_publisher(zinder_runtime::Readiness::default())
+            .await?;
+        let pair = slot.capture();
+        let query = WalletServingQuery::from_serving_pair_slot(
+            slot.clone(),
+            (),
+            Arc::new(primaries.activations.clone()),
+        );
+        corrupt_first_data_blocks(&split_files)?;
+
+        let failure = query
+            .compact_blocks_in_range(split_block_range(), None)
+            .await
+            .err()
+            .ok_or("a corrupt table file must fail the read")?;
+        assert!(!failure.is_missing_table_file(), "{failure:?}");
+        assert_eq!(
+            zinder_proto::BoundaryError::error_reason(&failure),
+            ErrorReason::StorageUnavailable
+        );
+        assert!(!pair.has_missing_table_file());
+        publisher.refresh_once().await?;
+        assert!(Arc::ptr_eq(&slot.capture(), &pair));
+        assert_eq!(
+            publisher.candidate_preparations,
+            CandidatePreparationCounts {
+                cold: 1,
+                recycled: 0
+            }
+        );
+
+        drop((pair, query, slot, publisher));
+        primaries.shutdown().await
+    }
+
+    /// A candidate that opens or catches up while the writer deletes a table
+    /// file it just listed leaves the published pair serving.
+    #[test]
+    fn a_candidate_missing_a_table_file_keeps_the_attested_pair_serving()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let activations = lifecycle_upgrade_activations()?;
+        let canonical_primary_path = temporary.path().join("canonical-primary");
+        drop(build_lifecycle_canonical_primary_through(
+            &canonical_primary_path,
+            &activations,
+            BlockHeight::new(SPLIT_TIP_HEIGHT),
+        )?);
+        split_rows_into_table_files(&canonical_primary_path)?;
+        let stale = RocksDbCanonicalSecondary::open_ready(
+            &canonical_primary_path,
+            temporary.path().join("canonical-secondary"),
+            &activations,
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(100)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        compact_away_table_files(&canonical_primary_path)?;
+        let missing = stale
+            .compact_blocks_in_range(split_block_range())
+            .err()
+            .ok_or("a stale secondary must reopen a compacted-away table file")?;
+        assert!(missing.is_missing_table_file(), "{missing:?}");
+
+        let failure = WalletServingPairError::Canonical(missing);
+        assert!(refresh_failure_retains_attested_pair(&failure));
+        assert_eq!(
+            refresh_failure_not_ready_cause(&failure),
+            Some(zinder_runtime::ReadinessCause::StorageUnavailable),
+            "past the staleness ceiling the failure still fails closed"
+        );
+        Ok(())
+    }
+
+    fn split_block_range() -> BlockHeightRange {
+        BlockHeightRange::inclusive(BlockHeight::new(1), BlockHeight::new(SPLIT_TIP_HEIGHT))
+    }
+
+    /// Opens a closed canonical primary directly, with automatic compaction
+    /// off in every family so only the test replaces its table files.
+    fn open_raw_canonical_primary(
+        path: &Path,
+    ) -> Result<(rust_rocksdb::DB, Vec<String>), Box<dyn std::error::Error>> {
+        let families = rust_rocksdb::DB::list_cf(&rust_rocksdb::Options::default(), path)?;
+        let db = rust_rocksdb::DB::open_cf(&rust_rocksdb::Options::default(), path, &families)?;
+        for family in &families {
+            let handle = db.cf_handle(family).ok_or("a listed family must open")?;
+            db.set_options_cf(&handle, &[("disable_auto_compactions", "true")])?;
+        }
+        Ok((db, families))
+    }
+
+    /// Rewrites every row of a closed canonical primary unchanged, flushing
+    /// after each, so each row's newest version sits in an L0 table file of
+    /// its own. Returns those files.
+    fn split_rows_into_table_files(
+        path: &Path,
+    ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+        let (db, families) = open_raw_canonical_primary(path)?;
+        for family in &families {
+            let handle = db.cf_handle(family).ok_or("a listed family must open")?;
+            let rows = db
+                .iterator_cf(&handle, rust_rocksdb::IteratorMode::Start)
+                .collect::<Result<Vec<_>, _>>()?;
+            for (key, row) in rows {
+                db.put_cf(&handle, key, row)?;
+                db.flush_cf(&handle)?;
+            }
+        }
+        level_zero_table_files(&db)
+    }
+
+    /// Compacts every family of a closed canonical primary, as the writer's
+    /// compaction does, and waits until its L0 table files are deleted.
+    ///
+    /// Rewriting the bottommost level too keeps a file that a compaction
+    /// would only move from surviving under its old number.
+    fn compact_away_table_files(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let (db, families) = open_raw_canonical_primary(path)?;
+        let replaced = level_zero_table_files(&db)?;
+        let mut options = rust_rocksdb::CompactOptions::default();
+        options.set_bottommost_level_compaction(rust_rocksdb::BottommostLevelCompaction::Force);
+        for family in &families {
+            let handle = db.cf_handle(family).ok_or("a listed family must open")?;
+            db.compact_range_cf_opt(&handle, None::<&[u8]>, None::<&[u8]>, &options);
+        }
+        // The primary deletes obsolete files after each compaction job, which
+        // can finish just after the call returns.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while replaced.iter().any(|file| file.exists()) {
+            if std::time::Instant::now() >= deadline {
+                return Err("the primary must delete the compacted-away table files".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
+    fn level_zero_table_files(
+        db: &rust_rocksdb::DB,
+    ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+        Ok(db
+            .live_files()?
+            .into_iter()
+            .filter(|file| file.level == 0)
+            .map(|file| Path::new(&file.directory).join(file.name.trim_start_matches('/')))
+            .collect())
+    }
+
+    /// Flips the first byte of each table file, which starts its first data
+    /// block, so reading a row it holds fails that block's checksum.
+    fn corrupt_first_data_blocks(files: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
+        for file in files {
+            let mut table_bytes = std::fs::read(file)?;
+            let first_byte = table_bytes
+                .first_mut()
+                .ok_or("a table file is never empty")?;
+            *first_byte ^= 0xff;
+            std::fs::write(file, table_bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Reads the missing-table-file pair count from a Prometheus exposition.
+    fn missing_table_file_pairs(exposition: &str) -> u64 {
+        exposition
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("zinder_wallet_serving_missing_table_file_pairs_total ")
+            })
+            .and_then(|count| count.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
     fn fetch_operations_json(
         address: std::net::SocketAddr,
         path: &str,
@@ -5051,7 +5509,42 @@ mod tests {
         canonical_primary_path: &Path,
         activations: &NetworkUpgradeActivations,
     ) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
-        let tip = BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([0x11; 32]));
+        build_lifecycle_canonical_primary_through(
+            canonical_primary_path,
+            activations,
+            BlockHeight::new(1),
+        )
+    }
+
+    /// Builds a canonical primary holding blocks 1 through `tip_height`, with
+    /// the hashes [`AdvancingPrimaries::append_block`] gives later blocks.
+    fn build_lifecycle_canonical_primary_through(
+        canonical_primary_path: &Path,
+        activations: &NetworkUpgradeActivations,
+        tip_height: BlockHeight,
+    ) -> Result<RocksDbCanonicalStore, Box<dyn std::error::Error>> {
+        let mut blocks = Vec::new();
+        let mut parent_hash = Network::ZcashRegtest.genesis_hash();
+        for height in (1..=tip_height.value()).map(BlockHeight::new) {
+            let block_hash = if height == BlockHeight::new(1) {
+                BlockHash::from_bytes([0x11; 32])
+            } else {
+                BlockHash::from_bytes([u8::try_from(height.value())?.wrapping_add(0x40); 32])
+            };
+            let mut block = lifecycle_build_block(height, block_hash, parent_hash);
+            // A bulk load holds checkpoints only at the build tip and on the
+            // global cadence.
+            if height != tip_height
+                && !height
+                    .value()
+                    .is_multiple_of(zinder_store::TREE_STATE_CHECKPOINT_STRIDE)
+            {
+                block.tree_state_checkpoint = None;
+            }
+            blocks.push(block);
+            parent_hash = block_hash;
+        }
+        let tip = BlockId::new(tip_height, parent_hash);
         let mut builder = RocksDbCanonicalBuilder::create_fresh(
             canonical_primary_path,
             CanonicalStoreWorkload::Wallet,
@@ -5064,13 +5557,11 @@ mod tests {
             )?,
             RocksDbResourceBudget::for_local_tests(),
         )?;
-        builder.bulk_load_blocks(std::iter::once(Ok::<_, std::io::Error>(
-            lifecycle_build_block(tip.height, tip.hash, Network::ZcashRegtest.genesis_hash()),
-        )))?;
+        builder.bulk_load_blocks(blocks.into_iter().map(Ok::<_, std::io::Error>))?;
         builder.load_subtree_roots(std::iter::empty())?;
         builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
             tip,
-            1,
+            tip_height.value(),
             CommitmentTreeFrontiers::default(),
         ))?;
         let validated = builder.prepare_cold_certified_publication()?;
@@ -5275,11 +5766,20 @@ mod tests {
 
     impl AdvancingPrimaries {
         async fn start() -> Result<Self, Box<dyn std::error::Error>> {
+            Self::start_through(BlockHeight::new(1)).await
+        }
+
+        async fn start_through(
+            tip_height: BlockHeight,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
             let temporary = TempDir::new()?;
             let activations = lifecycle_upgrade_activations()?;
             let canonical_primary_path = temporary.path().join("canonical-primary");
-            let canonical_primary =
-                build_lifecycle_canonical_primary(&canonical_primary_path, &activations)?;
+            let canonical_primary = build_lifecycle_canonical_primary_through(
+                &canonical_primary_path,
+                &activations,
+                tip_height,
+            )?;
             let wallet_outcome = build_wallet_from_canonical(
                 &canonical_primary,
                 temporary.path().join("wallet-primary"),
@@ -5331,13 +5831,26 @@ mod tests {
             readiness: zinder_runtime::Readiness,
         ) -> Result<(WalletServingPairPublisher, WalletServingPairSlot), Box<dyn std::error::Error>>
         {
-            let config = wallet_serving_pair_config(
-                self.temporary.path().join("canonical-primary"),
-                self.temporary.path().join("canonical-secondaries"),
-                self.temporary.path().join("wallet-primary"),
-                self.temporary.path().join("wallet-secondaries"),
-                Arc::new(self.activations.clone()),
-            )?;
+            self.bootstrap_publisher_every(readiness, Duration::from_millis(1))
+                .await
+        }
+
+        async fn bootstrap_publisher_every(
+            &self,
+            readiness: zinder_runtime::Readiness,
+            catchup_interval: Duration,
+        ) -> Result<(WalletServingPairPublisher, WalletServingPairSlot), Box<dyn std::error::Error>>
+        {
+            let config = WalletServingPairConfig {
+                catchup_interval,
+                ..wallet_serving_pair_config(
+                    self.temporary.path().join("canonical-primary"),
+                    self.temporary.path().join("canonical-secondaries"),
+                    self.temporary.path().join("wallet-primary"),
+                    self.temporary.path().join("wallet-secondaries"),
+                    Arc::new(self.activations.clone()),
+                )?
+            };
             Ok(
                 WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
                     config,
@@ -5347,6 +5860,31 @@ mod tests {
                 )
                 .await?,
             )
+        }
+
+        /// Closes the canonical primary so the test can act on its files as
+        /// only the writer may, and returns its path.
+        fn close_canonical_primary(&mut self) -> Result<PathBuf, Box<dyn std::error::Error>> {
+            drop(
+                self.canonical_primary
+                    .take()
+                    .ok_or("the canonical primary is already closed")?,
+            );
+            Ok(self.temporary.path().join("canonical-primary"))
+        }
+
+        /// Reopens the canonical primary [`Self::close_canonical_primary`]
+        /// closed.
+        fn reopen_canonical_primary(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+            self.canonical_primary = Some(RocksDbCanonicalStore::open_ready(
+                self.temporary.path().join("canonical-primary"),
+                &self.activations,
+                CanonicalStoreWorkload::Wallet,
+                RawBlobRetention::Transactions,
+                CanonicalReorgPolicy::new(100)?,
+                RocksDbResourceBudget::for_local_tests(),
+            )?);
+            Ok(())
         }
 
         fn canonical_primary(&self) -> Result<&RocksDbCanonicalStore, Box<dyn std::error::Error>> {

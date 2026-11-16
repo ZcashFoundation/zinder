@@ -895,8 +895,10 @@ publication by at most about 90 seconds, and they never stop publication for
 other clients.
 
 A pin on a released or never-served epoch receives
-`CHAIN_EPOCH_PIN_UNAVAILABLE`, and the client captures a new snapshot and
-restarts the whole workflow; it must not silently read replacement-branch
+`CHAIN_EPOCH_PIN_UNAVAILABLE`. So does a pin whose pair lost a table file to
+the primary's compaction once the replacement pair serves a newer epoch; see
+[ADR-0038](../adrs/0038-wallet-runtime-composition-and-capability-discovery.md#storage-and-pair-admission).
+The client captures a new snapshot and restarts the whole workflow; it must not silently read replacement-branch
 artifacts. A retained pair still answers its epoch after a reorg replaces that
 epoch's blocks, because a pinned read promises the pinned epoch's view, not the
 current best chain.

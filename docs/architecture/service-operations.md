@@ -331,7 +331,8 @@ It does not instantiate the native query's admitted ingest type or advertise
 native capabilities. Consumer support additionally requires the selected
 lightwalletd client to pass its complete lifecycle through a trusted edge.
 
-Writer-status transport failures and replica or projection lag report
+Writer-status transport failures, replica or projection lag, and a candidate
+that fails on a table file the primary just deleted report
 `serving_pair_stale` and keep serving the published pair, because that pair is
 still exactly what the writer attested. `storage.serving_pair_staleness_ceiling_ms`
 bounds how long that lasts, measured from the last writer attestation and
@@ -612,13 +613,59 @@ come long after startup. Once all four are open, the publisher never opens
 another slot to keep up with blocks. A slot whose catch-up or publication
 fails is closed and opened cold again when it is next used.
 
-An opened slot stays open after its pair drains, and its secondaries keep the
-primary files of their last catch-up, including files the primaries have
-since compacted away. The publisher takes drained slots in turn, starting
+An opened slot stays open after its pair drains, and its secondaries keep
+open the primary files their table caches hold, including files the primaries
+have since compacted away. The publisher takes drained slots in turn, starting
 after the slot it last published, so each opened slot is caught up again
 within a few publications and releases the files it no longer references.
 The disk a drained slot holds beyond the primaries is therefore limited to
 what the last few publications compacted away.
+
+A secondary holds at most `max_open_files` table files open, so a published
+pair can name a file it does not hold. When the writer's or the projector's
+compaction deletes that file, a read that needs it fails with an I/O error
+that names the missing `.sst` path. Query then handles the read this way:
+
+1. It marks the pair, which leaves retention at once.
+2. It wakes the publisher, which publishes a replacement at the writer's
+   fence, even when the writer has not moved. A recycled slot makes the
+   replacement in about the time of one catch-up.
+3. It waits up to five seconds for the replacement and reads once more there
+   when that pair answers its epoch.
+
+The client sees one of three outcomes:
+
+- an answer from the replacement;
+- `CHAIN_EPOCH_PIN_UNAVAILABLE` when the read was pinned to an epoch that only
+  the marked pair served; or
+- `STORAGE_UNAVAILABLE` when no replacement was published within five
+  seconds, for example while every slot is taken or the replacement needs a
+  cold open.
+
+Readiness does not change. Corruption and every other storage failure fail the
+read as before and leave the pair published.
+
+`zinder_wallet_serving_missing_table_file_pairs_total` counts the pairs marked
+this way, once per pair however many reads hit the file. Each mark also logs
+one `wallet_serving_pair_table_file_missing` warning with the pair's
+`chain_epoch` and the error, which names the missing file. The path shows
+which primary deleted it: the canonical store or the wallet store. An
+occasional increment is routine compaction overtaking a published pair, and
+the replacement publication follows it. A count that rises with most
+publications means files are replaced faster than pairs are, such as during a
+manual compaction or a bulk rewrite of the primary. If query still logs
+`STORAGE_UNAVAILABLE` for those reads, compare the warnings with
+`zinder_wallet_serving_pair_publisher_generation_wait_total` and the
+`wallet_serving_pair_publisher_refresh_failed` warnings: a replacement that
+cannot find a free slot, or keeps failing, leaves the marked pair current.
+
+A candidate can also fail its open or catch-up with the same missing-file
+error, when the primary deletes a file between listing and opening it. That
+refresh failure reports `serving_pair_stale` and keeps the published pair
+serving until the staleness ceiling, as a writer-status outage does. It counts
+under `zinder_wallet_serving_pair_publisher_refresh_total` with the
+`canonical_secondary` or `wallet_secondary` `error_class`, and the next
+refresh tries again.
 
 `zinder_wallet_serving_pair_publisher_candidate_prepared_total{kind}` counts
 candidates by `kind`: `cold` for a slot opened from the primaries, and

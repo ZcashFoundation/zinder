@@ -6109,6 +6109,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "parking_lot",
  "prost",
+ "rust-rocksdb",
  "serde",
  "serde_json",
  "tempfile",
