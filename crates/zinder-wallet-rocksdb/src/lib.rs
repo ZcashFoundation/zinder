@@ -27,4 +27,4 @@ pub use store::{
     WalletAddressUnspentOutputsPage, WalletOwnerCheckpointAdmission, WalletOwnerCheckpointEvidence,
     WalletRecoveryAdmissionConfig,
 };
-pub use transition::MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES;
+pub use transition::{MAX_WALLET_PROJECTION_TRANSITION_LOGICAL_BYTES, WalletTransitionFootprint};

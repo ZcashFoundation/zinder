@@ -114,6 +114,7 @@ impl RocksDbWalletSecondary {
                 control,
                 ready_evidence,
                 verified_undo_suffix_generation: None,
+                last_transition_footprint: None,
             },
             primary_path,
             expected_network,
