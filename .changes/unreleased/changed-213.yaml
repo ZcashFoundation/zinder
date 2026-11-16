@@ -1,6 +1,0 @@
-kind: changed
-body: Following a block no longer derives the same note-commitment-tree roots repeatedly, so `zinder-ingest` uses far less CPU per block while catching up after downtime or replaying a deep reorg. On a 20,122-block Testnet replay, canonical preparation of a block with no transparent activity fell from about 9 ms to under 2.5 ms.
-time: 2026-11-15T19:45:54.98737813Z
-custom:
-    Bump: patch
-    PR: "213"
