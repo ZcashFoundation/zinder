@@ -21,6 +21,11 @@ use eyre::{Result, eyre};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
+use zebra_chain::{
+    block::Block,
+    serialization::{ZcashDeserialize, ZcashSerialize},
+    transaction::{self, Transaction},
+};
 use zinder_bench::{
     capture::measure_fixture_blocks,
     fixture::{
@@ -31,8 +36,8 @@ use zinder_bench::{
 };
 use zinder_core::{
     BlockHeight, BlockId, CommitmentTreeAccumulator, CommitmentTreeCheckpoint,
-    CommitmentTreeFrontiers, Network, NetworkUpgradeActivations, UnixTimestampMillis,
-    wire::encode_zinder_native_chain_name,
+    CommitmentTreeFrontiers, Network, NetworkUpgradeActivations, TransactionId,
+    TransparentOutPoint, UnixTimestampMillis, wire::encode_zinder_native_chain_name,
 };
 use zinder_ingest::{CanonicalConstructionConfig, load_fresh_canonical};
 use zinder_source::{
@@ -41,10 +46,13 @@ use zinder_source::{
 };
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan,
-    CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalStore,
-    RocksDbResourceBudget,
+    CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
+    RocksDbCanonicalStore, RocksDbResourceBudget,
 };
-use zinder_testkit::sample_regtest_upgrade_activations;
+use zinder_testkit::{
+    P2pkhSpendArgs, TRANSPARENT_BROADCAST_TEST_SEED, TransparentTestKey,
+    ZIP317_FEE_ONE_IN_ONE_OUT_ZATS, sample_regtest_upgrade_activations,
+};
 use zinder_wallet_rocksdb::{RocksDbWalletBuildOptions, build_wallet_from_canonical};
 
 use crate::common::regtest_activation_records;
@@ -62,6 +70,10 @@ const START_HEIGHT: u32 = 4;
 const CHAIN_TIP_HEIGHT: u32 = 8;
 /// Bounds a replay that must fail, so one that retries forever fails the test.
 const REPLAY_FAILURE_DEADLINE: Duration = Duration::from_secs(15);
+/// Value of the output each test spend creates.
+const SPEND_OUTPUT_VALUE_ZATS: u64 = 12_345;
+/// Height the test spends sign for, past Regtest coinbase maturity.
+const SPEND_TARGET_HEIGHT: u32 = 120;
 
 /// Test-local source serving a parseable Regtest chain and its checkpoints.
 #[derive(Clone)]
@@ -145,9 +157,13 @@ impl TipReplayInputs {
 }
 
 async fn prepare_inputs() -> Result<TipReplayInputs> {
+    prepare_inputs_for(parseable_chain(CHAIN_TIP_HEIGHT)?).await
+}
+
+/// Inputs as [`prepare_inputs`] builds them, from `blocks` instead.
+async fn prepare_inputs_for(blocks: BTreeMap<BlockHeight, SourceBlock>) -> Result<TipReplayInputs> {
     let directory = tempdir()?;
     let activations = sample_regtest_upgrade_activations();
-    let blocks = parseable_chain(CHAIN_TIP_HEIGHT)?;
     let source = ParseableChainSource {
         checkpoints: Arc::new(checkpoints_for(&blocks, &activations)?),
         blocks: Arc::new(blocks),
@@ -221,6 +237,15 @@ async fn publish_canonical(
 }
 
 fn parseable_chain(tip_height: u32) -> Result<BTreeMap<BlockHeight, SourceBlock>> {
+    chain_spending_at(tip_height, None)
+}
+
+/// A parseable chain whose block at `spending_height` also spends the
+/// coinbase of the block below it, and then that spend's output.
+fn chain_spending_at(
+    tip_height: u32,
+    spending_height: Option<u32>,
+) -> Result<BTreeMap<BlockHeight, SourceBlock>> {
     let fixture: Value = serde_json::from_str(REGTEST_BLOCK_1)?;
     let raw_block_bytes = hex::decode(
         fixture
@@ -235,12 +260,52 @@ fn parseable_chain(tip_height: u32) -> Result<BTreeMap<BlockHeight, SourceBlock>
         block_bytes[SERIALIZED_HEADER_PARENT_OFFSET..SERIALIZED_HEADER_PARENT_END]
             .copy_from_slice(&parent_hash.as_bytes());
         block_bytes[COINBASE_HEIGHT_OPCODE_OFFSET] = 0x50_u8.saturating_add(u8::try_from(height)?);
+        if Some(height) == spending_height {
+            let below = blocks
+                .get(&BlockHeight::new(height - 1))
+                .ok_or_else(|| eyre!("a spending block needs the block below it"))?;
+            block_bytes = with_coinbase_spends(&block_bytes, below)?;
+        }
         let height = BlockHeight::new(height);
         let block = SourceBlock::from_raw_block_bytes(Network::ZcashRegtest, height, block_bytes)?;
         parent_hash = block.hash;
         blocks.insert(height, block);
     }
     Ok(blocks)
+}
+
+/// Appends to `block_bytes` a spend of `below`'s coinbase output and a spend
+/// of that spend's output.
+fn with_coinbase_spends(block_bytes: &[u8], below: &SourceBlock) -> Result<Vec<u8>> {
+    let coinbase = Block::zcash_deserialize(below.raw_block_bytes.as_slice())?
+        .transactions
+        .first()
+        .ok_or_else(|| eyre!("a block must hold a coinbase"))?
+        .hash();
+    let spend = p2pkh_spend(
+        coinbase,
+        SPEND_OUTPUT_VALUE_ZATS + ZIP317_FEE_ONE_IN_ONE_OUT_ZATS,
+    )?;
+    let descendant = p2pkh_spend(spend.hash(), SPEND_OUTPUT_VALUE_ZATS)?;
+    let mut block = Block::zcash_deserialize(block_bytes)?;
+    block
+        .transactions
+        .extend([Arc::new(spend), Arc::new(descendant)]);
+    Ok(block.zcash_serialize_to_vec()?)
+}
+
+/// A one-input spend of output 0 of `spent`, which holds `spent_value_zats`.
+fn p2pkh_spend(spent: transaction::Hash, spent_value_zats: u64) -> Result<Transaction> {
+    let key = TransparentTestKey::from_seed(&TRANSPARENT_BROADCAST_TEST_SEED)?;
+    let recipient = key.scratch_recipient_address(1);
+    let bytes = key.build_p2pkh_spend(&P2pkhSpendArgs {
+        coinbase_txid_be: spent.0,
+        coinbase_vout: 0,
+        coinbase_value_zats: spent_value_zats,
+        recipient: &recipient,
+        target_height: SPEND_TARGET_HEIGHT,
+    })?;
+    Ok(Transaction::zcash_deserialize(bytes.as_slice())?)
 }
 
 fn checkpoints_for(
@@ -1081,6 +1146,120 @@ async fn tip_replay_checkpoints_refuse_replacement_and_a_different_manifest() ->
 const REORG_TIP_HEIGHT: u32 = CHAIN_TIP_HEIGHT - 1;
 const REORG_DEPTH: u32 = REORG_WINDOW_BLOCKS;
 
+/// The replaced block that spends the coinbase of the block below it, which
+/// the branch also replaces, and then that spend's output.
+const SPENDING_HEIGHT: u32 = REORG_TIP_HEIGHT;
+
+/// The transactions [`chain_spending_at`] adds at `SPENDING_HEIGHT`, the
+/// coinbase they spend, and the outpoint each spend reads.
+#[derive(Debug, Eq, PartialEq)]
+struct SpendLinks {
+    coinbase: TransactionId,
+    spend: TransactionId,
+    spend_input: TransparentOutPoint,
+    descendant: TransactionId,
+    descendant_input: TransparentOutPoint,
+}
+
+impl SpendLinks {
+    /// The links in the fixture chain.
+    fn of_chain(chain: &BTreeMap<BlockHeight, SourceBlock>) -> Result<Self> {
+        let block_at = |height: u32| -> Result<Block> {
+            let block = chain
+                .get(&BlockHeight::new(height))
+                .ok_or_else(|| eyre!("the chain is missing height {height}"))?;
+            Ok(Block::zcash_deserialize(block.raw_block_bytes.as_slice())?)
+        };
+        let id = |transaction: &Transaction| TransactionId::from_bytes(transaction.hash().0);
+        let input = |transaction: &Transaction| -> Result<TransparentOutPoint> {
+            let outpoint = transaction
+                .spent_outpoints()
+                .next()
+                .ok_or_else(|| eyre!("a spend must have an input"))?;
+            Ok(TransparentOutPoint::new(
+                TransactionId::from_bytes(outpoint.hash.0),
+                outpoint.index,
+            ))
+        };
+        let below = block_at(SPENDING_HEIGHT - 1)?;
+        let spending = block_at(SPENDING_HEIGHT)?;
+        let [coinbase] = &below.transactions[..] else {
+            return Err(eyre!("the block below the spends holds only its coinbase"));
+        };
+        let [_, spend, descendant] = &spending.transactions[..] else {
+            return Err(eyre!(
+                "the spending block holds its coinbase and two spends"
+            ));
+        };
+        Ok(Self {
+            coinbase: id(coinbase),
+            spend: id(spend),
+            spend_input: input(spend)?,
+            descendant: id(descendant),
+            descendant_input: input(descendant)?,
+        })
+    }
+
+    /// The links in a canonical store, read through a fresh secondary.
+    fn of_store(inputs: &TipReplayInputs, canonical_store: &Path, name: &str) -> Result<Self> {
+        let secondary = RocksDbCanonicalSecondary::open_ready(
+            canonical_store,
+            inputs
+                .directory
+                .path()
+                .join(format!("{name}-links-secondary")),
+            &inputs.activations,
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(REORG_WINDOW_BLOCKS)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let facts_at = |height: u32| -> Result<zinder_core::CanonicalBlockFacts> {
+            secondary
+                .block_replay_facts_at(BlockHeight::new(height))?
+                .ok_or_else(|| eyre!("the canonical store is missing height {height}"))
+        };
+        let below = facts_at(SPENDING_HEIGHT - 1)?;
+        let spending = facts_at(SPENDING_HEIGHT)?;
+        let [coinbase] = &below.transactions[..] else {
+            return Err(eyre!("the block below the spends holds only its coinbase"));
+        };
+        let [_, spend, descendant] = &spending.transactions[..] else {
+            return Err(eyre!(
+                "the spending block holds its coinbase and two spends"
+            ));
+        };
+        let input = |transaction: &zinder_core::CanonicalTransactionFacts| {
+            transaction
+                .transparent_inputs
+                .first()
+                .map(|input| input.spent_outpoint)
+                .ok_or_else(|| eyre!("a spend must have an input"))
+        };
+        Ok(Self {
+            coinbase: coinbase.public_facts.transaction_id,
+            spend: spend.public_facts.transaction_id,
+            spend_input: input(spend)?,
+            descendant: descendant.public_facts.transaction_id,
+            descendant_input: input(descendant)?,
+        })
+    }
+
+    /// Asserts each spend reads output 0 of the transaction it spends.
+    fn assert_linked(&self, name: &str) {
+        assert_eq!(
+            self.spend_input,
+            TransparentOutPoint::new(self.coinbase, 0),
+            "{name}"
+        );
+        assert_eq!(
+            self.descendant_input,
+            TransparentOutPoint::new(self.spend, 0),
+            "{name}"
+        );
+    }
+}
+
 /// A raised reorg window that replaying to `REORG_TIP_HEIGHT` cannot fill.
 ///
 /// The input store settled at `START_HEIGHT - REORG_WINDOW_BLOCKS`, and
@@ -1129,10 +1308,19 @@ fn run_tip_reorg(inputs: &TipReplayInputs, name: &str, extra: &[&str]) -> Result
 
 #[tokio::test]
 async fn tip_reorg_switches_to_a_fork_and_matches_a_rebuilt_wallet() -> Result<()> {
-    let inputs = prepare_inputs().await?;
+    let chain = chain_spending_at(CHAIN_TIP_HEIGHT, Some(SPENDING_HEIGHT))?;
+    let fixture_links = SpendLinks::of_chain(&chain)?;
+    fixture_links.assert_linked("fixture");
+    let inputs = prepare_inputs_for(chain).await?;
     let canonical_before = tree_digest(&inputs.canonical_store())?;
     let wallet_before = tree_digest(&inputs.wallet_store())?;
-    for (fork, rewritten_coinbases) in [("same-transactions", 0), ("distinct-coinbases", 3)] {
+    // A distinct-coinbases branch renames every coinbase. The spend reaches a
+    // renamed coinbase of an earlier block, and the descendant reaches the
+    // renamed spend in its own block.
+    for (fork, rewritten_coinbases, relinked_spends) in [
+        ("same-transactions", 0, 0),
+        ("distinct-coinbases", REORG_DEPTH + 1, 2),
+    ] {
         let (report, _) = run_tip_reorg(&inputs, fork, &["--fork", fork, "--keep-scratch"])?;
 
         assert_eq!(report["contract_identity"], "rocksdb-tip-reorg");
@@ -1144,6 +1332,14 @@ async fn tip_reorg_switches_to_a_fork_and_matches_a_rebuilt_wallet() -> Result<(
         assert_eq!(report["fork"]["first_height"], REORG_TIP_HEIGHT - 1);
         assert_eq!(report["fork"]["rewrite"]["blocks"], REORG_DEPTH + 1);
         assert_eq!(report["fork"]["rewrite"]["coinbases"], rewritten_coinbases);
+        assert_eq!(
+            report["fork"]["rewrite"]["spending_transactions"],
+            relinked_spends
+        );
+        assert_eq!(
+            report["fork"]["rewrite"]["relinked_inputs"],
+            relinked_spends
+        );
         let replacement = &report["canonical_replacement"];
         assert_eq!(replacement["replacement_prepared_blocks"], REORG_DEPTH);
         assert_eq!(replacement["before"]["tip_height"], REORG_TIP_HEIGHT);
@@ -1171,6 +1367,15 @@ async fn tip_reorg_switches_to_a_fork_and_matches_a_rebuilt_wallet() -> Result<(
         let kept_canonical = report["kept_scratch"]["canonical_store"]
             .as_str()
             .ok_or_else(|| eyre!("--keep-scratch must name the kept canonical store"))?;
+        let branch_links = SpendLinks::of_store(&inputs, Path::new(kept_canonical), fork)?;
+        branch_links.assert_linked(fork);
+        if relinked_spends == 0 {
+            assert_eq!(branch_links, fixture_links);
+        } else {
+            assert_ne!(branch_links.coinbase, fixture_links.coinbase);
+            assert_ne!(branch_links.spend, fixture_links.spend);
+            assert_ne!(branch_links.descendant, fixture_links.descendant);
+        }
         let rebuilt = inputs.directory.path().join("rebuilt-wallet");
         if rebuilt.exists() {
             std::fs::remove_dir_all(&rebuilt)?;
