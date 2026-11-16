@@ -1081,9 +1081,24 @@ async fn tip_replay_checkpoints_refuse_replacement_and_a_different_manifest() ->
 const REORG_TIP_HEIGHT: u32 = CHAIN_TIP_HEIGHT - 1;
 const REORG_DEPTH: u32 = REORG_WINDOW_BLOCKS;
 
-fn run_tip_reorg(inputs: &TipReplayInputs, name: &str, extra: &[&str]) -> Result<(Value, Output)> {
-    let report_path = inputs.directory.path().join(format!("{name}.json"));
-    let output = Command::new(env!("CARGO_BIN_EXE_zinder-bench"))
+/// A raised reorg window that replaying to `REORG_TIP_HEIGHT` cannot fill.
+///
+/// The input store settled at `START_HEIGHT - REORG_WINDOW_BLOCKS`, and
+/// settlement holds there until the tip passes it by the whole window.
+const UNFILLED_REORG_WINDOW_BLOCKS: u32 = 3 * REORG_WINDOW_BLOCKS;
+
+fn tip_reorg_report_path(inputs: &TipReplayInputs, name: &str) -> PathBuf {
+    inputs.directory.path().join(format!("{name}.json"))
+}
+
+fn tip_reorg_command(
+    inputs: &TipReplayInputs,
+    name: &str,
+    reorg_window_blocks: u32,
+    extra: &[&str],
+) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_zinder-bench"));
+    command
         .arg("rocksdb-tip-reorg")
         .arg("--fixture")
         .arg(inputs.fixture())
@@ -1094,18 +1109,22 @@ fn run_tip_reorg(inputs: &TipReplayInputs, name: &str, extra: &[&str]) -> Result
         .arg("--scratch-dir")
         .arg(inputs.directory.path().join(format!("{name}-scratch")))
         .arg("--report")
-        .arg(&report_path)
+        .arg(tip_reorg_report_path(inputs, name))
         .args(["--software-revision", "integration-test"])
         .args(["--reorg-tip-height", &REORG_TIP_HEIGHT.to_string()])
         .args(["--depth", &REORG_DEPTH.to_string()])
-        .args(["--reorg-window-blocks", &REORG_WINDOW_BLOCKS.to_string()])
+        .args(["--reorg-window-blocks", &reorg_window_blocks.to_string()])
         .args(["--canonical-block-cache-bytes", "8388608"])
         .args(["--canonical-secondary-block-cache-bytes", "8388608"])
         .args(["--wallet-block-cache-bytes", "8388608"])
-        .args(extra)
-        .output()?;
+        .args(extra);
+    command
+}
+
+fn run_tip_reorg(inputs: &TipReplayInputs, name: &str, extra: &[&str]) -> Result<(Value, Output)> {
+    let output = tip_reorg_command(inputs, name, REORG_WINDOW_BLOCKS, extra).output()?;
     require_success(&output, "tip reorg")?;
-    Ok((read_json(&report_path)?, output))
+    Ok((read_json(&tip_reorg_report_path(inputs, name))?, output))
 }
 
 #[tokio::test]
@@ -1188,5 +1207,31 @@ async fn tip_reorg_reports_a_refused_transition_with_the_wallet_unchanged() -> R
     assert_eq!(transition["wallet_unchanged"], true);
     assert!(transition["footprint"].is_null());
     assert!(transition["final_wallet"].is_null());
+    Ok(())
+}
+
+#[tokio::test]
+async fn tip_reorg_refuses_a_reorg_window_the_replay_has_not_filled() -> Result<()> {
+    let inputs = prepare_inputs().await?;
+    let output =
+        tip_reorg_command(&inputs, "unfilled", UNFILLED_REORG_WINDOW_BLOCKS, &[]).output()?;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let settled = START_HEIGHT - REORG_WINDOW_BLOCKS;
+    assert!(
+        stderr.contains(&format!(
+            "settled through {settled} under a {UNFILLED_REORG_WINDOW_BLOCKS}-block reorg window"
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "raise --reorg-tip-height to at least {}",
+            settled + UNFILLED_REORG_WINDOW_BLOCKS
+        )),
+        "{stderr}"
+    );
+    assert!(!tip_reorg_report_path(&inputs, "unfilled").exists());
     Ok(())
 }

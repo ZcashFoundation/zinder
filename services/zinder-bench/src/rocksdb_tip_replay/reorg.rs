@@ -408,6 +408,20 @@ fn switch_to_fork(
             before_fork.settled_tip.height.value()
         )));
     }
+    // The follower replaces through the settled tip plus the window. Past the
+    // reorg tip, that takes in the branch's extra block, and no append follows.
+    let window_blocks = stores.reorg_window_blocks()?;
+    let replaceable_through = before_fork
+        .settled_tip
+        .height
+        .value()
+        .saturating_add(window_blocks);
+    if replaceable_through > plan.reverted.end.value() {
+        return Err(BenchError::invalid_argument(format!(
+            "the canonical store settled through {} under a {window_blocks}-block reorg window, so the follower would replace the branch's extra block too; raise --reorg-tip-height to at least {replaceable_through} so the window fills first",
+            before_fork.settled_tip.height.value()
+        )));
+    }
     let replaced_workload = total_workload(
         &stores.block_workloads(plan.reverted.start.value()..=plan.reverted.end.value())?,
     );

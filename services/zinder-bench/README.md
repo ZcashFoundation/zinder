@@ -558,6 +558,13 @@ fixture blocks, so the store tip must be at least `--depth` blocks below
 `--reorg-tip-height`. The reorg must also start above the canonical settled
 tip, so `--depth` can be at most `--reorg-window-blocks`.
 
+The reorg window must be full when the branch arrives. The follower replaces
+blocks up to the settled tip plus the window. When `--reorg-window-blocks`
+raises the store's window, settlement stays where it was until the replay
+passes it by the whole new window. Before that point the replacement would
+also take in the branch's extra block, so the command refuses to build the
+branch and names the lowest `--reorg-tip-height` that fills the window.
+
 ```bash
 zinder-bench rocksdb-tip-reorg \
   --fixture ./fixtures/testnet-tip \
