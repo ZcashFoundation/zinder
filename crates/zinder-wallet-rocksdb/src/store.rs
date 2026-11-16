@@ -209,6 +209,11 @@ pub struct RocksDbWalletStore {
     pub(crate) bounded_open: BoundedRocksDbOpen,
     pub(crate) control: WalletStoreControlRecord,
     pub(crate) ready_evidence: WalletProjectionReadyEvidence,
+    /// Writer generation of the READY publication whose durable undo suffix
+    /// this handle verified, by reading every retained row or by publishing an
+    /// append planned on a verified suffix. `None` until the handle's first
+    /// transition reads the whole suffix.
+    pub(crate) verified_undo_suffix_generation: Option<u64>,
 }
 
 /// A cold-admitted READY wallet held only for canonical following.
@@ -711,6 +716,7 @@ impl ValidatedRocksDbWalletBuild {
             bounded_open: self.bounded_open,
             control: ready_control,
             ready_evidence,
+            verified_undo_suffix_generation: None,
         })
     }
 }
@@ -734,11 +740,14 @@ impl RocksDbWalletStore {
     /// [`Self::open_ready`], but deliberately does not compare the persisted
     /// source fence with a potentially newer canonical writer. It does not
     /// rescan the row families; full row-to-accumulator validation remains the
-    /// bounded BUILDING-to-READY publication check. The returned
-    /// [`RocksDbWalletFollowingStore`] exposes no query methods; callers must
-    /// converge it through retained canonical events and then call
-    /// [`RocksDbWalletFollowingStore::into_ready_store`] with an exact source
-    /// identity before serving queries.
+    /// bounded BUILDING-to-READY publication check. The first transition on
+    /// the returned handle reads and decodes every retained undo row before
+    /// it publishes, and a missing, corrupt, or disconnected row fails it.
+    ///
+    /// The returned [`RocksDbWalletFollowingStore`] exposes no query methods;
+    /// callers must converge it through retained canonical events and then
+    /// call [`RocksDbWalletFollowingStore::into_ready_store`] with an exact
+    /// source identity before serving queries.
     pub fn open_ready_for_following(
         path: impl AsRef<Path>,
         expected_network: Network,
@@ -774,6 +783,7 @@ impl RocksDbWalletStore {
                 bounded_open,
                 ready_evidence: ready_evidence.clone(),
                 control,
+                verified_undo_suffix_generation: None,
             },
         })
     }

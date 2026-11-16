@@ -45,6 +45,72 @@ use zinder_testkit::process_crash::crash_point;
 #[cfg(not(test))]
 const fn crash_point(_name: &str) {}
 
+/// One unit of planner work on a retained reorg-undo row.
+#[derive(Clone, Copy)]
+enum UndoRowWork {
+    DurableRead,
+    ValueCopy,
+    FullDecode,
+}
+
+#[cfg(not(test))]
+const fn count_undo_row_work(_column_family_name: &str, _work: UndoRowWork) {}
+
+/// Undo-row work the planner performed on this thread since the last take.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct UndoRowWorkCounts {
+    durable_reads: u64,
+    value_copies: u64,
+    full_decodes: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static UNDO_ROW_WORK: std::cell::Cell<UndoRowWorkCounts> = const {
+        std::cell::Cell::new(UndoRowWorkCounts {
+            durable_reads: 0,
+            value_copies: 0,
+            full_decodes: 0,
+        })
+    };
+}
+
+#[cfg(test)]
+fn count_undo_row_work(column_family_name: &str, work: UndoRowWork) {
+    if column_family_name != REORG_UNDO_COLUMN_FAMILY {
+        return;
+    }
+    UNDO_ROW_WORK.with(|counts| {
+        let mut next = counts.get();
+        match work {
+            UndoRowWork::DurableRead => next.durable_reads += 1,
+            UndoRowWork::ValueCopy => next.value_copies += 1,
+            UndoRowWork::FullDecode => next.full_decodes += 1,
+        }
+        counts.set(next);
+    });
+}
+
+#[cfg(test)]
+fn take_undo_row_work() -> UndoRowWorkCounts {
+    UNDO_ROW_WORK.with(std::cell::Cell::take)
+}
+
+/// How a planned transition establishes that its undo suffix is publishable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UndoSuffixCheck {
+    /// Reads and fully decodes every retained undo row.
+    Full,
+    /// Rechecks no row the plan keeps, which belong to the suffix this handle
+    /// verified for the READY publication the plan starts from. The plan still
+    /// reads each row it prunes and the successor that binds the new settled
+    /// tip, and checks that the pruned rows' source digests connect to that
+    /// successor. Every row it writes chains from the verified tip by
+    /// construction.
+    Incremental,
+}
+
 /// Largest permitted in-process logical-byte plan for one wallet transition.
 ///
 /// Each caller must select a smaller nonzero ceiling. The planner accounts
@@ -130,6 +196,14 @@ impl RocksDbWalletStore {
             resulting_settled_tip,
             resulting_fence.visible_tip(),
         )?;
+        let undo_suffix_check = match event.kind() {
+            CanonicalEventKind::Committed
+                if self.verified_undo_suffix_generation == Some(self.control.writer_generation) =>
+            {
+                UndoSuffixCheck::Incremental
+            }
+            CanonicalEventKind::Committed | CanonicalEventKind::Reorged => UndoSuffixCheck::Full,
+        };
 
         let mut planner = WalletTransitionPlanner::new(self, max_logical_bytes);
         match event.kind() {
@@ -159,7 +233,7 @@ impl RocksDbWalletStore {
             });
         }
         planner.advance_settled_tip(resulting_settled_tip)?;
-        planner.require_publishable_undo_suffix()?;
+        planner.require_publishable_undo_suffix(undo_suffix_check)?;
 
         let event_cursor = WalletProjectionEventCursor::from_bytes(event.cursor().as_bytes())?;
         let source_position = WalletProjectionSourcePosition::with_event_cursor(
@@ -292,7 +366,7 @@ impl RocksDbWalletStore {
             });
         }
         planner.advance_settled_tip(target_settled_tip)?;
-        planner.require_publishable_undo_suffix()?;
+        planner.require_publishable_undo_suffix(UndoSuffixCheck::Full)?;
 
         let final_event =
             retained_events
@@ -357,6 +431,9 @@ impl RocksDbWalletStore {
         );
         let mut write_options = WriteOptions::default();
         write_options.set_sync(true);
+        // A failed or unconfirmed write leaves no verified suffix, so the next
+        // transition reads the whole suffix again.
+        self.verified_undo_suffix_generation = None;
         crash_point("wallet_projection.transition.before_atomic_write");
         self.bounded_open
             .db
@@ -374,6 +451,7 @@ impl RocksDbWalletStore {
                 reason: "READY control differs after atomic wallet transition",
             });
         }
+        self.verified_undo_suffix_generation = Some(self.control.writer_generation);
         Ok(())
     }
 
@@ -881,6 +959,11 @@ fn checked_transition_bytes(left: u64, right: u64) -> Result<u64, RocksDbWalletE
         .ok_or(RocksDbWalletError::TransitionLogicalByteAccountingOverflow)
 }
 
+fn decode_undo(key: &[u8], encoded: &[u8]) -> Result<WalletReorgUndo, RocksDbWalletError> {
+    count_undo_row_work(REORG_UNDO_COLUMN_FAMILY, UndoRowWork::FullDecode);
+    Ok(WalletReorgUndo::decode(key, encoded)?)
+}
+
 type OverlayKey = (&'static str, Vec<u8>);
 
 struct WalletTransitionPlanner<'store> {
@@ -1207,16 +1290,19 @@ impl<'store> WalletTransitionPlanner<'store> {
             });
         }
 
-        if resulting_settled_tip == self.current_tip {
+        // Pruned rows leave the suffix a later full check reads, so their
+        // digest chain is checked here, up to where the kept suffix starts.
+        let pruned_digest_after = if resulting_settled_tip == self.current_tip {
             // The caller's resulting fence already authenticated the exact
             // visible tip, so no successor undo row exists to bind the floor.
+            self.source_sequence_digest
         } else {
             let successor_height = resulting_settled_tip.height.next().ok_or(
                 RocksDbWalletError::ProjectionTransitionRejected {
                     reason: "canonical settled tip cannot have a successor beyond the height domain",
                 },
             )?;
-            let (successor, _) = self.load_undo(successor_height)?.ok_or(
+            let successor = self.inspect_undo(successor_height)?.ok_or(
                 RocksDbWalletError::WalletProjectionRebuildRequired {
                     reason: "durable undo suffix cannot authenticate the advanced canonical settled tip",
                 },
@@ -1228,13 +1314,15 @@ impl<'store> WalletTransitionPlanner<'store> {
                     reason: "canonical settled tip does not match the retained successor undo record",
                 });
             }
-        }
+            successor.source_sequence_digest_before
+        };
 
         let mut height = self.settled_tip.height.next().ok_or(
             RocksDbWalletError::ProjectionTransitionRejected {
                 reason: "wallet undo floor cannot advance beyond the height domain",
             },
         )?;
+        let mut previous_digest_after = None;
         loop {
             let (undo, encoded) = self.load_undo(height)?.ok_or(
                 RocksDbWalletError::WalletProjectionRebuildRequired {
@@ -1246,13 +1334,23 @@ impl<'store> WalletTransitionPlanner<'store> {
                     reason: "durable wallet undo floor has a height/key mismatch",
                 });
             }
-            self.remove_row(
+            let is_last_pruned = height == resulting_settled_tip.height;
+            if previous_digest_after
+                .is_some_and(|digest| digest != undo.source_sequence_digest_before)
+                || (is_last_pruned && undo.source_sequence_digest_after != pruned_digest_after)
+            {
+                return Err(RocksDbWalletError::ProjectionTransitionRejected {
+                    reason: "durable wallet undo suffix has disconnected source digests",
+                });
+            }
+            previous_digest_after = Some(undo.source_sequence_digest_after);
+            self.remove_row_after_value_observed(
                 WalletProjectionRowFamily::ReorgUndo,
                 REORG_UNDO_COLUMN_FAMILY,
                 &height.value().to_be_bytes(),
                 &encoded,
             )?;
-            if height == resulting_settled_tip.height {
+            if is_last_pruned {
                 break;
             }
             height = height
@@ -1265,7 +1363,10 @@ impl<'store> WalletTransitionPlanner<'store> {
         Ok(())
     }
 
-    fn require_publishable_undo_suffix(&self) -> Result<(), RocksDbWalletError> {
+    fn require_publishable_undo_suffix(
+        &self,
+        check: UndoSuffixCheck,
+    ) -> Result<(), RocksDbWalletError> {
         let undo_count = self.accumulator_row_counts.reorg_undo_count;
         let expected_count = u64::from(self.current_tip.height.value())
             .checked_sub(u64::from(self.settled_tip.height.value()))
@@ -1282,7 +1383,7 @@ impl<'store> WalletTransitionPlanner<'store> {
                 reason: "planned wallet undo rows do not exactly cover the canonical unsettled suffix",
             });
         }
-        if expected_count == 0 {
+        if expected_count == 0 || check == UndoSuffixCheck::Incremental {
             return Ok(());
         }
         let first_height = self.settled_tip.height.next().ok_or(
@@ -1293,7 +1394,7 @@ impl<'store> WalletTransitionPlanner<'store> {
         let mut previous_digest_after = None;
         let mut block_height = first_height;
         for offset in 0..expected_count {
-            let Some((undo, _)) = self.load_undo(block_height)? else {
+            let Some(undo) = self.inspect_undo(block_height)? else {
                 return Err(RocksDbWalletError::ProjectionTransitionRejected {
                     reason: "planned wallet undo suffix has a missing durable record",
                 });
@@ -1350,7 +1451,7 @@ impl<'store> WalletTransitionPlanner<'store> {
             }
             self.insert_unspent(&spent.output)?;
         }
-        self.remove_row(
+        self.remove_row_after_value_observed(
             WalletProjectionRowFamily::ReorgUndo,
             REORG_UNDO_COLUMN_FAMILY,
             &undo.encode_key(),
@@ -1553,17 +1654,38 @@ impl<'store> WalletTransitionPlanner<'store> {
         )
     }
 
+    /// Reads one retained undo row with the bytes a plan needs to remove it.
     fn load_undo(
         &self,
         height: BlockHeight,
     ) -> Result<Option<(WalletReorgUndo, Vec<u8>)>, RocksDbWalletError> {
         let key = height.value().to_be_bytes();
         self.raw(REORG_UNDO_COLUMN_FAMILY, &key)?
-            .map(|encoded| {
-                WalletReorgUndo::decode(&key, &encoded)
-                    .map(|undo| (undo, encoded))
-                    .map_err(Into::into)
-            })
+            .map(|encoded| decode_undo(&key, &encoded).map(|undo| (undo, encoded)))
+            .transpose()
+    }
+
+    /// Decodes one retained undo row in place, from the plan's overlay or a
+    /// pinned durable value, for a plan that keeps the row.
+    fn inspect_undo(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<WalletReorgUndo>, RocksDbWalletError> {
+        let key = height.value().to_be_bytes();
+        if let Some(planned) = self.overlay.get(&(REORG_UNDO_COLUMN_FAMILY, key.to_vec())) {
+            return planned
+                .as_deref()
+                .map(|encoded| decode_undo(&key, encoded))
+                .transpose();
+        }
+        let column_family = column_family(&self.store.bounded_open, REORG_UNDO_COLUMN_FAMILY)?;
+        count_undo_row_work(REORG_UNDO_COLUMN_FAMILY, UndoRowWork::DurableRead);
+        self.store
+            .bounded_open
+            .db
+            .get_pinned_cf(&column_family, key)
+            .map_err(|source| RocksDbWalletError::rocksdb("wallet transition point read", source))?
+            .map(|encoded| decode_undo(&key, &encoded))
             .transpose()
     }
 
@@ -1780,15 +1902,23 @@ impl<'store> WalletTransitionPlanner<'store> {
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, RocksDbWalletError> {
         let overlay_key = (column_family_name, key.to_vec());
-        if let Some(overlay_value) = self.overlay.get(&overlay_key) {
-            return Ok(overlay_value.clone());
+        let encoded = if let Some(overlay_value) = self.overlay.get(&overlay_key) {
+            overlay_value.clone()
+        } else {
+            let column_family = column_family(&self.store.bounded_open, column_family_name)?;
+            count_undo_row_work(column_family_name, UndoRowWork::DurableRead);
+            self.store
+                .bounded_open
+                .db
+                .get_cf(&column_family, key)
+                .map_err(|source| {
+                    RocksDbWalletError::rocksdb("wallet transition point read", source)
+                })?
+        };
+        if encoded.is_some() {
+            count_undo_row_work(column_family_name, UndoRowWork::ValueCopy);
         }
-        let column_family = column_family(&self.store.bounded_open, column_family_name)?;
-        self.store
-            .bounded_open
-            .db
-            .get_cf(&column_family, key)
-            .map_err(|source| RocksDbWalletError::rocksdb("wallet transition point read", source))
+        Ok(encoded)
     }
 
     fn put_raw(
@@ -1850,7 +1980,8 @@ mod tests {
     use zinder_core::{TransparentAddressScriptHash, TransparentOutputFact};
     use zinder_store::{
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence,
-        CanonicalEventHistoryRequest, CanonicalLiveAppend, CanonicalReorgPolicy,
+        CanonicalEventHistoryRequest, CanonicalLiveAppend, CanonicalLiveReplacement,
+        CanonicalReorgPolicy, CanonicalReplacementBlock, CanonicalRetainedEvent,
         CanonicalStoreBuildPlan, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder,
         RocksDbCanonicalSecondary, RocksDbCanonicalStore, RocksDbResourceBudget,
     };
@@ -1861,13 +1992,20 @@ mod tests {
         WalletCanonicalSourceIdentity, WalletProjectionBuildLeaseRequest,
         WalletProjectionBuildOwner, WalletProjectionContractError, WalletProjectionDigestBuilder,
         WalletProjectionReadyEvidence, WalletProjectionRetainedEventAnchor,
-        WalletProjectionSourcePosition, WalletUtxoSetSummary,
+        WalletProjectionSourcePosition, WalletReorgUndo, WalletUtxoSetSummary,
     };
 
-    use super::{extend_source_sequence_digest, source_identity_from_fence};
+    use super::{
+        UndoRowWorkCounts, extend_source_sequence_digest, source_identity_from_fence,
+        take_undo_row_work,
+    };
     use crate::{
-        RocksDbWalletBuildStore, RocksDbWalletFollowingStore, RocksDbWalletStore,
-        store::{RocksDbWalletBuilder, WalletColdValidationConfig},
+        RocksDbWalletBuildOptions, RocksDbWalletBuildStore, RocksDbWalletError,
+        RocksDbWalletFollowingStore, RocksDbWalletStore, build_wallet_from_canonical,
+        store::{
+            REORG_UNDO_COLUMN_FAMILY, RocksDbWalletBuilder, WalletColdValidationConfig,
+            column_family,
+        },
     };
 
     #[test]
@@ -2675,5 +2813,467 @@ mod tests {
             transaction_blobs,
             block_blob: None,
         }
+    }
+
+    /// Settlement lag of the coinbase-only chains below, and the reorg depth
+    /// their wallets support.
+    const COINBASE_ONLY_DEPTH: u32 = 4;
+
+    /// Visible tip a [`FollowedCoinbaseOnlyChain`] wallet reaches on one handle.
+    const FOLLOWED_TIP: u32 = 106;
+
+    /// A retained undo row that the next append neither prunes nor binds to
+    /// its settled tip, and that replacing the tip does not roll back.
+    const DAMAGED_UNDO_HEIGHT: u32 = 105;
+
+    #[test]
+    fn appends_on_a_verified_suffix_read_only_the_undo_rows_they_change()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let depth = u64::from(COINBASE_ONLY_DEPTH);
+        let window_full = 100 + COINBASE_ONLY_DEPTH;
+        let reopened_at = 100 + 2 * COINBASE_ONLY_DEPTH + 1;
+        let through = 100 + 3 * COINBASE_ONLY_DEPTH;
+        let _chain = CoinbaseOnlyChain::publish(temporary.path(), through)?;
+        let secondary = open_checkpointed_secondary(temporary.path(), "canonical-secondary")?;
+        let mut wallet = open_coinbase_only_wallet(temporary.path())?;
+        let work = |durable_reads, value_copies, full_decodes| UndoRowWorkCounts {
+            durable_reads,
+            value_copies,
+            full_decodes,
+        };
+        let mut observed = Vec::new();
+        let mut expected = Vec::new();
+        for height in 101..=through {
+            if height == reopened_at {
+                drop(wallet);
+                wallet = open_coinbase_only_wallet(temporary.path())?;
+            }
+            take_undo_row_work();
+            apply_next_coinbase_only_event(&mut wallet, &secondary)?;
+            observed.push((height, take_undo_row_work()));
+            // Every append reads its new undo key once to prove it absent.
+            // The first transition on a handle then decodes the whole suffix
+            // in place; later appends read and decode only the successor row
+            // that binds the new settled tip and the one row they prune.
+            let expected_work = if height == 101 {
+                work(1, 0, 1)
+            } else if height <= window_full {
+                work(1, 0, 0)
+            } else if height == reopened_at {
+                work(depth + 2, 1, depth + 2)
+            } else {
+                work(3, 1, 2)
+            };
+            expected.push((height, expected_work));
+        }
+        assert_eq!(observed, expected);
+
+        let cold = build_wallet_from_canonical(
+            &secondary,
+            temporary.path().join("wallet-cold"),
+            RocksDbWalletBuildOptions {
+                supported_reorg_depth: COINBASE_ONLY_DEPTH,
+                ..RocksDbWalletBuildOptions::for_local_tests()
+            },
+        )?;
+        assert_eq!(wallet.ready_evidence(), cold.store.ready_evidence());
+        Ok(())
+    }
+
+    #[test]
+    fn first_transition_after_open_rejects_a_damaged_retained_undo_row()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for damage in UndoRowDamage::ALL {
+            let fixture = FollowedCoinbaseOnlyChain::follow()?;
+            damage.apply(&fixture.wallet, BlockHeight::new(DAMAGED_UNDO_HEIGHT))?;
+            let before = fixture.wallet.ready_evidence().clone();
+            drop(fixture.wallet);
+            let _chain = fixture.chain.append_through(FOLLOWED_TIP + 1)?;
+            let mut secondary = fixture.secondary;
+            secondary.try_catch_up()?;
+            let mut reopened = open_coinbase_only_wallet(fixture.temporary.path())?;
+            assert_eq!(reopened.verified_undo_suffix_generation, None);
+
+            let outcome = apply_next_coinbase_only_event(&mut reopened, &secondary);
+            assert_damage_reported(damage, outcome)?;
+            assert_eq!(reopened.ready_evidence(), &before);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_on_a_verified_handle_rejects_a_damaged_retained_undo_row()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for damage in UndoRowDamage::ALL {
+            let mut fixture = FollowedCoinbaseOnlyChain::follow()?;
+            damage.apply(&fixture.wallet, BlockHeight::new(DAMAGED_UNDO_HEIGHT))?;
+            let before = fixture.wallet.ready_evidence().clone();
+            let _chain = fixture.chain.replace_tip()?;
+            fixture.secondary.try_catch_up()?;
+            let event = next_retained_event(&fixture.secondary, &fixture.wallet)?;
+            assert!(event.reverted_range().is_some(), "{event:?}");
+
+            let outcome = apply_next_coinbase_only_event(&mut fixture.wallet, &fixture.secondary);
+            assert_damage_reported(damage, outcome)?;
+            assert_eq!(fixture.wallet.ready_evidence(), &before);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reconciliation_on_a_verified_handle_rejects_a_damaged_retained_undo_row()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for damage in UndoRowDamage::ALL {
+            let mut fixture = FollowedCoinbaseOnlyChain::follow()?;
+            damage.apply(&fixture.wallet, BlockHeight::new(DAMAGED_UNDO_HEIGHT))?;
+            let before = fixture.wallet.ready_evidence().clone();
+            let _chain = fixture.chain.append_through(FOLLOWED_TIP + 1)?;
+            fixture.secondary.try_catch_up()?;
+
+            let outcome =
+                reconcile_next_coinbase_only_event(&mut fixture.wallet, &fixture.secondary);
+            assert_damage_reported(damage, outcome)?;
+            assert_eq!(fixture.wallet.ready_evidence(), &before);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn appends_on_a_verified_handle_reject_a_disconnected_undo_row_before_pruning_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let damage = UndoRowDamage::Disconnected;
+        let mut fixture = FollowedCoinbaseOnlyChain::follow()?;
+        damage.apply(&fixture.wallet, BlockHeight::new(DAMAGED_UNDO_HEIGHT))?;
+        let _chain = fixture
+            .chain
+            .append_through(DAMAGED_UNDO_HEIGHT + COINBASE_ONLY_DEPTH)?;
+        fixture.secondary.try_catch_up()?;
+
+        // This append prunes a row two below the damaged one.
+        apply_next_coinbase_only_event(&mut fixture.wallet, &fixture.secondary)?;
+        assert_eq!(
+            fixture.wallet.verified_undo_suffix_generation,
+            Some(fixture.wallet.control.writer_generation)
+        );
+        let before = fixture.wallet.ready_evidence().clone();
+        let outcome = apply_next_coinbase_only_event(&mut fixture.wallet, &fixture.secondary);
+        assert_damage_reported(damage, outcome)?;
+        assert_eq!(fixture.wallet.ready_evidence(), &before);
+        assert!(
+            before.source_position.tip.height
+                < BlockHeight::new(DAMAGED_UNDO_HEIGHT + COINBASE_ONLY_DEPTH)
+        );
+        Ok(())
+    }
+
+    /// Damage done to one retained undo row behind a wallet handle's back.
+    #[derive(Clone, Copy, Debug)]
+    enum UndoRowDamage {
+        Missing,
+        Corrupt,
+        Disconnected,
+    }
+
+    impl UndoRowDamage {
+        const ALL: [Self; 3] = [Self::Missing, Self::Corrupt, Self::Disconnected];
+
+        fn apply(
+            self,
+            wallet: &RocksDbWalletStore,
+            height: BlockHeight,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let db = &wallet.bounded_open.db;
+            let family = column_family(&wallet.bounded_open, REORG_UNDO_COLUMN_FAMILY)?;
+            let key = height.value().to_be_bytes();
+            let encoded = db
+                .get_cf(&family, key)?
+                .ok_or("damaged undo row must be retained")?;
+            match self {
+                Self::Missing => db.delete_cf(&family, key)?,
+                Self::Corrupt => {
+                    let mut corrupt = encoded;
+                    corrupt.push(0);
+                    db.put_cf(&family, key, corrupt)?;
+                }
+                Self::Disconnected => {
+                    let mut undo = WalletReorgUndo::decode(&key, &encoded)?;
+                    undo.source_sequence_digest_before =
+                        CanonicalBlockFactsSequenceDigest::from_admitted_checkpoint_parts(
+                            CanonicalBlockFactsSequenceDigestVersion::V1,
+                            undo.source_sequence_digest_before.block_count(),
+                            [0x5a; 32],
+                        );
+                    db.put_cf(&family, key, undo.encode_value()?)?;
+                }
+            }
+            Ok(())
+        }
+
+        /// Returns whether `error` is the rejection a whole-suffix check
+        /// reports for this damage.
+        fn is_reported_by(self, error: &RocksDbWalletError) -> bool {
+            match self {
+                Self::Missing => matches!(
+                    error,
+                    RocksDbWalletError::ProjectionTransitionRejected { reason }
+                        if *reason == "planned wallet undo suffix has a missing durable record"
+                ),
+                Self::Corrupt => matches!(
+                    error,
+                    RocksDbWalletError::Contract(
+                        WalletProjectionContractError::DurableLengthPrefixMismatch {
+                            field: "reorg_undo value"
+                        }
+                    )
+                ),
+                Self::Disconnected => matches!(
+                    error,
+                    RocksDbWalletError::ProjectionTransitionRejected { reason }
+                        if *reason == "durable wallet undo suffix has disconnected source digests"
+                ),
+            }
+        }
+    }
+
+    fn assert_damage_reported(
+        damage: UndoRowDamage,
+        outcome: Result<(), Box<dyn std::error::Error>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let error = outcome
+            .err()
+            .ok_or_else(|| format!("transition accepted a {damage:?} undo row"))?;
+        let wallet_error = error
+            .downcast_ref::<RocksDbWalletError>()
+            .ok_or_else(|| format!("{damage:?} undo row failed outside the wallet: {error}"))?;
+        assert!(
+            damage.is_reported_by(wallet_error),
+            "{damage:?}: {wallet_error:?}"
+        );
+        Ok(())
+    }
+
+    /// A wallet that followed a coinbase-only chain to [`FOLLOWED_TIP`] on one
+    /// handle, so the handle has verified its full undo window.
+    struct FollowedCoinbaseOnlyChain {
+        chain: CoinbaseOnlyChain,
+        secondary: RocksDbCanonicalSecondary,
+        wallet: RocksDbWalletStore,
+        temporary: TempDir,
+    }
+
+    impl FollowedCoinbaseOnlyChain {
+        fn follow() -> Result<Self, Box<dyn std::error::Error>> {
+            let temporary = TempDir::new()?;
+            let chain = CoinbaseOnlyChain::publish(temporary.path(), FOLLOWED_TIP)?;
+            let secondary = open_checkpointed_secondary(temporary.path(), "canonical-secondary")?;
+            let mut wallet = open_coinbase_only_wallet(temporary.path())?;
+            while wallet.ready_evidence().source_position.tip.height
+                < BlockHeight::new(FOLLOWED_TIP)
+            {
+                apply_next_coinbase_only_event(&mut wallet, &secondary)?;
+            }
+            assert_eq!(
+                wallet.ready_evidence().row_counts.reorg_undo_count,
+                u64::from(COINBASE_ONLY_DEPTH)
+            );
+            assert_eq!(
+                wallet.verified_undo_suffix_generation,
+                Some(wallet.control.writer_generation)
+            );
+            Ok(Self {
+                chain,
+                secondary,
+                wallet,
+                temporary,
+            })
+        }
+    }
+
+    /// A checkpointed canonical store of blocks without transparent activity.
+    ///
+    /// Each block's only transaction is a coinbase without transparent
+    /// outputs, and the store settles [`COINBASE_ONLY_DEPTH`] blocks below its
+    /// tip.
+    struct CoinbaseOnlyChain {
+        activations: NetworkUpgradeActivations,
+        canonical_store: RocksDbCanonicalStore,
+        fence: CanonicalEventFence,
+        accumulator: CommitmentTreeAccumulator,
+        accumulator_below_tip: CommitmentTreeAccumulator,
+    }
+
+    impl CoinbaseOnlyChain {
+        /// Publishes the height-100 checkpoint and its READY wallet under
+        /// `root`, then appends coinbase-only blocks through height `through`.
+        fn publish(root: &Path, through: u32) -> Result<Self, Box<dyn std::error::Error>> {
+            let published = publish_checkpointed_wallet(root)?;
+            let accumulator =
+                checkpoint_accumulator(&published.activations, published.initial_fence)?;
+            Self {
+                activations: published.activations,
+                canonical_store: published.canonical_store,
+                fence: published.initial_fence,
+                accumulator_below_tip: accumulator.clone(),
+                accumulator,
+            }
+            .append_through(through)
+        }
+
+        fn append_through(mut self, through: u32) -> Result<Self, Box<dyn std::error::Error>> {
+            for height in self.fence.visible_tip().height.value() + 1..=through {
+                self.accumulator_below_tip = self.accumulator.clone();
+                let block_hash = coinbase_only_hash(height);
+                let block = checkpointed_append_block(
+                    &mut self.accumulator,
+                    height,
+                    coinbase_only_hash(height - 1),
+                    block_hash,
+                    vec![coinbase_without_transparent_outputs(block_hash)],
+                )?;
+                (self.canonical_store, self.fence) = self.canonical_store.commit_live_append(
+                    CanonicalLiveAppend::new(
+                        self.fence,
+                        block,
+                        Vec::new(),
+                        coinbase_only_settled_tip(BlockHeight::new(height)),
+                        UnixTimestampMillis::new(1_750_000_100_000 + u64::from(height)),
+                    ),
+                    &self.activations,
+                )?;
+            }
+            Ok(self)
+        }
+
+        /// Replaces the visible tip with a coinbase-only sibling block.
+        fn replace_tip(mut self) -> Result<Self, Box<dyn std::error::Error>> {
+            let height = self.fence.visible_tip().height.value();
+            let mut accumulator = self.accumulator_below_tip.clone();
+            let block_hash = [0xc0; 32];
+            let block = checkpointed_append_block(
+                &mut accumulator,
+                height,
+                coinbase_only_hash(height - 1),
+                block_hash,
+                vec![coinbase_without_transparent_outputs(block_hash)],
+            )?;
+            (self.canonical_store, self.fence) = self.canonical_store.commit_live_replacement(
+                CanonicalLiveReplacement::new(
+                    self.fence,
+                    vec![CanonicalReplacementBlock::new(block, Vec::new())],
+                    UnixTimestampMillis::new(1_750_000_200_000),
+                ),
+                &self.activations,
+            )?;
+            self.accumulator = accumulator;
+            Ok(self)
+        }
+    }
+
+    /// A block's unique coinbase, identified by the block's hash bytes.
+    fn coinbase_without_transparent_outputs(block_hash: [u8; 32]) -> CanonicalTransactionFacts {
+        let mut public_facts =
+            transparent_spend_public_facts(TransactionId::from_bytes(block_hash));
+        public_facts.version = TransactionVersion::V4;
+        public_facts.is_coinbase = true;
+        public_facts.unsupported_sections = Vec::new();
+        CanonicalTransactionFacts {
+            public_facts,
+            serialized_bytes_digest: SerializedBytesDigest::from_serialized_bytes(&[0x66]),
+            intrinsic_value_balances: TransactionIntrinsicValueBalances::default(),
+            transparent_inputs: vec![TransparentInputFact::new(
+                0,
+                TransparentOutPoint::COINBASE_SENTINEL,
+            )],
+            transparent_outputs: Vec::new(),
+        }
+    }
+
+    fn coinbase_only_hash(height: u32) -> [u8; 32] {
+        if height == 100 {
+            return [0xa0; 32];
+        }
+        let mut hash = [0xb0; 32];
+        hash[..4].copy_from_slice(&height.to_be_bytes());
+        hash
+    }
+
+    fn coinbase_only_settled_tip(visible_height: BlockHeight) -> BlockId {
+        let height = visible_height
+            .value()
+            .saturating_sub(COINBASE_ONLY_DEPTH)
+            .max(100);
+        BlockId::new(
+            BlockHeight::new(height),
+            BlockHash::from_bytes(coinbase_only_hash(height)),
+        )
+    }
+
+    /// Opens the wallet under `root` at the coinbase-only chain's reorg depth.
+    fn open_coinbase_only_wallet(
+        root: &Path,
+    ) -> Result<RocksDbWalletStore, Box<dyn std::error::Error>> {
+        let mut following = RocksDbWalletStore::open_ready_for_following(
+            root.join("wallet"),
+            Network::ZcashRegtest,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        following.raise_supported_reorg_depth(COINBASE_ONLY_DEPTH)?;
+        let source = WalletCanonicalSourceIdentity::from_ready_evidence(following.ready_evidence());
+        Ok(following.into_ready_store(source)?)
+    }
+
+    fn next_retained_event(
+        secondary: &RocksDbCanonicalSecondary,
+        wallet: &RocksDbWalletStore,
+    ) -> Result<CanonicalRetainedEvent, Box<dyn std::error::Error>> {
+        let source = WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
+        let cursor = source.source_position().event_cursor.as_bytes();
+        let events = secondary.canonical_event_history(CanonicalEventHistoryRequest::new(
+            Some(&cursor),
+            NonZeroU32::MIN,
+        ))?;
+        Ok(*events
+            .first()
+            .ok_or("no retained canonical event follows the wallet cursor")?)
+    }
+
+    fn apply_next_coinbase_only_event(
+        wallet: &mut RocksDbWalletStore,
+        secondary: &RocksDbCanonicalSecondary,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let event = next_retained_event(secondary, wallet)?;
+        let fence = event.resulting_fence();
+        let source = WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
+        wallet.apply_canonical_event_range(
+            source,
+            event,
+            fence,
+            coinbase_only_settled_tip(fence.visible_tip().height),
+            test_transition_logical_byte_limit(),
+            secondary.scan_canonical_replay_range(event.committed_range())?,
+        )?;
+        Ok(())
+    }
+
+    fn reconcile_next_coinbase_only_event(
+        wallet: &mut RocksDbWalletStore,
+        secondary: &RocksDbCanonicalSecondary,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let event = next_retained_event(secondary, wallet)?;
+        let fence = event.resulting_fence();
+        let source = WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence());
+        let replay_range = event.committed_range();
+        wallet.reconcile_canonical_event_sequence(
+            source,
+            &[event],
+            fence,
+            coinbase_only_settled_tip(fence.visible_tip().height),
+            None,
+            replay_range,
+            test_transition_logical_byte_limit(),
+            secondary.scan_canonical_replay_range(replay_range)?,
+        )?;
+        Ok(())
     }
 }
