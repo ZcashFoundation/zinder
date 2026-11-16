@@ -46,7 +46,10 @@ const ZINGOLIB_UPGRADE_CEILING: &str = "NU6.2";
 const ZINGOLIB_BIRTHDAY: u64 = 1;
 const ZINGOLIB_CONFIRMATION_BLOCKS: u32 = 3;
 const MEMPOOL_OBSERVE_TIMEOUT: Duration = Duration::from_secs(20);
-const WALLET_SERVING_READY_TIMEOUT: Duration = Duration::from_secs(20);
+// Publication can lag a mined block by up to the one-minute retention window
+// plus the 30-second released-pair read limit, once more than three blocks
+// arrive within a minute. The flow mines two bursts close together.
+const WALLET_SERVING_READY_TIMEOUT: Duration = Duration::from_mins(2);
 const PUBLIC_REGTEST_TEST_VECTOR_SEED: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
 
 #[tokio::test(flavor = "multi_thread")]
