@@ -404,22 +404,26 @@ fn relink_inputs(
     let mut bytes = spender
         .zcash_serialize_to_vec()
         .map_err(|source| fork_error(height, &source.to_string()))?;
+    // Inputs serialize in spend order, so each search resumes after the
+    // previous match and the transaction is scanned once. A match outside an
+    // input leaves the real input unpatched, which the check below rejects.
+    let mut cursor = 0;
     for (outpoint, new_hash) in &relinks {
         let mut serialized = [0_u8; OUTPOINT_BYTES];
         serialized[..32].copy_from_slice(&outpoint.hash.0);
         serialized[32..].copy_from_slice(&outpoint.index.to_le_bytes());
-        let mut positions = bytes
-            .windows(OUTPOINT_BYTES)
-            .enumerate()
-            .filter(|(_, window)| *window == serialized)
-            .map(|(position, _)| position);
-        let (Some(position), None) = (positions.next(), positions.next()) else {
-            return Err(fork_error(
-                height,
-                "a spent outpoint does not occur exactly once in its transaction",
-            ));
-        };
+        let position = bytes
+            .get(cursor..)
+            .and_then(|rest| {
+                rest.windows(OUTPOINT_BYTES)
+                    .position(|window| window == serialized)
+            })
+            .map(|offset| cursor + offset)
+            .ok_or_else(|| {
+                fork_error(height, "a spent outpoint is missing from its transaction")
+            })?;
         bytes[position..position + 32].copy_from_slice(&new_hash.0);
+        cursor = position + OUTPOINT_BYTES;
         *relinked_inputs += 1;
     }
     let relinked = Transaction::zcash_deserialize(bytes.as_slice())
@@ -443,4 +447,74 @@ fn fork_error(height: BlockHeight, reason: &str) -> BenchError {
         "cannot fork fixture block {}: {reason}",
         height.value()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use sha2::{Digest, Sha256};
+    use zebra_chain::{
+        serialization::ZcashDeserialize,
+        transaction::{self, Transaction},
+    };
+    use zinder_core::BlockHeight;
+
+    use super::{Renames, relink_inputs};
+
+    /// Enough inputs that rescanning the whole transaction once per input
+    /// outlasts the test runner's kill window.
+    const DENSE_SPEND_INPUTS: u16 = 10_000;
+
+    #[test]
+    fn relinks_every_input_of_a_dense_spend() -> Result<(), Box<dyn std::error::Error>> {
+        let spent: Vec<transaction::Hash> = (0..DENSE_SPEND_INPUTS)
+            .map(|index| transaction::Hash(Sha256::digest(index.to_le_bytes()).into()))
+            .collect();
+        let renames: Renames = spent
+            .iter()
+            .map(|hash| {
+                let mut renamed = hash.0;
+                renamed[0] ^= 0xff;
+                (*hash, transaction::Hash(renamed))
+            })
+            .collect();
+        let spender = Transaction::zcash_deserialize(version_1_spend(&spent).as_slice())?;
+
+        let mut relinked_inputs = 0;
+        let relinked = relink_inputs(
+            BlockHeight::new(1),
+            &spender,
+            |txid| renames.get(txid).copied(),
+            &mut relinked_inputs,
+        )?
+        .ok_or("every input spends a renamed output")?;
+
+        assert_eq!(relinked_inputs, u32::from(DENSE_SPEND_INPUTS));
+        assert!(
+            relinked
+                .spent_outpoints()
+                .map(|outpoint| (outpoint.hash, outpoint.index))
+                .eq(spent
+                    .iter()
+                    .map(|hash| (renames.get(hash).copied().unwrap_or(*hash), 0)))
+        );
+        Ok(())
+    }
+
+    /// A version 1 transaction that spends output 0 of each of `spent`.
+    fn version_1_spend(spent: &[transaction::Hash]) -> Vec<u8> {
+        let mut bytes = 1_u32.to_le_bytes().to_vec();
+        bytes.push(0xfd);
+        bytes.extend_from_slice(&u16::try_from(spent.len()).unwrap_or(u16::MAX).to_le_bytes());
+        for hash in spent {
+            bytes.extend_from_slice(&hash.0);
+            bytes.extend_from_slice(&0_u32.to_le_bytes());
+            bytes.push(0);
+            bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        }
+        bytes.push(1);
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes
+    }
 }
