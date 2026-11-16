@@ -1,0 +1,6 @@
+kind: fixed
+body: x86-64 release binaries now build identically on any build machine. v0.16.2 was tagged but never published, because its two x86-64 release builds differed, so its wallet-serving fix for table files deleted by compaction first ships in this release.
+time: 2026-11-16T23:26:08.610482102Z
+custom:
+    Bump: patch
+    PR: "233"
