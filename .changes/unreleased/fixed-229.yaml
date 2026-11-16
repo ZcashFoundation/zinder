@@ -1,0 +1,6 @@
+kind: fixed
+body: Wallet serving now replaces a reader whose table file the writer's compaction deleted and retries the read, instead of answering `STORAGE_UNAVAILABLE` until the next block. The new `zinder_wallet_serving_missing_table_file_pairs_total` metric counts each replacement.
+time: 2026-11-16T19:44:17.576236473Z
+custom:
+    Bump: patch
+    PR: "229"
