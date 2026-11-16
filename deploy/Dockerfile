@@ -298,7 +298,9 @@ EXPOSE 9102 9106
 # The start period covers the entrypoint's default canonical, wallet, and
 # serving deadlines, which together run to five and a half hours. A parked
 # canonical writer counts as healthy: query then refuses wallets with the typed
-# REORG_WINDOW_EXCEEDED halt, and the entrypoint keeps that refusal up.
+# REORG_WINDOW_EXCEEDED halt, and the entrypoint keeps that refusal up. A
+# projector parked on a wallet transition over its logical-byte limit counts
+# as healthy too, because restarting only parks it on the same transition.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=6h --retries=3 \
     CMD ["zinder-wallet-serving-healthcheck"]
 

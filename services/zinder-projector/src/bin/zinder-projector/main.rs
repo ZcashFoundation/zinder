@@ -38,11 +38,15 @@ use zinder_wallet_rocksdb::{
 mod canonical_writer_control;
 mod config;
 mod following_readiness;
+mod parked_following;
 mod projector_control;
 
 use canonical_writer_control::{CanonicalRetentionLease, CanonicalWriterControlClient};
 use config::{ProjectorConfigOverrides, ProjectorError};
 use following_readiness::FollowingReadiness;
+use parked_following::{
+    ParkedFollowing, ParkedLease, RefusedTransition, park_on_refused_transition,
+};
 use projector_control::{
     ProjectorControlCommand, ProjectorControlGrpcAdapter, projector_control_channel,
 };
@@ -312,6 +316,8 @@ async fn run_owned_projector(
                     event_sequence = wallet_source.source_position().event_sequence,
                     "resuming wallet projection from its persisted authenticated cursor"
                 );
+                let control =
+                    ProjectorControlTasks::start(&config.projector_control, &cancel).await?;
                 return run_continuous_wallet_following(
                     config,
                     readiness,
@@ -320,6 +326,7 @@ async fn run_owned_projector(
                     canonical_control,
                     wallet,
                     canonical_lease,
+                    control,
                 )
                 .await;
             }
@@ -334,7 +341,7 @@ async fn run_owned_projector(
                     first_retained_event_sequence,
                     "bootstrapping following from the one retained event after the persisted wallet cursor"
                 );
-                return bootstrap_resumed_wallet_following(
+                return Box::pin(bootstrap_resumed_wallet_following(
                     config,
                     readiness,
                     cancel,
@@ -342,7 +349,7 @@ async fn run_owned_projector(
                     canonical_control,
                     wallet,
                     first_retained_event_sequence,
-                )
+                ))
                 .await;
             }
         }
@@ -532,6 +539,7 @@ async fn run_owned_projector(
         build_seconds = report.phase_durations.total.as_secs_f64(),
         "wallet projection constructed, cold-validated, and entering continuous following"
     );
+    let control = ProjectorControlTasks::start(&config.projector_control, &cancel).await?;
     run_continuous_wallet_following(
         config,
         readiness,
@@ -540,6 +548,7 @@ async fn run_owned_projector(
         canonical_control,
         wallet,
         canonical_lease,
+        control,
     )
     .await
 }
@@ -561,8 +570,8 @@ async fn run_continuous_wallet_following(
     mut canonical_control: CanonicalWriterControlClient,
     mut wallet: RocksDbWalletFollowingStore,
     mut canonical_lease: CanonicalRetentionLease,
+    mut control: ProjectorControlTasks,
 ) -> Result<(), ProjectorError> {
-    let mut control = ProjectorControlTasks::start(&config.projector_control, &cancel).await?;
     let mut following_readiness = FollowingReadiness::for_wallet(
         readiness,
         WalletCanonicalSourceIdentity::from_ready_evidence(wallet.ready_evidence())
@@ -686,16 +695,7 @@ async fn run_continuous_wallet_following(
                 continue;
             }
             Ok(RetainedEventPageValidation::Events(events)) => events,
-            Err(ProjectorError::CanonicalEventCursorExpired {
-                wallet_event_sequence,
-                oldest_retained_event_sequence,
-            }) => {
-                return Err(ProjectorError::WalletRebuildRequired {
-                    wallet_event_sequence,
-                    oldest_retained_event_sequence,
-                });
-            }
-            Err(error) => return Err(error),
+            Err(error) => return Err(rebuild_required_for_expired_cursor(error)),
         };
         let transition = plan_next_wallet_transition(&canonical, &retained_events)?;
         renew_following_retention_lease_for_transition(
@@ -705,7 +705,8 @@ async fn run_continuous_wallet_following(
             config.lease_duration,
         )
         .await?;
-        let Some(reconciled_source) = apply_next_wallet_transition(
+        let resulting_fence = transition.resulting_fence();
+        let reconciled_source = match apply_next_wallet_transition(
             &mut wallet,
             &canonical,
             wallet_source,
@@ -713,9 +714,39 @@ async fn run_continuous_wallet_following(
             config.reorg_window_blocks,
             config.follow.max_transition_logical_bytes,
             &cancel,
-        )?
-        else {
-            return Ok(());
+        ) {
+            Ok(Some(reconciled_source)) => reconciled_source,
+            Ok(None) => return Ok(()),
+            Err(ProjectorError::WalletTransitionLogicalByteLimit {
+                limit_bytes,
+                required_bytes,
+            }) => {
+                match Box::pin(park_on_refused_transition(
+                    config,
+                    readiness,
+                    &cancel,
+                    &mut canonical,
+                    &mut canonical_control,
+                    &mut control,
+                    ParkedLease {
+                        lease: &mut canonical_lease,
+                        anchor: wallet_source,
+                    },
+                    wallet_source,
+                    RefusedTransition {
+                        resulting_fence,
+                        required_bytes,
+                        limit_bytes,
+                    },
+                    writer_fence.writer_tip_height(),
+                ))
+                .await?
+                {
+                    ParkedFollowing::Cancelled => return Ok(()),
+                    ParkedFollowing::TransitionChanged => continue,
+                }
+            }
+            Err(error) => return Err(error),
         };
         following_readiness.wallet_advanced(reconciled_source.source_position().tip.height.value());
         canonical_lease = advance_retention_lease_anchor(
@@ -742,10 +773,7 @@ impl ProjectorControlTasks {
         cancel: &CancellationToken,
     ) -> Result<Self, ProjectorError> {
         let Some(listen_addr) = config.listen_addr else {
-            return Ok(Self {
-                commands: None,
-                server: None,
-            });
+            return Ok(Self::disabled());
         };
         let Some(bearer_token) = config.bearer_token.clone() else {
             return Err(ProjectorError::ProjectorControlTokenMissing);
@@ -772,6 +800,15 @@ impl ProjectorControlTasks {
             commands: Some(commands),
             server: Some(server),
         })
+    }
+
+    /// Returns tasks without an owner-control listener, which only pace the
+    /// follow loop's polling.
+    const fn disabled() -> Self {
+        Self {
+            commands: None,
+            server: None,
+        }
     }
 
     fn require_running(&self, cancel: &CancellationToken) -> Result<(), ProjectorError> {
@@ -985,16 +1022,7 @@ async fn bootstrap_resumed_wallet_following(
                 continue;
             }
             Ok(RetainedEventPageValidation::Events(events)) => events,
-            Err(ProjectorError::CanonicalEventCursorExpired {
-                wallet_event_sequence,
-                oldest_retained_event_sequence,
-            }) => {
-                return Err(ProjectorError::WalletRebuildRequired {
-                    wallet_event_sequence,
-                    oldest_retained_event_sequence,
-                });
-            }
-            Err(error) => return Err(error),
+            Err(error) => return Err(rebuild_required_for_expired_cursor(error)),
         };
         let bootstrap_source = bootstrap_first_retained_event_source(
             &canonical,
@@ -1013,6 +1041,9 @@ async fn bootstrap_resumed_wallet_following(
         }
     };
 
+    // Bound before the bootstrap can park, so a parked bootstrap refuses
+    // captures; continuous following inherits this listener.
+    let mut control = ProjectorControlTasks::start(&config.projector_control, &cancel).await?;
     loop {
         if cancel.is_cancelled() {
             return Ok(());
@@ -1049,16 +1080,7 @@ async fn bootstrap_resumed_wallet_following(
                 continue;
             }
             Ok(RetainedEventPageValidation::Events(events)) => events,
-            Err(ProjectorError::CanonicalEventCursorExpired {
-                wallet_event_sequence,
-                oldest_retained_event_sequence,
-            }) => {
-                return Err(ProjectorError::WalletRebuildRequired {
-                    wallet_event_sequence,
-                    oldest_retained_event_sequence,
-                });
-            }
-            Err(error) => return Err(error),
+            Err(error) => return Err(rebuild_required_for_expired_cursor(error)),
         };
         let bootstrap_source = bootstrap_first_retained_event_source(
             &canonical,
@@ -1075,7 +1097,8 @@ async fn bootstrap_resumed_wallet_following(
             config.lease_duration,
         )
         .await?;
-        let Some(reconciled_source) = apply_next_wallet_transition(
+        let resulting_fence = transition.resulting_fence();
+        let reconciled_source = match apply_next_wallet_transition(
             &mut wallet,
             &canonical,
             wallet_source,
@@ -1083,9 +1106,39 @@ async fn bootstrap_resumed_wallet_following(
             config.reorg_window_blocks,
             config.follow.max_transition_logical_bytes,
             &cancel,
-        )?
-        else {
-            return Ok(());
+        ) {
+            Ok(Some(reconciled_source)) => reconciled_source,
+            Ok(None) => return Ok(()),
+            Err(ProjectorError::WalletTransitionLogicalByteLimit {
+                limit_bytes,
+                required_bytes,
+            }) => {
+                match Box::pin(park_on_refused_transition(
+                    config,
+                    readiness,
+                    &cancel,
+                    &mut canonical,
+                    &mut canonical_control,
+                    &mut control,
+                    ParkedLease {
+                        lease: &mut bootstrap_lease,
+                        anchor: bootstrap_source,
+                    },
+                    wallet_source,
+                    RefusedTransition {
+                        resulting_fence,
+                        required_bytes,
+                        limit_bytes,
+                    },
+                    writer_fence.writer_tip_height(),
+                ))
+                .await?
+                {
+                    ParkedFollowing::Cancelled => return Ok(()),
+                    ParkedFollowing::TransitionChanged => continue,
+                }
+            }
+            Err(error) => return Err(error),
         };
         let canonical_lease = advance_retention_lease_anchor(
             &mut canonical_control,
@@ -1102,6 +1155,7 @@ async fn bootstrap_resumed_wallet_following(
             canonical_control,
             wallet,
             canonical_lease,
+            control,
         )
         .await;
     }
@@ -1935,6 +1989,22 @@ async fn fetch_retained_event_page_to_target(
     let local_events = canonical
         .canonical_event_history(CanonicalEventHistoryRequest::new(Some(&cursor), page_limit))?;
     validate_one_retained_event_page(&page, local_events, wallet_source, target_fence)
+}
+
+/// Reports a wallet cursor the writer no longer retains as a side-by-side
+/// rebuild requirement, and passes every other page failure through.
+fn rebuild_required_for_expired_cursor(error: ProjectorError) -> ProjectorError {
+    if let ProjectorError::CanonicalEventCursorExpired {
+        wallet_event_sequence,
+        oldest_retained_event_sequence,
+    } = error
+    {
+        return ProjectorError::WalletRebuildRequired {
+            wallet_event_sequence,
+            oldest_retained_event_sequence,
+        };
+    }
+    error
 }
 
 /// Validates one remote `EventPage` against retained local-secondary rows.
@@ -3133,40 +3203,7 @@ mod tests {
             let canonical_path = temporary.path().join("canonical");
             // Wide enough to keep the baseline block settled across the burst.
             let reorg_policy = CanonicalReorgPolicy::new(16)?;
-            let block_one = empty_canonical_block(
-                1,
-                zinder_core::Network::ZcashRegtest.genesis_hash().as_bytes(),
-                [0x11; 32],
-            );
-            let block_one_id = BlockId::new(
-                block_one.facts.block_header.height,
-                block_one.facts.block_header.block_hash,
-            );
-            let mut builder = RocksDbCanonicalBuilder::create_fresh(
-                &canonical_path,
-                CanonicalStoreWorkload::Wallet,
-                CanonicalStoreBuildPlan::complete(
-                    &activations,
-                    0,
-                    block_one_id,
-                    RawBlobRetention::Transactions,
-                    reorg_policy,
-                )?,
-                RocksDbResourceBudget::for_local_tests(),
-            )?;
-            builder.bulk_load_blocks([Ok::<_, std::convert::Infallible>(block_one)])?;
-            builder.load_subtree_roots(std::iter::empty())?;
-            builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
-                block_one_id,
-                1,
-                regtest_checkpoint_frontiers_at(BlockHeight::new(1)),
-            ))?;
-            let validated = builder.prepare_cold_certified_publication()?;
-            let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
-                block_one_id,
-                UnixTimestampMillis::new(1),
-            ))?;
-            let mut writer = validated.publish_baseline(publication)?;
+            let (mut writer, block_one_id) = baseline_writer(&canonical_path, reorg_policy)?;
             let baseline_fence = writer.event_fence();
             let mut next_height = 2;
             writer = append_empty_blocks(writer, &mut next_height, caught_up_blocks, block_one_id)?;
@@ -3229,6 +3266,49 @@ mod tests {
         }
     }
 
+    /// Publishes a Regtest canonical writer whose only block is an empty
+    /// block one, and returns it with that block's identity.
+    pub(super) fn baseline_writer(
+        canonical_path: &std::path::Path,
+        reorg_policy: CanonicalReorgPolicy,
+    ) -> Result<(RocksDbCanonicalStore, BlockId), Box<dyn std::error::Error>> {
+        let activations = zinder_testkit::sample_regtest_upgrade_activations();
+        let block_one = empty_canonical_block(
+            1,
+            zinder_core::Network::ZcashRegtest.genesis_hash().as_bytes(),
+            [0x11; 32],
+        );
+        let block_one_id = BlockId::new(
+            block_one.facts.block_header.height,
+            block_one.facts.block_header.block_hash,
+        );
+        let mut builder = RocksDbCanonicalBuilder::create_fresh(
+            canonical_path,
+            CanonicalStoreWorkload::Wallet,
+            CanonicalStoreBuildPlan::complete(
+                &activations,
+                0,
+                block_one_id,
+                RawBlobRetention::Transactions,
+                reorg_policy,
+            )?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        builder.bulk_load_blocks([Ok::<_, std::convert::Infallible>(block_one)])?;
+        builder.load_subtree_roots(std::iter::empty())?;
+        builder.confirm_source_tip_checkpoint(&CommitmentTreeCheckpoint::new(
+            block_one_id,
+            1,
+            regtest_checkpoint_frontiers_at(BlockHeight::new(1)),
+        ))?;
+        let validated = builder.prepare_cold_certified_publication()?;
+        let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
+            block_one_id,
+            UnixTimestampMillis::new(1),
+        ))?;
+        Ok((validated.publish_baseline(publication)?, block_one_id))
+    }
+
     fn append_empty_blocks(
         mut writer: RocksDbCanonicalStore,
         next_height: &mut u32,
@@ -3263,7 +3343,7 @@ mod tests {
     }
 
     /// Encodes a retained event the way the writer's `EventPage` does.
-    fn writer_retained_event(
+    pub(super) fn writer_retained_event(
         event: CanonicalRetainedEvent,
     ) -> zinder_proto::v1::ingest::CanonicalRetainedEvent {
         let range = |range: BlockHeightRange| CanonicalEventBlockRange {
@@ -3284,7 +3364,7 @@ mod tests {
         }
     }
 
-    fn empty_canonical_block(
+    pub(super) fn empty_canonical_block(
         height: u32,
         parent_hash: [u8; 32],
         block_hash: [u8; 32],

@@ -410,6 +410,7 @@ fn readiness_sync_lag_blocks(cause: &crate::ReadinessCause) -> f64 {
         | crate::ReadinessCause::StorageUnavailable
         | crate::ReadinessCause::SchemaMismatch
         | crate::ReadinessCause::ReorgWindowExceeded { .. }
+        | crate::ReadinessCause::WalletTransitionLimitExceeded { .. }
         | crate::ReadinessCause::ReplicaLagging { .. }
         | crate::ReadinessCause::ServingPairStale { .. }
         | crate::ReadinessCause::WriterStatusUnavailable
@@ -435,6 +436,7 @@ fn readiness_replica_lag_chain_epochs(cause: &crate::ReadinessCause) -> f64 {
         | crate::ReadinessCause::StorageUnavailable
         | crate::ReadinessCause::SchemaMismatch
         | crate::ReadinessCause::ReorgWindowExceeded { .. }
+        | crate::ReadinessCause::WalletTransitionLimitExceeded { .. }
         | crate::ReadinessCause::WriterStatusUnavailable
         | crate::ReadinessCause::IngestControlUnavailable
         | crate::ReadinessCause::CanonicalTipUnconfirmed

@@ -36,6 +36,7 @@ zinder-wallet-rocksdb.workspace = true
 
 [dev-dependencies]
 eyre.workspace = true
+parking_lot.workspace = true
 tempfile.workspace = true
 zinder-testkit.workspace = true
 

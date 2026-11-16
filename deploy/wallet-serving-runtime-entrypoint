@@ -115,7 +115,9 @@ probe_connect_seconds=""
 probe_failure_class=""
 probe_report=""
 probe_halted=0
+probe_parked=0
 writer_halt_reported=0
+projector_park_reported=0
 
 # curl writes the status code and connect time after the body; a newline
 # separates them because JSON escapes newlines inside strings.
@@ -344,6 +346,64 @@ readiness_cause_is_writer_halt() {
   esac
 }
 
+# A projector that refused a wallet transition over its logical-byte limit
+# stays parked until an operator raises the limit and restarts it, but the
+# topology is still doing its job: ingest keeps the canonical store current,
+# and the projector keeps its retention lease. A query already running keeps
+# answering wallets from its last pair until that pair goes stale, then
+# refuses them with SERVICE_NOT_READY. Restarting would only plan the same
+# refused transition again, so a parked projector counts as serving.
+readiness_cause_is_projector_park() {
+  case "$1" in
+    wallet_transition_limit_exceeded)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Query publishes a pair only once the wallet reaches the canonical fence, so
+# behind a parked projector its refusal is the park's. Given whether the
+# projector is parked, succeeds when the query plane just probed answered
+# unready behind it. A query plane that stops answering still counts as
+# unready.
+query_unready_behind_projector_park() {
+  [ "$1" -eq 1 ] && [ -n "$probe_http_status" ]
+}
+
+# Starts query and waits for it to admit traffic, unless the projector probe
+# that ended its startup wait reported the park. Query's startup fails closed
+# until it converges a serving pair, which a parked wallet never reaches, so
+# query would exit and restart the container into the same park. The
+# container instead stays up without query until the serving loop sees the
+# projector leave the park.
+start_wallet_serving() {
+  if readiness_cause_is_projector_park "$probe_cause"; then
+    log "zinder-query was not started: it cannot publish a serving pair behind the parked projector, so wallets are refused until an operator raises ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES and redeploys: $probe_report"
+    projector_park_reported=1
+    return 0
+  fi
+
+  log "starting wallet serving"
+  start_runtime_process /usr/local/bin/zinder-query /etc/zinder/query.toml \
+    "$query_config_paths"
+  query_pid="$!"
+  await_readiness zinder-query "$query_ops_addr" "$wallet_serving_deadline_seconds"
+  log "wallet serving is ready"
+}
+
+# Given whether the projector reported its park, whether it was unreachable,
+# and its report, fails once it answers with any other state while startup
+# left query stopped behind the park. The container then restarts, and startup
+# brings query up behind the moving wallet.
+require_projector_park_for_stopped_query() {
+  if [ "$1" -eq 0 ] && [ "$2" -eq 0 ]; then
+    fail "zinder-projector no longer reports the wallet transition park; restarting so zinder-query starts behind it: $3"
+  fi
+}
+
 assert_started_processes_alive() {
   if [ -n "$ingest_pid" ] && ! kill -0 "$ingest_pid" 2>/dev/null; then
     fail "zinder-ingest exited"
@@ -379,6 +439,10 @@ await_readiness() {
       log "$role serves the canonical writer halt; continuing so wallets receive the typed refusal: $probe_report"
       return 0
     fi
+    if readiness_cause_is_projector_park "$probe_cause"; then
+      log "$role is parked on a wallet transition over its logical-byte limit; continuing so the topology stays up: $probe_report"
+      return 0
+    fi
 
     if readiness_cause_is_terminal "$probe_cause"; then
       fail "$role reports $probe_cause, which no amount of waiting clears: $probe_report"
@@ -397,20 +461,26 @@ await_readiness() {
   done
 }
 
-# Returns zero while the plane admits traffic or serves the canonical writer
-# halt, and sets `probe_halted` for the latter. Returns non-zero for every
-# other unready cause, so the caller can time how long it persists.
+# Returns zero while the plane admits traffic, serves the canonical writer
+# halt, or reports the projector park, and sets `probe_halted` or
+# `probe_parked` for the latter two. Returns non-zero for every other unready
+# cause, so the caller can time how long it persists.
 observe_plane_readiness() {
   role="$1"
   ops_addr="$2"
 
   probe_halted=0
+  probe_parked=0
   probe_readiness "$ops_addr"
   if [ "$probe_http_status" = "200" ]; then
     return 0
   fi
   if readiness_cause_is_writer_halt "$probe_cause"; then
     probe_halted=1
+    return 0
+  fi
+  if readiness_cause_is_projector_park "$probe_cause"; then
+    probe_parked=1
     return 0
   fi
   if readiness_cause_is_terminal "$probe_cause"; then
@@ -639,13 +709,7 @@ projector_pid="$!"
 await_readiness zinder-projector "$projector_ops_addr" \
   "$wallet_construction_deadline_seconds"
 
-log "starting wallet serving"
-start_runtime_process /usr/local/bin/zinder-query /etc/zinder/query.toml \
-  "$query_config_paths"
-query_pid="$!"
-await_readiness zinder-query "$query_ops_addr" "$wallet_serving_deadline_seconds"
-
-log "wallet serving is ready"
+start_wallet_serving
 
 startup_completed_epoch="$(date +%s)"
 ingest_flap_ready_since_epoch="$startup_completed_epoch"
@@ -658,7 +722,13 @@ query_flap_ready_since_epoch="$startup_completed_epoch"
 # signal that liveness cannot. A canonical writer parked on an oversized reorg
 # is the exception: its planes report `reorg_window_exceeded`, query refuses
 # wallets with the typed status, and the container keeps that refusal up
-# instead of restarting into the same park.
+# instead of restarting into the same park. A projector parked on a wallet
+# transition over its logical-byte limit is the other: it reports
+# `wallet_transition_limit_exceeded`, query's answered refusals behind it
+# count as serving, and the container stays up for the same reason. When
+# startup left query stopped behind that park, the container restarts once
+# the projector answers with any other state, so startup brings query up
+# behind the moving wallet.
 unready_since_epoch=0
 
 while true; do
@@ -692,17 +762,27 @@ while true; do
     projector_unreachable=1
   fi
   plane_halted=$((plane_halted | probe_halted))
+  projector_parked="$probe_parked"
 
   query_ready=0
-  if observe_plane_readiness zinder-query "$query_ops_addr"; then
-    query_ready=1
-  fi
-  query_report="$probe_report"
   query_unreachable=0
-  if [ -z "$probe_http_status" ]; then
-    query_unreachable=1
+  if [ -z "$query_pid" ]; then
+    require_projector_park_for_stopped_query "$projector_parked" \
+      "$projector_unreachable" "$projector_report"
+    query_ready=1
+    query_report="not started behind the parked projector"
+  else
+    if observe_plane_readiness zinder-query "$query_ops_addr"; then
+      query_ready=1
+    elif query_unready_behind_projector_park "$projector_parked"; then
+      query_ready=1
+    fi
+    query_report="$probe_report"
+    if [ -z "$probe_http_status" ]; then
+      query_unreachable=1
+    fi
+    plane_halted=$((plane_halted | probe_halted))
   fi
-  plane_halted=$((plane_halted | probe_halted))
 
   if [ "$plane_halted" -eq 1 ] && [ "$writer_halt_reported" -eq 0 ]; then
     log "the canonical writer is parked on a reorg deeper than its window; wallets receive REORG_WINDOW_EXCEEDED until an operator reconciles the canonical store: $ingest_report"
@@ -710,6 +790,14 @@ while true; do
   elif [ "$plane_halted" -eq 0 ] && [ "$writer_halt_reported" -eq 1 ]; then
     log "no plane reports the canonical writer halt any longer"
     writer_halt_reported=0
+  fi
+
+  if [ "$projector_parked" -eq 1 ] && [ "$projector_park_reported" -eq 0 ]; then
+    log "zinder-projector is parked on a wallet transition over projector.follow.max_transition_logical_bytes; wallets receive SERVICE_NOT_READY once query's last pair goes stale, until an operator raises ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES and redeploys: $projector_report"
+    projector_park_reported=1
+  elif [ "$projector_parked" -eq 0 ] && [ "$projector_park_reported" -eq 1 ]; then
+    log "zinder-projector no longer reports the wallet transition park"
+    projector_park_reported=0
   fi
 
   # shellcheck disable=SC2046 # word-splitting the fixed-width numeric fields update_plane_recurrence prints is intentional; see its own comment.

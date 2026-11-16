@@ -155,7 +155,7 @@ pub(crate) enum ProjectorError {
     },
 
     #[error(
-        "wallet following stopped planning a transition that already needs {required_bytes} logical bytes, more than projector.follow.max_transition_logical_bytes (ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES) allows ({limit_bytes}), and the complete transition may need more; the wallet is unchanged and restarting with the same setting fails again, so raise it well above {required_bytes}, up to the maximum of {MAX_FOLLOW_MAX_TRANSITION_LOGICAL_BYTES} bytes, with matching memory headroom for the projector, or, if it is already at the maximum, rebuild the wallet in a separately provisioned side-by-side lane"
+        "wallet following stopped planning a transition that already needs {required_bytes} logical bytes, more than projector.follow.max_transition_logical_bytes (ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES) allows ({limit_bytes}), and the complete transition may need more; the wallet is unchanged and the projector stays parked, not ready, until it restarts with a larger setting, so raise it well above {required_bytes}, up to the maximum of {MAX_FOLLOW_MAX_TRANSITION_LOGICAL_BYTES} bytes, with matching memory headroom for the projector, or, if it is already at the maximum, rebuild the wallet in a separately provisioned side-by-side lane"
     )]
     WalletTransitionLogicalByteLimit {
         /// Configured logical-byte ceiling for one following transition.
@@ -899,6 +899,8 @@ mod tests {
         assert!(message.contains("536870913"));
         assert!(message.contains("1073741824"));
         assert!(message.contains("the wallet is unchanged"));
+        assert!(message.contains("stays parked"));
+        assert!(!message.contains("fails again"));
         assert!(message.contains("side-by-side"));
     }
 

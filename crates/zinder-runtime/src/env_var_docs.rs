@@ -1178,8 +1178,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       and final value in the plan and again in the write batch, and the \
                       control record counts once. Must be greater than zero and at most \
                       1073741824. Defaults to 536870912. A transition that needs more leaves \
-                      the wallet unchanged and stops the projector with an error that names \
-                      this setting; see [Wallet transition exceeds its logical-byte \
+                      the wallet unchanged and parks the projector, not ready, with \
+                      `wallet_transition_limit_exceeded` until it restarts with a larger \
+                      value; see [Wallet transition exceeds its logical-byte \
                       limit](../runbooks/deploying-wallet-serving.md#wallet-transition-exceeds-its-logical-byte-limit).",
     },
     EnvVarDoc {

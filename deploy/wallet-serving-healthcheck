@@ -4,19 +4,25 @@
 #
 # Healthy means the native query surface answers wallets usefully: it is ready,
 # or it refuses every request with the typed REORG_WINDOW_EXCEEDED halt because
-# the canonical writer is parked. The entrypoint deliberately keeps a parked
-# topology up, so an orchestrator that restarts unhealthy containers must not
-# replace that typed refusal with refused connections.
+# the canonical writer is parked. A projector parked on a wallet transition
+# over its logical-byte limit is healthy too, whether query answers unready
+# behind it or was never started because it cannot publish a serving pair
+# there. The entrypoint deliberately keeps a parked topology up, so an
+# orchestrator that restarts unhealthy containers must not restart it into the
+# same park.
 
 set -u
 
 query_ops_addr="${1:-127.0.0.1:9106}"
+projector_ops_addr="${2:-127.0.0.1:9110}"
 
+# The image HEALTHCHECK allows five seconds in total, which both probes share.
+# An unreachable query falls through to the projector park check.
 readiness_body="$(
-  curl -s --connect-timeout 2 --max-time 4 \
+  curl -s --connect-timeout 2 --max-time 3 \
     -w '\n%{http_code}' \
     "http://$query_ops_addr/readyz"
-)" || exit 1
+)" || readiness_body=""
 
 http_status="${readiness_body##*
 }"
@@ -27,6 +33,17 @@ fi
 
 case "$readiness_body" in
   *'"reorg_window_exceeded"'*)
+    exit 0
+    ;;
+  *) ;;
+esac
+
+projector_body="$(
+  curl -s --connect-timeout 1 --max-time 1 "http://$projector_ops_addr/readyz"
+)" || exit 1
+
+case "$projector_body" in
+  *'"wallet_transition_limit_exceeded"'*)
     exit 0
     ;;
   *)

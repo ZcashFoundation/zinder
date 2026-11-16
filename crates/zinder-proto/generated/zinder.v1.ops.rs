@@ -61,7 +61,10 @@ pub struct ReadinessReport {
 /// malformed.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReadinessCauseDetail {
-    #[prost(oneof = "readiness_cause_detail::Payload", tags = "1, 2, 3, 4, 5, 8, 9, 10")]
+    #[prost(
+        oneof = "readiness_cause_detail::Payload",
+        tags = "1, 2, 3, 4, 5, 8, 9, 10, 11"
+    )]
     pub payload: ::core::option::Option<readiness_cause_detail::Payload>,
 }
 /// Nested message and enum types in `ReadinessCauseDetail`.
@@ -84,6 +87,8 @@ pub mod readiness_cause_detail {
         UpstreamNotReady(super::UpstreamNotReadyDetail),
         #[prost(message, tag = "10")]
         ServingPairStale(super::ServingPairStaleDetail),
+        #[prost(message, tag = "11")]
+        WalletTransitionLimitExceeded(super::WalletTransitionLimitExceededDetail),
     }
 }
 /// Detail for READINESS_CAUSE_SYNCING.
@@ -148,6 +153,21 @@ pub struct ServingPairStaleDetail {
     /// Seconds since the writer last attested the published pair.
     #[prost(uint64, tag = "2")]
     pub staleness_seconds: u64,
+}
+/// Detail for READINESS_CAUSE_WALLET_TRANSITION_LIMIT_EXCEEDED.
+///
+/// Carries the two numbers an operator needs to choose a new limit.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WalletTransitionLimitExceededDetail {
+    /// Logical bytes the refused transition had already accounted when the
+    /// projector stopped planning it. This is a lower bound: the complete
+    /// transition needs at least this many bytes and may need more.
+    #[prost(uint64, tag = "1")]
+    pub required_bytes: u64,
+    /// Configured logical-byte limit for one following transition,
+    /// `projector.follow.max_transition_logical_bytes`.
+    #[prost(uint64, tag = "2")]
+    pub configured_bytes: u64,
 }
 /// Detail for READINESS_CAUSE_NODE_UNAVAILABLE.
 ///
@@ -260,6 +280,11 @@ pub enum ReadinessCause {
     /// its node since it opened the store, so its fence may sit on a branch the
     /// node abandoned. Wallet-serving readers refuse traffic until it does.
     CanonicalTipUnconfirmed = 19,
+    /// The wallet projector refused its next following transition because the
+    /// transition needs more logical bytes than its configured limit allows. It
+    /// stays parked with the wallet unchanged until it restarts with a larger
+    /// limit or a later canonical event changes the transition.
+    WalletTransitionLimitExceeded = 20,
 }
 impl ReadinessCause {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -287,6 +312,9 @@ impl ReadinessCause {
                 "READINESS_CAUSE_INGEST_CONTROL_UNAVAILABLE"
             }
             Self::CanonicalTipUnconfirmed => "READINESS_CAUSE_CANONICAL_TIP_UNCONFIRMED",
+            Self::WalletTransitionLimitExceeded => {
+                "READINESS_CAUSE_WALLET_TRANSITION_LIMIT_EXCEEDED"
+            }
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -316,6 +344,9 @@ impl ReadinessCause {
             }
             "READINESS_CAUSE_CANONICAL_TIP_UNCONFIRMED" => {
                 Some(Self::CanonicalTipUnconfirmed)
+            }
+            "READINESS_CAUSE_WALLET_TRANSITION_LIMIT_EXCEEDED" => {
+                Some(Self::WalletTransitionLimitExceeded)
             }
             _ => None,
         }

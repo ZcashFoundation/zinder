@@ -131,6 +131,18 @@ pub enum ReadinessCause {
         #[serde(skip_serializing_if = "Option::is_none")]
         covered: Option<u64>,
     },
+    /// The wallet projector refused its next following transition because it
+    /// needs more logical bytes than `projector.follow.max_transition_logical_bytes`
+    /// allows. The projector stays parked with the wallet unchanged until it
+    /// restarts with a larger limit or a later canonical event changes the
+    /// transition.
+    WalletTransitionLimitExceeded {
+        /// Logical bytes the transition had accounted when it was refused, a
+        /// lower bound on what the complete transition needs.
+        required_bytes: u64,
+        /// Configured logical-byte limit for one following transition.
+        configured_bytes: u64,
+    },
     /// A `RocksDB` secondary reader is behind the primary beyond the configured threshold.
     ReplicaLagging {
         /// Chain-epoch distance between the writer and this secondary reader.
@@ -326,6 +338,7 @@ impl ReadinessCause {
         "storage_unavailable",
         "schema_mismatch",
         "reorg_window_exceeded",
+        "wallet_transition_limit_exceeded",
         "replica_lagging",
         "serving_pair_stale",
         "writer_status_unavailable",
@@ -348,6 +361,7 @@ impl ReadinessCause {
             Self::StorageUnavailable => "storage_unavailable",
             Self::SchemaMismatch => "schema_mismatch",
             Self::ReorgWindowExceeded { .. } => "reorg_window_exceeded",
+            Self::WalletTransitionLimitExceeded { .. } => "wallet_transition_limit_exceeded",
             Self::ReplicaLagging { .. } => "replica_lagging",
             Self::ServingPairStale { .. } => "serving_pair_stale",
             Self::WriterStatusUnavailable => "writer_status_unavailable",
@@ -377,6 +391,7 @@ impl ReadinessCause {
             | Self::StorageUnavailable
             | Self::SchemaMismatch
             | Self::ReorgWindowExceeded { .. }
+            | Self::WalletTransitionLimitExceeded { .. }
             | Self::ReplicaLagging { .. }
             | Self::ServingPairStale { .. }
             | Self::WriterStatusUnavailable
@@ -763,6 +778,31 @@ impl ReadinessState {
         }
     }
 
+    /// Returns the state of a wallet projector parked on a following
+    /// transition over its logical-byte limit.
+    ///
+    /// `required_bytes` is the lower bound the refused transition had
+    /// accounted, `configured_bytes` the limit it exceeded. `current_height`
+    /// carries the unchanged wallet tip and `target_height` the writer tip
+    /// the wallet cannot reach.
+    #[must_use]
+    pub const fn wallet_transition_limit_exceeded(
+        required_bytes: u64,
+        configured_bytes: u64,
+        current_height: Option<u32>,
+        target_height: Option<u32>,
+    ) -> Self {
+        Self {
+            cause: ReadinessCause::WalletTransitionLimitExceeded {
+                required_bytes,
+                configured_bytes,
+            },
+            current_height,
+            target_height,
+            phase: None,
+        }
+    }
+
     /// Returns a node-capability-missing state.
     ///
     /// `capability` is the stable diagnostic name of the missing capability,
@@ -887,6 +927,9 @@ impl From<&ReadinessCause> for ops_proto::ReadinessCause {
             ReadinessCause::StorageUnavailable => Self::StorageUnavailable,
             ReadinessCause::SchemaMismatch => Self::SchemaMismatch,
             ReadinessCause::ReorgWindowExceeded { .. } => Self::ReorgWindowExceeded,
+            ReadinessCause::WalletTransitionLimitExceeded { .. } => {
+                Self::WalletTransitionLimitExceeded
+            }
             ReadinessCause::ReplicaLagging { .. } => Self::ReplicaLagging,
             ReadinessCause::ServingPairStale { .. } => Self::ServingPairStale,
             ReadinessCause::WriterStatusUnavailable => Self::WriterStatusUnavailable,
@@ -968,6 +1011,15 @@ impl From<&ReadinessCause> for Option<ops_proto::ReadinessCauseDetail> {
                     depth: *depth,
                     configured: *configured,
                     covered: *covered,
+                },
+            ),
+            ReadinessCause::WalletTransitionLimitExceeded {
+                required_bytes,
+                configured_bytes,
+            } => ops_proto::readiness_cause_detail::Payload::WalletTransitionLimitExceeded(
+                ops_proto::WalletTransitionLimitExceededDetail {
+                    required_bytes: *required_bytes,
+                    configured_bytes: *configured_bytes,
                 },
             ),
             ReadinessCause::ReplicaLagging { lag_chain_epochs } => {
@@ -1376,6 +1428,65 @@ mod tests {
     }
 
     #[test]
+    fn wallet_transition_limit_exceeded_refuses_traffic_and_carries_both_byte_counts()
+    -> Result<(), serde_json::Error> {
+        let readiness = Readiness::new(ReadinessState::wallet_transition_limit_exceeded(
+            541_122_672,
+            536_870_912,
+            Some(4_602_673),
+            Some(4_602_680),
+        ));
+        let report = readiness.report();
+        assert!(!report.is_ready);
+        assert_eq!(report.current_height, Some(4_602_673));
+        assert_eq!(report.target_height, Some(4_602_680));
+        assert_eq!(
+            report.cause.metric_label(),
+            "wallet_transition_limit_exceeded"
+        );
+
+        let rendered = serde_json::to_value(&report)?;
+        assert_eq!(
+            rendered["cause"],
+            serde_json::json!({
+                "wallet_transition_limit_exceeded": {
+                    "required_bytes": 541_122_672_u64,
+                    "configured_bytes": 536_870_912_u64,
+                }
+            })
+        );
+
+        let proto = ops_proto::ReadinessReport::from(&report);
+        assert_eq!(
+            proto.cause,
+            ops_proto::ReadinessCause::WalletTransitionLimitExceeded as i32
+        );
+        assert_eq!(
+            proto.detail.and_then(|detail| detail.payload),
+            Some(
+                ops_proto::readiness_cause_detail::Payload::WalletTransitionLimitExceeded(
+                    ops_proto::WalletTransitionLimitExceededDetail {
+                        required_bytes: 541_122_672,
+                        configured_bytes: 536_870_912,
+                    }
+                )
+            )
+        );
+
+        let refusal = not_ready_status(&report.cause);
+        assert_eq!(refusal.code(), tonic::Code::Unavailable);
+        let refusal_details = refusal.get_error_details();
+        assert_eq!(
+            refusal_details
+                .error_info()
+                .and_then(|error_info| error_info.metadata.get("readiness_cause"))
+                .map(String::as_str),
+            Some("wallet_transition_limit_exceeded")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn replica_lagging_carries_lag_chain_epochs() {
         let readiness = Readiness::new(ReadinessState::replica_lagging(4, Some(100)));
         let report = readiness.report();
@@ -1425,6 +1536,10 @@ mod tests {
                 depth: 0,
                 configured: 0,
                 covered: None,
+            },
+            ReadinessCause::WalletTransitionLimitExceeded {
+                required_bytes: 0,
+                configured_bytes: 0,
             },
             ReadinessCause::ReplicaLagging {
                 lag_chain_epochs: 0,
@@ -1479,6 +1594,9 @@ mod tests {
             ReadinessCause::ReorgWindowExceeded { .. } => {
                 ops_proto::ReadinessCause::ReorgWindowExceeded
             }
+            ReadinessCause::WalletTransitionLimitExceeded { .. } => {
+                ops_proto::ReadinessCause::WalletTransitionLimitExceeded
+            }
             ReadinessCause::ReplicaLagging { .. } => ops_proto::ReadinessCause::ReplicaLagging,
             ReadinessCause::ServingPairStale { .. } => ops_proto::ReadinessCause::ServingPairStale,
             ReadinessCause::WriterStatusUnavailable => {
@@ -1525,6 +1643,10 @@ mod tests {
                 depth: 0,
                 configured: 0,
                 covered: None,
+            },
+            ReadinessCause::WalletTransitionLimitExceeded {
+                required_bytes: 0,
+                configured_bytes: 0,
             },
             ReadinessCause::ReplicaLagging {
                 lag_chain_epochs: 0,

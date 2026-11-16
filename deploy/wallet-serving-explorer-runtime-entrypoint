@@ -239,9 +239,10 @@ log "starting wallet serving"
 ) &
 wallet_serving_pid="$!"
 
-# The healthcheck passes once query admits traffic, or while query serves the
-# typed refusal of a parked canonical writer, which the wallet-serving
-# entrypoint keeps up.
+# The healthcheck passes once query admits traffic, while query serves the
+# typed refusal of a parked canonical writer, or while the projector is parked
+# on a wallet transition over its logical-byte limit, whether or not query
+# started behind it. The wallet-serving entrypoint keeps both parks up.
 until "$wallet_serving_healthcheck" >/dev/null 2>&1; do
   if ! is_alive "$wallet_serving_pid"; then
     collect_wallet_serving_status

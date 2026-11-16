@@ -345,10 +345,12 @@ start period for a Mainnet build.
 
 The container terminates with a non-zero status in these cases:
 
-- any of the three processes exits;
+- any process it started exits;
 - a plane reports `schema_mismatch` or `node_capability_missing`;
-- a plane stops admitting traffic for an hour; or
-- a plane keeps flapping, as described below.
+- a plane stops admitting traffic for an hour;
+- a plane keeps flapping, as described below; or
+- the projector leaves a park that kept query from starting, as described in
+  [Wallet transition exceeds its logical-byte limit](#wallet-transition-exceeds-its-logical-byte-limit).
 
 The restart policy is `ALWAYS` with no retry cap, so a surviving subset never
 keeps answering requests it cannot satisfy and the platform never stops
@@ -373,7 +375,10 @@ Health checks follow the same rule. The image `HEALTHCHECK` runs
 `zinder-wallet-serving-healthcheck`, which passes when query `/readyz` answers
 200 or reports `reorg_window_exceeded`, so a Docker or Compose host that
 restarts unhealthy containers keeps the typed refusal up instead of restarting
-into the same park.
+into the same park. It also passes while the projector reports the
+`wallet_transition_limit_exceeded` park described in
+[Wallet transition exceeds its logical-byte limit](#wallet-transition-exceeds-its-logical-byte-limit),
+whether query answers behind it or never started.
 
 Railway's deploy-time healthcheck is different. It uses `/healthz`, which
 passes once the query endpoint listens, so a parked writer does not fail a
@@ -429,32 +434,51 @@ when the window expires.
 
 ### Wallet transition exceeds its logical-byte limit
 
-The projector logs `projector failed` with an error that begins:
+The projector logs `wallet_projection_following_parked` once, at error level,
+with an error that begins:
 
 ```text
 wallet following stopped planning a transition that already needs <n> logical bytes, more than projector.follow.max_transition_logical_bytes (ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES) allows (<limit>)
 ```
 
-The container then terminates, and the `ALWAYS` restart policy brings it back
-into the same failure. One wallet transition, typically a deep reorg that rolls
-back and replays many blocks of a busy address, touches more wallet rows than
-the limit allows. The limit counts each row the transition touches twice, once
-for the plan in memory and once for the write batch that publishes it. The
-projector refuses the transition before it writes anything, so the wallet is
-unchanged, and `<n>` is a lower bound on what the whole transition needs.
+One wallet transition, typically a deep reorg that rolls back and replays many
+blocks of a busy address, touches more wallet rows than the limit allows. The
+limit counts each row the transition touches twice, once for the plan in memory
+and once for the write batch that publishes it. The projector refuses the
+transition before it writes anything, so the wallet is unchanged, and `<n>` is
+a lower bound on what the whole transition needs.
 
-The loop does not end on its own:
+The projector stays up, parked, and its `/readyz` reports both numbers:
 
-- each restart plans the same transition from the same wallet cursor and
-  refuses it at the same point;
-- each attempt repeats that transition's canonical replay and wallet reads up
-  to the refusal; and
-- each restart leases canonical retention at the wallet cursor again, so the
-  canonical writer keeps every retained event from that cursor on.
+```text
+{"status":"not_ready","cause":{"wallet_transition_limit_exceeded":{"required_bytes":<n>,"configured_bytes":<limit>}},"current_height":<wallet height>,"target_height":<writer height>}
+```
 
-Waiting for the chain to move on does not help. If later canonical events
-overwrite the refused range, the projector reconciles instead, but a
-reconciliation is also one transition under the same limit.
+While it is parked:
+
+- it keeps renewing its one canonical retention lease, so the canonical writer
+  keeps every retained event from the wallet cursor on, and the wallet later
+  resumes from that cursor without a rebuild;
+- it plans the transition again only after the writer commits, and never
+  repeats the refused transition's canonical replay and wallet reads;
+- it resumes on its own only if a later reorg replaces the refused blocks, and
+  that reconciliation is also one transition under the same limit; and
+- a query that was already running keeps answering wallets from its last
+  serving pair for a few blocks, reports `serving_pair_stale`, and once its
+  staleness ceiling passes refuses them with `SERVICE_NOT_READY` and readiness
+  cause `replica_lagging`.
+
+The container stays up in this state, and the supervisor logs the park once.
+
+A restart with the same setting, such as a crash restart, a plain restart, or
+a host reboot, parks the projector on the same transition again. Query cannot
+publish its first serving pair behind the parked wallet, so its startup would
+fail, and the supervisor does not start it. The supervisor logs
+`zinder-query was not started`, and the container stays up with ingest and the
+parked projector. Wallets get refused connections until the projector
+recovers, and the image `HEALTHCHECK` still passes. If the projector later
+leaves the park on its own, the supervisor terminates the container, and the
+restart starts query behind the moving wallet.
 
 To recover, set `ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES` on
 the service well above `<n>`, up to the maximum of `1073741824`, and redeploy.
@@ -462,6 +486,11 @@ The default is `536870912`. The projector can hold up to the limit in memory
 while it plans and publishes one transition, so raise the container's memory
 by at least the bytes you add to the limit. Memory use at the maximum has not
 been measured.
+
+If the new limit is still too small, the projector parks again and query never
+starts, so `/healthz` never answers. Railway then marks the deployment failed
+when the healthcheck window expires and stops the container. Raise the limit
+further and redeploy.
 
 If `<n>` already exceeds `1073741824`, or the failure repeats at the maximum,
 no setting admits the transition. Rebuild the wallet in a second wallet-serving
@@ -531,8 +560,10 @@ wallet serving starts, so the deployment fails at once instead of hours later.
 
 The entrypoint then starts the wallet-serving entrypoint and waits until
 `zinder-wallet-serving-healthcheck` passes, which happens when query `/readyz`
-answers 200 or reports `reorg_window_exceeded`. What happens next depends on
-whether ingest writes the Explorer views:
+answers 200 or reports `reorg_window_exceeded`, or while the projector reports
+the `wallet_transition_limit_exceeded` park. Behind a park that kept query from
+starting, the Explorer's reads that compose wallet query fail until query
+starts. What happens next depends on whether ingest writes the Explorer views:
 
 - With the views enabled, as this image configures them, the entrypoint waits
   until ingest `/readyz` on port 9105 lists `materialized_view_identities`,

@@ -34,6 +34,7 @@ version and commit appear in the `zinder_build_info` metric and native
 | `storage_unavailable` | Required local storage cannot be opened or read. |
 | `schema_mismatch` | Persisted identity or schema differs from the binary. |
 | `reorg_window_exceeded` | A replacement crosses the persisted reorg policy. The detail carries the replacement depth, the window, and the depth the window covered, which is smaller than the window while a raised window is still growing. |
+| `wallet_transition_limit_exceeded` | The projector refused its next wallet transition because it needs more logical bytes than `projector.follow.max_transition_logical_bytes` allows, and stays parked. The detail carries the bytes the transition had accounted when it was refused, a lower bound on what it needs, and the configured limit. |
 | `replica_lagging` | A RocksDB secondary exceeds the admitted epoch lag. |
 | `serving_pair_stale` | A wallet-serving reader cannot refresh its published pair, which is still within its staleness ceiling. |
 | `writer_status_unavailable` | A trusted reader cannot reach the writer control API. |
@@ -48,8 +49,8 @@ cause refuses it.
 Payload-bearing causes include structured detail. `node_unavailable` carries a
 bounded failure class, sanitized reason, consecutive-failure count, and outage
 duration. `upstream_not_ready` carries source heights, verification progress,
-and the health-probe source. Reorg, replica, serving-pair, and
-canonical-retention causes carry the numeric boundary that failed.
+and the health-probe source. Reorg, wallet-transition, replica, serving-pair,
+and canonical-retention causes carry the numeric boundary that failed.
 
 Readiness detail is operational data, not a place for raw node responses,
 authorization material, filesystem paths, transaction identifiers, or other
@@ -238,6 +239,19 @@ instead, until it gives the wallet a block to apply, as described in
 projector reports is the wallet's authenticated height, never the canonical
 secondary's.
 
+A wallet transition that needs more logical bytes than
+`projector.follow.max_transition_logical_bytes` allows leaves the wallet
+unchanged, and the projector parks instead of exiting: the same wallet cursor
+would plan the same transition again, and the same limit would refuse it at
+the same point. A parked projector reports `wallet_transition_limit_exceeded`
+with the wallet's height and the writer's, keeps and renews the one canonical
+retention lease it holds, and refuses owner-control captures with
+`FAILED_PRECONDITION`. It plans the next transition again only after the writer
+commits, and resumes following only when that plan ends at a different fence,
+as it does after a later reorg replaces the refused blocks. Otherwise it stays
+parked until it restarts with a larger limit, which resumes from the
+persisted cursor without a rebuild because the lease kept it retained.
+
 ### Native wallet query
 
 Native wallet query is ready only when all three independently retained inputs
@@ -293,6 +307,16 @@ When the shared traffic gate is closed, new gRPC calls return
 `/readyz` carries the corresponding structured detail. This keeps a
 readiness outage distinguishable from poisoned transport without mutating the
 endpoint's immutable capability set.
+
+Behind a parked projector, the wallet stops advancing, so query cannot publish
+a newer pair. It keeps answering from its last pair while the writer stays
+within `storage.secondary_replica_lag_threshold_chain_epochs`, reports
+`serving_pair_stale` until `storage.serving_pair_staleness_ceiling_ms` passes,
+and then refuses wallets with `SERVICE_NOT_READY` and readiness cause
+`replica_lagging`. A query runtime that starts behind a parked projector cannot
+converge its first pair, so its startup fails before its endpoints listen. The
+single-host wallet-serving supervisor therefore does not start query while the
+projector reports the park.
 
 ### Lightwalletd compatibility
 
