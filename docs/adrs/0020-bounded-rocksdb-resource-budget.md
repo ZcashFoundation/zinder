@@ -43,7 +43,7 @@ I/O resolution, and open retry policy.
 
 ### Direct I/O With Buffered Fallback
 
-Every RocksDB open first attempts direct I/O:
+Every production RocksDB open first attempts direct I/O:
 
 - Primary and secondary opens set `use_direct_reads = true`.
 - Primary opens also set `use_direct_io_for_flush_and_compaction = true` and
@@ -58,6 +58,11 @@ remaining portable on filesystems and development platforms that do not.
 Successful opens log `event="rocksdb_io_mode"` with the resolved mode
 (`direct` or `buffered`), store path, and role. The resolved mode is retained
 beside the RocksDB handle for observability.
+
+`RocksDbResourceBudget::preferred_io_mode` names the mode the open attempts
+first. Every profile and every configuration section leaves it at `direct`.
+Only `zinder-bench rocksdb-tip-replay` sets it to `buffered`, which skips the
+direct attempt so a benchmark can compare the two read paths on one filesystem.
 
 ### Resource Budget
 
@@ -204,6 +209,9 @@ anonymous memory.
 
 ## Revision history
 
+- 2026-11-16: `RocksDbResourceBudget::preferred_io_mode` lets the benchmark
+  harness open a store buffered without a direct attempt. No configuration
+  section exposes it, and production opens are unchanged.
 - 2026-11-15: The shared table factory sets no filter policy, so the canonical
   and materialized-view stores have no filter blocks. The wallet store's four
   hash-keyed families carry partitioned hybrid-Ribbon whole-key filters charged

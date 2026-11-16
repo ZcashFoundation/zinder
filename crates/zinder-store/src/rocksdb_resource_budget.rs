@@ -7,7 +7,10 @@
 //! - **Architectural invariants** (WAL on, point-in-time recovery, atomic
 //!   flush, ordered writes, and direct-I/O fallback) live in the bounded
 //!   `RocksDB` open path. They are not tunable; touching them breaks the
-//!   per-epoch commit contract.
+//!   per-epoch commit contract. The one exception is
+//!   [`RocksDbResourceBudget::preferred_io_mode`], which the benchmark harness
+//!   sets to buffered to skip the direct attempt; no configuration section
+//!   exposes it.
 //! - **Bounded resource budget** lives here. The numbers below cap the
 //!   block-cache, table-cache, WAL, primary-writer background jobs,
 //!   per-column-family write buffers, and total memtable memory surfaces so a
@@ -19,6 +22,8 @@
 //! for `RocksDB` secondaries. Operators may override individual fields through
 //! `[storage.canonical.rocksdb]`, `[storage.materialized_views.rocksdb]`, and
 //! `[wallet.rocksdb]` in their TOML.
+
+use crate::RocksDbIoMode;
 
 /// Bounded `RocksDB` resource budget applied to one DB instance at open.
 ///
@@ -68,6 +73,13 @@ pub struct RocksDbResourceBudget {
     pub memtable_budget_bytes: u64,
     /// `RocksDB` statistics collection gate.
     pub statistics_level: RocksDbStatisticsLevel,
+    /// Filesystem I/O mode the open attempts first.
+    ///
+    /// Every profile defaults to [`RocksDbIoMode::Direct`], which falls back
+    /// to buffered I/O when the filesystem rejects direct I/O.
+    /// [`RocksDbIoMode::Buffered`] skips the direct attempt. Only the
+    /// benchmark harness overrides it; no configuration section exposes it.
+    pub preferred_io_mode: RocksDbIoMode,
 }
 
 impl RocksDbResourceBudget {
@@ -123,6 +135,7 @@ impl RocksDbResourceBudget {
             max_background_jobs: 2,
             memtable_budget_bytes: 256 * MIB,
             statistics_level: RocksDbStatisticsLevel::Tickers,
+            preferred_io_mode: RocksDbIoMode::Direct,
         }
     }
 
@@ -146,6 +159,7 @@ impl RocksDbResourceBudget {
             max_background_jobs: 2,
             memtable_budget_bytes: 512 * MIB,
             statistics_level: RocksDbStatisticsLevel::Tickers,
+            preferred_io_mode: RocksDbIoMode::Direct,
         }
     }
 
@@ -178,6 +192,7 @@ impl RocksDbResourceBudget {
             max_background_jobs: 2,
             memtable_budget_bytes: 16 * MIB,
             statistics_level: RocksDbStatisticsLevel::Tickers,
+            preferred_io_mode: RocksDbIoMode::Direct,
         }
     }
 
@@ -199,6 +214,7 @@ impl RocksDbResourceBudget {
             max_background_jobs: 2,
             memtable_budget_bytes: 16 * MIB,
             statistics_level: RocksDbStatisticsLevel::Tickers,
+            preferred_io_mode: RocksDbIoMode::Direct,
         }
     }
 
@@ -229,6 +245,7 @@ impl RocksDbResourceBudget {
             max_background_jobs: 2,
             memtable_budget_bytes: 8 * MIB,
             statistics_level: RocksDbStatisticsLevel::Tickers,
+            preferred_io_mode: RocksDbIoMode::Direct,
         }
     }
 

@@ -416,6 +416,14 @@ fn assert_two_repeat_report(report: &Value) -> Result<&Value> {
     assert_eq!(report["contract_identity"], "rocksdb-tip-replay");
     assert_eq!(report["method"]["percentile_method"], "nearest-rank");
     assert_eq!(
+        report["method"]["scratch_page_cache"],
+        if cfg!(target_os = "linux") {
+            "evicted-after-copy"
+        } else {
+            "not-evicted"
+        }
+    );
+    assert_eq!(
         report["provenance"]["software_revision"],
         "integration-test"
     );
@@ -583,8 +591,221 @@ async fn tip_replay_reports_compare_and_name_their_setting_differences() -> Resu
     Ok(())
 }
 
+/// Runs a one-repeat tip replay and returns its report path.
+fn replay_to_report(inputs: &TipReplayInputs, name: &str, extra: &[&str]) -> Result<PathBuf> {
+    let scratch = inputs.directory.path().join(format!("scratch-{name}"));
+    let report = inputs.directory.path().join(format!("report-{name}.json"));
+    let mut arguments = vec![
+        "--scratch-dir".to_owned(),
+        scratch.to_string_lossy().into_owned(),
+        "--report".to_owned(),
+        report.to_string_lossy().into_owned(),
+    ];
+    arguments.extend(extra.iter().map(|argument| (*argument).to_owned()));
+    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    require_success(
+        &run_tip_replay(inputs, &inputs.fixture(), &arguments)?,
+        "tip replay",
+    )?;
+    Ok(report)
+}
+
 #[tokio::test]
-async fn tip_replay_comparison_refuses_reports_summarized_by_different_methods() -> Result<()> {
+async fn tip_replay_reports_the_requested_io_modes_and_wallet_statistics_deltas() -> Result<()> {
+    let inputs = prepare_inputs().await?;
+    let report_path = replay_to_report(
+        &inputs,
+        "statistics",
+        &[
+            "--wallet-rocksdb-statistics",
+            "--canonical-io-mode",
+            "buffered",
+            "--wallet-io-mode",
+            "buffered",
+        ],
+    )?;
+
+    let report = read_json(&report_path)?;
+
+    assert_eq!(report["report_format_version"], 2);
+    let io_mode = &report["configuration"]["rocksdb_io_mode"];
+    assert_eq!(io_mode["requested"]["canonical"], "buffered");
+    assert_eq!(io_mode["requested"]["wallet"], "buffered");
+    for store in ["canonical_primary", "canonical_secondary", "wallet"] {
+        assert_eq!(io_mode["resolved"][store], "buffered", "{store}");
+    }
+    assert_eq!(
+        report["configuration"]["wallet_statistics"]["collected"],
+        true
+    );
+    assert_eq!(
+        report["configuration"]["wallet_budget"]["statistics_level"],
+        "tickers"
+    );
+    let reported_tickers = report["configuration"]["wallet_statistics"]["tickers"]
+        .as_array()
+        .ok_or_else(|| eyre!("collected statistics must name their tickers"))?;
+    for ticker in [
+        "rocksdb.number.keys.read",
+        "rocksdb.bloom.filter.useful",
+        "rocksdb.bloom.filter.full.positive",
+        "rocksdb.bloom.filter.full.true.positive",
+        "rocksdb.block.cache.data.miss",
+        "rocksdb.block.cache.data.hit",
+        "rocksdb.block.cache.filter.miss",
+        "rocksdb.block.cache.index.miss",
+        "rocksdb.bytes.read",
+        "rocksdb.compact.read.bytes",
+        "rocksdb.compact.write.bytes",
+        "rocksdb.flush.write.bytes",
+    ] {
+        assert!(reported_tickers.contains(&Value::from(ticker)), "{ticker}");
+    }
+    let unavailable: Vec<&Value> = report["unavailable_measurements"]
+        .as_array()
+        .ok_or_else(|| eyre!("report must list unavailable measurements"))?
+        .iter()
+        .map(|entry| &entry["measurement"])
+        .collect();
+    assert_eq!(
+        unavailable,
+        [&Value::from("canonical_store_read_statistics")]
+    );
+    assert_wallet_ticker_deltas(&report)
+}
+
+/// Checks the per-block and per-stratum ticker deltas of a collecting replay.
+fn assert_wallet_ticker_deltas(report: &Value) -> Result<()> {
+    let blocks = report["repeats"][0]["blocks"]
+        .as_array()
+        .ok_or_else(|| eyre!("report must list blocks"))?;
+    assert!(!blocks.is_empty());
+    for block in blocks {
+        let deltas = &block["wallet_ticker_deltas"];
+        let point_reads = deltas["rocksdb.number.keys.read"].as_u64();
+        assert!(
+            point_reads > Some(0),
+            "height {}: {deltas}",
+            block["height"]
+        );
+        for ticker in [
+            "rocksdb.bytes.read",
+            "rocksdb.compact.read.bytes",
+            "rocksdb.flush.write.bytes",
+        ] {
+            assert!(deltas[ticker].is_u64(), "{ticker}: {deltas}");
+        }
+    }
+    for stratum in ["all_blocks", "no_transparent_activity"] {
+        let summary = &report["aggregate"][stratum]["wallet_tickers"]["rocksdb.number.keys.read"];
+        assert!(summary["total"].as_u64() > Some(0), "{stratum}: {summary}");
+        assert!(summary["p99"].is_u64());
+    }
+    assert!(report["aggregate"]["input_heavy"]["wallet_tickers"].is_null());
+    Ok(())
+}
+
+#[tokio::test]
+async fn tip_replay_leaves_wallet_statistics_off_unless_asked() -> Result<()> {
+    let inputs = prepare_inputs().await?;
+    let report_path = replay_to_report(&inputs, "default", &[])?;
+
+    let report = read_json(&report_path)?;
+
+    assert_eq!(
+        report["configuration"]["wallet_statistics"],
+        serde_json::json!({"collected": false, "tickers": []})
+    );
+    assert_eq!(
+        report["configuration"]["wallet_budget"]["statistics_level"],
+        "off"
+    );
+    assert_eq!(
+        report["configuration"]["rocksdb_io_mode"]["requested"],
+        serde_json::json!({"canonical": "direct", "wallet": "direct"})
+    );
+    assert!(report["repeats"][0]["blocks"][0]["wallet_ticker_deltas"].is_null());
+    assert!(report["aggregate"]["all_blocks"]["wallet_tickers"].is_null());
+    let unavailable = report["unavailable_measurements"]
+        .as_array()
+        .ok_or_else(|| eyre!("report must list unavailable measurements"))?;
+    for measurement in ["point_read_counts", "rocksdb_statistics_deltas"] {
+        assert!(
+            unavailable
+                .iter()
+                .any(|entry| entry["measurement"] == measurement),
+            "{measurement}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn tip_replay_comparison_names_io_mode_differences_and_refuses_mixed_statistics() -> Result<()>
+{
+    let inputs = prepare_inputs().await?;
+    let direct = replay_to_report(&inputs, "direct", &[])?;
+    let buffered = replay_to_report(&inputs, "buffered", &["--wallet-io-mode", "buffered"])?;
+    let collecting = replay_to_report(&inputs, "collecting", &["--wallet-rocksdb-statistics"])?;
+    let comparison_path = inputs.directory.path().join("comparison.json");
+
+    require_success(
+        &compare_reports(&direct, &buffered, &comparison_path)?,
+        "report comparison",
+    )?;
+
+    let comparison = read_json(&comparison_path)?;
+    let differences = comparison["setting_differences"]
+        .as_array()
+        .ok_or_else(|| eyre!("comparison must list setting differences"))?;
+    let requested = differences
+        .iter()
+        .find(|difference| {
+            difference["setting"] == "configuration.rocksdb_io_mode.requested.wallet"
+        })
+        .ok_or_else(|| eyre!("the requested wallet I/O mode must differ: {differences:?}"))?;
+    assert_eq!(requested["baseline"], "direct");
+    assert_eq!(requested["candidate"], "buffered");
+
+    let refused_path = inputs.directory.path().join("refused-comparison.json");
+    let refused = compare_reports(&direct, &collecting, &refused_path)?;
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains(
+            "baseline wallet statistics collection (false) differs from the candidate (true)"
+        ),
+        "{stderr}"
+    );
+    assert!(!refused_path.exists());
+
+    let both_collecting = replay_to_report(
+        &inputs,
+        "collecting-again",
+        &["--wallet-rocksdb-statistics"],
+    )?;
+    require_success(
+        &compare_reports(
+            &collecting,
+            &both_collecting,
+            &inputs.directory.path().join("statistics-comparison.json"),
+        )?,
+        "statistics comparison",
+    )?;
+    let statistics_comparison =
+        read_json(&inputs.directory.path().join("statistics-comparison.json"))?;
+    assert!(
+        statistics_comparison["timers"]["all_blocks"]["wallet_ticker_mean_per_block"]
+            ["rocksdb.number.keys.read"]["baseline"]
+            .as_f64()
+            > Some(0.0)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn tip_replay_comparison_refuses_other_summary_methods_and_lists_page_cache_state()
+-> Result<()> {
     let inputs = prepare_inputs().await?;
     let scratch = inputs.directory.path().join("scratch");
     let report = inputs.directory.path().join("report.json");
@@ -636,6 +857,31 @@ async fn tip_replay_comparison_refuses_reports_summarized_by_different_methods()
         assert!(stderr.contains(expected), "{stderr}");
         assert!(!refused_path.exists());
     }
+
+    let mut other_cache_state = read_json(&report)?;
+    let measured_state = other_cache_state["method"]["scratch_page_cache"].clone();
+    let other_state = if measured_state == "evicted-after-copy" {
+        "not-evicted"
+    } else {
+        "evicted-after-copy"
+    };
+    other_cache_state["method"]["scratch_page_cache"] = Value::from(other_state);
+    let other_path = inputs.directory.path().join("other-page-cache.json");
+    std::fs::write(&other_path, serde_json::to_vec_pretty(&other_cache_state)?)?;
+    let comparison_path = inputs.directory.path().join("page-cache-comparison.json");
+    require_success(
+        &compare_reports(&report, &other_path, &comparison_path)?,
+        "page-cache comparison",
+    )?;
+    let comparison = read_json(&comparison_path)?;
+    assert_eq!(
+        comparison["setting_differences"],
+        serde_json::json!([{
+            "setting": "method.scratch_page_cache",
+            "baseline": measured_state,
+            "candidate": other_state,
+        }])
+    );
     Ok(())
 }
 

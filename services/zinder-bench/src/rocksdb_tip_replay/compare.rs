@@ -37,7 +37,7 @@ struct TipReplayComparison {
     baseline: ComparedReport,
     candidate: ComparedReport,
     workload: ComparedWorkload,
-    /// Every build, host, and configuration setting that differs between the reports.
+    /// Every build, host, configuration, and method setting that differs between the reports.
     setting_differences: Vec<SettingDifference>,
     process: BTreeMap<&'static str, MetricChange>,
     /// Pooled timers by stratum, then by timer name.
@@ -92,6 +92,9 @@ struct StratumChange {
     candidate_block_count: u32,
     /// Present when both reports have blocks in this stratum.
     timers: Option<BTreeMap<&'static str, TimerChange>>,
+    /// Mean per-block wallet-store ticker deltas by `RocksDB` ticker name;
+    /// present when both reports collected statistics over blocks in this stratum.
+    wallet_ticker_mean_per_block: Option<BTreeMap<String, MetricChange>>,
 }
 
 /// Changes of one timer's summary statistics, in milliseconds.
@@ -182,6 +185,15 @@ fn require_same_workload(
             )));
         }
     }
+    let (baseline_statistics, candidate_statistics) = (
+        baseline.configuration.wallet_statistics.collected,
+        candidate.configuration.wallet_statistics.collected,
+    );
+    if baseline_statistics != candidate_statistics {
+        return Err(BenchError::report_format(format!(
+            "the baseline wallet statistics collection ({baseline_statistics}) differs from the candidate ({candidate_statistics}); collecting statistics changes the wallet store's options and can change timings"
+        )));
+    }
     if baseline.method.stratum_rules != candidate.method.stratum_rules {
         return Err(BenchError::report_format(
             "the baseline and candidate stratum rules differ, so their strata hold different blocks",
@@ -259,6 +271,11 @@ fn setting_differences(
         flatten(
             "configuration",
             &serde_json::to_value(&report.configuration)?,
+            &mut flattened,
+        );
+        flatten(
+            "method",
+            &serde_json::to_value(&report.method)?,
             &mut flattened,
         );
         flattened.remove("configuration.scratch_directory");
@@ -365,5 +382,22 @@ fn stratum_change(baseline: &StratumSummary, candidate: &StratumSummary) -> Stra
                     .collect()
             },
         ),
+        wallet_ticker_mean_per_block: baseline
+            .wallet_tickers
+            .as_ref()
+            .zip(candidate.wallet_tickers.as_ref())
+            .map(|(baseline, candidate)| {
+                baseline
+                    .0
+                    .iter()
+                    .filter_map(|(name, baseline)| {
+                        let candidate = candidate.0.get(name)?;
+                        Some((
+                            name.clone(),
+                            MetricChange::new(baseline.mean_per_block, candidate.mean_per_block),
+                        ))
+                    })
+                    .collect()
+            }),
     }
 }

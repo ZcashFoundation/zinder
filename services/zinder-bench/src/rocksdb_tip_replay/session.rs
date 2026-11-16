@@ -35,7 +35,10 @@ use zinder_wallet_projection::{
 };
 use zinder_wallet_rocksdb::{RocksDbWalletFollowingStore, RocksDbWalletStore};
 
-use super::measurement::{BlockTimings, BlockWorkload};
+use super::{
+    measurement::{BlockTimings, BlockWorkload},
+    statistics::{TickerDeltas, TickerSnapshot},
+};
 
 /// Production histogram recorded around `RocksDbCanonicalStore::commit_live_append`.
 const LIVE_COMMIT_HISTOGRAM: &str = "zinder_ingest_canonical_live_commit_seconds";
@@ -54,7 +57,21 @@ pub(super) struct StoreSettings {
     pub(super) canonical_writer_budget: RocksDbResourceBudget,
     pub(super) canonical_secondary_budget: RocksDbResourceBudget,
     pub(super) wallet_budget: RocksDbResourceBudget,
+    /// Whether to read the wallet store's statistics tickers around each transition.
+    pub(super) collect_wallet_tickers: bool,
     pub(super) max_transition_logical_bytes: NonZeroU64,
+}
+
+/// What one replayed block measured.
+pub(super) struct ReplayedBlock {
+    pub(super) timings: BlockTimings,
+    pub(super) wallet_tickers: Option<TickerDeltas>,
+}
+
+/// The wallet transition's duration and, when collected, its ticker deltas.
+struct WalletApply {
+    elapsed: Duration,
+    tickers: Option<TickerDeltas>,
 }
 
 /// Scratch store paths for one repeat.
@@ -91,6 +108,7 @@ pub(super) struct ReplayStores {
     secondary: RocksDbCanonicalSecondary,
     wallet: RocksDbWalletFollowingStore,
     follow_activations: Arc<NetworkUpgradeActivations>,
+    collect_wallet_tickers: bool,
     max_transition_logical_bytes: NonZeroU64,
     readiness: ComposedReadiness,
     source: ReplayFixtureSource,
@@ -142,6 +160,7 @@ impl ReplayStores {
             secondary,
             wallet,
             follow_activations,
+            collect_wallet_tickers: settings.collect_wallet_tickers,
             max_transition_logical_bytes: settings.max_transition_logical_bytes,
             readiness: ComposedReadiness::new(Readiness::default(), &[]),
             source: ReplayFixtureSource {
@@ -183,7 +202,7 @@ impl ReplayStores {
         runtime: &tokio::runtime::Runtime,
         recorder: &FollowStepRecorder,
         expected_tip: BlockId,
-    ) -> Result<BlockTimings, BenchError> {
+    ) -> Result<ReplayedBlock, BenchError> {
         let store = self.canonical.take().ok_or_else(|| {
             BenchError::tip_replay("the canonical writer was lost by an earlier step")
         })?;
@@ -220,22 +239,28 @@ impl ReplayStores {
         let wallet_apply = self.apply_wallet_transition(fence)?;
         let wallet_step = wallet_started.elapsed();
 
-        Ok(BlockTimings {
-            canonical_follow_step: milliseconds(canonical_follow_step),
-            canonical_prepare: prepare * 1_000.0,
-            canonical_commit: commit * 1_000.0,
-            canonical_secondary_catch_up: milliseconds(canonical_secondary_catch_up),
-            wallet_apply: milliseconds(wallet_apply),
-            wallet_step: milliseconds(wallet_step),
+        Ok(ReplayedBlock {
+            timings: BlockTimings {
+                canonical_follow_step: milliseconds(canonical_follow_step),
+                canonical_prepare: prepare * 1_000.0,
+                canonical_commit: commit * 1_000.0,
+                canonical_secondary_catch_up: milliseconds(canonical_secondary_catch_up),
+                wallet_apply: milliseconds(wallet_apply.elapsed),
+                wallet_step: milliseconds(wallet_step),
+            },
+            wallet_tickers: wallet_apply.tickers,
         })
     }
 
     /// Applies the one retained event that produced `fence`, as the projector
     /// does for an append, and returns the time spent in the wallet transition.
+    ///
+    /// Ticker reads sit outside the timed span, so collecting them does not
+    /// lengthen `wallet_apply`.
     fn apply_wallet_transition(
         &mut self,
         fence: CanonicalEventFence,
-    ) -> Result<Duration, BenchError> {
+    ) -> Result<WalletApply, BenchError> {
         if self.secondary.event_fence() != fence {
             return Err(BenchError::tip_replay(
                 "the canonical secondary did not catch up to the writer fence",
@@ -271,6 +296,9 @@ impl ReplayStores {
             fence,
             settled_tip: BlockId::new(epoch.settled_tip_height, epoch.settled_tip_hash),
         };
+        let tickers_before = self
+            .collect_wallet_tickers
+            .then(|| TickerSnapshot::read(&self.wallet));
         let apply_started = Instant::now();
         let replay_rows = self.secondary.scan_canonical_replay_range(committed)?;
         self.wallet.apply_canonical_event_range(
@@ -281,7 +309,9 @@ impl ReplayStores {
             self.max_transition_logical_bytes,
             replay_rows,
         )?;
-        let wallet_apply = apply_started.elapsed();
+        let elapsed = apply_started.elapsed();
+        let tickers =
+            tickers_before.map(|before| TickerSnapshot::read(&self.wallet).delta_since(&before));
         if WalletCanonicalSourceIdentity::from_ready_evidence(self.wallet.ready_evidence())
             != wallet_source_identity(position)
         {
@@ -289,7 +319,7 @@ impl ReplayStores {
                 "the wallet transition published a source other than the retained event's result",
             ));
         }
-        Ok(wallet_apply)
+        Ok(WalletApply { elapsed, tickers })
     }
 
     /// Counts the transparent workload of retained blocks at `heights`.
