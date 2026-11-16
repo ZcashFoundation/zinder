@@ -121,6 +121,16 @@ epoch, ordered sequence digest, and retained canonical event state atomically.
 The writer does not perform historical wallet-output lookups or read wallet
 projection state.
 
+Each append also authenticates the note-commitment trees. Ingest appends the
+block's note commitments to the visible-tip frontier of every active pool. The
+result must equal the node's validated tree state for that block, byte for
+byte. The canonical store repeats the derivation from its own persisted
+checkpoint before it commits. Frontier validation reuses the roots of the 16
+most recently validated encodings from a process-wide memo, keyed by pool and
+exact `finalState` bytes. After the first append in a writer process, a pool
+that the block leaves unchanged costs no root computation. A pool that the
+block changes costs one, for the node's new tree state.
+
 Readiness becomes ready only when canonical lag is within
 `ingest.follow.lag_threshold_blocks` and the live mempool gate, when configured,
 has completed its current source snapshot. Source failures move readiness to
