@@ -349,10 +349,10 @@ readiness_cause_is_writer_halt() {
 # A projector that refused a wallet transition over its logical-byte limit
 # stays parked until an operator raises the limit and restarts it, but the
 # topology is still doing its job: ingest keeps the canonical store current,
-# the projector keeps its retention lease, and query keeps answering wallets
-# from its last pair until that pair goes stale, then refuses them with
-# SERVICE_NOT_READY. Restarting would only plan the same refused transition
-# again, so a parked projector counts as serving.
+# and the projector keeps its retention lease. A query already running keeps
+# answering wallets from its last pair until that pair goes stale, then
+# refuses them with SERVICE_NOT_READY. Restarting would only plan the same
+# refused transition again, so a parked projector counts as serving.
 readiness_cause_is_projector_park() {
   case "$1" in
     wallet_transition_limit_exceeded)
@@ -364,13 +364,6 @@ readiness_cause_is_projector_park() {
   esac
 }
 
-# Succeeds when the plane at $1 reports the projector park. This replaces the
-# probe results, so callers keep what they need from an earlier probe first.
-plane_reports_projector_park() {
-  probe_readiness "$1"
-  readiness_cause_is_projector_park "$probe_cause"
-}
-
 # Query publishes a pair only once the wallet reaches the canonical fence, so
 # behind a parked projector its refusal is the park's. Given whether the
 # projector is parked, succeeds when the query plane just probed answered
@@ -378,6 +371,37 @@ plane_reports_projector_park() {
 # unready.
 query_unready_behind_projector_park() {
   [ "$1" -eq 1 ] && [ -n "$probe_http_status" ]
+}
+
+# Starts query and waits for it to admit traffic, unless the projector probe
+# that ended its startup wait reported the park. Query's startup fails closed
+# until it converges a serving pair, which a parked wallet never reaches, so
+# query would exit and restart the container into the same park. The
+# container instead stays up without query until the serving loop sees the
+# projector leave the park.
+start_wallet_serving() {
+  if readiness_cause_is_projector_park "$probe_cause"; then
+    log "zinder-query was not started: it cannot publish a serving pair behind the parked projector, so wallets are refused until an operator raises ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES and redeploys: $probe_report"
+    projector_park_reported=1
+    return 0
+  fi
+
+  log "starting wallet serving"
+  start_runtime_process /usr/local/bin/zinder-query /etc/zinder/query.toml \
+    "$query_config_paths"
+  query_pid="$!"
+  await_readiness zinder-query "$query_ops_addr" "$wallet_serving_deadline_seconds"
+  log "wallet serving is ready"
+}
+
+# Given whether the projector reported its park, whether it was unreachable,
+# and its report, fails once it answers with any other state while startup
+# left query stopped behind the park. The container then restarts, and startup
+# brings query up behind the moving wallet.
+require_projector_park_for_stopped_query() {
+  if [ "$1" -eq 0 ] && [ "$2" -eq 0 ]; then
+    fail "zinder-projector no longer reports the wallet transition park; restarting so zinder-query starts behind it: $3"
+  fi
 }
 
 assert_started_processes_alive() {
@@ -395,14 +419,11 @@ assert_started_processes_alive() {
 # Waits for one plane to admit traffic. Every already-started process is
 # checked on each iteration: a plane reads canonical through a secondary of the
 # store the previous plane writes, so a dead upstream makes the awaited
-# readiness unreachable while the awaited process itself stays alive. With a
-# fourth argument, the projector ops address, an answered refusal also ends
-# the wait while that projector reports its park.
+# readiness unreachable while the awaited process itself stays alive.
 await_readiness() {
   role="$1"
   ops_addr="$2"
   phase_deadline_seconds="$3"
-  parked_projector_ops_addr="${4:-}"
 
   phase_started_epoch="$(date +%s)"
   deadline_epoch=$((phase_started_epoch + phase_deadline_seconds))
@@ -427,19 +448,12 @@ await_readiness() {
       fail "$role reports $probe_cause, which no amount of waiting clears: $probe_report"
     fi
 
-    awaited_report="$probe_report"
-    if [ -n "$parked_projector_ops_addr" ] && [ -n "$probe_http_status" ] \
-      && plane_reports_projector_park "$parked_projector_ops_addr"; then
-      log "$role is unready behind the parked projector; continuing so the topology stays up: $awaited_report"
-      return 0
-    fi
-
     probe_epoch="$(date +%s)"
     if [ "$probe_epoch" -ge "$deadline_epoch" ]; then
-      fail "$role stayed unready for ${phase_deadline_seconds}s: $awaited_report"
+      fail "$role stayed unready for ${phase_deadline_seconds}s: $probe_report"
     fi
     if [ "$probe_epoch" -ge "$next_report_epoch" ]; then
-      log "$role unready after $((probe_epoch - phase_started_epoch))s: $awaited_report"
+      log "$role unready after $((probe_epoch - phase_started_epoch))s: $probe_report"
       next_report_epoch=$((probe_epoch + unready_report_interval_seconds))
     fi
 
@@ -695,14 +709,7 @@ projector_pid="$!"
 await_readiness zinder-projector "$projector_ops_addr" \
   "$wallet_construction_deadline_seconds"
 
-log "starting wallet serving"
-start_runtime_process /usr/local/bin/zinder-query /etc/zinder/query.toml \
-  "$query_config_paths"
-query_pid="$!"
-await_readiness zinder-query "$query_ops_addr" "$wallet_serving_deadline_seconds" \
-  "$projector_ops_addr"
-
-log "wallet serving is ready"
+start_wallet_serving
 
 startup_completed_epoch="$(date +%s)"
 ingest_flap_ready_since_epoch="$startup_completed_epoch"
@@ -718,7 +725,10 @@ query_flap_ready_since_epoch="$startup_completed_epoch"
 # instead of restarting into the same park. A projector parked on a wallet
 # transition over its logical-byte limit is the other: it reports
 # `wallet_transition_limit_exceeded`, query's answered refusals behind it
-# count as serving, and the container stays up for the same reason.
+# count as serving, and the container stays up for the same reason. When
+# startup left query stopped behind that park, the container restarts once
+# the projector answers with any other state, so startup brings query up
+# behind the moving wallet.
 unready_since_epoch=0
 
 while true; do
@@ -755,17 +765,24 @@ while true; do
   projector_parked="$probe_parked"
 
   query_ready=0
-  if observe_plane_readiness zinder-query "$query_ops_addr"; then
-    query_ready=1
-  elif query_unready_behind_projector_park "$projector_parked"; then
-    query_ready=1
-  fi
-  query_report="$probe_report"
   query_unreachable=0
-  if [ -z "$probe_http_status" ]; then
-    query_unreachable=1
+  if [ -z "$query_pid" ]; then
+    require_projector_park_for_stopped_query "$projector_parked" \
+      "$projector_unreachable" "$projector_report"
+    query_ready=1
+    query_report="not started behind the parked projector"
+  else
+    if observe_plane_readiness zinder-query "$query_ops_addr"; then
+      query_ready=1
+    elif query_unready_behind_projector_park "$projector_parked"; then
+      query_ready=1
+    fi
+    query_report="$probe_report"
+    if [ -z "$probe_http_status" ]; then
+      query_unreachable=1
+    fi
+    plane_halted=$((plane_halted | probe_halted))
   fi
-  plane_halted=$((plane_halted | probe_halted))
 
   if [ "$plane_halted" -eq 1 ] && [ "$writer_halt_reported" -eq 0 ]; then
     log "the canonical writer is parked on a reorg deeper than its window; wallets receive REORG_WINDOW_EXCEEDED until an operator reconciles the canonical store: $ingest_report"

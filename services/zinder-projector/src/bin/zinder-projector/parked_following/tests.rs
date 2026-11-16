@@ -36,8 +36,8 @@ use zinder_proto::v1::ingest::{
     projector_control_client::ProjectorControlClient,
 };
 use zinder_runtime::{
-    BearerToken, Readiness, ReadinessCause, ReadinessReport, ResolvedProjectorControl,
-    connect_zinder_grpc, expected_writer_fence,
+    AuthenticatedChannel, BearerToken, Readiness, ReadinessCause, ReadinessReport,
+    ResolvedProjectorControl, connect_zinder_grpc, expected_writer_fence,
 };
 use zinder_source::{NodeAuth, NodeTarget};
 use zinder_store::{
@@ -70,6 +70,9 @@ const DENSE_BLOCK_OUTPUTS: u32 = 1_024;
 const LEASE_DURATION: Duration = Duration::from_mins(1);
 const WAIT_TIMEOUT: Duration = Duration::from_mins(1);
 const PROJECTOR_CONTROL_TOKEN: &str = "parked-following-test-token";
+const CAPTURE_RETRIES: u32 = 8;
+/// Long enough that each renewal extends the lease by a whole millisecond.
+const CAPTURE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_transition_parks_following_until_a_reorg_changes_it() -> TestResult {
@@ -150,9 +153,23 @@ async fn drive_park_and_resume(
     assert_eq!(parked.current_height, Some(1));
     assert_eq!(parked.target_height, Some(2));
 
-    let refused_capture = capture_state_bundle(projector_control_addr).await?;
+    let mut owner_control = connect_projector_control(projector_control_addr).await?;
+    let refused_capture = capture_state_bundle(&mut owner_control).await?;
     assert_eq!(refused_capture.code(), tonic::Code::FailedPrecondition);
     assert!(refused_capture.message().contains("parked"));
+
+    // Captures retried far more often than the poll interval still let the
+    // follower renew its lease and poll the writer after each refusal.
+    let before_retries = control.calls.snapshot();
+    for _ in 0..CAPTURE_RETRIES {
+        tokio::time::sleep(CAPTURE_RETRY_INTERVAL).await;
+        let refused_retry = capture_state_bundle(&mut owner_control).await?;
+        assert_eq!(refused_retry.code(), tonic::Code::FailedPrecondition);
+    }
+    let after_retries = control.calls.snapshot();
+    assert!(after_retries.renews >= before_retries.renews + CAPTURE_RETRIES - 1);
+    assert!(after_retries.writer_statuses >= before_retries.writer_statuses + CAPTURE_RETRIES - 1);
+    assert_eq!(after_retries.event_pages, before_retries.event_pages);
 
     // Nothing changes on the writer, so the parked follower keeps polling and
     // renewing its one lease without planning again.
@@ -204,11 +221,19 @@ async fn drive_park_and_resume(
     Ok(())
 }
 
-async fn capture_state_bundle(projector_control_addr: SocketAddr) -> TestResult<Status> {
+async fn connect_projector_control(
+    projector_control_addr: SocketAddr,
+) -> TestResult<ProjectorControlClient<AuthenticatedChannel>> {
     let token = BearerToken::from_str(PROJECTOR_CONTROL_TOKEN)?;
     let channel =
         connect_zinder_grpc(&format!("http://{projector_control_addr}"), Some(&token)).await?;
-    match ProjectorControlClient::new(channel)
+    Ok(ProjectorControlClient::new(channel))
+}
+
+async fn capture_state_bundle(
+    owner_control: &mut ProjectorControlClient<AuthenticatedChannel>,
+) -> TestResult<Status> {
+    match owner_control
         .create_state_bundle_capture(CreateStateBundleCaptureRequest {
             candidate_id: "parked-capture".to_owned(),
         })

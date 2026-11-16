@@ -134,9 +134,11 @@ pub(crate) async fn park_on_refused_transition(
     let mut convergence_readiness = FollowingReadiness::for_wallet(&unserved, wallet_height);
     let mut planned_at_writer_sequence = Some(canonical.event_fence().chain_event_sequence());
     loop {
+        // A refused command falls through to renewal and the writer poll, so
+        // a client that retries faster than the poll interval cannot starve
+        // either.
         if let Some(command) = control.next_command_or_poll(cancel).await? {
             refuse_parked_command(command, refused);
-            continue;
         }
         if cancel.is_cancelled() {
             return Ok(ParkedFollowing::Cancelled);

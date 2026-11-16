@@ -28,8 +28,9 @@ for function_name in \
   readiness_cause_is_terminal \
   readiness_cause_is_writer_halt \
   readiness_cause_is_projector_park \
-  plane_reports_projector_park \
   query_unready_behind_projector_park \
+  start_wallet_serving \
+  require_projector_park_for_stopped_query \
   classify_probe_failure \
   probe_readiness \
   observe_plane_readiness \
@@ -83,29 +84,12 @@ response_separator='
 
 fake_status=""
 fake_body=""
-fake_projector_status=""
-fake_projector_body=""
 fail_message=""
 sleep_count=0
-projector_ops_fixture_addr=127.0.0.1:9110
 
 # Stands in for curl's `-w` output: the body, the separator, then the status
-# code and connect time. The projector's ops address serves its own fixture
-# once one is set, and every other address serves the shared one.
+# code and connect time.
 curl() {
-  for curl_argument in "$@"; do
-    curl_url="$curl_argument"
-  done
-  case "$curl_url" in
-    *"$projector_ops_fixture_addr"*)
-      if [ -n "$fake_projector_body" ]; then
-        printf '%s%s%s 0.001' "$fake_projector_body" "$response_separator" \
-          "$fake_projector_status"
-        return 0
-      fi
-      ;;
-    *) ;;
-  esac
   printf '%s%s%s 0.001' "$fake_body" "$response_separator" "$fake_status"
 }
 
@@ -130,11 +114,6 @@ fail() {
 serve() {
   fake_status="$1"
   fake_body="$2"
-}
-
-serve_projector() {
-  fake_projector_status="$1"
-  fake_projector_body="$2"
 }
 
 halted_body='{"ready":false,"cause":{"reorg_window_exceeded":{"depth":1001,"configured":1000}},"current_height":4200}'
@@ -229,35 +208,57 @@ await_readiness zinder-projector 127.0.0.1:9110 60 \
 [ -z "$fail_message" ] || test_failure "startup failed on a parked projector: $fail_message"
 [ "$sleep_count" -eq 0 ] || test_failure "startup waited on a parked projector"
 
-# Query behind a parked projector never publishes a newer pair, so startup
-# continues once its answered refusal is the park's.
-serve 503 "$lagging_body"
-serve_projector 503 "$parked_body"
-sleep_count=0
-fail_message=""
-await_readiness zinder-query 127.0.0.1:9106 60 127.0.0.1:9110 \
-  || test_failure "startup must continue past query behind a parked projector"
-[ -z "$fail_message" ] \
-  || test_failure "startup failed on query behind a parked projector: $fail_message"
-[ "$sleep_count" -eq 0 ] || test_failure "startup waited on query behind a parked projector"
-
-# Without the park, a lagging query still has to admit traffic in time.
-serve 503 "$lagging_body"
-serve_projector 503 "$syncing_body"
-unexcused_query_message="$(
-  # The evaluated await_readiness calls this stand-in, which ends the subshell.
+# Query's startup cannot converge a serving pair behind a parked projector and
+# would exit, restarting the container into the same park, so startup leaves
+# query stopped when the projector's startup wait ended on the park. The
+# subshell keeps the process stand-in and its state out of the rest of this
+# test.
+(
+  query_ops_addr=127.0.0.1:9106
+  wallet_serving_deadline_seconds=60
+  started_binaries=""
+  # The evaluated start_wallet_serving calls this stand-in.
   # shellcheck disable=SC2329
-  fail() {
-    printf '%s' "$*"
-    exit 1
+  start_runtime_process() {
+    started_binaries="$started_binaries ${1##*/}"
+    : &
   }
-  await_readiness zinder-query 127.0.0.1:9106 0 127.0.0.1:9110
-)" || true
-case "$unexcused_query_message" in
-  *"zinder-query stayed unready"*replica_lagging*) ;;
-  *) test_failure "query behind a syncing projector ended the wait: '$unexcused_query_message'" ;;
+
+  query_pid=""
+  projector_park_reported=0
+  serve 503 "$parked_body"
+  probe_readiness 127.0.0.1:9110
+  start_wallet_serving || test_failure "startup failed behind a parked projector: $fail_message"
+  [ -z "$started_binaries" ] || test_failure "zinder-query started behind a parked projector"
+  [ -z "$query_pid" ] || test_failure "startup recorded a query process behind a parked projector"
+  [ "$projector_park_reported" -eq 1 ] \
+    || test_failure "the serving loop would report the park startup already logged"
+
+  serve 200 "$ready_body"
+  probe_readiness 127.0.0.1:9110
+  sleep_count=0
+  fail_message=""
+  start_wallet_serving || test_failure "startup failed behind a ready projector: $fail_message"
+  [ "$started_binaries" = " zinder-query" ] \
+    || test_failure "startup started '$started_binaries' behind a ready projector"
+  [ -n "$query_pid" ] || test_failure "startup did not record the query process"
+  wait
+)
+
+# Query that startup left stopped counts as serving while the projector
+# reports the park or stops answering, and the container restarts once the
+# projector answers with any other state.
+fail_message=""
+require_projector_park_for_stopped_query 1 0 "$parked_body" \
+  || test_failure "a parked projector must keep query stopped: $fail_message"
+require_projector_park_for_stopped_query 0 1 "unreachable" \
+  || test_failure "an unreachable projector must not restart the container: $fail_message"
+[ -z "$fail_message" ] || test_failure "a stopped query failed the container: $fail_message"
+require_projector_park_for_stopped_query 0 0 "$syncing_body" || true
+case "$fail_message" in
+  *"no longer reports the wallet transition park"*syncing*) ;;
+  *) test_failure "a projector that left the park kept query stopped: '$fail_message'" ;;
 esac
-serve_projector "" ""
 
 # In the serving loop, an answered query refusal counts as serving while the
 # projector is parked, and only then.
@@ -504,7 +505,6 @@ stub_bin="$(mktemp -d)"
 trap 'rm -rf "$scoping_root" "$stub_bin"' EXIT
 cat >"$stub_bin/curl" <<'STUB'
 #!/bin/sh
-[ "${HEALTHCHECK_STUB_UNREACHABLE:-0}" -eq 0 ] || exit 7
 for argument in "$@"; do
   url="$argument"
 done
@@ -515,6 +515,11 @@ case "$url" in
     ;;
   *) ;;
 esac
+# An unreachable query still prints the `-w` trailer, as curl does.
+if [ "${HEALTHCHECK_STUB_UNREACHABLE:-0}" -ne 0 ]; then
+  printf '\n000'
+  exit 7
+fi
 printf '%s\n%s' "$HEALTHCHECK_STUB_BODY" "$HEALTHCHECK_STUB_STATUS"
 STUB
 chmod +x "$stub_bin/curl"
@@ -546,8 +551,7 @@ run_healthcheck 503 "$lagging_body" 0 "$parked_body" \
 if run_healthcheck 503 "$lagging_body" 0 "$syncing_body"; then
   test_failure "the healthcheck must fail a lagging query plane behind a syncing projector"
 fi
-if run_healthcheck 503 "$lagging_body" 1 "$parked_body"; then
-  test_failure "the healthcheck must fail an unreachable query plane behind a parked projector"
-fi
+run_healthcheck 200 "$ready_body" 1 "$parked_body" \
+  || test_failure "the healthcheck must pass a parked projector that startup left without query"
 
 printf 'wallet-serving entrypoint tests passed\n'

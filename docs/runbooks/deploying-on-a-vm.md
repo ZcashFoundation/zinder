@@ -589,9 +589,15 @@ parked, it keeps renewing its one canonical retention lease, so the wallet
 later resumes from its cursor without a rebuild, and it plans the transition
 again only after the writer commits. It resumes on its own only if a later
 reorg replaces the refused blocks, and that reconciliation is also one
-transition under the same limit. Native query and compatibility keep answering
-from their last serving pair until it goes stale, then refuse wallets with
-`SERVICE_NOT_READY`.
+transition under the same limit.
+
+Native query and compatibility containers that were already running keep
+answering from their last serving pair until it goes stale, then refuse
+wallets with `SERVICE_NOT_READY`. Neither can publish its first serving pair
+behind the parked wallet, so one that restarts while the projector is parked
+exits during startup, and its `on-failure` policy keeps restarting it until
+the projector recovers. A fresh `docker compose up`, such as after a host
+reboot, does not start either one, because both wait for a healthy projector.
 
 To recover, stop the projector, raise the limit, and start it again:
 

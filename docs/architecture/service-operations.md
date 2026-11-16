@@ -313,7 +313,10 @@ a newer pair. It keeps answering from its last pair while the writer stays
 within `storage.secondary_replica_lag_threshold_chain_epochs`, reports
 `serving_pair_stale` until `storage.serving_pair_staleness_ceiling_ms` passes,
 and then refuses wallets with `SERVICE_NOT_READY` and readiness cause
-`replica_lagging`.
+`replica_lagging`. A query runtime that starts behind a parked projector cannot
+converge its first pair, so its startup fails before its endpoints listen. The
+single-host wallet-serving supervisor therefore does not start query while the
+projector reports the park.
 
 ### Lightwalletd compatibility
 
