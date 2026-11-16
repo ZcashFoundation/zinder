@@ -196,6 +196,72 @@ Per-plane engine mixing multiplies backup, readiness, failover, and support
 combinations. A future topology must define one coherent application contract
 for all required stores and runtimes.
 
+## Topology review status
+
+`rocksdb-single-host` remains the supported topology. A review of whether one
+process and one database per instance would remove costs of the separate
+runtimes is open. It has no result, and this section records its status rather
+than a decision against the alternative. Each figure names its network and
+source. The thresholds below are proposals until the project owner sets
+service objectives in [issue #81](https://github.com/ZcashFoundation/zinder/issues/81).
+
+Status at v0.16.1:
+
+- Secondary catch-up failures under write pressure: not determined. Synthetic
+  load on rust-rocksdb 0.51 produced transient catch-up errors that recovered
+  on retry. Production logs sampled so far show none, but they come mostly from
+  releases that opened a fresh secondary for every publication. A projector
+  catch-up error, or a failed writer-status call, ends the projector process,
+  and the single-host supervisor then restarts the container. In query, a
+  failed candidate catch-up closes that generation and reopens it cold at its
+  next use, while the published pair keeps serving through lag or a deleted
+  table file until the staleness ceiling.
+- Table files deleted by compaction: a read that fails on a table file the
+  primary's compaction deleted marks its serving pair. The publisher replaces
+  the pair at the writer's fence, and the read waits up to five seconds and
+  runs once more. A pinned read whose epoch only the marked pair served ends
+  with `CHAIN_EPOCH_PIN_UNAVAILABLE`. In a local 50-minute Testnet run
+  (Zakura 1.8.6, v0.16.1) a deleted file failed every read on the current pair
+  for about 31 s before this replacement existed. The replacement has not been
+  measured on a deployment.
+- Commit-to-publication delay: measured on Testnet only. In that local run,
+  v0.16.1 had a median of 0.86 s, a 90th percentile of 20.1 s, and a maximum
+  of 34.9 s, against 0.59 s, 0.94 s, and 7.6 s on v0.16.0 over the same
+  blocks. The difference is coalescing: v0.16.1 keeps each replaced pair
+  pinnable for one minute and publishes nothing while no generation is free.
+  It lost no pin, where v0.16.0 failed four of 278 walks with
+  `CHAIN_EPOCH_PIN_UNAVAILABLE`. Simulation on a recorded Mainnet block trace
+  delays about 43% of heights, with a 95th percentile of 25 s. No v0.16 release
+  has run on Mainnet, and the projector exports no lag metric.
+- Long stable views: open. Native streams end with the typed epoch expiry that
+  ADR-0038 specifies. In the compact-blocks-only compatibility runtime, a
+  request that still holds the retired generation stops the next publication,
+  and once lag passes the threshold and the staleness ceiling passes, the
+  runtime refuses clients. Whether a long compatibility stream survives
+  wallet-serving retention is unmeasured.
+- Evidence limits: the comparison of a combined commit and in-process snapshot
+  serving has not been rerun on current code. Benchmark figures come from one
+  host with local NVMe and a Testnet store.
+
+The review closes with a decision recorded here after four measurements: a
+production census on Mainnet, a catch-up run under write pressure that forces
+table-cache eviction, a replay comparison between rust-rocksdb 0.51 and 0.54,
+and a long compatibility-stream run with a real lightwalletd client.
+
+The review reopens early when a production deployment shows any of these:
+
+- A runtime exit or a `storage_unavailable` refusal caused by secondary
+  catch-up, a writer-status call, or a missing table file under a serving pair.
+- A Mainnet commit-to-publication 95th percentile above the owner's freshness
+  objective over seven days, including coalescing, reported with its
+  retention-window and projector-lag components.
+- A compatibility stream that fails after the stream fixes ship.
+- Two or more user-visible incidents in 30 days whose root cause is
+  coordination between runtimes.
+
+Horizontal deployment, including several complete instances behind one
+endpoint, is not supported by this topology. Issue #81 decides it.
+
 ## Revision history
 
 - 2026-11-14: Construction leases belong to the build-owner identity. The same
@@ -204,3 +270,5 @@ for all required stores and runtimes.
   beside the wallet path refuses a concurrent build or discard of that path,
   and a fresh store reaches the wallet path only by rename after its control
   record is durable.
+- 2026-11-16: Records the open topology review, its status at v0.16.1, the
+  measurements that close it, and the conditions that reopen it early.
