@@ -669,7 +669,9 @@ pub fn build_block_based_table_factory(cache: &Cache) -> BlockBasedOptions {
 /// reopen it fails this way until the secondary catches up past the deletion
 /// or is reopened. Corruption, a missing MANIFEST or WAL, and every other
 /// failure return `false`. `rust-rocksdb` exposes only the status text, so
-/// the check matches the I/O status `RocksDB` builds for an absent `.sst`.
+/// the check matches the I/O status `RocksDB` builds for an absent file and
+/// requires the path it reports to end in a numbered table file name, such as
+/// `000199.sst`. A directory name that merely contains `.sst` does not count.
 #[must_use]
 pub fn is_missing_table_file_error(error: &rust_rocksdb::Error) -> bool {
     is_missing_table_file_status(&error.kind(), error.as_ref())
@@ -680,7 +682,19 @@ fn is_missing_table_file_status(kind: &rust_rocksdb::ErrorKind, message: &str) -
         kind,
         rust_rocksdb::ErrorKind::IOError | rust_rocksdb::ErrorKind::NotFound
     ) && message.contains("No such file or directory")
-        && message.contains(".sst")
+        && message.split(": ").any(names_table_file)
+}
+
+/// Reports whether `status_part`, one `": "`-separated part of a `RocksDB`
+/// status, is a path whose file name is a table file `RocksDB` numbered.
+fn names_table_file(status_part: &str) -> bool {
+    Path::new(status_part)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(|file_name| file_name.strip_suffix(".sst"))
+        .is_some_and(|file_number| {
+            !file_number.is_empty() && file_number.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 const PER_CF_INT_PROPERTIES: [&str; 13] = [
@@ -746,9 +760,32 @@ mod tests {
             "IO error: No such file or directory: While open a file for random read: \
              /canonical/000199.sst: No such file or directory"
         ));
+        assert!(is_missing_table_file_status(
+            &rust_rocksdb::ErrorKind::IOError,
+            "IO error: No such file or directory: While open a file for random read: \
+             /data/wallet.sst/1234567.sst: No such file or directory"
+        ));
         assert!(!is_missing_table_file_status(
             &rust_rocksdb::ErrorKind::IOError,
             "IO error: No such file or directory: /canonical/MANIFEST-000123"
+        ));
+        // A directory whose name contains `.sst` does not make its MANIFEST or
+        // WAL a table file.
+        assert!(!is_missing_table_file_status(
+            &rust_rocksdb::ErrorKind::IOError,
+            "IO error: No such file or directory: While opening a file for sequentially \
+             reading: /data/wallet.sst/MANIFEST-000123: No such file or directory"
+        ));
+        assert!(!is_missing_table_file_status(
+            &rust_rocksdb::ErrorKind::IOError,
+            "IO error: No such file or directory: While opening a file for sequentially \
+             reading: /data/000123.sst/000124.log: No such file or directory"
+        ));
+        // Only the status kind rejects this one.
+        assert!(!is_missing_table_file_status(
+            &rust_rocksdb::ErrorKind::Corruption,
+            "IO error: No such file or directory: While open a file for random read: \
+             /canonical/000199.sst: No such file or directory"
         ));
         assert!(!is_missing_table_file_status(
             &rust_rocksdb::ErrorKind::Corruption,
