@@ -898,7 +898,9 @@ current best chain.
 Each retained pair keeps its canonical and wallet secondaries open, with their
 own block caches and memtables, so a wallet-serving reader holds up to four
 secondary pairs at once: the current pair, the candidate it is catching up,
-and two replaced pairs, either retained or still held by a request. The
+and two replaced pairs, either retained or still held by a request. A
+generation also stays open after its pair drains, so the reader catches it up
+for a later block instead of opening it again. The
 `zinder_wallet_serving_pair_publisher_retained_pairs` gauge reports the
 retained count, `zinder_wallet_serving_pair_publisher_pinned_retired_pairs`
 reports the released pairs that requests still hold, and

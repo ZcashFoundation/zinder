@@ -60,7 +60,9 @@ so the baked configs pin every budget that would otherwise be derived from it:
 
 Query keeps up to four serving pairs open, each with its own block caches: the
 current pair, the candidate it is catching up, and two replaced pairs that
-either still answer pinned reads or are held by a long request. The remainder covers allocator
+either still answer pinned reads or are held by a long request. A generation
+stays open after its pair drains so a later block can reuse it, so after three
+blocks within one minute all four stay open until query restarts. The remainder covers allocator
 overhead, gRPC buffers, and task stacks. In a
 smaller container the cgroup OOM-killer takes one process during construction.
 That terminates the whole container, and the restart resumes construction from
@@ -306,6 +308,17 @@ Canonical readiness proves the writer and mempool contract only. Wallet
 readiness proves the projection. Serving readiness proves an admitted
 canonical and wallet pair at an exact fence, and it is the only one that
 proves a client can be answered.
+
+Once serving is ready, each new block reaches wallets within about 1.25
+seconds of the canonical commit: one query refresh
+(`ZINDER_STORAGE__SECONDARY_CATCHUP_INTERVAL_MS`, 1,000 ms by default) plus
+one 250 ms projector poll. Compare `canonical_live_append_committed` in the
+ingest log with `wallet_serving_pair_publisher_published` in the query log
+for the same height. For the first few blocks after a start, query also opens
+and admits a new serving-pair generation, which takes about 25 seconds on
+Testnet. A cold open that recurs on later blocks logs
+`wallet_serving_pair_publisher_generation_opened` after a
+`wallet_serving_pair_publisher_refresh_failed` warning that names the error.
 
 ### Construction deadlines
 

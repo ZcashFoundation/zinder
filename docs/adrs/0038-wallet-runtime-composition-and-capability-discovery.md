@@ -163,6 +163,19 @@ Pair rotation may advance the canonical fence but must preserve retention and
 every other input to the immutable endpoint contract. A candidate that changes
 those inputs is not published.
 
+The serving-pair publisher opens each secondary generation slot once, with
+the full cold admission that
+[ADR-0003](0003-canonical-storage-access-boundary.md) requires. Once the pair
+a generation published is neither retained nor held by a request, the
+publisher takes back sole ownership of that generation's canonical and wallet
+secondaries and catches them up in place for a later candidate. That candidate
+passes the same writer attestation, exact-fence, and source-identity checks as
+a cold one before it is published. Catch-up authenticates store control, build
+identity, and the replay rows that the chain events since the last catch-up
+changed. It does not repeat the cold scan of retained history. A generation
+whose pair is still held is never caught up. A generation whose catch-up fails
+is closed, and its slot is opened cold when it is next used.
+
 ## Consumer admission and certification
 
 Native consumers such as Zallet own the exact capability requirements for each
@@ -260,6 +273,22 @@ end or the process restarts. Revoking reads on a released pair after a fixed
 limit bounds that delay, and the typed expiry already tells consumers to
 restart.
 
+### Open a new generation for every publication
+
+Cold admission scans the retained canonical history, so its cost grows with
+the store rather than with the block. On a Testnet store it took about 25
+seconds, which delayed every publication by that long. Blocks that arrived
+during an open were never published on their own: one Testnet deployment
+published 304 of 605 heights. Catching a drained generation up costs only
+what the new blocks changed.
+
+### Pre-open a warm candidate
+
+Opening the next generation before the block arrives still pays one cold
+admission per block in reader I/O and memory, and a block that arrives before
+the open finishes still waits for it. Reusing a drained generation removes the
+cold open from the steady state instead.
+
 ### Serve only the current pair
 
 Expiring a pin at the next publication fails any workflow that spans a block.
@@ -273,6 +302,10 @@ controlled consumer cutover uses the current contract without shims.
 
 ## Revision history
 
+- 2026-11-16: The serving-pair publisher opens each secondary generation slot
+  once and catches a drained generation up in place for its next publication,
+  instead of opening new secondaries for every block. Cold admission runs when
+  a slot is first used and after a failed catch-up.
 - 2026-11-15: Requests may keep reading a released serving pair for at most
   30 seconds. The publisher then revokes reads on it, and the transparent
   unspent-output and full-block streams end with

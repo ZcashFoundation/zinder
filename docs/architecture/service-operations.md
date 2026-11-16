@@ -574,6 +574,32 @@ a held retired pair leaves no slot free, the publisher releases a retained
 pair that no request holds, so publication continues while up to two retired
 pairs are pinned.
 
+The publisher opens each generation slot cold once: it opens both secondaries
+and runs their full admission, which takes about 25 seconds on a Testnet
+store. Once a slot's pair drains, the publisher catches the same open
+secondaries up in place for a later block, which takes milliseconds. A slot is
+opened cold again only after its catch-up fails.
+`zinder_wallet_serving_pair_publisher_candidate_prepared_total{kind}` counts
+candidates by `kind`: `cold` for a slot opened from the primaries, and
+`recycled` for a drained generation caught up in place.
+`zinder_wallet_serving_pair_publisher_cold_open_duration_seconds{status}`
+records each cold open, and each successful one logs
+`wallet_serving_pair_publisher_generation_opened` with its `generation` and
+`elapsed_ms`. After startup the `cold` count stays at four or fewer, and
+`recycled` rises by one for each published block. A `cold` count that keeps
+rising means refreshes keep failing and closing their generations. The
+`wallet_serving_pair_publisher_refresh_failed` warning before each extra cold
+open names the error.
+
+A new block reaches wallet serving within about one publisher refresh of its
+canonical commit, and every block is published. The publisher refreshes every
+`storage.secondary_catchup_interval_ms` (1,000 ms by default), and the
+projector applies a block within one 250 ms follow poll. The time from
+`canonical_live_append_committed` to `wallet_serving_pair_publisher_published`
+for the same height is therefore at most about 1.25 seconds plus catch-up.
+After a restart, the first blocks wait for a cold open instead, one for each
+slot not yet opened.
+
 A request may keep reading a retired pair for at most 30 seconds after the
 publisher retired it. Past that read limit the publisher revokes reads on the
 pair. The `TransparentAddressUnspentOutputs` and `FullBlocksInRange` streams,
