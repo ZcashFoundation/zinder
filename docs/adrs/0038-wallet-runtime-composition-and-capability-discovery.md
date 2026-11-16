@@ -188,6 +188,14 @@ Each publication carries the writer's fence at the moment its candidate
 converges. The publisher does not publish one pair for each height, so blocks
 that commit within one refresh share one publication at the later height.
 
+Blocks also share a publication when they arrive faster than retention allows.
+Every generation other than the current one may hold a replaced pair inside
+its retention window or a pair that a request still holds. While all of them
+do, the publisher publishes nothing. The first refresh after a generation
+frees publishes the writer's latest fence, and the blocks committed in the
+meantime get no publication of their own. The publisher never opens an extra
+generation to keep up.
+
 ## Consumer admission and certification
 
 Native consumers such as Zallet own the exact capability requirements for each
@@ -196,15 +204,18 @@ missing set before opening or migrating wallet storage. A capability profile
 named after a consumer is not added to Zinder.
 
 Zallet treats an expired exact view as a typed retry condition and reacquires
-the whole workflow boundary. Zinder retains a bounded history of serving pairs:
-the two most recently replaced pairs answer reads pinned to their epochs, each
-for at most one minute after it was replaced. Retention lets a multi-request
-workflow whose reads carry `at_epoch_id`, such as a transparent UTXO refresh
-across a wallet's receivers, finish across a new block without changing the
-expiry contract. A transparent-history first page carries no wire pin and is
-answered from the current pair, so a history walk that starts a new receiver
-after a publication still restarts. Consumer tests must prove that
-a retry does not commit a partial block batch.
+the whole workflow boundary. Zinder retains a bounded history of serving pairs.
+Each replaced pair answers reads pinned to its epoch for one minute after it
+was replaced, however fast later blocks arrive. Publication never releases a
+replaced pair before its minute ends; it waits for a free generation instead.
+Retention lets a multi-request workflow whose reads carry `at_epoch_id`, such
+as a transparent UTXO refresh across a wallet's receivers, finish across new
+blocks without changing the expiry contract. A pair republished at its own
+epoch, as a schedule revision does, leaves retention at once. The pair that
+replaced it answers the same epoch for longer. A transparent-history first
+page carries no wire pin and is answered from the current pair, so a history
+walk that starts a new receiver after a publication still restarts. Consumer
+tests must prove that a retry does not commit a partial block batch.
 
 A request holds the pair it reads, and a held pair keeps its secondary
 generation open. Once the publisher releases a pair from retention, requests
@@ -217,7 +228,9 @@ consumer treats the partial result as void and restarts at a newer epoch.
 These streams also read storage only as fast as the client consumes and stop
 reading when the client cancels or disconnects, so an abandoned read releases
 its pair at once. A slow or abandoned read therefore delays publication by at
-most the read limit and never stops it for other clients.
+most the read limit after its pair leaves retention. Retention and slow reads
+together delay a publication by at most the retention window, the read limit,
+and one page read, about 90 seconds, and never stop publication.
 
 ZODL continues to consume the separate lightwalletd-compatible
 `CompactTxStreamer` surface through trusted TLS at the deployment edge. Native
@@ -271,9 +284,46 @@ handler and evidence.
 ### Retain historical pairs indefinitely
 
 Unbounded pair retention has unbounded storage and resource semantics. Every
-retained pair keeps its own canonical and wallet secondaries open. Two pairs
-for at most one minute cover a multi-request workflow across a burst of
-blocks, and typed view expiry with whole-workflow retry covers the rest.
+retained pair keeps its own canonical and wallet secondaries open. One minute
+of retention for each replaced pair covers a multi-request workflow across a
+burst of blocks, and typed view expiry with whole-workflow retry covers the
+rest.
+
+### Release the oldest retained pair at each publication
+
+A count bound beside the time bound kept a generation free for every block,
+but it tied a pin's lifetime to block spacing. While each publication waited
+about 25 seconds for a cold open, the next two publications took about a
+minute, so the count bound never cut a pin short. Once publication followed
+each block within about a second, four Testnet blocks published within 11
+seconds released a pinned epoch about six seconds after it was replaced. A
+wallet whose transparent UTXO refresh reads about 30 receivers under one pin
+in about 21 seconds lost its pin in 2 of 11 refreshes. A time-only bound keeps
+a pin's lifetime independent of block spacing. It costs publication latency
+only when more than three blocks arrive within one minute.
+
+### Retain more pairs
+
+Each extra generation keeps another canonical and wallet secondary pair open
+with its own block caches, against the memory a wallet-serving reader budgets
+for four. More pairs still bound a pin by a number of blocks, so a fast enough
+burst still releases it.
+
+### Protect only epochs that a read has pinned
+
+Waiting only for pairs that have answered a pinned read would keep one
+publication per block when no client pins. A client learns its epoch from an
+unpinned read and pins it in a later request, so a burst between those two
+requests could still release the epoch. A pinned read can also race the
+publication that releases its pair. The time-only rule needs no per-pair mark
+and has no such race.
+
+### Answer a pin on an ancestor epoch from the current pair
+
+Unspent outputs, transaction status, tree state, and balances differ between
+epochs, so such an answer would mix two epochs, which a pin forbids. Only
+height-addressed blocks at or below the pinned tip are equal in both, and the
+current pair still cannot attest the pinned epoch's chain view.
 
 ### Let requests hold a released pair until they finish
 
@@ -332,6 +382,13 @@ controlled consumer cutover uses the current contract without shims.
 
 ## Revision history
 
+- 2026-11-16: Each replaced serving pair answers reads pinned to its epoch for
+  one minute after it was replaced, however fast later blocks arrive.
+  Publication no longer releases the oldest retained pair, and a retained pair
+  no longer yields its generation to a held one. While no generation is free,
+  the publisher publishes nothing, and the first refresh after one frees
+  publishes the writer's latest fence. A pair republished at its own epoch
+  leaves retention at once.
 - 2026-11-16: The serving-pair publisher catches a drained generation up in
   place for its next publication, instead of opening new secondaries for every
   block. Cold admission runs when a slot is first used and after a failed
