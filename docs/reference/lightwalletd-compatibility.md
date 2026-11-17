@@ -154,10 +154,9 @@ that identity response. Its fields follow
 [Identity and live-tip responses](#identity-and-live-tip-responses).
 
 A compact-blocks `GetBlockRange` stream holds a canonical generation only
-while it reads one chunk of at most 1,000 blocks, never while it waits for its
-client. A slow stream therefore does not keep the publisher from reopening
-the inactive generation, so publication and readiness do not depend on any
-client's pace.
+while it reads one chunk, never while it waits for its client. A slow stream
+therefore does not keep the publisher from reopening the inactive generation,
+so publication and readiness do not depend on any client's pace.
 
 ## Block range transaction contents
 
@@ -195,6 +194,11 @@ block is sent. A stream that has started can also end with `ABORTED` or
 `OUT_OF_RANGE` after the blocks it sent, when a reorg reaches the chain it is
 sending; see [Block range consistency](#block-range-consistency).
 
+A `GetBlockRange` or `GetBlockRangeNullifiers` request that arrives while the
+process already serves its limit of concurrent block-range streams fails with
+`RESOURCE_EXHAUSTED` before any read. Retry it later. lightwalletd sets no such
+limit; see [Block range resource limits](#block-range-resource-limits).
+
 Unary block lookups validate the selector before reading. Height 0 with a
 32-byte hash is a hash lookup. Height 0 with an empty hash is an unspecified
 identifier, so `GetBlock` returns `INVALID_ARGUMENT` for it in both serving
@@ -204,18 +208,27 @@ served.
 ## Block range consistency
 
 `GetBlockRange` in both serving modes, and `GetBlockRangeNullifiers` in wallet
-serving, read a range wider than 1,000 blocks in chunks of at most 1,000. The
-first chunk is read at the chain view current when the request arrives, before
-the response starts. Each later chunk is read at the view current when the
-server reads it, and continues the stream only when it links by hash to the
-last block the stream sent
+serving, read a range in chunks of at most 1,000 blocks and at most 2 MiB of
+compact blocks, as [Chunk size](#chunk-size) describes. A range of large
+blocks therefore takes several chunks even when it spans fewer than 1,000
+heights. The first chunk is read at the chain view current when the request
+arrives, before the response starts. Each later chunk is read at the view
+current when the server reads it, and continues the stream only when it links
+by hash to the last block the stream sent
 ([ADR-0038](../adrs/0038-wallet-runtime-composition-and-capability-discovery.md#compatibility-block-range-streams)).
-A client can rely on the following:
+Every chunk edge carries the same hash check, whatever ended the chunk before
+it. A client can rely on the following:
 
-1. **Request-time outcomes.** `INVALID_ARGUMENT` for a malformed request,
-   `OUT_OF_RANGE` when the higher bound is above the visible tip when the
-   request arrives, and `NOT_FOUND` when the first chunk touches a height the
-   store does not hold. These fail the call before any block is sent.
+1. **Request-time outcomes.** These fail the call before any block is sent:
+   - `INVALID_ARGUMENT` for a malformed request, whatever the server's load.
+   - `RESOURCE_EXHAUSTED` when the server already serves its limit of
+     block-range streams, as [Concurrent streams](#concurrent-streams)
+     describes.
+   - `OUT_OF_RANGE` when the higher bound is above the visible tip when the
+     request arrives.
+   - `NOT_FOUND` when one of the first 1,000 heights the stream would send is
+     outside the store's retained history, even when the first chunk stops
+     before that height.
 2. **Order and coverage.** Blocks arrive at consecutive heights in the
    requested direction. A stream that ends `OK` has sent every requested
    height exactly once.
@@ -231,13 +244,18 @@ A client can rely on the following:
    best chain when the client receives them.
 5. **No time limit.** The server does not end a stream because of elapsed
    time, new blocks, or how slowly the client reads. Process shutdown and
-   drain still end open streams. A client that stops reading holds no serving
-   pair or generation, only the blocks already queued for it, plus transport
-   buffers:
+   drain still end open streams, and so does a connection that stops
+   answering HTTP/2 keepalive pings. A client that stops reading holds no
+   serving pair or generation, only the blocks already queued for it, plus
+   transport buffers:
    - Until the client has received the whole first chunk, the rest of that
      chunk and the next chunk are queued, at most two chunks.
    - After that, at most one chunk is queued, plus a buffer of 16 blocks in
      wallet serving or 8 in compact-blocks serving.
+   - Beyond the server, the client's HTTP/2 stream window holds the blocks
+     already sent but not yet read by the wallet.
+     [Block range resource limits](#block-range-resource-limits) sizes each
+     term.
 6. **Reorg ending.** An ascending stream ends early when a reorg replaces the
    last block it sent or any block below it. A descending stream ends early
    when a reorg replaces the next height it has to send. Either ending comes
@@ -261,6 +279,185 @@ A client can rely on the following:
    ends it with `NOT_FOUND`. In wallet serving, a reorg that lowers the tip in
    the moment between a chunk's tip check and its read also ends the stream
    with `NOT_FOUND`.
+
+## Block range resource limits
+
+`GetBlockRange` and `GetBlockRangeNullifiers` streams are the compatibility
+runtime's largest memory term after its block caches. Three mechanisms limit
+what the streams hold:
+
+- The chunk cap limits the stored blocks that one chunk read keeps.
+- A process-wide limit bounds how many streams run at once.
+- HTTP/2 keepalive ends the streams of clients that vanished.
+
+None of them sets a byte maximum on that memory, and the total is not
+measured.
+
+### Chunk size
+
+A chunk holds at most 1,000 blocks and at most 2 MiB of compact blocks. The
+2 MiB counts each block as the store holds it, the whole compact block before
+pool filtering, because that is what the read materializes. So
+`GetBlockRangeNullifiers` reads the same chunks as `GetBlockRange` although it
+sends smaller messages.
+
+- The read walks the range in the order the stream sends it and stops before
+  the block that would take the chunk past 2 MiB. A range of small blocks
+  keeps 1,000-block chunks, and a range of large blocks is read and sent in
+  smaller ones.
+- A chunk always holds at least one block, so a single block larger than
+  2 MiB is read and sent alone.
+- Before it reads, a chunk checks that every height it could cover, up to
+  1,000, is in retained history. A range that reaches outside it ends with
+  `NOT_FOUND` exactly where a 1,000-block chunk would end.
+- The store fetches rows in batches. The first batch is one row. Each later
+  batch fetches as many rows as the budget left holds at the size of the
+  largest row the read has seen, up to 16. While block sizes stay steady, the
+  rows a read fetches past the point where it stops therefore fit in the
+  budget it had left. A read that meets blocks larger than any it has seen
+  can fetch up to 16 of them in one batch. The read releases the rows it does
+  not keep before it returns.
+
+The cap is fixed. On Testnet, 1,000-block stretches of heavy blocks measured
+2.1 to 8.8 MB on the wire, so such a stretch is read in two to five chunks.
+
+### One stream
+
+The server holds, for one stream:
+
+- The chunk it is reading: at most 2 MiB of stored blocks, or one block that
+  is larger. The read decodes each block into values that it allocates
+  separately. The encoding then builds lightwalletd messages with byte
+  vectors of their own while the decoded chunk is still held. After that, the
+  encoded chunk waits for the client.
+- During a read, the rows it fetched but does not keep: within the chunk's
+  2 MiB of stored bytes while block sizes stay steady, and up to 16 blocks
+  when the read meets blocks larger than any before them.
+- Up to 16 queued blocks in wallet serving, or 8 in compact-blocks serving.
+  These are whole blocks, so their size follows the blocks in the range, not
+  the chunk cap.
+- Up to 400 KiB in the stream's HTTP/2 send buffer and about 32 KiB of gRPC
+  encoding buffer. The encoding buffer can exceed 32 KiB by one block.
+
+At the start of a stream, the first chunk and the second can both be held.
+Later, the stream holds the chunk it is reading and the blocks queued from
+the chunk before it.
+
+The server enforces these limits for one stream:
+
+- The stored bytes that one chunk read keeps, and the 1,000-block maximum of
+  a chunk.
+- The number of chunks the stream holds at once.
+- The number of queued blocks.
+
+It does not limit the bytes behind them:
+
+- A chunk takes more memory than its stored bytes, because the decoded
+  blocks and the encoded messages each allocate their own values. How much
+  more depends on the shape of the blocks and is not measured.
+- A block larger than 2 MiB is read alone, so its own size sets the size of
+  its chunk.
+- Queued blocks are whole blocks of any size.
+
+The memory one stream holds therefore has no maximum that the server
+enforces, and it is not measured.
+
+The client holds one more term. Its HTTP/2 stream window bounds how far the
+server can send ahead of what the wallet has read, and those blocks sit in
+the client's memory, not the server's. tonic and hyper clients default to a
+2 MiB stream window and a 5 MiB connection window; other gRPC stacks use
+other windows. A tonic client that stopped reading on Testnet held about
+2 MiB of unread blocks while the server's socket send queue stayed under
+3 KB.
+
+### Concurrent streams
+
+`compat.max_concurrent_block_range_streams`
+(`ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS`) limits how many
+`GetBlockRange` and `GetBlockRangeNullifiers` streams the process serves at
+once. It defaults to 100 and accepts 1 to 65,536.
+
+- A stream takes a slot once its request is validated, so a malformed
+  request gets `INVALID_ARGUMENT` whatever the load. It returns the slot when
+  the stream ends or fails, or when the client cancels it or disconnects,
+  once no chunk read of the stream is still running. A chunk read that has
+  started finishes even after the client has gone, so the slot stays taken
+  for at most one more chunk read. This holds for the first chunk, which the
+  server reads before it answers, and for the chunks its background reader
+  reads later.
+- A valid request past the limit fails with `RESOURCE_EXHAUSTED` before any
+  read, and `zinder_compat_block_range_stream_refusals_total` counts it.
+  `zinder_compat_block_range_streams_open` reports how many streams hold a
+  slot.
+- The Zcash Android SDK retries a failed batch, so a refusal delays its sync
+  rather than failing it. How other clients handle `RESOURCE_EXHAUSTED` is not
+  verified.
+
+A syncing wallet holds few block-range streams at once, so the default
+serves many syncing wallets. The limit bounds how many streams hold the
+terms in [One stream](#one-stream), not how many bytes they hold together.
+That total is not measured, at the default or at any other limit.
+
+Size the limit to the memory left after the block caches described below.
+Then check the container's memory while
+`zinder_compat_block_range_streams_open` is near the limit, with the blocks
+your wallets request. Freed memory can stay with the allocator after the
+streams end.
+
+Every client shares the limit, and the server cannot tell clients apart.
+Behind a proxy, every wallet arrives over the proxy's connections. A stream
+has no time limit (point 5 of
+[Block range consistency](#block-range-consistency)), and a client that stops
+reading still answers keepalive pings. One client that opens as many streams
+as the limit and stops reading therefore holds every slot, and the server
+refuses other wallets until that client disconnects. A public endpoint should
+limit concurrent requests per client at its edge. The shipped Caddy template
+sets no such limit.
+
+### Connections
+
+The compatibility server limits one HTTP/2 connection to 200 concurrent
+streams, which is hyper's own server default. A client at that limit queues
+further streams or opens another connection, depending on its HTTP/2 stack.
+
+The server pings a connection after one minute without a frame from it and
+closes the connection when a ping goes unanswered for 20 seconds. Closing it
+ends its streams and returns their slots, so a wallet that vanished without
+closing its connection holds its slot for about 80 seconds. A client that is
+connected but reads slowly still answers pings and keeps its stream.
+
+Behind a TLS proxy or managed edge, the server talks to the proxy, not to the
+wallets:
+
+- The pings reach the proxy, so the proxy's own timeouts decide when a
+  vanished wallet's stream is cancelled. The shipped Caddy template,
+  `deploy/compat-lightwalletd.Caddyfile`, sets no timeouts, so Caddy's
+  defaults apply. How long they let a vanished wallet hold a slot is not
+  measured.
+- The proxy carries every wallet's streams over its own connections to the
+  server, so the 200-stream limit applies to each proxy connection, not to
+  each wallet. Whether Caddy opens another connection or queues streams at
+  that limit is not verified.
+
+These connection settings are fixed. lightwalletd sets no stream limit per
+connection or per process. It keeps grpc-go's server defaults, which advertise
+no stream limit and ping a connection only after two hours without activity,
+and it never returns `RESOURCE_EXHAUSTED`. It reads and sends one block at a
+time through an unbuffered channel, so its server holds about one block per
+stream.
+
+### Block caches
+
+In wallet serving, the compatibility runtime keeps up to four reader
+generations open, as native query does. Each generation is a canonical and a
+wallet secondary, and each secondary has its own block cache: by default
+128 MiB for the canonical reader, or one eighth of the container memory limit
+up to 512 MiB, and 64 MiB for the wallet reader. A generation stays open
+until the process restarts, and its caches fill with the history that
+streams read while it was current. Plan for four times one generation's cache
+budget. Under the Compose default memory limit of 4 GiB, which derives
+512 MiB canonical caches, that is about 2.25 GiB. Compact-blocks serving
+keeps two canonical generations.
 
 ## Transaction lookup
 

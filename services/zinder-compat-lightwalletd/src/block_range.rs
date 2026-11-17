@@ -1,23 +1,358 @@
-//! Chain continuity across the chunk reads of one lightwalletd block-range
-//! stream.
+//! Chunk planning, chain continuity, and the concurrency limit of lightwalletd
+//! block-range streams.
 //!
-//! A `GetBlockRange` wider than one store read is served as a sequence of
-//! chunk reads. Each chunk after the first is read at the chain view current
-//! when the server reads it, so a stream never holds a serving pair or a
-//! compact-blocks generation while it waits for its client. A later chunk
-//! continues the stream only when it links by hash to the last block the
-//! stream sent. A block hash commits to its parent, so that one link proves
-//! the blocks sent and the blocks to come form one chain. Otherwise a reorg
-//! replaced a block the stream needs, and the stream ends after the blocks it
-//! already sent with the code lightwalletd returns for the same case:
-//! `ABORTED` for a broken link, and `OUT_OF_RANGE` when the visible tip fell
-//! below a height still to send. ADR-0038, "Compatibility block-range
-//! streams", records the contract.
+//! A `GetBlockRange` is served as a sequence of chunk reads. A chunk holds at
+//! most 1,000 blocks and at most [`BLOCK_RANGE_CHUNK_MAX_BYTES`] of stored
+//! compact blocks, or one block when that block alone is larger, so a range
+//! of large blocks is read and sent in smaller chunks. Each chunk after the
+//! first is read at the chain view current when the server reads it, so a
+//! stream never holds a serving pair or a compact-blocks generation while it
+//! waits for its client. A later chunk continues the stream only when it
+//! links by hash to the last block the stream sent. A block hash commits to
+//! its parent, so that one link proves the blocks sent and the blocks to come
+//! form one chain. Otherwise a reorg replaced a block the stream needs, and
+//! the stream ends after the blocks it already sent with the code lightwalletd
+//! returns for the same case: `ABORTED` for a broken link, and `OUT_OF_RANGE`
+//! when the visible tip fell below a height still to send. ADR-0038,
+//! "Compatibility block-range streams", records the contract.
+//!
+//! A stream holds one slot of a process-wide [`BlockRangeStreamLimit`] from
+//! its admission until its response is dropped and every chunk read of the
+//! stream has finished, so the number of slots bounds how many streams hold chunks
+//! at once.
 
+use std::{
+    num::NonZeroU32,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
+
+use tokio::sync::{
+    OwnedSemaphorePermit, Semaphore,
+    mpsc::{self, error::SendError},
+};
+use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 use tonic::Status;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, CompactBlockArtifact,
 };
+use zinder_query::DEFAULT_MAX_COMPACT_BLOCK_RANGE;
+use zinder_store::HeightOrder;
+
+/// Stored compact-block bytes one block-range chunk keeps at most.
+///
+/// A chunk keeps one block even when that block alone is larger. The stored
+/// encoding is the whole compact block before pool filtering, which is what a
+/// chunk read materializes, so `GetBlockRangeNullifiers` reads the same chunks
+/// as `GetBlockRange`.
+pub const BLOCK_RANGE_CHUNK_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// Default for the process-wide limit on concurrent `GetBlockRange` and
+/// `GetBlockRangeNullifiers` streams.
+pub const DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS: NonZeroU32 =
+    NonZeroU32::MIN.saturating_add(99);
+
+/// Plans the chunk reads of one block-range stream in wire order.
+///
+/// [`Self::next_chunk`] offers up to 1,000 heights at the end of the
+/// remaining range that the stream sends first. A byte-bounded read keeps a
+/// run of them from that end, and [`Self::advance`] moves past the blocks it
+/// kept, so the next chunk starts at the next height to send.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockRangeChunks {
+    /// Heights no chunk has covered yet, or `None` once every height has.
+    remaining: Option<BlockHeightRange>,
+    is_descending: bool,
+}
+
+impl BlockRangeChunks {
+    /// Plans the chunks of `range` in the order the stream sends them.
+    #[must_use]
+    pub const fn new(range: BlockHeightRange, is_descending: bool) -> Self {
+        let remaining = if range.start.value() <= range.end.value() {
+            Some(range)
+        } else {
+            None
+        };
+        Self {
+            remaining,
+            is_descending,
+        }
+    }
+
+    /// Returns whether a chunk remains to be read.
+    #[must_use]
+    pub const fn has_remaining(&self) -> bool {
+        self.remaining.is_some()
+    }
+
+    /// Returns the height order of the stream, which every chunk read walks.
+    #[must_use]
+    pub const fn order(&self) -> HeightOrder {
+        if self.is_descending {
+            HeightOrder::Descending
+        } else {
+            HeightOrder::Ascending
+        }
+    }
+
+    /// Returns the heights the next chunk read may cover: up to 1,000 at the
+    /// end of the remaining range that the stream sends first.
+    #[must_use]
+    pub fn next_chunk(&self) -> Option<BlockHeightRange> {
+        let remaining = self.remaining?;
+        let span = DEFAULT_MAX_COMPACT_BLOCK_RANGE.get().saturating_sub(1);
+        Some(if self.is_descending {
+            let start = remaining
+                .end
+                .value()
+                .saturating_sub(span)
+                .max(remaining.start.value());
+            BlockHeightRange::inclusive(BlockHeight::new(start), remaining.end)
+        } else {
+            let end = remaining
+                .start
+                .value()
+                .saturating_add(span)
+                .min(remaining.end.value());
+            BlockHeightRange::inclusive(remaining.start, BlockHeight::new(end))
+        })
+    }
+
+    /// Moves past `read_blocks` heights at the end of the remaining range
+    /// that the stream sends first.
+    ///
+    /// A read that kept no block leaves the plan unchanged. Its caller must
+    /// end the stream, as the continuity check of an empty chunk does.
+    pub fn advance(&mut self, read_blocks: usize) {
+        let Some(remaining) = self.remaining else {
+            return;
+        };
+        let span = remaining.end.value() - remaining.start.value();
+        match u32::try_from(read_blocks) {
+            Ok(0) => {}
+            Ok(read_blocks) if read_blocks <= span => {
+                self.remaining = Some(if self.is_descending {
+                    BlockHeightRange::inclusive(
+                        remaining.start,
+                        BlockHeight::new(remaining.end.value() - read_blocks),
+                    )
+                } else {
+                    BlockHeightRange::inclusive(
+                        BlockHeight::new(remaining.start.value() + read_blocks),
+                        remaining.end,
+                    )
+                });
+            }
+            _ => self.remaining = None,
+        }
+    }
+}
+
+/// Gauge of the block-range streams that hold a slot.
+const OPEN_STREAMS_GAUGE: &str = "zinder_compat_block_range_streams_open";
+
+/// Process-wide limit on concurrent `GetBlockRange` and
+/// `GetBlockRangeNullifiers` streams.
+///
+/// Clones share one limit. A stream takes a slot after its request passes
+/// validation. It returns the slot when the stream ends, fails, or the client
+/// goes away, and no chunk read of the stream is still running.
+#[derive(Clone, Debug)]
+pub struct BlockRangeStreamLimit {
+    slots: Arc<Semaphore>,
+    max_streams: NonZeroU32,
+}
+
+impl BlockRangeStreamLimit {
+    /// Creates a limit that admits at most `max_streams` streams at once.
+    #[must_use]
+    pub fn new(max_streams: NonZeroU32) -> Self {
+        let permits = usize::try_from(max_streams.get())
+            .unwrap_or(Semaphore::MAX_PERMITS)
+            .min(Semaphore::MAX_PERMITS);
+        // Publishes the gauge before the first stream opens. Setting it to
+        // zero would discard the slots that other limits in the process hold.
+        metrics::gauge!(OPEN_STREAMS_GAUGE).increment(0.0);
+        Self {
+            slots: Arc::new(Semaphore::new(permits)),
+            max_streams,
+        }
+    }
+
+    /// Returns the most streams this limit admits at once.
+    #[must_use]
+    pub const fn max_streams(&self) -> NonZeroU32 {
+        self.max_streams
+    }
+
+    /// Takes a slot for one new stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RESOURCE_EXHAUSTED` when every slot is taken, and counts the
+    /// refusal in `zinder_compat_block_range_stream_refusals_total`.
+    pub fn try_open(&self) -> Result<BlockRangeStreamSlot, Status> {
+        let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() else {
+            metrics::counter!("zinder_compat_block_range_stream_refusals_total").increment(1);
+            return Err(Status::resource_exhausted(format!(
+                "this server already serves its limit of {} concurrent block-range streams",
+                self.max_streams
+            )));
+        };
+        Ok(BlockRangeStreamSlot {
+            _open_stream: Arc::new(OpenStream::new(permit)),
+        })
+    }
+}
+
+/// A taken slot, counted in `zinder_compat_block_range_streams_open` until it
+/// is dropped.
+///
+/// The gauge moves by one on each open and close rather than taking a count,
+/// so concurrent opens and closes cannot leave it at a stale value.
+#[derive(Debug)]
+struct OpenStream {
+    _permit: OwnedSemaphorePermit,
+}
+
+impl OpenStream {
+    fn new(permit: OwnedSemaphorePermit) -> Self {
+        metrics::gauge!(OPEN_STREAMS_GAUGE).increment(1.0);
+        Self { _permit: permit }
+    }
+}
+
+impl Drop for OpenStream {
+    fn drop(&mut self) {
+        metrics::gauge!(OPEN_STREAMS_GAUGE).decrement(1.0);
+    }
+}
+
+/// A block-range response: the blocks a stream sends, in wire order.
+pub type BlockRangeResponse<Message> = Pin<Box<dyn Stream<Item = Message> + Send + 'static>>;
+
+/// One stream's slot of a [`BlockRangeStreamLimit`].
+///
+/// The slot returns to the limit once every holder has dropped it: the
+/// response, the [`BlockRangeSink`] of the stream's reader for a stream of
+/// more than one chunk, and a read run with [`Self::hold_during`] that has
+/// not finished.
+#[derive(Clone, Debug)]
+pub struct BlockRangeStreamSlot {
+    _open_stream: Arc<OpenStream>,
+}
+
+impl BlockRangeStreamSlot {
+    /// Runs `read` on a task of its own that holds this slot until `read`
+    /// has finished and its output is dropped, and returns that output.
+    ///
+    /// A store read runs on the blocking pool, which finishes it even after
+    /// its caller is cancelled. A client that cancels its request during
+    /// `read` therefore cannot return the slot while `read` still holds the
+    /// chunk it reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of `read`, or `UNAVAILABLE` when the task that runs
+    /// `read` panics.
+    pub async fn hold_during<Output, Read>(&self, read: Read) -> Result<Output, Status>
+    where
+        Output: Send + 'static,
+        Read: Future<Output = Result<Output, Status>> + Send + 'static,
+    {
+        let stream_slot = self.clone();
+        let (outcome, _stream_slot) = tokio::spawn(async move { (read.await, stream_slot) })
+            .await
+            .map_err(|error| Status::unavailable(format!("block-range read failed: {error}")))?;
+        outcome
+    }
+
+    /// Returns a response that sends `messages` and holds this slot until it
+    /// is dropped.
+    #[must_use]
+    pub fn hold_for<Message: Send + 'static>(
+        self,
+        messages: Vec<Message>,
+    ) -> BlockRangeResponse<Message> {
+        self.hold_for_stream(Box::pin(tokio_stream::iter(messages)))
+    }
+
+    /// Returns a response that sends `first_messages` and then what `reader`
+    /// queues, at most `capacity` messages ahead of the client, and spawns
+    /// `reader` to read the later chunks.
+    ///
+    /// The response and the reader's sink each hold this slot, so the reader
+    /// keeps the slot while it reads, even after the client has gone away.
+    #[must_use]
+    pub fn hold_with_reader<Message, Reader>(
+        self,
+        first_messages: Vec<Message>,
+        capacity: usize,
+        reader: impl FnOnce(BlockRangeSink<Message>) -> Reader,
+    ) -> BlockRangeResponse<Message>
+    where
+        Message: Send + 'static,
+        Reader: Future<Output = ()> + Send + 'static,
+    {
+        let (messages, queued_messages) = mpsc::channel(capacity);
+        tokio::spawn(reader(BlockRangeSink {
+            messages,
+            _stream_slot: self.clone(),
+        }));
+        self.hold_for_stream(Box::pin(
+            tokio_stream::iter(first_messages).chain(ReceiverStream::new(queued_messages)),
+        ))
+    }
+
+    fn hold_for_stream<Message: 'static>(
+        self,
+        stream: BlockRangeResponse<Message>,
+    ) -> BlockRangeResponse<Message> {
+        Box::pin(SlotHoldingStream {
+            stream,
+            _slot: self,
+        })
+    }
+}
+
+/// Where the reader of a stream's later chunks queues their messages.
+///
+/// It holds the stream's slot until the reader drops it.
+#[derive(Debug)]
+pub struct BlockRangeSink<Message> {
+    messages: mpsc::Sender<Message>,
+    _stream_slot: BlockRangeStreamSlot,
+}
+
+impl<Message> BlockRangeSink<Message> {
+    /// Queues `message` for the client, waiting while the queue is full.
+    ///
+    /// # Errors
+    ///
+    /// Returns the message when the client has dropped the response.
+    pub async fn send(&self, message: Message) -> Result<(), SendError<Message>> {
+        self.messages.send(message).await
+    }
+}
+
+struct SlotHoldingStream<S> {
+    stream: S,
+    _slot: BlockRangeStreamSlot,
+}
+
+impl<S: Stream + Unpin> Stream for SlotHoldingStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<S::Item>> {
+        Pin::new(&mut self.stream).poll_next(context)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.stream.size_hint()
+    }
+}
 
 /// The last block a lightwalletd block-range stream sent, and the chain view
 /// it was read at.
@@ -65,9 +400,9 @@ impl BlockRangeContinuity {
     ///
     /// # Errors
     ///
-    /// Returns `UNAVAILABLE` when `blocks` is empty. A compact-block range
-    /// read returns every requested height or fails, so an empty chunk means
-    /// the store broke that contract.
+    /// Returns `UNAVAILABLE` when `blocks` is empty. A chunk read keeps at
+    /// least one block or fails, so an empty chunk means the store broke that
+    /// contract.
     pub fn after_first_chunk(
         blocks: &[CompactBlockArtifact],
         chain_epoch_id: ChainEpochId,
@@ -116,9 +451,10 @@ impl BlockRangeContinuity {
         Ok(())
     }
 
-    /// Accepts `blocks`, the compact blocks of `next_chunk` in ascending
-    /// height order read at `read_at`, when they continue the chain the stream
-    /// has sent, and moves past them.
+    /// Accepts `blocks`, the compact blocks a read of `next_chunk` at
+    /// `read_at` kept from the end the stream sends first, in ascending height
+    /// order, when they continue the chain the stream has sent, and moves past
+    /// them.
     ///
     /// Ascending, the chunk's lowest block must sit one height above the last
     /// block sent and name it as its parent. Descending, the chunk's highest
@@ -197,6 +533,8 @@ impl BlockRangeContinuity {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+
     use tonic::Code;
     use zinder_core::{
         ArtifactSchemaVersion, BlockHash, BlockHeight, BlockHeightRange, BlockId, ChainEpoch,
@@ -204,7 +542,9 @@ mod tests {
         UnixTimestampMillis,
     };
 
-    use super::BlockRangeContinuity;
+    use zinder_store::HeightOrder;
+
+    use super::{BlockRangeChunks, BlockRangeContinuity, BlockRangeStreamLimit};
 
     const SENT_EPOCH: ChainEpochId = ChainEpochId::new(4);
     const CURRENT_EPOCH: ChainEpochId = ChainEpochId::new(5);
@@ -380,5 +720,120 @@ mod tests {
             outcome.err().map(|status| status.code()),
             Some(Code::Unavailable)
         );
+    }
+
+    /// Plans every chunk of `chunks`, assuming each read keeps the whole
+    /// chunk it was offered.
+    fn drain(chunks: &mut BlockRangeChunks) -> Vec<BlockHeightRange> {
+        std::iter::from_fn(|| {
+            let chunk = chunks.next_chunk()?;
+            chunks.advance(chunk.into_iter().len());
+            Some(chunk)
+        })
+        .collect()
+    }
+
+    #[test]
+    fn chunks_hold_at_most_one_store_read_and_preserve_direction() {
+        let mut ascending = BlockRangeChunks::new(range(1, 2_500), false);
+        assert_eq!(ascending.order(), HeightOrder::Ascending);
+        assert_eq!(
+            drain(&mut ascending),
+            vec![range(1, 1_000), range(1_001, 2_000), range(2_001, 2_500)]
+        );
+        assert!(!ascending.has_remaining());
+
+        let mut descending = BlockRangeChunks::new(range(1, 2_500), true);
+        assert_eq!(descending.order(), HeightOrder::Descending);
+        assert_eq!(
+            drain(&mut descending),
+            vec![range(1_501, 2_500), range(501, 1_500), range(1, 500)]
+        );
+
+        let mut single = BlockRangeChunks::new(range(7, 7), true);
+        assert_eq!(drain(&mut single), vec![range(7, 7)]);
+        let mut top = BlockRangeChunks::new(range(u32::MAX - 1, u32::MAX), false);
+        assert_eq!(drain(&mut top), vec![range(u32::MAX - 1, u32::MAX)]);
+        let mut whole = BlockRangeChunks::new(range(0, u32::MAX), true);
+        assert_eq!(whole.next_chunk(), Some(range(u32::MAX - 999, u32::MAX)));
+        whole.advance(usize::MAX);
+        assert!(!whole.has_remaining());
+    }
+
+    #[test]
+    fn the_next_chunk_starts_after_the_blocks_a_read_kept() {
+        let mut ascending = BlockRangeChunks::new(range(1, 3_000), false);
+        assert_eq!(ascending.next_chunk(), Some(range(1, 1_000)));
+        // A byte-bounded read kept 120 of the 1,000 heights it was offered.
+        ascending.advance(120);
+        assert_eq!(ascending.next_chunk(), Some(range(121, 1_120)));
+        ascending.advance(1);
+        assert_eq!(ascending.next_chunk(), Some(range(122, 1_121)));
+        // A read that kept nothing leaves the plan where it was.
+        ascending.advance(0);
+        assert_eq!(ascending.next_chunk(), Some(range(122, 1_121)));
+        ascending.advance(2_878);
+        assert_eq!(ascending.next_chunk(), Some(range(3_000, 3_000)));
+        ascending.advance(1);
+        assert_eq!(ascending.next_chunk(), None);
+
+        let mut descending = BlockRangeChunks::new(range(1, 3_000), true);
+        assert_eq!(descending.next_chunk(), Some(range(2_001, 3_000)));
+        descending.advance(120);
+        assert_eq!(descending.next_chunk(), Some(range(1_881, 2_880)));
+        descending.advance(2_880);
+        assert!(!descending.has_remaining());
+    }
+
+    #[test]
+    fn the_stream_limit_refuses_past_its_slots_until_one_is_returned() -> Result<(), tonic::Status>
+    {
+        let limit = BlockRangeStreamLimit::new(NonZeroU32::MIN.saturating_add(1));
+        let response_side = limit.try_open()?;
+        let other_stream = limit.try_open()?;
+        assert_eq!(
+            limit.try_open().err().map(|status| status.code()),
+            Some(Code::ResourceExhausted)
+        );
+
+        // A slot shared by a response and its reader returns only when both
+        // are dropped.
+        let reader_side = response_side.clone();
+        drop(response_side);
+        assert!(limit.try_open().is_err());
+        drop(reader_side);
+        let reopened = limit.try_open()?;
+        drop((reopened, other_stream));
+        Ok(())
+    }
+
+    #[test]
+    fn the_open_streams_gauge_counts_each_slot_until_its_last_holder_drops_it()
+    -> Result<(), tonic::Status> {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let open_streams = || {
+            handle.render().lines().find_map(|line| {
+                line.strip_prefix("zinder_compat_block_range_streams_open ")?
+                    .parse::<f64>()
+                    .ok()
+            })
+        };
+        metrics::with_local_recorder(&recorder, || {
+            let limit = BlockRangeStreamLimit::new(NonZeroU32::MIN.saturating_add(1));
+            assert_eq!(open_streams(), Some(0.0));
+            let response_side = limit.try_open()?;
+            let other_stream = limit.try_open()?;
+            let reader_side = response_side.clone();
+            // A limit created while streams are open leaves their count alone.
+            let _other_limit = BlockRangeStreamLimit::new(NonZeroU32::MIN);
+            assert_eq!(open_streams(), Some(2.0));
+
+            drop((response_side, other_stream));
+            assert_eq!(open_streams(), Some(1.0));
+            drop(reader_side);
+            assert_eq!(open_streams(), Some(0.0));
+            Ok(())
+        })
     }
 }

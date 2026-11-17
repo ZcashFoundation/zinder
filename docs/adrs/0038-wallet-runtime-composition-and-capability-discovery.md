@@ -299,10 +299,12 @@ keeps one stream open for more than eight minutes while new blocks arrive. No
 pin covers that. A replaced pair answers its epoch for one minute, and a
 request that holds a pair past that delays publication for every client.
 
-The compatibility runtime therefore binds each chunk of at most 1,000 blocks,
-not the stream, to one chain view. Both serving modes apply this rule to
-`GetBlockRange`. Wallet serving also applies it to `GetBlockRangeNullifiers`,
-which compact-blocks serving does not serve.
+The compatibility runtime therefore binds each chunk, not the stream, to one
+chain view. A chunk holds at most 1,000 blocks and at most 2 MiB of stored
+compact blocks, or one larger block, so the stored blocks one chunk read
+keeps do not grow with the number of large blocks in the range. Both serving
+modes apply this rule to `GetBlockRange`. Wallet serving also applies it to
+`GetBlockRangeNullifiers`, which compact-blocks serving does not serve.
 
 - The first chunk is read at the epoch current when the request arrives,
   before the response starts, and the range bounds are checked against that
@@ -550,6 +552,17 @@ response would still contain a block whose parent is not the block sent
 before it, so a client could not trust one `OK` stream as one chain. Ending
 the stream lets the wallet read the new branch in a fresh request.
 
+### Size each block-range chunk from the blocks of the chunk before it
+
+A size derived from the previous chunk's average block is a target, not a
+bound. The first chunk has no chunk before it, and a chunk that enters dense
+blocks after sparse ones is sized for the sparse ones, so either can hold
+1,000 dense blocks. A read that stops at a byte budget bounds every chunk,
+the first included. The budget is fixed rather than configurable, because the
+reference tells operators to watch container memory while
+`zinder_compat_block_range_streams_open` is near the limit, and that guidance
+assumes it.
+
 ### End a block-range stream with `CHAIN_EPOCH_PIN_UNAVAILABLE`
 
 The reason would gain a second failure mode, and a lightwalletd client has no
@@ -564,6 +577,9 @@ controlled consumer cutover uses the current contract without shims.
 
 ## Revision history
 
+- 2026-11-17: A compatibility block-range chunk also stops at 2 MiB of stored
+  compact blocks, keeping at least one block, so a range of large blocks takes
+  several chunks. Every chunk edge carries the same hash check.
 - 2026-11-17: A lightwalletd block-range stream binds each chunk, not the
   whole stream, to one chain view, and continues at a newer view only along
   the chain it has already sent. It holds no serving pair or compact-blocks

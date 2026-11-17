@@ -268,6 +268,16 @@ impl CanonicalReader for GatedCanonicalReader {
         self.canonical_reader.compact_blocks_in_range(range)
     }
 
+    fn compact_blocks_in_range_up_to(
+        &self,
+        range: BlockHeightRange,
+        order: zinder_store::HeightOrder,
+        max_bytes: usize,
+    ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
+        self.canonical_reader
+            .compact_blocks_in_range_up_to(range, order, max_bytes)
+    }
+
     fn block_blob_at(
         &self,
         height: BlockHeight,

@@ -980,12 +980,15 @@ semantics bounded at Zinder's boundary. For example, `GetSubtreeRoots` treats
 materialize every retained subtree root.
 `GetBlockRange` consumes the bounded native range result and streams decoded
 lightwalletd blocks without a second full-range allocation. Both it and
-`GetBlockRangeNullifiers` read each 1,000-block chunk at the chain view
-current when they read that chunk and continue only along the chain they have
-already sent
-([ADR-0038](../adrs/0038-wallet-runtime-composition-and-capability-discovery.md#compatibility-block-range-streams)). True per-item store
-back-pressure requires an owned snapshot streaming read API; until then the
-range cap is the memory bound.
+`GetBlockRangeNullifiers` read each chunk at the chain view current when
+they read that chunk and continue only along the chain they have already sent
+([ADR-0038](../adrs/0038-wallet-runtime-composition-and-capability-discovery.md#compatibility-block-range-streams)).
+A chunk holds at most 1,000 blocks and 2 MiB of stored compact blocks, or one
+larger block. True per-item store back-pressure requires an owned snapshot
+streaming read API. Until then, the chunk caps and the process-wide limit on
+concurrent block-range streams are the only controls on that memory.
+[Block range resource limits](../reference/lightwalletd-compatibility.md#block-range-resource-limits)
+lists what they leave unbounded.
 `GetAddressUtxos` and `GetAddressUtxosStream` bound each address at the read.
 They consume each address's `TransparentAddressUnspentOutputs` stream in
 address-index order and stop it once its later outputs cannot change the

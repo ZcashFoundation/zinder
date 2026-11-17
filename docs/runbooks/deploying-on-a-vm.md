@@ -130,6 +130,13 @@ Each file contains a stable, non-secret `ZINDER_PROJECTOR_BUILD_OWNER_HEX`;
 assign a different 32-character hexadecimal value to every side-by-side
 projector lane.
 
+The compatibility container's memory limit, `ZINDER_COMPAT_MEMORY_LIMIT`
+(4 GiB by default), must cover four reader generations of block caches plus
+`compat.max_concurrent_block_range_streams` block-range streams.
+[Block range resource limits](../reference/lightwalletd-compatibility.md#block-range-resource-limits)
+describes both terms. The memory the streams hold is not measured, so check
+the container's memory under wallet load before you raise the stream limit.
+
 ### Upgrade an existing env file
 
 Earlier releases derived the project, network, and cookie volume names from
@@ -512,6 +519,16 @@ template, certificate and DNS ownership, `/readyz` routing gate, external
 unreachability proof, endpoint attribution, and rollback evidence. An already
 accepted compatibility request may drain against its immutable canonical/wallet
 generation, but new traffic must stop when compatibility `/readyz` returns 503.
+
+Compatibility pings each HTTP/2 connection after one minute without a frame
+and closes it when the ping goes unanswered, which returns the block-range
+stream slots of a wallet that vanished. Behind the TLS edge those pings reach
+the proxy, so the proxy's own timeouts decide when a vanished wallet's stream
+ends. The Caddy template sets none, so Caddy's defaults apply; how long they
+let a vanished wallet hold a slot is not measured. Every wallet shares the
+compatibility server's block-range stream limit, and the template sets no
+per-client request limit, so one client can take every slot
+([Concurrent streams](../reference/lightwalletd-compatibility.md#concurrent-streams)).
 
 ## Install systemd supervision
 

@@ -20,7 +20,7 @@ use zinder_core::{
 use zinder_store::{
     BlockHashLookup, CanonicalActivationSchedule, CanonicalEventFence, CanonicalStoreError,
     ChainEventEnvelope, ChainEventHistoryRequest, ChainEventStreamFamily, ChainEventStreamResume,
-    EventStreamStartPosition, RawBlobRetention, RocksDbCanonicalSecondary,
+    EventStreamStartPosition, HeightOrder, RawBlobRetention, RocksDbCanonicalSecondary,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
@@ -86,6 +86,17 @@ pub trait CanonicalReader: Send + Sync + 'static {
     fn compact_blocks_in_range(
         &self,
         range: BlockHeightRange,
+    ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError>;
+
+    /// Reads compact blocks from the end of `range` that `order` visits
+    /// first, until the next block would take their stored bytes past
+    /// `max_bytes`, as
+    /// [`RocksDbCanonicalSecondary::compact_blocks_in_range_up_to`] does.
+    fn compact_blocks_in_range_up_to(
+        &self,
+        range: BlockHeightRange,
+        order: HeightOrder,
+        max_bytes: usize,
     ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError>;
 
     /// Reads one retained full block blob by height.
@@ -310,6 +321,15 @@ macro_rules! impl_canonical_read {
                 range: BlockHeightRange,
             ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
                 self.compact_blocks_in_range(range)
+            }
+
+            fn compact_blocks_in_range_up_to(
+                &self,
+                range: BlockHeightRange,
+                order: HeightOrder,
+                max_bytes: usize,
+            ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
+                self.compact_blocks_in_range_up_to(range, order, max_bytes)
             }
 
             fn block_blob_at(

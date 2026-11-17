@@ -23,7 +23,7 @@ use zinder_proto::capabilities::WALLET_READ_CHAIN_VALUE_POOLS_AT_TIP_V1;
 use zinder_source::SourceError;
 use zinder_store::{
     ArtifactFamily, ChainEventEnvelope, ChainEventStreamFamily, ChainEventStreamResume,
-    DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, EventStreamStartPosition, StoreError,
+    DEFAULT_MAX_CHAIN_EVENT_HISTORY_EVENTS, EventStreamStartPosition, HeightOrder, StoreError,
     StreamCursorTokenV1,
 };
 
@@ -135,6 +135,28 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     async fn compact_blocks_in_range(
         &self,
         block_range: BlockHeightRange,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<CompactBlockRange, QueryError>;
+
+    /// Reads compact block artifacts from one end of an inclusive height
+    /// range, up to a byte budget.
+    ///
+    /// The read starts at the end of `block_range` that `order` visits first
+    /// and stops before the block that would take the stored bytes of the
+    /// blocks it keeps past `max_bytes`. It always keeps one block, so a
+    /// block larger than `max_bytes` is returned alone. The response's
+    /// `block_range` is the heights kept, and its blocks are in ascending
+    /// height order.
+    ///
+    /// Validation and errors are those of
+    /// [`Self::compact_blocks_in_range`] for the whole of `block_range`: a
+    /// range that reaches outside retained history fails even where the
+    /// budget would stop the read first.
+    async fn compact_blocks_in_range_up_to(
+        &self,
+        block_range: BlockHeightRange,
+        order: HeightOrder,
+        max_bytes: usize,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockRange, QueryError>;
 
@@ -556,7 +578,8 @@ pub struct CompactBlock {
 pub struct CompactBlockRange {
     /// Chain epoch used for every compact block in this range.
     pub chain_epoch: ChainEpoch,
-    /// Inclusive height range requested.
+    /// Inclusive height range the compact blocks cover: the requested range,
+    /// or the part of it a byte-bounded read kept.
     pub block_range: BlockHeightRange,
     /// Compact block artifacts in ascending height order.
     pub compact_blocks: Vec<CompactBlockArtifact>,
