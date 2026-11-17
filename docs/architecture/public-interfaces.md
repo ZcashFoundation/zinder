@@ -196,7 +196,7 @@ Important current reasons include:
 
 | Reason | Meaning |
 | --- | --- |
-| `CHAIN_EPOCH_PIN_UNAVAILABLE` | Requested epoch is no longer retained, or a reorg replaced the chain a lightwalletd block-range stream was sending |
+| `CHAIN_EPOCH_PIN_UNAVAILABLE` | Requested epoch is no longer retained |
 | `SCHEMA_MISMATCH` | Persisted store contract differs from the running binary |
 | `REORG_WINDOW_EXCEEDED` | Replacement crosses the configured reorg policy |
 | `BLOCK_NOT_IN_BEST_CHAIN` | Requested block is not visible in the admitted epoch |

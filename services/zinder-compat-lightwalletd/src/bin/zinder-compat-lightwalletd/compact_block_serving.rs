@@ -2675,15 +2675,53 @@ mod tests {
         harness.stop().await
     }
 
+    /// A descending stream links each later chunk to the parent of the last
+    /// block it sent, so it crosses chunk edges and a publication without
+    /// ending.
+    #[tokio::test]
+    async fn a_descending_block_range_stream_crosses_chunks_and_publications()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const TIP_HEIGHT: u32 = 2_100;
+        let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
+            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .extend_blocks(TIP_HEIGHT + 1);
+        let mut harness = LongRangeHarness::start(
+            &zinder_testkit::CanonicalBaseline::new(&chain).through(BlockHeight::new(TIP_HEIGHT)),
+        )
+        .await?;
+
+        let mut stream = harness
+            .adapter
+            .get_block_range(Request::new(block_range(TIP_HEIGHT, 1)))
+            .await?
+            .into_inner();
+        let mut blocks = Vec::new();
+        // The chunks are 2,100 to 1,101, 1,100 to 101, and 100 to 1. The
+        // second is read before the publication and the third after it.
+        read_blocks(&mut stream, &mut blocks, 101).await?;
+        harness.writer.append_live_block(&chain)?;
+        harness.refresh_at_writer_fence().await?;
+        assert_eq!(harness.published_height(), BlockHeight::new(TIP_HEIGHT + 1));
+
+        read_blocks(&mut stream, &mut blocks, usize::MAX).await?;
+        assert_eq!(
+            blocks.first().map(|block| block.height),
+            Some(u64::from(TIP_HEIGHT))
+        );
+        blocks.reverse();
+        assert_linked_from_genesis(&blocks, TIP_HEIGHT);
+        drop(stream);
+        harness.stop().await
+    }
+
     /// What a stream over heights 1 through 2,050 sent across a reorg.
     ///
     /// The reorg is a live replacement from `fork_height` through
     /// `replacement_tip_height`, published while the stream waits on its
-    /// client. `sent_epoch` is the epoch the stream read before it.
+    /// client.
     struct ReorgedStream {
         blocks: Vec<lightwalletd::CompactBlock>,
         ending: Option<tonic::Status>,
-        sent_epoch: zinder_core::ChainEpochId,
     }
 
     async fn stream_across_reorg(
@@ -2738,51 +2776,39 @@ mod tests {
             .err();
         drop(stream);
         harness.stop().await?;
-        Ok(ReorgedStream {
-            blocks,
-            ending,
-            sent_epoch,
-        })
-    }
-
-    /// Asserts that a stream ended with the reorg status naming `sent_epoch`.
-    fn assert_reorg_ending(ending: Option<&tonic::Status>, sent_epoch: zinder_core::ChainEpochId) {
-        assert_eq!(
-            ending.map(tonic::Status::code),
-            Some(Code::FailedPrecondition),
-            "{ending:?}"
-        );
-        let details = ending.map(tonic_types::StatusExt::get_error_details);
-        assert_eq!(
-            details
-                .as_ref()
-                .and_then(|details| details.precondition_failure())
-                .and_then(|failure| failure.violations.first())
-                .map(|violation| violation.subject.clone()),
-            Some(format!("chain_epoch:{}", sent_epoch.value()))
-        );
+        Ok(ReorgedStream { blocks, ending })
     }
 
     /// A reorg that replaces a block the stream already sent ends the stream
-    /// with the reorg status after the blocks it sent.
+    /// with `ABORTED` after the blocks it sent, as lightwalletd does.
     #[tokio::test]
-    async fn a_block_range_stream_ends_with_the_reorg_status_when_a_sent_block_is_replaced()
+    async fn a_block_range_stream_ends_aborted_when_a_sent_block_is_replaced()
     -> Result<(), Box<dyn std::error::Error>> {
         let reorged = stream_across_reorg(1_990, 2_050).await?;
         assert_linked_from_genesis(&reorged.blocks, 2_000);
-        assert_reorg_ending(reorged.ending.as_ref(), reorged.sent_epoch);
+        assert_eq!(
+            reorged.ending.as_ref().map(tonic::Status::code),
+            Some(Code::Aborted),
+            "{:?}",
+            reorged.ending
+        );
         Ok(())
     }
 
     /// A reorg that leaves the visible tip below a height still to send ends
-    /// the stream with the reorg status, not the `NOT_FOUND` of a read above
-    /// the tip.
+    /// the stream with `OUT_OF_RANGE`, not the `NOT_FOUND` of a read above the
+    /// tip.
     #[tokio::test]
-    async fn a_block_range_stream_ends_with_the_reorg_status_when_the_tip_falls_below_the_range()
+    async fn a_block_range_stream_ends_out_of_range_when_the_tip_falls_below_the_range()
     -> Result<(), Box<dyn std::error::Error>> {
         let reorged = stream_across_reorg(2_020, 2_030).await?;
         assert_linked_from_genesis(&reorged.blocks, 2_000);
-        assert_reorg_ending(reorged.ending.as_ref(), reorged.sent_epoch);
+        assert_eq!(
+            reorged.ending.as_ref().map(tonic::Status::code),
+            Some(Code::OutOfRange),
+            "{:?}",
+            reorged.ending
+        );
         Ok(())
     }
 

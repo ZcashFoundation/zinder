@@ -197,9 +197,9 @@ answering reads pinned to its epoch for one minute after it was replaced, or
 retired but held by an in-flight request. While no slot is free, the reader
 publishes nothing, and its next publication carries the writer's latest fence.
 In-flight requests keep their existing immutable pair, which pins its
-generation until they finish. A lightwalletd `GetBlockRange` stream holds a
-pair only while it reads one 1,000-block chunk, never while it waits for its
-client
+generation until they finish. A lightwalletd `GetBlockRange` or
+`GetBlockRangeNullifiers` stream holds a pair only while it reads one
+1,000-block chunk, never while it waits for its client
 ([ADR-0038](../adrs/0038-wallet-runtime-composition-and-capability-discovery.md#compatibility-block-range-streams)). A
 transparent-output scan whose request is dropped stops at its next page and
 releases its pair. A slot is opened and cold-admitted the first time the

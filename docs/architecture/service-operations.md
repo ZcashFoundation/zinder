@@ -788,10 +788,17 @@ ended early at a reorg:
 Each ending also logs `compat_block_range_ended_by_reorg` at `info` under the
 `zinder::compat_lightwalletd` target, with `cause`, `last_sent_height`,
 `sent_chain_epoch`, `current_chain_epoch`, `next_chunk_start`, and
-`next_chunk_end`. The client receives `CHAIN_EPOCH_PIN_UNAVAILABLE` and
-requests again, so an ending is not an error on its own. Endings that keep
-rising while ingest logs no `canonical_live_replacement_committed` events
-point at a fault in the chain view the compatibility runtime serves.
+`next_chunk_end`. The client receives `ABORTED` for `chain_replaced` or
+`OUT_OF_RANGE` for `tip_lowered`, as lightwalletd returns, and requests again.
+An ending is therefore not an error on its own. Endings that keep rising while
+ingest logs no `canonical_live_replacement_committed` events point at a fault
+in the chain view the compatibility runtime serves.
+
+A chunk that links at a newer chain view than the chunk before it logs
+`compat_block_range_continued_at_newer_epoch` at `debug` under the same
+target, with `last_sent_height`, `sent_chain_epoch`, `current_chain_epoch`,
+`next_chunk_start`, and `next_chunk_end`. Enable `debug` for that target to
+see whether long streams cross publications. The event has no metric.
 
 ### RocksDB
 

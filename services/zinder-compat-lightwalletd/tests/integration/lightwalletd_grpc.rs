@@ -13,7 +13,6 @@ use std::sync::{
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Code, Request, Status, transport::Server};
-use tonic_types::StatusExt;
 use zebra_chain::{
     parameters::NetworkKind as ZebraNetworkKind, transparent::Address as ZebraTransparentAddress,
 };
@@ -535,39 +534,47 @@ fn assert_one_linked_chain(
     }
 }
 
-/// Asserts that a stream ended with the reorg status naming `sent_epoch`, the
-/// epoch of the last chunk it sent.
-fn assert_reorg_ending(ending: Option<&Status>, sent_epoch: u64) {
+/// Asserts that a stream ended with `code`, after the blocks it sent.
+fn assert_stream_ended_with(ending: Option<&Status>, code: Code) {
     assert_eq!(
         ending.map(Status::code),
-        Some(Code::FailedPrecondition),
-        "the stream must end with the reorg status: {ending:?}"
-    );
-    let Some(details) = ending.map(StatusExt::get_error_details) else {
-        return;
-    };
-    assert_eq!(
-        details
-            .error_info()
-            .map(|error_info| error_info.reason.as_str()),
-        Some("CHAIN_EPOCH_PIN_UNAVAILABLE")
-    );
-    assert_eq!(
-        details
-            .precondition_failure()
-            .and_then(|failure| failure.violations.first())
-            .map(|violation| violation.subject.clone()),
-        Some(format!("chain_epoch:{sent_epoch}"))
+        Some(code),
+        "the stream must end with {code:?}: {ending:?}"
     );
 }
 
-/// Returns the `cause` of every `compat_block_range_ended_by_reorg` event.
-fn reorg_ending_causes(log_capture: &LogCapture) -> Vec<String> {
+/// Returns the `cause` and `sent_chain_epoch` of every
+/// `compat_block_range_ended_by_reorg` event.
+fn reorg_endings(log_capture: &LogCapture) -> Vec<(String, String)> {
     log_capture
         .events()
         .iter()
         .filter(|event| event.field("event") == Some("compat_block_range_ended_by_reorg"))
-        .filter_map(|event| event.field("cause").map(str::to_owned))
+        .map(|event| {
+            (
+                event.field("cause").unwrap_or_default().to_owned(),
+                event
+                    .field("sent_chain_epoch")
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// Returns the `current_chain_epoch` of every
+/// `compat_block_range_continued_at_newer_epoch` event.
+fn continued_at_newer_epochs(log_capture: &LogCapture) -> Vec<String> {
+    log_capture
+        .events()
+        .iter()
+        .filter(|event| event.field("event") == Some("compat_block_range_continued_at_newer_epoch"))
+        .map(|event| {
+            event
+                .field("current_chain_epoch")
+                .unwrap_or_default()
+                .to_owned()
+        })
         .collect()
 }
 
@@ -596,6 +603,7 @@ async fn stream_across_views(
 #[tokio::test]
 async fn get_block_range_completes_across_publications_while_the_client_reads_slowly()
 -> eyre::Result<()> {
+    let log_capture = LogCapture::install_for_target("zinder::compat_lightwalletd");
     let store_fixture = acceptance_store_fixture()?;
     let recorder = EpochPinRecorder::new(store_fixture.query()).with_synthetic_views(vec![
         SyntheticView::entry(ENTRY_EPOCH, 3_500),
@@ -633,14 +641,21 @@ async fn get_block_range_completes_across_publications_while_the_client_reads_sl
             .collect::<Vec<_>>(),
         "each later chunk reads the view current when it is read"
     );
+    assert_eq!(
+        continued_at_newer_epochs(&log_capture),
+        (ENTRY_EPOCH + 1..=ENTRY_EPOCH + 3)
+            .map(|epoch| epoch.to_string())
+            .collect::<Vec<_>>(),
+        "each chunk that links at a newer view is logged at debug"
+    );
     Ok(())
 }
 
-/// A reorg that replaces a block the stream already sent ends the stream
-/// after the blocks it sent, and no block of the replacing branch is sent.
+/// A reorg that replaces a block the stream already sent ends the stream with
+/// `ABORTED` after the blocks it sent, as lightwalletd does, and no block of
+/// the replacing branch is sent.
 #[tokio::test]
-async fn get_block_range_ends_with_the_reorg_status_when_a_sent_block_is_replaced()
--> eyre::Result<()> {
+async fn get_block_range_ends_aborted_when_a_sent_block_is_replaced() -> eyre::Result<()> {
     let log_capture = LogCapture::install_for_target("zinder::compat_lightwalletd");
     let store_fixture = acceptance_store_fixture()?;
 
@@ -662,8 +677,11 @@ async fn get_block_range_ends_with_the_reorg_status_when_a_sent_block_is_replace
             .all(|block| block.hash == synthetic_wire_hash(block.height, 0)),
         "no block of the replacing branch may be sent"
     );
-    assert_reorg_ending(drained.ending.as_ref(), ENTRY_EPOCH);
-    assert_eq!(reorg_ending_causes(&log_capture), vec!["chain_replaced"]);
+    assert_stream_ended_with(drained.ending.as_ref(), Code::Aborted);
+    assert_eq!(
+        reorg_endings(&log_capture),
+        vec![("chain_replaced".to_owned(), ENTRY_EPOCH.to_string())]
+    );
     Ok(())
 }
 
@@ -712,7 +730,7 @@ async fn ascending_get_block_range_continues_only_when_its_last_sent_block_survi
     )
     .await?;
     assert_one_linked_chain(&fork_at_last_sent.blocks, 1, 1_000);
-    assert_reorg_ending(fork_at_last_sent.ending.as_ref(), ENTRY_EPOCH);
+    assert_stream_ended_with(fork_at_last_sent.ending.as_ref(), Code::Aborted);
 
     let fork_above_last_sent = stream_across_views(
         &store_fixture,
@@ -778,16 +796,18 @@ async fn descending_get_block_range_continues_only_into_the_parent_of_its_last_s
     )
     .await?;
     assert_one_linked_chain(&fork_below_last_sent.blocks, 3_000, 2_001);
-    assert_reorg_ending(fork_below_last_sent.ending.as_ref(), ENTRY_EPOCH);
+    assert_stream_ended_with(fork_below_last_sent.ending.as_ref(), Code::Aborted);
     Ok(())
 }
 
-/// A reorg that leaves the visible tip below a height the stream still has
-/// to send ends it with the reorg status, not the `NOT_FOUND` of a read above
-/// the tip, naming the epoch of the last chunk sent.
+/// A reorg that leaves the visible tip below a height still to send ends the
+/// stream with `OUT_OF_RANGE`.
+///
+/// The ending is not the `NOT_FOUND` of a read above the tip, and the log
+/// names the epoch of the last chunk sent.
 #[tokio::test]
-async fn get_block_range_ends_with_the_reorg_status_when_the_tip_falls_below_the_range()
--> eyre::Result<()> {
+async fn get_block_range_ends_out_of_range_when_the_tip_falls_below_the_range() -> eyre::Result<()>
+{
     let log_capture = LogCapture::install_for_target("zinder::compat_lightwalletd");
     let store_fixture = acceptance_store_fixture()?;
 
@@ -802,8 +822,11 @@ async fn get_block_range_ends_with_the_reorg_status_when_the_tip_falls_below_the
     .await?;
 
     assert_one_linked_chain(&drained.blocks, 1, 2_000);
-    assert_reorg_ending(drained.ending.as_ref(), ENTRY_EPOCH + 1);
-    assert_eq!(reorg_ending_causes(&log_capture), vec!["tip_lowered"]);
+    assert_stream_ended_with(drained.ending.as_ref(), Code::OutOfRange);
+    assert_eq!(
+        reorg_endings(&log_capture),
+        vec![("tip_lowered".to_owned(), (ENTRY_EPOCH + 1).to_string())]
+    );
     Ok(())
 }
 
@@ -843,17 +866,18 @@ async fn get_block_range_nullifiers_follows_the_same_chunk_contract() -> eyre::R
     ])
     .await?;
     assert_one_linked_chain(&across_reorg.blocks, 1, 1_000);
-    assert_reorg_ending(across_reorg.ending.as_ref(), ENTRY_EPOCH);
+    assert_stream_ended_with(across_reorg.ending.as_ref(), Code::Aborted);
     Ok(())
 }
 
 /// Store-backed artifacts carry real parent hashes. A stream whose sent
-/// blocks a live replacement displaced ends with the reorg status instead of
-/// sending the replacing branch.
+/// blocks a live replacement displaced ends with `ABORTED` instead of sending
+/// the replacing branch.
 #[tokio::test]
 async fn get_block_range_ends_when_a_live_replacement_displaces_sent_blocks() -> eyre::Result<()> {
     const TIP_HEIGHT: u32 = 1_020;
     const FORK_HEIGHT: u32 = 995;
+    let log_capture = LogCapture::install_for_target("zinder::compat_lightwalletd");
     let mut chain = ChainFixture::new(Network::ZcashRegtest)
         .with_raw_blob_retention(RawBlobRetention::Transactions)
         .extend_blocks(TIP_HEIGHT);
@@ -905,7 +929,11 @@ async fn get_block_range_ends_when_a_live_replacement_displaces_sent_blocks() ->
         drained.blocks.last().map(|block| block.hash.clone()),
         Some(encode_internal_block_hash(last_sent.hash).to_vec())
     );
-    assert_reorg_ending(drained.ending.as_ref(), sent_epoch.value());
+    assert_stream_ended_with(drained.ending.as_ref(), Code::Aborted);
+    assert_eq!(
+        reorg_endings(&log_capture),
+        vec![("chain_replaced".to_owned(), sent_epoch.value().to_string())]
+    );
     assert_eq!(
         recorder.served_compact_block_epochs().len(),
         2,

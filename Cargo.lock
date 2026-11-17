@@ -5908,7 +5908,6 @@ dependencies = [
  "toml",
  "tonic",
  "tonic-reflection",
- "tonic-types",
  "tracing",
  "zcash_address",
  "zcash_protocol",

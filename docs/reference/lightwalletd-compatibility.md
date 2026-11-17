@@ -191,10 +191,9 @@ genesis block as its authenticated predecessor and retains blocks from height
 touches height 0 returns `NOT_FOUND`.
 
 These codes describe the request as it arrives and fail the call before any
-block is sent. A stream that has started can also end with
-`FAILED_PRECONDITION` and `CHAIN_EPOCH_PIN_UNAVAILABLE` after the blocks it
-sent, when a reorg replaces the chain it is sending; see
-[Block range consistency](#block-range-consistency).
+block is sent. A stream that has started can also end with `ABORTED` or
+`OUT_OF_RANGE` after the blocks it sent, when a reorg reaches the chain it is
+sending; see [Block range consistency](#block-range-consistency).
 
 Unary block lookups validate the selector before reading. Height 0 with a
 32-byte hash is a hash lookup. Height 0 with an empty hash is an unspecified
@@ -233,26 +232,30 @@ A client can rely on the following:
 5. **No time limit.** The server does not end a stream because of elapsed
    time, new blocks, or how slowly the client reads. Process shutdown and
    drain still end open streams. A client that stops reading holds no serving
-   pair or generation, only the blocks already queued for it: at most one
-   chunk, plus 16 blocks in wallet serving or 8 in compact-blocks serving, plus
-   transport buffers.
+   pair or generation, only the blocks already queued for it, plus transport
+   buffers:
+   - Until the client has received the whole first chunk, the rest of that
+     chunk and the next chunk are queued, at most two chunks.
+   - After that, at most one chunk is queued, plus a buffer of 16 blocks in
+     wallet serving or 8 in compact-blocks serving.
 6. **Reorg ending.** An ascending stream ends early when a reorg replaces the
    last block it sent or any block below it. A descending stream ends early
-   when a reorg replaces the next height it has to send. Either stream also
-   ends when a reorg leaves the visible tip below a height it still has to
-   send. It ends after the blocks already sent with `FAILED_PRECONDITION`,
-   `ErrorInfo` reason `CHAIN_EPOCH_PIN_UNAVAILABLE` (domain `zinder.dev`), and
-   `PreconditionFailure` subject `chain_epoch:<id>`, which names the epoch of
-   the last chunk sent. To recover, request again from the height the wallet
+   when a reorg replaces the next height it has to send. Either ending comes
+   after the blocks already sent, with `ABORTED`. lightwalletd v0.5.5 and
+   later check the same link and end the stream with the same code. A stream
+   also ends early, with `OUT_OF_RANGE`, when a reorg leaves the visible tip
+   below a height it still has to send. Neither ending carries a Zinder
+   `ErrorInfo` reason. To recover, request again from the height the wallet
    needs. A wallet that kept the partial blocks finds the fork with its own
    parent check on the next block.
 7. **Settled history.** The canonical writer never replaces a block at or
    below the settled tip, so a stream over settled history never ends this
    way. Only the unsettled suffix, at most the reorg window of 1,000 blocks by
    default, can end a stream.
-8. **Read-ahead.** The server reads up to one chunk plus the buffers in point 5
-   ahead of the client, so the view a block was read at can be older than the
-   view current when the client receives it.
+8. **Read-ahead.** The server reads ahead of the client by the amounts in
+   point 5: up to two chunks at the start of a stream, and one chunk plus the
+   buffer after the first chunk. The view a block was read at can therefore be
+   older than the view current when the client receives it.
 9. **Mid-stream storage outcomes.** A storage failure ends the stream with
    `UNAVAILABLE`, and a descending range that runs below the retained floor
    ends it with `NOT_FOUND`. In wallet serving, a reorg that lowers the tip in

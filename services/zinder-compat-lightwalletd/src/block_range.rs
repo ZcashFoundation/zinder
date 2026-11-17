@@ -8,15 +8,16 @@
 //! continues the stream only when it links by hash to the last block the
 //! stream sent. A block hash commits to its parent, so that one link proves
 //! the blocks sent and the blocks to come form one chain. Otherwise a reorg
-//! replaced a block the stream needs, and the stream ends with
-//! `CHAIN_EPOCH_PIN_UNAVAILABLE` after the blocks it already sent. ADR-0038,
-//! "Compatibility block-range streams", records the contract.
+//! replaced a block the stream needs, and the stream ends after the blocks it
+//! already sent with the code lightwalletd returns for the same case:
+//! `ABORTED` for a broken link, and `OUT_OF_RANGE` when the visible tip fell
+//! below a height still to send. ADR-0038, "Compatibility block-range
+//! streams", records the contract.
 
 use tonic::Status;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, CompactBlockArtifact,
 };
-use zinder_query::{QueryError, status_from_query_error};
 
 /// The last block a lightwalletd block-range stream sent, and the chain view
 /// it was read at.
@@ -92,21 +93,25 @@ impl BlockRangeContinuity {
     /// Checks that `view` still serves every height of `next_chunk`.
     ///
     /// Call it before reading `next_chunk` at `view`, so a reorg that lowered
-    /// the visible tip ends the stream with the reorg status rather than the
-    /// `NOT_FOUND` of a read above the tip.
+    /// the visible tip ends the stream with lightwalletd's `OUT_OF_RANGE`
+    /// rather than the `NOT_FOUND` of a read above the tip.
     ///
     /// # Errors
     ///
-    /// Returns `FAILED_PRECONDITION` with `CHAIN_EPOCH_PIN_UNAVAILABLE`, naming
-    /// the epoch of the last chunk sent, when `next_chunk` ends above the
-    /// view's visible tip.
+    /// Returns `OUT_OF_RANGE` when `next_chunk` ends above the view's visible
+    /// tip.
     pub fn check_view_reaches(
         &self,
         next_chunk: BlockHeightRange,
         view: &ChainEpoch,
     ) -> Result<(), Status> {
         if next_chunk.end > view.visible_tip_height {
-            return Err(self.reorg_ending(ReorgEndingCause::TipLowered, next_chunk, view.id));
+            self.record_reorg_ending(ReorgEndingCause::TipLowered, next_chunk, view.id);
+            return Err(Status::out_of_range(format!(
+                "block {} is newer than latest block {} after a reorg",
+                next_chunk.end.value(),
+                view.visible_tip_height.value(),
+            )));
         }
         Ok(())
     }
@@ -121,8 +126,7 @@ impl BlockRangeContinuity {
     ///
     /// # Errors
     ///
-    /// Returns `FAILED_PRECONDITION` with `CHAIN_EPOCH_PIN_UNAVAILABLE`, naming
-    /// the epoch of the last chunk sent, when the chunk does not link.
+    /// Returns `ABORTED` when the chunk does not link.
     pub fn advance(
         &mut self,
         next_chunk: BlockHeightRange,
@@ -130,7 +134,23 @@ impl BlockRangeContinuity {
         blocks: &[CompactBlockArtifact],
     ) -> Result<(), Status> {
         if !self.is_continued_by(blocks) {
-            return Err(self.reorg_ending(ReorgEndingCause::ChainReplaced, next_chunk, read_at.id));
+            self.record_reorg_ending(ReorgEndingCause::ChainReplaced, next_chunk, read_at.id);
+            return Err(Status::aborted(
+                "block-range stream ended at a chain discontinuity: a reorg replaced the chain it \
+                 was sending",
+            ));
+        }
+        if read_at.id != self.sent_chain_epoch_id {
+            tracing::debug!(
+                target: "zinder::compat_lightwalletd",
+                event = "compat_block_range_continued_at_newer_epoch",
+                last_sent_height = self.last_sent_height.value(),
+                sent_chain_epoch = self.sent_chain_epoch_id.value(),
+                current_chain_epoch = read_at.id.value(),
+                next_chunk_start = next_chunk.start.value(),
+                next_chunk_end = next_chunk.end.value(),
+                "block-range stream continued at a newer chain view"
+            );
         }
         *self = Self::after_first_chunk(blocks, read_at.id, self.is_descending)?;
         Ok(())
@@ -150,12 +170,12 @@ impl BlockRangeContinuity {
         }
     }
 
-    fn reorg_ending(
+    fn record_reorg_ending(
         &self,
         cause: ReorgEndingCause,
         next_chunk: BlockHeightRange,
         current_chain_epoch_id: ChainEpochId,
-    ) -> Status {
+    ) {
         metrics::counter!(
             "zinder_compat_block_range_reorg_endings_total",
             "cause" => cause.label()
@@ -172,9 +192,6 @@ impl BlockRangeContinuity {
             next_chunk_end = next_chunk.end.value(),
             "block-range stream ended because a reorg replaced the chain it was sending"
         );
-        status_from_query_error(&QueryError::ChainEpochPinUnavailable {
-            chain_epoch_id: self.sent_chain_epoch_id,
-        })
     }
 }
 
@@ -247,10 +264,10 @@ mod tests {
         BlockHeightRange::inclusive(BlockHeight::new(start), BlockHeight::new(end))
     }
 
-    fn assert_reorg_ending(outcome: Result<(), tonic::Status>) {
+    fn assert_chain_discontinuity(outcome: Result<(), tonic::Status>) {
         assert_eq!(
             outcome.err().map(|status| status.code()),
-            Some(Code::FailedPrecondition)
+            Some(Code::Aborted)
         );
     }
 
@@ -266,13 +283,17 @@ mod tests {
 
         let mut fork_at_last_sent =
             BlockRangeContinuity::after_first_chunk(&sent, SENT_EPOCH, false)?;
-        assert_reorg_ending(fork_at_last_sent.advance(
+        assert_chain_discontinuity(fork_at_last_sent.advance(
             range(11, 20),
             &view(20),
             &chain(11, 20, 2, 10),
         ));
         let mut fork_below = BlockRangeContinuity::after_first_chunk(&sent, SENT_EPOCH, false)?;
-        assert_reorg_ending(fork_below.advance(range(11, 20), &view(20), &chain(11, 20, 2, 9)));
+        assert_chain_discontinuity(fork_below.advance(
+            range(11, 20),
+            &view(20),
+            &chain(11, 20, 2, 9),
+        ));
         Ok(())
     }
 
@@ -289,7 +310,11 @@ mod tests {
         continuity.advance(range(1, 10), &view(30), &chain(1, 10, 1, 21))?;
 
         let mut fork_below = BlockRangeContinuity::after_first_chunk(&sent, SENT_EPOCH, true)?;
-        assert_reorg_ending(fork_below.advance(range(11, 20), &view(30), &chain(11, 20, 2, 20)));
+        assert_chain_discontinuity(fork_below.advance(
+            range(11, 20),
+            &view(30),
+            &chain(11, 20, 2, 20),
+        ));
         Ok(())
     }
 
@@ -297,12 +322,16 @@ mod tests {
     fn a_chunk_at_the_wrong_height_does_not_link() -> Result<(), tonic::Status> {
         let ascending = chain(1, 10, 0, u32::MAX);
         let mut skipped = BlockRangeContinuity::after_first_chunk(&ascending, SENT_EPOCH, false)?;
-        assert_reorg_ending(skipped.advance(range(12, 20), &view(20), &chain(12, 20, 0, u32::MAX)));
+        assert_chain_discontinuity(skipped.advance(
+            range(12, 20),
+            &view(20),
+            &chain(12, 20, 0, u32::MAX),
+        ));
 
         let descending = chain(21, 30, 0, u32::MAX);
         let mut overlapping =
             BlockRangeContinuity::after_first_chunk(&descending, SENT_EPOCH, true)?;
-        assert_reorg_ending(overlapping.advance(
+        assert_chain_discontinuity(overlapping.advance(
             range(12, 21),
             &view(30),
             &chain(12, 21, 0, u32::MAX),
@@ -312,41 +341,34 @@ mod tests {
         // another height does not link either.
         let mut misnumbered =
             BlockRangeContinuity::after_first_chunk(&ascending, SENT_EPOCH, false)?;
-        assert_reorg_ending(misnumbered.advance(
+        assert_chain_discontinuity(misnumbered.advance(
             range(11, 11),
             &view(20),
             &[block_at(12, block_hash(12, 0), block_hash(10, 0))],
         ));
         let mut misnumbered_parent =
             BlockRangeContinuity::after_first_chunk(&descending, SENT_EPOCH, true)?;
-        assert_reorg_ending(misnumbered_parent.advance(
+        assert_chain_discontinuity(misnumbered_parent.advance(
             range(20, 20),
             &view(30),
             &[block_at(19, block_hash(20, 0), block_hash(18, 0))],
         ));
 
         let mut empty = BlockRangeContinuity::after_first_chunk(&ascending, SENT_EPOCH, false)?;
-        assert_reorg_ending(empty.advance(range(11, 20), &view(20), &[]));
+        assert_chain_discontinuity(empty.advance(range(11, 20), &view(20), &[]));
         Ok(())
     }
 
     #[test]
-    fn a_view_below_the_next_chunk_ends_the_stream_naming_the_sent_epoch()
-    -> Result<(), tonic::Status> {
+    fn a_view_below_the_next_chunk_ends_the_stream_out_of_range() -> Result<(), tonic::Status> {
         let continuity =
             BlockRangeContinuity::after_first_chunk(&chain(1, 10, 0, u32::MAX), SENT_EPOCH, false)?;
         continuity.check_view_reaches(range(11, 20), &view(20))?;
 
-        let Err(status) = continuity.check_view_reaches(range(11, 20), &view(19)) else {
-            return Err(tonic::Status::internal(
-                "a view below the chunk must end the stream",
-            ));
-        };
-        assert_eq!(status.code(), Code::FailedPrecondition);
-        assert!(
-            status.message().contains("ChainEpochId(4)"),
-            "the ending must name the sent epoch: {}",
-            status.message()
+        let outcome = continuity.check_view_reaches(range(11, 20), &view(19));
+        assert_eq!(
+            outcome.err().map(|status| status.code()),
+            Some(Code::OutOfRange)
         );
         Ok(())
     }
