@@ -3,6 +3,10 @@
 //! This module deliberately owns both the canonical-secondary lifecycle and
 //! the restricted protocol adapter. No compact-only topology type crosses the
 //! binary boundary.
+//!
+//! Both generations open on one block cache that the publisher owns, so the
+//! configured cache size bounds the process, and a generation opened on a
+//! refresh finds the blocks the previous one loaded.
 
 use std::{num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 
@@ -40,7 +44,8 @@ use zinder_runtime::{
 use zinder_source::{NodeCapability, NodeSource};
 use zinder_store::{
     BlockHashLookup, CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload,
-    RawBlobRetention, RocksDbCanonicalSecondary, RocksDbResourceBudget,
+    RawBlobRetention, RocksDbCanonicalSecondary, RocksDbOpenResources, RocksDbResourceBudget,
+    SharedBlockCache, StoreRole, record_shared_block_cache_gauges,
 };
 
 type GrpcStream<T> = std::pin::Pin<
@@ -170,6 +175,10 @@ pub(crate) struct CompactBlockPublisher {
     slot: CompactBlockServingSlot,
     active_generation: usize,
     retired: Option<Arc<RocksDbCanonicalSecondary>>,
+    /// The block cache both generations open on, sized by the configured
+    /// budget. It outlives each generation, so a cold open on a refresh
+    /// starts with the blocks the replaced generation loaded.
+    block_cache: SharedBlockCache,
     /// Last attestation of the active reader by a following writer with a
     /// confirmed tip, and the halt the writer last reported, which
     /// writer-status failures republish.
@@ -191,7 +200,8 @@ impl CompactBlockPublisher {
             .await
             .map_err(|error| CompactBlockServingError::WriterStatus(error.message().to_owned()))?;
         let generation_activations = Arc::clone(&config.activations);
-        let candidate = open_generation(&config, &generation_activations, 0).await?;
+        let block_cache = SharedBlockCache::new(config.resource_budget.block_cache_bytes);
+        let candidate = open_generation(&config, &generation_activations, &block_cache, 0).await?;
         let candidate = catch_up_generation(candidate).await?;
         let (candidate, attesting_status) =
             converge_candidate(&mut writer_status, &config, candidate)
@@ -216,9 +226,11 @@ impl CompactBlockPublisher {
             slot: slot.clone(),
             active_generation: 0,
             retired: None,
+            block_cache,
             writer_attestation,
             generation_activations,
         };
+        publisher.record_resource_gauges();
         Ok((publisher, slot))
     }
 
@@ -233,6 +245,7 @@ impl CompactBlockPublisher {
                     () = cancel.cancelled() => break,
                     () = tokio::time::sleep(self.config.catchup_interval) => {
                         self.refresh().await;
+                        self.record_resource_gauges();
                     }
                 }
             }
@@ -356,6 +369,7 @@ impl CompactBlockPublisher {
         let Ok(candidate) = open_generation(
             &self.config,
             &self.generation_activations,
+            &self.block_cache,
             candidate_generation,
         )
         .await
@@ -432,6 +446,20 @@ impl CompactBlockPublisher {
         );
     }
 
+    /// Publishes the shared block cache and the summed memory of the active
+    /// generation and of a replaced one that requests still hold.
+    fn record_resource_gauges(&self) {
+        let active = self.slot.capture();
+        record_shared_block_cache_gauges(
+            StoreRole::CanonicalSecondary,
+            &self.block_cache,
+            std::iter::once(active.as_ref())
+                .chain(self.retired.as_deref())
+                .map(RocksDbCanonicalSecondary::instance_memory)
+                .sum(),
+        );
+    }
+
     fn record_failure(&self, cause: ReadinessCause, height: u32) {
         metrics::counter!(
             "zinder_compat_compact_refresh_failures_total",
@@ -473,6 +501,7 @@ fn transport_failure_cause(stale_allowance: Option<Duration>) -> ReadinessCause 
 async fn open_generation(
     config: &CompactBlockServingConfig,
     activations: &Arc<NetworkUpgradeActivations>,
+    block_cache: &SharedBlockCache,
     generation: usize,
 ) -> Result<RocksDbCanonicalSecondary, CompactBlockServingError> {
     let primary = config.canonical_primary_path.clone();
@@ -480,7 +509,8 @@ async fn open_generation(
     let activations = Arc::clone(activations);
     let retention = config.raw_blob_retention;
     let reorg = config.reorg_policy;
-    let budget = config.resource_budget;
+    let resources =
+        RocksDbOpenResources::with_shared_block_cache(config.resource_budget, block_cache);
     tokio::task::spawn_blocking(move || {
         let secondary = secondary_root.join(format!("generation-{generation}"));
         std::fs::create_dir_all(&secondary).map_err(|error| {
@@ -495,7 +525,7 @@ async fn open_generation(
             CanonicalStoreWorkload::Wallet,
             retention,
             reorg,
-            budget,
+            resources,
         )
         .map_err(CompactBlockServingError::Storage)
     })
@@ -1804,6 +1834,136 @@ mod tests {
             message.contains("writer fence diverged from the candidate secondary"),
             "bootstrap failed for a reason other than fence divergence: {message}"
         );
+        Ok(())
+    }
+
+    /// Both compact-serving generations open on one block cache.
+    ///
+    /// The generation a refresh opens cold finds the blocks the active one
+    /// loaded, so reading them adds nothing to the cache. While a request
+    /// holds the replaced generation, the cache reports the configured
+    /// capacity once and the memtable gauge sums both open generations.
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "The test keeps the writer setup, the cold refresh, the cache reads, and the exported gauges in one causal path, as the lifecycle test does."
+    )]
+    async fn generations_open_on_one_block_cache() -> Result<(), Box<dyn std::error::Error>> {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let rendered_metrics = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let temporary = tempfile::tempdir()?;
+        let activations = lifecycle_activations();
+        let (primary, blocks) =
+            lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
+        let control = MutableCanonicalControl::new(lifecycle_writer_status(&primary));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let server = tokio::spawn({
+            let control = control.clone();
+            async move {
+                Server::builder()
+                    .add_service(CanonicalControlServer::new(control))
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                        let _ = shutdown_receiver.await;
+                    })
+                    .await
+            }
+        });
+        let serving_readiness = CompactServingReadiness::new(Readiness::default());
+        serving_readiness.publish_node(ReadinessCause::Ready);
+        let budget = RocksDbResourceBudget::for_local_tests();
+        let config = CompactBlockServingConfig {
+            canonical_primary_path: temporary.path().join("canonical-primary"),
+            canonical_secondary_root: temporary.path().join("canonical-secondaries"),
+            network: Network::ZcashRegtest,
+            activations: Arc::new(activations.clone()),
+            raw_blob_retention: RawBlobRetention::Transactions,
+            reorg_policy: CanonicalReorgPolicy::new(100)?,
+            resource_budget: budget,
+            catchup_interval: Duration::from_millis(1),
+            convergence_timeout: Duration::from_secs(2),
+            convergence_attempts: 4,
+            staleness_ceiling: Duration::from_mins(1),
+            lag_threshold: 0,
+        };
+        let (mut publisher, slot) =
+            CompactBlockPublisher::bootstrap(config, serving_readiness, &endpoint, None).await?;
+        let block_cache = publisher.block_cache.clone();
+        let initial = slot.capture();
+        let first_block = initial.compact_block_at(BlockHeight::new(1))?;
+        let loaded = block_cache.usage_bytes();
+        assert!(
+            loaded > 0,
+            "the active generation must read through the publisher's cache"
+        );
+
+        let second = blocks
+            .get(1)
+            .cloned()
+            .ok_or("lifecycle fixture has no append block")?;
+        let expected_fence = primary.event_fence();
+        let (primary, _) = primary.commit_live_append(
+            CanonicalLiveAppend::new(
+                expected_fence,
+                lifecycle_build_block(&second, &activations),
+                Vec::new(),
+                expected_fence.visible_tip(),
+                UnixTimestampMillis::new(2_000),
+            ),
+            &activations,
+        )?;
+        control.set_writer_status(lifecycle_writer_status(&primary));
+        publisher.refresh().await;
+        let replaced = slot.capture();
+        assert!(!Arc::ptr_eq(&initial, &replaced));
+        let before_read = block_cache.usage_bytes();
+        assert!(
+            before_read >= loaded,
+            "a cold open on refresh keeps the blocks already loaded"
+        );
+        assert_eq!(replaced.compact_block_at(BlockHeight::new(1))?, first_block);
+        assert_eq!(
+            block_cache.usage_bytes(),
+            before_read,
+            "the new generation reads the block the replaced one loaded"
+        );
+
+        publisher.record_resource_gauges();
+        let exposition = rendered_metrics.render();
+        let gauge = |name: &str| {
+            exposition.lines().find_map(|line| {
+                line.strip_prefix(name)?
+                    .strip_prefix("{store_role=\"canonical_secondary\"} ")?
+                    .parse::<f64>()
+                    .ok()
+            })
+        };
+        assert_eq!(
+            gauge("zinder_store_block_cache_capacity_bytes"),
+            Some(f64::from(u32::try_from(budget.block_cache_bytes)?))
+        );
+        assert_eq!(
+            gauge("zinder_store_block_cache_usage_bytes"),
+            Some(f64::from(u32::try_from(block_cache.usage_bytes())?))
+        );
+        assert_eq!(
+            gauge("zinder_store_memtable_budget_bytes"),
+            Some(f64::from(2 * u32::try_from(budget.memtable_budget_bytes)?)),
+            "the active and the held generation each keep their memtables"
+        );
+
+        let cancel = CancellationToken::new();
+        let drained = CancellationToken::new();
+        let publisher_handle = publisher.spawn(cancel.clone(), drained.clone());
+        cancel.cancel();
+        drained.cancel();
+        publisher_handle.await?;
+        drop((initial, replaced, slot));
+        assert_eq!(block_cache.pinned_usage_bytes(), 0);
+        let _ = shutdown_sender.send(());
+        server.await??;
         Ok(())
     }
 

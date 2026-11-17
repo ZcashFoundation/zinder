@@ -12,7 +12,7 @@ use zinder_core::{
 
 use crate::{
     BoundedRocksDbOpen, RawBlobRetention, RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget,
-    build_block_based_table_factory, open_bounded_rocksdb,
+    build_block_based_table_factory, keep_blocks_of_dropped_table_files, open_bounded_rocksdb,
 };
 
 use super::{
@@ -885,6 +885,7 @@ pub(super) fn canonical_data_options(
         usize::try_from(resource_budget.write_buffer_bytes).unwrap_or(usize::MAX),
     );
     options.set_max_write_buffer_number(resource_budget.max_write_buffer_count);
+    keep_blocks_of_dropped_table_files(&mut options);
     options
 }
 
@@ -1232,6 +1233,18 @@ mod tests {
         CANONICAL_STORE_IDENTITY, CANONICAL_STORE_SCHEMA_VERSION, CanonicalReorgPolicy,
         CanonicalStoreBuildPlan, RocksDbCanonicalBuilder,
     };
+
+    /// A canonical secondary may share its block cache with other secondaries
+    /// of the store, so no data family erases the blocks of a file it drops.
+    /// Every data family opens with these options.
+    #[test]
+    fn data_families_keep_the_blocks_of_dropped_table_files() {
+        let options = canonical_data_options(
+            &Cache::new_lru_cache(1024 * 1024),
+            RocksDbResourceBudget::for_local_tests(),
+        );
+        assert_eq!(options.get_uncache_aggressiveness(), 0);
+    }
 
     #[test]
     fn building_layout_is_exact_and_not_servable() -> Result<(), Box<dyn std::error::Error>> {

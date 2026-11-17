@@ -179,6 +179,16 @@ changed. It does not repeat the cold scan of retained history. A generation
 whose pair is still held is never caught up. A generation whose catch-up or
 publication fails is closed, and its slot is opened cold when it is next used.
 
+Every generation opens its canonical secondary on one block cache and its
+wallet secondary on another, both owned by the publisher and sized by the
+configured `block_cache_bytes`
+([ADR-0020](0020-bounded-rocksdb-resource-budget.md#block-caches-shared-across-secondaries)).
+The configured sizes bound the process, not each generation, and a
+generation that is opened cold or caught up finds the blocks the other
+generations already loaded. Each generation keeps its own table cache and
+memtables. Compact-blocks serving opens its two canonical generations on one
+cache the same way.
+
 A drained generation stays open, and an open secondary keeps open the
 primary files its table cache holds, including files the primary has since
 compacted away. The publisher therefore reuses drained generations in turn,
@@ -433,9 +443,9 @@ only when more than three blocks arrive within one minute.
 ### Retain more pairs
 
 Each extra generation keeps another canonical and wallet secondary pair open
-with its own block caches, against the memory a wallet-serving reader budgets
-for four. More pairs still bound a pin by a number of blocks, so a fast enough
-burst still releases it.
+with its own table caches and memtables, against the memory a wallet-serving
+reader budgets for four. More pairs still bound a pin by a number of blocks,
+so a fast enough burst still releases it.
 
 ### Protect only epochs that a read has pinned
 
@@ -577,6 +587,9 @@ controlled consumer cutover uses the current contract without shims.
 
 ## Revision history
 
+- 2026-11-17: The serving generations of a process share one block cache per
+  store, sized by the configured `block_cache_bytes`, instead of opening a
+  cache of that size each.
 - 2026-11-17: A compatibility block-range chunk also stops at 2 MiB of stored
   compact blocks, keeping at least one block, so a range of large blocks takes
   several chunks. Every chunk edge carries the same hash check.

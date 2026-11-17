@@ -56,16 +56,26 @@ so the baked configs pin every budget that would otherwise be derived from it:
 | --- | --- | --- |
 | `zinder-ingest` | ~2.6 GiB | canonical and materialized-view writer stores |
 | `zinder-projector` | ~2.7 GiB while building, ~1.2 GiB while following | wallet-build sorters |
-| `zinder-query` | ~0.4 GiB per open serving pair, up to ~1.4 GiB | canonical secondary block cache |
+| `zinder-query` | ~0.35 GiB with one open serving pair, up to ~0.45 GiB with four | canonical secondary block cache, shared by every pair |
 
-Query keeps up to four serving pairs open, each with its own block caches: the
-current pair and three more, each the candidate it is catching up, a replaced
-pair that still answers pinned reads, or one a long request holds. A generation
-stays open after its pair drains so a later block can reuse it, so once three
-blocks arrive within one minute, or a long request holds a released pair, all
-four stay open until query restarts. Query catches drained generations up in
-turn, so a primary file that compaction replaces stays on disk for only a few
-blocks while a drained generation still references it. The remainder covers
+Query keeps up to four serving pairs open: the current pair and three more,
+each the candidate it is catching up, a replaced pair that still answers
+pinned reads, or one a long request holds. All of them read through one
+canonical and one wallet block cache, so the configured cache sizes, 256 MiB
+and 64 MiB here, bound the process however many pairs are open. Each open pair
+adds its own memtables, up to 32 MiB, and the table readers of the files it
+holds open. A generation stays open after its pair drains so a later block can
+reuse it, so once three blocks arrive within one minute, or a long request
+holds a released pair, all four stay open until query restarts. Query catches
+drained generations up in turn, so a primary file that compaction replaces
+stays on disk for only a few blocks while a drained generation still
+references it. The wallet reader's 64 MiB default is likewise the total for
+every pair. A Mainnet wallet's index and filter blocks need far more; size
+`ZINDER_WALLET__ROCKSDB__BLOCK_CACHE_BYTES` from the wallet store's filter
+working set as
+[ADR-0020](../adrs/0020-bounded-rocksdb-resource-budget.md#locked-rocksdb-invariants)
+describes, and count it twice, because in this container the variable also
+sizes the projector's wallet writer cache. The remainder covers
 allocator overhead, gRPC buffers, and task stacks. In a
 smaller container the cgroup OOM-killer takes one process during construction.
 That terminates the whole container, and the restart resumes construction from

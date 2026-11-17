@@ -1,6 +1,6 @@
 use std::num::NonZeroU32;
 
-use rust_rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
+use rust_rocksdb::{DEFAULT_COLUMN_FAMILY_NAME, statistics::Ticker};
 use tempfile::TempDir;
 use zinder_core::{BlockHash, BlockHeight, BlockId, Network, UnixTimestampMillis};
 
@@ -15,7 +15,7 @@ use super::{
     },
     rocksdb::{COMPACT_BLOCK_COLUMN_FAMILY, validate_open_store_control},
 };
-use crate::{RawBlobRetention, RocksDbResourceBudget};
+use crate::{RawBlobRetention, RocksDbOpenResources, RocksDbResourceBudget, SharedBlockCache};
 
 const REORG_WINDOW: u32 = 2;
 
@@ -169,6 +169,232 @@ fn a_stale_secondary_reports_a_compacted_away_table_file_until_it_catches_up()
             store.compact_block_at(height)?
         );
     }
+    Ok(())
+}
+
+/// A shared block cache that holds a compacted-away file's blocks does not
+/// hide the file's absence from a secondary that has to reopen it.
+///
+/// A second secondary on the same cache reads every row first, so the cache
+/// holds a block of every split file. The stale secondary still opens a file
+/// before it looks up any of the file's blocks, so its reads fail, each as a
+/// missing table file, until it catches up.
+#[test]
+fn a_shared_block_cache_does_not_hide_a_compacted_away_table_file()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let store = published_store(
+        &store_path,
+        REORG_WINDOW,
+        BlockHeight::new(SPLIT_HEIGHTS),
+        BlockHeight::new(SPLIT_HEIGHTS - REORG_WINDOW),
+    )?;
+    split_rows_into_table_files(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    let block_cache = test_block_cache();
+    let mut stale = open_secondary_on(
+        &store_path,
+        temporary.path().join("stale"),
+        &activations,
+        &block_cache,
+    )??;
+    let warm = open_secondary_on(
+        &store_path,
+        temporary.path().join("warm"),
+        &activations,
+        &block_cache,
+    )??;
+    read_every_compact_block(&warm)?;
+    let (_, warming_misses) = data_block_lookups(&warm);
+    read_every_compact_block(&warm)?;
+    assert_eq!(
+        data_block_lookups(&warm).1,
+        warming_misses,
+        "warming must cache the block of every split row"
+    );
+    let warmed_usage = block_cache.usage_bytes();
+
+    compact_away_table_files(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    let failures = (1..=SPLIT_HEIGHTS)
+        .filter_map(|height| stale.compact_block_at(BlockHeight::new(height)).err())
+        .collect::<Vec<_>>();
+    assert!(
+        !failures.is_empty(),
+        "a stale secondary must reopen at least one compacted-away table file"
+    );
+    for failure in &failures {
+        assert!(
+            failure.is_missing_table_file(),
+            "only a missing table file may fail the stale read, got {failure:?}"
+        );
+    }
+    let family = stale
+        .bounded_open
+        .db
+        .cf_handle(COMPACT_BLOCK_COLUMN_FAMILY)
+        .ok_or("the family must exist")?;
+    let scan_failure = stale
+        .bounded_open
+        .db
+        .iterator_cf(&family, rust_rocksdb::IteratorMode::Start)
+        .find_map(Result::err)
+        .ok_or("a scan over the compacted-away files must fail")?;
+    assert!(crate::is_missing_table_file_error(&scan_failure));
+    drop(family);
+    assert!(
+        block_cache.usage_bytes() >= warmed_usage,
+        "the compacted-away files' blocks stay cached while the stale reads fail"
+    );
+
+    stale.try_catch_up()?;
+    for height in (1..=SPLIT_HEIGHTS).map(BlockHeight::new) {
+        assert_eq!(
+            stale.compact_block_at(height)?,
+            store.compact_block_at(height)?
+        );
+    }
+    Ok(())
+}
+
+/// Secondaries of one primary on one shared block cache hold one copy of
+/// each block they both read.
+///
+/// The second secondary's reads find every data block the first one loaded,
+/// so they add nothing to the cache. That holds for the bulk-built files of a
+/// fresh store, for files the writer flushes, and for files its compaction
+/// writes. A change to how `RocksDB` derives cache keys from table files
+/// would make the second secondary miss.
+#[test]
+fn secondaries_on_one_shared_block_cache_hold_one_copy_of_each_block()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let store = published_store(
+        &store_path,
+        REORG_WINDOW,
+        BlockHeight::new(SPLIT_HEIGHTS),
+        BlockHeight::new(SPLIT_HEIGHTS - REORG_WINDOW),
+    )?;
+    let block_cache = test_block_cache();
+    let mut first = open_secondary_on(
+        &store_path,
+        temporary.path().join("first"),
+        &activations,
+        &block_cache,
+    )??;
+    let mut second = open_secondary_on(
+        &store_path,
+        temporary.path().join("second"),
+        &activations,
+        &block_cache,
+    )??;
+    assert_second_reads_only_cached_blocks(&first, &second, &block_cache, "bulk-built")?;
+
+    split_rows_into_table_files(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    first.try_catch_up()?;
+    second.try_catch_up()?;
+    assert_second_reads_only_cached_blocks(&first, &second, &block_cache, "flushed")?;
+
+    compact_away_table_files(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    first.try_catch_up()?;
+    second.try_catch_up()?;
+    assert_second_reads_only_cached_blocks(&first, &second, &block_cache, "compacted")?;
+    Ok(())
+}
+
+/// A shared block cache outlives every secondary opened on it and keeps none
+/// of a closed secondary's pins.
+///
+/// Each secondary pins the index blocks of the level-0 files it holds open.
+/// Closing it releases them while the blocks stay cached, and a secondary
+/// opened later on the same cache reads every block the closed one loaded.
+#[test]
+fn a_shared_block_cache_outlives_a_closed_secondary_without_keeping_its_pins()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let store = published_store(
+        &store_path,
+        REORG_WINDOW,
+        BlockHeight::new(SPLIT_HEIGHTS),
+        BlockHeight::new(SPLIT_HEIGHTS - REORG_WINDOW),
+    )?;
+    split_rows_into_table_files(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    let block_cache = test_block_cache();
+
+    let closed = open_secondary_on(
+        &store_path,
+        temporary.path().join("closed"),
+        &activations,
+        &block_cache,
+    )??;
+    read_every_compact_block(&closed)?;
+    assert!(
+        block_cache.pinned_usage_bytes() > 0,
+        "an open secondary pins its level-0 index blocks"
+    );
+    let loaded = block_cache.usage_bytes();
+    drop(closed);
+    assert_eq!(block_cache.pinned_usage_bytes(), 0);
+    assert_eq!(block_cache.usage_bytes(), loaded);
+
+    let reopened = open_secondary_on(
+        &store_path,
+        temporary.path().join("reopened"),
+        &activations,
+        &block_cache,
+    )??;
+    let (hits_before, misses_before) = data_block_lookups(&reopened);
+    read_every_compact_block(&reopened)?;
+    let (hits_after, misses_after) = data_block_lookups(&reopened);
+    assert_eq!(
+        misses_after, misses_before,
+        "a later secondary reads the blocks a closed one loaded"
+    );
+    assert!(hits_after > hits_before);
+    assert_eq!(block_cache.usage_bytes(), loaded);
+    drop(reopened);
+    assert_eq!(block_cache.pinned_usage_bytes(), 0);
+    Ok(())
+}
+
+/// A secondary refuses to open on a shared block cache whose capacity
+/// differs from its budget's, so the recorded budget always names the cache
+/// the secondary reads through.
+#[test]
+fn a_secondary_refuses_a_shared_block_cache_its_budget_does_not_name()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let activations = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let _store = published_store(
+        &store_path,
+        REORG_WINDOW,
+        BlockHeight::new(4),
+        BlockHeight::new(2),
+    )?;
+    let budget = RocksDbResourceBudget::for_local_tests();
+    let larger_cache = SharedBlockCache::new(budget.block_cache_bytes * 2);
+    let error = open_secondary_on(
+        &store_path,
+        temporary.path().join("secondary"),
+        &activations,
+        &larger_cache,
+    )?
+    .err()
+    .ok_or("a budget that does not name the shared cache must be refused")?;
+    assert!(
+        matches!(
+            error,
+            CanonicalStoreError::InvalidResourceBudget { reason }
+                if reason.contains("shared block cache")
+        ),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(larger_cache.usage_bytes(), 0);
     Ok(())
 }
 
@@ -544,6 +770,84 @@ fn open_secondary(
         CanonicalReorgPolicy::new(REORG_WINDOW)?,
         RocksDbResourceBudget::for_local_tests(),
     ))
+}
+
+/// Opens a canonical secondary on `block_cache`, returning the admission
+/// outcome separately from fixture-construction failures.
+fn open_secondary_on(
+    store_path: &std::path::Path,
+    secondary_path: std::path::PathBuf,
+    activations: &zinder_core::NetworkUpgradeActivations,
+    block_cache: &SharedBlockCache,
+) -> Result<Result<RocksDbCanonicalSecondary, CanonicalStoreError>, Box<dyn std::error::Error>> {
+    Ok(RocksDbCanonicalSecondary::open_ready(
+        store_path,
+        secondary_path,
+        activations,
+        CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(REORG_WINDOW)?,
+        RocksDbOpenResources::with_shared_block_cache(
+            RocksDbResourceBudget::for_local_tests(),
+            block_cache,
+        ),
+    ))
+}
+
+/// A block cache sized by the local test budget, large enough that nothing a
+/// test reads is evicted.
+fn test_block_cache() -> SharedBlockCache {
+    SharedBlockCache::new(RocksDbResourceBudget::for_local_tests().block_cache_bytes)
+}
+
+fn read_every_compact_block(
+    secondary: &RocksDbCanonicalSecondary,
+) -> Result<(), CanonicalStoreError> {
+    for height in (1..=SPLIT_HEIGHTS).map(BlockHeight::new) {
+        secondary.compact_block_at(height)?;
+    }
+    Ok(())
+}
+
+/// Data-block cache hits and misses `secondary` has recorded.
+fn data_block_lookups(secondary: &RocksDbCanonicalSecondary) -> (u64, u64) {
+    let statistics = &secondary.bounded_open.statistics;
+    (
+        statistics.get_ticker_count(Ticker::BlockCacheDataHit),
+        statistics.get_ticker_count(Ticker::BlockCacheDataMiss),
+    )
+}
+
+/// Reads every compact block through `first` and then through `second`, and
+/// asserts that `second` found every data block in the cache and added
+/// nothing to it.
+fn assert_second_reads_only_cached_blocks(
+    first: &RocksDbCanonicalSecondary,
+    second: &RocksDbCanonicalSecondary,
+    block_cache: &SharedBlockCache,
+    files: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let before_first = block_cache.usage_bytes();
+    read_every_compact_block(first)?;
+    let after_first = block_cache.usage_bytes();
+    assert!(
+        after_first > before_first,
+        "reading {files} files through the first secondary must load blocks"
+    );
+    let (hits_before, misses_before) = data_block_lookups(second);
+    read_every_compact_block(second)?;
+    let (hits_after, misses_after) = data_block_lookups(second);
+    assert_eq!(
+        misses_after, misses_before,
+        "the second secondary must find every data block of the {files} files cached"
+    );
+    assert!(hits_after > hits_before);
+    assert_eq!(
+        block_cache.usage_bytes(),
+        after_first,
+        "reading the {files} files through the second secondary must not grow the cache"
+    );
+    Ok(())
 }
 
 /// Rewrites each row of `family` unchanged and flushes it, so every row is the

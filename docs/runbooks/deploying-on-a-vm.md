@@ -131,7 +131,8 @@ assign a different 32-character hexadecimal value to every side-by-side
 projector lane.
 
 The compatibility container's memory limit, `ZINDER_COMPAT_MEMORY_LIMIT`
-(4 GiB by default), must cover four reader generations of block caches plus
+(4 GiB by default), must cover the reader block caches, which all four reader
+generations share, the memtables of each open generation, and
 `compat.max_concurrent_block_range_streams` block-range streams.
 [Block range resource limits](../reference/lightwalletd-compatibility.md#block-range-resource-limits)
 describes both terms. The memory the streams hold is not measured, so check

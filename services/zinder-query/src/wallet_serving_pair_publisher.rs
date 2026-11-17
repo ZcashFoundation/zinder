@@ -15,6 +15,11 @@
 //! only that generation: the publisher keeps refreshing into the other
 //! bounded generation slots.
 //!
+//! Every generation reads through one block cache per store, which the
+//! publisher owns, so the configured cache sizes bound the process rather
+//! than each generation, and a generation opened or caught up later finds the
+//! blocks its siblings already loaded.
+//!
 //! A secondary does not keep the primary's table files alive, so a frozen
 //! generation can name a file the writer's compaction has since deleted. A
 //! read that finds such a file gone marks its pair, which then leaves the
@@ -62,7 +67,8 @@ use zinder_runtime::{
 use zinder_source::{NodeCapability, NodeSource, SourceError, UpstreamHealthSnapshot};
 use zinder_store::{
     CanonicalActivationSchedule, CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload,
-    RawBlobRetention, RocksDbCanonicalSecondary, RocksDbResourceBudget,
+    RawBlobRetention, RocksDbCanonicalSecondary, RocksDbInstanceMemory, RocksDbOpenResources,
+    RocksDbResourceBudget, SharedBlockCache, StoreRole, record_shared_block_cache_gauges,
 };
 use zinder_wallet_projection::WalletCanonicalSourceIdentity;
 use zinder_wallet_rocksdb::{RocksDbWalletError, RocksDbWalletSecondary};
@@ -119,9 +125,13 @@ pub struct WalletServingPairConfig {
     pub expected_raw_blob_retention: RawBlobRetention,
     /// Canonical replacement-depth identity expected from the writer.
     pub canonical_reorg_policy: CanonicalReorgPolicy,
-    /// `RocksDB` budget for each canonical secondary generation.
+    /// `RocksDB` budget for each canonical secondary generation. Its
+    /// `block_cache_bytes` sizes the one block cache that every canonical
+    /// generation of the process shares.
     pub canonical_resource_budget: RocksDbResourceBudget,
-    /// `RocksDB` budget for each wallet secondary generation.
+    /// `RocksDB` budget for each wallet secondary generation. Its
+    /// `block_cache_bytes` sizes the one block cache that every wallet
+    /// generation of the process shares.
     pub wallet_resource_budget: RocksDbResourceBudget,
     /// Delay between refresh attempts after initial publication.
     pub catchup_interval: Duration,
@@ -712,6 +722,10 @@ pub struct WalletServingPairPublisher {
     readiness: WalletServingReadiness,
     serving_pair_slot: Option<WalletServingPairSlot>,
     generations: [SecondaryGeneration; SECONDARY_GENERATION_COUNT],
+    /// The block caches every generation opens on. They outlive any one
+    /// generation, so a generation that closes leaves its cached blocks to
+    /// the others and to the next cold open.
+    block_caches: ServingBlockCaches,
     published_generation: Option<usize>,
     /// Trailing references to the pairs released from the slot.
     ///
@@ -774,6 +788,10 @@ impl WalletServingPairPublisher {
     ) -> Result<(Self, WalletServingPairSlot), WalletServingPairError> {
         let generations =
             std::array::from_fn(|generation| SecondaryGeneration::new(&config, generation));
+        let block_caches = ServingBlockCaches {
+            canonical: SharedBlockCache::new(config.canonical_resource_budget.block_cache_bytes),
+            wallet: SharedBlockCache::new(config.wallet_resource_budget.block_cache_bytes),
+        };
         let secondary_activations = Arc::clone(&config.network_upgrade_activations);
         let writer_attestation =
             WriterAttestation::new(config.network, config.serving_pair_staleness_ceiling);
@@ -783,6 +801,7 @@ impl WalletServingPairPublisher {
             readiness,
             serving_pair_slot: None,
             generations,
+            block_caches,
             published_generation: None,
             retired_pairs: Vec::with_capacity(SECONDARY_GENERATION_COUNT),
             writer_attestation,
@@ -793,6 +812,7 @@ impl WalletServingPairPublisher {
         };
         publisher.prepare_candidate(0).await?;
         publisher.converge_and_publish(0).await?;
+        publisher.record_resource_gauges();
         let Some(serving_pair_slot) = publisher.serving_pair_slot.clone() else {
             return Err(WalletServingPairError::PairSlotUnavailable);
         };
@@ -845,7 +865,9 @@ impl WalletServingPairPublisher {
     }
 
     async fn refresh_and_record(&mut self) {
-        let Err(error) = self.refresh_once().await else {
+        let refreshed = self.refresh_once().await;
+        self.record_resource_gauges();
+        let Err(error) = refreshed else {
             return;
         };
         let still_admitted = self.record_refresh_failure(&error);
@@ -904,6 +926,46 @@ impl WalletServingPairPublisher {
         };
         self.prepare_candidate(generation).await?;
         self.converge_and_publish(generation).await
+    }
+
+    /// Publishes the two shared block caches, the memory every open
+    /// generation holds outside them, and the number of open generations.
+    ///
+    /// Memtables and table readers belong to each open secondary, so their
+    /// gauges are summed over the open generations of each store.
+    fn record_resource_gauges(&self) {
+        let open_pairs = self
+            .generations
+            .iter()
+            .filter_map(|generation| match &generation.state {
+                SecondaryGenerationState::Vacant => None,
+                SecondaryGenerationState::Candidate { candidate } => {
+                    Some((&candidate.canonical, &candidate.wallet))
+                }
+                SecondaryGenerationState::Published { readers, .. } => {
+                    Some((readers.canonical.as_ref(), readers.wallet.as_ref()))
+                }
+            })
+            .collect::<Vec<_>>();
+        record_shared_block_cache_gauges(
+            StoreRole::CanonicalSecondary,
+            &self.block_caches.canonical,
+            open_pairs
+                .iter()
+                .map(|(canonical, _)| canonical.instance_memory())
+                .sum::<RocksDbInstanceMemory>(),
+        );
+        record_shared_block_cache_gauges(
+            StoreRole::WalletSecondary,
+            &self.block_caches.wallet,
+            open_pairs
+                .iter()
+                .map(|(_, wallet)| wallet.instance_memory())
+                .sum::<RocksDbInstanceMemory>(),
+        );
+        metrics::gauge!("zinder_wallet_serving_pair_publisher_open_generations").set(f64::from(
+            u32::try_from(open_pairs.len()).unwrap_or(u32::MAX),
+        ));
     }
 
     /// Counts a refresh that found every unpublished slot taken and published
@@ -1129,8 +1191,14 @@ impl WalletServingPairPublisher {
         let network_upgrade_activations = Arc::clone(&self.secondary_activations);
         let canonical_reorg_policy = self.config.canonical_reorg_policy;
         let expected_raw_blob_retention = self.config.expected_raw_blob_retention;
-        let canonical_resource_budget = self.config.canonical_resource_budget;
-        let wallet_resource_budget = self.config.wallet_resource_budget;
+        let canonical_resources = RocksDbOpenResources::with_shared_block_cache(
+            self.config.canonical_resource_budget,
+            &self.block_caches.canonical,
+        );
+        let wallet_resources = RocksDbOpenResources::with_shared_block_cache(
+            self.config.wallet_resource_budget,
+            &self.block_caches.wallet,
+        );
         let network = self.config.network;
         let started_at = Instant::now();
         let opened = tokio::task::spawn_blocking(move || {
@@ -1153,13 +1221,13 @@ impl WalletServingPairPublisher {
                 CanonicalStoreWorkload::Wallet,
                 expected_raw_blob_retention,
                 canonical_reorg_policy,
-                canonical_resource_budget,
+                canonical_resources,
             )?;
             let wallet = RocksDbWalletSecondary::open_ready(
                 wallet_primary_path,
                 wallet_secondary_path,
                 network,
-                wallet_resource_budget,
+                wallet_resources,
             )?;
             Ok::<_, WalletServingPairError>(Box::new(SecondaryPairCandidate { canonical, wallet }))
         })
@@ -1531,6 +1599,13 @@ enum ActiveWriterRelation {
     /// confirmed its tip since it reopened. Its fence does not advance in
     /// either state, so no replacement pair is prepared.
     Refusing,
+}
+
+/// The block cache of each store that every generation of one publisher
+/// reads through.
+struct ServingBlockCaches {
+    canonical: SharedBlockCache,
+    wallet: SharedBlockCache,
 }
 
 struct SecondaryGeneration {
@@ -4781,6 +4856,141 @@ mod tests {
         drop(slot);
         drop(publisher);
         primaries.shutdown().await
+    }
+
+    /// Every generation reads through one block cache per store.
+    ///
+    /// A generation that reads the blocks an older one already loaded adds
+    /// nothing to the cache. With every slot open, each cache reports the
+    /// configured capacity once, while the memtable gauges sum the open
+    /// generations. Once the publisher and every pair drop, both caches keep
+    /// their blocks with nothing pinned, so no closed generation still holds
+    /// an entry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn generations_read_through_one_block_cache_per_store()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let rendered_metrics = recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let mut primaries =
+            AdvancingPrimaries::start_through(BlockHeight::new(SPLIT_TIP_HEIGHT)).await?;
+        let (mut publisher, slot) = primaries
+            .bootstrap_publisher(zinder_runtime::Readiness::default())
+            .await?;
+        let canonical_cache = publisher.block_caches.canonical.clone();
+        let wallet_cache = publisher.block_caches.wallet.clone();
+        assert_eq!(
+            gauge_sample(
+                &rendered_metrics.render(),
+                "zinder_wallet_serving_pair_publisher_open_generations"
+            ),
+            Some(1.0)
+        );
+
+        let first = slot.capture();
+        let before_first_read = canonical_cache.usage_bytes();
+        let first_blocks = first
+            .canonical()
+            .compact_blocks_in_range(split_block_range())?;
+        assert!(canonical_cache.usage_bytes() > before_first_read);
+
+        primaries.append_block()?;
+        publisher.refresh_and_record().await;
+        let second = slot.capture();
+        assert!(!Arc::ptr_eq(&first, &second));
+        let before_second_read = canonical_cache.usage_bytes();
+        let second_blocks = second
+            .canonical()
+            .compact_blocks_in_range(split_block_range())?;
+        assert_eq!(second_blocks, first_blocks);
+        assert_eq!(
+            canonical_cache.usage_bytes(),
+            before_second_read,
+            "a second generation reading the same blocks must not grow the cache"
+        );
+
+        for _ in 2..SECONDARY_GENERATION_COUNT {
+            primaries.append_block()?;
+            publisher.refresh_and_record().await;
+        }
+        assert_eq!(
+            publisher.candidate_preparations.cold,
+            SECONDARY_GENERATION_COUNT
+        );
+        let exposition = rendered_metrics.render();
+        assert_eq!(
+            gauge_sample(
+                &exposition,
+                "zinder_wallet_serving_pair_publisher_open_generations"
+            ),
+            Some(f64::from(u32::try_from(SECONDARY_GENERATION_COUNT)?))
+        );
+        for (store_role, block_cache) in [
+            ("canonical_secondary", &canonical_cache),
+            ("wallet_secondary", &wallet_cache),
+        ] {
+            assert_shared_cache_gauges(&exposition, store_role, block_cache)?;
+        }
+
+        drop((first, second, slot, publisher));
+        for block_cache in [&canonical_cache, &wallet_cache] {
+            assert_eq!(block_cache.pinned_usage_bytes(), 0);
+            assert!(block_cache.usage_bytes() > 0);
+        }
+        primaries.shutdown().await
+    }
+
+    /// Asserts that `store_role`'s gauges report `block_cache` once, at the
+    /// configured capacity, and sum the memtables of every open generation.
+    fn assert_shared_cache_gauges(
+        exposition: &str,
+        store_role: &str,
+        block_cache: &zinder_store::SharedBlockCache,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let budget = RocksDbResourceBudget::for_local_tests();
+        let open_generations = u32::try_from(SECONDARY_GENERATION_COUNT)?;
+        let gauge = |name: &str| {
+            gauge_sample(
+                exposition,
+                &format!("{name}{{store_role=\"{store_role}\"}}"),
+            )
+        };
+        assert_eq!(
+            gauge("zinder_store_block_cache_capacity_bytes"),
+            Some(f64::from(u32::try_from(budget.block_cache_bytes)?)),
+            "{store_role} reports one cache of the configured size"
+        );
+        assert!(
+            block_cache.usage_bytes() > 0,
+            "{store_role} cache must hold blocks"
+        );
+        assert_eq!(
+            gauge("zinder_store_block_cache_usage_bytes"),
+            Some(f64::from(u32::try_from(block_cache.usage_bytes())?))
+        );
+        assert!(gauge("zinder_store_block_cache_pinned_usage_bytes").is_some());
+        assert_eq!(
+            gauge("zinder_store_memtable_budget_bytes"),
+            Some(f64::from(
+                open_generations * u32::try_from(budget.memtable_budget_bytes)?
+            )),
+            "{store_role} memtable budget sums the open generations"
+        );
+        assert!(gauge("zinder_store_memtable_budget_usage_bytes").is_some());
+        assert!(gauge("zinder_store_table_reader_memory_bytes").is_some());
+        Ok(())
+    }
+
+    /// Reads one unlabelled or fully labelled gauge series from a Prometheus
+    /// exposition.
+    fn gauge_sample(exposition: &str, series: &str) -> Option<f64> {
+        exposition.lines().find_map(|line| {
+            line.strip_prefix(series)?
+                .strip_prefix(' ')?
+                .trim()
+                .parse::<f64>()
+                .ok()
+        })
     }
 
     /// Reads one `generation_wait_total` series from a Prometheus exposition.

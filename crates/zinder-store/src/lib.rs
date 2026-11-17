@@ -55,9 +55,11 @@ pub use grpc_status::{
     status_from_store_error,
 };
 pub use kv::{
-    BoundedRocksDbOpen, ResourceGaugeThrottle, RocksDbIoMode, RocksDbOpenRole,
-    RocksDbResourceGaugeInputs, StoreRole, build_block_based_table_factory,
-    is_missing_table_file_error, open_bounded_rocksdb, record_rocksdb_resource_gauges,
+    BoundedRocksDbOpen, ResourceGaugeThrottle, RocksDbInstanceMemory, RocksDbIoMode,
+    RocksDbOpenResources, RocksDbOpenRole, RocksDbResourceGaugeInputs, SharedBlockCache, StoreRole,
+    build_block_based_table_factory, is_missing_table_file_error,
+    keep_blocks_of_dropped_table_files, open_bounded_rocksdb, record_rocksdb_resource_gauges,
+    record_shared_block_cache_gauges,
 };
 pub use mempool_event::{MempoolEvent, MempoolEventEnvelope, MempoolEventPosition};
 pub use mempool_event_store::{

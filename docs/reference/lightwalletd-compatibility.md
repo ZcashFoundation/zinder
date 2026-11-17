@@ -450,14 +450,17 @@ stream.
 
 In wallet serving, the compatibility runtime keeps up to four reader
 generations open, as native query does. Each generation is a canonical and a
-wallet secondary, and each secondary has its own block cache: by default
-128 MiB for the canonical reader, or one eighth of the container memory limit
-up to 512 MiB, and 64 MiB for the wallet reader. A generation stays open
-until the process restarts, and its caches fill with the history that
-streams read while it was current. Plan for four times one generation's cache
-budget. Under the Compose default memory limit of 4 GiB, which derives
-512 MiB canonical caches, that is about 2.25 GiB. Compact-blocks serving
-keeps two canonical generations.
+wallet secondary. Every canonical secondary reads through one canonical block
+cache and every wallet secondary through one wallet block cache, so the
+configured sizes bound the process: by default 128 MiB for the canonical
+reader, or one eighth of the container memory limit up to 512 MiB, and 64 MiB
+for the wallet reader. Under the Compose default memory limit of 4 GiB, which
+derives a 512 MiB canonical cache, the two caches take 576 MiB. Index and
+filter blocks that open table files pin can take a cache somewhat past its
+size. Each open generation also keeps its own memtables, up to 16 MiB per
+store by default, and the table readers of the files it holds open.
+Compact-blocks serving keeps two canonical generations on one canonical block
+cache.
 
 ## Transaction lookup
 
