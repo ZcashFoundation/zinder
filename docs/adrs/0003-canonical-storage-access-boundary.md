@@ -17,7 +17,11 @@ opening a second writer.
 
 Every chain-dependent read is bound to one `ChainEpoch` or one
 `CanonicalEventFence` before it reads artifacts. The bound reader may finish
-against that immutable visible state even when a newer epoch is published.
+against that immutable visible state even when a newer epoch is published. A
+lightwalletd compatibility block-range stream is assembled from bound reads at
+different epochs: it reads each chunk at the epoch current when it reads it,
+and proves by hash linkage that every block it sends belongs to one chain
+([ADR-0038](0038-wallet-runtime-composition-and-capability-discovery.md#compatibility-block-range-streams)).
 
 Canonical storage has one primary owner. Other processes open process-owned
 RocksDB secondaries with unique metadata paths. A secondary catches up before

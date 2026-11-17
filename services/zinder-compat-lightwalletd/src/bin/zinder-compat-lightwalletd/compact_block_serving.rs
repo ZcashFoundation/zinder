@@ -11,10 +11,10 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
-use zinder_compat_lightwalletd::compact_transaction_has_payload;
+use zinder_compat_lightwalletd::{BlockRangeContinuity, compact_transaction_has_payload};
 use zinder_core::{
-    BlockHash, BlockHeight, BlockHeightRange, CompactBlockArtifact, CompactTransaction,
-    CompactTransactionData, Network, NetworkUpgradeActivations,
+    BlockHash, BlockHeight, BlockHeightRange, ChainEpochId, CompactBlockArtifact,
+    CompactTransaction, CompactTransactionData, Network, NetworkUpgradeActivations,
     wire::{encode_branch_id_hex, encode_internal_block_hash, encode_internal_transaction_id},
 };
 use zinder_proto::{
@@ -810,44 +810,25 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlockAdapter {
                 Box::pin(tokio_stream::iter(std::iter::empty())) as Self::GetBlockRangeStream,
             ));
         };
-        let first_messages =
-            encode_chunk(Arc::clone(&reader), *first, pool_selection, descending).await?;
-        if remaining.is_empty() {
+        let encoding = ChunkEncoding {
+            selection: pool_selection,
+            descending,
+        };
+        let (first_messages, continuity) =
+            read_first_chunk(reader, *first, epoch.id, encoding, !remaining.is_empty()).await?;
+        let Some(continuity) = continuity else {
             return Ok(Response::new(
                 Box::pin(tokio_stream::iter(first_messages)) as Self::GetBlockRangeStream
             ));
-        }
+        };
         let (sender, receiver) = mpsc::channel(RANGE_CHANNEL_CAPACITY);
-        let reader = Arc::clone(&reader);
-        let remaining = remaining.to_vec();
-        tokio::spawn(async move {
-            for chunk in remaining {
-                let chunk_result = tokio::task::spawn_blocking({
-                    let reader = Arc::clone(&reader);
-                    move || {
-                        encode_chunk_blocking(reader.as_ref(), chunk, pool_selection, descending)
-                    }
-                })
-                .await
-                .map_err(|error| {
-                    Status::unavailable(format!("compact range worker failed: {error}"))
-                })
-                .and_then(std::convert::identity);
-                match chunk_result {
-                    Ok(messages) => {
-                        for message in messages {
-                            if sender.send(message).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        let _ = sender.send(Err(error)).await;
-                        return;
-                    }
-                }
-            }
-        });
+        tokio::spawn(stream_later_chunks(
+            self.slot.clone(),
+            remaining.to_vec(),
+            continuity,
+            encoding,
+            sender,
+        ));
         Ok(Response::new(Box::pin(
             tokio_stream::iter(first_messages).chain(ReceiverStream::new(receiver)),
         ) as Self::GetBlockRangeStream))
@@ -1019,38 +1000,129 @@ fn range_chunks(range: BlockHeightRange, descending: bool) -> Vec<BlockHeightRan
     chunks
 }
 
-async fn encode_chunk(
-    reader: Arc<RocksDbCanonicalSecondary>,
-    range: BlockHeightRange,
+/// How a block-range stream shapes the blocks it sends.
+#[derive(Clone, Copy)]
+struct ChunkEncoding {
     selection: PoolSelection,
     descending: bool,
-) -> Result<Vec<Result<lightwalletd::CompactBlock, Status>>, Status> {
-    tokio::task::spawn_blocking(move || {
-        encode_chunk_blocking(reader.as_ref(), range, selection, descending)
-    })
-    .await
-    .map_err(|error| Status::unavailable(format!("compact range worker failed: {error}")))?
 }
 
-fn encode_chunk_blocking(
-    reader: &RocksDbCanonicalSecondary,
-    range: BlockHeightRange,
-    selection: PoolSelection,
-    descending: bool,
-) -> Result<Vec<Result<lightwalletd::CompactBlock, Status>>, Status> {
-    let mut blocks = reader
-        .compact_blocks_in_range(range)
-        .map_err(store_status)?
-        .into_iter()
+type ChunkMessages = Vec<Result<lightwalletd::CompactBlock, Status>>;
+
+/// Reads and encodes the first chunk of a range at `reader`, the generation
+/// the request's bounds were checked against.
+///
+/// Returns the continuity that later chunks must follow when there are any.
+/// The reader is dropped when the read returns.
+async fn read_first_chunk(
+    reader: Arc<RocksDbCanonicalSecondary>,
+    chunk: BlockHeightRange,
+    chain_epoch_id: ChainEpochId,
+    encoding: ChunkEncoding,
+    has_later_chunks: bool,
+) -> Result<(ChunkMessages, Option<BlockRangeContinuity>), Status> {
+    tokio::task::spawn_blocking(move || {
+        let blocks = reader
+            .compact_blocks_in_range(chunk)
+            .map_err(store_status)?;
+        drop(reader);
+        let continuity = has_later_chunks
+            .then(|| {
+                BlockRangeContinuity::after_first_chunk(
+                    &blocks,
+                    chain_epoch_id,
+                    encoding.descending,
+                )
+            })
+            .transpose()?;
+        Ok((encode_blocks(&blocks, encoding)?, continuity))
+    })
+    .await
+    .map_err(|error| range_worker_failed(&error))?
+}
+
+/// Streams every chunk after the first, each read at the generation current
+/// when it is read.
+///
+/// The task holds a generation only inside one chunk read, never while it
+/// waits for the client, so a slow client cannot keep the publisher from
+/// recycling the retired generation.
+async fn stream_later_chunks(
+    slot: CompactBlockServingSlot,
+    chunks: Vec<BlockHeightRange>,
+    mut continuity: BlockRangeContinuity,
+    encoding: ChunkEncoding,
+    sender: mpsc::Sender<Result<lightwalletd::CompactBlock, Status>>,
+) {
+    for chunk in chunks {
+        let read = tokio::task::spawn_blocking({
+            let slot = slot.clone();
+            move || {
+                let messages = read_later_chunk(&slot, chunk, &mut continuity, encoding);
+                (continuity, messages)
+            }
+        })
+        .await;
+        let messages = match read {
+            Ok((next_continuity, Ok(messages))) => {
+                continuity = next_continuity;
+                messages
+            }
+            Ok((_, Err(status))) => {
+                let _ = sender.send(Err(status)).await;
+                return;
+            }
+            Err(error) => {
+                let _ = sender.send(Err(range_worker_failed(&error))).await;
+                return;
+            }
+        };
+        for message in messages {
+            if sender.send(message).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// Reads one later chunk at the current generation and accepts it only when
+/// it continues the chain the stream has sent.
+fn read_later_chunk(
+    slot: &CompactBlockServingSlot,
+    chunk: BlockHeightRange,
+    continuity: &mut BlockRangeContinuity,
+    encoding: ChunkEncoding,
+) -> Result<ChunkMessages, Status> {
+    let reader = slot.capture();
+    let epoch = reader.chain_epoch().map_err(store_status)?;
+    continuity.check_view_reaches(chunk, &epoch)?;
+    let blocks = reader
+        .compact_blocks_in_range(chunk)
+        .map_err(store_status)?;
+    drop(reader);
+    continuity.advance(chunk, &epoch, &blocks)?;
+    encode_blocks(&blocks, encoding)
+}
+
+fn range_worker_failed(error: &tokio::task::JoinError) -> Status {
+    Status::unavailable(format!("compact range worker failed: {error}"))
+}
+
+fn encode_blocks(
+    blocks: &[CompactBlockArtifact],
+    encoding: ChunkEncoding,
+) -> Result<ChunkMessages, Status> {
+    let mut messages = blocks
+        .iter()
         .map(|block| {
-            compact_block_to_lightwalletd(&block)
-                .map(|message| prune_pool_types(message, selection))
+            compact_block_to_lightwalletd(block)
+                .map(|message| prune_pool_types(message, encoding.selection))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if descending {
-        blocks.reverse();
+    if encoding.descending {
+        messages.reverse();
     }
-    Ok(blocks.into_iter().map(Ok).collect())
+    Ok(messages.into_iter().map(Ok).collect())
 }
 
 fn prune_pool_types(
@@ -2389,6 +2461,355 @@ mod tests {
             transport_failure_cause(None),
             ReadinessCause::WriterStatusUnavailable
         );
+    }
+
+    /// A canonical writer with more than one chunk of blocks, served through
+    /// the compact-blocks publisher and adapter.
+    struct LongRangeHarness {
+        writer: zinder_testkit::CanonicalWriterFixture,
+        control: MutableCanonicalControl,
+        readiness: Readiness,
+        publisher: CompactBlockPublisher,
+        slot: CompactBlockServingSlot,
+        adapter: CompactBlockAdapter,
+        shutdown: oneshot::Sender<()>,
+        server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+        _secondaries: tempfile::TempDir,
+    }
+
+    impl LongRangeHarness {
+        async fn start(
+            baseline: &zinder_testkit::CanonicalBaseline<'_>,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
+            let activations = zinder_testkit::sample_regtest_upgrade_activations();
+            let writer = zinder_testkit::CanonicalWriterFixture::publish(baseline, &activations)?;
+            let control =
+                MutableCanonicalControl::new(lifecycle_writer_status(writer.canonical_primary()?));
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = format!("http://{}", listener.local_addr()?);
+            let (shutdown, shutdown_receiver) = oneshot::channel();
+            let server = tokio::spawn({
+                let control = control.clone();
+                async move {
+                    Server::builder()
+                        .add_service(CanonicalControlServer::new(control))
+                        .serve_with_incoming_shutdown(
+                            TcpListenerStream::new(listener),
+                            async move {
+                                let _ = shutdown_receiver.await;
+                            },
+                        )
+                        .await
+                }
+            });
+            let secondaries = tempfile::tempdir()?;
+            let readiness = Readiness::default();
+            let serving_readiness = CompactServingReadiness::new(readiness.clone());
+            serving_readiness.publish_node(ReadinessCause::Ready);
+            let config = CompactBlockServingConfig {
+                canonical_primary_path: writer.canonical_primary_path().to_path_buf(),
+                canonical_secondary_root: secondaries.path().to_path_buf(),
+                network: Network::ZcashRegtest,
+                activations: Arc::new(activations.clone()),
+                raw_blob_retention: RawBlobRetention::Transactions,
+                reorg_policy: CanonicalReorgPolicy::new(100)?,
+                resource_budget: RocksDbResourceBudget::for_local_tests(),
+                catchup_interval: Duration::from_millis(1),
+                convergence_timeout: Duration::from_secs(2),
+                convergence_attempts: 4,
+                staleness_ceiling: Duration::from_mins(1),
+                lag_threshold: 0,
+            };
+            let (publisher, slot) =
+                CompactBlockPublisher::bootstrap(config, serving_readiness, &endpoint, None)
+                    .await?;
+            let adapter = CompactBlockAdapter::new(slot.clone(), Arc::new(activations));
+            Ok(Self {
+                writer,
+                control,
+                readiness,
+                publisher,
+                slot,
+                adapter,
+                shutdown,
+                server,
+                _secondaries: secondaries,
+            })
+        }
+
+        /// Reports the writer's current fence and runs one publisher refresh.
+        async fn refresh_at_writer_fence(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+            self.control
+                .set_writer_status(lifecycle_writer_status(self.writer.canonical_primary()?));
+            self.publisher.refresh().await;
+            Ok(())
+        }
+
+        fn published_height(&self) -> BlockHeight {
+            self.slot.capture().event_fence().visible_tip().height
+        }
+
+        async fn stop(self) -> Result<(), Box<dyn std::error::Error>> {
+            let cancel = CancellationToken::new();
+            let drained = CancellationToken::new();
+            let publisher_handle = self.publisher.spawn(cancel.clone(), drained.clone());
+            cancel.cancel();
+            drained.cancel();
+            publisher_handle.await?;
+            drop(self.slot);
+            drop(self.adapter);
+            let _ = self.shutdown.send(());
+            self.server.await??;
+            Ok(())
+        }
+    }
+
+    fn block_range(start: u32, end: u32) -> lightwalletd::BlockRange {
+        lightwalletd::BlockRange {
+            start: Some(lightwalletd::BlockId {
+                height: u64::from(start),
+                hash: Vec::new(),
+            }),
+            end: Some(lightwalletd::BlockId {
+                height: u64::from(end),
+                hash: Vec::new(),
+            }),
+            pool_types: Vec::new(),
+        }
+    }
+
+    /// Reads blocks until the stream has sent `count`, or until it ends.
+    async fn read_blocks<Stream>(
+        stream: &mut Stream,
+        blocks: &mut Vec<lightwalletd::CompactBlock>,
+        count: usize,
+    ) -> Result<(), tonic::Status>
+    where
+        Stream:
+            tokio_stream::Stream<Item = Result<lightwalletd::CompactBlock, tonic::Status>> + Unpin,
+    {
+        while blocks.len() < count {
+            let Some(message) = stream.next().await else {
+                return Ok(());
+            };
+            blocks.push(message?);
+        }
+        Ok(())
+    }
+
+    /// Asserts that `blocks` are heights `1..=last_height` in order and that
+    /// each names the block before it as its parent.
+    fn assert_linked_from_genesis(blocks: &[lightwalletd::CompactBlock], last_height: u32) {
+        assert_eq!(
+            blocks.len(),
+            usize::try_from(last_height).unwrap_or(usize::MAX),
+            "the stream must send heights 1 through {last_height}"
+        );
+        for (expected_height, block) in (1_u64..).zip(blocks) {
+            assert_eq!(block.height, expected_height);
+        }
+        for pair in blocks.windows(2) {
+            let [parent, child] = pair else {
+                continue;
+            };
+            assert_eq!(
+                child.prev_hash, parent.hash,
+                "block {} must link to block {}",
+                child.height, parent.height
+            );
+        }
+    }
+
+    /// A stream that waits on a slow client holds no generation, so the
+    /// publisher keeps publishing while it is open and readiness stays ready.
+    #[tokio::test]
+    async fn a_slow_block_range_stream_does_not_hold_a_generation_between_chunks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const TIP_HEIGHT: u32 = 2_100;
+        let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
+            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .extend_blocks(TIP_HEIGHT + 2);
+        let mut harness = LongRangeHarness::start(
+            &zinder_testkit::CanonicalBaseline::new(&chain).through(BlockHeight::new(TIP_HEIGHT)),
+        )
+        .await?;
+        let entry_generation = Arc::downgrade(&harness.slot.capture());
+
+        let mut stream = harness
+            .adapter
+            .get_block_range(Request::new(block_range(1, TIP_HEIGHT)))
+            .await?
+            .into_inner();
+        let mut blocks = Vec::new();
+        // Block 1,001 opens the second chunk, so that chunk has been read and
+        // the stream now waits on this client.
+        read_blocks(&mut stream, &mut blocks, 1_001).await?;
+
+        harness.writer.append_live_block(&chain)?;
+        harness.refresh_at_writer_fence().await?;
+        assert_eq!(harness.published_height(), BlockHeight::new(TIP_HEIGHT + 1));
+        // Only the publisher's retired slot may still hold the entry
+        // generation once no chunk read does.
+        let released = tokio::time::timeout(Duration::from_secs(10), async {
+            while entry_generation.strong_count() > 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok(),
+            "the open stream kept the retired generation while it waited for its client"
+        );
+        harness.writer.append_live_block(&chain)?;
+        harness.refresh_at_writer_fence().await?;
+        assert_eq!(
+            harness.published_height(),
+            BlockHeight::new(TIP_HEIGHT + 2),
+            "a second publication follows while the stream is open"
+        );
+        assert_eq!(harness.readiness.report().cause.metric_label(), "ready");
+
+        read_blocks(&mut stream, &mut blocks, usize::MAX).await?;
+        assert_linked_from_genesis(&blocks, TIP_HEIGHT);
+        drop(stream);
+        harness.stop().await
+    }
+
+    /// A descending stream links each later chunk to the parent of the last
+    /// block it sent, so it crosses chunk edges and a publication without
+    /// ending.
+    #[tokio::test]
+    async fn a_descending_block_range_stream_crosses_chunks_and_publications()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const TIP_HEIGHT: u32 = 2_100;
+        let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
+            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .extend_blocks(TIP_HEIGHT + 1);
+        let mut harness = LongRangeHarness::start(
+            &zinder_testkit::CanonicalBaseline::new(&chain).through(BlockHeight::new(TIP_HEIGHT)),
+        )
+        .await?;
+
+        let mut stream = harness
+            .adapter
+            .get_block_range(Request::new(block_range(TIP_HEIGHT, 1)))
+            .await?
+            .into_inner();
+        let mut blocks = Vec::new();
+        // The chunks are 2,100 to 1,101, 1,100 to 101, and 100 to 1. The
+        // second is read before the publication and the third after it.
+        read_blocks(&mut stream, &mut blocks, 101).await?;
+        harness.writer.append_live_block(&chain)?;
+        harness.refresh_at_writer_fence().await?;
+        assert_eq!(harness.published_height(), BlockHeight::new(TIP_HEIGHT + 1));
+
+        read_blocks(&mut stream, &mut blocks, usize::MAX).await?;
+        assert_eq!(
+            blocks.first().map(|block| block.height),
+            Some(u64::from(TIP_HEIGHT))
+        );
+        blocks.reverse();
+        assert_linked_from_genesis(&blocks, TIP_HEIGHT);
+        drop(stream);
+        harness.stop().await
+    }
+
+    /// What a stream over heights 1 through 2,050 sent across a reorg.
+    ///
+    /// The reorg is a live replacement from `fork_height` through
+    /// `replacement_tip_height`, published while the stream waits on its
+    /// client.
+    struct ReorgedStream {
+        blocks: Vec<lightwalletd::CompactBlock>,
+        ending: Option<tonic::Status>,
+    }
+
+    async fn stream_across_reorg(
+        fork_height: u32,
+        replacement_tip_height: u32,
+    ) -> Result<ReorgedStream, Box<dyn std::error::Error>> {
+        const TIP_HEIGHT: u32 = 2_050;
+        let mut chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
+            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .extend_blocks(TIP_HEIGHT);
+        for height in fork_height..=TIP_HEIGHT {
+            let displaced = chain
+                .block_at(BlockHeight::new(height))
+                .cloned()
+                .ok_or("fixture has no block to displace")?;
+            let mut transaction_id = [0x5a; 32];
+            transaction_id[..4].copy_from_slice(&height.to_le_bytes());
+            chain = chain.with_transaction_rows(zinder_testkit::FixtureTransactionRows::coinbase(
+                zinder_core::TransactionId::from_bytes(transaction_id),
+                displaced.height,
+                displaced.hash,
+                format!("raw-displaced-coinbase-{height}").into_bytes(),
+            ));
+        }
+        let replacement_chain = chain
+            .fork_at(BlockHeight::new(fork_height))?
+            .extend_blocks(replacement_tip_height - fork_height + 1);
+        let mut harness = LongRangeHarness::start(
+            &zinder_testkit::CanonicalBaseline::new(&chain)
+                .with_settled_tip(BlockHeight::new(TIP_HEIGHT - 90)),
+        )
+        .await?;
+        let sent_epoch = harness.slot.capture().chain_epoch()?.id;
+
+        let mut stream = harness
+            .adapter
+            .get_block_range(Request::new(block_range(1, TIP_HEIGHT)))
+            .await?
+            .into_inner();
+        let mut blocks = Vec::new();
+        // The second chunk is read before the replacement and the third
+        // after it.
+        read_blocks(&mut stream, &mut blocks, 1_001).await?;
+        harness
+            .writer
+            .replace_live_blocks(&replacement_chain, BlockHeight::new(fork_height))?;
+        harness.refresh_at_writer_fence().await?;
+        assert_ne!(harness.slot.capture().chain_epoch()?.id, sent_epoch);
+
+        let ending = read_blocks(&mut stream, &mut blocks, usize::MAX)
+            .await
+            .err();
+        drop(stream);
+        harness.stop().await?;
+        Ok(ReorgedStream { blocks, ending })
+    }
+
+    /// A reorg that replaces a block the stream already sent ends the stream
+    /// with `ABORTED` after the blocks it sent, as lightwalletd does.
+    #[tokio::test]
+    async fn a_block_range_stream_ends_aborted_when_a_sent_block_is_replaced()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let reorged = stream_across_reorg(1_990, 2_050).await?;
+        assert_linked_from_genesis(&reorged.blocks, 2_000);
+        assert_eq!(
+            reorged.ending.as_ref().map(tonic::Status::code),
+            Some(Code::Aborted),
+            "{:?}",
+            reorged.ending
+        );
+        Ok(())
+    }
+
+    /// A reorg that leaves the visible tip below a height still to send ends
+    /// the stream with `OUT_OF_RANGE`, not the `NOT_FOUND` of a read above the
+    /// tip.
+    #[tokio::test]
+    async fn a_block_range_stream_ends_out_of_range_when_the_tip_falls_below_the_range()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let reorged = stream_across_reorg(2_020, 2_030).await?;
+        assert_linked_from_genesis(&reorged.blocks, 2_000);
+        assert_eq!(
+            reorged.ending.as_ref().map(tonic::Status::code),
+            Some(Code::OutOfRange),
+            "{:?}",
+            reorged.ending
+        );
+        Ok(())
     }
 
     #[tokio::test]

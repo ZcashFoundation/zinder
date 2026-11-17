@@ -197,7 +197,10 @@ answering reads pinned to its epoch for one minute after it was replaced, or
 retired but held by an in-flight request. While no slot is free, the reader
 publishes nothing, and its next publication carries the writer's latest fence.
 In-flight requests keep their existing immutable pair, which pins its
-generation until they finish. A
+generation until they finish. A lightwalletd `GetBlockRange` or
+`GetBlockRangeNullifiers` stream holds a pair only while it reads one
+1,000-block chunk, never while it waits for its client
+([ADR-0038](../adrs/0038-wallet-runtime-composition-and-capability-discovery.md#compatibility-block-range-streams)). A
 transparent-output scan whose request is dropped stops at its next page and
 releases its pair. A slot is opened and cold-admitted the first time the
 reader uses it, and again only after a failed catch-up or publication closes
@@ -208,7 +211,9 @@ drained secondary keeps the primary files that compaction replaced for at most
 a few publications. The compact-blocks-only
 `zinder-compat-lightwalletd` alternates two canonical secondary generations,
 opens the inactive one cold on every refresh that finds the writer ahead, and
-retains no replaced pair.
+retains no replaced pair. Its unary requests hold a generation only while they
+run, and a `GetBlockRange` stream only while it reads one chunk, so a replaced
+generation drains within one chunk read and the next refresh can reopen it.
 
 ## Resource bounds
 

@@ -153,6 +153,12 @@ methods, transparent-address methods, transaction submission, and ping.
 that identity response. Its fields follow
 [Identity and live-tip responses](#identity-and-live-tip-responses).
 
+A compact-blocks `GetBlockRange` stream holds a canonical generation only
+while it reads one chunk of at most 1,000 blocks, never while it waits for its
+client. A slow stream therefore does not keep the publisher from reopening
+the inactive generation, so publication and readiness do not depend on any
+client's pace.
+
 ## Block range transaction contents
 
 `GetBlockRange` applies the requested pool types to every compact transaction
@@ -184,11 +190,77 @@ genesis block as its authenticated predecessor and retains blocks from height
 1, so no compact block exists at height 0, and a `GetBlockRange` read that
 touches height 0 returns `NOT_FOUND`.
 
+These codes describe the request as it arrives and fail the call before any
+block is sent. A stream that has started can also end with `ABORTED` or
+`OUT_OF_RANGE` after the blocks it sent, when a reorg reaches the chain it is
+sending; see [Block range consistency](#block-range-consistency).
+
 Unary block lookups validate the selector before reading. Height 0 with a
 32-byte hash is a hash lookup. Height 0 with an empty hash is an unspecified
 identifier, so `GetBlock` returns `INVALID_ARGUMENT` for it in both serving
 modes, not `NOT_FOUND`. `GetBlockNullifiers` applies the same rule where it is
 served.
+
+## Block range consistency
+
+`GetBlockRange` in both serving modes, and `GetBlockRangeNullifiers` in wallet
+serving, read a range wider than 1,000 blocks in chunks of at most 1,000. The
+first chunk is read at the chain view current when the request arrives, before
+the response starts. Each later chunk is read at the view current when the
+server reads it, and continues the stream only when it links by hash to the
+last block the stream sent
+([ADR-0038](../adrs/0038-wallet-runtime-composition-and-capability-discovery.md#compatibility-block-range-streams)).
+A client can rely on the following:
+
+1. **Request-time outcomes.** `INVALID_ARGUMENT` for a malformed request,
+   `OUT_OF_RANGE` when the higher bound is above the visible tip when the
+   request arrives, and `NOT_FOUND` when the first chunk touches a height the
+   store does not hold. These fail the call before any block is sent.
+2. **Order and coverage.** Blocks arrive at consecutive heights in the
+   requested direction. A stream that ends `OK` has sent every requested
+   height exactly once.
+3. **Every link holds.** In ascending order each block's `prev_hash` equals
+   the `hash` of the block sent just before it. In descending order each
+   block's `hash` equals the `prev_hash` of the block sent just before it. This
+   holds across chunk edges and across new blocks.
+4. **One chain as read.** The blocks one stream sends form one chain as the
+   server read it. An ascending stream that crosses a reorg above the last
+   block it sent continues on the new branch. A descending stream that crosses
+   a reorg at or above the last block it sent continues on the chain it
+   started on. An `OK` stream does not promise that its blocks are still the
+   best chain when the client receives them.
+5. **No time limit.** The server does not end a stream because of elapsed
+   time, new blocks, or how slowly the client reads. Process shutdown and
+   drain still end open streams. A client that stops reading holds no serving
+   pair or generation, only the blocks already queued for it, plus transport
+   buffers:
+   - Until the client has received the whole first chunk, the rest of that
+     chunk and the next chunk are queued, at most two chunks.
+   - After that, at most one chunk is queued, plus a buffer of 16 blocks in
+     wallet serving or 8 in compact-blocks serving.
+6. **Reorg ending.** An ascending stream ends early when a reorg replaces the
+   last block it sent or any block below it. A descending stream ends early
+   when a reorg replaces the next height it has to send. Either ending comes
+   after the blocks already sent, with `ABORTED`. lightwalletd v0.5.5 and
+   later check the same link and end the stream with the same code. A stream
+   also ends early, with `OUT_OF_RANGE`, when a reorg leaves the visible tip
+   below a height it still has to send. Neither ending carries a Zinder
+   `ErrorInfo` reason. To recover, request again from the height the wallet
+   needs. A wallet that kept the partial blocks finds the fork with its own
+   parent check on the next block.
+7. **Settled history.** The canonical writer never replaces a block at or
+   below the settled tip, so a stream over settled history never ends this
+   way. Only the unsettled suffix, at most the reorg window of 1,000 blocks by
+   default, can end a stream.
+8. **Read-ahead.** The server reads ahead of the client by the amounts in
+   point 5: up to two chunks at the start of a stream, and one chunk plus the
+   buffer after the first chunk. The view a block was read at can therefore be
+   older than the view current when the client receives it.
+9. **Mid-stream storage outcomes.** A storage failure ends the stream with
+   `UNAVAILABLE`, and a descending range that runs below the retained floor
+   ends it with `NOT_FOUND`. In wallet serving, a reorg that lowers the tip in
+   the moment between a chunk's tip check and its read also ends the stream
+   with `NOT_FOUND`.
 
 ## Transaction lookup
 

@@ -4,9 +4,11 @@
 //! `CompactTxStreamer` protocol. It consumes [`zinder_query::WalletQueryApi`]
 //! and does not open storage, call upstream nodes, or build artifacts.
 
+mod block_range;
 mod grpc;
 mod mempool;
 
+pub use block_range::BlockRangeContinuity;
 pub use grpc::{
     DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS, DEFAULT_MAX_LIGHTWALLETD_SUBTREE_ROOTS,
     LightwalletdAdmissionError, LightwalletdGrpcAdapter, LightwalletdResponseLimits,

@@ -11,7 +11,7 @@ each serve process-owned immutable readers admitted at one exact fence.
 | `zinder-ingest` | Zebra chain and mempool sources, canonical construction and following, reorg authority, canonical events, canonical leases, checkpoint coordination, live mempool state, materialized-view construction and following | Wallet rows, wallet-store promotion, or public wallet traffic |
 | `zinder-projector` | Wallet construction, projection build leases, continuous canonical-event following, wallet reorg reconciliation, wallet-store primary | Canonical writes, chain selection, public wallet traffic, or compatibility translation |
 | `zinder-query` | Canonical and wallet secondary generations, wallet-serving admission, native `WalletQuery` gRPC, transaction broadcast, and sparse tree-state fill | Either primary store, projection construction, compatibility translation, or mixed-generation responses |
-| `zinder-compat-lightwalletd` | Canonical and wallet secondary generations, wallet-serving admission, `CompactTxStreamer` translation, transaction broadcast, sparse tree-state fill | Either primary store, projection construction, or mixed-generation responses |
+| `zinder-compat-lightwalletd` | Canonical and wallet secondary generations, wallet-serving admission, `CompactTxStreamer` translation, transaction broadcast, sparse tree-state fill | Either primary store, projection construction, or mixed-generation responses (a chunked `GetBlockRange` stream is a sequence of single-generation reads joined by a hash link) |
 
 `zinder-explorer` and `zinder-compat-cipherscan` are optional workspace
 services, and the checked single-host composition does not start them. The
@@ -58,7 +58,12 @@ Each serving publisher catches both secondaries up, validates network, reorg
 policy, canonical source identity, event fence, and wallet digest, then
 atomically publishes a `WalletServingReadPair`. Each query operation retains
 that pair for its full lifetime. Multi-page reads bind their resume cursor to
-the admitted source and fail closed if publication advances between pages.
+the admitted source and fail closed if publication advances between pages. A
+lightwalletd `GetBlockRange` or `GetBlockRangeNullifiers` stream wider than one
+1,000-block chunk is the exception: it holds a pair only while it reads one
+chunk, reads each chunk at the pair current when it reads it, and ends when a
+chunk does not link by hash to the last block it sent
+([ADR-0038](../adrs/0038-wallet-runtime-composition-and-capability-discovery.md#compatibility-block-range-streams)).
 
 The supported topology is `rocksdb-single-host`. Primaries and secondaries
 share one host filesystem but remain separate processes and ownership domains.

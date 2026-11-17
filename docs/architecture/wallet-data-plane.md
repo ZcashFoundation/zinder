@@ -892,7 +892,9 @@ bounded blocking read that finishes on its own. A slow or abandoned read can
 therefore delay publication by at most the read limit plus one page read after
 its pair leaves retention. Retention and slow reads together delay a
 publication by at most about 90 seconds, and they never stop publication for
-other clients.
+other clients. A lightwalletd `GetBlockRange` or `GetBlockRangeNullifiers`
+stream holds a pair only while it reads one chunk, so it adds nothing to that
+bound.
 
 A pin on a released or never-served epoch receives
 `CHAIN_EPOCH_PIN_UNAVAILABLE`. So does a pin whose pair lost a table file to
@@ -977,7 +979,11 @@ semantics bounded at Zinder's boundary. For example, `GetSubtreeRoots` treats
 `maxEntries = 0` as a bounded compatibility request, not permission to
 materialize every retained subtree root.
 `GetBlockRange` consumes the bounded native range result and streams decoded
-lightwalletd blocks without a second full-range allocation. True per-item store
+lightwalletd blocks without a second full-range allocation. Both it and
+`GetBlockRangeNullifiers` read each 1,000-block chunk at the chain view
+current when they read that chunk and continue only along the chain they have
+already sent
+([ADR-0038](../adrs/0038-wallet-runtime-composition-and-capability-discovery.md#compatibility-block-range-streams)). True per-item store
 back-pressure requires an owned snapshot streaming read API; until then the
 range cap is the memory bound.
 `GetAddressUtxos` and `GetAddressUtxosStream` bound each address at the read.
