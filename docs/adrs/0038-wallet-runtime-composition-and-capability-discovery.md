@@ -299,8 +299,10 @@ keeps one stream open for more than eight minutes while new blocks arrive. No
 pin covers that. A replaced pair answers its epoch for one minute, and a
 request that holds a pair past that delays publication for every client.
 
-The compatibility runtime therefore binds each chunk of at most 1,000 blocks,
-not the stream, to one chain view. Both serving modes apply this rule to
+The compatibility runtime therefore binds each chunk, not the stream, to one
+chain view. A chunk holds at most 1,000 blocks and at most 2 MiB of stored
+compact blocks, or one larger block, so the memory one chunk read holds stays
+bounded however large the blocks are. Both serving modes apply this rule to
 `GetBlockRange`. Wallet serving also applies it to `GetBlockRangeNullifiers`,
 which compact-blocks serving does not serve.
 
@@ -564,6 +566,9 @@ controlled consumer cutover uses the current contract without shims.
 
 ## Revision history
 
+- 2026-11-17: A compatibility block-range chunk also stops at 2 MiB of stored
+  compact blocks, keeping at least one block, so a range of large blocks takes
+  several chunks. Every chunk edge carries the same hash check.
 - 2026-11-17: A lightwalletd block-range stream binds each chunk, not the
   whole stream, to one chain view, and continues at a newer view only along
   the chain it has already sent. It holds no serving pair or compact-blocks

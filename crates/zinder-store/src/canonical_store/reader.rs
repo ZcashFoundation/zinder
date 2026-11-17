@@ -166,6 +166,30 @@ macro_rules! impl_canonical_typed_reads {
                 read_compact_blocks_in_range(self, range)
             }
 
+            /// Reads compact blocks from one end of an inclusive range until
+            /// the next block would take their stored bytes past `max_bytes`.
+            ///
+            /// The read starts at the lowest height for
+            /// [`HeightOrder::Ascending`] and at the highest for
+            /// [`HeightOrder::Descending`], and walks toward the other end. It
+            /// always keeps the first block, so a block larger than
+            /// `max_bytes` is read alone. The blocks come back in ascending
+            /// height order and cover consecutive heights at the starting end.
+            ///
+            /// Every height of `range` is checked against retained history
+            /// first, so a range that reaches outside it fails with
+            /// [`CanonicalStoreError::ArtifactUnavailable`] exactly as
+            /// [`Self::compact_blocks_in_range`] does, even where the byte
+            /// budget would stop the read before that height.
+            pub fn compact_blocks_in_range_up_to(
+                &self,
+                range: zinder_core::BlockHeightRange,
+                order: HeightOrder,
+                max_bytes: usize,
+            ) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
+                read_compact_blocks_up_to(self, range, order, max_bytes)
+            }
+
             /// Reads the canonical location of one transaction.
             pub fn transaction_location(
                 &self,
@@ -354,6 +378,133 @@ fn read_compact_blocks_in_range(
     Ok(blocks)
 }
 
+/// Height order of a byte-bounded compact-block read.
+///
+/// The read starts at the end of its range this order visits first, so the
+/// blocks it keeps under its byte budget are the ones a stream in this order
+/// sends next.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeightOrder {
+    /// From the lowest height up.
+    Ascending,
+    /// From the highest height down.
+    Descending,
+}
+
+/// Rows one batch of a byte-bounded compact-block read fetches.
+///
+/// Small, so the rows fetched past the point where the budget stops the read
+/// stay few. They are released before the read returns.
+const BOUNDED_COMPACT_BLOCK_BATCH_SIZE: usize = 16;
+
+fn read_compact_blocks_up_to(
+    store: &impl CanonicalServingRead,
+    range: BlockHeightRange,
+    order: HeightOrder,
+    max_bytes: usize,
+) -> Result<Vec<CompactBlockArtifact>, CanonicalStoreError> {
+    let retained_span = retained_compact_block_span(store);
+    if let Some(height) = first_unretained_height(range, retained_span) {
+        return Err(CanonicalStoreError::ArtifactUnavailable {
+            family: crate::ArtifactFamily::CompactBlock,
+            height,
+        });
+    }
+    let (start, end) = (range.start.value(), range.end.value());
+    let heights: Vec<BlockHeight> = match order {
+        HeightOrder::Ascending => (start..=end).map(BlockHeight::new).collect(),
+        HeightOrder::Descending => (start..=end).rev().map(BlockHeight::new).collect(),
+    };
+    let mut blocks = Vec::new();
+    let mut kept_bytes = 0_usize;
+    'batches: for batch in heights.chunks(BOUNDED_COMPACT_BLOCK_BATCH_SIZE) {
+        let rows = CompactBlockRows::fetch(store, batch)?;
+        for ((height, compact_row), header_row) in
+            batch.iter().copied().zip(rows.compact).zip(rows.headers)
+        {
+            if !blocks.is_empty() && kept_bytes >= max_bytes {
+                break 'batches;
+            }
+            let encoded_compact_block = present_compact_row(retained_span, height, compact_row)?;
+            let row_bytes = encoded_compact_block.len();
+            if !blocks.is_empty() && kept_bytes.saturating_add(row_bytes) > max_bytes {
+                break 'batches;
+            }
+            kept_bytes = kept_bytes.saturating_add(row_bytes);
+            blocks.push(decode_compact_block_row(
+                height,
+                &encoded_compact_block,
+                header_row,
+            )?);
+        }
+    }
+    if order == HeightOrder::Descending {
+        blocks.reverse();
+    }
+    Ok(blocks)
+}
+
+/// Heights from the first retained block through the visible tip.
+fn retained_compact_block_span(store: &impl CanonicalServingRead) -> BlockHeightRange {
+    let ready_evidence = store.serving_ready_evidence();
+    BlockHeightRange::inclusive(
+        ready_evidence.first_retained_block.height,
+        ready_evidence.visible_tip.height,
+    )
+}
+
+/// Returns the lowest height of `range` outside `retained_span`, the height
+/// an ascending read of the whole range finds absent first.
+fn first_unretained_height(
+    range: BlockHeightRange,
+    retained_span: BlockHeightRange,
+) -> Option<BlockHeight> {
+    if range.start > range.end {
+        None
+    } else if !(retained_span.start..=retained_span.end).contains(&range.start) {
+        Some(range.start)
+    } else if range.end > retained_span.end {
+        retained_span.end.next()
+    } else {
+        None
+    }
+}
+
+/// The compact-block and header rows of one batch of heights, in batch order.
+struct CompactBlockRows<'db> {
+    compact: Vec<Result<Option<rust_rocksdb::DBPinnableSlice<'db>>, rust_rocksdb::Error>>,
+    headers: Vec<Result<Option<rust_rocksdb::DBPinnableSlice<'db>>, rust_rocksdb::Error>>,
+}
+
+impl<'db> CompactBlockRows<'db> {
+    fn fetch(
+        store: &'db impl CanonicalServingRead,
+        heights: &[BlockHeight],
+    ) -> Result<Self, CanonicalStoreError> {
+        let db = &store.serving_open().db;
+        let compact_family = column_family(db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+        let header_family = column_family(db, BLOCK_HEADER_COLUMN_FAMILY)?;
+        let keys = heights
+            .iter()
+            .copied()
+            .map(encode_block_position)
+            .collect::<Vec<_>>();
+        let is_sorted = heights.is_sorted();
+        Ok(Self {
+            compact: db.batched_multi_get_cf_slice(
+                &compact_family,
+                keys.iter().map(<[u8; 4]>::as_slice),
+                is_sorted,
+            ),
+            headers: db.batched_multi_get_cf_slice(
+                &header_family,
+                keys.iter().map(<[u8; 4]>::as_slice),
+                is_sorted,
+            ),
+        })
+    }
+}
+
 fn append_compact_block_batch(
     store: &impl CanonicalServingRead,
     retained_span: BlockHeightRange,
@@ -363,55 +514,59 @@ fn append_compact_block_batch(
     if heights.is_empty() {
         return Ok(());
     }
-    let compact_family = column_family(&store.serving_open().db, COMPACT_BLOCK_COLUMN_FAMILY)?;
-    let header_family = column_family(&store.serving_open().db, BLOCK_HEADER_COLUMN_FAMILY)?;
-    let keys = heights
-        .iter()
-        .copied()
-        .map(encode_block_position)
-        .collect::<Vec<_>>();
-    let compact_rows = store.serving_open().db.batched_multi_get_cf_slice(
-        &compact_family,
-        keys.iter().map(<[u8; 4]>::as_slice),
-        true,
-    );
-    let header_rows = store.serving_open().db.batched_multi_get_cf_slice(
-        &header_family,
-        keys.iter().map(<[u8; 4]>::as_slice),
-        true,
-    );
-
+    let rows = CompactBlockRows::fetch(store, heights)?;
     for ((height, compact_row), header_row) in
-        heights.iter().copied().zip(compact_rows).zip(header_rows)
+        heights.iter().copied().zip(rows.compact).zip(rows.headers)
     {
-        let encoded_compact_block = compact_row
-            .map_err(|source| CanonicalStoreError::RocksDbOperation {
-                operation: "compact block read",
-                source,
-            })?
-            .ok_or_else(|| absent_compact_block(retained_span, height))?;
-        let encoded_header = header_row
-            .map_err(|source| CanonicalStoreError::RocksDbOperation {
-                operation: "block header read",
-                source,
-            })?
-            .ok_or_else(|| CanonicalStoreError::publication("compact block header is absent"))?;
-        let header = decode_block_header(height, &encoded_header)?;
-        let compact_block =
-            crate::decode_compact_block_artifact(&encoded_compact_block).map_err(|_| {
-                CanonicalStoreError::publication(format!(
-                    "compact block at height {} is invalid",
-                    height.value()
-                ))
-            })?;
-        if compact_block.height() != height || compact_block.block_hash() != header.block_hash {
-            return Err(CanonicalStoreError::publication(
-                "compact block row does not match its canonical header",
-            ));
-        }
-        blocks.push(compact_block);
+        let encoded_compact_block = present_compact_row(retained_span, height, compact_row)?;
+        blocks.push(decode_compact_block_row(
+            height,
+            &encoded_compact_block,
+            header_row,
+        )?);
     }
     Ok(())
+}
+
+fn present_compact_row(
+    retained_span: BlockHeightRange,
+    height: BlockHeight,
+    compact_row: Result<Option<rust_rocksdb::DBPinnableSlice<'_>>, rust_rocksdb::Error>,
+) -> Result<rust_rocksdb::DBPinnableSlice<'_>, CanonicalStoreError> {
+    compact_row
+        .map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "compact block read",
+            source,
+        })?
+        .ok_or_else(|| absent_compact_block(retained_span, height))
+}
+
+/// Decodes one compact-block row and checks it against its canonical header.
+fn decode_compact_block_row(
+    height: BlockHeight,
+    encoded_compact_block: &[u8],
+    header_row: Result<Option<rust_rocksdb::DBPinnableSlice<'_>>, rust_rocksdb::Error>,
+) -> Result<CompactBlockArtifact, CanonicalStoreError> {
+    let encoded_header = header_row
+        .map_err(|source| CanonicalStoreError::RocksDbOperation {
+            operation: "block header read",
+            source,
+        })?
+        .ok_or_else(|| CanonicalStoreError::publication("compact block header is absent"))?;
+    let header = decode_block_header(height, &encoded_header)?;
+    let compact_block =
+        crate::decode_compact_block_artifact(encoded_compact_block).map_err(|_| {
+            CanonicalStoreError::publication(format!(
+                "compact block at height {} is invalid",
+                height.value()
+            ))
+        })?;
+    if compact_block.height() != height || compact_block.block_hash() != header.block_hash {
+        return Err(CanonicalStoreError::publication(
+            "compact block row does not match its canonical header",
+        ));
+    }
+    Ok(compact_block)
 }
 
 /// Classifies a missing compact-block row by the retained span it falls in.

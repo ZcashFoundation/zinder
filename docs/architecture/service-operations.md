@@ -548,7 +548,9 @@ operations. Store metrics use explicit canonical or wallet role labels.
 - `zinder_query_request_duration_seconds{operation,status,error_class}` is a
   histogram of request latency.
 - `zinder_query_compact_block_range_block_count{status}` samples the block
-  count each `compact_blocks_in_range` request asked for.
+  count each `compact_blocks_in_range` request asked for. A compatibility
+  block-range chunk asks for up to 1,000 blocks and can keep fewer under its
+  byte cap; the sample counts what it asked for.
 
 `status` is `ok` or `error`. `error_class` is `none` on success. On error it is
 the snake-case name of the `QueryError` variant, such as
@@ -570,8 +572,10 @@ record, and neither does a failure that ends the stream later. One protocol requ
 several domain reads. For example, a compatibility request that pins the
 visible tip first records a `visible_tip_block` sample. A compatibility
 `GetBlockRange` or `GetBlockRangeNullifiers` stream records one
-`visible_tip_block` and one `compact_blocks_in_range` sample for each
-1,000-block chunk after the first.
+`visible_tip_block` and one `compact_blocks_in_range` sample for each chunk
+after the first. A chunk holds at most 1,000 blocks and 2 MiB of stored
+compact blocks, so a range of large blocks records more samples than its
+width alone implies.
 
 The chain-event reads are the exception. `chain_events` page reads and
 `resolve_chain_events_start` serve a stream that the adapter records, so they
@@ -765,7 +769,8 @@ stream without cancelling it.
 ### Compatibility block-range streams
 
 `GetBlockRange`, and `GetBlockRangeNullifiers` in wallet serving, read a range
-wider than 1,000 blocks one chunk at a time. Each chunk after the first reads
+one chunk at a time. A chunk holds at most 1,000 blocks and 2 MiB of stored
+compact blocks, or one larger block. Each chunk after the first reads
 the chain view current when it is read and holds its serving pair, or its
 compact-blocks generation, only for that read. A slow client therefore holds
 no pair or generation while the server waits for it: in wallet serving its
@@ -799,6 +804,14 @@ A chunk that links at a newer chain view than the chunk before it logs
 target, with `last_sent_height`, `sent_chain_epoch`, `current_chain_epoch`,
 `next_chunk_start`, and `next_chunk_end`. Enable `debug` for that target to
 see whether long streams cross publications. The event has no metric.
+
+`zinder_compat_block_range_stream_refusals_total` counts block-range requests
+refused with `RESOURCE_EXHAUSTED` because the process already served
+`compat.max_concurrent_block_range_streams` streams. A count that keeps rising
+means wallets wait for slots: raise the limit if memory allows, or add a
+compatibility replica. The
+[compatibility reference](../reference/lightwalletd-compatibility.md#block-range-resource-limits)
+sizes one stream.
 
 ### RocksDB
 

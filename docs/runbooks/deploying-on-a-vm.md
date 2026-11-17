@@ -513,6 +513,15 @@ unreachability proof, endpoint attribution, and rollback evidence. An already
 accepted compatibility request may drain against its immutable canonical/wallet
 generation, but new traffic must stop when compatibility `/readyz` returns 503.
 
+Compatibility pings each HTTP/2 connection after one minute without a frame
+and closes it when the ping goes unanswered, which returns the block-range
+stream slots of a wallet that vanished. Behind the TLS edge those pings reach
+the proxy, so the proxy's own timeouts decide when a vanished wallet's stream
+ends. Its memory
+limit, `ZINDER_COMPAT_MEMORY_LIMIT`, must cover four reader generations of
+block caches plus `compat.max_concurrent_block_range_streams` streams; see
+[Block range resource limits](../reference/lightwalletd-compatibility.md#block-range-resource-limits).
+
 ## Install systemd supervision
 
 The repository unit expects the checkout at `/opt/zinder` and the selected

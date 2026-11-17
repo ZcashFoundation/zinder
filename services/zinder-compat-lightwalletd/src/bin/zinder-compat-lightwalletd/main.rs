@@ -1,6 +1,6 @@
 //! Zinder lightwalletd-compatible gRPC server entry point.
 
-use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc, time::Duration};
 use zinder_core::wire::encode_zinder_native_chain_name;
 
 use clap::Parser;
@@ -27,6 +27,28 @@ use zinder_query::{
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: zinder_runtime::RuntimeAllocator = zinder_runtime::RuntimeAllocator;
+
+/// Most concurrent HTTP/2 streams one client connection may open.
+///
+/// tonic otherwise advertises no limit, which also removes hyper's own
+/// server default of 200; this restores that value.
+const MAX_CONCURRENT_STREAMS_PER_CONNECTION: u32 = 200;
+
+/// Time without a frame from a client after which the server pings it.
+const HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_mins(1);
+
+/// Time a keepalive ping waits for its acknowledgement before the server
+/// closes the connection and ends the streams on it, so a client that
+/// vanished stops holding a block-range stream slot.
+const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The gRPC server both serving modes listen with.
+fn lightwalletd_grpc_server() -> tonic::transport::Server {
+    tonic::transport::Server::builder()
+        .max_concurrent_streams(MAX_CONCURRENT_STREAMS_PER_CONNECTION)
+        .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
+        .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
+}
 
 #[derive(Parser)]
 #[command(name = "zinder-compat-lightwalletd")]
@@ -254,7 +276,10 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         network_upgrade_activations.clone(),
     )?;
     let native_endpoint_capabilities = wallet_query.native_endpoint_capabilities().clone();
-    let grpc_adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(wallet_query)?;
+    let grpc_adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(wallet_query)?
+        .with_max_concurrent_block_range_streams(
+            lightwalletd_config.max_concurrent_block_range_streams,
+        );
     let ops_handle = spawn_ops_endpoint_for(
         RuntimeService::CompatLightwalletd,
         lightwalletd_config.ops_listen_addr,
@@ -331,7 +356,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         reflection_service,
         reflection_readiness,
     );
-    let server_result = tonic::transport::Server::builder()
+    let server_result = lightwalletd_grpc_server()
         .add_service(grpc_service)
         .add_service(reflection_service)
         .serve_with_shutdown(
@@ -485,7 +510,10 @@ async fn run_compact_blocks(
     .map_err(LightwalletdConfigError::CompactServing)?;
     let visible_height = Some(slot.capture().event_fence().visible_tip().height.value());
     open_storage_phase.complete();
-    let grpc_adapter = compact_block_serving::CompactBlockAdapter::new(slot, activations);
+    let grpc_adapter = compact_block_serving::CompactBlockAdapter::new(slot, activations)
+        .with_max_concurrent_block_range_streams(
+            lightwalletd_config.max_concurrent_block_range_streams,
+        );
     let ops_handle = spawn_ops_endpoint_for(
         RuntimeService::CompatLightwalletd,
         lightwalletd_config.ops_listen_addr,
@@ -537,7 +565,7 @@ async fn run_compact_blocks(
         reflection_service,
         reflection_readiness,
     );
-    let server_result = tonic::transport::Server::builder()
+    let server_result = lightwalletd_grpc_server()
         .add_service(grpc_service)
         .add_service(reflection_service)
         .serve_with_shutdown(

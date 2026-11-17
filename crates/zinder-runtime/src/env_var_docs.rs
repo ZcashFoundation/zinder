@@ -900,6 +900,17 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       1..=64; defaults to 12.",
     },
     EnvVarDoc {
+        name: "ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS",
+        toml_path: "compat.max_concurrent_block_range_streams",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Most `GetBlockRange` and `GetBlockRangeNullifiers` streams compatibility \
+                      serves at once. A request past the limit fails with \
+                      `RESOURCE_EXHAUSTED` before any read. Must be in 1..=65536; defaults to \
+                      100.",
+    },
+    EnvVarDoc {
         name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__BLOCK_CACHE_BYTES",
         toml_path: "storage.materialized_views.rocksdb.block_cache_bytes",
         used_by: &["zinder-ingest", "zinder-explorer"],
@@ -1625,6 +1636,7 @@ mod tests {
                 "ZINDER_COMPAT__SERVING",
                 "ZINDER_COMPAT__REORG_WINDOW_BLOCKS",
                 "ZINDER_COMPAT__PAIR_CONVERGENCE_ATTEMPTS",
+                "ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS",
             ]
         );
     }

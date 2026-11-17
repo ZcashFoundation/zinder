@@ -32,7 +32,7 @@ pub use canonical_store::{
     CanonicalStoreBuildPlan, CanonicalStoreBuildPlanError, CanonicalStoreBuildState,
     CanonicalStoreError, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
     CanonicalSubtreeRootLoadCoverage, CanonicalSubtreeRootLoadEvidence,
-    DEFAULT_REORG_WINDOW_BLOCKS, DisplacedBlockCursor, DisplacedBlockPage,
+    DEFAULT_REORG_WINDOW_BLOCKS, DisplacedBlockCursor, DisplacedBlockPage, HeightOrder,
     MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS, PreparedCanonicalBaselinePublication,
     ProjectionBuildAnchor, ProjectionBuildLease, ProjectionBuildLeaseId, RocksDbCanonicalBuilder,
     RocksDbCanonicalSecondary, RocksDbCanonicalStore, TREE_STATE_CHECKPOINT_STRIDE,

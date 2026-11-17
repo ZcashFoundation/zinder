@@ -903,6 +903,94 @@ mod tests {
     }
 
     #[test]
+    fn bounded_compact_block_read_keeps_the_blocks_at_its_starting_end_within_the_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::HeightOrder::{Ascending, Descending};
+
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let store = published_loaded_store(&store_path, BlockHeight::new(3))?;
+        let range = |start, end| {
+            zinder_core::BlockHeightRange::inclusive(BlockHeight::new(start), BlockHeight::new(end))
+        };
+        let read_heights = |order, max_bytes| -> Result<Vec<u32>, CanonicalStoreError> {
+            Ok(store
+                .compact_blocks_in_range_up_to(range(1, 3), order, max_bytes)?
+                .iter()
+                .map(|block| block.height().value())
+                .collect())
+        };
+        let all = store.compact_blocks_in_range(range(1, 3))?;
+        let row_bytes = all
+            .iter()
+            .map(|block| crate::encode_compact_block_artifact(block).len())
+            .collect::<Vec<_>>();
+        let [low_row, middle_row, high_row] = row_bytes[..] else {
+            return Err("the test store must hold three compact blocks".into());
+        };
+
+        for order in [Ascending, Descending] {
+            assert_eq!(
+                store.compact_blocks_in_range_up_to(range(1, 3), order, usize::MAX)?,
+                all,
+                "an unbounded {order:?} read returns the whole range in ascending order"
+            );
+        }
+        assert_eq!(read_heights(Ascending, 0)?, [1]);
+        assert_eq!(read_heights(Descending, 0)?, [3]);
+        assert_eq!(read_heights(Ascending, low_row + middle_row)?, [1, 2]);
+        assert_eq!(read_heights(Ascending, low_row + middle_row - 1)?, [1]);
+        assert_eq!(read_heights(Descending, middle_row + high_row)?, [2, 3]);
+        assert_eq!(read_heights(Descending, middle_row + high_row - 1)?, [3]);
+
+        // Retained history is checked for the whole range before the budget
+        // can stop the read, so the outcome matches an unbounded read.
+        for (start, end, first_absent) in [(4, 5, 4), (0, 1, 0), (3, 4, 4), (2, 4, 4)] {
+            for order in [Ascending, Descending] {
+                let error = store
+                    .compact_blocks_in_range_up_to(range(start, end), order, 0)
+                    .err()
+                    .ok_or("a range outside stored history must fail")?;
+                assert!(
+                    matches!(
+                        error,
+                        CanonicalStoreError::ArtifactUnavailable {
+                            family: crate::ArtifactFamily::CompactBlock,
+                            height,
+                        } if height == BlockHeight::new(first_absent)
+                    ),
+                    "{order:?} range {start}..={end}: unexpected error {error:?}"
+                );
+            }
+        }
+
+        // A missing row inside retained history fails closed once the read
+        // reaches it.
+        let family = store
+            .bounded_open
+            .db
+            .cf_handle(COMPACT_BLOCK_COLUMN_FAMILY)
+            .ok_or("compact-block family is absent")?;
+        store.bounded_open.db.delete_cf(
+            &family,
+            crate::canonical_store::block_load::encode_block_position(BlockHeight::new(2)),
+        )?;
+        assert_eq!(read_heights(Descending, 0)?, [3]);
+        let error = read_heights(Descending, usize::MAX)
+            .err()
+            .ok_or("an interior compact-block gap must fail closed")?;
+        assert!(
+            matches!(
+                &error,
+                CanonicalStoreError::PublicationRefused { reason }
+                    if reason.contains("compact block at height 2 is absent")
+            ),
+            "unexpected error {error:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn trusted_fresh_writer_publishes_without_cold_family_certification()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;

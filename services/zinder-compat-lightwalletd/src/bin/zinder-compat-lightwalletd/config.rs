@@ -2,14 +2,16 @@
 
 use std::{
     net::SocketAddr,
-    num::NonZeroU8,
+    num::{NonZeroU8, NonZeroU32},
     path::{Component, Path, PathBuf},
 };
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use zinder_compat_lightwalletd::LightwalletdAdmissionError;
+use zinder_compat_lightwalletd::{
+    DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS, LightwalletdAdmissionError,
+};
 use zinder_core::Network;
 use zinder_runtime::{
     BearerToken, BearerTokenError, CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml,
@@ -63,6 +65,7 @@ pub(crate) struct LightwalletdConfig {
     pub(crate) allow_public_bind: bool,
     pub(crate) canonical_reorg_policy: CanonicalReorgPolicy,
     pub(crate) pair_convergence_attempts: NonZeroU8,
+    pub(crate) max_concurrent_block_range_streams: NonZeroU32,
     pub(crate) broadcaster: Option<NodeTarget>,
 }
 
@@ -201,6 +204,7 @@ struct CompatSection {
     listen_addr: Option<String>,
     reorg_window_blocks: Option<u32>,
     pair_convergence_attempts: Option<u8>,
+    max_concurrent_block_range_streams: Option<u32>,
     serving: Option<CompatServing>,
 }
 
@@ -262,6 +266,9 @@ fn resolve_lightwalletd_config(
     )?)?;
     let pair_convergence_attempts =
         require_pair_convergence_attempts(config.compat.pair_convergence_attempts)?;
+    let max_concurrent_block_range_streams = require_max_concurrent_block_range_streams(
+        config.compat.max_concurrent_block_range_streams,
+    )?;
     guard_serving_bind("compat.listen_addr", listen_addr, allow_public_bind)?;
     guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
     let broadcaster =
@@ -282,6 +289,7 @@ fn resolve_lightwalletd_config(
         allow_public_bind,
         canonical_reorg_policy,
         pair_convergence_attempts,
+        max_concurrent_block_range_streams,
         broadcaster,
     })
 }
@@ -325,6 +333,7 @@ impl LightwalletdConfigToml {
                 listen_addr: config.listen_addr.to_string(),
                 reorg_window_blocks: config.canonical_reorg_policy.reorg_window_blocks(),
                 pair_convergence_attempts: config.pair_convergence_attempts.get(),
+                max_concurrent_block_range_streams: config.max_concurrent_block_range_streams.get(),
                 serving: config.serving,
             },
             node: config.broadcaster.as_ref().map(NodeToml::from_node_target),
@@ -337,6 +346,7 @@ struct CompatToml {
     listen_addr: String,
     reorg_window_blocks: u32,
     pair_convergence_attempts: u8,
+    max_concurrent_block_range_streams: u32,
     serving: CompatServing,
 }
 
@@ -365,6 +375,25 @@ fn require_pair_convergence_attempts(
         )));
     }
     Ok(non_zero_attempts)
+}
+
+/// Largest accepted `compat.max_concurrent_block_range_streams`.
+const MAX_CONCURRENT_BLOCK_RANGE_STREAMS: u32 = 65_536;
+
+fn require_max_concurrent_block_range_streams(
+    configured_streams: Option<u32>,
+) -> Result<NonZeroU32, ConfigError> {
+    let Some(configured_streams) = configured_streams else {
+        return Ok(DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS);
+    };
+    NonZeroU32::new(configured_streams)
+        .filter(|streams| streams.get() <= MAX_CONCURRENT_BLOCK_RANGE_STREAMS)
+        .ok_or_else(|| {
+            ConfigError::invalid(format!(
+                "compat.max_concurrent_block_range_streams must be between 1 and \
+                 {MAX_CONCURRENT_BLOCK_RANGE_STREAMS}",
+            ))
+        })
 }
 
 fn require_distinct_storage_paths(

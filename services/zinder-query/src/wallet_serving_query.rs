@@ -28,8 +28,8 @@ use zinder_proto::capabilities::{
 use zinder_source::{NodeCapability, NodeSource, TransactionBroadcaster, TreeStateUpstream};
 use zinder_store::{
     ArtifactFamily, BlockHashLookup, CanonicalActivationSchedule, ChainEventHistoryRequest,
-    ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition, RawBlobRetention,
-    StreamCursorTokenV1,
+    ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition, HeightOrder,
+    RawBlobRetention, StreamCursorTokenV1,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletCanonicalSourceIdentity, WalletProjectionSourcePosition,
@@ -790,6 +790,40 @@ where
             serving_read::read_at(self.pin(at_epoch_id), move |pair| {
                 let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
                 let compact_blocks = pair.canonical().compact_blocks_in_range(block_range)?;
+                Ok(CompactBlockRange {
+                    chain_epoch,
+                    block_range,
+                    compact_blocks,
+                })
+            })
+            .await
+        })
+        .await
+    }
+
+    async fn compact_blocks_in_range_up_to(
+        &self,
+        block_range: BlockHeightRange,
+        order: HeightOrder,
+        max_bytes: usize,
+        at_epoch_id: Option<ChainEpochId>,
+    ) -> Result<CompactBlockRange, QueryError> {
+        let requested_blocks = Some(block_range.into_iter().len());
+        serving_read::record("compact_blocks_in_range", requested_blocks, async {
+            validate_block_range(block_range, DEFAULT_MAX_COMPACT_BLOCK_RANGE)?;
+            serving_read::read_at(self.pin(at_epoch_id), move |pair| {
+                let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                let compact_blocks = pair.canonical().compact_blocks_in_range_up_to(
+                    block_range,
+                    order,
+                    max_bytes,
+                )?;
+                let block_range = match (compact_blocks.first(), compact_blocks.last()) {
+                    (Some(lowest), Some(highest)) => {
+                        BlockHeightRange::inclusive(lowest.height(), highest.height())
+                    }
+                    _ => block_range,
+                };
                 Ok(CompactBlockRange {
                     chain_epoch,
                     block_range,

@@ -50,6 +50,10 @@ fn print_config_renders_resolved_toml_to_stdout() -> eyre::Result<()> {
         "{stdout}"
     );
     assert!(
+        stdout.contains("max_concurrent_block_range_streams = 100"),
+        "{stdout}"
+    );
+    assert!(
         stdout.contains("listen_addr = \"127.0.0.1:9067\""),
         "{stdout}"
     );
@@ -209,6 +213,27 @@ fn zero_reorg_window_is_rejected_before_storage_open() -> eyre::Result<()> {
         &["--reorg-window-blocks", "0"],
         "canonical build reorg window must be greater than zero",
     )
+}
+
+#[test]
+fn block_range_stream_limit_outside_its_range_is_rejected() -> eyre::Result<()> {
+    for configured_streams in ["0", "65537"] {
+        assert_compat_cli_rejects(
+            |root| {
+                let config = compat_config_toml(
+                    &root.join("compat-stream-limit-store"),
+                    &root.join("compat-stream-limit-secondary"),
+                    &root.join("compat-stream-limit-wallet"),
+                )?;
+                Ok(format!(
+                    "{config}max_concurrent_block_range_streams = {configured_streams}\n"
+                ))
+            },
+            &[],
+            "compat.max_concurrent_block_range_streams must be between 1 and 65536",
+        )?;
+    }
+    Ok(())
 }
 
 #[test]

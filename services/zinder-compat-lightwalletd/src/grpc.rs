@@ -29,14 +29,17 @@ use zinder_proto::compat::lightwalletd::{
 };
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
-    CompactBlockRange, DEFAULT_MAX_COMPACT_BLOCK_RANGE, QueryError, SubtreeRoots,
-    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest, TreeState,
-    WalletQueryApi, WalletServingQuery, address_lookup_to_script_hash, status_from_query_error,
+    CompactBlockRange, QueryError, SubtreeRoots, TransparentAddressTxIdsInRangeRequest,
+    TransparentAddressUnspentOutputsRequest, TreeState, WalletQueryApi, WalletServingQuery,
+    address_lookup_to_script_hash, status_from_query_error,
 };
 use zinder_source::transparent_address_matches_network;
 use zinder_store::{MempoolEvent, RawBlobRetention};
 
-use crate::block_range::BlockRangeContinuity;
+use crate::block_range::{
+    BLOCK_RANGE_CHUNK_MAX_BYTES, BlockRangeChunks, BlockRangeContinuity, BlockRangeStreamLimit,
+    BlockRangeStreamSlot, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
+};
 use crate::mempool::{
     MempoolSnapshotPage, MempoolSurfaceError, MempoolTransactionLookup, SharedMempoolSurface,
     SharedTipChangeWatcher, TipChangeWatcherError,
@@ -62,7 +65,7 @@ pub const DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS: NonZeroU32 =
 /// Page size used to drain the native mempool snapshot for lightwalletd.
 const LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 1024;
 /// Blocks a slow `GetBlockRange` client can stall behind, on top of the chunk
-/// the producer is currently walking.
+/// the producer is currently sending.
 const COMPACT_BLOCK_STREAM_CHANNEL_CAPACITY: usize = 16;
 /// Maximum number of transaction-id suffixes accepted by one `GetMempoolTx` request.
 const MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST: usize = 1024;
@@ -117,6 +120,7 @@ pub enum LightwalletdAdmissionError {
 pub struct LightwalletdGrpcAdapter<QueryApi> {
     query_api: QueryApi,
     response_limits: LightwalletdResponseLimits,
+    block_range_streams: BlockRangeStreamLimit,
     transparent_address_support: bool,
     mempool_surface: Option<SharedMempoolSurface>,
     tip_change_watcher: Option<SharedTipChangeWatcher>,
@@ -128,6 +132,10 @@ impl<QueryApi: std::fmt::Debug> std::fmt::Debug for LightwalletdGrpcAdapter<Quer
             .debug_struct("LightwalletdGrpcAdapter")
             .field("query_api", &self.query_api)
             .field("response_limits", &self.response_limits)
+            .field(
+                "max_concurrent_block_range_streams",
+                &self.block_range_streams.max_streams(),
+            )
             .field(
                 "transparent_address_support",
                 &self.transparent_address_support,
@@ -160,17 +168,31 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
     /// Production compatibility composition must use
     /// [`LightwalletdGrpcAdapter::from_admitted_compatibility_query`].
     #[must_use]
-    pub const fn with_response_limits(
+    pub fn with_response_limits(
         query_api: QueryApi,
         response_limits: LightwalletdResponseLimits,
     ) -> Self {
         Self {
             query_api,
             response_limits,
+            block_range_streams: BlockRangeStreamLimit::new(
+                DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
+            ),
             transparent_address_support: false,
             mempool_surface: None,
             tip_change_watcher: None,
         }
+    }
+
+    /// Limits how many `GetBlockRange` and `GetBlockRangeNullifiers` streams
+    /// this adapter and its clones serve at once.
+    ///
+    /// A request past the limit fails with `RESOURCE_EXHAUSTED` before any
+    /// read. The default is [`DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS`].
+    #[must_use]
+    pub fn with_max_concurrent_block_range_streams(mut self, max_streams: NonZeroU32) -> Self {
+        self.block_range_streams = BlockRangeStreamLimit::new(max_streams);
+        self
     }
 
     /// Wires a mempool read surface into the adapter.
@@ -222,11 +244,8 @@ where
             );
         }
         Ok(Self {
-            query_api,
-            response_limits: LightwalletdResponseLimits::default(),
             transparent_address_support: true,
-            mempool_surface: None,
-            tip_change_watcher: None,
+            ..Self::new(query_api)
         })
     }
 }
@@ -572,6 +591,7 @@ where
         &self,
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<Self::GetBlockRangeStream>, Status> {
+        let stream_slot = self.block_range_streams.try_open()?;
         let chain_view = self.entry_chain_view().await?;
         let block_range_request = request.into_inner();
         let pool_selection = pool_selection_from_request(&block_range_request.pool_types)?;
@@ -581,6 +601,7 @@ where
             stream_compact_block_range(
                 self.query_api.clone(),
                 block_range,
+                stream_slot,
                 CompactBlockWindow {
                     entry_epoch_id: chain_view.epoch_id,
                     is_descending,
@@ -598,6 +619,7 @@ where
         &self,
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<Self::GetBlockRangeNullifiersStream>, Status> {
+        let stream_slot = self.block_range_streams.try_open()?;
         let chain_view = self.entry_chain_view().await?;
         let block_range_request = request.into_inner();
         let (block_range, is_descending) = block_range_from_request(&block_range_request)?;
@@ -606,6 +628,7 @@ where
             stream_compact_block_range(
                 self.query_api.clone(),
                 block_range,
+                stream_slot,
                 CompactBlockWindow {
                     entry_epoch_id: chain_view.epoch_id,
                     is_descending,
@@ -1019,32 +1042,40 @@ struct CompactBlockWindow {
 /// Streams a compact-block window the client asked for in one call.
 ///
 /// lightwalletd puts no width bound on `BlockRange`, while each store read is
-/// capped at [`DEFAULT_MAX_COMPACT_BLOCK_RANGE`]. The window is split into
-/// capped chunks read in wire order, so an arbitrarily wide request streams
-/// while at most one chunk is materialized at a time.
+/// capped at 1,000 blocks. [`BlockRangeChunks`] splits the window into chunks
+/// read in wire order, and each read keeps at most
+/// [`BLOCK_RANGE_CHUNK_MAX_BYTES`] of blocks, so an arbitrarily wide request
+/// of blocks of any size streams while at most one bounded chunk is
+/// materialized at a time.
 ///
 /// The first chunk is read at the entry epoch before the response, so an
 /// unreadable window fails the call rather than a stream the client has
-/// already opened. Later chunks follow [`BlockRangeContinuity`].
+/// already opened. Later chunks follow [`BlockRangeContinuity`]. The response
+/// and the reader of later chunks each hold `stream_slot` until they finish.
 async fn stream_compact_block_range<QueryApi>(
     query_api: QueryApi,
     block_range: BlockHeightRange,
+    stream_slot: BlockRangeStreamSlot,
     window: CompactBlockWindow,
 ) -> Result<GrpcStream<lightwalletd::CompactBlock>, Status>
 where
     QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
 {
-    let chunks = compact_block_range_chunks(block_range, window.is_descending);
-    let Some((first_chunk, remaining_chunks)) = chunks.split_first() else {
+    let mut chunks = BlockRangeChunks::new(block_range, window.is_descending);
+    let Some(first_chunk) = chunks.next_chunk() else {
         return Ok(Box::pin(stream::empty()));
     };
-    let first_range =
-        read_compact_block_chunk(&query_api, *first_chunk, Some(window.entry_epoch_id)).await?;
-    if remaining_chunks.is_empty() {
-        return Ok(Box::pin(stream::iter(encode_compact_block_chunk(
-            first_range.compact_blocks,
-            window,
-        ))));
+    let first_range = read_compact_block_chunk(
+        &query_api,
+        first_chunk,
+        &chunks,
+        Some(window.entry_epoch_id),
+    )
+    .await?;
+    chunks.advance(first_range.compact_blocks.len());
+    if !chunks.has_remaining() {
+        let first_messages = encode_compact_block_chunk(first_range.compact_blocks, window);
+        return Ok(stream_slot.hold_for(Box::pin(stream::iter(first_messages))));
     }
     let continuity = BlockRangeContinuity::after_first_chunk(
         &first_range.compact_blocks,
@@ -1056,42 +1087,26 @@ where
     let (message_sender, message_receiver) = mpsc::channel(COMPACT_BLOCK_STREAM_CHANNEL_CAPACITY);
     tokio::spawn(drive_compact_block_range(
         query_api,
-        remaining_chunks.to_vec(),
+        chunks,
         window,
         continuity,
-        message_sender,
+        BlockRangeSink {
+            messages: message_sender,
+            _stream_slot: stream_slot.clone(),
+        },
     ));
-    Ok(Box::pin(
+    Ok(stream_slot.hold_for(Box::pin(
         stream::iter(first_messages).chain(ReceiverStream::new(message_receiver)),
-    ))
+    )))
 }
 
-/// Splits a compact-block window into capped chunks ordered as the wire
-/// expects them, so the emitted heights stay monotonic across chunk edges.
-fn compact_block_range_chunks(
-    block_range: BlockHeightRange,
-    is_descending: bool,
-) -> Vec<BlockHeightRange> {
-    let last_height = block_range.end.value();
-    let mut chunks = Vec::new();
-    let mut chunk_start = block_range.start.value();
-    loop {
-        let chunk_end = chunk_start
-            .saturating_add(DEFAULT_MAX_COMPACT_BLOCK_RANGE.get().saturating_sub(1))
-            .min(last_height);
-        chunks.push(BlockHeightRange::inclusive(
-            BlockHeight::new(chunk_start),
-            BlockHeight::new(chunk_end),
-        ));
-        if chunk_end >= last_height {
-            break;
-        }
-        chunk_start = chunk_end.saturating_add(1);
-    }
-    if is_descending {
-        chunks.reverse();
-    }
-    chunks
+/// Where the reader of later chunks queues their blocks.
+///
+/// It holds the stream's slot, so the slot stays taken until the reader
+/// stops, even after the client has gone away.
+struct BlockRangeSink {
+    messages: mpsc::Sender<Result<lightwalletd::CompactBlock, Status>>,
+    _stream_slot: BlockRangeStreamSlot,
 }
 
 /// Reads every chunk after the first and forwards its blocks to the sink.
@@ -1101,25 +1116,26 @@ fn compact_block_range_chunks(
 /// send.
 async fn drive_compact_block_range<QueryApi>(
     query_api: QueryApi,
-    chunks: Vec<BlockHeightRange>,
+    mut chunks: BlockRangeChunks,
     window: CompactBlockWindow,
     mut continuity: BlockRangeContinuity,
-    message_sender: mpsc::Sender<Result<lightwalletd::CompactBlock, Status>>,
+    sink: BlockRangeSink,
 ) where
     QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
 {
-    for chunk in chunks {
-        let compact_blocks = match read_continuation_chunk(&query_api, chunk, &mut continuity).await
-        {
-            Ok(compact_blocks) => compact_blocks,
-            Err(status) => {
-                let _ = message_sender.send(Err(status)).await;
-                return;
-            }
-        };
+    while let Some(chunk) = chunks.next_chunk() {
+        let compact_blocks =
+            match read_continuation_chunk(&query_api, chunk, &chunks, &mut continuity).await {
+                Ok(compact_blocks) => compact_blocks,
+                Err(status) => {
+                    let _ = sink.messages.send(Err(status)).await;
+                    return;
+                }
+            };
+        chunks.advance(compact_blocks.len());
         for message in encode_compact_block_chunk(compact_blocks, window) {
             let is_terminal = message.is_err();
-            if message_sender.send(message).await.is_err() || is_terminal {
+            if sink.messages.send(message).await.is_err() || is_terminal {
                 return;
             }
         }
@@ -1135,6 +1151,7 @@ async fn drive_compact_block_range<QueryApi>(
 async fn read_continuation_chunk<QueryApi>(
     query_api: &QueryApi,
     chunk: BlockHeightRange,
+    chunks: &BlockRangeChunks,
     continuity: &mut BlockRangeContinuity,
 ) -> Result<Vec<CompactBlockArtifact>, Status>
 where
@@ -1145,7 +1162,7 @@ where
         .await
         .map_err(|error| status_from_query_error(&error))?;
     continuity.check_view_reaches(chunk, &visible_tip_block.chain_epoch)?;
-    let compact_block_range = read_compact_block_chunk(query_api, chunk, None).await?;
+    let compact_block_range = read_compact_block_chunk(query_api, chunk, chunks, None).await?;
     continuity.advance(
         chunk,
         &compact_block_range.chain_epoch,
@@ -1154,16 +1171,24 @@ where
     Ok(compact_block_range.compact_blocks)
 }
 
+/// Reads the blocks of `chunk` that fit one chunk's byte budget, from the
+/// end the stream sends first.
 async fn read_compact_block_chunk<QueryApi>(
     query_api: &QueryApi,
     chunk: BlockHeightRange,
+    chunks: &BlockRangeChunks,
     at_epoch_id: Option<ChainEpochId>,
 ) -> Result<CompactBlockRange, Status>
 where
     QueryApi: WalletQueryApi + Send + Sync,
 {
     query_api
-        .compact_blocks_in_range(chunk, at_epoch_id)
+        .compact_blocks_in_range_up_to(
+            chunk,
+            chunks.order(),
+            BLOCK_RANGE_CHUNK_MAX_BYTES,
+            at_epoch_id,
+        )
         .await
         .map_err(|error| status_from_query_error(&error))
 }
