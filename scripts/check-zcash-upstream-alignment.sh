@@ -34,7 +34,7 @@ require_single_runtime_pin() {
 }
 
 require_single_runtime_pin Zebra \
-  'docker.io/zfnd/zebra:7.0.0@sha256:a70d2be8ffef3a4b6e37355724e36a0e6c1838e46baa28bfb216739f00cf2d34' \
+  'docker.io/zfnd/zebra:7.1.0@sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba' \
   '(docker\.io/)?zfnd/zebra:[0-9A-Za-z._-]+(@sha256:[a-f0-9]{64})?'
 require_single_runtime_pin Zakura \
   'docker.io/zakuracore/zakura:1.8.6@sha256:e514c89b751b685686690098928507aaa994311e6b90c79373c55b0afaa45d50' \
@@ -55,6 +55,20 @@ resolved_versions() {
     }
   ' <<<"$tree" | sort -u
 }
+
+# The parser must be the zebra-chain release the certified Zebra image uses.
+expected_zebra_chain_version='16.0.0'
+mapfile -t zebra_chain_versions < <(
+  resolved_versions zebra-chain "$workspace_tree"
+)
+if [[
+  "${#zebra_chain_versions[@]}" -ne 1 ||
+  "${zebra_chain_versions[0]:-}" != "$expected_zebra_chain_version"
+]]; then
+  echo >&2 \
+    "zebra-chain must resolve to exactly $expected_zebra_chain_version, the release the certified Zebra image uses; found: ${zebra_chain_versions[*]:-none}"
+  exit 1
+fi
 
 for package_name in \
   incrementalmerkletree \

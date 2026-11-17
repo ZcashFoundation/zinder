@@ -295,6 +295,17 @@ parks with `reorg_window_exceeded` only on a change the node itself could not
 produce, such as a replaced or resynced node. The window is not a consensus
 finality guarantee.
 
+Zebra 7.1.0 can finalize earlier, keeping as few as 100 non-finalized blocks,
+when the index entries of its non-finalized chains pass 6,200,000 on Mainnet
+or 2,000,000 on test networks. The node then presents only shallower reorgs,
+which the 1000-block window still covers, so the window needs no change. The
+node's `state.memory.index.entries` gauge shows how close it is to the cap, and
+its `state.memory.fork.evicted.count` counter and `the fork limit evicted a
+chain` warning record evicted forks. A node that finalized early on a branch
+the network later abandons cannot reorg back. Resync or replace it, and ingest
+then follows the network's branch, or parks if the fork is deeper than the
+window.
+
 A smaller window parks on reorgs the node can produce. On 2026-07-20, a Zcash
 testnet mining race produced a 114-block reorg after the losing branch had
 remained visible for more than an hour, which exceeded the 100-block window

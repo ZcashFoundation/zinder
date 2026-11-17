@@ -9,12 +9,21 @@
 
 ## Context
 
-Zebra commits a block to its finalized state only once its best non-finalized
-chain grows past `MAX_BLOCK_REORG_HEIGHT`, which is 1000 blocks in Zebra 7.0.0
-(`zebra-state/src/service/write.rs` and
-`zebra-chain/src/parameters/constants.rs`). Zakura, the other node Zinder
+Zebra commits a block to its finalized state once its best non-finalized chain
+grows past `MAX_BLOCK_REORG_HEIGHT`, which is 1000 blocks in Zebra 7.1.0
+(`zebra-chain/src/parameters/constants.rs`). Zakura, the other node Zinder
 qualifies, finalizes on the same 1000-block constant. A node can therefore
 present a legitimate reorg up to 1000 blocks deep, and never a deeper one.
+
+Zebra 7.1.0 can also finalize earlier. It caps the index entries of all its
+non-finalized chains at `MAX_NON_FINALIZED_INDEX_ENTRIES`: 6,200,000 on
+Mainnet and 2,000,000 on test networks (`zebra-state/src/constants.rs`). Past
+the cap, it evicts the lowest-work forks, keeping the best chain and the chain
+it just extended. If those two alone still pass the cap, it finalizes the best
+chain's oldest blocks while that chain holds more than 100 blocks
+(`NonFinalizedState::should_finalize_root`). Early finalization only shortens
+the reorg the node can present, to as few as 100 blocks, so 1000 blocks
+remains the node's upper bound.
 
 Zinder's reorg window bounds how far below the visible tip a replacement may
 start. A deeper replacement parks ingest with `reorg_window_exceeded`. The
@@ -84,9 +93,10 @@ on catch-up and refuses a lower one.
 A node's tip can fall below Zinder's settled tip without a reorg. Zebra
 restores its unfinalized blocks from a backup on restart, and when that backup
 is missing or unreadable its tip falls back to its finalized tip, which a
-window equal to the node's bound places at or near Zinder's settled tip. Its
-best chain is then a prefix of Zinder's, so following it needs no
-replacement.
+window equal to the node's bound places at or near Zinder's settled tip. After
+early finalization the finalized tip sits higher, inside Zinder's replaceable
+suffix. Either way its best chain is a prefix of Zinder's, so following it
+needs no replacement.
 
 The writer therefore parks only on evidence of a fork. When the source tip is
 at or below the settled tip and its hash equals the retained canonical header
@@ -253,6 +263,13 @@ operators would still need to raise it as observed reorgs grow.
 
 - The settled tip trails the visible tip by up to 1000 blocks. Surfaces that
   report finality from the settled tip report it later than before.
+- The window is an upper bound on the node's reorg depth, not a mirror of it.
+  A Zebra 7.1.0 node that finalizes early presents shallower reorgs, which the
+  window still covers, so no configuration or capability check follows the
+  node's index pressure. Such a node cannot leave a branch below its finalized
+  tip, and Zinder follows the node onto that branch. Recovering requires
+  resyncing or replacing the node, and Zinder then replaces the branch if the
+  fork lies within the window, or parks with `reorg_window_exceeded`.
 - After a raise, until the visible tip is a full window above the held settled
   tip, a reorg deeper than the current unsettled suffix still parks ingest.
 - Wallet undo rows scale with the window. Construction accounts retained undo
@@ -299,3 +316,10 @@ operators would still need to raise it as observed reorgs grow.
   or the node abandons the branch. A dedicated budget is used because the
   construction pipeline's preparation watermark admits a stream of blocks,
   while a replacement must hold all of its blocks at once.
+
+## Revision history
+
+- 2026-11-17: Zebra 7.1.0 finalizes blocks early under index pressure. The
+  window stays 1000 blocks as the node's upper bound, and the Context, the
+  node-behind case, and the Consequences describe the shallower reorgs and the
+  higher finalized tip.

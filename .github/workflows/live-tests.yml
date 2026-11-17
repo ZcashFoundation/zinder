@@ -3,7 +3,7 @@ name: live-tests
 # T3 (live) tests under tests/live/, double-gated by #[ignore] and
 # require_live():
 #   - regtest runs nightly, and on pull requests that touch node-facing code,
-#     once against a Dockerized Zebra 7.0.0 and once against a Dockerized
+#     once against a Dockerized Zebra 7.1.0 and once against a Dockerized
 #     Zakura 1.8.6 Regtest node. Both activate every upgrade through NU7 on the
 #     same schedule (deploy/zebra/regtest.toml, deploy/zakura/regtest.toml).
 #     The Zebra leg reads the indexer over plaintext and the Zakura leg over
@@ -141,7 +141,7 @@ jobs:
             -e ZEBRA_RPC__INDEXER_LISTEN_ADDR=0.0.0.0:8155 \
             -e ZEBRA_RPC__ENABLE_COOKIE_AUTH=false \
             -e ZEBRA_MINING__MINER_ADDRESS=tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx \
-            docker.io/zfnd/zebra:7.0.0@sha256:a70d2be8ffef3a4b6e37355724e36a0e6c1838e46baa28bfb216739f00cf2d34
+            docker.io/zfnd/zebra:7.1.0@sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba
 
       # The Zakura leg serves its indexer over mutual TLS, so the indexer tests
       # run Zinder's TLS client against a real node while the Zebra leg covers
