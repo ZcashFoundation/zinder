@@ -16,14 +16,14 @@ use tempfile::TempDir;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{
-    BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeCheckpoint, CommitmentTreeFrontier,
-    CommitmentTreeFrontiers, Network, NetworkUpgradeActivations,
+    BlockHash, BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeCheckpoint,
+    CommitmentTreeFrontier, CommitmentTreeFrontiers, Network, NetworkUpgradeActivations,
     NetworkUpgradeActivationsFingerprintVersion, ShieldedProtocol,
 };
 use zinder_ingest::{
     CanonicalBlockLoadOutcome, CanonicalConstructionConfig, CanonicalConstructionError,
-    CanonicalFollowConfig, CanonicalWriterConfig, CanonicalWriterError, admit_canonical_store,
-    load_fresh_canonical, load_fresh_canonical_blocks,
+    CanonicalFollowConfig, CanonicalWriterConfig, CanonicalWriterError, IngestError,
+    admit_canonical_store, load_fresh_canonical, load_fresh_canonical_blocks,
 };
 use zinder_runtime::{ComposedReadiness, Readiness};
 use zinder_source::{
@@ -370,6 +370,79 @@ async fn canonical_source_families_authenticate_empty_subtree_ranges_and_fixed_t
     assert_eq!(source_outcome.subtree_root_evidence.subtree_root_count, 0);
     assert!(source_outcome.builder.is_source_tip_checkpoint_confirmed());
     assert_eq!(source.request_count(), 2);
+    Ok(())
+}
+
+/// The node holds a sibling of the build tip when construction reads the
+/// tip's tree state. Construction stops with a changed-view source error and
+/// publishes nothing.
+#[tokio::test]
+async fn construction_stops_when_the_build_tip_left_the_node_best_chain()
+-> Result<(), Box<dyn std::error::Error>> {
+    let source_block = fixture_source_block()?;
+    let fixed_tip = BlockId::new(source_block.height, source_block.hash);
+    let activations = regtest_activations();
+    let build_plan = CanonicalStoreBuildPlan::complete(
+        &activations,
+        source_block.block_time_seconds.saturating_sub(1),
+        fixed_tip,
+        RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(100)?,
+    )?;
+    let history_predecessor = build_plan.history_predecessor().block_id;
+    let sibling_checkpoint = CommitmentTreeCheckpoint::new(
+        BlockId::new(fixed_tip.height, BlockHash::from_bytes([7; 32])),
+        source_block.block_time_seconds,
+        CommitmentTreeFrontiers::from_validated_parts(
+            Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
+            None,
+            None,
+        ),
+    );
+    assert_ne!(sibling_checkpoint.block_id, fixed_tip);
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let builder = RocksDbCanonicalBuilder::create_fresh(
+        &store_path,
+        CanonicalStoreWorkload::Wallet,
+        build_plan,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    let source = SingleBlockSource::new(source_block, history_predecessor)
+        .with_chain_checkpoint(sibling_checkpoint);
+    let config = CanonicalConstructionConfig::for_local_tests(
+        Duration::from_secs(5),
+        Arc::clone(&activations),
+    );
+
+    let error = load_fresh_canonical(builder, &source, &config)
+        .await
+        .err()
+        .ok_or("a build tip outside the node's best chain must not publish")?;
+
+    assert!(
+        matches!(
+            &error,
+            CanonicalConstructionError::Source {
+                source: IngestError::Source(SourceError::BlockReorgDuringFetch { height, .. }),
+            } if *height == fixed_tip.height
+        ),
+        "{error}"
+    );
+    let reopen_error = RocksDbCanonicalStore::open_ready(
+        &store_path,
+        &activations,
+        CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(100)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )
+    .err()
+    .ok_or("an unconfirmed build tip must leave the store BUILDING")?;
+    assert!(matches!(
+        reopen_error,
+        CanonicalStoreError::StoreNotReady { .. }
+    ));
     Ok(())
 }
 

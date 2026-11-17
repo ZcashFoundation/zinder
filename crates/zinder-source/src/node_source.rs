@@ -105,6 +105,10 @@ pub trait NodeSource: Send + Sync + 'static {
     }
 
     /// Fetches one source-authenticated checkpoint with validated typed frontiers.
+    ///
+    /// The checkpoint names whichever block the node's best chain holds at
+    /// `height` when it answers. Callers that already identified the block use
+    /// [`Self::fetch_chain_checkpoint_for_block`] instead.
     async fn fetch_chain_checkpoint(
         &self,
         height: BlockHeight,
@@ -114,6 +118,39 @@ pub trait NodeSource: Send + Sync + 'static {
         Err(SourceError::NodeCapabilityMissing {
             capability: crate::NodeCapability::TreeState,
         })
+    }
+
+    /// Fetches the source-authenticated checkpoint of exactly `block_id`.
+    ///
+    /// A checkpoint for another block at the same height means the node's
+    /// best chain changed after `block_id` was observed. That returns
+    /// [`SourceError::BlockReorgDuringFetch`], so the caller observes the node
+    /// again instead of comparing one block with another block's tree state.
+    ///
+    /// The default implementation reads by height and checks the identity.
+    /// A source whose node accepts a hash-keyed tree-state read overrides it,
+    /// so the node answers for `block_id` itself or reports that the block
+    /// left its best chain.
+    async fn fetch_chain_checkpoint_for_block(
+        &self,
+        block_id: BlockId,
+        network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> Result<CommitmentTreeCheckpoint, SourceError> {
+        let checkpoint = self
+            .fetch_chain_checkpoint(block_id.height, network_upgrade_activations)
+            .await?;
+        if checkpoint.block_id.height != block_id.height {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "tree-state height does not match the requested block",
+            });
+        }
+        if checkpoint.block_id.hash != block_id.hash {
+            return Err(SourceError::BlockReorgDuringFetch {
+                height: block_id.height,
+                reason: "tree-state hash disagrees with the fetched block hash",
+            });
+        }
+        Ok(checkpoint)
     }
 
     /// Returns the node's current best tip identity (height and hash).
@@ -276,9 +313,79 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    use zinder_core::{BroadcastAccepted, RawTransactionBytes, TransactionId};
+    use zinder_core::{
+        BlockHash, BlockHeight, BlockId, BroadcastAccepted, CommitmentTreeCheckpoint,
+        CommitmentTreeFrontiers, Network, NetworkUpgradeActivations, RawTransactionBytes,
+        TransactionId,
+    };
 
-    use super::{SourceError, TransactionBroadcastOutcome, TransactionBroadcaster};
+    use super::{NodeSource, SourceError, TransactionBroadcastOutcome, TransactionBroadcaster};
+    use crate::{NodeCapabilities, SourceBlock};
+
+    /// Answers every height-keyed tree-state read with one fixed checkpoint.
+    struct FixedCheckpointSource {
+        checkpoint: CommitmentTreeCheckpoint,
+    }
+
+    #[async_trait::async_trait]
+    impl NodeSource for FixedCheckpointSource {
+        fn capabilities(&self) -> NodeCapabilities {
+            NodeCapabilities::default()
+        }
+
+        async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+            Err(SourceError::BlockUnavailable {
+                height,
+                reason: "fixed checkpoint source serves no blocks".to_owned(),
+            })
+        }
+
+        async fn fetch_chain_checkpoint(
+            &self,
+            _height: BlockHeight,
+            _network_upgrade_activations: &NetworkUpgradeActivations,
+        ) -> Result<CommitmentTreeCheckpoint, SourceError> {
+            Ok(self.checkpoint.clone())
+        }
+
+        async fn tip_id(&self) -> Result<BlockId, SourceError> {
+            Ok(self.checkpoint.block_id)
+        }
+    }
+
+    #[tokio::test]
+    async fn block_bound_checkpoint_classifies_another_block_as_a_changed_view()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fetched = BlockId::new(BlockHeight::new(7), BlockHash::from_bytes([1; 32]));
+        let sibling = BlockId::new(BlockHeight::new(7), BlockHash::from_bytes([2; 32]));
+        let other_height = BlockId::new(BlockHeight::new(8), BlockHash::from_bytes([1; 32]));
+        let activations = NetworkUpgradeActivations::new(Network::ZcashRegtest, Vec::new())?;
+        let answer = |block_id| FixedCheckpointSource {
+            checkpoint: CommitmentTreeCheckpoint::new(
+                block_id,
+                1_774_668_700,
+                CommitmentTreeFrontiers::default(),
+            ),
+        };
+
+        let same_block = answer(fetched)
+            .fetch_chain_checkpoint_for_block(fetched, &activations)
+            .await?;
+        assert_eq!(same_block.block_id, fetched);
+        assert!(matches!(
+            answer(sibling)
+                .fetch_chain_checkpoint_for_block(fetched, &activations)
+                .await,
+            Err(SourceError::BlockReorgDuringFetch { height, .. }) if height == fetched.height
+        ));
+        assert!(matches!(
+            answer(other_height)
+                .fetch_chain_checkpoint_for_block(fetched, &activations)
+                .await,
+            Err(SourceError::SourceProtocolMismatch { .. })
+        ));
+        Ok(())
+    }
 
     #[derive(Clone, Default)]
     struct CountingBroadcaster {

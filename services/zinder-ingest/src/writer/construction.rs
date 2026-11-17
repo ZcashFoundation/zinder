@@ -462,7 +462,7 @@ where
     let fixed_tip = builder.build_plan().build_tip();
     let source_tip_checkpoint = tokio::time::timeout(
         config.request_timeout,
-        source.fetch_chain_checkpoint(fixed_tip.height, &config.network_upgrade_activations),
+        source.fetch_chain_checkpoint_for_block(fixed_tip, &config.network_upgrade_activations),
     )
     .await
     .map_err(|_| CanonicalConstructionError::SourceRequestTimedOut {

@@ -1,0 +1,6 @@
+kind: fixed
+body: Ingest no longer exits and restarts when the node switches to a sibling block between ingest's block read and its tree-state read; it reads the tree state by block hash, observes the node again, and logs a `canonical_source_recovery` warning. `zinder_ingest_canonical_source_recoveries_total` now carries a `failure_class` label, and a tree state that contradicts its own block still stops ingest.
+time: 2026-11-17T11:14:36.485383974Z
+custom:
+    Bump: patch
+    PR: "236"

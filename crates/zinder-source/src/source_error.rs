@@ -286,9 +286,10 @@ pub enum SourceError {
 
     /// Concurrent observations of the same height disagreed.
     ///
-    /// Produced when the JSON-RPC adapter's height-keyed `getblock` and
-    /// `z_gettreestate` calls observe different blocks because the upstream
-    /// chain reorged between the requests. Distinct from
+    /// Produced when two reads of the same height observe different blocks
+    /// because the upstream chain reorged between the requests, for example a
+    /// height-keyed `z_gettreestate` answer that names another block than the
+    /// `getblock` answer before it. Distinct from
     /// [`Self::SourceProtocolMismatch`] (a wire-contract violation: a broken
     /// node) and [`Self::BlockUnavailable`] (a height that left the best chain
     /// before any fetch landed). The loop treats this as a re-observation

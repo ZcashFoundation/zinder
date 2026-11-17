@@ -16,10 +16,13 @@ use std::{
 use eyre::Result;
 use futures_util::{Stream, future::join_all};
 use parking_lot::Mutex;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status, transport::Server};
-use zinder_core::{BlockHeight, Network, wire::encode_rpc_block_hash_hex};
+use zinder_core::{
+    BlockHeight, BlockId, ConsensusBranchId, Network, NetworkUpgradeActivation,
+    NetworkUpgradeActivations, wire::encode_rpc_block_hash_hex,
+};
 use zinder_proto::external::zebra_indexer_rpc::{
     BlockAndHash, BlockHashAndHeight, BlockRequest, Empty, MempoolChangeMessage,
     NonFinalizedStateChangeRequest,
@@ -27,8 +30,9 @@ use zinder_proto::external::zebra_indexer_rpc::{
 };
 use zinder_source::{
     NodeAuth, NodeSource, ZebraIndexerBlockSource, ZebraIndexerBlockSourceOptions,
-    ZebraIndexerSourceTarget, ZebraJsonRpcSource,
+    ZebraIndexerSourceTarget, ZebraJsonRpcSource, decode_rpc_block_hash,
 };
+use zinder_testkit::{JsonRpcTestServer, RpcReply, method};
 
 type ChainTipStream =
     Pin<Box<dyn Stream<Item = Result<BlockHashAndHeight, Status>> + Send + 'static>>;
@@ -103,6 +107,21 @@ async fn start_block_source(
     response_delay: Duration,
     max_in_flight_requests: NonZeroU32,
 ) -> Result<RunningBlockSource> {
+    start_block_source_with_control_plane(
+        response,
+        response_delay,
+        max_in_flight_requests,
+        "http://127.0.0.1:1",
+    )
+    .await
+}
+
+async fn start_block_source_with_control_plane(
+    response: BlockAndHash,
+    response_delay: Duration,
+    max_in_flight_requests: NonZeroU32,
+    control_plane_url: &str,
+) -> Result<RunningBlockSource> {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let active_requests = Arc::new(AtomicU64::new(0));
     let max_active_requests = Arc::new(AtomicU64::new(0));
@@ -121,7 +140,7 @@ async fn start_block_source(
     );
     let json_control = ZebraJsonRpcSource::new(
         Network::ZcashRegtest,
-        "http://127.0.0.1:1",
+        control_plane_url,
         NodeAuth::None,
         Duration::from_secs(1),
     )?;
@@ -206,6 +225,59 @@ async fn indexer_get_block_rejects_hash_that_disagrees_with_raw_header() -> Resu
         error,
         zinder_source::SourceError::SourceProtocolMismatch { .. }
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn indexer_source_reads_a_block_tree_state_by_hash_through_its_control_plane() -> Result<()> {
+    let block_hash_hex = "0f".repeat(32);
+    let control_plane =
+        JsonRpcTestServer::start([method("z_gettreestate").reply(RpcReply::result(json!({
+            "height": 100,
+            "hash": block_hash_hex,
+            "time": 1_774_668_700,
+            "sapling": {"commitments": {}},
+            "orchard": {"commitments": {}},
+        })))])?;
+    let (response, _) = fixture_block()?;
+    let running = start_block_source_with_control_plane(
+        response,
+        Duration::ZERO,
+        ZebraIndexerBlockSourceOptions::default().max_in_flight_requests,
+        &control_plane.url(),
+    )
+    .await?;
+    let block_id = BlockId::new(
+        BlockHeight::new(100),
+        decode_rpc_block_hash(&block_hash_hex)?,
+    );
+    let pre_sapling_activations = NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        vec![
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(1),
+                activation_height: BlockHeight::new(200),
+                name: "Sapling".to_owned(),
+            },
+            NetworkUpgradeActivation {
+                branch_id: ConsensusBranchId::new(2),
+                activation_height: BlockHeight::new(300),
+                name: "NU5".to_owned(),
+            },
+        ],
+    )?;
+
+    let checkpoint = running
+        .source
+        .fetch_chain_checkpoint_for_block(block_id, &pre_sapling_activations)
+        .await?;
+    running.server.abort();
+
+    assert_eq!(checkpoint.block_id, block_id);
+    assert_eq!(
+        control_plane.requests_for("z_gettreestate")?[0].params,
+        json!([block_hash_hex])
+    );
     Ok(())
 }
 
