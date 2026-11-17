@@ -38,8 +38,9 @@ In particular, `GetLightdInfo.taddrSupport` is an immutable serving-process
 claim derived by the compatibility constructor. Construction admits it only
 when the canonical pair retains transaction blobs (`transactions` or `all`)
 and the exact wallet-serving pair provides the transparent reads; insufficient
-retention fails before the listener binds. Later pair lag or provider outage
-changes readiness without rewriting `GetLightdInfo`.
+retention fails before the listener binds. Later pair lag changes readiness,
+and a node outage degrades the node dependency, without rewriting
+`GetLightdInfo`.
 
 `GetLightdInfo` derives its upgrade fields from one activation table and the
 served tip on every request:
@@ -90,7 +91,9 @@ The Zinder-specific values are fixed:
   than impersonating another build.
 - `estimatedHeight` equals `blockHeight`. Zinder serves its own visible tip and
   does not report the node's estimate, so it stays at the served tip while the
-  node syncs.
+  node syncs or is unavailable. Compatibility keeps serving that tip through a
+  node outage, so `estimatedHeight` does not show that the chain stopped
+  advancing. Operators read `served_epoch_age_seconds` on `/readyz` for that.
 - `taddrSupport` is `true` in wallet-serving mode, where construction admitted
   transparent reads, and `false` in compact-blocks mode and in a generic
   adapter built without the transparent constructor.

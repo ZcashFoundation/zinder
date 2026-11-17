@@ -46,6 +46,44 @@ version and commit appear in the `zinder_build_info` metric and native
 `ready`, `cursor_at_risk`, and `serving_pair_stale` admit traffic; every other
 cause refuses it.
 
+A runtime can also report dependencies it keeps serving without. Native wallet
+query reports its node source and ingest control this way, and lightwalletd
+compatibility in wallet mode reports its node source. A dependency whose cause
+does not admit traffic appears in the report's `degraded` list with its
+`input` label (`node_source`, `ingest_control`, or
+`materialized_view_catchup`) and its cause. The runtime's own `cause` can
+still be `ready`, because only the requests that call the dependency fail. On
+`/readyz`, `degraded` follows the top-level `cause`, and each entry names its
+cause `dependency_cause`, so a parser that reads the first `"cause"` key gets
+the runtime's own cause:
+
+```json
+{
+  "status": "ready",
+  "cause": "ready",
+  "current_height": 3412870,
+  "served_epoch_age_seconds": 420,
+  "degraded": [
+    {
+      "input": "node_source",
+      "dependency_cause": {
+        "node_unavailable": {
+          "failure_class": "node_unreachable",
+          "last_reason": "upstream node is unavailable: connection refused",
+          "consecutive_failures": 14,
+          "outage_seconds": 390
+        }
+      }
+    }
+  ]
+}
+```
+
+A wallet-serving reader also reports `served_epoch_age_seconds`, the time since
+the canonical writer committed the chain epoch the reader serves. While the
+node or the writer stops advancing, the reader keeps serving its last chain
+view as ready, and this age is the signal that the view is stale.
+
 Payload-bearing causes include structured detail. `node_unavailable` carries a
 bounded failure class, sanitized reason, consecutive-failure count, and outage
 duration. `upstream_not_ready` carries source heights, verification progress,
@@ -67,16 +105,25 @@ runtime whose readiness depends on more than one owner composes them through
    halt, which is the root cause of the admission failures that follow it;
 3. the admission state (storage, serving pair, or canonical writer) when it
    refuses traffic;
-4. the first refusing named input, in the order node source, ingest control,
-   materialized-view catch-up;
+4. the first refusing required input, in the order node source, ingest
+   control, materialized-view catch-up;
 5. otherwise the admission state, including a warning that admits traffic.
+
+Each input is either required or a dependency, as the runtime declares. A
+required input that refuses traffic supplies the cause at step 4. A dependency
+never does. Its refusing cause is listed under `degraded` instead, unless it
+is the writer halt of step 2, which refuses traffic from either kind of input.
 
 The admission state supplies the reported heights. When shutdown or an input
 supplies the cause, the reported target height is cleared. Every owner
-replaces only its own input, so no owner can clear another owner's failure.
-Ingest, native wallet query, lightwalletd compatibility, and Explorer use this
-composition. Projector and Cipherscan compatibility each keep one owner of
-their readiness state.
+replaces only its own input, so no owner can clear another owner's
+observation. Ingest, native wallet query, lightwalletd compatibility, and
+Explorer use this composition. Ingest's node-source input and Explorer's
+materialized-view catch-up input are required inputs. Native query's node
+source and ingest control, and compatibility's node source, are dependencies
+([ADR-0045](../adrs/0045-wallet-serving-readiness-follows-the-serving-pair.md)).
+Compact-blocks compatibility composes no input. Projector and Cipherscan
+compatibility each keep one owner of their readiness state.
 
 ### Canonical fence attestation
 
@@ -254,12 +301,30 @@ persisted cursor without a rebuild because the lease kept it retained.
 
 ### Native wallet query
 
-Native wallet query is ready only when all three independently retained inputs
-are healthy: the admitted canonical-and-wallet serving pair, the exact node
-source used by every advertised node-backed operation, and the authenticated
-ingest-control channel used by pair publication and live wallet operations.
-No input can erase another input's failure. Capability discovery remains
-immutable while any admitted dependency is temporarily unhealthy.
+Native wallet query is ready when its admitted canonical-and-wallet serving
+pair admits traffic. Two other observations are retained independently as
+dependencies:
+
+- the exact node source used by every advertised node-backed operation; and
+- the authenticated ingest-control channel used by pair publication and live
+  wallet operations.
+
+A dependency outage never closes the traffic gate. It appears under
+`degraded`, and only the requests that call the dependency fail. No input can
+erase another input's observation. Capability discovery remains immutable
+while any admitted dependency is temporarily unhealthy.
+
+| Request | Node unavailable or not synchronized | Ingest unreachable |
+| --- | --- | --- |
+| Stored reads: tips, blocks, compact blocks, mined transactions, transparent address reads, subtree roots, tree state at any height, the latest tree-state checkpoint, chain events, activations, and `ServerInfo` | Served | Served until `storage.serving_pair_staleness_ceiling_ms` passes |
+| `BroadcastTransaction` | `UNAVAILABLE`, `NODE_UNAVAILABLE` | Served until the ceiling passes |
+| `MempoolSnapshot`, `MempoolEvents`, and unmined `Transaction` lookups | Passed to ingest, which answers or fails them from its own mempool state | `UNAVAILABLE` |
+
+A node-backed request always calls the node, whatever the node probe last
+observed, so a node that recovers between probes serves it. The staleness
+ceiling starts only when the publisher cannot read `WriterStatus`. An
+ingest-control health failure that leaves `WriterStatus` answering, such as a
+failing mempool snapshot, degrades the dependency without starting it.
 
 Before storage is opened or traffic is bound, `AdmittedIngestControl` connects
 once and validates `ServerInfo` service identity, network, contract revision,
@@ -271,12 +336,14 @@ validate coherent network and tip evidence. Block arrival does not fail the
 check: the writer answers a mempool read at a new tip once its replacement
 generation is certified, waiting up to five seconds, and a snapshot that is
 still not coherent returns `CHAIN_EPOCH_PIN_UNAVAILABLE`, which the probe
-accepts as healthy. A transition into failure emits
-one classified warning and drains readiness with
-`ingest_control_unavailable`; recovery emits one event and restores only the
-ingest-control input. A `WriterStatus` that reports a parked writer instead
-drains readiness with `reorg_window_exceeded`, which takes precedence over the
-serving-pair failures it causes. New native requests then fail with
+accepts as healthy. A transition into failure emits one classified warning and
+degrades the ingest-control dependency with `ingest_control_unavailable`;
+recovery emits one event and clears only that dependency. A `WriterStatus`
+that reports `upstream_not_ready` degrades the dependency with the writer's
+`upstream_not_ready` detail instead, so `/readyz` names the syncing node as the
+root cause. A `WriterStatus` that reports a parked writer refuses traffic with
+`reorg_window_exceeded`, which takes precedence over the serving-pair failures
+it causes. New native requests then fail with
 `REORG_WINDOW_EXCEEDED`, and open `ChainEvents` streams end with the same
 status. The serving-pair publisher reads the same halt from
 `CanonicalControl.WriterStatus`, which is how lightwalletd compatibility,
@@ -284,14 +351,22 @@ which has no ingest-control probe, refuses traffic in both serving modes. The
 health probe intentionally shares the configured serving-pair refresh cadence
 because both observe the same control plane.
 
+Losing ingest control entirely also stops pair refresh, because the publisher
+reads `CanonicalControl.WriterStatus` through the same channel. The pair then
+reports `serving_pair_stale` and refuses traffic with
+`writer_status_unavailable` once `storage.serving_pair_staleness_ceiling_ms`
+passes, as it does for any writer-status outage.
+
 The node probe exercises `tip_id` and upstream synchronization health through
-the same shared source handle installed in the query. It does not repeat
-structural capability discovery. Transaction broadcast is the only node-backed
-operation; tree state at any height is served from the serving pair. A query
-that does not advertise broadcast therefore runs no node probe, and its node
-input is always ready. Any node-backed composition must admit `TipId` before
-binding so this liveness prerequisite cannot fail later as a configuration
-surprise. The serving-pair publisher, node-readiness probe, and
+the same shared source handle installed in the query, and publishes
+`node_unavailable`, `upstream_not_ready`, or `node_capability_missing` as the
+node-source dependency's cause. It does not repeat structural capability
+discovery. Transaction broadcast is the only node-backed operation; tree state
+at any height is served from the serving pair. A query that does not advertise
+broadcast therefore runs no node probe, and its node-source dependency is
+never degraded. Any node-backed composition must admit `TipId` before binding
+so this liveness prerequisite cannot fail later as a configuration surprise.
+The serving-pair publisher, node-readiness probe, and
 ingest-control-readiness probe are supervised with the gRPC server; an
 unexpected exit drains readiness and terminates the runtime.
 
@@ -304,7 +379,8 @@ at 10 seconds, after which calls still open are abandoned, and the readiness
 probes stop without waiting for a node or ingest-control request in flight, so
 query exits within the wallet-serving supervisor's 20-second grace window.
 
-When the shared traffic gate is closed, new gRPC calls return
+When the shared traffic gate is closed, which only the serving pair, a parked
+writer, or shutdown can cause, new gRPC calls return
 `UNAVAILABLE` with `ErrorReason = SERVICE_NOT_READY` and
 `ErrorInfo.metadata["readiness_cause"]` set to the stable readiness label.
 `/readyz` carries the corresponding structured detail. This keeps a
@@ -325,9 +401,13 @@ projector reports the park.
 
 Compatibility is ready only while `WalletServingPairPublisher` can reach writer
 status, catch canonical and wallet secondaries up, and publish a pair that
-passes exact-fence admission, and while the admitted node source needed by its
-compatibility methods is healthy. Traffic uses a readiness interceptor, so a
-process that has drained readiness does not accept new gRPC requests.
+passes exact-fence admission. In wallet mode, the node source behind
+`SendTransaction` is a dependency. Its outage appears under `degraded`, and
+`SendTransaction` fails with `UNAVAILABLE` while every other method, including
+`GetTreeState` at any height, keeps answering. Compact-blocks
+mode calls the node from no method and runs no node probe. Traffic uses a
+readiness interceptor, so a process whose serving pair refuses traffic does
+not accept new gRPC requests.
 Compatibility bootstraps its serving pair through the writer-status endpoint
 and uses separate ingest-control channels for mempool and tip-change traffic.
 It does not instantiate the native query's admitted ingest type or advertise
@@ -419,7 +499,14 @@ records the decision.
 
 Every runtime exports build information and readiness state.
 `zinder_build_info` is a constant gauge labeled by service, product version,
-build Git commit, and network. Important runtime metrics include:
+build Git commit, and network. `zinder_readiness_state{cause}` is 1 for the
+runtime's current readiness cause. A runtime with dependency inputs also
+exports `zinder_readiness_dependency_state{input, cause}`, which is 1 for each
+dependency's current cause and 0 for every other cause label. A wallet-serving
+reader exports `zinder_readiness_served_epoch_age_seconds`. Alert on a
+dependency gauge whose cause does not admit traffic, and on a served-epoch age
+that has grown past several block intervals, because a reader keeps answering
+200 through both. Important runtime metrics include:
 
 ### Canonical writer
 
@@ -939,9 +1026,10 @@ logs, reports, or test snapshots.
 
 ## Recovery
 
-Recoverable source errors drain readiness and retry from durable state. Store
-identity, corruption, schema, and reorg-policy failures fail closed and require
-operator action.
+Recoverable source errors drain ingest readiness and retry from durable state.
+Wallet-serving readers report the same errors as degraded dependencies and keep
+serving stored reads. Store identity, corruption, schema, and reorg-policy
+failures fail closed and require operator action.
 
 Production wallet recovery is one coherent state-bundle operation:
 

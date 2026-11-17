@@ -23,10 +23,12 @@ provide operators with the actionable reason and recovery cadence.
 4. **Source errors describe observations.** `SourceFailureClass` (`NodeUnreachable`, `UpstreamViewChanged`, `StreamDisconnected`, `CapabilityMissing`, `ProtocolMismatch`, `Malformed`, `Configuration`) is the operator-facing label returned by `SourceError::upstream_classification()`.
 5. **Readiness carries operator detail.** `ReadinessCause::NodeUnavailable` carries `NodeUnavailableDetail` with `{ failure_class, last_reason, consecutive_failures, outage_seconds }`. `/readyz`, the proto report, and `zinder_readiness_node_failure_class{class=...}` surface that detail.
 6. **Per-call retry handles narrow transport classes.** `retry_source_request` retries only `NodeUnreachable` and `StreamDisconnected` failures. Other source failures return to the loop, which re-observes upstream state before issuing dependent requests.
+7. **Only the writer drains on a source failure.** Wallet-serving readers report their node probe's `node_unavailable` or `upstream_not_ready`, and the writer's `upstream_not_ready` relayed through ingest control, as degraded dependencies with the same detail. They keep serving stored reads, and a node-backed request fails on its own with `NODE_UNAVAILABLE` ([ADR-0045](0045-wallet-serving-readiness-follows-the-serving-pair.md)).
 
 ## Consequences
 
-- Canonical following stays alive through source outages while `/readyz` reports `node_unavailable` with the source-failure class.
+- Canonical following stays alive through source outages while ingest `/readyz` reports `node_unavailable` with the source-failure class.
+- Wallet-serving readers stay ready through the same outages, so an operator watches ingest readiness and the readers' `zinder_readiness_dependency_state` gauge rather than reader 503s.
 - Operators can see the failure class, latest reason, retry count, and outage duration without consulting logs.
 - New `SourceError` variants select a `SourceFailureClass`; recovery posture remains owned by ingest.
 
@@ -35,3 +37,9 @@ provide operators with the actionable reason and recovery cadence.
 - `docs/architecture/node-source-boundary.md` — Capability Model section: `SourceFailureClass` taxonomy and the operator-action table (`failure_class` → action).
 - `docs/architecture/service-operations.md` — Health and Readiness section: the `NodeUnavailableDetail` payload contract.
 - `docs/architecture/chain-ingestion.md` — Continuous following: loop-owned recovery posture.
+
+## Revision history
+
+- 2026-11-17: Wallet-serving readers no longer drain readiness on a source
+  failure. They report it as a degraded dependency and fail only node-backed
+  requests ([ADR-0045](0045-wallet-serving-readiness-follows-the-serving-pair.md)).

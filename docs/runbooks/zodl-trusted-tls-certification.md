@@ -119,7 +119,11 @@ The template has 3 independent properties:
    that listener beyond the host.
 
 The pre-check stops new RPCs after readiness drains, but it cannot revoke an
-RPC or stream that was already admitted. The compatibility runtime also gates
+RPC or stream that was already admitted. A node outage does not drain
+compatibility readiness: `/readyz` stays 200, lists the node under `degraded`,
+and only `SendTransaction` fails, with `UNAVAILABLE`; `GetTreeState` is served
+from storage at every retained height. The gate therefore stays open for every
+method the stored chain answers. The compatibility runtime also gates
 new gRPC traffic with its own readiness interceptor, so a transition between
 the Caddy pre-check and the upstream call fails closed. Existing streams drain
 against the immutable canonical and wallet generation they already captured;

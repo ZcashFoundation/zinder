@@ -499,8 +499,9 @@ is not a reason to bypass the wallet data plane.
 constructor. It is `true` only when the canonical pair retains transaction
 blobs with `raw_blob_policy = "transactions"` or `"all"` and the exact
 wallet-serving pair provides the transparent reads. A `none` composition fails
-before the compatibility listener binds; later pair lag or provider outage
-drains readiness without rewriting the immutable claim. Transparent output
+before the compatibility listener binds. Later pair lag drains readiness, and
+a node outage degrades the node dependency, without rewriting the immutable
+claim. Transparent output
 reads themselves remain available from canonical artifacts when raw payload
 retention is `none`, but lightwalletd transparent transaction history returns
 raw transaction bytes and therefore requires `transactions` or `all`. The flag

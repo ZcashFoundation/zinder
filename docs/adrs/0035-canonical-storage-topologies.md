@@ -352,12 +352,13 @@ mempool fail:
   lookup pinned with `at_epoch_id` never consults the mempool, so it keeps
   working.
 
-Under `rocksdb-single-host`, native wallet query keeps the rule that no
-input can erase another input's failure: it is ready only when the serving
-pair, the node source, and the ingest-control channel are all healthy, as
+Under `rocksdb-single-host`, native wallet query already serves in this
+partial state. Its readiness follows the serving pair, and an unavailable node
+source or ingest-control channel appears under the report's `degraded`
+dependencies while only the requests that call it fail, as
 [Service operations](../architecture/service-operations.md#native-wallet-query)
 and
-[ADR-0038](0038-wallet-runtime-composition-and-capability-discovery.md#support-readiness-and-request-outcomes)
+[ADR-0045](0045-wallet-serving-readiness-follows-the-serving-pair.md)
 describe. How a `postgres-horizontal` reader reports this partial state to
 readiness and to a load balancer is not designed yet.
 
@@ -685,6 +686,11 @@ Measured behavior of `rocksdb-single-host` that still informs operators:
 
 ## Revision history
 
+- 2026-11-17: Under `rocksdb-single-host`, native wallet query serves while
+  its node or ingest control is unavailable and reports them as degraded
+  dependencies, instead of refusing traffic until all three of its inputs are
+  healthy
+  ([ADR-0045](0045-wallet-serving-readiness-follows-the-serving-pair.md)).
 - 2026-11-14: Construction leases belong to the build-owner identity. The same
   owner reclaims a live lease at a higher generation instead of waiting for it
   to expire, and a different owner is still refused. A process-lifetime lock

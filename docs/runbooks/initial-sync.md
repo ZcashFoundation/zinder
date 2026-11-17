@@ -250,7 +250,7 @@ fence, and wallet digest.
 | --- | --- | --- |
 | ingest | `starting`, `syncing`, or `upstream_not_ready` | Canonical lag is within threshold, mempool snapshot is complete, and a configured `[node.health]` probe reports Zebra ready |
 | projector | `starting` or `syncing` | Wallet store is published and following the admitted canonical source |
-| native query | `starting`, `replica_lagging`, `writer_status_unavailable`, `ingest_control_unavailable`, or `canonical_tip_unconfirmed` | One exact canonical and wallet pair is published, the admitted node is healthy, and `WriterStatus` plus a bounded mempool snapshot succeed through the admitted ingest-control channel |
+| native query | `starting`, `replica_lagging`, `writer_status_unavailable`, or `canonical_tip_unconfirmed` | One exact canonical and wallet pair is published, and the writer has confirmed its tip against its node and does not report a park |
 | compatibility | `starting`, `replica_lagging`, `writer_status_unavailable`, or `canonical_tip_unconfirmed` | One exact canonical and wallet pair (or, for compact-block serving, one canonical reader) is published, and the writer has confirmed its tip against its node and does not report a park |
 
 After the first publication, a reader that loses writer status or falls behind
@@ -278,11 +278,15 @@ finalized tip. When that tip is a block ingest already holds, ingest reports
 re-verify past its tip; it parks only when the node's tip is on another
 branch.
 
-`node_unavailable`, `upstream_not_ready`, and
-`ingest_control_unavailable` are recoverable dependency conditions. For native
-query, inspect the classified `ingest_control_health_unavailable` warning and
-restore the admitted writer endpoint, authentication, writer status, or
-tip-coherent mempool snapshot. Startup identity, network, contract-revision,
+Native query and compatibility do not wait for their node or, for native
+query, ingest control. Until each probe reports healthy, the `/readyz` body
+lists it under `degraded` with cause `starting`, and the runtime still admits
+traffic once its pair is published. Afterwards, `node_unavailable`,
+`upstream_not_ready`, and `ingest_control_unavailable` appear there as
+recoverable dependency conditions, and only the requests that call the
+dependency fail. For native query, inspect the classified
+`ingest_control_health_unavailable` warning and restore the admitted writer
+endpoint, authentication, writer status, or tip-coherent mempool snapshot. Startup identity, network, contract-revision,
 or required-capability mismatches fail before traffic binds and require
 configuration or deployment correction rather than health-probe retries.
 `schema_mismatch`, `reorg_window_exceeded`, corrupt store errors, and source

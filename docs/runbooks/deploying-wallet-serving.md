@@ -246,10 +246,17 @@ deployment's earlier healthcheck setting.
 `/healthz` passes as soon as the query endpoint listens. It does not show
 whether the native query surface serves. Watch query `/readyz` on port 9106 for
 that, and alert on it in monitoring. It is not the deploy-time healthcheck
-because it returns 503 with cause `upstream_not_ready` while the Zebra node is
-behind its estimated network tip, even when Zinder has indexed everything the
-node has committed. A lagging node would then fail the deployment without any
-Zinder fault.
+because it answers 503 in states a deployment should survive. A parked writer
+serves the typed refusal with `reorg_window_exceeded`, and after a restart
+query refuses with `canonical_tip_unconfirmed` until ingest confirms its
+stored tip against the node.
+
+Query `/readyz` stays 200 while the Zebra node is unavailable or behind its
+estimated network tip. Query keeps serving stored reads, fails broadcasts
+with `NODE_UNAVAILABLE`, and lists the node under `degraded` in its `/readyz`
+body. Alert on `zinder_readiness_dependency_state` with a cause other than
+`ready`, and on `zinder_readiness_served_epoch_age_seconds`, which grows while
+the node or ingest stops advancing the served chain.
 
 Also set the `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30` service variable. The
 entrypoint gives the three RocksDB openers twenty seconds to flush, so a
@@ -442,8 +449,17 @@ before it starts the new one, so the redeploy also ends the deployment that was
 serving the typed refusal. A plain restart or a crash restart under the
 `ALWAYS` policy comes back serving the halt.
 
-Upstream outages and sync lag drain readiness the same way but clear on their
-own, so they are tolerated for an hour before the container terminates.
+Sync lag and transient faults drain readiness but clear on their own, so a
+plane that stays unready is tolerated for an hour before the container
+terminates.
+
+A node outage is tolerated much longer. While ingest reports
+`node_unavailable` or `upstream_not_ready`, query keeps serving the stored
+chain, and a restart cannot help: ingest needs the node to start, so the
+restarted container would serve nothing. The supervisor logs the outage once
+when it begins and once when it ends, keeps it out of the one-hour tolerance
+and the recurrence budgets below, and terminates the container only after the
+outage has lasted 24 hours.
 
 A plane that flaps between ready and unready never stays down for an hour, so
 the supervisor also tracks its unready stretches. It terminates the container
