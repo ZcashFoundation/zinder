@@ -7,8 +7,8 @@ use rust_rocksdb::{DB, IteratorMode, ReadOptions, WriteBatch};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zinder_core::{
-    BlockHash, BlockHeight, ChainTipMetadata, ShieldedProtocol, SubtreeRootArtifact,
-    SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
+    BlockHash, BlockHeight, ChainTipMetadata, CompletedSubtreeRoot, ShieldedProtocol,
+    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
 };
 
 use super::{
@@ -24,17 +24,32 @@ const SUBTREE_ROOT_SEQUENCE_DIGEST_VERSION: u16 = 2;
 const SUBTREE_ROOT_SEQUENCE_DIGEST_DOMAIN: &[u8] = b"zinder.canonical.subtree-root-sequence.v2\0";
 type EncodedSubtreeRoot = ([u8; SUBTREE_ROOT_KEY_LEN], [u8; SUBTREE_ROOT_VALUE_LEN]);
 
-/// Source-authenticated subtree-root fields before canonical block identity is attached.
+/// Caller-authenticated subtree-root fields before canonical block identity is attached.
+///
+/// The ingest writer derives these roots from the completing blocks' note
+/// commitments. The store checks each root's pool, index, and completing
+/// height against the blocks it commits or retains, but not the root itself.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CanonicalBuildSubtreeRoot {
     /// Shielded protocol containing the completed subtree.
     pub protocol: ShieldedProtocol,
     /// Exact completed subtree index.
     pub subtree_index: SubtreeRootIndex,
-    /// Root returned by the canonical node source.
+    /// Merkle root of the complete subtree.
     pub root_hash: SubtreeRootHash,
     /// Retained canonical block that completed the subtree.
     pub completing_block_height: BlockHeight,
+}
+
+impl From<CompletedSubtreeRoot> for CanonicalBuildSubtreeRoot {
+    fn from(root: CompletedSubtreeRoot) -> Self {
+        Self {
+            protocol: root.protocol,
+            subtree_index: root.subtree_index,
+            root_hash: root.root_hash,
+            completing_block_height: root.completing_block_height,
+        }
+    }
 }
 
 /// Coverage represented by one canonical subtree-root construction load.
@@ -63,7 +78,7 @@ pub struct CanonicalSubtreeRootLoadEvidence {
     pub coverage: CanonicalSubtreeRootLoadCoverage,
     /// Version of the domain-separated subtree-root sequence digest.
     pub sequence_digest_version: u16,
-    /// Number of contiguous source-authenticated subtree roots.
+    /// Number of contiguous caller-authenticated subtree roots.
     pub subtree_root_count: u64,
     /// Total key and value bytes written to the subtree-root family.
     pub subtree_root_logical_bytes: u64,

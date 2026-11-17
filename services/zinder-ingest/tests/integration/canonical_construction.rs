@@ -127,7 +127,9 @@ async fn wallet_canonical_blocks_retain_transactions_and_position_compact_metada
         RawBlobRetention::Transactions,
     )
     .await?;
-    let CanonicalBlockLoadOutcome { builder, evidence } = outcome;
+    let CanonicalBlockLoadOutcome {
+        builder, evidence, ..
+    } = outcome;
 
     assert_eq!(evidence.block_count, 1);
     assert_eq!(evidence.block_header_count, 1);
