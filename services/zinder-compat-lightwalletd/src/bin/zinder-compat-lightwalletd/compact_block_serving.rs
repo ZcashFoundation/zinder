@@ -2938,6 +2938,9 @@ mod tests {
         let mut cancelled = adapter.get_block_range(Request::new(block_range(1, TIP_HEIGHT)));
         assert!(poll_once(&mut cancelled).is_pending());
         drop(cancelled);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
 
         let refused = poll_once(&mut adapter.get_block_range(Request::new(block_range(1, 4))));
         assert!(

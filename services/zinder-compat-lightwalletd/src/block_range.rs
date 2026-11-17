@@ -17,8 +17,8 @@
 //! "Compatibility block-range streams", records the contract.
 //!
 //! A stream holds one slot of a process-wide [`BlockRangeStreamLimit`] from
-//! its admission until its response is dropped and every read it started
-//! has finished, so the number of slots bounds how many streams hold chunks
+//! its admission until its response is dropped and every chunk read of the
+//! stream has finished, so the number of slots bounds how many streams hold chunks
 //! at once.
 
 use std::{
@@ -158,7 +158,7 @@ const OPEN_STREAMS_GAUGE: &str = "zinder_compat_block_range_streams_open";
 ///
 /// Clones share one limit. A stream takes a slot after its request passes
 /// validation. It returns the slot when the stream ends, fails, or the client
-/// goes away, and no read of the stream is still running.
+/// goes away, and no chunk read of the stream is still running.
 #[derive(Clone, Debug)]
 pub struct BlockRangeStreamLimit {
     slots: Arc<Semaphore>,

@@ -559,8 +559,9 @@ bound. The first chunk has no chunk before it, and a chunk that enters dense
 blocks after sparse ones is sized for the sparse ones, so either can hold
 1,000 dense blocks. A read that stops at a byte budget bounds every chunk,
 the first included. The budget is fixed rather than configurable, because the
-reference's account of what one stream holds, from which operators size the
-stream limit, assumes it.
+reference tells operators to watch container memory while
+`zinder_compat_block_range_streams_open` is near the limit, and that guidance
+assumes it.
 
 ### End a block-range stream with `CHAIN_EPOCH_PIN_UNAVAILABLE`
 
