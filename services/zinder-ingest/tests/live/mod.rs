@@ -8,4 +8,5 @@ mod mined_consensus_branch_id_parity;
 mod network_upgrade_boundary;
 mod nu7_activation;
 mod reorg_sweep;
+mod subtree_root_derivation;
 mod transparent_address_unspent_outputs;

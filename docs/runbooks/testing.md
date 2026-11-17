@@ -675,6 +675,14 @@ via `require_live_for(&[Network::ZcashRegtest])` and refuse to run here.
 Omit `ZINDER_TEST_QUERY_GRPC_ADDR` only when no standalone native runtime is
 available; that omission intentionally skips the native contract smoke.
 
+`live::subtree_root_derivation` runs on testnet and mainnet. For each pool, it
+derives the most recently completed subtree root from the completing block's
+note commitments and the tree state before that block. The node's
+`z_getsubtreesbyindex` root must match it byte for byte, because ingest stores
+the derived root. A Regtest chain never fills a 65,536-leaf subtree, so the
+test skips there, and it fails against a node on which no pool has completed a
+subtree.
+
 The fixed-range canonical tracer runs on testnet and mainnet. It captures one
 tip identity, retains the requested predecessor-to-tip range, and loads every
 source-derived version-1 family retained by the Wallet workload through one

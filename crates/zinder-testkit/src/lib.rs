@@ -66,7 +66,7 @@ pub use chain_fixture::{
 };
 pub use commitment_tree_fixtures::{
     FIXTURE_NOTE_COMMITMENT, completed_sapling_subtree_frontier, completed_subtree_frontier,
-    one_leaf_frontier, one_leaf_sapling_frontier,
+    frontier_of_size, one_leaf_frontier, one_leaf_sapling_frontier,
 };
 pub use env_var_contract::EnvVarContractProbe;
 pub use ingest_control_fixture::{IngestControlFixture, IngestControlFixtureService};

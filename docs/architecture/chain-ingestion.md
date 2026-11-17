@@ -64,6 +64,15 @@ computation for each pool that changed since the previous checkpoint. The
 node's tree state for the build tip is requested by the tip's hash. If that
 block has left the node's best chain, construction stops and publishes nothing.
 
+The loader also derives the root of every subtree that a loaded block
+completes, and construction stores those derived roots. Construction reads the
+completed ranges with `z_getsubtreesbyindex` before it requests the build
+tip's tree state, so a node that switched to another chain between the two
+requests refuses the second one. A node that still holds the build tip must
+report the derived roots exactly, with the same indexes and completing
+heights. Otherwise construction stops with `SourceSubtreeRootMismatch`, which
+names the pool and subtree index, and publishes nothing.
+
 `CanonicalConstructionSettings` and `CanonicalPipelineLimits` bound:
 
 - source segment size and target response bytes;
@@ -158,6 +167,23 @@ state for the same block whose
 time or frontiers differ from the derived result is a contradiction, not a
 changed view. It stops the writer with `SourceCheckpointMismatch`, which names
 the part that differed.
+
+Each append also derives the root of every subtree that the block completes,
+from the same frontier that authenticates the block's tree state. A root is
+taken when the commitment that fills the subtree's last leaf is appended, so a
+subtree that the block completes partway through its commitments is included.
+Ingest commits the derived roots. For a block that completes a subtree, it
+also reads the completed range with `z_getsubtreesbyindex` and requires the
+node's roots, indexes, and completing heights to equal the derived ones. A
+block that completes no subtree costs no subtree-root request. The subtree-root
+request names no block, so the node can answer for a sibling block that
+replaced the block after ingest read it. When the roots differ, ingest requests
+the block's tree state again by its hash. A node that no longer holds the block
+refuses that request as a changed upstream view, and the next iteration
+observes the node again. A node that still holds the block contradicts the
+derivation, and the writer stops with `SourceSubtreeRootMismatch`, which names
+the block height, pool, and subtree index. Replacement blocks are checked the
+same way.
 
 Readiness becomes ready only when canonical lag is within
 `ingest.follow.lag_threshold_blocks` and the live mempool gate, when configured,

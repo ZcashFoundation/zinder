@@ -34,7 +34,8 @@ use crate::{
         detail_for_ongoing_outage,
     },
     writer::construction::{
-        canonical_build_block, compact_block_commitments, register_prohibited_read_metrics,
+        build_subtree_root, canonical_build_block, compact_block_commitments,
+        first_differing_subtree_root, register_prohibited_read_metrics,
     },
     writer::control::{
         CanonicalControlCommand, CanonicalControlScheduling, ParkedWriterHalt, TipConfirmation,
@@ -348,6 +349,21 @@ pub enum CanonicalFollowError {
         height: BlockHeight,
         /// First checkpoint part that differed.
         component: CheckpointComponent,
+    },
+    /// The node still holds a block, but its root for a subtree the block
+    /// completed differs from the root derived from the block's own note
+    /// commitments.
+    #[error(
+        "source {protocol:?} subtree {} root differs from the root derived from block {height:?}",
+        .subtree_index.value()
+    )]
+    SourceSubtreeRootMismatch {
+        /// Height of the block that completed the subtree.
+        height: BlockHeight,
+        /// Shielded pool of the subtree.
+        protocol: ShieldedProtocol,
+        /// First subtree whose root, index, or completing height differed.
+        subtree_index: SubtreeRootIndex,
     },
     /// Size-only compact metadata diverged from the typed frontier accumulator.
     #[error(
@@ -756,7 +772,7 @@ where
     let raw_blob_retention = store.raw_blob_retention();
     let preparation_started = std::time::Instant::now();
     let activations_for_prepare = Arc::clone(&network_upgrade_activations);
-    let (block, next_tip_metadata) = tokio::task::spawn_blocking(move || {
+    let prepared = tokio::task::spawn_blocking(move || {
         prepare_live_block(
             &source_block,
             &predecessor_checkpoint,
@@ -771,18 +787,18 @@ where
     })??;
     metrics::histogram!("zinder_ingest_canonical_live_prepare_seconds")
         .record(preparation_started.elapsed().as_secs_f64());
-    let subtree_roots = fetch_live_subtree_roots(
+    let subtree_roots = confirm_live_subtree_roots(
         source,
         config.request_timeout,
         cancel,
-        anchor.tip_checkpoint().tip_metadata(),
-        next_tip_metadata,
+        network_upgrade_activations.as_ref(),
+        &prepared,
     )
     .await?;
     Ok(FollowIteration::Append {
         append: Box::new(CanonicalLiveAppend::new(
             anchor.event_fence(),
-            block,
+            prepared.block,
             subtree_roots,
             settled_tip,
             UnixTimestampMillis::now(),
@@ -933,7 +949,6 @@ where
     let mut predecessor_checkpoint =
         store.replacement_parent_checkpoint(common_parent, network_upgrade_activations.as_ref())?;
     let raw_blob_retention = store.raw_blob_retention();
-    let mut previous_tip_metadata = predecessor_checkpoint.tip_metadata();
     let mut replacement_blocks = Vec::new();
     let replacement_depth = replacement_tip_height
         .value()
@@ -978,7 +993,7 @@ where
         let checkpoint_for_prepare = source_checkpoint.clone();
         let activations_for_prepare = Arc::clone(&network_upgrade_activations);
         let preparation_started = std::time::Instant::now();
-        let (block, next_tip_metadata) = tokio::task::spawn_blocking(move || {
+        let prepared = tokio::task::spawn_blocking(move || {
             prepare_live_block(
                 &source_block_for_prepare,
                 &predecessor_for_prepare,
@@ -993,15 +1008,15 @@ where
         })??;
         metrics::histogram!("zinder_ingest_canonical_live_replacement_prepare_seconds")
             .record(preparation_started.elapsed().as_secs_f64());
-        let subtree_roots = fetch_live_subtree_roots(
+        let subtree_roots = confirm_live_subtree_roots(
             source,
             config.request_timeout,
             cancel,
-            previous_tip_metadata,
-            next_tip_metadata,
+            network_upgrade_activations.as_ref(),
+            &prepared,
         )
         .await?;
-        memory.hold(prepared_replacement_bytes(&block));
+        memory.hold(prepared_replacement_bytes(&prepared.block));
         if memory.exceeded() {
             return Err(memory.exceeded_error(
                 replacement_depth,
@@ -1010,9 +1025,11 @@ where
                     .saturating_add(1),
             ));
         }
-        replacement_blocks.push(CanonicalReplacementBlock::new(block, subtree_roots));
+        replacement_blocks.push(CanonicalReplacementBlock::new(
+            prepared.block,
+            subtree_roots,
+        ));
         predecessor_checkpoint = source_checkpoint;
-        previous_tip_metadata = next_tip_metadata;
         height = current_height.next();
     }
     metrics::counter!("zinder_ingest_canonical_fork_discoveries_total").increment(1);
@@ -1262,13 +1279,23 @@ fn next_settled_height(
     )
 }
 
+/// One live block prepared on its predecessor's authenticated frontier.
+struct PreparedLiveBlock {
+    block: CanonicalBuildBlock,
+    block_id: BlockId,
+    /// Subtree-root ranges the block completes, as the node indexes them.
+    subtree_root_ranges: Vec<SubtreeRootRange>,
+    /// Roots of those subtrees, derived from the block's own note commitments.
+    derived_subtree_roots: Vec<CanonicalBuildSubtreeRoot>,
+}
+
 fn prepare_live_block(
     source_block: &SourceBlock,
     predecessor_checkpoint: &CommitmentTreeCheckpoint,
     source_checkpoint: &CommitmentTreeCheckpoint,
     network_upgrade_activations: &NetworkUpgradeActivations,
     raw_blob_retention: zinder_store::RawBlobRetention,
-) -> Result<(CanonicalBuildBlock, ChainTipMetadata), CanonicalFollowError> {
+) -> Result<PreparedLiveBlock, CanonicalFollowError> {
     let height = source_block.height;
     let prepared = prepare_canonical_block(
         source_block,
@@ -1301,8 +1328,9 @@ fn prepare_live_block(
             accumulated: accumulated_tip_metadata,
         });
     }
+    let block_id = BlockId::new(height, source_block.hash);
     let derived_checkpoint = CommitmentTreeCheckpoint::new(
-        BlockId::new(height, source_block.hash),
+        block_id,
         source_block.block_time_seconds,
         accumulator
             .validated_frontiers()
@@ -1312,11 +1340,20 @@ fn prepare_live_block(
     {
         return Err(CanonicalFollowError::SourceCheckpointMismatch { height, component });
     }
-    let tip_metadata = positioned.tip_metadata;
-    Ok((
-        canonical_build_block(positioned, Some(derived_checkpoint), None),
-        tip_metadata,
-    ))
+    let subtree_root_ranges = live_subtree_root_ranges(
+        predecessor_checkpoint.tip_metadata(),
+        positioned.tip_metadata,
+    )?;
+    Ok(PreparedLiveBlock {
+        block: canonical_build_block(positioned, Some(derived_checkpoint), None),
+        block_id,
+        subtree_root_ranges,
+        derived_subtree_roots: accumulator
+            .completed_subtree_roots(source_block.hash)
+            .iter()
+            .map(build_subtree_root)
+            .collect(),
+    })
 }
 
 /// Names the first part in which two checkpoints differ, or `None` when they
@@ -1343,37 +1380,58 @@ fn differing_checkpoint_component(
     }
 }
 
-async fn fetch_live_subtree_roots<Source>(
+/// Returns the roots of the subtrees `prepared` completes, derived from its own
+/// note commitments, once the node reports the same roots.
+///
+/// `z_getsubtreesbyindex` names no block, so the node can answer for a block
+/// that replaced this one after it was read. On a disagreement the block is
+/// read again by hash. A node that no longer holds it fails that read as a
+/// changed upstream view, and the caller observes the node again. A node that
+/// still holds it contradicts the derivation, which stops the writer with
+/// [`CanonicalFollowError::SourceSubtreeRootMismatch`].
+async fn confirm_live_subtree_roots<Source>(
     source: &Source,
     request_timeout: Duration,
     cancel: &CancellationToken,
-    previous_tip_metadata: ChainTipMetadata,
-    next_tip_metadata: ChainTipMetadata,
+    network_upgrade_activations: &NetworkUpgradeActivations,
+    prepared: &PreparedLiveBlock,
 ) -> Result<Vec<CanonicalBuildSubtreeRoot>, CanonicalFollowError>
 where
     Source: NodeSource,
 {
-    let mut roots = Vec::new();
-    for range in live_subtree_root_ranges(previous_tip_metadata, next_tip_metadata)? {
+    let mut source_roots = Vec::new();
+    for range in &prepared.subtree_root_ranges {
         let response = source_request(
             request_timeout,
             cancel,
-            source.fetch_subtree_root_range(range),
+            source.fetch_subtree_root_range(*range),
         )
         .await?;
-        roots.extend(
-            response
-                .subtree_roots
-                .into_iter()
-                .map(|root| CanonicalBuildSubtreeRoot {
-                    protocol: response.protocol,
-                    subtree_index: root.subtree_index,
-                    root_hash: root.root_hash,
-                    completing_block_height: root.completing_block_height,
-                }),
-        );
+        source_roots.extend(response.subtree_roots.into_iter().map(|root| {
+            CanonicalBuildSubtreeRoot {
+                protocol: response.protocol,
+                subtree_index: root.subtree_index,
+                root_hash: root.root_hash,
+                completing_block_height: root.completing_block_height,
+            }
+        }));
     }
-    Ok(roots)
+    let Some(differing_root) =
+        first_differing_subtree_root(&prepared.derived_subtree_roots, &source_roots)
+    else {
+        return Ok(prepared.derived_subtree_roots.clone());
+    };
+    source_request(
+        request_timeout,
+        cancel,
+        source.fetch_chain_checkpoint_for_block(prepared.block_id, network_upgrade_activations),
+    )
+    .await?;
+    Err(CanonicalFollowError::SourceSubtreeRootMismatch {
+        height: prepared.block_id.height,
+        protocol: differing_root.protocol,
+        subtree_index: differing_root.subtree_index,
+    })
 }
 
 fn live_subtree_root_ranges(

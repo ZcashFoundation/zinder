@@ -971,6 +971,13 @@ pub(super) fn fixture_orchard_source_block() -> Result<SourceBlock, Box<dyn Erro
     )
 }
 
+pub(super) fn fixture_zakura_orchard_source_block() -> Result<SourceBlock, Box<dyn Error>> {
+    fixture_source_block_from(
+        Network::ZcashRegtest,
+        include_str!("../fixtures/zakura-1.8.6-regtest-orchard-block-111.json"),
+    )
+}
+
 fn fixture_source_block_from(
     network: Network,
     fixture_json: &str,

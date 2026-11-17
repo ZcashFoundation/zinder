@@ -21,7 +21,7 @@ use zinder_core::{
     BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeAccumulator,
     CommitmentTreeAccumulatorError, CommitmentTreeCheckpoint, Network, NetworkUpgradeActivations,
     NetworkUpgradeActivationsFingerprint, NetworkUpgradeActivationsFingerprintVersion,
-    ShieldedProtocol,
+    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex,
 };
 use zinder_source::{NodeSource, SourceBlock};
 use zinder_store::{
@@ -316,6 +316,19 @@ pub enum CanonicalConstructionError {
         /// Position derived from typed commitment-tree frontiers.
         accumulated: ChainTipMetadata,
     },
+    /// The node still holds the fixed build tip, but its root for a subtree
+    /// that a loaded block completed differs from the root derived from the
+    /// loaded blocks' note commitments.
+    #[error(
+        "source {protocol:?} subtree {} root differs from the root derived from the loaded blocks",
+        .subtree_index.value()
+    )]
+    SourceSubtreeRootMismatch {
+        /// Shielded pool of the subtree.
+        protocol: ShieldedProtocol,
+        /// First subtree whose root, index, or completing height differed.
+        subtree_index: SubtreeRootIndex,
+    },
     /// The blocking SST loader task could not complete.
     #[error("canonical loader task failed: {reason}")]
     LoaderTaskFailed {
@@ -347,6 +360,9 @@ pub struct CanonicalBlockLoadOutcome {
     /// Cache-bypassing family readback remains a separate prerequisite for
     /// publishing this build as `READY`.
     pub evidence: CanonicalBlockLoadEvidence,
+    /// Roots of the subtrees the loaded blocks completed, derived from their
+    /// note commitments, in the order the node's ranges list them.
+    pub derived_subtree_roots: Vec<CanonicalBuildSubtreeRoot>,
 }
 
 /// Complete source-family outcome ready for fresh-reopen publication validation.
@@ -429,13 +445,14 @@ where
     let CanonicalBlockLoadOutcome {
         mut builder,
         evidence: block_evidence,
+        derived_subtree_roots,
     } = block_outcome;
     validate_network_upgrade_activations(
         builder.build_plan(),
         &config.network_upgrade_activations,
     )?;
     let required_ranges = builder.required_subtree_root_ranges()?;
-    let mut subtree_roots = Vec::new();
+    let mut source_subtree_roots = Vec::new();
     for range in required_ranges {
         let source_roots = tokio::time::timeout(
             config.request_timeout,
@@ -449,7 +466,7 @@ where
         .map_err(|source| CanonicalConstructionError::Source {
             source: IngestError::from(source),
         })?;
-        subtree_roots.extend(source_roots.subtree_roots.into_iter().map(|root| {
+        source_subtree_roots.extend(source_roots.subtree_roots.into_iter().map(|root| {
             CanonicalBuildSubtreeRoot {
                 protocol: source_roots.protocol,
                 subtree_index: root.subtree_index,
@@ -458,7 +475,9 @@ where
             }
         }));
     }
-    let subtree_root_evidence = builder.load_subtree_roots(subtree_roots)?;
+    // The subtree-root reads name no block. The fixed tip is read by hash
+    // after them, so a node that no longer holds it refuses that read, and a
+    // node that does is held to the roots derived from the loaded blocks.
     let fixed_tip = builder.build_plan().build_tip();
     let source_tip_checkpoint = tokio::time::timeout(
         config.request_timeout,
@@ -472,6 +491,15 @@ where
     .map_err(|source| CanonicalConstructionError::Source {
         source: IngestError::from(source),
     })?;
+    if let Some(differing_root) =
+        first_differing_subtree_root(&derived_subtree_roots, &source_subtree_roots)
+    {
+        return Err(CanonicalConstructionError::SourceSubtreeRootMismatch {
+            protocol: differing_root.protocol,
+            subtree_index: differing_root.subtree_index,
+        });
+    }
+    let subtree_root_evidence = builder.load_subtree_roots(derived_subtree_roots)?;
     builder.confirm_source_tip_checkpoint(&source_tip_checkpoint)?;
     Ok(CanonicalSourceLoadOutcome {
         builder,
@@ -799,6 +827,7 @@ where
             active_memory_permit: None,
             running_tree_sizes: CommitmentTreeSizes::from_tip_metadata(predecessor_tip_metadata),
             commitment_tree_accumulator,
+            derived_subtree_roots: Vec::new(),
             workload,
             build_tip_height,
             cancel: loader_cancel,
@@ -806,8 +835,16 @@ where
         let evidence = builder
             .bulk_load_blocks(&mut build_blocks)
             .map_err(canonical_build_error)?;
+        let mut derived_subtree_roots = std::mem::take(&mut build_blocks.derived_subtree_roots);
         drop(build_blocks);
-        Ok(CanonicalBlockLoadOutcome { builder, evidence })
+        // Blocks complete different pools' subtrees in any order, while the
+        // node's ranges and the store's keys list one pool after another.
+        derived_subtree_roots.sort_by_key(|root| (root.protocol.id(), root.subtree_index.value()));
+        Ok(CanonicalBlockLoadOutcome {
+            builder,
+            evidence,
+            derived_subtree_roots,
+        })
     });
 
     let forwarded = cancel
@@ -851,6 +888,7 @@ struct CanonicalBuildBlockReceiver {
     active_memory_permit: Option<OwnedSemaphorePermit>,
     running_tree_sizes: CommitmentTreeSizes,
     commitment_tree_accumulator: CommitmentTreeAccumulator,
+    derived_subtree_roots: Vec<CanonicalBuildSubtreeRoot>,
     workload: CanonicalStoreWorkload,
     build_tip_height: BlockHeight,
     cancel: CancellationToken,
@@ -903,6 +941,12 @@ impl CanonicalBuildBlockReceiver {
                 &commitments.ironwood,
             )
             .map_err(|source| CanonicalConstructionError::CommitmentTreeState { height, source })?;
+        self.derived_subtree_roots.extend(
+            self.commitment_tree_accumulator
+                .completed_subtree_roots(block_hash)
+                .iter()
+                .map(build_subtree_root),
+        );
         let positioned =
             position_canonical_block(prepared, &mut self.running_tree_sizes).map_err(|source| {
                 CanonicalConstructionError::Source {
@@ -1029,6 +1073,34 @@ pub(crate) fn canonical_build_block(
         transaction_blobs,
         block_blob,
     }
+}
+
+/// Drops the completing block's hash, which the store attaches from the block
+/// it commits or retains at that height.
+pub(crate) const fn build_subtree_root(root: &SubtreeRootArtifact) -> CanonicalBuildSubtreeRoot {
+    CanonicalBuildSubtreeRoot {
+        protocol: root.protocol,
+        subtree_index: root.subtree_index,
+        root_hash: root.root_hash,
+        completing_block_height: root.completing_block_height,
+    }
+}
+
+/// Returns the first root at which the derived and node-reported subtree-root
+/// lists differ, or `None` when they are equal.
+pub(crate) fn first_differing_subtree_root(
+    derived: &[CanonicalBuildSubtreeRoot],
+    source: &[CanonicalBuildSubtreeRoot],
+) -> Option<CanonicalBuildSubtreeRoot> {
+    let common_len = derived
+        .iter()
+        .zip(source)
+        .take_while(|(derived, source)| derived == source)
+        .count();
+    derived
+        .get(common_len)
+        .or_else(|| source.get(common_len))
+        .copied()
 }
 
 fn canonical_build_error(
