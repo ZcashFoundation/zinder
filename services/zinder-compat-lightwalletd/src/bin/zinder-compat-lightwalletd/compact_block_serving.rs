@@ -44,8 +44,9 @@ use zinder_runtime::{
 use zinder_source::{NodeCapability, NodeSource};
 use zinder_store::{
     BlockHashLookup, CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload,
-    RawBlobRetention, RocksDbCanonicalSecondary, RocksDbOpenResources, RocksDbResourceBudget,
-    SharedBlockCache, StoreRole, record_shared_block_cache_gauges,
+    RawBlobRetention, ResourceGaugeThrottle, RocksDbCanonicalSecondary, RocksDbOpenResources,
+    RocksDbResourceBudget, SharedBlockCache, StoreRole, record_instance_memory_gauges,
+    record_shared_block_cache_gauges,
 };
 
 type GrpcStream<T> = std::pin::Pin<
@@ -179,6 +180,9 @@ pub(crate) struct CompactBlockPublisher {
     /// budget. It outlives each generation, so a cold open on a refresh
     /// starts with the blocks the replaced generation loaded.
     block_cache: SharedBlockCache,
+    /// Gates the memory sample of the open generations, whose table-cache
+    /// lookups are too costly to repeat on every refresh.
+    instance_memory_throttle: ResourceGaugeThrottle,
     /// Last attestation of the active reader by a following writer with a
     /// confirmed tip, and the halt the writer last reported, which
     /// writer-status failures republish.
@@ -227,10 +231,11 @@ impl CompactBlockPublisher {
             active_generation: 0,
             retired: None,
             block_cache,
+            instance_memory_throttle: ResourceGaugeThrottle::for_instance_memory(),
             writer_attestation,
             generation_activations,
         };
-        publisher.record_resource_gauges();
+        publisher.record_resource_gauges().await;
         Ok((publisher, slot))
     }
 
@@ -245,7 +250,7 @@ impl CompactBlockPublisher {
                     () = cancel.cancelled() => break,
                     () = tokio::time::sleep(self.config.catchup_interval) => {
                         self.refresh().await;
-                        self.record_resource_gauges();
+                        self.record_resource_gauges().await;
                     }
                 }
             }
@@ -446,18 +451,30 @@ impl CompactBlockPublisher {
         );
     }
 
-    /// Publishes the shared block cache and the summed memory of the active
-    /// generation and of a replaced one that requests still hold.
-    fn record_resource_gauges(&self) {
-        let active = self.slot.capture();
-        record_shared_block_cache_gauges(
-            StoreRole::CanonicalSecondary,
-            &self.block_cache,
-            std::iter::once(active.as_ref())
-                .chain(self.retired.as_deref())
-                .map(RocksDbCanonicalSecondary::instance_memory)
-                .sum(),
-        );
+    /// Publishes the shared block cache and, once per throttle interval, the
+    /// summed memory of the active generation and of a replaced one that
+    /// requests still hold.
+    ///
+    /// The memory sample looks up every table file's reader, so it runs on
+    /// the blocking pool instead of the publisher task.
+    async fn record_resource_gauges(&self) {
+        record_shared_block_cache_gauges(StoreRole::CanonicalSecondary, &self.block_cache);
+        if !self.instance_memory_throttle.should_sample() {
+            return;
+        }
+        let generations = std::iter::once(self.slot.capture())
+            .chain(self.retired.clone())
+            .collect::<Vec<_>>();
+        let sampled = tokio::task::spawn_blocking(move || {
+            generations
+                .iter()
+                .map(|generation| generation.instance_memory())
+                .sum()
+        })
+        .await;
+        if let Ok(instances) = sampled {
+            record_instance_memory_gauges(StoreRole::CanonicalSecondary, instances);
+        }
     }
 
     fn record_failure(&self, cause: ReadinessCause, height: u32) {
@@ -1388,7 +1405,8 @@ mod tests {
     use zinder_store::{
         CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalLiveAppend,
         CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreWorkload, RawBlobRetention,
-        RocksDbCanonicalBuilder, RocksDbCanonicalStore, RocksDbResourceBudget,
+        ResourceGaugeThrottle, RocksDbCanonicalBuilder, RocksDbCanonicalStore,
+        RocksDbResourceBudget,
     };
 
     fn assert_unimplemented<T>(result: Result<T, tonic::Status>) {
@@ -1842,7 +1860,8 @@ mod tests {
     /// The generation a refresh opens cold finds the blocks the active one
     /// loaded, so reading them adds nothing to the cache. While a request
     /// holds the replaced generation, the cache reports the configured
-    /// capacity once and the memtable gauge sums both open generations.
+    /// capacity once and the memtable gauge sums both open generations. The
+    /// memtable gauge changes only when the memory-sample throttle admits.
     #[tokio::test]
     #[allow(
         clippy::too_many_lines,
@@ -1930,16 +1949,23 @@ mod tests {
             "the new generation reads the block the replaced one loaded"
         );
 
-        publisher.record_resource_gauges();
-        let exposition = rendered_metrics.render();
         let gauge = |name: &str| {
-            exposition.lines().find_map(|line| {
+            rendered_metrics.render().lines().find_map(|line| {
                 line.strip_prefix(name)?
                     .strip_prefix("{store_role=\"canonical_secondary\"} ")?
                     .parse::<f64>()
                     .ok()
             })
         };
+        let generation_memtable_budget = u32::try_from(budget.memtable_budget_bytes)?;
+        publisher.record_resource_gauges().await;
+        assert_eq!(
+            gauge("zinder_store_memtable_budget_bytes"),
+            Some(f64::from(generation_memtable_budget)),
+            "the memory sample waits for its throttle interval after bootstrap"
+        );
+        publisher.instance_memory_throttle = ResourceGaugeThrottle::new(Duration::ZERO);
+        publisher.record_resource_gauges().await;
         assert_eq!(
             gauge("zinder_store_block_cache_capacity_bytes"),
             Some(f64::from(u32::try_from(budget.block_cache_bytes)?))
@@ -1950,7 +1976,7 @@ mod tests {
         );
         assert_eq!(
             gauge("zinder_store_memtable_budget_bytes"),
-            Some(f64::from(2 * u32::try_from(budget.memtable_budget_bytes)?)),
+            Some(f64::from(2 * generation_memtable_budget)),
             "the active and the held generation each keep their memtables"
         );
 

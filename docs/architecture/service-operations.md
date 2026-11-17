@@ -835,26 +835,31 @@ compactions, write stops, bytes read and written, MultiGet behavior, filter
 tickers, read latency, and startup open duration.
 
 Ingest exports these series for the canonical secondary that hydration reads
-through (`canonical_secondary`) and for its materialized-view stores
-(`materialized_view_primary` and `materialized_view_secondary`). None of those
+through (`canonical_secondary`) and for its materialized-view primary
+(`materialized_view_primary`), and Explorer exports them for its
+materialized-view secondary (`materialized_view_secondary`). None of those
 stores configures a filter, so their `rocksdb.bloom.filter.*` tickers stay at
 zero.
 
 Query and the compatibility runtime keep several secondaries of a store open
-and share one block cache per store among them. After each refresh they
-export a smaller set for each store, labelled `canonical_secondary` and, in
-wallet serving, `wallet_secondary`:
+and share one block cache per store among them. They export a smaller set for
+each store, labelled `canonical_secondary` and, in wallet serving,
+`wallet_secondary`:
 
 - `zinder_store_block_cache_capacity_bytes`,
   `zinder_store_block_cache_usage_bytes`, and
-  `zinder_store_block_cache_pinned_usage_bytes` describe the one shared cache.
-  Usage can pass capacity by the index and filter blocks that open table files
-  pin.
+  `zinder_store_block_cache_pinned_usage_bytes` describe the one shared cache
+  and update after each refresh. Usage can pass capacity by the index and
+  filter blocks that open table files pin.
 - `zinder_store_memtable_budget_bytes` and
   `zinder_store_memtable_budget_usage_bytes` sum the memtable budget and usage
   of every open generation.
 - `zinder_store_table_reader_memory_bytes` sums the table-reader memory of
   every open generation that the block cache does not hold.
+
+The memtable and table-reader sums update at most once every 15 seconds,
+because sampling table-reader memory looks up every table file's reader. A sum
+can therefore trail a generation that opened or closed since the last sample.
 
 They export no per-generation properties or tickers. A `canonical_secondary`
 series therefore describes the hydration secondary in ingest and the shared

@@ -170,19 +170,32 @@ them:
   to the block cache either.
 - The statistics object and its tickers.
 
+A serving process exports the cache gauges once per cache and sums the
+memtable and table-reader memory of its open instances. It samples that memory
+at most once every 15 seconds and off its async tasks, because the table-reader
+estimate looks up every table file's reader in the table cache, which costs
+time in proportion to the file count and reorders the table cache's LRU list.
+
 A shared cache stays a non-strict LRU. A strict limit fails reads and table
 opens with `MemoryLimit` once pinned blocks fill the cache, and in a shared
 cache one generation's pinned index and filter blocks would then fail another
 generation's catch-up, which opens table files. Pinned usage can therefore
 take the cache past its capacity. Index and filter blocks are inserted at high
 priority into a pool of half the capacity, and data blocks at low priority, so
-the data blocks that only retained generations read are evicted first.
+data reads cannot evict the metadata that table readers need. The pool does
+not rank one generation's blocks above another's. The data blocks of every
+generation compete by recency, so a retained or released pair that still
+serves reads can evict data blocks the current pair read earlier. That
+competition lasts only as long as an older pair serves reads: its retention
+window and the read limit that follows
+([ADR-0038](0038-wallet-runtime-composition-and-capability-discovery.md)).
 
-Every canonical and wallet data family pins RocksDB's `uncache_aggressiveness`
-at 0. A non-zero value makes a secondary that drops a file at catch-up erase
-that file's cached blocks, pinned ones included, while the other generations
-still read the file. RocksDB documents that the default will likely change to
-about 300. With 0, unused blocks age out of the LRU.
+Every canonical and wallet data family, and every store's `default` family,
+pins RocksDB's `uncache_aggressiveness` at 0. A non-zero value makes a
+secondary that drops a file at catch-up erase that file's cached blocks,
+pinned ones included, while the other generations still read the file. RocksDB
+documents that the default will likely change to about 300. With 0, unused
+blocks age out of the LRU.
 
 ### Locked RocksDB Invariants
 
@@ -192,6 +205,10 @@ These options are storage-layer contracts and are not operator-configurable:
 - Point-in-time recovery stays enabled through RocksDB's default recovery mode.
 - Atomic cross-CF flush stays enabled on primary stores.
 - Ordered writes stay enabled.
+- Every column family reads through the instance's bounded block cache,
+  including each store's `default` family. The open path gives the `default`
+  family the shared table factory, so RocksDB does not build the 32 MiB cache
+  it otherwise creates for that family in every instance.
 - Index blocks, and filter blocks where a family configures a filter, are
   charged to the bounded block cache through
   `cache_index_and_filter_blocks = true` and
@@ -296,8 +313,10 @@ anonymous memory.
   shares one block cache of the configured size among them, per store.
   Sharing relies on RocksDB's file-derived cache keys, keeps the cache
   non-strict, and pins `uncache_aggressiveness` at 0 on the canonical and
-  wallet data families. The table cache, memtables, and statistics stay per
-  instance.
+  wallet data families and the `default` families. The table cache, memtables, and statistics stay per
+  instance, and serving processes sample their summed memory at most every 15
+  seconds. Each store's `default` family reads through the configured cache
+  instead of a 32 MiB cache that RocksDB builds for every instance.
 - 2026-11-16: `RocksDbResourceBudget::preferred_io_mode` lets the benchmark
   harness open a store buffered without a direct attempt. No configuration
   section exposes it, and production opens are unchanged.

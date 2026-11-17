@@ -328,6 +328,13 @@ pub struct BoundedRocksDbOpen {
 
 impl BoundedRocksDbOpen {
     /// Samples the memory this instance holds outside its block cache.
+    ///
+    /// The table-reader estimate looks up the reader of every table file in
+    /// the instance's table cache, which costs time in proportion to the file
+    /// count and marks every resident reader as recently used. A caller that
+    /// samples periodically gates it with
+    /// [`ResourceGaugeThrottle::for_instance_memory`] and runs it on a
+    /// blocking thread.
     #[must_use]
     pub fn instance_memory(&self) -> RocksDbInstanceMemory {
         let table_reader_bytes = self
@@ -486,7 +493,7 @@ where
     {
         column_families.push(ColumnFamilyDescriptor::new(
             DEFAULT_COLUMN_FAMILY_NAME,
-            default_column_family_options(),
+            default_column_family_options(open_attempt.block_cache),
         ));
     }
 
@@ -512,11 +519,16 @@ where
 ///
 /// Without a descriptor of its own, `rust-rocksdb` opens this family with
 /// `Options::default()`, whose compression `RocksDB` 11.5 changed from Snappy
-/// to LZ4. Pinning Snappy keeps new control-row files in the codec that
-/// existing stores already hold; every other option keeps `RocksDB`'s default.
-fn default_column_family_options() -> Options {
+/// to LZ4 and whose table factory builds a 32 MiB block cache for each
+/// instance. Pinning Snappy keeps new control-row files in the codec that
+/// existing stores already hold, and the shared table factory makes the
+/// family read through `cache`, so the configured cache bounds every family.
+/// Every other option keeps `RocksDB`'s default.
+fn default_column_family_options(cache: &Cache) -> Options {
     let mut options = Options::default();
     options.set_compression_type(DBCompressionType::Snappy);
+    options.set_block_based_table_factory(&build_block_based_table_factory(cache));
+    keep_blocks_of_dropped_table_files(&mut options);
     options
 }
 
@@ -643,21 +655,23 @@ pub fn record_rocksdb_resource_gauges(inputs: &RocksDbResourceGaugeInputs<'_>) {
     .set(1.0);
 }
 
-/// Publishes one shared block cache and the summed memory of the instances
-/// that read through it under `store_role`.
+/// Publishes one shared block cache under `store_role`.
 ///
-/// The cache gauges describe the one cache, however many instances share it.
-/// `instances` is the sum of every open instance's
-/// [`RocksDbInstanceMemory`], so the memtable and table-reader gauges count
-/// each instance once. Per-instance properties and tickers are not exported,
-/// because the instances would overwrite one another's series.
-pub fn record_shared_block_cache_gauges(
-    store_role: StoreRole,
-    block_cache: &SharedBlockCache,
-    instances: RocksDbInstanceMemory,
-) {
+/// The gauges describe the one cache, however many instances share it.
+/// Per-instance properties and tickers are not exported, because the
+/// instances would overwrite one another's series;
+/// [`record_instance_memory_gauges`] publishes their summed memory instead.
+pub fn record_shared_block_cache_gauges(store_role: StoreRole, block_cache: &SharedBlockCache) {
+    record_block_cache_gauges(store_role.as_str(), &block_cache.cache);
+}
+
+/// Publishes the memory that the instances sharing one block cache hold
+/// outside it, under `store_role`.
+///
+/// `instances` is the sum of every open instance's [`RocksDbInstanceMemory`],
+/// so the memtable and table-reader gauges count each instance once.
+pub fn record_instance_memory_gauges(store_role: StoreRole, instances: RocksDbInstanceMemory) {
     let store_role = store_role.as_str();
-    record_block_cache_gauges(store_role, &block_cache.cache);
     metrics::gauge!("zinder_store_memtable_budget_bytes", "store_role" => store_role)
         .set(u64_to_f64(instances.memtable_budget_bytes));
     metrics::gauge!("zinder_store_memtable_budget_usage_bytes", "store_role" => store_role)
@@ -724,6 +738,14 @@ fn record_rocksdb_ticker_gauges(statistics: &Options, store_role: &'static str) 
 /// fresh sample while a commit burst probes the sweep at most once per second.
 const RESOURCE_GAUGE_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Sampling cadence for [`BoundedRocksDbOpen::instance_memory`] over a serving
+/// process's open instances.
+///
+/// Matches the 15s Prometheus scrape interval: a scrape reads a sample at most
+/// one interval old, while the table-cache lookups the sample makes run once
+/// per scrape instead of on every catch-up.
+const INSTANCE_MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_secs(15);
+
 /// Rate-limits the `RocksDB` resource-gauge sweep so a burst of small commits
 /// probes every property at most once per interval instead of once per write.
 ///
@@ -744,6 +766,13 @@ impl ResourceGaugeThrottle {
             interval,
             last_sampled_at: Mutex::new(None),
         }
+    }
+
+    /// Builds a throttle for periodic [`BoundedRocksDbOpen::instance_memory`]
+    /// samples, which admits one sample per Prometheus scrape interval.
+    #[must_use]
+    pub fn for_instance_memory() -> Self {
+        Self::new(INSTANCE_MEMORY_SAMPLE_INTERVAL)
     }
 
     /// Returns `true` when a sweep is due, recording the sample instant.
@@ -881,10 +910,10 @@ pub fn build_block_based_table_factory(cache: &Cache) -> BlockBasedOptions {
 /// Serving processes open several secondaries of one store on one
 /// [`SharedBlockCache`], and a file one of them drops at catch-up is still
 /// read through the others. A non-zero `uncache_aggressiveness` erases that
-/// file's blocks, pinned ones included, and `RocksDB` plans to raise its
-/// default from 0 to about 300. Pinning 0 leaves unused blocks to age out of
-/// the LRU instead. Apply it to every column family that reads through a
-/// block cache that may be shared.
+/// file's blocks, pinned ones included, and `RocksDB` documents that its
+/// default of 0 will likely change to about 300. Pinning 0 leaves unused
+/// blocks to age out of the LRU instead. Apply it to every column family that
+/// reads through a block cache that may be shared.
 pub fn keep_blocks_of_dropped_table_files(column_family_options: &mut Options) {
     column_family_options.set_uncache_aggressiveness(0);
 }
@@ -1221,6 +1250,186 @@ mod tests {
             bounded_open.block_cache.get_usage(),
             usize::try_from(shared.usage_bytes())?
         );
+        Ok(())
+    }
+
+    /// The `default` family, which holds the control rows, reads through the
+    /// configured cache instead of a cache `RocksDB` builds for the instance.
+    #[test]
+    fn the_default_family_reads_through_the_configured_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store_dir = tempfile::tempdir()?;
+        let budget = RocksDbResourceBudget::for_local_tests();
+        let shared = SharedBlockCache::new(budget.block_cache_bytes);
+        let bounded_open = open_bounded_rocksdb(
+            RocksDbOpenRole::Primary {
+                path: store_dir.path(),
+            },
+            RocksDbOpenResources::with_shared_block_cache(budget, &shared),
+            |_, _| Vec::new(),
+        )?;
+        bounded_open.db.put(b"control", vec![7_u8; 4096])?;
+        bounded_open.db.flush()?;
+        let cached_before_read = shared.usage_bytes();
+        assert_eq!(
+            bounded_open.db.get(b"control")?.map(|row| row.len()),
+            Some(4096)
+        );
+        assert!(shared.usage_bytes() >= cached_before_read + 4096);
+        Ok(())
+    }
+
+    #[test]
+    fn instance_memory_samples_once_per_scrape_interval() {
+        let throttle = ResourceGaugeThrottle::for_instance_memory();
+        assert_eq!(throttle.interval, Duration::from_secs(15));
+        assert!(throttle.should_sample());
+        assert!(!throttle.should_sample());
+    }
+
+    /// Bytes of each row the shared-cache isolation tests write, large enough
+    /// that a read loads a data block of its own.
+    const ISOLATION_ROW_BYTES: usize = 64 * 1024;
+
+    fn rows_family(cache: &Cache, _: RocksDbResourceBudget) -> Vec<ColumnFamilyDescriptor> {
+        let mut options = Options::default();
+        options.set_block_based_table_factory(&build_block_based_table_factory(cache));
+        keep_blocks_of_dropped_table_files(&mut options);
+        vec![ColumnFamilyDescriptor::new("rows", options)]
+    }
+
+    fn open_rows_primary(path: &Path) -> Result<BoundedRocksDbOpen, rust_rocksdb::Error> {
+        open_bounded_rocksdb(
+            RocksDbOpenRole::Primary { path },
+            RocksDbResourceBudget::for_local_tests(),
+            rows_family,
+        )
+    }
+
+    fn open_rows_secondary(
+        primary_path: &Path,
+        secondary_path: &Path,
+        cache: &SharedBlockCache,
+    ) -> Result<BoundedRocksDbOpen, rust_rocksdb::Error> {
+        open_bounded_rocksdb(
+            RocksDbOpenRole::Secondary {
+                primary_path,
+                secondary_path,
+            },
+            RocksDbOpenResources::with_shared_block_cache(
+                RocksDbResourceBudget::for_local_tests(),
+                cache,
+            ),
+            rows_family,
+        )
+    }
+
+    /// Writes `fill` repeated as the row under `key` and flushes it to a
+    /// table file.
+    fn write_row(open: &BoundedRocksDbOpen, fill: u8) -> Result<(), Box<dyn std::error::Error>> {
+        let rows = open.db.cf_handle("rows").ok_or("rows must open")?;
+        open.db
+            .put_cf(&rows, b"key", vec![fill; ISOLATION_ROW_BYTES])?;
+        open.db.flush_cf(&rows)?;
+        Ok(())
+    }
+
+    /// The outcome of one row read, apart from a missing family.
+    type RowRead = Result<Option<Vec<u8>>, rust_rocksdb::Error>;
+
+    /// Reads the row under `key`, keeping the read's own error apart from a
+    /// missing family.
+    fn read_row(open: &BoundedRocksDbOpen) -> Result<RowRead, Box<dyn std::error::Error>> {
+        let rows = open.db.cf_handle("rows").ok_or("rows must open")?;
+        Ok(open.db.get_cf(&rows, b"key"))
+    }
+
+    fn table_file_names(store: &Path) -> Result<Vec<String>, std::io::Error> {
+        let mut names = fs::read_dir(store)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "sst"))
+            .filter_map(|path| Some(path.file_name()?.to_string_lossy().into_owned()))
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        Ok(names)
+    }
+
+    /// A secondary frozen at an older epoch never reads a newer epoch's row
+    /// through the shared cache.
+    ///
+    /// It keeps reading its own row after a sibling on the same cache loads
+    /// the newer version of that row. After compaction deletes its file, it
+    /// reads its own row or fails with a missing table file.
+    #[test]
+    fn a_frozen_secondary_never_reads_a_newer_epoch_through_the_shared_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let primary_path = root.path().join("primary");
+        let primary = open_rows_primary(&primary_path)?;
+        write_row(&primary, 1)?;
+        let cache =
+            SharedBlockCache::new(RocksDbResourceBudget::for_local_tests().block_cache_bytes);
+        let frozen = open_rows_secondary(&primary_path, &root.path().join("frozen"), &cache)?;
+        let current = open_rows_secondary(&primary_path, &root.path().join("current"), &cache)?;
+        assert_eq!(read_row(&frozen)??, Some(vec![1; ISOLATION_ROW_BYTES]));
+        assert_eq!(read_row(&current)??, Some(vec![1; ISOLATION_ROW_BYTES]));
+
+        write_row(&primary, 2)?;
+        current.db.try_catch_up_with_primary()?;
+        assert_eq!(read_row(&current)??, Some(vec![2; ISOLATION_ROW_BYTES]));
+        assert_eq!(read_row(&frozen)??, Some(vec![1; ISOLATION_ROW_BYTES]));
+        assert_eq!(read_row(&current)??, Some(vec![2; ISOLATION_ROW_BYTES]));
+
+        {
+            let rows = primary.db.cf_handle("rows").ok_or("rows must open")?;
+            primary
+                .db
+                .compact_range_cf(&rows, None::<&[u8]>, None::<&[u8]>);
+        }
+        current.db.try_catch_up_with_primary()?;
+        assert_eq!(read_row(&current)??, Some(vec![2; ISOLATION_ROW_BYTES]));
+        match read_row(&frozen)? {
+            Ok(found) => assert_eq!(found, Some(vec![1; ISOLATION_ROW_BYTES])),
+            Err(error) => assert!(is_missing_table_file_error(&error), "{error}"),
+        }
+        Ok(())
+    }
+
+    /// A secondary of a recreated store never reads the old store's blocks.
+    ///
+    /// The store recreated at the same path reuses the old table-file
+    /// numbers, and a secondary of the new store on the warm cache still
+    /// reads the new store's row.
+    #[test]
+    fn a_recreated_store_never_reads_the_old_stores_blocks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let primary_path = root.path().join("primary");
+        let secondary_path = root.path().join("secondary");
+        let cache =
+            SharedBlockCache::new(RocksDbResourceBudget::for_local_tests().block_cache_bytes);
+        let old_files = {
+            let primary = open_rows_primary(&primary_path)?;
+            write_row(&primary, 1)?;
+            let secondary = open_rows_secondary(&primary_path, &secondary_path, &cache)?;
+            assert_eq!(read_row(&secondary)??, Some(vec![1; ISOLATION_ROW_BYTES]));
+            table_file_names(&primary_path)?
+        };
+        let cached_old = cache.usage_bytes();
+        fs::remove_dir_all(&primary_path)?;
+        fs::remove_dir_all(&secondary_path)?;
+
+        let primary = open_rows_primary(&primary_path)?;
+        write_row(&primary, 2)?;
+        assert_eq!(
+            table_file_names(&primary_path)?,
+            old_files,
+            "the recreated store must reuse the old table-file numbers"
+        );
+        let secondary = open_rows_secondary(&primary_path, &secondary_path, &cache)?;
+        assert_eq!(read_row(&secondary)??, Some(vec![2; ISOLATION_ROW_BYTES]));
+        assert!(cache.usage_bytes() > cached_old);
         Ok(())
     }
 
