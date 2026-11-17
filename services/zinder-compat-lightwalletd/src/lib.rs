@@ -9,8 +9,9 @@ mod grpc;
 mod mempool;
 
 pub use block_range::{
-    BLOCK_RANGE_CHUNK_MAX_BYTES, BlockRangeChunks, BlockRangeContinuity, BlockRangeStreamLimit,
-    BlockRangeStreamSlot, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
+    BLOCK_RANGE_CHUNK_MAX_BYTES, BlockRangeChunks, BlockRangeContinuity, BlockRangeResponse,
+    BlockRangeSink, BlockRangeStreamLimit, BlockRangeStreamSlot,
+    DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
 };
 pub use grpc::{
     DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS, DEFAULT_MAX_LIGHTWALLETD_SUBTREE_ROOTS,

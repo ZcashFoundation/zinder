@@ -28,7 +28,7 @@ use zinder_query::{
 #[global_allocator]
 static GLOBAL_ALLOCATOR: zinder_runtime::RuntimeAllocator = zinder_runtime::RuntimeAllocator;
 
-/// Most concurrent HTTP/2 streams one client connection may open.
+/// Maximum concurrent HTTP/2 streams on one client connection.
 ///
 /// tonic otherwise advertises no limit, which also removes hyper's own
 /// server default of 200; this restores that value.
@@ -333,6 +333,8 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         network = encode_zinder_native_chain_name(lightwalletd_config.network),
         listen_addr = %lightwalletd_config.listen_addr,
         visible_height = ?visible_height,
+        max_concurrent_block_range_streams =
+            lightwalletd_config.max_concurrent_block_range_streams.get(),
         "lightwalletd-compatible gRPC server started"
     );
 
@@ -548,6 +550,8 @@ async fn run_compact_blocks(
         network = encode_zinder_native_chain_name(lightwalletd_config.network),
         listen_addr = %lightwalletd_config.listen_addr,
         visible_height = ?visible_height,
+        max_concurrent_block_range_streams =
+            lightwalletd_config.max_concurrent_block_range_streams.get(),
         "lightwalletd-compatible gRPC server started"
     );
     let reflection_service = tonic_reflection::server::Builder::configure()

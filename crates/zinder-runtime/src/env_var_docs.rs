@@ -905,10 +905,10 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-compat-lightwalletd"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Most `GetBlockRange` and `GetBlockRangeNullifiers` streams compatibility \
-                      serves at once. A request past the limit fails with \
-                      `RESOURCE_EXHAUSTED` before any read. Must be in 1..=65536; defaults to \
-                      100.",
+        description: "Maximum concurrent `GetBlockRange` and `GetBlockRangeNullifiers` \
+                      streams the compatibility server serves. A valid request past the limit \
+                      fails with `RESOURCE_EXHAUSTED` before any read. Must be in 1..=65536; \
+                      defaults to 100.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__BLOCK_CACHE_BYTES",

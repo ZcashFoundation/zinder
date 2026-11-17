@@ -391,10 +391,7 @@ pub enum HeightOrder {
     Descending,
 }
 
-/// Rows one batch of a byte-bounded compact-block read fetches.
-///
-/// Small, so the rows fetched past the point where the budget stops the read
-/// stay few. They are released before the read returns.
+/// Most rows one batch of a byte-bounded compact-block read fetches.
 const BOUNDED_COMPACT_BLOCK_BATCH_SIZE: usize = 16;
 
 fn read_compact_blocks_up_to(
@@ -410,19 +407,33 @@ fn read_compact_blocks_up_to(
             height,
         });
     }
-    let (start, end) = (range.start.value(), range.end.value());
-    let heights: Vec<BlockHeight> = match order {
-        HeightOrder::Ascending => (start..=end).map(BlockHeight::new).collect(),
-        HeightOrder::Descending => (start..=end).rev().map(BlockHeight::new).collect(),
+    let mut unread = range.start.value()..=range.end.value();
+    let mut next_height = || {
+        match order {
+            HeightOrder::Ascending => unread.next(),
+            HeightOrder::Descending => unread.next_back(),
+        }
+        .map(BlockHeight::new)
     };
     let mut blocks = Vec::new();
     let mut kept_bytes = 0_usize;
-    'batches: for batch in heights.chunks(BOUNDED_COMPACT_BLOCK_BATCH_SIZE) {
-        let rows = CompactBlockRows::fetch(store, batch)?;
+    let mut largest_row_bytes = 0_usize;
+    let is_budget_spent = |blocks: &[CompactBlockArtifact], kept_bytes: usize| {
+        !blocks.is_empty() && kept_bytes >= max_bytes
+    };
+    'batches: while !is_budget_spent(&blocks, kept_bytes) {
+        let batch_len = bounded_batch_len(max_bytes.saturating_sub(kept_bytes), largest_row_bytes);
+        let batch = std::iter::from_fn(&mut next_height)
+            .take(batch_len)
+            .collect::<Vec<_>>();
+        if batch.is_empty() {
+            break;
+        }
+        let rows = CompactBlockRows::fetch(store, &batch)?;
         for ((height, compact_row), header_row) in
             batch.iter().copied().zip(rows.compact).zip(rows.headers)
         {
-            if !blocks.is_empty() && kept_bytes >= max_bytes {
+            if is_budget_spent(&blocks, kept_bytes) {
                 break 'batches;
             }
             let encoded_compact_block = present_compact_row(retained_span, height, compact_row)?;
@@ -431,6 +442,7 @@ fn read_compact_blocks_up_to(
                 break 'batches;
             }
             kept_bytes = kept_bytes.saturating_add(row_bytes);
+            largest_row_bytes = largest_row_bytes.max(row_bytes);
             blocks.push(decode_compact_block_row(
                 height,
                 &encoded_compact_block,
@@ -442,6 +454,23 @@ fn read_compact_blocks_up_to(
         blocks.reverse();
     }
     Ok(blocks)
+}
+
+/// Rows the next batch of a byte-bounded read fetches.
+///
+/// That is as many as `remaining_bytes` holds at the size of the largest row
+/// read so far, from one to [`BOUNDED_COMPACT_BLOCK_BATCH_SIZE`], and one
+/// before any row is read.
+///
+/// A batch pins every row it fetches until the read has walked it, including
+/// the rows past the point where the budget stops the read. Sizing each batch
+/// to the budget left keeps those rows within that budget as long as no row is
+/// larger than the largest already read.
+fn bounded_batch_len(remaining_bytes: usize, largest_row_bytes: usize) -> usize {
+    remaining_bytes
+        .checked_div(largest_row_bytes)
+        .unwrap_or(1)
+        .clamp(1, BOUNDED_COMPACT_BLOCK_BATCH_SIZE)
 }
 
 /// Heights from the first retained block through the visible tip.
@@ -971,4 +1000,29 @@ fn read_array<const LENGTH: usize>(
         .get(offset..offset.saturating_add(LENGTH))
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or_else(|| CanonicalStoreError::publication("version-1 serving value is truncated"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BOUNDED_COMPACT_BLOCK_BATCH_SIZE, bounded_batch_len};
+
+    #[test]
+    fn a_bounded_batch_fits_the_budget_left_at_the_largest_row_read() {
+        // Before any row is read, a batch fetches one row to learn its size.
+        assert_eq!(bounded_batch_len(2 * 1024 * 1024, 0), 1);
+        assert_eq!(bounded_batch_len(0, 0), 1);
+        // Small rows fill the largest batch.
+        assert_eq!(
+            bounded_batch_len(2 * 1024 * 1024, 1_000),
+            BOUNDED_COMPACT_BLOCK_BATCH_SIZE
+        );
+        // Rows of about 250 KB fit 8 times in 2 MiB, and 3 times in what is
+        // left after 5 of them.
+        assert_eq!(bounded_batch_len(2 * 1024 * 1024, 250_000), 8);
+        assert_eq!(bounded_batch_len(2 * 1024 * 1024 - 5 * 250_000, 250_000), 3);
+        // A row larger than the budget left is still fetched alone, to find
+        // where the read stops.
+        assert_eq!(bounded_batch_len(100_000, 250_000), 1);
+        assert_eq!(bounded_batch_len(0, 250_000), 1);
+    }
 }

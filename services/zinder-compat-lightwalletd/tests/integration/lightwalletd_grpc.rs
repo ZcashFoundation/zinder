@@ -1275,6 +1275,99 @@ async fn block_range_streams_past_the_limit_are_refused_until_a_slot_returns() -
     Ok(())
 }
 
+/// Validation runs before a request takes a block-range stream slot, so a
+/// malformed request gets `INVALID_ARGUMENT` however many streams are open.
+#[tokio::test]
+async fn malformed_block_range_requests_are_rejected_before_the_stream_limit() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let recorder = EpochPinRecorder::new(store_fixture.query())
+        .with_synthetic_compact_blocks_to(BlockHeight::new(2_500));
+    let adapter = LightwalletdGrpcAdapter::new(recorder)
+        .with_max_concurrent_block_range_streams(NonZeroU32::MIN);
+    let open_stream = adapter
+        .get_block_range(Request::new(block_range_request(1, 10)))
+        .await?;
+    assert_eq!(
+        adapter
+            .get_block_range(Request::new(block_range_request(11, 20)))
+            .await
+            .err()
+            .map(|status| status.code()),
+        Some(Code::ResourceExhausted),
+        "the open stream takes the only slot"
+    );
+
+    for malformed in [
+        lightwalletd::BlockRange {
+            start: None,
+            ..block_range_request(1, 10)
+        },
+        lightwalletd::BlockRange {
+            pool_types: vec![999],
+            ..block_range_request(1, 10)
+        },
+    ] {
+        assert_eq!(
+            adapter
+                .get_block_range(Request::new(malformed))
+                .await
+                .err()
+                .map(|status| status.code()),
+            Some(Code::InvalidArgument),
+            "a malformed request at the limit must still be INVALID_ARGUMENT"
+        );
+    }
+    assert_eq!(
+        adapter
+            .get_block_range_nullifiers(Request::new(lightwalletd::BlockRange {
+                end: None,
+                ..block_range_request(1, 10)
+            }))
+            .await
+            .err()
+            .map(|status| status.code()),
+        Some(Code::InvalidArgument),
+        "a malformed nullifier request at the limit must still be INVALID_ARGUMENT"
+    );
+    drop(open_stream);
+    Ok(())
+}
+
+/// The reader of a stream's later chunks keeps the stream's slot while it
+/// reads, even after the client dropped the stream, so the next stream is
+/// admitted only once that read has finished.
+#[tokio::test]
+async fn a_dropped_block_range_stream_keeps_its_slot_until_its_reader_stops() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let later_chunk_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let recorder = EpochPinRecorder::new(store_fixture.query())
+        .with_synthetic_compact_blocks_to(BlockHeight::new(2_500))
+        .with_later_chunk_gate(Arc::clone(&later_chunk_gate));
+    let adapter = LightwalletdGrpcAdapter::new(recorder)
+        .with_max_concurrent_block_range_streams(NonZeroU32::MIN);
+
+    let wide = adapter
+        .get_block_range(Request::new(block_range_request(1, 2_500)))
+        .await?
+        .into_inner();
+    drop(wide);
+    // Give the reader time to reach the held read of its second chunk.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        adapter
+            .get_block_range(Request::new(block_range_request(1, 10)))
+            .await
+            .err()
+            .map(|status| status.code()),
+        Some(Code::ResourceExhausted),
+        "the reader of a dropped stream must keep its slot while it reads"
+    );
+
+    later_chunk_gate.add_permits(1);
+    wait_for_block_range_slot(&adapter).await?;
+    Ok(())
+}
+
 /// A client that disconnects in the middle of a stream returns its slot, and
 /// the refusal reaches a generated client as `RESOURCE_EXHAUSTED`.
 #[tokio::test]
@@ -1593,6 +1686,9 @@ struct EpochPinRecorder<Inner> {
     completed_compact_block_reads: Arc<AtomicUsize>,
     /// Epoch of the view that answered each successful compact-block range read.
     served_compact_block_epochs: Arc<Mutex<Vec<ChainEpochId>>>,
+    /// Holds every unpinned compact-block range read, the read of a later
+    /// block-range chunk, until it has a permit.
+    later_chunk_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl<Inner> EpochPinRecorder<Inner> {
@@ -1606,7 +1702,15 @@ impl<Inner> EpochPinRecorder<Inner> {
             later_views: Arc::from(Vec::new()),
             completed_compact_block_reads: Arc::new(AtomicUsize::new(0)),
             served_compact_block_epochs: Arc::new(Mutex::new(Vec::new())),
+            later_chunk_gate: None,
         }
+    }
+
+    /// Holds the read of every later block-range chunk until `gate` has a
+    /// permit. Each read returns the permit it took.
+    fn with_later_chunk_gate(mut self, gate: Arc<tokio::sync::Semaphore>) -> Self {
+        self.later_chunk_gate = Some(gate);
+        self
     }
 
     fn with_transparent_address_balance(
@@ -1945,6 +2049,11 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         max_bytes: usize,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockRange, QueryError> {
+        if at_epoch_id.is_none()
+            && let Some(gate) = &self.later_chunk_gate
+        {
+            let _permit = gate.acquire().await;
+        }
         self.record(at_epoch_id);
         let view_index = self.view_index();
         let compact_block_range = if let Some(view) = self.synthetic_view(view_index) {

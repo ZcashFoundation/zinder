@@ -23,12 +23,18 @@
 use std::{
     num::NonZeroU32,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
     task::{Context, Poll},
 };
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio_stream::Stream;
+use tokio::sync::{
+    OwnedSemaphorePermit, Semaphore,
+    mpsc::{self, error::SendError},
+};
+use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 use tonic::Status;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, CompactBlockArtifact,
@@ -146,14 +152,19 @@ impl BlockRangeChunks {
     }
 }
 
+/// Gauge of the block-range streams that hold a slot.
+const OPEN_STREAMS_GAUGE: &str = "zinder_compat_block_range_streams_open";
+
 /// Process-wide limit on concurrent `GetBlockRange` and
 /// `GetBlockRangeNullifiers` streams.
 ///
-/// Clones share one limit. A stream takes a slot when its request arrives and
-/// returns it when the stream ends, fails, or the client goes away.
+/// Clones share one limit. A stream takes a slot after its request passes
+/// validation and returns it when the stream ends, fails, or the client goes
+/// away.
 #[derive(Clone, Debug)]
 pub struct BlockRangeStreamLimit {
-    open_streams: Arc<Semaphore>,
+    slots: Arc<Semaphore>,
+    open_streams: Arc<AtomicU32>,
     max_streams: NonZeroU32,
 }
 
@@ -164,8 +175,10 @@ impl BlockRangeStreamLimit {
         let permits = usize::try_from(max_streams.get())
             .unwrap_or(Semaphore::MAX_PERMITS)
             .min(Semaphore::MAX_PERMITS);
+        metrics::gauge!(OPEN_STREAMS_GAUGE).set(0.0);
         Self {
-            open_streams: Arc::new(Semaphore::new(permits)),
+            slots: Arc::new(Semaphore::new(permits)),
+            open_streams: Arc::new(AtomicU32::new(0)),
             max_streams,
         }
     }
@@ -183,41 +196,129 @@ impl BlockRangeStreamLimit {
     /// Returns `RESOURCE_EXHAUSTED` when every slot is taken, and counts the
     /// refusal in `zinder_compat_block_range_stream_refusals_total`.
     pub fn try_open(&self) -> Result<BlockRangeStreamSlot, Status> {
-        let Ok(permit) = Arc::clone(&self.open_streams).try_acquire_owned() else {
+        let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() else {
             metrics::counter!("zinder_compat_block_range_stream_refusals_total").increment(1);
             return Err(Status::resource_exhausted(format!(
-                "this server is serving its limit of {} concurrent block-range streams; retry \
-                 later",
+                "this server already serves its limit of {} concurrent block-range streams",
                 self.max_streams
             )));
         };
         Ok(BlockRangeStreamSlot {
-            _permit: Arc::new(permit),
+            _open_stream: Arc::new(OpenStream::new(permit, Arc::clone(&self.open_streams))),
         })
     }
 }
 
+/// A taken slot, counted in `zinder_compat_block_range_streams_open` until it
+/// is dropped.
+#[derive(Debug)]
+struct OpenStream {
+    _permit: OwnedSemaphorePermit,
+    open_streams: Arc<AtomicU32>,
+}
+
+impl OpenStream {
+    fn new(permit: OwnedSemaphorePermit, open_streams: Arc<AtomicU32>) -> Self {
+        let open = open_streams
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        metrics::gauge!(OPEN_STREAMS_GAUGE).set(f64::from(open));
+        Self {
+            _permit: permit,
+            open_streams,
+        }
+    }
+}
+
+impl Drop for OpenStream {
+    fn drop(&mut self) {
+        let open = self
+            .open_streams
+            .fetch_sub(1, Ordering::Relaxed)
+            .saturating_sub(1);
+        metrics::gauge!(OPEN_STREAMS_GAUGE).set(f64::from(open));
+    }
+}
+
+/// A block-range response: the blocks a stream sends, in wire order.
+pub type BlockRangeResponse<Message> = Pin<Box<dyn Stream<Item = Message> + Send + 'static>>;
+
 /// One stream's slot of a [`BlockRangeStreamLimit`].
 ///
-/// Clones share the slot, which returns to the limit when the last clone is
-/// dropped. A stream's response and its background reader each hold a clone,
-/// so the slot stays taken while either can still hold blocks.
+/// The slot returns to the limit when the response it holds is dropped and,
+/// for a stream of more than one chunk, the [`BlockRangeSink`] of the stream's
+/// reader is dropped too.
 #[derive(Clone, Debug)]
 pub struct BlockRangeStreamSlot {
-    _permit: Arc<OwnedSemaphorePermit>,
+    _open_stream: Arc<OpenStream>,
 }
 
 impl BlockRangeStreamSlot {
-    /// Returns `stream` holding this slot until the stream is dropped.
+    /// Returns a response that sends `messages` and holds this slot until it
+    /// is dropped.
     #[must_use]
-    pub fn hold_for<Item: 'static>(
+    pub fn hold_for<Message: Send + 'static>(
         self,
-        stream: Pin<Box<dyn Stream<Item = Item> + Send + 'static>>,
-    ) -> Pin<Box<dyn Stream<Item = Item> + Send + 'static>> {
+        messages: Vec<Message>,
+    ) -> BlockRangeResponse<Message> {
+        self.hold_for_stream(Box::pin(tokio_stream::iter(messages)))
+    }
+
+    /// Returns a response that sends `first_messages` and then what `reader`
+    /// queues, at most `capacity` messages ahead of the client, and spawns
+    /// `reader` to read the later chunks.
+    ///
+    /// The response and the reader's sink each hold this slot, so the reader
+    /// keeps the slot while it reads, even after the client has gone away.
+    #[must_use]
+    pub fn hold_with_reader<Message, Reader>(
+        self,
+        first_messages: Vec<Message>,
+        capacity: usize,
+        reader: impl FnOnce(BlockRangeSink<Message>) -> Reader,
+    ) -> BlockRangeResponse<Message>
+    where
+        Message: Send + 'static,
+        Reader: Future<Output = ()> + Send + 'static,
+    {
+        let (messages, queued_messages) = mpsc::channel(capacity);
+        tokio::spawn(reader(BlockRangeSink {
+            messages,
+            _stream_slot: self.clone(),
+        }));
+        self.hold_for_stream(Box::pin(
+            tokio_stream::iter(first_messages).chain(ReceiverStream::new(queued_messages)),
+        ))
+    }
+
+    fn hold_for_stream<Message: 'static>(
+        self,
+        stream: BlockRangeResponse<Message>,
+    ) -> BlockRangeResponse<Message> {
         Box::pin(SlotHoldingStream {
             stream,
             _slot: self,
         })
+    }
+}
+
+/// Where the reader of a stream's later chunks queues their messages.
+///
+/// It holds the stream's slot until the reader drops it.
+#[derive(Debug)]
+pub struct BlockRangeSink<Message> {
+    messages: mpsc::Sender<Message>,
+    _stream_slot: BlockRangeStreamSlot,
+}
+
+impl<Message> BlockRangeSink<Message> {
+    /// Queues `message` for the client, waiting while the queue is full.
+    ///
+    /// # Errors
+    ///
+    /// Returns the message when the client has dropped the response.
+    pub async fn send(&self, message: Message) -> Result<(), SendError<Message>> {
+        self.messages.send(message).await
     }
 }
 

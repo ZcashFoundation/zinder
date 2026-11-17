@@ -7,13 +7,12 @@
 use std::{num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
-use tokio::{sync::mpsc, task::JoinHandle};
-use tokio_stream::{StreamExt, wrappers::ReceiverStream};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 use zinder_compat_lightwalletd::{
-    BLOCK_RANGE_CHUNK_MAX_BYTES, BlockRangeChunks, BlockRangeContinuity, BlockRangeStreamLimit,
-    BlockRangeStreamSlot, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
+    BLOCK_RANGE_CHUNK_MAX_BYTES, BlockRangeChunks, BlockRangeContinuity, BlockRangeSink,
+    BlockRangeStreamLimit, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
     compact_transaction_has_payload,
 };
 use zinder_core::{
@@ -795,8 +794,6 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlockAdapter {
         &self,
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<Self::GetBlockRangeStream>, Status> {
-        let stream_slot = self.block_range_streams.try_open()?;
-        let reader = self.reader();
         let request = request.into_inner();
         let start = request
             .start
@@ -818,13 +815,15 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlockAdapter {
         } else {
             BlockHeightRange::inclusive(start, end)
         };
+        let pool_selection = pool_selection_from_request(&request.pool_types)?;
+        let stream_slot = self.block_range_streams.try_open()?;
+        let reader = self.reader();
         let epoch = reader.chain_epoch().map_err(store_status)?;
         if range.end > epoch.visible_tip_height {
             return Err(Status::out_of_range(
                 "requested range is newer than latest block",
             ));
         }
-        let pool_selection = pool_selection_from_request(&request.pool_types)?;
         let encoding = ChunkEncoding {
             selection: pool_selection,
             descending,
@@ -837,24 +836,14 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlockAdapter {
         )
         .await?;
         let Some((chunks, continuity)) = later_chunks else {
-            return Ok(Response::new(
-                stream_slot.hold_for(Box::pin(tokio_stream::iter(first_messages))),
-            ));
+            return Ok(Response::new(stream_slot.hold_for(first_messages)));
         };
-        let (sender, receiver) = mpsc::channel(RANGE_CHANNEL_CAPACITY);
-        tokio::spawn(stream_later_chunks(
-            self.slot.clone(),
-            chunks,
-            continuity,
-            encoding,
-            RangeSink {
-                messages: sender,
-                _stream_slot: stream_slot.clone(),
-            },
-        ));
-        Ok(Response::new(stream_slot.hold_for(Box::pin(
-            tokio_stream::iter(first_messages).chain(ReceiverStream::new(receiver)),
-        ))))
+        let slot = self.slot.clone();
+        Ok(Response::new(stream_slot.hold_with_reader(
+            first_messages,
+            RANGE_CHANNEL_CAPACITY,
+            |sink| stream_later_chunks(slot, chunks, continuity, encoding, sink),
+        )))
     }
 
     async fn get_block_nullifiers(
@@ -1009,15 +998,6 @@ struct ChunkEncoding {
 
 type ChunkMessages = Vec<Result<lightwalletd::CompactBlock, Status>>;
 
-/// Where the reader of later chunks queues their blocks.
-///
-/// It holds the stream's slot, so the slot stays taken until the reader
-/// stops, even after the client has gone away.
-struct RangeSink {
-    messages: mpsc::Sender<Result<lightwalletd::CompactBlock, Status>>,
-    _stream_slot: BlockRangeStreamSlot,
-}
-
 /// Reads and encodes the first chunk of a range at `reader`, the generation
 /// the request's bounds were checked against.
 ///
@@ -1071,7 +1051,7 @@ async fn stream_later_chunks(
     mut chunks: BlockRangeChunks,
     mut continuity: BlockRangeContinuity,
     encoding: ChunkEncoding,
-    sink: RangeSink,
+    sink: BlockRangeSink<Result<lightwalletd::CompactBlock, Status>>,
 ) {
     while chunks.has_remaining() {
         let read = tokio::task::spawn_blocking({
@@ -1089,16 +1069,16 @@ async fn stream_later_chunks(
                 messages
             }
             Ok((_, _, Err(status))) => {
-                let _ = sink.messages.send(Err(status)).await;
+                let _ = sink.send(Err(status)).await;
                 return;
             }
             Err(error) => {
-                let _ = sink.messages.send(Err(range_worker_failed(&error))).await;
+                let _ = sink.send(Err(range_worker_failed(&error))).await;
                 return;
             }
         };
         for message in messages {
-            if sink.messages.send(message).await.is_err() {
+            if sink.send(message).await.is_err() {
                 return;
             }
         }
@@ -2824,10 +2804,12 @@ mod tests {
     }
 
     /// Compact-blocks serving refuses a block-range stream past the
-    /// process-wide limit with `RESOURCE_EXHAUSTED`.
+    /// process-wide limit with `RESOURCE_EXHAUSTED`, after it rejects a
+    /// malformed request.
     ///
-    /// A stream wider than one chunk keeps its slot while its reader runs and
-    /// returns it once the client drops the stream.
+    /// A stream wider than one chunk keeps its slot while its reader runs.
+    /// Once the client drops the stream, the slot returns when the reader
+    /// stops.
     #[tokio::test]
     async fn block_range_streams_past_the_limit_are_refused_until_a_slot_returns()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2857,8 +2839,29 @@ mod tests {
             refused.err().map(|status| status.code()),
             Some(Code::ResourceExhausted)
         );
+        // A malformed request is rejected before it takes a slot.
+        let malformed = adapter
+            .get_block_range(Request::new(lightwalletd::BlockRange {
+                pool_types: vec![999],
+                ..block_range(1, 4)
+            }))
+            .await;
+        assert_eq!(
+            malformed.err().map(|status| status.code()),
+            Some(Code::InvalidArgument)
+        );
 
         drop(stream);
+        // The test runtime has one thread, so the reader of later chunks has
+        // not run since the stream was dropped. It still holds the slot.
+        let held = adapter
+            .get_block_range(Request::new(block_range(1, 4)))
+            .await;
+        assert_eq!(
+            held.err().map(|status| status.code()),
+            Some(Code::ResourceExhausted),
+            "the reader of a dropped stream must keep its slot until it stops"
+        );
         let admitted = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 match adapter

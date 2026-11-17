@@ -4,9 +4,8 @@ use std::{num::NonZeroU32, pin::Pin};
 
 use serde_json::Value;
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio_stream as stream;
 use tokio_stream::StreamExt as _;
-use tokio_stream::{self as stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status};
 use zebra_chain::transparent::Address as ZebraTransparentAddress;
 use zinder_core::wire::WireDecodeError;
@@ -37,8 +36,8 @@ use zinder_source::transparent_address_matches_network;
 use zinder_store::{MempoolEvent, RawBlobRetention};
 
 use crate::block_range::{
-    BLOCK_RANGE_CHUNK_MAX_BYTES, BlockRangeChunks, BlockRangeContinuity, BlockRangeStreamLimit,
-    BlockRangeStreamSlot, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
+    BLOCK_RANGE_CHUNK_MAX_BYTES, BlockRangeChunks, BlockRangeContinuity, BlockRangeSink,
+    BlockRangeStreamLimit, BlockRangeStreamSlot, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
 };
 use crate::mempool::{
     MempoolSnapshotPage, MempoolSurfaceError, MempoolTransactionLookup, SharedMempoolSurface,
@@ -591,11 +590,11 @@ where
         &self,
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<Self::GetBlockRangeStream>, Status> {
-        let stream_slot = self.block_range_streams.try_open()?;
-        let chain_view = self.entry_chain_view().await?;
         let block_range_request = request.into_inner();
         let pool_selection = pool_selection_from_request(&block_range_request.pool_types)?;
         let (block_range, is_descending) = block_range_from_request(&block_range_request)?;
+        let stream_slot = self.block_range_streams.try_open()?;
+        let chain_view = self.entry_chain_view().await?;
         reject_future_block_height(block_range.end, chain_view.visible_tip_height)?;
         Ok(Response::new(
             stream_compact_block_range(
@@ -619,10 +618,10 @@ where
         &self,
         request: Request<lightwalletd::BlockRange>,
     ) -> Result<Response<Self::GetBlockRangeNullifiersStream>, Status> {
-        let stream_slot = self.block_range_streams.try_open()?;
-        let chain_view = self.entry_chain_view().await?;
         let block_range_request = request.into_inner();
         let (block_range, is_descending) = block_range_from_request(&block_range_request)?;
+        let stream_slot = self.block_range_streams.try_open()?;
+        let chain_view = self.entry_chain_view().await?;
         reject_future_block_height(block_range.end, chain_view.visible_tip_height)?;
         Ok(Response::new(
             stream_compact_block_range(
@@ -1075,7 +1074,7 @@ where
     chunks.advance(first_range.compact_blocks.len());
     if !chunks.has_remaining() {
         let first_messages = encode_compact_block_chunk(first_range.compact_blocks, window);
-        return Ok(stream_slot.hold_for(Box::pin(stream::iter(first_messages))));
+        return Ok(stream_slot.hold_for(first_messages));
     }
     let continuity = BlockRangeContinuity::after_first_chunk(
         &first_range.compact_blocks,
@@ -1083,30 +1082,11 @@ where
         window.is_descending,
     )?;
     let first_messages = encode_compact_block_chunk(first_range.compact_blocks, window);
-
-    let (message_sender, message_receiver) = mpsc::channel(COMPACT_BLOCK_STREAM_CHANNEL_CAPACITY);
-    tokio::spawn(drive_compact_block_range(
-        query_api,
-        chunks,
-        window,
-        continuity,
-        BlockRangeSink {
-            messages: message_sender,
-            _stream_slot: stream_slot.clone(),
-        },
-    ));
-    Ok(stream_slot.hold_for(Box::pin(
-        stream::iter(first_messages).chain(ReceiverStream::new(message_receiver)),
-    )))
-}
-
-/// Where the reader of later chunks queues their blocks.
-///
-/// It holds the stream's slot, so the slot stays taken until the reader
-/// stops, even after the client has gone away.
-struct BlockRangeSink {
-    messages: mpsc::Sender<Result<lightwalletd::CompactBlock, Status>>,
-    _stream_slot: BlockRangeStreamSlot,
+    Ok(stream_slot.hold_with_reader(
+        first_messages,
+        COMPACT_BLOCK_STREAM_CHANNEL_CAPACITY,
+        |sink| drive_compact_block_range(query_api, chunks, window, continuity, sink),
+    ))
 }
 
 /// Reads every chunk after the first and forwards its blocks to the sink.
@@ -1119,7 +1099,7 @@ async fn drive_compact_block_range<QueryApi>(
     mut chunks: BlockRangeChunks,
     window: CompactBlockWindow,
     mut continuity: BlockRangeContinuity,
-    sink: BlockRangeSink,
+    sink: BlockRangeSink<Result<lightwalletd::CompactBlock, Status>>,
 ) where
     QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
 {
@@ -1128,14 +1108,14 @@ async fn drive_compact_block_range<QueryApi>(
             match read_continuation_chunk(&query_api, chunk, &chunks, &mut continuity).await {
                 Ok(compact_blocks) => compact_blocks,
                 Err(status) => {
-                    let _ = sink.messages.send(Err(status)).await;
+                    let _ = sink.send(Err(status)).await;
                     return;
                 }
             };
         chunks.advance(compact_blocks.len());
         for message in encode_compact_block_chunk(compact_blocks, window) {
             let is_terminal = message.is_err();
-            if sink.messages.send(message).await.is_err() || is_terminal {
+            if sink.send(message).await.is_err() || is_terminal {
                 return;
             }
         }

@@ -552,6 +552,16 @@ response would still contain a block whose parent is not the block sent
 before it, so a client could not trust one `OK` stream as one chain. Ending
 the stream lets the wallet read the new branch in a fresh request.
 
+### Size each block-range chunk from the blocks of the chunk before it
+
+A size derived from the previous chunk's average block is a target, not a
+bound. The first chunk has no chunk before it, and a chunk that enters dense
+blocks after sparse ones is sized for the sparse ones, so either can hold
+1,000 dense blocks. A read that stops at a byte budget bounds every chunk,
+the first included. The budget is fixed rather than configurable, because the
+documented memory bound of one stream, and the stream limit operators size
+from it, assume it.
+
 ### End a block-range stream with `CHAIN_EPOCH_PIN_UNAVAILABLE`
 
 The reason would gain a second failure mode, and a lightwalletd client has no

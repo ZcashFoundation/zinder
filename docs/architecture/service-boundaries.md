@@ -61,8 +61,9 @@ that pair for its full lifetime. Multi-page reads bind their resume cursor to
 the admitted source and fail closed if publication advances between pages. A
 lightwalletd `GetBlockRange` or `GetBlockRangeNullifiers` stream of more than
 one chunk, at most 1,000 blocks and 2 MiB each, is the exception: it holds a
-pair only while it reads one chunk, reads each chunk at the pair current when it reads it, and ends when a
-chunk does not link by hash to the last block it sent
+pair only while it reads one chunk, reads each chunk at the pair current when
+it reads it, and ends when a chunk does not link by hash to the last block it
+sent
 ([ADR-0038](../adrs/0038-wallet-runtime-composition-and-capability-discovery.md#compatibility-block-range-streams)).
 
 The supported topology is `rocksdb-single-host`. Primaries and secondaries

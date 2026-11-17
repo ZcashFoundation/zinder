@@ -805,11 +805,17 @@ target, with `last_sent_height`, `sent_chain_epoch`, `current_chain_epoch`,
 `next_chunk_start`, and `next_chunk_end`. Enable `debug` for that target to
 see whether long streams cross publications. The event has no metric.
 
+`zinder_compat_block_range_streams_open` reports how many block-range
+streams hold a slot of `compat.max_concurrent_block_range_streams`, which the
+`compat_started` log records as `max_concurrent_block_range_streams`. Compare
+its peaks with the limit to see how close wallets come to it.
 `zinder_compat_block_range_stream_refusals_total` counts block-range requests
-refused with `RESOURCE_EXHAUSTED` because the process already served
-`compat.max_concurrent_block_range_streams` streams. A count that keeps rising
-means wallets wait for slots: raise the limit if memory allows, or add a
-compatibility replica. The
+refused with `RESOURCE_EXHAUSTED` because every slot was taken. A count that
+keeps rising means wallets wait for slots: raise the limit if memory allows,
+or add a compatibility replica. Refusals while few wallets sync can mean one
+client holds many streams without reading them. The compatibility server
+cannot tell clients apart, so limit concurrent requests per client at the
+edge. The
 [compatibility reference](../reference/lightwalletd-compatibility.md#block-range-resource-limits)
 sizes one stream.
 
