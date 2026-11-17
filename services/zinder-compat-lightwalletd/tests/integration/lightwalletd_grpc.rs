@@ -6,10 +6,14 @@
 use async_trait::async_trait;
 use eyre::eyre;
 use parking_lot::Mutex;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Code, Request, Status, transport::Server};
+use tonic_types::StatusExt;
 use zebra_chain::{
     parameters::NetworkKind as ZebraNetworkKind, transparent::Address as ZebraTransparentAddress,
 };
@@ -31,7 +35,7 @@ use zinder_proto::compat::lightwalletd::{
 };
 
 use zinder_query::{
-    BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, CompactBlockRange,
+    ArtifactKey, BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, CompactBlockRange,
     DEFAULT_MAX_COMPACT_BLOCK_RANGE, FullBlock, FullBlockStream, QueryError, RawTransaction,
     SettledTipBlock, SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
     TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
@@ -44,12 +48,12 @@ use zinder_source::{
     TransactionBroadcaster, TreeStateUpstream,
 };
 use zinder_store::{
-    CanonicalBuildSubtreeRoot, ChainEventStreamFamily, ChainEventStreamResume,
+    ArtifactFamily, CanonicalBuildSubtreeRoot, ChainEventStreamFamily, ChainEventStreamResume,
     EventStreamStartPosition, RawBlobRetention, StreamCursorTokenV1,
 };
 use zinder_testkit::{
     CanonicalBaseline, CanonicalWriterFixture, ChainFixture, FIXTURE_NOTE_COMMITMENT, FixtureBlock,
-    FixtureTransactionRows, MockTransactionBroadcaster, WalletServingStoreFixture,
+    FixtureTransactionRows, LogCapture, MockTransactionBroadcaster, WalletServingStoreFixture,
     completed_subtree_frontier, one_leaf_frontier, sample_regtest_upgrade_activations,
     synthetic_transaction_public_facts,
 };
@@ -444,6 +448,472 @@ async fn get_block_range_streams_windows_wider_than_one_store_read() -> eyre::Re
     Ok(())
 }
 
+fn block_range_request(start: u64, end: u64) -> lightwalletd::BlockRange {
+    lightwalletd::BlockRange {
+        start: Some(lightwalletd::BlockId {
+            height: start,
+            hash: Vec::new(),
+        }),
+        end: Some(lightwalletd::BlockId {
+            height: end,
+            hash: Vec::new(),
+        }),
+        pool_types: Vec::new(),
+    }
+}
+
+/// Blocks a block-range stream sent, and the status that ended it early.
+struct DrainedBlockRange {
+    blocks: Vec<lightwalletd::CompactBlock>,
+    ending: Option<Status>,
+}
+
+/// Drains a block-range stream one block at a time and yields between
+/// blocks, like a client that reads slower than the server.
+async fn drain_slowly<Stream>(mut stream: Stream) -> DrainedBlockRange
+where
+    Stream: tokio_stream::Stream<Item = Result<lightwalletd::CompactBlock, Status>> + Unpin,
+{
+    use tokio_stream::StreamExt as _;
+
+    let mut blocks = Vec::new();
+    while let Some(message) = stream.next().await {
+        match message {
+            Ok(block) => blocks.push(block),
+            Err(status) => {
+                return DrainedBlockRange {
+                    blocks,
+                    ending: Some(status),
+                };
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    DrainedBlockRange {
+        blocks,
+        ending: None,
+    }
+}
+
+/// Asserts that `blocks` are the consecutive heights from `first_height` to
+/// `last_height` in order, and that each block links by hash to the one sent
+/// before it.
+fn assert_one_linked_chain(
+    blocks: &[lightwalletd::CompactBlock],
+    first_height: u64,
+    last_height: u64,
+) {
+    let is_descending = first_height > last_height;
+    let expected_count = first_height.abs_diff(last_height).saturating_add(1);
+    assert_eq!(
+        u64::try_from(blocks.len()).unwrap_or(u64::MAX),
+        expected_count,
+        "the stream must send heights {first_height} through {last_height}"
+    );
+    for (offset, block) in (0_u64..).zip(blocks) {
+        let expected_height = if is_descending {
+            first_height.saturating_sub(offset)
+        } else {
+            first_height.saturating_add(offset)
+        };
+        assert_eq!(block.height, expected_height);
+    }
+    for pair in blocks.windows(2) {
+        let [earlier, later] = pair else {
+            continue;
+        };
+        let (parent, child) = if is_descending {
+            (later, earlier)
+        } else {
+            (earlier, later)
+        };
+        assert_eq!(
+            child.prev_hash, parent.hash,
+            "block {} must link to block {}",
+            later.height, earlier.height
+        );
+    }
+}
+
+/// Asserts that a stream ended with the reorg status naming `sent_epoch`, the
+/// epoch of the last chunk it sent.
+fn assert_reorg_ending(ending: Option<&Status>, sent_epoch: u64) {
+    assert_eq!(
+        ending.map(Status::code),
+        Some(Code::FailedPrecondition),
+        "the stream must end with the reorg status: {ending:?}"
+    );
+    let Some(details) = ending.map(StatusExt::get_error_details) else {
+        return;
+    };
+    assert_eq!(
+        details
+            .error_info()
+            .map(|error_info| error_info.reason.as_str()),
+        Some("CHAIN_EPOCH_PIN_UNAVAILABLE")
+    );
+    assert_eq!(
+        details
+            .precondition_failure()
+            .and_then(|failure| failure.violations.first())
+            .map(|violation| violation.subject.clone()),
+        Some(format!("chain_epoch:{sent_epoch}"))
+    );
+}
+
+/// Returns the `cause` of every `compat_block_range_ended_by_reorg` event.
+fn reorg_ending_causes(log_capture: &LogCapture) -> Vec<String> {
+    log_capture
+        .events()
+        .iter()
+        .filter(|event| event.field("event") == Some("compat_block_range_ended_by_reorg"))
+        .filter_map(|event| event.field("cause").map(str::to_owned))
+        .collect()
+}
+
+/// Wire hash of the synthetic block at `height` on `branch`.
+fn synthetic_wire_hash(height: u64, branch: u8) -> Vec<u8> {
+    let height = u32::try_from(height).unwrap_or(u32::MAX);
+    encode_internal_block_hash(synthetic_block_hash(height, branch)).to_vec()
+}
+
+/// Streams `start..=end` from a recorder that serves `views` in turn and
+/// drains it slowly.
+async fn stream_across_views(
+    store_fixture: &AcceptanceStore,
+    request: lightwalletd::BlockRange,
+    views: Vec<SyntheticView>,
+) -> eyre::Result<DrainedBlockRange> {
+    let recorder = EpochPinRecorder::new(store_fixture.query()).with_synthetic_views(views);
+    let adapter = LightwalletdGrpcAdapter::new(recorder);
+    let stream = adapter.get_block_range(Request::new(request)).await?;
+    Ok(drain_slowly(stream.into_inner()).await)
+}
+
+/// A wallet that reads slower than blocks arrive keeps its stream. Each chunk
+/// after the first reads the view current when it is read, so no chunk waits
+/// on a pin that retention has already released.
+#[tokio::test]
+async fn get_block_range_completes_across_publications_while_the_client_reads_slowly()
+-> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let recorder = EpochPinRecorder::new(store_fixture.query()).with_synthetic_views(vec![
+        SyntheticView::entry(ENTRY_EPOCH, 3_500),
+        SyntheticView::entry(ENTRY_EPOCH + 1, 3_501),
+        SyntheticView::entry(ENTRY_EPOCH + 2, 3_502),
+        SyntheticView::entry(ENTRY_EPOCH + 3, 3_503),
+    ]);
+    let adapter = LightwalletdGrpcAdapter::new(recorder.clone());
+
+    let drained = drain_slowly(
+        adapter
+            .get_block_range(Request::new(block_range_request(1, 3_500)))
+            .await?
+            .into_inner(),
+    )
+    .await;
+
+    if let Some(status) = drained.ending {
+        return Err(eyre!(
+            "a slow stream across publications must complete, but it ended with {:?}: {}",
+            status.code(),
+            status.message()
+        ));
+    }
+    assert_one_linked_chain(&drained.blocks, 1, 3_500);
+    assert_eq!(
+        recorder.recorded_epoch_ids(),
+        vec![Some(ChainEpochId::new(ENTRY_EPOCH)), None, None, None],
+        "only the first chunk is pinned to the entry epoch"
+    );
+    assert_eq!(
+        recorder.served_compact_block_epochs(),
+        (ENTRY_EPOCH..=ENTRY_EPOCH + 3)
+            .map(ChainEpochId::new)
+            .collect::<Vec<_>>(),
+        "each later chunk reads the view current when it is read"
+    );
+    Ok(())
+}
+
+/// A reorg that replaces a block the stream already sent ends the stream
+/// after the blocks it sent, and no block of the replacing branch is sent.
+#[tokio::test]
+async fn get_block_range_ends_with_the_reorg_status_when_a_sent_block_is_replaced()
+-> eyre::Result<()> {
+    let log_capture = LogCapture::install_for_target("zinder::compat_lightwalletd");
+    let store_fixture = acceptance_store_fixture()?;
+
+    let drained = stream_across_views(
+        &store_fixture,
+        block_range_request(1, 3_000),
+        vec![
+            SyntheticView::entry(ENTRY_EPOCH, 3_000),
+            SyntheticView::forked(ENTRY_EPOCH + 1, 500, 1, 3_000),
+        ],
+    )
+    .await?;
+
+    assert_one_linked_chain(&drained.blocks, 1, 1_000);
+    assert!(
+        drained
+            .blocks
+            .iter()
+            .all(|block| block.hash == synthetic_wire_hash(block.height, 0)),
+        "no block of the replacing branch may be sent"
+    );
+    assert_reorg_ending(drained.ending.as_ref(), ENTRY_EPOCH);
+    assert_eq!(reorg_ending_causes(&log_capture), vec!["chain_replaced"]);
+    Ok(())
+}
+
+/// A reorg above the blocks already sent keeps the chain the stream sent, so
+/// the stream continues on the replacing branch.
+#[tokio::test]
+async fn get_block_range_follows_a_reorg_above_the_blocks_it_sent() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+
+    let drained = stream_across_views(
+        &store_fixture,
+        block_range_request(1, 3_000),
+        vec![
+            SyntheticView::entry(ENTRY_EPOCH, 3_000),
+            SyntheticView::forked(ENTRY_EPOCH + 1, 1_500, 1, 3_000),
+        ],
+    )
+    .await?;
+
+    assert!(drained.ending.is_none(), "{:?}", drained.ending);
+    assert_one_linked_chain(&drained.blocks, 1, 3_000);
+    assert!(drained.blocks.iter().all(|block| {
+        let branch = u8::from(block.height >= 1_500);
+        block.hash == synthetic_wire_hash(block.height, branch)
+    }));
+    Ok(())
+}
+
+/// The link is checked at the last block an ascending stream sent: a fork at
+/// that height ends the stream, and a fork one height above it does not.
+#[tokio::test]
+async fn ascending_get_block_range_continues_only_when_its_last_sent_block_survives()
+-> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let views_forked_at = |fork_height| {
+        vec![
+            SyntheticView::entry(ENTRY_EPOCH, 2_000),
+            SyntheticView::forked(ENTRY_EPOCH + 1, fork_height, 1, 2_000),
+        ]
+    };
+
+    let fork_at_last_sent = stream_across_views(
+        &store_fixture,
+        block_range_request(1, 2_000),
+        views_forked_at(1_000),
+    )
+    .await?;
+    assert_one_linked_chain(&fork_at_last_sent.blocks, 1, 1_000);
+    assert_reorg_ending(fork_at_last_sent.ending.as_ref(), ENTRY_EPOCH);
+
+    let fork_above_last_sent = stream_across_views(
+        &store_fixture,
+        block_range_request(1, 2_000),
+        views_forked_at(1_001),
+    )
+    .await?;
+    assert!(
+        fork_above_last_sent.ending.is_none(),
+        "{:?}",
+        fork_above_last_sent.ending
+    );
+    assert_one_linked_chain(&fork_above_last_sent.blocks, 1, 2_000);
+    assert_eq!(
+        fork_above_last_sent
+            .blocks
+            .get(1_000)
+            .map(|block| block.hash.clone()),
+        Some(synthetic_wire_hash(1_001, 1))
+    );
+    Ok(())
+}
+
+/// A descending stream needs only the parent of the last block it sent: a
+/// fork at that block's height keeps the stream on the chain it was reading,
+/// and a fork one height below it ends the stream.
+#[tokio::test]
+async fn descending_get_block_range_continues_only_into_the_parent_of_its_last_sent_block()
+-> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let views_forked_at = |fork_height| {
+        vec![
+            SyntheticView::entry(ENTRY_EPOCH, 3_000),
+            SyntheticView::forked(ENTRY_EPOCH + 1, fork_height, 1, 3_000),
+        ]
+    };
+
+    // The first chunk sends 3,000 down to 2,001.
+    let fork_at_last_sent = stream_across_views(
+        &store_fixture,
+        block_range_request(3_000, 1),
+        views_forked_at(2_001),
+    )
+    .await?;
+    assert!(
+        fork_at_last_sent.ending.is_none(),
+        "{:?}",
+        fork_at_last_sent.ending
+    );
+    assert_one_linked_chain(&fork_at_last_sent.blocks, 3_000, 1);
+    assert!(
+        fork_at_last_sent
+            .blocks
+            .iter()
+            .all(|block| block.hash == synthetic_wire_hash(block.height, 0)),
+        "the stream returns exactly the entry view's chain"
+    );
+
+    let fork_below_last_sent = stream_across_views(
+        &store_fixture,
+        block_range_request(3_000, 1),
+        views_forked_at(2_000),
+    )
+    .await?;
+    assert_one_linked_chain(&fork_below_last_sent.blocks, 3_000, 2_001);
+    assert_reorg_ending(fork_below_last_sent.ending.as_ref(), ENTRY_EPOCH);
+    Ok(())
+}
+
+/// A reorg that leaves the visible tip below a height the stream still has
+/// to send ends it with the reorg status, not the `NOT_FOUND` of a read above
+/// the tip, naming the epoch of the last chunk sent.
+#[tokio::test]
+async fn get_block_range_ends_with_the_reorg_status_when_the_tip_falls_below_the_range()
+-> eyre::Result<()> {
+    let log_capture = LogCapture::install_for_target("zinder::compat_lightwalletd");
+    let store_fixture = acceptance_store_fixture()?;
+
+    let drained = stream_across_views(
+        &store_fixture,
+        block_range_request(1, 3_000),
+        vec![
+            SyntheticView::entry(ENTRY_EPOCH, 3_000),
+            SyntheticView::forked(ENTRY_EPOCH + 1, 2_900, 1, 2_950),
+        ],
+    )
+    .await?;
+
+    assert_one_linked_chain(&drained.blocks, 1, 2_000);
+    assert_reorg_ending(drained.ending.as_ref(), ENTRY_EPOCH + 1);
+    assert_eq!(reorg_ending_causes(&log_capture), vec!["tip_lowered"]);
+    Ok(())
+}
+
+/// `GetBlockRangeNullifiers` streams through the same chunk path: it
+/// completes across publications and ends at a reorg into its sent blocks.
+#[tokio::test]
+async fn get_block_range_nullifiers_follows_the_same_chunk_contract() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let nullifiers_across_views = |views| {
+        let adapter = LightwalletdGrpcAdapter::new(
+            EpochPinRecorder::new(store_fixture.query()).with_synthetic_views(views),
+        );
+        async move {
+            let stream = adapter
+                .get_block_range_nullifiers(Request::new(block_range_request(1, 2_500)))
+                .await?;
+            Ok::<_, eyre::Report>(drain_slowly(stream.into_inner()).await)
+        }
+    };
+
+    let across_publications = nullifiers_across_views(vec![
+        SyntheticView::entry(ENTRY_EPOCH, 2_500),
+        SyntheticView::entry(ENTRY_EPOCH + 1, 2_501),
+        SyntheticView::entry(ENTRY_EPOCH + 2, 2_502),
+    ])
+    .await?;
+    assert!(
+        across_publications.ending.is_none(),
+        "{:?}",
+        across_publications.ending
+    );
+    assert_one_linked_chain(&across_publications.blocks, 1, 2_500);
+
+    let across_reorg = nullifiers_across_views(vec![
+        SyntheticView::entry(ENTRY_EPOCH, 2_500),
+        SyntheticView::forked(ENTRY_EPOCH + 1, 900, 1, 2_500),
+    ])
+    .await?;
+    assert_one_linked_chain(&across_reorg.blocks, 1, 1_000);
+    assert_reorg_ending(across_reorg.ending.as_ref(), ENTRY_EPOCH);
+    Ok(())
+}
+
+/// Store-backed artifacts carry real parent hashes. A stream whose sent
+/// blocks a live replacement displaced ends with the reorg status instead of
+/// sending the replacing branch.
+#[tokio::test]
+async fn get_block_range_ends_when_a_live_replacement_displaces_sent_blocks() -> eyre::Result<()> {
+    const TIP_HEIGHT: u32 = 1_020;
+    const FORK_HEIGHT: u32 = 995;
+    let mut chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(TIP_HEIGHT);
+    for height in FORK_HEIGHT..=TIP_HEIGHT {
+        let displaced = fixture_block(&chain, BlockHeight::new(height))?;
+        let mut transaction_id = [0x5a; 32];
+        transaction_id[..4].copy_from_slice(&height.to_le_bytes());
+        chain = chain.with_transaction_rows(FixtureTransactionRows::coinbase(
+            TransactionId::from_bytes(transaction_id),
+            displaced.height,
+            displaced.hash,
+            format!("raw-displaced-coinbase-{height}").into_bytes(),
+        ));
+    }
+    let replacement_chain = chain
+        .fork_at(BlockHeight::new(FORK_HEIGHT))?
+        .extend_blocks(TIP_HEIGHT - FORK_HEIGHT + 1);
+    let mut writer = CanonicalWriterFixture::publish(
+        &CanonicalBaseline::new(&chain).with_settled_tip(BlockHeight::new(FORK_HEIGHT - 5)),
+        &sample_regtest_upgrade_activations(),
+    )?;
+    let before_reorg = AcceptanceStore::from_store_fixture(
+        writer.serving_store_fixture()?,
+        CompatNode::read_only(writer.canonical_primary()?.event_fence().visible_tip())?,
+    )?;
+    let sent_epoch = before_reorg
+        .query()
+        .visible_tip_block(None)
+        .await?
+        .chain_epoch
+        .id;
+    writer.replace_live_blocks(&replacement_chain, BlockHeight::new(FORK_HEIGHT))?;
+    let after_reorg = acceptance_store_from_writer(writer)?;
+    let recorder =
+        EpochPinRecorder::new(before_reorg.query()).with_later_views(vec![after_reorg.query()]);
+    let adapter = LightwalletdGrpcAdapter::new(recorder.clone());
+
+    let drained = drain_slowly(
+        adapter
+            .get_block_range(Request::new(block_range_request(1, u64::from(TIP_HEIGHT))))
+            .await?
+            .into_inner(),
+    )
+    .await;
+
+    assert_one_linked_chain(&drained.blocks, 1, 1_000);
+    let last_sent = fixture_block(&chain, BlockHeight::new(1_000))?;
+    assert_eq!(
+        drained.blocks.last().map(|block| block.hash.clone()),
+        Some(encode_internal_block_hash(last_sent.hash).to_vec())
+    );
+    assert_reorg_ending(drained.ending.as_ref(), sent_epoch.value());
+    assert_eq!(
+        recorder.served_compact_block_epochs().len(),
+        2,
+        "the second chunk is read at the replacing view"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn get_block_range_rejects_malformed_requests_before_streaming() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture()?;
@@ -645,13 +1115,26 @@ async fn get_subtree_roots_serves_ironwood() -> eyre::Result<()> {
 
 /// Records the `at_epoch_id` argument of every canonical read so a test can
 /// assert one handler pins all of its reads to a single chain epoch.
+///
+/// The recorder can also change the chain view it serves while a handler
+/// runs. `visible_tip_block` and `compact_blocks_in_range` answer from view
+/// `n` once `n` compact-block range reads have completed, so view 0 answers
+/// a block-range request and its first chunk, and view `n` answers the
+/// chunk after the `n`th. A pin on any other view's epoch is refused, which
+/// is stricter than production retention and needs no clock.
 #[derive(Clone)]
 struct EpochPinRecorder<Inner> {
     inner: Inner,
     recorded_epoch_ids: Arc<Mutex<Vec<Option<ChainEpochId>>>>,
     recorded_compact_block_ranges: Arc<Mutex<Vec<BlockHeightRange>>>,
     transparent_address_balance: Option<TransparentAddressBalance>,
-    synthetic_visible_tip_height: Option<BlockHeight>,
+    /// Synthetic chain views served in place of `inner`'s blocks.
+    synthetic_views: Option<Arc<[SyntheticView]>>,
+    /// Real queries that replace `inner` as the served view, in order.
+    later_views: Arc<[Inner]>,
+    completed_compact_block_reads: Arc<AtomicUsize>,
+    /// Epoch of the view that answered each successful compact-block range read.
+    served_compact_block_epochs: Arc<Mutex<Vec<ChainEpochId>>>,
 }
 
 impl<Inner> EpochPinRecorder<Inner> {
@@ -661,7 +1144,10 @@ impl<Inner> EpochPinRecorder<Inner> {
             recorded_epoch_ids: Arc::new(Mutex::new(Vec::new())),
             recorded_compact_block_ranges: Arc::new(Mutex::new(Vec::new())),
             transparent_address_balance: None,
-            synthetic_visible_tip_height: None,
+            synthetic_views: None,
+            later_views: Arc::from(Vec::new()),
+            completed_compact_block_reads: Arc::new(AtomicUsize::new(0)),
+            served_compact_block_epochs: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -676,8 +1162,24 @@ impl<Inner> EpochPinRecorder<Inner> {
     /// Reports `visible_tip_height` as the visible tip and answers every
     /// compact-block range from synthetic blocks, so a test can span more
     /// heights than a store fixture holds.
-    fn with_synthetic_compact_blocks_to(mut self, visible_tip_height: BlockHeight) -> Self {
-        self.synthetic_visible_tip_height = Some(visible_tip_height);
+    fn with_synthetic_compact_blocks_to(self, visible_tip_height: BlockHeight) -> Self {
+        self.with_synthetic_views(vec![SyntheticView::entry(
+            ENTRY_EPOCH,
+            visible_tip_height.value(),
+        )])
+    }
+
+    /// Serves `views` in turn, as the type documentation describes, with
+    /// synthetic blocks.
+    fn with_synthetic_views(mut self, views: Vec<SyntheticView>) -> Self {
+        self.synthetic_views = Some(Arc::from(views));
+        self
+    }
+
+    /// Serves `later_views` in turn after `inner`, as the type documentation
+    /// describes.
+    fn with_later_views(mut self, later_views: Vec<Inner>) -> Self {
+        self.later_views = Arc::from(later_views);
         self
     }
 
@@ -692,24 +1194,111 @@ impl<Inner> EpochPinRecorder<Inner> {
     fn recorded_compact_block_ranges(&self) -> Vec<BlockHeightRange> {
         self.recorded_compact_block_ranges.lock().clone()
     }
+
+    fn served_compact_block_epochs(&self) -> Vec<ChainEpochId> {
+        self.served_compact_block_epochs.lock().clone()
+    }
+
+    fn view_index(&self) -> usize {
+        self.completed_compact_block_reads.load(Ordering::SeqCst)
+    }
+
+    fn synthetic_view(&self, view_index: usize) -> Option<SyntheticView> {
+        let views = self.synthetic_views.as_deref()?;
+        views.get(view_index).or_else(|| views.last()).copied()
+    }
+
+    fn served_inner(&self, view_index: usize) -> &Inner {
+        view_index
+            .checked_sub(1)
+            .and_then(|later_index| {
+                self.later_views
+                    .get(later_index)
+                    .or_else(|| self.later_views.last())
+            })
+            .unwrap_or(&self.inner)
+    }
 }
 
-fn synthetic_compact_block(height: BlockHeight) -> CompactBlockArtifact {
-    let block_hash = |height: u32| {
-        let mut bytes = [0_u8; 32];
-        bytes[..4].copy_from_slice(&height.to_le_bytes());
-        BlockHash::from_bytes(bytes)
-    };
-    CompactBlockArtifact::empty(
-        BlockId::new(height, block_hash(height.value())),
-        block_hash(height.value().saturating_sub(1)),
-        0,
-        CompactChainMetadata {
-            sapling_commitment_tree_size: 0,
-            orchard_commitment_tree_size: 0,
-            ironwood_commitment_tree_size: 0,
-        },
-    )
+/// Epoch of the first synthetic view a block-range test serves.
+const ENTRY_EPOCH: u64 = 7;
+
+/// Hash of the synthetic block at `height` on `branch`; branch 0 is the chain
+/// a block-range request starts on.
+fn synthetic_block_hash(height: u32, branch: u8) -> BlockHash {
+    let mut bytes = [0_u8; 32];
+    bytes[..4].copy_from_slice(&height.to_le_bytes());
+    bytes[4] = branch;
+    BlockHash::from_bytes(bytes)
+}
+
+/// One chain view a synthetic recorder serves: heights `1..=visible_tip_height`
+/// of branch 0 below `fork_height`, and of `branch` from `fork_height` on.
+#[derive(Clone, Copy, Debug)]
+struct SyntheticView {
+    epoch_id: ChainEpochId,
+    visible_tip_height: BlockHeight,
+    branch: u8,
+    fork_height: u32,
+}
+
+impl SyntheticView {
+    /// Branch 0 through `visible_tip_height`.
+    const fn entry(epoch_id: u64, visible_tip_height: u32) -> Self {
+        Self {
+            epoch_id: ChainEpochId::new(epoch_id),
+            visible_tip_height: BlockHeight::new(visible_tip_height),
+            branch: 0,
+            fork_height: u32::MAX,
+        }
+    }
+
+    /// Branch 0 below `fork_height` and `branch` from it, through
+    /// `visible_tip_height`.
+    const fn forked(epoch_id: u64, fork_height: u32, branch: u8, visible_tip_height: u32) -> Self {
+        Self {
+            epoch_id: ChainEpochId::new(epoch_id),
+            visible_tip_height: BlockHeight::new(visible_tip_height),
+            branch,
+            fork_height,
+        }
+    }
+
+    const fn branch_at(&self, height: u32) -> u8 {
+        if height >= self.fork_height {
+            self.branch
+        } else {
+            0
+        }
+    }
+
+    fn block_hash_at(&self, height: u32) -> BlockHash {
+        synthetic_block_hash(height, self.branch_at(height))
+    }
+
+    fn compact_block_at(&self, height: BlockHeight) -> CompactBlockArtifact {
+        let parent_height = height.value().saturating_sub(1);
+        CompactBlockArtifact::empty(
+            BlockId::new(height, self.block_hash_at(height.value())),
+            self.block_hash_at(parent_height),
+            0,
+            CompactChainMetadata {
+                sapling_commitment_tree_size: 0,
+                orchard_commitment_tree_size: 0,
+                ironwood_commitment_tree_size: 0,
+            },
+        )
+    }
+
+    /// Answers a read at `at_epoch_id`, refusing a pin on any other epoch.
+    fn admit_pin(&self, at_epoch_id: Option<ChainEpochId>) -> Result<(), QueryError> {
+        match at_epoch_id {
+            Some(pinned) if pinned != self.epoch_id => Err(QueryError::ChainEpochPinUnavailable {
+                chain_epoch_id: pinned,
+            }),
+            _ => Ok(()),
+        }
+    }
 }
 
 #[async_trait]
@@ -730,11 +1319,20 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         &self,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<VisibleTipBlock, QueryError> {
-        let mut visible_tip_block = self.inner.visible_tip_block(at_epoch_id).await?;
-        if let Some(height) = self.synthetic_visible_tip_height {
-            visible_tip_block.height = height;
-            visible_tip_block.chain_epoch.visible_tip_height = height;
-        }
+        let view_index = self.view_index();
+        let Some(view) = self.synthetic_view(view_index) else {
+            return self
+                .served_inner(view_index)
+                .visible_tip_block(at_epoch_id)
+                .await;
+        };
+        view.admit_pin(at_epoch_id)?;
+        let mut visible_tip_block = self.inner.visible_tip_block(None).await?;
+        visible_tip_block.height = view.visible_tip_height;
+        visible_tip_block.block_hash = view.block_hash_at(view.visible_tip_height.value());
+        visible_tip_block.chain_epoch.id = view.epoch_id;
+        visible_tip_block.chain_epoch.visible_tip_height = visible_tip_block.height;
+        visible_tip_block.chain_epoch.visible_tip_hash = visible_tip_block.block_hash;
         Ok(visible_tip_block)
     }
 
@@ -782,25 +1380,45 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
     ) -> Result<CompactBlockRange, QueryError> {
         self.record(at_epoch_id);
         self.recorded_compact_block_ranges.lock().push(block_range);
-        if self.synthetic_visible_tip_height.is_some() {
-            let requested = block_range.into_iter().len();
-            let maximum =
-                usize::try_from(DEFAULT_MAX_COMPACT_BLOCK_RANGE.get()).unwrap_or(usize::MAX);
-            if requested > maximum {
-                return Err(QueryError::BlockRangeTooLarge { requested, maximum });
+        let view_index = self.view_index();
+        let Some(view) = self.synthetic_view(view_index) else {
+            let compact_block_range = self
+                .served_inner(view_index)
+                .compact_blocks_in_range(block_range, at_epoch_id)
+                .await;
+            self.completed_compact_block_reads
+                .fetch_add(1, Ordering::SeqCst);
+            if let Ok(served) = &compact_block_range {
+                self.served_compact_block_epochs
+                    .lock()
+                    .push(served.chain_epoch.id);
             }
-            return Ok(CompactBlockRange {
-                chain_epoch: self.visible_tip_block(at_epoch_id).await?.chain_epoch,
-                block_range,
-                compact_blocks: block_range
-                    .into_iter()
-                    .map(synthetic_compact_block)
-                    .collect(),
+            return compact_block_range;
+        };
+        let chain_epoch = self.visible_tip_block(at_epoch_id).await;
+        self.completed_compact_block_reads
+            .fetch_add(1, Ordering::SeqCst);
+        let chain_epoch = chain_epoch?.chain_epoch;
+        let requested = block_range.into_iter().len();
+        let maximum = usize::try_from(DEFAULT_MAX_COMPACT_BLOCK_RANGE.get()).unwrap_or(usize::MAX);
+        if requested > maximum {
+            return Err(QueryError::BlockRangeTooLarge { requested, maximum });
+        }
+        if block_range.end > view.visible_tip_height {
+            return Err(QueryError::ArtifactUnavailable {
+                family: ArtifactFamily::CompactBlock,
+                key: ArtifactKey::BlockHeight(block_range.end),
             });
         }
-        self.inner
-            .compact_blocks_in_range(block_range, at_epoch_id)
-            .await
+        self.served_compact_block_epochs.lock().push(view.epoch_id);
+        Ok(CompactBlockRange {
+            chain_epoch,
+            block_range,
+            compact_blocks: block_range
+                .into_iter()
+                .map(|height| view.compact_block_at(height))
+                .collect(),
+        })
     }
 
     async fn full_block_at(

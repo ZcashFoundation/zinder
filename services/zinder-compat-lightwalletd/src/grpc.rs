@@ -29,13 +29,14 @@ use zinder_proto::compat::lightwalletd::{
 };
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
-    DEFAULT_MAX_COMPACT_BLOCK_RANGE, QueryError, SubtreeRoots,
+    CompactBlockRange, DEFAULT_MAX_COMPACT_BLOCK_RANGE, QueryError, SubtreeRoots,
     TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest, TreeState,
     WalletQueryApi, WalletServingQuery, address_lookup_to_script_hash, status_from_query_error,
 };
 use zinder_source::transparent_address_matches_network;
 use zinder_store::{MempoolEvent, RawBlobRetention};
 
+use crate::block_range::BlockRangeContinuity;
 use crate::mempool::{
     MempoolSnapshotPage, MempoolSurfaceError, MempoolTransactionLookup, SharedMempoolSurface,
     SharedTipChangeWatcher, TipChangeWatcherError,
@@ -581,7 +582,7 @@ where
                 self.query_api.clone(),
                 block_range,
                 CompactBlockWindow {
-                    at_epoch_id: chain_view.epoch_id,
+                    entry_epoch_id: chain_view.epoch_id,
                     is_descending,
                     pool_selection,
                     payload_mode: CompactBlockPayloadMode::Full,
@@ -606,7 +607,7 @@ where
                 self.query_api.clone(),
                 block_range,
                 CompactBlockWindow {
-                    at_epoch_id: chain_view.epoch_id,
+                    entry_epoch_id: chain_view.epoch_id,
                     is_descending,
                     pool_selection: CompactBlockPoolSelection::shielded(),
                     payload_mode: CompactBlockPayloadMode::NullifiersOnly,
@@ -1003,8 +1004,10 @@ fn stream_items<T: Send + 'static>(items: Vec<T>) -> GrpcStream<T> {
 /// How one `BlockRange` handler reads and shapes its window.
 #[derive(Clone, Copy)]
 struct CompactBlockWindow {
-    /// Chain epoch every chunk read is pinned to.
-    at_epoch_id: ChainEpochId,
+    /// Chain epoch the request's bounds were checked against. Only the first
+    /// chunk is pinned to it; each later chunk reads the view current when
+    /// it is read.
+    entry_epoch_id: ChainEpochId,
     /// Whether the client asked for heights high to low.
     is_descending: bool,
     /// Pools the emitted blocks retain.
@@ -1020,8 +1023,9 @@ struct CompactBlockWindow {
 /// capped chunks read in wire order, so an arbitrarily wide request streams
 /// while at most one chunk is materialized at a time.
 ///
-/// The first chunk is read before the response, so an unreadable window fails
-/// the call rather than a stream the client has already opened.
+/// The first chunk is read at the entry epoch before the response, so an
+/// unreadable window fails the call rather than a stream the client has
+/// already opened. Later chunks follow [`BlockRangeContinuity`].
 async fn stream_compact_block_range<QueryApi>(
     query_api: QueryApi,
     block_range: BlockHeightRange,
@@ -1034,18 +1038,27 @@ where
     let Some((first_chunk, remaining_chunks)) = chunks.split_first() else {
         return Ok(Box::pin(stream::empty()));
     };
-    let first_blocks =
-        read_compact_block_chunk(&query_api, *first_chunk, window.at_epoch_id).await?;
-    let first_messages = encode_compact_block_chunk(first_blocks, window);
+    let first_range =
+        read_compact_block_chunk(&query_api, *first_chunk, Some(window.entry_epoch_id)).await?;
     if remaining_chunks.is_empty() {
-        return Ok(Box::pin(stream::iter(first_messages)));
+        return Ok(Box::pin(stream::iter(encode_compact_block_chunk(
+            first_range.compact_blocks,
+            window,
+        ))));
     }
+    let continuity = BlockRangeContinuity::after_first_chunk(
+        &first_range.compact_blocks,
+        first_range.chain_epoch.id,
+        window.is_descending,
+    )?;
+    let first_messages = encode_compact_block_chunk(first_range.compact_blocks, window);
 
     let (message_sender, message_receiver) = mpsc::channel(COMPACT_BLOCK_STREAM_CHANNEL_CAPACITY);
     tokio::spawn(drive_compact_block_range(
         query_api,
         remaining_chunks.to_vec(),
         window,
+        continuity,
         message_sender,
     ));
     Ok(Box::pin(
@@ -1083,25 +1096,27 @@ fn compact_block_range_chunks(
 
 /// Reads every chunk after the first and forwards its blocks to the sink.
 ///
-/// A read failure or an unencodable block ends the stream with that status;
-/// a client that stops draining ends the walk on the next send.
+/// A read failure, a reorg ending, or an unencodable block ends the stream
+/// with that status; a client that stops draining ends the walk on the next
+/// send.
 async fn drive_compact_block_range<QueryApi>(
     query_api: QueryApi,
     chunks: Vec<BlockHeightRange>,
     window: CompactBlockWindow,
+    mut continuity: BlockRangeContinuity,
     message_sender: mpsc::Sender<Result<lightwalletd::CompactBlock, Status>>,
 ) where
     QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
 {
     for chunk in chunks {
-        let compact_blocks =
-            match read_compact_block_chunk(&query_api, chunk, window.at_epoch_id).await {
-                Ok(compact_blocks) => compact_blocks,
-                Err(status) => {
-                    let _ = message_sender.send(Err(status)).await;
-                    return;
-                }
-            };
+        let compact_blocks = match read_continuation_chunk(&query_api, chunk, &mut continuity).await
+        {
+            Ok(compact_blocks) => compact_blocks,
+            Err(status) => {
+                let _ = message_sender.send(Err(status)).await;
+                return;
+            }
+        };
         for message in encode_compact_block_chunk(compact_blocks, window) {
             let is_terminal = message.is_err();
             if message_sender.send(message).await.is_err() || is_terminal {
@@ -1111,18 +1126,45 @@ async fn drive_compact_block_range<QueryApi>(
     }
 }
 
-async fn read_compact_block_chunk<QueryApi>(
+/// Reads a chunk after the first at the view current when it is read.
+///
+/// The read is unpinned: the hash link that `continuity` checks, not a pin,
+/// proves the chunk continues the chain already sent. The tip check before
+/// the read only tells a reorg that lowered the tip apart from a read of an
+/// unretained height.
+async fn read_continuation_chunk<QueryApi>(
     query_api: &QueryApi,
     chunk: BlockHeightRange,
-    at_epoch_id: ChainEpochId,
+    continuity: &mut BlockRangeContinuity,
 ) -> Result<Vec<CompactBlockArtifact>, Status>
 where
     QueryApi: WalletQueryApi + Send + Sync,
 {
-    query_api
-        .compact_blocks_in_range(chunk, Some(at_epoch_id))
+    let visible_tip_block = query_api
+        .visible_tip_block(None)
         .await
-        .map(|compact_block_range| compact_block_range.compact_blocks)
+        .map_err(|error| status_from_query_error(&error))?;
+    continuity.check_view_reaches(chunk, &visible_tip_block.chain_epoch)?;
+    let compact_block_range = read_compact_block_chunk(query_api, chunk, None).await?;
+    continuity.advance(
+        chunk,
+        &compact_block_range.chain_epoch,
+        &compact_block_range.compact_blocks,
+    )?;
+    Ok(compact_block_range.compact_blocks)
+}
+
+async fn read_compact_block_chunk<QueryApi>(
+    query_api: &QueryApi,
+    chunk: BlockHeightRange,
+    at_epoch_id: Option<ChainEpochId>,
+) -> Result<CompactBlockRange, Status>
+where
+    QueryApi: WalletQueryApi + Send + Sync,
+{
+    query_api
+        .compact_blocks_in_range(chunk, at_epoch_id)
+        .await
         .map_err(|error| status_from_query_error(&error))
 }
 

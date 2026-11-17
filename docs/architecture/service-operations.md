@@ -568,7 +568,10 @@ such as `full_blocks_in_range` or `transparent_address_unspent_outputs`,
 records when the stream is established. Later sub-reads of the stream do not
 record, and neither does a failure that ends the stream later. One protocol request can produce several samples when it composes
 several domain reads. For example, a compatibility request that pins the
-visible tip first records a `visible_tip_block` sample.
+visible tip first records a `visible_tip_block` sample. A compatibility
+`GetBlockRange` or `GetBlockRangeNullifiers` stream records one
+`visible_tip_block` and one `compact_blocks_in_range` sample for each
+1,000-block chunk after the first.
 
 The chain-event reads are the exception. `chain_events` page reads and
 `resolve_chain_events_start` serve a stream that the adapter records, so they
@@ -740,7 +743,9 @@ bounded blocking read that finishes on its own. A stream whose client cancels or
 the page in progress. A slow or abandoned stream can therefore hold
 publication for at most the read limit plus one page read after its pair
 leaves retention. Retention and slow streams together hold a publication for
-at most about 90 seconds.
+at most about 90 seconds. A lightwalletd `GetBlockRange` stream holds a pair
+only while it reads one chunk, so it takes no part in the read limit or in
+this bound.
 
 `zinder_wallet_serving_pair_publisher_pinned_retired_pairs` reports how many
 retired pairs requests still hold.
@@ -756,6 +761,37 @@ at reads that never check
 for revocation; revocations that keep rising point at clients whose streams
 outlast the read limit, such as a client that stops consuming an unspent-output
 stream without cancelling it.
+
+### Compatibility block-range streams
+
+`GetBlockRange`, and `GetBlockRangeNullifiers` in wallet serving, read a range
+wider than 1,000 blocks one chunk at a time. Each chunk after the first reads
+the chain view current when it is read and holds its serving pair, or its
+compact-blocks generation, only for that read. A slow client therefore holds
+no pair or generation while the server waits for it: in wallet serving its
+stream takes no part in retention or the read limit, and in compact-blocks
+serving the retired generation drains within one chunk read. A long stream
+should not coincide with `zinder_compat_compact_refresh_failures_total{cause="replica_lagging"}`
+or `compact_serving_refresh_failed` warnings.
+
+A later chunk continues a stream only when it links by hash to the last block
+the stream sent
+([ADR-0038](../adrs/0038-wallet-runtime-composition-and-capability-discovery.md#compatibility-block-range-streams)).
+`zinder_compat_block_range_reorg_endings_total{cause}` counts streams that
+ended early at a reorg:
+
+- `chain_replaced`: the next chunk did not link, because a reorg replaced the
+  block it had to link to.
+- `tip_lowered`: a reorg left the visible tip below a height the stream still
+  had to send.
+
+Each ending also logs `compat_block_range_ended_by_reorg` at `info` under the
+`zinder::compat_lightwalletd` target, with `cause`, `last_sent_height`,
+`sent_chain_epoch`, `current_chain_epoch`, `next_chunk_start`, and
+`next_chunk_end`. The client receives `CHAIN_EPOCH_PIN_UNAVAILABLE` and
+requests again, so an ending is not an error on its own. Endings that keep
+rising while ingest logs no `canonical_live_replacement_committed` events
+point at a fault in the chain view the compatibility runtime serves.
 
 ### RocksDB
 

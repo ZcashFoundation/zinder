@@ -30,7 +30,10 @@ states this decision removes.
 
 Zinder has one production native wallet-query composition. It reads through an
 admitted `WalletServingReadPair`; every request captures one immutable pair at
-an exact canonical fence.
+an exact canonical fence. A lightwalletd compatibility block-range stream
+instead makes one such read per chunk, as
+[Compatibility block-range streams](#compatibility-block-range-streams)
+describes.
 
 The admitted query privately owns one immutable
 `NativeWalletEndpointCapabilities` value. That value is derived once, after
@@ -273,6 +276,8 @@ its pair at once. A slow or abandoned read therefore delays publication by at
 most the read limit after its pair leaves retention. Retention and slow reads
 together delay a publication by at most the retention window, the read limit,
 and one page read, about 90 seconds, and never stop publication.
+Compatibility block-range streams take no part in this bound, because they
+hold no pair while they wait for a client.
 
 ZODL continues to consume the separate lightwalletd-compatible
 `CompactTxStreamer` surface through trusted TLS at the deployment edge. Native
@@ -285,6 +290,71 @@ Zinder contract tests prove internal storage, composition, discovery, error,
 and protocol invariants. Real current Zallet and ZODL binaries provide separate
 consumer certification. Fixture-backed parity tests remain useful contract
 evidence but are not downstream certification.
+
+## Compatibility block-range streams
+
+lightwalletd's `GetBlockRange` accepts a range of any width, and the client
+sets the pace. A wallet that catches up 100,000 blocks at 200 blocks a second
+keeps one stream open for more than eight minutes while new blocks arrive. No
+pin covers that. A replaced pair answers its epoch for one minute, and a
+request that holds a pair past that delays publication for every client.
+
+The compatibility runtime therefore binds each chunk of at most 1,000 blocks,
+not the stream, to one chain view. Both serving modes apply this rule to
+`GetBlockRange`. Wallet serving also applies it to `GetBlockRangeNullifiers`,
+which compact-blocks serving does not serve.
+
+- The first chunk is read at the epoch current when the request arrives,
+  before the response starts, and the range bounds are checked against that
+  epoch.
+- Each later chunk is read at the view current when the server reads it. It
+  holds its serving pair, or its compact-blocks generation, only for that
+  read, and never while it waits for the client. In wallet serving the read is
+  unpinned, and the server reads the visible tip first, so a reorg that
+  lowered the tip ends the stream as a reorg rather than as a read of an
+  unretained height.
+- A later chunk continues the stream only when it links by hash to the last
+  block the stream sent. In ascending order the chunk's lowest block sits one
+  height above that block and names it as its parent. In descending order the
+  chunk's highest block sits one height below that block and is its parent. A
+  block hash commits to its parent, so one equal link proves that the blocks
+  sent and the blocks to come form one chain.
+- When the link breaks, or the current view's visible tip is below a height
+  the stream still has to send, the stream ends after the blocks it sent with
+  `FAILED_PRECONDITION` and `CHAIN_EPOCH_PIN_UNAVAILABLE`, naming the epoch of
+  the last chunk sent.
+
+A stream therefore never sends two consecutive blocks that are not parent and
+child. A stream that ends `OK` sent one chain as the server read it. It does
+not promise that the chain is still the best chain when the client receives
+it, because a reorg after the last chunk is read is not reported.
+
+The direction decides which reorgs end a stream:
+
+- In ascending order, a reorg that replaces the last block sent, or any block
+  below it, ends the stream. A reorg above that block leaves the sent chain in
+  place, and later chunks come from the new branch.
+- In descending order, a stream needs only the parent of the last block it
+  sent. A reorg at or above the last block sent leaves that parent in place,
+  so the stream continues and returns the chain it started on, even though the
+  blocks it already sent are no longer the best chain. The stream ends only
+  when a reorg reaches the next height it has to send.
+
+The canonical writer never replaces a block at or below the settled tip, so a
+stream over settled history never ends this way. Only the unsettled suffix can
+end a stream, and that suffix is at most the reorg window, 1,000 blocks by
+default ([ADR-0041](0041-reorg-window-follows-the-node-bound.md)).
+
+The ending reuses the reason a released pin reports. In both cases the chain
+view the client was reading is no longer served, and the client requests again
+from the height it needs. The status detail, "requested chain epoch is not
+retained", is the reason's generic text; the
+`compat_block_range_ended_by_reorg` log names the actual cause.
+
+Block-range streams take no part in pair retention or the released-pair read
+limit, and they never delay publication. The native compact-block range and
+`FullBlocksInRange` keep one pair for the whole response, because a native
+range is bounded and a native response carries one chain epoch.
 
 ## Consequences
 
@@ -439,6 +509,32 @@ keeps every published pair immutable.
 A pinned read retried on a pair at another epoch would mix two epochs, which a
 pin forbids. The pin error tells the client to restart the workflow instead.
 
+### Hold one pair for a whole compatibility block-range stream
+
+A block-range stream lasts as long as the client makes it. Holding one pair
+past its retention minute, with or without a read limit, either ends the
+stream at the limit or takes a generation for as long as the client reads. In
+compact-blocks serving, which has two generations, one slow stream stopped
+publication for about seven minutes, and for the last two of them readiness
+refused new clients. Retaining pairs longer only moves the failure: no window
+covers a stream whose pace the client sets, and every retained pair takes a
+generation, so a longer window delays publication for every client.
+
+### Pin each later block-range chunk to the view whose tip it checked
+
+The pin adds no safety, because the hash link, not the pin, proves that a
+chunk continues the chain already sent. It would also keep a failure that an
+unpinned read avoids: a pinned read that finds a table file deleted fails when
+the replacement pair serves a newer epoch, while an unpinned read runs again
+on that replacement.
+
+### Send the new branch after a reorg below the stream's position
+
+A wallet that checks parent links would detect the break and rewind, but the
+response would combine two best-chain states, which
+[ADR-0003](0003-canonical-storage-access-boundary.md) forbids. Ending the
+stream lets the wallet read the new branch in a fresh request.
+
 ### Add compatibility aliases
 
 Aliases keep obsolete names and constructors available for new code. The
@@ -446,6 +542,12 @@ controlled consumer cutover uses the current contract without shims.
 
 ## Revision history
 
+- 2026-11-17: A lightwalletd block-range stream binds each chunk, not the
+  whole stream, to one chain view, and continues at a newer view only along
+  the chain it has already sent. It holds no serving pair or compact-blocks
+  generation between chunk reads and no longer depends on retention. A reorg
+  that replaces the block a later chunk must link to, or lowers the tip below a
+  height still to send, ends it with `CHAIN_EPOCH_PIN_UNAVAILABLE`.
 - 2026-11-16: A read that finds a table file of its serving pair deleted by
   the primary's compaction marks the pair. The publisher replaces the pair at
   the writer's fence even when the fence has not moved, and the read runs once
