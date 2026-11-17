@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.16.5] - 2026-11-17
+
+### Fixed
+
+- lightwalletd `GetBlockRange` and `GetBlockRangeNullifiers` streams that span several 1,000-block chunks no longer fail with `CHAIN_EPOCH_PIN_UNAVAILABLE` when new blocks arrive while a wallet reads slowly. In compact-blocks serving, a slow stream no longer stops publication or makes the service report not ready. A stream now ends early only when a reorg reaches the blocks it is sending, with `ABORTED` as lightwalletd returns, or with `OUT_OF_RANGE` when the reorg lowered the tip; `zinder_compat_block_range_reorg_endings_total` counts these endings. ([#250](https://github.com/ZcashFoundation/zinder/pull/250))
+
+
 ## [0.16.4] - 2026-11-17
 
 ### Changed
