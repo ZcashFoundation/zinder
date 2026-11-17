@@ -107,9 +107,9 @@ and provenance live in
 `crates/zinder-proto/proto/compat/lightwalletd/UPSTREAM.md`. The compatibility
 adapter translates native query results, byte order, errors, and capability
 claims into that contract. It does not mutate canonical storage or use the
-upstream node as a fallback for indexed history or canonical reads. Sparse
-tree-state fill and transaction broadcast are allowed only where
-`WalletQueryApi` explicitly delegates those operations upstream.
+upstream node as a fallback for indexed history or canonical reads.
+Transaction broadcast is the one operation `WalletQueryApi` delegates upstream;
+`GetTreeState` is served from stored checkpoints and compact blocks.
 
 Compatibility claims are bounded by executable certification. The stable method
 matrix lives in [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md).

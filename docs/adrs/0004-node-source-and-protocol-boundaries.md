@@ -44,9 +44,9 @@ they are not service contracts.
 `zinder-compat-lightwalletd` translates `WalletQueryApi` semantics into
 the vendored lightwalletd contract. It does not build missing canonical
 artifacts or mutate canonical storage. Its explicitly configured edge calls
-may broadcast a transaction, discover network-upgrade activations, or fill
-sparse tree state through `zinder-source`; none can substitute for indexed
-history.
+may broadcast a transaction or discover network-upgrade activations through
+`zinder-source`; neither can substitute for indexed history. Tree state is
+served from stored checkpoints and compact blocks, never from the node.
 
 ## Consequences
 
@@ -63,3 +63,9 @@ history.
 - [Protocol boundary](../architecture/protocol-boundary.md)
 - [Service boundaries](../architecture/service-boundaries.md)
 - [Public interfaces](../architecture/public-interfaces.md)
+
+## Revision history
+
+- 2026-11-17: The compatibility adapter no longer fills sparse tree state
+  from the node; tree state is served from stored checkpoints and compact
+  blocks (see ADR-0005).

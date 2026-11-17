@@ -28,7 +28,7 @@ The public Rust SDK is remote-first. Its default `RemoteChainIndex` uses gRPC to
 
 ### Lightwalletd compatibility contract
 
-`zinder-compat-lightwalletd` serves the vendored lightwalletd `CompactTxStreamer` protocol by translating requests onto `WalletQueryApi`. `WalletServingQuery` answers from an admitted pair of canonical and wallet-projection readers; it does not maintain a second index, read Explorer materialized views, use Zebra as a fallback for indexed history, or construct parallel artifacts. It may broadcast transactions, discover network-upgrade activations, and fill sparse tree state through `zinder-source` when the query contract explicitly delegates those operations upstream.
+`zinder-compat-lightwalletd` serves the vendored lightwalletd `CompactTxStreamer` protocol by translating requests onto `WalletQueryApi`. `WalletServingQuery` answers from an admitted pair of canonical and wallet-projection readers; it does not maintain a second index, read Explorer materialized views, use Zebra as a fallback for indexed history, or construct parallel artifacts. It may broadcast transactions and discover network-upgrade activations through `zinder-source`. Tree state at any height comes from stored checkpoints and compact blocks, not from the node.
 
 For a client that already speaks the supported `CompactTxStreamer` protocol, adopting Zinder can be an endpoint substitution rather than a wallet rewrite. This is a wire-compatibility statement, not a claim that the Zinder binaries and configuration replace a lightwalletd deployment unchanged. Operators deploy Zinder's ingest, projector, native query, and compatibility runtimes, and each named wallet requires its own end-to-end certification before the project claims tested support.
 

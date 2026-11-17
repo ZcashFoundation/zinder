@@ -719,9 +719,14 @@ async fn future_block_errors_match_reference_for_range_methods() -> Result<()> {
     Ok(())
 }
 
+/// Heights compared with the reference, most of them between construction
+/// checkpoints, where Zinder reconstructs the tree state from stored compact
+/// blocks while lightwalletd asks its node.
+const TREE_STATE_PARITY_HEIGHTS: [u64; 9] = [1, 2, 57, 99, 100, 101, 149, 199, 250];
+
 #[tokio::test]
 #[ignore = "live parity test; see CLAUDE.md §Live Node Tests"]
-async fn tree_state_matches_reference_for_known_height() -> Result<()> {
+async fn tree_state_matches_reference_between_checkpoints() -> Result<()> {
     let _guard = init();
     let Some(_env) = require_live()? else {
         return Ok(());
@@ -729,15 +734,22 @@ async fn tree_state_matches_reference_for_known_height() -> Result<()> {
     let Some((mut zinder, mut reference)) = open_parity_clients().await? else {
         return Ok(());
     };
+    let zinder_tip = zinder.get_latest_block(ChainSpec {}).await?.into_inner();
+    let reference_tip = reference.get_latest_block(ChainSpec {}).await?.into_inner();
+    let shared_tip = zinder_tip.height.min(reference_tip.height);
 
-    let request = || BlockId {
-        height: 1,
-        hash: Vec::new(),
-    };
-    let zinder_tree_state = zinder.get_tree_state(request()).await?.into_inner();
-    let reference_tree_state = reference.get_tree_state(request()).await?.into_inner();
-
-    assert_tree_state_identity_matches(&zinder_tree_state, &reference_tree_state);
+    for height in TREE_STATE_PARITY_HEIGHTS
+        .into_iter()
+        .filter(|height| *height <= shared_tip)
+    {
+        let request = || BlockId {
+            height,
+            hash: Vec::new(),
+        };
+        let zinder_tree_state = zinder.get_tree_state(request()).await?.into_inner();
+        let reference_tree_state = reference.get_tree_state(request()).await?.into_inner();
+        assert_tree_state_identity_matches(&zinder_tree_state, &reference_tree_state);
+    }
     Ok(())
 }
 

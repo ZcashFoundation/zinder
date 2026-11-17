@@ -51,7 +51,6 @@ use zinder_core::{
 };
 use zinder_query::{TransactionStatus, WalletQueryApi, WalletServingQuery};
 use zinder_source::{TransactionBroadcaster as _, ZebraJsonRpcSource};
-use zinder_store::TREE_STATE_CHECKPOINT_STRIDE;
 use zinder_testkit::live::{LiveTestEnv, init, optional_env, require_live_for};
 use zinder_testkit::{
     P2pkhSpendArgs, TRANSPARENT_BROADCAST_TEST_SEED, TransparentAddress, TransparentTestKey,
@@ -140,9 +139,7 @@ async fn funded_spends_cross_nu7_and_version_4_is_rejected_after_it() -> Result<
         .assert_coinbase_branches_straddle(nu7_height, &activations)
         .await?;
     served.assert_tree_sizes_match_node(&env, tip).await?;
-    served
-        .assert_tree_states_match_node(&env, &activations, nu7_height, tip)
-        .await?;
+    served.assert_tree_states_match_node(&env, tip).await?;
     served.assert_subtree_roots_match_node(&env).await?;
     Ok(())
 }
@@ -502,34 +499,19 @@ impl ServedChain {
         Ok(())
     }
 
-    /// Compares the served tree state with `z_gettreestate` at the
-    /// activation heights, across NU7, and at every height that holds a
-    /// stored checkpoint. Construction stores a checkpoint, built from
-    /// Zinder's own commitment-tree frontiers, at each multiple of
-    /// [`TREE_STATE_CHECKPOINT_STRIDE`] and at the tip; other heights are
-    /// filled from the node for Zinder's canonical block.
+    /// Compares the served tree state with `z_gettreestate` at every height
+    /// through the tip, across every activation and NU7.
+    ///
+    /// Construction stores a checkpoint, built from Zinder's own
+    /// commitment-tree frontiers, only every 100 blocks and at the tip, so
+    /// most heights are reconstructed from stored compact blocks without
+    /// contacting the node.
     async fn assert_tree_states_match_node(
         &self,
         env: &LiveTestEnv,
-        activations: &NetworkUpgradeActivations,
-        nu7_height: BlockHeight,
         tip: BlockHeight,
     ) -> Result<()> {
-        let mut heights = vec![1, nu7_height.value().saturating_sub(1), nu7_height.value()];
-        heights.extend(
-            ["NU5", "NU6.3"]
-                .into_iter()
-                .filter_map(|name| activations.activation_height_by_name(name))
-                .map(BlockHeight::value),
-        );
-        heights.extend(
-            (1..=tip.value() / TREE_STATE_CHECKPOINT_STRIDE)
-                .map(|multiple| multiple * TREE_STATE_CHECKPOINT_STRIDE),
-        );
-        heights.push(tip.value());
-        heights.sort_unstable();
-        heights.dedup();
-        for height in heights {
+        for height in 1..=tip.value() {
             let tree_state = self
                 .wallet_query
                 .tree_state_at(BlockHeight::new(height), None)

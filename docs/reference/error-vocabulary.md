@@ -109,6 +109,14 @@ Persistent or upstream data could not be decoded. Retry disposition: **NonRetrya
 | `COMPACT_BLOCK_PAYLOAD_MALFORMED` | A persisted compact block failed to deserialize |
 | `ARTIFACT_CORRUPT` | A persisted artifact's checksum or shape is invalid, or a federated response carried an unusable value (for example a missing outpoint or an out-of-range Zatoshi amount) |
 
+### `RESOURCE_EXHAUSTED` family
+
+The server is already running its limit of a bounded kind of work. Retry disposition: **RetryAfterBackoff**.
+
+| Reason | What it means |
+| --- | --- |
+| `TREE_STATE_REPLAY_LIMIT_REACHED` | `WalletQuery.TreeStateAtHeight` named a height without a stored checkpoint, and the query already reconstructs one tree state per available CPU from stored compact blocks. A height with a stored checkpoint is never refused this way |
+
 ### `UNAVAILABLE` family
 
 Service is reachable but a dependency is not, or the operation is not yet supported. Retry disposition: **RetryAfterBackoff**.
