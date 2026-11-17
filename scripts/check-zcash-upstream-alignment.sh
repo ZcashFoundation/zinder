@@ -56,6 +56,20 @@ resolved_versions() {
   ' <<<"$tree" | sort -u
 }
 
+# The parser must be the zebra-chain release the certified Zebra image uses.
+expected_zebra_chain_version='16.0.0'
+mapfile -t zebra_chain_versions < <(
+  resolved_versions zebra-chain "$workspace_tree"
+)
+if [[
+  "${#zebra_chain_versions[@]}" -ne 1 ||
+  "${zebra_chain_versions[0]:-}" != "$expected_zebra_chain_version"
+]]; then
+  echo >&2 \
+    "zebra-chain must resolve to exactly $expected_zebra_chain_version, the release the certified Zebra image uses; found: ${zebra_chain_versions[*]:-none}"
+  exit 1
+fi
+
 for package_name in \
   incrementalmerkletree \
   orchard \
