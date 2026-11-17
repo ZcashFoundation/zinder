@@ -48,7 +48,15 @@ pub fn completed_subtree_frontier(protocol: ShieldedProtocol) -> Result<Commitme
     frontier_of_size(protocol, SUBTREE_LEAF_COUNT)
 }
 
-fn frontier_of_size(protocol: ShieldedProtocol, tree_size: u32) -> Result<CommitmentTreeFrontier> {
+/// Returns a canonical `protocol` frontier of `tree_size` note commitments.
+///
+/// Its tip leaf and every ommer are [`FIXTURE_NOTE_COMMITMENT`], so a size one
+/// below a multiple of [`SUBTREE_LEAF_COUNT`] places the next appended
+/// commitment at a subtree boundary.
+pub fn frontier_of_size(
+    protocol: ShieldedProtocol,
+    tree_size: u32,
+) -> Result<CommitmentTreeFrontier> {
     let position = Position::from(
         u64::from(tree_size)
             .checked_sub(1)

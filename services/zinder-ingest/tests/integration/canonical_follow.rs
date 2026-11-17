@@ -6,6 +6,7 @@
 use std::{
     collections::BTreeMap,
     num::{NonZeroU32, NonZeroU64},
+    ops::Bound,
     path::Path,
     sync::Arc,
     time::Duration,
@@ -20,8 +21,9 @@ use tokio_util::sync::CancellationToken;
 use zebra_chain::{block::Block as ZebraBlock, serialization::ZcashDeserializeInto};
 use zinder_core::{
     BlockHeight, BlockId, CommitmentTreeAccumulator, CommitmentTreeCheckpoint,
-    CommitmentTreeFrontiers, MempoolEvictionReason, Network, NetworkUpgradeActivations,
-    SubtreeRootRange, TransactionId, UnixTimestampMillis,
+    CommitmentTreeFrontier, CommitmentTreeFrontiers, MempoolEvictionReason, Network,
+    NetworkUpgradeActivations, SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootArtifact,
+    SubtreeRootIndex, SubtreeRootRange, TransactionId, UnixTimestampMillis,
 };
 use zinder_ingest::{
     CanonicalConstructionConfig, CanonicalControlCommand, CanonicalFollowConfig, CanonicalFollower,
@@ -30,17 +32,23 @@ use zinder_ingest::{
 };
 use zinder_runtime::{ComposedReadiness, NodeUnavailableDetail, Readiness, ReadinessCause};
 use zinder_source::{
-    NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceChainSegment,
-    SourceChainSegmentLimits, SourceError, SourceSubtreeRoots,
+    NodeCapabilities, NodeSource, SourceBlock, SourceChainSegment, SourceChainSegmentLimits,
+    SourceError, SourceSubtreeRoot, SourceSubtreeRoots,
 };
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan,
     CanonicalStoreWorkload, MempoolEvent, MempoolEventRetentionConfig,
     MempoolEventRetentionStepBudget, RocksDbCanonicalBuilder, RocksDbResourceBudget,
 };
-use zinder_testkit::sample_regtest_upgrade_activations;
+use zinder_testkit::{frontier_of_size, sample_regtest_upgrade_activations};
 
-use super::fixture_block::fixture_source_block;
+use super::{
+    canonical_block_context::{chained_source_block, pool_commitments, shielded_transactions},
+    fixture_block::{
+        fixture_orchard_source_block, fixture_sapling_source_block, fixture_source_block,
+        fixture_zakura_orchard_source_block,
+    },
+};
 
 const SERIALIZED_HEADER_PARENT_OFFSET: usize = 4;
 const SERIALIZED_HEADER_PARENT_END: usize = SERIALIZED_HEADER_PARENT_OFFSET + 32;
@@ -67,16 +75,36 @@ struct RecordingParseableSource {
     tip_call_gate: Arc<Mutex<Option<SourceTipCallGate>>>,
     cancel_after_tip_call: Arc<Mutex<Option<(u32, CancellationToken)>>>,
     cancel_after_checkpoint: Arc<Mutex<Option<(BlockHeight, CancellationToken)>>>,
-    switch_before_checkpoint: Arc<Mutex<Option<PendingChainSwitch>>>,
+    switch_before_checkpoint: Arc<Mutex<Option<(BlockHeight, PendingChainSwitch)>>>,
+    switch_before_subtree_read: Arc<Mutex<Option<PendingChainSwitch>>>,
+    switch_back_after_subtree_read: Arc<Mutex<Option<(BlockHeight, PendingChainSwitch)>>>,
+    subtree_roots: Arc<Mutex<Vec<(ShieldedProtocol, SourceSubtreeRoot)>>>,
 }
 
-/// A best-chain switch the source applies when the tree state at `height` is
-/// next read, after the block at that height was already served.
+/// A best-chain switch the source applies before a later read, after it
+/// already served a block of the previous chain.
 struct PendingChainSwitch {
-    height: BlockHeight,
     blocks: BTreeMap<BlockHeight, SourceBlock>,
     checkpoints: BTreeMap<BlockHeight, CommitmentTreeCheckpoint>,
+    subtree_roots: Vec<(ShieldedProtocol, SourceSubtreeRoot)>,
     tip_height: BlockHeight,
+}
+
+impl PendingChainSwitch {
+    /// A switch to a parseable chain, which completes no subtree, with its
+    /// tip at `tip_height`.
+    fn to_parseable_chain(
+        blocks: BTreeMap<BlockHeight, SourceBlock>,
+        activations: &NetworkUpgradeActivations,
+        tip_height: BlockHeight,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            checkpoints: checkpoints_for_parseable_chain(&blocks, activations)?,
+            blocks,
+            subtree_roots: Vec::new(),
+            tip_height,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -102,11 +130,48 @@ impl RecordingParseableSource {
             cancel_after_tip_call: Arc::new(Mutex::new(None)),
             cancel_after_checkpoint: Arc::new(Mutex::new(None)),
             switch_before_checkpoint: Arc::new(Mutex::new(None)),
+            switch_before_subtree_read: Arc::new(Mutex::new(None)),
+            switch_back_after_subtree_read: Arc::new(Mutex::new(None)),
+            subtree_roots: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    fn switch_chain_before_checkpoint(&self, switch: PendingChainSwitch) {
-        *self.switch_before_checkpoint.lock() = Some(switch);
+    /// Switches to `switch` when the tree state at `height` is next read.
+    fn switch_chain_before_checkpoint(&self, height: BlockHeight, switch: PendingChainSwitch) {
+        *self.switch_before_checkpoint.lock() = Some((height, switch));
+    }
+
+    /// Switches to `switch` when subtree roots are next read.
+    fn switch_chain_before_subtree_read(&self, switch: PendingChainSwitch) {
+        *self.switch_before_subtree_read.lock() = Some(switch);
+    }
+
+    /// Switches to `switch` when subtree roots are next read, and to
+    /// `switch_back` when the tree state at `height` is read after that.
+    fn switch_chain_around_subtree_read(
+        &self,
+        switch: PendingChainSwitch,
+        height: BlockHeight,
+        switch_back: PendingChainSwitch,
+    ) {
+        self.switch_chain_before_subtree_read(switch);
+        *self.switch_back_after_subtree_read.lock() = Some((height, switch_back));
+    }
+
+    /// Returns a source that serves `chain`.
+    fn serving(chain: PendingChainSwitch) -> Self {
+        let source = Self::new(BTreeMap::new(), BTreeMap::new(), chain.tip_height);
+        source.apply_chain_switch(chain);
+        source
+    }
+
+    fn apply_chain_switch(&self, switch: PendingChainSwitch) {
+        self.replace_chain(switch.blocks, switch.checkpoints, switch.tip_height);
+        self.replace_subtree_roots(switch.subtree_roots);
+    }
+
+    fn replace_subtree_roots(&self, subtree_roots: Vec<(ShieldedProtocol, SourceSubtreeRoot)>) {
+        *self.subtree_roots.lock() = subtree_roots;
     }
 
     fn set_tip_height(&self, height: BlockHeight) {
@@ -214,9 +279,9 @@ impl NodeSource for RecordingParseableSource {
         let switch = self
             .switch_before_checkpoint
             .lock()
-            .take_if(|switch| switch.height == height);
-        if let Some(switch) = switch {
-            self.replace_chain(switch.blocks, switch.checkpoints, switch.tip_height);
+            .take_if(|(switch_height, _)| *switch_height == height);
+        if let Some((_, switch)) = switch {
+            self.apply_chain_switch(switch);
         }
         let checkpoint = self.checkpoint_at(height)?;
         if let Some((cancel_at, cancel)) = self.cancel_after_checkpoint.lock().as_ref()
@@ -254,14 +319,44 @@ impl NodeSource for RecordingParseableSource {
         Ok(BlockId::new(height, block.hash))
     }
 
+    /// Answers from the current chain's subtree roots, which, like
+    /// `z_getsubtreesbyindex`, name no block, and refuses a short range as
+    /// the JSON-RPC source does.
     async fn fetch_subtree_root_range(
         &self,
         range: SubtreeRootRange,
     ) -> Result<SourceSubtreeRoots, SourceError> {
         self.calls.lock().push(SourceCall::Subtree(range));
-        Err(SourceError::NodeCapabilityMissing {
-            capability: NodeCapability::SubtreeRoots,
-        })
+        let switch = self.switch_before_subtree_read.lock().take();
+        if let Some(switch) = switch {
+            self.apply_chain_switch(switch);
+            let switch_back = self.switch_back_after_subtree_read.lock().take();
+            if let Some((height, switch_back)) = switch_back {
+                self.switch_chain_before_checkpoint(height, switch_back);
+            }
+        }
+        let subtree_roots = self.subtree_roots.lock().clone();
+        let roots = range
+            .into_iter()
+            .map(|index| {
+                subtree_roots
+                    .iter()
+                    .find(|(protocol, root)| {
+                        *protocol == range.protocol && root.subtree_index == index
+                    })
+                    .map(|(_, root)| root.clone())
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| SourceError::SubtreeRootsUnavailable {
+                protocol: range.protocol,
+                start_index: range.start_index,
+                reason: "parseable follower fixture has no root at this index".to_owned(),
+            })?;
+        Ok(SourceSubtreeRoots::new(
+            range.protocol,
+            range.start_index,
+            roots,
+        ))
     }
 }
 
@@ -1825,12 +1920,10 @@ async fn switch_best_chain_before_tree_state_read()
     let sibling = forked_parseable_chain(&original, 3, 3, 31)?;
     let sibling_tip = block_id(&sibling, 3)?;
     assert_ne!(sibling_tip, block_id(&original, 3)?);
-    source.switch_chain_before_checkpoint(PendingChainSwitch {
-        height: BlockHeight::new(3),
-        checkpoints: checkpoints_for_parseable_chain(&sibling, &activations)?,
-        blocks: sibling,
-        tip_height: BlockHeight::new(3),
-    });
+    source.switch_chain_before_checkpoint(
+        BlockHeight::new(3),
+        PendingChainSwitch::to_parseable_chain(sibling, &activations, BlockHeight::new(3))?,
+    );
     source.clear_calls();
     Ok(BestChainSwitchBeforeTreeState {
         source,
@@ -1939,12 +2032,10 @@ async fn best_chain_switch_during_replacement_reobserves_and_replaces_with_the_n
         checkpoints_for_parseable_chain(&first_branch, &activations)?,
         BlockHeight::new(4),
     );
-    source.switch_chain_before_checkpoint(PendingChainSwitch {
-        height: BlockHeight::new(3),
-        checkpoints: checkpoints_for_parseable_chain(&second_branch, &activations)?,
-        blocks: second_branch,
-        tip_height: BlockHeight::new(4),
-    });
+    source.switch_chain_before_checkpoint(
+        BlockHeight::new(3),
+        PendingChainSwitch::to_parseable_chain(second_branch, &activations, BlockHeight::new(4))?,
+    );
     source.clear_calls();
 
     let readiness = ComposedReadiness::new(Readiness::default(), &[]);
@@ -2112,6 +2203,959 @@ async fn append_against_tree_states(
     )?;
     assert_eq!(reopened.event_fence(), original_fence);
     Ok(error)
+}
+
+/// A block that completes a subtree commits the root derived from its own
+/// note commitments, with one subtree-root read and no other added read.
+#[tokio::test]
+async fn a_block_that_completes_a_subtree_commits_the_root_derived_from_its_commitments()
+-> Result<(), Box<dyn std::error::Error>> {
+    let siblings = subtree_completing_siblings()?;
+    let temporary = tempdir()?;
+    let (source, store) =
+        publish_subtree_boundary_store(&siblings, 3, &temporary.path().join("canonical")).await?;
+    let first_root =
+        siblings.serve_chain_through(&source, &siblings.first, SUBTREE_COMPLETION_HEIGHT)?;
+    source.clear_calls();
+
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let cancel = CancellationToken::new();
+    let follower = follower_to_target(
+        &source,
+        &siblings.activations,
+        SUBTREE_COMPLETION_HEIGHT,
+        &readiness,
+        &cancel,
+    );
+    let store = follow_canonical_tip(store, follower).await?;
+
+    assert_eq!(
+        store.event_fence().visible_tip(),
+        BlockId::new(SUBTREE_COMPLETION_HEIGHT, siblings.first.hash)
+    );
+    assert_eq!(
+        store.subtree_roots(orchard_subtree_zero())?,
+        vec![completed_orchard_subtree_zero(&first_root, &siblings.first)]
+    );
+    assert_eq!(
+        source.calls(),
+        vec![
+            SourceCall::Tip,
+            SourceCall::Block(SUBTREE_COMPLETION_HEIGHT),
+            SourceCall::Checkpoint(SUBTREE_COMPLETION_HEIGHT),
+            SourceCall::Subtree(orchard_subtree_zero()),
+        ]
+    );
+    Ok(())
+}
+
+/// The node switches to a sibling that completes the same subtree at the
+/// same height between the block read and the subtree-root read.
+///
+/// The node's root disagrees with the root derived from the block ingest
+/// read, and the block is no longer on the node's best chain. The follower
+/// reports a changed upstream view, observes the node again, and appends the
+/// sibling with the sibling's own root.
+#[tokio::test]
+async fn best_chain_switch_before_the_subtree_root_read_appends_the_sibling_with_its_root()
+-> Result<(), Box<dyn std::error::Error>> {
+    let race = switch_best_chain_before_subtree_root_read(3, SUBTREE_COMPLETION_HEIGHT).await?;
+    let source = race.source.clone();
+    Box::pin(follow_subtree_root_race(
+        race,
+        &source,
+        "tree-state hash disagrees with the fetched block hash",
+        &append_race_calls(),
+    ))
+    .await
+}
+
+/// The same switch against a node that reads a tree state by block hash, as
+/// Zebra and Zakura do, and refuses the block that left its best chain.
+#[tokio::test]
+async fn hash_keyed_refusal_after_a_switch_before_the_subtree_root_read_appends_the_sibling()
+-> Result<(), Box<dyn std::error::Error>> {
+    let race = switch_best_chain_before_subtree_root_read(3, SUBTREE_COMPLETION_HEIGHT).await?;
+    let source = HashKeyedTreeStateSource(race.source.clone());
+    Box::pin(follow_subtree_root_race(
+        race,
+        &source,
+        "the requested block is not in the main chain",
+        &append_race_calls(),
+    ))
+    .await
+}
+
+/// The same switch while the follower prepares a replacement: the local
+/// block at height 4 completed no subtree, and each sibling branch replaces it
+/// with a block that does, extended to height 5.
+#[tokio::test]
+async fn best_chain_switch_before_a_replacement_subtree_root_read_replaces_with_the_sibling()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fork_tip = BlockHeight::new(SUBTREE_COMPLETION_HEIGHT.value().saturating_add(1));
+    let race = switch_best_chain_before_subtree_root_read(4, fork_tip).await?;
+    let source = HashKeyedTreeStateSource(race.source.clone());
+    let attempt = [
+        SourceCall::Tip,
+        SourceCall::Block(fork_tip),
+        SourceCall::Block(SUBTREE_COMPLETION_HEIGHT),
+        SourceCall::Checkpoint(SUBTREE_COMPLETION_HEIGHT),
+        SourceCall::Subtree(orchard_subtree_zero()),
+    ];
+    let expected_calls = [
+        attempt.as_slice(),
+        &[SourceCall::Checkpoint(SUBTREE_COMPLETION_HEIGHT)],
+        attempt.as_slice(),
+        &[SourceCall::Checkpoint(fork_tip)],
+    ]
+    .concat();
+    Box::pin(follow_subtree_root_race(
+        race,
+        &source,
+        "the requested block is not in the main chain",
+        &expected_calls,
+    ))
+    .await
+}
+
+/// A subtree root for the block ingest read that differs from the root
+/// derived from that block, while the node still holds the block, is a
+/// contradiction, not a changed view.
+///
+/// The follower re-reads the block and the subtree roots, stops with an error
+/// naming the subtree, and the store keeps its fence and stores no root.
+#[tokio::test]
+async fn a_subtree_root_that_contradicts_the_derived_root_for_the_same_block_fails_closed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let siblings = subtree_completing_siblings()?;
+    let first_root = siblings
+        .chain_switch(&siblings.first, SUBTREE_COMPLETION_HEIGHT)?
+        .subtree_roots;
+    let first_root = only_subtree_root(&first_root)?;
+    let second_root = siblings
+        .chain_switch(&siblings.second, SUBTREE_COMPLETION_HEIGHT)?
+        .subtree_roots;
+    let second_root = only_subtree_root(&second_root)?;
+    assert_ne!(first_root.root_hash, second_root.root_hash);
+    let contradictions = [
+        SourceSubtreeRoot::new(
+            first_root.subtree_index,
+            second_root.root_hash,
+            first_root.completing_block_height,
+        ),
+        SourceSubtreeRoot::new(
+            first_root.subtree_index,
+            first_root.root_hash,
+            BlockHeight::new(SUBTREE_COMPLETION_HEIGHT.value().saturating_add(1)),
+        ),
+    ];
+    for contradiction in contradictions {
+        let temporary = tempdir()?;
+        let store_path = temporary.path().join("canonical");
+        let (source, store) = publish_subtree_boundary_store(&siblings, 3, &store_path).await?;
+        let original_fence = store.event_fence();
+        siblings.serve_chain_through(&source, &siblings.first, SUBTREE_COMPLETION_HEIGHT)?;
+        source.replace_subtree_roots(vec![(ShieldedProtocol::Orchard, contradiction)]);
+        source.clear_calls();
+
+        let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+        let cancel = CancellationToken::new();
+        let follower = follower_to_target(
+            &source,
+            &siblings.activations,
+            SUBTREE_COMPLETION_HEIGHT,
+            &readiness,
+            &cancel,
+        );
+        let error = follow_canonical_tip(store, follower)
+            .await
+            .err()
+            .ok_or("a contradicting subtree root must stop the follower")?;
+
+        assert!(
+            matches!(
+                error,
+                zinder_ingest::CanonicalFollowError::SourceSubtreeRootMismatch {
+                    height,
+                    protocol: ShieldedProtocol::Orchard,
+                    subtree_index,
+                } if height == SUBTREE_COMPLETION_HEIGHT && subtree_index == SubtreeRootIndex::new(0)
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            source.calls(),
+            vec![
+                SourceCall::Tip,
+                SourceCall::Block(SUBTREE_COMPLETION_HEIGHT),
+                SourceCall::Checkpoint(SUBTREE_COMPLETION_HEIGHT),
+                SourceCall::Subtree(orchard_subtree_zero()),
+                SourceCall::Checkpoint(SUBTREE_COMPLETION_HEIGHT),
+                SourceCall::Subtree(orchard_subtree_zero()),
+            ]
+        );
+        let reopened = zinder_store::RocksDbCanonicalStore::open_ready(
+            &store_path,
+            &siblings.activations,
+            CanonicalStoreWorkload::Wallet,
+            zinder_store::RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(2)?,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        assert_eq!(reopened.event_fence(), original_fence);
+        assert!(reopened.subtree_roots(orchard_subtree_zero()).is_err());
+    }
+    Ok(())
+}
+
+/// The node switches to a sibling that completes the same subtree before the
+/// subtree-root read, and back before the block is read again by hash.
+///
+/// The node holds the block at that read, so the follower reads the subtree
+/// roots once more and appends the block with its own root in the same
+/// iteration, instead of stopping or observing the node again.
+#[tokio::test]
+async fn a_switch_away_and_back_around_the_subtree_root_read_appends_the_block_with_its_root()
+-> Result<(), Box<dyn std::error::Error>> {
+    let siblings = subtree_completing_siblings()?;
+    let temporary = tempdir()?;
+    let (source, store) =
+        publish_subtree_boundary_store(&siblings, 3, &temporary.path().join("canonical")).await?;
+    let first_root =
+        siblings.serve_chain_through(&source, &siblings.first, SUBTREE_COMPLETION_HEIGHT)?;
+    source.switch_chain_around_subtree_read(
+        siblings.chain_switch(&siblings.second, SUBTREE_COMPLETION_HEIGHT)?,
+        SUBTREE_COMPLETION_HEIGHT,
+        siblings.chain_switch(&siblings.first, SUBTREE_COMPLETION_HEIGHT)?,
+    );
+    source.clear_calls();
+
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let cancel = CancellationToken::new();
+    let follower = follower_to_target(
+        &source,
+        &siblings.activations,
+        SUBTREE_COMPLETION_HEIGHT,
+        &readiness,
+        &cancel,
+    );
+    let store = follow_canonical_tip(store, follower).await?;
+
+    assert_eq!(
+        store.event_fence().visible_tip(),
+        BlockId::new(SUBTREE_COMPLETION_HEIGHT, siblings.first.hash)
+    );
+    assert_eq!(
+        store.subtree_roots(orchard_subtree_zero())?,
+        vec![completed_orchard_subtree_zero(&first_root, &siblings.first)]
+    );
+    assert_eq!(
+        source.calls(),
+        vec![
+            SourceCall::Tip,
+            SourceCall::Block(SUBTREE_COMPLETION_HEIGHT),
+            SourceCall::Checkpoint(SUBTREE_COMPLETION_HEIGHT),
+            SourceCall::Subtree(orchard_subtree_zero()),
+            SourceCall::Checkpoint(SUBTREE_COMPLETION_HEIGHT),
+            SourceCall::Subtree(orchard_subtree_zero()),
+        ]
+    );
+    Ok(())
+}
+
+/// Construction stores the subtree roots derived from the blocks it loads, in
+/// the order the node lists them, when the blocks complete one pool's subtree
+/// before another's.
+#[tokio::test]
+async fn construction_stores_the_subtree_roots_derived_from_the_loaded_blocks()
+-> Result<(), Box<dyn std::error::Error>> {
+    let chains = InterleavedSubtreeChains::new()?;
+    let chain = chains.chain(&fixture_orchard_source_block()?, 1)?;
+    let orchard_block = block_id(&chain.blocks, 3)?;
+    let sapling_block = block_id(&chain.blocks, 4)?;
+    let expected_roots = InterleavedSubtreeChains::stored_roots(&chain)?;
+    let completion_order = chain
+        .subtree_roots
+        .iter()
+        .map(|(protocol, root)| (*protocol, root.completing_block_height))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        completion_order,
+        vec![
+            (ShieldedProtocol::Orchard, orchard_block.height),
+            (ShieldedProtocol::Sapling, sapling_block.height),
+        ]
+    );
+    let temporary = tempdir()?;
+    let source = RecordingParseableSource::serving(chain);
+
+    let built = chains
+        .construct(&source, &temporary.path().join("canonical"))
+        .await??;
+
+    assert_eq!(built.subtree_root_evidence.subtree_root_count, 2);
+    assert_eq!(
+        InterleavedSubtreeChains::publish_and_read_roots(built, orchard_block)?,
+        expected_roots
+    );
+    Ok(())
+}
+
+/// The node reports a sibling chain's Orchard root for the blocks
+/// construction loaded.
+///
+/// A node that switched to the sibling and keeps it refuses the fixed-tip read
+/// that follows as a changed view. A node that holds the fixed tip and reports
+/// the sibling's root on both reads contradicts the loaded blocks.
+/// Construction stores neither root.
+#[tokio::test]
+async fn construction_refuses_subtree_roots_read_from_a_sibling_chain()
+-> Result<(), Box<dyn std::error::Error>> {
+    let chains = InterleavedSubtreeChains::new()?;
+    let first = || chains.chain(&fixture_orchard_source_block()?, 1);
+    let second = || chains.chain(&fixture_zakura_orchard_source_block()?, 2);
+
+    let temporary = tempdir()?;
+    let source = RecordingParseableSource::serving(first()?);
+    source.switch_chain_before_subtree_read(second()?);
+    let error = chains
+        .construct(&source, &temporary.path().join("kept-sibling"))
+        .await?
+        .err()
+        .ok_or("a node that left the fixed tip must refuse construction")?;
+    assert!(
+        matches!(
+            error,
+            zinder_ingest::CanonicalConstructionError::Source { .. }
+        ),
+        "{error}"
+    );
+
+    let source = RecordingParseableSource::serving(first()?);
+    source.replace_subtree_roots(second()?.subtree_roots);
+    let error = chains
+        .construct(&source, &temporary.path().join("contradicting-roots"))
+        .await?
+        .err()
+        .ok_or("a sibling's subtree root must refuse construction")?;
+    assert!(
+        matches!(
+            error,
+            zinder_ingest::CanonicalConstructionError::SourceSubtreeRootMismatch {
+                protocol: ShieldedProtocol::Orchard,
+                subtree_index,
+            } if subtree_index == SubtreeRootIndex::new(0)
+        ),
+        "{error}"
+    );
+    assert_eq!(
+        subtree_and_checkpoint_calls(&source),
+        construction_reread_calls()
+    );
+    Ok(())
+}
+
+/// The node switches to a sibling chain before construction reads the loaded
+/// blocks' subtree roots, and back before it reads the fixed tip by hash.
+///
+/// The node holds the fixed tip at that read, so construction reads the roots
+/// once more and stores the roots derived from the loaded blocks.
+#[tokio::test]
+async fn construction_reads_subtree_roots_again_after_a_switch_away_and_back()
+-> Result<(), Box<dyn std::error::Error>> {
+    let chains = InterleavedSubtreeChains::new()?;
+    let first = chains.chain(&fixture_orchard_source_block()?, 1)?;
+    let settled = block_id(&first.blocks, 3)?;
+    let expected_roots = InterleavedSubtreeChains::stored_roots(&first)?;
+    let temporary = tempdir()?;
+    let source = RecordingParseableSource::serving(first);
+    source.switch_chain_around_subtree_read(
+        chains.chain(&fixture_zakura_orchard_source_block()?, 2)?,
+        BlockHeight::new(4),
+        chains.chain(&fixture_orchard_source_block()?, 1)?,
+    );
+
+    let built = chains
+        .construct(&source, &temporary.path().join("canonical"))
+        .await??;
+
+    assert_eq!(
+        subtree_and_checkpoint_calls(&source),
+        construction_reread_calls()
+    );
+    assert_eq!(
+        InterleavedSubtreeChains::publish_and_read_roots(built, settled)?,
+        expected_roots
+    );
+    Ok(())
+}
+
+/// Returns the subtree-root and tree-state reads `source` served.
+fn subtree_and_checkpoint_calls(source: &RecordingParseableSource) -> Vec<SourceCall> {
+    source
+        .calls()
+        .into_iter()
+        .filter(|call| matches!(call, SourceCall::Subtree(_) | SourceCall::Checkpoint(_)))
+        .collect()
+}
+
+/// Returns the reads of a construction whose first subtree-root reads differ
+/// from the derived roots: both ranges, the fixed tip by hash, and both
+/// ranges again.
+fn construction_reread_calls() -> Vec<SourceCall> {
+    let ranges = [
+        SourceCall::Subtree(subtree_zero(ShieldedProtocol::Sapling)),
+        SourceCall::Subtree(orchard_subtree_zero()),
+    ];
+    [
+        ranges.as_slice(),
+        &[SourceCall::Checkpoint(BlockHeight::new(4))],
+        ranges.as_slice(),
+    ]
+    .concat()
+}
+
+/// Chains on the parseable chain's block at height 2, whose tree state is one
+/// Sapling and one Orchard commitment short of subtree 0.
+///
+/// Block 3 of each chain completes Orchard subtree 0 and block 4 then
+/// completes Sapling subtree 0, which is the reverse of the order in which a
+/// node lists the two pools' roots.
+struct InterleavedSubtreeChains {
+    activations: Arc<NetworkUpgradeActivations>,
+    predecessor: CommitmentTreeCheckpoint,
+}
+
+impl InterleavedSubtreeChains {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let SubtreeCompletingSiblings {
+            activations,
+            predecessor,
+            ..
+        } = subtree_completing_siblings()?;
+        let predecessor = CommitmentTreeCheckpoint::new(
+            predecessor.block_id,
+            predecessor.block_time_seconds,
+            CommitmentTreeFrontiers::from_validated_parts(
+                Some(frontier_of_size(
+                    ShieldedProtocol::Sapling,
+                    SUBTREE_LEAF_COUNT - 1,
+                )?),
+                Some(frontier_of_size(
+                    ShieldedProtocol::Orchard,
+                    SUBTREE_LEAF_COUNT - 1,
+                )?),
+                None,
+            ),
+        );
+        Ok(Self {
+            activations,
+            predecessor,
+        })
+    }
+
+    /// Returns the chain whose block 3 carries `orchard_source`'s shielded
+    /// transactions, with the checkpoints and subtree roots a node serves.
+    fn chain(
+        &self,
+        orchard_source: &SourceBlock,
+        time_nonce: u8,
+    ) -> Result<PendingChainSwitch, Box<dyn std::error::Error>> {
+        let orchard_block = chained_source_block(
+            BlockHeight::new(3),
+            self.predecessor.block_id.hash,
+            time_nonce,
+            shielded_transactions(orchard_source)?,
+        )?;
+        let sapling_block = chained_source_block(
+            BlockHeight::new(4),
+            orchard_block.hash,
+            time_nonce,
+            shielded_transactions(&fixture_sapling_source_block()?)?,
+        )?;
+        let blocks = BTreeMap::from([
+            (orchard_block.height, orchard_block),
+            (sapling_block.height, sapling_block),
+        ]);
+        let (checkpoints, subtree_roots) =
+            tree_facts(&self.activations, &self.predecessor, &blocks)?;
+        Ok(PendingChainSwitch {
+            blocks,
+            checkpoints,
+            subtree_roots,
+            tip_height: BlockHeight::new(4),
+        })
+    }
+
+    /// Returns the Sapling and Orchard subtree-zero roots a store built from
+    /// `chain` holds, attributed to the chain's completing blocks.
+    fn stored_roots(
+        chain: &PendingChainSwitch,
+    ) -> Result<Vec<SubtreeRootArtifact>, Box<dyn std::error::Error>> {
+        [
+            (ShieldedProtocol::Sapling, 4),
+            (ShieldedProtocol::Orchard, 3),
+        ]
+        .into_iter()
+        .map(|(protocol, height)| {
+            let block = block_id(&chain.blocks, height)?;
+            chain
+                .subtree_roots
+                .iter()
+                .find(|(root_protocol, _)| *root_protocol == protocol)
+                .map(|(_, root)| {
+                    SubtreeRootArtifact::new(
+                        protocol,
+                        root.subtree_index,
+                        root.root_hash,
+                        block.height,
+                        block.hash,
+                    )
+                })
+                .ok_or_else(|| "the chain completes a subtree in each pool".into())
+        })
+        .collect()
+    }
+
+    /// Publishes `built` settled at `settled` and returns its Sapling and
+    /// Orchard subtree-zero roots.
+    fn publish_and_read_roots(
+        built: zinder_ingest::CanonicalSourceLoadOutcome,
+        settled: BlockId,
+    ) -> Result<Vec<SubtreeRootArtifact>, Box<dyn std::error::Error>> {
+        let validated = built.builder.prepare_cold_certified_publication()?;
+        let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
+            settled,
+            UnixTimestampMillis::new(1_783_933_200_000),
+        ))?;
+        let store = validated.publish_baseline(publication)?;
+        let mut roots = store.subtree_roots(subtree_zero(ShieldedProtocol::Sapling))?;
+        roots.extend(store.subtree_roots(orchard_subtree_zero())?);
+        Ok(roots)
+    }
+
+    /// Constructs a store from the predecessor through the block `source`
+    /// serves at height 4.
+    async fn construct(
+        &self,
+        source: &RecordingParseableSource,
+        store_path: &Path,
+    ) -> Result<
+        Result<
+            zinder_ingest::CanonicalSourceLoadOutcome,
+            zinder_ingest::CanonicalConstructionError,
+        >,
+        Box<dyn std::error::Error>,
+    > {
+        let build_plan = CanonicalStoreBuildPlan::checkpointed(
+            &self.activations,
+            self.predecessor.clone(),
+            source
+                .fetch_block_at(BlockHeight::new(4))
+                .await
+                .map(|block| BlockId::new(block.height, block.hash))?,
+            zinder_store::RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(2)?,
+        )?;
+        let builder = RocksDbCanonicalBuilder::create_fresh(
+            store_path,
+            CanonicalStoreWorkload::Wallet,
+            build_plan,
+            RocksDbResourceBudget::for_local_tests(),
+        )?;
+        let construction = CanonicalConstructionConfig::for_local_tests(
+            Duration::from_secs(5),
+            Arc::clone(&self.activations),
+        );
+        Ok(load_fresh_canonical(builder, source, &construction).await)
+    }
+}
+
+/// Height at which each subtree-completing sibling completes Orchard subtree 0.
+const SUBTREE_COMPLETION_HEIGHT: BlockHeight = BlockHeight::new(4);
+
+/// Two blocks at [`SUBTREE_COMPLETION_HEIGHT`] on the same parent that each
+/// complete Orchard subtree 0, with different first Orchard commitments and so
+/// different roots.
+struct SubtreeCompletingSiblings {
+    activations: Arc<NetworkUpgradeActivations>,
+    /// Tree state at height 2, one Orchard commitment short of subtree 0.
+    predecessor: CommitmentTreeCheckpoint,
+    /// Coinbase-only blocks at heights 3 and [`SUBTREE_COMPLETION_HEIGHT`].
+    base: BTreeMap<BlockHeight, SourceBlock>,
+    first: SourceBlock,
+    second: SourceBlock,
+}
+
+fn subtree_completing_siblings() -> Result<SubtreeCompletingSiblings, Box<dyn std::error::Error>> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let parseable = parseable_multi_block_chain()?;
+    let predecessor_block = parseable
+        .get(&BlockHeight::new(2))
+        .ok_or("parseable chain must contain height 2")?;
+    let predecessor = CommitmentTreeCheckpoint::new(
+        BlockId::new(predecessor_block.height, predecessor_block.hash),
+        predecessor_block.block_time_seconds,
+        CommitmentTreeFrontiers::from_validated_parts(
+            Some(CommitmentTreeFrontier::empty(ShieldedProtocol::Sapling)),
+            Some(frontier_of_size(
+                ShieldedProtocol::Orchard,
+                SUBTREE_LEAF_COUNT - 1,
+            )?),
+            None,
+        ),
+    );
+    let base: BTreeMap<_, _> = parseable
+        .range(BlockHeight::new(3)..=SUBTREE_COMPLETION_HEIGHT)
+        .map(|(height, block)| (*height, block.clone()))
+        .collect();
+    let parent_hash = block_id(&parseable, 3)?.hash;
+    // Time nonces keep both siblings' headers distinct from the coinbase-only
+    // block at the same height.
+    let first = chained_source_block(
+        SUBTREE_COMPLETION_HEIGHT,
+        parent_hash,
+        1,
+        shielded_transactions(&fixture_orchard_source_block()?)?,
+    )?;
+    let second = chained_source_block(
+        SUBTREE_COMPLETION_HEIGHT,
+        parent_hash,
+        2,
+        shielded_transactions(&fixture_zakura_orchard_source_block()?)?,
+    )?;
+    Ok(SubtreeCompletingSiblings {
+        activations,
+        predecessor,
+        base,
+        first,
+        second,
+    })
+}
+
+impl SubtreeCompletingSiblings {
+    /// Returns the chain through height 3 extended by `sibling` and then by
+    /// coinbase-only blocks through `tip_height`.
+    fn chain(
+        &self,
+        sibling: &SourceBlock,
+        tip_height: BlockHeight,
+    ) -> Result<BTreeMap<BlockHeight, SourceBlock>, Box<dyn std::error::Error>> {
+        let mut blocks: BTreeMap<_, _> = self
+            .base
+            .range(..=BlockHeight::new(3))
+            .map(|(height, block)| (*height, block.clone()))
+            .collect();
+        blocks.insert(sibling.height, sibling.clone());
+        let mut parent_hash = sibling.hash;
+        for height in sibling.height.value().saturating_add(1)..=tip_height.value() {
+            let block = chained_source_block(BlockHeight::new(height), parent_hash, 0, Vec::new())?;
+            parent_hash = block.hash;
+            blocks.insert(block.height, block);
+        }
+        Ok(blocks)
+    }
+
+    /// Makes `source` serve [`Self::chain`] with its checkpoints and subtree
+    /// roots, and returns the subtree root `sibling` completes.
+    fn serve_chain_through(
+        &self,
+        source: &RecordingParseableSource,
+        sibling: &SourceBlock,
+        tip_height: BlockHeight,
+    ) -> Result<SourceSubtreeRoot, Box<dyn std::error::Error>> {
+        let switch = self.chain_switch(sibling, tip_height)?;
+        let root = only_subtree_root(&switch.subtree_roots)?;
+        source.apply_chain_switch(switch);
+        Ok(root)
+    }
+
+    fn chain_switch(
+        &self,
+        sibling: &SourceBlock,
+        tip_height: BlockHeight,
+    ) -> Result<PendingChainSwitch, Box<dyn std::error::Error>> {
+        let blocks = self.chain(sibling, tip_height)?;
+        let (checkpoints, subtree_roots) =
+            tree_facts(&self.activations, &self.predecessor, &blocks)?;
+        Ok(PendingChainSwitch {
+            blocks,
+            checkpoints,
+            subtree_roots,
+            tip_height,
+        })
+    }
+}
+
+/// Returns each block above `predecessor`'s checkpoint and the subtree roots
+/// the blocks complete, in completion order, as a node reports them.
+#[expect(
+    clippy::type_complexity,
+    reason = "the fixture returns the two node views a test source serves"
+)]
+fn tree_facts(
+    activations: &NetworkUpgradeActivations,
+    predecessor: &CommitmentTreeCheckpoint,
+    blocks: &BTreeMap<BlockHeight, SourceBlock>,
+) -> Result<
+    (
+        BTreeMap<BlockHeight, CommitmentTreeCheckpoint>,
+        Vec<(ShieldedProtocol, SourceSubtreeRoot)>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
+        predecessor.block_id.height,
+        &predecessor.frontiers,
+        activations,
+    )?;
+    let mut checkpoints = BTreeMap::new();
+    let mut subtree_roots = Vec::new();
+    for (height, block) in blocks.range((
+        Bound::Excluded(predecessor.block_id.height),
+        Bound::Unbounded,
+    )) {
+        let commitments = pool_commitments(block)?;
+        accumulator.append_block_commitments(
+            *height,
+            &commitments.sapling,
+            &commitments.orchard,
+            &commitments.ironwood,
+        )?;
+        checkpoints.insert(
+            *height,
+            CommitmentTreeCheckpoint::new(
+                BlockId::new(*height, block.hash),
+                block.block_time_seconds,
+                accumulator.validated_frontiers()?,
+            ),
+        );
+        subtree_roots.extend(accumulator.completed_subtree_roots().iter().map(|root| {
+            (
+                root.protocol,
+                SourceSubtreeRoot::new(
+                    root.subtree_index,
+                    root.root_hash,
+                    root.completing_block_height,
+                ),
+            )
+        }));
+    }
+    Ok((checkpoints, subtree_roots))
+}
+
+/// Publishes a store from the siblings' predecessor through the coinbase-only
+/// block at `build_tip_height`, settled at height 3, and returns it with a
+/// source that serves that chain.
+async fn publish_subtree_boundary_store(
+    siblings: &SubtreeCompletingSiblings,
+    build_tip_height: u32,
+    store_path: &Path,
+) -> Result<
+    (
+        RecordingParseableSource,
+        zinder_store::RocksDbCanonicalStore,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let published: BTreeMap<_, _> = siblings
+        .base
+        .range(..=BlockHeight::new(build_tip_height))
+        .map(|(height, block)| (*height, block.clone()))
+        .collect();
+    let (checkpoints, subtree_roots) =
+        tree_facts(&siblings.activations, &siblings.predecessor, &published)?;
+    assert!(
+        subtree_roots.is_empty(),
+        "the published chain must not complete a subtree"
+    );
+    let source = RecordingParseableSource::new(
+        published.clone(),
+        checkpoints,
+        BlockHeight::new(build_tip_height),
+    );
+    let build_plan = CanonicalStoreBuildPlan::checkpointed(
+        &siblings.activations,
+        siblings.predecessor.clone(),
+        block_id(&published, build_tip_height)?,
+        zinder_store::RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(2)?,
+    )?;
+    let builder = RocksDbCanonicalBuilder::create_fresh(
+        store_path,
+        CanonicalStoreWorkload::Wallet,
+        build_plan,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    let construction = CanonicalConstructionConfig::for_local_tests(
+        Duration::from_secs(5),
+        Arc::clone(&siblings.activations),
+    );
+    let built = load_fresh_canonical(builder, &source, &construction).await?;
+    let validated = built.builder.prepare_cold_certified_publication()?;
+    let publication = validated.prepare_baseline(CanonicalBaselinePublication::new(
+        block_id(&published, 3)?,
+        UnixTimestampMillis::new(1_783_933_200_000),
+    ))?;
+    Ok((source, validated.publish_baseline(publication)?))
+}
+
+/// A store at `build_tip_height` whose source serves the first sibling's
+/// chain through `tip_height` and switches to the second sibling's chain
+/// before its next subtree-root read.
+struct SubtreeRootRace {
+    source: RecordingParseableSource,
+    store: zinder_store::RocksDbCanonicalStore,
+    siblings: SubtreeCompletingSiblings,
+    tip_height: BlockHeight,
+    second_tip: BlockId,
+    first_root: SourceSubtreeRoot,
+    second_root: SourceSubtreeRoot,
+    _temporary: tempfile::TempDir,
+}
+
+async fn switch_best_chain_before_subtree_root_read(
+    build_tip_height: u32,
+    tip_height: BlockHeight,
+) -> Result<SubtreeRootRace, Box<dyn std::error::Error>> {
+    let siblings = subtree_completing_siblings()?;
+    let temporary = tempdir()?;
+    let (source, store) = publish_subtree_boundary_store(
+        &siblings,
+        build_tip_height,
+        &temporary.path().join("canonical"),
+    )
+    .await?;
+    let first_root = siblings.serve_chain_through(&source, &siblings.first, tip_height)?;
+    let switch = siblings.chain_switch(&siblings.second, tip_height)?;
+    let second_root = only_subtree_root(&switch.subtree_roots)?;
+    let second_tip = block_id(&switch.blocks, tip_height.value())?;
+    assert_eq!(first_root.subtree_index, second_root.subtree_index);
+    assert_eq!(
+        first_root.completing_block_height,
+        second_root.completing_block_height
+    );
+    assert_ne!(first_root.root_hash, second_root.root_hash);
+    source.switch_chain_before_subtree_read(switch);
+    source.clear_calls();
+    Ok(SubtreeRootRace {
+        source,
+        store,
+        siblings,
+        tip_height,
+        second_tip,
+        first_root,
+        second_root,
+        _temporary: temporary,
+    })
+}
+
+/// Follows `race` through `follower_source` and checks its outcome.
+///
+/// The follower must report one `upstream_view_changed` recovery naming
+/// `expected_reason`, make the source reads `expected_calls`, and commit the
+/// second sibling's chain with the second sibling's own root.
+async fn follow_subtree_root_race<Source: NodeSource>(
+    race: SubtreeRootRace,
+    follower_source: &Source,
+    expected_reason: &str,
+    expected_calls: &[SourceCall],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let SubtreeRootRace {
+        source,
+        store,
+        siblings,
+        tip_height,
+        second_tip,
+        first_root,
+        second_root,
+        _temporary,
+    } = race;
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let cancel = CancellationToken::new();
+    let follower = follower_to_target(
+        follower_source,
+        &siblings.activations,
+        tip_height,
+        &readiness,
+        &cancel,
+    );
+    let (outage, outcome) = tokio::join!(
+        first_node_unavailable_detail(&readiness),
+        follow_canonical_tip(store, follower),
+    );
+    let store = outcome?;
+    let outage = outage?;
+
+    assert_eq!(store.event_fence().visible_tip(), second_tip);
+    let stored_roots = store.subtree_roots(orchard_subtree_zero())?;
+    assert_eq!(
+        stored_roots,
+        vec![completed_orchard_subtree_zero(
+            &second_root,
+            &siblings.second
+        )]
+    );
+    assert!(
+        stored_roots
+            .iter()
+            .all(|root| root.root_hash != first_root.root_hash)
+    );
+    assert_eq!(outage.failure_class, "upstream_view_changed");
+    assert!(
+        outage.last_reason.contains(expected_reason),
+        "{}",
+        outage.last_reason
+    );
+    assert_eq!(source.calls(), expected_calls);
+    Ok(())
+}
+
+/// Returns the reads of an append attempt that fails on its subtree-root
+/// read, the block re-read that refuses it, and the second attempt.
+fn append_race_calls() -> Vec<SourceCall> {
+    let attempt = [
+        SourceCall::Tip,
+        SourceCall::Block(SUBTREE_COMPLETION_HEIGHT),
+        SourceCall::Checkpoint(SUBTREE_COMPLETION_HEIGHT),
+        SourceCall::Subtree(orchard_subtree_zero()),
+    ];
+    [
+        attempt.as_slice(),
+        &[SourceCall::Checkpoint(SUBTREE_COMPLETION_HEIGHT)],
+        attempt.as_slice(),
+    ]
+    .concat()
+}
+
+fn orchard_subtree_zero() -> SubtreeRootRange {
+    subtree_zero(ShieldedProtocol::Orchard)
+}
+
+fn subtree_zero(protocol: ShieldedProtocol) -> SubtreeRootRange {
+    SubtreeRootRange::new(protocol, SubtreeRootIndex::new(0), NonZeroU32::MIN)
+}
+
+fn completed_orchard_subtree_zero(
+    root: &SourceSubtreeRoot,
+    completing_block: &SourceBlock,
+) -> SubtreeRootArtifact {
+    SubtreeRootArtifact::new(
+        ShieldedProtocol::Orchard,
+        SubtreeRootIndex::new(0),
+        root.root_hash,
+        completing_block.height,
+        completing_block.hash,
+    )
+}
+
+fn only_subtree_root(
+    subtree_roots: &[(ShieldedProtocol, SourceSubtreeRoot)],
+) -> Result<SourceSubtreeRoot, Box<dyn std::error::Error>> {
+    match subtree_roots {
+        [(ShieldedProtocol::Orchard, root)] => Ok(root.clone()),
+        _ => Err(format!("expected one Orchard subtree root, found {subtree_roots:?}").into()),
+    }
 }
 
 /// Returns the first `node_unavailable` readiness detail the writer publishes.

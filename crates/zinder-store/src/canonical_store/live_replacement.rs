@@ -40,7 +40,7 @@ use super::{
     subtree_load::{encode_subtree_root_key, required_subtree_root_ranges},
 };
 
-/// One replacement block and its source-authenticated completed subtree roots.
+/// One replacement block and the caller-authenticated roots of the subtrees it completes.
 #[derive(Debug)]
 pub struct CanonicalReplacementBlock {
     block: CanonicalBuildBlock,

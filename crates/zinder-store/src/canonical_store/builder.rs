@@ -228,7 +228,7 @@ impl RocksDbCanonicalBuilder {
         )
     }
 
-    /// Atomically loads every source-authenticated completed subtree root.
+    /// Atomically loads every caller-authenticated completed subtree root.
     pub fn load_subtree_roots(
         &mut self,
         subtree_roots: impl IntoIterator<Item = CanonicalBuildSubtreeRoot>,

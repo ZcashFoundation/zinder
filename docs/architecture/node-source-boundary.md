@@ -79,6 +79,12 @@ of a height-keyed answer instead, and returns `BlockReorgDuringFetch` when the
 answer names another block. `fetch_chain_checkpoint` stays height-keyed for a
 caller that knows only a height, such as a configured construction checkpoint.
 
+`fetch_subtree_root_range` has no block-keyed form. `z_getsubtreesbyindex` is
+keyed by pool and subtree index, and each root it returns carries only the
+height of the block that completed it. Ingest therefore stores the roots it
+derives from the completing blocks' note commitments and uses the node's roots
+only as a cross-check, as [Chain ingestion](chain-ingestion.md) describes.
+
 `TransactionBroadcaster` is separate because broadcasting is a command, not a
 chain observation. The unit implementation returns
 `TransactionBroadcastDisabled`, so a read-only composition fails explicitly.

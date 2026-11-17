@@ -850,13 +850,15 @@ fn append_source_block(
 }
 
 #[derive(Default)]
-struct PoolCommitments {
-    sapling: Vec<[u8; 32]>,
-    orchard: Vec<[u8; 32]>,
-    ironwood: Vec<[u8; 32]>,
+pub(super) struct PoolCommitments {
+    pub(super) sapling: Vec<[u8; 32]>,
+    pub(super) orchard: Vec<[u8; 32]>,
+    pub(super) ironwood: Vec<[u8; 32]>,
 }
 
-fn pool_commitments(source_block: &SourceBlock) -> Result<PoolCommitments, Box<dyn Error>> {
+pub(super) fn pool_commitments(
+    source_block: &SourceBlock,
+) -> Result<PoolCommitments, Box<dyn Error>> {
     let compact_block = prepare_canonical_block(
         source_block,
         &sample_regtest_upgrade_activations(),
@@ -977,7 +979,7 @@ fn shielded_transactions_at(height: u32) -> Result<Vec<Arc<ZebraTransaction>>, B
 ///
 /// Transparent inputs are dropped: their previous outputs belong to the
 /// fixture's own chain, which the synthetic chain does not contain.
-fn shielded_transactions(
+pub(super) fn shielded_transactions(
     fixture: &SourceBlock,
 ) -> Result<Vec<Arc<ZebraTransaction>>, Box<dyn Error>> {
     let block: ZebraBlock = fixture
@@ -1037,7 +1039,7 @@ fn without_transparent_inputs(
     ZebraTransaction::zcash_deserialize(rebuilt_bytes.as_slice()).map_err(Into::into)
 }
 
-fn chained_source_block(
+pub(super) fn chained_source_block(
     height: BlockHeight,
     parent_hash: BlockHash,
     time_nonce: u8,
