@@ -1006,16 +1006,11 @@ impl NodeSource for ZebraJsonRpcSource {
     }
 
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
-        let block_unavailable = |error: JsonRpcCallError| SourceError::BlockUnavailable {
-            height,
-            reason: error.message,
-        };
-
         let raw_block_hex = self
             .call_typed::<String>(
                 "getblock",
                 positional_params([Value::from(height.value().to_string()), Value::from(0)])?,
-                block_unavailable,
+                |error| block_read_error(height, error.message),
             )
             .await?;
 
@@ -1421,8 +1416,38 @@ const FAST_SYNCED_SUBTREE_REFUSAL: &str = "continuing synchronization will not r
 /// Zebra's and Zakura's refusal of a block that is not on their best chain.
 const BLOCK_OUTSIDE_BEST_CHAIN_REFUSAL: &str = "not in the main chain";
 
+/// Zebra's refusal of a known block whose stored transactions are incomplete
+/// (`zebra_state::BlockReadError::BlockBodyUnavailable`, Zebra 7.1.0 and later).
+const INCOMPLETE_STORED_BLOCK_REFUSAL: &str = "stored transactions are incomplete";
+
+/// Zebra's refusal of a known block whose stored header or transaction
+/// locations are inconsistent (`zebra_state::BlockReadError::CorruptBlock`,
+/// Zebra 7.1.0 and later).
+const CORRUPT_STORED_BLOCK_REFUSAL: &str = "corrupt block metadata at height";
+
+/// Returns whether a node error message refuses to reassemble a stored block.
+pub(crate) fn is_unreadable_stored_block_refusal(message: &str) -> bool {
+    message.contains(INCOMPLETE_STORED_BLOCK_REFUSAL)
+        || message.contains(CORRUPT_STORED_BLOCK_REFUSAL)
+}
+
+/// Maps a node refusal of a height-keyed read that needs the block body.
+///
+/// A refusal to reassemble a stored block is permanent for that node. Any
+/// other refusal, including a reworded one, stays a changed upstream view.
+fn block_read_error(height: BlockHeight, reason: String) -> SourceError {
+    if is_unreadable_stored_block_refusal(&reason) {
+        SourceError::HistoricalBlockBodyUnavailable { height, reason }
+    } else {
+        SourceError::BlockUnavailable { height, reason }
+    }
+}
+
 /// Maps a call error from a read that needs per-height commitment trees,
 /// keyed by height or by block hash.
+///
+/// Zebra reads the block body to answer `z_gettreestate`, so that call
+/// carries its block-read refusals too.
 fn tree_state_call_error(height: BlockHeight, error: JsonRpcCallError) -> SourceError {
     if error.message.contains(FAST_SYNCED_TREE_STATE_REFUSAL) {
         SourceError::HistoricalTreeStateUnavailable {
@@ -1430,22 +1455,21 @@ fn tree_state_call_error(height: BlockHeight, error: JsonRpcCallError) -> Source
             reason: error.message,
         }
     } else {
-        SourceError::BlockUnavailable {
-            height,
-            reason: error.message,
-        }
+        block_read_error(height, error.message)
     }
 }
 
 /// Maps a call error from a `z_gettreestate` read keyed by the hash of a block
 /// the node served.
 ///
-/// Only a block that left the best chain, or a fast-synced node's permanent
-/// refusal, is an expected answer. Any other refusal of that hash breaks the
-/// node contract, so it is not reported as a changed view.
+/// Only a block that left the best chain, a fast-synced node's permanent
+/// refusal, or a refusal to reassemble the stored block is an expected
+/// answer. Any other refusal of that hash breaks the node contract, so it is
+/// not reported as a changed view.
 fn block_tree_state_call_error(block_id: BlockId, error: JsonRpcCallError) -> SourceError {
     if error.message.contains(BLOCK_OUTSIDE_BEST_CHAIN_REFUSAL)
         || error.message.contains(FAST_SYNCED_TREE_STATE_REFUSAL)
+        || is_unreadable_stored_block_refusal(&error.message)
     {
         return tree_state_call_error(block_id.height, error);
     }
@@ -1585,10 +1609,10 @@ fn next_batch_value<'a>(
 ) -> Result<Value, SourceError> {
     match responses.next() {
         Some(Ok(response_value)) => Ok(response_value),
-        Some(Err(error)) => Err(SourceError::BlockUnavailable {
+        Some(Err(error)) => Err(block_read_error(
             height,
-            reason: batch_call_error_message(method, &error),
-        }),
+            batch_call_error_message(method, &error),
+        )),
         None => Err(SourceError::SourceProtocolMismatch {
             reason: "batched block response contained fewer entries than requested",
         }),
@@ -1689,6 +1713,9 @@ fn source_error_class(error: Option<&SourceError>) -> &'static str {
         Some(SourceError::SubtreeRootsUnavailable { .. }) => "subtree_roots_unavailable",
         Some(SourceError::HistoricalTreeStateUnavailable { .. }) => {
             "historical_tree_state_unavailable"
+        }
+        Some(SourceError::HistoricalBlockBodyUnavailable { .. }) => {
+            "historical_block_body_unavailable"
         }
         Some(SourceError::HistoricalSubtreeRootsUnavailable { .. }) => {
             "historical_subtree_roots_unavailable"
@@ -2280,11 +2307,35 @@ fn map_transport_error(
             operation,
             max_response_bytes: max_response_bytes.get(),
         }
+    } else if client_error_is_unauthorized(error) {
+        SourceError::NodeUnavailable {
+            reason: format!(
+                "node refused the {operation} request credentials with HTTP 401; check node.auth \
+                 (a cookie file is read again when the client reconnects)"
+            ),
+        }
     } else {
         SourceError::NodeUnavailable {
             reason: error.to_string(),
         }
     }
+}
+
+/// Returns whether the node refused the request credentials.
+///
+/// Zebra 7.1.0 and later answer a missing or stale cookie with HTTP 401 and a
+/// JSON-RPC error body. jsonrpsee rejects any non-success status before it
+/// reads the body, so the refusal arrives as a transport error. It stays
+/// `NodeUnavailable`: that class counts toward the client rebuild that reads
+/// a rotated cookie file again.
+fn client_error_is_unauthorized(error: &ClientError) -> bool {
+    let ClientError::Transport(source) = error else {
+        return false;
+    };
+    matches!(
+        source.downcast_ref::<jsonrpsee::http_client::transport::Error>(),
+        Some(jsonrpsee::http_client::transport::Error::Rejected { status_code: 401 })
+    )
 }
 
 fn source_response_too_large(error: &SourceError) -> bool {
@@ -2506,6 +2557,32 @@ mod tests {
         assert!(payload.get("time").is_none());
 
         Ok(())
+    }
+
+    #[test]
+    fn batched_block_refusals_keep_their_classes() {
+        let height = BlockHeight::new(7);
+        let unreadable = ErrorObject::owned(
+            -1,
+            "block body unavailable at height Height(7): stored transactions are incomplete",
+            None::<()>,
+        );
+        let out_of_range = ErrorObject::owned(-8, "height out of range", None::<()>);
+
+        let unreadable_outcome =
+            next_batch_value(&mut std::iter::once(Err(unreadable)), height, "getblock");
+        let out_of_range_outcome =
+            next_batch_value(&mut std::iter::once(Err(out_of_range)), height, "getblock");
+
+        assert!(matches!(
+            unreadable_outcome,
+            Err(SourceError::HistoricalBlockBodyUnavailable { height: refused, .. })
+                if refused == height
+        ));
+        assert!(matches!(
+            out_of_range_outcome,
+            Err(SourceError::BlockUnavailable { height: refused, .. }) if refused == height
+        ));
     }
 
     #[test]

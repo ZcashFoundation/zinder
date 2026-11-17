@@ -329,6 +329,23 @@ pub enum SourceError {
         reason: String,
     },
 
+    /// The node knows the block at `height` but cannot return its complete
+    /// body.
+    ///
+    /// Zebra 7.1.0 and later refuse to serve a stored block whose
+    /// transactions are incomplete or whose stored metadata is inconsistent,
+    /// instead of returning a partial block. A node that keeps every block
+    /// body raises this only when its store is damaged, so retrying the same
+    /// node cannot succeed. It is classed as a missing capability rather than
+    /// a changed upstream view.
+    #[error("block body at height {height:?} is permanently unavailable from this node: {reason}")]
+    HistoricalBlockBodyUnavailable {
+        /// Requested block height.
+        height: BlockHeight,
+        /// Node error message.
+        reason: String,
+    },
+
     /// The node permanently lacks the requested shielded subtree roots.
     ///
     /// A node built by a fast-sync path that skips per-height trees never
@@ -508,7 +525,8 @@ impl SourceError {
     ///
     /// This covers every error classed
     /// [`SourceFailureClass::CapabilityMissing`], including the permanent
-    /// historical tree-state and subtree-root refusals of a fast-synced node.
+    /// historical tree-state and subtree-root refusals of a fast-synced node
+    /// and the refusal of a stored block body the node cannot reassemble.
     #[must_use]
     pub const fn is_node_capability_missing(&self) -> bool {
         matches!(
@@ -540,6 +558,7 @@ impl SourceError {
             }
             Self::NodeCapabilityMissing { .. }
             | Self::HistoricalTreeStateUnavailable { .. }
+            | Self::HistoricalBlockBodyUnavailable { .. }
             | Self::HistoricalSubtreeRootsUnavailable { .. } => {
                 SourceFailureClass::CapabilityMissing
             }

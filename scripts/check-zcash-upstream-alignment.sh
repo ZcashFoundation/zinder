@@ -34,7 +34,7 @@ require_single_runtime_pin() {
 }
 
 require_single_runtime_pin Zebra \
-  'docker.io/zfnd/zebra:7.0.0@sha256:a70d2be8ffef3a4b6e37355724e36a0e6c1838e46baa28bfb216739f00cf2d34' \
+  'docker.io/zfnd/zebra:7.1.0@sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba' \
   '(docker\.io/)?zfnd/zebra:[0-9A-Za-z._-]+(@sha256:[a-f0-9]{64})?'
 require_single_runtime_pin Zakura \
   'docker.io/zakuracore/zakura:1.8.6@sha256:e514c89b751b685686690098928507aaa994311e6b90c79373c55b0afaa45d50' \

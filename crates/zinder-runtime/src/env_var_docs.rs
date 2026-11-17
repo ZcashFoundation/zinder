@@ -285,7 +285,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Maximum JSON-RPC response body size (bytes) accepted from the node. \
                       Defaults to 67108864 (64 MiB). This is a ceiling on what Zinder accepts, \
-                      not a request size: Zebra 7.0.0 and Zakura 1.8.6 refuse responses above \
+                      not a request size: Zebra 7.1.0 and Zakura 1.8.6 refuse responses above \
                       50 MiB by default, and ingest splits a source segment the node refuses.",
     },
     EnvVarDoc {
@@ -1038,8 +1038,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Chain-truth invariant: how deep the live reorg window extends. Bounds \
                       settlement, classifier default, and replacement traversal. Must be \
-                      greater than zero. Defaults to 1000, Zebra's finalization depth. A larger \
-                      value raises an existing store's window in place; a smaller one is \
+                      greater than zero. Defaults to 1000, Zebra's maximum finalization depth. A \
+                      larger value raises an existing store's window in place; a smaller one is \
                       refused.",
     },
     EnvVarDoc {

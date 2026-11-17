@@ -1,4 +1,4 @@
-# Zebra 7.0.0 Regtest configuration for Zinder's live and parity suites.
+# Zebra 7.1.0 Regtest configuration for Zinder's live and parity suites.
 #
 # Zebra's Regtest activates Overwinter through Canopy at height 1 and leaves
 # NU5 and every later upgrade unset unless they are configured, so a chain

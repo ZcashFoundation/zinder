@@ -45,10 +45,10 @@ used by the writer's resource controller. See
 `ZebraJsonRpcSource` fetches a segment as one JSON-RPC batch with one
 `getblock` entry per block. Two node limits shape that batch:
 
-- Zakura 1.8.6 refuses a batch with more than 1,000 entries. Zebra 7.0.0 has
+- Zakura 1.8.6 refuses a batch with more than 1,000 entries. Zebra 7.1.0 has
   no entry limit. Ingest therefore rejects a configured segment size above
   1000 blocks at startup.
-- Zebra 7.0.0 and Zakura 1.8.6 each refuse a response larger than 50 MiB by
+- Zebra 7.1.0 and Zakura 1.8.6 each refuse a response larger than 50 MiB by
   default. Either node answers an oversized batch with a single error object
   instead of a response array. The source treats that answer like an
   oversized response and splits the segment.
@@ -63,13 +63,16 @@ not a chain identity and must not be used to accept a value across a reorg.
 `fetch_chain_checkpoint_for_block` applies the same rule to tree state. It
 returns the checkpoint of a block that the caller has already identified.
 `ZebraJsonRpcSource` sends that block's hash to `z_gettreestate`, which Zebra
-7.0.0 and Zakura 1.8.6 accept in place of a height. The node then answers for
+7.1.0 and Zakura 1.8.6 accept in place of a height. The node then answers for
 that block, or refuses with "the requested block is not in the main chain" when
 the block has left its best chain. The source maps that refusal to
 `BlockUnavailable`, and a response that names another block to
-`SourceProtocolMismatch`. Any other refusal of the hash, except a fast-synced
-Zakura node's refusal of a skipped tree, is also `SourceProtocolMismatch`,
-because the hash came from a block that the node itself served. The source logs
+`SourceProtocolMismatch`. Two refusals keep the class they have on a
+height-keyed read: a fast-synced Zakura node's refusal of a skipped tree, and
+Zebra's refusal to reassemble a damaged stored block
+(`HistoricalBlockBodyUnavailable`). Any other refusal of the hash is also
+`SourceProtocolMismatch`, because the hash came from a block that the node
+itself served. The source logs
 the node's code and message as `tree_state_block_hash_refused`. A source
 without a hash-keyed read checks the identity
 of a height-keyed answer instead, and returns `BlockReorgDuringFetch` when the
@@ -143,21 +146,25 @@ capabilities without changing the required canonical contract. Missing or
 contradictory capabilities produce typed failures rather than version-based
 guesses.
 
-Some nodes refuse historical commitment-tree reads permanently. A Zakura node
-built by verified-commitment-trees fast sync never writes per-height trees or
-subtree roots below its last checkpoint. The source maps those refusals to
-dedicated errors classed `capability_missing`:
+Some nodes refuse historical reads permanently. A Zakura node built by
+verified-commitment-trees fast sync never writes per-height trees or subtree
+roots below its last checkpoint. Zebra 7.1.0 and later refuse a stored block
+whose transactions are incomplete or whose metadata is inconsistent, instead of
+returning a partial block; on a node that keeps every block body, that means
+its store is damaged. The source maps those refusals to dedicated errors
+classed `capability_missing`:
 
 | Error | Raised for |
 | --- | --- |
 | `HistoricalTreeStateUnavailable` | `z_gettreestate` or verbose `getblock` at a height whose tree the node never wrote |
+| `HistoricalBlockBodyUnavailable` | `getblock` (single or batched), `z_gettreestate`, or indexer `GetBlock` for a stored block the node cannot reassemble |
 | `HistoricalSubtreeRootsUnavailable` | `z_getsubtreesbyindex` for subtrees the node never recorded and will not restore |
 
 A subtree refusal that may resolve once the node passes its last checkpoint
 stays `SubtreeRootsUnavailable`, classed `upstream_view_changed`. The match is
 on the node's error text, so a reworded refusal falls back to the transient
-classes rather than to a wrong answer. Query reports both permanent errors as
-the non-retryable `NODE_CAPABILITY_MISSING`.
+classes rather than to a wrong answer. Query reports all three permanent errors
+as the non-retryable `NODE_CAPABILITY_MISSING`.
 
 Source errors describe the upstream observation. `SourceFailureClass` groups
 them for writer recovery and readiness:
@@ -180,6 +187,13 @@ process retries or exits.
 `NodeAuth` represents valid authentication states: none, cookie file, or basic
 credentials. Invalid combinations are rejected before connection. Secrets are
 redacted from resolved configuration and logs.
+
+Zebra 7.1.0 and later refuse missing or stale credentials with HTTP 401 and a
+JSON-RPC error body. The source reports the refusal as `NodeUnavailable`,
+classed `node_unreachable`, with a reason that names HTTP 401. Three
+consecutive failures of that class rebuild the JSON-RPC client, and the
+rebuild reads a cookie file again, so ingest recovers after a node restart
+rotates its cookie.
 
 ## Indexer transport security
 

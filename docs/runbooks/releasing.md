@@ -111,7 +111,7 @@ required` in its pull request template.
 ## Publish a release
 
 After the release-preparation change merges, wait for required checks to pass.
-Zinder certifies both Zebra 7.0.0 and Zakura 1.8.6, so a failure against
+Zinder certifies both Zebra 7.1.0 and Zakura 1.8.6, so a failure against
 either node blocks the release. Before tagging, confirm on the
 release-preparation commit:
 

@@ -34,7 +34,8 @@ use crate::{
     SourceChainSegmentLimits, SourceChainSegmentStats, SourceChainUpdate, SourceError,
     SourceSubtreeRoots, SourceTreeState, UpstreamHealthSnapshot, ZebraIndexerChannelOptions,
     ZebraIndexerSourceTarget, ZebraJsonRpcSource, connect_zebra_indexer_channel,
-    source_chain_update::SourceChainCursorPosition, zebra_json_rpc::validate_source_block_links,
+    source_chain_update::SourceChainCursorPosition,
+    zebra_json_rpc::{is_unreadable_stored_block_refusal, validate_source_block_links},
 };
 
 const ZEBRA_INDEXER_BLOCK_SOURCE_LABEL: &str = "zebra_indexer_grpc";
@@ -416,6 +417,15 @@ fn map_get_block_status(height: BlockHeight, status: &Status) -> SourceError {
         Code::InvalidArgument | Code::DataLoss => SourceError::SourceProtocolMismatch {
             reason: "Zebra indexer rejected a valid height-keyed GetBlock request",
         },
+        // Zebra answers a block-read refusal with `Unavailable`, the code a
+        // transport failure also carries, so only the refusal text tells the
+        // two apart.
+        Code::Unavailable if is_unreadable_stored_block_refusal(status.message()) => {
+            SourceError::HistoricalBlockBodyUnavailable {
+                height,
+                reason: status.message().to_owned(),
+            }
+        }
         _ => SourceError::NodeUnavailable {
             reason: format!("Zebra indexer GetBlock failed: {status}"),
         },

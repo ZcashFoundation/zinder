@@ -2,7 +2,7 @@ name: parity-compat
 
 # T3 (live) fixed-fence parity diff between Zinder's `zinder-compat-lightwalletd`
 # and the pinned upstream `electriccoinco/lightwalletd` Go reference, both
-# pointed at the same pinned regtest node. One leg runs against Zebra 7.0.0 and
+# pointed at the same pinned regtest node. One leg runs against Zebra 7.1.0 and
 # one against Zakura 1.8.6; both legs must pass on a release commit. Mempool
 # parity remains outside this workflow until dedicated ingest-control
 # composition is restored.
@@ -113,7 +113,7 @@ jobs:
             -e ZEBRA_RPC__LISTEN_ADDR=0.0.0.0:39232 \
             -e ZEBRA_RPC__ENABLE_COOKIE_AUTH=false \
             -e ZEBRA_MINING__MINER_ADDRESS="${PARITY_TRANSPARENT_ADDRESS}" \
-            docker.io/zfnd/zebra:7.0.0@sha256:a70d2be8ffef3a4b6e37355724e36a0e6c1838e46baa28bfb216739f00cf2d34
+            docker.io/zfnd/zebra:7.1.0@sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba
 
       # Zakura runs on the host network with every listener on loopback
       # (deploy/zakura/regtest.toml), because it refuses a plaintext indexer
