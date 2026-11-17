@@ -182,8 +182,10 @@ cache one generation's pinned index and filter blocks would then fail another
 generation's catch-up, which opens table files. Pinned usage can therefore
 take the cache past its capacity. Index and filter blocks are inserted at high
 priority into a pool of half the capacity, and data blocks at low priority, so
-data reads cannot evict the metadata that table readers need. The pool does
-not rank one generation's blocks above another's. The data blocks of every
+the cache retains that metadata in preference to data blocks. The preference is
+not a guarantee. Unpinned index and filter blocks beyond the pool's capacity
+spill into the low-priority pool, where they compete with data blocks and can
+be evicted. Only pinned entries are never evicted. The pool does not rank one generation's blocks above another's. The data blocks of every
 generation compete by recency, so a retained or released pair that still
 serves reads can evict data blocks the current pair read earlier. That
 competition lasts only as long as an older pair serves reads: its retention
