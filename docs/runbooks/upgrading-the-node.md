@@ -22,6 +22,12 @@ crosses an NU7 activation on local Zebra 7.1.0 and Zakura 1.8.6 Regtest chains;
 see [Regtest through NU7](testing.md#regtest-through-nu7). Zinder has not yet
 run across an NU7 activation on Mainnet or on Testnet.
 
+Zinder certifies the node releases that the live and parity lanes run: Zebra
+7.1.0 and Zakura 1.8.6. Zebra 7.0.0 advertises the same protocol version and
+network upgrades and is expected to keep working, but no lane tests it.
+Upgrade Zebra 7.0.0 to 7.1.0 for its security fixes. The upgrade changes no
+upgrade table, so it needs neither schedule admission nor a store rebuild.
+
 ## Before you start
 
 - Install the same Zinder release for ingest, projector, query, compatibility,
