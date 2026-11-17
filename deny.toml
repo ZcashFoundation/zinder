@@ -6,7 +6,14 @@
 all-features = true
 
 [advisories]
-ignore = []
+ignore = [
+    # Unmaintained notices with no known vulnerability. Both crates are
+    # unconditional dependencies of the pinned zebra-chain 15.0.0, and
+    # zebra-chain 16.0.0 still depends on them. Remove each entry when a
+    # Zebra crate cohort advance drops the crate from Cargo.lock.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained (no known vulnerability); reached only through zebra-chain 15.0.0" },
+    { id = "RUSTSEC-2026-0542", reason = "humantime is unmaintained (no known vulnerability); reached only through zebra-chain 15.0.0" },
+]
 
 [licenses]
 allow = [
