@@ -1,6 +1,0 @@
-kind: changed
-body: Zinder now certifies Zebra 7.1.0 and parses blocks with zebra-chain 16.0.0, the release Zebra 7.1.0 uses. Zebra 7.0.0 is expected to keep working but is no longer tested; upgrade to 7.1.0 for its security fixes, without a store rebuild. When Zebra 7.1.0 cannot reassemble a damaged stored block, ingest readiness reports `node_unavailable` with class `capability_missing` instead of a changed chain, and query returns `NODE_CAPABILITY_MISSING`. A refused node credential now logs a reason that names HTTP 401.
-time: 2026-11-17T12:12:30.797457442Z
-custom:
-    Bump: patch
-    PR: "239"
