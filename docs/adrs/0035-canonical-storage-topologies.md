@@ -71,16 +71,16 @@ record a decision about future work, and no release supports it until it
 passes the [benchmark gate](#benchmark-gate) and the certification of its
 slices. The `postgres-horizontal`, Benchmark gate, Build order, and Changed
 commitments sections record decided work that does not ship yet. The Upgrade
-contract is a decision that applies to releases from now on, and no release
-note carries the class label yet. The remaining sections describe
+contract is decided now, and its class label becomes mandatory with the first
+release after the release workflow carries it. The remaining sections describe
 `rocksdb-single-host`, apart from the Consequences and Rejected alternatives
 entries that name `postgres-horizontal`.
 
 Parity between the topologies is promised only on the public wallet
 contracts: native `WalletQuery` and lightwalletd compatibility.
-[Changed commitments](#changed-commitments) lists where `postgres-horizontal`
-behaves differently on those contracts. Canonical and wallet storage never use
-different engines inside one deployment.
+[Changed commitments](#changed-commitments) lists the differences decided so
+far on those contracts. Canonical and wallet storage never use different
+engines inside one deployment.
 
 ### Canonical record
 
@@ -210,26 +210,35 @@ The first release is deliberately smaller than the full PostgreSQL design in
 - **Database layout.** Canonical and wallet data live in one database per
   network, in separate schemas, so one snapshot can validate both.
 - **Reads.** Readers query the PostgreSQL primary only. Replica (hot standby)
-  reads come in a later slice that the build order does not place yet, and
-  fences are designed so they can be added. Until then one primary caps read
-  scale, and the Zinder tier is what scales.
+  reads come in a later slice that the build order does not place yet and
+  that starts only when the traffic census shows the primary's read capacity
+  limits serving. Fences are designed so replica reads can be added. Until
+  then one primary caps read scale, and the Zinder tier is what scales.
 - **Writers.** Each writer domain has a durable ownership row with a writer
   term from the start. One ingest and one projector run at first. Standby
   writers and automatic failover come in a later slice, after fault-injection
-  testing. Once that slice ships, a standby takes over within 60 seconds of the
-  active writer stopping.
+  testing. The target once that slice ships is that a standby takes over
+  within 60 seconds of the active writer stopping.
 - **Mempool.** The mempool stays in the active ingest's memory and is not
   persisted in PostgreSQL. Readers find the active ingest through its
-  ownership row and call it. When ingest is down, only mempool methods fail;
-  block, balance, and history reads keep working.
+  ownership row and call it. When ingest is unreachable, mempool methods
+  fail, and so does a transaction lookup that misses canonical storage and
+  needs the mempool to decide its answer. Block, balance, and history reads
+  keep working. [Changed commitments](#changed-commitments) describes both
+  limits. Whether the resumable mempool event log, which the canonical store
+  keeps today, moves to PostgreSQL is not settled. If it does not, a
+  `MempoolEvents` cursor does not survive an ingest restart or takeover.
 - **Pinned reads.** Rows carry no epoch-validity ranges. A read pinned to a
   height keeps working across appends, and a reorg that replaces the pinned
-  blocks ends it with a retryable error.
+  blocks ends it with a retryable error. What a pinned read of wallet state
+  that a later block changes, such as unspent outputs, returns after an
+  append is not settled, because the rows carry no validity ranges. The
+  wallet slice decides it.
 - **Cursor signing key.** The key that signs event cursors is a deployment
   secret shared by all readers. Today each store generates its own key, so a
   cursor does not work across instances.
-- **PostgreSQL versions.** PostgreSQL 17 and 18 are certified. Issue #56
-  named 18 only.
+- **PostgreSQL versions.** The topology is certified against PostgreSQL 17
+  and 18 when it ships. Issue #56 named 18 only.
 - **Database hosting.** The benchmark spike and Testnet run on a single
   database with point-in-time backups. The Mainnet database host, either a
   replicated cluster on the current platform or an external managed service,
@@ -251,9 +260,17 @@ into build work. The spike passes when all four thresholds hold:
 2. Long block-range streaming reaches at least half of RocksDB's rate per
    reader.
 3. A Mainnet build from scratch finishes in under 48 hours.
-4. The database is less than twice the size of the RocksDB stores.
+4. The database is less than twice the size of the RocksDB canonical and
+   wallet stores built from the same data. Explorer views are not part of the
+   comparison.
 
-A missed threshold sends that part of the design back to design. It does not
+The statistic for threshold 1 and the reader counts for thresholds 1 and 2 are
+fixed in the spike's plan before its first run. The thresholds do not measure
+wallet queries, the total read capacity of one primary, or serving while a
+projection build runs on the same primary. Passing the gate does not show that
+one primary carries a given client load.
+
+A missed threshold sends that part of the design back for rework. It does not
 reverse the direction. The spike also reports the real database size and cost,
 which decide the Mainnet database host.
 
@@ -291,19 +308,39 @@ faucet backend, and to Mainnet last.
 The decision changes three existing commitments. The first two apply only to
 `postgres-horizontal`; `rocksdb-single-host` behavior does not change.
 
-**A native pinned read can end with a retryable error after a reorg.** Under
+**A native read can end with a retryable error after a reorg.** Under
 `postgres-horizontal`, a reorg that replaces the blocks a native read pinned
-ends that read with a retryable error, and the client restarts that walk. This
-is a visible change to the native wallet contract for this topology. Under
-`rocksdb-single-host`, a retained serving pair still answers its epoch after a
-reorg replaces that epoch's blocks, as the
+ends that read with a retryable error, and the client restarts that walk. An
+unpinned read can get the same kind of outcome for a short interval: after the
+canonical writer replaces blocks and before the projector publishes the
+matching wallet state, a read that needs both has no consistent view. Under
+`rocksdb-single-host` the published pair keeps answering through that
+interval. Which reads this affects and for how long is settled in the wallet
+slice. This is a visible change to the native wallet contract for this
+topology. Under `rocksdb-single-host`, a retained serving pair still answers
+its epoch after a reorg replaces that epoch's blocks, as the
 [Wallet data plane](../architecture/wallet-data-plane.md) describes. The error
-code `postgres-horizontal` returns is not chosen yet.
+code `postgres-horizontal` returns is not chosen yet. What a pinned
+unspent-output or spend-status read returns after an append is also not
+chosen yet.
 
-**A reader may serve while mempool methods are unavailable.** Under
+**A reader may serve while the mempool is unavailable.** Under
 `postgres-horizontal`, a reader stays in service for block, balance, and
-history reads while the active ingest is unreachable, and only mempool methods
-fail. Under `rocksdb-single-host`, native wallet query keeps the rule that no
+history reads while the active ingest is unreachable. Only answers that need
+the live mempool fail:
+
+- Mempool methods fail.
+- An unpinned `WalletQuery.Transaction` lookup and a lightwalletd
+  `GetTransaction` call composed with the mempool surface fail when the
+  transaction is not in canonical storage.
+  The reader needs the mempool to tell a pending transaction from an absent
+  one, as [ADR-0042](0042-proven-transaction-absence.md) describes, so it
+  returns the mempool failure instead of an answer. The same lookups still
+  answer a transaction found in canonical storage. A `WalletQuery.Transaction`
+  lookup pinned with `at_epoch_id` never consults the mempool, so it keeps
+  working.
+
+Under `rocksdb-single-host`, native wallet query keeps the rule that no
 input can erase another input's failure: it is ready only when the serving
 pair, the node source, and the ingest-control channel are all healthy, as
 [Service operations](../architecture/service-operations.md#native-wallet-query)
@@ -311,6 +348,20 @@ and
 [ADR-0038](0038-wallet-runtime-composition-and-capability-discovery.md#support-readiness-and-request-outcomes)
 describe. How a `postgres-horizontal` reader reports this partial state to
 readiness and to a load balancer is not designed yet.
+
+Serving without ingest has a freshness bound. Under `rocksdb-single-host`, a
+wallet-serving reader that cannot refresh its pair reports
+`serving_pair_stale` and keeps serving the last pair the writer attested only
+until `storage.serving_pair_staleness_ceiling_ms` passes, measured from the
+last writer attestation. It then refuses traffic, as
+[Service operations](../architecture/service-operations.md#lightwalletd-compatibility)
+describes. Native wallet query does not reach this case when ingest itself is
+unreachable, because its ingest-control input already refuses traffic. Whether
+`postgres-horizontal` bounds serving without ingest with an equivalent
+ceiling, and what a reader returns past it, is not settled here. The signal a
+reader uses to measure staleness without calling ingest is a design detail of
+the slice and is not settled here. One candidate is the renewal evidence the
+writer keeps in its ownership row, read against database time.
 
 **One set of binaries carries both engines.** Zinder ships one set of
 binaries that contains both storage engines, and configuration selects the
@@ -321,9 +372,11 @@ once it exists.
 
 ### Upgrade contract
 
-Every release declares one upgrade class. The class label applies from now on
-to every release, including `rocksdb-single-host` releases, before any
-PostgreSQL code exists.
+Every release declares one upgrade class. The contract is decided now and
+applies to `rocksdb-single-host` releases too, before any PostgreSQL code
+exists. The class label becomes mandatory with the first release after the
+release workflow carries it. Adding the label to the release workflow is
+tracked separately.
 
 | Class | Operator action | Read downtime | Extra cost |
 | --- | --- | --- | --- |
@@ -332,19 +385,68 @@ PostgreSQL code exists.
 | Projection layout change (wallet or Explorer) | A new projector builds a new versioned schema in the same database while the old one serves; switch when ready | None | That projection's storage twice for the build time |
 | Canonical layout change (rare) | Build a second database side by side, then switch the proxy | None | Full storage twice for the build time |
 
+The Extra cost column counts only the build. The previous schema or database
+is then kept for 7 days for rollback, so the doubled storage lasts for the
+build time plus those 7 days. A canonical layout change also runs a second
+ingest, projector, and reader set against the second database while it builds.
+
+Whether event cursors and pinned epochs issued before a canonical layout
+switch stay valid on the second database is not settled. Epoch ids and event
+sequences count commits in each store today, so a separately built database
+does not reproduce them unless the design makes it. Until that is settled,
+clients re-establish cursors and pins at such a switch.
+
 The operator actions, downtime, and costs in the table describe
 `postgres-horizontal`. A single-volume `rocksdb-single-host` host still
-restarts every runtime at each release, whatever the class.
+restarts every runtime at each release, whatever the class. There the class
+declares what the release changes in the stores and what a rollback costs. A
+layout change on RocksDB needs a fresh store or a side-by-side rebuild, as
+[Storage backend](../architecture/storage-backend.md#schema-admission)
+describes, and how the 7-day retention applies on a single volume is not
+decided.
+
+"Read downtime: None" covers block, balance, and history reads. A rolling
+restart also restarts the active ingest, which holds the mempool in memory.
+Until the standby slice ships, mempool methods and the transaction lookups
+that need the mempool fail from the moment ingest stops until the restarted
+ingest has rebuilt its mempool view, and no block commits in that interval.
+After the standby slice ships, the same gap lasts until the standby takes
+over and builds its own mempool view.
 
 Wallet and Explorer data live in versioned schemas, so a layout change
 rebuilds only that projection.
 
+An additive schema change must work in both directions. During a rolling
+restart, the previous and the new release run against the same schema at the
+same time. The previous release must therefore read and write correctly
+against the migrated schema. For example, a new column is nullable or has a
+default that the previous release's writes satisfy. The new release must also
+run correctly on rows the previous release writes. A change that cannot meet
+both conditions is a layout change, not an additive one.
+
 Rollback follows the class:
 
 - Compatible and additive upgrades are reversed by redeploying the previous
-  release. Each release must therefore read the schema its successor writes.
-- For a layout change, the old schema or database is kept for 7 days.
-  Rollback points readers back at it.
+  release against the same schema. Both releases must therefore read and
+  write correctly against that schema and against each other's rows, for the
+  whole upgrade and its rollback.
+- For a layout change, the previous schema or database is kept for 7 days. It
+  stops following the chain at cutover unless something keeps it current. A
+  rollback therefore first brings it back to the current tip: the previous
+  release's projector resumes following from where it stopped, or, for a
+  canonical layout change, the previous release's whole stack does.
+  Resuming needs the canonical events the retained schema has not applied to
+  stay retained for the whole 7 days. How that retention is held while no
+  projector follows the schema is not designed yet. If those events are
+  pruned, the rollback is a rebuild of that projection. The retained schema
+  or database must then pass serving admission before readers are pointed
+  back at it. Readers never switch to a schema or database that
+  has not passed admission. A rollback therefore takes catch-up time and is
+  not instant. Keeping the retained schema or database following during the
+  7 days is an operator choice that trades compute for a faster rollback.
+
+No upgrade command, migration job, or versioned schema exists yet. The rest of
+this section records the contract they are built to.
 
 One upgrade command drives an upgrade. It reads the running version and the
 target, and prints the class, the steps, the expected duration, and the disk
@@ -381,8 +483,28 @@ Compose and Railway. The command's name and the parts of it that apply to
   retryable error on a pinned read after a reorg and restart that walk.
 - Until replica reads ship, one PostgreSQL primary caps the read scale of a
   `postgres-horizontal` deployment.
-- Every release declares an upgrade class. A compatible or additive release
-  must leave the previous release able to read its schema.
+- Once the release workflow carries the class label, every release declares
+  an upgrade class. During a compatible or additive upgrade, the previous and
+  the new release must each read and write correctly against the same schema
+  and against each other's rows.
+- Rolling back a layout change takes the time the retained schema or database
+  needs to catch up to the tip and pass serving admission, unless the
+  operator kept it following.
+- A layout change holds the affected storage twice for its build time and
+  the 7 days of rollback retention.
+- `postgres-horizontal` is not chosen to reduce storage. The gate allows a
+  database up to twice the size of the RocksDB canonical and wallet stores, a
+  replicated database host repeats it for each replica, and a layout change
+  doubles the affected part for its build and rollback retention.
+- Under `postgres-horizontal` the database is the only stateful component,
+  and the deployment is as available and as recoverable as that database.
+  Losing a single database costs a restore from backup, or a rebuild that the
+  benchmark gate allows to take up to 48 hours.
+- Until the Explorer slice ships, a hosted deployment that serves both
+  wallets and the Explorer runs two complete stacks: `postgres-horizontal`
+  for wallet serving and a separate `rocksdb-single-host` deployment for the
+  Explorer, with its own ingest and canonical store. That second stack keeps
+  the release downtime and rebuild cost described in [Context](#context).
 - Node redundancy is a separate concern that this decision does not solve.
   Ordered node endpoint failover in ingest and node diversity (Zebra and
   Zakura) are tracked separately and do not wait for PostgreSQL.
@@ -413,6 +535,11 @@ history, and each engine answers them in its own way. They cover only the
 reads both topologies serve, a conformance suite that both engines pass
 defines them, and writers keep engine-specific code.
 
+The interfaces ship before the second engine exists, so until a PostgreSQL
+reader passes the suite only one implementation has proven the boundary. This
+replaces the earlier rule in this ADR that a shared abstraction is introduced
+only when two supported implementations prove the same boundary.
+
 ### Release construction leases only on a clean exit
 
 The projector already releases both leases when construction fails or is
@@ -437,9 +564,10 @@ deployment, not as one plane of a mixed deployment.
 
 ### Several complete RocksDB instances behind one endpoint
 
-Each instance repeats the full stack and about 465 GB of Mainnet storage. Each
-instance still has release downtime on a single volume and still needs a
-manual rebuild or restore when its host is lost. Instances also diverge: epoch
+Each instance repeats the full stack and about 465 GB of Mainnet storage when
+it carries the Explorer views. Each instance still has release downtime on a
+single volume and still needs a manual rebuild or restore when its host is
+lost. Instances also diverge: epoch
 ids count commits in each store and each store generates its own cursor key,
 so a pin or cursor issued by one instance does not carry its meaning to
 another, and a load balancer would need session affinity. A node's
@@ -477,8 +605,8 @@ production shows a need.
 A review asked whether one process and one database per instance would remove
 the costs of the separate runtimes, and how Zinder should scale beyond one
 host. This decision closes it. `rocksdb-single-host` stays unchanged for
-self-hosters and small deployments, and `postgres-horizontal` is the
-production topology for hosted fleets.
+self-hosters and small deployments, and `postgres-horizontal` is the decided
+production topology for hosted fleets once it ships.
 
 The decision rests on three facts:
 
@@ -490,7 +618,8 @@ The decision rests on three facts:
   redeploy. Any topology that keeps state on a service volume restarts its
   readers at each release.
 - **Storage cost of repeated instances.** Each extra RocksDB instance repeats
-  about 465 GB of Mainnet storage and the full stack.
+  about 465 GB of Mainnet storage when it carries the Explorer views, and the
+  full stack.
 
 Two pieces of evidence did not exist when the decision was made. No load limit
 of `rocksdb-single-host` had been measured under client load. No PostgreSQL
@@ -498,6 +627,14 @@ measurement at the chain tip existed; the `zinder-bench` arm measures bulk
 persistence of a replay corpus, not tip following under readers. The
 [benchmark gate](#benchmark-gate) therefore precedes build work, and its four
 thresholds are the conditions that send a part of the design back.
+
+The decision also closed the review before the measurements the 2026-11-16
+revision planned were complete. For `rocksdb-single-host` these remain
+unmeasured: secondary catch-up under write pressure that forces table-cache
+eviction, the replacement of a pair that lost a table file when provoked on a
+deployment, whether a long compatibility stream survives wallet-serving
+retention, and commit-to-publication delay over seven days. The Mainnet delay
+figures below cover about six hours.
 
 Measured behavior of `rocksdb-single-host` that still informs operators:
 
@@ -526,3 +663,6 @@ Measured behavior of `rocksdb-single-host` that still informs operators:
   topology, not yet implemented, certified, or advertised, with its scope,
   benchmark gate, build order, and three changed commitments. Adds the release
   upgrade contract and replaces the open topology review with its outcome.
+  Replaces the rule that a shared abstraction is introduced only when two
+  supported implementations prove the same boundary, because the
+  engine-neutral read interfaces ship before the second engine.
