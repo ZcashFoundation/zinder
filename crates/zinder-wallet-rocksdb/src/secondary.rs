@@ -10,7 +10,10 @@ use rust_rocksdb::{DB, Options};
 use zinder_core::{
     BlockHeight, BlockHeightRange, Network, TransparentAddressScriptHash, TransparentOutPoint,
 };
-use zinder_store::{RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget, open_bounded_rocksdb};
+use zinder_store::{
+    RocksDbInstanceMemory, RocksDbIoMode, RocksDbOpenResources, RocksDbOpenRole,
+    open_bounded_rocksdb,
+};
 use zinder_wallet_projection::{
     WalletAddressTransaction, WalletAddressTransactionKey, WalletAddressUnspentOutputKey,
     WalletCanonicalSourceIdentity, WalletProjectionBuildState, WalletProjectionReadyEvidence,
@@ -20,10 +23,7 @@ use zinder_wallet_projection::{
 use crate::{
     RocksDbWalletError, RocksDbWalletStore, WalletAddressTransactionHistoryPage,
     WalletAddressUnspentOutputsPage,
-    store::{
-        decode_only_control, required_column_family_names, validate_resource_budget,
-        wallet_column_family_descriptors,
-    },
+    store::{decode_only_control, required_column_family_names, wallet_column_family_descriptors},
 };
 
 /// Result of one explicit wallet-secondary catch-up barrier.
@@ -69,13 +69,21 @@ pub struct RocksDbWalletSecondary {
 impl RocksDbWalletSecondary {
     /// Opens one READY wallet secondary and catches it up to the primary's
     /// current publication without opening the primary for reads or writes.
+    ///
+    /// A [`zinder_store::RocksDbResourceBudget`] opens the secondary on a
+    /// block cache of its own;
+    /// [`RocksDbOpenResources::with_shared_block_cache`] opens it on a cache
+    /// other wallet secondaries read through.
     pub fn open_ready(
         primary_path: impl AsRef<Path>,
         secondary_path: impl AsRef<Path>,
         expected_network: Network,
-        resource_budget: RocksDbResourceBudget,
+        resources: impl Into<RocksDbOpenResources>,
     ) -> Result<Self, RocksDbWalletError> {
-        validate_resource_budget(resource_budget)?;
+        let resources = resources.into();
+        resources
+            .validate()
+            .map_err(|reason| RocksDbWalletError::InvalidResourceBudget { reason })?;
         let primary_path = fs::canonicalize(primary_path.as_ref()).map_err(|source| {
             RocksDbWalletError::PathUnavailable {
                 path: primary_path.as_ref().to_path_buf(),
@@ -94,7 +102,7 @@ impl RocksDbWalletSecondary {
                 primary_path: &primary_path,
                 secondary_path,
             },
-            resource_budget,
+            resources,
             wallet_column_family_descriptors,
         )
         .map_err(|source| RocksDbWalletError::rocksdb("open wallet secondary", source))?;
@@ -288,6 +296,12 @@ impl RocksDbWalletSecondary {
     #[must_use]
     pub const fn io_mode(&self) -> RocksDbIoMode {
         self.store.io_mode()
+    }
+
+    /// Samples the memory this secondary holds outside its block cache.
+    #[must_use]
+    pub fn instance_memory(&self) -> RocksDbInstanceMemory {
+        self.store.bounded_open.instance_memory()
     }
 }
 

@@ -906,13 +906,15 @@ epoch's blocks, because a pinned read promises the pinned epoch's view, not the
 current best chain.
 
 Each retained pair keeps its canonical and wallet secondaries open, with their
-own block caches and memtables, so a wallet-serving reader holds up to four
+own memtables and table readers, so a wallet-serving reader holds up to four
 secondary pairs at once: the current pair and three more, each the candidate
-it is catching up, a retained pair, or a released pair a request still holds. A
-generation also stays open after its pair drains, so the reader catches it up
-for a later block instead of opening it again. The reader reuses drained
-generations in turn, so none keeps primary files that compaction replaced for
-more than a few publications. The
+it is catching up, a retained pair, or a released pair a request still holds.
+Every pair reads through the reader's one canonical and one wallet block
+cache, so the configured cache sizes bound the reader however many pairs are
+open. A generation also stays open after its pair drains, so the reader
+catches it up for a later block instead of opening it again. The reader reuses
+drained generations in turn, so none keeps primary files that compaction
+replaced for more than a few publications. The
 `zinder_wallet_serving_pair_publisher_retained_pairs` gauge reports the
 retained count, `zinder_wallet_serving_pair_publisher_pinned_retired_pairs`
 reports the released pairs that requests still hold, and

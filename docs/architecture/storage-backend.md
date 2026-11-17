@@ -215,6 +215,13 @@ retains no replaced pair. Its unary requests hold a generation only while they
 run, and a `GetBlockRange` stream only while it reads one chunk, so a replaced
 generation drains within one chunk read and the next refresh can reopen it.
 
+In both runtimes every generation reads through one block cache per store,
+which the reader owns and sizes from the configured `block_cache_bytes`. The
+configured sizes therefore bound the process rather than each generation, and
+a generation that is opened cold or caught up finds the blocks the others
+already loaded. Each generation keeps its own table cache and memtables; see
+[ADR-0020](../adrs/0020-bounded-rocksdb-resource-budget.md#block-caches-shared-across-secondaries).
+
 ## Resource bounds
 
 All RocksDB opens use `RocksDbResourceBudget` and shared helpers from
@@ -224,7 +231,10 @@ flush behavior. Store size must not make process RSS unbounded.
 
 The canonical secondary, materialized-view primary, and materialized-view
 secondary export `zinder_store_*` resource metrics under distinct `store_role`
-labels; the canonical primary and the wallet stores do not export them.
+labels. Query and the compatibility runtime export their shared block caches
+as `canonical_secondary` and, in wallet serving, `wallet_secondary`, with
+memtable and table-reader memory summed over their open generations. The
+canonical primary and the wallet primary do not export them.
 Operators should alert on memory pressure, live WAL bytes, pending compaction,
 write stops, catch-up failure, and replica lag rather than infer health from
 directory size.

@@ -25,7 +25,7 @@ use zinder_core::{
 use zinder_store::{
     BoundedRocksDbOpen, CanonicalEventFence, CanonicalRetainedEvent, CanonicalStoreError,
     RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget, build_block_based_table_factory,
-    open_bounded_rocksdb,
+    keep_blocks_of_dropped_table_files, open_bounded_rocksdb,
 };
 use zinder_wallet_projection::{
     WALLET_PROJECTION_SCHEMA_VERSION, WALLET_PROJECTION_STORE_IDENTITY, WALLET_STORE_CONTROL_KEY,
@@ -1679,6 +1679,7 @@ fn wallet_data_options(
         usize::try_from(resource_budget.write_buffer_bytes).unwrap_or(usize::MAX),
     );
     options.set_max_write_buffer_number(resource_budget.max_write_buffer_count);
+    keep_blocks_of_dropped_table_files(&mut options);
     options
 }
 
@@ -3047,6 +3048,23 @@ mod tests {
     const TEST_VALIDATION_SORT_MEMORY_BYTES: u64 = 16 * 1024 * 1024;
     const TEST_VALIDATION_TEMPORARY_FILE_BYTES: u64 = 256 * 1024 * 1024;
     const TEST_VALIDATION_REORG_UNDO_BYTES: u64 = 16 * 1024 * 1024;
+
+    /// A wallet secondary may share its block cache with other wallet
+    /// secondaries, so no data family erases the blocks of a file it drops.
+    #[test]
+    fn data_families_keep_the_blocks_of_dropped_table_files() {
+        let options = WalletColumnFamilyOptions::new(
+            &rust_rocksdb::Cache::new_lru_cache(1024 * 1024),
+            RocksDbResourceBudget::for_local_tests(),
+        );
+        for (name, family) in WALLET_DATA_COLUMN_FAMILIES {
+            assert_eq!(
+                options.for_family(family).get_uncache_aggressiveness(),
+                0,
+                "{name}"
+            );
+        }
+    }
 
     const fn validation_config() -> WalletColdValidationConfig {
         WalletColdValidationConfig {

@@ -464,8 +464,9 @@ canonical block-local boundary.
 - `zinder_materialized_view_prevout_block_reads_total{cache}` counts the
   producing blocks each walker read from canonical storage to resolve its
   `canonical` share.
-- The `zinder_store_*` gauges with `store_role="canonical_secondary"` describe
-  the canonical secondary that hydration reads through. Producing replay rows
+- In ingest, the `zinder_store_*` gauges with
+  `store_role="canonical_secondary"` describe the canonical secondary that
+  hydration reads through. Producing replay rows
   bypass its block cache, so `rocksdb.block.cache.data.miss` against
   `rocksdb.block.cache.data.hit` in `zinder_store_rocksdb_ticker` shows how
   often a transaction-location lookup reached the volume.
@@ -708,6 +709,13 @@ startup means a failed refresh closed that slot, and the
 error. A `cold` count that keeps rising means refreshes keep failing and
 closing their generations.
 
+`zinder_wallet_serving_pair_publisher_open_generations` reports how many slots
+hold open secondaries, at most four. Every open generation reads through the
+publisher's one canonical and one wallet block cache, so the
+`canonical_secondary` and `wallet_secondary` block-cache gauges describe one
+cache each however many generations are open, and the memtable gauges grow
+with this count. [RocksDB](#rocksdb) lists them.
+
 Each refresh publishes the writer's fence at the moment its candidate
 converges, not one pair for each height. Blocks that commit closer together
 than one refresh share one publication at the later height, and the earlier
@@ -826,11 +834,44 @@ and use, memtables, WAL bytes and limits, pending compaction, active
 compactions, write stops, bytes read and written, MultiGet behavior, filter
 tickers, read latency, and startup open duration.
 
-The `canonical_secondary`, `materialized_view_primary`, and
-`materialized_view_secondary` roles export these series. None of those stores
-configures a filter, so their `rocksdb.bloom.filter.*` tickers stay at zero.
-The wallet store, whose four hash-keyed families carry filters, does not
-export `zinder_store_*` series. While `wallet.rocksdb.statistics_level` is
+Ingest exports these series for the canonical secondary that hydration reads
+through (`canonical_secondary`) and for its materialized-view primary
+(`materialized_view_primary`), and Explorer exports them for its
+materialized-view secondary (`materialized_view_secondary`). None of those
+stores configures a filter, so their `rocksdb.bloom.filter.*` tickers stay at
+zero.
+
+Query and the compatibility runtime keep several secondaries of a store open
+and share one block cache per store among them. They export a smaller set for
+each store, labelled `canonical_secondary` and, in wallet serving,
+`wallet_secondary`:
+
+- `zinder_store_block_cache_capacity_bytes`,
+  `zinder_store_block_cache_usage_bytes`, and
+  `zinder_store_block_cache_pinned_usage_bytes` describe the one shared cache
+  and update after each refresh. Usage can pass capacity by the index and
+  filter blocks that open table files pin.
+- `zinder_store_memtable_budget_bytes` and
+  `zinder_store_memtable_budget_usage_bytes` sum the memtable budget and usage
+  of every open generation.
+- `zinder_store_table_reader_memory_bytes` sums the table-reader memory of
+  every open generation that the block cache does not hold.
+
+The memtable and table-reader sums update at most once every 15 seconds,
+because sampling table-reader memory looks up every table file's reader. A sum
+can therefore trail a generation that opened or closed since the last sample.
+
+They export no per-generation properties or tickers. A `canonical_secondary`
+series therefore describes the hydration secondary in ingest and the shared
+serving cache in query or the compatibility runtime; tell them apart by the
+scrape target, not by `store_role`. To tell cache fill from other memory
+growth in a serving process, subtract its cache usage, memtable usage, and
+table-reader memory from its anonymous resident memory. Once the caches stop
+growing, a remainder that keeps rising is not cache.
+
+The projector's wallet primary, whose four hash-keyed families carry filters,
+does not export `zinder_store_*` series, and the serving wallet secondaries
+export only the set above. While `wallet.rocksdb.statistics_level` is
 `tickers` or `full`, RocksDB writes the projector's wallet primary statistics
 to the `LOG` file in the wallet store directory every 10 minutes; wallet
 secondaries do not write them. Read the filters there:

@@ -71,7 +71,7 @@ stores. It carries:
 
 | Knob | Canonical writer | Materialized-view writer | Canonical reader | Materialized-view reader | Effect |
 | --- | --- | --- | --- | --- | --- |
-| `block_cache_bytes` | 512 MiB | 256 MiB | 128 MiB | 64 MiB | Bounded LRU cache shared by data and index blocks, and by filter blocks in families that configure a filter. |
+| `block_cache_bytes` | 512 MiB | 256 MiB | 128 MiB | 64 MiB | Bounded LRU cache shared by data and index blocks, and by filter blocks in families that configure a filter. A process that keeps several secondaries of one store open shares one cache of this size among them. |
 | `max_wal_bytes` | 256 MiB | 256 MiB | 32 MiB | 16 MiB | Live WAL ceiling. Writer stores flush once the WAL crosses this limit. |
 | `max_open_files` | 512 | 512 | 128 | 64 | Open SST handle cap so RocksDB does not pin metadata for every file. |
 | `write_buffer_bytes` | 16 MiB | 16 MiB | 8 MiB | 4 MiB | Per-column-family mutable memtable size. |
@@ -125,6 +125,80 @@ Serial table-handler loading keeps steady-state thread creation independent of
 catch-up cadence and column-family count. This is a locked reader posture, not
 an operator-tunable resource setting.
 
+### Block Caches Shared Across Secondaries
+
+A block cache belongs to one store in one process. A process that keeps several
+secondaries of one store open at the same time opens all of them on one
+`SharedBlockCache` of the configured `block_cache_bytes`, so that value bounds
+the process instead of each secondary:
+
+- Wallet-serving `zinder-query` and `zinder-compat-lightwalletd` keep up to
+  four generations of a canonical and a wallet secondary
+  ([ADR-0038](0038-wallet-runtime-composition-and-capability-discovery.md)).
+  Each store's generations share one cache, and the two stores keep separate
+  caches, so one store's scans cannot evict the other's index and filter
+  blocks.
+- Compact-blocks `zinder-compat-lightwalletd` opens its two canonical
+  generations on one cache.
+
+The canonical-reader default, `min(cgroup limit / 8, 512 MiB)` with a 128 MiB
+floor, therefore sizes one cache per process, and the wallet-reader default of
+64 MiB is the process total as well.
+
+Sharing works because RocksDB keys a cached block by the identity of the table
+file that holds it: the file's `db_session_id` and original file number table
+properties, plus the block offset. Every secondary of one primary computes the
+same key for the same file, so the generations hold one copy of each block they
+all read, and a generation opened or caught up later finds the blocks its
+siblings loaded. Different files, and the files of different stores, never
+share a key. Store tests pin the sharing for bulk-built, flushed, and compacted
+files, so a RocksDB change to the key derivation fails them.
+
+The open path takes the cache from
+`RocksDbOpenResources::with_shared_block_cache` and rejects a budget whose
+`block_cache_bytes` differs from the cache's capacity. Each instance keeps its
+own reference, so the cache lives until the last instance and the owning
+publisher drop it, and closing one instance releases only its pins.
+
+These stay per instance, because neither RocksDB nor `rust-rocksdb` can share
+them:
+
+- The table cache: open table readers and file descriptors, up to
+  `max_open_files` plus the handles that open and catch-up pin to file
+  metadata. Table-reader memory is not charged to the block cache.
+- The write-buffer manager and the memtables it records, which are not charged
+  to the block cache either.
+- The statistics object and its tickers.
+
+A serving process exports the cache gauges once per cache and sums the
+memtable and table-reader memory of its open instances. It samples that memory
+at most once every 15 seconds and off its async tasks, because the table-reader
+estimate looks up every table file's reader in the table cache, which costs
+time in proportion to the file count and reorders the table cache's LRU list.
+
+A shared cache stays a non-strict LRU. A strict limit fails reads and table
+opens with `MemoryLimit` once pinned blocks fill the cache, and in a shared
+cache one generation's pinned index and filter blocks would then fail another
+generation's catch-up, which opens table files. Pinned usage can therefore
+take the cache past its capacity. Index and filter blocks are inserted at high
+priority into a pool of half the capacity, and data blocks at low priority, so
+the cache retains that metadata in preference to data blocks. The preference is
+not a guarantee. Unpinned index and filter blocks beyond the pool's capacity
+spill into the low-priority pool, where they compete with data blocks and can
+be evicted. Only pinned entries are never evicted. The pool does not rank one generation's blocks above another's. The data blocks of every
+generation compete by recency, so a retained or released pair that still
+serves reads can evict data blocks the current pair read earlier. That
+competition lasts only as long as an older pair serves reads: its retention
+window and the read limit that follows
+([ADR-0038](0038-wallet-runtime-composition-and-capability-discovery.md)).
+
+Every canonical and wallet data family, and every store's `default` family,
+pins RocksDB's `uncache_aggressiveness` at 0. A non-zero value makes a
+secondary that drops a file at catch-up erase that file's cached blocks,
+pinned ones included, while the other generations still read the file. RocksDB
+documents that the default will likely change to about 300. With 0, unused
+blocks age out of the LRU.
+
 ### Locked RocksDB Invariants
 
 These options are storage-layer contracts and are not operator-configurable:
@@ -133,6 +207,10 @@ These options are storage-layer contracts and are not operator-configurable:
 - Point-in-time recovery stays enabled through RocksDB's default recovery mode.
 - Atomic cross-CF flush stays enabled on primary stores.
 - Ordered writes stay enabled.
+- Every column family reads through the instance's bounded block cache,
+  including each store's `default` family. The open path gives the `default`
+  family the shared table factory, so RocksDB does not build the 32 MiB cache
+  it otherwise creates for that family in every instance.
 - Index blocks, and filter blocks where a family configures a filter, are
   charged to the bounded block cache through
   `cache_index_and_filter_blocks = true` and
@@ -197,6 +275,9 @@ time.
 - Rebuildable materialized-view replay backs off only on non-reclaimable memory pressure.
   Reclaimable file cache does not pause indexing.
 - Reader processes can start and expose `/readyz` while a secondary catches up.
+- A serving process's block-cache term is the configured canonical plus wallet
+  cache size, not that sum times the number of open generations. Memtables
+  and table readers remain per generation.
 
 ## Alternatives considered
 
@@ -213,6 +294,13 @@ time.
   while the kernel could reclaim the memory.
 - **Fail startup when initial catchup is slow.** Rejected. Replica lag is a
   readiness condition, not a liveness failure.
+- **Divide each reader budget among the serving generations.** Rejected. Each
+  generation would still cache its own copy of the blocks they all read, the
+  current pair would get a quarter of the configured cache, and a generation
+  that closes would lose its share.
+- **One cache for the canonical and wallet stores.** Rejected. One store's
+  scans would evict the other's index and filter blocks, and the two configured
+  budgets would lose their meaning.
 
 ## Store-size-independent memory invariant
 
@@ -223,6 +311,14 @@ anonymous memory.
 
 ## Revision history
 
+- 2026-11-17: A process that keeps several secondaries of one store open
+  shares one block cache of the configured size among them, per store.
+  Sharing relies on RocksDB's file-derived cache keys, keeps the cache
+  non-strict, and pins `uncache_aggressiveness` at 0 on the canonical and
+  wallet data families and the `default` families. The table cache, memtables, and statistics stay per
+  instance, and serving processes sample their summed memory at most every 15
+  seconds. Each store's `default` family reads through the configured cache
+  instead of a 32 MiB cache that RocksDB builds for every instance.
 - 2026-11-16: `RocksDbResourceBudget::preferred_io_mode` lets the benchmark
   harness open a store buffered without a direct attempt. No configuration
   section exposes it, and production opens are unchanged.

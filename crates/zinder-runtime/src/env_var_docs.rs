@@ -619,7 +619,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Wallet-projection RocksDB block cache budget in bytes. Defaults to 268435456 \
-                      for the writer and 67108864 for the wallet-serving reader.",
+                      for the writer and 67108864 for the wallet-serving reader. In zinder-query \
+                      and zinder-compat-lightwalletd, one cache of this size serves every wallet \
+                      secondary generation of the process.",
     },
     EnvVarDoc {
         name: "ZINDER_WALLET__ROCKSDB__MAX_WAL_BYTES",
@@ -727,7 +729,10 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Canonical-store RocksDB block cache budget in bytes. Defaults to 536870912 \
-                      for writers and 134217728 for readers.",
+                      for writers. Readers default to one eighth of the detected cgroup memory \
+                      limit, clamped between 134217728 and 536870912, and to 134217728 without \
+                      a limit. In zinder-query and zinder-compat-lightwalletd, one cache of this \
+                      size serves every canonical secondary generation of the process.",
     },
     EnvVarDoc {
         name: "ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_WAL_BYTES",

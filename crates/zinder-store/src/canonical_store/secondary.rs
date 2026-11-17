@@ -9,8 +9,9 @@ use zinder_core::{
 };
 
 use crate::{
-    BoundedRocksDbOpen, RawBlobRetention, RocksDbIoMode, RocksDbOpenRole, RocksDbResourceBudget,
-    RocksDbResourceGaugeInputs, StoreRole, open_bounded_rocksdb, record_rocksdb_resource_gauges,
+    BoundedRocksDbOpen, RawBlobRetention, RocksDbInstanceMemory, RocksDbIoMode,
+    RocksDbOpenResources, RocksDbOpenRole, RocksDbResourceBudget, RocksDbResourceGaugeInputs,
+    StoreRole, open_bounded_rocksdb, record_rocksdb_resource_gauges,
 };
 
 use super::{
@@ -31,7 +32,6 @@ use super::{
     rocksdb::{
         CANONICAL_DATA_COLUMN_FAMILIES, CanonicalStoreAdmissionExpectation,
         canonical_column_family_descriptors, canonical_store_path, validate_open_store_control,
-        validate_resource_budget,
     },
 };
 
@@ -105,7 +105,10 @@ impl RocksDbCanonicalSecondary {
     /// Opens one exactly admitted secondary and catches it up to the primary's current state.
     ///
     /// The expected raw-blob retention is an immutable store identity, not a
-    /// request to infer coverage from currently present rows.
+    /// request to infer coverage from currently present rows. A
+    /// [`RocksDbResourceBudget`] opens the secondary on a block cache of its
+    /// own; [`RocksDbOpenResources::with_shared_block_cache`] opens it on a
+    /// cache other secondaries of the same store read through.
     #[allow(
         clippy::too_many_arguments,
         reason = "secondary admission keeps both filesystem identities and every immutable canonical contract explicit"
@@ -121,9 +124,13 @@ impl RocksDbCanonicalSecondary {
         expected_workload: CanonicalStoreWorkload,
         expected_raw_blob_retention: RawBlobRetention,
         expected_reorg_policy: super::CanonicalReorgPolicy,
-        resource_budget: RocksDbResourceBudget,
+        resources: impl Into<RocksDbOpenResources>,
     ) -> Result<Self, CanonicalStoreError> {
-        validate_resource_budget(resource_budget)?;
+        let resources = resources.into();
+        resources
+            .validate()
+            .map_err(|reason| CanonicalStoreError::InvalidResourceBudget { reason })?;
+        let resource_budget = resources.budget();
         let primary_path = canonical_store_path(primary_path.as_ref())?;
         let secondary_path = secondary_path.as_ref();
         if secondary_path == primary_path {
@@ -144,7 +151,7 @@ impl RocksDbCanonicalSecondary {
                 primary_path: &primary_path,
                 secondary_path,
             },
-            resource_budget,
+            resources,
             canonical_column_family_descriptors,
         )
         .map_err(|source| CanonicalStoreError::RocksDbOperation {
@@ -238,6 +245,12 @@ impl RocksDbCanonicalSecondary {
             io_mode: self.bounded_open.io_mode,
             resource_budget: self.resource_budget,
         });
+    }
+
+    /// Samples the memory this secondary holds outside its block cache.
+    #[must_use]
+    pub fn instance_memory(&self) -> RocksDbInstanceMemory {
+        self.bounded_open.instance_memory()
     }
 
     /// Catches up and authenticates the new visible replay tail.
