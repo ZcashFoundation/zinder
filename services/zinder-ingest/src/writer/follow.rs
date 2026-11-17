@@ -299,10 +299,15 @@ pub enum CanonicalFollowError {
         source: CommitmentTreeAccumulatorError,
     },
     /// The source checkpoint did not authenticate the locally derived next frontier.
-    #[error("source checkpoint differs from the locally derived live checkpoint at {height:?}")]
+    #[error(
+        "source checkpoint differs from the locally derived live checkpoint at {height:?} in its {component}"
+    )]
     SourceCheckpointMismatch {
         /// Height whose tree state diverged.
         height: BlockHeight,
+        /// First checkpoint part that differed: `block identity`, `block
+        /// time`, or `commitment-tree frontiers`.
+        component: &'static str,
     },
     /// Size-only compact metadata diverged from the typed frontier accumulator.
     #[error(
@@ -701,7 +706,10 @@ where
     let source_checkpoint = source_request(
         config.request_timeout,
         cancel,
-        source.fetch_chain_checkpoint(next_height, network_upgrade_activations.as_ref()),
+        source.fetch_chain_checkpoint_for_block(
+            BlockId::new(next_height, source_block.hash),
+            network_upgrade_activations.as_ref(),
+        ),
     )
     .await?;
     let predecessor_checkpoint = anchor.tip_checkpoint().clone();
@@ -919,7 +927,10 @@ where
         let source_checkpoint = source_request(
             config.request_timeout,
             cancel,
-            source.fetch_chain_checkpoint(current_height, network_upgrade_activations.as_ref()),
+            source.fetch_chain_checkpoint_for_block(
+                BlockId::new(current_height, source_block.hash),
+                network_upgrade_activations.as_ref(),
+            ),
         )
         .await?;
         let source_block_for_prepare = source_block.clone();
@@ -1257,14 +1268,39 @@ fn prepare_live_block(
             .validated_frontiers()
             .map_err(|source| CanonicalFollowError::CommitmentTreeState { height, source })?,
     );
-    if &derived_checkpoint != source_checkpoint {
-        return Err(CanonicalFollowError::SourceCheckpointMismatch { height });
+    if let Some(component) = differing_checkpoint_component(&derived_checkpoint, source_checkpoint)
+    {
+        return Err(CanonicalFollowError::SourceCheckpointMismatch { height, component });
     }
     let tip_metadata = positioned.tip_metadata;
     Ok((
         canonical_build_block(positioned, Some(derived_checkpoint), None),
         tip_metadata,
     ))
+}
+
+/// Names the first part in which two checkpoints differ, or `None` when they
+/// are equal.
+fn differing_checkpoint_component(
+    derived: &CommitmentTreeCheckpoint,
+    source: &CommitmentTreeCheckpoint,
+) -> Option<&'static str> {
+    // Naming every field keeps this as strict as checkpoint equality when the
+    // checkpoint gains a field.
+    let CommitmentTreeCheckpoint {
+        block_id,
+        block_time_seconds,
+        frontiers,
+    } = derived;
+    if *block_id != source.block_id {
+        Some("block identity")
+    } else if *block_time_seconds != source.block_time_seconds {
+        Some("block time")
+    } else if *frontiers != source.frontiers {
+        Some("commitment-tree frontiers")
+    } else {
+        None
+    }
 }
 
 async fn fetch_live_subtree_roots<Source>(
@@ -1506,15 +1542,16 @@ mod tests {
     use std::{num::NonZeroU32, time::Duration};
 
     use zinder_core::{
-        BlockHash, BlockHeight, BlockId, ChainTipMetadata, SUBTREE_LEAF_COUNT, ShieldedProtocol,
-        SubtreeRootIndex, SubtreeRootRange,
+        BlockHash, BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeCheckpoint,
+        CommitmentTreeFrontiers, SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootIndex,
+        SubtreeRootRange,
     };
 
     use super::{
         ReplacementMemory, await_follow_preparation_or_mempool_change,
-        gate_canonical_readiness_on_mempool_hydration, live_subtree_root_ranges,
-        next_settled_height, publish_follow_readiness, wait_for_mempool_hydration_change,
-        withdraw_follow_readiness_for_mempool_hydration,
+        differing_checkpoint_component, gate_canonical_readiness_on_mempool_hydration,
+        live_subtree_root_ranges, next_settled_height, publish_follow_readiness,
+        wait_for_mempool_hydration_change, withdraw_follow_readiness_for_mempool_hydration,
     };
     use crate::mempool_ready_channel;
     use zinder_runtime::{
@@ -1876,6 +1913,28 @@ mod tests {
             &after_fresh_observation.cause,
             ReadinessCause::Ready
         ));
+    }
+
+    #[test]
+    fn checkpoint_comparison_names_the_first_differing_part() {
+        let checkpoint = |block: BlockId, block_time_seconds| {
+            CommitmentTreeCheckpoint::new(
+                block,
+                block_time_seconds,
+                CommitmentTreeFrontiers::default(),
+            )
+        };
+        let derived = checkpoint(block_id(3, 1), 10);
+
+        assert_eq!(differing_checkpoint_component(&derived, &derived), None);
+        assert_eq!(
+            differing_checkpoint_component(&derived, &checkpoint(block_id(3, 2), 11)),
+            Some("block identity")
+        );
+        assert_eq!(
+            differing_checkpoint_component(&derived, &checkpoint(block_id(3, 1), 11)),
+            Some("block time")
+        );
     }
 
     #[test]

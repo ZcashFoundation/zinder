@@ -275,6 +275,16 @@ impl NodeSource for ZebraIndexerBlockSource {
             .await
     }
 
+    async fn fetch_chain_checkpoint_for_block(
+        &self,
+        block_id: BlockId,
+        activations: &NetworkUpgradeActivations,
+    ) -> Result<CommitmentTreeCheckpoint, SourceError> {
+        self.control_plane
+            .fetch_chain_checkpoint_for_block(block_id, activations)
+            .await
+    }
+
     async fn tip_id(&self) -> Result<BlockId, SourceError> {
         self.control_plane.tip_id().await
     }

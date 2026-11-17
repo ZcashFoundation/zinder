@@ -60,6 +60,18 @@ both node limits, so a split is the exception rather than the normal path.
 `tip_id` returns height and hash from one source observation. Height alone is
 not a chain identity and must not be used to accept a value across a reorg.
 
+`fetch_chain_checkpoint_for_block` applies the same rule to tree state. It
+returns the checkpoint of a block that the caller has already identified.
+`ZebraJsonRpcSource` sends that block's hash to `z_gettreestate`, which Zebra
+7.0.0 and Zakura 1.8.6 accept in place of a height. The node then answers for
+that block, or refuses with "the requested block is not in the main chain" when
+the block has left its best chain. The source maps that refusal to
+`BlockUnavailable`, and a response that names another block to
+`SourceProtocolMismatch`. A source without a hash-keyed read checks the identity
+of a height-keyed answer instead, and returns `BlockReorgDuringFetch` when the
+answer names another block. `fetch_chain_checkpoint` stays height-keyed for a
+caller that knows only a height, such as a configured construction checkpoint.
+
 `TransactionBroadcaster` is separate because broadcasting is a command, not a
 chain observation. The unit implementation returns
 `TransactionBroadcastDisabled`, so a read-only composition fails explicitly.
@@ -149,7 +161,7 @@ them for writer recovery and readiness:
 | Class | Meaning |
 | --- | --- |
 | `node_unreachable` | The endpoint cannot be reached |
-| `upstream_view_changed` | A best-chain observation changed during the operation |
+| `upstream_view_changed` | A best-chain observation changed during the operation, for example a block left the best chain before its tree state was read |
 | `stream_disconnected` | An indexer subscription disconnected |
 | `capability_missing` | A required upstream operation is unavailable |
 | `protocol_mismatch` | A response violates the expected wire contract |

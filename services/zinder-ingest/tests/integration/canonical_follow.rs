@@ -12,6 +12,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use metrics_exporter_prometheus::PrometheusBuilder;
 use parking_lot::Mutex;
 use tempfile::tempdir;
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -27,7 +28,7 @@ use zinder_ingest::{
     RawBlobPolicy, follow_canonical_tip, follow_canonical_tip_with_control, load_fresh_canonical,
     prepare_canonical_block,
 };
-use zinder_runtime::{ComposedReadiness, Readiness, ReadinessCause};
+use zinder_runtime::{ComposedReadiness, NodeUnavailableDetail, Readiness, ReadinessCause};
 use zinder_source::{
     NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceChainSegment,
     SourceChainSegmentLimits, SourceError, SourceSubtreeRoots,
@@ -66,6 +67,16 @@ struct RecordingParseableSource {
     tip_call_gate: Arc<Mutex<Option<SourceTipCallGate>>>,
     cancel_after_tip_call: Arc<Mutex<Option<(u32, CancellationToken)>>>,
     cancel_after_checkpoint: Arc<Mutex<Option<(BlockHeight, CancellationToken)>>>,
+    switch_before_checkpoint: Arc<Mutex<Option<PendingChainSwitch>>>,
+}
+
+/// A best-chain switch the source applies when the tree state at `height` is
+/// next read, after the block at that height was already served.
+struct PendingChainSwitch {
+    height: BlockHeight,
+    blocks: BTreeMap<BlockHeight, SourceBlock>,
+    checkpoints: BTreeMap<BlockHeight, CommitmentTreeCheckpoint>,
+    tip_height: BlockHeight,
 }
 
 #[derive(Clone)]
@@ -90,7 +101,12 @@ impl RecordingParseableSource {
             tip_call_gate: Arc::new(Mutex::new(None)),
             cancel_after_tip_call: Arc::new(Mutex::new(None)),
             cancel_after_checkpoint: Arc::new(Mutex::new(None)),
+            switch_before_checkpoint: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn switch_chain_before_checkpoint(&self, switch: PendingChainSwitch) {
+        *self.switch_before_checkpoint.lock() = Some(switch);
     }
 
     fn set_tip_height(&self, height: BlockHeight) {
@@ -195,6 +211,13 @@ impl NodeSource for RecordingParseableSource {
         _network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> Result<CommitmentTreeCheckpoint, SourceError> {
         self.calls.lock().push(SourceCall::Checkpoint(height));
+        let switch = self
+            .switch_before_checkpoint
+            .lock()
+            .take_if(|switch| switch.height == height);
+        if let Some(switch) = switch {
+            self.replace_chain(switch.blocks, switch.checkpoints, switch.tip_height);
+        }
         let checkpoint = self.checkpoint_at(height)?;
         if let Some((cancel_at, cancel)) = self.cancel_after_checkpoint.lock().as_ref()
             && height == *cancel_at
@@ -1422,6 +1445,31 @@ async fn follow_fork_with_replacement_budget(
     Ok(error)
 }
 
+fn follower_to_target<'a>(
+    source: &'a RecordingParseableSource,
+    activations: &Arc<NetworkUpgradeActivations>,
+    target_height: BlockHeight,
+    readiness: &'a ComposedReadiness,
+    cancel: &'a CancellationToken,
+) -> CanonicalFollower<'a, RecordingParseableSource> {
+    CanonicalFollower::new(
+        source,
+        Arc::clone(activations),
+        CanonicalFollowConfig {
+            request_timeout: Duration::from_secs(5),
+            poll_interval: Duration::ZERO,
+            lag_threshold_blocks: 0,
+            target_height: Some(target_height),
+            event_retention_window: None,
+            event_retention_check_interval: Duration::from_secs(1),
+            mempool_ready_gate: None,
+            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+        },
+        readiness,
+        cancel,
+    )
+}
+
 fn single_pass_follower<'a>(
     source: &'a RecordingParseableSource,
     activations: &Arc<NetworkUpgradeActivations>,
@@ -1628,6 +1676,329 @@ async fn canonical_follower_reports_source_outage_and_resumes_after_recovery()
         ReadinessCause::NodeUnavailable(_)
     ));
     Ok(())
+}
+
+/// The node switches its best chain to a sibling block after the follower
+/// read the block at the next height and before it read that block's tree
+/// state.
+///
+/// The follower observes the node again once, reporting the changed view as
+/// `upstream_view_changed`, and appends the sibling instead of exiting.
+#[tokio::test]
+async fn best_chain_switch_between_block_and_tree_state_reads_appends_the_new_block()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let original = parseable_multi_block_chain()?;
+    let original_checkpoints = checkpoints_for_parseable_chain(&original, &activations)?;
+    let published: BTreeMap<_, _> = original
+        .range(..=BlockHeight::new(2))
+        .map(|(height, block)| (*height, block.clone()))
+        .collect();
+    let source = RecordingParseableSource::new(
+        published.clone(),
+        original_checkpoints.clone(),
+        BlockHeight::new(2),
+    );
+    let temporary = tempdir()?;
+    let store = publish_parseable_store(
+        &source,
+        &published,
+        Arc::clone(&activations),
+        &temporary.path().join("canonical"),
+        2,
+        BlockHeight::new(1),
+    )
+    .await?;
+    source.replace_chain(original.clone(), original_checkpoints, BlockHeight::new(3));
+    let sibling = forked_parseable_chain(&original, 3, 3, 31)?;
+    let sibling_three = block_id(&sibling, 3)?;
+    assert_ne!(sibling_three, block_id(&original, 3)?);
+    source.switch_chain_before_checkpoint(PendingChainSwitch {
+        height: BlockHeight::new(3),
+        checkpoints: checkpoints_for_parseable_chain(&sibling, &activations)?,
+        blocks: sibling,
+        tip_height: BlockHeight::new(3),
+    });
+    source.clear_calls();
+
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let cancel = CancellationToken::new();
+    let follower = follower_to_target(
+        &source,
+        &activations,
+        BlockHeight::new(3),
+        &readiness,
+        &cancel,
+    );
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let recorded_metrics = recorder.handle();
+    let local_recorder = metrics::set_default_local_recorder(&recorder);
+    let (outage, outcome) = tokio::join!(
+        first_node_unavailable_detail(&readiness),
+        follow_canonical_tip(store, follower),
+    );
+    drop(local_recorder);
+    let store = outcome?;
+    let outage = outage?;
+
+    assert_eq!(store.event_fence().visible_tip(), sibling_three);
+    assert_eq!(outage.failure_class, "upstream_view_changed");
+    assert!(
+        outage
+            .last_reason
+            .contains("tree-state hash disagrees with the fetched block hash"),
+        "{}",
+        outage.last_reason
+    );
+    assert_eq!(
+        source.calls(),
+        vec![
+            SourceCall::Tip,
+            SourceCall::Block(BlockHeight::new(3)),
+            SourceCall::Checkpoint(BlockHeight::new(3)),
+            SourceCall::Tip,
+            SourceCall::Block(BlockHeight::new(3)),
+            SourceCall::Checkpoint(BlockHeight::new(3)),
+        ]
+    );
+    assert!(
+        recorded_metrics
+            .render()
+            .lines()
+            .any(|line| line == "zinder_ingest_canonical_source_recoveries_total 1"),
+        "exactly one source recovery must be recorded"
+    );
+    Ok(())
+}
+
+/// The node switches its best chain again while the follower prepares a
+/// replacement, between a replacement block read and its tree-state read.
+///
+/// The follower discards the half-prepared replacement, observes the node
+/// again, and commits the replacement the node now holds.
+#[tokio::test]
+async fn best_chain_switch_during_replacement_reobserves_and_replaces_with_the_new_branch()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let original = parseable_multi_block_chain()?;
+    let published: BTreeMap<_, _> = original
+        .range(..=BlockHeight::new(3))
+        .map(|(height, block)| (*height, block.clone()))
+        .collect();
+    let source = RecordingParseableSource::new(
+        published.clone(),
+        checkpoints_for_parseable_chain(&published, &activations)?,
+        BlockHeight::new(3),
+    );
+    let temporary = tempdir()?;
+    let store = publish_parseable_store(
+        &source,
+        &published,
+        Arc::clone(&activations),
+        &temporary.path().join("canonical"),
+        3,
+        BlockHeight::new(1),
+    )
+    .await?;
+    let first_branch = forked_parseable_chain(&original, 3, 4, 41)?;
+    let second_branch = forked_parseable_chain(&original, 3, 4, 43)?;
+    let second_tip = block_id(&second_branch, 4)?;
+    assert_ne!(block_id(&first_branch, 3)?, block_id(&second_branch, 3)?);
+    source.replace_chain(
+        first_branch.clone(),
+        checkpoints_for_parseable_chain(&first_branch, &activations)?,
+        BlockHeight::new(4),
+    );
+    source.switch_chain_before_checkpoint(PendingChainSwitch {
+        height: BlockHeight::new(3),
+        checkpoints: checkpoints_for_parseable_chain(&second_branch, &activations)?,
+        blocks: second_branch,
+        tip_height: BlockHeight::new(4),
+    });
+    source.clear_calls();
+
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let cancel = CancellationToken::new();
+    let follower = follower_to_target(
+        &source,
+        &activations,
+        BlockHeight::new(4),
+        &readiness,
+        &cancel,
+    );
+    let (outage, outcome) = tokio::join!(
+        first_node_unavailable_detail(&readiness),
+        follow_canonical_tip(store, follower),
+    );
+    let store = outcome?;
+    let outage = outage?;
+
+    assert_eq!(store.event_fence().visible_tip(), second_tip);
+    assert_eq!(outage.failure_class, "upstream_view_changed");
+    assert!(
+        outage
+            .last_reason
+            .contains("tree-state hash disagrees with the fetched block hash"),
+        "{}",
+        outage.last_reason
+    );
+    let discovery_through_first_tree_state = [
+        SourceCall::Tip,
+        SourceCall::Block(BlockHeight::new(4)),
+        SourceCall::Block(BlockHeight::new(3)),
+        SourceCall::Block(BlockHeight::new(2)),
+        SourceCall::Checkpoint(BlockHeight::new(3)),
+    ];
+    assert_eq!(
+        source.calls(),
+        [
+            discovery_through_first_tree_state.as_slice(),
+            discovery_through_first_tree_state.as_slice(),
+            &[SourceCall::Checkpoint(BlockHeight::new(4))],
+        ]
+        .concat()
+    );
+    Ok(())
+}
+
+/// A tree state that names the fetched block but disagrees with the locally
+/// derived checkpoint is a contradiction, not a changed view.
+///
+/// The follower stops on the first read with an error naming the differing
+/// part, and the store keeps its fence.
+#[tokio::test]
+async fn same_block_tree_state_that_contradicts_the_derived_checkpoint_fails_closed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let original = parseable_multi_block_chain()?;
+    let original_checkpoints = checkpoints_for_parseable_chain(&original, &activations)?;
+    let honest = original_checkpoints
+        .get(&BlockHeight::new(3))
+        .ok_or("parseable chain must have a checkpoint at height 3")?
+        .clone();
+    let contradictions = [
+        (
+            CommitmentTreeCheckpoint::new(
+                honest.block_id,
+                honest.block_time_seconds.wrapping_add(1),
+                honest.frontiers.clone(),
+            ),
+            "block time",
+        ),
+        (
+            CommitmentTreeCheckpoint::new(
+                honest.block_id,
+                honest.block_time_seconds,
+                CommitmentTreeFrontiers::default(),
+            ),
+            "commitment-tree frontiers",
+        ),
+    ];
+    for (contradiction, expected_component) in contradictions {
+        assert_ne!(contradiction, honest);
+        let mut checkpoints = original_checkpoints.clone();
+        checkpoints.insert(BlockHeight::new(3), contradiction);
+        let error =
+            append_against_tree_states(&original, &original_checkpoints, checkpoints, &activations)
+                .await?;
+
+        assert!(
+            matches!(
+                error,
+                zinder_ingest::CanonicalFollowError::SourceCheckpointMismatch { height, component }
+                    if height == BlockHeight::new(3) && component == expected_component
+            ),
+            "{error}"
+        );
+    }
+    Ok(())
+}
+
+/// Publishes `original` through height 2, then follows to height 3 while the
+/// source serves `follow_checkpoints`, and returns the error that stopped the
+/// follower.
+///
+/// Asserts that the follower made exactly one attempt and left the store's
+/// fence unchanged.
+async fn append_against_tree_states(
+    original: &BTreeMap<BlockHeight, SourceBlock>,
+    original_checkpoints: &BTreeMap<BlockHeight, CommitmentTreeCheckpoint>,
+    follow_checkpoints: BTreeMap<BlockHeight, CommitmentTreeCheckpoint>,
+    activations: &Arc<NetworkUpgradeActivations>,
+) -> Result<zinder_ingest::CanonicalFollowError, Box<dyn std::error::Error>> {
+    let published: BTreeMap<_, _> = original
+        .range(..=BlockHeight::new(2))
+        .map(|(height, block)| (*height, block.clone()))
+        .collect();
+    let source = RecordingParseableSource::new(
+        published.clone(),
+        original_checkpoints.clone(),
+        BlockHeight::new(2),
+    );
+    let temporary = tempdir()?;
+    let store_path = temporary.path().join("canonical");
+    let store = publish_parseable_store(
+        &source,
+        &published,
+        Arc::clone(activations),
+        &store_path,
+        2,
+        BlockHeight::new(1),
+    )
+    .await?;
+    let original_fence = store.event_fence();
+    source.replace_chain(original.clone(), follow_checkpoints, BlockHeight::new(3));
+    source.clear_calls();
+
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let cancel = CancellationToken::new();
+    let follower = follower_to_target(
+        &source,
+        activations,
+        BlockHeight::new(3),
+        &readiness,
+        &cancel,
+    );
+    let error = follow_canonical_tip(store, follower)
+        .await
+        .err()
+        .ok_or("a contradicting tree state must stop the follower")?;
+
+    assert_eq!(
+        source.calls(),
+        vec![
+            SourceCall::Tip,
+            SourceCall::Block(BlockHeight::new(3)),
+            SourceCall::Checkpoint(BlockHeight::new(3)),
+        ]
+    );
+    let reopened = zinder_store::RocksDbCanonicalStore::open_ready(
+        &store_path,
+        activations,
+        CanonicalStoreWorkload::Wallet,
+        zinder_store::RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(2)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    assert_eq!(reopened.event_fence(), original_fence);
+    Ok(error)
+}
+
+/// Returns the first `node_unavailable` readiness detail the writer publishes.
+async fn first_node_unavailable_detail(
+    readiness: &ComposedReadiness,
+) -> Result<NodeUnavailableDetail, tokio::time::error::Elapsed> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let ReadinessCause::NodeUnavailable(detail) =
+                readiness.runtime_readiness().report().cause
+            {
+                return detail;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
 }
 
 #[expect(

@@ -238,7 +238,9 @@ impl ZebraJsonRpcSource {
     /// recent height instead of replaying the chain from genesis. The values
     /// come from one height-keyed `z_gettreestate` request. Frontier presence
     /// is validated against `network_upgrade_activations`, including custom
-    /// Testnet and Regtest schedules.
+    /// Testnet and Regtest schedules. When the block is already identified,
+    /// [`NodeSource::fetch_chain_checkpoint_for_block`] keys the same request
+    /// by its hash instead.
     ///
     /// # Errors
     ///
@@ -254,6 +256,18 @@ impl ZebraJsonRpcSource {
         height: BlockHeight,
         network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> Result<CommitmentTreeCheckpoint, SourceError> {
+        self.fetch_tree_state_checkpoint(height, None, network_upgrade_activations)
+            .await
+    }
+
+    /// Reads one `z_gettreestate` checkpoint, keyed by `block_hash` when the
+    /// block is identified and by `height` otherwise.
+    async fn fetch_tree_state_checkpoint(
+        &self,
+        height: BlockHeight,
+        block_hash: Option<BlockHash>,
+        network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> Result<CommitmentTreeCheckpoint, SourceError> {
         if network_upgrade_activations.network() != self.network {
             return Err(SourceError::SourceProtocolMismatch {
                 reason: "checkpoint activation table network does not match the node source",
@@ -267,10 +281,12 @@ impl ZebraJsonRpcSource {
                 reason: "checkpoint activation table is missing Sapling",
             });
         }
+        let request_key =
+            block_hash.map_or_else(|| height.value().to_string(), encode_rpc_block_hash);
         let tree_state: ZebraGetTreestate = self
             .call_typed(
                 "z_gettreestate",
-                positional_params([Value::from(height.value().to_string())])?,
+                positional_params([Value::from(request_key)])?,
                 |error| tree_state_call_error(height, error),
             )
             .await?;
@@ -279,8 +295,13 @@ impl ZebraJsonRpcSource {
                 reason: "z_gettreestate height does not match requested checkpoint height",
             });
         }
-        let block_hash = decode_rpc_block_hash(&tree_state.hash)?;
-        let block_id = BlockId::new(height, block_hash);
+        let response_hash = decode_rpc_block_hash(&tree_state.hash)?;
+        if block_hash.is_some_and(|requested_hash| requested_hash != response_hash) {
+            return Err(SourceError::SourceProtocolMismatch {
+                reason: "z_gettreestate hash does not match the requested block",
+            });
+        }
+        let block_id = BlockId::new(height, response_hash);
         let block_time_seconds = tree_state.time;
         let frontiers = decode_zebra_commitment_tree_frontiers(
             tree_state,
@@ -1026,6 +1047,19 @@ impl NodeSource for ZebraJsonRpcSource {
         network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> Result<CommitmentTreeCheckpoint, SourceError> {
         Self::fetch_chain_checkpoint(self, height, network_upgrade_activations).await
+    }
+
+    async fn fetch_chain_checkpoint_for_block(
+        &self,
+        block_id: BlockId,
+        network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> Result<CommitmentTreeCheckpoint, SourceError> {
+        self.fetch_tree_state_checkpoint(
+            block_id.height,
+            Some(block_id.hash),
+            network_upgrade_activations,
+        )
+        .await
     }
 
     async fn tip_id(&self) -> Result<BlockId, SourceError> {

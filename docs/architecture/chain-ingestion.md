@@ -60,7 +60,9 @@ compared with the node's tree state. The loader therefore cross-checks each
 checkpoint as it writes it: the root of the in-memory frontier must equal the
 root of the checkpoint's canonical `finalState` encoding. A mismatch stops
 construction, and nothing is published. The check costs at most one more root
-computation for each pool that changed since the previous checkpoint.
+computation for each pool that changed since the previous checkpoint. The
+node's tree state for the build tip is requested by the tip's hash. If that
+block has left the node's best chain, construction stops and publishes nothing.
 
 `CanonicalConstructionSettings` and `CanonicalPipelineLimits` bound:
 
@@ -142,6 +144,17 @@ process-wide memo, keyed by pool and exact `finalState` bytes. After the first
 append in a writer process, a pool that the block leaves unchanged costs no
 root computation. A pool that the block changes costs one, for the node's new
 tree state.
+
+Ingest reads a block and its tree state with two node requests, and the node
+can switch its best chain between them. The tree-state request therefore names
+the block that ingest just read by its hash, for each append and for each block
+of a replacement. When that block has left the node's best chain, the request
+fails as a changed upstream view. Readiness reports `node_unavailable` with
+class `upstream_view_changed`, committed state and the fence are kept, and the
+next iteration observes the node again. A tree state for the same block whose
+time or frontiers differ from the derived result is a contradiction, not a
+changed view. It stops the writer with `SourceCheckpointMismatch`, which names
+the part that differed.
 
 Readiness becomes ready only when canonical lag is within
 `ingest.follow.lag_threshold_blocks` and the live mempool gate, when configured,
