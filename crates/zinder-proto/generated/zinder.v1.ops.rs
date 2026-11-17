@@ -71,8 +71,7 @@ pub struct ReadinessReport {
 /// Latest observation of one dependency a process keeps serving without.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ReadinessDependency {
-    /// Stable snake-case dependency label: `node_source`, `ingest_control`, or
-    /// `materialized_view_catchup`.
+    /// Stable snake-case dependency label: `node_source` or `ingest_control`.
     #[prost(string, tag = "1")]
     pub input: ::prost::alloc::string::String,
     /// Latest cause the dependency's owner reported.

@@ -515,11 +515,13 @@ serve its contract now. Metrics and readiness causes name the owning subsystem:
 `canonical`, `wallet_projection`, `materialized_view`, `source`, `mempool`, or
 `serving_pair`.
 
-A readiness report names its dependencies with `ReadinessInput` labels:
-`node_source`, `ingest_control`, and `materialized_view_catchup`. A dependency
-that the process serves without, and whose cause does not admit traffic,
-appears in the report's `degraded` list as a `ReadinessDependency` with that
-`input` label and its cause. On `/readyz` the cause key of an entry is
+Readiness inputs carry `ReadinessInput` labels: `node_source`,
+`ingest_control`, and `materialized_view_catchup`. A dependency that the
+process serves without, and whose cause does not admit traffic, appears in the
+report's `degraded` list as a `ReadinessDependency` with that `input` label
+and its cause. Only `node_source` and `ingest_control` are dependencies today;
+Explorer's `materialized_view_catchup` input is required and refuses traffic
+as Explorer's own cause. On `/readyz` the cause key of an entry is
 `dependency_cause`, and in the `zinder.v1.ops.ReadinessReport` message it is
 `cause` with an optional `detail`. A wallet-serving reader's report also
 carries `served_epoch_age_seconds`. The metrics that mirror these fields are

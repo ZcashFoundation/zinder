@@ -50,8 +50,10 @@ A runtime can also report dependencies it keeps serving without. Native wallet
 query reports its node source and ingest control this way, and lightwalletd
 compatibility in wallet mode reports its node source. A dependency whose cause
 does not admit traffic appears in the report's `degraded` list with its
-`input` label (`node_source`, `ingest_control`, or
-`materialized_view_catchup`) and its cause. The runtime's own `cause` can
+`input` label (`node_source` or `ingest_control`) and its cause. Explorer's
+`materialized_view_catchup` input is required, not a dependency: its failure
+becomes Explorer's own cause and refuses traffic, so it never appears under
+`degraded`. The runtime's own `cause` can
 still be `ready`, because only the requests that call the dependency fail. On
 `/readyz`, `degraded` follows the top-level `cause`, and each entry names its
 cause `dependency_cause`, so a parser that reads the first `"cause"` key gets
