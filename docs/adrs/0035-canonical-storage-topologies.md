@@ -64,12 +64,12 @@ selects one topology for a whole deployment.
 | Topology | Role | Status |
 | --- | --- | --- |
 | `rocksdb-single-host` | Self-hosters and small deployments | Implemented and supported. The only topology Zinder advertises. |
-| `postgres-horizontal` | Hosted fleets | Decided. Not implemented, not certified, and not advertised. |
+| `postgres-horizontal` | Hosted fleets | Decided. Not implemented, not certified, and not advertised. Becomes certified and advertised at the end of slice 2 of the [build order](#build-order). |
 
 `postgres-horizontal` does not exist in code. The sections that describe it
 record a decision about future work, and no release supports it until it
-passes the [benchmark gate](#benchmark-gate) and the certification of its
-slices. The `postgres-horizontal`, Benchmark gate, Build order, and Changed
+passes the [benchmark gate](#benchmark-gate) and is certified at the end of
+slice 2. The `postgres-horizontal`, Benchmark gate, Build order, and Changed
 commitments sections record decided work that does not ship yet. The Upgrade
 contract is decided now, and its class label becomes mandatory with the first
 release after the release workflow carries it. The remaining sections describe
@@ -178,8 +178,8 @@ same canonical replay corpus and digest oracle. It does not provide the
 runtime ownership, wallet projection, wallet-serving admission, replication,
 recovery, or operational contracts required for a deployable topology. Zinder
 therefore does not advertise a PostgreSQL deployment mode, and it does not
-advertise `postgres-horizontal` until that topology is implemented and
-certified.
+advertise `postgres-horizontal` until that topology is certified at the end
+of slice 2.
 
 ### Recovery boundary
 
@@ -218,16 +218,20 @@ The first release is deliberately smaller than the full PostgreSQL design in
   term from the start. One ingest and one projector run at first. Standby
   writers and automatic failover come in a later slice, after fault-injection
   testing. The target once that slice ships is that a standby takes over
-  within 60 seconds of the active writer stopping.
-- **Mempool.** The mempool stays in the active ingest's memory and is not
-  persisted in PostgreSQL. Readers find the active ingest through its
-  ownership row and call it. When ingest is unreachable, mempool methods
-  fail, and so does a transaction lookup that misses canonical storage and
-  needs the mempool to decide its answer. Block, balance, and history reads
-  keep working. [Changed commitments](#changed-commitments) describes both
-  limits. Whether the resumable mempool event log, which the canonical store
-  keeps today, moves to PostgreSQL is not settled. If it does not, a
-  `MempoolEvents` cursor does not survive an ingest restart or takeover.
+  within 60 seconds of the active writer stopping. Until then, an ingest
+  outage longer than the staleness ceiling stops all reads, as
+  [Changed commitments](#changed-commitments) describes. This is accepted
+  for slices 1 and 2.
+- **Mempool.** The mempool contents, the live index of pending
+  transactions, stay in the active ingest's memory and are not persisted in
+  PostgreSQL. Readers find the active ingest through its ownership row and
+  call it. The resumable mempool event log, which the canonical store keeps
+  today, is stored in PostgreSQL, so a `MempoolEvents` cursor survives an
+  ingest restart. When ingest is unreachable, mempool methods fail, and so
+  does a transaction lookup that misses canonical storage and needs the
+  mempool to decide its answer. Block, balance, and history reads keep
+  working until the staleness ceiling passes.
+  [Changed commitments](#changed-commitments) describes these limits.
 - **Pinned reads.** Rows carry no epoch-validity ranges. A read pinned to a
   height keeps working across appends, and a reorg that replaces the pinned
   blocks ends it with a retryable error. What a pinned read of wallet state
@@ -238,7 +242,7 @@ The first release is deliberately smaller than the full PostgreSQL design in
   secret shared by all readers. Today each store generates its own key, so a
   cursor does not work across instances.
 - **PostgreSQL versions.** The topology is certified against PostgreSQL 17
-  and 18 when it ships. Issue #56 named 18 only.
+  and 18 at the end of slice 2. Issue #56 named 18 only.
 - **Database hosting.** The benchmark spike and Testnet run on a single
   database with point-in-time backups. The Mainnet database host, either a
   replicated cluster on the current platform or an external managed service,
@@ -254,15 +258,18 @@ The first release is deliberately smaller than the full PostgreSQL design in
 ### Benchmark gate
 
 A benchmark spike on Mainnet-shaped data runs before issue #56 is broken down
-into build work. The spike passes when all four thresholds hold:
+into build work. The gate precedes the PostgreSQL build work. It does not
+hold back the engine-neutral read interfaces in the
+[build order](#build-order). The spike passes when all four thresholds hold:
 
 1. A block commits in under 2 seconds while readers run concurrently.
 2. Long block-range streaming reaches at least half of RocksDB's rate per
    reader.
-3. A Mainnet build from scratch finishes in under 48 hours.
-4. The database is less than twice the size of the RocksDB canonical and
-   wallet stores built from the same data. Explorer views are not part of the
-   comparison.
+3. A Mainnet build from scratch of canonical and wallet data together
+   finishes in under 48 hours.
+4. The PostgreSQL canonical and wallet data together are less than twice the
+   size of the RocksDB canonical and wallet stores built from the same data.
+   Explorer views are not part of the comparison on either engine.
 
 The statistic for threshold 1 and the reader counts for thresholds 1 and 2 are
 fixed in the spike's plan before its first run. The thresholds do not measure
@@ -292,12 +299,16 @@ Work proceeds in this order:
 2. Engine-neutral asynchronous read interfaces, with RocksDB behind them and a
    shared conformance suite that both engines must pass. They ship in a
    release of their own before any PostgreSQL reader ships. Reads come first;
-   writers keep engine-specific code.
+   writers keep engine-specific code. This work does not wait for the
+   benchmark gate.
 3. Slice 1: a canonical writer in PostgreSQL that follows the tip, with two
    stateless lightwalletd-compatible servers serving compact blocks behind a
    proxy.
-4. Slice 2: wallet projection and native queries.
-5. Slice 3: writer standby and failover.
+4. Slice 2: wallet projection and native queries. At the end of this slice,
+   `postgres-horizontal` becomes certified and advertised.
+5. Slice 3: writer standby and failover. This slice moves earlier only if
+   Testnet operation shows that the one-writer ingest outage described in
+   [Changed commitments](#changed-commitments) matters.
 6. Slice 4: Explorer.
 
 Each slice deploys first to a Testnet test deployment, then to the Testnet
@@ -326,8 +337,9 @@ chosen yet.
 
 **A reader may serve while the mempool is unavailable.** Under
 `postgres-horizontal`, a reader stays in service for block, balance, and
-history reads while the active ingest is unreachable. Only answers that need
-the live mempool fail:
+history reads while the active ingest is unreachable, until the staleness
+ceiling described below passes. Until then, only answers that need the live
+mempool fail:
 
 - Mempool methods fail.
 - An unpinned `WalletQuery.Transaction` lookup and a lightwalletd
@@ -356,12 +368,18 @@ until `storage.serving_pair_staleness_ceiling_ms` passes, measured from the
 last writer attestation. It then refuses traffic, as
 [Service operations](../architecture/service-operations.md#lightwalletd-compatibility)
 describes. Native wallet query does not reach this case when ingest itself is
-unreachable, because its ingest-control input already refuses traffic. Whether
-`postgres-horizontal` bounds serving without ingest with an equivalent
-ceiling, and what a reader returns past it, is not settled here. The signal a
-reader uses to measure staleness without calling ingest is a design detail of
-the slice and is not settled here. One candidate is the renewal evidence the
-writer keeps in its ownership row, read against database time.
+unreachable, because its ingest-control input already refuses traffic.
+
+Under `postgres-horizontal`, a reader also bounds serving without ingest with
+a staleness ceiling. Slices 1 and 2 run one ingest and no standby, so an
+ingest outage longer than the ceiling stops all reads across the fleet, not
+only the answers that need the mempool. This is accepted for slices 1 and 2.
+The standby slice moves earlier only if Testnet operation shows that this
+matters. The response a reader returns past the ceiling is not chosen yet.
+The signal a reader uses to measure staleness without calling ingest is a
+design detail of the slice and is not settled here. One candidate is the
+renewal evidence the writer keeps in its ownership row, read against
+database time.
 
 **One set of binaries carries both engines.** Zinder ships one set of
 binaries that contains both storage engines, and configuration selects the
@@ -390,11 +408,14 @@ is then kept for 7 days for rollback, so the doubled storage lasts for the
 build time plus those 7 days. A canonical layout change also runs a second
 ingest, projector, and reader set against the second database while it builds.
 
-Whether event cursors and pinned epochs issued before a canonical layout
-switch stay valid on the second database is not settled. Epoch ids and event
-sequences count commits in each store today, so a separately built database
-does not reproduce them unless the design makes it. Until that is settled,
-clients re-establish cursors and pins at such a switch.
+Event cursors and pinned epochs issued before a canonical layout switch do
+not carry over to the second database. Epoch ids and event sequences count
+commits in each store, and the second database is not required to reproduce
+them. Clients re-establish cursors and pins at such a switch. This is
+accepted for this rare class. For a canonical layout change, "Read downtime:
+None" therefore means that readers keep answering requests through the
+switch. It does not mean that a cursor or pin issued against the first
+database keeps working on the second.
 
 The operator actions, downtime, and costs in the table describe
 `postgres-horizontal`. A single-volume `rocksdb-single-host` host still
@@ -406,12 +427,15 @@ describes, and how the 7-day retention applies on a single volume is not
 decided.
 
 "Read downtime: None" covers block, balance, and history reads. A rolling
-restart also restarts the active ingest, which holds the mempool in memory.
-Until the standby slice ships, mempool methods and the transaction lookups
-that need the mempool fail from the moment ingest stops until the restarted
-ingest has rebuilt its mempool view, and no block commits in that interval.
-After the standby slice ships, the same gap lasts until the standby takes
-over and builds its own mempool view.
+restart also restarts the active ingest, which holds the mempool contents in
+memory. Until the standby slice ships, mempool methods and the transaction
+lookups that need the mempool fail from the moment ingest stops until the
+restarted ingest has rebuilt its mempool view, and no block commits in that
+interval. Block, balance, and history reads keep answering only while that
+interval stays shorter than the staleness ceiling. After the standby slice
+ships, the same gap lasts until the standby takes over and builds its own
+mempool view. A `MempoolEvents` cursor issued before the restart stays
+valid, because the mempool event log is stored in PostgreSQL.
 
 Wallet and Explorer data live in versioned schemas, so a layout change
 rebuilds only that projection.
@@ -476,9 +500,14 @@ Compose and Railway. The command's name and the parts of it that apply to
   other's builds instead of being refused.
 - Zinder carries two production topologies and the release and test work of
   both. The engine-neutral reads pass one conformance suite on both engines.
-- Until `postgres-horizontal` ships and passes certification, hosted
+- Until `postgres-horizontal` is certified at the end of slice 2, hosted
   deployments keep the release downtime and the rebuild cost described in
   [Context](#context).
+- Until the standby slice ships, a `postgres-horizontal` deployment has one
+  ingest, and an ingest outage longer than the staleness ceiling stops all
+  of its reads.
+- Clients re-establish event cursors and pins after a canonical layout
+  switch.
 - Native wallet clients of a `postgres-horizontal` deployment must handle a
   retryable error on a pinned read after a reorg and restart that walk.
 - Until replica reads ship, one PostgreSQL primary caps the read scale of a
@@ -498,8 +527,8 @@ Compose and Railway. The command's name and the parts of it that apply to
   doubles the affected part for its build and rollback retention.
 - Under `postgres-horizontal` the database is the only stateful component,
   and the deployment is as available and as recoverable as that database.
-  Losing a single database costs a restore from backup, or a rebuild that the
-  benchmark gate allows to take up to 48 hours.
+  Losing a single database costs a restore from backup, or a canonical and
+  wallet rebuild that the benchmark gate allows to take up to 48 hours.
 - Until the Explorer slice ships, a hosted deployment that serves both
   wallets and the Explorer runs two complete stacks: `postgres-horizontal`
   for wallet serving and a separate `rocksdb-single-host` deployment for the
@@ -507,7 +536,9 @@ Compose and Railway. The command's name and the parts of it that apply to
   the release downtime and rebuild cost described in [Context](#context).
 - Node redundancy is a separate concern that this decision does not solve.
   Ordered node endpoint failover in ingest and node diversity (Zebra and
-  Zakura) are tracked separately and do not wait for PostgreSQL.
+  Zakura) are tracked separately and do not wait for PostgreSQL. Reader node
+  failover, for the query and compatibility readers that each depend on one
+  node today, is tracked separately too.
 
 ## Rejected alternatives
 
@@ -590,15 +621,17 @@ deletes a table file the secondary still uses. Moving a primary path behind a
 network filesystem is outside the `rocksdb-single-host` contract, and on the
 hosting platform in use a volume attaches to only one service.
 
-### Persisting the mempool in PostgreSQL in the first release
+### Persisting the mempool contents in PostgreSQL in the first release
 
-This is deferred, not rejected. Today the canonical store keeps only the
-resumable mempool event log; the mempool index lives in ingest memory. A
-persisted mempool is new durable state with its own hydration and
+This is deferred, not rejected. It concerns the mempool contents, the live
+index that ingest keeps in memory. The resumable mempool event log, which
+the canonical store keeps today, is stored in PostgreSQL in the first
+release, so `MempoolEvents` cursors survive an ingest restart. Persisted
+mempool contents are new durable state with their own hydration and
 certification work. Readers can instead call the active ingest, which they
 find through its ownership row, and keep serving other reads while it is
-down. The mempool is persisted later only if the benchmark spike or
-production shows a need.
+down, until the staleness ceiling passes. The mempool contents are persisted
+later only if the benchmark spike or production shows a need.
 
 ## Topology review outcome
 
@@ -625,8 +658,9 @@ Two pieces of evidence did not exist when the decision was made. No load limit
 of `rocksdb-single-host` had been measured under client load. No PostgreSQL
 measurement at the chain tip existed; the `zinder-bench` arm measures bulk
 persistence of a replay corpus, not tip following under readers. The
-[benchmark gate](#benchmark-gate) therefore precedes build work, and its four
-thresholds are the conditions that send a part of the design back.
+[benchmark gate](#benchmark-gate) therefore precedes PostgreSQL build work,
+and its four thresholds are the conditions that send a part of the design
+back.
 
 The decision also closed the review before the measurements the 2026-11-16
 revision planned were complete. For `rocksdb-single-host` these remain
@@ -666,3 +700,12 @@ Measured behavior of `rocksdb-single-host` that still informs operators:
   Replaces the rule that a shared abstraction is introduced only when two
   supported implementations prove the same boundary, because the
   engine-neutral read interfaces ship before the second engine.
+- 2026-11-17: Settles points the first 2026-11-17 entry left open. With one
+  writer, an ingest outage longer than the staleness ceiling stops all reads,
+  which is accepted for slices 1 and 2. The resumable mempool event log is
+  stored in PostgreSQL, while the mempool contents stay in ingest memory.
+  Clients re-establish cursors and pins at a canonical layout switch. The
+  gate's build and size thresholds cover canonical and wallet data together.
+  The read-interface work does not wait for the gate, and
+  `postgres-horizontal` becomes certified and advertised at the end of
+  slice 2.
