@@ -110,6 +110,97 @@ async fn native_mempool_snapshot_forwards_typed_stale_status_unchanged() -> eyre
     Ok(())
 }
 
+/// A writer whose live mempool is hydrating answers with `NODE_UNAVAILABLE`,
+/// which query forwards instead of blaming an unreachable ingest control.
+#[tokio::test]
+async fn native_mempool_snapshot_forwards_a_writer_hydration_refusal_unchanged() -> eyre::Result<()>
+{
+    let hydrating = zinder_proto::status_for_reason(
+        ops::ErrorReason::NodeUnavailable,
+        "live mempool index is hydrating from an upstream snapshot",
+    );
+    let (adapter, _store_fixture, cancel, server_task) =
+        native_serving_adapter_with_ingest_control(
+            StaticIngestControl::new().with_mempool_snapshot_status(hydrating),
+        )
+        .await?;
+
+    let status = WalletQueryService::mempool_snapshot(
+        &adapter,
+        Request::new(wallet::MempoolSnapshotRequest {
+            max_entries: 1,
+            from_cursor: Vec::new(),
+        }),
+    )
+    .await
+    .err()
+    .ok_or_else(|| eyre!("a hydrating writer must refuse the snapshot"))?;
+    assert_eq!(status.code(), Code::Unavailable);
+    let status_details = status.get_error_details();
+    let error_info = status_details
+        .error_info()
+        .ok_or_else(|| eyre!("the hydration refusal omitted ErrorInfo"))?;
+    assert_eq!(error_info.domain, zinder_proto::ZINDER_ERROR_DOMAIN);
+    assert_eq!(
+        error_info.reason,
+        ops::ErrorReason::NodeUnavailable.as_str_name()
+    );
+    assert!(!status.message().contains("ingest control is unreachable"));
+
+    cancel.cancel();
+    server_task.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mempool_calls_fail_with_upstream_unreachable_once_ingest_control_stops() -> eyre::Result<()>
+{
+    let (adapter, _store_fixture, cancel, server_task) =
+        native_serving_adapter_with_ingest_control(StaticIngestControl::new()).await?;
+    cancel.cancel();
+    server_task.await??;
+
+    let assert_upstream_unreachable = |operation: &str, status: &Status| -> eyre::Result<()> {
+        assert_eq!(status.code(), Code::Unavailable, "{operation}: {status:?}");
+        let error_details = status.get_error_details();
+        let error_info = error_details
+            .error_info()
+            .ok_or_else(|| eyre!("{operation} omitted ErrorInfo: {status:?}"))?;
+        assert_eq!(error_info.domain, zinder_proto::ZINDER_ERROR_DOMAIN);
+        assert_eq!(
+            error_info.reason,
+            ops::ErrorReason::UpstreamUnreachable.as_str_name(),
+            "{operation}: {status:?}"
+        );
+        Ok(())
+    };
+
+    let snapshot = WalletQueryService::mempool_snapshot(
+        &adapter,
+        Request::new(wallet::MempoolSnapshotRequest {
+            max_entries: 1,
+            from_cursor: Vec::new(),
+        }),
+    )
+    .await
+    .err()
+    .ok_or_else(|| eyre!("mempool snapshot succeeded without ingest control"))?;
+    assert_upstream_unreachable("MempoolSnapshot", &snapshot)?;
+
+    let events = WalletQueryService::mempool_events(
+        &adapter,
+        Request::new(wallet::MempoolEventsRequest { start: None }),
+    )
+    .await
+    .err()
+    .ok_or_else(|| eyre!("mempool events opened without ingest control"))?;
+    assert_upstream_unreachable("MempoolEvents", &events)?;
+
+    let unmined = transaction_status(&adapter, TransactionId::from_bytes([0x48; 32]), None).await?;
+    assert_upstream_unreachable("Transaction", &unmined)?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn ingest_control_admission_rejects_a_different_service_identity() -> eyre::Result<()> {
     let ingest_control = StaticIngestControl::new().with_service_name("not-zinder-ingest");

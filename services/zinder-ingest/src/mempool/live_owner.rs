@@ -187,16 +187,22 @@ impl MempoolOwnerStatus {
 
     /// Returns the source tip and certification time of a serving index, or
     /// the status a request that needs one is refused with.
+    ///
+    /// A hydrating or rebuilding index waits on a node snapshot, so its
+    /// refusal carries `NODE_UNAVAILABLE`. The typed reason also tells a
+    /// reader that the writer answered, unlike a transport failure.
     fn serving_anchor(self) -> Result<(BlockId, UnixTimestampMillis), Status> {
         match self {
             Self::Serving {
                 source_tip,
                 snapshot_certified_at,
             } => Ok((source_tip, snapshot_certified_at)),
-            Self::Hydrating => Err(Status::unavailable(
+            Self::Hydrating => Err(status_for_reason(
+                ErrorReason::NodeUnavailable,
                 "live mempool index is hydrating from an upstream snapshot",
             )),
-            Self::RebuildRequired => Err(Status::unavailable(
+            Self::RebuildRequired => Err(status_for_reason(
+                ErrorReason::NodeUnavailable,
                 "live mempool index is rebuilding after a durable transition mismatch",
             )),
             Self::Halted(halt) => Err(halt.status()),

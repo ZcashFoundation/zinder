@@ -123,13 +123,13 @@ Service is reachable but a dependency is not, or the operation is not yet suppor
 
 | Reason | What it means |
 | --- | --- |
-| `NODE_UNAVAILABLE` | Upstream node (Zebra) is unreachable or returning errors |
+| `NODE_UNAVAILABLE` | Upstream node (Zebra) is unreachable or returning errors. The writer's live mempool also returns it while it hydrates or rebuilds from the node, and query forwards it for mempool calls |
 | `STORAGE_UNAVAILABLE` | Local storage cannot serve the request (fall-through case) |
 | `BLOCKING_TASK_FAILED` | An internal background task failed unexpectedly |
 | `UNSUPPORTED_CHAIN_EVENT` | The requested event variant cannot be represented by this binary |
 | `UNSUPPORTED_BLOCK_SELECTOR` | The requested selector shape cannot be represented |
 | `UNSUPPORTED_TRANSACTION_STATUS` | The received transaction-status variant cannot be decoded |
-| `UPSTREAM_UNREACHABLE` | A configured federated endpoint (for example the explorer's wallet-query endpoint) is temporarily unreachable |
+| `UPSTREAM_UNREACHABLE` | A configured federated endpoint (for example the explorer's wallet-query endpoint, or native query's ingest control behind mempool calls) is temporarily unreachable |
 | `SERVICE_NOT_READY` | The process is alive but its shared readiness gate is closed; `ErrorInfo.metadata["readiness_cause"]` contains the stable readiness label and `/readyz` carries any structured detail |
 | `NO_VISIBLE_CHAIN_EPOCH` | No visible chain epoch has been committed yet (the store is empty or still bootstrapping) |
 

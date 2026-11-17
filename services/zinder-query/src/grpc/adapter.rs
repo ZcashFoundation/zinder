@@ -36,7 +36,10 @@ type AuthenticatedIngestControlClient = IngestControlClient<AuthenticatedChannel
 use crate::{
     QueryError, TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest,
     WalletQueryApi, WalletServingQuery,
-    ingest_control::{WALLET_INGEST_CONTROL_REQUEST_TIMEOUT, wallet_ingest_control_request},
+    ingest_control::{
+        WALLET_INGEST_CONTROL_REQUEST_TIMEOUT, typed_ingest_control_status,
+        wallet_ingest_control_request,
+    },
 };
 
 use super::chain_events::{decode_address_filter, spawn_filtered_stream};
@@ -80,7 +83,8 @@ async fn mempool_transaction(
         .mempool_transaction(wallet_ingest_control_request(MempoolTransactionRequest {
             transaction_id: encode_rpc_transaction_id_hex(transaction_id),
         }))
-        .await;
+        .await
+        .map_err(typed_ingest_control_status);
     record_proxy_outcome("mempool_transaction", started_at, &proxy_outcome);
     proxy_outcome.map(Response::into_inner)
 }
@@ -575,6 +579,7 @@ where
             client
                 .mempool_snapshot(wallet_ingest_control_request(request.into_inner()))
                 .await
+                .map_err(typed_ingest_control_status)
         }
         .await;
         record_proxy_outcome("mempool_snapshot", started_at, &outcome);
@@ -604,8 +609,12 @@ where
                     ErrorReason::UpstreamUnreachable,
                     "ingest-control mempool event stream establishment timed out",
                 )
-            })??;
-            Ok(self.server_stream(Box::pin(response.into_inner())))
+            })?
+            .map_err(typed_ingest_control_status)?;
+            let events = response
+                .into_inner()
+                .map(|event| event.map_err(typed_ingest_control_status));
+            Ok(self.server_stream(Box::pin(events)))
         }
         .await;
         record_proxy_outcome("mempool_events", started_at, &outcome);

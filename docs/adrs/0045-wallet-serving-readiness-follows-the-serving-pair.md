@@ -84,8 +84,10 @@ observed. A failed call returns `UNAVAILABLE` with `NODE_UNAVAILABLE`, which
 clients retry with backoff. The probe polls every 30 seconds by default. A
 request therefore must not fail on an observation that may be 30 seconds old,
 and `node.request_timeout_secs` and `node.broadcast_timeout_secs` already bound
-the call. Mempool requests and unmined transaction lookups fail the same way
-when ingest control does not answer.
+the call. Mempool requests and unmined transaction lookups fail per request
+too when ingest control does not answer: native query returns `UNAVAILABLE`
+with `UPSTREAM_UNREACHABLE` for a call or stream the writer never answered,
+and passes through every status the writer itself returns.
 
 Losing ingest control entirely stays bounded. Native query reads
 `CanonicalControl.WriterStatus` through the same admitted channel, so the pair

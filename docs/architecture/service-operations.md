@@ -318,7 +318,7 @@ while any admitted dependency is temporarily unhealthy.
 | --- | --- | --- |
 | Stored reads: tips, blocks, compact blocks, mined transactions, transparent address reads, subtree roots, tree state at any height, the latest tree-state checkpoint, chain events, activations, and `ServerInfo` | Served | Served until `storage.serving_pair_staleness_ceiling_ms` passes |
 | `BroadcastTransaction` | `UNAVAILABLE`, `NODE_UNAVAILABLE` | Served until the ceiling passes |
-| `MempoolSnapshot`, `MempoolEvents`, and unmined `Transaction` lookups | Passed to ingest, which answers or fails them from its own mempool state | `UNAVAILABLE` |
+| `MempoolSnapshot`, `MempoolEvents`, and unmined `Transaction` lookups | Passed to ingest, which answers or fails them from its own mempool state; while that mempool hydrates or rebuilds from the node, `UNAVAILABLE`, `NODE_UNAVAILABLE` | `UNAVAILABLE`, `UPSTREAM_UNREACHABLE` |
 
 A node-backed request always calls the node, whatever the node probe last
 observed, so a node that recovers between probes serves it. The staleness
@@ -336,7 +336,10 @@ validate coherent network and tip evidence. Block arrival does not fail the
 check: the writer answers a mempool read at a new tip once its replacement
 generation is certified, waiting up to five seconds, and a snapshot that is
 still not coherent returns `CHAIN_EPOCH_PIN_UNAVAILABLE`, which the probe
-accepts as healthy. A transition into failure emits one classified warning and
+accepts as healthy. A writer mempool that is hydrating or rebuilding from the
+node answers `NODE_UNAVAILABLE`, which the probe also accepts: ingest readiness
+and the reader's own node probe report that outage, so ingest control is not
+blamed for it. A transition into failure emits one classified warning and
 degrades the ingest-control dependency with `ingest_control_unavailable`;
 recovery emits one event and clears only that dependency. A `WriterStatus`
 that reports `upstream_not_ready` degrades the dependency with the writer's

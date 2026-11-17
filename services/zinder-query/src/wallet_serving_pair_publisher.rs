@@ -2628,7 +2628,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wallet_ingest_control_probe_degrades_for_hydration_and_recovers()
+    async fn wallet_ingest_control_probe_degrades_only_for_untyped_snapshot_failures()
     -> Result<(), Box<dyn std::error::Error>> {
         let ingest_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
         let stale_status = zinder_proto::status_for_reason(
@@ -2654,6 +2654,17 @@ mod tests {
         let mut traffic_gate = zinder_runtime::TrafficReadinessInterceptor::new(runtime.clone());
         assert!(traffic_gate.call(Request::new(())).is_ok());
 
+        // A hydrating writer answers with a typed refusal, so ingest control
+        // stays healthy and the node outage is reported where it happens.
+        ingest_fixture.set_mempool_snapshot_error(Some(zinder_proto::status_for_reason(
+            ErrorReason::NodeUnavailable,
+            "live mempool index is hydrating from an upstream snapshot",
+        )));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(runtime.report().degraded.is_empty());
+
+        // An untyped unavailable status is indistinguishable from a transport
+        // failure.
         ingest_fixture.set_mempool_snapshot_error(Some(Status::unavailable(
             "fixture mempool hydration is unavailable",
         )));
