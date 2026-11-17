@@ -29,7 +29,7 @@ for function_name in \
   readiness_cause_is_writer_halt \
   readiness_cause_is_projector_park \
   readiness_cause_is_upstream_outage \
-  update_upstream_outage \
+  update_node_unreachable_outage \
   query_unready_behind_projector_park \
   start_wallet_serving \
   require_projector_park_for_stopped_query \
@@ -66,14 +66,14 @@ recurrence_min_answered_episode_seconds="$(
   entrypoint_setting recurrence_min_answered_episode_seconds
 )"
 serving_unready_tolerance_seconds="$(entrypoint_setting serving_unready_tolerance_seconds)"
-upstream_outage_tolerance_seconds="$(entrypoint_setting upstream_outage_tolerance_seconds)"
+node_unreachable_tolerance_seconds="$(entrypoint_setting node_unreachable_tolerance_seconds)"
 for shipped_setting in \
   "$ingest_config_paths" "$projector_config_paths" "$query_config_paths" \
   "$entrypoint_config_paths" \
   "$recurrence_clear_window_seconds" "$recurrence_episode_budget" \
   "$recurrence_cumulative_unready_seconds_budget" \
   "$recurrence_min_answered_episode_seconds" \
-  "$serving_unready_tolerance_seconds" "$upstream_outage_tolerance_seconds"; do
+  "$serving_unready_tolerance_seconds" "$node_unreachable_tolerance_seconds"; do
   [ -n "$shipped_setting" ] || test_failure "entrypoint no longer sets a setting this test reads"
 done
 
@@ -85,6 +85,7 @@ unready_report_interval_seconds=300
 probe_halted=0
 probe_parked=0
 probe_upstream_outage=0
+probe_node_unreachable=0
 response_separator='
 '
 
@@ -319,41 +320,52 @@ for outage_body in "$ingest_node_unavailable_body" "$ingest_upstream_not_ready_b
   [ "$probe_upstream_outage" -eq 1 ] \
     || test_failure "the probe did not name the upstream outage in: $outage_body"
 done
+# Only an unreachable node starts the restart clock: a node that answers but is
+# not synchronized proves the ingest node client works.
+serve 503 "$ingest_node_unavailable_body"
+observe_plane_readiness zinder-ingest 127.0.0.1:9105 || true
+[ "$probe_node_unreachable" -eq 1 ] \
+  || test_failure "the probe did not name an unreachable node"
+serve 503 "$ingest_upstream_not_ready_body"
+observe_plane_readiness zinder-ingest 127.0.0.1:9105 || true
+[ "$probe_node_unreachable" -eq 0 ] \
+  || test_failure "an unsynchronized node that answers must not count as unreachable"
 serve 200 "$ready_body"
 observe_plane_readiness zinder-ingest 127.0.0.1:9105 \
   || test_failure "a ready ingest plane must count as serving"
 [ "$probe_upstream_outage" -eq 0 ] || test_failure "a ready plane is not an upstream outage"
+[ "$probe_node_unreachable" -eq 0 ] || test_failure "a ready plane does not report an unreachable node"
 
-# An upstream outage escalates only after its own tolerance, which is much
+# An unreachable node escalates only after its own tolerance, which is much
 # longer than the contiguous-unready tolerance, so a long node outage does not
 # restart the container into a full outage, while an ingest wedged in its own
 # node client is still restarted eventually.
-[ "$upstream_outage_tolerance_seconds" -gt "$serving_unready_tolerance_seconds" ] \
-  || test_failure "the upstream-outage tolerance must outlast the unready tolerance"
+[ "$node_unreachable_tolerance_seconds" -gt "$serving_unready_tolerance_seconds" ] \
+  || test_failure "the unreachable-node tolerance must outlast the unready tolerance"
 outage_state="0 0"
-poll_upstream_outage() {
+poll_node_unreachable() {
   # shellcheck disable=SC2046,SC2086 # the counters are separate arguments
-  set -- $(update_upstream_outage "$1" "$2" ${outage_state%% *} "fixture report")
+  set -- $(update_node_unreachable_outage "$1" "$2" ${outage_state%% *} "fixture report")
   outage_state="$1 $2"
 }
-poll_upstream_outage 1 5000
-[ "$outage_state" = "5000 0" ] || test_failure "an upstream outage started as '$outage_state'"
-poll_upstream_outage 1 $((5000 + serving_unready_tolerance_seconds))
+poll_node_unreachable 1 5000
+[ "$outage_state" = "5000 0" ] || test_failure "an unreachable-node outage started as '$outage_state'"
+poll_node_unreachable 1 $((5000 + serving_unready_tolerance_seconds))
 [ "${outage_state##* }" -eq 0 ] \
-  || test_failure "an upstream outage escalated at the ordinary unready tolerance"
-poll_upstream_outage 1 $((5000 + upstream_outage_tolerance_seconds - 1))
+  || test_failure "an unreachable-node outage escalated at the ordinary unready tolerance"
+poll_node_unreachable 1 $((5000 + node_unreachable_tolerance_seconds - 1))
 [ "${outage_state##* }" -eq 0 ] \
-  || test_failure "an upstream outage escalated before its tolerance"
-poll_upstream_outage 1 $((5000 + upstream_outage_tolerance_seconds))
+  || test_failure "an unreachable-node outage escalated before its tolerance"
+poll_node_unreachable 1 $((5000 + node_unreachable_tolerance_seconds))
 [ "${outage_state##* }" -eq 1 ] \
-  || test_failure "an upstream outage that outlasted its tolerance did not escalate"
+  || test_failure "an unreachable-node outage that outlasted its tolerance did not escalate"
 outage_state="0 0"
-poll_upstream_outage 1 7000
-poll_upstream_outage 0 7015
-[ "$outage_state" = "0 0" ] || test_failure "a cleared upstream outage left state '$outage_state'"
-poll_upstream_outage 1 $((7030 + upstream_outage_tolerance_seconds - 1))
-[ "$outage_state" = "$((7030 + upstream_outage_tolerance_seconds - 1)) 0" ] \
-  || test_failure "a new upstream outage did not restart its clock: '$outage_state'"
+poll_node_unreachable 1 7000
+poll_node_unreachable 0 7015
+[ "$outage_state" = "0 0" ] || test_failure "a cleared unreachable-node outage left state '$outage_state'"
+poll_node_unreachable 1 $((7030 + node_unreachable_tolerance_seconds - 1))
+[ "$outage_state" = "$((7030 + node_unreachable_tolerance_seconds - 1)) 0" ] \
+  || test_failure "a new unreachable-node outage did not restart its clock: '$outage_state'"
 
 # The `degraded` list follows the top-level cause and names each dependency
 # cause under its own key, so the probe parses the plane's own cause.

@@ -406,7 +406,9 @@ The container terminates with a non-zero status in these cases:
 
 - any process it started exits;
 - a plane reports `schema_mismatch` or `node_capability_missing`;
-- a plane stops admitting traffic for an hour;
+- a plane stops admitting traffic for an hour, except while ingest reports a
+  node outage;
+- ingest reports `node_unavailable` for 24 hours;
 - a plane keeps flapping, as described below; or
 - the projector leaves a park that kept query from starting, as described in
   [Wallet transition exceeds its logical-byte limit](#wallet-transition-exceeds-its-logical-byte-limit).
@@ -457,10 +459,12 @@ terminates.
 A node outage is tolerated much longer. While ingest reports
 `node_unavailable` or `upstream_not_ready`, query keeps serving the stored
 chain, and a restart cannot help: ingest needs the node to start, so the
-restarted container would serve nothing. The supervisor logs the outage once
-when it begins and once when it ends, keeps it out of the one-hour tolerance
-and the recurrence budgets below, and terminates the container only after the
-outage has lasted 24 hours.
+restarted container would serve nothing. The supervisor keeps the outage out of
+the one-hour tolerance and the recurrence budgets below. An `upstream_not_ready`
+node answers, so a resync of any length never restarts the container. An
+unreachable node is logged once when the outage begins and once when it ends,
+and terminates the container only after it has lasted 24 hours, in case ingest
+is stuck in its own node client.
 
 A plane that flaps between ready and unready never stays down for an hour, so
 the supervisor also tracks its unready stretches. It terminates the container

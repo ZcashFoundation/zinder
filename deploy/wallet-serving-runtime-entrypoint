@@ -49,9 +49,10 @@ serving_unready_tolerance_seconds=3600
 # by restarting: ingest needs the node to start, so a restart turns the outage
 # into a full one while query would otherwise keep serving the stored chain.
 # Such an outage spends neither the tolerance above nor the recurrence budgets
-# below. It ends the container only after this much longer window, so an
-# ingest wedged in its own node client still restarts eventually.
-upstream_outage_tolerance_seconds=86400
+# below. A node that answers but is not synchronized proves the ingest node
+# client works. Only an unreachable node ends the container, and only after this
+# much longer window, so an ingest wedged in its own node client restarts.
+node_unreachable_tolerance_seconds=86400
 
 # A plane that flips ready/unready never trips the tolerance above: any single
 # all-ready poll resets it to zero. This budget escalates on the flap pattern
@@ -125,7 +126,8 @@ probe_report=""
 probe_halted=0
 probe_parked=0
 probe_upstream_outage=0
-ingest_upstream_outage_since_epoch=0
+probe_node_unreachable=0
+ingest_node_unreachable_since_epoch=0
 writer_halt_reported=0
 projector_park_reported=0
 
@@ -489,7 +491,8 @@ await_readiness() {
 # halt, or reports the projector park, and sets `probe_halted` or
 # `probe_parked` for the latter two. Returns non-zero for every other unready
 # cause, so the caller can time how long it persists, and sets
-# `probe_upstream_outage` when that cause is an upstream outage.
+# `probe_upstream_outage` when that cause is an upstream outage and
+# `probe_node_unreachable` when it is `node_unavailable`.
 observe_plane_readiness() {
   role="$1"
   ops_addr="$2"
@@ -497,6 +500,7 @@ observe_plane_readiness() {
   probe_halted=0
   probe_parked=0
   probe_upstream_outage=0
+  probe_node_unreachable=0
   probe_readiness "$ops_addr"
   if [ "$probe_http_status" = "200" ]; then
     return 0
@@ -515,16 +519,19 @@ observe_plane_readiness() {
   if readiness_cause_is_upstream_outage "$probe_cause"; then
     probe_upstream_outage=1
   fi
+  if [ "$probe_cause" = "node_unavailable" ]; then
+    probe_node_unreachable=1
+  fi
 
   return 1
 }
 
-# Folds whether the ingest plane reports an upstream outage in this poll into
+# Folds whether the ingest plane reports `node_unavailable` in this poll into
 # the start of the outage in progress, and reports the updated state on stdout
 # as "<outage_since_epoch> <escalate>", for the same reason
 # update_plane_recurrence reports rather than acts. Logs the outage once when
 # it begins and once when it ends.
-update_upstream_outage() {
+update_node_unreachable_outage() {
   is_outage="$1"
   now_epoch="$2"
   outage_since_epoch="$3"
@@ -534,12 +541,12 @@ update_upstream_outage() {
   if [ "$is_outage" -eq 1 ]; then
     if [ "$outage_since_epoch" -eq 0 ]; then
       outage_since_epoch="$now_epoch"
-      log "zinder-ingest reports that its node is unavailable or not synchronized; wallets are served from the stored chain, and the container restarts only if this lasts ${upstream_outage_tolerance_seconds}s: $report"
-    elif [ $((now_epoch - outage_since_epoch)) -ge "$upstream_outage_tolerance_seconds" ]; then
+      log "zinder-ingest cannot reach its node; wallets are served from the stored chain, and the container restarts only if this lasts ${node_unreachable_tolerance_seconds}s: $report"
+    elif [ $((now_epoch - outage_since_epoch)) -ge "$node_unreachable_tolerance_seconds" ]; then
       escalate=1
     fi
   elif [ "$outage_since_epoch" -ne 0 ]; then
-    log "zinder-ingest no longer reports a node outage, after $((now_epoch - outage_since_epoch))s"
+    log "zinder-ingest reaches its node again, after $((now_epoch - outage_since_epoch))s"
     outage_since_epoch=0
   fi
 
@@ -809,13 +816,13 @@ while true; do
   plane_halted=$((plane_halted | probe_halted))
 
   # An ingest upstream outage counts as serving for the recurrence budgets and
-  # the unready tolerance; only its own tolerance ends the container.
-  # shellcheck disable=SC2046 # word-splitting the two numeric fields update_upstream_outage prints is intentional.
-  set -- $(update_upstream_outage "$probe_upstream_outage" "$now_epoch" \
-    "$ingest_upstream_outage_since_epoch" "$ingest_report")
-  ingest_upstream_outage_since_epoch="$1"
+  # the unready tolerance; only an unreachable node has its own tolerance.
+  # shellcheck disable=SC2046 # word-splitting the two numeric fields update_node_unreachable_outage prints is intentional.
+  set -- $(update_node_unreachable_outage "$probe_node_unreachable" "$now_epoch" \
+    "$ingest_node_unreachable_since_epoch" "$ingest_report")
+  ingest_node_unreachable_since_epoch="$1"
   if [ "$2" -eq 1 ]; then
-    fail "zinder-ingest has reported a node outage for $((now_epoch - ingest_upstream_outage_since_epoch))s: $ingest_report"
+    fail "zinder-ingest has not reached its node for $((now_epoch - ingest_node_unreachable_since_epoch))s: $ingest_report"
   fi
   if [ "$probe_upstream_outage" -eq 1 ]; then
     ingest_ready=1

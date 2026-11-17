@@ -127,9 +127,11 @@ gauge instead of on a reader's 503.
 The single-host wallet-serving entrypoint treats an ingest plane that reports
 `node_unavailable` or `upstream_not_ready` as serving for its restart budgets.
 Such an outage spends neither the contiguous-unready tolerance nor the
-recurrence budgets. The entrypoint ends the container only after the outage has
-lasted 24 hours, so an ingest stuck in its own node client still restarts
-eventually. The container healthcheck is unchanged, because query now answers
+recurrence budgets. An ingest that reports `upstream_not_ready` reaches its
+node, which proves its node client works, so the entrypoint never restarts the
+container for it, however long the node takes to synchronize. An ingest that
+reports `node_unavailable` for 24 hours ends the container, so an ingest stuck
+in its own node client still restarts eventually. The container healthcheck is unchanged, because query now answers
 200 through the outage.
 
 The reference Docker Compose topology starts the readers once the ingest
@@ -185,7 +187,10 @@ ingest.
   stuck in its own node client, with a healthy node, would then never restart.
   Restarting only when query's own node probe reports the node healthy would
   separate the two cases, but it ties the entrypoint to query's degraded list.
-  A 24-hour bound handles both without that coupling.
+  A 24-hour bound on `node_unavailable` handles both without that coupling.
+- **Bound `upstream_not_ready` the same way.** Rejected. A node that answers
+  with its sync state rules out a stuck node client, so a restart during a
+  long resync only turns a degraded but serving container into a full outage.
 - **Keep readiness conjunctive.** Rejected for the reasons in
   [Context](#context): it refuses every stored read without making any request
   succeed.
