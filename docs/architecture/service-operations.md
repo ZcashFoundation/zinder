@@ -502,11 +502,14 @@ Every runtime exports build information and readiness state.
 build Git commit, and network. `zinder_readiness_state{cause}` is 1 for the
 runtime's current readiness cause. A runtime with dependency inputs also
 exports `zinder_readiness_dependency_state{input, cause}`, which is 1 for each
-dependency's current cause and 0 for every other cause label. A wallet-serving
-reader exports `zinder_readiness_served_epoch_age_seconds`. Alert on a
-dependency gauge whose cause does not admit traffic, and on a served-epoch age
-that has grown past several block intervals, because a reader keeps answering
-200 through both. Important runtime metrics include:
+dependency's current cause and 0 for every other cause label. The gauge
+reports the cause the dependency published, so a writer's
+`reorg_window_exceeded` halt read through ingest control appears on it even
+though it is the runtime's own cause and not a `degraded` entry. A
+wallet-serving reader exports `zinder_readiness_served_epoch_age_seconds`.
+Alert on a dependency gauge whose cause does not admit traffic and is not
+`reorg_window_exceeded`, and on a served-epoch age that has grown past several
+block intervals, because a reader keeps answering 200 through both. Important runtime metrics include:
 
 ### Canonical writer
 

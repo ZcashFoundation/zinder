@@ -271,6 +271,83 @@ async fn readyz_admits_traffic_and_lists_degraded_dependencies() -> Result<()> {
 }
 
 #[tokio::test]
+async fn writer_halt_through_a_dependency_refuses_traffic_without_a_degraded_entry() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listen_addr: SocketAddr = listener.local_addr()?;
+    drop(listener);
+
+    install_metrics_recorder_for_service(RuntimeService::Query, "0.0.0", "zcash-regtest")?;
+    let readiness = Readiness::default();
+    let composed = ComposedReadiness::with_dependency_inputs(
+        readiness.clone(),
+        &[ReadinessInput::NodeSource, ReadinessInput::IngestControl],
+    );
+    composed.publish_admission(ReadinessState::ready(Some(7)));
+    composed.publish_input(ReadinessInput::NodeSource, ReadinessCause::Ready);
+    composed.publish_input(
+        ReadinessInput::IngestControl,
+        ReadinessState::reorg_window_exceeded(1_001, 1_000, Some(1_000), Some(7)).cause,
+    );
+    let server_handle = spawn_ops_endpoint(
+        listen_addr,
+        OpsServer {
+            service_name: "zinder-test",
+            service_version: "0.0.0",
+            network_name: "zcash-regtest",
+            advertised_capabilities: Arc::from([]),
+        },
+        readiness.clone(),
+    )
+    .await?;
+
+    let (status, readyz_value) = get_json(listen_addr, "/readyz").await?;
+    assert_eq!(status, 503);
+    assert!(
+        readyz_value["cause"].get("reorg_window_exceeded").is_some(),
+        "{readyz_value}"
+    );
+    assert!(readyz_value.get("degraded").is_none(), "{readyz_value}");
+
+    // The dependency gauge reports the cause ingest control published, so the
+    // degraded-dependency alert must exclude the halt the runtime's own cause
+    // already reports.
+    let (_, metrics_text) = get_text(listen_addr, "/metrics").await?;
+    let sample = |metric: &str, labels: &[&str]| {
+        metrics_text
+            .lines()
+            .find(|line| {
+                line.starts_with(metric)
+                    && labels
+                        .iter()
+                        .all(|label| line.contains(&format!("{label}\"")))
+            })
+            .and_then(|line| line.rsplit(' ').next())
+            .map(str::to_owned)
+    };
+    assert_eq!(
+        sample(
+            "zinder_readiness_dependency_state{",
+            &["input=\"ingest_control", "cause=\"reorg_window_exceeded"]
+        )
+        .as_deref(),
+        Some("1"),
+        "{metrics_text}"
+    );
+    assert_eq!(
+        sample(
+            "zinder_readiness_state{",
+            &["cause=\"reorg_window_exceeded"]
+        )
+        .as_deref(),
+        Some("1"),
+        "{metrics_text}"
+    );
+
+    server_handle.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn spawn_ops_endpoint_fails_before_returning_when_port_is_occupied() -> Result<()> {
     let occupied_listener = TcpListener::bind("127.0.0.1:0").await?;
     let listen_addr = occupied_listener.local_addr()?;

@@ -239,6 +239,8 @@ local rules cover:
 - traffic-blocking readiness causes
 - traffic-safe readiness warnings
 - a wallet-serving pair serving past its last writer attestation
+- a reader dependency that is degraded while the reader keeps serving
+- a served chain epoch older than 30 minutes outside Regtest
 - secondary replica lag
 - node RPC errors
 - wallet-query p95 above 250ms
@@ -259,3 +261,8 @@ should make writer, secondary-reader, and replica-lag failures easy to spot:
 - `Secondary Catchup P95`: catchup latency for the compatibility wallet-serving pair.
 - `Storage Access Error Rate`: writer-status and wallet-serving-pair catchup error rates.
   A flat zero line is the healthy state.
+- `Degraded Dependencies`: red when a wallet-serving reader keeps serving
+  without its node or ingest control. Such a reader answers 200, so it never
+  appears under `Traffic-Blocking Services`.
+- `Served Chain Age`: seconds since the writer committed the chain epoch each
+  reader serves. It grows while the node or ingest stops advancing the chain.

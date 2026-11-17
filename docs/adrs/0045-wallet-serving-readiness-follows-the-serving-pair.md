@@ -109,8 +109,11 @@ The report gains two additive fields on `/readyz` and on the
 
 Metrics gain `zinder_readiness_dependency_state{input, cause}`, which is 1 for
 each dependency's current cause and 0 for every other cause label, and
-`zinder_readiness_served_epoch_age_seconds`. `/readyz` keeps answering 200
-while the runtime admits traffic, whatever its dependencies report.
+`zinder_readiness_served_epoch_age_seconds`. The gauge carries a dependency's
+halt too, so an alert on degraded dependencies excludes
+`reorg_window_exceeded`, which the runtime's own cause already reports.
+`/readyz` keeps answering 200 while the runtime admits traffic, whatever its
+dependencies report.
 
 During a node outage the canonical writer stops committing, and the reader
 serves its last chain view as ready. `GetLightdInfo.estimated_height` keeps

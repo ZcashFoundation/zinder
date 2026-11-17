@@ -254,8 +254,9 @@ stored tip against the node.
 Query `/readyz` stays 200 while the Zebra node is unavailable or behind its
 estimated network tip. Query keeps serving stored reads, fails broadcasts
 with `NODE_UNAVAILABLE`, and lists the node under `degraded` in its `/readyz`
-body. Alert on `zinder_readiness_dependency_state` with a cause other than
-`ready`, and on `zinder_readiness_served_epoch_age_seconds`, which grows while
+body. Alert on `zinder_readiness_dependency_state` with a cause that does not
+admit traffic, other than the `reorg_window_exceeded` halt that query already
+refuses traffic for, and on `zinder_readiness_served_epoch_age_seconds`, which grows while
 the node or ingest stops advancing the served chain.
 
 Also set the `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30` service variable. The

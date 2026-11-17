@@ -42,8 +42,10 @@ groups:
 
       # Wallet-serving readers keep admitting traffic while a dependency is
       # down, so a reader's degraded node or ingest control shows only here.
+      # A writer halt reported through ingest control refuses traffic as the
+      # reader's own cause, so ZinderServiceNotReady covers it instead.
       - alert: ZinderDependencyDegraded
-        expr: zinder_readiness_dependency_state{cause!~"^(ready|cursor_at_risk|serving_pair_stale)$"} == 1
+        expr: zinder_readiness_dependency_state{cause!~"^(ready|cursor_at_risk|serving_pair_stale|reorg_window_exceeded)$"} == 1
         for: 2m
         labels:
           severity: warning

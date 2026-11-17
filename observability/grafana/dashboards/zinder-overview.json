@@ -1190,6 +1190,167 @@
       ],
       "title": "Storage Access Error Rate",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "zinder-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 46
+      },
+      "id": 14,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "11.5.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "zinder-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(zinder_readiness_dependency_state{cause!~\"^(ready|cursor_at_risk|serving_pair_stale|reorg_window_exceeded)$\"}) or vector(0)",
+          "legendFormat": "degraded dependencies",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Degraded Dependencies",
+      "type": "stat",
+      "description": "Dependencies that wallet-serving readers keep serving without, such as the node behind broadcast. Readers answer 200 through these, so they do not appear under Traffic-Blocking Services."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "zinder-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "age",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 46
+      },
+      "id": 15,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "zinder-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "zinder_readiness_served_epoch_age_seconds",
+          "legendFormat": "{{service}} served chain age",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Served Chain Age",
+      "type": "timeseries",
+      "description": "Seconds since the canonical writer committed the chain epoch each reader serves. It grows while the node or ingest stops advancing the served chain, even though the reader stays ready."
     }
   ],
   "refresh": "5s",
