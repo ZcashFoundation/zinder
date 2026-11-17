@@ -1,6 +1,0 @@
-kind: fixed
-body: Wallet subtree-root reads, lightwalletd `GetSubtreeRoots` and the native `SubtreeRoots` RPC, now serve the root computed from the block that completed each subtree. Previously, a node that switched to a competing block at that height while ingest read the roots could leave the competing block's root stored without an error. If the node keeps reporting a different root for a block it still holds, ingest stops with "source ... subtree N root differs from the root derived from block ..."; check that the node is synced and healthy, then restart ingest, which resumes from the last committed block. Roots stored before this release are not rechecked, so rebuild the store if a reorg may have crossed a subtree boundary while it was written.
-time: 2026-11-17T17:46:33.582175011Z
-custom:
-    Bump: patch
-    PR: "252"
