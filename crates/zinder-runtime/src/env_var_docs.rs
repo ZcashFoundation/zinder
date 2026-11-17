@@ -317,7 +317,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "URL of the upstream's HTTP `/ready` endpoint. When set, ingest, the \
                       wallet-serving readers, and `zinder-explorer` poll it as the primary \
                       upstream-sync signal; when unset, they fall back \
-                      to `getblockchaininfo.verificationprogress`/`estimatedheight`. See \
+                      to `getblockchaininfo.verificationprogress`/`estimatedheight`. \
+                      Compatibility with `compat.serving = \"compact-blocks\"` runs no node \
+                      probe and ignores every `node.health` setting. See \
                       [ADR-0015](../adrs/0015-phase-driven-ingest.md).",
     },
     EnvVarDoc {
@@ -332,8 +334,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Cadence of the upstream-health probe in milliseconds. Defaults to 30000. \
-                      Must be greater than zero. Query and compatibility use it to refresh \
-                      the node dependency their readiness reports; `zinder-explorer` reuses \
+                      Must be greater than zero. Query and wallet-serving compatibility use \
+                      it to refresh the node dependency their readiness reports; \
+                      compact-blocks compatibility ignores it; `zinder-explorer` reuses \
                       the same cadence for \
                       its upstream-observation probe (the one that populates \
                       `ExplorerFreshness.chain_view.upstream_tip`).",
