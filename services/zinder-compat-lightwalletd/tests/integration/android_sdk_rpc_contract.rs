@@ -30,7 +30,6 @@ use zinder_proto::compat::lightwalletd::{
 use zinder_query::{WalletServingPairSlot, WalletServingQuery, WalletServingReadPair};
 use zinder_source::{
     NodeCapabilities, NodeCapability, NodeSource, SourceError, TransactionBroadcaster,
-    TreeStateUpstream,
 };
 use zinder_store::{CURRENT_ARTIFACT_SCHEMA_VERSION, MempoolEventEnvelope, RawBlobRetention};
 use zinder_testkit::{
@@ -127,7 +126,6 @@ async fn current_android_sdk_rpc_contract_uses_admitted_production_pair() -> eyr
     let source = AndroidSdkNodeSource::accepted(
         accepted_transaction_id,
         BlockId::new(block.height, block.hash),
-        block.block_time_seconds,
     )?;
     let query = WalletServingQuery::from_probed_node_source(
         WalletServingPairSlot::new(serving_pair),
@@ -422,15 +420,10 @@ struct AndroidSdkNodeSource {
     capabilities: NodeCapabilities,
     broadcaster: MockTransactionBroadcaster,
     tip: BlockId,
-    tree_state: zinder_source::SourceTreeState,
 }
 
 impl AndroidSdkNodeSource {
-    fn accepted(
-        transaction_id: TransactionId,
-        tip: BlockId,
-        block_time_seconds: u32,
-    ) -> eyre::Result<Self> {
+    fn accepted(transaction_id: TransactionId, tip: BlockId) -> eyre::Result<Self> {
         Ok(Self {
             capabilities: NodeCapabilities::new([
                 NodeCapability::TipId,
@@ -440,11 +433,6 @@ impl AndroidSdkNodeSource {
             ])?,
             broadcaster: MockTransactionBroadcaster::accepted(transaction_id),
             tip,
-            tree_state: zinder_source::SourceTreeState::new(
-                tip,
-                block_time_seconds,
-                TREE_STATE_PAYLOAD.to_vec(),
-            ),
         })
     }
 }
@@ -478,16 +466,6 @@ impl TransactionBroadcaster for AndroidSdkNodeSource {
         self.broadcaster
             .broadcast_transaction(raw_transaction)
             .await
-    }
-}
-
-#[async_trait]
-impl TreeStateUpstream for AndroidSdkNodeSource {
-    async fn fetch_tree_state_for_block(
-        &self,
-        _block_id: BlockId,
-    ) -> Result<zinder_source::SourceTreeState, SourceError> {
-        Ok(self.tree_state.clone())
     }
 }
 

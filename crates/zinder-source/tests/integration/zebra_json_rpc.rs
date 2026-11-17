@@ -21,7 +21,7 @@ use zinder_core::{
 };
 use zinder_source::{
     CookieSource, NodeAuth, NodeCapability, NodeHealthConfig, NodeSource, SourceChainCursor,
-    SourceChainUpdate, SourceError, SourceFailureClass, SourceTreeState, TransactionBroadcaster,
+    SourceChainUpdate, SourceError, SourceFailureClass, TransactionBroadcaster,
     UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
     UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, ZebraJsonRpcSource,
@@ -484,115 +484,18 @@ async fn bad_raw_block_hex_maps_to_invalid_raw_block_hex() -> eyre::Result<()> {
     Ok(())
 }
 
-const TREE_STATE_BLOCK_HASH_HEX: &str =
-    "1111111111111111111111111111111111111111111111111111111111111111";
-
-async fn fetch_tree_state_response(
-    tree_state_response: Value,
-) -> eyre::Result<Result<SourceTreeState, SourceError>> {
-    let server = JsonRpcTestServer::start([
-        method("z_gettreestate").reply(RpcReply::result(tree_state_response))
-    ])?;
-    let source = regtest_source(&server)?;
-    let block_id = BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([0x11; 32]));
-
-    Ok(source.fetch_tree_state_for_block(block_id).await)
-}
-
 #[tokio::test]
-async fn tree_state_promotes_all_final_note_commitment_roots_without_reversing_bytes()
--> eyre::Result<()> {
-    let tree_state_response = json!({
-        "network": "regtest",
-        "height": 1,
-        "hash": TREE_STATE_BLOCK_HASH_HEX,
-        "time": 1_774_668_700,
-        "sapling": {"commitments": {
-            "finalRoot": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-            "finalState": "aabb"
-        }},
-        "orchard": {"commitments": {
-            "finalRoot": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        }},
-        "ironwood": {"commitments": {
-            "finalRoot": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-        }}
-    });
-
-    let tree_state = fetch_tree_state_response(tree_state_response.clone()).await??;
-    let roots = tree_state.final_note_commitment_roots;
-
-    assert_eq!(roots.height, BlockHeight::new(1));
-    assert_eq!(roots.block_hash, BlockHash::from_bytes([0x11; 32]));
-    assert_eq!(
-        roots
-            .sapling
-            .map(zinder_core::FinalNoteCommitmentRoot::as_bytes),
-        Some([
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
-            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
-            0x1c, 0x1d, 0x1e, 0x1f,
-        ])
-    );
-    assert_eq!(
-        roots
-            .orchard
-            .map(zinder_core::FinalNoteCommitmentRoot::as_bytes),
-        Some([0xaa; 32])
-    );
-    assert_eq!(
-        roots
-            .ironwood
-            .map(zinder_core::FinalNoteCommitmentRoot::as_bytes),
-        Some([0xff; 32])
-    );
-    assert_eq!(
-        serde_json::from_slice::<Value>(&tree_state.payload_bytes)?,
-        json!({
-            "sapling": {"commitments": {"finalState": "aabb"}}
-        }),
-    );
-    assert_eq!(tree_state.block_time_seconds, 1_774_668_700);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn tree_state_maps_unavailable_final_note_commitment_roots_to_none() -> eyre::Result<()> {
-    let tree_state = fetch_tree_state_response(json!({
-        "network": "regtest",
-        "height": 1,
-        "hash": TREE_STATE_BLOCK_HASH_HEX,
-        "time": 1_774_668_700,
-        "sapling": {"commitments": {}},
-        "orchard": {"commitments": {"finalRoot": null}}
-    }))
-    .await??;
-
-    assert_eq!(tree_state.final_note_commitment_roots.sapling, None);
-    assert_eq!(tree_state.final_note_commitment_roots.orchard, None);
-    assert_eq!(tree_state.final_note_commitment_roots.ironwood, None);
-    assert_eq!(tree_state.block_time_seconds, 1_774_668_700);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&tree_state.payload_bytes)?,
-        json!({}),
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn malformed_final_note_commitment_root_has_typed_source_error() -> eyre::Result<()> {
-    let result = fetch_tree_state_response(json!({
-        "height": 1,
-        "hash": TREE_STATE_BLOCK_HASH_HEX,
-        "sapling": {"commitments": {"finalRoot": 7}}
-    }))
+async fn non_hex_checkpoint_final_root_has_typed_source_error() -> eyre::Result<()> {
+    let (_, final_state) = one_leaf_sapling_frontier_rpc_parts()?;
+    let result = fetch_checkpoint_response(
+        checkpoint_response(Some("not-hex"), Some(&final_state)),
+        &checkpoint_activations(1, 200)?,
+    )
     .await?;
 
     assert!(matches!(
         result,
-        Err(SourceError::MalformedFinalNoteCommitmentRoot {
+        Err(SourceError::InvalidFinalNoteCommitmentRootHex {
             protocol: ShieldedProtocol::Sapling,
             ..
         })
@@ -602,110 +505,21 @@ async fn malformed_final_note_commitment_root_has_typed_source_error() -> eyre::
 }
 
 #[tokio::test]
-async fn non_hex_final_note_commitment_root_has_typed_source_error() -> eyre::Result<()> {
-    let result = fetch_tree_state_response(json!({
-        "height": 1,
-        "hash": TREE_STATE_BLOCK_HASH_HEX,
-        "orchard": {"commitments": {"finalRoot": "not-hex"}}
-    }))
-    .await?;
-
-    assert!(matches!(
-        result,
-        Err(SourceError::InvalidFinalNoteCommitmentRootHex {
-            protocol: ShieldedProtocol::Orchard,
-            ..
-        })
-    ));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn wrong_length_final_note_commitment_root_has_typed_source_error() -> eyre::Result<()> {
-    let result = fetch_tree_state_response(json!({
-        "height": 1,
-        "hash": TREE_STATE_BLOCK_HASH_HEX,
-        "ironwood": {"commitments": {"finalRoot": "abcd"}}
-    }))
+async fn wrong_length_checkpoint_final_root_has_typed_source_error() -> eyre::Result<()> {
+    let (_, final_state) = one_leaf_sapling_frontier_rpc_parts()?;
+    let result = fetch_checkpoint_response(
+        checkpoint_response(Some("abcd"), Some(&final_state)),
+        &checkpoint_activations(1, 200)?,
+    )
     .await?;
 
     assert!(matches!(
         result,
         Err(SourceError::InvalidFinalNoteCommitmentRootLength {
-            protocol: ShieldedProtocol::Ironwood,
+            protocol: ShieldedProtocol::Sapling,
             byte_count: 2,
         })
     ));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn tree_state_hash_disagreement_maps_to_block_reorg_during_fetch() -> eyre::Result<()> {
-    // Same shape as the header-hash test: tree-state hash disagreeing
-    // with the parsed raw block hash is the second reorg-during-fetch
-    // signature. Classified as UpstreamViewChanged so the loop recovers.
-    let fixture = fixture_block()?;
-    let server =
-        JsonRpcTestServer::start([method("z_gettreestate").reply(RpcReply::result(json!({
-            "network": "regtest",
-            "height": fixture["height"],
-            "hash": "1111111111111111111111111111111111111111111111111111111111111111",
-        })))])?;
-    let source = regtest_source(&server)?;
-    let requested_block = BlockId::new(
-        BlockHeight::new(1),
-        decode_rpc_block_hash(string_field(&fixture, "hash")?)?,
-    );
-
-    let error = match source.fetch_tree_state_for_block(requested_block).await {
-        Ok(tree_state) => {
-            return Err(eyre!("expected fetch error, got {tree_state:?}"));
-        }
-        Err(error) => error,
-    };
-
-    assert!(
-        matches!(
-            error,
-            SourceError::BlockReorgDuringFetch { height, .. } if height == BlockHeight::new(1)
-        ),
-        "expected BlockReorgDuringFetch, got {error:?}",
-    );
-    assert_eq!(
-        error.upstream_classification(),
-        zinder_source::SourceFailureClass::UpstreamViewChanged,
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn tree_state_height_mismatch_maps_to_protocol_mismatch() -> eyre::Result<()> {
-    let fixture = fixture_block()?;
-    let server =
-        JsonRpcTestServer::start([method("z_gettreestate").reply(RpcReply::result(json!({
-            "network": "regtest",
-            "height": 2,
-            "hash": fixture["hash"],
-        })))])?;
-    let source = regtest_source(&server)?;
-    let requested_block = BlockId::new(
-        BlockHeight::new(1),
-        decode_rpc_block_hash(string_field(&fixture, "hash")?)?,
-    );
-
-    let error = match source.fetch_tree_state_for_block(requested_block).await {
-        Ok(tree_state) => {
-            return Err(eyre!("expected fetch error, got {tree_state:?}"));
-        }
-        Err(error) => error,
-    };
-
-    // Tree-state returned the wrong height for the same request id —
-    // a Zebra wire-contract violation, not a reorg.
-    assert!(matches!(error, SourceError::SourceProtocolMismatch { .. }));
 
     Ok(())
 }
@@ -1383,33 +1197,6 @@ const ZAKURA_SUBTREE_NOT_STORED_MESSAGE: &str = "historical sapling note commitm
 /// `zakura_state::HistoricalSubtreeUnavailable` with the `Indeterminate` reason.
 const ZAKURA_SUBTREE_INDETERMINATE_MESSAGE: &str = "historical sapling note commitment subtree NoteCommitmentSubtreeIndex(0) is unavailable at last checkpoint Height(3418406): this node has not reached the last checkpoint, so it cannot yet tell whether the subtree was skipped; subtrees completed below the last checkpoint are never recorded";
 
-#[tokio::test]
-async fn fast_synced_tree_state_refusal_is_a_missing_capability() -> eyre::Result<()> {
-    let server = JsonRpcTestServer::start([method("z_gettreestate").reply(
-        RpcReply::error_with_code(-1, ZAKURA_FAST_SYNCED_TREE_STATE_MESSAGE),
-    )])?;
-    let source = regtest_source(&server)?;
-    let block_id = BlockId::new(BlockHeight::new(1_000_000), BlockHash::from_bytes([1; 32]));
-
-    let error = match source.fetch_tree_state_for_block(block_id).await {
-        Ok(tree_state) => return Err(eyre!("expected tree-state error, got {tree_state:?}")),
-        Err(error) => error,
-    };
-
-    assert!(matches!(
-        error,
-        SourceError::HistoricalTreeStateUnavailable { height, .. }
-            if height == BlockHeight::new(1_000_000)
-    ));
-    assert_eq!(
-        error.upstream_classification(),
-        zinder_source::SourceFailureClass::CapabilityMissing,
-    );
-    assert!(error.is_node_capability_missing());
-
-    Ok(())
-}
-
 /// Zebra 7.1.0's refusal of a stored block with missing transaction rows
 /// (`zebra_state::BlockReadError::BlockBodyUnavailable`, JSON-RPC code -1).
 const ZEBRA_INCOMPLETE_BLOCK_BODY_MESSAGE: &str =
@@ -1454,24 +1241,26 @@ async fn unreadable_stored_block_refusal_is_a_missing_capability() -> eyre::Resu
 }
 
 #[tokio::test]
-async fn tree_state_refusal_of_an_unreadable_stored_block_is_a_missing_capability()
+async fn checkpoint_refusal_of_an_unreadable_stored_block_is_a_missing_capability()
 -> eyre::Result<()> {
     // Zebra reads the block body to answer `z_gettreestate`.
     let server = JsonRpcTestServer::start([method("z_gettreestate").reply(
         RpcReply::error_with_code(-1, ZEBRA_INCOMPLETE_BLOCK_BODY_MESSAGE),
     )])?;
     let source = regtest_source(&server)?;
-    let block_id = BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32]));
 
-    let error = match source.fetch_tree_state_for_block(block_id).await {
-        Ok(tree_state) => return Err(eyre!("expected tree-state error, got {tree_state:?}")),
+    let error = match source
+        .fetch_chain_checkpoint(BlockHeight::new(100), &checkpoint_activations(1, 1)?)
+        .await
+    {
+        Ok(checkpoint) => return Err(eyre!("expected checkpoint error, got {checkpoint:?}")),
         Err(error) => error,
     };
 
     assert!(matches!(
         error,
         SourceError::HistoricalBlockBodyUnavailable { height, .. }
-            if height == BlockHeight::new(1)
+            if height == BlockHeight::new(100)
     ));
     assert!(error.is_node_capability_missing());
 
@@ -1498,6 +1287,10 @@ async fn fast_synced_checkpoint_refusal_is_a_missing_capability() -> eyre::Resul
         SourceError::HistoricalTreeStateUnavailable { height, .. }
             if height == BlockHeight::new(100)
     ));
+    assert_eq!(
+        error.upstream_classification(),
+        zinder_source::SourceFailureClass::CapabilityMissing,
+    );
     assert!(error.is_node_capability_missing());
 
     Ok(())

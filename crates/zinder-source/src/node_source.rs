@@ -11,7 +11,7 @@ use zinder_core::{
 
 use crate::{
     NodeCapabilities, SourceBlock, SourceChainSegment, SourceChainSegmentLimits, SourceChainUpdate,
-    SourceError, SourceSubtreeRoots, SourceTreeState, UpstreamHealthSnapshot,
+    SourceError, SourceSubtreeRoots, UpstreamHealthSnapshot,
     source_chain_update::SourceChainCursorPosition,
 };
 
@@ -91,17 +91,6 @@ pub trait NodeSource: Send + Sync + 'static {
         }
 
         Ok(SourceChainSegment::connected_blocks(blocks))
-    }
-
-    /// Fetches a tree-state payload for one already-identified block.
-    async fn fetch_tree_state_for_block(
-        &self,
-        block_id: BlockId,
-    ) -> Result<SourceTreeState, SourceError> {
-        let _ = block_id;
-        Err(SourceError::NodeCapabilityMissing {
-            capability: crate::NodeCapability::TreeState,
-        })
     }
 
     /// Fetches one source-authenticated checkpoint with validated typed frontiers.
@@ -266,22 +255,6 @@ where
             None => Err(SourceError::TransactionBroadcastDisabled),
         }
     }
-}
-
-/// Upstream tree-state fill boundary for the wallet query plane.
-///
-/// The query plane serves a coherent commitment tree state at any block height.
-/// Stored sparse checkpoints answer most requests; for a height without a stored
-/// checkpoint the plane fills from the configured upstream node, mirroring
-/// lightwalletd's `GetTreeState`. This is the one query path permitted to contact
-/// an upstream node (zinder ADR-0005), gated on an explicitly supplied source.
-#[async_trait]
-pub trait TreeStateUpstream: Send + Sync + 'static {
-    /// Fetches the tree state for one already-identified canonical block.
-    async fn fetch_tree_state_for_block(
-        &self,
-        block_id: BlockId,
-    ) -> Result<SourceTreeState, SourceError>;
 }
 
 fn bounded_segment_end_height(

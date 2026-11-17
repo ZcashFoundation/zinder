@@ -954,6 +954,7 @@ mod server_info_tests {
             WALLET_READ_SETTLED_TIP_BLOCK_V1,
             WALLET_READ_BLOCK_ID_BY_SELECTOR_V1,
             WALLET_READ_COMPACT_BLOCK_RANGE_V2,
+            WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
             WALLET_READ_SERVER_INFO_V2,
             WALLET_READ_NETWORK_UPGRADE_ACTIVATIONS_V1,
             WALLET_READ_TRANSACTION_BY_ID_V2,
@@ -966,7 +967,6 @@ mod server_info_tests {
         for structurally_absent in [
             WALLET_READ_FULL_BLOCK_AT_V1,
             WALLET_READ_FULL_BLOCK_RANGE_V1,
-            WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
             WALLET_BROADCAST_TRANSACTION_V1,
             WALLET_READ_BLOCK_HEADER_BY_SELECTOR_V1,
         ] {
@@ -975,7 +975,6 @@ mod server_info_tests {
 
         let probed_node = NodeCapabilities::new([
             NodeCapability::OpenRpcDiscovery,
-            NodeCapability::TreeState,
             NodeCapability::TransactionBroadcast,
         ])?;
         let all = NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
@@ -986,7 +985,6 @@ mod server_info_tests {
         for evidence_backed in [
             WALLET_READ_FULL_BLOCK_AT_V1,
             WALLET_READ_FULL_BLOCK_RANGE_V1,
-            WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
             WALLET_BROADCAST_TRANSACTION_V1,
             WALLET_READ_TRANSACTION_BY_ID_V2,
             WALLET_READ_TRANSACTION_BYTES_V1,

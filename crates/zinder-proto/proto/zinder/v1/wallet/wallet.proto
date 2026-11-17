@@ -593,7 +593,9 @@ message CompactBlocksInRangeChunk {
 message TreeStateAtHeightRequest {
   // Exact block height to return the tree state for. The response height
   // always equals this value: the server serves a stored checkpoint when one
-  // exists at this height, otherwise it fills from the configured upstream node.
+  // exists at this height, and otherwise reconstructs it from the nearest
+  // stored checkpoint below it and the stored compact blocks in between. The
+  // server never contacts an upstream node to answer.
   uint32 height = 1;
 
   // Optional chain-epoch id that must be used to answer the request. When
@@ -1497,7 +1499,10 @@ service WalletQuery {
   rpc Transaction(TransactionRequest) returns (TransactionStatusResponse);
 
   // Return the tree state at one exact block height. Served from a stored
-  // checkpoint when present, otherwise filled from the configured upstream node.
+  // checkpoint when present, otherwise reconstructed from stored compact
+  // blocks. A reconstruction refused because the server already runs its
+  // limit of concurrent reconstructions fails with RESOURCE_EXHAUSTED and
+  // `TREE_STATE_REPLAY_LIMIT_REACHED`.
   rpc TreeStateAtHeight(TreeStateAtHeightRequest) returns (TreeStateResponse);
 
   // Return the latest checkpoint tree state visible to the selected epoch.

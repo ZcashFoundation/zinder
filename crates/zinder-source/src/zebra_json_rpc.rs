@@ -15,24 +15,24 @@ use jsonrpsee::types::{ErrorObject, ErrorObjectOwned};
 use parking_lot::Mutex;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use zinder_core::{
-    BlockFinalNoteCommitmentRoots, BlockHash, BlockHeight, BlockId, BlockValuePoolBalances,
-    BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding, BroadcastQueued,
-    BroadcastRejected, BroadcastRejectionReason, BroadcastUnknown, ChainValuePool, ChainValuePools,
-    CommitmentTreeCheckpoint, CommitmentTreeFrontier, CommitmentTreeFrontierValidationError,
-    CommitmentTreeFrontiers, ConsensusBranchId, FinalNoteCommitmentRoot, Network,
-    NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome,
-    TransactionId, ValuePoolBalance,
+    BlockHash, BlockHeight, BlockId, BlockValuePoolBalances, BroadcastAccepted, BroadcastDuplicate,
+    BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastRejectionReason,
+    BroadcastUnknown, ChainValuePool, ChainValuePools, CommitmentTreeCheckpoint,
+    CommitmentTreeFrontier, CommitmentTreeFrontierValidationError, CommitmentTreeFrontiers,
+    ConsensusBranchId, FinalNoteCommitmentRoot, Network, NetworkUpgradeActivation,
+    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootHash,
+    SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome, TransactionId,
+    ValuePoolBalance,
 };
 
 use crate::{
     CookieSource, CookieSourceError, NodeAuth, NodeCapabilities, NodeCapability, NodeHealthConfig,
     NodeSource, ResilientClient, SourceBlock, SourceChainCursor, SourceChainSegment,
     SourceChainSegmentLimits, SourceChainSegmentStats, SourceChainUpdate, SourceError,
-    SourceSubtreeRoot, SourceSubtreeRoots, SourceTreeState, TransactionBroadcaster,
-    TreeStateUpstream, UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
+    SourceSubtreeRoot, SourceSubtreeRoots, TransactionBroadcaster,
+    UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
     UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, UpstreamHealthSnapshot,
     ZEBRA_REBUILD_THRESHOLD, decode_rpc_block_hash, encode_rpc_block_hash,
@@ -1020,27 +1020,6 @@ impl NodeSource for ZebraJsonRpcSource {
         SourceBlock::from_raw_block_bytes(self.network, height, raw_block_bytes)
     }
 
-    async fn fetch_tree_state_for_block(
-        &self,
-        block_id: BlockId,
-    ) -> Result<SourceTreeState, SourceError> {
-        let tree_state = self
-            .call_typed::<Value>(
-                "z_gettreestate",
-                positional_params([Value::from(block_id.height.value().to_string())])?,
-                |error| tree_state_call_error(block_id.height, error),
-            )
-            .await?;
-        let final_note_commitment_roots =
-            parse_zebra_final_note_commitment_roots(&tree_state, block_id)?;
-        let (block_time_seconds, payload_bytes) = normalize_zebra_tree_state_payload(&tree_state)?;
-        Ok(SourceTreeState::with_final_note_commitment_roots(
-            final_note_commitment_roots,
-            block_time_seconds,
-            payload_bytes,
-        ))
-    }
-
     async fn fetch_chain_checkpoint(
         &self,
         height: BlockHeight,
@@ -1383,16 +1362,6 @@ impl TransactionBroadcaster for ZebraJsonRpcSource {
                 self.max_response_bytes,
             )),
         }
-    }
-}
-
-#[async_trait]
-impl TreeStateUpstream for ZebraJsonRpcSource {
-    async fn fetch_tree_state_for_block(
-        &self,
-        block_id: BlockId,
-    ) -> Result<SourceTreeState, SourceError> {
-        <Self as NodeSource>::fetch_tree_state_for_block(self, block_id).await
     }
 }
 
@@ -1743,7 +1712,6 @@ fn source_error_class(error: Option<&SourceError>) -> &'static str {
             | SourceError::InvalidTransactionIdLength { .. }
             | SourceError::InvalidSubtreeRootHex { .. }
             | SourceError::InvalidSubtreeRootLength { .. }
-            | SourceError::MalformedFinalNoteCommitmentRoot { .. }
             | SourceError::InvalidFinalNoteCommitmentRootHex { .. }
             | SourceError::InvalidFinalNoteCommitmentRootLength { .. }
             | SourceError::MalformedCommitmentTreeFrontier { .. }
@@ -1895,113 +1863,6 @@ fn positional_params(
             .map_err(|source| SourceError::SourcePayloadEncodingFailed { source })?;
     }
     Ok(params)
-}
-
-fn validate_zebra_tree_state(
-    tree_state: &Value,
-    requested_height: BlockHeight,
-    block_hash: BlockHash,
-) -> Result<(), SourceError> {
-    let tree_state_hash = tree_state
-        .get("hash")
-        .and_then(Value::as_str)
-        .ok_or(SourceError::SourceProtocolMismatch {
-            reason: "tree-state response is missing block hash",
-        })
-        .and_then(decode_rpc_block_hash)?;
-    if tree_state_hash != block_hash {
-        // Mid-flight reorg: `z_gettreestate` and the parsed `getblock`
-        // bytes observed different blocks at the same height.
-        return Err(SourceError::BlockReorgDuringFetch {
-            height: requested_height,
-            reason: "tree-state hash disagrees with the parsed raw block hash",
-        });
-    }
-
-    let tree_state_height = tree_state.get("height").and_then(Value::as_u64).ok_or(
-        SourceError::SourceProtocolMismatch {
-            reason: "tree-state response is missing block height",
-        },
-    )?;
-    if tree_state_height != u64::from(requested_height.value()) {
-        return Err(SourceError::SourceProtocolMismatch {
-            reason: "tree-state height does not match requested height",
-        });
-    }
-
-    Ok(())
-}
-
-fn parse_zebra_final_note_commitment_roots(
-    tree_state: &Value,
-    block_id: BlockId,
-) -> Result<BlockFinalNoteCommitmentRoots, SourceError> {
-    validate_zebra_tree_state(tree_state, block_id.height, block_id.hash)?;
-
-    Ok(BlockFinalNoteCommitmentRoots::new(
-        block_id.height,
-        block_id.hash,
-        parse_zebra_final_note_commitment_root(tree_state, ShieldedProtocol::Sapling)?,
-        parse_zebra_final_note_commitment_root(tree_state, ShieldedProtocol::Orchard)?,
-        parse_zebra_final_note_commitment_root(tree_state, ShieldedProtocol::Ironwood)?,
-    ))
-}
-
-fn normalize_zebra_tree_state_payload(tree_state: &Value) -> Result<(u32, Vec<u8>), SourceError> {
-    let block_time_seconds = tree_state
-        .get("time")
-        .and_then(Value::as_u64)
-        .and_then(|time| u32::try_from(time).ok())
-        .ok_or(SourceError::SourceProtocolMismatch {
-            reason: "tree-state response is missing a valid block time",
-        })?;
-    let mut payload = Map::new();
-    for pool_name in ["sapling", "orchard", "ironwood"] {
-        let Some(final_state) = tree_state
-            .get(pool_name)
-            .and_then(|pool| pool.get("commitments"))
-            .and_then(|commitments| commitments.get("finalState"))
-        else {
-            continue;
-        };
-        let final_state = final_state
-            .as_str()
-            .ok_or(SourceError::SourceProtocolMismatch {
-                reason: "tree-state finalState must be a string",
-            })?;
-        payload.insert(
-            pool_name.to_owned(),
-            serde_json::json!({"commitments": {"finalState": final_state}}),
-        );
-    }
-    serde_json::to_vec(&Value::Object(payload))
-        .map(|payload_bytes| (block_time_seconds, payload_bytes))
-        .map_err(|source| SourceError::SourcePayloadEncodingFailed { source })
-}
-
-fn parse_zebra_final_note_commitment_root(
-    tree_state: &Value,
-    protocol: ShieldedProtocol,
-) -> Result<Option<FinalNoteCommitmentRoot>, SourceError> {
-    let Some(pool) = tree_state.get(protocol.rpc_pool_name()) else {
-        return Ok(None);
-    };
-    let Some(commitments) = pool.get("commitments") else {
-        return Ok(None);
-    };
-    let Some(final_root) = commitments.get("finalRoot") else {
-        return Ok(None);
-    };
-    if final_root.is_null() {
-        return Ok(None);
-    }
-    let root_hex = final_root
-        .as_str()
-        .ok_or(SourceError::MalformedFinalNoteCommitmentRoot {
-            protocol,
-            reason: "finalRoot must be a hex string or null",
-        })?;
-    decode_final_note_commitment_root_hex(protocol, root_hex).map(Some)
 }
 
 fn decode_zebra_commitment_tree_frontiers(
@@ -2524,39 +2385,6 @@ mod tests {
     )]
 
     use super::*;
-
-    #[test]
-    fn tree_state_payload_normalization_keeps_only_pool_frontiers() -> Result<(), SourceError> {
-        let source_payload = serde_json::json!({
-            "network": "regtest",
-            "height": 42,
-            "hash": "11".repeat(32),
-            "time": 1_774_668_700,
-            "sapling": {"commitments": {"finalRoot": "22".repeat(32), "finalState": "aa"}},
-            "orchard": {"commitments": {"finalState": "bb"}},
-            "ironwood": {"commitments": {"finalState": "cc"}},
-        });
-
-        let (block_time_seconds, payload_bytes) =
-            normalize_zebra_tree_state_payload(&source_payload)?;
-        let payload: Value = serde_json::from_slice(&payload_bytes)
-            .map_err(|source| SourceError::SourcePayloadEncodingFailed { source })?;
-
-        assert_eq!(block_time_seconds, 1_774_668_700);
-        assert_eq!(
-            payload,
-            serde_json::json!({
-                "sapling": {"commitments": {"finalState": "aa"}},
-                "orchard": {"commitments": {"finalState": "bb"}},
-                "ironwood": {"commitments": {"finalState": "cc"}},
-            })
-        );
-        assert!(payload.get("height").is_none());
-        assert!(payload.get("hash").is_none());
-        assert!(payload.get("time").is_none());
-
-        Ok(())
-    }
 
     #[test]
     fn batched_block_refusals_keep_their_classes() {

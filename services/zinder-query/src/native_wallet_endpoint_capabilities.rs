@@ -39,16 +39,18 @@ impl NativeWalletEndpointCapabilities {
         Arc::clone(&self.ordered)
     }
 
+    /// Reports whether any advertised operation contacts the upstream node.
+    ///
+    /// Transaction broadcast is the only such operation, so a query that does
+    /// not advertise it serves every request from its serving pair.
     pub(crate) fn has_node_backed_capabilities(&self) -> bool {
-        self.contains(capabilities::WALLET_READ_TREE_STATE_AT_HEIGHT_V2)
-            || self.contains(capabilities::WALLET_BROADCAST_TRANSACTION_V1)
+        self.contains(capabilities::WALLET_BROADCAST_TRANSACTION_V1)
     }
 
     /// Derives the capabilities implemented by the shared exact-pair query.
     ///
     /// `node_capabilities` must be the result of the probe performed on the
-    /// same source handle installed as the query's tree-state provider and
-    /// transaction broadcaster.
+    /// same source handle installed as the query's transaction broadcaster.
     pub(crate) fn for_wallet_serving_pair(
         raw_blob_retention: RawBlobRetention,
         node_capabilities: NodeCapabilities,
@@ -97,6 +99,7 @@ impl NativeWalletEndpointCapabilities {
                 | capabilities::WALLET_READ_COMPACT_BLOCK_AT_V2
                 | capabilities::WALLET_READ_COMPACT_BLOCK_RANGE_V2
                 | capabilities::WALLET_READ_COMPACT_BLOCK_IRONWOOD_V2
+                | capabilities::WALLET_READ_TREE_STATE_AT_HEIGHT_V2
                 | capabilities::WALLET_READ_LATEST_TREE_STATE_CHECKPOINT_V2
                 | capabilities::WALLET_READ_SUBTREE_ROOTS_IN_RANGE_V1
                 | capabilities::WALLET_READ_SUBTREE_ROOTS_IRONWOOD_V1
@@ -113,9 +116,6 @@ impl NativeWalletEndpointCapabilities {
                 capabilities::WALLET_READ_FULL_BLOCK_AT_V1
                     | capabilities::WALLET_READ_FULL_BLOCK_RANGE_V1
             ) && raw_blob_retention.retains_block_blobs())
-            || (capability == capabilities::WALLET_READ_TREE_STATE_AT_HEIGHT_V2
-                && node_was_probed
-                && node_capabilities.supports(NodeCapability::TreeState))
             || (capability == capabilities::WALLET_BROADCAST_TRANSACTION_V1
                 && node_was_probed
                 && node_capabilities.supports(NodeCapability::TransactionBroadcast))

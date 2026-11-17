@@ -1668,34 +1668,23 @@ fn lightwalletd_tree_state(tree_state: &TreeState) -> Result<lightwalletd::TreeS
     })
 }
 
+/// Returns one pool's `finalState`, or an empty string for a pool the tree
+/// state omits because it is not active yet.
+///
+/// The payload is the one `WalletServingQuery` derives from stored frontiers,
+/// which gives every active pool a `commitments.finalState` string.
 fn tree_state_pool_final_state(payload: &Value, pool_name: &'static str) -> Result<String, Status> {
     let Some(pool) = payload.get(pool_name) else {
         return Ok(String::new());
     };
-    let Some(pool_fields) = pool.as_object() else {
-        return Err(Status::data_loss(format!(
-            "{pool_name} tree-state pool must be a JSON object"
-        )));
-    };
-    let Some(commitments) = pool_fields.get("commitments") else {
-        return Ok(String::new());
-    };
-
-    if let Some(final_state) = commitments.get("finalState").and_then(Value::as_str) {
-        return Ok(final_state.to_owned());
-    }
-
-    match commitments {
-        Value::Object(fields) if fields.is_empty() => Ok(String::new()),
-        Value::Object(_) => Err(Status::data_loss(format!(
-            "{pool_name} tree-state commitments are missing finalState"
-        ))),
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Array(_) => {
-            Err(Status::data_loss(format!(
-                "{pool_name} tree-state commitments must be a JSON object"
-            )))
-        }
-    }
+    pool.pointer("/commitments/finalState")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            Status::data_loss(format!(
+                "{pool_name} tree state is missing its commitments.finalState string"
+            ))
+        })
 }
 
 fn lightwalletd_subtree_roots(subtree_roots: &SubtreeRoots) -> Vec<lightwalletd::SubtreeRoot> {
@@ -2099,6 +2088,68 @@ mod tests {
         assert_eq!(Some(none_pending.consensus_branch_id), branch_hex("NU7"));
         assert_eq!(none_pending.upgrade_name, "");
         assert_eq!(none_pending.upgrade_height, 0);
+    }
+
+    fn tree_state_with_payload(payload: &[u8]) -> TreeState {
+        TreeState {
+            chain_epoch: test_chain_epoch(),
+            height: BlockHeight::new(1),
+            block_hash: BlockHash::from_bytes([1; 32]),
+            block_time_seconds: 1_774_668_401,
+            payload_bytes: payload.to_vec(),
+        }
+    }
+
+    #[test]
+    fn tree_state_maps_every_pool_final_state_and_the_typed_identity() -> Result<(), Status> {
+        let tree_state = lightwalletd_tree_state(&tree_state_with_payload(
+            br#"{"sapling":{"commitments":{"finalState":"aa"}},"orchard":{"commitments":{"finalState":"bb"}},"ironwood":{"commitments":{"finalState":"cc"}}}"#,
+        ))?;
+
+        assert_eq!(
+            tree_state.network,
+            encode_bip70_chain_name(Network::ZcashRegtest)
+        );
+        assert_eq!(tree_state.height, 1);
+        assert_eq!(
+            tree_state.hash,
+            encode_rpc_block_hash_hex(BlockHash::from_bytes([1; 32]))
+        );
+        assert_eq!(tree_state.time, 1_774_668_401);
+        assert_eq!(tree_state.sapling_tree, "aa");
+        assert_eq!(tree_state.orchard_tree, "bb");
+        assert_eq!(tree_state.ironwood_tree, "cc");
+        Ok(())
+    }
+
+    #[test]
+    fn tree_state_reports_an_inactive_pool_as_an_empty_tree() -> Result<(), Status> {
+        let tree_state = lightwalletd_tree_state(&tree_state_with_payload(
+            br#"{"sapling":{"commitments":{"finalState":"000000"}}}"#,
+        ))?;
+
+        assert_eq!(tree_state.sapling_tree, "000000");
+        assert_eq!(tree_state.orchard_tree, "");
+        assert_eq!(tree_state.ironwood_tree, "");
+        Ok(())
+    }
+
+    #[test]
+    fn tree_state_reports_a_malformed_payload_as_data_loss() {
+        for payload in [
+            b"not json".as_slice(),
+            br#"{"sapling":[]}"#,
+            br#"{"sapling":{"commitments":[]}}"#,
+            br#"{"sapling":{"commitments":{}}}"#,
+            br#"{"orchard":{"commitments":{"finalState":7}}}"#,
+        ] {
+            let outcome = lightwalletd_tree_state(&tree_state_with_payload(payload));
+            assert!(
+                matches!(&outcome, Err(status) if status.code() == tonic::Code::DataLoss),
+                "payload {} must be refused as data loss, got {outcome:?}",
+                String::from_utf8_lossy(payload)
+            );
+        }
     }
 
     #[test]

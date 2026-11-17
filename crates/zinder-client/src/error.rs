@@ -485,7 +485,8 @@ const fn retry_policy_for_remote(reason: &ErrorReason, code: Code) -> RetryPolic
         | ErrorReason::NoVisibleChainEpoch
         | ErrorReason::UpstreamUnreachable
         | ErrorReason::ServiceNotReady
-        | ErrorReason::TransactionNotFound => RetryPolicy::RetryWithBackoff,
+        | ErrorReason::TransactionNotFound
+        | ErrorReason::TreeStateReplayLimitReached => RetryPolicy::RetryWithBackoff,
         ErrorReason::Unknown(_) => retry_policy_for_status(code),
     }
 }

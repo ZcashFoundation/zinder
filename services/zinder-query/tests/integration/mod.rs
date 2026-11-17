@@ -11,4 +11,5 @@ mod single_artifact_lookup;
 mod stream_cancellation;
 mod transaction_broadcast;
 mod transparent_outpoint_spend_status;
+mod tree_state_at_height;
 mod wallet_serving_query;

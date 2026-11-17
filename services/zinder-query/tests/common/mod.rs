@@ -12,10 +12,7 @@
     reason = "Items are reachable via `mod support;` from each test binary."
 )]
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::Arc;
 use zinder_core::{BlockHeight, BlockId, Network};
 
 use async_trait::async_trait;
@@ -24,8 +21,7 @@ use zinder_query::{
     AdmittedIngestControl, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_source::{
-    NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError, SourceTreeState,
-    TransactionBroadcaster, TreeStateUpstream,
+    NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError, TransactionBroadcaster,
 };
 use zinder_testkit::{
     ChainFixture, IngestControlFixture, MockTransactionBroadcaster, WalletServingStoreFixture,
@@ -141,33 +137,16 @@ pub fn probed_serving_query_over(
     Ok((query, store_fixture))
 }
 
-/// Probed node double that serves one fixed tree state and delegates
-/// broadcasts to a [`MockTransactionBroadcaster`].
+/// Probed node double that delegates broadcasts to a
+/// [`MockTransactionBroadcaster`].
 #[derive(Clone)]
 pub struct ProbedNode {
     capabilities: NodeCapabilities,
     tip: BlockId,
-    tree_state: Option<SourceTreeState>,
-    tree_state_fetch_count: Arc<AtomicUsize>,
     broadcaster: MockTransactionBroadcaster,
 }
 
 impl ProbedNode {
-    /// Advertises tree-state fill and answers every fill with `tree_state`.
-    pub fn with_tree_state(tip: BlockId, tree_state: SourceTreeState) -> eyre::Result<Self> {
-        Ok(Self {
-            capabilities: NodeCapabilities::new([
-                NodeCapability::OpenRpcDiscovery,
-                NodeCapability::TipId,
-                NodeCapability::TreeState,
-            ])?,
-            tip,
-            tree_state: Some(tree_state),
-            tree_state_fetch_count: Arc::new(AtomicUsize::new(0)),
-            broadcaster: MockTransactionBroadcaster::broadcast_disabled(),
-        })
-    }
-
     /// Advertises transaction broadcast and forwards it to `broadcaster`.
     pub fn with_broadcaster(
         tip: BlockId,
@@ -180,15 +159,8 @@ impl ProbedNode {
                 NodeCapability::TransactionBroadcast,
             ])?,
             tip,
-            tree_state: None,
-            tree_state_fetch_count: Arc::new(AtomicUsize::new(0)),
             broadcaster,
         })
-    }
-
-    /// Returns how many tree-state fills reached this node.
-    pub fn tree_state_fetch_count(&self) -> usize {
-        self.tree_state_fetch_count.load(Ordering::SeqCst)
     }
 }
 
@@ -206,21 +178,6 @@ impl NodeSource for ProbedNode {
 
     async fn tip_id(&self) -> Result<BlockId, SourceError> {
         Ok(self.tip)
-    }
-}
-
-#[async_trait]
-impl TreeStateUpstream for ProbedNode {
-    async fn fetch_tree_state_for_block(
-        &self,
-        _block_id: BlockId,
-    ) -> Result<SourceTreeState, SourceError> {
-        self.tree_state_fetch_count.fetch_add(1, Ordering::SeqCst);
-        self.tree_state
-            .clone()
-            .ok_or(SourceError::NodeCapabilityMissing {
-                capability: NodeCapability::TreeState,
-            })
     }
 }
 

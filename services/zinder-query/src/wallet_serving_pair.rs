@@ -14,8 +14,8 @@ use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 use zinder_core::{
     BlockBlobArtifact, BlockHeaderArtifact, BlockHeight, BlockHeightRange, BlockId,
     CanonicalHistoryBounds, ChainEpoch, CommitmentTreeCheckpoint, CompactBlockArtifact, Network,
-    SubtreeRootArtifact, SubtreeRootRange, TransactionBlobArtifact, TransactionId,
-    TransactionLocation, TransparentAddressScriptHash, TransparentOutPoint,
+    NetworkUpgradeActivations, SubtreeRootArtifact, SubtreeRootRange, TransactionBlobArtifact,
+    TransactionId, TransactionLocation, TransparentAddressScriptHash, TransparentOutPoint,
 };
 use zinder_store::{
     BlockHashLookup, CanonicalActivationSchedule, CanonicalEventFence, CanonicalStoreError,
@@ -137,6 +137,16 @@ pub trait CanonicalReader: Send + Sync + 'static {
     fn tree_state_checkpoint_at_or_before(
         &self,
         height: BlockHeight,
+    ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError>;
+
+    /// Reads the commitment-tree checkpoint at exactly `height`,
+    /// reconstructing it from stored compact blocks when no checkpoint is
+    /// stored there, as
+    /// [`RocksDbCanonicalSecondary::tree_state_checkpoint_at`] does.
+    fn tree_state_checkpoint_at(
+        &self,
+        height: BlockHeight,
+        network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError>;
 
     /// Reads a contiguous range of subtree roots.
@@ -372,6 +382,14 @@ macro_rules! impl_canonical_read {
                 height: BlockHeight,
             ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
                 self.tree_state_checkpoint_at_or_before(height)
+            }
+
+            fn tree_state_checkpoint_at(
+                &self,
+                height: BlockHeight,
+                network_upgrade_activations: &NetworkUpgradeActivations,
+            ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
+                self.tree_state_checkpoint_at(height, network_upgrade_activations)
             }
 
             fn subtree_roots(

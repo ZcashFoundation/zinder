@@ -454,6 +454,12 @@ pub enum ErrorReason {
     /// A `WalletQuery.TransparentOutpointSpendStatus` request carried no
     /// outpoints or more than the 1,024-outpoint per-request cap.
     TransparentOutpointCountOutOfRange = 53,
+    /// RESOURCE_EXHAUSTED family.
+    /// `WalletQuery.TreeStateAtHeight` named a height without a stored
+    /// checkpoint, and the server already reconstructs its limit of tree states
+    /// from stored compact blocks at once. Retry with backoff; a height with a
+    /// stored checkpoint is never refused this way.
+    TreeStateReplayLimitReached = 54,
 }
 impl ErrorReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -517,6 +523,7 @@ impl ErrorReason {
             Self::TransparentOutpointCountOutOfRange => {
                 "TRANSPARENT_OUTPOINT_COUNT_OUT_OF_RANGE"
             }
+            Self::TreeStateReplayLimitReached => "TREE_STATE_REPLAY_LIMIT_REACHED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -583,6 +590,7 @@ impl ErrorReason {
             "TRANSPARENT_OUTPOINT_COUNT_OUT_OF_RANGE" => {
                 Some(Self::TransparentOutpointCountOutOfRange)
             }
+            "TREE_STATE_REPLAY_LIMIT_REACHED" => Some(Self::TreeStateReplayLimitReached),
             _ => None,
         }
     }

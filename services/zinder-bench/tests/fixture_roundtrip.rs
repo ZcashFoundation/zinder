@@ -623,12 +623,6 @@ async fn canonical_fixture_source_serves_only_the_admitted_boundary_checkpoints(
         fixed_tip
     );
     assert!(!source.capabilities().supports(NodeCapability::TreeState));
-    assert!(matches!(
-        source.fetch_tree_state_for_block(fixed_tip.block_id).await,
-        Err(SourceError::NodeCapabilityMissing {
-            capability: NodeCapability::TreeState,
-        })
-    ));
     Ok(())
 }
 

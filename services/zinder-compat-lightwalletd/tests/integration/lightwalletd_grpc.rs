@@ -32,7 +32,8 @@ use zinder_core::{
     SUBTREE_LEAF_COUNT, ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex, SubtreeRootRange,
     TransactionBroadcastOutcome, TransactionComponentCounts, TransactionId, TransactionLocation,
     TransparentAddressBalance, TransparentAddressScriptHash, TransparentOutPoint,
-    TransparentSpendFact, TransparentUnspentOutput, wire::encode_internal_block_hash,
+    TransparentSpendFact, TransparentUnspentOutput,
+    wire::{encode_internal_block_hash, encode_rpc_block_hash_hex},
 };
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
@@ -49,8 +50,7 @@ use zinder_query::{
     WalletServingReadPair,
 };
 use zinder_source::{
-    NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError, SourceTreeState,
-    TransactionBroadcaster, TreeStateUpstream,
+    NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError, TransactionBroadcaster,
 };
 use zinder_store::{
     ArtifactFamily, CanonicalBuildSubtreeRoot, ChainEventStreamFamily, ChainEventStreamResume,
@@ -60,8 +60,8 @@ use zinder_store::{
 use zinder_testkit::{
     CanonicalBaseline, CanonicalWriterFixture, ChainFixture, FIXTURE_NOTE_COMMITMENT, FixtureBlock,
     FixtureTransactionRows, LogCapture, MockTransactionBroadcaster, WalletServingStoreFixture,
-    completed_subtree_frontier, one_leaf_frontier, sample_regtest_upgrade_activations,
-    synthetic_transaction_public_facts,
+    commitment_tree_checkpoints, completed_subtree_frontier, one_leaf_frontier,
+    sample_regtest_upgrade_activations, synthetic_transaction_public_facts, with_note_commitments,
 };
 
 const ACCEPTANCE_BLOCK_HEIGHT: BlockHeight = BlockHeight::new(1);
@@ -2412,6 +2412,70 @@ async fn tree_state_reports_future_height_like_lightwalletd() -> eyre::Result<()
     Ok(())
 }
 
+/// `GetTreeState` answers heights between construction checkpoints from the
+/// store. The node holds no tree state, and the expected trees come from
+/// appending every block's note commitments from genesis.
+#[tokio::test]
+async fn tree_state_between_checkpoints_is_served_from_storage_without_the_node() -> eyre::Result<()>
+{
+    let activations = sample_regtest_upgrade_activations();
+    let chain = with_note_commitments(
+        &ChainFixture::new(Network::ZcashRegtest).extend_blocks(150),
+        &activations,
+    )?;
+    let expected = commitment_tree_checkpoints(&chain, &activations)?;
+    let tip = chain
+        .blocks()
+        .last()
+        .ok_or_else(|| eyre!("tree-state chain must contain a block"))?;
+    let store_fixture = AcceptanceStore::from_store_fixture(
+        CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &activations)?
+            .into_serving_store_fixture()?,
+        CompatNode::read_only(BlockId::new(tip.height, tip.hash))?,
+    )?;
+    let adapter = acceptance_adapter(&store_fixture);
+
+    for height in [1_u32, 2, 57, 99, 100, 101, 149, 150] {
+        let checkpoint = expected
+            .get(usize::try_from(height - 1)?)
+            .ok_or_else(|| eyre!("no expected tree state at height {height}"))?;
+        let tree_state = adapter
+            .get_tree_state(Request::new(lightwalletd::BlockId {
+                height: u64::from(height),
+                hash: Vec::new(),
+            }))
+            .await
+            .map_err(|status| eyre!("height {height} was refused: {status:?}"))?
+            .into_inner();
+        let final_state = |protocol: ShieldedProtocol| {
+            checkpoint
+                .frontiers
+                .get(protocol)
+                .map(|frontier| hex::encode(frontier.final_state_bytes()))
+                .unwrap_or_default()
+        };
+
+        assert_eq!(tree_state.height, u64::from(height));
+        assert_eq!(
+            tree_state.hash,
+            encode_rpc_block_hash_hex(checkpoint.block_id.hash)
+        );
+        assert_eq!(tree_state.time, checkpoint.block_time_seconds);
+        assert_eq!(
+            tree_state.sapling_tree,
+            final_state(ShieldedProtocol::Sapling),
+            "sapling tree at height {height}"
+        );
+        assert_eq!(
+            tree_state.orchard_tree,
+            final_state(ShieldedProtocol::Orchard),
+            "orchard tree at height {height}"
+        );
+        assert_eq!(tree_state.ironwood_tree, "");
+    }
+    Ok(())
+}
+
 /// Block-order index of the spending transaction in the UTXO stream fixture.
 /// The spend must follow both creating transactions, which the fixture places
 /// at indices 0 and 1.
@@ -3013,34 +3077,6 @@ async fn generated_lightwalletd_client_streams_over_grpc_transport() -> eyre::Re
 }
 
 #[tokio::test]
-async fn tree_state_reports_missing_non_empty_final_state_as_data_loss() -> eyre::Result<()> {
-    let store_fixture = sparse_tree_state_fixture(
-        br#"{"hash":"010101","height":1,"time":1296694002,"sapling":{"commitments":{"size":1}},"orchard":{"commitments":{}}}"#
-            .to_vec(),
-    )?;
-    let adapter = acceptance_adapter(&store_fixture);
-
-    let status = match adapter
-        .get_tree_state(Request::new(lightwalletd::BlockId {
-            height: 1,
-            hash: Vec::new(),
-        }))
-        .await
-    {
-        Ok(response) => {
-            return Err(eyre!(
-                "expected malformed tree-state error, got {response:?}"
-            ));
-        }
-        Err(status) => status,
-    };
-
-    assert_eq!(status.code(), Code::DataLoss);
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn tree_state_rejects_zero_empty_block_id_without_reader_fallback() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture()?;
     let adapter = acceptance_adapter(&store_fixture);
@@ -3057,143 +3093,6 @@ async fn tree_state_rejects_zero_empty_block_id_without_reader_fallback() -> eyr
     };
 
     assert_eq!(status.code(), Code::InvalidArgument);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn tree_state_treats_absent_pool_and_empty_commitments_as_empty() -> eyre::Result<()> {
-    let store_fixture = sparse_tree_state_fixture(
-        br#"{"hash":"010101","height":1,"time":1296694002,"orchard":{"commitments":{}}}"#.to_vec(),
-    )?;
-    let adapter = acceptance_adapter(&store_fixture);
-
-    let tree_state = adapter
-        .get_tree_state(Request::new(lightwalletd::BlockId {
-            height: 1,
-            hash: Vec::new(),
-        }))
-        .await?
-        .into_inner();
-
-    assert_eq!(tree_state.sapling_tree, "");
-    assert_eq!(tree_state.orchard_tree, "");
-    assert_eq!(tree_state.ironwood_tree, "");
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn tree_state_maps_ironwood_pool_final_state() -> eyre::Result<()> {
-    let store_fixture = sparse_tree_state_fixture(
-        br#"{"hash":"010101","height":1,"time":1296694002,"sapling":{"commitments":{}},"orchard":{"commitments":{}},"ironwood":{"commitments":{"finalState":"aabbcc"}}}"#
-            .to_vec(),
-    )?;
-    let adapter = acceptance_adapter(&store_fixture);
-
-    let tree_state = adapter
-        .get_tree_state(Request::new(lightwalletd::BlockId {
-            height: 1,
-            hash: Vec::new(),
-        }))
-        .await?
-        .into_inner();
-
-    assert_eq!(tree_state.ironwood_tree, "aabbcc");
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn tree_state_reports_wrong_pool_shape_as_data_loss() -> eyre::Result<()> {
-    let store_fixture = sparse_tree_state_fixture(
-        br#"{"hash":"010101","height":1,"time":1296694002,"sapling":[]}"#.to_vec(),
-    )?;
-    let adapter = acceptance_adapter(&store_fixture);
-
-    let status = match adapter
-        .get_tree_state(Request::new(lightwalletd::BlockId {
-            height: 1,
-            hash: Vec::new(),
-        }))
-        .await
-    {
-        Ok(response) => {
-            return Err(eyre!("expected malformed pool error, got {response:?}"));
-        }
-        Err(status) => status,
-    };
-
-    assert_eq!(status.code(), Code::DataLoss);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn tree_state_reports_wrong_commitments_shape_as_data_loss() -> eyre::Result<()> {
-    let store_fixture = sparse_tree_state_fixture(
-        br#"{"hash":"010101","height":1,"time":1296694002,"sapling":{"commitments":[]}}"#.to_vec(),
-    )?;
-    let adapter = acceptance_adapter(&store_fixture);
-
-    let status = match adapter
-        .get_tree_state(Request::new(lightwalletd::BlockId {
-            height: 1,
-            hash: Vec::new(),
-        }))
-        .await
-    {
-        Ok(response) => {
-            return Err(eyre!(
-                "expected malformed commitments error, got {response:?}"
-            ));
-        }
-        Err(status) => status,
-    };
-
-    assert_eq!(status.code(), Code::DataLoss);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn tree_state_uses_typed_time_when_payload_omits_time() -> eyre::Result<()> {
-    let store_fixture = sparse_tree_state_fixture(
-        br#"{"hash":"010101","height":1,"sapling":{"commitments":{}},"orchard":{"commitments":{}}}"#
-            .to_vec(),
-    )?;
-    let adapter = acceptance_adapter(&store_fixture);
-
-    let response = adapter
-        .get_tree_state(Request::new(lightwalletd::BlockId {
-            height: 1,
-            hash: Vec::new(),
-        }))
-        .await?
-        .into_inner();
-
-    assert_eq!(response.time, 1_774_668_401);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn tree_state_ignores_non_authoritative_payload_time() -> eyre::Result<()> {
-    let store_fixture = sparse_tree_state_fixture(
-        br#"{"hash":"010101","height":1,"time":"1296694002","sapling":{"commitments":{}},"orchard":{"commitments":{}}}"#
-            .to_vec(),
-    )?;
-    let adapter = acceptance_adapter(&store_fixture);
-
-    let response = adapter
-        .get_tree_state(Request::new(lightwalletd::BlockId {
-            height: 1,
-            hash: Vec::new(),
-        }))
-        .await?
-        .into_inner();
-
-    assert_eq!(response.time, 1_774_668_401);
 
     Ok(())
 }
@@ -3846,29 +3745,6 @@ fn broadcasting_acceptance_adapter(
     Ok((acceptance_adapter(&store_fixture), store_fixture))
 }
 
-/// Builds a two-block pair whose height-1 tree state is not a canonical
-/// checkpoint, so the node fills it with `tree_state_payload`.
-fn sparse_tree_state_fixture(tree_state_payload: Vec<u8>) -> eyre::Result<AcceptanceStore> {
-    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(2);
-    let sparse_block = chain
-        .block_at(ACCEPTANCE_BLOCK_HEIGHT)
-        .ok_or_else(|| eyre!("sparse tree-state fixture must include height 1"))?;
-    let sparse_block_id = BlockId::new(sparse_block.height, sparse_block.hash);
-    let tip = chain
-        .block_at(BlockHeight::new(2))
-        .ok_or_else(|| eyre!("sparse tree-state fixture must include height 2"))?;
-    AcceptanceStore::from_chain(
-        &chain,
-        CompatNode::read_only(BlockId::new(tip.height, tip.hash))?.with_tree_state(
-            SourceTreeState::new(
-                sparse_block_id,
-                sparse_block.block_time_seconds,
-                tree_state_payload,
-            ),
-        ),
-    )
-}
-
 fn acceptance_store_fixture() -> eyre::Result<AcceptanceStore> {
     acceptance_store_fixture_with_transaction_rows(RawBlobRetention::None, |block| {
         let transaction_id = TransactionId::from_bytes([2; 32]);
@@ -3963,14 +3839,13 @@ where
 
 /// Probed node double for the compatibility composition.
 ///
-/// It always advertises tree-state fill, as production nodes do, and answers
-/// a fill only for the one tree state it holds.
+/// It advertises tree state, as production nodes do, although the query never
+/// asks a node for one.
 #[derive(Clone)]
 struct CompatNode {
     capabilities: NodeCapabilities,
     tip: BlockId,
     broadcaster: MockTransactionBroadcaster,
-    tree_state: Option<SourceTreeState>,
 }
 
 impl CompatNode {
@@ -3983,7 +3858,6 @@ impl CompatNode {
             ])?,
             tip,
             broadcaster: MockTransactionBroadcaster::broadcast_disabled(),
-            tree_state: None,
         })
     }
 
@@ -3997,13 +3871,7 @@ impl CompatNode {
             ])?,
             tip,
             broadcaster,
-            tree_state: None,
         })
-    }
-
-    fn with_tree_state(mut self, tree_state: SourceTreeState) -> Self {
-        self.tree_state = Some(tree_state);
-        self
     }
 }
 
@@ -4021,21 +3889,6 @@ impl NodeSource for CompatNode {
 
     async fn tip_id(&self) -> Result<BlockId, SourceError> {
         Ok(self.tip)
-    }
-}
-
-#[async_trait]
-impl TreeStateUpstream for CompatNode {
-    async fn fetch_tree_state_for_block(
-        &self,
-        block_id: BlockId,
-    ) -> Result<SourceTreeState, SourceError> {
-        self.tree_state
-            .clone()
-            .filter(|tree_state| tree_state.block_id == block_id)
-            .ok_or_else(|| SourceError::NodeUnavailable {
-                reason: "compatibility test node holds no tree state for this block".to_owned(),
-            })
     }
 }
 

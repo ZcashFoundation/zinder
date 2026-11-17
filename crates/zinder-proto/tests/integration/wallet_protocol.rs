@@ -1481,6 +1481,24 @@ where
 }
 
 #[test]
+fn tree_state_replay_refusal_is_resource_exhausted_and_retryable() -> eyre::Result<()> {
+    let reason = ops::ErrorReason::TreeStateReplayLimitReached;
+    assert_eq!(reason.as_str_name(), "TREE_STATE_REPLAY_LIMIT_REACHED");
+    assert_eq!(
+        ops::ErrorReason::from_str_name("TREE_STATE_REPLAY_LIMIT_REACHED"),
+        Some(reason)
+    );
+    assert_eq!(ops::ErrorReason::try_from(54)?, reason);
+    let policy = zinder_proto::reason_policy(reason);
+    assert_eq!(policy.code, tonic::Code::ResourceExhausted);
+    assert_eq!(
+        policy.retry,
+        zinder_proto::RetryDisposition::RetryAfterBackoff
+    );
+    Ok(())
+}
+
+#[test]
 fn transaction_lookup_reasons_round_trip_by_name_and_scalar() -> eyre::Result<()> {
     for (reason, name, scalar) in [
         (

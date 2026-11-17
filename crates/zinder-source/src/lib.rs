@@ -14,7 +14,6 @@ mod source_chain_update;
 mod source_error;
 mod source_subtree_root;
 mod source_transaction;
-mod source_tree_state;
 mod transparent_address;
 mod transport;
 mod upstream_health;
@@ -35,7 +34,7 @@ pub use mempool_source::{
 };
 pub use node_auth::{CookieSource, CookieSourceError, NodeAuth};
 pub use node_capabilities::{NodeCapabilities, NodeCapabilitiesError, NodeCapability};
-pub use node_source::{NodeSource, TransactionBroadcaster, TreeStateUpstream};
+pub use node_source::{NodeSource, TransactionBroadcaster};
 pub use node_target::{
     DEFAULT_NODE_HEALTH_ESTIMATED_GAP_FLOOR_BLOCKS, DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS,
     DEFAULT_NODE_HEALTH_VERIFICATION_PROGRESS_FLOOR, DEFAULT_NODE_REQUEST_TIMEOUT_SECS,
@@ -56,7 +55,6 @@ pub use source_transaction::{
     TransactionPublicFactSet, parse_transaction_public_fact_set, parse_transaction_public_facts,
     transaction_component_counts, transaction_public_fact_set_from_parsed,
 };
-pub use source_tree_state::SourceTreeState;
 pub use transparent_address::transparent_address_matches_network;
 pub use transport::{
     ResilientClient, ZEBRA_REBUILD_THRESHOLD, ZebraIndexerChannelOptions, ZebraTransportError,

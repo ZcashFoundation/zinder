@@ -133,4 +133,11 @@ enum ErrorReason {
   // A `WalletQuery.TransparentOutpointSpendStatus` request carried no
   // outpoints or more than the 1,024-outpoint per-request cap.
   TRANSPARENT_OUTPOINT_COUNT_OUT_OF_RANGE = 53;
+
+  // RESOURCE_EXHAUSTED family.
+  // `WalletQuery.TreeStateAtHeight` named a height without a stored
+  // checkpoint, and the server already reconstructs its limit of tree states
+  // from stored compact blocks at once. Retry with backoff; a height with a
+  // stored checkpoint is never refused this way.
+  TREE_STATE_REPLAY_LIMIT_REACHED = 54;
 }

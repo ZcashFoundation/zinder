@@ -32,7 +32,7 @@ use zinder_proto::external::zebra_indexer_rpc::{
 use crate::{
     NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceChainSegment,
     SourceChainSegmentLimits, SourceChainSegmentStats, SourceChainUpdate, SourceError,
-    SourceSubtreeRoots, SourceTreeState, UpstreamHealthSnapshot, ZebraIndexerChannelOptions,
+    SourceSubtreeRoots, UpstreamHealthSnapshot, ZebraIndexerChannelOptions,
     ZebraIndexerSourceTarget, ZebraJsonRpcSource, connect_zebra_indexer_channel,
     source_chain_update::SourceChainCursorPosition,
     zebra_json_rpc::{is_unreadable_stored_block_refusal, validate_source_block_links},
@@ -255,15 +255,6 @@ impl NodeSource for ZebraIndexerBlockSource {
         Ok(SourceChainSegment::connected_blocks_with_stats(
             blocks, stats,
         ))
-    }
-
-    async fn fetch_tree_state_for_block(
-        &self,
-        block_id: BlockId,
-    ) -> Result<SourceTreeState, SourceError> {
-        self.control_plane
-            .fetch_tree_state_for_block(block_id)
-            .await
     }
 
     async fn fetch_chain_checkpoint(
