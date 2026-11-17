@@ -1,6 +1,0 @@
-kind: fixed
-body: lightwalletd `GetBlockRange` and `GetBlockRangeNullifiers` streams that span several 1,000-block chunks no longer fail with `CHAIN_EPOCH_PIN_UNAVAILABLE` when new blocks arrive while a wallet reads slowly. In compact-blocks serving, a slow stream no longer stops publication or makes the service report not ready. A stream now ends early only when a reorg reaches the blocks it is sending, with `ABORTED` as lightwalletd returns, or with `OUT_OF_RANGE` when the reorg lowered the tip; `zinder_compat_block_range_reorg_endings_total` counts these endings.
-time: 2026-11-17T13:20:11.078067048Z
-custom:
-    Bump: patch
-    PR: "250"
