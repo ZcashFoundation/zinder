@@ -198,6 +198,20 @@ impl SubtreeRootHash {
     }
 }
 
+/// Root of a subtree that one block completed, before that block's hash is
+/// attached.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompletedSubtreeRoot {
+    /// Shielded protocol this subtree root belongs to.
+    pub protocol: ShieldedProtocol,
+    /// Subtree index within `protocol`.
+    pub subtree_index: SubtreeRootIndex,
+    /// Merkle root of the complete subtree.
+    pub root_hash: SubtreeRootHash,
+    /// Height of the block that completed this subtree.
+    pub completing_block_height: BlockHeight,
+}
+
 /// Wallet-oriented subtree-root artifact.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubtreeRootArtifact {

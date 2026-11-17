@@ -21,8 +21,8 @@ use zcash_primitives::merkle_tree::{HashSer, read_commitment_tree, write_commitm
 
 use crate::{
     BlockFinalNoteCommitmentRoots, BlockHash, BlockHeight, BlockId, ChainTipMetadata,
-    FinalNoteCommitmentRoot, NetworkUpgradeActivations, SUBTREE_LEAF_COUNT, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootHash, SubtreeRootIndex,
+    CompletedSubtreeRoot, FinalNoteCommitmentRoot, NetworkUpgradeActivations, SUBTREE_LEAF_COUNT,
+    ShieldedProtocol, SubtreeRootHash, SubtreeRootIndex,
 };
 
 /// Maximum canonical Zebra `finalState` size admitted for one commitment tree.
@@ -548,14 +548,7 @@ pub struct CommitmentTreeAccumulator {
     ironwood: Option<PoolAccumulator<MerkleHashOrchard>>,
     /// Subtrees the most recently appended block completed, in completion
     /// order.
-    completed_subtrees: Vec<CompletedSubtree>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct CompletedSubtree {
-    protocol: ShieldedProtocol,
-    subtree_index: SubtreeRootIndex,
-    root_hash: SubtreeRootHash,
+    completed_subtree_roots: Vec<CompletedSubtreeRoot>,
 }
 
 #[derive(Clone, Debug)]
@@ -617,7 +610,7 @@ impl CommitmentTreeAccumulator {
                 .ironwood()
                 .map(|frontier| seed_pool(ShieldedProtocol::Ironwood, frontier))
                 .transpose()?,
-            completed_subtrees: Vec::new(),
+            completed_subtree_roots: Vec::new(),
         })
     }
 
@@ -680,32 +673,32 @@ impl CommitmentTreeAccumulator {
             |bytes| Option::<MerkleHashOrchard>::from(MerkleHashOrchard::from_bytes(&bytes)),
         )?;
 
-        let mut completed_subtrees = Vec::new();
+        let mut completed_subtree_roots = Vec::new();
         apply_pool_update(
             &mut self.sapling,
             sapling_update,
             SaplingNode::to_bytes,
-            &mut completed_subtrees,
+            &mut completed_subtree_roots,
         );
         apply_pool_update(
             &mut self.orchard,
             orchard_update,
             MerkleHashOrchard::to_bytes,
-            &mut completed_subtrees,
+            &mut completed_subtree_roots,
         );
         apply_pool_update(
             &mut self.ironwood,
             ironwood_update,
             MerkleHashOrchard::to_bytes,
-            &mut completed_subtrees,
+            &mut completed_subtree_roots,
         );
-        self.completed_subtrees = completed_subtrees;
+        self.completed_subtree_roots = completed_subtree_roots;
         self.tip_height = block_height;
         Ok(())
     }
 
-    /// Returns the subtree roots that the most recently appended block
-    /// completed, attributed to that block as `block_hash`.
+    /// Returns the roots of the subtrees that the most recently appended block
+    /// completed, at that block's height.
     ///
     /// A root is taken when the commitment that fills its subtree's last leaf
     /// is appended, so a subtree that a block completes partway through its
@@ -713,21 +706,10 @@ impl CommitmentTreeAccumulator {
     /// them, and each is in the byte order that `z_getsubtreesbyindex`
     /// reports, which for Sapling is not the reversed order of `finalRoot`.
     /// An accumulator that has not appended a block since it was seeded
-    /// returns none.
+    /// returns none, and a rejected append keeps the previous block's roots.
     #[must_use]
-    pub fn completed_subtree_roots(&self, block_hash: BlockHash) -> Vec<SubtreeRootArtifact> {
-        self.completed_subtrees
-            .iter()
-            .map(|completed| {
-                SubtreeRootArtifact::new(
-                    completed.protocol,
-                    completed.subtree_index,
-                    completed.root_hash,
-                    self.tip_height,
-                    block_hash,
-                )
-            })
-            .collect()
+    pub fn completed_subtree_roots(&self) -> &[CompletedSubtreeRoot] {
+        &self.completed_subtree_roots
     }
 
     /// Produces canonical, revalidated Zebra `finalState` checkpoints.
@@ -995,6 +977,7 @@ where
 
 struct PreparedPoolUpdate<Node> {
     protocol: ShieldedProtocol,
+    block_height: BlockHeight,
     pool_active: bool,
     commitments: Vec<Node>,
     next_tree_size: u32,
@@ -1054,6 +1037,7 @@ fn prepare_pool_update<Node>(
         }
         return Ok(PreparedPoolUpdate {
             protocol,
+            block_height,
             pool_active,
             commitments: Vec::new(),
             next_tree_size: 0,
@@ -1091,6 +1075,7 @@ fn prepare_pool_update<Node>(
     }
     Ok(PreparedPoolUpdate {
         protocol,
+        block_height,
         pool_active,
         commitments,
         next_tree_size,
@@ -1098,12 +1083,12 @@ fn prepare_pool_update<Node>(
 }
 
 /// Appends a prepared pool update and adds each subtree it completes to
-/// `completed_subtrees`, encoding roots with `subtree_root_bytes`.
+/// `completed_subtree_roots`, encoding roots with `subtree_root_bytes`.
 fn apply_pool_update<Node>(
     current: &mut Option<PoolAccumulator<Node>>,
     update: PreparedPoolUpdate<Node>,
     subtree_root_bytes: impl Fn(&Node) -> [u8; 32],
-    completed_subtrees: &mut Vec<CompletedSubtree>,
+    completed_subtree_roots: &mut Vec<CompletedSubtreeRoot>,
 ) where
     Node: Clone + Hashable,
 {
@@ -1121,10 +1106,11 @@ fn apply_pool_update<Node>(
         // size is strictly below the official depth-32 frontier's 2^32 limit.
         let _appended_within_prevalidated_capacity = pool.frontier.append(commitment);
         if let Some((subtree_index, root)) = completed_subtree_root(&pool.frontier) {
-            completed_subtrees.push(CompletedSubtree {
+            completed_subtree_roots.push(CompletedSubtreeRoot {
                 protocol: update.protocol,
                 subtree_index,
                 root_hash: SubtreeRootHash::from_bytes(subtree_root_bytes(&root)),
+                completing_block_height: update.block_height,
             });
         }
     }
@@ -2192,8 +2178,7 @@ mod tests {
             &frontiers,
             &activations,
         )?;
-        let block_hash = BlockHash::from_bytes([10; 32]);
-        assert!(accumulator.completed_subtree_roots(block_hash).is_empty());
+        assert!(accumulator.completed_subtree_roots().is_empty());
 
         // Sapling completes subtree 0 with its last commitment, Orchard
         // completes subtree 0 with the first of two, and Ironwood completes
@@ -2204,21 +2189,18 @@ mod tests {
             &[commitment(3), commitment(4)],
             &[commitment(5)],
         )?;
-        let completed = |protocol, index, root: [u8; 32]| {
-            SubtreeRootArtifact::new(
-                protocol,
-                SubtreeRootIndex::new(index),
-                SubtreeRootHash::from_bytes(root),
-                BlockHeight::new(10),
-                block_hash,
-            )
+        let completed = |protocol, index, root: [u8; 32]| CompletedSubtreeRoot {
+            protocol,
+            subtree_index: SubtreeRootIndex::new(index),
+            root_hash: SubtreeRootHash::from_bytes(root),
+            completing_block_height: BlockHeight::new(10),
         };
         let sapling_root = expected_subtree_root(&sapling_leaf, sapling_node(2)?).to_bytes();
         let orchard_root = expected_subtree_root(&orchard_leaf, orchard_node(3)?).to_bytes();
         let ironwood_root = expected_subtree_root(&orchard_leaf, orchard_node(5)?).to_bytes();
         assert_eq!(
-            accumulator.completed_subtree_roots(block_hash),
-            vec![
+            accumulator.completed_subtree_roots(),
+            [
                 completed(ShieldedProtocol::Sapling, 0, sapling_root),
                 completed(ShieldedProtocol::Orchard, 0, orchard_root),
                 completed(ShieldedProtocol::Ironwood, 1, ironwood_root),
@@ -2234,11 +2216,7 @@ mod tests {
         );
 
         accumulator.append_block_commitments(BlockHeight::new(11), &[commitment(6)], &[], &[])?;
-        assert!(
-            accumulator
-                .completed_subtree_roots(BlockHash::from_bytes([11; 32]))
-                .is_empty()
-        );
+        assert!(accumulator.completed_subtree_roots().is_empty());
         Ok(())
     }
 
@@ -2262,8 +2240,7 @@ mod tests {
             &activations,
         )?;
         accumulator.append_block_commitments(BlockHeight::new(10), &[commitment(2)], &[], &[])?;
-        let block_hash = BlockHash::from_bytes([10; 32]);
-        let completed = accumulator.completed_subtree_roots(block_hash);
+        let completed = accumulator.completed_subtree_roots().to_vec();
         assert_eq!(completed.len(), 1);
 
         assert!(
@@ -2271,7 +2248,7 @@ mod tests {
                 .append_block_commitments(BlockHeight::new(11), &[[0xff; 32]], &[], &[])
                 .is_err()
         );
-        assert_eq!(accumulator.completed_subtree_roots(block_hash), completed);
+        assert_eq!(accumulator.completed_subtree_roots(), completed);
         Ok(())
     }
 }

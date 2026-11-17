@@ -7,8 +7,8 @@ use std::num::NonZeroU32;
 
 use eyre::{Result, eyre};
 use zinder_core::{
-    BlockHeight, CommitmentTreeAccumulator, Network, NetworkUpgradeActivations, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootIndex, SubtreeRootRange,
+    BlockHeight, CommitmentTreeAccumulator, CompletedSubtreeRoot, Network,
+    NetworkUpgradeActivations, ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange,
 };
 use zinder_ingest::{RawBlobPolicy, prepare_canonical_block};
 use zinder_source::NodeSource;
@@ -92,7 +92,7 @@ async fn derive_completed_subtree_roots(
     source: &impl NodeSource,
     activations: &NetworkUpgradeActivations,
     height: BlockHeight,
-) -> Result<Vec<SubtreeRootArtifact>> {
+) -> Result<Vec<CompletedSubtreeRoot>> {
     let predecessor_height = height
         .value()
         .checked_sub(1)
@@ -134,5 +134,5 @@ async fn derive_completed_subtree_roots(
         activations,
     )?;
     accumulator.append_block_commitments(height, &sapling, &orchard, &ironwood)?;
-    Ok(accumulator.completed_subtree_roots(block.hash))
+    Ok(accumulator.completed_subtree_roots().to_vec())
 }

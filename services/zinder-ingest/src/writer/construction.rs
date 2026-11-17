@@ -21,7 +21,7 @@ use zinder_core::{
     BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeAccumulator,
     CommitmentTreeAccumulatorError, CommitmentTreeCheckpoint, Network, NetworkUpgradeActivations,
     NetworkUpgradeActivationsFingerprint, NetworkUpgradeActivationsFingerprintVersion,
-    ShieldedProtocol, SubtreeRootArtifact, SubtreeRootIndex,
+    ShieldedProtocol, SubtreeRootIndex, SubtreeRootRange,
 };
 use zinder_source::{NodeSource, SourceBlock};
 use zinder_store::{
@@ -316,9 +316,9 @@ pub enum CanonicalConstructionError {
         /// Position derived from typed commitment-tree frontiers.
         accumulated: ChainTipMetadata,
     },
-    /// The node still holds the fixed build tip, but its root for a subtree
-    /// that a loaded block completed differs from the root derived from the
-    /// loaded blocks' note commitments.
+    /// The node holds the fixed build tip, but on two reads its root for a
+    /// subtree that a loaded block completed differs from the root derived
+    /// from the loaded blocks' note commitments.
     #[error(
         "source {protocol:?} subtree {} root differs from the root derived from the loaded blocks",
         .subtree_index.value()
@@ -433,7 +433,8 @@ where
     .await
 }
 
-/// Loads the exact completed-subtree ranges and authenticates the final fixed tip.
+/// Authenticates the final fixed tip and loads the subtree roots derived from
+/// the loaded blocks once the node reports the same roots.
 pub async fn load_fresh_canonical_source_families<Source>(
     block_outcome: CanonicalBlockLoadOutcome,
     source: &Source,
@@ -452,32 +453,9 @@ where
         &config.network_upgrade_activations,
     )?;
     let required_ranges = builder.required_subtree_root_ranges()?;
-    let mut source_subtree_roots = Vec::new();
-    for range in required_ranges {
-        let source_roots = tokio::time::timeout(
-            config.request_timeout,
-            source.fetch_subtree_root_range(range),
-        )
-        .await
-        .map_err(|_| CanonicalConstructionError::SourceRequestTimedOut {
-            operation: "fetch exact subtree-root range",
-            timeout: config.request_timeout,
-        })?
-        .map_err(|source| CanonicalConstructionError::Source {
-            source: IngestError::from(source),
-        })?;
-        source_subtree_roots.extend(source_roots.subtree_roots.into_iter().map(|root| {
-            CanonicalBuildSubtreeRoot {
-                protocol: source_roots.protocol,
-                subtree_index: root.subtree_index,
-                root_hash: root.root_hash,
-                completing_block_height: root.completing_block_height,
-            }
-        }));
-    }
+    let source_subtree_roots = fetch_source_subtree_roots(source, config, &required_ranges).await?;
     // The subtree-root reads name no block. The fixed tip is read by hash
-    // after them, so a node that no longer holds it refuses that read, and a
-    // node that does is held to the roots derived from the loaded blocks.
+    // after them, so a node that no longer holds it refuses that read.
     let fixed_tip = builder.build_plan().build_tip();
     let source_tip_checkpoint = tokio::time::timeout(
         config.request_timeout,
@@ -491,21 +469,63 @@ where
     .map_err(|source| CanonicalConstructionError::Source {
         source: IngestError::from(source),
     })?;
-    if let Some(differing_root) =
-        first_differing_subtree_root(&derived_subtree_roots, &source_subtree_roots)
-    {
-        return Err(CanonicalConstructionError::SourceSubtreeRootMismatch {
-            protocol: differing_root.protocol,
-            subtree_index: differing_root.subtree_index,
-        });
+    builder.confirm_source_tip_checkpoint(&source_tip_checkpoint)?;
+    if first_differing_subtree_root(&derived_subtree_roots, &source_subtree_roots).is_some() {
+        // A node that switched away and back between the two reads answered
+        // the first one for another chain, so it is asked once more while it
+        // holds the fixed tip.
+        let source_subtree_roots =
+            fetch_source_subtree_roots(source, config, &required_ranges).await?;
+        if let Some(differing_root) =
+            first_differing_subtree_root(&derived_subtree_roots, &source_subtree_roots)
+        {
+            return Err(CanonicalConstructionError::SourceSubtreeRootMismatch {
+                protocol: differing_root.protocol,
+                subtree_index: differing_root.subtree_index,
+            });
+        }
     }
     let subtree_root_evidence = builder.load_subtree_roots(derived_subtree_roots)?;
-    builder.confirm_source_tip_checkpoint(&source_tip_checkpoint)?;
     Ok(CanonicalSourceLoadOutcome {
         builder,
         block_evidence,
         subtree_root_evidence,
     })
+}
+
+/// Reads the node's roots for `ranges`, in range order.
+async fn fetch_source_subtree_roots<Source>(
+    source: &Source,
+    config: &CanonicalConstructionConfig,
+    ranges: &[SubtreeRootRange],
+) -> Result<Vec<CanonicalBuildSubtreeRoot>, CanonicalConstructionError>
+where
+    Source: NodeSource,
+{
+    let mut subtree_roots = Vec::new();
+    for range in ranges {
+        let source_roots = tokio::time::timeout(
+            config.request_timeout,
+            source.fetch_subtree_root_range(*range),
+        )
+        .await
+        .map_err(|_| CanonicalConstructionError::SourceRequestTimedOut {
+            operation: "fetch exact subtree-root range",
+            timeout: config.request_timeout,
+        })?
+        .map_err(|source| CanonicalConstructionError::Source {
+            source: IngestError::from(source),
+        })?;
+        subtree_roots.extend(source_roots.subtree_roots.into_iter().map(|root| {
+            CanonicalBuildSubtreeRoot {
+                protocol: source_roots.protocol,
+                subtree_index: root.subtree_index,
+                root_hash: root.root_hash,
+                completing_block_height: root.completing_block_height,
+            }
+        }));
+    }
+    Ok(subtree_roots)
 }
 
 /// Loads every clean-v1 source family needed before publication validation.
@@ -943,9 +963,10 @@ impl CanonicalBuildBlockReceiver {
             .map_err(|source| CanonicalConstructionError::CommitmentTreeState { height, source })?;
         self.derived_subtree_roots.extend(
             self.commitment_tree_accumulator
-                .completed_subtree_roots(block_hash)
+                .completed_subtree_roots()
                 .iter()
-                .map(build_subtree_root),
+                .copied()
+                .map(CanonicalBuildSubtreeRoot::from),
         );
         let positioned =
             position_canonical_block(prepared, &mut self.running_tree_sizes).map_err(|source| {
@@ -1072,17 +1093,6 @@ pub(crate) fn canonical_build_block(
         block_final_note_commitment_roots,
         transaction_blobs,
         block_blob,
-    }
-}
-
-/// Drops the completing block's hash, which the store attaches from the block
-/// it commits or retains at that height.
-pub(crate) const fn build_subtree_root(root: &SubtreeRootArtifact) -> CanonicalBuildSubtreeRoot {
-    CanonicalBuildSubtreeRoot {
-        protocol: root.protocol,
-        subtree_index: root.subtree_index,
-        root_hash: root.root_hash,
-        completing_block_height: root.completing_block_height,
     }
 }
 

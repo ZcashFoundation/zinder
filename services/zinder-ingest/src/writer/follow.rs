@@ -34,8 +34,8 @@ use crate::{
         detail_for_ongoing_outage,
     },
     writer::construction::{
-        build_subtree_root, canonical_build_block, compact_block_commitments,
-        first_differing_subtree_root, register_prohibited_read_metrics,
+        canonical_build_block, compact_block_commitments, first_differing_subtree_root,
+        register_prohibited_read_metrics,
     },
     writer::control::{
         CanonicalControlCommand, CanonicalControlScheduling, ParkedWriterHalt, TipConfirmation,
@@ -350,9 +350,9 @@ pub enum CanonicalFollowError {
         /// First checkpoint part that differed.
         component: CheckpointComponent,
     },
-    /// The node still holds a block, but its root for a subtree the block
-    /// completed differs from the root derived from the block's own note
-    /// commitments.
+    /// The node still holds a block, but on two reads its root for a subtree
+    /// the block completed differs from the root derived from the block's own
+    /// note commitments.
     #[error(
         "source {protocol:?} subtree {} root differs from the root derived from block {height:?}",
         .subtree_index.value()
@@ -1349,9 +1349,10 @@ fn prepare_live_block(
         block_id,
         subtree_root_ranges,
         derived_subtree_roots: accumulator
-            .completed_subtree_roots(source_block.hash)
+            .completed_subtree_roots()
             .iter()
-            .map(build_subtree_root)
+            .copied()
+            .map(CanonicalBuildSubtreeRoot::from)
             .collect(),
     })
 }
@@ -1387,13 +1388,48 @@ fn differing_checkpoint_component(
 /// that replaced this one after it was read. On a disagreement the block is
 /// read again by hash. A node that no longer holds it fails that read as a
 /// changed upstream view, and the caller observes the node again. A node that
-/// still holds it contradicts the derivation, which stops the writer with
-/// [`CanonicalFollowError::SourceSubtreeRootMismatch`].
+/// still holds it is asked for the roots once more, because it may have
+/// switched away and back between the two reads. A second disagreement stops
+/// the writer with [`CanonicalFollowError::SourceSubtreeRootMismatch`].
 async fn confirm_live_subtree_roots<Source>(
     source: &Source,
     request_timeout: Duration,
     cancel: &CancellationToken,
     network_upgrade_activations: &NetworkUpgradeActivations,
+    prepared: &PreparedLiveBlock,
+) -> Result<Vec<CanonicalBuildSubtreeRoot>, CanonicalFollowError>
+where
+    Source: NodeSource,
+{
+    let source_roots = fetch_live_subtree_roots(source, request_timeout, cancel, prepared).await?;
+    if first_differing_subtree_root(&prepared.derived_subtree_roots, &source_roots).is_none() {
+        return Ok(prepared.derived_subtree_roots.clone());
+    }
+    source_request(
+        request_timeout,
+        cancel,
+        source.fetch_chain_checkpoint_for_block(prepared.block_id, network_upgrade_activations),
+    )
+    .await?;
+    let source_roots = fetch_live_subtree_roots(source, request_timeout, cancel, prepared).await?;
+    if let Some(differing_root) =
+        first_differing_subtree_root(&prepared.derived_subtree_roots, &source_roots)
+    {
+        return Err(CanonicalFollowError::SourceSubtreeRootMismatch {
+            height: prepared.block_id.height,
+            protocol: differing_root.protocol,
+            subtree_index: differing_root.subtree_index,
+        });
+    }
+    Ok(prepared.derived_subtree_roots.clone())
+}
+
+/// Reads the node's roots for the subtree ranges `prepared` completes, in
+/// range order.
+async fn fetch_live_subtree_roots<Source>(
+    source: &Source,
+    request_timeout: Duration,
+    cancel: &CancellationToken,
     prepared: &PreparedLiveBlock,
 ) -> Result<Vec<CanonicalBuildSubtreeRoot>, CanonicalFollowError>
 where
@@ -1416,22 +1452,7 @@ where
             }
         }));
     }
-    let Some(differing_root) =
-        first_differing_subtree_root(&prepared.derived_subtree_roots, &source_roots)
-    else {
-        return Ok(prepared.derived_subtree_roots.clone());
-    };
-    source_request(
-        request_timeout,
-        cancel,
-        source.fetch_chain_checkpoint_for_block(prepared.block_id, network_upgrade_activations),
-    )
-    .await?;
-    Err(CanonicalFollowError::SourceSubtreeRootMismatch {
-        height: prepared.block_id.height,
-        protocol: differing_root.protocol,
-        subtree_index: differing_root.subtree_index,
-    })
+    Ok(source_roots)
 }
 
 fn live_subtree_root_ranges(
