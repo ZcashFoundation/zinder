@@ -5,8 +5,9 @@
 
 use eyre::{Result, eyre};
 use zinder_core::{
-    BlockHash, BlockHeight, BlockId, ConsensusBranchId, Network, RawTransactionBytes,
-    ShieldedProtocol, SubtreeRootIndex, TransactionBroadcastOutcome, TransactionId,
+    BlockHash, BlockHeight, BlockId, CommitmentTreeCheckpoint, ConsensusBranchId, Network,
+    NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex,
+    TransactionBroadcastOutcome, TransactionId,
 };
 use zinder_source::{
     JsonRpcMempoolSource, JsonRpcMempoolSourceOptions, MempoolSource, MempoolSourceBackend,
@@ -67,14 +68,7 @@ async fn fetch_chain_checkpoint_for_block_answers_by_hash_and_refuses_an_unknown
     };
     let source = zebra_source(&env)?;
     let activations = source.fetch_network_upgrade_activations().await?;
-    let tip = NodeSource::tip_id(&source).await?;
-
-    let by_hash = source
-        .fetch_chain_checkpoint_for_block(tip, &activations)
-        .await?;
-    let by_height = source
-        .fetch_chain_checkpoint(tip.height, &activations)
-        .await?;
+    let (tip, by_hash, by_height) = read_tip_tree_state_twice(&source, &activations).await?;
 
     assert_eq!(by_hash.block_id, tip);
     assert_eq!(by_hash, by_height);
@@ -93,6 +87,43 @@ async fn fetch_chain_checkpoint_for_block_answers_by_hash_and_refuses_an_unknown
         SourceFailureClass::UpstreamViewChanged
     );
     Ok(())
+}
+
+const TIP_SWITCH_ATTEMPTS: usize = 3;
+
+/// Reads the tip's tree state by hash, then by height.
+///
+/// A live node can switch to a sibling tip between the reads, which refuses the
+/// hash-keyed read as a changed view or makes the two reads name different
+/// blocks. The whole sequence is retried in that case only.
+async fn read_tip_tree_state_twice(
+    source: &ZebraJsonRpcSource,
+    activations: &NetworkUpgradeActivations,
+) -> Result<(BlockId, CommitmentTreeCheckpoint, CommitmentTreeCheckpoint)> {
+    let mut attempt = 1;
+    loop {
+        let reads = async {
+            let tip = NodeSource::tip_id(source).await?;
+            let by_hash = source
+                .fetch_chain_checkpoint_for_block(tip, activations)
+                .await?;
+            let by_height = source
+                .fetch_chain_checkpoint(tip.height, activations)
+                .await?;
+            Ok::<_, SourceError>((tip, by_hash, by_height))
+        }
+        .await;
+        let tip_switched = match &reads {
+            Ok((_, by_hash, by_height)) => by_hash.block_id != by_height.block_id,
+            Err(error) => {
+                error.upstream_classification() == SourceFailureClass::UpstreamViewChanged
+            }
+        };
+        if !tip_switched || attempt == TIP_SWITCH_ATTEMPTS {
+            return Ok(reads?);
+        }
+        attempt += 1;
+    }
 }
 
 async fn parse_block(
