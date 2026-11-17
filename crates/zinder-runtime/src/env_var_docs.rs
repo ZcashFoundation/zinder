@@ -333,7 +333,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Cadence of the upstream-health probe in milliseconds. Defaults to 30000. \
                       Must be greater than zero. Query and compatibility use it to refresh \
-                      serving readiness; `zinder-explorer` reuses the same cadence for \
+                      the node dependency their readiness reports; `zinder-explorer` reuses \
+                      the same cadence for \
                       its upstream-observation probe (the one that populates \
                       `ExplorerFreshness.chain_view.upstream_tip`).",
     },

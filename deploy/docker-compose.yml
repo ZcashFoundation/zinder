@@ -144,9 +144,13 @@ services:
       target: zinder-query
     restart: on-failure
     network_mode: "service:zinder-ingest"
+    # The shared network namespace needs only a started ingest container.
+    # Query keeps serving through a node outage that leaves ingest unhealthy,
+    # and the first start still waits for the projector, which waits for a
+    # healthy ingest.
     depends_on:
       zinder-ingest:
-        condition: service_healthy
+        condition: service_started
       zinder-projector:
         condition: service_healthy
     volumes:
@@ -178,9 +182,10 @@ services:
       target: zinder-compat-lightwalletd
     restart: on-failure
     network_mode: "service:zinder-ingest"
+    # Same dependency rule as zinder-query.
     depends_on:
       zinder-ingest:
-        condition: service_healthy
+        condition: service_started
       zinder-projector:
         condition: service_healthy
     volumes:

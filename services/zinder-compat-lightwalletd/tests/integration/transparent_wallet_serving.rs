@@ -32,9 +32,7 @@ use zinder_query::{
     CanonicalReader, WalletProjectionReader, WalletServingPairSlot, WalletServingQuery,
     WalletServingReadPair,
 };
-use zinder_runtime::{
-    NodeUnavailableDetail, Readiness, ReadinessState, TrafficReadinessInterceptor,
-};
+use zinder_runtime::{Readiness, ReadinessCause, ReadinessState, TrafficReadinessInterceptor};
 use zinder_store::{
     CanonicalEventFence, CanonicalStoreError, ChainEventEnvelope, ChainEventHistoryRequest,
     ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition, RawBlobRetention,
@@ -290,9 +288,8 @@ async fn admitted_transparent_support_stays_immutable_through_readiness_recovery
         .into_inner();
     assert!(initial.taddr_support);
 
-    readiness.set(ReadinessState::node_unavailable_with_detail(
-        NodeUnavailableDetail::first_iteration("node_unreachable", "synthetic provider outage"),
-        Some(1),
+    readiness.set(ReadinessState::not_ready(
+        ReadinessCause::StorageUnavailable,
     ));
     let outage = match client.get_lightd_info(lightwalletd::Empty {}).await {
         Ok(response) => {

@@ -88,6 +88,27 @@ message ReadinessReport {
   // Consumer identities of the Explorer view store this process admitted.
   // Empty when the process has not admitted one.
   repeated string materialized_view_identities = 6;
+  // Dependencies the process keeps serving without whose latest cause does
+  // not admit traffic, such as the node behind broadcast. Each one fails only
+  // the requests that call it, so `cause` can still admit traffic. Empty when
+  // every dependency is healthy or the process declares none.
+  repeated ReadinessDependency degraded = 7;
+  // Seconds since the canonical writer committed the chain epoch this reader
+  // serves. Absent when the process serves no chain epoch. A reader keeps
+  // serving its last chain view while its node or the writer stops
+  // advancing, so this age shows how stale that view is.
+  optional uint64 served_epoch_age_seconds = 8;
+}
+
+// Latest observation of one dependency a process keeps serving without.
+message ReadinessDependency {
+  // Stable snake-case dependency label: `node_source`, `ingest_control`, or
+  // `materialized_view_catchup`.
+  string input = 1;
+  // Latest cause the dependency's owner reported.
+  ReadinessCause cause = 2;
+  // Detail tied to `cause`, under the same rules as `ReadinessReport.detail`.
+  optional ReadinessCauseDetail detail = 3;
 }
 
 // Operator-actionable detail tied to a parametric readiness cause. The

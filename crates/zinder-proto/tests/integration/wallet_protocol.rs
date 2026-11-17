@@ -1431,6 +1431,8 @@ fn ops_readiness_report_round_trips_explorer_view_identities() -> eyre::Result<(
         target_height: Some(42),
         detail: None,
         materialized_view_identities: vec!["block_summary".to_owned()],
+        degraded: Vec::new(),
+        served_epoch_age_seconds: None,
     };
 
     let decoded = round_trip(&report)?;
@@ -1456,6 +1458,8 @@ fn ops_readiness_report_round_trips_a_wallet_transition_limit_park() -> eyre::Re
             ),
         }),
         materialized_view_identities: Vec::new(),
+        degraded: Vec::new(),
+        served_epoch_age_seconds: None,
     };
 
     let decoded = round_trip(&report)?;
@@ -1469,6 +1473,45 @@ fn ops_readiness_report_round_trips_a_wallet_transition_limit_park() -> eyre::Re
         ops::ReadinessCause::WalletTransitionLimitExceeded.as_str_name(),
         "READINESS_CAUSE_WALLET_TRANSITION_LIMIT_EXCEEDED"
     );
+    Ok(())
+}
+
+#[test]
+fn ops_readiness_report_round_trips_degraded_dependencies_and_served_epoch_age() -> eyre::Result<()>
+{
+    let report = ops::ReadinessReport {
+        cause: ops::ReadinessCause::Ready as i32,
+        current_height: Some(4_602_673),
+        target_height: Some(4_602_673),
+        detail: None,
+        materialized_view_identities: Vec::new(),
+        degraded: vec![
+            ops::ReadinessDependency {
+                input: "node_source".to_owned(),
+                cause: ops::ReadinessCause::NodeUnavailable as i32,
+                detail: Some(ops::ReadinessCauseDetail {
+                    payload: Some(ops::readiness_cause_detail::Payload::NodeUnavailable(
+                        ops::NodeUnavailableDetail {
+                            failure_class: "node_unreachable".to_owned(),
+                            last_reason: "connection refused".to_owned(),
+                            consecutive_failures: 4,
+                            outage_seconds: 45,
+                        },
+                    )),
+                }),
+            },
+            ops::ReadinessDependency {
+                input: "ingest_control".to_owned(),
+                cause: ops::ReadinessCause::IngestControlUnavailable as i32,
+                detail: None,
+            },
+        ],
+        served_epoch_age_seconds: Some(900),
+    };
+
+    let decoded = round_trip(&report)?;
+
+    assert_eq!(decoded, report);
     Ok(())
 }
 

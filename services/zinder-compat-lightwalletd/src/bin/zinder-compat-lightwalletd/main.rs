@@ -187,7 +187,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         .map_err(OpsServerError::from)?;
     }
     let readiness = Readiness::default();
-    let serving_readiness = WalletServingReadiness::awaiting_node_source(readiness.clone());
+    let serving_readiness = WalletServingReadiness::compatibility(readiness.clone());
     let start_api_phase = StartupPhase::StartApi.start();
 
     let connect_node_phase = StartupPhase::ConnectNode.start();
@@ -527,19 +527,6 @@ async fn run_compact_blocks(
     .await?;
     let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
-    let node_readiness_handle = compact_block_serving::spawn_node_readiness_probe(
-        broadcaster_source.clone(),
-        serving_readiness.clone(),
-        lightwalletd_config
-            .broadcaster
-            .as_ref()
-            .and_then(|target| target.health.as_ref())
-            .map_or_else(
-                || std::time::Duration::from_millis(DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS),
-                |health| health.poll_interval,
-            ),
-        cancel.clone(),
-    )?;
     let serving_runtime_drained = CancellationToken::new();
     let publisher_handle = publisher.spawn(cancel.clone(), serving_runtime_drained.clone());
     metrics::gauge!("zinder_compat_serving_info", "serving" => "compact-blocks").set(1.0);
@@ -588,15 +575,6 @@ async fn run_compact_blocks(
     );
     if let Some(handle) = ops_handle {
         handle.shutdown().await?;
-    }
-    match node_readiness_handle.await {
-        Ok(()) => {}
-        Err(error) => tracing::error!(
-            target: "zinder::compat_lightwalletd",
-            event = "compact_node_readiness_join_failed",
-            error = %error,
-            "compact node readiness task did not exit cleanly"
-        ),
     }
     match publisher_handle.await {
         Ok(()) => {}

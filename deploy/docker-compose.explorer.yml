@@ -33,9 +33,12 @@ services:
       target: zinder-explorer
     restart: on-failure
     network_mode: "service:zinder-ingest"
+    # Same dependency rule as zinder-query: the shared network namespace needs
+    # only a started ingest container, so the Explorer starts through a node
+    # outage that leaves ingest unhealthy.
     depends_on:
       zinder-ingest:
-        condition: service_healthy
+        condition: service_started
       zinder-query:
         condition: service_healthy
     volumes:

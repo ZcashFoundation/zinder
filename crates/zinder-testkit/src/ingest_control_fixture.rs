@@ -107,6 +107,12 @@ impl IngestControlFixture {
         self.service.set_reorg_window_exceeded(halt);
     }
 
+    /// Reports a canonical writer whose node is not ready for queries, or
+    /// clears the observation with `None`.
+    pub fn set_upstream_not_ready(&self, upstream_not_ready: Option<ops::UpstreamNotReadyDetail>) {
+        self.service.set_upstream_not_ready(upstream_not_ready);
+    }
+
     /// Stops the fixture and waits for its server task.
     pub async fn shutdown(mut self) -> eyre::Result<()> {
         self.cancel.cancel();
@@ -131,6 +137,7 @@ pub struct IngestControlFixtureService {
     mempool_entries: Arc<Mutex<Vec<wallet::MempoolEntry>>>,
     mempool_transaction_error: Arc<Mutex<Option<Status>>>,
     reorg_window_exceeded: Arc<Mutex<Option<ops::ReorgWindowExceededDetail>>>,
+    upstream_not_ready: Arc<Mutex<Option<ops::UpstreamNotReadyDetail>>>,
 }
 
 impl IngestControlFixtureService {
@@ -145,6 +152,7 @@ impl IngestControlFixtureService {
             mempool_entries: Arc::new(Mutex::new(Vec::new())),
             mempool_transaction_error: Arc::new(Mutex::new(None)),
             reorg_window_exceeded: Arc::new(Mutex::new(None)),
+            upstream_not_ready: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -181,6 +189,12 @@ impl IngestControlFixtureService {
     /// or clears the halt with `None`.
     pub fn set_reorg_window_exceeded(&self, halt: Option<ops::ReorgWindowExceededDetail>) {
         *self.reorg_window_exceeded.lock() = halt;
+    }
+
+    /// Reports a canonical writer whose node is not ready for queries, or
+    /// clears the observation with `None`.
+    pub fn set_upstream_not_ready(&self, upstream_not_ready: Option<ops::UpstreamNotReadyDetail>) {
+        *self.upstream_not_ready.lock() = upstream_not_ready;
     }
 }
 
@@ -234,7 +248,7 @@ impl IngestControl for IngestControlFixtureService {
             network_name: encode_zinder_native_chain_name(self.network).to_owned(),
             phase: WriterPhase::FollowingTip.into(),
             gap_blocks: reorg_window_exceeded.is_none().then_some(0),
-            upstream_not_ready: None,
+            upstream_not_ready: self.upstream_not_ready.lock().clone(),
             reorg_window_exceeded,
         }))
     }

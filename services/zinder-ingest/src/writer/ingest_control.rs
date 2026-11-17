@@ -1194,7 +1194,7 @@ mod tests {
                 upstream_estimated_height: Some(visible_height.saturating_add(900)),
                 upstream_verification_progress: Some(0.4),
                 upstream_health: UpstreamHealth {
-                    source: "zebra_ready_endpoint",
+                    source: std::borrow::Cow::Borrowed("zebra_ready_endpoint"),
                     reason: std::borrow::Cow::Borrowed("syncing"),
                 },
             }),
@@ -1260,7 +1260,7 @@ mod tests {
                 upstream_estimated_height: Some(9_000),
                 upstream_verification_progress: Some(0.4),
                 upstream_health: UpstreamHealth {
-                    source: "zebra_ready_endpoint",
+                    source: std::borrow::Cow::Borrowed("zebra_ready_endpoint"),
                     reason: std::borrow::Cow::Borrowed("syncing"),
                 },
             }),

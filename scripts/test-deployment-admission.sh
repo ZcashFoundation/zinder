@@ -177,6 +177,7 @@ jq -e '
   and .services["zinder-ingest"].ulimits.nofile.hard == 65536
   and .services["zinder-explorer"].ulimits.nofile.soft == 65536
   and .services["zinder-explorer"].ulimits.nofile.hard == 65536
+  and .services["zinder-explorer"].depends_on["zinder-ingest"].condition == "service_started"
   and .services["zinder-explorer"].depends_on["zinder-query"].condition == "service_healthy"
   and .services["zinder-explorer"].healthcheck.test == [
     "CMD",

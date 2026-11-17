@@ -28,6 +28,8 @@ for function_name in \
   readiness_cause_is_terminal \
   readiness_cause_is_writer_halt \
   readiness_cause_is_projector_park \
+  readiness_cause_is_upstream_outage \
+  update_upstream_outage \
   query_unready_behind_projector_park \
   start_wallet_serving \
   require_projector_park_for_stopped_query \
@@ -63,12 +65,15 @@ recurrence_cumulative_unready_seconds_budget="$(
 recurrence_min_answered_episode_seconds="$(
   entrypoint_setting recurrence_min_answered_episode_seconds
 )"
+serving_unready_tolerance_seconds="$(entrypoint_setting serving_unready_tolerance_seconds)"
+upstream_outage_tolerance_seconds="$(entrypoint_setting upstream_outage_tolerance_seconds)"
 for shipped_setting in \
   "$ingest_config_paths" "$projector_config_paths" "$query_config_paths" \
   "$entrypoint_config_paths" \
   "$recurrence_clear_window_seconds" "$recurrence_episode_budget" \
   "$recurrence_cumulative_unready_seconds_budget" \
-  "$recurrence_min_answered_episode_seconds"; do
+  "$recurrence_min_answered_episode_seconds" \
+  "$serving_unready_tolerance_seconds" "$upstream_outage_tolerance_seconds"; do
   [ -n "$shipped_setting" ] || test_failure "entrypoint no longer sets a setting this test reads"
 done
 
@@ -79,6 +84,7 @@ poll_interval_seconds=15
 unready_report_interval_seconds=300
 probe_halted=0
 probe_parked=0
+probe_upstream_outage=0
 response_separator='
 '
 
@@ -122,6 +128,12 @@ syncing_body='{"ready":false,"cause":{"syncing":{"lag_blocks":12}}}'
 ready_body='{"ready":true,"cause":"ready"}'
 parked_body='{"ready":false,"cause":{"wallet_transition_limit_exceeded":{"required_bytes":541122672,"configured_bytes":536870912}},"current_height":4602673,"target_height":4602680}'
 lagging_body='{"ready":false,"cause":{"replica_lagging":{"lag_chain_epochs":5}},"current_height":4602673}'
+ingest_node_unavailable_body='{"status":"not_ready","phase":"following_tip","cause":{"node_unavailable":{"failure_class":"node_unreachable","last_reason":"connection refused","consecutive_failures":4,"outage_seconds":45}},"current_height":4602673}'
+ingest_upstream_not_ready_body='{"status":"not_ready","phase":"following_tip","cause":{"upstream_not_ready":{"upstream_committed_height":4602600,"upstream_health":{"source":"zebra_ready_endpoint","reason":"syncing"}}},"current_height":4602673}'
+# Query keeps admitting traffic through a node outage and lists the outage
+# under `degraded`, after the top-level cause and under its own key.
+degraded_ready_body='{"status":"ready","cause":"ready","current_height":4602673,"served_epoch_age_seconds":900,"degraded":[{"input":"node_source","dependency_cause":{"node_unavailable":{"failure_class":"node_unreachable","last_reason":"connection refused","consecutive_failures":4,"outage_seconds":45}}},{"input":"ingest_control","dependency_cause":{"upstream_not_ready":{"upstream_health":{"source":"zebra_ready_endpoint","reason":"syncing"}}}}]}'
+degraded_lagging_body='{"status":"not_ready","cause":{"replica_lagging":{"lag_chain_epochs":5}},"current_height":4602673,"degraded":[{"input":"node_source","dependency_cause":"starting"},{"input":"ingest_control","dependency_cause":"ingest_control_unavailable"}]}'
 
 readiness_cause_is_terminal schema_mismatch \
   || test_failure "schema_mismatch must stay terminal"
@@ -282,6 +294,81 @@ serve 503 "$syncing_body"
 if observe_plane_readiness zinder-ingest 127.0.0.1:9105; then
   test_failure "a syncing ingest plane must count as unready while the projector is parked"
 fi
+[ "$probe_upstream_outage" -eq 0 ] || test_failure "a syncing plane is not an upstream outage"
+
+# An ingest plane that reports its node unavailable or unsynchronized is
+# unready, and the probe names the upstream outage so the serving loop can
+# keep it out of the restart budgets.
+readiness_cause_is_upstream_outage node_unavailable \
+  || test_failure "node_unavailable must be an upstream outage"
+readiness_cause_is_upstream_outage upstream_not_ready \
+  || test_failure "upstream_not_ready must be an upstream outage"
+for other_cause in syncing replica_lagging storage_unavailable reorg_window_exceeded unreachable; do
+  if readiness_cause_is_upstream_outage "$other_cause"; then
+    test_failure "$other_cause is not an upstream outage"
+  fi
+done
+if readiness_cause_is_terminal node_unavailable || readiness_cause_is_terminal upstream_not_ready; then
+  test_failure "an upstream outage must not terminate the container"
+fi
+for outage_body in "$ingest_node_unavailable_body" "$ingest_upstream_not_ready_body"; do
+  serve 503 "$outage_body"
+  if observe_plane_readiness zinder-ingest 127.0.0.1:9105; then
+    test_failure "an ingest plane in an upstream outage must still count as unready"
+  fi
+  [ "$probe_upstream_outage" -eq 1 ] \
+    || test_failure "the probe did not name the upstream outage in: $outage_body"
+done
+serve 200 "$ready_body"
+observe_plane_readiness zinder-ingest 127.0.0.1:9105 \
+  || test_failure "a ready ingest plane must count as serving"
+[ "$probe_upstream_outage" -eq 0 ] || test_failure "a ready plane is not an upstream outage"
+
+# An upstream outage escalates only after its own tolerance, which is much
+# longer than the contiguous-unready tolerance, so a long node outage does not
+# restart the container into a full outage, while an ingest wedged in its own
+# node client is still restarted eventually.
+[ "$upstream_outage_tolerance_seconds" -gt "$serving_unready_tolerance_seconds" ] \
+  || test_failure "the upstream-outage tolerance must outlast the unready tolerance"
+outage_state="0 0"
+poll_upstream_outage() {
+  # shellcheck disable=SC2046,SC2086 # the counters are separate arguments
+  set -- $(update_upstream_outage "$1" "$2" ${outage_state%% *} "fixture report")
+  outage_state="$1 $2"
+}
+poll_upstream_outage 1 5000
+[ "$outage_state" = "5000 0" ] || test_failure "an upstream outage started as '$outage_state'"
+poll_upstream_outage 1 $((5000 + serving_unready_tolerance_seconds))
+[ "${outage_state##* }" -eq 0 ] \
+  || test_failure "an upstream outage escalated at the ordinary unready tolerance"
+poll_upstream_outage 1 $((5000 + upstream_outage_tolerance_seconds - 1))
+[ "${outage_state##* }" -eq 0 ] \
+  || test_failure "an upstream outage escalated before its tolerance"
+poll_upstream_outage 1 $((5000 + upstream_outage_tolerance_seconds))
+[ "${outage_state##* }" -eq 1 ] \
+  || test_failure "an upstream outage that outlasted its tolerance did not escalate"
+outage_state="0 0"
+poll_upstream_outage 1 7000
+poll_upstream_outage 0 7015
+[ "$outage_state" = "0 0" ] || test_failure "a cleared upstream outage left state '$outage_state'"
+poll_upstream_outage 1 $((7030 + upstream_outage_tolerance_seconds - 1))
+[ "$outage_state" = "$((7030 + upstream_outage_tolerance_seconds - 1)) 0" ] \
+  || test_failure "a new upstream outage did not restart its clock: '$outage_state'"
+
+# The `degraded` list follows the top-level cause and names each dependency
+# cause under its own key, so the probe parses the plane's own cause.
+serve 200 "$degraded_ready_body"
+probe_readiness 127.0.0.1:9106
+[ "$probe_cause" = "ready" ] \
+  || test_failure "probe parsed cause '$probe_cause' from a degraded ready plane"
+observe_plane_readiness zinder-query 127.0.0.1:9106 \
+  || test_failure "a degraded plane that admits traffic must count as serving"
+[ "$probe_upstream_outage" -eq 0 ] \
+  || test_failure "a degraded query plane is not an ingest upstream outage"
+serve 503 "$degraded_lagging_body"
+probe_readiness 127.0.0.1:9106
+[ "$probe_cause" = "replica_lagging" ] \
+  || test_failure "probe parsed cause '$probe_cause' from a lagging plane with degraded dependencies"
 
 # Recurrence counters as "<episode_count> <flap_unready_since_epoch>
 # <flap_episode_counted> <cumulative_unready_seconds> <flap_ready_since_epoch>".
@@ -553,5 +640,10 @@ if run_healthcheck 503 "$lagging_body" 0 "$syncing_body"; then
 fi
 run_healthcheck 200 "$ready_body" 1 "$parked_body" \
   || test_failure "the healthcheck must pass a parked projector that startup left without query"
+run_healthcheck 200 "$degraded_ready_body" \
+  || test_failure "the healthcheck must pass a query plane serving through a node outage"
+if run_healthcheck 503 "$degraded_lagging_body"; then
+  test_failure "the healthcheck must fail a lagging query plane whatever its dependencies report"
+fi
 
 printf 'wallet-serving entrypoint tests passed\n'

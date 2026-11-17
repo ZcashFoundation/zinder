@@ -292,7 +292,7 @@ variable.
 | `ZINDER_NODE__MAX_RESPONSE_BYTES` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.max_response_bytes` | Maximum JSON-RPC response body size (bytes) accepted from the node. Defaults to 67108864 (64 MiB). This is a ceiling on what Zinder accepts, not a request size: Zebra 7.1.0 and Zakura 1.8.6 refuse responses above 50 MiB by default, and ingest splits a source segment the node refuses. |
 | `ZINDER_NODE__BROADCAST_TIMEOUT_SECS` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.broadcast_timeout_secs` | Per-call timeout (seconds) applied only to `sendrawtransaction`. When unset, the global `request_timeout_secs` applies instead. Recommended: 7. |
 | `ZINDER_NODE__HEALTH__ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.addr` | URL of the upstream's HTTP `/ready` endpoint. When set, ingest, the wallet-serving readers, and `zinder-explorer` poll it as the primary upstream-sync signal; when unset, they fall back to `getblockchaininfo.verificationprogress`/`estimatedheight`. See [ADR-0015](../adrs/0015-phase-driven-ingest.md). |
-| `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.poll_interval_ms` | Cadence of the upstream-health probe in milliseconds. Defaults to 30000. Must be greater than zero. Query and compatibility use it to refresh serving readiness; `zinder-explorer` reuses the same cadence for its upstream-observation probe (the one that populates `ExplorerFreshness.chain_view.upstream_tip`). |
+| `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.poll_interval_ms` | Cadence of the upstream-health probe in milliseconds. Defaults to 30000. Must be greater than zero. Query and compatibility use it to refresh the node dependency their readiness reports; `zinder-explorer` reuses the same cadence for its upstream-observation probe (the one that populates `ExplorerFreshness.chain_view.upstream_tip`). |
 | `ZINDER_NODE__HEALTH__VERIFICATION_PROGRESS_FLOOR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.verification_progress_floor` | Lower bound on `getblockchaininfo.verificationprogress` below which the fallback path reports `upstream_not_ready`. Defaults to 0.999. Must be in `(0.0, 1.0)`. |
 | `ZINDER_NODE__HEALTH__ESTIMATED_GAP_FLOOR_BLOCKS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.estimated_gap_floor_blocks` | Block gap between `estimatedheight` and the local tip above which the fallback path reports `upstream_not_ready`. Defaults to 10. |
 | `ZINDER_OPS__LISTEN_ADDR` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer, zinder-compat-cipherscan | Optional | `ops.listen_addr` | Listen address for the operational HTTP endpoint (`/healthz`, `/readyz`, `/metrics`). Defaults to a per-service loopback address (`127.0.0.1:9105` ingest, `9110` projector, `9106` query, `9107` compat, `9069` explorer, `9108` cipherscan). Set to an empty string to disable the endpoint entirely. |
@@ -514,6 +514,19 @@ Health answers whether the process is alive. Readiness answers whether it can
 serve its contract now. Metrics and readiness causes name the owning subsystem:
 `canonical`, `wallet_projection`, `materialized_view`, `source`, `mempool`, or
 `serving_pair`.
+
+A readiness report names its dependencies with `ReadinessInput` labels:
+`node_source`, `ingest_control`, and `materialized_view_catchup`. A dependency
+that the process serves without, and whose cause does not admit traffic,
+appears in the report's `degraded` list as a `ReadinessDependency` with that
+`input` label and its cause. On `/readyz` the cause key of an entry is
+`dependency_cause`, and in the `zinder.v1.ops.ReadinessReport` message it is
+`cause` with an optional `detail`. A wallet-serving reader's report also
+carries `served_epoch_age_seconds`. The metrics that mirror these fields are
+`zinder_readiness_dependency_state{input, cause}` and
+`zinder_readiness_served_epoch_age_seconds`. [Service
+operations](service-operations.md#readiness-vocabulary) describes when each
+appears.
 
 Metric labels are bounded enumerations. Do not place addresses, transaction
 identifiers, paths, error messages, or other unbounded values in labels. Log

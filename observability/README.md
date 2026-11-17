@@ -206,6 +206,8 @@ The smoke should produce samples for:
 
 - `zinder_node_request_total`
 - `zinder_readiness_state`
+- `zinder_readiness_dependency_state`
+- `zinder_readiness_served_epoch_age_seconds`
 - `zinder_readiness_sync_lag_blocks`
 - `zinder_readiness_replica_lag_chain_epochs`
 - `zinder_ingest_canonical_live_appends_total`

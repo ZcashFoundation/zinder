@@ -55,6 +55,32 @@ pub struct ReadinessReport {
     pub materialized_view_identities: ::prost::alloc::vec::Vec<
         ::prost::alloc::string::String,
     >,
+    /// Dependencies the process keeps serving without whose latest cause does
+    /// not admit traffic, such as the node behind broadcast. Each one fails only
+    /// the requests that call it, so `cause` can still admit traffic. Empty when
+    /// every dependency is healthy or the process declares none.
+    #[prost(message, repeated, tag = "7")]
+    pub degraded: ::prost::alloc::vec::Vec<ReadinessDependency>,
+    /// Seconds since the canonical writer committed the chain epoch this reader
+    /// serves. Absent when the process serves no chain epoch. A reader keeps
+    /// serving its last chain view while its node or the writer stops
+    /// advancing, so this age shows how stale that view is.
+    #[prost(uint64, optional, tag = "8")]
+    pub served_epoch_age_seconds: ::core::option::Option<u64>,
+}
+/// Latest observation of one dependency a process keeps serving without.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadinessDependency {
+    /// Stable snake-case dependency label: `node_source`, `ingest_control`, or
+    /// `materialized_view_catchup`.
+    #[prost(string, tag = "1")]
+    pub input: ::prost::alloc::string::String,
+    /// Latest cause the dependency's owner reported.
+    #[prost(enumeration = "ReadinessCause", tag = "2")]
+    pub cause: i32,
+    /// Detail tied to `cause`, under the same rules as `ReadinessReport.detail`.
+    #[prost(message, optional, tag = "3")]
+    pub detail: ::core::option::Option<ReadinessCauseDetail>,
 }
 /// Operator-actionable detail tied to a parametric readiness cause. The
 /// active oneof variant must match the cause enum value or the report is

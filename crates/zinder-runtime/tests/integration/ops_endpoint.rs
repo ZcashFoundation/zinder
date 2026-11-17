@@ -5,8 +5,8 @@ use http_body_util::BodyExt;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use tokio::net::TcpListener;
 use zinder_runtime::{
-    OpsServer, OpsServerError, Readiness, ReadinessState, RuntimeService,
-    install_metrics_recorder_for_service, spawn_ops_endpoint,
+    ComposedReadiness, OpsServer, OpsServerError, Readiness, ReadinessCause, ReadinessInput,
+    ReadinessState, RuntimeService, install_metrics_recorder_for_service, spawn_ops_endpoint,
 };
 
 async fn get_json(listen_addr: SocketAddr, path: &str) -> Result<(u16, serde_json::Value)> {
@@ -133,6 +133,140 @@ async fn ops_endpoint_serves_health_readiness_and_metrics() -> Result<()> {
 
     server_handle.shutdown().await?;
 
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one fixture covers the degraded /readyz body, its dependency metrics, and recovery"
+)]
+async fn readyz_admits_traffic_and_lists_degraded_dependencies() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listen_addr: SocketAddr = listener.local_addr()?;
+    drop(listener);
+
+    install_metrics_recorder_for_service(RuntimeService::Query, "0.0.0", "zcash-regtest")?;
+    let readiness = Readiness::default();
+    let composed = ComposedReadiness::with_dependency_inputs(
+        readiness.clone(),
+        &[ReadinessInput::NodeSource, ReadinessInput::IngestControl],
+    );
+    composed.publish_admission(ReadinessState::ready(Some(7)));
+    composed.publish_input(ReadinessInput::IngestControl, ReadinessCause::Ready);
+    composed.publish_input(
+        ReadinessInput::NodeSource,
+        ReadinessCause::NodeUnavailable(zinder_runtime::NodeUnavailableDetail::first_iteration(
+            "node_unreachable",
+            "synthetic test outage",
+        )),
+    );
+    readiness.set_served_epoch_committed_at(zinder_core::UnixTimestampMillis::new(
+        zinder_core::UnixTimestampMillis::now()
+            .value()
+            .saturating_sub(120_000),
+    ));
+    let server_handle = spawn_ops_endpoint(
+        listen_addr,
+        OpsServer {
+            service_name: "zinder-test",
+            service_version: "0.0.0",
+            network_name: "zcash-regtest",
+            advertised_capabilities: Arc::from([]),
+        },
+        readiness.clone(),
+    )
+    .await?;
+
+    let (status, readyz_value) = get_text(listen_addr, "/readyz").await?;
+    assert_eq!(status, 200);
+    let cause_offset = readyz_value
+        .find("\"cause\":")
+        .ok_or_else(|| eyre::eyre!("/readyz omitted its cause: {readyz_value}"))?;
+    let degraded_offset = readyz_value
+        .find("\"degraded\":")
+        .ok_or_else(|| eyre::eyre!("/readyz omitted degraded: {readyz_value}"))?;
+    assert!(
+        cause_offset < degraded_offset,
+        "the runtime's cause must precede its degraded dependencies: {readyz_value}"
+    );
+    assert_eq!(
+        readyz_value.matches("\"cause\":").count(),
+        1,
+        "{readyz_value}"
+    );
+    let readyz_value: serde_json::Value = serde_json::from_str(&readyz_value)?;
+    assert_eq!(readyz_value["status"], "ready");
+    assert_eq!(readyz_value["cause"], "ready");
+    assert!(
+        readyz_value["served_epoch_age_seconds"]
+            .as_u64()
+            .is_some_and(|age| (120..=122).contains(&age)),
+        "{readyz_value}"
+    );
+    assert_eq!(
+        readyz_value["degraded"],
+        serde_json::json!([{
+            "input": "node_source",
+            "dependency_cause": {"node_unavailable": {
+                "failure_class": "node_unreachable",
+                "last_reason": "synthetic test outage",
+                "consecutive_failures": 1,
+                "outage_seconds": 0,
+            }},
+        }])
+    );
+
+    let (_, metrics_text) = get_text(listen_addr, "/metrics").await?;
+    let dependency_sample = |input: &str, cause: &str| {
+        metrics_text
+            .lines()
+            .find(|line| {
+                line.starts_with("zinder_readiness_dependency_state{")
+                    && line.contains(&format!("input=\"{input}\""))
+                    && line.contains(&format!("cause=\"{cause}\""))
+            })
+            .and_then(|line| line.rsplit(' ').next())
+            .map(str::to_owned)
+    };
+    assert_eq!(
+        dependency_sample("node_source", "node_unavailable").as_deref(),
+        Some("1"),
+        "{metrics_text}"
+    );
+    assert_eq!(
+        dependency_sample("node_source", "ready").as_deref(),
+        Some("0"),
+        "{metrics_text}"
+    );
+    assert_eq!(
+        dependency_sample("ingest_control", "ready").as_deref(),
+        Some("1"),
+        "{metrics_text}"
+    );
+    assert!(
+        metrics_text
+            .lines()
+            .any(|line| line.starts_with("zinder_readiness_served_epoch_age_seconds{")),
+        "{metrics_text}"
+    );
+
+    composed.publish_input(ReadinessInput::NodeSource, ReadinessCause::Ready);
+    let (status, readyz_value) = get_json(listen_addr, "/readyz").await?;
+    assert_eq!(status, 200);
+    assert!(readyz_value.get("degraded").is_none(), "{readyz_value}");
+    let (_, metrics_text) = get_text(listen_addr, "/metrics").await?;
+    assert!(
+        metrics_text.lines().any(|line| {
+            line.starts_with("zinder_readiness_dependency_state{")
+                && line.contains("input=\"node_source\"")
+                && line.contains("cause=\"ready\"")
+                && line.ends_with(" 1")
+        }),
+        "{metrics_text}"
+    );
+
+    server_handle.shutdown().await?;
     Ok(())
 }
 

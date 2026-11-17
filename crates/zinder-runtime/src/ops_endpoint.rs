@@ -307,6 +307,12 @@ struct ReadinessResponseBody {
     target_height: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     materialized_view_identities: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    served_epoch_age_seconds: Option<u64>,
+    // Serialized after `cause`, so a shell parser that takes the first
+    // `"cause":` key of the body reads the runtime's own cause.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    degraded: Vec<crate::ReadinessDependency>,
 }
 
 fn readyz_handler(readiness: &Readiness) -> (StatusCode, Json<ReadinessResponseBody>) {
@@ -327,6 +333,8 @@ fn readyz_handler(readiness: &Readiness) -> (StatusCode, Json<ReadinessResponseB
         current_height: report.current_height,
         target_height: report.target_height,
         materialized_view_identities: report.materialized_view_identities,
+        served_epoch_age_seconds: report.served_epoch_age_seconds,
+        degraded: report.degraded,
     };
 
     (status_code, Json(body))
@@ -365,6 +373,28 @@ fn record_readiness_metrics(state: &MetricsState) {
             "cause" => *cause
         )
         .set(if *cause == active_cause { 1.0 } else { 0.0 });
+    }
+
+    for dependency in state.readiness.dependencies() {
+        let dependency_cause = dependency.cause.metric_label();
+        for cause in crate::ReadinessCause::ALL_METRIC_LABELS {
+            metrics::gauge!(
+                "zinder_readiness_dependency_state",
+                "service" => state.service_name,
+                "network" => state.network_name,
+                "input" => dependency.input.wire_label(),
+                "cause" => *cause
+            )
+            .set(if *cause == dependency_cause { 1.0 } else { 0.0 });
+        }
+    }
+    if let Some(served_epoch_age_seconds) = report.served_epoch_age_seconds {
+        metrics::gauge!(
+            "zinder_readiness_served_epoch_age_seconds",
+            "service" => state.service_name,
+            "network" => state.network_name
+        )
+        .set(u64_to_f64(served_epoch_age_seconds));
     }
 
     let active_failure_class = report.cause.node_failure_class_label();

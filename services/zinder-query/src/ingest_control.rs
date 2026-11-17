@@ -20,7 +20,7 @@ use zinder_proto::{
         ServerInfoRequest, WriterStatusRequest, ingest_control_client::IngestControlClient,
     },
     v1::{
-        ops::{ErrorReason, ReorgWindowExceededDetail},
+        ops::{ErrorReason, ReorgWindowExceededDetail, UpstreamNotReadyDetail},
         wallet,
     },
     wire::chain_epoch_from_message,
@@ -193,8 +193,10 @@ fn validate_writer_status(
             writer_status.network_name == expected_network && epoch.network_name == expected_network
         })
         .ok_or(IngestControlHealthError::WriterStatusInvalid)?;
-    if writer_status.upstream_not_ready.is_some() {
-        return Err(IngestControlHealthError::WriterUpstreamNotReady);
+    if let Some(upstream_not_ready) = &writer_status.upstream_not_ready {
+        return Err(IngestControlHealthError::WriterUpstreamNotReady(
+            upstream_not_ready.clone(),
+        ));
     }
     let writer_epoch = chain_epoch_from_message(writer_epoch_message.clone())
         .map_err(|_| IngestControlHealthError::WriterStatusInvalid)?;
@@ -262,7 +264,7 @@ pub(crate) enum IngestControlHealthError {
     #[error("ingest-control WriterStatus returned incoherent network or chain evidence")]
     WriterStatusInvalid,
     #[error("ingest-control WriterStatus reports that its upstream is not ready")]
-    WriterUpstreamNotReady,
+    WriterUpstreamNotReady(UpstreamNotReadyDetail),
     #[error(
         "canonical writer is parked: a {}-block replacement exceeds its {}-block reorg window",
         .0.depth,
@@ -280,15 +282,18 @@ pub(crate) enum IngestControlHealthError {
 }
 
 impl IngestControlHealthError {
-    /// Returns the readiness cause this health failure projects onto the
-    /// wallet-serving gate. Only a parked writer's halt is a typed cause;
-    /// every other failure is a recoverable control-channel outage.
+    /// Returns the cause this health failure publishes as the ingest-control
+    /// dependency. A parked writer's halt refuses wallet traffic, and a
+    /// writer whose node is not ready relays that observation; every other
+    /// failure is a recoverable control-channel outage.
     pub(crate) fn readiness_cause(&self) -> ReadinessCause {
         match self {
             Self::WriterReorgWindowExceeded(halt) => ReadinessCause::from(*halt),
+            Self::WriterUpstreamNotReady(detail) => ReadinessCause::UpstreamNotReady(
+                zinder_runtime::UpstreamNotReadyDetail::from(detail),
+            ),
             Self::WriterStatusRpc(_)
             | Self::WriterStatusInvalid
-            | Self::WriterUpstreamNotReady
             | Self::MempoolSnapshotRpc(_)
             | Self::MempoolSnapshotInvalid
             | Self::MempoolSnapshotOlderThanWriter
@@ -300,7 +305,7 @@ impl IngestControlHealthError {
         match self {
             Self::WriterStatusRpc(_) => "writer_status_rpc",
             Self::WriterStatusInvalid => "writer_status_invalid",
-            Self::WriterUpstreamNotReady => "writer_upstream_not_ready",
+            Self::WriterUpstreamNotReady(_) => "writer_upstream_not_ready",
             Self::WriterReorgWindowExceeded(_) => "writer_reorg_window_exceeded",
             Self::MempoolSnapshotRpc(_) => "mempool_snapshot_rpc",
             Self::MempoolSnapshotInvalid => "mempool_snapshot_invalid",
@@ -437,14 +442,29 @@ mod tests {
     }
 
     #[test]
-    fn health_rejects_explicit_upstream_not_ready_evidence() {
+    fn health_relays_the_writer_upstream_not_ready_observation()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut writer = writer_status(1, 1, "01");
-        writer.upstream_not_ready = Some(UpstreamNotReadyDetail::default());
-        let outcome = validate_health_observation(&writer, &snapshot(1, 1, "01"), NETWORK);
-        assert!(matches!(
-            outcome,
-            Err(IngestControlHealthError::WriterUpstreamNotReady)
-        ));
+        writer.upstream_not_ready = Some(UpstreamNotReadyDetail {
+            upstream_committed_height: Some(1),
+            upstream_estimated_height: Some(9),
+            upstream_verification_progress: Some(0.5),
+            upstream_health_source: "zebra_ready_endpoint".to_owned(),
+            upstream_health_reason: "syncing".to_owned(),
+        });
+        let error = validate_health_observation(&writer, &snapshot(1, 1, "01"), NETWORK)
+            .err()
+            .ok_or("a writer whose node is not ready must fail health")?;
+        assert_eq!(error.class(), "writer_upstream_not_ready");
+        let zinder_runtime::ReadinessCause::UpstreamNotReady(detail) = error.readiness_cause()
+        else {
+            return Err(format!("unexpected cause {:?}", error.readiness_cause()).into());
+        };
+        assert_eq!(detail.upstream_committed_height, Some(1));
+        assert_eq!(detail.upstream_estimated_height, Some(9));
+        assert_eq!(detail.upstream_health.source, "zebra_ready_endpoint");
+        assert_eq!(detail.upstream_health.reason, "syncing");
+        Ok(())
     }
 
     #[test]
@@ -476,7 +496,7 @@ mod tests {
             Err(IngestControlHealthError::WriterStatusInvalid)
         ));
         assert!(matches!(
-            IngestControlHealthError::WriterUpstreamNotReady.readiness_cause(),
+            IngestControlHealthError::WriterStatusInvalid.readiness_cause(),
             zinder_runtime::ReadinessCause::IngestControlUnavailable
         ));
         Ok(())
