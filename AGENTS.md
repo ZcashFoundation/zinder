@@ -20,7 +20,7 @@ Project 7 uses these delivery fields:
 - Track: `Wallet adoption`, `Single-host production`, `Query scalability`, `PostgreSQL topology`, `Explorer`, `Release engineering`.
 - Milestones: M0 Consumer adoption, M1 v0.6.x reliability, M2 Operator-ready RocksDB, M3 Horizontal topology, and M4 Explorer. A milestone is an exit gate, not merely a topic label.
 
-Wallet compatibility evidence and production-topology qualification are separate claims. The supported candidate remains `rocksdb-single-host` until release-specific capacity, recovery, replacement, and operator evidence admit another topology. PostgreSQL tracer or benchmark work remains diagnostic and non-production until the measured single-host evidence and the explicit horizontal-admission decision close.
+Wallet compatibility evidence and production-topology qualification are separate claims. The supported candidate remains `rocksdb-single-host` until release-specific capacity, recovery, replacement, and operator evidence admit another topology. ADR-0035 records `postgres-horizontal` as the decided topology for hosted fleets. It is not implemented, certified, or advertised, and PostgreSQL tracer or benchmark work remains diagnostic and non-production until the ADR-0035 benchmark gate passes and a slice ships.
 
 Project 7's native workflows are enabled for item addition, sub-issue addition, issue closure, pull-request linkage, and pull-request merge. Preserve those workflows. After any issue, pull request, milestone, label, dependency, or Project mutation, verify the native hierarchy, direct dependencies, labels, milestone, Project Status/Priority/Track, and mirrored `Blocked by` value.
 
