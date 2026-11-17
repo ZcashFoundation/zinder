@@ -2,6 +2,7 @@
 
 use std::{
     collections::BTreeMap,
+    fmt,
     future::Future,
     num::{NonZeroU32, NonZeroU64},
     sync::Arc,
@@ -121,6 +122,20 @@ where
         else {
             return Err(CanonicalFollowError::SourceRecoveryRejected);
         };
+        if source_outage
+            .as_ref()
+            .is_none_or(|(_, previous)| previous.failure_class != failure_class.label())
+        {
+            tracing::warn!(
+                target: "zinder::ingest",
+                event = "canonical_source_recovery",
+                failure_class = failure_class.label(),
+                reason = %last_reason,
+                visible_height = visible_height.value(),
+                backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+                "canonical follower kept its fence and will observe the node again"
+            );
+        }
         let detail = source_outage.as_ref().map_or_else(
             || detail_for_new_outage(failure_class, last_reason.clone()),
             |(started_at, previous)| {
@@ -141,7 +156,11 @@ where
                 detail,
                 Some(visible_height.value()),
             ));
-        metrics::counter!("zinder_ingest_canonical_source_recoveries_total").increment(1);
+        metrics::counter!(
+            "zinder_ingest_canonical_source_recoveries_total",
+            "failure_class" => failure_class.label()
+        )
+        .increment(1);
         Ok(tokio::select! {
             () = self.cancel.cancelled() => true,
             () = tokio::time::sleep(backoff) => false,
@@ -273,6 +292,28 @@ impl CanonicalReorgWindowExceeded {
     }
 }
 
+/// Part of a source checkpoint that differs from the locally derived one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum CheckpointComponent {
+    /// Block height and hash.
+    BlockIdentity,
+    /// Block time.
+    BlockTime,
+    /// Sapling, Orchard, and Ironwood commitment-tree frontiers.
+    CommitmentTreeFrontiers,
+}
+
+impl fmt::Display for CheckpointComponent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BlockIdentity => formatter.write_str("block identity"),
+            Self::BlockTime => formatter.write_str("block time"),
+            Self::CommitmentTreeFrontiers => formatter.write_str("commitment-tree frontiers"),
+        }
+    }
+}
+
 /// Failure while following the clean canonical store.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -305,9 +346,8 @@ pub enum CanonicalFollowError {
     SourceCheckpointMismatch {
         /// Height whose tree state diverged.
         height: BlockHeight,
-        /// First checkpoint part that differed: `block identity`, `block
-        /// time`, or `commitment-tree frontiers`.
-        component: &'static str,
+        /// First checkpoint part that differed.
+        component: CheckpointComponent,
     },
     /// Size-only compact metadata diverged from the typed frontier accumulator.
     #[error(
@@ -1284,7 +1324,7 @@ fn prepare_live_block(
 fn differing_checkpoint_component(
     derived: &CommitmentTreeCheckpoint,
     source: &CommitmentTreeCheckpoint,
-) -> Option<&'static str> {
+) -> Option<CheckpointComponent> {
     // Naming every field keeps this as strict as checkpoint equality when the
     // checkpoint gains a field.
     let CommitmentTreeCheckpoint {
@@ -1293,11 +1333,11 @@ fn differing_checkpoint_component(
         frontiers,
     } = derived;
     if *block_id != source.block_id {
-        Some("block identity")
+        Some(CheckpointComponent::BlockIdentity)
     } else if *block_time_seconds != source.block_time_seconds {
-        Some("block time")
+        Some(CheckpointComponent::BlockTime)
     } else if *frontiers != source.frontiers {
-        Some("commitment-tree frontiers")
+        Some(CheckpointComponent::CommitmentTreeFrontiers)
     } else {
         None
     }
@@ -1548,7 +1588,7 @@ mod tests {
     };
 
     use super::{
-        ReplacementMemory, await_follow_preparation_or_mempool_change,
+        CheckpointComponent, ReplacementMemory, await_follow_preparation_or_mempool_change,
         differing_checkpoint_component, gate_canonical_readiness_on_mempool_hydration,
         live_subtree_root_ranges, next_settled_height, publish_follow_readiness,
         wait_for_mempool_hydration_change, withdraw_follow_readiness_for_mempool_hydration,
@@ -1929,11 +1969,11 @@ mod tests {
         assert_eq!(differing_checkpoint_component(&derived, &derived), None);
         assert_eq!(
             differing_checkpoint_component(&derived, &checkpoint(block_id(3, 2), 11)),
-            Some("block identity")
+            Some(CheckpointComponent::BlockIdentity)
         );
         assert_eq!(
             differing_checkpoint_component(&derived, &checkpoint(block_id(3, 1), 11)),
-            Some("block time")
+            Some(CheckpointComponent::BlockTime)
         );
     }
 

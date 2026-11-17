@@ -151,7 +151,10 @@ the block that ingest just read by its hash, for each append and for each block
 of a replacement. When that block has left the node's best chain, the request
 fails as a changed upstream view. Readiness reports `node_unavailable` with
 class `upstream_view_changed`, committed state and the fence are kept, and the
-next iteration observes the node again. A tree state for the same block whose
+next iteration observes the node again. The writer logs a
+`canonical_source_recovery` warning when an outage starts or changes class, and
+counts every retry in `zinder_ingest_canonical_source_recoveries_total`. A tree
+state for the same block whose
 time or frontiers differ from the derived result is a contradiction, not a
 changed view. It stops the writer with `SourceCheckpointMismatch`, which names
 the part that differed.

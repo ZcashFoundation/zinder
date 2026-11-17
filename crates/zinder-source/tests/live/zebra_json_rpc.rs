@@ -5,13 +5,13 @@
 
 use eyre::{Result, eyre};
 use zinder_core::{
-    BlockHeight, ConsensusBranchId, Network, RawTransactionBytes, ShieldedProtocol,
-    SubtreeRootIndex, TransactionBroadcastOutcome, TransactionId,
+    BlockHash, BlockHeight, BlockId, ConsensusBranchId, Network, RawTransactionBytes,
+    ShieldedProtocol, SubtreeRootIndex, TransactionBroadcastOutcome, TransactionId,
 };
 use zinder_source::{
     JsonRpcMempoolSource, JsonRpcMempoolSourceOptions, MempoolSource, MempoolSourceBackend,
-    NodeCapability, NodeSource, TransactionBroadcaster, UpstreamTransactionLookup,
-    ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
+    NodeCapability, NodeSource, SourceError, SourceFailureClass, TransactionBroadcaster,
+    UpstreamTransactionLookup, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
 };
 use zinder_testkit::live::{init, require_live, require_live_for, require_live_mainnet};
 
@@ -49,6 +49,48 @@ async fn fetch_chain_checkpoint_at_tip_reflects_supported_tree_sizes() -> Result
         expected_sizes,
         "(Sapling, Orchard, Ironwood) tree sizes at tip {}",
         tip.value()
+    );
+    Ok(())
+}
+
+/// A tree-state read keyed by a block's hash matches the height-keyed read.
+///
+/// The node refuses a hash outside its best chain with the refusal that ingest
+/// treats as a changed view.
+#[tokio::test]
+#[ignore = "live test; see CLAUDE.md §Live Node Tests"]
+async fn fetch_chain_checkpoint_for_block_answers_by_hash_and_refuses_an_unknown_block()
+-> Result<()> {
+    let _guard = init();
+    let Some(env) = require_live()? else {
+        return Ok(());
+    };
+    let source = zebra_source(&env)?;
+    let activations = source.fetch_network_upgrade_activations().await?;
+    let tip = NodeSource::tip_id(&source).await?;
+
+    let by_hash = source
+        .fetch_chain_checkpoint_for_block(tip, &activations)
+        .await?;
+    let by_height = source
+        .fetch_chain_checkpoint(tip.height, &activations)
+        .await?;
+
+    assert_eq!(by_hash.block_id, tip);
+    assert_eq!(by_hash, by_height);
+    let unknown_block = BlockId::new(tip.height, BlockHash::from_bytes([1; 32]));
+    let refusal = source
+        .fetch_chain_checkpoint_for_block(unknown_block, &activations)
+        .await
+        .err()
+        .ok_or_else(|| eyre!("an unknown block hash must have no tree state"))?;
+    assert!(
+        matches!(refusal, SourceError::BlockUnavailable { .. }),
+        "{refusal}"
+    );
+    assert_eq!(
+        refusal.upstream_classification(),
+        SourceFailureClass::UpstreamViewChanged
     );
     Ok(())
 }

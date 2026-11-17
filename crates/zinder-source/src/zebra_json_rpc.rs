@@ -287,7 +287,12 @@ impl ZebraJsonRpcSource {
             .call_typed(
                 "z_gettreestate",
                 positional_params([Value::from(request_key)])?,
-                |error| tree_state_call_error(height, error),
+                |error| match block_hash {
+                    Some(block_hash) => {
+                        block_tree_state_call_error(BlockId::new(height, block_hash), error)
+                    }
+                    None => tree_state_call_error(height, error),
+                },
             )
             .await?;
         if tree_state.height != height.value() {
@@ -1413,8 +1418,11 @@ const FAST_SYNCED_TREE_STATE_REFUSAL: &str = "is unavailable: this node was fast
 /// sync passes the last checkpoint.
 const FAST_SYNCED_SUBTREE_REFUSAL: &str = "continuing synchronization will not restore it";
 
-/// Maps a call error from a height-keyed read that needs per-height
-/// commitment trees.
+/// Zebra's and Zakura's refusal of a block that is not on their best chain.
+const BLOCK_OUTSIDE_BEST_CHAIN_REFUSAL: &str = "not in the main chain";
+
+/// Maps a call error from a read that needs per-height commitment trees,
+/// keyed by height or by block hash.
 fn tree_state_call_error(height: BlockHeight, error: JsonRpcCallError) -> SourceError {
     if error.message.contains(FAST_SYNCED_TREE_STATE_REFUSAL) {
         SourceError::HistoricalTreeStateUnavailable {
@@ -1426,6 +1434,32 @@ fn tree_state_call_error(height: BlockHeight, error: JsonRpcCallError) -> Source
             height,
             reason: error.message,
         }
+    }
+}
+
+/// Maps a call error from a `z_gettreestate` read keyed by the hash of a block
+/// the node served.
+///
+/// Only a block that left the best chain, or a fast-synced node's permanent
+/// refusal, is an expected answer. Any other refusal of that hash breaks the
+/// node contract, so it is not reported as a changed view.
+fn block_tree_state_call_error(block_id: BlockId, error: JsonRpcCallError) -> SourceError {
+    if error.message.contains(BLOCK_OUTSIDE_BEST_CHAIN_REFUSAL)
+        || error.message.contains(FAST_SYNCED_TREE_STATE_REFUSAL)
+    {
+        return tree_state_call_error(block_id.height, error);
+    }
+    tracing::warn!(
+        target: "zinder::source",
+        event = "tree_state_block_hash_refused",
+        height = block_id.height.value(),
+        block_hash = ?block_id.hash,
+        code = ?error.code,
+        reason = %error.message,
+        "z_gettreestate refused the hash of a block the node served"
+    );
+    SourceError::SourceProtocolMismatch {
+        reason: "z_gettreestate refused the hash of a block the node served",
     }
 }
 

@@ -71,7 +71,8 @@ pub use writer::control::{
 };
 pub use writer::follow::{
     CanonicalFollowConfig, CanonicalFollowError, CanonicalFollower, CanonicalReorgWindowExceeded,
-    DEFAULT_MAX_REPLACEMENT_BYTES, follow_canonical_tip, follow_canonical_tip_with_control,
+    CheckpointComponent, DEFAULT_MAX_REPLACEMENT_BYTES, follow_canonical_tip,
+    follow_canonical_tip_with_control,
 };
 pub use writer::ingest_control::{
     CanonicalIngestControlGrpcAdapter,

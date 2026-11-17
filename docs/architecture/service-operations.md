@@ -427,13 +427,21 @@ build Git commit, and network. Important runtime metrics include:
 - `zinder_ingest_canonical_live_appends_total`
 - `zinder_ingest_canonical_live_replacements_total`
 - `zinder_ingest_canonical_live_commit_seconds`
+- `zinder_ingest_canonical_source_recoveries_total{failure_class}`
 - source fetch queue, reservation, response-size, and reassembly gauges
 - construction watermark and persistence measurements
 - `zinder_ingest_canonical_historical_prevout_reads_total`
 - `zinder_ingest_canonical_cross_block_wallet_reads_total`
 
-The last two counters are expected to remain zero and protect the canonical
-block-local boundary.
+`zinder_ingest_canonical_source_recoveries_total` counts follower iterations
+that failed on a source error, kept the fence, and retried after a backoff. Its
+`failure_class` label uses the readiness class names, such as
+`upstream_view_changed` or `protocol_mismatch`. A short outage can end before a
+readiness probe sees it, so this counter and the `canonical_source_recovery`
+warning are the lasting record.
+
+The last two counters in the list are expected to remain zero and protect the
+canonical block-local boundary.
 
 ### Explorer view replay
 

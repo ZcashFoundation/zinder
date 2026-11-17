@@ -12,7 +12,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use parking_lot::Mutex;
 use tempfile::tempdir;
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -25,8 +25,8 @@ use zinder_core::{
 };
 use zinder_ingest::{
     CanonicalConstructionConfig, CanonicalControlCommand, CanonicalFollowConfig, CanonicalFollower,
-    RawBlobPolicy, follow_canonical_tip, follow_canonical_tip_with_control, load_fresh_canonical,
-    prepare_canonical_block,
+    CheckpointComponent, RawBlobPolicy, follow_canonical_tip, follow_canonical_tip_with_control,
+    load_fresh_canonical, prepare_canonical_block,
 };
 use zinder_runtime::{ComposedReadiness, NodeUnavailableDetail, Readiness, ReadinessCause};
 use zinder_source::{
@@ -262,6 +262,71 @@ impl NodeSource for RecordingParseableSource {
         Err(SourceError::NodeCapabilityMissing {
             capability: NodeCapability::SubtreeRoots,
         })
+    }
+}
+
+/// Answers a block-bound tree-state read the way Zebra and Zakura do.
+///
+/// The read is keyed by the block's hash, so a block that left the best chain
+/// is refused rather than answered with the block that replaced it.
+#[derive(Clone)]
+struct HashKeyedTreeStateSource(RecordingParseableSource);
+
+#[async_trait]
+impl NodeSource for HashKeyedTreeStateSource {
+    fn capabilities(&self) -> NodeCapabilities {
+        self.0.capabilities()
+    }
+
+    async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+        self.0.fetch_block_at(height).await
+    }
+
+    async fn fetch_chain_segment(
+        &self,
+        limits: SourceChainSegmentLimits,
+    ) -> Result<SourceChainSegment, SourceError> {
+        self.0.fetch_chain_segment(limits).await
+    }
+
+    async fn fetch_chain_checkpoint(
+        &self,
+        height: BlockHeight,
+        network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> Result<CommitmentTreeCheckpoint, SourceError> {
+        self.0
+            .fetch_chain_checkpoint(height, network_upgrade_activations)
+            .await
+    }
+
+    async fn fetch_chain_checkpoint_for_block(
+        &self,
+        block_id: BlockId,
+        network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> Result<CommitmentTreeCheckpoint, SourceError> {
+        let checkpoint = self
+            .0
+            .fetch_chain_checkpoint(block_id.height, network_upgrade_activations)
+            .await?;
+        if checkpoint.block_id == block_id {
+            Ok(checkpoint)
+        } else {
+            Err(SourceError::BlockUnavailable {
+                height: block_id.height,
+                reason: "the requested block is not in the main chain".to_owned(),
+            })
+        }
+    }
+
+    async fn tip_id(&self) -> Result<BlockId, SourceError> {
+        self.0.tip_id().await
+    }
+
+    async fn fetch_subtree_root_range(
+        &self,
+        range: SubtreeRootRange,
+    ) -> Result<SourceSubtreeRoots, SourceError> {
+        self.0.fetch_subtree_root_range(range).await
     }
 }
 
@@ -1445,13 +1510,13 @@ async fn follow_fork_with_replacement_budget(
     Ok(error)
 }
 
-fn follower_to_target<'a>(
-    source: &'a RecordingParseableSource,
+fn follower_to_target<'a, Source: NodeSource>(
+    source: &'a Source,
     activations: &Arc<NetworkUpgradeActivations>,
     target_height: BlockHeight,
     readiness: &'a ComposedReadiness,
     cancel: &'a CancellationToken,
-) -> CanonicalFollower<'a, RecordingParseableSource> {
+) -> CanonicalFollower<'a, Source> {
     CanonicalFollower::new(
         source,
         Arc::clone(activations),
@@ -1687,6 +1752,53 @@ async fn canonical_follower_reports_source_outage_and_resumes_after_recovery()
 #[tokio::test]
 async fn best_chain_switch_between_block_and_tree_state_reads_appends_the_new_block()
 -> Result<(), Box<dyn std::error::Error>> {
+    let switch = switch_best_chain_before_tree_state_read().await?;
+    let source = switch.source.clone();
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let recorded_metrics = recorder.handle();
+    let _local_recorder = metrics::set_default_local_recorder(&recorder);
+    append_sibling_after_one_recovery(
+        switch,
+        &source,
+        "tree-state hash disagrees with the fetched block hash",
+        &recorded_metrics,
+    )
+    .await
+}
+
+/// The same switch against a node that answers a tree-state read by block
+/// hash, as Zebra and Zakura do, and refuses the block that left its best
+/// chain.
+#[tokio::test]
+async fn hash_keyed_tree_state_refusal_after_a_best_chain_switch_appends_the_new_block()
+-> Result<(), Box<dyn std::error::Error>> {
+    let switch = switch_best_chain_before_tree_state_read().await?;
+    let source = HashKeyedTreeStateSource(switch.source.clone());
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let recorded_metrics = recorder.handle();
+    let _local_recorder = metrics::set_default_local_recorder(&recorder);
+    append_sibling_after_one_recovery(
+        switch,
+        &source,
+        "the requested block is not in the main chain",
+        &recorded_metrics,
+    )
+    .await
+}
+
+/// A store published through height 2 whose source switches its best chain to
+/// a sibling at height 3 after serving the original block 3 and before
+/// serving that block's tree state.
+struct BestChainSwitchBeforeTreeState {
+    source: RecordingParseableSource,
+    store: zinder_store::RocksDbCanonicalStore,
+    activations: Arc<NetworkUpgradeActivations>,
+    sibling_tip: BlockId,
+    _temporary: tempfile::TempDir,
+}
+
+async fn switch_best_chain_before_tree_state_read()
+-> Result<BestChainSwitchBeforeTreeState, Box<dyn std::error::Error>> {
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let original = parseable_multi_block_chain()?;
     let original_checkpoints = checkpoints_for_parseable_chain(&original, &activations)?;
@@ -1711,8 +1823,8 @@ async fn best_chain_switch_between_block_and_tree_state_reads_appends_the_new_bl
     .await?;
     source.replace_chain(original.clone(), original_checkpoints, BlockHeight::new(3));
     let sibling = forked_parseable_chain(&original, 3, 3, 31)?;
-    let sibling_three = block_id(&sibling, 3)?;
-    assert_ne!(sibling_three, block_id(&original, 3)?);
+    let sibling_tip = block_id(&sibling, 3)?;
+    assert_ne!(sibling_tip, block_id(&original, 3)?);
     source.switch_chain_before_checkpoint(PendingChainSwitch {
         height: BlockHeight::new(3),
         checkpoints: checkpoints_for_parseable_chain(&sibling, &activations)?,
@@ -1720,33 +1832,53 @@ async fn best_chain_switch_between_block_and_tree_state_reads_appends_the_new_bl
         tip_height: BlockHeight::new(3),
     });
     source.clear_calls();
+    Ok(BestChainSwitchBeforeTreeState {
+        source,
+        store,
+        activations,
+        sibling_tip,
+        _temporary: temporary,
+    })
+}
 
+/// Follows `switch` to height 3 through `follower_source` and asserts one
+/// `upstream_view_changed` recovery naming `expected_reason`, a second
+/// observation of the node, and the sibling appended.
+///
+/// The caller installs the thread-local recorder behind `recorded_metrics`.
+async fn append_sibling_after_one_recovery<Source: NodeSource>(
+    switch: BestChainSwitchBeforeTreeState,
+    follower_source: &Source,
+    expected_reason: &str,
+    recorded_metrics: &PrometheusHandle,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let BestChainSwitchBeforeTreeState {
+        source,
+        store,
+        activations,
+        sibling_tip,
+        _temporary,
+    } = switch;
     let readiness = ComposedReadiness::new(Readiness::default(), &[]);
     let cancel = CancellationToken::new();
     let follower = follower_to_target(
-        &source,
+        follower_source,
         &activations,
         BlockHeight::new(3),
         &readiness,
         &cancel,
     );
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let recorded_metrics = recorder.handle();
-    let local_recorder = metrics::set_default_local_recorder(&recorder);
     let (outage, outcome) = tokio::join!(
         first_node_unavailable_detail(&readiness),
         follow_canonical_tip(store, follower),
     );
-    drop(local_recorder);
     let store = outcome?;
     let outage = outage?;
 
-    assert_eq!(store.event_fence().visible_tip(), sibling_three);
+    assert_eq!(store.event_fence().visible_tip(), sibling_tip);
     assert_eq!(outage.failure_class, "upstream_view_changed");
     assert!(
-        outage
-            .last_reason
-            .contains("tree-state hash disagrees with the fetched block hash"),
+        outage.last_reason.contains(expected_reason),
         "{}",
         outage.last_reason
     );
@@ -1762,11 +1894,9 @@ async fn best_chain_switch_between_block_and_tree_state_reads_appends_the_new_bl
         ]
     );
     assert!(
-        recorded_metrics
-            .render()
-            .lines()
-            .any(|line| line == "zinder_ingest_canonical_source_recoveries_total 1"),
-        "exactly one source recovery must be recorded"
+        recorded_metrics.render().lines().any(|line| line
+            == r#"zinder_ingest_canonical_source_recoveries_total{failure_class="upstream_view_changed"} 1"#),
+        "exactly one changed-view source recovery must be recorded"
     );
     Ok(())
 }
@@ -1883,7 +2013,7 @@ async fn same_block_tree_state_that_contradicts_the_derived_checkpoint_fails_clo
                 honest.block_time_seconds.wrapping_add(1),
                 honest.frontiers.clone(),
             ),
-            "block time",
+            CheckpointComponent::BlockTime,
         ),
         (
             CommitmentTreeCheckpoint::new(
@@ -1891,7 +2021,7 @@ async fn same_block_tree_state_that_contradicts_the_derived_checkpoint_fails_clo
                 honest.block_time_seconds,
                 CommitmentTreeFrontiers::default(),
             ),
-            "commitment-tree frontiers",
+            CheckpointComponent::CommitmentTreeFrontiers,
         ),
     ];
     for (contradiction, expected_component) in contradictions {

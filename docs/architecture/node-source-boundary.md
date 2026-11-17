@@ -67,7 +67,11 @@ returns the checkpoint of a block that the caller has already identified.
 that block, or refuses with "the requested block is not in the main chain" when
 the block has left its best chain. The source maps that refusal to
 `BlockUnavailable`, and a response that names another block to
-`SourceProtocolMismatch`. A source without a hash-keyed read checks the identity
+`SourceProtocolMismatch`. Any other refusal of the hash, except a fast-synced
+Zakura node's refusal of a skipped tree, is also `SourceProtocolMismatch`,
+because the hash came from a block that the node itself served. The source logs
+the node's code and message as `tree_state_block_hash_refused`. A source
+without a hash-keyed read checks the identity
 of a height-keyed answer instead, and returns `BlockReorgDuringFetch` when the
 answer names another block. `fetch_chain_checkpoint` stays height-keyed for a
 caller that knows only a height, such as a configured construction checkpoint.

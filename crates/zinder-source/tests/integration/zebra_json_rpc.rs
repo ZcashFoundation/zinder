@@ -1783,6 +1783,41 @@ async fn fetch_chain_checkpoint_for_block_reports_a_block_that_left_the_best_cha
 }
 
 #[tokio::test]
+async fn fetch_chain_checkpoint_for_block_classifies_refusals_that_are_not_a_changed_view()
+-> eyre::Result<()> {
+    let block_id = BlockId::new(
+        BlockHeight::new(100),
+        decode_rpc_block_hash(CHECKPOINT_BLOCK_HASH_HEX)?,
+    );
+    for (code, message, expected_class) in [
+        (
+            -8,
+            "parse error: could not convert the input string to a hash or height",
+            SourceFailureClass::ProtocolMismatch,
+        ),
+        (
+            -1,
+            ZAKURA_FAST_SYNCED_TREE_STATE_MESSAGE,
+            SourceFailureClass::CapabilityMissing,
+        ),
+    ] {
+        let server = JsonRpcTestServer::start([
+            method("z_gettreestate").reply(RpcReply::error_with_code(code, message))
+        ])?;
+        let source = regtest_source(&server)?;
+
+        let error = source
+            .fetch_chain_checkpoint_for_block(block_id, &checkpoint_activations(1, 200)?)
+            .await
+            .err()
+            .ok_or_else(|| eyre!("a refused block hash has no tree state"))?;
+
+        assert_eq!(error.upstream_classification(), expected_class, "{error}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn fetch_chain_checkpoint_rejects_one_sided_frontier() -> eyre::Result<()> {
     let (final_root, _) = empty_sapling_frontier_rpc_parts()?;
     let outcome = fetch_checkpoint_response(
