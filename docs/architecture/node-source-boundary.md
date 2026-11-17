@@ -193,7 +193,8 @@ JSON-RPC error body. The source reports the refusal as `NodeUnavailable`,
 classed `node_unreachable`, with a reason that names HTTP 401. Three
 consecutive failures of that class rebuild the JSON-RPC client, and the
 rebuild reads a cookie file again, so ingest recovers after a node restart
-rotates its cookie.
+rotates its cookie. Basic credentials and an inline cookie do not change on a
+rebuild, so their refusal continues until `node.auth` is corrected.
 
 ## Indexer transport security
 

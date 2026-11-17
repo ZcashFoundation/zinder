@@ -2310,8 +2310,7 @@ fn map_transport_error(
     } else if client_error_is_unauthorized(error) {
         SourceError::NodeUnavailable {
             reason: format!(
-                "node refused the {operation} request credentials with HTTP 401; check node.auth \
-                 (a cookie file is read again when the client reconnects)"
+                "node refused the {operation} request credentials with HTTP 401; check node.auth"
             ),
         }
     } else {
