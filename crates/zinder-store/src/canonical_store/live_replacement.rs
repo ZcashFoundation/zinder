@@ -6,8 +6,8 @@ use rust_rocksdb::{DB, WriteBatch, WriteOptions};
 use zinder_core::{
     BlockHeight, BlockHeightRange, BlockId, CanonicalBlockFactsDigestVersion,
     CanonicalBlockFactsSequenceDigestBuilder, ChainEpochId, CommitmentTreeAccumulator,
-    CommitmentTreeCheckpoint, CompactBlockArtifact, NetworkUpgradeActivations, ShieldedProtocol,
-    SubtreeRootArtifact, SubtreeRootHash, UnixTimestampMillis,
+    CommitmentTreeCheckpoint, NetworkUpgradeActivations, SubtreeRootArtifact, SubtreeRootHash,
+    UnixTimestampMillis,
     wire::{encode_internal_block_hash, encode_internal_transaction_id},
 };
 
@@ -38,6 +38,7 @@ use super::{
         TRANSACTION_LOCATION_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
     },
     subtree_load::{encode_subtree_root_key, required_subtree_root_ranges},
+    tree_state_replay::append_compact_block_commitments,
 };
 
 /// One replacement block and the caller-authenticated roots of the subtrees it completes.
@@ -483,11 +484,8 @@ fn validate_replacement_blocks(
                 header.height.value()
             )));
         }
-        append_compact_commitments(
-            &mut accumulator,
-            header.height,
-            &replacement.block.compact_block,
-        )?;
+        append_compact_block_commitments(&mut accumulator, &replacement.block.compact_block)
+            .map_err(|source| CanonicalStoreError::live_commit(source.to_string()))?;
         let checkpoint = replacement
             .block
             .tree_state_checkpoint
@@ -522,109 +520,23 @@ fn validate_replacement_blocks(
     Ok(())
 }
 
+/// Reads or reconstructs the local tree checkpoint of the canonical block `target`.
 fn checkpoint_at(
     store: &RocksDbCanonicalStore,
     target: BlockId,
     activations: &NetworkUpgradeActivations,
 ) -> Result<CommitmentTreeCheckpoint, CanonicalStoreError> {
     let checkpoint = store
-        .tree_state_checkpoint_at_or_before(target.height)?
+        .tree_state_checkpoint_at(target.height, activations)?
         .ok_or_else(|| {
             CanonicalStoreError::live_commit("replacement parent has no rewind checkpoint")
         })?;
-    if checkpoint.block_id.height == target.height {
-        if checkpoint.block_id != target {
-            return Err(CanonicalStoreError::live_commit(
-                "replacement parent checkpoint has the wrong canonical hash",
-            ));
-        }
-        return Ok(checkpoint);
-    }
-    let mut accumulator = CommitmentTreeAccumulator::from_validated_frontiers(
-        checkpoint.block_id.height,
-        &checkpoint.frontiers,
-        activations,
-    )
-    .map_err(|source| CanonicalStoreError::live_commit(source.to_string()))?;
-    let mut height = checkpoint.block_id.height.next();
-    while height.is_some_and(|height| height <= target.height) {
-        let current = height.ok_or_else(|| {
-            CanonicalStoreError::live_commit("replacement parent checkpoint height overflow")
-        })?;
-        let compact = store.compact_block_at(current)?.ok_or_else(|| {
-            CanonicalStoreError::live_commit("replacement parent compact block is absent")
-        })?;
-        append_compact_commitments(&mut accumulator, current, &compact)?;
-        height = current.next();
-    }
-    let header = store.block_header_at(target.height)?.ok_or_else(|| {
-        CanonicalStoreError::live_commit("replacement parent block header is absent")
-    })?;
-    if header.block_hash != target.hash {
+    if checkpoint.block_id != target {
         return Err(CanonicalStoreError::live_commit(
-            "replacement parent header has the wrong canonical hash",
+            "replacement parent checkpoint has the wrong canonical hash",
         ));
     }
-    let block_time_seconds = u32::try_from(header.block_time).map_err(|_| {
-        CanonicalStoreError::live_commit("replacement parent block time is outside u32")
-    })?;
-    Ok(CommitmentTreeCheckpoint::new(
-        target,
-        block_time_seconds,
-        accumulator
-            .validated_frontiers()
-            .map_err(|source| CanonicalStoreError::live_commit(source.to_string()))?,
-    ))
-}
-
-fn append_compact_commitments(
-    accumulator: &mut CommitmentTreeAccumulator,
-    height: BlockHeight,
-    compact: &CompactBlockArtifact,
-) -> Result<(), CanonicalStoreError> {
-    let mut sapling = Vec::new();
-    let mut orchard = Vec::new();
-    let mut ironwood = Vec::new();
-    for transaction in compact.transactions() {
-        for output in &transaction.data.sapling_outputs {
-            sapling.push(commitment_bytes(
-                height,
-                ShieldedProtocol::Sapling,
-                &output.commitment,
-            )?);
-        }
-        for action in &transaction.data.orchard_actions {
-            orchard.push(commitment_bytes(
-                height,
-                ShieldedProtocol::Orchard,
-                &action.commitment,
-            )?);
-        }
-        for action in &transaction.data.ironwood_actions {
-            ironwood.push(commitment_bytes(
-                height,
-                ShieldedProtocol::Ironwood,
-                &action.commitment,
-            )?);
-        }
-    }
-    accumulator
-        .append_block_commitments(height, &sapling, &orchard, &ironwood)
-        .map_err(|source| CanonicalStoreError::live_commit(source.to_string()))
-}
-
-fn commitment_bytes(
-    height: BlockHeight,
-    protocol: ShieldedProtocol,
-    bytes: &[u8],
-) -> Result<[u8; 32], CanonicalStoreError> {
-    bytes.try_into().map_err(|_| {
-        CanonicalStoreError::live_commit(format!(
-            "replacement block {} has a {protocol:?} commitment with {} bytes",
-            height.value(),
-            bytes.len()
-        ))
-    })
+    Ok(checkpoint)
 }
 
 fn replacement_visible_sequence(
