@@ -31,6 +31,7 @@ mod rocksdb_compact_block_range;
 mod rocksdb_raw_blob_retention_comparison;
 mod rocksdb_storage_lifecycle;
 mod rocksdb_tip_replay;
+mod rocksdb_tree_state_replay;
 mod rocksdb_wallet_rebuild;
 
 use canonical_replay_storage_command::{CanonicalReplayStorageArgs, run_canonical_replay_storage};
@@ -46,6 +47,7 @@ use rocksdb_tip_replay::{
     CompareTipReplayReportsArgs, RocksDbTipReorgArgs, RocksDbTipReplayArgs,
     run_compare_tip_replay_reports, run_rocksdb_tip_reorg, run_rocksdb_tip_replay,
 };
+use rocksdb_tree_state_replay::{RocksDbTreeStateReplayArgs, run_rocksdb_tree_state_replay};
 use rocksdb_wallet_rebuild::{RocksDbWalletRebuildArgs, run_rocksdb_wallet_rebuild};
 
 #[global_allocator]
@@ -96,6 +98,9 @@ enum Command {
     /// Measure version-1 compact-block ranges through an admitted secondary.
     #[command(name = "rocksdb-compact-block-range")]
     RocksDbCompactBlockRange(RocksDbCompactBlockRangeArgs),
+    /// Measure tree-state reconstructions at wallet anchor heights.
+    #[command(name = "rocksdb-tree-state-replay")]
+    RocksDbTreeStateReplay(RocksDbTreeStateReplayArgs),
     /// Capture the node's tree-state checkpoint for every fixture height.
     #[command(name = "capture-tip-replay-checkpoints")]
     CaptureTipReplayCheckpoints(CaptureTipReplayCheckpointsArgs),
@@ -293,6 +298,10 @@ async fn run(cli: Cli) -> Result<(), BenchError> {
         }
         Command::RocksDbCompactBlockRange(args) => {
             let output = run_rocksdb_compact_block_range(args)?;
+            emit_report(&output.report, output.report_path.as_deref())
+        }
+        Command::RocksDbTreeStateReplay(args) => {
+            let output = run_rocksdb_tree_state_replay(args)?;
             emit_report(&output.report, output.report_path.as_deref())
         }
         Command::CaptureTipReplayCheckpoints(args) => {
@@ -601,6 +610,31 @@ mod tests {
         ])?;
 
         assert!(matches!(cli.command, Command::RocksDbCompactBlockRange(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn rocksdb_tree_state_replay_command_spelling_is_stable() -> Result<(), Box<dyn Error>> {
+        let cli = Cli::try_parse_from([
+            "zinder-bench",
+            "rocksdb-tree-state-replay",
+            "--fixture",
+            "fixture",
+            "--canonical-store",
+            "canonical",
+            "--secondary-root",
+            "secondary",
+            "--software-revision",
+            "5079515",
+            "--from-height",
+            "1710000",
+            "--to-height",
+            "1850000",
+            "--max-anchors",
+            "128",
+        ])?;
+
+        assert!(matches!(cli.command, Command::RocksDbTreeStateReplay(_)));
         Ok(())
     }
 
