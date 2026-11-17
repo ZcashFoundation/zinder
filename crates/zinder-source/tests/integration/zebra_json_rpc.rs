@@ -20,8 +20,8 @@ use zinder_core::{
     SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome, TransactionId,
 };
 use zinder_source::{
-    NodeAuth, NodeCapability, NodeHealthConfig, NodeSource, SourceChainCursor, SourceChainUpdate,
-    SourceError, SourceFailureClass, SourceTreeState, TransactionBroadcaster,
+    CookieSource, NodeAuth, NodeCapability, NodeHealthConfig, NodeSource, SourceChainCursor,
+    SourceChainUpdate, SourceError, SourceFailureClass, SourceTreeState, TransactionBroadcaster,
     UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
     UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, ZebraJsonRpcSource,
@@ -315,6 +315,103 @@ async fn http_503_marks_node_unavailable_retryable() -> eyre::Result<()> {
     assert_eq!(
         error.upstream_classification(),
         zinder_source::SourceFailureClass::NodeUnreachable,
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_401_credential_refusal_marks_node_unavailable() -> eyre::Result<()> {
+    // Zebra 7.1.0 and later answer missing or stale cookie credentials with
+    // HTTP 401 and a JSON-RPC error body. Every call keeps the transport class,
+    // including a block read whose JSON-RPC errors map to a changed view.
+    let server = JsonRpcTestServer::start([
+        method("getbestblockheightandhash").reply(RpcReply::unauthenticated()),
+        method("getblock").reply(RpcReply::unauthenticated()),
+    ])?;
+    let source = regtest_source(&server)?;
+
+    let tip_error = match source.tip_id().await {
+        Ok(tip_id) => return Err(eyre!("expected credential refusal, got {tip_id:?}")),
+        Err(error) => error,
+    };
+    let block_error = match source.fetch_block_at(BlockHeight::new(1)).await {
+        Ok(source_block) => {
+            return Err(eyre!("expected credential refusal, got {source_block:?}"));
+        }
+        Err(error) => error,
+    };
+
+    for error in [tip_error, block_error] {
+        assert!(
+            matches!(&error, SourceError::NodeUnavailable { reason } if reason.contains("HTTP 401")),
+            "credential refusal must name HTTP 401, got {error:?}"
+        );
+        assert_eq!(
+            error.upstream_classification(),
+            zinder_source::SourceFailureClass::NodeUnreachable,
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn cookie_refusal_reconnects_with_the_rotated_cookie() -> eyre::Result<()> {
+    // Zebra writes a new cookie when it restarts and then refuses the old one
+    // with HTTP 401. Consecutive refusals rebuild the client, which must read
+    // the cookie file again instead of replaying the startup credentials.
+    const ATTEMPTS: usize = 40;
+    const STARTUP_AUTHORIZATION: &str = "Basic X19jb29raWVfXzpiZWZvcmUtcmVzdGFydA==";
+    const ROTATED_AUTHORIZATION: &str = "Basic X19jb29raWVfXzphZnRlci1yZXN0YXJ0";
+
+    let server = JsonRpcTestServer::start(
+        (0..ATTEMPTS)
+            .map(|_| method("getbestblockheightandhash").reply(RpcReply::unauthenticated())),
+    )?;
+    let cookie_dir = tempfile::tempdir()?;
+    let cookie_path = cookie_dir.path().join(".cookie");
+    std::fs::write(&cookie_path, "__cookie__:before-restart")?;
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::Cookie(CookieSource::File(cookie_path.clone())),
+        Duration::from_secs(5),
+    )?;
+
+    if let Ok(tip_id) = source.tip_id().await {
+        return Err(eyre!("expected credential refusal, got {tip_id:?}"));
+    }
+    std::fs::write(&cookie_path, "__cookie__:after-restart")?;
+
+    let mut sent_rotated_cookie = false;
+    for _ in 1..ATTEMPTS {
+        match source.tip_id().await {
+            Ok(tip_id) => return Err(eyre!("expected credential refusal, got {tip_id:?}")),
+            Err(error) => assert!(matches!(error, SourceError::NodeUnavailable { .. })),
+        }
+        let latest_authorization = server
+            .requests()?
+            .last()
+            .and_then(|request| request.authorization.clone());
+        if latest_authorization.as_deref() == Some(ROTATED_AUTHORIZATION) {
+            sent_rotated_cookie = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(
+        sent_rotated_cookie,
+        "repeated HTTP 401 refusals must rebuild the client with the rotated cookie"
+    );
+    let requests = server.requests()?;
+    assert!(
+        requests
+            .iter()
+            .take(3)
+            .all(|request| request.authorization.as_deref() == Some(STARTUP_AUTHORIZATION)),
+        "the client keeps its credentials until consecutive refusals rebuild it"
     );
 
     Ok(())
@@ -1313,6 +1410,74 @@ async fn fast_synced_tree_state_refusal_is_a_missing_capability() -> eyre::Resul
     Ok(())
 }
 
+/// Zebra 7.1.0's refusal of a stored block with missing transaction rows
+/// (`zebra_state::BlockReadError::BlockBodyUnavailable`, JSON-RPC code -1).
+const ZEBRA_INCOMPLETE_BLOCK_BODY_MESSAGE: &str =
+    "block body unavailable at height Height(1): stored transactions are incomplete";
+
+/// Zebra 7.1.0's refusal of a stored block with inconsistent metadata
+/// (`zebra_state::BlockReadError::CorruptBlock`, JSON-RPC code -1).
+const ZEBRA_CORRUPT_BLOCK_MESSAGE: &str = "corrupt block metadata at height Height(1)";
+
+#[tokio::test]
+async fn unreadable_stored_block_refusal_is_a_missing_capability() -> eyre::Result<()> {
+    for message in [
+        ZEBRA_INCOMPLETE_BLOCK_BODY_MESSAGE,
+        ZEBRA_CORRUPT_BLOCK_MESSAGE,
+    ] {
+        let server = JsonRpcTestServer::start([
+            method("getblock").reply(RpcReply::error_with_code(-1, message))
+        ])?;
+        let source = regtest_source(&server)?;
+
+        let error = match source.fetch_block_at(BlockHeight::new(1)).await {
+            Ok(source_block) => return Err(eyre!("expected block error, got {source_block:?}")),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(
+                &error,
+                SourceError::HistoricalBlockBodyUnavailable { height, reason }
+                    if *height == BlockHeight::new(1) && reason == message
+            ),
+            "unexpected error for {message:?}: {error:?}"
+        );
+        assert_eq!(
+            error.upstream_classification(),
+            zinder_source::SourceFailureClass::CapabilityMissing,
+        );
+        assert!(error.is_node_capability_missing());
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn tree_state_refusal_of_an_unreadable_stored_block_is_a_missing_capability()
+-> eyre::Result<()> {
+    // Zebra reads the block body to answer `z_gettreestate`.
+    let server = JsonRpcTestServer::start([method("z_gettreestate").reply(
+        RpcReply::error_with_code(-1, ZEBRA_INCOMPLETE_BLOCK_BODY_MESSAGE),
+    )])?;
+    let source = regtest_source(&server)?;
+    let block_id = BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32]));
+
+    let error = match source.fetch_tree_state_for_block(block_id).await {
+        Ok(tree_state) => return Err(eyre!("expected tree-state error, got {tree_state:?}")),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        SourceError::HistoricalBlockBodyUnavailable { height, .. }
+            if height == BlockHeight::new(1)
+    ));
+    assert!(error.is_node_capability_missing());
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn fast_synced_checkpoint_refusal_is_a_missing_capability() -> eyre::Result<()> {
     let server = JsonRpcTestServer::start([method("z_gettreestate").reply(
@@ -1798,6 +1963,16 @@ async fn fetch_chain_checkpoint_for_block_classifies_refusals_that_are_not_a_cha
         (
             -1,
             ZAKURA_FAST_SYNCED_TREE_STATE_MESSAGE,
+            SourceFailureClass::CapabilityMissing,
+        ),
+        (
+            -1,
+            ZEBRA_INCOMPLETE_BLOCK_BODY_MESSAGE,
+            SourceFailureClass::CapabilityMissing,
+        ),
+        (
+            -1,
+            ZEBRA_CORRUPT_BLOCK_MESSAGE,
             SourceFailureClass::CapabilityMissing,
         ),
     ] {

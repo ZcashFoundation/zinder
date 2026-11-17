@@ -11,16 +11,22 @@ Schedule admission only lets existing stores open against the new table. Zinder
 must also be able to parse blocks after the new upgrade activates. Check the
 release notes of the Zinder release you are installing for that support.
 
-For NU7, Zinder parses blocks with `zebra-chain` 15.0.0 and the matching
-librustzcash family, the same parser release Zebra 7.0.0 uses. Zinder 0.9.0
+For NU7, Zinder parses blocks with `zebra-chain` 16.0.0 and the matching
+librustzcash family, the same parser release Zebra 7.1.0 uses. Zinder 0.9.0
 and earlier parse with `zebra-chain` 11.2.0, which rejects branch `0x77190ad9`,
 so their ingest stops at the first NU7 block. NU7 decoding is tested against
 Regtest blocks captured from Zebra 7.0.0 and Zakura 1.8.6, including Zakura
 blocks with Orchard and Ironwood shielding spends on both sides of NU7; see
 [Capturing node fixtures](capturing-node-fixtures.md). The live suite also
-crosses an NU7 activation on local Zebra 7.0.0 and Zakura 1.8.6 Regtest chains;
+crosses an NU7 activation on local Zebra 7.1.0 and Zakura 1.8.6 Regtest chains;
 see [Regtest through NU7](testing.md#regtest-through-nu7). Zinder has not yet
 run across an NU7 activation on Mainnet or on Testnet.
+
+Zinder certifies the node releases that the live and parity lanes run: Zebra
+7.1.0 and Zakura 1.8.6. Zebra 7.0.0 advertises the same protocol version and
+network upgrades and is expected to keep working, but no lane tests it.
+Upgrade Zebra 7.0.0 to 7.1.0 for its security fixes. The upgrade changes no
+upgrade table, so it needs neither schedule admission nor a store rebuild.
 
 ## Before you start
 

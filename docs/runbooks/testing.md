@@ -259,7 +259,7 @@ the slower external runs start.
 ## T3: Live regtest sweep
 
 The most valuable automated check that exercises a real node. CI runs it
-against both certified nodes, Zebra 7.0.0 and Zakura 1.8.6, every night and on
+against both certified nodes, Zebra 7.1.0 and Zakura 1.8.6, every night and on
 pull requests. The live and parity workflows share one pull request path
 filter: a crate the live or parity tests exercise, the workspace manifest or
 lockfile, the Rust toolchain pin, the nextest configuration, either node TOML,
@@ -288,7 +288,7 @@ the mining or indexer TLS script, or either workflow.
 
 ### Regtest through NU7
 
-Zebra 7.0.0 on Regtest activates Overwinter through Canopy at height 1 and
+Zebra 7.1.0 on Regtest activates Overwinter through Canopy at height 1 and
 leaves NU5 and every later upgrade unset unless the node is configured
 otherwise. A node started with only `ZEBRA_NETWORK__NETWORK=Regtest` stays on
 Canopy, so it never produces version-5 or version-6 transactions, Orchard or
@@ -333,7 +333,7 @@ docker run -d --name zebra-regtest \
   -e ZEBRA_RPC__INDEXER_LISTEN_ADDR=0.0.0.0:8155 \
   -e ZEBRA_RPC__ENABLE_COOKIE_AUTH=false \
   -e ZEBRA_MINING__MINER_ADDRESS=tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx \
-  docker.io/zfnd/zebra:7.0.0@sha256:a70d2be8ffef3a4b6e37355724e36a0e6c1838e46baa28bfb216739f00cf2d34
+  docker.io/zfnd/zebra:7.1.0@sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba
 scripts/mine-live-regtest.sh http://127.0.0.1:39232 120
 ```
 
@@ -467,7 +467,7 @@ restarts.
 #### What the NU7 Regtest run covers
 
 The NU7 Regtest run is local evidence from one isolated chain per node, on
-Zebra 7.0.0 and on Zakura 1.8.6. It covers:
+Zebra 7.1.0 and on Zakura 1.8.6. It covers:
 
 - Parsing, canonical construction, wallet projection, and serving reads for
   version-5 and version-6 blocks with Ironwood note commitments, before, at,
@@ -490,7 +490,7 @@ Zebra 7.0.0 and on Zakura 1.8.6. It covers:
 
 It does not cover:
 
-- Any node other than Zebra 7.0.0 and Zakura 1.8.6, and Zakura's Sapling and
+- Any node other than Zebra 7.1.0 and Zakura 1.8.6, and Zakura's Sapling and
   Orchard pools, which its coinbase cannot pay. A Zakura block with an Orchard
   shielding spend is covered only by a captured fixture; see
   [Capturing node fixtures](capturing-node-fixtures.md).

@@ -122,6 +122,10 @@ pub enum RpcReply {
     },
     /// Non-200 HTTP status code with an empty JSON body.
     HttpStatus(u16),
+    /// The HTTP 401 answer Zebra 7.1.0 and later send for missing or stale
+    /// cookie credentials: a `WWW-Authenticate` challenge and a JSON-RPC
+    /// error body with code 401.
+    Unauthenticated,
     /// JSON-RPC response with neither `result` nor `error` set.
     Empty,
 }
@@ -164,6 +168,12 @@ impl RpcReply {
         Self::HttpStatus(status_code)
     }
 
+    /// Builds Zebra's HTTP 401 refusal of missing or stale cookie credentials.
+    #[must_use]
+    pub const fn unauthenticated() -> Self {
+        Self::Unauthenticated
+    }
+
     /// Builds an empty JSON-RPC response (no `result` and no `error` field).
     #[must_use]
     pub const fn empty() -> Self {
@@ -202,7 +212,19 @@ impl RpcReply {
                     503 => "Service Unavailable",
                     _ => "Status",
                 },
+                extra_headers: "",
                 body: "{}".to_owned(),
+            },
+            Self::Unauthenticated => HttpResponse {
+                status_code: 401,
+                reason_phrase: "Unauthorized",
+                extra_headers: "WWW-Authenticate: Basic realm=\"jsonrpc\"\r\n",
+                body: json!({
+                    "jsonrpc": "2.0",
+                    "error": {"code": 401, "message": "unauthenticated method"},
+                    "id": null,
+                })
+                .to_string(),
             },
             Self::Empty => {
                 HttpResponse::ok(json!({"jsonrpc": "2.0", "id": request_id}).to_string())
@@ -334,6 +356,8 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<ServerState>) {
 struct HttpResponse {
     status_code: u16,
     reason_phrase: &'static str,
+    /// Header lines beyond the standard set, each ending in `\r\n`.
+    extra_headers: &'static str,
     body: String,
 }
 
@@ -342,6 +366,7 @@ impl HttpResponse {
         Self {
             status_code: 200,
             reason_phrase: "OK",
+            extra_headers: "",
             body,
         }
     }
@@ -394,9 +419,10 @@ fn read_http_request(stream: &mut TcpStream) -> Result<JsonRpcRequest> {
 
 fn write_http_response(stream: &mut TcpStream, response: &HttpResponse) -> Result<()> {
     let formatted = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         response.status_code,
         response.reason_phrase,
+        response.extra_headers,
         response.body.len(),
         response.body
     );

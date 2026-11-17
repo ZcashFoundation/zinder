@@ -42,7 +42,7 @@ type MempoolStream =
 
 #[derive(Clone)]
 struct BlockService {
-    response: BlockAndHash,
+    response: Result<BlockAndHash, Status>,
     requests: Arc<Mutex<Vec<Vec<u8>>>>,
     response_delay: Duration,
     active_requests: Arc<AtomicU64>,
@@ -91,7 +91,7 @@ impl Indexer for BlockService {
             .lock()
             .push(request.into_inner().hash_or_height);
         self.active_requests.fetch_sub(1, Ordering::Relaxed);
-        Ok(Response::new(self.response.clone()))
+        self.response.clone().map(Response::new)
     }
 }
 
@@ -103,7 +103,7 @@ struct RunningBlockSource {
 }
 
 async fn start_block_source(
-    response: BlockAndHash,
+    response: Result<BlockAndHash, Status>,
     response_delay: Duration,
     max_in_flight_requests: NonZeroU32,
 ) -> Result<RunningBlockSource> {
@@ -117,7 +117,7 @@ async fn start_block_source(
 }
 
 async fn start_block_source_with_control_plane(
-    response: BlockAndHash,
+    response: Result<BlockAndHash, Status>,
     response_delay: Duration,
     max_in_flight_requests: NonZeroU32,
     control_plane_url: &str,
@@ -188,7 +188,7 @@ fn fixture_block() -> Result<(BlockAndHash, zinder_source::SourceBlock)> {
 async fn indexer_get_block_returns_raw_block_by_big_endian_height() -> Result<()> {
     let (response, expected_block) = fixture_block()?;
     let running = start_block_source(
-        response,
+        Ok(response),
         Duration::ZERO,
         ZebraIndexerBlockSourceOptions::default().max_in_flight_requests,
     )
@@ -207,7 +207,7 @@ async fn indexer_get_block_rejects_hash_that_disagrees_with_raw_header() -> Resu
     let (mut response, _) = fixture_block()?;
     response.hash = vec![0; 32];
     let running = start_block_source(
-        response,
+        Ok(response),
         Duration::ZERO,
         ZebraIndexerBlockSourceOptions::default().max_in_flight_requests,
     )
@@ -241,7 +241,7 @@ async fn indexer_source_reads_a_block_tree_state_by_hash_through_its_control_pla
         })))])?;
     let (response, _) = fixture_block()?;
     let running = start_block_source_with_control_plane(
-        response,
+        Ok(response),
         Duration::ZERO,
         ZebraIndexerBlockSourceOptions::default().max_in_flight_requests,
         &control_plane.url(),
@@ -285,7 +285,8 @@ async fn indexer_source_reads_a_block_tree_state_by_hash_through_its_control_pla
 async fn indexer_get_block_limit_is_shared_across_source_clones() -> Result<()> {
     let (response, _) = fixture_block()?;
     let request_limit = NonZeroU32::new(3).ok_or_else(|| eyre::eyre!("three is nonzero"))?;
-    let running = start_block_source(response, Duration::from_millis(40), request_limit).await?;
+    let running =
+        start_block_source(Ok(response), Duration::from_millis(40), request_limit).await?;
 
     let requests = (1..=9).map(|height| {
         let source = running.source.clone();
@@ -299,5 +300,51 @@ async fn indexer_get_block_limit_is_shared_across_source_clones() -> Result<()> 
         running.max_active_requests.load(Ordering::Relaxed),
         u64::from(request_limit.get())
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn indexer_get_block_refusal_of_an_unreadable_stored_block_is_a_missing_capability()
+-> Result<()> {
+    // Zebra 7.1.0 refuses a stored block it cannot reassemble with
+    // `Unavailable`, the code a transport failure also carries.
+    let refusals = [
+        Status::unavailable(
+            "failed to read block: block body unavailable at height Height(1): \
+             stored transactions are incomplete",
+        ),
+        Status::unavailable("failed to read block: database is busy"),
+    ];
+    let mut errors = Vec::with_capacity(refusals.len());
+    for refusal in refusals {
+        let running = start_block_source(
+            Err(refusal),
+            Duration::ZERO,
+            ZebraIndexerBlockSourceOptions::default().max_in_flight_requests,
+        )
+        .await?;
+        let error = running
+            .source
+            .fetch_block_at(BlockHeight::new(1))
+            .await
+            .err()
+            .ok_or_else(|| eyre::eyre!("refused block read must fail"))?;
+        running.server.abort();
+        errors.push(error);
+    }
+
+    let [unreadable, busy] = errors.as_slice() else {
+        return Err(eyre::eyre!("expected two refusals"));
+    };
+    assert!(matches!(
+        unreadable,
+        zinder_source::SourceError::HistoricalBlockBodyUnavailable { height, .. }
+            if *height == BlockHeight::new(1)
+    ));
+    assert!(unreadable.is_node_capability_missing());
+    assert!(matches!(
+        busy,
+        zinder_source::SourceError::NodeUnavailable { .. }
+    ));
     Ok(())
 }

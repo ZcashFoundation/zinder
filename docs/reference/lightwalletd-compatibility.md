@@ -194,7 +194,7 @@ served.
 
 `GetTransaction` returns a pending transaction the way lightwalletd does.
 lightwalletd calls Zebra's `getrawtransaction`, which checks the mempool first
-and omits `height` for a mempool transaction (Zebra 7.0.0,
+and omits `height` for a mempool transaction (Zebra 7.1.0,
 `zebra-rpc/src/methods.rs:2114-2144` and
 `zebra-rpc/src/methods/types/transaction.rs:313-317`), so lightwalletd answers
 with the raw bytes at height 0 (lightwalletd `e7436d2`,
@@ -251,7 +251,7 @@ transaction's position in the block. The order differs only when a positive
 
 One response returns at most `LightwalletdResponseLimits::max_address_utxos`
 outputs, 100,000 by default, the same cap Zebra puts on `getaddressutxos`
-(Zebra 7.0.0, `zebra-rpc/src/methods.rs:4142`). A request that would return
+(Zebra 7.1.0, `zebra-rpc/src/methods.rs:4142`). A request that would return
 more fails with `RESOURCE_EXHAUSTED`. Zinder never drops rows silently, because
 librustzcash, the Android SDK, Brave, and Zingo add these rows up as the
 address balance. `GetAddressUtxosStream` has the same bound.
@@ -280,7 +280,7 @@ lightwalletd resolves it on Zebra, so a request that works there works here:
   defaults both to the chain tip (lightwalletd `e7436d2`,
   `frontend/service.go:128-137`).
 - Both bounds are clamped to the visible tip, as Zebra's `getaddresstxids`
-  clamps them (Zebra 7.0.0, `zebra-rpc/src/methods.rs:5163-5187`). An end
+  clamps them (Zebra 7.1.0, `zebra-rpc/src/methods.rs:5163-5187`). An end
   above the tip reads to the tip, and a start above the tip reads the tip
   block. A start of 0 reads from genesis.
 - An explicit end below the start is `INVALID_ARGUMENT`.
@@ -325,7 +325,7 @@ The vendored protocol pin and parity workflow image digests are:
   (`e7436d2adb9ab5828eb8a27de534e16218841fc2`) as the source reference, which
   parses the version-6 transactions that NU6.3 introduced;
 - `electriccoinco/lightwalletd:v0.6.0@sha256:abc8199dae800e050415a3459f71c7850aeefeb1ca6a681e9b9eda7249ce8613`;
-- `docker.io/zfnd/zebra:7.0.0@sha256:a70d2be8ffef3a4b6e37355724e36a0e6c1838e46baa28bfb216739f00cf2d34`,
+- `docker.io/zfnd/zebra:7.1.0@sha256:4f9536c8061e407f9f2ec81b7e0dd2f1762f81deec316abb1530dca8796a33ba`,
   started on Regtest with `deploy/zebra/regtest.toml`, which activates every
   upgrade through NU7 (see
   [Regtest through NU7](../runbooks/testing.md#regtest-through-nu7));

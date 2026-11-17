@@ -1259,6 +1259,10 @@ mod error_reason_tests {
                 height: BlockHeight::new(1_000_000),
                 reason: "probe".to_owned(),
             },
+            SourceError::HistoricalBlockBodyUnavailable {
+                height: BlockHeight::new(1_000_000),
+                reason: "probe".to_owned(),
+            },
             SourceError::HistoricalSubtreeRootsUnavailable {
                 protocol: ShieldedProtocol::Sapling,
                 start_index: zinder_core::SubtreeRootIndex::new(0),
