@@ -41,6 +41,7 @@ zinder-wallet-rocksdb.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 eyre.workspace = true
+metrics-exporter-prometheus.workspace = true
 parking_lot.workspace = true
 secrecy.workspace = true
 sha2.workspace = true

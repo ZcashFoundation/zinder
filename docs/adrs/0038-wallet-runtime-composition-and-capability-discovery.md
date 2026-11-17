@@ -301,10 +301,10 @@ request that holds a pair past that delays publication for every client.
 
 The compatibility runtime therefore binds each chunk, not the stream, to one
 chain view. A chunk holds at most 1,000 blocks and at most 2 MiB of stored
-compact blocks, or one larger block, so the memory one chunk read holds stays
-bounded however large the blocks are. Both serving modes apply this rule to
-`GetBlockRange`. Wallet serving also applies it to `GetBlockRangeNullifiers`,
-which compact-blocks serving does not serve.
+compact blocks, or one larger block, so the stored blocks one chunk read
+keeps do not grow with the number of large blocks in the range. Both serving
+modes apply this rule to `GetBlockRange`. Wallet serving also applies it to
+`GetBlockRangeNullifiers`, which compact-blocks serving does not serve.
 
 - The first chunk is read at the epoch current when the request arrives,
   before the response starts, and the range bounds are checked against that
@@ -559,8 +559,8 @@ bound. The first chunk has no chunk before it, and a chunk that enters dense
 blocks after sparse ones is sized for the sparse ones, so either can hold
 1,000 dense blocks. A read that stops at a byte budget bounds every chunk,
 the first included. The budget is fixed rather than configurable, because the
-documented memory bound of one stream, and the stream limit operators size
-from it, assume it.
+reference's account of what one stream holds, from which operators size the
+stream limit, assumes it.
 
 ### End a block-range stream with `CHAIN_EPOCH_PIN_UNAVAILABLE`
 

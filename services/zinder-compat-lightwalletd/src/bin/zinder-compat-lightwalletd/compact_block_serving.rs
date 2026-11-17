@@ -828,13 +828,14 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlockAdapter {
             selection: pool_selection,
             descending,
         };
-        let (first_messages, later_chunks) = read_first_chunk(
-            reader,
-            BlockRangeChunks::new(range, descending),
-            epoch.id,
-            encoding,
-        )
-        .await?;
+        let (first_messages, later_chunks) = stream_slot
+            .hold_during(read_first_chunk(
+                reader,
+                BlockRangeChunks::new(range, descending),
+                epoch.id,
+                encoding,
+            ))
+            .await?;
         let Some((chunks, continuity)) = later_chunks else {
             return Ok(Response::new(stream_slot.hold_for(first_messages)));
         };
@@ -1003,7 +1004,10 @@ type ChunkMessages = Vec<Result<lightwalletd::CompactBlock, Status>>;
 ///
 /// When heights remain after the blocks the read kept, returns the plan and
 /// the continuity that later chunks must follow. The reader is dropped when
-/// the read returns.
+/// the read returns. The caller runs this under
+/// [`zinder_compat_lightwalletd::BlockRangeStreamSlot::hold_during`], because
+/// the blocking read and encoding finish even when the client cancels the
+/// request.
 async fn read_first_chunk(
     reader: Arc<RocksDbCanonicalSecondary>,
     mut chunks: BlockRangeChunks,
@@ -2881,6 +2885,99 @@ mod tests {
         let mut short_blocks = Vec::new();
         read_blocks(&mut admitted, &mut short_blocks, usize::MAX).await?;
         assert_linked_from_genesis(&short_blocks, 4);
+        drop(admitted);
+        harness.stop().await
+    }
+
+    /// Polls `call` once, so a test can cancel it where it first waits.
+    fn poll_once<Call: Future + Unpin>(call: &mut Call) -> std::task::Poll<Call::Output> {
+        std::pin::Pin::new(call).poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+    }
+
+    /// A request cancelled during its first chunk read keeps its slot until
+    /// the read has finished.
+    ///
+    /// The runtime has one blocking thread and the test holds it, so the
+    /// first chunk's read cannot finish until the test lets it run. The slot
+    /// returns once the read has finished.
+    #[test]
+    fn a_request_cancelled_during_its_first_read_keeps_its_slot_until_the_read_ends()
+    -> Result<(), Box<dyn std::error::Error>> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()?
+            .block_on(cancel_during_a_gated_first_read())
+    }
+
+    async fn cancel_during_a_gated_first_read() -> Result<(), Box<dyn std::error::Error>> {
+        const TIP_HEIGHT: u32 = 10;
+        let chain = zinder_testkit::ChainFixture::new(Network::ZcashRegtest)
+            .with_raw_blob_retention(RawBlobRetention::Transactions)
+            .extend_blocks(TIP_HEIGHT);
+        let harness = LongRangeHarness::start(
+            &zinder_testkit::CanonicalBaseline::new(&chain).through(BlockHeight::new(TIP_HEIGHT)),
+        )
+        .await?;
+        let adapter = harness
+            .adapter
+            .clone()
+            .with_max_concurrent_block_range_streams(std::num::NonZeroU32::MIN);
+        let generation = Arc::downgrade(&harness.slot.capture());
+
+        let (gate_held, gate_held_receiver) = oneshot::channel();
+        let (release_gate, gate) = oneshot::channel::<()>();
+        let gate_thread = tokio::task::spawn_blocking(move || {
+            let _ = gate_held.send(());
+            let _ = gate.blocking_recv();
+        });
+        gate_held_receiver.await?;
+
+        // One poll takes the slot and starts the first chunk's read, which
+        // waits for the blocking thread. Dropping the call cancels it there.
+        let mut cancelled = adapter.get_block_range(Request::new(block_range(1, TIP_HEIGHT)));
+        assert!(poll_once(&mut cancelled).is_pending());
+        drop(cancelled);
+
+        let refused = poll_once(&mut adapter.get_block_range(Request::new(block_range(1, 4))));
+        assert!(
+            matches!(
+                &refused,
+                std::task::Poll::Ready(Err(status)) if status.code() == Code::ResourceExhausted
+            ),
+            "a request cancelled during its first read must keep its slot while the read runs"
+        );
+        assert_eq!(
+            generation.strong_count(),
+            2,
+            "the cancelled request's first read still holds its generation"
+        );
+
+        let _ = release_gate.send(());
+        gate_thread.await?;
+        let mut admitted = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match adapter
+                    .get_block_range(Request::new(block_range(1, 4)))
+                    .await
+                {
+                    Ok(response) => return Ok(response.into_inner()),
+                    Err(status) if status.code() == Code::ResourceExhausted => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(status) => return Err(status),
+                }
+            }
+        })
+        .await??;
+        assert_eq!(
+            generation.strong_count(),
+            1,
+            "the slot returns only after the cancelled request's first read has finished"
+        );
+        let mut blocks = Vec::new();
+        read_blocks(&mut admitted, &mut blocks, usize::MAX).await?;
+        assert_linked_from_genesis(&blocks, 4);
         drop(admitted);
         harness.stop().await
     }

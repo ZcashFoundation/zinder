@@ -5894,6 +5894,7 @@ dependencies = [
  "eyre",
  "hex",
  "metrics",
+ "metrics-exporter-prometheus",
  "parking_lot",
  "prost",
  "secrecy",

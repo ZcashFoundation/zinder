@@ -985,9 +985,10 @@ they read that chunk and continue only along the chain they have already sent
 ([ADR-0038](../adrs/0038-wallet-runtime-composition-and-capability-discovery.md#compatibility-block-range-streams)).
 A chunk holds at most 1,000 blocks and 2 MiB of stored compact blocks, or one
 larger block. True per-item store back-pressure requires an owned snapshot
-streaming read API; until then the chunk caps and the process-wide limit on
-concurrent block-range streams are the memory bound
-([Block range resource limits](../reference/lightwalletd-compatibility.md#block-range-resource-limits)).
+streaming read API. Until then, the chunk caps and the process-wide limit on
+concurrent block-range streams are the only controls on that memory.
+[Block range resource limits](../reference/lightwalletd-compatibility.md#block-range-resource-limits)
+lists what they leave unbounded.
 `GetAddressUtxos` and `GetAddressUtxosStream` bound each address at the read.
 They consume each address's `TransparentAddressUnspentOutputs` stream in
 address-index order and stop it once its later outputs cannot change the

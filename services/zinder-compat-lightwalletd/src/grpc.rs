@@ -1049,8 +1049,9 @@ struct CompactBlockWindow {
 ///
 /// The first chunk is read at the entry epoch before the response, so an
 /// unreadable window fails the call rather than a stream the client has
-/// already opened. Later chunks follow [`BlockRangeContinuity`]. The response
-/// and the reader of later chunks each hold `stream_slot` until they finish.
+/// already opened. Later chunks follow [`BlockRangeContinuity`]. The read of
+/// the first chunk, the response, and the reader of later chunks each hold
+/// `stream_slot` until they finish, even when the client cancels the call.
 async fn stream_compact_block_range<QueryApi>(
     query_api: QueryApi,
     block_range: BlockHeightRange,
@@ -1064,13 +1065,20 @@ where
     let Some(first_chunk) = chunks.next_chunk() else {
         return Ok(Box::pin(stream::empty()));
     };
-    let first_range = read_compact_block_chunk(
-        &query_api,
-        first_chunk,
-        &chunks,
-        Some(window.entry_epoch_id),
-    )
-    .await?;
+    let first_range = stream_slot
+        .hold_during({
+            let query_api = query_api.clone();
+            async move {
+                read_compact_block_chunk(
+                    &query_api,
+                    first_chunk,
+                    &chunks,
+                    Some(window.entry_epoch_id),
+                )
+                .await
+            }
+        })
+        .await?;
     chunks.advance(first_range.compact_blocks.len());
     if !chunks.has_remaining() {
         let first_messages = encode_compact_block_chunk(first_range.compact_blocks, window);

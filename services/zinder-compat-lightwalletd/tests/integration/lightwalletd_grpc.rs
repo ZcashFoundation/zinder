@@ -1368,6 +1368,61 @@ async fn a_dropped_block_range_stream_keeps_its_slot_until_its_reader_stops() ->
     Ok(())
 }
 
+/// A request cancelled during its first chunk read keeps its slot until the
+/// read has finished.
+///
+/// A store read finishes on the blocking pool after its caller is gone, so
+/// the slot must cover it. The slot returns once the read has finished.
+#[tokio::test]
+async fn a_request_cancelled_during_its_first_read_keeps_its_slot_until_the_read_ends()
+-> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let first_chunk_gate = FirstChunkGate::closed();
+    let recorder = EpochPinRecorder::new(store_fixture.query())
+        .with_synthetic_compact_blocks_to(BlockHeight::new(2_500))
+        .with_first_chunk_gate(first_chunk_gate.clone());
+    let adapter = LightwalletdGrpcAdapter::new(recorder.clone())
+        .with_max_concurrent_block_range_streams(NonZeroU32::MIN);
+
+    let mut cancelled = adapter.get_block_range(Request::new(block_range_request(1, 2_500)));
+    tokio::select! {
+        outcome = &mut cancelled => {
+            return Err(eyre!(
+                "the request ended before its gated first read: {:?}",
+                outcome.map(|_| ())
+            ));
+        }
+        () = first_chunk_gate.reached.notified() => {}
+    }
+    drop(cancelled);
+
+    assert_eq!(
+        adapter
+            .get_block_range(Request::new(block_range_request(1, 10)))
+            .await
+            .err()
+            .map(|status| status.code()),
+        Some(Code::ResourceExhausted),
+        "a request cancelled during its first read must keep its slot while the read runs"
+    );
+    assert!(
+        recorder.recorded_compact_block_ranges().is_empty(),
+        "the cancelled request's first read is still waiting"
+    );
+
+    first_chunk_gate.release.add_permits(1);
+    wait_for_block_range_slot(&adapter).await?;
+    assert_eq!(
+        recorder.recorded_compact_block_ranges().first(),
+        Some(&BlockHeightRange::inclusive(
+            BlockHeight::new(1),
+            BlockHeight::new(1_000)
+        )),
+        "the slot returns only after the cancelled request's first read has finished"
+    );
+    Ok(())
+}
+
 /// A client that disconnects in the middle of a stream returns its slot, and
 /// the refusal reaches a generated client as `RESOURCE_EXHAUSTED`.
 #[tokio::test]
@@ -1689,6 +1744,28 @@ struct EpochPinRecorder<Inner> {
     /// Holds every unpinned compact-block range read, the read of a later
     /// block-range chunk, until it has a permit.
     later_chunk_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// Holds the next pinned compact-block range read, the read of a
+    /// block-range stream's first chunk, until the gate opens. Only one read
+    /// waits on it.
+    first_chunk_gate: Arc<Mutex<Option<FirstChunkGate>>>,
+}
+
+/// A gate on one read that tells the test when the read has reached it.
+#[derive(Clone)]
+struct FirstChunkGate {
+    /// Notified once the read waits on the gate.
+    reached: Arc<tokio::sync::Notify>,
+    /// The read continues once this has a permit.
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl FirstChunkGate {
+    fn closed() -> Self {
+        Self {
+            reached: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
 }
 
 impl<Inner> EpochPinRecorder<Inner> {
@@ -1703,6 +1780,7 @@ impl<Inner> EpochPinRecorder<Inner> {
             completed_compact_block_reads: Arc::new(AtomicUsize::new(0)),
             served_compact_block_epochs: Arc::new(Mutex::new(Vec::new())),
             later_chunk_gate: None,
+            first_chunk_gate: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1710,6 +1788,13 @@ impl<Inner> EpochPinRecorder<Inner> {
     /// permit. Each read returns the permit it took.
     fn with_later_chunk_gate(mut self, gate: Arc<tokio::sync::Semaphore>) -> Self {
         self.later_chunk_gate = Some(gate);
+        self
+    }
+
+    /// Holds the read of the next block-range stream's first chunk on
+    /// `gate`. Later first-chunk reads do not wait.
+    fn with_first_chunk_gate(mut self, gate: FirstChunkGate) -> Self {
+        self.first_chunk_gate = Arc::new(Mutex::new(Some(gate)));
         self
     }
 
@@ -2049,6 +2134,15 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         max_bytes: usize,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<CompactBlockRange, QueryError> {
+        let first_chunk_gate = if at_epoch_id.is_some() {
+            self.first_chunk_gate.lock().take()
+        } else {
+            None
+        };
+        if let Some(gate) = first_chunk_gate {
+            gate.reached.notify_one();
+            let _permit = gate.release.acquire().await;
+        }
         if at_epoch_id.is_none()
             && let Some(gate) = &self.later_chunk_gate
         {

@@ -283,9 +283,15 @@ it. A client can rely on the following:
 ## Block range resource limits
 
 `GetBlockRange` and `GetBlockRangeNullifiers` streams are the compatibility
-runtime's largest memory term after its block caches. The chunk size bounds
-one stream, a process-wide limit bounds how many streams run at once, and
-HTTP/2 keepalive ends the streams of clients that vanished.
+runtime's largest memory term after its block caches. Three mechanisms limit
+what the streams hold:
+
+- The chunk cap limits the stored blocks that one chunk read keeps.
+- A process-wide limit bounds how many streams run at once.
+- HTTP/2 keepalive ends the streams of clients that vanished.
+
+None of them sets a byte maximum on that memory, and the total is not
+measured.
 
 ### Chunk size
 
@@ -319,13 +325,14 @@ The cap is fixed. On Testnet, 1,000-block stretches of heavy blocks measured
 
 The server holds, for one stream:
 
-- The chunk it is reading, at most 2 MiB of stored blocks unless one block is
-  larger. While the read and the encoding overlap, it takes about one to two
-  times the chunk's size in live memory. The encoded chunk then waits for the
-  client.
+- The chunk it is reading: at most 2 MiB of stored blocks, or one block that
+  is larger. The read decodes each block into values that it allocates
+  separately. The encoding then builds lightwalletd messages with byte
+  vectors of their own while the decoded chunk is still held. After that, the
+  encoded chunk waits for the client.
 - During a read, the rows it fetched but does not keep: within the chunk's
-  2 MiB while block sizes stay steady, and up to 16 blocks when the read meets
-  blocks larger than any before them.
+  2 MiB of stored bytes while block sizes stay steady, and up to 16 blocks
+  when the read meets blocks larger than any before them.
 - Up to 16 queued blocks in wallet serving, or 8 in compact-blocks serving.
   These are whole blocks, so their size follows the blocks in the range, not
   the chunk cap.
@@ -333,11 +340,27 @@ The server holds, for one stream:
   encoding buffer. The encoding buffer can exceed 32 KiB by one block.
 
 At the start of a stream, the first chunk and the second can both be held.
-Without blocks larger than 2 MiB, and with block sizes that stay steady within
-a read, one stream therefore holds at most about 6 MiB of chunk data while it
-reads its second chunk, and about 4 MiB while it reads a later one, plus its
-queued blocks and transport buffers. These figures are arithmetic from the
-caps, not measurements.
+Later, the stream holds the chunk it is reading and the blocks queued from
+the chunk before it.
+
+The server enforces these limits for one stream:
+
+- The stored bytes that one chunk read keeps, and the 1,000-block maximum of
+  a chunk.
+- The number of chunks the stream holds at once.
+- The number of queued blocks.
+
+It does not limit the bytes behind them:
+
+- A chunk takes more memory than its stored bytes, because the decoded
+  blocks and the encoded messages each allocate their own values. How much
+  more depends on the shape of the blocks and is not measured.
+- A block larger than 2 MiB is read alone, so its own size sets the size of
+  its chunk.
+- Queued blocks are whole blocks of any size.
+
+The memory one stream holds therefore has no maximum that the server
+enforces, and it is not measured.
 
 The client holds one more term. Its HTTP/2 stream window bounds how far the
 server can send ahead of what the wallet has read, and those blocks sit in
@@ -356,9 +379,12 @@ once. It defaults to 100 and accepts 1 to 65,536.
 
 - A stream takes a slot once its request is validated, so a malformed
   request gets `INVALID_ARGUMENT` whatever the load. It returns the slot when
-  the stream ends or fails, or when the client cancels it or disconnects. A
-  stream of more than one chunk returns its slot once its background reader
-  stops too, which takes at most one chunk read.
+  the stream ends or fails, or when the client cancels it or disconnects,
+  once no chunk read of the stream is still running. A chunk read that has
+  started finishes even after the client has gone, so the slot stays taken
+  for at most one more chunk read. This holds for the first chunk, which the
+  server reads before it answers, and for the chunks its background reader
+  reads later.
 - A valid request past the limit fails with `RESOURCE_EXHAUSTED` before any
   read, and `zinder_compat_block_range_stream_refusals_total` counts it.
   `zinder_compat_block_range_streams_open` reports how many streams hold a
@@ -368,10 +394,14 @@ once. It defaults to 100 and accepts 1 to 65,536.
   verified.
 
 A syncing wallet holds few block-range streams at once, so the default
-serves many syncing wallets. Size the limit to the memory left after the
-block caches described below. At the default, 100 streams that all start at
-once hold about 600 MiB of chunk data, plus up to 16 queued blocks each and
-their transport buffers. Freed memory can stay with the allocator after the
+serves many syncing wallets. The limit bounds how many streams hold the
+terms in [One stream](#one-stream), not how many bytes they hold together.
+That total is not measured, at the default or at any other limit.
+
+Size the limit to the memory left after the block caches described below.
+Then check the container's memory while
+`zinder_compat_block_range_streams_open` is near the limit, with the blocks
+your wallets request. Freed memory can stay with the allocator after the
 streams end.
 
 Every client shares the limit, and the server cannot tell clients apart.

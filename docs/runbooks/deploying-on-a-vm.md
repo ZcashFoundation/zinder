@@ -134,7 +134,8 @@ The compatibility container's memory limit, `ZINDER_COMPAT_MEMORY_LIMIT`
 (4 GiB by default), must cover four reader generations of block caches plus
 `compat.max_concurrent_block_range_streams` block-range streams.
 [Block range resource limits](../reference/lightwalletd-compatibility.md#block-range-resource-limits)
-sizes both terms.
+describes both terms. The memory the streams hold is not measured, so check
+the container's memory under wallet load before you raise the stream limit.
 
 ### Upgrade an existing env file
 

@@ -16,17 +16,15 @@
 //! when the visible tip fell below a height still to send. ADR-0038,
 //! "Compatibility block-range streams", records the contract.
 //!
-//! Every open stream holds one slot of a process-wide
-//! [`BlockRangeStreamLimit`], so the memory that block-range streams hold is
-//! bounded by the number of slots times the bound of one stream.
+//! A stream holds one slot of a process-wide [`BlockRangeStreamLimit`] from
+//! its admission until its response is dropped and every read it started
+//! has finished, so the number of slots bounds how many streams hold chunks
+//! at once.
 
 use std::{
     num::NonZeroU32,
     pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering},
-    },
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -159,12 +157,11 @@ const OPEN_STREAMS_GAUGE: &str = "zinder_compat_block_range_streams_open";
 /// `GetBlockRangeNullifiers` streams.
 ///
 /// Clones share one limit. A stream takes a slot after its request passes
-/// validation and returns it when the stream ends, fails, or the client goes
-/// away.
+/// validation. It returns the slot when the stream ends, fails, or the client
+/// goes away, and no read of the stream is still running.
 #[derive(Clone, Debug)]
 pub struct BlockRangeStreamLimit {
     slots: Arc<Semaphore>,
-    open_streams: Arc<AtomicU32>,
     max_streams: NonZeroU32,
 }
 
@@ -175,10 +172,11 @@ impl BlockRangeStreamLimit {
         let permits = usize::try_from(max_streams.get())
             .unwrap_or(Semaphore::MAX_PERMITS)
             .min(Semaphore::MAX_PERMITS);
-        metrics::gauge!(OPEN_STREAMS_GAUGE).set(0.0);
+        // Publishes the gauge before the first stream opens. Setting it to
+        // zero would discard the slots that other limits in the process hold.
+        metrics::gauge!(OPEN_STREAMS_GAUGE).increment(0.0);
         Self {
             slots: Arc::new(Semaphore::new(permits)),
-            open_streams: Arc::new(AtomicU32::new(0)),
             max_streams,
         }
     }
@@ -204,39 +202,31 @@ impl BlockRangeStreamLimit {
             )));
         };
         Ok(BlockRangeStreamSlot {
-            _open_stream: Arc::new(OpenStream::new(permit, Arc::clone(&self.open_streams))),
+            _open_stream: Arc::new(OpenStream::new(permit)),
         })
     }
 }
 
 /// A taken slot, counted in `zinder_compat_block_range_streams_open` until it
 /// is dropped.
+///
+/// The gauge moves by one on each open and close rather than taking a count,
+/// so concurrent opens and closes cannot leave it at a stale value.
 #[derive(Debug)]
 struct OpenStream {
     _permit: OwnedSemaphorePermit,
-    open_streams: Arc<AtomicU32>,
 }
 
 impl OpenStream {
-    fn new(permit: OwnedSemaphorePermit, open_streams: Arc<AtomicU32>) -> Self {
-        let open = open_streams
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        metrics::gauge!(OPEN_STREAMS_GAUGE).set(f64::from(open));
-        Self {
-            _permit: permit,
-            open_streams,
-        }
+    fn new(permit: OwnedSemaphorePermit) -> Self {
+        metrics::gauge!(OPEN_STREAMS_GAUGE).increment(1.0);
+        Self { _permit: permit }
     }
 }
 
 impl Drop for OpenStream {
     fn drop(&mut self) {
-        let open = self
-            .open_streams
-            .fetch_sub(1, Ordering::Relaxed)
-            .saturating_sub(1);
-        metrics::gauge!(OPEN_STREAMS_GAUGE).set(f64::from(open));
+        metrics::gauge!(OPEN_STREAMS_GAUGE).decrement(1.0);
     }
 }
 
@@ -245,15 +235,40 @@ pub type BlockRangeResponse<Message> = Pin<Box<dyn Stream<Item = Message> + Send
 
 /// One stream's slot of a [`BlockRangeStreamLimit`].
 ///
-/// The slot returns to the limit when the response it holds is dropped and,
-/// for a stream of more than one chunk, the [`BlockRangeSink`] of the stream's
-/// reader is dropped too.
+/// The slot returns to the limit once every holder has dropped it: the
+/// response, the [`BlockRangeSink`] of the stream's reader for a stream of
+/// more than one chunk, and a read run with [`Self::hold_during`] that has
+/// not finished.
 #[derive(Clone, Debug)]
 pub struct BlockRangeStreamSlot {
     _open_stream: Arc<OpenStream>,
 }
 
 impl BlockRangeStreamSlot {
+    /// Runs `read` on a task of its own that holds this slot until `read`
+    /// has finished and its output is dropped, and returns that output.
+    ///
+    /// A store read runs on the blocking pool, which finishes it even after
+    /// its caller is cancelled. A client that cancels its request during
+    /// `read` therefore cannot return the slot while `read` still holds the
+    /// chunk it reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of `read`, or `UNAVAILABLE` when the task that runs
+    /// `read` panics.
+    pub async fn hold_during<Output, Read>(&self, read: Read) -> Result<Output, Status>
+    where
+        Output: Send + 'static,
+        Read: Future<Output = Result<Output, Status>> + Send + 'static,
+    {
+        let stream_slot = self.clone();
+        let (outcome, _stream_slot) = tokio::spawn(async move { (read.await, stream_slot) })
+            .await
+            .map_err(|error| Status::unavailable(format!("block-range read failed: {error}")))?;
+        outcome
+    }
+
     /// Returns a response that sends `messages` and holds this slot until it
     /// is dropped.
     #[must_use]
@@ -790,5 +805,35 @@ mod tests {
         let reopened = limit.try_open()?;
         drop((reopened, other_stream));
         Ok(())
+    }
+
+    #[test]
+    fn the_open_streams_gauge_counts_each_slot_until_its_last_holder_drops_it()
+    -> Result<(), tonic::Status> {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let open_streams = || {
+            handle.render().lines().find_map(|line| {
+                line.strip_prefix("zinder_compat_block_range_streams_open ")?
+                    .parse::<f64>()
+                    .ok()
+            })
+        };
+        metrics::with_local_recorder(&recorder, || {
+            let limit = BlockRangeStreamLimit::new(NonZeroU32::MIN.saturating_add(1));
+            assert_eq!(open_streams(), Some(0.0));
+            let response_side = limit.try_open()?;
+            let other_stream = limit.try_open()?;
+            let reader_side = response_side.clone();
+            // A limit created while streams are open leaves their count alone.
+            let _other_limit = BlockRangeStreamLimit::new(NonZeroU32::MIN);
+            assert_eq!(open_streams(), Some(2.0));
+
+            drop((response_side, other_stream));
+            assert_eq!(open_streams(), Some(1.0));
+            drop(reader_side);
+            assert_eq!(open_streams(), Some(0.0));
+            Ok(())
+        })
     }
 }
