@@ -9,8 +9,8 @@ use zinder_compat_cipherscan::CipherscanRestAdapter;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_runtime::{
     Readiness, ReadinessCause, ReadinessState, RuntimeService, StartupPhase,
-    cancel_on_terminating_signal, connect_zinder_grpc, install_tracing_subscriber,
-    spawn_ops_endpoint_for,
+    TracingSubscriberError, cancel_on_terminating_signal, connect_zinder_grpc,
+    install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 
 mod config;
@@ -60,7 +60,9 @@ struct Cli {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    install_tracing_subscriber();
+    if let Err(error) = install_tracing_subscriber() {
+        return emit_tracing_subscriber_error(&error);
+    }
 
     if cli.print_config {
         return run_print_config(cli);
@@ -204,6 +206,15 @@ async fn run_cipherscan_adapter(cli: Cli) -> Result<(), CipherscanConfigError> {
 async fn drain_readiness_on_cancel(cancel: CancellationToken, readiness: Readiness) {
     cancel.cancelled().await;
     readiness.set(ReadinessState::not_ready(ReadinessCause::ShuttingDown));
+}
+
+#[allow(
+    clippy::print_stderr,
+    reason = "no tracing subscriber is installed, so stderr is the only channel left"
+)]
+fn emit_tracing_subscriber_error(error: &TracingSubscriberError) -> ExitCode {
+    eprintln!("{}: {error}", env!("CARGO_BIN_NAME"));
+    ExitCode::FAILURE
 }
 
 fn emit_runtime_error(error: &CipherscanConfigError) -> ExitCode {

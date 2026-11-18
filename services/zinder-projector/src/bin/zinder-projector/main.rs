@@ -15,9 +15,10 @@ use zinder_core::{
 use zinder_runtime::{
     CanonicalFenceConvergence, CanonicalFenceConvergenceError, CanonicalFenceConvergencePolicy,
     CanonicalFenceLag, CanonicalFenceProbe, CanonicalFenceRelation, OpsServer, Readiness,
-    ReadinessState, cancel_on_terminating_signal, compare_canonical_writer_fences,
-    converge_on_canonical_writer_fence, expected_writer_fence, host_cpu_meets_compiled_baseline,
-    install_tracing_subscriber, spawn_ops_endpoint, writer_attests_network_upgrade_schedule,
+    ReadinessState, TracingSubscriberError, cancel_on_terminating_signal,
+    compare_canonical_writer_fences, converge_on_canonical_writer_fence, expected_writer_fence,
+    host_cpu_meets_compiled_baseline, install_tracing_subscriber, spawn_ops_endpoint,
+    writer_attests_network_upgrade_schedule,
 };
 use zinder_store::{
     CanonicalEventCursor, CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalReorgPolicy,
@@ -147,7 +148,9 @@ impl From<Cli> for ProjectorConfigOverrides {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    install_tracing_subscriber();
+    if let Err(error) = install_tracing_subscriber() {
+        return emit_tracing_subscriber_error(&error);
+    }
     if !host_cpu_meets_compiled_baseline() {
         return ExitCode::FAILURE;
     }
@@ -2397,6 +2400,15 @@ fn wallet_row_count(counts: zinder_wallet_projection::WalletProjectionFamilyRowC
         .saturating_add(counts.transparent_address_transaction_count)
         .saturating_add(counts.transparent_address_balance_count)
         .saturating_add(counts.reorg_undo_count)
+}
+
+#[allow(
+    clippy::print_stderr,
+    reason = "no tracing subscriber is installed, so stderr is the only channel left"
+)]
+fn emit_tracing_subscriber_error(error: &TracingSubscriberError) -> ExitCode {
+    eprintln!("{}: {error}", env!("CARGO_BIN_NAME"));
+    ExitCode::FAILURE
 }
 
 fn emit_error(error: &ProjectorError) -> ExitCode {
