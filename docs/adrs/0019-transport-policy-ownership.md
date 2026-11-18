@@ -391,7 +391,7 @@ them, as
 describes, so the bound covers native `BroadcastTransaction`, lightwalletd
 `SendTransaction`, and the Cipherscan broadcast that query serves.
 
-The policy leaves four gaps:
+The policy leaves five gaps:
 
 - Clients spread over many connections can still keep a pool full, because
   each connection then holds no more slots than a new one would. Limit
@@ -406,6 +406,12 @@ The policy leaves four gaps:
   reads, resets the stream, or closes the connection, because hyper waits for
   flow-control window before it asks the body again. Graceful shutdown waits
   for such a stream too.
+- The receive limit runs before each service's interceptors, so a request
+  claims a slot before the Explorer's bearer-token check refuses it. An
+  unauthenticated client can therefore fill a pool, or evict a request that is
+  still arriving, for the moment before its own request is refused. The
+  Explorer has no client-streaming methods, so that moment is short, but keep a
+  bearer-token listener on a private network.
 
 ### Observability
 
