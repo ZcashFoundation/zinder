@@ -268,13 +268,21 @@ broadcast, so it exports none of those series.
 | `zinder_query_request_total` | counter | `operation`, `status`, `error_class` | Wallet reads. One protocol request can record several reads. |
 | `zinder_query_request_duration_seconds` | histogram | `operation`, `status`, `error_class` | Duration of each read, including any tree-state rebuild and the node call of a broadcast. |
 | `zinder_query_compact_block_range_block_count` | histogram | `status` | Blocks each compact-block range read asked for. |
-| `zinder_query_tree_state_replayed_blocks` | histogram | | Blocks replayed to answer each served tree-state read, from 0 to 99. A stored checkpoint records 0. |
-| `zinder_query_tree_state_replayed_commitments` | histogram | | Note commitments appended across all pools to answer each served tree-state read. A stored checkpoint records 0. |
+| `zinder_query_tree_state_reads_total` | counter | `source`, `height_band` | Served tree-state reads. `source` is `stored` for a height with a stored checkpoint and `replayed` for a rebuilt one. |
+| `zinder_query_tree_state_replayed_blocks` | histogram | `height_band` | Blocks replayed to answer each served tree-state read, from 0 to 99. A stored checkpoint records 0. |
+| `zinder_query_tree_state_replayed_commitments` | histogram | `pool`, `height_band` | Note commitments appended to each pool (`sapling`, `orchard`, `ironwood`) to answer each served tree-state read. A stored checkpoint records 0. |
 | `zinder_query_tree_state_replay_admissions_total` | counter | | Tree-state rebuilds that took a rebuild slot. |
 | `zinder_query_tree_state_replay_refusals_total` | counter | | Tree-state reads refused because one rebuild per CPU was already running. |
 | `zinder_query_tree_state_replay_wait_duration_seconds` | histogram | | Time each admitted or refused rebuild waited for a rebuild slot. |
-| `zinder_query_tree_state_replay_duration_seconds` | histogram | | Time each completed rebuild spent reading and replaying compact blocks. |
+| `zinder_query_tree_state_replay_duration_seconds` | histogram | `height_band` | Time each completed rebuild spent reading and replaying compact blocks. |
 | `zinder_query_broadcast_budget_refusals_total` | counter | | Broadcasts refused because 16 MiB of transactions were already in flight. |
+
+`height_band` is the first height of the read's 250,000-block band, such as
+`1750000`. Rebuild time can follow note commitments more than blocks, so
+compare `zinder_query_tree_state_replayed_commitments` with the rebuild
+duration in dense bands such as the 2022 spam range. The share of reads served
+from a stored checkpoint, per band, is
+`sum by (height_band) (rate(zinder_query_tree_state_reads_total{source="stored"}[5m])) / sum by (height_band) (rate(zinder_query_tree_state_reads_total[5m]))`.
 
 `operation` names the read, such as `compact_blocks_in_range` or
 `tree_state_at`. `status` is `ok` or `error`. `error_class` is `none` on

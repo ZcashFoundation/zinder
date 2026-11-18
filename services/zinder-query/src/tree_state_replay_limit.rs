@@ -4,9 +4,19 @@
 use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use zinder_core::ChainTipMetadata;
+use zinder_core::{BlockHeight, ChainTipMetadata};
 
 use crate::QueryError;
+
+/// Blocks in one `height_band` label value.
+///
+/// A coarse band keeps the label set small, about 15 values on Mainnet, while
+/// still separating dense eras such as the 2022 spam range from the rest.
+const HEIGHT_BAND_BLOCKS: u32 = 250_000;
+
+/// Counter of served tree-state reads, by whether a checkpoint was stored at
+/// the height.
+const TREE_STATE_READS_COUNTER: &str = "zinder_query_tree_state_reads_total";
 
 /// Counter of reconstructions that took a replay slot.
 const REPLAY_ADMISSIONS_COUNTER: &str = "zinder_query_tree_state_replay_admissions_total";
@@ -82,50 +92,88 @@ impl TreeStateReplayLimit {
     }
 }
 
-/// Records one served tree-state read whose trees after its seed hold
-/// `seed_trees`, its answer holds `served_trees`, and its seed sits
-/// `replayed_blocks` below the requested height.
+/// Records one served tree-state read at `height` whose seed sits
+/// `replayed_blocks` below it, whose trees after that seed hold `seed_trees`,
+/// and whose answer holds `served_trees`.
 ///
-/// A stored checkpoint is its own seed and records zero blocks and zero
-/// commitments, so the samples show how often requests avoid a replay.
-pub(crate) fn record_tree_state_depth(
+/// A stored checkpoint is its own seed, so it counts as a `stored` read and
+/// records zero blocks and zero commitments in every pool. Every other read
+/// replays at least one block and counts as `replayed`.
+pub(crate) fn record_tree_state_read(
+    height: BlockHeight,
     replayed_blocks: u32,
     seed_trees: ChainTipMetadata,
     served_trees: ChainTipMetadata,
 ) {
-    metrics::histogram!(REPLAYED_BLOCKS_HISTOGRAM).record(f64::from(replayed_blocks));
-    // u64 note-commitment counts stay exact in an f64 below 2^53.
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "a replay appends far fewer than 2^53 commitments"
-    )]
-    metrics::histogram!(REPLAYED_COMMITMENTS_HISTOGRAM)
-        .record(appended_commitments(seed_trees, served_trees) as f64);
+    let band = height_band(height);
+    let source = if replayed_blocks == 0 {
+        "stored"
+    } else {
+        "replayed"
+    };
+    metrics::counter!(TREE_STATE_READS_COUNTER, "source" => source, "height_band" => band.clone())
+        .increment(1);
+    metrics::histogram!(REPLAYED_BLOCKS_HISTOGRAM, "height_band" => band.clone())
+        .record(f64::from(replayed_blocks));
+    for (pool, appended) in appended_commitments(seed_trees, served_trees) {
+        metrics::histogram!(
+            REPLAYED_COMMITMENTS_HISTOGRAM,
+            "pool" => pool,
+            "height_band" => band.clone()
+        )
+        .record(f64::from(appended));
+    }
 }
 
-/// Records how long one completed reconstruction spent replaying.
-pub(crate) fn record_replay_duration(replay_duration: Duration) {
-    metrics::histogram!(REPLAY_DURATION_HISTOGRAM).record(replay_duration.as_secs_f64());
+/// Records how long one completed reconstruction of `height` spent replaying.
+pub(crate) fn record_replay_duration(height: BlockHeight, replay_duration: Duration) {
+    metrics::histogram!(REPLAY_DURATION_HISTOGRAM, "height_band" => height_band(height))
+        .record(replay_duration.as_secs_f64());
 }
 
-/// Note commitments appended across all pools to grow `seed_trees` into
-/// `served_trees`.
-fn appended_commitments(seed_trees: ChainTipMetadata, served_trees: ChainTipMetadata) -> u64 {
-    let appended = |seed: u32, served: u32| u64::from(served.saturating_sub(seed));
-    appended(
-        seed_trees.sapling_commitment_tree_size,
-        served_trees.sapling_commitment_tree_size,
-    ) + appended(
-        seed_trees.orchard_commitment_tree_size,
-        served_trees.orchard_commitment_tree_size,
-    ) + appended(
-        seed_trees.ironwood_commitment_tree_size,
-        served_trees.ironwood_commitment_tree_size,
-    )
+/// The `height_band` label of `height`: the first height of its
+/// [`HEIGHT_BAND_BLOCKS`]-block band.
+fn height_band(height: BlockHeight) -> String {
+    (height.value() - height.value() % HEIGHT_BAND_BLOCKS).to_string()
+}
+
+/// Note commitments appended to each pool to grow `seed_trees` into
+/// `served_trees`, labelled by pool.
+fn appended_commitments(
+    seed_trees: ChainTipMetadata,
+    served_trees: ChainTipMetadata,
+) -> [(&'static str, u32); 3] {
+    [
+        (
+            "sapling",
+            served_trees
+                .sapling_commitment_tree_size
+                .saturating_sub(seed_trees.sapling_commitment_tree_size),
+        ),
+        (
+            "orchard",
+            served_trees
+                .orchard_commitment_tree_size
+                .saturating_sub(seed_trees.orchard_commitment_tree_size),
+        ),
+        (
+            "ironwood",
+            served_trees
+                .ironwood_commitment_tree_size
+                .saturating_sub(seed_trees.ironwood_commitment_tree_size),
+        ),
+    ]
 }
 
 /// Registers `# HELP` and `# TYPE` text for the tree-state read metrics.
 pub(crate) fn describe_metrics() {
+    metrics::describe_counter!(
+        TREE_STATE_READS_COUNTER,
+        metrics::Unit::Count,
+        "Served tree-state reads. `source` is `stored` when a checkpoint is stored at the \
+         height and `replayed` when it was rebuilt; `height_band` is the first height of \
+         the read's 250,000-block band."
+    );
     metrics::describe_counter!(
         REPLAY_ADMISSIONS_COUNTER,
         metrics::Unit::Count,
@@ -142,13 +190,14 @@ pub(crate) fn describe_metrics() {
         REPLAYED_BLOCKS_HISTOGRAM,
         metrics::Unit::Count,
         "Compact blocks replayed to answer one tree-state request, from the nearest \
-         stored checkpoint to the requested height. A stored checkpoint records 0."
+         stored checkpoint to the requested height, by height band. A stored \
+         checkpoint records 0."
     );
     metrics::describe_histogram!(
         REPLAYED_COMMITMENTS_HISTOGRAM,
         metrics::Unit::Count,
-        "Note commitments appended across all pools to answer one tree-state request. \
-         A stored checkpoint records 0."
+        "Note commitments appended to one pool to answer one tree-state request, by \
+         pool and height band. A stored checkpoint records 0."
     );
     metrics::describe_histogram!(
         REPLAY_WAIT_HISTOGRAM,
@@ -159,28 +208,32 @@ pub(crate) fn describe_metrics() {
     metrics::describe_histogram!(
         REPLAY_DURATION_HISTOGRAM,
         metrics::Unit::Seconds,
-        "Time one completed tree-state rebuild spent reading and replaying compact blocks."
+        "Time one completed tree-state rebuild spent reading and replaying compact blocks, \
+         by height band."
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use zinder_core::ChainTipMetadata;
+    use zinder_core::{BlockHeight, ChainTipMetadata};
 
-    use super::appended_commitments;
+    use super::{appended_commitments, height_band};
 
     #[test]
-    fn appended_commitments_sum_every_pool_growth() {
+    fn appended_commitments_count_each_pool_growth() {
         assert_eq!(
             appended_commitments(
                 ChainTipMetadata::new(10, 0, 4),
                 ChainTipMetadata::new(13, 5, 4)
             ),
-            8
+            [("sapling", 3), ("orchard", 5), ("ironwood", 0)]
         );
-        assert_eq!(
-            appended_commitments(ChainTipMetadata::empty(), ChainTipMetadata::empty()),
-            0
-        );
+    }
+
+    #[test]
+    fn height_bands_start_at_each_250_000_block_boundary() {
+        assert_eq!(height_band(BlockHeight::new(0)), "0");
+        assert_eq!(height_band(BlockHeight::new(249_999)), "0");
+        assert_eq!(height_band(BlockHeight::new(1_812_345)), "1750000");
     }
 }

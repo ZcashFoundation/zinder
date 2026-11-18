@@ -50,7 +50,7 @@ use crate::{
     node_broadcast::EndpointVerifications,
     serving_read,
     tree_state_replay_limit::{
-        TreeStateReplayLimit, record_replay_duration, record_tree_state_depth,
+        TreeStateReplayLimit, record_replay_duration, record_tree_state_read,
     },
     validate_block_range, validate_subtree_root_range,
 };
@@ -1079,7 +1079,7 @@ where
             {
                 let tree_state = tree_state_from_checkpoint(lookup_epoch, stored)?;
                 let trees = stored.tip_metadata();
-                record_tree_state_depth(0, trees, trees);
+                record_tree_state_read(height, 0, trees, trees);
                 return Ok(tree_state);
             }
             // Without a seed the canonical reader replays nothing: it answers
@@ -1104,8 +1104,9 @@ where
                 })
                 .await?;
             if let Some(seed) = nearest {
-                record_replay_duration(replay_duration);
-                record_tree_state_depth(
+                record_replay_duration(height, replay_duration);
+                record_tree_state_read(
+                    height,
                     height.value().saturating_sub(seed.block_id.height.value()),
                     seed.tip_metadata(),
                     checkpoint.tip_metadata(),
@@ -1684,9 +1685,13 @@ mod tree_state_replay_limit_tests {
 
         let rendered = rendered.render();
         for expected in [
-            "zinder_query_tree_state_replayed_blocks_count 2",
-            "zinder_query_tree_state_replayed_commitments_count 2",
-            "zinder_query_tree_state_replay_duration_seconds_count 1",
+            "zinder_query_tree_state_reads_total{source=\"stored\",height_band=\"0\"} 1",
+            "zinder_query_tree_state_reads_total{source=\"replayed\",height_band=\"0\"} 1",
+            "zinder_query_tree_state_replayed_blocks_count{height_band=\"0\"} 2",
+            "zinder_query_tree_state_replayed_commitments_count{pool=\"sapling\",height_band=\"0\"} 2",
+            "zinder_query_tree_state_replayed_commitments_count{pool=\"orchard\",height_band=\"0\"} 2",
+            "zinder_query_tree_state_replayed_commitments_count{pool=\"ironwood\",height_band=\"0\"} 2",
+            "zinder_query_tree_state_replay_duration_seconds_count{height_band=\"0\"} 1",
             "zinder_query_tree_state_replay_wait_duration_seconds_count 3",
             "zinder_query_tree_state_replay_admissions_total 2",
             "zinder_query_tree_state_replay_refusals_total 1",
@@ -1697,8 +1702,9 @@ mod tree_state_replay_limit_tests {
             );
         }
         assert!(
-            rendered.lines().any(|line| line
-                .starts_with("zinder_query_tree_state_replayed_blocks{quantile=\"0\"} 0")),
+            rendered.lines().any(|line| line.starts_with(
+                "zinder_query_tree_state_replayed_blocks{height_band=\"0\",quantile=\"0\"} 0"
+            )),
             "a stored checkpoint samples zero replayed blocks:\n{rendered}"
         );
         Ok(())
