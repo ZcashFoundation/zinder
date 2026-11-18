@@ -16,7 +16,9 @@ use zinder_core::{
 };
 use zinder_proto::capabilities::WALLET_BROADCAST_TRANSACTION_V1;
 use zinder_query::{OrderedBroadcaster, QueryError, WalletQueryApi, WalletServingQuery};
-use zinder_source::{NodeAuth, SourceError, ZebraJsonRpcSource};
+use zinder_source::{
+    DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth, NodeTarget, SourceError, ZebraJsonRpcSource,
+};
 use zinder_testkit::{
     ChainFixture, JsonRpcTestServer, MockTransactionBroadcaster, RpcReply,
     WalletServingStoreFixture, method, sample_regtest_upgrade_activations,
@@ -277,6 +279,70 @@ async fn node_cookie_written_after_startup_is_verified_once_it_appears() -> eyre
             .iter()
             .all(|request| request.authorization.as_deref() == Some(AUTHORIZATION)),
         "{requests:?}"
+    );
+    Ok(())
+}
+
+/// A fallback endpoint's node can write its cookie file after the reader
+/// starts.
+///
+/// Building the broadcaster from `[node]` and `[node_fallbacks.N]` does not
+/// fail, `[node]` passes verification on its own, and the fallback receives
+/// no request until its cookie file appears. The next verification round
+/// then reaches the fallback with the cookie credentials.
+#[tokio::test]
+async fn fallback_cookie_written_after_startup_is_verified_once_it_appears() -> eyre::Result<()> {
+    const AUTHORIZATION: &str = "Basic X19jb29raWVfXzpmYWxsYmFjay1zdGFydGVk";
+    let schedule = one_upgrade_per_height()?;
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let tip_hash = chain
+        .block_at(BlockHeight::new(1))
+        .ok_or_else(|| eyre!("fixture must contain height 1"))?
+        .hash;
+    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &schedule)?;
+    let slot = serving_pair_slot(&mut store_fixture)?;
+    let primary_server = verifiable_node(&schedule, tip_hash)?;
+    let fallback_server = verifiable_node(&schedule, tip_hash)?;
+    let cookie_dir = tempfile::tempdir()?;
+    let cookie_path = cookie_dir.path().join(".cookie");
+    let target = |server: &JsonRpcTestServer, node_auth| {
+        NodeTarget::new(
+            Network::ZcashRegtest,
+            server.url(),
+            node_auth,
+            Duration::from_secs(5),
+            DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES,
+        )
+    };
+    let nodes = OrderedBroadcaster::connect(
+        &target(&primary_server, NodeAuth::None),
+        &[target(
+            &fallback_server,
+            NodeAuth::cookie_file(&cookie_path),
+        )],
+    )?;
+
+    nodes.verify(&slot).await?;
+    assert!(nodes.verified_capabilities().is_some());
+    assert!(fallback_server.requests()?.is_empty());
+
+    std::fs::write(&cookie_path, "__cookie__:fallback-started")?;
+    nodes.verify(&slot).await?;
+
+    let fallback_requests = fallback_server.requests()?;
+    let fallback_methods: Vec<&str> = fallback_requests
+        .iter()
+        .map(|request| request.method.as_str())
+        .collect();
+    assert_eq!(
+        fallback_methods,
+        ["rpc.discover", "getblockchaininfo", "getblockhash"]
+    );
+    assert!(
+        fallback_requests
+            .iter()
+            .all(|request| request.authorization.as_deref() == Some(AUTHORIZATION)),
+        "{fallback_requests:?}"
     );
     Ok(())
 }

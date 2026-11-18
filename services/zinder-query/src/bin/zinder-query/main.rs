@@ -628,6 +628,37 @@ mod tests {
         Ok(())
     }
 
+    /// Each endpoint's node writes its own cookie file, so a missing fallback
+    /// cookie leaves that endpoint unverified instead of failing startup.
+    #[test]
+    fn a_missing_fallback_cookie_file_leaves_broadcast_unverified()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cookie_dir = tempfile::tempdir()?;
+        let node = node_target("http://127.0.0.1:1", NodeAuth::None);
+        let fallback = node_target(
+            "http://127.0.0.1:2",
+            NodeAuth::cookie_file(cookie_dir.path().join(".cookie")),
+        );
+
+        let node_broadcast = build_node_broadcast(Some(&node), &[fallback])?;
+
+        assert!(node_broadcast.is_some_and(|nodes| {
+            nodes.endpoint_count() == 2 && nodes.verified_capabilities().is_none()
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn a_malformed_fallback_node_address_fails_startup() {
+        let node = node_target("http://127.0.0.1:1", NodeAuth::None);
+        let fallback = node_target("not a node address", NodeAuth::None);
+
+        assert!(matches!(
+            build_node_broadcast(Some(&node), &[fallback]),
+            Err(QueryConfigError::Source(_))
+        ));
+    }
+
     #[test]
     fn a_malformed_node_address_fails_startup() {
         let node = node_target("not a node address", NodeAuth::None);

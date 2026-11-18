@@ -290,7 +290,9 @@ ZINDER_SOURCE_COOKIE_VOLUME_NAME=zakura-mainnet-cookie \
 ```
 
 The overlay mounts the fallback cookie at `/var/run/auth-fallback` for ingest,
-query, and compatibility. An empty `INDEXER_GRPC_ADDR` polls the fallback's
+query, and compatibility. As with `[node]`, query and compatibility start while
+the fallback cookie is unreadable, and broadcast through the fallback once they
+can read it and it passes verification. An empty `INDEXER_GRPC_ADDR` polls the fallback's
 mempool after a switch, as for `[node]`; to stream it over TLS, add the
 `ZINDER_NODE_FALLBACKS__1__INDEXER_TLS__*_PATH` variables to `zinder-ingest`
 the way the indexer TLS overlay sets the `[node]` ones.

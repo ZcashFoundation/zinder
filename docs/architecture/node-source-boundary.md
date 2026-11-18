@@ -276,8 +276,8 @@ Building a source reads no cookie file it cannot read yet. The node writes the
 file when it starts, so a missing, unreadable, or empty file leaves the source
 waiting for it: each request reads the file first and, until it holds
 credentials, fails with `NodeUnavailable` without reaching the node. A reader
-therefore starts before its node, and its first-contact verification passes
-once the file appears. Ingest's startup capability probe fails on the same
+therefore starts before any of its nodes, and each endpoint's first-contact
+verification passes once that endpoint's file appears. Ingest's startup capability probe fails on the same
 error, so ingest still exits when it starts without a readable cookie for
 `[node]`. With `[node_fallbacks.N]`, an endpoint whose cookie file is not
 readable yet fails its startup check as unreachable: ingest starts on the
