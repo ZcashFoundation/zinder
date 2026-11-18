@@ -870,7 +870,5 @@ async fn construction_times_each_phase_and_serial_loader_stage()
             "missing {series}"
         );
     }
-    // A wallet build derives no per-block final roots.
-    assert!(!rendered.contains("stage=\"tree_hashing_final_roots\""));
     Ok(())
 }

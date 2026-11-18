@@ -1239,8 +1239,31 @@ fn memory_permits_for_block(raw_block_capacity: usize, available_permits: u32) -
 
 #[cfg(test)]
 mod tests {
-    use super::{CanonicalPipelineLimits, CanonicalPipelineLimitsError};
+    use super::{
+        BlockLoaderStageTimers, CanonicalPipelineLimits, CanonicalPipelineLimitsError,
+        CanonicalStoreWorkload,
+    };
     use std::num::{NonZeroU32, NonZeroU64};
+
+    #[test]
+    fn only_an_explorer_loader_registers_a_final_roots_timer() {
+        let registered_stages = |workload| {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let timers = metrics::with_local_recorder(&recorder, || {
+                BlockLoaderStageTimers::register(workload)
+            });
+            (timers.tree_hashing_final_roots.is_some(), handle.render())
+        };
+
+        let (wallet_timer, wallet_series) = registered_stages(CanonicalStoreWorkload::Wallet);
+        let (explorer_timer, explorer_series) = registered_stages(CanonicalStoreWorkload::Explorer);
+
+        assert!(!wallet_timer);
+        assert!(!wallet_series.contains("tree_hashing_final_roots"));
+        assert!(explorer_timer);
+        assert!(explorer_series.contains("tree_hashing_final_roots"));
+    }
 
     const MIB: u64 = 1_024 * 1_024;
 
