@@ -160,8 +160,8 @@ admitted the Explorer view store sets them, and the metric no longer has a
 
 Removing request fields, methods, and response fields, and adding
 `TransparentOutpointSpendStatus`, changes the native wire contract in place, so
-`zinder_proto::CONTRACT_REVISION` is 8. A revision 7 server still serves the
-removed methods and lacks the new one, so
+this decision raised `zinder_proto::CONTRACT_REVISION` to 8. A revision 7
+server still serves the removed methods and lacks the new one, so
 `zinder_client::MIN_SUPPORTED_CONTRACT_REVISION` is also 8.
 
 ## Old-to-new mapping

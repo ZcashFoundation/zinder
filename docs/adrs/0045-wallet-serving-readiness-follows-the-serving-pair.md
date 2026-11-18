@@ -100,6 +100,21 @@ too when ingest control does not answer: native query returns `UNAVAILABLE`
 with `UPSTREAM_UNREACHABLE` for a call or stream the writer never answered,
 and passes through every status the writer itself returns.
 
+While the writer's live mempool hydrates or rebuilds from its node,
+`MempoolSnapshot` returns `UNAVAILABLE` with `NODE_UNAVAILABLE`. A
+`MempoolEvents` subscription replays its retained events and then ends with
+the same status instead of staying open, because a silent stream would read as
+an unchanged mempool while no request reports the outage. Ending an existing
+stream on a new condition revises its semantics in place, so
+`zinder_proto::CONTRACT_REVISION` is 9
+([ADR-0027](0027-event-stream-start-positions.md#contract_revision-on-opsserverinfo)).
+A revision 8 server keeps such a subscription open and silent, so a consumer
+that relies on the stream ending requires revision 9.
+`zinder_client::MIN_SUPPORTED_CONTRACT_REVISION` stays 8, because the client
+reads both behaviors correctly and only misses the ending against an older
+server. `zinder-query` admits `zinder-ingest` only at its own revision, so
+ingest and the readers upgrade together.
+
 Losing ingest control entirely stays bounded. Native query reads
 `CanonicalControl.WriterStatus` through the same admitted channel, so the pair
 reports `serving_pair_stale` and then refuses traffic with
