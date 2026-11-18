@@ -70,3 +70,20 @@ impl TreeStateReplayLimit {
 pub(crate) fn record_replayed_blocks(replayed_blocks: u32) {
     metrics::histogram!(REPLAYED_BLOCKS_HISTOGRAM).record(f64::from(replayed_blocks));
 }
+
+/// Registers `# HELP` and `# TYPE` text for the tree-state rebuild metrics.
+pub(crate) fn describe_metrics() {
+    metrics::describe_counter!(
+        REPLAY_REFUSALS_COUNTER,
+        metrics::Unit::Count,
+        "Tree-state requests refused because the query already runs its limit of \
+         rebuilds. Sustained growth means wallets request heights without a stored \
+         checkpoint faster than the server rebuilds them."
+    );
+    metrics::describe_histogram!(
+        REPLAYED_BLOCKS_HISTOGRAM,
+        metrics::Unit::Count,
+        "Compact blocks replayed by one tree-state rebuild, from the nearest stored \
+         checkpoint to the requested height."
+    );
+}

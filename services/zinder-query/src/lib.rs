@@ -286,8 +286,14 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     /// Reads the tree state at exactly `height`.
     ///
     /// Served from a stored checkpoint when one exists at `height`, otherwise
-    /// filled from the configured upstream node. The returned height always
+    /// rebuilt from the nearest stored checkpoint below it and the stored
+    /// compact blocks, without contacting the node. The returned height always
     /// equals `height`.
+    ///
+    /// A height above the visible tip or below retained history fails with
+    /// [`QueryError::BlockNotInBestChain`]. A rebuild requested while the
+    /// query already runs its limit of them fails with
+    /// [`QueryError::TreeStateReplayLimitReached`].
     async fn tree_state_at(
         &self,
         height: BlockHeight,
@@ -389,8 +395,8 @@ const QUERY_RPC_METRICS: zinder_runtime::RpcMetricNames =
 /// Call once at startup, after `install_metrics_recorder` returns and before
 /// the gRPC server records its first request. Delegates the RPC metric pair
 /// to [`zinder_runtime::describe_rpc_metrics`] so every Zinder service
-/// shares one description template; the compact-block-range histogram is
-/// `WalletQuery`-specific and stays registered here.
+/// shares one description template; the compact-block-range and tree-state
+/// rebuild metrics are `WalletQuery`-specific and stay registered here.
 pub fn describe_request_metrics() {
     zinder_runtime::describe_rpc_metrics(QUERY_RPC_METRICS, "WalletQuery");
     metrics::describe_histogram!(
@@ -399,6 +405,7 @@ pub fn describe_request_metrics() {
         "Number of blocks returned by a single CompactBlockRange response, labelled \
          by status. Used to monitor request fan-out and page sizing."
     );
+    tree_state_replay_limit::describe_metrics();
 }
 
 pub(crate) fn record_wallet_query_outcome<Response>(
