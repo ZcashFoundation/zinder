@@ -737,7 +737,9 @@ identity, the workload's constants, and, over all wallets:
 
 - `rpcs`: for each method, requests by client-observed status, latency of
   successful calls, and for `GetBlockRange` the time to first block. A
-  `connect` entry counts the connections wallets opened. A status is a gRPC
+  `connect` entry counts every connection the run opened: one for the
+  probe that reads the endpoint's identity and tip, and the rest by wallets.
+  A status is a gRPC
   status name, `client_timeout`, `client_cancelled` for a call the wallet
   dropped, `connect_failed`, `out_of_sequence`, or `incomplete_stream`.
   `status_examples` keeps the first message received with each failed
