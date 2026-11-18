@@ -328,9 +328,10 @@ done
 # writer's own observations under its `ingest_control` dependency, so the
 # serving loop still recognizes an unsynchronized node behind any syncing
 # ingest. A relayed mempool `node_unavailable` starts the unreachable-node
-# clock only behind the mempool gate's `syncing` with no known lag: a writer
-# that trails a reachable node also keeps its mempool hydrating, and stays on
-# the ordinary unready tolerance. None of this applies to an unrelated ingest
+# clock only behind the mempool gate's `syncing` with no known lag and a
+# current height at or above the target height: a writer that trails a
+# reachable node also keeps its mempool hydrating, and stays on the ordinary
+# unready tolerance. None of this applies to an unrelated ingest
 # cause or to query's own view of the node.
 ingest_mempool_gated_syncing_body='{"status":"not_ready","phase":"following_tip","cause":{"syncing":{"lag_blocks":null}},"current_height":4602673,"target_height":4602673}'
 ingest_trailing_syncing_body='{"status":"not_ready","phase":"following_tip","cause":{"syncing":{"lag_blocks":40}},"current_height":4602633,"target_height":4602673}'
@@ -353,10 +354,18 @@ relayed_outage="$(writer_node_outage_behind_syncing_ingest syncing \
 [ -z "$relayed_outage" ] \
   || test_failure "a trailing ingest whose mempool waits for canonical ingest must stay on the unready tolerance, got '$relayed_outage'"
 # The mempool gate also reports no lag over the one block the default follow
-# threshold admits, so only equal heights prove that canonical ingest caught up.
+# threshold admits, so only a current height at or above the target height
+# proves that canonical ingest caught up.
+ingest_ahead_of_target_gated_body='{"status":"not_ready","phase":"following_tip","cause":{"syncing":{"lag_blocks":null}},"current_height":4602674,"target_height":4602673}'
+relayed_outage="$(writer_node_outage_behind_syncing_ingest syncing \
+  "$ingest_ahead_of_target_gated_body" "$query_relays_writer_mempool_node_unavailable_body")"
+[ "$relayed_outage" = "node_unavailable" ] \
+  || test_failure "a gated ingest above its target height has caught up, so its writer mempool's refusal must be an unreachable-node outage, got '$relayed_outage'"
 ingest_one_block_behind_gated_body='{"status":"not_ready","phase":"following_tip","cause":{"syncing":{"lag_blocks":null}},"current_height":4602672,"target_height":4602673}'
 ingest_gated_without_target_body='{"status":"not_ready","phase":"following_tip","cause":{"syncing":{"lag_blocks":null}},"current_height":4602673}'
-for unproven_body in "$ingest_one_block_behind_gated_body" "$ingest_gated_without_target_body"; do
+ingest_gated_without_current_body='{"status":"not_ready","phase":"following_tip","cause":{"syncing":{"lag_blocks":null}},"target_height":4602673}'
+for unproven_body in "$ingest_one_block_behind_gated_body" "$ingest_gated_without_target_body" \
+  "$ingest_gated_without_current_body"; do
   relayed_outage="$(writer_node_outage_behind_syncing_ingest syncing \
     "$unproven_body" "$query_relays_writer_mempool_node_unavailable_body")"
   [ -z "$relayed_outage" ] \

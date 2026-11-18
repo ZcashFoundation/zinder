@@ -396,10 +396,10 @@ readiness_cause_is_upstream_outage() {
 # `node_unavailable` means the writer's live mempool refuses while it waits for
 # a node snapshot, which also happens while a canonical writer that trails a
 # reachable node catches up. Only a syncing ingest with no known lag whose
-# `current_height` equals its `target_height` points that refusal at the node:
-# the mempool gate reports `lag_blocks: null` over any lag the follow threshold
-# admits, so only the equal heights prove that canonical ingest has caught up.
-# Any other syncing ingest stays on the ordinary unready tolerance. Given
+# `current_height` is at or above its `target_height` points that refusal at
+# the node: the mempool gate reports `lag_blocks: null` over any lag the follow
+# threshold admits, so only the heights prove that canonical ingest has caught
+# up. Any other syncing ingest stays on the ordinary unready tolerance. Given
 # ingest's cause, ingest's body, and the body query just answered, prints the
 # relayed cause when it explains ingest's syncing, and nothing otherwise.
 writer_node_outage_behind_syncing_ingest() {
@@ -412,8 +412,9 @@ writer_node_outage_behind_syncing_ingest() {
       case "$2" in
         *'"cause":{"syncing":{"lag_blocks":null}'*)
           relay_current_height="$(readiness_body_height "$2" current_height)"
-          if [ -n "$relay_current_height" ] \
-            && [ "$relay_current_height" = "$(readiness_body_height "$2" target_height)" ]; then
+          relay_target_height="$(readiness_body_height "$2" target_height)"
+          if [ -n "$relay_current_height" ] && [ -n "$relay_target_height" ] \
+            && [ "$relay_current_height" -ge "$relay_target_height" ]; then
             printf 'node_unavailable\n'
           fi
           ;;
