@@ -173,6 +173,11 @@ The outcomes are typed:
   header, and a missing compact block inside retained history, are store
   damage and fail as a canonical storage error (`UNAVAILABLE` with
   `STORAGE_UNAVAILABLE`), never as a wrong tree state.
+- A reconstruction seeds only from a checkpoint no lower than the newest
+  multiple of 100 at or below `height`, or the history predecessor when that
+  is newer, because every store holds those checkpoints. A missing one is
+  store damage with the same status, so a lost checkpoint never stretches a
+  read into a longer replay.
 - Each query runs at most one reconstruction per available CPU at once. A
   request that needs one while every slot is taken fails at once with
   `RESOURCE_EXHAUSTED` and `TREE_STATE_REPLAY_LIMIT_REACHED`; a height with a

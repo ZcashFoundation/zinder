@@ -1,11 +1,14 @@
 //! Commitment-tree checkpoints at any retained height.
 //!
-//! Construction stores a checkpoint every [`super::TREE_STATE_CHECKPOINT_STRIDE`]
-//! blocks and at its build tip, and live following stores one for every
-//! block. Any other retained height is answered by seeding the trees from the
-//! newest checkpoint below it and appending each stored compact block's note
-//! commitments, the derivation construction and live following check against
-//! the node's tree state before they store a block.
+//! Construction stores a checkpoint at its history predecessor, every
+//! [`TREE_STATE_CHECKPOINT_STRIDE`] blocks, and at its build tip, and live
+//! following and replacement store one for every block. Any other retained
+//! height is answered by seeding the trees from the newest checkpoint below it
+//! and appending each stored compact block's note commitments, the derivation
+//! construction and live following check against the node's tree state before
+//! they store a block. A seed below `required_seed_height` means a checkpoint
+//! is missing, so a reconstruction replays fewer than
+//! [`TREE_STATE_CHECKPOINT_STRIDE`] blocks or fails as store damage.
 
 use zinder_core::{
     BlockHeight, BlockId, ChainTipMetadata, CommitmentTreeAccumulator,
@@ -14,7 +17,7 @@ use zinder_core::{
 };
 
 use super::{
-    CanonicalStoreError,
+    CanonicalStoreError, TREE_STATE_CHECKPOINT_STRIDE,
     reader::{
         CanonicalServingRead, read_block_header_at, read_compact_block_at,
         read_tree_state_checkpoint_at_or_before,
@@ -34,12 +37,25 @@ pub(super) fn read_tree_state_checkpoint_at(
             "tree-state reconstruction activation table differs from the admitted schedule at or below the requested height",
         ));
     }
-    if height > store.serving_ready_evidence().visible_tip.height {
+    let history_predecessor_height = store
+        .serving_build_plan()
+        .history_predecessor()
+        .block_id
+        .height;
+    if height > store.serving_ready_evidence().visible_tip.height
+        || height < history_predecessor_height
+    {
         return Ok(None);
     }
-    let Some(seed) = read_tree_state_checkpoint_at_or_before(store, height)? else {
-        return Ok(None);
-    };
+    let required_seed = required_seed_height(height, history_predecessor_height);
+    let seed = read_tree_state_checkpoint_at_or_before(store, height)?
+        .filter(|seed| seed.block_id.height >= required_seed)
+        .ok_or_else(|| {
+            CanonicalStoreError::publication(format!(
+                "tree-state checkpoint at height {} is absent",
+                required_seed.value()
+            ))
+        })?;
     if seed.block_id.height == height {
         return Ok(Some(seed));
     }
@@ -70,6 +86,20 @@ pub(super) fn read_tree_state_checkpoint_at(
         block_time_seconds,
         frontiers,
     )))
+}
+
+/// Returns the lowest checkpoint height a reconstruction of `height` may seed
+/// from.
+///
+/// Every store holds a checkpoint at its history predecessor, at each cadence
+/// height construction wrote, and at every block live following or a
+/// replacement wrote, and it never drops retained blocks. The newest
+/// checkpoint at or below `height` is therefore no lower than the newest
+/// cadence height at or below it, or the history predecessor when that is
+/// newer. A lower one means a checkpoint is missing.
+fn required_seed_height(height: BlockHeight, history_predecessor: BlockHeight) -> BlockHeight {
+    let cadence_height = height.value() - height.value() % TREE_STATE_CHECKPOINT_STRIDE;
+    BlockHeight::new(cadence_height.max(history_predecessor.value()))
 }
 
 /// Seeds the trees from `seed` and appends each stored compact block through

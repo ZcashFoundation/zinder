@@ -283,13 +283,17 @@ macro_rules! impl_canonical_typed_reads {
             /// A reconstruction seeds the trees from the newest stored
             /// checkpoint below `height` and appends each stored compact
             /// block's note commitments up to `height`, one block at a time.
-            /// Each block must extend the one below it and reach the tree
-            /// sizes its compact block records, the last must be the
-            /// canonical block at `height`, and the resulting frontiers are
-            /// re-encoded and checked against the appended trees. A failed
-            /// check is store damage and fails with
-            /// [`CanonicalStoreError::PublicationRefused`]. The work grows
-            /// with the blocks and note commitments between the two heights.
+            /// That checkpoint must be no lower than the newest
+            /// [`TREE_STATE_CHECKPOINT_STRIDE`](crate::TREE_STATE_CHECKPOINT_STRIDE)
+            /// multiple at or below `height`, or the history predecessor when
+            /// that is newer, so a reconstruction replays fewer than
+            /// `TREE_STATE_CHECKPOINT_STRIDE` blocks. Each block must extend
+            /// the one below it and reach the tree sizes its compact block
+            /// records, the last must be the canonical block at `height`, and
+            /// the resulting frontiers are re-encoded and checked against the
+            /// appended trees. A missing checkpoint or a failed check is store
+            /// damage and fails with
+            /// [`CanonicalStoreError::PublicationRefused`].
             ///
             /// `network_upgrade_activations` must agree with the schedule this
             /// store admits at every height through `height`, so a node table

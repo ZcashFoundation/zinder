@@ -13,10 +13,12 @@ use zinder_core::{
 
 use super::{
     CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RocksDbCanonicalSecondary,
-    RocksDbCanonicalStore, block_load::encode_block_position,
-    live_replacement_tests::published_store, publication::column_family,
-    rocksdb::COMPACT_BLOCK_COLUMN_FAMILY, test_checkpoint_frontiers,
-    test_network_upgrade_activations,
+    RocksDbCanonicalStore,
+    block_load::encode_block_position,
+    live_replacement_tests::published_store,
+    publication::column_family,
+    rocksdb::{COMPACT_BLOCK_COLUMN_FAMILY, TREE_STATE_CHECKPOINT_COLUMN_FAMILY},
+    test_checkpoint_frontiers, test_network_upgrade_activations,
 };
 use crate::{RawBlobRetention, RocksDbResourceBudget};
 
@@ -117,6 +119,46 @@ fn reconstruction_refuses_a_missing_compact_block() -> Result<(), Box<dyn std::e
         .delete_cf(&family, encode_block_position(BlockHeight::new(120)))?;
 
     assert_publication_refused(&store, BlockHeight::new(140), &activations)
+}
+
+#[test]
+fn reconstruction_refuses_a_missing_cadence_checkpoint() -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store = gapped_store(&temporary)?;
+    let activations = test_network_upgrade_activations(Network::ZcashTestnet)?;
+    delete_checkpoint(&store, BlockHeight::new(100))?;
+
+    for height in [100, 120, 149] {
+        assert_publication_refused(&store, BlockHeight::new(height), &activations)?;
+    }
+    for height in [99, TIP_HEIGHT] {
+        let height = BlockHeight::new(height);
+        assert_eq!(
+            store.tree_state_checkpoint_at(height, &activations)?,
+            Some(expected_checkpoint(&activations, height)?),
+            "tree state at height {}",
+            height.value()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn reconstruction_refuses_a_missing_history_predecessor_checkpoint()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store = gapped_store(&temporary)?;
+    let activations = test_network_upgrade_activations(Network::ZcashTestnet)?;
+    delete_checkpoint(&store, BlockHeight::new(0))?;
+
+    for height in [0, 1, 99] {
+        assert_publication_refused(&store, BlockHeight::new(height), &activations)?;
+    }
+    assert_eq!(
+        store.tree_state_checkpoint_at(BlockHeight::new(120), &activations)?,
+        Some(expected_checkpoint(&activations, BlockHeight::new(120))?)
+    );
+    Ok(())
 }
 
 #[test]
@@ -276,6 +318,18 @@ fn replace_compact_block(
         encode_block_position(compact_block.height()),
         crate::encode_compact_block_artifact(compact_block),
     )?;
+    Ok(())
+}
+
+fn delete_checkpoint(
+    store: &RocksDbCanonicalStore,
+    height: BlockHeight,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let family = column_family(&store.bounded_open.db, TREE_STATE_CHECKPOINT_COLUMN_FAMILY)?;
+    store
+        .bounded_open
+        .db
+        .delete_cf(&family, encode_block_position(height))?;
     Ok(())
 }
 
