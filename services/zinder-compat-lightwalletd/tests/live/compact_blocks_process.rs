@@ -376,8 +376,7 @@ async fn compact_blocks_process_serves_exact_contract() -> Result<()> {
     fs::write(&config_path, config)?;
     let binary = selected_binary()?;
     let process_started = Instant::now();
-    let mut child = Command::new(&binary.path)
-        .env_remove("ZINDER_NETWORK")
+    let mut child = compact_process_command(&binary.path)
         .arg("--config")
         .arg(&config_path)
         .stdout(Stdio::null())
@@ -706,8 +705,7 @@ async fn compact_blocks_process_refreshes_after_shallow_reorg() -> Result<()> {
     )?;
     let binary = selected_binary()?;
     let process_started = Instant::now();
-    let mut child = Command::new(&binary.path)
-        .env_remove("ZINDER_NETWORK")
+    let mut child = compact_process_command(&binary.path)
         .arg("--config")
         .arg(&config_path)
         .stdout(Stdio::null())
@@ -802,6 +800,25 @@ async fn compact_blocks_process_refreshes_after_shallow_reorg() -> Result<()> {
     assert!(compat_stopped && ops_stopped && control_shutdown.is_cancelled());
     write_report_atomically(&evidence_root.join("report.json"), &report)?;
     Ok(())
+}
+
+/// Starts building the compact-blocks process command without the live-test
+/// node settings.
+///
+/// The test process reads its node from `ZINDER_NODE__*`, but compact-blocks
+/// serving rejects every node setting, so the child must not inherit them.
+fn compact_process_command(binary: &Path) -> Command {
+    let mut command = Command::new(binary);
+    command.env_remove("ZINDER_NETWORK");
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with("ZINDER_NODE__"))
+        {
+            command.env_remove(name);
+        }
+    }
+    command
 }
 
 fn selected_binary() -> Result<SelectedBinary> {
