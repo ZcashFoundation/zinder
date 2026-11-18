@@ -11,11 +11,10 @@ use zinder_core::wire::WireDecodeError;
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockSelector, BroadcastAccepted, BroadcastDuplicate,
     BroadcastInvalidEncoding, BroadcastQueued, BroadcastRejected, BroadcastUnknown, ChainEpochId,
-    CompactBlockArtifact, CompactTransaction, CompactTransactionData, Network,
+    CompactBlockArtifact, CompactTransaction, CompactTransactionData, MinedTransaction, Network,
     NetworkUpgradeActivations, RawTransactionBytes, ShieldedProtocol, SubtreeRootIndex,
-    SubtreeRootRange, TransactionBroadcastOutcome, TransactionId, TransactionLocation,
-    TransparentAddressScriptHash, TransparentAddressTxIndexArtifact, TransparentUnspentOutput,
-    TxStatus,
+    SubtreeRootRange, TransactionBroadcastOutcome, TransactionId, TransparentAddressScriptHash,
+    TransparentAddressTxIndexArtifact, TransparentUnspentOutput, TxStatus,
     wire::{
         decode_internal_transaction_id, encode_bip70_chain_name, encode_branch_id_hex,
         encode_internal_block_hash, encode_internal_transaction_id, encode_rpc_block_hash_bytes,
@@ -27,13 +26,14 @@ use zinder_proto::compat::lightwalletd::{
 };
 use zinder_proto::v1::wallet::{self as wallet_proto, address_lookup};
 use zinder_query::{
-    CompactBlockRange, MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES, QueryError, SubtreeRoots,
-    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest, TreeState,
-    WalletQueryApi, WalletServingQuery, address_lookup_to_script_hash, status_from_query_error,
+    ArtifactKey, CompactBlockRange, MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES, QueryError,
+    SubtreeRoots, TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest,
+    TreeState, WalletQueryApi, WalletServingQuery, address_lookup_to_script_hash,
+    status_from_query_error,
 };
 use zinder_runtime::RepeatedFieldGuard;
 use zinder_source::{parse_transparent_address, transparent_address_matches_network};
-use zinder_store::{MempoolEvent, RawBlobRetention};
+use zinder_store::{ArtifactFamily, MempoolEvent, RawBlobRetention};
 
 use crate::block_range::{
     BLOCK_RANGE_CHUNK_MAX_BYTES, BlockRangeChunks, BlockRangeContinuity, BlockRangeSink,
@@ -69,6 +69,9 @@ const LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 1024;
 /// Blocks a slow `GetBlockRange` client can stall behind, on top of the chunk
 /// the producer is currently sending.
 const COMPACT_BLOCK_STREAM_CHANNEL_CAPACITY: usize = 16;
+/// Transactions a `GetTaddressTransactions` or `GetTaddressTxids` response
+/// reads ahead of its client.
+const TRANSPARENT_HISTORY_STREAM_CHANNEL_CAPACITY: usize = 8;
 /// Maximum number of transaction-id suffixes accepted by one `GetMempoolTx` request.
 pub(crate) const MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST: usize = 1024;
 /// Most distinct transactions one `GetMempoolStream` sends between tip changes.
@@ -495,37 +498,32 @@ where
         }
     }
 
-    async fn transparent_address_raw_transactions(
+    /// Starts reading the mined history `filter` selects at the visible
+    /// chain epoch, and reads its first page, so a request that cannot be
+    /// served fails before any transaction is sent.
+    async fn transparent_history(
         &self,
         filter: &lightwalletd::TransparentAddressBlockFilter,
-    ) -> Result<Vec<Result<lightwalletd::RawTransaction, Status>>, Status> {
+    ) -> Result<TransparentHistory<QueryApi>, Status>
+    where
+        QueryApi: Clone,
+    {
         let visible_tip_block = self
             .query_api
             .visible_tip_block(None)
             .await
             .map_err(|error| status_from_query_error(&error))?;
-        let at_epoch_id = visible_tip_block.chain_epoch.id;
-        let typed_request = transparent_address_tx_history_request(
+        let request = transparent_address_tx_history_request(
             filter,
             visible_tip_block.chain_epoch.network,
             visible_tip_block.height,
         )?;
-        let history =
-            transparent_address_tx_history(&self.query_api, typed_request, at_epoch_id).await?;
-        let mut raw_transactions = Vec::with_capacity(history.len());
-
-        for artifact in history {
-            let response = self
-                .query_api
-                .transaction(artifact.transaction_id, Some(at_epoch_id))
-                .await
-                .map_err(|error| status_from_query_error(&error))?;
-            let location = mined_location_from_status(response.status)?;
-            raw_transactions
-                .push(raw_transaction_from_location(&self.query_api, at_epoch_id, location).await);
-        }
-
-        Ok(raw_transactions)
+        TransparentHistory::start(
+            self.query_api.clone(),
+            request,
+            visible_tip_block.chain_epoch.id,
+        )
+        .await
     }
 
     /// Returns lightwalletd `Balance { value_zat: int64 }` from the wallet
@@ -739,10 +737,7 @@ where
         let canonical_miss = match lookup {
             Ok(response) => match response.status {
                 TxStatus::Mined(mined) => {
-                    return Ok(Response::new(
-                        raw_transaction_from_location(&self.query_api, at_epoch_id, mined.location)
-                            .await?,
-                    ));
+                    return Ok(Response::new(raw_transaction_from_mined(mined)?));
                 }
                 TxStatus::InMempool(entry) => {
                     return Ok(Response::new(mempool_raw_transaction(&entry)));
@@ -781,9 +776,11 @@ where
         &self,
         request: Request<lightwalletd::TransparentAddressBlockFilter>,
     ) -> Result<Response<Self::GetTaddressTxidsStream>, Status> {
-        let filter = request.into_inner();
-        let raw_transactions = self.transparent_address_raw_transactions(&filter).await?;
-        Ok(Response::new(Box::pin(stream::iter(raw_transactions))))
+        let history = self.transparent_history(&request.into_inner()).await?;
+        Ok(Response::new(spawn_response_stream(
+            history,
+            TRANSPARENT_HISTORY_STREAM_CHANNEL_CAPACITY,
+        )))
     }
 
     type GetTaddressTransactionsStream = GrpcStream<lightwalletd::RawTransaction>;
@@ -792,9 +789,11 @@ where
         &self,
         request: Request<lightwalletd::TransparentAddressBlockFilter>,
     ) -> Result<Response<Self::GetTaddressTransactionsStream>, Status> {
-        let filter = request.into_inner();
-        let raw_transactions = self.transparent_address_raw_transactions(&filter).await?;
-        Ok(Response::new(Box::pin(stream::iter(raw_transactions))))
+        let history = self.transparent_history(&request.into_inner()).await?;
+        Ok(Response::new(spawn_response_stream(
+            history,
+            TRANSPARENT_HISTORY_STREAM_CHANNEL_CAPACITY,
+        )))
     }
 
     async fn get_taddress_balance(
@@ -1060,25 +1059,113 @@ where
     }
 }
 
-async fn transparent_address_tx_history<QueryApi>(
-    query_api: &QueryApi,
-    mut request: TransparentAddressTxIdsInRangeRequest,
+/// Where a server-streaming response produced by a reader task gets its
+/// items, in response order.
+trait ResponseSource: Send + 'static {
+    /// One response message.
+    type Message: Send + 'static;
+
+    /// Reads the next message, or the status that ends the response, or
+    /// `None` once the response is complete.
+    fn next(&mut self) -> impl Future<Output = Option<Result<Self::Message, Status>>> + Send;
+}
+
+/// Returns a response that sends what `source` reads, at most `capacity`
+/// messages ahead of the client, and spawns the task that reads it.
+///
+/// The response ends after the first status `source` returns, so a client
+/// that received rows before a failure sees the failure as the response's
+/// status. The task stops once the client drops the response.
+fn spawn_response_stream<Source: ResponseSource>(
+    mut source: Source,
+    capacity: usize,
+) -> GrpcStream<Source::Message> {
+    let (messages, queued_messages) = tokio::sync::mpsc::channel(capacity);
+    tokio::spawn(async move {
+        while let Some(message) = source.next().await {
+            let is_terminal = message.is_err();
+            if messages.send(message).await.is_err() || is_terminal {
+                return;
+            }
+        }
+    });
+    Box::pin(tokio_stream::wrappers::ReceiverStream::new(queued_messages))
+}
+
+/// One transparent address's mined transactions at one chain epoch, read a
+/// page of history entries at a time and one transaction at a time.
+struct TransparentHistory<QueryApi> {
+    query_api: QueryApi,
+    request: TransparentAddressTxIdsInRangeRequest,
     at_epoch_id: ChainEpochId,
-) -> Result<Vec<TransparentAddressTxIndexArtifact>, Status>
+    page: std::vec::IntoIter<TransparentAddressTxIndexArtifact>,
+    has_later_pages: bool,
+}
+
+impl<QueryApi> TransparentHistory<QueryApi>
 where
-    QueryApi: WalletQueryApi + ?Sized,
+    QueryApi: WalletQueryApi + Send + Sync + 'static,
 {
-    let mut artifacts = Vec::new();
-    loop {
-        let response = query_api
-            .transparent_address_tx_ids_in_range(request.clone(), Some(at_epoch_id))
+    async fn start(
+        query_api: QueryApi,
+        request: TransparentAddressTxIdsInRangeRequest,
+        at_epoch_id: ChainEpochId,
+    ) -> Result<Self, Status> {
+        let mut history = Self {
+            query_api,
+            request,
+            at_epoch_id,
+            page: Vec::new().into_iter(),
+            has_later_pages: true,
+        };
+        history.read_page().await?;
+        Ok(history)
+    }
+
+    async fn read_page(&mut self) -> Result<(), Status> {
+        let response = self
+            .query_api
+            .transparent_address_tx_ids_in_range(self.request.clone(), Some(self.at_epoch_id))
             .await
             .map_err(|error| status_from_query_error(&error))?;
-        artifacts.extend(response.artifacts);
-        let Some(next_cursor) = response.next_cursor else {
-            return Ok(artifacts);
-        };
-        request.from_cursor = Some(next_cursor);
+        self.page = response.artifacts.into_iter();
+        self.has_later_pages = response.next_cursor.is_some();
+        self.request.from_cursor = response.next_cursor;
+        Ok(())
+    }
+
+    async fn read_transaction(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<lightwalletd::RawTransaction, Status> {
+        let response = self
+            .query_api
+            .transaction(transaction_id, Some(self.at_epoch_id))
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
+        raw_transaction_from_mined(mined_transaction_from_status(response.status)?)
+    }
+}
+
+impl<QueryApi> ResponseSource for TransparentHistory<QueryApi>
+where
+    QueryApi: WalletQueryApi + Send + Sync + 'static,
+{
+    type Message = lightwalletd::RawTransaction;
+
+    async fn next(&mut self) -> Option<Result<Self::Message, Status>> {
+        loop {
+            if let Some(artifact) = self.page.next() {
+                return Some(self.read_transaction(artifact.transaction_id).await);
+            }
+            if !self.has_later_pages {
+                return None;
+            }
+            if let Err(status) = self.read_page().await {
+                self.has_later_pages = false;
+                return Some(Err(status));
+            }
+        }
     }
 }
 
@@ -1544,9 +1631,9 @@ fn block_range_from_request(
     clippy::wildcard_enum_match_arm,
     reason = "TxStatus is #[non_exhaustive]; non-mined statuses map to gRPC NOT_FOUND on the lightwalletd wire because lightwalletd's RawTransaction shape is mined-only."
 )]
-fn mined_location_from_status(status: TxStatus) -> Result<TransactionLocation, Status> {
+fn mined_transaction_from_status(status: TxStatus) -> Result<MinedTransaction, Status> {
     match status {
-        TxStatus::Mined(mined) => Ok(mined.location),
+        TxStatus::Mined(mined) => Ok(mined),
         TxStatus::NotFound | TxStatus::InMempool(_) => Err(Status::not_found(
             "transaction is not mined in the canonical chain",
         )),
@@ -1556,22 +1643,20 @@ fn mined_location_from_status(status: TxStatus) -> Result<TransactionLocation, S
     }
 }
 
-async fn raw_transaction_from_location<Q: WalletQueryApi + ?Sized>(
-    query_api: &Q,
-    chain_epoch_id: ChainEpochId,
-    location: TransactionLocation,
+/// Returns a mined transaction's bytes as lightwalletd sends them, from the
+/// read that located it.
+fn raw_transaction_from_mined(
+    mined: MinedTransaction,
 ) -> Result<lightwalletd::RawTransaction, Status> {
-    let raw_transaction = query_api
-        .raw_transaction(location.transaction_id, Some(chain_epoch_id))
-        .await
-        .map_err(|error| status_from_query_error(&error))?;
-    if raw_transaction.transaction.location != location {
-        return Err(Status::data_loss(
-            "stored raw transaction location does not match the indexed transaction location",
-        ));
-    }
+    let location = mined.location;
+    let raw_transaction_bytes = mined.raw_transaction_bytes.ok_or_else(|| {
+        status_from_query_error(&QueryError::ArtifactUnavailable {
+            family: ArtifactFamily::TransactionBlob,
+            key: ArtifactKey::TransactionId(location.transaction_id),
+        })
+    })?;
     Ok(lightwalletd::RawTransaction {
-        data: raw_transaction.transaction.raw_transaction_bytes,
+        data: raw_transaction_bytes,
         height: u64::from(location.block_height.value()),
     })
 }

@@ -2526,10 +2526,11 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
     }
 }
 
-/// The by-hash `GetTransaction` path issues two canonical reads.
+/// The by-hash `GetTransaction` path reads a mined transaction once.
 ///
-/// The status lookup and the raw-transaction fetch must pin to the same chain
-/// epoch so the response cannot mix two chain states across a tip move.
+/// One canonical read returns its location and bytes, pinned to the epoch
+/// the handler resolved, so the response cannot mix two chain states across
+/// a tip move.
 #[tokio::test]
 async fn get_transaction_by_hash_pins_every_read_to_one_epoch() -> eyre::Result<()> {
     let transaction_id = TransactionId::from_bytes([0x77; 32]);
@@ -2560,8 +2561,8 @@ async fn get_transaction_by_hash_pins_every_read_to_one_epoch() -> eyre::Result<
     let recorded_pins = recorder.recorded_epoch_ids();
     assert_eq!(
         recorded_pins.len(),
-        2,
-        "the by-hash path issues two canonical reads"
+        1,
+        "the by-hash path reads the transaction and its bytes once"
     );
     let entry_epoch_id = recorded_pins
         .first()

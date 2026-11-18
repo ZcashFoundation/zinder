@@ -164,7 +164,9 @@ Both methods resolve `range` the way lightwalletd does on Zebra:
 
 lightwalletd rejects a span wider than 10,000,000 blocks. Zinder clamps the end to the tip and serves it, because wallets such as WebZjs send `end = u64::MAX`.
 
-All reads of one request are pinned to one epoch. If the request is still reading one minute after a new block replaces that epoch, it fails with `CHAIN_EPOCH_PIN_UNAVAILABLE`. The server reads the whole history in the range, with every transaction's bytes, before it sends the first one, so memory grows with the address's history.
+All reads of one request are pinned to one epoch. The server reads the history 1,000 entries at a time and sends each transaction as it reads it, at most 8 transactions ahead of the client, so memory does not grow with the address's history.
+
+A failure after the first transaction ends the stream with its status, after the transactions already sent, as lightwalletd does when a transaction read fails. A stream still reading one minute after a new block replaces its epoch ends with `CHAIN_EPOCH_PIN_UNAVAILABLE`, which a client that reads a long history slowly can meet. A client must treat a stream that ends with an error as incomplete and request the range again.
 
 ### `GetTaddressBalance` and `GetTaddressBalanceStream`
 
