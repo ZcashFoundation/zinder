@@ -103,11 +103,9 @@ pub enum EndpointAdmission {
 }
 
 impl EndpointAdmission {
-    /// Checks one endpoint the way ingest checks it before reading from it.
-    ///
-    /// `genesis_hash` is checked only when supplied: a single-endpoint
-    /// deployment keeps its startup reads unchanged.
-    pub async fn check<Source>(endpoint: &Source, genesis_hash: Option<BlockHash>) -> Self
+    /// Checks one endpoint the way ingest checks it before reading from it,
+    /// its block 0 against `genesis_hash` included.
+    pub async fn check<Source>(endpoint: &Source, genesis_hash: BlockHash) -> Self
     where
         Source: NodeSource + ?Sized,
     {
@@ -122,17 +120,29 @@ impl EndpointAdmission {
             Ok(activations) => activations,
             Err(error) => return Self::Unreachable(error),
         };
-        if let Some(genesis_hash) = genesis_hash {
-            match endpoint.fetch_block_at(BlockHeight::new(0)).await {
-                Ok(genesis) if genesis.hash == genesis_hash => {}
-                Ok(_) => return Self::Excluded(EndpointExclusion::GenesisMismatch),
-                Err(error) => return Self::Unreachable(error),
-            }
+        if let Some(refusal) = Self::check_genesis(endpoint, genesis_hash).await {
+            return refusal;
         }
         Self::Admitted(AdmittedEndpoint {
             capabilities,
             activations,
         })
+    }
+
+    /// Compares the endpoint's block 0 with `genesis_hash` and returns the
+    /// verdict that refuses the endpoint, or `None` when they match.
+    ///
+    /// A read that fails is no evidence against the endpoint, so it leaves
+    /// the endpoint [`Self::Unreachable`].
+    async fn check_genesis<Source>(endpoint: &Source, genesis_hash: BlockHash) -> Option<Self>
+    where
+        Source: NodeSource + ?Sized,
+    {
+        match endpoint.fetch_block_at(BlockHeight::new(0)).await {
+            Ok(genesis) if genesis.hash == genesis_hash => None,
+            Ok(_) => Some(Self::Excluded(EndpointExclusion::GenesisMismatch)),
+            Err(error) => Some(Self::Unreachable(error)),
+        }
     }
 
     async fn missing_capability<Source>(endpoint: &Source, missing: NodeCapability) -> Self
@@ -250,7 +260,7 @@ impl NodeEndpointAdmissions {
         let mut checks = nodes
             .endpoints()
             .map(|(position, endpoint)| async move {
-                let verdict = EndpointAdmission::check(endpoint, Some(genesis_hash)).await;
+                let verdict = EndpointAdmission::check(endpoint, genesis_hash).await;
                 let verdict = match store {
                     Some(store) if position > 0 => verdict.check_takeover(endpoint, store).await,
                     Some(_) | None => verdict,
@@ -378,6 +388,36 @@ fn settled_active_position(decided: &[Option<EndpointAdmission>]) -> Option<usiz
         }
     }
     None
+}
+
+/// Refuses `[node]`, the only configured endpoint, unless its block 0 is
+/// `network`'s genesis block.
+///
+/// This is the genesis check [`NodeEndpointAdmissions::admit`] runs on every
+/// endpoint, for a deployment without `[node_fallbacks.N]` that reads its
+/// capabilities and activation table on its own. It costs one block read.
+///
+/// # Errors
+///
+/// Returns [`NoNodeEndpointAdmitted`] whose [`NoNodeEndpointAdmitted::primary`]
+/// verdict is [`EndpointAdmission::Excluded`] with
+/// [`EndpointExclusion::GenesisMismatch`] when the node serves another chain,
+/// or [`EndpointAdmission::Unreachable`] when block 0 could not be read, for
+/// example while the node is still starting.
+pub async fn check_single_endpoint_genesis<Source>(
+    endpoint: &Source,
+    network: Network,
+) -> Result<(), NoNodeEndpointAdmitted>
+where
+    Source: NodeSource + ?Sized,
+{
+    EndpointAdmission::check_genesis(endpoint, network.genesis_hash())
+        .await
+        .map_or(Ok(()), |refusal| {
+            Err(NoNodeEndpointAdmitted {
+                verdicts: vec![refusal],
+            })
+        })
 }
 
 /// No configured node endpoint passed its startup checks.

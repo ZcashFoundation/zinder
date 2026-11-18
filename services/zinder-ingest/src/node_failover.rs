@@ -32,7 +32,8 @@ use zinder_source::{NodeSet, NodeSetSwitch, NodeSource, SourceFailureClass};
 
 pub use admission::{
     AdmittedEndpoint, EndpointAdmission, EndpointExclusion, NoNodeEndpointAdmitted,
-    NodeEndpointAdmissions, REQUIRED_INGEST_NODE_CAPABILITIES, missing_required_capability,
+    NodeEndpointAdmissions, REQUIRED_INGEST_NODE_CAPABILITIES, check_single_endpoint_genesis,
+    missing_required_capability,
 };
 pub use monitor::{NodeEndpointMonitor, spawn_node_endpoint_monitor};
 
