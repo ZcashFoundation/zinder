@@ -362,6 +362,69 @@ async fn duplicate_after_an_unreachable_endpoint_is_reported_accepted() -> eyre:
     Ok(())
 }
 
+/// The id reported after an unreachable endpoint is computed on the blocking
+/// pool, and an answer that needs no id does not wait for it.
+///
+/// Parsing a large shielded transaction then leaves the async worker free for
+/// other wallet requests. The runtime has one blocking thread and the test
+/// holds it, so only a broadcast that computes an id waits until the test
+/// lets that thread go.
+#[test]
+fn accepted_id_after_an_unreachable_endpoint_is_computed_off_the_async_worker() -> eyre::Result<()>
+{
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()?
+        .block_on(broadcast_while_the_blocking_pool_is_held())
+}
+
+async fn broadcast_while_the_blocking_pool_is_held() -> eyre::Result<()> {
+    let (raw_transaction, transaction_id) = decodable_transaction()?;
+    let after_unreachable =
+        Endpoints::verified(vec![unreachable_node(), node_answering(duplicate_answer())]).await?;
+    let direct = Endpoints::verified(vec![node_answering(duplicate_answer())]).await?;
+    let (pool_held, pool_held_receiver) = tokio::sync::oneshot::channel();
+    let (release_pool, pool_released) = tokio::sync::oneshot::channel::<()>();
+    let held_pool = tokio::task::spawn_blocking(move || {
+        let _ = pool_held.send(());
+        let _ = pool_released.blocking_recv();
+    });
+    pool_held_receiver.await?;
+
+    let direct_broadcast = tokio::spawn({
+        let nodes = direct.nodes.clone();
+        let raw_transaction = raw_transaction.clone();
+        async move { nodes.broadcast_transaction(raw_transaction).await }
+    });
+    let failover_broadcast = tokio::spawn({
+        let nodes = after_unreachable.nodes.clone();
+        async move { nodes.broadcast_transaction(raw_transaction).await }
+    });
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        direct_broadcast.is_finished(),
+        "an answer that needs no id must not wait for the blocking pool"
+    );
+    assert!(
+        !failover_broadcast.is_finished(),
+        "the id must be computed on the blocking pool"
+    );
+
+    release_pool
+        .send(())
+        .map_err(|()| eyre!("the held blocking thread stopped waiting"))?;
+    held_pool.await?;
+    assert_eq!(direct_broadcast.await??, duplicate_answer());
+    assert_eq!(
+        failover_broadcast.await??,
+        TransactionBroadcastOutcome::Accepted(BroadcastAccepted { transaction_id })
+    );
+    Ok(())
+}
+
 /// Without an id to report, the node's own answer is returned unchanged.
 #[tokio::test]
 async fn duplicate_of_undecodable_bytes_after_an_unreachable_endpoint_stays_duplicate()

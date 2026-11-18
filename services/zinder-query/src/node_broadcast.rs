@@ -270,7 +270,7 @@ where
                     if let Some(cause) = attempt.first_pass_over {
                         self.prefer(position, cause);
                     }
-                    return Ok(attempt.settle(answer, &raw_transaction, position));
+                    return Ok(attempt.settle(answer, raw_transaction, position).await);
                 }
                 Err(error)
                     if error.upstream_classification() == SourceFailureClass::NodeUnreachable =>
@@ -349,10 +349,10 @@ impl BroadcastAttempt {
         clippy::wildcard_enum_match_arm,
         reason = "only duplicate and queued answers can follow an earlier delivery"
     )]
-    fn settle(
-        &self,
+    async fn settle(
+        self,
         answer: TransactionBroadcastOutcome,
-        raw_transaction: &RawTransactionBytes,
+        raw_transaction: RawTransactionBytes,
         position: usize,
     ) -> TransactionBroadcastOutcome {
         if self.unreachable.is_none() {
@@ -360,15 +360,16 @@ impl BroadcastAttempt {
         }
         match answer {
             TransactionBroadcastOutcome::Duplicate(_) | TransactionBroadcastOutcome::Queued(_) => {
-                submitted_transaction_id(raw_transaction).map_or(answer, |transaction_id| {
-                    tracing::info!(
-                        target: "zinder::wallet_serving",
-                        event = "broadcast_reported_accepted_after_unreachable_endpoint",
-                        position,
-                        "node endpoint already knew a transaction an unreachable endpoint may have accepted; reporting it accepted"
-                    );
-                    TransactionBroadcastOutcome::Accepted(BroadcastAccepted { transaction_id })
-                })
+                let Some(transaction_id) = submitted_transaction_id(raw_transaction).await else {
+                    return answer;
+                };
+                tracing::info!(
+                    target: "zinder::wallet_serving",
+                    event = "broadcast_reported_accepted_after_unreachable_endpoint",
+                    position,
+                    "node endpoint already knew a transaction an unreachable endpoint may have accepted; reporting it accepted"
+                );
+                TransactionBroadcastOutcome::Accepted(BroadcastAccepted { transaction_id })
             }
             answer => answer,
         }
@@ -396,13 +397,23 @@ fn no_verified_endpoint() -> SourceError {
 }
 
 /// Computes the transaction id of the submitted bytes, or `None` when they do
-/// not parse as a transaction this build decodes.
-fn submitted_transaction_id(raw_transaction: &RawTransactionBytes) -> Option<TransactionId> {
-    raw_transaction
-        .as_slice()
-        .zcash_deserialize_into::<Transaction>()
-        .ok()
-        .map(|transaction| TransactionId::from_bytes(transaction.hash().0))
+/// not parse as a transaction this build decodes or the computation does not
+/// finish.
+///
+/// Parsing and hashing a large shielded transaction can hold a thread for
+/// milliseconds, so it runs on the blocking pool instead of the async worker
+/// serving other wallet requests.
+async fn submitted_transaction_id(raw_transaction: RawTransactionBytes) -> Option<TransactionId> {
+    tokio::task::spawn_blocking(move || {
+        raw_transaction
+            .as_slice()
+            .zcash_deserialize_into::<Transaction>()
+            .ok()
+            .map(|transaction| TransactionId::from_bytes(transaction.hash().0))
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 #[allow(
