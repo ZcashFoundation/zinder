@@ -582,6 +582,28 @@ explorer.migration.denominations_v1
   not filled with zero values to simplify clients.
 - Stable enum scalar values and field tags are never renumbered.
 
+## Public gRPC listeners
+
+`zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer` build their
+listeners with `zinder_runtime::public_grpc_server`. Clients of any of them
+can meet these fixed limits:
+
+| Limit | Value | Client sees |
+| --- | --- | --- |
+| Request message size, every Zinder gRPC server (`MAX_DECODING_MESSAGE_BYTES`) | 2 MiB | `OUT_OF_RANGE` |
+| Concurrent streams per HTTP/2 connection | 200 | Stream queued or a new connection, by client stack |
+| Unary and server-streaming requests being received, process-wide | 32 | `UNAVAILABLE` |
+| Client-streaming and bidirectional calls open, process-wide | 32 | `UNAVAILABLE` |
+| Time for a request to arrive after its stream opens | 20 s | `DEADLINE_EXCEEDED` |
+| Time a client stream may go without sending | 20 s | `DEADLINE_EXCEEDED` |
+
+A unary or server-streaming call holds its receive slot only until its
+request has arrived, so long-lived response streams such as `ChainEvents`,
+`CompactBlocksInRange`, and `GetBlockRange` hold none. `UNAVAILABLE` from a
+full pool carries no `ErrorInfo`; retry with backoff.
+[ADR-0019](../adrs/0019-transport-policy-ownership.md#public-grpc-listeners)
+records the policy and its gaps.
+
 ## Operational names
 
 Health answers whether the process is alive. Readiness answers whether it can

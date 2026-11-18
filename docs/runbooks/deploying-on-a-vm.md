@@ -622,6 +622,9 @@ let a vanished wallet hold a slot is not measured. Every wallet shares the
 compatibility server's block-range stream limit, and the template sets no
 per-client request limit, so one client can take every slot
 ([Concurrent streams](../reference/lightwalletd-compatibility.md#concurrent-streams)).
+The same holds for the 32 slots the server uses to receive requests, which
+every client also shares
+([Requests being received](../reference/lightwalletd-compatibility.md#requests-being-received)).
 
 ## Install systemd supervision
 

@@ -473,8 +473,9 @@ sets no such limit.
 
 ### Connections
 
-The compatibility server limits one HTTP/2 connection to 200 concurrent
-streams, which is hyper's own server default. A client at that limit queues
+The compatibility server, like every public Zinder gRPC server, limits one
+HTTP/2 connection to 200 concurrent streams, which is hyper's own server
+default. A client at that limit queues
 further streams or opens another connection, depending on its HTTP/2 stack.
 
 The server pings a connection after one minute without a frame from it and
@@ -502,6 +503,31 @@ no stream limit and ping a connection only after two hours without activity,
 and it never returns `RESOURCE_EXHAUSTED`. It reads and sends one block at a
 time through an unbuffered channel, so its server holds about one block per
 stream.
+
+### Requests being received
+
+The server reads a whole request message into memory before the handler runs,
+so it bounds how many requests it receives at once across every connection.
+The bound is fixed and shared with native query and Explorer
+([ADR-0019](../adrs/0019-transport-policy-ownership.md#public-grpc-listeners)):
+
+- A request message larger than 2 MiB fails with `OUT_OF_RANGE` before the
+  server buffers it. A `SendTransaction` of the largest valid transaction,
+  2,000,000 bytes, fits.
+- At most 32 requests are being received at once. A unary or server-streaming
+  call holds its slot only until its request has arrived, so an open
+  `GetBlockRange` or `GetMempoolStream` holds none. A request that has not
+  arrived 20 seconds after its stream opened fails with `DEADLINE_EXCEEDED`.
+- `GetTaddressBalanceStream` and gRPC reflection draw on a separate pool of
+  32 slots and keep theirs until the client half-closes or the call ends. A
+  stream that sends nothing for 20 seconds fails with `DEADLINE_EXCEEDED`.
+- A request whose pool is full fails with `UNAVAILABLE` at once.
+  `zinder_grpc_request_receive_refusals_total{pool}` counts refusals and
+  `zinder_grpc_request_receive_timeouts_total{pool}` counts timeouts.
+
+The server cannot tell clients apart, so a client with many streams can keep
+a pool full. Limit concurrent requests per client at the edge.
+lightwalletd's fix for GHSA-xrx5-jc6q-9h8r sets the same values.
 
 ### Block caches
 

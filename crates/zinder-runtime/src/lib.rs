@@ -17,6 +17,10 @@
 //! - Two thin lifecycle helpers used by every binary entry point:
 //!   [`cancel_on_terminating_signal`] and [`install_tracing_subscriber`],
 //!   which rejects an invalid `RUST_LOG` with [`TracingSubscriberError`].
+//! - The gRPC server builder every public listener serves with
+//!   ([`public_grpc_server`]), which bounds streams per connection, pings
+//!   idle connections, and limits how many requests the process receives at
+//!   once ([`GrpcReceiveLimitLayer`]).
 //! - The process allocator every binary entry point installs
 //!   ([`RuntimeAllocator`]).
 //! - The process-wide Prometheus metrics recorder
@@ -41,6 +45,7 @@ mod logging;
 mod memory_budget;
 mod metrics;
 mod ops_endpoint;
+mod public_grpc_server;
 mod readiness;
 mod rpc_metrics;
 mod sections;
@@ -86,6 +91,11 @@ pub use ops_endpoint::{
     OpsEndpointHandle, OpsServer, OpsServerError, serve_ops_endpoint, spawn_ops_endpoint,
     spawn_ops_endpoint_for,
 };
+pub use public_grpc_server::{
+    DEFAULT_GRPC_RECEIVE_SLOTS, DEFAULT_GRPC_RECEIVE_TIMEOUT, GrpcReceiveLimit,
+    GrpcReceiveLimitLayer, GrpcReceiveLimits, MAX_CONCURRENT_STREAMS_PER_CONNECTION,
+    PublicGrpcServer, public_grpc_server, public_grpc_server_with,
+};
 pub use readiness::{
     ActiveNodeEndpoint, IngestPhase, NodeUnavailableDetail, Readiness, ReadinessCause,
     ReadinessDependency, ReadinessReport, ReadinessState, TrafficReadinessInterceptor,
@@ -117,19 +127,24 @@ pub use transport::{
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-/// Upper bound on the size of an incoming gRPC request frame, applied to
+/// Upper bound on the size of an incoming gRPC request message, applied to
 /// every serving Zinder gRPC server via `max_decoding_message_size`.
 ///
-/// The value accommodates the largest legitimate request: a broadcast
-/// transaction, itself capped at
-/// [`zinder_core::MAX_RAW_TRANSACTION_BYTES`] (2 MB), plus gRPC framing
-/// overhead. It must stay at or above that 2 MB bound so an oversized
-/// broadcast is rejected by the application-layer broadcast guard with its
-/// typed error, not by the transport.
+/// tonic holds a request message in memory while it decodes it, so this
+/// bound times [`DEFAULT_GRPC_RECEIVE_SLOTS`] bounds the request bytes a
+/// public server decodes at once.
 ///
-/// Setting it explicitly pins tonic's implicit default in place so a
-/// future framework default change cannot silently widen the limit.
-pub const MAX_DECODING_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+/// The largest legitimate request is a broadcast transaction of
+/// [`zinder_core::MAX_RAW_TRANSACTION_BYTES`] (2,000,000 bytes), which
+/// encodes to at most 2,000,015 bytes as a lightwalletd `RawTransaction` and
+/// fits under 2 MiB with room to spare. A larger transaction that still fits
+/// is rejected by the broadcast guard with its typed error; one beyond this
+/// bound fails in the transport with `OUT_OF_RANGE`, before tonic buffers
+/// it.
+///
+/// Setting it explicitly also keeps a future tonic default from silently
+/// widening the limit.
+pub const MAX_DECODING_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Git commit embedded by release builds.
 ///

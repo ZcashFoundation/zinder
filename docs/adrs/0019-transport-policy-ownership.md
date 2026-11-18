@@ -285,6 +285,64 @@ exclusions cover IngestControl only. The indexer channel is a client of a
 server whose TLS policy the node operator sets, so Zinder must meet that
 policy itself.
 
+### Public gRPC listeners
+
+`zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer` accept
+connections from clients Zinder does not control. Each builds its listener with
+[`zinder_runtime::public_grpc_server`](../../crates/zinder-runtime/src/public_grpc_server.rs),
+which owns one policy for all three:
+
+- At most 200 concurrent streams on one HTTP/2 connection, hyper's own server
+  default, which tonic otherwise removes.
+- An HTTP/2 keepalive ping after one minute without a frame from the client.
+  A ping unanswered for 20 seconds closes the connection.
+- A process-wide bound on requests being received, `GrpcReceiveLimitLayer`.
+
+tonic reads a whole request message into memory before the handler runs. The
+per-connection stream limit does not bound how many messages the process reads
+at once across connections, so many large requests sent together could exhaust
+memory. The receive limit has two pools of 32 slots each:
+
+- A unary or server-streaming call claims a request slot when its stream
+  opens, before any body arrives, and frees it when its request body ends,
+  before the handler runs. A long-lived response stream therefore holds no
+  slot. A request that has not finished arriving 20 seconds after its stream
+  opened fails with `DEADLINE_EXCEEDED`.
+- A client-streaming or bidirectional call, which today means lightwalletd
+  `GetTaddressBalanceStream` and gRPC reflection `ServerReflectionInfo`, claims
+  a client-stream slot and keeps it until the client half-closes or the call
+  ends. A client stream that sends no frame for 20 seconds fails with
+  `DEADLINE_EXCEEDED`. The separate pool keeps open client streams from
+  starving single-message calls. A unit test checks the list of
+  client-streaming methods against every service descriptor a public server
+  registers.
+- A request whose pool is full is refused with `UNAVAILABLE` before its body is
+  read.
+
+Every Zinder gRPC server also decodes at most `MAX_DECODING_MESSAGE_BYTES`
+(2 MiB) per request message. The largest legitimate request, a broadcast of a
+2,000,000-byte transaction, encodes to at most 2,000,015 bytes. With 32
+request slots, a public server holds at most 64 MiB of request messages being
+decoded. tonic refuses a larger message with `OUT_OF_RANGE` from its 5-byte
+length prefix, before buffering it.
+
+The values are constants, not configuration. Precedent is lightwalletd's fix
+for GHSA-xrx5-jc6q-9h8r, which uses the same slot count, timeout, and message
+size.
+
+The policy leaves three gaps:
+
+- A full pool refuses every new request, whichever client holds the slots. One
+  client with many streams or connections can therefore keep the pool full.
+  lightwalletd lets a new request evict the oldest slot of the connection
+  holding the most; Zinder does not. Limit concurrent requests per client at
+  the edge.
+- tonic has no HTTP/2 handshake timeout, and keepalive pings start only after
+  the handshake. A TCP connection that never sends the HTTP/2 preface holds a
+  file descriptor until the client closes it.
+- Each connection can buffer up to hyper's 1 MiB connection window of request
+  data before the receive limit reads or refuses it.
+
 ### Observability
 
 A single helper, `record_transport_event(peer, event, reason)`,
@@ -363,3 +421,7 @@ translations.
   image that accepts the entrypoint-only `*_PEM` variables, and described how
   its entrypoint delivers the materialized paths to both the wallet-serving
   processes and `zinder-explorer`.
+- 2026-11-18: Added public gRPC listeners: the shared
+  `zinder_runtime::public_grpc_server` builder with its per-connection stream
+  limit, keepalive, and process-wide receive limit, and the 2 MiB request
+  message bound.

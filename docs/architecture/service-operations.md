@@ -1112,6 +1112,25 @@ edge. The
 [compatibility reference](../reference/lightwalletd-compatibility.md#block-range-resource-limits)
 sizes one stream.
 
+### Public gRPC request receiving
+
+`zinder-query`, `zinder-compat-lightwalletd`, and `zinder-explorer` bound the
+requests they receive at once
+([Public gRPC listeners](public-interfaces.md#public-grpc-listeners)):
+
+- `zinder_grpc_request_receive_refusals_total{pool}` counts requests refused
+  with `UNAVAILABLE` because every slot of their pool was taken.
+- `zinder_grpc_request_receive_timeouts_total{pool}` counts requests cancelled
+  with `DEADLINE_EXCEEDED` because their request did not arrive within
+  20 seconds (`pool="request"`) or their client stream sent nothing for
+  20 seconds (`pool="client_stream"`).
+
+`pool` is `request` for unary and server-streaming calls and `client_stream`
+for client-streaming and bidirectional calls, including gRPC reflection.
+Refusals while traffic is light, or timeouts that keep rising, point at
+clients that open streams and send slowly or not at all. The server cannot
+tell clients apart, so limit concurrent requests per client at the edge.
+
 ### RocksDB
 
 `zinder-store` exports bounded role-labelled metrics for block-cache capacity
@@ -1238,7 +1257,10 @@ cookie contents, viewing keys, or unbounded payloads.
 Public listeners require explicit `security.allow_public_bind = true`. The
 release service does not provide public TLS termination, authentication, rate
 limits, or quota accounting. Put public compatibility traffic behind an
-operator-controlled HTTP/2 proxy.
+operator-controlled HTTP/2 proxy. Public gRPC listeners bound request size,
+streams per connection, and requests being received across the process, but
+not requests per client
+([Public gRPC listeners](public-interfaces.md#public-grpc-listeners)).
 
 Private ingest and projector control endpoints use bearer tokens loaded from
 files. Configuration output shows redaction markers, and errors identify only

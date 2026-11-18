@@ -280,7 +280,7 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     );
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
-    let server = tonic::transport::Server::builder()
+    let server = zinder_runtime::public_grpc_server()
         .add_service(grpc_service)
         .add_service(reflection_service)
         .serve_with_shutdown(query_config.listen_addr, cancel.clone().cancelled_owned());

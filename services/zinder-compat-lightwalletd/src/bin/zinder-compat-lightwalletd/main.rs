@@ -1,6 +1,6 @@
 //! Zinder lightwalletd-compatible gRPC server entry point.
 
-use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc};
 use zinder_core::wire::encode_zinder_native_chain_name;
 
 use clap::Parser;
@@ -27,28 +27,6 @@ use zinder_query::{
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: zinder_runtime::RuntimeAllocator = zinder_runtime::RuntimeAllocator;
-
-/// Maximum concurrent HTTP/2 streams on one client connection.
-///
-/// tonic otherwise advertises no limit, which also removes hyper's own
-/// server default of 200; this restores that value.
-const MAX_CONCURRENT_STREAMS_PER_CONNECTION: u32 = 200;
-
-/// Time without a frame from a client after which the server pings it.
-const HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_mins(1);
-
-/// Time a keepalive ping waits for its acknowledgement before the server
-/// closes the connection and ends the streams on it, so a client that
-/// vanished stops holding a block-range stream slot.
-const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// The gRPC server both serving modes listen with.
-fn lightwalletd_grpc_server() -> tonic::transport::Server {
-    tonic::transport::Server::builder()
-        .max_concurrent_streams(MAX_CONCURRENT_STREAMS_PER_CONNECTION)
-        .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
-        .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
-}
 
 #[derive(Parser)]
 #[command(name = "zinder-compat-lightwalletd")]
@@ -355,7 +333,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         reflection_service,
         reflection_readiness,
     );
-    let server_result = lightwalletd_grpc_server()
+    let server_result = zinder_runtime::public_grpc_server()
         .add_service(grpc_service)
         .add_service(reflection_service)
         .serve_with_shutdown(
@@ -548,7 +526,7 @@ async fn run_compact_blocks(
         reflection_service,
         reflection_readiness,
     );
-    let server_result = lightwalletd_grpc_server()
+    let server_result = zinder_runtime::public_grpc_server()
         .add_service(grpc_service)
         .add_service(reflection_service)
         .serve_with_shutdown(
@@ -657,6 +635,8 @@ fn configured_ping(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use zinder_core::Network;
     use zinder_source::{DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, NodeAuth};
 

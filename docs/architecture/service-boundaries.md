@@ -23,9 +23,13 @@ release workflow publishes `zinder-explorer` as a runtime image and inside the
 
 The services may share domain types from `zinder-core`, protocol definitions
 from `zinder-proto`, storage contracts from the owning storage crates, runtime
-configuration, operations support, and canonical secondary attestation against
-`CanonicalControl.WriterStatus` from `zinder-runtime`, and fixtures from
-`zinder-testkit`.
+configuration, operations support, the public gRPC listener policy, and
+canonical secondary attestation against `CanonicalControl.WriterStatus` from
+`zinder-runtime`, and fixtures from `zinder-testkit`. Query, compatibility, and
+Explorer serve their public gRPC listeners through
+`zinder_runtime::public_grpc_server`, so the request size, stream, and
+request-receive limits are the same on all three
+([Public gRPC listeners](public-interfaces.md#public-grpc-listeners)).
 
 They do not share mutable in-memory chain state or a writable RocksDB handle.
 No reader repairs missing canonical or wallet rows on demand. No compatibility
