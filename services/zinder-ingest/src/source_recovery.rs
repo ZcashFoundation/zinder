@@ -24,7 +24,7 @@
 //!   require manual reset.
 //!
 //! See [`docs/architecture/chain-ingestion.md`](../../../docs/architecture/chain-ingestion.md)
-//! and [`docs/adrs/0013-source-failure-recovery-topology.md`](../../../docs/adrs/0013-source-failure-recovery-topology.md)
+//! and [`docs/adrs/0007-node-failure-recovery-and-transport-policy.md`](../../../docs/adrs/0007-node-failure-recovery-and-transport-policy.md)
 //! for the corresponding architectural contract.
 
 use std::{borrow::Cow, time::Duration};

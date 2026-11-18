@@ -795,9 +795,8 @@ async fn latest_tree_state_matches_reference_when_tip_matches() -> Result<()> {
 /// empty list: a shielded subtree completes only after `2^16` notes, far
 /// beyond what a parity CI run mines. An empty-vs-empty pass here proves the
 /// two shims agree there is nothing to report, not that a non-empty root
-/// round-trips correctly. Non-empty coverage is tracked as remaining work in
-/// `docs/reference/lightwalletd-compatibility.md` (`GetSubtreeRoots`
-/// row) and needs a testnet/mainnet-scale fixture, not a regtest one.
+/// round-trips correctly. Non-empty coverage needs a testnet/mainnet-scale
+/// fixture, not a regtest one.
 #[tokio::test]
 #[ignore = "live parity test; see CLAUDE.md §Live Node Tests"]
 async fn subtree_roots_match_reference_for_supported_pools() -> Result<()> {
@@ -840,9 +839,7 @@ async fn subtree_roots_match_reference_for_supported_pools() -> Result<()> {
 /// there is nothing pending, not that a non-empty snapshot round-trips
 /// correctly. Non-empty coverage needs a broadcast helper (see
 /// `zinder-testkit::TransparentTestKey`, already used by `zinder-ingest`'s
-/// live broadcast-cycle test) and is tracked as remaining work in
-/// `docs/reference/lightwalletd-compatibility.md` (`GetMempoolTx`
-/// row).
+/// live broadcast-cycle test).
 ///
 /// If a mempool transaction does exist at call time, this issues two
 /// separate unary calls (Zinder, then reference) against the same live

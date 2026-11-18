@@ -1,89 +1,39 @@
-# ADR-0001: Use RocksDB for Canonical Storage
+# ADR-0001: Store chain data in RocksDB
 
-| Field | Value |
-| ----- | ----- |
-| Status | Accepted |
-| Product | Zinder |
-| Domain | Storage and persistence |
-| Related | [Storage backend](../architecture/storage-backend.md), [Service boundaries](../architecture/service-boundaries.md) |
+Status: Accepted
 
 ## Context
 
-`zinder-ingest` needs a canonical embedded KV store that owns durable chain artifacts: block metadata, compact-block payloads, transaction lookup records, tree state, epoch pointers, and the reorg window.
+`zinder-ingest` keeps the durable copy of the chain that every other Zinder runtime reads: block headers, compact blocks, transaction locations, tree-state checkpoints, chain epochs, and retained chain events. The storage engine has to fit that workload:
 
-The workload is not generic. It is append-heavy, range-read-heavy for wallet sync, and reorg-aware at the chain tip. It must support atomic per-`ChainEpoch` commits across multiple logical tables, explicit migrations, crash recovery, and a projected 100-200 GB storage footprint.
+- Writes are append-heavy and ordered by height, both during a first sync and while following the tip.
+- Wallet sync reads long ranges of consecutive heights.
+- A reorg replaces a short suffix of recent blocks.
+- One block commit changes several logical tables at once. The commit must land atomically and survive a crash.
+- A Mainnet deployment holds hundreds of gigabytes, so backup, checkpoint, compaction, and recovery tooling matter in production.
 
-Service architecture matters too. `zinder-ingest` is the only canonical writer. Read replicas reach canonical state through `RocksDbCanonicalSecondary` and the `CanonicalReader` contract, not by holding their own write handle. Production recovery, checkpointing, and operational tooling matter more than native multi-process write sharing.
+Each store has exactly one writer process, and readers run in other processes on the same host ([ADR-0003](0003-epoch-bound-reads-and-storage-roles.md)). Zinder therefore does not need several processes to write one database file. It does need an engine with a long production record.
 
-The candidates evaluated were RocksDB through `rust-rocksdb`, `fjall`, `redb`, and LMDB through `heed`.
+The candidates were RocksDB through `rust-rocksdb`, `fjall`, `redb`, and LMDB through `heed`.
 
 ## Decision
 
-Zinder uses **RocksDB through `rust-rocksdb`** as the canonical KV store for `zinder-store`.
+1. Zinder stores its canonical chain data in RocksDB through `rust-rocksdb`. The wallet store and the materialized-view stores use the same engine.
+2. Column families separate artifact families. One write batch commits everything a new chain epoch changes, so a crash leaves either the previous epoch or the new one.
+3. RocksDB stays inside the storage crates. Runtimes and public APIs see chain epochs, typed artifacts, and typed errors, never RocksDB handles, options, or errors.
+4. Store checkpoints use RocksDB's own checkpoint primitive. A wallet-serving backup binds a canonical and a wallet checkpoint together ([ADR-0004](0004-storage-and-deployment-topologies.md)). Zinder can capture such a pair but has no restore command yet, so rebuilding is the only restore today, as [Service operations](../architecture/service-operations.md#recovery) describes.
 
-The storage boundary hides RocksDB behind Zinder-owned domain contracts. Public
-APIs expose `ChainEpoch`, `BlockHeaderArtifact`, `BlockBlobArtifact`,
-`CompactBlockArtifact`, transaction fact/location artifacts, transparent-output
-artifacts, and `ReorgWindow`, never RocksDB types. RocksDB is owned by
-`zinder-ingest`; other services read through epoch-pinned store readers or an
-explicit query-owned store.
-
-## Rationale
-
-RocksDB has the strongest feature set for Zinder's canonical-store workload:
-
-- **Append-heavy ingest:** the LSM design fits height-ordered chain bulk catchup and tip following.
-- **Atomic multi-table commits:** `WriteBatch` plus column families maps cleanly to per-`ChainEpoch` commits across block metadata, compact blocks, transaction lookups, tree state, and epoch pointers.
-- **Range serving:** iterators, prefix-oriented options, bloom filters, block cache controls, and snapshots support wallet `GetBlockRange` traffic and explorer-derived access.
-- **Operational resilience:** checkpoints, backup tooling, compaction controls, WAL configuration, recovery modes, statistics, and a mature tuning surface matter more at 100-200 GB than pure-Rust dependency cleanliness.
-- **Production maturity:** RocksDB has the deepest deployment history among the candidates and the richest operational literature.
-
-The cost is developer experience. RocksDB adds a C++ build surface, longer cold-cache builds, larger binaries, and a larger tuning vocabulary. That cost is acceptable because canonical storage is the highest-blast-radius part of the project and the operational feature set materially reduces production risk.
+[Storage backend](../architecture/storage-backend.md) describes the stores, their column families, and their layout.
 
 ## Consequences
 
-Positive:
+- Building Zinder needs a C++ toolchain. Cold builds take longer, and binaries are larger than with a pure-Rust engine.
+- CI caches the native build. Each new release target needs its own native build validation.
+- RocksDB tuning is part of Zinder's operational surface. Zinder keeps it small by exposing a curated resource budget instead of raw options ([ADR-0005](0005-bounded-process-memory.md)).
+- Every new store API must be domain-shaped, so that RocksDB concepts do not leak into callers.
 
-- The canonical store starts from the most operationally mature candidate.
-- Column families partition artifact families without inventing table multiplexing.
-- Backups and snapshots use established RocksDB primitives.
-- One store supports wallet-facing range access and block-explorer-derived ingestion without changing engines.
+## Alternatives rejected
 
-Negative:
-
-- Contributors need a working native toolchain for RocksDB.
-- CI caches and monitors the native dependency build.
-- Cross-compilation, especially MUSL targets, needs explicit validation.
-- RocksDB tuning is part of Zinder's operational surface.
-- The storage abstraction must keep RocksDB concepts out of public APIs.
-
-Neutral:
-
-- `fjall` remains a fallback if RocksDB DX cost becomes unacceptable.
-- `redb` remains a candidate for small coordination state, not for canonical chain artifacts.
-- LMDB remains a useful reference for read-heavy replicas, not for the canonical writer store.
-
-## Switch Criteria
-
-Switching from RocksDB to `fjall` requires all of:
-
-- `fjall` passes the same real-fixture replay and crash-recovery tests.
-- `fjall` stays within 2x of RocksDB's disk footprint at the measured fixture size.
-- `fjall` matches or beats RocksDB on chain bulk catchup and reorg replacement within the accepted thresholds.
-- RocksDB's native build or cross-compilation cost blocks normal contributor or CI workflows.
-
-Switching to a third engine requires a new ADR.
-
-## Alternatives Considered
-
-### `fjall`
-
-Strongest pure-Rust DX challenger and best key-value separation for large values. Rejected because operational maturity, file-format track record, backup story, and production evidence are weaker than RocksDB's.
-
-### `redb`
-
-Clean pure-Rust API, ACID transactions, and chain-indexing evidence through `ord`. Rejected for the canonical store because append-heavy, reorg-replacement, and disk-efficiency evidence is weaker than RocksDB and `fjall`. Viable for small coordination state.
-
-### LMDB through `heed`
-
-Excellent for mmap-backed read-heavy access and direct multi-process readers. Rejected because Zinder's service boundary does not rely on multiple processes opening the same database file as primary, and LMDB is less aligned with append-heavy mutable artifact storage and reorg replacement.
+- **`fjall`.** It is the strongest pure-Rust challenger and separates large values well. Its file-format track record, backup story, and production evidence are weaker than RocksDB's. Zinder reconsiders it only if all of these hold: it passes the same real-fixture replay and crash-recovery tests, stays within twice RocksDB's disk footprint, matches RocksDB on bulk catch-up and reorg replacement, and the RocksDB native build blocks normal contributor or CI work.
+- **`redb`.** It has a clean API and ACID transactions. Its evidence for append-heavy writes, reorg replacement, and disk efficiency is weaker than RocksDB's and `fjall`'s. It remains a candidate for small coordination state, not for chain data.
+- **LMDB through `heed`.** It excels at memory-mapped, read-heavy access from several processes. Zinder does not need several processes to open one database as primary, and LMDB fits append-heavy, frequently replaced data less well.

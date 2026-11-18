@@ -1,398 +1,247 @@
 # Chain ingestion
 
-`zinder-ingest` is the only canonical writer. The release runtime either opens
-an authenticated ready store or constructs one in a writer-owned staging path,
-then continuously follows Zebra. It also owns live mempool state and the private
-control APIs used by projectors and trusted readers.
+This page explains how `zinder-ingest` builds and maintains the canonical
+store, the block facts and indexes that every other runtime reads. It is for
+operators and contributors who need to predict what ingest does on first start,
+at the tip, on a reorg, after a restart, and when a node fails.
 
-## Runtime sequence
+`zinder-ingest` is the only process that writes the canonical store. It works in
+two phases:
 
-```text
-load and validate configuration
-  -> connect to Zebra and discover capabilities
-     (with [node_fallbacks.N], admit every endpoint and start on the first admitted one)
-  -> discover network-upgrade activations
-  -> refuse a node whose block 0 is not the network's genesis block
-  -> open a ready canonical store
-     or recover a published staging store
-     or construct and publish a fresh store
-  -> admit the discovered activations as a schedule revision
-  -> raise the store's reorg window to the configured window, if larger
-  -> start continuous canonical following with the admitted schedule
-  -> serve authenticated control commands and mempool state
-```
+1. **Fresh construction.** With no store on disk, ingest bulk-builds one from
+   genesis to the node's tip at that moment, in a staging directory. Readers
+   see nothing until the build is published.
+2. **Continuous following.** With a published store, ingest polls the node and
+   appends one block at a time, or replaces recent blocks after a reorg.
 
-Store identity, network, workload, construction activation fingerprint,
-raw-blob retention, reorg policy, construction build plan, and schema are
-validated before a ready store is admitted. The immutable construction manifest
-must describe the same typed workload and complete build plan as the store
-control record. An incompatible non-empty path fails without mutation.
+Ingest picks the phase from what is on disk, not from a setting. It moves from
+construction to following once, when it publishes the build. Following then
+appends the blocks mined during construction.
 
-The writer then admits the node's activation table. A table that adds or
-changes only activations above the visible tip is journaled as the next
-schedule revision; a change at or below the tip fails without mutation. See
-[ADR-0039](../adrs/0039-writer-admitted-network-upgrade-schedules.md).
+## Startup sequence
 
-A configured reorg window larger than the store's effective window is recorded
-as a monotonic store revision. The settled tip holds until the visible tip is a
-full new window above it, so the replaceable suffix grows with new blocks. A
-smaller configured window fails without mutation. See
-[ADR-0041](../adrs/0041-reorg-window-follows-the-node-bound.md).
+1. Check every configured node endpoint. See
+   [What ingest checks before it writes](#what-ingest-checks-before-it-writes).
+2. Admit the canonical store: open the published store at `storage.path`, or
+   install a published build left in staging, or discard unpublished staging
+   and construct a fresh store.
+3. Record the node's activation table and the configured reorg window in the
+   store when they extend what it already holds.
+4. Start the mempool owner, when the private control listener is configured,
+   and, with fallback endpoints, the standby monitor.
+5. Follow the chain and serve the private control API to the projector and
+   readers.
+
+An existing store whose network, raw-blob retention, build plan, or schema
+does not match fails startup unchanged. So does a configured reorg window
+smaller than the store's. See
+[Reorgs and the reorg window](#reorgs-and-the-reorg-window).
+
+Network-upgrade activation heights come from the node. A node table that only
+adds or moves activations above the store's tip becomes a new schedule
+revision. A change at or below the tip fails startup. See
+[ADR-0008](../adrs/0008-consensus-parameters-from-the-node.md).
 
 ## Fresh construction
 
-Fresh construction uses a sibling staging path. `CanonicalStoreBuildPlan`
-fixes the source range, checkpoint predecessor, network, activation
-fingerprint, raw-blob retention, and reorg policy before data is loaded. The
-workload and complete build plan are bound into the construction manifest
-before publication.
+Construction fixes its target before it loads data: the node's tip at that
+moment, or `ingest.run_overrides.target_height` if lower. It starts at genesis
+unless `ingest.run_overrides.checkpoint_height` names a checkpoint.
 
-The source path fetches bounded connected segments. Block preparation validates
-source identity, parses each block once, and constructs `CanonicalBlockFacts`,
-retained raw blobs, compact-block material, tree commitments, and direct-index
-inputs. Transaction locations are always derived from ordered canonical facts;
-transaction and block bytes are written only when the build plan retains them.
-CPU-heavy preparation may run in parallel; commitment-tree positioning and
-publication remain ordered.
+Ingest fetches blocks in bounded batches, prepares them in parallel, and writes
+them in order. It rebuilds the note commitment trees from the blocks and stores
+a tree-state checkpoint every 100 blocks and at the build tip.
 
-The ordered loader appends each block's note commitments to one in-memory
-frontier per active pool. It writes a tree-state checkpoint every 100 blocks
-and at the build tip. Before publication, only the build-tip checkpoint is
-compared with the node's tree state. The loader therefore cross-checks each
-checkpoint as it writes it: the root of the in-memory frontier must equal the
-root of the checkpoint's canonical `finalState` encoding. A mismatch stops
-construction, and nothing is published. The check costs at most one more root
-computation for each pool that changed since the previous checkpoint. The
-node's tree state for the build tip is requested by the tip's hash. If that
-block has left the node's best chain, construction stops and publishes nothing.
+Before publishing, construction compares its derived tree state at the build
+tip, and every subtree root the loaded blocks complete, with the node's. A
+mismatch stops construction with an error that names it, such as
+`SourceSubtreeRootMismatch`, and nothing is published. Publication validates
+the whole build and installs it in one step.
 
-Readers serve the tree state at every other retained height from the same
-derivation. The canonical reader seeds an accumulator from the nearest
-checkpoint below the height and appends each stored compact block's note
-commitments up to it, checking parent links and the tree sizes each compact
-block records. Live following stores a checkpoint for every block it appends,
-so only construction-built history is reconstructed, at most 99 blocks at a
-time. See [Wallet data plane](wallet-data-plane.md) for the read contract.
+The `[ingest.construction]` settings bound batch size, request concurrency, and
+the memory held by blocks in flight. See
+[Configuration](../reference/configuration.md) and
+[ADR-0009](../adrs/0009-ingest-lifecycle-and-construction.md).
 
-The loader also derives the root of every subtree that a loaded block
-completes, and construction stores those derived roots. Construction reads the
-completed ranges with `z_getsubtreesbyindex` before it requests the build
-tip's tree state, so a node that switched to another chain between the two
-requests refuses the second one. A node that still holds the build tip must
-report the derived roots exactly, with the same indexes and completing
-heights. When its first answer differs, construction reads the ranges once
-more, because a node that switched away and back between the two requests
-answered the first one for the other chain. When the second answer also
-differs, construction stops with `SourceSubtreeRootMismatch`, which names the
-pool and subtree index, and publishes nothing.
+### Restart during construction
 
-`CanonicalConstructionSettings` and `CanonicalPipelineLimits` bound:
-
-- source segment size and target response bytes;
-- concurrent source requests and reserved response bytes;
-- block-preparation concurrency; and
-- the memory reserved by blocks admitted to preparation until their ordered
-  store write completes.
-
-Startup rejects `ingest.construction.source_segment_max_blocks` above 1000.
-Each segment block is one entry in a JSON-RPC batch, and Zakura refuses a batch
-with more than 1,000 entries.
-
-Construction loads an inactive `RocksDbCanonicalBuilder`, validates continuity,
-manifest identity, per-block replay envelopes, and the ordered facts digest,
-then publishes `CanonicalBaselinePublication`. The candidate is not readable as
-a canonical store until publication succeeds.
-
-Subtree-root construction makes its load coverage explicit. The normal
-node-backed path loads `RetainedRange`: roots completed after the authenticated
-history predecessor. An admitted captured corpus may instead call
-`load_complete_subtree_root_prefix` with `CompletePrefix`: every root from index
-zero through each protocol's completed count at the fixed tip. This import is a
-caller-authenticated boundary, not a claim that the store can prove headers it
-does not retain. Completion blocks strictly before retained history preserve
-the captured identity; a root completing at the authenticated predecessor must
-match that predecessor hash; roots completing in retained history must match
-retained headers.
-
-`CanonicalSubtreeRootLoadCoverage`, sequence-digest version 2, and the exact
-ordered root rows are bound into construction-manifest format 4. Cold
-publication readback recomputes the same coverage-aware digest and repeats the
-available predecessor and retained-header checks. Coverage is never inferred
-from row counts.
-
-On restart, a ready staging store is installed and cold-opened at the configured
-path. An unpublished or invalid staging store is removed and reconstructed. A
-ready configured store is never replaced by staging data.
-
-Shutdown stops construction, and the writer returns without admitting a
-store. Source requests stop as soon as shutdown is requested. While blocks
-stream into the builder, the blocking loader stops at its next block boundary
-and leaves its block-load staging for the next start to discard, so shutdown
-does not wait for a large deletion. Two later stages cannot be interrupted:
-SST finalization after the last block, and publication, which flushes and
-reopens the store. The writer waits for them to finish, so no `RocksDB` work
-outlives the writer. Finalization merges the reverse indexes of the whole
-build, so on a long chain it can outlast the supervisor's grace window, and
-the supervisor's kill is then a crash during construction. In every case the
-next start applies the restart rules above: a cancelled construction is
-equivalent to a crash before publication, and a publication that finished
-during shutdown leaves a staged READY store that is installed.
+Construction does not resume. Any stop before publication discards staging
+and rebuilds from genesis, construction never fails over, and the projector
+follows the same rule; see
+[Initial sync](../runbooks/initial-sync.md#restarts-during-the-first-sync).
 
 ## Continuous following
 
-`CanonicalFollower` polls one atomic source tip and compares it with the
-admitted `CanonicalEventFence`.
+The follower polls the node's tip every `ingest.follow.poll_interval_ms`
+(1,000 ms by default):
 
-- A connected next block produces `CanonicalLiveAppend`.
-- A changed suffix within `CanonicalReorgPolicy` produces
-  `CanonicalLiveReplacement`.
-- A replacement deeper than the persisted policy fails closed.
-- An unchanged source tip waits for the configured poll interval.
+- When the next block connects to the store's tip, ingest appends it.
+- When the node's chain differs within the reorg window, ingest replaces the
+  differing blocks.
+- When nothing changed, it waits for the next poll.
 
-Append and replacement commits advance block facts, direct indexes, chain
-epoch, ordered sequence digest, and retained canonical event state atomically.
-The writer does not perform historical wallet-output lookups or read wallet
-projection state.
+Each append or replacement is one atomic commit of the block facts, the
+indexes, the next chain epoch (the store version readers pin), and a
+[chain event](chain-events.md). Readers see the old state or the new state,
+never a mix.
 
-Each append also authenticates the note-commitment trees. Ingest appends the
-block's note commitments to the visible-tip frontier of every active pool. The
-result must equal the node's validated tree state for that block, byte for
-byte. The canonical store repeats the derivation from its own persisted
-checkpoint before it commits. Because the result is compared with the node's
-tree state, the append takes each changed pool's root from its canonical
-encoding and skips the cross-check that construction checkpoints run. Frontier
-validation reuses the roots of the 16 most recently validated encodings from a
-process-wide memo, keyed by pool and exact `finalState` bytes. After the first
-append in a writer process, a pool that the block leaves unchanged costs no
-root computation. A pool that the block changes costs one, for the node's new
-tree state.
+Each append also authenticates the note commitment trees. Ingest derives the
+block's tree state and requires it to equal the node's, byte for byte. It asks
+for the node's tree state by block hash, so a node that switched chains in
+between refuses instead of answering for another block. For a block that
+completes a shielded subtree, ingest also compares the derived root with the
+node's. A contradiction stops the writer with `SourceCheckpointMismatch` or
+`SourceSubtreeRootMismatch`, and nothing is committed for that block.
 
-Ingest reads a block and its tree state with two node requests, and the node
-can switch its best chain between them. The tree-state request therefore names
-the block that ingest just read by its hash, for each append and for each block
-of a replacement. When that block has left the node's best chain, the request
-fails as a changed upstream view. Readiness reports `node_unavailable` with
-class `upstream_view_changed`, committed state and the fence are kept, and the
-next iteration observes the node again. The writer logs a
-`canonical_source_recovery` warning when an outage starts or changes class, and
-counts every retry in `zinder_ingest_canonical_source_recoveries_total`. A tree
-state for the same block whose
-time or frontiers differ from the derived result is a contradiction, not a
-changed view. It stops the writer with `SourceCheckpointMismatch`, which names
-the part that differed.
+Ingest is ready when the store is within `ingest.follow.lag_threshold_blocks`
+(1 by default) of the node's tip and the mempool owner, when it runs, has
+loaded its snapshot. See [Readiness](../reference/readiness.md).
 
-Each append also derives the root of every subtree that the block completes,
-from the same frontier that authenticates the block's tree state. A root is
-taken when the commitment that fills the subtree's last leaf is appended, so a
-subtree that the block completes partway through its commitments is included.
-Ingest commits the derived roots. For a block that completes a subtree, it
-also reads the completed range with `z_getsubtreesbyindex` and requires the
-node's roots, indexes, and completing heights to equal the derived ones. A
-block that completes no subtree costs no subtree-root request. The subtree-root
-request names no block, so the node can answer for a sibling block that
-replaced the block after ingest read it. When the roots differ, ingest requests
-the block's tree state again by its hash. A node that no longer holds the block
-refuses that request as a changed upstream view, and the next iteration
-observes the node again. A node that still holds the block is asked for the
-range once more, because it may have switched away and back between the two
-requests. When the second answer also differs, the writer stops with
-`SourceSubtreeRootMismatch`, which names the block height, pool, and subtree
-index. Nothing is committed for that block, so a restart resumes from the kept
-fence. A node that switches to the sibling again before the second request
-can also cause this stop, but a stop that recurs at the same block means that
-the node and ingest disagree on the root. Replacement blocks are checked the
-same way.
+### Reorgs and the reorg window
 
-Readiness becomes ready only when canonical lag is within
-`ingest.follow.lag_threshold_blocks` and the live mempool gate, when configured,
-has completed its current source snapshot. Source failures move readiness to
-`node_unavailable`, preserve committed state, back off by failure class, and
-resume from the current fence. Storage corruption, schema mismatch, invalid
-reorg depth, and internal invariant failures terminate the writer.
+Ingest can replace only the newest `ingest.reorg_window_blocks` blocks, 1,000
+by default. The block at the bottom of that window is the settled tip, and
+ingest never rewrites it or anything below it.
+[ADR-0010](../adrs/0010-reorg-window-and-displaced-blocks.md) explains why the
+default matches the node's own finalization bound.
 
-### Control commands while following
+On a reorg, ingest walks back to the last block both chains share, prepares the
+replacement suffix in memory, and commits it atomically. The memory held is
+capped by `ingest.follow.max_replacement_bytes` (2 GiB by default). A larger
+replacement stops the writer with an error that names the setting.
 
-The follower that owns the primary also serves, through one command queue,
-the `CanonicalControl` and `IngestControl` commands of projectors, readers,
-and the live mempool owner. While the follower waits on the node, for a node
-request, a recovery backoff, or an endpoint switch attempt, it answers every
-read-only command at once: writer status, the chain epoch, retained chain-event
-and mempool-event pages, mempool stream starts and snapshot cursors, and
-checkpoint re-admission context. `WriterStatus` reports `tip_unconfirmed` as
-it does between waits, until a source observation confirms the visible tip.
-A slow or stalled node therefore does not delay `WriterStatus`, however long
-`node.request_timeout_secs` lets one request run, unless the follower already
-holds a full queue of writes.
+A fork at or below the settled tip is deeper than the window. Ingest then
+parks: it stops following, keeps its control API open, and reports
+`reorg_window_exceeded`. Readers refuse requests with `REORG_WINDOW_EXCEEDED`.
+A parked writer needs an operator. A node whose tip is an older block of the
+store's own chain is behind, not forked, so ingest reports `node_unavailable`
+and waits.
 
-Commands that write the store are held while the follower waits on the node,
-and apply in arrival order when the wait ends. They are mempool appends and
-retention steps, projection-build lease operations, and owner checkpoints. A mempool
-retention step still yields to canonical work before the next queued command.
-A read can be answered before a write that arrived earlier. No caller has
-observed that write yet: every caller awaits a write's reply before acting on
-it, and the live mempool owner publishes an index change only after its
-durable append replies. The follower holds at most 64 such writes, the
-capacity of its command queue. Beyond that it stops receiving commands until
-the wait ends, so a `WriterStatus` sent then is answered only after the wait.
+Raising `ingest.reorg_window_blocks` takes effect on the next start. The
+settled tip then holds until the visible tip is a full new window above it.
+The projector raises the wallet store's window to match, and readers require
+the exact recorded window. Lowering the window fails startup. A release that
+does not know the raised format refuses the store, so a raise cannot be undone
+without a rebuild.
 
-### Node endpoint failover
+### Node failures while following
 
-With `[node_fallbacks.N]` endpoints configured, ingest reads through the active
-endpoint of the ordered node list ([Node source boundary §Ordered node
-list](node-source-boundary.md#ordered-node-list)). The rules are recorded in
-[ADR-0013](../adrs/0013-source-failure-recovery-topology.md) Decision 8.
+A node failure does not stop the writer. Ingest keeps its committed state,
+reports `node_unavailable` with the failure class, backs off, and resumes from
+its last commit. It logs `canonical_source_recovery` and counts retries in
+`zinder_ingest_canonical_source_recoveries_total`. Storage corruption, a schema
+mismatch, a reorg beyond the window, and a broken internal invariant stop the
+writer instead.
 
-At startup, every endpoint is checked concurrently: required capabilities,
-activation table, and genesis block. The first admitted endpoint in position
-order becomes active as soon as every lower position has a verdict, and its
-table is the one the store admits. Startup does not wait for higher positions:
-an endpoint still being checked then is deferred (`node_endpoint_deferred`) to
-the standby monitor, so a fallback that does not answer never delays a healthy
-`[node]`. An endpoint that reports pruned storage, lacks a required capability,
-answers for another network, or advertises another activation table is
-excluded until restart (`node_endpoint_excluded`). A fallback that would
-become active with a table other than the one the store follows, its latest
-admitted revision or, before the first, its construction table, is excluded
-the same way, so only `[node]` can bring a new table; the comparison
-waits until every lower position has a verdict, so a fallback that already
-advertises the table `[node]` brings stays a standby. An endpoint that times out,
-fails a call, or does not report its storage mode is unreachable
-(`node_endpoint_unreachable`) and is evaluated again. With a READY store, a
-fallback must also qualify as a switch target would: report ready, have a tip
-at or above the store's visible tip, and hold the visible tip or the settled
-tip. Otherwise it is skipped (`node_endpoint_skipped`) and evaluated again, so
-startup never follows a chain that differs at or below the settled tip. When no endpoint is
-admitted, startup fails with the readiness `[node]` alone would have reported.
-A single-endpoint deployment keeps its capability and activation checks and
-runs the same genesis check on `[node]`; see [Supported
-chains](#supported-chains).
+While it waits on the node, the follower still answers read-only control
+commands such as `WriterStatus` at once. Writes, such as mempool appends, queue
+(up to 64) and apply when the wait ends.
 
-While ingest follows, a standby monitor polls every endpoint on the
-`[node.health]` cadence, 30 seconds by default. Each endpoint's evaluation is
-bounded by that cadence, or by 5 seconds when the cadence is shorter, and is
-recorded as soon as it completes, so an active endpoint that hangs never delays
-the evidence about the others. A switch abandons the evaluation in flight and
-starts a new one at once, so the endpoint ingest left becomes a candidate again
-within one evaluation rather than one cadence later. The monitor records
-whether the active endpoint reports ready, and whether each other endpoint
-could take over: it must report ready, advertise the required capabilities and the admitted table, hold the
-configured network's genesis block, and have a tip at or above the visible tip. It is a standby when it holds the
-visible tip, and a diverged standby when it holds only the settled tip. Until
-the follower publishes its first fence, a candidate that passes the other
-checks stays pending, and the monitor evaluates again as soon as that fence
-appears rather than one cadence later. Shutdown stops the monitor at once,
-even during an evaluation that waits on an endpoint that does not answer. The
-follower switches between iterations after three consecutive
-`node_unreachable` or `stream_disconnected` recoveries, or once the active
-endpoint has reported not ready for 300 seconds. It tries standbys in position
-order, then diverged standbys, rechecking only that each candidate still
-reports ready, its tip, and the block it holds at the visible or settled tip.
-Every candidate is rechecked at once within one five-second bound for the
-whole attempt, and the follower switches to the first one in that order that
-passes and logs
-`node_endpoint_switched`. A diverged standby's suffix above the settled tip is
-replaced within the reorg window as any reorg is. When no endpoint qualifies,
-the follower stays on its endpoint and recovers as before, and it attempts the
-switch again only after the monitor records another evaluation, so a follower
-waiting at its tip does not repeat the attempt on every iteration.
+## Node endpoint failover
 
-A switch to a standby keeps the visible tip confirmed, because the final check
-found that block on the new endpoint, so wallet-serving readers keep serving
-even when the new endpoint's first iteration fails. A switch to a diverged
-standby resets tip confirmation until the replacement commits, so readers see
-`tip_unconfirmed` meanwhile. Either switch skips the recovery backoff, stops
-admitting the mempool certification made from the previous endpoint, and ends
-the live mempool stream, so the owner rebuilds from the new endpoint. Each
-certification records the active endpoint the owner observed before it last
-found its source stream open, and the gate admits it only while that endpoint
-is still active. Ingest readiness therefore stays withdrawn until the owner
-certifies a snapshot from the new endpoint, even when the owner is still busy
-with the previous endpoint or finishes certifying one of its snapshots after
-the switch.
-Each endpoint's client applies that endpoint's own `request_timeout_secs`, and
-the writer bounds every node call by the longest timeout in the list, so a call
-to a fallback slower than `[node]` is not cut short after a switch. Each client
-also accepts responses up to its own `max_response_bytes`, and construction can
-start on any endpoint, so construction reserves and admits source responses
-against the largest limit in the list, which keeps its in-flight byte bound
-whichever endpoint is active, and aims them at the smallest.
-There is no timed failback. The next switch walks positions from 0 again, and a
-restart starts at position 0. Fresh construction does not switch: a node
-failure there exits, and the restart admits the first reachable endpoint.
+You can list fallback nodes after `[node]` as `[node_fallbacks.1]`,
+`[node_fallbacks.2]`, and so on; see
+[Configuration](../reference/configuration.md#the-node-sections) for the format. Ingest reads
+from one active endpoint at a time and switches when it fails.
+[ADR-0007](../adrs/0007-node-failure-recovery-and-transport-policy.md) records
+the rules.
 
-## Canonical events and retention
+| Situation | Failover |
+| --- | --- |
+| Continuous following | Ingest switches between follow iterations. |
+| Broadcast from `zinder-query` or wallet-mode compatibility | Moves to the next verified endpoint within the request. |
+| Fresh construction | None. A node failure exits, and the restart begins again. |
+| Explorer | None. It reads only `[node]`. |
 
-Every visible append or replacement publishes an authenticated retained event
-with a monotonically increasing sequence. Projectors use event history to bind
-their progress to canonical state. A writer-owned retention lease prevents
-pruning below a projector's required anchor. Event retention and lease
-operations are serialized through the canonical owner.
+**At startup**, ingest checks every endpoint concurrently and starts on the
+first one in list order that passes, without waiting for slower higher
+positions. An endpoint is excluded until restart when it reports pruned
+storage, lacks a required capability, has another genesis block, or advertises
+another activation table. Only `[node]` can introduce a new table. An endpoint
+that does not answer is checked again later. With an existing store, a
+fallback must also be ready, reach the store's tip, and hold the store's tip
+or settled tip. When no
+endpoint passes, startup fails with the readiness `[node]` alone would report.
 
-See [Chain events](chain-events.md) for event semantics and cursor behavior.
+**While following**, a standby monitor checks every endpoint each
+`[node.health]` poll interval (30 seconds by default). A standby must be ready,
+advertise the required capabilities and the store's activation table, have the
+configured genesis block, and have a tip at or above ingest's tip.
+
+The follower switches after either:
+
+- three consecutive recoveries of the same transport class, either
+  `node_unreachable` or `stream_disconnected`;
+- 300 seconds of the active endpoint reporting not ready.
+
+Other failure classes, such as a malformed response, never switch, because
+switching would hide the problem behind whichever node answers. The follower
+tries standbys that hold ingest's tip first, in list order, then standbys on
+another branch above the settled tip, which it handles as a reorg. It logs
+`node_endpoint_switched`, restarts the mempool stream from the new endpoint,
+and stays not ready until that snapshot loads.
+
+Limits:
+
+- There is no timed failback. The next switch walks the list from position 0,
+  and a restart starts at position 0.
+- Every endpoint must advertise the same activation table.
+- Each endpoint keeps its own `request_timeout_secs` and `max_response_bytes`.
+
+[Metrics](../reference/metrics.md) lists the endpoint state gauge.
+
+## What ingest checks before it writes
+
+Before it opens storage, ingest checks each endpoint it will read:
+
+- **Archive storage.** The node must report `pruned: false`. A pruned node is
+  refused, including as a fallback, with readiness cause
+  `node_capability_missing`. A node that does not report its storage mode
+  cannot become active; with fallbacks, ingest checks it again later.
+- **Capabilities.** The node must provide the JSON-RPC methods ingest needs;
+  see [Node source boundary](node-source-boundary.md).
+- **Network identity.** Block 0 must have the configured network's genesis
+  hash. The chain name a node reports cannot replace this check, because Zebra
+  reports `test` for both Testnet and Regtest.
+
+The genesis check runs on `[node]` in a single-endpoint deployment, on every
+endpoint checked at startup, and on every standby evaluation. A fallback that
+startup had not reached when it chose an endpoint is logged as
+`node_endpoint_deferred` and skips the startup check; the standby monitor runs
+it before the endpoint can become a candidate. The diagnostic
+`zinder-ingest probe` command does not run it.
+
+When `[node]` fails the genesis check and no endpoint passes, startup fails and
+logs `node_endpoints_unavailable`, and `/readyz` reports `node_unavailable`
+with failure class `configuration`. A failed block 0 read, for example while
+the node is starting, is not evidence of another chain. Startup then fails with
+that read's own failure class.
 
 ## Mempool ownership
 
-The live mempool owner and the mempool-event retention task start once the
-writer admits a READY canonical store, not with the control surface. During
-fresh construction the writer does not service its command queue, so durable
-mempool replay and retention would only time out. The owner consumes either the
-Zebra indexer stream or the JSON-RPC source selected by configuration. It
-publishes a complete in-memory snapshot before satisfying the writer readiness
-gate, then applies typed added, mined, and invalidated events. Retained mempool
-events support cursor resume and bounded audit queries.
+Ingest owns the live mempool when its private control listener
+(`[ingest_control]`) is configured. The mempool owner starts once a published
+store is open, not during construction. It streams from the node's indexer
+gRPC when `node.indexer_grpc_addr` is set, and polls JSON-RPC otherwise. It
+loads a full snapshot before ingest reports ready, then applies added, mined,
+and invalidated events. Mempool state is not part of block commits. Readers get it
+through the private control API. See
+[ADR-0012](../adrs/0012-mempool-topology-and-retention.md).
 
-Mempool state is not part of a canonical block commit. The control API exposes
-snapshot pages, transaction lookup, and event streaming without granting any
-reader a canonical write handle.
+## Supported networks
 
-## Configuration
-
-The release writer uses these sections:
-
-- `[network]` and `[node]` select and authenticate the upstream source, and
-  optional `[node_fallbacks.N]` tables add fallback endpoints;
-- `[storage]` selects the canonical path, immutable raw-blob retention, and
-  RocksDB resource budget;
-- `[ingest.construction]` bounds fresh construction;
-- `[ingest.follow]` controls polling and readiness lag;
-- `[ingest.run_overrides]` supplies an optional checkpoint or target height;
-- `[retention]` controls canonical and mempool event windows; and
-- `[ingest_control]` configures the private authenticated control listener.
-
-`ingest.phase_classification` is read only by the diagnostic `probe` command.
-The writer selects construction or following from the store lifecycle described
-in [Runtime sequence](#runtime-sequence), not from a gap threshold, so no
-setting chooses between two binaries or requires an operator handoff.
-
-## Supported chains
-
-Zinder indexes the public Mainnet and Testnet chains and Regtest. Each
-`Network` carries a fixed genesis block hash. A genesis-complete build uses
-that hash as its history predecessor, so it fails when the node's block 1 does
-not descend from it.
-
-Before it opens storage, ingest reads block 0 from each endpoint it checks at
-startup, including `[node]` when it is the only endpoint, and refuses an
-endpoint whose block hash differs from the configured network's. The chain name a node reports cannot replace
-this check: Zebra reports `test` for both Testnet and Regtest. With one
-endpoint, a mismatch fails startup with `node_endpoints_unavailable`, and
-`/readyz` reports `node_unavailable` with failure class `configuration`. A
-block 0 read that fails, for example while the node is still starting, is no
-evidence of another chain: startup fails with the read's own failure class, as
-when any other startup read fails.
-
-A Zebra or Zakura test network configured with its own genesis block is not
-supported. Its activation heights are discovered like any other network's, but
-its genesis differs from the one Zinder expects, so ingest refuses to start on
-it, checkpointed builds included.
+Ingest indexes Zcash Mainnet, Testnet, and Regtest, each with a fixed genesis
+hash. Custom activation heights work, because ingest reads them from the node.
+A Zebra or Zakura test network with its own genesis block is not supported:
+ingest refuses to start on it, checkpointed builds included.
 
 ## Invariants
 
-- Only `zinder-ingest` opens canonical storage for writes.
-- Construction never publishes before complete validation.
-- Following never commits a replacement beyond the fixed reorg policy.
-- Canonical commits contain block-local facts and direct canonical indexes, not
-  wallet or explorer query models.
-- Source errors are recoverable readiness states; integrity errors fail closed.
-- Secrets and raw authorization material never appear in logs or
-  `--print-config` output.
+- Only `zinder-ingest` opens the canonical store for writes.
+- Construction publishes nothing before it validates the whole build.
+- Following never replaces a block at or below the settled tip.
+- Canonical commits hold block-local facts and direct indexes, not wallet or
+  explorer query models.
+- Node failures are recoverable readiness states. Integrity failures stop the
+  writer.
+- Node credentials never appear in logs or `--print-config` output.

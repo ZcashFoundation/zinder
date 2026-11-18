@@ -6,11 +6,12 @@ Zinder is a service-oriented Zcash indexer. Architecture, vocabulary, and bounda
 
 ## Where to read first
 
-- [docs/README.md](docs/README.md): full doc index with lifecycle rules.
-- [docs/architecture/service-boundaries.md](docs/architecture/service-boundaries.md): who owns what across the four release runtimes (`zinder-ingest`, `zinder-projector`, `zinder-query`, `zinder-compat-lightwalletd`) plus the optional explorer runtime.
-- [docs/architecture/public-interfaces.md](docs/architecture/public-interfaces.md): the vocabulary spine (types, errors, config fields, capability strings).
+- [docs/README.md](docs/README.md): the doc index, grouped by reader, with the rules for keeping docs short and non-duplicated.
+- [docs/architecture/overview.md](docs/architecture/overview.md): the runtimes, which one writes which store, how a block becomes a wallet response, and where a new capability belongs.
+- [docs/architecture/public-interfaces.md](docs/architecture/public-interfaces.md): the vocabulary spine (type names, naming rules, protocol ownership, wire conventions).
+- [docs/reference/configuration.md](docs/reference/configuration.md), [capabilities.md](docs/reference/capabilities.md), and [error-vocabulary.md](docs/reference/error-vocabulary.md): config fields and environment variables, capability strings, and error reasons.
 - [docs/architecture/chain-ingestion.md](docs/architecture/chain-ingestion.md): the canonical commit pipeline.
-- [docs/adrs/0003-canonical-storage-access-boundary.md](docs/adrs/0003-canonical-storage-access-boundary.md): the epoch-bound storage API, writer/reader topology, secondary catchup, and writer-status RPC.
+- [docs/adrs/README.md](docs/adrs/README.md): the decision records, indexed by domain. [ADR-0003](docs/adrs/0003-epoch-bound-reads-and-storage-roles.md) covers epoch-bound reads and the writer and reader storage roles.
 - [.changes/README.md](.changes/README.md): the pull request release-note workflow and fragment-writing guidance.
 
 Before changing public types, storage layouts, protocol bytes, or service boundaries, read the relevant doc above and amend it in the same change.
@@ -235,7 +236,11 @@ artifacts and add a generated message round-trip test in
 
 ## Doc Maintenance Rule
 
-When a change alters a service boundary, public API, storage byte layout, protocol surface, or vocabulary, update the owning document in `docs/` in the same change. ADRs are written in present tense and describe the current decision; clarifications and rewordings are edited in place. Substantive design changes get a new ADR with the next contiguous number.
+When a change alters a service boundary, public API, storage byte layout, protocol surface, or vocabulary, update the owning document in `docs/` in the same change.
+
+Each topic has one owning page, listed in [docs/README.md](docs/README.md). Explain a topic there and link to it from everywhere else; do not restate it in a second page, an ADR, or a runbook. Architecture pages describe how the system works now, reference pages hold facts to look up, runbooks give steps, and ADRs record why. Keep migration history, dated evidence, and plans out of `docs/`.
+
+ADRs are written in present tense and describe the current decision. When a decision changes in a domain an ADR already covers, edit that ADR in place. Only a decision in a new domain gets a new ADR with the next contiguous number.
 
 ## Consensus Dependency Pins
 

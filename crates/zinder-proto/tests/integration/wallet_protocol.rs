@@ -977,7 +977,7 @@ fn tree_state_checkpoint_response_round_trips_through_prost() -> eyre::Result<()
 /// [`encode_rpc_transaction_id_hex`], and consumers must be able to
 /// decode it back with [`decode_rpc_transaction_id_hex`] into the same
 /// internal-form `TransactionId` the upstream observed. A regression to
-/// internal byte order on the wire (the bug ADR-0021 fixes) fails this
+/// internal byte order on the wire (the bug ADR-0009 fixes) fails this
 /// test deterministically because the assert compares against the RPC-
 /// form string a Zexplorer user paste would produce.
 #[test]

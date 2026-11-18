@@ -12,7 +12,7 @@ use eyre::{Result, ensure, eyre};
 ///
 /// `zinder-runtime::transport` owns intra-Zinder gRPC channels;
 /// `zinder-source::transport` owns every long-lived client to a Zebra
-/// full node. ADR-0019 codifies the split.
+/// full node. ADR-0007 codifies the split.
 const CORE_TRANSPORT_OWNERSHIP: &[&str] = &[
     "crates/zinder-runtime/src/transport.rs",
     "crates/zinder-source/src/transport.rs",
@@ -151,7 +151,7 @@ fn transport_construction_lives_only_in_transport_modules() -> Result<()> {
 
     Err(eyre!(
         "transport construction must live in its explicitly owning module \
-         (see ADR-0019). Offending production-source sites:\n{formatted_offenders}",
+         (see ADR-0007). Offending production-source sites:\n{formatted_offenders}",
     ))
 }
 

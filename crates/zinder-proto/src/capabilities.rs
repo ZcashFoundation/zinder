@@ -7,8 +7,8 @@
 //! descriptive requirements; it does not discover the capabilities of a
 //! composed wallet runtime. The `capability-table-vs-descriptor` CI guard
 //! cross-checks the table against the compiled `FileDescriptorSet`. The full
-//! protocol contract is in [Public interfaces §Capability
-//! Discovery](../../docs/architecture/public-interfaces.md#capability-discovery).
+//! protocol contract is in the [capabilities
+//! reference](../../docs/reference/capabilities.md).
 //!
 //! Capability naming follows `domain.subdomain.capability_name_v{N}`.
 //! Versioned suffixes are part of the capability identity; a `_v2`
@@ -187,7 +187,7 @@ pub const EXPLORER_BLOCK_ACTIVITY_DISTRIBUTION_V1: &str = "explorer.block.activi
 ///
 /// Signals that the explorer plane classifies a raw user input string
 /// into typed search candidates per
-/// [ADR-0012](../../../docs/adrs/0012-typed-explorer-search-and-privacy-refusal.md).
+/// [ADR-0019](../../../docs/adrs/0019-explorer-plane.md).
 /// The classifier short-circuits shielded receivers and viewing keys
 /// into the typed `NotPubliclyIndexable` refusal arm before any storage
 /// read; gated on `wallet_query_endpoint.is_some()` because hash
@@ -452,7 +452,7 @@ pub const INGEST_CONTROL_CHAIN_VALUE_POOLS_AT_TIP_V1: &str =
 ///
 /// Advertises the classifier-driven `zinder.v1.ingest.WriterPhase`
 /// vocabulary wired in
-/// [ADR-0015](../../../docs/adrs/0015-phase-driven-ingest.md). Gates a
+/// [ADR-0009](../../../docs/adrs/0009-ingest-lifecycle-and-construction.md). Gates a
 /// field on `WriterStatus` rather than a dedicated RPC.
 pub const INGEST_WRITER_PHASE_V1: &str = "ingest.writer.phase_v1";
 

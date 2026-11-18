@@ -1,6 +1,6 @@
 //! In-process refusal of public binds on Zinder's plaintext serving surfaces.
 //!
-//! Zinder ships no server TLS by design (ADR-0006 assigns encryption and
+//! Zinder ships no server TLS by design (ADR-0011 assigns encryption and
 //! public exposure to a reverse proxy), so every serving and operational
 //! listener is plaintext. A listener bound to an unspecified
 //! (`0.0.0.0`, `::`) or globally-routable address therefore exposes
@@ -109,13 +109,13 @@ pub fn guard_serving_bind(
                     bind_addr = %bind_addr,
                     class = ?class,
                     "binding a plaintext serving surface to a non-loopback address; \
-                     terminate TLS and authorization at a reverse proxy (ADR-0006)"
+                     terminate TLS and authorization at a reverse proxy (ADR-0011)"
                 );
                 Ok(())
             } else {
                 Err(ConfigError::invalid(format!(
                     "{surface} {bind_addr} binds a plaintext serving surface to a public or \
-                     unspecified address; Zinder ships no server TLS (ADR-0006). Front it with a \
+                     unspecified address; Zinder ships no server TLS (ADR-0011). Front it with a \
                      reverse proxy and set security.allow_public_bind = true \
                      (ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true) to opt in."
                 )))

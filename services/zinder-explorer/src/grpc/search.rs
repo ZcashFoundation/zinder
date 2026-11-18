@@ -4,10 +4,10 @@
 //! [`zinder_core::explorer_search`], confirms non-shielded candidates
 //! against the upstream wallet plane, and wraps the typed candidates in
 //! the cross-cutting [`ExplorerFreshness`] envelope per
-//! [ADR-0011](../../../docs/adrs/0011-explorer-freshness-envelope.md).
+//! [ADR-0019](../../../docs/adrs/0019-explorer-plane.md).
 //!
 //! The handler enforces the privacy invariant from
-//! [ADR-0012](../../../docs/adrs/0012-typed-explorer-search-and-privacy-refusal.md):
+//! [ADR-0019](../../../docs/adrs/0019-explorer-plane.md):
 //! shielded receivers, viewing keys, and shielded receivers inside a
 //! unified address never reach a `WalletQuery` call. The wallet client
 //! is only consulted to disambiguate `HashCandidate` arms and confirm

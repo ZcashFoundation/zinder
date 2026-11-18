@@ -177,7 +177,7 @@ COPY --from=zinder-service-state --chown=10001:10001 /var/lib/zinder /var/lib/zi
 # /etc/zinder/config.toml and passes it with CMD. The file binds every
 # container interface so `docker run -p` works; other containers on the same
 # network can still reach these listeners, and host networking binds the
-# host's interfaces (see service-operations.md, Runtime images). A config
+# host's interfaces (see docs/architecture/service-operations.md, Security boundary). A config
 # mounted at the same path replaces the file as a whole, and arguments after
 # the image name replace CMD.
 USER 10001:10001

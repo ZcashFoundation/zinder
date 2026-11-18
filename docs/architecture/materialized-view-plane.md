@@ -1,391 +1,120 @@
 # Materialized-view plane
 
-The materialized-view plane builds explorer-shaped indexes and aggregates from
-canonical artifacts and retained events. It is optional, independently
-versioned, and rebuildable. A materialized-view failure must not change
-canonical truth or wallet projection state.
+This page explains how Zinder builds the Explorer's indexes and aggregates: who writes them, the contract each one follows, which ship, how they replay, and how their schemas change. It is for developers changing a view and operators running one. [ADR-0020](../adrs/0020-materialized-views.md) records why the plane works this way. [Explorer plane](explorer-plane.md) describes the queries that read it.
 
-The implementation lives in `zinder-materialized-views`. The crate owns the
-consumer SDK, the materialized-view RocksDB wrapper, bundled explorer
-consumers, per-consumer schema manifests, cursors, coverage, and read
-snapshots. `zinder-explorer` is the primary reader of those views.
+## What a materialized view is
 
-This subsystem is not the wallet projection. Wallet state is owned by
-`zinder-wallet-projection`, `zinder-wallet-rocksdb`, and `zinder-projector`.
-Those crates do not depend on `zinder-materialized-views`.
+A materialized view is a query-shaped index or aggregate that Zinder can rebuild at any time from the canonical chain. Block summaries, address activity, fee distributions, and reorg incidents are views. Each view is written by one consumer, a piece of code that receives committed blocks and writes rows for them.
 
-## Deployment status
-
-`zinder-ingest` builds the materialized views. It opens one in-process
-canonical secondary at `<storage.path>.materialized-view-secondary`, hydrates
-block contexts from canonical replay rows, and writes the view store nested
-under the canonical path. The writer handle never serves these reads, so the
-canonical writer's cross-block read counters stay at zero.
-
-`zinder-explorer` reads those views as a RocksDB secondary. It is not part of
-the certified four-runtime topology, which does not start it or expose its
-native query service. An operator who wants the explorer query surface runs it
-against the same storage path, through the Compose overlay or the
-`zinder-wallet-serving-explorer` single-volume image.
-
-## Runtime selection
-
-The ingest runtime requests the optional Explorer materialized-view workload
-with `[ingest].explorer_views = true`. The boolean defaults to `false` for
-every coverage and deployment shape; coverage never enables Explorer views
-implicitly. When false, the existing materialized-view directory remains
-untouched and no materialized-view secondary, store, tailer, replay sampler,
-or historical backfill starts. It does not change canonical-writer or
-wallet-projection ownership or readiness.
-
-`explorer_views = true` opens the Explorer view store with every bundled
-consumer. Every bundled consumer is an Explorer view; there is no wallet
-workload in the materialized-view store
-([ADR-0043](../adrs/0043-owned-transparent-wallet-query-surface.md)). Wallet
-projection and wallet-serving readiness remain owned by `zinder-projector`,
-`zinder-wallet-rocksdb`, and the wallet readers.
-
-When the field is true, the request is printed by `--print-config` and the
-admitted state is emitted in bounded ingest startup evidence. Wallet-serving
-deployment files set `explorer_views = false`; the Explorer Compose overlay
-sets `ZINDER_INGEST__EXPLORER_VIEWS=true`, and the
-`zinder-wallet-serving-explorer` image bakes `explorer_views = true`.
-
-An enabled store is admitted only after its persisted manifest matches this
-release's bundled consumer set exactly. `MaterializedViewStore::open_explorer_views`
-and `MaterializedViewStore::open_explorer_views_secondary` preflight the
-manifest before the database opens. A recorded identity this release does not
-bundle fails with `ConsumerNotDeclared`, and a recorded subset fails with
-`ExplorerViewManifestRequiresFreshStore`. Neither failure mutates the store;
-the operator rebuilds Explorer views on a fresh materialized-view path. A store
-built before the `transparent_address_transaction_history` consumer was
-retired records that identity and needs this rebuild. This selection does not introduce a storage-layout migration. Enabled
-materialized views require genesis-complete canonical history or the
-authenticated height-0 checkpoint: checkpoint heights above zero are not
-admitted because cumulative address views can under-report when their producing
-blocks precede the first retained height.
-
-Readiness reports consumer identities in `materialized_view_identities` only
-after enabled-store admission, and only from the process that admitted the
-store. Disabled ingest therefore omits the field rather than claiming view
-readiness. `ExplorerServerInfo.materialized_view_identities` carries the same
-identities on the Explorer endpoint. Wallet endpoints carry none.
-
-A store built with `ingest.run_overrides.checkpoint_height` at height 0 may host
-enabled materialized views because height 0 is the authenticated predecessor
-for the complete height-1 history. A checkpoint above height 0 does not host
-materialized views: cumulative address views resolve spends against the
-producing block, so a store whose first available height is above block 1
-would silently under-report. The tailer refuses such a store instead.
-
-## Ownership
-
-A materialized view is appropriate when the value is a query-specific
-aggregation, ordering, summary, or index that can be reconstructed from named
-canonical inputs. Examples include transaction history, address activity,
-block summaries, fee distributions, reorg incidents, value-pool history, and
-time-indexed block production.
-
-A value belongs in canonical storage when it is immutable source truth needed
-by more than one consumer, required for wallet correctness, or required to
-rebuild a projection without contacting the node. Consumer presentation,
-ranking, rolling windows, and product-specific formulas do not belong in
-canonical storage.
+A fact belongs in canonical storage instead when it is immutable, needed by more than one consumer, needed for wallet correctness, or needed to rebuild a view without the node. Rankings, rolling windows, presentation, and product-specific formulas belong in views.
 
 ```text
-Immutable reusable source fact?
+Immutable, reusable source fact?
 ├── yes -> canonical storage
 └── no
-    └── deterministic query-specific view? -> materialized-view consumer
+    └── deterministic, query-specific? -> materialized-view consumer
 ```
 
-Materialized-view consumers do not import `zinder-source` or call Zebra. If a
-rebuild needs an upstream fact that canonical storage does not retain, the
-canonical source and artifact contract must be extended first.
+A consumer never imports `zinder-source` or calls a node. If a view needs a fact that canonical storage lacks, the canonical artifact is extended first.
+
+Views are optional and rebuildable. A view failure never changes canonical or wallet state. The wallet projection is a different system, owned by `zinder-projector` and `zinder-wallet-rocksdb`, and does not depend on `zinder-materialized-views`.
+
+## Who writes the views and when
+
+Only `zinder-ingest` writes views, and only when [the Explorer is turned on](explorer-plane.md#turn-it-on). Otherwise ingest opens no view store and leaves an existing one untouched.
+
+When enabled, ingest works in this order:
+
+1. It waits until its canonical store is published, then opens an in-process canonical secondary and the view store as a primary.
+2. It admits the store only if the recorded consumers match this release's bundled set exactly (see [Schema versions](#schema-versions)).
+3. After canonical sync reaches the tip, it replays committed blocks into every view and then follows new blocks.
+4. Once replay reaches the tip, it runs the historical backfills for the conventional-fee distribution and the transaction-component summary.
+
+The view store is a separate RocksDB instance at `<storage.path>/materialized-views`, on the canonical volume. Replay pauses when that volume runs low on space, as [What it costs](explorer-plane.md#what-it-costs) describes, and also slows or pauses under memory pressure.
+
+`zinder-explorer` reads the store as a RocksDB secondary. A secondary validates the store after every catch-up and never writes.
 
 ## Consumer contract
 
-`MaterializedViewConsumer` is the event-level interface. It applies committed
-and reorged chain events through a `MaterializedViewConsumerCtx` that owns the
-pending RocksDB batch.
+Most views implement `BlockKeyedConsumer`. It applies and reverts one `BlockCommitContext`, which carries the block's identity, time, parsed transaction facts, and resolved spends. The host builds each context once and shares it across consumers. `MaterializedViewConsumer` is the event-level interface for views that need only the chain event, and `MaterializedViewMempoolConsumer` receives mempool events.
 
-`BlockKeyedConsumer` is the standard per-block interface. Implementations apply
-and revert one `BlockCommitContext`; the store's chain-event dispatch supplies
-the event range loops and the batch hooks. `BlockCommitContext` carries the shared block identity,
-time, transaction facts, and any hydrated spend facts required by the selected
-consumers. The host hydrates a context once and shares it across consumers.
+Each consumer declares a `MaterializedViewConsumerSchema`:
 
-`MaterializedViewMempoolConsumer` handles typed mempool events for views that
-include unconfirmed activity. Chain and mempool cursors remain separate because
-chain state rewinds on reorg while the mempool event sequence does not.
+- a stable `MaterializedViewConsumerName`, persisted in the store, so renaming one is a storage change;
+- a schema version;
+- the column families it owns, which no other consumer may share; and
+- the single row version its reader accepts.
 
-Every consumer declares one `MaterializedViewConsumerSchema` containing:
+These rules keep every view rebuildable and reorg-safe:
 
-- a stable `MaterializedViewConsumerName`;
-- a monotonically increasing schema version;
-- the complete set of owned column families; and
-- the single row version admitted by the current reader.
+- One write batch holds a consumer's rows, its view state, and its cursor advance. A crash cannot publish a cursor past the rows it describes.
+- Persisted keys use codecs from `zinder-core::wire` for heights, positions, timestamps, script hashes, and outpoints.
+- Reverting a block deletes exactly the rows it wrote. Height-prefixed layouts use range deletes. Other layouts keep a per-height undo index, retained for one reorg window.
+- A reorg leaves the same bytes as a fresh apply of the replacement chain, however blocks were batched. A conformance test checks this for every registered chain-event consumer except the reorg-incident log, which records the reorg itself.
 
-Column-family ownership must be disjoint. Consumer names are persisted keys,
-not display labels, so renaming one is a storage migration rather than a source
-cleanup.
+## Bundled consumers
 
-## Bundled consumer registry
+`bundled_materialized_view_consumer_definitions()` is the closed list of views a release ships. The store's manifest, its cursor lists, and the replay host's dispatch all derive from it, so a registered consumer cannot be left out of replay.
 
-`bundled_materialized_view_consumer_definitions()` is the single, closed list
-of Explorer views bundled with a release. Each
-`MaterializedViewConsumerDefinition` declares the schema and the
-`MaterializedViewDispatch`:
+The dispatch column says how a consumer receives data. "Replay" consumers follow the shared replay cursor. "Backfill join" consumers follow the same cursor but track their own historical coverage. "Snapshot" means the consumer joins after its own build publishes a snapshot.
 
-| Dispatch | Receives | Recovery source |
+| Consumer | Dispatch | Read by |
 | --- | --- | --- |
-| `ChainEventBlocks`, join `Replay` | Every retained chain event with block contexts | Canonical chain events |
-| `ChainEventBlocks`, join `CanonicalBackfill` | The live tail from the shared replay cursor | Canonical backfill plus chain events |
-| `ChainEventBlocks`, join `CanonicalSnapshot` | Chain events once its snapshot is active | Canonical snapshot plus chain events |
-| `ChainEventEnvelope` | Every retained chain event, envelope only | Canonical chain events |
-| `MempoolEvents` | Mempool events, once a host drives them | Mempool events |
-| `CanonicalBackfillOnly` | No events | Canonical backfill |
+| `block_summary` | Replay | `BlockSummariesInRange`, `BlockDetail`, `FeeSummary`, `BlockActivityDistribution`, `OverviewSnapshot` |
+| `recent_transactions` | Replay | `RecentTransactions` |
+| `transaction_history` | Replay | `TransactionHistory`, `OverviewSnapshot` |
+| `transaction_fees` | Replay | Paid fees and input values in `TransactionDetail` and history rows |
+| `transparent_outpoint_spend` | Replay | `spent_by` in `TransactionDetail` |
+| `transparent_address_activity` | Replay | `TransparentAddressActivity` |
+| `transparent_address_deltas` | Replay | `TransparentAddressDeltas` |
+| `transparent_address_ranking` | Snapshot | `TransparentAddressRanking`, the summary in `TransparentAddressActivity` |
+| `ironwood_migration` | Replay | `MigrationOverview`, `MigrationCohorts`, `MigrationDenominations` |
+| `conventional_fee_distribution` | Backfill join, with an ingest backfill | `ConventionalFeeDistribution` |
+| `transaction_component_summary` | Backfill join, with an ingest backfill | `TransactionComponentSummary` |
+| `value_pool_flow_history` | Backfill join | The `ValuePoolFlow*` methods |
+| `block_production_time` | Backfill join | `BlockProductionInTimeRange`, which the Explorer cannot serve |
+| `commitment_root_search` | Backfill join | `CommitmentRootSearch`, which the Explorer cannot serve |
+| `paid_fee_distribution` | Backfill join | `PaidFeeDistribution`, which the Explorer cannot serve |
+| `reorg_incidents` | Chain-event envelope only | `ChainReorgHistory` |
+| `value_pool_balance_history` | Backfill only | `ValuePoolBalanceHistory` |
+| `mempool_event_counts` | Mempool events | `MempoolEventCounts`, `OverviewSnapshot` |
 
-The store derives its exact consumer manifest and chain-event cursor lists from
-the registry. The ingest replay host constructs each selected chain-event
-consumer from its entry and derives its cursor-agreement and backfill-owned
-sets from the join kind. Neither side keeps its own consumer list, so a
-registered chain-event consumer cannot be left out of chain-event dispatch.
-No bundled runtime drives `MempoolEvents` consumers yet.
-`mempool_event_counts` is registered and included in the Explorer manifest, but
-nothing calls `MaterializedViewStore::write_mempool_event`, so its column
-family receives no rows.
+Two registered views receive no rows in this release. No runtime writes mempool events, so `mempool_event_counts` stays empty. No backfill exists for `value_pool_balance_history`, so it stays empty too.
 
-### Publishing the canonical snapshot
-
-The transparent-address ranking is the only `CanonicalSnapshot` consumer. Its
-summaries are cumulative, so it cannot join the shared replay cursor partway
-through history. The ingest replay host publishes its snapshot in one of two
-ways:
-
-- On a view store that has not materialized any height, the host activates an
-  empty generation at genesis before the first rebuild. Its coverage is
-  complete through height 0, and its lifetime history is the empty range that
-  starts at height 1. The ranking then replays from height 1 with every other
-  block consumer and follows the tip at the shared cursor.
-- On a store whose views materialized heights without the ranking, the host
-  builds an inactive generation from genesis on a worker of its own, beside
-  the replay tailer. Each build step applies settled history for at most 10
-  seconds and never passes the height the other views have materialized. The
-  build resumes after a restart, adopts each step's visible tip as its target,
-  and pauses with replay under the canonical-phase gate, memory pressure, and
-  the free-space floor.
-
-The build activates in one of two ways:
-
-- While the other views rebuild from canonical heights without a shared
-  cursor, a build that reaches their materialized height joins them there. The
-  height must be settled, and the views must hold the same block at it. The
-  join writes no cursor. The shared replay then applies every later height to
-  the ranking together with the other views, and its next cursor advance
-  includes the ranking. A store that is still far behind the tip therefore
-  serves the ranking long before its replay finishes, as a fresh store does.
-- Once the views sit at the canonical fence with a shared cursor, the step
-  that reaches the settled tip reads the unsettled tail, at most one reorg
-  window long. One write applies that tail, activates the generation, and
-  adopts the shared cursor.
-
-While the other views rebuild without a shared cursor and their materialized
-height is settled, replay dispatches no further page until the build reaches
-that height and joins them. Hydration reads dominate both walks, so a replay
-that kept advancing would only move the join point away, and the build would
-hydrate every height it passed a second time. After the join, one hydration
-per height serves every view, and replay takes over the prevout cache the
-build walked to the joined height instead of warming its own over the same
-history. Replay stops waiting once the build, outside its pauses, neither
-applies a page nor warms its cache past an earlier warm-up for 5 minutes, so a
-failing build cannot hold the views back. Replay waits again once that build
-applies history; otherwise it activates at the fence later. Views that follow a shared
-cursor never wait, and a page that carries a revert is dispatched before
-replay waits. `MaterializedViewTailer::catch_up` applies the same order on one
-thread: a trailing build first walks to the views' height and joins them, and
-replay runs after it.
-
-Settled heights never change, so the inactive build never holds a block that a
-reorg could replace. A step that pauses or is cancelled before an activating
-write leaves only settled progress behind. The ranking store also checks that
-every tail block extends the block applied below it, so a build left on a
-replaced branch fails instead of activating.
-
-## Store contract
-
-`MaterializedViewStore` is a separate RocksDB instance located under
-`MATERIALIZED_VIEW_STORE_SUBDIR`, currently `materialized-views`, beneath the
-configured canonical path. Writer and reader processes resolve that path
-through `MaterializedViewStore::path_for_canonical`. Its column families
-compress every level with ZSTD;
-[ADR-0034](../adrs/0034-exclusive-index-build-stages-and-block-local-spend-replay.md)
-records the writer's RocksDB settings.
-
-The primary stages consumer rows, materialized-view state, and cursor advances in one
-write batch. A crash cannot publish a cursor beyond the rows it describes. A
-secondary validates the container and every declared consumer after open and
-after each catch-up; it never alters schemas or writes primary state.
-
-`MaterializedViewStore::read_snapshot` binds materialized-view metadata and reads to
-one store sequence. Primary stores use a RocksDB snapshot. Secondary stores
-hold the shared side of the catch-up barrier for the snapshot lifetime, so a
-catch-up cannot advance the underlying sequence halfway through a multi-read
-response.
+`reorg_incidents` reads chain-event envelopes directly. When first created, it backfills from the oldest retained chain event and then keeps incidents after chain-event retention drops them. It cannot recover incidents pruned before it existed.
 
 ## Replay and coverage
 
-The host feeds retained `ChainEventEnvelope` values in order, hydrates the
-blocks named by each event, and calls
-`MaterializedViewStore::write_chain_event`. Rebuild starts from the earliest
-point covered by the consumer's declared recovery source, not automatically
-from the oldest retained event.
+Replay feeds retained chain events in order, hydrates the blocks each event names, and writes them through `MaterializedViewStore::write_chain_event`. Hydration resolves each transparent input's previous output from the blocks in hand, then from an in-memory cache of recent outputs, and last from canonical storage. After a restart partway through history, the host first warms that cache from earlier blocks.
 
-Block-keyed consumers resume from their shared chain-event cursor. When that
-cursor is expired, or when the consumers do not all hold one, retained events
-cannot show whether a reorg replaced rows the view already holds. The host then
-rebuilds from canonical heights instead. Before it rebuilds, it reverts the
-reorg window below the view's newest materialized height. For a missing cursor
-it skips that revert only when the block the view last checkpointed is still
-canonical, because every row below a canonical block is canonical too. When the
-view wrote its newest height, the settled tip was at least that height minus the
-reorg window, so no replacement reaches below that window. The undo indexes keep
-exactly that window, so the revert deletes the same rows on a pruned store as on
-one that kept every undo row.
+When the shared cursor has expired, or the consumers disagree about it, retained events cannot show whether a reorg replaced rows the views hold. Replay then rebuilds from canonical heights instead. It first reverts the reorg window below the newest materialized height, unless the last checkpointed block is still canonical.
 
-Hydration resolves each transparent input's previous output from the hydrated
-range, then from an in-memory prevout cache of outputs that earlier ranges
-produced, and last from the producing block's canonical replay row. The cache
-answers only for a range that extends the last block it applied, so results
-never depend on it. The canonical reads of the last step are independent, so
-they run on up to 16 threads and their storage waits overlap. Each thread
-reads a contiguous run of sorted keys in batched lookups, so keys in the same
-or adjacent data blocks cost one device read. Producing replay rows bypass the
-canonical block cache: a historical row is rarely read twice, and admitting it
-would evict the transaction-location and index blocks that every later lookup
-reuses. The threads allocate through jemalloc
-([ADR-0044](../adrs/0044-service-binaries-allocate-through-jemalloc.md)), so
-they do not queue on allocator locks between reads.
+The transparent-address ranking cannot join partway through history, because its totals are cumulative. On a store with no materialized heights, ingest activates an empty ranking at genesis and it replays with the other views. On a store whose views were built without it, ingest builds the ranking from genesis beside replay and activates it once it reaches the other views' height. Settled heights only enter the build, so a reorg cannot leave the inactive build on a replaced branch.
 
-The cache lives in process memory. When replay or the ranking build resumes
-partway through history with an empty cache and at least 10,000 heights left to
-walk, the host first warms the cache: it applies every retained block below the
-resume height in order, reading and decoding the rows on the same threads, so
-the cache holds what an uninterrupted walk from genesis would have held, up to
-its bound. Spends of outputs produced before a restart then resolve from memory
-instead of from their producing blocks. The ranking build warms in bounded
-steps, so it never holds the shared canonical secondary longer than one build
-step. A pause empties the cache, and the walker then resumes cold for the rest
-of the process instead of warming again, so repeated memory-pressure pauses
-cannot stop it from advancing.
+A cursor position is progress, not proof of completeness. Views that make completeness claims persist a `MaterializedViewState` beside their rows: the canonical epoch, the view tip, a revision, and an optional contiguous `MaterializedViewCoverage`. The Explorer reports that coverage, and advertises some capabilities only once it exists. `MaterializedViewStore::read_snapshot` binds the state and the rows to one store sequence, so a multi-read response cannot mix data from before and after a catch-up.
 
-Replay pauses while the volume that holds the canonical store, and therefore
-the view store, has less available space than
-`ingest.explorer_views_min_free_bytes` (10 GiB by default). Startup cursor
-seeding waits behind the same floor. Replay resumes on its own once at least a
-tenth more than that is available. Canonical ingest and
-wallet serving keep running while the views are paused.
-[ADR-0034](../adrs/0034-exclusive-index-build-stages-and-block-local-spend-replay.md)
-records the resolution order, the cache bound, and the guard.
+## Schema versions
 
-Consumers that make completeness claims persist `MaterializedViewState`
-beside their rows. It records the canonical epoch, materialized-view tip, revision,
-and optional contiguous `MaterializedViewCoverage`. Cursor position alone is
-progress evidence and must not be presented as historical completeness.
+`MATERIALIZED_VIEW_STORE_FORMAT_VERSION` versions the shared container: manifest layout, cursor encoding, and metadata families. Each consumer versions its own rows.
 
-A deterministic recovery source can be retained events, canonical artifacts,
-or an explicit checkpoint. Before activating a replacement store, operators
-must prove that the declared source covers the history being rebuilt. This
-prevents a replacement from publishing partial history behind a fresh cursor.
+A fresh store records its complete manifest at creation. Every later open, primary or secondary, requires the exact consumer names, versions, column families, and physical column-family set. Any difference fails without changing the store:
 
-## Schema lifecycle
+- A recorded consumer this release does not ship fails with `ConsumerNotDeclared`.
+- A store that records only part of the bundled set fails with `ExplorerViewManifestRequiresFreshStore`.
+- A container or consumer version difference fails with a schema mismatch.
 
-`MATERIALIZED_VIEW_STORE_FORMAT_VERSION` versions shared container state:
-manifest layout, cursor encoding, and metadata families. Every opener rejects a
-container mismatch without mutation. Operators create a fresh materialized-view
-path and rebuild from a certified recovery source; no service deletes an
-existing materialized-view directory during open.
+No service deletes or migrates a view store. After a release that adds, removes, or changes a view, rebuild the views on a fresh path; [Add the Explorer](../runbooks/deploying-on-a-vm.md#add-the-explorer) gives the procedure.
 
-Individual row layouts use per-consumer versions. A fresh store records the
-complete manifest atomically. Every later primary or secondary open requires
-the exact consumer names, versions, owned column families, and physical
-column-family set. Any divergence fails without mutation and requires a fresh
-store rebuilt from a certified recovery source. The full decision is recorded
-in [ADR-0028](../adrs/0028-materialized-view-schema-versioning.md).
+A consumer may add a payload field within one version only when its reader still decodes every earlier row. An older release may then misread the new rows, so rolling back requires rebuilding the views.
 
-A consumer may still add a payload field within one version when its reader
-decodes every earlier row. The transparent-address delta and activity rows
-store their transaction id as 32 internal-order bytes; rows an earlier release
-wrote keep the 64-character RPC hex form, and readers accept both. An earlier
-release reads the new rows with an empty transaction id, so rolling back to it
-requires rebuilding the Explorer views.
+## Adding a consumer
 
-## Key codecs and reorgs
-
-Persisted keys use codecs from `zinder-core::wire`. Heights, positions,
-timestamps, address script hashes, and outpoints are not encoded ad hoc inside
-consumers.
-
-Each block-keyed consumer must be able to delete exactly the rows produced by a
-reverted block. Height-prefixed layouts use bounded range deletes. Layouts
-whose primary key does not begin with height maintain a per-height index of the
-keys written by that block. Reorg deletion and replacement rows share the same
-batch as the cursor and materialized-view-state transition.
-
-No revert reaches a height more than one reorg window below the newest height
-a view applied, so the replay host keeps each such index for that window only.
-The transparent-address activity, deltas, and outpoint-spend views and the
-transaction-fee view declare their per-height index as a height undo index.
-Ingest opens the view store with the canonical store's effective window `W`.
-Applying height `h` deletes the index row at `h - W`, and each time ingest
-opens the store it deletes every older row on a blocking thread and compacts
-the range, so a store built by an earlier release shrinks in place. A pass that
-shutdown interrupts resumes on the next start, including one stopped after its
-rows were hidden but before their files were reclaimed. The newest
-row stays, so replay still reads its durable height from the outpoint-spend
-index. After an operator raises the window, recovery reverts heights the
-smaller window already pruned; they are settled, so re-applying them writes the
-rows an unpruned revert would have removed. The full retention rule is in
-[ADR-0017](../adrs/0017-materialized-view-consumer-and-key-codec.md#undo-index-retention).
-
-A reorg must leave the same bytes a fresh apply of the replacement chain
-writes, independent of how blocks were grouped into batches. Reorg
-conformance checks this for every registered chain-event consumer, in both
-directions of a fork, and excludes only the reorg-incident log, which records
-the reorg it observed. See
-[ADR-0017](../adrs/0017-materialized-view-consumer-and-key-codec.md#rewind-contract).
-
-## Query exposure
-
-`zinder-explorer` exposes materialized views through `ExplorerQuery` and
-advertises a capability only when its dependencies and coverage support the
-method. An unavailable materialized-view store maps to the stable
-`MATERIALIZED_VIEW_UNAVAILABLE` vocabulary. Missing data is never translated
-into zero, an empty complete result, or canonical absence.
-
-The Cipherscan adapter may translate those explorer methods into product
-routes, but Cipherscan names and response shapes stop at the adapter boundary.
-No materialized-view consumer may shape canonical storage around an external
-product contract.
-
-## Extension checklist
-
-When adding a consumer:
-
-1. identify the complete canonical recovery source and retention boundary;
-2. choose a stable consumer name and owned column families;
-3. add reusable key codecs to `zinder-core::wire`;
-4. implement apply and revert behavior in one atomic batch, encoding index
-   payloads in a deterministic order;
-5. add one registry entry declaring the schema and dispatch;
-6. persist truthful materialized-view coverage when the public method needs it;
-7. define the fresh-store recovery behavior for a schema change;
-8. expose the method under an explorer capability; and
-9. test replay, crash recovery, secondary catch-up, and incomplete coverage
-   refusal. The reorg conformance test runs every registry entry; extend its
-   fixture chain until the consumer writes comparable rows, and list any
-   path-dependent column family with its reason.
-
-See [ADR-0017](../adrs/0017-materialized-view-consumer-and-key-codec.md)
-for the consumer template and [Explorer plane](explorer-plane.md) for public
-query behavior.
+1. Name the complete canonical source the view rebuilds from, and its retention limit.
+2. Choose a stable consumer name and the column families it owns.
+3. Add any new key codec to `zinder-core::wire`.
+4. Implement apply and revert in one atomic batch, with index payloads in a deterministic order.
+5. Add one registry entry declaring the schema and dispatch.
+6. Persist coverage if the public method makes a completeness claim.
+7. Plan the fresh-store rebuild that the schema change requires.
+8. Expose the query on `ExplorerQuery` under a new capability ([Capabilities](../reference/capabilities.md)).
+9. Test replay, crash recovery, secondary catch-up, and refusal on incomplete coverage. Extend the reorg conformance fixture until the consumer writes comparable rows.

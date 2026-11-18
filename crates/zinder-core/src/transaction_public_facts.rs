@@ -9,7 +9,7 @@
 //! privacy classification the explorer needs.
 //!
 //! The full design contract lives in
-//! [ADR-0010](../../../docs/adrs/0010-transaction-public-facts.md).
+//! [ADR-0018](../../../docs/adrs/0018-transaction-facts-status-and-broadcast.md).
 
 use crate::{AuthDigest, BlockHeight, ConsensusBranchId, TransactionId};
 

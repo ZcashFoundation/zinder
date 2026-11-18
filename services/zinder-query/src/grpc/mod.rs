@@ -31,7 +31,7 @@ pub use native::{
 pub use request_limits::WALLET_QUERY_FIELD_LIMITS;
 
 /// Maps a [`QueryError`] to a tonic [`Status`] using the canonical mapping
-/// from [`Public Interfaces §Error Conventions`](../../../docs/architecture/public-interfaces.md#error-conventions).
+/// from the [error vocabulary](../../../docs/reference/error-vocabulary.md).
 ///
 /// This is the single source of truth for `QueryError` to gRPC translation.
 /// The native [`WalletQueryGrpcAdapter`] calls this function instead of

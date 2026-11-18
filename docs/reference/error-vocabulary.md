@@ -1,172 +1,203 @@
-# Error Vocabulary
+# Error vocabulary
 
-This page lists every `zinder.v1.ops.ErrorReason` value, the gRPC `Status` code it pairs with, the recommended retry disposition, and the auxiliary detail clients should expect alongside it. Use it as the reference when you map Zinder errors to your local retry, alert, and operator-action decisions.
+This page lists every reason a Zinder gRPC error can carry, the status code it
+comes with, and whether a client should retry. It is for client developers who
+map Zinder errors to retries, alerts, and operator actions.
 
-The proto enum is defined in [`crates/zinder-proto/proto/zinder/v1/ops/error.proto`](../../crates/zinder-proto/proto/zinder/v1/ops/error.proto). The reason-to-(code, retry) mapping is authored once in [`crates/zinder-proto/src/error_policy.rs`](../../crates/zinder-proto/src/error_policy.rs) as the `reason_policy` table; every Zinder surface builds its `Status` through `status_with_reason`/`status_for_reason`, so the code on the wire and the typed reason can never disagree. Each library boundary error enum (`QueryError`, `StoreError`, `ExplorerError`) implements `BoundaryError::error_reason` next to its own definition. This page owns the wire semantics clients should rely on; the policy table and the docs are kept in agreement by the `error_reason_policy_drift` CI guard and the per-boundary "no variant maps to unspecified" tests.
+## How an error appears on the wire
 
-`BroadcastRejectionReason` stays a separate payload verdict per [ADR-0023](../adrs/0023-typed-broadcast-rejection-reasons.md) and is never folded into `ErrorReason`.
+A failed Zinder gRPC call carries:
 
-## How to read the wire
+- a standard gRPC status code, which is the general retry signal;
+- a `google.rpc.ErrorInfo` detail with `domain = "zinder.dev"` and `reason`
+  set to an `ErrorReason` name, such as `"CHAIN_EPOCH_PIN_UNAVAILABLE"`; and
+- for some reasons, `ErrorInfo.metadata` keys or a second detail:
+  `BadRequest.field_violations`, `PreconditionFailure.violations`, or
+  `ResourceInfo`.
 
-Every failure a Zinder handler returns ships:
+Check the domain before you trust the reason, so another service's
+`ErrorInfo` is not mistaken for Zinder's. The status code always matches the
+reason, because one table, `reason_policy` in
+`crates/zinder-proto/src/error_policy.rs`, assigns both. The enum is defined in
+`crates/zinder-proto/proto/zinder/v1/ops/error.proto`.
 
-- A `tonic::Status` carrying a standard gRPC `Code` (one of 16).
-- A `google.rpc.ErrorInfo` detail with `domain = "zinder.dev"` and `reason = <ErrorReason name>` (the string-form name of the enum value, e.g. `"BROADCAST_DISABLED"`).
-- For some reasons, an additional structured detail (`BadRequest.field_violations`, `PreconditionFailure.violations`, `ResourceInfo`).
+Transport refusals, which happen before any handler runs, carry no
+`ErrorInfo`. [Configuration](configuration.md#public-grpc-listeners) lists
+them with their status codes.
 
-A request the transport refuses before any handler runs carries only the
-status code and message, with no `ErrorInfo`: a request frame over 4 MiB, a
-message that fails to decode, or a list over its
-[request list bound](../architecture/public-interfaces.md#request-list-bounds),
-which fails with `INVALID_ARGUMENT`.
+A node that rejects a broadcast transaction is not an error. The response
+carries a `BroadcastRejectionReason` verdict instead, as
+[ADR-0018](../adrs/0018-transaction-facts-status-and-broadcast.md) describes.
 
-Clients consult `ErrorInfo.reason` for the typed category and the auxiliary detail for the failure shape. Match on the domain first to avoid mistaking a non-Zinder service's `ErrorInfo` for a Zinder one. The Rust SDK converts recognized strings to its client-owned `ErrorReason` variants and preserves unrecognized Zinder reasons as `ErrorReason::Unknown(String)`, so a newer server does not erase diagnostic identity at an older client.
+## Retry dispositions
 
-The Rust client crate `zinder-client` exposes the typed accessors:
-
-```rust
-use zinder_client::{IndexerError, RetryPolicy};
-
-match indexer_error {
-    err if err.retry_policy() == RetryPolicy::RefreshChainEpoch => restart_with_fresh_epoch(&err),
-    err if err.retry_policy() == RetryPolicy::OperatorActionRequired => alert_oncall(&err),
-    err if err.retry_policy() == RetryPolicy::ClientError => fix_request(&err),
-    err => retry_with_backoff(&err),
-}
-```
-
-## Retry disposition semantics
-
-The authored `reason_policy` table pairs each reason with a `RetryDisposition`:
+Each reason has one retry disposition:
 
 | Disposition | Meaning |
 | --- | --- |
-| `RetryAfterBackoff` | A transient dependency is unavailable or the resource may appear after a future commit. Retry with exponential backoff. |
-| `Retryable` | The failure is a momentary contention signal; retry is safe without backoff. |
-| `NonRetryable` | Retrying the same request is futile until the request shape or deployment state changes (malformed request, schema mismatch, broadcast disabled, internal/data-loss conditions). |
+| `RetryAfterBackoff` | A dependency is temporarily unavailable, or the resource may appear after a later commit. Retry with exponential backoff. |
+| `NonRetryable` | The same request fails until the request or the deployment changes. |
+| `Retryable` | Safe to retry without backoff. No reason uses it today. |
 
-The Rust client crate `zinder-client` exposes `RetryPolicy::RetryWithBackoff`, `RefreshChainEpoch`, `OperatorActionRequired`, and `ClientError`. `RefreshChainEpoch` means the same pinned request cannot succeed: acquire `current_epoch` again and restart the whole epoch-bound operation. The `RetryDisposition` above remains the authoritative wire-level disposition.
+The Rust client maps each error to a `RetryPolicy`, which is more specific
+than the wire disposition:
 
-## Reason table
-
-### `INVALID_ARGUMENT` family
-
-The request shape failed validation. Retry disposition: **NonRetryable**. Carries `BadRequest.field_violations` naming the offending field and a human-readable reason.
-
-| Reason | What it means | Example metadata |
-| --- | --- | --- |
-| `INVALID_BLOCK_RANGE` | `start_height` exceeds `end_height` | `field_violations[start_height, end_height]` |
-| `BLOCK_RANGE_TOO_LARGE` | Requested compact- or full-block range exceeds the per-deployment cap | `field_violations[end_height]` |
-| `SUBTREE_ROOT_RANGE_TOO_LARGE` | Requested subtree-root count exceeds the public 1,024-entry per-request cap | `field_violations[max_entries]` |
-| `TRANSPARENT_OUTPOINT_COUNT_OUT_OF_RANGE` | A `TransparentOutpointSpendStatus` request carries no outpoints or more than the 1,024-outpoint per-request cap | `field_violations[outpoints]` |
-| `CHAIN_EVENT_CURSOR_INVALID` | Cursor bytes failed to parse, are for a different network / store / stream family, or a non-default request family disagrees with the cursor's encoded family | `field_violations[from_cursor]` |
-| `ADDRESS_OUTPUT_CURSOR_INVALID` | Same as above for address-output streams | `field_violations[from_cursor]` |
-| `TRANSPARENT_HISTORY_CURSOR_INVALID` | Same as above for transparent-history streams | `field_violations[from_cursor]` |
-| `SNAPSHOT_PAGE_CURSOR_INVALID` | Same as above for `MempoolSnapshot` paging cursors | `field_violations[from_cursor]` |
-| `INVALID_ADDRESS` | Address selector is empty, malformed, or targets a different network | `field_violations[address]` |
-| `UNSUPPORTED_SHIELDED_PROTOCOL` | Shielded protocol value is not supported by the wallet protocol | `field_violations[shielded_protocol]` |
-| `BROADCAST_TRANSACTION_TOO_LARGE` | Submitted raw transaction exceeds the maximum serialized transaction size | `field_violations[raw_transaction]` |
-| `INVALID_CHAIN_STORE_OPTIONS` | Operator misconfiguration in `[storage]` | — |
-| `ARTIFACT_PAYLOAD_TOO_LARGE` | Stored artifact exceeds size limits (deployment data issue) | — |
-| `INVALID_CHAIN_EPOCH_ARTIFACTS` | A future commit batch failed structural validation | — |
-
-### `FAILED_PRECONDITION` family
-
-The request shape is valid but the deployment is in a state that cannot serve it. Retry disposition: **NonRetryable**. Most reasons carry `PreconditionFailure.violations` with a typed `type` + `subject` + `description`.
-
-| Reason | What it means | Example metadata |
-| --- | --- | --- |
-| `BROADCAST_DISABLED` | The `broadcaster` is the no-op `()` implementation; deployment is read-only | `type=TRANSACTION_BROADCAST_DISABLED, subject=wallet.broadcast.transaction_v1` |
-| `CHAIN_EVENT_CURSOR_EXPIRED` | Cursor sequence is older than retained history (consumer fell behind) | `type=CHAIN_EVENT_CURSOR_EXPIRED, subject=chain_event:<seq>` |
-| `MEMPOOL_EVENT_CURSOR_EXPIRED` | Same as above for the mempool event stream | `type=MEMPOOL_EVENT_CURSOR_EXPIRED, subject=mempool_event:<seq>` |
-| `SNAPSHOT_PAGE_CURSOR_EXPIRED` | `MempoolSnapshot` paging cursor is anchored ahead of the mempool-event sequence the writer has applied | `type=SNAPSHOT_PAGE_CURSOR_EXPIRED, subject=snapshot_page:<anchor_seq>` |
-| `CHAIN_EPOCH_PIN_UNAVAILABLE` | Pinned chain epoch is no longer retained. A `TransparentAddressUnspentOutputs` or `FullBlocksInRange` stream also ends with it, after the items already sent, when it outlasts the read limit on its epoch's released serving pair, or when its pair lost a table file to compaction and the replacement serves a newer epoch; discard the partial result and read again at a newer epoch | `subject=chain_epoch:<id>` |
-| `SCHEMA_MISMATCH` | Persistent store schema is incompatible with the running binary | — |
-| `SCHEMA_TOO_NEW` | Store was opened by a newer Zinder; rolling back is unsafe | — |
-| `REORG_WINDOW_EXCEEDED` | A reorg crossed the configured reorg window and the canonical writer is parked until an operator reconciles it. Native query and lightwalletd compatibility return it on new requests, and native query also as the final item of open `ChainEvents` and `MempoolEvents` streams | `readiness_cause=reorg_window_exceeded, replacement_depth_blocks=<blocks>, reorg_window_blocks=<blocks>, covered_depth_blocks=<blocks>` |
-| `CHAIN_EPOCH_CONFLICT` | Detected chain-epoch contention between writer and reader | — |
-| `CHAIN_EPOCH_NETWORK_MISMATCH` | Store opened against the wrong `network` | — |
-| `MATERIALIZED_VIEW_UNAVAILABLE` | A required wallet projection or explorer materialized view is not configured for this deployment | `type=MATERIALIZED_VIEW_UNAVAILABLE, subject=<capability>` |
-| `ENDPOINT_CAPABILITY_UNAVAILABLE` | The admitted wallet endpoint does not expose the capability required by this operation | `type=ENDPOINT_CAPABILITY_UNAVAILABLE, subject=<capability>` |
-| `DEPENDENCY_NOT_CONFIGURED` | A federated dependency the explorer request needs (the canonical store, a materialized view, or a wallet-query endpoint) is not wired on this deployment | — |
-| `NODE_CAPABILITY_MISSING` | The upstream Zcash node does not advertise a capability the request requires. On the wire this comes only from transaction broadcast, the one request the query forwards to the node; the operator must reconfigure or replace the node | — |
-| `EXPLORER_PRECONDITION_UNSATISFIED` | An explorer read cannot serve the requested transaction state | — |
-| `CANONICAL_HISTORY_UNAVAILABLE` | The store's retained canonical history starts after a checkpoint, so a transaction lookup or a `TransparentOutpointSpendStatus` request that missed cannot prove an absence; query a store with complete history. An unpinned transaction lookup returns it only after the live mempool also missed, so a pending transaction is still reported | `ErrorInfo.metadata["first_available_height"]` |
-
-### `NOT_FOUND` family
-
-The requested resource is not available in the visible query state. Retry disposition: **RetryAfterBackoff** (the resource may appear after a future commit). Some reasons carry `ResourceInfo` naming the family/key. The `resource_type` is the on-wire artifact-family label (the `zinder_core::artifact_family` constants such as `compact_block`, `chain_epoch`); clients read it directly without a Rust-side translation table.
-
-| Reason | What it means | Example metadata |
-| --- | --- | --- |
-| `ARTIFACT_UNAVAILABLE` | A specific artifact is missing from the named family at the visible epoch. A block-range read names the first requested height above the visible tip or below the retained floor. A subtree-root read names the first completed root the store does not hold, such as one completed before a checkpointed store's history floor. Explorer reads also raise it for a not-yet-materialized materialized-view row | `resource_type=<family>, resource_name=<key>` |
-| `CHAIN_EPOCH_MISSING` | Chain epoch is not retained (often: pruned), or, on an unpinned `WalletQuery.Transaction` miss, the writer's mempool answered at a different epoch than this replica read | `resource_type=chain_epoch, resource_name=chain_epoch:<id>` |
-| `BLOCK_NOT_IN_BEST_CHAIN` | No block matching the requested selector is visible in the best chain; unknown and reorged-out selectors share this reason | — |
-| `TRANSACTION_NOT_FOUND` | Proven absence from `WalletQuery.Transaction`: the transaction is in neither the answering epoch's canonical chain nor, for an unpinned lookup, the writer's live mempool at that same epoch, and the store retains complete history. It is an answer rather than a failure; no other failure carries it | `ErrorInfo.metadata["chain_epoch_id"]`, `["first_covered_height"]` (always `1`), `["visible_tip_height"]`, `["covers_mempool"]` (`true` or `false`) |
-
-`WalletQuery.Transaction` reports an absence only through `TRANSACTION_NOT_FOUND`. Any other `NOT_FOUND` reason on that method, including `ARTIFACT_UNAVAILABLE`, `CHAIN_EPOCH_MISSING`, and `BLOCK_NOT_IN_BEST_CHAIN`, is a failure and says nothing about whether the transaction exists. Servers below contract revision 6 answered absences with `ARTIFACT_UNAVAILABLE` and no `ResourceInfo`, the same shape as several storage failures, so that shape is ambiguous. A current query server keeps that shape for an unpinned miss whose writer answered the mempool lookup without the typed absence.
-
-### `DATA_LOSS` family
-
-Persistent or upstream data could not be decoded. Retry disposition: **NonRetryable**. Pages on-call; this is the strongest signal that storage corruption needs to be investigated.
-
-| Reason | What it means |
+| `RetryPolicy` | What to do |
 | --- | --- |
-| `COMPACT_BLOCK_PAYLOAD_MALFORMED` | A persisted compact block failed to deserialize |
-| `ARTIFACT_CORRUPT` | A persisted artifact's checksum or shape is invalid, or a federated response carried an unusable value (for example a missing outpoint or an out-of-range Zatoshi amount) |
+| `RetryWithBackoff` | Retry with exponential backoff. |
+| `RefreshChainEpoch` | Read the current epoch again and restart the whole epoch-bound operation. Retrying the same pinned request cannot succeed. |
+| `RestartFromEarliestRetained` | Resubscribe to chain events from the earliest retained event and rebuild derived state from there. |
+| `OperatorActionRequired` | Alert an operator. Do not retry until the deployment changes. |
+| `ClientError` | Fix the request. |
 
-### `RESOURCE_EXHAUSTED` family
+```rust
+use zinder_client::RetryPolicy;
 
-The server is already running its limit of a bounded kind of work. Retry disposition: **RetryAfterBackoff**.
+match error.retry_policy() {
+    RetryPolicy::RetryWithBackoff => retry_with_backoff(),
+    RetryPolicy::RefreshChainEpoch => restart_at_current_epoch(),
+    RetryPolicy::RestartFromEarliestRetained => resubscribe_from_earliest(),
+    RetryPolicy::ClientError => fix_request(),
+    _ => alert_operator(),
+}
+```
 
-| Reason | What it means |
+The client converts known reason strings to `ErrorReason` variants and keeps
+unknown ones as `ErrorReason::Unknown(String)`. For an unknown reason, it
+derives the policy from the status code.
+
+## Reasons
+
+Each section below covers one status code. Its first line gives the wire
+disposition and the Rust client's policy.
+
+### `INVALID_ARGUMENT`
+
+`NonRetryable`. Client policy: `ClientError`. When one field is at fault, a
+`BadRequest.field_violations` entry names it.
+
+| Reason | Meaning |
 | --- | --- |
-| `TREE_STATE_REPLAY_LIMIT_REACHED` | `WalletQuery.TreeStateAtHeight` named a height without a stored checkpoint, and the query already reconstructs one tree state per available CPU from stored compact blocks. A height with a stored checkpoint is never refused this way |
+| `INVALID_BLOCK_RANGE` | `start_height` is above `end_height`. |
+| `BLOCK_RANGE_TOO_LARGE` | A compact-block or full-block range asks for more than 1,000 blocks. |
+| `SUBTREE_ROOT_RANGE_TOO_LARGE` | `max_entries` is above 1,024. |
+| `TRANSPARENT_OUTPOINT_COUNT_OUT_OF_RANGE` | A `TransparentOutpointSpendStatus` request has no outpoints or more than 1,024. |
+| `TRANSPARENT_BALANCE_ADDRESS_COUNT_EXCEEDED` | A lightwalletd transparent balance request has no addresses or more than 256. |
+| `CHAIN_EVENT_CURSOR_INVALID` | The cursor does not parse, belongs to another network, store, or stream family, or disagrees with the requested family. |
+| `ADDRESS_OUTPUT_CURSOR_INVALID` | The same, for address-output streams. |
+| `TRANSPARENT_HISTORY_CURSOR_INVALID` | The same, for transparent-history streams. |
+| `SNAPSHOT_PAGE_CURSOR_INVALID` | The same, for `MempoolSnapshot` page cursors. |
+| `INVALID_ADDRESS` | The address is empty, malformed, or for another network, or a `ChainEvents` address filter has more than 256 entries. |
+| `UNSUPPORTED_SHIELDED_PROTOCOL` | The wallet protocol does not support the requested shielded protocol. |
+| `BROADCAST_TRANSACTION_TOO_LARGE` | The raw transaction is larger than 2,000,000 bytes. |
+| `INVALID_CHAIN_STORE_OPTIONS` | `[storage]` is misconfigured. |
+| `ARTIFACT_PAYLOAD_TOO_LARGE` | A stored artifact exceeds a size limit. |
+| `INVALID_CHAIN_EPOCH_ARTIFACTS` | A commit batch failed structural validation. |
 
-### `UNAVAILABLE` family
+### `FAILED_PRECONDITION`
 
-Service is reachable but a dependency is not, or the operation is not yet supported. Retry disposition: **RetryAfterBackoff**.
+`NonRetryable`. Client policy: `OperatorActionRequired`, except where the
+table says otherwise. Some reasons carry a `PreconditionFailure` violation
+with a `type` and `subject`.
 
-| Reason | What it means |
+| Reason | Meaning |
 | --- | --- |
-| `NODE_UNAVAILABLE` | Upstream node (Zebra) is unreachable or returning errors. A broadcast also returns it, without sending the transaction, until one of the reader's configured node endpoints passes first-contact verification, and when every verified endpoint is unreachable. The writer's live mempool also returns it while it hydrates or rebuilds from the node, and query forwards it for mempool calls |
-| `STORAGE_UNAVAILABLE` | Local storage cannot serve the request (fall-through case). The canonical writer also returns it for a `CanonicalControl` or `IngestControl` request that the owner of its canonical store did not service within 60 seconds or stopped before answering. Native query forwards it for mempool calls when the owner has stopped, but it ends its own ingest-control calls after 15 seconds, so an owner that stalls reaches native query callers as `UPSTREAM_UNREACHABLE` |
-| `BLOCKING_TASK_FAILED` | An internal background task failed unexpectedly |
-| `UNSUPPORTED_CHAIN_EVENT` | The requested event variant cannot be represented by this binary |
-| `UNSUPPORTED_BLOCK_SELECTOR` | The requested selector shape cannot be represented |
-| `UNSUPPORTED_TRANSACTION_STATUS` | The received transaction-status variant cannot be decoded |
-| `UPSTREAM_UNREACHABLE` | A configured federated endpoint (for example the explorer's wallet-query endpoint, or native query's ingest control behind mempool calls) is temporarily unreachable |
-| `SERVICE_NOT_READY` | The process is alive but its shared readiness gate is closed; `ErrorInfo.metadata["readiness_cause"]` contains the stable readiness label and `/readyz` carries any structured detail |
-| `NO_VISIBLE_CHAIN_EPOCH` | No visible chain epoch has been committed yet (the store is empty or still bootstrapping) |
-| `BROADCAST_BUDGET_EXHAUSTED` | A transaction broadcast, including lightwalletd `SendTransaction`, was refused before reaching any node because the process is already broadcasting its 16 MiB budget of transaction bytes. The budget always fits one maximum-size transaction |
+| `BROADCAST_DISABLED` | Defined for a server that cannot broadcast, but current servers do not return it. Without `[node]`, broadcast is not advertised and fails with `ENDPOINT_CAPABILITY_UNAVAILABLE` instead. |
+| `CHAIN_EVENT_CURSOR_EXPIRED` | The cursor is older than retained chain events. Client policy: `RestartFromEarliestRetained`. |
+| `MEMPOOL_EVENT_CURSOR_EXPIRED` | The cursor is older than retained mempool events. Client policy: `OperatorActionRequired`, so the Rust client does not recover on its own. To continue, read a new `MempoolSnapshot` and follow `MempoolEvents` from its `events_resume_cursor`. |
+| `SNAPSHOT_PAGE_CURSOR_EXPIRED` | A `MempoolSnapshot` page cursor is anchored ahead of the mempool events the writer has applied. Client policy: `OperatorActionRequired`, so the Rust client does not recover on its own. To continue, start the snapshot walk again from the first page. |
+| `CHAIN_EPOCH_PIN_UNAVAILABLE` | The pinned epoch is no longer retained. A `TransparentAddressUnspentOutputs` or `FullBlocksInRange` stream can also end with it after sending items, when its serving pair is released or replaced. Discard the partial result and read again at a newer epoch. Client policy: `RefreshChainEpoch`. |
+| `SCHEMA_MISMATCH` | The store's schema does not match the running binary. |
+| `SCHEMA_TOO_NEW` | A newer Zinder wrote the store. Rolling back is unsafe. |
+| `REORG_WINDOW_EXCEEDED` | A reorg went deeper than the reorg window, and the writer is parked until an operator reconciles it. Native query also sends it as the last item of open `ChainEvents` and `MempoolEvents` streams. Metadata: `readiness_cause`, `replacement_depth_blocks`, `reorg_window_blocks`, `covered_depth_blocks`. |
+| `CHAIN_EPOCH_CONFLICT` | The writer and a reader disagree about a chain epoch. |
+| `CHAIN_EPOCH_NETWORK_MISMATCH` | The store belongs to a different network. |
+| `MATERIALIZED_VIEW_UNAVAILABLE` | A required wallet projection or explorer view is not configured. Violation subject: the capability. |
+| `ENDPOINT_CAPABILITY_UNAVAILABLE` | This wallet endpoint does not advertise the capability the method needs. Violation subject: the capability. |
+| `DEPENDENCY_NOT_CONFIGURED` | An explorer request needs a dependency that is not configured: the canonical store, a materialized view, or a wallet query endpoint. Waiting never clears it. |
+| `NODE_CAPABILITY_MISSING` | The node lacks a capability the request needs. Only broadcast, the one request forwarded to the node, returns it. |
+| `EXPLORER_PRECONDITION_UNSATISFIED` | An explorer read cannot serve the requested transaction state. |
+| `CANONICAL_HISTORY_UNAVAILABLE` | The store's history starts at a checkpoint, so a transaction lookup or `TransparentOutpointSpendStatus` miss cannot prove an absence. An unpinned lookup checks the live mempool first. Metadata: `first_available_height`. Client policy: `OperatorActionRequired`. Only a store with complete history can answer. |
 
-### `UNIMPLEMENTED` family
+### `NOT_FOUND`
 
-The selected deployment cannot serve this method. Retry disposition: **NonRetryable**.
+`RetryAfterBackoff`, because the resource may appear after a later commit.
+Client policy: `RetryWithBackoff`. Some reasons carry `ResourceInfo`, whose
+`resource_type` is an artifact family label such as `compact_block` or
+`chain_epoch`.
 
-| Reason | What it means |
+| Reason | Meaning |
 | --- | --- |
-| `EXPLORER_METHOD_DISABLED` | The configured explorer materialized view omits the method's required product view |
+| `ARTIFACT_UNAVAILABLE` | An artifact is missing at the visible epoch. A block-range read names the first height above the visible tip or below the retained floor. A subtree-root read names the first completed root the store lacks. Explorer reads return it for a view row not yet materialized. `ResourceInfo`: family and key. |
+| `CHAIN_EPOCH_MISSING` | The epoch is not retained, or, for an unpinned `Transaction` miss, the writer's mempool answered at a different epoch than this reader. `ResourceInfo`: `chain_epoch`. |
+| `BLOCK_NOT_IN_BEST_CHAIN` | No visible best-chain block matches the selector. Unknown and reorged-out selectors look the same. |
+| `TRANSACTION_NOT_FOUND` | A proven absence from `WalletQuery.Transaction`. The transaction is in neither the answering epoch's chain nor, for an unpinned lookup, the writer's mempool at that epoch, and the store has complete history. It is an answer, not a failure. Metadata: `chain_epoch_id`, `first_covered_height` (always `1`), `visible_tip_height`, and `covers_mempool`. |
 
-### `INTERNAL` family
+On `WalletQuery.Transaction`, only `TRANSACTION_NOT_FOUND` reports an
+absence. Any other `NOT_FOUND` reason on that method is a failure and says
+nothing about whether the transaction exists.
 
-A self-inflicted failure that needs investigation. Retry disposition: **NonRetryable**.
+### `DATA_LOSS`
 
-| Reason | What it means |
+`NonRetryable`. Client policy: `OperatorActionRequired`. Page on-call: stored
+data may be corrupt.
+
+| Reason | Meaning |
 | --- | --- |
-| `ENTROPY_UNAVAILABLE` | The deployment cannot read OS-level entropy (very rare) |
-| `EXPLORER_INTERNAL` | An explorer read hit an unexpected condition: a stored materialized-view record failed to decode, a federated wallet response omitted a required field, or an index key had the wrong shape |
+| `COMPACT_BLOCK_PAYLOAD_MALFORMED` | A stored compact block failed to decode. |
+| `ARTIFACT_CORRUPT` | A stored artifact has an invalid checksum or shape, or a federated response carried an unusable value, such as a missing outpoint or an out-of-range amount. |
 
-### Sentinel
+### `RESOURCE_EXHAUSTED`
 
-`ERROR_REASON_UNSPECIFIED = 0` is the default scalar. It is never emitted intentionally; if a client receives it, treat it as a Zinder bug and report it. The Rust client preserves an explicitly received `Unspecified` reason through `IndexerError::RemoteFailure`. Do not infer a missing wire reason from `IndexerError::reason() == None`: deliberately coarser variants such as `IndexerError::NotFound` do not retain their originating reason.
+`RetryAfterBackoff`. Client policy: `RetryWithBackoff`.
+
+| Reason | Meaning |
+| --- | --- |
+| `TREE_STATE_REPLAY_LIMIT_REACHED` | `TreeStateAtHeight` named a height without a stored checkpoint while the server was already rebuilding one tree state per CPU. A height with a stored checkpoint is never refused this way. |
+
+### `UNAVAILABLE`
+
+`RetryAfterBackoff`. Client policy: `RetryWithBackoff`.
+
+| Reason | Meaning |
+| --- | --- |
+| `NODE_UNAVAILABLE` | The node is unreachable or failing. A broadcast also returns it, without sending, until one configured endpoint passes first-contact verification and whenever every verified endpoint is unreachable. The writer's mempool returns it while it hydrates from the node, and query forwards that for mempool calls. |
+| `STORAGE_UNAVAILABLE` | Local storage cannot serve the request. The writer also returns it for a control request that its store owner did not answer within 60 seconds or stopped before answering. Native query forwards it for mempool calls when the owner has stopped. Native query gives up on ingest control after 15 seconds, so a stalled owner reaches its callers as `UPSTREAM_UNREACHABLE`. |
+| `UPSTREAM_UNREACHABLE` | A configured federated endpoint, such as the explorer's wallet query endpoint or native query's ingest control, is temporarily unreachable. |
+| `SERVICE_NOT_READY` | The process is alive but not ready. Metadata: `readiness_cause`, a label from [Readiness](readiness.md#readiness-causes). |
+| `NO_VISIBLE_CHAIN_EPOCH` | No chain epoch has been committed yet. |
+| `BROADCAST_BUDGET_EXHAUSTED` | The process is already broadcasting its 16 MiB budget of transaction bytes. Covers lightwalletd `SendTransaction` too. The broadcast never reached a node. |
+| `BLOCKING_TASK_FAILED` | An internal background task failed. |
+| `UNSUPPORTED_CHAIN_EVENT` | This binary cannot represent the requested event variant. |
+| `UNSUPPORTED_BLOCK_SELECTOR` | This binary cannot represent the requested selector. |
+| `UNSUPPORTED_TRANSACTION_STATUS` | A transaction status cannot be encoded on the wire. |
+| `UNSUPPORTED_WALLET_ENCODING` | A value has no representation in the wallet protocol. |
+
+### `UNIMPLEMENTED`
+
+`NonRetryable`. Client policy: `OperatorActionRequired`.
+
+| Reason | Meaning |
+| --- | --- |
+| `EXPLORER_METHOD_DISABLED` | The configured explorer views omit the view this method needs. |
+
+### `INTERNAL`
+
+`NonRetryable`. Client policy: `OperatorActionRequired`.
+
+| Reason | Meaning |
+| --- | --- |
+| `ENTROPY_UNAVAILABLE` | The process cannot read operating-system entropy. |
+| `EXPLORER_INTERNAL` | An explorer read hit an unexpected condition, such as a stored view record that fails to decode or a wallet response missing a required field. |
+| `ERROR_REASON_UNSPECIFIED` | The default value, never sent on purpose. Report it as a Zinder bug. |
+
+The Rust client keeps an explicitly received `ERROR_REASON_UNSPECIFIED` in
+`IndexerError::RemoteFailure`. Do not read `IndexerError::reason() == None` as
+a missing wire reason: coarser variants such as `IndexerError::NotFound` do
+not keep their original reason.
 
 ## Stability
 
-The set above is the v1 contract. Existing reasons' semantics are stable within a major version. Removing or repurposing a reason requires a major-version boundary because clients make retry and alerting decisions from this vocabulary.
-
-## References
-
-- [`crates/zinder-proto/proto/zinder/v1/ops/error.proto`](../../crates/zinder-proto/proto/zinder/v1/ops/error.proto)
-- [`crates/zinder-client/src/error.rs`](../../crates/zinder-client/src/error.rs)
-- [Public interfaces](../architecture/public-interfaces.md)
+A new reason gets a new scalar value. Renaming, removing, or changing the
+meaning of a reason is a breaking change: it increments `contract_revision`
+and reserves the removed name and value.

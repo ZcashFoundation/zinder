@@ -1,68 +1,46 @@
-# Cipherscan Adapter Verification
+# Verify the Cipherscan adapter
 
-Use this runbook to verify the existing Cipherscan application against
-`zinder-compat-cipherscan`. It records acceptance boundaries, not a particular
-environment run.
+Use this procedure to confirm that an unchanged Cipherscan frontend works against `zinder-compat-cipherscan`, after you deploy the adapter or change it or the Explorer. The [coverage matrix](../architecture/cipherscan-adapter.md) says what each route should return.
 
-## Preconditions
+## Prerequisites
 
-- Custom-composed `WalletQuery` and `ExplorerQuery` endpoints and the Cipherscan
-  adapter are healthy on the same network. The release Compose file does not
-  provide these native query endpoints.
-- The block-production time materialized view reports complete coverage through its
-  materialized-view tip.
-- Cipherscan uses the adapter as its API base URL without source changes.
-- Required materialized views report complete coverage for the ranges under
-  test.
+- `zinder-explorer` is ready, with `[ingest].explorer_views = true` on ingest ([Explorer plane](../architecture/explorer-plane.md)).
+- `zinder-query` is reachable from the adapter.
+- The adapter is running with its default listeners: REST on `127.0.0.1:9070` and ops on `127.0.0.1:9108`. Adjust the commands below if you changed them.
+- A Cipherscan checkout whose API base URL points at the adapter.
 
-## Pool Distribution
+## Steps
 
-Probe `/api/mining/pool-distribution` with no query, an empty `period`, each of
-`24h`, `3d`, `7d`, `30d`, `90d`, `6m`, `1y`, and `all`, and one unknown token.
-For every response, verify:
+1. Check that the adapter is alive and connected:
 
-1. The status is `200` and the object has exactly `generatedAt`, `period`,
-   `pools`, and `totalBlocks`.
-2. Every pool has exactly `address`, `blocks`, `name`, `share`, and
-   `totalFeesZat`, with `totalFeesZat` encoded as a decimal string.
-3. The default and empty period echo `7d`. A known period echoes itself. An
-   unknown period echoes the supplied token while using the seven-day window.
-4. `totalBlocks` equals the sum of pool block counts, shares are finite and in
-   `[0, 1]`, and each fee total is the exact sum of retained paid-fee facts.
-5. Two requests with the same effective raw period string within five minutes
-   return the same `generatedAt`. Distinct raw strings use distinct cache keys.
-6. A multi-page request remains valid while the chain extends. A reorg that
-   displaces the frozen materialized-view tip invalidates the continuation.
+   ```bash
+   curl --fail http://127.0.0.1:9108/healthz
+   curl --fail http://127.0.0.1:9108/readyz
+   ```
 
-Compare each response with the public testnet Cipherscan API by structure,
-types, period behavior, grouping semantics, and cache behavior. Moving windows
-may differ by blocks added between requests or by cache age; do not require
-identical totals. Historical source anomalies are not a compatibility target.
+   `/readyz` answers 200 once the adapter has connected to both gRPC endpoints. It does not prove that any view covers a requested range.
 
-Open the unchanged local `/mining` page and exercise each period control it
-renders. The distribution must leave its loading state and show the returned
-total and pool groups. Failures in independently owned mining ranking,
-hashrate-share, miner-behavior, or ZODL panels do not invalidate this route.
+2. Probe one data-bearing route from each family the matrix lists as working:
 
-## Focused Regression
+   ```bash
+   curl --fail http://127.0.0.1:9070/api/info
+   curl --fail http://127.0.0.1:9070/api/mempool
+   curl --fail http://127.0.0.1:9070/api/network/fees
+   curl --fail http://127.0.0.1:9070/api/rich-list
+   curl --fail http://127.0.0.1:9070/api/pools/flows
+   ```
 
-After projection or adapter changes, smoke-test the actively rendered workflows
-that already have complete coverage:
+   Each must return 200 with Cipherscan's JSON shape. A body with `"degraded": true` is acceptable only where the matrix lists that route as degraded.
 
-- home and chain status;
-- blocks and one block detail;
-- transactions and one transaction detail;
-- mempool;
-- one transparent address and the rich list;
-- network and supply;
-- value pools;
-- privacy;
-- migration;
-- reorg history; and
-- mining production.
+3. Probe one route from each family the matrix lists as failing, and confirm the documented status. For example, `/api/blocks` returns 502 with `"code": "upstream_error"`, and `/api/mining/pool-distribution` returns 503 with `"code": "upstream_field_unavailable"`. A failing route must never return 200 with zeroes or an empty list.
 
-For each workflow, require a successful primary request, rendered non-placeholder
-content, and no new application error caused by the change. Degraded panels
-listed as sidecar-owned or unavailable in the
-[coverage matrix](../architecture/cipherscan-adapter.md) remain outside
-this regression boundary.
+4. Open the Cipherscan frontend and load each page whose routes work: home and chain status, one transaction, the mempool, one transparent address and the rich list, supply, value pools, and privacy statistics. Each page must leave its loading state and show real content, with no new application error.
+
+The adapter passes when every check matches the matrix. Panels the matrix marks as sidecar-owned, unavailable, or failing are outside this check.
+
+## If a check fails
+
+- **The adapter exits at startup.** It connects to both gRPC endpoints before it binds its listener. Start `zinder-explorer` and `zinder-query` first, then restart the adapter.
+- **503 with `upstream_unavailable`.** The Explorer or `zinder-query` is down or unreachable. Check their `/readyz`.
+- **503 with `upstream_field_unavailable` on a route the matrix lists as working.** The Explorer does not advertise the capability yet, usually because its views are still building. Wait for view replay to reach the tip, then retry.
+- **502 with `upstream_error` on a route the matrix lists as working.** The Explorer rejected the call. Check the Explorer log for the method and its error reason in [Error vocabulary](../reference/error-vocabulary.md).

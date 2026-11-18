@@ -99,7 +99,7 @@ fn transaction_history_policies_require_typed_projection_readiness_and_wallet_qu
 /// Capabilities retired because no packaged consumer owned them.
 ///
 /// The strings stay out of the registry so no runtime can advertise them again
-/// by accident. ADR-0043 records the ownership evidence and the old-to-new
+/// by accident. ADR-0017 records the ownership evidence and the old-to-new
 /// mapping.
 const RETIRED_CAPABILITIES: &[&str] = &[
     "wallet.read.transparent_outputs_by_outpoint_v1",

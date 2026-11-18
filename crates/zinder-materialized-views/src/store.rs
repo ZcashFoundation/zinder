@@ -6,7 +6,7 @@
 //!
 //! Both stores share one source of truth for `RocksDB` option choices:
 //! [`zinder_store::open_bounded_rocksdb`] from
-//! [ADR-0020](../../../../docs/adrs/0020-bounded-rocksdb-resource-budget.md).
+//! [ADR-0005](../../../../docs/adrs/0005-bounded-process-memory.md).
 //! That keeps the bulk-catchup-OOM trap, which is a property of unbounded
 //! `RocksDB` defaults rather than the canonical store's specific layout,
 //! impossible to recur in the materialized-view plane.

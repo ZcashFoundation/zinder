@@ -1,7 +1,7 @@
 //! Shared config sections used by every Zinder service binary.
 //!
 //! Each module owns one section of the canonical TOML layout
-//! (`docs/architecture/public-interfaces.md`). Section structs are
+//! (`docs/reference/configuration.md`). Section structs are
 //! consumed by the per-service `RawConfig` and the matching
 //! [`crate::ConfigLoader`] helpers (`with_*_section`) wire the per-service
 //! defaults so a new service cannot drift from the established schema.

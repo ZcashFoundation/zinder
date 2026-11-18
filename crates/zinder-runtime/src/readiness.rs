@@ -2,7 +2,7 @@
 //!
 //! The hand-written [`ReadinessCause`] enum below mirrors the proto-defined
 //! `zinder.v1.ops.ReadinessCause` enum 1:1. The proto enum and
-//! `docs/architecture/service-operations.md` are the documented source of
+//! `docs/reference/readiness.md` are the documented source of
 //! truth for the cause vocabulary.
 //! The Rust enum carries the struct-variant payloads so the existing
 //! `/readyz` JSON wire shape stays byte-identical; the [`ReadinessReport`]
@@ -27,7 +27,7 @@ use zinder_proto::{
 
 use crate::composed_readiness::ReadinessInput;
 
-/// Current phase of the canonical writer ([ADR-0015]).
+/// Current phase of the canonical writer ([ADR-0009]).
 ///
 /// `phase` is orthogonal to [`ReadinessCause`]: an ingest writer in
 /// [`IngestPhase::BulkCatchup`] may report `cause=syncing` (normal) or
@@ -39,7 +39,7 @@ use crate::composed_readiness::ReadinessInput;
 /// `zinder.v1.ingest.WriterPhase` enum. The wire shape is part of the
 /// public contract; the Rust enum spelling is an implementation detail.
 ///
-/// [ADR-0015]: ../../../docs/adrs/0015-phase-driven-ingest.md
+/// [ADR-0009]: ../../../docs/adrs/0009-ingest-lifecycle-and-construction.md
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -83,7 +83,7 @@ impl From<IngestPhase> for ingest_proto::WriterPhase {
     }
 }
 
-/// Stable readiness cause matching `docs/architecture/service-operations.md`.
+/// Stable readiness cause matching `docs/reference/readiness.md`.
 ///
 /// Causes that carry operator-actionable detail use struct variants so the
 /// data is reachable by `serde_json` consumers without an out-of-band lookup.
@@ -185,7 +185,7 @@ pub enum ReadinessCause {
     /// Service is shutting down and no longer accepting new traffic.
     ShuttingDown,
     /// Upstream node is reachable but reports it is itself behind the
-    /// network tip. ADR-0015 §Upstream sync detection. Payload carries the
+    /// network tip. ADR-0009 §Upstream sync detection. Payload carries the
     /// signal source (`zebra_ready_endpoint` or
     /// `verification_progress_fallback`) and the sentinel string that
     /// triggered, so operators can triage from `/readyz` alone.
@@ -229,10 +229,10 @@ pub struct NodeUnavailableDetail {
 /// set. Carries the dual-path probe output: the upstream's reported
 /// heights, the signal source label, and the sentinel string from
 /// Zebra's `/ready` response or the fallback predicate name. See
-/// [ADR-0015 §Upstream sync detection].
+/// [ADR-0009 §Upstream sync detection].
 ///
-/// [ADR-0015 §Upstream sync detection]:
-///     ../../../docs/adrs/0015-phase-driven-ingest.md#upstream-sync-detection
+/// [ADR-0009 §Upstream sync detection]:
+///     ../../../docs/adrs/0009-ingest-lifecycle-and-construction.md#upstream-sync-detection
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct UpstreamNotReadyDetail {
     /// Upstream's last committed tip height when known.
@@ -247,7 +247,7 @@ pub struct UpstreamNotReadyDetail {
     pub upstream_verification_progress: Option<f64>,
     /// Nested upstream-health diagnostic. The JSON shape `{source, reason}`
     /// is documented in the [Initial sync runbook]
-    /// (`docs/runbooks/initial-sync.md`).
+    /// (`docs/reference/readiness.md`).
     pub upstream_health: UpstreamHealth,
 }
 
@@ -256,7 +256,7 @@ pub struct UpstreamNotReadyDetail {
 /// The JSON shape is `{ "source": "...", "reason": "..." }`; agents
 /// parsing `/readyz` can build a closed dispatch table from the
 /// enumerated source labels and the sentinel-string set documented in
-/// ADR-0015.
+/// ADR-0009.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct UpstreamHealth {
     /// Stable kebab-case label naming the signal source:
@@ -482,11 +482,11 @@ pub struct ReadinessReport {
     pub current_height: Option<u32>,
     /// Node-observed target height when known.
     pub target_height: Option<u32>,
-    /// Ingest loop phase ([ADR-0015]). `Some` only for `zinder-ingest`;
+    /// Ingest loop phase ([ADR-0009]). `Some` only for `zinder-ingest`;
     /// reader binaries serialize `phase: null` (omitted from JSON via
     /// `skip_serializing_if`). Orthogonal to [`Self::cause`].
     ///
-    /// [ADR-0015]: ../../../docs/adrs/0015-phase-driven-ingest.md
+    /// [ADR-0009]: ../../../docs/adrs/0009-ingest-lifecycle-and-construction.md
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<IngestPhase>,
     /// Consumer identities of the Explorer view store this service admitted.
@@ -791,11 +791,11 @@ pub struct ReadinessState {
     pub current_height: Option<u32>,
     /// Node-observed target height when known.
     pub target_height: Option<u32>,
-    /// Ingest loop phase ([ADR-0015]). Reader binaries leave this `None`
+    /// Ingest loop phase ([ADR-0009]). Reader binaries leave this `None`
     /// for the life of the process. The ingest binary updates it on every
     /// classifier iteration via [`Self::with_phase`].
     ///
-    /// [ADR-0015]: ../../../docs/adrs/0015-phase-driven-ingest.md
+    /// [ADR-0009]: ../../../docs/adrs/0009-ingest-lifecycle-and-construction.md
     pub phase: Option<IngestPhase>,
 }
 
@@ -1021,10 +1021,10 @@ impl ReadinessState {
     /// `current_height` carries the writer's last visible tip so
     /// operators see how far Zinder has committed while waiting for
     /// Zebra to catch up. `detail` carries the signal-source label and
-    /// sentinel string per [ADR-0015 §Upstream sync detection].
+    /// sentinel string per [ADR-0009 §Upstream sync detection].
     ///
-    /// [ADR-0015 §Upstream sync detection]:
-    ///     ../../../docs/adrs/0015-phase-driven-ingest.md#upstream-sync-detection
+    /// [ADR-0009 §Upstream sync detection]:
+    ///     ../../../docs/adrs/0009-ingest-lifecycle-and-construction.md#upstream-sync-detection
     #[must_use]
     pub fn upstream_not_ready_with_detail(
         detail: UpstreamNotReadyDetail,

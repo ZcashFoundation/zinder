@@ -1,307 +1,265 @@
-# Testing Runbook
+# Testing
 
-Operational procedures for validating Zinder against its workspace, real Zebra
-nodes, and external wallet applications. This document owns the test tiers,
-runner profiles, live-node gates, and consumer-facing certification evidence.
+This runbook tells contributors how to run Zinder's tests: the test tiers,
+the validation gate every change must pass, what CI runs, and how to run the
+live tests against a real Zebra or Zakura node.
 
-## Test tier matrix
+## Test tiers
 
-| Tier | Location | Profile | Trigger | Catches |
-| ---- | -------- | ------- | ------- | ------- |
-| T0 unit | `#[cfg(test)] mod tests in src/` | `default-filter` of `default`/`ci` | Every commit | Logic regressions in the unit under test |
-| T1 integration | `tests/integration/` | `default-filter` of `default`/`ci` | Every commit | Cross-module wiring, gRPC adapter shape, store/proto round-trips |
-| T1 PostgreSQL integration | `services/zinder-bench/tests/integration/postgres_canonical_replay.rs` | `ci-postgres` | Every pull request with disposable PostgreSQL | SCRAM connection, binary COPY, transaction, reconnect, and persisted read-back through the diagnostic driver |
-| T2 perf | `tests/perf/` | `ci-perf` | Every commit | Latency budget regressions per the published budgets |
-| Consumer parity | `crates/zinder-client/tests/parity/` | `ci-parity` | Consumer contract changes / release certification | Consumer-shaped request and error-shape regressions against production serving compositions |
-| T3 live | `tests/live/` | `ci-live` | Manual / scheduled CI / node-facing pull requests | Real upstream-node behavior (Zebra and Zakura JSON-RPC, indexer gRPC) |
-| External | n/a | n/a | Manual | Exploratory wallet runs (Zodl/Android SDK, public lightwalletd clients) |
+Tests are split into tiers by where they live. Each tier has a
+[nextest](https://nexte.st) profile in `.config/nextest.toml`.
 
-`default-filter = "not test(/^live::/) and not test(/^perf::/) and not test(/^parity::/)"`
-is the structural boundary. Every live test additionally carries
-`#[ignore = LIVE_TEST_IGNORE_REASON]` and a runtime
-`zinder_testkit::live::require_live()` check, so a stray `cargo test` cannot
-talk to a node by accident.
+| Tier | Location | Profile | Needs | Runs in CI |
+| --- | --- | --- | --- | --- |
+| T0 unit | `#[cfg(test)]` modules in `src/` | `ci` | Nothing | Every pull request |
+| T1 integration | `tests/integration/` | `ci` | Nothing | Every pull request |
+| T1 PostgreSQL | `services/zinder-bench/tests/integration/postgres_canonical_replay.rs` | `ci-postgres` | A fresh, disposable PostgreSQL database | Every pull request |
+| T2 perf | `tests/perf/` | `ci-perf` | Nothing | Every pull request |
+| T3 live | `tests/live/` | `ci-live` | A running node, and for some tests more endpoints | Nightly, on node-facing pull requests, and weekly on Testnet |
+| T4 parity | `tests/parity/` in `zinder-client` | `ci-parity` | Nothing; it uses fixtures | Every pull request |
 
-`ci-parity` is fixture-backed and does not require `ZINDER_TEST_LIVE`. Treat it
-as a consumer-contract gate for request and error shapes, not as a
-replacement for live SDK, Zallet, or network validation.
+The default profile's filter keeps the live, perf, and parity tiers out of an
+ordinary run:
 
-The PostgreSQL integration test remains `#[ignore]` so the DB-free default gate
-cannot connect to an accidental local service. Pull-request CI supplies a fresh
-SCRAM-configured PostgreSQL service and runs `ci-postgres` with
-`--run-ignored=all`; developers use the same profile with an explicit
-`ZINDER_TEST_POSTGRES_DATABASE_URL`.
+```toml
+default-filter = "not test(/^live::/) and not test(/^perf::/) and not test(/^parity::/)"
+```
 
-## Lightwalletd certification
+Every live test is also `#[ignore]`d and checks `ZINDER_TEST_LIVE=1` at run
+time. A stray `cargo test` therefore never contacts a node. The PostgreSQL
+test is `#[ignore]`d for the same reason.
 
-The compatibility adapter is certified in layers: vendored-protocol coverage,
-live parity against the pinned reference, an independent-client flow, then the
-actual public deployment. The required boundaries and reference pins live in
-[Lightwalletd compatibility](../reference/lightwalletd-compatibility.md).
+The T4 parity tier checks the request and error shapes that consumers depend
+on: lightwalletd clients, Zallet, lightwalletd operators, and explorers. It
+does not prove that a real SDK or wallet works. Live parity against a
+reference lightwalletd is a T3 test, described in
+[Parity against a reference lightwalletd](#parity-against-a-reference-lightwalletd).
 
-Keep the evidence simple: retain the exact commands, image digests, client
-version, network, wallet-serving coverage bounds, and command output with the release.
-Do not generate a repository-specific report or manifest merely to restate
-those results.
+## Default validation gate
 
-## Default validation gate (T0 + T1 + T2 + format/lint/docs)
-
-Run before considering any change complete. This is the canonical gate; CI
-mirrors it (see [Continuous integration](#continuous-integration)).
+Run this before you consider a change complete. Every command must exit zero.
 
 ```bash
 cargo fmt --all --check
 cargo check --workspace --all-targets --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo nextest run --profile=ci
+cargo nextest run --profile=ci-parity
 cargo nextest run --profile=ci-perf
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
 cargo deny check
 cargo machete
-scripts/test-container-resource-evidence.sh
-scripts/test-storage-benchmark-campaign-validator.sh
-scripts/test-observability-smoke-safety.sh
+scripts/test-changelog.sh
+scripts/validate-changelog.sh fragments
 scripts/runbook-lint.sh docs/runbooks/testing.md
 scripts/test-install-ci-tool.sh
 git diff --check
 ```
 
-Expected outcome: every command exits zero. The full suite runs in ~5 minutes
-on a developer laptop. If `cargo machete` reports unused dependencies on a
-crate you did not touch, treat it as a pre-existing finding, not a blocker.
+The `dependency hygiene` CI job also runs script tests for release, deployment,
+storage-benchmark, and entrypoint policy. When you change one of those areas,
+run the matching `scripts/test-*.sh` locally.
 
-The 2 storage-benchmark shell tests are hermetic contract tests. One exercises
-resource observation, failure-status preservation, and exclusive artifact
-publication against a fake cgroup; the other constructs a complete synthetic
-campaign and verifies report, resource, alignment, and aggregation rejection
-paths. Neither requires Docker or a live PostgreSQL server.
+### Area-specific gates
 
-After changing captured fixture subtree roots, canonical subtree-root loading,
-construction-manifest evidence, or fixture format admission, run the focused
-complete-prefix proof:
+Run these in addition to the default gate when your change touches the area.
 
-```bash
-cargo nextest run -p zinder-store --profile=ci \
-  -E 'test(complete_prefix_loader_rejects_invalid_input_atomically_and_accepts_retry)'
-cargo nextest run -p zinder-store --profile=ci \
-  -E 'test(cold_certification_rejects_tampered_complete_prefix_rows)'
-cargo nextest run -p zinder-bench --profile=ci \
-  -E 'test(canonical_fixture_replay_cli_emits_self_validating_zero_prohibited_reads)'
-cargo nextest run -p zinder-bench --profile=ci \
-  -E 'test(canonical_fixture_replay_preserves_historical_subtree_prefix_after_cold_reopen_and_secondary)'
-scripts/test-storage-benchmark-campaign-validator.sh
-```
+| You changed | Run |
+| --- | --- |
+| `zinder-core`, `zinder-proto`, `zinder-client`, their manifests, or generated protocol files | `scripts/verify-sdk-packages.sh` |
+| The PostgreSQL canonical-replay path or its driver dependencies | The [PostgreSQL gate](#postgresql-gate) |
+| Storage commit paths, parsers, or the canonical live commit, replacement, or event lifecycle | The [heavy probes](#heavy-probes) |
+| Node-facing code | The [live tests](#live-tests) on Regtest |
 
-The first command proves that the public complete-prefix loader atomically
-rejects missing, extra, misordered, and unauthenticated completion records and
-then accepts a valid retry. The second proves cold certification rejects
-post-load subtree-row tampering. The third executes the benchmark CLI in a
-separate process and proves its self-validation observes both prohibited-read
-series at zero. The fourth replays an index-zero historical prefix through
-publication, independent cold reopen, and a fresh RocksDB secondary. The script
-proves the hermetic campaign validator accepts fixture format v3 and refuses
-obsolete fixture format v2.
+`scripts/verify-sdk-packages.sh` packages the three public crates, builds them
+with `PROTOC` unavailable, and compiles a standalone consumer against the
+extracted packages. It catches path leakage and missing package files that a
+workspace build hides.
 
-`scripts/runbook-lint.sh` parses every fenced `bash` block in this runbook
-through `bash -n` (syntax-only mode) so a typo or unclosed quote in an
-operator recipe fails CI immediately rather than ambushing an on-call
-engineer. It does not execute the blocks; running them still requires the
-documented prerequisites. See [Runbook self-test](#runbook-self-test)
-below for the full contract.
+### PostgreSQL gate
 
-### Archive-safe test conventions
-
-Tests may run from a `cargo nextest archive` on a machine that did not build
-them, so they must not depend on the build machine's paths.
-
-An integration test that starts a service binary resolves it with
-`zinder_testkit::bin_exe!`, never with `env!("CARGO_BIN_EXE_<name>")`. The
-macro prefers the `NEXTEST_BIN_EXE_<name>` path that nextest sets at run time
-and falls back to the compile-time Cargo path, so the same call works under
-`cargo nextest run`, `cargo test`, and an extracted archive. The name is the
-binary target name with hyphens, as in `bin_exe!("zinder-query")`.
-
-```rust
-let output = Command::new(zinder_testkit::bin_exe!("zinder-query"))
-    .arg("--version")
-    .output()?;
-```
-
-A test that reads the source tree resolves the workspace from the run-time
-`CARGO_MANIFEST_DIR`, which nextest rewrites under `--workspace-remap`. It must
-fail when the tree is missing or nearly empty, and never treat a missing
-directory as a clean scan. The workspace invariant scans in `zinder-core`,
-`zinder-source`, and `zinder-proto` do this and assert a minimum number of
-scanned files.
-
-## Continuous integration
-
-The pull request workflows (`ci-pr`, `protocol-contracts`, `live-tests`,
-`parity-compat`, `binary-archives`, and `build-images`) share a few operating
-rules.
-
-**Superseded runs are cancelled.** `ci-pr`, `protocol-contracts`,
-`live-tests`, and `parity-compat` use one concurrency group per workflow,
-event, and pull request number. A new push to a pull request cancels the
-previous run of the same workflow. Runs on `main`, scheduled runs, and manual
-dispatches have their own group per run and are never cancelled by a later
-one. `binary-archives` and `build-images` keep their own groups keyed by pull
-request or reference with `cancel-in-progress: true`, so any newer run for the
-same pull request or reference, including a second manual dispatch, cancels the
-older one.
-
-**Every job has a timeout.** A hung job stops at its `timeout-minutes` limit
-instead of holding a runner for the GitHub default of six hours.
-
-**Tools are installed from checksum-pinned release assets.** No CI job compiles
-a Cargo test or lint tool from source. The release Docker build still installs
-`cargo-auditable` inside its pinned build image. `scripts/install-ci-tool.sh <name>` reads
-[`.github/ci-tools.lock`](../../.github/ci-tools.lock), which lists each tool's
-version, the upstream project's x86_64 Linux release URL, and the sha256 of the
-archive. The installer verifies the checksum before it extracts anything and
-installs only the tool's executable into `~/.cargo/bin`. It covers
-`cargo-nextest`, `cargo-deny`, `cargo-machete`, `cargo-llvm-cov`, and
-`cargo-mutants`. To bump a tool, change its version, URL, and checksum together
-in the lock; the `dependency hygiene` job runs `scripts/test-install-ci-tool.sh`
-to keep the installer and the lock well formed. The lock has no aarch64
-assets, because no job that installs a tool runs on an arm64 runner.
-
-**Rust caches are written from `main` only.** Every `Swatinem/rust-cache` step
-sets `save-if: ${{ github.ref == 'refs/heads/main' }}`, so pull request runs
-restore from the default branch and never write. Jobs that compile the same
-profile share a key: the `ci-pr` `rust` job and all `live-tests` jobs use
-`shared-key: test`, `parity-compat` builds release binaries as well and uses
-`parity`, and the other jobs use their own keys (`sdk`, `policy`, `coverage`,
-`mutation`, `proto-codegen`, and `capability-coverage`). Where a matrix would
-write one key from several legs, only the Zebra leg saves. The `test` key is
-normally written by the `ci-pr` push run on `main`, which compiles a superset
-of what the live jobs need; the `parity` key is written by the scheduled
-`parity-compat` run on the default branch.
-`rust-cache` hashes every `CARGO_*` and `RUST*` environment variable into the
-key, so the workflow-level `env` block of jobs that share a key must stay
-identical, and tool versions live in the lock rather than in `CARGO_*`
-variables.
-
-**Live and parity share one path filter.** Both list `rust-toolchain.toml` and
-`.config/nextest.toml` next to the manifest and lockfile, so a toolchain or
-profile change runs them. Keep the two lists identical. `binary-archives` and
-`build-images` list `tools/**` and `.dockerignore` because the Docker build
-context copies them.
-
-**Cargo commands in the live and parity workflows use `--locked`**, so a stale
-lockfile fails the job instead of silently resolving new versions.
-
-**`proto breaking` runs on pull requests only.** On `main` it would compare the
-branch with itself.
-
-## Public SDK package gate
-
-Run after changing `zinder-core`, `zinder-proto`, `zinder-client`, their
-manifests, generated protocol artifacts, or release packaging:
-
-```bash
-scripts/verify-sdk-packages.sh
-```
-
-The gate permits exactly those three crates for crates.io, verifies their
-lockstep dependency requirements and workspace MSRV, packages them in
-dependency order, checks default and feature-extreme builds, and builds their
-documentation with `PROTOC` unavailable. It then extracts the `.crate`
-archives and compiles a standalone consumer against the extracted packages
-using the workspace toolchain. This catches workspace path leakage, missing
-package files, accidental test inclusion, generated-code dependencies, and
-public protobuf vocabulary that a normal workspace build can hide.
-
-## PostgreSQL driver integration gate
-
-Run after changing the canonical-replay PostgreSQL path, its driver dependencies, or
-the benchmark database configuration. The URL must identify a fresh disposable
-database because the test deliberately leaves its completed schema in place and
-then proves reuse is rejected.
+The URL must name a fresh database, because the test leaves its schema in
+place and then checks that reuse is rejected.
+[Storage benchmark environment](../../deploy/storage-benchmark.md#run-the-postgresql-driver-integration-gate)
+shows how to start and remove that database.
 
 ```bash
 ZINDER_TEST_POSTGRES_DATABASE_URL='postgresql://zinder_bench:zinder_bench_local_only@127.0.0.1:55432/zinder_bench' \
   cargo nextest run -p zinder-bench --profile=ci-postgres --run-ignored=all
 ```
 
-The test generates its own one-block regtest fixture. A passing run proves a
-real TCP password-authenticated connection, binary COPY, commit, deferred index
-creation, complete read-back, completion publication, reconnect, WAL/storage
-measurement, and safe existing-schema rejection. Start and clean the disposable
-database with the commands in [Storage benchmark environment](../../deploy/storage-benchmark.md#run-the-postgresql-driver-integration-gate).
+### Heavy probes
 
-## Consumer parity gate (consumer-shaped fixtures)
-
-Run before tagging a release, and after any change that touches a consumer-facing
-wire contract or compatibility adapter:
+Coverage and mutation testing are slow; mutation often takes more than 30
+minutes. Scheduled CI runs them weekly, with a wider file set in the
+`mutation` job of `.github/workflows/ci-pr.yml`.
 
 ```bash
-cargo nextest run --profile=ci-parity
+cargo llvm-cov --workspace --all-features --no-report
+cargo mutants --workspace --all-features \
+  --file crates/zinder-store/src/canonical_store/live_commit.rs \
+  --file crates/zinder-store/src/canonical_store/live_replacement.rs \
+  --file crates/zinder-store/src/canonical_store/event_lifecycle.rs \
+  --file crates/zinder-store/src/canonical_store/rocksdb.rs \
+  --file crates/zinder-store/src/canonical_store/activation_schedule.rs \
+  --file crates/zinder-store/src/canonical_store/control.rs \
+  --file crates/zinder-core/src/network_upgrade_activations.rs \
+  --file crates/zinder-source/src/source_block.rs \
+  --re 'canonical_event_history|validate_live_settled_tip|validate_live_block_extension|validate_replacement_blocks|from_raw_block_bytes|matching_fingerprint_prefix_len|preserves_through|next_activation_schedule|validate_activation_expectation|read_bound|validate_open_store_control|raise_reorg_policy|decode_reorg_policy_trailer'
 ```
 
-Expected outcome: every `parity::` module exits zero and the report is archived
-with the release evidence. This profile is organized by consumer:
+## Run one test or one tier
 
-- `parity/lightwalletd_adapter_shapes.rs` covers isolated lightwalletd adapter
-  shapes. Current ZODL proof comes from the bound ten-RPC contract and the real
-  Android application certification run.
-- `parity/zallet.rs` covers a Zallet-shaped retained chain-view contract,
-  including the cloneable, `'static` owned snapshot surface. It is not a claim
-  that a downstream Zallet integration has been certified.
-- `parity/lightwalletd_operators.rs` covers public lightwalletd operator
-  expectations.
-- `parity/explorers.rs` covers explorer-facing transparent-address read shapes.
+Filter with a nextest expression. Integration tests live in each crate's
+`tests/{integration,live,perf}/` modules, and the per-crate test binary is
+`tests/acceptance.rs`, so those test paths start with the tier name.
 
-Do not use `ci-parity` as proof that a real consumer SDK or binary works. It
-proves the fixture-backed request and error shapes that must stay stable before
-the slower external runs start.
+```bash
+# One test in one crate.
+cargo nextest run -p zinder-query -E 'test(parallel_compact_block_range_readers_all_drain_to_completion)'
 
-## T3: Live regtest sweep
+# One module of a tier.
+cargo nextest run -E 'test(/^integration::cli::/)'
 
-The most valuable automated check that exercises a real node. CI runs it
-against both certified nodes, Zebra 7.1.0 and Zakura 1.8.6, every night and on
-pull requests. The live and parity workflows share one pull request path
-filter: a crate the live or parity tests exercise, the workspace manifest or
-lockfile, the Rust toolchain pin, the nextest configuration, either node TOML,
-the mining or indexer TLS script, or either workflow.
+# One live test, with its logs.
+RUST_LOG=debug,zinder=trace \
+  cargo nextest run --profile=ci-live --run-ignored=all --no-capture \
+    -E 'test(read_endpoint_latency_baseline)'
+```
 
-### Prerequisites
+The `ci` profile retries a failed test once and `ci-live` retries twice.
+Nextest has no rerun-failures flag, so copy the failed name into `-E`.
+`cargo test --workspace --all-features` works as a fallback runner, but it is
+not the gate.
 
-1. **A Regtest node**, either Zebra or Zakura on the NU7 chain described in
-   [Regtest through NU7](#regtest-through-nu7), which CI uses, or a
-   **z3 regtest sidecar** running Zebra. The default ZF z3 setup gives you:
-   - `z3-regtest-zebra-1` (Zebra) listening JSON-RPC on host
-     `127.0.0.1:29232` and indexer gRPC on `127.0.0.1:39155`.
-   - Health endpoint at `127.0.0.1:28080`.
-   - Mining target seed-derived address `tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx`
-     (configured via `ZEBRA_MINING__MINER_ADDRESS`).
-2. **An indexer gRPC listener.** Zebra in a container needs
-   `ZEBRA_RPC__INDEXER_LISTEN_ADDR=0.0.0.0:8155` (mapped to host `39155`).
-   Zakura refuses a plaintext indexer listener on any non-loopback address, so
-   bind it to loopback and run the container on the host network, as
-   `deploy/zakura/regtest.toml` does. CI serves the Zakura indexer over mutual
-   TLS, as described in [Regtest through NU7](#regtest-through-nu7). Without an
-   indexer address, the indexer-gRPC tests skip.
-3. **Auth method** matches what the node publishes. The default sidecar and
-   the CI nodes disable cookie auth and ignore the basic-auth pair
-   `zebra:zebra`.
+## Writing tests that CI can run
+
+Tests can run from a `cargo nextest archive` on a machine that did not build
+them, so they must not depend on build-machine paths:
+
+- Start a service binary with `zinder_testkit::bin_exe!("zinder-query")`, not
+  `env!("CARGO_BIN_EXE_<name>")`. The macro prefers the path nextest sets at
+  run time.
+- Resolve the source tree from the run-time `CARGO_MANIFEST_DIR`. A scan must
+  fail when the tree is missing or nearly empty, never pass as clean.
+
+Process-crash tests kill a real writer at a named point inside a commit, then
+reopen the store and assert it holds exactly one complete batch. To cover a
+new write path:
+
+1. Add `crash_point("<store>.<write_path>.before_atomic_write")` and
+   `...after_atomic_write` calls around its single atomic write. In the owning
+   crate, `crash_point` resolves to `zinder_testkit::process_crash` only under
+   `#[cfg(test)]` and to an empty function otherwise.
+2. Add a child test that calls `crash_child()`, drives the write, and returns
+   an error if it gets past the armed point.
+3. Add a parent test, marked `#[cfg(unix)]` and named
+   `<behavior>_across_process_abort`, that calls `run_crash_child` and checks
+   the reopened store. The nextest override for that suffix allows 60 seconds.
+
+`rg 'crash_point\("'` lists every existing crash point. These tests prove
+atomic recovery to a complete batch. They do not prove durability across power
+loss, because an aborted process leaves the page cache intact. That
+durability rests on the synced (`set_sync(true)`) write points, and no CI tier
+exercises it.
+
+## Continuous integration
+
+| Workflow | Runs on | What it checks |
+| --- | --- | --- |
+| `ci-pr` | Every pull request, pushes to `main`, and weekly | The `rust` job runs format, check, clippy, docs, and the `ci`, `ci-postgres`, `ci-parity`, and `ci-perf` profiles. `dependency hygiene` runs the changelog, runbook, alignment, and release-policy scripts, `cargo deny`, and `cargo machete`. Other jobs check the SDK packages and the vendored protocols. Coverage and mutation run only on the weekly schedule or a manual run. |
+| `protocol-contracts` | Pull requests and `main` pushes that touch the protocol | Checked-in generated code, `proto breaking` (pull requests only), and capability coverage |
+| `live-tests` | Node-facing pull requests, nightly Regtest, weekly Testnet, and manual Mainnet | The T3 suite, once against Zebra and once against Zakura on Regtest |
+| `parity-compat` | Node-facing pull requests and nightly | Live parity against a reference lightwalletd, on both nodes |
+| `binary-archives` | Pull requests that touch build inputs | Release binary archives for both platforms |
+| `build-images` | Pull requests that touch images or deployment files | Deployment admission and runtime image smoke builds |
+
+All workflows follow these rules:
+
+- **A new push cancels the superseded run.** `ci-pr`, `protocol-contracts`,
+  `live-tests`, and `parity-compat` group runs by workflow, event, and pull
+  request number. Runs on `main`, scheduled runs, and manual runs are never
+  cancelled. `binary-archives` and `build-images` cancel any older run for the
+  same pull request or reference, including a manual one.
+- **Every job has a timeout.** A hung job stops at its `timeout-minutes`.
+- **Tools come from checksum-pinned release assets.** No job compiles
+  `cargo-nextest`, `cargo-deny`, `cargo-machete`, `cargo-llvm-cov`, or
+  `cargo-mutants`. `scripts/install-ci-tool.sh <name>` reads
+  [`.github/ci-tools.lock`](../../.github/ci-tools.lock), verifies the
+  archive's sha256 before extracting it, and installs the executable into
+  `~/.cargo/bin`. To bump a tool, change its version, URL, and checksum
+  together. The lock has x86_64 assets only, because no tool-installing job
+  runs on arm64.
+- **Rust caches are written from `main` only.** Every `Swatinem/rust-cache`
+  step saves only when `github.ref` is `refs/heads/main`. The `ci-pr` `rust`
+  job and all `live-tests` jobs share the `test` key, `parity-compat` uses
+  `parity`, and other jobs use their own keys. In a two-node matrix, only the
+  Zebra leg saves. The action hashes every `CARGO_*` and `RUST*` variable into
+  the key, so jobs that share a key must keep identical workflow-level `env`
+  blocks.
+- **Live and parity share one path filter.** Keep the `paths` lists in
+  `live-tests.yml` and `parity-compat.yml` identical.
+- **Live and parity Cargo commands use `--locked`**, so a stale lockfile fails
+  the job.
+
+## Live tests
+
+### How live tests are gated and configured
+
+A live test runs only when `ZINDER_TEST_LIVE=1` is set. It reads the network
+from `ZINDER_NETWORK` (`zcash-regtest`, `zcash-testnet`, or `zcash-mainnet`)
+and the node endpoint from the same `ZINDER_NODE__*` variables the production
+binaries use (see
+[Configuration](../reference/configuration.md#environment-variables)).
+`ZINDER_TEST_*` variables never reach production configuration.
+
+Each test declares the networks it supports:
+
+- `require_live()` accepts Regtest and Testnet.
+- `require_live_for(&[...])` accepts only the listed networks.
+  `require_live_mainnet()` accepts only Mainnet.
+
+A test that does not support the selected network returns early, and nextest
+reports it as passed. Some tests also return early unless their own endpoints
+are set:
+
+| Variable | Enables |
+| --- | --- |
+| `ZINDER_NODE__INDEXER_GRPC_ADDR` | The indexer mempool tests, including the node restart test. Add `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH`, `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH`, and `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH` for a mutual-TLS indexer, and `ZINDER_NODE__INDEXER_TLS__SERVER_NAME` when the certificate does not name the URL host. |
+| `ZINDER_TEST_INDEXER_CONTAINER_NAME` | The container the restart test restarts. It defaults to `z3_regtest_sidecar_zebra` and needs a Docker health check. |
+| `ZINDER_TEST_QUERY_GRPC_ADDR` | The standalone native `WalletQuery` smoke test against a running `zinder-query`. `live::nu7_activation` also broadcasts through it when set. |
+| `ZINDER_TEST_PARITY_ZINDER_ADDR`, `ZINDER_TEST_PARITY_LIGHTWALLETD_ADDR` | The `live::parity_against_lightwalletd` tests |
+| `ZINDER_TEST_ZINGOLIB_BIN`, `ZINDER_TEST_ZINGOLIB_SERVER` | The Zingolib real-client flow |
+| `ZINDER_TEST_COMPACT_*` | The two `live::compact_blocks_process` tests |
+| `ZINDER_TEST_CANONICAL_BLOCK_COUNT` | The block count of the Testnet canonical tracer (default 1,000) |
+
+When you record evidence, count only the tests that exercised the node.
+
+Tests that mutate the node, or share its indexer port, join the
+`node-mutating` test group, which runs one test at a time. The group does not
+stop other tests from running beside its members. Run the node restart test,
+`streaming_source_recovers_after_zebra_indexer_restart`, in its own invocation
+after the rest of the suite.
+
+Name live test functions after the behavior they check. Do not put `live`,
+`regtest`, `testnet`, `mainnet`, or `z3` in the name.
+
+A scratch store from an older schema version fails admission when it is
+reopened. Delete scratch stores under `.tmp/` between runs on different
+commits.
 
 ### Regtest through NU7
 
-Zebra 7.1.0 on Regtest activates Overwinter through Canopy at height 1 and
-leaves NU5 and every later upgrade unset unless the node is configured
-otherwise. A node started with only `ZEBRA_NETWORK__NETWORK=Regtest` stays on
-Canopy, so it never produces version-5 or version-6 transactions, Orchard or
-Ironwood notes, or an NU7 block.
-
-The live and parity workflows run every Regtest job twice, once against Zebra
-with [`deploy/zebra/regtest.toml`](../../deploy/zebra/regtest.toml) and once
+CI runs every Regtest job twice: once against Zebra with
+[`deploy/zebra/regtest.toml`](../../deploy/zebra/regtest.toml), and once
 against Zakura 1.8.6 with
-[`deploy/zakura/regtest.toml`](../../deploy/zakura/regtest.toml). Both files
-activate each upgrade at its own height:
+[`deploy/zakura/regtest.toml`](../../deploy/zakura/regtest.toml). A Regtest
+node started without such a file stays on Canopy and never produces
+version-5 or version-6 transactions. Both files activate the upgrades on the
+same schedule:
 
 | Upgrade | Activation height |
-| ------- | ----------------- |
+| --- | --- |
 | Overwinter, Sapling, Blossom, Heartwood, Canopy | 1 |
 | NU5 | 2 |
 | NU6 | 3 |
@@ -310,17 +268,13 @@ activate each upgrade at its own height:
 | NU6.3 | 6 |
 | NU7 | 140 |
 
-Both files configure the same lockbox and Major Grants funding streams, with
-non-overlapping height ranges as Zebra 7 requires, and the same zero-value
-lockbox disbursement in the NU6.1 activation block, which Zakura requires.
-Environment variables cannot set these keys, because config-rs lowercases them
-and `NU6.1` contains its path separator, so mount the file.
+Environment variables cannot set these keys, because config-rs lowercases
+them and `NU6.1` contains its path separator. Mount the file.
 
-Then mine with `scripts/mine-live-regtest.sh`. On a fresh chain it asks the
-node to pay the first 10 blocks to the default Regtest unified address with
-`generatetoaddress`, checks that the Sapling, Orchard, and Ironwood trees each
-hold notes at height 10, and mines the rest to the configured transparent
-miner. For Zebra:
+**1. Start Zebra.** `scripts/mine-live-regtest.sh` pays the first 10 blocks to
+the default Regtest unified address, checks that the Sapling, Orchard, and
+Ironwood trees all hold notes at height 10, and mines the rest to the
+configured transparent miner:
 
 ```bash
 docker run -d --name zebra-regtest \
@@ -337,33 +291,21 @@ docker run -d --name zebra-regtest \
 scripts/mine-live-regtest.sh http://127.0.0.1:39232 120
 ```
 
-Zakura differs in three ways:
+**Or start Zakura.** Zakura differs from Zebra in three ways:
 
-- It has no `generatetoaddress`, which the script detects from JSON-RPC error
-  `-32601`, so every block pays the configured miner.
-- Its coinbase cannot pay Sapling or Orchard. A unified miner address pays its
-  transparent receiver before NU6.3 and an Ironwood action from NU6.3 onward,
-  so on this schedule only the Ironwood tree holds notes.
-- It refuses a plaintext indexer listener on any non-loopback address, so the
-  TOML binds every listener, including the QUIC endpoint, to loopback, and the
-  container runs on the host network.
+- It has no `generatetoaddress`, so every block pays the configured miner.
+  The node starts twice on the same state: first with the unified address in
+  the TOML for 10 blocks, then with the transparent test key.
+- Its coinbase cannot pay Sapling or Orchard, so only the Ironwood tree holds
+  notes on this schedule.
+- It refuses a plaintext indexer listener on a non-loopback address. The TOML
+  binds every listener to loopback, the container runs on the host network,
+  and CI serves its indexer over mutual TLS.
 
-The live workflow also serves Zakura's indexer over mutual TLS, so the indexer
-tests exercise Zinder's TLS client against a real node, while the Zebra leg
-covers the plaintext channel. `scripts/generate-live-indexer-tls.sh` writes
-throwaway material into a new directory: a CA in `ca.pem`, the node's
-certificate for `localhost` and `127.0.0.1` in `server.pem` and
-`server-key.pem`, and Zinder's client certificate in `client.pem` and
-`client-key.pem`. Every file is readable only by you, so the node must run as
-your user. The certificates expire after two days; delete the directory and
-run the script again to renew them.
-
-Start it twice on the same state: first with the unified address in the TOML
-as miner for 10 blocks, then with the transparent broadcast test key. Zakura
-backs up its non-finalized state at most every 5 seconds and does not flush it
-at shutdown, so wait before stopping it and check that the restart kept height
-10. The image entrypoint drops root to UID 10001, so run `zakurad` directly as
-your own user on a state directory you own:
+`scripts/generate-live-indexer-tls.sh` writes throwaway TLS material that only
+your user can read, so the node runs as your user. The certificates expire
+after two days. Zakura backs up its non-finalized state at most every 5
+seconds and does not flush it at shutdown, so wait before stopping it:
 
 ```bash
 mkdir -p .tmp/zakura-regtest-state
@@ -389,306 +331,116 @@ sleep 6
 docker stop zakura-regtest && docker rm zakura-regtest
 start_zakura -e ZAKURA_MINING__MINER_ADDRESS=tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx
 until curl -sf -o /dev/null http://127.0.0.1:38080/healthy; do sleep 1; done
-# Expect a tip of 10 and a non-zero Ironwood tree size at height 10.
-for request in '"getblockcount","params":[]' '"getblock","params":["10",1]'; do
-  curl -s -H 'content-type: application/json' \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":${request}}" \
-    http://127.0.0.1:39232 | jq -c '.result | if type == "object" then .trees else . end'
-done
 scripts/mine-live-regtest.sh http://127.0.0.1:39232 120
 ```
 
-The TOML uses the CI ports: JSON-RPC `39232`, indexer `39230`, health `38080`,
-legacy P2P `38233`, and QUIC `38234`. To run beside another node on the same
-host, override each listener with `ZAKURA_RPC__LISTEN_ADDR`,
+The restart must keep height 10. The Zakura TOML listens on JSON-RPC `39232`,
+indexer `39230`, health `38080`, P2P `38233`, and QUIC `38234`. To run beside
+another node, override `ZAKURA_RPC__LISTEN_ADDR`,
 `ZAKURA_RPC__INDEXER_LISTEN_ADDR`, `ZAKURA_HEALTH__LISTEN_ADDR`,
-`ZAKURA_NETWORK__LISTEN_ADDR`, and `ZAKURA_NETWORK__ZAKURA__LISTEN_ADDR`, all
-on `127.0.0.1`, and point the health command at the new health port.
+`ZAKURA_NETWORK__LISTEN_ADDR`, and `ZAKURA_NETWORK__ZAKURA__LISTEN_ADDR` on
+`127.0.0.1`, and point the health check at the new port.
 
-`live::nu7_activation` needs a tip below NU7, so run it before the rest of the
-suite:
-
-```bash
-ZINDER_TEST_LIVE=1 \
-  ZINDER_NETWORK=zcash-regtest \
-  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232 \
-  ZINDER_NODE__AUTH__METHOD=basic \
-  ZINDER_NODE__AUTH__USERNAME=zebra \
-  ZINDER_NODE__AUTH__PASSWORD=zebra \
-  cargo nextest run --workspace --profile=ci-live --run-ignored=all \
-    -E 'test(/^live::nu7_activation::/)'
-```
-
-The test broadcasts a funded transparent spend below NU7, signs a version-4
-spend for the NU6.3 branch, mines across the activation, and broadcasts a
-second funded spend after it. It expects the version-4 spend to be rejected as
-`UnsupportedTransactionVersion` (ZIP 2003). It then constructs a production
-canonical store and wallet projection from genesis through the tip, and checks
-the following against the node:
-
-- Each funded spend is mined on its side of NU7 as a version-6 transaction,
-  with the NU6.3 or NU7 consensus branch.
-- The coinbase consensus branch changes from NU6.3 to NU7 at the activation
-  height.
-- Every block's Sapling, Orchard, and Ironwood tree sizes match `getblock`,
-  and the Ironwood tree holds notes. Only Ironwood is required, because
-  Zakura's Sapling and Orchard trees stay empty on this schedule; the mining
-  script checks all three on Zebra.
-- Served tree states match `z_gettreestate` at every height through the tip.
-  Construction stores a checkpoint only every 100 blocks, so most heights,
-  including the activation heights and both sides of NU7, are reconstructed
-  from stored compact blocks without contacting the node.
-- Subtree roots match `z_getsubtreesbyindex`.
-
-To check the rejection across the native wire contract, set
-`ZINDER_TEST_QUERY_GRPC_ADDR` to a running `zinder-query`, started as in
-[End-to-end with a real lightwalletd-compatible client](#end-to-end-with-a-real-lightwalletd-compatible-client).
-Every broadcast then goes through the `zinder-client` remote chain index
-instead of the node broadcaster. On a chain that already reached NU7, the test
-logs `nu7_activation_already_reached` and returns.
-
-Then run the rest of the suite as in [Run](#run). For Zebra, set
-`ZINDER_NODE__INDEXER_GRPC_ADDR=http://127.0.0.1:39155` and
-`ZINDER_TEST_INDEXER_CONTAINER_NAME=zebra-regtest`. For Zakura, set
-`ZINDER_TEST_INDEXER_CONTAINER_NAME=zakura-regtest` and the TLS indexer
-settings. nextest runs each test binary from its own crate directory, so the
-paths must be absolute:
+**2. Check the node.** Each probe must succeed before you run tests:
 
 ```bash
-export ZINDER_NODE__INDEXER_GRPC_ADDR=https://127.0.0.1:39230
-export ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH="$PWD/.tmp/indexer-tls/ca.pem"
-export ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH="$PWD/.tmp/indexer-tls/client.pem"
-export ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH="$PWD/.tmp/indexer-tls/client-key.pem"
-```
+curl -s -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getblockcount","params":[]}' \
+  http://127.0.0.1:39232 | jq '.result'
+# Expect: 120
 
-Run the restart test last and at least 6 seconds after the last mined block,
-so the node's non-finalized backup holds the whole chain when the container
-restarts.
-
-#### What the NU7 Regtest run covers
-
-The NU7 Regtest run is local evidence from one isolated chain per node, on
-Zebra 7.1.0 and on Zakura 1.8.6. It covers:
-
-- Parsing, canonical construction, wallet projection, and serving reads for
-  version-5 and version-6 blocks with Ironwood note commitments, before, at,
-  and after NU7, and on Zebra also Sapling and Orchard note commitments.
-- Byte-exact re-serialization of every block each node serves, and the order
-  in which each node advertises its network upgrades.
-- Typed broadcast outcomes across NU7, through the node broadcaster and,
-  with `ZINDER_TEST_QUERY_GRPC_ADDR`, through a running `zinder-query`.
-- A transparent-to-Ironwood shielding spend that `zinder-testkit` builds with
-  a real Halo2 proof, which each node accepts and mines, and which Zinder
-  indexes with its two Ironwood actions
-  (`shielded_outputs_are_indexed_after_mining`). The workflow runs it after
-  the activation test, so on a chain past NU7.
-- The rest of the live suite on a chain past NU7, including the indexer
-  mempool tests and the indexer restart test, over a loopback indexer channel:
-  plaintext on Zebra, and mutual TLS with a private CA on Zakura.
-- `zinder-compat-lightwalletd` parity with lightwalletd v0.6.0 over a fixed
-  fence past NU7, in the parity workflow (see
-  [Parity against a reference lightwalletd](#t3-parity-against-a-reference-lightwalletd)).
-
-It does not cover:
-
-- Any node other than Zebra 7.1.0 and Zakura 1.8.6, and Zakura's Sapling and
-  Orchard pools, which its coinbase cannot pay. A Zakura block with an Orchard
-  shielding spend is covered only by a captured fixture; see
-  [Capturing node fixtures](capturing-node-fixtures.md).
-- Indexer TLS that verifies the node against the system roots or through a
-  `server_name` override, or that reloads rotated certificate files.
-- NU7 activation on Testnet or Mainnet, or production capacity.
-- Spends of shielded notes. The shielded pools receive only coinbase outputs
-  and shielding spends, so no shielded nullifier is exercised and no subtree
-  completes; both sides report empty subtree-root lists.
-- Reorgs deeper than the reorg window, and restarts of the Zinder runtimes.
-- Tests that return early without their own endpoints, listed in [Run](#run).
-
-### Pre-flight checks
-
-```bash
-# Zebra JSON-RPC reachable
-curl -s -u zebra:zebra -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"1.0","id":"1","method":"getblockchaininfo","params":[]}' \
-  http://127.0.0.1:29232 | jq '.result | {chain, blocks, bestblockhash}'
-
-# Indexer gRPC reachable (and feature compiled in)
+# Zebra's plaintext indexer. Expect: zebra.indexer.rpc.Indexer
 grpcurl -plaintext 127.0.0.1:39155 list
-# Expect: zebra.indexer.rpc.Indexer
 
-# Zakura's mutual-TLS indexer accepts Zinder's client certificate. Zakura
-# serves no reflection, so check the handshake instead of listing services.
+# Zakura's mutual-TLS indexer. It serves no reflection, so check the handshake.
+# Expect: ALPN protocol: h2, Verify return code: 0 (ok)
 openssl s_client -connect 127.0.0.1:39230 -alpn h2 \
   -CAfile .tmp/indexer-tls/ca.pem -verify_return_error \
   -cert .tmp/indexer-tls/client.pem -key .tmp/indexer-tls/client-key.pem \
   </dev/null 2>&1 | grep -E 'ALPN protocol|Verify return code'
-# Expect: ALPN protocol: h2, Verify return code: 0 (ok)
 ```
 
-If a probe fails, fix the node before running tests. Don't use a
-"--insecure" or "--ignore-failures" flag to paper over a missing service.
-
-### Cleanup between runs
-
-A persisted store from a previous run that bumped
-`CANONICAL_STORE_SCHEMA_VERSION`, or a wallet or materialized-view layout
-version, fails admission on reopen. Clear the scratch directories before
-reusing them across schema-changing commits:
+**3. Run the NU7 activation test first.** It needs a tip below NU7, which the
+rest of the suite mines past:
 
 ```bash
-rm -rf .tmp/regtest.zinder-store \
-  .tmp/regtest.projector-canonical-secondary \
-  .tmp/regtest.wallet-store \
-  .tmp/regtest.compat-canonical-secondary \
-  .tmp/regtest.compat-wallet-secondary
-```
-
-The `.tmp/` directory is `.gitignore`'d for exactly this purpose.
-
-### Standalone native WalletQuery smoke
-
-When a running `zinder-query` is available, set the test-only endpoint and run
-the native T3 contract smoke. The endpoint is optional for the full live suite;
-the test skips when it is absent. `require_live()` still supplies the network
-identity and rejects mainnet, while `ZINDER_TEST_QUERY_GRPC_ADDR` names only the
-already-running native gRPC surface under test.
-
-```bash
-ZINDER_TEST_LIVE=1 \
+export ZINDER_TEST_LIVE=1 \
   ZINDER_NETWORK=zcash-regtest \
-  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:29232 \
+  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232 \
   ZINDER_NODE__AUTH__METHOD=basic \
   ZINDER_NODE__AUTH__USERNAME=zebra \
-  ZINDER_NODE__AUTH__PASSWORD=zebra \
-  ZINDER_TEST_QUERY_GRPC_ADDR=http://127.0.0.1:29102 \
-  cargo nextest run -p zinder-query --profile=ci-live --run-ignored=all \
-    -E 'test(standalone_wallet_query_serves_native_contract)'
+  ZINDER_NODE__AUTH__PASSWORD=zebra
+cargo nextest run --workspace --profile=ci-live --run-ignored=all \
+  -E 'test(/^live::nu7_activation::/)'
 ```
 
-The smoke certifies reflection and service identity, the exact capability set
-Zally requires, an epoch-pinned structured one-block compact range at the
-settled tip, an epoch-pinned typed tree state at that height, and successful
-chain-event stream admission.
+The test broadcasts a funded spend on each side of NU7 and expects a
+version-4 spend after NU7 to be rejected as `UnsupportedTransactionVersion`
+(ZIP 2003). It then builds a canonical store and wallet projection from
+genesis and checks, against the node, the consensus branch of each spend and
+coinbase, every block's tree sizes, tree states at every height, and subtree
+roots. On a chain already past NU7 it logs `nu7_activation_already_reached`
+and passes without checking anything.
 
-### Run
+**4. Run the rest of the suite**, then the restart test alone. Both nodes run
+with cookie authentication off and ignore the `zebra:zebra` pair. nextest runs
+each test binary from its crate directory, so TLS paths must be absolute.
 
 ```bash
-ZINDER_TEST_LIVE=1 \
-  ZINDER_NETWORK=zcash-regtest \
-  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:29232 \
-  ZINDER_NODE__INDEXER_GRPC_ADDR=http://127.0.0.1:39155 \
-  ZINDER_NODE__AUTH__METHOD=basic \
-  ZINDER_NODE__AUTH__USERNAME=zebra \
-  ZINDER_NODE__AUTH__PASSWORD=zebra \
-  cargo nextest run --profile=ci-live --run-ignored=all
+# Zebra:
+export ZINDER_NODE__INDEXER_GRPC_ADDR=http://127.0.0.1:39155
+export ZINDER_TEST_INDEXER_CONTAINER_NAME=zebra-regtest
+
+# Zakura (use instead of the two Zebra lines):
+# export ZINDER_NODE__INDEXER_GRPC_ADDR=https://127.0.0.1:39230
+# export ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH="$PWD/.tmp/indexer-tls/ca.pem"
+# export ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH="$PWD/.tmp/indexer-tls/client.pem"
+# export ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH="$PWD/.tmp/indexer-tls/client-key.pem"
+# export ZINDER_TEST_INDEXER_CONTAINER_NAME=zakura-regtest
+
+cargo nextest run --workspace --profile=ci-live --run-ignored=all \
+  -E 'test(/^live::/) and not test(/^live::nu7_activation::/) and not test(mainnet) and not test(streaming_source_recovers_after_zebra_indexer_restart)'
+sleep 6
+cargo nextest run --workspace --profile=ci-live --run-ignored=all \
+  -E 'test(streaming_source_recovers_after_zebra_indexer_restart)'
 ```
 
-Expected outcome on a healthy regtest with the indexer gRPC port set: all
-regtest-targeted tests pass in ~30 s. A full regtest `ci-live` invocation also
-contains hosted-network checks that deliberately refuse to run on regtest:
-the mainnet-only tests
-(`fetch_chain_checkpoint_returns_advancing_tree_sizes_on_mainnet` and
-`tip_id_advances_above_one_million`) and the testnet-or-mainnet test
-`cli_constructs_complete_wallet_serving_history_from_config`.
+Every Regtest test should pass. The `sleep` lets the node back up its whole
+chain before the restart. Tests limited to Testnet or Mainnet pass without
+running.
 
-Without `ZINDER_NODE__INDEXER_GRPC_ADDR`, the two Zebra Indexer mempool-source
-tests skip: `zebra_indexer_mempool_source_opens_stream_against_running_indexer`
-and `streaming_source_recovers_after_zebra_indexer_restart`. The restart test
-runs `docker restart` on the container named by
-`ZINDER_TEST_INDEXER_CONTAINER_NAME` (default `z3_regtest_sidecar_zebra`) and
-waits for Docker to report it healthy, so that container needs a health check.
-The group only serializes its own members, so JSON-RPC tests outside it can
-see the node vanish mid-request. Run the restart test in its own invocation
-after the rest of the suite, as the live workflow does, or exclude it with
-`and not test(streaming_source_recovers_after_zebra_indexer_restart)`.
+This run covers parsing, canonical construction, wallet projection, and
+serving reads for version-5 and version-6 blocks before, at, and after NU7.
+It includes a transparent-to-Ironwood shielding spend with a real Halo2 proof
+(`shielded_outputs_are_indexed_after_mining`). It does not cover:
 
-Other tests return early, and nextest reports them as passed, unless their own
-endpoints are set:
+- Zakura's Sapling and Orchard pools. A captured fixture covers a Zakura
+  Orchard spend; see [Capturing node fixtures](capturing-node-fixtures.md).
+- Spends of shielded notes, or a completed subtree. Both nodes report empty
+  subtree-root lists.
+- Indexer TLS verified against system roots, or rotated certificate files.
+- NU7 on Testnet or Mainnet, production capacity, reorgs deeper than the
+  reorg window, and restarts of the Zinder runtimes.
 
-- the `live::parity_against_lightwalletd` tests need
-  `ZINDER_TEST_PARITY_ZINDER_ADDR` and `ZINDER_TEST_PARITY_LIGHTWALLETD_ADDR`;
-- the zingolib flow needs `ZINDER_TEST_ZINGOLIB_BIN` and
-  `ZINDER_TEST_ZINGOLIB_SERVER`;
-- the two `live::compact_blocks_process` tests need their process evidence
-  paths;
-- the standalone native `WalletQuery` smoke needs
-  `ZINDER_TEST_QUERY_GRPC_ADDR`;
-- `live::nu7_activation` needs a tip below NU7.
-
-When you record evidence, count only the tests that exercised the node.
-
-The two indexer tests build their channel from the same `[node]` settings as
-`zinder-ingest`. To run them against an indexer that requires mutual TLS, set
-an `https://` `ZINDER_NODE__INDEXER_GRPC_ADDR` and the
-`ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH`,
-`ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH`, and
-`ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH` file paths, as the Zakura leg does
-in [Regtest through NU7](#regtest-through-nu7). Add
-`ZINDER_NODE__INDEXER_TLS__SERVER_NAME` when the node's certificate does not
-name the URL host.
-
-### Targeted reruns
-
-```bash
-# Single test
-cargo nextest run --profile=ci-live -E 'test(read_endpoint_latency_baseline)' --run-ignored=all
-
-# Whole suite of one file
-cargo nextest run --profile=ci-live -E 'test(/^live::mempool_broadcast_cycle::/)' --run-ignored=all
-
-# Re-run a specific failed test in isolation, with logs visible
-cargo nextest run --profile=ci-live -E 'test(<failed_test_name>)' \
-  --run-ignored=all --no-capture
-```
-
-Nextest does not have a built-in `--rerun-failures` flag; the `ci-live`
-profile already retries each test up to twice on transient failure. For
-deterministic reruns, copy the failed test name from the summary and pass it
-through `-E 'test(<name>)'` as above.
-
-The `node-mutating` test group in `.config/nextest.toml` serializes any test
-that mutates regtest state (broadcast cycles, indexer-restart, deep-chain
-construction runs). Run them in isolation if you want to debug — parallel execution
-will fight for the same node.
-
-### Node endpoint failover
-
-Ingest failover between node endpoints has no live test yet. A two-node run
-needs a Zebra node and a Zakura node on one Regtest chain, and the local
-Regtest nodes do not peer with each other. The behavior is covered by
-simulated-source integration tests in
-`services/zinder-ingest/tests/integration/node_failover.rs`: startup admission
-and exclusion, the transport-failure and sustained-unready switches, candidate
-ranking, and a standby that lags or diverged below settlement. The mempool
-rebuild on a switch is covered in
-`crates/zinder-source/tests/integration/node_set.rs`.
-
-Reader broadcast failover is covered by
-`services/zinder-query/tests/integration/broadcast_failover.rs`: failover
-within a broadcast, the preferred endpoint, the duplicate-after-timeout
-answer, exclusion and its backoff, and verification after a schedule revision,
-an activation crossing, or a tip that reaches an activation only the node's
-table schedules, an inconclusive repeat that keeps the earlier verification
-until its grace ends on time, a revision that moves an activation off the
-broadcast height while the repeat waits on the node or after it is
-inconclusive, a preference that only a failover moves, and
-the endpoint metrics. Lightwalletd's `SendTransaction` mapping of that answer is in `services/zinder-compat-lightwalletd/tests/integration/lightwalletd_grpc.rs`.
-The node probe's per-endpoint schedule, with a standby that never answers
-beside verified endpoints, is covered by the `wallet_node_probe_*` unit tests
-in `services/zinder-query/src/wallet_serving_pair_publisher.rs`.
-One live test, `live::broadcast_fallback`, needs only one Regtest node: it puts
-a local TCP proxy to the live node at `[node]` and the live node itself at
-`[node_fallbacks.1]`, verifies both, stops the proxy, and checks that a
-broadcast reaches the live node and moves the preference with cause
+Node endpoint failover has no two-node live test, because the local Regtest
+nodes do not peer with each other. Integration tests in
+`services/zinder-ingest/tests/integration/node_failover.rs` and
+`services/zinder-query/tests/integration/broadcast_failover.rs` cover it with
+simulated sources. `live::broadcast_fallback` needs one Regtest node: it puts a
+proxy to the node at `[node]` and the node itself at `[node_fallbacks.1]`,
+stops the proxy, and checks that a broadcast moves to the fallback with cause
 `node_unreachable`.
 
-## T3: Live testnet (Zebra cookie auth)
+The Zingolib flow cannot run on this chain. Zingolib 5.0.0 supports upgrades
+only through NU6.2, and the test refuses a tip at or past NU6.3.
 
-Same surface as regtest but against real testnet. Useful for capability probes
-and tip-fetch validation against a node with non-trivial chain weight.
+### Testnet
+
+Testnet uses the same command with a cookie-authenticated node. This example
+reads the cookie from a Z3 stack's shared volume:
 
 ```bash
-cookie=$(docker exec <zebra_container> cat /var/run/auth/.cookie)
+cookie=$(docker run --rm -v z3-testnet-cookie:/auth:ro alpine cat /auth/.cookie)
 ZINDER_TEST_LIVE=1 \
   ZINDER_NETWORK=zcash-testnet \
   ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:18232 \
@@ -696,171 +448,46 @@ ZINDER_TEST_LIVE=1 \
   ZINDER_NODE__AUTH__METHOD=basic \
   ZINDER_NODE__AUTH__USERNAME=${cookie%%:*} \
   ZINDER_NODE__AUTH__PASSWORD=${cookie#*:} \
-  ZINDER_TEST_QUERY_GRPC_ADDR=http://127.0.0.1:19102 \
   cargo nextest run --profile=ci-live --run-ignored=all
 ```
 
-`require_live()` accepts testnet by default; nothing further to opt in. Tests
-that target only mainnet (see below) still skip. Tests that exercise
-regtest-only RPCs (`generate`, `invalidateblock`, `reconsiderblock`) opt in
-via `require_live_for(&[Network::ZcashRegtest])` and refuse to run here.
-Omit `ZINDER_TEST_QUERY_GRPC_ADDR` only when no standalone native runtime is
-available; that omission intentionally skips the native contract smoke.
+Tests that mine or reorg the chain are limited to Regtest and pass without
+running. Set `ZINDER_TEST_QUERY_GRPC_ADDR` to also run the native
+`WalletQuery` smoke against a running `zinder-query`.
 
-`live::subtree_root_derivation` runs on testnet and mainnet, and the Mainnet
-lane's allowlist selects it. For each pool, it derives the most recently
-completed subtree root from the completing block's note commitments and the
-tree state before that block. The node's `z_getsubtreesbyindex` root must
-match it byte for byte, because ingest stores the derived root and stops when
-the node's root differs. A Regtest chain never fills a 65,536-leaf subtree, so
-the test skips there, and it fails against a node on which no pool has
-completed a subtree. Offline, `zinder-core`'s
-`integration::subtree_root_known_answers` replays three Testnet subtree
-completions, one per pool, against the roots a Zakura node reported, on every
-`ci` run. The live test still covers the current chain and each runtime, so
-run it against both certified runtimes when either runtime pin or the
-commitment-tree codec changes:
+Two tests matter mostly on Testnet and Mainnet:
+
+- `latest_completed_subtree_roots_derive_from_their_completing_blocks` derives
+  each pool's latest completed subtree root from the completing block and
+  compares it byte for byte with `z_getsubtreesbyindex`. Run it against both
+  certified nodes when either node pin or the commitment-tree code changes. It
+  fails on a node where no pool has completed a subtree.
+- `canonical_blocks_load_requested_range_from_fixed_checkpoint` loads a fixed
+  range (1,000 blocks by default) into a canonical store and verifies the
+  written files. It leaves the store in its building state, so it does not
+  prove readiness.
+
+To run that tracer in Docker beside a Z3 Testnet node, without touching the
+node's chain volume:
 
 ```bash
-cargo nextest run --profile=ci-live --run-ignored=all \
-  -E 'test(latest_completed_subtree_roots_derive_from_their_completing_blocks)'
-```
-
-The fixed-range canonical tracer runs on testnet and mainnet. It captures one
-tip identity, retains the requested predecessor-to-tip range, and loads every
-source-derived version-1 family retained by the Wallet workload through one
-production source-to-SST pass. Construction fully decodes the persisted replay
-sequence without filling the block cache. The tracer then reopens RocksDB
-read-only, checks exact live-file entry counts, rejects tombstones and
-overlapping or malformed SST key ranges, checksum-reads every SST boundary,
-and cross-checks first, middle, and tip identities across the header, reverse
-index, replay, compact-block, transaction-location, and raw transaction
-families. It reports per-family prepared logical bytes and persisted SST
-telemetry plus aggregate throughput. The store deliberately remains
-`BUILDING`: this test does not claim canonical or wallet readiness before the
-remaining source-observed families, publication records, and wallet projection
-exist.
-Run only this tracer with the same environment shown above:
-
-```bash
-cargo nextest run --profile=ci-live --run-ignored=all \
-  -E 'test(canonical_blocks_load_requested_range_from_fixed_checkpoint)'
-```
-
-The tracer retains 1,000 blocks by default. Set
-`ZINDER_TEST_CANONICAL_BLOCK_COUNT` to a positive integer for a larger
-fixed-tip calibration range.
-
-For the local Z3 testnet topology, the dedicated Docker setup builds the test
-in release mode, joins the existing Zebra network, mounts its cookie volume
-read-only, and creates an isolated project-scoped Zinder volume. It never
-mounts Zebra's chain volume or the active Zinder data volume:
-
-```bash
-docker build -f deploy/Dockerfile \
-  --target zinder-ingest-live-tests \
+docker build -f deploy/Dockerfile --target zinder-ingest-live-tests \
   -t zinder-ingest-live-tests:local .
 docker compose -p zinder-canonical-live-test \
-  -f deploy/docker-compose.canonical-live-test.yml \
-  run --rm canonical-blocks
+  -f deploy/docker-compose.canonical-live-test.yml run --rm canonical-blocks
 docker compose -p zinder-canonical-live-test \
-  -f deploy/docker-compose.canonical-live-test.yml \
-  down -v
+  -f deploy/docker-compose.canonical-live-test.yml down -v
 ```
 
-### Complete RocksDB storage lifecycle
+### Mainnet
 
-The canonical tracer above proves a bounded source-to-SST range but
-deliberately leaves the store `BUILDING`. Use the dedicated
-[RocksDB storage lifecycle harness](../../deploy/rocksdb-storage-lifecycle.md)
-to measure a fresh complete-history canonical store through `READY`, then build
-and cold-admit the wallet store at the same fixed Zebra tip. The
-harness reports canonical and wallet times separately and captures exact peak
-container memory plus sampled peak disk usage.
-
-Run a small fixed-tip smoke before a current-tip measurement. Both runs reuse
-Zebra's synchronized chain state but delete all project-scoped Zinder state:
+Mainnet tests run only against a synced node you operate. A test runs on
+Mainnet only if it opts in with `require_live_mainnet()` or
+`require_live_for(&[Network::ZcashMainnet, ...])`. Every other test passes
+without running.
 
 ```bash
-docker build -f deploy/Dockerfile --target zinder-bench -t zinder-bench:local .
-
-ZINDER_STORAGE_LIFECYCLE_TIP_HEIGHT=10000 \
-ZINDER_STORAGE_LIFECYCLE_PROJECT_NAME=zinder-storage-lifecycle-smoke \
-ZINDER_STORAGE_LIFECYCLE_EVIDENCE_PATH="$PWD/.tmp/rocksdb-storage-lifecycle-smoke" \
-  scripts/run-rocksdb-storage-lifecycle.sh
-
-scripts/run-rocksdb-storage-lifecycle.sh
-```
-
-This certifies only canonical and wallet storage readiness. Query serving,
-continuous tip following, and executed reorg recovery remain separate gates.
-
-### Canonical runtime tracer
-
-Use the dedicated runtime topology after the storage lifecycle gate. It starts
-the actual `zinder-ingest` binary, gives it one disposable Zinder volume, joins
-the existing Zebra network, and mounts only Zebra's authentication cookie
-read-only. It enforces the established 10-CPU, 10-GiB envelope. `/healthz` is
-the container liveness check; the operator must poll `/readyz` separately and
-record the authenticated canonical fence.
-
-Choose a fixed source-authenticated predecessor below the current Zebra tip and
-pin the locally reviewed image by immutable ID:
-
-```bash
-docker build -f deploy/Dockerfile \
-  --target zinder-ingest \
-  -t zinder-ingest:canonical-runtime-local .
-
-image_id=$(docker image inspect \
-  zinder-ingest:canonical-runtime-local \
-  --format '{{.Id}}')
-
-ZINDER_CANONICAL_RUNTIME_IMAGE="$image_id" \
-ZINDER_CANONICAL_RUNTIME_CHECKPOINT_HEIGHT=<height> \
-  docker compose \
-    -f deploy/docker-compose.canonical-runtime-test.yml \
-    up -d zinder-ingest
-```
-
-Acceptance requires a fresh `canonical.building` path to publish and cold-open
-epoch 1 and event 1, then at least one natural Zebra advance to increment the
-tip, epoch, event sequence, and digest together. Restart the service and require
-the same fence to reopen before accepting further appends. A reversible source
-outage may be tested by disconnecting only the ingest container from the source
-network; readiness must become `node_unavailable`, the fence must remain
-unchanged, and reconnecting must restore following. Never stop Zebra or mount,
-delete, or modify its chain volume for this gate.
-
-Record the image ID, checkpoint and fixed build fence, each appended fence,
-readiness payloads, resource limit and observations, volume mounts, and these
-metrics:
-
-- `zinder_ingest_canonical_chain_epoch`;
-- `zinder_ingest_canonical_chain_event_sequence`;
-- `zinder_ingest_canonical_tip_height`;
-- `zinder_ingest_canonical_lag_blocks`;
-- `zinder_ingest_canonical_historical_prevout_reads_total`; and
-- `zinder_ingest_canonical_cross_block_wallet_reads_total`.
-
-This tracer certifies append-only service composition, not full-chain
-construction performance, reorg replacement, wallet readiness, query serving,
-client parity, or Railway behavior. Preserve its project-scoped volume until
-the evidence has been reviewed. Remove it only with the Compose project name
-and without `external` Zebra resources in the command scope.
-
-## T3: Live mainnet (operator-hosted Zebra)
-
-Local mainnet runs are supported against an operator-hosted Zebra:
-
-1. Mainnet tests opt in via `require_live_for(&[Network::ZcashMainnet])` or
-   `require_live_mainnet()`. They refuse to run on any other network.
-2. `ZINDER_NETWORK=zcash-mainnet` plus the standard `ZINDER_NODE__*` schema
-   pointed at a synced mainnet Zebra.
-3. Same `cargo nextest` invocation as above:
-
-```bash
-cookie=$(docker exec <zebra_mainnet_container> cat /var/run/auth/.cookie)
+cookie=$(docker run --rm -v z3-mainnet-cookie:/auth:ro alpine cat /auth/.cookie)
 ZINDER_TEST_LIVE=1 \
   ZINDER_NETWORK=zcash-mainnet \
   ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:8232 \
@@ -870,791 +497,267 @@ ZINDER_TEST_LIVE=1 \
   cargo nextest run --profile=ci-live --run-ignored=all
 ```
 
-Currently-mainnet-only tests are
+The Mainnet-only tests are
 `fetch_chain_checkpoint_returns_advancing_tree_sizes_on_mainnet` and
-`tip_id_advances_above_one_million`.
+`tip_id_advances_above_one_million`. No live test writes to Mainnet.
 
-## T3: Parity against a reference lightwalletd
+### Parity against a reference lightwalletd
 
-Compares `zinder-compat-lightwalletd` against the pinned
-`electriccoinco/lightwalletd` v0.6.0 reference, both pointed at the same node.
-Catches drift in the wire-shape contract `LightdInfo`, `BlockId`,
-`CompactBlock`, and `RawTransaction` use across the two shims. The parity
-workflow runs once against Zebra and once against Zakura, each on the
-[Regtest through NU7](#regtest-through-nu7) chain mined to height 150, so its
-fixed fence covers blocks on both sides of NU7.
+These tests compare `zinder-compat-lightwalletd` with the pinned
+`electriccoinco/lightwalletd` v0.6.0, both reading the same Regtest node. CI
+mines the [Regtest through NU7](#regtest-through-nu7) chain to height 150, so
+the compared range crosses NU7. The tests compare only the fields that the
+[lightwalletd compatibility reference](../reference/lightwalletd-compatibility.md)
+names as comparable; build metadata, version strings, and the donation
+address are expected to differ.
 
-These tests live in
-[`services/zinder-compat-lightwalletd/tests/live/parity_against_lightwalletd.rs`](../../services/zinder-compat-lightwalletd/tests/live/parity_against_lightwalletd.rs)
-and need both shims running on host-reachable ports. Start the reference
-without `--ping-very-insecure`, its default, because the `Ping` test expects
-both shims to refuse `Ping`. They skip when either env var is absent so the
-default `ci-live` invocation does not require a parity sidecar pair:
+Start a fresh node as in step 1 of [Regtest through NU7](#regtest-through-nu7),
+but mine to 150 instead of 120. Then start the reference. Leave
+`--ping-very-insecure` off, because the `Ping` test expects both servers to
+refuse `Ping`.
+
+```bash
+scripts/mine-live-regtest.sh http://127.0.0.1:39232 150
+docker run -d --name lightwalletd-reference --network host \
+  docker.io/electriccoinco/lightwalletd:v0.6.0@sha256:abc8199dae800e050415a3459f71c7850aeefeb1ca6a681e9b9eda7249ce8613 \
+  --grpc-bind-addr 0.0.0.0:9088 \
+  --rpchost 127.0.0.1 --rpcport 39232 --rpcuser zebra --rpcpassword zebra \
+  --no-tls-very-insecure --data-dir /tmp/lwd --log-file /dev/stdout
+```
+
+Next, start a fixed-height Zinder compatibility server on port 9087. Ingest
+builds the canonical store, stops while `zinder-bench` builds the wallet store
+from it, and restarts so the compatibility server can authenticate against a
+live writer. Every process that opens the canonical store must state the same
+raw-blob retention, here `all`. The binaries take the network from
+`--network`, so unset the test-only `ZINDER_NETWORK` first:
+
+```bash
+cargo build --locked --release -p zinder-ingest -p zinder-compat-lightwalletd -p zinder-bench
+unset ZINDER_NETWORK
+export ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:39232 \
+  ZINDER_NODE__AUTH__METHOD=basic \
+  ZINDER_NODE__AUTH__USERNAME=zebra \
+  ZINDER_NODE__AUTH__PASSWORD=zebra
+mkdir -p .tmp
+start_ingest() {
+  ZINDER_STORAGE__RAW_BLOB_POLICY=all ./target/release/zinder-ingest --network zcash-regtest \
+    --storage-path .tmp/parity-store > .tmp/ingest.log 2>&1 &
+  ingest_pid=$!
+  until grep -qE ' visible_tip_height=150( |$)' .tmp/ingest.log; do sleep 2; done
+}
+start_ingest
+kill "$ingest_pid"
+wait "$ingest_pid" || true
+./target/release/zinder-bench rocksdb-wallet-rebuild \
+  --network zcash-regtest --json-rpc-addr http://127.0.0.1:39232 \
+  --raw-blob-retention all \
+  --canonical-store .tmp/parity-store \
+  --wallet-store .tmp/parity-wallet-store > .tmp/wallet-rebuild.json
+start_ingest
+ZINDER_STORAGE__RAW_BLOB_POLICY=all ./target/release/zinder-compat-lightwalletd --network zcash-regtest \
+  --canonical-primary-path .tmp/parity-store \
+  --canonical-secondary-root .tmp/parity-secondary-compat-canonical \
+  --wallet-primary-path .tmp/parity-wallet-store \
+  --wallet-secondary-root .tmp/parity-secondary-compat-wallet \
+  --listen-addr 127.0.0.1:9087 \
+  --node-json-rpc-addr http://127.0.0.1:39232 > .tmp/compat.log 2>&1 &
+until curl -sf -o /dev/null http://127.0.0.1:9107/readyz; do sleep 1; done
+```
+
+Then run the parity tests:
 
 ```bash
 ZINDER_TEST_LIVE=1 \
+  ZINDER_NETWORK=zcash-regtest \
   ZINDER_TEST_PARITY_ZINDER_ADDR=http://127.0.0.1:9087 \
   ZINDER_TEST_PARITY_LIGHTWALLETD_ADDR=http://127.0.0.1:9088 \
-  cargo nextest run --profile=ci-live --run-ignored=all \
-    -E 'test(/^live::parity_against_lightwalletd::/)'
+  ZINDER_TEST_PARITY_TRANSPARENT_ADDRESS=tmDpFafuBHKGUYmuwLsrxWJrwcnSyzEEtYx \
+  cargo nextest run -p zinder-compat-lightwalletd --profile=ci-live --run-ignored=all \
+    -E 'test(/^live::parity_against_lightwalletd::/) and not test(/mempool/)'
 ```
 
-Operator-divergent fields (build metadata, version strings, donation
-address) are intentionally allow-listed; the assertions focus on the wire
-shape both shims must agree on. Never hash or diff a whole `LightdInfo` or
-`BlockID` response as parity evidence: only the fields the
-[identity contract](../reference/lightwalletd-compatibility.md#identity-and-live-tip-responses)
-names as comparable are compared, and `GetLatestBlock` hashes only at equal
-heights. The fixture-backed `ci-parity` profile
-covers the same byte-shape contract without the running-binaries
-dependency and is the gate enforced on every CI run.
+CI excludes the mempool parity tests, because this fixed-height setup has no
+live mempool composition.
 
-## T3: Reorg sweep
+## Specialized procedures
 
-Forces a bounded canonical-chain reorg on the regtest sidecar through
-`invalidateblock`/`reconsiderblock`. The test starts the production
-`RocksDbCanonicalStore` writer, reads its narrow
-`IngestControl.VisibleChainEvents` stream, and verifies that the emitted
-`ChainReorged` range covers the invalidated suffix. This catches drift between
-Zebra rollback, current-writer replacement, and the ingest control stream.
+### Reorg sweep
+
+`live::reorg_sweep` starts the production canonical writer, invalidates the
+top three blocks on the Regtest node with `invalidateblock`, and checks that
+the writer's `IngestControl.VisibleChainEvents` stream publishes a reorg
+covering them. It runs in the Regtest suite. To run it alone, with the
+Regtest variables from step 3 exported:
 
 ```bash
-ZINDER_TEST_LIVE=1 \
-  ZINDER_NETWORK=zcash-regtest \
-  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:29232 \
-  ZINDER_NODE__AUTH__METHOD=basic \
-  ZINDER_NODE__AUTH__USERNAME=zebra \
-  ZINDER_NODE__AUTH__PASSWORD=zebra \
-  cargo nextest run --profile=ci-live -E 'test(/^live::reorg_sweep::/)' \
-    --run-ignored=all
+cargo nextest run --profile=ci-live --run-ignored=all -E 'test(/^live::reorg_sweep::/)'
 ```
 
-The test uses a current checkpoint plus one newly mined block for construction,
-then replaces a three-block suffix. It joins the `node-mutating` nextest group;
-only regtest is in scope because forced reorgs are destructive on shared or
-public networks.
+Never run a forced reorg against a shared network. The test refuses any
+network but Regtest.
 
-## T3: Network upgrade boundary crossing
+### Network-upgrade boundary
 
-Pins the per-height consensus-branch-id contract across a network
-upgrade activation. The single-tip
-[`mined_consensus_branch_id_parity`](../../services/zinder-ingest/tests/live/mined_consensus_branch_id_parity.rs)
-test only samples the chain tip; this companion samples three heights
-that straddle the latest reachable activation, so a regression in
-[ADR-0008](../adrs/0008-network-parameter-discovery.md)'s discovery path
-or in how `MinedTransactionChainContext.consensus_branch_id` is populated surfaces here
-even when the tip happens to be in a "stable" upgrade window.
+`live::network_upgrade_boundary` checks the coinbase consensus branch ID at
+the latest reachable activation height and one block on either side. On the
+[Regtest through NU7](#regtest-through-nu7) chain it samples heights 139, 140,
+and 141. On a node that activates every upgrade at height 1 there is no
+boundary, and the test returns early. The reason for reading the schedule
+from the node is in
+[ADR-0008](../adrs/0008-consensus-parameters-from-the-node.md).
 
 ```bash
-ZINDER_TEST_LIVE=1 \
-  ZINDER_NETWORK=zcash-regtest \
-  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:29232 \
-  ZINDER_NODE__AUTH__METHOD=basic \
-  ZINDER_NODE__AUTH__USERNAME=zebra \
-  ZINDER_NODE__AUTH__PASSWORD=zebra \
-  cargo nextest run --profile=ci-live \
-    -E 'test(/^live::network_upgrade_boundary::/)' --run-ignored=all
+cargo nextest run --profile=ci-live --run-ignored=all -E 'test(/^live::network_upgrade_boundary::/)'
 ```
 
-Both tests build the production canonical store and wallet projection from
-genesis, so they run on regtest only. The boundary test returns early when
-the regtest node activates every upgrade at height 1, because there is no
-boundary to cross. On the [Regtest through NU7](#regtest-through-nu7) chain,
-the latest reachable activation is NU7 at height 140, so the test samples
-heights 139, 140, and 141.
+### Writer fencing and crash recovery
 
-File:
-[`services/zinder-ingest/tests/live/network_upgrade_boundary.rs`](../../services/zinder-ingest/tests/live/network_upgrade_boundary.rs).
+Only one process may write each store; readers open RocksDB secondaries (see
+[ADR-0003](../adrs/0003-epoch-bound-reads-and-storage-roles.md)). The
+canonical store tests in
+`crates/zinder-store/src/canonical_store/secondary_tests.rs` run in the `ci`
+profile and prove that a second primary is refused, that a secondary keeps
+serving after the primary stops, and that a restarted primary resumes from
+the same fence.
 
-## T3: Writer fencing and crash recovery
-
-Multi-process storage access is the production deployment shape per
-[ADR-0003](../adrs/0003-canonical-storage-access-boundary.md): one
-`zinder-ingest` canonical primary, one `zinder-projector` wallet primary,
-reader-local projector/compatibility secondaries, and no second writer for
-either namespace. This section validates the structural RocksDB fencing and
-the operationally critical "owner crashed, published readers survive"
-semantic one store at a time; the wallet-serving admission tests cover the cross-store
-boundary.
-
-### Primary and secondary coverage
-
-The canonical-store unit tests in
-[`crates/zinder-store/src/canonical_store/secondary_tests.rs`](../../crates/zinder-store/src/canonical_store/secondary_tests.rs)
-run with every `cargo nextest run --profile=ci` against the production
-`RocksDbCanonicalStore` and `RocksDbCanonicalSecondary`:
-
-- `second_ready_primary_open_is_refused_while_the_first_owns_the_store`:
-  a second writer cannot take over an open primary. The RocksDB lock
-  surfaces as a refused `open ready` operation, and the store reopens at the
-  same fence once the first owner drops.
-- `secondary_and_reopened_primary_serve_the_last_durable_fence_after_the_primary_drops`:
-  publishes a baseline, appends a live block, and drops the primary handle.
-  A fresh secondary serves the last durable fence without the primary, and a
-  restarted primary resumes from the same fence.
-- `secondary_observes_a_live_append_only_after_explicit_catch_up`: a
-  secondary keeps its admitted fence until `try_catch_up` reports the
-  advance to the primary's new fence.
-- `secondary_admission_rejects_another_network_activation_table` and
-  `secondary_admission_reports_and_requires_the_persisted_raw_blob_retention`:
-  secondary admission is exact for the network and raw-blob retention.
-
-### Serving-pair fixtures
-
-Query, compatibility, client, and explorer tests serve their chains from
-`zinder_testkit::WalletServingStoreFixture`. It publishes through the
-production canonical writer and wallet projection, then admits immutable
-secondaries, so every row a test reads passed writer validation.
-
-`zinder_testkit::CanonicalWriterFixture` drives the same writer for history a
-single baseline cannot express:
-
-- checkpointed history above a floor, with `CanonicalBaseline::with_history_floor`;
-- an unsettled suffix, with `CanonicalBaseline::with_settled_tip`, that
-  `replace_live_blocks` reorgs;
-- live appends, canonical event pruning, and completed subtree roots; and
-- serving pairs taken before and after a transition.
-
-Commitment trees follow each compact block's chain metadata. A live block must
-carry the note commitments that reach its declared tree sizes, because the
-store re-derives them. A cold baseline can declare trees too large to build in
-a test, such as a completed 2^16-leaf subtree, with
-`ChainFixture::with_commitment_tree_frontiers_at`. A block that a replacement
-displaces must start with a coinbase, such as
-`FixtureTransactionRows::coinbase`, because the store archives it.
-
-Two history shapes have no fixture because no production store holds them: a
-height-0 block, which canonical history never retains (see
-[Lightwalletd compatibility §Block range status codes](../reference/lightwalletd-compatibility.md#block-range-status-codes)),
-and an epoch without a tree-state checkpoint, since every build retains a
-block above its floor and checkpoints its tip (see
-[Wallet data plane](../architecture/wallet-data-plane.md)).
-
-### Process-crash coverage
-
-Process-crash tests run with every `cargo nextest run --profile=ci`. They kill
-a real writer at a named point inside a commit and prove the reopened store
-holds exactly one complete batch: the state before the batch or the state
-after it.
-
-Each test runs in two processes from the same test binary.
-[`zinder_testkit::process_crash`](../../crates/zinder-testkit/src/process_crash.rs)
-supplies both halves:
-
-1. The parent test calls `run_crash_child` with the child test's exact name,
-   a store path, and one crash point. The harness re-runs the current test
-   binary with only that child selected and the point armed through
-   `ZINDER_TEST_CRASH_POINT`.
-2. The child test calls `crash_child()`, drives the write path, and aborts
-   when it reaches the armed `crash_point`. Run directly, `crash_child()`
-   returns `None` and the child passes as a no-op.
-3. The harness accepts only a child killed by `SIGABRT`. A child that exits
-   with an error, or a child name that matches no test, fails the parent
-   instead of passing as a crash.
-4. The parent reopens the store and asserts the recovered state.
-
-`run_crash_child` exists only on Unix, the only platform Zinder builds, tests,
-and releases, because `SIGABRT` is what separates an abort from an ordinary
-failure. Mark every parent test, and any helper only a parent uses,
-`#[cfg(unix)]`.
-
-Crash points are one-line calls in production source. Each crate that owns a
-crash point declares a `crash_point` name that resolves to the harness only in
-its unit-test build:
-
-```rust
-#[cfg(test)]
-use zinder_testkit::process_crash::crash_point;
-
-#[cfg(not(test))]
-const fn crash_point(_name: &str) {}
-
-// At the write site:
-crash_point("canonical.live_commit.before_atomic_write");
-```
-
-Every other build calls the empty function instead, so no integration-test or
-release binary can abort at a crash point. `zinder-testkit` remains a
-dev-dependency of each owning crate, which keeps it out of release dependency
-graphs.
-
-| Store | Write path | Crash points | Parent test |
-| ----- | ---------- | ------------ | ----------- |
-| Canonical | Baseline publication | `canonical.publication.` `after_flush`, `after_builder_drop`, `after_cold_validation`, `after_construction_manifest`, `before_atomic_write`, `after_atomic_write` | `publication_crashes_preserve_the_atomic_build_state` |
-| Canonical | Live append | `canonical.live_commit.` `before_atomic_write`, `after_atomic_write` | `live_commit_crashes_reopen_at_one_complete_atomic_fence` |
-| Canonical | Live replacement | `canonical.live_replacement.` `before_atomic_write`, `after_atomic_write` | `replacement_batch_is_either_pre_update_or_post_update_across_process_abort` |
-| Canonical | Store-control revision (activation-schedule admission and reorg-window raise) | `canonical.control_revision.` `before_atomic_write`, `after_atomic_write` | `activation_schedule_crash_recovers_before_or_after_atomic_record_and_control_write` |
-| Materialized views | Final and intermediate chain-event chunk | `materialized_view.chain_event_chunk.` `before_write`, `after_write` | `chain_event_chunk_reopens_at_one_complete_batch_across_process_abort` |
-| Wallet projection | Canonical-event transition | `wallet_projection.transition.` `before_atomic_write`, `after_atomic_write` | `wallet_transition_reopens_at_one_complete_publication_across_process_abort` |
-
-To cover a new write path, add crash points before and after its single
-atomic write, add a child test that returns an error if it gets past them, and
-name the parent test `<behavior>_across_process_abort`. The
-`.config/nextest.toml` crash-test override matches that suffix and gives the
-test a 60-second timeout window, because each abort can take seconds on a host
-that collects core dumps.
-
-#### Power-loss limitation
-
-`std::process::abort` ends the process but leaves the operating-system page
-cache intact. A write that reached the page cache without an fsync survives
-the abort, so a missing fsync passes every process-crash test. For example,
-the materialized-view chain-event chunk write is unsynced, yet
-`chain_event_chunk_reopens_at_one_complete_batch_across_process_abort` passes
-the same assertions a synced write would.
-
-These tests therefore prove atomicity and recovery to a complete batch. They
-do not prove durability across power loss or a kernel crash, and no CI tier
-does. That durability rests on review of the synchronous write points: the
-canonical publication, live append, live replacement, and lifecycle batches,
-and every wallet-projection transition, write with `set_sync(true)`. The
-materialized-view store writes unsynced and recovers a lost batch by replay
-([ADR-0029](../adrs/0029-durable-transparent-outpoint-spend-projection.md#recovery)).
-Exercising power loss needs a fault-injecting filesystem or a hard reset of a
-virtual machine.
-
-### Manual reproduction: kill -9 mid-commit
-
-Use this when changing storage commit paths. It kills a real `zinder-ingest`
-process at an arbitrary moment, which complements the fixed crash points
-above. Like those tests, `kill -9` keeps the page cache, so it does not
-simulate power loss.
+When you change a storage commit path, also reproduce it by hand with a real
+process. Export the `ZINDER_NODE__*` variables from step 3 first, but not
+`ZINDER_NETWORK`; the binary takes the network from `--network`.
 
 ```bash
-# Terminal 1: start the canonical writer against z3 regtest.
+cargo build --release -p zinder-ingest
 mkdir -p .tmp
 rm -rf .tmp/regtest.zinder-store
-cargo run --release --bin zinder-ingest -- \
-  --config .tmp/regtest.ingest.toml &
-INGEST_PID=$!
+./target/release/zinder-ingest --network zcash-regtest \
+  --storage-path .tmp/regtest.zinder-store > .tmp/ingest.log 2>&1 &
+ingest_pid=$!
+# Wait until the writer follows the tip, then kill it without warning.
+until grep -q ' visible_tip_height=' .tmp/ingest.log; do sleep 2; done
+kill -9 "$ingest_pid"
+wait "$ingest_pid" 2>/dev/null || true
+./target/release/zinder-ingest --network zcash-regtest \
+  --storage-path .tmp/regtest.zinder-store probe
+```
 
-# Terminal 1 (after a few blocks commit): SIGKILL the writer mid-flight.
+`probe` prints a JSON line with a numeric `store_tip` and exits zero. Kill the
+writer only after it follows the tip. A kill during construction discards the
+unpublished store, and `probe` then refuses to open it.
+
+To check fencing across processes, start a second writer while the first is
+running. Disable its ops endpoint, so it cannot fail on the port instead:
+
+```bash
+./target/release/zinder-ingest --network zcash-regtest \
+  --storage-path .tmp/regtest.zinder-store > .tmp/ingest.log 2>&1 &
+first_pid=$!
 sleep 5
-kill -9 "$INGEST_PID"
-wait "$INGEST_PID" 2>/dev/null || true
-
-# Reopen and assert state is consistent. The probe command opens the
-# canonical store through its normal fail-closed admission path.
-cargo run --release --bin zinder-ingest -- \
-  --config .tmp/regtest.ingest.toml probe
+ZINDER_OPS__LISTEN_ADDR= ./target/release/zinder-ingest --network zcash-regtest \
+  --storage-path .tmp/regtest.zinder-store
+kill "$first_pid"
 ```
 
-Expected: probe reports a durable `store_tip` and exits successfully. RocksDB's
-WAL replay restores any committed batch on reopen; partial commits are visible
-only after their write batch is durably persisted, so the reopened tip is
-always at or below the last batch the writer signaled durable.
+The second process must log `ingest_run_failed`, with a
+`canonical store RocksDB open ready failed` cause, and exit non-zero. The first
+keeps running.
 
-### Manual reproduction: second-writer fencing across processes
+### Concurrent readers
 
-```bash
-cargo run --release --bin zinder-ingest -- \
-  --config .tmp/regtest.ingest.toml &
-sleep 2
-# This second invocation must fail to open the primary because the first
-# process holds .tmp/regtest.zinder-store/LOCK. If it succeeds, the fencing
-# contract is broken.
-cargo run --release --bin zinder-ingest -- \
-  --config .tmp/regtest.ingest.toml
-```
+`services/zinder-query/tests/integration/stream_cancellation.rs` runs in the
+`ci` profile. It checks that a cancelled stream does not break later
+requests, and that 16 parallel readers each drain a full range within 20
+seconds.
 
-Expected: the second `zinder-ingest` process logs `ingest_run_failed` and
-exits non-zero. Its underlying `CanonicalStoreError::RocksDbOperation` for
-`open ready` carries RocksDB's LOCK error, as
-`second_ready_primary_open_is_refused_while_the_first_owns_the_store` pins.
-The first process continues uninterrupted.
-
-## Concurrent readers and stream cancellation
-
-Production deployments fan many clients into each immutable-pair
-`zinder-compat-lightwalletd` server. The gRPC adapter must serve concurrent
-streamed reads without serializing them and clean up request-owned generation
-handles when a client disconnects mid-stream.
-
-### Stream cancellation coverage
-
-Two integration tests under
-[`services/zinder-query/tests/integration/stream_cancellation.rs`](../../services/zinder-query/tests/integration/stream_cancellation.rs)
-run with every `cargo nextest run --profile=ci`:
-
-- `dropping_compact_block_range_stream_does_not_break_subsequent_requests`
-  — opens a `compact_block_range` stream, reads one chunk, drops it,
-  then opens a second stream and drains it. Asserts the server stays
-  responsive after a mid-stream cancellation.
-- `parallel_compact_block_range_readers_all_drain_to_completion` —
-  spawns 16 concurrent clients each draining the full committed range
-  and asserts every reader finishes within a 20-second deadline.
-
-### Manual reproduction: N concurrent compat readers
-
-Operator-grade reproduction needs a real bulk-caught-up store plus a real
-gRPC client. Two terminals:
+To load a real compatibility server, start one as in
+[Parity against a reference lightwalletd](#parity-against-a-reference-lightwalletd)
+and fan out range requests:
 
 ```bash
-# Terminal 1: serve over a populated store.
-cargo run --release --bin zinder-compat-lightwalletd -- \
-  --config .tmp/regtest.compat.toml
-
-# Terminal 2: fan out N parallel GetBlockRange calls.
 for reader_index in $(seq 1 10); do
-  grpcurl -plaintext \
-    -import-path crates/zinder-proto/proto/compat/lightwalletd \
-    -proto crates/zinder-proto/proto/compat/lightwalletd/service.proto \
-    -d '{"start":{"height":1},"end":{"height":100}}' \
-    127.0.0.1:9067 cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange \
+  grpcurl -plaintext -d '{"start":{"height":1},"end":{"height":100}}' \
+    127.0.0.1:9087 cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange \
     > ".tmp/reader-$reader_index.out" &
 done
 wait
 wc -l .tmp/reader-*.out
 ```
 
-Expected: every reader receives a non-zero number of lines, no
-`-1`/transport errors, and no reader hangs past the others.
+Every reader must receive blocks without a transport error, and none may hang
+after the others finish.
 
-## Performance calibration (T2 + live latency)
+### Performance
 
-Three layers, each answering a different question: synthetic budgets, live
-read latency, and per-block cost at the tip.
+| Question | Run | Result |
+| --- | --- | --- |
+| Did a read path get slower? | `cargo nextest run --profile=ci-perf` | Fails when `services/zinder-query/tests/perf/perf_smoke.rs` exceeds its budgets: 250 ms for the visible tip, 2 s for a compact block range, and 5 s for a full block range of 1,000 blocks. |
+| How fast are reads against a real node? | `read_endpoint_latency_baseline` on Regtest, with `--no-capture` | Prints one `live_latency_baseline` line with microsecond timings. Nothing is asserted; compare the line across changes. |
+| What does each block cost the writer and projector at the tip? | `zinder-bench rocksdb-tip-replay` | Follow [section 4 of the zinder-bench README](../../services/zinder-bench/README.md#4-measure-per-block-cost-at-the-tip). |
+| Does a deep reorg fit the wallet transition limit? | `zinder-bench rocksdb-tip-reorg` | Follow [section 5 of the zinder-bench README](../../services/zinder-bench/README.md#5-measure-a-deep-reorg-at-the-tip). |
+| How long, and how much memory and disk, does a full build take? | `scripts/run-rocksdb-storage-lifecycle.sh` | Follow [RocksDB storage lifecycle](../../deploy/rocksdb-storage-lifecycle.md). |
 
-### T2 perf budgets
+### Canonical runtime tracer
 
-Synthetic, fast, deterministic; runs every commit:
-
-```bash
-cargo nextest run --profile=ci-perf
-```
-
-The `services/zinder-query/tests/perf/perf_smoke.rs` library-contract fixture holds the budgets;
-each test asserts an upper bound (`PERF_SMOKE_LATEST_BUDGET = 250 ms`,
-`PERF_SMOKE_RANGE_BUDGET = 2 s`, and
-`PERF_SMOKE_FULL_BLOCK_RANGE_BUDGET = 5 s` for 1,000 blocks). A budget
-violation is a test failure.
-
-### Live latency baseline
-
-Real Zebra, real RocksDB; reports microsecond budgets per call:
+This runs the real `zinder-ingest` image beside an existing Zebra Testnet
+node, in a 10-CPU, 10 GiB container with its own disposable volume. It mounts
+only the node's cookie, never its chain volume.
 
 ```bash
-ZINDER_TEST_LIVE=1 \
-  ZINDER_NETWORK=zcash-regtest \
-  ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:29232 \
-  ZINDER_NODE__AUTH__METHOD=basic \
-  ZINDER_NODE__AUTH__USERNAME=zebra \
-  ZINDER_NODE__AUTH__PASSWORD=zebra \
-  cargo nextest run --profile=ci-live -E 'test(read_endpoint_latency_baseline)' \
-    --run-ignored=all --no-capture
+docker build -f deploy/Dockerfile --target zinder-ingest \
+  -t zinder-ingest:canonical-runtime-local .
+image_id=$(docker image inspect zinder-ingest:canonical-runtime-local --format '{{.Id}}')
+ZINDER_CANONICAL_RUNTIME_IMAGE="$image_id" \
+ZINDER_CANONICAL_RUNTIME_CHECKPOINT_HEIGHT="${checkpoint_height:?set a height below the node tip}" \
+  docker compose -f deploy/docker-compose.canonical-runtime-test.yml up -d zinder-ingest
 ```
 
-Look for the `live_latency_baseline` line in the output:
+Set `checkpoint_height` to a height below the node's tip first. Poll `/readyz` and the
+`zinder_ingest_canonical_*` metrics. The store must publish, then advance its
+tip, epoch, and event sequence together as the node mines. After a restart it
+must reopen at the same fence. If you disconnect only the ingest container
+from the node's network, readiness must report `node_unavailable` without
+changing the fence, and following must resume when you reconnect it.
 
-```text
-live_latency_baseline  network=zcash-regtest  tip=2361
-  visible_tip_block          = 160 µs
-  compact_block_at      = 168 µs
-  compact_block_range_50 = 1175 µs
-  tree_state_checkpoint_at_or_before         = 249 µs
-```
+### External wallets
 
-These numbers are not asserted by the test; treat the printed values as
-operator-facing telemetry. Compare across changes to spot regressions in
-the read path. The baseline does not exercise `transaction()` — that path
-goes through `mempool_broadcast_cycle` (broadcast then look up the mined
-txid) and `deep_chain` (high-volume canonical construction).
-
-### Tip-replay benchmark
-
-Use this to measure a performance change to the canonical writer or the wallet
-projector, one variable at a time. `zinder-bench rocksdb-tip-replay` replays a
-captured block range through the production canonical follower and the
-production wallet transition, on scratch copies of a canonical store and a
-wallet store that end just before the range. The
-[zinder-bench README](../../services/zinder-bench/README.md#4-measure-per-block-cost-at-the-tip)
-defines the timers, workload strata, and report fields.
-
-Prepare the inputs once per start height. Pick a range well below the node tip
-so no block in it can be reorged. This example uses a local Testnet node with
-cookie authentication:
-
-```bash
-cargo build --release -p zinder-bench
-bench=target/release/zinder-bench
-node=http://127.0.0.1:18232
-cookie=/var/run/zebra-auth/.cookie
-start=4618499
-end=4620999
-work=.tmp/tip-replay
-
-mkdir -p "$work"
-"$bench" rocksdb-storage-lifecycle \
-  --network zcash-testnet --json-rpc-addr "$node" --node-auth-cookie "$cookie" \
-  --canonical-store "$work/canonical" --wallet-store "$work/wallet" \
-  --tip-height "$start" --cpu-limit-cores 8 --memory-limit-bytes 17179869184 \
-  --report "$work/lifecycle.json"
-"$bench" capture \
-  --network zcash-testnet --json-rpc-addr "$node" --node-auth-cookie "$cookie" \
-  --from-height "$((start + 1))" --to-height "$end" --out "$work/fixture"
-"$bench" capture-tip-replay-checkpoints \
-  --network zcash-testnet --json-rpc-addr "$node" --node-auth-cookie "$cookie" \
-  --fixture "$work/fixture"
-```
-
-Before relying on a new set of inputs, check the replay against an
-independent wallet rebuild. Keep the scratch stores of one replay, rebuild a
-wallet from its canonical store, and compare the two digests, which must
-match:
-
-```bash
-"$bench" rocksdb-tip-replay \
-  --fixture "$work/fixture" \
-  --canonical-store "$work/canonical" --wallet-store "$work/wallet" \
-  --scratch-dir "$work/scratch-check" --report "$work/check.json" \
-  --software-revision "$(git rev-parse HEAD)" --keep-scratch
-"$bench" rocksdb-wallet-rebuild \
-  --network zcash-testnet --json-rpc-addr "$node" --node-auth-cookie "$cookie" \
-  --canonical-store "$work/scratch-check/repeat-0/canonical" \
-  --wallet-store "$work/rebuilt-wallet" > "$work/rebuild.json"
-jq -r '.wallet_projection_digest_hex' "$work/rebuild.json"
-jq -r '.repeats[-1].final_wallet.projection_digest_hex' "$work/check.json"
-rm -rf "$work/scratch-check" "$work/rebuilt-wallet"
-```
-
-Measure the baseline and the candidate from the same inputs, with the same
-`--repeat` count of at least 3, on a quiet host. The comparison refuses reports
-with different repeat counts. Build each binary from its own revision, give
-each run its own `--scratch-dir` and `--report`, then compare:
-
-```bash
-"$bench" rocksdb-tip-replay \
-  --fixture "$work/fixture" \
-  --canonical-store "$work/canonical" --wallet-store "$work/wallet" \
-  --scratch-dir "$work/scratch-baseline" --report "$work/baseline.json" \
-  --software-revision "$(git rev-parse HEAD)" --repeat 3
-"$bench" compare-tip-replay-reports \
-  --baseline "$work/baseline.json" --candidate "$work/candidate.json" \
-  --report "$work/comparison.json"
-```
-
-To measure the read path, replay the same inputs once per I/O mode and compare
-the reports. `--wallet-io-mode` and `--canonical-io-mode` take `direct` (the
-production policy) or `buffered`, and the report records the mode each store
-resolved:
-
-```bash
-"$bench" rocksdb-tip-replay \
-  --fixture "$work/fixture" \
-  --canonical-store "$work/canonical" --wallet-store "$work/wallet" \
-  --scratch-dir "$work/scratch-buffered" --report "$work/buffered.json" \
-  --software-revision "$(git rev-parse HEAD)" --repeat 3 \
-  --wallet-io-mode buffered
-```
-
-Run the pair on Linux. Each repeat evicts its scratch copies from the page
-cache after copying them, so both modes start cold, and the report records
-`method.scratch_page_cache` as `evicted-after-copy`. On other platforms the
-copies stay cached and the buffered run starts warm, so the pair does not
-measure the I/O mode.
-
-To see why a wallet read costs what it does, add `--wallet-rocksdb-statistics`
-to both runs of a pair. The report then carries the wallet store's `RocksDB`
-ticker deltas per block and per workload stratum: point reads, Bloom filter
-outcomes, block-cache misses, and the bytes background flushes and compactions
-moved. A block's deltas include the reads of any flush or compaction that ran
-during its transition, so set aside blocks with a nonzero
-`rocksdb.compact.read.bytes` or `rocksdb.flush.write.bytes` before reading
-their miss counts as the transition's own. Collection can change timings, so
-measure timings on runs without it, and note that the comparison refuses a run
-that collected statistics against one that did not.
-
-Each repeat copies both stores, so the scratch filesystem needs room for the
-inputs twice over; at a Testnet tip near height 4.6 million that is about
-11 GiB of canonical store and 3 GiB of wallet store each. The replay refuses to
-start when the copy would leave less than 2 GiB free, and it deletes each
-repeat's copy unless `--keep-scratch` is set. Delete `$work` when you are done.
-
-### Deep-reorg benchmark
-
-Use this to check whether a deep reorg fits the wallet transition ceiling,
-`projector.follow.max_transition_logical_bytes`, and how much memory the
-transition takes. `zinder-bench rocksdb-tip-reorg` takes the same inputs as the
-tip replay. It replays the fixture to `--reorg-tip-height`, makes the
-production canonical follower switch to a branch that rewrites the newest
-`--depth` blocks, and applies the resulting `Reorged` event to the wallet as
-`zinder-projector` does:
-
-```bash
-"$bench" rocksdb-tip-reorg \
-  --fixture "$work/fixture" \
-  --canonical-store "$work/canonical" --wallet-store "$work/wallet" \
-  --scratch-dir "$work/scratch-reorg" --report "$work/reorg.json" \
-  --software-revision "$(git rev-parse HEAD)" \
-  --reorg-tip-height "$((end - 1))" --depth 1000 --fork distinct-coinbases
-jq '.wallet_transition | {outcome, refused_required_bytes, footprint, memory}' "$work/reorg.json"
-```
-
-The fixture must start at least `--depth` blocks below `--reorg-tip-height`.
-It must also hold one block past it. A refused transition still produces a
-report. The
-[zinder-bench README](../../services/zinder-bench/README.md#5-measure-a-deep-reorg-at-the-tip)
-describes the branch kinds and the report fields.
-
-### Heavy probes (trust-sensitive code only)
-
-Run on demand for changes to storage commit paths, parser code, or the
-canonical store's live commit, live replacement, and event lifecycle:
-
-```bash
-cargo llvm-cov --workspace --all-features --no-report
-cargo mutants --workspace --all-features \
-  --file crates/zinder-store/src/canonical_store/live_commit.rs \
-  --file crates/zinder-store/src/canonical_store/live_replacement.rs \
-  --file crates/zinder-store/src/canonical_store/event_lifecycle.rs \
-  --file crates/zinder-store/src/canonical_store/rocksdb.rs \
-  --file crates/zinder-store/src/canonical_store/activation_schedule.rs \
-  --file crates/zinder-store/src/canonical_store/control.rs \
-  --file crates/zinder-core/src/network_upgrade_activations.rs \
-  --file crates/zinder-source/src/source_block.rs \
-  --re 'canonical_event_history|validate_live_settled_tip|validate_live_block_extension|validate_replacement_blocks|from_raw_block_bytes|matching_fingerprint_prefix_len|preserves_through|next_activation_schedule|validate_activation_expectation|read_bound|validate_open_store_control|raise_reorg_policy|decode_reorg_policy_trailer'
-```
-
-These are slow (mutants often >30 min). Scheduled CI runs them weekly; locally,
-gate on whether you actually changed trust-sensitive code.
-
-## External integration: lightwalletd-compatible wallets
-
-### Conventions for the recipes below
-
-- The production-shaped runtime set is `zinder-ingest`, `zinder-projector`,
-  `zinder-query`, and `zinder-compat-lightwalletd`. Each accepts a TOML file,
-  the `ZINDER_*` environment schema, and CLI overrides in that order.
-- Keep every primary and secondary path distinct. Ingest owns the canonical
-  primary, projector owns the wallet primary, and each reader owns up to 4
-  bounded generations beneath its distinct canonical and wallet secondary roots.
-- Run `CanonicalControl` and `IngestControl` on loopback for same-host tests.
-  A non-loopback writer requires one bearer-token file shared with projector
-  and both serving readers.
-- Put per-process configs under `.tmp/`:
-
-  ```toml
-  # .tmp/regtest.ingest.toml
-  [network]
-  name = "zcash-regtest"
-
-  [node]
-  json_rpc_addr = "http://127.0.0.1:29232"
-
-  [node.auth]
-  method = "basic"
-  username = "zebra"
-  password = "zebra"
-
-  [storage]
-  path = ".tmp/regtest.canonical"
-  raw_blob_policy = "transactions"
-
-  [ingest]
-  source = "zebra-json-rpc"
-  reorg_window_blocks = 1000
-
-  [ingest.run_overrides]
-  coverage = "wallet-serving"
-
-  [ingest_control]
-  listen_addr = "127.0.0.1:9100"
-  ```
-
-  ```toml
-  # .tmp/regtest.projector.toml
-  # The projector uses no node and rejects a [node] section.
-  [network]
-  name = "zcash-regtest"
-
-  [storage]
-  canonical_path = ".tmp/regtest.canonical"
-  canonical_secondary_path = ".tmp/regtest.projector-canonical-secondary"
-
-  [wallet]
-  path = ".tmp/regtest.wallet"
-
-  [projector]
-  reorg_window_blocks = 1000
-  build_owner_hex = "00112233445566778899aabbccddeeff"
-  lease_duration_seconds = 14400
-
-  [ingest_control]
-  addr = "http://127.0.0.1:9100"
-  ```
-
-  ```toml
-  # .tmp/regtest.query.toml
-  # [node] is optional and used only for SendTransaction. The query starts
-  # without contacting it and verifies it on first contact.
-  [network]
-  name = "zcash-regtest"
-
-  [node]
-  json_rpc_addr = "http://127.0.0.1:29232"
-
-  [node.auth]
-  method = "basic"
-  username = "zebra"
-  password = "zebra"
-
-  [storage]
-  path = ".tmp/regtest.canonical"
-  secondary_path = ".tmp/regtest.query-canonical-secondary"
-
-  [wallet]
-  path = ".tmp/regtest.wallet"
-  secondary_path = ".tmp/regtest.query-wallet-secondary"
-
-  [ingest_control]
-  addr = "http://127.0.0.1:9100"
-
-  [query]
-  listen_addr = "127.0.0.1:9102"
-  reorg_window_blocks = 1000
-  pair_convergence_attempts = 12
-  ```
-
-  ```toml
-  # .tmp/regtest.compat.toml
-  # [node] is optional and used only for SendTransaction. Compatibility starts
-  # without contacting it and verifies it on first contact.
-  [network]
-  name = "zcash-regtest"
-
-  [node]
-  json_rpc_addr = "http://127.0.0.1:29232"
-
-  [node.auth]
-  method = "basic"
-  username = "zebra"
-  password = "zebra"
-
-  [storage]
-  path = ".tmp/regtest.canonical"
-  secondary_path = ".tmp/regtest.compat-canonical-secondary"
-
-  [wallet]
-  path = ".tmp/regtest.wallet"
-  secondary_path = ".tmp/regtest.compat-wallet-secondary"
-
-  [ingest_control]
-  addr = "http://127.0.0.1:9100"
-
-  [compat]
-  listen_addr = "127.0.0.1:9067"
-  reorg_window_blocks = 1000
-  pair_convergence_attempts = 12
-  ```
-
-### One-shot deterministic test
-
-Already covered by
 `services/zinder-compat-lightwalletd/tests/integration/lightwalletd_scan_contract.rs`
-in the default validation gate. It:
+runs in the `ci` profile. It scans a populated store through the generated
+`CompactTxStreamer` client and checks transaction alignment, tree sizes, and
+that no key material reaches the server.
 
-1. Stands up `LightwalletdGrpcAdapter` over a populated production canonical
-   and wallet serving pair.
-2. Connects through the generated `CompactTxStreamerClient` to exercise the
-   protocol transport directly.
-3. Calls `GetBlockRange`, decodes every compact block, asserts `vtx`/`txid`
-   alignment with stored transaction artifacts, and asserts the advertised
-   Sapling tree size grows with each block's note commitment.
-4. Asserts no key material appears in any client→server payload.
+Before you claim support for a real lightwalletd-compatible wallet, deploy a
+Testnet stack as in [Deploying Zinder](deploying.md), expose it as in
+[Exposing Zinder over TLS](exposing-over-tls.md), and point the wallet at the
+compatibility endpoint. Check each of these with every runtime's `/readyz`
+ready:
 
-This is a deterministic generic lightwalletd scan contract, not current SDK or
-application certification. Running it under `cargo nextest run --profile=ci`
-is part of every commit.
+1. A new wallet syncs to the advertised tip.
+2. A restored wallet syncs. Tree-state and subtree-root requests at or above
+   the store floor succeed.
+3. `GetAddressUtxosStream` returns the wallet's transparent outputs.
+4. A sent transaction appears in `GetMempoolStream`, then in
+   `GetTransaction` after it is mined.
 
-### End-to-end with a real lightwalletd-compatible client
+## Failure interpretation
 
-Use five terminals and keep all 4 Zinder processes alive. Stopping ingest before
-reader bootstrap is invalid because each reader authenticates every candidate
-pair through live `CanonicalControl`.
+| Message or symptom | Cause | Fix |
+| --- | --- | --- |
+| `set ZINDER_TEST_LIVE=1 plus ZINDER_NETWORK and ZINDER_NODE__* env vars to run live tests` | The live gate is not set. | Export the variables. |
+| `resolving node target from environment` | A `ZINDER_NODE__*` value is missing or invalid. | Fix it as in [Configuration](../reference/configuration.md#environment-variables). |
+| A live test passes in milliseconds | It returned early: the selected network is not one it supports, or its endpoint variable is unset. | Check [How live tests are gated and configured](#how-live-tests-are-gated-and-configured). |
+| `connection refused` or `transport error` | The node is not running, or a port is wrong. | Run the probes in step 2. |
+| `canonical store admission refused` with `store schema version` | A scratch store from an older schema. | Delete the scratch store. |
+| `persisted network ... does not equal requested network` | A store reused across networks, or the wrong `ZINDER_NETWORK`. | Use a separate store per network. |
+| `canonical store RocksDB open ready failed` | Another process holds the store's primary lock. | Stop the other writer. |
+| `nu7_activation_already_reached` in the log | The chain is already past NU7. | Start a fresh node. |
+| The restart test fails, or other tests fail during it | It ran alongside other live tests. | Run it alone, last, after a 6-second wait. |
 
-```bash
-# Terminal 1: canonical writer and live control plane.
-cargo run --release --bin zinder-ingest -- \
-  --config .tmp/regtest.ingest.toml
-```
+## Native capability list
 
-```bash
-# Terminal 2: current-format wallet construction and continuous following.
-cargo run --release --bin zinder-projector -- \
-  --config .tmp/regtest.projector.toml
-```
-
-```bash
-# Terminal 3: immutable native WalletQuery reader.
-cargo run --release --bin zinder-query -- \
-  --config .tmp/regtest.query.toml
-```
-
-```bash
-# Terminal 4: immutable wallet-serving lightwalletd compatibility reader.
-cargo run --release --bin zinder-compat-lightwalletd -- \
-  --config .tmp/regtest.compat.toml
-```
-
-```bash
-# Terminal 5: probe native WalletQuery, then point the legacy wallet or SDK at
-# http://127.0.0.1:9067.
-grpcurl -plaintext \
-  -import-path crates/zinder-proto/proto \
-  -proto zinder/v1/wallet/wallet.proto \
-  -d '{}' 127.0.0.1:9102 \
-  zinder.v1.wallet.WalletQuery/ServerInfo
-
-grpcurl -plaintext -d '{}' 127.0.0.1:9067 \
-  cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo
-```
-
-Require ingest, projector, native query, and compatibility `/readyz` to be ready,
-with no `degraded` dependency, before recording client evidence. Record both native `WalletQuery/ServerInfo`
-and compatibility `GetLightdInfo`; a typed projection-behind or replica-behind
-result is a failed admission for the current sample, not an empty wallet response.
-
-For production Android-wallet claims
-
-- Create-new-wallet bootstrap reaches the compat endpoint's advertised tip
-  without protocol-shape errors.
-- Restore/import and resync flows request tree state and subtree roots inside
-  the complete wallet-serving retained range. Unknown tree-state or
-  subtree-root gaps are release blockers, not acceptable follow-up notes.
-- `GetAddressUtxosStream` is backed by stored transparent output artifacts.
-  Synthetic empty responses, upstream-node fallbacks, and compact-block scans do
-  not satisfy the wallet-serving contract.
-- Pending-transaction UX requires `SendTransaction` and `GetMempoolStream`
-  through the selected endpoint, followed by `GetTransaction` after mining.
-  `GetMempoolTx` remains broader lightwalletd compatibility and is not part of
-  the current Android SDK inventory.
-- Send tests record writer-tip lag at submission time. A success when the writer
-  is outside the wallet expiry window is not production evidence.
-
-Reference comparison points: `zec.rocks` for public lightwalletd behavior and
-`lightwalletd_scan_contract.rs` for the in-process protocol baseline.
-
-## Public native `WalletQuery` contract
-
-`zinder-query` owns the native wallet request types, query API, error mapping,
-gRPC adapter, and standalone serving runtime. It is a first-class external
-protocol surface for native consumers such as Zally and is deployed alongside
-ingest and projector in the wallet-serving topology. Certify it directly
-through its unit and integration tests plus the
-[standalone native WalletQuery smoke](#standalone-native-walletquery-smoke).
-
-`zinder-compat-lightwalletd` is a separate first-class external service that
-translates the lightwalletd protocol. Its parity and wallet certification do
-not replace native WalletQuery contract or live-smoke coverage, and native
-coverage does not replace compatibility certification.
-
-### Capability descriptor
-
-Expected entries (this list is the public contract; treat any drift as a
-breaking change requiring a capability rename). The
-`zinder-proto::integration::capability_docs::testing_runbook_capability_list_mirrors_zinder_capabilities`
-test asserts the list below equals the wallet and explorer rows of the
-[`CAPABILITIES`](../../crates/zinder-proto/src/capabilities.rs) table:
+`testing_runbook_capability_list_mirrors_zinder_capabilities` in
+`crates/zinder-proto/tests/integration/capability_docs.rs` checks that this
+list equals the wallet and explorer rows of the
+[`CAPABILITIES`](../../crates/zinder-proto/src/capabilities.rs) table. The
+[capabilities reference](../reference/capabilities.md) explains each string.
 
 <!-- capability-list:testing-runbook:start -->
 ```text
@@ -1729,172 +832,15 @@ explorer.migration.denominations_v1
 ```
 <!-- capability-list:testing-runbook:end -->
 
-The wallet rows above describe the public native contract advertised by the
-standalone `zinder-query` runtime. The compatibility adapter may consume those
-capabilities internally, but its lightwalletd protocol remains a separately
-certified external surface. Explorer rows belong to the optional
-`zinder-explorer` runtime, which these wallet tiers do not certify.
-
-## Failure interpretation reference
-
-A live test failure is one of these classes. Read the error string before
-debugging code.
-
-| Error fragment | Class | Action |
-| -------------- | ----- | ------ |
-| `set ZINDER_TEST_LIVE=1 plus ZINDER_NETWORK and ZINDER_NODE__* env vars` | Opt-in missing | Add the env vars; not a real failure |
-| `live test allowed only on [ZcashMainnet]` | Mainnet-only gate | Expected on regtest/testnet; refuse to bypass |
-| `live test allowed only on [ZcashTestnet, ZcashMainnet]` | Hosted-network-only gate | Expected on regtest; rerun against testnet or mainnet |
-| `requires ZINDER_NODE__INDEXER_GRPC_ADDR` | Indexer-feature missing | Restart the node with its indexer listener enabled (`ZEBRA_RPC__INDEXER_LISTEN_ADDR` for Zebra, `rpc.indexer_listen_addr` on loopback for Zakura) and add the env var |
-| `connection refused` / `transport error` | Sidecar not running | Restart z3 / verify ports |
-| `chain_epoch.network does not match` | Wrong network | Check `ZINDER_NETWORK` matches the running node |
-| `schema mismatch` | Persisted store from a different schema version | Use a fresh `.tmp/<network>.zinder-store/` directory |
-| `compact_block_range_too_large` / `invalid_block_range` | Real assertion | Treat as a real failure — investigate |
-| `block_not_in_best_chain` from a hash lookup | Reorged out OR never indexed | Check the chain epoch you queried; not necessarily a bug |
-
-If a test that previously passed starts failing, run with
-`RUST_LOG=debug,zinder=trace` and the `--no-capture` flag for live tests:
-
-```bash
-ZINDER_TEST_LIVE=1 ... \
-RUST_LOG=debug,zinder=trace \
-cargo nextest run --profile=ci-live -E 'test(<failing_test>)' \
-  --run-ignored=all --no-capture 2>&1 | tee .tmp/<failing_test>.log
-```
-
-The `.tmp/` directory is `.gitignore`'d for exactly this purpose.
-
-## External certification procedures
-
-Use this table when a change makes a production-readiness or consumer-support
-claim after the default and live-node gates are already green. Each item points
-at the owning detail instead of repeating the full procedure here. Keep evidence
-artifacts in `.tmp/` unless the result changes a durable claim, in which case
-update the referenced architecture or reference page.
-
-| Procedure | Friction | Run shape | Pass condition | Evidence to keep | Owning detail |
-| --- | --- | --- | --- | --- | --- |
-| Full wallet-serving testnet bulk catchup | Medium | Against a synced testnet Zebra, start the checked-in ingest, projector, native query, and compatibility topology with fresh canonical and wallet stores. | Canonical construction reaches READY, the projector publishes the same authenticated fence, both readers open exact canonical/wallet secondary pairs, every `/readyz` endpoint is ready, native `WalletQuery/ServerInfo` reports the admitted tip, and `GetLightdInfo` reports the same non-zero height with `taddrSupport: true`. | Logs and `/readyz` JSON for all four runtimes; `WalletQuery/ServerInfo` and `GetLightdInfo` output; canonical floor/tip; wallet source event sequence and digest. | [Wallet data plane §External Wallet Compatibility Claims](../architecture/wallet-data-plane.md#external-wallet-compatibility-claims), [Chain ingestion §Operation Shape](../architecture/chain-ingestion.md#operation-shape) |
-| Testnet upstream-readiness calibration | Medium | Configure Zebra with `ready_max_blocks_behind = 4`, `ready_max_tip_age = "5m"`, at least 1 live peer, and readiness enforcement on Testnet. Record the local time when each new `bestblockhash` first appears. At every sample, capture Zebra `/ready`, `getblockchaininfo`, and `getblockheader(bestblockhash)` including `time`, plus all Zinder `/readyz` endpoints and the trusted-TLS compatibility route. Cover an ordinary gap long enough to exercise the configured estimator limit, then introduce each upstream failure condition separately. | The header-time-to-local-observation offset accounts for every estimated-lag transition. Across the witnessed ordinary gap below 5 minutes, `blocks == headers`, estimated lag stays within the configured threshold, and the route remains available. Excessive local tip age, actual chain lag, peer loss, incomplete synchronization, and an unavailable health endpoint each drain ingest readiness and appear under `degraded` in native query and compatibility `/readyz` while the route stays available for stored reads, and each clears after the upstream condition clears. If estimated lag exceeds the configured limit before local tip age while the chain is canonically current, the calibration is rejected rather than waived. | Exact Zebra config and image identity; timestamped `/ready`, `getblockchaininfo`, best-header `time`, first local height observation, Zinder readiness, and trusted-TLS samples; derived estimator inputs; consumer progress; intentional-failure start, recovery, and attribution. | [Deploying the wallet-serving container §Failure handling](deploying-wallet-serving.md#failure-handling), [Trusted TLS and ZODL compatibility admission](zodl-trusted-tls-certification.md) |
-| Lightwalletd-compatible wallet bootstrap and restore | Medium | Point a real lightwalletd-compatible wallet or SDK at the testnet compat endpoint. Exercise create-new-wallet first, then restore/import or resync against the same serving store. | Create-new-wallet and restored/resync wallets reach the chain tip when requested tree-state and subtree-root heights are at or above the store floor. Below-floor requests fail only as the documented strict `NOT_FOUND` unsupported-floor case; unknown tree-state or subtree-root gaps are blockers. | Wallet logs, endpoint config diff, wallet-visible height, store floor, requested tree-state/subtree-root heights, `GetAddressUtxosStream` sample. | [External integration: lightwalletd-compatible wallets](#external-integration-lightwalletd-compatible-wallets), [Wallet data plane §External Wallet Compatibility Claims](../architecture/wallet-data-plane.md#external-wallet-compatibility-claims) |
-| Current Zodl send plus mempool | Medium | With the unified `zinder-ingest` loop and mempool surface running, submit a self-send from the exact current app through its selected trusted-TLS compatibility endpoint. | `SendTransaction` returns the expected success mapping. The app's `GetMempoolStream` emits the exact submitted `RawTransaction` before mining, the bytes match the node transaction, wallet scan-back observes confirmation, and restart preserves the result. Traffic attribution shows no bundled-endpoint fallback. | App and compatibility logs, txid-correlated stream digest, matching node transaction digest, mined height, selected endpoint, no-fallback trace, and post-restart app state. | [Trusted TLS and ZODL compatibility admission](zodl-trusted-tls-certification.md), [Wallet data plane §External Wallet Compatibility Claims](../architecture/wallet-data-plane.md#external-wallet-compatibility-claims) |
-| Broader lightwalletd mempool methods | Medium | Exercise every additional mempool RPC named by the compatibility claim, independently of the current Zodl method inventory. | `GetMempoolTx` returns the compact transaction while pending and empties after mining; stream lifecycle behavior matches the pinned lightwalletd contract. | Protocol-client transcript, transaction ID, compact transaction digest, mined height, and before/after responses. | [Wallet data plane §Mempool Snapshot and Subscription](../architecture/wallet-data-plane.md#mempool-snapshot-and-subscription) |
-| Mainnet bounded live sweep | Low when local mainnet is synced | Run the mainnet-only `ci-live` tests against the local operator-hosted Zebra before attempting longer sessions. Prefer targeted filters first, then the full live profile if the node is healthy. | Mainnet-only tests pass on `ZINDER_NETWORK=zcash-mainnet`; non-mainnet tests either pass or skip for the documented reason. No test mutates mainnet state. | Nextest output, Zebra tip height, tested block range, node auth source used. | [T3: Live mainnet](#t3-live-mainnet-operator-hosted-zebra) |
-| Lightwalletd compatibility parity | Medium | Run the same lightwalletd-compatible probes or wallet flow against Zinder and a reference lightwalletd endpoint. Include `GetBlockRange`, transaction lookup, transparent history, UTXO, mempool, and send shapes that the support claim names. | Zinder returns compatible response and error shapes where the lightwalletd contract applies. Any intentional difference is documented against the native contract or compatibility adapter. Hot-path timings stay inside the published budgets. | Per-method request/response summaries, error codes, timing samples, endpoint versions. | [T3: Parity against a reference lightwalletd](#t3-parity-against-a-reference-lightwalletd), [Wallet data plane §Performance and Pagination](../architecture/wallet-data-plane.md#performance-and-pagination) |
-| Public deployment shape | Medium for internal CA, high for public cert | Put TLS in front of `zinder-compat-lightwalletd` with Caddy, nginx, or traefik, forwarding h2c to the local compat process. Use a private CA only for internal pilots; use a publicly trusted cert for public claims. | A real lightwalletd-compatible wallet validation succeeds through TLS, `GetLightdInfo` works through the proxy, public traffic cannot reach plaintext gRPC, `IngestControl`, or ops endpoints, proxy rate limiting is present for public exposure, and `--print-config` plus logs redact secrets. | Proxy config, cert source, endpoint validation logs, `grpcurl` result through TLS, bind-address audit, redacted `--print-config` output. | [Trusted TLS and ZODL compatibility admission](zodl-trusted-tls-certification.md), [Integration surfaces §Lightwalletd Compatibility](../reference/integration-surfaces.md#lightwalletd-compatibility) |
-| Observability and mempool lifecycle semantics | Low | Run `scripts/observability-smoke.sh run` against regtest or a bounded public-network smoke. After it completes, manually query the documented `zinder_mempool_*` series because the smoke report does not yet assert the lifecycle and retention series. Inspect `/readyz`, Prometheus, and Grafana after mempool traffic and one retention pass. | Healthy traffic has no blocking readiness cause; exactly one mempool lifecycle state is active; retained count, floor sequence and age are present; examined-event and examined-encoded-byte histograms reflect bounded retention steps; retention duration uses only the documented closed step outcomes. Withdrawing the mempool hydration gate makes ingest non-ready until a newly certified snapshot at the exact canonical tip and a fresh canonical observation restore it. | `.tmp/observability/reports/latest-readiness.json`, latest readiness Markdown, manual Prometheus query output, Grafana screenshot or panel JSON, service logs. | [Service operations §Health and Readiness](../architecture/service-operations.md#health-and-readiness), [Observability smoke](../../observability/README.md) |
-| Coherent backup, restore, and rolling restart | High until the coherent bundle exists | Produce one authenticated canonical/wallet checkpoint bundle, stop the stack, restore both stores into fresh paths, then start ingest, projector, native query, and compatibility in ownership order. Restart compatibility, query, projector, and ingest separately while the source advances. | The restored stores carry one matching canonical event fence and wallet digest; all owners fail closed on mismatches; both readers publish only an admitted wallet-serving pair; the 10,000-block tail reaches ready within 15 minutes; later restarts preserve continuous following. An ad hoc copy of independently timed RocksDB directories is not evidence. | Bundle manifest and digests, restore duration, tail range, source and restored fences, restart logs, all four `/readyz` responses, native `WalletQuery/ServerInfo` after every restart, compatibility `GetLightdInfo` after every restart, and second-owner failure output. | [ADR-0035 §Recovery boundary](../adrs/0035-canonical-storage-topologies.md#recovery-boundary), [Service operations §Recovery](../architecture/service-operations.md#recovery) |
-| Long soak | High | Run ingest, projector, native query, and compatibility for several hours or longer while scraping every runtime and exercising native and compatibility wallet reads, mempool streams, and transaction submission. | No unexplained readiness flaps; canonical, projection, and wallet-serving lag stay bounded; cursor-retention and RocksDB alerts stay quiet; memory growth is explainable; and restart/shutdown is clean. | Metrics scrape and readiness samples for all four runtimes, native `WalletQuery/ServerInfo` samples, compatibility `GetLightdInfo` samples, process logs, memory/RSS samples, and final restart result. | [Service operations §Validation Tiers](../architecture/service-operations.md#validation-tiers), [Wallet data plane §Performance and Pagination](../architecture/wallet-data-plane.md#performance-and-pagination) |
-| Certification evidence manifest | Low | Before declaring a production-ready support claim, collect the commands, versions, network, node tip, consumer versions, and artifact paths from the rows above into one file under `.tmp/production-readiness/<run-id>/manifest.md` or `.json`. | A reviewer can replay the certification story without chat history: every claimed consumer, network, command, binary version, and evidence artifact has a path and pass/fail result. | Manifest file, command transcript, commit SHA, binary versions, Zebra version and tip height, consumer versions. | This runbook |
-
-## Production release certification checklist
-
-Use this checklist only when the goal is a production-readiness or release claim.
-For ordinary code changes, use the shorter pre-flight checklist below.
-
-- [ ] Default validation gate is green.
-- [ ] `cargo nextest run --profile=ci-parity` is green and its report is archived
-      with the release evidence.
-- [ ] T3 regtest is green on both the Zebra and the Zakura leg, with indexer
-      gRPC enabled, and both legs of the lightwalletd parity workflow are green
-      on the release commit (see
-      [Releasing Zinder](releasing.md#publish-a-release)).
-- [ ] Testnet live sweep is green for every wallet-serving claim in the release.
-- [ ] Testnet upstream-readiness calibration records the best-header timestamp
-      and first local height observation, then proves the configured estimator
-      allowance prevents witnessed normal-gap flaps while peer loss,
-      incomplete sync, actual lag, tips older than 5 minutes, and an unavailable
-      Zebra health endpoint each fail closed and recover independently.
-- [ ] Mainnet read-only targeted tests are green when the release makes a mainnet
-      readiness claim.
-- [ ] Full wallet-serving construction and following phase evidence exists for the target
-      network, including store floor, tip height, `/readyz`, and reader secondary
-      state.
-- [ ] Zodl or Android SDK bootstrap, restore/resync, transparent output, send,
-      and mempool evidence is green when claiming lightwalletd-compatible wallet
-      support.
-- [ ] Public deployment audit is green: TLS on the public wallet endpoint, no
-      public plaintext gRPC, no public ops endpoints, no public `IngestControl`,
-      rate limiting present, filesystem permissions restricted, and secrets
-      redacted in logs and `--print-config`.
-- [ ] Observability smoke or calibration report exists, with zero traffic-blocking
-      readiness causes and warning causes classified separately.
-- [ ] Backup restore and restart evidence exists for the store used in the claim.
-- [ ] Long soak evidence exists when the release touches ingestion, storage,
-      mempool, compatibility serving, or public deployment shape.
-- [ ] A release evidence manifest points to every command, version, network,
-      artifact, and pass/fail result used for the claim.
-
-## Pre-flight checklist (before declaring a change shipped)
-
-- [ ] Default validation gate green (`cargo fmt`/`cargo clippy`/`cargo nextest run --profile=ci`/`cargo nextest run --profile=ci-perf`/`cargo doc`/`cargo deny`/`scripts/runbook-lint.sh`).
-- [ ] If the change touched a consumer-facing wire contract or compatibility
-      adapter: `cargo nextest run --profile=ci-parity`.
-- [ ] Live regtest sweep green (`ci-live` profile against z3, with indexer
-      gRPC env), including
-      [Reorg sweep](#t3-reorg-sweep),
-      [Network upgrade boundary crossing](#t3-network-upgrade-boundary-crossing),
-      and [Writer fencing and crash recovery](#t3-writer-fencing-and-crash-recovery)
-      where applicable. Hosted-network-only gates are expected to refuse regtest
-      and should be rerun against testnet or mainnet.
-- [ ] If the change touched storage commit, schema, or multi-process semantics:
-      the [Writer fencing and crash recovery](#t3-writer-fencing-and-crash-recovery)
-      `kill -9` and second-writer recipes have been replayed locally.
-- [ ] If the change touched a streamed gRPC surface or the
-      `zinder-compat-lightwalletd` adapter: the
-      [Concurrent readers and stream cancellation](#concurrent-readers-and-stream-cancellation)
-      tests have been replayed.
-- [ ] If the change touched the lightwalletd wire surface: a manual end-to-end
-      run with a lightwalletd-compatible wallet or the Android SDK against
-      `zinder-compat-lightwalletd`.
-- [ ] If the change touched the public native `WalletQuery` contract: its unit
-      and integration tests plus the standalone live contract smoke are green,
-      and the capability descriptor reflects every added, removed, or renamed
-      capability. Run compatibility parity separately when the change also
-      affects the lightwalletd adapter or shared behavior it exposes.
-- [ ] If the change altered storage byte layout: `cargo mutants` against
-      `canonical_store/{live_commit,live_replacement,event_lifecycle}.rs` is a
-      healthy plus coverage run via `cargo llvm-cov`.
-- [ ] If the change altered readiness, metrics, backup, restart, or deployment
-      configuration: run the relevant observability or deployment row from the
-      ecosystem validation queue.
-- [ ] If the change is mainnet-relevant: run the targeted mainnet live tests
-      against an operator-hosted Zebra and record the evidence path.
-
 ## Runbook self-test
 
-This runbook is operator-facing, dense, and changes often. Three classes
-of drift are easy to introduce and expensive to discover during an
-incident: a typo in a fenced shell command, a profile name that no
-longer matches `.config/nextest.toml`, or a capability list that has
-fallen behind the `CAPABILITIES` table. Each is caught by a piece of the
-standard validation gate.
+`scripts/runbook-lint.sh docs/runbooks/testing.md` parses every fenced `bash`
+block in this file with `bash -n`. It is part of the default gate and the
+`dependency hygiene` CI job. It checks syntax only; it does not run the
+blocks. Run it after you edit this file, and confirm it reports a non-zero
+block count.
 
-| Drift class | How it's caught | Where |
-| ----------- | --------------- | ----- |
-| Bash syntax in a fenced `bash` block | `scripts/runbook-lint.sh` runs every block through `bash -n`. Wired into the default validation gate above and into the `dependency hygiene` CI job. | [`scripts/runbook-lint.sh`](../../scripts/runbook-lint.sh) |
-| Profile-name drift between this runbook and `.config/nextest.toml` | `testing_runbook_profile_names_exist_in_nextest_toml` asserts every `--profile=<name>` quoted in this file resolves to a real `[profile.<name>]` section. | [`crates/zinder-proto/tests/integration/capability_docs.rs`](../../crates/zinder-proto/tests/integration/capability_docs.rs) |
-| Default-filter drift between this runbook and `.config/nextest.toml` | `testing_runbook_default_filter_mirrors_nextest_toml` asserts the quoted expression matches the canonical one. | Same file. |
-| Capability-list drift between this runbook and the `CAPABILITIES` table | `testing_runbook_capability_list_mirrors_zinder_capabilities` asserts the list under the `<!-- capability-list:testing-runbook -->` markers matches the wallet and explorer rows of the table. | Same file. |
-
-All four checks ship with the default `cargo nextest run --profile=ci`
-invocation; no separate runbook-self-test profile is needed. When you
-add a new fenced command, profile, or capability, the corresponding
-check fires on the next CI run if the runbook and code diverge.
-
-To extend the self-test (for example, to gate a new profile name or a
-new doc embedded constant), add an entry to
-`RUNBOOK_REFERENCED_PROFILES` (or a peer constant) in
-[`capability_docs.rs`](../../crates/zinder-proto/tests/integration/capability_docs.rs)
-and let the existing assertion shape catch drift. The runbook-lint
-script needs no changes for new blocks — it discovers them by markdown
-fence syntax.
-
-## Cross-references
-
-- [ADR-0003: Epoch-bound storage access with RocksDB secondaries](../adrs/0003-canonical-storage-access-boundary.md) — secondary catchup and writer-status semantics that some live tests verify.
-- [ADR-0006: IngestControl transport security](../adrs/0006-ingest-control-transport-security.md) — the bearer-token contract referenced in the external-integration conventions.
-- [Service operations](../architecture/service-operations.md) — the operator-facing deployment story; the external-integration recipes here use its single-host, single-store conventions. For multi-host or multi-process deployments, follow that doc's recipes instead.
-- [Wallet data plane](../architecture/wallet-data-plane.md) — the wire surface the external integration tests exercise.
-- [Integration surfaces](../reference/integration-surfaces.md) — the consumer-facing support boundaries this runbook certifies.
-- [Observability smoke](../../observability/README.md) — the local metrics and readiness harness; it records restore as blocked until a coherent canonical-plus-wallet bundle exists.
+The tests in `crates/zinder-proto/tests/integration/capability_docs.rs` also
+check this file on every `ci` run: the quoted `default-filter` must match
+`.config/nextest.toml`, every profile in `RUNBOOK_REFERENCED_PROFILES` must
+exist and appear here, and the capability list must match the code.

@@ -1,7 +1,7 @@
 //! Background task that drives `cause=upstream_not_ready` readiness from
 //! [`NodeSource::poll_upstream_health`].
 //!
-//! Spawned once at writer startup per [ADR-0015 §Upstream sync detection].
+//! Spawned once at writer startup per [ADR-0009 §Upstream sync detection].
 //! The task is independent of the ingest loop: probe failures never cancel
 //! the loop and never propagate beyond a warning log. The probe owns the
 //! [`ReadinessInput::NodeSource`] input of the writer's
@@ -19,8 +19,8 @@
 //! probe publishes only while the endpoint it probed is still active, so only
 //! the active endpoint updates the input.
 //!
-//! [ADR-0015 §Upstream sync detection]:
-//!     ../../../docs/adrs/0015-phase-driven-ingest.md#upstream-sync-detection
+//! [ADR-0009 §Upstream sync detection]:
+//!     ../../../docs/adrs/0009-ingest-lifecycle-and-construction.md#upstream-sync-detection
 
 use std::{sync::Arc, time::Duration};
 

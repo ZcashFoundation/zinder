@@ -87,7 +87,7 @@ pub struct UpstreamTip {
 ///
 /// Folds the epoch identity, the reorg-vs-replay tips, the upstream view, and
 /// the materialized-view status into one shape so a consumer reads chain state the
-/// same way on every surface. See ADR-0011.
+/// same way on every surface. See ADR-0019.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChainView {
     /// Chain epoch this response was produced from.
@@ -137,7 +137,7 @@ pub struct BlockId {
 /// Visible-tip block identity response bound to one chain epoch.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct VisibleTipBlockResponse {
-    /// Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+    /// Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
     #[prost(message, optional, tag = "1")]
     pub chain_view: ::core::option::Option<ChainView>,
     /// Visible-tip block in this chain epoch.
@@ -156,7 +156,7 @@ pub struct VisibleTipBlockRequest {
 /// block at the chain epoch's settlement watermark.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SettledTipBlockResponse {
-    /// Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+    /// Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
     #[prost(message, optional, tag = "1")]
     pub chain_view: ::core::option::Option<ChainView>,
     /// Block at chain_view.chain_epoch.settled_tip.height.
@@ -211,7 +211,7 @@ pub struct BlockSelectorRequest {
 /// Block-identity resolver response bound to one chain epoch.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlockIdResponse {
-    /// Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+    /// Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
     #[prost(message, optional, tag = "1")]
     pub chain_view: ::core::option::Option<ChainView>,
     /// Resolved block identity in the canonical best chain.
@@ -254,7 +254,7 @@ pub struct BlockHeader {
 /// Block-header read response bound to one chain epoch.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlockHeaderResponse {
-    /// Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+    /// Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
     #[prost(message, optional, tag = "1")]
     pub chain_view: ::core::option::Option<ChainView>,
     /// Block-header read-model value at the resolved selector.
@@ -420,7 +420,7 @@ pub struct CompactBlockRequest {
 /// Single compact block response bound to one chain epoch.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CompactBlockResponse {
-    /// Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+    /// Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
     #[prost(message, optional, tag = "1")]
     pub chain_view: ::core::option::Option<ChainView>,
     /// Compact block at the requested height.
@@ -465,7 +465,7 @@ pub struct FullBlockRequest {
 /// Single full block response bound to one chain epoch.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FullBlockResponse {
-    /// Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+    /// Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
     #[prost(message, optional, tag = "1")]
     pub chain_view: ::core::option::Option<ChainView>,
     /// Full block at the requested height.
@@ -489,7 +489,7 @@ pub struct FullBlocksInRangeRequest {
 /// Streamed full block range chunk bound to one chain epoch.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FullBlocksInRangeChunk {
-    /// Cross-plane chain-state envelope for this chunk (ADR-0011, field tag 1).
+    /// Cross-plane chain-state envelope for this chunk (ADR-0019, field tag 1).
     #[prost(message, optional, tag = "1")]
     pub chain_view: ::core::option::Option<ChainView>,
     /// Full block at the next requested height.
@@ -624,7 +624,7 @@ pub mod compact_blocks_in_range_chunk {
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Body {
         /// Leading header carrying the chain epoch that answers the entire range
-        /// (ADR-0011). Sent once, before any item.
+        /// (ADR-0019). Sent once, before any item.
         #[prost(message, tag = "1")]
         Header(super::ChainView),
         /// Compact block at the next requested height. Sent after the header.
@@ -658,7 +658,7 @@ pub struct LatestTreeStateCheckpointRequest {
 /// Checkpoint tree-state response bound to one chain epoch.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TreeStateResponse {
-    /// Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+    /// Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
     #[prost(message, optional, tag = "1")]
     pub chain_view: ::core::option::Option<ChainView>,
     /// Height this tree state belongs to.
@@ -749,7 +749,7 @@ pub struct SubtreeRoot {
 /// Subtree-root range response bound to one chain epoch.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SubtreeRootsResponse {
-    /// Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+    /// Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
     #[prost(message, optional, tag = "1")]
     pub chain_view: ::core::option::Option<ChainView>,
     /// Shielded protocol returned.
@@ -977,7 +977,7 @@ pub struct ChainEventEnvelope {
     /// Monotonic sequence in the chain-event stream.
     #[prost(uint64, tag = "2")]
     pub event_sequence: u64,
-    /// Cross-plane chain-state envelope visible after this event (ADR-0011,
+    /// Cross-plane chain-state envelope visible after this event (ADR-0019,
     /// field tag 3 on this message). `chain_view.chain_epoch` is the epoch
     /// visible after the event; `chain_view.chain_epoch.settled_tip.height`
     /// carries the settled tip height that was true for this event.
@@ -1128,7 +1128,7 @@ pub struct MempoolSnapshotRequest {
 /// Snapshot response bound to one chain epoch.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MempoolSnapshotResponse {
-    /// Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+    /// Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
     #[prost(message, optional, tag = "1")]
     pub chain_view: ::core::option::Option<ChainView>,
     /// Opaque `MempoolEvents` `after_cursor` value anchored at the moment the
@@ -1345,7 +1345,7 @@ pub mod transparent_unspent_outputs_chunk {
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Body {
         /// Leading header carrying the chain epoch pinned for the entire stream
-        /// (ADR-0011). Sent once, before any item.
+        /// (ADR-0019). Sent once, before any item.
         #[prost(message, tag = "1")]
         Header(super::ChainView),
         /// One unspent transparent output. Sent after the header.
@@ -1371,7 +1371,7 @@ pub struct TransparentOutpointSpendStatusRequest {
 /// Spend status of every requested outpoint, read at one chain epoch.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TransparentOutpointSpendStatusResponse {
-    /// Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+    /// Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
     /// Every entry was read at `chain_view.chain_epoch`.
     #[prost(message, optional, tag = "1")]
     pub chain_view: ::core::option::Option<ChainView>,
@@ -1454,7 +1454,7 @@ pub struct ChainValuePoolsAtTipRequest {}
 /// Wallet-plane response for chain-wide value-pool totals.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ChainValuePoolsAtTipResponse {
-    /// Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+    /// Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
     /// Visible to Zinder when the upstream value-pool read was answered.
     #[prost(message, optional, tag = "1")]
     pub chain_view: ::core::option::Option<ChainView>,
@@ -1533,7 +1533,7 @@ pub mod transparent_address_tx_ids_chunk {
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Body {
         /// Leading header carrying the chain epoch pinned for the entire stream
-        /// (ADR-0011). Sent once, before any item.
+        /// (ADR-0019). Sent once, before any item.
         #[prost(message, tag = "1")]
         Header(super::ChainView),
         /// One indexed transparent-address tx-history entry. Sent after the header.

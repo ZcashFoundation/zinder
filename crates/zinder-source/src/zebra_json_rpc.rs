@@ -530,10 +530,10 @@ impl ZebraJsonRpcSource {
     /// trait method [`NodeSource::poll_upstream_health`] hits Zebra's
     /// `/ready` endpoint; without it, the same method falls back to
     /// `getblockchaininfo.verificationprogress` per
-    /// [ADR-0015 §Upstream sync detection].
+    /// [ADR-0009 §Upstream sync detection].
     ///
-    /// [ADR-0015 §Upstream sync detection]:
-    ///     ../../../docs/adrs/0015-phase-driven-ingest.md#upstream-sync-detection
+    /// [ADR-0009 §Upstream sync detection]:
+    ///     ../../../docs/adrs/0009-ingest-lifecycle-and-construction.md#upstream-sync-detection
     #[must_use]
     pub fn with_health_config(mut self, health_config: Option<NodeHealthConfig>) -> Self {
         self.ready_http_client = health_config
@@ -2260,7 +2260,7 @@ fn is_already_queued_message(message: &str) -> bool {
 /// Maps the upstream rejection message to a typed reason.
 ///
 /// The submitter is the only crate allowed to peek at Zebra's free-form
-/// message strings (per ADR-0004); downstream consumers match on the typed
+/// message strings (per ADR-0006); downstream consumers match on the typed
 /// [`BroadcastRejectionReason`] instead.
 fn classify_rejection_reason(message: &str) -> BroadcastRejectionReason {
     let lowercased_message = message.to_ascii_lowercase();

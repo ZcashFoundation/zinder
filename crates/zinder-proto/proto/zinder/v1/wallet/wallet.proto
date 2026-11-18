@@ -88,7 +88,7 @@ message UpstreamTip {
 //
 // Folds the epoch identity, the reorg-vs-replay tips, the upstream view, and
 // the materialized-view status into one shape so a consumer reads chain state the
-// same way on every surface. See ADR-0011.
+// same way on every surface. See ADR-0019.
 message ChainView {
   // Chain epoch this response was produced from.
   ChainEpoch chain_epoch = 1;
@@ -144,7 +144,7 @@ message BlockId {
 
 // Visible-tip block identity response bound to one chain epoch.
 message VisibleTipBlockResponse {
-  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  // Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
   ChainView chain_view = 1;
 
   // Visible-tip block in this chain epoch.
@@ -161,7 +161,7 @@ message VisibleTipBlockRequest {
 // Settled-tip block metadata response bound to one chain epoch. Returns the
 // block at the chain epoch's settlement watermark.
 message SettledTipBlockResponse {
-  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  // Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
   ChainView chain_view = 1;
 
   // Block at chain_view.chain_epoch.settled_tip.height.
@@ -205,7 +205,7 @@ message BlockSelectorRequest {
 
 // Block-identity resolver response bound to one chain epoch.
 message BlockIdResponse {
-  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  // Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
   ChainView chain_view = 1;
 
   // Resolved block identity in the canonical best chain.
@@ -246,7 +246,7 @@ message BlockHeader {
 
 // Block-header read response bound to one chain epoch.
 message BlockHeaderResponse {
-  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  // Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
   ChainView chain_view = 1;
 
   // Block-header read-model value at the resolved selector.
@@ -400,7 +400,7 @@ message CompactBlockRequest {
 
 // Single compact block response bound to one chain epoch.
 message CompactBlockResponse {
-  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  // Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
   ChainView chain_view = 1;
 
   // Compact block at the requested height.
@@ -442,7 +442,7 @@ message FullBlockRequest {
 
 // Single full block response bound to one chain epoch.
 message FullBlockResponse {
-  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  // Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
   ChainView chain_view = 1;
 
   // Full block at the requested height.
@@ -464,7 +464,7 @@ message FullBlocksInRangeRequest {
 
 // Streamed full block range chunk bound to one chain epoch.
 message FullBlocksInRangeChunk {
-  // Cross-plane chain-state envelope for this chunk (ADR-0011, field tag 1).
+  // Cross-plane chain-state envelope for this chunk (ADR-0019, field tag 1).
   ChainView chain_view = 1;
 
   // Full block at the next requested height.
@@ -581,7 +581,7 @@ message TransactionStatusResponse {
 message CompactBlocksInRangeChunk {
   oneof body {
     // Leading header carrying the chain epoch that answers the entire range
-    // (ADR-0011). Sent once, before any item.
+    // (ADR-0019). Sent once, before any item.
     ChainView header = 1;
 
     // Compact block at the next requested height. Sent after the header.
@@ -612,7 +612,7 @@ message LatestTreeStateCheckpointRequest {
 
 // Checkpoint tree-state response bound to one chain epoch.
 message TreeStateResponse {
-  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  // Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
   ChainView chain_view = 1;
 
   // Height this tree state belongs to.
@@ -713,7 +713,7 @@ message SubtreeRoot {
 
 // Subtree-root range response bound to one chain epoch.
 message SubtreeRootsResponse {
-  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  // Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
   ChainView chain_view = 1;
 
   // Shielded protocol returned.
@@ -943,7 +943,7 @@ message ChainEventEnvelope {
   // Monotonic sequence in the chain-event stream.
   uint64 event_sequence = 2;
 
-  // Cross-plane chain-state envelope visible after this event (ADR-0011,
+  // Cross-plane chain-state envelope visible after this event (ADR-0019,
   // field tag 3 on this message). `chain_view.chain_epoch` is the epoch
   // visible after the event; `chain_view.chain_epoch.settled_tip.height`
   // carries the settled tip height that was true for this event.
@@ -1095,7 +1095,7 @@ message MempoolSnapshotRequest {
 
 // Snapshot response bound to one chain epoch.
 message MempoolSnapshotResponse {
-  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  // Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
   ChainView chain_view = 1;
 
   // Opaque `MempoolEvents` `after_cursor` value anchored at the moment the
@@ -1282,7 +1282,7 @@ message TransparentUnspentOutput {
 message TransparentUnspentOutputsChunk {
   oneof body {
     // Leading header carrying the chain epoch pinned for the entire stream
-    // (ADR-0011). Sent once, before any item.
+    // (ADR-0019). Sent once, before any item.
     ChainView header = 1;
 
     // One unspent transparent output. Sent after the header.
@@ -1306,7 +1306,7 @@ message TransparentOutpointSpendStatusRequest {
 
 // Spend status of every requested outpoint, read at one chain epoch.
 message TransparentOutpointSpendStatusResponse {
-  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  // Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
   // Every entry was read at `chain_view.chain_epoch`.
   ChainView chain_view = 1;
 
@@ -1379,7 +1379,7 @@ message ChainValuePoolsAtTipRequest {}
 
 // Wallet-plane response for chain-wide value-pool totals.
 message ChainValuePoolsAtTipResponse {
-  // Cross-plane chain-state envelope for this response (ADR-0011, field tag 1).
+  // Cross-plane chain-state envelope for this response (ADR-0019, field tag 1).
   // Visible to Zinder when the upstream value-pool read was answered.
   ChainView chain_view = 1;
 
@@ -1455,7 +1455,7 @@ message TransparentAddressTxId {
 message TransparentAddressTxIdsChunk {
   oneof body {
     // Leading header carrying the chain epoch pinned for the entire stream
-    // (ADR-0011). Sent once, before any item.
+    // (ADR-0019). Sent once, before any item.
     ChainView header = 1;
 
     // One indexed transparent-address tx-history entry. Sent after the header.

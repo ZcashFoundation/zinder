@@ -6,7 +6,7 @@
 //! allocation functions. Glibc malloc makes
 //! concurrent threads share a few arena locks, and a deployment that caps the
 //! arena count serializes Zinder's parallel storage reads on them. See
-//! [ADR-0044](../../../docs/adrs/0044-service-binaries-allocate-through-jemalloc.md).
+//! [ADR-0005](../../../docs/adrs/0005-bounded-process-memory.md).
 
 /// Global allocator for a Zinder service binary.
 ///

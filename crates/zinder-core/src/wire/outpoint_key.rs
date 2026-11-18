@@ -8,7 +8,7 @@
 //! Materialized-view store boundaries build outpoint keys through this encoder rather than
 //! inlining `outpoint.transaction_id.as_bytes()` with
 //! `outpoint.output_index.to_be_bytes()`, keeping the 36-byte layout in one
-//! place per the key-codec convention in ADR-0017.
+//! place per the key-codec convention in ADR-0020.
 
 use crate::TransparentOutPoint;
 use crate::wire::{

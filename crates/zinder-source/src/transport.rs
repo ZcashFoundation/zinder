@@ -14,7 +14,7 @@
 //! call sites. New Zebra-facing adapters add a factory here and consume
 //! it.
 //!
-//! See [ADR-0019](../../../docs/adrs/0019-transport-policy-ownership.md)
+//! See [ADR-0007](../../../docs/adrs/0007-node-failure-recovery-and-transport-policy.md)
 //! for the boundary and policy decisions this module enforces.
 
 use std::future::Future;
@@ -51,7 +51,7 @@ pub const ZEBRA_REBUILD_THRESHOLD: NonZeroU32 = NonZeroU32::MIN.saturating_add(2
 /// `keep_alive_while_idle(true)` to avoid tonic issue #258
 /// (`ENHANCE_YOUR_CALM` from servers that don't permit
 /// keep-alive-without-calls); the streams are always active, so pings
-/// flow regardless. See ADR-0019.
+/// flow regardless. See ADR-0007.
 const ZEBRA_INDEXER_HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Maximum time a single HTTP/2 keep-alive ping waits for an ACK before
@@ -138,7 +138,7 @@ pub struct ZebraIndexerChannelOptions {
 /// Opens a long-lived gRPC channel to a Zebra Indexer endpoint.
 ///
 /// The returned [`Channel`] carries the HTTP/2 + TCP keep-alive policy
-/// mandated by ADR-0019. Callers wrap it in the generated Indexer client
+/// mandated by ADR-0007. Callers wrap it in the generated Indexer client
 /// (`IndexerClient::new(channel)`). Streaming sources open a fresh channel on
 /// every subscription; [`ResilientClient`] does not wrap indexer channels.
 ///
@@ -320,7 +320,7 @@ type ClientRebuilder<C> =
 ///
 /// The wrapper is `Clone`: every clone shares the same self-healing
 /// state through an `Arc`, so source structs that derive `Clone` keep
-/// doing so without further work. See ADR-0019.
+/// doing so without further work. See ADR-0007.
 pub struct ResilientClient<C> {
     state: Arc<ResilientState<C>>,
 }

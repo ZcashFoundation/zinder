@@ -34,7 +34,7 @@ pub struct ServerInfoRequest {}
 /// Server descriptor response.
 ///
 /// Carries the standard `ExplorerFreshness` envelope per
-/// [ADR-0011](../../../../../docs/adrs/0011-explorer-freshness-envelope.md)
+/// [ADR-0019](../../../../../docs/adrs/0019-explorer-plane.md)
 /// so consumers can read the upstream tip and capability versions from any
 /// explorer response, including the bootstrap call. Without this, the upstream
 /// tip (which rides on `ExplorerFreshness.chain_view.upstream_tip`) would only
@@ -54,7 +54,7 @@ pub struct ServerInfoResponse {
 /// the structured `reason` or render `human_reason` verbatim. The reason
 /// string comes from the canonical registry in
 /// `crates/zinder-core/src/explorer_reasons.rs`; the contract is defined in
-/// [ADR-0011](../../../../../docs/adrs/0011-explorer-freshness-envelope.md).
+/// [ADR-0019](../../../../../docs/adrs/0019-explorer-plane.md).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UnavailableField {
     /// Dotted path matching the response field hierarchy, e.g.
@@ -74,7 +74,7 @@ pub struct UnavailableField {
 /// The chain-state axes (epoch, tips, upstream, materialized views) live on
 /// `chain_view`; this message keeps only the metadata that genuinely varies
 /// per call. Defined in
-/// [ADR-0011](../../../../../docs/adrs/0011-explorer-freshness-envelope.md);
+/// [ADR-0019](../../../../../docs/adrs/0019-explorer-plane.md);
 /// every `ExplorerQuery` RPC's response carries this field tag 1 first so
 /// consumers can read `response.freshness` unconditionally.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -152,7 +152,7 @@ pub struct TransactionComponentCounts {
 ///
 /// Parsed once by `zinder_source::parse_transaction_public_facts` from raw
 /// transaction bytes plus the node-discovered network upgrade table per
-/// [ADR-0010](../../../../../docs/adrs/0010-transaction-public-facts.md).
+/// [ADR-0018](../../../../../docs/adrs/0018-transaction-facts-status-and-broadcast.md).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransactionPublicFacts {
     /// Canonical Zcash transaction identifier in RPC byte order (64 lowercase
@@ -2505,7 +2505,7 @@ pub struct TransparentAddressActivityRecord {
     /// Set only when `prevout_resolution_status == Resolved` AND every
     /// prevout the transaction reads was successfully resolved. Partial
     /// resolution leaves this field unset rather than reporting a half-
-    /// summed value as if it were complete (see ADR-0018).
+    /// summed value as if it were complete (see ADR-0014).
     #[prost(sint64, optional, tag = "3")]
     pub net_value_zat: ::core::option::Option<i64>,
     #[prost(uint32, tag = "4")]
@@ -3075,7 +3075,7 @@ pub struct OverviewSnapshotRequest {
 /// `visible_tip` across responses to detect snapshot boundary crosses.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OverviewSnapshotResponse {
-    /// Cross-cutting envelope (field tag 1 per ADR-0011). Single freshness
+    /// Cross-cutting envelope (field tag 1 per ADR-0019). Single freshness
     /// for the entire bundle.
     #[prost(message, optional, tag = "1")]
     pub freshness: ::core::option::Option<ExplorerFreshness>,
@@ -4177,7 +4177,7 @@ pub mod explorer_query_client {
             self.inner.unary(req, path, codec).await
         }
         /// Classifies a raw user input string into typed search candidates per
-        /// [ADR-0012](../../../../../docs/adrs/0012-typed-explorer-search-and-privacy-refusal.md).
+        /// [ADR-0019](../../../../../docs/adrs/0019-explorer-plane.md).
         /// Shielded receivers, viewing keys, and shielded receivers inside
         /// unified addresses route to the typed `NotPubliclyIndexable` arm and
         /// never reach a storage read. Capability: `explorer.search_v1`.
@@ -5189,7 +5189,7 @@ pub mod explorer_query_server {
             tonic::Status,
         >;
         /// Classifies a raw user input string into typed search candidates per
-        /// [ADR-0012](../../../../../docs/adrs/0012-typed-explorer-search-and-privacy-refusal.md).
+        /// [ADR-0019](../../../../../docs/adrs/0019-explorer-plane.md).
         /// Shielded receivers, viewing keys, and shielded receivers inside
         /// unified addresses route to the typed `NotPubliclyIndexable` arm and
         /// never reach a storage read. Capability: `explorer.search_v1`.

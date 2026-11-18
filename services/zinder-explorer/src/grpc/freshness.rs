@@ -6,7 +6,7 @@
 //! (refreshed by a background probe) and shares it with every handler through
 //! an [`UpstreamObservationCache`] handle.
 //!
-//! Per ADR-0011 the axis is optional: a response that fires before the first
+//! Per ADR-0019 the axis is optional: a response that fires before the first
 //! probe completes carries `chain_view.upstream_tip = None`. Consumers treat
 //! absence as "unknown", not zero.
 
