@@ -33,6 +33,12 @@ const REFRESH_INTERVAL: Duration = Duration::from_mins(1);
 /// failure instead of each calling an unreachable query.
 const FIRST_FETCH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Longest wait for one fetch from the wallet query.
+///
+/// The wallet channel sets keepalives but no request deadline, so a stalled
+/// query would otherwise hold every request that needs a fetch.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The last activation table fetched from the wallet query.
 #[derive(Clone)]
 pub(crate) struct NetworkUpgradeActivationsCache {
@@ -78,7 +84,7 @@ impl NetworkUpgradeActivationsCache {
 
     /// Returns the cached table until its refresh is due, and otherwise the
     /// table `fetch` returns, falling back to the cached one when `fetch`
-    /// fails.
+    /// fails or does not finish within [`FETCH_TIMEOUT`].
     async fn current_or_fetch<Fetch, Fetched>(
         &self,
         fetch: Fetch,
@@ -109,7 +115,7 @@ impl NetworkUpgradeActivationsCache {
             CacheState::Empty | CacheState::Failed { .. } => {
                 // The lock stays held, so requests that arrive meanwhile wait
                 // for this fetch instead of starting their own.
-                let fetched = fetch().await;
+                let fetched = within_fetch_timeout(fetch()).await;
                 let (next_state, outcome) = match fetched {
                     Ok(activations) => {
                         let activations = Arc::new(activations);
@@ -133,7 +139,7 @@ impl NetworkUpgradeActivationsCache {
     }
 
     /// Replaces `cached` with the table `fetch` returns, or keeps serving it
-    /// when `fetch` fails.
+    /// when `fetch` fails or does not finish within [`FETCH_TIMEOUT`].
     async fn refresh<Fetch, Fetched>(
         &self,
         cached: Arc<NetworkUpgradeActivations>,
@@ -143,7 +149,7 @@ impl NetworkUpgradeActivationsCache {
         Fetch: FnOnce() -> Fetched,
         Fetched: Future<Output = Result<NetworkUpgradeActivations, Status>>,
     {
-        match fetch().await {
+        match within_fetch_timeout(fetch()).await {
             Ok(activations) => {
                 let activations = Arc::new(activations);
                 *self.state.lock().await = CacheState::fetched(Arc::clone(&activations));
@@ -171,6 +177,23 @@ impl CacheState {
             refresh_at: Instant::now() + REFRESH_INTERVAL,
         }
     }
+}
+
+/// Fails `fetch` as an unreachable wallet query when it does not finish
+/// within [`FETCH_TIMEOUT`].
+async fn within_fetch_timeout<Fetched>(fetch: Fetched) -> Result<NetworkUpgradeActivations, Status>
+where
+    Fetched: Future<Output = Result<NetworkUpgradeActivations, Status>>,
+{
+    tokio::time::timeout(FETCH_TIMEOUT, fetch)
+        .await
+        .unwrap_or_else(|_elapsed| {
+            Err(ExplorerError::upstream_unreachable(format!(
+                "WalletQuery.NetworkUpgradeActivations did not answer within {} seconds",
+                FETCH_TIMEOUT.as_secs()
+            ))
+            .into())
+        })
 }
 
 async fn fetch_network_upgrade_activations(
@@ -387,6 +410,35 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(sapling_height(&retried), Some(BlockHeight::new(1)));
         Ok(())
+    }
+
+    /// A refresh that never answers falls back to the cached table once
+    /// [`FETCH_TIMEOUT`] passes.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_refresh_serves_the_cached_table() -> Result<(), Status> {
+        let cache = NetworkUpgradeActivationsCache::new(Network::ZcashRegtest);
+        cache.current_or_fetch(|| async { table(1) }).await?;
+        tokio::time::advance(REFRESH_INTERVAL).await;
+        let started = Instant::now();
+
+        let stale = cache.current_or_fetch(std::future::pending).await?;
+
+        assert_eq!(started.elapsed(), FETCH_TIMEOUT);
+        assert_eq!(sapling_height(&stale), Some(BlockHeight::new(1)));
+        Ok(())
+    }
+
+    /// A first fetch that never answers fails as an unreachable wallet query
+    /// once [`FETCH_TIMEOUT`] passes, instead of holding the request.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_first_fetch_fails_as_unavailable() {
+        let cache = NetworkUpgradeActivationsCache::new(Network::ZcashRegtest);
+        let started = Instant::now();
+
+        let outcome = cache.current_or_fetch(std::future::pending).await;
+
+        assert_eq!(started.elapsed(), FETCH_TIMEOUT);
+        assert!(matches!(outcome, Err(status) if status.code() == tonic::Code::Unavailable));
     }
 
     #[test]
