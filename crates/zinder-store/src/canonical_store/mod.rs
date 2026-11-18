@@ -646,6 +646,19 @@ pub enum CanonicalStoreError {
         path: PathBuf,
     },
 
+    /// A reader that adopts the writer-admitted network-upgrade schedule
+    /// opened a READY store whose writer has not admitted one yet.
+    ///
+    /// The canonical writer admits its first schedule revision when it opens
+    /// the store, so a reader retries until that admission is visible.
+    #[error(
+        "canonical store {path:?} has no writer-admitted network-upgrade schedule yet; the canonical writer admits one when it opens the store"
+    )]
+    NetworkUpgradeScheduleNotAdmitted {
+        /// Exact READY store path without an admitted schedule.
+        path: PathBuf,
+    },
+
     /// A `RocksDB` operation failed after identity admission.
     #[error("canonical store RocksDB {operation} failed")]
     RocksDbOperation {

@@ -28,8 +28,6 @@
     reason = "Live test names describe the behavior under test."
 )]
 
-use std::sync::Arc;
-
 use eyre::{Result, eyre};
 use zinder_core::{
     BlockHeight, ConsensusBranchId, MinedTransaction, Network, NetworkUpgradeActivations, TxStatus,
@@ -74,8 +72,7 @@ async fn mined_consensus_branch_id_advances_across_latest_activation_height() ->
     let window_end = BlockHeight::new(activation_height.value().saturating_add(1));
 
     let live = live_serving_pair(&env, &activations, window_end).await?;
-    let wallet_query =
-        WalletServingQuery::from_serving_pair_slot(live.slot, (), Arc::clone(&activations));
+    let wallet_query = WalletServingQuery::from_serving_pair_slot(live.slot);
 
     let pre_activation_branch_id = read_coinbase_consensus_branch_id(&wallet_query, window_start)
         .await

@@ -1366,6 +1366,13 @@ pub trait EndpointBackedIndex: ChainIndex {
 
     /// Broadcasts raw transaction bytes without mutating canonical storage.
     ///
+    /// The server starts without contacting its node and sends nothing to a
+    /// node that has not passed first-contact verification. Until then, and
+    /// during a node outage, the call fails with
+    /// [`ErrorReason::NodeUnavailable`](crate::ErrorReason::NodeUnavailable),
+    /// which [`RetryPolicy::RetryWithBackoff`](crate::RetryPolicy::RetryWithBackoff)
+    /// covers.
+    ///
     /// # Examples
     ///
     /// ```no_run

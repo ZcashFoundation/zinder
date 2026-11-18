@@ -36,11 +36,11 @@ It serves indexed reads from an admitted exact-fence pair of canonical and
 wallet-projection secondaries. It does not write canonical storage, build
 artifacts independently, or use Zebra as a fallback for indexed history.
 
-The compatibility runtime uses `zinder-source` only for explicit edge
-capabilities: transaction broadcast and network-upgrade activation discovery.
-`GetTreeState` is served from stored checkpoints and compact blocks.
-Those calls never substitute for indexed history or change the pinned serving
-pair.
+The compatibility runtime uses `zinder-source` only for one explicit edge
+capability: transaction broadcast. Activations come from the writer-admitted
+schedule, and `GetTreeState` is served from stored checkpoints and compact
+blocks. That call never substitutes for indexed history or changes the pinned
+serving pair.
 
 For a compatible wallet, Zinder is an endpoint-level replacement for
 lightwalletd: the wallet keeps the `CompactTxStreamer` contract and changes the
@@ -173,6 +173,12 @@ At connect time, call `ServerInfo` and check:
 1. `network` matches the expected wire string exactly (`zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`).
 2. `contract_revision` meets the consumer's minimum.
 3. Every capability the consumer requires is present in `capabilities`.
+
+`wallet.broadcast.transaction_v1` means the operator configured a node for
+broadcast. The query starts without contacting that node and verifies it on
+first contact, so a broadcast can fail with the retryable `NODE_UNAVAILABLE`
+until the node answers, as it does during any node outage. `node` in
+`ServerInfo` stays empty until that verification passes.
 
 The release `zinder-query` composition admits one authenticated
 `IngestControl` identity before opening storage or binding traffic. Admission

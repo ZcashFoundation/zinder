@@ -47,10 +47,11 @@ use super::native::{
     TransactionStatusLookup, WalletEndpointMetadata, address_lookup_to_script_hash,
     block_header_by_selector_response, block_id_by_selector_response,
     broadcast_transaction_response, build_chain_view_message, build_full_block_message,
-    build_transparent_address_tx_ids_chunk, build_transparent_address_tx_ids_header,
-    build_transparent_unspent_output_message, build_transparent_unspent_outputs_header,
-    build_wallet_server_info, chain_value_pools_at_tip_response, compact_block_response,
-    compact_blocks_in_range_chunks, full_block_response, latest_tree_state_checkpoint_response,
+    build_node_capabilities_descriptor, build_transparent_address_tx_ids_chunk,
+    build_transparent_address_tx_ids_header, build_transparent_unspent_output_message,
+    build_transparent_unspent_outputs_header, build_wallet_server_info,
+    chain_value_pools_at_tip_response, compact_block_response, compact_blocks_in_range_chunks,
+    full_block_response, latest_tree_state_checkpoint_response,
     network_upgrade_activations_response, settled_tip_block_response, subtree_roots_response,
     transaction_response, transparent_address_unspent_outputs_response,
     transparent_outpoint_spend_status_response, tree_state_at_response, visible_tip_block_response,
@@ -735,8 +736,14 @@ where
         &self,
         _request: Request<wallet::ServerInfoRequest>,
     ) -> Result<Response<wallet::ServerInfoResponse>, Status> {
+        let mut server_info = self.server_info.clone();
+        // The node endpoint is verified after startup, so its capabilities
+        // are read per request.
+        server_info.node = Some(build_node_capabilities_descriptor(
+            self.query_api.upstream_node_capabilities(),
+        ));
         Ok(Response::new(wallet::ServerInfoResponse {
-            info: Some(self.server_info.clone()),
+            info: Some(server_info),
         }))
     }
 

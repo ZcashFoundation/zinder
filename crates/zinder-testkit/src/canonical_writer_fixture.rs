@@ -139,7 +139,9 @@ pub struct CanonicalWriterFixture {
 }
 
 impl CanonicalWriterFixture {
-    /// Builds, cold-certifies, and publishes `baseline` as epoch 1.
+    /// Builds, cold-certifies, and publishes `baseline` as epoch 1, then
+    /// admits `network_upgrade_activations` as schedule revision 1, as the
+    /// canonical writer does when it first opens a store.
     ///
     /// # Errors
     ///
@@ -200,7 +202,8 @@ impl CanonicalWriterFixture {
             BlockId::new(settled_height, settled_block.hash),
             fixture_created_at(tip_block),
         ))?;
-        let canonical_primary = validated.publish_baseline(publication)?;
+        let mut canonical_primary = validated.publish_baseline(publication)?;
+        canonical_primary.admit_network_upgrade_schedule(network_upgrade_activations)?;
 
         Ok(Self {
             canonical_primary: Some(canonical_primary),
@@ -380,7 +383,6 @@ impl CanonicalWriterFixture {
             self.serving_fixture_count,
             &self.canonical_primary_path,
             canonical_primary,
-            &self.network_upgrade_activations,
         )
     }
 
@@ -396,7 +398,6 @@ impl CanonicalWriterFixture {
             self.temporary_directory,
             &self.canonical_primary_path,
             canonical_primary,
-            &self.network_upgrade_activations,
         )
     }
 

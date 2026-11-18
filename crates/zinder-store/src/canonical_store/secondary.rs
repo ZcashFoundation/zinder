@@ -104,6 +104,12 @@ impl RocksDbCanonicalSecondary {
 
     /// Opens one exactly admitted secondary and catches it up to the primary's current state.
     ///
+    /// `expected_network_upgrade_activations` is a node-observed table: it
+    /// must agree with the writer-admitted schedule through the visible tip,
+    /// or equal the construction table before the writer's first admission.
+    /// A reader that has no node of its own opens with
+    /// [`Self::open_ready_adopting_writer_schedule`] instead.
+    ///
     /// The expected raw-blob retention is an immutable store identity, not a
     /// request to infer coverage from currently present rows. A
     /// [`RocksDbResourceBudget`] opens the secondary on a block cache of its
@@ -112,10 +118,6 @@ impl RocksDbCanonicalSecondary {
     #[allow(
         clippy::too_many_arguments,
         reason = "secondary admission keeps both filesystem identities and every immutable canonical contract explicit"
-    )]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "initial secondary admission binds control, schedule, manifest, and READY publication"
     )]
     pub fn open_ready(
         primary_path: impl AsRef<Path>,
@@ -126,25 +128,76 @@ impl RocksDbCanonicalSecondary {
         expected_reorg_policy: super::CanonicalReorgPolicy,
         resources: impl Into<RocksDbOpenResources>,
     ) -> Result<Self, CanonicalStoreError> {
-        let resources = resources.into();
+        Self::open_ready_with_expectation(
+            primary_path.as_ref(),
+            secondary_path.as_ref(),
+            &CanonicalStoreAdmissionExpectation::from_activations(
+                expected_network_upgrade_activations,
+                expected_workload,
+                expected_raw_blob_retention,
+                expected_reorg_policy,
+            ),
+            resources.into(),
+        )
+    }
+
+    /// Opens one exactly admitted secondary of a `expected_network` store and
+    /// adopts the network-upgrade schedule its canonical writer admitted.
+    ///
+    /// The reader brings no activation table of its own, so it needs no node:
+    /// the schedule it reads through is the one the writer persisted, and
+    /// each catch-up follows the writer's later revisions. A READY store whose
+    /// writer has not admitted a schedule yet is refused with
+    /// [`CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted`], which a
+    /// reader retries, because the writer admits its first revision when it
+    /// opens the store.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "secondary admission keeps both filesystem identities and every immutable canonical contract explicit"
+    )]
+    pub fn open_ready_adopting_writer_schedule(
+        primary_path: impl AsRef<Path>,
+        secondary_path: impl AsRef<Path>,
+        expected_network: Network,
+        expected_workload: CanonicalStoreWorkload,
+        expected_raw_blob_retention: RawBlobRetention,
+        expected_reorg_policy: super::CanonicalReorgPolicy,
+        resources: impl Into<RocksDbOpenResources>,
+    ) -> Result<Self, CanonicalStoreError> {
+        Self::open_ready_with_expectation(
+            primary_path.as_ref(),
+            secondary_path.as_ref(),
+            &CanonicalStoreAdmissionExpectation::adopting_writer_schedule(
+                expected_network,
+                expected_workload,
+                expected_raw_blob_retention,
+                expected_reorg_policy,
+            ),
+            resources.into(),
+        )
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "initial secondary admission binds control, schedule, manifest, and READY publication"
+    )]
+    fn open_ready_with_expectation(
+        primary_path: &Path,
+        secondary_path: &Path,
+        expectation: &CanonicalStoreAdmissionExpectation,
+        resources: RocksDbOpenResources,
+    ) -> Result<Self, CanonicalStoreError> {
         resources
             .validate()
             .map_err(|reason| CanonicalStoreError::InvalidResourceBudget { reason })?;
         let resource_budget = resources.budget();
-        let primary_path = canonical_store_path(primary_path.as_ref())?;
-        let secondary_path = secondary_path.as_ref();
+        let primary_path = canonical_store_path(primary_path)?;
         if secondary_path == primary_path {
             return Err(CanonicalStoreError::admission(
                 &primary_path,
                 "secondary metadata path must differ from the canonical primary path",
             ));
         }
-        let expectation = CanonicalStoreAdmissionExpectation::from_activations(
-            expected_network_upgrade_activations,
-            expected_workload,
-            expected_raw_blob_retention,
-            expected_reorg_policy,
-        );
         require_exact_primary_column_family_metadata(&primary_path)?;
         let bounded_open = open_bounded_rocksdb(
             RocksDbOpenRole::Secondary {
@@ -167,7 +220,7 @@ impl RocksDbCanonicalSecondary {
             })?;
         require_exact_secondary_column_families(&bounded_open, &primary_path)?;
         let opened_control =
-            validate_open_store_control(&bounded_open.db, &primary_path, &expectation)?;
+            validate_open_store_control(&bounded_open.db, &primary_path, expectation)?;
         validate_mempool_lifecycle_admission(
             &bounded_open.db,
             opened_control.network,
@@ -203,20 +256,21 @@ impl RocksDbCanonicalSecondary {
                 )
             })
             .transpose()?;
+        let workload = opened_control.workload;
         Ok(Self {
             bounded_open,
             primary_path,
-            // The reader's node table is checked only at open. Catch-ups
+            // An opening table is checked only at open. Catch-ups
             // authenticate the schedule journal and follow each revision the
             // writer admits, so a long-running reader never pins its startup
             // observation. The reorg window stays exact: a writer raise
             // after open fails catch-up until the reader restarts with it.
             expectation: CanonicalStoreAdmissionExpectation::from_build_plan(
                 &opened_control.build_plan,
-                expected_workload,
+                workload,
                 reorg_policy,
             ),
-            workload: expected_workload,
+            workload,
             build_plan: opened_control.build_plan,
             ready_evidence,
             subtree_root_coverage,

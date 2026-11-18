@@ -744,9 +744,7 @@ async fn spawn_wallet_query_server(
             Arc::new(canonical_reader),
             Arc::new(wallet_reader),
         )?)),
-        (),
         ingest_control,
-        activations,
     );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;

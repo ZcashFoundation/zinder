@@ -677,11 +677,12 @@ pub struct TreeStateResponse {
     #[prost(uint32, optional, tag = "5")]
     pub block_time_seconds: ::core::option::Option<u32>,
 }
-/// One node-advertised network-upgrade activation.
+/// One network-upgrade activation in the writer-admitted schedule.
 ///
-/// Names and activation heights come from the configured node's
-/// `getblockchaininfo.upgrades` response. Unknown future branch ids remain
-/// representable so wallet clients can fail closed before consensus diverges.
+/// Names and activation heights come from the schedule the canonical writer
+/// admitted from its node's `getblockchaininfo.upgrades` response. Unknown
+/// future branch ids remain representable so wallet clients can fail closed
+/// before consensus diverges.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NetworkUpgradeActivation {
     /// Consensus branch identifier assigned to this upgrade.
@@ -694,10 +695,11 @@ pub struct NetworkUpgradeActivation {
     #[prost(uint32, tag = "3")]
     pub activation_height: u32,
 }
-/// Node-advertised network-upgrade activation-table request.
+/// Writer-admitted network-upgrade activation-table request.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NetworkUpgradeActivationsRequest {}
-/// Node-advertised network-upgrade activation table.
+/// Writer-admitted network-upgrade schedule served with the current serving
+/// pair.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct NetworkUpgradeActivationsResponse {
     /// Entries ordered by ascending activation height.
@@ -1008,12 +1010,13 @@ pub struct WalletServerInfo {
     /// settled prefix (settled_tip_height) once it is buried at least this deep.
     #[prost(uint32, tag = "4")]
     pub reorg_window_blocks: u32,
-    /// Upstream node capabilities detected by zinder-source.
+    /// Capabilities of the broadcast node endpoint. Empty until the endpoint
+    /// passes first-contact verification, and when no node is configured.
     #[prost(message, optional, tag = "8")]
     pub node: ::core::option::Option<NodeCapabilitiesDescriptor>,
 }
-/// Upstream node capability descriptor. Storage-only query deployments may
-/// leave this empty when the query service has no source probe snapshot.
+/// Broadcast node endpoint capability descriptor. Empty until the endpoint
+/// passes first-contact verification, and when no node is configured.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NodeCapabilitiesDescriptor {
     /// Node-reported semantic version, when available.
@@ -2458,7 +2461,8 @@ pub mod wallet_query_client {
                 .insert(GrpcMethod::new("zinder.v1.wallet.WalletQuery", "ServerInfo"));
             self.inner.unary(req, path, codec).await
         }
-        /// Return the configured node's advertised consensus-upgrade schedule.
+        /// Return the writer-admitted consensus-upgrade schedule served with the
+        /// current serving pair.
         /// Capability: `wallet.read.network_upgrade_activations_v1`.
         pub async fn network_upgrade_activations(
             &mut self,
@@ -2746,7 +2750,8 @@ pub mod wallet_query_server {
             tonic::Response<super::ServerInfoResponse>,
             tonic::Status,
         >;
-        /// Return the configured node's advertised consensus-upgrade schedule.
+        /// Return the writer-admitted consensus-upgrade schedule served with the
+        /// current serving pair.
         /// Capability: `wallet.read.network_upgrade_activations_v1`.
         async fn network_upgrade_activations(
             &self,

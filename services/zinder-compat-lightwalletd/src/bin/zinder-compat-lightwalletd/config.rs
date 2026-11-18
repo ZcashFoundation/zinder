@@ -197,7 +197,7 @@ struct LightwalletdRawConfig {
     wallet: Option<WalletSection>,
     ingest_control: IngestControlSection,
     compat: CompatSection,
-    node: NodeSection,
+    node: Option<NodeSection>,
     security: SecuritySection,
 }
 
@@ -227,6 +227,12 @@ fn resolve_lightwalletd_config(
     if matches!(serving, CompatServing::CompactBlocks) && wallet.is_some() {
         return Err(ConfigError::invalid(
             "compat.serving = \"compact-blocks\" does not accept wallet.path, wallet.secondary_path, or wallet.rocksdb settings; remove the wallet section or select compat.serving = \"wallet\"",
+        )
+        .into());
+    }
+    if matches!(serving, CompatServing::CompactBlocks) && config.node.is_some() {
+        return Err(ConfigError::invalid(
+            "compat.serving = \"compact-blocks\" does not accept node settings, because compact-block serving never contacts a node; remove the node section and every ZINDER_NODE__* variable, or select compat.serving = \"wallet\"",
         )
         .into());
     }
@@ -274,8 +280,7 @@ fn resolve_lightwalletd_config(
     )?;
     guard_serving_bind("compat.listen_addr", listen_addr, allow_public_bind)?;
     guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
-    let broadcaster =
-        NodeTarget::resolve_optional(network, config.node).map_err(ConfigError::from)?;
+    let broadcaster = resolve_broadcaster(network, config.node)?;
 
     Ok(LightwalletdConfig {
         network,
@@ -295,6 +300,18 @@ fn resolve_lightwalletd_config(
         max_concurrent_block_range_streams,
         broadcaster,
     })
+}
+
+/// Resolves the wallet-mode broadcast node. Any node setting asks for
+/// broadcast, so a section without `node.json_rpc_addr` is an error rather
+/// than a compatibility process without `SendTransaction`.
+fn resolve_broadcaster(
+    network: Network,
+    node: Option<NodeSection>,
+) -> Result<Option<NodeTarget>, ConfigError> {
+    node.map(|section| NodeTarget::resolve(network, section))
+        .transpose()
+        .map_err(ConfigError::from)
 }
 
 #[derive(Serialize)]

@@ -12,15 +12,13 @@ use thiserror::Error;
 use zinder_core::Network;
 use zinder_runtime::{
     BearerToken, ConfigError, ConfigLoader, IngestControlReaderToml, IngestControlSection,
-    NetworkSection, NetworkToml, NodeToml, OpsSection, OpsServerError, OpsToml,
-    ProjectorControlSection, ProjectorControlToml, RocksDbResourceBudgetSection,
-    RocksDbResourceBudgetToml, SecuritySection, SecurityToml, StorageRoleSection,
-    guard_optional_serving_bind, require_field, resolve_allow_public_bind,
-    resolve_canonical_reader_rocksdb_budget, resolve_ingest_control_reader,
-    resolve_ops_listen_addr, resolve_projector_control,
+    NetworkSection, NetworkToml, OpsSection, OpsServerError, OpsToml, ProjectorControlSection,
+    ProjectorControlToml, RocksDbResourceBudgetSection, RocksDbResourceBudgetToml, SecuritySection,
+    SecurityToml, StorageRoleSection, guard_optional_serving_bind, require_field,
+    resolve_allow_public_bind, resolve_canonical_reader_rocksdb_budget,
+    resolve_ingest_control_reader, resolve_ops_listen_addr, resolve_projector_control,
     resolve_wallet_projection_writer_rocksdb_budget,
 };
-use zinder_source::{NodeSection, NodeTarget};
 use zinder_store::{RawBlobRetention, RocksDbResourceBudget};
 
 const DEFAULT_CANONICAL_PATH: &str = "/var/lib/zinder/canonical";
@@ -72,7 +70,6 @@ pub(crate) struct ProjectorConfig {
     pub(crate) ingest_control_bearer_token_path: Option<PathBuf>,
     pub(crate) ingest_control_bearer_token: Option<BearerToken>,
     pub(crate) projector_control: zinder_runtime::ResolvedProjectorControl,
-    pub(crate) node: NodeTarget,
     pub(crate) ops_listen_addr: Option<SocketAddr>,
     pub(crate) allow_public_bind: bool,
 }
@@ -104,7 +101,6 @@ pub(crate) struct ProjectorConfigOverrides {
     pub(crate) reorg_window_blocks: Option<u32>,
     pub(crate) build_owner_hex: Option<String>,
     pub(crate) lease_duration_seconds: Option<u64>,
-    pub(crate) node_json_rpc_addr: Option<String>,
     pub(crate) ingest_control_addr: Option<String>,
     pub(crate) ingest_control_bearer_token_path: Option<PathBuf>,
     pub(crate) projector_control_listen_addr: Option<SocketAddr>,
@@ -121,12 +117,6 @@ pub(crate) enum ProjectorError {
 
     #[error(transparent)]
     OpsServer(#[from] OpsServerError),
-
-    #[error("node source initialization failed: {0}")]
-    NodeConfig(#[from] zinder_source::NodeConfigError),
-
-    #[error("node source request failed: {0}")]
-    Source(#[from] zinder_source::SourceError),
 
     #[error(transparent)]
     CanonicalStore(#[from] zinder_store::CanonicalStoreError),
@@ -314,7 +304,6 @@ pub(crate) fn load_projector_config(
             "projector.lease_duration_seconds",
             overrides.lease_duration_seconds,
         )?
-        .with_override_if("node.json_rpc_addr", overrides.node_json_rpc_addr)?
         .with_override_if("ingest_control.addr", overrides.ingest_control_addr)?
         .with_override_path_if(
             "ingest_control.bearer_token_path",
@@ -403,7 +392,6 @@ struct ProjectorRawConfig {
     storage: ProjectorStorageSection,
     wallet: ProjectorWalletSection,
     projector: ProjectorSection,
-    node: NodeSection,
     ingest_control: IngestControlSection,
     projector_control: ProjectorControlSection,
     ops: OpsSection,
@@ -486,7 +474,6 @@ fn resolve_projector_config(raw: ProjectorRawConfig) -> Result<ProjectorConfig, 
     )?;
     let build = resolve_build_config(&raw.projector.build)?;
     let follow = resolve_follow_config(&raw.projector.follow)?;
-    let node = NodeTarget::resolve(network, raw.node)?;
     let ingest_control = resolve_ingest_control_reader(raw.ingest_control)?;
     let projector_control = resolve_projector_control(raw.projector_control)?;
     let ops_listen_addr = resolve_ops_listen_addr(raw.ops)?;
@@ -511,7 +498,6 @@ fn resolve_projector_config(raw: ProjectorRawConfig) -> Result<ProjectorConfig, 
         ingest_control_bearer_token_path: ingest_control.bearer_token_path,
         ingest_control_bearer_token: ingest_control.bearer_token,
         projector_control,
-        node,
         ops_listen_addr,
         allow_public_bind,
     })
@@ -684,7 +670,6 @@ struct ProjectorConfigToml {
     storage: ProjectorStorageToml,
     wallet: ProjectorWalletToml,
     projector: ProjectorToml,
-    node: NodeToml,
     ingest_control: IngestControlReaderToml,
     projector_control: ProjectorControlToml,
     ops: OpsToml,
@@ -713,7 +698,6 @@ impl ProjectorConfigToml {
                 build: ProjectorBuildToml::from(config.build),
                 follow: ProjectorFollowToml::from(config.follow),
             },
-            node: NodeToml::from_node_target(&config.node),
             ingest_control: IngestControlReaderToml::from_resolved(
                 config.ingest_control_addr.clone(),
                 config.ingest_control_bearer_token_path.as_deref(),

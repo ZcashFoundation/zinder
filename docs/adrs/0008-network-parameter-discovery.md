@@ -39,16 +39,18 @@ The type exposes pure-data queries:
 ### Source-of-truth flow
 
 1. `ZebraJsonRpcSource::fetch_network_upgrade_activations()` parses `getblockchaininfo.upgrades` and validates branch-id uniqueness. The map key (hex branch id) becomes `branch_id`; the value's `name` and `activationheight` become `name` and `activation_height`.
-2. `ZebraJsonRpcSource::discover_network_upgrade_activations(target)` wraps the fetch, emits a `network_upgrade_activations_discovered` structured log event keyed by service name, and returns `Arc<NetworkUpgradeActivations>`. The four service binaries call this one helper so the discovery event shape stays consistent across the workspace.
-3. Consumers receive `Arc<NetworkUpgradeActivations>` at construction and call methods on the owned type. No process ever consults `zcash_chain::Network::sapling_activation_height` or any other library-default constant.
+2. `ZebraJsonRpcSource::discover_network_upgrade_activations(target)` wraps the fetch, emits a `network_upgrade_activations_discovered` structured log event keyed by service name, and returns `Arc<NetworkUpgradeActivations>`. The canonical writer calls this one helper, so the discovery event shape stays consistent.
+3. The writer admits the discovered table into the canonical store as a schedule revision ([ADR-0039](0039-writer-admitted-network-upgrade-schedules.md)). Readers take the admitted table from the store and call methods on the owned type. No process ever consults `zcash_chain::Network::sapling_activation_height` or any other library-default constant.
 
 Production code does not consult `RegtestParameters::default()` or library-default activation singletons; consumers receive `Arc<NetworkUpgradeActivations>` and call methods on the owned type. The testkit's `regtest_local_network()` is derived from `sample_regtest_upgrade_activations()` so the in-process unit-test fixtures cannot drift from the discovery path; doc comments steer live tests toward `local_network_from_activations(&activations)` and `discover_network_upgrade_activations()`.
 
 ### Wiring contract per service
 
 - **`zinder-ingest`** discovers the activations before canonical construction so transaction parsing and the immutable store identity use the node's exact table. Each later open admits the discovered table as a schedule revision. Wallet-serving coverage independently requires complete transparent history.
-- **`zinder-query`** holds `Arc<NetworkUpgradeActivations>` on `WalletServingQuery` as a required constructor parameter. `MinedTransactionChainContext.consensus_branch_id` reflects the active branch at the mined height in the schedule admitted with the captured serving pair. The production binary errors out at startup if `[node]` is not configured (the table cannot be discovered without an RPC endpoint).
-- **`zinder-compat-lightwalletd`** discovers the table at startup to open its serving readers. `GetLightdInfo` reads the writer-admitted table on each request, through `WalletQueryApi::network_upgrade_activations` in wallet-serving mode and from the served canonical reader in compact-block mode. Same startup-time failure if `[node]` is not configured.
+- **`zinder-query`** discovers nothing. Each serving pair carries the schedule the writer admitted, and `MinedTransactionChainContext.consensus_branch_id` reflects the active branch at the mined height in the schedule admitted with the captured serving pair. The query starts without `[node]` or with its node down.
+- **`zinder-compat-lightwalletd`** discovers nothing either. `GetLightdInfo` reads the writer-admitted table on each request, through `WalletQueryApi::network_upgrade_activations` in wallet-serving mode and from the served canonical reader in compact-block mode.
+- **`zinder-projector`** opens its canonical secondary on the writer-admitted schedule and has no `[node]`.
+- **`zinder-explorer`** reads the table through the wallet query's `NetworkUpgradeActivations` and attempts a refresh at most once a minute. A refresh that fails, or does not answer within five seconds, keeps serving the cached table until the next attempt. Until a first fetch succeeds, requests share each failure for five seconds before the next request fetches again.
 - **`zinder-client`** discovers the table through `RemoteChainIndex::network_upgrade_activations`, after preflighting the native server's identity, network, contract revision, and advertised capability.
 - **`zinder-testkit`** exposes `local_network_from_activations(&activations) -> LocalNetwork` for live tests; `TransparentTestKey::from_seed_with_local_network` accepts the result. `regtest_local_network()` is derived from `sample_regtest_upgrade_activations()` so the two regtest fixtures cannot drift.
 
@@ -68,7 +70,7 @@ A live test in `crates/zinder-source/tests/live/zebra_json_rpc.rs` calls `fetch_
 
 ### What this costs
 
-- Each process pays one `getblockchaininfo` round-trip at startup so consensus parsing and served upgrade metadata use the node's exact activation table.
+- The writer pays one `getblockchaininfo` round-trip at startup so consensus parsing and the admitted schedule use the node's exact activation table. Readers pay none, and serve whatever the writer admitted.
 - The table is cached for process lifetime. If the operator reconfigures the node's activation heights mid-flight without restarting Zinder, the cache goes stale until restart. Documented in the runbook.
 - Tests that exercise `WalletQuery` must pass an activations table. The testkit's `sample_regtest_upgrade_activations()` covers the common case; the cost is one extra line per test.
 
@@ -82,3 +84,9 @@ A live test in `crates/zinder-source/tests/live/zebra_json_rpc.rs` calls `fetch_
 - `local_network_from_activations` (the testkit bridge to `zcash_protocol::LocalNetwork`).
 
 See [Public interfaces §Core vocabulary](../architecture/public-interfaces.md#core-vocabulary).
+
+## Revision history
+
+- 2026-11-18: Only the canonical writer discovers the table. Query,
+  compatibility, the projector, and Explorer read the schedule the writer
+  admitted and no longer need a node to start.

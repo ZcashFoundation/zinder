@@ -89,9 +89,7 @@ async fn full_block_range_one_thousand_blocks_stays_under_budget() -> eyre::Resu
         crate::common::admitted_ingest_control_fixture().await?;
     let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
         WalletServingPairSlot::new(serving_pair),
-        (),
         ingest_control,
-        activations,
     );
 
     let start = Instant::now();

@@ -121,7 +121,8 @@ variables its binary accepts:
 
 | Variables | `zinder-ingest` | `zinder-projector` | `zinder-query` |
 | --- | --- | --- | --- |
-| `ZINDER_NETWORK__*`, `ZINDER_NODE__*`, `ZINDER_OPS__*`, `ZINDER_SECURITY__*`, `ZINDER_INGEST_CONTROL__*` | yes | yes | yes |
+| `ZINDER_NETWORK__*`, `ZINDER_OPS__*`, `ZINDER_SECURITY__*`, `ZINDER_INGEST_CONTROL__*` | yes | yes | yes |
+| `ZINDER_NODE__*` | yes | | yes |
 | `ZINDER_STORAGE__CANONICAL__*`, `ZINDER_STORAGE__RAW_BLOB_POLICY` | yes | yes | yes |
 | `ZINDER_INGEST__*`, `ZINDER_RETENTION__*`, `ZINDER_STORAGE__MATERIALIZED_VIEWS__*` | yes | | |
 | `ZINDER_PROJECTOR__*`, `ZINDER_PROJECTOR_CONTROL__*` | | yes | |
@@ -131,7 +132,9 @@ variables its binary accepts:
 For example, `ZINDER_PROJECTOR__BUILD__MAX_TEMPORARY_FILE_BYTES_PER_SORTER`
 and `ZINDER_STORAGE__SERVING_PAIR_STALENESS_CEILING_MS` each reach one
 process, while `ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES` applies to
-all three.
+all three. `zinder-projector` uses no node, so it never receives
+`ZINDER_NODE__*` and fails at startup if a node setting reaches it some other
+way.
 
 No process receives the `ZINDER_WALLET_SERVING__*` variables, which configure
 the entrypoint itself, or the two bearer secrets. Any other
@@ -458,25 +461,25 @@ terminates.
 
 A node outage is tolerated much longer. While ingest reports
 `node_unavailable` or `upstream_not_ready`, query keeps serving the stored
-chain, and a restart cannot help: ingest needs the node to start, so the
-restarted container would serve nothing. The supervisor keeps the outage out of
-the one-hour tolerance and the recurrence budgets below. While Zebra resyncs,
-or while only the node's mempool feed fails, ingest can report `syncing`
-instead, because it trails the node or its mempool cannot hydrate. The
-supervisor treats that as the same outage when query's `/readyz` lists
-`ingest_control` with `upstream_not_ready`, which is the writer's own
-observation of its node. An `upstream_not_ready` node answers, so a resync of
-any length never restarts the container. When query lists `ingest_control`
-with `node_unavailable` instead, the writer's mempool is waiting for a node
-snapshot. The supervisor counts that as an unreachable node only while
-ingest's `syncing` cause carries `"lag_blocks": null`, which means canonical
-ingest has caught up and only the mempool is behind. A numeric `lag_blocks`
-means the writer trails a node it can reach, and its mempool waits for it, so
-the one-hour tolerance and the recurrence budgets still apply. An unreachable
-node, including one that only the writer's mempool cannot reach, is logged
-once when the outage begins and once when it ends, and terminates the
-container only after it has lasted 24 hours, in case ingest is stuck in its
-own node client.
+chain, and a restart cannot help: query and the projector start without the
+node, but ingest needs it to start, so the restarted container would serve
+nothing. The supervisor keeps the outage out of the one-hour tolerance and the
+recurrence budgets below. While Zebra resyncs, or while only the node's
+mempool feed fails, ingest can report `syncing` instead, because it trails the
+node or its mempool cannot hydrate. The supervisor treats that as the same
+outage when query's `/readyz` lists `ingest_control` with
+`upstream_not_ready`, which is the writer's own observation of its node. An
+`upstream_not_ready` node answers, so a resync of any length never restarts
+the container. When query lists `ingest_control` with `node_unavailable`
+instead, the writer's mempool is waiting for a node snapshot. The supervisor
+counts that as an unreachable node only while ingest's `syncing` cause carries
+`"lag_blocks": null`, which means canonical ingest has caught up and only the
+mempool is behind. A numeric `lag_blocks` means the writer trails a node it
+can reach, and its mempool waits for it, so the one-hour tolerance and the
+recurrence budgets still apply. An unreachable node, including one that only
+the writer's mempool cannot reach, is logged once when the outage begins and
+once when it ends, and terminates the container only after it has lasted 24
+hours, in case ingest is stuck in its own node client.
 
 A plane that flaps between ready and unready never stays down for an hour, so
 the supervisor also tracks its unready stretches. It terminates the container

@@ -69,6 +69,75 @@ fn print_config_uses_native_ports_and_dedicated_secondary_roots() -> eyre::Resul
     Ok(())
 }
 
+/// A query without a node serves storage only, so `[node]` is optional and
+/// the rendered configuration omits it.
+#[test]
+fn print_config_accepts_a_query_without_a_node() -> eyre::Result<()> {
+    let temporary = TempDir::new()?;
+    let output = Command::new(zinder_testkit::bin_exe!("zinder-query"))
+        .args(["--print-config", "--network", "zcash-regtest"])
+        .arg("--canonical-primary-path")
+        .arg(temporary.path().join("canonical-primary"))
+        .arg("--canonical-secondary-root")
+        .arg(temporary.path().join("canonical-secondary"))
+        .arg("--wallet-primary-path")
+        .arg(temporary.path().join("wallet-primary"))
+        .arg("--wallet-secondary-root")
+        .arg(temporary.path().join("wallet-secondary"))
+        .args(["--ingest-control-addr", "http://127.0.0.1:9100"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "print-config failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(!stdout.contains("[node]"), "{stdout}");
+    assert!(!stdout.contains("json_rpc_addr"), "{stdout}");
+    Ok(())
+}
+
+/// A node setting asks for broadcast, so a `[node]` section without its
+/// address fails configuration instead of starting a storage-only query.
+#[test]
+fn node_settings_without_an_address_are_rejected() -> eyre::Result<()> {
+    let temporary = TempDir::new()?;
+    let config_path = temporary.path().join("query-node.toml");
+    std::fs::write(
+        &config_path,
+        "[node]\nrequest_timeout_secs = 30\nbroadcast_timeout_secs = 7\n",
+    )?;
+    let base = || {
+        let mut command = Command::new(zinder_testkit::bin_exe!("zinder-query"));
+        command
+            .env_clear()
+            .args(["--print-config", "--network", "zcash-regtest"])
+            .arg("--canonical-primary-path")
+            .arg(temporary.path().join("canonical-primary"))
+            .arg("--canonical-secondary-root")
+            .arg(temporary.path().join("canonical-secondary"))
+            .arg("--wallet-primary-path")
+            .arg(temporary.path().join("wallet-primary"))
+            .arg("--wallet-secondary-root")
+            .arg(temporary.path().join("wallet-secondary"))
+            .args(["--ingest-control-addr", "http://127.0.0.1:9100"]);
+        command
+    };
+
+    let from_file = base().arg("--config").arg(&config_path).output()?;
+    let from_environment = base()
+        .env("ZINDER_NODE__AUTH__METHOD", "cookie")
+        .env("ZINDER_NODE__AUTH__PATH", "/var/run/auth/.cookie")
+        .output()?;
+
+    for output in [from_file, from_environment] {
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(stderr.contains("node.json_rpc_addr"), "{stderr}");
+    }
+    Ok(())
+}
+
 #[test]
 fn print_config_exposes_the_full_block_retention_contract() -> eyre::Result<()> {
     let temporary = TempDir::new()?;

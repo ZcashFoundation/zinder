@@ -566,16 +566,6 @@ addr = "http://${INGEST_CONTROL_ADDR}"
 [ops]
 listen_addr = "${PROJECTOR_OPS_ADDR}"
 
-[node]
-json_rpc_addr = "${node_addr}"
-request_timeout_secs = 30
-max_response_bytes = 67108864
-
-[node.auth]
-method = "basic"
-username = "${node_username}"
-password = "${node_password}"
-
 [security]
 allow_public_bind = true
 EOF

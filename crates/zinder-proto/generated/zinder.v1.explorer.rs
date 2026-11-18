@@ -2433,9 +2433,10 @@ pub struct ValuePoolBalanceHistoryResponse {
 pub struct NetworkUpgradeStatusRequest {}
 /// One network-upgrade activation entry projected for explorer consumers.
 ///
-/// Sourced from the node-advertised activation table
-/// (`getblockchaininfo.upgrades`). `active` is `true` when
-/// `activation_height <= tip_height` in the enclosing response.
+/// Sourced from the activation table the canonical writer admitted from its
+/// node's `getblockchaininfo.upgrades`, as the wallet query serves it.
+/// `active` is `true` when `activation_height <= tip_height` in the enclosing
+/// response.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NetworkUpgradeEntry {
     /// Upgrade name as reported by the node (for example `"Sapling"`, `"NU5"`,
@@ -2456,7 +2457,7 @@ pub struct NetworkUpgradeEntry {
 }
 /// `ExplorerQuery.NetworkUpgradeStatus` response.
 ///
-/// Carries the node-advertised upgrade table ordered by ascending activation
+/// Carries the writer-admitted upgrade table ordered by ascending activation
 /// height, the canonical tip height the `active` flags are computed against,
 /// and the currently-active upgrade's name and branch id for convenience.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -4526,7 +4527,7 @@ pub mod explorer_query_client {
                 );
             self.inner.unary(req, path, codec).await
         }
-        /// Returns the node-advertised network-upgrade activation table alongside
+        /// Returns the writer-admitted network-upgrade activation table alongside
         /// the canonical tip height, so a client can tell whether an upgrade is
         /// active and, if not, how far the tip is from its activation height.
         /// Capability: `explorer.network_upgrade.status_v1`.
@@ -5307,7 +5308,7 @@ pub mod explorer_query_server {
             tonic::Response<super::ValuePoolSummaryResponse>,
             tonic::Status,
         >;
-        /// Returns the node-advertised network-upgrade activation table alongside
+        /// Returns the writer-admitted network-upgrade activation table alongside
         /// the canonical tip height, so a client can tell whether an upgrade is
         /// active and, if not, how far the tip is from its activation height.
         /// Capability: `explorer.network_upgrade.status_v1`.

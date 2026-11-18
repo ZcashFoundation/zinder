@@ -376,15 +376,26 @@ reports `serving_pair_stale` and refuses traffic with
 `writer_status_unavailable` once `storage.serving_pair_staleness_ceiling_ms`
 passes, as it does for any writer-status outage.
 
-The node probe exercises `tip_id` and upstream synchronization health through
-the same shared source handle installed in the query, and publishes
+Transaction broadcast is the only node-backed operation; tree state at any
+height is served from the serving pair. `[node]` is therefore optional: a
+query without it serves storage only, advertises no broadcast, runs no node
+probe, and never degrades its node-source dependency. Any node setting counts
+as `[node]`, so a section, `ZINDER_NODE__*` variable, or override without
+`node.json_rpc_addr` fails configuration. A query with `[node]`
+advertises broadcast and starts without contacting the node, even before the
+node writes its cookie file. Its node probe
+first verifies the endpoint: `rpc.discover` must list `sendrawtransaction`,
+the node's activation table must agree with the serving pair's writer-admitted
+schedule through the visible tip, and the node's best chain must hold the
+pair's visible tip block. Until that passes, every broadcast fails with
+`UNAVAILABLE` and `NODE_UNAVAILABLE` without sending the transaction, and the
+dependency reports `node_unavailable` (failure class `protocol_mismatch` for a
+table that disagrees, and `node_unreachable` for a cookie file the query cannot
+read yet) or `node_capability_missing`. The probe retries the
+verification every round. Once it passes, the probe exercises `tip_id` and
+upstream synchronization health through the same endpoint and publishes
 `node_unavailable`, `upstream_not_ready`, or `node_capability_missing` as the
-node-source dependency's cause. It does not repeat structural capability
-discovery. Transaction broadcast is the only node-backed operation; tree state
-at any height is served from the serving pair. A query that does not advertise
-broadcast therefore runs no node probe, and its node-source dependency is
-never degraded. Any node-backed composition must admit `TipId` before binding
-so this liveness prerequisite cannot fail later as a configuration surprise.
+dependency's cause. It never changes the advertised capability set.
 The serving-pair publisher, node-readiness probe, and
 ingest-control-readiness probe are supervised with the gRPC server; an
 unexpected exit drains readiness and terminates the runtime.
@@ -423,15 +434,18 @@ status, catch canonical and wallet secondaries up, and publish a pair that
 passes exact-fence admission. In wallet mode, the node source behind
 `SendTransaction` and ingest control behind `GetMempoolStream`,
 `GetMempoolTx`, and unmined `GetTransaction` lookups are dependencies, probed
-as native query probes them. An outage of either appears under `degraded`,
-and only the methods that call it fail with `UNAVAILABLE` while every other
-method, including `GetTreeState` at any height, keeps answering. A writer
-mempool that hydrates or rebuilds from its node degrades ingest control with
+as native query probes them. The node is optional and verified on first
+contact as for native query; without `[node]`, `SendTransaction` is
+unsupported. An outage of either dependency appears under `degraded`, and only
+the methods that call it fail with `UNAVAILABLE` while every other method,
+including `GetTreeState` at any height, keeps answering. A writer mempool that
+hydrates or rebuilds from its node degrades ingest control with
 `node_unavailable`, and a writer halt observed by the ingest-control probe
 refuses traffic until the serving-pair publisher validates a following
-writer. Compact-blocks mode calls neither from any method and runs no
-dependency probe. Traffic uses a readiness interceptor, so a process whose
-serving pair refuses traffic does not accept new gRPC requests.
+writer. Compact-blocks mode calls neither from any method, runs no dependency
+probe, and rejects every node setting. Traffic uses a readiness interceptor,
+so a process whose serving pair refuses traffic does not accept new gRPC
+requests.
 
 Wallet-mode compatibility admits ingest control at startup through the same
 `AdmittedIngestControl` as native query, which validates service identity,
@@ -506,7 +520,13 @@ one upstream runtime is briefly unready, without making any request succeed.
 Startup phases use the shared `StartupPhase` vocabulary, including load config,
 connect node, admit ingest control, check schema, recover state, open storage,
 start API, and ready. Phase duration and failure are metrics and structured
-logs.
+logs. Only ingest connects to the node at startup. Query, compatibility, and
+the projector open storage on the schedule the canonical writer admitted, so
+they start while the node is down or before it writes its cookie file. A store
+whose writer has not admitted a schedule yet delays their storage open within
+its convergence bound. Native query and wallet-mode compatibility count each
+such round as `outcome="writer_schedule_not_admitted"` in
+`zinder_wallet_serving_pair_publisher_convergence_total`.
 
 On termination, a runtime sets `shutting_down`, stops accepting new traffic,
 cancels background tasks, waits for owned tasks and servers, and closes the

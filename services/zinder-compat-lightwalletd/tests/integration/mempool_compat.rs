@@ -47,14 +47,9 @@ fn single_block_serving_query() -> eyre::Result<(WalletServingQuery<()>, WalletS
         &activations,
     )?;
     let (canonical, wallet) = store_fixture.take_readers()?;
-    let query = WalletServingQuery::from_serving_pair_slot(
-        WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
-            Arc::new(canonical),
-            Arc::new(wallet),
-        )?)),
-        (),
-        activations,
-    );
+    let query = WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(
+        WalletServingReadPair::new(Arc::new(canonical), Arc::new(wallet))?,
+    )));
     Ok((query, store_fixture))
 }
 

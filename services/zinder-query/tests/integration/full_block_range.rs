@@ -245,9 +245,7 @@ async fn serving_pair_with_all_retention_advertises_and_serves_full_blocks() -> 
         crate::common::admitted_ingest_control_fixture().await?;
     let query = WalletServingQuery::from_admitted_native_serving_pair(
         WalletServingPairSlot::new(pair),
-        (),
         ingest_control,
-        activations,
     );
 
     assert!(
@@ -351,9 +349,7 @@ async fn serving_pair_without_block_retention_omits_and_rejects_full_blocks() ->
         crate::common::admitted_ingest_control_fixture().await?;
     let query = WalletServingQuery::from_admitted_native_serving_pair(
         WalletServingPairSlot::new(pair),
-        (),
         ingest_control,
-        activations,
     );
 
     assert!(

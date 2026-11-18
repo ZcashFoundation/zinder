@@ -4,7 +4,12 @@ use zinder_core::{ArtifactSchemaVersion, Network};
 
 use crate::{Capability, CapabilityDescriptor};
 
-/// Upstream node metadata captured by the query endpoint.
+/// Metadata of the node endpoint a query broadcasts transactions through.
+///
+/// The query starts without contacting its node and verifies the endpoint on
+/// first contact. Until that verification passes, the server reports this
+/// descriptor empty: no version and no capabilities. A query configured
+/// without a node always reports it empty.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct NodeServerInfo {
@@ -37,7 +42,13 @@ pub struct ServerInfo {
     pub schema_version: ArtifactSchemaVersion,
     /// Configured canonical reorg window depth in blocks.
     pub reorg_window_blocks: u32,
-    /// Upstream node metadata, when the endpoint has a source snapshot.
+    /// Broadcast node metadata, empty until the endpoint's node passes
+    /// first-contact verification. Read it on each `ServerInfo` call rather
+    /// than caching the first answer.
+    ///
+    /// The release query always sets this field. Empty means a descriptor
+    /// with no version and no capabilities, so check `capabilities.is_empty()`
+    /// rather than `is_none()`; `None` means the server sent no descriptor.
     pub node: Option<NodeServerInfo>,
 }
 

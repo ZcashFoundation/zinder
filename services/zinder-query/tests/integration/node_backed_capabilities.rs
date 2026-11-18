@@ -23,11 +23,12 @@ use zinder_proto::capabilities::{
 };
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
 use zinder_query::{
-    AdmittedIngestControl, WalletEndpointMetadata, WalletQueryApi, WalletQueryGrpcAdapter,
-    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
+    AdmittedIngestControl, NodeBroadcast, WalletEndpointMetadata, WalletQueryApi,
+    WalletQueryGrpcAdapter, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_source::{
-    NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError, TransactionBroadcaster,
+    BroadcastNodeProbe, NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError,
+    TransactionBroadcaster,
 };
 use zinder_store::RawBlobRetention;
 use zinder_testkit::{ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations};
@@ -49,7 +50,7 @@ async fn native_and_operations_surfaces_advertise_the_same_admitted_capabilities
         broadcast_count: Arc::new(AtomicUsize::new(0)),
         broadcast_outcome: None,
     };
-    let (query, _store_fixture, _ingest_control_fixture) = serving_query(source).await?;
+    let NodeQueryFixture { query, .. } = serving_query(source).await?;
     let admitted = query.native_endpoint_capabilities().shared_identifiers();
     let adapter = WalletQueryGrpcAdapter::new(query.clone(), WalletEndpointMetadata::default());
     let native =
@@ -136,7 +137,7 @@ async fn openrpc_value_pool_method_is_not_sufficient_native_admission_evidence()
         broadcast_count: Arc::new(AtomicUsize::new(0)),
         broadcast_outcome: None,
     };
-    let (query, _store_fixture, _ingest_control_fixture) = serving_query(source).await?;
+    let NodeQueryFixture { query, .. } = serving_query(source).await?;
 
     assert!(
         !query
@@ -184,7 +185,7 @@ async fn absent_node_value_pool_capability_is_omitted_and_rejected_before_fetch(
         broadcast_count: Arc::new(AtomicUsize::new(0)),
         broadcast_outcome: None,
     };
-    let (query, _store_fixture, _ingest_control_fixture) = serving_query(source).await?;
+    let NodeQueryFixture { query, .. } = serving_query(source).await?;
 
     assert!(
         !query
@@ -208,13 +209,12 @@ async fn absent_node_value_pool_capability_is_omitted_and_rejected_before_fetch(
     Ok(())
 }
 
+/// Composition never contacts the node: a configured node advertises
+/// broadcast at once, whatever it would report on first contact.
 #[tokio::test]
-async fn node_backed_composition_requires_tip_liveness_capability() -> eyre::Result<()> {
+async fn configured_node_advertises_broadcast_without_being_contacted() -> eyre::Result<()> {
     let source = ProbedValuePoolSource {
-        capabilities: NodeCapabilities::new([
-            NodeCapability::OpenRpcDiscovery,
-            NodeCapability::TransactionBroadcast,
-        ])?,
+        capabilities: NodeCapabilities::new([NodeCapability::OpenRpcDiscovery])?,
         value_pools: ChainValuePools::new(
             BlockId::new(BlockHeight::new(7), BlockHash::from_bytes([0x77; 32])),
             Vec::new(),
@@ -223,26 +223,27 @@ async fn node_backed_composition_requires_tip_liveness_capability() -> eyre::Res
         broadcast_count: Arc::new(AtomicUsize::new(0)),
         broadcast_outcome: None,
     };
+    let contact_count = Arc::clone(&source.fetch_count);
 
-    assert!(matches!(
-        serving_query(source).await,
-        Err(error)
-            if error
-                .downcast_ref::<zinder_query::QueryError>()
-                .is_some_and(|error| matches!(
-                    error,
-                    zinder_query::QueryError::Node(SourceError::NodeCapabilityMissing {
-                        capability: NodeCapability::TipId
-                    })
-                ))
-    ));
+    let NodeQueryFixture { query, .. } = serving_query(source).await?;
+
+    assert!(
+        query
+            .native_endpoint_capabilities()
+            .contains(WALLET_BROADCAST_TRANSACTION_V1)
+    );
+    assert!(query.upstream_node_capabilities().is_none());
+    assert_eq!(contact_count.load(Ordering::SeqCst), 0);
     Ok(())
 }
 
-/// A node's tree-state capability is not node-backed evidence: tree state is
-/// served from storage, so composition does not demand a liveness probe.
+/// Tree state is served from storage. A node that lists tree state but not
+/// `sendrawtransaction` fails first-contact verification, so it never
+/// receives a transaction while every stored read keeps working.
 #[tokio::test]
-async fn tree_state_capability_alone_does_not_make_the_query_node_backed() -> eyre::Result<()> {
+async fn node_without_broadcast_fails_verification_and_receives_no_transaction() -> eyre::Result<()>
+{
+    let broadcast_count = Arc::new(AtomicUsize::new(0));
     let source = ProbedValuePoolSource {
         capabilities: NodeCapabilities::new([
             NodeCapability::OpenRpcDiscovery,
@@ -253,28 +254,44 @@ async fn tree_state_capability_alone_does_not_make_the_query_node_backed() -> ey
             Vec::new(),
         ),
         fetch_count: Arc::new(AtomicUsize::new(0)),
-        broadcast_count: Arc::new(AtomicUsize::new(0)),
+        broadcast_count: Arc::clone(&broadcast_count),
         broadcast_outcome: None,
     };
 
-    let (query, _store_fixture, _ingest_control_fixture) = serving_query(source).await?;
+    let NodeQueryFixture {
+        query, node, slot, ..
+    } = serving_query(source).await?;
 
+    assert!(matches!(
+        node.verify(&slot).await,
+        Err(SourceError::NodeCapabilityMissing {
+            capability: NodeCapability::TransactionBroadcast
+        })
+    ));
     assert!(
         query
             .native_endpoint_capabilities()
             .contains(WALLET_READ_TREE_STATE_AT_HEIGHT_V2)
     );
-    assert!(
-        !query
-            .native_endpoint_capabilities()
-            .contains(WALLET_BROADCAST_TRANSACTION_V1)
+    assert_eq!(
+        query.tree_state_at(BlockHeight::new(1), None).await?.height,
+        BlockHeight::new(1)
     );
+    assert!(matches!(
+        query
+            .broadcast_transaction(RawTransactionBytes::new(vec![1]))
+            .await,
+        Err(zinder_query::QueryError::Node(
+            SourceError::NodeUnavailable { .. }
+        ))
+    ));
+    assert_eq!(broadcast_count.load(Ordering::SeqCst), 0);
     Ok(())
 }
 
 #[tokio::test]
-async fn probed_broadcast_is_advertised_and_invokable_beside_stored_tree_state() -> eyre::Result<()>
-{
+async fn verified_broadcast_is_advertised_and_invokable_beside_stored_tree_state()
+-> eyre::Result<()> {
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let chain = ChainFixture::new(Network::ZcashRegtest)
         .with_raw_blob_retention(RawBlobRetention::Transactions)
@@ -298,8 +315,10 @@ async fn probed_broadcast_is_advertised_and_invokable_beside_stored_tree_state()
             transaction_id: accepted_transaction_id,
         })),
     };
-    let (query, _store_fixture, _ingest_control_fixture) =
-        serving_query_from_chain(source, &chain, &activations).await?;
+    let NodeQueryFixture {
+        query, node, slot, ..
+    } = serving_query_from_chain(source, &chain, &activations).await?;
+    node.verify(&slot).await?;
 
     for capability in [
         WALLET_READ_TREE_STATE_AT_HEIGHT_V2,
@@ -377,7 +396,10 @@ async fn native_broadcast_carries_nu7_rejection_reasons_on_the_wire() -> eyre::R
                 message: message.to_owned(),
             })),
         };
-        let (query, _store_fixture, _ingest_control_fixture) = serving_query(source).await?;
+        let NodeQueryFixture {
+            query, node, slot, ..
+        } = serving_query(source).await?;
+        node.verify(&slot).await?;
         let adapter = WalletQueryGrpcAdapter::new(query, WalletEndpointMetadata::default());
 
         let broadcast = WalletQueryService::broadcast_transaction(
@@ -400,21 +422,27 @@ async fn native_broadcast_carries_nu7_rejection_reasons_on_the_wire() -> eyre::R
     Ok(())
 }
 
+/// A query without a configured node serves storage only and advertises no
+/// broadcast.
 #[tokio::test]
-async fn absent_broadcast_capability_rejects_without_invoking_the_source_and_keeps_tree_state()
--> eyre::Result<()> {
-    let broadcast_count = Arc::new(AtomicUsize::new(0));
-    let source = ProbedValuePoolSource {
-        capabilities: NodeCapabilities::new([NodeCapability::OpenRpcDiscovery])?,
-        value_pools: ChainValuePools::new(
-            BlockId::new(BlockHeight::new(7), BlockHash::from_bytes([0x77; 32])),
-            Vec::new(),
-        ),
-        fetch_count: Arc::new(AtomicUsize::new(0)),
-        broadcast_count: Arc::clone(&broadcast_count),
-        broadcast_outcome: None,
-    };
-    let (query, _store_fixture, _ingest_control_fixture) = serving_query(source).await?;
+async fn query_without_a_node_omits_broadcast_and_keeps_tree_state() -> eyre::Result<()> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let chain = ChainFixture::new(Network::ZcashRegtest)
+        .with_raw_blob_retention(RawBlobRetention::Transactions)
+        .extend_blocks(1);
+    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+    let (canonical, wallet) = store_fixture.take_readers()?;
+    let pair = Arc::new(WalletServingReadPair::new(
+        Arc::new(canonical),
+        Arc::new(wallet),
+    )?);
+    let (ingest_control, _ingest_control_fixture) =
+        crate::common::admitted_ingest_control_fixture().await?;
+    let query = WalletServingQuery::from_admitted_native_serving_pair(
+        WalletServingPairSlot::new(pair),
+        ingest_control,
+    )
+    .with_node_broadcast::<ProbedValuePoolSource>(None);
 
     assert!(
         query
@@ -438,17 +466,20 @@ async fn absent_broadcast_capability_rejects_without_invoking_the_source_and_kee
             capability: WALLET_BROADCAST_TRANSACTION_V1
         })
     ));
-    assert_eq!(broadcast_count.load(Ordering::SeqCst), 0);
     Ok(())
 }
 
-async fn serving_query(
-    source: ProbedValuePoolSource,
-) -> eyre::Result<(
-    WalletServingQuery<ProbedValuePoolSource, AdmittedIngestControl>,
-    WalletServingStoreFixture,
-    zinder_testkit::IngestControlFixture,
-)> {
+/// Native query composed over a node double, with the node handle and slot
+/// a test verifies against.
+struct NodeQueryFixture {
+    query: WalletServingQuery<Option<NodeBroadcast<ProbedValuePoolSource>>, AdmittedIngestControl>,
+    node: NodeBroadcast<ProbedValuePoolSource>,
+    slot: WalletServingPairSlot,
+    _store_fixture: WalletServingStoreFixture,
+    _ingest_control_fixture: zinder_testkit::IngestControlFixture,
+}
+
+async fn serving_query(source: ProbedValuePoolSource) -> eyre::Result<NodeQueryFixture> {
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let chain = ChainFixture::new(Network::ZcashRegtest)
         .with_raw_blob_retention(RawBlobRetention::Transactions)
@@ -460,11 +491,7 @@ async fn serving_query_from_chain(
     source: ProbedValuePoolSource,
     chain: &ChainFixture,
     activations: &Arc<zinder_core::NetworkUpgradeActivations>,
-) -> eyre::Result<(
-    WalletServingQuery<ProbedValuePoolSource, AdmittedIngestControl>,
-    WalletServingStoreFixture,
-    zinder_testkit::IngestControlFixture,
-)> {
+) -> eyre::Result<NodeQueryFixture> {
     let mut store_fixture = WalletServingStoreFixture::from_chain(chain, activations)?;
     let (canonical, wallet) = store_fixture.take_readers()?;
     let pair = Arc::new(WalletServingReadPair::new(
@@ -473,13 +500,17 @@ async fn serving_query_from_chain(
     )?);
     let (ingest_control, ingest_control_fixture) =
         crate::common::admitted_ingest_control_fixture().await?;
-    let query = WalletServingQuery::from_admitted_native_sources(
-        WalletServingPairSlot::new(pair),
-        source,
-        ingest_control,
-        Arc::clone(activations),
-    )?;
-    Ok((query, store_fixture, ingest_control_fixture))
+    let slot = WalletServingPairSlot::new(pair);
+    let node = NodeBroadcast::new(source);
+    let query = WalletServingQuery::from_admitted_native_serving_pair(slot.clone(), ingest_control)
+        .with_node_broadcast(Some(node.clone()));
+    Ok(NodeQueryFixture {
+        query,
+        node,
+        slot,
+        _store_fixture: store_fixture,
+        _ingest_control_fixture: ingest_control_fixture,
+    })
 }
 
 #[derive(Clone)]
@@ -510,6 +541,24 @@ impl NodeSource for ProbedValuePoolSource {
     async fn fetch_chain_value_pools_at_tip(&self) -> Result<ChainValuePools, SourceError> {
         self.fetch_count.fetch_add(1, Ordering::SeqCst);
         Ok(self.value_pools.clone())
+    }
+}
+
+#[async_trait]
+impl BroadcastNodeProbe for ProbedValuePoolSource {
+    async fn probe_capabilities(&self) -> Result<NodeCapabilities, SourceError> {
+        self.fetch_count.fetch_add(1, Ordering::SeqCst);
+        Ok(self.capabilities)
+    }
+
+    async fn fetch_network_upgrade_activations(
+        &self,
+    ) -> Result<zinder_core::NetworkUpgradeActivations, SourceError> {
+        Ok(sample_regtest_upgrade_activations())
+    }
+
+    async fn holds_block(&self, _block: BlockId) -> Result<bool, SourceError> {
+        Ok(true)
     }
 }
 

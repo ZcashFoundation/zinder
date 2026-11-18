@@ -421,9 +421,7 @@ async fn spawn_unspent_output_server(
         crate::common::admitted_ingest_control_fixture().await?;
     let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
         WalletServingPairSlot::new(Arc::clone(&pair)),
-        (),
         ingest_control,
-        activations,
     );
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
     let server_addr = spawn_wallet_query_server(grpc_adapter, store_fixture).await?;
@@ -553,9 +551,7 @@ async fn commit_store_and_build_adapter() -> Result<(ServingAdapter, WalletServi
         crate::common::admitted_ingest_control_fixture().await?;
     let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
         WalletServingPairSlot::new(serving_pair),
-        (),
         ingest_control,
-        activations,
     );
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
     Ok((grpc_adapter, store_fixture))

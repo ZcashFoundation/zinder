@@ -3,37 +3,286 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
+use std::time::Duration;
+
 use eyre::eyre;
+use serde_json::json;
 use zinder_core::{
-    BlockHeight, BlockId, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding,
+    BlockHash, BlockHeight, BroadcastAccepted, BroadcastDuplicate, BroadcastInvalidEncoding,
     BroadcastQueued, BroadcastRejected, BroadcastRejectionReason, MAX_RAW_TRANSACTION_BYTES,
-    Network, RawTransactionBytes, TransactionBroadcastOutcome, TransactionId,
+    Network, NetworkUpgradeActivation, NetworkUpgradeActivations, RawTransactionBytes,
+    TransactionBroadcastOutcome, TransactionId,
+    wire::{encode_branch_id_hex, encode_rpc_block_hash_hex},
 };
 use zinder_proto::capabilities::WALLET_BROADCAST_TRANSACTION_V1;
-use zinder_query::{QueryError, WalletQueryApi, WalletServingQuery};
-use zinder_source::SourceError;
-use zinder_testkit::{ChainFixture, MockTransactionBroadcaster, WalletServingStoreFixture};
+use zinder_query::{NodeBroadcast, QueryError, WalletQueryApi, WalletServingQuery};
+use zinder_source::{NodeAuth, SourceError, ZebraJsonRpcSource};
+use zinder_testkit::{
+    ChainFixture, JsonRpcTestServer, MockTransactionBroadcaster, RpcReply,
+    WalletServingStoreFixture, method, sample_regtest_upgrade_activations,
+};
 
-use crate::common::{ProbedNode, probed_serving_query_over, serving_query_over};
+use crate::common::{
+    NodeBroadcastQuery, serving_pair_slot, serving_query_over, verified_node_query_over,
+};
 
-/// Builds the release serving query whose probed node admits broadcast and
-/// forwards it to `broadcaster`.
-fn broadcasting_query(
+/// Builds the release serving query whose verified node forwards broadcasts
+/// to `broadcaster`.
+async fn broadcasting_query(
     broadcaster: MockTransactionBroadcaster,
-) -> eyre::Result<(WalletServingQuery<ProbedNode>, WalletServingStoreFixture)> {
+) -> eyre::Result<(NodeBroadcastQuery, WalletServingStoreFixture)> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
-    let tip = chain
+    verified_node_query_over(&chain, broadcaster).await
+}
+
+/// A reader starts without contacting its node, so a broadcast that arrives
+/// before the node's first-contact verification fails without sending the
+/// transaction anywhere.
+#[tokio::test]
+async fn broadcast_before_node_verification_fails_without_sending() -> eyre::Result<()> {
+    let broadcaster = MockTransactionBroadcaster::accepted(TransactionId::from_bytes([7; 32]))
+        .with_node_activations(sample_regtest_upgrade_activations());
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let mut store_fixture =
+        WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
+    let slot = serving_pair_slot(&mut store_fixture)?;
+    let node = NodeBroadcast::new(broadcaster.clone());
+    let wallet_query = WalletServingQuery::from_serving_pair_slot(slot.clone())
+        .with_node_broadcast(Some(node.clone()));
+
+    assert!(
+        wallet_query
+            .native_endpoint_capabilities()
+            .contains(WALLET_BROADCAST_TRANSACTION_V1)
+    );
+    assert!(wallet_query.upstream_node_capabilities().is_none());
+    let error = wallet_query
+        .broadcast_transaction(RawTransactionBytes::new([0x00, 0x01]))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("an unverified node must not receive a broadcast"))?;
+    assert!(
+        matches!(error, QueryError::Node(SourceError::NodeUnavailable { .. })),
+        "unexpected unverified-node error: {error:?}"
+    );
+    assert!(broadcaster.captured_calls().is_empty());
+
+    node.verify(&slot).await?;
+    assert!(wallet_query.upstream_node_capabilities().is_some());
+    wallet_query
+        .broadcast_transaction(RawTransactionBytes::new([0x00, 0x01]))
+        .await?;
+    assert_eq!(broadcaster.call_count(), 1);
+    Ok(())
+}
+
+/// A node whose activation table differs from the writer-admitted schedule
+/// through the served tip is on another network, so verification refuses it
+/// and it never receives a transaction.
+#[tokio::test]
+async fn node_on_another_chain_fails_verification_and_receives_nothing() -> eyre::Result<()> {
+    let mainnet_shaped = NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        sample_regtest_upgrade_activations()
+            .activations()
+            .iter()
+            .map(|activation| NetworkUpgradeActivation {
+                activation_height: BlockHeight::new(419_200),
+                ..activation.clone()
+            })
+            .collect(),
+    )?;
+    let broadcaster = MockTransactionBroadcaster::accepted(TransactionId::from_bytes([7; 32]))
+        .with_node_activations(mainnet_shaped);
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let mut store_fixture =
+        WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
+    let slot = serving_pair_slot(&mut store_fixture)?;
+    let node = NodeBroadcast::new(broadcaster.clone());
+    let wallet_query = WalletServingQuery::from_serving_pair_slot(slot.clone())
+        .with_node_broadcast(Some(node.clone()));
+
+    let refusal = node
+        .verify(&slot)
+        .await
+        .err()
+        .ok_or_else(|| eyre!("a node on another chain must fail verification"))?;
+    assert!(
+        matches!(refusal, SourceError::SourceProtocolMismatch { .. }),
+        "unexpected verification refusal: {refusal:?}"
+    );
+    assert!(
+        wallet_query
+            .broadcast_transaction(RawTransactionBytes::new([0x00, 0x01]))
+            .await
+            .is_err()
+    );
+    assert!(broadcaster.captured_calls().is_empty());
+    Ok(())
+}
+
+/// A node with the writer-admitted schedule whose best chain holds another
+/// block at the served tip follows another chain, so verification refuses it
+/// and it never receives a transaction.
+#[tokio::test]
+async fn node_with_the_same_schedule_on_another_chain_fails_verification() -> eyre::Result<()> {
+    let broadcaster = MockTransactionBroadcaster::accepted(TransactionId::from_bytes([7; 32]))
+        .with_node_activations(sample_regtest_upgrade_activations())
+        .on_another_chain();
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let mut store_fixture =
+        WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
+    let slot = serving_pair_slot(&mut store_fixture)?;
+    let node = NodeBroadcast::new(broadcaster.clone());
+    let wallet_query = WalletServingQuery::from_serving_pair_slot(slot.clone())
+        .with_node_broadcast(Some(node.clone()));
+
+    let refusal = node
+        .verify(&slot)
+        .await
+        .err()
+        .ok_or_else(|| eyre!("a node on another chain must fail verification"))?;
+    assert!(
+        matches!(refusal, SourceError::SourceProtocolMismatch { .. }),
+        "unexpected verification refusal: {refusal:?}"
+    );
+    assert!(wallet_query.upstream_node_capabilities().is_none());
+    assert!(
+        wallet_query
+            .broadcast_transaction(RawTransactionBytes::new([0x00, 0x01]))
+            .await
+            .is_err()
+    );
+    assert!(broadcaster.captured_calls().is_empty());
+    Ok(())
+}
+
+/// The sample regtest upgrades with one upgrade per height, so a node table
+/// compares equal whatever order its `upgrades` object lists them in.
+fn one_upgrade_per_height() -> eyre::Result<NetworkUpgradeActivations> {
+    Ok(NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        sample_regtest_upgrade_activations()
+            .activations()
+            .iter()
+            .zip(1..)
+            .map(|(activation, height)| NetworkUpgradeActivation {
+                activation_height: BlockHeight::new(height),
+                ..activation.clone()
+            })
+            .collect(),
+    )?)
+}
+
+/// Starts a node double that passes first-contact verification once for a
+/// pair serving `schedule` with `tip_hash` at its tip, then accepts one
+/// broadcast.
+fn verifiable_node(
+    schedule: &NetworkUpgradeActivations,
+    tip_hash: BlockHash,
+) -> eyre::Result<JsonRpcTestServer> {
+    let upgrades: serde_json::Map<String, serde_json::Value> = schedule
+        .activations()
+        .iter()
+        .map(|activation| {
+            (
+                encode_branch_id_hex(activation.branch_id),
+                json!({
+                    "name": activation.name,
+                    "activationheight": activation.activation_height.value(),
+                    "status": "active",
+                }),
+            )
+        })
+        .collect();
+    JsonRpcTestServer::start([
+        method("rpc.discover").reply(RpcReply::result(json!({
+            "openrpc": "1.3.2",
+            "methods": [{"name": "rpc.discover"}, {"name": "sendrawtransaction"}],
+        }))),
+        method("getblockchaininfo").reply(RpcReply::result(json!({ "upgrades": upgrades }))),
+        method("getblockhash").reply(RpcReply::result(json!(encode_rpc_block_hash_hex(tip_hash)))),
+        method("sendrawtransaction").reply(RpcReply::result(json!(
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        ))),
+    ])
+}
+
+/// A reader with cookie authentication can start before its node writes the
+/// cookie file.
+///
+/// Verification and broadcast fail as node-unavailable without contacting
+/// the node until the file appears. Verification then passes, and broadcast
+/// reaches the node with the cookie credentials.
+#[tokio::test]
+async fn node_cookie_written_after_startup_is_verified_once_it_appears() -> eyre::Result<()> {
+    const AUTHORIZATION: &str = "Basic X19jb29raWVfXzpub2RlLXN0YXJ0ZWQ=";
+    let schedule = one_upgrade_per_height()?;
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let tip_hash = chain
         .block_at(BlockHeight::new(1))
-        .ok_or_else(|| eyre!("fixture must contain height 1"))?;
-    let node = ProbedNode::with_broadcaster(BlockId::new(tip.height, tip.hash), broadcaster)?;
-    probed_serving_query_over(&chain, node)
+        .ok_or_else(|| eyre!("fixture must contain height 1"))?
+        .hash;
+    let mut store_fixture = WalletServingStoreFixture::from_chain(&chain, &schedule)?;
+    let slot = serving_pair_slot(&mut store_fixture)?;
+    let server = verifiable_node(&schedule, tip_hash)?;
+    let cookie_dir = tempfile::tempdir()?;
+    let cookie_path = cookie_dir.path().join(".cookie");
+    let node = NodeBroadcast::new(ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::cookie_file(&cookie_path),
+        Duration::from_secs(5),
+    )?);
+    let wallet_query = WalletServingQuery::from_serving_pair_slot(slot.clone())
+        .with_node_broadcast(Some(node.clone()));
+
+    let refused_broadcast = wallet_query
+        .broadcast_transaction(RawTransactionBytes::new([0x00, 0x01]))
+        .await
+        .err();
+    let refused_verification = node.verify(&slot).await.err();
+    assert!(
+        matches!(
+            refused_broadcast,
+            Some(QueryError::Node(SourceError::NodeUnavailable { .. }))
+        ),
+        "unexpected broadcast outcome before the cookie exists: {refused_broadcast:?}"
+    );
+    assert!(
+        matches!(&refused_verification, Some(SourceError::NodeUnavailable { reason }) if reason.contains("cookie")),
+        "unexpected verification outcome before the cookie exists: {refused_verification:?}"
+    );
+    assert!(server.requests()?.is_empty());
+
+    std::fs::write(&cookie_path, "__cookie__:node-started")?;
+    node.verify(&slot).await?;
+    let broadcast_outcome = wallet_query
+        .broadcast_transaction(RawTransactionBytes::new([0x00, 0x01]))
+        .await?;
+
+    assert_eq!(
+        broadcast_outcome,
+        TransactionBroadcastOutcome::Accepted(BroadcastAccepted {
+            transaction_id: TransactionId::from_bytes([0x11; 32]),
+        })
+    );
+    let requests = server.requests()?;
+    assert_eq!(requests.len(), 4, "{requests:?}");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.authorization.as_deref() == Some(AUTHORIZATION)),
+        "{requests:?}"
+    );
+    Ok(())
 }
 
 #[tokio::test]
 async fn broadcast_transaction_returns_accepted_result() -> eyre::Result<()> {
     let transaction_id = TransactionId::from_bytes([7; 32]);
     let mock_broadcaster = MockTransactionBroadcaster::accepted(transaction_id);
-    let (wallet_query, _store_fixture) = broadcasting_query(mock_broadcaster.clone())?;
+    let (wallet_query, _store_fixture) = broadcasting_query(mock_broadcaster.clone()).await?;
 
     let broadcast_outcome = wallet_query
         .broadcast_transaction(RawTransactionBytes::new([0x00, 0x01]))
@@ -90,7 +339,8 @@ async fn broadcast_transaction_preserves_rejection_classes() -> eyre::Result<()>
     for expected_broadcast_outcome in cases {
         let (wallet_query, _store_fixture) = broadcasting_query(
             MockTransactionBroadcaster::returning(expected_broadcast_outcome.clone()),
-        )?;
+        )
+        .await?;
 
         let broadcast_outcome = wallet_query
             .broadcast_transaction(RawTransactionBytes::new([0x02]))
@@ -106,7 +356,7 @@ async fn broadcast_transaction_preserves_rejection_classes() -> eyre::Result<()>
 async fn broadcast_transaction_rejects_oversized_payload_before_upstream_call() -> eyre::Result<()>
 {
     let mock_broadcaster = MockTransactionBroadcaster::accepted(TransactionId::from_bytes([1; 32]));
-    let (wallet_query, _store_fixture) = broadcasting_query(mock_broadcaster.clone())?;
+    let (wallet_query, _store_fixture) = broadcasting_query(mock_broadcaster.clone()).await?;
     let oversized = RawTransactionBytes::new(vec![0u8; MAX_RAW_TRANSACTION_BYTES + 1]);
 
     let error = match wallet_query.broadcast_transaction(oversized).await {
@@ -133,7 +383,7 @@ async fn broadcast_transaction_rejects_oversized_payload_before_upstream_call() 
 async fn broadcast_transaction_admits_payload_at_size_bound() -> eyre::Result<()> {
     let transaction_id = TransactionId::from_bytes([6; 32]);
     let mock_broadcaster = MockTransactionBroadcaster::accepted(transaction_id);
-    let (wallet_query, _store_fixture) = broadcasting_query(mock_broadcaster.clone())?;
+    let (wallet_query, _store_fixture) = broadcasting_query(mock_broadcaster.clone()).await?;
     let at_bound = RawTransactionBytes::new(vec![0u8; MAX_RAW_TRANSACTION_BYTES]);
 
     let broadcast_outcome = wallet_query.broadcast_transaction(at_bound.clone()).await?;
@@ -151,7 +401,8 @@ async fn broadcast_transaction_admits_payload_at_size_bound() -> eyre::Result<()
 async fn broadcast_transaction_maps_node_unavailability_to_query_error() -> eyre::Result<()> {
     let (wallet_query, _store_fixture) = broadcasting_query(
         MockTransactionBroadcaster::node_unavailable("node is offline"),
-    )?;
+    )
+    .await?;
 
     let error = match wallet_query
         .broadcast_transaction(RawTransactionBytes::new([0x03]))
@@ -176,7 +427,7 @@ async fn broadcast_transaction_maps_node_unavailability_to_query_error() -> eyre
 async fn broadcast_transaction_does_not_mutate_chain_epoch() -> eyre::Result<()> {
     let transaction_id = TransactionId::from_bytes([9; 32]);
     let (wallet_query, _store_fixture) =
-        broadcasting_query(MockTransactionBroadcaster::accepted(transaction_id))?;
+        broadcasting_query(MockTransactionBroadcaster::accepted(transaction_id)).await?;
     let chain_epoch = wallet_query.visible_tip_block(None).await?.chain_epoch;
 
     let broadcast_outcome = wallet_query

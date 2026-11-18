@@ -34,7 +34,7 @@ pub use mempool_source::{
 };
 pub use node_auth::{CookieSource, CookieSourceError, NodeAuth};
 pub use node_capabilities::{NodeCapabilities, NodeCapabilitiesError, NodeCapability};
-pub use node_source::{NodeSource, TransactionBroadcaster};
+pub use node_source::{BroadcastNodeProbe, NodeSource, TransactionBroadcaster};
 pub use node_target::{
     DEFAULT_NODE_HEALTH_ESTIMATED_GAP_FLOOR_BLOCKS, DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS,
     DEFAULT_NODE_HEALTH_VERIFICATION_PROGRESS_FLOOR, DEFAULT_NODE_REQUEST_TIMEOUT_SECS,

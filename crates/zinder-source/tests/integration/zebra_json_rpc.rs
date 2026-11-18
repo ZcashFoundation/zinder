@@ -20,8 +20,8 @@ use zinder_core::{
     SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome, TransactionId,
 };
 use zinder_source::{
-    CookieSource, NodeAuth, NodeCapability, NodeHealthConfig, NodeSource, SourceChainCursor,
-    SourceChainUpdate, SourceError, SourceFailureClass, TransactionBroadcaster,
+    BroadcastNodeProbe, CookieSource, NodeAuth, NodeCapability, NodeHealthConfig, NodeSource,
+    SourceChainCursor, SourceChainUpdate, SourceError, SourceFailureClass, TransactionBroadcaster,
     UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
     UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, ZebraJsonRpcSource,
@@ -415,6 +415,65 @@ async fn cookie_refusal_reconnects_with_the_rotated_cookie() -> eyre::Result<()>
     );
 
     Ok(())
+}
+
+/// A source built before its node wrote the cookie file waits for the file.
+///
+/// Construction succeeds, each request fails without reaching the node until
+/// the file holds credentials, and the next request then carries them.
+#[tokio::test]
+async fn cookie_file_written_after_construction_is_read_on_the_next_request() -> eyre::Result<()> {
+    const AUTHORIZATION: &str = "Basic X19jb29raWVfXzphZnRlci1zdGFydA==";
+
+    let server = JsonRpcTestServer::start([
+        method("getblockchaininfo").reply(RpcReply::result(json!({ "upgrades": {} })))
+    ])?;
+    let cookie_dir = tempfile::tempdir()?;
+    let cookie_path = cookie_dir.path().join(".cookie");
+    let source = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        server.url(),
+        NodeAuth::cookie_file(&cookie_path),
+        Duration::from_secs(5),
+    )?;
+
+    let missing = source.fetch_network_upgrade_activations().await.err();
+    std::fs::write(&cookie_path, "\n")?;
+    let empty = source.fetch_network_upgrade_activations().await.err();
+    assert!(
+        server.requests()?.is_empty(),
+        "no request reaches the node before its cookie file holds credentials"
+    );
+    std::fs::write(&cookie_path, "__cookie__:after-start")?;
+    source.fetch_network_upgrade_activations().await?;
+
+    for (error, reason) in [
+        (missing, "cookie source could not be read"),
+        (empty, "cookie credentials are empty"),
+    ] {
+        assert!(
+            matches!(&error, Some(SourceError::NodeUnavailable { reason: actual }) if actual.contains(reason)),
+            "expected a node-unavailable cookie failure naming {reason:?}, got {error:?}"
+        );
+    }
+    let requests = server.requests()?;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].authorization.as_deref(), Some(AUTHORIZATION));
+    Ok(())
+}
+
+/// Inline cookie credentials come from configuration, so empty ones still
+/// fail construction instead of being awaited like a cookie file.
+#[test]
+fn empty_inline_cookie_fails_construction() {
+    let outcome = ZebraJsonRpcSource::new(
+        Network::ZcashRegtest,
+        "http://127.0.0.1:1",
+        NodeAuth::cookie_inline(String::new()),
+        Duration::from_secs(5),
+    );
+
+    assert!(matches!(outcome, Err(SourceError::NodeUnavailable { .. })));
 }
 
 #[tokio::test]
@@ -2464,5 +2523,56 @@ async fn poll_upstream_health_uses_ready_endpoint_when_configured() -> eyre::Res
     assert!(!snapshot.ready_for_queries);
     assert_eq!(snapshot.source, "zebra_ready_endpoint");
     assert_eq!(snapshot.reason.as_ref(), "insufficient peers");
+    Ok(())
+}
+
+/// First-contact verification asks the node for the block at the reader's
+/// tip height, so a node on another chain with the same activation table is
+/// told apart by its block hash.
+#[tokio::test]
+async fn holds_block_compares_the_block_hash_at_its_height() -> eyre::Result<()> {
+    let held = BlockId::new(BlockHeight::new(7), BlockHash::from_bytes([0x07; 32]));
+    let held_hash_hex = json!(zinder_core::wire::encode_rpc_block_hash_hex(held.hash));
+    let server = JsonRpcTestServer::start([
+        method("getblockhash").reply(RpcReply::result(held_hash_hex.clone())),
+        method("getblockhash").reply(RpcReply::result(held_hash_hex)),
+    ])?;
+    let source = regtest_source(&server)?;
+
+    assert!(BroadcastNodeProbe::holds_block(&source, held).await?);
+    let other = BlockId::new(held.height, BlockHash::from_bytes([0x70; 32]));
+    assert!(!BroadcastNodeProbe::holds_block(&source, other).await?);
+    let requests = server.requests_for("getblockhash")?;
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests.iter().all(|request| request.params == json!([7])),
+        "getblockhash takes the height as a number: {requests:?}"
+    );
+    Ok(())
+}
+
+/// A node that has not reached the reader's tip holds no block there, which
+/// is a retryable read failure rather than evidence of another chain.
+#[tokio::test]
+async fn holds_block_above_the_node_tip_is_block_unavailable() -> eyre::Result<()> {
+    let server = JsonRpcTestServer::start([
+        method("getblockhash").reply(RpcReply::error("height out of range"))
+    ])?;
+    let source = regtest_source(&server)?;
+
+    let error = BroadcastNodeProbe::holds_block(
+        &source,
+        BlockId::new(BlockHeight::new(9), BlockHash::from_bytes([0x09; 32])),
+    )
+    .await
+    .err()
+    .ok_or_else(|| eyre!("a block above the node tip must not be reported as held"))?;
+    assert!(
+        matches!(
+            error,
+            SourceError::BlockUnavailable { height, .. } if height == BlockHeight::new(9)
+        ),
+        "unexpected error: {error:?}"
+    );
     Ok(())
 }

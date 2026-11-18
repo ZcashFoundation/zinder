@@ -27,9 +27,8 @@ use zinder_core::{
 use zinder_proto::compat::lightwalletd::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
 };
-use zinder_query::{WalletServingPairSlot, WalletServingQuery, WalletServingReadPair};
-use zinder_source::{
-    NodeCapabilities, NodeCapability, NodeSource, SourceError, TransactionBroadcaster,
+use zinder_query::{
+    NodeBroadcast, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_store::{CURRENT_ARTIFACT_SCHEMA_VERSION, MempoolEventEnvelope, RawBlobRetention};
 use zinder_testkit::{
@@ -123,15 +122,12 @@ async fn current_android_sdk_rpc_contract_uses_admitted_production_pair() -> eyr
         Arc::new(canonical_reader),
         Arc::new(wallet_reader),
     )?);
-    let source = AndroidSdkNodeSource::accepted(
-        accepted_transaction_id,
-        BlockId::new(block.height, block.hash),
-    )?;
-    let query = WalletServingQuery::from_probed_node_source(
-        WalletServingPairSlot::new(serving_pair),
-        source.clone(),
-        activations.clone(),
-    )?;
+    let broadcaster = MockTransactionBroadcaster::accepted(accepted_transaction_id)
+        .with_node_activations(activations.as_ref().clone());
+    let slot = WalletServingPairSlot::new(serving_pair);
+    let node = NodeBroadcast::new(broadcaster.clone());
+    node.verify(&slot).await?;
+    let query = WalletServingQuery::from_serving_pair_slot(slot).with_node_broadcast(Some(node));
     let adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(query)?
         .with_mempool_surface(Arc::new(AndroidSdkMempoolSurface::new()?));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -218,9 +214,9 @@ async fn current_android_sdk_rpc_contract_uses_admitted_production_pair() -> eyr
         .await?
         .into_inner();
     assert_eq!(send_response.error_code, 0);
-    assert_eq!(source.broadcaster.call_count(), 1);
+    assert_eq!(broadcaster.call_count(), 1);
     assert_eq!(
-        source.broadcaster.captured_calls()[0].as_slice(),
+        broadcaster.captured_calls()[0].as_slice(),
         SUBMITTED_TRANSACTION_BYTES
     );
 
@@ -412,60 +408,6 @@ impl MempoolSurface for AndroidSdkMempoolSurface {
                 chain_epoch_id: synthetic_chain_epoch().id,
             })
         }
-    }
-}
-
-#[derive(Clone)]
-struct AndroidSdkNodeSource {
-    capabilities: NodeCapabilities,
-    broadcaster: MockTransactionBroadcaster,
-    tip: BlockId,
-}
-
-impl AndroidSdkNodeSource {
-    fn accepted(transaction_id: TransactionId, tip: BlockId) -> eyre::Result<Self> {
-        Ok(Self {
-            capabilities: NodeCapabilities::new([
-                NodeCapability::TipId,
-                NodeCapability::TreeState,
-                NodeCapability::TransactionBroadcast,
-                NodeCapability::OpenRpcDiscovery,
-            ])?,
-            broadcaster: MockTransactionBroadcaster::accepted(transaction_id),
-            tip,
-        })
-    }
-}
-
-#[async_trait]
-impl NodeSource for AndroidSdkNodeSource {
-    fn capabilities(&self) -> NodeCapabilities {
-        self.capabilities
-    }
-
-    async fn fetch_block_at(
-        &self,
-        _height: BlockHeight,
-    ) -> Result<zinder_source::SourceBlock, SourceError> {
-        Err(SourceError::NodeCapabilityMissing {
-            capability: NodeCapability::BestChainBlocks,
-        })
-    }
-
-    async fn tip_id(&self) -> Result<BlockId, SourceError> {
-        Ok(self.tip)
-    }
-}
-
-#[async_trait]
-impl TransactionBroadcaster for AndroidSdkNodeSource {
-    async fn broadcast_transaction(
-        &self,
-        raw_transaction: RawTransactionBytes,
-    ) -> Result<zinder_core::TransactionBroadcastOutcome, SourceError> {
-        self.broadcaster
-            .broadcast_transaction(raw_transaction)
-            .await
     }
 }
 

@@ -79,7 +79,7 @@ recurrence_min_answered_episode_seconds=60
 # loaders. The `wallet_serving` settings configure this entrypoint and reach
 # no process.
 ingest_config_paths="network ops node security ingest_control ingest retention storage.path storage.canonical storage.materialized_views storage.raw_blob_policy"
-projector_config_paths="network ops node security ingest_control projector projector_control storage.canonical_path storage.canonical_secondary_path storage.canonical storage.raw_blob_policy wallet.path wallet.rocksdb"
+projector_config_paths="network ops security ingest_control projector projector_control storage.canonical_path storage.canonical_secondary_path storage.canonical storage.raw_blob_policy wallet.path wallet.rocksdb"
 query_config_paths="network ops node security ingest_control query wallet storage.path storage.secondary_path storage.canonical storage.raw_blob_policy storage.initial_catchup_timeout_ms storage.secondary_catchup_interval_ms storage.secondary_replica_lag_threshold_chain_epochs storage.serving_pair_staleness_ceiling_ms"
 entrypoint_config_paths="wallet_serving.canonical_construction_deadline_seconds wallet_serving.wallet_construction_deadline_seconds"
 

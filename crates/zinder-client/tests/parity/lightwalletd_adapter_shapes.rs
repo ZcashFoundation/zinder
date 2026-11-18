@@ -15,9 +15,7 @@ use zinder_query::{
     CanonicalReader, WalletProjectionReader, WalletServingPairSlot, WalletServingQuery,
     WalletServingReadPair,
 };
-use zinder_testkit::{
-    MockTransactionBroadcaster, WalletServingStoreFixture, sample_regtest_upgrade_activations,
-};
+use zinder_testkit::{WalletServingStoreFixture, sample_regtest_upgrade_activations};
 
 use super::{
     address_history_filter, build_transparent_address_adapter,
@@ -40,11 +38,7 @@ async fn serves_lightwalletd_scan_shape_from_fixture() -> eyre::Result<()> {
         Arc::new(wallet_reader) as Arc<dyn WalletProjectionReader>,
     )?);
     let serving_pair_slot = WalletServingPairSlot::new(serving_pair);
-    let query = WalletServingQuery::from_serving_pair_slot(
-        serving_pair_slot,
-        MockTransactionBroadcaster::broadcast_disabled(),
-        Arc::clone(&activations),
-    );
+    let query = WalletServingQuery::from_serving_pair_slot(serving_pair_slot);
     let adapter = LightwalletdGrpcAdapter::new(query);
 
     let visible_tip_block = adapter

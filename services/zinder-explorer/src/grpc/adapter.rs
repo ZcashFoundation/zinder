@@ -19,7 +19,7 @@ use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, Response, Status, service::interceptor::InterceptedService};
-use zinder_core::{Network, NetworkUpgradeActivations, wire::encode_zinder_native_chain_name};
+use zinder_core::{Network, wire::encode_zinder_native_chain_name};
 use zinder_proto::capabilities::{
     CapabilitySurface, EXPLORER_BLOCK_PRODUCTION_TIME_RANGE_V1,
     EXPLORER_CONVENTIONAL_FEE_DISTRIBUTION_V1, EXPLORER_PAID_FEE_DISTRIBUTION_V1,
@@ -88,6 +88,7 @@ use super::mempool_event_counts::query_mempool_event_counts;
 use super::migration::{
     query_migration_cohorts, query_migration_denominations, query_migration_overview,
 };
+use super::network_upgrade_activations::NetworkUpgradeActivationsCache;
 use super::network_upgrade_status::query_network_upgrade_status;
 use super::overview_snapshot::query_overview_snapshot;
 use super::recent_transactions::{RecentTransactionsStream, query_recent_transactions};
@@ -143,7 +144,7 @@ pub struct ExplorerQueryGrpcAdapter {
     materialized_view_store: Option<MaterializedViewStore>,
     transaction_history_materialized_view_reader:
         Option<Arc<dyn TransactionHistoryMaterializedViewReadApi>>,
-    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+    network_upgrade_activations: NetworkUpgradeActivationsCache,
     wallet_channel: Arc<OnceCell<AuthenticatedChannel>>,
     prevout_resolution_online: bool,
     upstream_observation_cache: UpstreamObservationCache,
@@ -160,9 +161,7 @@ impl ExplorerQueryGrpcAdapter {
             bearer_token: None,
             materialized_view_store: None,
             transaction_history_materialized_view_reader: None,
-            network_upgrade_activations: Arc::new(NetworkUpgradeActivations::empty(
-                settings.network,
-            )),
+            network_upgrade_activations: NetworkUpgradeActivationsCache::new(settings.network),
             wallet_channel: Arc::new(OnceCell::new()),
             prevout_resolution_online: false,
             upstream_observation_cache: UpstreamObservationCache::empty(),
@@ -177,17 +176,6 @@ impl ExplorerQueryGrpcAdapter {
             TransactionHistoryMaterializedViewReader::new(store.clone()),
         ));
         self.materialized_view_store = Some(store);
-        self
-    }
-
-    /// Wires the node-advertised network-upgrade activation table the
-    /// `NetworkUpgradeStatus` handler projects onto the wire.
-    #[must_use]
-    pub fn with_network_upgrade_activations(
-        mut self,
-        activations: Arc<NetworkUpgradeActivations>,
-    ) -> Self {
-        self.network_upgrade_activations = activations;
         self
     }
 
@@ -443,11 +431,15 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let started = Instant::now();
         let outcome = async {
             let mut client = self.wallet_client(OP.method).await?;
+            let network_upgrade_activations = self
+                .network_upgrade_activations
+                .current(&mut client)
+                .await?;
             query_transaction_detail(
                 &mut client,
                 TransactionDetailContext {
                     materialized_view_store: self.materialized_view_store.as_ref(),
-                    network_upgrade_activations: &self.network_upgrade_activations,
+                    network_upgrade_activations: &network_upgrade_activations,
                     upstream_observation_cache: &self.upstream_observation_cache,
                 },
                 request,
@@ -913,9 +905,13 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         let started = Instant::now();
         let outcome = async {
             let mut client = self.wallet_client(OP.method).await?;
+            let network_upgrade_activations = self
+                .network_upgrade_activations
+                .current(&mut client)
+                .await?;
             query_network_upgrade_status(
                 self.materialized_view_store.as_ref(),
-                &self.network_upgrade_activations,
+                &network_upgrade_activations,
                 &mut client,
                 &self.upstream_observation_cache,
                 request,

@@ -29,14 +29,10 @@ async fn server_reflection_lists_compact_tx_streamer_service() -> Result<()> {
         &activations,
     )?;
     let (canonical, wallet) = store_fixture.take_readers()?;
-    let wallet_query = WalletServingQuery::from_serving_pair_slot(
-        WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
-            Arc::new(canonical),
-            Arc::new(wallet),
-        )?)),
-        (),
-        Arc::clone(&activations),
-    );
+    let wallet_query =
+        WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(Arc::new(
+            WalletServingReadPair::new(Arc::new(canonical), Arc::new(wallet))?,
+        )));
     let adapter = LightwalletdGrpcAdapter::new(wallet_query).into_server();
     let reflection_service = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET)

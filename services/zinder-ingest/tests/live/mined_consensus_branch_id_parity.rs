@@ -25,8 +25,6 @@
 //! The serving pair requires genesis-complete history, which only fits test
 //! budgets on regtest.
 
-use std::sync::Arc;
-
 use eyre::{Result, eyre};
 use zinder_core::{MinedTransaction, Network, TxStatus};
 use zinder_query::{TransactionStatus, WalletQueryApi, WalletServingQuery};
@@ -53,8 +51,7 @@ async fn mined_details_consensus_branch_id_matches_node_upgrade_activations() ->
 
     let activations = fetch_live_network_upgrade_activations(&env).await?;
     let live = live_serving_pair(&env, &activations, tip_height).await?;
-    let wallet_query =
-        WalletServingQuery::from_serving_pair_slot(live.slot, (), Arc::clone(&activations));
+    let wallet_query = WalletServingQuery::from_serving_pair_slot(live.slot);
 
     let coinbase_transaction_id = coinbase_transaction_id(&wallet_query, tip_height).await?;
     let status = wallet_query

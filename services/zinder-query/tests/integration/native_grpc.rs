@@ -37,8 +37,8 @@ use zinder_proto::v1::{
 use zinder_proto::wire::TransactionAbsence;
 use zinder_query::{
     AdmittedIngestControl, DEFAULT_MAX_COMPACT_BLOCK_RANGE, IngestControlAdmissionError,
-    WalletEndpointMetadata, WalletQueryApi, WalletQueryGrpcAdapter, WalletServingPairSlot,
-    WalletServingQuery, WalletServingReadPair,
+    NodeBroadcast, WalletEndpointMetadata, WalletQueryApi, WalletQueryGrpcAdapter,
+    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_store::{
     EventStreamStartPosition, RawBlobRetention, StreamCursorTokenV1, event_stream_start_message,
@@ -948,9 +948,7 @@ async fn assert_native_retention_case(raw_blob_retention: RawBlobRetention) -> e
     )?);
     let wallet_query = WalletServingQuery::from_admitted_native_serving_pair(
         WalletServingPairSlot::new(serving_pair),
-        (),
         admitted_ingest_control,
-        Arc::clone(&activations),
     );
     let grpc_adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
 
@@ -1262,10 +1260,11 @@ async fn native_grpc_service_uses_query_owned_capabilities() -> eyre::Result<()>
             Arc::new(canonical),
             Arc::new(wallet),
         )?)),
-        MockTransactionBroadcaster::accepted(TransactionId::from_bytes([0x33; 32])),
         ingest_control,
-        activations,
-    );
+    )
+    .with_node_broadcast(Some(NodeBroadcast::new(
+        MockTransactionBroadcaster::accepted(TransactionId::from_bytes([0x33; 32])),
+    )));
     let broadcast_adapter =
         WalletQueryGrpcAdapter::new(broadcast_query, WalletEndpointMetadata::default());
     let broadcast_info = WalletQueryService::server_info(
@@ -1278,8 +1277,13 @@ async fn native_grpc_service_uses_query_owned_capabilities() -> eyre::Result<()>
     .ok_or_else(|| eyre!("missing broadcast info"))?;
 
     assert!(
-        !has_capability(&broadcast_info, WALLET_BROADCAST_TRANSACTION_V1),
-        "a broadcaster without a probed node must not advertise broadcast"
+        has_capability(&broadcast_info, WALLET_BROADCAST_TRANSACTION_V1),
+        "a configured node advertises broadcast before its first contact"
+    );
+    assert_eq!(
+        broadcast_info.node,
+        Some(wallet::NodeCapabilitiesDescriptor::default()),
+        "an unverified node reports no capabilities"
     );
 
     Ok(())
@@ -1775,7 +1779,6 @@ async fn native_serving_adapter_over(
         Network::ZcashRegtest,
     )
     .await?;
-    let activations = Arc::new(sample_regtest_upgrade_activations());
     let (canonical, wallet) = store_fixture.take_readers()?;
     let serving_pair = Arc::new(WalletServingReadPair::new(
         Arc::new(canonical),
@@ -1783,9 +1786,7 @@ async fn native_serving_adapter_over(
     )?);
     let query = WalletServingQuery::from_admitted_native_serving_pair(
         WalletServingPairSlot::new(serving_pair),
-        (),
         admitted_ingest_control,
-        activations,
     );
     Ok((
         WalletQueryGrpcAdapter::new(query, WalletEndpointMetadata::default()),

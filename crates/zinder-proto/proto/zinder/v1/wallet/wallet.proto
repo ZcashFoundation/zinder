@@ -631,11 +631,12 @@ message TreeStateResponse {
   optional uint32 block_time_seconds = 5;
 }
 
-// One node-advertised network-upgrade activation.
+// One network-upgrade activation in the writer-admitted schedule.
 //
-// Names and activation heights come from the configured node's
-// `getblockchaininfo.upgrades` response. Unknown future branch ids remain
-// representable so wallet clients can fail closed before consensus diverges.
+// Names and activation heights come from the schedule the canonical writer
+// admitted from its node's `getblockchaininfo.upgrades` response. Unknown
+// future branch ids remain representable so wallet clients can fail closed
+// before consensus diverges.
 message NetworkUpgradeActivation {
   // Consensus branch identifier assigned to this upgrade.
   uint32 consensus_branch_id = 1;
@@ -647,10 +648,11 @@ message NetworkUpgradeActivation {
   uint32 activation_height = 3;
 }
 
-// Node-advertised network-upgrade activation-table request.
+// Writer-admitted network-upgrade activation-table request.
 message NetworkUpgradeActivationsRequest {}
 
-// Node-advertised network-upgrade activation table.
+// Writer-admitted network-upgrade schedule served with the current serving
+// pair.
 message NetworkUpgradeActivationsResponse {
   // Entries ordered by ascending activation height.
   repeated NetworkUpgradeActivation activations = 1;
@@ -973,12 +975,13 @@ message WalletServerInfo {
   // retention duration.
   reserved 5, 6, 7;
 
-  // Upstream node capabilities detected by zinder-source.
+  // Capabilities of the broadcast node endpoint. Empty until the endpoint
+  // passes first-contact verification, and when no node is configured.
   NodeCapabilitiesDescriptor node = 8;
 }
 
-// Upstream node capability descriptor. Storage-only query deployments may
-// leave this empty when the query service has no source probe snapshot.
+// Broadcast node endpoint capability descriptor. Empty until the endpoint
+// passes first-contact verification, and when no node is configured.
 message NodeCapabilitiesDescriptor {
   // Node-reported semantic version, when available.
   optional string version = 1;
@@ -1555,7 +1558,8 @@ service WalletQuery {
   // Return the server capability descriptor.
   rpc ServerInfo(ServerInfoRequest) returns (ServerInfoResponse);
 
-  // Return the configured node's advertised consensus-upgrade schedule.
+  // Return the writer-admitted consensus-upgrade schedule served with the
+  // current serving pair.
   // Capability: `wallet.read.network_upgrade_activations_v1`.
   rpc NetworkUpgradeActivations(NetworkUpgradeActivationsRequest)
       returns (NetworkUpgradeActivationsResponse);

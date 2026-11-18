@@ -19,11 +19,10 @@ use zinder_runtime::{
     converge_on_canonical_writer_fence, expected_writer_fence, host_cpu_meets_compiled_baseline,
     install_tracing_subscriber, spawn_ops_endpoint, writer_attests_network_upgrade_schedule,
 };
-use zinder_source::{ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::{
     CanonicalEventCursor, CanonicalEventFence, CanonicalEventHistoryRequest, CanonicalReorgPolicy,
-    CanonicalRetainedEvent, CanonicalStoreReadyEvidence, CanonicalStoreWorkload,
-    RocksDbCanonicalSecondary,
+    CanonicalRetainedEvent, CanonicalStoreError, CanonicalStoreReadyEvidence,
+    CanonicalStoreWorkload, RocksDbCanonicalSecondary,
 };
 use zinder_wallet_projection::{
     WalletCanonicalSourceIdentity, WalletProjectionBuildLeaseRequest, WalletProjectionBuildOwner,
@@ -104,9 +103,6 @@ struct Cli {
     /// Explicit duration of each durable projection-build lease (at least four hours).
     #[arg(long = "lease-duration-seconds")]
     lease_duration_seconds: Option<u64>,
-    /// Zebra JSON-RPC endpoint used only to authenticate the activation table.
-    #[arg(long = "node-json-rpc-addr")]
-    node_json_rpc_addr: Option<String>,
     /// Private ingest-control endpoint used for retained-event lease ownership.
     #[arg(long = "ingest-control-addr")]
     ingest_control_addr: Option<String>,
@@ -137,7 +133,6 @@ impl From<Cli> for ProjectorConfigOverrides {
             reorg_window_blocks: cli.reorg_window_blocks,
             build_owner_hex: cli.build_owner_hex,
             lease_duration_seconds: cli.lease_duration_seconds,
-            node_json_rpc_addr: cli.node_json_rpc_addr,
             ingest_control_addr: cli.ingest_control_addr,
             ingest_control_bearer_token_path: cli.ingest_control_bearer_token_path,
             projector_control_listen_addr: cli.projector_control_listen_addr,
@@ -240,33 +235,14 @@ async fn run_owned_projector(
     readiness: &Readiness,
     cancel: CancellationToken,
 ) -> Result<(), ProjectorError> {
-    let source = ZebraJsonRpcSource::with_options(
-        config.network,
-        &config.node.json_rpc_addr,
-        config.node.node_auth.clone(),
-        ZebraJsonRpcSourceOptions {
-            request_timeout: config.node.request_timeout,
-            max_response_bytes: config.node.max_response_bytes,
-            broadcast_timeout: None,
-        },
-    )?;
-    let activations = source
-        .discover_network_upgrade_activations(PROJECTOR_SERVICE_NAME)
-        .await?;
     let reorg_policy = CanonicalReorgPolicy::new(config.reorg_window_blocks).map_err(|error| {
         zinder_runtime::ConfigError::invalid(format!(
             "projector.reorg_window_blocks is invalid: {error}"
         ))
     })?;
-    let mut canonical = RocksDbCanonicalSecondary::open_ready(
-        &config.canonical_path,
-        &config.canonical_secondary_path,
-        &activations,
-        CanonicalStoreWorkload::Wallet,
-        config.expected_canonical_raw_blob_retention,
-        reorg_policy,
-        config.canonical_rocksdb_budget,
-    )?;
+    let Some(mut canonical) = open_canonical_secondary(config, reorg_policy, &cancel).await? else {
+        return Ok(());
+    };
     let mut canonical_control = CanonicalWriterControlClient::connect(
         &config.ingest_control_addr,
         config.ingest_control_bearer_token.as_ref(),
@@ -1685,6 +1661,55 @@ impl WriterFence {
                 writer_tip_height, ..
             } => *writer_tip_height,
         }
+    }
+}
+
+/// Opens the canonical secondary, adopting the network-upgrade schedule the
+/// canonical writer admitted, or returns `None` when `cancel` fires first.
+///
+/// The writer admits its first schedule revision when it opens the store, so
+/// a READY store without one is retried until
+/// `projector.fence_convergence_timeout_seconds` passes.
+async fn open_canonical_secondary(
+    config: &config::ProjectorConfig,
+    reorg_policy: CanonicalReorgPolicy,
+    cancel: &CancellationToken,
+) -> Result<Option<RocksDbCanonicalSecondary>, ProjectorError> {
+    let deadline = tokio::time::Instant::now() + config.fence_convergence_timeout;
+    let mut delay = CANONICAL_FENCE_CONVERGENCE_INITIAL_DELAY;
+    let mut waiting_logged = false;
+    loop {
+        match RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
+            &config.canonical_path,
+            &config.canonical_secondary_path,
+            config.network,
+            CanonicalStoreWorkload::Wallet,
+            config.expected_canonical_raw_blob_retention,
+            reorg_policy,
+            config.canonical_rocksdb_budget,
+        ) {
+            Ok(canonical) => return Ok(Some(canonical)),
+            Err(CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted { .. })
+                if tokio::time::Instant::now() < deadline =>
+            {
+                if !waiting_logged {
+                    tracing::info!(
+                        target: "zinder::projector",
+                        event = "canonical_schedule_admission_pending",
+                        "waiting for the canonical writer to admit a network-upgrade schedule"
+                    );
+                    waiting_logged = true;
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        tokio::select! {
+            () = cancel.cancelled() => return Ok(None),
+            () = tokio::time::sleep(delay) => {}
+        }
+        delay = delay
+            .saturating_mul(2)
+            .min(CANONICAL_FENCE_CONVERGENCE_MAX_DELAY);
     }
 }
 

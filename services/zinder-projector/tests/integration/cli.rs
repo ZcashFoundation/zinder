@@ -35,8 +35,6 @@ fn print_config_renders_the_complete_fail_closed_contract() -> eyre::Result<()> 
             path_str(&wallet_path)?,
             "--reorg-window-blocks",
             "100",
-            "--node-json-rpc-addr",
-            "http://127.0.0.1:18232",
             "--build-owner-hex",
             "00112233445566778899aabbccddeeff",
             "--lease-duration-seconds",
@@ -114,8 +112,6 @@ fn print_config_rejects_paths_that_cannot_have_independent_owners() -> eyre::Res
             path_str(&same_path)?,
             "--wallet-path",
             path_str(&same_path)?,
-            "--node-json-rpc-addr",
-            "http://127.0.0.1:18232",
             "--build-owner-hex",
             "00112233445566778899aabbccddeeff",
         ])
@@ -142,8 +138,6 @@ fn print_config_rejects_nested_storage_roots() -> eyre::Result<()> {
             path_str(&canonical_path.join("secondary"))?,
             "--wallet-path",
             path_str(&tempdir.path().join("wallet"))?,
-            "--node-json-rpc-addr",
-            "http://127.0.0.1:18232",
             "--build-owner-hex",
             "00112233445566778899aabbccddeeff",
             "--lease-duration-seconds",
@@ -173,8 +167,6 @@ fn print_config_rejects_lexically_aliased_storage_roots() -> eyre::Result<()> {
             path_str(&tempdir.path().join("canonical-secondary"))?,
             "--wallet-path",
             path_str(&wallet_alias)?,
-            "--node-json-rpc-addr",
-            "http://127.0.0.1:18232",
             "--build-owner-hex",
             "00112233445566778899aabbccddeeff",
             "--lease-duration-seconds",
@@ -202,8 +194,6 @@ fn print_config_requires_an_explicit_lease_that_exceeds_the_build_hard_gate() ->
             path_str(&tempdir.path().join("secondary"))?,
             "--wallet-path",
             path_str(&tempdir.path().join("wallet"))?,
-            "--node-json-rpc-addr",
-            "http://127.0.0.1:18232",
             "--build-owner-hex",
             "00112233445566778899aabbccddeeff",
             "--lease-duration-seconds",
@@ -231,8 +221,6 @@ fn print_config_rejects_an_implicit_construction_lease() -> eyre::Result<()> {
             path_str(&tempdir.path().join("secondary"))?,
             "--wallet-path",
             path_str(&tempdir.path().join("wallet"))?,
-            "--node-json-rpc-addr",
-            "http://127.0.0.1:18232",
             "--build-owner-hex",
             "00112233445566778899aabbccddeeff",
         ])
@@ -263,8 +251,6 @@ fn print_config_rejects_a_zero_fence_convergence_timeout() -> eyre::Result<()> {
             path_str(&tempdir.path().join("secondary"))?,
             "--wallet-path",
             path_str(&tempdir.path().join("wallet"))?,
-            "--node-json-rpc-addr",
-            "http://127.0.0.1:18232",
             "--build-owner-hex",
             "00112233445566778899aabbccddeeff",
             "--lease-duration-seconds",
@@ -300,9 +286,6 @@ unsupported_path = "{}"
 reorg_window_blocks = 100
 build_owner_hex = "00112233445566778899aabbccddeeff"
 lease_duration_seconds = 14400
-
-[node]
-json_rpc_addr = "http://127.0.0.1:18232"
 "#,
             path_str(&tempdir.path().join("canonical"))?,
             path_str(&tempdir.path().join("canonical-secondary"))?,
@@ -320,6 +303,33 @@ json_rpc_addr = "http://127.0.0.1:18232"
         stderr.contains("unknown field `unsupported_path`"),
         "{stderr}"
     );
+    Ok(())
+}
+
+/// The projector reads the canonical writer's admitted schedule, so it
+/// accepts no node setting from any source.
+#[test]
+fn node_settings_are_rejected() -> eyre::Result<()> {
+    let flag = projector_command()
+        .args([
+            "--print-config",
+            "--node-json-rpc-addr",
+            "http://127.0.0.1:18232",
+        ])
+        .output()?;
+    assert!(!flag.status.success(), "{flag:?}");
+    assert!(
+        String::from_utf8(flag.stderr)?.contains("--node-json-rpc-addr"),
+        "the removed flag must be named in the refusal"
+    );
+
+    let environment = projector_command()
+        .args(["--print-config", "--network", "zcash-regtest"])
+        .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:18232")
+        .output()?;
+    assert!(!environment.status.success(), "{environment:?}");
+    let stderr = String::from_utf8(environment.stderr)?;
+    assert!(stderr.contains("unknown field `node`"), "{stderr}");
     Ok(())
 }
 

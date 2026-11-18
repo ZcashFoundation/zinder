@@ -39,24 +39,22 @@ impl NativeWalletEndpointCapabilities {
         Arc::clone(&self.ordered)
     }
 
-    /// Reports whether any advertised operation contacts the upstream node.
-    ///
-    /// Transaction broadcast is the only such operation, so a query that does
-    /// not advertise it serves every request from its serving pair.
-    pub(crate) fn has_node_backed_capabilities(&self) -> bool {
-        self.contains(capabilities::WALLET_BROADCAST_TRANSACTION_V1)
+    /// Derives the storage capabilities implemented by the shared exact-pair
+    /// query.
+    pub(crate) fn for_wallet_serving_pair(raw_blob_retention: RawBlobRetention) -> Self {
+        Self::from_predicate(|capability| {
+            Self::wallet_serving_pair_supports(capability, raw_blob_retention)
+        })
     }
 
-    /// Derives the capabilities implemented by the shared exact-pair query.
+    /// Adds transaction broadcast for a query with a configured node endpoint.
     ///
-    /// `node_capabilities` must be the result of the probe performed on the
-    /// same source handle installed as the query's transaction broadcaster.
-    pub(crate) fn for_wallet_serving_pair(
-        raw_blob_retention: RawBlobRetention,
-        node_capabilities: NodeCapabilities,
-    ) -> Self {
+    /// Broadcast is advertised from configuration, so the set stays fixed for
+    /// the life of the process even though the endpoint is verified only on
+    /// first contact; until then each broadcast fails on its own.
+    pub(crate) fn with_node_broadcast(&self) -> Self {
         Self::from_predicate(|capability| {
-            Self::wallet_serving_pair_supports(capability, raw_blob_retention, node_capabilities)
+            capability == capabilities::WALLET_BROADCAST_TRANSACTION_V1 || self.contains(capability)
         })
     }
 
@@ -66,13 +64,12 @@ impl NativeWalletEndpointCapabilities {
     /// Its admitted type state is supplied only by the native composition root.
     pub(crate) fn for_admitted_native_wallet_query(
         raw_blob_retention: RawBlobRetention,
-        node_capabilities: NodeCapabilities,
         ingest_control: &AdmittedIngestControl,
     ) -> Self {
         Self::from_predicate(|capability| {
             let transaction_lookup_supported =
                 ingest_control.supports(capabilities::INGEST_CONTROL_MEMPOOL_TRANSACTION_V2);
-            Self::wallet_serving_pair_supports(capability, raw_blob_retention, node_capabilities)
+            Self::wallet_serving_pair_supports(capability, raw_blob_retention)
                 || (capability == capabilities::WALLET_READ_TRANSACTION_BY_ID_V2
                     && transaction_lookup_supported)
                 || (capability == capabilities::WALLET_READ_TRANSACTION_BYTES_V1
@@ -88,9 +85,7 @@ impl NativeWalletEndpointCapabilities {
     fn wallet_serving_pair_supports(
         capability: &str,
         raw_blob_retention: RawBlobRetention,
-        node_capabilities: NodeCapabilities,
     ) -> bool {
-        let node_was_probed = node_capabilities.supports(NodeCapability::OpenRpcDiscovery);
         let implemented_without_optional_evidence = matches!(
             capability,
             capabilities::WALLET_READ_VISIBLE_TIP_BLOCK_V1
@@ -116,9 +111,6 @@ impl NativeWalletEndpointCapabilities {
                 capabilities::WALLET_READ_FULL_BLOCK_AT_V1
                     | capabilities::WALLET_READ_FULL_BLOCK_RANGE_V1
             ) && raw_blob_retention.retains_block_blobs())
-            || (capability == capabilities::WALLET_BROADCAST_TRANSACTION_V1
-                && node_was_probed
-                && node_capabilities.supports(NodeCapability::TransactionBroadcast))
     }
 
     fn from_predicate(mut is_supported: impl FnMut(&str) -> bool) -> Self {
@@ -131,7 +123,8 @@ impl NativeWalletEndpointCapabilities {
     }
 }
 
-/// Diagnostic snapshot from the upstream node probe used by this query.
+/// Diagnostic snapshot of the node endpoint a query broadcasts through,
+/// captured when the endpoint passed first-contact verification.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UpstreamNodeCapabilities {
     /// Node-reported semantic version when available.
@@ -140,7 +133,7 @@ pub struct UpstreamNodeCapabilities {
 }
 
 impl UpstreamNodeCapabilities {
-    /// Captures stable diagnostic names from the successful source probe.
+    /// Captures stable diagnostic names from the verifying source probe.
     pub(crate) fn from_probed(node_capabilities: NodeCapabilities) -> Self {
         Self {
             version: None,

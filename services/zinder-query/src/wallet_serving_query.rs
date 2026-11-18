@@ -25,11 +25,11 @@ use zinder_proto::capabilities::{
     WALLET_READ_FULL_BLOCK_AT_V1, WALLET_READ_FULL_BLOCK_RANGE_V1,
     WALLET_READ_TRANSACTION_BY_ID_V2,
 };
-use zinder_source::{NodeCapability, NodeSource, TransactionBroadcaster};
+use zinder_source::TransactionBroadcaster;
 use zinder_store::{
-    ArtifactFamily, BlockHashLookup, CanonicalActivationSchedule, ChainEventHistoryRequest,
-    ChainEventStreamFamily, ChainEventStreamResume, EventStreamStartPosition, HeightOrder,
-    RawBlobRetention, StreamCursorTokenV1,
+    ArtifactFamily, BlockHashLookup, ChainEventHistoryRequest, ChainEventStreamFamily,
+    ChainEventStreamResume, EventStreamStartPosition, HeightOrder, RawBlobRetention,
+    StreamCursorTokenV1,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletCanonicalSourceIdentity, WalletProjectionSourcePosition,
@@ -39,12 +39,14 @@ use crate::{
     AdmittedIngestControl, ArtifactKey, BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents,
     CompactBlock, CompactBlockRange, DEFAULT_MAX_COMPACT_BLOCK_RANGE, DEFAULT_MAX_FULL_BLOCK_RANGE,
     FULL_BLOCK_STREAM_CHANNEL_CAPACITY, FULL_BLOCK_STREAM_SUB_READ_BLOCKS, FullBlock,
-    FullBlockStream, NativeWalletEndpointCapabilities, QueryError, RawTransaction, SettledTipBlock,
-    SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
+    FullBlockStream, NativeWalletEndpointCapabilities, NodeBroadcast, QueryError, RawTransaction,
+    SettledTipBlock, SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
     TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
     TransparentAddressUnspentOutputsRequest, TransparentOutpointSpendStatuses, TreeState,
     UpstreamNodeCapabilities, VisibleTipBlock, WalletProjectionReader, WalletQueryApi,
-    WalletServingPairSlot, WalletServingReadPair, serving_read,
+    WalletServingPairSlot, WalletServingReadPair,
+    node_broadcast::NodeVerification,
+    serving_read,
     tree_state_replay_limit::{TreeStateReplayLimit, record_replayed_blocks},
     validate_block_range, validate_subtree_root_range,
 };
@@ -171,20 +173,6 @@ fn cursor_bytes<const N: usize>(
         .get(range)
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or_else(invalid_transparent_history_cursor)
-}
-
-/// Returns the activation table admitted with `pair`'s canonical fence.
-///
-/// Reader admission accepts a store without a writer-admitted schedule only
-/// when the discovered table equals the construction baseline, so the
-/// discovered table is exact in that case.
-fn admitted_activations<'pair>(
-    pair: &'pair WalletServingReadPair,
-    discovered: &'pair NetworkUpgradeActivations,
-) -> &'pair NetworkUpgradeActivations {
-    pair.canonical()
-        .network_upgrade_schedule()
-        .map_or(discovered, CanonicalActivationSchedule::activations)
 }
 
 fn invalid_transparent_history_cursor() -> QueryError {
@@ -407,10 +395,9 @@ pub struct WalletServingQuery<Broadcaster, NativeIngest = ()> {
     serving_pair_slot: WalletServingPairSlot,
     broadcaster: Broadcaster,
     native_ingest: NativeIngest,
-    network_upgrade_activations: Arc<NetworkUpgradeActivations>,
     tree_state_replays: TreeStateReplayLimit,
     native_endpoint_capabilities: NativeWalletEndpointCapabilities,
-    upstream_node_capabilities: Option<UpstreamNodeCapabilities>,
+    node_verification: Option<NodeVerification>,
 }
 
 impl<Broadcaster, NativeIngest> std::fmt::Debug for WalletServingQuery<Broadcaster, NativeIngest> {
@@ -428,68 +415,94 @@ impl<Broadcaster, NativeIngest> std::fmt::Debug for WalletServingQuery<Broadcast
     }
 }
 
-impl<Broadcaster> WalletServingQuery<Broadcaster> {
-    /// Builds a query over a swappable slot of already-admitted immutable pairs.
+impl WalletServingQuery<()> {
+    /// Builds a storage-only query over a swappable slot of already-admitted
+    /// immutable pairs.
     ///
     /// Every [`WalletQueryApi`] method captures one `Arc` from this slot before
     /// reading. A publisher can therefore atomically replace the pair without
     /// changing the canonical or wallet reader observed by an in-flight request.
+    /// The query advertises no transaction broadcast until
+    /// [`WalletServingQuery::with_node_broadcast`] installs a node endpoint.
     #[must_use]
-    pub fn from_serving_pair_slot(
+    pub fn from_serving_pair_slot(serving_pair_slot: WalletServingPairSlot) -> Self {
+        let raw_blob_retention = serving_pair_slot.capture().canonical().raw_blob_retention();
+        Self {
+            native_endpoint_capabilities: NativeWalletEndpointCapabilities::for_wallet_serving_pair(
+                raw_blob_retention,
+            ),
+            serving_pair_slot,
+            broadcaster: (),
+            native_ingest: (),
+            tree_state_replays: TreeStateReplayLimit::for_available_parallelism(),
+            node_verification: None,
+        }
+    }
+}
+
+impl WalletServingQuery<(), AdmittedIngestControl> {
+    /// Builds the storage-only native query from an exact pair and admitted
+    /// ingest control.
+    ///
+    /// The native instantiation is the only exact-pair query accepted by the
+    /// standard native gRPC adapter. It advertises no transaction broadcast
+    /// until [`WalletServingQuery::with_node_broadcast`] installs a node
+    /// endpoint.
+    #[must_use]
+    pub fn from_admitted_native_serving_pair(
         serving_pair_slot: WalletServingPairSlot,
-        broadcaster: Broadcaster,
-        network_upgrade_activations: Arc<NetworkUpgradeActivations>,
+        ingest_control: AdmittedIngestControl,
     ) -> Self {
         let raw_blob_retention = serving_pair_slot.capture().canonical().raw_blob_retention();
-        let native_endpoint_capabilities =
-            NativeWalletEndpointCapabilities::for_wallet_serving_pair(
-                raw_blob_retention,
-                zinder_source::NodeCapabilities::default(),
-            );
         Self {
+            native_endpoint_capabilities:
+                NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
+                    raw_blob_retention,
+                    &ingest_control,
+                ),
             serving_pair_slot,
-            broadcaster,
-            native_ingest: (),
-            network_upgrade_activations,
+            broadcaster: (),
+            native_ingest: ingest_control,
             tree_state_replays: TreeStateReplayLimit::for_available_parallelism(),
-            native_endpoint_capabilities,
-            upstream_node_capabilities: None,
+            node_verification: None,
         }
     }
 }
 
 impl<Broadcaster> WalletServingQuery<Broadcaster, AdmittedIngestControl> {
-    /// Builds the native query from an exact pair and admitted ingest control.
-    ///
-    /// The resulting type is the only exact-pair instantiation accepted by the
-    /// standard native gRPC adapter.
-    #[must_use]
-    pub fn from_admitted_native_serving_pair(
-        serving_pair_slot: WalletServingPairSlot,
-        broadcaster: Broadcaster,
-        ingest_control: AdmittedIngestControl,
-        network_upgrade_activations: Arc<NetworkUpgradeActivations>,
-    ) -> Self {
-        let raw_blob_retention = serving_pair_slot.capture().canonical().raw_blob_retention();
-        let native_endpoint_capabilities =
-            NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
-                raw_blob_retention,
-                zinder_source::NodeCapabilities::default(),
-                &ingest_control,
-            );
-        Self {
-            serving_pair_slot,
-            broadcaster,
-            native_ingest: ingest_control,
-            network_upgrade_activations,
-            tree_state_replays: TreeStateReplayLimit::for_available_parallelism(),
-            native_endpoint_capabilities,
-            upstream_node_capabilities: None,
-        }
-    }
-
     pub(crate) fn admitted_native_ingest(&self) -> &AdmittedIngestControl {
         &self.native_ingest
+    }
+}
+
+impl<NativeIngest> WalletServingQuery<(), NativeIngest> {
+    /// Broadcasts transactions through `node`, the operator's configured node
+    /// endpoint, or keeps the query storage-only when `node` is `None`.
+    ///
+    /// With a node, the query advertises transaction broadcast from now on,
+    /// for the life of the process, without contacting the node. A broadcast
+    /// fails with [`QueryError::Node`] carrying
+    /// [`zinder_source::SourceError::NodeUnavailable`] until the endpoint
+    /// passes [`NodeBroadcast::verify`], and only then reaches the node.
+    /// `ServerInfo` reports the verified endpoint's capabilities.
+    #[must_use]
+    pub fn with_node_broadcast<Source>(
+        self,
+        node: Option<NodeBroadcast<Source>>,
+    ) -> WalletServingQuery<Option<NodeBroadcast<Source>>, NativeIngest> {
+        let native_endpoint_capabilities = if node.is_some() {
+            self.native_endpoint_capabilities.with_node_broadcast()
+        } else {
+            self.native_endpoint_capabilities
+        };
+        WalletServingQuery {
+            serving_pair_slot: self.serving_pair_slot,
+            node_verification: node.as_ref().map(NodeBroadcast::verification),
+            broadcaster: node,
+            native_ingest: self.native_ingest,
+            tree_state_replays: self.tree_state_replays,
+            native_endpoint_capabilities,
+        }
     }
 }
 
@@ -570,105 +583,6 @@ impl<Broadcaster, NativeIngest> WalletServingQuery<Broadcaster, NativeIngest> {
     }
 }
 
-impl<Source> WalletServingQuery<Source>
-where
-    Source: NodeSource + TransactionBroadcaster,
-{
-    /// Builds the shared exact-pair query from one probed node source.
-    ///
-    /// This state is suitable for the compatibility adapter. The native
-    /// endpoint instead requires `from_admitted_native_sources`.
-    pub fn from_probed_node_source(
-        serving_pair_slot: WalletServingPairSlot,
-        source: Source,
-        network_upgrade_activations: Arc<NetworkUpgradeActivations>,
-    ) -> Result<Self, QueryError> {
-        let node_capabilities = source.capabilities();
-        if !node_capabilities.supports(NodeCapability::OpenRpcDiscovery) {
-            return Err(QueryError::Node(
-                zinder_source::SourceError::NodeCapabilityMissing {
-                    capability: NodeCapability::OpenRpcDiscovery,
-                },
-            ));
-        }
-        let raw_blob_retention = serving_pair_slot.capture().canonical().raw_blob_retention();
-        let native_endpoint_capabilities =
-            NativeWalletEndpointCapabilities::for_wallet_serving_pair(
-                raw_blob_retention,
-                node_capabilities,
-            );
-        if native_endpoint_capabilities.has_node_backed_capabilities()
-            && !node_capabilities.supports(NodeCapability::TipId)
-        {
-            return Err(QueryError::Node(
-                zinder_source::SourceError::NodeCapabilityMissing {
-                    capability: NodeCapability::TipId,
-                },
-            ));
-        }
-        Ok(Self {
-            serving_pair_slot,
-            broadcaster: source,
-            native_ingest: (),
-            network_upgrade_activations,
-            tree_state_replays: TreeStateReplayLimit::for_available_parallelism(),
-            native_endpoint_capabilities,
-            upstream_node_capabilities: Some(UpstreamNodeCapabilities::from_probed(
-                node_capabilities,
-            )),
-        })
-    }
-}
-
-impl<Source> WalletServingQuery<Source, AdmittedIngestControl>
-where
-    Source: NodeSource + TransactionBroadcaster,
-{
-    /// Builds the native release query from its exact admitted sources.
-    pub fn from_admitted_native_sources(
-        serving_pair_slot: WalletServingPairSlot,
-        source: Source,
-        ingest_control: AdmittedIngestControl,
-        network_upgrade_activations: Arc<NetworkUpgradeActivations>,
-    ) -> Result<Self, QueryError> {
-        let node_capabilities = source.capabilities();
-        if !node_capabilities.supports(NodeCapability::OpenRpcDiscovery) {
-            return Err(QueryError::Node(
-                zinder_source::SourceError::NodeCapabilityMissing {
-                    capability: NodeCapability::OpenRpcDiscovery,
-                },
-            ));
-        }
-        let raw_blob_retention = serving_pair_slot.capture().canonical().raw_blob_retention();
-        let native_endpoint_capabilities =
-            NativeWalletEndpointCapabilities::for_admitted_native_wallet_query(
-                raw_blob_retention,
-                node_capabilities,
-                &ingest_control,
-            );
-        if native_endpoint_capabilities.has_node_backed_capabilities()
-            && !node_capabilities.supports(NodeCapability::TipId)
-        {
-            return Err(QueryError::Node(
-                zinder_source::SourceError::NodeCapabilityMissing {
-                    capability: NodeCapability::TipId,
-                },
-            ));
-        }
-        Ok(Self {
-            serving_pair_slot,
-            broadcaster: source,
-            native_ingest: ingest_control,
-            network_upgrade_activations,
-            tree_state_replays: TreeStateReplayLimit::for_available_parallelism(),
-            native_endpoint_capabilities,
-            upstream_node_capabilities: Some(UpstreamNodeCapabilities::from_probed(
-                node_capabilities,
-            )),
-        })
-    }
-}
-
 #[async_trait]
 impl<Broadcaster, NativeIngest> WalletQueryApi for WalletServingQuery<Broadcaster, NativeIngest>
 where
@@ -680,12 +594,13 @@ where
     }
 
     fn upstream_node_capabilities(&self) -> Option<&UpstreamNodeCapabilities> {
-        self.upstream_node_capabilities.as_ref()
+        self.node_verification
+            .as_ref()
+            .and_then(NodeVerification::verified_capabilities)
     }
 
     async fn network_upgrade_activations(&self) -> Result<NetworkUpgradeActivations, QueryError> {
-        let activations =
-            admitted_activations(&self.capture_pair(), &self.network_upgrade_activations).clone();
+        let activations = self.capture_pair().network_upgrade_activations().clone();
         serving_read::record("network_upgrade_activations", None, ready(Ok(activations))).await
     }
 
@@ -896,10 +811,9 @@ where
         transaction_id: TransactionId,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TransactionStatus, QueryError> {
-        let discovered_activations = Arc::clone(&self.network_upgrade_activations);
         serving_read::run("transaction_by_id", self.pin(at_epoch_id), move |pair| {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-            let network_upgrade_activations = admitted_activations(&pair, &discovered_activations);
+            let network_upgrade_activations = pair.network_upgrade_activations();
             // READY admission requires transaction-location coverage to equal
             // the authenticated source count for every retention mode. Blob
             // coverage equals that count only under Transactions/All and is
@@ -1137,7 +1051,6 @@ where
         height: BlockHeight,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError> {
-        let discovered_activations = Arc::clone(&self.network_upgrade_activations);
         let replays = self.tree_state_replays.clone();
         serving_read::run("tree_state_at", self.pin(at_epoch_id), move |pair| {
             let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
@@ -1156,10 +1069,7 @@ where
             // seed as store damage, so only a seeded read takes a slot.
             let _replay_slot = nearest.as_ref().map(|_| replays.try_admit()).transpose()?;
             let checkpoint = canonical
-                .tree_state_checkpoint_at(
-                    height,
-                    admitted_activations(&pair, &discovered_activations),
-                )?
+                .tree_state_checkpoint_at(height, pair.network_upgrade_activations())?
                 .ok_or(QueryError::BlockNotInBestChain)?;
             if let Some(seed) = nearest {
                 record_replayed_blocks(height.value().saturating_sub(seed.block_id.height.value()));
@@ -1622,11 +1532,9 @@ mod full_block_range_tests {
                 Arc::new(canonical),
                 Arc::new(wallet),
             )?);
-            let query = WalletServingQuery::from_serving_pair_slot(
-                WalletServingPairSlot::new(Arc::clone(&pair)),
-                (),
-                Arc::new(activations),
-            );
+            let query = WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(
+                Arc::clone(&pair),
+            ));
             Ok(Self {
                 pair,
                 query,
@@ -1674,11 +1582,8 @@ mod tree_state_replay_limit_tests {
             Arc::new(canonical),
             Arc::new(wallet),
         )?);
-        let mut query = WalletServingQuery::from_serving_pair_slot(
-            WalletServingPairSlot::new(pair),
-            (),
-            Arc::new(activations),
-        );
+        let mut query =
+            WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(pair));
         query.tree_state_replays = TreeStateReplayLimit::new(NonZeroU32::MIN);
         let reconstructed = BlockHeight::new(2);
         let checkpointed_tip = BlockHeight::new(3);

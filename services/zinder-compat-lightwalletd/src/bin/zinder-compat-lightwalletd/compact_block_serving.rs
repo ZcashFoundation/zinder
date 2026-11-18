@@ -30,7 +30,6 @@ use zinder_proto::{
         CanonicalWriterFence, CanonicalWriterStatusRequest, CanonicalWriterStatusResponse,
         canonical_control_client::CanonicalControlClient,
     },
-    wire::decode_canonical_network_upgrade_schedule,
 };
 use zinder_query::{QueryError, status_from_query_error};
 use zinder_runtime::{
@@ -73,6 +72,10 @@ enum ConvergenceFailure {
     WriterAhead,
     #[error("writer fence diverged from the candidate secondary")]
     WriterFenceDiverged,
+    #[error(
+        "the canonical writer has not admitted a network-upgrade schedule for the candidate secondary to adopt"
+    )]
+    WriterScheduleNotAdmitted,
     #[error("candidate storage failed: {0}")]
     Storage(CompactBlockServingError),
 }
@@ -119,7 +122,6 @@ pub(crate) struct CompactBlockServingConfig {
     pub(crate) canonical_primary_path: PathBuf,
     pub(crate) canonical_secondary_root: PathBuf,
     pub(crate) network: Network,
-    pub(crate) activations: Arc<NetworkUpgradeActivations>,
     pub(crate) raw_blob_retention: RawBlobRetention,
     pub(crate) reorg_policy: CanonicalReorgPolicy,
     pub(crate) resource_budget: RocksDbResourceBudget,
@@ -192,10 +194,6 @@ pub(crate) struct CompactBlockPublisher {
     /// confirmed tip, and the halt the writer last reported, which
     /// writer-status failures republish.
     writer_attestation: WriterAttestation,
-    /// Activation table each new generation opens with: the node's table at
-    /// startup, then the table the writer reports, so generations keep
-    /// opening after the chain crosses an activation admitted later.
-    generation_activations: Arc<NetworkUpgradeActivations>,
 }
 
 impl CompactBlockPublisher {
@@ -208,14 +206,25 @@ impl CompactBlockPublisher {
         let mut writer_status = WriterStatus::connect(writer_status_endpoint, bearer_token)
             .await
             .map_err(|error| CompactBlockServingError::WriterStatus(error.message().to_owned()))?;
-        let generation_activations = Arc::clone(&config.activations);
         let block_cache = SharedBlockCache::new(config.resource_budget.block_cache_bytes);
-        let candidate = open_generation(&config, &generation_activations, &block_cache, 0).await?;
-        let candidate = catch_up_generation(candidate).await?;
-        let (candidate, attesting_status) =
-            converge_candidate(&mut writer_status, &config, candidate)
-                .await
-                .map_err(|error| CompactBlockServingError::Runtime(error.to_string()))?;
+        let (candidate, attesting_status) = converge_candidate(
+            &mut writer_status,
+            &config,
+            CandidateGeneration {
+                block_cache: &block_cache,
+                generation: 0,
+            },
+        )
+        .await
+        .map_err(|failure| match failure {
+            ConvergenceFailure::Storage(error) => error,
+            failure @ (ConvergenceFailure::WriterStatusTransport(_)
+            | ConvergenceFailure::WriterAhead
+            | ConvergenceFailure::WriterFenceDiverged
+            | ConvergenceFailure::WriterScheduleNotAdmitted) => {
+                CompactBlockServingError::Runtime(failure.to_string())
+            }
+        })?;
         let reader = Arc::new(candidate);
         let slot = CompactBlockServingSlot::new(Arc::clone(&reader));
         let visible_height = reader.event_fence().visible_tip().height.value();
@@ -239,7 +248,6 @@ impl CompactBlockPublisher {
             block_cache,
             instance_memory_throttle: ResourceGaugeThrottle::for_instance_memory(),
             writer_attestation,
-            generation_activations,
         };
         publisher.record_resource_gauges().await;
         Ok((publisher, slot))
@@ -364,82 +372,57 @@ impl CompactBlockPublisher {
                 );
             }
         }
-        if let Some(schedule) = status.network_upgrade_schedule.clone() {
-            let Ok((activations, _revision)) =
-                decode_canonical_network_upgrade_schedule(schedule, self.config.network)
-            else {
+        let candidate_generation = (self.active_generation + 1) % GENERATION_COUNT;
+        let (candidate, attesting_status) = match converge_candidate(
+            &mut self.writer_status,
+            &self.config,
+            CandidateGeneration {
+                block_cache: &self.block_cache,
+                generation: candidate_generation,
+            },
+        )
+        .await
+        {
+            Ok(converged) => converged,
+            Err(ConvergenceFailure::WriterStatusTransport(_)) => {
+                let cause = self.writer_attestation.stale_allowance().map_or(
+                    ReadinessCause::WriterStatusUnavailable,
+                    |staleness| ReadinessCause::ServingPairStale {
+                        lag_chain_epochs: lag,
+                        staleness_seconds: staleness.as_secs(),
+                    },
+                );
+                self.record_failure(cause, active.event_fence().visible_tip().height.value());
+                return;
+            }
+            Err(ConvergenceFailure::WriterAhead) => {
+                let cause = self.writer_attestation.stale_allowance().map_or(
+                    ReadinessCause::ReplicaLagging {
+                        lag_chain_epochs: lag,
+                    },
+                    |staleness| ReadinessCause::ServingPairStale {
+                        lag_chain_epochs: lag,
+                        staleness_seconds: staleness.as_secs(),
+                    },
+                );
+                self.record_failure(cause, active.event_fence().visible_tip().height.value());
+                return;
+            }
+            Err(ConvergenceFailure::WriterFenceDiverged) => {
                 self.record_failure(
                     ReadinessCause::SchemaMismatch,
                     active.event_fence().visible_tip().height.value(),
                 );
                 return;
-            };
-            self.generation_activations = Arc::new(activations);
-        }
-        let candidate_generation = (self.active_generation + 1) % GENERATION_COUNT;
-        let Ok(candidate) = open_generation(
-            &self.config,
-            &self.generation_activations,
-            &self.block_cache,
-            candidate_generation,
-        )
-        .await
-        else {
-            self.record_failure(
-                ReadinessCause::StorageUnavailable,
-                active.event_fence().visible_tip().height.value(),
-            );
-            return;
+            }
+            Err(ConvergenceFailure::Storage(_) | ConvergenceFailure::WriterScheduleNotAdmitted) => {
+                self.record_failure(
+                    ReadinessCause::StorageUnavailable,
+                    active.event_fence().visible_tip().height.value(),
+                );
+                return;
+            }
         };
-        let Ok(candidate) = catch_up_generation(candidate).await else {
-            self.record_failure(
-                ReadinessCause::StorageUnavailable,
-                active.event_fence().visible_tip().height.value(),
-            );
-            return;
-        };
-        let (candidate, attesting_status) =
-            match converge_candidate(&mut self.writer_status, &self.config, candidate).await {
-                Ok(converged) => converged,
-                Err(ConvergenceFailure::WriterStatusTransport(_)) => {
-                    let cause = self.writer_attestation.stale_allowance().map_or(
-                        ReadinessCause::WriterStatusUnavailable,
-                        |staleness| ReadinessCause::ServingPairStale {
-                            lag_chain_epochs: lag,
-                            staleness_seconds: staleness.as_secs(),
-                        },
-                    );
-                    self.record_failure(cause, active.event_fence().visible_tip().height.value());
-                    return;
-                }
-                Err(ConvergenceFailure::WriterAhead) => {
-                    let cause = self.writer_attestation.stale_allowance().map_or(
-                        ReadinessCause::ReplicaLagging {
-                            lag_chain_epochs: lag,
-                        },
-                        |staleness| ReadinessCause::ServingPairStale {
-                            lag_chain_epochs: lag,
-                            staleness_seconds: staleness.as_secs(),
-                        },
-                    );
-                    self.record_failure(cause, active.event_fence().visible_tip().height.value());
-                    return;
-                }
-                Err(ConvergenceFailure::WriterFenceDiverged) => {
-                    self.record_failure(
-                        ReadinessCause::SchemaMismatch,
-                        active.event_fence().visible_tip().height.value(),
-                    );
-                    return;
-                }
-                Err(ConvergenceFailure::Storage(_)) => {
-                    self.record_failure(
-                        ReadinessCause::StorageUnavailable,
-                        active.event_fence().visible_tip().height.value(),
-                    );
-                    return;
-                }
-            };
         let reader = Arc::new(candidate);
         self.retired = Some(self.slot.publish(Arc::clone(&reader)));
         self.active_generation = candidate_generation;
@@ -524,13 +507,15 @@ fn transport_failure_cause(stale_allowance: Option<Duration>) -> ReadinessCause 
 
 async fn open_generation(
     config: &CompactBlockServingConfig,
-    activations: &Arc<NetworkUpgradeActivations>,
-    block_cache: &SharedBlockCache,
-    generation: usize,
+    candidate: CandidateGeneration<'_>,
 ) -> Result<RocksDbCanonicalSecondary, CompactBlockServingError> {
+    let CandidateGeneration {
+        block_cache,
+        generation,
+    } = candidate;
     let primary = config.canonical_primary_path.clone();
     let secondary_root = config.canonical_secondary_root.clone();
-    let activations = Arc::clone(activations);
+    let network = config.network;
     let retention = config.raw_blob_retention;
     let reorg = config.reorg_policy;
     let resources =
@@ -542,10 +527,10 @@ async fn open_generation(
                 "cannot create compact-block secondary: {error}"
             ))
         })?;
-        RocksDbCanonicalSecondary::open_ready(
+        RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
             primary,
             secondary,
-            activations.as_ref(),
+            network,
             CanonicalStoreWorkload::Wallet,
             retention,
             reorg,
@@ -571,6 +556,13 @@ async fn catch_up_generation(
                 ))
             })??,
     )
+}
+
+/// The generation slot a candidate opens in, on the publisher's shared cache.
+#[derive(Clone, Copy)]
+struct CandidateGeneration<'a> {
+    block_cache: &'a SharedBlockCache,
+    generation: usize,
 }
 
 struct CandidateFenceProbe<'a> {
@@ -599,24 +591,75 @@ impl CanonicalFenceProbe for CandidateFenceProbe<'_> {
     }
 }
 
+/// Returns the schedule the canonical writer admitted, which every generation
+/// adopts when it opens.
+fn writer_admitted_activations(
+    reader: &RocksDbCanonicalSecondary,
+) -> Result<&NetworkUpgradeActivations, Status> {
+    reader.network_upgrade_activations().ok_or_else(|| {
+        Status::failed_precondition(
+            "canonical reader carries no writer-admitted network-upgrade schedule",
+        )
+    })
+}
+
 fn candidate_unavailable() -> ConvergenceFailure {
     ConvergenceFailure::Storage(CompactBlockServingError::Runtime(
         "compact-block candidate is unavailable".to_owned(),
     ))
 }
 
-/// Converges `candidate` on the writer fence and returns it with the writer
-/// status that attested it.
+/// Opens a candidate in `generation`, retrying until `convergence_timeout`
+/// passes while the canonical writer has not admitted its first
+/// network-upgrade schedule.
+///
+/// The writer admits that schedule when it first opens the store, which can
+/// take longer than the convergence attempts allow, so this wait is bounded
+/// by time alone.
+async fn open_generation_awaiting_schedule(
+    config: &CompactBlockServingConfig,
+    generation: CandidateGeneration<'_>,
+    retry_delay: Duration,
+) -> Result<RocksDbCanonicalSecondary, ConvergenceFailure> {
+    let deadline = tokio::time::Instant::now() + config.convergence_timeout;
+    let mut waiting_logged = false;
+    loop {
+        match open_generation(config, generation).await {
+            Ok(candidate) => return Ok(candidate),
+            Err(CompactBlockServingError::Storage(
+                CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted { .. },
+            )) if tokio::time::Instant::now() < deadline => {
+                if !waiting_logged {
+                    tracing::info!(
+                        target: "zinder::compat_lightwalletd",
+                        event = "canonical_schedule_admission_pending",
+                        "waiting for the canonical writer to admit a network-upgrade schedule"
+                    );
+                    waiting_logged = true;
+                }
+            }
+            Err(CompactBlockServingError::Storage(
+                CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted { .. },
+            )) => return Err(ConvergenceFailure::WriterScheduleNotAdmitted),
+            Err(error) => return Err(ConvergenceFailure::Storage(error)),
+        }
+        tokio::time::sleep(retry_delay).await;
+    }
+}
+
+/// Opens a candidate in `generation`, converges it on the writer fence, and
+/// returns it with the writer status that attested it.
 async fn converge_candidate(
     writer_status: &mut WriterStatus,
     config: &CompactBlockServingConfig,
-    candidate: RocksDbCanonicalSecondary,
+    generation: CandidateGeneration<'_>,
 ) -> Result<(RocksDbCanonicalSecondary, CanonicalWriterStatusResponse), ConvergenceFailure> {
+    let retry_delay = config.catchup_interval.min(CONVERGENCE_RETRY_DELAY_CAP);
+    let candidate = open_generation_awaiting_schedule(config, generation, retry_delay).await?;
     let mut probe = CandidateFenceProbe {
         writer_status,
         candidate: Some(candidate),
     };
-    let retry_delay = config.catchup_interval.min(CONVERGENCE_RETRY_DELAY_CAP);
     let outcome = converge_on_canonical_writer_fence(
         &mut probe,
         config.network,
@@ -648,18 +691,13 @@ async fn converge_candidate(
 #[derive(Clone)]
 pub(crate) struct CompactBlockAdapter {
     slot: CompactBlockServingSlot,
-    activations: Arc<NetworkUpgradeActivations>,
     block_range_streams: BlockRangeStreamLimit,
 }
 
 impl CompactBlockAdapter {
-    pub(crate) fn new(
-        slot: CompactBlockServingSlot,
-        activations: Arc<NetworkUpgradeActivations>,
-    ) -> Self {
+    pub(crate) fn new(slot: CompactBlockServingSlot) -> Self {
         Self {
             slot,
-            activations,
             block_range_streams: BlockRangeStreamLimit::new(
                 DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
             ),
@@ -735,16 +773,7 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlockAdapter {
     ) -> Result<Response<lightwalletd::LightdInfo>, Status> {
         let reader = self.reader();
         let epoch = reader.chain_epoch().map_err(store_status)?;
-        // Before the writer's first admission, reader admission requires the
-        // startup table to equal the store's construction table.
-        let activations = reader
-            .network_upgrade_activations()
-            .unwrap_or(&self.activations);
-        if epoch.network != activations.network() {
-            return Err(Status::failed_precondition(
-                "admitted network does not match node activations",
-            ));
-        }
+        let activations = writer_admitted_activations(&reader)?;
         Ok(Response::new(lightd_info(
             activations,
             epoch.visible_tip_height.value(),
@@ -1574,7 +1603,23 @@ mod tests {
         }
     }
 
+    /// Builds the lifecycle store and admits `activations` as schedule
+    /// revision 1, as the canonical writer does when it first opens it.
     fn lifecycle_store(
+        root: &std::path::Path,
+        activations: &zinder_core::NetworkUpgradeActivations,
+    ) -> Result<
+        (RocksDbCanonicalStore, Vec<zinder_testkit::FixtureBlock>),
+        Box<dyn std::error::Error>,
+    > {
+        let (mut store, blocks) = unadmitted_lifecycle_store(root, activations)?;
+        store.admit_network_upgrade_schedule(activations)?;
+        Ok((store, blocks))
+    }
+
+    /// Builds the READY lifecycle store before its writer's first schedule
+    /// admission.
+    fn unadmitted_lifecycle_store(
         root: &std::path::Path,
         activations: &zinder_core::NetworkUpgradeActivations,
     ) -> Result<
@@ -1775,7 +1820,6 @@ mod tests {
             canonical_primary_path: temporary.path().join("canonical-primary"),
             canonical_secondary_root: temporary.path().join("canonical-secondaries"),
             network: Network::ZcashRegtest,
-            activations: Arc::new(activations),
             raw_blob_retention: RawBlobRetention::Transactions,
             reorg_policy: CanonicalReorgPolicy::new(100)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -1805,6 +1849,139 @@ mod tests {
         assert!(
             message.contains("writer fence diverged from the candidate secondary"),
             "bootstrap failed for a reason other than fence divergence: {message}"
+        );
+        Ok(())
+    }
+
+    /// Compact serving brings no activation table of its own: bootstrap waits
+    /// for the writer's first schedule admission and serves that schedule.
+    ///
+    /// The wait is bounded by the convergence timeout, however many attempts
+    /// it takes.
+    #[tokio::test]
+    async fn bootstrap_waits_for_the_writers_first_schedule_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let activations = lifecycle_activations();
+        let (mut primary, _blocks) =
+            unadmitted_lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
+        let control = MutableCanonicalControl::new(lifecycle_writer_status(&primary));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let server = tokio::spawn({
+            let control = control.clone();
+            async move {
+                Server::builder()
+                    .add_service(CanonicalControlServer::new(control))
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                        let _ = shutdown_receiver.await;
+                    })
+                    .await
+            }
+        });
+        let config = CompactBlockServingConfig {
+            canonical_primary_path: temporary.path().join("canonical-primary"),
+            canonical_secondary_root: temporary.path().join("canonical-secondaries"),
+            network: Network::ZcashRegtest,
+            raw_blob_retention: RawBlobRetention::Transactions,
+            reorg_policy: CanonicalReorgPolicy::new(100)?,
+            resource_budget: RocksDbResourceBudget::for_local_tests(),
+            catchup_interval: Duration::from_millis(1),
+            convergence_timeout: Duration::from_secs(10),
+            convergence_attempts: 1,
+            staleness_ceiling: Duration::from_mins(1),
+            lag_threshold: 0,
+        };
+        let bootstrap = tokio::spawn(async move {
+            CompactBlockPublisher::bootstrap(
+                config,
+                CompactServingReadiness::new(Readiness::default()),
+                &endpoint,
+                None,
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !bootstrap.is_finished(),
+            "bootstrap must wait for the schedule"
+        );
+        primary.admit_network_upgrade_schedule(&activations)?;
+        control.set_writer_status(lifecycle_writer_status(&primary));
+        let (_publisher, slot) = bootstrap.await??;
+
+        let reader = slot.capture();
+        assert_eq!(reader.network_upgrade_activations(), Some(&activations));
+        let info = CompactBlockAdapter::new(slot.clone())
+            .get_lightd_info(Request::new(lightwalletd::Empty {}))
+            .await?
+            .into_inner();
+        assert_eq!(
+            info.chain_name,
+            zinder_core::wire::encode_bip70_chain_name(Network::ZcashRegtest)
+        );
+        drop(reader);
+        let _ = shutdown_sender.send(());
+        server.await??;
+        Ok(())
+    }
+
+    /// A writer that never admits a schedule fails bootstrap with a typed
+    /// error instead of a reader-supplied table.
+    #[tokio::test]
+    async fn bootstrap_reports_a_store_whose_writer_admitted_no_schedule()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let activations = lifecycle_activations();
+        let (primary, _blocks) =
+            unadmitted_lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
+        let control = MutableCanonicalControl::new(lifecycle_writer_status(&primary));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(CanonicalControlServer::new(control))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    let _ = shutdown_receiver.await;
+                })
+                .await
+        });
+        let config = CompactBlockServingConfig {
+            canonical_primary_path: temporary.path().join("canonical-primary"),
+            canonical_secondary_root: temporary.path().join("canonical-secondaries"),
+            network: Network::ZcashRegtest,
+            raw_blob_retention: RawBlobRetention::Transactions,
+            reorg_policy: CanonicalReorgPolicy::new(100)?,
+            resource_budget: RocksDbResourceBudget::for_local_tests(),
+            catchup_interval: Duration::from_millis(1),
+            convergence_timeout: Duration::from_millis(300),
+            convergence_attempts: 4,
+            staleness_ceiling: Duration::from_mins(1),
+            lag_threshold: 0,
+        };
+
+        let outcome = CompactBlockPublisher::bootstrap(
+            config,
+            CompactServingReadiness::new(Readiness::default()),
+            &endpoint,
+            None,
+        )
+        .await;
+
+        let bootstrap_error = outcome.err();
+        let _ = shutdown_sender.send(());
+        server.await??;
+        let Some(CompactBlockServingError::Runtime(message)) = bootstrap_error else {
+            return Err(
+                format!("expected a runtime bootstrap error, got {bootstrap_error:?}").into(),
+            );
+        };
+        assert!(
+            message.contains("has not admitted a network-upgrade schedule"),
+            "bootstrap failed for another reason: {message}"
         );
         Ok(())
     }
@@ -1850,7 +2027,6 @@ mod tests {
             canonical_primary_path: temporary.path().join("canonical-primary"),
             canonical_secondary_root: temporary.path().join("canonical-secondaries"),
             network: Network::ZcashRegtest,
-            activations: Arc::new(activations.clone()),
             raw_blob_retention: RawBlobRetention::Transactions,
             reorg_policy: CanonicalReorgPolicy::new(100)?,
             resource_budget: budget,
@@ -1979,7 +2155,6 @@ mod tests {
             canonical_primary_path: temporary.path().join("canonical-primary"),
             canonical_secondary_root: temporary.path().join("canonical-secondaries"),
             network: Network::ZcashRegtest,
-            activations: Arc::new(activations.clone()),
             raw_blob_retention: RawBlobRetention::Transactions,
             reorg_policy: CanonicalReorgPolicy::new(100)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -2169,7 +2344,6 @@ mod tests {
             canonical_primary_path: temporary.path().join("canonical-primary"),
             canonical_secondary_root: temporary.path().join("canonical-secondaries"),
             network: Network::ZcashRegtest,
-            activations: Arc::new(activations.clone()),
             raw_blob_retention: RawBlobRetention::Transactions,
             reorg_policy: CanonicalReorgPolicy::new(100)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -2276,7 +2450,6 @@ mod tests {
             canonical_primary_path: temporary.path().join("canonical-primary"),
             canonical_secondary_root: temporary.path().join("canonical-secondaries"),
             network: Network::ZcashRegtest,
-            activations: Arc::new(activations.clone()),
             raw_blob_retention: RawBlobRetention::Transactions,
             reorg_policy: CanonicalReorgPolicy::new(100)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -2357,7 +2530,6 @@ mod tests {
             canonical_primary_path: temporary.path().join("canonical-primary"),
             canonical_secondary_root: temporary.path().join("canonical-secondaries"),
             network: Network::ZcashRegtest,
-            activations: Arc::new(activations.clone()),
             raw_blob_retention: RawBlobRetention::Transactions,
             reorg_policy: CanonicalReorgPolicy::new(100)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -2465,15 +2637,12 @@ mod tests {
             activations
                 .active_at(BlockHeight::new(height))
                 .map(|activation| zinder_core::wire::encode_branch_id_hex(activation.branch_id))
-                .ok_or("the startup table must have an active upgrade")
+                .ok_or("the construction table must have an active upgrade")
         };
         let canopy_branch_id = branch_active_at(1)?;
         let nu6_3_branch_id = branch_active_at(2)?;
         let (mut primary, blocks) =
             lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
-        // The writer's first start admits the unchanged node table as
-        // revision 1 before the compatibility runtime starts with that table.
-        primary.admit_network_upgrade_schedule(&activations)?;
         let control = MutableCanonicalControl::new(lifecycle_writer_status(&primary));
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}", listener.local_addr()?);
@@ -2494,7 +2663,6 @@ mod tests {
             canonical_primary_path: temporary.path().join("canonical-primary"),
             canonical_secondary_root: temporary.path().join("canonical-secondaries"),
             network: Network::ZcashRegtest,
-            activations: Arc::new(activations.clone()),
             raw_blob_retention: RawBlobRetention::Transactions,
             reorg_policy: CanonicalReorgPolicy::new(100)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -2506,7 +2674,7 @@ mod tests {
         };
         let (mut publisher, slot) =
             CompactBlockPublisher::bootstrap(config, serving_readiness, &endpoint, None).await?;
-        let adapter = CompactBlockAdapter::new(slot.clone(), Arc::new(activations.clone()));
+        let adapter = CompactBlockAdapter::new(slot.clone());
         let startup = adapter
             .get_lightd_info(Request::new(lightwalletd::Empty::default()))
             .await?
@@ -2637,7 +2805,6 @@ mod tests {
                 canonical_primary_path: writer.canonical_primary_path().to_path_buf(),
                 canonical_secondary_root: secondaries.path().to_path_buf(),
                 network: Network::ZcashRegtest,
-                activations: Arc::new(activations.clone()),
                 raw_blob_retention: RawBlobRetention::Transactions,
                 reorg_policy: CanonicalReorgPolicy::new(100)?,
                 resource_budget: RocksDbResourceBudget::for_local_tests(),
@@ -2650,7 +2817,7 @@ mod tests {
             let (publisher, slot) =
                 CompactBlockPublisher::bootstrap(config, serving_readiness, &endpoint, None)
                     .await?;
-            let adapter = CompactBlockAdapter::new(slot.clone(), Arc::new(activations));
+            let adapter = CompactBlockAdapter::new(slot.clone());
             Ok(Self {
                 writer,
                 control,
@@ -3159,10 +3326,7 @@ mod tests {
             zinder_testkit::WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
         let (canonical, wallet) = fixture.take_readers()?;
         drop(wallet);
-        let adapter = CompactBlockAdapter::new(
-            CompactBlockServingSlot::new(Arc::new(canonical)),
-            activations,
-        );
+        let adapter = CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(canonical)));
 
         let cases = [
             ("start above visible tip", 4_u64, 5_u64, Code::OutOfRange),
@@ -3322,10 +3486,9 @@ mod tests {
             zinder_testkit::WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
         let (canonical, wallet) = fixture.take_readers()?;
         drop(wallet);
-        Ok(CompactBlockAdapter::new(
-            CompactBlockServingSlot::new(Arc::new(canonical)),
-            activations,
-        ))
+        Ok(CompactBlockAdapter::new(CompactBlockServingSlot::new(
+            Arc::new(canonical),
+        )))
     }
 
     async fn range_parity_blocks(
@@ -3453,10 +3616,7 @@ mod tests {
     fn adapter_serving(
         reader: &Arc<zinder_store::RocksDbCanonicalSecondary>,
     ) -> CompactBlockAdapter {
-        CompactBlockAdapter::new(
-            CompactBlockServingSlot::new(Arc::clone(reader)),
-            Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
-        )
+        CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::clone(reader)))
     }
 
     /// Returns how many blocks of `1..=LARGE_BLOCK_TIP` one byte-capped chunk
@@ -3740,10 +3900,7 @@ mod tests {
             .find(|activation| activation.name == "NU6.2")
             .map(|activation| zinder_core::wire::encode_branch_id_hex(activation.branch_id))
             .ok_or("the sample table must include NU6.2")?;
-        let adapter = CompactBlockAdapter::new(
-            CompactBlockServingSlot::new(Arc::new(canonical)),
-            activations,
-        );
+        let adapter = CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(canonical)));
 
         let info = adapter
             .get_lightd_info(Request::new(lightwalletd::Empty::default()))
@@ -3804,10 +3961,7 @@ mod tests {
             .compact_block_at(BlockHeight::new(2))?
             .ok_or("fixture block missing")?;
         let expected_wire = compact_block_to_lightwalletd(&expected_block)?;
-        let adapter = CompactBlockAdapter::new(
-            CompactBlockServingSlot::new(Arc::new(canonical)),
-            activations,
-        );
+        let adapter = CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(canonical)));
 
         let info = adapter
             .get_lightd_info(Request::new(lightwalletd::Empty::default()))
@@ -3967,10 +4121,7 @@ mod tests {
             zinder_testkit::WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
         let (canonical, wallet) = fixture.take_readers()?;
         drop(wallet);
-        let adapter = CompactBlockAdapter::new(
-            CompactBlockServingSlot::new(Arc::new(canonical)),
-            Arc::clone(&activations),
-        );
+        let adapter = CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(canonical)));
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}", listener.local_addr()?);
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();

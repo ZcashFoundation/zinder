@@ -43,6 +43,10 @@ pub enum StartupPhase {
     /// Verify the schema version against the storage handle.
     CheckSchema,
     /// Establish the upstream node connection and probe capabilities.
+    ///
+    /// Only the canonical writer enters this phase. Readers start without
+    /// contacting a node and verify their broadcast endpoint in the
+    /// background instead.
     ConnectNode,
     /// Authenticate and structurally admit the ingest-control service.
     AdmitIngestControl,

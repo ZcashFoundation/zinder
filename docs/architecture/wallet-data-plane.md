@@ -289,12 +289,9 @@ prevented by construction. `consensus_branch_id` is resolved from the
 network-upgrade schedule the canonical writer admitted, as captured with the
 serving pair: callers invoke `activations.consensus_branch_id_at(height)`,
 which returns `PRE_OVERWINTER_BRANCH_ID` for heights below the earliest
-activation. Before the writer's first admission, the pair carries no schedule
-and the query uses the table it discovered at startup through
-`ZebraJsonRpcSource::discover_network_upgrade_activations()`; reader admission
-requires that table to equal the store's construction table. The service
-binary refuses to start when `[node]` is not configured, so the field always
-reflects a real node-discovered table; see
+activation. A serving pair requires a writer-admitted schedule, and a reader
+waits for the writer's first admission before it opens storage, so the field
+always reflects the table the writer discovered from its node; see
 [ADR-0008](../adrs/0008-network-parameter-discovery.md) and
 [ADR-0039](../adrs/0039-writer-admitted-network-upgrade-schedules.md).
 `block_time` is read from the stored `BlockHeaderArtifact` and falls back to

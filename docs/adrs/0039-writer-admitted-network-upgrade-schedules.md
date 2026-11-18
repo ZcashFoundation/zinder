@@ -67,20 +67,35 @@ table.
 
 ### Readers
 
-Readers never write a revision. Each reader checks its own discovered table
-once, when it first opens a canonical secondary. Before the writer's first
-admission, the table must reproduce the construction fingerprint exactly. After
-it, the table must equal the admitted schedule at or below the visible tip.
+Readers never write a revision, and the reader runtimes bring no activation
+table of their own. Query, compatibility in both serving modes, and the
+projector open every canonical secondary with
+`RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule`, which takes
+only the expected network and reads through the schedule the writer persisted.
+None of them contacts a node to learn the table, so they start while the node
+is down.
 
-After that startup check, a reader follows the writer rather than its startup
-observation:
+A READY store whose writer has not admitted a schedule yet refuses that open
+with `CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted`. The writer
+admits revision 1 when it opens the store, so the refusal is transient. The
+serving publishers retry it before they converge, until
+`storage.initial_catchup_timeout_ms` passes, and these rounds do not count
+against `pair_convergence_attempts`. The projector retries it until
+`projector.fence_convergence_timeout_seconds` passes. A serving pair requires an admitted schedule and serves it as its
+activation table.
+
+A secondary opened in the writer's own process, such as ingest's
+materialized-view secondary, still opens with its node-observed table through
+`RocksDbCanonicalSecondary::open_ready`. Before the writer's first admission,
+that table must reproduce the construction fingerprint exactly. After it, the
+table must equal the admitted schedule at or below the visible tip.
+
+After it opens, a reader follows the writer:
 
 - A long-lived secondary, such as the projector's, reads each new revision when
   it catches up.
-- A serving runtime that opens a fresh secondary generation for each refresh
-  opens it with the table the writer last reported in
-  `CanonicalControl.WriterStatus`. The query's serving-pair publisher and the
-  compact-block compatibility publisher work this way, so a runtime started
+- A serving runtime that opens a fresh secondary generation for a refresh
+  adopts the schedule that generation finds in the store, so a runtime started
   before an admission keeps refreshing after the chain crosses the newly
   admitted activation.
 - The query serves the table admitted with the captured serving pair. Its
@@ -119,12 +134,14 @@ responses carry the admitted table, revision, and V1 fingerprint.
   when the node's table is unchanged. Earlier releases reject the journal keys
   and the control trailer, so they cannot open the store afterwards. Rolling
   back requires a state bundle or checkpoint taken before the upgrade.
-- Until the writer's first admission, a reader whose node advertises a table
-  other than the construction table refuses to open, so ingest restarts before
-  its readers.
-- A reader that restarts against a node whose table differs from the admitted
-  schedule at or below the tip refuses to open, even though readers that are
-  already running keep following the writer.
+- A reader cannot open a READY store before the writer's first admission. It
+  retries until its convergence timeout passes, so a reader started before
+  ingest only waits.
+- Readers no longer compare a node's table with the store when they open. A
+  reader that broadcasts transactions instead verifies its node's table
+  against the admitted schedule through the served tip on first contact,
+  before any transaction reaches the node
+  ([ADR-0038](0038-wallet-runtime-composition-and-capability-discovery.md)).
 
 ## Rejected alternatives
 
@@ -149,5 +166,16 @@ the same identity.
 
 - `CanonicalActivationSchedule` (one writer-admitted schedule revision in the
   canonical store).
+- `NetworkUpgradeScheduleNotAdmitted` (the retryable refusal of a reader that
+  adopts the writer's schedule before the writer admitted one).
 
 See [Public interfaces §Core vocabulary](../architecture/public-interfaces.md#core-vocabulary).
+
+## Revision history
+
+- 2026-11-18: Reader runtimes adopt the writer-admitted schedule instead of
+  checking a node-discovered table at open. Query, compatibility, and the
+  projector no longer contact a node to open storage, and a store without an
+  admitted schedule is refused with the retryable
+  `NetworkUpgradeScheduleNotAdmitted`. A broadcasting reader verifies its
+  node's table on first contact instead.

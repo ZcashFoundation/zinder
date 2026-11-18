@@ -42,15 +42,12 @@ use zinder_proto::compat::lightwalletd::{
 
 use zinder_query::{
     ArtifactKey, BlockHeaderAtEpoch, BlockIdAtEpoch, ChainEvents, CompactBlock, CompactBlockRange,
-    DEFAULT_MAX_COMPACT_BLOCK_RANGE, FullBlock, FullBlockStream, QueryError, RawTransaction,
-    SettledTipBlock, SubtreeRoots, Transaction, TransactionStatus, TransparentAddressTxIds,
-    TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputs,
-    TransparentAddressUnspentOutputsRequest, TransparentOutpointSpendStatuses, TreeState,
-    VisibleTipBlock, WalletQueryApi, WalletServingPairSlot, WalletServingQuery,
-    WalletServingReadPair,
-};
-use zinder_source::{
-    NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError, TransactionBroadcaster,
+    DEFAULT_MAX_COMPACT_BLOCK_RANGE, FullBlock, FullBlockStream, NodeBroadcast, QueryError,
+    RawTransaction, SettledTipBlock, SubtreeRoots, Transaction, TransactionStatus,
+    TransparentAddressTxIds, TransparentAddressTxIdsInRangeRequest,
+    TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest,
+    TransparentOutpointSpendStatuses, TreeState, VisibleTipBlock, WalletQueryApi,
+    WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_store::{
     ArtifactFamily, CanonicalBuildSubtreeRoot, ChainEventStreamFamily, ChainEventStreamResume,
@@ -906,10 +903,7 @@ async fn get_block_range_ends_when_a_live_replacement_displaces_sent_blocks() ->
         &CanonicalBaseline::new(&chain).with_settled_tip(BlockHeight::new(FORK_HEIGHT - 5)),
         &sample_regtest_upgrade_activations(),
     )?;
-    let before_reorg = AcceptanceStore::from_store_fixture(
-        writer.serving_store_fixture()?,
-        CompatNode::read_only(writer.canonical_primary()?.event_fence().visible_tip())?,
-    )?;
+    let before_reorg = AcceptanceStore::from_store_fixture(writer.serving_store_fixture()?, None)?;
     let sent_epoch = before_reorg
         .query()
         .visible_tip_block(None)
@@ -2425,14 +2419,10 @@ async fn tree_state_between_checkpoints_is_served_from_storage_without_the_node(
     )?;
     let probed_heights = [1, 2, 57, 99, 100, 101, 149, 150].map(BlockHeight::new);
     let expected = commitment_tree_checkpoints(&chain, &activations, &probed_heights)?;
-    let tip = chain
-        .blocks()
-        .last()
-        .ok_or_else(|| eyre!("tree-state chain must contain a block"))?;
     let store_fixture = AcceptanceStore::from_store_fixture(
         CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &activations)?
             .into_serving_store_fixture()?,
-        CompatNode::read_only(BlockId::new(tip.height, tip.hash))?,
+        None,
     )?;
     let adapter = acceptance_adapter(&store_fixture);
 
@@ -2806,7 +2796,7 @@ async fn get_transaction_returns_not_found_when_blob_is_unretained() -> eyre::Re
 async fn send_transaction_forwards_accepted_to_zero_error_code() -> eyre::Result<()> {
     let transaction_id = TransactionId::from_bytes([0x42; 32]);
     let broadcaster = MockTransactionBroadcaster::accepted(transaction_id);
-    let (adapter, _store_fixture) = broadcasting_acceptance_adapter(broadcaster)?;
+    let (adapter, _store_fixture) = broadcasting_acceptance_adapter(broadcaster).await?;
 
     let response = adapter
         .send_transaction(Request::new(lightwalletd::RawTransaction {
@@ -2832,7 +2822,7 @@ async fn send_transaction_maps_invalid_encoding_to_minus_22() -> eyre::Result<()
             message: "TX decode failed".to_owned(),
         }),
     );
-    let (adapter, _store_fixture) = broadcasting_acceptance_adapter(broadcaster)?;
+    let (adapter, _store_fixture) = broadcasting_acceptance_adapter(broadcaster).await?;
 
     let response = adapter
         .send_transaction(Request::new(lightwalletd::RawTransaction {
@@ -2900,7 +2890,7 @@ async fn send_transaction_maps_duplicate_and_rejected_codes() -> eyre::Result<()
 
     for (broadcast_outcome, expected_code, expected_message) in cases {
         let broadcaster = MockTransactionBroadcaster::returning(broadcast_outcome);
-        let (adapter, _store_fixture) = broadcasting_acceptance_adapter(broadcaster)?;
+        let (adapter, _store_fixture) = broadcasting_acceptance_adapter(broadcaster).await?;
 
         let response = adapter
             .send_transaction(Request::new(lightwalletd::RawTransaction {
@@ -2926,7 +2916,7 @@ async fn send_transaction_forwards_node_error_code_when_present() -> eyre::Resul
             message: "missing-input".to_owned(),
         },
     ));
-    let (adapter, _store_fixture) = broadcasting_acceptance_adapter(broadcaster)?;
+    let (adapter, _store_fixture) = broadcasting_acceptance_adapter(broadcaster).await?;
 
     let response = adapter
         .send_transaction(Request::new(lightwalletd::RawTransaction {
@@ -3505,10 +3495,7 @@ async fn get_transaction_returns_not_found_after_reorg_invalidates_transaction()
         hash: transaction_id.as_bytes().to_vec(),
     };
 
-    let before_reorg = AcceptanceStore::from_store_fixture(
-        writer.serving_store_fixture()?,
-        CompatNode::read_only(writer.canonical_primary()?.event_fence().visible_tip())?,
-    )?;
+    let before_reorg = AcceptanceStore::from_store_fixture(writer.serving_store_fixture()?, None)?;
     let served = acceptance_adapter(&before_reorg)
         .get_transaction(Request::new(transaction_filter()))
         .await?
@@ -3665,18 +3652,26 @@ where
 }
 /// Serves the writer's final fence through the compatibility composition.
 fn acceptance_store_from_writer(writer: CanonicalWriterFixture) -> eyre::Result<AcceptanceStore> {
-    let node = CompatNode::read_only(writer.canonical_primary()?.event_fence().visible_tip())?;
-    AcceptanceStore::from_store_fixture(writer.into_serving_store_fixture()?, node)
+    AcceptanceStore::from_store_fixture(writer.into_serving_store_fixture()?, None)
 }
 
-/// Exact production serving pair queried through a probed node double.
+/// Compatibility query that broadcasts through a node double, when one is
+/// configured.
+type AcceptanceQuery = WalletServingQuery<Option<NodeBroadcast<MockTransactionBroadcaster>>>;
+
+/// Exact production serving pair queried through the compatibility query.
 struct AcceptanceStore {
-    query: WalletServingQuery<CompatNode>,
+    query: AcceptanceQuery,
+    slot: WalletServingPairSlot,
+    node: Option<NodeBroadcast<MockTransactionBroadcaster>>,
     _store_fixture: WalletServingStoreFixture,
 }
 
 impl AcceptanceStore {
-    fn from_chain(chain: &ChainFixture, node: CompatNode) -> eyre::Result<Self> {
+    fn from_chain(
+        chain: &ChainFixture,
+        node: Option<MockTransactionBroadcaster>,
+    ) -> eyre::Result<Self> {
         Self::from_store_fixture(
             WalletServingStoreFixture::from_chain(chain, &sample_regtest_upgrade_activations())?,
             node,
@@ -3685,62 +3680,60 @@ impl AcceptanceStore {
 
     fn from_store_fixture(
         mut store_fixture: WalletServingStoreFixture,
-        node: CompatNode,
+        node: Option<MockTransactionBroadcaster>,
     ) -> eyre::Result<Self> {
-        let activations = Arc::new(sample_regtest_upgrade_activations());
         let (canonical, wallet) = store_fixture.take_readers()?;
-        let query = WalletServingQuery::from_probed_node_source(
-            WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
-                Arc::new(canonical),
-                Arc::new(wallet),
-            )?)),
-            node,
-            activations,
-        )?;
+        let slot = WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
+            Arc::new(canonical),
+            Arc::new(wallet),
+        )?));
+        let node = node.map(|broadcaster| {
+            NodeBroadcast::new(
+                broadcaster.with_node_activations(sample_regtest_upgrade_activations()),
+            )
+        });
+        let query = WalletServingQuery::from_serving_pair_slot(slot.clone())
+            .with_node_broadcast(node.clone());
         Ok(Self {
             query,
+            slot,
+            node,
             _store_fixture: store_fixture,
         })
     }
 
-    fn query(&self) -> WalletServingQuery<CompatNode> {
+    /// Passes the node's first-contact verification, as the node probe does
+    /// once the node answers.
+    async fn verify_node(&self) -> eyre::Result<()> {
+        let node = self
+            .node
+            .as_ref()
+            .ok_or_else(|| eyre!("the acceptance store has no node to verify"))?;
+        node.verify(&self.slot).await?;
+        Ok(())
+    }
+
+    fn query(&self) -> AcceptanceQuery {
         self.query.clone()
     }
 }
 
-fn acceptance_adapter(
-    store_fixture: &AcceptanceStore,
-) -> LightwalletdGrpcAdapter<WalletServingQuery<CompatNode>> {
+fn acceptance_adapter(store_fixture: &AcceptanceStore) -> LightwalletdGrpcAdapter<AcceptanceQuery> {
     LightwalletdGrpcAdapter::new(store_fixture.query())
 }
 
 fn acceptance_store_from_chain(chain: &ChainFixture) -> eyre::Result<AcceptanceStore> {
-    let tip = chain
-        .blocks()
-        .last()
-        .ok_or_else(|| eyre!("acceptance chain must contain a block"))?;
-    AcceptanceStore::from_chain(
-        chain,
-        CompatNode::read_only(BlockId::new(tip.height, tip.hash))?,
-    )
+    AcceptanceStore::from_chain(chain, None)
 }
 
-/// Builds a compatibility adapter whose probed node admits broadcast and
-/// forwards it to `broadcaster`.
-fn broadcasting_acceptance_adapter(
+/// Builds a compatibility adapter whose verified node forwards broadcasts
+/// to `broadcaster`.
+async fn broadcasting_acceptance_adapter(
     broadcaster: MockTransactionBroadcaster,
-) -> eyre::Result<(
-    LightwalletdGrpcAdapter<WalletServingQuery<CompatNode>>,
-    AcceptanceStore,
-)> {
+) -> eyre::Result<(LightwalletdGrpcAdapter<AcceptanceQuery>, AcceptanceStore)> {
     let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
-    let tip = chain
-        .block_at(ACCEPTANCE_BLOCK_HEIGHT)
-        .ok_or_else(|| eyre!("broadcast fixture must include the height 1 block"))?;
-    let store_fixture = AcceptanceStore::from_chain(
-        &chain,
-        CompatNode::broadcasting(BlockId::new(tip.height, tip.hash), broadcaster)?,
-    )?;
+    let store_fixture = AcceptanceStore::from_chain(&chain, Some(broadcaster))?;
+    store_fixture.verify_node().await?;
     Ok((acceptance_adapter(&store_fixture), store_fixture))
 }
 
@@ -3834,73 +3827,6 @@ where
     }
 
     acceptance_store_from_chain(&chain_fixture)
-}
-
-/// Probed node double for the compatibility composition.
-///
-/// It advertises tree state, as production nodes do, although the query never
-/// asks a node for one.
-#[derive(Clone)]
-struct CompatNode {
-    capabilities: NodeCapabilities,
-    tip: BlockId,
-    broadcaster: MockTransactionBroadcaster,
-}
-
-impl CompatNode {
-    fn read_only(tip: BlockId) -> eyre::Result<Self> {
-        Ok(Self {
-            capabilities: NodeCapabilities::new([
-                NodeCapability::OpenRpcDiscovery,
-                NodeCapability::TipId,
-                NodeCapability::TreeState,
-            ])?,
-            tip,
-            broadcaster: MockTransactionBroadcaster::broadcast_disabled(),
-        })
-    }
-
-    fn broadcasting(tip: BlockId, broadcaster: MockTransactionBroadcaster) -> eyre::Result<Self> {
-        Ok(Self {
-            capabilities: NodeCapabilities::new([
-                NodeCapability::OpenRpcDiscovery,
-                NodeCapability::TipId,
-                NodeCapability::TreeState,
-                NodeCapability::TransactionBroadcast,
-            ])?,
-            tip,
-            broadcaster,
-        })
-    }
-}
-
-#[async_trait]
-impl NodeSource for CompatNode {
-    fn capabilities(&self) -> NodeCapabilities {
-        self.capabilities
-    }
-
-    async fn fetch_block_at(&self, _height: BlockHeight) -> Result<SourceBlock, SourceError> {
-        Err(SourceError::NodeCapabilityMissing {
-            capability: NodeCapability::BestChainBlocks,
-        })
-    }
-
-    async fn tip_id(&self) -> Result<BlockId, SourceError> {
-        Ok(self.tip)
-    }
-}
-
-#[async_trait]
-impl TransactionBroadcaster for CompatNode {
-    async fn broadcast_transaction(
-        &self,
-        raw_transaction: RawTransactionBytes,
-    ) -> Result<TransactionBroadcastOutcome, SourceError> {
-        self.broadcaster
-            .broadcast_transaction(raw_transaction)
-            .await
-    }
 }
 
 fn acceptance_compact_block_artifact_at(

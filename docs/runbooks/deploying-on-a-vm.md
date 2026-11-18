@@ -215,6 +215,9 @@ wait for a healthy projector. Query and compatibility wait only for the ingest
 container to start, not for it to be healthy, because they share its network
 namespace and keep serving through a node outage that leaves ingest
 unhealthy. Query and compatibility receive five-minute startup grace periods.
+The projector has no node settings, and query and compatibility do not
+contact the node to start: they reach it only to broadcast transactions,
+after checking on first contact that it serves the store's chain.
 
 ### Attach a Zakura node
 
@@ -251,7 +254,9 @@ It runs as UID 10001 with no capabilities and no network. Every 5 seconds it
 sets the cookie's mode to 0644 in place; it never copies the cookie. It is a
 separate Compose project, so the Zinder systemd unit does not stop it. After a
 node restart, ingest can find the cookie unreadable for up to one poll
-interval. Ingest reports the node as unavailable and retries. Z3 already runs
+interval. Ingest reports the node as unavailable and retries. Query and
+compatibility start even while the cookie is unreadable: they report the node
+as unavailable and refuse broadcasts until they can read it. Z3 already runs
 an equivalent service, so Z3 deployments do not need this project.
 
 ### Attach an explorer consumer

@@ -4,16 +4,6 @@
 [network]
 name = "zcash-mainnet"
 
-[node]
-# The node JSON-RPC endpoint comes from ZINDER_NODE__JSON_RPC_ADDR, which the
-# selected deploy env file sets.
-request_timeout_secs = 30
-max_response_bytes = 67108864
-
-[node.auth]
-method = "cookie"
-path = "/var/run/auth/.cookie"
-
 [storage]
 canonical_path = "/var/lib/zinder/canonical"
 canonical_secondary_path = "/var/lib/zinder/projector/canonical-secondary"

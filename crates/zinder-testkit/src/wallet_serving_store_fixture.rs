@@ -69,11 +69,10 @@ impl WalletServingStoreFixture {
     /// `admitted_activations` over a store built with
     /// `construction_activations`.
     ///
-    /// Before the live append, the writer admits the construction table as
-    /// revision 1, as a writer's first start does, and then
-    /// `admitted_activations` as the next revision. The live block is
-    /// committed with the admitted table, and the canonical reader opens with
-    /// it, as a serving publisher does after following writer status.
+    /// The baseline admits the construction table as revision 1, as a
+    /// writer's first start does. Before the live append, the writer admits
+    /// `admitted_activations` as the next revision, and the live block is
+    /// committed with it.
     ///
     /// # Errors
     ///
@@ -110,7 +109,6 @@ impl WalletServingStoreFixture {
             construction_activations,
         )?;
         if let Some(admitted_activations) = admitted_activations {
-            writer.admit_network_upgrade_schedule(construction_activations)?;
             writer.admit_network_upgrade_schedule(admitted_activations)?;
         }
         writer.append_live_block(chain_fixture)?;
@@ -122,26 +120,32 @@ impl WalletServingStoreFixture {
     ///
     /// `canonical_primary` must be the READY wallet-workload store at
     /// `canonical_primary_path`, inside `temporary_directory`. The fixture
-    /// takes ownership of the directory, builds the wallet primary beside the
-    /// canonical one, and drops both primaries before admitting readers. Use
-    /// this to serve a canonical store built by production construction, such
-    /// as one loaded from a live node.
+    /// admits `network_upgrade_activations` as the writer's schedule, as the
+    /// canonical writer does when it opens the store, takes ownership of the
+    /// directory, builds the wallet primary beside the canonical one, and
+    /// drops both primaries before admitting readers. Use this to serve a
+    /// canonical store built by production construction, such as one loaded
+    /// from a live node.
     ///
     /// # Errors
     ///
-    /// Returns an error when the wallet projection, either secondary
-    /// admission, or the canonical primary's contract fails.
+    /// Returns an error when the schedule admission, the wallet projection,
+    /// either secondary admission, or the canonical primary's contract fails.
     pub fn from_published_canonical(
         temporary_directory: TempDir,
         canonical_primary_path: &Path,
-        canonical_primary: RocksDbCanonicalStore,
+        mut canonical_primary: RocksDbCanonicalStore,
         network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> eyre::Result<Self> {
+        ensure!(
+            canonical_primary.network() == network_upgrade_activations.network(),
+            "canonical primary and network-upgrade activations must use the same network"
+        );
+        canonical_primary.admit_network_upgrade_schedule(network_upgrade_activations)?;
         Self::admit_closing_primary(
             Arc::new(temporary_directory),
             canonical_primary_path,
             canonical_primary,
-            network_upgrade_activations,
         )
     }
 
@@ -151,7 +155,6 @@ impl WalletServingStoreFixture {
         temporary_directory: Arc<TempDir>,
         canonical_primary_path: &Path,
         canonical_primary: RocksDbCanonicalStore,
-        network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> eyre::Result<Self> {
         let reader_paths = ReaderPaths::new(temporary_directory.path(), "");
         let identity = build_wallet_primary(&canonical_primary, &reader_paths)?;
@@ -161,7 +164,6 @@ impl WalletServingStoreFixture {
             canonical_primary_path,
             &reader_paths,
             identity,
-            network_upgrade_activations,
         )
     }
 
@@ -172,7 +174,6 @@ impl WalletServingStoreFixture {
         generation: u32,
         canonical_primary_path: &Path,
         canonical_primary: &RocksDbCanonicalStore,
-        network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> eyre::Result<Self> {
         let reader_paths = ReaderPaths::new(temporary_directory.path(), &format!("-{generation}"));
         let identity = build_wallet_primary(canonical_primary, &reader_paths)?;
@@ -181,25 +182,21 @@ impl WalletServingStoreFixture {
             canonical_primary_path,
             &reader_paths,
             identity,
-            network_upgrade_activations,
         )
     }
 
+    /// Opens both readers as a serving runtime does: the canonical reader
+    /// adopts the schedule the canonical writer admitted.
     fn open_readers(
         temporary_directory: Arc<TempDir>,
         canonical_primary_path: &Path,
         reader_paths: &ReaderPaths,
         identity: CanonicalServingIdentity,
-        network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> eyre::Result<Self> {
-        ensure!(
-            identity.network == network_upgrade_activations.network(),
-            "canonical primary and network-upgrade activations must use the same network"
-        );
-        let canonical_reader = RocksDbCanonicalSecondary::open_ready(
+        let canonical_reader = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
             canonical_primary_path,
             &reader_paths.canonical_secondary,
-            network_upgrade_activations,
+            identity.network,
             CanonicalStoreWorkload::Wallet,
             identity.raw_blob_retention,
             identity.reorg_policy,

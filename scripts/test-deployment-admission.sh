@@ -231,12 +231,12 @@ for deployment_env in "${deployment_env_names[@]}"; do
     and (.services as $services
       | [
           "zinder-ingest",
-          "zinder-projector",
           "zinder-query",
           "zinder-compat-lightwalletd",
           "zinder-explorer"
         ]
       | all($services[.].environment.ZINDER_NODE__JSON_RPC_ADDR == $json_rpc_addr))
+    and (.services["zinder-projector"].environment | has("ZINDER_NODE__JSON_RPC_ADDR") | not)
   ' "$resolved_env_explorer_compose" >/dev/null \
     || fail "the $deployment_env env file does not resolve to its own node network, cookie volume, and endpoint"
 

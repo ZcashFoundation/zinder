@@ -146,11 +146,23 @@ in pruned storage mode.
 
 Ingest validates the capabilities it needs before mutation begins and requires
 `historical_block_bodies`, so it refuses a pruned node at startup with readiness
-cause `node_capability_missing`. Query and lightwalletd compatibility do not
-fetch historical block bodies and accept a pruned node. Optional methods add
-capabilities without changing the required canonical contract. Missing or
-contradictory capabilities produce typed failures rather than version-based
-guesses.
+cause `node_capability_missing`. Optional methods add capabilities without
+changing the required canonical contract. Missing or contradictory
+capabilities produce typed failures rather than version-based guesses.
+
+Ingest is the only runtime that needs its node to start. Query and
+lightwalletd compatibility use a node only to broadcast transactions, accept a
+pruned node, and start without contacting it; the projector and compact-blocks
+compatibility use no node at all. A reader wraps its configured endpoint in a
+`NodeBroadcast` and verifies it on first contact through the source's
+`BroadcastNodeProbe`: `rpc.discover` must list `sendrawtransaction`, the
+`getblockchaininfo` activation table must agree with the serving pair's
+writer-admitted schedule through the visible tip, and the node's best chain
+must hold the pair's visible tip block, read with `getblockhash`. A broadcast
+before that verification passes fails with `NodeUnavailable` and sends
+nothing, so a transaction never reaches a node on another network or chain.
+A reader also starts before its node writes a cookie file, as described under
+[Authentication and health](#authentication-and-health).
 
 Some nodes refuse historical reads permanently. A Zakura node built by
 verified-commitment-trees fast sync never writes per-height trees or subtree
@@ -202,6 +214,16 @@ consecutive failures of that class rebuild the JSON-RPC client, and the
 rebuild reads a cookie file again, so ingest recovers after a node restart
 rotates its cookie. Basic credentials and an inline cookie do not change on a
 rebuild, so their refusal continues until `node.auth` is corrected.
+
+Building a source reads no cookie file it cannot read yet. The node writes the
+file when it starts, so a missing, unreadable, or empty file leaves the source
+waiting for it: each request reads the file first and, until it holds
+credentials, fails with `NodeUnavailable` without reaching the node. A reader
+therefore starts before its node, and its first-contact verification passes
+once the file appears. Ingest's startup capability probe fails on the same
+error, so ingest still exits when it starts without a readable cookie. Empty
+inline cookie credentials and a `node.json_rpc_addr` that is not a usable URL
+come from configuration and still fail at startup.
 
 ## Indexer transport security
 

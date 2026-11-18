@@ -122,14 +122,19 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.json_rpc_addr",
         used_by: &[
             "zinder-ingest",
-            "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
-        requirement: Requirement::Required,
+        requirement: Requirement::ConditionalOn(
+            "running zinder-ingest, or broadcasting transactions from a reader",
+        ),
         sensitive: false,
-        description: "Upstream Zebra JSON-RPC URL the service connects to. Optional for \
+        description: "Upstream Zebra JSON-RPC URL. `zinder-ingest` requires it. `zinder-query` \
+                      and wallet-mode `zinder-compat-lightwalletd` broadcast transactions \
+                      through it and start without contacting it; without it they serve \
+                      storage only and advertise no broadcast. Compact-blocks compatibility \
+                      rejects every `ZINDER_NODE__*` variable. Optional for \
                       `zinder-explorer`: without it the upstream-observation probe stays \
                       off and `ExplorerFreshness.chain_view.upstream_tip` is always unset.",
     },
@@ -190,7 +195,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.auth.method",
         used_by: &[
             "zinder-ingest",
-            "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
@@ -204,7 +208,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.auth.username",
         used_by: &[
             "zinder-ingest",
-            "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
@@ -218,7 +221,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.auth.password",
         used_by: &[
             "zinder-ingest",
-            "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
@@ -232,7 +234,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.auth.path",
         used_by: &[
             "zinder-ingest",
-            "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
@@ -246,7 +247,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.auth.cookie",
         used_by: &[
             "zinder-ingest",
-            "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
@@ -262,7 +262,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.request_timeout_secs",
         used_by: &[
             "zinder-ingest",
-            "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
@@ -276,7 +275,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.max_response_bytes",
         used_by: &[
             "zinder-ingest",
-            "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
@@ -293,7 +291,6 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         toml_path: "node.broadcast_timeout_secs",
         used_by: &[
             "zinder-ingest",
-            "zinder-projector",
             "zinder-query",
             "zinder-compat-lightwalletd",
             "zinder-explorer",
@@ -318,8 +315,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       wallet-serving readers, and `zinder-explorer` poll it as the primary \
                       upstream-sync signal; when unset, they fall back \
                       to `getblockchaininfo.verificationprogress`/`estimatedheight`. \
-                      Compatibility with `compat.serving = \"compact-blocks\"` runs no node \
-                      probe and ignores every `node.health` setting. See \
+                      Compatibility with `compat.serving = \"compact-blocks\"` rejects \
+                      every node setting. See \
                       [ADR-0015](../adrs/0015-phase-driven-ingest.md).",
     },
     EnvVarDoc {
@@ -335,9 +332,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Cadence of the upstream-health probe in milliseconds. Defaults to 30000. \
                       Must be greater than zero. Query and wallet-serving compatibility use \
-                      it to refresh the node dependency their readiness reports; \
-                      compact-blocks compatibility ignores it; `zinder-explorer` reuses \
-                      the same cadence for \
+                      it to verify their broadcast node on first contact and then refresh \
+                      the node dependency their readiness reports; compact-blocks \
+                      compatibility rejects it; `zinder-explorer` reuses the same cadence for \
                       its upstream-observation probe (the one that populates \
                       `ExplorerFreshness.chain_view.upstream_tip`).",
     },
@@ -886,8 +883,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Runtime serving selection: exactly `wallet` or `compact-blocks`; defaults \
-                      to `wallet`. `compact-blocks` rejects wallet settings, and no canonical or \
-                      legacy aliases are accepted.",
+                      to `wallet`. `compact-blocks` rejects wallet and node settings, and no \
+                      canonical or legacy aliases are accepted.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__REORG_WINDOW_BLOCKS",
