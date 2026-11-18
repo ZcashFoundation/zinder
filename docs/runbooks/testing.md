@@ -886,9 +886,10 @@ fixed fence covers blocks on both sides of NU7.
 
 These tests live in
 [`services/zinder-compat-lightwalletd/tests/live/parity_against_lightwalletd.rs`](../../services/zinder-compat-lightwalletd/tests/live/parity_against_lightwalletd.rs)
-and need both shims running on host-reachable ports. They skip when either
-env var is absent so the default `ci-live` invocation does not require a
-parity sidecar pair:
+and need both shims running on host-reachable ports. Start the reference
+without `--ping-very-insecure`, its default, because the `Ping` test expects
+both shims to refuse `Ping`. They skip when either env var is absent so the
+default `ci-live` invocation does not require a parity sidecar pair:
 
 ```bash
 ZINDER_TEST_LIVE=1 \
