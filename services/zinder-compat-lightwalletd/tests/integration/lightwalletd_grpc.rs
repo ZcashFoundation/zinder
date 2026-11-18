@@ -1933,6 +1933,9 @@ struct EpochPinRecorder<Inner> {
     /// block-range stream's first chunk, until the gate opens. Only one read
     /// waits on it.
     first_chunk_gate: Arc<Mutex<Option<FirstChunkGate>>>,
+    /// Refuses every tree-state rebuild as the query's full rebuild limit
+    /// does.
+    refuses_tree_state_rebuilds: bool,
 }
 
 /// A gate on one read that tells the test when the read has reached it.
@@ -1966,6 +1969,7 @@ impl<Inner> EpochPinRecorder<Inner> {
             served_compact_block_epochs: Arc::new(Mutex::new(Vec::new())),
             later_chunk_gate: None,
             first_chunk_gate: Arc::new(Mutex::new(None)),
+            refuses_tree_state_rebuilds: false,
         }
     }
 
@@ -1973,6 +1977,13 @@ impl<Inner> EpochPinRecorder<Inner> {
     /// permit. Each read returns the permit it took.
     fn with_later_chunk_gate(mut self, gate: Arc<tokio::sync::Semaphore>) -> Self {
         self.later_chunk_gate = Some(gate);
+        self
+    }
+
+    /// Refuses every tree-state rebuild as a query whose rebuild slots stay
+    /// taken past its wait does.
+    const fn refusing_tree_state_rebuilds(mut self) -> Self {
+        self.refuses_tree_state_rebuilds = true;
         self
     }
 
@@ -2489,6 +2500,11 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError> {
         self.record(at_epoch_id);
+        if self.refuses_tree_state_rebuilds {
+            return Err(QueryError::TreeStateReplayLimitReached {
+                max_concurrent_replays: NonZeroU32::MIN,
+            });
+        }
         self.inner.tree_state_at(height, at_epoch_id).await
     }
 
@@ -2585,6 +2601,29 @@ async fn get_transaction_by_hash_pins_every_read_to_one_epoch() -> eyre::Result<
         "every read in one handler must pin the same epoch; recorded {recorded_pins:?}"
     );
 
+    Ok(())
+}
+
+/// A refused tree-state rebuild is `UNAVAILABLE` on the lightwalletd surface.
+///
+/// A full block-range limit returns the same code, so both admission limits
+/// tell a wallet to retry the same way.
+#[tokio::test]
+async fn a_refused_tree_state_rebuild_is_unavailable() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let adapter = LightwalletdGrpcAdapter::new(
+        EpochPinRecorder::new(store_fixture.query()).refusing_tree_state_rebuilds(),
+    );
+
+    let status = adapter
+        .get_tree_state(Request::new(lightwalletd::BlockId {
+            height: u64::from(ACCEPTANCE_BLOCK_HEIGHT.value()),
+            hash: Vec::new(),
+        }))
+        .await
+        .err()
+        .ok_or_else(|| eyre!("a refused rebuild must fail the call"))?;
+    assert_eq!(status.code(), Code::Unavailable);
     Ok(())
 }
 

@@ -1174,7 +1174,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Milliseconds a lightwalletd `GetTreeState` rebuild waits for a rebuild slot \
-                      before it is refused with `RESOURCE_EXHAUSTED`. Wallet serving only; \
+                      before it is refused with `UNAVAILABLE`. Wallet serving only; \
                       compact-blocks serving rejects it. Must be in 0..=5000; 0 refuses at \
                       once; defaults to 2000.",
     },

@@ -950,7 +950,7 @@ where
             .query_api
             .tree_state_at(height, Some(chain_view.epoch_id))
             .await
-            .map_err(|error| status_from_query_error(&error))?;
+            .map_err(|error| tree_state_status(&error))?;
 
         Ok(Response::new(lightwalletd_tree_state(&tree_state)?))
     }
@@ -2021,6 +2021,19 @@ fn address_utxo_limit_exceeded(response_limit: usize) -> Status {
     Status::resource_exhausted(format!(
         "more unspent outputs match than the {response_limit} one response returns"
     ))
+}
+
+/// Maps a tree-state read failure to the lightwalletd status.
+///
+/// A rebuild refused for want of a rebuild slot is `UNAVAILABLE`, as a full
+/// block-range limit is, so a wallet retries both admission limits the same
+/// way. Native `TreeStateAtHeight` keeps `RESOURCE_EXHAUSTED` with its typed
+/// reason.
+fn tree_state_status(error: &QueryError) -> Status {
+    if matches!(error, QueryError::TreeStateReplayLimitReached { .. }) {
+        return Status::unavailable(format!("{error}; retry shortly"));
+    }
+    status_from_query_error(error)
 }
 
 fn lightwalletd_tree_state(tree_state: &TreeState) -> Result<lightwalletd::TreeState, Status> {
