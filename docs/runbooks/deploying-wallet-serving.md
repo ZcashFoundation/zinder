@@ -505,10 +505,12 @@ outage when query's `/readyz` lists `ingest_control` with
 the container. When query lists `ingest_control` with `node_unavailable`
 instead, the writer's mempool is waiting for a node snapshot. The supervisor
 counts that as an unreachable node only while ingest's `syncing` cause carries
-`"lag_blocks": null`, which means canonical ingest has caught up and only the
-mempool is behind. A numeric `lag_blocks` means the writer trails a node it
-can reach, and its mempool waits for it, so the one-hour tolerance and the
-recurrence budgets still apply. An unreachable node, including one that only
+`"lag_blocks": null` and ingest reports a `current_height` at or above its
+`target_height`, which means canonical ingest has caught up and only the
+mempool is behind. A numeric `lag_blocks`, or a `current_height` below
+`target_height`, means the writer trails a node it can reach, and its mempool
+waits for it, so the one-hour tolerance and the recurrence budgets still
+apply. An unreachable node, including one that only
 the writer's mempool cannot reach, is logged once when the outage begins and
 once when it ends, and terminates the container only after it has lasted 24
 hours, in case ingest is stuck in its own node client.

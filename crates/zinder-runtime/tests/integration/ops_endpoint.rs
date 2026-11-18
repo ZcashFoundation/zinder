@@ -86,6 +86,14 @@ async fn ops_endpoint_serves_health_readiness_and_metrics() -> Result<()> {
         "node_unreachable"
     );
 
+    // `deploy/wallet-serving-runtime-entrypoint` compares both heights to tell
+    // a caught-up writer from one that trails its node.
+    readiness.set(ReadinessState::syncing(None, Some(7), Some(7)));
+    let (status, readyz_value) = get_json(listen_addr, "/readyz").await?;
+    assert_eq!(status, 503);
+    assert_eq!(readyz_value["current_height"], 7);
+    assert_eq!(readyz_value["target_height"], 7);
+
     let (status, metrics_text) = get_text(listen_addr, "/metrics").await?;
     assert_eq!(status, 200);
     assert!(
