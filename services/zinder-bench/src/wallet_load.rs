@@ -10,6 +10,7 @@
 
 mod calls;
 mod classic_sdk;
+mod point_reads;
 mod slipstream;
 mod vizor;
 
@@ -29,6 +30,7 @@ use zinder_proto::compat::lightwalletd::{ChainSpec, CompactBlock, Empty};
 
 const DEFAULT_WALLETS: u32 = 1;
 const DEFAULT_TRANSACTIONS_PER_WALLET: u32 = 16;
+const DEFAULT_POINT_READ_ROUNDS: u32 = 20;
 const PROBE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// CLI contract for driving wallet-shaped load at one endpoint.
@@ -67,6 +69,13 @@ pub(crate) struct LightwalletdWalletLoadArgs {
     /// Vizor batch byte budget, overriding the profile's.
     #[arg(long = "batch-byte-budget")]
     batch_byte_budget: Option<u64>,
+    /// Rounds of point reads each `point-reads` wallet makes.
+    #[arg(long, default_value_t = DEFAULT_POINT_READ_ROUNDS)]
+    rounds: u32,
+    /// Transparent address whose history and unspent outputs `point-reads`
+    /// wallets request. Repeat for several addresses.
+    #[arg(long = "transparent-address")]
+    transparent_addresses: Vec<String>,
     /// Free-form label for the server under test, such as its name and version.
     #[arg(long = "target-label")]
     target_label: Option<String>,
@@ -85,6 +94,9 @@ pub(crate) enum WalletWorkload {
     Vizor,
     /// The classic Zcash Android SDK `CompactBlockProcessor`.
     ClassicSdk,
+    /// Server info, tip, tree-state, and transparent-address reads, without
+    /// block downloads.
+    PointReads,
 }
 
 /// Report and optional output path produced by one load run.
@@ -146,6 +158,7 @@ enum WorkloadParameters {
     Slipstream(slipstream::Parameters),
     Vizor(vizor::Parameters),
     ClassicSdk(classic_sdk::Parameters),
+    PointReads(point_reads::Parameters),
 }
 
 /// Heights and chain facts every wallet of a run shares.
@@ -275,7 +288,7 @@ pub(crate) async fn run_lightwalletd_wallet_load(
     let (server, plan) = probe(&connector, &args).await?;
     let plan = Arc::new(plan);
     let settings = Arc::new(WorkloadSettings::from_args(&args));
-    let parameters = settings.parameters(args.workload);
+    let parameters = settings.parameters(args.workload, &plan);
     let started = Instant::now();
     let mut wallets = Vec::new();
     for wallet_index in 0..args.wallets {
@@ -320,6 +333,8 @@ pub(super) struct WorkloadSettings {
     pub(super) split_bytes: u64,
     pub(super) vizor_profile: vizor::VizorProfile,
     pub(super) batch_byte_budget: Option<u64>,
+    pub(super) rounds: u32,
+    pub(super) transparent_addresses: Vec<String>,
 }
 
 impl WorkloadSettings {
@@ -330,10 +345,12 @@ impl WorkloadSettings {
             split_bytes: args.split_bytes.max(1),
             vizor_profile: args.vizor_profile,
             batch_byte_budget: args.batch_byte_budget,
+            rounds: args.rounds,
+            transparent_addresses: args.transparent_addresses.clone(),
         }
     }
 
-    fn parameters(&self, workload: WalletWorkload) -> WorkloadParameters {
+    fn parameters(&self, workload: WalletWorkload, plan: &WalletPlan) -> WorkloadParameters {
         match workload {
             WalletWorkload::Slipstream => {
                 WorkloadParameters::Slipstream(slipstream::Parameters::new(self))
@@ -342,13 +359,16 @@ impl WorkloadSettings {
             WalletWorkload::ClassicSdk => {
                 WorkloadParameters::ClassicSdk(classic_sdk::Parameters::new())
             }
+            WalletWorkload::PointReads => {
+                WorkloadParameters::PointReads(point_reads::Parameters::new(self, plan))
+            }
         }
     }
 
     fn txid_limit(&self, workload: WalletWorkload) -> usize {
         match workload {
             WalletWorkload::Slipstream => self.transactions_per_wallet,
-            WalletWorkload::Vizor | WalletWorkload::ClassicSdk => 0,
+            WalletWorkload::Vizor | WalletWorkload::ClassicSdk | WalletWorkload::PointReads => 0,
         }
     }
 }
@@ -366,6 +386,7 @@ async fn sync_wallet(
         }
         WalletWorkload::Vizor => vizor::sync_wallet(connector, &plan, &settings, &progress).await,
         WalletWorkload::ClassicSdk => classic_sdk::sync_wallet(connector, &plan, &progress).await,
+        WalletWorkload::PointReads => point_reads::sync_wallet(connector, &plan, &settings).await,
     };
     progress.finish(outcome)
 }
@@ -581,6 +602,8 @@ mod tests {
                 split_bytes: super::slipstream::DEFAULT_SPLIT_BYTES,
                 vizor_profile: VizorProfile::Mobile,
                 batch_byte_budget: None,
+                rounds: 3,
+                transparent_addresses: Vec::new(),
                 target_label: Some("zinder-compat-lightwalletd test server".to_owned()),
                 report: None,
             }
@@ -733,6 +756,36 @@ mod tests {
                 .and_then(Value::as_f64),
             Some(36.0)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn point_reads_separate_stored_checkpoints_from_replays() -> TestResult {
+        let server = CompatServer::start().await?;
+        let mut args = server.args(WalletWorkload::PointReads, 1);
+        args.rounds = 2;
+        args.transparent_addresses = vec!["tmT1cVki2DufFCxicpR6UFwbdrKf8BWiFrn".to_owned()];
+
+        let report = report_json(args).await?;
+
+        assert_eq!(count(&report, "/wallets_completed")?, 1);
+        // The probe adds one GetLightdInfo and one GetLatestBlock.
+        assert_eq!(status(&report, "GetLightdInfo", "ok")?, 3);
+        assert_eq!(status(&report, "GetLatestBlock", "ok")?, 3);
+        // Below the tip of 250, the checkpoint at 100 and the height 99,
+        // which replays from the checkpoint at 0.
+        assert_eq!(count(&report, "/parameters/stored_checkpoint_height")?, 100);
+        assert_eq!(count(&report, "/parameters/replay_height")?, 99);
+        assert_eq!(
+            status(&report, "GetTreeState(stored checkpoint)", "ok")?
+                + status(&report, "GetTreeState(replay)", "ok")?
+                + status(&report, "GetTreeState(replay)", "resource_exhausted")?,
+            4
+        );
+        // An address with no history streams nothing, successfully.
+        assert_eq!(status(&report, "GetTaddressTxids", "ok")?, 2);
+        assert_eq!(count(&report, "/rpcs/GetTaddressTxids/messages")?, 0);
+        assert_eq!(status(&report, "GetAddressUtxosStream", "ok")?, 2);
         Ok(())
     }
 

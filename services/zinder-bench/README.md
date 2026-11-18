@@ -724,6 +724,13 @@ source:
   connection downloads serial 1,000-block batches (100 where a batch touches
   heights 1,710,000 to 2,050,000), each after the tree state below its first
   block, with an empty pool filter. Each call gets 5 attempts.
+- `point-reads`: no block downloads. Each wallet repeats `--rounds` rounds
+  of `GetLightdInfo`, `GetLatestBlock`, a tree state at a stored checkpoint
+  and one at the height below it, which Zinder rebuilds by replaying 99
+  blocks, and, for each `--transparent-address`, `GetTaddressTxids` over the
+  range plus one `GetAddressUtxosStream` for all of them. The two tree states
+  are reported as `GetTreeState(stored checkpoint)` and
+  `GetTreeState(replay)`. Calls are not retried.
 
 The report, `lightwalletd-wallet-load`, records the endpoint's `GetLightdInfo`
 identity, the workload's constants, and, over all wallets:

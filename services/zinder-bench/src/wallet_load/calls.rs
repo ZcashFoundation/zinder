@@ -331,10 +331,21 @@ pub(super) async fn get_tree_state(
     limits: &CallLimits,
     height: u64,
 ) -> Result<(), CallFailure> {
+    get_tree_state_as(recorder, "GetTreeState", client, limits, height).await
+}
+
+/// Requests the tree state at `height`, recording it under `method`.
+pub(super) async fn get_tree_state_as(
+    recorder: &CallRecorder,
+    method: &'static str,
+    client: &mut LwdClient,
+    limits: &CallLimits,
+    height: u64,
+) -> Result<(), CallFailure> {
     recorder.note_tree_state_height(height);
     unary(
         recorder,
-        "GetTreeState",
+        method,
         limits.unary,
         client.get_tree_state(BlockId {
             height,
@@ -364,6 +375,50 @@ pub(super) async fn get_transaction(
     )
     .await
     .map(drop)
+}
+
+/// Opens a server stream with `open` and reads it to its end, recording it
+/// under `method`.
+pub(super) async fn drain_stream<Reply, Open>(
+    recorder: &CallRecorder,
+    method: &'static str,
+    limits: &CallLimits,
+    open: Open,
+) -> Result<u64, CallFailure>
+where
+    Reply: prost::Message + Default,
+    Open: Future<Output = Result<tonic::Response<tonic::Streaming<Reply>>, Status>>,
+{
+    let mut pending = PendingCall::new(recorder, method);
+    let started = pending.started;
+    let outcome = async {
+        let mut replies = tokio::time::timeout(limits.stream_open, open)
+            .await
+            .map_err(|_| CallFailure::client_timeout("stream open", limits.stream_open))?
+            .map_err(|status| CallFailure::from_status(&status))?
+            .into_inner();
+        loop {
+            let next = match limits.stream_idle {
+                Some(idle) => tokio::time::timeout(idle, replies.message())
+                    .await
+                    .map_err(|_| CallFailure::client_timeout("stream idle", idle))?,
+                None => replies.message().await,
+            }
+            .map_err(|status| CallFailure::from_status(&status))?;
+            let Some(reply) = next else { break };
+            pending
+                .first_message
+                .get_or_insert_with(|| started.elapsed());
+            pending.messages = pending.messages.saturating_add(1);
+            pending.bytes = pending
+                .bytes
+                .saturating_add(u64::try_from(reply.encoded_len()).unwrap_or(u64::MAX));
+        }
+        Ok(pending.messages)
+    }
+    .await;
+    pending.finish(outcome.as_ref().map(drop));
+    outcome
 }
 
 /// One `GetBlockRange` request.

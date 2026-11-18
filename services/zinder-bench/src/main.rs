@@ -662,7 +662,7 @@ mod tests {
             ])
         };
 
-        for workload in ["slipstream", "vizor", "classic-sdk"] {
+        for workload in ["slipstream", "vizor", "classic-sdk", "point-reads"] {
             assert!(matches!(
                 load(workload)?.command,
                 Command::LightwalletdWalletLoad(_)
