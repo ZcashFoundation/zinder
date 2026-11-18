@@ -149,9 +149,14 @@ runtime operator contract, not a new Rust library export or a storage/proto
 layout change.
 
 Compact-block serving admits exactly `GetLightdInfo`, `GetLatestBlock`,
-`GetBlock`, and `GetBlockRange`. Every other `CompactTxStreamer` RPC returns
-`UNIMPLEMENTED`, including wallet queries, mempool methods, tree/subtree
-methods, transparent-address methods, transaction submission, and ping.
+`GetBlock`, and `GetBlockRange`. Every other `CompactTxStreamer` RPC except
+`Ping` returns `UNIMPLEMENTED`, including wallet queries, mempool methods,
+tree/subtree methods, transparent-address methods, and transaction
+submission.
+
+Both serving modes refuse `Ping` with `FAILED_PRECONDITION`, as reference
+lightwalletd does unless it is started with `--ping-very-insecure`. `Ping` is
+lightwalletd's load-testing RPC, and Zinder has no setting that enables it.
 `GetLightdInfo` reports the admitted network and tip with
 `taddrSupport = false`. Compact-blocks serving never contacts a node, so it
 rejects a `[node]` section, `[node_fallbacks.N]`, `--node-json-rpc-addr`,

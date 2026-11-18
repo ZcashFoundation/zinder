@@ -974,7 +974,11 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlockAdapter {
         &self,
         _request: Request<lightwalletd::Duration>,
     ) -> Result<Response<lightwalletd::PingResponse>, Status> {
-        Err(Self::unsupported("Ping"))
+        // Reference lightwalletd answers this load-test RPC only when started
+        // with `--ping-very-insecure`; Zinder never enables it.
+        Err(Status::failed_precondition(
+            "Ping is not enabled on this server",
+        ))
     }
 }
 
@@ -4189,11 +4193,12 @@ mod tests {
                 .get_address_utxos_stream(Request::new(lightwalletd::GetAddressUtxosArg::default()))
                 .await,
         );
-        assert_unimplemented(
-            adapter
-                .ping(Request::new(lightwalletd::Duration::default()))
-                .await,
-        );
+        let ping_status = adapter
+            .ping(Request::new(lightwalletd::Duration::default()))
+            .await
+            .err()
+            .map(|status| status.code());
+        assert_eq!(ping_status, Some(Code::FailedPrecondition));
         Ok(())
     }
 

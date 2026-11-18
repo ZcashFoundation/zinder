@@ -938,7 +938,7 @@ async fn mempool_tx_invalid_requests_match_reference() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "live parity test; see CLAUDE.md §Live Node Tests"]
-async fn ping_responds_on_both_shims() -> Result<()> {
+async fn ping_is_refused_on_both_shims() -> Result<()> {
     let _guard = init();
     let Some(_env) = require_live()? else {
         return Ok(());
@@ -947,22 +947,22 @@ async fn ping_responds_on_both_shims() -> Result<()> {
         return Ok(());
     };
 
-    let zinder_ping = zinder
+    // The reference runs without `--ping-very-insecure`, its default.
+    let zinder_code = zinder
         .ping(lightwalletd::Duration { interval_us: 0 })
-        .await?
-        .into_inner();
-    let reference_ping = reference
+        .await
+        .err()
+        .map(|status| status.code());
+    let reference_code = reference
         .ping(lightwalletd::Duration { interval_us: 0 })
-        .await?
-        .into_inner();
+        .await
+        .err()
+        .map(|status| status.code());
 
-    assert!(
-        zinder_ping.entry >= 0 && zinder_ping.exit >= 0,
-        "Zinder Ping counts must be non-negative",
-    );
-    assert!(
-        reference_ping.entry >= 0 && reference_ping.exit >= 0,
-        "reference Ping counts must be non-negative",
+    assert_eq!(zinder_code, Some(Code::FailedPrecondition));
+    assert_eq!(
+        zinder_code, reference_code,
+        "Ping status diverges across shims"
     );
     Ok(())
 }
