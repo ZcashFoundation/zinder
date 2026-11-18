@@ -185,7 +185,7 @@ fn wallet_serving_image_config_resolves() -> eyre::Result<()> {
         "addr = \"http://127.0.0.1:9100\"",
         "listen_addr = \"[::]:9067\"",
         "serving = \"wallet\"",
-        "listen_addr = \"127.0.0.1:9107\"",
+        "listen_addr = \"[::]:9107\"",
         "allow_public_bind = true",
     ] {
         assert!(stdout.contains(expected), "missing {expected}: {stdout}");
