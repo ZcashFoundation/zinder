@@ -19,7 +19,7 @@
 //! The serving pair requires genesis-complete history, which only fits test
 //! budgets on regtest.
 //!
-//! Reference: `docs/adrs/0008-network-parameter-discovery.md`.
+//! Reference: `docs/adrs/0008-consensus-parameters-from-the-node.md`.
 //!
 //! [`mined_consensus_branch_id_parity`]: ./mined_consensus_branch_id_parity.rs
 

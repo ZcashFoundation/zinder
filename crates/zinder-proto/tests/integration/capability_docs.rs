@@ -20,8 +20,7 @@ fn documented_capabilities() -> BTreeSet<String> {
         .collect()
 }
 
-const PUBLIC_INTERFACES_DOC: &str =
-    include_str!("../../../../docs/architecture/public-interfaces.md");
+const CAPABILITIES_DOC: &str = include_str!("../../../../docs/reference/capabilities.md");
 const TESTING_RUNBOOK_DOC: &str = include_str!("../../../../docs/runbooks/testing.md");
 const NEXTEST_TOML: &str = include_str!("../../../../.config/nextest.toml");
 
@@ -38,10 +37,10 @@ const TESTING_RUNBOOK_END: &str = "<!-- capability-list:testing-runbook:end -->"
 const RUNBOOK_REFERENCED_PROFILES: &[&str] = &["ci", "ci-perf", "ci-live", "ci-parity"];
 
 #[test]
-fn public_interfaces_capability_list_mirrors_zinder_capabilities() -> Result<()> {
+fn capabilities_reference_list_mirrors_zinder_capabilities() -> Result<()> {
     assert_capability_list_matches(
-        "docs/architecture/public-interfaces.md",
-        PUBLIC_INTERFACES_DOC,
+        "docs/reference/capabilities.md",
+        CAPABILITIES_DOC,
         PUBLIC_INTERFACES_START,
         PUBLIC_INTERFACES_END,
     )

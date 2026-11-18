@@ -1,43 +1,39 @@
-# Chain Data Catalog
+# Chain data catalog
 
-This catalog is the single reference for public chain information gathered or derived by Zinder. It answers what data Zinder can serve after a consumer has selected an [integration surface](integration-surfaces.md); it does not compare deployment architectures, compatibility adapters, or competing products. A row represents an information family rather than an individual RPC.
+This table lists the public chain data Zinder stores or derives, which component writes it, and which service methods serve it. Use it to find where a piece of data comes from before you read the method's own reference. Each row is a family of data, not a single method.
 
-Availability is part of the contract. Consumers must use capability discovery, freshness envelopes, canonical artifact versions, and per-materialized-view coverage instead of inferring completeness from a successful response.
+The "Stored in" column names where the data lives. `zinder-ingest` writes the canonical store, owns the live mempool, and writes the optional materialized views that `zinder-explorer` reads. `zinder-projector` writes the wallet store from the canonical store. [Overview](../architecture/overview.md) explains the roles, and [Storage backend](../architecture/storage-backend.md) the layout.
 
-| Domain | Information gathered or derived | Source and retention | Public surface | Availability and completeness | Use case and value |
-| --- | --- | --- | --- | --- | --- |
-| Consistency and discovery | Network, service version, capabilities, canonical artifact schema, visible and settled tips, and source observation | Service configuration, canonical store, and live source probes; current state | Wallet and Explorer `ServerInfo`, `ChainView`, and freshness envelopes | Always explicit; optional surfaces are callable only when their capability is advertised | Lets developers, users, and agents negotiate features and detect stale or incompatible deployments before trusting data |
-| Blocks and shielded trees | Canonical block identity, header fields, time, size, transaction ids, compact blocks, and optional raw blocks | Parsed node blocks; canonical retention plus configured raw-blob retention | Wallet block selectors, compact/full block reads, Explorer block detail and block ranges | Epoch-pinned; raw bytes may be unavailable by retention policy | Wallet synchronization, explorer block pages, audit trails, and deterministic joins |
-| Blocks and shielded trees | Sapling, Orchard, and Ironwood tree state, subtree roots, final note-commitment roots, and tree sizes | Node tree state and parsed blocks; canonical artifacts with resumable historical enrichment for final roots | Wallet tree-state/subtree RPCs and Explorer commitment-root search | Pool fields are activation-aware; final-root capability and coverage identify enriched history | Wallet witness construction, migration analysis, root lookup, and chain-integrity diagnostics |
-| Blocks and shielded trees | Block production series and weekday/hour activity distribution | Block-summary materialized view | Explorer production and activity RPCs | Bounded by the materialized-view checkpoint and reported coverage | Explorer charts, operational analysis, and machine-readable activity patterns |
-| Transactions | Canonical transaction location, status, raw bytes, parsed public facts, component counts, privacy shape, and pool action counts | Parsed node transactions; facts retained canonically, raw bytes policy-controlled | Wallet transaction lookup; Explorer detail, block transactions, recent transactions, generic history, and component summary | Missing raw bytes or optional facts remain unknown; history responses carry materialized-view fences and coverage | Transaction pages, wallet confirmation tracking, search results, analytics, and agent-safe inspection |
-| Transactions | Transaction-intrinsic Sprout, Sapling, Orchard, and Ironwood value balances | Parsed transaction bytes; canonical artifact with resumable enrichment | Explorer transaction detail and generic transaction history | Capability and enrichment coverage identify availability; absence means unknown, not zero | Shielded-flow analysis without repeated transaction parsing |
-| Transactions | Resolved transparent inputs, outputs, prevouts, spends, and paid fee | Canonical transaction facts plus outpoint resolution; facts retained while raw bytes follow policy | Explorer transaction detail and paid-fee materialized views | Paid fee is present only when every required prevout resolves at the pinned view | Accurate fee displays, transaction accounting, and spend provenance |
-| Transparent state | Address UTXOs, transaction ids, history, value deltas, lifetime totals, and coherent activity | Canonical transparent facts, the wallet projection, and materialized views | Wallet transparent-address UTXO and history RPCs; lightwalletd address balance; Explorer activity and delta RPCs | Epoch-pinned; each materialized-view-backed response uses its own materialized-view checkpoint | Wallet support, explorer address pages, accounting, and reusable address analytics |
-| Transparent state | Address ranking by received, sent, balance, and transaction activity with script-type totals | Snapshot plus incremental transparent-address materialized view | Explorer transparent-address ranking | Capability is withheld until ingest activates a ranking generation, at genesis on a fresh store or after an in-place build on an existing one | Rich-list views, distribution analysis, and bounded agent queries |
-| Mempool | Coherent transaction snapshot, count, bytes, fees, action counts, activity windows, event counts, and resumable events | Live source polling/streaming and bounded mempool store | Wallet mempool events; Explorer snapshot, summary, activity, and event-count RPCs | Snapshot fields share one observation; freshness reports upstream age and ingest lag | Wallet pending state, explorer mempool pages, alerting, and automation |
-| Fees | Per-transaction paid fee and aggregate paid-fee distribution | Resolved canonical prevouts and transaction-fee materialized views | Explorer transaction detail, fee summary, and paid-fee distribution | Proven fees only; unresolved transactions are counted as incomplete rather than assigned a value | Honest fee-market analysis and transaction cost reporting |
-| Fees | ZIP-317 conventional fee and conventional-fee distribution | Transaction component facts and ZIP-317 calculation | Explorer conventional-fee distribution | Derived independently of paid-fee availability; coverage identifies the complete range | Fee-policy comparison, wallet tuning, and anomaly detection |
-| Value pools and economics | Source-reported chain value pools at tip and canonical per-block balances | Node value-pool response plus canonical block artifacts | Wallet chain value pools; Explorer value-pool summary and balance history | Source tip is explicit; historical capability requires complete enrichment coverage | Supply dashboards, pool adoption analysis, and cross-checking source state |
-| Value pools and economics | Per-transaction value-pool flow events and time/range summaries | Intrinsic balances plus canonical transaction context; materialized-view history | Explorer flow history, aggregate, threshold, and rounded-amount RPCs | Materialized-view checkpoint and coverage bound every result; transparent flow is excluded when prevouts are unavailable | Shielded-pool migration analysis, privacy research, and bounded analytics |
-| Value pools and economics | Ironwood migration totals, cohorts, and denominations | Ironwood migration materialized view | Explorer migration RPCs | Capability and materialized-view freshness are explicit | Network-upgrade monitoring, migration audits, and product reporting |
-| Reorgs | Durable committed/reverted chain events and summarized reorg incidents | Canonical writer event log and materialized view | Wallet chain events and Explorer reorg history | Cursor-resumable and epoch-aware; retention limits are explicit | Wallet rollback, payment lifecycle correction, explorer fork context, and incident analysis |
-| Reorgs | Displaced-block facts, canonical replacement at the former height, payout script, and final roots when captured | Writer-owned displaced-block archive | Explorer displaced-block history/detail and root search | Archive coverage starts at its activation boundary; retention policy is operator-visible | Fork monitoring and post-reorg analysis without conflating displaced blocks with canonical blocks |
-| Search and privacy | Typed search results for supported public identifiers plus explicit privacy refusals | Canonical indexes and address parsing | Explorer search | Unsupported private-address searches fail explicitly rather than returning misleading empty results | Predictable UX and agent behavior while preserving privacy boundaries |
-| Commands and verification | Typed transaction broadcast outcomes | Node submission through the source boundary | Wallet broadcast RPC | Accepted, duplicate, queued, rejected, and unknown outcomes remain distinct | Idempotent payment submission and actionable user errors |
+| Data | Stored in | Served through | Notes |
+| --- | --- | --- | --- |
+| Block identity, headers, and best-chain hash index | Canonical | `WalletQuery` tips and `BlockIdBySelector`; lightwalletd `GetLatestBlock`, `GetBlock`; `ExplorerQuery.BlockDetail` | `BlockHeaderBySelector` is not advertised |
+| Compact blocks | Canonical | `WalletQuery.CompactBlock`, `CompactBlocksInRange`; lightwalletd `GetBlock`, `GetBlockRange`, nullifier variants | Built at commit, never on request |
+| Full serialized blocks | Canonical | `WalletQuery.FullBlock`, `FullBlocksInRange` | Only when `storage.raw_blob_policy = "all"` |
+| Tree states (Sapling, Orchard, Ironwood) | Canonical | `WalletQuery.TreeStateAtHeight`, `LatestTreeStateCheckpoint`; lightwalletd `GetTreeState`, `GetLatestTreeState` | Checkpoints every 100 blocks and at every followed block; other heights rebuilt from compact blocks |
+| Shielded subtree roots | Canonical | `WalletQuery.SubtreeRoots`; lightwalletd `GetSubtreeRoots` | |
+| Note commitment tree roots per block | Materialized views | None | `ExplorerQuery.CommitmentRootSearch` is not advertised and always fails |
+| Network-upgrade schedule | Canonical, from the node | `WalletQuery.NetworkUpgradeActivations`; lightwalletd `GetLightdInfo`; `ExplorerQuery.NetworkUpgradeStatus` | |
+| Transaction location and status | Canonical | `WalletQuery.Transaction`; lightwalletd `GetTransaction`; `ExplorerQuery.TransactionDetail` | Absence is reported only when proven |
+| Raw transaction bytes | Canonical | `WalletQuery.Transaction`; lightwalletd `GetTransaction`, `GetTaddressTransactions` | Only when `raw_blob_policy` is `transactions` or `all` |
+| Transaction facts: components, value balances, transparent inputs and outputs | Canonical | `ExplorerQuery.TransactionDetail` | Missing optional facts mean unknown, not zero. `BlockTransactions` is not advertised and always fails |
+| Chain events (commits and reorgs) | Canonical | `WalletQuery.ChainEvents`; `ExplorerQuery.ChainReorgHistory` | Cursor-resumable, retention-bounded |
+| Displaced blocks | Canonical | None | Archive of blocks a reorg replaced. `ExplorerQuery.DisplacedBlockHistory` and `DisplacedBlockDetail` are not advertised and always fail |
+| Live mempool and mempool events | Ingest's mempool view and event log | `WalletQuery.MempoolSnapshot`, `MempoolEvents`; lightwalletd `GetMempoolTx`, `GetMempoolStream`, `GetTransaction`; `ExplorerQuery` mempool methods | Events kept 60 minutes after mining, 24 hours after invalidation, by default |
+| Transparent unspent outputs by address | Wallet | `WalletQuery.TransparentAddressUnspentOutputs`; lightwalletd `GetAddressUtxos`, `GetAddressUtxosStream` | |
+| Transparent spent outputs | Wallet | `WalletQuery.TransparentOutpointSpendStatus` | |
+| Transparent address transaction history | Wallet | `WalletQuery.TransparentAddressTxIdsInRange`; lightwalletd `GetTaddressTxids`, `GetTaddressTransactions` | Ascending only |
+| Transparent address balance | Wallet | lightwalletd `GetTaddressBalance`, `GetTaddressBalanceStream` | No native balance method |
+| Address activity, deltas, and ranking | Materialized views | `ExplorerQuery.TransparentAddressActivity`, `TransparentAddressDeltas`, `TransparentAddressRanking` | Ranking is advertised only after its view is built |
+| Block summaries, production, and activity distribution | Materialized views | `ExplorerQuery.BlockSummariesInRange`, `BlockActivityDistribution` | `BlockProductionSeries` and `BlockProductionInTimeRange` are not advertised and always fail |
+| Transaction history and recent transactions | Materialized views | `ExplorerQuery.TransactionHistory`, `RecentTransactions`, `TransactionComponentSummary` | |
+| Fees | Materialized views | `ExplorerQuery.FeeSummary`, `ConventionalFeeDistribution` | ZIP-317 conventional fees; `PaidFeeDistribution` is not advertised |
+| Value-pool balances and flows | Materialized views | `ExplorerQuery.ValuePoolBalanceHistory` and `ValuePoolFlow*` methods | |
+| Value-pool totals at the node's tip | Not stored | None | `WalletQuery.ChainValuePoolsAtTip` is not advertised. `ExplorerQuery.ValuePoolSummary` reads it, so both fail with `ENDPOINT_CAPABILITY_UNAVAILABLE` |
+| Orchard-to-Ironwood migration | Materialized views | `ExplorerQuery.MigrationOverview`, `MigrationCohorts`, `MigrationDenominations` | |
+| Broadcast outcomes | Not stored | `WalletQuery.BroadcastTransaction`; lightwalletd `SendTransaction` | Forwarded to the node |
 
-## Contract Rules
+## Rules that apply to every row
 
-1. A canonical artifact schema version describes writer/read compatibility for canonical facts. It does not prove that an independently backfilled materialized view is complete.
-2. Each materialized-view-backed RPC uses that consumer's materialized-view checkpoint and coverage as its read fence. The block-summary tip is useful dashboard context, not a completeness proof for every materialized view.
-3. Absent optional facts mean unknown or unavailable. APIs must not convert missing retention, unresolved prevouts, pre-activation pools, or incomplete enrichment into fabricated zero values.
-4. Compatibility adapters may translate these native contracts, but they do not define Zinder's storage model, public vocabulary, or feature lifecycle.
-
-## References
-
-- [Public interfaces](../architecture/public-interfaces.md)
-- [Explorer plane](../architecture/explorer-plane.md)
-- [Wallet data plane](../architecture/wallet-data-plane.md)
-- [Materialized-view plane](../architecture/materialized-view-plane.md)
-- [Storage backend](../architecture/storage-backend.md)
-- [Initial synchronization](../runbooks/initial-sync.md)
+1. Check the method's capability in `ServerInfo` before you rely on it. [Capabilities](capabilities.md) lists the strings.
+2. An absent optional fact means unknown or unavailable. Zinder does not turn missing retention, unresolved prevouts, inactive pools, or incomplete backfill into zero.
+3. A materialized-view response is bounded by that view's own checkpoint and coverage, which its freshness envelope reports. The canonical tip does not prove that a view is complete. [Explorer plane](../architecture/explorer-plane.md) explains freshness.

@@ -6,7 +6,7 @@
 //! so the read path serves a single-address timeline as a forward range
 //! scan with no post-fetch reversal.
 //!
-//! ## Field-presence rules (ADR-0018)
+//! ## Field-presence rules (ADR-0014)
 //!
 //! `net_value_zat` is set only when the consumer resolved every
 //! previous transparent output the transaction reads from this address. If any

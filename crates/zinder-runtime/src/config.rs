@@ -14,7 +14,7 @@
 //! [`NodeAuthToml::from_node_auth`] (used by `--print-config`) and in the
 //! manual `Debug` impls on [`zinder_source::NodeAuth`] and
 //! [`crate::auth::BearerToken`]. Per-surface file-only constraints (see
-//! [ADR-0006](../../../docs/adrs/0006-ingest-control-transport-security.md))
+//! [ADR-0011](../../../docs/adrs/0011-ingest-control-transport-security.md))
 //! remain enforced at their respective config types.
 
 use std::{
@@ -122,7 +122,7 @@ pub enum ConfigError {
         "rejected environment variable `{original_name}`: produced configuration key \
          `{rejected_key}`, which is not a valid field. Zinder env vars use `__` (double \
          underscore) between TOML section names and single `_` inside field names. \
-         {}See `docs/architecture/public-interfaces.md` for the canonical env-var table.",
+         {}See `docs/reference/configuration.md` for the canonical env-var table.",
         suggestion_sentence(suggested_name.as_deref())
     )]
     RejectedEnvVar {

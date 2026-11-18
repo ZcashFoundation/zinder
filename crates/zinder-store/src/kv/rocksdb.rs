@@ -817,13 +817,13 @@ fn apply_statistics_level(db_options: &mut Options, level: RocksDbStatisticsLeve
 /// Builds `RocksDB` options for any writer-posture instance in the workspace.
 ///
 /// The canonical chain store and the materialized-view store both route through this
-/// factory; ADR-0020 describes the bounded resource budget applied here.
+/// factory; ADR-0005 describes the bounded resource budget applied here.
 ///
 /// Locked invariants applied here are non-tunable: write-ahead logging on
 /// (`disable_wal=false`), point-in-time recovery on (`RocksDB` default),
 /// atomic cross-CF flush on (`set_atomic_flush(true)`), and ordered
 /// writes on (`unordered_write=false`). See
-/// [ADR-0020](../../../docs/adrs/0020-bounded-rocksdb-resource-budget.md)
+/// [ADR-0005](../../../docs/adrs/0005-bounded-process-memory.md)
 /// for the full design.
 #[must_use]
 fn build_primary_db_options(
@@ -895,7 +895,7 @@ fn build_write_buffer_manager(memtable_budget_bytes: u64) -> WriteBufferManager 
 /// to the returned options, as the wallet store does for its hash-keyed
 /// families. Public because the materialized-view and wallet stores re-use the
 /// same factory; see
-/// [ADR-0020](../../../docs/adrs/0020-bounded-rocksdb-resource-budget.md).
+/// [ADR-0005](../../../docs/adrs/0005-bounded-process-memory.md).
 #[must_use]
 pub fn build_block_based_table_factory(cache: &Cache) -> BlockBasedOptions {
     let mut bbt = BlockBasedOptions::default();

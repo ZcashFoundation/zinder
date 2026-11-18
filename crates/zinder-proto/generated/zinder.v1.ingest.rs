@@ -32,7 +32,7 @@ pub struct WriterStatusResponse {
     /// `chain_view` because it is known before the first commit.
     #[prost(string, tag = "2")]
     pub network_name: ::prost::alloc::string::String,
-    /// Current phase of the phase-driven ingest loop. ADR-0015.
+    /// Current phase of the phase-driven ingest loop. ADR-0009.
     #[prost(enumeration = "WriterPhase", tag = "5")]
     pub phase: i32,
     /// Distance from the writer's visible tip to the observed upstream tip
@@ -44,7 +44,7 @@ pub struct WriterStatusResponse {
     /// sample yet (writer still in the `STARTING` window) or when the
     /// upstream is healthy. Carries the same payload `ReadinessReport`
     /// surfaces under `cause=upstream_not_ready`; readers parse one struct
-    /// for both surfaces. ADR-0015 §Upstream sync detection.
+    /// for both surfaces. ADR-0009 §Upstream sync detection.
     #[prost(message, optional, tag = "8")]
     pub upstream_not_ready: ::core::option::Option<super::ops::UpstreamNotReadyDetail>,
     /// Set while the canonical writer is parked because a replacement crossed
@@ -52,7 +52,7 @@ pub struct WriterStatusResponse {
     /// operator reconciles the store. `chain_view` carries the frozen writer
     /// fence while the parked writer still answers and is absent otherwise.
     /// Carries the same payload `ReadinessReport` surfaces under
-    /// `cause=reorg_window_exceeded`. ADR-0041.
+    /// `cause=reorg_window_exceeded`. ADR-0010.
     #[prost(message, optional, tag = "9")]
     pub reorg_window_exceeded: ::core::option::Option<
         super::ops::ReorgWindowExceededDetail,
@@ -104,7 +104,7 @@ pub struct CanonicalWriterStatusResponse {
     /// its reorg window. `fence` is then the frozen fence the parked writer
     /// still serves, so readers stay converged, but they must refuse wallet
     /// traffic with the typed halt instead of reporting ready. Absent from
-    /// writers that predate this field. ADR-0041.
+    /// writers that predate this field. ADR-0010.
     #[prost(message, optional, tag = "5")]
     pub reorg_window_exceeded: ::core::option::Option<
         super::ops::ReorgWindowExceededDetail,
@@ -116,7 +116,7 @@ pub struct CanonicalWriterStatusResponse {
     /// may sit on a branch the node abandoned while the writer was down, so
     /// wallet-serving readers must not report ready on it. The projector may
     /// keep converging on it. Writers that predate this field never set it, and
-    /// readers then attest the fence as before. ADR-0041.
+    /// readers then attest the fence as before. ADR-0010.
     #[prost(bool, tag = "6")]
     pub tip_unconfirmed: bool,
 }
@@ -368,7 +368,7 @@ pub struct CreateCanonicalOwnerCheckpointResponse {
     >,
     /// Reorg window the checkpoint enforces when a canonical writer raised it
     /// above `build_plan.reorg_window_blocks`. Absent when the checkpoint
-    /// enforces its construction window. ADR-0041.
+    /// enforces its construction window. ADR-0010.
     #[prost(uint32, optional, tag = "10")]
     pub effective_reorg_window_blocks: ::core::option::Option<u32>,
 }
@@ -427,7 +427,7 @@ pub struct CreateStateBundleCaptureResponse {
 }
 /// Current phase of the phase-driven ingest loop. Orthogonal to readiness
 /// `cause`: a writer in `WRITER_PHASE_BULK_CATCHUP` may report `syncing`
-/// (normal) or `upstream_not_ready` (Zebra itself is behind). See ADR-0015.
+/// (normal) or `upstream_not_ready` (Zebra itself is behind). See ADR-0009.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum WriterPhase {

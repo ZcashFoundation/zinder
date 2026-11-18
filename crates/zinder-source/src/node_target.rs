@@ -6,7 +6,7 @@
 //! deserializes into [`NodeSection`], and [`NodeTarget::resolve`] turns that
 //! raw section into the resolved type.
 //!
-//! See [Public interfaces §Configuration Conventions](../../../docs/architecture/public-interfaces.md#configuration-conventions)
+//! See [Configuration](../../../docs/reference/configuration.md)
 //! for the canonical TOML schema. The env-var keys (after `config-rs`'s `__`
 //! flattening) are:
 //!
@@ -34,7 +34,7 @@
 //!
 //! Indexer TLS material is accepted only as file paths. The indexer URL scheme
 //! decides whether the channel uses TLS; see
-//! [ADR-0019](../../../docs/adrs/0019-transport-policy-ownership.md).
+//! [ADR-0007](../../../docs/adrs/0007-node-failure-recovery-and-transport-policy.md).
 
 use std::{collections::BTreeMap, fmt, num::NonZeroU64, path::PathBuf, time::Duration};
 
@@ -97,10 +97,10 @@ pub struct NodeTarget {
     /// `None` means the operator did not set `[node.health].addr`, so the
     /// upstream-health signal falls back to the JSON-RPC
     /// `getblockchaininfo.verificationprogress` path per
-    /// [ADR-0015 §Upstream sync detection].
+    /// [ADR-0009 §Upstream sync detection].
     ///
-    /// [ADR-0015 §Upstream sync detection]:
-    ///     ../../../docs/adrs/0015-phase-driven-ingest.md#upstream-sync-detection
+    /// [ADR-0009 §Upstream sync detection]:
+    ///     ../../../docs/adrs/0009-ingest-lifecycle-and-construction.md#upstream-sync-detection
     pub health: Option<NodeHealthConfig>,
 }
 
@@ -378,7 +378,7 @@ impl NodeTarget {
 ///
 /// `[node]` describes the upstream node itself (endpoint, transport, auth).
 /// Ingest's choice of which adapter implementation to instantiate lives on
-/// `[ingest].source` per [ADR-0016](../../../docs/adrs/0016-source-segment-fetching.md)
+/// `[ingest].source` per [ADR-0006](../../../docs/adrs/0006-node-source-boundary.md)
 /// because it is a writer-private implementation decision, not a property
 /// of the node.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -571,10 +571,10 @@ pub struct NodeIndexerClientIdentity {
 /// omitting [`Self::addr`] leaves the resolved
 /// [`NodeTarget::health`] at `None` and the writer falls back to the
 /// `verificationprogress` JSON-RPC path per
-/// [ADR-0015 §Upstream sync detection].
+/// [ADR-0009 §Upstream sync detection].
 ///
-/// [ADR-0015 §Upstream sync detection]:
-///     ../../../docs/adrs/0015-phase-driven-ingest.md#upstream-sync-detection
+/// [ADR-0009 §Upstream sync detection]:
+///     ../../../docs/adrs/0009-ingest-lifecycle-and-construction.md#upstream-sync-detection
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NodeHealthSection {

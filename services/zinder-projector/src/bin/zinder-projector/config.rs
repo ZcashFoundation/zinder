@@ -28,7 +28,7 @@ const DEFAULT_WALLET_PATH: &str = "/var/lib/zinder/wallet";
 pub(crate) const DEFAULT_OPS_LISTEN_ADDR: &str = "127.0.0.1:9110";
 const DEFAULT_REORG_WINDOW_BLOCKS: u32 = zinder_store::DEFAULT_REORG_WINDOW_BLOCKS;
 const DEFAULT_FENCE_CONVERGENCE_TIMEOUT_SECONDS: u64 = 30;
-/// ADR-0035 permits at most two hours for wallet construction after canonical.
+/// ADR-0004 permits at most two hours for wallet construction after canonical.
 ///
 /// The builder can heartbeat only at durable phase boundaries, so its lease
 /// must cover two complete hard-gate windows rather than relying on a periodic

@@ -6,7 +6,7 @@
 // payloads consumed by the existing `/readyz` JSON serializer.
 //
 // See:
-// - docs/architecture/service-operations.md (Health and Readiness)
+// - docs/reference/readiness.md
 
 syntax = "proto3";
 
@@ -50,7 +50,7 @@ enum ReadinessCause {
   // Upstream node is reachable but reports it is itself behind the network
   // tip. Sourced from Zebra's `/ready` endpoint when configured, or from
   // `getblockchaininfo.verificationprogress`/`estimatedheight` as fallback.
-  // See ADR-0015.
+  // See ADR-0009.
   READINESS_CAUSE_UPSTREAM_NOT_READY = 16;
   // A wallet-serving reader cannot refresh or match its published canonical
   // and wallet pair, but the pair is still within its staleness ceiling and
@@ -235,7 +235,7 @@ message NodeUnavailableDetail {
 // "we're up to date with Zebra" from "Zebra is itself syncing." The signal
 // is sourced from Zebra's HTTP `/ready` endpoint when configured, or from
 // `getblockchaininfo.verificationprogress`/`estimatedheight` as fallback.
-// See ADR-0015 §Upstream sync detection.
+// See ADR-0009 §Upstream sync detection.
 message UpstreamNotReadyDetail {
   // Upstream's last committed tip height when known.
   optional uint32 upstream_committed_height = 1;

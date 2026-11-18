@@ -12,7 +12,7 @@
 //!
 //! The outer `Status` code stays the canonical gRPC retry signal; the reason
 //! rides alongside as the typed key a client pins to. `BroadcastRejectionReason`
-//! stays a separate payload verdict per ADR-0023 and is never folded into
+//! stays a separate payload verdict per ADR-0018 and is never folded into
 //! [`ErrorReason`].
 //!
 //! See [`docs/reference/error-vocabulary.md`](../../docs/reference/error-vocabulary.md).

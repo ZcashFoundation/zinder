@@ -1,10 +1,10 @@
 //! Operator-facing environment-variable reference for Zinder service binaries.
 //!
 //! The `ZINDER_*` env-var schema is part of Zinder's public interface (see
-//! [Public interfaces §Environment variable mapping]). The entries in
+//! [Configuration §Environment variables]). The entries in
 //! [`ENVIRONMENT_VARIABLES`] are the hand-maintained description of that
 //! surface and feed the Markdown table embedded in
-//! `docs/architecture/public-interfaces.md`.
+//! `docs/reference/configuration.md`.
 //!
 //! [`render_environment_variable_table`] returns the Markdown the doc block
 //! must contain. The doc-mirror integration test in this crate asserts exact
@@ -27,8 +27,8 @@
 //! or whether a binary acts on a variable it accepts. Adding a config field
 //! means adding a row here and regenerating the doc block.
 //!
-//! [Public interfaces §Environment variable mapping]:
-//!     ../../docs/architecture/public-interfaces.md#environment-variable-mapping
+//! [Configuration §Environment variables]:
+//!     ../../docs/reference/configuration.md#environment-variables
 
 use std::fmt::Write as _;
 
@@ -87,7 +87,7 @@ impl Requirement {
 /// Operator-facing `ZINDER_*` environment variables advertised by Zinder
 /// service binaries.
 ///
-/// Mirrored into `docs/architecture/public-interfaces.md` between the
+/// Mirrored into `docs/reference/configuration.md` between the
 /// `<!-- env-var-table:public-interfaces:start -->` and corresponding `:end`
 /// markers; the doc-mirror test in
 /// `crates/zinder-runtime/tests/integration/env_var_docs.rs` fails when the
@@ -321,7 +321,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       to `getblockchaininfo.verificationprogress`/`estimatedheight`. \
                       Compatibility with `compat.serving = \"compact-blocks\"` rejects \
                       every node setting. See \
-                      [ADR-0015](../adrs/0015-phase-driven-ingest.md).",
+                      [ADR-0009](../adrs/0009-ingest-lifecycle-and-construction.md).",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__HEALTH__POLL_INTERVAL_MS",
@@ -632,7 +632,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       surfaces to a public or unspecified (`0.0.0.0`, `::`) address. Defaults \
                       to `false`: a loopback or private-range bind is always allowed, but a \
                       public or unspecified bind is refused at startup unless this is `true`. \
-                      Zinder ships no server TLS (ADR-0006); set this only when a reverse \
+                      Zinder ships no server TLS (ADR-0011); set this only when a reverse \
                       proxy terminates TLS and authorization in front of the listener.",
     },
     EnvVarDoc {
@@ -642,7 +642,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Listen address of the private IngestControl gRPC endpoint. Localhost-only \
-                      by default; cross-host deployments must add bearer-token auth per ADR-0006. \
+                      by default; cross-host deployments must add bearer-token auth per ADR-0011. \
                       Set to an empty string to disable the endpoint for diagnostic one-shot runs \
                       (such as `--target-height` pre-seed).",
     },
@@ -672,7 +672,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::ConditionalOn("ingest enforces auth"),
         sensitive: false,
         description: "Path to the shared-secret bearer token the IngestControl endpoint enforces \
-                      on every request (ADR-0006). The writer reads it to verify; the readers \
+                      on every request (ADR-0011). The writer reads it to verify; the readers \
                       read the same file to present. File-only by policy; inline secrets are \
                       rejected at config load.",
     },
@@ -1239,7 +1239,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "Source-adapter selector. Lives on `[ingest]` (not `[node]`) because the \
                       choice is a writer-private implementation decision: `[node]` describes the \
                       upstream node itself, `[ingest].source` describes which adapter ingest \
-                      uses to talk to it. See [ADR-0016](../adrs/0016-source-segment-fetching.md).",
+                      uses to talk to it. See [ADR-0006](../adrs/0006-node-source-boundary.md).",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__EXPLORER_VIEWS",
@@ -1377,7 +1377,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       secondary gives the wallet a block to apply, and starts another attempt; \
                       the projector does not exit. A same-sequence mismatch or a secondary \
                       ahead of the writer fails immediately. Readiness while the wallet trails \
-                      is described in [Service operations](service-operations.md#projector). \
+                      is described in [Readiness](readiness.md#projector). \
                       Must be greater than zero. Defaults to 30.",
     },
     EnvVarDoc {
@@ -1439,7 +1439,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       the wallet unchanged and parks the projector, not ready, with \
                       `wallet_transition_limit_exceeded` until it restarts with a larger \
                       value; see [Wallet transition exceeds its logical-byte \
-                      limit](../runbooks/deploying-wallet-serving.md#wallet-transition-exceeds-its-logical-byte-limit).",
+                      limit](../runbooks/deploying-single-volume.md#wallet-transition-exceeds-its-logical-byte-limit).",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__PHASE_CLASSIFICATION__CATCHUP_THRESHOLD_BLOCKS",
@@ -1449,7 +1449,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Gap (in blocks) above which `zinder-ingest probe` reports `BulkCatchup` \
                       instead of `FollowingTip`. Defaults to `ingest.reorg_window_blocks`. See \
-                      [ADR-0015](../adrs/0015-phase-driven-ingest.md).",
+                      [ADR-0009](../adrs/0009-ingest-lifecycle-and-construction.md).",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__CONSTRUCTION__SOURCE_SEGMENT_MAX_BLOCKS",
@@ -1650,7 +1650,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Path to the shared-secret bearer token the ExplorerQuery endpoint enforces \
-                      on cross-service explorer-plane reads (ADR-0006).",
+                      on cross-service explorer-plane reads (ADR-0011).",
     },
     EnvVarDoc {
         name: "ZINDER_EXPLORER__LISTEN_ADDR",
@@ -1723,7 +1723,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Path to the shared-secret bearer token the adapter presents to both the \
-                      ExplorerQuery and WalletQuery endpoints (ADR-0006). Unset sends no token.",
+                      ExplorerQuery and WalletQuery endpoints (ADR-0011). Unset sends no token.",
     },
 ];
 

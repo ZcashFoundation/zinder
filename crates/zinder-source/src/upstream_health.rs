@@ -3,10 +3,10 @@
 //! [`UpstreamHealthSnapshot`] is the source-boundary value produced by
 //! [`crate::NodeSource::poll_upstream_health`]. Writers translate the
 //! snapshot to a `cause=upstream_not_ready` readiness state per
-//! [ADR-0015 §Upstream sync detection].
+//! [ADR-0009 §Upstream sync detection].
 //!
-//! [ADR-0015 §Upstream sync detection]:
-//!     ../../../docs/adrs/0015-phase-driven-ingest.md#upstream-sync-detection
+//! [ADR-0009 §Upstream sync detection]:
+//!     ../../../docs/adrs/0009-ingest-lifecycle-and-construction.md#upstream-sync-detection
 
 use std::borrow::Cow;
 

@@ -9,7 +9,7 @@
 //! [`SearchClassification::UnifiedAddress`]) short-circuit before the
 //! handler in `zinder-explorer` issues any `WalletQuery` lookup, which is
 //! the structural invariant required by
-//! [ADR-0012](../../../docs/adrs/0012-typed-explorer-search-and-privacy-refusal.md).
+//! [ADR-0019](../../../docs/adrs/0019-explorer-plane.md).
 //!
 //! The handler in `services/zinder-explorer/src/grpc/search.rs` composes
 //! the classifier output with optional `WalletQuery` confirmations:
@@ -63,7 +63,7 @@ pub enum SearchClassification {
         /// User-provided hex in RPC byte order, lowercase, exactly 64
         /// characters. Forwarded verbatim to the upstream wallet plane
         /// (which expects RPC-form strings on its hash-shaped fields per
-        /// ADR-0021).
+        /// ADR-0009).
         rpc_hex: String,
         /// Decoded 32 bytes in internal byte order, ready for storage
         /// lookups and round-trip validation through

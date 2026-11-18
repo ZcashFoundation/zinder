@@ -35,7 +35,7 @@ message ServerInfoRequest {}
 // Server descriptor response.
 //
 // Carries the standard `ExplorerFreshness` envelope per
-// [ADR-0011](../../../../../docs/adrs/0011-explorer-freshness-envelope.md)
+// [ADR-0019](../../../../../docs/adrs/0019-explorer-plane.md)
 // so consumers can read the upstream tip and capability versions from any
 // explorer response, including the bootstrap call. Without this, the upstream
 // tip (which rides on `ExplorerFreshness.chain_view.upstream_tip`) would only
@@ -53,7 +53,7 @@ message ServerInfoResponse {
 // the structured `reason` or render `human_reason` verbatim. The reason
 // string comes from the canonical registry in
 // `crates/zinder-core/src/explorer_reasons.rs`; the contract is defined in
-// [ADR-0011](../../../../../docs/adrs/0011-explorer-freshness-envelope.md).
+// [ADR-0019](../../../../../docs/adrs/0019-explorer-plane.md).
 message UnavailableField {
   // Dotted path matching the response field hierarchy, e.g.
   // `fee.computed.zip317_conventional_zat`.
@@ -95,7 +95,7 @@ enum UnavailableReason {
 // The chain-state axes (epoch, tips, upstream, materialized views) live on
 // `chain_view`; this message keeps only the metadata that genuinely varies
 // per call. Defined in
-// [ADR-0011](../../../../../docs/adrs/0011-explorer-freshness-envelope.md);
+// [ADR-0019](../../../../../docs/adrs/0019-explorer-plane.md);
 // every `ExplorerQuery` RPC's response carries this field tag 1 first so
 // consumers can read `response.freshness` unconditionally.
 message ExplorerFreshness {
@@ -185,7 +185,7 @@ message TransactionComponentCounts {
 //
 // Parsed once by `zinder_source::parse_transaction_public_facts` from raw
 // transaction bytes plus the node-discovered network upgrade table per
-// [ADR-0010](../../../../../docs/adrs/0010-transaction-public-facts.md).
+// [ADR-0018](../../../../../docs/adrs/0018-transaction-facts-status-and-broadcast.md).
 message TransactionPublicFacts {
   // Canonical Zcash transaction identifier in RPC byte order (64 lowercase
   // hex characters; the form `zcash-cli`, every wallet UI, and every block
@@ -1941,7 +1941,7 @@ service ExplorerQuery {
   rpc BlockTransactions(BlockDetailRequest) returns (BlockTransactionsResponse);
 
   // Classifies a raw user input string into typed search candidates per
-  // [ADR-0012](../../../../../docs/adrs/0012-typed-explorer-search-and-privacy-refusal.md).
+  // [ADR-0019](../../../../../docs/adrs/0019-explorer-plane.md).
   // Shielded receivers, viewing keys, and shielded receivers inside
   // unified addresses route to the typed `NotPubliclyIndexable` arm and
   // never reach a storage read. Capability: `explorer.search_v1`.
@@ -2486,7 +2486,7 @@ message TransparentAddressActivityRecord {
   // Set only when `prevout_resolution_status == Resolved` AND every
   // prevout the transaction reads was successfully resolved. Partial
   // resolution leaves this field unset rather than reporting a half-
-  // summed value as if it were complete (see ADR-0018).
+  // summed value as if it were complete (see ADR-0014).
   optional sint64 net_value_zat = 3;
   uint32 input_count = 4;
   uint32 output_count = 5;
@@ -2952,7 +2952,7 @@ message OverviewSnapshotRequest {
 // freshness envelope. Consumers compare the chain epoch's `chain_epoch_id` and
 // `visible_tip` across responses to detect snapshot boundary crosses.
 message OverviewSnapshotResponse {
-  // Cross-cutting envelope (field tag 1 per ADR-0011). Single freshness
+  // Cross-cutting envelope (field tag 1 per ADR-0019). Single freshness
   // for the entire bundle.
   ExplorerFreshness freshness = 1;
 

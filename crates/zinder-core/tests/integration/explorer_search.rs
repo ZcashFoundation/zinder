@@ -1,6 +1,6 @@
 //! Unit tests for the `ExplorerQuery.Search` classifier.
 //!
-//! Pinned by [ADR-0012](../../../../docs/adrs/0012-typed-explorer-search-and-privacy-refusal.md).
+//! Pinned by [ADR-0019](../../../../docs/adrs/0019-explorer-plane.md).
 //! Every shielded input class must classify without any IO; the classifier
 //! is intentionally a pure function so the privacy invariant is structural.
 

@@ -1,7 +1,7 @@
 //! Role-scoped `RocksDB` resource budget.
 //!
 //! `RocksDbResourceBudget` separates the two halves of `RocksDB` option setting that
-//! [ADR-0020](../../../docs/adrs/0020-bounded-rocksdb-resource-budget.md)
+//! [ADR-0005](../../../docs/adrs/0005-bounded-process-memory.md)
 //! identifies:
 //!
 //! - **Architectural invariants** (WAL on, point-in-time recovery, atomic
@@ -85,7 +85,7 @@ pub struct RocksDbResourceBudget {
 impl RocksDbResourceBudget {
     /// Smallest accepted [`Self::block_cache_bytes`]. Anything smaller
     /// degenerates into per-`SST` pinning, which is the regression
-    /// [ADR-0020](../../../docs/adrs/0020-bounded-rocksdb-resource-budget.md)
+    /// [ADR-0005](../../../docs/adrs/0005-bounded-process-memory.md)
     /// closes.
     pub const MIN_BLOCK_CACHE_BYTES: u64 = 4 * MIB;
 
@@ -123,7 +123,7 @@ impl RocksDbResourceBudget {
     ///
     /// `512 MiB` block cache, `256 MiB` WAL ceiling, `512` open file handles,
     /// `16 MiB x 2` write buffers per column family, `2` background jobs, and
-    /// `256 MiB` total memtable budget. See ADR-0020 for the budget derivation.
+    /// `256 MiB` total memtable budget. See ADR-0005 for the budget derivation.
     #[must_use]
     pub const fn canonical_writer_defaults() -> Self {
         Self {

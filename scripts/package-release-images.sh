@@ -121,15 +121,15 @@ describe_image() {
       ;;
     zinder-canonical-runtime)
       image_description="Zinder ingest-only canary runtime for one volume; it serves no client protocol."
-      documentation_path=docs/runbooks/deploying-on-railway.md
+      documentation_path=docs/runbooks/deploying-single-volume.md
       ;;
     zinder-wallet-serving)
       image_description="Zinder ingest, wallet projector, native WalletQuery, and lightwalletd compatibility supervised together on one volume."
-      documentation_path=docs/runbooks/deploying-wallet-serving.md
+      documentation_path=docs/runbooks/deploying-single-volume.md
       ;;
     zinder-wallet-serving-explorer)
       image_description="Zinder wallet serving and the ExplorerQuery server supervised together on one volume."
-      documentation_path=docs/runbooks/deploying-wallet-serving.md
+      documentation_path=docs/runbooks/deploying-single-volume.md
       ;;
     *)
       echo >&2 "no image description for ${1}; add one to describe_image"
