@@ -314,7 +314,8 @@ fn ensure_exit(executable: &Path, output: &Output, code: i32, case: &str) -> Res
     Ok(())
 }
 
+/// Port 1 is privileged and unassigned on loopback, so nothing a test binds can
+/// take it, unlike a port released by a dropped listener.
 fn closed_loopback_addr() -> Result<SocketAddr> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    Ok(listener.local_addr()?)
+    Ok(SocketAddr::from(([127, 0, 0, 1], 1)))
 }

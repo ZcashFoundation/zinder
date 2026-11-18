@@ -46,7 +46,10 @@ is skipped, and the probe uses the service's default ops address. The probe
 ignores the service's `--ops-listen-addr` flag; pass the same address with
 `--addr`. The runtime images run `zinder-<runtime> --config
 /etc/zinder/config.toml healthcheck`, so they probe the ops address of the file
-at that path, whether the image's default or a mounted one. The whole probe is
+at that path, whether the image's default or a mounted one. A container started
+with `--config` pointing at another path still has that healthcheck, so mount
+the file at `/etc/zinder/config.toml` instead, or override the healthcheck with
+the same `--config`, whenever the file changes the ops address. The whole probe is
 bounded at 3 seconds, below the 5-second timeout of the image and Compose
 healthchecks, so the probe reports its own reason before the container runtime
 kills it.
