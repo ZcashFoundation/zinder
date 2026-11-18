@@ -117,12 +117,25 @@ pub(super) const CANONICAL_DATA_COLUMN_FAMILIES: [&str; 15] = [
 #[derive(Clone)]
 pub(super) struct CanonicalStoreAdmissionExpectation {
     network: Network,
-    activations_fingerprint: NetworkUpgradeActivationsFingerprint,
-    expected_activations: Option<NetworkUpgradeActivations>,
+    activations: ActivationAdmission,
     allow_schedule_update: bool,
     workload: CanonicalStoreWorkload,
     raw_blob_retention: RawBlobRetention,
     reorg_policy: ReorgPolicyAdmission,
+}
+
+/// How admission compares a caller's activation table with persisted identity.
+#[derive(Clone, Debug)]
+enum ActivationAdmission {
+    /// The persisted construction fingerprint must equal this one.
+    ConstructionBaseline(NetworkUpgradeActivationsFingerprint),
+    /// A node-observed table, admitted against the writer-admitted schedule
+    /// through the visible tip, or against the construction baseline before
+    /// the writer's first admission.
+    NodeObserved(NetworkUpgradeActivations),
+    /// The caller brings no table and adopts the writer-admitted schedule,
+    /// refusing a READY store whose writer has not admitted one yet.
+    WriterAdmitted,
 }
 
 /// How admission compares a caller's window with the persisted effective one.
@@ -145,9 +158,25 @@ impl CanonicalStoreAdmissionExpectation {
     ) -> Self {
         Self {
             network: activations.network(),
-            activations_fingerprint: activations
-                .fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1),
-            expected_activations: Some(activations.clone()),
+            activations: ActivationAdmission::NodeObserved(activations.clone()),
+            allow_schedule_update: false,
+            workload,
+            raw_blob_retention,
+            reorg_policy: ReorgPolicyAdmission::Exact(reorg_policy),
+        }
+    }
+
+    /// Expects a READY store of `network` whose writer has admitted a
+    /// network-upgrade schedule, which the reader then adopts.
+    pub(super) const fn adopting_writer_schedule(
+        network: Network,
+        workload: CanonicalStoreWorkload,
+        raw_blob_retention: RawBlobRetention,
+        reorg_policy: super::CanonicalReorgPolicy,
+    ) -> Self {
+        Self {
+            network,
+            activations: ActivationAdmission::WriterAdmitted,
             allow_schedule_update: false,
             workload,
             raw_blob_retention,
@@ -164,8 +193,9 @@ impl CanonicalStoreAdmissionExpectation {
     ) -> Self {
         Self {
             network: build_plan.network(),
-            activations_fingerprint: build_plan.network_upgrade_activations_fingerprint(),
-            expected_activations: None,
+            activations: ActivationAdmission::ConstructionBaseline(
+                build_plan.network_upgrade_activations_fingerprint(),
+            ),
             allow_schedule_update: false,
             workload,
             raw_blob_retention: build_plan.raw_blob_retention(),
@@ -1067,7 +1097,14 @@ pub(super) fn validate_open_store_control(
         admitted_schedule.as_ref(),
         visible_tip,
     )
-    .map_err(|reason| CanonicalStoreError::admission(path, reason))?;
+    .map_err(|refusal| match refusal {
+        ActivationRefusal::Mismatch(reason) => CanonicalStoreError::admission(path, reason),
+        ActivationRefusal::ScheduleNotAdmitted => {
+            CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted {
+                path: path.to_path_buf(),
+            }
+        }
+    })?;
     let expected_schedule_key_count = match persisted.activation_schedule_binding {
         Some(binding) => usize::try_from(binding.revision).map_err(|_| {
             CanonicalStoreError::admission(path, "activation schedule revision exceeds memory size")
@@ -1176,6 +1213,15 @@ fn reorg_policy_lowering_refused(
     )
 }
 
+/// Why a caller's activation expectation does not admit the persisted store.
+enum ActivationRefusal {
+    /// The caller's table contradicts the persisted identity.
+    Mismatch(&'static str),
+    /// The caller adopts the writer-admitted schedule, and the writer of this
+    /// READY store has not admitted one yet.
+    ScheduleNotAdmitted,
+}
+
 /// Checks the caller's activation expectation against persisted identity.
 ///
 /// Construction and exact re-admission compare the immutable construction
@@ -1184,23 +1230,37 @@ fn reorg_policy_lowering_refused(
 /// node-observed table is admitted only when the writer has already admitted
 /// a schedule that agrees with that table through the visible tip; before the
 /// first admission, the reader's table must equal the construction baseline.
+/// A reader without a table adopts the writer-admitted schedule, so it needs
+/// one to exist.
 fn validate_activation_expectation(
     expectation: &CanonicalStoreAdmissionExpectation,
     persisted_fingerprint: NetworkUpgradeActivationsFingerprint,
     admitted_schedule: Option<&CanonicalActivationSchedule>,
     visible_tip: Option<zinder_core::BlockHeight>,
-) -> Result<(), &'static str> {
-    let exact_baseline = || {
-        if persisted_fingerprint == expectation.activations_fingerprint {
+) -> Result<(), ActivationRefusal> {
+    let exact_baseline = |expected_fingerprint: NetworkUpgradeActivationsFingerprint| {
+        if persisted_fingerprint == expected_fingerprint {
             Ok(())
         } else {
-            Err(
+            Err(ActivationRefusal::Mismatch(
                 "persisted network upgrade activations do not equal the requested activation table; restart the canonical writer so it admits the node's schedule",
-            )
+            ))
         }
     };
-    let Some(observed) = expectation.expected_activations.as_ref() else {
-        return exact_baseline();
+    let observed = match &expectation.activations {
+        ActivationAdmission::ConstructionBaseline(fingerprint) => {
+            return exact_baseline(*fingerprint);
+        }
+        ActivationAdmission::WriterAdmitted => {
+            return match (admitted_schedule, visible_tip) {
+                (Some(_), Some(_)) | (None, None) => Ok(()),
+                (None, Some(_)) => Err(ActivationRefusal::ScheduleNotAdmitted),
+                (Some(_), None) => Err(ActivationRefusal::Mismatch(
+                    "BUILDING store control must not bind an activation schedule",
+                )),
+            };
+        }
+        ActivationAdmission::NodeObserved(observed) => observed,
     };
     match (admitted_schedule, visible_tip) {
         (_, Some(_)) if expectation.allow_schedule_update => Ok(()),
@@ -1208,13 +1268,17 @@ fn validate_activation_expectation(
             if observed.preserves_through(admitted.activations(), visible_tip) {
                 Ok(())
             } else {
-                Err(
+                Err(ActivationRefusal::Mismatch(
                     "node network upgrade activations differ from the writer-admitted schedule at or below the visible tip",
-                )
+                ))
             }
         }
-        (None, _) => exact_baseline(),
-        (Some(_), None) => Err("BUILDING store control must not bind an activation schedule"),
+        (None, _) => {
+            exact_baseline(observed.fingerprint(NetworkUpgradeActivationsFingerprintVersion::V1))
+        }
+        (Some(_), None) => Err(ActivationRefusal::Mismatch(
+            "BUILDING store control must not bind an activation schedule",
+        )),
     }
 }
 

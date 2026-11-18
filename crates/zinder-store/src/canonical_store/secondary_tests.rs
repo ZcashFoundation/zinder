@@ -602,6 +602,89 @@ fn secondary_admission_rejects_another_network_activation_table()
     Ok(())
 }
 
+/// A reader without a node adopts the writer's schedule: it waits for the
+/// writer's first admission, then reads through the admitted table and
+/// follows each later revision on catch-up.
+#[test]
+fn a_secondary_adopts_the_writer_admitted_schedule_once_one_exists()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let construction = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let mut store = published_store(
+        &store_path,
+        REORG_WINDOW,
+        BlockHeight::new(4),
+        BlockHeight::new(2),
+    )?;
+
+    let error = open_adopting_secondary(&store_path, temporary.path().join("early"))?
+        .err()
+        .ok_or("a READY store without an admitted schedule must refuse a node-free reader")?;
+    assert!(
+        matches!(
+            error,
+            CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted { .. }
+        ),
+        "unexpected pre-admission error: {error:?}"
+    );
+
+    store.admit_network_upgrade_schedule(&construction)?;
+    let mut secondary = open_adopting_secondary(&store_path, temporary.path().join("reader"))??;
+    assert_eq!(secondary.network(), Network::ZcashTestnet);
+    assert_eq!(
+        secondary
+            .network_upgrade_schedule()
+            .map(super::CanonicalActivationSchedule::revision),
+        Some(1)
+    );
+    assert_eq!(secondary.network_upgrade_activations(), Some(&construction));
+
+    let extended = extend_with_future_activation(&construction)?;
+    store.admit_network_upgrade_schedule(&extended)?;
+    secondary.try_catch_up()?;
+    assert_eq!(
+        secondary
+            .network_upgrade_schedule()
+            .map(super::CanonicalActivationSchedule::revision),
+        Some(2)
+    );
+    assert_eq!(secondary.network_upgrade_activations(), Some(&extended));
+    Ok(())
+}
+
+#[test]
+fn a_secondary_adopting_the_writer_schedule_refuses_another_network()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let store_path = temporary.path().join("canonical");
+    let construction = super::test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let mut store = published_store(
+        &store_path,
+        REORG_WINDOW,
+        BlockHeight::new(4),
+        BlockHeight::new(2),
+    )?;
+    store.admit_network_upgrade_schedule(&construction)?;
+
+    let error = RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
+        &store_path,
+        temporary.path().join("secondary"),
+        Network::ZcashMainnet,
+        CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(REORG_WINDOW)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )
+    .err()
+    .ok_or("a node-free reader for another network must be refused")?;
+    assert!(
+        matches!(error, CanonicalStoreError::AdmissionRefused { .. }),
+        "unexpected network-mismatch error: {error:?}"
+    );
+    Ok(())
+}
+
 #[test]
 fn secondary_and_reopened_primary_serve_the_last_durable_fence_after_the_primary_drops()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -770,6 +853,42 @@ fn open_secondary(
         CanonicalReorgPolicy::new(REORG_WINDOW)?,
         RocksDbResourceBudget::for_local_tests(),
     ))
+}
+
+/// Opens a node-free wallet secondary that adopts the writer's schedule,
+/// returning the admission outcome separately from fixture failures.
+fn open_adopting_secondary(
+    store_path: &std::path::Path,
+    secondary_path: std::path::PathBuf,
+) -> Result<Result<RocksDbCanonicalSecondary, CanonicalStoreError>, Box<dyn std::error::Error>> {
+    Ok(
+        RocksDbCanonicalSecondary::open_ready_adopting_writer_schedule(
+            store_path,
+            secondary_path,
+            Network::ZcashTestnet,
+            CanonicalStoreWorkload::Wallet,
+            RawBlobRetention::Transactions,
+            CanonicalReorgPolicy::new(REORG_WINDOW)?,
+            RocksDbResourceBudget::for_local_tests(),
+        ),
+    )
+}
+
+/// Returns `activations` with one more upgrade activating far above any
+/// fixture tip, which a writer admits as a future-only revision.
+fn extend_with_future_activation(
+    activations: &zinder_core::NetworkUpgradeActivations,
+) -> Result<zinder_core::NetworkUpgradeActivations, Box<dyn std::error::Error>> {
+    let mut entries = activations.activations().to_vec();
+    entries.push(zinder_core::NetworkUpgradeActivation {
+        branch_id: zinder_core::ConsensusBranchId::new(0x0fff_fff0),
+        activation_height: BlockHeight::new(1_000_000),
+        name: "FutureUpgrade".to_owned(),
+    });
+    Ok(zinder_core::NetworkUpgradeActivations::new(
+        activations.network(),
+        entries,
+    )?)
 }
 
 /// Opens a canonical secondary on `block_cache`, returning the admission
