@@ -27,8 +27,10 @@ use zinder_source::{
 /// block unless built [`MockTransactionBroadcaster::on_another_chain`], so a
 /// reader's first-contact verification passes against a store with that
 /// table. Its capability probe yields to the runtime once before it answers,
-/// so concurrent verifications interleave. Clones share the captured calls
-/// and the probe answers.
+/// so concurrent verifications interleave, and answers until
+/// [`MockTransactionBroadcaster::report_unreachable`] or
+/// [`MockTransactionBroadcaster::report_unresponsive`] is called. Clones share
+/// the captured calls and the probe answers.
 #[derive(Clone, Debug)]
 pub struct MockTransactionBroadcaster {
     outcome: BroadcastOutcome,
@@ -40,7 +42,17 @@ pub struct MockTransactionBroadcaster {
 struct MockNodeProbe {
     node_activations: Option<NetworkUpgradeActivations>,
     on_another_chain: bool,
+    reachability: MockReachability,
     capability_probes: usize,
+}
+
+/// How the fake node answers a capability probe.
+#[derive(Clone, Copy, Debug, Default)]
+enum MockReachability {
+    #[default]
+    Answering,
+    Unreachable,
+    Unresponsive,
 }
 
 #[derive(Clone, Debug)]
@@ -137,6 +149,20 @@ impl MockTransactionBroadcaster {
         self.probe.lock().on_another_chain = true;
     }
 
+    /// Fails every capability probe from now on with
+    /// [`SourceError::NodeUnavailable`], for this broadcaster and every
+    /// clone, as a node that stopped accepting connections would.
+    pub fn report_unreachable(&self) {
+        self.probe.lock().reachability = MockReachability::Unreachable;
+    }
+
+    /// Leaves every capability probe from now on unanswered, for this
+    /// broadcaster and every clone, as a node that stopped answering before
+    /// its request timeout would.
+    pub fn report_unresponsive(&self) {
+        self.probe.lock().reachability = MockReachability::Unresponsive;
+    }
+
     /// Returns how many times a reader probed this node's capabilities, which
     /// it does once per first-contact verification.
     #[must_use]
@@ -169,8 +195,21 @@ impl MockTransactionBroadcaster {
 #[async_trait]
 impl BroadcastNodeProbe for MockTransactionBroadcaster {
     async fn probe_capabilities(&self) -> Result<NodeCapabilities, SourceError> {
-        self.probe.lock().capability_probes += 1;
+        let reachability = {
+            let mut probe = self.probe.lock();
+            probe.capability_probes += 1;
+            probe.reachability
+        };
         tokio::task::yield_now().await;
+        match reachability {
+            MockReachability::Answering => {}
+            MockReachability::Unreachable => {
+                return Err(SourceError::NodeUnavailable {
+                    reason: "the mock node refuses connections".to_owned(),
+                });
+            }
+            MockReachability::Unresponsive => std::future::pending::<()>().await,
+        }
         NodeCapabilities::new([
             NodeCapability::JsonRpc,
             NodeCapability::OpenRpcDiscovery,

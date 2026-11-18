@@ -33,9 +33,10 @@ const EXCLUSION_MAX_BACKOFF: Duration = Duration::from_mins(5);
 
 /// Longest an endpoint stays verified against an earlier basis.
 ///
-/// It applies after the serving pair's basis changed and the endpoint could
-/// not be verified against the new one, for example because it was one block
-/// behind.
+/// It counts from when the serving pair was first seen on a new basis, or
+/// from the start of an inconclusive repeat against the same basis, and
+/// covers a verification that has not returned yet as well as one that was
+/// inconclusive, for example because the node was one block behind.
 const STALE_VERIFICATION_GRACE: Duration = Duration::from_mins(1);
 
 /// Interval between verification rounds while an endpoint is verified only
@@ -72,18 +73,21 @@ const STATE_GAUGE: &str = "zinder_wallet_broadcast_endpoint_state";
 /// no endpoint answered fails as unreachable even when another endpoint
 /// rejected it for its consensus branch.
 ///
-/// A passed verification lasts until the serving pair's schedule revision or
-/// the network upgrade active at the height after its tip changes, and the
-/// endpoint is then verified again. When that check is inconclusive, the
-/// endpoint stays verified against the earlier basis for up to one minute
-/// while it is checked again. A passed verification also records the first
-/// height above the checked one at which the endpoint's table disagrees with
-/// the writer-admitted schedule. Once the block a broadcast targets reaches
-/// that height, the endpoint receives no broadcast, and verifying it again
-/// cannot keep the earlier verification. An endpoint that lacks
-/// `sendrawtransaction` or whose table disagrees is excluded, and verified
-/// again after a backoff that starts at 30 seconds and doubles to 5 minutes.
-/// Clones share every endpoint's verification and the preferred position.
+/// A passed verification keeps the endpoint's activation table. A broadcast
+/// reaches the endpoint only while that table agrees with the writer-admitted
+/// schedule of the newest captured serving pair, through the height a
+/// broadcast targets under that pair. A schedule revision, or a tip that
+/// reaches an activation in either table, therefore stops broadcasts to a
+/// disagreeing endpoint at once, without contacting it. The endpoint is
+/// verified again once the pair's schedule revision or the network upgrade
+/// active at the height after its tip changes. Until that check passes, the
+/// endpoint keeps its earlier verification for up to one minute from when
+/// the new basis was first seen, while the check waits on the node and after
+/// it was inconclusive, but only while its kept table agrees. An endpoint
+/// that lacks `sendrawtransaction` or whose table disagrees is excluded, and
+/// verified again after a backoff that starts at 30 seconds and doubles to 5
+/// minutes. Clones share every endpoint's verification and the preferred
+/// position.
 pub struct OrderedBroadcaster<Source> {
     inner: Arc<OrderedBroadcasterInner<Source>>,
 }
@@ -119,7 +123,7 @@ impl<Source> OrderedBroadcaster<Source> {
                 .map(EndpointVerification::new)
                 .collect(),
             preferred: nodes.subscribe_switches(),
-            broadcast_height: Arc::new(parking_lot::Mutex::new(None)),
+            admission: Arc::new(parking_lot::Mutex::new(None)),
         };
         Self {
             inner: Arc::new(OrderedBroadcasterInner {
@@ -171,7 +175,8 @@ impl<Source> OrderedBroadcaster<Source> {
     }
 
     /// Returns whether the endpoint at `position` is verified only against
-    /// an earlier basis because its last verification was inconclusive.
+    /// an earlier basis: the serving pair moved to another basis, or a repeat
+    /// against the same basis was inconclusive.
     pub(crate) fn awaits_reverification(&self, position: usize) -> bool {
         self.inner
             .verifications
@@ -197,7 +202,12 @@ impl<Source> OrderedBroadcaster<Source> {
                 .verifications
                 .endpoints
                 .get(position)
-                .is_some_and(|verification| !verification.table_agrees_at(broadcast_height(pair)))
+                .is_some_and(|verification| {
+                    !verification.table_agrees_through(
+                        pair.network_upgrade_activations(),
+                        broadcast_height(pair),
+                    )
+                })
     }
 
     /// Makes `position` the preferred endpoint after it answered while every
@@ -286,13 +296,13 @@ where
         position: usize,
         target: &VerificationTarget,
     ) -> Result<(), SourceError> {
-        let (Some(source), Some(verification)) = (
-            self.inner.nodes.endpoint(position),
-            self.inner.verifications.endpoints.get(position),
-        ) else {
+        let Some(source) = self.inner.nodes.endpoint(position) else {
             return Err(no_verified_endpoint());
         };
-        verification.verify(source, target).await
+        self.inner
+            .verifications
+            .verify(position, source, target)
+            .await
     }
 }
 
@@ -505,9 +515,15 @@ fn record_attempt(position: usize, outcome: &Result<TransactionBroadcastOutcome,
 pub(crate) struct EndpointVerifications {
     endpoints: Arc<[EndpointVerification]>,
     preferred: watch::Receiver<usize>,
-    /// The height a broadcast targets under the serving pair of the newest
-    /// chain epoch that a verification or a wallet broadcast captured.
-    broadcast_height: Arc<parking_lot::Mutex<Option<EpochBroadcastHeight>>>,
+    /// The evidence of the newest serving pair, by chain epoch and then
+    /// schedule revision, that a verification or a wallet broadcast
+    /// captured, which a broadcast checks every kept activation table
+    /// against.
+    ///
+    /// An endpoint's verification state changes only while this lock is
+    /// held, so a verification whose basis differs from this pair's is
+    /// always marked stale.
+    admission: Arc<parking_lot::Mutex<Option<Arc<VerificationTarget>>>>,
 }
 
 impl EndpointVerifications {
@@ -519,53 +535,80 @@ impl EndpointVerifications {
     }
 
     fn is_verified(&self, position: usize) -> bool {
-        let broadcast_height = self.tracked_broadcast_height();
-        self.endpoints
-            .get(position)
-            .is_some_and(|verification| verification.is_verified(broadcast_height))
+        self.verified_capabilities_at(position).is_some()
     }
 
     pub(crate) fn verified_capabilities(&self) -> Option<UpstreamNodeCapabilities> {
-        let broadcast_height = self.tracked_broadcast_height();
-        self.preference_order().find_map(|position| {
-            self.endpoints
-                .get(position)
-                .and_then(|verification| verification.verified_capabilities(broadcast_height))
-        })
+        self.preference_order()
+            .find_map(|position| self.verified_capabilities_at(position))
     }
 
-    /// Admits a broadcast only to endpoints whose verified table agrees with
-    /// the writer-admitted schedule at the height a broadcast targets under
-    /// `pair`.
+    fn verified_capabilities_at(&self, position: usize) -> Option<UpstreamNodeCapabilities> {
+        // Held through the state load: `track` and `record` take the same
+        // lock, so the check never pairs a superseded schedule with a
+        // verification recorded after a newer one was tracked.
+        let admission = self.admission.lock();
+        self.endpoints
+            .get(position)?
+            .state
+            .load()
+            .in_force(admission.as_deref()?)
+            .cloned()
+    }
+
+    /// Admits a broadcast only to endpoints whose kept table agrees with the
+    /// writer-admitted schedule of `pair` through the height a broadcast
+    /// targets under it.
     pub(crate) fn track_broadcast_height(&self, pair: &WalletServingReadPair) {
-        self.track(EpochBroadcastHeight::of(pair));
+        self.track(&Arc::new(VerificationTarget::of(pair)));
     }
 
-    /// Tracks `captured` unless a pair of a newer chain epoch was tracked, so
-    /// a caller that captured an older pair cannot replace the height of a
-    /// newer one.
-    fn track(&self, captured: EpochBroadcastHeight) {
-        let mut tracked = self.broadcast_height.lock();
-        if tracked.is_none_or(|tracked| tracked.chain_epoch_id <= captured.chain_epoch_id) {
-            *tracked = Some(captured);
+    /// Tracks `captured` unless a newer pair was tracked, so a caller that
+    /// captured an older pair cannot replace a newer one, and starts the
+    /// grace of every verification of another basis.
+    fn track(&self, captured: &Arc<VerificationTarget>) {
+        let mut admission = self.admission.lock();
+        if admission
+            .as_ref()
+            .is_some_and(|tracked| tracked.publication_order() > captured.publication_order())
+        {
+            return;
         }
+        let seen_at = Instant::now();
+        for verification in self.endpoints.iter() {
+            verification.supersede(captured.basis, seen_at);
+        }
+        *admission = Some(Arc::clone(captured));
     }
 
-    fn tracked_broadcast_height(&self) -> BlockHeight {
-        self.broadcast_height
-            .lock()
-            .map_or(BlockHeight::new(0), |tracked| tracked.broadcast_height)
-    }
-
-    /// Captures the evidence a verification checks against and tracks its
-    /// broadcast height.
-    fn target(&self, pair_slot: &WalletServingPairSlot) -> VerificationTarget {
-        let target = VerificationTarget::capture(pair_slot);
-        self.track(EpochBroadcastHeight {
-            chain_epoch_id: target.chain_epoch_id,
-            broadcast_height: target.broadcast_height,
-        });
+    /// Captures the evidence a verification checks against and tracks it.
+    fn target(&self, pair_slot: &WalletServingPairSlot) -> Arc<VerificationTarget> {
+        let target = Arc::new(VerificationTarget::of(&pair_slot.capture()));
+        self.track(&target);
         target
+    }
+
+    /// Verifies the endpoint at `position`, reached through `source`, against
+    /// `target`, unless its verification still holds against it.
+    async fn verify(
+        &self,
+        position: usize,
+        source: &impl BroadcastNodeProbe,
+        target: &VerificationTarget,
+    ) -> Result<(), SourceError> {
+        let Some(verification) = self.endpoints.get(position) else {
+            return Err(no_verified_endpoint());
+        };
+        if let Some(settled) = verification.settled(target) {
+            return settled;
+        }
+        let _attempt = verification.attempt.lock().await;
+        if let Some(settled) = verification.settled(target) {
+            return settled;
+        }
+        let outcome = verify_node_endpoint(source, target).await;
+        let admission = self.admission.lock();
+        verification.record(outcome, target, admission.as_deref())
     }
 }
 
@@ -586,13 +629,14 @@ enum VerificationState {
     Verified {
         capabilities: UpstreamNodeCapabilities,
         basis: VerificationBasis,
-        /// When a verification against a later basis was first
-        /// inconclusive, or `None` while `basis` is the latest one checked.
+        /// The endpoint's activation table as the verification fetched it.
+        node_activations: NetworkUpgradeActivations,
+        /// When the serving pair was first seen on another basis, or when a
+        /// repeat against `basis` was first inconclusive, or `None` while
+        /// `basis` is the latest one seen.
         stale_since: Option<Instant>,
-        /// The first height above the checked one at which the endpoint's
-        /// table disagrees with the writer-admitted schedule, or `None` when
-        /// the two tables are the same.
-        disagreement_height: Option<BlockHeight>,
+        /// Whether a repeat since `stale_since` was inconclusive.
+        retrying: bool,
     },
     Excluded {
         refusal: VerificationRefusal,
@@ -610,23 +654,23 @@ impl VerificationState {
         }
     }
 
-    /// Returns the capabilities of a verification a broadcast targeting
-    /// `broadcast_height` may rely on now: one of the latest basis checked,
-    /// or one of an earlier basis whose [`STALE_VERIFICATION_GRACE`] has not
-    /// ended, whose table agrees with the writer-admitted schedule at that
-    /// height.
+    /// Returns the capabilities of a verification a broadcast under
+    /// `admission` may rely on now: one of the latest basis seen, or one of
+    /// an earlier basis whose [`STALE_VERIFICATION_GRACE`] has not ended,
+    /// whose kept table agrees with the writer-admitted schedule of
+    /// `admission` through the height a broadcast targets.
     ///
     /// The grace ends on time even while no later verification completes, so
     /// a slow verification round cannot extend it.
-    fn in_force(&self, broadcast_height: BlockHeight) -> Option<&UpstreamNodeCapabilities> {
+    fn in_force(&self, admission: &VerificationTarget) -> Option<&UpstreamNodeCapabilities> {
         match self {
             Self::Verified {
                 capabilities,
+                node_activations,
                 stale_since,
-                disagreement_height,
                 ..
             } if !stale_since.is_some_and(stale_grace_ended)
-                && agrees_at(*disagreement_height, broadcast_height) =>
+                && admission.agrees_with(node_activations) =>
             {
                 Some(capabilities)
             }
@@ -635,13 +679,6 @@ impl VerificationState {
             }
         }
     }
-}
-
-/// Returns whether a table that first disagrees with the writer-admitted
-/// schedule at `disagreement_height` agrees with it through
-/// `broadcast_height`.
-fn agrees_at(disagreement_height: Option<BlockHeight>, broadcast_height: BlockHeight) -> bool {
-    disagreement_height.is_none_or(|disagreement_height| broadcast_height < disagreement_height)
 }
 
 /// Returns whether the grace of a verification first left stale at `since`
@@ -661,19 +698,18 @@ impl EndpointVerification {
         verification
     }
 
-    fn is_verified(&self, broadcast_height: BlockHeight) -> bool {
-        self.state.load().in_force(broadcast_height).is_some()
-    }
-
-    /// Returns whether a verified table agrees with the writer-admitted
-    /// schedule at `broadcast_height`; an endpoint without a verification
-    /// has no table to disagree.
-    fn table_agrees_at(&self, broadcast_height: BlockHeight) -> bool {
+    /// Returns whether a kept table agrees with `schedule` through
+    /// `broadcast_height`; an endpoint without a verification has no table
+    /// to disagree.
+    fn table_agrees_through(
+        &self,
+        schedule: &NetworkUpgradeActivations,
+        broadcast_height: BlockHeight,
+    ) -> bool {
         match &**self.state.load() {
             VerificationState::Verified {
-                disagreement_height,
-                ..
-            } => agrees_at(*disagreement_height, broadcast_height),
+                node_activations, ..
+            } => node_activations.preserves_through(schedule, broadcast_height),
             VerificationState::Unchecked
             | VerificationState::Unverified
             | VerificationState::Excluded { .. } => true,
@@ -690,31 +726,42 @@ impl EndpointVerification {
         )
     }
 
-    fn verified_capabilities(
-        &self,
-        broadcast_height: BlockHeight,
-    ) -> Option<UpstreamNodeCapabilities> {
-        self.state.load().in_force(broadcast_height).cloned()
+    /// Starts the grace of a current verification of a basis other than
+    /// `seen`, the basis of a serving pair seen at `seen_at`.
+    fn supersede(&self, seen: VerificationBasis, seen_at: Instant) {
+        let state = self.state.load();
+        if let VerificationState::Verified {
+            capabilities,
+            basis,
+            node_activations,
+            stale_since: None,
+            ..
+        } = &**state
+            && *basis != seen
+        {
+            self.state.store(Arc::new(VerificationState::Verified {
+                capabilities: capabilities.clone(),
+                basis: *basis,
+                node_activations: node_activations.clone(),
+                stale_since: Some(seen_at),
+                retrying: false,
+            }));
+        }
     }
 
     /// Returns the outcome of a verification that still holds against
     /// `target`, or `None` when the endpoint must be verified again.
     ///
-    /// A verification kept after an inconclusive repeat is never settled,
-    /// even when the pair returns to its basis, so a later round either
-    /// renews it or lets its grace end.
+    /// A stale verification is never settled, even when the pair returns to
+    /// its basis, so a later round either renews it or lets its grace end.
     fn settled(&self, target: &VerificationTarget) -> Option<Result<(), SourceError>> {
         match &**self.state.load() {
             VerificationState::Verified {
                 basis: verified,
+                node_activations,
                 stale_since: None,
-                disagreement_height,
                 ..
-            } if *verified == target.basis
-                && agrees_at(*disagreement_height, target.broadcast_height) =>
-            {
-                Some(Ok(()))
-            }
+            } if *verified == target.basis && target.agrees_with(node_activations) => Some(Ok(())),
             VerificationState::Excluded {
                 refusal, retry_at, ..
             } if Instant::now() < *retry_at => Some(Err(refusal.error())),
@@ -725,32 +772,23 @@ impl EndpointVerification {
         }
     }
 
-    async fn verify(
-        &self,
-        source: &impl BroadcastNodeProbe,
-        target: &VerificationTarget,
-    ) -> Result<(), SourceError> {
-        if let Some(settled) = self.settled(target) {
-            return settled;
-        }
-        let _attempt = self.attempt.lock().await;
-        if let Some(settled) = self.settled(target) {
-            return settled;
-        }
-        let outcome = verify_node_endpoint(source, target).await;
-        self.record(outcome, target)
-    }
-
+    /// Records the outcome of a verification against `target` while a
+    /// broadcast checks kept tables against `admission`.
+    ///
+    /// A pass against a basis other than the one of `admission`, which the
+    /// serving pair moved to while the verification ran, is stale from when
+    /// `target` was captured.
     fn record(
         &self,
         outcome: Result<PassedVerification, VerificationFailure>,
         target: &VerificationTarget,
+        admission: Option<&VerificationTarget>,
     ) -> Result<(), SourceError> {
         let previous = self.state.load_full();
         let (next, verification) = match outcome {
             Ok(PassedVerification {
                 capabilities,
-                disagreement_height,
+                node_activations,
             }) => {
                 if !matches!(*previous, VerificationState::Verified { .. }) {
                     tracing::info!(
@@ -760,19 +798,23 @@ impl EndpointVerification {
                         "node endpoint passed first-contact verification; transaction broadcast reaches it"
                     );
                 }
+                let stale_since = admission
+                    .is_some_and(|admission| admission.basis != target.basis)
+                    .then_some(target.captured_at);
                 (
                     VerificationState::Verified {
                         capabilities,
                         basis: target.basis,
-                        stale_since: None,
-                        disagreement_height,
+                        node_activations,
+                        stale_since,
+                        retrying: false,
                     },
                     Ok(()),
                 )
             }
             Err(VerificationFailure::Refused(refusal)) => self.excluded(&previous, refusal),
             Err(VerificationFailure::Inconclusive(error)) => {
-                self.inconclusive(&previous, error, target.broadcast_height)
+                self.inconclusive(&previous, error, target)
             }
         };
         self.record_state_gauge(next.label());
@@ -817,25 +859,27 @@ impl EndpointVerification {
     /// [`STALE_VERIFICATION_GRACE`], since an endpoint one block behind or
     /// mid-reorg at an activation is inconclusive without being wrong.
     ///
-    /// A verification whose table disagrees with the writer-admitted
-    /// schedule at `broadcast_height` is wrong there, so it is not kept.
+    /// A verification whose kept table disagrees with the writer-admitted
+    /// schedule of `target` through the height a broadcast targets is wrong
+    /// there, so it is not kept.
     fn inconclusive(
         &self,
         previous: &VerificationState,
         error: SourceError,
-        broadcast_height: BlockHeight,
+        target: &VerificationTarget,
     ) -> (VerificationState, Result<(), SourceError>) {
         if let VerificationState::Verified {
             capabilities,
             basis,
+            node_activations,
             stale_since,
-            disagreement_height,
+            retrying,
         } = previous
-            && agrees_at(*disagreement_height, broadcast_height)
+            && target.agrees_with(node_activations)
         {
-            let since = stale_since.unwrap_or_else(Instant::now);
+            let since = stale_since.unwrap_or(target.captured_at);
             if !stale_grace_ended(since) {
-                if stale_since.is_none() {
+                if !retrying {
                     tracing::warn!(
                         target: "zinder::wallet_serving",
                         event = "wallet_node_reverification_inconclusive",
@@ -848,8 +892,9 @@ impl EndpointVerification {
                 let retained = VerificationState::Verified {
                     capabilities: capabilities.clone(),
                     basis: *basis,
+                    node_activations: node_activations.clone(),
                     stale_since: Some(since),
-                    disagreement_height: *disagreement_height,
+                    retrying: true,
                 };
                 return (retained, Ok(()));
             }
@@ -913,43 +958,41 @@ fn broadcast_height(pair: &WalletServingReadPair) -> BlockHeight {
     tip_height.next().unwrap_or(tip_height)
 }
 
-/// The height a broadcast targets under one serving pair, with the chain
-/// epoch that orders the pair among the others.
-#[derive(Clone, Copy)]
-struct EpochBroadcastHeight {
-    chain_epoch_id: ChainEpochId,
-    broadcast_height: BlockHeight,
-}
-
-impl EpochBroadcastHeight {
-    fn of(pair: &WalletServingReadPair) -> Self {
-        Self {
-            chain_epoch_id: pair.canonical_fence().chain_epoch_id(),
-            broadcast_height: broadcast_height(pair),
-        }
-    }
-}
-
-/// The serving-pair evidence one verification checks endpoints against,
-/// captured without retaining the pair across node calls.
+/// The serving-pair evidence a verification checks endpoints against and a
+/// broadcast checks kept tables against, captured without retaining the pair
+/// across node calls.
 struct VerificationTarget {
     basis: VerificationBasis,
     admitted_activations: NetworkUpgradeActivations,
     broadcast_height: BlockHeight,
     chain_epoch_id: ChainEpochId,
     visible_tip: BlockId,
+    captured_at: Instant,
 }
 
 impl VerificationTarget {
-    fn capture(pair_slot: &WalletServingPairSlot) -> Self {
-        let pair = pair_slot.capture();
+    fn of(pair: &WalletServingReadPair) -> Self {
         Self {
-            basis: VerificationBasis::of(&pair),
+            basis: VerificationBasis::of(pair),
             admitted_activations: pair.network_upgrade_activations().clone(),
-            broadcast_height: broadcast_height(&pair),
+            broadcast_height: broadcast_height(pair),
             chain_epoch_id: pair.canonical_fence().chain_epoch_id(),
             visible_tip: pair.canonical_fence().visible_tip(),
+            captured_at: Instant::now(),
         }
+    }
+
+    /// Returns whether `node_activations` agrees with the writer-admitted
+    /// schedule through the height a broadcast targets.
+    fn agrees_with(&self, node_activations: &NetworkUpgradeActivations) -> bool {
+        node_activations.preserves_through(&self.admitted_activations, self.broadcast_height)
+    }
+
+    /// Orders captured pairs by when they were published: by chain epoch, and
+    /// within one epoch by schedule revision, since a writer restart can
+    /// admit a revision without moving the chain epoch.
+    fn publication_order(&self) -> (ChainEpochId, Option<u64>) {
+        (self.chain_epoch_id, self.basis.schedule_revision)
     }
 }
 
@@ -977,7 +1020,7 @@ impl VerificationRefusal {
 /// What a passed verification established about an endpoint.
 struct PassedVerification {
     capabilities: UpstreamNodeCapabilities,
-    disagreement_height: Option<BlockHeight>,
+    node_activations: NetworkUpgradeActivations,
 }
 
 enum VerificationFailure {
@@ -1006,7 +1049,7 @@ async fn verify_node_endpoint(
         .fetch_network_upgrade_activations()
         .await
         .map_err(VerificationFailure::Inconclusive)?;
-    if !node_activations.preserves_through(&target.admitted_activations, target.broadcast_height) {
+    if !target.agrees_with(&node_activations) {
         return Err(VerificationFailure::Refused(
             VerificationRefusal::ScheduleMismatch,
         ));
@@ -1026,29 +1069,6 @@ async fn verify_node_endpoint(
     }
     Ok(PassedVerification {
         capabilities: UpstreamNodeCapabilities::from_probed(capabilities),
-        disagreement_height: first_disagreement(
-            &node_activations,
-            &target.admitted_activations,
-            target.broadcast_height,
-        ),
+        node_activations,
     })
-}
-
-/// Returns the lowest height above `agreed_through` at which `node` and
-/// `admitted` disagree, or `None` when they never do.
-///
-/// Two tables that agree through one height can first disagree only at a
-/// height where one of them activates an upgrade, and once they disagree they
-/// disagree at every later height.
-fn first_disagreement(
-    node: &NetworkUpgradeActivations,
-    admitted: &NetworkUpgradeActivations,
-    agreed_through: BlockHeight,
-) -> Option<BlockHeight> {
-    node.activations()
-        .iter()
-        .chain(admitted.activations())
-        .map(|activation| activation.activation_height)
-        .filter(|height| *height > agreed_through && !node.preserves_through(admitted, *height))
-        .min()
 }
