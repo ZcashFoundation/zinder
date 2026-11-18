@@ -466,8 +466,9 @@ impl WalletServingReadiness {
 /// `MempoolSnapshot` through the same authenticated channel used by pair
 /// publication and live wallet operations. A failure degrades the
 /// ingest-control dependency without closing the traffic gate, except a
-/// parked writer's halt, which refuses traffic. Structural capabilities stay
-/// immutable either way.
+/// parked writer's halt, which refuses traffic until the writer follows its
+/// node again with a confirmed tip. Structural capabilities stay immutable
+/// either way.
 pub fn spawn_wallet_ingest_control_readiness_probe(
     ingest_control: AdmittedIngestControl,
     readiness: WalletServingReadiness,
@@ -475,37 +476,11 @@ pub fn spawn_wallet_ingest_control_readiness_probe(
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut last_health_was_available = None;
+        let mut observer = IngestControlObserver::default();
         loop {
-            let health_outcome = tokio::select! {
+            let cause = tokio::select! {
                 () = cancel.cancelled() => break,
-                outcome = ingest_control.probe_health() => outcome,
-            };
-            let cause = match health_outcome {
-                Ok(()) => {
-                    if last_health_was_available == Some(false) {
-                        tracing::info!(
-                            target: "zinder::query",
-                            event = "ingest_control_health_recovered",
-                            "admitted ingest-control health recovered"
-                        );
-                    }
-                    last_health_was_available = Some(true);
-                    ReadinessCause::Ready
-                }
-                Err(error) => {
-                    if last_health_was_available != Some(false) {
-                        tracing::warn!(
-                            target: "zinder::query",
-                            event = "ingest_control_health_unavailable",
-                            error_class = error.class(),
-                            error = %error,
-                            "admitted ingest-control health became unavailable"
-                        );
-                    }
-                    last_health_was_available = Some(false);
-                    error.readiness_cause()
-                }
+                cause = observer.observe(&ingest_control) => cause,
             };
             readiness.publish_ingest_control_cause(cause);
 
@@ -515,6 +490,66 @@ pub fn spawn_wallet_ingest_control_readiness_probe(
             }
         }
     })
+}
+
+/// State the ingest-control probe carries from one observation to the next.
+#[derive(Debug, Default)]
+struct IngestControlObserver {
+    /// Whether the last observation found ingest control healthy, so that
+    /// only transitions are logged.
+    last_health_was_available: Option<bool>,
+    /// Canonical writer halt the probe observed and keeps publishing.
+    ///
+    /// The pair publisher may not have seen the halt yet. Losing it to a later
+    /// control failure, or to an answer from a writer restarted on its frozen
+    /// fence, would let the published pair reopen traffic on a chain the
+    /// writer cannot follow. Only a canonical writer status that shows a
+    /// following writer with a confirmed tip clears it.
+    retained_halt: Option<ReadinessCause>,
+}
+
+impl IngestControlObserver {
+    /// Probes ingest control once and returns the cause to publish as the
+    /// ingest-control dependency.
+    async fn observe(&mut self, ingest_control: &AdmittedIngestControl) -> ReadinessCause {
+        let observed = match ingest_control.probe_health().await {
+            Ok(()) => {
+                if self.last_health_was_available == Some(false) {
+                    tracing::info!(
+                        target: "zinder::query",
+                        event = "ingest_control_health_recovered",
+                        "admitted ingest-control health recovered"
+                    );
+                }
+                self.last_health_was_available = Some(true);
+                ReadinessCause::Ready
+            }
+            Err(error) => {
+                if self.last_health_was_available != Some(false) {
+                    tracing::warn!(
+                        target: "zinder::query",
+                        event = "ingest_control_health_unavailable",
+                        error_class = error.class(),
+                        error = %error,
+                        "admitted ingest-control health became unavailable"
+                    );
+                }
+                self.last_health_was_available = Some(false);
+                error.readiness_cause()
+            }
+        };
+        if observed.reorg_window_exceeded_detail().is_some() {
+            self.retained_halt = Some(observed.clone());
+        } else if self.retained_halt.is_some() && ingest_control.confirms_following_writer().await {
+            self.retained_halt = None;
+            tracing::info!(
+                target: "zinder::query",
+                event = "ingest_control_writer_halt_cleared",
+                "the canonical writer follows its node again with a confirmed tip"
+            );
+        }
+        self.retained_halt.clone().unwrap_or(observed)
+    }
 }
 
 /// Starts the liveness probe for the exact node source admitted by a wallet query.
@@ -2187,12 +2222,12 @@ mod tests {
     };
 
     use super::{
-        CandidatePreparationCounts, CanonicalFenceRelation, RETAINED_PAIR_WINDOW,
-        SECONDARY_GENERATION_COUNT, SecondaryGenerationState, WalletServingConvergence,
-        WalletServingPairConfig, WalletServingPairError, WalletServingPairPublisher,
-        WalletServingPairSlot, WalletServingReadiness, candidate_admission_outcome,
-        classify_canonical_writer_fence, classify_pair_admission, error_with_sources,
-        missing_table_file_reported, refresh_failure_is_routine_lag,
+        CandidatePreparationCounts, CanonicalFenceRelation, IngestControlObserver,
+        RETAINED_PAIR_WINDOW, SECONDARY_GENERATION_COUNT, SecondaryGenerationState,
+        WalletServingConvergence, WalletServingPairConfig, WalletServingPairError,
+        WalletServingPairPublisher, WalletServingPairSlot, WalletServingReadiness,
+        candidate_admission_outcome, classify_canonical_writer_fence, classify_pair_admission,
+        error_with_sources, missing_table_file_reported, refresh_failure_is_routine_lag,
         refresh_failure_not_ready_cause, refresh_failure_retains_attested_pair,
         spawn_wallet_ingest_control_readiness_probe, spawn_wallet_node_readiness_probe,
         wallet_ingest_control_request, wallet_source_writer_fence,
@@ -2560,9 +2595,14 @@ mod tests {
     #[tokio::test]
     async fn wallet_ingest_control_probe_projects_a_parked_writer_as_a_typed_halt()
     -> Result<(), Box<dyn std::error::Error>> {
-        let ingest_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
+        let ingest_fixture = IngestControlFixtureService::new(Network::ZcashRegtest);
+        let writer_control = WriterControlFixture::spawn(
+            ingest_fixture.clone(),
+            MutableCanonicalControl::new(following_writer_status()),
+        )
+        .await?;
         let admitted_ingest_control =
-            AdmittedIngestControl::connect(ingest_fixture.endpoint(), None, Network::ZcashRegtest)
+            AdmittedIngestControl::connect(&writer_control.endpoint, None, Network::ZcashRegtest)
                 .await?;
         let runtime = zinder_runtime::Readiness::default();
         let readiness = WalletServingReadiness::native_query(runtime.clone());
@@ -2623,8 +2663,84 @@ mod tests {
 
         cancel.cancel();
         handle.await?;
-        ingest_fixture.shutdown().await?;
-        Ok(())
+        writer_control.shutdown().await
+    }
+
+    /// A writer halt the ingest-control probe observed outlasts control
+    /// failures.
+    ///
+    /// It keeps refusing traffic through a control outage and through a
+    /// restarted writer that has not confirmed its tip, even while the pair
+    /// publisher, which has not seen the halt, admits traffic on its stale
+    /// pair. Only a canonical status from a following writer with a confirmed
+    /// tip clears it.
+    #[tokio::test]
+    async fn wallet_ingest_control_probe_retains_a_writer_halt_until_the_writer_follows_again()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ingest_fixture = IngestControlFixtureService::new(Network::ZcashRegtest);
+        let canonical_control = MutableCanonicalControl::new(CanonicalWriterStatusResponse {
+            tip_unconfirmed: true,
+            ..following_writer_status()
+        });
+        let writer_control =
+            WriterControlFixture::spawn(ingest_fixture.clone(), canonical_control.clone()).await?;
+        let admitted_ingest_control =
+            AdmittedIngestControl::connect(&writer_control.endpoint, None, Network::ZcashRegtest)
+                .await?;
+        let runtime = zinder_runtime::Readiness::default();
+        let readiness = WalletServingReadiness::native_query(runtime.clone());
+        readiness.publish_pair_state(zinder_runtime::ReadinessState::serving_pair_stale(
+            0,
+            1,
+            Some(1),
+        ));
+        readiness.publish_node_source_cause(zinder_runtime::ReadinessCause::Ready);
+        let mut observer = IngestControlObserver::default();
+        let is_halted = |runtime: &zinder_runtime::Readiness| {
+            let report = runtime.report();
+            !report.is_ready
+                && matches!(
+                    report.cause,
+                    zinder_runtime::ReadinessCause::ReorgWindowExceeded { depth: 1_001, .. }
+                )
+        };
+
+        ingest_fixture.set_reorg_window_exceeded(Some(
+            zinder_proto::v1::ops::ReorgWindowExceededDetail {
+                depth: 1_001,
+                configured: 1_000,
+                covered: Some(1_000),
+            },
+        ));
+        readiness.publish_ingest_control_cause(observer.observe(&admitted_ingest_control).await);
+        assert!(is_halted(&runtime), "{:?}", runtime.report());
+
+        ingest_fixture.set_health_available(false);
+        canonical_control.set_available(false);
+        readiness.publish_ingest_control_cause(observer.observe(&admitted_ingest_control).await);
+        assert!(
+            is_halted(&runtime),
+            "a control outage must not reopen traffic on a parked writer's chain: {:?}",
+            runtime.report()
+        );
+
+        ingest_fixture.set_reorg_window_exceeded(None);
+        ingest_fixture.set_health_available(true);
+        canonical_control.set_available(true);
+        readiness.publish_ingest_control_cause(observer.observe(&admitted_ingest_control).await);
+        assert!(
+            is_halted(&runtime),
+            "a writer without a confirmed tip must not clear the halt: {:?}",
+            runtime.report()
+        );
+
+        canonical_control.set_writer_status(following_writer_status());
+        readiness.publish_ingest_control_cause(observer.observe(&admitted_ingest_control).await);
+        let recovered = runtime.report();
+        assert!(recovered.is_ready, "{recovered:?}");
+        assert!(recovered.degraded.is_empty(), "{recovered:?}");
+
+        writer_control.shutdown().await
     }
 
     #[tokio::test]
@@ -7084,6 +7200,57 @@ mod tests {
             self.cancel.cancel();
             self.server_task.await??;
             Ok(())
+        }
+    }
+
+    /// Ingest control and canonical control served on one endpoint, as the
+    /// canonical writer serves them.
+    struct WriterControlFixture {
+        endpoint: String,
+        cancel: CancellationToken,
+        server_task: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    }
+
+    impl WriterControlFixture {
+        async fn spawn(
+            ingest_control: IngestControlFixtureService,
+            canonical_control: MutableCanonicalControl,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = format!("http://{}", listener.local_addr()?);
+            let cancel = CancellationToken::new();
+            let server_cancel = cancel.clone();
+            let server_task = tokio::spawn(async move {
+                Server::builder()
+                    .add_service(CanonicalControlServer::new(canonical_control))
+                    .add_service(IngestControlServer::new(ingest_control))
+                    .serve_with_incoming_shutdown(
+                        TcpListenerStream::new(listener),
+                        server_cancel.cancelled_owned(),
+                    )
+                    .await
+            });
+            Ok(Self {
+                endpoint,
+                cancel,
+                server_task,
+            })
+        }
+
+        async fn shutdown(self) -> Result<(), Box<dyn std::error::Error>> {
+            self.cancel.cancel();
+            self.server_task.await??;
+            Ok(())
+        }
+    }
+
+    /// Canonical status of a regtest writer that follows its node with a
+    /// confirmed tip.
+    fn following_writer_status() -> CanonicalWriterStatusResponse {
+        CanonicalWriterStatusResponse {
+            network_name: zinder_core::wire::encode_zinder_native_chain_name(Network::ZcashRegtest)
+                .to_owned(),
+            ..CanonicalWriterStatusResponse::default()
         }
     }
 

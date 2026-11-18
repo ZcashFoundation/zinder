@@ -352,7 +352,14 @@ it causes. New native requests then fail with
 `REORG_WINDOW_EXCEEDED`, and open `ChainEvents` streams end with the same
 status. The serving-pair publisher reads the same halt from
 `CanonicalControl.WriterStatus`, which is how lightwalletd compatibility,
-which has no ingest-control probe, refuses traffic in both serving modes. The
+which has no ingest-control probe, refuses traffic in both serving modes.
+
+The probe keeps publishing a halt it observed until
+`CanonicalControl.WriterStatus` shows a writer that follows its node with a
+confirmed tip, the same evidence on which the publisher clears a halt it
+remembers. A later probe failure, or a writer restarted on its frozen fence
+that answers without the halt, therefore cannot reopen traffic, even when the
+publisher never saw the halt and still admits traffic on a stale pair. The
 health probe intentionally shares the configured serving-pair refresh cadence
 because both observe the same control plane.
 

@@ -71,6 +71,14 @@ follow it. A halt is the runtime's own cause and is never a degraded entry.
 Each input still owns only its own slot, so no probe can clear another probe's
 observation.
 
+Because an ingest-control failure no longer refuses traffic, native query's
+ingest-control probe keeps a halt it observed through later failures and
+through answers without the halt. It clears the halt only when
+`CanonicalControl.WriterStatus` shows a writer that follows its node with a
+confirmed tip, the evidence on which the serving-pair publisher clears the
+halt it remembers. A control outage therefore cannot reopen traffic on a halt
+that the publisher has not seen yet.
+
 When the canonical writer reports `upstream_not_ready` in
 `IngestControl.WriterStatus`, native query relays that observation, with the
 writer's heights and health source, as the `upstream_not_ready` cause of its
