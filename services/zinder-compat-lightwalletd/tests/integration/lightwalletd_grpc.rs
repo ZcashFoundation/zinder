@@ -3281,17 +3281,19 @@ async fn tree_state_rejects_zero_empty_block_id_without_reader_fallback() -> eyr
 }
 
 #[tokio::test]
-async fn ping_returns_zero_entry_and_exit() -> eyre::Result<()> {
+async fn ping_is_refused_like_lightwalletd_without_its_testing_flag() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture()?;
     let adapter = acceptance_adapter(&store_fixture);
 
-    let response = adapter
+    let outcome = adapter
         .ping(Request::new(lightwalletd::Duration { interval_us: 0 }))
-        .await?
-        .into_inner();
+        .await;
 
-    assert_eq!(response.entry, 0);
-    assert_eq!(response.exit, 0);
+    let status = match outcome {
+        Ok(response) => return Err(eyre!("expected Ping to be refused, got {response:?}")),
+        Err(status) => status,
+    };
+    assert_eq!(status.code(), Code::FailedPrecondition);
 
     Ok(())
 }

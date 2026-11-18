@@ -1020,10 +1020,11 @@ where
         &self,
         _request: Request<lightwalletd::Duration>,
     ) -> Result<Response<lightwalletd::PingResponse>, Status> {
-        Ok(Response::new(lightwalletd::PingResponse {
-            entry: 0,
-            exit: 0,
-        }))
+        // Reference lightwalletd answers this load-test RPC only when started
+        // with `--ping-very-insecure`; Zinder never enables it.
+        Err(Status::failed_precondition(
+            "Ping is not enabled on this server",
+        ))
     }
 }
 

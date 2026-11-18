@@ -177,7 +177,7 @@ jobs:
             "${REFERENCE_LIGHTWALLETD_IMAGE}" \
             --grpc-bind-addr 0.0.0.0:9088 \
             --rpchost 127.0.0.1 --rpcport 39232 --rpcuser zebra --rpcpassword zebra \
-            --no-tls-very-insecure --ping-very-insecure \
+            --no-tls-very-insecure \
             --data-dir /tmp/lwd --log-file /dev/stdout
           for _ in $(seq 1 60); do
             if docker logs lightwalletd-reference 2>&1 | grep -q "Waiting for block: $((tip + 1))"; then
