@@ -805,6 +805,12 @@ mod tests {
         assert_eq!(count(&report, "/retries")?, 3, "{report}");
         assert_eq!(status(&report, "GetBlockRange", "ok")?, 1);
         assert_eq!(status(&report, "GetBlockRange", "out_of_range")?, 4);
+        assert!(
+            report
+                .pointer("/rpcs/GetBlockRange/status_examples/out_of_range")
+                .and_then(Value::as_str)
+                .is_some_and(|message| !message.is_empty())
+        );
         // The probe, the wallet's shared connection, the workers that took a
         // chunk, and a new connection for each retry. The probe's worker can
         // take the second chunk too, so one or two workers connect.

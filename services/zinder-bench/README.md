@@ -740,6 +740,8 @@ identity, the workload's constants, and, over all wallets:
   `connect` entry counts the connections wallets opened. A status is a gRPC
   status name, `client_timeout`, `client_cancelled` for a call the wallet
   dropped, `connect_failed`, `out_of_sequence`, or `incomplete_stream`.
+  `status_examples` keeps the first message received with each failed
+  status.
 - `time_to_first_block_seconds` and `wallet_sync_seconds` per wallet,
   `blocks_per_second` and `bytes_per_second` over the run, `retries`, and the
   status that ended each failed wallet, or `client_task_failed` for a wallet

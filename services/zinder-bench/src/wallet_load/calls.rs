@@ -25,6 +25,9 @@ pub(super) type LwdClient = CompactTxStreamerClient<AuthenticatedChannel>;
 /// How long a wallet waits for a connection to open, as Vizor does.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Longest status message kept as an example in the report.
+const STATUS_EXAMPLE_CHARS: usize = 200;
+
 /// Largest response message a simulated wallet accepts.
 const MAX_RESPONSE_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -153,6 +156,7 @@ struct RecorderState {
 #[derive(Default)]
 struct CallSamples {
     statuses: BTreeMap<&'static str, u64>,
+    status_examples: BTreeMap<&'static str, String>,
     ok_seconds: Vec<f64>,
     first_message_seconds: Vec<f64>,
     messages: u64,
@@ -177,6 +181,19 @@ impl CallRecorder {
         drop(state);
     }
 
+    /// Keeps the first message seen for each failed status of `method`.
+    fn note_status_example(&self, method: &'static str, status: &'static str, detail: &str) {
+        let mut state = self.state.lock();
+        state
+            .calls
+            .entry(method)
+            .or_default()
+            .status_examples
+            .entry(status)
+            .or_insert_with(|| detail.chars().take(STATUS_EXAMPLE_CHARS).collect());
+        drop(state);
+    }
+
     fn note_tree_state_height(&self, height: u64) {
         self.state.lock().tree_state_heights.push(height);
     }
@@ -193,6 +210,7 @@ impl CallRecorder {
                     RpcSummary {
                         requests: samples.statuses.values().sum(),
                         statuses: samples.statuses.clone(),
+                        status_examples: samples.status_examples.clone(),
                         ok_seconds: Percentiles::of(samples.ok_seconds.iter().copied()),
                         first_message_seconds: (!samples.first_message_seconds.is_empty()).then(
                             || Percentiles::of(samples.first_message_seconds.iter().copied()),
@@ -221,6 +239,9 @@ pub(crate) struct RpcSummary {
     /// `out_of_sequence` for a stream that sent a block other than the next
     /// height, or `incomplete_stream` for one that ended early.
     statuses: BTreeMap<&'static str, u64>,
+    /// The first message the client received with each failed status.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    status_examples: BTreeMap<&'static str, String>,
     /// Latency of successful calls. A stream counts until its last block.
     ok_seconds: Percentiles,
     /// Time from opening a stream to its first block.
@@ -512,6 +533,7 @@ struct PendingCall<'run> {
     method: &'static str,
     started: Instant,
     status: Option<&'static str>,
+    detail: Option<String>,
     first_message: Option<Duration>,
     messages: u64,
     bytes: u64,
@@ -524,6 +546,7 @@ impl<'run> PendingCall<'run> {
             method,
             started: Instant::now(),
             status: None,
+            detail: None,
             first_message: None,
             messages: 0,
             bytes: 0,
@@ -532,15 +555,21 @@ impl<'run> PendingCall<'run> {
 
     fn finish(&mut self, outcome: Result<(), &CallFailure>) {
         self.status = Some(outcome.map_or_else(|failure| failure.label, |()| "ok"));
+        self.detail = outcome.err().map(|failure| failure.detail.clone());
     }
 }
 
 impl Drop for PendingCall<'_> {
     fn drop(&mut self) {
+        let status = self.status.unwrap_or("client_cancelled");
+        if let Some(detail) = &self.detail {
+            self.recorder
+                .note_status_example(self.method, status, detail);
+        }
         self.recorder.record_call(
             self.method,
             CallSample {
-                status: self.status.unwrap_or("client_cancelled"),
+                status,
                 elapsed: self.started.elapsed(),
                 first_message: self.first_message,
                 messages: self.messages,
