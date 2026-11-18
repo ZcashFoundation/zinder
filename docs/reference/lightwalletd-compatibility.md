@@ -87,7 +87,7 @@ These outcomes fail the call before any block is sent:
 | Condition | Status |
 | --- | --- |
 | Malformed request, including a missing bound or an invalid pool type | `INVALID_ARGUMENT` |
-| The process already serves its limit of block-range streams | `RESOURCE_EXHAUSTED` |
+| No block-range stream slot returned within 10 seconds, or the queue for one is full | `UNAVAILABLE` |
 | Higher bound above the visible tip | `OUT_OF_RANGE` |
 | One of the first 1,000 heights the stream would send is outside retained history, including height 0 | `NOT_FOUND` |
 | A block missing inside retained history | `UNAVAILABLE` |
@@ -106,11 +106,14 @@ A chunk holds at most 1,000 blocks and at most 2 MiB of stored compact blocks, c
 
 `compat.max_concurrent_block_range_streams` (`ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS`) limits how many `GetBlockRange` and `GetBlockRangeNullifiers` streams the process serves at once. It defaults to 100 and accepts 1 to 65,536.
 
-- A stream holds its slot from validation until it ends, fails, or is cancelled. A valid request past the limit fails with `RESOURCE_EXHAUSTED` before any read. `zinder_compat_block_range_stream_refusals_total` counts refusals, and `zinder_compat_block_range_streams_open` reports open streams.
-- The Zcash Android SDK retries a refused batch. Other clients should retry `RESOURCE_EXHAUSTED` with backoff.
-- Every client shares the limit. A client that opens the limit's worth of streams and stops reading holds every slot until it disconnects. Set a per-client limit on concurrent requests at your proxy. The shipped Caddy template does not include one.
+- A stream holds its slot from validation until it ends, fails, or is cancelled.
+- A valid request past the limit waits for a slot, first come first served, for up to 10 seconds, and reads nothing while it waits. If no slot returns in time, it fails with `UNAVAILABLE`. lightwalletd waits and fails the same way.
+- At most as many requests wait as the limit has slots, 100 by default. A request that finds the queue full fails with `UNAVAILABLE` at once. A client that cancels, disconnects, or reaches its deadline while it waits gives up its place.
+- The Zcash Android SDK, Slipstream, and Vizor retry a failed block-range request after a short backoff, so an occasional refusal delays a sync. Repeated refusals can still end a sync attempt.
+- `zinder_compat_block_range_streams_open` reports open streams, `zinder_compat_block_range_slot_wait_duration_seconds` how long requests waited, and `zinder_compat_block_range_stream_refusals_total` the refusals, as [Metrics](metrics.md#zinder-compat-lightwalletd) lists.
+- Every client shares the limit and the queue. A client that opens the limit's worth of streams and stops reading holds every slot until it disconnects, and one that also sends as many more requests fills the queue. Set a per-client limit on concurrent requests at your proxy. The shipped Caddy template does not include one.
 
-The memory a stream uses beyond its stored bytes has no enforced maximum and has not been measured. Size the limit to the memory left after the block caches in [Storage backend](../architecture/storage-backend.md), and watch container memory while `zinder_compat_block_range_streams_open` is near it. lightwalletd sets no stream limit.
+The memory a stream uses beyond its stored bytes has no enforced maximum and has not been measured. Size the limit to the memory left after the block caches in [Storage backend](../architecture/storage-backend.md), and watch container memory while `zinder_compat_block_range_streams_open` is near it. lightwalletd v0.6.2 limits block-range requests with `--max-concurrent-blockrange`, 200 by default.
 
 ### `GetTreeState` and `GetLatestTreeState`
 

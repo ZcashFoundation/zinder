@@ -1164,8 +1164,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Maximum concurrent `GetBlockRange` and `GetBlockRangeNullifiers` \
                       streams the compatibility server serves. A valid request past the limit \
-                      fails with `RESOURCE_EXHAUSTED` before any read. Must be in 1..=65536; \
-                      defaults to 100.",
+                      waits up to 10 seconds for a slot, then fails with `UNAVAILABLE`. Must \
+                      be in 1..=65536; defaults to 100.",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__PING_VERY_INSECURE",

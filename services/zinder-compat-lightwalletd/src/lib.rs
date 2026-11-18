@@ -13,7 +13,7 @@ mod request_limits;
 pub use block_range::{
     BLOCK_RANGE_CHUNK_MAX_BYTES, BlockRangeChunks, BlockRangeContinuity, BlockRangeResponse,
     BlockRangeSink, BlockRangeStage, BlockRangeStreamLimit, BlockRangeStreamSlot,
-    DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
+    DEFAULT_BLOCK_RANGE_ADMISSION_WAIT, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
 };
 pub use grpc::{
     DEFAULT_MAX_LIGHTWALLETD_ADDRESS_UTXOS, DEFAULT_MAX_LIGHTWALLETD_SUBTREE_ROOTS,

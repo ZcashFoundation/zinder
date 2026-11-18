@@ -1,6 +1,6 @@
 //! gRPC implementation for the vendored lightwalletd protocol.
 
-use std::{collections::HashSet, num::NonZeroU32, pin::Pin};
+use std::{collections::HashSet, num::NonZeroU32, pin::Pin, time::Duration};
 
 use serde_json::Value;
 use thiserror::Error;
@@ -199,11 +199,22 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
     /// Limits how many `GetBlockRange` and `GetBlockRangeNullifiers` streams
     /// this adapter and its clones serve at once.
     ///
-    /// A request past the limit fails with `RESOURCE_EXHAUSTED` before any
-    /// read. The default is [`DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS`].
+    /// A request past the limit waits for a slot before any read, and fails
+    /// with `UNAVAILABLE` when none returns in time. The default is
+    /// [`DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS`].
     #[must_use]
     pub fn with_max_concurrent_block_range_streams(mut self, max_streams: NonZeroU32) -> Self {
-        self.block_range_streams = BlockRangeStreamLimit::new(max_streams);
+        self.block_range_streams = BlockRangeStreamLimit::new(max_streams)
+            .with_max_wait(self.block_range_streams.max_wait());
+        self
+    }
+
+    /// Sets how long a block-range request past the limit waits for a slot
+    /// before it fails with `UNAVAILABLE`. The default is
+    /// [`crate::DEFAULT_BLOCK_RANGE_ADMISSION_WAIT`].
+    #[must_use]
+    pub fn with_block_range_admission_wait(mut self, max_wait: Duration) -> Self {
+        self.block_range_streams = self.block_range_streams.with_max_wait(max_wait);
         self
     }
 
@@ -659,7 +670,7 @@ where
         let block_range_request = request.into_inner();
         let pool_selection = pool_selection_from_request(&block_range_request.pool_types)?;
         let (block_range, is_descending) = block_range_from_request(&block_range_request)?;
-        let stream_slot = self.block_range_streams.try_open()?;
+        let stream_slot = self.block_range_streams.open().await?;
         let chain_view = self.entry_chain_view().await?;
         reject_future_block_height(block_range.end, chain_view.visible_tip_height)?;
         Ok(Response::new(
@@ -686,7 +697,7 @@ where
     ) -> Result<Response<Self::GetBlockRangeNullifiersStream>, Status> {
         let block_range_request = request.into_inner();
         let (block_range, is_descending) = block_range_from_request(&block_range_request)?;
-        let stream_slot = self.block_range_streams.try_open()?;
+        let stream_slot = self.block_range_streams.open().await?;
         let chain_view = self.entry_chain_view().await?;
         reject_future_block_height(block_range.end, chain_view.visible_tip_height)?;
         Ok(Response::new(

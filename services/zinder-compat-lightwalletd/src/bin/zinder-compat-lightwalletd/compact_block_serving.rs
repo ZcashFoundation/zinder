@@ -721,7 +721,8 @@ impl CompactBlockAdapter {
         mut self,
         max_streams: NonZeroU32,
     ) -> Self {
-        self.block_range_streams = BlockRangeStreamLimit::new(max_streams);
+        self.block_range_streams = BlockRangeStreamLimit::new(max_streams)
+            .with_max_wait(self.block_range_streams.max_wait());
         self
     }
 
@@ -863,7 +864,7 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlockAdapter {
             BlockHeightRange::inclusive(start, end)
         };
         let pool_selection = pool_selection_from_request(&request.pool_types)?;
-        let stream_slot = self.block_range_streams.try_open()?;
+        let stream_slot = self.block_range_streams.open().await?;
         let reader = self.reader();
         let epoch = reader.chain_epoch().map_err(store_status)?;
         if range.end > epoch.visible_tip_height {
@@ -3270,13 +3271,13 @@ mod tests {
         Ok(())
     }
 
-    /// Compact-blocks serving refuses a block-range stream past the
-    /// process-wide limit with `RESOURCE_EXHAUSTED`, after it rejects a
-    /// malformed request.
+    /// Compact-blocks serving refuses a block-range stream that waited past
+    /// its admission wait with `UNAVAILABLE`, after it rejects a malformed
+    /// request.
     ///
     /// A stream wider than one chunk keeps its slot while its reader runs.
     /// Once the client drops the stream, the slot returns when the reader
-    /// stops.
+    /// stops, and a waiting request takes it.
     #[tokio::test]
     async fn block_range_streams_past_the_limit_are_refused_until_a_slot_returns()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -3292,6 +3293,7 @@ mod tests {
             .adapter
             .clone()
             .with_max_concurrent_block_range_streams(std::num::NonZeroU32::MIN);
+        let impatient = impatient_clone(&adapter);
 
         let mut stream = adapter
             .get_block_range(Request::new(block_range(1, TIP_HEIGHT)))
@@ -3299,12 +3301,12 @@ mod tests {
             .into_inner();
         let mut blocks = Vec::new();
         read_blocks(&mut stream, &mut blocks, 1).await?;
-        let refused = adapter
+        let refused = impatient
             .get_block_range(Request::new(block_range(1, 4)))
             .await;
         assert_eq!(
             refused.err().map(|status| status.code()),
-            Some(Code::ResourceExhausted)
+            Some(Code::Unavailable)
         );
         // A malformed request is rejected before it takes a slot.
         let malformed = adapter
@@ -3320,36 +3322,38 @@ mod tests {
 
         drop(stream);
         // The test runtime has one thread, so the reader of later chunks has
-        // not run since the stream was dropped. It still holds the slot.
-        let held = adapter
-            .get_block_range(Request::new(block_range(1, 4)))
-            .await;
-        assert_eq!(
-            held.err().map(|status| status.code()),
-            Some(Code::ResourceExhausted),
+        // not run since the stream was dropped. It still holds the slot, so
+        // the next request waits until the reader stops.
+        // Admission takes a free slot on its first poll, so a pending first
+        // poll shows that the slot is still taken, without yielding to the
+        // reader.
+        let mut admission = Box::pin(adapter.block_range_streams.open());
+        assert!(
+            poll_once(&mut admission).is_pending(),
             "the reader of a dropped stream must keep its slot until it stops"
         );
-        let admitted = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match adapter
-                    .get_block_range(Request::new(block_range(1, 4)))
-                    .await
-                {
-                    Ok(response) => return Ok(response.into_inner()),
-                    Err(status) if status.code() == Code::ResourceExhausted => {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                    Err(status) => return Err(status),
-                }
-            }
-        })
-        .await??;
+        drop(admission);
+        let next = adapter.get_block_range(Request::new(block_range(1, 4)));
+        let admitted = tokio::time::timeout(Duration::from_secs(10), next)
+            .await??
+            .into_inner();
         let mut admitted = admitted;
         let mut short_blocks = Vec::new();
         read_blocks(&mut admitted, &mut short_blocks, usize::MAX).await?;
         assert_linked_from_genesis(&short_blocks, 4);
         drop(admitted);
         harness.stop().await
+    }
+
+    /// Returns a clone of `adapter` that shares its block-range slots but
+    /// waits only briefly for one, so a test can observe a refusal quickly.
+    fn impatient_clone(adapter: &CompactBlockAdapter) -> CompactBlockAdapter {
+        let mut impatient = adapter.clone();
+        impatient.block_range_streams = impatient
+            .block_range_streams
+            .clone()
+            .with_max_wait(Duration::from_millis(50));
+        impatient
     }
 
     /// Polls `call` once, so a test can cancel it where it first waits.
@@ -3405,12 +3409,9 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        let refused = poll_once(&mut adapter.get_block_range(Request::new(block_range(1, 4))));
+        let mut waiting = adapter.get_block_range(Request::new(block_range(1, 4)));
         assert!(
-            matches!(
-                &refused,
-                std::task::Poll::Ready(Err(status)) if status.code() == Code::ResourceExhausted
-            ),
+            poll_once(&mut waiting).is_pending(),
             "a request cancelled during its first read must keep its slot while the read runs"
         );
         assert_eq!(
@@ -3421,21 +3422,9 @@ mod tests {
 
         let _ = release_gate.send(());
         gate_thread.await?;
-        let mut admitted = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match adapter
-                    .get_block_range(Request::new(block_range(1, 4)))
-                    .await
-                {
-                    Ok(response) => return Ok(response.into_inner()),
-                    Err(status) if status.code() == Code::ResourceExhausted => {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                    Err(status) => return Err(status),
-                }
-            }
-        })
-        .await??;
+        let mut admitted = tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await??
+            .into_inner();
         assert_eq!(
             generation.strong_count(),
             1,

@@ -453,6 +453,16 @@ async fn get_block_range_streams_windows_wider_than_one_store_read() -> eyre::Re
     Ok(())
 }
 
+/// Returns how many slot-wait samples `rendered` holds for `outcome`.
+fn slot_wait_samples(rendered: &str, outcome: &str) -> Option<u64> {
+    let series = format!(
+        "zinder_compat_block_range_slot_wait_duration_seconds_count{{outcome=\"{outcome}\"}} "
+    );
+    rendered
+        .lines()
+        .find_map(|line| line.strip_prefix(series.as_str())?.parse::<u64>().ok())
+}
+
 /// Returns how many samples `rendered` holds for the block-range `stage`.
 fn block_range_stage_samples(rendered: &str, stage: &str) -> Option<u64> {
     let series =
@@ -1212,6 +1222,10 @@ async fn byte_capped_chunks_keep_the_hash_link_at_every_chunk_edge() -> eyre::Re
     Ok(())
 }
 
+/// Admission wait of the adapters that test refusals: long enough for a
+/// request to queue, short enough to keep the tests fast.
+const REFUSAL_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Opens `GetBlockRange` streams until one is admitted, for up to ten
 /// seconds, and returns how the last attempt ended.
 async fn wait_for_block_range_slot<QueryApi>(
@@ -1228,8 +1242,7 @@ where
         {
             Ok(_) => return Ok(()),
             Err(status)
-                if status.code() == Code::ResourceExhausted
-                    && tokio::time::Instant::now() < deadline =>
+                if status.code() == Code::Unavailable && tokio::time::Instant::now() < deadline =>
             {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -1238,8 +1251,8 @@ where
     }
 }
 
-/// The process-wide limit refuses a block-range stream past its slots with
-/// `RESOURCE_EXHAUSTED`.
+/// The process-wide limit refuses a block-range stream that waited past its
+/// admission wait with `UNAVAILABLE`.
 ///
 /// A slot returns when its stream ends, when its request fails, and when the
 /// client drops a stream partway through.
@@ -1249,11 +1262,12 @@ async fn block_range_streams_past_the_limit_are_refused_until_a_slot_returns() -
     let recorder = EpochPinRecorder::new(store_fixture.query())
         .with_synthetic_compact_blocks_to(BlockHeight::new(2_500));
     let adapter = LightwalletdGrpcAdapter::new(recorder.clone())
-        .with_max_concurrent_block_range_streams(NonZeroU32::MIN);
+        .with_max_concurrent_block_range_streams(NonZeroU32::MIN)
+        .with_block_range_admission_wait(REFUSAL_WAIT);
     let assert_refused = |outcome: Result<_, Status>| {
         assert_eq!(
             outcome.err().map(|status| status.code()),
-            Some(Code::ResourceExhausted),
+            Some(Code::Unavailable),
             "a stream past the limit must be refused"
         );
     };
@@ -1316,7 +1330,8 @@ async fn malformed_block_range_requests_are_rejected_before_the_stream_limit() -
     let recorder = EpochPinRecorder::new(store_fixture.query())
         .with_synthetic_compact_blocks_to(BlockHeight::new(2_500));
     let adapter = LightwalletdGrpcAdapter::new(recorder)
-        .with_max_concurrent_block_range_streams(NonZeroU32::MIN);
+        .with_max_concurrent_block_range_streams(NonZeroU32::MIN)
+        .with_block_range_admission_wait(REFUSAL_WAIT);
     let open_stream = adapter
         .get_block_range(Request::new(block_range_request(1, 10)))
         .await?;
@@ -1326,7 +1341,7 @@ async fn malformed_block_range_requests_are_rejected_before_the_stream_limit() -
             .await
             .err()
             .map(|status| status.code()),
-        Some(Code::ResourceExhausted),
+        Some(Code::Unavailable),
         "the open stream takes the only slot"
     );
 
@@ -1377,7 +1392,8 @@ async fn a_dropped_block_range_stream_keeps_its_slot_until_its_reader_stops() ->
         .with_synthetic_compact_blocks_to(BlockHeight::new(2_500))
         .with_later_chunk_gate(Arc::clone(&later_chunk_gate));
     let adapter = LightwalletdGrpcAdapter::new(recorder)
-        .with_max_concurrent_block_range_streams(NonZeroU32::MIN);
+        .with_max_concurrent_block_range_streams(NonZeroU32::MIN)
+        .with_block_range_admission_wait(REFUSAL_WAIT);
 
     let wide = adapter
         .get_block_range(Request::new(block_range_request(1, 2_500)))
@@ -1392,7 +1408,7 @@ async fn a_dropped_block_range_stream_keeps_its_slot_until_its_reader_stops() ->
             .await
             .err()
             .map(|status| status.code()),
-        Some(Code::ResourceExhausted),
+        Some(Code::Unavailable),
         "the reader of a dropped stream must keep its slot while it reads"
     );
 
@@ -1415,7 +1431,8 @@ async fn a_request_cancelled_during_its_first_read_keeps_its_slot_until_the_read
         .with_synthetic_compact_blocks_to(BlockHeight::new(2_500))
         .with_first_chunk_gate(first_chunk_gate.clone());
     let adapter = LightwalletdGrpcAdapter::new(recorder.clone())
-        .with_max_concurrent_block_range_streams(NonZeroU32::MIN);
+        .with_max_concurrent_block_range_streams(NonZeroU32::MIN)
+        .with_block_range_admission_wait(REFUSAL_WAIT);
 
     let mut cancelled = adapter.get_block_range(Request::new(block_range_request(1, 2_500)));
     tokio::select! {
@@ -1435,7 +1452,7 @@ async fn a_request_cancelled_during_its_first_read_keeps_its_slot_until_the_read
             .await
             .err()
             .map(|status| status.code()),
-        Some(Code::ResourceExhausted),
+        Some(Code::Unavailable),
         "a request cancelled during its first read must keep its slot while the read runs"
     );
     assert!(
@@ -1457,14 +1474,19 @@ async fn a_request_cancelled_during_its_first_read_keeps_its_slot_until_the_read
 }
 
 /// A client that disconnects in the middle of a stream returns its slot, and
-/// the refusal reaches a generated client as `RESOURCE_EXHAUSTED`.
+/// the refusal reaches a generated client as `UNAVAILABLE`.
 #[tokio::test]
 async fn a_disconnected_client_returns_its_block_range_stream_slot() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture()?;
+    // The gate holds the stream's later chunks, so the stream keeps its slot
+    // until the test opens the gate.
+    let later_chunk_gate = Arc::new(tokio::sync::Semaphore::new(0));
     let recorder = EpochPinRecorder::new(store_fixture.query())
-        .with_synthetic_compact_blocks_to(BlockHeight::new(5_000));
+        .with_synthetic_compact_blocks_to(BlockHeight::new(5_000))
+        .with_later_chunk_gate(Arc::clone(&later_chunk_gate));
     let adapter = LightwalletdGrpcAdapter::new(recorder)
-        .with_max_concurrent_block_range_streams(NonZeroU32::MIN);
+        .with_max_concurrent_block_range_streams(NonZeroU32::MIN)
+        .with_block_range_admission_wait(REFUSAL_WAIT);
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server_addr = listener.local_addr()?;
     let server = adapter.clone().into_server();
@@ -1493,16 +1515,145 @@ async fn a_disconnected_client_returns_its_block_range_stream_slot() -> eyre::Re
         .await;
     assert_eq!(
         refused.err().map(|status| status.code()),
-        Some(Code::ResourceExhausted)
+        Some(Code::Unavailable)
     );
 
     drop(wide);
     drop(syncing_wallet);
+    later_chunk_gate.add_permits(1);
     wait_for_block_range_slot(&adapter).await?;
     let admitted = other_wallet
         .get_block_range(block_range_request(1, 10))
         .await?
         .into_inner();
+    drop(admitted);
+
+    let _ = shutdown_tx.send(());
+    server_handle.await??;
+    Ok(())
+}
+
+/// A request past the limit waits for a slot instead of failing, and is
+/// admitted as soon as the stream holding the slot ends.
+#[tokio::test]
+async fn a_block_range_request_past_the_limit_waits_for_the_next_slot() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let recorder = EpochPinRecorder::new(store_fixture.query())
+        .with_synthetic_compact_blocks_to(BlockHeight::new(2_500));
+    let adapter = LightwalletdGrpcAdapter::new(recorder)
+        .with_max_concurrent_block_range_streams(NonZeroU32::MIN);
+    let open_stream = adapter
+        .get_block_range(Request::new(block_range_request(1, 10)))
+        .await?
+        .into_inner();
+
+    let waiting = tokio::spawn({
+        let adapter = adapter.clone();
+        async move {
+            let stream = adapter
+                .get_block_range(Request::new(block_range_request(11, 20)))
+                .await?
+                .into_inner();
+            collect_stream(stream).await
+        }
+    });
+    tokio::time::sleep(REFUSAL_WAIT).await;
+    assert!(
+        !waiting.is_finished(),
+        "a request past the limit must wait for a slot"
+    );
+
+    collect_stream(open_stream).await?;
+    let blocks = waiting.await??;
+    assert_eq!(
+        blocks.iter().map(|block| block.height).collect::<Vec<_>>(),
+        (11..=20).collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+/// A client that disconnects while its block-range request waits for a slot
+/// gives back its place in the queue.
+///
+/// One slot admits one waiter. If the disconnected request still waited, the
+/// next request would find the queue full and fail at once.
+#[tokio::test]
+async fn a_disconnected_waiting_client_gives_back_its_place_in_the_queue() -> eyre::Result<()> {
+    let metrics_recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = metrics_recorder.handle();
+    // The test runtime runs the server on this thread too, so the local
+    // recorder sees the server's admission metrics.
+    let _recorder_guard = metrics::set_default_local_recorder(&metrics_recorder);
+    let store_fixture = acceptance_store_fixture()?;
+    // The gate holds the stream's later chunks, so the stream keeps its slot
+    // until the test opens the gate.
+    let later_chunk_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let recorder = EpochPinRecorder::new(store_fixture.query())
+        .with_synthetic_compact_blocks_to(BlockHeight::new(5_000))
+        .with_later_chunk_gate(Arc::clone(&later_chunk_gate));
+    let adapter = LightwalletdGrpcAdapter::new(recorder)
+        .with_max_concurrent_block_range_streams(NonZeroU32::MIN);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let server_addr = listener.local_addr()?;
+    let server = adapter.clone().into_server();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server_handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(server)
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+    let endpoint = format!("http://{server_addr}");
+
+    let mut syncing_wallet = CompactTxStreamerClient::connect(endpoint.clone()).await?;
+    let mut open_stream = syncing_wallet
+        .get_block_range(block_range_request(1, 5_000))
+        .await?
+        .into_inner();
+    assert!(open_stream.message().await?.is_some());
+    let waiting_wallet = tokio::spawn({
+        let endpoint = endpoint.clone();
+        async move {
+            let mut client = CompactTxStreamerClient::connect(endpoint).await?;
+            client.get_block_range(block_range_request(1, 10)).await?;
+            Ok::<_, eyre::Report>(())
+        }
+    });
+    tokio::time::sleep(REFUSAL_WAIT).await;
+    assert!(!waiting_wallet.is_finished(), "the second wallet must wait");
+    waiting_wallet.abort();
+    assert!(
+        waiting_wallet
+            .await
+            .is_err_and(|error| error.is_cancelled())
+    );
+    // The server records the cancelled wait when it drops the waiting
+    // request, in the same step that gives back its place.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while slot_wait_samples(&metrics_handle.render(), "cancelled") != Some(1) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+
+    let mut next_wallet = CompactTxStreamerClient::connect(endpoint).await?;
+    let next_request = tokio::spawn(async move {
+        next_wallet
+            .get_block_range(block_range_request(11, 20))
+            .await
+            .map(tonic::Response::into_inner)
+    });
+    tokio::time::sleep(REFUSAL_WAIT).await;
+    assert!(
+        !next_request.is_finished(),
+        "the next request must wait in the place the disconnected one gave back"
+    );
+    drop(open_stream);
+    drop(syncing_wallet);
+    later_chunk_gate.add_permits(1);
+    let admitted = next_request.await??;
     drop(admitted);
 
     let _ = shutdown_tx.send(());
@@ -1517,7 +1668,8 @@ async fn the_default_block_range_stream_limit_serves_wallet_syncs() -> eyre::Res
     let store_fixture = acceptance_store_fixture()?;
     let recorder = EpochPinRecorder::new(store_fixture.query())
         .with_synthetic_compact_blocks_to(BlockHeight::new(5_000));
-    let adapter = LightwalletdGrpcAdapter::new(recorder);
+    let adapter =
+        LightwalletdGrpcAdapter::new(recorder).with_block_range_admission_wait(REFUSAL_WAIT);
 
     for start in (1_u64..=5_000).step_by(1_000) {
         let request = block_range_request(start, start + 999);
@@ -1546,7 +1698,7 @@ async fn the_default_block_range_stream_limit_serves_wallet_syncs() -> eyre::Res
             .await
             .err()
             .map(|status| status.code()),
-        Some(Code::ResourceExhausted)
+        Some(Code::Unavailable)
     );
     drop(open_streams);
     wait_for_block_range_slot(&adapter).await?;
