@@ -23,7 +23,7 @@ Allocation is the other half. Explorer view replay reads canonical data on up to
 4. **Metadata is charged to the cache.** Every column family, including each store's default family, reads through the bounded block cache, and index and filter blocks count against it.
 5. **One cache per store per process.** A process that keeps several secondaries of one store open shares one block cache of the configured size among them. The canonical and wallet stores keep separate caches. The cache stays non-strict, so one generation's pinned blocks cannot fail another generation's catch-up.
 6. **Pressure means non-reclaimable memory.** Throttling of rebuildable work, such as materialized-view replay, uses anonymous memory against the cgroup limit, not working set.
-7. **Slow catch-up is lag, not failure.** A reader's startup catch-up is bounded by `storage.initial_catchup_timeout_ms`. A reader still behind then starts, and readiness reports the lag.
+7. **Startup catch-up is bounded, and later lag is not a failure.** A wallet-serving reader waits up to `storage.initial_catchup_timeout_ms` to admit its first serving pair. If it cannot, it exits before it opens its public or ops listeners, so `/readyz` does not exist yet and the supervisor restarts it. After the first pair is published, a reader that falls behind keeps running, and readiness reports the lag.
 8. **Service binaries allocate through jemalloc on Linux.** `zinder-runtime` links jemalloc with unprefixed symbols, so RocksDB's C allocations use it too, and every service binary installs it as the Rust global allocator. Operators tune it through `MALLOC_CONF`. Release builds fix jemalloc's page size and address width so one binary runs on every supported kernel. Other platforms keep the system allocator.
 
 [Storage backend](../architecture/storage-backend.md) describes the budget, its defaults, and the fixed RocksDB options. [Configuration](../reference/configuration.md) lists the budget keys.
@@ -40,7 +40,8 @@ Allocation is the other half. Explorer view replay reads canonical data on up to
 
 - **A direct-I/O toggle.** Automatic detection with buffered fallback keeps the same invariant, and a toggle adds a way to break it.
 - **Only block-cache and open-file caps.** They bound RocksDB's own memory but not the page cache that buffered reads fill.
-- **Failing startup when catch-up is slow.** Replica lag is a readiness condition, not a liveness failure.
+- **Exiting when a published reader falls behind.** After the first pair, replica lag is a readiness condition, not a liveness failure. Only the first admission has a deadline, because a reader with no pair has nothing to serve.
+- **Waiting without a deadline for the first pair.** A reader that can never converge would stay silent, with no listener to report why.
 - **Dividing a reader budget among generations.** Each generation would cache its own copy of the same blocks, and the current pair would get a fraction of the configured cache.
 - **One cache for the canonical and wallet stores.** One store's scans would evict the other's index and filter blocks, and the two budgets would lose their meaning.
 - **Removing the arena cap from deployments.** Replay recovers, but throughput would still depend on a variable that operators set for unrelated reasons.
