@@ -32,9 +32,10 @@ for function_name in \
   writer_node_outage_behind_syncing_ingest \
   readiness_body_height \
   update_node_unreachable_outage \
-  query_unready_behind_projector_park \
+  reader_unready_behind_projector_park \
+  wallet_reader_names \
   start_wallet_serving \
-  require_projector_park_for_stopped_query \
+  require_projector_park_for_stopped_readers \
   classify_probe_failure \
   probe_readiness \
   observe_plane_readiness \
@@ -46,7 +47,9 @@ for function_name in \
   zinder_setting \
   zinder_fallback_positions \
   require_fallback_indexer_endpoints \
-  require_known_entrypoint_settings; do
+  require_known_entrypoint_settings \
+  resolve_lightwalletd_setting \
+  require_distinct_reader_secondaries; do
   definition="$(entrypoint_function "$function_name")"
   [ -n "$definition" ] || test_failure "entrypoint no longer defines $function_name"
   eval "$definition"
@@ -61,7 +64,9 @@ entrypoint_setting() {
 ingest_config_paths="$(entrypoint_setting ingest_config_paths)"
 projector_config_paths="$(entrypoint_setting projector_config_paths)"
 query_config_paths="$(entrypoint_setting query_config_paths)"
+compat_config_paths="$(entrypoint_setting compat_config_paths)"
 entrypoint_config_paths="$(entrypoint_setting entrypoint_config_paths)"
+compat_ops_addr="$(entrypoint_setting compat_ops_addr)"
 recurrence_clear_window_seconds="$(entrypoint_setting recurrence_clear_window_seconds)"
 recurrence_episode_budget="$(entrypoint_setting recurrence_episode_budget)"
 recurrence_cumulative_unready_seconds_budget="$(
@@ -74,7 +79,7 @@ serving_unready_tolerance_seconds="$(entrypoint_setting serving_unready_toleranc
 node_unreachable_tolerance_seconds="$(entrypoint_setting node_unreachable_tolerance_seconds)"
 for shipped_setting in \
   "$ingest_config_paths" "$projector_config_paths" "$query_config_paths" \
-  "$entrypoint_config_paths" \
+  "$compat_config_paths" "$entrypoint_config_paths" "$compat_ops_addr" \
   "$recurrence_clear_window_seconds" "$recurrence_episode_budget" \
   "$recurrence_cumulative_unready_seconds_budget" \
   "$recurrence_min_answered_episode_seconds" \
@@ -91,6 +96,7 @@ probe_halted=0
 probe_parked=0
 probe_upstream_outage=0
 probe_node_unreachable=0
+lightwalletd_enabled=1
 response_separator='
 '
 
@@ -226,72 +232,121 @@ await_readiness zinder-projector 127.0.0.1:9110 60 \
 [ -z "$fail_message" ] || test_failure "startup failed on a parked projector: $fail_message"
 [ "$sleep_count" -eq 0 ] || test_failure "startup waited on a parked projector"
 
-# Query's startup cannot converge a serving pair behind a parked projector and
-# would exit, restarting the container into the same park, so startup leaves
-# query stopped when the projector's startup wait ended on the park. The
-# subshell keeps the process stand-in and its state out of the rest of this
-# test.
+# A reader's startup cannot converge a serving pair behind a parked projector
+# and would exit, restarting the container into the same park, so startup
+# leaves both readers stopped when the projector's startup wait ended on the
+# park. Otherwise query and compatibility start together, unless compatibility
+# is turned off. The subshell keeps the process stand-in and its state out of
+# the rest of this test.
 (
   query_ops_addr=127.0.0.1:9106
   wallet_serving_deadline_seconds=60
   started_binaries=""
-  # The evaluated start_wallet_serving calls this stand-in.
+  awaited_phase_starts=""
+  # The evaluated start_wallet_serving calls these stand-ins.
   # shellcheck disable=SC2329
   start_runtime_process() {
     started_binaries="$started_binaries ${1##*/}"
     : &
   }
+  # shellcheck disable=SC2329
+  await_readiness() {
+    awaited_phase_starts="$awaited_phase_starts $1@$4"
+  }
 
   query_pid=""
+  compat_pid=""
   projector_park_reported=0
   serve 503 "$parked_body"
   probe_readiness 127.0.0.1:9110
   start_wallet_serving || test_failure "startup failed behind a parked projector: $fail_message"
-  [ -z "$started_binaries" ] || test_failure "zinder-query started behind a parked projector"
-  [ -z "$query_pid" ] || test_failure "startup recorded a query process behind a parked projector"
+  [ -z "$started_binaries" ] || test_failure "'$started_binaries' started behind a parked projector"
+  [ -z "$query_pid$compat_pid" ] || test_failure "startup recorded a reader process behind a parked projector"
   [ "$projector_park_reported" -eq 1 ] \
     || test_failure "the serving loop would report the park startup already logged"
 
   serve 200 "$ready_body"
   probe_readiness 127.0.0.1:9110
-  sleep_count=0
-  fail_message=""
   start_wallet_serving || test_failure "startup failed behind a ready projector: $fail_message"
-  [ "$started_binaries" = " zinder-query" ] \
+  [ "$started_binaries" = " zinder-query zinder-compat-lightwalletd" ] \
     || test_failure "startup started '$started_binaries' behind a ready projector"
-  [ -n "$query_pid" ] || test_failure "startup did not record the query process"
+  [ -n "$query_pid" ] && [ -n "$compat_pid" ] \
+    || test_failure "startup did not record both reader processes"
+  # Both waits measure the one serving deadline from the same start.
+  case "$awaited_phase_starts" in
+    " zinder-query@"[0-9]*" zinder-compat-lightwalletd@"[0-9]*)
+      query_phase_start="${awaited_phase_starts#* zinder-query@}"
+      query_phase_start="${query_phase_start%% *}"
+      [ "$awaited_phase_starts" = " zinder-query@$query_phase_start zinder-compat-lightwalletd@$query_phase_start" ] \
+        || test_failure "the readers' serving deadlines started apart: '$awaited_phase_starts'"
+      ;;
+    *) test_failure "startup awaited '$awaited_phase_starts' instead of both readers" ;;
+  esac
+  wait
+
+  lightwalletd_enabled=0
+  started_binaries=""
+  awaited_phase_starts=""
+  query_pid=""
+  compat_pid=""
+  start_wallet_serving || test_failure "startup failed without compatibility: $fail_message"
+  [ "$started_binaries" = " zinder-query" ] \
+    || test_failure "startup started '$started_binaries' with compatibility turned off"
+  [ -z "$compat_pid" ] || test_failure "startup recorded a compatibility process it turned off"
   wait
 )
 
-# Query that startup left stopped counts as serving while the projector
+# A plane awaited against a serving deadline that started earlier fails once
+# that shared deadline passes, without spending a fresh one.
+serve 503 "$syncing_body"
+deadline_message="$(
+  # The evaluated await_readiness calls these stand-ins.
+  # shellcheck disable=SC2329
+  fail() {
+    printf '%s' "$*"
+    exit 0
+  }
+  # shellcheck disable=SC2329
+  sleep_interruptibly() {
+    printf 'waited'
+    exit 0
+  }
+  await_readiness zinder-compat-lightwalletd "$compat_ops_addr" 60 "$(($(date +%s) - 60))"
+)"
+case "$deadline_message" in
+  "zinder-compat-lightwalletd stayed unready for 60s:"*) ;;
+  *) test_failure "a reader past the shared serving deadline did not fail at once: '$deadline_message'" ;;
+esac
+
+# Readers that startup left stopped count as serving while the projector
 # reports the park or stops answering, and the container restarts once the
 # projector answers with any other state.
 fail_message=""
-require_projector_park_for_stopped_query 1 0 "$parked_body" \
-  || test_failure "a parked projector must keep query stopped: $fail_message"
-require_projector_park_for_stopped_query 0 1 "unreachable" \
+require_projector_park_for_stopped_readers 1 0 "$parked_body" \
+  || test_failure "a parked projector must keep the readers stopped: $fail_message"
+require_projector_park_for_stopped_readers 0 1 "unreachable" \
   || test_failure "an unreachable projector must not restart the container: $fail_message"
-[ -z "$fail_message" ] || test_failure "a stopped query failed the container: $fail_message"
-require_projector_park_for_stopped_query 0 0 "$syncing_body" || true
+[ -z "$fail_message" ] || test_failure "stopped readers failed the container: $fail_message"
+require_projector_park_for_stopped_readers 0 0 "$syncing_body" || true
 case "$fail_message" in
-  *"no longer reports the wallet transition park"*syncing*) ;;
-  *) test_failure "a projector that left the park kept query stopped: '$fail_message'" ;;
+  *"no longer reports the wallet transition park"*zinder-compat-lightwalletd*syncing*) ;;
+  *) test_failure "a projector that left the park kept the readers stopped: '$fail_message'" ;;
 esac
 
-# In the serving loop, an answered query refusal counts as serving while the
+# In the serving loop, an answered reader refusal counts as serving while the
 # projector is parked, and only then.
 serve 503 "$lagging_body"
 if observe_plane_readiness zinder-query 127.0.0.1:9106; then
   test_failure "a lagging query plane must count as unready on its own"
 fi
-query_unready_behind_projector_park 1 \
-  || test_failure "an answered query refusal behind a parked projector must count as serving"
-if query_unready_behind_projector_park 0; then
-  test_failure "a query refusal without a parked projector must stay unready"
+reader_unready_behind_projector_park 1 \
+  || test_failure "an answered reader refusal behind a parked projector must count as serving"
+if reader_unready_behind_projector_park 0; then
+  test_failure "a reader refusal without a parked projector must stay unready"
 fi
 probe_http_status=""
-if query_unready_behind_projector_park 1; then
-  test_failure "an unreachable query plane must stay unready behind a parked projector"
+if reader_unready_behind_projector_park 1; then
+  test_failure "an unreachable reader plane must stay unready behind a parked projector"
 fi
 
 # The park excuses only query: an unready ingest plane observed while the
@@ -577,9 +632,62 @@ esac
 fail_message=""
 ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE_SECONDS=86400 \
   ZINDER_WALLET_SERVING__WALLET_CONSTRUCTION_DEADLINE_SECONDS=43200 \
+  ZINDER_WALLET_SERVING__LIGHTWALLETD=false \
   require_known_entrypoint_settings || true
 [ -z "$fail_message" ] \
   || test_failure "documented entrypoint settings were rejected: $fail_message"
+
+# Compatibility runs unless the setting is false; only true and false, in any
+# letter case, are accepted.
+for lightwalletd_value in true TRUE True; do
+  lightwalletd_enabled=0
+  fail_message=""
+  resolve_lightwalletd_setting "$lightwalletd_value" || true
+  [ -z "$fail_message" ] && [ "$lightwalletd_enabled" -eq 1 ] \
+    || test_failure "ZINDER_WALLET_SERVING__LIGHTWALLETD=$lightwalletd_value did not turn compatibility on"
+done
+for lightwalletd_value in false FALSE False; do
+  lightwalletd_enabled=1
+  fail_message=""
+  resolve_lightwalletd_setting "$lightwalletd_value" || true
+  [ -z "$fail_message" ] && [ "$lightwalletd_enabled" -eq 0 ] \
+    || test_failure "ZINDER_WALLET_SERVING__LIGHTWALLETD=$lightwalletd_value did not turn compatibility off"
+done
+for lightwalletd_value in "" 0 1 no off yes; do
+  fail_message=""
+  resolve_lightwalletd_setting "$lightwalletd_value" || true
+  case "$fail_message" in
+    "ZINDER_WALLET_SERVING__LIGHTWALLETD must be true or false"*) ;;
+    *) test_failure "ZINDER_WALLET_SERVING__LIGHTWALLETD='$lightwalletd_value' was accepted" ;;
+  esac
+done
+lightwalletd_enabled=1
+
+# A secondary path variable reaches both readers, which must not share a
+# secondary root, so it is refused while compatibility runs.
+fail_message=""
+ZINDER_STORAGE__SECONDARY_PATH=/var/lib/zinder/shared-secondary \
+  require_distinct_reader_secondaries || true
+case "$fail_message" in
+  "ZINDER_STORAGE__SECONDARY_PATH would give zinder-query and zinder-compat-lightwalletd the same secondary root"*) ;;
+  *) test_failure "a canonical secondary path was accepted with both readers running: '$fail_message'" ;;
+esac
+fail_message=""
+ZINDER_Wallet__Secondary_Path=/var/lib/zinder/shared-secondary \
+  require_distinct_reader_secondaries || true
+case "$fail_message" in
+  "ZINDER_WALLET__SECONDARY_PATH would give zinder-query and zinder-compat-lightwalletd the same secondary root"*) ;;
+  *) test_failure "a mixed-case wallet secondary path was accepted with both readers running: '$fail_message'" ;;
+esac
+fail_message=""
+lightwalletd_enabled=0
+ZINDER_STORAGE__SECONDARY_PATH=/var/lib/zinder/query/canonical-secondary \
+  require_distinct_reader_secondaries \
+  || test_failure "a secondary path was refused with compatibility turned off: $fail_message"
+lightwalletd_enabled=1
+require_distinct_reader_secondaries \
+  || test_failure "the readers' own secondary roots were refused: $fail_message"
+[ -z "$fail_message" ] || test_failure "the secondary guard failed without a path variable: $fail_message"
 
 # Every fallback node endpoint needs its indexer stream, as [node] does; a
 # position is configured by any of its variables.
@@ -644,7 +752,10 @@ chmod +x "$scoping_root/bin/setpriv"
   export ZINDER_PROJECTOR__BUILD__MAX_TEMPORARY_FILE_BYTES_PER_SORTER=128849018880
   export ZINDER_WALLET__ROCKSDB__MAX_OPEN_FILES=64
   export ZINDER_QUERY__PAIR_CONVERGENCE_ATTEMPTS=8
+  export ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS=40
+  export ZINDER_COMPAT__PING_VERY_INSECURE=false
   export ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE_SECONDS=86400
+  export ZINDER_WALLET_SERVING__LIGHTWALLETD=true
   export ZINDER_EXPLORER__LISTEN_ADDR=127.0.0.1:9068
   export INGEST_CONTROL_BEARER_TOKEN=fixture-token
   export CHECKPOINT_BEARER_TOKEN=fixture-token
@@ -655,6 +766,9 @@ chmod +x "$scoping_root/bin/setpriv"
     /usr/local/bin/zinder-projector /etc/zinder/projector.toml "$projector_config_paths"
   PATH="$stub_path" start_runtime_process \
     /usr/local/bin/zinder-query /etc/zinder/query.toml "$query_config_paths"
+  PATH="$stub_path" start_runtime_process \
+    /usr/local/bin/zinder-compat-lightwalletd /etc/zinder/compat-lightwalletd.toml \
+    "$compat_config_paths"
   wait
 )
 
@@ -662,7 +776,7 @@ chmod +x "$scoping_root/bin/setpriv"
 assert_received_by() {
   variable_name="$1"
   shift
-  for process_name in zinder-ingest zinder-projector zinder-query; do
+  for process_name in zinder-ingest zinder-projector zinder-query zinder-compat-lightwalletd; do
     received_file="$scoping_root/received/$process_name"
     [ -f "$received_file" ] || test_failure "$process_name did not start"
     expected=0
@@ -677,20 +791,27 @@ assert_received_by() {
   done
 }
 
-assert_received_by ZINDER_NETWORK__NAME zinder-ingest zinder-projector zinder-query
-assert_received_by ZINDER_NODE__JSON_RPC_ADDR zinder-ingest zinder-query
-assert_received_by ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR zinder-ingest zinder-query
+assert_received_by ZINDER_NETWORK__NAME \
+  zinder-ingest zinder-projector zinder-query zinder-compat-lightwalletd
+assert_received_by ZINDER_NODE__JSON_RPC_ADDR zinder-ingest zinder-query zinder-compat-lightwalletd
+assert_received_by ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR \
+  zinder-ingest zinder-query zinder-compat-lightwalletd
 assert_received_by ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES \
-  zinder-ingest zinder-projector zinder-query
+  zinder-ingest zinder-projector zinder-query zinder-compat-lightwalletd
 assert_received_by ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_OPEN_FILES zinder-ingest
-assert_received_by ZINDER_STORAGE__SERVING_PAIR_STALENESS_CEILING_MS zinder-query
-assert_received_by ZINDER_WALLET__SECONDARY_PATH zinder-query
+assert_received_by ZINDER_STORAGE__SERVING_PAIR_STALENESS_CEILING_MS \
+  zinder-query zinder-compat-lightwalletd
+assert_received_by ZINDER_WALLET__SECONDARY_PATH zinder-query zinder-compat-lightwalletd
 assert_received_by ZINDER_INGEST__FOLLOW__POLL_INTERVAL_MS zinder-ingest
 assert_received_by ZINDER_RETENTION__CHAIN_EVENT_RETENTION_HOURS zinder-ingest
 assert_received_by ZINDER_PROJECTOR__BUILD__MAX_TEMPORARY_FILE_BYTES_PER_SORTER zinder-projector
-assert_received_by ZINDER_WALLET__ROCKSDB__MAX_OPEN_FILES zinder-projector zinder-query
+assert_received_by ZINDER_WALLET__ROCKSDB__MAX_OPEN_FILES \
+  zinder-projector zinder-query zinder-compat-lightwalletd
 assert_received_by ZINDER_QUERY__PAIR_CONVERGENCE_ATTEMPTS zinder-query
+assert_received_by ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS zinder-compat-lightwalletd
+assert_received_by ZINDER_COMPAT__PING_VERY_INSECURE zinder-compat-lightwalletd
 assert_received_by ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE_SECONDS
+assert_received_by ZINDER_WALLET_SERVING__LIGHTWALLETD
 assert_received_by ZINDER_EXPLORER__LISTEN_ADDR
 assert_received_by INGEST_CONTROL_BEARER_TOKEN
 assert_received_by CHECKPOINT_BEARER_TOKEN
@@ -698,15 +819,29 @@ assert_received_by CHECKPOINT_BEARER_TOKEN
 unread_names="$(
   ZINDER_EXPLORER__LISTEN_ADDR=127.0.0.1:9068 \
     ZINDER_WALLET_SERVING__WALLET_CONSTRUCTION_DEADLINE_SECONDS=43200 \
+    ZINDER_WALLET_SERVING__LIGHTWALLETD=true \
     ZINDER_QUERY__PAIR_CONVERGENCE_ATTEMPTS=8 \
+    ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS=40 \
     ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES=64 \
     ZINDER_STORAGE__CANONICAL_PAHT=/misspelled \
     zinder_variables_outside \
-    "$ingest_config_paths $projector_config_paths $query_config_paths $entrypoint_config_paths" \
+    "$ingest_config_paths $projector_config_paths $query_config_paths $compat_config_paths $entrypoint_config_paths" \
     | sort | tr '\n' ' '
 )"
 [ "$unread_names" = "ZINDER_EXPLORER__LISTEN_ADDR ZINDER_STORAGE__CANONICAL_PAHT " ] \
   || test_failure "variables no process reads were reported as '$unread_names'"
+
+# With compatibility turned off, its own settings reach no process, so the
+# entrypoint reports them as unread.
+unread_names="$(
+  ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS=40 \
+    ZINDER_QUERY__PAIR_CONVERGENCE_ATTEMPTS=8 \
+    zinder_variables_outside \
+    "$ingest_config_paths $projector_config_paths $query_config_paths $entrypoint_config_paths" \
+    | sort | tr '\n' ' '
+)"
+[ "$unread_names" = "ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS " ] \
+  || test_failure "compatibility settings without compatibility were reported as '$unread_names'"
 
 # The container healthcheck runs as its own process, so it is exercised with a
 # stub curl on PATH that serves the fixture status and body.
@@ -723,9 +858,17 @@ case "$url" in
     printf '%s' "$HEALTHCHECK_STUB_PROJECTOR_BODY"
     exit 0
     ;;
+  *:9107/readyz)
+    # An unreachable reader still prints the `-w` trailer, as curl does.
+    if [ "${HEALTHCHECK_STUB_COMPAT_UNREACHABLE:-0}" -ne 0 ]; then
+      printf '\n000'
+      exit 7
+    fi
+    printf '%s\n%s' "$HEALTHCHECK_STUB_COMPAT_BODY" "$HEALTHCHECK_STUB_COMPAT_STATUS"
+    exit 0
+    ;;
   *) ;;
 esac
-# An unreachable query still prints the `-w` trailer, as curl does.
 if [ "${HEALTHCHECK_STUB_UNREACHABLE:-0}" -ne 0 ]; then
   printf '\n000'
   exit 7
@@ -735,12 +878,23 @@ STUB
 chmod +x "$stub_bin/curl"
 
 # Serves the query status and body, whether query is unreachable, and the
-# projector body.
+# projector body. Compatibility answers ready unless run_compat_healthcheck
+# sets it.
 run_healthcheck() {
   HEALTHCHECK_STUB_STATUS="$1" HEALTHCHECK_STUB_BODY="$2" \
     HEALTHCHECK_STUB_UNREACHABLE="${3:-0}" \
     HEALTHCHECK_STUB_PROJECTOR_BODY="${4:-$ready_body}" \
+    HEALTHCHECK_STUB_COMPAT_STATUS="${HEALTHCHECK_STUB_COMPAT_STATUS:-200}" \
+    HEALTHCHECK_STUB_COMPAT_BODY="${HEALTHCHECK_STUB_COMPAT_BODY:-$ready_body}" \
     PATH="$stub_bin:$PATH" sh "$healthcheck"
+}
+
+# Serves the compatibility status and body and whether it is unreachable
+# behind a ready query plane, then the projector body.
+run_compat_healthcheck() {
+  HEALTHCHECK_STUB_COMPAT_STATUS="$1" HEALTHCHECK_STUB_COMPAT_BODY="$2" \
+    HEALTHCHECK_STUB_COMPAT_UNREACHABLE="${3:-0}" \
+    run_healthcheck 200 "$ready_body" 0 "${4:-$ready_body}"
 }
 
 run_healthcheck 200 "$ready_body" \
@@ -767,6 +921,31 @@ run_healthcheck 200 "$degraded_ready_body" \
   || test_failure "the healthcheck must pass a query plane serving through a node outage"
 if run_healthcheck 503 "$degraded_lagging_body"; then
   test_failure "the healthcheck must fail a lagging query plane whatever its dependencies report"
+fi
+
+# Query and compatibility serve the same pair, so the container is healthy
+# only while both serve, unless compatibility is turned off.
+run_compat_healthcheck 200 "$ready_body" \
+  || test_failure "the healthcheck must pass two ready readers"
+run_compat_healthcheck 503 "$halted_body" \
+  || test_failure "the healthcheck must pass a compatibility plane serving the writer halt"
+if run_compat_healthcheck 503 "$syncing_body"; then
+  test_failure "the healthcheck must fail a syncing compatibility plane behind a ready query plane"
+fi
+if run_compat_healthcheck 200 "$ready_body" 1; then
+  test_failure "the healthcheck must fail an unreachable compatibility plane"
+fi
+run_compat_healthcheck 503 "$lagging_body" 0 "$parked_body" \
+  || test_failure "the healthcheck must pass a compatibility plane behind a parked projector"
+run_compat_healthcheck 200 "$ready_body" 1 "$parked_body" \
+  || test_failure "the healthcheck must pass a parked projector that startup left without compatibility"
+for lightwalletd_value in false FALSE; do
+  ZINDER_WALLET_SERVING__LIGHTWALLETD="$lightwalletd_value" \
+    run_compat_healthcheck 200 "$ready_body" 1 \
+    || test_failure "the healthcheck must ignore compatibility turned off by '$lightwalletd_value'"
+done
+if ZINDER_WALLET_SERVING__LIGHTWALLETD=true run_compat_healthcheck 503 "$syncing_body"; then
+  test_failure "the healthcheck must check compatibility when it is turned on"
 fi
 
 printf 'wallet-serving entrypoint tests passed\n'

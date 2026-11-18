@@ -1,7 +1,8 @@
 # Native WalletQuery configuration for the Railway wallet-serving container.
-# The query surface is the only process in this container that binds beyond
-# loopback: Railway's private network is IPv6-only and both the WalletQuery
-# protocol and the Railway healthcheck reach this process from outside.
+# Query and lightwalletd compatibility are the only processes in this
+# container that bind beyond loopback: Railway's private network is IPv6-only
+# and both the WalletQuery protocol and the Railway healthcheck reach this
+# process from outside.
 
 [node]
 request_timeout_secs = 30
@@ -12,7 +13,7 @@ path = "/var/lib/zinder/canonical"
 secondary_path = "/var/lib/zinder/query/canonical-secondary"
 
 # The canonical-reader cache defaults to a fraction of the detected cgroup
-# limit. All three processes share one cgroup here, so each budget is pinned
+# limit. Every process shares one cgroup here, so each budget is pinned
 # instead: the container limit describes the topology, not any one process.
 [storage.canonical.rocksdb]
 block_cache_bytes = 268435456

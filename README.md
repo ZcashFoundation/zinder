@@ -41,12 +41,13 @@ on one host filesystem: `zinder-ingest` owns canonical storage,
 `zinder-projector` owns the wallet projection, and
 `zinder-query` and `zinder-compat-lightwalletd` independently serve native and
 compatibility protocols over immutable exact-fence pairs. A separate
-[single-volume container target](docs/runbooks/deploying-wallet-serving.md)
-runs ingest, projector, and native query as supervised processes when a host
-can attach one volume to only one container; that image omits
-`zinder-compat-lightwalletd` and is published beside the runtime images. A
-variant of it also runs `zinder-explorer`, and the Explorer has its own runtime
-image for hosts that share a volume across containers.
+[single-volume container target](docs/runbooks/deploying-wallet-serving.md),
+`zinder-wallet-serving`, runs the same four runtimes as supervised processes
+when a host can attach one volume to only one container: one image, one
+container, one volume, and lightwalletd compatibility on port 9067. It is
+published beside the runtime images. A variant of it also runs
+`zinder-explorer`, and the Explorer has its own runtime image for hosts that
+share a volume across containers.
 
 Tagged releases also provide checksum-bound GNU/Linux bundles containing these
 same 4 executables plus `zinder-explorer` for `x86_64-v3` and AArch64 hosts. The x86 archive

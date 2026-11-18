@@ -154,6 +154,46 @@ fn wallet_serving_accepts_node_fallbacks_only_with_a_primary_node() -> eyre::Res
     Ok(())
 }
 
+/// The wallet-serving image runs compatibility beside native query, on its own
+/// secondary roots and with the cache budget pinned as query's is.
+#[test]
+fn wallet_serving_image_config_resolves() -> eyre::Result<()> {
+    let config_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../deploy/config/wallet-serving/compat-lightwalletd.toml");
+    let temporary = tempdir()?;
+    let token_path = temporary.path().join("ingest.token");
+    fs::write(&token_path, "fixture-token\n")?;
+
+    let output = zinder_compat_command()
+        .args(["--config", path_str(&config_path)?, "--print-config"])
+        .env("ZINDER_NETWORK__NAME", "zcash-testnet")
+        .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:18232")
+        .env(
+            "ZINDER_INGEST_CONTROL__BEARER_TOKEN_PATH",
+            path_str(&token_path)?,
+        )
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    for expected in [
+        "path = \"/var/lib/zinder/canonical\"",
+        "secondary_path = \"/var/lib/zinder/compat/canonical-secondary\"",
+        "block_cache_bytes = 268435456",
+        "path = \"/var/lib/zinder/wallet\"",
+        "secondary_path = \"/var/lib/zinder/compat/wallet-secondary\"",
+        "addr = \"http://127.0.0.1:9100\"",
+        "listen_addr = \"[::]:9067\"",
+        "serving = \"wallet\"",
+        "listen_addr = \"[::]:9107\"",
+        "allow_public_bind = true",
+    ] {
+        assert!(stdout.contains(expected), "missing {expected}: {stdout}");
+    }
+
+    Ok(())
+}
+
 #[test]
 fn compact_blocks_serving_can_be_selected_by_cli_and_environment() -> eyre::Result<()> {
     let temporary = tempdir()?;

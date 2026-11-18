@@ -28,7 +28,7 @@ Storage encodings belong to [Storage backend](storage-backend.md).
 | Native explorer API | `zinder_proto::v1::explorer` | `zinder-explorer` | Optional runtime: the `zinder-explorer` release image with the Compose overlay, or the `zinder-wallet-serving-explorer` single-volume image |
 | Private control APIs | `zinder_proto::v1::ingest` | `zinder-ingest` and `zinder-projector` | Internal deployed services |
 | Shared operations messages | `zinder_proto::v1::ops` | Runtime and service adapters | Embedded in native/control surfaces |
-| Lightwalletd compatibility API | `zinder_proto::compat::lightwalletd` | `zinder-compat-lightwalletd` | Published compatibility service |
+| Lightwalletd compatibility API | `zinder_proto::compat::lightwalletd` | `zinder-compat-lightwalletd` | Published compatibility service: the `zinder-compat-lightwalletd` release image, or the `zinder-wallet-serving` and `zinder-wallet-serving-explorer` single-volume images |
 | Zebra indexer client contract | `zinder_proto::external::zebra` | `zinder-source` | Client-only upstream protocol |
 
 `CanonicalReader` is a Rust storage trait, not a gRPC service. It is the

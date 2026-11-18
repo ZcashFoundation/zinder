@@ -475,9 +475,9 @@ the owning service declares it as a production dependency. In particular,
 `zinder-compat-lightwalletd` includes and must report `zinder-query`. A
 single-volume host image must report exactly the executables its target
 copies: `zinder-canonical-runtime` reports `zinder-ingest`,
-`zinder-wallet-serving` reports `zinder-ingest`, `zinder-projector`, and
-`zinder-query`, and `zinder-wallet-serving-explorer` reports those 3 plus
-`zinder-explorer`. All other sibling runtime packages remain rejected. If image evidence fails, regenerate
+`zinder-wallet-serving` reports `zinder-ingest`, `zinder-projector`,
+`zinder-query`, and `zinder-compat-lightwalletd`, and
+`zinder-wallet-serving-explorer` reports those 4 plus `zinder-explorer`. All other sibling runtime packages remain rejected. If image evidence fails, regenerate
 the SBOM from the exact child digest and compare its runtime-named packages
 with the owning service manifest before changing the policy. Do not remove a
 declared dependency from the evidence or broaden the allowed package set.

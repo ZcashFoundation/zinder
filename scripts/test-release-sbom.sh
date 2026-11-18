@@ -300,7 +300,8 @@ wallet_serving_image=ghcr.io/example/zinder-wallet-serving
 wallet_serving_fixture="$scratch/wallet-serving-syft-fixture.json"
 jq --argjson ingest "$(cargo_package zinder-ingest)" \
   --argjson projector "$(cargo_package zinder-projector)" \
-  '.packages += [$ingest, $projector]' "$fixture" > "$wallet_serving_fixture"
+  --argjson compat "$(cargo_package zinder-compat-lightwalletd)" \
+  '.packages += [$ingest, $projector, $compat]' "$fixture" > "$wallet_serving_fixture"
 wallet_serving_explorer_image=ghcr.io/example/zinder-wallet-serving-explorer
 wallet_serving_explorer_fixture="$scratch/wallet-serving-explorer-syft-fixture.json"
 jq --argjson explorer "$(cargo_package zinder-explorer)" \
@@ -375,12 +376,12 @@ expect_rejected "a wallet-serving image SBOM without the projector executable pa
   check_single_volume_image_evidence "$wallet_serving_image" \
     "$wallet_serving_missing_projector_sbom" "$scratch/wallet-serving-arm64.spdx.json"
 
-wallet_serving_compat_sbom="$scratch/wallet-serving-compat.spdx.json"
-jq --argjson compat "$(cargo_package zinder-compat-lightwalletd)" '.packages += [$compat]' \
-  "$scratch/wallet-serving-amd64.spdx.json" > "$wallet_serving_compat_sbom"
-expect_rejected "a wallet-serving image SBOM containing the compatibility executable package" \
+wallet_serving_missing_compat_sbom="$scratch/wallet-serving-missing-compat.spdx.json"
+jq 'del(.packages[] | select(.name == "zinder-compat-lightwalletd"))' \
+  "$scratch/wallet-serving-amd64.spdx.json" > "$wallet_serving_missing_compat_sbom"
+expect_rejected "a wallet-serving image SBOM without the compatibility executable package" \
   check_single_volume_image_evidence "$wallet_serving_image" \
-    "$wallet_serving_compat_sbom" "$scratch/wallet-serving-arm64.spdx.json"
+    "$wallet_serving_missing_compat_sbom" "$scratch/wallet-serving-arm64.spdx.json"
 
 canonical_runtime_query_sbom="$scratch/canonical-runtime-query.spdx.json"
 jq --argjson query "$(cargo_package zinder-query)" '.packages += [$query]' \

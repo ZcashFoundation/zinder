@@ -618,6 +618,15 @@ every other refresh failure as a warning. Both increment
 `zinder_wallet_serving_pair_publisher_refresh_total{status="error"}` with their
 `error_class`, such as `projection_behind`.
 
+Open `GetMempoolStream` calls end with `UNAVAILABLE` when termination closes
+their tip-change source. Open `GetBlockRange` and `GetBlockRangeNullifiers`
+calls do not end when termination is requested, so a graceful drain waits for
+each range to finish, which a client that reads slowly can delay for as long
+as it keeps reading. The drain is therefore bounded at 10 seconds, as native
+query's is, and calls still open then are abandoned, logged as
+`compat_server_drain_timed_out`. Compatibility then exits within the
+wallet-serving supervisor's 20-second grace window.
+
 ### Explorer
 
 Explorer is ready after its API has started and, when a materialized-view store
@@ -1411,9 +1420,9 @@ lightwalletd compatibility, and the optional Explorer, which the
 `deploy/docker-compose.explorer.yml` overlay adds to that composition. A
 release also publishes the three single-volume host images in
 `deploy/release-single-volume-images.json` for hosts that attach one volume to
-one container: `zinder-wallet-serving`, which is native-only and omits
-lightwalletd compatibility; `zinder-wallet-serving-explorer`, which adds the
-Explorer to it; and `zinder-canonical-runtime`, an ingest-only diagnostic or
+one container: `zinder-wallet-serving`, which supervises ingest, projector,
+native query, and lightwalletd compatibility over one volume;
+`zinder-wallet-serving-explorer`, which adds the Explorer to it; and `zinder-canonical-runtime`, an ingest-only diagnostic or
 canary runtime. None is the complete supported composition. Every image is a
 target of the single `deploy/Dockerfile`. Cipherscan and PostgreSQL are not
 release classes.

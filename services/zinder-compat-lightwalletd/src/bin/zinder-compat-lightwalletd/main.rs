@@ -1,10 +1,12 @@
 //! Zinder lightwalletd-compatible gRPC server entry point.
 
 use std::{
+    future::Future,
     net::SocketAddr,
     path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
+    time::Duration,
 };
 use zinder_core::wire::encode_zinder_native_chain_name;
 
@@ -33,6 +35,15 @@ use zinder_query::{
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: zinder_runtime::RuntimeAllocator = zinder_runtime::RuntimeAllocator;
+
+/// Longest the gRPC server may drain after shutdown starts before open calls
+/// are abandoned.
+///
+/// A graceful drain waits for every open call, and a block-range stream to a
+/// client that reads slowly stays open until its range ends. This bound keeps
+/// such calls from holding the process past the wallet-serving supervisor's
+/// 20-second grace window, with room left for secondary teardown.
+const GRPC_SERVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser)]
 #[command(name = "zinder-compat-lightwalletd")]
@@ -351,14 +362,17 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         reflection_service,
         reflection_readiness,
     );
-    let server_result = zinder_runtime::public_grpc_server()
-        .add_service(grpc_service)
-        .add_service(reflection_service)
-        .serve_with_shutdown(
-            lightwalletd_config.listen_addr,
-            cancel.clone().cancelled_owned(),
-        )
-        .await;
+    let server_result = serve_with_bounded_drain(
+        zinder_runtime::public_grpc_server()
+            .add_service(grpc_service)
+            .add_service(reflection_service)
+            .serve_with_shutdown(
+                lightwalletd_config.listen_addr,
+                cancel.clone().cancelled_owned(),
+            ),
+        &cancel,
+    )
+    .await;
 
     serving_readiness.publish_shutting_down();
     cancel.cancel();
@@ -544,14 +558,17 @@ async fn run_compact_blocks(
         reflection_service,
         reflection_readiness,
     );
-    let server_result = zinder_runtime::public_grpc_server()
-        .add_service(grpc_service)
-        .add_service(reflection_service)
-        .serve_with_shutdown(
-            lightwalletd_config.listen_addr,
-            cancel.clone().cancelled_owned(),
-        )
-        .await;
+    let server_result = serve_with_bounded_drain(
+        zinder_runtime::public_grpc_server()
+            .add_service(grpc_service)
+            .add_service(reflection_service)
+            .serve_with_shutdown(
+                lightwalletd_config.listen_addr,
+                cancel.clone().cancelled_owned(),
+            ),
+        &cancel,
+    )
+    .await;
     serving_readiness.publish_shutting_down();
     cancel.cancel();
     serving_runtime_drained.cancel();
@@ -574,6 +591,32 @@ async fn run_compact_blocks(
         ),
     }
     server_result.map_err(LightwalletdConfigError::Transport)
+}
+
+/// Runs the gRPC server until it stops, abandoning the calls still open
+/// [`GRPC_SERVER_DRAIN_TIMEOUT`] after `shutdown` is cancelled.
+async fn serve_with_bounded_drain<Server>(
+    server: Server,
+    shutdown: &CancellationToken,
+) -> Result<(), tonic::transport::Error>
+where
+    Server: Future<Output = Result<(), tonic::transport::Error>>,
+{
+    let mut server = std::pin::pin!(server);
+    tokio::select! {
+        server_outcome = &mut server => return server_outcome,
+        () = shutdown.cancelled() => {}
+    }
+    if let Ok(server_outcome) = tokio::time::timeout(GRPC_SERVER_DRAIN_TIMEOUT, server).await {
+        return server_outcome;
+    }
+    tracing::warn!(
+        target: "zinder::compat_lightwalletd",
+        event = "compat_server_drain_timed_out",
+        timeout_seconds = GRPC_SERVER_DRAIN_TIMEOUT.as_secs(),
+        "lightwalletd-compatible gRPC server did not drain before its shutdown deadline; abandoning open calls"
+    );
+    Ok(())
 }
 
 /// Builds the broadcast endpoints from `[node]` and `[node_fallbacks.N]`
@@ -744,5 +787,54 @@ mod tests {
             build_node_broadcast(Some(&node), &[]),
             Err(LightwalletdConfigError::Source(_))
         ));
+    }
+
+    /// A server whose open calls never finish stops holding the process once
+    /// the drain bound passes.
+    #[tokio::test(start_paused = true)]
+    async fn requested_shutdown_abandons_a_server_that_does_not_drain() {
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let server = async move {
+            server_shutdown.cancelled().await;
+            std::future::pending::<Result<(), tonic::transport::Error>>().await
+        };
+        let started_at = tokio::time::Instant::now();
+        shutdown.cancel();
+
+        let server_outcome = serve_with_bounded_drain(server, &shutdown).await;
+
+        assert!(server_outcome.is_ok());
+        assert_eq!(started_at.elapsed(), GRPC_SERVER_DRAIN_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_server_that_drains_within_the_bound_stops_when_it_drains() {
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let server = async move {
+            server_shutdown.cancelled().await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok(())
+        };
+        let started_at = tokio::time::Instant::now();
+        shutdown.cancel();
+
+        let server_outcome = serve_with_bounded_drain(server, &shutdown).await;
+
+        assert!(server_outcome.is_ok());
+        assert_eq!(started_at.elapsed(), Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_server_that_stops_on_its_own_does_not_wait_for_shutdown() {
+        let shutdown = CancellationToken::new();
+        let server = async { Ok(()) };
+        let started_at = tokio::time::Instant::now();
+
+        let server_outcome = serve_with_bounded_drain(server, &shutdown).await;
+
+        assert!(server_outcome.is_ok());
+        assert_eq!(started_at.elapsed(), Duration::ZERO);
     }
 }

@@ -60,10 +60,10 @@ case "$service_name" in
     image_runtime_packages='["zinder-ingest"]'
     ;;
   zinder-wallet-serving)
-    image_runtime_packages='["zinder-ingest", "zinder-projector", "zinder-query"]'
+    image_runtime_packages='["zinder-ingest", "zinder-projector", "zinder-query", "zinder-compat-lightwalletd"]'
     ;;
   zinder-wallet-serving-explorer)
-    image_runtime_packages='["zinder-ingest", "zinder-projector", "zinder-query", "zinder-explorer"]'
+    image_runtime_packages='["zinder-ingest", "zinder-projector", "zinder-query", "zinder-compat-lightwalletd", "zinder-explorer"]'
     ;;
   *)
     image_runtime_packages="$(jq -c -n --arg service "$service_name" '[$service]')"
