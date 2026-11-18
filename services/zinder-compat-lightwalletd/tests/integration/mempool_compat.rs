@@ -982,6 +982,113 @@ async fn lightwalletd_get_mempool_stream_closes_when_tip_change_precedes_watcher
     Ok(())
 }
 
+/// A closed tip-change signal is not a tip change. Ending with OK would tell
+/// the client a block arrived, so the stream fails with `UNAVAILABLE`.
+#[tokio::test(flavor = "multi_thread")]
+async fn lightwalletd_get_mempool_stream_fails_unavailable_when_tip_signal_closes()
+-> eyre::Result<()> {
+    let (wallet_query, _store_fixture) = single_block_serving_query()?;
+    let surface = ScriptedMempoolSurface::with_entries(Vec::new());
+    let adapter = LightwalletdGrpcAdapter::new(wallet_query)
+        .with_mempool_surface(Arc::new(surface))
+        .with_tip_change_watcher(Arc::new(ClosedTipChangeWatcher::new()));
+
+    let mut response_stream = adapter
+        .get_mempool_stream(Request::new(lightwalletd::Empty {}))
+        .await?
+        .into_inner();
+
+    let closing = tokio::time::timeout(std::time::Duration::from_secs(2), response_stream.next())
+        .await
+        .map_err(|_| eyre!("stream did not react to the closed tip signal before timeout"))?;
+    match closing {
+        Some(Err(status)) => assert_eq!(status.code(), Code::Unavailable),
+        other => return Err(eyre!("expected UNAVAILABLE, got: {other:?}")),
+    }
+    let after = tokio::time::timeout(std::time::Duration::from_secs(2), response_stream.next())
+        .await
+        .map_err(|_| eyre!("stream did not end after the UNAVAILABLE status"))?;
+    assert!(after.is_none(), "expected stream end, got: {after:?}");
+    Ok(())
+}
+
+/// lightwalletd sends each txid once per block interval. A transaction in a
+/// snapshot page that is also delivered as a live `Added` event, or added
+/// again after an eviction, is not sent twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn lightwalletd_get_mempool_stream_sends_each_transaction_once() -> eyre::Result<()> {
+    let (wallet_query, _store_fixture) = single_block_serving_query()?;
+    let surface = ScriptedMempoolSurface::with_entries(vec![
+        synthetic_entry(0x10, synthetic_chain_epoch())?,
+        synthetic_entry(0x20, synthetic_chain_epoch())?,
+    ]);
+    let control = surface.event_control();
+    let adapter =
+        LightwalletdGrpcAdapter::new(wallet_query).with_mempool_surface(Arc::new(surface));
+
+    let mut response_stream = adapter
+        .get_mempool_stream(Request::new(lightwalletd::Empty {}))
+        .await?
+        .into_inner();
+    for expected_byte in [0x10, 0x20] {
+        let snapshot_raw = response_stream
+            .next()
+            .await
+            .ok_or_else(|| eyre!("expected snapshot raw transaction {expected_byte:#04x}"))??;
+        assert_eq!(snapshot_raw.data, vec![expected_byte; 16]);
+    }
+
+    for live_byte in [0x10, 0x20, 0x30, 0x30] {
+        control.push_event(MempoolEvent::Added {
+            entry: synthetic_entry(live_byte, synthetic_chain_epoch())?,
+        })?;
+    }
+    let live_raw = tokio::time::timeout(std::time::Duration::from_secs(2), response_stream.next())
+        .await?
+        .ok_or_else(|| eyre!("expected the first new live raw transaction"))??;
+    assert_eq!(live_raw.data, vec![0x30; 16]);
+
+    let no_more = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        response_stream.next(),
+    )
+    .await;
+    assert!(
+        no_more.is_err(),
+        "already-sent transactions must not repeat; got {no_more:?}"
+    );
+    Ok(())
+}
+
+/// A tip-change watcher whose signal source is already gone.
+struct ClosedTipChangeWatcher {
+    receiver: tokio::sync::watch::Receiver<u64>,
+}
+
+impl ClosedTipChangeWatcher {
+    fn new() -> Self {
+        let (_sender, receiver) = tokio::sync::watch::channel(7);
+        Self { receiver }
+    }
+}
+
+#[async_trait]
+impl TipChangeWatcher for ClosedTipChangeWatcher {
+    async fn await_tip_change_after(
+        &self,
+        chain_epoch_id: ChainEpochId,
+    ) -> Result<(), TipChangeWatcherError> {
+        let mut receiver = self.receiver.clone();
+        if *receiver.borrow_and_update() > chain_epoch_id.value() {
+            return Ok(());
+        }
+        receiver
+            .changed()
+            .await
+            .map_err(|_| TipChangeWatcherError::SignalClosed)
+    }
+}
+
 struct ScriptedTipChangeWatcher {
     sender: tokio::sync::watch::Sender<u64>,
     receiver: tokio::sync::watch::Receiver<u64>,

@@ -467,11 +467,15 @@ The lightwalletd compat shim maps `GetMempoolStream` and `GetMempoolTx` over
 `MempoolEvents` and `MempoolSnapshot` when the adapter is configured with the
 mempool surface. `GetMempoolStream` streams the current snapshot walk's
 contents first, then subscribes `MempoolEvents` with
-`after_cursor = events_resume_cursor` for live delivery; the composition is
-at-least-once, matching lightwalletd-go semantics. The shim also races the
-stream against retained `ChainEvents` after the first page's `chain_epoch.id`;
-a change already observed during stream startup closes the stream immediately
-instead of being discarded. A compatibility runtime without that concrete
+`after_cursor = events_resume_cursor` for live delivery. That handoff is
+at-least-once, so the shim drops a transaction id it already sent on the same
+stream, as lightwalletd-go sends each transaction once per block interval. The
+shim also races the stream against retained `ChainEvents` after the first
+page's `chain_epoch.id`; a change already observed during stream startup
+closes the stream immediately instead of being discarded. A tip change ends
+the stream with `OK`. If the tip-change signal itself closes, for example
+while the runtime shuts down, the stream ends with `UNAVAILABLE`, so a client
+does not mistake it for a new block. A compatibility runtime without that concrete
 surface returns a typed unavailable response from the lightwalletd methods.
 It does not publish or interpret the native Wallet capability descriptor;
 native discovery remains owned by `zinder-query`.

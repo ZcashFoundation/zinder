@@ -862,8 +862,10 @@ where
             .clone();
         // Deliver the current mempool contents from the snapshot walk, then
         // continue with events strictly after the walk's resume anchor. The
-        // anchor guarantees at-least-once delivery; a transaction admitted
-        // mid-walk may appear both in a later page and as an event.
+        // anchor hands off at-least-once: a transaction admitted mid-walk may
+        // appear both in a later page and as an event, and an evicted
+        // transaction may be added again. lightwalletd sends each txid once
+        // per block interval, so the stream drops txids it already sent.
         let first_page = mempool_surface
             .mempool_snapshot_page(LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE, None)
             .await
@@ -873,11 +875,17 @@ where
             .mempool_events(first_page.events_resume_cursor.clone())
             .await
             .map_err(status_from_mempool_surface_error)?;
-        let snapshot_raw_transactions = mempool_snapshot_entries(mempool_surface, first_page)
-            .map(|entry_outcome| entry_outcome.map(|entry| mempool_raw_transaction(&entry)));
-        let raw_transaction_stream = snapshot_raw_transactions.chain(
-            stream::StreamExt::filter_map(event_stream, project_added_to_raw_transaction),
+        let entry_stream = mempool_snapshot_entries(mempool_surface, first_page).chain(
+            stream::StreamExt::filter_map(event_stream, added_mempool_entry),
         );
+        let mut delivered_transaction_ids = HashSet::new();
+        let raw_transaction_stream =
+            stream::StreamExt::filter_map(entry_stream, move |entry_outcome| match entry_outcome {
+                Ok(entry) => delivered_transaction_ids
+                    .insert(entry.transaction_id())
+                    .then(|| Ok(mempool_raw_transaction(&entry))),
+                Err(status) => Some(Err(status)),
+            });
 
         let bounded_stream: GrpcStream<lightwalletd::RawTransaction> =
             if let Some(watcher) = self.tip_change_watcher.clone() {
@@ -1937,6 +1945,11 @@ where
                                 error = %error,
                                 "tip-change signal source closed; GetMempoolStream will end"
                             );
+                            // Ending with OK would tell the client a new block
+                            // arrived when no tip change was observed.
+                            let _ = output_sender
+                                .send(Err(Status::unavailable(error.to_string())))
+                                .await;
                         }
                     }
                     return;
@@ -2025,12 +2038,12 @@ fn transaction_id_is_uniquely_excluded(
     clippy::wildcard_enum_match_arm,
     reason = "MempoolEvent is #[non_exhaustive]; the lightwalletd compat shim only projects Added events into RawTransaction, so every non-Added variant is filtered out of the GetMempoolStream projection."
 )]
-fn project_added_to_raw_transaction(
+fn added_mempool_entry(
     event_outcome: Result<zinder_store::MempoolEventEnvelope, MempoolSurfaceError>,
-) -> Option<Result<lightwalletd::RawTransaction, Status>> {
+) -> Option<Result<zinder_core::MempoolEntry, Status>> {
     match event_outcome {
         Ok(envelope) => match envelope.event {
-            MempoolEvent::Added { entry } => Some(Ok(mempool_raw_transaction(&entry))),
+            MempoolEvent::Added { entry } => Some(Ok(entry)),
             _ => None,
         },
         Err(error) => Some(Err(status_from_mempool_surface_error(error))),
