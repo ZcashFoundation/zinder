@@ -1,6 +1,0 @@
-kind: fixed
-body: "`zinder-compat-lightwalletd` `GetMempoolStream` now sends each transaction once per stream, as reference lightwalletd does. It previously could send a transaction twice when it appeared in the mempool snapshot and as a live event, or was evicted and added again. When the tip-change signal closes, for example while the runtime shuts down, the stream now ends with `UNAVAILABLE` instead of `OK`, so a wallet does not treat it as a new block. One stream sends at most 100,000 distinct transactions between tip changes and then ends with `UNAVAILABLE`, which wallets retry."
-time: 2026-11-18T13:29:00.000000000Z
-custom:
-    Bump: patch
-    PR: "267"

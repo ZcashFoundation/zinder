@@ -1,6 +1,0 @@
-kind: fixed
-body: "`zinder-compat-lightwalletd` now sends `SubtreeRoot.completingBlockHash` from `GetSubtreeRoots` in RPC byte order, as reference lightwalletd does. It previously sent the hash in internal byte order, so clients that compare it with lightwalletd or with a block explorer saw reversed bytes. Subtree roots and completing heights are unchanged."
-time: 2026-11-18T13:29:00.000000000Z
-custom:
-    Bump: patch
-    PR: "266"

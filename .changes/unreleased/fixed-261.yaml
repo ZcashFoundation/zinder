@@ -1,6 +1,0 @@
-kind: fixed
-body: "`zinder-ingest` now answers read-only canonical-control requests, including `WriterStatus`, while its writer waits on a node request, backs off after a node failure, or decides on an endpoint switch. Before, a stalled node delayed these requests by up to `node.request_timeout_secs` per call, so wallet readers could miss their 15-second writer-status deadline and stop serving once the stall outlasted `storage.serving_pair_staleness_ceiling_ms`, although stored reads were still possible. Mempool appends, pruning, leases, and owner checkpoints sent during the wait are still applied in arrival order once it ends."
-time: 2026-11-18T18:00:00.000000000Z
-custom:
-    Bump: patch
-    PR: "261"
