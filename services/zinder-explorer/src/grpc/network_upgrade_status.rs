@@ -1,6 +1,6 @@
 //! `ExplorerQuery.NetworkUpgradeStatus` handler.
 //!
-//! Projects the node-advertised [`NetworkUpgradeActivations`] table onto the
+//! Projects the writer-admitted [`NetworkUpgradeActivations`] table onto the
 //! wire, anchoring the `active` flags to the canonical tip height read from
 //! `WalletQuery.VisibleTipBlock`.
 
