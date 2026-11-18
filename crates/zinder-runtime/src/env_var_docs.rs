@@ -376,7 +376,7 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
             "zinder-compat-lightwalletd",
             "zinder-explorer",
         ],
-        requirement: Requirement::ConditionalOn("any `ZINDER_NODE_FALLBACKS__<N>__*` is set"),
+        requirement: Requirement::ConditionalOn("any ZINDER_NODE_FALLBACKS__<N>__* is set"),
         sensitive: false,
         description: "JSON-RPC URL of fallback node endpoint `<N>`. Endpoints form one ordered list: \
                       `[node]` is position 0 and `[node_fallbacks.N]` is position `N`, starting at 1 \

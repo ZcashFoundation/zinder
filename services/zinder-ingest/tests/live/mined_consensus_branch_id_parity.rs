@@ -15,7 +15,7 @@
 //! table. This test follows the end-to-end production path:
 //!
 //! 1. Fetch the activations from the running Zebra via
-//!    `ZebraJsonRpcSource::fetch_network_upgrade_activations()`.
+//!    `NodeSource::fetch_network_upgrade_activations()`.
 //! 2. Construct and publish a production canonical store from genesis to the
 //!    tip, project its wallet store, and serve the pair.
 //! 3. Pick the tip block's coinbase from its compact block.

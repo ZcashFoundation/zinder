@@ -21,7 +21,7 @@
 //!   [`zcash_protocol::local_consensus::LocalNetwork`] shape consumed by
 //!   `TransparentTestKey::from_seed_with_local_network`. Live tests that
 //!   broadcast through Zebra MUST use this; the activations come from
-//!   `ZebraJsonRpcSource::fetch_network_upgrade_activations()` and reflect
+//!   `NodeSource::fetch_network_upgrade_activations()` and reflect
 //!   what the running node is actually configured with. Mismatched heights
 //!   produce an `incorrect consensus branch id` rejection from Zebra's
 //!   mempool.
@@ -119,7 +119,7 @@ pub fn sample_regtest_upgrade_activations() -> NetworkUpgradeActivations {
 /// stay `None`, which `zcash_primitives` reads as "not yet activated". Use
 /// this for any signing path that needs to match the running node's active
 /// consensus rules. The activations come from
-/// `ZebraJsonRpcSource::fetch_network_upgrade_activations()` and reflect the
+/// `NodeSource::fetch_network_upgrade_activations()` and reflect the
 /// node's `getblockchaininfo.upgrades` advertisement.
 #[must_use]
 pub fn local_network_from_activations(activations: &NetworkUpgradeActivations) -> LocalNetwork {

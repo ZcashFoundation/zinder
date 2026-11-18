@@ -79,7 +79,7 @@ A live test in `crates/zinder-source/tests/live/zebra_json_rpc.rs` calls `fetch_
 - `NetworkUpgradeActivations` (the carrier).
 - `NetworkUpgradeActivation` (one row).
 - `PRE_OVERWINTER_BRANCH_ID = 0` (the wire convention for "no branch active at this height").
-- `ZebraJsonRpcSource::fetch_network_upgrade_activations` (the discovery function).
+- `NodeSource::fetch_network_upgrade_activations` (the discovery function; `ZebraJsonRpcSource` implements it over `getblockchaininfo`).
 - `zinder_source::discover_network_upgrade_activations(&source, service)` (the shared startup wrapper over `NodeSource::fetch_network_upgrade_activations` that returns `Arc<NetworkUpgradeActivations>` and emits a structured discovery log).
 - `local_network_from_activations` (the testkit bridge to `zcash_protocol::LocalNetwork`).
 
