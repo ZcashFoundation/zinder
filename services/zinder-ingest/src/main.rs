@@ -306,7 +306,7 @@ async fn run_ingest(
     let volume_space_guard = materialized_view_plane.volume_space_guard.clone();
     let mut worker_tasks = IngestWorkerTaskHandles {
         upstream_health_probe: spawn_upstream_health_probe_for(
-            &command_config.runtime_config.node,
+            &command_config,
             &nodes,
             writer_readiness.clone(),
             worker_cancel.clone(),
@@ -1107,22 +1107,24 @@ fn log_canonical_writer_start(
     command_config: &IngestCommandConfig,
     writer_config: &CanonicalWriterConfig,
 ) {
+    let active_node_position = writer_config
+        .follow
+        .node_failover
+        .as_ref()
+        .map_or(0, zinder_ingest::NodeFailover::active_position);
     tracing::info!(
         target: "zinder::ingest",
         event = "canonical_writer_started",
         network = encode_zinder_native_chain_name(command_config.runtime_config.node.network),
         storage_path = %writer_config.storage_path.display(),
-        json_rpc_addr = command_config.runtime_config.node.json_rpc_addr.as_str(),
+        json_rpc_addr =
+            node_target_at(command_config, active_node_position).json_rpc_addr.as_str(),
         node_endpoints = command_config
             .runtime_config
             .node_fallbacks
             .len()
             .saturating_add(1),
-        active_node_position = writer_config
-            .follow
-            .node_failover
-            .as_ref()
-            .map_or(0, zinder_ingest::NodeFailover::active_position),
+        active_node_position,
         workload = "wallet",
         schema_version = zinder_store::CANONICAL_STORE_SCHEMA_VERSION,
         raw_blob_retention = %writer_config.raw_blob_retention,
@@ -1407,17 +1409,35 @@ fn validate_indexer_endpoint(node_target: &NodeTarget) -> Result<(), IngestConfi
     })
 }
 
+/// The configured target at `position` of the ordered node list: `[node]`
+/// at 0, then each `[node_fallbacks.N]`.
+fn node_target_at(command_config: &IngestCommandConfig, position: usize) -> &NodeTarget {
+    position
+        .checked_sub(1)
+        .and_then(|fallback| command_config.runtime_config.node_fallbacks.get(fallback))
+        .unwrap_or(&command_config.runtime_config.node)
+}
+
 fn spawn_upstream_health_probe_for(
-    node_target: &NodeTarget,
+    command_config: &IngestCommandConfig,
     nodes: &NodeSet<ZebraJsonRpcSource>,
     readiness: ComposedReadiness,
     cancel: CancellationToken,
 ) -> Option<JoinHandle<()>> {
-    let health_config = node_target.health.as_ref()?;
+    let health_config = command_config.runtime_config.node.health.as_ref()?;
+    // The probe polls whichever endpoint is active, through that endpoint's
+    // own health address or its JSON-RPC sync progress when it has none.
+    let active_node_position = nodes.active_position();
+    let active_health_addr = node_target_at(command_config, active_node_position)
+        .health
+        .as_ref()
+        .map(|health| health.addr.as_str());
     tracing::info!(
         target: "zinder::ingest",
         event = "upstream_health_probe_started",
-        addr = health_config.addr.as_str(),
+        active_node_position,
+        addr = active_health_addr.unwrap_or("json_rpc_verification_progress"),
+        follows_active_endpoint = nodes.has_fallbacks(),
         poll_interval_ms = u64::try_from(health_config.poll_interval.as_millis())
             .unwrap_or(u64::MAX),
         "upstream health probe started"
