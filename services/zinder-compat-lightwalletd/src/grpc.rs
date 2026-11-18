@@ -51,6 +51,7 @@ use crate::mempool::{
     SharedTipChangeWatcher, TipChangeWatcherError,
 };
 use crate::network_tip_estimate::estimated_network_height;
+use crate::node_tip_witness::NodeTipWitness;
 use crate::ping::LightwalletdPing;
 use crate::request_limits::COMPACT_TX_STREAMER_FIELD_LIMITS;
 use crate::stale_tip::{StaleTipLimit, TipBlockTimeCache, unix_now_seconds};
@@ -158,6 +159,7 @@ pub struct LightwalletdGrpcAdapter<QueryApi> {
     block_range_streams: BlockRangeStreamLimit,
     stale_tip_limit: StaleTipLimit,
     tip_block_times: TipBlockTimeCache,
+    node_tip_witness: NodeTipWitness,
     transparent_address_support: bool,
     mempool_surface: Option<SharedMempoolSurface>,
     tip_change_watcher: Option<SharedTipChangeWatcher>,
@@ -176,6 +178,7 @@ impl<QueryApi: std::fmt::Debug> std::fmt::Debug for LightwalletdGrpcAdapter<Quer
             )
             .field("stale_tip_limit", &self.stale_tip_limit.limit())
             .field("tip_block_times", &self.tip_block_times)
+            .field("node_tip_witness", &self.node_tip_witness)
             .field(
                 "transparent_address_support",
                 &self.transparent_address_support,
@@ -221,6 +224,7 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
             ),
             stale_tip_limit: StaleTipLimit::DISABLED,
             tip_block_times: TipBlockTimeCache::default(),
+            node_tip_witness: NodeTipWitness::default(),
             transparent_address_support: false,
             mempool_surface: None,
             tip_change_watcher: None,
@@ -258,6 +262,17 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
     #[must_use]
     pub const fn with_stale_tip_limit(mut self, stale_tip_limit: StaleTipLimit) -> Self {
         self.stale_tip_limit = stale_tip_limit;
+        self
+    }
+
+    /// Sets the witness whose report of the writer's node decides whether an
+    /// old served tip is the chain tip or a stale one.
+    ///
+    /// Without one, no tip is vouched for, so the stale-tip limit refuses
+    /// every tip older than the limit.
+    #[must_use]
+    pub fn with_node_tip_witness(mut self, node_tip_witness: NodeTipWitness) -> Self {
+        self.node_tip_witness = node_tip_witness;
         self
     }
 
@@ -387,6 +402,7 @@ where
             method,
             served_tip.block_time_unix_seconds,
             served_tip.now_unix_seconds,
+            self.node_tip_witness.vouches_for(served_tip.block.height),
         )?;
         Ok(served_tip)
     }

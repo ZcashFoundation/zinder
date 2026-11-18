@@ -17,8 +17,8 @@ use tonic::{Request, Response, Status};
 use zinder_compat_lightwalletd::{
     BLOCK_RANGE_CHUNK_MAX_BYTES, BlockRangeChunks, BlockRangeContinuity, BlockRangeSink,
     BlockRangeStage, BlockRangeStreamLimit, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
-    LightwalletdPing, StaleTipLimit, TipBlockTimeCache, compact_transaction_has_payload,
-    estimated_network_height, unix_now_seconds,
+    LightwalletdPing, NodeTipWitness, StaleTipLimit, TipBlockTimeCache,
+    compact_transaction_has_payload, estimated_network_height, unix_now_seconds,
 };
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, ChainEpoch, ChainEpochId, CompactBlockArtifact,
@@ -699,6 +699,7 @@ pub(crate) struct CompactBlockAdapter {
     block_range_streams: BlockRangeStreamLimit,
     stale_tip_limit: StaleTipLimit,
     tip_block_times: TipBlockTimeCache,
+    node_tip_witness: NodeTipWitness,
     ping: LightwalletdPing,
 }
 
@@ -711,6 +712,7 @@ impl CompactBlockAdapter {
             ),
             stale_tip_limit: StaleTipLimit::DISABLED,
             tip_block_times: TipBlockTimeCache::default(),
+            node_tip_witness: NodeTipWitness::default(),
             ping: LightwalletdPing::default(),
         }
     }
@@ -719,6 +721,13 @@ impl CompactBlockAdapter {
     /// `GetLightdInfo` fail with `UNAVAILABLE`.
     pub(crate) const fn with_stale_tip_limit(mut self, stale_tip_limit: StaleTipLimit) -> Self {
         self.stale_tip_limit = stale_tip_limit;
+        self
+    }
+
+    /// Sets the witness whose report of the writer's node decides whether an
+    /// old served tip is the chain tip or a stale one.
+    pub(crate) fn with_node_tip_witness(mut self, node_tip_witness: NodeTipWitness) -> Self {
+        self.node_tip_witness = node_tip_witness;
         self
     }
 
@@ -778,7 +787,12 @@ impl CompactBlockAdapter {
             block_time
         };
         let now = unix_now_seconds();
-        self.stale_tip_limit.check(method, tip_block_time, now)?;
+        self.stale_tip_limit.check(
+            method,
+            tip_block_time,
+            now,
+            self.node_tip_witness.vouches_for(epoch.visible_tip_height),
+        )?;
         Ok((epoch, tip_block_time, now))
     }
 
@@ -4259,9 +4273,12 @@ mod tests {
         )?)
     }
 
+    /// Tip calls refuse a stale tip the writer's node does not report.
+    ///
     /// A served tip older than the stale-tip limit fails `GetLatestBlock`
-    /// and `GetLightdInfo` with `UNAVAILABLE`, while block ranges keep
-    /// serving. A disabled limit serves the old tip.
+    /// and `GetLightdInfo` with `UNAVAILABLE` unless the writer's node
+    /// reports that tip, while block ranges keep serving. A disabled limit
+    /// serves the old tip.
     #[tokio::test]
     async fn tip_calls_refuse_a_stale_tip_unless_the_limit_is_disabled()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -4286,6 +4303,47 @@ mod tests {
         assert_eq!(info, Some(Code::Unavailable));
         let blocks = range_parity_blocks(&limited, 1, 4, Vec::new()).await?;
         assert_eq!(blocks.len(), 4);
+
+        // The writer's node reports the served tip: the chain is only quiet.
+        let node_tip_witness = zinder_compat_lightwalletd::NodeTipWitness::default();
+        let vouched = adapter_serving(&reader)
+            .with_stale_tip_limit(zinder_compat_lightwalletd::StaleTipLimit::after(
+                Duration::from_mins(25),
+            ))
+            .with_node_tip_witness(node_tip_witness.clone());
+        node_tip_witness.observe(Some(BlockHeight::new(4)));
+        vouched
+            .get_latest_block(Request::new(lightwalletd::ChainSpec::default()))
+            .await?;
+        vouched
+            .get_lightd_info(Request::new(lightwalletd::Empty::default()))
+            .await?;
+        // The writer is behind a node that has a newer block.
+        let behind_witness = zinder_compat_lightwalletd::NodeTipWitness::default();
+        let behind = adapter_serving(&reader)
+            .with_stale_tip_limit(zinder_compat_lightwalletd::StaleTipLimit::after(
+                Duration::from_mins(25),
+            ))
+            .with_node_tip_witness(behind_witness.clone());
+        behind_witness.observe(Some(BlockHeight::new(9)));
+        assert_eq!(
+            behind
+                .get_lightd_info(Request::new(lightwalletd::Empty::default()))
+                .await
+                .err()
+                .map(|status| status.code()),
+            Some(Code::Unavailable)
+        );
+        // The node becomes unreachable.
+        node_tip_witness.observe(None);
+        assert_eq!(
+            vouched
+                .get_latest_block(Request::new(lightwalletd::ChainSpec::default()))
+                .await
+                .err()
+                .map(|status| status.code()),
+            Some(Code::Unavailable)
+        );
 
         let unlimited = adapter_serving(&reader)
             .with_stale_tip_limit(zinder_compat_lightwalletd::StaleTipLimit::DISABLED);

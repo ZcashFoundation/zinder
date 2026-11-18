@@ -22,7 +22,7 @@ use zebra_chain::{
 };
 use zinder_compat_lightwalletd::{
     BLOCK_RANGE_CHUNK_MAX_BYTES, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
-    LightwalletdGrpcAdapter, LightwalletdPing, StaleTipLimit,
+    LightwalletdGrpcAdapter, LightwalletdPing, NodeTipWitness, StaleTipLimit,
 };
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, BlockSelector, BroadcastDuplicate,
@@ -231,9 +231,10 @@ async fn lightd_info_estimates_the_network_height_from_the_served_tip() -> eyre:
 
 /// Tip calls refuse a stale served tip and answer again for a fresh one.
 ///
-/// Once the served tip is older than the stale-tip limit, `GetLatestBlock`
-/// and `GetLightdInfo` fail with `UNAVAILABLE`, while the stored chain keeps
-/// serving. The tip calls answer again as soon as a fresh tip is served.
+/// With no report from the writer's node, once the served tip is older than
+/// the stale-tip limit, `GetLatestBlock` and `GetLightdInfo` fail with
+/// `UNAVAILABLE`, while the stored chain keeps serving. The tip calls answer
+/// again as soon as a fresh tip is served.
 #[tokio::test]
 async fn tip_calls_refuse_a_stale_tip_and_recover_with_a_fresh_one() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture()?;
@@ -291,6 +292,113 @@ async fn tip_calls_refuse_a_stale_tip_and_recover_with_a_fresh_one() -> eyre::Re
     Ok(())
 }
 
+/// Runs the two tip calls and returns how each ended.
+async fn tip_call_codes<QueryApi>(
+    adapter: &LightwalletdGrpcAdapter<QueryApi>,
+) -> (Result<(), Code>, Result<(), Code>)
+where
+    QueryApi: WalletQueryApi + Clone + Send + Sync + 'static,
+{
+    let latest = adapter
+        .get_latest_block(Request::new(lightwalletd::ChainSpec {}))
+        .await
+        .map(|_| ())
+        .map_err(|status| status.code());
+    let lightd_info = adapter
+        .get_lightd_info(Request::new(lightwalletd::Empty {}))
+        .await
+        .map(|_| ())
+        .map_err(|status| status.code());
+    (latest, lightd_info)
+}
+
+const REFUSED: (Result<(), Code>, Result<(), Code>) =
+    (Err(Code::Unavailable), Err(Code::Unavailable));
+const ANSWERED: (Result<(), Code>, Result<(), Code>) = (Ok(()), Ok(()));
+
+/// A quiet chain is not a stale one: while the writer's node is reachable
+/// and has no block above the served tip, the tip calls answer however old
+/// that tip is.
+#[tokio::test]
+async fn tip_calls_answer_an_old_tip_the_node_still_reports() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let recorder = EpochPinRecorder::new(store_fixture.query());
+    let node_tip_witness = NodeTipWitness::default();
+    let adapter = LightwalletdGrpcAdapter::new(recorder.clone())
+        .with_stale_tip_limit(StaleTipLimit::after(std::time::Duration::from_mins(25)))
+        .with_node_tip_witness(node_tip_witness.clone());
+
+    recorder.set_block_time(unix_now()? - 60 * 60);
+    node_tip_witness.observe(Some(ACCEPTANCE_BLOCK_HEIGHT));
+    assert_eq!(tip_call_codes(&adapter).await, ANSWERED);
+    let lightd_info = adapter
+        .get_lightd_info(Request::new(lightwalletd::Empty {}))
+        .await?
+        .into_inner();
+    assert!(
+        lightd_info.estimated_height > lightd_info.block_height,
+        "estimatedHeight still tells the wallet the chain is quiet"
+    );
+    Ok(())
+}
+
+/// While the writer's node is unreachable, an old tip is refused, and the
+/// tip calls answer again once the node reports the served tip.
+#[tokio::test]
+async fn tip_calls_refuse_an_old_tip_while_the_node_is_unreachable() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let recorder = EpochPinRecorder::new(store_fixture.query());
+    let node_tip_witness = NodeTipWitness::default();
+    let adapter = LightwalletdGrpcAdapter::new(recorder.clone())
+        .with_stale_tip_limit(StaleTipLimit::after(std::time::Duration::from_mins(25)))
+        .with_node_tip_witness(node_tip_witness.clone());
+
+    // Within the limit the tip calls answer whatever the node does.
+    recorder.set_block_time(unix_now()? - 10 * 60);
+    node_tip_witness.observe(None);
+    assert_eq!(tip_call_codes(&adapter).await, ANSWERED);
+
+    let old_adapter = LightwalletdGrpcAdapter::new(recorder.clone())
+        .with_stale_tip_limit(StaleTipLimit::after(std::time::Duration::from_mins(25)))
+        .with_node_tip_witness(node_tip_witness.clone());
+    recorder.set_block_time(unix_now()? - 30 * 60);
+    assert_eq!(tip_call_codes(&old_adapter).await, REFUSED);
+
+    // The node answers again at the served tip: the chain was only quiet.
+    node_tip_witness.observe(Some(ACCEPTANCE_BLOCK_HEIGHT));
+    assert_eq!(tip_call_codes(&old_adapter).await, ANSWERED);
+    Ok(())
+}
+
+/// While the writer is behind its node, an old tip is refused, and the tip
+/// calls answer again once the writer has caught up to the node.
+#[tokio::test]
+async fn tip_calls_refuse_an_old_tip_while_the_writer_is_behind_its_node() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let caught_up_store =
+        acceptance_store_from_chain(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(2))?;
+    let recorder = EpochPinRecorder::new(store_fixture.query())
+        .with_later_views(vec![caught_up_store.query()]);
+    let node_tip_witness = NodeTipWitness::default();
+    let adapter = LightwalletdGrpcAdapter::new(recorder.clone())
+        .with_stale_tip_limit(StaleTipLimit::after(std::time::Duration::from_mins(25)))
+        .with_node_tip_witness(node_tip_witness.clone());
+
+    recorder.set_block_time(unix_now()? - 30 * 60);
+    node_tip_witness.observe(Some(BlockHeight::new(2)));
+    assert_eq!(tip_call_codes(&adapter).await, REFUSED);
+
+    // A block-range read moves the served view to height 2, the node's tip.
+    collect_block_range(&adapter, block_range_request(1, 1)).await?;
+    assert_eq!(tip_call_codes(&adapter).await, ANSWERED);
+    let latest = adapter
+        .get_latest_block(Request::new(lightwalletd::ChainSpec {}))
+        .await?
+        .into_inner();
+    assert_eq!(latest.height, 2);
+    Ok(())
+}
+
 /// With the stale-tip limit disabled, the tip calls keep answering however
 /// old the served tip is.
 #[tokio::test]
@@ -304,11 +412,11 @@ async fn a_disabled_stale_tip_limit_serves_an_old_tip() -> eyre::Result<()> {
     adapter
         .get_latest_block(Request::new(lightwalletd::ChainSpec {}))
         .await?;
-    let info = adapter
+    let lightd_info = adapter
         .get_lightd_info(Request::new(lightwalletd::Empty {}))
         .await?
         .into_inner();
-    assert!(info.estimated_height > info.block_height);
+    assert!(lightd_info.estimated_height > lightd_info.block_height);
     Ok(())
 }
 

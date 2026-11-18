@@ -266,7 +266,7 @@ unreachable.
 | --- | --- | --- | --- |
 | `zinder-ingest` | `node_unavailable` | Its private control API, including writer status. | Committing blocks. The chain tip stops advancing. |
 | `zinder-projector` | `ready` | Its last wallet state. | Nothing new to apply. |
-| `zinder-query`, wallet-mode compatibility | `ready`, with `node_source` under `degraded` | Compact blocks, blocks, transactions, transparent address queries, tree states at any height, subtree roots, chain events, and server info, from storage. | Broadcasts, which fail with `UNAVAILABLE` and `NODE_UNAVAILABLE`. In compatibility serving, wallet and compact-blocks alike, `GetLatestBlock` and `GetLightdInfo` once the served tip is older than `compat.stale_tip_limit_ms`, 25 minutes by default ([Stale tip](lightwalletd-compatibility.md#stale-tip)). |
+| `zinder-query`, wallet-mode compatibility | `ready`, with `node_source` under `degraded` | Compact blocks, blocks, transactions, transparent address queries, tree states at any height, subtree roots, chain events, and server info, from storage. | Broadcasts, which fail with `UNAVAILABLE` and `NODE_UNAVAILABLE`. In compatibility serving, wallet and compact-blocks alike, `GetLatestBlock` and `GetLightdInfo` once the served tip is older than `compat.stale_tip_limit_ms`, 25 minutes by default ([Stale tip](lightwalletd-compatibility.md#stale-tip)), because the writer cannot reach its node to vouch for the tip. |
 | `zinder-explorer` | `ready` | Stored views. | Observing the node's tip for `ExplorerFreshness`. |
 
 Watch `served_epoch_age_seconds` during an outage. It grows while the chain
@@ -274,7 +274,7 @@ stands still, and it is the readiness signal that shows the served view is
 stale. A wallet that builds a transaction on a tip more than about 40 blocks
 behind the network creates one that has already expired, which is why
 lightwalletd tip calls stop answering a tip older than
-`compat.stale_tip_limit_ms`.
+`compat.stale_tip_limit_ms` that the node cannot vouch for.
 
 Readers stop serving in these cases:
 

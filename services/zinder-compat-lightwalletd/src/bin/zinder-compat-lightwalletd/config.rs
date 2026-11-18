@@ -305,7 +305,7 @@ fn resolve_lightwalletd_config(
     let max_concurrent_block_range_streams = require_max_concurrent_block_range_streams(
         config.compat.max_concurrent_block_range_streams,
     )?;
-    let stale_tip_limit = resolve_stale_tip_limit(network, config.compat.stale_tip_limit_ms)?;
+    let stale_tip_limit = resolve_stale_tip_limit(config.compat.stale_tip_limit_ms)?;
     guard_serving_bind("compat.listen_addr", listen_addr, allow_public_bind)?;
     guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
     let (broadcaster, node_fallbacks) =
@@ -551,14 +551,9 @@ fn resolve_tree_state_replay_waiters_per_slot(
 const MIN_STALE_TIP_LIMIT: Duration = Duration::from_mins(5);
 
 /// Resolves the stale-tip limit: 0 disables it, and an unset limit takes
-/// the default, except on Regtest, which mines on demand, so its tip age says
-/// nothing about its node.
-fn resolve_stale_tip_limit(
-    network: Network,
-    configured_ms: Option<u64>,
-) -> Result<StaleTipLimit, ConfigError> {
+/// the default on every network.
+fn resolve_stale_tip_limit(configured_ms: Option<u64>) -> Result<StaleTipLimit, ConfigError> {
     match configured_ms {
-        None if matches!(network, Network::ZcashRegtest) => Ok(StaleTipLimit::DISABLED),
         None => Ok(StaleTipLimit::after(DEFAULT_STALE_TIP_LIMIT)),
         Some(0) => Ok(StaleTipLimit::DISABLED),
         Some(configured_ms) => {

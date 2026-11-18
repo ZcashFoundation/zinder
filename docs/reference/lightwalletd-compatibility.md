@@ -78,10 +78,16 @@ The upgrade fields come from the network-upgrade schedule that ingest admitted, 
 
 `estimatedHeight` is the height Zebra would report as `estimatedheight` for the served tip: the tip, plus the blocks the target spacing would have produced since the tip's block time. Each era uses the spacing of its network upgrade in the admitted schedule: 150 seconds before Blossom, 75 seconds from Blossom, and 25 seconds from NU7. Go lightwalletd forwards Zebra's value, which Zebra computes the same way from its own tip. During a node outage the served tip stands still and `estimatedHeight` keeps rising.
 
-Once the served tip's block is older than `compat.stale_tip_limit_ms` (`ZINDER_COMPAT__STALE_TIP_LIMIT_MS`), `GetLatestBlock` and `GetLightdInfo` fail with `UNAVAILABLE`, as lightwalletd's do while its node is down. They answer again as soon as a newer tip is served. Every other method keeps serving stored data. `zinder_compat_stale_tip_refusals_total{method}` counts the refusals.
+An old tip is not always a stale one: the network may simply not have produced a block. So `GetLatestBlock` and `GetLightdInfo` fail with `UNAVAILABLE` only when both hold:
 
-- The limit defaults to 25 minutes on Mainnet and Testnet. Regtest mines on demand, so its tip age says nothing about the node, and the limit is off there by default.
-- The limit follows the served tip's age, whatever the cause. A deployment still catching up to the network, or restored from an old snapshot, refuses the tip calls until its tip is within the limit, although `/readyz` reports it ready. Go lightwalletd instead answers with its node's lagging tip in that state.
+- The served tip's block is older than `compat.stale_tip_limit_ms` (`ZINDER_COMPAT__STALE_TIP_LIMIT_MS`).
+- The writer cannot vouch that the served tip is its node's tip: its node is unreachable, the node has a block above the served tip because the writer is behind it (catching up or restored from an old snapshot), the writer is starting or parked, or ingest control does not answer.
+
+While the writer's node is reachable and reports no block above the served tip, the tip calls answer however old that tip is, and `estimatedHeight` tells wallets the chain is quiet. Go lightwalletd likewise fails these calls only while its node is down.
+
+The process reads the writer's status from ingest control every `storage.secondary_catchup_interval_ms`, 1 second by default. A writer that reaches its node reports the node's committed tip there and reports none while the node is unreachable. A reading vouches for 30 seconds or three reading intervals, whichever is longer, so a stopped ingest control stops vouching within that time. When the node reports a new block, the tip it replaces keeps vouching for 10 seconds, while the reader catches up to the new block. The tip calls answer again as soon as the node reports the served tip or a newer tip is served. Every other method keeps serving stored data. `zinder_compat_stale_tip_refusals_total{method}` counts the refusals.
+
+- The limit defaults to 25 minutes on every network. On a quiet Regtest chain, which mines on demand, the reachable node vouches for the tip.
 - 0 turns the limit off, for a private deployment that wants its wallets to keep syncing through a long outage. Its wallets then build transactions that expire on arrival once the tip is about 50 minutes old. Any other value must be at least 5 minutes.
 - Every wallet engine below expires a transaction 40 blocks after the tip it was told, plus one, and 120 blocks from NU7: 50 minutes of target time either way. The default limit is half that window, so a wallet stops on the stale tip well before a transaction built on it would expire.
 

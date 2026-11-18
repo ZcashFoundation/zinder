@@ -1195,11 +1195,13 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-compat-lightwalletd"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Milliseconds the served tip's block may predate the clock before \
-                      lightwalletd `GetLatestBlock` and `GetLightdInfo` fail with `UNAVAILABLE`, \
-                      so wallets stop building transactions on a stale tip. 0 disables it; \
-                      otherwise at least 300000. Defaults to 1500000 (25 minutes) on Mainnet \
-                      and Testnet and to 0 on Regtest.",
+        description: "Milliseconds the served tip's block may predate the clock, while the \
+                      writer cannot vouch for it because its node is unreachable or ahead of it, \
+                      before lightwalletd \
+                      `GetLatestBlock` and `GetLightdInfo` fail with `UNAVAILABLE`, so wallets \
+                      stop building transactions on a stale tip. A tip the node still reports \
+                      is never refused. 0 disables it; otherwise at least 300000. Defaults to \
+                      1500000 (25 minutes).",
     },
     EnvVarDoc {
         name: "ZINDER_COMPAT__PING_VERY_INSECURE",

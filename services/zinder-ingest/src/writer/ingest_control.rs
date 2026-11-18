@@ -458,7 +458,14 @@ fn writer_status_response(
                 None
             }
         });
-    let upstream_tip = upstream_tip_from_readiness(readiness_report, upstream_not_ready);
+    // The health probe keeps its last observation when a probe fails, so
+    // while the follower reports the node unreachable that observation is
+    // stale and names no tip the node can still vouch for.
+    let upstream_tip = if matches!(readiness_report.cause, ReadinessCause::NodeUnavailable(_)) {
+        None
+    } else {
+        upstream_tip_from_readiness(readiness_report, upstream_not_ready)
+    };
     let gap_blocks = upstream_tip
         .as_ref()
         .and_then(|upstream_tip| upstream_tip.committed_height)
@@ -1237,6 +1244,71 @@ mod tests {
                 .and_then(|tip| tip.estimated_height),
             Some(visible_height.saturating_add(900))
         );
+
+        fixture.shutdown().await
+    }
+
+    /// While the follower reports its node unavailable, writer status names
+    /// no upstream tip, even though the health probe still holds its last
+    /// `upstream_not_ready` observation from before the outage.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn writer_status_reports_no_upstream_tip_while_the_node_is_unavailable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = shared_control_fixture().await?;
+        let visible_height = fixture
+            .canonical
+            .chain_epoch()
+            .await?
+            .chain_epoch
+            .visible_tip_height
+            .value();
+        let readiness = Readiness::default();
+        let composed = ComposedReadiness::new(readiness.clone(), &[]);
+        composed.publish_input(
+            ReadinessInput::NodeSource,
+            ReadinessCause::UpstreamNotReady(UpstreamNotReadyDetail {
+                upstream_committed_height: Some(visible_height),
+                upstream_estimated_height: Some(visible_height.saturating_add(900)),
+                upstream_verification_progress: Some(0.4),
+                upstream_health: UpstreamHealth {
+                    source: std::borrow::Cow::Borrowed("zebra_ready_endpoint"),
+                    reason: std::borrow::Cow::Borrowed("syncing"),
+                },
+            }),
+        );
+        composed.publish_admission(
+            ReadinessState::node_unavailable_with_detail(
+                zinder_runtime::NodeUnavailableDetail::first_iteration(
+                    "connection",
+                    "connection refused",
+                ),
+                Some(visible_height),
+            )
+            .with_phase(IngestPhase::FollowingTip),
+        );
+        let source: Arc<dyn NodeSource> = Arc::new(ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashTestnet,
+            "http://127.0.0.1:1",
+            NodeAuth::None,
+            Duration::from_secs(1),
+        )?);
+        let adapter = CanonicalIngestControlGrpcAdapter::new(
+            zinder_core::Network::ZcashTestnet,
+            fixture.canonical.clone(),
+            fixture.mempool.clone(),
+            source,
+            composed,
+        );
+
+        let response = IngestControl::writer_status(&adapter, Request::new(WriterStatusRequest {}))
+            .await?
+            .into_inner();
+        assert_eq!(
+            response.chain_view.and_then(|view| view.upstream_tip),
+            None,
+            "an unreachable node has no tip to report"
+        );
+        assert_eq!(response.gap_blocks, None);
 
         fixture.shutdown().await
     }

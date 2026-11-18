@@ -13,8 +13,8 @@ use zinder_core::wire::encode_zinder_native_chain_name;
 use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 use zinder_compat_lightwalletd::{
-    IngestControlMempoolSurface, LightwalletdGrpcAdapter, LightwalletdPing,
-    spawn_ingest_control_tip_change_publisher,
+    IngestControlMempoolSurface, LightwalletdGrpcAdapter, LightwalletdPing, NodeTipWitness,
+    spawn_ingest_control_tip_change_publisher, spawn_node_tip_witness,
 };
 use zinder_runtime::{
     OpsHealthcheckArgs, OpsServerError, Readiness, RuntimeService, StartupPhase,
@@ -280,11 +280,14 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         .with_tree_state_replay_wait(tree_state_replay_wait)
         .with_tree_state_replay_waiters_per_slot(tree_state_replay_waiters_per_slot);
     let cancel = CancellationToken::new();
+    let (node_tip_witness, node_tip_witness_handle) =
+        spawn_configured_node_tip_witness(&lightwalletd_config, &cancel);
     let grpc_adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(wallet_query)?
         .with_max_concurrent_block_range_streams(
             lightwalletd_config.max_concurrent_block_range_streams,
         )
         .with_stale_tip_limit(lightwalletd_config.stale_tip_limit)
+        .with_node_tip_witness(node_tip_witness)
         .with_ping(configured_ping(&lightwalletd_config, &cancel));
     let ops_handle = spawn_ops_endpoint_for(
         RuntimeService::CompatLightwalletd,
@@ -404,6 +407,8 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     if let Some(handle) = ops_handle {
         handle.shutdown().await?;
     }
+
+    await_node_tip_witness(node_tip_witness_handle).await;
 
     // Drain the tip-change publisher so a panic in its task surfaces in
     // the operator's log instead of vanishing silently. The publisher's
@@ -529,11 +534,14 @@ async fn run_compact_blocks(
     let visible_height = Some(slot.capture().event_fence().visible_tip().height.value());
     open_storage_phase.complete();
     let cancel = CancellationToken::new();
+    let (node_tip_witness, node_tip_witness_handle) =
+        spawn_configured_node_tip_witness(&lightwalletd_config, &cancel);
     let grpc_adapter = compact_block_serving::CompactBlockAdapter::new(slot)
         .with_max_concurrent_block_range_streams(
             lightwalletd_config.max_concurrent_block_range_streams,
         )
         .with_stale_tip_limit(lightwalletd_config.stale_tip_limit)
+        .with_node_tip_witness(node_tip_witness)
         .with_ping(configured_ping(&lightwalletd_config, &cancel));
     let ops_handle = spawn_ops_endpoint_for(
         RuntimeService::CompatLightwalletd,
@@ -602,6 +610,7 @@ async fn run_compact_blocks(
     if let Some(handle) = ops_handle {
         handle.shutdown().await?;
     }
+    await_node_tip_witness(node_tip_witness_handle).await;
     match publisher_handle.await {
         Ok(()) => {}
         Err(error) => tracing::error!(
@@ -718,6 +727,34 @@ impl From<Cli> for LightwalletdConfigOverrides {
             reorg_window_blocks: cli.reorg_window_blocks,
             ping_very_insecure: cli.ping_very_insecure,
         }
+    }
+}
+
+/// Starts reading the writer's report of its node from ingest control, at
+/// the cadence the reader already observes ingest control with.
+fn spawn_configured_node_tip_witness(
+    lightwalletd_config: &config::LightwalletdConfig,
+    cancel: &CancellationToken,
+) -> (NodeTipWitness, tokio::task::JoinHandle<()>) {
+    spawn_node_tip_witness(
+        lightwalletd_config.ingest_control_addr.clone(),
+        lightwalletd_config.ingest_control_bearer_token.clone(),
+        lightwalletd_config.network,
+        lightwalletd_config.storage.secondary_catchup_interval,
+        cancel.clone(),
+    )
+}
+
+/// Joins the node-tip witness so a panic in its task reaches the log.
+async fn await_node_tip_witness(handle: tokio::task::JoinHandle<()>) {
+    if let Err(join_error) = handle.await {
+        tracing::warn!(
+            target: "zinder::compat_lightwalletd",
+            event = "node_tip_witness_join_failed",
+            panicked = join_error.is_panic(),
+            error = %join_error,
+            "node-tip witness task did not exit cleanly",
+        );
     }
 }
 

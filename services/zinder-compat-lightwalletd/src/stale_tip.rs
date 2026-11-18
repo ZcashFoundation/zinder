@@ -7,8 +7,10 @@
 //! on arrival. Go lightwalletd fails its tip calls while its node is down, and
 //! wallets treat that `UNAVAILABLE` as "this server is not usable now", so the
 //! compatibility server fails `GetLatestBlock` and `GetLightdInfo` the same
-//! way once its served tip is older than the limit. Every other call keeps
-//! serving the stored chain.
+//! way once its served tip is older than the limit and the writer's node does
+//! not vouch for it. A tip the node still reports is the chain tip of a quiet
+//! network and keeps answering. Every other call keeps serving the stored
+//! chain.
 
 use std::{
     sync::Arc,
@@ -19,7 +21,7 @@ use arc_swap::ArcSwapOption;
 use tonic::Status;
 use zinder_core::{BlockHeight, ChainEpochId};
 
-/// Default stale-tip limit on Mainnet and Testnet: 25 minutes.
+/// Default stale-tip limit on every network: 25 minutes.
 ///
 /// That is half the 50-minute window of the default transaction expiry, so a
 /// wallet is told well before a transaction built on the served tip would
@@ -55,20 +57,28 @@ impl StaleTipLimit {
     /// Checks a tip whose block time is `tip_block_time_unix_seconds` at
     /// `now_unix_seconds` for the tip call `method`.
     ///
+    /// A tip the writer's node vouches for, `node_vouches`, is the chain tip
+    /// however old it is, because the network has only been quiet, so only a
+    /// tip the node cannot vouch for is refused.
+    ///
     /// # Errors
     ///
-    /// Returns `UNAVAILABLE` when the tip's block is older than the limit,
-    /// and counts the refusal in
+    /// Returns `UNAVAILABLE` when the node does not vouch for the tip and the
+    /// tip's block is older than the limit, and counts the refusal in
     /// `zinder_compat_stale_tip_refusals_total{method}`.
     pub fn check(
         self,
         method: &'static str,
         tip_block_time_unix_seconds: i64,
         now_unix_seconds: i64,
+        node_vouches: bool,
     ) -> Result<(), Status> {
         let Some(limit) = self.limit else {
             return Ok(());
         };
+        if node_vouches {
+            return Ok(());
+        }
         let age_seconds =
             u64::try_from(now_unix_seconds.saturating_sub(tip_block_time_unix_seconds))
                 .unwrap_or(0);
@@ -78,7 +88,8 @@ impl StaleTipLimit {
         metrics::counter!(STALE_TIP_REFUSALS_COUNTER, "method" => method).increment(1);
         Err(Status::unavailable(format!(
             "the newest block this server serves is {} minutes old, past its {}-minute stale-tip \
-             limit; its node may be unreachable, so retry later or use another server",
+             limit, and its node has not confirmed that block as the chain tip; retry later or use \
+             another server",
             age_seconds / 60,
             limit.as_secs() / 60,
         )))
@@ -163,15 +174,29 @@ mod tests {
     #[test]
     fn a_tip_within_the_limit_answers_and_an_older_one_is_unavailable() {
         let limit = StaleTipLimit::after(Duration::from_mins(25));
-        assert!(limit.check("get_latest_block", NOW - 25 * 60, NOW).is_ok());
+        assert!(
+            limit
+                .check("get_latest_block", NOW - 25 * 60, NOW, false)
+                .is_ok()
+        );
         // A tip mined ahead of the local clock is fresh.
-        assert!(limit.check("get_latest_block", NOW + 600, NOW).is_ok());
+        assert!(
+            limit
+                .check("get_latest_block", NOW + 600, NOW, false)
+                .is_ok()
+        );
         assert_eq!(
             limit
-                .check("get_latest_block", NOW - 25 * 60 - 1, NOW)
+                .check("get_latest_block", NOW - 25 * 60 - 1, NOW, false)
                 .err()
                 .map(|status| status.code()),
             Some(Code::Unavailable)
+        );
+        // The node vouches for an old tip: the chain is only quiet.
+        assert!(
+            limit
+                .check("get_latest_block", NOW - 24 * 60 * 60, NOW, true)
+                .is_ok()
         );
     }
 
@@ -179,7 +204,7 @@ mod tests {
     fn a_disabled_limit_answers_any_tip() {
         assert!(
             StaleTipLimit::DISABLED
-                .check("get_lightd_info", 0, NOW)
+                .check("get_lightd_info", 0, NOW, false)
                 .is_ok()
         );
     }

@@ -8,6 +8,7 @@ mod block_range;
 mod grpc;
 mod mempool;
 mod network_tip_estimate;
+mod node_tip_witness;
 mod ping;
 mod request_limits;
 mod stale_tip;
@@ -29,6 +30,10 @@ pub use mempool::{
     spawn_ingest_control_tip_change_publisher,
 };
 pub use network_tip_estimate::estimated_network_height;
+pub use node_tip_witness::{
+    NODE_TIP_OBSERVATION_MAX_AGE, NodeTipWitness, node_tip_from_writer_status,
+    spawn_node_tip_witness,
+};
 pub use ping::LightwalletdPing;
 pub use request_limits::COMPACT_TX_STREAMER_FIELD_LIMITS;
 pub use stale_tip::{DEFAULT_STALE_TIP_LIMIT, StaleTipLimit, TipBlockTimeCache, unix_now_seconds};

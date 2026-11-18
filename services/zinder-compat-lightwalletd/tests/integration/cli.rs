@@ -563,13 +563,13 @@ fn compact_blocks_rejects_the_tree_state_replay_wait() -> eyre::Result<()> {
     Ok(())
 }
 
-/// The stale-tip limit defaults by network and is bounded.
+/// The stale-tip limit defaults to 25 minutes on every network and is
+/// bounded.
 ///
-/// It is 25 minutes on Mainnet and Testnet and off on Regtest, which mines on
-/// demand. An operator may set any limit of at least five minutes, or 0 to
-/// serve through any outage.
+/// An operator may set any limit of at least five minutes, or 0 to serve
+/// through any outage.
 #[test]
-fn stale_tip_limit_defaults_by_network_and_is_bounded() -> eyre::Result<()> {
+fn stale_tip_limit_defaults_to_25_minutes_and_is_bounded() -> eyre::Result<()> {
     let tempdir = tempdir()?;
     let config_path = tempdir.path().join("zinder-compat.toml");
     fs::write(
@@ -592,7 +592,7 @@ fn stale_tip_limit_defaults_by_network_and_is_bounded() -> eyre::Result<()> {
     };
 
     for (network, configured, expected) in [
-        ("zcash-regtest", None, "0"),
+        ("zcash-regtest", None, "1500000"),
         ("zcash-testnet", None, "1500000"),
         ("zcash-mainnet", None, "1500000"),
         ("zcash-mainnet", Some("0"), "0"),
