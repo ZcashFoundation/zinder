@@ -1,4 +1,4 @@
-# ADR-0011: Ingest control uses a bearer token, not built-in TLS
+# ADR-0011: Ingest control authenticates with a bearer token, and the operator provides TLS
 
 Status: Accepted
 
@@ -8,7 +8,7 @@ Status: Accepted
 
 The supported deployment runs every runtime on one host ([ADR-0004](0004-storage-and-deployment-topologies.md)), so the endpoint normally listens on loopback. An attacker with code execution on that host can already read the store directory, which is the stronger boundary. Some deployments still put the endpoint on a container or private network, where a network check adds real protection.
 
-Native TLS would bring certificate provisioning, rotation, and CA distribution into Zinder. Operators who need encryption already run a reverse proxy for the public wallet listener, and Zinder ships no built-in TLS on any listener ([Service operations](../architecture/service-operations.md#security-boundary)).
+Native TLS would bring certificate provisioning, rotation, and CA distribution into Zinder. Operators who need encryption already run a reverse proxy for the public wallet listener, and TLS termination for every Zinder listener belongs in that proxy ([Service operations](../architecture/service-operations.md#security-boundary)).
 
 ## Decision
 
@@ -16,7 +16,7 @@ Native TLS would bring certificate provisioning, rotation, and CA distribution i
 2. **Any non-loopback bind requires a shared bearer token.** Ingest refuses to start when `ingest_control.listen_addr` is outside loopback and `ingest_control.bearer_token_path` is unset. A public or unspecified address additionally requires `security.allow_public_bind`.
 3. **The token comes from a file.** Every process that dials `IngestControl` reads the same file and sends the token on every call. The writer checks it in constant time. Environment variables are not supported, because they leak into process listings and debugger snapshots. The token is redacted from logs and `--print-config`. Rotation means replacing the file and restarting every process that shares it.
 4. **Checkpoint creation has its own capability token.** The writer refuses owner checkpoint creation unless `ingest_control.checkpoint_bearer_token_path` is configured, and then requires that second token on the call. Reader processes never receive it.
-5. **Encryption belongs to the operator.** Zinder ships no TLS on `IngestControl`. When its traffic must cross an untrusted network, the operator wraps it in a VPN or a TLS-terminating proxy that forwards h2c and passes the `authorization` header through.
+5. **Encryption belongs to the operator.** When `IngestControl` traffic must cross an untrusted network, the operator wraps it in a VPN or a TLS-terminating proxy that forwards h2c and passes the `authorization` header through.
 
 [Configuration](../reference/configuration.md) lists the `[ingest_control]` keys.
 

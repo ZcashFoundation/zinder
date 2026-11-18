@@ -65,9 +65,10 @@ the memory held by blocks in flight. See
 
 ### Restart during construction
 
-Construction does not resume. Any stop before publication discards staging
-and rebuilds from genesis, construction never fails over, and the projector
-follows the same rule; see
+A restart during construction starts the build over. Any stop before
+publication discards staging, and the next start rebuilds from genesis.
+Construction does not fail over between nodes. The projector follows the same
+rule; see
 [Initial sync](../runbooks/initial-sync.md#restarts-during-the-first-sync).
 
 ## Continuous following
@@ -99,8 +100,8 @@ loaded its snapshot. See [Readiness](../reference/readiness.md).
 
 ### Reorgs and the reorg window
 
-Ingest can replace only the newest `ingest.reorg_window_blocks` blocks, 1,000
-by default. The block at the bottom of that window is the settled tip, and
+Ingest replaces blocks within the newest `ingest.reorg_window_blocks` blocks,
+1,000 by default. The block at the bottom of that window is the settled tip, and
 ingest never rewrites it or anything below it.
 [ADR-0010](../adrs/0010-reorg-window-and-displaced-blocks.md) explains why the
 default matches the node's own finalization bound.
@@ -181,10 +182,10 @@ another branch above the settled tip, which it handles as a reorg. It logs
 `node_endpoint_switched`, restarts the mempool stream from the new endpoint,
 and stays not ready until that snapshot loads.
 
-Limits:
+Failover rules:
 
-- There is no timed failback. The next switch walks the list from position 0,
-  and a restart starts at position 0.
+- The follower stays on its new endpoint until the next switch, which walks
+  the list from position 0. A restart also starts at position 0.
 - Every endpoint must advertise the same activation table.
 - Each endpoint keeps its own `request_timeout_secs` and `max_response_bytes`.
 
@@ -232,8 +233,9 @@ through the private control API. See
 
 Ingest indexes Zcash Mainnet, Testnet, and Regtest, each with a fixed genesis
 hash. Custom activation heights work, because ingest reads them from the node.
-A Zebra or Zakura test network with its own genesis block is not supported:
-ingest refuses to start on it, checkpointed builds included.
+Ingest requires one of these genesis hashes, so it refuses to start on a Zebra
+or Zakura test network with its own genesis block, checkpointed builds
+included.
 
 ## Invariants
 

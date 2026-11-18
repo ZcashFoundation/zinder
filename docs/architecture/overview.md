@@ -12,7 +12,7 @@ consumers at the same time: wallets that speak the lightwalletd protocol,
 native clients, and optional explorers. Each consumer reads the same index
 instead of building its own.
 
-Zinder serves chain data only. Keys, note scanning, and balances of shielded
+Zinder serves public chain data. Keys, note scanning, and balances of shielded
 funds stay in the wallet. For how Zinder compares with Zebra, Zakura, Go
 lightwalletd, and other indexers, see the
 [indexer comparison](../reference/indexer-comparison.md).
@@ -57,9 +57,9 @@ flowchart LR
     Query -.-> Explorer
 ```
 
-The supported deployment runs every runtime on one host, because RocksDB
-secondaries only work on the same filesystem as the primary. There are no read
-replicas on other hosts. Remote consumers connect over gRPC. For the
+The supported deployment runs every runtime on one host, because a RocksDB
+secondary reads the primary's files on the same filesystem. Remote consumers
+connect over gRPC. For the
 supported topologies and their requirements, see
 [service operations](service-operations.md) and
 [deploying Zinder](../runbooks/deploying.md).

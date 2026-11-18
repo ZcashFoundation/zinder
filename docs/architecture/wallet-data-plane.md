@@ -2,7 +2,7 @@
 
 This page describes what the native `zinder.v1.wallet.WalletQuery` gRPC service returns and the rules a client can rely on: which reads agree with each other, how ranges and pages are bounded, and which errors to handle. It is for developers who build a wallet backend or SDK against `zinder-query`. Clients of the lightwalletd protocol use `zinder-compat-lightwalletd` instead, described in [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md).
 
-Zinder serves public chain data only. Keys, trial decryption, note and account state, and transaction building stay in the wallet, as [Overview](overview.md) explains. The reasons for this API shape are recorded in [ADR-0014](../adrs/0014-consumer-neutral-wallet-data-plane.md) and [ADR-0015](../adrs/0015-wallet-runtime-composition.md). Capability strings are listed in [Capabilities](../reference/capabilities.md), and error reasons with their retry rules in [Error vocabulary](../reference/error-vocabulary.md).
+Zinder serves public chain data. Keys, trial decryption, note and account state, and transaction building stay in the wallet, as [Overview](overview.md) explains. The reasons for this API shape are recorded in [ADR-0014](../adrs/0014-consumer-neutral-wallet-data-plane.md) and [ADR-0015](../adrs/0015-wallet-runtime-composition.md). Capability strings are listed in [Capabilities](../reference/capabilities.md), and error reasons with their retry rules in [Error vocabulary](../reference/error-vocabulary.md).
 
 ## How reads stay consistent
 
@@ -162,7 +162,7 @@ The writer, `zinder-ingest`, owns the live mempool view. `zinder-query` forwards
 
 Mempool events are retained for 60 minutes after mining and 24 hours after invalidation by default. An expired cursor fails with `MEMPOOL_EVENT_CURSOR_EXPIRED`.
 
-There is no transparent lookup by address or outpoint in the mempool. Each `MempoolEntry` carries `transparent_outputs` and `transparent_spends`, so a client that watches addresses filters entries itself. Shielded mempool interest is found the same way, by scanning `compact_transaction_data` locally.
+A client that watches transparent addresses filters mempool entries itself, using the `transparent_outputs` and `transparent_spends` each `MempoolEntry` carries. The mempool has no lookup by address or outpoint. Shielded mempool interest is found the same way, by scanning `compact_transaction_data` locally.
 
 ## Transparent address data
 
@@ -170,7 +170,7 @@ Transparent addresses and their outputs are public on chain. These reads still r
 
 An address is given as an `AddressLookup`: either the 32-byte SHA-256 of its `scriptPubKey`, or the base58 address text. Text longer than 64 bytes, an invalid address, or an address for another network fails with `INVALID_ARGUMENT` and `INVALID_ADDRESS`.
 
-These reads come from the wallet store that `zinder-projector` writes. Its history matches the canonical store's. A wallet-serving store starts at height 1. A store built from a recent checkpoint lacks older rows and is not suitable for wallets that restore from an old birthday.
+These reads come from the wallet store that `zinder-projector` writes. Its history matches the canonical store's. A wallet-serving store starts at height 1. Wallets that restore from an old birthday need a store with complete history, because a store built from a recent checkpoint lacks older rows.
 
 ### Unspent outputs
 
@@ -188,7 +188,7 @@ The server reads the set in pages of 1,024 outputs and reads the next page only 
 - A cursor resumes on the epoch that issued it. Once that epoch is released, the next page fails with `CHAIN_EPOCH_PIN_UNAVAILABLE`. Restart the history from its first page.
 - The request has no `at_epoch_id`. `zinder-client` checks the header epoch against its snapshot instead and reports a mismatch as `ChainEpochPinUnavailable`.
 
-History is ascending only. For newest-first address history, use `ExplorerQuery.TransparentAddressActivity`.
+History is in ascending order. For newest-first address history, use `ExplorerQuery.TransparentAddressActivity`.
 
 ### Outpoint spend status
 
@@ -208,11 +208,11 @@ A request with no outpoints or more than 1,024 fails with `INVALID_ARGUMENT` and
 
 ### Balance
 
-The wallet store keeps a balance for each transparent address, but the native service has no balance method. The compatibility runtime serves those balances through the lightwalletd `GetTaddressBalance` methods, as [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md) describes. Native wallets sum the unspent outputs they read. Explorer clients use `ExplorerQuery.TransparentAddressActivity`.
+The wallet store keeps a balance for each transparent address. The compatibility runtime serves those balances through the lightwalletd `GetTaddressBalance` methods, as [Lightwalletd compatibility](../reference/lightwalletd-compatibility.md) describes. Native wallets sum the unspent outputs they read, because the native service has no balance method. Explorer clients use `ExplorerQuery.TransparentAddressActivity`.
 
 ## Value pools
 
-`ChainValuePoolsAtTip` is in the protocol but not advertised. A call fails with `FAILED_PRECONDITION` and `ENDPOINT_CAPABILITY_UNAVAILABLE` without contacting the node. Zinder does not yet verify that its node returns the value-pool payload this method needs.
+`ChainValuePoolsAtTip` is in the protocol but not advertised, because Zinder does not verify that its node returns the value-pool payload this method needs. A call fails with `FAILED_PRECONDITION` and `ENDPOINT_CAPABILITY_UNAVAILABLE` without contacting the node.
 
 ## Broadcast
 
@@ -250,4 +250,4 @@ Without `[node]`, `wallet.broadcast.transaction_v1` is not advertised, and a bro
 
 ## Readiness and node outages
 
-A reader that is not ready rejects new requests with `UNAVAILABLE` and `SERVICE_NOT_READY`; `ErrorInfo.metadata["readiness_cause"]` names the cause. If the canonical writer stopped because a reorg exceeded its window, requests fail with `REORG_WINDOW_EXCEEDED` instead, and only an operator can recover. During a node outage, stored reads keep working while the tip stops advancing. [Readiness](../reference/readiness.md) lists the causes and what stays ready.
+A reader that is not ready rejects new requests with `UNAVAILABLE` and `SERVICE_NOT_READY`; `ErrorInfo.metadata["readiness_cause"]` names the cause. If the canonical writer stopped because a reorg exceeded its window, requests fail with `REORG_WINDOW_EXCEEDED` instead until an operator recovers the writer. During a node outage, stored reads keep working while the tip stops advancing. [Readiness](../reference/readiness.md) lists the causes and what stays ready.

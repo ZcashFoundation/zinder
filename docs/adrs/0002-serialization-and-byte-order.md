@@ -43,4 +43,4 @@ Hashes add a second problem. A Zcash 32-byte hash exists in two byte orders. The
 - **`rkyv` or another zero-copy format for canonical storage.** Alignment, validation, and migration constraints are too risky for chain data. A materialized-view cache may adopt one privately only after profiling shows at least a 30 percent P99 improvement on a real workload, including validation cost.
 - **FlatBuffers or Cap'n Proto.** Either would add a second IDL beside the protobuf that lightwalletd compatibility already requires.
 - **Internal byte order on the native wire.** It keeps storage and wire identical but pushes byte reversal onto every consumer, which is the defect this decision removes.
-- **Both forms as parallel fields.** Zinder's consumers are its own alpha clients, so one breaking change costs less than a deprecation cycle.
+- **Both forms as parallel fields.** Zinder's consumers are its own clients, so one breaking change costs less than a deprecation cycle.

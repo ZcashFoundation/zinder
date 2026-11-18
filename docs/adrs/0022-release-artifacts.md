@@ -75,9 +75,8 @@ The release procedure and how operators verify a download are in
   SLSA Build Level 2: the repository workflow is the build definition and is
   not an isolated builder, so Level 3 is not claimed. Provenance shows how an
   artifact was built, not that it is secure.
-- The SBOM names the Rust crate that builds RocksDB but lists no native C or
-  C++ package identities, because the release cannot yet produce that
-  inventory without guessing. That gap remains open.
+- The SBOM names the Rust crate that builds RocksDB and lists no native C or
+  C++ package identities, because the release does not guess at them.
 - A rerun may replace draft assets from the same commit. A published release
   is never modified.
 - Musl builds are not produced. They would be a separate product, not an

@@ -20,9 +20,9 @@ host requirements and a shorter quickstart.
   [What you need](deploying.md#what-you-need).
 - A reverse proxy for TLS, authentication, rate limits, and quotas.
 
-All stores live on one Docker volume. Do not split the processes across hosts:
-the readers open the stores as RocksDB secondaries, which works only on the
-same filesystem.
+All stores live on one Docker volume. Run every process on this host, because
+the readers open the stores as RocksDB secondaries on the writers'
+filesystem.
 
 ## Install
 
@@ -288,7 +288,7 @@ Inside the node network, consumers reach the Explorer at
 The views live in the data volume, under
 `/var/lib/zinder/canonical/materialized-views`. Ingest pauses them when the
 volume runs low on space, as
-[What it costs](../architecture/explorer-plane.md#what-it-costs) describes.
+[What it needs](../architecture/explorer-plane.md#what-it-needs) describes.
 
 A release that adds, removes, or changes an Explorer view refuses a view store
 built by another release. Ingest logs `materialized_view_store_open_failed`
@@ -352,8 +352,8 @@ traffic to a lane that already runs the earlier release.
 ## Inspect a runtime container
 
 The runtime images hold the service binary and the C and C++ runtime
-libraries it links. They have no shell, `curl`, or package manager, so
-`docker compose exec zinder-query sh` fails. Run the binary itself instead:
+libraries it links, without a shell, `curl`, or package manager. Inspect a
+container by running the binary itself, not `docker compose exec zinder-query sh`:
 
 ```bash
 cd /opt/zinder
@@ -393,15 +393,14 @@ the shell.
 | Ingest exits; `/readyz` reported `node_capability_missing` for `historical_block_bodies` | The node is pruned. | Use an archive node. |
 | Ingest `/readyz` reports `node_unavailable` while the node answers | Zinder cannot read the node's cookie, because the node runs under a UID other than 10001. | Use `basic` node authentication, or run the Zinder services as the node's UID, as [Runtime images](../architecture/service-operations.md#runtime-images) describes. |
 | Projector `/readyz` reports `wallet_transition_limit_exceeded` | One wallet update is larger than its limit, and the projector parked. | Raise `max_transition_logical_bytes` under `[projector.follow]` in `deploy/config/projector.toml` and restart the projector, as [Wallet transition exceeds its logical-byte limit](deploying-single-volume.md#wallet-transition-exceeds-its-logical-byte-limit) describes. |
-| Query and compatibility refuse requests with `REORG_WINDOW_EXCEEDED` | The node replaced more blocks than the 1000-block reorg window, so ingest stopped following. A correctly working node does not do this. | Look for a replaced, resynced, or misbehaving node. Confirm the correct chain, then rebuild the stores on empty paths. Restarting only parks ingest again. |
+| Query and compatibility refuse requests with `REORG_WINDOW_EXCEEDED` | The node replaced more blocks than the 1000-block reorg window, so ingest stopped following. A correctly working node does not do this. | Look for a replaced, resynced, or misbehaving node. Confirm the correct chain, then rebuild the stores on empty paths. A restart parks ingest again. |
 
 ## Side-by-side wallet rebuild and cutover
 
 The projector refuses some failures with a request to rebuild the wallet in a
 separate lane, for example when its cursor is no longer retained. Never
-rebuild a wallet store in place while readers serve it. The repository ships
-no Compose file for a second lane, so you provision lane B yourself, with all
-of these different from lane A:
+rebuild a wallet store in place while readers serve it. Provision lane B with
+your own Compose file, with all of these different from lane A:
 
 - the wallet store path and the projector's canonical secondary path;
 - the native query and compatibility secondary paths;
@@ -437,9 +436,9 @@ tar -xzf "zinder-${release#v}-${platform}.tar.gz"
 sudo install -m 0755 "zinder-${release#v}-${platform}"/bin/zinder-* /usr/local/bin/
 ```
 
-The repository ships no systemd units for the binaries and does not test this
-path. If you run them directly, start from the files in `deploy/config/`,
-which each binary reads with `--config`, and keep what Compose provides:
+When you run the binaries directly, you provide their process supervision,
+such as your own systemd units. Start from the files in `deploy/config/`,
+which each binary reads with `--config`, and provide what Compose provides:
 
 - one filesystem for every store, with the paths in those files;
 - the two control tokens at the configured paths;
@@ -449,5 +448,5 @@ which each binary reads with `--config`, and keep what Compose provides:
   node's user;
 - the start order ingest, projector, then the readers, each after the previous
   one is ready;
-- loopback listen addresses. `compat-lightwalletd.toml` binds `0.0.0.0:9067`,
-  which is safe only inside the Compose network namespace.
+- loopback listen addresses. `compat-lightwalletd.toml` binds `0.0.0.0:9067`
+  for the Compose network namespace, so set a loopback address in its place.

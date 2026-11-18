@@ -6,10 +6,10 @@ wallets on the internet. You put Caddy in front of
 new request only while Zinder reports ready, and forwards it to Zinder's
 plaintext gRPC listener on loopback.
 
-Zinder has no built-in TLS and does not authenticate wallet clients. TLS,
-client access rules, and rate limits belong in the proxy. What must stay
-private is described in
-[Service operations](../architecture/service-operations.md#security-boundary).
+TLS termination, client access rules, and rate limits belong in the proxy,
+and Zinder serves plaintext gRPC behind it. Keep private everything that
+[Service operations](../architecture/service-operations.md#security-boundary)
+lists.
 
 ## Prerequisites
 
@@ -17,10 +17,10 @@ private is described in
   [Initial sync](initial-sync.md).
 - A DNS name you control, with A and, if you publish IPv6, AAAA records that
   point to the host running Caddy.
-- A certificate and private key for that name. The template does not obtain
-  or renew certificates. Mobile wallets check the certificate against the
-  device's trust store, so use a publicly trusted certificate whose subject
-  alternative names include the exact DNS name.
+- A certificate and private key for that name, which you obtain and renew.
+  The template reads them from the files you name. Mobile wallets check the
+  certificate against the device's trust store, so use a publicly trusted
+  certificate whose subject alternative names include the exact DNS name.
 - Caddy v2 on the same host as Zinder, and `grpcurl` on a machine outside it.
 - Inbound TCP port 443 open to the internet. Every other Zinder port stays
   closed to the internet.
@@ -118,16 +118,15 @@ with a scan from outside.
 
 ## Add access control and rate limits
 
-The template enforces neither client authentication nor rate limits. Before
-you announce a public endpoint, add a policy in Caddy or in front of it that
-limits connections, requests, and concurrent streams per client. Leave room
-for normal wallet sync, which streams many blocks in a row.
+Add your client authentication and rate limits before you announce a public
+endpoint. Put a policy in Caddy or in front of it that limits connections,
+requests, and concurrent streams per client. Leave room for normal wallet
+sync, which streams many blocks in a row.
 
 ## Expose the native endpoint too
 
-The repository ships a template only for the compatibility endpoint. To
-expose the native `WalletQuery` endpoint, add a second site block with its
-own DNS name and certificate. Point its `forward_auth` at the query ops port
+To expose the native `WalletQuery` endpoint as well, add a second site block
+to the template, with its own DNS name and certificate. Point its `forward_auth` at the query ops port
 (`ZINDER_QUERY_OPS_HOST_PORT`, 9106 on Mainnet) and its `reverse_proxy` at
 `h2c://127.0.0.1:` plus the query gRPC port (`ZINDER_QUERY_HOST_PORT`, 9102 on
 Mainnet). Verify it the same way, calling
@@ -136,10 +135,9 @@ Mainnet). Verify it the same way, calling
 
 ## Supported wallets
 
-A working endpoint does not mean that a particular wallet app works with it.
-A named wallet is supported only after end-to-end certification, as described
-in
-[Lightwalletd compatibility](../reference/lightwalletd-compatibility.md#claim-boundary).
+Wallet apps are supported by name, each after end-to-end certification, as
+[Lightwalletd compatibility](../reference/lightwalletd-compatibility.md#claim-boundary)
+describes.
 When you test a wallet, configure its endpoint as `https://<your name>:443`
 and confirm that it does not fall back to a bundled server.
 

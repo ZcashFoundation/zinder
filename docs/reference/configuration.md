@@ -325,8 +325,8 @@ pool is full, a request from a connection that holds fewer slots takes the
 oldest slot of the connection that holds the most. The request that loses its
 slot fails with `UNAVAILABLE`. Retry these refusals with backoff.
 
-None of these limits is per client address. Behind a proxy, Zinder sees only
-the proxy's connections, so the proxy must enforce per-client limits.
+These limits count all clients together. Behind a proxy, Zinder sees the
+proxy's connections, so enforce per-client limits in the proxy.
 
 A response that the client stops reading, by withholding HTTP/2 flow-control
 window, ends after 60 seconds. A response that is waiting for the server to

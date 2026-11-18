@@ -5,8 +5,8 @@ what it answers and who it is for.
 
 ## Evaluate
 
-- [Use cases](use-cases.md): which products Zinder fits, and when something
-  simpler is enough.
+- [Use cases](use-cases.md): what Zinder gives each kind of product, and what
+  to enable for it.
 - [Indexer comparison](reference/indexer-comparison.md): Zinder beside Zebra,
   Zakura, ztreamer, Zingod, and Go lightwalletd, feature by feature.
 - [How Zinder works](architecture/overview.md): the processes, the stores, and

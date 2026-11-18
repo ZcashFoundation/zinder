@@ -8,9 +8,8 @@ Each store has one writer process, which opens it as the RocksDB primary.
 Every other process opens it read-only as a RocksDB secondary on the same
 filesystem. Stores never upgrade themselves in place: a store whose identity
 or layout does not match the binary is refused, and you rebuild it.
-[ADR-0004](../adrs/0004-storage-and-deployment-topologies.md) records why the
-supported topology is one host. It also records the multi-host PostgreSQL
-topology decided for hosted fleets, which is not implemented.
+[ADR-0004](../adrs/0004-storage-and-deployment-topologies.md) records why
+Zinder deploys on one host.
 [ADR-0003](../adrs/0003-epoch-bound-reads-and-storage-roles.md) records the
 epoch-bound read and secondary model.
 
@@ -20,7 +19,7 @@ epoch-bound read and secondary model.
 | --- | --- | --- | --- | --- |
 | Canonical | `zinder-ingest` | `storage.path` | Chain truth and chain event history | The node |
 | Wallet | `zinder-projector` | `wallet.path` | Transparent address indexes | The canonical store |
-| Materialized views | `zinder-ingest`, only when `ingest.explorer_views = true` | `materialized-views` under `storage.path` | Explorer aggregates | The canonical store |
+| Materialized views | `zinder-ingest`, when `ingest.explorer_views = true` | `materialized-views` under `storage.path` | Explorer aggregates | The canonical store |
 
 The canonical and wallet paths must be separate directories. Each reader also
 needs its own secondary metadata path. For the canonical store, that is
@@ -68,7 +67,7 @@ sequence digest together, so a reader never sees part of a transition.
 
 ## Wallet store
 
-The wallet store holds transparent address data only. Shielded data, such as
+The wallet store holds transparent address data. Shielded data, such as
 compact blocks and tree states, stays in the canonical store. The wallet store
 is versioned by `WALLET_ROCKSDB_SCHEMA_VERSION` for its layout and
 `WALLET_PROJECTION_VALUE_ENCODING_VERSION` for its row values. Its control
@@ -200,13 +199,13 @@ When a store fails admission, build a fresh store. A materialized-view store wit
 ## Checkpoints
 
 A state bundle binds a canonical and a wallet checkpoint at one chain event,
-because independently timed copies are not coherent. No shipped command
-restores one; see
-[Service operations](service-operations.md#rebuilding-is-the-only-restore).
+because independently timed copies are not coherent. Recovery rebuilds the
+stores rather than restoring a bundle; see
+[Service operations](service-operations.md#restore-by-rebuilding).
 
 ## PostgreSQL benchmark arm
 
 `zinder-bench` includes a PostgreSQL implementation of the canonical replay
 storage benchmark, to compare it with RocksDB on the same captured corpus. It
-is benchmark code only. Zinder has no PostgreSQL storage backend. The
+is benchmark code; Zinder stores its data in RocksDB. The
 [storage benchmark environment](../../deploy/storage-benchmark.md) runs it.
