@@ -1196,7 +1196,8 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Milliseconds the served tip's block may predate the clock, while the \
-                      writer cannot vouch for it because its node is unreachable or ahead of it, \
+                      writer cannot vouch for it because its node is unreachable, behind the \
+                      network, or ahead of the writer, \
                       before lightwalletd \
                       `GetLatestBlock` and `GetLightdInfo` fail with `UNAVAILABLE`, so wallets \
                       stop building transactions on a stale tip. A tip the node still reports \

@@ -399,6 +399,63 @@ async fn tip_calls_refuse_an_old_tip_while_the_writer_is_behind_its_node() -> ey
     Ok(())
 }
 
+/// A node that answers but reports itself behind its peers cannot vouch for
+/// its tip, so an old tip is refused until the node has caught up.
+///
+/// A not-ready report derived only from the tip's age, which a quiet chain
+/// also raises, still vouches.
+#[tokio::test]
+async fn tip_calls_refuse_an_old_tip_while_the_node_reports_it_is_behind() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let recorder = EpochPinRecorder::new(store_fixture.query());
+    let node_tip_witness = NodeTipWitness::default();
+    let adapter = LightwalletdGrpcAdapter::new(recorder.clone())
+        .with_stale_tip_limit(StaleTipLimit::after(std::time::Duration::from_mins(25)))
+        .with_node_tip_witness(node_tip_witness.clone());
+    recorder.set_block_time(unix_now()? - 30 * 60);
+    let writer_status = |node_health_reason: Option<&str>| {
+        let tip = ACCEPTANCE_BLOCK_HEIGHT.value();
+        zinder_proto::v1::ingest::WriterStatusResponse {
+            network_name: zinder_core::wire::encode_zinder_native_chain_name(Network::ZcashRegtest)
+                .to_owned(),
+            chain_view: Some(zinder_proto::v1::wallet::ChainView {
+                upstream_tip: Some(zinder_proto::v1::wallet::UpstreamTip {
+                    committed_height: Some(tip),
+                    estimated_height: None,
+                }),
+                ..zinder_proto::v1::wallet::ChainView::default()
+            }),
+            upstream_not_ready: node_health_reason.map(|reason| {
+                // Zebra's `/ready` reports carry no heights; the writer
+                // reports the node tip its follower observed beside them.
+                zinder_proto::v1::ops::UpstreamNotReadyDetail {
+                    upstream_health_source: "zebra_ready_endpoint".to_owned(),
+                    upstream_health_reason: reason.to_owned(),
+                    ..zinder_proto::v1::ops::UpstreamNotReadyDetail::default()
+                }
+            }),
+            ..zinder_proto::v1::ingest::WriterStatusResponse::default()
+        }
+    };
+
+    let observe = |node_health_reason| {
+        node_tip_witness.observe(zinder_compat_lightwalletd::node_tip_from_writer_status(
+            &writer_status(node_health_reason),
+            Network::ZcashRegtest,
+        ));
+    };
+
+    observe(Some("syncing"));
+    assert_eq!(tip_call_codes(&adapter).await, REFUSED);
+    // The node catches up and reports the served tip as the chain tip.
+    observe(None);
+    assert_eq!(tip_call_codes(&adapter).await, ANSWERED);
+    // A quiet chain makes Zebra report the tip's age; that still vouches.
+    observe(Some("tip_age=1800s"));
+    assert_eq!(tip_call_codes(&adapter).await, ANSWERED);
+    Ok(())
+}
+
 /// With the stale-tip limit disabled, the tip calls keep answering however
 /// old the served tip is.
 #[tokio::test]

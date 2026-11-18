@@ -202,6 +202,17 @@ impl ComposedReadiness {
         self.composition.lock().inputs.get(&input).cloned()
     }
 
+    /// Returns the target height of the admission state.
+    ///
+    /// A refusing required input clears the target from
+    /// [`Self::runtime_readiness`]; this accessor still reports the one the
+    /// admission state last observed, such as the node tip a canonical
+    /// writer follows while its node-health probe reports not ready.
+    #[must_use]
+    pub fn admission_target_height(&self) -> Option<u32> {
+        self.composition.lock().admission.target_height
+    }
+
     /// Replaces one input's latest cause.
     pub fn publish_input(&self, input: ReadinessInput, cause: ReadinessCause) {
         self.publish_with(|composition| {

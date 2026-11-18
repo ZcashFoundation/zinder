@@ -163,6 +163,7 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
                 None,
                 &readiness_report,
                 node_source_observation.as_ref(),
+                self.readiness.admission_target_height(),
             )));
         }
         // A parked writer reports its frozen fence while it still answers;
@@ -185,6 +186,7 @@ impl IngestControl for CanonicalIngestControlGrpcAdapter {
             chain_epoch,
             &readiness_report,
             node_source_observation.as_ref(),
+            self.readiness.admission_target_height(),
         )))
     }
 
@@ -442,11 +444,15 @@ fn chain_epoch_committed_message(
     }
 }
 
+/// `followed_target` is the node tip the follower last observed, which the
+/// projected `readiness_report` drops while a required node-health input
+/// refuses.
 fn writer_status_response(
     network: Network,
     chain_epoch: Option<ChainEpoch>,
     readiness_report: &ReadinessReport,
     node_source_observation: Option<&ReadinessCause>,
+    followed_target: Option<u32>,
 ) -> WriterStatusResponse {
     let upstream_not_ready = [node_source_observation, Some(&readiness_report.cause)]
         .into_iter()
@@ -464,7 +470,7 @@ fn writer_status_response(
     let upstream_tip = if matches!(readiness_report.cause, ReadinessCause::NodeUnavailable(_)) {
         None
     } else {
-        upstream_tip_from_readiness(readiness_report, upstream_not_ready)
+        upstream_tip_from_readiness(followed_target, upstream_not_ready)
     };
     let gap_blocks = upstream_tip
         .as_ref()
@@ -492,27 +498,27 @@ fn writer_status_response(
 }
 
 fn upstream_tip_from_readiness(
-    readiness_report: &ReadinessReport,
+    followed_target: Option<u32>,
     upstream_not_ready: Option<&UpstreamNotReadyDetail>,
 ) -> Option<wallet::UpstreamTip> {
-    upstream_not_ready.map_or_else(
-        || {
-            readiness_report
-                .target_height
-                .map(|committed_height| wallet::UpstreamTip {
-                    committed_height: Some(committed_height),
-                    estimated_height: None,
-                })
-        },
-        |detail| {
-            (detail.upstream_committed_height.is_some()
-                || detail.upstream_estimated_height.is_some())
-            .then_some(wallet::UpstreamTip {
+    let followed_tip = || {
+        followed_target.map(|committed_height| wallet::UpstreamTip {
+            committed_height: Some(committed_height),
+            estimated_height: None,
+        })
+    };
+    // Zebra's `/ready` reports carry no heights, so a report without them
+    // leaves the node tip the follower observed.
+    upstream_not_ready
+        .filter(|detail| {
+            detail.upstream_committed_height.is_some() || detail.upstream_estimated_height.is_some()
+        })
+        .map_or_else(followed_tip, |detail| {
+            Some(wallet::UpstreamTip {
                 committed_height: detail.upstream_committed_height,
                 estimated_height: detail.upstream_estimated_height,
             })
-        },
-    )
+        })
 }
 
 fn chain_value_pools_response(
@@ -1244,6 +1250,74 @@ mod tests {
                 .and_then(|tip| tip.estimated_height),
             Some(visible_height.saturating_add(900))
         );
+
+        fixture.shutdown().await
+    }
+
+    /// A `/ready` not-ready report carries no heights, so writer status
+    /// reports the node tip the follower observed instead of no upstream tip.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn writer_status_reports_the_followed_node_tip_beside_a_heightless_probe_report()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = shared_control_fixture().await?;
+        let visible_height = fixture
+            .canonical
+            .chain_epoch()
+            .await?
+            .chain_epoch
+            .visible_tip_height
+            .value();
+        let readiness = Readiness::default();
+        let composed = ComposedReadiness::new(readiness.clone(), &[]);
+        composed.publish_admission(
+            ReadinessState::ready_with_target(Some(visible_height), Some(visible_height))
+                .with_phase(IngestPhase::FollowingTip),
+        );
+        composed.publish_input(
+            ReadinessInput::NodeSource,
+            ReadinessCause::UpstreamNotReady(UpstreamNotReadyDetail {
+                upstream_committed_height: None,
+                upstream_estimated_height: None,
+                upstream_verification_progress: None,
+                upstream_health: UpstreamHealth {
+                    source: std::borrow::Cow::Borrowed("zebra_ready_endpoint"),
+                    reason: std::borrow::Cow::Borrowed("tip_age=1800s"),
+                },
+            }),
+        );
+        let source: Arc<dyn NodeSource> = Arc::new(ZebraJsonRpcSource::new(
+            zinder_core::Network::ZcashTestnet,
+            "http://127.0.0.1:1",
+            NodeAuth::None,
+            Duration::from_secs(1),
+        )?);
+        let adapter = CanonicalIngestControlGrpcAdapter::new(
+            zinder_core::Network::ZcashTestnet,
+            fixture.canonical.clone(),
+            fixture.mempool.clone(),
+            source,
+            composed,
+        );
+
+        let response = IngestControl::writer_status(&adapter, Request::new(WriterStatusRequest {}))
+            .await?
+            .into_inner();
+        assert_eq!(
+            response
+                .upstream_not_ready
+                .as_ref()
+                .map(|detail| detail.upstream_health_reason.as_str()),
+            Some("tip_age=1800s")
+        );
+        assert_eq!(
+            response
+                .chain_view
+                .and_then(|view| view.upstream_tip)
+                .and_then(|tip| tip.committed_height),
+            Some(visible_height),
+            "the follower's observed node tip must stand in for a heightless report"
+        );
+        assert_eq!(response.gap_blocks, Some(0));
 
         fixture.shutdown().await
     }
