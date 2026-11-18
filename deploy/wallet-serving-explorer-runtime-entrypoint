@@ -3,8 +3,8 @@
 set -eu
 
 # Runs the wallet-serving runtime entrypoint, which supervises zinder-ingest,
-# zinder-projector, and zinder-query over /var/lib/zinder, and starts
-# zinder-explorer once native wallet serving answers. The Explorer opens the
+# zinder-projector, zinder-query, and zinder-compat-lightwalletd over
+# /var/lib/zinder, and starts zinder-explorer once wallet serving answers. The Explorer opens the
 # materialized-view store that ingest writes and composes its wallet reads
 # through zinder-query. A wallet-serving exit stops the Explorer and ends the
 # container. An Explorer exit restarts only the Explorer, with a growing delay,
@@ -236,10 +236,11 @@ log "starting wallet serving"
 ) &
 wallet_serving_pid="$!"
 
-# The healthcheck passes once query admits traffic, while query serves the
-# typed refusal of a parked canonical writer, or while the projector is parked
-# on a wallet transition over its logical-byte limit, whether or not query
-# started behind it. The wallet-serving entrypoint keeps both parks up.
+# The healthcheck passes once both wallet readers admit traffic, while they
+# serve the typed refusal of a parked canonical writer, or while the projector
+# is parked on a wallet transition over its logical-byte limit, whether or not
+# the readers started behind it. The wallet-serving entrypoint keeps both
+# parks up.
 until "$wallet_serving_healthcheck" >/dev/null 2>&1; do
   if ! is_alive "$wallet_serving_pid"; then
     collect_wallet_serving_status

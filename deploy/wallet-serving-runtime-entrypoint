@@ -16,7 +16,7 @@ if [ "$indexer_tls_pem_present" -eq 1 ]; then
 fi
 
 # RocksDB opens the canonical primary, the in-process canonical secondary, the
-# materialized-view store, and both reader secondaries from one process table.
+# materialized-view store, and every reader secondary from one process table.
 nofile_limit=65536
 
 poll_interval_seconds=15
@@ -26,7 +26,9 @@ unready_report_interval_seconds=300
 
 # Railway drains this container for 30 seconds. The runtime processes get a
 # strictly shorter window so a flush that needs the full budget still finishes
-# before the platform sends SIGKILL.
+# before the platform sends SIGKILL. They all receive the signal at once and
+# stop in parallel, so the window does not grow with the process count; query
+# and compatibility each bound their own gRPC drain at 10 seconds to fit it.
 shutdown_grace_seconds=20
 
 # A phase that outlives its deadline names itself and its last readiness in the
@@ -36,7 +38,14 @@ shutdown_grace_seconds=20
 # A set but empty variable fails validation instead of taking the default.
 canonical_construction_deadline_seconds="${ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE_SECONDS-10800}"
 wallet_construction_deadline_seconds="${ZINDER_WALLET_SERVING__WALLET_CONSTRUCTION_DEADLINE_SECONDS-7200}"
+# Query and compatibility start together and share this one deadline.
 wallet_serving_deadline_seconds=1800
+
+# The lightwalletd compatibility reader runs beside native query unless this
+# is false, which leaves a memory-constrained host one reader fewer. A set but
+# empty variable fails validation instead of taking the default.
+lightwalletd_setting="${ZINDER_WALLET_SERVING__LIGHTWALLETD-true}"
+lightwalletd_enabled=1
 
 # Sync lag and transient faults clear on their own; a plane that stays unready
 # past this window ends the container so the platform restarts a clean set.
@@ -78,11 +87,13 @@ recurrence_min_answered_episode_seconds=60
 ingest_config_paths="network ops node node_fallbacks security ingest_control ingest retention storage.path storage.canonical storage.materialized_views storage.raw_blob_policy"
 projector_config_paths="network ops security ingest_control projector projector_control storage.canonical_path storage.canonical_secondary_path storage.canonical storage.raw_blob_policy wallet.path wallet.rocksdb"
 query_config_paths="network ops node node_fallbacks security ingest_control query wallet storage.path storage.secondary_path storage.canonical storage.raw_blob_policy storage.initial_catchup_timeout_ms storage.secondary_catchup_interval_ms storage.secondary_replica_lag_threshold_chain_epochs storage.serving_pair_staleness_ceiling_ms"
-entrypoint_config_paths="wallet_serving.canonical_construction_deadline_seconds wallet_serving.wallet_construction_deadline_seconds"
+compat_config_paths="network ops node node_fallbacks security ingest_control compat wallet storage.path storage.secondary_path storage.canonical storage.raw_blob_policy storage.initial_catchup_timeout_ms storage.secondary_catchup_interval_ms storage.secondary_replica_lag_threshold_chain_epochs storage.serving_pair_staleness_ceiling_ms"
+entrypoint_config_paths="wallet_serving.canonical_construction_deadline_seconds wallet_serving.wallet_construction_deadline_seconds wallet_serving.lightwalletd"
 
 ingest_ops_addr="127.0.0.1:9105"
 projector_ops_addr="127.0.0.1:9110"
 query_ops_addr="127.0.0.1:9106"
+compat_ops_addr="127.0.0.1:9107"
 
 ingest_control_token_path="/var/run/zinder-control/ingest.token"
 checkpoint_token_path="/var/run/zinder-checkpoint/checkpoint.token"
@@ -90,6 +101,7 @@ checkpoint_token_path="/var/run/zinder-checkpoint/checkpoint.token"
 ingest_pid=""
 projector_pid=""
 query_pid=""
+compat_pid=""
 sleep_pid=""
 
 # Per-plane recurrence counters. `*_flap_unready_since_epoch` is 0 while the
@@ -112,6 +124,12 @@ query_flap_unready_since_epoch=0
 query_flap_episode_counted=0
 query_cumulative_unready_seconds=0
 query_flap_ready_since_epoch=0
+
+compat_episode_count=0
+compat_flap_unready_since_epoch=0
+compat_flap_episode_counted=0
+compat_cumulative_unready_seconds=0
+compat_flap_ready_since_epoch=0
 
 probe_http_status=""
 probe_body=""
@@ -141,7 +159,7 @@ log() {
 stop_processes() {
   signal_name="$1"
 
-  for runtime_pid in "$query_pid" "$projector_pid" "$ingest_pid"; do
+  for runtime_pid in "$compat_pid" "$query_pid" "$projector_pid" "$ingest_pid"; do
     if [ -n "$runtime_pid" ]; then
       kill -s "$signal_name" "$runtime_pid" 2>/dev/null || true
     fi
@@ -159,6 +177,9 @@ alive_process_labels() {
   fi
   if [ -n "$query_pid" ] && kill -0 "$query_pid" 2>/dev/null; then
     labels="$labels zinder-query($query_pid)"
+  fi
+  if [ -n "$compat_pid" ] && kill -0 "$compat_pid" 2>/dev/null; then
+    labels="$labels zinder-compat-lightwalletd($compat_pid)"
   fi
 
   printf '%s' "${labels# }"
@@ -267,13 +288,12 @@ classify_probe_failure() {
 }
 
 # This probes only the ops `/readyz` listener, never the data-plane gRPC port
-# (`query.listen_addr` and its ingest/projector counterparts). A data-plane
-# probe, such as a `grpc.health.v1.Health` check or a round trip through the
-# existing `ServerInfo` RPC, would catch a wedged serving loop that keeps
-# answering `/readyz`, which is the blind spot that hid the outage this
-# detector responds to. Adding one is out of scope here: none of the three
-# gRPC servers register a health or reflection service yet
-# (zinder-proto/src/lib.rs documents reflection as unwired), and this image
+# (`query.listen_addr`, `compat.listen_addr`, and their ingest/projector
+# counterparts). A data-plane probe, such as a `grpc.health.v1.Health` check
+# or a round trip through the existing `ServerInfo` RPC, would catch a wedged
+# serving loop that keeps answering `/readyz`, which is the blind spot that
+# hid the outage this detector responds to. Adding one is out of scope here:
+# none of the gRPC servers register a health service yet, and this image
 # ships curl but no gRPC-aware client. A bare TCP connect to the data-plane
 # port would not close the gap either; a saturated tokio executor still
 # completes a TCP handshake without ever reaching the handler that a real
@@ -434,43 +454,64 @@ readiness_body_height() {
   printf '%s\n' "${height_fragment%%[!0-9]*}"
 }
 
-# Query publishes a pair only once the wallet reaches the canonical fence, so
-# behind a parked projector its refusal is the park's. Given whether the
-# projector is parked, succeeds when the query plane just probed answered
-# unready behind it. A query plane that stops answering still counts as
-# unready.
-query_unready_behind_projector_park() {
+# Query and compatibility publish a pair only once the wallet reaches the
+# canonical fence, so behind a parked projector their refusal is the park's.
+# Given whether the projector is parked, succeeds when the reader plane just
+# probed answered unready behind it. A reader plane that stops answering
+# still counts as unready.
+reader_unready_behind_projector_park() {
   [ "$1" -eq 1 ] && [ -n "$probe_http_status" ]
 }
 
-# Starts query and waits for it to admit traffic, unless the projector probe
-# that ended its startup wait reported the park. Query's startup fails closed
-# until it converges a serving pair, which a parked wallet never reaches, so
-# query would exit and restart the container into the same park. The
-# container instead stays up without query until the serving loop sees the
-# projector leave the park.
+# Names the wallet readers this container runs.
+wallet_reader_names() {
+  if [ "$lightwalletd_enabled" -eq 1 ]; then
+    printf 'zinder-query and zinder-compat-lightwalletd'
+  else
+    printf 'zinder-query'
+  fi
+}
+
+# Starts query and, unless it is turned off, compatibility, and waits for each
+# to admit traffic within the one serving deadline, unless the projector probe
+# that ended its startup wait reported the park. A reader's startup fails
+# closed until it converges a serving pair, which a parked wallet never
+# reaches, so it would exit and restart the container into the same park. The
+# container instead stays up without the readers until the serving loop sees
+# the projector leave the park.
 start_wallet_serving() {
   if readiness_cause_is_projector_park "$probe_cause"; then
-    log "zinder-query was not started: it cannot publish a serving pair behind the parked projector, so wallets are refused until an operator raises ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES and redeploys: $probe_report"
+    log "wallet readers not started ($(wallet_reader_names)): no reader can publish a serving pair behind the parked projector, so wallets are refused until an operator raises ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES and redeploys: $probe_report"
     projector_park_reported=1
     return 0
   fi
 
-  log "starting wallet serving"
+  log "starting wallet serving with $(wallet_reader_names)"
+  serving_started_epoch="$(date +%s)"
   start_runtime_process /usr/local/bin/zinder-query /etc/zinder/query.toml \
     "$query_config_paths"
   query_pid="$!"
-  await_readiness zinder-query "$query_ops_addr" "$wallet_serving_deadline_seconds"
+  if [ "$lightwalletd_enabled" -eq 1 ]; then
+    start_runtime_process /usr/local/bin/zinder-compat-lightwalletd \
+      /etc/zinder/compat-lightwalletd.toml "$compat_config_paths"
+    compat_pid="$!"
+  fi
+  await_readiness zinder-query "$query_ops_addr" "$wallet_serving_deadline_seconds" \
+    "$serving_started_epoch"
+  if [ -n "$compat_pid" ]; then
+    await_readiness zinder-compat-lightwalletd "$compat_ops_addr" \
+      "$wallet_serving_deadline_seconds" "$serving_started_epoch"
+  fi
   log "wallet serving is ready"
 }
 
 # Given whether the projector reported its park, whether it was unreachable,
 # and its report, fails once it answers with any other state while startup
-# left query stopped behind the park. The container then restarts, and startup
-# brings query up behind the moving wallet.
-require_projector_park_for_stopped_query() {
+# left the readers stopped behind the park. The container then restarts, and
+# startup brings the readers up behind the moving wallet.
+require_projector_park_for_stopped_readers() {
   if [ "$1" -eq 0 ] && [ "$2" -eq 0 ]; then
-    fail "zinder-projector no longer reports the wallet transition park; restarting so zinder-query starts behind it: $3"
+    fail "zinder-projector no longer reports the wallet transition park; restarting so $(wallet_reader_names) can start behind it: $3"
   fi
 }
 
@@ -484,18 +525,23 @@ assert_started_processes_alive() {
   if [ -n "$query_pid" ] && ! kill -0 "$query_pid" 2>/dev/null; then
     fail "zinder-query exited"
   fi
+  if [ -n "$compat_pid" ] && ! kill -0 "$compat_pid" 2>/dev/null; then
+    fail "zinder-compat-lightwalletd exited"
+  fi
 }
 
-# Waits for one plane to admit traffic. Every already-started process is
-# checked on each iteration: a plane reads canonical through a secondary of the
-# store the previous plane writes, so a dead upstream makes the awaited
-# readiness unreachable while the awaited process itself stays alive.
+# Waits for one plane to admit traffic within the phase deadline, measured
+# from the optional phase start epoch or from now. Every already-started
+# process is checked on each iteration: a plane reads canonical through a
+# secondary of the store the previous plane writes, so a dead upstream makes
+# the awaited readiness unreachable while the awaited process itself stays
+# alive.
 await_readiness() {
   role="$1"
   ops_addr="$2"
   phase_deadline_seconds="$3"
 
-  phase_started_epoch="$(date +%s)"
+  phase_started_epoch="${4:-$(date +%s)}"
   deadline_epoch=$((phase_started_epoch + phase_deadline_seconds))
   next_report_epoch=$((phase_started_epoch + unready_report_interval_seconds))
 
@@ -756,6 +802,31 @@ require_known_entrypoint_settings() {
   fi
 }
 
+# Sets lightwalletd_enabled from $1, the ZINDER_WALLET_SERVING__LIGHTWALLETD
+# value, which is true or false in any letter case; any other value fails.
+resolve_lightwalletd_setting() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    true) lightwalletd_enabled=1 ;;
+    false) lightwalletd_enabled=0 ;;
+    *) fail "ZINDER_WALLET_SERVING__LIGHTWALLETD must be true or false, got '$1'" ;;
+  esac
+}
+
+# Query and compatibility each open process-unique canonical and wallet
+# secondary generations, and nothing stops two readers from sharing a root. A
+# secondary path variable reaches both readers, so it fails while both run.
+require_distinct_reader_secondaries() {
+  [ "$lightwalletd_enabled" -eq 1 ] || return 0
+  for secondary_path_setting in storage.secondary_path wallet.secondary_path; do
+    if [ -n "$(zinder_setting "$secondary_path_setting")" ]; then
+      secondary_path_variable="ZINDER_$(
+        printf '%s' "$secondary_path_setting" | sed 's/\./__/g' | tr '[:lower:]' '[:upper:]'
+      )"
+      fail "$secondary_path_variable would give zinder-query and zinder-compat-lightwalletd the same secondary root; remove it, or set ZINDER_WALLET_SERVING__LIGHTWALLETD=false"
+    fi
+  done
+}
+
 # Prints the value of the `ZINDER_*` variable that sets configuration path $1,
 # matched as zinder_variables_outside matches names, so a variable the
 # binaries read in any letter case counts.
@@ -819,10 +890,17 @@ require_positive_seconds ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE_
   "$canonical_construction_deadline_seconds"
 require_positive_seconds ZINDER_WALLET_SERVING__WALLET_CONSTRUCTION_DEADLINE_SECONDS \
   "$wallet_construction_deadline_seconds"
+resolve_lightwalletd_setting "$lightwalletd_setting"
+require_distinct_reader_secondaries
 
+started_config_paths="$ingest_config_paths $projector_config_paths $query_config_paths"
+if [ "$lightwalletd_enabled" -eq 1 ]; then
+  started_config_paths="$started_config_paths $compat_config_paths"
+else
+  log "lightwalletd compatibility is turned off by ZINDER_WALLET_SERVING__LIGHTWALLETD; port 9067 stays closed"
+fi
 unread_variables="$(
-  zinder_variables_outside \
-    "$ingest_config_paths $projector_config_paths $query_config_paths $entrypoint_config_paths" \
+  zinder_variables_outside "$started_config_paths $entrypoint_config_paths" \
     | sort | tr '\n' ' '
 )"
 if [ -n "$unread_variables" ]; then
@@ -837,7 +915,9 @@ mkdir -p \
   /var/lib/zinder/checkpoints \
   /var/lib/zinder/projector/canonical-secondary \
   /var/lib/zinder/query/canonical-secondary \
-  /var/lib/zinder/query/wallet-secondary
+  /var/lib/zinder/query/wallet-secondary \
+  /var/lib/zinder/compat/canonical-secondary \
+  /var/lib/zinder/compat/wallet-secondary
 chown -R zinder:zinder /var/lib/zinder
 
 # The runtime shell implements the open-file resource POSIX leaves undefined.
@@ -851,7 +931,9 @@ materialize_token "$checkpoint_token_path" "${CHECKPOINT_BEARER_TOKEN:-}"
 if [ -n "${ZINDER_INGEST__REORG_WINDOW_BLOCKS:-}" ]; then
   ZINDER_PROJECTOR__REORG_WINDOW_BLOCKS="$ZINDER_INGEST__REORG_WINDOW_BLOCKS"
   ZINDER_QUERY__REORG_WINDOW_BLOCKS="$ZINDER_INGEST__REORG_WINDOW_BLOCKS"
-  export ZINDER_PROJECTOR__REORG_WINDOW_BLOCKS ZINDER_QUERY__REORG_WINDOW_BLOCKS
+  ZINDER_COMPAT__REORG_WINDOW_BLOCKS="$ZINDER_INGEST__REORG_WINDOW_BLOCKS"
+  export ZINDER_PROJECTOR__REORG_WINDOW_BLOCKS ZINDER_QUERY__REORG_WINDOW_BLOCKS \
+    ZINDER_COMPAT__REORG_WINDOW_BLOCKS
 fi
 
 log "starting canonical construction (deadline ${canonical_construction_deadline_seconds}s)"
@@ -874,19 +956,20 @@ startup_completed_epoch="$(date +%s)"
 ingest_flap_ready_since_epoch="$startup_completed_epoch"
 projector_flap_ready_since_epoch="$startup_completed_epoch"
 query_flap_ready_since_epoch="$startup_completed_epoch"
+compat_flap_ready_since_epoch="$startup_completed_epoch"
 
 # A surviving subset of the topology answers requests it cannot satisfy, so one
 # exit terminates the container and the orchestrator restarts a clean set.
 # Liveness alone does not prove the topology advances, so readiness carries the
 # signal that liveness cannot. A canonical writer parked on an oversized reorg
-# is the exception: its planes report `reorg_window_exceeded`, query refuses
-# wallets with the typed status, and the container keeps that refusal up
-# instead of restarting into the same park. A projector parked on a wallet
+# is the exception: its planes report `reorg_window_exceeded`, the readers
+# refuse wallets with the typed status, and the container keeps that refusal
+# up instead of restarting into the same park. A projector parked on a wallet
 # transition over its logical-byte limit is the other: it reports
-# `wallet_transition_limit_exceeded`, query's answered refusals behind it
+# `wallet_transition_limit_exceeded`, the readers' answered refusals behind it
 # count as serving, and the container stays up for the same reason. When
-# startup left query stopped behind that park, the container restarts once
-# the projector answers with any other state, so startup brings query up
+# startup left the readers stopped behind that park, the container restarts
+# once the projector answers with any other state, so startup brings them up
 # behind the moving wallet.
 unready_since_epoch=0
 
@@ -931,20 +1014,39 @@ while true; do
   query_unreachable=0
   query_body=""
   if [ -z "$query_pid" ]; then
-    require_projector_park_for_stopped_query "$projector_parked" \
+    require_projector_park_for_stopped_readers "$projector_parked" \
       "$projector_unreachable" "$projector_report"
     query_ready=1
     query_report="not started behind the parked projector"
   else
     if observe_plane_readiness zinder-query "$query_ops_addr"; then
       query_ready=1
-    elif query_unready_behind_projector_park "$projector_parked"; then
+    elif reader_unready_behind_projector_park "$projector_parked"; then
       query_ready=1
     fi
     query_report="$probe_report"
     query_body="$probe_body"
     if [ -z "$probe_http_status" ]; then
       query_unreachable=1
+    fi
+    plane_halted=$((plane_halted | probe_halted))
+  fi
+
+  # Startup starts compatibility with query, so it is stopped only behind the
+  # same park as query, or when it is turned off.
+  compat_ready=1
+  compat_unreachable=0
+  compat_report="not started"
+  if [ -n "$compat_pid" ]; then
+    compat_ready=0
+    if observe_plane_readiness zinder-compat-lightwalletd "$compat_ops_addr"; then
+      compat_ready=1
+    elif reader_unready_behind_projector_park "$projector_parked"; then
+      compat_ready=1
+    fi
+    compat_report="$probe_report"
+    if [ -z "$probe_http_status" ]; then
+      compat_unreachable=1
     fi
     plane_halted=$((plane_halted | probe_halted))
   fi
@@ -984,7 +1086,7 @@ while true; do
   fi
 
   if [ "$projector_parked" -eq 1 ] && [ "$projector_park_reported" -eq 0 ]; then
-    log "zinder-projector is parked on a wallet transition over projector.follow.max_transition_logical_bytes; wallets receive SERVICE_NOT_READY once query's last pair goes stale, until an operator raises ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES and redeploys: $projector_report"
+    log "zinder-projector is parked on a wallet transition over projector.follow.max_transition_logical_bytes; wallets receive SERVICE_NOT_READY once each reader's last pair goes stale, until an operator raises ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES and redeploys: $projector_report"
     projector_park_reported=1
   elif [ "$projector_parked" -eq 0 ] && [ "$projector_park_reported" -eq 1 ]; then
     log "zinder-projector no longer reports the wallet transition park"
@@ -1030,6 +1132,19 @@ while true; do
   query_total_unready_seconds="$6"
   query_escalate="$7"
 
+  # shellcheck disable=SC2046 # word-splitting the fixed-width numeric fields update_plane_recurrence prints is intentional; see its own comment.
+  set -- $(update_plane_recurrence zinder-compat-lightwalletd "$compat_ready" "$compat_unreachable" \
+    "$now_epoch" "$compat_episode_count" "$compat_flap_unready_since_epoch" \
+    "$compat_flap_episode_counted" "$compat_cumulative_unready_seconds" \
+    "$compat_flap_ready_since_epoch" "$compat_report")
+  compat_episode_count="$1"
+  compat_flap_unready_since_epoch="$2"
+  compat_flap_episode_counted="$3"
+  compat_cumulative_unready_seconds="$4"
+  compat_flap_ready_since_epoch="$5"
+  compat_total_unready_seconds="$6"
+  compat_escalate="$7"
+
   if [ "$ingest_escalate" -eq 1 ]; then
     fail "zinder-ingest recurrence budget exceeded: $ingest_episode_count episode(s), ${ingest_total_unready_seconds}s unready without a sustained recovery: $ingest_report"
   fi
@@ -1039,8 +1154,12 @@ while true; do
   if [ "$query_escalate" -eq 1 ]; then
     fail "zinder-query recurrence budget exceeded: $query_episode_count episode(s), ${query_total_unready_seconds}s unready without a sustained recovery: $query_report"
   fi
+  if [ "$compat_escalate" -eq 1 ]; then
+    fail "zinder-compat-lightwalletd recurrence budget exceeded: $compat_episode_count episode(s), ${compat_total_unready_seconds}s unready without a sustained recovery: $compat_report"
+  fi
 
-  if [ "$ingest_ready" -eq 1 ] && [ "$projector_ready" -eq 1 ] && [ "$query_ready" -eq 1 ]; then
+  if [ "$ingest_ready" -eq 1 ] && [ "$projector_ready" -eq 1 ] && [ "$query_ready" -eq 1 ] \
+    && [ "$compat_ready" -eq 1 ]; then
     if [ "$unready_since_epoch" -ne 0 ]; then
       log "every plane admits traffic again"
       unready_since_epoch=0
@@ -1054,9 +1173,12 @@ while true; do
   elif [ "$projector_ready" -eq 0 ]; then
     hard_down_plane="zinder-projector"
     hard_down_report="$projector_report"
-  else
+  elif [ "$query_ready" -eq 0 ]; then
     hard_down_plane="zinder-query"
     hard_down_report="$query_report"
+  else
+    hard_down_plane="zinder-compat-lightwalletd"
+    hard_down_report="$compat_report"
   fi
 
   if [ "$unready_since_epoch" -eq 0 ]; then

@@ -8,7 +8,7 @@ canonical_path = "/var/lib/zinder/canonical"
 canonical_secondary_path = "/var/lib/zinder/projector/canonical-secondary"
 
 # The canonical-reader cache defaults to a fraction of the detected cgroup
-# limit. All three processes share one cgroup here, so each budget is pinned
+# limit. Every process shares one cgroup here, so each budget is pinned
 # instead: the container limit describes the topology, not any one process.
 [storage.canonical.rocksdb]
 block_cache_bytes = 134217728

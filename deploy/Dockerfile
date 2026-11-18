@@ -307,20 +307,23 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 
 ENTRYPOINT ["zinder-canonical-runtime-entrypoint"]
 
-# Native WalletQuery runtime: the canonical writer, the wallet writer, and the
-# query reader run as three supervised processes against the one volume
-# mounted at /var/lib/zinder, because the readers open secondaries over paths
-# the writers own. It does not serve the lightwalletd compatibility protocol.
+# Wallet-serving runtime: the canonical writer, the wallet writer, the native
+# query reader, and the lightwalletd compatibility reader run as supervised
+# processes against the one volume mounted at /var/lib/zinder, because the
+# readers open secondaries over paths the writers own. The compatibility
+# reader can be turned off with ZINDER_WALLET_SERVING__LIGHTWALLETD=false.
 # Hosts with shared volumes across containers use deploy/docker-compose.yml.
 FROM zinder-runtime-base AS zinder-wallet-serving
 
 COPY --from=zinder-binaries-selected /zinder-binaries/zinder-ingest /usr/local/bin/zinder-ingest
 COPY --from=zinder-binaries-selected /zinder-binaries/zinder-projector /usr/local/bin/zinder-projector
 COPY --from=zinder-binaries-selected /zinder-binaries/zinder-query /usr/local/bin/zinder-query
+COPY --from=zinder-binaries-selected /zinder-binaries/zinder-compat-lightwalletd /usr/local/bin/zinder-compat-lightwalletd
 
 COPY deploy/config/wallet-serving/ingest.toml /etc/zinder/ingest.toml
 COPY deploy/config/wallet-serving/projector.toml /etc/zinder/projector.toml
 COPY deploy/config/wallet-serving/query.toml /etc/zinder/query.toml
+COPY deploy/config/wallet-serving/compat-lightwalletd.toml /etc/zinder/compat-lightwalletd.toml
 
 COPY --chmod=0644 deploy/materialize-indexer-tls \
     /usr/local/lib/zinder/materialize-indexer-tls
@@ -335,11 +338,12 @@ COPY --chmod=0755 deploy/wallet-serving-healthcheck \
 USER root:root
 WORKDIR /var/lib/zinder
 
-EXPOSE 9102 9106
+EXPOSE 9067 9102 9106
 
 # The start period covers the entrypoint's default canonical, wallet, and
-# serving deadlines, which together run to five and a half hours. A parked
-# canonical writer counts as healthy: query then refuses wallets with the typed
+# serving deadlines, which together run to five and a half hours; query and
+# compatibility share the serving deadline. A parked canonical writer counts
+# as healthy: both readers then refuse wallets with the typed
 # REORG_WINDOW_EXCEEDED halt, and the entrypoint keeps that refusal up. A
 # projector parked on a wallet transition over its logical-byte limit counts
 # as healthy too, because restarting only parks it on the same transition.
@@ -364,7 +368,7 @@ RUN sed -i 's/^explorer_views = false$/explorer_views = true/' /etc/zinder/inges
 COPY --chmod=0755 deploy/wallet-serving-explorer-runtime-entrypoint \
     /usr/local/bin/zinder-wallet-serving-explorer-runtime-entrypoint
 
-EXPOSE 9068 9069 9102 9106
+EXPOSE 9067 9068 9069 9102 9106
 
 # The inherited wallet-serving HEALTHCHECK deliberately ignores the Explorer:
 # the entrypoint restarts the Explorer alone, and a host that restarts

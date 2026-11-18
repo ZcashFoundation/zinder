@@ -2,11 +2,13 @@
 
 # Container healthcheck for the single-host wallet-serving image.
 #
-# Healthy means the native query surface answers wallets usefully: it is ready,
-# or it refuses every request with the typed REORG_WINDOW_EXCEEDED halt because
-# the canonical writer is parked. A projector parked on a wallet transition
-# over its logical-byte limit is healthy too, whether query answers unready
-# behind it or was never started because it cannot publish a serving pair
+# Healthy means both wallet readers answer wallets usefully: native query and,
+# unless ZINDER_WALLET_SERVING__LIGHTWALLETD turns it off, lightwalletd
+# compatibility. They serve the same pair, so each must be ready or refuse
+# every request with the typed REORG_WINDOW_EXCEEDED halt because the
+# canonical writer is parked. A projector parked on a wallet transition over
+# its logical-byte limit is healthy too, whether the readers answer unready
+# behind it or were never started because they cannot publish a serving pair
 # there. The entrypoint deliberately keeps a parked topology up, so an
 # orchestrator that restarts unhealthy containers must not restart it into the
 # same park.
@@ -15,29 +17,42 @@ set -u
 
 query_ops_addr="${1:-127.0.0.1:9106}"
 projector_ops_addr="${2:-127.0.0.1:9110}"
+compat_ops_addr="${3:-127.0.0.1:9107}"
 
-# The image HEALTHCHECK allows five seconds in total, which both probes share.
-# An unreachable query falls through to the projector park check.
-readiness_body="$(
-  curl -s --connect-timeout 2 --max-time 3 \
-    -w '\n%{http_code}' \
-    "http://$query_ops_addr/readyz"
-)" || readiness_body=""
+# Succeeds when the reader whose operational endpoint is $1 admits traffic or
+# serves the canonical writer halt. The image HEALTHCHECK allows five seconds
+# in total, which the two reader probes and the projector probe share.
+reader_serves() {
+  readiness_body="$(
+    curl -s --connect-timeout 1 --max-time 2 \
+      -w '\n%{http_code}' \
+      "http://$1/readyz"
+  )" || return 1
 
-http_status="${readiness_body##*
-}"
+  if [ "${readiness_body##*
+}" = "200" ]; then
+    return 0
+  fi
 
-if [ "$http_status" = "200" ]; then
+  case "$readiness_body" in
+    *'"reorg_window_exceeded"'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The entrypoint rejects any value other than true or false in any letter
+# case, so a running container holds one of those.
+lightwalletd_turned_off() {
+  [ "$(printf '%s' "${ZINDER_WALLET_SERVING__LIGHTWALLETD:-true}" | tr '[:upper:]' '[:lower:]')" = "false" ]
+}
+
+if reader_serves "$query_ops_addr" \
+  && { lightwalletd_turned_off || reader_serves "$compat_ops_addr"; }; then
   exit 0
 fi
 
-case "$readiness_body" in
-  *'"reorg_window_exceeded"'*)
-    exit 0
-    ;;
-  *) ;;
-esac
-
+# A reader that is unreachable or unready falls through to the projector park
+# check.
 projector_body="$(
   curl -s --connect-timeout 1 --max-time 1 "http://$projector_ops_addr/readyz"
 )" || exit 1
