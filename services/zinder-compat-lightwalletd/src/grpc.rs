@@ -519,6 +519,37 @@ where
     }
 }
 
+/// The distinct script hashes of one balance request, in request order.
+///
+/// A request may repeat an address, so it is counted once; the request is
+/// refused at the first distinct address over
+/// [`MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES`], before anything past the cap
+/// is stored.
+#[derive(Default)]
+struct DistinctBalanceAddresses {
+    script_hashes: Vec<TransparentAddressScriptHash>,
+    seen: HashSet<TransparentAddressScriptHash>,
+}
+
+impl DistinctBalanceAddresses {
+    fn admit(&mut self, script_hash: TransparentAddressScriptHash) -> Result<(), Status> {
+        if self.seen.contains(&script_hash) {
+            return Ok(());
+        }
+        if self.script_hashes.len() >= u32_to_usize(MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES) {
+            return Err(status_from_query_error(
+                &QueryError::TransparentBalanceAddressCountExceeded {
+                    requested: self.script_hashes.len().saturating_add(1),
+                    maximum: MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
+                },
+            ));
+        }
+        self.seen.insert(script_hash);
+        self.script_hashes.push(script_hash);
+        Ok(())
+    }
+}
+
 /// Parses a streamed or listed lightwalletd address into its script hash on
 /// `network`, so callers keep 32 bytes per address instead of the raw string.
 fn compat_address_script_hash(
@@ -732,15 +763,12 @@ where
     ) -> Result<Response<lightwalletd::Balance>, Status> {
         let addresses = request.into_inner().addresses;
         let network = self.compat_visible_tip_block().await?.chain_epoch.network;
-        let mut script_hashes = Vec::with_capacity(addresses.len());
-        let mut distinct_script_hashes = HashSet::with_capacity(addresses.len());
+        let mut balance_addresses = DistinctBalanceAddresses::default();
         for address in addresses {
-            let script_hash = compat_address_script_hash(address, network)?;
-            if distinct_script_hashes.insert(script_hash) {
-                script_hashes.push(script_hash);
-            }
+            balance_addresses.admit(compat_address_script_hash(address, network)?)?;
         }
-        self.compat_balance_response(script_hashes).await
+        self.compat_balance_response(balance_addresses.script_hashes)
+            .await
     }
 
     async fn get_taddress_balance_stream(
@@ -751,23 +779,12 @@ where
         // The network is fixed for the runtime, so reading it here pins no
         // epoch for the duration of the client's stream.
         let network = self.compat_visible_tip_block().await?.chain_epoch.network;
-        let mut script_hashes = Vec::new();
-        let mut distinct_script_hashes = HashSet::new();
+        let mut balance_addresses = DistinctBalanceAddresses::default();
         while let Some(received) = stream.next().await {
-            let script_hash = compat_address_script_hash(received?.address, network)?;
-            if distinct_script_hashes.insert(script_hash) {
-                if script_hashes.len() >= u32_to_usize(MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES) {
-                    return Err(status_from_query_error(
-                        &QueryError::TransparentBalanceAddressCountExceeded {
-                            requested: script_hashes.len().saturating_add(1),
-                            maximum: MAX_TRANSPARENT_ADDRESS_BALANCE_ADDRESSES,
-                        },
-                    ));
-                }
-                script_hashes.push(script_hash);
-            }
+            balance_addresses.admit(compat_address_script_hash(received?.address, network)?)?;
         }
-        self.compat_balance_response(script_hashes).await
+        self.compat_balance_response(balance_addresses.script_hashes)
+            .await
     }
 
     type GetMempoolTxStream = GrpcStream<lightwalletd::CompactTx>;
