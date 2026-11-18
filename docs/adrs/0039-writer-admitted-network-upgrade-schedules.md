@@ -99,6 +99,11 @@ observation:
   applies the retained events its secondary already holds. A newer revision
   cannot change how those blocks are interpreted, because a revision changes
   only entries above the tip it was admitted at.
+- A commitment-tree reconstruction at one height reads only blocks at or below
+  that height, so it accepts any table that equals the admitted schedule at or
+  below that height. Ingest seeds its final-root accumulators this way with its
+  node-observed table, on a secondary that can open before the writer admits
+  that table.
 
 `CanonicalControl.WriterStatus` and `CanonicalControl.CreateOwnerCheckpoint`
 responses carry the admitted table, revision, and V1 fingerprint.

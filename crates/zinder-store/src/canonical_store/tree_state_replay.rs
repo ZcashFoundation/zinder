@@ -28,10 +28,10 @@ pub(super) fn read_tree_state_checkpoint_at(
     height: BlockHeight,
     activations: &NetworkUpgradeActivations,
 ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
-    if !store.serving_admits_activations(activations) {
+    if !store.serving_admits_activations_through(activations, height) {
         return Err(CanonicalStoreError::admission(
             store.serving_open().db.path(),
-            "tree-state reconstruction activation table differs from the admitted store identity",
+            "tree-state reconstruction activation table differs from the admitted schedule at or below the requested height",
         ));
     }
     if height > store.serving_ready_evidence().visible_tip.height {

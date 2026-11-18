@@ -7,15 +7,18 @@
 use tempfile::TempDir;
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, CommitmentTreeCheckpoint, CompactBlockArtifact,
-    CompactChainMetadata, Network, NetworkUpgradeActivation, NetworkUpgradeActivations,
+    CompactChainMetadata, ConsensusBranchId, Network, NetworkUpgradeActivation,
+    NetworkUpgradeActivations,
 };
 
 use super::{
-    CanonicalStoreError, RocksDbCanonicalStore, block_load::encode_block_position,
+    CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload, RocksDbCanonicalSecondary,
+    RocksDbCanonicalStore, block_load::encode_block_position,
     live_replacement_tests::published_store, publication::column_family,
     rocksdb::COMPACT_BLOCK_COLUMN_FAMILY, test_checkpoint_frontiers,
     test_network_upgrade_activations,
 };
+use crate::{RawBlobRetention, RocksDbResourceBudget};
 
 const TIP_HEIGHT: u32 = 150;
 
@@ -141,6 +144,64 @@ fn reconstruction_refuses_an_activation_table_the_store_did_not_admit()
         ));
     }
     Ok(())
+}
+
+#[test]
+fn a_secondary_reconstructs_with_a_node_table_its_writer_has_not_admitted_yet()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = TempDir::new()?;
+    let mut store = gapped_store(&temporary)?;
+    let baseline = test_network_upgrade_activations(Network::ZcashTestnet)?;
+    let admitted = with_future_activation(&baseline, 99, TIP_HEIGHT + 50)?;
+    store.admit_network_upgrade_schedule(&admitted)?;
+    let secondary = RocksDbCanonicalSecondary::open_ready(
+        temporary.path().join("canonical"),
+        temporary.path().join("canonical-secondary"),
+        &baseline,
+        CanonicalStoreWorkload::Wallet,
+        RawBlobRetention::Transactions,
+        CanonicalReorgPolicy::new(2)?,
+        RocksDbResourceBudget::for_local_tests(),
+    )?;
+    let node_observed = with_future_activation(&admitted, 100, TIP_HEIGHT + 60)?;
+    store.admit_network_upgrade_schedule(&node_observed)?;
+    assert_eq!(secondary.network_upgrade_activations(), Some(&admitted));
+
+    for height in [100, 120, TIP_HEIGHT] {
+        let height = BlockHeight::new(height);
+        assert_eq!(
+            secondary.tree_state_checkpoint_at(height, &node_observed)?,
+            Some(expected_checkpoint(&baseline, height)?),
+            "tree state at height {}",
+            height.value()
+        );
+    }
+    let mut historical_edit = node_observed.activations().to_vec();
+    historical_edit[0].name = "Changed historical upgrade".to_owned();
+    let historical_edit = NetworkUpgradeActivations::new(Network::ZcashTestnet, historical_edit)?;
+    assert!(matches!(
+        secondary.tree_state_checkpoint_at(BlockHeight::new(120), &historical_edit),
+        Err(CanonicalStoreError::AdmissionRefused { .. })
+    ));
+    Ok(())
+}
+
+/// `activations` with one more upgrade activating at `activation_height`.
+fn with_future_activation(
+    activations: &NetworkUpgradeActivations,
+    branch_id: u32,
+    activation_height: u32,
+) -> Result<NetworkUpgradeActivations, Box<dyn std::error::Error>> {
+    let mut entries = activations.activations().to_vec();
+    entries.push(NetworkUpgradeActivation {
+        branch_id: ConsensusBranchId::new(branch_id),
+        activation_height: BlockHeight::new(activation_height),
+        name: format!("Future {branch_id}"),
+    });
+    Ok(NetworkUpgradeActivations::new(
+        Network::ZcashTestnet,
+        entries,
+    )?)
 }
 
 /// Publishes complete history through [`TIP_HEIGHT`], whose checkpoints are

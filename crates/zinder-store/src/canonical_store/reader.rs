@@ -43,7 +43,11 @@ pub(super) trait CanonicalServingRead {
     fn serving_build_plan(&self) -> &super::CanonicalStoreBuildPlan;
     fn serving_ready_evidence(&self) -> super::CanonicalStoreReadyEvidence;
     fn serving_subtree_root_coverage(&self) -> CanonicalSubtreeRootLoadCoverage;
-    fn serving_admits_activations(&self, activations: &NetworkUpgradeActivations) -> bool;
+    fn serving_admits_activations_through(
+        &self,
+        activations: &NetworkUpgradeActivations,
+        height: BlockHeight,
+    ) -> bool;
 }
 
 impl CanonicalServingRead for RocksDbCanonicalStore {
@@ -67,8 +71,17 @@ impl CanonicalServingRead for RocksDbCanonicalStore {
         self.subtree_root_coverage
     }
 
-    fn serving_admits_activations(&self, activations: &NetworkUpgradeActivations) -> bool {
-        self.activation_table_is_admitted(activations)
+    fn serving_admits_activations_through(
+        &self,
+        activations: &NetworkUpgradeActivations,
+        height: BlockHeight,
+    ) -> bool {
+        super::activation_schedule::admits_activation_table_through(
+            &self.build_plan,
+            self.activation_schedule.as_ref(),
+            activations,
+            height,
+        )
     }
 }
 
@@ -93,11 +106,16 @@ impl CanonicalServingRead for RocksDbCanonicalSecondary {
         self.subtree_root_coverage
     }
 
-    fn serving_admits_activations(&self, activations: &NetworkUpgradeActivations) -> bool {
-        super::activation_schedule::admits_activation_table(
+    fn serving_admits_activations_through(
+        &self,
+        activations: &NetworkUpgradeActivations,
+        height: BlockHeight,
+    ) -> bool {
+        super::activation_schedule::admits_activation_table_through(
             &self.build_plan,
             self.activation_schedule.as_ref(),
             activations,
+            height,
         )
     }
 }
@@ -273,8 +291,11 @@ macro_rules! impl_canonical_typed_reads {
             /// [`CanonicalStoreError::PublicationRefused`]. The work grows
             /// with the blocks and note commitments between the two heights.
             ///
-            /// `network_upgrade_activations` must be the table this store
-            /// admits; any other fails with
+            /// `network_upgrade_activations` must agree with the schedule this
+            /// store admits at every height through `height`, so a node table
+            /// that only changes activations above `height` is accepted before
+            /// the writer admits it. Without a writer-admitted schedule it must
+            /// equal the construction table. Any other table fails with
             /// [`CanonicalStoreError::AdmissionRefused`]. Returns `Ok(None)`
             /// for a height below the history predecessor or above the
             /// visible tip.
