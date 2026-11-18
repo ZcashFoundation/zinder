@@ -202,6 +202,8 @@ wallet_mode=serve explorer_mode=serve start_entrypoint \
   ZINDER_NETWORK__NAME=zcash-testnet \
   ZINDER_NODE__JSON_RPC_ADDR=http://node:18232 \
   ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM="$key_pem" \
+  ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR=http://zakura:18232 \
+  ZINDER_NODE_FALLBACKS__1__INDEXER_TLS__CLIENT_KEY_PEM="$key_pem" \
   ZINDER_INGEST__REORG_WINDOW_BLOCKS=1000 \
   ZINDER_INGEST__explorer_views_min_free_bytes=0 \
   ZINDER_explorer__ops_listen_addr=127.0.0.1:9069 \
@@ -227,8 +229,8 @@ done
 if grep -qi '^ZINDER_EXPLORER__' "$wallet_env"; then
   test_failure "an Explorer variable reached the wallet-serving processes"
 fi
-for expected in ZINDER_NETWORK__NAME ZINDER_NODE__JSON_RPC_ADDR ZINDER_EXPLORER__BEARER_TOKEN_PATH \
-  ZINDER_explorer__ops_listen_addr RUST_LOG; do
+for expected in ZINDER_NETWORK__NAME ZINDER_NODE__JSON_RPC_ADDR ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR \
+  ZINDER_EXPLORER__BEARER_TOKEN_PATH ZINDER_explorer__ops_listen_addr RUST_LOG; do
   grep -q "^${expected}=" "$explorer_env" || test_failure "the Explorer did not receive $expected"
 done
 for unexpected in ZINDER_INGEST__ ZINDER_PROJECTOR__ INGEST_CONTROL_BEARER_TOKEN CHECKPOINT_BEARER_TOKEN; do
@@ -246,6 +248,8 @@ for runtime_env in "$wallet_env" "$explorer_env"; do
   fi
   grep -qxF "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH=$work/run/zinder-indexer-tls/client-key.pem" \
     "$runtime_env" || test_failure "the materialized client key path did not reach $runtime_env"
+  grep -qxF "ZINDER_NODE_FALLBACKS__1__INDEXER_TLS__CLIENT_KEY_PATH=$work/run/zinder-indexer-tls/node-fallback-1-client-key.pem" \
+    "$runtime_env" || test_failure "the materialized fallback client key path did not reach $runtime_env"
 done
 
 kill -s TERM "$wrapper_pid"
