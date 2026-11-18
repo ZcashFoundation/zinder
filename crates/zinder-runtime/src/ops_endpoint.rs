@@ -313,6 +313,7 @@ struct ReadinessResponseBody {
     // `"cause":` key of the body reads the runtime's own cause.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     degraded: Vec<crate::ReadinessDependency>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     active_node: Option<crate::ActiveNodeEndpoint>,
 }
 
