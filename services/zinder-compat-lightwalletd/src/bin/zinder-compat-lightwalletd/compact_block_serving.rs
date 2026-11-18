@@ -567,36 +567,14 @@ struct CandidateGeneration<'a> {
 
 struct CandidateFenceProbe<'a> {
     writer_status: &'a mut WriterStatus,
-    config: &'a CompactBlockServingConfig,
-    generation: CandidateGeneration<'a>,
     candidate: Option<RocksDbCanonicalSecondary>,
-    /// Whether the last round found the store without a writer-admitted
-    /// schedule to adopt.
-    schedule_not_admitted: bool,
 }
 
 impl CanonicalFenceProbe for CandidateFenceProbe<'_> {
     type Error = ConvergenceFailure;
 
     async fn catch_up(&mut self) -> Result<Option<CanonicalWriterFence>, ConvergenceFailure> {
-        // The candidate opens inside convergence, so a store whose writer has
-        // not admitted its first schedule yet is retried within the bounds.
-        let candidate = match self.candidate.take() {
-            Some(candidate) => candidate,
-            None => match open_generation(self.config, self.generation).await {
-                Ok(candidate) => {
-                    self.schedule_not_admitted = false;
-                    candidate
-                }
-                Err(CompactBlockServingError::Storage(
-                    CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted { .. },
-                )) => {
-                    self.schedule_not_admitted = true;
-                    return Ok(None);
-                }
-                Err(error) => return Err(ConvergenceFailure::Storage(error)),
-            },
-        };
+        let candidate = self.candidate.take().ok_or_else(candidate_unavailable)?;
         let candidate = catch_up_generation(candidate)
             .await
             .map_err(ConvergenceFailure::Storage)?;
@@ -631,6 +609,44 @@ fn candidate_unavailable() -> ConvergenceFailure {
     ))
 }
 
+/// Opens a candidate in `generation`, retrying until `convergence_timeout`
+/// passes while the canonical writer has not admitted its first
+/// network-upgrade schedule.
+///
+/// The writer admits that schedule when it first opens the store, which can
+/// take longer than the convergence attempts allow, so this wait is bounded
+/// by time alone.
+async fn open_generation_awaiting_schedule(
+    config: &CompactBlockServingConfig,
+    generation: CandidateGeneration<'_>,
+    retry_delay: Duration,
+) -> Result<RocksDbCanonicalSecondary, ConvergenceFailure> {
+    let deadline = tokio::time::Instant::now() + config.convergence_timeout;
+    let mut waiting_logged = false;
+    loop {
+        match open_generation(config, generation).await {
+            Ok(candidate) => return Ok(candidate),
+            Err(CompactBlockServingError::Storage(
+                CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted { .. },
+            )) if tokio::time::Instant::now() < deadline => {
+                if !waiting_logged {
+                    tracing::info!(
+                        target: "zinder::compat_lightwalletd",
+                        event = "canonical_schedule_admission_pending",
+                        "waiting for the canonical writer to admit a network-upgrade schedule"
+                    );
+                    waiting_logged = true;
+                }
+            }
+            Err(CompactBlockServingError::Storage(
+                CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted { .. },
+            )) => return Err(ConvergenceFailure::WriterScheduleNotAdmitted),
+            Err(error) => return Err(ConvergenceFailure::Storage(error)),
+        }
+        tokio::time::sleep(retry_delay).await;
+    }
+}
+
 /// Opens a candidate in `generation`, converges it on the writer fence, and
 /// returns it with the writer status that attested it.
 async fn converge_candidate(
@@ -638,14 +654,12 @@ async fn converge_candidate(
     config: &CompactBlockServingConfig,
     generation: CandidateGeneration<'_>,
 ) -> Result<(RocksDbCanonicalSecondary, CanonicalWriterStatusResponse), ConvergenceFailure> {
+    let retry_delay = config.catchup_interval.min(CONVERGENCE_RETRY_DELAY_CAP);
+    let candidate = open_generation_awaiting_schedule(config, generation, retry_delay).await?;
     let mut probe = CandidateFenceProbe {
         writer_status,
-        config,
-        generation,
-        candidate: None,
-        schedule_not_admitted: false,
+        candidate: Some(candidate),
     };
-    let retry_delay = config.catchup_interval.min(CONVERGENCE_RETRY_DELAY_CAP);
     let outcome = converge_on_canonical_writer_fence(
         &mut probe,
         config.network,
@@ -663,12 +677,6 @@ async fn converge_candidate(
             .candidate
             .map(|candidate| (candidate, *attesting_status))
             .ok_or_else(candidate_unavailable),
-        Ok(CanonicalFenceConvergence::Cancelled | CanonicalFenceConvergence::Trailing(_))
-        | Err(CanonicalFenceConvergenceError::DidNotConverge)
-            if probe.schedule_not_admitted =>
-        {
-            Err(ConvergenceFailure::WriterScheduleNotAdmitted)
-        }
         Ok(CanonicalFenceConvergence::Cancelled | CanonicalFenceConvergence::Trailing(_))
         | Err(CanonicalFenceConvergenceError::DidNotConverge) => {
             Err(ConvergenceFailure::WriterAhead)
@@ -1845,9 +1853,11 @@ mod tests {
         Ok(())
     }
 
-    /// Compact serving brings no activation table of its own: bootstrap waits,
-    /// within its convergence bounds, for the writer's first schedule
-    /// admission and serves that schedule.
+    /// Compact serving brings no activation table of its own: bootstrap waits
+    /// for the writer's first schedule admission and serves that schedule.
+    ///
+    /// The wait is bounded by the convergence timeout, however many attempts
+    /// it takes.
     #[tokio::test]
     async fn bootstrap_waits_for_the_writers_first_schedule_admission()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1877,9 +1887,9 @@ mod tests {
             raw_blob_retention: RawBlobRetention::Transactions,
             reorg_policy: CanonicalReorgPolicy::new(100)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
-            catchup_interval: Duration::from_millis(20),
+            catchup_interval: Duration::from_millis(1),
             convergence_timeout: Duration::from_secs(10),
-            convergence_attempts: 64,
+            convergence_attempts: 1,
             staleness_ceiling: Duration::from_mins(1),
             lag_threshold: 0,
         };
@@ -1893,7 +1903,7 @@ mod tests {
             .await
         });
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             !bootstrap.is_finished(),
             "bootstrap must wait for the schedule"
@@ -1947,7 +1957,7 @@ mod tests {
             reorg_policy: CanonicalReorgPolicy::new(100)?,
             resource_budget: RocksDbResourceBudget::for_local_tests(),
             catchup_interval: Duration::from_millis(1),
-            convergence_timeout: Duration::from_secs(2),
+            convergence_timeout: Duration::from_millis(300),
             convergence_attempts: 4,
             staleness_ceiling: Duration::from_mins(1),
             lag_threshold: 0,

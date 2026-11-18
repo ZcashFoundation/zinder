@@ -141,9 +141,11 @@ pub struct WalletServingPairConfig {
     pub wallet_resource_budget: RocksDbResourceBudget,
     /// Delay between refresh attempts after initial publication.
     pub catchup_interval: Duration,
-    /// Maximum wall time allowed for pair convergence.
+    /// Maximum wall time allowed for pair convergence. Bootstrap also waits up
+    /// to this long for the canonical writer's first schedule admission.
     pub convergence_timeout: Duration,
-    /// Maximum catch-up attempts allowed for pair convergence.
+    /// Maximum catch-up attempts allowed for pair convergence. Rounds that
+    /// wait for the writer's first schedule admission do not count.
     pub convergence_attempts: NonZeroU8,
     /// Writer lag tolerated before readiness fails.
     pub replica_lag_threshold_chain_epochs: u64,
@@ -972,6 +974,7 @@ impl WalletServingPairPublisher {
             #[cfg(test)]
             candidate_preparations: CandidatePreparationCounts::default(),
         };
+        publisher.prepare_candidate_awaiting_schedule(0).await?;
         publisher.converge_and_publish(0).await?;
         publisher.record_resource_gauges().await;
         let Some(serving_pair_slot) = publisher.serving_pair_slot.clone() else {
@@ -1352,6 +1355,49 @@ impl WalletServingPairPublisher {
         self.candidate_preparations.record(preparation);
         self.generations[generation].state = SecondaryGenerationState::Candidate { candidate };
         Ok(())
+    }
+
+    /// Prepares `generation` as [`Self::prepare_candidate`] does, retrying
+    /// until `convergence_timeout` passes while the canonical writer has not
+    /// admitted its first network-upgrade schedule.
+    ///
+    /// The writer admits that schedule when it first opens the store, which
+    /// can take longer than the convergence attempts allow, so this wait is
+    /// bounded by time alone.
+    async fn prepare_candidate_awaiting_schedule(
+        &mut self,
+        generation: usize,
+    ) -> Result<(), WalletServingPairError> {
+        let deadline = Instant::now() + self.config.convergence_timeout;
+        let retry_delay = self
+            .config
+            .catchup_interval
+            .min(CONVERGENCE_RETRY_DELAY_CAP);
+        let mut waiting_logged = false;
+        loop {
+            match self.prepare_candidate(generation).await {
+                Err(WalletServingPairError::Canonical(
+                    CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted { .. },
+                )) => {
+                    record_pair_convergence(WalletServingConvergence::WriterScheduleNotAdmitted);
+                    if Instant::now() >= deadline {
+                        return Err(WalletServingPairError::ConvergenceTimedOut {
+                            last_outcome: WalletServingConvergence::WriterScheduleNotAdmitted,
+                        });
+                    }
+                    if !waiting_logged {
+                        tracing::info!(
+                            target: "zinder::wallet_serving",
+                            event = "canonical_schedule_admission_pending",
+                            "waiting for the canonical writer to admit a network-upgrade schedule"
+                        );
+                        waiting_logged = true;
+                    }
+                    tokio::time::sleep(retry_delay).await;
+                }
+                outcome => return outcome,
+            }
+        }
     }
 
     /// Opens both secondaries of `generation` and runs their full cold
@@ -2064,8 +2110,8 @@ impl CanonicalFenceProbe for CandidatePairFenceProbe<'_> {
     type Error = WalletServingPairError;
 
     async fn catch_up(&mut self) -> Result<Option<CanonicalWriterFence>, WalletServingPairError> {
-        // A vacant generation is opened here, so a store whose writer has
-        // not admitted its first schedule yet is retried within the bounds.
+        // Bootstrap waits for the first schedule before it converges, so a
+        // generation reopened here finds the store's admitted schedule.
         match self.publisher.prepare_candidate(self.generation).await {
             Ok(()) => {}
             Err(WalletServingPairError::Canonical(
@@ -2660,7 +2706,7 @@ mod tests {
     }
 
     /// A node whose activation table disagrees with the writer-admitted
-    /// schedule is on another network or fork, so it never receives a
+    /// schedule is on another network, so it never receives a
     /// transaction.
     #[tokio::test]
     async fn wallet_node_probe_refuses_a_node_on_another_chain()
@@ -3414,6 +3460,7 @@ mod tests {
         broadcast_attempts: Arc<std::sync::atomic::AtomicUsize>,
         capabilities: NodeCapabilities,
         node_activations: NetworkUpgradeActivations,
+        holds_tip: bool,
     }
 
     impl MutableHealthSource {
@@ -3434,6 +3481,7 @@ mod tests {
                 broadcast_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 capabilities,
                 node_activations: sample_regtest_upgrade_activations(),
+                holds_tip: true,
             }
         }
 
@@ -3459,6 +3507,10 @@ mod tests {
         ) -> Result<NetworkUpgradeActivations, SourceError> {
             self.outage_error()
                 .map_or_else(|| Ok(self.node_activations.clone()), Err)
+        }
+
+        async fn holds_block(&self, _block: BlockId) -> Result<bool, SourceError> {
+            self.outage_error().map_or(Ok(self.holds_tip), Err)
         }
     }
 
@@ -3680,9 +3732,12 @@ mod tests {
         }
     }
 
-    /// A reader brings no activation table of its own: bootstrap waits,
-    /// within its convergence bounds, for the writer to admit the store's
-    /// first schedule, and then serves exactly that schedule.
+    /// A reader brings no activation table of its own: bootstrap waits for
+    /// the writer to admit the store's first schedule and then serves exactly
+    /// that schedule.
+    ///
+    /// The wait is bounded by the convergence timeout, however many attempts
+    /// it takes.
     #[tokio::test(flavor = "multi_thread")]
     async fn bootstrap_waits_for_the_writers_first_schedule_admission()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -3706,9 +3761,8 @@ mod tests {
         let control = MutableCanonicalControl::new(writer_status_for_store(&canonical_primary));
         let (endpoint, cancel, server_task) = serve_canonical_control(control.clone()).await?;
         let config = WalletServingPairConfig {
-            catchup_interval: Duration::from_millis(20),
-            convergence_attempts: std::num::NonZeroU8::new(64)
-                .ok_or("convergence attempts must be non-zero")?,
+            catchup_interval: Duration::from_millis(1),
+            convergence_attempts: std::num::NonZeroU8::MIN,
             convergence_timeout: Duration::from_secs(10),
             ..wallet_serving_pair_config(
                 canonical_primary_path.clone(),
@@ -3727,7 +3781,7 @@ mod tests {
             .await
         });
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             !bootstrap.is_finished(),
             "bootstrap must wait for the schedule"
@@ -3776,12 +3830,15 @@ mod tests {
         let (endpoint, cancel, server_task) = serve_canonical_control(control).await?;
 
         let outcome = WalletServingPairPublisher::bootstrap_from_writer_status_endpoint(
-            wallet_serving_pair_config(
-                canonical_primary_path.clone(),
-                temporary.path().join("canonical-secondaries"),
-                wallet_primary_path.clone(),
-                temporary.path().join("wallet-secondaries"),
-            )?,
+            WalletServingPairConfig {
+                convergence_timeout: Duration::from_millis(300),
+                ..wallet_serving_pair_config(
+                    canonical_primary_path.clone(),
+                    temporary.path().join("canonical-secondaries"),
+                    wallet_primary_path.clone(),
+                    temporary.path().join("wallet-secondaries"),
+                )?
+            },
             WalletServingReadiness::pair_only(zinder_runtime::Readiness::default()),
             &endpoint,
             None,
