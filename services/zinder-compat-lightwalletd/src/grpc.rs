@@ -67,6 +67,13 @@ const LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 1024;
 const COMPACT_BLOCK_STREAM_CHANNEL_CAPACITY: usize = 16;
 /// Maximum number of transaction-id suffixes accepted by one `GetMempoolTx` request.
 const MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST: usize = 1024;
+/// Most distinct transactions one `GetMempoolStream` sends between tip changes.
+///
+/// The stream remembers each id it sent so it can skip repeats, and that set
+/// only resets when the stream closes on a tip change. The bound keeps a
+/// stalled tip from growing it without limit; it is far above what a Zcash
+/// mempool turns over in one block interval.
+const MAX_MEMPOOL_STREAM_TRANSACTIONS: usize = 100_000;
 
 /// Response bounds for [`LightwalletdGrpcAdapter`].
 ///
@@ -862,8 +869,10 @@ where
             .clone();
         // Deliver the current mempool contents from the snapshot walk, then
         // continue with events strictly after the walk's resume anchor. The
-        // anchor guarantees at-least-once delivery; a transaction admitted
-        // mid-walk may appear both in a later page and as an event.
+        // anchor hands off at-least-once: a transaction admitted mid-walk may
+        // appear both in a later page and as an event, and an evicted
+        // transaction may be added again. lightwalletd sends each txid once
+        // per block interval, so the stream drops txids it already sent.
         let first_page = mempool_surface
             .mempool_snapshot_page(LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE, None)
             .await
@@ -873,11 +882,15 @@ where
             .mempool_events(first_page.events_resume_cursor.clone())
             .await
             .map_err(status_from_mempool_surface_error)?;
-        let snapshot_raw_transactions = mempool_snapshot_entries(mempool_surface, first_page)
-            .map(|entry_outcome| entry_outcome.map(|entry| mempool_raw_transaction(&entry)));
-        let raw_transaction_stream = snapshot_raw_transactions.chain(
-            stream::StreamExt::filter_map(event_stream, project_added_to_raw_transaction),
+        let entry_stream = mempool_snapshot_entries(mempool_surface, first_page).chain(
+            stream::StreamExt::filter_map(event_stream, added_mempool_entry),
         );
+        let raw_transaction_stream = each_once_up_to(
+            entry_stream,
+            zinder_core::MempoolEntry::transaction_id,
+            MAX_MEMPOOL_STREAM_TRANSACTIONS,
+        )
+        .map(|entry_outcome| entry_outcome.map(|entry| mempool_raw_transaction(&entry)));
 
         let bounded_stream: GrpcStream<lightwalletd::RawTransaction> =
             if let Some(watcher) = self.tip_change_watcher.clone() {
@@ -1937,6 +1950,11 @@ where
                                 error = %error,
                                 "tip-change signal source closed; GetMempoolStream will end"
                             );
+                            // Ending with OK would tell the client a new block
+                            // arrived when no tip change was observed.
+                            let _ = output_sender
+                                .send(Err(Status::unavailable(error.to_string())))
+                                .await;
                         }
                     }
                     return;
@@ -1945,6 +1963,83 @@ where
         }
     });
     tokio_stream::wrappers::ReceiverStream::new(output_receiver)
+}
+
+/// Passes each item whose `key` it has not yielded before, and errors are
+/// passed through unchanged.
+///
+/// After `max_distinct` distinct keys, the next new key ends the stream with
+/// `UNAVAILABLE`, which lightwalletd clients retry, instead of letting the
+/// seen set grow or letting a repeat through.
+fn each_once_up_to<S, KeyFn, K>(
+    streamed: S,
+    key: KeyFn,
+    max_distinct: usize,
+) -> EachOnceUpTo<S, KeyFn, K> {
+    EachOnceUpTo {
+        upstream: Some(Box::pin(streamed)),
+        key,
+        seen: HashSet::new(),
+        max_distinct,
+    }
+}
+
+/// The stream [`each_once_up_to`] returns.
+///
+/// On exhaustion it drops its upstream and its seen set before yielding the
+/// error, so it ends without polling the upstream again.
+struct EachOnceUpTo<S, KeyFn, K> {
+    upstream: Option<Pin<Box<S>>>,
+    key: KeyFn,
+    seen: HashSet<K>,
+    max_distinct: usize,
+}
+
+impl<S, KeyFn, K, T> tonic::codegen::tokio_stream::Stream for EachOnceUpTo<S, KeyFn, K>
+where
+    S: tonic::codegen::tokio_stream::Stream<Item = Result<T, Status>>,
+    KeyFn: Fn(&T) -> K + Unpin,
+    K: Eq + std::hash::Hash + Unpin,
+{
+    type Item = Result<T, Status>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            let Some(upstream) = this.upstream.as_mut() else {
+                return std::task::Poll::Ready(None);
+            };
+            let outcome = match upstream.as_mut().poll_next(context) {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(None) => {
+                    this.upstream = None;
+                    return std::task::Poll::Ready(None);
+                }
+                std::task::Poll::Ready(Some(outcome)) => outcome,
+            };
+            let streamed = match outcome {
+                Ok(streamed) => streamed,
+                Err(status) => return std::task::Poll::Ready(Some(Err(status))),
+            };
+            let streamed_key = (this.key)(&streamed);
+            if this.seen.contains(&streamed_key) {
+                continue;
+            }
+            if this.seen.len() >= this.max_distinct {
+                this.upstream = None;
+                this.seen = HashSet::new();
+                return std::task::Poll::Ready(Some(Err(Status::unavailable(format!(
+                    "stream sent {} distinct transactions without a tip change; reconnect",
+                    this.max_distinct
+                )))));
+            }
+            this.seen.insert(streamed_key);
+            return std::task::Poll::Ready(Some(Ok(streamed)));
+        }
+    }
 }
 
 /// Streams live-mempool entries page by page, starting with the
@@ -2025,12 +2120,12 @@ fn transaction_id_is_uniquely_excluded(
     clippy::wildcard_enum_match_arm,
     reason = "MempoolEvent is #[non_exhaustive]; the lightwalletd compat shim only projects Added events into RawTransaction, so every non-Added variant is filtered out of the GetMempoolStream projection."
 )]
-fn project_added_to_raw_transaction(
+fn added_mempool_entry(
     event_outcome: Result<zinder_store::MempoolEventEnvelope, MempoolSurfaceError>,
-) -> Option<Result<lightwalletd::RawTransaction, Status>> {
+) -> Option<Result<zinder_core::MempoolEntry, Status>> {
     match event_outcome {
         Ok(envelope) => match envelope.event {
-            MempoolEvent::Added { entry } => Some(Ok(mempool_raw_transaction(&entry))),
+            MempoolEvent::Added { entry } => Some(Ok(entry)),
             _ => None,
         },
         Err(error) => Some(Err(status_from_mempool_surface_error(error))),
@@ -2098,6 +2193,26 @@ mod tests {
             address_count: 1,
             chain_epoch: test_chain_epoch(),
         }
+    }
+
+    #[tokio::test]
+    async fn each_once_up_to_skips_repeats_and_ends_unavailable_past_the_bound()
+    -> Result<(), tokio::time::error::Elapsed> {
+        // The upstream never ends, so only the bound itself can end the stream.
+        let streamed = tokio_stream::iter([1, 2, 1, 2, 3, 4].map(Ok::<u8, Status>))
+            .chain(tokio_stream::pending());
+        let outcomes: Vec<Result<u8, Status>> = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            each_once_up_to(streamed, |id: &u8| *id, 2).collect(),
+        )
+        .await?;
+
+        let codes: Vec<Result<u8, tonic::Code>> = outcomes
+            .into_iter()
+            .map(|outcome| outcome.map_err(|status| status.code()))
+            .collect();
+        assert_eq!(codes, vec![Ok(1), Ok(2), Err(tonic::Code::Unavailable)]);
+        Ok(())
     }
 
     #[test]
