@@ -24,7 +24,7 @@ use zinder_proto::{
     },
     wire::{TransactionAbsence, outpoint_from_message},
 };
-use zinder_runtime::{AuthenticatedChannel, Readiness};
+use zinder_runtime::{AuthenticatedChannel, Readiness, RepeatedFieldGuard};
 
 use crate::record_proxy_outcome;
 use zinder_store::{
@@ -220,14 +220,18 @@ impl<QueryApi: WalletQueryApi> WalletQueryGrpcAdapter<QueryApi> {
         Response::new(end_on_shutdown(stream, self.shutdown.as_ref()))
     }
 
-    /// Wraps this adapter in the generated tonic server type.
+    /// Wraps this adapter in the generated tonic server type, behind the
+    /// pre-decode bounds of [`WALLET_QUERY_FIELD_LIMITS`](super::WALLET_QUERY_FIELD_LIMITS).
     #[must_use]
-    pub fn into_server(self) -> wallet_query_server::WalletQueryServer<Self>
+    pub fn into_server(self) -> RepeatedFieldGuard<wallet_query_server::WalletQueryServer<Self>>
     where
         Self: wallet_query_server::WalletQuery,
     {
-        wallet_query_server::WalletQueryServer::new(self)
-            .max_decoding_message_size(zinder_runtime::MAX_DECODING_MESSAGE_BYTES)
+        RepeatedFieldGuard::new(
+            wallet_query_server::WalletQueryServer::new(self)
+                .max_decoding_message_size(zinder_runtime::MAX_DECODING_MESSAGE_BYTES),
+            super::WALLET_QUERY_FIELD_LIMITS,
+        )
     }
 
     fn require_endpoint_capability(&self, capability: &'static str) -> Result<(), Status> {

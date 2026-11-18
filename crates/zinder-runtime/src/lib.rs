@@ -33,6 +33,9 @@
 //!   ([`classify_canonical_writer_fence`],
 //!   [`converge_on_canonical_writer_fence`], [`WriterAttestation`]), shared
 //!   by every runtime that reads a canonical `RocksDB` secondary.
+//! - Pre-decode element-count bounds on repeated gRPC request fields
+//!   ([`RepeatedFieldGuard`], [`MethodFieldLimits`], [`RepeatedFieldLimit`]),
+//!   applied by every public gRPC server whose requests carry lists.
 //!
 //! It deliberately defines no storage or protocol types of its own; it
 //! composes those owned by `zinder-core`, `zinder-proto`, and `zinder-store`.
@@ -52,6 +55,7 @@ mod metrics;
 mod ops_endpoint;
 mod public_grpc_server;
 mod readiness;
+mod repeated_field_limits;
 mod rpc_metrics;
 mod sections;
 mod startup_phase;
@@ -111,6 +115,9 @@ pub use readiness::{
     ReadinessDependency, ReadinessReport, ReadinessState, TrafficReadinessInterceptor,
     UpstreamHealth, UpstreamNotReadyDetail, not_ready_status,
 };
+pub use repeated_field_limits::{
+    MethodFieldLimits, RepeatedElementEncoding, RepeatedFieldGuard, RepeatedFieldLimit,
+};
 pub use rpc_metrics::{RpcMetricNames, RpcOutcome, describe_rpc_metrics, record_rpc_request};
 pub use sections::{
     CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml, DEFAULT_ALLOW_PUBLIC_BIND,
@@ -155,6 +162,14 @@ use tokio_util::sync::CancellationToken;
 /// Setting it explicitly also keeps a future tonic default from silently
 /// widening the limit.
 pub const MAX_DECODING_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Pre-decode element bound for a repeated enum request field that no
+/// handler caps, applied through [`RepeatedFieldGuard`].
+///
+/// Such a field selects among a handful of enum values, so no client needs
+/// more elements than this; the bound only stops a request that repeats them
+/// to inflate decoding.
+pub const MAX_UNCAPPED_ENUM_LIST_ELEMENTS: usize = 1_000;
 
 /// Git commit embedded by release builds.
 ///

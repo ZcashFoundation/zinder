@@ -551,6 +551,34 @@ store by default, and the table readers of the files it holds open.
 Compact-blocks serving keeps two canonical generations on one canonical block
 cache.
 
+## Request list limits
+
+The server counts the elements of every list in a request before it decodes
+the request, and refuses a request over the limit with `INVALID_ARGUMENT` and
+the message `<Method> request field <field> carries <count> elements; at most
+<limit> are accepted`. An empty address or txid suffix takes 2 bytes on the
+wire but at least 24 once decoded, so without this check one 4 MiB request
+could cost tens of MiB before a handler's own cap refused it.
+
+| Method | Field | Limit | Handler cap |
+| --- | --- | --- | --- |
+| `GetTaddressBalance` | `addresses` | 512 | 256 addresses per balance |
+| `GetAddressUtxos`, `GetAddressUtxosStream` | `addresses` | 10,000 | none |
+| `GetMempoolTx` | `exclude_txid_suffixes` | 2,048 | 1,024 |
+| `GetMempoolTx` | `poolTypes` | 1,000 | none |
+| `GetBlockRange`, `GetBlockRangeNullifiers` | `poolTypes` | 1,000 | none |
+| `GetTaddressTxids`, `GetTaddressTransactions` | `range.poolTypes` | 1,000 | none |
+
+A limit is twice the handler's cap where one exists, so a request just over
+the cap still gets the handler's error. `poolTypes` names at most five pools,
+and the server reduces it to a set once per request, so 1,000 entries leave
+room for any client while stopping a list that only inflates decoding.
+
+lightwalletd checks the same fields before decoding, also at twice its handler
+caps (lightwalletd `78c8476`), but reports the refusal as `INTERNAL`, because
+grpc-go turns every codec error into that code. lightwalletd does not check
+`range.poolTypes` in `GetTaddressTxids` and `GetTaddressTransactions`.
+
 ## Transaction lookup
 
 `GetTransaction` returns a pending transaction the way lightwalletd does.

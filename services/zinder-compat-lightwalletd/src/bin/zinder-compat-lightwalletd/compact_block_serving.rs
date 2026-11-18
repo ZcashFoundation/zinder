@@ -725,9 +725,15 @@ impl CompactBlockAdapter {
         self
     }
 
-    pub(crate) fn into_server(self) -> compact_tx_streamer_server::CompactTxStreamerServer<Self> {
-        compact_tx_streamer_server::CompactTxStreamerServer::new(self)
-            .max_decoding_message_size(zinder_runtime::MAX_DECODING_MESSAGE_BYTES)
+    pub(crate) fn into_server(
+        self,
+    ) -> zinder_runtime::RepeatedFieldGuard<compact_tx_streamer_server::CompactTxStreamerServer<Self>>
+    {
+        zinder_runtime::RepeatedFieldGuard::new(
+            compact_tx_streamer_server::CompactTxStreamerServer::new(self)
+                .max_decoding_message_size(zinder_runtime::MAX_DECODING_MESSAGE_BYTES),
+            zinder_compat_lightwalletd::COMPACT_TX_STREAMER_FIELD_LIMITS,
+        )
     }
 
     fn reader(&self) -> Arc<RocksDbCanonicalSecondary> {
@@ -4241,6 +4247,73 @@ mod tests {
             .err()
             .ok_or("client-streaming RPC unexpectedly succeeded")?;
         assert_eq!(error.code(), Code::Unimplemented);
+        let _ = shutdown_sender.send(());
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn served_block_ranges_refuse_a_pool_type_flood_before_decoding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let chain =
+            zinder_testkit::ChainFixture::new(zinder_core::Network::ZcashRegtest).extend_blocks(2);
+        let activations = Arc::new(zinder_testkit::sample_regtest_upgrade_activations());
+        let mut fixture =
+            zinder_testkit::WalletServingStoreFixture::from_chain(&chain, activations.as_ref())?;
+        let (canonical, wallet) = fixture.take_readers()?;
+        drop(wallet);
+        let adapter = CompactBlockAdapter::new(CompactBlockServingSlot::new(Arc::new(canonical)));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(adapter.into_server())
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    let _ = shutdown_receiver.await;
+                })
+                .await
+        });
+        let block_range = |pool_types| lightwalletd::BlockRange {
+            start: Some(lightwalletd::BlockId {
+                height: 1,
+                hash: Vec::new(),
+            }),
+            end: Some(lightwalletd::BlockId {
+                height: 2,
+                hash: Vec::new(),
+            }),
+            pool_types,
+        };
+        let sapling = lightwalletd::PoolType::Sapling as i32;
+
+        let mut client = CompactTxStreamerClient::connect(endpoint).await?;
+        let refusal = client
+            .get_block_range(block_range(vec![
+                sapling;
+                zinder_runtime::MAX_DECODING_MESSAGE_BYTES
+                    - 64
+            ]))
+            .await
+            .err()
+            .ok_or("a pool-type flood was accepted")?;
+        let mut blocks = client
+            .get_block_range(block_range(vec![sapling]))
+            .await?
+            .into_inner();
+        let mut streamed_blocks = 0;
+        while blocks.message().await?.is_some() {
+            streamed_blocks += 1;
+        }
+
+        assert_eq!(refusal.code(), Code::InvalidArgument);
+        assert!(
+            refusal
+                .message()
+                .starts_with("GetBlockRange request field poolTypes carries "),
+            "{refusal:?}"
+        );
+        assert_eq!(streamed_blocks, 2);
         let _ = shutdown_sender.send(());
         server.await??;
         Ok(())

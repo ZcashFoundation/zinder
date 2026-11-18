@@ -6268,6 +6268,8 @@ dependencies = [
  "incrementalmerkletree",
  "orchard",
  "parking_lot",
+ "prost",
+ "prost-types",
  "rand 0.10.2",
  "sapling-crypto",
  "secp256k1",

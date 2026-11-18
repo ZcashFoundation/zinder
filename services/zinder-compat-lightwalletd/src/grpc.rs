@@ -31,6 +31,7 @@ use zinder_query::{
     TransparentAddressTxIdsInRangeRequest, TransparentAddressUnspentOutputsRequest, TreeState,
     WalletQueryApi, WalletServingQuery, address_lookup_to_script_hash, status_from_query_error,
 };
+use zinder_runtime::RepeatedFieldGuard;
 use zinder_source::{parse_transparent_address, transparent_address_matches_network};
 use zinder_store::{MempoolEvent, RawBlobRetention};
 
@@ -43,6 +44,7 @@ use crate::mempool::{
     SharedTipChangeWatcher, TipChangeWatcherError,
 };
 use crate::ping::LightwalletdPing;
+use crate::request_limits::COMPACT_TX_STREAMER_FIELD_LIMITS;
 
 type GrpcStream<T> =
     Pin<Box<dyn tonic::codegen::tokio_stream::Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -67,7 +69,7 @@ const LIGHTWALLETD_MEMPOOL_SNAPSHOT_PAGE_SIZE: u32 = 1024;
 /// the producer is currently sending.
 const COMPACT_BLOCK_STREAM_CHANNEL_CAPACITY: usize = 16;
 /// Maximum number of transaction-id suffixes accepted by one `GetMempoolTx` request.
-const MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST: usize = 1024;
+pub(crate) const MAX_EXCLUDED_TXID_SUFFIXES_PER_REQUEST: usize = 1024;
 /// Most distinct transactions one `GetMempoolStream` sends between tip changes.
 ///
 /// The stream remembers each id it sent so it can skip repeats, and that set
@@ -229,14 +231,20 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
         self
     }
 
-    /// Wraps this adapter in the generated tonic server type.
+    /// Wraps this adapter in the generated tonic server type, behind the
+    /// pre-decode bounds of [`COMPACT_TX_STREAMER_FIELD_LIMITS`].
     #[must_use]
-    pub fn into_server(self) -> compact_tx_streamer_server::CompactTxStreamerServer<Self>
+    pub fn into_server(
+        self,
+    ) -> RepeatedFieldGuard<compact_tx_streamer_server::CompactTxStreamerServer<Self>>
     where
         Self: compact_tx_streamer_server::CompactTxStreamer,
     {
-        compact_tx_streamer_server::CompactTxStreamerServer::new(self)
-            .max_decoding_message_size(zinder_runtime::MAX_DECODING_MESSAGE_BYTES)
+        RepeatedFieldGuard::new(
+            compact_tx_streamer_server::CompactTxStreamerServer::new(self)
+                .max_decoding_message_size(zinder_runtime::MAX_DECODING_MESSAGE_BYTES),
+            COMPACT_TX_STREAMER_FIELD_LIMITS,
+        )
     }
 }
 
@@ -1908,7 +1916,7 @@ fn classified_send_error_code(reported_code: Option<i64>, default_code: i32) -> 
     clippy::cast_possible_truncation,
     reason = "zinder-core rejects targets with pointer widths below 32 bits"
 )]
-const fn u32_to_usize(count: u32) -> usize {
+pub(crate) const fn u32_to_usize(count: u32) -> usize {
     count as usize
 }
 

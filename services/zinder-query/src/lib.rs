@@ -39,8 +39,8 @@ mod wallet_serving_pair_publisher;
 mod wallet_serving_query;
 
 pub use grpc::{
-    TransactionStatusLookup, WalletEndpointMetadata, WalletQueryGrpcAdapter,
-    address_lookup_to_script_hash, block_header_by_selector_response,
+    TransactionStatusLookup, WALLET_QUERY_FIELD_LIMITS, WalletEndpointMetadata,
+    WalletQueryGrpcAdapter, address_lookup_to_script_hash, block_header_by_selector_response,
     block_id_by_selector_response, broadcast_transaction_response,
     build_transparent_address_tx_ids_chunk, build_transparent_address_tx_ids_header,
     build_transparent_unspent_output_message, build_transparent_unspent_outputs_header,

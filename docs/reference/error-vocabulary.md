@@ -8,11 +8,17 @@ The proto enum is defined in [`crates/zinder-proto/proto/zinder/v1/ops/error.pro
 
 ## How to read the wire
 
-Every Zinder gRPC failure ships:
+Every failure a Zinder handler returns ships:
 
 - A `tonic::Status` carrying a standard gRPC `Code` (one of 16).
 - A `google.rpc.ErrorInfo` detail with `domain = "zinder.dev"` and `reason = <ErrorReason name>` (the string-form name of the enum value, e.g. `"BROADCAST_DISABLED"`).
 - For some reasons, an additional structured detail (`BadRequest.field_violations`, `PreconditionFailure.violations`, `ResourceInfo`).
+
+A request the transport refuses before any handler runs carries only the
+status code and message, with no `ErrorInfo`: a request frame over 4 MiB, a
+message that fails to decode, or a list over its
+[request list bound](../architecture/public-interfaces.md#request-list-bounds),
+which fails with `INVALID_ARGUMENT`.
 
 Clients consult `ErrorInfo.reason` for the typed category and the auxiliary detail for the failure shape. Match on the domain first to avoid mistaking a non-Zinder service's `ErrorInfo` for a Zinder one. The Rust SDK converts recognized strings to its client-owned `ErrorReason` variants and preserves unrecognized Zinder reasons as `ErrorReason::Unknown(String)`, so a newer server does not erase diagnostic identity at an older client.
 

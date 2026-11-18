@@ -55,6 +55,7 @@ pub mod network_upgrade_fixtures;
 pub mod note_commitment_chain;
 pub mod orchard_test_key;
 pub mod process_crash;
+pub mod repeated_request_fields;
 pub mod runtime_allocator;
 pub mod transparent_signer;
 pub mod wallet_serving_store_fixture;
@@ -89,6 +90,7 @@ pub use network_upgrade_fixtures::{
 };
 pub use note_commitment_chain::{commitment_tree_checkpoints, with_note_commitments};
 pub use orchard_test_key::{OrchardAddress, OrchardTestKey, regtest_unified_address};
+pub use repeated_request_fields::{RepeatedRequestField, repeated_request_fields};
 pub use runtime_allocator::check_binary_allocates_through_jemalloc;
 pub use transparent_signer::{
     LocalNetwork, P2pkhShieldingSpendArgs, P2pkhSpendArgs, ShieldedOutputPool,
