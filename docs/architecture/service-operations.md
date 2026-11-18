@@ -489,38 +489,40 @@ the served tip, the block a broadcast transaction targets, and keeps the table
 it fetched. Every broadcast checks that kept table again, without contacting
 the node, against the writer-admitted schedule of the newest served pair
 through the height that pair targets, and skips the endpoint where they
-disagree. A node that schedules NU7 at 700 while the writer schedules it at
-703 therefore receives no broadcast once the served tip reaches 699, and
-neither does a node left on the earlier schedule after the writer moves NU7
-from 700 to 703 at tip 699. A passed verification lasts until the serving
-pair's schedule revision or the network upgrade active at the height after
-the tip changes, or until that height reaches one where the kept table
-disagrees. In each case the probe verifies the endpoint again at once instead
-of waiting for the poll interval. Until that repeat passes, the endpoint
-keeps its earlier verification for up to one minute from when the new basis
-was first seen, while the repeat waits on the node and after it is
+disagree. The newest pair is the one of the latest chain epoch and, within
+that epoch, of the latest schedule revision, since a writer restart can admit
+a revision without moving the epoch. A node that schedules NU7 at 700 while
+the writer schedules it at 703 therefore receives no broadcast once the served
+tip reaches 699, and neither does a node left on the earlier schedule after
+the writer moves NU7 from 700 to 703 at tip 699. A passed verification lasts
+until the serving pair's schedule revision or the network upgrade active at
+the height after the tip changes, or until that height reaches one where the
+kept table disagrees. In each case the probe verifies the endpoint again at
+once instead of waiting for the poll interval. Until that repeat passes, the
+endpoint keeps its earlier verification for up to one minute from when the new
+basis was first seen, while the repeat waits on the node and after it is
 inconclusive, for example because the node has not received the block that
 crossed the activation. An inconclusive repeat is logged once as
 `wallet_node_reverification_inconclusive`, and the probe retries the endpoint
 every two seconds. After the minute the endpoint receives no broadcast, even
 before a retry finishes, and it is unverified. The minute never admits a
-broadcast that the kept table disagrees with. An endpoint that
-lacks `sendrawtransaction` or whose activation table disagrees is excluded and
+broadcast that the kept table disagrees with. An endpoint that lacks
+`sendrawtransaction` or whose activation table disagrees is excluded and
 logged as `wallet_node_excluded`; it is verified again after a backoff that
 starts at 30 seconds and doubles to 5 minutes. An endpoint that cannot be
 verified for any other reason, such as a timeout, a node that has not reached
 the served tip, or another block at the served tip height, is verified again
 at the next poll interval. The probe verifies each endpoint on its own
 schedule, so an endpoint that hangs until its request timeout delays neither
-another endpoint's verification and retries nor the observation that moves
-the preference past a verified endpoint that stopped answering. With more
-than one endpoint, set `broadcast_timeout_secs`
-on every endpoint well below wallet request deadlines, because a broadcast
-moves on only after it expires. Each endpoint takes its own value: a
-`[node_fallbacks.N]` table without `broadcast_timeout_secs` waits for its own
-`request_timeout_secs`, not for `[node]`'s broadcast timeout. Readers verify
-and observe every endpoint on `[node].health.poll_interval_ms` and ignore a
-fallback's `health.poll_interval_ms`.
+another endpoint's verification and retries nor the observation that moves the
+preference past a verified endpoint that stopped answering. With more than one
+endpoint, set `broadcast_timeout_secs` on every endpoint well below wallet
+request deadlines, because a broadcast moves on only after it expires. Each
+endpoint takes its own value: a `[node_fallbacks.N]` table without
+`broadcast_timeout_secs` waits for its own `request_timeout_secs`, not for
+`[node]`'s broadcast timeout. Readers verify and observe every endpoint on
+`[node].health.poll_interval_ms` and ignore a fallback's
+`health.poll_interval_ms`.
 
 ### Lightwalletd compatibility
 

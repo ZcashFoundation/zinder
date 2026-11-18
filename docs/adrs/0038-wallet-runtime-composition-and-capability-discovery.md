@@ -112,27 +112,29 @@ verification nor the liveness observation of the verified endpoints.
 
 A passed verification keeps the node's activation table. A broadcast reaches
 the endpoint only while that table agrees with the writer-admitted schedule
-through the height after the visible tip, both taken from the pair of the
-newest chain epoch that a broadcast or a verification has captured, so a
-request still holding an older pair cannot loosen the check. The check runs
-in the reader without contacting the node. A revision changes only
-activations above the tip it was admitted at, and it can move the activation
-at the very height a broadcast targets, such as NU7 from 700 to 703 while the
-tip is 699. From that pair on, a node whose table still schedules NU7 at 700
-receives no broadcast, whatever state its verification is in. The node's
-table can also schedule an upgrade at a height where the writer's schedule
-activates nothing, such as NU7 at 700 when the writer schedules it at 703, and
-the same check stops broadcasts once the tip reaches 699. The node's own table
-can change as well, for example after an operator restarts it, so a change of
-the revision or of the upgrade active at the broadcast height, or a tip that
-reaches a height where the kept table disagrees, verifies the endpoint again
-at once. An endpoint that answers verification with
-positive evidence, a missing `sendrawtransaction` or a disagreeing table, is
-excluded and verified again after a backoff that starts at 30 seconds and
-doubles to 5 minutes, so a node fixed by its operator returns without a reader
-restart. Any other failure, including a timeout, an unreached tip, or another
-block at the tip height, which a reorg the pair has not published yet also
-produces, leaves the endpoint unverified until its next verification.
+through the height after the visible tip, both taken from the newest pair that
+a broadcast or a verification has captured. Pairs are ordered by chain epoch
+and, within one epoch, by schedule revision, because a writer restart can
+admit a revision without moving the epoch. A request still holding an older
+pair therefore cannot loosen the check. The check runs in the reader without
+contacting the node. A revision changes only activations above the tip it was
+admitted at, and it can move the activation at the very height a broadcast
+targets, such as NU7 from 700 to 703 while the tip is 699. From that pair on,
+a node whose table still schedules NU7 at 700 receives no broadcast, whatever
+state its verification is in. The node's table can also schedule an upgrade at
+a height where the writer's schedule activates nothing, such as NU7 at 700
+when the writer schedules it at 703, and the same check stops broadcasts once
+the tip reaches 699. The node's own table can change as well, for example
+after an operator restarts it, so a change of the revision or of the upgrade
+active at the broadcast height, or a tip that reaches a height where the kept
+table disagrees, verifies the endpoint again at once. An endpoint that answers
+verification with positive evidence, a missing `sendrawtransaction` or a
+disagreeing table, is excluded and verified again after a backoff that starts
+at 30 seconds and doubles to 5 minutes, so a node fixed by its operator
+returns without a reader restart. Any other failure, including a timeout, an
+unreached tip, or another block at the tip height, which a reorg the pair has
+not published yet also produces, leaves the endpoint unverified until its next
+verification.
 
 The verification that runs when the tip crosses an activation often reaches a
 node that has not received that block yet. Until a verification against the
@@ -734,12 +736,13 @@ health-blind until it is.
   endpoint that hangs until its request timeout no longer delays another
   endpoint's verification or the liveness observation. A passed verification
   keeps the node's activation table, and every broadcast checks it against
-  the schedule of the newest captured pair through the broadcast height. A
-  revision that moves an activation at that height, or a tip that reaches an
-  activation only the node's table schedules, therefore stops broadcasts to a
-  disagreeing endpoint at once, also while its repeat verification waits or
-  after it was inconclusive. The one-minute grace of an earlier verification
-  counts from when the new basis was first seen.
+  the schedule of the newest captured pair, by chain epoch and then schedule
+  revision, through the broadcast height. A revision that moves an activation
+  at that height, or a tip that reaches an activation only the node's table
+  schedules, therefore stops broadcasts to a disagreeing endpoint at once,
+  also while its repeat verification waits or after it was inconclusive. The
+  one-minute grace of an earlier verification counts from when the new basis
+  was first seen.
 - 2026-11-18: Readers broadcast through the ordered node list. An
   `OrderedBroadcaster` replaces `NodeBroadcast`, verifies each endpoint,
   repeats a verification when the schedule revision or the tip's network

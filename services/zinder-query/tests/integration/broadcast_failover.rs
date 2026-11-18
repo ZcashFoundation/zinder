@@ -16,8 +16,8 @@ use zinder_query::{
 };
 use zinder_source::{SourceError, TransactionBroadcaster as _};
 use zinder_testkit::{
-    ChainFixture, MockTransactionBroadcaster, WalletServingStoreFixture,
-    sample_regtest_upgrade_activations,
+    CanonicalBaseline, CanonicalWriterFixture, ChainFixture, MockTransactionBroadcaster,
+    WalletServingStoreFixture, sample_regtest_upgrade_activations,
 };
 
 use crate::common::serving_pair_slot;
@@ -194,43 +194,48 @@ fn schedule_activating_nu6_3_at(height: u32) -> eyre::Result<NetworkUpgradeActiv
     )?)
 }
 
-/// Two regtest serving pairs on either side of a writer revision that moves
-/// NU6.3 from height 4 to height 5.
+/// Regtest serving pairs on either side of a writer revision that moves NU6.3
+/// from height 4 to height 5.
 ///
-/// The writer admits the revision at tip 2 and then appends block 3, so a
-/// broadcast under the revision targets height 4, where only the earlier
-/// schedule activates NU6.3.
+/// The writer publishes blocks through height 2 under the earlier schedule,
+/// appends block 3, and then admits the revision at tip 3 without moving the
+/// chain epoch, as a writer restart can. A broadcast at tip 3 targets height
+/// 4, where only the earlier schedule activates NU6.3.
 struct NextHeightRevision {
     /// Serves a tip at height 2 under the earlier schedule, so a broadcast
     /// targets height 3, where both schedules agree.
     earlier_slot: WalletServingPairSlot,
-    /// Serves a tip at height 3 under the revision, in the chain epoch after
-    /// the one `earlier_slot` serves.
+    /// Serves a tip at height 3 under the earlier schedule, in the chain
+    /// epoch after the one `earlier_slot` serves.
+    unrevised_slot: WalletServingPairSlot,
+    /// Serves the tip and chain epoch of `unrevised_slot` under the revision.
     revised_slot: WalletServingPairSlot,
     earlier: NetworkUpgradeActivations,
     revised: NetworkUpgradeActivations,
-    _stores: [WalletServingStoreFixture; 2],
+    _stores: [WalletServingStoreFixture; 3],
 }
 
 impl NextHeightRevision {
     fn new() -> eyre::Result<Self> {
         let earlier = schedule_activating_nu6_3_at(4)?;
         let revised = schedule_activating_nu6_3_at(5)?;
-        let mut earlier_store = WalletServingStoreFixture::from_chain(
-            &ChainFixture::new(Network::ZcashRegtest).extend_blocks(2),
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+        let mut writer = CanonicalWriterFixture::publish(
+            &CanonicalBaseline::new(&chain).through(BlockHeight::new(2)),
             &earlier,
         )?;
-        let mut revised_store = WalletServingStoreFixture::from_chain_after_admitted_live_append(
-            &ChainFixture::new(Network::ZcashRegtest).extend_blocks(3),
-            &earlier,
-            &revised,
-        )?;
+        let mut earlier_store = writer.serving_store_fixture()?;
+        writer.append_live_block(&chain)?;
+        let mut unrevised_store = writer.serving_store_fixture()?;
+        writer.admit_network_upgrade_schedule(&revised)?;
+        let mut revised_store = writer.into_serving_store_fixture()?;
         Ok(Self {
             earlier_slot: serving_pair_slot(&mut earlier_store)?,
+            unrevised_slot: serving_pair_slot(&mut unrevised_store)?,
             revised_slot: serving_pair_slot(&mut revised_store)?,
             earlier,
             revised,
-            _stores: [earlier_store, revised_store],
+            _stores: [earlier_store, unrevised_store, revised_store],
         })
     }
 
@@ -1052,6 +1057,40 @@ async fn revision_at_the_broadcast_height_skips_the_earlier_table_after_an_incon
     assert_eq!(on_earlier.call_count(), 0);
     assert_eq!(on_revised.call_count(), 2);
     assert!(nodes.verified_capabilities().is_none());
+    Ok(())
+}
+
+/// A request that captured the pair before a same-epoch revision does not
+/// bring back the earlier schedule.
+///
+/// A writer restart admits the revision without moving the chain epoch. After
+/// a broadcast under the revision, a broadcast over the earlier pair of that
+/// epoch and a later one both skip the node whose table matches only the
+/// earlier schedule, while the node whose table matches the revision keeps
+/// its earlier verification within the grace.
+#[tokio::test]
+async fn earlier_revision_captured_later_keeps_skipping_the_earlier_table() -> eyre::Result<()> {
+    let revision = NextHeightRevision::new()?;
+    let (nodes, on_earlier, on_revised) = revision.verified_endpoints().await?;
+    let revised_query: BroadcastQuery =
+        WalletServingQuery::from_serving_pair_slot(revision.revised_slot.clone())
+            .with_node_broadcast(Some(nodes.clone()));
+    let unrevised_query: BroadcastQuery =
+        WalletServingQuery::from_serving_pair_slot(revision.unrevised_slot.clone())
+            .with_node_broadcast(Some(nodes.clone()));
+
+    revised_query
+        .broadcast_transaction(RawTransactionBytes::new([0x1f]))
+        .await?;
+    unrevised_query
+        .broadcast_transaction(RawTransactionBytes::new([0x20]))
+        .await?;
+    nodes
+        .broadcast_transaction(RawTransactionBytes::new([0x21]))
+        .await?;
+
+    assert_eq!(on_earlier.call_count(), 0);
+    assert_eq!(on_revised.call_count(), 3);
     Ok(())
 }
 

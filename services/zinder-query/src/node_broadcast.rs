@@ -515,9 +515,10 @@ fn record_attempt(position: usize, outcome: &Result<TransactionBroadcastOutcome,
 pub(crate) struct EndpointVerifications {
     endpoints: Arc<[EndpointVerification]>,
     preferred: watch::Receiver<usize>,
-    /// The evidence of the serving pair of the newest chain epoch that a
-    /// verification or a wallet broadcast captured, which a broadcast checks
-    /// every kept activation table against.
+    /// The evidence of the newest serving pair, by chain epoch and then
+    /// schedule revision, that a verification or a wallet broadcast
+    /// captured, which a broadcast checks every kept activation table
+    /// against.
     ///
     /// An endpoint's verification state changes only while this lock is
     /// held, so a verification whose basis differs from this pair's is
@@ -559,14 +560,14 @@ impl EndpointVerifications {
         self.track(&Arc::new(VerificationTarget::of(pair)));
     }
 
-    /// Tracks `captured` unless a pair of a newer chain epoch was tracked, so
-    /// a caller that captured an older pair cannot replace a newer one, and
-    /// starts the grace of every verification of another basis.
+    /// Tracks `captured` unless a newer pair was tracked, so a caller that
+    /// captured an older pair cannot replace a newer one, and starts the
+    /// grace of every verification of another basis.
     fn track(&self, captured: &Arc<VerificationTarget>) {
         let mut admission = self.admission.lock();
         if admission
             .as_ref()
-            .is_some_and(|tracked| tracked.chain_epoch_id > captured.chain_epoch_id)
+            .is_some_and(|tracked| tracked.publication_order() > captured.publication_order())
         {
             return;
         }
@@ -982,6 +983,13 @@ impl VerificationTarget {
     /// schedule through the height a broadcast targets.
     fn agrees_with(&self, node_activations: &NetworkUpgradeActivations) -> bool {
         node_activations.preserves_through(&self.admitted_activations, self.broadcast_height)
+    }
+
+    /// Orders captured pairs by when they were published: by chain epoch, and
+    /// within one epoch by schedule revision, since a writer restart can
+    /// admit a revision without moving the chain epoch.
+    fn publication_order(&self) -> (ChainEpochId, Option<u64>) {
+        (self.chain_epoch_id, self.basis.schedule_revision)
     }
 }
 
