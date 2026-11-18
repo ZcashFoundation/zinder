@@ -741,15 +741,52 @@ require_known_entrypoint_settings() {
   fi
 }
 
+# Prints the value of the `ZINDER_*` variable that sets configuration path $1,
+# matched as zinder_variables_outside matches names, so a variable the
+# binaries read in any letter case counts.
+zinder_setting() {
+  awk -v wanted_path="$1" '
+    BEGIN {
+      for (name in ENVIRON) {
+        if (name !~ /^ZINDER_[A-Za-z0-9_]+$/) {
+          continue
+        }
+        variable_path = tolower(substr(name, 8))
+        gsub(/__/, ".", variable_path)
+        if (variable_path == wanted_path) {
+          print ENVIRON[name]
+          exit
+        }
+      }
+    }
+  '
+}
+
+# Prints, one per line, the position N of every [node_fallbacks.N] endpoint
+# that a `ZINDER_*` variable configures, matched as zinder_setting matches.
+zinder_fallback_positions() {
+  awk '
+    BEGIN {
+      for (name in ENVIRON) {
+        if (name !~ /^ZINDER_[A-Za-z0-9_]+$/) {
+          continue
+        }
+        segment_count = split(tolower(substr(name, 8)), segments, "__")
+        if (segment_count >= 3 && segments[1] == "node_fallbacks" &&
+          segments[2] ~ /^[0-9]+$/) {
+          print segments[2]
+        }
+      }
+    }
+  ' | sort -u
+}
+
 # Fails unless every [node_fallbacks.N] endpoint in the environment names its
 # indexer gRPC URL. Ingest follows the mempool of whichever endpoint it
 # switched to, so a fallback without the stream brings polling back.
 require_fallback_indexer_endpoints() {
-  for fallback_position in $(
-    env | sed -n -E 's/^ZINDER_NODE_FALLBACKS__([0-9]+)__[A-Z0-9_]+=.*/\1/p' | sort -un
-  ); do
-    eval "fallback_indexer_addr=\"\${ZINDER_NODE_FALLBACKS__${fallback_position}__INDEXER_GRPC_ADDR:-}\""
-    if [ -z "$fallback_indexer_addr" ]; then
+  for fallback_position in $(zinder_fallback_positions); do
+    if [ -z "$(zinder_setting "node_fallbacks.${fallback_position}.indexer_grpc_addr")" ]; then
       fail "ZINDER_NODE_FALLBACKS__${fallback_position}__INDEXER_GRPC_ADDR is required: every fallback node endpoint needs its indexer gRPC URL, because ingest follows the mempool of the endpoint it switched to"
     fi
   done
@@ -758,7 +795,7 @@ require_fallback_indexer_endpoints() {
 # Without the node indexer stream, ingest follows the node mempool by polling
 # JSON-RPC and re-reads the whole mempool after every block, withdrawing
 # readiness whenever that re-read outlasts its 30-second tip-transition grace.
-if [ -z "${ZINDER_NODE__INDEXER_GRPC_ADDR:-}" ]; then
+if [ -z "$(zinder_setting node.indexer_grpc_addr)" ]; then
   fail "ZINDER_NODE__INDEXER_GRPC_ADDR is required: set it to the node's indexer gRPC URL. Without the indexer stream, ingest re-reads the whole node mempool over JSON-RPC after every block and withdraws readiness when that takes longer than 30 seconds"
 fi
 require_fallback_indexer_endpoints

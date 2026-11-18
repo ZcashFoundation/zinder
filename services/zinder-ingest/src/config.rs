@@ -408,6 +408,30 @@ fn optional_nonzero_u32_config(
         .transpose()
 }
 
+/// Returns the smallest and the largest `max_response_bytes` of the ordered
+/// node list.
+///
+/// Startup can make any endpoint active, and each endpoint's client accepts
+/// responses up to its own limit. Source fetch reserves and admits responses
+/// against the largest, so the in-flight byte bound holds on every endpoint,
+/// and aims responses at the smallest, so no endpoint refuses the default
+/// target.
+fn node_response_byte_range(
+    node_target: &NodeTarget,
+    node_fallbacks: &[NodeTarget],
+) -> (NonZeroU64, NonZeroU64) {
+    node_fallbacks
+        .iter()
+        .map(|fallback| fallback.max_response_bytes)
+        .fold(
+            (
+                node_target.max_response_bytes,
+                node_target.max_response_bytes,
+            ),
+            |(smallest, largest), limit| (smallest.min(limit), largest.max(limit)),
+        )
+}
+
 fn available_logical_core_count() -> NonZeroU32 {
     let logical_core_count =
         std::thread::available_parallelism().map_or(8, std::num::NonZeroUsize::get);
@@ -424,10 +448,12 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
     let node_target = NodeTarget::resolve(network, config.node).map_err(ConfigError::from)?;
     let node_fallbacks =
         NodeTarget::resolve_fallbacks(network, config.node_fallbacks).map_err(ConfigError::from)?;
+    let (smallest_node_response_bytes, largest_node_response_bytes) =
+        node_response_byte_range(&node_target, &node_fallbacks);
     let resolved_pipeline_limits = CanonicalPipelineLimits::resolve(
         container_memory_budget_bytes().and_then(NonZeroU64::new),
         available_logical_core_count(),
-        node_target.max_response_bytes,
+        largest_node_response_bytes,
     );
     let node_source_text = config
         .ingest
@@ -495,7 +521,11 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
             .source_segment_target_response_bytes,
         "ingest.construction.source_segment_target_response_bytes",
     )?
-    .unwrap_or(resolved_pipeline_limits.source_segment_target_response_bytes);
+    .unwrap_or_else(|| {
+        resolved_pipeline_limits
+            .source_segment_target_response_bytes
+            .min(smallest_node_response_bytes)
+    });
     let source_fetch_max_in_flight_requests = optional_nonzero_u32_config(
         config
             .ingest
@@ -510,7 +540,7 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
     )?
     .unwrap_or(resolved_pipeline_limits.source_fetch_max_in_flight_bytes);
     let pipeline_limits = CanonicalPipelineLimits {
-        max_response_bytes: node_target.max_response_bytes,
+        max_response_bytes: largest_node_response_bytes,
         source_segment_target_response_bytes,
         source_segment_max_blocks,
         source_fetch_max_in_flight_requests,

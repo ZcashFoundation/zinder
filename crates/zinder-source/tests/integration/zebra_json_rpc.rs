@@ -2502,6 +2502,42 @@ async fn poll_upstream_health_falls_back_when_ready_endpoint_unreachable() -> ey
     Ok(())
 }
 
+/// A `/ready` endpoint that never answers holds the poll for two seconds.
+///
+/// The poll then falls back to JSON-RPC whatever its interval, so a caller
+/// with a short deadline still gets an answer.
+#[tokio::test]
+async fn poll_upstream_health_falls_back_when_ready_endpoint_never_answers() -> eyre::Result<()> {
+    let server =
+        JsonRpcTestServer::start([method("getblockchaininfo").reply(RpcReply::result(json!({
+            "blocks": 50,
+            "estimatedheight": 50,
+            "verificationprogress": 1.0,
+            "valuePools": [],
+            "upgrades": {},
+        })))])?;
+    // Never accepts: the kernel completes the handshake, and the probe's
+    // request then waits for an answer that never comes.
+    let silent_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let source = testnet_source(&server)?.with_health_config(Some(NodeHealthConfig::new(
+        format!("http://{}/ready", silent_listener.local_addr()?),
+        Duration::from_secs(30),
+        0.999,
+        10,
+    )));
+
+    let snapshot = tokio::time::timeout(Duration::from_secs(5), source.poll_upstream_health())
+        .await
+        .map_err(|_elapsed| eyre!("the poll waited out the silent ready endpoint's interval"))??;
+
+    assert!(snapshot.ready_for_queries);
+    assert_eq!(
+        snapshot.source,
+        UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK
+    );
+    Ok(())
+}
+
 /// A failed ready probe logs the health address with its credentials
 /// redacted, so a standby evaluation of a fallback never writes them.
 #[tokio::test]

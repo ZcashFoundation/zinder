@@ -40,7 +40,10 @@ impl<Endpoint> NodeEndpointMonitor<Endpoint> {
 /// Cancellation stops the monitor at once, even during a round that waits on
 /// an endpoint that does not answer. A round that ran before the follower
 /// published its fence leaves candidates pending, so the monitor evaluates
-/// again as soon as the fence appears instead of one interval later.
+/// again as soon as the fence appears instead of one interval later. A switch
+/// leaves the previous active endpoint pending, so it abandons the round in
+/// flight, or the wait for the next one, and the monitor evaluates every
+/// endpoint in its new role at once.
 #[must_use = "drop the handle to detach the task or await it for symmetric shutdown"]
 pub fn spawn_node_endpoint_monitor<Endpoint>(
     monitor: NodeEndpointMonitor<Endpoint>,
@@ -54,16 +57,20 @@ where
         let shared = monitor.shared.as_ref();
         let interval = shared.policy.standby_evaluation_interval;
         let mut fence = shared.fence.subscribe();
+        let mut switches = shared.nodes.subscribe_switches();
         loop {
             let round_fence = *fence.borrow_and_update();
+            switches.mark_unchanged();
             tokio::select! {
                 () = cancel.cancelled() => break,
                 () = evaluate_round(shared, &admitted_activations, round_fence) => {}
+                () = endpoint_switched(&mut switches) => continue,
             }
             tokio::select! {
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(interval) => {}
                 () = fence_published(&mut fence), if round_fence.is_none() => {}
+                () = endpoint_switched(&mut switches) => {}
             }
         }
     })
@@ -72,6 +79,13 @@ where
 /// Resolves once the follower has published a fence.
 async fn fence_published(fence: &mut watch::Receiver<Option<FenceTips>>) {
     if fence.wait_for(Option::is_some).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Resolves on the next switch of the active endpoint.
+async fn endpoint_switched(switches: &mut watch::Receiver<usize>) {
+    if switches.changed().await.is_err() {
         std::future::pending::<()>().await;
     }
 }

@@ -42,6 +42,8 @@ for function_name in \
   zinder_variables_outside \
   start_runtime_process \
   require_positive_seconds \
+  zinder_setting \
+  zinder_fallback_positions \
   require_fallback_indexer_endpoints \
   require_known_entrypoint_settings; do
   definition="$(entrypoint_function "$function_name")"
@@ -570,6 +572,25 @@ ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR=http://127.0.0.1:28232 \
   ZINDER_NODE_FALLBACKS__1__INDEXER_GRPC_ADDR=http://127.0.0.1:28155 \
   require_fallback_indexer_endpoints \
   || test_failure "a fallback endpoint with an indexer URL was rejected: $fail_message"
+
+# The binaries read variable names in any letter case after `ZINDER_`, so the
+# requirement matches them the same way: a mixed-case fallback still needs its
+# indexer URL, and a mixed-case indexer URL satisfies it.
+fail_message=""
+ZINDER_Node_Fallbacks__3__Json_Rpc_Addr=http://127.0.0.1:28232 \
+  require_fallback_indexer_endpoints || true
+case "$fail_message" in
+  ZINDER_NODE_FALLBACKS__3__INDEXER_GRPC_ADDR\ is\ required:*) ;;
+  *) test_failure "a mixed-case fallback endpoint without an indexer URL was accepted: '$fail_message'" ;;
+esac
+fail_message=""
+ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR=http://127.0.0.1:28232 \
+  ZINDER_node_fallbacks__1__indexer_grpc_addr=http://127.0.0.1:28155 \
+  require_fallback_indexer_endpoints \
+  || test_failure "a mixed-case fallback indexer URL was rejected: $fail_message"
+[ "$(ZINDER_Node__Indexer_Grpc_Addr=http://127.0.0.1:18155 zinder_setting node.indexer_grpc_addr)" \
+  = http://127.0.0.1:18155 ] \
+  || test_failure "a mixed-case [node] indexer URL was not found"
 
 # Each process starts with the variables its binary accepts. A stub setpriv on
 # PATH records the environment variable names each process receives.

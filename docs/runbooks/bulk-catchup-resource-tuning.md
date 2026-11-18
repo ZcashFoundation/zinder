@@ -45,8 +45,10 @@ queue admission:
 The byte watermarks use container-aware defaults when a cgroup v2 memory limit
 is available. Explicit TOML or `ZINDER_INGEST__CONSTRUCTION__*` overrides win,
 but they are diagnostic controls rather than required production settings. Keep
-the source watermark at least as large as `node.max_response_bytes`; startup
-rejects a configuration that cannot admit its first source request.
+the source watermark at least as large as `node.max_response_bytes`, or the
+largest `max_response_bytes` in the list when `[node_fallbacks.N]` endpoints
+are configured; startup rejects a configuration that cannot admit its first
+source request.
 
 For memory pressure, first lower `block_prepare_concurrency`, then lower the
 source or prepare watermark that metrics identify. Raising concurrency without raising the

@@ -38,7 +38,10 @@ a tree-state response whose height or hash does not match the request.
 
 Fresh canonical construction consumes one `CanonicalPipelineLimits` value.
 The runtime resolves it from the container memory budget, logical CPU count,
-and `node.max_response_bytes`:
+and `node.max_response_bytes`. With `[node_fallbacks.N]` endpoints, startup can
+make any endpoint active, so the formulas below use the largest
+`max_response_bytes` in the ordered node list for the response limit and the
+source watermark, and the smallest for the response target:
 
 - `source_segment_max_blocks = 64`, and validation rejects values above 1000,
   the largest JSON-RPC batch a Zakura node accepts
@@ -134,6 +137,9 @@ memory, and node response limits.
 
 ## Revision history
 
+- 2026-11-18: With fallback node endpoints, the response limit and source
+  watermark use the largest `max_response_bytes` in the ordered node list, and
+  the response target the smallest.
 - 2026-11-17: Tree state at a height between checkpoints is reconstructed
   from the nearest checkpoint below and the stored compact blocks, so
   `TreeStateAtHeight` and `GetTreeState` serve every retained height without

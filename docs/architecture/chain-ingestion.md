@@ -269,9 +269,11 @@ While ingest follows, a standby monitor polls every endpoint on the
 `[node.health]` cadence, 30 seconds by default. Each endpoint's evaluation is
 bounded by that cadence, or by 5 seconds when the cadence is shorter, and is
 recorded as soon as it completes, so an active endpoint that hangs never delays
-the evidence about the others. The monitor records whether the active endpoint
-reports ready, and whether each other endpoint could take over: it must report
-ready, advertise the required capabilities and the admitted table, hold the
+the evidence about the others. A switch abandons the evaluation in flight and
+starts a new one at once, so the endpoint ingest left becomes a candidate again
+within one evaluation rather than one cadence later. The monitor records
+whether the active endpoint reports ready, and whether each other endpoint
+could take over: it must report ready, advertise the required capabilities and the admitted table, hold the
 configured network's genesis block, and have a tip at or above the visible tip. It is a standby when it holds the
 visible tip, and a diverged standby when it holds only the settled tip. Until
 the follower publishes its first fence, a candidate that passes the other
@@ -307,7 +309,11 @@ with the previous endpoint or finishes certifying one of its snapshots after
 the switch.
 Each endpoint's client applies that endpoint's own `request_timeout_secs`, and
 the writer bounds every node call by the longest timeout in the list, so a call
-to a fallback slower than `[node]` is not cut short after a switch.
+to a fallback slower than `[node]` is not cut short after a switch. Each client
+also accepts responses up to its own `max_response_bytes`, and construction can
+start on any endpoint, so construction reserves and admits source responses
+against the largest limit in the list, which keeps its in-flight byte bound
+whichever endpoint is active, and aims them at the smallest.
 There is no timed failback. The next switch walks positions from 0 again, and a
 restart starts at position 0. Fresh construction does not switch: a node
 failure there exits, and the restart admits the first reachable endpoint.

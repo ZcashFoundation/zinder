@@ -320,9 +320,13 @@ Compose topology mounts the files into ingest with
 [Deploying on one VM](../runbooks/deploying-on-a-vm.md#stream-mempool-events-over-indexer-tls).
 
 When `[node.health].addr` is configured, `ZebraJsonRpcSource` polls Zebra's
-readiness endpoint using the configured cadence and thresholds. Without that
-explicit endpoint, source status comes from the JSON-RPC observations available
-to the writer. Upstream readiness caps ingest readiness even when local storage
+readiness endpoint using the configured cadence and thresholds. Each probe
+waits at most two seconds, or the cadence when it is shorter; a probe that
+fails or takes longer falls back to `getblockchaininfo` in the same poll, so an
+endpoint that accepts connections but never answers cannot hold up a caller
+with a short deadline, such as ingest's switch check. Without that explicit
+endpoint, source status comes from the JSON-RPC observations available to the
+writer. Upstream readiness caps ingest readiness even when local storage
 is healthy. Wallet-serving readers use their node only for broadcast, so they
 report its readiness as a degraded dependency and keep serving stored reads
 ([ADR-0045](../adrs/0045-wallet-serving-readiness-follows-the-serving-pair.md)).

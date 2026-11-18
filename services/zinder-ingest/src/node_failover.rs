@@ -568,6 +568,20 @@ where
         }
     }
 
+    /// Resets the gated [`ReadinessInput::NodeSource`] input to `starting`
+    /// for the endpoint a switch makes active.
+    ///
+    /// It runs as part of the switch, before the upstream health probe can
+    /// observe it, so the probe's first observation of the new endpoint
+    /// always replaces the reset rather than being overwritten by it.
+    fn reset_node_source_input(&self) {
+        if self.readiness.gates_node_source_input {
+            self.readiness
+                .readiness
+                .publish_input(ReadinessInput::NodeSource, ReadinessCause::Starting);
+        }
+    }
+
     fn complete_switch(
         &self,
         from_position: usize,
@@ -575,11 +589,6 @@ where
         failure_class: &'static str,
         diverged: bool,
     ) -> NodeEndpointSwitch {
-        if self.readiness.gates_node_source_input {
-            self.readiness
-                .readiness
-                .publish_input(ReadinessInput::NodeSource, ReadinessCause::Starting);
-        }
         self.publish_active_position();
         metrics::counter!(
             "zinder_ingest_node_endpoint_switches_total",
@@ -672,7 +681,11 @@ where
             })
             .collect::<FuturesOrdered<_>>();
         while let Some((position, evaluation, confirmed)) = confirmations.next().await {
-            if confirmed && self.switch.switch_to(position) {
+            if confirmed
+                && self
+                    .switch
+                    .switch_to_with(position, || self.reset_node_source_input())
+            {
                 return Some(self.complete_switch(
                     from_position,
                     position,

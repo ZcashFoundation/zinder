@@ -33,6 +33,15 @@ use crate::{
 /// payloads from the configured URL.
 const READY_RESPONSE_BODY_BYTES_CAP: usize = 4 * 1024;
 
+/// Longest one probe waits for the endpoint's answer.
+///
+/// Zebra answers `/ready` at once with a short body, so a slower probe counts
+/// as failed and the same health poll falls back to JSON-RPC. The bound keeps
+/// an endpoint that accepts connections but never answers from using up the
+/// deadline of a caller that also needs that fallback, such as ingest's
+/// five-second switch check.
+const READY_PROBE_TIMEOUT_CEILING: Duration = Duration::from_secs(2);
+
 /// One-shot HTTP/1 probe of Zebra's `/ready` endpoint.
 ///
 /// Opens a fresh TCP connection each call: the probe runs once per
@@ -44,8 +53,12 @@ pub(crate) struct ZebraReadyClient {
 }
 
 impl ZebraReadyClient {
-    pub(crate) const fn new(request_timeout: Duration) -> Self {
-        Self { request_timeout }
+    /// Builds a client for probes made every `poll_interval`. Each probe
+    /// waits at most that interval, and never longer than two seconds.
+    pub(crate) fn new(poll_interval: Duration) -> Self {
+        Self {
+            request_timeout: poll_interval.min(READY_PROBE_TIMEOUT_CEILING),
+        }
     }
 
     /// Issues a `GET` against `addr` and returns the parsed snapshot.

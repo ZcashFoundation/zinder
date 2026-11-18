@@ -232,10 +232,12 @@ failed probe keeps the last observation. The follower cannot clear the probe's
 Zebra. Without a health endpoint, ingest has no node-source input.
 
 With `[node_fallbacks.N]` endpoints, the probe observes whichever endpoint is
-active. A switch resets the node-source input to `starting`, abandons a probe
-of the previous endpoint still in flight, and probes the new endpoint at once.
-A probe publishes only while the endpoint it probed is still active, so the
-previous endpoint's observation never stands for the new one. Without `[node.health]`, the standby monitor still tracks each
+active. A switch resets the node-source input to `starting` as part of the
+switch itself, abandons a probe of the previous endpoint still in flight, and
+probes the new endpoint at once, so the reset never overwrites the new
+endpoint's first observation. A probe publishes only while the endpoint it
+probed is still active, so the previous endpoint's observation never stands for
+the new one. Without `[node.health]`, the standby monitor still tracks each
 endpoint's health for the failover, but nothing publishes a node-source input.
 `/readyz` and the ops `ReadinessReport` then also carry
 `active_node: { "position": N }`, 0 for `[node]` and `N` for
