@@ -247,7 +247,7 @@ while IFS= read -r image_name; do
     continue
   fi
 
-  # UID 1000, the zinder user, runs every release process, including the
+  # UID 10001, the zinder user, runs every release process, including the
   # processes that the single-volume entrypoints start as root and then drop.
   smoke_image="zinder-release-smoke/${image_name}:${platform_arch}"
   docker buildx build \
@@ -273,19 +273,19 @@ while IFS= read -r image_name; do
       exit 1
     }
     image_binary_version="$(
-      docker run --rm --platform "$platform" --user 1000:1000 \
+      docker run --rm --platform "$platform" --user 10001:10001 \
         --entrypoint "$binary_name" "$smoke_image" --version
     )"
     [[ "$image_binary_version" == "${binary_name} ${release_tag#v}" ]] || {
       echo >&2 "${image_name} reports '${image_binary_version}' for ${binary_name}, expected '${binary_name} ${release_tag#v}'"
       exit 1
     }
-    docker run --rm --platform "$platform" --user 1000:1000 \
+    docker run --rm --platform "$platform" --user 10001:10001 \
       --entrypoint "$binary_name" "$smoke_image" --help >/dev/null
     # Port 1 has no listener, so the healthcheck must report unhealthy (1),
     # not a usage error (2) from a binary without the subcommand.
     healthcheck_status=0
-    docker run --rm --platform "$platform" --user 1000:1000 \
+    docker run --rm --platform "$platform" --user 10001:10001 \
       --entrypoint "$binary_name" "$smoke_image" healthcheck --addr 127.0.0.1:1 \
       >/dev/null 2>&1 || healthcheck_status=$?
     [[ "$healthcheck_status" -eq 1 ]] || {
@@ -294,5 +294,5 @@ while IFS= read -r image_name; do
     }
   done
   rm -f -- "$smoke_filesystem"
-  echo "${image_name} (${platform_arch}): ${carried_binaries[*]} match the archive and run as UID 1000"
+  echo "${image_name} (${platform_arch}): ${carried_binaries[*]} match the archive and run as UID 10001"
 done <<< "$image_names"

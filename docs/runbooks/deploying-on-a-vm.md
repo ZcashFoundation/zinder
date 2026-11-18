@@ -192,14 +192,14 @@ Create the root-owned file-backed control-secret directory before validating
 Compose. The ordinary ingest token is mounted into all four runtimes; the
 checkpoint token is mounted only into ingest and projector.
 The group must be the container service group (the release images use GID
-1000), while the files remain owned by root and are not stored in the shared
+10001), while the files remain owned by root and are not stored in the shared
 RocksDB volume.
 
 ```bash
-sudo install -d -o root -g 1000 -m 0750 /etc/zinder/control-secrets
+sudo install -d -o root -g 10001 -m 0750 /etc/zinder/control-secrets
 openssl rand -hex 32 | sudo tee /etc/zinder/control-secrets/ingest.token >/dev/null
 openssl rand -hex 32 | sudo tee /etc/zinder/control-secrets/checkpoint.token >/dev/null
-sudo chown root:1000 /etc/zinder/control-secrets/*.token
+sudo chown root:10001 /etc/zinder/control-secrets/*.token
 sudo chmod 0440 /etc/zinder/control-secrets/*.token
 ```
 
@@ -267,6 +267,29 @@ manager, so a custom healthcheck must also call the binary, for example
 `["CMD", "zinder-query", "healthcheck", "--path", "/healthz"]` for liveness
 only. See [Inspect a runtime container](#inspect-a-runtime-container).
 
+### Upgrade from images that ran as UID 1000
+
+Earlier runtime images ran as UID and GID 1000; they now run as 10001. On the
+first start of the upgraded topology, `state-init` hands the data and
+checkpoint-staging volumes to UID 10001, so the stores need no manual step.
+Files mounted from the host do. Before you start the upgraded topology, give
+the control secrets, and the indexer TLS files if you use that overlay, the
+new group:
+
+```bash
+sudo chgrp 10001 /etc/zinder/control-secrets /etc/zinder/control-secrets/*.token
+sudo chgrp 10001 /etc/zinder/indexer-tls /etc/zinder/indexer-tls/*.pem
+```
+
+If you ran the cookie-permissions project beside a Zakura node, remove it,
+including a fallback node's project; Zinder now reads the node's cookie
+without it. The cookie stays mode 0644 until the node writes a new one on its
+next start.
+
+```bash
+docker compose -p zinder-<network>-node-cookie down
+```
+
 ### Attach a Zakura node
 
 Zakura's own Compose file does not share a network or a cookie volume with
@@ -289,23 +312,14 @@ address. The Zakura env files therefore leave
 mempool events from Zakura instead, follow
 [Stream mempool events over indexer TLS](#stream-mempool-events-over-indexer-tls).
 
-Zebra and Zakura write the cookie as UID 10001 with mode 0600, and replace it
-on every start. The Zinder runtimes run as UID 1000 and cannot read it. Run
-the cookie-permissions project beside the node with the same env file:
-
-```bash
-docker compose --env-file /etc/zinder/env \
-  -f deploy/node-cookie-permissions.yml up -d
-```
-
-It runs as UID 10001 with no capabilities and no network. Every 5 seconds it
-sets the cookie's mode to 0644 in place; it never copies the cookie. It is a
-separate Compose project, so the Zinder systemd unit does not stop it. After a
-node restart, ingest can find the cookie unreadable for up to one poll
-interval. Ingest reports the node as unavailable and retries. Query and
-compatibility start even while the cookie is unreadable: they report the node
-as unavailable and refuse broadcasts until they can read it. Z3 already runs
-an equivalent service, so Z3 deployments do not need this project.
+The Zebra and Zakura images run the node as UID 10001 and write the cookie
+with mode 0600, replacing it on every start. The Zinder images run as UID
+10001 too, so they read the cookie as written. If the node runs under another
+UID, set the same `user:` on the Zinder services that mount the cookie, or,
+where the node accepts a fixed RPC password, set
+`ZINDER_NODE__AUTH__METHOD=basic` with `ZINDER_NODE__AUTH__USERNAME` and
+`ZINDER_NODE__AUTH__PASSWORD`. Native binaries likewise read the cookie only
+when they run as the node's user.
 
 ### Fail over to a second node
 
@@ -326,15 +340,6 @@ docker compose --env-file /etc/zinder/env \
   -f deploy/docker-compose.yml \
   -f deploy/docker-compose.node-fallback.yml \
   up -d --no-build
-```
-
-Run the cookie-permissions project for the fallback node's cookie volume too,
-as a project of its own:
-
-```bash
-ZINDER_SOURCE_COOKIE_VOLUME_NAME=zakura-mainnet-cookie \
-  docker compose -p zinder-mainnet-fallback-node-cookie \
-  --env-file /etc/zinder/env -f deploy/node-cookie-permissions.yml up -d
 ```
 
 The overlay mounts the fallback cookie at `/var/run/auth-fallback` for ingest,
@@ -411,7 +416,8 @@ mounts individual files, so query and compatibility receive only
 capability; reader runtimes must never mount or read it.
 
 The root-owned `state-init` service initializes the shared data volume and the
-separate checkpoint-staging volume for UID/GID 1000 before ingest starts.
+separate checkpoint-staging volume for UID/GID 10001 on every start, before
+ingest starts.
 Checkpoint staging is mounted only into ingest and projector, never into query
 or compatibility. Canonical checkpoint requests accept only an opaque candidate
 identifier beneath that root; the projector prepares the candidate directory,
@@ -550,10 +556,10 @@ Install them in a root-owned directory that the container service group can
 read, outside the shared RocksDB volume:
 
 ```bash
-sudo install -d -o root -g 1000 -m 0750 /etc/zinder/indexer-tls
-sudo install -o root -g 1000 -m 0440 node-indexer-ca.pem /etc/zinder/indexer-tls/ca.pem
-sudo install -o root -g 1000 -m 0440 zinder-client.pem /etc/zinder/indexer-tls/client.pem
-sudo install -o root -g 1000 -m 0440 zinder-client-key.pem /etc/zinder/indexer-tls/client-key.pem
+sudo install -d -o root -g 10001 -m 0750 /etc/zinder/indexer-tls
+sudo install -o root -g 10001 -m 0440 node-indexer-ca.pem /etc/zinder/indexer-tls/ca.pem
+sudo install -o root -g 10001 -m 0440 zinder-client.pem /etc/zinder/indexer-tls/client.pem
+sudo install -o root -g 10001 -m 0440 zinder-client-key.pem /etc/zinder/indexer-tls/client-key.pem
 ```
 
 Then set the indexer URL and the directory in `/etc/zinder/env`:
@@ -630,7 +636,7 @@ fail.
 
 ## Inspect a runtime container
 
-The runtime images run the service binary as UID 1000 and contain no shell,
+The runtime images run the service binary as UID 10001 and contain no shell,
 so `docker compose exec zinder-query sh` fails. Run the binary itself instead:
 
 ```bash

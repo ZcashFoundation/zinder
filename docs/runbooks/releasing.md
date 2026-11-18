@@ -184,7 +184,7 @@ read-only repository token, and a third job compares them:
    `scripts/package-release-images.sh check`, without logging in to a registry
    or pushing. Every image binary must match its archive binary byte for byte,
    be a root-owned regular file with mode `0755` in an export of the image
-   filesystem, and run `--version` and `--help` as UID 1000, the `zinder`
+   filesystem, and run `--version` and `--help` as UID 10001, the `zinder`
    user, inside its image. Its `healthcheck` subcommand must also exit 1, the
    unhealthy status, against a port with no listener. The 5 runtime images
    have no shell, so no check runs a shell command inside them.

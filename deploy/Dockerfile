@@ -163,14 +163,15 @@ RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${T
 # glibc, libgcc_s, libstdc++, and CA certificates but no shell, package
 # manager, or HTTP client. The image HEALTHCHECK runs the binary's own
 # `healthcheck` subcommand. BuildKit creates a WORKDIR in an empty stage, so
-# the state directories need no RUN.
+# the state directories need no RUN. UID and GID 10001 match the Zebra and
+# Zakura images, so the services read the node's mode-0600 RPC cookie.
 FROM scratch AS zinder-service-state
 
 WORKDIR /var/lib/zinder/secondary
 
 FROM gcr.io/distroless/cc-debian12:nonroot@${DISTROLESS_IMAGE_DIGEST} AS zinder-service-base
 
-COPY --from=zinder-service-state --chown=1000:1000 /var/lib/zinder /var/lib/zinder
+COPY --from=zinder-service-state --chown=10001:10001 /var/lib/zinder /var/lib/zinder
 
 # Each service binds every container interface by default so `docker run -p`
 # works. Other containers on the same network can still reach these
@@ -181,7 +182,7 @@ COPY --from=zinder-service-state --chown=1000:1000 /var/lib/zinder /var/lib/zind
 # variable to change them.
 ENV ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true
 
-USER 1000:1000
+USER 10001:10001
 WORKDIR /var/lib/zinder
 
 FROM zinder-service-base AS zinder-ingest
@@ -262,9 +263,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # BuildKit gives directories that `COPY --chmod` creates the file mode, so
-# /usr/local/lib/zinder must exist before a 0644 file is copied into it.
-RUN groupadd --system --gid 1000 zinder \
-    && useradd --system --uid 1000 --gid zinder --home /var/lib/zinder --shell /usr/sbin/nologin zinder \
+# /usr/local/lib/zinder must exist before a 0644 file is copied into it. The
+# zinder account uses the per-service images' UID and GID.
+RUN groupadd --system --gid 10001 zinder \
+    && useradd --system --uid 10001 --gid zinder --home /var/lib/zinder --shell /usr/sbin/nologin zinder \
     && mkdir -p /var/lib/zinder/secondary /etc/zinder /usr/local/lib/zinder \
     && chown -R zinder:zinder /var/lib/zinder /etc/zinder
 

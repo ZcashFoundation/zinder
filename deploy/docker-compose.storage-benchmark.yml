@@ -42,7 +42,7 @@ services:
         bind:
           create_host_path: false
       - type: volume
-        # A fresh named-volume root is initialized for UID 1000 by the
+        # A fresh named-volume root is initialized for UID 10001 by the
         # runbook before the measured command starts.
         source: rocksdb-canonical-replay-storage-store
         target: /var/lib/zinder

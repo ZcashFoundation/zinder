@@ -298,31 +298,6 @@ for deployment_env in "${deployment_env_names[@]}"; do
     and (.services["zinder-projector"].environment | has("ZINDER_NODE__JSON_RPC_ADDR") | not)
   ' "$resolved_env_explorer_compose" >/dev/null \
     || fail "the $deployment_env env file does not resolve to its own node network, cookie volume, and endpoint"
-
-  resolved_cookie_compose="$temporary_directory/resolved-$deployment_env-cookie-compose.json"
-  docker compose \
-    --env-file "$repository_root/deploy/.env.$deployment_env" \
-    -f "$repository_root/deploy/node-cookie-permissions.yml" \
-    config --format json > "$resolved_cookie_compose"
-  jq -e --arg cookie_volume "$(env_file_value "$deployment_env" ZINDER_SOURCE_COOKIE_VOLUME_NAME)" '
-    (.services | keys) == ["cookie-permissions"]
-    and .services["cookie-permissions"].user == "10001:10001"
-    and .services["cookie-permissions"].cap_drop == ["ALL"]
-    and (.services["cookie-permissions"].cap_add // []) == []
-    and (.services["cookie-permissions"].security_opt | index("no-new-privileges:true")) != null
-    and .services["cookie-permissions"].read_only == true
-    and .services["cookie-permissions"].network_mode == "none"
-    and .services["cookie-permissions"].restart == "unless-stopped"
-    and .services["cookie-permissions"].volumes == [{
-      "type": "volume",
-      "source": "node-cookie",
-      "target": "/var/run/auth",
-      "volume": {}
-    }]
-    and .volumes["node-cookie"].external == true
-    and .volumes["node-cookie"].name == $cookie_volume
-  ' "$resolved_cookie_compose" >/dev/null \
-    || fail "the $deployment_env cookie permissions project does not keep its unprivileged in-place contract"
 done
 
 missing_node_env="$temporary_directory/missing-node.env"
@@ -335,14 +310,12 @@ if ZINDER_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
 fi
 missing_deploy_network_env="$temporary_directory/missing-deploy-network.env"
 grep -v '^ZINDER_DEPLOY_NETWORK=' "$repository_root/deploy/.env.testnet" > "$missing_deploy_network_env"
-for compose_file in docker-compose.yml node-cookie-permissions.yml; do
-  if ZINDER_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
-    --env-file "$missing_deploy_network_env" \
-    -f "$repository_root/deploy/$compose_file" \
-    config -q >/dev/null 2>&1; then
-    fail "$compose_file resolved without ZINDER_DEPLOY_NETWORK"
-  fi
-done
+if ZINDER_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
+  --env-file "$missing_deploy_network_env" \
+  -f "$repository_root/deploy/docker-compose.yml" \
+  config -q >/dev/null 2>&1; then
+  fail "docker-compose.yml resolved without ZINDER_DEPLOY_NETWORK"
+fi
 
 missing_state_init_compose="$temporary_directory/missing-state-init-compose.json"
 jq 'del(.services["state-init"]) | del(.services["zinder-ingest"].depends_on["state-init"])' \
@@ -352,11 +325,18 @@ expect_rejected \
   --compose-contract "$missing_state_init_compose"
 
 missing_checkpoint_root_compose="$temporary_directory/missing-checkpoint-root-compose.json"
-jq '.services["state-init"].command = ["chown", "-R", "1000:1000", "/var/lib/zinder"]' \
+jq '.services["state-init"].command = ["chown", "-R", "10001:10001", "/var/lib/zinder"]' \
   "$resolved_compose" > "$missing_checkpoint_root_compose"
 expect_rejected \
   "a Compose contract that does not initialize the isolated checkpoint volume" \
   --compose-contract "$missing_checkpoint_root_compose"
+
+legacy_uid_state_init_compose="$temporary_directory/legacy-uid-state-init-compose.json"
+jq '.services["state-init"].command[2] |= sub("chown -R 10001:10001 "; "chown -R 1000:1000 ")' \
+  "$resolved_compose" > "$legacy_uid_state_init_compose"
+expect_rejected \
+  "a Compose contract that initializes the shared volumes for UID 1000" \
+  --compose-contract "$legacy_uid_state_init_compose"
 
 shared_checkpoint_volume_compose="$temporary_directory/shared-checkpoint-volume-compose.json"
 jq '
@@ -1003,6 +983,24 @@ expect_rejected_because \
   'release admission rejected: every per-service release image must build on' \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
   --dockerfile "$unpinned_distroless_dockerfile"
+
+legacy_uid_dockerfile="$temporary_directory/legacy-uid.Dockerfile"
+sed 's/^USER 10001:10001$/USER 1000:1000/' \
+  "$repository_root/deploy/Dockerfile" > "$legacy_uid_dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose service images run as UID 1000" \
+  'release admission rejected: every per-service release image must build on' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$legacy_uid_dockerfile"
+
+legacy_account_dockerfile="$temporary_directory/legacy-account.Dockerfile"
+sed 's/useradd --system --uid 10001 --gid zinder/useradd --system --uid 1000 --gid zinder/' \
+  "$repository_root/deploy/Dockerfile" > "$legacy_account_dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose single-volume zinder account is not UID 10001" \
+  'release admission rejected: every per-service release image must build on' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$legacy_account_dockerfile"
 
 curl_healthcheck_dockerfile="$temporary_directory/curl-healthcheck.Dockerfile"
 sed 's#^    CMD \["zinder-projector", "healthcheck"\]$#    CMD curl -fsS http://localhost:9110/readyz || exit 1#' \

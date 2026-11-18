@@ -35,7 +35,7 @@ services:
       [
         "sh",
         "-c",
-        "mkdir -p /var/lib/zinder/checkpoints /var/lib/zinder/projector/canonical-secondary /var/lib/zinder/query/canonical-secondary /var/lib/zinder/query/wallet-secondary /var/lib/zinder/compat/canonical-secondary /var/lib/zinder/compat/wallet-secondary /var/lib/zinder/explorer/secondary && chown -R 1000:1000 /var/lib/zinder",
+        "mkdir -p /var/lib/zinder/checkpoints /var/lib/zinder/projector/canonical-secondary /var/lib/zinder/query/canonical-secondary /var/lib/zinder/query/wallet-secondary /var/lib/zinder/compat/canonical-secondary /var/lib/zinder/compat/wallet-secondary /var/lib/zinder/explorer/secondary && chown -R 10001:10001 /var/lib/zinder",
       ]
     volumes:
       - type: volume

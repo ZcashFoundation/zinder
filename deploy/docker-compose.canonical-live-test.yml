@@ -4,7 +4,7 @@ services:
     user: "0:0"
     command:
       - chown
-      - 1000:1000
+      - 10001:10001
       - /var/lib/zinder-live
     volumes:
       - live_test_data:/var/lib/zinder-live

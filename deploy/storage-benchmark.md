@@ -60,7 +60,7 @@ cp deploy/.env.storage-benchmark.example /tmp/zinder-storage-benchmark.env
 mkdir -p benchmark-results
 ```
 
-The result directory must be writable by UID 1000, which runs the benchmark
+The result directory must be writable by UID 10001, which runs the benchmark
 image.
 
 Formal runs require an immutable image identity and structured provenance.
@@ -157,7 +157,7 @@ docker compose \
   --profile rocksdb run --rm --no-deps \
   --user 0:0 --entrypoint /bin/sh rocksdb-canonical-replay-storage -ceu '
     test -z "$(ls -A /var/lib/zinder)"
-    chown 1000:1000 /var/lib/zinder
+    chown 10001:10001 /var/lib/zinder
   '
 
 docker compose \
@@ -476,7 +476,7 @@ docker compose \
   --profile comparison run --rm --no-deps \
   --user 0:0 --entrypoint /bin/sh rocksdb-canonical-replay-storage -ceu '
     test -z "$(ls -A /var/lib/zinder)"
-    chown 1000:1000 /var/lib/zinder
+    chown 10001:10001 /var/lib/zinder
   '
 
 docker compose \

@@ -21,12 +21,9 @@
 # to it when [node] stops answering or stays unsynchronized, and switches back
 # only when position 1 fails in turn or ingest restarts. zinder-query and
 # zinder-compat-lightwalletd broadcast through the same list, moving to
-# position 1 when [node] is unreachable. Run node-cookie-permissions.yml
-# for the fallback cookie volume too, as its own project:
-#
-#   ZINDER_SOURCE_COOKIE_VOLUME_NAME="$ZINDER_FALLBACK_SOURCE_COOKIE_VOLUME_NAME" \
-#     docker compose -p zinder-mainnet-fallback-node-cookie \
-#     --env-file /etc/zinder/env -f deploy/node-cookie-permissions.yml up -d
+# position 1 when [node] is unreachable. The Zinder runtimes run as UID 10001
+# and read the fallback's mode-0600 cookie when the node runs as that UID too,
+# as the Zebra and Zakura images do.
 #
 # See "Fail over to a second node" in docs/runbooks/deploying-on-a-vm.md.
 

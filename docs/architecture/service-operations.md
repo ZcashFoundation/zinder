@@ -1393,9 +1393,9 @@ which predate schedule admission, remain readable.
 
 The complete supported composition is the same-host RocksDB deployment in
 `deploy/docker-compose.yml` and `deploy/systemd/`. It attaches to an external
-Zebra or Zakura node selected entirely by a `deploy/.env.*` file, and
-`deploy/node-cookie-permissions.yml` makes a non-Z3 node's cookie readable to
-the Zinder runtimes. The runtime release-image catalog,
+Zebra or Zakura node selected entirely by a `deploy/.env.*` file. The
+runtimes read the node's mode-0600 RPC cookie directly because they run as the
+node images' UID, 10001. The runtime release-image catalog,
 `deploy/release-images.json`, holds ingest, projector, native query,
 lightwalletd compatibility, and the optional Explorer, which the
 `deploy/docker-compose.explorer.yml` overlay adds to that composition. A
@@ -1410,10 +1410,18 @@ release classes.
 
 ### Runtime images
 
-Each runtime image runs one binary as UID 1000 on a digest-pinned
+Each runtime image runs one binary as UID and GID 10001 on a digest-pinned
 `gcr.io/distroless/cc-debian12:nonroot` base, which carries glibc, the GCC and
 C++ runtime libraries, and CA certificates. The image has no shell, curl,
-or package manager. Its `HEALTHCHECK` runs the
+or package manager. The Zebra and Zakura images also run as UID 10001 and
+write their RPC cookie with mode 0600, so a runtime that mounts the cookie
+reads it directly. When the node runs under another UID, run the Zinder
+container with that UID, or use `basic` node authentication where the node
+accepts a fixed RPC password. The single-volume host images create their
+`zinder` account with the same UID and GID, and their entrypoints hand the
+mounted volume to it on every start. Other orchestrators must give volumes to
+UID 10001 themselves, for example with Kubernetes `fsGroup: 10001`. Its
+`HEALTHCHECK` runs the
 [healthcheck subcommand](#healthcheck-subcommand): ingest probes `/healthz`
 after a 10-second start period, and the other runtimes probe `/readyz`. The
 single-volume host images, the benchmark, and the live-test runner keep the

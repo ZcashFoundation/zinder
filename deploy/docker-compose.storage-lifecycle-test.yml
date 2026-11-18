@@ -14,7 +14,7 @@ services:
     command:
       - chown
       - -R
-      - ${ZINDER_STORAGE_LIFECYCLE_UID:-1000}:${ZINDER_STORAGE_LIFECYCLE_GID:-1000}
+      - ${ZINDER_STORAGE_LIFECYCLE_UID:-10001}:${ZINDER_STORAGE_LIFECYCLE_GID:-10001}
       - /var/lib/zinder/canonical-state
       - /var/lib/zinder/wallet-state
     volumes:
@@ -31,7 +31,7 @@ services:
 
   rocksdb-storage-lifecycle:
     image: ${ZINDER_STORAGE_LIFECYCLE_IMAGE:?set ZINDER_STORAGE_LIFECYCLE_IMAGE to an immutable image ID or digest-pinned reference}
-    user: "${ZINDER_STORAGE_LIFECYCLE_UID:-1000}:${ZINDER_STORAGE_LIFECYCLE_GID:-1000}"
+    user: "${ZINDER_STORAGE_LIFECYCLE_UID:-10001}:${ZINDER_STORAGE_LIFECYCLE_GID:-10001}"
     init: true
     read_only: true
     restart: "no"

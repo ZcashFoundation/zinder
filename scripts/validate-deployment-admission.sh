@@ -201,7 +201,7 @@ if [[ -n "$compose_contract" ]]; then
     and ($services["state-init"].command == [
       "sh",
       "-c",
-      "mkdir -p /var/lib/zinder/checkpoints /var/lib/zinder/projector/canonical-secondary /var/lib/zinder/query/canonical-secondary /var/lib/zinder/query/wallet-secondary /var/lib/zinder/compat/canonical-secondary /var/lib/zinder/compat/wallet-secondary /var/lib/zinder/explorer/secondary && chown -R 1000:1000 /var/lib/zinder"
+      "mkdir -p /var/lib/zinder/checkpoints /var/lib/zinder/projector/canonical-secondary /var/lib/zinder/query/canonical-secondary /var/lib/zinder/query/wallet-secondary /var/lib/zinder/compat/canonical-secondary /var/lib/zinder/compat/wallet-secondary /var/lib/zinder/explorer/secondary && chown -R 10001:10001 /var/lib/zinder"
     ])
     and ($state_data | length == 1)
     and ($state_checkpoint | length == 1)
@@ -904,12 +904,17 @@ EOF
   if [[ "$image_target_bases_match" != true ]] \
     || ! grep -Eq '^ARG DISTROLESS_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$dockerfile" \
     || [[ "$(dockerfile_stage_base zinder-service-base)" != 'gcr.io/distroless/cc-debian12:nonroot@${DISTROLESS_IMAGE_DIGEST}' ]] \
-    || ! grep -Fqx 'USER 1000:1000' <<< "$(dockerfile_stage_body zinder-service-base)"; then
+    || ! grep -Fqx 'USER 10001:10001' <<< "$(dockerfile_stage_body zinder-service-base)" \
+    || ! grep -Fqx 'COPY --from=zinder-service-state --chown=10001:10001 /var/lib/zinder /var/lib/zinder' \
+      <<< "$(dockerfile_stage_body zinder-service-base)" \
+    || ! grep -Fq 'groupadd --system --gid 10001 zinder' <<< "$(dockerfile_stage_body zinder-runtime-base)" \
+    || ! grep -Fq 'useradd --system --uid 10001 --gid zinder' <<< "$(dockerfile_stage_body zinder-runtime-base)"; then
     cat >&2 <<'EOF'
 release admission rejected: every per-service release image must build on the
-digest-pinned distroless zinder-service-base as UID 1000 and probe itself with
-its own healthcheck subcommand, and every single-volume image must build on the
-Debian zinder-runtime-base that carries its shell entrypoints.
+digest-pinned distroless zinder-service-base as UID and GID 10001 and probe
+itself with its own healthcheck subcommand, and every single-volume image must
+build on the Debian zinder-runtime-base, whose zinder account has the same UID
+and GID, for its shell entrypoints.
 EOF
     exit 1
   fi
