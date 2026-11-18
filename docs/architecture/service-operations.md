@@ -339,11 +339,15 @@ check: the writer answers a mempool read at a new tip once its replacement
 generation is certified, waiting up to five seconds, and a snapshot that is
 still not coherent returns `CHAIN_EPOCH_PIN_UNAVAILABLE`, which the probe
 accepts as healthy. A writer mempool that is hydrating or rebuilding from the
-node answers `NODE_UNAVAILABLE`, which the probe also accepts: ingest readiness
-and the reader's own node probe report that outage, so ingest control is not
-blamed for it. A transition into failure emits one classified warning and
-degrades the ingest-control dependency with `ingest_control_unavailable`;
-recovery emits one event and clears only that dependency. A `WriterStatus`
+node answers `NODE_UNAVAILABLE`. Ingest control answered, so the probe does not
+blame it: it degrades the dependency with `node_unavailable` instead, with the
+`stream_disconnected` failure class, the writer's reason, and a failure count
+and outage duration that grow across polls. `/readyz` therefore shows that
+mempool calls fail even when the reader's own node probe, which does not read
+the node's mempool stream, stays healthy. A transition into failure emits one
+classified warning, and any other failure degrades the ingest-control
+dependency with `ingest_control_unavailable`; recovery emits one event and
+clears only that dependency. A `WriterStatus`
 that reports `upstream_not_ready` degrades the dependency with the writer's
 `upstream_not_ready` detail instead, so `/readyz` names the syncing node as the
 root cause. A `WriterStatus` that reports a parked writer refuses traffic with

@@ -29,9 +29,10 @@ use zinder_proto::{
     wire::chain_epoch_from_message,
 };
 use zinder_runtime::{
-    AuthenticatedChannel, BearerToken, BearerTokenConnectError, ReadinessCause, RuntimeService,
-    connect_zinder_grpc,
+    AuthenticatedChannel, BearerToken, BearerTokenConnectError, NodeUnavailableDetail,
+    ReadinessCause, RuntimeService, connect_zinder_grpc,
 };
+use zinder_source::SourceFailureClass;
 /// Bound applied to native wallet unary ingest-control calls and stream establishment.
 pub const WALLET_INGEST_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUIRED_CAPABILITIES: [&str; 5] = [
@@ -148,7 +149,22 @@ impl AdmittedIngestControl {
             .await
         {
             Ok(response) => response.into_inner(),
-            Err(status) if is_healthy_writer_mempool_refusal(&status) => return Ok(()),
+            Err(status)
+                if is_writer_refusal(
+                    &status,
+                    Code::FailedPrecondition,
+                    ErrorReason::ChainEpochPinUnavailable,
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(status)
+                if is_writer_refusal(&status, Code::Unavailable, ErrorReason::NodeUnavailable) =>
+            {
+                return Err(IngestControlHealthError::WriterMempoolNodeUnavailable(
+                    status,
+                ));
+            }
             Err(status) => return Err(IngestControlHealthError::MempoolSnapshotRpc(status)),
         };
         validate_snapshot_observation(&writer_epoch, &snapshot, self.network_name)
@@ -294,29 +310,23 @@ pub(crate) fn typed_ingest_control_status(status: tonic::Status) -> tonic::Statu
     )
 }
 
-/// Whether a failed `MempoolSnapshot` is a writer answer that leaves ingest
-/// control healthy.
+/// Whether `status` is a refusal the writer itself built with `code` and
+/// `reason`, rather than a failure of the call or of another server.
 ///
-/// A snapshot that is not yet coherent at a new tip returns
-/// `CHAIN_EPOCH_PIN_UNAVAILABLE`. A live mempool that is hydrating or
-/// rebuilding from the node returns `NODE_UNAVAILABLE`: ingest readiness and
-/// the reader's own node probe report that outage, and mempool requests fail
-/// with the same reason on their own.
-fn is_healthy_writer_mempool_refusal(status: &tonic::Status) -> bool {
-    let expected_reason = if status.code() == Code::FailedPrecondition {
-        ErrorReason::ChainEpochPinUnavailable
-    } else if status.code() == Code::Unavailable {
-        ErrorReason::NodeUnavailable
-    } else {
-        return false;
-    };
-    status
-        .get_error_details()
-        .error_info()
-        .is_some_and(|error_info| {
-            error_info.domain == ZINDER_ERROR_DOMAIN
-                && error_info.reason == expected_reason.as_str_name()
-        })
+/// A `MempoolSnapshot` that is not yet coherent at a new tip returns
+/// `CHAIN_EPOCH_PIN_UNAVAILABLE`, which leaves ingest control healthy. A live
+/// mempool that is hydrating or rebuilding from the node returns
+/// `NODE_UNAVAILABLE`, which the probe relays as the writer's node outage
+/// rather than an ingest-control failure.
+fn is_writer_refusal(status: &tonic::Status, code: Code, reason: ErrorReason) -> bool {
+    status.code() == code
+        && status
+            .get_error_details()
+            .error_info()
+            .is_some_and(|error_info| {
+                error_info.domain == ZINDER_ERROR_DOMAIN
+                    && error_info.reason == reason.as_str_name()
+            })
 }
 
 #[derive(Debug, Error)]
@@ -335,6 +345,8 @@ pub(crate) enum IngestControlHealthError {
     WriterReorgWindowExceeded(ReorgWindowExceededDetail),
     #[error("ingest-control MempoolSnapshot failed: {0}")]
     MempoolSnapshotRpc(tonic::Status),
+    #[error("the writer's live mempool waits on its node: {}", .0.message())]
+    WriterMempoolNodeUnavailable(tonic::Status),
     #[error("ingest-control MempoolSnapshot returned incoherent chain evidence")]
     MempoolSnapshotInvalid,
     #[error("ingest-control MempoolSnapshot is older than the preceding WriterStatus")]
@@ -345,15 +357,22 @@ pub(crate) enum IngestControlHealthError {
 
 impl IngestControlHealthError {
     /// Returns the cause this health failure publishes as the ingest-control
-    /// dependency. A parked writer's halt refuses wallet traffic, and a
-    /// writer whose node is not ready relays that observation; every other
-    /// failure is a recoverable control-channel outage.
+    /// dependency. A parked writer's halt refuses wallet traffic. A writer
+    /// whose node is not ready, or whose live mempool waits on its node,
+    /// relays that observation; every other failure is a recoverable
+    /// control-channel outage.
     pub(crate) fn readiness_cause(&self) -> ReadinessCause {
         match self {
             Self::WriterReorgWindowExceeded(halt) => ReadinessCause::from(*halt),
             Self::WriterUpstreamNotReady(detail) => ReadinessCause::UpstreamNotReady(
                 zinder_runtime::UpstreamNotReadyDetail::from(detail),
             ),
+            Self::WriterMempoolNodeUnavailable(status) => {
+                ReadinessCause::NodeUnavailable(NodeUnavailableDetail::first_iteration(
+                    SourceFailureClass::StreamDisconnected.label(),
+                    status.message().to_owned(),
+                ))
+            }
             Self::WriterStatusRpc(_)
             | Self::WriterStatusInvalid
             | Self::MempoolSnapshotRpc(_)
@@ -370,6 +389,7 @@ impl IngestControlHealthError {
             Self::WriterUpstreamNotReady(_) => "writer_upstream_not_ready",
             Self::WriterReorgWindowExceeded(_) => "writer_reorg_window_exceeded",
             Self::MempoolSnapshotRpc(_) => "mempool_snapshot_rpc",
+            Self::WriterMempoolNodeUnavailable(_) => "writer_mempool_node_unavailable",
             Self::MempoolSnapshotInvalid => "mempool_snapshot_invalid",
             Self::MempoolSnapshotOlderThanWriter => "mempool_snapshot_older_than_writer",
             Self::MempoolSnapshotWriterFenceMismatch => "mempool_snapshot_writer_fence_mismatch",
@@ -438,8 +458,7 @@ mod tests {
 
     use super::{
         AdmittedIngestControl, IngestControlHealthError, WALLET_INGEST_CONTROL_REQUEST_TIMEOUT,
-        is_healthy_writer_mempool_refusal, typed_ingest_control_status,
-        validate_health_observation,
+        is_writer_refusal, typed_ingest_control_status, validate_health_observation,
     };
 
     const NETWORK: &str = "zcash-regtest";
@@ -610,18 +629,32 @@ mod tests {
     }
 
     #[test]
-    fn healthy_writer_refusal_predicate_requires_the_exact_structured_status() {
+    fn writer_refusal_predicate_requires_the_exact_structured_status() {
+        use zinder_proto::v1::ops::ErrorReason;
+
+        let is_stale_view = |status: &Status| {
+            is_writer_refusal(
+                status,
+                Code::FailedPrecondition,
+                ErrorReason::ChainEpochPinUnavailable,
+            )
+        };
         let exact = status_for_reason(
-            zinder_proto::v1::ops::ErrorReason::ChainEpochPinUnavailable,
+            ErrorReason::ChainEpochPinUnavailable,
             "requested chain epoch is no longer available",
         );
-        assert!(is_healthy_writer_mempool_refusal(&exact));
+        assert!(is_stale_view(&exact));
 
         let hydrating = status_for_reason(
-            zinder_proto::v1::ops::ErrorReason::NodeUnavailable,
+            ErrorReason::NodeUnavailable,
             "live mempool index is hydrating from an upstream snapshot",
         );
-        assert!(is_healthy_writer_mempool_refusal(&hydrating));
+        assert!(is_writer_refusal(
+            &hydrating,
+            Code::Unavailable,
+            ErrorReason::NodeUnavailable
+        ));
+        assert!(!is_stale_view(&hydrating));
         let passed = typed_ingest_control_status(hydrating.clone());
         assert_eq!(
             passed
@@ -634,35 +667,54 @@ mod tests {
                 .map(|info| info.reason.clone())
         );
 
-        let different_reason = status_for_reason(
-            zinder_proto::v1::ops::ErrorReason::ServiceNotReady,
-            "mempool is not ready",
-        );
-        assert!(!is_healthy_writer_mempool_refusal(&different_reason));
+        let different_reason =
+            status_for_reason(ErrorReason::ServiceNotReady, "mempool is not ready");
+        assert!(!is_stale_view(&different_reason));
 
         let foreign_domain = Status::with_error_details(
             Code::FailedPrecondition,
             "foreign stale view",
             ErrorDetails::with_error_info("CHAIN_EPOCH_PIN_UNAVAILABLE", "other.example", []),
         );
-        assert!(!is_healthy_writer_mempool_refusal(&foreign_domain));
+        assert!(!is_stale_view(&foreign_domain));
 
         let wrong_code = Status::with_error_details(
             Code::Unavailable,
             "stale view with the wrong code",
             ErrorDetails::with_error_info("CHAIN_EPOCH_PIN_UNAVAILABLE", ZINDER_ERROR_DOMAIN, []),
         );
-        assert!(!is_healthy_writer_mempool_refusal(&wrong_code));
+        assert!(!is_stale_view(&wrong_code));
 
         let absent_details = Status::failed_precondition("missing error details");
-        assert!(!is_healthy_writer_mempool_refusal(&absent_details));
+        assert!(!is_stale_view(&absent_details));
 
         let malformed_details = Status::with_error_details(
             Code::FailedPrecondition,
             "missing ErrorInfo",
             ErrorDetails::new(),
         );
-        assert!(!is_healthy_writer_mempool_refusal(&malformed_details));
+        assert!(!is_stale_view(&malformed_details));
+    }
+
+    /// A writer whose live mempool waits on its node relays that outage as a
+    /// node outage, not as an ingest-control failure.
+    #[test]
+    fn writer_mempool_node_refusal_reports_the_node_outage() -> Result<(), String> {
+        let error = IngestControlHealthError::WriterMempoolNodeUnavailable(status_for_reason(
+            zinder_proto::v1::ops::ErrorReason::NodeUnavailable,
+            "live mempool index is hydrating from an upstream snapshot",
+        ));
+        let zinder_runtime::ReadinessCause::NodeUnavailable(detail) = error.readiness_cause()
+        else {
+            return Err(format!("unexpected cause {:?}", error.readiness_cause()));
+        };
+        assert_eq!(detail.failure_class, "stream_disconnected");
+        assert_eq!(
+            detail.last_reason,
+            "live mempool index is hydrating from an upstream snapshot"
+        );
+        assert_eq!(error.class(), "writer_mempool_node_unavailable");
+        Ok(())
     }
 
     #[test]

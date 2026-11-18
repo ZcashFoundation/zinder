@@ -506,6 +506,9 @@ struct IngestControlObserver {
     /// writer cannot follow. Only a canonical writer status that shows a
     /// following writer with a confirmed tip clears it.
     retained_halt: Option<ReadinessCause>,
+    /// Outage of the writer's live mempool, which waits on its node, in
+    /// progress across observations.
+    writer_mempool_outage: Option<WalletNodeOutage>,
 }
 
 impl IngestControlObserver {
@@ -538,6 +541,7 @@ impl IngestControlObserver {
                 error.readiness_cause()
             }
         };
+        let observed = self.continue_writer_mempool_outage(observed);
         if observed.reorg_window_exceeded_detail().is_some() {
             self.retained_halt = Some(observed.clone());
         } else if self.retained_halt.is_some() && ingest_control.confirms_following_writer().await {
@@ -549,6 +553,24 @@ impl IngestControlObserver {
             );
         }
         self.retained_halt.clone().unwrap_or(observed)
+    }
+
+    /// Carries the start and failure count of a writer mempool outage across
+    /// observations, so the relayed `node_unavailable` detail grows like the
+    /// node probe's own.
+    fn continue_writer_mempool_outage(&mut self, observed: ReadinessCause) -> ReadinessCause {
+        let ReadinessCause::NodeUnavailable(detail) = observed else {
+            self.writer_mempool_outage = None;
+            return observed;
+        };
+        let continued = WalletNodeOutage::continue_with(
+            self.writer_mempool_outage.as_ref(),
+            detail.failure_class,
+            &detail.last_reason,
+        );
+        let cause = ReadinessCause::NodeUnavailable(continued.detail.clone());
+        self.writer_mempool_outage = Some(continued);
+        cause
     }
 }
 
@@ -608,14 +630,15 @@ where
                     });
                 }
                 Err(error) => {
-                    let detail = node_unavailable_detail(&error, outage.as_ref());
-                    outage = Some(WalletNodeOutage {
-                        started_at: outage
-                            .as_ref()
-                            .map_or_else(Instant::now, |prior| prior.started_at),
-                        detail: detail.clone(),
-                    });
-                    readiness.publish_node_source_cause(ReadinessCause::NodeUnavailable(detail));
+                    let continued = WalletNodeOutage::continue_with(
+                        outage.as_ref(),
+                        error.upstream_classification().label(),
+                        &error.to_string(),
+                    );
+                    readiness.publish_node_source_cause(ReadinessCause::NodeUnavailable(
+                        continued.detail.clone(),
+                    ));
+                    outage = Some(continued);
                 }
             }
 
@@ -640,23 +663,28 @@ struct WalletNodeOutage {
     detail: NodeUnavailableDetail,
 }
 
-fn node_unavailable_detail(
-    error: &SourceError,
-    prior_outage: Option<&WalletNodeOutage>,
-) -> NodeUnavailableDetail {
-    let failure_class = error.upstream_classification().label();
-    let last_reason = Cow::Owned(truncate_readiness_reason(&error.to_string()));
-    if let Some(prior_outage) = prior_outage {
+impl WalletNodeOutage {
+    /// Records one more failed observation of the node: it continues `prior`
+    /// when an outage is already in progress and starts one otherwise.
+    fn continue_with(prior: Option<&Self>, failure_class: &'static str, reason: &str) -> Self {
+        let last_reason = Cow::Owned(truncate_readiness_reason(reason));
+        let Some(prior) = prior else {
+            return Self {
+                started_at: Instant::now(),
+                detail: NodeUnavailableDetail::first_iteration(failure_class, last_reason),
+            };
+        };
         let outage_seconds =
-            u32::try_from(prior_outage.started_at.elapsed().as_secs()).unwrap_or(u32::MAX);
-        NodeUnavailableDetail::extend_with(
-            &prior_outage.detail,
-            failure_class,
-            last_reason,
-            outage_seconds,
-        )
-    } else {
-        NodeUnavailableDetail::first_iteration(failure_class, last_reason)
+            u32::try_from(prior.started_at.elapsed().as_secs()).unwrap_or(u32::MAX);
+        Self {
+            started_at: prior.started_at,
+            detail: NodeUnavailableDetail::extend_with(
+                &prior.detail,
+                failure_class,
+                last_reason,
+                outage_seconds,
+            ),
+        }
     }
 }
 
@@ -2743,8 +2771,10 @@ mod tests {
         writer_control.shutdown().await
     }
 
+    /// Snapshot refusals degrade the ingest-control dependency by what they
+    /// mean, and none drains the reader.
     #[tokio::test]
-    async fn wallet_ingest_control_probe_degrades_only_for_untyped_snapshot_failures()
+    async fn wallet_ingest_control_probe_classifies_snapshot_refusals_without_draining()
     -> Result<(), Box<dyn std::error::Error>> {
         let ingest_fixture = IngestControlFixture::spawn(Network::ZcashRegtest).await?;
         let stale_status = zinder_proto::status_for_reason(
@@ -2770,14 +2800,27 @@ mod tests {
         let mut traffic_gate = zinder_runtime::TrafficReadinessInterceptor::new(runtime.clone());
         assert!(traffic_gate.call(Request::new(())).is_ok());
 
-        // A hydrating writer answers with a typed refusal, so ingest control
-        // stays healthy and the node outage is reported where it happens.
+        // A hydrating writer answers with a typed refusal: ingest control
+        // answers, and the dependency reports the writer's node outage that
+        // fails mempool calls, growing across observations.
         ingest_fixture.set_mempool_snapshot_error(Some(zinder_proto::status_for_reason(
             ErrorReason::NodeUnavailable,
             "live mempool index is hydrating from an upstream snapshot",
         )));
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(runtime.report().degraded.is_empty());
+        wait_for_report(&runtime, |report| {
+            report.degraded.iter().any(|dependency| {
+                dependency.input == zinder_runtime::ReadinessInput::IngestControl
+                    && matches!(
+                        &dependency.cause,
+                        zinder_runtime::ReadinessCause::NodeUnavailable(detail)
+                            if detail.consecutive_failures > 1
+                                && detail.failure_class == "stream_disconnected"
+                    )
+            })
+        })
+        .await?;
+        assert!(runtime.report().is_ready);
+        assert!(traffic_gate.call(Request::new(())).is_ok());
 
         // An untyped unavailable status is indistinguishable from a transport
         // failure.

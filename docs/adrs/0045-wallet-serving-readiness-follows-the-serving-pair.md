@@ -82,8 +82,11 @@ that the publisher has not seen yet.
 When the canonical writer reports `upstream_not_ready` in
 `IngestControl.WriterStatus`, native query relays that observation, with the
 writer's heights and health source, as the `upstream_not_ready` cause of its
-ingest-control dependency. Every other ingest-control health failure reports
-`ingest_control_unavailable`.
+ingest-control dependency. When the writer's live mempool, which waits on the
+node, refuses `MempoolSnapshot` with `NODE_UNAVAILABLE`, native query reports
+`node_unavailable` as that dependency's cause, so `/readyz` shows that mempool
+calls fail even while the reader's own node probe succeeds. Every other
+ingest-control health failure reports `ingest_control_unavailable`.
 
 ### Each request fails on its own
 
