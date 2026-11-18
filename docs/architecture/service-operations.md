@@ -379,11 +379,14 @@ passes, as it does for any writer-status outage.
 Transaction broadcast is the only node-backed operation; tree state at any
 height is served from the serving pair. `[node]` is therefore optional: a
 query without it serves storage only, advertises no broadcast, runs no node
-probe, and never degrades its node-source dependency. A query with `[node]`
+probe, and never degrades its node-source dependency. Any node setting counts
+as `[node]`, so a section, `ZINDER_NODE__*` variable, or override without
+`node.json_rpc_addr` fails configuration. A query with `[node]`
 advertises broadcast and starts without contacting the node. Its node probe
-first verifies the endpoint: `rpc.discover` must list `sendrawtransaction`, and
+first verifies the endpoint: `rpc.discover` must list `sendrawtransaction`,
 the node's activation table must agree with the serving pair's writer-admitted
-schedule through the visible tip. Until that passes, every broadcast fails with
+schedule through the visible tip, and the node's best chain must hold the
+pair's visible tip block. Until that passes, every broadcast fails with
 `UNAVAILABLE` and `NODE_UNAVAILABLE` without sending the transaction, and the
 dependency reports `node_unavailable` (failure class `protocol_mismatch` for a
 table that disagrees) or `node_capability_missing`. The probe retries the

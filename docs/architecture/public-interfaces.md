@@ -23,8 +23,8 @@ and wire contracts that actually carry versions.
 | `WalletProjectionReader` | Immutable wallet side of an admitted serving pair |
 | `WalletServingReadPair` | Canonical and wallet readers proven to describe one exact fence |
 | `WalletServingQuery` | `WalletQueryApi` implementation over an atomically replaceable serving pair, shared by native and compatibility runtimes |
-| `NodeBroadcast` | The configured node endpoint a wallet query broadcasts through, verified on first contact against the serving pair's writer-admitted schedule before any transaction reaches it |
-| `BroadcastNodeProbe` | Source seam for that verification: the endpoint's advertised methods and its activation table |
+| `NodeBroadcast` | The configured node endpoint a wallet query broadcasts through, verified on first contact against the serving pair's writer-admitted schedule and visible tip block before any transaction reaches it |
+| `BroadcastNodeProbe` | Source seam for that verification: the endpoint's advertised methods, its activation table, and whether its best chain holds a block |
 | `WalletServingPairPublisher` | Serving-runtime owner that catches up, admits, and publishes process-local serving pairs |
 | `MaterializedViewConsumer` | Explorer materialized-view consumer that applies retained canonical events |
 | `MaterializedViewStore` | Independent store for materialized-view rows, cursors, coverage, and schemas |
@@ -227,7 +227,9 @@ Release configuration is grouped by owner:
 - `[network]`, `[node]`, `[node.auth]`, `[node.indexer_tls]`, `[ops]`, and
   `[security]` are shared sections. Ingest requires `[node]`. Query and
   wallet-mode compatibility accept it only for transaction broadcast and
-  start without contacting the node; without it they serve storage only.
+  start without contacting the node; without it they serve storage only. For
+  them any node setting, from TOML, `ZINDER_NODE__*`, or the command line,
+  requires `node.json_rpc_addr`.
   Explorer accepts it for the upstream-tip probe. The projector and
   compact-blocks compatibility reject it;
 - `[storage]`, `[ingest]`, `[ingest.construction]`, `[ingest.mempool]`,

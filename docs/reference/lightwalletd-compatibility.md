@@ -52,13 +52,14 @@ served tip on every request:
 - `saplingActivationHeight` is the Sapling activation height.
 
 In both serving modes that table is the schedule the canonical writer
-admitted. A running compatibility process therefore reports a newly admitted
-upgrade, such as NU7, as pending while its tip is below the activation height,
-and as the active `consensusBranchId` once the tip reaches it. Before the
-writer's first admission, it is the table discovered from the node at
-startup, which reader admission requires to equal the store's construction
-table. See
-[ADR-0039](../adrs/0039-writer-admitted-network-upgrade-schedules.md).
+admitted, and neither mode reads a table from the node. A running
+compatibility process therefore reports a newly admitted upgrade, such as NU7,
+as pending while its tip is below the activation height, and as the active
+`consensusBranchId` once the tip reaches it. A store whose writer has not
+admitted a schedule yet cannot be served: the process retries it at startup
+until `storage.initial_catchup_timeout_ms` passes, and exits if ingest has
+still not admitted one. See
+[ADR-0039 §Readers](../adrs/0039-writer-admitted-network-upgrade-schedules.md#readers).
 
 ## Identity and live-tip responses
 
@@ -152,9 +153,17 @@ Compact-block serving admits exactly `GetLightdInfo`, `GetLatestBlock`,
 `UNIMPLEMENTED`, including wallet queries, mempool methods, tree/subtree
 methods, transparent-address methods, transaction submission, and ping.
 `GetLightdInfo` reports the admitted network and tip with
-`taddrSupport = false`; node discovery and liveness are still required for
-that identity response. Its fields follow
+`taddrSupport = false`. Compact-blocks serving never contacts a node, so it
+rejects a `[node]` section, `--node-json-rpc-addr`, and every `ZINDER_NODE__*`
+variable at startup. Its fields follow
 [Identity and live-tip responses](#identity-and-live-tip-responses).
+
+Wallet serving uses `[node]` only for `SendTransaction`. It starts without
+contacting the node and verifies the node on first contact, as
+[ADR-0038](../adrs/0038-wallet-runtime-composition-and-capability-discovery.md)
+describes. Until that verification passes, `SendTransaction` fails with
+`UNAVAILABLE` and sends nothing. Without `[node]`, `SendTransaction` is
+unsupported.
 
 A compact-blocks `GetBlockRange` stream holds a canonical generation only
 while it reads one chunk, never while it waits for its client. A slow stream

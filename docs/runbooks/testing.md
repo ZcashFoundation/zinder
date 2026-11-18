@@ -1431,16 +1431,9 @@ gate on whether you actually changed trust-sensitive code.
 
   ```toml
   # .tmp/regtest.projector.toml
+  # The projector uses no node and rejects a [node] section.
   [network]
   name = "zcash-regtest"
-
-  [node]
-  json_rpc_addr = "http://127.0.0.1:29232"
-
-  [node.auth]
-  method = "basic"
-  username = "zebra"
-  password = "zebra"
 
   [storage]
   canonical_path = ".tmp/regtest.canonical"
@@ -1460,6 +1453,8 @@ gate on whether you actually changed trust-sensitive code.
 
   ```toml
   # .tmp/regtest.query.toml
+  # [node] is optional and used only for SendTransaction. The query starts
+  # without contacting it and verifies it on first contact.
   [network]
   name = "zcash-regtest"
 
@@ -1490,6 +1485,8 @@ gate on whether you actually changed trust-sensitive code.
 
   ```toml
   # .tmp/regtest.compat.toml
+  # [node] is optional and used only for SendTransaction. Compatibility starts
+  # without contacting it and verifies it on first contact.
   [network]
   name = "zcash-regtest"
 

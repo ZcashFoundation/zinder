@@ -77,10 +77,11 @@ is down.
 
 A READY store whose writer has not admitted a schedule yet refuses that open
 with `CanonicalStoreError::NetworkUpgradeScheduleNotAdmitted`. The writer
-admits revision 1 when it opens the store, so the refusal is transient: the
-serving publishers retry it inside their bounded convergence, and the
-projector retries it until `projector.fence_convergence_timeout_seconds`
-passes. A serving pair requires an admitted schedule and serves it as its
+admits revision 1 when it opens the store, so the refusal is transient. The
+serving publishers retry it before they converge, until
+`storage.initial_catchup_timeout_ms` passes, and these rounds do not count
+against `pair_convergence_attempts`. The projector retries it until
+`projector.fence_convergence_timeout_seconds` passes. A serving pair requires an admitted schedule and serves it as its
 activation table.
 
 A secondary opened in the writer's own process, such as ingest's
@@ -134,7 +135,8 @@ responses carry the admitted table, revision, and V1 fingerprint.
   and the control trailer, so they cannot open the store afterwards. Rolling
   back requires a state bundle or checkpoint taken before the upgrade.
 - A reader cannot open a READY store before the writer's first admission. It
-  retries within its bound, so a reader started before ingest only waits.
+  retries until its convergence timeout passes, so a reader started before
+  ingest only waits.
 - Readers no longer compare a node's table with the store when they open. A
   reader that broadcasts transactions instead verifies its node's table
   against the admitted schedule through the served tip on first contact,

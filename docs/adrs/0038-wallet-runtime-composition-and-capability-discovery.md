@@ -42,8 +42,7 @@ composition and admission, from concrete evidence:
 - the serving pair's authenticated persisted `RawBlobRetention` and projection
   evidence;
 - the methods implemented by the production query;
-- admitted upstream-node capabilities and the concrete broadcaster
-  dependency; and
+- the configured node endpoint behind the concrete `NodeBroadcast`; and
 - any authenticated ingest-control dependencies whose methods the native
   adapter exposes.
 
@@ -95,10 +94,13 @@ capability.
 
 The configured endpoint is verified on first contact, in the background,
 before any transaction reaches it. `rpc.discover` must list
-`sendrawtransaction`, and the node's `getblockchaininfo` activation table must
+`sendrawtransaction`, the node's `getblockchaininfo` activation table must
 agree with the serving pair's writer-admitted schedule through the visible
-tip. That table is specific to one network and chain, so it rejects a node on
-another network or fork. Until verification passes, every broadcast fails with
+tip, and `getblockhash` at the visible tip height must return the pair's tip
+hash. The table check rejects a node on another network. The block check
+rejects a node on another chain with the same schedule, such as a second
+regtest or a custom testnet with the same activation heights, and a node that
+has not reached the tip yet. Until verification passes, every broadcast fails with
 `UNAVAILABLE` and `NODE_UNAVAILABLE`, and the node dependency reports why
 under `degraded`. Verification is shared by every clone of the endpoint, runs
 once at a time, retries on every node-probe round until it passes, and then
@@ -634,7 +636,8 @@ controlled consumer cutover uses the current contract without shims.
   broadcast is advertised when a node endpoint is configured, instead of after
   a startup probe of `OpenRpcDiscovery`, `TransactionBroadcast`, and `TipId`.
   The endpoint is verified on first contact in the background against the
-  serving pair's writer-admitted schedule, and every broadcast fails with
+  serving pair's writer-admitted schedule and visible tip block, and every
+  broadcast fails with
   `NODE_UNAVAILABLE` until it passes. `ServerInfo.node` reports the verified
   endpoint, and a query without a node serves storage only.
 - 2026-11-17: Readiness follows the serving pair. Node-source and

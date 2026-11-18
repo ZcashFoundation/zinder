@@ -69,8 +69,10 @@ upgrade table, so it needs neither schedule admission nor a store rebuild.
 5. Start the readers in dependency order: `zinder-projector`, `zinder-query`,
    then `zinder-compat-lightwalletd` and Explorer. Readers take the table from
    the store, not from the node, so they need no node to start. A reader
-   started before a store's first admission waits for it within its
-   convergence bound; restart it if it gave up before ingest was ready.
+   started before a store's first admission waits for it until
+   `storage.initial_catchup_timeout_ms` passes (for the projector,
+   `projector.fence_convergence_timeout_seconds`); restart it if it gave up
+   before ingest was ready.
 6. Confirm that `WalletQuery.NetworkUpgradeActivations` returns the new table,
    including the new upgrade's branch ID and height.
 

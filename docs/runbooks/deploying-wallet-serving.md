@@ -121,7 +121,8 @@ variables its binary accepts:
 
 | Variables | `zinder-ingest` | `zinder-projector` | `zinder-query` |
 | --- | --- | --- | --- |
-| `ZINDER_NETWORK__*`, `ZINDER_NODE__*`, `ZINDER_OPS__*`, `ZINDER_SECURITY__*`, `ZINDER_INGEST_CONTROL__*` | yes | yes | yes |
+| `ZINDER_NETWORK__*`, `ZINDER_OPS__*`, `ZINDER_SECURITY__*`, `ZINDER_INGEST_CONTROL__*` | yes | yes | yes |
+| `ZINDER_NODE__*` | yes | | yes |
 | `ZINDER_STORAGE__CANONICAL__*`, `ZINDER_STORAGE__RAW_BLOB_POLICY` | yes | yes | yes |
 | `ZINDER_INGEST__*`, `ZINDER_RETENTION__*`, `ZINDER_STORAGE__MATERIALIZED_VIEWS__*` | yes | | |
 | `ZINDER_PROJECTOR__*`, `ZINDER_PROJECTOR_CONTROL__*` | | yes | |
@@ -131,7 +132,9 @@ variables its binary accepts:
 For example, `ZINDER_PROJECTOR__BUILD__MAX_TEMPORARY_FILE_BYTES_PER_SORTER`
 and `ZINDER_STORAGE__SERVING_PAIR_STALENESS_CEILING_MS` each reach one
 process, while `ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES` applies to
-all three.
+all three. `zinder-projector` uses no node, so it never receives
+`ZINDER_NODE__*` and fails at startup if a node setting reaches it some other
+way.
 
 No process receives the `ZINDER_WALLET_SERVING__*` variables, which configure
 the entrypoint itself, or the two bearer secrets. Any other

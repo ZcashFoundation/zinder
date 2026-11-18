@@ -36,11 +36,11 @@ It serves indexed reads from an admitted exact-fence pair of canonical and
 wallet-projection secondaries. It does not write canonical storage, build
 artifacts independently, or use Zebra as a fallback for indexed history.
 
-The compatibility runtime uses `zinder-source` only for explicit edge
-capabilities: transaction broadcast and network-upgrade activation discovery.
-`GetTreeState` is served from stored checkpoints and compact blocks.
-Those calls never substitute for indexed history or change the pinned serving
-pair.
+The compatibility runtime uses `zinder-source` only for one explicit edge
+capability: transaction broadcast. Activations come from the writer-admitted
+schedule, and `GetTreeState` is served from stored checkpoints and compact
+blocks. That call never substitutes for indexed history or changes the pinned
+serving pair.
 
 For a compatible wallet, Zinder is an endpoint-level replacement for
 lightwalletd: the wallet keeps the `CompactTxStreamer` contract and changes the

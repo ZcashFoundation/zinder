@@ -155,11 +155,12 @@ lightwalletd compatibility use a node only to broadcast transactions, accept a
 pruned node, and start without contacting it; the projector and compact-blocks
 compatibility use no node at all. A reader wraps its configured endpoint in a
 `NodeBroadcast` and verifies it on first contact through the source's
-`BroadcastNodeProbe`: `rpc.discover` must list `sendrawtransaction`, and the
+`BroadcastNodeProbe`: `rpc.discover` must list `sendrawtransaction`, the
 `getblockchaininfo` activation table must agree with the serving pair's
-writer-admitted schedule through the visible tip. A broadcast before that
-verification passes fails with `NodeUnavailable` and sends nothing, so a
-transaction never reaches a node on another network or fork.
+writer-admitted schedule through the visible tip, and the node's best chain
+must hold the pair's visible tip block, read with `getblockhash`. A broadcast
+before that verification passes fails with `NodeUnavailable` and sends
+nothing, so a transaction never reaches a node on another network or chain.
 
 Some nodes refuse historical reads permanently. A Zakura node built by
 verified-commitment-trees fast sync never writes per-height trees or subtree
