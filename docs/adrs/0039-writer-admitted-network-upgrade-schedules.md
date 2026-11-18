@@ -70,9 +70,13 @@ table.
 The writer admits a table only when it opens the store. When ingest has
 fallback node endpoints ([ADR-0013](0013-source-failure-recovery-topology.md)),
 it admits the table of the endpoint it starts on. Before choosing that
-endpoint, it reads the store's latest admitted revision without opening the
-primary, and a fallback that would become active with a table other than that
-revision is refused at startup. The comparison waits until every lower
+endpoint, it reads the table the store follows without opening the primary:
+the latest admitted revision or, before revision 1, the construction table,
+compared by fingerprint. It reads the store at the storage path or, when none
+exists, a published construction staged beside it, which the writer recovers
+before following. A fallback that would become active with any other table,
+including the construction table with entries appended, is refused at
+startup. The comparison waits until every lower
 position has a verdict, so a fallback that already advertises the table
 `[node]` brings is not refused for answering first. Only `[node]` can bring a new table, so a fallback running an older
 release never removes a pending activation while `[node]` is merely slow to
@@ -199,6 +203,8 @@ the same identity.
   canonical store).
 - `NetworkUpgradeScheduleNotAdmitted` (the retryable refusal of a reader that
   adopts the writer's schedule before the writer admitted one).
+- `CanonicalReadyStoreSummary` (what the writer reads from a READY store,
+  without opening its primary, to check node endpoints before it starts).
 
 See [Public interfaces §Core vocabulary](../architecture/public-interfaces.md#core-vocabulary).
 
@@ -211,6 +217,6 @@ See [Public interfaces §Core vocabulary](../architecture/public-interfaces.md#c
   `NetworkUpgradeScheduleNotAdmitted`. A broadcasting reader verifies its
   node's table on first contact instead.
 - 2026-11-18: Added "Node endpoint switches": ingest admits only its starting
-  endpoint's table, a fallback starts ingest only with the store's admitted
-  table, and other endpoints must advertise exactly the admitted table to take
-  over.
+  endpoint's table, a fallback starts ingest only with the table the store
+  follows, its admitted revision or, before the first, its construction table,
+  and other endpoints must advertise exactly the admitted table to take over.

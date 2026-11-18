@@ -87,6 +87,7 @@ pub use writer::ingest_control::{
 };
 pub use writer::{
     CanonicalWriterConfig, CanonicalWriterError, admit_canonical_store,
-    follow_admitted_canonical_store, run_canonical_writer, run_canonical_writer_with_control,
+    follow_admitted_canonical_store, read_ready_store_summary, run_canonical_writer,
+    run_canonical_writer_with_control,
 };
 pub use zinder_runtime::container_memory_budget_bytes;

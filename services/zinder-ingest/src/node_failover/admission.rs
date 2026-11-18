@@ -8,6 +8,7 @@ use zinder_core::{BlockHash, BlockHeight, Network, NetworkUpgradeActivations};
 use zinder_source::{
     NodeCapabilities, NodeCapability, NodeSet, NodeSource, NodeStorageMode, SourceError,
 };
+use zinder_store::CanonicalReadyStoreSummary;
 
 /// Capabilities every node endpoint ingest reads from must advertise.
 pub const REQUIRED_INGEST_NODE_CAPABILITIES: &[NodeCapability] = &[
@@ -31,8 +32,8 @@ pub enum EndpointExclusion {
     /// The node's block 0 is not the configured network's genesis block.
     GenesisMismatch,
     /// The node advertises an activation table other than the active
-    /// endpoint's, or a fallback advertises one other than the store's
-    /// writer-admitted revision.
+    /// endpoint's, or a fallback that would start ingest advertises one other
+    /// than the table the store follows.
     ScheduleConflict,
 }
 
@@ -176,10 +177,11 @@ impl NodeEndpointAdmissions {
     /// Checks every endpoint concurrently and selects the first admitted one
     /// in position order.
     ///
-    /// `store_activations` is the table of the store's latest writer-admitted
-    /// schedule revision, if any. A fallback that would become active with
-    /// another table is excluded with [`EndpointExclusion::ScheduleConflict`],
-    /// so only `[node]` can introduce a new revision and a fallback never
+    /// `store` is the READY store the writer will open, if any; see
+    /// [`crate::read_ready_store_summary`]. A fallback that would become
+    /// active with a table other than the one the store follows is excluded
+    /// with [`EndpointExclusion::ScheduleConflict`], so only `[node]` can
+    /// introduce a new revision, the first one included, and a fallback never
     /// rewrites the schedule while `[node]` is merely slow to answer. The
     /// comparison waits until every lower position has a verdict, so a
     /// fallback that already advertises the table `[node]` brings is not
@@ -194,7 +196,7 @@ impl NodeEndpointAdmissions {
     pub async fn admit<Endpoint>(
         nodes: &NodeSet<Endpoint>,
         network: Network,
-        store_activations: Option<&NetworkUpgradeActivations>,
+        store: Option<&CanonicalReadyStoreSummary>,
     ) -> Result<Self, NoNodeEndpointAdmitted>
     where
         Endpoint: NodeSource,
@@ -217,7 +219,7 @@ impl NodeEndpointAdmissions {
                 let Some(slot) = decided.get_mut(position) else {
                     break None;
                 };
-                if starts_on_another_schedule(position, slot.as_ref(), store_activations) {
+                if starts_on_another_schedule(position, slot.as_ref(), store) {
                     *slot = Some(EndpointAdmission::Excluded(
                         EndpointExclusion::ScheduleConflict,
                     ));
@@ -285,18 +287,18 @@ impl NodeEndpointAdmissions {
 }
 
 /// Returns whether an admitted fallback would start the writer with a table
-/// other than the store's admitted revision.
+/// other than the one the store follows.
 ///
 /// `[node]` may still bring a new table, which the store admits only as a
 /// future-only revision.
 fn starts_on_another_schedule(
     position: usize,
     verdict: Option<&EndpointAdmission>,
-    store_activations: Option<&NetworkUpgradeActivations>,
+    store: Option<&CanonicalReadyStoreSummary>,
 ) -> bool {
-    match (verdict, store_activations) {
-        (Some(EndpointAdmission::Admitted(admitted)), Some(store_activations)) => {
-            position > 0 && admitted.activations != *store_activations
+    match (verdict, store) {
+        (Some(EndpointAdmission::Admitted(admitted)), Some(store)) => {
+            position > 0 && !store.follows_activations(&admitted.activations)
         }
         _ => false,
     }

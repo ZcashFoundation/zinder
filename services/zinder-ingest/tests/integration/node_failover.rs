@@ -5,6 +5,7 @@
 
 use std::{
     collections::BTreeMap,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -27,7 +28,7 @@ use zinder_ingest::{
     FailoverReadiness, IneligibleReason, MempoolReadyGate, NodeEndpointAdmissions,
     NodeEndpointState, NodeFailover, NodeFailoverPolicy, REQUIRED_INGEST_NODE_CAPABILITIES,
     follow_canonical_tip, follow_canonical_tip_with_control, mempool_ready_channel,
-    spawn_node_endpoint_monitor, spawn_upstream_health_probe_task,
+    read_ready_store_summary, spawn_node_endpoint_monitor, spawn_upstream_health_probe_task,
 };
 use zinder_proto::v1::ingest::CanonicalWriterStatusResponse;
 use zinder_runtime::{
@@ -263,6 +264,20 @@ struct PublishedStore {
 }
 
 async fn published_store() -> TestResult<PublishedStore> {
+    let directory = tempdir()?;
+    let (blocks, store) = publish_fixture_store(&directory.path().join("canonical")).await?;
+    Ok(PublishedStore {
+        blocks,
+        store,
+        _directory: directory,
+    })
+}
+
+/// Publishes the [`PublishedStore`] fixture at `store_path`, without a
+/// writer-admitted schedule revision.
+async fn publish_fixture_store(
+    store_path: &Path,
+) -> TestResult<(BTreeMap<BlockHeight, SourceBlock>, RocksDbCanonicalStore)> {
     let blocks = parseable_multi_block_chain()?;
     let activations = Arc::new(sample_regtest_upgrade_activations());
     let builder_source = RecordingParseableSource::new(
@@ -270,7 +285,6 @@ async fn published_store() -> TestResult<PublishedStore> {
         checkpoints_for_parseable_chain(&blocks, &activations)?,
         BlockHeight::new(4),
     );
-    let directory = tempdir()?;
     let published: BTreeMap<_, _> = blocks
         .range(..=BlockHeight::new(2))
         .map(|(height, block)| (*height, block.clone()))
@@ -279,16 +293,12 @@ async fn published_store() -> TestResult<PublishedStore> {
         &builder_source,
         &published,
         activations,
-        &directory.path().join("canonical"),
+        store_path,
         2,
         BlockHeight::new(1),
     )
     .await?;
-    Ok(PublishedStore {
-        blocks,
-        store,
-        _directory: directory,
-    })
+    Ok((blocks, store))
 }
 
 /// One failover run: the policy, whether `[node.health]` gates readiness,
@@ -731,18 +741,12 @@ async fn startup_refuses_a_fallback_that_would_change_the_admitted_schedule() ->
         mut store,
         _directory: directory,
     } = published_store().await?;
-    store.admit_network_upgrade_schedule(&sample_regtest_upgrade_activations())?;
-    assert!(
-        RocksDbCanonicalStore::read_admitted_network_upgrade_activations(
-            directory.path().join("absent")
-        )?
-        .is_none()
-    );
-    let store_activations = RocksDbCanonicalStore::read_admitted_network_upgrade_activations(
-        directory.path().join("canonical"),
-    )?
-    .ok_or("the writer admitted a schedule")?;
-    assert_eq!(store_activations, sample_regtest_upgrade_activations());
+    let store_activations = sample_regtest_upgrade_activations();
+    store.admit_network_upgrade_schedule(&store_activations)?;
+    assert!(read_ready_store_summary(&directory.path().join("absent"))?.is_none());
+    let store_summary = read_ready_store_summary(&directory.path().join("canonical"))?
+        .ok_or("the store is READY")?;
+    assert!(store_summary.follows_activations(&store_activations));
     let older_table = NetworkUpgradeActivations::new(
         Network::ZcashRegtest,
         store_activations
@@ -764,7 +768,7 @@ async fn startup_refuses_a_fallback_that_would_change_the_admitted_schedule() ->
 
     let (only_older, _switch) = NodeSet::new(unreachable_primary()?, [older_fallback()?]);
     let refusal =
-        NodeEndpointAdmissions::admit(&only_older, Network::ZcashRegtest, Some(&store_activations))
+        NodeEndpointAdmissions::admit(&only_older, Network::ZcashRegtest, Some(&store_summary))
             .await
             .err()
             .ok_or("an older fallback must not start ingest")?;
@@ -775,12 +779,9 @@ async fn startup_refuses_a_fallback_that_would_change_the_admitted_schedule() ->
         unreachable_primary()?,
         [older_fallback()?, FailoverEndpoint::serving(&blocks, 4)?],
     );
-    let admissions = NodeEndpointAdmissions::admit(
-        &with_matching,
-        Network::ZcashRegtest,
-        Some(&store_activations),
-    )
-    .await?;
+    let admissions =
+        NodeEndpointAdmissions::admit(&with_matching, Network::ZcashRegtest, Some(&store_summary))
+            .await?;
     assert_eq!(admissions.active_position(), 2);
     assert_eq!(
         admissions
@@ -797,7 +798,7 @@ async fn startup_refuses_a_fallback_that_would_change_the_admitted_schedule() ->
     let admissions = NodeEndpointAdmissions::admit(
         &primary_changes,
         Network::ZcashRegtest,
-        Some(&store_activations),
+        Some(&store_summary),
     )
     .await?;
     assert_eq!(admissions.active_position(), 0);
@@ -809,8 +810,15 @@ async fn startup_refuses_a_fallback_that_would_change_the_admitted_schedule() ->
 /// endpoint that becomes active.
 #[tokio::test]
 async fn startup_keeps_a_fallback_that_advertises_the_new_table_node_brings() -> TestResult {
-    let blocks = parseable_multi_block_chain()?;
+    let PublishedStore {
+        blocks,
+        mut store,
+        _directory: directory,
+    } = published_store().await?;
     let store_activations = sample_regtest_upgrade_activations();
+    store.admit_network_upgrade_schedule(&store_activations)?;
+    let store_summary = read_ready_store_summary(&directory.path().join("canonical"))?
+        .ok_or("the store is READY")?;
     let upgraded_table = with_future_upgrade(&store_activations)?;
     let mut upgraded_primary = FailoverEndpoint::serving(&blocks, 4)?;
     upgraded_primary.activations = upgraded_table.clone();
@@ -820,8 +828,7 @@ async fn startup_keeps_a_fallback_that_advertises_the_new_table_node_brings() ->
     let (nodes, _switch) = NodeSet::new(upgraded_primary, [upgraded_fallback]);
 
     let admissions =
-        NodeEndpointAdmissions::admit(&nodes, Network::ZcashRegtest, Some(&store_activations))
-            .await?;
+        NodeEndpointAdmissions::admit(&nodes, Network::ZcashRegtest, Some(&store_summary)).await?;
 
     assert_eq!(admissions.active_position(), 0);
     assert!(matches!(
@@ -843,6 +850,58 @@ fn with_future_upgrade(table: &NetworkUpgradeActivations) -> TestResult<NetworkU
         Network::ZcashRegtest,
         activations,
     )?)
+}
+
+/// Before a READY store's first schedule revision, a fallback may start
+/// ingest only with the construction table.
+///
+/// A fallback with an upgrade appended would make the writer admit it as
+/// revision 1, which only `[node]` may bring. This holds for a published
+/// construction still staged beside the store path, which the writer
+/// recovers before following.
+#[tokio::test]
+async fn startup_refuses_a_fallback_that_would_admit_the_first_schedule_revision() -> TestResult {
+    let directory = tempdir()?;
+    let storage_path = directory.path().join("canonical");
+    let (blocks, staged_store) =
+        publish_fixture_store(&directory.path().join("canonical.building")).await?;
+    drop(staged_store);
+    let store_summary =
+        read_ready_store_summary(&storage_path)?.ok_or("the staged store is READY")?;
+    let construction_table = sample_regtest_upgrade_activations();
+    let appended_table = with_future_upgrade(&construction_table)?;
+    assert!(store_summary.follows_activations(&construction_table));
+    assert!(!store_summary.follows_activations(&appended_table));
+    let unreachable_primary = || -> TestResult<FailoverEndpoint> {
+        let primary = FailoverEndpoint::serving(&blocks, 4)?;
+        primary.set_unreachable(true);
+        Ok(primary)
+    };
+    let mut appended_fallback = FailoverEndpoint::serving(&blocks, 4)?;
+    appended_fallback.activations = appended_table;
+
+    let (only_appended, _switch) =
+        NodeSet::new(unreachable_primary()?, [appended_fallback.clone()]);
+    let refusal =
+        NodeEndpointAdmissions::admit(&only_appended, Network::ZcashRegtest, Some(&store_summary))
+            .await
+            .err()
+            .ok_or("a fallback must not bring the first schedule revision")?;
+    let message = refusal.to_string();
+    assert!(message.contains("position 1: excluded"), "{message}");
+
+    let (with_construction_table, _switch) = NodeSet::new(
+        unreachable_primary()?,
+        [appended_fallback, FailoverEndpoint::serving(&blocks, 4)?],
+    );
+    let admissions = NodeEndpointAdmissions::admit(
+        &with_construction_table,
+        Network::ZcashRegtest,
+        Some(&store_summary),
+    )
+    .await?;
+    assert_eq!(admissions.active_position(), 2);
+    Ok(())
 }
 
 #[tokio::test]

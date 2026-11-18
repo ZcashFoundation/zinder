@@ -225,8 +225,9 @@ the standby monitor, so a fallback that does not answer never delays a healthy
 `[node]`. An endpoint that reports pruned storage, lacks a required capability,
 answers for another network, or advertises another activation table is
 excluded until restart (`node_endpoint_excluded`). A fallback that would
-become active with a table other than the store's latest admitted revision is
-excluded the same way, so only `[node]` can bring a new table; the comparison
+become active with a table other than the one the store follows, its latest
+admitted revision or, before the first, its construction table, is excluded
+the same way, so only `[node]` can bring a new table; the comparison
 waits until every lower position has a verdict, so a fallback that already
 advertises the table `[node]` brings stays a standby. An endpoint that times out,
 fails a call, or does not report its storage mode is unreachable

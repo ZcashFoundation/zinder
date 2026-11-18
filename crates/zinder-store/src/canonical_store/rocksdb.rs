@@ -40,6 +40,35 @@ use super::{
     replay_tail::AuthenticatedReplayTail,
 };
 
+/// What a READY canonical store records that a writer checks node endpoints
+/// against before it opens the store.
+///
+/// Read with [`RocksDbCanonicalStore::read_ready_summary`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalReadyStoreSummary {
+    admitted_activations: Option<NetworkUpgradeActivations>,
+    construction_activations_fingerprint: NetworkUpgradeActivationsFingerprint,
+}
+
+impl CanonicalReadyStoreSummary {
+    /// Returns whether `activations` is exactly the table the store follows:
+    /// its latest writer-admitted schedule revision or, before the first
+    /// revision, the table it was constructed with.
+    ///
+    /// Any other table, including the construction table with entries
+    /// appended, would make the writer admit a new revision.
+    #[must_use]
+    pub fn follows_activations(&self, activations: &NetworkUpgradeActivations) -> bool {
+        self.admitted_activations.as_ref().map_or_else(
+            || {
+                activations.fingerprint(self.construction_activations_fingerprint.version())
+                    == self.construction_activations_fingerprint
+            },
+            |admitted| admitted == activations,
+        )
+    }
+}
+
 /// Cold-admitted identity and READY evidence for an owner-created canonical checkpoint.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalOwnerCheckpointEvidence {
@@ -783,15 +812,14 @@ impl RocksDbCanonicalStore {
         read_construction_manifest_binding(path.as_ref())
     }
 
-    /// Reads the activation table of the latest schedule revision a canonical
-    /// writer admitted, without opening a `RocksDB` primary.
+    /// Reads what a canonical writer checks node endpoints against before it
+    /// opens the store, without opening a `RocksDB` primary.
     ///
-    /// Returns `None` when no store exists at `path` or no writer has admitted
-    /// a schedule yet. A writer reads it before choosing which node endpoint
-    /// to start on.
-    pub fn read_admitted_network_upgrade_activations(
+    /// Returns `None` when no store exists at `path` or the store is still
+    /// being built.
+    pub fn read_ready_summary(
         path: impl AsRef<Path>,
-    ) -> Result<Option<NetworkUpgradeActivations>, CanonicalStoreError> {
+    ) -> Result<Option<CanonicalReadyStoreSummary>, CanonicalStoreError> {
         let path = path.as_ref();
         let exists = path.try_exists().map_err(|error| {
             CanonicalStoreError::admission(path, format!("store path check failed: {error}"))
@@ -818,8 +846,16 @@ impl RocksDbCanonicalStore {
             })?
             .ok_or_else(|| CanonicalStoreError::admission(path, "store identity is absent"))?;
         let control = decode_store_control(path, &encoded_control)?;
-        Ok(read_admitted_schedule(&db, path, &control)?
-            .map(|schedule| schedule.activations().clone()))
+        if !matches!(control.build_state, CanonicalStoreBuildState::Ready(_)) {
+            return Ok(None);
+        }
+        Ok(Some(CanonicalReadyStoreSummary {
+            admitted_activations: read_admitted_schedule(&db, path, &control)?
+                .map(|schedule| schedule.activations().clone()),
+            construction_activations_fingerprint: control
+                .build_plan
+                .network_upgrade_activations_fingerprint(),
+        }))
     }
 
     /// Returns the immutable network persisted by the store control record.
@@ -1389,6 +1425,7 @@ mod tests {
         .err()
         .ok_or("a BUILDING store must not be servable")?;
         assert!(matches!(error, CanonicalStoreError::StoreNotReady { .. }));
+        assert_eq!(RocksDbCanonicalStore::read_ready_summary(&path)?, None);
 
         let control_before = read_control(&path)?;
         let mainnet_activations =

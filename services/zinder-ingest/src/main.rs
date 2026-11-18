@@ -1274,20 +1274,16 @@ async fn admit_node_endpoints(
         return Ok(None);
     }
     let node = &command_config.runtime_config.node;
-    let store_activations =
-        zinder_store::RocksDbCanonicalStore::read_admitted_network_upgrade_activations(
-            &command_config.runtime_config.storage_path,
-        )
-        .map_err(zinder_ingest::CanonicalWriterError::from)?;
-    let admissions =
-        match NodeEndpointAdmissions::admit(&nodes, node.network, store_activations.as_ref()).await
-        {
-            Ok(admissions) => admissions,
-            Err(refusal) => {
-                publish_endpoint_refusal(&refusal, readiness);
-                return Err(refusal.into());
-            }
-        };
+    let store =
+        zinder_ingest::read_ready_store_summary(&command_config.runtime_config.storage_path)?;
+    let admissions = match NodeEndpointAdmissions::admit(&nodes, node.network, store.as_ref()).await
+    {
+        Ok(admissions) => admissions,
+        Err(refusal) => {
+            publish_endpoint_refusal(&refusal, readiness);
+            return Err(refusal.into());
+        }
+    };
     log_endpoint_admissions(&admissions);
     let policy = NodeFailoverPolicy {
         standby_evaluation_interval: node.health.as_ref().map_or_else(
