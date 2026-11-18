@@ -1971,40 +1971,75 @@ where
 /// After `max_distinct` distinct keys, the next new key ends the stream with
 /// `UNAVAILABLE`, which lightwalletd clients retry, instead of letting the
 /// seen set grow or letting a repeat through.
-fn each_once_up_to<S, T, K>(
+fn each_once_up_to<S, KeyFn, K>(
     streamed: S,
-    key: impl Fn(&T) -> K + Send + 'static,
+    key: KeyFn,
     max_distinct: usize,
-) -> impl tonic::codegen::tokio_stream::Stream<Item = Result<T, Status>> + Send + 'static
+) -> EachOnceUpTo<S, KeyFn, K> {
+    EachOnceUpTo {
+        upstream: Some(Box::pin(streamed)),
+        key,
+        seen: HashSet::new(),
+        max_distinct,
+    }
+}
+
+/// The stream [`each_once_up_to`] returns.
+///
+/// On exhaustion it drops its upstream and its seen set before yielding the
+/// error, so it ends without polling the upstream again.
+struct EachOnceUpTo<S, KeyFn, K> {
+    upstream: Option<Pin<Box<S>>>,
+    key: KeyFn,
+    seen: HashSet<K>,
+    max_distinct: usize,
+}
+
+impl<S, KeyFn, K, T> tonic::codegen::tokio_stream::Stream for EachOnceUpTo<S, KeyFn, K>
 where
-    S: tonic::codegen::tokio_stream::Stream<Item = Result<T, Status>> + Send + 'static,
-    T: Send + 'static,
-    K: Eq + std::hash::Hash + Send + 'static,
+    S: tonic::codegen::tokio_stream::Stream<Item = Result<T, Status>>,
+    KeyFn: Fn(&T) -> K + Unpin,
+    K: Eq + std::hash::Hash + Unpin,
 {
-    let mut seen = HashSet::new();
-    let mut exhausted = false;
-    stream::StreamExt::filter_map(streamed, move |outcome| {
-        if exhausted {
-            return None;
-        }
-        match outcome {
-            Ok(streamed) => {
-                let streamed_key = key(&streamed);
-                if seen.contains(&streamed_key) {
-                    return None;
+    type Item = Result<T, Status>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            let Some(upstream) = this.upstream.as_mut() else {
+                return std::task::Poll::Ready(None);
+            };
+            let outcome = match upstream.as_mut().poll_next(context) {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(None) => {
+                    this.upstream = None;
+                    return std::task::Poll::Ready(None);
                 }
-                if seen.len() >= max_distinct {
-                    exhausted = true;
-                    return Some(Err(Status::unavailable(format!(
-                        "stream sent {max_distinct} distinct transactions without a tip change; reconnect"
-                    ))));
-                }
-                seen.insert(streamed_key);
-                Some(Ok(streamed))
+                std::task::Poll::Ready(Some(outcome)) => outcome,
+            };
+            let streamed = match outcome {
+                Ok(streamed) => streamed,
+                Err(status) => return std::task::Poll::Ready(Some(Err(status))),
+            };
+            let streamed_key = (this.key)(&streamed);
+            if this.seen.contains(&streamed_key) {
+                continue;
             }
-            Err(status) => Some(Err(status)),
+            if this.seen.len() >= this.max_distinct {
+                this.upstream = None;
+                this.seen = HashSet::new();
+                return std::task::Poll::Ready(Some(Err(Status::unavailable(format!(
+                    "stream sent {} distinct transactions without a tip change; reconnect",
+                    this.max_distinct
+                )))));
+            }
+            this.seen.insert(streamed_key);
+            return std::task::Poll::Ready(Some(Ok(streamed)));
         }
-    })
+    }
 }
 
 /// Streams live-mempool entries page by page, starting with the
@@ -2161,16 +2196,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn each_once_up_to_skips_repeats_and_ends_unavailable_past_the_bound() {
-        let streamed = tokio_stream::iter([1, 2, 1, 2, 3, 4].map(Ok::<u8, Status>));
-        let outcomes: Vec<Result<u8, Status>> =
-            each_once_up_to(streamed, |id: &u8| *id, 2).collect().await;
+    async fn each_once_up_to_skips_repeats_and_ends_unavailable_past_the_bound()
+    -> Result<(), tokio::time::error::Elapsed> {
+        // The upstream never ends, so only the bound itself can end the stream.
+        let streamed = tokio_stream::iter([1, 2, 1, 2, 3, 4].map(Ok::<u8, Status>))
+            .chain(tokio_stream::pending());
+        let outcomes: Vec<Result<u8, Status>> = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            each_once_up_to(streamed, |id: &u8| *id, 2).collect(),
+        )
+        .await?;
 
         let codes: Vec<Result<u8, tonic::Code>> = outcomes
             .into_iter()
             .map(|outcome| outcome.map_err(|status| status.code()))
             .collect();
         assert_eq!(codes, vec![Ok(1), Ok(2), Err(tonic::Code::Unavailable)]);
+        Ok(())
     }
 
     #[test]
