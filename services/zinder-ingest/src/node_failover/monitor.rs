@@ -3,7 +3,7 @@
 //! The monitor runs beside the canonical follower and never switches. It
 //! records the active endpoint's health, for the sustained-unready trigger,
 //! and whether each other endpoint could take over, so a switch only
-//! rechecks the chosen candidate's tip and one block, and the writer's
+//! rechecks each candidate's readiness, tip, and one block, and the writer's
 //! control plane stays responsive during a failover.
 
 use std::{sync::Arc, time::Instant};
@@ -194,7 +194,7 @@ where
 ///
 /// An endpoint without a readiness signal counts as ready: the tip checks
 /// still require it to hold ingest's chain.
-async fn health_of<Endpoint>(endpoint: &Endpoint) -> Option<bool>
+pub(super) async fn health_of<Endpoint>(endpoint: &Endpoint) -> Option<bool>
 where
     Endpoint: NodeSource,
 {

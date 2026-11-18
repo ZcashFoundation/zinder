@@ -501,9 +501,10 @@ where
         candidates
     }
 
-    /// Rechecks the chosen candidate within one bounded wait: its tip must
-    /// still reach the visible tip, and the block it holds at the visible
-    /// tip, or at the settled tip for a diverged candidate, must still match.
+    /// Rechecks a candidate within one bounded wait: it must still report
+    /// ready, its tip must still reach the visible tip, and the block it
+    /// holds at the visible tip, or at the settled tip for a diverged
+    /// candidate, must still match.
     async fn confirm_candidate(&self, position: usize, evaluation: CandidateEvaluation) -> bool {
         let Some(endpoint) = self.nodes.endpoint(position) else {
             return false;
@@ -512,6 +513,11 @@ where
             return false;
         };
         let check = async {
+            match monitor::health_of(endpoint).await {
+                Some(true) => {}
+                Some(false) => return Ok(Some(IneligibleReason::NotReady.label())),
+                None => return Ok(Some("unreachable")),
+            }
             let tip = endpoint.tip_id().await?;
             if tip.height < fence.local_tip.height {
                 return Ok(Some(IneligibleReason::Lagging.label()));
@@ -685,7 +691,145 @@ fn record_state_metrics(records: &[EndpointRecord]) {
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
+    use zinder_core::{BlockHeight, Network};
+    use zinder_runtime::Readiness;
+    use zinder_source::{
+        NodeCapabilities, SourceBlock, SourceError, UPSTREAM_HEALTH_SOURCE_ZEBRA_READY_ENDPOINT,
+        UpstreamHealthSnapshot,
+    };
+
     use super::*;
+
+    /// The visible tip every test endpoint holds.
+    fn visible_tip() -> BlockId {
+        BlockId::new(BlockHeight::new(4), BlockHash::from_bytes([4; 32]))
+    }
+
+    /// A candidate that holds [`visible_tip`] and answers, or not, as set.
+    #[derive(Clone, Copy)]
+    struct CandidateEndpoint {
+        ready: bool,
+        hangs: bool,
+    }
+
+    impl CandidateEndpoint {
+        const READY: Self = Self {
+            ready: true,
+            hangs: false,
+        };
+
+        async fn answer(self) {
+            if self.hangs {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    #[async_trait]
+    impl NodeSource for CandidateEndpoint {
+        fn capabilities(&self) -> NodeCapabilities {
+            NodeCapabilities::default()
+        }
+
+        async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
+            self.answer().await;
+            Ok(SourceBlock {
+                network: Network::ZcashRegtest,
+                height,
+                hash: visible_tip().hash,
+                parent_hash: BlockHash::from_bytes([3; 32]),
+                block_time_seconds: 0,
+                raw_block_bytes: Vec::new(),
+            })
+        }
+
+        async fn tip_id(&self) -> Result<BlockId, SourceError> {
+            self.answer().await;
+            Ok(visible_tip())
+        }
+
+        async fn poll_upstream_health(&self) -> Result<UpstreamHealthSnapshot, SourceError> {
+            self.answer().await;
+            Ok(if self.ready {
+                UpstreamHealthSnapshot::ready(
+                    UPSTREAM_HEALTH_SOURCE_ZEBRA_READY_ENDPOINT,
+                    None,
+                    None,
+                    None,
+                )
+            } else {
+                UpstreamHealthSnapshot::not_ready(
+                    UPSTREAM_HEALTH_SOURCE_ZEBRA_READY_ENDPOINT,
+                    "syncing",
+                    None,
+                    None,
+                    None,
+                )
+            })
+        }
+    }
+
+    /// Failover state whose standby evaluations, recorded just now, found
+    /// every endpoint after `[node]` holding the visible tip.
+    fn failover_with_standbys(
+        active: CandidateEndpoint,
+        standbys: Vec<CandidateEndpoint>,
+        policy: NodeFailoverPolicy,
+    ) -> FailoverShared<CandidateEndpoint> {
+        let records = std::iter::once(NodeEndpointState::Active)
+            .chain(standbys.iter().map(|_| NodeEndpointState::Standby))
+            .map(|state| EndpointRecord {
+                excluded: None,
+                state,
+                evaluation: (state == NodeEndpointState::Standby).then(|| CandidateEvaluation {
+                    diverged: false,
+                    observed_at: Instant::now(),
+                }),
+                not_ready_since: None,
+            })
+            .collect();
+        let (nodes, switch) = NodeSet::new(active, standbys);
+        FailoverShared {
+            nodes,
+            switch,
+            policy,
+            readiness: FailoverReadiness {
+                readiness: ComposedReadiness::new(Readiness::default(), &[]),
+                gates_node_source_input: false,
+            },
+            genesis_hash: Network::ZcashRegtest.genesis_hash(),
+            value_pool_capabilities: ValuePoolCapabilities::default(),
+            board: Mutex::new(FailoverBoard {
+                fence: Some(FenceTips {
+                    local_tip: visible_tip(),
+                    settled_tip: visible_tip(),
+                }),
+                records,
+                evaluations_applied: 1,
+                failed_switch_after: None,
+            }),
+        }
+    }
+
+    /// A standby evaluated ready that reports not ready by the time a switch
+    /// rechecks it is skipped for the next candidate.
+    #[tokio::test]
+    async fn a_switch_skips_a_standby_that_stopped_reporting_ready() {
+        let syncing = CandidateEndpoint {
+            ready: false,
+            ..CandidateEndpoint::READY
+        };
+        let failover = failover_with_standbys(
+            CandidateEndpoint::READY,
+            vec![syncing, CandidateEndpoint::READY],
+            NodeFailoverPolicy::default(),
+        );
+
+        let switch = failover.switch_away("node_unreachable").await;
+
+        assert_eq!(switch.map(|switch| switch.to_position), Some(2));
+    }
 
     #[test]
     fn transport_failures_switch_at_the_threshold_and_not_before() {

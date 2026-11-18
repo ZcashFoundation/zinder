@@ -245,8 +245,9 @@ visible tip, and a diverged standby when it holds only the settled tip. The
 follower switches between iterations after three consecutive
 `node_unreachable` or `stream_disconnected` recoveries, or once the active
 endpoint has reported not ready for 300 seconds. It tries standbys in position
-order, then diverged standbys, rechecking only the candidate's tip and the
-block it holds at the visible or settled tip, and logs
+order, then diverged standbys, rechecking only that the candidate still
+reports ready, its tip, and the block it holds at the visible or settled tip,
+and logs
 `node_endpoint_switched`. A diverged standby's suffix above the settled tip is
 replaced within the reorg window as any reorg is. When no endpoint qualifies,
 the follower stays on its endpoint and recovers as before, and it attempts the
