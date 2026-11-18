@@ -6,7 +6,8 @@ use zinder_core::wire::encode_zinder_native_chain_name;
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use zinder_compat_lightwalletd::{
-    IngestControlMempoolSurface, LightwalletdGrpcAdapter, spawn_ingest_control_tip_change_publisher,
+    IngestControlMempoolSurface, LightwalletdGrpcAdapter, LightwalletdPing,
+    spawn_ingest_control_tip_change_publisher,
 };
 use zinder_runtime::{
     OpsServerError, Readiness, RuntimeService, StartupPhase, TracingSubscriberError,
@@ -97,6 +98,9 @@ struct Cli {
     /// Node JSON-RPC address used for transaction broadcast. Omit to disable broadcast.
     #[arg(long = "node-json-rpc-addr")]
     node_json_rpc_addr: Option<String>,
+    /// Answer the `Ping` load-testing RPC, as `lightwalletd --ping-very-insecure` does.
+    #[arg(long = "ping-very-insecure")]
+    ping_very_insecure: bool,
 }
 
 #[tokio::main]
@@ -259,10 +263,12 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
 
     let wallet_query = WalletServingQuery::from_serving_pair_slot(serving_pair_slot.clone())
         .with_node_broadcast(node_broadcast.clone());
+    let cancel = CancellationToken::new();
     let grpc_adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(wallet_query)?
         .with_max_concurrent_block_range_streams(
             lightwalletd_config.max_concurrent_block_range_streams,
-        );
+        )
+        .with_ping(configured_ping(&lightwalletd_config, &cancel));
     let ops_handle = spawn_ops_endpoint_for(
         RuntimeService::CompatLightwalletd,
         lightwalletd_config.ops_listen_addr,
@@ -272,7 +278,6 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         Arc::from([]),
     )
     .await?;
-    let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
     let node_readiness_handle = spawn_wallet_node_readiness_probe(
         node_broadcast,
@@ -326,6 +331,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         visible_height = ?visible_height,
         max_concurrent_block_range_streams =
             lightwalletd_config.max_concurrent_block_range_streams.get(),
+        ping_very_insecure = lightwalletd_config.ping_very_insecure,
         "lightwalletd-compatible gRPC server started"
     );
 
@@ -496,10 +502,12 @@ async fn run_compact_blocks(
     .map_err(LightwalletdConfigError::CompactServing)?;
     let visible_height = Some(slot.capture().event_fence().visible_tip().height.value());
     open_storage_phase.complete();
+    let cancel = CancellationToken::new();
     let grpc_adapter = compact_block_serving::CompactBlockAdapter::new(slot)
         .with_max_concurrent_block_range_streams(
             lightwalletd_config.max_concurrent_block_range_streams,
-        );
+        )
+        .with_ping(configured_ping(&lightwalletd_config, &cancel));
     let ops_handle = spawn_ops_endpoint_for(
         RuntimeService::CompatLightwalletd,
         lightwalletd_config.ops_listen_addr,
@@ -509,7 +517,6 @@ async fn run_compact_blocks(
         Arc::from([]),
     )
     .await?;
-    let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
     let serving_runtime_drained = CancellationToken::new();
     let publisher_handle = publisher.spawn(cancel.clone(), serving_runtime_drained.clone());
@@ -523,6 +530,7 @@ async fn run_compact_blocks(
         visible_height = ?visible_height,
         max_concurrent_block_range_streams =
             lightwalletd_config.max_concurrent_block_range_streams.get(),
+        ping_very_insecure = lightwalletd_config.ping_very_insecure,
         "lightwalletd-compatible gRPC server started"
     );
     let reflection_service = tonic_reflection::server::Builder::configure()
@@ -631,7 +639,19 @@ impl From<Cli> for LightwalletdConfigOverrides {
             ops_listen_addr: cli.ops_listen_addr,
             node_json_rpc_addr: cli.node_json_rpc_addr,
             reorg_window_blocks: cli.reorg_window_blocks,
+            ping_very_insecure: cli.ping_very_insecure,
         }
+    }
+}
+
+fn configured_ping(
+    lightwalletd_config: &config::LightwalletdConfig,
+    shutdown: &CancellationToken,
+) -> LightwalletdPing {
+    if lightwalletd_config.ping_very_insecure {
+        LightwalletdPing::enabled(shutdown.clone())
+    } else {
+        LightwalletdPing::default()
     }
 }
 

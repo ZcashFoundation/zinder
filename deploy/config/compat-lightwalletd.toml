@@ -37,6 +37,9 @@ pair_convergence_attempts = 12
 # RESOURCE_EXHAUSTED. Size it to the container memory as
 # docs/reference/lightwalletd-compatibility.md describes.
 max_concurrent_block_range_streams = 100
+# Answer the lightwalletd Ping load-testing RPC, as lightwalletd
+# --ping-very-insecure does. Leave it off outside a load test.
+ping_very_insecure = false
 # Runtime serving selector. Omit this key to retain the wallet default.
 serving = "wallet"
 

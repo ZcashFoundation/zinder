@@ -66,6 +66,8 @@ pub(crate) struct LightwalletdConfig {
     pub(crate) canonical_reorg_policy: CanonicalReorgPolicy,
     pub(crate) pair_convergence_attempts: NonZeroU8,
     pub(crate) max_concurrent_block_range_streams: NonZeroU32,
+    /// Whether `Ping` answers, as `lightwalletd --ping-very-insecure` does.
+    pub(crate) ping_very_insecure: bool,
     pub(crate) broadcaster: Option<NodeTarget>,
     /// Endpoints wallet-mode broadcast tries after `broadcaster`, in position
     /// order. Compact-blocks serving refuses them.
@@ -87,6 +89,7 @@ pub(crate) struct LightwalletdConfigOverrides {
     pub(crate) ops_listen_addr: Option<SocketAddr>,
     pub(crate) node_json_rpc_addr: Option<String>,
     pub(crate) reorg_window_blocks: Option<u32>,
+    pub(crate) ping_very_insecure: bool,
 }
 
 /// Error returned while resolving lightwalletd compat config or running its gRPC server.
@@ -177,6 +180,10 @@ pub(crate) fn load_lightwalletd_config(
         )?
         .with_override_if("node.json_rpc_addr", overrides.node_json_rpc_addr)?
         .with_override_if("compat.reorg_window_blocks", overrides.reorg_window_blocks)?
+        .with_override_if(
+            "compat.ping_very_insecure",
+            overrides.ping_very_insecure.then_some(true),
+        )?
         .load()?;
 
     resolve_lightwalletd_config(raw_config)
@@ -212,6 +219,7 @@ struct CompatSection {
     reorg_window_blocks: Option<u32>,
     pair_convergence_attempts: Option<u8>,
     max_concurrent_block_range_streams: Option<u32>,
+    ping_very_insecure: Option<bool>,
     serving: Option<CompatServing>,
 }
 
@@ -297,6 +305,7 @@ fn resolve_lightwalletd_config(
         canonical_reorg_policy,
         pair_convergence_attempts,
         max_concurrent_block_range_streams,
+        ping_very_insecure: config.compat.ping_very_insecure.unwrap_or(false),
         broadcaster,
         node_fallbacks,
     })
@@ -371,6 +380,7 @@ impl LightwalletdConfigToml {
                 reorg_window_blocks: config.canonical_reorg_policy.reorg_window_blocks(),
                 pair_convergence_attempts: config.pair_convergence_attempts.get(),
                 max_concurrent_block_range_streams: config.max_concurrent_block_range_streams.get(),
+                ping_very_insecure: config.ping_very_insecure,
                 serving: config.serving,
             },
             node: config.broadcaster.as_ref().map(NodeToml::from_node_target),
@@ -385,6 +395,7 @@ struct CompatToml {
     reorg_window_blocks: u32,
     pair_convergence_attempts: u8,
     max_concurrent_block_range_streams: u32,
+    ping_very_insecure: bool,
     serving: CompatServing,
 }
 

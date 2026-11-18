@@ -1,0 +1,6 @@
+kind: added
+body: "`zinder-compat-lightwalletd` can now answer the lightwalletd `Ping` load-testing RPC. Set `compat.ping_very_insecure = true`, `ZINDER_COMPAT__PING_VERY_INSECURE=true`, or pass `--ping-very-insecure`, as on lightwalletd. Both serving modes then report the number of `Ping` calls in flight and sleep for the requested interval, as `lightwalletd --ping-very-insecure` does. Each call holds a server task for as long as the client asks, so enable it only while load testing. The setting is off by default, and `Ping` is then refused with `FAILED_PRECONDITION`."
+time: 2026-11-18T15:03:48.000000000Z
+custom:
+    Bump: minor
+    PR: "284"

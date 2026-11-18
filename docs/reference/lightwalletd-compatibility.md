@@ -159,9 +159,20 @@ every `ZINDER_NODE__*` variable, and every `ZINDER_NODE_FALLBACKS__*` variable
 at startup. Its fields follow
 [Identity and live-tip responses](#identity-and-live-tip-responses).
 
-Both serving modes refuse `Ping` with `FAILED_PRECONDITION`, as reference
-lightwalletd does unless it is started with `--ping-very-insecure`. `Ping` is
-lightwalletd's load-testing RPC, and Zinder has no setting that enables it.
+`Ping` is lightwalletd's load-testing RPC. Both serving modes refuse it with
+`FAILED_PRECONDITION` by default, as reference lightwalletd does. Setting
+`compat.ping_very_insecure = true` (`ZINDER_COMPAT__PING_VERY_INSECURE`, or
+`--ping-very-insecure` as on lightwalletd) makes it answer the way
+`lightwalletd --ping-very-insecure` does: `entry` is the number of `Ping`
+calls in flight once this one starts, the call sleeps `interval_us`
+microseconds, and `exit` is the number still in flight when it returns. The
+interval converts to nanoseconds with wrapping arithmetic, as lightwalletd's
+Go `time.Duration` does, so an interval too large to represent returns at
+once. Each call holds a server task for as long as the client asks, so enable
+it only on a server you are load testing. A call still sleeping when the
+server starts shutting down ends with `UNAVAILABLE`, so it does not delay
+shutdown. The `compat_started` log records the setting as
+`ping_very_insecure`.
 
 Wallet serving uses `[node]` and the `[node_fallbacks.N]` endpoints only for
 `SendTransaction`. It starts without contacting any node and verifies each

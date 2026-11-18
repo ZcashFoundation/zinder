@@ -42,6 +42,7 @@ use crate::mempool::{
     MempoolSnapshotPage, MempoolSurfaceError, MempoolTransactionLookup, SharedMempoolSurface,
     SharedTipChangeWatcher, TipChangeWatcherError,
 };
+use crate::ping::LightwalletdPing;
 
 type GrpcStream<T> =
     Pin<Box<dyn tonic::codegen::tokio_stream::Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -129,6 +130,7 @@ pub struct LightwalletdGrpcAdapter<QueryApi> {
     transparent_address_support: bool,
     mempool_surface: Option<SharedMempoolSurface>,
     tip_change_watcher: Option<SharedTipChangeWatcher>,
+    ping: LightwalletdPing,
 }
 
 impl<QueryApi: std::fmt::Debug> std::fmt::Debug for LightwalletdGrpcAdapter<QueryApi> {
@@ -147,6 +149,7 @@ impl<QueryApi: std::fmt::Debug> std::fmt::Debug for LightwalletdGrpcAdapter<Quer
             )
             .field("mempool_surface", &self.mempool_surface.is_some())
             .field("tip_change_watcher", &self.tip_change_watcher.is_some())
+            .field("ping_enabled", &self.ping.is_enabled())
             .finish()
     }
 }
@@ -186,6 +189,7 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
             transparent_address_support: false,
             mempool_surface: None,
             tip_change_watcher: None,
+            ping: LightwalletdPing::default(),
         }
     }
 
@@ -213,6 +217,15 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
     #[must_use]
     pub fn with_tip_change_watcher(mut self, watcher: SharedTipChangeWatcher) -> Self {
         self.tip_change_watcher = Some(watcher);
+        self
+    }
+
+    /// Sets how this adapter answers `Ping`. The default refuses it with
+    /// `FAILED_PRECONDITION`, as lightwalletd does without
+    /// `--ping-very-insecure`.
+    #[must_use]
+    pub fn with_ping(mut self, ping: LightwalletdPing) -> Self {
+        self.ping = ping;
         self
     }
 
@@ -1018,13 +1031,12 @@ where
 
     async fn ping(
         &self,
-        _request: Request<lightwalletd::Duration>,
+        request: Request<lightwalletd::Duration>,
     ) -> Result<Response<lightwalletd::PingResponse>, Status> {
-        // Reference lightwalletd answers this load-test RPC only when started
-        // with `--ping-very-insecure`; Zinder never enables it.
-        Err(Status::failed_precondition(
-            "Ping is not enabled on this server",
-        ))
+        self.ping
+            .respond(request.into_inner())
+            .await
+            .map(Response::new)
     }
 }
 
