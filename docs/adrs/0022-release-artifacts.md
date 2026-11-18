@@ -50,6 +50,13 @@ the release claiming precision it does not have for native libraries.
 8. **Published releases are immutable.** The workflow fails if the published
    GitHub Release is not immutable, and the stable `latest` image tag moves
    only after every artifact passes verification.
+9. **Runtime images hold only their binary.** Each runtime image runs on a
+   digest-pinned distroless base with no shell, package manager, or HTTP
+   client. The binary probes its own operational endpoint for the container
+   healthcheck. Every image runs as UID and GID 10001, the UID of the Zebra
+   and Zakura images, so Zinder reads the node's mode-0600 RPC cookie as the
+   node writes it. The single-volume images keep a Debian base, because their
+   supervising entrypoints are shell scripts.
 
 The release procedure and how operators verify a download are in
 [Releasing](../runbooks/releasing.md) and
@@ -75,6 +82,12 @@ The release procedure and how operators verify a download are in
   is never modified.
 - Musl builds are not produced. They would be a separate product, not an
   alias for these archives.
+- An operator cannot open a shell in a runtime container. Inspection runs the
+  binary itself or attaches a separate toolbox container, as
+  [Deploying on a VM](../runbooks/deploying-on-a-vm.md#inspect-a-runtime-container)
+  shows.
+- A node that runs under another UID needs `basic` authentication, or Zinder
+  containers that run as the node's UID.
 
 ## Alternatives rejected
 
@@ -88,3 +101,8 @@ The release procedure and how operators verify a download are in
   which workflow and commit produced the bytes.
 - **Guessing native package identities in the SBOM.** An inventory with
   invented versions is worse than one that states its limit.
+- **A Debian runtime base with `curl` for healthchecks.** Every container
+  would carry a shell and a package set that the service never uses.
+- **A sidecar that relaxes the node cookie's mode.** It must run beside every
+  node, and mode 0644 makes the cookie readable by every UID that mounts the
+  volume.

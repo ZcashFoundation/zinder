@@ -58,9 +58,9 @@ disk on top of the figures below.
 | Regtest | Not measured | Compose container limits: 2, 2, 1, and 1 GiB | Not measured |
 
 The memory figures are the limits the shipped Compose env files set. They are
-ceilings, not measured use. The single-volume container needs at least 8 GB
-for its three processes. CPU requirements are not measured. The release
-binaries need an x86-64-v3 or AArch64 CPU.
+ceilings, not measured use. The single-volume container needs at least 8 GB.
+CPU requirements are not measured. The release binaries need an x86-64-v3 or
+AArch64 CPU.
 
 The Mainnet disk figures come from separate observations, and they do not add
 up to a peak:
@@ -86,7 +86,7 @@ the current release, so plan for the longer figure.
 | --- | --- | --- |
 | Docker Compose beside a node | You want to try Zinder, or run it on a host that already runs your node in Docker. | [Quickstart](#quickstart-with-docker-compose) below |
 | Docker Compose under systemd on a VM | You run a long-lived service on a VM you manage. This is the complete topology. | [Deploying on a VM](deploying-on-a-vm.md) |
-| Single-volume container | Your platform attaches one volume to one container, such as Railway. It serves native `WalletQuery` only, without the lightwalletd adapter. | [Deploying the single-volume container](deploying-single-volume.md) |
+| Single-volume container | Your platform attaches one volume to one container, such as Railway. It runs the same four processes in one container and serves both native `WalletQuery` and lightwalletd. | [Deploying the single-volume container](deploying-single-volume.md) |
 
 ## Quickstart with Docker Compose
 
@@ -97,9 +97,8 @@ This path runs Zinder on Testnet beside a Zebra node from the
 step 1.
 
 The steps use Docker Engine with the Compose v2 plugin, `git`, `openssl`,
-`curl`, and `grpcurl`. Step 4 builds the Zinder images from the checked-out
-source. To run the released images instead, follow step 1 of
-[Deploying on a VM](deploying-on-a-vm.md).
+`curl`, and `grpcurl`. Step 4 runs the published release images. To build the
+images from source instead, see [Build from source](#build-from-source).
 
 1. Start a Zebra Testnet node with Z3, from your Z3 checkout, and wait until it
    has synchronized:
@@ -121,22 +120,31 @@ source. To run the released images instead, follow step 1 of
 
 3. Create the two control tokens that the Zinder processes use to talk to
    each other. `deploy/.env.testnet` expects them in
-   `/etc/zinder/control-secrets`, readable by the container group, GID 1000:
+   `/etc/zinder/control-secrets`, readable by the container group, GID 10001:
 
    ```bash
-   sudo install -d -o root -g 1000 -m 0750 /etc/zinder/control-secrets
+   sudo install -d -o root -g 10001 -m 0750 /etc/zinder/control-secrets
    openssl rand -hex 32 | sudo tee /etc/zinder/control-secrets/ingest.token >/dev/null
    openssl rand -hex 32 | sudo tee /etc/zinder/control-secrets/checkpoint.token >/dev/null
-   sudo chown root:1000 /etc/zinder/control-secrets/*.token
+   sudo chown root:10001 /etc/zinder/control-secrets/*.token
    sudo chmod 0440 /etc/zinder/control-secrets/*.token
    ```
 
-4. Build and start Zinder:
+4. Pull the release images for the tag you checked out, and start Zinder:
 
    ```bash
+   export ZINDER_VERSION=vX.Y.Z
    docker compose --env-file deploy/.env.testnet \
-     -f deploy/docker-compose.yml up -d --build
+     -f deploy/docker-compose.yml pull
+   docker compose --env-file deploy/.env.testnet \
+     -f deploy/docker-compose.yml up -d --no-build
    ```
+
+   `ZINDER_VERSION` selects the signed release image of every runtime, such
+   as `ghcr.io/zcashfoundation/zinder-ingest:vX.Y.Z`. Use the tag you checked out, because each Compose file
+   matches the images of its own release. `pull` fails on a tag that was never
+   published. Keep `--no-build`: without it, Compose would build missing
+   images from source and label the result as the release.
 
    Compose starts ingest first. It starts the projector only once ingest is
    healthy, and the two readers only once the projector is healthy, so on a
@@ -168,12 +176,26 @@ source. To run the released images instead, follow step 1 of
    `blockHeight` close to your node's tip.
 
 The same Compose file also starts Prometheus on host port 19095. Add
-`--profile observability` to the command in step 4 to start Grafana on 13002.
+`--profile observability` to the commands in step 4 to start Grafana on 13002.
+
+### Build from source
+
+To run a checkout that has no published images, leave `ZINDER_VERSION` unset
+and run this command instead of step 4:
+
+```bash
+docker compose --env-file deploy/.env.testnet \
+  -f deploy/docker-compose.yml up -d --build
+```
+
+Compose builds every image from the checkout and tags it `:local`.
 
 ## Before you expose it
 
 Wallet listeners have no TLS or client authentication, so expose them only
-through your own proxy ([Exposing over TLS](exposing-over-tls.md)). The
+through your own proxy ([Exposing over TLS](exposing-over-tls.md)). Compose
+publishes ports on host loopback, but any container on the node's Docker
+network can still reach the wallet and ops listeners. The
 [security boundary](../architecture/service-operations.md#security-boundary)
 lists what must stay private.
 

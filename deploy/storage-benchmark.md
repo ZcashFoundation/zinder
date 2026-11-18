@@ -37,7 +37,7 @@ rendered Compose model with the evidence.
 ## Prepare the environment
 
 Run every command from the repository root. Copy the example environment file
-and create a results directory writable by UID 1000:
+and create a results directory writable by UID 10001:
 
 ```bash
 cp deploy/.env.storage-benchmark.example /tmp/zinder-storage-benchmark.env
@@ -134,7 +134,7 @@ docker compose \
   --profile rocksdb run --rm --no-deps \
   --user 0:0 --entrypoint /bin/sh rocksdb-canonical-replay-storage -ceu '
     test -z "$(ls -A /var/lib/zinder)"
-    chown 1000:1000 /var/lib/zinder
+    chown 10001:10001 /var/lib/zinder
   '
 
 docker compose \
@@ -374,7 +374,7 @@ docker compose \
   --profile comparison run --rm --no-deps \
   --user 0:0 --entrypoint /bin/sh rocksdb-canonical-replay-storage -ceu '
     test -z "$(ls -A /var/lib/zinder)"
-    chown 1000:1000 /var/lib/zinder
+    chown 10001:10001 /var/lib/zinder
   '
 
 docker compose \

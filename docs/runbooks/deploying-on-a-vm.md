@@ -12,6 +12,10 @@ host requirements and a shorter quickstart.
   node's Docker network and reads its RPC cookie from a named volume. The
   [Z3 stack](https://github.com/ZcashFoundation/z3) provides both for Zebra.
   For Zakura, see [Attach a Zakura node](#attach-a-zakura-node).
+- The node running as UID 10001, as the Zebra and Zakura images do, so the
+  Zinder containers, which also run as UID 10001, can read its mode-0600
+  cookie. For a node under another UID, see
+  [Runtime images](../architecture/service-operations.md#runtime-images).
 - Disk and memory for your network, from
   [What you need](deploying.md#what-you-need).
 - A reverse proxy for TLS, authentication, rate limits, and quotas.
@@ -29,33 +33,21 @@ sudo git clone https://github.com/ZcashFoundation/zinder.git /opt/zinder
 sudo git -C /opt/zinder checkout vX.Y.Z
 ```
 
-The Compose file builds the images from this checkout. To run the released
-images instead, set these in the environment file from step 3, preferably
-pinned by digest:
-
-```bash
-ZINDER_INGEST_IMAGE=ghcr.io/zcashfoundation/zinder-ingest:vX.Y.Z
-ZINDER_PROJECTOR_IMAGE=ghcr.io/zcashfoundation/zinder-projector:vX.Y.Z
-ZINDER_QUERY_IMAGE=ghcr.io/zcashfoundation/zinder-query:vX.Y.Z
-ZINDER_COMPAT_IMAGE=ghcr.io/zcashfoundation/zinder-compat-lightwalletd:vX.Y.Z
-```
-
-Then run `docker compose ... pull` and start with `--no-build`. Do not pass
-`--build` while these name released images, because Compose then builds from
-source and tags the result with the release name. [Releasing](releasing.md)
-shows how to verify a release's images.
+Step 3 selects the release images of the same tag. Each Compose file matches
+the images of its own release. [Releasing](releasing.md) shows how to verify
+a release's image signatures.
 
 ### 2. Create the control secrets
 
 Ingest's private control API, on loopback port 9100, needs two bearer tokens.
 Keep them outside the data volume, owned by root, and readable by the
-containers' group, GID 1000:
+containers' group, GID 10001:
 
 ```bash
-sudo install -d -o root -g 1000 -m 0750 /etc/zinder/control-secrets
+sudo install -d -o root -g 10001 -m 0750 /etc/zinder/control-secrets
 openssl rand -hex 32 | sudo tee /etc/zinder/control-secrets/ingest.token >/dev/null
 openssl rand -hex 32 | sudo tee /etc/zinder/control-secrets/checkpoint.token >/dev/null
-sudo chown root:1000 /etc/zinder/control-secrets/*.token
+sudo chown root:10001 /etc/zinder/control-secrets/*.token
 sudo chmod 0440 /etc/zinder/control-secrets/*.token
 ```
 
@@ -74,7 +66,15 @@ Copy the env file for your node and network to `/etc/zinder/env`:
 ```bash
 sudo install -d -o root -g root -m 0755 /etc/zinder
 sudo cp /opt/zinder/deploy/.env.mainnet /etc/zinder/env
+echo 'ZINDER_VERSION=vX.Y.Z' | sudo tee -a /etc/zinder/env >/dev/null
 ```
+
+`ZINDER_VERSION` selects the signed release images
+`ghcr.io/zcashfoundation/zinder-<runtime>:vX.Y.Z`. Set it to the tag from
+step 1. To build every image from the checkout instead, leave it unset.
+`ZINDER_INGEST_IMAGE`, `ZINDER_PROJECTOR_IMAGE`, `ZINDER_QUERY_IMAGE`,
+`ZINDER_COMPAT_IMAGE`, and `ZINDER_EXPLORER_IMAGE` each replace one whole
+image reference, for example with one pinned by digest.
 
 Check these values. Compose refuses to start when any of the first five, or
 the last two, is unset:
@@ -104,21 +104,32 @@ other setting.
 
 ### 4. Start the runtimes
 
-Validate the resolved Compose file, then start it:
+Validate the resolved Compose file, pull the release images, and start them:
 
 ```bash
 cd /opt/zinder
 docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml config -q
-docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml up -d --build
+docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml pull
+docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml up -d --no-build
 ```
 
+`pull` and `--no-build` work as in step 4 of the
+[quickstart](deploying.md#quickstart-with-docker-compose). If you left
+`ZINDER_VERSION` unset, skip `pull` and run `up -d --build` instead. Do the same wherever a later command in this
+runbook passes `--no-build`.
+
 Compose starts ingest, then the projector once ingest is healthy, then query
-and compatibility once the projector is healthy. On a first sync, the command
-waits while the stores are built. The health checks give ingest 3 hours and the
-projector 2 hours before they count as unhealthy. A Mainnet build can take
-longer. If the command then exits because a container is unhealthy, leave the
-running containers alone and run the same command again once that process's
-`/readyz` returns 200. [Initial sync](initial-sync.md) describes the phases.
+and compatibility once the projector is healthy. Each health check runs the
+service's own binary, for example `zinder-query healthcheck`, which requests
+that process's `/readyz` and passes only on HTTP 200. `docker compose ps`
+shows each container's health state.
+
+On a first sync, the command waits while the stores are built. The health
+checks give ingest 3 hours and the projector 2 hours before they count as
+unhealthy. A Mainnet build can take longer. If the command then exits because
+a container is unhealthy, leave the running containers alone and run the same
+command again once that process's `/readyz` returns 200.
+[Initial sync](initial-sync.md) describes the phases.
 
 Do not restart ingest or the projector during their first build. A restart
 discards the unfinished build and starts it over.
@@ -187,16 +198,8 @@ Start the Zakura node with these settings:
 - An explicit `ZAKURA_NETWORK__ZAKURA__LISTEN_ADDR`. When it is unset, Zakura's
   QUIC peer listener binds `0.0.0.0:8234`.
 
-The node writes its cookie as UID 10001 with mode 0600, and Zinder runs as
-UID 1000. Run the cookie-permissions project beside the node with the same
-env file. It resets the cookie's mode to 0644 every 5 seconds:
-
-```bash
-docker compose --env-file /etc/zinder/env -f deploy/node-cookie-permissions.yml up -d
-```
-
-Z3 already does this for Zebra. Zakura refuses a plaintext indexer listener
-off loopback, so to stream its mempool, follow
+Zakura refuses a plaintext indexer listener off loopback, so to stream its
+mempool, follow
 [Stream mempool events over indexer TLS](#stream-mempool-events-over-indexer-tls).
 
 ## Fail over to a second node
@@ -214,15 +217,11 @@ ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR=http://zakura:8232
 ZINDER_NODE_FALLBACKS__1__INDEXER_GRPC_ADDR=
 ```
 
-Run the cookie-permissions project for the fallback's volume, then merge the
-overlay:
+Then merge the overlay:
 
 ```bash
-ZINDER_SOURCE_COOKIE_VOLUME_NAME=zakura-mainnet-cookie \
-  docker compose -p zinder-mainnet-fallback-node-cookie \
-  --env-file /etc/zinder/env -f deploy/node-cookie-permissions.yml up -d
 docker compose --env-file /etc/zinder/env \
-  -f deploy/docker-compose.yml -f deploy/docker-compose.node-fallback.yml up -d
+  -f deploy/docker-compose.yml -f deploy/docker-compose.node-fallback.yml up -d --no-build
 ```
 
 The overlay sets a 7-second broadcast timeout for the fallback. Ingest
@@ -243,10 +242,10 @@ host Zinder dials, such as `zakura`.
 Install Zinder's three PEM files outside the data volume:
 
 ```bash
-sudo install -d -o root -g 1000 -m 0750 /etc/zinder/indexer-tls
-sudo install -o root -g 1000 -m 0440 node-indexer-ca.pem /etc/zinder/indexer-tls/ca.pem
-sudo install -o root -g 1000 -m 0440 zinder-client.pem /etc/zinder/indexer-tls/client.pem
-sudo install -o root -g 1000 -m 0440 zinder-client-key.pem /etc/zinder/indexer-tls/client-key.pem
+sudo install -d -o root -g 10001 -m 0750 /etc/zinder/indexer-tls
+sudo install -o root -g 10001 -m 0440 node-indexer-ca.pem /etc/zinder/indexer-tls/ca.pem
+sudo install -o root -g 10001 -m 0440 zinder-client.pem /etc/zinder/indexer-tls/client.pem
+sudo install -o root -g 10001 -m 0440 zinder-client-key.pem /etc/zinder/indexer-tls/client-key.pem
 ```
 
 Set the URL and directory in `/etc/zinder/env`, and add
@@ -262,7 +261,7 @@ Start with the overlay, and add it to the systemd unit as in step 6:
 
 ```bash
 docker compose --env-file /etc/zinder/env \
-  -f deploy/docker-compose.yml -f deploy/docker-compose.indexer-tls.yml up -d
+  -f deploy/docker-compose.yml -f deploy/docker-compose.indexer-tls.yml up -d --no-build
 ```
 
 Ingest exits with a configuration error when a file is missing or holds no
@@ -273,17 +272,18 @@ each indexer reconnect, so you can replace them without a restart.
 
 Merge the Explorer overlay. It turns on Explorer views in ingest and starts
 `zinder-explorer` on host ports 9068 and 9069 on Mainnet, 19068 and 19069 on
-Testnet, and 29068 and 29069 on Regtest:
+Testnet, and 29068 and 29069 on Regtest. `ZINDER_VERSION` selects the
+released `zinder-explorer` image too:
 
 ```bash
 docker compose --env-file /etc/zinder/env \
-  -f deploy/docker-compose.yml -f deploy/docker-compose.explorer.yml up -d --build
+  -f deploy/docker-compose.yml -f deploy/docker-compose.explorer.yml pull
+docker compose --env-file /etc/zinder/env \
+  -f deploy/docker-compose.yml -f deploy/docker-compose.explorer.yml up -d --no-build
 ```
 
-To use the released image, set
-`ZINDER_EXPLORER_IMAGE=ghcr.io/zcashfoundation/zinder-explorer:vX.Y.Z`, pull,
-and start with `--no-build`. Inside the node network, consumers reach the
-Explorer at `zinder-${ZINDER_DEPLOY_NETWORK}-explorer:9068`.
+Inside the node network, consumers reach the Explorer at
+`zinder-${ZINDER_DEPLOY_NETWORK}-explorer:9068`.
 
 The views live in the data volume, under
 `/var/lib/zinder/canonical/materialized-views`. Ingest pauses them when the
@@ -307,10 +307,35 @@ startup. To rebuild the views:
 5. Delete the moved directory once `ServerInfo` reports zero `lag_blocks` and
    advertises every capability from step 1.
 
-## Restart and roll back
+## Upgrade, restart, and roll back
 
-Restart one process at a time, in order, and wait for each `/readyz` before
-the next:
+To upgrade, change the release tag:
+
+1. Read the new release's notes for any step the upgrade needs.
+2. Check out the new tag and point `ZINDER_VERSION` at it:
+
+   ```bash
+   sudo git -C /opt/zinder fetch --tags
+   sudo git -C /opt/zinder checkout vX.Y.Z
+   sudo sed -i 's/^ZINDER_VERSION=.*/ZINDER_VERSION=vX.Y.Z/' /etc/zinder/env
+   ```
+
+3. Pull the new images, adding every overlay you use:
+
+   ```bash
+   cd /opt/zinder
+   docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml pull
+   ```
+
+   Pull before the restart. The unit's `up` builds any image that is missing
+   from the host.
+
+4. Restart the unit with `sudo systemctl restart zinder`. It stops every
+   runtime and starts them again in order, so wallets are not served until
+   the readers are healthy again.
+
+To restart without upgrading, restart one process at a time, in order, and
+wait for each `/readyz` before the next:
 
 ```bash
 docker compose --env-file /etc/zinder/env -f /opt/zinder/deploy/docker-compose.yml restart zinder-ingest
@@ -320,9 +345,45 @@ Repeat for `zinder-projector`, `zinder-query`, and
 `zinder-compat-lightwalletd`. Readers stop serving five minutes after ingest
 stops, so keep ingest's downtime short.
 
-To roll back a release, route traffic to a lane that already runs the earlier
-release. Do not start an earlier release on stores a later release wrote,
-unless that release states the stores are compatible.
+To roll back, repeat the upgrade steps with the earlier tag only when that
+release states it can open stores the later release wrote. Otherwise, route
+traffic to a lane that already runs the earlier release.
+
+## Inspect a runtime container
+
+The runtime images hold the service binary and the C and C++ runtime
+libraries it links. They have no shell, `curl`, or package manager, so
+`docker compose exec zinder-query sh` fails. Run the binary itself instead:
+
+```bash
+cd /opt/zinder
+# The effective configuration, with secrets redacted.
+docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml \
+  exec zinder-query zinder-query --config /etc/zinder/config.toml --print-config
+# One readiness probe, which prints the reason when it fails.
+docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml \
+  exec zinder-query zinder-query healthcheck
+```
+
+A custom health check must call the binary too, for example
+`["CMD", "zinder-query", "healthcheck", "--path", "/healthz"]` for liveness
+only.
+
+To use ordinary tools on the container's files, processes, or loopback
+listeners, attach a throwaway toolbox container to its namespaces, with its
+volumes read-only:
+
+```bash
+container="$(docker compose --env-file /etc/zinder/env \
+  -f deploy/docker-compose.yml ps -q zinder-query)"
+docker run --rm -it \
+  --network "container:${container}" --pid "container:${container}" \
+  --volumes-from "${container}:ro" \
+  busybox:1.37 sh
+```
+
+The toolbox leaves the running container unchanged and stops when you exit
+the shell.
 
 ## Troubleshooting
 
@@ -330,7 +391,7 @@ unless that release states the stores are compatible.
 | --- | --- | --- |
 | Ingest logs `node_endpoints_unavailable` with `the node's block 0 is not the configured network's genesis block` | The node is on a different network than `ZINDER_NETWORK__NAME`. | Point `ZINDER_NODE__JSON_RPC_ADDR` at a node on the configured network. |
 | Ingest exits; `/readyz` reported `node_capability_missing` for `historical_block_bodies` | The node is pruned. | Use an archive node. |
-| Ingest `/readyz` reports `node_unavailable` after a node restart | The node replaced its cookie, and Zinder cannot read it yet. | Wait one poll interval. For Zakura, check that the cookie-permissions project runs. |
+| Ingest `/readyz` reports `node_unavailable` while the node answers | Zinder cannot read the node's cookie, because the node runs under a UID other than 10001. | Use `basic` node authentication, or run the Zinder services as the node's UID, as [Runtime images](../architecture/service-operations.md#runtime-images) describes. |
 | Projector `/readyz` reports `wallet_transition_limit_exceeded` | One wallet update is larger than its limit, and the projector parked. | Raise `max_transition_logical_bytes` under `[projector.follow]` in `deploy/config/projector.toml` and restart the projector, as [Wallet transition exceeds its logical-byte limit](deploying-single-volume.md#wallet-transition-exceeds-its-logical-byte-limit) describes. |
 | Query and compatibility refuse requests with `REORG_WINDOW_EXCEEDED` | The node replaced more blocks than the 1000-block reorg window, so ingest stopped following. A correctly working node does not do this. | Look for a replaced, resynced, or misbehaving node. Confirm the correct chain, then rebuild the stores on empty paths. Restarting only parks ingest again. |
 
@@ -384,6 +445,8 @@ which each binary reads with `--config`, and keep what Compose provides:
 - the two control tokens at the configured paths;
 - the node endpoint, network, and projector identity from step 3, as
   environment variables;
+- read access to the node's mode-0600 cookie, which means running as the
+  node's user;
 - the start order ingest, projector, then the readers, each after the previous
   one is ready;
 - loopback listen addresses. `compat-lightwalletd.toml` binds `0.0.0.0:9067`,

@@ -26,14 +26,37 @@ Most settings have working defaults. A wallet-serving deployment of
 | `ingest_control.bearer_token_path` | ingest, projector, query, compat | File holding a shared secret. Ingest requires it when `ingest_control.listen_addr` is not a loopback address. |
 | `security.allow_public_bind` | any runtime bound to `0.0.0.0`, `::`, or a public address | `true`, and only behind a proxy that terminates TLS |
 
-The files in `deploy/config/` are complete examples for the Compose topology,
-and [Deploying Zinder](../runbooks/deploying.md) walks through them. Run any
-binary with `--print-config` to see the merged result before you start it.
+The `*.toml` files directly in `deploy/config/` are complete examples for the
+Compose topology, and [Deploying Zinder](../runbooks/deploying.md) walks
+through them. Run any binary with `--print-config` to see the merged result
+before you start it.
 
 Every listener binds to loopback by default. The
 [security boundary](../architecture/service-operations.md#security-boundary)
 explains which addresses `security.allow_public_bind` admits and why a public
 listener needs your own proxy.
+
+The runtime images change those defaults. Each image installs a file from
+`deploy/config/images/` at `/etc/zinder/config.toml` and starts with
+`--config /etc/zinder/config.toml`. The file sets
+`security.allow_public_bind = true` and these listeners:
+
+| Image | Listeners |
+| --- | --- |
+| `zinder-ingest` | `ops.listen_addr = "[::]:9105"` |
+| `zinder-projector` | `ops.listen_addr = "[::]:9110"` |
+| `zinder-query` | `query.listen_addr = "[::]:9102"`, `ops.listen_addr = "[::]:9106"` |
+| `zinder-compat-lightwalletd` | `compat.listen_addr = "[::]:9067"`, `ops.listen_addr = "[::]:9107"` |
+| `zinder-explorer` | `explorer.listen_addr = "[::]:9068"`, `ops.listen_addr = "[::]:9069"` |
+
+Other listeners, such as `ingest_control.listen_addr`, keep their loopback
+defaults. The image files set no network, node, or storage values, so supply
+those with `ZINDER_*` variables or a mounted file. A file you mount at
+`/etc/zinder/config.toml` replaces the image file whole. A listener it does
+not set then binds loopback, and without `allow_public_bind = true` a
+listener on `[::]` or a public address is refused. Arguments after the image
+name replace `--config /etc/zinder/config.toml`, so repeat it when you pass
+your own.
 
 ## How configuration is loaded
 

@@ -7,7 +7,10 @@ resource that limits construction and which setting to change.
 Ingest sizes its canonical construction budgets from the container's memory
 limit. Wallet construction uses fixed default budgets. Most deployments need
 no tuning. Change a setting only after a metric shows which resource is
-short. To see the values a binary resolved, run it with `--print-config`.
+short. To see the values a binary resolved, run it with `--print-config`. The
+runtime images have no shell, so run it in a container as
+[Inspect a runtime container](deploying-on-a-vm.md#inspect-a-runtime-container)
+shows.
 
 ## Find the limiting resource
 

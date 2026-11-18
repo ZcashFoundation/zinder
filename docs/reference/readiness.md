@@ -68,6 +68,47 @@ A wallet-serving reader during a node outage answers like this:
 `cause`. A script that reads the first `"cause"` key therefore gets the
 runtime's own cause.
 
+## Container healthcheck
+
+The runtime images have no shell or HTTP client, so every runtime binary
+except `zinder-compat-cipherscan` probes its own endpoint with a `healthcheck`
+subcommand:
+
+```bash
+zinder-query --config /etc/zinder/config.toml healthcheck
+zinder-ingest healthcheck --addr 127.0.0.1:9105 --path /healthz
+```
+
+The probe sends one HTTP/1.1 `GET` and exits 0 only when the endpoint answers
+200. Otherwise it exits 1 and prints the reason to stderr, which Docker
+records as the failure reason.
+
+| Flag | Default |
+| --- | --- |
+| `--path` | `/readyz`. Use `/healthz` to check liveness only. |
+| `--addr` | `ZINDER_OPS__LISTEN_ADDR`, then `[ops] listen_addr` in the `--config` file, then the runtime's built-in ops address. |
+
+- The probe reads only `[ops] listen_addr` from the config file. It skips a
+  file that is missing, unreadable, or not TOML.
+- It ignores the runtime's `--ops-listen-addr` flag. Pass that address with
+  `--addr`.
+- An unspecified host probes loopback. `0.0.0.0` probes `127.0.0.1`, and
+  `[::]` probes `[::1]`, then `127.0.0.1`.
+- An empty address disables the endpoint, so the probe fails without
+  connecting.
+- The whole probe takes at most 3 seconds, below the 5-second timeout of the
+  image and Compose healthchecks.
+
+Each runtime image runs `zinder-<runtime> --config /etc/zinder/config.toml
+healthcheck`. The ingest image adds `--path /healthz`, because ingest reports
+`syncing` throughout a first sync. The reference Compose file probes `/readyz`
+for every runtime. If you start a container with a config file at another
+path that changes the ops address, override the healthcheck with the same
+`--config`. The `zinder-canonical-runtime` image runs
+`zinder-ingest healthcheck --path /healthz`. The two wallet-serving images
+run their own healthcheck script, described in
+[Single-volume deployment](../runbooks/deploying-single-volume.md).
+
 ## Readiness causes
 
 The same causes appear in `/readyz`, in the `zinder.v1.ops.ReadinessReport`

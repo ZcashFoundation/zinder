@@ -45,10 +45,10 @@ the runtimes in this order:
 3. `zinder-query` and `zinder-compat-lightwalletd`, once the projector is
    healthy and the ingest container has started.
 
-A query runtime that starts behind a parked projector cannot publish its
-first serving pair, so it fails before it listens. The single-volume
-entrypoint therefore does not start query while the projector reports that
-park.
+A query or compatibility runtime that starts behind a parked projector cannot
+publish its first serving pair, so it fails before it listens. The
+single-volume entrypoint therefore starts neither reader while the projector
+reports that park.
 
 A restart during a first sync does not resume; see
 [Initial sync](../runbooks/initial-sync.md#restarts-during-the-first-sync).
@@ -62,8 +62,11 @@ of a store closes it, and readers make no final writes.
 
 `zinder-query` ends open server streams, such as `ChainEvents` and
 `MempoolEvents`, with `UNAVAILABLE` and `SERVICE_NOT_READY`, because event
-streams never end on their own. Its gRPC drain is bounded at 10 seconds. The
-single-volume entrypoint allows its processes 20 seconds to exit.
+streams never end on their own. `zinder-query` and
+`zinder-compat-lightwalletd` each bound their gRPC drain at 10 seconds. Calls
+still open then, such as a block-range stream to a client that reads slowly,
+are abandoned. The single-volume entrypoint allows its processes 20 seconds to
+exit.
 
 ## Memory allocator
 
@@ -113,6 +116,47 @@ Bearer tokens are read from files. Configuration output, such as
 `--print-config`, shows redaction markers in place of secrets, and errors
 name only the field or the path. Log events that carry a node URL replace its
 user information, query, and fragment with `[REDACTED]`.
+
+### Runtime images
+
+Each runtime image runs its one binary as UID and GID 10001 on a
+digest-pinned `gcr.io/distroless/cc-debian12:nonroot` base. The image has no
+shell, package manager, or HTTP client. The single-volume images keep a
+Debian base with a shell, because their entrypoint scripts need one.
+[ADR-0022](../adrs/0022-release-artifacts.md) records why.
+
+The Zebra and Zakura images also run as UID 10001 and write the node's RPC
+cookie with mode 0600, so a Zinder container that mounts the cookie reads it
+directly. If your node runs under another UID, use `basic` node
+authentication where the node accepts a fixed RPC password. Otherwise, run the
+Zinder containers that mount the cookie as the node's UID. That UID then also
+needs write access to the data volume, which the reference Compose file's
+`state-init` service gives to UID 10001 on every start. In an orchestrator
+other than Compose, give mounted volumes to UID 10001 yourself, for example
+with Kubernetes `fsGroup: 10001`.
+
+The runtime images listen on every container interface. Their default
+configuration sets each serving and operational listener to `[::]` and sets
+`security.allow_public_bind = true`, as
+[Configuration](../reference/configuration.md) lists. Publishing a port is
+therefore not the only way in:
+
+- On a Docker bridge network, every container on that network can connect to
+  the listeners, whether or not you publish their ports. On Linux, the host
+  can too, through the container's address.
+- With host networking, `[::]` binds every interface of the host.
+
+To restrict who can connect, run the containers on a dedicated network that
+holds only the services that need them, and do not use host networking.
+Publish ports on `127.0.0.1` unless a proxy that terminates TLS and
+authorization sits in front of them. To keep a listener on container
+loopback, set its address, for example
+`ZINDER_OPS__LISTEN_ADDR=127.0.0.1:9106`. The ingest control listener keeps
+its `127.0.0.1:9100` default.
+
+To inspect a running container, run its binary with `docker exec`, as
+[Inspect a runtime container](../runbooks/deploying-on-a-vm.md#inspect-a-runtime-container)
+shows.
 
 ## Recovery
 

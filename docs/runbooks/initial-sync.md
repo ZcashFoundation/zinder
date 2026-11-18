@@ -24,12 +24,10 @@ disk.
 
 ## Start and watch the sync
 
-1. Start the stack with the env file for your node and network:
-
-   ```bash
-   docker compose --env-file deploy/.env.testnet \
-     -f deploy/docker-compose.yml up -d
-   ```
+1. Start the stack with the start command from your deployment runbook, such
+   as step 4 of the
+   [Docker Compose quickstart](deploying.md#quickstart-with-docker-compose) or
+   of [Deploying on a VM](deploying-on-a-vm.md).
 
    Compose starts ingest first, the projector once ingest is healthy, and the
    two readers once the projector is healthy. The command can wait for hours
@@ -106,7 +104,7 @@ removes its own unpublished staging on the next start.
 | --- | --- | --- |
 | Ingest exits at startup. `/readyz` showed `node_capability_missing` for `historical_block_bodies` | The node is pruned or does not report its storage mode | Point ingest at an archive node |
 | Ingest or the projector restarts repeatedly with exit code 137 | The container ran out of memory | Lower the limiting budget as described in [Bulk-catchup resource tuning](bulk-catchup-resource-tuning.md), or raise the container limit |
-| On Mainnet, `docker compose up` reports `zinder-ingest` unhealthy after three hours | Canonical construction outlasted the Compose health-check start period. Compose does not restart the container for this | Wait until ingest `/readyz` returns 200, then run the same `docker compose up -d` again to start the other runtimes |
+| On Mainnet, `docker compose up` reports `zinder-ingest` unhealthy after three hours | Canonical construction outlasted the Compose health-check start period. Compose does not restart the container for this | Wait until ingest `/readyz` returns 200, then run the same start command again to start the other runtimes |
 | The single-volume container exits during construction on Mainnet | Construction outlasted the image's construction deadline | Raise the deadlines as described in [Deploying on a single volume](deploying-single-volume.md) |
 | Construction stops on Mainnet with failure class `capability_missing` on a tree-state or subtree read | The node is a Zakura node built by fast sync, which never stored per-height trees below its last checkpoint | Use a node synchronized without fast sync |
 | Projector exits with `wallet construction needs ... temporary bytes in one sorter` or `stopped a sorter whose input had not ended` | `projector.build.max_temporary_file_bytes_per_sorter` is below what a sorter needs. The figure in the second message is a lower bound | Unset the key to use the default (206158430208, 192 GiB), or raise it well above the reported figure. Make sure that much space is free |

@@ -129,8 +129,12 @@ approve the release only after all four jobs pass on the tag's commit.
    - Per platform, `compile release binaries` and
      `reproduce release binaries` build the archive twice in independent,
      uncached jobs. The reproduction also packages every image from its
-     archive without pushing. `compare independent release builds` then
-     requires identical archive and binary hashes.
+     archive without pushing, with `scripts/package-release-images.sh
+     check`. Each image binary must match its archive binary byte for byte
+     and be a root-owned file with mode `0755`. It must run `--version` and
+     `--help` as UID 10001, and its `healthcheck` subcommand must exit 1
+     against a port with no listener. `compare independent release builds`
+     then requires identical archive and binary hashes.
 
 3. GitHub requests approval for `publish public SDK crates`, the only job in
    the `release` environment. Every later job depends on it. Before you
@@ -197,6 +201,41 @@ anonymous `docker pull` of the new image confirms it.
 Deployments should pin a verified image digest or archive checksum, not
 `latest`.
 
+### Inspect an image
+
+The five runtime images have no shell, so `docker run ... sh` fails. Inspect
+an image from outside, and run its binary as the entrypoint:
+
+```console
+image=ghcr.io/zcashfoundation/zinder-query:v0.18.0
+docker pull "$image"
+docker image inspect "$image" --format '{{.Config.User}}'
+docker image inspect "$image" --format '{{json .Config.Labels}}' | jq
+docker run --rm --entrypoint zinder-query "$image" --version
+```
+
+A runtime image runs as `10001:10001`, and `--version` prints
+`zinder-query 0.18.0`. A single-volume image starts as root, and its
+entrypoint drops every Zinder process to UID 10001.
+
+Every image carries these OCI labels:
+
+| Label | Value |
+| --- | --- |
+| `org.opencontainers.image.title` | The image name, such as `zinder-query` |
+| `org.opencontainers.image.description` | One line on what the image runs |
+| `org.opencontainers.image.version` | The release tag |
+| `org.opencontainers.image.revision` | The tag-target commit |
+| `org.opencontainers.image.created` | The tag-target commit time in UTC, so a rebuilt image reports the same time |
+| `org.opencontainers.image.source`, `org.opencontainers.image.url` | The GitHub repository |
+| `org.opencontainers.image.documentation` | The deployment runbook for the image at the release tag |
+| `org.opencontainers.image.vendor` | `Zcash Foundation` |
+| `org.opencontainers.image.licenses` | `MIT` |
+
+`scripts/package-release-images.sh` sets the description and runbook per
+image. Packaging fails for a catalog image that has no entry there, so add one
+when you add an image.
+
 ## Recover a failed release
 
 Nothing is published before approval. A tag whose binaries do not build,
@@ -212,7 +251,7 @@ tags from the same commit.
 | `publish public SDK crates` times out on registry propagation | Rerun the job. It reobserves crates.io and skips verified versions. |
 | A crate version exists but was published from another commit | Stop and investigate. Never yank or replace a version to let the release continue. |
 | Exact and commit image tags do not converge in GHCR | Inspect both tags in GHCR before you retry. Do not bypass the topology check. |
-| Image SBOM evidence reports an unexpected runtime package | Regenerate the SBOM from the exact child digest and compare it with the owning service's manifest. Do not widen the allowed package set. |
+| Image SBOM evidence reports an unexpected runtime package | Regenerate the SBOM from the exact child digest and compare it with the owning service's manifest. A single-volume image must report exactly the executables its `deploy/Dockerfile` target copies. Do not widen the allowed package set. |
 | A prerelease published crates or images but no GitHub Release | Leave the tag and artifacts as they are. Merge the fix and publish the next release candidate. |
 | Only `promote stable image tags` failed | Rerun that job. It checks all eight exact manifests before it moves any `latest` tag. |
 
