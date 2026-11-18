@@ -1434,11 +1434,11 @@ Each runtime image runs one binary as UID and GID 10001 on a digest-pinned
 C++ runtime libraries, and CA certificates. The image has no shell, curl,
 or package manager. The Zebra and Zakura images also run as UID 10001 and
 write their RPC cookie with mode 0600, so a runtime that mounts the cookie
-reads it directly. When the node runs under another UID, run the Zinder
-container with that UID, or use `basic` node authentication where the node
-accepts a fixed RPC password. The single-volume host images create their
-`zinder` account with the same UID and GID, and their entrypoints hand the
-mounted volume to it on every start. Other orchestrators must give volumes to
+reads it directly. The Compose deployment requires the node to run as UID
+10001. Its `state-init` service gives the stores to UID 10001 on every start,
+so a Zinder container under another UID cannot write them. The single-volume
+host images create their `zinder` account with the same UID and GID, and
+their entrypoints hand the mounted volume to it on every start. Other orchestrators must give volumes to
 UID 10001 themselves, for example with Kubernetes `fsGroup: 10001`. Its
 `HEALTHCHECK` runs the
 [healthcheck subcommand](#healthcheck-subcommand): ingest probes `/healthz`

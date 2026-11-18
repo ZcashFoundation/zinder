@@ -314,12 +314,16 @@ mempool events from Zakura instead, follow
 
 The Zebra and Zakura images run the node as UID 10001 and write the cookie
 with mode 0600, replacing it on every start. The Zinder images run as UID
-10001 too, so they read the cookie as written. If the node runs under another
-UID, set the same `user:` on the Zinder services that mount the cookie, or,
-where the node accepts a fixed RPC password, set
-`ZINDER_NODE__AUTH__METHOD=basic` with `ZINDER_NODE__AUTH__USERNAME` and
-`ZINDER_NODE__AUTH__PASSWORD`. Native binaries likewise read the cookie only
-when they run as the node's user.
+10001 too, so they read the cookie as written.
+
+Run the node as UID 10001. If you set another user on the node container,
+remove that setting. Do not set `user:` on the Zinder services to match the
+node. `state-init` gives the data and checkpoint-staging volumes to UID 10001
+on every start, so a Zinder service under another UID cannot write its
+stores.
+
+Native binaries likewise read the cookie only when they run as the node's
+user.
 
 ### Fail over to a second node
 
