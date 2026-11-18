@@ -6,14 +6,17 @@
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use serde_json::json;
 use tokio_stream::StreamExt as _;
-use zinder_core::{BlockHash, BlockHeight, BlockId};
+use zinder_core::{BlockHash, BlockHeight, BlockId, Network};
 use zinder_source::{
-    ACTIVE_NODE_ENDPOINT_CHANGED_REASON, MempoolSource, MempoolSourceAdmissionLimits,
-    MempoolSourceEvent, MempoolSourceFactory, NodeCapabilities, NodeSet, NodeSource, SourceBlock,
-    SourceError,
+    ACTIVE_NODE_ENDPOINT_CHANGED_REASON, DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, MempoolSource,
+    MempoolSourceAdmissionLimits, MempoolSourceEvent, MempoolSourceFactory, NodeAuth,
+    NodeCapabilities, NodeSet, NodeSource, NodeTarget, SourceBlock, SourceError,
 };
-use zinder_testkit::{MockMempoolSource, MockMempoolSourceControl};
+use zinder_testkit::{
+    JsonRpcTestServer, MockMempoolSource, MockMempoolSourceControl, RpcReply, method,
+};
 
 /// One endpoint of a test node set: it reports a fixed tip and owns a
 /// scripted mempool source.
@@ -137,5 +140,49 @@ async fn a_switch_ends_the_open_mempool_stream_and_reopens_on_the_new_endpoint()
         from_fallback,
         Some(Ok(MempoolSourceEvent::InitialSnapshotComplete { source_tip })) if source_tip == fallback_tip
     ));
+    Ok(())
+}
+
+/// A fallback whose cookie file is missing does not fail building the set.
+///
+/// A node writes its cookie file when it starts. Until then that endpoint
+/// fails as node-unavailable without being contacted, and the other
+/// endpoints answer.
+#[tokio::test]
+async fn connect_builds_a_fallback_whose_cookie_file_is_missing() -> eyre::Result<()> {
+    let upgrades = json!({ "upgrades": {} });
+    let primary_server = JsonRpcTestServer::start([
+        method("getblockchaininfo").reply(RpcReply::result(upgrades.clone()))
+    ])?;
+    let fallback_server =
+        JsonRpcTestServer::start([method("getblockchaininfo").reply(RpcReply::result(upgrades))])?;
+    let cookie_dir = tempfile::tempdir()?;
+    let target = |server: &JsonRpcTestServer, node_auth| {
+        NodeTarget::new(
+            Network::ZcashRegtest,
+            server.url(),
+            node_auth,
+            Duration::from_secs(5),
+            DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES,
+        )
+    };
+
+    let (nodes, switch) = NodeSet::connect(
+        &target(&primary_server, NodeAuth::None),
+        &[target(
+            &fallback_server,
+            NodeAuth::cookie_file(cookie_dir.path().join(".cookie")),
+        )],
+    )?;
+    nodes.fetch_network_upgrade_activations().await?;
+    assert!(switch.switch_to(1));
+    let waiting = nodes.fetch_network_upgrade_activations().await.err();
+
+    assert!(
+        matches!(&waiting, Some(SourceError::NodeUnavailable { reason }) if reason.contains("cookie")),
+        "unexpected fallback outcome before its cookie exists: {waiting:?}"
+    );
+    assert_eq!(primary_server.requests()?.len(), 1);
+    assert!(fallback_server.requests()?.is_empty());
     Ok(())
 }

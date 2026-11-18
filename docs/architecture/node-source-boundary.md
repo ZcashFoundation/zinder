@@ -266,9 +266,12 @@ waiting for it: each request reads the file first and, until it holds
 credentials, fails with `NodeUnavailable` without reaching the node. A reader
 therefore starts before its node, and its first-contact verification passes
 once the file appears. Ingest's startup capability probe fails on the same
-error, so ingest still exits when it starts without a readable cookie. Empty
-inline cookie credentials and a `node.json_rpc_addr` that is not a usable URL
-come from configuration and still fail at startup.
+error, so ingest still exits when it starts without a readable cookie for
+`[node]`. With `[node_fallbacks.N]`, an endpoint whose cookie file is not
+readable yet fails its startup check as unreachable: ingest starts on the
+first endpoint that passes and checks the waiting one again while it runs.
+Empty inline cookie credentials and a `node.json_rpc_addr` that is not a
+usable URL come from configuration and still fail at startup.
 
 ## Indexer transport security
 
