@@ -1170,7 +1170,8 @@ async fn stream_later_chunks(
                 continuity = next_continuity;
                 messages
             }
-            Ok((_, _, Err(status), _)) => {
+            Ok((_, _, Err(status), timings)) => {
+                timings.record();
                 let _ = sink.send(Err(status)).await;
                 return;
             }
@@ -3251,6 +3252,31 @@ mod tests {
             "{:?}",
             reorged.ending
         );
+        Ok(())
+    }
+
+    /// A later chunk whose read does not continue the sent chain still
+    /// records its read, as a first chunk and every wallet-serving read do,
+    /// and records no conversion or send, because neither ran.
+    #[tokio::test]
+    async fn a_later_chunk_that_ends_the_stream_records_its_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let metrics_recorder =
+            metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics_handle = metrics_recorder.handle();
+        let _recorder_guard = metrics::set_default_local_recorder(&metrics_recorder);
+
+        let reorged = stream_across_reorg(1_990, 2_050).await?;
+        assert_eq!(
+            reorged.ending.as_ref().map(tonic::Status::code),
+            Some(Code::Aborted)
+        );
+
+        // Chunks 1 and 2 are sent; chunk 3 is read and fails the hash link.
+        let rendered = metrics_handle.render();
+        assert_eq!(block_range_stage_samples(&rendered, "read"), Some(3));
+        assert_eq!(block_range_stage_samples(&rendered, "convert"), Some(2));
+        assert_eq!(block_range_stage_samples(&rendered, "send"), Some(1));
         Ok(())
     }
 
