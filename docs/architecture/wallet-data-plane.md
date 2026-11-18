@@ -96,10 +96,10 @@ Ingest stores a tree-state checkpoint every 100 blocks during a first sync, at t
 | Condition | Status and reason |
 | --- | --- |
 | Height above the visible tip, or below the parent of the store's first retained block | `NOT_FOUND`, `BLOCK_NOT_IN_BEST_CHAIN` |
-| A rebuild is needed while the query already runs one rebuild per available CPU | `RESOURCE_EXHAUSTED`, `TREE_STATE_REPLAY_LIMIT_REACHED` |
+| A rebuild is needed, the query already runs one rebuild per available CPU, and no slot frees within the wait or every waiting place is taken | `RESOURCE_EXHAUSTED`, `TREE_STATE_REPLAY_LIMIT_REACHED` |
 | A seed checkpoint is missing, or replayed history does not link or reach the recorded tree sizes | `UNAVAILABLE`, `STORAGE_UNAVAILABLE` (store damage) |
 
-A height with a stored checkpoint is never refused for the rebuild limit. Retry a refused request after a short delay. `zinder_query_tree_state_replay_refusals_total` counts refusals.
+A height with a stored checkpoint is never refused for the rebuild limit and never waits for a slot. A rebuild that finds every slot taken waits for one, with at most two requests waiting per slot. `zinder-query` waits up to `query.tree_state_replay_wait_ms` (2 seconds by default, at most 5). `zinder-compat-lightwalletd` always waits up to 2 seconds. A full rebuild in the densest history can take longer than 2 seconds, so expect some refusals there under load. Retry a refused request after a short delay. `zinder_query_tree_state_replay_refusals_total` counts refusals by reason.
 
 `LatestTreeStateCheckpoint(at_epoch_id)` returns the newest stored checkpoint at or below the visible tip.
 

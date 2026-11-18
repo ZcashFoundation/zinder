@@ -1,7 +1,14 @@
 //! Bound on concurrent tree-state reconstructions, and the metrics of every
 //! tree-state read.
 
-use std::{num::NonZeroU32, sync::Arc, time::Duration};
+use std::{
+    num::NonZeroU32,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use zinder_core::{BlockHeight, ChainTipMetadata};
@@ -36,59 +43,153 @@ const REPLAY_WAIT_HISTOGRAM: &str = "zinder_query_tree_state_replay_wait_duratio
 /// Histogram of the time one reconstruction spent replaying.
 const REPLAY_DURATION_HISTOGRAM: &str = "zinder_query_tree_state_replay_duration_seconds";
 
+/// Default time a reconstruction waits for a replay slot before it is
+/// refused.
+pub const DEFAULT_TREE_STATE_REPLAY_WAIT: Duration = Duration::from_secs(2);
+
+/// Longest replay-slot wait a query accepts.
+///
+/// The wait and the reconstruction that follows it share the client's
+/// deadline. A full reconstruction in the densest history takes seconds, so
+/// a longer wait would let admitted requests time out at a 10-second client
+/// deadline.
+pub const MAX_TREE_STATE_REPLAY_WAIT: Duration = Duration::from_secs(5);
+
+/// Requests that may wait for a replay slot, per slot.
+const WAITERS_PER_SLOT: u32 = 2;
+
 /// Limit on the tree-state reconstructions one wallet query runs at once.
 ///
 /// A height without a stored checkpoint is reconstructed by replaying up to a
 /// checkpoint stride of compact blocks on the blocking pool, so concurrent
 /// reconstructions of dense history could otherwise occupy every blocking
 /// thread. Clones share one limit, so the clones of a runtime's query share
-/// it. A request that finds every slot taken is refused at once rather than
-/// queued.
+/// it. A request that finds every slot taken waits for one up to the
+/// configured wait, alongside at most [`WAITERS_PER_SLOT`] other requests per
+/// slot, and is refused when the wait ends or the waiting places are full.
 #[derive(Clone, Debug)]
 pub(crate) struct TreeStateReplayLimit {
     slots: Arc<Semaphore>,
     max_replays: NonZeroU32,
+    waiters: Arc<AtomicU32>,
+    max_waiters: u32,
+    wait: Duration,
 }
 
 impl TreeStateReplayLimit {
-    /// Admits one reconstruction per available CPU.
-    pub(crate) fn for_available_parallelism() -> Self {
+    /// Admits one reconstruction per available CPU, each waiting up to
+    /// `wait` for a slot.
+    pub(crate) fn for_available_parallelism(wait: Duration) -> Self {
         let max_replays = std::thread::available_parallelism()
             .ok()
             .and_then(|parallelism| u32::try_from(parallelism.get()).ok())
             .and_then(NonZeroU32::new)
             .unwrap_or(NonZeroU32::MIN);
-        Self::new(max_replays)
+        Self::new(max_replays, wait)
     }
 
-    /// Admits at most `max_replays` reconstructions at once.
-    pub(crate) fn new(max_replays: NonZeroU32) -> Self {
+    /// Admits at most `max_replays` reconstructions at once, each waiting up
+    /// to `wait`, capped at [`MAX_TREE_STATE_REPLAY_WAIT`], for a slot.
+    pub(crate) fn new(max_replays: NonZeroU32, wait: Duration) -> Self {
         let permits = usize::try_from(max_replays.get())
             .unwrap_or(Semaphore::MAX_PERMITS)
             .min(Semaphore::MAX_PERMITS);
         Self {
             slots: Arc::new(Semaphore::new(permits)),
             max_replays,
+            waiters: Arc::new(AtomicU32::new(0)),
+            max_waiters: max_replays.get().saturating_mul(WAITERS_PER_SLOT),
+            wait: wait.min(MAX_TREE_STATE_REPLAY_WAIT),
+        }
+    }
+
+    /// Returns this limit with every reconstruction waiting up to `wait`,
+    /// capped at [`MAX_TREE_STATE_REPLAY_WAIT`], for a slot.
+    pub(crate) fn with_wait(self, wait: Duration) -> Self {
+        Self {
+            wait: wait.min(MAX_TREE_STATE_REPLAY_WAIT),
+            ..self
         }
     }
 
     /// Takes a slot for one reconstruction, held until the returned permit
-    /// is dropped, and records the admission or refusal.
+    /// is dropped, and records the wait and the admission or refusal.
+    ///
+    /// Dropping the returned future gives up its waiting place and records
+    /// nothing.
     ///
     /// # Errors
     ///
-    /// Returns [`QueryError::TreeStateReplayLimitReached`] when every slot is
-    /// taken.
-    pub(crate) fn try_admit(&self) -> Result<OwnedSemaphorePermit, QueryError> {
-        metrics::histogram!(REPLAY_WAIT_HISTOGRAM).record(Duration::ZERO.as_secs_f64());
-        let permit = Arc::clone(&self.slots).try_acquire_owned().map_err(|_| {
-            metrics::counter!(REPLAY_REFUSALS_COUNTER).increment(1);
+    /// Returns [`QueryError::TreeStateReplayLimitReached`] when no slot frees
+    /// within the wait, or when every waiting place is taken.
+    pub(crate) async fn admit(&self) -> Result<OwnedSemaphorePermit, QueryError> {
+        let started_at = Instant::now();
+        let admission = self.acquire().await;
+        metrics::histogram!(REPLAY_WAIT_HISTOGRAM).record(started_at.elapsed().as_secs_f64());
+        let permit = admission.map_err(|refusal| {
+            metrics::counter!(REPLAY_REFUSALS_COUNTER, "reason" => refusal.label()).increment(1);
             QueryError::TreeStateReplayLimitReached {
                 max_concurrent_replays: self.max_replays,
             }
         })?;
         metrics::counter!(REPLAY_ADMISSIONS_COUNTER).increment(1);
         Ok(permit)
+    }
+
+    async fn acquire(&self) -> Result<OwnedSemaphorePermit, ReplayRefusal> {
+        if let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() {
+            return Ok(permit);
+        }
+        if self.wait.is_zero() {
+            return Err(ReplayRefusal::WaitExpired);
+        }
+        let _waiting_place = WaitingPlace::take(&self.waiters, self.max_waiters)
+            .ok_or(ReplayRefusal::WaitersFull)?;
+        match tokio::time::timeout(self.wait, Arc::clone(&self.slots).acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) | Err(_) => Err(ReplayRefusal::WaitExpired),
+        }
+    }
+}
+
+/// Why a reconstruction was refused a replay slot.
+#[derive(Clone, Copy, Debug)]
+enum ReplayRefusal {
+    /// No slot freed within the wait.
+    WaitExpired,
+    /// Every waiting place was taken.
+    WaitersFull,
+}
+
+impl ReplayRefusal {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::WaitExpired => "wait_expired",
+            Self::WaitersFull => "waiters_full",
+        }
+    }
+}
+
+/// One of the places a request waiting for a replay slot holds, released
+/// when dropped.
+struct WaitingPlace<'waiters> {
+    waiters: &'waiters AtomicU32,
+}
+
+impl<'waiters> WaitingPlace<'waiters> {
+    fn take(waiters: &'waiters AtomicU32, max_waiters: u32) -> Option<Self> {
+        waiters
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |waiting| {
+                (waiting < max_waiters).then_some(waiting + 1)
+            })
+            .ok()
+            .map(|_| Self { waiters })
+    }
+}
+
+impl Drop for WaitingPlace<'_> {
+    fn drop(&mut self) {
+        self.waiters.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -182,8 +283,9 @@ pub(crate) fn describe_metrics() {
     metrics::describe_counter!(
         REPLAY_REFUSALS_COUNTER,
         metrics::Unit::Count,
-        "Tree-state requests refused because the query already runs its limit of \
-         rebuilds. Sustained growth means wallets request heights without a stored \
+        "Tree-state requests refused a rebuild slot. `reason` is `wait_expired` when no \
+         slot freed within the wait and `waiters_full` when every waiting place was \
+         taken. Sustained growth means wallets request heights without a stored \
          checkpoint faster than the server rebuilds them."
     );
     metrics::describe_histogram!(
@@ -215,9 +317,88 @@ pub(crate) fn describe_metrics() {
 
 #[cfg(test)]
 mod tests {
+    use std::{error::Error, num::NonZeroU32, time::Duration};
+
     use zinder_core::{BlockHeight, ChainTipMetadata};
 
-    use super::{appended_commitments, height_band};
+    use super::{TreeStateReplayLimit, appended_commitments, height_band};
+    use crate::QueryError;
+
+    const WAIT: Duration = Duration::from_secs(2);
+
+    fn one_slot() -> TreeStateReplayLimit {
+        TreeStateReplayLimit::new(NonZeroU32::MIN, WAIT)
+    }
+
+    fn is_refused<T>(admission: &Result<T, QueryError>) -> bool {
+        matches!(
+            admission,
+            Err(QueryError::TreeStateReplayLimitReached { .. })
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_waiter_takes_a_slot_that_frees_within_the_wait() -> Result<(), Box<dyn Error>> {
+        let limit = one_slot();
+        let held = limit.admit().await?;
+        let waiter = tokio::spawn({
+            let limit = limit.clone();
+            async move { limit.admit().await.map(drop) }
+        });
+        tokio::time::sleep(WAIT / 2).await;
+        drop(held);
+        waiter.await??;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_waiter_is_refused_when_the_wait_ends() -> Result<(), Box<dyn Error>> {
+        let limit = one_slot();
+        let _held = limit.admit().await?;
+        let started_at = tokio::time::Instant::now();
+        assert!(is_refused(&limit.admit().await));
+        assert_eq!(started_at.elapsed(), WAIT);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_past_the_waiting_places_is_refused_at_once() -> Result<(), Box<dyn Error>> {
+        let limit = one_slot();
+        let _held = limit.admit().await?;
+        let waiters = [limit.clone(), limit.clone()]
+            .map(|limit| tokio::spawn(async move { limit.admit().await.map(drop) }));
+        tokio::task::yield_now().await;
+        let started_at = tokio::time::Instant::now();
+        assert!(is_refused(&limit.admit().await));
+        assert_eq!(started_at.elapsed(), Duration::ZERO);
+        for waiter in waiters {
+            assert!(is_refused(&waiter.await?));
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_waiter_gives_up_its_waiting_place() -> Result<(), Box<dyn Error>> {
+        let limit = one_slot();
+        let held = limit.admit().await?;
+        for _ in 0..2 {
+            assert!(tokio::time::timeout(WAIT / 4, limit.admit()).await.is_err());
+        }
+        let waiter = tokio::spawn({
+            let limit = limit.clone();
+            async move { limit.admit().await.map(drop) }
+        });
+        tokio::task::yield_now().await;
+        drop(held);
+        waiter.await??;
+        Ok(())
+    }
+
+    #[test]
+    fn a_wait_is_capped_at_the_longest_the_client_deadline_allows() {
+        let limit = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::from_mins(1));
+        assert_eq!(limit.wait, super::MAX_TREE_STATE_REPLAY_WAIT);
+    }
 
     #[test]
     fn appended_commitments_count_each_pool_growth() {

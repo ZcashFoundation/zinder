@@ -30,6 +30,7 @@ use super::{
     subtree_load::{
         CanonicalSubtreeRootLoadCoverage, decode_subtree_root, encode_subtree_root_key,
     },
+    tree_state_replay::{TreeStateLookup, TreeStateReplay},
 };
 
 const CHAIN_EPOCH_VALUE_BYTES: usize = 93;
@@ -315,6 +316,47 @@ macro_rules! impl_canonical_typed_reads {
                 )
             }
 
+            /// Finds how the tree state at `height` is answered: by the
+            /// checkpoint stored there, or by a reconstruction from the
+            /// newest stored checkpoint below it.
+            ///
+            /// Applies every check of [`Self::tree_state_checkpoint_at`]
+            /// that precedes the replay, with the same errors, and returns
+            /// `Ok(None)` for the same heights. Pass a
+            /// [`TreeStateLookup::Replay`] to [`Self::replay_tree_state`] to
+            /// reconstruct it without reading the seed again.
+            pub fn tree_state_lookup(
+                &self,
+                height: BlockHeight,
+                network_upgrade_activations: &zinder_core::NetworkUpgradeActivations,
+            ) -> Result<Option<TreeStateLookup>, CanonicalStoreError> {
+                super::tree_state_replay::lookup_tree_state(
+                    self,
+                    height,
+                    network_upgrade_activations,
+                )
+            }
+
+            /// Reconstructs the tree state a [`Self::tree_state_lookup`]
+            /// found no checkpoint for, applying every check of
+            /// [`Self::tree_state_checkpoint_at`].
+            ///
+            /// Replays from the seed the lookup read. When this store shows
+            /// another visible chain than the store that issued `replay`, it
+            /// answers exactly as [`Self::tree_state_checkpoint_at`] does for
+            /// [`TreeStateReplay::height`], including `Ok(None)`.
+            pub fn replay_tree_state(
+                &self,
+                replay: &TreeStateReplay,
+                network_upgrade_activations: &zinder_core::NetworkUpgradeActivations,
+            ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
+                super::tree_state_replay::replay_tree_state(
+                    self,
+                    replay,
+                    network_upgrade_activations,
+                )
+            }
+
             /// Reads the contiguous subtree-root rows requested by `range`.
             ///
             /// In a store loaded with retained-range coverage, an absent root
@@ -525,6 +567,37 @@ fn read_compact_blocks_up_to(
         blocks.reverse();
     }
     Ok(blocks)
+}
+
+/// Passes each compact block of `range` to `visit` in ascending height order,
+/// reading rows in multi-get batches of at most
+/// [`BOUNDED_COMPACT_BLOCK_BATCH_SIZE`].
+///
+/// Each block is checked against its canonical header as a range read checks
+/// it, and only one batch of rows is held at a time. A height outside retained
+/// history fails with [`CanonicalStoreError::ArtifactUnavailable`], and a
+/// missing row inside it fails as store damage.
+pub(super) fn visit_compact_blocks_in_range(
+    store: &impl CanonicalServingRead,
+    range: BlockHeightRange,
+    mut visit: impl FnMut(CompactBlockArtifact) -> Result<(), CanonicalStoreError>,
+) -> Result<(), CanonicalStoreError> {
+    let retained_span = retained_compact_block_span(store);
+    let heights = range.into_iter().collect::<Vec<_>>();
+    for batch in heights.chunks(BOUNDED_COMPACT_BLOCK_BATCH_SIZE) {
+        let rows = CompactBlockRows::fetch(store, batch)?;
+        for ((height, compact_row), header_row) in
+            batch.iter().copied().zip(rows.compact).zip(rows.headers)
+        {
+            let encoded_compact_block = present_compact_row(retained_span, height, compact_row)?;
+            visit(decode_compact_block_row(
+                height,
+                &encoded_compact_block,
+                header_row,
+            )?)?;
+        }
+    }
+    Ok(())
 }
 
 /// Rows the next batch of a byte-bounded read fetches.

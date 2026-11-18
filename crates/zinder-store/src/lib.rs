@@ -36,7 +36,7 @@ pub use canonical_store::{
     MAX_CANONICAL_INCREMENTAL_REPLAY_BLOCKS, PreparedCanonicalBaselinePublication,
     ProjectionBuildAnchor, ProjectionBuildLease, ProjectionBuildLeaseId, RocksDbCanonicalBuilder,
     RocksDbCanonicalSecondary, RocksDbCanonicalStore, TREE_STATE_CHECKPOINT_STRIDE,
-    ValidatedRocksDbCanonicalBuild,
+    TreeStateLookup, TreeStateReplay, ValidatedRocksDbCanonicalBuild,
 };
 pub use chain_event::{
     ChainEpochCommitted, ChainEvent, ChainEventEnvelope, ChainEventHistoryRequest,

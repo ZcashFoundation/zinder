@@ -21,6 +21,7 @@ use zinder_store::{
     BlockHashLookup, CanonicalActivationSchedule, CanonicalEventFence, CanonicalStoreError,
     ChainEventEnvelope, ChainEventHistoryRequest, ChainEventStreamFamily, ChainEventStreamResume,
     EventStreamStartPosition, HeightOrder, RawBlobRetention, RocksDbCanonicalSecondary,
+    TreeStateLookup, TreeStateReplay,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletAddressUnspentOutputKey, WalletCanonicalSourceIdentity,
@@ -148,6 +149,35 @@ pub trait CanonicalReader: Send + Sync + 'static {
         height: BlockHeight,
         network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError>;
+
+    /// Finds how the tree state at `height` is answered, as
+    /// [`RocksDbCanonicalSecondary::tree_state_lookup`] does.
+    ///
+    /// The default answers every height through
+    /// [`Self::tree_state_checkpoint_at`] as stored, so a reader that keeps it
+    /// rebuilds inline, outside the query's replay-slot limit.
+    fn tree_state_lookup(
+        &self,
+        height: BlockHeight,
+        network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> Result<Option<TreeStateLookup>, CanonicalStoreError> {
+        self.tree_state_checkpoint_at(height, network_upgrade_activations)
+            .map(|checkpoint| checkpoint.map(TreeStateLookup::Stored))
+    }
+
+    /// Reconstructs the tree state a [`Self::tree_state_lookup`] found no
+    /// checkpoint for, as [`RocksDbCanonicalSecondary::replay_tree_state`]
+    /// does.
+    ///
+    /// The default reads the height through
+    /// [`Self::tree_state_checkpoint_at`].
+    fn replay_tree_state(
+        &self,
+        replay: &TreeStateReplay,
+        network_upgrade_activations: &NetworkUpgradeActivations,
+    ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
+        self.tree_state_checkpoint_at(replay.height(), network_upgrade_activations)
+    }
 
     /// Reads a contiguous range of subtree roots.
     fn subtree_roots(
@@ -394,6 +424,22 @@ macro_rules! impl_canonical_read {
                 network_upgrade_activations: &NetworkUpgradeActivations,
             ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
                 self.tree_state_checkpoint_at(height, network_upgrade_activations)
+            }
+
+            fn tree_state_lookup(
+                &self,
+                height: BlockHeight,
+                network_upgrade_activations: &NetworkUpgradeActivations,
+            ) -> Result<Option<TreeStateLookup>, CanonicalStoreError> {
+                self.tree_state_lookup(height, network_upgrade_activations)
+            }
+
+            fn replay_tree_state(
+                &self,
+                replay: &TreeStateReplay,
+                network_upgrade_activations: &NetworkUpgradeActivations,
+            ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
+                self.replay_tree_state(replay, network_upgrade_activations)
             }
 
             fn subtree_roots(

@@ -64,6 +64,7 @@ pub use node_broadcast::OrderedBroadcaster;
 pub use transparent_unspent_output_stream::{
     TRANSPARENT_UNSPENT_OUTPUT_PAGE_SIZE, TransparentAddressUnspentOutputs,
 };
+pub use tree_state_replay_limit::{DEFAULT_TREE_STATE_REPLAY_WAIT, MAX_TREE_STATE_REPLAY_WAIT};
 pub use wallet_serving_pair::{
     CanonicalReader, WalletProjectionReader, WalletServingAdmissionError, WalletServingReadPair,
 };
@@ -298,8 +299,8 @@ pub trait WalletQueryApi: Send + Sync + 'static {
     ///
     /// A height above the visible tip or below retained history fails with
     /// [`QueryError::BlockNotInBestChain`]. A rebuild requested while the
-    /// query already runs its limit of them fails with
-    /// [`QueryError::TreeStateReplayLimitReached`].
+    /// query already runs its limit of them waits a bounded time for a slot
+    /// and then fails with [`QueryError::TreeStateReplayLimitReached`].
     async fn tree_state_at(
         &self,
         height: BlockHeight,
@@ -998,7 +999,8 @@ pub enum QueryError {
     },
 
     /// A tree state at a height without a stored checkpoint needs a
-    /// reconstruction, and the query already runs its limit of them.
+    /// reconstruction, the query already runs its limit of them, and no slot
+    /// freed within the wait.
     #[error(
         "tree-state reconstruction limit reached: this server already reconstructs {max_concurrent_replays} tree states at once"
     )]

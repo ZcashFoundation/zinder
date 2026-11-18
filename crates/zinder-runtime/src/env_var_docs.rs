@@ -1097,6 +1097,16 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       and wallet secondary pair. Must be in 1..=64; defaults to 12.",
     },
     EnvVarDoc {
+        name: "ZINDER_QUERY__TREE_STATE_REPLAY_WAIT_MS",
+        toml_path: "query.tree_state_replay_wait_ms",
+        used_by: &["zinder-query"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Milliseconds a tree-state rebuild waits for a rebuild slot before it is \
+                      refused with `TREE_STATE_REPLAY_LIMIT_REACHED`. Must be in 0..=5000; 0 \
+                      refuses at once; defaults to 2000.",
+    },
+    EnvVarDoc {
         name: "ZINDER_COMPAT__LISTEN_ADDR",
         toml_path: "compat.listen_addr",
         used_by: &["zinder-compat-lightwalletd"],
@@ -1873,6 +1883,7 @@ mod tests {
                 "ZINDER_QUERY__LISTEN_ADDR",
                 "ZINDER_QUERY__REORG_WINDOW_BLOCKS",
                 "ZINDER_QUERY__PAIR_CONVERGENCE_ATTEMPTS",
+                "ZINDER_QUERY__TREE_STATE_REPLAY_WAIT_MS",
             ]
         );
         let compat_specific = ENVIRONMENT_VARIABLES

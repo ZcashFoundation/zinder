@@ -325,6 +325,24 @@ impl CanonicalReader for GatedCanonicalReader {
             .tree_state_checkpoint_at(height, network_upgrade_activations)
     }
 
+    fn tree_state_lookup(
+        &self,
+        height: BlockHeight,
+        network_upgrade_activations: &zinder_core::NetworkUpgradeActivations,
+    ) -> Result<Option<zinder_store::TreeStateLookup>, CanonicalStoreError> {
+        self.canonical_reader
+            .tree_state_lookup(height, network_upgrade_activations)
+    }
+
+    fn replay_tree_state(
+        &self,
+        replay: &zinder_store::TreeStateReplay,
+        network_upgrade_activations: &zinder_core::NetworkUpgradeActivations,
+    ) -> Result<Option<CommitmentTreeCheckpoint>, CanonicalStoreError> {
+        self.canonical_reader
+            .replay_tree_state(replay, network_upgrade_activations)
+    }
+
     fn subtree_roots(
         &self,
         range: SubtreeRootRange,

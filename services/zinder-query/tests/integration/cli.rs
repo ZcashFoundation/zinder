@@ -204,3 +204,41 @@ fn public_bind_requires_an_explicit_security_opt_in() -> eyre::Result<()> {
     assert!(String::from_utf8_lossy(&output.stderr).contains("public"));
     Ok(())
 }
+
+/// The tree-state rebuild wait defaults to two seconds, follows its
+/// environment variable, and refuses a wait the client deadline cannot hold.
+#[test]
+fn tree_state_replay_wait_defaults_to_two_seconds_and_is_bounded() -> eyre::Result<()> {
+    let temporary = TempDir::new()?;
+    let secondary = temporary.path().join("canonical-secondary");
+    let rendered = |wait_ms: Option<&str>| -> eyre::Result<std::process::Output> {
+        let mut command = query_command(&temporary, &secondary);
+        command.env_remove("ZINDER_QUERY__TREE_STATE_REPLAY_WAIT_MS");
+        if let Some(wait_ms) = wait_ms {
+            command.env("ZINDER_QUERY__TREE_STATE_REPLAY_WAIT_MS", wait_ms);
+        }
+        Ok(command.output()?)
+    };
+
+    for (configured, expected) in [(None, "2000"), (Some("0"), "0"), (Some("5000"), "5000")] {
+        let output = rendered(configured)?;
+        assert!(
+            output.status.success(),
+            "print-config failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout)?;
+        assert!(
+            stdout.contains(&format!("tree_state_replay_wait_ms = {expected}")),
+            "{stdout}"
+        );
+    }
+    let too_long = rendered(Some("5001"))?;
+    assert!(!too_long.status.success(), "{too_long:?}");
+    let stderr = String::from_utf8(too_long.stderr)?;
+    assert!(
+        stderr.contains("query.tree_state_replay_wait_ms must not exceed 5000"),
+        "{stderr}"
+    );
+    Ok(())
+}

@@ -223,7 +223,8 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
         pair_slot.clone(),
         ingest_control.clone(),
     )
-    .with_node_broadcast(node_broadcast.clone());
+    .with_node_broadcast(node_broadcast.clone())
+    .with_tree_state_replay_wait(query_config.tree_state_replay_wait);
     let endpoint_metadata = WalletEndpointMetadata {
         network: encode_zinder_native_chain_name(query_config.network).to_owned(),
         service_version: env!("CARGO_PKG_VERSION").to_owned(),

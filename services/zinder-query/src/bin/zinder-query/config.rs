@@ -4,11 +4,13 @@ use std::{
     net::SocketAddr,
     num::NonZeroU8,
     path::{Component, Path, PathBuf},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_core::Network;
+use zinder_query::{DEFAULT_TREE_STATE_REPLAY_WAIT, MAX_TREE_STATE_REPLAY_WAIT};
 use zinder_runtime::{
     BearerToken, BearerTokenError, CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml,
     ConfigError, ConfigLoader, IngestControlReaderToml, IngestControlSection, NetworkSection,
@@ -38,6 +40,8 @@ pub(super) struct QueryConfig {
     pub(super) allow_public_bind: bool,
     pub(super) canonical_reorg_policy: CanonicalReorgPolicy,
     pub(super) pair_convergence_attempts: NonZeroU8,
+    /// Longest a tree-state rebuild waits for a rebuild slot.
+    pub(super) tree_state_replay_wait: Duration,
     /// First node endpoint transaction broadcast tries, or `None` for a
     /// storage-only query.
     pub(super) node: Option<NodeTarget>,
@@ -162,6 +166,7 @@ struct QuerySection {
     listen_addr: Option<String>,
     reorg_window_blocks: Option<u32>,
     pair_convergence_attempts: Option<u8>,
+    tree_state_replay_wait_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -205,6 +210,8 @@ fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConf
     )?)?;
     let pair_convergence_attempts =
         require_pair_convergence_attempts(config.query.pair_convergence_attempts)?;
+    let tree_state_replay_wait =
+        require_tree_state_replay_wait(config.query.tree_state_replay_wait_ms)?;
     let node = config
         .node
         .map(|section| NodeTarget::resolve(network, section))
@@ -229,6 +236,7 @@ fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConf
         allow_public_bind,
         canonical_reorg_policy,
         pair_convergence_attempts,
+        tree_state_replay_wait,
         node,
         node_fallbacks,
     })
@@ -248,6 +256,20 @@ fn require_pair_convergence_attempts(configured: Option<u8>) -> Result<NonZeroU8
         )));
     }
     Ok(attempts)
+}
+
+fn require_tree_state_replay_wait(configured_ms: Option<u64>) -> Result<Duration, ConfigError> {
+    let Some(configured_ms) = configured_ms else {
+        return Ok(DEFAULT_TREE_STATE_REPLAY_WAIT);
+    };
+    let wait = Duration::from_millis(configured_ms);
+    if wait > MAX_TREE_STATE_REPLAY_WAIT {
+        return Err(ConfigError::invalid(format!(
+            "query.tree_state_replay_wait_ms must not exceed {}",
+            MAX_TREE_STATE_REPLAY_WAIT.as_millis()
+        )));
+    }
+    Ok(wait)
 }
 
 fn require_distinct_storage_paths(
@@ -342,6 +364,8 @@ impl QueryConfigToml {
                 listen_addr: config.listen_addr.to_string(),
                 reorg_window_blocks: config.canonical_reorg_policy.reorg_window_blocks(),
                 pair_convergence_attempts: config.pair_convergence_attempts.get(),
+                tree_state_replay_wait_ms: u64::try_from(config.tree_state_replay_wait.as_millis())
+                    .unwrap_or(u64::MAX),
             },
             node: config.node.as_ref().map(NodeToml::from_node_target),
             node_fallbacks: NodeFallbacksToml::from_node_targets(&config.node_fallbacks),
@@ -354,6 +378,7 @@ struct QueryToml {
     listen_addr: String,
     reorg_window_blocks: u32,
     pair_convergence_attempts: u8,
+    tree_state_replay_wait_ms: u64,
 }
 
 #[derive(Serialize)]

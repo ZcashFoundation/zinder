@@ -30,7 +30,7 @@ use zinder_source::TransactionBroadcaster;
 use zinder_store::{
     ArtifactFamily, BlockHashLookup, ChainEventHistoryRequest, ChainEventStreamFamily,
     ChainEventStreamResume, EventStreamStartPosition, HeightOrder, RawBlobRetention,
-    StreamCursorTokenV1,
+    StreamCursorTokenV1, TreeStateLookup,
 };
 use zinder_wallet_projection::{
     WalletAddressTransactionKey, WalletCanonicalSourceIdentity, WalletProjectionSourcePosition,
@@ -50,7 +50,8 @@ use crate::{
     node_broadcast::EndpointVerifications,
     serving_read,
     tree_state_replay_limit::{
-        TreeStateReplayLimit, record_replay_duration, record_tree_state_read,
+        DEFAULT_TREE_STATE_REPLAY_WAIT, TreeStateReplayLimit, record_replay_duration,
+        record_tree_state_read,
     },
     validate_block_range, validate_subtree_root_range,
 };
@@ -392,8 +393,10 @@ mod tests {
 ///
 /// A tree state at a height without a stored checkpoint is reconstructed from
 /// stored compact blocks. The query and its clones run at most one such
-/// reconstruction per available CPU at once and refuse the rest with
-/// [`QueryError::TreeStateReplayLimitReached`].
+/// reconstruction per available CPU at once. A reconstruction that finds
+/// every slot taken waits for one, by default up to
+/// [`DEFAULT_TREE_STATE_REPLAY_WAIT`](crate::DEFAULT_TREE_STATE_REPLAY_WAIT),
+/// and is then refused with [`QueryError::TreeStateReplayLimitReached`].
 #[derive(Clone)]
 pub struct WalletServingQuery<Broadcaster, NativeIngest = ()> {
     serving_pair_slot: WalletServingPairSlot,
@@ -439,7 +442,9 @@ impl WalletServingQuery<()> {
             serving_pair_slot,
             broadcaster: (),
             native_ingest: (),
-            tree_state_replays: TreeStateReplayLimit::for_available_parallelism(),
+            tree_state_replays: TreeStateReplayLimit::for_available_parallelism(
+                DEFAULT_TREE_STATE_REPLAY_WAIT,
+            ),
             broadcast_bytes: BroadcastByteBudget::process(),
             node_verifications: None,
         }
@@ -469,7 +474,9 @@ impl WalletServingQuery<(), AdmittedIngestControl> {
             serving_pair_slot,
             broadcaster: (),
             native_ingest: ingest_control,
-            tree_state_replays: TreeStateReplayLimit::for_available_parallelism(),
+            tree_state_replays: TreeStateReplayLimit::for_available_parallelism(
+                DEFAULT_TREE_STATE_REPLAY_WAIT,
+            ),
             broadcast_bytes: BroadcastByteBudget::process(),
             node_verifications: None,
         }
@@ -516,6 +523,22 @@ impl<NativeIngest> WalletServingQuery<(), NativeIngest> {
 }
 
 impl<Broadcaster, NativeIngest> WalletServingQuery<Broadcaster, NativeIngest> {
+    /// Lets a tree-state reconstruction that finds every replay slot taken
+    /// wait up to `wait` for one before it is refused.
+    ///
+    /// The wait is capped at
+    /// [`MAX_TREE_STATE_REPLAY_WAIT`](crate::MAX_TREE_STATE_REPLAY_WAIT),
+    /// because the reconstruction that follows it must still fit the client's
+    /// deadline. `Duration::ZERO` refuses at once. The query and every clone
+    /// made after this call share the new wait and the existing slots.
+    #[must_use]
+    pub fn with_tree_state_replay_wait(self, wait: std::time::Duration) -> Self {
+        Self {
+            tree_state_replays: self.tree_state_replays.with_wait(wait),
+            ..self
+        }
+    }
+
     fn capture_pair(&self) -> Arc<WalletServingReadPair> {
         self.serving_pair_slot.capture()
     }
@@ -1061,57 +1084,55 @@ where
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError> {
         serving_read::record("tree_state_at", None, async {
-            let (pair, lookup_epoch, nearest) =
+            let (lookup_epoch, lookup) =
                 serving_read::read_at(self.pin(at_epoch_id), move |pair| {
                     let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
                     if height > chain_epoch.visible_tip_height {
                         return Err(QueryError::BlockNotInBestChain);
                     }
-                    let nearest = pair
+                    let lookup = pair
                         .canonical()
-                        .tree_state_checkpoint_at_or_before(height)?;
-                    Ok((pair, chain_epoch, nearest))
+                        .tree_state_lookup(height, pair.network_upgrade_activations())?
+                        .ok_or(QueryError::BlockNotInBestChain)?;
+                    Ok((chain_epoch, lookup))
                 })
                 .await?;
-            if let Some(stored) = nearest
-                .as_ref()
-                .filter(|seed| seed.block_id.height == height)
-            {
-                let tree_state = tree_state_from_checkpoint(lookup_epoch, stored)?;
-                let trees = stored.tip_metadata();
-                record_tree_state_read(height, 0, trees, trees);
-                return Ok(tree_state);
-            }
-            // Without a seed the canonical reader replays nothing: it answers
-            // a height below the history predecessor as absent and a missing
-            // seed as store damage, so only a seeded read takes a slot. The
-            // blocking read holds the slot, so a cancelled request frees it
-            // only when its replay ends.
-            let replay_slot = nearest
-                .as_ref()
-                .map(|_| self.tree_state_replays.try_admit().map(Arc::new))
-                .transpose()?;
+            let replay = match lookup {
+                TreeStateLookup::Stored(stored) => {
+                    let tree_state = tree_state_from_checkpoint(lookup_epoch, &stored)?;
+                    let trees = stored.tip_metadata();
+                    record_tree_state_read(height, 0, trees, trees);
+                    return Ok(tree_state);
+                }
+                TreeStateLookup::Replay(replay) => replay,
+            };
+            // The slot is taken on the async side, so a request cancelled
+            // while it waits gives up its place, and no pair is held while it
+            // waits. Once taken, the blocking replay holds it, so a cancelled
+            // request frees it only when its replay ends. The replay captures
+            // the pair again; one showing a newer chain reads its own seed.
+            let replay_slot = Arc::new(self.tree_state_replays.admit().await?);
+            let seed_trees = replay.seed().tip_metadata();
+            let replayed_blocks = replay.replayed_blocks();
             let (chain_epoch, checkpoint, replay_duration) =
-                serving_read::read_pair(&self.serving_pair_slot, pair, at_epoch_id, move |pair| {
+                serving_read::read_at(self.pin(at_epoch_id), move |pair| {
                     let _replay_slot = replay_slot;
                     let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
                     let started_at = Instant::now();
                     let checkpoint = pair
                         .canonical()
-                        .tree_state_checkpoint_at(height, pair.network_upgrade_activations())?
+                        .replay_tree_state(&replay, pair.network_upgrade_activations())?
                         .ok_or(QueryError::BlockNotInBestChain)?;
                     Ok((chain_epoch, checkpoint, started_at.elapsed()))
                 })
                 .await?;
-            if let Some(seed) = nearest {
-                record_replay_duration(height, replay_duration);
-                record_tree_state_read(
-                    height,
-                    height.value().saturating_sub(seed.block_id.height.value()),
-                    seed.tip_metadata(),
-                    checkpoint.tip_metadata(),
-                );
-            }
+            record_replay_duration(height, replay_duration);
+            record_tree_state_read(
+                height,
+                replayed_blocks,
+                seed_trees,
+                checkpoint.tip_metadata(),
+            );
             tree_state_from_checkpoint(chain_epoch, &checkpoint)
         })
         .await
@@ -1599,7 +1620,7 @@ mod full_block_range_tests {
 
 #[cfg(test)]
 mod tree_state_replay_limit_tests {
-    use std::{error::Error, num::NonZeroU32, sync::Arc};
+    use std::{error::Error, num::NonZeroU32, sync::Arc, time::Duration};
 
     use metrics_exporter_prometheus::PrometheusBuilder;
 
@@ -1628,11 +1649,11 @@ mod tree_state_replay_limit_tests {
         )?);
         let mut query =
             WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(pair));
-        query.tree_state_replays = TreeStateReplayLimit::new(NonZeroU32::MIN);
+        query.tree_state_replays = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::ZERO);
         let reconstructed = BlockHeight::new(2);
         let checkpointed_tip = BlockHeight::new(3);
 
-        let held_slot = query.tree_state_replays.try_admit()?;
+        let held_slot = query.tree_state_replays.admit().await?;
         assert!(matches!(
             query.tree_state_at(reconstructed, None).await,
             Err(QueryError::TreeStateReplayLimitReached {
@@ -1649,6 +1670,41 @@ mod tree_state_replay_limit_tests {
             query.tree_state_at(reconstructed, None).await?.height,
             reconstructed
         );
+        Ok(())
+    }
+
+    /// A reconstruction that finds the only slot taken waits for it and is
+    /// served once the slot frees within the wait.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reconstruction_waits_for_a_slot_that_frees_within_the_wait()
+    -> Result<(), Box<dyn Error>> {
+        let activations = sample_regtest_upgrade_activations();
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+        let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+        let (canonical, wallet) = store.take_readers()?;
+        let pair = Arc::new(WalletServingReadPair::new(
+            Arc::new(canonical),
+            Arc::new(wallet),
+        )?);
+        let mut query =
+            WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(pair));
+        query.tree_state_replays = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::ZERO);
+        let query = query.with_tree_state_replay_wait(Duration::from_secs(5));
+        let reconstructed = BlockHeight::new(2);
+
+        let held_slot = query.tree_state_replays.admit().await?;
+        let waiting = tokio::spawn({
+            let query = query.clone();
+            async move { query.tree_state_at(reconstructed, None).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !waiting.is_finished(),
+            "the request did not wait for the slot"
+        );
+        drop(held_slot);
+
+        assert_eq!(waiting.await??.height, reconstructed);
         Ok(())
     }
 
@@ -1670,11 +1726,11 @@ mod tree_state_replay_limit_tests {
         )?);
         let mut query =
             WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(pair));
-        query.tree_state_replays = TreeStateReplayLimit::new(NonZeroU32::MIN);
+        query.tree_state_replays = TreeStateReplayLimit::new(NonZeroU32::MIN, Duration::ZERO);
 
         query.tree_state_at(BlockHeight::new(3), None).await?;
         query.tree_state_at(BlockHeight::new(2), None).await?;
-        let held_slot = query.tree_state_replays.try_admit()?;
+        let held_slot = query.tree_state_replays.admit().await?;
         assert!(
             query
                 .tree_state_at(BlockHeight::new(2), None)
@@ -1694,7 +1750,7 @@ mod tree_state_replay_limit_tests {
             "zinder_query_tree_state_replay_duration_seconds_count{height_band=\"0\"} 1",
             "zinder_query_tree_state_replay_wait_duration_seconds_count 3",
             "zinder_query_tree_state_replay_admissions_total 2",
-            "zinder_query_tree_state_replay_refusals_total 1",
+            "zinder_query_tree_state_replay_refusals_total{reason=\"wait_expired\"} 1",
         ] {
             assert!(
                 rendered.lines().any(|line| line == expected),

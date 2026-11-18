@@ -272,7 +272,7 @@ broadcast, so it exports none of those series.
 | `zinder_query_tree_state_replayed_blocks` | histogram | `height_band` | Blocks replayed to answer each served tree-state read, from 0 to 99. A stored checkpoint records 0. |
 | `zinder_query_tree_state_replayed_commitments` | histogram | `pool`, `height_band` | Note commitments appended to each pool (`sapling`, `orchard`, `ironwood`) to answer each served tree-state read. A stored checkpoint records 0. |
 | `zinder_query_tree_state_replay_admissions_total` | counter | | Tree-state rebuilds that took a rebuild slot. |
-| `zinder_query_tree_state_replay_refusals_total` | counter | | Tree-state reads refused because one rebuild per CPU was already running. |
+| `zinder_query_tree_state_replay_refusals_total` | counter | `reason` | Tree-state reads refused a rebuild slot: `wait_expired` when no slot freed within the wait, `waiters_full` when every waiting place was taken. |
 | `zinder_query_tree_state_replay_wait_duration_seconds` | histogram | | Time each admitted or refused rebuild waited for a rebuild slot. |
 | `zinder_query_tree_state_replay_duration_seconds` | histogram | `height_band` | Time each completed rebuild spent reading and replaying compact blocks. |
 | `zinder_query_broadcast_budget_refusals_total` | counter | | Broadcasts refused because 16 MiB of transactions were already in flight. |

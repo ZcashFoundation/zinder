@@ -153,7 +153,7 @@ data may be corrupt.
 
 | Reason | Meaning |
 | --- | --- |
-| `TREE_STATE_REPLAY_LIMIT_REACHED` | `TreeStateAtHeight` named a height without a stored checkpoint while the server was already rebuilding one tree state per CPU. A height with a stored checkpoint is never refused this way. |
+| `TREE_STATE_REPLAY_LIMIT_REACHED` | `TreeStateAtHeight` named a height without a stored checkpoint while the server was already rebuilding one tree state per CPU, and no rebuild slot freed within the configured wait. A height with a stored checkpoint is never refused this way. |
 
 ### `UNAVAILABLE`
 
