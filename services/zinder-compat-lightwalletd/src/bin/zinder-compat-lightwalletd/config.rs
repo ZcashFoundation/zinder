@@ -234,14 +234,6 @@ fn resolve_lightwalletd_config(
         )
         .into());
     }
-    if matches!(serving, CompatServing::CompactBlocks)
-        && (config.node.is_some() || !config.node_fallbacks.is_empty())
-    {
-        return Err(ConfigError::invalid(
-            "compat.serving = \"compact-blocks\" does not accept node settings, because compact-block serving never contacts a node; remove the node and node_fallbacks sections and every ZINDER_NODE__* and ZINDER_NODE_FALLBACKS__* variable, or select compat.serving = \"wallet\"",
-        )
-        .into());
-    }
     let wallet = wallet.unwrap_or_default();
     let network = config.network.resolve()?;
     let storage = resolve_canonical_secondary_storage(config.storage)?;
@@ -286,11 +278,8 @@ fn resolve_lightwalletd_config(
     )?;
     guard_serving_bind("compat.listen_addr", listen_addr, allow_public_bind)?;
     guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
-    let broadcaster = resolve_broadcaster(network, config.node)?;
-    let node_fallbacks =
-        NodeTarget::resolve_fallbacks(network, config.node_fallbacks).map_err(ConfigError::from)?;
-    NodeTarget::require_primary_for_fallbacks(broadcaster.as_ref(), &node_fallbacks)
-        .map_err(ConfigError::from)?;
+    let (broadcaster, node_fallbacks) =
+        resolve_node_list(serving, network, config.node, config.node_fallbacks)?;
 
     Ok(LightwalletdConfig {
         network,
@@ -313,16 +302,31 @@ fn resolve_lightwalletd_config(
     })
 }
 
-/// Resolves the wallet-mode broadcast node. Any node setting asks for
-/// broadcast, so a section without `node.json_rpc_addr` is an error rather
-/// than a compatibility process without `SendTransaction`.
-fn resolve_broadcaster(
+/// Resolves the wallet-mode broadcast node and its fallbacks.
+///
+/// Any node setting asks for broadcast, so a section without
+/// `node.json_rpc_addr` is an error rather than a compatibility process
+/// without `SendTransaction`. Compact-block serving never contacts a node and
+/// rejects every node setting.
+fn resolve_node_list(
+    serving: CompatServing,
     network: Network,
     node: Option<NodeSection>,
-) -> Result<Option<NodeTarget>, ConfigError> {
-    node.map(|section| NodeTarget::resolve(network, section))
-        .transpose()
-        .map_err(ConfigError::from)
+    node_fallbacks: NodeFallbackSections,
+) -> Result<(Option<NodeTarget>, Vec<NodeTarget>), ConfigError> {
+    if matches!(serving, CompatServing::CompactBlocks)
+        && (node.is_some() || !node_fallbacks.is_empty())
+    {
+        return Err(ConfigError::invalid(
+            "compat.serving = \"compact-blocks\" does not accept node settings, because compact-block serving never contacts a node; remove the node and node_fallbacks sections and every ZINDER_NODE__* and ZINDER_NODE_FALLBACKS__* variable, or select compat.serving = \"wallet\"",
+        ));
+    }
+    let broadcaster = node
+        .map(|section| NodeTarget::resolve(network, section))
+        .transpose()?;
+    let node_fallbacks = NodeTarget::resolve_fallbacks(network, node_fallbacks)?;
+    NodeTarget::require_primary_for_fallbacks(broadcaster.as_ref(), &node_fallbacks)?;
+    Ok((broadcaster, node_fallbacks))
 }
 
 #[derive(Serialize)]

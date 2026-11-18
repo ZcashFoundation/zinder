@@ -111,45 +111,45 @@ fn compact_blocks_print_config_omits_wallet_configuration() -> eyre::Result<()> 
     Ok(())
 }
 
-/// The shared node list in the environment does not stop compact-blocks
-/// serving, which reads no node; a list without `[node]` is still refused.
+/// Wallet-mode compatibility reads the shared node list, so its fallback
+/// tables print redacted, and a list without `[node]` is refused.
 #[test]
-fn compact_blocks_serving_starts_unchanged_when_the_environment_carries_node_fallbacks()
--> eyre::Result<()> {
+fn wallet_serving_accepts_node_fallbacks_only_with_a_primary_node() -> eyre::Result<()> {
     let temporary = tempdir()?;
-    let storage_path = temporary.path().join("compact-blocks-store");
-    let secondary_path = temporary.path().join("compact-blocks-secondary");
-    let config_path = temporary.path().join("compact-blocks.toml");
+    let config_path = temporary.path().join("compat-wallet.toml");
     fs::write(
         &config_path,
-        compact_blocks_config_toml(&storage_path, &secondary_path)?,
+        compat_config_toml(
+            &temporary.path().join("compat-store"),
+            &temporary.path().join("compat-secondary"),
+            &temporary.path().join("compat-wallet"),
+        )?,
     )?;
+    let with_fallback = |command: &mut Command| {
+        command
+            .args(["--print-config", "--config"])
+            .arg(&config_path)
+            .env(
+                "ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR",
+                "http://127.0.0.1:28232",
+            )
+            .env("ZINDER_NODE_FALLBACKS__1__AUTH__METHOD", "cookie")
+            .env("ZINDER_NODE_FALLBACKS__1__AUTH__COOKIE", "zakura:secret")
+            .output()
+    };
 
-    let output = zinder_compat_command()
-        .args(["--print-config", "--config", path_str(&config_path)?])
-        .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:18232")
-        .env(
-            "ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR",
-            "http://127.0.0.1:28232",
-        )
-        .env("ZINDER_NODE_FALLBACKS__1__AUTH__METHOD", "cookie")
-        .env("ZINDER_NODE_FALLBACKS__1__AUTH__COOKIE", "zakura:secret")
-        .output()?;
-
+    let output = with_fallback(
+        zinder_compat_command().env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:18232"),
+    )?;
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("[node_fallbacks.1]"), "{stdout}");
     assert!(!stdout.contains("zakura:secret"), "{stdout}");
 
-    let without_primary = zinder_compat_command()
-        .args(["--print-config", "--config", path_str(&config_path)?])
-        .env(
-            "ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR",
-            "http://127.0.0.1:28232",
-        )
-        .output()?;
-    assert!(!without_primary.status.success());
-    assert!(String::from_utf8(without_primary.stderr)?.contains("requires [node]"));
+    let without_primary = with_fallback(&mut zinder_compat_command())?;
+    assert!(!without_primary.status.success(), "{without_primary:?}");
+    let stderr = String::from_utf8(without_primary.stderr)?;
+    assert!(stderr.contains("requires [node]"), "{stderr}");
     Ok(())
 }
 
@@ -209,7 +209,8 @@ fn compact_blocks_rejects_explicit_wallet_configuration() -> eyre::Result<()> {
 }
 
 /// Compact-block serving never contacts a node, so a node setting from the
-/// file, the command line, or the environment is a configuration error.
+/// file, the command line, or the environment, fallback endpoints included,
+/// is a configuration error.
 #[test]
 fn compact_blocks_rejects_node_configuration() -> eyre::Result<()> {
     let temporary = tempdir()?;
@@ -240,8 +241,15 @@ fn compact_blocks_rejects_node_configuration() -> eyre::Result<()> {
         .args(["--print-config", "--config", path_str(&config_path)?])
         .env("ZINDER_NODE__AUTH__METHOD", "cookie")
         .output()?;
+    let from_fallbacks = zinder_compat_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .env(
+            "ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR",
+            "http://127.0.0.1:28232",
+        )
+        .output()?;
 
-    for output in [from_file, from_cli, from_environment] {
+    for output in [from_file, from_cli, from_environment, from_fallbacks] {
         assert!(!output.status.success(), "{output:?}");
         let stderr = String::from_utf8(output.stderr)?;
         assert!(stderr.contains("does not accept node settings"), "{stderr}");
