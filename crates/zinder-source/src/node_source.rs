@@ -342,6 +342,18 @@ where
     Source: NodeSource + ?Sized,
 {
     let activations = Arc::new(source.fetch_network_upgrade_activations().await?);
+    record_network_upgrade_activations_discovered(&activations, service);
+    Ok(activations)
+}
+
+/// Emits the discovery event of [`discover_network_upgrade_activations`].
+///
+/// It is for a table the caller already read from the node, such as the one
+/// ingest's endpoint admission validated.
+pub fn record_network_upgrade_activations_discovered(
+    activations: &NetworkUpgradeActivations,
+    service: &'static str,
+) {
     tracing::info!(
         target: "zinder::source",
         event = "network_upgrade_activations_discovered",
@@ -350,7 +362,6 @@ where
         advertised = activations.activations().len(),
         "discovered network upgrade activations from running node"
     );
-    Ok(activations)
 }
 
 fn bounded_segment_end_height(

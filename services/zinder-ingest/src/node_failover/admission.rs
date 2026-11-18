@@ -1,6 +1,6 @@
 //! Startup admission of every endpoint in the ordered node list.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use futures_util::{StreamExt as _, stream::FuturesUnordered};
 use thiserror::Error;
@@ -213,6 +213,7 @@ pub fn missing_required_capability(capabilities: NodeCapabilities) -> Option<Nod
 #[derive(Debug)]
 pub struct NodeEndpointAdmissions {
     active_position: usize,
+    active_activations: Arc<NetworkUpgradeActivations>,
     genesis_hash: BlockHash,
     verdicts: Vec<EndpointAdmission>,
 }
@@ -289,18 +290,19 @@ impl NodeEndpointAdmissions {
             return Err(NoNodeEndpointAdmitted { verdicts });
         };
         let active_activations = match verdicts.get(active_position) {
-            Some(EndpointAdmission::Admitted(admitted)) => admitted.activations.clone(),
+            Some(EndpointAdmission::Admitted(admitted)) => Arc::new(admitted.activations.clone()),
             _ => return Err(NoNodeEndpointAdmitted { verdicts }),
         };
         for verdict in &mut verdicts {
             if let EndpointAdmission::Admitted(admitted) = verdict
-                && admitted.activations != active_activations
+                && admitted.activations != *active_activations
             {
                 *verdict = EndpointAdmission::Excluded(EndpointExclusion::ScheduleConflict);
             }
         }
         Ok(Self {
             active_position,
+            active_activations,
             genesis_hash,
             verdicts,
         })
@@ -310,6 +312,16 @@ impl NodeEndpointAdmissions {
     #[must_use]
     pub const fn active_position(&self) -> usize {
         self.active_position
+    }
+
+    /// Activation table the active endpoint advertised during admission.
+    ///
+    /// Admission compared this table with the store's, so the writer opens
+    /// the store with it instead of reading the table again: a later read
+    /// could return a table no check has seen.
+    #[must_use]
+    pub fn active_activations(&self) -> Arc<NetworkUpgradeActivations> {
+        Arc::clone(&self.active_activations)
     }
 
     /// The endpoint ingest reads from first.

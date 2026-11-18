@@ -67,6 +67,8 @@ struct FailoverEndpoint {
     chain: RecordingParseableSource,
     capabilities: NodeCapabilities,
     activations: NetworkUpgradeActivations,
+    /// Replaces `activations` in every later answer once set.
+    advertised_activations: Arc<Mutex<Option<NetworkUpgradeActivations>>>,
     genesis_hash: BlockHash,
     storage_mode: Arc<Mutex<Result<NodeStorageMode, &'static str>>>,
     fault: Arc<Mutex<Fault>>,
@@ -98,6 +100,7 @@ impl FailoverEndpoint {
                     .chain([NodeCapability::ChainValuePools]),
             )?,
             activations,
+            advertised_activations: Arc::new(Mutex::new(None)),
             genesis_hash: Network::ZcashRegtest.genesis_hash(),
             storage_mode: Arc::new(Mutex::new(Ok(NodeStorageMode::Archive))),
             fault: Arc::new(Mutex::new(Fault::None)),
@@ -157,7 +160,11 @@ impl NodeSource for FailoverEndpoint {
         &self,
     ) -> Result<NetworkUpgradeActivations, SourceError> {
         self.answer().await?;
-        Ok(self.activations.clone())
+        Ok(self
+            .advertised_activations
+            .lock()
+            .clone()
+            .unwrap_or_else(|| self.activations.clone()))
     }
 
     async fn fetch_storage_mode(&self) -> Result<NodeStorageMode, SourceError> {
@@ -901,6 +908,41 @@ async fn startup_refuses_a_fallback_that_would_admit_the_first_schedule_revision
     )
     .await?;
     assert_eq!(admissions.active_position(), 2);
+    Ok(())
+}
+
+/// Admission keeps the table it compared with the store, so a fallback that
+/// changes its table after admission never hands the writer an unchecked one.
+#[tokio::test]
+async fn admission_keeps_the_table_it_checked_after_the_endpoint_changes_it() -> TestResult {
+    let PublishedStore {
+        blocks,
+        store,
+        _directory: directory,
+    } = published_store().await?;
+    drop(store);
+    let store_summary = read_ready_store_summary(&directory.path().join("canonical"))?
+        .ok_or("the store is READY")?;
+    let construction_table = sample_regtest_upgrade_activations();
+    let primary = FailoverEndpoint::serving(&blocks, 4)?;
+    primary.set_unreachable(true);
+    let fallback = FailoverEndpoint::serving(&blocks, 4)?;
+    let changing_fallback = fallback.clone();
+    let (nodes, _switch) = NodeSet::new(primary, [fallback]);
+
+    let admissions =
+        NodeEndpointAdmissions::admit(&nodes, Network::ZcashRegtest, Some(&store_summary)).await?;
+    let appended_table = with_future_upgrade(&construction_table)?;
+    *changing_fallback.advertised_activations.lock() = Some(appended_table.clone());
+
+    assert_eq!(admissions.active_position(), 1);
+    assert_eq!(
+        changing_fallback
+            .fetch_network_upgrade_activations()
+            .await?,
+        appended_table
+    );
+    assert_eq!(*admissions.active_activations(), construction_table);
     Ok(())
 }
 

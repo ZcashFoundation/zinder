@@ -270,17 +270,13 @@ async fn run_ingest(
     let (nodes, node_switch) = connect_node_set(&command_config.runtime_config)?;
     connect_node_phase.complete();
     let check_schema_phase = StartupPhase::CheckSchema.start();
-    let node_failover = admit_node_endpoints(
+    let (network_upgrade_activations, node_failover) = admit_node_endpoints(
         &command_config,
         nodes.clone(),
         node_switch,
         &writer_readiness,
     )
     .await?;
-    let network_upgrade_activations =
-        zinder_source::discover_network_upgrade_activations(&nodes, "zinder-ingest")
-            .await
-            .map_err(IngestError::from)?;
     check_schema_phase.complete();
     let (node_failover, node_endpoint_monitor) = node_failover.unzip();
 
@@ -1258,21 +1254,30 @@ fn connect_node_set(
         .map_err(IngestConfigError::from)
 }
 
-/// Admits the endpoint ingest reads from first.
+/// Endpoint failover handles, present only with `[node_fallbacks.N]`.
+type AdmittedNodeFailover = Option<(NodeFailover, NodeEndpointMonitor<ZebraJsonRpcSource>)>;
+
+/// Admits the endpoint ingest reads from first and returns the activation
+/// table the writer opens the store with.
 ///
 /// Without `[node_fallbacks.N]`, `[node]` is checked as it always was. With
 /// them, every endpoint is checked, its genesis block included, and the first
 /// admitted endpoint in position order becomes active; the returned failover
-/// switches between them while ingest follows the chain.
+/// switches between them while ingest follows the chain. The table is then
+/// the one admission compared with the store, never a later read.
 async fn admit_node_endpoints(
     command_config: &IngestCommandConfig,
     nodes: NodeSet<ZebraJsonRpcSource>,
     node_switch: NodeSetSwitch<ZebraJsonRpcSource>,
     readiness: &ComposedReadiness,
-) -> Result<Option<(NodeFailover, NodeEndpointMonitor<ZebraJsonRpcSource>)>, IngestConfigError> {
+) -> Result<(Arc<NetworkUpgradeActivations>, AdmittedNodeFailover), IngestConfigError> {
     if !nodes.has_fallbacks() {
         ensure_node_capabilities(&nodes, readiness).await?;
-        return Ok(None);
+        let activations =
+            zinder_source::discover_network_upgrade_activations(&nodes, "zinder-ingest")
+                .await
+                .map_err(IngestError::from)?;
+        return Ok((activations, None));
     }
     let node = &command_config.runtime_config.node;
     let store =
@@ -1286,6 +1291,8 @@ async fn admit_node_endpoints(
         }
     };
     log_endpoint_admissions(&admissions);
+    let activations = admissions.active_activations();
+    zinder_source::record_network_upgrade_activations_discovered(&activations, "zinder-ingest");
     let policy = NodeFailoverPolicy {
         standby_evaluation_interval: node.health.as_ref().map_or_else(
             || NodeFailoverPolicy::default().standby_evaluation_interval,
@@ -1297,13 +1304,16 @@ async fn admit_node_endpoints(
         readiness: readiness.clone(),
         gates_node_source_input: node.health.is_some(),
     };
-    Ok(Some(NodeFailover::new(
-        nodes,
-        node_switch,
-        &admissions,
-        policy,
-        failover_readiness,
-    )))
+    Ok((
+        activations,
+        Some(NodeFailover::new(
+            nodes,
+            node_switch,
+            &admissions,
+            policy,
+            failover_readiness,
+        )),
+    ))
 }
 
 /// Publishes the readiness a single-endpoint startup would publish for the

@@ -69,7 +69,9 @@ table.
 
 The writer admits a table only when it opens the store. When ingest has
 fallback node endpoints ([ADR-0013](0013-source-failure-recovery-topology.md)),
-it admits the table of the endpoint it starts on. Before choosing that
+it admits the table of the endpoint it starts on, exactly as that endpoint's
+startup check read it; ingest does not read the table again before opening
+the store, so a table no check has seen never reaches it. Before choosing that
 endpoint, it reads the table the store follows without opening the primary:
 the latest admitted revision or, before revision 1, the construction table,
 compared by fingerprint. It reads the store at the storage path or, when none
@@ -220,3 +222,5 @@ See [Public interfaces §Core vocabulary](../architecture/public-interfaces.md#c
   endpoint's table, a fallback starts ingest only with the table the store
   follows, its admitted revision or, before the first, its construction table,
   and other endpoints must advertise exactly the admitted table to take over.
+- 2026-11-18: With fallback endpoints, the writer opens the store with the
+  table the starting endpoint's admission read, not a second read of it.

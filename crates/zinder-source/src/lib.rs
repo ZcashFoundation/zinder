@@ -38,7 +38,7 @@ pub use node_capabilities::{NodeCapabilities, NodeCapabilitiesError, NodeCapabil
 pub use node_set::{ACTIVE_NODE_ENDPOINT_CHANGED_REASON, NodeSet, NodeSetSwitch};
 pub use node_source::{
     BroadcastNodeProbe, NodeSource, NodeStorageMode, TransactionBroadcaster,
-    discover_network_upgrade_activations,
+    discover_network_upgrade_activations, record_network_upgrade_activations_discovered,
 };
 pub use node_target::{
     DEFAULT_NODE_HEALTH_ESTIMATED_GAP_FLOOR_BLOCKS, DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS,

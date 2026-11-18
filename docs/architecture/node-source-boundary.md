@@ -42,8 +42,9 @@ Forbidden outside `zinder-source`:
 Ingest reaches these through the trait, and a wallet reader's
 `BroadcastNodeProbe` delegates to the same methods.
 `discover_network_upgrade_activations` wraps
-`fetch_network_upgrade_activations` with the shared discovery log event,
-and `MempoolSourceFactory` builds an endpoint's live mempool source: the
+`fetch_network_upgrade_activations` with the shared discovery log event, which
+`record_network_upgrade_activations_discovered` emits alone for a table the
+caller already read, and `MempoolSourceFactory` builds an endpoint's live mempool source: the
 streaming indexer source when the endpoint names an indexer, polling
 otherwise. `ZebraJsonRpcSource::from_node_target` builds the source one
 resolved `NodeTarget` describes, including its indexer endpoint.
