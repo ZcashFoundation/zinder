@@ -152,17 +152,16 @@ Compact-block serving admits exactly `GetLightdInfo`, `GetLatestBlock`,
 `GetBlock`, and `GetBlockRange`. Every other `CompactTxStreamer` RPC except
 `Ping` returns `UNIMPLEMENTED`, including wallet queries, mempool methods,
 tree/subtree methods, transparent-address methods, and transaction
-submission.
-
-Both serving modes refuse `Ping` with `FAILED_PRECONDITION`, as reference
-lightwalletd does unless it is started with `--ping-very-insecure`. `Ping` is
-lightwalletd's load-testing RPC, and Zinder has no setting that enables it.
-`GetLightdInfo` reports the admitted network and tip with
+submission. Its `GetLightdInfo` reports the admitted network and tip with
 `taddrSupport = false`. Compact-blocks serving never contacts a node, so it
 rejects a `[node]` section, `[node_fallbacks.N]`, `--node-json-rpc-addr`,
 every `ZINDER_NODE__*` variable, and every `ZINDER_NODE_FALLBACKS__*` variable
 at startup. Its fields follow
 [Identity and live-tip responses](#identity-and-live-tip-responses).
+
+Both serving modes refuse `Ping` with `FAILED_PRECONDITION`, as reference
+lightwalletd does unless it is started with `--ping-very-insecure`. `Ping` is
+lightwalletd's load-testing RPC, and Zinder has no setting that enables it.
 
 Wallet serving uses `[node]` and the `[node_fallbacks.N]` endpoints only for
 `SendTransaction`. It starts without contacting any node and verifies each
