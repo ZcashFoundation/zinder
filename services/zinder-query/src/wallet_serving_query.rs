@@ -45,6 +45,7 @@ use crate::{
     TransparentAddressUnspentOutputs, TransparentAddressUnspentOutputsRequest,
     TransparentOutpointSpendStatuses, TreeState, UpstreamNodeCapabilities, VisibleTipBlock,
     WalletProjectionReader, WalletQueryApi, WalletServingPairSlot, WalletServingReadPair,
+    broadcast_byte_budget::BroadcastByteBudget,
     node_broadcast::EndpointVerifications,
     serving_read,
     tree_state_replay_limit::{TreeStateReplayLimit, record_replayed_blocks},
@@ -396,6 +397,7 @@ pub struct WalletServingQuery<Broadcaster, NativeIngest = ()> {
     broadcaster: Broadcaster,
     native_ingest: NativeIngest,
     tree_state_replays: TreeStateReplayLimit,
+    broadcast_bytes: BroadcastByteBudget,
     native_endpoint_capabilities: NativeWalletEndpointCapabilities,
     node_verifications: Option<EndpointVerifications>,
 }
@@ -435,6 +437,7 @@ impl WalletServingQuery<()> {
             broadcaster: (),
             native_ingest: (),
             tree_state_replays: TreeStateReplayLimit::for_available_parallelism(),
+            broadcast_bytes: BroadcastByteBudget::process(),
             node_verifications: None,
         }
     }
@@ -464,6 +467,7 @@ impl WalletServingQuery<(), AdmittedIngestControl> {
             broadcaster: (),
             native_ingest: ingest_control,
             tree_state_replays: TreeStateReplayLimit::for_available_parallelism(),
+            broadcast_bytes: BroadcastByteBudget::process(),
             node_verifications: None,
         }
     }
@@ -502,6 +506,7 @@ impl<NativeIngest> WalletServingQuery<(), NativeIngest> {
             broadcaster: nodes,
             native_ingest: self.native_ingest,
             tree_state_replays: self.tree_state_replays,
+            broadcast_bytes: self.broadcast_bytes,
             native_endpoint_capabilities,
         }
     }
@@ -1208,6 +1213,7 @@ where
                     maximum: zinder_core::MAX_RAW_TRANSACTION_BYTES,
                 });
             }
+            let _reserved_bytes = self.broadcast_bytes.try_reserve(raw_transaction.len())?;
             if let Some(node_verifications) = &self.node_verifications {
                 node_verifications.track_broadcast_height(&pair);
             }
@@ -1609,6 +1615,59 @@ mod tree_state_replay_limit_tests {
             query.tree_state_at(reconstructed, None).await?.height,
             reconstructed
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod broadcast_byte_budget_tests {
+    use std::{error::Error, sync::Arc};
+
+    use zinder_core::{MAX_RAW_TRANSACTION_BYTES, Network, RawTransactionBytes, TransactionId};
+    use zinder_testkit::{
+        ChainFixture, MockTransactionBroadcaster, WalletServingStoreFixture,
+        sample_regtest_upgrade_activations,
+    };
+
+    use crate::{
+        OrderedBroadcaster, QueryError, WalletQueryApi, WalletServingPairSlot, WalletServingQuery,
+        WalletServingReadPair, broadcast_byte_budget::BroadcastByteBudget,
+    };
+
+    /// A broadcast that does not fit the bytes other broadcasts hold is
+    /// refused before it reaches the node, and a finished broadcast returns
+    /// its bytes to the budget.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_spent_broadcast_budget_refuses_until_bytes_return() -> Result<(), Box<dyn Error>> {
+        let activations = sample_regtest_upgrade_activations();
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+        let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+        let (canonical, wallet) = store.take_readers()?;
+        let slot = WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
+            Arc::new(canonical),
+            Arc::new(wallet),
+        )?));
+        let broadcaster = MockTransactionBroadcaster::accepted(TransactionId::from_bytes([7; 32]))
+            .with_node_activations(activations);
+        let node = OrderedBroadcaster::new(broadcaster.clone(), []);
+        node.verify(&slot).await?;
+        let mut query =
+            WalletServingQuery::from_serving_pair_slot(slot).with_node_broadcast(Some(node));
+        query.broadcast_bytes = BroadcastByteBudget::new(MAX_RAW_TRANSACTION_BYTES);
+        let largest = || RawTransactionBytes::new(vec![0; MAX_RAW_TRANSACTION_BYTES]);
+
+        let in_flight = query.broadcast_bytes.try_reserve(1)?;
+        assert!(matches!(
+            query.broadcast_transaction(largest()).await,
+            Err(QueryError::BroadcastBudgetExhausted { budget_bytes })
+                if budget_bytes == MAX_RAW_TRANSACTION_BYTES
+        ));
+        assert_eq!(broadcaster.call_count(), 0);
+
+        drop(in_flight);
+        query.broadcast_transaction(largest()).await?;
+        query.broadcast_transaction(largest()).await?;
+        assert_eq!(broadcaster.call_count(), 2);
         Ok(())
     }
 }

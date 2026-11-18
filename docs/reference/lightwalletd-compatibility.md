@@ -186,6 +186,14 @@ transaction id instead of -27 or -25, because the unreachable endpoint may
 have accepted the transaction. Without `[node]`, `SendTransaction` is
 unsupported.
 
+A send copies its transaction several times on the way to the node and holds
+the copies until the node answers or `broadcast_timeout_secs` expires. The
+process therefore works on at most 16 MiB of transactions at once, the
+default of lightwalletd's `--max-concurrent-sendtx-mib`. A send that does not
+fit fails at once with `UNAVAILABLE` and `BROADCAST_BUDGET_EXHAUSTED` and
+reaches no node. The budget always fits one 2,000,000-byte transaction, and
+`zinder_query_broadcast_budget_refusals_total` counts refusals.
+
 A compact-blocks `GetBlockRange` stream holds a canonical generation only
 while it reads one chunk, never while it waits for its client. A slow stream
 therefore does not keep the publisher from reopening the inactive generation,

@@ -840,6 +840,12 @@ operations. Store metrics use explicit canonical or wallet role labels.
   already ran one reconstruction per available CPU. A sustained rate means
   wallets anchor on construction-built history faster than the host replays
   it.
+- `zinder_query_broadcast_budget_refusals_total` counts broadcasts and
+  lightwalletd `SendTransaction` calls refused with
+  `broadcast_budget_exhausted` because the process was already broadcasting
+  16 MiB of transactions. A sustained rate while few wallets send points at
+  clients flooding large transactions, or at a node slow enough that
+  broadcasts wait out `broadcast_timeout_secs`.
 
 `status` is `ok` or `error`. `error_class` is `none` on success. On error it is
 the snake-case name of the `QueryError` variant, such as

@@ -212,6 +212,7 @@ Important current reasons include:
 | `UPSTREAM_UNREACHABLE` | A configured dependency is temporarily unreachable |
 | `SERVICE_NOT_READY` | The process is alive but its shared readiness gate is closed; `ErrorInfo.metadata["readiness_cause"]` identifies the stable cause |
 | `NODE_CAPABILITY_MISSING` | The source node cannot provide a required capability |
+| `BROADCAST_BUDGET_EXHAUSTED` | The process is already broadcasting its 16 MiB budget of transaction bytes; retry with backoff |
 
 Do not encode retry policy in error text. Do not reuse a reason for a different
 failure mode. Additive proto reasons receive new scalar values, mappings,
@@ -486,7 +487,10 @@ endpoint is configured, because readers start without contacting their node.
 Until one of the configured endpoints passes first-contact verification, and
 whenever every verified endpoint is unreachable, a broadcast fails with
 `UNAVAILABLE` and `NODE_UNAVAILABLE`, and while no endpoint is verified
-`WalletServerInfo.node` stays empty. Otherwise `WalletServerInfo.node` lists
+`WalletServerInfo.node` stays empty. A broadcast also reserves its
+transaction's bytes from a 16 MiB budget the process shares until the node
+answers or the broadcast times out. One that does not fit fails at once with
+`UNAVAILABLE` and `BROADCAST_BUDGET_EXHAUSTED` without reaching any node. Otherwise `WalletServerInfo.node` lists
 the capabilities that the first verified endpoint, in broadcast preference
 order, advertised. The static capability registry owns identifiers and method
 associations, but does not select a runtime subset.

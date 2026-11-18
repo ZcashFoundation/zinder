@@ -138,6 +138,7 @@ Service is reachable but a dependency is not, or the operation is not yet suppor
 | `UPSTREAM_UNREACHABLE` | A configured federated endpoint (for example the explorer's wallet-query endpoint, or native query's ingest control behind mempool calls) is temporarily unreachable |
 | `SERVICE_NOT_READY` | The process is alive but its shared readiness gate is closed; `ErrorInfo.metadata["readiness_cause"]` contains the stable readiness label and `/readyz` carries any structured detail |
 | `NO_VISIBLE_CHAIN_EPOCH` | No visible chain epoch has been committed yet (the store is empty or still bootstrapping) |
+| `BROADCAST_BUDGET_EXHAUSTED` | A transaction broadcast, including lightwalletd `SendTransaction`, was refused before reaching any node because the process is already broadcasting its 16 MiB budget of transaction bytes. The budget always fits one maximum-size transaction |
 
 ### `UNIMPLEMENTED` family
 

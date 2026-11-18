@@ -92,6 +92,7 @@ define_error_reasons! {
     CanonicalHistoryUnavailable => "CANONICAL_HISTORY_UNAVAILABLE",
     TransparentOutpointCountOutOfRange => "TRANSPARENT_OUTPOINT_COUNT_OUT_OF_RANGE",
     TreeStateReplayLimitReached => "TREE_STATE_REPLAY_LIMIT_REACHED",
+    BroadcastBudgetExhausted => "BROADCAST_BUDGET_EXHAUSTED",
 }
 
 #[cfg(all(test, feature = "remote"))]
@@ -155,6 +156,7 @@ mod tests {
             WireErrorReason::CanonicalHistoryUnavailable,
             WireErrorReason::TransparentOutpointCountOutOfRange,
             WireErrorReason::TreeStateReplayLimitReached,
+            WireErrorReason::BroadcastBudgetExhausted,
         ];
 
         for generated in generated_reasons {

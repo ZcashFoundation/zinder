@@ -361,7 +361,14 @@ prefix, before buffering it.
 
 The values are constants, not configuration. Precedent is lightwalletd's fix
 for GHSA-xrx5-jc6q-9h8r, which uses the same slot count, timeout, message
-size, and eviction rule.
+size, and eviction rule. That fix also bounds the transaction bytes
+`SendTransaction` works on at once, because a send's copies outlive its
+receive slot. Zinder's equivalent is not a transport policy: the wallet query
+reserves each broadcast's bytes from a 16 MiB process budget before it copies
+them, as
+[Public interfaces](../architecture/public-interfaces.md#capabilities)
+describes, so the bound covers native `BroadcastTransaction`, lightwalletd
+`SendTransaction`, and the Cipherscan broadcast that query serves.
 
 The policy leaves four gaps:
 

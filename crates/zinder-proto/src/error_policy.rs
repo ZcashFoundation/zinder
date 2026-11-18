@@ -126,7 +126,8 @@ pub const fn reason_policy(reason: ErrorReason) -> ReasonPolicy {
         | ErrorReason::StorageUnavailable
         | ErrorReason::UpstreamUnreachable
         | ErrorReason::ServiceNotReady
-        | ErrorReason::NoVisibleChainEpoch => {
+        | ErrorReason::NoVisibleChainEpoch
+        | ErrorReason::BroadcastBudgetExhausted => {
             ReasonPolicy::new(Code::Unavailable, RetryAfterBackoff)
         }
 
