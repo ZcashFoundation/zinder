@@ -15,6 +15,9 @@
 //! checkpoint, and replays that cross an activation. Heights between them take
 //! the same replay path, so probing them would only add cost: each probe
 //! derives every pool's root, which takes milliseconds in a debug build.
+//!
+//! A height outside retained history is not found, while a retained height
+//! whose seed checkpoint is missing is store damage.
 
 use std::sync::{
     Arc,
@@ -28,12 +31,14 @@ use tonic::{Code, Request};
 use tonic_types::StatusExt as _;
 use zinder_core::{
     BlockHeight, BlockId, CommitmentTreeCheckpoint, Network, NetworkUpgradeActivation,
-    NetworkUpgradeActivations, ShieldedProtocol, wire::encode_rpc_block_hash_hex,
+    NetworkUpgradeActivations, ShieldedProtocol,
+    wire::{encode_height_key_ascending, encode_rpc_block_hash_hex},
 };
 use zinder_proto::capabilities::WALLET_READ_TREE_STATE_AT_HEIGHT_V2;
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
 use zinder_query::{
-    AdmittedIngestControl, WalletEndpointMetadata, WalletQueryGrpcAdapter, WalletServingQuery,
+    AdmittedIngestControl, WalletEndpointMetadata, WalletQueryGrpcAdapter, WalletServingPairSlot,
+    WalletServingQuery, WalletServingReadPair,
 };
 use zinder_source::{NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError};
 use zinder_testkit::{
@@ -160,6 +165,48 @@ async fn tree_state_after_a_live_replacement_serves_the_replacement_chain() -> e
     served.shutdown().await
 }
 
+#[tokio::test]
+async fn tree_state_without_its_history_predecessor_checkpoint_reports_damaged_storage()
+-> eyre::Result<()> {
+    let activations = gap_activations()?;
+    let chain = with_note_commitments(
+        &ChainFixture::new(Network::ZcashRegtest).extend_blocks(3),
+        &activations,
+    )?;
+    let tip_height = BlockHeight::new(3);
+    let expected_tip = commitment_tree_checkpoints(&chain, &activations, &[tip_height])?;
+    let writer = CanonicalWriterFixture::publish(&CanonicalBaseline::new(&chain), &activations)?;
+    let canonical_primary_path = writer.canonical_primary_path().to_owned();
+    let mut store_fixture = writer.into_serving_store_fixture()?;
+    delete_tree_state_checkpoint(&canonical_primary_path, BlockHeight::new(0))?;
+    let (mut canonical, wallet) = store_fixture.take_readers()?;
+    canonical.try_catch_up()?;
+    let slot = WalletServingPairSlot::new(Arc::new(WalletServingReadPair::new(
+        Arc::new(canonical),
+        Arc::new(wallet),
+    )?));
+    let served = NodelessQuery::over_slot(slot, store_fixture, &activations).await?;
+
+    for seedless in [1, 2] {
+        let status = served
+            .tree_state_status(BlockHeight::new(seedless))
+            .await?
+            .ok_or_else(|| eyre!("height {seedless} was served without a seed checkpoint"))?;
+        assert_eq!(status.code(), Code::Unavailable, "height {seedless}");
+        assert_eq!(reason(&status), "STORAGE_UNAVAILABLE", "height {seedless}");
+    }
+    for checkpoint in &expected_tip {
+        served.assert_tree_state(checkpoint).await?;
+    }
+    let above_tip = served
+        .tree_state_status(BlockHeight::new(4))
+        .await?
+        .ok_or_else(|| eyre!("a height above the visible tip must be refused"))?;
+    assert_eq!(above_tip.code(), Code::NotFound);
+    assert_eq!(reason(&above_tip), "BLOCK_NOT_IN_BEST_CHAIN");
+    served.shutdown().await
+}
+
 /// Regtest activations with Orchard and Ironwood activating between
 /// construction checkpoints.
 fn gap_activations() -> eyre::Result<NetworkUpgradeActivations> {
@@ -199,11 +246,21 @@ impl NodelessQuery {
         mut store_fixture: WalletServingStoreFixture,
         activations: &NetworkUpgradeActivations,
     ) -> eyre::Result<Self> {
+        let slot = crate::common::serving_pair_slot(&mut store_fixture)?;
+        Self::over_slot(slot, store_fixture, activations).await
+    }
+
+    /// Serves `slot`, whose readers `store_fixture` keeps the paths of.
+    async fn over_slot(
+        slot: WalletServingPairSlot,
+        store_fixture: WalletServingStoreFixture,
+        activations: &NetworkUpgradeActivations,
+    ) -> eyre::Result<Self> {
         let node = UnreachableNode::new()?;
         let (ingest_control, ingest_control_fixture) =
             crate::common::admitted_ingest_control_fixture().await?;
         let query = WalletServingQuery::from_admitted_native_sources(
-            crate::common::serving_pair_slot(&mut store_fixture)?,
+            slot,
             node.clone(),
             ingest_control,
             Arc::new(activations.clone()),
@@ -305,6 +362,23 @@ fn expected_payload(checkpoint: &CommitmentTreeCheckpoint) -> Value {
         }
     }
     Value::Object(payload)
+}
+
+/// Deletes the stored tree-state checkpoint at `height` from a closed
+/// canonical primary, as store damage would.
+fn delete_tree_state_checkpoint(
+    canonical_primary_path: &std::path::Path,
+    height: BlockHeight,
+) -> eyre::Result<()> {
+    let options = rust_rocksdb::Options::default();
+    let families = rust_rocksdb::DB::list_cf(&options, canonical_primary_path)?;
+    let db = rust_rocksdb::DB::open_cf(&options, canonical_primary_path, &families)?;
+    let family = db
+        .cf_handle("tree_state_checkpoint")
+        .ok_or_else(|| eyre!("the canonical primary has no tree-state checkpoint family"))?;
+    db.delete_cf(&family, encode_height_key_ascending(height))?;
+    db.flush_cf(&family)?;
+    Ok(())
 }
 
 fn reason(status: &tonic::Status) -> String {

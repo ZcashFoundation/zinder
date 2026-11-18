@@ -217,7 +217,7 @@ for every height.
 | --- | --- |
 | Height above the visible tip | `INVALID_ARGUMENT`, as lightwalletd returns |
 | Height below the store's history predecessor | `NOT_FOUND` with reason `BLOCK_NOT_IN_BEST_CHAIN` |
-| Stored history between the checkpoint and the height is damaged | `UNAVAILABLE` with reason `STORAGE_UNAVAILABLE` |
+| A checkpoint the rebuild seeds from is missing, or stored history between it and the height is damaged | `UNAVAILABLE` with reason `STORAGE_UNAVAILABLE` |
 | Rebuild requested while the process already runs one rebuild per available CPU | `RESOURCE_EXHAUSTED` with reason `TREE_STATE_REPLAY_LIMIT_REACHED` |
 
 A height with a stored checkpoint is never refused this way. Retry a refused

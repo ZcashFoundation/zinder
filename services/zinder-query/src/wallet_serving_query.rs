@@ -1145,24 +1145,25 @@ where
                 return Err(QueryError::BlockNotInBestChain);
             }
             let canonical = pair.canonical();
-            let nearest = canonical
-                .tree_state_checkpoint_at_or_before(height)?
-                .ok_or(QueryError::BlockNotInBestChain)?;
-            if nearest.block_id.height == height {
-                return tree_state_from_checkpoint(chain_epoch, &nearest);
+            let nearest = canonical.tree_state_checkpoint_at_or_before(height)?;
+            if let Some(stored) = &nearest
+                && stored.block_id.height == height
+            {
+                return tree_state_from_checkpoint(chain_epoch, stored);
             }
-            let _replay_slot = replays.try_admit()?;
+            // Without a seed the canonical reader replays nothing: it answers
+            // a height below the history predecessor as absent and a missing
+            // seed as store damage, so only a seeded read takes a slot.
+            let _replay_slot = nearest.as_ref().map(|_| replays.try_admit()).transpose()?;
             let checkpoint = canonical
                 .tree_state_checkpoint_at(
                     height,
                     admitted_activations(&pair, &discovered_activations),
                 )?
                 .ok_or(QueryError::BlockNotInBestChain)?;
-            record_replayed_blocks(
-                height
-                    .value()
-                    .saturating_sub(nearest.block_id.height.value()),
-            );
+            if let Some(seed) = nearest {
+                record_replayed_blocks(height.value().saturating_sub(seed.block_id.height.value()));
+            }
             tree_state_from_checkpoint(chain_epoch, &checkpoint)
         })
         .await
