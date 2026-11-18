@@ -1146,6 +1146,18 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       defaults to 100.",
     },
     EnvVarDoc {
+        name: "ZINDER_COMPAT__PING_VERY_INSECURE",
+        toml_path: "compat.ping_very_insecure",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Answers the lightwalletd `Ping` load-testing RPC, as \
+                      `lightwalletd --ping-very-insecure` does. Each call holds a server task \
+                      for as long as the client asks, so enable it only on a server you are \
+                      load testing. Defaults to false, which refuses `Ping` with \
+                      `FAILED_PRECONDITION`.",
+    },
+    EnvVarDoc {
         name: "ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__BLOCK_CACHE_BYTES",
         toml_path: "storage.materialized_views.rocksdb.block_cache_bytes",
         used_by: &["zinder-ingest", "zinder-explorer"],
@@ -1876,6 +1888,7 @@ mod tests {
                 "ZINDER_COMPAT__REORG_WINDOW_BLOCKS",
                 "ZINDER_COMPAT__PAIR_CONVERGENCE_ATTEMPTS",
                 "ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS",
+                "ZINDER_COMPAT__PING_VERY_INSECURE",
             ]
         );
     }

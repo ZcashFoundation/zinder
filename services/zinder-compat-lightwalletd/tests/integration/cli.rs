@@ -53,6 +53,7 @@ fn print_config_renders_resolved_toml_to_stdout() -> eyre::Result<()> {
         stdout.contains("max_concurrent_block_range_streams = 100"),
         "{stdout}"
     );
+    assert!(stdout.contains("ping_very_insecure = false"), "{stdout}");
     assert!(
         stdout.contains("listen_addr = \"127.0.0.1:9067\""),
         "{stdout}"
@@ -340,6 +341,42 @@ fn zero_reorg_window_is_rejected_before_storage_open() -> eyre::Result<()> {
         &["--reorg-window-blocks", "0"],
         "canonical build reorg window must be greater than zero",
     )
+}
+
+/// `--ping-very-insecure` and `ZINDER_COMPAT__PING_VERY_INSECURE` turn on
+/// `Ping`, matching the lightwalletd flag name.
+#[test]
+fn ping_very_insecure_is_enabled_by_flag_or_environment() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let config_path = tempdir.path().join("zinder-compat.toml");
+    fs::write(
+        &config_path,
+        compat_config_toml(
+            &tempdir.path().join("compat-ping-store"),
+            &tempdir.path().join("compat-ping-secondary"),
+            &tempdir.path().join("compat-ping-wallet"),
+        )?,
+    )?;
+
+    let by_flag = zinder_compat_command()
+        .args([
+            "--print-config",
+            "--config",
+            path_str(&config_path)?,
+            "--ping-very-insecure",
+        ])
+        .output()?;
+    let by_environment = zinder_compat_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .env("ZINDER_COMPAT__PING_VERY_INSECURE", "true")
+        .output()?;
+
+    for output in [by_flag, by_environment] {
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout)?;
+        assert!(stdout.contains("ping_very_insecure = true"), "{stdout}");
+    }
+    Ok(())
 }
 
 #[test]

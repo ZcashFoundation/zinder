@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 use zinder_compat_lightwalletd::{
     BLOCK_RANGE_CHUNK_MAX_BYTES, BlockRangeChunks, BlockRangeContinuity, BlockRangeSink,
-    BlockRangeStreamLimit, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
+    BlockRangeStreamLimit, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS, LightwalletdPing,
     compact_transaction_has_payload,
 };
 use zinder_core::{
@@ -696,6 +696,7 @@ async fn converge_candidate(
 pub(crate) struct CompactBlockAdapter {
     slot: CompactBlockServingSlot,
     block_range_streams: BlockRangeStreamLimit,
+    ping: LightwalletdPing,
 }
 
 impl CompactBlockAdapter {
@@ -705,7 +706,14 @@ impl CompactBlockAdapter {
             block_range_streams: BlockRangeStreamLimit::new(
                 DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
             ),
+            ping: LightwalletdPing::default(),
         }
+    }
+
+    /// Sets how this adapter answers `Ping`.
+    pub(crate) fn with_ping(mut self, ping: LightwalletdPing) -> Self {
+        self.ping = ping;
+        self
     }
 
     /// Limits how many `GetBlockRange` streams this adapter serves at once.
@@ -972,13 +980,12 @@ impl compact_tx_streamer_server::CompactTxStreamer for CompactBlockAdapter {
     }
     async fn ping(
         &self,
-        _request: Request<lightwalletd::Duration>,
+        request: Request<lightwalletd::Duration>,
     ) -> Result<Response<lightwalletd::PingResponse>, Status> {
-        // Reference lightwalletd answers this load-test RPC only when started
-        // with `--ping-very-insecure`; Zinder never enables it.
-        Err(Status::failed_precondition(
-            "Ping is not enabled on this server",
-        ))
+        self.ping
+            .respond(request.into_inner())
+            .await
+            .map(Response::new)
     }
 }
 

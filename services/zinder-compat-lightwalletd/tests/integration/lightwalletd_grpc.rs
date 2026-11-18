@@ -22,7 +22,7 @@ use zebra_chain::{
 };
 use zinder_compat_lightwalletd::{
     BLOCK_RANGE_CHUNK_MAX_BYTES, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
-    LightwalletdGrpcAdapter,
+    LightwalletdGrpcAdapter, LightwalletdPing,
 };
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, BlockSelector, BroadcastDuplicate,
@@ -3295,6 +3295,20 @@ async fn ping_is_refused_like_lightwalletd_without_its_testing_flag() -> eyre::R
     };
     assert_eq!(status.code(), Code::FailedPrecondition);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn ping_answers_like_lightwalletd_when_enabled() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let adapter = acceptance_adapter(&store_fixture).with_ping(LightwalletdPing::enabled());
+
+    let response = adapter
+        .ping(Request::new(lightwalletd::Duration { interval_us: 0 }))
+        .await?
+        .into_inner();
+
+    assert_eq!((response.entry, response.exit), (1, 0));
     Ok(())
 }
 

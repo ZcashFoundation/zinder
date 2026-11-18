@@ -6,7 +6,8 @@ use zinder_core::wire::encode_zinder_native_chain_name;
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use zinder_compat_lightwalletd::{
-    IngestControlMempoolSurface, LightwalletdGrpcAdapter, spawn_ingest_control_tip_change_publisher,
+    IngestControlMempoolSurface, LightwalletdGrpcAdapter, LightwalletdPing,
+    spawn_ingest_control_tip_change_publisher,
 };
 use zinder_runtime::{
     OpsServerError, Readiness, RuntimeService, StartupPhase, TracingSubscriberError,
@@ -97,6 +98,9 @@ struct Cli {
     /// Node JSON-RPC address used for transaction broadcast. Omit to disable broadcast.
     #[arg(long = "node-json-rpc-addr")]
     node_json_rpc_addr: Option<String>,
+    /// Answer the `Ping` load-testing RPC, as `lightwalletd --ping-very-insecure` does.
+    #[arg(long = "ping-very-insecure")]
+    ping_very_insecure: bool,
 }
 
 #[tokio::main]
@@ -262,7 +266,8 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     let grpc_adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(wallet_query)?
         .with_max_concurrent_block_range_streams(
             lightwalletd_config.max_concurrent_block_range_streams,
-        );
+        )
+        .with_ping(configured_ping(&lightwalletd_config));
     let ops_handle = spawn_ops_endpoint_for(
         RuntimeService::CompatLightwalletd,
         lightwalletd_config.ops_listen_addr,
@@ -326,6 +331,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         visible_height = ?visible_height,
         max_concurrent_block_range_streams =
             lightwalletd_config.max_concurrent_block_range_streams.get(),
+        ping_very_insecure = lightwalletd_config.ping_very_insecure,
         "lightwalletd-compatible gRPC server started"
     );
 
@@ -499,7 +505,8 @@ async fn run_compact_blocks(
     let grpc_adapter = compact_block_serving::CompactBlockAdapter::new(slot)
         .with_max_concurrent_block_range_streams(
             lightwalletd_config.max_concurrent_block_range_streams,
-        );
+        )
+        .with_ping(configured_ping(&lightwalletd_config));
     let ops_handle = spawn_ops_endpoint_for(
         RuntimeService::CompatLightwalletd,
         lightwalletd_config.ops_listen_addr,
@@ -523,6 +530,7 @@ async fn run_compact_blocks(
         visible_height = ?visible_height,
         max_concurrent_block_range_streams =
             lightwalletd_config.max_concurrent_block_range_streams.get(),
+        ping_very_insecure = lightwalletd_config.ping_very_insecure,
         "lightwalletd-compatible gRPC server started"
     );
     let reflection_service = tonic_reflection::server::Builder::configure()
@@ -631,7 +639,16 @@ impl From<Cli> for LightwalletdConfigOverrides {
             ops_listen_addr: cli.ops_listen_addr,
             node_json_rpc_addr: cli.node_json_rpc_addr,
             reorg_window_blocks: cli.reorg_window_blocks,
+            ping_very_insecure: cli.ping_very_insecure,
         }
+    }
+}
+
+fn configured_ping(lightwalletd_config: &config::LightwalletdConfig) -> LightwalletdPing {
+    if lightwalletd_config.ping_very_insecure {
+        LightwalletdPing::enabled()
+    } else {
+        LightwalletdPing::default()
     }
 }
 
