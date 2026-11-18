@@ -178,7 +178,7 @@ impl<QueryApi: WalletQueryApi> WalletQueryGrpcAdapter<QueryApi> {
         let server_info = build_wallet_server_info(
             metadata,
             query_api.native_endpoint_capabilities(),
-            query_api.upstream_node_capabilities(),
+            query_api.upstream_node_capabilities().as_ref(),
         );
         Self {
             query_api,
@@ -740,7 +740,7 @@ where
         // The node endpoint is verified after startup, so its capabilities
         // are read per request.
         server_info.node = Some(build_node_capabilities_descriptor(
-            self.query_api.upstream_node_capabilities(),
+            self.query_api.upstream_node_capabilities().as_ref(),
         ));
         Ok(Response::new(wallet::ServerInfoResponse {
             info: Some(server_info),

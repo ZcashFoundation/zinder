@@ -16,7 +16,7 @@ use std::sync::Arc;
 use zinder_core::Network;
 
 use zinder_query::{
-    AdmittedIngestControl, NodeBroadcast, WalletServingPairSlot, WalletServingQuery,
+    AdmittedIngestControl, OrderedBroadcaster, WalletServingPairSlot, WalletServingQuery,
     WalletServingReadPair,
 };
 use zinder_testkit::{
@@ -109,7 +109,8 @@ pub fn serving_query_after_live_append(
 }
 
 /// Release serving query that broadcasts through a verified node double.
-pub type NodeBroadcastQuery = WalletServingQuery<Option<NodeBroadcast<MockTransactionBroadcaster>>>;
+pub type NodeBroadcastQuery =
+    WalletServingQuery<Option<OrderedBroadcaster<MockTransactionBroadcaster>>>;
 
 /// Builds the release serving query over `chain` with `broadcaster` as its
 /// node, verified against the served pair.
@@ -120,7 +121,7 @@ pub async fn verified_node_query_over(
     let activations = sample_regtest_upgrade_activations();
     let mut store_fixture = WalletServingStoreFixture::from_chain(chain, &activations)?;
     let slot = serving_pair_slot(&mut store_fixture)?;
-    let node = NodeBroadcast::new(broadcaster.with_node_activations(activations));
+    let node = OrderedBroadcaster::new(broadcaster.with_node_activations(activations), []);
     node.verify(&slot).await?;
     let query = WalletServingQuery::from_serving_pair_slot(slot).with_node_broadcast(Some(node));
     Ok((query, store_fixture))

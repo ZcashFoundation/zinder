@@ -16,6 +16,7 @@ arc-swap.workspace = true
 async-trait.workspace = true
 clap = { workspace = true, features = ["derive"] }
 config.workspace = true
+futures-util.workspace = true
 hex.workspace = true
 metrics.workspace = true
 parking_lot.workspace = true

@@ -1,3 +1,4 @@
+mod broadcast_failover;
 mod cli;
 mod compact_block_range;
 mod env_var_contract;

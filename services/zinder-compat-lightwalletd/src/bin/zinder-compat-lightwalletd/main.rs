@@ -13,15 +13,13 @@ use zinder_runtime::{
     cancel_on_terminating_signal, install_metrics_recorder_for_service, install_tracing_subscriber,
     spawn_ops_endpoint_for,
 };
-use zinder_source::{
-    DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS, NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
-};
+use zinder_source::{DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS, NodeTarget, ZebraJsonRpcSource};
 
 mod compact_block_serving;
 mod config;
 use config::{CompatServing, LightwalletdConfigError, LightwalletdConfigOverrides};
 use zinder_query::{
-    AdmittedIngestControl, NodeBroadcast, WalletServingPairConfig, WalletServingPairPublisher,
+    AdmittedIngestControl, OrderedBroadcaster, WalletServingPairConfig, WalletServingPairPublisher,
     WalletServingQuery, WalletServingReadiness, spawn_wallet_ingest_control_readiness_probe,
     spawn_wallet_node_readiness_probe,
 };
@@ -208,7 +206,10 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     };
     let start_api_phase = StartupPhase::StartApi.start();
 
-    let node_broadcast = match build_node_broadcast(lightwalletd_config.broadcaster.as_ref()) {
+    let node_broadcast = match build_node_broadcast(
+        lightwalletd_config.broadcaster.as_ref(),
+        &lightwalletd_config.node_fallbacks,
+    ) {
         Ok(node_broadcast) => node_broadcast,
         Err(error) => {
             start_api_phase.fail(&error);
@@ -569,11 +570,12 @@ async fn run_compact_blocks(
     server_result.map_err(LightwalletdConfigError::Transport)
 }
 
-/// Builds the broadcast endpoint from `[node]` without contacting the node,
-/// or `None` when no node is configured.
+/// Builds the broadcast endpoints from `[node]` and `[node_fallbacks.N]`
+/// without contacting any node, or `None` when no node is configured.
 fn build_node_broadcast(
     node_target: Option<&NodeTarget>,
-) -> Result<Option<NodeBroadcast<ZebraJsonRpcSource>>, LightwalletdConfigError> {
+    node_fallbacks: &[NodeTarget],
+) -> Result<Option<OrderedBroadcaster<ZebraJsonRpcSource>>, LightwalletdConfigError> {
     let Some(node_target) = node_target else {
         tracing::info!(
             target: "zinder::compat_lightwalletd",
@@ -582,27 +584,15 @@ fn build_node_broadcast(
         );
         return Ok(None);
     };
-
-    let source = ZebraJsonRpcSource::with_options(
-        node_target.network,
-        node_target.json_rpc_addr.clone(),
-        node_target.node_auth.clone(),
-        ZebraJsonRpcSourceOptions {
-            request_timeout: node_target.request_timeout,
-            max_response_bytes: node_target.max_response_bytes,
-            broadcast_timeout: node_target.broadcast_timeout,
-        },
-    )
-    .map_err(|source| LightwalletdConfigError::Source(Box::new(source)))?
-    .with_health_config(node_target.health.clone());
-
+    let nodes = OrderedBroadcaster::connect(node_target, node_fallbacks)
+        .map_err(|source| LightwalletdConfigError::Source(Box::new(source)))?;
     tracing::info!(
         target: "zinder::compat_lightwalletd",
         event = "transaction_broadcast_enabled",
-        json_rpc_addr = %node_target.json_rpc_addr,
-        "transaction broadcast enabled via node JSON-RPC once the node passes first-contact verification"
+        endpoint_count = nodes.endpoint_count(),
+        "transaction broadcast enabled through each node endpoint once it passes first-contact verification"
     );
-    Ok(Some(NodeBroadcast::new(source)))
+    Ok(Some(nodes))
 }
 
 fn emit_runtime_error(error: &LightwalletdConfigError) -> ExitCode {
@@ -663,7 +653,7 @@ mod tests {
             NodeAuth::cookie_file(cookie_dir.path().join(".cookie")),
         );
 
-        let node_broadcast = build_node_broadcast(Some(&node))?;
+        let node_broadcast = build_node_broadcast(Some(&node), &[])?;
 
         assert!(node_broadcast.is_some_and(|node| node.verified_capabilities().is_none()));
         Ok(())
@@ -674,7 +664,7 @@ mod tests {
         let node = node_target("not a node address", NodeAuth::None);
 
         assert!(matches!(
-            build_node_broadcast(Some(&node)),
+            build_node_broadcast(Some(&node), &[]),
             Err(LightwalletdConfigError::Source(_))
         ));
     }

@@ -38,11 +38,10 @@ pub(super) struct QueryConfig {
     pub(super) allow_public_bind: bool,
     pub(super) canonical_reorg_policy: CanonicalReorgPolicy,
     pub(super) pair_convergence_attempts: NonZeroU8,
-    /// Node endpoint transaction broadcast reaches, or `None` for a
+    /// First node endpoint transaction broadcast tries, or `None` for a
     /// storage-only query.
     pub(super) node: Option<NodeTarget>,
-    /// Fallback endpoints after `node`. Query reads them but does not use them
-    /// yet.
+    /// Endpoints broadcast tries after `node`, in position order.
     pub(super) node_fallbacks: Vec<NodeTarget>,
 }
 

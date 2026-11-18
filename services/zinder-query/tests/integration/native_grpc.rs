@@ -37,7 +37,7 @@ use zinder_proto::v1::{
 use zinder_proto::wire::TransactionAbsence;
 use zinder_query::{
     AdmittedIngestControl, DEFAULT_MAX_COMPACT_BLOCK_RANGE, IngestControlAdmissionError,
-    NodeBroadcast, WalletEndpointMetadata, WalletQueryApi, WalletQueryGrpcAdapter,
+    OrderedBroadcaster, WalletEndpointMetadata, WalletQueryApi, WalletQueryGrpcAdapter,
     WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_store::{
@@ -1262,8 +1262,9 @@ async fn native_grpc_service_uses_query_owned_capabilities() -> eyre::Result<()>
         )?)),
         ingest_control,
     )
-    .with_node_broadcast(Some(NodeBroadcast::new(
+    .with_node_broadcast(Some(OrderedBroadcaster::new(
         MockTransactionBroadcaster::accepted(TransactionId::from_bytes([0x33; 32])),
+        [],
     )));
     let broadcast_adapter =
         WalletQueryGrpcAdapter::new(broadcast_query, WalletEndpointMetadata::default());

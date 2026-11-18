@@ -23,7 +23,7 @@ use zinder_proto::capabilities::{
 };
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
 use zinder_query::{
-    AdmittedIngestControl, NodeBroadcast, WalletEndpointMetadata, WalletQueryApi,
+    AdmittedIngestControl, OrderedBroadcaster, WalletEndpointMetadata, WalletQueryApi,
     WalletQueryGrpcAdapter, WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_source::{
@@ -472,8 +472,11 @@ async fn query_without_a_node_omits_broadcast_and_keeps_tree_state() -> eyre::Re
 /// Native query composed over a node double, with the node handle and slot
 /// a test verifies against.
 struct NodeQueryFixture {
-    query: WalletServingQuery<Option<NodeBroadcast<ProbedValuePoolSource>>, AdmittedIngestControl>,
-    node: NodeBroadcast<ProbedValuePoolSource>,
+    query: WalletServingQuery<
+        Option<OrderedBroadcaster<ProbedValuePoolSource>>,
+        AdmittedIngestControl,
+    >,
+    node: OrderedBroadcaster<ProbedValuePoolSource>,
     slot: WalletServingPairSlot,
     _store_fixture: WalletServingStoreFixture,
     _ingest_control_fixture: zinder_testkit::IngestControlFixture,
@@ -501,7 +504,7 @@ async fn serving_query_from_chain(
     let (ingest_control, ingest_control_fixture) =
         crate::common::admitted_ingest_control_fixture().await?;
     let slot = WalletServingPairSlot::new(pair);
-    let node = NodeBroadcast::new(source);
+    let node = OrderedBroadcaster::new(source, []);
     let query = WalletServingQuery::from_admitted_native_serving_pair(slot.clone(), ingest_control)
         .with_node_broadcast(Some(node.clone()));
     Ok(NodeQueryFixture {

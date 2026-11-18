@@ -49,7 +49,7 @@ use zinder_core::{
         decode_rpc_transaction_id_hex, encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex,
     },
 };
-use zinder_query::{NodeBroadcast, TransactionStatus, WalletQueryApi, WalletServingQuery};
+use zinder_query::{OrderedBroadcaster, TransactionStatus, WalletQueryApi, WalletServingQuery};
 use zinder_source::{TransactionBroadcaster as _, ZebraJsonRpcSource};
 use zinder_testkit::live::{LiveTestEnv, init, optional_env, require_live_for};
 use zinder_testkit::{
@@ -345,7 +345,7 @@ fn assert_unsupported_transaction_version(outcome: &TransactionBroadcastOutcome)
 /// A production canonical store and wallet projection constructed from
 /// genesis through the node tip, read through the serving query.
 struct ServedChain {
-    wallet_query: WalletServingQuery<Option<NodeBroadcast<ZebraJsonRpcSource>>>,
+    wallet_query: WalletServingQuery<Option<OrderedBroadcaster<ZebraJsonRpcSource>>>,
     _store_fixture: WalletServingStoreFixture,
 }
 
@@ -360,7 +360,7 @@ impl ServedChain {
             source,
             store_fixture,
         } = live_serving_pair(env, activations, tip).await?;
-        let node = NodeBroadcast::new(source);
+        let node = OrderedBroadcaster::new(source, []);
         node.verify(&slot).await?;
         let wallet_query =
             WalletServingQuery::from_serving_pair_slot(slot).with_node_broadcast(Some(node));

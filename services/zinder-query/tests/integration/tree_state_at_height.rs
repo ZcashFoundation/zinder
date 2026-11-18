@@ -37,7 +37,7 @@ use zinder_core::{
 use zinder_proto::capabilities::WALLET_READ_TREE_STATE_AT_HEIGHT_V2;
 use zinder_proto::v1::wallet::{self, wallet_query_server::WalletQuery as WalletQueryService};
 use zinder_query::{
-    AdmittedIngestControl, NodeBroadcast, WalletEndpointMetadata, WalletQueryGrpcAdapter,
+    AdmittedIngestControl, OrderedBroadcaster, WalletEndpointMetadata, WalletQueryGrpcAdapter,
     WalletServingPairSlot, WalletServingQuery, WalletServingReadPair,
 };
 use zinder_source::{NodeCapabilities, NodeCapability, NodeSource, SourceBlock, SourceError};
@@ -236,7 +236,7 @@ fn gap_activations() -> eyre::Result<NetworkUpgradeActivations> {
 /// every call it receives.
 struct NodelessQuery {
     adapter: WalletQueryGrpcAdapter<
-        WalletServingQuery<Option<NodeBroadcast<UnreachableNode>>, AdmittedIngestControl>,
+        WalletServingQuery<Option<OrderedBroadcaster<UnreachableNode>>, AdmittedIngestControl>,
     >,
     node: UnreachableNode,
     _store_fixture: WalletServingStoreFixture,
@@ -258,7 +258,7 @@ impl NodelessQuery {
         let (ingest_control, ingest_control_fixture) =
             crate::common::admitted_ingest_control_fixture().await?;
         let query = WalletServingQuery::from_admitted_native_serving_pair(slot, ingest_control)
-            .with_node_broadcast(Some(NodeBroadcast::new(node.clone())));
+            .with_node_broadcast(Some(OrderedBroadcaster::new(node.clone(), [])));
         Ok(Self {
             adapter: WalletQueryGrpcAdapter::new(query, WalletEndpointMetadata::default()),
             node,

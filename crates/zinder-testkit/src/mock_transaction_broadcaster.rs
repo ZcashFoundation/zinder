@@ -26,13 +26,21 @@ use zinder_source::{
 /// [`MockTransactionBroadcaster::with_node_activations`], and holds every
 /// block unless built [`MockTransactionBroadcaster::on_another_chain`], so a
 /// reader's first-contact verification passes against a store with that
-/// table.
+/// table. Its capability probe yields to the runtime once before it answers,
+/// so concurrent verifications interleave. Clones share the captured calls
+/// and the probe answers.
 #[derive(Clone, Debug)]
 pub struct MockTransactionBroadcaster {
     outcome: BroadcastOutcome,
     captured_calls: Arc<Mutex<Vec<RawTransactionBytes>>>,
+    probe: Arc<Mutex<MockNodeProbe>>,
+}
+
+#[derive(Debug, Default)]
+struct MockNodeProbe {
     node_activations: Option<NetworkUpgradeActivations>,
     on_another_chain: bool,
+    capability_probes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -102,17 +110,31 @@ impl MockTransactionBroadcaster {
     /// Reports `activations` as the node's activation table to a reader's
     /// first-contact verification.
     #[must_use]
-    pub fn with_node_activations(mut self, activations: NetworkUpgradeActivations) -> Self {
-        self.node_activations = Some(activations);
+    pub fn with_node_activations(self, activations: NetworkUpgradeActivations) -> Self {
+        self.report_node_activations(activations);
         self
+    }
+
+    /// Reports `activations` as the node's activation table from now on, for
+    /// this broadcaster and every clone, as a node restarted with another
+    /// table would.
+    pub fn report_node_activations(&self, activations: NetworkUpgradeActivations) {
+        self.probe.lock().node_activations = Some(activations);
     }
 
     /// Reports that the node's best chain holds none of the reader's blocks,
     /// as a node on another chain with the same activation table would.
     #[must_use]
-    pub fn on_another_chain(mut self) -> Self {
-        self.on_another_chain = true;
+    pub fn on_another_chain(self) -> Self {
+        self.probe.lock().on_another_chain = true;
         self
+    }
+
+    /// Returns how many times a reader probed this node's capabilities, which
+    /// it does once per first-contact verification.
+    #[must_use]
+    pub fn capability_probe_count(&self) -> usize {
+        self.probe.lock().capability_probes
     }
 
     /// Returns the raw-transaction byte arguments captured by every call to
@@ -132,8 +154,7 @@ impl MockTransactionBroadcaster {
         Self {
             outcome,
             captured_calls: Arc::new(Mutex::new(Vec::new())),
-            node_activations: None,
-            on_another_chain: false,
+            probe: Arc::new(Mutex::new(MockNodeProbe::default())),
         }
     }
 }
@@ -141,6 +162,8 @@ impl MockTransactionBroadcaster {
 #[async_trait]
 impl BroadcastNodeProbe for MockTransactionBroadcaster {
     async fn probe_capabilities(&self) -> Result<NodeCapabilities, SourceError> {
+        self.probe.lock().capability_probes += 1;
+        tokio::task::yield_now().await;
         NodeCapabilities::new([
             NodeCapability::JsonRpc,
             NodeCapability::OpenRpcDiscovery,
@@ -155,7 +178,9 @@ impl BroadcastNodeProbe for MockTransactionBroadcaster {
     async fn fetch_network_upgrade_activations(
         &self,
     ) -> Result<NetworkUpgradeActivations, SourceError> {
-        self.node_activations
+        self.probe
+            .lock()
+            .node_activations
             .clone()
             .ok_or_else(|| SourceError::NodeUnavailable {
                 reason: "the mock node reports no network-upgrade activation table".to_owned(),
@@ -163,7 +188,7 @@ impl BroadcastNodeProbe for MockTransactionBroadcaster {
     }
 
     async fn holds_block(&self, _block: BlockId) -> Result<bool, SourceError> {
-        Ok(!self.on_another_chain)
+        Ok(!self.probe.lock().on_another_chain)
     }
 }
 

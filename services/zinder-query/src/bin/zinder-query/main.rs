@@ -8,7 +8,7 @@ use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_query::{
-    AdmittedIngestControl, NodeBroadcast, WalletEndpointMetadata, WalletQueryApi,
+    AdmittedIngestControl, OrderedBroadcaster, WalletEndpointMetadata, WalletQueryApi,
     WalletQueryGrpcAdapter, WalletServingPairConfig, WalletServingPairPublisher,
     WalletServingQuery, WalletServingReadiness, spawn_wallet_ingest_control_readiness_probe,
     spawn_wallet_node_readiness_probe,
@@ -18,9 +18,7 @@ use zinder_runtime::{
     TrafficReadinessInterceptor, cancel_on_terminating_signal,
     install_metrics_recorder_for_service, install_tracing_subscriber, spawn_ops_endpoint_for,
 };
-use zinder_source::{
-    DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions,
-};
+use zinder_source::{DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS, ZebraJsonRpcSource};
 
 mod config;
 
@@ -165,7 +163,8 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
             return Err(error.into());
         }
     };
-    let node_broadcast = build_node_broadcast(query_config.node.as_ref())?;
+    let node_broadcast =
+        build_node_broadcast(query_config.node.as_ref(), &query_config.node_fallbacks)?;
 
     let open_storage_phase = StartupPhase::OpenStorage.start();
     let (pair_publisher, pair_slot) =
@@ -298,11 +297,12 @@ async fn run_query(cli: Cli) -> Result<(), QueryConfigError> {
     .await
 }
 
-/// Builds the broadcast endpoint from `[node]` without contacting the node,
-/// or `None` when no node is configured.
+/// Builds the broadcast endpoints from `[node]` and `[node_fallbacks.N]`
+/// without contacting any node, or `None` when no node is configured.
 fn build_node_broadcast(
     node: Option<&zinder_source::NodeTarget>,
-) -> Result<Option<NodeBroadcast<ZebraJsonRpcSource>>, QueryConfigError> {
+    node_fallbacks: &[zinder_source::NodeTarget],
+) -> Result<Option<OrderedBroadcaster<ZebraJsonRpcSource>>, QueryConfigError> {
     let Some(node) = node else {
         tracing::info!(
             target: "zinder::query",
@@ -311,19 +311,15 @@ fn build_node_broadcast(
         );
         return Ok(None);
     };
-    let source = ZebraJsonRpcSource::with_options(
-        node.network,
-        node.json_rpc_addr.clone(),
-        node.node_auth.clone(),
-        ZebraJsonRpcSourceOptions {
-            request_timeout: node.request_timeout,
-            max_response_bytes: node.max_response_bytes,
-            broadcast_timeout: node.broadcast_timeout,
-        },
-    )
-    .map_err(|error| QueryConfigError::Source(Box::new(error)))?
-    .with_health_config(node.health.clone());
-    Ok(Some(NodeBroadcast::new(source)))
+    let nodes = OrderedBroadcaster::connect(node, node_fallbacks)
+        .map_err(|error| QueryConfigError::Source(Box::new(error)))?;
+    tracing::info!(
+        target: "zinder::query",
+        event = "transaction_broadcast_enabled",
+        endpoint_count = nodes.endpoint_count(),
+        "transaction broadcast enabled through each node endpoint once it passes first-contact verification"
+    );
+    Ok(Some(nodes))
 }
 
 struct QueryBackgroundTasks {
@@ -626,7 +622,7 @@ mod tests {
             NodeAuth::cookie_file(cookie_dir.path().join(".cookie")),
         );
 
-        let node_broadcast = build_node_broadcast(Some(&node))?;
+        let node_broadcast = build_node_broadcast(Some(&node), &[])?;
 
         assert!(node_broadcast.is_some_and(|node| node.verified_capabilities().is_none()));
         Ok(())
@@ -637,7 +633,7 @@ mod tests {
         let node = node_target("not a node address", NodeAuth::None);
 
         assert!(matches!(
-            build_node_broadcast(Some(&node)),
+            build_node_broadcast(Some(&node), &[]),
             Err(QueryConfigError::Source(_))
         ));
     }

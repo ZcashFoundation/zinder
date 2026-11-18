@@ -15,7 +15,7 @@ use zinder_core::{
     wire::{encode_branch_id_hex, encode_rpc_block_hash_hex},
 };
 use zinder_proto::capabilities::WALLET_BROADCAST_TRANSACTION_V1;
-use zinder_query::{NodeBroadcast, QueryError, WalletQueryApi, WalletServingQuery};
+use zinder_query::{OrderedBroadcaster, QueryError, WalletQueryApi, WalletServingQuery};
 use zinder_source::{NodeAuth, SourceError, ZebraJsonRpcSource};
 use zinder_testkit::{
     ChainFixture, JsonRpcTestServer, MockTransactionBroadcaster, RpcReply,
@@ -46,7 +46,7 @@ async fn broadcast_before_node_verification_fails_without_sending() -> eyre::Res
     let mut store_fixture =
         WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
     let slot = serving_pair_slot(&mut store_fixture)?;
-    let node = NodeBroadcast::new(broadcaster.clone());
+    let node = OrderedBroadcaster::new(broadcaster.clone(), []);
     let wallet_query = WalletServingQuery::from_serving_pair_slot(slot.clone())
         .with_node_broadcast(Some(node.clone()));
 
@@ -98,7 +98,7 @@ async fn node_on_another_chain_fails_verification_and_receives_nothing() -> eyre
     let mut store_fixture =
         WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
     let slot = serving_pair_slot(&mut store_fixture)?;
-    let node = NodeBroadcast::new(broadcaster.clone());
+    let node = OrderedBroadcaster::new(broadcaster.clone(), []);
     let wallet_query = WalletServingQuery::from_serving_pair_slot(slot.clone())
         .with_node_broadcast(Some(node.clone()));
 
@@ -133,7 +133,7 @@ async fn node_with_the_same_schedule_on_another_chain_fails_verification() -> ey
     let mut store_fixture =
         WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
     let slot = serving_pair_slot(&mut store_fixture)?;
-    let node = NodeBroadcast::new(broadcaster.clone());
+    let node = OrderedBroadcaster::new(broadcaster.clone(), []);
     let wallet_query = WalletServingQuery::from_serving_pair_slot(slot.clone())
         .with_node_broadcast(Some(node.clone()));
 
@@ -228,12 +228,15 @@ async fn node_cookie_written_after_startup_is_verified_once_it_appears() -> eyre
     let server = verifiable_node(&schedule, tip_hash)?;
     let cookie_dir = tempfile::tempdir()?;
     let cookie_path = cookie_dir.path().join(".cookie");
-    let node = NodeBroadcast::new(ZebraJsonRpcSource::new(
-        Network::ZcashRegtest,
-        server.url(),
-        NodeAuth::cookie_file(&cookie_path),
-        Duration::from_secs(5),
-    )?);
+    let node = OrderedBroadcaster::new(
+        ZebraJsonRpcSource::new(
+            Network::ZcashRegtest,
+            server.url(),
+            NodeAuth::cookie_file(&cookie_path),
+            Duration::from_secs(5),
+        )?,
+        [],
+    );
     let wallet_query = WalletServingQuery::from_serving_pair_slot(slot.clone())
         .with_node_broadcast(Some(node.clone()));
 

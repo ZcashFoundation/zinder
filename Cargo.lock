@@ -6100,6 +6100,7 @@ dependencies = [
  "clap",
  "config",
  "eyre",
+ "futures-util",
  "hex",
  "metrics",
  "metrics-exporter-prometheus",
