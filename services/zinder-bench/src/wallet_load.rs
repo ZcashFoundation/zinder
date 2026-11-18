@@ -12,6 +12,7 @@ mod calls;
 mod classic_sdk;
 mod point_reads;
 mod slipstream;
+mod transport;
 mod vizor;
 
 use std::{

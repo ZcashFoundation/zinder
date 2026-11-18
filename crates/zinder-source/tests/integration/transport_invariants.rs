@@ -22,6 +22,14 @@ const CORE_TRANSPORT_OWNERSHIP: &[&str] = &[
 const EXTERNAL_PRODUCT_HTTP_TRANSPORT_OWNERSHIP: &[&str] =
     &["services/zinder-compat-cipherscan/src/market_price.rs"];
 
+/// gRPC endpoint owners: the core transports, and the benchmark load client,
+/// which calls lightwalletd servers outside Zinder without keep-alive pings.
+const GRPC_ENDPOINT_OWNERSHIP: &[&str] = &[
+    "crates/zinder-runtime/src/transport.rs",
+    "crates/zinder-source/src/transport.rs",
+    "services/zinder-bench/src/wallet_load/transport.rs",
+];
+
 const SCANNED_DIRECTORIES: &[&str] = &["crates", "services"];
 
 /// Floor for the Rust sources one scan root must yield. The tree holds several
@@ -45,7 +53,7 @@ const BANNED_TRANSPORT_PATTERNS: &[BannedPattern] = &[
         explanation: "use zinder_runtime::connect_zinder_grpc for intra-Zinder channels, \
              zinder_source::connect_zebra_indexer_channel for Zebra Indexer gRPC, \
              or zinder_runtime::validate_zinder_grpc_endpoint to validate a URL at config load",
-        allowed_owners: CORE_TRANSPORT_OWNERSHIP,
+        allowed_owners: GRPC_ENDPOINT_OWNERSHIP,
     },
     BannedPattern {
         needle: "HttpClientBuilder",

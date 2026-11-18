@@ -758,9 +758,10 @@ an average. They also omit what a sync does besides blocks and tree states:
 `GetSubtreeRoots`, transparent address queries, mempool streams, and tip polls.
 Vizor sizes batches from compiled Mainnet tree sizes; the simulated wallet
 uses the density it has received, so its first batch is 10 blocks.
-Connections open through Zinder's gRPC client transport, which gives up on a
-connection after 10 seconds and sends HTTP/2 keep-alive pings every 30
-seconds.
+Each connection gives up after 10 seconds and sends no HTTP/2 keep-alive
+pings. Go lightwalletd's grpc-go server closes a connection whose client pings
+more often than every five minutes, so pinging would end streams a real
+wallet keeps.
 
 ## Report fields
 

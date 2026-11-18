@@ -10,17 +10,18 @@ use std::{
 use parking_lot::Mutex;
 use prost::Message as _;
 use serde::Serialize;
-use tonic::{Code, Status};
+use tonic::{
+    Code, Status,
+    transport::{Channel, Endpoint},
+};
 use zinder_proto::compat::lightwalletd::{
     BlockId, BlockRange, CompactBlock, TxFilter,
     compact_tx_streamer_client::CompactTxStreamerClient,
 };
-use zinder_runtime::{AuthenticatedChannel, connect_zinder_grpc, validate_zinder_grpc_endpoint};
 use zinder_store::TREE_STATE_CHECKPOINT_STRIDE;
 
-/// Client for one HTTP/2 connection to the endpoint under test. The channel
-/// carries no bearer token.
-pub(super) type LwdClient = CompactTxStreamerClient<AuthenticatedChannel>;
+/// Client for one HTTP/2 connection to the endpoint under test.
+pub(super) type LwdClient = CompactTxStreamerClient<Channel>;
 
 /// How long a wallet waits for a connection to open, as Vizor does.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -51,18 +52,15 @@ pub(super) struct CallLimits {
 /// Opens fresh connections to the endpoint under test and records every call.
 #[derive(Clone)]
 pub(super) struct Connector {
-    /// Endpoint URL, already validated. An `https` URL connects over TLS
-    /// with the platform's trusted roots.
-    url: Arc<str>,
+    endpoint: Endpoint,
     recorder: Arc<CallRecorder>,
 }
 
 impl Connector {
     /// Checks `url` and returns a connector for it.
     pub(super) fn new(url: &str, recorder: Arc<CallRecorder>) -> Result<Self, String> {
-        validate_zinder_grpc_endpoint(url).map_err(|error| error.to_string())?;
         Ok(Self {
-            url: Arc::from(url),
+            endpoint: super::transport::wallet_endpoint(url, CONNECT_TIMEOUT)?,
             recorder,
         })
     }
@@ -87,16 +85,12 @@ impl Connector {
     /// Opens one new HTTP/2 connection, as a wallet does after an error.
     pub(super) async fn connect(&self) -> Result<LwdClient, CallFailure> {
         let mut pending = PendingCall::new(&self.recorder, "connect");
-        let outcome =
-            match tokio::time::timeout(CONNECT_TIMEOUT, connect_zinder_grpc(&self.url, None)).await
-            {
-                Ok(Ok(channel)) => Ok(channel),
-                Ok(Err(error)) => Err(CallFailure {
-                    label: "connect_failed",
-                    detail: error.to_string(),
-                }),
-                Err(_) => Err(CallFailure::client_timeout("connect", CONNECT_TIMEOUT)),
-            };
+        let outcome = super::transport::connect(&self.endpoint)
+            .await
+            .map_err(|detail| CallFailure {
+                label: "connect_failed",
+                detail,
+            });
         pending.finish(outcome.as_ref().map(drop));
         outcome.map(|channel| {
             CompactTxStreamerClient::new(channel)
