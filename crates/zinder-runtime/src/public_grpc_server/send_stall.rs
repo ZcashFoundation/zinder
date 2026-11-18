@@ -14,6 +14,11 @@
 //! [`RESPONSE_PIECE_BYTES`], so the bytes hyper itself keeps for a stalled
 //! stream stay small, and a slow but steady client is polled often enough
 //! that it never looks stalled.
+//!
+//! An outer layer can also end a response early by attaching a
+//! [`ResponseCancellation`] to its request. The receive limit uses it for a
+//! client stream that loses its receive slot, because a handler blocked on
+//! its response never polls the request body that reports the eviction.
 
 use std::{
     mem,
@@ -36,6 +41,22 @@ use super::SEND_STALLS_METRIC;
 
 /// Largest piece of a response data chunk handed to the transport at once.
 const RESPONSE_PIECE_BYTES: usize = 64 * 1024;
+
+/// Asks [`GrpcSendStall`] to drop a request's handler body once `token` is
+/// cancelled, ending the response with `status`.
+///
+/// Attached to the request extensions by an outer layer.
+#[derive(Clone, Debug)]
+pub(super) struct ResponseCancellation {
+    token: CancellationToken,
+    status: Status,
+}
+
+impl ResponseCancellation {
+    pub(super) const fn new(token: CancellationToken, status: Status) -> Self {
+        Self { token, status }
+    }
+}
 
 /// Tower layer that ends a response stream once its client has stopped
 /// reading for the send stall timeout.
@@ -93,10 +114,17 @@ where
 
     fn call(&mut self, request: http::Request<Body>) -> Self::Future {
         let send_stall_timeout = self.send_stall_timeout;
+        let cancellation = request.extensions().get::<ResponseCancellation>().cloned();
         self.inner
             .call(request)
             .map_ok(move |response| {
-                response.map(|body| Body::new(SendStallBoundBody::new(body, send_stall_timeout)))
+                response.map(|body| {
+                    Body::new(SendStallBoundBody::new(
+                        body,
+                        send_stall_timeout,
+                        cancellation,
+                    ))
+                })
             })
             .boxed()
     }
@@ -106,8 +134,10 @@ where
 struct SendStallBoundBody {
     sending: Arc<Mutex<Sending>>,
     send_stall_timeout: Duration,
+    /// Handed to the watchdog when it starts.
+    cancellation: Option<ResponseCancellation>,
     /// Stops the watchdog when the response ends. Set once the first data
-    /// piece is handed out.
+    /// piece is handed out, or at once for a cancellable response.
     watchdog: Option<DropGuard>,
 }
 
@@ -121,23 +151,33 @@ struct Sending {
 
 enum Source {
     Handler(Body),
-    /// The client stopped reading and the handler's body was dropped.
-    Abandoned,
+    /// The handler's body was dropped; the stream ends with this status.
+    Abandoned(Status),
     /// The abandoned stream reported its status.
     Reported,
 }
 
 impl SendStallBoundBody {
-    fn new(inner: Body, send_stall_timeout: Duration) -> Self {
-        Self {
+    fn new(
+        inner: Body,
+        send_stall_timeout: Duration,
+        cancellation: Option<ResponseCancellation>,
+    ) -> Self {
+        let cancellable = cancellation.is_some();
+        let mut body = Self {
             sending: Arc::new(Mutex::new(Sending {
                 source: Source::Handler(inner),
                 unsent: Bytes::new(),
                 handed_out_at: None,
             })),
             send_stall_timeout,
+            cancellation,
             watchdog: None,
+        };
+        if cancellable {
+            body.start_watchdog();
         }
+        body
     }
 
     fn start_watchdog(&mut self) {
@@ -148,10 +188,11 @@ impl SendStallBoundBody {
             return;
         };
         let finished = CancellationToken::new();
-        runtime.spawn(abandon_when_stalled(
+        runtime.spawn(abandon_when_stalled_or_cancelled(
             Arc::downgrade(&self.sending),
             self.send_stall_timeout,
             finished.clone(),
+            self.cancellation.take(),
         ));
         self.watchdog = Some(finished.drop_guard());
     }
@@ -164,19 +205,19 @@ impl Sending {
         self.unsent.split_to(piece_len)
     }
 
-    /// Drops the handler's body if the transport has held the last piece for
-    /// `send_stall_timeout`, returning it so the caller drops it unlocked.
-    fn abandon_if_stalled(&mut self, send_stall_timeout: Duration) -> Option<Body> {
-        let stalled = self
-            .handed_out_at
-            .is_some_and(|handed_out_at| handed_out_at.elapsed() >= send_stall_timeout);
-        if !stalled {
-            return None;
-        }
+    fn is_stalled(&self, send_stall_timeout: Duration) -> bool {
+        self.handed_out_at
+            .is_some_and(|handed_out_at| handed_out_at.elapsed() >= send_stall_timeout)
+    }
+
+    /// Drops what the response still holds and records `status` for the
+    /// transport, returning the handler's body so the caller drops it
+    /// unlocked.
+    fn abandon(&mut self, status: Status) -> Option<Body> {
         self.unsent = Bytes::new();
-        match mem::replace(&mut self.source, Source::Abandoned) {
+        match mem::replace(&mut self.source, Source::Abandoned(status)) {
             Source::Handler(body) => Some(body),
-            finished @ (Source::Abandoned | Source::Reported) => {
+            finished @ (Source::Abandoned(_) | Source::Reported) => {
                 self.source = finished;
                 None
             }
@@ -184,37 +225,58 @@ impl Sending {
     }
 }
 
-async fn abandon_when_stalled(
+/// Drops the handler's body once the transport has held the last piece for
+/// `send_stall_timeout`, or at once when `cancellation` fires.
+async fn abandon_when_stalled_or_cancelled(
     sending: Weak<Mutex<Sending>>,
     send_stall_timeout: Duration,
     finished: CancellationToken,
+    cancellation: Option<ResponseCancellation>,
 ) {
+    let (cancelled, cancel_status) = match cancellation {
+        Some(ResponseCancellation { token, status }) => (token, status),
+        None => (
+            CancellationToken::new(),
+            Status::cancelled("response cancelled"),
+        ),
+    };
     loop {
         let Some(shared) = sending.upgrade() else {
             return;
         };
         let checked_at = shared.lock().handed_out_at.unwrap_or_else(Instant::now);
         drop(shared);
-        tokio::select! {
+        let stalled = tokio::select! {
             () = finished.cancelled() => return,
-            () = tokio::time::sleep_until(checked_at + send_stall_timeout) => {}
-        }
+            () = cancelled.cancelled() => false,
+            () = tokio::time::sleep_until(checked_at + send_stall_timeout) => true,
+        };
         let Some(shared) = sending.upgrade() else {
             return;
         };
-        let abandoned = shared.lock().abandon_if_stalled(send_stall_timeout);
-        drop(shared);
-        if let Some(handler_body) = abandoned {
-            drop(handler_body);
+        let mut sending_state = shared.lock();
+        let abandoned = if !stalled {
+            sending_state.abandon(cancel_status)
+        } else if sending_state.is_stalled(send_stall_timeout) {
             metrics::counter!(SEND_STALLS_METRIC).increment(1);
-            return;
-        }
+            sending_state.abandon(client_stopped_reading())
+        } else {
+            continue;
+        };
+        drop(sending_state);
+        drop(shared);
+        drop(abandoned);
+        return;
     }
 }
 
-fn client_stopped_reading_trailers() -> Result<Frame<Bytes>, Status> {
+fn client_stopped_reading() -> Status {
+    Status::deadline_exceeded("client stopped reading the stream")
+}
+
+fn trailers_reporting(status: &Status) -> Result<Frame<Bytes>, Status> {
     let mut trailers = http::HeaderMap::new();
-    Status::deadline_exceeded("client stopped reading the stream").add_header(&mut trailers)?;
+    status.add_header(&mut trailers)?;
     Ok(Frame::trailers(trailers))
 }
 
@@ -234,9 +296,10 @@ impl http_body::Body for SendStallBoundBody {
         }
         let handler_body = match &mut sending.source {
             Source::Handler(handler_body) => handler_body,
-            Source::Abandoned => {
+            Source::Abandoned(status) => {
+                let trailers = trailers_reporting(status);
                 sending.source = Source::Reported;
-                return Poll::Ready(Some(client_stopped_reading_trailers()));
+                return Poll::Ready(Some(trailers));
             }
             Source::Reported => return Poll::Ready(None),
         };
@@ -260,7 +323,7 @@ impl http_body::Body for SendStallBoundBody {
         sending.unsent.is_empty()
             && match &sending.source {
                 Source::Handler(handler_body) => handler_body.is_end_stream(),
-                Source::Abandoned => false,
+                Source::Abandoned(_) => false,
                 Source::Reported => true,
             }
     }
@@ -269,7 +332,7 @@ impl http_body::Body for SendStallBoundBody {
         let sending = self.sending.lock();
         match &sending.source {
             Source::Handler(handler_body) if sending.unsent.is_empty() => handler_body.size_hint(),
-            Source::Handler(_) | Source::Abandoned | Source::Reported => SizeHint::default(),
+            Source::Handler(_) | Source::Abandoned(_) | Source::Reported => SizeHint::default(),
         }
     }
 }

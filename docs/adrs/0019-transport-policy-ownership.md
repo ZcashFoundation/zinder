@@ -332,13 +332,22 @@ a connection already holding as many slots as any other is refused. A request
 on a transport that reports no remote address counts as a connection of its
 own. `zinder_grpc_request_receive_evictions_total{pool}` counts evictions.
 
+An evicted request learns of it when its body is next read, which a handler
+blocked on its response never does. For a client stream, the receive layer
+therefore also attaches the slot's eviction signal to the request, and the
+send stall layer below it drops the handler's response body as soon as the
+slot is taken and ends the stream with `UNAVAILABLE`. A blocked gRPC
+reflection task then ends and frees its buffers when it next runs, so
+repeated evictions cannot pile up blocked producers beyond the pool size.
+That release follows the newcomer's admission by a scheduler turn rather
+than preceding it.
+
 hyper asks a response body for its next frame only after the client's HTTP/2
 flow-control window has room for the previous one. A client that answers
 keepalive pings but never sends `WINDOW_UPDATE` therefore parks the response,
 and whatever produces it, with no end: gRPC reflection's task blocks on its
 one-message channel while holding the request stream, its client-stream slot,
-and several echoed messages, where neither the receive timeout nor eviction can
-reach it. The send stall layer ends such a response. It hands each data chunk
+and several echoed messages, where the receive timeout cannot reach it. The send stall layer ends such a response. It hands each data chunk
 to hyper in pieces of at most 64 KiB, and a watchdog task drops the handler's
 response body once hyper has held a piece for 60 seconds without asking for
 the next. Dropping the body cancels the handler the way a client cancellation
@@ -466,5 +475,6 @@ translations.
 - 2026-11-18: Added public gRPC listeners: the shared
   `zinder_runtime::public_grpc_server` builder with its per-connection stream
   limit, keepalive, and process-wide receive limit with per-connection
-  eviction, and the 2 MiB request message bound, which also covers public gRPC
-  reflection.
+  eviction, the 2 MiB request message bound, which also covers public gRPC
+  reflection, and the send stall bound, which also ends an evicted client
+  stream's response.

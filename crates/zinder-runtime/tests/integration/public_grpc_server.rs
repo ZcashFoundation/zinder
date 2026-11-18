@@ -33,8 +33,8 @@ use tonic_health::{
 };
 use tonic_prost::ProstCodec;
 use tonic_reflection::pb::v1::{
-    ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
-    server_reflection_request::MessageRequest,
+    ServerReflectionRequest, ServerReflectionResponse,
+    server_reflection_client::ServerReflectionClient, server_reflection_request::MessageRequest,
 };
 use tower::ServiceExt as _;
 use zinder_runtime::{
@@ -74,6 +74,14 @@ impl TestServer {
 /// reflection (bidirectional) behind the public server builder, the way
 /// public Zinder listeners do.
 async fn serve(slots: usize, receive_timeout: Duration) -> Result<TestServer> {
+    serve_with_send_stall(slots, receive_timeout, SHORT_SEND_STALL_TIMEOUT).await
+}
+
+async fn serve_with_send_stall(
+    slots: usize,
+    receive_timeout: Duration,
+    send_stall_timeout: Duration,
+) -> Result<TestServer> {
     let slots = NonZeroUsize::new(slots).ok_or_else(|| eyre!("slots must be non-zero"))?;
     let (health, health_server) = tonic_health::server::health_reporter();
     let reflection = public_grpc_reflection(zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET)?;
@@ -82,7 +90,7 @@ async fn serve(slots: usize, receive_timeout: Duration) -> Result<TestServer> {
     let server = tokio::spawn(
         public_grpc_server_with(
             GrpcReceiveLimits::new(slots, receive_timeout),
-            SHORT_SEND_STALL_TIMEOUT,
+            send_stall_timeout,
         )
         .add_service(health_server.max_decoding_message_size(MAX_DECODING_MESSAGE_BYTES))
         .add_service(reflection)
@@ -328,29 +336,8 @@ async fn an_idle_reflection_stream_is_cancelled_and_returns_its_slot() -> Result
 #[tokio::test]
 async fn a_reflection_stream_whose_client_stops_reading_ends_and_returns_its_slot() -> Result<()> {
     let server = serve(1, Duration::from_secs(30)).await?;
-    // A small stream window and a large connection window: the stalled
-    // stream cannot take the connection's window from the probes below.
-    let channel = Endpoint::new(format!("http://{}", server.address))?
-        .initial_stream_window_size(Some(64 * 1024))
-        .initial_connection_window_size(Some(16 * 1024 * 1024))
-        .connect()
-        .await?;
-    let (sender, receiver) = mpsc::channel(4);
-    let mut stalled = ServerReflectionClient::new(channel.clone())
-        .server_reflection_info(ReceiverStream::new(receiver))
-        .await?
-        .into_inner();
-    // Reflection echoes the host twice in each answer, so three answers
-    // overflow the stream window, reflection's one-message channel, and
-    // the message its task is sending. The client never reads them.
-    for _ in 0..3 {
-        sender
-            .send(ServerReflectionRequest {
-                host: "x".repeat(256 * 1024),
-                message_request: Some(MessageRequest::ListServices(String::new())),
-            })
-            .await?;
-    }
+    let channel = small_stream_window_connection(&server).await?;
+    let (sender, mut stalled) = unread_reflection_answers(&channel).await?;
 
     // The stalled stream holds the only client-stream slot until the server
     // ends it. A probe on the same connection cannot evict it.
@@ -389,6 +376,83 @@ async fn a_reflection_stream_whose_client_stops_reading_ends_and_returns_its_slo
     );
     drop(sender);
     Ok(())
+}
+
+#[tokio::test]
+async fn an_evicted_reflection_stream_whose_client_stopped_reading_ends_at_once() -> Result<()> {
+    let server = serve_with_send_stall(1, Duration::from_secs(30), Duration::from_hours(1)).await?;
+    let attacker = small_stream_window_connection(&server).await?;
+    let (sender, mut stalled) = unread_reflection_answers(&attacker).await?;
+    tokio::time::sleep(CLAIM_SETTLE).await;
+
+    // A connection holding no slot takes the stalled stream's.
+    let mut newcomer = ServerReflectionClient::new(server.connect().await?)
+        .server_reflection_info(tokio_stream::once(list_services()))
+        .await?
+        .into_inner();
+    within_wait_limit(newcomer.next())
+        .await?
+        .ok_or_else(|| eyre!("reflection ended before answering"))??;
+    tokio::time::sleep(CLAIM_SETTLE).await;
+
+    // Had the evicted handler survived until now, reading again would
+    // deliver all three answers. It was dropped while the client was not
+    // reading, so the stream ends with UNAVAILABLE after what the transport
+    // already held.
+    let mut answers = 0;
+    let ended_with = loop {
+        match within_wait_limit(stalled.next()).await? {
+            Some(Ok(_)) => answers += 1,
+            Some(Err(status)) => break Some(status),
+            None => break None,
+        }
+    };
+    assert!(answers < 3, "the evicted handler kept answering");
+    assert_eq!(
+        ended_with.map(|status| status.code()),
+        Some(Code::Unavailable)
+    );
+    drop(sender);
+    Ok(())
+}
+
+/// Opens a connection with a small stream window and a large connection
+/// window, so a stream it stops reading cannot take the window of other
+/// streams on it.
+async fn small_stream_window_connection(server: &TestServer) -> Result<Channel> {
+    Ok(Endpoint::new(format!("http://{}", server.address))?
+        .initial_stream_window_size(Some(64 * 1024))
+        .initial_connection_window_size(Some(16 * 1024 * 1024))
+        .connect()
+        .await?)
+}
+
+/// Opens a reflection stream on `channel` and sends three requests whose
+/// answers the client never reads.
+///
+/// Reflection echoes the host twice in each answer, so three answers
+/// overflow the stream window, reflection's one-message channel, and the
+/// message its task is sending, which leaves that task blocked.
+async fn unread_reflection_answers(
+    channel: &Channel,
+) -> Result<(
+    mpsc::Sender<ServerReflectionRequest>,
+    tonic::Streaming<ServerReflectionResponse>,
+)> {
+    let (sender, receiver) = mpsc::channel(4);
+    let answers = ServerReflectionClient::new(channel.clone())
+        .server_reflection_info(ReceiverStream::new(receiver))
+        .await?
+        .into_inner();
+    for _ in 0..3 {
+        sender
+            .send(ServerReflectionRequest {
+                host: "x".repeat(256 * 1024),
+                message_request: Some(MessageRequest::ListServices(String::new())),
+            })
+            .await?;
+    }
+    Ok((sender, answers))
 }
 
 #[tokio::test]

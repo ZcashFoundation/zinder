@@ -147,6 +147,12 @@ impl ReceiveSlot {
     pub(super) fn evicted(&self) -> WaitForCancellationFutureOwned {
         self.eviction.clone().cancelled_owned()
     }
+
+    /// The token cancelled when another connection's request takes this
+    /// slot.
+    pub(super) fn eviction_token(&self) -> CancellationToken {
+        self.eviction.clone()
+    }
 }
 
 impl Drop for ReceiveSlot {

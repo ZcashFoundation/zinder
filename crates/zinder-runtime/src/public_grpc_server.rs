@@ -55,6 +55,7 @@ use tower::{
     layer::util::{Identity, Stack},
 };
 
+use self::send_stall::ResponseCancellation;
 pub use self::send_stall::{GrpcSendStall, GrpcSendStallLayer};
 use self::{
     message_boundaries::MessageBoundaries,
@@ -106,7 +107,7 @@ const SEND_STALLS_METRIC: &str = "zinder_grpc_response_send_stalls_total";
 
 /// The tonic server type that [`public_grpc_server`] returns.
 pub type PublicGrpcServer =
-    Server<Stack<GrpcReceiveLimitLayer, Stack<GrpcSendStallLayer, Identity>>>;
+    Server<Stack<GrpcSendStallLayer, Stack<GrpcReceiveLimitLayer, Identity>>>;
 
 /// Returns the gRPC server builder for a public Zinder listener, with the
 /// default receive limits and send stall timeout.
@@ -135,8 +136,8 @@ pub fn public_grpc_server_with(
         .max_concurrent_streams(MAX_CONCURRENT_STREAMS_PER_CONNECTION)
         .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
         .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
-        .layer(GrpcSendStallLayer::new(send_stall_timeout))
         .layer(GrpcReceiveLimitLayer::new(limits))
+        .layer(GrpcSendStallLayer::new(send_stall_timeout))
 }
 
 /// Returns the gRPC reflection v1 service for a public Zinder listener,
@@ -301,6 +302,15 @@ where
             metrics::counter!(RECEIVE_EVICTIONS_METRIC, "pool" => pool.label()).increment(1);
         }
         let receive_timeout = self.pools.receive_timeout;
+        let mut request = request;
+        if pool == ReceivePool::ClientStream {
+            // A handler blocked on its response does not poll the request
+            // body, so the response must end on eviction by itself.
+            request.extensions_mut().insert(ResponseCancellation::new(
+                admission.slot.eviction_token(),
+                too_many_requests(),
+            ));
+        }
         let request = request.map(|body| {
             Body::new(ReceiveBoundBody {
                 inner: body,
