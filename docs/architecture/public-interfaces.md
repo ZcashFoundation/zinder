@@ -488,10 +488,12 @@ Until one of the configured endpoints passes first-contact verification, and
 whenever every verified endpoint is unreachable, a broadcast fails with
 `UNAVAILABLE` and `NODE_UNAVAILABLE`, and while no endpoint is verified
 `WalletServerInfo.node` stays empty. A broadcast also reserves its
-transaction's bytes from a 16 MiB budget the process shares until the node
-answers or the broadcast times out. One that does not fit fails at once with
-`UNAVAILABLE` and `BROADCAST_BUDGET_EXHAUSTED` without reaching any node. Otherwise `WalletServerInfo.node` lists
-the capabilities that the first verified endpoint, in broadcast preference
+transaction's bytes from a 16 MiB budget the process shares until the last
+copy is gone: when the node answers or the broadcast times out, or, for a
+cancelled broadcast, when work it handed to the blocking pool ends. One that
+does not fit fails at once with `UNAVAILABLE` and `BROADCAST_BUDGET_EXHAUSTED`
+without reaching any node. Otherwise `WalletServerInfo.node` lists the
+capabilities that the first verified endpoint, in broadcast preference
 order, advertised. The static capability registry owns identifiers and method
 associations, but does not select a runtime subset.
 

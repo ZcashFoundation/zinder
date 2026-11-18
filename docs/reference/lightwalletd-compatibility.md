@@ -187,7 +187,9 @@ have accepted the transaction. Without `[node]`, `SendTransaction` is
 unsupported.
 
 A send copies its transaction several times on the way to the node and holds
-the copies until the node answers or `broadcast_timeout_secs` expires. The
+the copies until the node answers or `broadcast_timeout_secs` expires. Its
+bytes stay reserved until the last copy is gone, including one a cancelled
+send left on the blocking pool to compute its transaction id. The
 process therefore works on at most 16 MiB of transactions at once, the
 default of lightwalletd's `--max-concurrent-sendtx-mib`. A send that does not
 fit fails at once with `UNAVAILABLE` and `BROADCAST_BUDGET_EXHAUSTED` and
