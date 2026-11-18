@@ -540,7 +540,7 @@ mod tests {
         metrics::with_local_recorder(&recorder, || store.bulk_load_blocks(blocks))?;
 
         let rendered = recorder_handle.render();
-        for stage in ["validate", "sequence", "write"] {
+        for stage in ["validate", "encode", "sequence", "write"] {
             let series = format!(
                 "zinder_store_canonical_block_load_stage_duration_seconds_count{{stage=\"{stage}\"}} 2"
             );
@@ -2700,6 +2700,153 @@ mod tests {
         assert_eq!(evidence.transaction_blob_count, 1);
         assert_eq!(evidence.block_blob_count, 1);
         Ok(())
+    }
+
+    #[test]
+    fn bulk_load_stores_reference_encodings_and_fact_digests()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::canonical_store::{
+            block_load::{
+                encode_block_final_note_commitment_roots, encode_block_position,
+                encode_tree_state_checkpoint,
+            },
+            rocksdb::{
+                BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY,
+                TREE_STATE_CHECKPOINT_COLUMN_FAMILY,
+            },
+        };
+
+        let temporary = TempDir::new()?;
+        let mut store = explorer_all_blobs_builder(&temporary.path().join("canonical"))?;
+        let reference = explorer_block_with_every_family()?;
+        let roots = reference
+            .block_final_note_commitment_roots
+            .ok_or("reference block must carry final roots")?;
+        let expected_compact = zinder_proto::wire::encode_compact_block(&reference.compact_block);
+        let checkpoint = reference
+            .tree_state_checkpoint
+            .as_ref()
+            .ok_or("reference block must carry a checkpoint")?;
+        let expected_checkpoint =
+            encode_tree_state_checkpoint(checkpoint.block_time_seconds, &checkpoint.frontiers);
+        let expected_roots = encode_block_final_note_commitment_roots(&roots);
+        let mut expected_sequence_digest = CanonicalBlockFactsSequenceDigestBuilder::new(
+            CanonicalBlockFactsSequenceDigestVersion::V1,
+        );
+        expected_sequence_digest
+            .try_append(reference.facts.digest(CanonicalBlockFactsDigestVersion::V1))?;
+
+        let evidence = store
+            .bulk_load_blocks([Ok::<_, std::io::Error>(explorer_block_with_every_family()?)])?;
+
+        let db = &store.bounded_open.db;
+        let height_key = encode_block_position(BlockHeight::new(1));
+        let stored = |family: &str| -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+            let handle = db.cf_handle(family).ok_or("column family is absent")?;
+            Ok(db.get_cf(&handle, height_key)?)
+        };
+        assert_eq!(
+            stored(COMPACT_BLOCK_COLUMN_FAMILY)?,
+            Some(expected_compact.clone())
+        );
+        assert_eq!(
+            stored(TREE_STATE_CHECKPOINT_COLUMN_FAMILY)?,
+            Some(expected_checkpoint.clone())
+        );
+        assert_eq!(
+            stored(BLOCK_FINAL_NOTE_COMMITMENT_ROOTS_COLUMN_FAMILY)?,
+            Some(expected_roots.clone())
+        );
+        assert_eq!(
+            evidence.compact_block_logical_bytes,
+            4 + u64::try_from(expected_compact.len())?
+        );
+        assert_eq!(
+            evidence.block_final_note_commitment_roots_logical_bytes,
+            4 + u64::try_from(expected_roots.len())?
+        );
+        let predecessor = store.build_plan.history_predecessor();
+        let predecessor_checkpoint =
+            encode_tree_state_checkpoint(predecessor.block_time_seconds, &predecessor.frontiers);
+        assert_eq!(
+            evidence.tree_state_checkpoint_logical_bytes,
+            4 + u64::try_from(predecessor_checkpoint.len())?
+                + 4
+                + u64::try_from(expected_checkpoint.len())?
+        );
+        assert_eq!(evidence.sequence_digest, expected_sequence_digest.finish());
+        Ok(())
+    }
+
+    /// The sequence digest reuses each envelope's reference digest, so a block
+    /// whose envelope encodes other facts must be refused before staging.
+    #[test]
+    fn bulk_load_rejects_a_replay_envelope_digest_of_other_facts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let store_path = temporary.path().join("canonical");
+        let mut store = create_building_store(&store_path, CanonicalHistoryBounds::complete())?;
+        let mut block = canonical_build_block(
+            BlockHeight::new(1),
+            [1; 32],
+            Network::ZcashTestnet.genesis_hash().as_bytes(),
+        );
+        add_tree_state_checkpoint(&mut block)?;
+        // Height, hash, and parent still match the envelope; only the digest differs.
+        block.facts.serialized_bytes_digest = SerializedBytesDigest::from_serialized_bytes(&[1]);
+
+        let error = store
+            .bulk_load_blocks([Ok::<_, std::io::Error>(block)])
+            .err()
+            .ok_or("an envelope digest of other facts must be rejected")?;
+
+        assert!(matches!(
+            error,
+            CanonicalStoreBuildError::Store(CanonicalStoreError::BlockLoadSequenceInvalid { ref reason })
+                if reason.contains("replay envelope does not match its canonical facts")
+        ));
+        assert!(canonical_block_families_are_empty(&store.bounded_open.db)?);
+        Ok(())
+    }
+
+    fn explorer_all_blobs_builder(
+        store_path: &Path,
+    ) -> Result<RocksDbCanonicalBuilder, Box<dyn std::error::Error>> {
+        let activations =
+            crate::canonical_store::test_network_upgrade_activations(Network::ZcashTestnet)?;
+        let build_plan = CanonicalStoreBuildPlan::complete(
+            &activations,
+            0,
+            BlockId::new(BlockHeight::new(1), BlockHash::from_bytes([1; 32])),
+            RawBlobRetention::All,
+            CanonicalReorgPolicy::new(100)?,
+        )?;
+        Ok(RocksDbCanonicalBuilder::create_fresh(
+            store_path,
+            CanonicalStoreWorkload::Explorer,
+            build_plan,
+            RocksDbResourceBudget::for_local_tests(),
+        )?)
+    }
+
+    /// Block 1 with raw blobs, a tip checkpoint, and final roots, so it
+    /// stages a row in every block family.
+    fn explorer_block_with_every_family()
+    -> Result<crate::CanonicalBuildBlock, Box<dyn std::error::Error>> {
+        let mut block = canonical_build_block_with_raw_blobs(
+            BlockHeight::new(1),
+            [1; 32],
+            Network::ZcashTestnet.genesis_hash().as_bytes(),
+        );
+        add_tree_state_checkpoint(&mut block)?;
+        block.block_final_note_commitment_roots = Some(BlockFinalNoteCommitmentRoots::new(
+            BlockHeight::new(1),
+            BlockHash::from_bytes([1; 32]),
+            Some(FinalNoteCommitmentRoot::from_bytes([31; 32])),
+            None,
+            Some(FinalNoteCommitmentRoot::from_bytes([33; 32])),
+        ));
+        Ok(block)
     }
 
     #[test]
