@@ -82,6 +82,19 @@ build has been timed on the current release.
 
 ## Choose a deployment
 
+First decide what to serve. Each deployment below runs a different set of
+processes. [Use cases](../use-cases.md) explains which clients fit each
+surface.
+
+| Deployment | What runs | What it serves | What it requires |
+| --- | --- | --- | --- |
+| Wallet endpoint | Ingest, projector, and `zinder-compat-lightwalletd`. Compose and the single-volume image also run `zinder-query`. | lightwalletd `CompactTxStreamer` on port 9067, to existing light wallets | The chain store and the wallet store, with `storage.raw_blob_policy` set to `transactions` or `all`. The shipped configurations set `transactions`. |
+| Native wallet backend | Ingest, projector, and `zinder-query` | `WalletQuery` on port 9102, with reads pinned to one chain snapshot and typed errors, to clients built on `zinder-client` or the native API | The chain store and the wallet store |
+| Wallet plus explorer | The wallet processes plus `zinder-explorer` | Both wallet surfaces, and `ExplorerQuery` on port 9068 | Set `ingest.explorer_views = true`. Ingest then also builds the Explorer view store. |
+| Block feed | Ingest and `zinder-compat-lightwalletd` in compact-blocks mode | `GetLightdInfo`, `GetLatestBlock`, `GetBlock`, and `GetBlockRange` from the chain store, to consumers that read compact blocks | The chain store only. Start `zinder-compat-lightwalletd` with `ZINDER_COMPAT__SERVING=compact-blocks` and no `[node]` or `[wallet]` settings. |
+
+Then choose how to package it:
+
 | Deployment | Pick it when | Runbook |
 | --- | --- | --- |
 | Docker Compose beside a node | You want to try Zinder, or run it on a host that already runs your node in Docker. | [Quickstart](#quickstart-with-docker-compose) below |
