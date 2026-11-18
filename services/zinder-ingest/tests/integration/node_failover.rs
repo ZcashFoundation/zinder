@@ -1109,6 +1109,60 @@ async fn a_standby_takes_over_while_the_active_health_check_hangs() -> TestResul
     Ok(())
 }
 
+/// A switch evaluates the endpoint ingest left at once.
+///
+/// The monitor starts a new round even while the previous one still waits
+/// on that endpoint, rather than one cadence later.
+#[tokio::test]
+async fn a_switch_evaluates_the_endpoint_it_left_at_once() -> TestResult {
+    let PublishedStore {
+        blocks,
+        store,
+        _directory,
+    } = published_store().await?;
+    let primary = FailoverEndpoint::serving(&blocks, 2)?;
+    let fallback = FailoverEndpoint::serving(&blocks, 4)?;
+    let failing_primary = primary.clone();
+    let started = StartedFailover::start(
+        vec![primary, fallback],
+        FailoverRun {
+            policy: NodeFailoverPolicy {
+                standby_evaluation_interval: Duration::from_hours(1),
+                ..fast_policy()
+            },
+            ..FailoverRun::to_height(4)
+        },
+    )
+    .await?;
+    // The active health check never answers, so the round that qualifies the
+    // fallback is still in flight when the follower switches to it.
+    failing_primary.health_hangs.store(true, Ordering::SeqCst);
+    failing_primary.set_unreachable(true);
+
+    let followed = tokio::time::timeout(
+        Duration::from_secs(30),
+        Box::pin(follow_canonical_tip(store, started.follower(4))),
+    )
+    .await;
+    let evaluated = tokio::time::timeout(Duration::from_secs(5), async {
+        while started.failover.endpoint_states().first() == Some(&NodeEndpointState::Pending) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    let failover = started.failover.clone();
+    started.stop().await?;
+
+    followed??;
+    assert_eq!(failover.active_position(), 1);
+    assert!(evaluated.is_ok(), "the endpoint ingest left stayed pending");
+    assert_eq!(
+        failover.endpoint_states().first(),
+        Some(&NodeEndpointState::Unreachable)
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn follower_switches_after_three_stream_disconnected_recoveries() -> TestResult {
     let PublishedStore {

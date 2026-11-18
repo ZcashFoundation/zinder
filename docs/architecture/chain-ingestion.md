@@ -269,9 +269,11 @@ While ingest follows, a standby monitor polls every endpoint on the
 `[node.health]` cadence, 30 seconds by default. Each endpoint's evaluation is
 bounded by that cadence, or by 5 seconds when the cadence is shorter, and is
 recorded as soon as it completes, so an active endpoint that hangs never delays
-the evidence about the others. The monitor records whether the active endpoint
-reports ready, and whether each other endpoint could take over: it must report
-ready, advertise the required capabilities and the admitted table, hold the
+the evidence about the others. A switch abandons the evaluation in flight and
+starts a new one at once, so the endpoint ingest left becomes a candidate again
+within one evaluation rather than one cadence later. The monitor records
+whether the active endpoint reports ready, and whether each other endpoint
+could take over: it must report ready, advertise the required capabilities and the admitted table, hold the
 configured network's genesis block, and have a tip at or above the visible tip. It is a standby when it holds the
 visible tip, and a diverged standby when it holds only the settled tip. Until
 the follower publishes its first fence, a candidate that passes the other
