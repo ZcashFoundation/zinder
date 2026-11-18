@@ -7,8 +7,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use zinder_core::{
-    BroadcastAccepted, NetworkUpgradeActivations, RawTransactionBytes, TransactionBroadcastOutcome,
-    TransactionId,
+    BlockId, BroadcastAccepted, NetworkUpgradeActivations, RawTransactionBytes,
+    TransactionBroadcastOutcome, TransactionId,
 };
 use zinder_source::{
     BroadcastNodeProbe, NodeCapabilities, NodeCapability, SourceError, TransactionBroadcaster,
@@ -21,15 +21,18 @@ use zinder_source::{
 /// bytes are captured automatically and can be inspected via
 /// [`MockTransactionBroadcaster::captured_calls`].
 ///
-/// As a [`BroadcastNodeProbe`], the fake advertises transaction broadcast
-/// and reports the table set by
-/// [`MockTransactionBroadcaster::with_node_activations`], so a reader's
-/// first-contact verification passes against a store with that table.
+/// As a [`BroadcastNodeProbe`], the fake advertises transaction broadcast,
+/// reports the table set by
+/// [`MockTransactionBroadcaster::with_node_activations`], and holds every
+/// block unless built [`MockTransactionBroadcaster::on_another_chain`], so a
+/// reader's first-contact verification passes against a store with that
+/// table.
 #[derive(Clone, Debug)]
 pub struct MockTransactionBroadcaster {
     outcome: BroadcastOutcome,
     captured_calls: Arc<Mutex<Vec<RawTransactionBytes>>>,
     node_activations: Option<NetworkUpgradeActivations>,
+    on_another_chain: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -104,6 +107,14 @@ impl MockTransactionBroadcaster {
         self
     }
 
+    /// Reports that the node's best chain holds none of the reader's blocks,
+    /// as a node on another chain with the same activation table would.
+    #[must_use]
+    pub fn on_another_chain(mut self) -> Self {
+        self.on_another_chain = true;
+        self
+    }
+
     /// Returns the raw-transaction byte arguments captured by every call to
     /// this broadcaster, in call order.
     #[must_use]
@@ -122,6 +133,7 @@ impl MockTransactionBroadcaster {
             outcome,
             captured_calls: Arc::new(Mutex::new(Vec::new())),
             node_activations: None,
+            on_another_chain: false,
         }
     }
 }
@@ -148,6 +160,10 @@ impl BroadcastNodeProbe for MockTransactionBroadcaster {
             .ok_or_else(|| SourceError::NodeUnavailable {
                 reason: "the mock node reports no network-upgrade activation table".to_owned(),
             })
+    }
+
+    async fn holds_block(&self, _block: BlockId) -> Result<bool, SourceError> {
+        Ok(!self.on_another_chain)
     }
 }
 

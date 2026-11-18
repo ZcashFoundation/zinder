@@ -14,10 +14,11 @@ use crate::{UpstreamNodeCapabilities, WalletServingPairSlot};
 ///
 /// A reader starts without contacting its node, so the endpoint is verified
 /// on first contact instead: `rpc.discover` must list `sendrawtransaction`,
-/// and the node's activation table must agree with the writer-admitted
-/// schedule of the serving pair through its visible tip. That table is
-/// specific to one network and chain, so a node on another network or fork
-/// fails the check. Until a verification passes, every broadcast fails with
+/// the node's activation table must agree with the writer-admitted schedule
+/// of the serving pair through its visible tip, and the node's best chain
+/// must hold the pair's visible tip block. A node on another network fails
+/// the table check, and a node on another chain with the same schedule fails
+/// the block check. Until a verification passes, every broadcast fails with
 /// [`SourceError::NodeUnavailable`] and no transaction bytes reach the
 /// endpoint. A passed verification holds for the life of the process, and
 /// clones share it.
@@ -69,9 +70,11 @@ where
     ///
     /// Returns the node's transport or protocol failure,
     /// [`SourceError::NodeCapabilityMissing`] when the node does not list
-    /// `sendrawtransaction`, or [`SourceError::SourceProtocolMismatch`] when
-    /// its activation table differs from the writer-admitted schedule at or
-    /// below the visible tip.
+    /// `sendrawtransaction`, [`SourceError::BlockUnavailable`] when the node
+    /// has not reached the visible tip, or
+    /// [`SourceError::SourceProtocolMismatch`] when its activation table
+    /// differs from the writer-admitted schedule at or below the visible tip
+    /// or its best chain holds another block at the visible tip height.
     pub async fn verify(
         &self,
         pair_slot: &WalletServingPairSlot,
@@ -128,13 +131,19 @@ async fn verify_node_endpoint(
     }
     let node_activations = source.fetch_network_upgrade_activations().await?;
     let pair = pair_slot.capture();
-    if !node_activations.preserves_through(
-        pair.network_upgrade_activations(),
-        pair.canonical_fence().visible_tip().height,
-    ) {
+    let visible_tip = pair.canonical_fence().visible_tip();
+    if !node_activations.preserves_through(pair.network_upgrade_activations(), visible_tip.height) {
         return Err(SourceError::SourceProtocolMismatch {
             reason: "node network-upgrade activations differ from the writer-admitted \
                      schedule at or below the served tip",
+        });
+    }
+    drop(pair);
+    // A tip block replaced by a reorg the pair has not published yet also
+    // fails here; the background probe verifies again on its next round.
+    if !source.holds_block(visible_tip).await? {
+        return Err(SourceError::SourceProtocolMismatch {
+            reason: "node best chain holds another block at the served tip height",
         });
     }
     Ok(UpstreamNodeCapabilities::from_probed(capabilities))

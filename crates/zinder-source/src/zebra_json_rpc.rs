@@ -330,6 +330,23 @@ impl ZebraJsonRpcSource {
             .map(SourceChainUpdate::connected_block)
     }
 
+    /// Fetches the hash of the block the node's best chain holds at `height`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SourceError::BlockUnavailable`] when the node holds no block
+    /// at `height`, such as one above its tip.
+    pub async fn fetch_block_hash(&self, height: BlockHeight) -> Result<BlockHash, SourceError> {
+        let block_hash_hex = self
+            .call_typed::<String>(
+                "getblockhash",
+                positional_params([Value::from(height.value())])?,
+                |error| block_read_error(height, error.message),
+            )
+            .await?;
+        decode_rpc_block_hash(&block_hash_hex)
+    }
+
     /// Fetches the node-advertised network upgrade activations.
     ///
     /// The values come from Zebra's `getblockchaininfo.upgrades` field so
@@ -1323,6 +1340,10 @@ impl BroadcastNodeProbe for ZebraJsonRpcSource {
         &self,
     ) -> Result<NetworkUpgradeActivations, SourceError> {
         Self::fetch_network_upgrade_activations(self).await
+    }
+
+    async fn holds_block(&self, block: BlockId) -> Result<bool, SourceError> {
+        Ok(self.fetch_block_hash(block.height).await? == block.hash)
     }
 }
 

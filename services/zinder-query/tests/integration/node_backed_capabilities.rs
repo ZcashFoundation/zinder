@@ -556,6 +556,10 @@ impl BroadcastNodeProbe for ProbedValuePoolSource {
     ) -> Result<zinder_core::NetworkUpgradeActivations, SourceError> {
         Ok(sample_regtest_upgrade_activations())
     }
+
+    async fn holds_block(&self, _block: BlockId) -> Result<bool, SourceError> {
+        Ok(true)
+    }
 }
 
 #[async_trait]

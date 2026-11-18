@@ -73,8 +73,8 @@ async fn broadcast_before_node_verification_fails_without_sending() -> eyre::Res
 }
 
 /// A node whose activation table differs from the writer-admitted schedule
-/// through the served tip is on another network or fork, so verification
-/// refuses it and it never receives a transaction.
+/// through the served tip is on another network, so verification refuses it
+/// and it never receives a transaction.
 #[tokio::test]
 async fn node_on_another_chain_fails_verification_and_receives_nothing() -> eyre::Result<()> {
     let mainnet_shaped = NetworkUpgradeActivations::new(
@@ -107,6 +107,42 @@ async fn node_on_another_chain_fails_verification_and_receives_nothing() -> eyre
         matches!(refusal, SourceError::SourceProtocolMismatch { .. }),
         "unexpected verification refusal: {refusal:?}"
     );
+    assert!(
+        wallet_query
+            .broadcast_transaction(RawTransactionBytes::new([0x00, 0x01]))
+            .await
+            .is_err()
+    );
+    assert!(broadcaster.captured_calls().is_empty());
+    Ok(())
+}
+
+/// A node with the writer-admitted schedule whose best chain holds another
+/// block at the served tip follows another chain, so verification refuses it
+/// and it never receives a transaction.
+#[tokio::test]
+async fn node_with_the_same_schedule_on_another_chain_fails_verification() -> eyre::Result<()> {
+    let broadcaster = MockTransactionBroadcaster::accepted(TransactionId::from_bytes([7; 32]))
+        .with_node_activations(sample_regtest_upgrade_activations())
+        .on_another_chain();
+    let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(1);
+    let mut store_fixture =
+        WalletServingStoreFixture::from_chain(&chain, &sample_regtest_upgrade_activations())?;
+    let slot = serving_pair_slot(&mut store_fixture)?;
+    let node = NodeBroadcast::new(broadcaster.clone());
+    let wallet_query = WalletServingQuery::from_serving_pair_slot(slot.clone())
+        .with_node_broadcast(Some(node.clone()));
+
+    let refusal = node
+        .verify(&slot)
+        .await
+        .err()
+        .ok_or_else(|| eyre!("a node on another chain must fail verification"))?;
+    assert!(
+        matches!(refusal, SourceError::SourceProtocolMismatch { .. }),
+        "unexpected verification refusal: {refusal:?}"
+    );
+    assert!(wallet_query.upstream_node_capabilities().is_none());
     assert!(
         wallet_query
             .broadcast_transaction(RawTransactionBytes::new([0x00, 0x01]))

@@ -20,8 +20,8 @@ use zinder_core::{
     SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome, TransactionId,
 };
 use zinder_source::{
-    CookieSource, NodeAuth, NodeCapability, NodeHealthConfig, NodeSource, SourceChainCursor,
-    SourceChainUpdate, SourceError, SourceFailureClass, TransactionBroadcaster,
+    BroadcastNodeProbe, CookieSource, NodeAuth, NodeCapability, NodeHealthConfig, NodeSource,
+    SourceChainCursor, SourceChainUpdate, SourceError, SourceFailureClass, TransactionBroadcaster,
     UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
     UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, ZebraJsonRpcSource,
@@ -2464,5 +2464,56 @@ async fn poll_upstream_health_uses_ready_endpoint_when_configured() -> eyre::Res
     assert!(!snapshot.ready_for_queries);
     assert_eq!(snapshot.source, "zebra_ready_endpoint");
     assert_eq!(snapshot.reason.as_ref(), "insufficient peers");
+    Ok(())
+}
+
+/// First-contact verification asks the node for the block at the reader's
+/// tip height, so a node on another chain with the same activation table is
+/// told apart by its block hash.
+#[tokio::test]
+async fn holds_block_compares_the_block_hash_at_its_height() -> eyre::Result<()> {
+    let held = BlockId::new(BlockHeight::new(7), BlockHash::from_bytes([0x07; 32]));
+    let held_hash_hex = json!(zinder_core::wire::encode_rpc_block_hash_hex(held.hash));
+    let server = JsonRpcTestServer::start([
+        method("getblockhash").reply(RpcReply::result(held_hash_hex.clone())),
+        method("getblockhash").reply(RpcReply::result(held_hash_hex)),
+    ])?;
+    let source = regtest_source(&server)?;
+
+    assert!(BroadcastNodeProbe::holds_block(&source, held).await?);
+    let other = BlockId::new(held.height, BlockHash::from_bytes([0x70; 32]));
+    assert!(!BroadcastNodeProbe::holds_block(&source, other).await?);
+    let requests = server.requests_for("getblockhash")?;
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests.iter().all(|request| request.params == json!([7])),
+        "getblockhash takes the height as a number: {requests:?}"
+    );
+    Ok(())
+}
+
+/// A node that has not reached the reader's tip holds no block there, which
+/// is a retryable read failure rather than evidence of another chain.
+#[tokio::test]
+async fn holds_block_above_the_node_tip_is_block_unavailable() -> eyre::Result<()> {
+    let server = JsonRpcTestServer::start([
+        method("getblockhash").reply(RpcReply::error("height out of range"))
+    ])?;
+    let source = regtest_source(&server)?;
+
+    let error = BroadcastNodeProbe::holds_block(
+        &source,
+        BlockId::new(BlockHeight::new(9), BlockHash::from_bytes([0x09; 32])),
+    )
+    .await
+    .err()
+    .ok_or_else(|| eyre!("a block above the node tip must not be reported as held"))?;
+    assert!(
+        matches!(
+            error,
+            SourceError::BlockUnavailable { height, .. } if height == BlockHeight::new(9)
+        ),
+        "unexpected error: {error:?}"
+    );
     Ok(())
 }
