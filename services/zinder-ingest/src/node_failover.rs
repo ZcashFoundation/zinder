@@ -24,7 +24,7 @@ use std::{
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use zinder_core::BlockId;
+use zinder_core::{BlockHash, BlockId};
 use zinder_runtime::{ActiveNodeEndpoint, ComposedReadiness, ReadinessCause, ReadinessInput};
 use zinder_source::{NodeSet, NodeSetSwitch, NodeSource, SourceFailureClass};
 
@@ -85,11 +85,21 @@ impl NodeFailoverPolicy {
         not_ready_for.is_some_and(|duration| duration >= self.upstream_not_ready_before_switch)
     }
 
-    /// Age past which a standby evaluation no longer qualifies a candidate.
-    fn evaluation_max_age(self) -> Duration {
+    /// Longest one endpoint's standby evaluation may take before the monitor
+    /// records it as unreachable.
+    fn evaluation_timeout(self) -> Duration {
         self.standby_evaluation_interval
-            .saturating_mul(3)
             .max(self.switch_check_timeout)
+    }
+
+    /// Age past which a standby evaluation no longer qualifies a candidate.
+    ///
+    /// Two evaluations of an endpoint that keeps answering are at most one
+    /// interval and two evaluation timeouts apart, whatever the other
+    /// endpoints do, so this bound only expires evaluations of an endpoint
+    /// that stopped answering.
+    fn evaluation_max_age(self) -> Duration {
+        self.evaluation_timeout().saturating_mul(4)
     }
 }
 
@@ -243,6 +253,7 @@ impl NodeFailover {
             switch,
             policy,
             readiness,
+            genesis_hash: admissions.genesis_hash(),
             value_pool_capabilities: admissions
                 .active()
                 .map(|active| ValuePoolCapabilities::of(active.capabilities))
@@ -250,6 +261,8 @@ impl NodeFailover {
             board: Mutex::new(FailoverBoard {
                 fence: None,
                 records,
+                evaluations_applied: 0,
+                failed_switch_after: None,
             }),
         });
         shared.publish_active_position();
@@ -358,6 +371,7 @@ struct FailoverShared<Endpoint> {
     switch: NodeSetSwitch<Endpoint>,
     policy: NodeFailoverPolicy,
     readiness: FailoverReadiness,
+    genesis_hash: BlockHash,
     value_pool_capabilities: ValuePoolCapabilities,
     board: Mutex<FailoverBoard>,
 }
@@ -365,6 +379,13 @@ struct FailoverShared<Endpoint> {
 struct FailoverBoard {
     fence: Option<FenceTips>,
     records: Vec<EndpointRecord>,
+    /// Standby evaluations the monitor has applied since ingest started.
+    evaluations_applied: u64,
+    /// `evaluations_applied` when the last switch attempt failed. Until the
+    /// monitor applies another evaluation, the board cannot offer a better
+    /// candidate, so a follower looping at its tip neither repeats the
+    /// attempt nor logs it again.
+    failed_switch_after: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -388,7 +409,9 @@ impl EndpointRecord {
             EndpointAdmission::Admitted(_) if position == admissions.active_position() => {
                 (None, NodeEndpointState::Active)
             }
-            EndpointAdmission::Admitted(_) => (None, NodeEndpointState::Pending),
+            EndpointAdmission::Admitted(_) | EndpointAdmission::Deferred => {
+                (None, NodeEndpointState::Pending)
+            }
             EndpointAdmission::Unreachable(_) => (None, NodeEndpointState::Unreachable),
         };
         Self {
@@ -431,6 +454,7 @@ where
             });
         }
         let mut board = self.board.lock();
+        board.failed_switch_after = None;
         for (position, record) in board.records.iter_mut().enumerate() {
             if position == active_position {
                 record.state = NodeEndpointState::Active;
@@ -598,6 +622,13 @@ where
 
     async fn switch_away(&self, failure_class: &'static str) -> Option<NodeEndpointSwitch> {
         let from_position = self.nodes.active_position();
+        let evaluations_applied = {
+            let board = self.board.lock();
+            if board.failed_switch_after == Some(board.evaluations_applied) {
+                return None;
+            }
+            board.evaluations_applied
+        };
         let candidates = self.ranked_candidates();
         if candidates.is_empty() {
             tracing::warn!(
@@ -607,7 +638,6 @@ where
                 failure_class,
                 "no standby node endpoint can take over; the follower stays on its endpoint"
             );
-            return None;
         }
         for (position, evaluation) in candidates {
             if self.confirm_candidate(position, evaluation).await && self.switch.switch_to(position)
@@ -620,6 +650,7 @@ where
                 ));
             }
         }
+        self.board.lock().failed_switch_after = Some(evaluations_applied);
         None
     }
 }
@@ -679,6 +710,21 @@ mod tests {
                 !policy.switches_after_failures(class, u32::MAX),
                 "{class:?}"
             );
+        }
+    }
+
+    #[test]
+    fn evaluations_of_an_answering_endpoint_never_expire_between_rounds() {
+        for (interval_ms, check_timeout_ms) in [(30_000, 5_000), (1_000, 5_000), (20, 1_000)] {
+            let policy = NodeFailoverPolicy {
+                standby_evaluation_interval: Duration::from_millis(interval_ms),
+                switch_check_timeout: Duration::from_millis(check_timeout_ms),
+                ..NodeFailoverPolicy::default()
+            };
+            let longest_gap = policy
+                .standby_evaluation_interval
+                .saturating_add(policy.evaluation_timeout().saturating_mul(2));
+            assert!(policy.evaluation_max_age() > longest_gap, "{policy:?}");
         }
     }
 

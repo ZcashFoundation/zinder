@@ -8,7 +8,7 @@
 
 use std::{sync::Arc, time::Instant};
 
-use futures_util::future::join_all;
+use futures_util::{StreamExt as _, stream::FuturesUnordered};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zinder_core::NetworkUpgradeActivations;
@@ -57,6 +57,7 @@ where
     })
 }
 
+#[derive(Clone, Copy)]
 enum Observation {
     ActiveHealth {
         ready: Option<bool>,
@@ -67,6 +68,26 @@ enum Observation {
     },
 }
 
+impl Observation {
+    const fn timed_out(active: bool) -> Self {
+        if active {
+            Self::ActiveHealth { ready: None }
+        } else {
+            Self::Standby {
+                state: NodeEndpointState::Unreachable,
+                evaluation: None,
+            }
+        }
+    }
+}
+
+/// Evaluates every endpoint that is not excluded, each within one
+/// evaluation timeout, and applies each observation as soon as it arrives.
+///
+/// Applying observations one at a time keeps a candidate's evaluation as
+/// fresh as its own answer: an active endpoint that hangs delays only its
+/// own health observation, never the evidence that another endpoint can
+/// take over.
 async fn evaluate_round<Endpoint>(
     shared: &FailoverShared<Endpoint>,
     admitted_activations: &NetworkUpgradeActivations,
@@ -83,67 +104,90 @@ async fn evaluate_round<Endpoint>(
             .collect::<Vec<_>>();
         (board.fence, excluded)
     };
-    let observations = join_all(
-        shared
-            .nodes
-            .endpoints()
-            .filter(|(position, _)| !excluded.get(*position).copied().unwrap_or(true))
-            .map(|(position, endpoint)| async move {
-                let observation = if position == active_position {
-                    Observation::ActiveHealth {
-                        ready: health_of(endpoint).await,
-                    }
-                } else {
-                    evaluate_candidate(
-                        endpoint,
-                        admitted_activations,
-                        fence,
-                        shared.value_pool_capabilities,
-                    )
-                    .await
-                };
-                (position, observation)
-            }),
-    )
-    .await;
-    apply_observations(shared, active_position, observations);
+    let evaluation_timeout = shared.policy.evaluation_timeout();
+    let mut observations = shared
+        .nodes
+        .endpoints()
+        .filter(|(position, _)| !excluded.get(*position).copied().unwrap_or(true))
+        .map(|(position, endpoint)| async move {
+            let active = position == active_position;
+            let observation = tokio::time::timeout(
+                evaluation_timeout,
+                observe(shared, endpoint, active, admitted_activations, fence),
+            )
+            .await
+            .unwrap_or_else(|_elapsed| Observation::timed_out(active));
+            (position, observation)
+        })
+        .collect::<FuturesUnordered<_>>();
+    while let Some((position, observation)) = observations.next().await {
+        if !apply_observation(shared, active_position, position, observation) {
+            break;
+        }
+    }
 }
 
-fn apply_observations<Endpoint>(
+async fn observe<Endpoint>(
+    shared: &FailoverShared<Endpoint>,
+    endpoint: &Endpoint,
+    active: bool,
+    admitted_activations: &NetworkUpgradeActivations,
+    fence: Option<FenceTips>,
+) -> Observation
+where
+    Endpoint: NodeSource,
+{
+    if active {
+        Observation::ActiveHealth {
+            ready: health_of(endpoint).await,
+        }
+    } else {
+        evaluate_candidate(shared, endpoint, admitted_activations, fence).await
+    }
+}
+
+/// Records one observation, or returns `false` once a switch since the
+/// round started has made the round's observations meaningless.
+fn apply_observation<Endpoint>(
     shared: &FailoverShared<Endpoint>,
     observed_active_position: usize,
-    observations: Vec<(usize, Observation)>,
-) where
+    position: usize,
+    observation: Observation,
+) -> bool
+where
     Endpoint: NodeSource,
 {
     let mut board = shared.board.lock();
-    // A switch during the round changes every endpoint's role, so the round's
-    // observations no longer describe them.
+    // A switch changes every endpoint's role, so observations taken for the
+    // previous roles no longer describe them.
     if shared.nodes.active_position() != observed_active_position {
-        return;
+        return false;
     }
-    for (position, observation) in observations {
-        let Some(record) = board.records.get_mut(position) else {
-            continue;
-        };
-        match observation {
-            Observation::ActiveHealth { ready } => match ready {
-                Some(true) => record.not_ready_since = None,
-                Some(false) => {
-                    record.not_ready_since.get_or_insert_with(Instant::now);
+    match observation {
+        Observation::ActiveHealth { ready } => {
+            if let Some(record) = board.records.get_mut(position) {
+                match ready {
+                    Some(true) => record.not_ready_since = None,
+                    Some(false) => {
+                        record.not_ready_since.get_or_insert_with(Instant::now);
+                    }
+                    None => {}
                 }
-                None => {}
-            },
-            Observation::Standby { state, evaluation } => {
+            }
+        }
+        Observation::Standby { state, evaluation } => {
+            if let Some(record) = board.records.get_mut(position) {
                 if record.state != state {
                     log_state_change(position, state);
                 }
                 record.state = state;
                 record.evaluation = evaluation;
             }
+            board.evaluations_applied = board.evaluations_applied.wrapping_add(1);
         }
     }
     record_state_metrics(&board.records);
+    true
 }
 
 /// Returns the endpoint's readiness, or `None` when it did not answer.
@@ -164,10 +208,10 @@ where
 }
 
 async fn evaluate_candidate<Endpoint>(
+    shared: &FailoverShared<Endpoint>,
     endpoint: &Endpoint,
     admitted_activations: &NetworkUpgradeActivations,
     fence: Option<FenceTips>,
-    value_pool_capabilities: ValuePoolCapabilities,
 ) -> Observation
 where
     Endpoint: NodeSource,
@@ -180,21 +224,23 @@ where
         state: NodeEndpointState::Unreachable,
         evaluation: None,
     };
-    match EndpointAdmission::check(endpoint, None).await {
+    // The genesis check covers endpoints that startup deferred or found
+    // unreachable, which were never checked against the configured network.
+    match EndpointAdmission::check(endpoint, Some(shared.genesis_hash)).await {
         EndpointAdmission::Admitted(admitted) => {
             if admitted.activations != *admitted_activations {
                 return ineligible(IneligibleReason::Refused(
                     EndpointExclusion::ScheduleConflict,
                 ));
             }
-            if ValuePoolCapabilities::of(admitted.capabilities) != value_pool_capabilities {
+            if ValuePoolCapabilities::of(admitted.capabilities) != shared.value_pool_capabilities {
                 return ineligible(IneligibleReason::CapabilityMismatch);
             }
         }
         EndpointAdmission::Excluded(exclusion) => {
             return ineligible(IneligibleReason::Refused(exclusion));
         }
-        EndpointAdmission::Unreachable(_) => return unreachable,
+        EndpointAdmission::Unreachable(_) | EndpointAdmission::Deferred => return unreachable,
     }
     match health_of(endpoint).await {
         Some(true) => {}

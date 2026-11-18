@@ -216,22 +216,29 @@ endpoint of the ordered node list ([Node source boundary §Ordered node
 list](node-source-boundary.md#ordered-node-list)). The rules are recorded in
 [ADR-0013](../adrs/0013-source-failure-recovery-topology.md) Decision 7.
 
-At startup, every endpoint is checked: required capabilities, activation
-table, and genesis block. The first admitted endpoint in position order becomes
-active, and its table is the one the store admits. An endpoint that reports
-pruned storage, lacks a required capability, answers for another network, or
-advertises another activation table is excluded until restart
-(`node_endpoint_excluded`). An endpoint that times out, fails a call, or does
-not report its storage mode is unreachable (`node_endpoint_unreachable`) and is
-evaluated again. When no endpoint is admitted, startup fails with the readiness
-`[node]` alone would have reported. A single-endpoint deployment keeps its
-startup checks unchanged and runs no genesis check.
+At startup, every endpoint is checked concurrently: required capabilities,
+activation table, and genesis block. The first admitted endpoint in position
+order becomes active as soon as every lower position has a verdict, and its
+table is the one the store admits. Startup does not wait for higher positions:
+an endpoint still being checked then is deferred (`node_endpoint_deferred`) to
+the standby monitor, so a fallback that does not answer never delays a healthy
+`[node]`. An endpoint that reports pruned storage, lacks a required capability,
+answers for another network, or advertises another activation table is
+excluded until restart (`node_endpoint_excluded`). An endpoint that times out,
+fails a call, or does not report its storage mode is unreachable
+(`node_endpoint_unreachable`) and is evaluated again. When no endpoint is
+admitted, startup fails with the readiness `[node]` alone would have reported.
+A single-endpoint deployment keeps its startup checks unchanged and runs no
+genesis check.
 
 While ingest follows, a standby monitor polls every endpoint on the
-`[node.health]` cadence, 30 seconds by default. It records whether the active
-endpoint reports ready, and whether each other endpoint could take over: it
-must report ready, advertise the required capabilities and the admitted table,
-and have a tip at or above the visible tip. It is a standby when it holds the
+`[node.health]` cadence, 30 seconds by default. Each endpoint's evaluation is
+bounded by that cadence, or by 5 seconds when the cadence is shorter, and is
+recorded as soon as it completes, so an active endpoint that hangs never delays
+the evidence about the others. The monitor records whether the active endpoint
+reports ready, and whether each other endpoint could take over: it must report
+ready, advertise the required capabilities and the admitted table, hold the
+configured network's genesis block, and have a tip at or above the visible tip. It is a standby when it holds the
 visible tip, and a diverged standby when it holds only the settled tip. The
 follower switches between iterations after three consecutive
 `node_unreachable` or `stream_disconnected` recoveries, or once the active
@@ -240,7 +247,9 @@ order, then diverged standbys, rechecking only the candidate's tip and the
 block it holds at the visible or settled tip, and logs
 `node_endpoint_switched`. A diverged standby's suffix above the settled tip is
 replaced within the reorg window as any reorg is. When no endpoint qualifies,
-the follower stays on its endpoint and recovers as before.
+the follower stays on its endpoint and recovers as before, and it attempts the
+switch again only after the monitor records another evaluation, so a follower
+waiting at its tip does not repeat the attempt on every iteration.
 
 A switch resets tip confirmation, skips the recovery backoff, and ends the live
 mempool stream, so the owner withdraws certification and rebuilds from the new

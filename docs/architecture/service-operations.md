@@ -1076,11 +1076,13 @@ events include:
 - `canonical_live_replacement_committed`
 
 With fallback node endpoints, ingest also logs `node_endpoint_admitted`,
-`node_endpoint_unreachable`, and `node_endpoint_excluded` at startup;
-`node_endpoint_state_changed` and `node_endpoint_skipped`, with a `reason`, as
-standby evaluation changes; `node_endpoint_switched` with `from_position`,
-`to_position`, and `failure_class`; and `node_endpoint_switch_unavailable` when
-a trigger finds no endpoint that can take over. Logs name endpoints by
+`node_endpoint_unreachable`, `node_endpoint_excluded`, and
+`node_endpoint_deferred` at startup; `node_endpoint_state_changed` and
+`node_endpoint_skipped`, with a `reason`, as standby evaluation changes;
+`node_endpoint_switched` with `from_position`, `to_position`, and
+`failure_class`; and `node_endpoint_switch_unavailable` when a trigger finds no
+endpoint that can take over. That last event repeats at most once per standby
+evaluation the monitor records, not on every follow iteration. Logs name endpoints by
 position, never by URL.
 
 Explorer view replay logs `materialized_view_replay_volume_space_low` once

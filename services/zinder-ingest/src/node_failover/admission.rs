@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use futures_util::future::join_all;
+use futures_util::{StreamExt as _, stream::FuturesUnordered};
 use thiserror::Error;
 use zinder_core::{BlockHash, BlockHeight, Network, NetworkUpgradeActivations};
 use zinder_source::{
@@ -85,6 +85,9 @@ pub enum EndpointAdmission {
     Unreachable(SourceError),
     /// The endpoint answered with evidence that it cannot serve this store.
     Excluded(EndpointExclusion),
+    /// The endpoint was still being checked when a lower position was
+    /// admitted. The standby monitor checks it, its genesis block included.
+    Deferred,
 }
 
 impl EndpointAdmission {
@@ -146,6 +149,7 @@ impl EndpointAdmission {
             Self::Admitted(_) => "admitted",
             Self::Unreachable(_) => "unreachable",
             Self::Excluded(exclusion) => exclusion.label(),
+            Self::Deferred => "deferred",
         }
     }
 }
@@ -163,6 +167,7 @@ pub fn missing_required_capability(capabilities: NodeCapabilities) -> Option<Nod
 #[derive(Debug)]
 pub struct NodeEndpointAdmissions {
     active_position: usize,
+    genesis_hash: BlockHash,
     verdicts: Vec<EndpointAdmission>,
 }
 
@@ -170,8 +175,12 @@ impl NodeEndpointAdmissions {
     /// Checks every endpoint concurrently and selects the first admitted one
     /// in position order.
     ///
-    /// Another admitted endpoint whose activation table differs from the
-    /// selected one is excluded with [`EndpointExclusion::ScheduleConflict`].
+    /// Admission returns as soon as every position below the first admitted
+    /// one has a verdict, so a fallback that does not answer never delays a
+    /// healthy `[node]`. Endpoints still being checked then are
+    /// [`EndpointAdmission::Deferred`]. Another admitted endpoint whose
+    /// activation table differs from the selected one is excluded with
+    /// [`EndpointExclusion::ScheduleConflict`].
     pub async fn admit<Endpoint>(
         nodes: &NodeSet<Endpoint>,
         network: Network,
@@ -179,17 +188,36 @@ impl NodeEndpointAdmissions {
     where
         Endpoint: NodeSource,
     {
-        let genesis_hash = Some(network.genesis_hash());
-        let mut verdicts = join_all(
-            nodes
-                .endpoints()
-                .map(|(_, endpoint)| EndpointAdmission::check(endpoint, genesis_hash)),
-        )
-        .await;
-        let Some(active_position) = verdicts
-            .iter()
-            .position(|verdict| matches!(verdict, EndpointAdmission::Admitted(_)))
-        else {
+        let genesis_hash = network.genesis_hash();
+        let mut checks = nodes
+            .endpoints()
+            .map(|(position, endpoint)| async move {
+                (
+                    position,
+                    EndpointAdmission::check(endpoint, Some(genesis_hash)).await,
+                )
+            })
+            .collect::<FuturesUnordered<_>>();
+        let mut decided = std::iter::repeat_with(|| None)
+            .take(nodes.endpoint_count())
+            .collect::<Vec<Option<EndpointAdmission>>>();
+        let active_position = loop {
+            if let Some(position) = settled_active_position(&decided) {
+                break Some(position);
+            }
+            let Some((position, verdict)) = checks.next().await else {
+                break None;
+            };
+            if let Some(slot) = decided.get_mut(position) {
+                *slot = Some(verdict);
+            }
+        };
+        drop(checks);
+        let mut verdicts = decided
+            .into_iter()
+            .map(|verdict| verdict.unwrap_or(EndpointAdmission::Deferred))
+            .collect::<Vec<_>>();
+        let Some(active_position) = active_position else {
             return Err(NoNodeEndpointAdmitted { verdicts });
         };
         let active_activations = match verdicts.get(active_position) {
@@ -205,6 +233,7 @@ impl NodeEndpointAdmissions {
         }
         Ok(Self {
             active_position,
+            genesis_hash,
             verdicts,
         })
     }
@@ -228,6 +257,28 @@ impl NodeEndpointAdmissions {
     pub fn verdicts(&self) -> impl Iterator<Item = (usize, &EndpointAdmission)> {
         self.verdicts.iter().enumerate()
     }
+
+    /// Genesis hash of the configured network.
+    pub(super) const fn genesis_hash(&self) -> BlockHash {
+        self.genesis_hash
+    }
+}
+
+/// Returns the first admitted position once every lower position has a
+/// verdict.
+fn settled_active_position(decided: &[Option<EndpointAdmission>]) -> Option<usize> {
+    for (position, verdict) in decided.iter().enumerate() {
+        match verdict {
+            None => return None,
+            Some(EndpointAdmission::Admitted(_)) => return Some(position),
+            Some(
+                EndpointAdmission::Unreachable(_)
+                | EndpointAdmission::Excluded(_)
+                | EndpointAdmission::Deferred,
+            ) => {}
+        }
+    }
+    None
 }
 
 /// No configured node endpoint passed its startup checks.
@@ -257,6 +308,7 @@ fn summarize(verdicts: &[EndpointAdmission]) -> String {
             EndpointAdmission::Excluded(exclusion) => {
                 format!("position {position}: excluded ({exclusion})")
             }
+            EndpointAdmission::Deferred => format!("position {position}: deferred"),
         })
         .collect::<Vec<_>>()
         .join("; ")

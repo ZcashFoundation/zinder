@@ -1364,6 +1364,12 @@ fn log_endpoint_admissions(admissions: &NodeEndpointAdmissions) {
                 detail = %exclusion,
                 "node endpoint is excluded until ingest restarts"
             ),
+            EndpointAdmission::Deferred => tracing::info!(
+                target: "zinder::ingest",
+                event = "node_endpoint_deferred",
+                position,
+                "node endpoint was still being checked when a lower position was admitted; the standby monitor checks it"
+            ),
             _ => {}
         }
     }

@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use parking_lot::Mutex;
 use tempfile::tempdir;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zinder_core::{
     BlockHash, BlockHeight, BlockId, CommitmentTreeCheckpoint, Network, NetworkUpgradeActivations,
@@ -25,16 +26,19 @@ use zinder_ingest::{
     CanonicalFollowConfig, CanonicalFollower, EndpointAdmission, EndpointExclusion,
     FailoverReadiness, IneligibleReason, NodeEndpointAdmissions, NodeEndpointState, NodeFailover,
     NodeFailoverPolicy, REQUIRED_INGEST_NODE_CAPABILITIES, follow_canonical_tip,
-    spawn_node_endpoint_monitor,
+    follow_canonical_tip_with_control, spawn_node_endpoint_monitor,
+    spawn_upstream_health_probe_task,
 };
-use zinder_runtime::{ActiveNodeEndpoint, ComposedReadiness, Readiness};
+use zinder_runtime::{
+    ActiveNodeEndpoint, ComposedReadiness, Readiness, ReadinessCause, ReadinessInput,
+};
 use zinder_source::{
     NodeCapabilities, NodeCapability, NodeSet, NodeSource, NodeStorageMode, SourceBlock,
     SourceChainSegment, SourceChainSegmentLimits, SourceError, SourceSubtreeRoots,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, UpstreamHealthSnapshot,
 };
 use zinder_store::RocksDbCanonicalStore;
-use zinder_testkit::sample_regtest_upgrade_activations;
+use zinder_testkit::{LogCapture, sample_regtest_upgrade_activations};
 
 use super::canonical_follow::{
     RecordingParseableSource, block_id, checkpoints_for_parseable_chain, forked_parseable_chain,
@@ -42,6 +46,18 @@ use super::canonical_follow::{
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+/// How an endpoint answers every call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Fault {
+    None,
+    /// Every call fails as `node_unreachable`.
+    Unreachable,
+    /// Every call fails as `stream_disconnected`.
+    StreamDisconnected,
+    /// Every call waits forever, as a black-holed host does.
+    Hangs,
+}
 
 /// A node endpoint with switchable faults over a parseable fixture chain.
 #[derive(Clone)]
@@ -51,7 +67,13 @@ struct FailoverEndpoint {
     activations: NetworkUpgradeActivations,
     genesis_hash: BlockHash,
     storage_mode: Arc<Mutex<Result<NodeStorageMode, &'static str>>>,
-    unreachable: Arc<AtomicBool>,
+    fault: Arc<Mutex<Fault>>,
+    /// Delay before capability discovery answers.
+    probe_delay: Arc<Mutex<Duration>>,
+    /// Makes the upstream health check wait forever.
+    health_hangs: Arc<AtomicBool>,
+    /// Blocks above this height are unavailable.
+    blocks_unavailable_above: Arc<Mutex<Option<BlockHeight>>>,
     ready: Arc<AtomicBool>,
 }
 
@@ -74,26 +96,42 @@ impl FailoverEndpoint {
             activations,
             genesis_hash: Network::ZcashRegtest.genesis_hash(),
             storage_mode: Arc::new(Mutex::new(Ok(NodeStorageMode::Archive))),
-            unreachable: Arc::new(AtomicBool::new(false)),
+            fault: Arc::new(Mutex::new(Fault::None)),
+            probe_delay: Arc::new(Mutex::new(Duration::ZERO)),
+            health_hangs: Arc::new(AtomicBool::new(false)),
+            blocks_unavailable_above: Arc::new(Mutex::new(None)),
             ready: Arc::new(AtomicBool::new(true)),
         })
     }
 
     fn set_unreachable(&self, unreachable: bool) {
-        self.unreachable.store(unreachable, Ordering::SeqCst);
+        self.set_fault(if unreachable {
+            Fault::Unreachable
+        } else {
+            Fault::None
+        });
+    }
+
+    fn set_fault(&self, fault: Fault) {
+        *self.fault.lock() = fault;
     }
 
     fn set_ready(&self, ready: bool) {
         self.ready.store(ready, Ordering::SeqCst);
     }
 
-    fn answer(&self) -> Result<(), SourceError> {
-        if self.unreachable.load(Ordering::SeqCst) {
-            return Err(SourceError::NodeUnavailable {
+    async fn answer(&self) -> Result<(), SourceError> {
+        let fault = *self.fault.lock();
+        match fault {
+            Fault::None => Ok(()),
+            Fault::Unreachable => Err(SourceError::NodeUnavailable {
                 reason: "connection refused".to_owned(),
-            });
+            }),
+            Fault::StreamDisconnected => Err(SourceError::ChainTipStreamUnavailable {
+                reason: "stream reset".to_owned(),
+            }),
+            Fault::Hangs => std::future::pending().await,
         }
-        Ok(())
     }
 }
 
@@ -104,26 +142,28 @@ impl NodeSource for FailoverEndpoint {
     }
 
     async fn probe_capabilities(&self) -> Result<NodeCapabilities, SourceError> {
-        self.answer()?;
+        let probe_delay = *self.probe_delay.lock();
+        tokio::time::sleep(probe_delay).await;
+        self.answer().await?;
         Ok(self.capabilities)
     }
 
     async fn fetch_network_upgrade_activations(
         &self,
     ) -> Result<NetworkUpgradeActivations, SourceError> {
-        self.answer()?;
+        self.answer().await?;
         Ok(self.activations.clone())
     }
 
     async fn fetch_storage_mode(&self) -> Result<NodeStorageMode, SourceError> {
-        self.answer()?;
+        self.answer().await?;
         (*self.storage_mode.lock()).map_err(|reason| SourceError::NodeUnavailable {
             reason: reason.to_owned(),
         })
     }
 
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
-        self.answer()?;
+        self.answer().await?;
         if height == BlockHeight::new(0) {
             return Ok(SourceBlock {
                 network: Network::ZcashRegtest,
@@ -134,6 +174,13 @@ impl NodeSource for FailoverEndpoint {
                 raw_block_bytes: Vec::new(),
             });
         }
+        let unavailable_above = *self.blocks_unavailable_above.lock();
+        if unavailable_above.is_some_and(|limit| height > limit) {
+            return Err(SourceError::BlockUnavailable {
+                height,
+                reason: "block not yet available".to_owned(),
+            });
+        }
         self.chain.fetch_block_at(height).await
     }
 
@@ -141,7 +188,7 @@ impl NodeSource for FailoverEndpoint {
         &self,
         limits: SourceChainSegmentLimits,
     ) -> Result<SourceChainSegment, SourceError> {
-        self.answer()?;
+        self.answer().await?;
         self.chain.fetch_chain_segment(limits).await
     }
 
@@ -150,14 +197,14 @@ impl NodeSource for FailoverEndpoint {
         height: BlockHeight,
         network_upgrade_activations: &NetworkUpgradeActivations,
     ) -> Result<CommitmentTreeCheckpoint, SourceError> {
-        self.answer()?;
+        self.answer().await?;
         self.chain
             .fetch_chain_checkpoint(height, network_upgrade_activations)
             .await
     }
 
     async fn tip_id(&self) -> Result<BlockId, SourceError> {
-        self.answer()?;
+        self.answer().await?;
         self.chain.tip_id().await
     }
 
@@ -165,12 +212,15 @@ impl NodeSource for FailoverEndpoint {
         &self,
         range: SubtreeRootRange,
     ) -> Result<SourceSubtreeRoots, SourceError> {
-        self.answer()?;
+        self.answer().await?;
         self.chain.fetch_subtree_root_range(range).await
     }
 
     async fn poll_upstream_health(&self) -> Result<UpstreamHealthSnapshot, SourceError> {
-        self.answer()?;
+        if self.health_hangs.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        self.answer().await?;
         Ok(if self.ready.load(Ordering::SeqCst) {
             UpstreamHealthSnapshot::ready(
                 UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK,
@@ -235,60 +285,147 @@ async fn published_store() -> TestResult<PublishedStore> {
     })
 }
 
-/// Admits `endpoints`, starts the standby monitor, and follows to
-/// `target_height` with failover enabled.
+/// One failover run: the policy, whether `[node.health]` gates readiness,
+/// and the height the follower stops at.
+#[derive(Clone, Copy)]
+struct FailoverRun {
+    policy: NodeFailoverPolicy,
+    gates_node_source_input: bool,
+    target_height: u32,
+}
+
+impl FailoverRun {
+    fn to_height(target_height: u32) -> Self {
+        Self {
+            policy: fast_policy(),
+            gates_node_source_input: false,
+            target_height,
+        }
+    }
+}
+
+/// Admitted endpoints with a running standby monitor.
+struct StartedFailover {
+    nodes: NodeSet<FailoverEndpoint>,
+    failover: NodeFailover,
+    readiness: Readiness,
+    composed: ComposedReadiness,
+    activations: Arc<NetworkUpgradeActivations>,
+    cancel: CancellationToken,
+    monitor: JoinHandle<()>,
+}
+
+impl StartedFailover {
+    async fn start(endpoints: Vec<FailoverEndpoint>, run: FailoverRun) -> TestResult<Self> {
+        let mut endpoints = endpoints.into_iter();
+        let primary = endpoints.next().ok_or("the node list needs [node]")?;
+        let (nodes, switch) = NodeSet::new(primary, endpoints);
+        let admissions = NodeEndpointAdmissions::admit(&nodes, Network::ZcashRegtest).await?;
+        let readiness = Readiness::default();
+        let required_inputs: &[ReadinessInput] = if run.gates_node_source_input {
+            &[ReadinessInput::NodeSource]
+        } else {
+            &[]
+        };
+        let composed = ComposedReadiness::new(readiness.clone(), required_inputs);
+        let (failover, monitor) = NodeFailover::new(
+            nodes.clone(),
+            switch,
+            &admissions,
+            run.policy,
+            FailoverReadiness {
+                readiness: composed.clone(),
+                gates_node_source_input: run.gates_node_source_input,
+            },
+        );
+        let activations = Arc::new(sample_regtest_upgrade_activations());
+        let cancel = CancellationToken::new();
+        let monitor =
+            spawn_node_endpoint_monitor(monitor, Arc::clone(&activations), cancel.clone());
+        Ok(Self {
+            nodes,
+            failover,
+            readiness,
+            composed,
+            activations,
+            cancel,
+            monitor,
+        })
+    }
+
+    fn follower(&self, target_height: u32) -> CanonicalFollower<'_, NodeSet<FailoverEndpoint>> {
+        CanonicalFollower::new(
+            &self.nodes,
+            Arc::clone(&self.activations),
+            CanonicalFollowConfig {
+                request_timeout: Duration::from_secs(5),
+                poll_interval: Duration::ZERO,
+                lag_threshold_blocks: 0,
+                target_height: Some(BlockHeight::new(target_height)),
+                event_retention_window: None,
+                event_retention_check_interval: Duration::from_secs(1),
+                mempool_ready_gate: None,
+                max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+                node_failover: Some(self.failover.clone()),
+            },
+            &self.composed,
+            &self.cancel,
+        )
+    }
+
+    async fn stop(self) -> TestResult<FailoverOutcomeHandles> {
+        self.cancel.cancel();
+        self.monitor.await?;
+        Ok(FailoverOutcomeHandles {
+            failover: self.failover,
+            readiness: self.readiness,
+            composed: self.composed,
+        })
+    }
+}
+
+struct FailoverOutcomeHandles {
+    failover: NodeFailover,
+    readiness: Readiness,
+    composed: ComposedReadiness,
+}
+
+struct FailoverOutcome {
+    store: RocksDbCanonicalStore,
+    failover: NodeFailover,
+    readiness: Readiness,
+    composed: ComposedReadiness,
+}
+
+/// Admits `endpoints`, starts the standby monitor, and follows to the run's
+/// target height with failover enabled.
 async fn follow_with_failover(
     store: RocksDbCanonicalStore,
     endpoints: Vec<FailoverEndpoint>,
-    policy: NodeFailoverPolicy,
+    run: FailoverRun,
     before_follow: impl FnOnce(),
-    target_height: u32,
-) -> TestResult<(RocksDbCanonicalStore, NodeFailover, Readiness)> {
-    let mut endpoints = endpoints.into_iter();
-    let primary = endpoints.next().ok_or("the node list needs [node]")?;
-    let (nodes, switch) = NodeSet::new(primary, endpoints);
-    let admissions = NodeEndpointAdmissions::admit(&nodes, Network::ZcashRegtest).await?;
-    let readiness = Readiness::default();
-    let composed = ComposedReadiness::new(readiness.clone(), &[]);
-    let (failover, monitor) = NodeFailover::new(
-        nodes.clone(),
-        switch,
-        &admissions,
-        policy,
-        FailoverReadiness {
-            readiness: composed.clone(),
-            gates_node_source_input: false,
-        },
-    );
-    let activations = Arc::new(sample_regtest_upgrade_activations());
-    let cancel = CancellationToken::new();
-    let monitor = spawn_node_endpoint_monitor(monitor, Arc::clone(&activations), cancel.clone());
+) -> TestResult<FailoverOutcome> {
+    let started = StartedFailover::start(endpoints, run).await?;
     before_follow();
-    let follower = CanonicalFollower::new(
-        &nodes,
-        activations,
-        CanonicalFollowConfig {
-            request_timeout: Duration::from_secs(5),
-            poll_interval: Duration::ZERO,
-            lag_threshold_blocks: 0,
-            target_height: Some(BlockHeight::new(target_height)),
-            event_retention_window: None,
-            event_retention_check_interval: Duration::from_secs(1),
-            mempool_ready_gate: None,
-            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
-            node_failover: Some(failover.clone()),
-        },
-        &composed,
-        &cancel,
-    );
     let follow_outcome = tokio::time::timeout(
         Duration::from_secs(30),
-        Box::pin(follow_canonical_tip(store, follower)),
+        Box::pin(follow_canonical_tip(
+            store,
+            started.follower(run.target_height),
+        )),
     )
     .await;
-    cancel.cancel();
-    monitor.await?;
-    Ok((follow_outcome??, failover, readiness))
+    let FailoverOutcomeHandles {
+        failover,
+        readiness,
+        composed,
+    } = started.stop().await?;
+    Ok(FailoverOutcome {
+        store: follow_outcome??,
+        failover,
+        readiness,
+        composed,
+    })
 }
 
 #[tokio::test]
@@ -305,12 +442,16 @@ async fn follower_switches_after_three_unreachable_recoveries_and_keeps_appendin
     let fallback = FailoverEndpoint::serving(&blocks, 4)?;
     let failing_primary = primary.clone();
 
-    let (store, failover, readiness) = follow_with_failover(
+    let FailoverOutcome {
+        store,
+        failover,
+        readiness,
+        ..
+    } = follow_with_failover(
         store,
         vec![primary, fallback],
-        fast_policy(),
+        FailoverRun::to_height(4),
         || failing_primary.set_unreachable(true),
-        4,
     )
     .await?;
 
@@ -366,10 +507,12 @@ async fn stays_on_the_active_endpoint(
     let standby = make_standby(&blocks)?;
     let recovering_primary = primary.clone();
 
-    let (store, failover, _readiness) = follow_with_failover(
+    let FailoverOutcome {
+        store, failover, ..
+    } = follow_with_failover(
         store,
         vec![primary, standby],
-        fast_policy(),
+        FailoverRun::to_height(4),
         move || {
             recovering_primary.set_unreachable(true);
             tokio::spawn(async move {
@@ -379,7 +522,6 @@ async fn stays_on_the_active_endpoint(
                 recovering_primary.set_unreachable(false);
             });
         },
-        4,
     )
     .await?;
 
@@ -408,12 +550,13 @@ async fn standby_holding_the_visible_tip_wins_over_a_diverged_one() -> TestResul
     let holding = FailoverEndpoint::serving(&blocks, 4)?;
     let failing_primary = primary.clone();
 
-    let (store, failover, _readiness) = follow_with_failover(
+    let FailoverOutcome {
+        store, failover, ..
+    } = follow_with_failover(
         store,
         vec![primary, diverged, holding],
-        fast_policy(),
+        FailoverRun::to_height(4),
         || failing_primary.set_unreachable(true),
-        4,
     )
     .await?;
 
@@ -434,12 +577,13 @@ async fn a_diverged_standby_takes_over_when_it_is_the_only_one() -> TestResult {
     let diverged = FailoverEndpoint::serving(&diverged_chain, 4)?;
     let failing_primary = primary.clone();
 
-    let (store, failover, _readiness) = follow_with_failover(
+    let FailoverOutcome {
+        store, failover, ..
+    } = follow_with_failover(
         store,
         vec![primary, diverged],
-        fast_policy(),
+        FailoverRun::to_height(4),
         || failing_primary.set_unreachable(true),
-        4,
     )
     .await?;
 
@@ -465,15 +609,19 @@ async fn sustained_not_ready_switches_at_the_top_of_an_iteration() -> TestResult
     let fallback = FailoverEndpoint::serving(&blocks, 4)?;
     let unready_primary = primary.clone();
 
-    let (store, failover, _readiness) = follow_with_failover(
+    let FailoverOutcome {
+        store, failover, ..
+    } = follow_with_failover(
         store,
         vec![primary, fallback],
-        NodeFailoverPolicy {
-            upstream_not_ready_before_switch: Duration::from_millis(100),
-            ..fast_policy()
+        FailoverRun {
+            policy: NodeFailoverPolicy {
+                upstream_not_ready_before_switch: Duration::from_millis(100),
+                ..fast_policy()
+            },
+            ..FailoverRun::to_height(4)
         },
         || unready_primary.set_ready(false),
-        4,
     )
     .await?;
 
@@ -506,6 +654,9 @@ async fn startup_reads_from_the_first_admitted_endpoint() -> TestResult {
 async fn startup_excludes_endpoints_only_on_positive_evidence() -> TestResult {
     let blocks = parseable_multi_block_chain()?;
     let primary = FailoverEndpoint::serving(&blocks, 4)?;
+    // Admission returns once `[node]` is admitted, so `[node]` answers last
+    // to let every fallback's verdict land first.
+    *primary.probe_delay.lock() = Duration::from_millis(200);
     let mut pruned = FailoverEndpoint::serving(&blocks, 4)?;
     pruned.capabilities = archive_capabilities_withheld(pruned.capabilities)?;
     *pruned.storage_mode.lock() = Ok(NodeStorageMode::Pruned);
@@ -578,6 +729,286 @@ async fn startup_fails_when_no_endpoint_is_admitted() -> TestResult {
     let message = refusal.to_string();
     assert!(message.contains("position 0: unreachable"), "{message}");
     assert!(message.contains("position 1: excluded"), "{message}");
+    Ok(())
+}
+
+/// A fallback that never answers does not hold back a healthy `[node]`; it
+/// is left to the standby monitor.
+#[tokio::test]
+async fn startup_does_not_wait_for_a_fallback_that_does_not_answer() -> TestResult {
+    let blocks = parseable_multi_block_chain()?;
+    let primary = FailoverEndpoint::serving(&blocks, 4)?;
+    let black_holed = FailoverEndpoint::serving(&blocks, 4)?;
+    black_holed.set_fault(Fault::Hangs);
+    let (nodes, _switch) = NodeSet::new(primary, [black_holed]);
+
+    let admissions = tokio::time::timeout(
+        Duration::from_secs(5),
+        NodeEndpointAdmissions::admit(&nodes, Network::ZcashRegtest),
+    )
+    .await??;
+
+    assert_eq!(admissions.active_position(), 0);
+    assert!(matches!(
+        admissions.verdicts().nth(1),
+        Some((1, EndpointAdmission::Deferred))
+    ));
+    Ok(())
+}
+
+/// The monitor checks a deferred endpoint's genesis block, so an endpoint
+/// on another network never becomes a candidate.
+#[tokio::test]
+async fn the_monitor_checks_the_genesis_block_of_a_deferred_endpoint() -> TestResult {
+    let blocks = parseable_multi_block_chain()?;
+    let primary = FailoverEndpoint::serving(&blocks, 4)?;
+    let mut other_network = FailoverEndpoint::serving(&blocks, 4)?;
+    other_network.genesis_hash = Network::ZcashTestnet.genesis_hash();
+    *other_network.probe_delay.lock() = Duration::from_millis(200);
+
+    let started =
+        StartedFailover::start(vec![primary, other_network], FailoverRun::to_height(4)).await?;
+    let expected = NodeEndpointState::Ineligible(IneligibleReason::Refused(
+        EndpointExclusion::GenesisMismatch,
+    ));
+    let observed = tokio::time::timeout(Duration::from_secs(5), async {
+        while started.failover.endpoint_states().get(1).copied() != Some(expected) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    started.stop().await?;
+
+    assert!(
+        observed.is_ok(),
+        "the monitor never checked the genesis block"
+    );
+    Ok(())
+}
+
+/// An active endpoint whose health check hangs past every evaluation bound
+/// does not hold back the evidence that a standby can take over.
+#[tokio::test]
+async fn a_standby_takes_over_while_the_active_health_check_hangs() -> TestResult {
+    let PublishedStore {
+        blocks,
+        store,
+        _directory,
+    } = published_store().await?;
+    let primary = FailoverEndpoint::serving(&blocks, 2)?;
+    let fallback = FailoverEndpoint::serving(&blocks, 4)?;
+    let failing_primary = primary.clone();
+
+    let FailoverOutcome {
+        store, failover, ..
+    } = follow_with_failover(
+        store,
+        vec![primary, fallback],
+        FailoverRun::to_height(4),
+        || {
+            failing_primary.health_hangs.store(true, Ordering::SeqCst);
+            failing_primary.set_unreachable(true);
+        },
+    )
+    .await?;
+
+    assert_eq!(failover.active_position(), 1);
+    assert_eq!(store.event_fence().visible_tip(), block_id(&blocks, 4)?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn follower_switches_after_three_stream_disconnected_recoveries() -> TestResult {
+    let PublishedStore {
+        blocks,
+        store,
+        _directory,
+    } = published_store().await?;
+    let primary = FailoverEndpoint::serving(&blocks, 2)?;
+    let fallback = FailoverEndpoint::serving(&blocks, 4)?;
+    let failing_primary = primary.clone();
+
+    let FailoverOutcome {
+        store, failover, ..
+    } = follow_with_failover(
+        store,
+        vec![primary, fallback],
+        FailoverRun::to_height(4),
+        || failing_primary.set_fault(Fault::StreamDisconnected),
+    )
+    .await?;
+
+    assert_eq!(failover.active_position(), 1);
+    assert_eq!(store.event_fence().visible_tip(), block_id(&blocks, 4)?);
+    Ok(())
+}
+
+/// With `[node.health]` gating readiness, a switch withholds readiness
+/// until the probe observes the new endpoint.
+#[tokio::test]
+async fn a_switch_resets_the_gated_node_source_input_to_starting() -> TestResult {
+    let PublishedStore {
+        blocks,
+        store,
+        _directory,
+    } = published_store().await?;
+    let primary = FailoverEndpoint::serving(&blocks, 2)?;
+    let fallback = FailoverEndpoint::serving(&blocks, 4)?;
+    let failing_primary = primary.clone();
+
+    let FailoverOutcome {
+        failover, composed, ..
+    } = follow_with_failover(
+        store,
+        vec![primary, fallback],
+        FailoverRun {
+            gates_node_source_input: true,
+            ..FailoverRun::to_height(4)
+        },
+        || failing_primary.set_unreachable(true),
+    )
+    .await?;
+
+    assert_eq!(failover.active_position(), 1);
+    assert!(matches!(
+        composed.input_cause(ReadinessInput::NodeSource),
+        Some(ReadinessCause::Starting)
+    ));
+    Ok(())
+}
+
+/// A tip the previous endpoint confirmed is unconfirmed after a switch
+/// until the new endpoint confirms it.
+#[tokio::test]
+async fn a_switch_reports_the_tip_unconfirmed_until_the_new_endpoint_confirms_it() -> TestResult {
+    let PublishedStore {
+        blocks,
+        store,
+        _directory,
+    } = published_store().await?;
+    let primary = FailoverEndpoint::serving(&blocks, 2)?;
+    let fallback = FailoverEndpoint::serving(&blocks, 4)?;
+    *fallback.blocks_unavailable_above.lock() = Some(BlockHeight::new(2));
+    let failing_primary = primary.clone();
+    let healing_fallback = fallback.clone();
+    let started =
+        StartedFailover::start(vec![primary, fallback], FailoverRun::to_height(4)).await?;
+    let (canonical, commands) = zinder_ingest::canonical_control_channel();
+
+    let observe = async {
+        while !started.readiness.report().is_ready {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let confirmed = canonical.writer_status().await?;
+        failing_primary.set_unreachable(true);
+        while started.failover.active_position() != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let after_switch = canonical.writer_status().await?;
+        *healing_fallback.blocks_unavailable_above.lock() = None;
+        Ok::<_, tonic::Status>((confirmed, after_switch))
+    };
+    let (statuses, outcome) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(
+            observe,
+            Box::pin(follow_canonical_tip_with_control(
+                store,
+                started.follower(4),
+                commands,
+            )),
+        )
+    })
+    .await?;
+    let (confirmed, after_switch) = statuses?;
+    let store = outcome?;
+    started.stop().await?;
+
+    assert!(!confirmed.tip_unconfirmed);
+    assert!(after_switch.tip_unconfirmed);
+    assert_eq!(store.event_fence().visible_tip(), block_id(&blocks, 4)?);
+    Ok(())
+}
+
+/// A switch attempt that finds no candidate is not repeated, or logged
+/// again, until the monitor applies another standby evaluation.
+#[tokio::test]
+async fn a_failed_switch_is_retried_only_after_a_new_standby_evaluation() -> TestResult {
+    let capture = LogCapture::install_for_target("zinder::ingest");
+    let PublishedStore {
+        blocks,
+        store,
+        _directory,
+    } = published_store().await?;
+    let primary = FailoverEndpoint::serving(&blocks, 2)?;
+    let standby = FailoverEndpoint::serving(&blocks, 4)?;
+    standby.set_ready(false);
+    let unready_primary = primary.clone();
+    let recovering_standby = standby.clone();
+
+    let FailoverOutcome { failover, .. } = follow_with_failover(
+        store,
+        vec![primary, standby],
+        FailoverRun {
+            policy: NodeFailoverPolicy {
+                upstream_not_ready_before_switch: Duration::from_millis(50),
+                standby_evaluation_interval: Duration::from_millis(200),
+                ..fast_policy()
+            },
+            ..FailoverRun::to_height(4)
+        },
+        move || {
+            unready_primary.set_ready(false);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1_500)).await;
+                recovering_standby.set_ready(true);
+            });
+        },
+    )
+    .await?;
+
+    let unavailable = capture
+        .events()
+        .iter()
+        .filter(|event| event.field("event") == Some("node_endpoint_switch_unavailable"))
+        .count();
+    assert_eq!(failover.active_position(), 1);
+    // About eight standby evaluations land before the standby recovers; the
+    // follower loops at its tip thousands of times in that window.
+    assert!((1..=15).contains(&unavailable), "{unavailable}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn upstream_health_probe_observes_the_new_endpoint_right_after_a_switch() -> TestResult {
+    let blocks = parseable_multi_block_chain()?;
+    let primary = FailoverEndpoint::serving(&blocks, 4)?;
+    let syncing_fallback = FailoverEndpoint::serving(&blocks, 4)?;
+    syncing_fallback.set_ready(false);
+    let (nodes, switch) = NodeSet::new(primary, [syncing_fallback]);
+    let composed = ComposedReadiness::new(Readiness::default(), &[ReadinessInput::NodeSource]);
+    let cancel = CancellationToken::new();
+    let probe = spawn_upstream_health_probe_task(
+        Arc::new(nodes.clone()),
+        composed.clone(),
+        Duration::from_hours(1),
+        Some(nodes.subscribe_switches()),
+        cancel.clone(),
+    );
+
+    assert!(switch.switch_to(1));
+    let observed = tokio::time::timeout(Duration::from_secs(5), async {
+        while !matches!(
+            composed.input_cause(ReadinessInput::NodeSource),
+            Some(ReadinessCause::UpstreamNotReady(_))
+        ) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    cancel.cancel();
+    probe.await?;
+
+    assert!(observed.is_ok(), "the probe waited for its next tick");
     Ok(())
 }
 

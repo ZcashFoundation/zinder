@@ -296,9 +296,11 @@ mempool after a switch, as for `[node]`; to stream it over TLS, add the
 the way the indexer TLS overlay sets the `[node]` ones.
 
 At startup, ingest checks each endpoint's capabilities, activation table, and
-genesis block, and starts on the first one that passes, `[node]` first.
+genesis block, and starts on the first one that passes, `[node]` first, without
+waiting for the fallbacks once `[node]` passes.
 `docker compose logs zinder-ingest` shows `node_endpoint_admitted`,
-`node_endpoint_unreachable`, or `node_endpoint_excluded` for each position, and
+`node_endpoint_unreachable`, `node_endpoint_excluded`, or
+`node_endpoint_deferred` for each position, and
 `/readyz` on port 9105 reports `active_node.position`. A switch logs
 `node_endpoint_switched`. Ingest does not switch back on its own: it stays on
 the fallback until the fallback fails or ingest restarts, and a restart starts
