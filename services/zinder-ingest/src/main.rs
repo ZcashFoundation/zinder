@@ -21,10 +21,11 @@ use zinder_ingest::{
     MempoolRetentionSettings, NoNodeEndpointAdmitted, NodeEndpointAdmissions, NodeEndpointMonitor,
     NodeFailover, NodeFailoverPolicy, NodeSourceKind, ReplayPrevoutCaches,
     TransactionComponentBackfillConfig, TransactionComponentBackfillContext, VolumeSpaceGuard,
-    admit_canonical_store, canonical_control_channel, classify_phase,
-    follow_admitted_canonical_store, mempool_ready_channel, missing_required_capability,
-    open_primary_materialized_view_store, run_live_mempool_owner, run_mempool_retention,
-    seed_backfill_owned_consumer_cursors, spawn_conventional_fee_distribution_backfill_task,
+    admit_canonical_store, canonical_control_channel, check_single_endpoint_genesis,
+    classify_phase, follow_admitted_canonical_store, mempool_ready_channel,
+    missing_required_capability, open_primary_materialized_view_store, run_live_mempool_owner,
+    run_mempool_retention, seed_backfill_owned_consumer_cursors,
+    spawn_conventional_fee_distribution_backfill_task,
     spawn_materialized_view_replay_budget_metrics_task, spawn_materialized_view_tailer_task,
     spawn_node_endpoint_monitor, spawn_runtime_memory_metrics_task,
     spawn_transaction_component_backfill_task, spawn_undo_index_pruning_task,
@@ -1262,26 +1263,33 @@ type AdmittedNodeFailover = Option<(NodeFailover, NodeEndpointMonitor<ZebraJsonR
 /// Admits the endpoint ingest reads from first and returns the activation
 /// table the writer opens the store with.
 ///
-/// Without `[node_fallbacks.N]`, `[node]` is checked as it always was. With
-/// them, every endpoint is checked, its genesis block included, and the first
-/// admitted endpoint in position order becomes active; the returned failover
-/// switches between them while ingest follows the chain. The table is then
-/// the one admission compared with the store, never a later read.
+/// Every endpoint's genesis block is checked, so a node serving another
+/// chain never starts ingest. Without `[node_fallbacks.N]`, `[node]` keeps
+/// its own capability and activation reads. With them, every endpoint is checked
+/// and the first admitted endpoint in position order becomes active; the
+/// returned failover switches between them while ingest follows the chain.
+/// The table is then the one admission compared with the store, never a
+/// later read.
 async fn admit_node_endpoints(
     command_config: &IngestCommandConfig,
     nodes: NodeSet<ZebraJsonRpcSource>,
     node_switch: NodeSetSwitch<ZebraJsonRpcSource>,
     readiness: &ComposedReadiness,
 ) -> Result<(Arc<NetworkUpgradeActivations>, AdmittedNodeFailover), IngestConfigError> {
+    let node = &command_config.runtime_config.node;
     if !nodes.has_fallbacks() {
         ensure_node_capabilities(&nodes, readiness).await?;
-        let activations =
-            zinder_source::discover_network_upgrade_activations(&nodes, "zinder-ingest")
-                .await
-                .map_err(IngestError::from)?;
-        return Ok((activations, None));
+        let activations = nodes
+            .fetch_network_upgrade_activations()
+            .await
+            .map_err(IngestError::from)?;
+        if let Err(refusal) = check_single_endpoint_genesis(&nodes, node.network).await {
+            publish_endpoint_refusal(&refusal, readiness);
+            return Err(refusal.into());
+        }
+        zinder_source::record_network_upgrade_activations_discovered(&activations, "zinder-ingest");
+        return Ok((Arc::new(activations), None));
     }
-    let node = &command_config.runtime_config.node;
     let store =
         zinder_ingest::read_ready_store_summary(&command_config.runtime_config.storage_path)?;
     let admissions = match NodeEndpointAdmissions::admit(&nodes, node.network, store.as_ref()).await

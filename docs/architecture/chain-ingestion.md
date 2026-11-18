@@ -12,6 +12,7 @@ load and validate configuration
   -> connect to Zebra and discover capabilities
      (with [node_fallbacks.N], admit every endpoint and start on the first admitted one)
   -> discover network-upgrade activations
+  -> refuse a node whose block 0 is not the network's genesis block
   -> open a ready canonical store
      or recover a published staging store
      or construct and publish a fresh store
@@ -262,8 +263,9 @@ at or above the store's visible tip, and hold the visible tip or the settled
 tip. Otherwise it is skipped (`node_endpoint_skipped`) and evaluated again, so
 startup never follows a chain that differs at or below the settled tip. When no endpoint is
 admitted, startup fails with the readiness `[node]` alone would have reported.
-A single-endpoint deployment keeps its startup checks unchanged and runs no
-genesis check.
+A single-endpoint deployment keeps its capability and activation checks and
+runs the same genesis check on `[node]`; see [Supported
+chains](#supported-chains).
 
 While ingest follows, a standby monitor polls every endpoint on the
 `[node.health]` cadence, 30 seconds by default. Each endpoint's evaluation is
@@ -369,12 +371,20 @@ Zinder indexes the public Mainnet and Testnet chains and Regtest. Each
 that hash as its history predecessor, so it fails when the node's block 1 does
 not descend from it.
 
+Before it opens storage, ingest reads block 0 from each endpoint it checks at
+startup, including `[node]` when it is the only endpoint, and refuses an
+endpoint whose block hash differs from the configured network's. The chain name a node reports cannot replace
+this check: Zebra reports `test` for both Testnet and Regtest. With one
+endpoint, a mismatch fails startup with `node_endpoints_unavailable`, and
+`/readyz` reports `node_unavailable` with failure class `configuration`. A
+block 0 read that fails, for example while the node is still starting, is no
+evidence of another chain: startup fails with the read's own failure class, as
+when any other startup read fails.
+
 A Zebra or Zakura test network configured with its own genesis block is not
 supported. Its activation heights are discovered like any other network's, but
-its genesis differs from the one Zinder expects. A checkpointed build never
-compares the node's chain with the genesis hash. Pointing a checkpointed build
-at such a node can therefore store a different chain under the `zcash-testnet`
-identity.
+its genesis differs from the one Zinder expects, so ingest refuses to start on
+it, checkpointed builds included.
 
 ## Invariants
 

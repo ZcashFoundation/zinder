@@ -3,9 +3,11 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
-use std::{error::Error, fs, path::Path};
+use std::{error::Error, fs, path::Path, process::Output};
 
+use serde_json::{Value, json};
 use tempfile::tempdir;
+use zinder_testkit::json_rpc_test_server::{JsonRpcTestServer, RpcReply, method};
 
 use crate::common::zinder_ingest_command;
 
@@ -263,6 +265,89 @@ fn startup_fails_before_connecting_when_the_indexer_ca_file_is_missing()
     );
 
     Ok(())
+}
+
+/// A single `[node]` whose block 0 is not the configured network's genesis
+/// block refuses startup before storage is created.
+#[test]
+fn startup_refuses_a_single_node_on_another_chain() -> Result<(), Box<dyn Error>> {
+    let block_one: Value =
+        serde_json::from_str(include_str!("../fixtures/z3-regtest-block-1.json"))?;
+    let raw_block_hex = block_one
+        .get("raw_block_hex")
+        .cloned()
+        .ok_or("the fixture carries raw_block_hex")?;
+    let node = archive_node_stub(RpcReply::result(raw_block_hex))?;
+
+    let (output, storage_created) = run_ingest_against(&node)?;
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("node_endpoints_unavailable"), "{stderr}");
+    assert!(
+        stderr.contains(
+            "position 0: excluded (the node's block 0 is not the configured network's genesis block)"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(node.requests_for("getblock")?.len(), 1);
+    assert!(!storage_created, "startup opened storage before failing");
+    Ok(())
+}
+
+/// A single `[node]` that cannot serve block 0 while it warms up fails
+/// startup as unreachable, never as another chain.
+#[test]
+fn startup_reports_a_warming_up_single_node_as_unreachable() -> Result<(), Box<dyn Error>> {
+    let node = archive_node_stub(RpcReply::error_with_code(-28, "Loading block index..."))?;
+
+    let (output, storage_created) = run_ingest_against(&node)?;
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("position 0: unreachable"), "{stderr}");
+    assert!(!stderr.contains("genesis block"), "{stderr}");
+    assert!(!storage_created, "startup opened storage before failing");
+    Ok(())
+}
+
+/// A Zebra archive node that passes the capability and activation reads and
+/// answers `getblock` with `block_reply`.
+fn archive_node_stub(block_reply: RpcReply) -> Result<JsonRpcTestServer, Box<dyn Error>> {
+    let blockchain_info = || RpcReply::result(json!({"pruned": false, "upgrades": {}}));
+    Ok(JsonRpcTestServer::start([
+        method("rpc.discover").reply(RpcReply::result(json!({
+            "openrpc": "1.3.2",
+            "methods": [
+                {"name": "getblock"},
+                {"name": "getbestblockheightandhash"},
+                {"name": "z_gettreestate"},
+                {"name": "z_getsubtreesbyindex"},
+                {"name": "getblockchaininfo"},
+                {"name": "rpc.discover"},
+            ],
+        }))),
+        method("getblockchaininfo").reply(blockchain_info()),
+        method("getblockchaininfo").reply(blockchain_info()),
+        method("getblock").reply(block_reply),
+    ])?)
+}
+
+/// Runs `zinder-ingest` on regtest against `node` and returns its output and
+/// whether it created its storage path.
+fn run_ingest_against(node: &JsonRpcTestServer) -> Result<(Output, bool), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(
+        &config_path,
+        ingest_config_toml(&storage_path)?.replace("http://127.0.0.1:39232", &node.url()),
+    )?;
+    let output = zinder_ingest_command()
+        .args(["--config", path_str(&config_path)?])
+        .env("ZINDER_OPS__LISTEN_ADDR", "")
+        .output()?;
+    Ok((output, storage_path.exists()))
 }
 
 #[test]

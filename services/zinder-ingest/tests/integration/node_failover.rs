@@ -27,8 +27,9 @@ use zinder_ingest::{
     CanonicalFollowConfig, CanonicalFollower, EndpointAdmission, EndpointExclusion,
     FailoverReadiness, IneligibleReason, MempoolReadyGate, NodeEndpointAdmissions,
     NodeEndpointState, NodeFailover, NodeFailoverPolicy, REQUIRED_INGEST_NODE_CAPABILITIES,
-    follow_canonical_tip, follow_canonical_tip_with_control, mempool_ready_channel,
-    read_ready_store_summary, spawn_node_endpoint_monitor, spawn_upstream_health_probe_task,
+    check_single_endpoint_genesis, follow_canonical_tip, follow_canonical_tip_with_control,
+    mempool_ready_channel, read_ready_store_summary, spawn_node_endpoint_monitor,
+    spawn_upstream_health_probe_task,
 };
 use zinder_proto::v1::ingest::CanonicalWriterStatusResponse;
 use zinder_runtime::{
@@ -1021,6 +1022,62 @@ async fn startup_fails_when_no_endpoint_is_admitted() -> TestResult {
     let message = refusal.to_string();
     assert!(message.contains("position 0: unreachable"), "{message}");
     assert!(message.contains("position 1: excluded"), "{message}");
+    Ok(())
+}
+
+/// Without fallbacks, `[node]` starts ingest only on the network's genesis.
+///
+/// Testnet and Regtest share Zebra's `test` chain name, so only the genesis
+/// block tells them apart.
+#[tokio::test]
+async fn a_single_endpoint_on_another_chain_is_excluded() -> TestResult {
+    let blocks = parseable_multi_block_chain()?;
+    let regtest_node = FailoverEndpoint::serving(&blocks, 4)?;
+
+    check_single_endpoint_genesis(&regtest_node, Network::ZcashRegtest).await?;
+    for configured in [Network::ZcashTestnet, Network::ZcashMainnet] {
+        let refusal = check_single_endpoint_genesis(&regtest_node, configured)
+            .await
+            .err()
+            .ok_or("a node on another chain must not start ingest")?;
+        assert!(
+            matches!(
+                refusal.primary(),
+                Some(EndpointAdmission::Excluded(
+                    EndpointExclusion::GenesisMismatch
+                ))
+            ),
+            "{refusal}"
+        );
+        let message = refusal.to_string();
+        assert!(message.contains("position 0: excluded"), "{message}");
+    }
+    Ok(())
+}
+
+/// A single endpoint that cannot serve block 0 yet, as while it warms up, is
+/// unreachable rather than excluded, so startup fails as any other unanswered
+/// startup read does.
+#[tokio::test]
+async fn a_single_endpoint_that_cannot_serve_block_zero_is_unreachable() -> TestResult {
+    let blocks = parseable_multi_block_chain()?;
+    let warming_up = FailoverEndpoint::serving(&blocks, 4)?;
+    warming_up.set_unreachable(true);
+
+    let refusal = check_single_endpoint_genesis(&warming_up, Network::ZcashRegtest)
+        .await
+        .err()
+        .ok_or("an unanswered genesis read must not admit the endpoint")?;
+
+    assert!(
+        matches!(
+            refusal.primary(),
+            Some(EndpointAdmission::Unreachable(
+                SourceError::NodeUnavailable { .. }
+            ))
+        ),
+        "{refusal}"
+    );
     Ok(())
 }
 

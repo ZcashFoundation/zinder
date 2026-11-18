@@ -53,7 +53,7 @@ pub use node_failover::{
     AdmittedEndpoint, EndpointAdmission, EndpointExclusion, FailoverReadiness, IneligibleReason,
     NoNodeEndpointAdmitted, NodeEndpointAdmissions, NodeEndpointMonitor, NodeEndpointState,
     NodeEndpointSwitch, NodeFailover, NodeFailoverPolicy, REQUIRED_INGEST_NODE_CAPABILITIES,
-    missing_required_capability, spawn_node_endpoint_monitor,
+    check_single_endpoint_genesis, missing_required_capability, spawn_node_endpoint_monitor,
 };
 pub use phase::classify_phase;
 pub use runtime_config::{

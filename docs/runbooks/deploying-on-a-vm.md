@@ -120,6 +120,17 @@ is unset. The Zebra and Zakura files for one network share
 describe the same deployment. Switching the file switches the node and keeps
 the existing stores.
 
+Ingest reads the node's block 0 before it opens storage and refuses to start
+when it is not the genesis block of `ZINDER_NETWORK__NAME`, for example a
+Regtest node behind a `zcash-testnet` configuration. `docker compose logs
+zinder-ingest` then shows `node_endpoints_unavailable` with `the node's block 0
+is not the configured network's genesis block`, and `/readyz` on port 9105
+reports `node_unavailable` with failure class `configuration`. Every restart
+fails the same way until `ZINDER_NODE__JSON_RPC_ADDR` points at a node on the
+configured network. A node that cannot serve block 0 yet, such as one still
+loading its state, fails startup as unreachable instead, and ingest starts on
+a later restart once the node answers.
+
 Every checked-in file leaves `ZINDER_NODE__INDEXER_GRPC_ADDR` empty, so ingest
 polls the node's mempool over JSON-RPC. To stream mempool events from a Z3
 Zebra node instead, set `ZEBRA_RPC__INDEXER_LISTEN_ADDR=0.0.0.0:8155` in the
@@ -298,7 +309,8 @@ mempool after a switch, as for `[node]`; to stream it over TLS, add the
 the way the indexer TLS overlay sets the `[node]` ones.
 
 At startup, ingest checks each endpoint's capabilities, activation table, and
-genesis block, and starts on the first one that passes, `[node]` first, without
+genesis block, as it checks `[node]` alone, and starts on the first one that
+passes, `[node]` first, without
 waiting for the fallbacks once `[node]` passes.
 `docker compose logs zinder-ingest` shows `node_endpoint_admitted`,
 `node_endpoint_unreachable`, `node_endpoint_excluded`, or

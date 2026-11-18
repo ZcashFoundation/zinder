@@ -39,7 +39,7 @@ The type exposes pure-data queries:
 ### Source-of-truth flow
 
 1. `NodeSource::fetch_network_upgrade_activations()`, as `ZebraJsonRpcSource` implements it, parses `getblockchaininfo.upgrades` and validates branch-id uniqueness. The map key (hex branch id) becomes `branch_id`; the value's `name` and `activationheight` become `name` and `activation_height`.
-2. `zinder_source::discover_network_upgrade_activations(&source, service)` wraps `NodeSource::fetch_network_upgrade_activations`, emits a `network_upgrade_activations_discovered` structured log event keyed by service name, and returns `Arc<NetworkUpgradeActivations>`. The canonical writer calls this one helper, so the discovery event shape stays consistent. With fallback node endpoints, the writer instead takes the table its endpoint admission already read and emits the same event through `zinder_source::record_network_upgrade_activations_discovered`.
+2. `zinder_source::discover_network_upgrade_activations(&source, service)` wraps `NodeSource::fetch_network_upgrade_activations`, emits a `network_upgrade_activations_discovered` structured log event keyed by service name, and returns `Arc<NetworkUpgradeActivations>`. The canonical writer reads the table as one of its startup endpoint checks, which also compare the node's block 0 with the configured network's genesis hash, and emits the same event through `zinder_source::record_network_upgrade_activations_discovered` only once those checks pass, so the discovery event shape stays consistent. That holds with `[node]` alone and with fallback node endpoints.
 3. The writer admits the discovered table into the canonical store as a schedule revision ([ADR-0039](0039-writer-admitted-network-upgrade-schedules.md)). Readers take the admitted table from the store and call methods on the owned type. No process ever consults `zcash_chain::Network::sapling_activation_height` or any other library-default constant.
 
 Production code does not consult `RegtestParameters::default()` or library-default activation singletons; consumers receive `Arc<NetworkUpgradeActivations>` and call methods on the owned type. The testkit's `regtest_local_network()` is derived from `sample_regtest_upgrade_activations()` so the in-process unit-test fixtures cannot drift from the discovery path; doc comments steer live tests toward `local_network_from_activations(&activations)` and `discover_network_upgrade_activations()`.
@@ -65,12 +65,12 @@ A live test in `crates/zinder-source/tests/live/zebra_json_rpc.rs` calls `fetch_
 - Operators can iterate on regtest activation heights above the store's tip via their `zebrad.toml` without forking Zinder or coordinating a code change. Restart ingest to admit the new table; a change to an activation the store has crossed fails closed.
 - `MinedTransactionChainContext.consensus_branch_id` is correct on every network for every supported upgrade automatically; no Zinder code-change tax per upgrade.
 - New consumers that need consensus parameters have one obvious answer: accept `Arc<NetworkUpgradeActivations>` in your constructor; the production binary already discovers and shares one.
-- Custom testnets become first-class: the table discovers itself from the node; nothing in Zinder hardcodes mainnet/testnet activation heights. This covers custom activation heights only. A test network with its own genesis block is not supported, because each `Network` carries a fixed genesis hash; see [Chain ingestion](../architecture/chain-ingestion.md#supported-chains).
+- Custom testnets become first-class: the table discovers itself from the node; nothing in Zinder hardcodes mainnet/testnet activation heights. This covers custom activation heights only. A test network with its own genesis block is not supported, because each `Network` carries a fixed genesis hash; ingest refuses to start on a node whose block 0 differs from it. The chain name from `getblockchaininfo` cannot tell these networks apart, since Zebra reports `test` for both Testnet and Regtest. See [Chain ingestion](../architecture/chain-ingestion.md#supported-chains).
 - Required-at-construction wiring eliminates the "silently serves branch id 0 forever" failure mode: a misconfigured service refuses to start instead of misreporting `MinedTransactionChainContext.consensus_branch_id` for its entire lifetime.
 
 ### What this costs
 
-- The writer pays one `getblockchaininfo` round-trip at startup so consensus parsing and the admitted schedule use the node's exact activation table. Readers pay none, and serve whatever the writer admitted.
+- The writer pays one `getblockchaininfo` round-trip at startup so consensus parsing and the admitted schedule use the node's exact activation table, and one `getblock` read of block 0 to check the node serves the configured network's chain. Readers pay none, and serve whatever the writer admitted.
 - The table is cached for process lifetime. If the operator reconfigures the node's activation heights mid-flight without restarting Zinder, the cache goes stale until restart. Documented in the runbook.
 - Tests that exercise `WalletQuery` must pass an activations table. The testkit's `sample_regtest_upgrade_activations()` covers the common case; the cost is one extra line per test.
 
@@ -90,3 +90,6 @@ See [Public interfaces §Core vocabulary](../architecture/public-interfaces.md#c
 - 2026-11-18: Only the canonical writer discovers the table. Query,
   compatibility, the projector, and Explorer read the schedule the writer
   admitted and no longer need a node to start.
+- 2026-11-18: Ingest checks the node's block 0 against the configured
+  network's genesis hash with `[node]` alone too, and records the discovered
+  table only after that check passes.

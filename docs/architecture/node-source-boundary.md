@@ -131,6 +131,10 @@ after any stream failure, even when the previous endpoint stalls.
 Ingest switches its chain reads only between follow iterations; see
 [Chain ingestion §Node endpoint failover](chain-ingestion.md#node-endpoint-failover)
 and [ADR-0013](../adrs/0013-source-failure-recovery-topology.md).
+Before it reads the chain, ingest compares the block 0 of each endpoint it
+checks at startup with the configured network's genesis hash, with or without
+fallbacks, and refuses an endpoint that serves another chain; see [Chain
+ingestion §Supported chains](chain-ingestion.md#supported-chains).
 `zinder-query` and wallet-mode compatibility use the list only to broadcast:
 their `OrderedBroadcaster` holds a `NodeSet` whose active endpoint is the one a
 broadcast tries first, and moves it to the endpoint that answered; see

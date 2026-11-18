@@ -259,7 +259,7 @@ where
     };
     // The genesis check covers endpoints that startup deferred or found
     // unreachable, which were never checked against the configured network.
-    match EndpointAdmission::check(endpoint, Some(shared.genesis_hash)).await {
+    match EndpointAdmission::check(endpoint, shared.genesis_hash).await {
         EndpointAdmission::Admitted(admitted) => {
             if admitted.activations != *admitted_activations {
                 return ineligible(IneligibleReason::Refused(
