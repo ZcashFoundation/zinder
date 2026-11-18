@@ -18,8 +18,8 @@ use zinder_core::{
     TxStatus,
     wire::{
         decode_internal_transaction_id, encode_bip70_chain_name, encode_branch_id_hex,
-        encode_internal_block_hash, encode_internal_transaction_id, encode_rpc_block_hash_hex,
-        encode_rpc_transaction_id_hex,
+        encode_internal_block_hash, encode_internal_transaction_id, encode_rpc_block_hash_bytes,
+        encode_rpc_block_hash_hex, encode_rpc_transaction_id_hex,
     },
 };
 use zinder_proto::compat::lightwalletd::{
@@ -1735,7 +1735,7 @@ fn lightwalletd_subtree_roots(subtree_roots: &SubtreeRoots) -> Vec<lightwalletd:
         .iter()
         .map(|subtree_root| lightwalletd::SubtreeRoot {
             root_hash: subtree_root.root_hash.as_bytes().to_vec(),
-            completing_block_hash: encode_internal_block_hash(subtree_root.completing_block_hash)
+            completing_block_hash: encode_rpc_block_hash_bytes(subtree_root.completing_block_hash)
                 .to_vec(),
             completing_block_height: u64::from(subtree_root.completing_block_height.value()),
         })

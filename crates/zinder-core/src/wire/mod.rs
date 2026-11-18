@@ -7,9 +7,10 @@
 //! the storage form and the lightwalletd-compat `bytes` boundary;
 //! `encode_rpc_*_hex` and `decode_rpc_*_hex` for the RPC byte order hex form
 //! every public wallet UI, block explorer, log record, and Zcash JSON-RPC
-//! reply uses; `decode_rpc_*_bytes` for RPC byte order carried as raw bytes
-//! (Zebra's indexer gRPC fills hash `bytes` fields with
-//! `bytes_in_display_order`).
+//! reply uses; `encode_rpc_*_bytes` and `decode_rpc_*_bytes` for RPC byte
+//! order carried as raw bytes (Zebra's indexer gRPC fills hash `bytes` fields
+//! with `bytes_in_display_order`, and lightwalletd fills
+//! `SubtreeRoot.completingBlockHash` the same way).
 //!
 //! RPC byte order is defined normatively in the Zcash protocol specification
 //! at protocol.tex:1127 (`\rpcByteOrder`) and used at protocol.tex:4036. It
@@ -51,7 +52,7 @@ pub use auth_digest::{
 };
 pub use block_hash::{
     decode_internal_block_hash, decode_rpc_block_hash_bytes, decode_rpc_block_hash_hex,
-    encode_internal_block_hash, encode_rpc_block_hash_hex,
+    encode_internal_block_hash, encode_rpc_block_hash_bytes, encode_rpc_block_hash_hex,
 };
 pub use branch_id::{decode_branch_id_hex, encode_branch_id_hex};
 pub use chain_name::{

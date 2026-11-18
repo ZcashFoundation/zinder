@@ -3446,10 +3446,11 @@ async fn get_subtree_roots_serves_non_empty_orchard_and_ironwood() -> eyre::Resu
             .first()
             .ok_or_else(|| eyre!("{protocol:?} root missing"))?;
         assert_eq!(root.root_hash, vec![root_byte; 32]);
-        assert_eq!(
-            root.completing_block_hash,
-            encode_internal_block_hash(completing_block.hash).to_vec()
-        );
+        // Reference lightwalletd reverses the hash into RPC byte order here,
+        // unlike every other compact `bytes` hash field.
+        let mut rpc_order_hash = completing_block.hash.as_bytes();
+        rpc_order_hash.reverse();
+        assert_eq!(root.completing_block_hash, rpc_order_hash.to_vec());
         assert_eq!(
             root.completing_block_height,
             u64::from(completing_height.value())
