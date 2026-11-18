@@ -5,6 +5,7 @@ use std::{
     future::ready,
     num::{NonZeroU16, NonZeroU32},
     sync::Arc,
+    time::Instant,
 };
 
 use async_trait::async_trait;
@@ -48,7 +49,9 @@ use crate::{
     broadcast_byte_budget::BroadcastByteBudget,
     node_broadcast::EndpointVerifications,
     serving_read,
-    tree_state_replay_limit::{TreeStateReplayLimit, record_replayed_blocks},
+    tree_state_replay_limit::{
+        TreeStateReplayLimit, record_replay_duration, record_tree_state_depth,
+    },
     validate_block_range, validate_subtree_root_range,
 };
 
@@ -1057,28 +1060,56 @@ where
         height: BlockHeight,
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<TreeState, QueryError> {
-        let replays = self.tree_state_replays.clone();
-        serving_read::run("tree_state_at", self.pin(at_epoch_id), move |pair| {
-            let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
-            if height > chain_epoch.visible_tip_height {
-                return Err(QueryError::BlockNotInBestChain);
-            }
-            let canonical = pair.canonical();
-            let nearest = canonical.tree_state_checkpoint_at_or_before(height)?;
-            if let Some(stored) = &nearest
-                && stored.block_id.height == height
+        serving_read::record("tree_state_at", None, async {
+            let (pair, lookup_epoch, nearest) =
+                serving_read::read_at(self.pin(at_epoch_id), move |pair| {
+                    let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                    if height > chain_epoch.visible_tip_height {
+                        return Err(QueryError::BlockNotInBestChain);
+                    }
+                    let nearest = pair
+                        .canonical()
+                        .tree_state_checkpoint_at_or_before(height)?;
+                    Ok((pair, chain_epoch, nearest))
+                })
+                .await?;
+            if let Some(stored) = nearest
+                .as_ref()
+                .filter(|seed| seed.block_id.height == height)
             {
-                return tree_state_from_checkpoint(chain_epoch, stored);
+                let tree_state = tree_state_from_checkpoint(lookup_epoch, stored)?;
+                let trees = stored.tip_metadata();
+                record_tree_state_depth(0, trees, trees);
+                return Ok(tree_state);
             }
             // Without a seed the canonical reader replays nothing: it answers
             // a height below the history predecessor as absent and a missing
-            // seed as store damage, so only a seeded read takes a slot.
-            let _replay_slot = nearest.as_ref().map(|_| replays.try_admit()).transpose()?;
-            let checkpoint = canonical
-                .tree_state_checkpoint_at(height, pair.network_upgrade_activations())?
-                .ok_or(QueryError::BlockNotInBestChain)?;
+            // seed as store damage, so only a seeded read takes a slot. The
+            // blocking read holds the slot, so a cancelled request frees it
+            // only when its replay ends.
+            let replay_slot = nearest
+                .as_ref()
+                .map(|_| self.tree_state_replays.try_admit().map(Arc::new))
+                .transpose()?;
+            let (chain_epoch, checkpoint, replay_duration) =
+                serving_read::read_pair(&self.serving_pair_slot, pair, at_epoch_id, move |pair| {
+                    let _replay_slot = replay_slot;
+                    let chain_epoch = Self::chain_epoch(&pair, at_epoch_id)?;
+                    let started_at = Instant::now();
+                    let checkpoint = pair
+                        .canonical()
+                        .tree_state_checkpoint_at(height, pair.network_upgrade_activations())?
+                        .ok_or(QueryError::BlockNotInBestChain)?;
+                    Ok((chain_epoch, checkpoint, started_at.elapsed()))
+                })
+                .await?;
             if let Some(seed) = nearest {
-                record_replayed_blocks(height.value().saturating_sub(seed.block_id.height.value()));
+                record_replay_duration(replay_duration);
+                record_tree_state_depth(
+                    height.value().saturating_sub(seed.block_id.height.value()),
+                    seed.tip_metadata(),
+                    checkpoint.tip_metadata(),
+                );
             }
             tree_state_from_checkpoint(chain_epoch, &checkpoint)
         })
@@ -1569,6 +1600,8 @@ mod full_block_range_tests {
 mod tree_state_replay_limit_tests {
     use std::{error::Error, num::NonZeroU32, sync::Arc};
 
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
     use zinder_core::{BlockHeight, Network};
     use zinder_testkit::{
         ChainFixture, WalletServingStoreFixture, sample_regtest_upgrade_activations,
@@ -1614,6 +1647,59 @@ mod tree_state_replay_limit_tests {
         assert_eq!(
             query.tree_state_at(reconstructed, None).await?.height,
             reconstructed
+        );
+        Ok(())
+    }
+
+    /// Every served tree state samples its replay depth, a stored checkpoint
+    /// included, and each reconstruction records its slot wait, its replay
+    /// time, and whether it was admitted or refused.
+    #[tokio::test]
+    async fn tree_state_reads_record_depth_slot_and_replay_time() -> Result<(), Box<dyn Error>> {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let rendered = recorder.handle();
+        let _local_recorder = metrics::set_default_local_recorder(&recorder);
+        let activations = sample_regtest_upgrade_activations();
+        let chain = ChainFixture::new(Network::ZcashRegtest).extend_blocks(3);
+        let mut store = WalletServingStoreFixture::from_chain(&chain, &activations)?;
+        let (canonical, wallet) = store.take_readers()?;
+        let pair = Arc::new(WalletServingReadPair::new(
+            Arc::new(canonical),
+            Arc::new(wallet),
+        )?);
+        let mut query =
+            WalletServingQuery::from_serving_pair_slot(WalletServingPairSlot::new(pair));
+        query.tree_state_replays = TreeStateReplayLimit::new(NonZeroU32::MIN);
+
+        query.tree_state_at(BlockHeight::new(3), None).await?;
+        query.tree_state_at(BlockHeight::new(2), None).await?;
+        let held_slot = query.tree_state_replays.try_admit()?;
+        assert!(
+            query
+                .tree_state_at(BlockHeight::new(2), None)
+                .await
+                .is_err()
+        );
+        drop(held_slot);
+
+        let rendered = rendered.render();
+        for expected in [
+            "zinder_query_tree_state_replayed_blocks_count 2",
+            "zinder_query_tree_state_replayed_commitments_count 2",
+            "zinder_query_tree_state_replay_duration_seconds_count 1",
+            "zinder_query_tree_state_replay_wait_duration_seconds_count 3",
+            "zinder_query_tree_state_replay_admissions_total 2",
+            "zinder_query_tree_state_replay_refusals_total 1",
+        ] {
+            assert!(
+                rendered.lines().any(|line| line == expected),
+                "missing {expected}:\n{rendered}"
+            );
+        }
+        assert!(
+            rendered.lines().any(|line| line
+                .starts_with("zinder_query_tree_state_replayed_blocks{quantile=\"0\"} 0")),
+            "a stored checkpoint samples zero replayed blocks:\n{rendered}"
         );
         Ok(())
     }

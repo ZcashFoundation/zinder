@@ -268,8 +268,12 @@ broadcast, so it exports none of those series.
 | `zinder_query_request_total` | counter | `operation`, `status`, `error_class` | Wallet reads. One protocol request can record several reads. |
 | `zinder_query_request_duration_seconds` | histogram | `operation`, `status`, `error_class` | Duration of each read, including any tree-state rebuild and the node call of a broadcast. |
 | `zinder_query_compact_block_range_block_count` | histogram | `status` | Blocks each compact-block range read asked for. |
-| `zinder_query_tree_state_replayed_blocks` | histogram | | Blocks replayed to rebuild a tree state, from 1 to 99. |
+| `zinder_query_tree_state_replayed_blocks` | histogram | | Blocks replayed to answer each served tree-state read, from 0 to 99. A stored checkpoint records 0. |
+| `zinder_query_tree_state_replayed_commitments` | histogram | | Note commitments appended across all pools to answer each served tree-state read. A stored checkpoint records 0. |
+| `zinder_query_tree_state_replay_admissions_total` | counter | | Tree-state rebuilds that took a rebuild slot. |
 | `zinder_query_tree_state_replay_refusals_total` | counter | | Tree-state reads refused because one rebuild per CPU was already running. |
+| `zinder_query_tree_state_replay_wait_duration_seconds` | histogram | | Time each admitted or refused rebuild waited for a rebuild slot. |
+| `zinder_query_tree_state_replay_duration_seconds` | histogram | | Time each completed rebuild spent reading and replaying compact blocks. |
 | `zinder_query_broadcast_budget_refusals_total` | counter | | Broadcasts refused because 16 MiB of transactions were already in flight. |
 
 `operation` names the read, such as `compact_blocks_in_range` or
