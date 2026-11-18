@@ -119,7 +119,7 @@ The memory a stream uses beyond its stored bytes has no enforced maximum and has
 
 `GetTreeState` answers every retained height from Zinder's store, where lightwalletd asks its node. It returns the same statuses as native `TreeStateAtHeight`, listed in [Wallet data plane](../architecture/wallet-data-plane.md#tree-states-and-subtree-roots), except that a height above the visible tip is `INVALID_ARGUMENT`, as lightwalletd returns.
 
-Zinder bounds concurrent tree-state rebuilds, where lightwalletd has no rebuild limit. Retry a `RESOURCE_EXHAUSTED` from `GetTreeState` with backoff. `GetLatestTreeState` returns the newest stored checkpoint at or below the visible tip.
+Zinder bounds concurrent tree-state rebuilds, where lightwalletd has no rebuild limit. A rebuild that finds every slot taken waits up to `compat.tree_state_replay_wait_ms` (`ZINDER_COMPAT__TREE_STATE_REPLAY_WAIT_MS`, 0 to 5,000 ms, 2,000 by default), then fails with `RESOURCE_EXHAUSTED`. It fails at once when every waiting place is taken, with two per slot. Retry that refusal with backoff. `GetLatestTreeState` returns the newest stored checkpoint at or below the visible tip.
 
 ### `GetSubtreeRoots`
 

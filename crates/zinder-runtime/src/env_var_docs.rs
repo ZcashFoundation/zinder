@@ -1168,6 +1168,17 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       be in 1..=65536; defaults to 100.",
     },
     EnvVarDoc {
+        name: "ZINDER_COMPAT__TREE_STATE_REPLAY_WAIT_MS",
+        toml_path: "compat.tree_state_replay_wait_ms",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Milliseconds a lightwalletd `GetTreeState` rebuild waits for a rebuild slot \
+                      before it is refused with `RESOURCE_EXHAUSTED`. Wallet serving only; \
+                      compact-blocks serving rejects it. Must be in 0..=5000; 0 refuses at \
+                      once; defaults to 2000.",
+    },
+    EnvVarDoc {
         name: "ZINDER_COMPAT__PING_VERY_INSECURE",
         toml_path: "compat.ping_very_insecure",
         used_by: &["zinder-compat-lightwalletd"],
@@ -1912,6 +1923,7 @@ mod tests {
                 "ZINDER_COMPAT__REORG_WINDOW_BLOCKS",
                 "ZINDER_COMPAT__PAIR_CONVERGENCE_ATTEMPTS",
                 "ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS",
+                "ZINDER_COMPAT__TREE_STATE_REPLAY_WAIT_MS",
                 "ZINDER_COMPAT__PING_VERY_INSECURE",
             ]
         );

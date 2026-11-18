@@ -28,8 +28,9 @@ mod compact_block_serving;
 mod config;
 use config::{CompatServing, LightwalletdConfigError, LightwalletdConfigOverrides};
 use zinder_query::{
-    AdmittedIngestControl, OrderedBroadcaster, WalletServingPairConfig, WalletServingPairPublisher,
-    WalletServingQuery, WalletServingReadiness, spawn_wallet_ingest_control_readiness_probe,
+    AdmittedIngestControl, DEFAULT_TREE_STATE_REPLAY_WAIT, OrderedBroadcaster,
+    WalletServingPairConfig, WalletServingPairPublisher, WalletServingQuery,
+    WalletServingReadiness, spawn_wallet_ingest_control_readiness_probe,
     spawn_wallet_node_readiness_probe,
 };
 
@@ -268,8 +269,12 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     );
     open_storage_phase.complete();
 
+    let tree_state_replay_wait = lightwalletd_config
+        .tree_state_replay_wait
+        .unwrap_or(DEFAULT_TREE_STATE_REPLAY_WAIT);
     let wallet_query = WalletServingQuery::from_serving_pair_slot(serving_pair_slot.clone())
-        .with_node_broadcast(node_broadcast.clone());
+        .with_node_broadcast(node_broadcast.clone())
+        .with_tree_state_replay_wait(tree_state_replay_wait);
     let cancel = CancellationToken::new();
     let grpc_adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(wallet_query)?
         .with_max_concurrent_block_range_streams(
@@ -338,6 +343,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         visible_height = ?visible_height,
         max_concurrent_block_range_streams =
             lightwalletd_config.max_concurrent_block_range_streams.get(),
+        tree_state_replay_wait_ms = tree_state_replay_wait.as_millis(),
         ping_very_insecure = lightwalletd_config.ping_very_insecure,
         "lightwalletd-compatible gRPC server started"
     );
