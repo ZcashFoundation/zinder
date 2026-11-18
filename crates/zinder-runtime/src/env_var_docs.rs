@@ -1621,8 +1621,10 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Which settled blocks receive a stored tree-state checkpoint: \
-                      `every-block`, or `commitment-budget` for the first block after each \
-                      `commitment_budget` note commitments. Defaults to `every-block`.",
+                      `commitment-budget` stores one each time `commitment_budget` note \
+                      commitments have accumulated, and `every-block` stores one for every \
+                      block, so no tree-state read replays. Defaults to \
+                      `commitment-budget`.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__COMMITMENT_BUDGET",
@@ -1631,8 +1633,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Note commitments, over every pool, between two stored tree-state \
-                      checkpoints under `selection = \"commitment-budget\"`. Must be greater \
-                      than zero and is refused with any other selection. Defaults to 1024.",
+                      checkpoints under the `commitment-budget` selection. Must be greater \
+                      than zero and is refused with `selection = \"every-block\"`. Defaults \
+                      to 1024.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__WORKERS",
@@ -1644,13 +1647,15 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       greater than zero. Defaults to 2.",
     },
     EnvVarDoc {
-        name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__MAX_ROWS_PER_SECOND",
-        toml_path: "ingest.tree_state_densification.max_rows_per_second",
+        name: "ZINDER_INGEST__TREE_STATE_DENSIFICATION__MAX_BLOCKS_PER_SECOND",
+        toml_path: "ingest.tree_state_densification.max_blocks_per_second",
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Ceiling on densified tree-state checkpoint rows written per second. \
-                      Must be greater than zero. Defaults to 4000.",
+        description: "Ceiling on stored blocks the tree-state densification pass replays \
+                      per second. Each block costs about two reads and adds at most one \
+                      row, so this bounds the pass's reads and writes. Must be greater \
+                      than zero. Defaults to 500.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__RUN_OVERRIDES__TARGET_HEIGHT",

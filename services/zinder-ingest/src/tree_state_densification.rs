@@ -40,8 +40,12 @@ use crate::{
 
 /// Default number of strides replayed at once.
 pub const DEFAULT_TREE_STATE_DENSIFICATION_WORKERS: u32 = 2;
-/// Default ceiling on densified checkpoint rows committed per second.
-pub const DEFAULT_TREE_STATE_DENSIFICATION_MAX_ROWS_PER_SECOND: u32 = 4_000;
+/// Default ceiling on stored blocks the pass replays per second.
+///
+/// Replaying a block reads its compact block and header, so this also bounds
+/// the pass's reads, and the rows it writes, which never exceed the blocks it
+/// replays.
+pub const DEFAULT_TREE_STATE_DENSIFICATION_MAX_BLOCKS_PER_SECOND: u32 = 500;
 /// Default commitment budget of the budgeted selection.
 pub const DEFAULT_TREE_STATE_COMMITMENT_BUDGET: u32 = 1_024;
 
@@ -63,19 +67,22 @@ pub struct TreeStateDensificationConfig {
     pub selection: TreeStateCheckpointSelection,
     /// Strides replayed at once, each on one blocking thread.
     pub workers: NonZeroU32,
-    /// Ceiling on densified rows committed per second.
-    pub max_rows_per_second: NonZeroU32,
+    /// Ceiling on stored blocks replayed per second, which bounds the pass's
+    /// reads and writes.
+    pub max_blocks_per_second: NonZeroU32,
 }
 
 impl Default for TreeStateDensificationConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            selection: TreeStateCheckpointSelection::EveryBlock,
+            selection: TreeStateCheckpointSelection::CommitmentBudget(
+                NonZeroU32::new(DEFAULT_TREE_STATE_COMMITMENT_BUDGET).unwrap_or(NonZeroU32::MIN),
+            ),
             workers: NonZeroU32::new(DEFAULT_TREE_STATE_DENSIFICATION_WORKERS)
                 .unwrap_or(NonZeroU32::MIN),
-            max_rows_per_second: NonZeroU32::new(
-                DEFAULT_TREE_STATE_DENSIFICATION_MAX_ROWS_PER_SECOND,
+            max_blocks_per_second: NonZeroU32::new(
+                DEFAULT_TREE_STATE_DENSIFICATION_MAX_BLOCKS_PER_SECOND,
             )
             .unwrap_or(NonZeroU32::MIN),
         }
@@ -183,7 +190,7 @@ async fn run_tree_state_densification<Writer: TreeStateStrideWriter>(
         event = "tree_state_densification_started",
         selection = ?context.config.selection,
         workers = context.config.workers.get(),
-        max_rows_per_second = context.config.max_rows_per_second.get(),
+        max_blocks_per_second = context.config.max_blocks_per_second.get(),
         "tree-state densification started"
     );
     let mut pass = DensificationPass::new(Arc::new(RwLock::new(secondary)), &context);
@@ -323,10 +330,10 @@ impl DensificationPass {
         let mut committed = 0;
         for (stride, replay) in batch.iter().zip(replays) {
             match self.commit(writer, *stride, replay).await {
-                Ok(rows_written) => {
+                Ok(_) => {
                     committed += 1;
                     record_remaining(self.queue.len() + batch.len() - committed);
-                    if self.pace(rows_written, cancel).await {
+                    if self.pace(*stride, cancel).await {
                         return Ok(StepOutcome::Cancelled);
                     }
                 }
@@ -448,10 +455,11 @@ impl DensificationPass {
         }
     }
 
-    /// Holds the pass so committed rows stay under the configured rate.
-    async fn pace(&self, rows_written: u32, cancel: &CancellationToken) -> bool {
+    /// Holds the pass so replayed blocks stay under the configured rate.
+    async fn pace(&self, stride: TreeStateStride, cancel: &CancellationToken) -> bool {
+        let replayed_blocks = stride.end_height().value() - stride.seed_height().value();
         let pause = Duration::from_secs_f64(
-            f64::from(rows_written) / f64::from(self.config.max_rows_per_second.get()),
+            f64::from(replayed_blocks) / f64::from(self.config.max_blocks_per_second.get()),
         );
         cancel.is_cancelled() || (!pause.is_zero() && sleep_or_cancel(pause, cancel).await)
     }

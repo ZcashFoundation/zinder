@@ -581,7 +581,7 @@ impl Harness {
                     enabled: true,
                     selection,
                     workers: NonZeroU32::new(2).ok_or_else(|| eyre::eyre!("zero workers"))?,
-                    max_rows_per_second: NonZeroU32::MAX,
+                    max_blocks_per_second: NonZeroU32::MAX,
                 },
             },
             cancel.clone(),

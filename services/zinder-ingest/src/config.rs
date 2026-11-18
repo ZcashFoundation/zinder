@@ -336,7 +336,7 @@ struct IngestTreeStateDensificationSection {
     selection: Option<TreeStateSelectionName>,
     commitment_budget: Option<u32>,
     workers: Option<u32>,
-    max_rows_per_second: Option<u32>,
+    max_blocks_per_second: Option<u32>,
 }
 
 /// Configured name of a tree-state checkpoint selection.
@@ -708,15 +708,15 @@ fn resolve_tree_state_densification(
         })
     };
     let selection = match (section.selection, section.commitment_budget) {
-        (None | Some(TreeStateSelectionName::EveryBlock), None) => {
+        (Some(TreeStateSelectionName::EveryBlock), None) => {
             TreeStateCheckpointSelection::EveryBlock
         }
-        (None | Some(TreeStateSelectionName::EveryBlock), Some(_)) => {
+        (Some(TreeStateSelectionName::EveryBlock), Some(_)) => {
             return Err(ConfigError::invalid(
                 "ingest.tree_state_densification.commitment_budget applies only to selection = \"commitment-budget\"",
             ));
         }
-        (Some(TreeStateSelectionName::CommitmentBudget), budget) => {
+        (None | Some(TreeStateSelectionName::CommitmentBudget), budget) => {
             TreeStateCheckpointSelection::CommitmentBudget(nonzero(
                 budget,
                 NonZeroU32::new(DEFAULT_TREE_STATE_COMMITMENT_BUDGET).unwrap_or(NonZeroU32::MIN),
@@ -732,10 +732,10 @@ fn resolve_tree_state_densification(
             defaults.workers,
             "ingest.tree_state_densification.workers",
         )?,
-        max_rows_per_second: nonzero(
-            section.max_rows_per_second,
-            defaults.max_rows_per_second,
-            "ingest.tree_state_densification.max_rows_per_second",
+        max_blocks_per_second: nonzero(
+            section.max_blocks_per_second,
+            defaults.max_blocks_per_second,
+            "ingest.tree_state_densification.max_blocks_per_second",
         )?,
     })
 }
@@ -925,7 +925,7 @@ struct IngestTreeStateDensificationToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     commitment_budget: Option<u32>,
     workers: u32,
-    max_rows_per_second: u32,
+    max_blocks_per_second: u32,
 }
 
 impl IngestTreeStateDensificationToml {
@@ -943,7 +943,7 @@ impl IngestTreeStateDensificationToml {
             selection,
             commitment_budget,
             workers: config.workers.get(),
-            max_rows_per_second: config.max_rows_per_second.get(),
+            max_blocks_per_second: config.max_blocks_per_second.get(),
         }
     }
 }
@@ -1018,11 +1018,44 @@ mod tests {
     }
 
     #[test]
-    fn tree_state_densification_defaults_to_every_block_and_accepts_a_budget() {
+    fn tree_state_densification_defaults_to_a_commitment_budget_and_accepts_every_block() {
+        let defaults =
+            resolve_tree_state_densification(IngestTreeStateDensificationSection::default());
         assert_eq!(
-            resolve_tree_state_densification(IngestTreeStateDensificationSection::default()).ok(),
-            Some(TreeStateDensificationConfig::default())
+            defaults.as_ref().ok(),
+            Some(&TreeStateDensificationConfig::default())
         );
+        assert!(matches!(
+            defaults,
+            Ok(TreeStateDensificationConfig {
+                enabled: true,
+                selection: zinder_store::TreeStateCheckpointSelection::CommitmentBudget(budget),
+                workers,
+                max_blocks_per_second,
+            }) if budget.get() == 1_024 && workers.get() == 2 && max_blocks_per_second.get() == 500
+        ));
+        let budget_without_selection =
+            resolve_tree_state_densification(IngestTreeStateDensificationSection {
+                commitment_budget: Some(512),
+                ..IngestTreeStateDensificationSection::default()
+            });
+        assert!(matches!(
+            budget_without_selection,
+            Ok(TreeStateDensificationConfig {
+                selection: zinder_store::TreeStateCheckpointSelection::CommitmentBudget(budget),
+                ..
+            }) if budget.get() == 512
+        ));
+        assert!(matches!(
+            resolve_tree_state_densification(IngestTreeStateDensificationSection {
+                selection: Some(TreeStateSelectionName::EveryBlock),
+                ..IngestTreeStateDensificationSection::default()
+            }),
+            Ok(TreeStateDensificationConfig {
+                selection: zinder_store::TreeStateCheckpointSelection::EveryBlock,
+                ..
+            })
+        ));
         let budgeted = resolve_tree_state_densification(IngestTreeStateDensificationSection {
             selection: Some(TreeStateSelectionName::CommitmentBudget),
             commitment_budget: Some(2_048),
@@ -1063,10 +1096,10 @@ mod tests {
             ),
             (
                 IngestTreeStateDensificationSection {
-                    max_rows_per_second: Some(0),
+                    max_blocks_per_second: Some(0),
                     ..IngestTreeStateDensificationSection::default()
                 },
-                "ingest.tree_state_densification.max_rows_per_second",
+                "ingest.tree_state_densification.max_blocks_per_second",
             ),
             (
                 IngestTreeStateDensificationSection {
@@ -1078,6 +1111,7 @@ mod tests {
             ),
             (
                 IngestTreeStateDensificationSection {
+                    selection: Some(TreeStateSelectionName::EveryBlock),
                     commitment_budget: Some(1_024),
                     ..IngestTreeStateDensificationSection::default()
                 },
