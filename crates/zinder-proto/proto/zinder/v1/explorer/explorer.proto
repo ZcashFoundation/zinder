@@ -2013,7 +2013,7 @@ service ExplorerQuery {
   // `explorer.value_pool.summary_v1`.
   rpc ValuePoolSummary(ValuePoolSummaryRequest) returns (ValuePoolSummaryResponse);
 
-  // Returns the node-advertised network-upgrade activation table alongside
+  // Returns the writer-admitted network-upgrade activation table alongside
   // the canonical tip height, so a client can tell whether an upgrade is
   // active and, if not, how far the tip is from its activation height.
   // Capability: `explorer.network_upgrade.status_v1`.

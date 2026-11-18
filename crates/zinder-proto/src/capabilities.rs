@@ -291,7 +291,7 @@ pub const EXPLORER_TRANSPARENT_ADDRESS_RANKING_V1: &str = "explorer.transparent_
 pub const EXPLORER_VALUE_POOL_SUMMARY_V1: &str = "explorer.value_pool.summary_v1";
 /// Capability advertised for `ExplorerQuery.NetworkUpgradeStatus`.
 ///
-/// Signals that the explorer plane can surface the node-advertised
+/// Signals that the explorer plane can surface the writer-admitted
 /// network-upgrade activation table alongside the canonical tip height, so a
 /// consumer can render whether an upgrade is active and how far the tip is
 /// from a not-yet-active activation. The tip height rides on the wallet-plane

@@ -4527,7 +4527,7 @@ pub mod explorer_query_client {
                 );
             self.inner.unary(req, path, codec).await
         }
-        /// Returns the node-advertised network-upgrade activation table alongside
+        /// Returns the writer-admitted network-upgrade activation table alongside
         /// the canonical tip height, so a client can tell whether an upgrade is
         /// active and, if not, how far the tip is from its activation height.
         /// Capability: `explorer.network_upgrade.status_v1`.
@@ -5308,7 +5308,7 @@ pub mod explorer_query_server {
             tonic::Response<super::ValuePoolSummaryResponse>,
             tonic::Status,
         >;
-        /// Returns the node-advertised network-upgrade activation table alongside
+        /// Returns the writer-admitted network-upgrade activation table alongside
         /// the canonical tip height, so a client can tell whether an upgrade is
         /// active and, if not, how far the tip is from its activation height.
         /// Capability: `explorer.network_upgrade.status_v1`.
