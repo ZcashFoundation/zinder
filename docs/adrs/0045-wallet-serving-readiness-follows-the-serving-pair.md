@@ -157,11 +157,16 @@ halt too, so an alert on degraded dependencies excludes
 dependencies report.
 
 During a node outage the canonical writer stops committing, and the reader
-serves its last chain view as ready. `GetLightdInfo.estimated_height` keeps
-equal to the served tip, as it is during normal operation, so a lightwalletd
-client cannot tell from it that the chain has stopped advancing. The
-served-epoch age is the signal. Operators alert on it and on the dependency
-gauge instead of on a reader's 503.
+serves its last chain view as ready. The writer keeps answering
+`CanonicalControl.WriterStatus` while it waits on the node, however long a
+node request stalls, unless it already holds a full command queue of writes.
+The reader therefore keeps its attestation fresh and the staleness ceiling
+does not start
+([Chain ingestion](../architecture/chain-ingestion.md#control-commands-while-following)).
+`GetLightdInfo.estimated_height` keeps equal to the served tip, as it is
+during normal operation, so a lightwalletd client cannot tell from it that the
+chain has stopped advancing. The served-epoch age is the signal. Operators
+alert on it and on the dependency gauge instead of on a reader's 503.
 
 ### Deployments stop restarting on node outages
 
@@ -271,6 +276,10 @@ ingest.
 
 ## Revision history
 
+- 2026-11-18: The canonical writer answers `WriterStatus` while it waits on a
+  node request, a recovery backoff, or an endpoint switch, so a stalled node
+  keeps readers attested instead of draining them with
+  `writer_status_unavailable` once the staleness ceiling passes.
 - 2026-11-18: A reader moves a broadcast past an unreachable endpoint of its
   ordered node list, so the broadcast consequence covers only the case where
   none of its endpoints answers.

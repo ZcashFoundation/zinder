@@ -334,7 +334,10 @@ while any admitted dependency is temporarily unhealthy.
 
 A node-backed request always calls the node, whatever the node probe last
 observed, so a node that recovers between probes serves it. The staleness
-ceiling starts only when the publisher cannot read `WriterStatus`. An
+ceiling starts only when the publisher cannot read `WriterStatus`. Ingest
+answers `WriterStatus` while its writer waits on a slow or stalled node, so a
+node outage alone never starts the ceiling
+([Chain ingestion](chain-ingestion.md#control-commands-while-following)). An
 ingest-control health failure that leaves `WriterStatus` answering, such as a
 failing mempool snapshot, degrades the dependency without starting it.
 

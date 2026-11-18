@@ -30,6 +30,7 @@ use zinder_ingest::{
     CheckpointComponent, RawBlobPolicy, follow_canonical_tip, follow_canonical_tip_with_control,
     load_fresh_canonical, prepare_canonical_block,
 };
+use zinder_proto::v1::ingest::CanonicalWriterStatusResponse;
 use zinder_runtime::{ComposedReadiness, NodeUnavailableDetail, Readiness, ReadinessCause};
 use zinder_source::{
     NodeCapabilities, NodeSource, SourceBlock, SourceChainSegment, SourceChainSegmentLimits,
@@ -37,7 +38,7 @@ use zinder_source::{
 };
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalReorgPolicy, CanonicalStoreBuildPlan,
-    CanonicalStoreWorkload, MempoolEvent, MempoolEventRetentionConfig,
+    CanonicalStoreWorkload, MempoolEvent, MempoolEventEnvelope, MempoolEventRetentionConfig,
     MempoolEventRetentionStepBudget, RocksDbCanonicalBuilder, RocksDbResourceBudget,
 };
 use zinder_testkit::{frontier_of_size, sample_regtest_upgrade_activations};
@@ -1738,7 +1739,7 @@ async fn retention_steps_yield_to_canonical_source_observation()
             activations,
             CanonicalFollowConfig {
                 request_timeout: Duration::from_secs(5),
-                poll_interval: Duration::from_secs(1),
+                poll_interval: Duration::ZERO,
                 lag_threshold_blocks: 0,
                 target_height: None,
                 event_retention_window: None,
@@ -1849,6 +1850,245 @@ async fn canonical_follower_reports_source_outage_and_resumes_after_recovery()
         ReadinessCause::NodeUnavailable(_)
     ));
     Ok(())
+}
+
+/// A reader's deadline for one `WriterStatus` request.
+const READER_WRITER_STATUS_DEADLINE: Duration = Duration::from_secs(15);
+
+/// A node request that stalls past a reader's writer-status deadline does not
+/// stall the writer's control plane.
+///
+/// The first tip request never answers, so it fails at the default request
+/// timeout. Meanwhile the follower answers every `WriterStatus` at once, as a
+/// writer that has not yet confirmed its reopened tip, and holds the mempool
+/// writes sent during the stall. It applies them, in arrival order, only once
+/// the stalled request has failed.
+#[tokio::test]
+async fn writer_status_answers_while_a_node_request_stalls()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (source, activations, store, _temporary) = follower_fixture_at_its_node_tip().await?;
+    let (stalled_tip_entered, _never_resumed) = source.pause_tip_call(1);
+    tokio::time::pause();
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let cancel = CancellationToken::new();
+    let (commands, control_commands) =
+        mpsc::channel(zinder_ingest::CANONICAL_CONTROL_COMMAND_CAPACITY);
+    let follower =
+        follower_with_default_request_timeout(&source, &activations, &readiness, &cancel);
+    let observe = async {
+        let observed = async {
+            stalled_tip_entered.notified().await;
+            let stall_started = tokio::time::Instant::now();
+            let mut appends = Vec::new();
+            for (stall_offset_secs, append_tag) in [(0, None), (5, Some(1)), (15, Some(2)), (29, None)]
+            {
+                tokio::time::sleep_until(stall_started + Duration::from_secs(stall_offset_secs))
+                    .await;
+                if let Some(transaction_tag) = append_tag {
+                    appends.push(send_mempool_append(&commands, transaction_tag).await?);
+                }
+                let (status, answered_after) = timed_writer_status(&commands).await?;
+                assert_eq!(answered_after, Duration::ZERO, "at {stall_offset_secs}s");
+                assert!(status.tip_unconfirmed);
+                for append in &mut appends {
+                    assert!(
+                        matches!(append.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+                        "a write sent during the stall waits for the node request at {stall_offset_secs}s"
+                    );
+                }
+            }
+            let mut appended_sequences = Vec::new();
+            for append in appends {
+                let envelope =
+                    tokio::time::timeout(READER_WRITER_STATUS_DEADLINE, append).await???;
+                appended_sequences.push(envelope.event_sequence);
+            }
+            assert!(stall_started.elapsed() >= Duration::from_secs(30));
+            assert_eq!(appended_sequences, vec![1, 2]);
+
+            tokio::time::timeout(Duration::from_mins(1), async {
+                while !readiness.runtime_readiness().report().is_ready {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await?;
+            let (status, _answered_after) = timed_writer_status(&commands).await?;
+            assert!(!status.tip_unconfirmed);
+            Ok::<_, Box<dyn std::error::Error>>(())
+        }
+        .await;
+        cancel.cancel();
+        observed
+    };
+    let (observed, outcome) = tokio::join!(
+        observe,
+        follow_canonical_tip_with_control(store, follower, control_commands),
+    );
+    observed?;
+    outcome?;
+    Ok(())
+}
+
+/// The follower answers `WriterStatus` while it waits out a source-recovery
+/// backoff, and applies a write sent during the backoff once it ends.
+#[tokio::test]
+async fn writer_status_answers_during_the_source_recovery_backoff()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (source, activations, store, _temporary) = follower_fixture_at_its_node_tip().await?;
+    // The node advertises a tip whose block it cannot serve, so each
+    // observation fails at once and the follower waits out its backoff.
+    source.set_tip_height(BlockHeight::new(99));
+    tokio::time::pause();
+    let readiness = ComposedReadiness::new(Readiness::default(), &[]);
+    let cancel = CancellationToken::new();
+    let (commands, control_commands) =
+        mpsc::channel(zinder_ingest::CANONICAL_CONTROL_COMMAND_CAPACITY);
+    let follower =
+        follower_with_default_request_timeout(&source, &activations, &readiness, &cancel);
+    let observe = async {
+        let observed = async {
+            yield_until_node_unavailable(&readiness).await?;
+            let (status, answered_after) = timed_writer_status(&commands).await?;
+            assert_eq!(answered_after, Duration::ZERO);
+            assert!(status.tip_unconfirmed);
+
+            let append_sent_at = tokio::time::Instant::now();
+            let mut append = send_mempool_append(&commands, 1).await?;
+            let (_status, answered_after) = timed_writer_status(&commands).await?;
+            assert_eq!(answered_after, Duration::ZERO);
+            assert!(matches!(
+                append.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            let envelope = tokio::time::timeout(READER_WRITER_STATUS_DEADLINE, append).await???;
+            assert!(
+                append_sent_at.elapsed() > Duration::ZERO,
+                "a write sent during the backoff applies once the backoff ends"
+            );
+            assert_eq!(envelope.event_sequence, 1);
+            Ok::<_, Box<dyn std::error::Error>>(())
+        }
+        .await;
+        cancel.cancel();
+        observed
+    };
+    let (observed, outcome) = tokio::join!(
+        observe,
+        follow_canonical_tip_with_control(store, follower, control_commands),
+    );
+    observed?;
+    outcome?;
+    Ok(())
+}
+
+/// A canonical store published through height 4, the tip of its source.
+async fn follower_fixture_at_its_node_tip() -> Result<
+    (
+        RecordingParseableSource,
+        Arc<NetworkUpgradeActivations>,
+        zinder_store::RocksDbCanonicalStore,
+        tempfile::TempDir,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let activations = Arc::new(sample_regtest_upgrade_activations());
+    let blocks = parseable_multi_block_chain()?;
+    let source = RecordingParseableSource::new(
+        blocks.clone(),
+        checkpoints_for_parseable_chain(&blocks, &activations)?,
+        BlockHeight::new(4),
+    );
+    let temporary = tempdir()?;
+    let store = publish_parseable_store(
+        &source,
+        &blocks,
+        Arc::clone(&activations),
+        &temporary.path().join("canonical"),
+        4,
+        BlockHeight::new(4),
+    )
+    .await?;
+    Ok((source, activations, store, temporary))
+}
+
+/// A follower that bounds each node request by the default
+/// `node.request_timeout_secs`.
+fn follower_with_default_request_timeout<'a>(
+    source: &'a RecordingParseableSource,
+    activations: &Arc<NetworkUpgradeActivations>,
+    readiness: &'a ComposedReadiness,
+    cancel: &'a CancellationToken,
+) -> CanonicalFollower<'a, RecordingParseableSource> {
+    CanonicalFollower::new(
+        source,
+        Arc::clone(activations),
+        CanonicalFollowConfig {
+            request_timeout: Duration::from_secs(30),
+            poll_interval: Duration::from_secs(1),
+            lag_threshold_blocks: 0,
+            target_height: None,
+            event_retention_window: None,
+            event_retention_check_interval: Duration::from_secs(1),
+            mempool_ready_gate: None,
+            max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+            node_failover: None,
+        },
+        readiness,
+        cancel,
+    )
+}
+
+/// Asks the follower for its writer status within a reader's deadline and
+/// returns it with the time the follower took to answer.
+async fn timed_writer_status(
+    commands: &mpsc::Sender<CanonicalControlCommand>,
+) -> Result<(CanonicalWriterStatusResponse, Duration), Box<dyn std::error::Error>> {
+    let asked_at = tokio::time::Instant::now();
+    let (reply, response) = oneshot::channel();
+    commands
+        .send(CanonicalControlCommand::WriterStatus { reply })
+        .await?;
+    let status = tokio::time::timeout(READER_WRITER_STATUS_DEADLINE, response).await???;
+    Ok((status, asked_at.elapsed()))
+}
+
+/// Sends one durable mempool append and returns the receiver of its reply.
+async fn send_mempool_append(
+    commands: &mpsc::Sender<CanonicalControlCommand>,
+    transaction_tag: u8,
+) -> Result<
+    oneshot::Receiver<Result<MempoolEventEnvelope, tonic::Status>>,
+    Box<dyn std::error::Error>,
+> {
+    let (reply, response) = oneshot::channel();
+    commands
+        .send(CanonicalControlCommand::AppendMempoolEvent {
+            event: Box::new(MempoolEvent::Invalidated {
+                transaction_id: TransactionId::from_bytes([transaction_tag; 32]),
+                reason: MempoolEvictionReason::Unknown,
+            }),
+            observed_at: UnixTimestampMillis::new(1_000),
+            reply,
+        })
+        .await?;
+    Ok(response)
+}
+
+/// Yields until the follower reports a node outage. Yielding keeps a paused
+/// clock still, so the follower is then waiting out its recovery backoff.
+async fn yield_until_node_unavailable(
+    readiness: &ComposedReadiness,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for _ in 0..10_000 {
+        if matches!(
+            readiness.runtime_readiness().report().cause,
+            ReadinessCause::NodeUnavailable(_)
+        ) {
+            return Ok(());
+        }
+        tokio::task::yield_now().await;
+    }
+    Err("the follower never reported the node outage".into())
 }
 
 /// The node switches its best chain to a sibling block after the follower

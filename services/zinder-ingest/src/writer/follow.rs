@@ -1,7 +1,7 @@
 //! Continuous append-only following for the canonical store.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fmt,
     future::Future,
     num::{NonZeroU32, NonZeroU64},
@@ -39,8 +39,10 @@ use crate::{
         register_prohibited_read_metrics,
     },
     writer::control::{
-        CanonicalControlCommand, CanonicalControlScheduling, ParkedWriterHalt, TipConfirmation,
-        apply_following_canonical_control_command, apply_parked_canonical_control_command,
+        CANONICAL_CONTROL_COMMAND_CAPACITY, CanonicalControlCommand, CanonicalControlRead,
+        CanonicalControlScheduling, ParkedWriterHalt, TipConfirmation,
+        answer_canonical_control_read, apply_following_canonical_control_command,
+        apply_parked_canonical_control_command,
     },
     writer::raw_blob_policy_for_retention,
 };
@@ -545,8 +547,9 @@ where
 
 /// Follows while servicing bounded commands against the same primary handle.
 ///
-/// The receiver is owned by this loop, not by a storage adapter. Commands may
-/// queue while source preparation is in flight, but `AtTip` waits always select
+/// The receiver is owned by this loop, not by a storage adapter. While the
+/// follower waits on the node, it answers read-only commands at once and
+/// applies writes in arrival order when the wait ends. `AtTip` waits select
 /// between a command, cancellation, and the configured poll delay.
 pub async fn follow_canonical_tip_with_control<Source>(
     store: RocksDbCanonicalStore,
@@ -566,7 +569,7 @@ where
 async fn follow_canonical_tip_controlled<Source>(
     mut store: RocksDbCanonicalStore,
     follower: CanonicalFollower<'_, Source>,
-    mut control_commands: Option<mpsc::Receiver<CanonicalControlCommand>>,
+    control_commands: Option<mpsc::Receiver<CanonicalControlCommand>>,
 ) -> Result<RocksDbCanonicalStore, CanonicalFollowError>
 where
     Source: NodeSource,
@@ -579,30 +582,30 @@ where
     let mut observed_fence_tip = None;
     let mut next_event_retention_check = std::time::Instant::now();
     let mut mempool_hydration_changes = follower.config.mempool_ready_gate.clone();
+    let mut control = ControlInbox::new(control_commands);
     // The opened store's visible tip may sit on a branch the node abandoned
     // while this writer was down. Readers learn that it is confirmed only
     // from a source observation, never from the persisted fence itself.
     let mut tip_confirmation = TipConfirmation::Unconfirmed;
 
     loop {
-        if let Some(control_commands) = control_commands.as_mut() {
-            while let Ok(command) = control_commands.try_recv() {
-                if apply_following_canonical_control_command(&mut store, command, tip_confirmation)
-                    == CanonicalControlScheduling::YieldToCanonical
-                {
-                    break;
-                }
-            }
-        }
+        control.drain(&mut store, tip_confirmation);
         if follower.cancel.is_cancelled() {
             return Ok(store);
         }
         if let Some(node_failover) = follower.config.node_failover.as_ref() {
             observe_fence_for_failover(node_failover, &store, &mut observed_fence_tip)?;
-            let switch = tokio::select! {
-                () = follower.cancel.cancelled() => return Ok(store),
-                switch = node_failover.switch_after_unready() => switch,
-            };
+            let switch = control
+                .serve_reads_until(&store, tip_confirmation, async {
+                    tokio::select! {
+                        () = follower.cancel.cancelled() => None,
+                        switch = node_failover.switch_after_unready() => switch,
+                    }
+                })
+                .await;
+            if follower.cancel.is_cancelled() {
+                return Ok(store);
+            }
             if let Some(switch) = switch {
                 source_outage = None;
                 tip_confirmation =
@@ -638,20 +641,25 @@ where
             return Ok(store);
         }
 
-        let Some(prepared) = await_follow_preparation_or_mempool_change(
-            prepare_follow_iteration(
+        let Some(prepared) = control
+            .serve_reads_until(
                 &store,
-                follower.source,
-                Arc::clone(&follower.network_upgrade_activations),
-                follower.config.clone(),
-                follower.cancel,
-            ),
-            &mut mempool_hydration_changes,
-            follower.config.mempool_ready_gate.as_ref(),
-            follower.readiness,
-            store.event_fence().visible_tip(),
-        )
-        .await
+                tip_confirmation,
+                Box::pin(await_follow_preparation_or_mempool_change(
+                    prepare_follow_iteration(
+                        &store,
+                        follower.source,
+                        Arc::clone(&follower.network_upgrade_activations),
+                        follower.config.clone(),
+                        follower.cancel,
+                    ),
+                    &mut mempool_hydration_changes,
+                    follower.config.mempool_ready_gate.as_ref(),
+                    follower.readiness,
+                    store.event_fence().visible_tip(),
+                )),
+            )
+            .await
         else {
             // Source preparation is read-only, so dropping it on a mempool
             // lifecycle transition preserves the admitted canonical fence.
@@ -662,12 +670,14 @@ where
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(CanonicalFollowError::Source(source_error)) => {
-                match follower
-                    .recover_source_failure(
-                        source_error,
-                        &mut source_outage,
-                        store.event_fence().visible_tip().height,
-                    )
+                control.drain(&mut store, tip_confirmation);
+                let recovery = follower.recover_source_failure(
+                    source_error,
+                    &mut source_outage,
+                    store.event_fence().visible_tip().height,
+                );
+                match control
+                    .serve_reads_until(&store, tip_confirmation, recovery)
                     .await?
                 {
                     SourceRecovery::Cancelled => return Ok(store),
@@ -688,14 +698,9 @@ where
                 if let Some(mempool_ready_gate) = follower.config.mempool_ready_gate.as_ref() {
                     mempool_ready_gate.halt_owner(evidence.halt());
                 }
-                if let Some(control_commands) = control_commands.as_mut() {
-                    serve_parked_writer(
-                        &mut store,
-                        control_commands,
-                        evidence.halt(),
-                        follower.cancel,
-                    )
-                    .await;
+                if control.is_connected() {
+                    serve_parked_writer(&mut store, &mut control, evidence.halt(), follower.cancel)
+                        .await;
                 }
                 return Err(CanonicalFollowError::ReorgWindowExceeded(evidence));
             }
@@ -709,6 +714,7 @@ where
         if follower.cancel.is_cancelled() {
             return Ok(store);
         }
+        control.drain(&mut store, tip_confirmation);
 
         match prepared {
             FollowIteration::AtTip { observed_tip } => {
@@ -723,48 +729,25 @@ where
                     follower.config.lag_threshold_blocks,
                     follower.config.mempool_ready_gate.as_ref(),
                 );
-                if let Some(control_receiver) = control_commands.as_mut() {
-                    let control_channel_closed = tokio::select! {
-                        () = follower.cancel.cancelled() => return Ok(store),
-                        hydration_changed = wait_for_mempool_hydration_change(&mut mempool_hydration_changes) => {
-                            apply_mempool_hydration_change(
-                                hydration_changed,
-                                &mut mempool_hydration_changes,
-                                follower.readiness,
-                                follower.config.mempool_ready_gate.as_ref(),
-                                store.event_fence().visible_tip(),
-                            );
-                            false
-                        }
-                        command = control_receiver.recv() => {
-                            command.is_none_or(|command| {
-                                apply_following_canonical_control_command(
-                                    &mut store,
-                                    command,
-                                    tip_confirmation,
-                                );
-                                false
-                            })
-                        }
-                        () = tokio::time::sleep(follower.config.poll_interval) => false,
-                    };
-                    if control_channel_closed {
-                        control_commands = None;
+                tokio::select! {
+                    () = follower.cancel.cancelled() => return Ok(store),
+                    hydration_changed = wait_for_mempool_hydration_change(&mut mempool_hydration_changes) => {
+                        apply_mempool_hydration_change(
+                            hydration_changed,
+                            &mut mempool_hydration_changes,
+                            follower.readiness,
+                            follower.config.mempool_ready_gate.as_ref(),
+                            store.event_fence().visible_tip(),
+                        );
                     }
-                } else {
-                    tokio::select! {
-                        () = follower.cancel.cancelled() => return Ok(store),
-                        hydration_changed = wait_for_mempool_hydration_change(&mut mempool_hydration_changes) => {
-                            apply_mempool_hydration_change(
-                                hydration_changed,
-                                &mut mempool_hydration_changes,
-                                follower.readiness,
-                                follower.config.mempool_ready_gate.as_ref(),
-                                store.event_fence().visible_tip(),
-                            );
-                        }
-                        () = tokio::time::sleep(follower.config.poll_interval) => {}
+                    command = control.next_command() => {
+                        apply_following_canonical_control_command(
+                            &mut store,
+                            command,
+                            tip_confirmation,
+                        );
                     }
+                    () = tokio::time::sleep(follower.config.poll_interval) => {}
                 }
             }
             FollowIteration::Append {
@@ -782,6 +765,97 @@ where
             } => {
                 store = follower.commit_replacement(store, *replacement, observed_tip)?;
                 tip_confirmation = TipConfirmation::Confirmed;
+            }
+        }
+    }
+}
+
+/// The follower's end of the control channel.
+///
+/// While the follower waits on the node, it answers reads at once and holds
+/// writes here. Held writes apply in arrival order, ahead of the commands
+/// still in the channel, once the follower holds the store exclusively again.
+struct ControlInbox {
+    receiver: Option<mpsc::Receiver<CanonicalControlCommand>>,
+    held_writes: VecDeque<CanonicalControlCommand>,
+}
+
+impl ControlInbox {
+    const fn new(receiver: Option<mpsc::Receiver<CanonicalControlCommand>>) -> Self {
+        Self {
+            receiver,
+            held_writes: VecDeque::new(),
+        }
+    }
+
+    const fn is_connected(&self) -> bool {
+        self.receiver.is_some()
+    }
+
+    /// Applies held writes, then the commands already in the channel, until a
+    /// mempool retention step yields to canonical work or none is left.
+    fn drain(&mut self, store: &mut RocksDbCanonicalStore, tip_confirmation: TipConfirmation) {
+        while let Some(command) = self.held_writes.pop_front().or_else(|| {
+            self.receiver
+                .as_mut()
+                .and_then(|receiver| receiver.try_recv().ok())
+        }) {
+            if apply_following_canonical_control_command(store, command, tip_confirmation)
+                == CanonicalControlScheduling::YieldToCanonical
+            {
+                return;
+            }
+        }
+    }
+
+    /// Receives the next command, a held write first. Never completes once
+    /// the channel has closed and no write is held.
+    async fn next_command(&mut self) -> CanonicalControlCommand {
+        if let Some(command) = self.held_writes.pop_front() {
+            return command;
+        }
+        while let Some(receiver) = self.receiver.as_mut() {
+            if let Some(command) = receiver.recv().await {
+                return command;
+            }
+            self.receiver = None;
+        }
+        std::future::pending().await
+    }
+
+    /// Drives `pending` to completion while it answers control reads from
+    /// `store` and holds writes for [`Self::drain`].
+    ///
+    /// It stops receiving while it holds a channel's worth of writes, so the
+    /// channel bound pushes back on further commands as it does while the
+    /// follower is busy.
+    async fn serve_reads_until<T>(
+        &mut self,
+        store: &RocksDbCanonicalStore,
+        tip_confirmation: TipConfirmation,
+        pending: impl Future<Output = T>,
+    ) -> T {
+        let mut pending = std::pin::pin!(pending);
+        loop {
+            if self.held_writes.len() >= CANONICAL_CONTROL_COMMAND_CAPACITY {
+                return pending.await;
+            }
+            let Some(receiver) = self.receiver.as_mut() else {
+                return pending.await;
+            };
+            tokio::select! {
+                biased;
+                outcome = &mut pending => return outcome,
+                command = receiver.recv() => match command {
+                    Some(command) => {
+                        if let CanonicalControlRead::Write(write) =
+                            answer_canonical_control_read(store, command, tip_confirmation)
+                        {
+                            self.held_writes.push_back(write);
+                        }
+                    }
+                    None => self.receiver = None,
+                },
             }
         }
     }
@@ -1340,9 +1414,11 @@ fn prepared_replacement_bytes(block: &CanonicalBuildBlock) -> u64 {
 /// The writer no longer follows, but readers still need its frozen fence,
 /// retained events, retention leases, and owner checkpoints, and its control
 /// plane keeps reporting the typed halt. No command changes canonical rows.
+/// Writes held while the last preparation waited on the node are handled
+/// first, so a mempool write sent before the park is refused like any other.
 async fn serve_parked_writer(
     store: &mut RocksDbCanonicalStore,
-    control_commands: &mut mpsc::Receiver<CanonicalControlCommand>,
+    control: &mut ControlInbox,
     halt: ParkedWriterHalt,
     cancel: &CancellationToken,
 ) {
@@ -1356,11 +1432,7 @@ async fn serve_parked_writer(
         tokio::select! {
             biased;
             () = cancel.cancelled() => return,
-            command = control_commands.recv() => {
-                let Some(command) = command else {
-                    cancel.cancelled().await;
-                    return;
-                };
+            command = control.next_command() => {
                 apply_parked_canonical_control_command(store, command, halt);
             }
         }
@@ -1791,13 +1863,26 @@ mod tests {
         SubtreeRootRange,
     };
 
-    use super::{
-        CheckpointComponent, ReplacementMemory, await_follow_preparation_or_mempool_change,
-        differing_checkpoint_component, gate_canonical_readiness_on_mempool_hydration,
-        live_subtree_root_ranges, next_settled_height, publish_follow_readiness,
-        wait_for_mempool_hydration_change, withdraw_follow_readiness_for_mempool_hydration,
+    use tokio::sync::{mpsc, oneshot};
+    use zinder_core::{MempoolEvictionReason, TransactionId, UnixTimestampMillis};
+    use zinder_store::{
+        MempoolEvent, MempoolEventEnvelope, MempoolEventRetentionConfig,
+        MempoolEventRetentionStepBudget,
     };
-    use crate::mempool_ready_channel;
+
+    use super::{
+        CheckpointComponent, ControlInbox, ReplacementMemory,
+        await_follow_preparation_or_mempool_change, differing_checkpoint_component,
+        gate_canonical_readiness_on_mempool_hydration, live_subtree_root_ranges,
+        next_settled_height, publish_follow_readiness, wait_for_mempool_hydration_change,
+        withdraw_follow_readiness_for_mempool_hydration,
+    };
+    use crate::{
+        mempool_ready_channel,
+        writer::control::{
+            CanonicalControlCommand, TipConfirmation, test_support::published_fixture_store,
+        },
+    };
     use zinder_runtime::{
         ComposedReadiness, IngestPhase, Readiness, ReadinessCause, ReadinessInput, ReadinessState,
         UpstreamHealth, UpstreamNotReadyDetail,
@@ -1821,6 +1906,88 @@ mod tests {
                 reason: std::borrow::Cow::Borrowed("syncing"),
             },
         })
+    }
+
+    /// While the follower waits, reads are answered and writes are held in
+    /// arrival order. Held writes apply once the wait ends, and a held
+    /// retention step still yields to canonical work before the next write.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn held_writes_apply_in_arrival_order_and_yield_after_a_retention_step()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let mut store = published_fixture_store(&temporary.path().join("canonical"))?;
+        let (commands, receiver) = mpsc::channel(8);
+        let mut control = ControlInbox::new(Some(receiver));
+        let mut first_append = send_mempool_append(&commands, 1).await?;
+        let (prune_reply, mut prune_outcome) = oneshot::channel();
+        commands
+            .send(CanonicalControlCommand::PruneMempoolEvents {
+                now: UnixTimestampMillis::new(10_000),
+                retention: MempoolEventRetentionConfig::new(
+                    Some(Duration::from_millis(1)),
+                    Some(Duration::from_millis(1)),
+                ),
+                budget: MempoolEventRetentionStepBudget::new(
+                    NonZeroU32::new(1).ok_or("event budget is nonzero")?,
+                    std::num::NonZeroU64::new(1_000_000).ok_or("byte budget is nonzero")?,
+                ),
+                reply: prune_reply,
+            })
+            .await?;
+        let mut second_append = send_mempool_append(&commands, 2).await?;
+        let (status_reply, mut status) = oneshot::channel();
+        commands
+            .send(CanonicalControlCommand::WriterStatus {
+                reply: status_reply,
+            })
+            .await?;
+
+        control
+            .serve_reads_until(
+                &store,
+                TipConfirmation::Confirmed,
+                tokio::time::sleep(Duration::from_secs(1)),
+            )
+            .await;
+
+        let status = status.try_recv()??;
+        assert!(!status.tip_unconfirmed);
+        assert!(first_append.try_recv().is_err());
+        assert!(prune_outcome.try_recv().is_err());
+        assert!(second_append.try_recv().is_err());
+
+        control.drain(&mut store, TipConfirmation::Confirmed);
+        assert_eq!(first_append.try_recv()??.event_sequence, 1);
+        prune_outcome.try_recv()??;
+        assert!(
+            second_append.try_recv().is_err(),
+            "a held retention step yields before the next held write"
+        );
+
+        control.drain(&mut store, TipConfirmation::Confirmed);
+        assert_eq!(second_append.try_recv()??.event_sequence, 2);
+        Ok(())
+    }
+
+    async fn send_mempool_append(
+        commands: &mpsc::Sender<CanonicalControlCommand>,
+        transaction_tag: u8,
+    ) -> Result<
+        oneshot::Receiver<Result<MempoolEventEnvelope, tonic::Status>>,
+        Box<dyn std::error::Error>,
+    > {
+        let (reply, response) = oneshot::channel();
+        commands
+            .send(CanonicalControlCommand::AppendMempoolEvent {
+                event: Box::new(MempoolEvent::Invalidated {
+                    transaction_id: TransactionId::from_bytes([transaction_tag; 32]),
+                    reason: MempoolEvictionReason::Unknown,
+                }),
+                observed_at: UnixTimestampMillis::new(1_000),
+                reply,
+            })
+            .await?;
+        Ok(response)
     }
 
     #[test]

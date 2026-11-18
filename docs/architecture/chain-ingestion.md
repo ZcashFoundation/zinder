@@ -209,6 +209,31 @@ has completed its current source snapshot. Source failures move readiness to
 resume from the current fence. Storage corruption, schema mismatch, invalid
 reorg depth, and internal invariant failures terminate the writer.
 
+### Control commands while following
+
+The follower that owns the primary also serves, through one command queue,
+the `CanonicalControl` and `IngestControl` commands of projectors, readers,
+and the live mempool owner. While the follower waits on the node, for a node
+request, a recovery backoff, or an endpoint switch attempt, it answers every
+read-only command at once: writer status, the chain epoch, retained chain-event
+and mempool-event pages, mempool stream starts and snapshot cursors, and
+checkpoint re-admission context. `WriterStatus` reports `tip_unconfirmed` as
+it does between waits, until a source observation confirms the visible tip.
+A slow or stalled node therefore does not delay `WriterStatus`, however long
+`node.request_timeout_secs` lets one request run, unless the follower already
+holds a full queue of writes.
+
+Commands that write the store are held while the follower waits on the node,
+and apply in arrival order when the wait ends. They are mempool appends and
+retention steps, projection-build lease operations, and owner checkpoints. A mempool
+retention step still yields to canonical work before the next queued command.
+A read can be answered before a write that arrived earlier. No caller has
+observed that write yet: every caller awaits a write's reply before acting on
+it, and the live mempool owner publishes an index change only after its
+durable append replies. The follower holds at most 64 such writes, the
+capacity of its command queue. Beyond that it stops receiving commands until
+the wait ends, so a `WriterStatus` sent then is answered only after the wait.
+
 ### Node endpoint failover
 
 With `[node_fallbacks.N]` endpoints configured, ingest reads through the active
