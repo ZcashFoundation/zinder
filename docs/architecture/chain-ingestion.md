@@ -307,7 +307,11 @@ with the previous endpoint or finishes certifying one of its snapshots after
 the switch.
 Each endpoint's client applies that endpoint's own `request_timeout_secs`, and
 the writer bounds every node call by the longest timeout in the list, so a call
-to a fallback slower than `[node]` is not cut short after a switch.
+to a fallback slower than `[node]` is not cut short after a switch. Each client
+also accepts responses up to its own `max_response_bytes`, and construction can
+start on any endpoint, so construction reserves and admits source responses
+against the largest limit in the list, which keeps its in-flight byte bound
+whichever endpoint is active, and aims them at the smallest.
 There is no timed failback. The next switch walks positions from 0 again, and a
 restart starts at position 0. Fresh construction does not switch: a node
 failure there exits, and the restart admits the first reachable endpoint.

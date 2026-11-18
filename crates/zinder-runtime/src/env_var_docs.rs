@@ -1457,7 +1457,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         requirement: Requirement::Optional,
         sensitive: false,
         description: "Diagnostic override for adaptive response sizing. The default is \
-                      `min(node.max_response_bytes, 33554432)`.",
+                      `min(node.max_response_bytes, 33554432)`; with `[node_fallbacks.N]` \
+                      endpoints, the smallest `max_response_bytes` in the list replaces \
+                      `node.max_response_bytes`.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__CONSTRUCTION__SOURCE_FETCH_MAX_IN_FLIGHT_REQUESTS",
@@ -1476,7 +1478,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "Diagnostic override for predicted active source responses plus measured \
                       completed reassembly. The default is \
                       `max(node.max_response_bytes, clamp(container_memory / 64, 134217728, \
-                      402653184))`.",
+                      402653184))`; with `[node_fallbacks.N]` endpoints, the largest \
+                      `max_response_bytes` in the list replaces `node.max_response_bytes`, \
+                      and an override must be at least that large.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__CONSTRUCTION__BLOCK_PREPARE_CONCURRENCY",

@@ -1683,6 +1683,81 @@ source = "zebra-json-rpc"
         Ok(())
     }
 
+    /// Loads an ingest config whose `[node]` accepts 16 MiB responses and
+    /// whose fallback accepts 256 MiB, with `construction` appended to its
+    /// `[ingest]` table.
+    fn load_config_with_unequal_response_limits(
+        construction: &str,
+    ) -> Result<super::config::IngestCommandConfig, Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let config_path = temporary.path().join("zinder-ingest.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"[network]
+name = "zcash-regtest"
+
+[node]
+json_rpc_addr = "http://127.0.0.1:39232"
+max_response_bytes = 16777216
+
+[node_fallbacks.1]
+json_rpc_addr = "http://127.0.0.1:39233"
+max_response_bytes = 268435456
+
+[storage]
+path = "{}"
+
+[ingest]
+source = "zebra-json-rpc"
+{construction}
+"#,
+                temporary.path().join("store").display()
+            ),
+        )?;
+        Ok(super::config::load_ingest_config(
+            Some(config_path),
+            super::IngestConfigOverrides::default(),
+        )?)
+    }
+
+    /// Startup can make a fallback with a larger response limit than
+    /// `[node]` active, so source fetch reserves and admits responses
+    /// against the largest limit in the list, and aims them at the smallest.
+    #[test]
+    fn construction_sizes_source_responses_by_every_endpoint_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let command_config = load_config_with_unequal_response_limits("")?;
+
+        let limits = command_config.runtime_config.construction.pipeline_limits;
+        assert_eq!(limits.max_response_bytes.get(), 268_435_456);
+        assert!(limits.source_fetch_max_in_flight_bytes.get() >= 268_435_456);
+        assert_eq!(
+            limits.source_segment_target_response_bytes.get(),
+            16_777_216
+        );
+        Ok(())
+    }
+
+    /// A source watermark that cannot admit one response from the endpoint
+    /// with the largest limit is refused, even when `[node]`'s fits.
+    #[test]
+    fn construction_refuses_a_watermark_below_a_fallback_response_limit() {
+        let loaded = load_config_with_unequal_response_limits(
+            "\n[ingest.construction]\nsource_fetch_max_in_flight_bytes = 134217728\n",
+        );
+
+        let refusal = loaded
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(
+            refusal
+                .contains("source fetch watermark 134217728 is below maximum response 268435456"),
+            "{refusal}"
+        );
+    }
+
     #[test]
     fn explorer_views_task_composition_matches_admission() {
         assert!(!explorer_views_start_backfills(false));
