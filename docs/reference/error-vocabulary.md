@@ -124,7 +124,7 @@ Service is reachable but a dependency is not, or the operation is not yet suppor
 | Reason | What it means |
 | --- | --- |
 | `NODE_UNAVAILABLE` | Upstream node (Zebra) is unreachable or returning errors. A broadcast also returns it, without sending the transaction, until one of the reader's configured node endpoints passes first-contact verification, and when every verified endpoint is unreachable. The writer's live mempool also returns it while it hydrates or rebuilds from the node, and query forwards it for mempool calls |
-| `STORAGE_UNAVAILABLE` | Local storage cannot serve the request (fall-through case). The canonical writer also returns it for a `CanonicalControl` or `IngestControl` request that the owner of its canonical store did not service in time or stopped before answering, and native query forwards it for mempool calls |
+| `STORAGE_UNAVAILABLE` | Local storage cannot serve the request (fall-through case). The canonical writer also returns it for a `CanonicalControl` or `IngestControl` request that the owner of its canonical store did not service within 60 seconds or stopped before answering. Native query forwards it for mempool calls when the owner has stopped, but it ends its own ingest-control calls after 15 seconds, so an owner that stalls reaches native query callers as `UPSTREAM_UNREACHABLE` |
 | `BLOCKING_TASK_FAILED` | An internal background task failed unexpectedly |
 | `UNSUPPORTED_CHAIN_EVENT` | The requested event variant cannot be represented by this binary |
 | `UNSUPPORTED_BLOCK_SELECTOR` | The requested selector shape cannot be represented |
