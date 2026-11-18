@@ -11,8 +11,9 @@ use tokio_stream::StreamExt as _;
 use zinder_core::{BlockHash, BlockHeight, BlockId, Network};
 use zinder_source::{
     ACTIVE_NODE_ENDPOINT_CHANGED_REASON, DEFAULT_MAX_JSON_RPC_RESPONSE_BYTES, MempoolSource,
-    MempoolSourceAdmissionLimits, MempoolSourceEvent, MempoolSourceFactory, NodeAuth,
-    NodeCapabilities, NodeSet, NodeSource, NodeTarget, SourceBlock, SourceError,
+    MempoolSourceAdmissionLimits, MempoolSourceCapabilities, MempoolSourceEvent,
+    MempoolSourceEventStream, MempoolSourceFactory, NodeAuth, NodeCapabilities, NodeSet,
+    NodeSource, NodeTarget, SourceBlock, SourceError,
 };
 use zinder_testkit::{
     JsonRpcTestServer, LogCapture, MockMempoolSource, MockMempoolSourceControl, RpcReply, method,
@@ -24,6 +25,8 @@ use zinder_testkit::{
 struct FixedTipEndpoint {
     tip: BlockId,
     mempool: MockMempoolSource,
+    /// Makes opening the mempool stream wait forever, as a stalled indexer does.
+    stalls_opening: bool,
 }
 
 impl FixedTipEndpoint {
@@ -34,6 +37,7 @@ impl FixedTipEndpoint {
             Self {
                 tip: BlockId::new(BlockHeight::new(height), BlockHash::from_bytes([tag; 32])),
                 mempool,
+                stalls_opening: false,
             },
             control,
         )
@@ -63,7 +67,25 @@ impl MempoolSourceFactory for FixedTipEndpoint {
         &self,
         _admission_limits: MempoolSourceAdmissionLimits,
     ) -> Arc<dyn MempoolSource> {
-        Arc::new(self.mempool.clone())
+        if self.stalls_opening {
+            Arc::new(StalledOpenMempoolSource)
+        } else {
+            Arc::new(self.mempool.clone())
+        }
+    }
+}
+
+/// A mempool source whose stream never finishes opening.
+struct StalledOpenMempoolSource;
+
+#[async_trait]
+impl MempoolSource for StalledOpenMempoolSource {
+    fn capabilities(&self) -> MempoolSourceCapabilities {
+        MempoolSourceCapabilities::streaming()
+    }
+
+    async fn events(&self) -> Result<MempoolSourceEventStream, SourceError> {
+        std::future::pending().await
     }
 }
 
@@ -139,6 +161,33 @@ async fn a_switch_ends_the_open_mempool_stream_and_reopens_on_the_new_endpoint()
     assert!(matches!(
         from_fallback,
         Some(Ok(MempoolSourceEvent::InitialSnapshotComplete { source_tip })) if source_tip == fallback_tip
+    ));
+    Ok(())
+}
+
+/// An endpoint whose stream open stalls does not hold the mempool on it
+/// after a switch: the open ends as soon as the active endpoint changes.
+#[tokio::test]
+async fn a_switch_abandons_a_stalled_mempool_stream_open() -> eyre::Result<()> {
+    let (mut primary, _primary_control) = FixedTipEndpoint::at_height(10);
+    primary.stalls_opening = true;
+    let (fallback, _fallback_control) = FixedTipEndpoint::at_height(20);
+    let (nodes, switch) = NodeSet::new(primary, [fallback]);
+    let mempool = nodes.mempool_source(MempoolSourceAdmissionLimits::default());
+
+    let (opened, switched) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(5), mempool.events()),
+        async {
+            tokio::task::yield_now().await;
+            switch.switch_to(1)
+        },
+    );
+
+    assert!(switched);
+    assert!(matches!(
+        opened?.err(),
+        Some(SourceError::MempoolStreamUnavailable { ref reason })
+            if reason == ACTIVE_NODE_ENDPOINT_CHANGED_REASON
     ));
     Ok(())
 }

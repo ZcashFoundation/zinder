@@ -123,8 +123,9 @@ to its active endpoint, so code written against one node is unchanged.
 build one `ZebraJsonRpcSource` from `[node]`. Only the `NodeSetSwitch` returned
 with the set changes the active endpoint, and `NodeSet::mempool_source` follows
 the active endpoint's mempool: a switch ends the open event stream with one
-`MempoolStreamUnavailable` item, so the consumer rebuilds its snapshot from the
-new endpoint as after any stream failure.
+`MempoolStreamUnavailable` item, and fails a stream that is still opening with
+the same error, so the consumer rebuilds its snapshot from the new endpoint as
+after any stream failure, even when the previous endpoint stalls.
 
 Only ingest switches, and only between follow iterations; see
 [Chain ingestion §Node endpoint failover](chain-ingestion.md#node-endpoint-failover)

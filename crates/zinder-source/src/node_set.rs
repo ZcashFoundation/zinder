@@ -239,11 +239,25 @@ impl MempoolSource for ActiveEndpointMempoolSource {
             })
     }
 
+    /// Opens the active endpoint's stream. A switch while the stream opens
+    /// abandons the open, so an endpoint that stalls never delays the
+    /// rebuild from the new one.
     async fn events(&self) -> Result<MempoolSourceEventStream, SourceError> {
         let mut switches = self.active.subscribe();
         let position = *switches.borrow_and_update();
-        let events = self.source_at(position)?.events().await?;
+        let source = self.source_at(position)?;
+        let events = tokio::select! {
+            biased;
+            Ok(()) = switches.changed() => return Err(active_endpoint_changed()),
+            events = source.events() => events?,
+        };
         Ok(end_on_switch(events, switches))
+    }
+}
+
+fn active_endpoint_changed() -> SourceError {
+    SourceError::MempoolStreamUnavailable {
+        reason: ACTIVE_NODE_ENDPOINT_CHANGED_REASON.to_owned(),
     }
 }
 
@@ -259,12 +273,7 @@ fn end_on_switch(
             let (mut events, mut switches) = state?;
             tokio::select! {
                 biased;
-                Ok(()) = switches.changed() => Some((
-                    Err(SourceError::MempoolStreamUnavailable {
-                        reason: ACTIVE_NODE_ENDPOINT_CHANGED_REASON.to_owned(),
-                    }),
-                    None,
-                )),
+                Ok(()) = switches.changed() => Some((Err(active_endpoint_changed()), None)),
                 event = events.next() => event.map(|event| (event, Some((events, switches)))),
             }
         },
