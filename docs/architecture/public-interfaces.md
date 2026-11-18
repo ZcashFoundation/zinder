@@ -294,7 +294,7 @@ each process only the `ZINDER_*` variables its binary accepts, as
 [Wallet-serving deployment](../runbooks/deploying-wallet-serving.md#service-configuration)
 describes.
 
-`RUST_LOG` is the one non-`ZINDER_*` variable every binary reads. It selects
+`RUST_LOG` is the one non-`ZINDER_*` variable every service binary reads. It selects
 the log filter rather than a configuration field, so it has no TOML field and
 no row in the table below. Unset or blank means `info`, and a value that does
 not parse fails startup, as

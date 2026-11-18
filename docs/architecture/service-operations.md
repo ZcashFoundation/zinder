@@ -1175,12 +1175,13 @@ transaction identifiers, exception text, or user input as labels.
 
 ## Structured logs
 
-Every binary writes logs to stderr and selects them with the `RUST_LOG`
-filter, in
+The service binaries, `zinder-ingest`, `zinder-projector`, `zinder-query`,
+`zinder-compat-lightwalletd`, `zinder-explorer`, and `zinder-compat-cipherscan`,
+write logs to stderr and select them with the `RUST_LOG` filter, in
 [`tracing-subscriber` `EnvFilter` syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html#directives),
 such as `info,zinder::ingest=debug`. An unset, empty, or whitespace-only
 `RUST_LOG` selects `info`. A value that does not parse, such as
-`zinder=verbose`, stops the binary before it reads configuration or opens
+`zinder=verbose`, stops the service before it reads configuration or opens
 storage: it prints `RUST_LOG="<value>" is not a valid log filter: <reason>`,
 prefixed with the binary name, to stderr and exits non-zero. A `RUST_LOG`
 that is not valid Unicode fails the same way. A bare word such as `zinder` is
