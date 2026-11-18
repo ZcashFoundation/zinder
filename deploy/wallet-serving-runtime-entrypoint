@@ -391,21 +391,24 @@ readiness_cause_is_upstream_outage() {
 }
 
 # Ingest's own cause hides its node probe while its admission state refuses
-# traffic: while Zebra resyncs, ingest reports `syncing` because it trails the
-# node or because its mempool cannot hydrate. Query relays the writer's own
-# node observation, which `IngestControl.WriterStatus` reports independently of
-# that admission state, as its `ingest_control` dependency. Given ingest's
-# cause and the body query just answered, succeeds when ingest is syncing
-# behind a node that the writer reports is not synchronized.
-ingest_syncs_behind_unsynchronized_node() {
-  [ "$1" = "syncing" ] || return 1
+# traffic: while Zebra resyncs, or while only the node's mempool feed fails,
+# ingest reports `syncing` because it trails the node or because its mempool
+# cannot hydrate. Query relays the writer's own node observation as the cause
+# of its `ingest_control` dependency: `upstream_not_ready` when
+# `IngestControl.WriterStatus` reports the node unsynchronized, and
+# `node_unavailable` when the writer's live mempool waits on an unreachable
+# node. Given ingest's cause and the body query just answered, prints that
+# relayed cause when ingest is syncing behind it, and nothing otherwise.
+writer_node_outage_behind_syncing_ingest() {
+  [ "$1" = "syncing" ] || return 0
   case "$2" in
     *'{"input":"ingest_control","dependency_cause":{"upstream_not_ready":'*)
-      return 0
+      printf 'upstream_not_ready\n'
       ;;
-    *)
-      return 1
+    *'{"input":"ingest_control","dependency_cause":{"node_unavailable":'*)
+      printf 'node_unavailable\n'
       ;;
+    *) ;;
   esac
 }
 
@@ -830,21 +833,12 @@ while true; do
   ingest_report="$probe_report"
   ingest_cause="$probe_cause"
   ingest_upstream_outage="$probe_upstream_outage"
+  ingest_node_unreachable="$probe_node_unreachable"
   ingest_unreachable=0
   if [ -z "$probe_http_status" ]; then
     ingest_unreachable=1
   fi
   plane_halted=$((plane_halted | probe_halted))
-
-  # An ingest upstream outage counts as serving for the recurrence budgets and
-  # the unready tolerance; only an unreachable node has its own tolerance.
-  # shellcheck disable=SC2046 # word-splitting the two numeric fields update_node_unreachable_outage prints is intentional.
-  set -- $(update_node_unreachable_outage "$probe_node_unreachable" "$now_epoch" \
-    "$ingest_node_unreachable_since_epoch" "$ingest_report")
-  ingest_node_unreachable_since_epoch="$1"
-  if [ "$2" -eq 1 ]; then
-    fail "zinder-ingest has not reached its node for $((now_epoch - ingest_node_unreachable_since_epoch))s: $ingest_report"
-  fi
 
   projector_ready=0
   if observe_plane_readiness zinder-projector "$projector_ops_addr"; then
@@ -880,8 +874,26 @@ while true; do
     plane_halted=$((plane_halted | probe_halted))
   fi
 
-  if ingest_syncs_behind_unsynchronized_node "$ingest_cause" "$query_body"; then
-    ingest_upstream_outage=1
+  case "$(writer_node_outage_behind_syncing_ingest "$ingest_cause" "$query_body")" in
+    upstream_not_ready)
+      ingest_upstream_outage=1
+      ;;
+    node_unavailable)
+      ingest_upstream_outage=1
+      ingest_node_unreachable=1
+      ingest_report="$ingest_report; zinder-query relays the writer mempool's node outage: $query_report"
+      ;;
+    *) ;;
+  esac
+
+  # An ingest upstream outage counts as serving for the recurrence budgets and
+  # the unready tolerance; only an unreachable node has its own tolerance.
+  # shellcheck disable=SC2046 # word-splitting the two numeric fields update_node_unreachable_outage prints is intentional.
+  set -- $(update_node_unreachable_outage "$ingest_node_unreachable" "$now_epoch" \
+    "$ingest_node_unreachable_since_epoch" "$ingest_report")
+  ingest_node_unreachable_since_epoch="$1"
+  if [ "$2" -eq 1 ]; then
+    fail "zinder-ingest has not reached its node for $((now_epoch - ingest_node_unreachable_since_epoch))s: $ingest_report"
   fi
   if [ "$ingest_upstream_outage" -eq 1 ]; then
     ingest_ready=1
