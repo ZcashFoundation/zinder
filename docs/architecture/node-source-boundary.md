@@ -251,7 +251,10 @@ process retries or exits.
 
 `NodeAuth` represents valid authentication states: none, cookie file, or basic
 credentials. Invalid combinations are rejected before connection. Secrets are
-redacted from resolved configuration and logs.
+redacted from resolved configuration and logs. An endpoint URL can carry a
+credential too, so `--print-config`, the source's health-probe logs, and
+ingest's startup logs show node URLs with their user information, query, and
+fragment replaced by `[REDACTED]`.
 
 Zebra 7.1.0 and later refuse missing or stale credentials with HTTP 401 and a
 JSON-RPC error body. The source reports the refusal as `NodeUnavailable`,

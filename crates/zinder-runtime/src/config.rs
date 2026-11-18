@@ -32,7 +32,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use zinder_core::Network;
 use zinder_core::wire::{decode_zinder_native_chain_name, encode_zinder_native_chain_name};
-use zinder_source::{NodeAuth, NodeConfigError, NodeHealthConfig, NodeIndexerTls, NodeTarget};
+use zinder_source::{
+    NodeAuth, NodeConfigError, NodeHealthConfig, NodeIndexerTls, NodeTarget, redact_endpoint_url,
+};
 
 use crate::auth::{BearerToken, BearerTokenError};
 use crate::env_diagnostics::{RejectedEnvVar, translate_env_error};
@@ -656,7 +658,8 @@ impl NodeAuthToml {
 /// TOML projection of `[node.health]` for `--print-config`.
 #[derive(Debug, Serialize)]
 pub struct NodeHealthToml {
-    /// Full URL of the upstream node's readiness endpoint.
+    /// URL of the upstream node's readiness endpoint, with credentials
+    /// redacted.
     pub addr: String,
     /// Upstream-health probe cadence in milliseconds.
     pub poll_interval_ms: u64,
@@ -671,7 +674,7 @@ impl NodeHealthToml {
     #[must_use]
     pub fn from_node_health_config(health: &NodeHealthConfig) -> Self {
         Self {
-            addr: health.addr.clone(),
+            addr: redact_endpoint_url(&health.addr).into_owned(),
             poll_interval_ms: duration_as_millis_u64(health.poll_interval),
             verification_progress_floor: health.verification_progress_floor,
             estimated_gap_floor_blocks: health.estimated_gap_floor_blocks,
@@ -724,9 +727,9 @@ impl NodeIndexerTlsToml {
 /// Redacted TOML projection of `[node]` for `--print-config`.
 #[derive(Debug, Serialize)]
 pub struct NodeToml {
-    /// Node JSON-RPC base URL.
+    /// Node JSON-RPC base URL, with credentials redacted.
     pub json_rpc_addr: String,
-    /// Optional Zebra indexer gRPC endpoint URL.
+    /// Optional Zebra indexer gRPC endpoint URL, with credentials redacted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub indexer_grpc_addr: Option<String>,
     /// Per-RPC request timeout in seconds.
@@ -751,8 +754,11 @@ impl NodeToml {
     #[must_use]
     pub fn from_node_target(target: &NodeTarget) -> Self {
         Self {
-            json_rpc_addr: target.json_rpc_addr.clone(),
-            indexer_grpc_addr: target.indexer_grpc_addr.clone(),
+            json_rpc_addr: redact_endpoint_url(&target.json_rpc_addr).into_owned(),
+            indexer_grpc_addr: target
+                .indexer_grpc_addr
+                .as_deref()
+                .map(|addr| redact_endpoint_url(addr).into_owned()),
             request_timeout_secs: target.request_timeout.as_secs(),
             max_response_bytes: target.max_response_bytes.get(),
             broadcast_timeout_secs: target.broadcast_timeout.map(|d| d.as_secs()),
@@ -988,6 +994,58 @@ mod tests {
         assert!(rendered.contains("[node_fallbacks.1.auth]"));
         assert!(!rendered.contains("secret-password"));
         assert!(rendered.contains("password = \"[REDACTED]\""));
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_urls_render_with_their_credentials_redacted() -> Result<(), toml::ser::Error> {
+        #[derive(Serialize)]
+        struct Rendered {
+            node: NodeToml,
+            node_fallbacks: NodeFallbacksToml,
+        }
+        let target = NodeTarget::new(
+            Network::ZcashRegtest,
+            "http://zebra:rpc-secret@127.0.0.1:18232".to_owned(),
+            NodeAuth::None,
+            Duration::from_secs(30),
+            std::num::NonZeroU64::MIN,
+        )
+        .with_indexer_grpc_addr(Some(
+            "http://zebra:indexer-secret@127.0.0.1:18230/?token=query-secret".to_owned(),
+        ))
+        .with_health(Some(NodeHealthConfig::new(
+            "http://127.0.0.1:18233/ready?token=health-secret".to_owned(),
+            Duration::from_millis(1_250),
+            0.875,
+            42,
+        )));
+
+        let rendered = toml::to_string(&Rendered {
+            node: NodeToml::from_node_target(&target),
+            node_fallbacks: NodeFallbacksToml::from_node_targets(std::slice::from_ref(&target)),
+        })?;
+
+        assert!(!rendered.contains("secret"), "{rendered}");
+        let sections = rendered
+            .split_once("[node_fallbacks.1]")
+            .unwrap_or_default();
+        for fields in <[&str; 2]>::from(sections) {
+            assert!(
+                fields.contains("json_rpc_addr = \"http://[REDACTED]@127.0.0.1:18232\""),
+                "{rendered}"
+            );
+            assert!(
+                fields.contains(
+                    "indexer_grpc_addr = \"http://[REDACTED]@127.0.0.1:18230/?[REDACTED]\""
+                ),
+                "{rendered}"
+            );
+            assert!(
+                fields.contains("addr = \"http://127.0.0.1:18233/ready?[REDACTED]\""),
+                "{rendered}"
+            );
+        }
         Ok(())
     }
 
