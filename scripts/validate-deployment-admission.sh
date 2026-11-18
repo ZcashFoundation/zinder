@@ -886,12 +886,37 @@ EOF
   single_volume_image_targets="$(jq -r '.[]' "$single_volume_images_catalog")"
   image_target_bases_match=true
   while IFS= read -r image_target; do
+    image_target_body="$(dockerfile_stage_body "$image_target")"
     if [[ "$(dockerfile_stage_base "$image_target")" != zinder-service-base ]] \
-      || ! grep -Fq "    CMD [\"${image_target}\", \"healthcheck\"" <<< "$(dockerfile_stage_body "$image_target")" \
-      || grep -Fq 'curl' <<< "$(dockerfile_stage_body "$image_target")"; then
+      || ! grep -Fq "    CMD [\"${image_target}\", \"--config\", \"/etc/zinder/config.toml\", \"healthcheck\"" <<< "$image_target_body" \
+      || grep -Fq 'curl' <<< "$image_target_body"; then
       image_target_bases_match=false
     fi
   done <<< "$configured_release_images"
+  image_targets_bake_default_config=true
+  if grep -Eq '^ENV ' <<< "$(dockerfile_stage_body zinder-service-base)"; then
+    image_targets_bake_default_config=false
+  fi
+  while IFS= read -r image_target; do
+    image_target_body="$(dockerfile_stage_body "$image_target")"
+    image_config="deploy/config/images/${image_target#zinder-}.toml"
+    if [[ ! -f "$repository_root/$image_config" ]] \
+      || ! grep -Fqx "COPY ${image_config} /etc/zinder/config.toml" <<< "$image_target_body" \
+      || ! grep -Fqx "ENTRYPOINT [\"${image_target}\"]" <<< "$image_target_body" \
+      || ! grep -Fqx 'CMD ["--config", "/etc/zinder/config.toml"]' <<< "$image_target_body" \
+      || grep -Eq '^ENV ' <<< "$image_target_body"; then
+      image_targets_bake_default_config=false
+    fi
+  done <<< "$configured_release_images"
+  if [[ "$image_targets_bake_default_config" != true ]]; then
+    cat >&2 <<'EOF'
+release admission rejected: every per-service release image must copy its
+deploy/config/images/<service>.toml to /etc/zinder/config.toml, pass it with
+CMD ["--config", "/etc/zinder/config.toml"] after its binary ENTRYPOINT, and
+set no ENV, so a mounted config file is not silently overridden.
+EOF
+    exit 1
+  fi
   while IFS= read -r image_target; do
     image_target_base="$(dockerfile_stage_base "$image_target")"
     if [[ "$image_target_base" != zinder-runtime-base ]] \

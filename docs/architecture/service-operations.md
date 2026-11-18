@@ -31,18 +31,25 @@ Every runtime binary, `zinder-ingest`, `zinder-projector`, `zinder-query`,
 It exits 0 only on HTTP 200 and exits 1 otherwise, printing the reason, such
 as the refused address or the status and the start of the body, to stderr.
 Container runtimes record that line as the failure reason. The probe does not
-read the configuration file:
+load the service configuration; of the global `--config` file it reads only
+`[ops] listen_addr`:
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--addr` | `ZINDER_OPS__LISTEN_ADDR`, then the service's default ops address | The endpoint to probe. An unspecified host, `[::]` or `0.0.0.0`, probes loopback: `[::]` tries `[::1]`, then `127.0.0.1`. |
+| `--addr` | `ZINDER_OPS__LISTEN_ADDR`, then `[ops] listen_addr` in the `--config` file, then the service's default ops address | The endpoint to probe. An unspecified host, `[::]` or `0.0.0.0`, probes loopback: `[::]` tries `[::1]`, then `127.0.0.1`. |
 | `--path` | `/readyz` | The route to request. Use `/healthz` for liveness only. |
 
-An empty `ZINDER_OPS__LISTEN_ADDR` disables the endpoint, so the probe fails
-without connecting. When the ops address is set only in the configuration
-file, pass it with `--addr`. The whole probe is bounded at 3 seconds, below
-the 5-second timeout of the image and Compose healthchecks, so the probe
-reports its own reason before the container runtime kills it.
+An empty address from the environment or the file disables the endpoint, so
+the probe fails without connecting. A `--config` file that is missing,
+unreadable, or not TOML, or that does not set `[ops] listen_addr` to a string,
+is skipped, and the probe uses the service's default ops address. The probe
+ignores the service's `--ops-listen-addr` flag; pass the same address with
+`--addr`. The runtime images run `zinder-<runtime> --config
+/etc/zinder/config.toml healthcheck`, so they probe the ops address of the file
+at that path, whether the image's default or a mounted one. The whole probe is
+bounded at 3 seconds, below the 5-second timeout of the image and Compose
+healthchecks, so the probe reports its own reason before the container runtime
+kills it.
 
 ## Readiness vocabulary
 
@@ -1427,18 +1434,34 @@ after a 10-second start period, and the other runtimes probe `/readyz`. The
 single-volume host images, the benchmark, and the live-test runner keep the
 Debian base with `sh` and `curl`, because their entrypoint scripts need them.
 
-Each runtime image sets these listener defaults, so `docker run -p` reaches a
-container started without other configuration:
+Each runtime image installs a default configuration file from
+`deploy/config/images/` at `/etc/zinder/config.toml`, and its `CMD` passes it:
+the image runs `zinder-<runtime> --config /etc/zinder/config.toml`. The file
+holds only listener defaults, so `docker run -p` reaches a container started
+without other configuration:
 
-| Image | Environment defaults |
+| Image | Default file settings |
 | --- | --- |
-| `zinder-ingest` | `ZINDER_OPS__LISTEN_ADDR=[::]:9105` |
-| `zinder-projector` | `ZINDER_OPS__LISTEN_ADDR=[::]:9110` |
-| `zinder-query` | `ZINDER_QUERY__LISTEN_ADDR=[::]:9102`, `ZINDER_OPS__LISTEN_ADDR=[::]:9106` |
-| `zinder-compat-lightwalletd` | `ZINDER_COMPAT__LISTEN_ADDR=[::]:9067`, `ZINDER_OPS__LISTEN_ADDR=[::]:9107` |
-| `zinder-explorer` | `ZINDER_EXPLORER__LISTEN_ADDR=[::]:9068`, `ZINDER_OPS__LISTEN_ADDR=[::]:9069` |
+| `zinder-ingest` | `[ops] listen_addr = "[::]:9105"` |
+| `zinder-projector` | `[ops] listen_addr = "[::]:9110"` |
+| `zinder-query` | `[query] listen_addr = "[::]:9102"`, `[ops] listen_addr = "[::]:9106"` |
+| `zinder-compat-lightwalletd` | `[compat] listen_addr = "[::]:9067"`, `[ops] listen_addr = "[::]:9107"` |
+| `zinder-explorer` | `[explorer] listen_addr = "[::]:9068"`, `[ops] listen_addr = "[::]:9069"` |
 
-Every runtime image also sets `ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true`.
+Every file also sets `[security] allow_public_bind = true`. None sets a
+network, node, or storage value, so those stay required, from a mounted file
+or `ZINDER_*` variables.
+
+A file mounted at `/etc/zinder/config.toml` replaces the default as a whole.
+A listener it does not set takes the service's built-in loopback default, and
+without `allow_public_bind = true` the service refuses a non-loopback serving
+bind. `ZINDER_*` variables override individual values of whichever file is
+used, as they do for any config file. Arguments after the image name replace
+`CMD`, so pass `--config /etc/zinder/config.toml` again to keep the file, for
+example `docker run <image> --config /etc/zinder/config.toml --print-config`.
+`deploy/docker-compose.yml` mounts its own file at that path and sets its
+listeners explicitly.
+
 Publishing a port is not the only way to reach these listeners:
 
 - On a Docker bridge network, every container on the same network, and on
@@ -1450,14 +1473,10 @@ Publishing a port is not the only way to reach these listeners:
 Run the containers on a dedicated network that holds only the services that
 should reach them, do not use host networking for them, and publish ports on
 `127.0.0.1` unless a proxy terminates TLS and authorization in front of them.
-To keep a listener on loopback inside the container instead, set its variable,
-for example `-e ZINDER_OPS__LISTEN_ADDR=127.0.0.1:9106`. Ingest's
-`IngestControl` listener keeps its `127.0.0.1:9100` default.
-
-Environment variables outrank the configuration file, so these defaults also
-replace `listen_addr` and `allow_public_bind` values in a mounted file. To
-change one, set its environment variable, for example
-`-e ZINDER_OPS__LISTEN_ADDR=127.0.0.1:9106`.
+To keep a listener on loopback inside the container instead, set it in a
+mounted file or with its variable, for example
+`-e ZINDER_OPS__LISTEN_ADDR=127.0.0.1:9106`. Ingest's `IngestControl` listener
+keeps its `127.0.0.1:9100` default.
 
 To inspect a running container, run its binary with `docker exec`, for example
 `docker exec <container> zinder-query --config /etc/zinder/config.toml

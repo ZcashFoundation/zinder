@@ -1003,13 +1003,56 @@ expect_rejected_because \
   --dockerfile "$legacy_account_dockerfile"
 
 curl_healthcheck_dockerfile="$temporary_directory/curl-healthcheck.Dockerfile"
-sed 's#^    CMD \["zinder-projector", "healthcheck"\]$#    CMD curl -fsS http://localhost:9110/readyz || exit 1#' \
+sed 's#^    CMD \["zinder-projector", "--config", "/etc/zinder/config.toml", "healthcheck"\]$#    CMD curl -fsS http://localhost:9110/readyz || exit 1#' \
   "$repository_root/deploy/Dockerfile" > "$curl_healthcheck_dockerfile"
 expect_rejected_because \
   "a Dockerfile whose projector image probes itself with curl" \
   'release admission rejected: every per-service release image must build on' \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
   --dockerfile "$curl_healthcheck_dockerfile"
+
+configless_healthcheck_dockerfile="$temporary_directory/configless-healthcheck.Dockerfile"
+sed 's#^    CMD \["zinder-query", "--config", "/etc/zinder/config.toml", "healthcheck"\]$#    CMD ["zinder-query", "healthcheck"]#' \
+  "$repository_root/deploy/Dockerfile" > "$configless_healthcheck_dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose query healthcheck ignores the image config file" \
+  'release admission rejected: every per-service release image must build on' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$configless_healthcheck_dockerfile"
+
+listener_env_dockerfile="$temporary_directory/listener-env.Dockerfile"
+awk '
+  { print }
+  $0 == "COPY deploy/config/images/query.toml /etc/zinder/config.toml" {
+    print "ENV ZINDER_OPS__LISTEN_ADDR=[::]:9106"
+  }
+' "$repository_root/deploy/Dockerfile" > "$listener_env_dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose query image sets a listener through the environment" \
+  'release admission rejected: every per-service release image must copy its' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$listener_env_dockerfile"
+
+public_bind_env_dockerfile="$temporary_directory/public-bind-env.Dockerfile"
+sed 's#^USER 10001:10001$#ENV ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true\nUSER 10001:10001#' \
+  "$repository_root/deploy/Dockerfile" > "$public_bind_env_dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose service base allows public binds through the environment" \
+  'release admission rejected: every per-service release image must copy its' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$public_bind_env_dockerfile"
+
+unconfigured_cmd_dockerfile="$temporary_directory/unconfigured-cmd.Dockerfile"
+awk '
+  $0 == "ENTRYPOINT [\"zinder-explorer\"]" { explorer = 1 }
+  explorer && $0 == "CMD [\"--config\", \"/etc/zinder/config.toml\"]" { explorer = 0; next }
+  { print }
+' "$repository_root/deploy/Dockerfile" > "$unconfigured_cmd_dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose explorer image does not pass its default config" \
+  'release admission rejected: every per-service release image must copy its' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$unconfigured_cmd_dockerfile"
 
 parallel_publication_workflow="$temporary_directory/parallel-publication-release.yml"
 sed 's/group: release-publication/group: release-${{ github.ref }}/' \

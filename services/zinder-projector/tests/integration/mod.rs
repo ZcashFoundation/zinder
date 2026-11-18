@@ -5,5 +5,5 @@
 
 mod cli;
 mod env_var_contract;
-mod healthcheck;
+mod release_image;
 mod runtime_allocator;

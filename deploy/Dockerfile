@@ -173,15 +173,13 @@ FROM gcr.io/distroless/cc-debian12:nonroot@${DISTROLESS_IMAGE_DIGEST} AS zinder-
 
 COPY --from=zinder-service-state --chown=10001:10001 /var/lib/zinder /var/lib/zinder
 
-# Each service binds every container interface by default so `docker run -p`
-# works. Other containers on the same network can still reach these
-# listeners, and host networking binds the host's interfaces, so operators
-# restrict access at the container network (see service-operations.md,
-# Runtime images). Environment variables outrank the config file, so these
-# defaults also replace listener settings in a mounted config; override the
-# variable to change them.
-ENV ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true
-
+# Each service image installs deploy/config/images/<service>.toml as
+# /etc/zinder/config.toml and passes it with CMD. The file binds every
+# container interface so `docker run -p` works; other containers on the same
+# network can still reach these listeners, and host networking binds the
+# host's interfaces (see service-operations.md, Runtime images). A config
+# mounted at the same path replaces the file as a whole, and arguments after
+# the image name replace CMD.
 USER 10001:10001
 WORKDIR /var/lib/zinder
 
@@ -189,69 +187,71 @@ FROM zinder-service-base AS zinder-ingest
 
 COPY --from=zinder-binaries-selected /zinder-binaries/zinder-ingest /usr/local/bin/zinder-ingest
 
-ENV ZINDER_OPS__LISTEN_ADDR=[::]:9105
+COPY deploy/config/images/ingest.toml /etc/zinder/config.toml
 
 EXPOSE 9105
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["zinder-ingest", "healthcheck", "--path", "/healthz"]
+    CMD ["zinder-ingest", "--config", "/etc/zinder/config.toml", "healthcheck", "--path", "/healthz"]
 
 ENTRYPOINT ["zinder-ingest"]
+CMD ["--config", "/etc/zinder/config.toml"]
 
 FROM zinder-service-base AS zinder-projector
 
 COPY --from=zinder-binaries-selected /zinder-binaries/zinder-projector /usr/local/bin/zinder-projector
 
-ENV ZINDER_OPS__LISTEN_ADDR=[::]:9110
+COPY deploy/config/images/projector.toml /etc/zinder/config.toml
 
 EXPOSE 9110
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD ["zinder-projector", "healthcheck"]
+    CMD ["zinder-projector", "--config", "/etc/zinder/config.toml", "healthcheck"]
 
 ENTRYPOINT ["zinder-projector"]
+CMD ["--config", "/etc/zinder/config.toml"]
 
 FROM zinder-service-base AS zinder-query
 
 COPY --from=zinder-binaries-selected /zinder-binaries/zinder-query /usr/local/bin/zinder-query
 
-ENV ZINDER_QUERY__LISTEN_ADDR=[::]:9102
-ENV ZINDER_OPS__LISTEN_ADDR=[::]:9106
+COPY deploy/config/images/query.toml /etc/zinder/config.toml
 
 EXPOSE 9102 9106
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD ["zinder-query", "healthcheck"]
+    CMD ["zinder-query", "--config", "/etc/zinder/config.toml", "healthcheck"]
 
 ENTRYPOINT ["zinder-query"]
+CMD ["--config", "/etc/zinder/config.toml"]
 
 FROM zinder-service-base AS zinder-compat-lightwalletd
 
 COPY --from=zinder-binaries-selected /zinder-binaries/zinder-compat-lightwalletd /usr/local/bin/zinder-compat-lightwalletd
 
-ENV ZINDER_COMPAT__LISTEN_ADDR=[::]:9067
-ENV ZINDER_OPS__LISTEN_ADDR=[::]:9107
+COPY deploy/config/images/compat-lightwalletd.toml /etc/zinder/config.toml
 
 EXPOSE 9067 9107
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD ["zinder-compat-lightwalletd", "healthcheck"]
+    CMD ["zinder-compat-lightwalletd", "--config", "/etc/zinder/config.toml", "healthcheck"]
 
 ENTRYPOINT ["zinder-compat-lightwalletd"]
+CMD ["--config", "/etc/zinder/config.toml"]
 
 FROM zinder-service-base AS zinder-explorer
 
 COPY --from=zinder-binaries-selected /zinder-binaries/zinder-explorer /usr/local/bin/zinder-explorer
 
-ENV ZINDER_EXPLORER__LISTEN_ADDR=[::]:9068
-ENV ZINDER_OPS__LISTEN_ADDR=[::]:9069
+COPY deploy/config/images/explorer.toml /etc/zinder/config.toml
 
 EXPOSE 9068 9069
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5m --retries=3 \
-    CMD ["zinder-explorer", "healthcheck"]
+    CMD ["zinder-explorer", "--config", "/etc/zinder/config.toml", "healthcheck"]
 
 ENTRYPOINT ["zinder-explorer"]
+CMD ["--config", "/etc/zinder/config.toml"]
 
 # Debian base for the images whose POSIX entrypoints and helper scripts need a
 # shell, curl, and the zinder account: the single-volume host images, the

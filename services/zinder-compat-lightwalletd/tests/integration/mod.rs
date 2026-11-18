@@ -1,12 +1,12 @@
 mod android_sdk_rpc_contract;
 mod cli;
 mod env_var_contract;
-mod healthcheck;
 mod ingest_control_tip_change;
 mod lightwalletd_grpc;
 mod lightwalletd_scan_contract;
 mod mempool_compat;
 mod reflection;
+mod release_image;
 mod repeated_field_limits;
 mod runtime_allocator;
 mod transparent_wallet_serving;

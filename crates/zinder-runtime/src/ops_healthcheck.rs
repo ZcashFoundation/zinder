@@ -3,13 +3,15 @@
 //!
 //! Release service images carry no shell and no HTTP client, so the image
 //! `HEALTHCHECK` runs the service binary itself. The probe resolves the
-//! operational endpoint without loading the service configuration, sends one
+//! operational endpoint without loading the service configuration, reading at
+//! most the `[ops] listen_addr` key of the configuration file, sends one
 //! HTTP/1.1 `GET` with `Connection: close`, and succeeds only when the endpoint
 //! answers status 200.
 
 use std::{
     io::{self, Read, Write},
     net::{AddrParseError, IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream},
+    path::Path,
     time::{Duration, Instant},
 };
 
@@ -17,6 +19,10 @@ use thiserror::Error;
 
 /// Environment variable that sets `ops.listen_addr` for every service binary.
 pub const OPS_LISTEN_ADDR_ENV_VAR: &str = "ZINDER_OPS__LISTEN_ADDR";
+
+const CONFIG_FILE_OPS_LISTEN_ADDR_ORIGIN: &str = "[ops] listen_addr in the --config file";
+
+const DEFAULT_OPS_LISTEN_ADDR_ORIGIN: &str = "default ops address";
 
 /// Path the `healthcheck` subcommand requests unless `--path` names another.
 pub const DEFAULT_OPS_HEALTHCHECK_PATH: &str = "/readyz";
@@ -41,8 +47,9 @@ const RESPONSE_HEAD_TERMINATOR: &[u8] = b"\r\n\r\n";
 #[derive(Clone, Debug, clap::Args)]
 pub struct OpsHealthcheckArgs {
     /// Operational endpoint to probe, such as 127.0.0.1:9106. Defaults to
-    /// `ZINDER_OPS__LISTEN_ADDR`, then to the service's default ops address.
-    /// An unspecified host (`[::]` or `0.0.0.0`) probes loopback.
+    /// `ZINDER_OPS__LISTEN_ADDR`, then to `[ops] listen_addr` in the
+    /// `--config` file, then to the service's default ops address. An
+    /// unspecified host (`[::]` or `0.0.0.0`) probes loopback.
     #[arg(long = "addr")]
     pub addr: Option<SocketAddr>,
     /// HTTP path to request; only status 200 counts as healthy.
@@ -53,20 +60,43 @@ pub struct OpsHealthcheckArgs {
 impl OpsHealthcheckArgs {
     /// Resolves the endpoint address and probes it once.
     ///
+    /// `config_path` is the service's `--config` file, of which only
+    /// `[ops] listen_addr` is read (see [`config_file_ops_listen_addr`]).
     /// `default_ops_listen_addr` is the service's default `ops.listen_addr`,
-    /// used when neither `--addr` nor `ZINDER_OPS__LISTEN_ADDR` names one.
-    /// The service configuration file is not read; pass `--addr` when the ops
-    /// address is set only there.
-    pub fn run(&self, default_ops_listen_addr: &str) -> Result<(), OpsHealthcheckError> {
+    /// used when no other source names one.
+    pub fn run(
+        &self,
+        config_path: Option<&Path>,
+        default_ops_listen_addr: &str,
+    ) -> Result<(), OpsHealthcheckError> {
         let environment_value = std::env::var_os(OPS_LISTEN_ADDR_ENV_VAR)
             .map(|environment_value| environment_value.to_string_lossy().into_owned());
+        let config_file_value = config_path.and_then(config_file_ops_listen_addr);
         let endpoint = resolve_ops_healthcheck_addr(
             self.addr,
             environment_value.as_deref(),
+            config_file_value.as_deref(),
             default_ops_listen_addr,
         )?;
         probe_ops_endpoint(endpoint, &self.path, OPS_HEALTHCHECK_TIMEOUT)
     }
+}
+
+/// Reads `[ops] listen_addr` from the TOML configuration file at `path`.
+///
+/// Every other key is ignored, so the file need not be a valid configuration
+/// for the service. Returns `None` when the file cannot be read, is not TOML,
+/// or does not set the key to a string, which lets the healthcheck fall back
+/// to the service's default ops address.
+#[must_use]
+pub fn config_file_ops_listen_addr(path: &Path) -> Option<String> {
+    let file_text = std::fs::read_to_string(path).ok()?;
+    let table = toml::from_str::<toml::Table>(&file_text).ok()?;
+    table
+        .get("ops")?
+        .get("listen_addr")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// Error returned when the operational endpoint is not healthy or cannot be
@@ -74,9 +104,12 @@ impl OpsHealthcheckArgs {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum OpsHealthcheckError {
-    /// `ZINDER_OPS__LISTEN_ADDR` is empty, which disables the endpoint.
-    #[error("the operational endpoint is disabled because ZINDER_OPS__LISTEN_ADDR is empty")]
-    EndpointDisabled,
+    /// The resolved `ops.listen_addr` is empty, which disables the endpoint.
+    #[error("the operational endpoint is disabled because {origin} is empty")]
+    EndpointDisabled {
+        /// Where the empty address came from.
+        origin: &'static str,
+    },
 
     /// The address to probe is not a socket address.
     #[error("{origin} {text:?} is not a socket address: {source}")]
@@ -159,23 +192,28 @@ fn body_suffix(body_excerpt: &str) -> String {
 /// Selects the operational endpoint address the healthcheck probes.
 ///
 /// `addr_flag` wins over `environment_value`, the value of
-/// `ZINDER_OPS__LISTEN_ADDR`, which wins over `default_ops_listen_addr`. An
-/// empty environment value disables the endpoint, as it does for the service.
+/// `ZINDER_OPS__LISTEN_ADDR`, which wins over `config_file_value`, the
+/// configuration file's `[ops] listen_addr`, which wins over
+/// `default_ops_listen_addr`. An empty value disables the endpoint, as it does
+/// for the service.
 pub fn resolve_ops_healthcheck_addr(
     addr_flag: Option<SocketAddr>,
     environment_value: Option<&str>,
+    config_file_value: Option<&str>,
     default_ops_listen_addr: &str,
 ) -> Result<SocketAddr, OpsHealthcheckError> {
     if let Some(addr) = addr_flag {
         return Ok(addr);
     }
-    let (origin, text) = match environment_value {
-        Some(environment_value) if environment_value.trim().is_empty() => {
-            return Err(OpsHealthcheckError::EndpointDisabled);
-        }
-        Some(environment_value) => (OPS_LISTEN_ADDR_ENV_VAR, environment_value.trim()),
-        None => ("default ops address", default_ops_listen_addr),
+    let (origin, text) = match (environment_value, config_file_value) {
+        (Some(environment_value), _) => (OPS_LISTEN_ADDR_ENV_VAR, environment_value),
+        (None, Some(config_file_value)) => (CONFIG_FILE_OPS_LISTEN_ADDR_ORIGIN, config_file_value),
+        (None, None) => (DEFAULT_OPS_LISTEN_ADDR_ORIGIN, default_ops_listen_addr),
     };
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(OpsHealthcheckError::EndpointDisabled { origin });
+    }
     text.parse()
         .map_err(|source| OpsHealthcheckError::InvalidAddress {
             origin,
@@ -402,7 +440,8 @@ mod tests {
     };
 
     use super::{
-        OpsHealthcheckError, probe_ops_endpoint, probe_targets, resolve_ops_healthcheck_addr,
+        OpsHealthcheckError, config_file_ops_listen_addr, probe_ops_endpoint, probe_targets,
+        resolve_ops_healthcheck_addr,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -630,19 +669,28 @@ mod tests {
     }
 
     #[test]
-    fn the_flag_wins_over_the_environment_and_the_default() -> TestResult {
+    fn the_flag_wins_over_every_other_source() -> TestResult {
         let flag = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19106);
 
-        let resolved =
-            resolve_ops_healthcheck_addr(Some(flag), Some("[::]:9106"), "127.0.0.1:9106")?;
+        let resolved = resolve_ops_healthcheck_addr(
+            Some(flag),
+            Some("[::]:9106"),
+            Some("[::]:29106"),
+            "127.0.0.1:9106",
+        )?;
 
         assert_eq!(resolved, flag);
         Ok(())
     }
 
     #[test]
-    fn the_environment_wins_over_the_default() -> TestResult {
-        let resolved = resolve_ops_healthcheck_addr(None, Some(" [::]:9107 "), "127.0.0.1:9106")?;
+    fn the_environment_wins_over_the_config_file_and_the_default() -> TestResult {
+        let resolved = resolve_ops_healthcheck_addr(
+            None,
+            Some(" [::]:9107 "),
+            Some("127.0.0.1:29107"),
+            "127.0.0.1:9106",
+        )?;
 
         assert_eq!(
             resolved,
@@ -652,8 +700,20 @@ mod tests {
     }
 
     #[test]
-    fn the_default_applies_without_a_flag_or_environment() -> TestResult {
-        let resolved = resolve_ops_healthcheck_addr(None, None, "127.0.0.1:9110")?;
+    fn the_config_file_wins_over_the_default() -> TestResult {
+        let resolved =
+            resolve_ops_healthcheck_addr(None, None, Some("[::]:9106"), "127.0.0.1:9106")?;
+
+        assert_eq!(
+            resolved,
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 9106)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_default_applies_without_any_other_source() -> TestResult {
+        let resolved = resolve_ops_healthcheck_addr(None, None, None, "127.0.0.1:9110")?;
 
         assert_eq!(
             resolved,
@@ -663,28 +723,105 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_environment_value_means_the_endpoint_is_disabled() {
-        let outcome = resolve_ops_healthcheck_addr(None, Some("  "), "127.0.0.1:9106");
+    fn an_empty_value_means_the_endpoint_is_disabled() {
+        let from_environment =
+            resolve_ops_healthcheck_addr(None, Some("  "), Some("[::]:9106"), "127.0.0.1:9106");
+        let from_config_file = resolve_ops_healthcheck_addr(None, None, Some(""), "127.0.0.1:9106");
 
         assert!(
-            matches!(outcome, Err(OpsHealthcheckError::EndpointDisabled)),
-            "{outcome:?}"
+            matches!(
+                from_environment,
+                Err(OpsHealthcheckError::EndpointDisabled {
+                    origin: "ZINDER_OPS__LISTEN_ADDR"
+                })
+            ),
+            "{from_environment:?}"
+        );
+        assert!(
+            matches!(
+                from_config_file,
+                Err(OpsHealthcheckError::EndpointDisabled {
+                    origin: "[ops] listen_addr in the --config file"
+                })
+            ),
+            "{from_config_file:?}"
         );
     }
 
     #[test]
-    fn an_invalid_environment_value_names_its_origin() {
-        let outcome = resolve_ops_healthcheck_addr(None, Some("localhost:9106"), "127.0.0.1:9106");
+    fn an_invalid_value_names_its_origin() {
+        let from_environment =
+            resolve_ops_healthcheck_addr(None, Some("localhost:9106"), None, "127.0.0.1:9106");
+        let from_config_file =
+            resolve_ops_healthcheck_addr(None, None, Some("localhost:9106"), "127.0.0.1:9106");
 
         assert!(
             matches!(
-                outcome,
+                from_environment,
                 Err(OpsHealthcheckError::InvalidAddress {
                     origin: "ZINDER_OPS__LISTEN_ADDR",
                     ..
                 })
             ),
-            "{outcome:?}"
+            "{from_environment:?}"
         );
+        assert!(
+            matches!(
+                from_config_file,
+                Err(OpsHealthcheckError::InvalidAddress {
+                    origin: "[ops] listen_addr in the --config file",
+                    ..
+                })
+            ),
+            "{from_config_file:?}"
+        );
+    }
+
+    #[test]
+    fn the_config_file_supplies_only_the_ops_listen_addr() -> TestResult {
+        let config_dir = tempfile::tempdir()?;
+        let config_path = config_dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[network]\nname = \"zcash-regtest\"\n\n[ops]\nlisten_addr = \"[::]:9106\"\nunknown_key = 1\n\n[not_a_section]\nlisten_addr = \"127.0.0.1:1\"\n",
+        )?;
+
+        assert_eq!(
+            config_file_ops_listen_addr(&config_path).as_deref(),
+            Some("[::]:9106")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_unusable_config_file_falls_back() -> TestResult {
+        let config_dir = tempfile::tempdir()?;
+        let not_toml = config_dir.path().join("not-toml.toml");
+        std::fs::write(&not_toml, "[ops\nlisten_addr = ")?;
+        let without_key = config_dir.path().join("without-key.toml");
+        std::fs::write(&without_key, "[query]\nlisten_addr = \"[::]:9102\"\n")?;
+        let non_string = config_dir.path().join("non-string.toml");
+        std::fs::write(&non_string, "[ops]\nlisten_addr = 9106\n")?;
+        let missing = config_dir.path().join("missing.toml");
+
+        for path in [&not_toml, &without_key, &non_string, &missing] {
+            assert_eq!(
+                config_file_ops_listen_addr(path),
+                None,
+                "{}",
+                path.display()
+            );
+        }
+        let resolved = resolve_ops_healthcheck_addr(
+            None,
+            None,
+            config_file_ops_listen_addr(&not_toml).as_deref(),
+            "127.0.0.1:9110",
+        )?;
+        assert_eq!(
+            resolved,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9110)
+        );
+        Ok(())
     }
 }

@@ -7,6 +7,7 @@
 //! the exit status, the requested path, and the address resolution order.
 
 use std::{
+    fs,
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::Path,
@@ -19,7 +20,7 @@ use std::{
     time::Duration,
 };
 
-use eyre::{Result, WrapErr as _, ensure};
+use eyre::{Result, WrapErr as _, ensure, eyre};
 use parking_lot::Mutex;
 
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(1);
@@ -121,8 +122,10 @@ fn answer(mut stream: TcpStream, response: &[u8]) -> Option<String> {
 /// The binary runs with a cleared environment, so the check also proves that
 /// the subcommand needs no service configuration. It must exit 0 when the
 /// endpoint answers 200 on `/readyz` and 1 with a one-line reason on any other
-/// status or a refused connection, honor `--path`, and fall back from `--addr`
-/// to `ZINDER_OPS__LISTEN_ADDR`.
+/// status or a refused connection, and honor `--path`. It must resolve the
+/// endpoint from `--addr`, then `ZINDER_OPS__LISTEN_ADDR`, then `[ops]
+/// listen_addr` in the global `--config` file, ignoring the file's other keys
+/// and falling back when the file is missing or not TOML.
 pub fn check_binary_healthcheck(executable: impl AsRef<Path>) -> Result<()> {
     let executable = executable.as_ref();
     let healthy = OpsEndpointStub::start("200 OK", r#"{"status":"ready"}"#)?;
@@ -130,26 +133,34 @@ pub fn check_binary_healthcheck(executable: impl AsRef<Path>) -> Result<()> {
         "503 Service Unavailable",
         r#"{"status":"not_ready","cause":"starting"}"#,
     )?;
+    let healthy_addr = healthy.addr().to_string();
 
-    let output = run_healthcheck(executable, &["--addr", &healthy.addr().to_string()], None)?;
+    let output = run_healthcheck(executable, &[], &["--addr", &healthy_addr], None)?;
     ensure_exit(executable, &output, 0, "a 200 /readyz")?;
 
     let output = run_healthcheck(
         executable,
-        &["--addr", &healthy.addr().to_string(), "--path", "/healthz"],
+        &[],
+        &["--addr", &healthy_addr, "--path", "/healthz"],
         None,
     )?;
     ensure_exit(executable, &output, 0, "a 200 /healthz")?;
 
     let unspecified_env_addr = format!("0.0.0.0:{}", healthy.addr().port());
-    let output = run_healthcheck(executable, &[], Some(&unspecified_env_addr))?;
+    let output = run_healthcheck(executable, &[], &[], Some(&unspecified_env_addr))?;
     ensure_exit(executable, &output, 0, "ZINDER_OPS__LISTEN_ADDR on 0.0.0.0")?;
+
+    check_config_file_resolution(executable, &healthy, &unhealthy)?;
 
     ensure!(
         healthy.request_lines()
             == [
                 "GET /readyz HTTP/1.1",
                 "GET /healthz HTTP/1.1",
+                "GET /readyz HTTP/1.1",
+                "GET /readyz HTTP/1.1",
+                "GET /readyz HTTP/1.1",
+                "GET /readyz HTTP/1.1",
                 "GET /readyz HTTP/1.1"
             ],
         "{} healthcheck requested {:?}",
@@ -159,8 +170,9 @@ pub fn check_binary_healthcheck(executable: impl AsRef<Path>) -> Result<()> {
 
     let output = run_healthcheck(
         executable,
+        &[],
         &["--addr", &unhealthy.addr().to_string()],
-        Some(&healthy.addr().to_string()),
+        Some(&healthy_addr),
     )?;
     ensure_exit(executable, &output, 1, "a 503 /readyz")?;
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -172,7 +184,12 @@ pub fn check_binary_healthcheck(executable: impl AsRef<Path>) -> Result<()> {
     );
 
     let refused_addr = closed_loopback_addr()?;
-    let output = run_healthcheck(executable, &["--addr", &refused_addr.to_string()], None)?;
+    let output = run_healthcheck(
+        executable,
+        &[],
+        &["--addr", &refused_addr.to_string()],
+        None,
+    )?;
     ensure_exit(executable, &output, 1, "a refused connection")?;
     ensure!(
         String::from_utf8_lossy(&output.stderr).contains("could not connect"),
@@ -183,19 +200,107 @@ pub fn check_binary_healthcheck(executable: impl AsRef<Path>) -> Result<()> {
     Ok(())
 }
 
+/// Runs the `--config` cases, which request `/readyz` from `healthy` four
+/// times.
+fn check_config_file_resolution(
+    executable: &Path,
+    healthy: &OpsEndpointStub,
+    unhealthy: &OpsEndpointStub,
+) -> Result<()> {
+    let config_dir = tempfile::tempdir()?;
+    let healthy_config = config_dir.path().join("healthy.toml");
+    fs::write(
+        &healthy_config,
+        format!(
+            "[network]\nname = \"not-a-network\"\n\n[ops]\nlisten_addr = \"0.0.0.0:{}\"\nnot_an_ops_key = true\n",
+            healthy.addr().port()
+        ),
+    )?;
+    let unhealthy_config = config_dir.path().join("unhealthy.toml");
+    fs::write(
+        &unhealthy_config,
+        format!("[ops]\nlisten_addr = \"{}\"\n", unhealthy.addr()),
+    )?;
+    let not_toml_config = config_dir.path().join("not-toml.toml");
+    fs::write(&not_toml_config, "[ops\nlisten_addr = ")?;
+    let healthy_addr = healthy.addr().to_string();
+
+    let output = run_healthcheck(
+        executable,
+        &["--config", path_str(&healthy_config)?],
+        &[],
+        None,
+    )?;
+    ensure_exit(
+        executable,
+        &output,
+        0,
+        "[ops] listen_addr in the --config file",
+    )?;
+
+    let output = run_healthcheck(
+        executable,
+        &["--config", path_str(&unhealthy_config)?],
+        &[],
+        Some(&healthy_addr),
+    )?;
+    ensure_exit(
+        executable,
+        &output,
+        0,
+        "ZINDER_OPS__LISTEN_ADDR over the --config file",
+    )?;
+
+    for unusable_config in [&not_toml_config, &config_dir.path().join("missing.toml")] {
+        let output = run_healthcheck(
+            executable,
+            &[],
+            &[
+                "--config",
+                path_str(unusable_config)?,
+                "--addr",
+                &healthy_addr,
+            ],
+            None,
+        )?;
+        ensure_exit(
+            executable,
+            &output,
+            0,
+            "--addr with an unusable --config file",
+        )?;
+    }
+    Ok(())
+}
+
+fn path_str(path: &Path) -> Result<&str> {
+    path.to_str()
+        .ok_or_else(|| eyre!("{} is not UTF-8", path.display()))
+}
+
+/// Runs `<executable> <global_args> healthcheck <args>` with a cleared
+/// environment, setting only `ZINDER_OPS__LISTEN_ADDR` when given.
 fn run_healthcheck(
     executable: &Path,
+    global_args: &[&str],
     args: &[&str],
     ops_listen_addr: Option<&str>,
 ) -> Result<Output> {
     let mut command = Command::new(executable);
-    command.env_clear().arg("healthcheck").args(args);
+    command
+        .env_clear()
+        .args(global_args)
+        .arg("healthcheck")
+        .args(args);
     if let Some(ops_listen_addr) = ops_listen_addr {
         command.env("ZINDER_OPS__LISTEN_ADDR", ops_listen_addr);
     }
-    command
-        .output()
-        .wrap_err_with(|| format!("run {} healthcheck {args:?}", executable.display()))
+    command.output().wrap_err_with(|| {
+        format!(
+            "run {} {global_args:?} healthcheck {args:?}",
+            executable.display()
+        )
+    })
 }
 
 fn ensure_exit(executable: &Path, output: &Output, code: i32, case: &str) -> Result<()> {

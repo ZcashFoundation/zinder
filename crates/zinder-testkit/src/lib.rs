@@ -56,6 +56,7 @@ pub mod note_commitment_chain;
 pub mod ops_healthcheck;
 pub mod orchard_test_key;
 pub mod process_crash;
+pub mod release_image_config;
 pub mod repeated_request_fields;
 pub mod runtime_allocator;
 pub mod transparent_signer;
@@ -92,6 +93,7 @@ pub use network_upgrade_fixtures::{
 pub use note_commitment_chain::{commitment_tree_checkpoints, with_note_commitments};
 pub use ops_healthcheck::{OpsEndpointStub, check_binary_healthcheck};
 pub use orchard_test_key::{OrchardAddress, OrchardTestKey, regtest_unified_address};
+pub use release_image_config::check_release_image_config;
 pub use repeated_request_fields::{RepeatedRequestField, repeated_request_fields};
 pub use runtime_allocator::check_binary_allocates_through_jemalloc;
 pub use transparent_signer::{

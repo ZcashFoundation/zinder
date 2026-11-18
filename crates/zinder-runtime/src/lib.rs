@@ -111,7 +111,8 @@ pub use ops_endpoint::{
 };
 pub use ops_healthcheck::{
     DEFAULT_OPS_HEALTHCHECK_PATH, OPS_HEALTHCHECK_TIMEOUT, OPS_LISTEN_ADDR_ENV_VAR,
-    OpsHealthcheckArgs, OpsHealthcheckError, probe_ops_endpoint, resolve_ops_healthcheck_addr,
+    OpsHealthcheckArgs, OpsHealthcheckError, config_file_ops_listen_addr, probe_ops_endpoint,
+    resolve_ops_healthcheck_addr,
 };
 pub use public_grpc_server::{
     DEFAULT_GRPC_RECEIVE_SLOTS, DEFAULT_GRPC_RECEIVE_TIMEOUT, DEFAULT_GRPC_SEND_STALL_TIMEOUT,

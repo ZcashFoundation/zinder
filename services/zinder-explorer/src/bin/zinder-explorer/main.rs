@@ -1,6 +1,12 @@
 //! Zinder explorer-plane gRPC server entry point.
 
-use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    process::ExitCode,
+    sync::Arc,
+    time::Duration,
+};
 use zinder_core::wire::encode_zinder_native_chain_name;
 
 use clap::{Parser, Subcommand};
@@ -79,7 +85,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Probe the operational endpoint once and exit 0 only when it answers
-    /// HTTP 200. Reads no configuration file.
+    /// HTTP 200. Reads only `[ops] listen_addr` from the `--config` file.
     Healthcheck(OpsHealthcheckArgs),
 }
 
@@ -87,7 +93,7 @@ enum Command {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     if let Some(Command::Healthcheck(healthcheck)) = &cli.command {
-        return run_healthcheck(healthcheck);
+        return run_healthcheck(healthcheck, cli.config_path.as_deref());
     }
     if let Err(error) = install_tracing_subscriber() {
         return emit_tracing_subscriber_error(&error);
@@ -477,8 +483,11 @@ fn build_grpc_adapter(
     clippy::print_stderr,
     reason = "the container runtime records the healthcheck's stderr as its failure reason"
 )]
-fn run_healthcheck(healthcheck: &OpsHealthcheckArgs) -> ExitCode {
-    match healthcheck.run(default_ops_listen_addr(RuntimeService::Explorer)) {
+fn run_healthcheck(healthcheck: &OpsHealthcheckArgs, config_path: Option<&Path>) -> ExitCode {
+    match healthcheck.run(
+        config_path,
+        default_ops_listen_addr(RuntimeService::Explorer),
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{}: healthcheck failed: {error}", env!("CARGO_BIN_NAME"));
