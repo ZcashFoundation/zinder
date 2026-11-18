@@ -1297,8 +1297,10 @@ cookie contents, viewing keys, or unbounded payloads.
 ## Security boundary
 
 Public listeners require explicit `security.allow_public_bind = true`, which
-the [runtime images](#runtime-images) set because a container listener is
-exposed only through a published port. The
+the [runtime images](#runtime-images) set so their listeners accept
+connections from outside the container's loopback. Restrict who can reach
+those listeners at the container network, as
+[Runtime images](#runtime-images) describes. The
 release service does not provide public TLS termination, authentication, rate
 limits, or quota accounting. Put public compatibility traffic behind an
 operator-controlled HTTP/2 proxy. Public gRPC listeners bound request size,
@@ -1429,11 +1431,20 @@ container started without other configuration:
 | `zinder-explorer` | `ZINDER_EXPLORER__LISTEN_ADDR=[::]:9068`, `ZINDER_OPS__LISTEN_ADDR=[::]:9069` |
 
 Every runtime image also sets `ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true`.
-Inside a container, `[::]` covers only the container's own interfaces, and a
-listener is reachable from the host only through a published port, so the port
-publication decides exposure. Publish ports on `127.0.0.1` unless a proxy
-terminates TLS and authorization in front of them. Ingest's `IngestControl`
-listener keeps its `127.0.0.1:9100` default.
+Publishing a port is not the only way to reach these listeners:
+
+- On a Docker bridge network, every container on the same network, and on
+  Linux the host itself through the container's address, can connect to a
+  `[::]` listener whether or not its port is published.
+- With host networking (`--network host` or `network_mode: host`), `[::]`
+  binds every interface of the host.
+
+Run the containers on a dedicated network that holds only the services that
+should reach them, do not use host networking for them, and publish ports on
+`127.0.0.1` unless a proxy terminates TLS and authorization in front of them.
+To keep a listener on loopback inside the container instead, set its variable,
+for example `-e ZINDER_OPS__LISTEN_ADDR=127.0.0.1:9106`. Ingest's
+`IngestControl` listener keeps its `127.0.0.1:9100` default.
 
 Environment variables outrank the configuration file, so these defaults also
 replace `listen_addr` and `allow_public_bind` values in a mounted file. To

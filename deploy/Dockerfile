@@ -172,11 +172,13 @@ FROM gcr.io/distroless/cc-debian12:nonroot@${DISTROLESS_IMAGE_DIGEST} AS zinder-
 
 COPY --from=zinder-service-state --chown=1000:1000 /var/lib/zinder /var/lib/zinder
 
-# A container listener is reachable from the host only through a published
-# port, so `docker run -p` or a Compose `ports:` entry decides host exposure
-# and each service binds every container interface by default. Environment
-# variables outrank the config file, so these defaults also replace listener
-# settings in a mounted config; override the variable to change them.
+# Each service binds every container interface by default so `docker run -p`
+# works. Other containers on the same network can still reach these
+# listeners, and host networking binds the host's interfaces, so operators
+# restrict access at the container network (see service-operations.md,
+# Runtime images). Environment variables outrank the config file, so these
+# defaults also replace listener settings in a mounted config; override the
+# variable to change them.
 ENV ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true
 
 USER 1000:1000
