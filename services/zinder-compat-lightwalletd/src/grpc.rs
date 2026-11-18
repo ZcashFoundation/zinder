@@ -37,7 +37,8 @@ use zinder_store::{MempoolEvent, RawBlobRetention};
 
 use crate::block_range::{
     BLOCK_RANGE_CHUNK_MAX_BYTES, BlockRangeChunks, BlockRangeContinuity, BlockRangeSink,
-    BlockRangeStreamLimit, BlockRangeStreamSlot, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
+    BlockRangeStage, BlockRangeStreamLimit, BlockRangeStreamSlot,
+    DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
 };
 use crate::mempool::{
     MempoolSnapshotPage, MempoolSurfaceError, MempoolTransactionLookup, SharedMempoolSurface,
@@ -1201,11 +1202,20 @@ async fn drive_compact_block_range<QueryApi>(
                 }
             };
         chunks.advance(compact_blocks.len());
-        for message in encode_compact_block_chunk(compact_blocks, window) {
-            let is_terminal = message.is_err();
-            if sink.send(message).await.is_err() || is_terminal {
-                return;
-            }
+        let messages = encode_compact_block_chunk(compact_blocks, window);
+        let sent_chunk = BlockRangeStage::Send
+            .time_async(async {
+                for message in messages {
+                    let is_terminal = message.is_err();
+                    if sink.send(message).await.is_err() || is_terminal {
+                        return false;
+                    }
+                }
+                true
+            })
+            .await;
+        if !sent_chunk {
+            return;
         }
     }
 }
@@ -1250,13 +1260,13 @@ async fn read_compact_block_chunk<QueryApi>(
 where
     QueryApi: WalletQueryApi + Send + Sync,
 {
-    query_api
-        .compact_blocks_in_range_up_to(
+    BlockRangeStage::Read
+        .time_async(query_api.compact_blocks_in_range_up_to(
             chunk,
             chunks.order(),
             BLOCK_RANGE_CHUNK_MAX_BYTES,
             at_epoch_id,
-        )
+        ))
         .await
         .map_err(|error| status_from_query_error(&error))
 }
@@ -1265,17 +1275,19 @@ fn encode_compact_block_chunk(
     mut compact_blocks: Vec<CompactBlockArtifact>,
     window: CompactBlockWindow,
 ) -> Vec<Result<lightwalletd::CompactBlock, Status>> {
-    if window.is_descending {
-        compact_blocks.reverse();
-    }
-    compact_blocks
-        .iter()
-        .map(|compact_block| {
-            compact_block_to_lightwalletd(compact_block).map(|compact_block| {
-                prune_compact_block(compact_block, window.pool_selection, window.payload_mode)
+    BlockRangeStage::Convert.time(|| {
+        if window.is_descending {
+            compact_blocks.reverse();
+        }
+        compact_blocks
+            .iter()
+            .map(|compact_block| {
+                compact_block_to_lightwalletd(compact_block).map(|compact_block| {
+                    prune_compact_block(compact_block, window.pool_selection, window.payload_mode)
+                })
             })
-        })
-        .collect()
+            .collect()
+    })
 }
 
 fn compact_block_to_lightwalletd(

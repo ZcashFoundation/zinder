@@ -12,7 +12,7 @@ mod request_limits;
 
 pub use block_range::{
     BLOCK_RANGE_CHUNK_MAX_BYTES, BlockRangeChunks, BlockRangeContinuity, BlockRangeResponse,
-    BlockRangeSink, BlockRangeStreamLimit, BlockRangeStreamSlot,
+    BlockRangeSink, BlockRangeStage, BlockRangeStreamLimit, BlockRangeStreamSlot,
     DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
 };
 pub use grpc::{

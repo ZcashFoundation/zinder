@@ -26,6 +26,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::{Duration, Instant},
 };
 
 use tokio::sync::{
@@ -152,6 +153,63 @@ impl BlockRangeChunks {
 
 /// Gauge of the block-range streams that hold a slot.
 const OPEN_STREAMS_GAUGE: &str = "zinder_compat_block_range_streams_open";
+/// Counter of the block-range streams that took a slot.
+const ADMITTED_STREAMS_COUNTER: &str = "zinder_compat_block_range_streams_admitted_total";
+/// Counter of the block-range requests refused a slot.
+const REFUSED_STREAMS_COUNTER: &str = "zinder_compat_block_range_stream_refusals_total";
+/// Histogram of the time a block-range request spent getting, or failing to
+/// get, a slot, labelled by `outcome`.
+const SLOT_WAIT_HISTOGRAM: &str = "zinder_compat_block_range_slot_wait_duration_seconds";
+/// Histogram of the time one chunk of a block-range stream spent in one
+/// stage, labelled by `stage`.
+const STAGE_DURATION_HISTOGRAM: &str = "zinder_compat_block_range_stage_duration_seconds";
+
+/// A stage of serving one chunk of a block-range stream, timed in
+/// `zinder_compat_block_range_stage_duration_seconds{stage}`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum BlockRangeStage {
+    /// Reading the chunk's compact blocks from storage.
+    Read,
+    /// Converting the chunk's blocks to lightwalletd messages and pruning
+    /// them to the requested pools.
+    Convert,
+    /// Waiting for the client to make room for the chunk's messages. Only the
+    /// chunks after the first have this stage, because the first chunk is
+    /// part of the response itself.
+    Send,
+}
+
+impl BlockRangeStage {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Convert => "convert",
+            Self::Send => "send",
+        }
+    }
+
+    /// Records that one chunk spent `elapsed` in this stage.
+    pub fn record(self, elapsed: Duration) {
+        metrics::histogram!(STAGE_DURATION_HISTOGRAM, "stage" => self.label()).record(elapsed);
+    }
+
+    /// Runs `stage_work` and records how long it took.
+    pub fn time<Output>(self, stage_work: impl FnOnce() -> Output) -> Output {
+        let started_at = Instant::now();
+        let output = stage_work();
+        self.record(started_at.elapsed());
+        output
+    }
+
+    /// Awaits `stage_work` and records how long it took.
+    pub async fn time_async<Output>(self, stage_work: impl Future<Output = Output>) -> Output {
+        let started_at = Instant::now();
+        let output = stage_work.await;
+        self.record(started_at.elapsed());
+        output
+    }
+}
 
 /// Process-wide limit on concurrent `GetBlockRange` and
 /// `GetBlockRangeNullifiers` streams.
@@ -187,24 +245,45 @@ impl BlockRangeStreamLimit {
         self.max_streams
     }
 
-    /// Takes a slot for one new stream.
+    /// Takes a slot for one new stream, counting it in
+    /// `zinder_compat_block_range_streams_admitted_total`.
     ///
     /// # Errors
     ///
     /// Returns `RESOURCE_EXHAUSTED` when every slot is taken, and counts the
     /// refusal in `zinder_compat_block_range_stream_refusals_total`.
     pub fn try_open(&self) -> Result<BlockRangeStreamSlot, Status> {
+        let started_at = Instant::now();
         let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() else {
-            metrics::counter!("zinder_compat_block_range_stream_refusals_total").increment(1);
+            record_admission(AdmissionOutcome::Refused, started_at.elapsed());
             return Err(Status::resource_exhausted(format!(
                 "this server already serves its limit of {} concurrent block-range streams",
                 self.max_streams
             )));
         };
+        record_admission(AdmissionOutcome::Admitted, started_at.elapsed());
         Ok(BlockRangeStreamSlot {
             _open_stream: Arc::new(OpenStream::new(permit)),
         })
     }
+}
+
+/// How a block-range request left admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdmissionOutcome {
+    Admitted,
+    Refused,
+}
+
+/// Counts one admission decision and records how long the request waited
+/// for it.
+fn record_admission(outcome: AdmissionOutcome, waited: Duration) {
+    let (counter, label) = match outcome {
+        AdmissionOutcome::Admitted => (ADMITTED_STREAMS_COUNTER, "admitted"),
+        AdmissionOutcome::Refused => (REFUSED_STREAMS_COUNTER, "refused"),
+    };
+    metrics::counter!(counter).increment(1);
+    metrics::histogram!(SLOT_WAIT_HISTOGRAM, "outcome" => label).record(waited);
 }
 
 /// A taken slot, counted in `zinder_compat_block_range_streams_open` until it
@@ -805,6 +884,56 @@ mod tests {
         let reopened = limit.try_open()?;
         drop((reopened, other_stream));
         Ok(())
+    }
+
+    /// Returns the value of the first sample of `rendered` whose series is
+    /// exactly `series`, name and labels included.
+    fn rendered_sample(rendered: &str, series: &str) -> Option<f64> {
+        rendered.lines().find_map(|line| {
+            line.strip_prefix(series)?
+                .strip_prefix(' ')?
+                .parse::<f64>()
+                .ok()
+        })
+    }
+
+    #[test]
+    fn admission_counts_admitted_and_refused_streams_and_samples_their_slot_wait()
+    -> Result<(), tonic::Status> {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let limit = BlockRangeStreamLimit::new(NonZeroU32::MIN);
+            let open_stream = limit.try_open()?;
+            assert!(limit.try_open().is_err());
+
+            let rendered = handle.render();
+            assert_eq!(
+                rendered_sample(
+                    &rendered,
+                    "zinder_compat_block_range_streams_admitted_total"
+                ),
+                Some(1.0)
+            );
+            assert_eq!(
+                rendered_sample(&rendered, "zinder_compat_block_range_stream_refusals_total"),
+                Some(1.0)
+            );
+            for outcome in ["admitted", "refused"] {
+                assert_eq!(
+                    rendered_sample(
+                        &rendered,
+                        &format!(
+                            "zinder_compat_block_range_slot_wait_duration_seconds_count{{outcome=\"{outcome}\"}}"
+                        ),
+                    ),
+                    Some(1.0),
+                    "one {outcome} request must record one slot-wait sample"
+                );
+            }
+            drop(open_stream);
+            Ok(())
+        })
     }
 
     #[test]

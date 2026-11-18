@@ -453,6 +453,42 @@ async fn get_block_range_streams_windows_wider_than_one_store_read() -> eyre::Re
     Ok(())
 }
 
+/// Returns how many samples `rendered` holds for the block-range `stage`.
+fn block_range_stage_samples(rendered: &str, stage: &str) -> Option<u64> {
+    let series =
+        format!("zinder_compat_block_range_stage_duration_seconds_count{{stage=\"{stage}\"}} ");
+    rendered
+        .lines()
+        .find_map(|line| line.strip_prefix(series.as_str())?.parse::<u64>().ok())
+}
+
+/// Each chunk of a block-range stream records how long it took to read and
+/// to convert.
+///
+/// Each chunk after the first also records how long its reader waited to
+/// queue it for the client; the first is sent from the response.
+#[tokio::test]
+async fn get_block_range_times_each_chunk_stage() -> eyre::Result<()> {
+    let metrics_recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let metrics_handle = metrics_recorder.handle();
+    // The test runtime runs every task on this thread, so the local recorder
+    // sees the reader task of the later chunks too.
+    let _recorder_guard = metrics::set_default_local_recorder(&metrics_recorder);
+    let store_fixture = acceptance_store_fixture()?;
+    let recorder = EpochPinRecorder::new(store_fixture.query())
+        .with_synthetic_compact_blocks_to(BlockHeight::new(2_500));
+    let adapter = LightwalletdGrpcAdapter::new(recorder);
+
+    let blocks = collect_block_range(&adapter, block_range_request(1, 2_500)).await?;
+    assert_one_linked_chain(&blocks, 1, 2_500);
+
+    let rendered = metrics_handle.render();
+    assert_eq!(block_range_stage_samples(&rendered, "read"), Some(3));
+    assert_eq!(block_range_stage_samples(&rendered, "convert"), Some(3));
+    assert_eq!(block_range_stage_samples(&rendered, "send"), Some(2));
+    Ok(())
+}
+
 fn block_range_request(start: u64, end: u64) -> lightwalletd::BlockRange {
     lightwalletd::BlockRange {
         start: Some(lightwalletd::BlockId {

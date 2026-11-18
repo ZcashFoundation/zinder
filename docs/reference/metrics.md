@@ -346,7 +346,10 @@ bidirectional calls.
 | --- | --- | --- | --- |
 | `zinder_compat_serving_info` | gauge | `serving` | 1 for the serving mode: `wallet` or `compact-blocks`. |
 | `zinder_compat_block_range_streams_open` | gauge | | Block-range streams holding a slot of `compat.max_concurrent_block_range_streams`. |
+| `zinder_compat_block_range_streams_admitted_total` | counter | | Block-range requests that took a slot. |
 | `zinder_compat_block_range_stream_refusals_total` | counter | | Block-range requests refused with `RESOURCE_EXHAUSTED`. |
+| `zinder_compat_block_range_slot_wait_duration_seconds` | histogram | `outcome` | Time a block-range request spent in admission before it took a slot (`admitted`) or was refused (`refused`). |
+| `zinder_compat_block_range_stage_duration_seconds` | histogram | `stage` | Time one chunk of a block-range stream spent reading from storage (`read`), converting to lightwalletd messages (`convert`), or, for each chunk after the first, waiting for the client to make room for it (`send`). |
 | `zinder_compat_block_range_reorg_endings_total` | counter | `cause` | Streams ended early by a reorg: `chain_replaced` or `tip_lowered`. Clients retry. |
 | `zinder_compat_compact_refresh_failures_total` | counter | `cause` | Compact-blocks mode: failed refreshes, by readiness cause. |
 
