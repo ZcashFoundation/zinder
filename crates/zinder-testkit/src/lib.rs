@@ -72,7 +72,8 @@ pub use commitment_tree_fixtures::{
 pub use env_var_contract::EnvVarContractProbe;
 pub use ingest_control_fixture::{IngestControlFixture, IngestControlFixtureService};
 pub use json_rpc_test_server::{
-    JsonRpcRequest, JsonRpcStub, JsonRpcStubBuilder, JsonRpcTestServer, RpcReply, method,
+    BatchResponseShape, JsonRpcRequest, JsonRpcStub, JsonRpcStubBuilder, JsonRpcTestServer,
+    RpcReply, method,
 };
 pub use log_capture::{CapturedEvent, LogCapture};
 pub use materialized_view_fixture::{
