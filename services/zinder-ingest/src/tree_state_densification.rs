@@ -40,11 +40,11 @@ use crate::{
 
 /// Default number of strides replayed at once.
 pub const DEFAULT_TREE_STATE_DENSIFICATION_WORKERS: u32 = 2;
-/// Default ceiling on stored blocks the pass replays per second.
+/// Default average ceiling on stored blocks the pass replays per second.
 ///
-/// Replaying a block reads its compact block and header, so this also bounds
-/// the pass's reads, and the rows it writes, which never exceed the blocks it
-/// replays.
+/// Replaying a block reads its compact block and header, and each scanned
+/// stride is charged as a few blocks, so this also bounds the pass's reads,
+/// and the rows it writes, which never exceed the blocks it replays.
 pub const DEFAULT_TREE_STATE_DENSIFICATION_MAX_BLOCKS_PER_SECOND: u32 = 500;
 /// Default commitment budget of the budgeted selection.
 pub const DEFAULT_TREE_STATE_COMMITMENT_BUDGET: u32 = 1_024;
@@ -57,6 +57,17 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// How often the pass reopens its canonical secondary when no store is
 /// published yet.
 const OPEN_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+/// File, inside the canonical store directory, in which the pass records its
+/// progress.
+pub const TREE_STATE_DENSIFICATION_WATERMARK_FILE: &str = "tree-state-densification-watermark.json";
+const WATERMARK_VERSION: u32 = 1;
+/// Least time between two progress records while strides are committed.
+const WATERMARK_WRITE_INTERVAL: Duration = Duration::from_secs(10);
+/// Settled strides one scan chunk examines.
+const SCAN_CHUNK_STRIDES: u32 = 64;
+/// Reads charged as one replayed block against the replay rate, the compact
+/// block and header a replay reads for each block.
+const SCAN_READS_PER_BLOCK: u32 = 2;
 
 /// Resolved `[ingest.tree_state_densification]` settings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -193,7 +204,7 @@ async fn run_tree_state_densification<Writer: TreeStateStrideWriter>(
         max_blocks_per_second = context.config.max_blocks_per_second.get(),
         "tree-state densification started"
     );
-    let mut pass = DensificationPass::new(Arc::new(RwLock::new(secondary)), &context);
+    let mut pass = DensificationPass::resume(Arc::new(RwLock::new(secondary)), &context).await;
     loop {
         if wait_until_historical_work_or_cancelled(&context.gate, &cancel).await {
             return;
@@ -266,51 +277,112 @@ enum StepOutcome {
 
 /// Resumable state of one run of the pass.
 ///
-/// The first scan of a run walks every settled stride once; later scans start
-/// where the previous one ended, so only newly settled strides are examined
-/// again. A stride skipped as an integrity failure is revisited only by the
-/// next run's first scan.
+/// A run resumes at its verified watermark, or at the first stride when there
+/// is none, and scans forward in bounded chunks. Later scans start where the
+/// previous one ended, so only newly settled strides are examined again. A
+/// stride skipped as an integrity failure holds the watermark below it, so the
+/// next run examines it again.
 struct DensificationPass {
     secondary: Arc<RwLock<RocksDbCanonicalSecondary>>,
     activations: Arc<NetworkUpgradeActivations>,
     config: TreeStateDensificationConfig,
-    /// Strides found by the last scan and not yet committed or skipped.
+    watermark_file: WatermarkFile,
+    /// Strides found by scanning and not yet committed or skipped.
     queue: VecDeque<TreeStateStride>,
-    /// Height the next scan starts from.
+    /// Height the next scan chunk starts from.
     scan_from: BlockHeight,
+    /// Whether the last scan chunk reached the first unsettled stride.
+    scan_reached_unsettled: bool,
+    /// Height of the history predecessor, below every stride end.
+    predecessor_height: BlockHeight,
+    /// Lowest seed of a stride skipped as an integrity failure in this run.
+    damaged_floor: Option<BlockHeight>,
+    /// Height the watermark file records for this run's selection.
+    watermark: Option<BlockHeight>,
+    last_watermark_write: Instant,
     caught_up_logged: bool,
 }
 
 impl DensificationPass {
-    fn new<Writer>(
+    /// Starts a run at the recorded watermark when the stored rows confirm it.
+    async fn resume<Writer: TreeStateStrideWriter>(
         secondary: Arc<RwLock<RocksDbCanonicalSecondary>>,
         context: &TreeStateDensificationContext<Writer>,
     ) -> Self {
+        let predecessor_height = secondary
+            .read()
+            .build_plan()
+            .history_predecessor()
+            .block_id
+            .height;
+        let watermark_file = WatermarkFile::new(
+            &context.canonical_primary_path,
+            secondary
+                .read()
+                .ready_evidence()
+                .construction_manifest_sha256,
+            context.config.selection,
+        );
+        let watermark = {
+            let secondary = Arc::clone(&secondary);
+            let watermark_file = watermark_file.clone();
+            let verified =
+                tokio::task::spawn_blocking(move || watermark_file.verified(&secondary.read()))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|verified| verified.map_err(|error| error.to_string()));
+            verified.unwrap_or_else(|reason| {
+                tracing::warn!(
+                    target: "zinder::ingest",
+                    event = "tree_state_densification_resume_failed",
+                    reason = %reason,
+                    "tree-state densification could not check its recorded progress and scans every settled stride"
+                );
+                None
+            })
+        };
+        if let Some(watermark) = watermark {
+            metrics::gauge!("zinder_ingest_tree_state_densification_watermark_height")
+                .set(f64::from(watermark.value()));
+        }
         Self {
             secondary,
             activations: Arc::clone(&context.network_upgrade_activations),
             config: context.config,
+            watermark_file,
             queue: VecDeque::new(),
-            scan_from: BlockHeight::new(0),
+            scan_from: watermark.unwrap_or(BlockHeight::new(0)),
+            scan_reached_unsettled: false,
+            predecessor_height,
+            damaged_floor: None,
+            watermark,
+            last_watermark_write: Instant::now(),
             caught_up_logged: false,
         }
     }
 
-    /// Densifies and commits up to one queued stride per worker, scanning for
-    /// strides first when none are queued.
+    /// Densifies and commits up to one queued stride per worker, or scans one
+    /// bounded chunk for strides when none are queued.
     async fn step(
         &mut self,
         writer: &impl TreeStateStrideWriter,
         cancel: &CancellationToken,
     ) -> Result<StepOutcome, String> {
         if self.queue.is_empty() {
-            let scan = self.scan().await?;
-            self.scan_from = scan.next_scan_from;
-            self.queue = scan.strides;
-            record_remaining(self.queue.len());
-            if self.queue.is_empty() {
+            if self.scan_reached_unsettled {
+                self.scan_reached_unsettled = false;
+                self.record_watermark(true).await;
                 return Ok(StepOutcome::CaughtUp);
             }
+            let reads = self.scan_chunk().await?;
+            self.record_watermark(false).await;
+            if self
+                .pace(reads.div_ceil(SCAN_READS_PER_BLOCK), cancel)
+                .await
+            {
+                return Ok(StepOutcome::Cancelled);
+            }
+            return Ok(StepOutcome::Progressed);
         }
         self.caught_up_logged = false;
         let workers = usize::try_from(self.config.workers.get()).unwrap_or(usize::MAX);
@@ -330,10 +402,12 @@ impl DensificationPass {
         let mut committed = 0;
         for (stride, replay) in batch.iter().zip(replays) {
             match self.commit(writer, *stride, replay).await {
-                Ok(_) => {
+                Ok(()) => {
                     committed += 1;
                     record_remaining(self.queue.len() + batch.len() - committed);
-                    if self.pace(*stride, cancel).await {
+                    let replayed_blocks =
+                        stride.end_height().value() - stride.seed_height().value();
+                    if self.pace(replayed_blocks, cancel).await {
                         return Ok(StepOutcome::Cancelled);
                     }
                 }
@@ -346,25 +420,36 @@ impl DensificationPass {
                 }
             }
         }
+        self.record_watermark(false).await;
         Ok(StepOutcome::Progressed)
     }
 
-    /// Catches the secondary up and lists every settled stride from
-    /// `scan_from` that does not satisfy the selection, on a blocking thread.
-    async fn scan(&self) -> Result<StrideScan, String> {
+    /// Catches the secondary up and examines one bounded chunk of settled
+    /// strides on a blocking thread, returning the reads it made.
+    async fn scan_chunk(&mut self) -> Result<u32, String> {
         let secondary = Arc::clone(&self.secondary);
         let selection = self.config.selection;
         let from = self.scan_from;
-        tokio::task::spawn_blocking(move || {
+        let limit = NonZeroU32::new(SCAN_CHUNK_STRIDES).unwrap_or(NonZeroU32::MIN);
+        let scan = tokio::task::spawn_blocking(move || {
             secondary.write().try_catch_up()?;
-            scan_strides(&secondary.read(), from, selection)
+            secondary
+                .read()
+                .scan_tree_state_strides(from, selection, limit)
         })
         .await
         .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        for (stride, reason) in &scan.damaged {
+            self.record_damaged(*stride, reason);
+        }
+        self.queue.extend(scan.incomplete);
+        self.scan_from = scan.next_from;
+        self.scan_reached_unsettled = scan.reached_unsettled;
+        record_remaining(self.queue.len());
+        Ok(scan.reads)
     }
 
-    /// Replays `strides` in parallel, one blocking thread each.
     /// Catches the secondary up to the primary, so a long queue never reads
     /// files the primary has since compacted away, then replays `strides`.
     async fn catch_up_and_replay(
@@ -414,20 +499,16 @@ impl DensificationPass {
     /// as an integrity failure and skipped. Any other error is returned for
     /// a retry.
     async fn commit(
-        &self,
+        &mut self,
         writer: &impl TreeStateStrideWriter,
         stride: TreeStateStride,
         replay: Result<DensifiedTreeStateStride, CanonicalStoreError>,
-    ) -> Result<u32, String> {
+    ) -> Result<(), String> {
         let densified = match replay {
             Ok(densified) => densified,
             Err(error @ CanonicalStoreError::TreeStateStrideMismatch { .. }) => {
-                record_integrity_failure(
-                    stride.seed_height(),
-                    stride.end_height(),
-                    &error.to_string(),
-                );
-                return Ok(0);
+                self.record_damaged(stride, &error.to_string());
+                return Ok(());
             }
             Err(error) => return Err(error.to_string()),
         };
@@ -445,23 +526,84 @@ impl DensificationPass {
                     "zinder_ingest_tree_state_densification_replayed_commitments_total"
                 )
                 .increment(replayed_commitments);
-                Ok(commit.rows_written)
+                Ok(())
             }
             Err(TreeStateStrideWriteError::Integrity { reason }) => {
-                record_integrity_failure(stride.seed_height(), stride.end_height(), &reason);
-                Ok(0)
+                self.record_damaged(stride, &reason);
+                Ok(())
             }
             Err(error) => Err(error.to_string()),
         }
     }
 
-    /// Holds the pass so replayed blocks stay under the configured rate.
-    async fn pace(&self, stride: TreeStateStride, cancel: &CancellationToken) -> bool {
-        let replayed_blocks = stride.end_height().value() - stride.seed_height().value();
+    /// Holds the pass so the blocks it replays, and the blocks a scan is
+    /// charged for, stay under the configured rate on average.
+    async fn pace(&self, blocks: u32, cancel: &CancellationToken) -> bool {
         let pause = Duration::from_secs_f64(
-            f64::from(replayed_blocks) / f64::from(self.config.max_blocks_per_second.get()),
+            f64::from(blocks) / f64::from(self.config.max_blocks_per_second.get()),
         );
         cancel.is_cancelled() || (!pause.is_zero() && sleep_or_cancel(pause, cancel).await)
+    }
+
+    fn record_damaged(&mut self, stride: TreeStateStride, reason: &str) {
+        record_integrity_failure(stride.seed_height(), stride.end_height(), reason);
+        let seed_height = stride.seed_height();
+        self.damaged_floor = Some(
+            self.damaged_floor
+                .map_or(seed_height, |floor| floor.min(seed_height)),
+        );
+    }
+
+    /// Records the highest height below which every settled stride is known
+    /// to satisfy the selection, at most every
+    /// [`WATERMARK_WRITE_INTERVAL`] unless `now` is set.
+    ///
+    /// Every stride below the lowest queued stride, the lowest damaged
+    /// stride, and the next scan start was committed or found satisfied, and
+    /// commits are synced before they return, so the file never claims a
+    /// stride whose rows are not durable.
+    async fn record_watermark(&mut self, now: bool) {
+        let candidate = [
+            self.queue.front().map(|stride| stride.seed_height()),
+            self.damaged_floor,
+            Some(self.scan_from),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .filter(|height| {
+            height.value().is_multiple_of(TREE_STATE_CHECKPOINT_STRIDE)
+                && *height > self.predecessor_height
+        });
+        let Some(candidate) = candidate else {
+            return;
+        };
+        if self
+            .watermark
+            .is_some_and(|watermark| watermark >= candidate)
+            || (!now && self.last_watermark_write.elapsed() < WATERMARK_WRITE_INTERVAL)
+        {
+            return;
+        }
+        let watermark_file = self.watermark_file.clone();
+        let written = tokio::task::spawn_blocking(move || watermark_file.write(candidate))
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|written| written.map_err(|error| error.to_string()));
+        match written {
+            Ok(()) => {
+                self.watermark = Some(candidate);
+                self.last_watermark_write = Instant::now();
+                metrics::gauge!("zinder_ingest_tree_state_densification_watermark_height")
+                    .set(f64::from(candidate.value()));
+            }
+            Err(reason) => tracing::warn!(
+                target: "zinder::ingest",
+                event = "tree_state_densification_watermark_write_failed",
+                reason = %reason,
+                "could not record tree-state densification progress; a restart rescans from the last recorded height"
+            ),
+        }
     }
 
     fn log_caught_up(&mut self) {
@@ -477,59 +619,133 @@ impl DensificationPass {
     }
 }
 
-/// Lists every settled stride from `from` that does not satisfy `selection`.
-fn scan_strides(
-    secondary: &RocksDbCanonicalSecondary,
-    from: BlockHeight,
-    selection: TreeStateCheckpointSelection,
-) -> Result<StrideScan, CanonicalStoreError> {
-    let settled_height = secondary.sequence_checkpoint().through().height;
-    let mut strides = VecDeque::new();
-    let mut next = from;
-    while let Some(stride) = next_stride(secondary, next, selection)? {
-        next = stride.end_height();
-        strides.push_back(stride);
-    }
-    // Every stride ending at or below the settled tip was examined, so the
-    // next scan starts at the seed of the first one that was not.
-    let unsettled_seed = BlockHeight::new(
-        settled_height.value() - settled_height.value() % TREE_STATE_CHECKPOINT_STRIDE,
-    );
-    Ok(StrideScan {
-        strides,
-        next_scan_from: from.max(unsettled_seed),
-    })
-}
-
-/// Strides one scan found and where the next scan starts.
-struct StrideScan {
-    strides: VecDeque<TreeStateStride>,
-    next_scan_from: BlockHeight,
-}
-
-/// Returns the next stride to densify at or above `from`.
+/// The pass's progress file inside the canonical store directory.
 ///
-/// A stride whose stored rows or blocks are damaged cannot be densified, so it
-/// is recorded as an integrity failure and skipped.
-fn next_stride(
-    secondary: &RocksDbCanonicalSecondary,
-    mut from: BlockHeight,
+/// It records the store's construction manifest digest and the selection
+/// the progress was made under, so a rebuilt store or a changed selection
+/// starts over instead of trusting it.
+#[derive(Clone)]
+struct WatermarkFile {
+    path: PathBuf,
+    construction_manifest_sha256: String,
     selection: TreeStateCheckpointSelection,
-) -> Result<Option<TreeStateStride>, CanonicalStoreError> {
-    loop {
-        match secondary.next_tree_state_stride(from, selection) {
-            Err(
-                error @ CanonicalStoreError::TreeStateStrideMismatch {
-                    seed_height,
-                    end_height,
-                    ..
-                },
-            ) => {
-                record_integrity_failure(seed_height, end_height, &error.to_string());
-                from = end_height;
-            }
-            found => return found,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct WatermarkRecord {
+    version: u32,
+    construction_manifest_sha256: String,
+    selection: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    commitment_budget: Option<u32>,
+    through_height: u32,
+}
+
+impl WatermarkFile {
+    fn new(
+        canonical_primary_path: &std::path::Path,
+        construction_manifest_sha256: [u8; 32],
+        selection: TreeStateCheckpointSelection,
+    ) -> Self {
+        Self {
+            path: canonical_primary_path.join(TREE_STATE_DENSIFICATION_WATERMARK_FILE),
+            construction_manifest_sha256: hex::encode(construction_manifest_sha256),
+            selection,
         }
+    }
+
+    /// Names the selection as the file records it, or `None` for a
+    /// selection the file format does not know, whose progress is then
+    /// neither recorded nor trusted.
+    fn selection_fields(&self) -> Option<(String, Option<u32>)> {
+        match self.selection {
+            TreeStateCheckpointSelection::EveryBlock => Some(("every-block".to_owned(), None)),
+            TreeStateCheckpointSelection::CommitmentBudget(budget) => {
+                Some(("commitment-budget".to_owned(), Some(budget.get())))
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns the recorded height when it was made for this store and
+    /// selection and the stride that ends at it still satisfies the
+    /// selection in the stored rows.
+    fn verified(
+        &self,
+        secondary: &RocksDbCanonicalSecondary,
+    ) -> Result<Option<BlockHeight>, CanonicalStoreError> {
+        let Ok(encoded) = std::fs::read(&self.path) else {
+            return Ok(None);
+        };
+        let Some((selection, commitment_budget)) = self.selection_fields() else {
+            return Ok(None);
+        };
+        let Some(height) = serde_json::from_slice::<WatermarkRecord>(&encoded)
+            .ok()
+            .filter(|record| {
+                record.version == WATERMARK_VERSION
+                    && record.construction_manifest_sha256 == self.construction_manifest_sha256
+                    && record.selection == selection
+                    && record.commitment_budget == commitment_budget
+            })
+            .map(|record| BlockHeight::new(record.through_height))
+        else {
+            self.log_discarded("it was recorded for another store or selection");
+            return Ok(None);
+        };
+        let satisfied = height.value().is_multiple_of(TREE_STATE_CHECKPOINT_STRIDE)
+            && height.value() > 0
+            && match secondary.tree_state_stride_satisfied(height, self.selection) {
+                Ok(satisfied) => satisfied,
+                Err(CanonicalStoreError::PublicationRefused { .. }) => false,
+                Err(error) => return Err(error),
+            };
+        if !satisfied {
+            self.log_discarded("the stored rows do not satisfy the stride it ends");
+            return Ok(None);
+        }
+        tracing::info!(
+            target: "zinder::ingest",
+            event = "tree_state_densification_resumed",
+            through_height = height.value(),
+            "tree-state densification resumes from its recorded progress"
+        );
+        Ok(Some(height))
+    }
+
+    fn log_discarded(&self, reason: &'static str) {
+        tracing::warn!(
+            target: "zinder::ingest",
+            event = "tree_state_densification_watermark_discarded",
+            path = %self.path.display(),
+            reason,
+            "tree-state densification ignores its recorded progress and scans every settled stride"
+        );
+    }
+
+    /// Replaces the file atomically with `height`.
+    fn write(&self, height: BlockHeight) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let Some((selection, commitment_budget)) = self.selection_fields() else {
+            return Ok(());
+        };
+        let record = WatermarkRecord {
+            version: WATERMARK_VERSION,
+            construction_manifest_sha256: self.construction_manifest_sha256.clone(),
+            selection,
+            commitment_budget,
+            through_height: height.value(),
+        };
+        let encoded = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
+        let staged = self.path.with_extension("json.tmp");
+        let mut file = std::fs::File::create(&staged)?;
+        file.write_all(&encoded)?;
+        file.sync_all()?;
+        std::fs::rename(&staged, &self.path)?;
+        if let Some(directory) = self.path.parent() {
+            std::fs::File::open(directory)?.sync_all()?;
+        }
+        Ok(())
     }
 }
 

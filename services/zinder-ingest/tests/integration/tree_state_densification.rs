@@ -132,6 +132,10 @@ async fn an_every_block_pass_completes_strides_an_earlier_budget_pass_densified(
         commits.len()
     );
     eyre::ensure!(
+        harness.watermark()?["selection"] == "every-block",
+        "the watermark must follow the new selection"
+    );
+    eyre::ensure!(
         commits
             .iter()
             .all(|commit| commit.rows_already_present == 0 && commit.rows_written > 0),
@@ -166,6 +170,142 @@ async fn a_history_predecessor_off_the_cadence_seeds_the_first_stride() -> eyre:
         Ok(())
     })?;
     harness.assert_reads_match_the_chain(131..=DENSIFIED_THROUGH)?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_completed_pass_records_its_progress_and_a_restart_commits_nothing() -> eyre::Result<()> {
+    let harness = Harness::new()?;
+    harness
+        .run_pass_to_completion(EVERY_BLOCK, &Hooks::default())
+        .await?;
+
+    let watermark = harness.watermark()?;
+    eyre::ensure!(
+        watermark["selection"] == "every-block"
+            && watermark["through_height"] == DENSIFIED_THROUGH
+            && watermark["construction_manifest_sha256"] == harness.manifest_sha256()?,
+        "unexpected watermark {watermark}"
+    );
+    let resumed = harness
+        .run_pass_to_completion(EVERY_BLOCK, &Hooks::default())
+        .await?;
+    eyre::ensure!(resumed.is_empty(), "a resumed pass committed {resumed:?}");
+    Ok(())
+}
+
+/// A verified watermark is trusted for every stride below it, so a restart
+/// does not scan them again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_resumes_at_a_verified_watermark_without_scanning_below_it() -> eyre::Result<()> {
+    let harness = Harness::new()?;
+    let refuse_first = Hooks {
+        refuse_seed_height: Some(0),
+        ..Hooks::default()
+    };
+    harness
+        .run_pass_to_completion(EVERY_BLOCK, &refuse_first)
+        .await?;
+    eyre::ensure!(
+        !harness.watermark_path()?.exists(),
+        "a damaged first stride must hold the watermark back"
+    );
+    harness.write_watermark(&serde_json::json!({
+        "version": 1,
+        "construction_manifest_sha256": harness.manifest_sha256()?,
+        "selection": "every-block",
+        "through_height": 200,
+    }))?;
+
+    let commits = harness
+        .run_pass_to_completion_from(EVERY_BLOCK, &Hooks::default(), BlockHeight::new(200))
+        .await?;
+
+    eyre::ensure!(commits.is_empty(), "the restart committed {commits:?}");
+    harness.with_primary(|primary| {
+        eyre::ensure!(
+            stored_checkpoint_heights(primary, 0, 100)? == vec![0, 100],
+            "a stride below a verified watermark must not be scanned again"
+        );
+        Ok(())
+    })?;
+    eyre::ensure!(harness.watermark()?["through_height"] == DENSIFIED_THROUGH);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_watermark_ahead_of_its_rows_or_from_another_store_is_discarded() -> eyre::Result<()> {
+    for (version, foreign_manifest) in [(1, false), (1, true), (2, false)] {
+        let harness = Harness::new()?;
+        let manifest = if foreign_manifest {
+            "00".repeat(32)
+        } else {
+            harness.manifest_sha256()?
+        };
+        harness.write_watermark(&serde_json::json!({
+            "version": version,
+            "construction_manifest_sha256": manifest,
+            "selection": "every-block",
+            "through_height": DENSIFIED_THROUGH,
+        }))?;
+
+        let commits = harness
+            .run_pass_to_completion(EVERY_BLOCK, &Hooks::default())
+            .await?;
+
+        eyre::ensure!(
+            commits.len() == 3,
+            "{} strides were densified",
+            commits.len()
+        );
+        harness.assert_reads_match_the_chain(1..=DENSIFIED_THROUGH)?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_watermark_is_discarded() -> eyre::Result<()> {
+    let harness = Harness::new()?;
+    std::fs::write(harness.watermark_path()?, b"{ not json")?;
+
+    let commits = harness
+        .run_pass_to_completion(EVERY_BLOCK, &Hooks::default())
+        .await?;
+
+    eyre::ensure!(
+        commits.len() == 3,
+        "{} strides were densified",
+        commits.len()
+    );
+    eyre::ensure!(harness.watermark()?["through_height"] == DENSIFIED_THROUGH);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_changed_commitment_budget_rescans_and_records_progress_under_the_new_budget()
+-> eyre::Result<()> {
+    let harness = Harness::new()?;
+    let budget = |commitments| {
+        NonZeroU32::new(commitments)
+            .map(TreeStateCheckpointSelection::CommitmentBudget)
+            .ok_or_else(|| eyre::eyre!("zero budget"))
+    };
+    harness
+        .run_pass_to_completion(budget(20)?, &Hooks::default())
+        .await?;
+    eyre::ensure!(harness.watermark()?["commitment_budget"] == 20);
+
+    // A looser budget needs no new rows, but its progress is its own.
+    let commits = harness
+        .run_pass_to_completion(budget(30)?, &Hooks::default())
+        .await?;
+
+    eyre::ensure!(commits.is_empty(), "a looser budget committed {commits:?}");
+    let watermark = harness.watermark()?;
+    eyre::ensure!(
+        watermark["commitment_budget"] == 30 && watermark["through_height"] == DENSIFIED_THROUGH,
+        "unexpected watermark {watermark}"
+    );
     Ok(())
 }
 
@@ -225,6 +365,10 @@ async fn a_stride_the_writer_refuses_as_contradictory_is_skipped_and_the_rest_de
         eyre::ensure!(stored_checkpoint_heights(primary, 200, 300)?.len() == 101);
         Ok(())
     })?;
+    eyre::ensure!(
+        harness.watermark()?["through_height"] == 100,
+        "a refused stride must hold the watermark at its seed"
+    );
     harness.assert_reads_match_the_chain(1..=DENSIFIED_THROUGH)?;
     Ok(())
 }
@@ -524,6 +668,31 @@ impl Harness {
             .and_then(|fixture| read(fixture.canonical_primary()?))
     }
 
+    fn watermark_path(&self) -> eyre::Result<PathBuf> {
+        Ok(self
+            .primary_path()?
+            .join(zinder_ingest::TREE_STATE_DENSIFICATION_WATERMARK_FILE))
+    }
+
+    fn watermark(&self) -> eyre::Result<serde_json::Value> {
+        Ok(serde_json::from_slice(&std::fs::read(
+            self.watermark_path()?,
+        )?)?)
+    }
+
+    fn write_watermark(&self, watermark: &serde_json::Value) -> eyre::Result<()> {
+        std::fs::write(self.watermark_path()?, serde_json::to_vec(watermark)?)?;
+        Ok(())
+    }
+
+    fn manifest_sha256(&self) -> eyre::Result<String> {
+        self.with_primary(|primary| {
+            Ok(hex::encode(
+                primary.ready_evidence().construction_manifest_sha256,
+            ))
+        })
+    }
+
     fn primary_path(&self) -> eyre::Result<PathBuf> {
         let fixture = self.fixture.lock();
         Ok(fixture
@@ -541,13 +710,26 @@ impl Harness {
             .into_serving_store_fixture()
     }
 
-    /// Runs the pass until every settled stride satisfies `selection`.
+    /// Runs the pass until every settled stride satisfies `selection` and
+    /// its progress is recorded.
     async fn run_pass_to_completion(
         &self,
         selection: TreeStateCheckpointSelection,
         hooks: &Hooks,
     ) -> eyre::Result<Vec<TreeStateStrideCommit>> {
-        self.run_pass(selection, hooks, CancellationToken::new())
+        self.run_pass_to_completion_from(selection, hooks, BlockHeight::new(0))
+            .await
+    }
+
+    /// Runs the pass until every settled stride from `from` satisfies
+    /// `selection` and its progress is recorded.
+    async fn run_pass_to_completion_from(
+        &self,
+        selection: TreeStateCheckpointSelection,
+        hooks: &Hooks,
+        from: BlockHeight,
+    ) -> eyre::Result<Vec<TreeStateStrideCommit>> {
+        self.run_pass_from(selection, hooks, CancellationToken::new(), from)
             .await
     }
 
@@ -558,6 +740,17 @@ impl Harness {
         selection: TreeStateCheckpointSelection,
         hooks: &Hooks,
         cancel: CancellationToken,
+    ) -> eyre::Result<Vec<TreeStateStrideCommit>> {
+        self.run_pass_from(selection, hooks, cancel, BlockHeight::new(0))
+            .await
+    }
+
+    async fn run_pass_from(
+        &self,
+        selection: TreeStateCheckpointSelection,
+        hooks: &Hooks,
+        cancel: CancellationToken,
+        from: BlockHeight,
     ) -> eyre::Result<Vec<TreeStateStrideCommit>> {
         let writer = FixtureWriter {
             fixture: Arc::clone(&self.fixture),
@@ -593,7 +786,7 @@ impl Harness {
                     return Ok(());
                 }
                 let next = self.with_primary(|primary| {
-                    let mut from = BlockHeight::new(0);
+                    let mut from = from;
                     while let Some(stride) = primary.next_tree_state_stride(from, selection)? {
                         if Some(stride.seed_height()) != refused {
                             return Ok(Some(stride));
@@ -602,7 +795,15 @@ impl Harness {
                     }
                     Ok(None)
                 })?;
-                if next.is_none() {
+                // A refused stride holds the recorded progress at its seed, and
+                // a refused first stride leaves nothing to record.
+                let expected_watermark = refused.map_or(DENSIFIED_THROUGH, BlockHeight::value);
+                let recorded = expected_watermark == 0
+                    || self.watermark().is_ok_and(|watermark| {
+                        watermark["through_height"] == expected_watermark
+                            && recorded_under(&watermark, selection)
+                    });
+                if next.is_none() && recorded {
                     return Ok::<_, eyre::Report>(());
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -703,6 +904,17 @@ impl TreeStateStrideWriter for FixtureWriter {
             cancel.cancel();
         }
         Ok(commit)
+    }
+}
+
+/// Whether `watermark` was recorded under `selection`.
+fn recorded_under(watermark: &serde_json::Value, selection: TreeStateCheckpointSelection) -> bool {
+    match selection {
+        TreeStateCheckpointSelection::CommitmentBudget(budget) => {
+            watermark["selection"] == "commitment-budget"
+                && watermark["commitment_budget"] == budget.get()
+        }
+        TreeStateCheckpointSelection::EveryBlock | _ => watermark["selection"] == "every-block",
     }
 }
 

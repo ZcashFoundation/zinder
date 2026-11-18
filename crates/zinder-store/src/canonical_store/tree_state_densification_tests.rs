@@ -496,3 +496,74 @@ fn assert_stride_mismatch(error: &CanonicalStoreError, expected: TreeStateStride
         "unexpected error: {error}"
     );
 }
+
+#[test]
+fn a_stride_reports_satisfied_only_when_its_stored_rows_satisfy_the_selection() -> TestResult {
+    let temporary = TempDir::new()?;
+    let store = densification_store(&temporary, BlockHeight::new(TIP_HEIGHT))?;
+    let activations = activations()?;
+    let end = BlockHeight::new(100);
+    assert!(!store.tree_state_stride_satisfied(end, EVERY_BLOCK)?);
+
+    densify_all(&store, &activations, EVERY_BLOCK)?;
+    assert!(store.tree_state_stride_satisfied(end, EVERY_BLOCK)?);
+    assert!(
+        open_secondary(&temporary, &activations)?.tree_state_stride_satisfied(end, EVERY_BLOCK)?
+    );
+    // Above the settled tip nothing is satisfied, and only cadence heights
+    // end a stride.
+    assert!(!store.tree_state_stride_satisfied(BlockHeight::new(200), EVERY_BLOCK)?);
+    let not_an_end = store
+        .tree_state_stride_satisfied(BlockHeight::new(150), EVERY_BLOCK)
+        .err()
+        .ok_or("a height off the cadence must be refused")?;
+    assert!(matches!(
+        not_an_end,
+        CanonicalStoreError::PublicationRefused { .. }
+    ));
+
+    delete_row(&store, BlockHeight::new(99))?;
+    assert!(!store.tree_state_stride_satisfied(end, EVERY_BLOCK)?);
+    Ok(())
+}
+
+#[test]
+fn a_bounded_scan_examines_at_most_its_limit_and_reports_where_to_continue() -> TestResult {
+    let temporary = TempDir::new()?;
+    let store = densification_store(&temporary, BlockHeight::new(TIP_HEIGHT))?;
+    let one = std::num::NonZeroU32::new(1).ok_or("limit must be nonzero")?;
+
+    let first = store.scan_tree_state_strides(BlockHeight::new(0), EVERY_BLOCK, one)?;
+    assert_eq!(first.incomplete, vec![stride(0, 100)]);
+    assert_eq!(first.examined, 1);
+    assert_eq!(first.reads, 1);
+    assert_eq!(first.next_from, BlockHeight::new(100));
+    assert!(!first.reached_unsettled);
+
+    let second = store.scan_tree_state_strides(first.next_from, EVERY_BLOCK, one)?;
+    assert!(second.incomplete.is_empty());
+    assert_eq!(second.examined, 0);
+    assert_eq!(second.next_from, BlockHeight::new(100));
+    assert!(second.reached_unsettled);
+
+    break_parent_link(&store, BlockHeight::new(20))?;
+    let family = column_family(&store.bounded_open.db, COMPACT_BLOCK_COLUMN_FAMILY)?;
+    store.bounded_open.db.put_cf(
+        &family,
+        encode_block_position(BlockHeight::new(99)),
+        [0xff; 3],
+    )?;
+    let budget = TreeStateCheckpointSelection::CommitmentBudget(one);
+    let damaged = store.scan_tree_state_strides(BlockHeight::new(0), budget, one)?;
+    assert!(damaged.incomplete.is_empty());
+    assert_eq!(
+        damaged
+            .damaged
+            .iter()
+            .map(|(stride, _)| *stride)
+            .collect::<Vec<_>>(),
+        vec![stride(0, 100)]
+    );
+    assert_eq!(damaged.next_from, BlockHeight::new(100));
+    Ok(())
+}

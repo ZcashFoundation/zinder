@@ -1652,10 +1652,11 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         used_by: &["zinder-ingest"],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Ceiling on stored blocks the tree-state densification pass replays \
-                      per second. Each block costs about two reads and adds at most one \
-                      row, so this bounds the pass's reads and writes. Must be greater \
-                      than zero. Defaults to 500.",
+        description: "Average ceiling on stored blocks the tree-state densification pass \
+                      replays per second, with each scanned stride charged as two blocks. \
+                      Each block costs about two reads and adds at most one row, so this \
+                      bounds the pass's reads and writes. Must be greater than zero. \
+                      Defaults to 500.",
     },
     EnvVarDoc {
         name: "ZINDER_INGEST__RUN_OVERRIDES__TARGET_HEIGHT",

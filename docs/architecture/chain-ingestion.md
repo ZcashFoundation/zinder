@@ -179,18 +179,34 @@ ingest logs `tree_state_densification_integrity_failure`, counts it, and reads
 there keep replaying.
 
 Only settled history is densified, so no reorg reaches a densified row. A
-stride commits whole or not at all. When ingest starts, the pass checks every
-gap between stored checkpoints in each settled stride and queues the strides
-that do not satisfy the selection, so it resumes after a restart, or after a
-change to a stricter selection, without a progress record. Later scans check
-only strides that settled since. The writer commits through its command queue,
+stride commits whole or not at all, and its commit is synced before the writer
+answers. The pass scans settled strides in bounded chunks, checking every gap
+between stored checkpoints, and queues the strides that do not satisfy the
+selection. It records how far every stride satisfies the selection in
+`tree-state-densification-watermark.json` inside the canonical store
+directory, together with the store's construction manifest digest and the
+selection, and never past a stride it has not committed or found satisfied,
+or one it skipped as damaged.
+
+When ingest starts, the pass resumes at that height if the file names this
+store and the configured selection and the stride that ends at it still holds
+the selected checkpoints; otherwise it ignores the file, logs
+`tree_state_densification_watermark_discarded`, and scans from the start, as
+it does after a change of selection. The file is written only after the
+commits it covers are durable. Only the stride that ends at the recorded
+height is checked again on start, so damage below it is not looked for again;
+a read there checks its stored row against its roots as always, and a missing
+row only makes that read replay. The writer commits through its command queue,
 so the pass runs only when `ingest_control.listen_addr` is set, as it is for
-wallet serving. `ingest.tree_state_densification.workers` (2 by default) bounds
-how many strides it replays at once, each on one CPU, and
-`max_blocks_per_second` (500 by default) bounds how many stored blocks it
-replays per second. Each replayed block costs about two reads, its compact
-block and its header, and adds at most one row, so the defaults keep the pass
-near 1,000 reads per second at most. Progress is reported by the
+wallet serving.
+
+`ingest.tree_state_densification.workers` (2 by default) bounds how many
+strides the pass replays at once, each on one CPU, and `max_blocks_per_second`
+(500 by default) bounds, on average, how many stored blocks it replays per
+second; a scan is charged one block for every two reads it makes. A replayed block costs
+about two reads, its compact block and its header, and adds at most one row,
+so the defaults hold the pass near 1,000 reads per second on average, with
+short bursts of up to one stride per worker. Progress is reported by the
 `zinder_ingest_tree_state_densification_*` metrics in
 [Metrics](../reference/metrics.md). A canonical rebuild returns history to the
 100-block cadence until the pass runs again.

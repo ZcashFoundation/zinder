@@ -91,6 +91,7 @@ pub use subtree_load::{
 };
 pub use tree_state_densification::{
     DensifiedTreeStateStride, TreeStateCheckpointSelection, TreeStateStride, TreeStateStrideCommit,
+    TreeStateStrideScan,
 };
 pub use tree_state_replay::{TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome};
 

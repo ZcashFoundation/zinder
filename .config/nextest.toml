@@ -72,6 +72,14 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 filter = "test(/^transparent_signer::tests::shielding_spend_.*_pays_one_/)"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
+[[profile.default.overrides]]
+# These tests publish a 380-block chain with note commitments, derive every
+# block's trees from genesis to check against, and run the densification pass
+# to completion. Each takes 4-18s alone in a debug build and more under
+# full-workspace parallelism, which crosses the 20s default kill window.
+filter = "test(/^integration::tree_state_densification::/)"
+slow-timeout = { period = "60s", terminate-after = 2 }
+
 [profile.ci-perf]
 default-filter = "test(/^perf::/)"
 slow-timeout = { period = "5m", terminate-after = 1 }

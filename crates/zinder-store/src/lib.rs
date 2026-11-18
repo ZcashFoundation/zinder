@@ -38,7 +38,7 @@ pub use canonical_store::{
     ProjectionBuildLeaseId, RocksDbCanonicalBuilder, RocksDbCanonicalSecondary,
     RocksDbCanonicalStore, TREE_STATE_CHECKPOINT_STRIDE, TreeStateCheckpointSelection,
     TreeStateLookup, TreeStateReplay, TreeStateReplayOutcome, TreeStateStride,
-    TreeStateStrideCommit, ValidatedRocksDbCanonicalBuild,
+    TreeStateStrideCommit, TreeStateStrideScan, ValidatedRocksDbCanonicalBuild,
 };
 pub use chain_event::{
     ChainEpochCommitted, ChainEvent, ChainEventEnvelope, ChainEventHistoryRequest,

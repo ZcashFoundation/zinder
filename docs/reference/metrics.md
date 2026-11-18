@@ -113,8 +113,9 @@ The projector exports only these series. Its wallet store exports no
 | `zinder_ingest_source_retry_total` | counter | `operation` | Node requests retried within one call. |
 | `zinder_ingest_source_fetch_active` | gauge | `operation` | Node fetches in flight. |
 | `zinder_ingest_historical_work_gate_open` | gauge | | 1 when ingest follows the tip and, if Explorer views are enabled, they have caught up, so backfills and tree-state densification may run. |
-| `zinder_ingest_tree_state_densification_strides_total` | counter | `outcome` | Settled 100-block strides the densification pass finished: `densified` when the writer committed it, even with no rows left to add, or `integrity_failure` when its stored blocks or checkpoints are damaged or do not replay to each other. Any `integrity_failure` is store damage; the pass skips that stride until ingest restarts. |
-| `zinder_ingest_tree_state_densification_remaining_strides` | gauge | | Strides the last scan found that the pass has not finished yet. |
+| `zinder_ingest_tree_state_densification_strides_total` | counter | `outcome` | Settled 100-block strides the densification pass finished: `densified` when the writer committed it, even with no rows left to add, or `integrity_failure` when its stored blocks or checkpoints are damaged or do not replay to each other. Any `integrity_failure` is store damage. The pass skips that stride and holds its recorded progress below it, so it examines the stride again after ingest restarts. |
+| `zinder_ingest_tree_state_densification_remaining_strides` | gauge | | Strides the pass has found in its current scan chunk and not finished yet. |
+| `zinder_ingest_tree_state_densification_watermark_height` | gauge | | Height through which the pass has recorded every settled stride as satisfying the selection. |
 | `zinder_ingest_tree_state_densification_rows_written_total` | counter | | Tree-state checkpoint rows the pass wrote. |
 | `zinder_ingest_tree_state_densification_replayed_commitments_total` | counter | | Note commitments the pass appended while replaying strides. |
 | `zinder_ingest_tree_state_densification_stride_duration_seconds` | histogram | | Time to replay one stride. |

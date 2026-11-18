@@ -139,6 +139,25 @@ impl DensifiedTreeStateStride {
     }
 }
 
+/// What one bounded scan of settled strides found.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreeStateStrideScan {
+    /// Strides whose stored checkpoints do not satisfy the selection.
+    pub incomplete: Vec<TreeStateStride>,
+    /// Strides whose stored rows or blocks are damaged, with the check that
+    /// failed.
+    pub damaged: Vec<(TreeStateStride, String)>,
+    /// Number of settled strides the scan examined.
+    pub examined: u32,
+    /// Range scans and compact-block reads the scan made.
+    pub reads: u32,
+    /// Height the next scan continues from.
+    pub next_from: BlockHeight,
+    /// Whether the scan stopped at the first stride above the settled tip
+    /// rather than at its limit.
+    pub reached_unsettled: bool,
+}
+
 /// What committing one densified stride changed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TreeStateStrideCommit {
@@ -149,6 +168,31 @@ pub struct TreeStateStrideCommit {
 }
 
 impl RocksDbCanonicalSecondary {
+    /// Examines up to `limit` settled strides from `from` against
+    /// `selection`, so a caller can pace a scan of a long history.
+    pub fn scan_tree_state_strides(
+        &self,
+        from: BlockHeight,
+        selection: TreeStateCheckpointSelection,
+        limit: NonZeroU32,
+    ) -> Result<TreeStateStrideScan, CanonicalStoreError> {
+        scan_tree_state_strides(self, from, selection, limit)
+    }
+
+    /// Returns whether the settled stride that ends at `end` holds the
+    /// checkpoints `selection` asks for.
+    ///
+    /// A stride above the settled tip, or one whose stored rows or blocks are
+    /// damaged, is not satisfied. `end` must be a cadence height above the
+    /// history predecessor.
+    pub fn tree_state_stride_satisfied(
+        &self,
+        end: BlockHeight,
+        selection: TreeStateCheckpointSelection,
+    ) -> Result<bool, CanonicalStoreError> {
+        stride_ending_at_satisfied(self, end, selection)
+    }
+
     /// Returns the lowest settled stride at or above `from` whose stored
     /// checkpoints do not yet satisfy `selection`, or `None` when every
     /// settled stride from `from` does.
@@ -177,6 +221,28 @@ impl RocksDbCanonicalSecondary {
 }
 
 impl RocksDbCanonicalStore {
+    /// Examines up to `limit` settled strides from `from`; see
+    /// [`RocksDbCanonicalSecondary::scan_tree_state_strides`].
+    pub fn scan_tree_state_strides(
+        &self,
+        from: BlockHeight,
+        selection: TreeStateCheckpointSelection,
+        limit: NonZeroU32,
+    ) -> Result<TreeStateStrideScan, CanonicalStoreError> {
+        scan_tree_state_strides(self, from, selection, limit)
+    }
+
+    /// Returns whether the settled stride that ends at `end` holds the
+    /// checkpoints `selection` asks for; see
+    /// [`RocksDbCanonicalSecondary::tree_state_stride_satisfied`].
+    pub fn tree_state_stride_satisfied(
+        &self,
+        end: BlockHeight,
+        selection: TreeStateCheckpointSelection,
+    ) -> Result<bool, CanonicalStoreError> {
+        stride_ending_at_satisfied(self, end, selection)
+    }
+
     /// Returns the lowest settled stride at or above `from` whose stored
     /// checkpoints do not yet satisfy `selection`.
     pub fn next_tree_state_stride(
@@ -247,15 +313,103 @@ impl RocksDbCanonicalStore {
             }
         }
         if commit.rows_written > 0 {
-            // A lost commit only leaves its stride for the next pass, so the
-            // write needs the WAL but not a sync.
-            db.write_opt(&batch, &WriteOptions::default())
-                .map_err(|source| CanonicalStoreError::RocksDbOperation {
+            // The pass records its progress only after this returns, so the
+            // rows must be durable first.
+            let mut options = WriteOptions::default();
+            options.set_sync(true);
+            db.write_opt(&batch, &options).map_err(|source| {
+                CanonicalStoreError::RocksDbOperation {
                     operation: "tree-state densification commit",
                     source,
-                })?;
+                }
+            })?;
         }
         Ok(commit)
+    }
+}
+
+fn scan_tree_state_strides(
+    store: &impl CanonicalServingRead,
+    from: BlockHeight,
+    selection: TreeStateCheckpointSelection,
+    limit: NonZeroU32,
+) -> Result<TreeStateStrideScan, CanonicalStoreError> {
+    let predecessor_height = store
+        .serving_build_plan()
+        .history_predecessor()
+        .block_id
+        .height;
+    let settled_height = store
+        .serving_ready_evidence()
+        .sequence_checkpoint
+        .through()
+        .height;
+    let mut seed_height = first_seed_at_or_above(from.max(predecessor_height), predecessor_height);
+    let mut scan = TreeStateStrideScan {
+        incomplete: Vec::new(),
+        damaged: Vec::new(),
+        examined: 0,
+        reads: 0,
+        next_from: seed_height,
+        reached_unsettled: false,
+    };
+    while scan.examined < limit.get() {
+        let stride = TreeStateStride::after_seed(seed_height)?;
+        if stride.end_height > settled_height {
+            scan.reached_unsettled = true;
+            break;
+        }
+        match stride_satisfies_counting_reads(store, stride, selection, &mut scan.reads)
+            .map_err(|error| within_stride(stride, error))
+        {
+            Ok(true) => {}
+            Ok(false) => scan.incomplete.push(stride),
+            Err(CanonicalStoreError::TreeStateStrideMismatch { reason, .. }) => {
+                scan.damaged.push((stride, reason));
+            }
+            Err(error) => return Err(error),
+        }
+        scan.examined += 1;
+        seed_height = stride.end_height;
+        scan.next_from = seed_height;
+    }
+    Ok(scan)
+}
+
+fn stride_ending_at_satisfied(
+    store: &impl CanonicalServingRead,
+    end: BlockHeight,
+    selection: TreeStateCheckpointSelection,
+) -> Result<bool, CanonicalStoreError> {
+    let predecessor_height = store
+        .serving_build_plan()
+        .history_predecessor()
+        .block_id
+        .height;
+    if !end.value().is_multiple_of(TREE_STATE_CHECKPOINT_STRIDE) || end <= predecessor_height {
+        return Err(CanonicalStoreError::publication(format!(
+            "height {} does not end a tree-state stride",
+            end.value()
+        )));
+    }
+    let settled_height = store
+        .serving_ready_evidence()
+        .sequence_checkpoint
+        .through()
+        .height;
+    if end > settled_height {
+        return Ok(false);
+    }
+    let stride = TreeStateStride {
+        seed_height: BlockHeight::new(
+            (end.value() - TREE_STATE_CHECKPOINT_STRIDE).max(predecessor_height.value()),
+        ),
+        end_height: end,
+    };
+    match stride_satisfies(store, stride, selection).map_err(|error| within_stride(stride, error)) {
+        Ok(satisfied) => Ok(satisfied),
+        Err(CanonicalStoreError::TreeStateStrideMismatch { .. }) => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -308,6 +462,18 @@ fn stride_satisfies(
     stride: TreeStateStride,
     selection: TreeStateCheckpointSelection,
 ) -> Result<bool, CanonicalStoreError> {
+    stride_satisfies_counting_reads(store, stride, selection, &mut 0)
+}
+
+/// [`stride_satisfies`], adding to `reads` the range scan and the compact
+/// blocks it read.
+fn stride_satisfies_counting_reads(
+    store: &impl CanonicalServingRead,
+    stride: TreeStateStride,
+    selection: TreeStateCheckpointSelection,
+    reads: &mut u32,
+) -> Result<bool, CanonicalStoreError> {
+    *reads = reads.saturating_add(1);
     let stored_heights = stored_heights_through_end(store, stride)?;
     if stored_heights.last() != Some(&stride.end_height) {
         return Err(stride_mismatch(
@@ -322,6 +488,7 @@ fn stride_satisfies(
             if selection == TreeStateCheckpointSelection::EveryBlock {
                 return Ok(false);
             }
+            *reads = reads.saturating_add(2);
             let anchored = commitment_count(stored_tree_sizes(store, stride, previous)?);
             let reached =
                 commitment_count(stored_tree_sizes(store, stride, BlockHeight::new(gap_end))?);

@@ -69,9 +69,9 @@ pub use transaction_component_backfill::{
 };
 pub use tree_state_densification::{
     DEFAULT_TREE_STATE_COMMITMENT_BUDGET, DEFAULT_TREE_STATE_DENSIFICATION_MAX_BLOCKS_PER_SECOND,
-    DEFAULT_TREE_STATE_DENSIFICATION_WORKERS, TreeStateDensificationConfig,
-    TreeStateDensificationContext, TreeStateStrideWriteError, TreeStateStrideWriter,
-    spawn_tree_state_densification_task,
+    DEFAULT_TREE_STATE_DENSIFICATION_WORKERS, TREE_STATE_DENSIFICATION_WATERMARK_FILE,
+    TreeStateDensificationConfig, TreeStateDensificationContext, TreeStateStrideWriteError,
+    TreeStateStrideWriter, spawn_tree_state_densification_task,
 };
 pub use upstream_health_probe::spawn_upstream_health_probe_task;
 pub use writer::construction::{
