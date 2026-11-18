@@ -217,9 +217,8 @@ jq -e '
   and .services["zinder-explorer"].depends_on["zinder-query"].condition == "service_healthy"
   and .services["zinder-explorer"].healthcheck.test == [
     "CMD",
-    "curl",
-    "-fsS",
-    "http://localhost:9069/readyz"
+    "zinder-explorer",
+    "healthcheck"
   ]
   and .services["zinder-explorer"].environment.ZINDER_EXPLORER__LISTEN_ADDR == "[::]:9068"
   and .services["zinder-explorer"].environment.ZINDER_OPS__LISTEN_ADDR == "[::]:9069"
@@ -234,6 +233,30 @@ jq -e '
     | all(.target != "/var/run/zinder-checkpoint/checkpoint.token"))
 ' "$resolved_explorer_compose" >/dev/null \
   || fail "the optional explorer overlay does not preserve its reader-only deployment contract"
+
+released_compose="$temporary_directory/released-compose.json"
+ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
+ZINDER_VERSION=v9.8.7 \
+docker compose \
+  --env-file "$repository_root/deploy/.env.testnet" \
+  -f "$repository_root/deploy/docker-compose.yml" \
+  -f "$repository_root/deploy/docker-compose.explorer.yml" \
+  config --format json > "$released_compose"
+jq -e '
+  [
+    "zinder-ingest",
+    "zinder-projector",
+    "zinder-query",
+    "zinder-compat-lightwalletd",
+    "zinder-explorer"
+  ]
+  | all(. as $service
+    | $released[0].services[$service].image == ("ghcr.io/zcashfoundation/" + $service + ":v9.8.7")
+    and $released[0].services[$service].build.target == $service
+    and $source[0].services[$service].image == ("ghcr.io/zcashfoundation/" + $service + ":local"))
+' --slurpfile released "$released_compose" --slurpfile source "$resolved_explorer_compose" \
+  -n >/dev/null \
+  || fail "ZINDER_VERSION does not select the published release image for every runtime while keeping its source build"
 
 for deployment_env in "${deployment_env_names[@]}"; do
   resolved_env_compose="$temporary_directory/resolved-$deployment_env-compose.json"
@@ -455,7 +478,7 @@ expect_rejected \
   --compose-contract "$published_control_compose"
 
 healthz_compose="$temporary_directory/healthz-compose.json"
-jq '.services["zinder-ingest"].healthcheck.test[-1] = "http://localhost:9105/healthz"' \
+jq '.services["zinder-ingest"].healthcheck.test += ["--path", "/healthz"]' \
   "$resolved_compose" > "$healthz_compose"
 expect_rejected \
   "a Compose dependency gate using liveness instead of readiness" \
@@ -675,12 +698,43 @@ unchecked_installed_mode_packager="$temporary_directory/unchecked-installed-mode
 # The literal shell variables are the fixture removal target.
 # shellcheck disable=SC2016
 mutate_image_packager "$unchecked_installed_mode_packager" \
-  sed '/\[\[ "\$image_binary_stat" == /d'
+  sed '/\[\[ "\$image_binary_listing" == /d'
 expect_rejected_because \
   "an image packager that ignores the mode installed inside the image" \
   'release admission rejected: the release image packager must' \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
   --image-packager "$unchecked_installed_mode_packager"
+
+unchecked_healthcheck_packager="$temporary_directory/unchecked-healthcheck-packager.sh"
+# The literal shell variables are the fixture removal target.
+# shellcheck disable=SC2016
+mutate_image_packager "$unchecked_healthcheck_packager" \
+  sed '/\[\[ "\$healthcheck_status" -eq 1 \]\]/d'
+expect_rejected_because \
+  "an image packager that does not run the healthcheck inside the image" \
+  'release admission rejected: the release image packager must' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --image-packager "$unchecked_healthcheck_packager"
+
+wall_clock_created_packager="$temporary_directory/wall-clock-created-packager.sh"
+# The literal shell variables are the fixture rewrite target.
+# shellcheck disable=SC2016
+mutate_image_packager "$wall_clock_created_packager" \
+  sed 's/date -u -d "@\${source_date_epoch}"/date -u/'
+expect_rejected_because \
+  "an image packager whose created label is the build time" \
+  'release admission rejected: the release image packager must' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --image-packager "$wall_clock_created_packager"
+
+undescribed_image_packager="$temporary_directory/undescribed-image-packager.sh"
+mutate_image_packager "$undescribed_image_packager" \
+  sed '/org.opencontainers.image.description=/d'
+expect_rejected_because \
+  "an image packager that omits the image description label" \
+  'release admission rejected: the release image packager must' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --image-packager "$undescribed_image_packager"
 
 pushing_check_packager="$temporary_directory/pushing-check-packager.sh"
 mutate_image_packager "$pushing_check_packager" \
@@ -920,6 +974,44 @@ expect_rejected_because \
   'release admission rejected: the zinder-binaries stage must compile exactly' \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
   --dockerfile "$compiling_archive_dockerfile"
+
+debian_service_dockerfile="$temporary_directory/debian-service.Dockerfile"
+sed 's/^FROM zinder-service-base AS zinder-query$/FROM zinder-runtime-base AS zinder-query/' \
+  "$repository_root/deploy/Dockerfile" > "$debian_service_dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose query image builds on the Debian runtime base" \
+  'release admission rejected: every per-service release image must build on' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$debian_service_dockerfile"
+
+shell_less_single_volume_dockerfile="$temporary_directory/shell-less-single-volume.Dockerfile"
+sed 's/^FROM zinder-runtime-base AS zinder-wallet-serving$/FROM zinder-service-base AS zinder-wallet-serving/' \
+  "$repository_root/deploy/Dockerfile" > "$shell_less_single_volume_dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose wallet-serving image has no shell for its entrypoint" \
+  'release admission rejected: every per-service release image must build on' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$shell_less_single_volume_dockerfile"
+
+unpinned_distroless_dockerfile="$temporary_directory/unpinned-distroless.Dockerfile"
+# The variable reference is the literal Dockerfile text being rewritten.
+# shellcheck disable=SC2016
+sed 's#^FROM gcr.io/distroless/cc-debian12:nonroot@\${DISTROLESS_IMAGE_DIGEST} AS zinder-service-base$#FROM gcr.io/distroless/cc-debian12:nonroot AS zinder-service-base#' \
+  "$repository_root/deploy/Dockerfile" > "$unpinned_distroless_dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose distroless service base is not digest-pinned" \
+  'release admission rejected: every per-service release image must build on' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$unpinned_distroless_dockerfile"
+
+curl_healthcheck_dockerfile="$temporary_directory/curl-healthcheck.Dockerfile"
+sed 's#^    CMD \["zinder-projector", "healthcheck"\]$#    CMD curl -fsS http://localhost:9110/readyz || exit 1#' \
+  "$repository_root/deploy/Dockerfile" > "$curl_healthcheck_dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose projector image probes itself with curl" \
+  'release admission rejected: every per-service release image must build on' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$curl_healthcheck_dockerfile"
 
 parallel_publication_workflow="$temporary_directory/parallel-publication-release.yml"
 sed 's/group: release-publication/group: release-${{ github.ref }}/' \

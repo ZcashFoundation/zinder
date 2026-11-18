@@ -21,7 +21,7 @@ services:
       - "127.0.0.1:${ZINDER_EXPLORER_OPS_HOST_PORT:-9069}:9069"
 
   zinder-explorer:
-    image: ${ZINDER_EXPLORER_IMAGE:-zinder-explorer:local}
+    image: ${ZINDER_EXPLORER_IMAGE:-ghcr.io/zcashfoundation/zinder-explorer:${ZINDER_VERSION:-local}}
     mem_limit: ${ZINDER_EXPLORER_MEMORY_LIMIT:-4g}
     ulimits:
       nofile:
@@ -54,7 +54,7 @@ services:
       ZINDER_OPS__LISTEN_ADDR: "[::]:9069"
       ZINDER_SECURITY__ALLOW_PUBLIC_BIND: "true"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:9069/readyz"]
+      test: ["CMD", "zinder-explorer", "healthcheck"]
       interval: 30s
       timeout: 5s
       start_period: 5m

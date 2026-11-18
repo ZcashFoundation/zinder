@@ -161,8 +161,8 @@ if [[ -n "$compose_contract" ]]; then
   jq -e '
     .services as $services
     |
-    def exact_healthcheck($url; $start_period):
-      .test == ["CMD", "curl", "-fsS", $url]
+    def exact_healthcheck($binary; $start_period):
+      .test == ["CMD", $binary, "healthcheck"]
       and .interval == "30s"
       and .timeout == "5s"
       and .start_period == $start_period
@@ -238,10 +238,10 @@ if [[ -n "$compose_contract" ]]; then
     and exact_read_only_bind("zinder-compat-lightwalletd"; "/etc/zinder/config.toml"; "/deploy/config/compat-lightwalletd.toml")
     and exact_read_only_bind("zinder-query"; "/var/run/zinder-control/ingest.token"; "/ingest.token")
     and exact_read_only_bind("zinder-compat-lightwalletd"; "/var/run/zinder-control/ingest.token"; "/ingest.token")
-    and ($services["zinder-ingest"].healthcheck | exact_healthcheck("http://localhost:9105/readyz"; "3h0m0s"))
-    and ($services["zinder-projector"].healthcheck | exact_healthcheck("http://localhost:9110/readyz"; "2h0m0s"))
-    and ($services["zinder-query"].healthcheck | exact_healthcheck("http://localhost:9106/readyz"; "5m0s"))
-    and ($services["zinder-compat-lightwalletd"].healthcheck | exact_healthcheck("http://localhost:9107/readyz"; "5m0s"))
+    and ($services["zinder-ingest"].healthcheck | exact_healthcheck("zinder-ingest"; "3h0m0s"))
+    and ($services["zinder-projector"].healthcheck | exact_healthcheck("zinder-projector"; "2h0m0s"))
+    and ($services["zinder-query"].healthcheck | exact_healthcheck("zinder-query"; "5m0s"))
+    and ($services["zinder-compat-lightwalletd"].healthcheck | exact_healthcheck("zinder-compat-lightwalletd"; "5m0s"))
     and ($services["zinder-projector"].depends_on["zinder-ingest"].condition == "service_healthy")
     and ($services["zinder-compat-lightwalletd"].depends_on["zinder-ingest"].condition == "service_started")
     and ($services["zinder-compat-lightwalletd"].depends_on["zinder-projector"].condition == "service_healthy")
@@ -851,14 +851,11 @@ EOF
   release_image_targets="$(jq -r '.[]' "$release_images_catalog" "$single_volume_images_catalog")"
   image_targets_package_selected_binaries=true
   while IFS= read -r image_target; do
-    image_target_base="$(dockerfile_stage_base "$image_target")"
     image_target_sources="$(
       awk -v stage="$image_target" '$1 == "copy" && $2 == stage { print $3 }' \
         <<< "$dockerfile_stages" | sort -u
     )"
-    if { [[ "$image_target_base" != zinder-runtime-base ]] \
-        && ! grep -Fqx -- "$image_target_base" <<< "$release_image_targets"; } \
-      || [[ -n "$image_target_sources" && "$image_target_sources" != zinder-binaries-selected ]]; then
+    if [[ -n "$image_target_sources" && "$image_target_sources" != zinder-binaries-selected ]]; then
       image_targets_package_selected_binaries=false
     fi
   done <<< "$release_image_targets"
@@ -876,6 +873,43 @@ release admission rejected: the zinder-binaries stage must compile exactly the
 runtime catalog, without the benchmark, and every release image target must
 take its binaries from zinder-binaries-selected, whose archived source is an
 empty stage that fails without its build context.
+EOF
+    exit 1
+  fi
+
+  dockerfile_stage_body() {
+    awk -v stage="$1" '
+      /^FROM / { in_stage = (NF >= 4 && toupper($3) == "AS" && $4 == stage); next }
+      in_stage && !/^[[:space:]]*#/ { print }
+    ' "$dockerfile"
+  }
+  single_volume_image_targets="$(jq -r '.[]' "$single_volume_images_catalog")"
+  image_target_bases_match=true
+  while IFS= read -r image_target; do
+    if [[ "$(dockerfile_stage_base "$image_target")" != zinder-service-base ]] \
+      || ! grep -Fq "    CMD [\"${image_target}\", \"healthcheck\"" <<< "$(dockerfile_stage_body "$image_target")" \
+      || grep -Fq 'curl' <<< "$(dockerfile_stage_body "$image_target")"; then
+      image_target_bases_match=false
+    fi
+  done <<< "$configured_release_images"
+  while IFS= read -r image_target; do
+    image_target_base="$(dockerfile_stage_base "$image_target")"
+    if [[ "$image_target_base" != zinder-runtime-base ]] \
+      && ! grep -Fqx -- "$image_target_base" <<< "$single_volume_image_targets"; then
+      image_target_bases_match=false
+    fi
+  done <<< "$single_volume_image_targets"
+  # The variable reference is the literal Dockerfile text being inspected.
+  # shellcheck disable=SC2016
+  if [[ "$image_target_bases_match" != true ]] \
+    || ! grep -Eq '^ARG DISTROLESS_IMAGE_DIGEST=sha256:[0-9a-f]{64}$' "$dockerfile" \
+    || [[ "$(dockerfile_stage_base zinder-service-base)" != 'gcr.io/distroless/cc-debian12:nonroot@${DISTROLESS_IMAGE_DIGEST}' ]] \
+    || ! grep -Fqx 'USER 1000:1000' <<< "$(dockerfile_stage_body zinder-service-base)"; then
+    cat >&2 <<'EOF'
+release admission rejected: every per-service release image must build on the
+digest-pinned distroless zinder-service-base as UID 1000 and probe itself with
+its own healthcheck subcommand, and every single-volume image must build on the
+Debian zinder-runtime-base that carries its shell entrypoints.
 EOF
     exit 1
   fi
@@ -1035,13 +1069,23 @@ EOF
     || ! grep -Fq "binary_mode=\"\$(stat -c '%a' -- \"\$binary_path\")\"" "$image_packager" \
     || ! grep -Fq 'if [[ "$binary_mode" != "$archive_binary_mode" ]]; then' "$image_packager" \
     || ! grep -Fq 'cmp -- "${binary_root}/${binary_name}" "$image_binary"' "$image_packager" \
-    || ! grep -Fq -- "-c '%a %u:%g %F' \"/usr/local/bin/\${binary_name}\"" "$image_packager" \
-    || ! grep -Fq '[[ "$image_binary_stat" == "${archive_binary_mode} 0:0 regular file" ]]' "$image_packager" \
+    || ! grep -Fqx 'archive_binary_listing_mode=-rwxr-xr-x' "$image_packager" \
+    || ! grep -Fq 'docker container export --output "$smoke_filesystem" "$smoke_container"' "$image_packager" \
+    || ! grep -Fq 'tar --list --verbose --numeric-owner --file "$smoke_filesystem" \' "$image_packager" \
+    || ! grep -Fq '[[ "$image_binary_listing" == "${archive_binary_listing_mode} 0/0" ]]' "$image_packager" \
     || ! grep -Fq -- '--entrypoint "$binary_name" "$smoke_image" --version' "$image_packager" \
+    || ! grep -Fq -- '--entrypoint "$binary_name" "$smoke_image" healthcheck --addr 127.0.0.1:1 \' "$image_packager" \
+    || ! grep -Fq '[[ "$healthcheck_status" -eq 1 ]]' "$image_packager" \
     || ! grep -Fq "jq -r '.[]' <<< \"\$images_json\"" "$image_packager" \
     || ! grep -Fq -- '--build-context "zinder-archived-binaries=${binary_context}"' "$image_packager" \
     || ! grep -Fq -- '--build-arg "ZINDER_BINARIES_SOURCE=zinder-archived-binaries"' "$image_packager" \
     || ! grep -Fq -- '--build-arg "SOURCE_DATE_EPOCH=${source_date_epoch}"' "$image_packager" \
+    || ! grep -Fq 'image_created="$(date -u -d "@${source_date_epoch}" '"'"'+%Y-%m-%dT%H:%M:%SZ'"'"')"' "$image_packager" \
+    || ! grep -Fq -- '--label "org.opencontainers.image.created=${image_created}"' "$image_packager" \
+    || ! grep -Fq -- '--label "org.opencontainers.image.title=${image_name}"' "$image_packager" \
+    || ! grep -Fq -- '--label "org.opencontainers.image.description=${image_description}"' "$image_packager" \
+    || ! grep -Fq -- '--label "org.opencontainers.image.documentation=${image_documentation}"' "$image_packager" \
+    || ! grep -Fq -- '--label "org.opencontainers.image.vendor=Zcash Foundation"' "$image_packager" \
     || ! grep -Fq -- '--provenance=mode=max' "$image_packager" \
     || ! grep -Fq -- '--sbom=true' "$image_packager" \
     || ! grep -Fq 'push) image_output="type=image,name=${registry}/${image_name},push-by-digest=true,name-canonical=true,push=true" ;;' "$image_packager" \
@@ -1053,8 +1097,10 @@ release admission rejected: the release image packager must check the archive
 binary hashes and their regular-file 0755 mode before any image build, package
 every image from the archived-binaries context without compiling or caching,
 compare every image binary with the archive byte for byte and by mode before
-publishing it, build with max-mode provenance and an SBOM, push only in push
-mode, and run each binary inside its image in check mode.
+publishing it, label each image with its catalog description and the commit
+timestamp, build with max-mode provenance and an SBOM, push only in push
+mode, and in check mode verify each installed binary's mode and owner from the
+image filesystem and run its version, help, and healthcheck inside the image.
 EOF
     exit 1
   fi
