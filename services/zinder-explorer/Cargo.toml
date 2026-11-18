@@ -14,7 +14,6 @@ publish.workspace = true
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
 config.workspace = true
-parking_lot.workspace = true
 prost.workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
@@ -49,7 +48,7 @@ hex.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "process", "rt", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "process", "rt", "rt-multi-thread", "test-util", "time"] }
 tokio-stream.workspace = true
 tonic = { workspace = true, features = ["transport"] }
 tracing.workspace = true
