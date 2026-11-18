@@ -1,6 +1,0 @@
-kind: fixed
-body: "`zinder-ingest` with only `[node]` configured now checks at startup that the node's block 0 is the configured network's genesis block, and refuses to start when it is not. Before, only deployments with `[node_fallbacks.N]` ran this check, so a checkpointed build pointed at a node on another chain, such as a Regtest node behind a `zcash-testnet` configuration, could store that chain under the configured network. A refused startup logs `node_endpoints_unavailable` and reports `node_unavailable` with failure class `configuration` on `/readyz`. A node that cannot serve block 0 yet, for example while it is still starting, fails startup as unreachable, as before."
-time: 2026-11-18T19:00:00.000000000Z
-custom:
-    Bump: patch
-    PR: "275"

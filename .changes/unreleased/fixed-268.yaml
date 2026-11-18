@@ -1,6 +1,0 @@
-kind: fixed
-body: "`zinder-compat-lightwalletd` now refuses `Ping` with `FAILED_PRECONDITION` in both serving modes, as reference lightwalletd does unless it is started with `--ping-very-insecure`. Wallet serving previously answered with zero counts, and compact-blocks serving answered `UNIMPLEMENTED`."
-time: 2026-11-18T13:29:00.000000000Z
-custom:
-    Bump: patch
-    PR: "268"
