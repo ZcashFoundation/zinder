@@ -172,6 +172,11 @@ impl ActivationCrossing {
 /// as a node whose table schedules an upgrade earlier than the writer
 /// admitted it would report.
 fn schedule_with_an_earlier_upgrade() -> eyre::Result<NetworkUpgradeActivations> {
+    schedule_activating_nu6_3_at(4)
+}
+
+/// The store's regtest table with NU6.3 moved from height 603 to `height`.
+fn schedule_activating_nu6_3_at(height: u32) -> eyre::Result<NetworkUpgradeActivations> {
     Ok(NetworkUpgradeActivations::new(
         Network::ZcashRegtest,
         sample_regtest_upgrade_activations()
@@ -179,7 +184,7 @@ fn schedule_with_an_earlier_upgrade() -> eyre::Result<NetworkUpgradeActivations>
             .iter()
             .map(|activation| NetworkUpgradeActivation {
                 activation_height: if activation.name == "NU6.3" {
-                    BlockHeight::new(4)
+                    BlockHeight::new(height)
                 } else {
                     activation.activation_height
                 },
@@ -187,6 +192,64 @@ fn schedule_with_an_earlier_upgrade() -> eyre::Result<NetworkUpgradeActivations>
             })
             .collect(),
     )?)
+}
+
+/// Two regtest serving pairs on either side of a writer revision that moves
+/// NU6.3 from height 4 to height 5.
+///
+/// The writer admits the revision at tip 2 and then appends block 3, so a
+/// broadcast under the revision targets height 4, where only the earlier
+/// schedule activates NU6.3.
+struct NextHeightRevision {
+    /// Serves a tip at height 2 under the earlier schedule, so a broadcast
+    /// targets height 3, where both schedules agree.
+    earlier_slot: WalletServingPairSlot,
+    /// Serves a tip at height 3 under the revision, in the chain epoch after
+    /// the one `earlier_slot` serves.
+    revised_slot: WalletServingPairSlot,
+    earlier: NetworkUpgradeActivations,
+    revised: NetworkUpgradeActivations,
+    _stores: [WalletServingStoreFixture; 2],
+}
+
+impl NextHeightRevision {
+    fn new() -> eyre::Result<Self> {
+        let earlier = schedule_activating_nu6_3_at(4)?;
+        let revised = schedule_activating_nu6_3_at(5)?;
+        let mut earlier_store = WalletServingStoreFixture::from_chain(
+            &ChainFixture::new(Network::ZcashRegtest).extend_blocks(2),
+            &earlier,
+        )?;
+        let mut revised_store = WalletServingStoreFixture::from_chain_after_admitted_live_append(
+            &ChainFixture::new(Network::ZcashRegtest).extend_blocks(3),
+            &earlier,
+            &revised,
+        )?;
+        Ok(Self {
+            earlier_slot: serving_pair_slot(&mut earlier_store)?,
+            revised_slot: serving_pair_slot(&mut revised_store)?,
+            earlier,
+            revised,
+            _stores: [earlier_store, revised_store],
+        })
+    }
+
+    /// Verifies an endpoint whose table matches the earlier schedule, at
+    /// position 0, and one whose table matches the revision, at position 1,
+    /// against the earlier pair.
+    async fn verified_endpoints(
+        &self,
+    ) -> eyre::Result<(
+        OrderedBroadcaster<MockTransactionBroadcaster>,
+        MockTransactionBroadcaster,
+        MockTransactionBroadcaster,
+    )> {
+        let on_earlier = accepting_node(0x1a).with_node_activations(self.earlier.clone());
+        let on_revised = accepting_node(0x1b).with_node_activations(self.revised.clone());
+        let nodes = OrderedBroadcaster::new(on_earlier.clone(), [on_revised.clone()]);
+        nodes.verify(&self.earlier_slot).await?;
+        Ok((nodes, on_earlier, on_revised))
+    }
 }
 
 /// Two regtest serving pairs on either side of height 4, the activation
@@ -899,6 +962,95 @@ async fn returning_to_the_earlier_basis_does_not_extend_its_grace() -> eyre::Res
 
     assert!(nodes.verify(&crossing.before_slot).await.is_err());
     assert_eq!(node.capability_probe_count(), 3);
+    assert!(nodes.verified_capabilities().is_none());
+    Ok(())
+}
+
+/// A revision that moves an activation off the broadcast height skips a node
+/// whose table still activates it there while verification waits.
+///
+/// The verification against the revision never returns. An endpoint whose
+/// verified table matches the revision keeps receiving broadcasts until one
+/// minute after the revision was first seen.
+#[tokio::test(start_paused = true)]
+async fn revision_at_the_broadcast_height_skips_the_earlier_table_while_verification_waits()
+-> eyre::Result<()> {
+    let revision = NextHeightRevision::new()?;
+    let (nodes, on_earlier, on_revised) = revision.verified_endpoints().await?;
+    on_earlier.report_unresponsive();
+    on_revised.report_unresponsive();
+
+    let reverification = tokio::spawn({
+        let nodes = nodes.clone();
+        let revised_slot = revision.revised_slot.clone();
+        async move { nodes.verify(&revised_slot).await }
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(on_earlier.capability_probe_count(), 2);
+    assert_eq!(on_revised.capability_probe_count(), 2);
+
+    nodes
+        .broadcast_transaction(RawTransactionBytes::new([0x1a]))
+        .await?;
+    assert_eq!(on_earlier.call_count(), 0);
+    assert_eq!(on_revised.call_count(), 1);
+
+    tokio::time::advance(Duration::from_secs(61)).await;
+    assert!(
+        nodes
+            .broadcast_transaction(RawTransactionBytes::new([0x1b]))
+            .await
+            .is_err()
+    );
+    assert_eq!(on_earlier.call_count(), 0);
+    assert_eq!(on_revised.call_count(), 1);
+    assert!(!reverification.is_finished());
+    reverification.abort();
+    Ok(())
+}
+
+/// A revision that moves an activation off the broadcast height skips a node
+/// whose table still activates it there after an inconclusive verification.
+///
+/// An endpoint whose verified table matches the revision keeps its earlier
+/// verification for one minute counted from the broadcast that first saw the
+/// revision, not from the inconclusive verification 40 seconds later.
+#[tokio::test(start_paused = true)]
+async fn revision_at_the_broadcast_height_skips_the_earlier_table_after_an_inconclusive_verification()
+-> eyre::Result<()> {
+    let revision = NextHeightRevision::new()?;
+    let (nodes, on_earlier, on_revised) = revision.verified_endpoints().await?;
+    let query: BroadcastQuery =
+        WalletServingQuery::from_serving_pair_slot(revision.revised_slot.clone())
+            .with_node_broadcast(Some(nodes.clone()));
+    on_earlier.report_unreachable();
+    on_revised.report_unreachable();
+
+    query
+        .broadcast_transaction(RawTransactionBytes::new([0x1c]))
+        .await?;
+    tokio::time::advance(Duration::from_secs(40)).await;
+    nodes.verify(&revision.revised_slot).await?;
+    query
+        .broadcast_transaction(RawTransactionBytes::new([0x1d]))
+        .await?;
+    assert_eq!(on_earlier.capability_probe_count(), 2);
+    assert_eq!(on_earlier.call_count(), 0);
+    assert_eq!(on_revised.call_count(), 2);
+
+    tokio::time::advance(Duration::from_secs(21)).await;
+    let outcome = query
+        .broadcast_transaction(RawTransactionBytes::new([0x1e]))
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(QueryError::Node(SourceError::NodeUnavailable { .. }))
+        ),
+        "unexpected outcome: {outcome:?}"
+    );
+    assert_eq!(on_earlier.call_count(), 0);
+    assert_eq!(on_revised.call_count(), 2);
     assert!(nodes.verified_capabilities().is_none());
     Ok(())
 }

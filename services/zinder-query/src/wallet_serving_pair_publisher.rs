@@ -631,10 +631,10 @@ impl IngestControlObserver {
 /// verified once it recovers, and an endpoint that answers only when its
 /// request times out delays neither another endpoint's verification nor the
 /// liveness observation. An endpoint is verified again every
-/// `poll_interval`, every two seconds while a repeated verification stays
-/// inconclusive, and at once when a publication changes the pair's schedule
-/// revision or the network upgrade at the height after its tip, or brings
-/// that height to one at which the endpoint's table disagrees with the
+/// `poll_interval`, every two seconds while it holds only a verification of
+/// an earlier basis, and at once when a publication changes the pair's
+/// schedule revision or the network upgrade at the height after its tip, or
+/// brings that height to one at which the endpoint's table disagrees with the
 /// writer-admitted schedule. The verified endpoints are observed every
 /// `poll_interval`, and as soon as an endpoint's verification outcome
 /// changes, in broadcast preference order through `tip_id` and upstream sync

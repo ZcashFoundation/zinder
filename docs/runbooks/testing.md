@@ -669,7 +669,9 @@ within a broadcast, the preferred endpoint, the duplicate-after-timeout
 answer, exclusion and its backoff, and verification after a schedule revision,
 an activation crossing, or a tip that reaches an activation only the node's
 table schedules, an inconclusive repeat that keeps the earlier verification
-until its grace ends on time, a preference that only a failover moves, and
+until its grace ends on time, a revision that moves an activation off the
+broadcast height while the repeat waits on the node or after it is
+inconclusive, a preference that only a failover moves, and
 the endpoint metrics. Lightwalletd's `SendTransaction` mapping of that answer is in `services/zinder-compat-lightwalletd/tests/integration/lightwalletd_grpc.rs`.
 The node probe's per-endpoint schedule, with a standby that never answers
 beside verified endpoints, is covered by the `wallet_node_probe_*` unit tests

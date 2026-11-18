@@ -110,22 +110,23 @@ schedule, at every poll interval until it passes. An endpoint that answers
 only when its request times out therefore delays neither another endpoint's
 verification nor the liveness observation of the verified endpoints.
 
-A passed verification holds while the serving pair's schedule revision and the
-network upgrade active at the height after its visible tip stay the same. A
-revision changes only activations above the tip it was admitted at, and the
-tip can later cross one of them, so the node's table was checked only through
-the earlier height. The node's table can also schedule an upgrade at a height
-where the writer's schedule activates nothing, such as NU7 at 700 when the
-writer schedules it at 703. Crossing such a height changes neither the
-revision nor the writer's upgrade at the broadcast height, so a passed
-verification also records the first height above the checked one at which
-the node's table disagrees with the writer's schedule. A broadcast skips the
-endpoint once the height after the visible tip reaches that height. That
-height comes from the pair of the newest chain epoch that a broadcast or a
-verification has captured, so a request still holding an older pair cannot
-lower it. A change of the revision or of the upgrade, or a tip that
-reaches the endpoint's first disagreement, verifies the endpoint again at
-once. An endpoint that answers verification with
+A passed verification keeps the node's activation table. A broadcast reaches
+the endpoint only while that table agrees with the writer-admitted schedule
+through the height after the visible tip, both taken from the pair of the
+newest chain epoch that a broadcast or a verification has captured, so a
+request still holding an older pair cannot loosen the check. The check runs
+in the reader without contacting the node. A revision changes only
+activations above the tip it was admitted at, and it can move the activation
+at the very height a broadcast targets, such as NU7 from 700 to 703 while the
+tip is 699. From that pair on, a node whose table still schedules NU7 at 700
+receives no broadcast, whatever state its verification is in. The node's
+table can also schedule an upgrade at a height where the writer's schedule
+activates nothing, such as NU7 at 700 when the writer schedules it at 703, and
+the same check stops broadcasts once the tip reaches 699. The node's own table
+can change as well, for example after an operator restarts it, so a change of
+the revision or of the upgrade active at the broadcast height, or a tip that
+reaches a height where the kept table disagrees, verifies the endpoint again
+at once. An endpoint that answers verification with
 positive evidence, a missing `sendrawtransaction` or a disagreeing table, is
 excluded and verified again after a backoff that starts at 30 seconds and
 doubles to 5 minutes, so a node fixed by its operator returns without a reader
@@ -134,16 +135,22 @@ block at the tip height, which a reorg the pair has not published yet also
 produces, leaves the endpoint unverified until its next verification.
 
 The verification that runs when the tip crosses an activation often reaches a
-node that has not received that block yet. Such an inconclusive repeat
-therefore keeps the endpoint's earlier verification for up to one minute, and
-the endpoint is verified again every two seconds, or at the poll interval
-when it is shorter, until it passes, is refused, or the minute ends and it
-becomes unverified. The minute counts from the first inconclusive repeat and
-ends on time, so a broadcast after it skips the endpoint even while a
-verification still waits on the node, and a pair that returns to the earlier
-basis does not renew it. An earlier verification whose table disagrees with
-the writer's schedule at the new height is not kept. Only positive evidence
-excludes an endpoint at once.
+node that has not received that block yet. Until a verification against the
+new basis passes, the endpoint therefore keeps its earlier verification for
+up to one minute, both while that verification waits on the node and after
+it was inconclusive. The endpoint is verified again every two seconds, or at
+the poll interval when it is shorter, until it passes, is refused, or the
+minute ends and it becomes unverified. The minute counts from when a
+broadcast or a verification first captured a pair on the new basis, before
+any node call, and ends on time, so a broadcast after it skips the endpoint
+even while a verification still waits on the node, and a pair that returns to
+the earlier basis does not renew it. An inconclusive repeat against an
+unchanged basis keeps the verification for one minute from the start of that
+repeat. The minute covers only what the reader cannot check without the
+node, whether the node's live table or chain changed: a kept table that
+disagrees with the current schedule through the broadcast height admits no
+broadcast during it, and an inconclusive repeat does not keep that
+verification. Only positive evidence excludes an endpoint at once.
 
 A broadcast tries the verified endpoints in order, starting at the preferred
 one, which is `[node]` until a failover moves it. It moves to the next
@@ -726,10 +733,13 @@ health-blind until it is.
 - 2026-11-18: The node probe verifies each endpoint on its own schedule, so an
   endpoint that hangs until its request timeout no longer delays another
   endpoint's verification or the liveness observation. A passed verification
-  also ends once the height after the tip reaches the first height at which
-  the node's table disagrees with the writer's schedule, even when the
-  writer's schedule activates nothing there, and a broadcast skips the
-  endpoint from that height on.
+  keeps the node's activation table, and every broadcast checks it against
+  the schedule of the newest captured pair through the broadcast height. A
+  revision that moves an activation at that height, or a tip that reaches an
+  activation only the node's table schedules, therefore stops broadcasts to a
+  disagreeing endpoint at once, also while its repeat verification waits or
+  after it was inconclusive. The one-minute grace of an earlier verification
+  counts from when the new basis was first seen.
 - 2026-11-18: Readers broadcast through the ordered node list. An
   `OrderedBroadcaster` replaces `NodeBroadcast`, verifies each endpoint,
   repeats a verification when the schedule revision or the tip's network
