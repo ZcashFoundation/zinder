@@ -156,12 +156,14 @@ where
             "failure_class" => failure_class.label()
         )
         .increment(1);
-        if let Some(node_failover) = self.config.node_failover.as_ref()
-            && let Some(switch) = node_failover
-                .switch_after_failures(failure_class, consecutive_same_class)
-                .await
-        {
-            return Ok(SourceRecovery::Switched(switch));
+        if let Some(node_failover) = self.config.node_failover.as_ref() {
+            let switch = tokio::select! {
+                () = self.cancel.cancelled() => return Ok(SourceRecovery::Cancelled),
+                switch = node_failover.switch_after_failures(failure_class, consecutive_same_class) => switch,
+            };
+            if let Some(switch) = switch {
+                return Ok(SourceRecovery::Switched(switch));
+            }
         }
         Ok(tokio::select! {
             () = self.cancel.cancelled() => SourceRecovery::Cancelled,
@@ -598,7 +600,11 @@ where
         }
         if let Some(node_failover) = follower.config.node_failover.as_ref() {
             observe_fence_for_failover(node_failover, &store, &mut observed_fence_tip)?;
-            if let Some(switch) = node_failover.switch_after_unready().await {
+            let switch = tokio::select! {
+                () = follower.cancel.cancelled() => return Ok(store),
+                switch = node_failover.switch_after_unready() => switch,
+            };
+            if let Some(switch) = switch {
                 source_outage = None;
                 tip_confirmation =
                     follower.after_endpoint_switch(&switch, store.event_fence().visible_tip());

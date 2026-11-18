@@ -23,6 +23,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures_util::{StreamExt as _, stream::FuturesOrdered};
 use parking_lot::Mutex;
 use zinder_core::{BlockHash, BlockId};
 use zinder_runtime::{ActiveNodeEndpoint, ComposedReadiness, ReadinessCause, ReadinessInput};
@@ -649,9 +650,18 @@ where
                 "no standby node endpoint can take over; the follower stays on its endpoint"
             );
         }
-        for (position, evaluation) in candidates {
-            if self.confirm_candidate(position, evaluation).await && self.switch.switch_to(position)
-            {
+        // Every candidate is rechecked at once, so the attempt takes one
+        // switch-check bound however many candidates hang, and the first
+        // candidate in rank order that passes is chosen as soon as it does.
+        let mut confirmations = candidates
+            .into_iter()
+            .map(|(position, evaluation)| async move {
+                let confirmed = self.confirm_candidate(position, evaluation).await;
+                (position, evaluation, confirmed)
+            })
+            .collect::<FuturesOrdered<_>>();
+        while let Some((position, evaluation, confirmed)) = confirmations.next().await {
+            if confirmed && self.switch.switch_to(position) {
                 return Some(self.complete_switch(
                     from_position,
                     position,
@@ -810,6 +820,36 @@ mod tests {
                 failed_switch_after: None,
             }),
         }
+    }
+
+    /// Candidates that hang during the final check cost one switch-check
+    /// bound together, not one each, so the follower's control loop waits
+    /// at most that bound.
+    #[tokio::test]
+    async fn hanging_candidates_share_one_switch_check_bound() {
+        let hanging = CandidateEndpoint {
+            hangs: true,
+            ..CandidateEndpoint::READY
+        };
+        let switch_check_timeout = Duration::from_millis(300);
+        let failover = failover_with_standbys(
+            CandidateEndpoint::READY,
+            vec![hanging, hanging, CandidateEndpoint::READY],
+            NodeFailoverPolicy {
+                switch_check_timeout,
+                ..NodeFailoverPolicy::default()
+            },
+        );
+
+        let started_at = Instant::now();
+        let switch = failover.switch_away("node_unreachable").await;
+        let elapsed = started_at.elapsed();
+
+        assert_eq!(switch.map(|switch| switch.to_position), Some(3));
+        assert!(
+            elapsed < switch_check_timeout.saturating_mul(2),
+            "the switch attempt took {elapsed:?}"
+        );
     }
 
     /// A standby evaluated ready that reports not ready by the time a switch
