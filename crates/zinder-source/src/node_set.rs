@@ -198,6 +198,22 @@ impl<Endpoint> NodeSetSwitch<Endpoint> {
     /// is already active.
     #[must_use = "a refused switch leaves the active endpoint unchanged"]
     pub fn switch_to(&self, position: usize) -> bool {
+        self.switch_to_with(position, || {})
+    }
+
+    /// Makes the endpoint at `position` active and runs `on_switch` as part
+    /// of the same change.
+    ///
+    /// `on_switch` runs only when the switch happens, before any receiver
+    /// from [`NodeSet::subscribe_switches`] is notified, and while the active
+    /// position is locked. A task that publishes while it holds a borrow of
+    /// that receiver therefore publishes either before the switch and its
+    /// effect, or after both. `on_switch` must not use the switch channel.
+    ///
+    /// Returns `false` without a change, and without running `on_switch`,
+    /// when `position` names no endpoint or is already active.
+    #[must_use = "a refused switch leaves the active endpoint unchanged"]
+    pub fn switch_to_with(&self, position: usize, on_switch: impl FnOnce()) -> bool {
         if position > self.inner.fallbacks.len() {
             return false;
         }
@@ -206,6 +222,7 @@ impl<Endpoint> NodeSetSwitch<Endpoint> {
                 false
             } else {
                 *active = position;
+                on_switch();
                 true
             }
         })

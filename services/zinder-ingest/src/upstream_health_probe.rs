@@ -13,10 +13,11 @@
 //! A failed probe keeps the last observation, because an unreachable or
 //! malformed health response is not evidence that the upstream is ready.
 //! When the node failover switches endpoints it resets the input to
-//! `starting`, and the probe observes the new endpoint at once instead of at
-//! its next tick. A switch abandons a probe of the previous endpoint still in
-//! flight, and a probe publishes only while the endpoint it probed is still
-//! active, so only the active endpoint updates the input.
+//! `starting` as part of the switch, before the probe can observe it, and the
+//! probe observes the new endpoint at once instead of at its next tick. A
+//! switch abandons a probe of the previous endpoint still in flight, and a
+//! probe publishes only while the endpoint it probed is still active, so only
+//! the active endpoint updates the input.
 //!
 //! [ADR-0015 §Upstream sync detection]:
 //!     ../../../docs/adrs/0015-phase-driven-ingest.md#upstream-sync-detection
@@ -102,9 +103,10 @@ async fn run_upstream_health_probe_once<Source>(
         probe_outcome = source.poll_upstream_health() => probe_outcome,
     };
     // The borrow holds the switch channel's read lock through the
-    // publication. A switch that landed first is seen here; one that lands
-    // later waits for the lock and then resets the input itself, so a probe
-    // of the previous endpoint never replaces that reset.
+    // publication, and a switch resets the input while it holds the write
+    // lock. A switch that landed first is seen here; one that lands later
+    // waits for the lock, so a probe of the previous endpoint never replaces
+    // that reset, and a probe of the new endpoint always follows it.
     let probed_endpoint_still_active = endpoint_switches.borrow();
     if !probed_endpoint_still_active.has_changed() {
         publish_probe_outcome(probe_outcome, readiness);

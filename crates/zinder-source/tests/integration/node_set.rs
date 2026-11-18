@@ -3,7 +3,13 @@
     reason = "Integration test names describe the behavior under test."
 )]
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -120,6 +126,40 @@ async fn switch_refuses_unknown_positions_and_the_active_one() {
     assert!(switch.switch_to(1));
     assert!(switches.has_changed().unwrap_or(false));
     assert_eq!(*switches.borrow_and_update(), 1);
+}
+
+/// A switch's effect lands before any receiver observes the switch, and a
+/// refused switch runs no effect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_switch_effect_lands_before_receivers_observe_the_switch() -> eyre::Result<()> {
+    let (primary, _) = FixedTipEndpoint::at_height(10);
+    let (fallback, _) = FixedTipEndpoint::at_height(20);
+    let (nodes, switch) = NodeSet::new(primary, [fallback]);
+    let effect_applied = Arc::new(AtomicBool::new(false));
+    let mut switches = nodes.subscribe_switches();
+    let observed_effect = Arc::clone(&effect_applied);
+    let observer = tokio::spawn(async move {
+        switches.changed().await.ok()?;
+        Some(observed_effect.load(Ordering::SeqCst))
+    });
+    // Lets the observer park on the other worker before the switch.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    assert!(!switch.switch_to_with(0, || effect_applied.store(true, Ordering::SeqCst)));
+    assert!(!effect_applied.load(Ordering::SeqCst));
+    assert!(switch.switch_to_with(1, || {
+        // Holds the effect back long enough for an observer woken by the
+        // switch to run first, were it woken before the effect.
+        std::thread::sleep(Duration::from_millis(50));
+        effect_applied.store(true, Ordering::SeqCst);
+    }));
+
+    assert_eq!(
+        observer.await?,
+        Some(true),
+        "a receiver observed the switch before its effect"
+    );
+    Ok(())
 }
 
 #[tokio::test]
