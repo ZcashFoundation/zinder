@@ -7,9 +7,9 @@
 //! one block reaches one endpoint. There is no timed failback: a later switch
 //! walks positions from 0 again, and a restart starts at position 0.
 //!
-//! See [ADR-0013](../../../docs/adrs/0013-source-failure-recovery-topology.md)
+//! See [ADR-0007](../../../docs/adrs/0007-node-failure-recovery-and-transport-policy.md)
 //! for the switch rule and
-//! [ADR-0039](../../../docs/adrs/0039-writer-admitted-network-upgrade-schedules.md)
+//! [ADR-0008](../../../docs/adrs/0008-consensus-parameters-from-the-node.md)
 //! for the activation-table rule.
 
 mod admission;

@@ -904,7 +904,7 @@ PY
 )"
   # The ingest loop honours --target-height and exits cleanly when
   # reached. The same binary handles bulk-catchup and tip-follow in one
-  # process per ADR-0015; the long-running invocation below omits the
+  # process per ADR-0009; the long-running invocation below omits the
   # flag so it continues into FollowingTip after the seed completes.
   if ! (
     cd "$ROOT_DIR"

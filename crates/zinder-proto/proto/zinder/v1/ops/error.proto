@@ -10,7 +10,7 @@
 //
 // See:
 // - docs/reference/error-vocabulary.md
-// - docs/architecture/public-interfaces.md (Error vocabulary)
+// - docs/reference/error-vocabulary.md
 
 syntax = "proto3";
 

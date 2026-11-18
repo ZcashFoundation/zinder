@@ -35,7 +35,7 @@ pub fn container_memory_budget_bytes() -> Option<u64> {
 /// Derives the canonical-reader block-cache size from the container memory budget.
 ///
 /// Rule: `min(budget / 8, 512 MiB)`, floored at 128 MiB when no cgroup limit is
-/// detectable. Direct I/O stays enabled on readers because the ADR-0020
+/// detectable. Direct I/O stays enabled on readers because the ADR-0005
 /// store-size-independence invariant applies to readers just as it does to
 /// writers: without direct I/O the OS page cache grows proportionally to the
 /// CF on-disk size, defeating the purpose of a bounded block cache.

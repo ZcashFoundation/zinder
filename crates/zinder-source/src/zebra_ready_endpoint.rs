@@ -6,11 +6,11 @@
 //! `503 Service Unavailable` with a documented sentinel body otherwise.
 //! See the
 //! [Zebra user guide](https://zebra.zfnd.org/user/health.html) and
-//! [ADR-0015 §Upstream sync detection].
+//! [ADR-0009 §Upstream sync detection].
 //!
 //! [`ZebraJsonRpcSource::poll_upstream_health`]: crate::ZebraJsonRpcSource
-//! [ADR-0015 §Upstream sync detection]:
-//!     ../../../docs/adrs/0015-phase-driven-ingest.md#upstream-sync-detection
+//! [ADR-0009 §Upstream sync detection]:
+//!     ../../../docs/adrs/0009-ingest-lifecycle-and-construction.md#upstream-sync-detection
 
 use std::{borrow::Cow, time::Duration};
 
@@ -64,7 +64,7 @@ impl ZebraReadyClient {
     /// Issues a `GET` against `addr` and returns the parsed snapshot.
     ///
     /// Errors map to `Err` so the caller can fall back to the JSON-RPC
-    /// `verificationprogress` path per ADR-0015 (a transient `/ready`
+    /// `verificationprogress` path per ADR-0009 (a transient `/ready`
     /// outage must not be reported as `upstream_not_ready`).
     pub(crate) async fn probe(
         &self,

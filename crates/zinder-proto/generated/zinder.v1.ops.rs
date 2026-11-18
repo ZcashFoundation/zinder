@@ -239,7 +239,7 @@ pub struct NodeUnavailableDetail {
 /// "we're up to date with Zebra" from "Zebra is itself syncing." The signal
 /// is sourced from Zebra's HTTP `/ready` endpoint when configured, or from
 /// `getblockchaininfo.verificationprogress`/`estimatedheight` as fallback.
-/// See ADR-0015 §Upstream sync detection.
+/// See ADR-0009 §Upstream sync detection.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UpstreamNotReadyDetail {
     /// Upstream's last committed tip height when known.
@@ -303,7 +303,7 @@ pub enum ReadinessCause {
     /// Upstream node is reachable but reports it is itself behind the network
     /// tip. Sourced from Zebra's `/ready` endpoint when configured, or from
     /// `getblockchaininfo.verificationprogress`/`estimatedheight` as fallback.
-    /// See ADR-0015.
+    /// See ADR-0009.
     UpstreamNotReady = 16,
     /// A wallet-serving reader cannot refresh or match its published canonical
     /// and wallet pair, but the pair is still within its staleness ceiling and

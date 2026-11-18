@@ -2,7 +2,7 @@
 //!
 //! The writer reads `listen_addr` to bind the private control-plane
 //! endpoint; the readers read `addr` to connect; both sides read
-//! `bearer_token_path` when ADR-0006 auth is enforced. Sharing one
+//! `bearer_token_path` when ADR-0011 auth is enforced. Sharing one
 //! section means operators configure the secret in one place and
 //! ingest-control discovery works the same way regardless of which
 //! binary is reading it.
@@ -40,7 +40,7 @@ pub struct IngestControlSection {
     /// `http://127.0.0.1:9100`.
     pub addr: Option<String>,
     /// Shared-secret bearer token path enforced on every `IngestControl`
-    /// request when auth is enabled (ADR-0006). The writer reads this
+    /// request when auth is enabled (ADR-0011). The writer reads this
     /// file to verify; the readers read the same file to present.
     pub bearer_token_path: Option<PathBuf>,
     /// File containing the capability token required only for canonical owner
@@ -58,7 +58,7 @@ pub struct ResolvedIngestControlWriter {
     /// Listen address. `None` when the operator opted out via empty
     /// string.
     pub listen_addr: Option<SocketAddr>,
-    /// Bearer token file path, when ADR-0006 auth is enabled.
+    /// Bearer token file path, when ADR-0011 auth is enabled.
     pub bearer_token_path: Option<PathBuf>,
     /// Loaded bearer token, when [`Self::bearer_token_path`] is set.
     pub bearer_token: Option<BearerToken>,
@@ -75,7 +75,7 @@ pub struct ResolvedIngestControlWriter {
 pub struct ResolvedIngestControlReader {
     /// URL the reader dials. Validated as a [`tonic::transport::Endpoint`].
     pub addr: String,
-    /// Bearer token file path, when ADR-0006 auth is enabled.
+    /// Bearer token file path, when ADR-0011 auth is enabled.
     pub bearer_token_path: Option<PathBuf>,
     /// Loaded bearer token, when [`Self::bearer_token_path`] is set.
     pub bearer_token: Option<BearerToken>,

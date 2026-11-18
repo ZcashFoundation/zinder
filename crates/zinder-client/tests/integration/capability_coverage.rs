@@ -36,7 +36,7 @@ fn every_capability_row_has_a_non_empty_string() {
 ///
 /// `ingest.writer.phase_v1` must stay always-on so federated clients can rely
 /// on the writer-phase vocabulary advertised by every Zinder deployment.
-/// ADR-0015.
+/// ADR-0009.
 #[test]
 fn ingest_writer_phase_is_always_on() {
     assert!(

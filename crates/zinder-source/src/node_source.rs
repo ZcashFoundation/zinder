@@ -252,13 +252,13 @@ pub trait NodeSource: Send + Sync + 'static {
     /// Returns an [`UpstreamHealthSnapshot`] each call so the background
     /// probe task can drive the `cause=upstream_not_ready` readiness
     /// payload per
-    /// [ADR-0015 §Upstream sync detection]. The default implementation
+    /// [ADR-0009 §Upstream sync detection]. The default implementation
     /// returns [`SourceError::NodeCapabilityMissing`] so sources that
     /// have not opted in surface a typed failure rather than silently
     /// degrading.
     ///
-    /// [ADR-0015 §Upstream sync detection]:
-    ///     ../../../docs/adrs/0015-phase-driven-ingest.md#upstream-sync-detection
+    /// [ADR-0009 §Upstream sync detection]:
+    ///     ../../../docs/adrs/0009-ingest-lifecycle-and-construction.md#upstream-sync-detection
     async fn poll_upstream_health(&self) -> Result<UpstreamHealthSnapshot, SourceError> {
         Err(SourceError::NodeCapabilityMissing {
             capability: NodeCapability::ReadinessProbe,

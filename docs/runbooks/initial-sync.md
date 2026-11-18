@@ -1,409 +1,123 @@
 # Initial sync
 
-This runbook covers the supported single-host wallet-serving topology. The
-canonical writer constructs and publishes canonical RocksDB, the projector
-builds wallet RocksDB from an authenticated canonical fence, and the native
-query plus lightwalletd compatibility runtimes begin serving only after their
-process-local secondary readers form a wallet-serving pair.
+This runbook is for an operator starting Zinder on empty storage. It explains
+what each runtime does during the first sync, what `/readyz` reports while it
+works, and what to do when the sync stops.
 
-There is no in-place migration from an incompatible store identity or schema.
-Use empty target paths or a certified coherent restore bundle.
+A first sync builds two stores from the node. `zinder-ingest` reads every block
+from genesis into the canonical store. `zinder-projector` then derives the
+wallet store from it. The readers, `zinder-query` and
+`zinder-compat-lightwalletd`, serve traffic only after both stores exist.
 
-## Prerequisites
+On Mainnet the first sync takes many hours.
+[Deploying Zinder](deploying.md#what-you-need) gives the measured times and
+disk.
 
-- A Zebra or Zakura archive node on the selected network with required
-  JSON-RPC capabilities, attached as described in
-  [Deploying on a VM](deploying-on-a-vm.md#deploy-with-compose). See
-  [Archive node required for ingest](#archive-node-required-for-ingest).
-- Enough local storage for canonical data, wallet state, staging, compaction,
-  checkpoints, and growth reserve.
-- Stable canonical and wallet primary paths on one host filesystem.
-- Unique secondary metadata roots for projector, native query, and compatibility.
-- Stable projector build-owner identity and private control bearer tokens.
-- Resource limits that leave headroom outside RocksDB caches and memtables.
+## Before you start
 
-For Z3-managed nodes, start and synchronize the selected Z3 network before
-starting Zinder. The example uses the Z3 Testnet env file; pick the file for
-your node and network from the table in the VM runbook.
+- The node is an archive node on the right network and has finished its own
+  sync. Ingest refuses a pruned node.
+- The canonical and wallet storage paths are empty or absent. Zinder does not
+  migrate a store built with an incompatible identity or schema in place.
+- `ZINDER_PROJECTOR_BUILD_OWNER_HEX` (`projector.build_owner_hex`) has a
+  value that stays the same across restarts.
 
-## Start the stack
+## Start and watch the sync
 
-```bash
-docker compose \
-  --env-file deploy/.env.testnet \
-  -f deploy/docker-compose.yml \
-  up -d --build
-```
+1. Start the stack with the env file for your node and network:
 
-The dependency order is ingest, projector, then both serving runtimes, but
-container start does not imply traffic readiness. Compose keeps each expected
-initial construction in Docker's `starting` state for the corresponding
-production hard gate: three hours for canonical construction, two hours for
-wallet construction, and five minutes for each serving reader. A process that
-is still non-ready after its grace period becomes unhealthy and stops the
-dependency chain. Follow all four operational endpoints:
+   ```bash
+   docker compose --env-file deploy/.env.testnet \
+     -f deploy/docker-compose.yml up -d
+   ```
 
-```bash
-curl -sS http://127.0.0.1:19105/readyz  # ingest
-curl -sS http://127.0.0.1:19110/readyz  # projector
-curl -sS http://127.0.0.1:19106/readyz  # native query
-curl -sS http://127.0.0.1:19107/readyz  # compatibility
-```
+   Compose starts ingest first, the projector once ingest is healthy, and the
+   two readers once the projector is healthy. The command can wait for hours
+   while it does this.
 
-## Canonical construction
+2. Poll each runtime's `/readyz` and make the two test calls, as in steps 5
+   and 6 of the
+   [Docker Compose quickstart](deploying.md#quickstart-with-docker-compose).
+   [Readiness](../reference/readiness.md#readiness-causes) explains each
+   cause that `/readyz` reports.
 
-On an empty canonical path, ingest creates a sibling construction staging
-directory, fixes a source range, loads and validates it, publishes a baseline
-fence, installs it at the configured path, and starts continuous following.
-The configured path does not become a ready store until publication succeeds.
+The startup log line with `phase=ready` means a process finished starting. It
+does not mean the process is ready for traffic.
 
-The checked ingest configuration uses `coverage = "wallet-serving"` and
-explicitly sets `explorer_views = false`. The writer uses the
-genesis block as the authenticated predecessor and retains
-every block from height one. This is required for transparent predecessor
-resolution even though shielded wallet data begins at later activation heights.
-An explicit checkpoint remains available only for non-wallet-serving workloads
-and must carry the required predecessor tree state and source identity.
+## Phases
 
-Useful canonical metrics:
+| Phase | Runtime | What it does | `/readyz` while it runs | How to see progress |
+| --- | --- | --- | --- | --- |
+| Node checks | ingest | Checks the node's network, genesis block, archive storage, and network-upgrade table | `starting` | Startup log lines with `phase=connect_node` and `phase=check_schema` |
+| Canonical construction | ingest | Fixes a target tip, loads every block up to it into `<canonical>.building`, then publishes and moves it to the canonical path | `syncing`, `phase` `bulk_catchup`, `target_height` set to the fixed tip | `zinder_ingest_source_segment_connected_blocks_total` rises; `<canonical>.building` grows. Logs `canonical_fresh_construction_started`, then `canonical_fresh_construction_ready` |
+| Canonical catch-up | ingest | Follows the blocks the node produced during construction and loads the node's mempool | `syncing` until the lag is at most `ingest.follow.lag_threshold_blocks` (default 1) and the first mempool snapshot is complete | `zinder_ingest_canonical_tip_height` rises and `zinder_ingest_canonical_lag_blocks` falls |
+| Wallet build start | projector | Opens its canonical secondary, waits until it matches the writer exactly, and takes its build leases | `syncing`; `replica_lagging` or `writer_status_unavailable` after each `projector.fence_convergence_timeout_seconds` attempt | It retries and does not exit |
+| Wallet construction | projector | Builds the wallet store from the canonical store, spilling sorted data to `<wallet>.projection-load-staging` | `syncing`, `target_height` set to the canonical tip | No progress metric. The staging directory grows. Logs `wallet_projection_construction_complete` with `build_seconds` when done |
+| Wallet catch-up | projector | Applies canonical blocks committed during the build, then follows | `syncing` until the wallet matches the canonical tip | `current_height` approaches `target_height` |
+| Serving admission | query, compat | Opens matching canonical and wallet secondaries and checks that they describe the same chain | `starting`, `replica_lagging`, `writer_status_unavailable`, or `canonical_tip_unconfirmed` | Compose allows each reader five minutes to become `ready` |
 
-- `zinder_ingest_source_fetch_queue_requests`
-- `zinder_ingest_source_fetch_queue_bytes`
-- `zinder_ingest_canonical_tip_height`
-- `zinder_ingest_canonical_lag_blocks`
-- `zinder_ingest_canonical_historical_prevout_reads_total`
-- `zinder_ingest_canonical_cross_block_wallet_reads_total`
+`<canonical>` is ingest's `storage.path`, which the projector reads as
+`storage.canonical_path`. `<wallet>` is the projector's `wallet.path`. The
+reference configs under `deploy/config/` set them to
+`/var/lib/zinder/canonical` and `/var/lib/zinder/wallet`. Outside those
+configs, set `storage.path` explicitly. The ingest binary's own default is
+`/var/lib/zinder/store`, which differs from the projector's default
+`storage.canonical_path`.
 
-The last two counters must remain zero.
+## When each runtime becomes ready
 
-If the process stops during construction, restart it with the same
-configuration. A published staging store is installed and reopened. An
-unpublished staging store is removed and reconstructed. Do not manually move
-or edit the staging directory while the owner is running.
+[Readiness](../reference/readiness.md#per-runtime-readiness) lists when each
+runtime turns ready. Send traffic only after all four `/readyz` endpoints
+return 200 and the two test calls from step 2 succeed. To serve wallets on the
+internet, see [Exposing over TLS](exposing-over-tls.md).
 
-### Archive node required for ingest
+## Restarts during the first sync
 
-Ingest reads every historical block body, so it requires a node that stores
-all of them. At startup it reads `pruned` from `getblockchaininfo` and refuses
-a node that reports `pruned: true` or omits the field. Readiness reports
-`node_capability_missing` for capability `historical_block_bodies`, ingest
-logs that the node reports pruned storage, and the process exits before it
-touches the store.
+A restart during construction does not resume it. What survives depends on
+what was published before the process stopped:
 
-The check applies on every start, including a restart of an already-built
-store, even though following only needs recent blocks. Point ingest at an
-archive node; native query and lightwalletd compatibility may keep using a
-pruned node.
+| Stopped while | On restart |
+| --- | --- |
+| Ingest was loading blocks | Ingest deletes `<canonical>.building`, logs `canonical_unpublished_construction_restarted`, and builds again from genesis to a new target tip |
+| Ingest had published but not yet moved the store into place | The next start installs the published store and does not rebuild it. A clean stop during publication waits for publication to finish |
+| The projector was building | The published canonical store is kept. The projector discards the unpublished wallet store, logs `wallet_projection_unpublished_build_discarded`, and builds the wallet store again from the beginning |
+| Any runtime, after its store was published | The runtime reopens its store and continues following |
 
-A Zakura node built by verified-commitment-trees fast sync is an archive node
-for block bodies but never wrote per-height commitment trees or subtree roots
-below its last checkpoint. That band exists only on Mainnet. Reads inside the
-band fail with failure class `capability_missing`, and retrying against the
-same node never succeeds:
+A clean stop and a crash behave the same, so an out-of-memory kill restarts
+the interrupted build from the beginning. Fix the cause first, or the next
+attempt fails at the same point.
 
-- During construction, a checkpoint or subtree-range read inside the band
-  stops initial sync, and the process exits with the error. Restarting against
-  the same node fails the same way.
-- While following, a tree-state read inside the band reports
-  `node_unavailable` with that class and retries on the 10-second
-  operator-action backoff.
-- Native query and lightwalletd compatibility read tree states from the
-  store, never from the node, so the band does not reach their clients.
+A stop request ends construction at the next block. Two final stages cannot be
+interrupted: finalizing the store files and publication. On a long chain,
+finalization can outlast the supervisor's grace period, and the kill that
+follows counts as a crash.
 
-Use a node synchronized without fast sync, or one that serves the band from
-its historical frontier artifact.
+The first sync does not fail over to `[node_fallbacks.N]` endpoints. Ingest
+retries a failed node request a bounded number of times. If the node stays
+unavailable longer, ingest exits and canonical construction starts over. The
+restart begins on the first endpoint that passes its checks.
 
-## Wallet construction
+Do not move, edit, or delete staging directories by hand. Each runtime
+removes its own unpublished staging on the next start.
 
-Projector opens canonical storage through its own secondary, waits for the
-writer to attest the secondary's exact fence, and binds a wallet build plan to
-that source identity. A projector that resumes a published wallet instead
-follows its secondary as soon as it holds blocks the wallet has not applied. While the
-writer commits ahead of the secondary, it retries and reports `syncing` once
-the lag lasts longer than one second. An attempt that lasts
-`projector.fence_convergence_timeout_seconds` reports `replica_lagging` and
-starts another attempt; the projector does not exit for lag. It acquires
-a wallet projection build lease and a writer-owned canonical retention lease,
-then builds the wallet store in its owned path.
+## Problems
 
-Construction sorts transparent outputs, spends, and address rows externally.
-Each sorter spills to a staging directory beside the wallet store, up to
-`projector.build.max_temporary_file_bytes_per_sorter` bytes. The default is
-206158430208 (192 GiB). A sorter that spills more than one run needs about
-twice its spilled bytes, because its final merge writes every record again
-while the input runs still exist. In late 2026, the largest sorter of a Mainnet
-build from genesis, the outpoint sorter, needed about 99 GB.
-
-The ceiling applies to each sorter separately, but the staging directory holds
-several sorters' files and the finished SST files at the same time. While the
-outpoint sorter's merged run is read, the address sorters and the spent-output
-SST files grow beside it. The address-transaction sorter then merges while
-those SST files remain. In a November 2026 Mainnet build from genesis, staging
-peaked at about 117 GB near the end of the outpoint drain, and at about 110 GB
-during the address-transaction merge. Keep about 130 GB free on the volume when
-wallet construction starts. The finished wallet store keeps part of that space. The
-ceiling does not check free space, so an undersized volume fails with a
-disk-full error late in construction.
-
-If the ceiling is too small, the projector stops as soon as a sorter's final
-merge can no longer fit, which is usually while the canonical scan is still
-running. The figure in that error covers only the records sorted so far, so it
-is not a target: unset the setting to use the default, or raise it well above
-that figure. A sorter refused after its input ended reports its exact
-requirement instead. A restart with the same setting fails the same way.
-
-Wallet publication requires the complete build digest and source position to
-match the admitted canonical fence. The projector then catches up and takes
-continuous following ownership before releasing construction leases.
-
-For checkpointed canonical history, construction begins at the exact
-authenticated first retained block rather than assuming height one. Every
-transparent spend in the retained range must still resolve to an output in
-that range; an unresolved pre-checkpoint prevout fails the build closed because
-no transparent prefix state is carried by the checkpoint.
-
-The `wallet-serving` coverage profile therefore uses complete non-genesis
-history, with height zero as the authenticated predecessor and height one as
-the first retained block. A shielded activation checkpoint is insufficient for
-the global transparent projection because later transactions may spend outputs
-created before that activation. If a READY store starts later than the coverage
-requested at startup, ingest rejects it; rebuild the canonical and wallet stores
-instead of attempting to follow the narrower store forward.
-
-Restarting projector is safe. Lease generation, build state, source identity,
-and ready evidence are persisted.
-
-Both construction leases belong to the configured `projector.build_owner_hex`.
-After a crash during construction, a restart with the same owner value resumes
-at once:
-
-1. It discards the unpublished wallet store, including its live build lease,
-   and logs `wallet_projection_unpublished_build_discarded`.
-2. It reclaims its canonical retention lease at a higher generation.
-3. It builds again from the current canonical fence under a new wallet build
-   lease.
-
-The restart does not wait for `projector.lease_duration_seconds` to elapse.
-
-A second projector cannot build the same wallet path concurrently:
-
-- While one projector builds or discards the wallet path, another fails with
-  `wallet projection build at <path> is in progress in another running process`.
-  The lock behind this error is the `<wallet>.build-lock` file beside the
-  wallet path. The operating system releases it when the process exits, so it
-  never outlives a crash. Do not delete the file.
-- A projector with a different owner value is refused until the live lease
-  expires.
-
-A crash before the wallet store exists can leave
-`<wallet>.projection-load-staging` or `<wallet>.initializing` beside the absent
-wallet path. The next construction removes them before it starts.
-
-Give each concurrently running projector its own owner value. Projectors that
-share one value interrupt each other's builds instead of being refused.
-
-### Construction refused by another owner
-
-The projector can exit with this error:
-
-```text
-wallet projection build lease is held by owner <owner> until <expiry>
-```
-
-The unpublished wallet store then belongs to an owner value other than the
-configured one. This usually means `projector.build_owner_hex` changed between
-runs. Recover in one of these ways:
-
-- Set `projector.build_owner_hex` back to the reported owner and restart the
-  projector. It reclaims the build immediately.
-- Keep the new value and restart the projector after the reported expiry. It
-  then discards the store and builds again.
-
-Do not delete the unpublished wallet store by hand to skip the wait. The
-reported owner may be a projector that is still running. The canonical
-retention lease of an earlier owner expires on its own and does not block a
-new owner.
-
-## Wallet-serving admission
-
-Native query and compatibility each maintain generation-specific canonical and
-wallet secondaries. Each runtime catches both up, validates source identity and
-event position, and publishes one immutable `WalletServingReadPair`. Only then
-does its `/readyz` report ready and its gRPC readiness interceptor admit traffic.
-
-Probe a data-bearing method after readiness:
-
-```bash
-grpcurl -plaintext -d '{}' 127.0.0.1:19102 \
-  zinder.v1.wallet.WalletQuery/ServerInfo
-grpcurl -plaintext -d '{}' 127.0.0.1:19067 \
-  cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo
-```
-
-An open canonical secondary plus an open wallet secondary is not sufficient.
-The pair must agree on network, reorg policy, canonical source identity, event
-fence, and wallet digest.
-
-## Expected readiness states
-
-| Runtime | Normal initial state | Ready boundary |
+| Symptom | Cause | Action |
 | --- | --- | --- |
-| ingest | `starting`, `syncing`, or `upstream_not_ready` | Canonical lag is within threshold, mempool snapshot is complete, and a configured `[node.health]` probe reports Zebra ready |
-| projector | `starting` or `syncing` | Wallet store is published and following the admitted canonical source |
-| native query | `starting`, `replica_lagging`, `writer_status_unavailable`, or `canonical_tip_unconfirmed` | One exact canonical and wallet pair is published, and the writer has confirmed its tip against its node and does not report a park |
-| compatibility | `starting`, `replica_lagging`, `writer_status_unavailable`, or `canonical_tip_unconfirmed` | One exact canonical and wallet pair (or, for compact-block serving, one canonical reader) is published, and the writer has confirmed its tip against its node and does not report a park |
+| Ingest exits at startup. `/readyz` showed `node_capability_missing` for `historical_block_bodies` | The node is pruned or does not report its storage mode | Point ingest at an archive node |
+| Ingest or the projector restarts repeatedly with exit code 137 | The container ran out of memory | Lower the limiting budget as described in [Bulk-catchup resource tuning](bulk-catchup-resource-tuning.md), or raise the container limit |
+| On Mainnet, `docker compose up` reports `zinder-ingest` unhealthy after three hours | Canonical construction outlasted the Compose health-check start period. Compose does not restart the container for this | Wait until ingest `/readyz` returns 200, then run the same `docker compose up -d` again to start the other runtimes |
+| The single-volume container exits during construction on Mainnet | Construction outlasted the image's construction deadline | Raise the deadlines as described in [Deploying on a single volume](deploying-single-volume.md) |
+| Construction stops on Mainnet with failure class `capability_missing` on a tree-state or subtree read | The node is a Zakura node built by fast sync, which never stored per-height trees below its last checkpoint | Use a node synchronized without fast sync |
+| Projector exits with `wallet construction needs ... temporary bytes in one sorter` or `stopped a sorter whose input had not ended` | `projector.build.max_temporary_file_bytes_per_sorter` is below what a sorter needs. The figure in the second message is a lower bound | Unset the key to use the default (206158430208, 192 GiB), or raise it well above the reported figure. Make sure that much space is free |
+| Projector fails with a disk-full error late in wallet construction | The volume has too little free space for the sorters' spill files | Free or add space. On Mainnet keep about 130 GB free when wallet construction starts |
+| Projector exits with `wallet projection build lease is held by owner <owner> until <expiry>` | `projector.build_owner_hex` changed since the build started | Set it back to the reported owner and restart, or restart after the reported expiry |
+| Projector exits with `wallet projection build at <path> is in progress in another running process` | A second projector uses the same wallet path | Stop the second projector. Do not delete the `<wallet>.build-lock` file |
+| Projector stays at `replica_lagging` or `writer_status_unavailable` | Its canonical secondary cannot catch up with ingest, or ingest's control endpoint is unreachable | Check that ingest is running and that both use the same control token |
+| Query and compatibility stay at `canonical_tip_unconfirmed` | Ingest has not reached the node since it started | Restore the node. Restarting the readers does not help |
 
-After the first publication, a reader that loses writer status or falls behind
-reports `serving_pair_stale` and keeps answering from its published pair until
-the staleness ceiling passes; only then does it fall back to
-`writer_status_unavailable` or `replica_lagging` and stop admitting traffic.
-
-A parked canonical writer keeps answering writer status with its frozen fence
-and its halt. Native query and both compatibility serving modes then report
-`reorg_window_exceeded` and refuse wallet traffic with
-`REORG_WINDOW_EXCEEDED`, never `ready` on the frozen tip.
-
-After ingest restarts, native query and both compatibility serving modes
-report `canonical_tip_unconfirmed` until ingest's first source observation
-confirms the store's tip against the node, which normally takes one poll. If
-ingest cannot reach the node, they stay unready for as long as the outage
-lasts; restore the node rather than restarting the readers. A writer that
-finds a fork deeper than the window on that first observation parks, and the
-readers move straight to `reorg_window_exceeded`.
-
-A node restart can move the node's tip back below ingest's settled tip, for
-example when Zebra cannot restore its unfinalized blocks and restarts from its
-finalized tip. When that tip is a block ingest already holds, ingest reports
-`node_unavailable` with class `upstream_view_changed` and waits for the node to
-re-verify past its tip; it parks only when the node's tip is on another
-branch.
-
-Native query and compatibility do not wait for their node or, for native
-query, ingest control. Until each probe reports healthy, the `/readyz` body
-lists it under `degraded` with cause `starting`, and the runtime still admits
-traffic once its pair is published. Afterwards, `node_unavailable`,
-`upstream_not_ready`, and `ingest_control_unavailable` appear there as
-recoverable dependency conditions, and only the requests that call the
-dependency fail. For native query, inspect the classified
-`ingest_control_health_unavailable` warning and restore the admitted writer
-endpoint, authentication, writer status, or tip-coherent mempool snapshot. Startup identity, network, contract-revision,
-or required-capability mismatches fail before traffic binds and require
-configuration or deployment correction rather than health-probe retries.
-`schema_mismatch`, `reorg_window_exceeded`, corrupt store errors, and source
-identity mismatches require operator action.
-
-### Reorg-window sizing
-
-The default reorg window is 1000 blocks, the depth past which Zebra 7 and
-Zakura finalize blocks. Neither node can present a deeper reorg, so ingest
-parks with `reorg_window_exceeded` only on a change the node itself could not
-produce, such as a replaced or resynced node. The window is not a consensus
-finality guarantee.
-
-Zebra 7.1.0 can finalize earlier, keeping as few as 100 non-finalized blocks,
-when the index entries of its non-finalized chains pass 6,200,000 on Mainnet
-or 2,000,000 on test networks. The node then presents only shallower reorgs,
-which the 1000-block window still covers, so the window needs no change. The
-node's `state.memory.index.entries` gauge shows how close it is to the cap, and
-its `state.memory.fork.evicted.count` counter and `the fork limit evicted a
-chain` warning record evicted forks. A node that finalized early on a branch
-the network later abandons cannot reorg back. Resync or replace it, and ingest
-then follows the network's branch, or parks if the fork is deeper than the
-window.
-
-A smaller window parks on reorgs the node can produce. On 2026-07-20, a Zcash
-testnet mining race produced a 114-block reorg after the losing branch had
-remained visible for more than an hour, which exceeded the 100-block window
-then in use. Production testnet moved to 300 blocks, and the node's bound is
-higher still.
-
-A replacement commits atomically, so ingest holds its whole suffix, up to one
-window of blocks, in memory first: the raw blocks fork discovery fetched, then
-their prepared form. `ingest.follow.max_replacement_bytes` (2 GiB by default)
-bounds the estimated sum of both, so set it within the container's memory with
-headroom for the one block being decoded. A replacement that would exceed it
-fails before any write with `ReplacementBytesExceeded`, naming the depth, the
-blocks prepared (zero when discovery alone exceeded it), and the bytes held. A fork deeper than the window still parks with
-`reorg_window_exceeded` even when discovery exhausts the budget.
-This is not a park: ingest exits, and under the wallet-serving image's
-`ALWAYS` restart policy the container restarts, discovers the same fork, and
-fails again, with wallets seeing an unavailable service instead of
-`REORG_WINDOW_EXCEEDED`. Raise the limit to follow the reorg.
-
-The settled tip trails the visible tip by the window, so surfaces that report
-settlement or finality report it 1000 blocks behind the visible tip. Wallet
-undo rows scale with the window; construction accounts for them against
-`projector.build.max_accounted_reorg_undo_bytes`. Configure the same window for
-ingest, projector, native query, and compatibility admission.
-
-Upgrading to a release whose default is 1000 blocks raises existing stores the
-first time ingest starts, when the deployment relies on the default, the shipped
-`deploy/config` files, or the wallet-serving image. That raise is irreversible
-in place, so capture a state bundle before starting the new release if you need
-a rollback path.
-
-To raise the window on an existing deployment, restart the canonical writer
-with the larger window first, then restart the projector, native query, and
-compatibility with the same value. The writer records the raise in place and
-holds the settled tip until the visible tip is a full new window above it, so
-replaceable depth grows with new blocks rather than all at once. The projector
-raises the wallet's undo depth when it resumes. A reader still on the old
-window refuses to open or to catch up until it restarts with the new one.
-Earlier releases cannot open a raised store. If you might need to roll back
-to an earlier Zinder release, capture a state bundle or keep a certified
-side-by-side lane before raising. Lowering the window
-in place is refused; rebuild, or restore a state captured under the smaller
-window. See [ADR-0041](../adrs/0041-reorg-window-follows-the-node-bound.md).
-
-When a replacement exceeds the configured window, ingest drains readiness and
-parks for operator inspection until termination. Restarting does not make the
-settled store replaceable. Confirm the authoritative branch and the node's
-health, then rebuild or restore a coherent state bundle before returning the
-service to traffic.
-
-## Memory and storage pressure
-
-Watch cgroup memory, RocksDB block cache, memtables, WAL bytes, pending
-compaction, write-stop state, construction queue reservations, and disk free
-space. Store size must not determine process RSS.
-
-Explorer view replay pauses on its own when the volume holding the canonical
-store has less available space than `ingest.explorer_views_min_free_bytes`
-(10 GiB by default). Ingest logs `materialized_view_replay_volume_space_low`
-and `zinder_materialized_view_replay_volume_space_low` reads `1`. Canonical
-ingest and wallet serving keep running. Free or add space, and replay resumes
-from its persisted position once at least a tenth more than the floor is
-available. Raise the floor when other writers on the volume, such as a wallet
-rebuild, need more headroom.
-
-If construction approaches its memory boundary, stop the owner cleanly and
-reduce the source-request, reserved-response, preparation, or RocksDB budgets
-before restarting. Do not delete an admitted ready store merely to change a
-runtime resource limit. See
-[Bulk-catchup resource tuning](bulk-catchup-resource-tuning.md).
-
-## Recovery and restart order
-
-For ordinary process restarts, start owners before readers:
-
-1. `zinder-ingest`
-2. `zinder-projector`
-3. `zinder-compat-lightwalletd`
-
-Readers remain unready until their owner and secondary contracts recover. Do
-not replace this with manual directory copies or primary-read shortcuts.
-
-For disaster recovery, restore a coherent canonical and wallet state bundle
-into fresh paths and require cold owner admission plus normal wallet-serving
-admission. Independently timed RocksDB copies are not a wallet-serving backup.
-
-## Production acceptance
-
-A successful initial sync proves only the observed construction and admission
-run. Production acceptance also needs current evidence for sustained following,
-bounded reorg replacement, coherent restore, capacity headroom, restart
-behavior, mempool recovery, TLS routing, and the exact independent client and
-network being advertised.
-
-See [Testing](testing.md), [Service operations](../architecture/service-operations.md),
-and [ADR-0035](../adrs/0035-canonical-storage-topologies.md).
+Readiness causes that need an operator, such as `schema_mismatch` and
+`reorg_window_exceeded`, are described in
+[Readiness](../reference/readiness.md#readiness-causes). Ordinary restarts
+and recovery after the first sync are covered in
+[Service operations](../architecture/service-operations.md#recovery).

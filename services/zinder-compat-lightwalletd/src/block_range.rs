@@ -13,7 +13,7 @@
 //! form one chain. Otherwise a reorg replaced a block the stream needs, and
 //! the stream ends after the blocks it already sent with the code lightwalletd
 //! returns for the same case: `ABORTED` for a broken link, and `OUT_OF_RANGE`
-//! when the visible tip fell below a height still to send. ADR-0038,
+//! when the visible tip fell below a height still to send. ADR-0015,
 //! "Compatibility block-range streams", records the contract.
 //!
 //! A stream holds one slot of a process-wide [`BlockRangeStreamLimit`] from

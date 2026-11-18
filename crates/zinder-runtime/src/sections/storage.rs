@@ -1,7 +1,7 @@
 //! Shared `[storage]` config section.
 //!
 //! Reader shapes mirror the storage boundaries documented in
-//! [ADR-0003](../../../../docs/adrs/0003-canonical-storage-access-boundary.md):
+//! [ADR-0003](../../../../docs/adrs/0003-epoch-bound-reads-and-storage-roles.md):
 //!
 //! - [`SecondaryStorageSection`] for readers that open both canonical and
 //!   materialized-view stores (`zinder-query`, `zinder-explorer`).
@@ -28,7 +28,7 @@ const DEFAULT_SERVING_PAIR_STALENESS_CEILING_MS: u64 = 300_000;
 /// Raw role-scoped `rocksdb` sub-section.
 ///
 /// Surfaces the bounded `RocksDB` resource budget described in
-/// [ADR-0020](../../../../docs/adrs/0020-bounded-rocksdb-resource-budget.md).
+/// [ADR-0005](../../../../docs/adrs/0005-bounded-process-memory.md).
 /// Operators override any subset of fields; unspecified fields fall through
 /// to the role default selected by the resolver.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

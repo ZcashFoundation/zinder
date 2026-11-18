@@ -3,14 +3,14 @@
 //! The canonical writer selects construction or follow from the store
 //! lifecycle in `writer/mod.rs`. [`classify_phase`] reports which
 //! [`IngestPhase`] a store tip and an upstream tip correspond to, using the
-//! gap rules from [ADR-0015](../../../docs/adrs/0015-phase-driven-ingest.md).
+//! gap rules from [ADR-0009](../../../docs/adrs/0009-ingest-lifecycle-and-construction.md).
 
 use zinder_runtime::IngestPhase;
 
 /// Classifies the [`IngestPhase`] that a store tip and an upstream tip
 /// correspond to.
 ///
-/// Rules per [ADR-0015 §Decision]:
+/// Rules per [ADR-0009 §Decision]:
 ///
 /// - [`IngestPhase::AwaitingUpstream`] when `upstream_tip == 0`. Models
 ///   regtest near genesis and freshly initialized nodes: there is no
@@ -24,8 +24,8 @@ use zinder_runtime::IngestPhase;
 /// (local reorg in progress, `invalidateblock` race) collapses the gap
 /// to zero via saturating subtraction and lands in `FollowingTip`.
 ///
-/// [ADR-0015 §Decision]:
-///     ../../../docs/adrs/0015-phase-driven-ingest.md#decision
+/// [ADR-0009 §Decision]:
+///     ../../../docs/adrs/0009-ingest-lifecycle-and-construction.md#decision
 #[must_use]
 pub fn classify_phase(
     store_tip: Option<u32>,

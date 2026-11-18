@@ -107,7 +107,7 @@ pub const CANONICAL_STORE_SCHEMA_VERSION: u16 = 7;
 /// structured scan data for mined and mempool transactions, in addition to
 /// complete semantic replay envelopes and projection facts.
 /// Hash-shaped protobuf fields use RPC byte order as defined by
-/// [ADR-0024](../../../docs/adrs/0024-wire-format-rpc-byte-order.md).
+/// [ADR-0002](../../../docs/adrs/0002-serialization-and-byte-order.md).
 pub const CURRENT_ARTIFACT_SCHEMA_VERSION: ArtifactSchemaVersion = ArtifactSchemaVersion::new(20);
 /// Global block-height cadence for typed commitment-tree checkpoints.
 ///

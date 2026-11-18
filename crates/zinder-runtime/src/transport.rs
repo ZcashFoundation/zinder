@@ -3,8 +3,8 @@
 //! Every long-lived gRPC channel between two Zinder services (explorer ↔
 //! query, query ↔ ingest, compat ↔ ingest) is built through
 //! [`connect_zinder_grpc`]. The function attaches the
-//! [`BearerTokenClientInterceptor`] required by ADR-0006, configures the
-//! HTTP/2 + TCP keep-alive policy that ADR-0019 requires, and returns the
+//! [`BearerTokenClientInterceptor`] required by ADR-0011, configures the
+//! HTTP/2 + TCP keep-alive policy that ADR-0007 requires, and returns the
 //! [`AuthenticatedChannel`] callers wrap in their service-specific client.
 //!
 //! Direct construction of a [`tonic::transport::Endpoint`] outside this
@@ -14,7 +14,7 @@
 //!
 //! Zebra-facing transports live in `zinder-source::transport`; this
 //! module is intra-Zinder only, per the boundary declared in
-//! `lib.rs` ("deliberately exposes no domain types") and ADR-0004.
+//! `lib.rs` ("deliberately exposes no domain types") and ADR-0006.
 
 use std::time::Duration;
 
@@ -32,7 +32,7 @@ use crate::auth::{
 /// restarted reports healthy while `.await`s hang indefinitely (tonic
 /// issues #1254 and #1635). Both endpoints of intra-Zinder traffic are
 /// Zinder processes that permit keep-alive-without-calls, so the
-/// aggressive 30-second cadence is safe here. See ADR-0019.
+/// aggressive 30-second cadence is safe here. See ADR-0007.
 const ZINDER_GRPC_HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Maximum time a single HTTP/2 keep-alive ping waits for an ACK before
@@ -47,8 +47,8 @@ const ZINDER_GRPC_TCP_KEEPALIVE: Duration = Duration::from_mins(1);
 /// Opens a long-lived gRPC channel to another Zinder service.
 ///
 /// The returned [`AuthenticatedChannel`] carries the bearer-token
-/// interceptor required by ADR-0006 and the HTTP/2 + TCP keep-alive
-/// policy required by ADR-0019. Callers wrap it in a generated tonic
+/// interceptor required by ADR-0011 and the HTTP/2 + TCP keep-alive
+/// policy required by ADR-0007. Callers wrap it in a generated tonic
 /// client (e.g. `WalletQueryClient::new(channel)`) and treat the
 /// resulting client as `Clone`-cheap to share across tasks.
 pub async fn connect_zinder_grpc(

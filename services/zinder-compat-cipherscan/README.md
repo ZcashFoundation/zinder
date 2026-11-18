@@ -1,87 +1,35 @@
-# Zinder Cipherscan adapter
+# zinder-compat-cipherscan
 
-`zinder-compat-cipherscan` translates Cipherscan REST and WebSocket contracts
-onto Zinder `ExplorerQuery` and `WalletQuery` endpoints. It is a stateless
-protocol-edge service. It does not open Zinder storage, index blocks, or own
-Cipherscan product data.
+`zinder-compat-cipherscan` serves Cipherscan's REST and WebSocket API from Zinder's `ExplorerQuery` and `WalletQuery` services, so the Cipherscan frontend can use Zinder without changes. It opens no storage and keeps only bounded in-memory caches.
 
-```text
-Cipherscan UI
-    -> zinder-compat-cipherscan
-        -> ExplorerQuery
-        -> WalletQuery
-        -> external market-price providers
-```
+The adapter is optional and is not published as a release image. It needs a running `zinder-explorer` (with `[ingest].explorer_views = true`) and a reachable `zinder-query`. Many Cipherscan routes are degraded or unavailable against the current Explorer; check the [coverage matrix](../../docs/architecture/cipherscan-adapter.md) before deploying.
 
-The [adapter architecture](../../docs/architecture/cipherscan-adapter.md)
-records ownership and route coverage. The
-[verification runbook](../../docs/runbooks/cipherscan-adapter-verification.md)
-defines the acceptance probes.
+## Run it
 
-## Deployment status
-
-This service compiles in the workspace but is not a release image. The checked
-single-host composition publishes `zinder-ingest`, `zinder-projector`, and
-`zinder-compat-lightwalletd`; it does not publish standalone `WalletQuery` or
-`ExplorerQuery` endpoints. Running the Cipherscan adapter therefore requires a
-custom composition that supplies both native gRPC dependencies on the same
-network. Do not treat the checked wallet-serving Compose file as an end-to-end
-Cipherscan deployment.
-
-## Configuration
-
-Configuration precedence is defaults, TOML, `ZINDER_*` environment variables,
-then CLI overrides. Use `--print-config` to inspect the resolved, redacted
-configuration.
+Write a configuration file, for example `/etc/zinder/cipherscan.toml`:
 
 ```toml
 [network]
 name = "zcash-testnet"
 
-[security]
-allow_public_bind = false
-
-[ops]
-listen_addr = "127.0.0.1:9108"
-
 [cipherscan]
 listen_addr = "127.0.0.1:9070"
 explorer_query_endpoint = "http://127.0.0.1:9068"
 wallet_query_endpoint = "http://127.0.0.1:9102"
-current_price_endpoint = "https://api.coingecko.com/api/v3/simple/price?ids=zcash&vs_currencies=usd&include_24hr_change=true"
-historical_price_endpoint_template = "https://api.coingecko.com/api/v3/coins/zcash/history?localization=false&date={date}"
 # bearer_token_path = "/run/secrets/zinder-reader-token"
+
+[ops]
+listen_addr = "127.0.0.1:9108"
 ```
 
-Start the adapter only after both native gRPC endpoints are healthy:
+The values shown for the listeners and endpoints are the defaults. The price endpoints default to CoinGecko and can be changed with `current_price_endpoint` and `historical_price_endpoint_template`. Settings load from defaults, then the TOML file, then `ZINDER_*` environment variables, then command-line flags. `--print-config` prints the resolved configuration.
+
+Start the adapter after both gRPC endpoints are up, because it connects to them before it starts listening:
 
 ```bash
-cargo run -p zinder-compat-cipherscan -- \
-  --config /etc/zinder/cipherscan.toml
+cargo run --release -p zinder-compat-cipherscan -- --config /etc/zinder/cipherscan.toml
 ```
 
-The adapter refuses public listener binds unless
-`security.allow_public_bind = true`. Put public traffic behind an
-operator-controlled TLS proxy with authentication, rate limits, and quotas.
-Use a private network and the optional shared bearer token for both Zinder gRPC
-dependencies.
+The adapter refuses a public listen address unless `security.allow_public_bind = true`. It has no TLS or client authentication. Put public traffic behind your own TLS proxy with authentication, rate limits, and quotas. The optional bearer token is sent to both Zinder gRPC endpoints.
 
-## Readiness
-
-`/healthz` proves the process is alive. `/readyz` proves startup dependencies
-were connected. Neither proves that every materialized view covers an
-arbitrary requested range. Deployment probes must include at least one
-data-bearing route and must preserve explicit unavailable or degraded results.
-
-```bash
-curl --fail http://127.0.0.1:9108/healthz
-curl --fail http://127.0.0.1:9108/readyz
-curl --fail http://127.0.0.1:9070/api/info
-curl --fail 'http://127.0.0.1:9070/api/mining/pool-distribution?period=7d'
-```
-
-The adapter keeps only bounded in-memory caches and can restart without a
-backfill. Missing labels, market data, graph analytics, identity data, or other
-Cipherscan-owned enrichments remain sidecar responsibilities. The adapter must
-not replace missing facts with zeroes, empty successful results, or invented
-finality.
+`/healthz` on the ops listener shows the process is alive, and `/readyz` shows it connected to both endpoints. Neither proves that the Explorer's views cover a requested range. To check real routes, follow the [verification runbook](../../docs/runbooks/cipherscan-adapter-verification.md).

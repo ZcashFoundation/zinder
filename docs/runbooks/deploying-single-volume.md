@@ -1,0 +1,303 @@
+# Deploying the single-volume container
+
+This runbook deploys Zinder on a platform that attaches one persistent volume
+to one container, such as Railway. The `zinder-wallet-serving` image runs
+`zinder-ingest`, `zinder-projector`, and `zinder-query` as three supervised
+processes in one container. Read [Deploying Zinder](deploying.md) first for
+host requirements.
+
+## When to use it
+
+Use this image when your platform cannot share one volume between containers.
+The readers must open the stores on the writers' filesystem, so the three
+processes share a container.
+
+The image serves native `WalletQuery` only. It does not include the
+lightwalletd adapter, `zinder-compat-lightwalletd`. If your wallets speak the
+lightwalletd protocol, or your host can share a volume between containers, use
+[Deploying on a VM](deploying-on-a-vm.md) instead.
+
+## Get the image
+
+Each release publishes the image for Linux amd64 and arm64. The package is
+public, so pulling needs no credentials. Pin the release tag or its digest:
+
+```text
+ghcr.io/zcashfoundation/zinder-wallet-serving:vX.Y.Z
+```
+
+To run an unreleased commit, build the `zinder-wallet-serving` target and push
+it to a registry your platform can read:
+
+```bash
+docker build -f deploy/Dockerfile --target zinder-wallet-serving \
+  -t <registry>/zinder-wallet-serving:<commit> .
+```
+
+## Configure the container
+
+Attach one persistent volume at `/var/lib/zinder`, sized as
+[What you need](deploying.md#what-you-need) describes. Give the container at
+least 8 GB of memory. All three processes share one memory limit. In a
+smaller container, the kernel kills a process during the first build. The
+whole container then restarts, and the build starts over and fails again.
+
+Set these variables:
+
+| Variable | Value |
+| --- | --- |
+| `ZINDER_NETWORK__NAME` | `zcash-mainnet` or `zcash-testnet` |
+| `ZINDER_NODE__JSON_RPC_ADDR` | The node's JSON-RPC URL, such as `http://zebra.railway.internal:18232` |
+| `ZINDER_NODE__AUTH__METHOD` | `cookie` |
+| `ZINDER_NODE__AUTH__COOKIE` | The node's cookie, as the inline `user:password` string |
+| `ZINDER_NODE__INDEXER_GRPC_ADDR` | The node's indexer gRPC URL, such as `http://zebra.railway.internal:8155`. An `https://` URL uses TLS; see [Indexer TLS](#indexer-tls). |
+| `ZINDER_PROJECTOR__BUILD_OWNER_HEX` | A stable 32-character hexadecimal value |
+
+The container stops at startup without `ZINDER_NODE__INDEXER_GRPC_ADDR`.
+Without the indexer stream, ingest rereads the whole node mempool after every
+block, and withdraws readiness whenever that takes longer than 30 seconds.
+
+These variables are optional:
+
+| Variable | Effect |
+| --- | --- |
+| `ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE_SECONDS` | How long the chain-store build may take before the container stops. Default `10800`, 3 hours. |
+| `ZINDER_WALLET_SERVING__WALLET_CONSTRUCTION_DEADLINE_SECONDS` | How long the wallet-store build may take before the container stops. Default `7200`, 2 hours. |
+| `INGEST_CONTROL_BEARER_TOKEN`, `CHECKPOINT_BEARER_TOKEN` | The internal control tokens. The container generates them at startup when unset. |
+| `RUST_LOG` | Log filter. Default `info`. A value that does not parse stops the container. |
+
+The default deadlines fit Testnet but end a Mainnet build from an empty
+volume. For Mainnet, set at least `86400` (24 hours) and `43200` (12 hours)
+before the first deployment, and more on slower disks or a slower node.
+
+Any other variable from the
+[configuration reference](../reference/configuration.md#environment-variables)
+works if it applies to ingest, projector, or query. The entrypoint passes each
+process only the variables its binary accepts. At startup it logs the names of
+`ZINDER_*` variables that no process reads, so check that line after you add
+one. A misspelled `ZINDER_WALLET_SERVING__*` name stops the container.
+
+Do not override storage paths, listen addresses, control endpoints, or token
+paths. They are fixed in `deploy/config/wallet-serving/`, and a path variable
+such as `ZINDER_STORAGE__PATH` would reach more than one process.
+`ZINDER_WALLET__ROCKSDB__BLOCK_CACHE_BYTES` sizes both the projector's and
+query's wallet cache, so count it twice against the memory limit.
+
+### Indexer TLS
+
+Zakura requires mutual TLS on an indexer listener that is not on loopback.
+Set `ZINDER_NODE__INDEXER_GRPC_ADDR` to the `https://` URL. If your platform
+can mount files, mount the PEM files and set their paths. If it delivers
+secrets only as variables, as Railway does, set the PEM text with its line
+breaks intact:
+
+| Item | Path variable | Text variable |
+| --- | --- | --- |
+| CA that verifies the node. Omit to use system roots. | `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH` | `ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM` |
+| Client certificate chain | `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH` | `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM` |
+| Client private key | `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH` | `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM` |
+
+Set `ZINDER_NODE__INDEXER_TLS__SERVER_NAME` when the node certificate names a
+different host than the URL.
+
+The entrypoint writes each PEM value to a file only the `zinder` user can
+read. The deploy log names the location: `/dev/shm` is in memory, and `/run`
+may be on disk. The container stops when a value lacks a `-----BEGIN` line,
+has no line breaks, or is set as both text and path. To rotate the material,
+change the variables and redeploy.
+
+### Fallback node endpoints
+
+Ingest can switch to a second node, and query broadcasts through it; see
+[node endpoint failover](../architecture/chain-ingestion.md#node-endpoint-failover).
+Name each fallback with the `[node]` variables under a position, counting from
+1:
+
+| Variable | Value |
+| --- | --- |
+| `ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR` | `http://zakura.railway.internal:18232` |
+| `ZINDER_NODE_FALLBACKS__1__AUTH__METHOD` | `cookie` |
+| `ZINDER_NODE_FALLBACKS__1__AUTH__COOKIE` | That node's cookie |
+| `ZINDER_NODE_FALLBACKS__1__INDEXER_GRPC_ADDR` | That node's indexer gRPC URL. Required. |
+| `ZINDER_NODE_FALLBACKS__1__BROADCAST_TIMEOUT_SECS` | `7` |
+
+Set the broadcast timeout on every fallback, because
+[a fallback does not inherit it](../reference/configuration.md#the-node-sections).
+Indexer TLS takes the same variables under the
+position, such as `ZINDER_NODE_FALLBACKS__1__INDEXER_TLS__CLIENT_KEY_PEM`.
+
+## Ports
+
+| Port | Serves | Reachable from |
+| --- | --- | --- |
+| 9102 | Native `WalletQuery` gRPC, plaintext | The platform's private network |
+| 9106 | Query ops: `/healthz`, `/readyz`, `/metrics` | The private network and the platform health check |
+| 9100, 9101 | Ingest and projector control | Container loopback only |
+| 9105, 9110 | Ingest and projector ops | Container loopback only |
+
+Do not attach a public domain to 9102. Put TLS, authentication, rate limits,
+and quotas in a proxy in front of it, as
+[Before you expose it](deploying.md#before-you-expose-it) describes.
+
+## Deploy on Railway
+
+1. Create the service from a Docker image source, and name the image by its
+   exact tag. Railway pulls it. To upgrade, change the tag.
+2. Attach a volume at `/var/lib/zinder`, and set the variables above.
+3. Set `PORT=9106`, the query ops port that Railway health-checks, and
+   `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30`. The entrypoint gives the three
+   processes 20 seconds to flush their stores on shutdown, which a shorter
+   drain window cuts off.
+4. Set the restart policy to Always.
+5. On a first deployment to an empty volume, leave the health-check path
+   unset. Port 9106 does not listen until both builds finish, which can take
+   longer than Railway's maximum health-check timeout of 3600 seconds.
+6. When the deploy log shows `wallet serving is ready`, set the health-check
+   path to `/healthz` and the timeout to `3600`, then deploy again. A changed
+   setting applies to a new deployment, not to Redeploy of an existing one.
+
+Railway cannot build this image from the repository, because it builds only
+the last stage of a Dockerfile. Clients reach the service at
+`<service>.railway.internal:9102` over Railway's IPv6 private network.
+
+The Railway health check only shows that query listens, so also monitor
+query `/readyz` and `zinder_readiness_served_epoch_age_seconds`, which is the
+only signal of a [node outage](../reference/readiness.md#during-a-node-outage).
+
+## What a fresh sync looks like
+
+A fresh volume builds the chain store, then the wallet store, and serves
+nothing until both finish. Several hours without a serving port is expected.
+The deploy log names each phase:
+
+| Log line | Phase |
+| --- | --- |
+| `starting canonical construction` | Ingest is building the chain store. The line names the deadline. |
+| `starting wallet construction` | The projector is building the wallet store. |
+| `starting wallet serving` | Query is opening the stores. This phase has a fixed 30-minute deadline. |
+| `wallet serving is ready` | Native `WalletQuery` answers. |
+
+While a phase waits, the log repeats that process's `/readyz` body every five
+minutes. A restart during a build discards it and starts over. Once both
+stores are built, a restart resumes from them. [Initial sync](initial-sync.md)
+describes each phase.
+
+From a shell in the container, such as `railway ssh`, check each process:
+
+```bash
+curl -fsS http://127.0.0.1:9105/readyz   # ingest
+curl -fsS http://127.0.0.1:9110/readyz   # projector
+curl -fsS http://127.0.0.1:9106/readyz   # query
+```
+
+## Failure handling
+
+The entrypoint watches all three processes and their `/readyz`. When it gives
+up, it exits non-zero, and the platform's restart policy starts a clean set.
+
+| Symptom | Cause | What the container does | Action |
+| --- | --- | --- | --- |
+| A build phase outlives its deadline | The build is slower than the deadline | Logs the last `/readyz` body and exits | Raise the deadline variable. A restarted build starts over. |
+| A process exits | Crash or configuration error | Exits | Read the process's error in the log. |
+| `/readyz` reports `schema_mismatch` or `node_capability_missing` | Incompatible store, or a pruned or incapable node | Exits at once | Use empty paths for a new schema, or an archive node. |
+| A process stays unready for an hour | Lag or a fault that did not clear | Exits | Read the logged `/readyz` body. |
+| A process flaps between ready and unready | Repeated short faults | Exits after six unready episodes, or 900 seconds unready in total, without 10 ready minutes in a row | Read the logged episodes. |
+| Ingest cannot reach its node | Node outage | Keeps serving stored data. Logs the outage once when it starts and once when it ends. Exits after 24 hours. | Restore the node. After a restart, the container serves nothing until a node answers, because ingest needs one to start. |
+| Ingest reports `upstream_not_ready`, for example while the node resyncs | The node answers but is not synchronized | Keeps serving stored data with no time limit | Wait for the node. |
+| Query refuses wallets with `REORG_WINDOW_EXCEEDED` | The node replaced more blocks than the reorg window, `ZINDER_INGEST__REORG_WINDOW_BLOCKS`, default 1000. Ingest parks. | Stays up and keeps the typed refusal | Look for a replaced or misbehaving node, then rebuild. Do not redeploy otherwise: ingest parks again on the same reorg. |
+| Projector reports `wallet_transition_limit_exceeded` | See [below](#wallet-transition-exceeds-its-logical-byte-limit) | Stays up | Raise the limit and redeploy. |
+| Query logs `wallet_serving_pair_table_file_missing` | Compaction deleted a file under an open read view. Query replaced the view and retried. | Stays up | None for an occasional warning. If it follows most blocks, check for `wallet_serving_pair_publisher_refresh_failed` and for bulk compactions. |
+
+The image `HEALTHCHECK` runs `zinder-wallet-serving-healthcheck`. It passes
+when query `/readyz` returns 200, when query serves the
+`reorg_window_exceeded` refusal, and while the projector is parked on its
+transition limit. A host that restarts unhealthy containers therefore does not
+restart into the same park. Its start period is 6 hours, which covers only the
+default deadlines. Lengthen it for a Mainnet build.
+
+On `SIGTERM`, the entrypoint stops query, the projector, and ingest in that
+order, and waits 20 seconds. It exits non-zero and names any process still
+holding a store open.
+
+### Wallet transition exceeds its logical-byte limit
+
+The projector applies wallet changes as atomic transitions, and refuses a
+transition that touches more wallet data than
+`projector.follow.max_transition_logical_bytes` allows. A deep reorg that
+rolls back and replays many blocks of a busy address can exceed it. The
+projector logs `wallet_projection_following_parked` once, with an error that
+begins:
+
+```text
+wallet following stopped planning a transition that already needs <n> logical bytes, more than projector.follow.max_transition_logical_bytes (ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES) allows (<limit>)
+```
+
+The wallet is unchanged, and `<n>` is a lower bound. The projector stays up,
+parked, and its `/readyz` reports `wallet_transition_limit_exceeded` with
+`required_bytes` and `configured_bytes`. It keeps its place in the chain, so
+it resumes without a rebuild once the limit allows the transition. A running
+query keeps answering from its last view for a few blocks, then refuses
+wallets with `SERVICE_NOT_READY`. After a restart, the entrypoint does not
+start query behind the parked projector and logs
+`zinder-query was not started`.
+
+To recover, set `ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES` well
+above `<n>`, at most `1073741824`, and redeploy. The default is `536870912`.
+While it applies one transition, the projector's memory grows by up to about
+1.5 times the bytes the transition counts. Add at least 1.5 times the bytes
+you add to the limit to the container's memory. On Testnet, one 1,000-block reorg needed 796 MB, which the default
+refuses.
+
+If the limit is still too small, the projector parks again and query never
+starts. If `<n>` already exceeds `1073741824`, no setting admits the
+transition. Rebuild the wallet in a second service with its own volume, move
+traffic to it once its `/readyz` returns 200, and retire this one.
+
+## Serve the Explorer from the same volume
+
+The `zinder-wallet-serving-explorer` image adds `zinder-explorer`, which
+serves `ExplorerQuery` for explorer front ends. Ingest in this image also
+builds the Explorer views. Configure it exactly like `zinder-wallet-serving`,
+with the same volume, variables, and Railway settings:
+
+```text
+ghcr.io/zcashfoundation/zinder-wallet-serving-explorer:vX.Y.Z
+```
+
+| Port | Serves | Reachable from |
+| --- | --- | --- |
+| 9068 | `ExplorerQuery` gRPC, plaintext | The private network |
+| 9069 | Explorer ops | The private network |
+
+The Explorer reads `ZINDER_NETWORK__*`, `ZINDER_NODE__*`, and
+`ZINDER_EXPLORER__*` variables. It uses only `[node]`, not the fallbacks.
+Memory and disk for the Explorer and its views are not measured, so give the
+container more than the 8 GB minimum and watch the volume.
+
+The container stops at startup if the Explorer configuration is invalid. The
+Explorer starts once wallet serving passes its health check and ingest admits
+the view store, or 10 minutes after that check passes. An Explorer failure
+does not stop wallet serving: the entrypoint restarts the Explorer after 15
+seconds, doubling the delay up to 5 minutes. Neither the image `HEALTHCHECK`
+nor the Railway health check covers the Explorer, so monitor its `/readyz` on
+port 9069.
+
+Ingest pauses the views when the volume runs low on space, as
+[What it costs](../architecture/explorer-plane.md#what-it-costs) describes. Set
+`ZINDER_INGEST__EXPLORER_VIEWS=false` to stop the views from growing while you
+grow the volume, and the Explorer serves them as they last stood.
+
+To rebuild the views after a release that changes them, follow
+[Add the Explorer](deploying-on-a-vm.md#add-the-explorer). From a shell in the
+container, move the store with
+`mv /var/lib/zinder/canonical/materialized-views /var/lib/zinder/materialized-views.previous`,
+then restart the deployment.
+
+## Chain-store-only diagnostic image
+
+Releases also publish `zinder-canonical-runtime`, which runs `zinder-ingest`
+alone. It builds and follows the chain store but serves no clients. Use it to
+check chain construction on a platform, not to serve wallets. The image has
+no configuration file, so you set every ingest setting, including the storage
+path under `/var/lib/zinder`, through `ZINDER_*` variables. Its ops port is
+9105, so set `PORT=9105` on Railway. Indexer TLS PEM variables work as above.

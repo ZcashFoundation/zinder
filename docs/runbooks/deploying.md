@@ -1,0 +1,201 @@
+# Deploying Zinder
+
+This page takes an operator from nothing to a running, verified Zinder
+deployment. It covers what you deploy, what the host needs, which deployment
+to choose, and a Docker Compose quickstart.
+
+Zinder is alpha. It runs on one host, with no read replicas and no snapshot
+bootstrap: every new deployment builds its stores from your node. Pin exact
+release versions and expect breaking upgrades.
+
+## What you deploy
+
+Zinder reads the chain from your Zcash node, stores it once, and serves it to
+wallets and applications. A deployment is four processes on one host
+filesystem, plus an optional fifth. `zinder-ingest` is the only process that
+writes the chain store, and `zinder-projector` is the only one that writes the
+wallet store. Native query and lightwalletd compatibility read both stores.
+The optional Explorer reads the chain store and the Explorer views that ingest
+writes, and it gets wallet data through native query. The
+[architecture overview](../architecture/overview.md) explains how they fit
+together.
+
+| Process | Serves | Port | Ops port |
+| --- | --- | --- | --- |
+| `zinder-ingest` | Nothing to clients. Reads the node and writes the chain store. | none | 9105 |
+| `zinder-projector` | Nothing to clients. Builds the wallet store. | none | 9110 |
+| `zinder-query` | Native `WalletQuery` gRPC | 9102 | 9106 |
+| `zinder-compat-lightwalletd` | lightwalletd `CompactTxStreamer` gRPC | 9067 | 9107 |
+| `zinder-explorer` (optional) | `ExplorerQuery` gRPC | 9068 | 9069 |
+
+Each ops port serves `/healthz`, `/readyz`, and `/metrics`. These are the
+Mainnet ports. The Compose files add 10000 on Testnet and 20000 on Regtest, so
+the Testnet native query port is 19102. Compose publishes every port on host
+loopback only.
+
+Compose also runs these private ports:
+
+| Port | Use | Published on the host |
+| --- | --- | --- |
+| 9100 | Ingest control API, used by the projector and the readers | No. Loopback inside the shared container network, same number on every network. |
+| 9101 | Projector control API | No. Loopback inside the shared container network, same number on every network. |
+| 9095 | Prometheus | Yes, on loopback. Testnet 19095, Regtest 29095. |
+| 3002 | Grafana, under the `observability` profile | Yes, on loopback. Testnet 13002, Regtest 23002. |
+
+## What you need
+
+You need an archive Zebra or Zakura node on the same network. Ingest reads
+every historical block, so it refuses a pruned node at startup. The certified
+node versions are Zebra 7.1.0 and Zakura 1.8.6. A Zakura node built by fast
+sync cannot serve a Mainnet first sync, because it never stored the
+per-height commitment trees below its last checkpoint. The node needs its own
+disk on top of the figures below.
+
+| Network | Disk | Memory | First sync |
+| --- | --- | --- | --- |
+| Mainnet | About 465 GB in use, including Explorer views. Wallet construction also needs about 130 GB free for temporary files when it starts. | Compose container limits: ingest 14 GiB, projector 10 GiB, query 4 GiB, compatibility 4 GiB | Between about 6 and 16 hours. See the note below. |
+| Testnet | Not measured | Compose container limits: ingest 8 GiB, projector 6 GiB, query 2 GiB, compatibility 2 GiB | Not measured. It fits the default construction deadlines of 3 hours for the chain store and 2 hours for the wallet store. |
+| Regtest | Not measured | Compose container limits: 2, 2, 1, and 1 GiB | Not measured |
+
+The memory figures are the limits the shipped Compose env files set. They are
+ceilings, not measured use. The single-volume container needs at least 8 GB
+for its three processes. CPU requirements are not measured. The release
+binaries need an x86-64-v3 or AArch64 CPU.
+
+The Mainnet disk figures come from separate observations, and they do not add
+up to a peak:
+
+- About 465 GB is the volume in use on one deployment on v0.16.3, after both
+  stores were built.
+- About 310 GB is the staging size of one measured canonical build. Ingest
+  builds the chain store in a staging directory on the same volume and renames
+  it into place when it publishes.
+- About 130 GB is the free space that the projector's temporary sort files
+  need on the same volume when wallet construction starts.
+
+Peak disk use during a first sync has not been measured.
+
+The sync time has two sources that disagree. One measured build took about four hours for
+the chain store and more than two hours for the wallet store. Builds on
+earlier releases took about 16 hours in total. No full build has been timed on
+the current release, so plan for the longer figure.
+
+## Choose a deployment
+
+| Deployment | Pick it when | Runbook |
+| --- | --- | --- |
+| Docker Compose beside a node | You want to try Zinder, or run it on a host that already runs your node in Docker. | [Quickstart](#quickstart-with-docker-compose) below |
+| Docker Compose under systemd on a VM | You run a long-lived service on a VM you manage. This is the complete topology. | [Deploying on a VM](deploying-on-a-vm.md) |
+| Single-volume container | Your platform attaches one volume to one container, such as Railway. It serves native `WalletQuery` only, without the lightwalletd adapter. | [Deploying the single-volume container](deploying-single-volume.md) |
+
+## Quickstart with Docker Compose
+
+This path runs Zinder on Testnet beside a Zebra node from the
+[Z3 stack](https://github.com/ZcashFoundation/z3). For a Zakura node, use
+`deploy/.env.zakura-testnet` and follow
+[Attach a Zakura node](deploying-on-a-vm.md#attach-a-zakura-node) instead of
+step 1.
+
+The steps use Docker Engine with the Compose v2 plugin, `git`, `openssl`,
+`curl`, and `grpcurl`. Step 4 builds the Zinder images from the checked-out
+source. To run the released images instead, follow step 1 of
+[Deploying on a VM](deploying-on-a-vm.md).
+
+1. Start a Zebra Testnet node with Z3, from your Z3 checkout, and wait until it
+   has synchronized:
+
+   ```bash
+   Z3_NETWORK=testnet docker compose up -d
+   ```
+
+   Z3 creates the `z3-testnet` Docker network and the `z3-testnet-cookie`
+   volume. `deploy/.env.testnet` names both.
+
+2. Check out a Zinder release:
+
+   ```bash
+   git clone https://github.com/ZcashFoundation/zinder.git
+   cd zinder
+   git checkout vX.Y.Z
+   ```
+
+3. Create the two control tokens that the Zinder processes use to talk to
+   each other. `deploy/.env.testnet` expects them in
+   `/etc/zinder/control-secrets`, readable by the container group, GID 1000:
+
+   ```bash
+   sudo install -d -o root -g 1000 -m 0750 /etc/zinder/control-secrets
+   openssl rand -hex 32 | sudo tee /etc/zinder/control-secrets/ingest.token >/dev/null
+   openssl rand -hex 32 | sudo tee /etc/zinder/control-secrets/checkpoint.token >/dev/null
+   sudo chown root:1000 /etc/zinder/control-secrets/*.token
+   sudo chmod 0440 /etc/zinder/control-secrets/*.token
+   ```
+
+4. Build and start Zinder:
+
+   ```bash
+   docker compose --env-file deploy/.env.testnet \
+     -f deploy/docker-compose.yml up -d --build
+   ```
+
+   Compose starts ingest first. It starts the projector only once ingest is
+   healthy, and the two readers only once the projector is healthy, so on a
+   first sync the command keeps waiting while the stores are built.
+   [Initial sync](initial-sync.md) describes each phase.
+
+5. Check readiness. Each command prints a JSON body that starts with
+   `{"status":"ready"` once that process serves traffic. Until then, `/readyz`
+   answers 503 with the reason, and `curl -f` exits non-zero:
+
+   ```bash
+   curl -fsS http://127.0.0.1:19105/readyz   # ingest
+   curl -fsS http://127.0.0.1:19110/readyz   # projector
+   curl -fsS http://127.0.0.1:19106/readyz   # native query
+   curl -fsS http://127.0.0.1:19107/readyz   # lightwalletd compatibility
+   ```
+
+6. Make one native call and one lightwalletd call:
+
+   ```bash
+   grpcurl -plaintext -d '{}' 127.0.0.1:19102 \
+     zinder.v1.wallet.WalletQuery/ServerInfo
+   grpcurl -plaintext -d '{}' 127.0.0.1:19067 \
+     cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo
+   ```
+
+   `ServerInfo` reports the network `zcash-testnet` and the service
+   `zinder-query`. `GetLightdInfo` reports `chainName` `test` and a
+   `blockHeight` close to your node's tip.
+
+The same Compose file also starts Prometheus on host port 19095. Add
+`--profile observability` to the command in step 4 to start Grafana on 13002.
+
+## Before you expose it
+
+Wallet listeners have no TLS or client authentication, so expose them only
+through your own proxy ([Exposing over TLS](exposing-over-tls.md)). The
+[security boundary](../architecture/service-operations.md#security-boundary)
+lists what must stay private.
+
+## Optional pieces
+
+- **Fallback nodes.** Ingest can switch to a second node when the first stops
+  answering, and broadcasts move to the next node. See
+  [Fail over to a second node](deploying-on-a-vm.md#fail-over-to-a-second-node)
+  and [node endpoint failover](../architecture/chain-ingestion.md#node-endpoint-failover).
+- **Explorer.** `zinder-explorer` serves block, transaction, address, and
+  mempool views for explorer front ends. See
+  [Add the Explorer](deploying-on-a-vm.md#add-the-explorer) and the
+  [Explorer plane](../architecture/explorer-plane.md).
+- **Full blocks.** Wallets that scan whole blocks need
+  `storage.raw_blob_policy = "all"` on ingest and every reader before the
+  first sync. The shipped configuration stores transactions only, and
+  changing an existing store requires a rebuild. See the
+  [wallet data plane](../architecture/wallet-data-plane.md).
+
+## What happens next
+
+The first sync builds the chain store and then the wallet store, and serves
+nothing until both finish. A restart during that build starts it over.
+[Initial sync](initial-sync.md) describes each phase and what to watch.
+[Readiness](../reference/readiness.md) explains every `/readyz` state.

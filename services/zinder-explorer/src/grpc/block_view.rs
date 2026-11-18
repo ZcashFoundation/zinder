@@ -4,7 +4,7 @@
 //! by [`zinder_materialized_views::BlockSummaryConsumer`] into the
 //! public wire shapes. The handlers wrap reads in the cross-cutting
 //! [`ExplorerFreshness`] envelope per
-//! [ADR-0011](../../../docs/adrs/0011-explorer-freshness-envelope.md) and
+//! [ADR-0019](../../../docs/adrs/0019-explorer-plane.md) and
 //! compute `materialized_view_cursor_lag_blocks` against the wallet plane's visible
 //! tip.
 

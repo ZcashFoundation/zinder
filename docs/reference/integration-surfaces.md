@@ -1,237 +1,131 @@
-# Integration Surfaces
+# Integration surfaces
 
-This page starts after a client has chosen Zinder. It maps each client shape to
-the smallest suitable contract and records the boundary between protocol
-coverage and consumer certification. For the architectural choice between
-direct node access, an embedded indexer, a shared Zinder deployment, and
-lightwalletd-compatible serving, see
-[Indexer/wallet boundary](../architecture/indexer-wallet-boundary.md).
+This page tells you how to connect a client to Zinder: which endpoint to use, the smallest working call, and what the client must handle. It is for wallet, SDK, and backend developers. To decide whether Zinder fits your product at all, read [Use cases](../use-cases.md) and [Indexer comparison](indexer-comparison.md).
 
-## Pick a surface
+## Choose a path
 
-| Client shape | Integration surface | Constraint |
-| --- | --- | --- |
-| Existing lightwalletd client | `zinder-compat-lightwalletd` | The client already speaks `CompactTxStreamer`; changing the endpoint should not require a protocol rewrite. |
-| Rust wallet or service that needs live events or broadcast | `zinder-client::RemoteChainIndex` | The consumer can link the Zinder Rust crates and reach a `zinder-query` deployment over gRPC. |
-| Client that cannot link `zinder-client` | Vendored `WalletQuery` protos | The consumer generates a native gRPC client with its own language and toolchain. |
-| Explorer or analytics application | `ExplorerQuery`, with `WalletQuery` where required | The consumer needs derived views rather than only wallet-sync artifacts. |
+| You have | Use | Service | Compose port |
+| --- | --- | --- | --- |
+| An existing lightwalletd client or SDK | `CompactTxStreamer` | `zinder-compat-lightwalletd` | 9067 |
+| A new client in any language | Native `zinder.v1.wallet.WalletQuery` gRPC | `zinder-query` | 9102 |
+| A Rust application | The `zinder-client` crate over `WalletQuery` | `zinder-query` | 9102 |
+| An explorer or analytics backend | `zinder.v1.explorer.ExplorerQuery`, plus `WalletQuery` | `zinder-explorer` | 9068 |
+| A server-side wallet | `zinder-client` plus a wallet library such as librustzcash | `zinder-query` | 9102 |
 
-## Current consumer boundaries
+The ports are the defaults in `deploy/docker-compose.yml` and `deploy/docker-compose.explorer.yml`, bound to host loopback. Your operator may publish different ones.
 
-Method coverage proves that Zinder has an appropriate public primitive. A
-support claim additionally requires the consumer's create or import, sync,
-recovery, send, mempool, and reorg flows against a selected release and
-network.
+## What every client must handle
 
-| Consumer | Contract | Current claim |
-| --- | --- | --- |
-| [Zallet](https://github.com/zcash/zallet) | Native `WalletQuery` through the backend-neutral `Chain` and snapshot-scoped `ChainView` traits | The current source-built default Zinder backend is Regtest-certified for server metadata, network-upgrade activations, visible tip, block selectors and headers, full blocks, tree state, Sapling, Orchard, and Ironwood subtree roots, transaction lookup, transparent-address UTXOs and ascending history, chain events, mempool snapshot and events, and broadcast. Official Zallet packaging remains tracked in [Zallet #696](https://github.com/zcash/zallet/issues/696). |
-| [ZODL](https://github.com/zodl-inc/zodl-android) | Zcash Android SDK `LightWalletEndpoint` over `CompactTxStreamer` | The current source-built ZODL and SDK pair has passed fresh-wallet, restore, transparent-history, send, mempool, mining, continuous-follow, and restart flows through the candidate's Android-trusted Testnet TLS route. This local certification does not claim a public operator deployment or reorg behavior. |
+**Transport.** Zinder listeners speak plaintext HTTP/2 (h2c), and only `zinder-explorer` can require a shared bearer token (`explorer.bearer_token_path`), which clients send as `authorization: Bearer <token>`. Connect to the `https://` address of the operator's proxy, which the [security boundary](../architecture/service-operations.md#security-boundary) requires and [Exposing over TLS](../runbooks/exposing-over-tls.md) sets up.
 
-## Lightwalletd compatibility
+**Readiness.** A runtime that is not ready rejects new requests with `UNAVAILABLE` and `SERVICE_NOT_READY`. Retry with backoff. A request that fails with `REORG_WINDOW_EXCEEDED` cannot succeed until an operator repairs the indexer; stop creating spends against it. [Readiness](readiness.md) lists the causes.
 
-`zinder-compat-lightwalletd` serves the vendored lightwalletd
-`CompactTxStreamer` protocol by translating requests onto `WalletQueryApi`.
-It serves indexed reads from an admitted exact-fence pair of canonical and
-wallet-projection secondaries. It does not write canonical storage, build
-artifacts independently, or use Zebra as a fallback for indexed history.
+**Capability discovery.** On connect, call `ServerInfo` and check three things:
 
-The compatibility runtime uses `zinder-source` only for one explicit edge
-capability: transaction broadcast. Activations come from the writer-admitted
-schedule, and `GetTreeState` is served from stored checkpoints and compact
-blocks. That call never substitutes for indexed history or changes the pinned
-serving pair.
+1. `network` is exactly `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`, matching what you expect.
+2. `contract_revision` is at least the revision your client was built for. `zinder-client` requires 8.
+3. Every capability string your client depends on is present. Strings match exactly. [Capabilities](capabilities.md) lists them.
 
-For a compatible wallet, Zinder is an endpoint-level replacement for
-lightwalletd: the wallet keeps the `CompactTxStreamer` contract and changes the
-server address. It is not an operator-level binary or configuration replacement.
-Zinder has its own ingest, storage, query, readiness, and deployment model.
+On `zinder-query`, a method whose capability is absent fails with `FAILED_PRECONDITION` and `ENDPOINT_CAPABILITY_UNAVAILABLE`. On `zinder-explorer`, a method whose backing store or `WalletQuery` endpoint is not configured fails with `FAILED_PRECONDITION` and `DEPENDENCY_NOT_CONFIGURED`. The `node` field describes the node that broadcasts transactions and can change while the server runs, so read it from a fresh `ServerInfo` instead of caching it.
 
-Public deployments terminate TLS, authentication, rate limiting, and quota controls before traffic reaches Zinder. The compatibility process speaks plaintext h2c by default and should be bound behind the operator's proxy boundary.
-For the isolated `transactions` retention route, trusted TLS, compatibility
-`/readyz` admission, external plaintext-unreachability, and ZODL endpoint
-attribution are owned by the [Trusted TLS and ZODL compatibility admission
-runbook](../runbooks/zodl-trusted-tls-certification.md).
+**Errors.** Most native failures carry a `google.rpc.ErrorInfo` with `domain = "zinder.dev"` and a stable reason string. Branch on the reason, not the message. Some rejections carry only a gRPC status code. Listener overload returns `UNAVAILABLE`; retry it with backoff. Malformed request fields, such as a missing block selector or an oversized repeated field, return `INVALID_ARGUMENT`. Handle a status without `ErrorInfo` by its code. [Error vocabulary](error-vocabulary.md) gives each reason's status code and retry rule.
 
-## Native Rust clients
+**Consistent reads.** Native responses carry the chain epoch they read. Pin related reads to one epoch with `at_epoch_id`, and restart the workflow when a pin fails with `CHAIN_EPOCH_PIN_UNAVAILABLE`. [Wallet data plane](../architecture/wallet-data-plane.md) explains the rules.
 
-`zinder-client` is the canonical Rust integration crate:
+## Lightwalletd clients
 
-- `RemoteChainIndex` is enabled by default and connects to a `WalletQuery` gRPC endpoint without a RocksDB dependency.
-- `ServerInfo`, `Capability`, `CapabilityDescriptor`, and `ErrorReason` are
-  client-owned public types. Generated protobuf messages and `tonic::Status`
-  remain behind the SDK boundary, while unknown capability and error-reason
-  strings are preserved for forward compatibility.
-- `ChainSnapshot<'_, I>` captures one epoch from a borrowed `ChainIndex` and
-  exposes its pinnable canonical reads without a repeated epoch parameter.
-- `OwnedChainSnapshot<I>` provides the same surface over `Arc<I>`, including
-  `Arc<dyn ChainIndex>`, for wallet adapters whose chain view must be cloneable
-  and `'static`.
+Point the client's server address at the compatibility endpoint. The client keeps the `CompactTxStreamer` protocol; nothing else changes on the client side. Check the endpoint with `grpcurl`, which works without proto files because the server exposes gRPC reflection:
 
-The contract is split across two async traits so the compiler expresses which calls a handle can serve:
+```bash
+grpcurl -plaintext -d '{}' 127.0.0.1:9067 \
+  cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo
+```
 
-- `ChainIndex` carries immutable network metadata plus canonical and wallet-projection reads. `RemoteChainIndex` implements the typed client contract; consumers preflight advertised capabilities before relying on optional reads.
-- `EndpointBackedIndex` carries operations that need live endpoint-owned
-  collaborators: transaction broadcast and chain value-pools require an
-  admitted upstream source; the chain-event stream and live-mempool
-  snapshot/events/overlays require the writer control boundary; and the
-  wallet-plane server descriptor describes the endpoint itself. Only
-  `RemoteChainIndex` implements it. The release query currently omits the
-  chain-value-pools capability because method discovery alone does not prove
-  the required payload or retained liveness semantics.
+A wallet-serving endpoint answers with `"taddrSupport": true`. An endpoint in compact-blocks mode serves only block reads. Method-by-method behavior, limits, and differences from Go lightwalletd are in [Lightwalletd compatibility](lightwalletd-compatibility.md). A named wallet is supported only after end-to-end certification, as its [claim boundary](lightwalletd-compatibility.md#claim-boundary) states.
 
-A consumer that broadcasts or subscribes bounds its handle `T: ChainIndex + EndpointBackedIndex`. Typed capability discovery (`CapabilityDescriptor::supports(Capability::…)`) probes the advertised set without matching raw strings.
+## Native gRPC clients
 
-The public traits and protocol include optional full-block methods. The
-admitted wallet-serving query advertises full-block reads only when
-authenticated canonical retention is `all`. Method presence is not a
-deployment support claim; consumers must preflight exact capability strings.
+`zinder-query` serves `WalletQuery` and also exposes gRPC reflection:
 
-`ChainSnapshot::transparent_outpoint_spend_status` reports whether each
-transparent outpoint a wallet tracks is unspent, spent by a named mined input,
-or not found, all at the snapshot's epoch. It is the per-outpoint spend lookup
-that Zallet's `spend-index` contract and librustzcash `GetSpendingTx` need, and
-it accepts any number of outpoints: the client splits large slices at one
-pinned epoch. Preflight `Capability::TransparentOutpointSpendStatus`.
+```bash
+grpcurl -plaintext -d '{}' 127.0.0.1:9102 \
+  zinder.v1.wallet.WalletQuery/ServerInfo
+grpcurl -plaintext -d '{"start_height": 1, "end_height": 10}' 127.0.0.1:9102 \
+  zinder.v1.wallet.WalletQuery/CompactBlocksInRange
+```
 
-When the canonical writer parks because a replacement crossed its reorg
-window, new reads and open chain-event streams return
-`IndexerError::ReorgWindowExceeded`, with the replacement depth and window when
-the server reports them. Its retry policy is `OperatorActionRequired`: the
-indexer serves a chain that no longer advances, so a wallet should stop
-creating spends against it until an operator reconciles the indexer.
+To generate a client, vendor the `.proto` files from `crates/zinder-proto/proto/` and keep the `zinder/v1/...` layout. The files import nothing outside this set.
 
-Capture calls `current_epoch` once. A remote that no longer serves the
-captured epoch returns `IndexerError::ChainEpochPinUnavailable`; its retry
-policy is `RefreshChainEpoch`. The released wallet-serving runtime keeps
-serving each replaced epoch for one minute after it was replaced, however fast
-later blocks arrive. A snapshot workflow whose reads send the pinned epoch id
-therefore finishes across new blocks when it ends within that minute. A
-transparent-history first page sends no epoch id and is answered from the
-current epoch, so it fails
-after a new block even while the old epoch is retained. Consumers must still refresh and restart the workflow on this error
-rather than assume longer retention. Implementations may retain older epochs,
-but may serve a pin only when they can answer that exact canonical epoch.
-
-Native clients get typed errors, capability discovery, epoch-pinned reads,
-chain-event cursors, transaction broadcast outcomes, mempool reads, and
-transparent-address artifacts without depending on the lightwalletd
-compatibility layer.
-
-Inside Zinder, `zinder-query` and `zinder-compat-lightwalletd` read storage
-through `WalletServingQuery` over an admitted `WalletServingReadPair`. That
-service-internal composition is not a public SDK adapter.
-
-The registry-ready Rust SDK consists of `zinder-core`, `zinder-proto`, and
-`zinder-client`, all at the lockstep product version and workspace Rust 1.95
-MSRV. Package CI builds each feature mode, checks documentation without
-`protoc`, and compiles a standalone consumer from the extracted crate archives.
-The packages become installable from crates.io only after a release publishes
-that lockstep version; local repository consumers continue to resolve the same
-edges by path.
-
-## Vendoring the protocol
-
-Consumers that cannot depend on `zinder-client` vendor the `.proto` files and
-generate their own stubs. This includes non-Rust stacks and Rust consumers with
-toolchain or native-dependency clashes. The protocol packages are
-self-contained; no `googleapis` or third-party proto is imported.
-
-### File set
-
-The import closure under `crates/zinder-proto/proto/` is:
-
-| Vendor when the consumer speaks | Files |
+| If you call | Vendor |
 | --- | --- |
 | `WalletQuery` | `zinder/v1/wallet/wallet.proto`, `zinder/v1/ops/server_info.proto` |
-| `IngestControl` (adds to the above) | `zinder/v1/ingest/ingest.proto`, `zinder/v1/ops/readiness.proto` |
-| `ExplorerQuery` (adds to the wallet set) | `zinder/v1/explorer/explorer.proto` |
+| `ExplorerQuery` | the wallet set, plus `zinder/v1/explorer/explorer.proto` |
+| any service | `zinder/v1/ops/error.proto`, which defines the `ErrorReason` names that `ErrorInfo` carries |
 
-`zinder/v1/ops/error.proto` sits outside every import closure but defines the `ErrorReason` enum; vendor it alongside so error handling compiles against the same vocabulary the wire carries.
+Then:
 
-### Pin and drift guard
+1. Record the Zinder commit you copied from in a `COMMIT` file next to the protos.
+2. Generate stubs with your own toolchain. Do not edit the vendored files.
+3. Add a CI check that fetches each file at the pinned commit and diffs it against your copy, so local edits and upstream changes both fail loudly.
 
-Mirror the pattern Zinder itself uses for the lightwalletd protos (`crates/zinder-proto/proto/compat/lightwalletd/COMMIT` plus the `vendored-proto` job in `.github/workflows/ci-pr.yml`):
+## Rust applications
 
-1. Copy the files preserving the `zinder/v1/...` directory layout and record the pinned Zinder commit hash in a `COMMIT` file next to them.
-2. Generate stubs with the consumer's own toolchain (`tonic-prost-build` for Rust; any `protoc` plugin elsewhere). Do not edit the vendored files.
-3. Add a CI job that fetches each file at the pinned commit and diffs it against the vendored copy, so local edits and upstream drift both fail loudly.
+`zinder-client` is the typed Rust SDK. It hides generated protobuf types and `tonic::Status` behind `ChainIndex`, `EndpointBackedIndex`, `ServerInfo`, and `IndexerError`. Releases publish `zinder-core`, `zinder-proto`, and `zinder-client` to crates.io at the product version. They need Rust 1.95 or later.
 
-### Contract surfaces outside the protos
+Add the client and an async runtime to your crate:
 
-Two vocabularies bind the integration but do not appear in any `.proto` message definition:
+```bash
+cargo add zinder-client
+cargo add tokio --features macros,rt-multi-thread
+```
 
-- Capability strings. The authoritative table lives in `crates/zinder-proto/src/capabilities.rs`; servers advertise them through `ServerInfo.capabilities` and clients gate features on exact string match.
-- Error reasons. `google.rpc.ErrorInfo` with `domain = "zinder.dev"` carries the string-form `ErrorReason` name on every failure; the [Error vocabulary](error-vocabulary.md) page owns the reason-to-code-to-retry semantics.
+This program prints nothing. It connects to a native `WalletQuery` endpoint, checks one capability, and reads the visible tip at a pinned epoch:
 
-These two vocabularies plus `ServerInfo.contract_revision` are the machine-checkable integration keys. A vendored consumer asserts a minimum `contract_revision` at connect time and treats a lower value as an incompatible server.
+```rust
+use zinder_client::{
+    Capability, CapabilityDescriptor, ChainIndex, EndpointBackedIndex, IndexerError, Network,
+    RemoteChainIndex, RemoteOpenOptions,
+};
 
-### Feature detection
+async fn read_visible_tip(endpoint: String) -> Result<(), IndexerError> {
+    let index = RemoteChainIndex::connect(RemoteOpenOptions {
+        endpoint,
+        network: Network::ZcashMainnet,
+    })?;
+    let info = index.server_info().await?;
+    if !info.supports(Capability::TransparentAddressUnspentOutputs) {
+        // Fall back or report that this endpoint cannot serve the feature.
+    }
+    let snapshot = index.snapshot().await?;
+    let visible_tip = snapshot.visible_tip_block().await?;
+    let _ = visible_tip;
+    Ok(())
+}
 
-At connect time, call `ServerInfo` and check:
+#[tokio::main]
+async fn main() -> Result<(), IndexerError> {
+    read_visible_tip("http://127.0.0.1:9102".to_owned()).await
+}
+```
 
-1. `network` matches the expected wire string exactly (`zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`).
-2. `contract_revision` meets the consumer's minimum.
-3. Every capability the consumer requires is present in `capabilities`.
+An `https://` endpoint makes the client use TLS with the system's root certificates. The connection opens on the first call.
 
-`wallet.broadcast.transaction_v1` means the operator configured a node for
-broadcast. The operator can configure an ordered list of node endpoints, and
-the query sends a transaction to the first verified one in its preference
-order, moving to the next when one is unreachable. The query starts without
-contacting those nodes and verifies each on first contact, so a broadcast can
-fail with the retryable `NODE_UNAVAILABLE` until one answers, as it does
-during any outage of every endpoint. `node` in `ServerInfo` stays empty until
-an endpoint passes verification, and then describes the first verified
-endpoint in preference order. That endpoint can change while the query runs,
-so read `node` from a fresh `ServerInfo` instead of caching it.
+- `ChainIndex` holds stored reads. `snapshot()` captures one chain epoch and pins every later read through the snapshot to it. `OwnedChainSnapshot` does the same over an `Arc` for a view that must be cloneable and `'static`.
+- `EndpointBackedIndex` holds calls that need a live endpoint: `server_info`, broadcast, chain events, and mempool reads. Bound a generic handle as `T: ChainIndex + EndpointBackedIndex` when you need both.
+- Every `IndexerError` has a `retry_policy()`: `RefreshChainEpoch`, `RestartFromEarliestRetained`, `RetryWithBackoff`, `OperatorActionRequired`, or `ClientError`. Act on the policy rather than on the error text.
+- The client checks the server's streams. A stream that breaks its contract, such as a repeated event cursor or a missing range header, fails with `IndexerError::MalformedResponse`. Reconnect from the last accepted cursor.
 
-The release `zinder-query` composition admits one authenticated
-`IngestControl` identity before opening storage or binding traffic. Admission
-validates the exact service name, network, contract revision, and the five
-control methods required for pair publication, transaction lookup, and mempool
-snapshot and events. The query,
-serving-pair publisher, live wallet handlers, and readiness probe all clone the
-same admitted channel. The probe checks `WriterStatus` plus a bounded,
-tip-coherent `MempoolSnapshot`; it does not repeat structural `ServerInfo`
-discovery.
+The crate's examples in `crates/zinder-client/examples/`, `observe_transparent_address.rs` and `observe_mempool_to_confirmed.rs`, show the snapshot, subscribe, and reconnect pattern end to end. Run one from a Zinder checkout against a running query endpoint, with the endpoint, the network, and a transparent address to watch:
 
-The native endpoint therefore advertises transaction lookup and mempool
-snapshot and events from that concrete composition. Transaction-byte support
-additionally requires authenticated transaction-blob retention. Temporary
-ingest-control failure degrades the ingest-control dependency and fails the
-mempool methods and unmined transaction lookups, without draining readiness or
-rewriting the immutable capability set. Methods with no admitted provider fail their capability guard
-before provider access. The native transparent surface contains only the
-transparent-address UTXO and ascending history reads that Zallet calls, plus
-the outpoint spend status that Zallet's `spend-index` contract needs; ZODL
-reaches the address reads through the lightwalletd adapter
-([ADR-0043](../adrs/0043-owned-transparent-wallet-query-surface.md)). These
-Zinder contract claims do not replace current Zallet or ZODL consumer
-certification.
-`wallet.events.chain_v1` remains independently derived from the admitted
-serving pair.
+```bash
+cargo run -p zinder-client --example observe_transparent_address -- \
+    http://127.0.0.1:9102 zcash-regtest <t-address>
+```
+
+## Explorer and analytics backends
+
+Use `ExplorerQuery` on `zinder-explorer` for derived views: block and transaction pages, address activity, search, fees, mempool summaries, and value-pool history. Use `WalletQuery` directly for canonical blocks, transactions, tree states, broadcast, and chain events. [Explorer plane](../architecture/explorer-plane.md) covers freshness and privacy refusals, and [Chain data catalog](chain-data-catalog.md) maps data to methods.
 
 ## Server-side wallets
 
-Server-side wallets can pair `zinder-client` with a higher-level wallet
-library. Zinder owns consumer-neutral chain reads and broadcast; the wallet
-process owns keys, trial decryption, note state, account state, transaction
-building, and proving. Keep that boundary explicit instead of embedding a
-wallet model in the chain-data service.
-
-## Explorer and analytics views
-
-Explorer-shaped reads use `WalletQuery` for canonical wallet-plane data and
-`ExplorerQuery` for derived views. A consumer should call `WalletQuery` directly
-for canonical blocks, transactions, tree state, broadcast, and wallet events.
-It should call `ExplorerQuery` for summaries, search, history, distributions,
-rankings, and other derived projections. The materialized-view plane consumes canonical
-artifacts and event streams, owns its own storage, and can be rebuilt without
-touching canonical chain state.
-
-## References
-
-- [Indexer/wallet boundary](../architecture/indexer-wallet-boundary.md)
-- [Wallet data plane](../architecture/wallet-data-plane.md)
-- [Materialized-view plane](../architecture/materialized-view-plane.md)
-- [Protocol boundary](../architecture/protocol-boundary.md)
+Pair `zinder-client` with a wallet library. Zinder serves chain reads, chain events, mempool state, and broadcast. Your process keeps keys, trial decryption, note and account state, transaction building, and proving. Zinder never receives viewing or spending keys.

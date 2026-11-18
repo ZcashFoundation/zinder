@@ -3,7 +3,7 @@
 //! This crate owns:
 //!
 //! - The typed [`Readiness`] state machine and [`ReadinessCause`]
-//!   values defined in `docs/architecture/service-operations.md`, plus the
+//!   values defined in `docs/reference/readiness.md`, plus the
 //!   [`ComposedReadiness`] precedence shared by multi-input runtimes.
 //! - The `/healthz`, `/readyz`, and `/metrics` HTTP endpoints
 //!   ([`spawn_ops_endpoint`], [`serve_ops_endpoint`]), and the `healthcheck`

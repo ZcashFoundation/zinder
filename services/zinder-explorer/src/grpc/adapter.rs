@@ -231,7 +231,7 @@ impl ExplorerQueryGrpcAdapter {
     /// awaits or drops it during shutdown. Without this call the cache
     /// stays empty and every `chain_view.upstream_tip` axis is `None`;
     /// that is the documented "probe has not fired yet" state per
-    /// ADR-0011.
+    /// ADR-0019.
     #[must_use]
     pub fn spawn_upstream_observation_probe<Source>(
         &self,
@@ -299,7 +299,7 @@ impl ExplorerQueryGrpcAdapter {
     /// Single source of truth for capability gating: `ServerInfo`, the ops
     /// endpoint `/healthz`, and any future advertisement surface all read
     /// from this method so a flag flip in one place reaches every consumer.
-    /// Per ADR-0018, each capability lights up only when the upstream
+    /// Per ADR-0014, each capability lights up only when the upstream
     /// state it depends on is satisfied; the adapter never advertises a
     /// capability whose handler would return `Unavailable`.
     #[must_use]
@@ -389,7 +389,7 @@ impl ExplorerQuery for ExplorerQueryGrpcAdapter {
         _request: Request<ServerInfoRequest>,
     ) -> Result<Response<ServerInfoResponse>, Status> {
         // ServerInfo carries the standard ExplorerFreshness envelope per
-        // ADR-0011 so consumers can read `chain_view.upstream_tip` from the
+        // ADR-0019 so consumers can read `chain_view.upstream_tip` from the
         // bootstrap call, before any materialized-view-backed capability is up.
         // During `bulk_catchup` this is the only explorer response that
         // is guaranteed to succeed; sync-progress UIs depend on it for

@@ -140,7 +140,7 @@ pub(crate) async fn query_recent_transactions(
 ///
 /// Coinbase rows are skipped (no fee record exists). Missing fee records
 /// leave `paid_fee_zat` unset; that's the explicit "not available" signal
-/// per ADR-0018.
+/// per ADR-0014.
 fn join_paid_fees(
     materialized_view_store: &MaterializedViewStore,
     entries: &mut [RecentTransactionEntry],

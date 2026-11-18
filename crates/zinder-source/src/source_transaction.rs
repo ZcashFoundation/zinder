@@ -44,7 +44,7 @@ pub struct TransactionPublicFactSet {
 ///
 /// Single source of truth for transaction parsing across ingest, mempool
 /// hydration, and the explorer read path per
-/// [ADR-0010](../../../docs/adrs/0010-transaction-public-facts.md). The
+/// [ADR-0018](../../../docs/adrs/0018-transaction-facts-status-and-broadcast.md). The
 /// `activations` table resolves the consensus branch ID for v3/v4
 /// transactions whose header omits it; v5+ transactions carry the branch ID
 /// directly through `Transaction::network_upgrade()`.

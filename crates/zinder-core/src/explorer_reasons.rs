@@ -7,7 +7,7 @@
 //! prose here means a single PR changes the language for every consumer.
 //!
 //! Strings are English-only in v1 per
-//! [ADR-0011](../../../docs/adrs/0011-explorer-freshness-envelope.md);
+//! [ADR-0019](../../../docs/adrs/0019-explorer-plane.md);
 //! per-locale rendering is a UI concern.
 
 /// Sapling, Orchard, and Sprout addresses have no public history by

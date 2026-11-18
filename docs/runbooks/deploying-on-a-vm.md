@@ -1,712 +1,150 @@
-# Deploying the wallet service on one VM
+# Deploying on a VM
 
-This runbook operates the supported `rocksdb-single-host` wallet-serving
-topology. Four independent processes share one host filesystem:
-`zinder-ingest` owns canonical storage, `zinder-projector` owns the wallet
-projection, and `zinder-query` plus `zinder-compat-lightwalletd` independently
-serve immutable canonical and wallet secondary pairs. The optional explorer
-overlay adds `zinder-explorer` for named explorer consumers; it is not part of
-the certified four-runtime topology. The single-volume host
-images that a release also publishes are separate deployment shapes, described
-in [Wallet-serving deployment (single-volume hosts)](deploying-wallet-serving.md),
-and are not this topology.
+This runbook sets up the complete Zinder topology on one Linux VM: ingest,
+projector, native query, and lightwalletd compatibility, run by Docker Compose
+and kept running by systemd. Read [Deploying Zinder](deploying.md) first for
+host requirements and a shorter quickstart.
 
-A successful deployment is a canary until the release's mainnet construction,
-wallet-build, coherent-restore, capacity, replacement, and independent-client
-gates have current evidence. See
-[ADR-0035](../adrs/0035-canonical-storage-topologies.md) and the
-[testing runbook](testing.md).
+## Before you start
 
-## Prerequisites
+- A Linux VM with Docker Engine and the Docker Compose v2 plugin.
+- An archive Zebra or Zakura node on the same Docker host. Zinder joins the
+  node's Docker network and reads its RPC cookie from a named volume. The
+  [Z3 stack](https://github.com/ZcashFoundation/z3) provides both for Zebra.
+  For Zakura, see [Attach a Zakura node](#attach-a-zakura-node).
+- Disk and memory for your network, from
+  [What you need](deploying.md#what-you-need).
+- A reverse proxy for TLS, authentication, rate limits, and quotas.
 
-- A Linux host with Docker Engine 24 or newer and Docker Compose v2.
-- A pinned Zinder release checkout at `/opt/zinder`.
-- A Zebra or Zakura node on the same Docker host. Zinder attaches to the
-  node's external Docker network and reads the node's RPC cookie from a
-  dedicated named volume. A [Z3](https://github.com/ZcashFoundation/z3) stack
-  provides both for Zebra. For Zakura, see
-  [Attach a Zakura node](#attach-a-zakura-node).
-- Storage sized for canonical data, the wallet projection, a coherent
-  checkpoint, compaction/restore workspace, and chain-growth reserve.
-- An HTTP/2-capable reverse proxy for TLS, authentication, rate limits, and
-  quotas.
-- GitHub CLI 2.94 or newer and Cosign with Sigstore bundle support when
-  installing a native release bundle.
-- For native binary installation, a GNU/Linux system with glibc 2.34 or newer,
-  dynamic `libstdc++.so.6` providing `GLIBCXX_3.4.30`, and either an
-  x86-64-v3 CPU or an AArch64 Armv8-A CPU. Debian 12 Bookworm is the certified
-  runtime baseline; the downloadable bundles are not musl artifacts.
-
-Do not place the two storage owners on hosts with independent filesystems.
-RocksDB secondary replication in this lifecycle is a same-filesystem boundary,
-not a network replication protocol.
+All stores live on one Docker volume. Do not split the processes across hosts:
+the readers open the stores as RocksDB secondaries, which works only on the
+same filesystem.
 
 ## Install
 
-### Download native binaries
-
-Choose the archive that matches the host CPU. Preserve prerelease suffixes in
-both the tag and filename:
-
-```bash
-release=vX.Y.Z
-platform=x86_64-v3-unknown-linux-gnu
-gh release download "$release" \
-  --repo ZcashFoundation/zinder \
-  --pattern "zinder-${release#v}-${platform}.tar.gz" \
-  --pattern "zinder-${release#v}-${platform}.spdx.json" \
-  --pattern SHA256SUMS \
-  --pattern SHA256SUMS.sigstore.json
-sha256sum --check SHA256SUMS
-gh release verify "$release" --repo ZcashFoundation/zinder
-gh release verify-asset "$release" \
-  "zinder-${release#v}-${platform}.tar.gz" \
-  --repo ZcashFoundation/zinder
-cosign verify-blob \
-  --bundle SHA256SUMS.sigstore.json \
-  --certificate-identity \
-    "https://github.com/ZcashFoundation/zinder/.github/workflows/release.yml@refs/tags/${release}" \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  SHA256SUMS
-tar -xzf "zinder-${release#v}-${platform}.tar.gz"
-sudo install -m 0755 \
-  "zinder-${release#v}-${platform}"/bin/zinder-* \
-  /usr/local/bin/
-```
-
-Releases before `v0.8.0` were published from `gustavovalverde/zinder`. To
-verify one of them, use that repository in the Cosign certificate identity
-and the `ghcr.io/gustavovalverde/` image namespace.
-
-Use `aarch64-unknown-linux-gnu` on AArch64. Inspect `BUILD-INFO.json`, the
-internal `SHA256SUMS`, and the accompanying SPDX SBOM before installation. The
-5 executables, including the optional `zinder-explorer`, still require
-separate service configuration, storage paths, control secrets, process
-supervision, and the ownership order documented below; downloading the bundle
-does not create a mixed single-process deployment.
-
-### Deploy with Compose
-
-Clone and pin the intended release:
+### 1. Get Zinder at a release tag
 
 ```bash
 sudo git clone https://github.com/ZcashFoundation/zinder.git /opt/zinder
 sudo git -C /opt/zinder checkout vX.Y.Z
-sudo install -d -o root -g root -m 0755 /etc/zinder
-sudo cp /opt/zinder/deploy/.env.mainnet /etc/zinder/env
-echo 'ZINDER_VERSION=vX.Y.Z' | sudo tee -a /etc/zinder/env >/dev/null
 ```
 
-`ZINDER_VERSION` selects the signed release images
-`ghcr.io/zcashfoundation/<runtime>:vX.Y.Z` for every runtime. Set it to the
-tag you checked out, because each Compose file matches the images of its own
-release. To build every image from the checkout instead, leave
-`ZINDER_VERSION` out of the env file. `ZINDER_INGEST_IMAGE`,
-`ZINDER_PROJECTOR_IMAGE`, `ZINDER_QUERY_IMAGE`, `ZINDER_COMPAT_IMAGE`, and
-`ZINDER_EXPLORER_IMAGE` each replace one whole image reference, for example
-with a digest-pinned one.
+The Compose file builds the images from this checkout. To run the released
+images instead, set these in the environment file from step 3, preferably
+pinned by digest:
 
-Pick the env file for your node and network:
+```bash
+ZINDER_INGEST_IMAGE=ghcr.io/zcashfoundation/zinder-ingest:vX.Y.Z
+ZINDER_PROJECTOR_IMAGE=ghcr.io/zcashfoundation/zinder-projector:vX.Y.Z
+ZINDER_QUERY_IMAGE=ghcr.io/zcashfoundation/zinder-query:vX.Y.Z
+ZINDER_COMPAT_IMAGE=ghcr.io/zcashfoundation/zinder-compat-lightwalletd:vX.Y.Z
+```
+
+Then run `docker compose ... pull` and start with `--no-build`. Do not pass
+`--build` while these name released images, because Compose then builds from
+source and tags the result with the release name. [Releasing](releasing.md)
+shows how to verify a release's images.
+
+### 2. Create the control secrets
+
+Ingest's private control API, on loopback port 9100, needs two bearer tokens.
+Keep them outside the data volume, owned by root, and readable by the
+containers' group, GID 1000:
+
+```bash
+sudo install -d -o root -g 1000 -m 0750 /etc/zinder/control-secrets
+openssl rand -hex 32 | sudo tee /etc/zinder/control-secrets/ingest.token >/dev/null
+openssl rand -hex 32 | sudo tee /etc/zinder/control-secrets/checkpoint.token >/dev/null
+sudo chown root:1000 /etc/zinder/control-secrets/*.token
+sudo chmod 0440 /etc/zinder/control-secrets/*.token
+```
+
+Compose mounts `ingest.token` into all four processes and `checkpoint.token`
+into ingest and the projector only.
+
+### 3. Write the environment file
+
+Copy the env file for your node and network to `/etc/zinder/env`:
 
 | Node | Mainnet | Testnet | Regtest |
 | --- | --- | --- | --- |
 | Zebra through Z3 | `.env.mainnet` | `.env.testnet` | `.env.regtest` |
 | Zakura | `.env.zakura-mainnet` | `.env.zakura-testnet` | not provided |
 
-The Compose file has no node address or network default. The env file
-supplies every node-specific value:
+```bash
+sudo install -d -o root -g root -m 0755 /etc/zinder
+sudo cp /opt/zinder/deploy/.env.mainnet /etc/zinder/env
+```
+
+Check these values. Compose refuses to start when any of the first five, or
+the last two, is unset:
 
 | Variable | Meaning |
 | --- | --- |
-| `ZINDER_DEPLOY_NETWORK` | `mainnet`, `testnet`, or `regtest`. It names the Compose project, the Zinder volumes, and the network aliases. |
+| `ZINDER_DEPLOY_NETWORK` | `mainnet`, `testnet`, or `regtest`. It names the Compose project and the volumes. |
 | `ZINDER_SOURCE_NETWORK_NAME` | The node's external Docker network. |
 | `ZINDER_SOURCE_COOKIE_VOLUME_NAME` | The external volume that holds the node's `.cookie`. |
+| `ZINDER_NETWORK__NAME` | `zcash-mainnet`, `zcash-testnet`, or `zcash-regtest`. |
 | `ZINDER_NODE__JSON_RPC_ADDR` | The node's JSON-RPC URL on that network. |
-| `ZINDER_NODE__INDEXER_GRPC_ADDR` | The node's indexer gRPC URL. Empty selects JSON-RPC mempool polling. |
+| `ZINDER_NODE__INDEXER_GRPC_ADDR` | The node's indexer gRPC URL. Empty makes ingest poll the mempool over JSON-RPC. |
+| `ZINDER_PROJECTOR_BUILD_OWNER_HEX` | A stable 32-character hexadecimal projector identity. |
+| `ZINDER_CONTROL_SECRETS_DIR` | The directory from step 2. |
 
-Compose refuses to start when `ZINDER_NETWORK__NAME` or any of the first four
-is unset. The Zebra and Zakura files for one network share
-`ZINDER_DEPLOY_NETWORK`, the host ports, and the projector owner, so they
-describe the same deployment. Switching the file switches the node and keeps
-the existing stores.
+The Zebra and Zakura files for one network share the project name, volumes,
+ports, and projector identity. Switching between them changes the node and
+keeps the stores. The files also set host ports and container memory limits.
 
-Ingest reads the node's block 0 before it opens storage and refuses to start
-when it is not the genesis block of `ZINDER_NETWORK__NAME`, for example a
-Regtest node behind a `zcash-testnet` configuration. `docker compose logs
-zinder-ingest` then shows `node_endpoints_unavailable` with `the node's block 0
-is not the configured network's genesis block`, and `/readyz` on port 9105
-reports `node_unavailable` with failure class `configuration`. Every restart
-fails the same way until `ZINDER_NODE__JSON_RPC_ADDR` points at a node on the
-configured network. A node that cannot serve block 0 yet, such as one still
-loading its state, fails startup as unreachable instead, and ingest starts on
-a later restart once the node answers.
+Every shipped file leaves `ZINDER_NODE__INDEXER_GRPC_ADDR` empty. To stream
+mempool events from a Z3 Zebra node instead, set
+`ZEBRA_RPC__INDEXER_LISTEN_ADDR=0.0.0.0:8155` in the Z3 `.env` file, restart
+Z3, and set `ZINDER_NODE__INDEXER_GRPC_ADDR=http://zebra:8155`.
 
-Every checked-in file leaves `ZINDER_NODE__INDEXER_GRPC_ADDR` empty, so ingest
-polls the node's mempool over JSON-RPC. To stream mempool events from a Z3
-Zebra node instead, set `ZEBRA_RPC__INDEXER_LISTEN_ADDR=0.0.0.0:8155` in the
-Z3 `.env` file, restart Z3, and set
-`ZINDER_NODE__INDEXER_GRPC_ADDR=http://zebra:8155` in `/etc/zinder/env`.
+The [configuration reference](../reference/configuration.md) lists every
+other setting.
 
-Each file contains a stable, non-secret `ZINDER_PROJECTOR_BUILD_OWNER_HEX`;
-assign a different 32-character hexadecimal value to every side-by-side
-projector lane.
+### 4. Start the runtimes
 
-The compatibility container's memory limit, `ZINDER_COMPAT_MEMORY_LIMIT`
-(4 GiB by default), must cover three terms:
-
-- The reader block caches, which every reader generation shares.
-- The memtables of each open generation.
-- `compat.max_concurrent_block_range_streams` block-range streams.
-
-[Block caches](../reference/lightwalletd-compatibility.md#block-caches) and
-[Block range resource limits](../reference/lightwalletd-compatibility.md#block-range-resource-limits)
-describe these terms. The memory the streams hold is not measured, so check
-the container's memory under wallet load before you raise the stream limit.
-
-### Upgrade an existing env file
-
-Earlier releases derived the project, network, and cookie volume names from
-`Z3_NETWORK_LOWER` and defaulted the node endpoints to `zebra`. Compose now
-ignores `Z3_NETWORK_LOWER` and requires the new variables. Before you start
-an upgraded checkout, edit `/etc/zinder/env`:
-
-1. Add `ZINDER_DEPLOY_NETWORK=<network>` next to `Z3_NETWORK_LOWER=<network>`.
-   Use the same value: it keeps the `zinder-<network>` project and volume
-   names, so the existing stores stay attached.
-2. Add `ZINDER_SOURCE_NETWORK_NAME=z3-<network>` and
-   `ZINDER_SOURCE_COOKIE_VOLUME_NAME=z3-<network>-cookie`.
-3. Check that `ZINDER_NETWORK__NAME` and `ZINDER_NODE__JSON_RPC_ADDR` are set.
-4. Set `ZINDER_NODE__INDEXER_GRPC_ADDR` to an empty value unless the node
-   serves its indexer listener on the Docker network. The earlier
-   `http://zebra:8155` value works only after the Z3 opt-in above.
-
-Comparing the file with the current `deploy/.env.<network>` shows any other
-missing value.
-
-Keep the old `Z3_NETWORK_LOWER=<network>` line until the upgrade is final.
-An earlier checkout ignores the new variables and falls back to
-`zinder-mainnet` without it, so a rollback on a testnet or regtest host would
-attach to the wrong project and volumes.
-
-Create the root-owned file-backed control-secret directory before validating
-Compose. The ordinary ingest token is mounted into all four runtimes; the
-checkpoint token is mounted only into ingest and projector.
-The group must be the container service group (the release images use GID
-10001), while the files remain owned by root and are not stored in the shared
-RocksDB volume.
-
-```bash
-sudo install -d -o root -g 10001 -m 0750 /etc/zinder/control-secrets
-openssl rand -hex 32 | sudo tee /etc/zinder/control-secrets/ingest.token >/dev/null
-openssl rand -hex 32 | sudo tee /etc/zinder/control-secrets/checkpoint.token >/dev/null
-sudo chown root:10001 /etc/zinder/control-secrets/*.token
-sudo chmod 0440 /etc/zinder/control-secrets/*.token
-```
-
-The checked-in network env templates already set
-`ZINDER_CONTROL_SECRETS_DIR=/etc/zinder/control-secrets`. If the host uses a
-different path, update the copied `/etc/zinder/env` value before resolving
-Compose. Query and compatibility mount only `ingest.token`; they cannot read
-`checkpoint.token` even though the files share one host directory.
-
-Validate the resolved topology before starting it:
+Validate the resolved Compose file, then start it:
 
 ```bash
 cd /opt/zinder
-docker compose --env-file /etc/zinder/env \
-  -f deploy/docker-compose.yml config -q
+docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml config -q
+docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml up -d --build
 ```
 
-Pull the release images and start the four release runtimes:
+Compose starts ingest, then the projector once ingest is healthy, then query
+and compatibility once the projector is healthy. On a first sync, the command
+waits while the stores are built. The health checks give ingest 3 hours and the
+projector 2 hours before they count as unhealthy. A Mainnet build can take
+longer. If the command then exits because a container is unhealthy, leave the
+running containers alone and run the same command again once that process's
+`/readyz` returns 200. [Initial sync](initial-sync.md) describes the phases.
+
+Do not restart ingest or the projector during their first build. A restart
+discards the unfinished build and starts it over.
+
+### 5. Verify
+
+Verify as in steps 5 and 6 of the
+[quickstart](deploying.md#quickstart-with-docker-compose), using the ports for
+your network from [What you deploy](deploying.md#what-you-deploy).
+
+### 6. Supervise with systemd
+
+Install the unit after the first sync has finished. Each start of the unit
+runs `docker compose down` first, which would discard a build in progress.
 
 ```bash
-docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml pull
-docker compose --env-file /etc/zinder/env \
-  -f deploy/docker-compose.yml up -d --no-build
-```
-
-`pull` fails when `ZINDER_VERSION` names a tag that was never published.
-`--no-build` keeps `up` from building that tag from source instead and naming
-the local result as the release. To verify the image signatures and
-attestations before starting them, follow
-[Verify publication](releasing.md#verify-publication).
-
-On a source-build host without `ZINDER_VERSION`, build and start the runtimes
-instead:
-
-```bash
-docker compose --env-file /etc/zinder/env \
-  -f deploy/docker-compose.yml up -d --build
-```
-
-The later commands in this runbook use `--no-build`; replace it with
-`--build` on a source-build host.
-
-The Compose topology gives projector, query, and compatibility containers the
-ingest container's network namespace. This keeps `CanonicalControl` and
-`IngestControl` on `127.0.0.1:9100` without weakening the non-loopback
-bearer-token rule. Both wallet-facing gRPC ports are published on host loopback
-only. Readiness is also the dependency gate: expected fresh construction stays
-in Docker's `starting` state for the documented three-hour canonical and
-two-hour wallet-build hard gates instead of being reported unhealthy after one
-minute. The projector waits for a healthy ingest, and query and compatibility
-wait for a healthy projector. Query and compatibility wait only for the ingest
-container to start, not for it to be healthy, because they share its network
-namespace and keep serving through a node outage that leaves ingest
-unhealthy. Query and compatibility receive five-minute startup grace periods.
-The projector has no node settings, and query and compatibility do not
-contact the node to start: they reach it only to broadcast transactions,
-after checking on first contact that it serves the store's chain.
-
-Each healthcheck runs the service's own binary, for example
-`zinder-query healthcheck`, which requests `/readyz` on the address in
-`ZINDER_OPS__LISTEN_ADDR` and passes only on HTTP 200. `docker compose ps`
-shows the result. The runtime images contain only the service binary and the
-C and C++ runtime libraries it links: there is no shell, curl, or package
-manager, so a custom healthcheck must also call the binary, for example
-`["CMD", "zinder-query", "healthcheck", "--path", "/healthz"]` for liveness
-only. See [Inspect a runtime container](#inspect-a-runtime-container).
-
-### Upgrade from images that ran as UID 1000
-
-Earlier runtime images ran as UID and GID 1000; they now run as 10001. On the
-first start of the upgraded topology, `state-init` hands the data and
-checkpoint-staging volumes to UID 10001, so the stores need no manual step.
-Files mounted from the host do. Before you start the upgraded topology, give
-the control secrets, and the indexer TLS files if you use that overlay, the
-new group:
-
-```bash
-sudo chgrp 10001 /etc/zinder/control-secrets /etc/zinder/control-secrets/*.token
-sudo chgrp 10001 /etc/zinder/indexer-tls /etc/zinder/indexer-tls/*.pem
-```
-
-If you ran the cookie-permissions project beside a Zakura node, remove it,
-including a fallback node's project; Zinder now reads the node's cookie
-without it. The cookie stays mode 0644 until the node writes a new one on its
-next start.
-
-```bash
-docker compose -p zinder-<network>-node-cookie down
-```
-
-### Attach a Zakura node
-
-Zakura's own Compose file does not share a network or a cookie volume with
-other projects. Start the node with these settings:
-
-- `ZAKURA_RPC__LISTEN_ADDR=0.0.0.0:8232` on Mainnet, or `0.0.0.0:18232` on
-  Testnet.
-- An external Docker network shared with Zinder, on which the node is
-  reachable as `zakura`. Name it in `ZINDER_SOURCE_NETWORK_NAME`.
-- `ZAKURA_RPC__COOKIE_DIR=/var/run/auth`, backed by a dedicated named volume.
-  Name it in `ZINDER_SOURCE_COOKIE_VOLUME_NAME`. Stock Zakura keeps the cookie
-  in its chain-state volume, which Zinder must not mount.
-- An explicit `network.zakura.listen_addr`
-  (`ZAKURA_NETWORK__ZAKURA__LISTEN_ADDR`). When it is unset, Zakura's QUIC
-  peer listener binds `0.0.0.0:8234`.
-
-Zakura refuses to start a plaintext indexer gRPC listener on a non-loopback
-address. The Zakura env files therefore leave
-`ZINDER_NODE__INDEXER_GRPC_ADDR` empty, and ingest polls the mempool. To stream
-mempool events from Zakura instead, follow
-[Stream mempool events over indexer TLS](#stream-mempool-events-over-indexer-tls).
-
-The Zebra and Zakura images run the node as UID 10001 and write the cookie
-with mode 0600, replacing it on every start. The Zinder images run as UID
-10001 too, so they read the cookie as written. If the node runs under another
-UID, set the same `user:` on the Zinder services that mount the cookie, or,
-where the node accepts a fixed RPC password, set
-`ZINDER_NODE__AUTH__METHOD=basic` with `ZINDER_NODE__AUTH__USERNAME` and
-`ZINDER_NODE__AUTH__PASSWORD`. Native binaries likewise read the cookie only
-when they run as the node's user.
-
-### Fail over to a second node
-
-Ingest can read from a second node, such as a Zakura node beside a Zebra node
-on the same network, and switch to it when the first stops answering or stays
-unsynchronized for five minutes. Merge `deploy/docker-compose.node-fallback.yml`
-and add the fallback node to the env file the way `[node]` is named:
-
-```text
-ZINDER_FALLBACK_SOURCE_NETWORK_NAME=zakura-mainnet
-ZINDER_FALLBACK_SOURCE_COOKIE_VOLUME_NAME=zakura-mainnet-cookie
-ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR=http://zakura:8232
-ZINDER_NODE_FALLBACKS__1__INDEXER_GRPC_ADDR=
-```
-
-```bash
-docker compose --env-file /etc/zinder/env \
-  -f deploy/docker-compose.yml \
-  -f deploy/docker-compose.node-fallback.yml \
-  up -d --no-build
-```
-
-The overlay mounts the fallback cookie at `/var/run/auth-fallback` for ingest,
-query, and compatibility. As with `[node]`, query and compatibility start while
-the fallback cookie is unreadable, and broadcast through the fallback once they
-can read it and it passes verification. An empty `INDEXER_GRPC_ADDR` polls the fallback's
-mempool after a switch, as for `[node]`; to stream it over TLS, add the
-`ZINDER_NODE_FALLBACKS__1__INDEXER_TLS__*_PATH` variables to `zinder-ingest`
-the way the indexer TLS overlay sets the `[node]` ones.
-
-At startup, ingest checks each endpoint's capabilities, activation table, and
-genesis block, as it checks `[node]` alone, and starts on the first one that
-passes, `[node]` first, without
-waiting for the fallbacks once `[node]` passes.
-`docker compose logs zinder-ingest` shows `node_endpoint_admitted`,
-`node_endpoint_unreachable`, `node_endpoint_excluded`, or
-`node_endpoint_deferred` for each position, and
-`/readyz` on port 9105 reports `active_node.position`. A switch logs
-`node_endpoint_switched`. Ingest does not switch back on its own: it stays on
-the fallback until the fallback fails or ingest restarts, and a restart starts
-at `[node]` again. Both nodes must advertise the same network-upgrade table;
-see [Upgrading the node](upgrading-the-node.md#with-a-fallback-node).
-
-Query and compatibility broadcast through the same list. They verify each
-endpoint before sending it a transaction, try `[node]` first, and move to the
-next verified endpoint when one is unreachable. The endpoint that answered
-after such a move stays preferred, and the node probe moves the preference the
-same way when the preferred endpoint stops answering. `docker compose logs
-zinder-query` shows `wallet_node_verified` or `wallet_node_excluded` for each
-position and `broadcast_endpoint_switched` when the preferred endpoint
-changes. Keep every endpoint's `broadcast_timeout_secs` well below wallet
-request deadlines, because a broadcast moves on only after it expires. Each
-endpoint takes its own value, and an endpoint without one waits for its own
-`request_timeout_secs` instead. The shipped configuration sets 7 seconds for
-`[node]`, and the overlay sets `ZINDER_NODE_FALLBACKS__1__BROADCAST_TIMEOUT_SECS`
-to 7 unless the env file overrides it.
-
-### Attach an explorer consumer
-
-When the same host serves Zexplorer or another named `ExplorerQuery` consumer,
-merge the explorer overlay:
-
-```bash
-docker compose --env-file /etc/zinder/env \
-  -f deploy/docker-compose.yml \
-  -f deploy/docker-compose.explorer.yml \
-  pull zinder-explorer
-docker compose --env-file /etc/zinder/env \
-  -f deploy/docker-compose.yml \
-  -f deploy/docker-compose.explorer.yml \
-  up -d --no-build
-```
-
-`ZINDER_VERSION` selects the released `zinder-explorer` image as it does for
-the other runtimes. On a source-build host, run the second command with
-`--build` instead of `--no-build`. Do not pass `--build` while
-`ZINDER_VERSION` or `ZINDER_EXPLORER_IMAGE` names a released image: Compose
-then builds from source and tags the local result with the release name.
-
-The Explorer opens a process-owned materialized-view
-secondary, and federates `WalletQuery` over the shared loopback namespace. The
-runtime does not open a canonical secondary. It publishes gRPC and ops
-endpoints on host loopback using `ZINDER_EXPLORER_HOST_PORT` and
-`ZINDER_EXPLORER_OPS_HOST_PORT`. Inside the node network, consumers use the
-stable `zinder-${ZINDER_DEPLOY_NETWORK}-explorer:9068` alias.
-
-Create two file-backed control secrets outside the shared data volume: the
-ordinary `ingest.token`, mounted into all four runtimes, and the separate
-`checkpoint.token`, mounted only into ingest and projector. Set
-`ZINDER_CONTROL_SECRETS_DIR` to the directory containing both files. Compose
-mounts individual files, so query and compatibility receive only
-`ingest.token`. `checkpoint.token` authorizes both the loopback
-`ProjectorControl` capture request and the method-level canonical checkpoint
-capability; reader runtimes must never mount or read it.
-
-The root-owned `state-init` service initializes the shared data volume and the
-separate checkpoint-staging volume for UID/GID 10001 on every start, before
-ingest starts.
-Checkpoint staging is mounted only into ingest and projector, never into query
-or compatibility. Canonical checkpoint requests accept only an opaque candidate
-identifier beneath that root; the projector prepares the candidate directory,
-ingest creates the fixed `canonical.rocksdb` child through its owner queue, and
-cold admission runs off the writer queue. The current capture foundation can add
-the exact-fence wallet checkpoint and publish a format-3 `state-bundle.json`
-manifest last. It can also create and byte-admit a fixed-layout sealed recovery
-directory whose outer manifest is published last and binds every payload file,
-both checkpoint identities, and the canonical construction-manifest sidecar.
-The configured local archive root is not physical WORM storage. Instance-state
-reset, immutable external publication, inactive-lane restore, and the required
-10000-block tail proof remain absent, so neither captured nor locally sealed
-manifests satisfy the restore production gate.
-
-### Wait for the transparent-address ranking after an upgrade
-
-`ExplorerQuery.TransparentAddressActivity` and
-`ExplorerQuery.TransparentAddressRanking` read the transparent-address
-ranking. Explorer views built by Zinder 0.10.0 have no ranking, so they
-withhold `explorer.transparent_address.activity_v2` and
-`explorer.transparent_address.ranking_v1`.
-
-You do not need to rebuild those views. After the upgrade, `zinder-ingest`
-builds the ranking from canonical history beside the other views, even while
-their replay is still far behind the tip. While those views are rebuilding,
-their replay waits until the build reaches their height, so each later height
-is read once for every view instead of once for the views and again for the
-build. It logs these events:
-
-- `transparent_address_ranking_build_started` when the build begins.
-- `transparent_address_ranking_build_progress` as it passes each
-  100000-height mark.
-- `materialized_view_replay_waiting_for_ranking_build` when view replay starts
-  waiting for the build, and
-  `materialized_view_replay_resumed_after_ranking_build` when it continues.
-- `transparent_address_ranking_joined_replay` when the build reaches the
-  height the other views are rebuilding at and joins their replay there.
-- `transparent_address_ranking_activated` when the build activates at the
-  shared cursor of views that already follow the tip.
-- `materialized_view_replay_ranking_build_stalled`, a warning, when the build
-  applied no history for 5 minutes outside its pauses. View replay then
-  continues without it, and the build activates once the views follow the tip.
-- `materialized_view_replay_ranking_build_state_unreadable`, a warning, when
-  replay cannot read the build's state. Replay continues without waiting for
-  the build.
-
-The build reads every canonical block from height 1 and resumes after a
-restart. Follow it with
-`zinder_materialized_view_transparent_address_ranking_build_height` and
-`zinder_materialized_view_transparent_address_ranking_build_target_height`.
-`zinder_materialized_view_replay_waiting_for_ranking_build` is `1` while view
-replay waits for it, so `zinder_materialized_view_replay_height` stays flat
-until the build joins.
-`ExplorerQuery.ServerInfo` advertises both capabilities once the ranking
-activates. A ranking that joined a replay still behind the tip answers address
-reads with the same catching-up freshness as the other views until replay
-reaches the tip.
-
-### Keep Explorer views from filling the volume
-
-Explorer views live inside the canonical store directory, so they share its
-volume. Ingest pauses view replay while that volume has less available space
-than `ZINDER_INGEST__EXPLORER_VIEWS_MIN_FREE_BYTES`, 10 GiB by default. It
-logs `materialized_view_replay_volume_space_low`, and `ExplorerQuery.ServerInfo`
-reports the views as paused. Canonical ingest and wallet serving keep running.
-
-To resume, grow the volume or free space on it. Replay continues from its
-persisted position once at least a tenth more than the floor is available.
-Set the variable to `0` only on a volume whose space you watch separately.
-
-### Rebuild Explorer views after a manifest change
-
-Each release admits only a materialized-view store whose recorded consumers
-match its bundled Explorer views exactly. A release that adds or retires an
-Explorer view therefore refuses stores built by earlier releases. For example,
-a store that still records the retired
-`transparent_address_transaction_history` view fails admission after the
-upgrade:
-
-- `zinder-ingest` logs `materialized_view_store_open_failed` with a
-  `ConsumerNotDeclared` error. It keeps writing canonical data and serving
-  wallet readers without Explorer views.
-- `zinder-explorer` exits at startup with the same error.
-
-A store that records only part of the manifest fails with
-`ExplorerViewManifestRequiresFreshStore` instead. Neither failure changes the
-store, and no Zinder service deletes it.
-
-To rebuild the Explorer views:
-
-1. Record the capabilities `ExplorerQuery.ServerInfo` advertises today. They
-   are the coverage the rebuilt store must reach again.
-2. Stop `zinder-explorer` and `zinder-ingest`.
-3. Move the `materialized-views` directory out of the canonical store path. In
-   the Compose topology it is `/var/lib/zinder/canonical/materialized-views` in
-   the `data` volume. Keep it until step 6.
-4. Start `zinder-ingest`. It creates a store with the current manifest and
-   replays retained canonical history, which must be genesis-complete or start
-   from the height-0 checkpoint. Views that own a historical backfill, such as
-   fee distributions, value-pool flows, and transaction components, fill their
-   settled history from separate backfill workers after the live tail joins.
-5. Start `zinder-explorer` once ingest reports ready.
-6. Delete the moved directory only after `ExplorerQuery.ServerInfo` reports
-   zero `lag_blocks` and advertises every capability recorded in step 1. Zero
-   lag covers only the shared replay cursor. A backfill-owned view advertises
-   its capability once its backfill completes. The transparent-address
-   ranking replays from genesis with the shared cursor, so zero lag covers it.
-
-### Stream mempool events over indexer TLS
-
-Ingest streams mempool events and chain-tip wakeups from the node's indexer
-gRPC listener when `ZINDER_NODE__INDEXER_GRPC_ADDR` is set, and polls the node
-over JSON-RPC otherwise. A node that serves its indexer listener over TLS
-needs the indexer TLS overlay, `deploy/docker-compose.indexer-tls.yml`.
-Zakura requires mutual TLS on any indexer listener that is not on loopback, so
-a Zakura node in another container streams to Zinder only this way.
-
-Configure the node's listener first. For Zakura, set:
-
-- `ZAKURA_RPC__INDEXER_LISTEN_ADDR=0.0.0.0:8230`;
-- `ZAKURA_RPC__INDEXER_TLS__CERT_FILE` and `ZAKURA_RPC__INDEXER_TLS__KEY_FILE`
-  to the node's certificate and key. The certificate must name the host that
-  Zinder dials, such as `zakura` on the shared Docker network;
-- `ZAKURA_RPC__INDEXER_TLS__CLIENT_CA_FILE` to the CA that signs Zinder's
-  client certificate.
-
-Zinder needs three PEM files:
-
-| File | Contents |
-| --- | --- |
-| `ca.pem` | The CA certificates that verify the node's indexer certificate. |
-| `client.pem` | Zinder's client certificate chain. |
-| `client-key.pem` | The private key for that certificate. |
-
-Install them in a root-owned directory that the container service group can
-read, outside the shared RocksDB volume:
-
-```bash
-sudo install -d -o root -g 10001 -m 0750 /etc/zinder/indexer-tls
-sudo install -o root -g 10001 -m 0440 node-indexer-ca.pem /etc/zinder/indexer-tls/ca.pem
-sudo install -o root -g 10001 -m 0440 zinder-client.pem /etc/zinder/indexer-tls/client.pem
-sudo install -o root -g 10001 -m 0440 zinder-client-key.pem /etc/zinder/indexer-tls/client-key.pem
-```
-
-Then set the indexer URL and the directory in `/etc/zinder/env`:
-
-```bash
-ZINDER_NODE__INDEXER_GRPC_ADDR=https://zakura:8230
-ZINDER_INDEXER_TLS_DIR=/etc/zinder/indexer-tls
-```
-
-When the node's certificate names a different host than the URL, also set
-`ZINDER_NODE__INDEXER_TLS__SERVER_NAME` to the name it carries.
-
-Validate and start the topology with the overlay:
-
-```bash
-docker compose --env-file /etc/zinder/env \
-  -f deploy/docker-compose.yml \
-  -f deploy/docker-compose.indexer-tls.yml \
-  config -q
-docker compose --env-file /etc/zinder/env \
-  -f deploy/docker-compose.yml \
-  -f deploy/docker-compose.indexer-tls.yml \
-  up -d --no-build
-```
-
-The overlay mounts the directory read-only into `zinder-ingest` only, because
-no other runtime reads the indexer, and points `[node.indexer_tls]` at the
-three files. Compose refuses to resolve the overlay without an indexer URL or
-`ZINDER_INDEXER_TLS_DIR`. Ingest checks the files at startup and exits with a
-configuration error when one is missing or holds no certificate or key, or
-when the indexer URL is not `https://`.
-
-Ingest reads the files again each time it reconnects to the indexer. The
-overlay mounts the directory rather than individual files, so a replaced file,
-including one renamed into place, takes effect on the next reconnect without a
-restart. A running stream keeps the session it opened with the old material.
-
-## Verify the ownership chain
-
-Use the host ports from the selected env file. Mainnet uses 9105, 9110, 9102,
-9106, 9107, and 9067; testnet adds 10000; regtest adds 20000.
-
-```bash
-curl -fsS http://127.0.0.1:9105/healthz
-curl -fsS http://127.0.0.1:9105/readyz
-curl -fsS http://127.0.0.1:9110/readyz
-curl -fsS http://127.0.0.1:9106/readyz
-curl -fsS http://127.0.0.1:9107/readyz
-
-grpcurl -plaintext -d '{}' 127.0.0.1:9102 \
-  zinder.v1.wallet.WalletQuery/ServerInfo
-grpcurl -plaintext -d '{}' 127.0.0.1:9067 \
-  cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo
-```
-
-Interpret the probes in order:
-
-1. Ingest is ready only when canonical following is within the configured lag
-   boundary and the current mempool generation has completed hydration.
-2. Projector is ready only when its admitted wallet store has reached an
-   authenticated canonical event fence.
-3. Native query is ready only when its inactive canonical and wallet
-   secondaries converge to one exact network, epoch, event sequence, visible
-   tip, settled tip, and digest before publication.
-4. Compatibility is ready only when its inactive canonical and wallet
-   secondaries converge to one exact network, epoch, event sequence, visible
-   tip, settled tip, and digest before publication.
-
-A process whose own serving state is not ready must continue returning 503. Do
-not route wallet traffic based on `/healthz`. Query and compatibility stay
-ready through a node or ingest-control outage. Their `/readyz` body lists the
-outage under `degraded`, and only the requests that call that dependency
-fail.
-
-## Inspect a runtime container
-
-The runtime images run the service binary as UID 10001 and contain no shell,
-so `docker compose exec zinder-query sh` fails. Run the binary itself instead:
-
-```bash
-# The effective configuration after the config file and the environment,
-# with secrets redacted.
-docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml \
-  exec zinder-query zinder-query --config /etc/zinder/config.toml --print-config
-# One readiness probe, which prints the reason when it fails.
-docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml \
-  exec zinder-query zinder-query healthcheck
-```
-
-To look at files, processes, or loopback listeners with ordinary tools, attach
-a throwaway toolbox container to the service's namespaces, with its volumes
-read-only:
-
-```bash
-container="$(docker compose --env-file /etc/zinder/env \
-  -f deploy/docker-compose.yml ps -q zinder-query)"
-docker run --rm -it \
-  --network "container:${container}" --pid "container:${container}" \
-  --volumes-from "${container}:ro" \
-  busybox:1.37 sh
-```
-
-The toolbox leaves the running container and its image unchanged, and it
-stops when you exit the shell.
-
-## Put TLS in front of compatibility
-
-The published host ports remain loopback-only. Expose only the compatibility
-route through an operator-owned trusted-TLS edge; do not publish the native
-query, compatibility plaintext listener, ops, control, observability, or
-storage ports. The [Trusted TLS and ZODL compatibility admission
-runbook](zodl-trusted-tls-certification.md) owns the parameterized Caddy
-template, certificate and DNS ownership, `/readyz` routing gate, external
-unreachability proof, endpoint attribution, and rollback evidence. An already
-accepted compatibility request may drain against its immutable canonical/wallet
-generation, but new traffic must stop when compatibility `/readyz` returns 503.
-
-Compatibility pings each HTTP/2 connection after one minute without a frame
-and closes it when the ping goes unanswered, which returns the block-range
-stream slots of a wallet that vanished. Behind the TLS edge those pings reach
-the proxy, so the proxy's own timeouts decide when a vanished wallet's stream
-ends. The Caddy template sets none, so Caddy's defaults apply; how long they
-let a vanished wallet hold a slot is not measured. Every wallet shares the
-compatibility server's block-range stream limit, and the template sets no
-per-client request limit, so one client can take every slot
-([Concurrent streams](../reference/lightwalletd-compatibility.md#concurrent-streams)).
-The same holds for the 32 slots the server uses to receive requests, which
-every client also shares
-([Requests being received](../reference/lightwalletd-compatibility.md#requests-being-received)).
-
-## Install systemd supervision
-
-The repository unit expects the checkout at `/opt/zinder` and the selected
-env file at `/etc/zinder/env`:
-
-```bash
-sudo cp /opt/zinder/deploy/systemd/zinder.service \
-  /etc/systemd/system/zinder.service
+sudo cp /opt/zinder/deploy/systemd/zinder.service /etc/systemd/system/zinder.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now zinder
 sudo journalctl -u zinder.service -f
 ```
 
-The unit runs only `deploy/docker-compose.yml`. A deployment that merges an
-overlay, such as the explorer or indexer TLS overlay, must name it in the
-unit's commands too, or the next start drops it. Add it with a drop-in from
-`sudo systemctl edit zinder`, for example for the indexer TLS overlay:
+The unit expects the checkout at `/opt/zinder` and the env file at
+`/etc/zinder/env`. It runs only `deploy/docker-compose.yml`. If you merge an
+overlay, such as the Explorer or indexer TLS overlay, add it to every command
+with `sudo systemctl edit zinder`, or the next start drops it:
 
 ```ini
 [Service]
@@ -718,144 +156,235 @@ ExecStop=
 ExecStop=/usr/bin/docker compose --env-file /etc/zinder/env -f docker-compose.yml -f docker-compose.indexer-tls.yml down
 ```
 
-## Side-by-side wallet rebuild and cutover
+### 7. Put TLS in front
 
-Never rebuild a wallet store in place while readers serve it. Provision lane B
-with all of the following distinct from lane A:
+Expose the wallet ports only through your reverse proxy, and keep every other
+port private, as [Exposing over TLS](exposing-over-tls.md) sets up.
 
-- `wallet.path`;
-- projector `storage.canonical_secondary_path`;
-- native-query canonical and wallet secondary roots;
-- compatibility canonical and wallet secondary roots;
-- projector build-owner identity;
-- native-query gRPC and ops ports;
-- compatibility gRPC and ops ports.
+## Before you take traffic
 
-Both projector lanes may read the same canonical primary and hold independent
-retention leases. Start lane B, wait for its projector, native query, and
-compatibility `/readyz` endpoints, run parity and client probes against lane B,
-then move the reverse-proxy upstream atomically. Keep lane A running until
-in-flight requests drain. Only then stop lane A and reclaim its wallet and
-secondary paths.
+- Step 5 passes.
+- From another host, the wallet ports answer only through the proxy, and no
+  other Zinder port answers.
+- The proxy stops sending new requests when compatibility `/readyz` returns
+  503.
+- Monitoring alerts on readiness and on `zinder_readiness_served_epoch_age_seconds`,
+  which grows while the served chain stops advancing. See
+  [Metrics](../reference/metrics.md).
+- The systemd unit is enabled and names every overlay you use.
 
-If lane B reports an expired event cursor or a source-fence mismatch, leave
-lane A serving and rebuild lane B from a newly captured canonical fence. Do not
-copy READY markers, rename a live RocksDB directory, or reuse a drained
-secondary path before every request holding its generation has released it.
+## Attach a Zakura node
 
-### Wallet transition exceeds its logical-byte limit
+Start the Zakura node with these settings:
 
-The projector logs `wallet_projection_following_parked` once, at error level,
-with an error that begins:
+- `ZAKURA_RPC__LISTEN_ADDR=0.0.0.0:8232` on Mainnet, or `0.0.0.0:18232` on
+  Testnet.
+- An external Docker network shared with Zinder, on which the node is
+  reachable as `zakura`. Name it in `ZINDER_SOURCE_NETWORK_NAME`.
+- `ZAKURA_RPC__COOKIE_DIR=/var/run/auth` on a dedicated named volume. Name it
+  in `ZINDER_SOURCE_COOKIE_VOLUME_NAME`. Do not give Zinder the node's state
+  volume.
+- An explicit `ZAKURA_NETWORK__ZAKURA__LISTEN_ADDR`. When it is unset, Zakura's
+  QUIC peer listener binds `0.0.0.0:8234`.
+
+The node writes its cookie as UID 10001 with mode 0600, and Zinder runs as
+UID 1000. Run the cookie-permissions project beside the node with the same
+env file. It resets the cookie's mode to 0644 every 5 seconds:
+
+```bash
+docker compose --env-file /etc/zinder/env -f deploy/node-cookie-permissions.yml up -d
+```
+
+Z3 already does this for Zebra. Zakura refuses a plaintext indexer listener
+off loopback, so to stream its mempool, follow
+[Stream mempool events over indexer TLS](#stream-mempool-events-over-indexer-tls).
+
+## Fail over to a second node
+
+Ingest can switch to a second node when the first fails, as
+[Node endpoint failover](../architecture/chain-ingestion.md#node-endpoint-failover)
+describes.
+
+Add the fallback to `/etc/zinder/env`:
 
 ```text
-wallet following stopped planning a transition that already needs <n> logical bytes, more than projector.follow.max_transition_logical_bytes (ZINDER_PROJECTOR__FOLLOW__MAX_TRANSITION_LOGICAL_BYTES) allows (<limit>)
+ZINDER_FALLBACK_SOURCE_NETWORK_NAME=zakura-mainnet
+ZINDER_FALLBACK_SOURCE_COOKIE_VOLUME_NAME=zakura-mainnet-cookie
+ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR=http://zakura:8232
+ZINDER_NODE_FALLBACKS__1__INDEXER_GRPC_ADDR=
 ```
 
-One wallet transition, typically a deep reorg that rolls back and replays many
-blocks of a busy address, touches more wallet rows than the limit allows. The
-limit counts each row the transition touches twice, once for the plan in memory
-and once for the write batch that publishes it. The projector refuses the
-transition before it writes anything, so the wallet is unchanged, and `<n>` is
-a lower bound on what the whole transition needs.
+Run the cookie-permissions project for the fallback's volume, then merge the
+overlay:
 
-The projector does not exit. It parks, and Compose reports it unhealthy because
-its `/readyz` answers 503 with cause `wallet_transition_limit_exceeded`, which
-carries `<n>` as `required_bytes` and the limit as `configured_bytes`. While
-parked, it keeps renewing its one canonical retention lease, so the wallet
-later resumes from its cursor without a rebuild, and it plans the transition
-again only after the writer commits. It resumes on its own only if a later
-reorg replaces the refused blocks, and that reconciliation is also one
-transition under the same limit.
+```bash
+ZINDER_SOURCE_COOKIE_VOLUME_NAME=zakura-mainnet-cookie \
+  docker compose -p zinder-mainnet-fallback-node-cookie \
+  --env-file /etc/zinder/env -f deploy/node-cookie-permissions.yml up -d
+docker compose --env-file /etc/zinder/env \
+  -f deploy/docker-compose.yml -f deploy/docker-compose.node-fallback.yml up -d
+```
 
-Native query and compatibility containers that were already running keep
-answering from their last serving pair until it goes stale, then refuse
-wallets with `SERVICE_NOT_READY`. Neither can publish its first serving pair
-behind the parked wallet, so one that restarts while the projector is parked
-exits during startup, and its `on-failure` policy keeps restarting it until
-the projector recovers. A fresh `docker compose up`, such as after a host
-reboot, does not start either one, because both wait for a healthy projector.
+The overlay sets a 7-second broadcast timeout for the fallback. Ingest
+`/readyz` reports `active_node.position`, and a switch logs
+`node_endpoint_switched`.
 
-To recover, stop the projector, raise the limit, and start it again:
+## Stream mempool events over indexer TLS
+
+A node that serves its indexer gRPC listener over TLS needs the
+`deploy/docker-compose.indexer-tls.yml` overlay. Zakura requires mutual TLS on
+any indexer listener off loopback. Configure Zakura with
+`ZAKURA_RPC__INDEXER_LISTEN_ADDR=0.0.0.0:8230`, its certificate and key in
+`ZAKURA_RPC__INDEXER_TLS__CERT_FILE` and `ZAKURA_RPC__INDEXER_TLS__KEY_FILE`,
+and the CA that signs Zinder's client certificate in
+`ZAKURA_RPC__INDEXER_TLS__CLIENT_CA_FILE`. The node certificate must name the
+host Zinder dials, such as `zakura`.
+
+Install Zinder's three PEM files outside the data volume:
+
+```bash
+sudo install -d -o root -g 1000 -m 0750 /etc/zinder/indexer-tls
+sudo install -o root -g 1000 -m 0440 node-indexer-ca.pem /etc/zinder/indexer-tls/ca.pem
+sudo install -o root -g 1000 -m 0440 zinder-client.pem /etc/zinder/indexer-tls/client.pem
+sudo install -o root -g 1000 -m 0440 zinder-client-key.pem /etc/zinder/indexer-tls/client-key.pem
+```
+
+Set the URL and directory in `/etc/zinder/env`, and add
+`ZINDER_NODE__INDEXER_TLS__SERVER_NAME` if the certificate names a different
+host:
+
+```bash
+ZINDER_NODE__INDEXER_GRPC_ADDR=https://zakura:8230
+ZINDER_INDEXER_TLS_DIR=/etc/zinder/indexer-tls
+```
+
+Start with the overlay, and add it to the systemd unit as in step 6:
 
 ```bash
 docker compose --env-file /etc/zinder/env \
-  -f /opt/zinder/deploy/docker-compose.yml stop zinder-projector
+  -f deploy/docker-compose.yml -f deploy/docker-compose.indexer-tls.yml up -d
 ```
 
-Add the setting to `/opt/zinder/deploy/config/projector.toml`, well above
-`<n>` and at most `1073741824`. The default is `536870912`.
+Ingest exits with a configuration error when a file is missing or holds no
+certificate or key, or when the URL is not `https://`. It rereads the files on
+each indexer reconnect, so you can replace them without a restart.
 
-```toml
-[projector.follow]
-max_transition_logical_bytes = 1073741824
-```
+## Add the Explorer
+
+Merge the Explorer overlay. It turns on Explorer views in ingest and starts
+`zinder-explorer` on host ports 9068 and 9069 on Mainnet, 19068 and 19069 on
+Testnet, and 29068 and 29069 on Regtest:
 
 ```bash
 docker compose --env-file /etc/zinder/env \
-  -f /opt/zinder/deploy/docker-compose.yml up -d zinder-projector
+  -f deploy/docker-compose.yml -f deploy/docker-compose.explorer.yml up -d --build
 ```
 
-While the projector plans and publishes one transition, its resident memory
-grows by about 0.7 to 1.5 times the bytes the transition accounts, depending
-on the blocks it replaces. Measured on Testnet with
-`zinder-bench rocksdb-tip-reorg`, a 1,000-block reorg that accounted 350 MB
-grew resident memory by 0.24 to 0.33 GB, and one that accounted 796 MB grew it
-by 1.09 to 1.18 GB. Keep at least 1.5 times the bytes you add to the limit free
-under the projector's memory limit, `ZINDER_PROJECTOR_MEMORY_LIMIT`, which
-defaults to `10g`.
+To use the released image, set
+`ZINDER_EXPLORER_IMAGE=ghcr.io/zcashfoundation/zinder-explorer:vX.Y.Z`, pull,
+and start with `--no-build`. Inside the node network, consumers reach the
+Explorer at `zinder-${ZINDER_DEPLOY_NETWORK}-explorer:9068`.
 
-If `<n>` already exceeds `1073741824`, or the failure repeats at the maximum,
-no setting admits the transition. Rebuild the wallet in lane B as described
-above, then move traffic to it.
+The views live in the data volume, under
+`/var/lib/zinder/canonical/materialized-views`. Ingest pauses them when the
+volume runs low on space, as
+[What it costs](../architecture/explorer-plane.md#what-it-costs) describes.
 
-## Restart and rollback
+A release that adds, removes, or changes an Explorer view refuses a view store
+built by another release. Ingest logs `materialized_view_store_open_failed`
+and keeps serving wallets without the views, and `zinder-explorer` exits at
+startup. To rebuild the views:
 
-Restart one owner at a time in dependency order:
+1. Record the capabilities that `ExplorerQuery.ServerInfo` advertised before
+   the upgrade.
+2. Stop `zinder-explorer`.
+3. Move `/var/lib/zinder/canonical/materialized-views` out of the canonical
+   path, on the same volume. Ingest opens the view store only at startup and
+   does not hold one it refused, so it can keep running.
+4. Restart `zinder-ingest`, then start `zinder-explorer` once ingest is ready.
+   Ingest rebuilds the views from stored chain history while wallet serving
+   continues.
+5. Delete the moved directory once `ServerInfo` reports zero `lag_blocks` and
+   advertises every capability from step 1.
+
+## Restart and roll back
+
+Restart one process at a time, in order, and wait for each `/readyz` before
+the next:
 
 ```bash
-docker compose --env-file /etc/zinder/env \
-  -f /opt/zinder/deploy/docker-compose.yml restart zinder-ingest
-docker compose --env-file /etc/zinder/env \
-  -f /opt/zinder/deploy/docker-compose.yml restart zinder-projector
-docker compose --env-file /etc/zinder/env \
-  -f /opt/zinder/deploy/docker-compose.yml restart zinder-query
-docker compose --env-file /etc/zinder/env \
-  -f /opt/zinder/deploy/docker-compose.yml restart zinder-compat-lightwalletd
+docker compose --env-file /etc/zinder/env -f /opt/zinder/deploy/docker-compose.yml restart zinder-ingest
 ```
 
-After each restart, require the complete readiness chain again. For a release
-rollback, route traffic to a previously certified side-by-side lane. Do not
-start a binary on existing canonical or wallet paths unless that release
-explicitly declares their physical layouts compatible.
+Repeat for `zinder-projector`, `zinder-query`, and
+`zinder-compat-lightwalletd`. Readers stop serving five minutes after ingest
+stops, so keep ingest's downtime short.
 
-## Production admission checklist
+To roll back a release, route traffic to a lane that already runs the earlier
+release. Do not start an earlier release on stores a later release wrote,
+unless that release states the stores are compatible.
 
-Before routing mainnet traffic, attach evidence for every item:
+## Troubleshooting
 
-- fresh canonical construction within the 3-hour hard gate;
-- wallet construction within the 2-hour hard gate and complete wallet-ready
-  lifecycle within 4 hours;
-- verified coherent canonical-plus-wallet restore and 10000-block tail within
-  15 minutes;
-- at most 2 blocks of canonical lag and at most 2 canonical epochs of wallet
-  lag under sustained following;
-- maximum-depth replacement, restart, and secondary-generation race tests;
-- storage capacity including checkpoint, compaction, restore, and growth
-  reserve;
-- fresh create, known-seed restore, non-empty transparent funds, send,
-  mempool, confirmation, restart, projection lag, and reorg on the pinned
-  independent client.
+| Symptom | Cause | Action |
+| --- | --- | --- |
+| Ingest logs `node_endpoints_unavailable` with `the node's block 0 is not the configured network's genesis block` | The node is on a different network than `ZINDER_NETWORK__NAME`. | Point `ZINDER_NODE__JSON_RPC_ADDR` at a node on the configured network. |
+| Ingest exits; `/readyz` reported `node_capability_missing` for `historical_block_bodies` | The node is pruned. | Use an archive node. |
+| Ingest `/readyz` reports `node_unavailable` after a node restart | The node replaced its cookie, and Zinder cannot read it yet. | Wait one poll interval. For Zakura, check that the cookie-permissions project runs. |
+| Projector `/readyz` reports `wallet_transition_limit_exceeded` | One wallet update is larger than its limit, and the projector parked. | Raise `max_transition_logical_bytes` under `[projector.follow]` in `deploy/config/projector.toml` and restart the projector, as [Wallet transition exceeds its logical-byte limit](deploying-single-volume.md#wallet-transition-exceeds-its-logical-byte-limit) describes. |
+| Query and compatibility refuse requests with `REORG_WINDOW_EXCEEDED` | The node replaced more blocks than the 1000-block reorg window, so ingest stopped following. A correctly working node does not do this. | Look for a replaced, resynced, or misbehaving node. Confirm the correct chain, then rebuild the stores on empty paths. Restarting only parks ingest again. |
 
-A local deployment is suitable for validation and controlled canaries. It is
-not a production certification claim without release-specific evidence for
-every gate above.
+## Side-by-side wallet rebuild and cutover
 
-## References
+The projector refuses some failures with a request to rebuild the wallet in a
+separate lane, for example when its cursor is no longer retained. Never
+rebuild a wallet store in place while readers serve it. The repository ships
+no Compose file for a second lane, so you provision lane B yourself, with all
+of these different from lane A:
 
-- [Public environment-variable contract](../architecture/public-interfaces.md#environment-variable-mapping)
-- [Initial sync](initial-sync.md)
-- [Testing](testing.md)
-- [ADR-0035](../adrs/0035-canonical-storage-topologies.md)
-- [ADR-0036](../adrs/0036-gnu-linux-binary-release-bundles.md)
-- [ADR-0037](../adrs/0037-release-artifact-provenance-and-sboms.md)
+- the wallet store path and the projector's canonical secondary path;
+- the native query and compatibility secondary paths;
+- `ZINDER_PROJECTOR_BUILD_OWNER_HEX`;
+- the native query and compatibility gRPC and ops ports.
+
+Both lanes read the same canonical store. Start lane B, wait for its
+projector, query, and compatibility `/readyz`, and test it with your clients.
+Then switch the proxy upstream to lane B. Stop lane A only after its in-flight
+requests drain. If lane B reports an expired event cursor, leave lane A
+serving and start lane B again on empty paths.
+
+## Run the release binaries without Docker
+
+Each release also publishes GNU/Linux archives of the five runtime binaries
+for x86-64-v3 and AArch64 CPUs. They need glibc 2.34 or newer and
+`libstdc++.so.6` with `GLIBCXX_3.4.30`. Debian 12 is the tested baseline.
+Download and verify an archive with GitHub CLI 2.94 or newer and Cosign:
+
+```bash
+release=vX.Y.Z
+platform=x86_64-v3-unknown-linux-gnu   # or aarch64-unknown-linux-gnu
+gh release download "$release" --repo ZcashFoundation/zinder \
+  --pattern "zinder-${release#v}-${platform}.tar.gz" \
+  --pattern "zinder-${release#v}-${platform}.spdx.json" \
+  --pattern SHA256SUMS --pattern SHA256SUMS.sigstore.json
+sha256sum --ignore-missing --check SHA256SUMS
+cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity "https://github.com/ZcashFoundation/zinder/.github/workflows/release.yml@refs/tags/${release}" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
+tar -xzf "zinder-${release#v}-${platform}.tar.gz"
+sudo install -m 0755 "zinder-${release#v}-${platform}"/bin/zinder-* /usr/local/bin/
+```
+
+The repository ships no systemd units for the binaries and does not test this
+path. If you run them directly, start from the files in `deploy/config/`,
+which each binary reads with `--config`, and keep what Compose provides:
+
+- one filesystem for every store, with the paths in those files;
+- the two control tokens at the configured paths;
+- the node endpoint, network, and projector identity from step 3, as
+  environment variables;
+- the start order ingest, projector, then the readers, each after the previous
+  one is ready;
+- loopback listen addresses. `compat-lightwalletd.toml` binds `0.0.0.0:9067`,
+  which is safe only inside the Compose network namespace.

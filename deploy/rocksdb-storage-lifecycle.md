@@ -1,22 +1,25 @@
-# RocksDB Storage Lifecycle
+# RocksDB storage lifecycle
 
-This harness measures fresh canonical-store construction followed by fresh
-wallet-store construction against an already-synchronized Zebra. It reports
-the time to canonical `READY` and wallet `READY` as separate acceptance
-boundaries, then independently cold-opens both stores and verifies that the
-wallet source fence equals the canonical fence. It does not certify continuous
-following, reorg recovery, query serving, lightwalletd compatibility, or a
-PostgreSQL deployment.
+This harness measures how long a fresh canonical store and then a fresh wallet
+store take to reach `READY` against an already synchronized Testnet Zebra. It
+reports the two times separately, then cold-opens both stores and checks that
+the wallet store has reached the same canonical chain event. It is a
+maintainer procedure.
 
-The Compose topology joins Zebra's existing external network and mounts only
-its authentication cookie read-only. It never declares or mounts Zebra's chain
-volume. Canonical and wallet data live in disposable, project-scoped volumes;
-the runner deletes those volumes before every measurement while preserving the
-Zebra state that makes repeated tests practical.
+The harness does not certify continuous following, reorg recovery, query
+serving, or lightwalletd compatibility. The canonical runtime tracer in the
+[testing runbook](../docs/runbooks/testing.md) covers the real `zinder-ingest`
+composition, following, and restart.
 
-## Build
+## Prerequisites
 
-Build the exact revision under test with the existing benchmark image target:
+- A synchronized Testnet Zebra from the Z3 stack. The harness joins its Docker
+  network (`z3-testnet` by default) and mounts only its cookie volume
+  (`z3-testnet-cookie`), read-only. It never mounts the chain volume.
+- Docker with at least the CPU and memory limits you choose below.
+- A clean checkout of the revision under test.
+
+## Build the image
 
 ```bash
 docker build \
@@ -26,18 +29,15 @@ docker build \
   .
 ```
 
-The runner resolves `zinder-bench:local` to its immutable Docker image ID and
-records that ID in the report. It also records a full Git object ID. The default
-revision is accepted only from a clean worktree; set
-`ZINDER_STORAGE_LIFECYCLE_SOFTWARE_REVISION` to the exact revision baked into a
-prebuilt image when the local checkout is unrelated. Set
-`ZINDER_STORAGE_LIFECYCLE_IMAGE` when using a different local tag or a
-digest-pinned registry reference.
+The runner records the image ID and the full Git revision in the report. It
+accepts the default revision only from a clean worktree. If you use a prebuilt
+image from another checkout, set `ZINDER_STORAGE_LIFECYCLE_SOFTWARE_REVISION`
+to the revision baked into it. Set `ZINDER_STORAGE_LIFECYCLE_IMAGE` to use a
+different tag or a digest-pinned reference.
 
-## Smoke test
+## Run a smoke test
 
-Use a small fixed tip to prove the complete deployed code path before spending
-hours on a current-tip measurement:
+A small fixed tip proves the whole code path in minutes:
 
 ```bash
 ZINDER_STORAGE_LIFECYCLE_TIP_HEIGHT=10000 \
@@ -46,36 +46,22 @@ ZINDER_STORAGE_LIFECYCLE_EVIDENCE_PATH="$PWD/.tmp/rocksdb-storage-lifecycle-smok
   scripts/run-rocksdb-storage-lifecycle.sh
 ```
 
-This is functional evidence only. A small-tip result is not a performance
-projection for the current chain.
+A smoke result is functional evidence only. It does not predict a current-tip
+run.
 
-## Current-tip measurement
-
-Run without `ZINDER_STORAGE_LIFECYCLE_TIP_HEIGHT` to capture the synchronized
-testnet Zebra height immediately before the measurement:
+## Measure to the current tip
 
 ```bash
 scripts/run-rocksdb-storage-lifecycle.sh
 ```
 
-The report and independent container-resource evidence are written under
-`.tmp/rocksdb-storage-lifecycle-evidence` by default. The report separates
-source discovery, canonical source loading, canonical cold validation and
-publication, wallet scanning and external sorting, wallet SST ingestion, wallet
-cold validation and publication, and final independent cold admission. Wallet
-cold validation is a digest and row-count readback of the durable rows against
-the construction evidence, and the report records the wall time of each family
-scan (the scans overlap, so each is bounded by the cold-validation total). The
-resource observer records exact cgroup peak memory and sampled peak disk usage
-for the complete process.
+The runner reads Zebra's height just before construction starts and freezes it
+for the whole run. The result covers height 1 through that tip, not blocks
+mined during the run.
 
-The current tip is the Zebra height observed immediately before construction
-starts. It is frozen for the entire run, so a node that advances while the test
-is running cannot move the acceptance fence. The result proves synchronization
-from height 1 through that fixed starting tip; it does not claim that the
-completed store also contains blocks Zebra mined during the measurement.
-
-To inspect the two acceptance durations after a successful run:
+The report and container resource evidence go to
+`.tmp/rocksdb-storage-lifecycle-evidence` by default. Read the two acceptance
+times with:
 
 ```bash
 jq '{
@@ -86,31 +72,35 @@ jq '{
 }' .tmp/rocksdb-storage-lifecycle-evidence/rocksdb-storage-lifecycle.json
 ```
 
-The default local envelope is 10 CPU cores and 10 GiB of memory, leaving Docker
-Desktop headroom on the reference development machine. The runner refuses a
-limit above Docker's advertised capacity before it creates any containers.
-Override `ZINDER_STORAGE_LIFECYCLE_CPU_LIMIT_CORES`,
-`ZINDER_STORAGE_LIFECYCLE_MEMORY_LIMIT_BYTES`, and
-`ZINDER_STORAGE_LIFECYCLE_STORAGE_CLASS` together when comparing another
-machine or deployment class. The lifecycle derives source concurrency,
-source/prepare watermarks, and prepare concurrency from that envelope plus
-`ZINDER_NODE_MAX_RESPONSE_BYTES`; independent pipeline tuning is intentionally
-not part of this certification command. Every report records the resolved
-limits, and the validator recomputes them from the requested Compose envelope.
-The CPU value is a container quota, not an exclusive reservation; Zebra shares
-the Docker engine and remains outside the measured lifecycle cgroup.
+The report also breaks the run into phases: canonical loading, canonical
+validation and publication, wallet scanning and sorting, wallet SST ingestion,
+wallet validation and publication, and the final cold admission. The resource
+observer records the cgroup memory peak and sampled peak disk use.
 
-## State lifecycle
+## Choose resource limits
 
-Every runner invocation first renders and inspects the Compose topology. It
-refuses an unsafe project name, a non-testnet network, a writable cookie mount,
-or any reference to the configured Zebra chain volume. Only after those checks
-does it run `docker compose down --volumes` for the project-scoped harness.
+The default envelope is 10 CPU cores and 10 GiB of memory. To measure another
+machine or deployment class, set these together:
 
-The harness leaves the completed canonical and wallet volumes available for
-diagnosis. A subsequent invocation deletes them before starting. After the
-runner has removed its containers, delete the default project's two volumes
-manually without touching Zebra with:
+- `ZINDER_STORAGE_LIFECYCLE_CPU_LIMIT_CORES`
+- `ZINDER_STORAGE_LIFECYCLE_MEMORY_LIMIT_BYTES`
+- `ZINDER_STORAGE_LIFECYCLE_STORAGE_CLASS`
+
+The runner refuses limits above Docker's advertised capacity before it creates
+containers. It derives source and preparation concurrency from the envelope and
+`ZINDER_NODE_MAX_RESPONSE_BYTES`. The CPU limit is a quota, not a reservation:
+Zebra shares the Docker engine and is not measured.
+
+## State and cleanup
+
+Before each run, the runner checks the rendered Compose model. It refuses an
+unsafe project name, a network other than Testnet, a writable cookie mount, or
+any reference to the Zebra chain volume. Only then does it run
+`docker compose down --volumes` for the harness project.
+
+The finished canonical and wallet volumes stay available for diagnosis until
+the next run deletes them. To delete them yourself after the containers have
+stopped:
 
 ```bash
 docker volume rm \
@@ -118,47 +108,27 @@ docker volume rm \
   zinder-storage-lifecycle-test_wallet_state
 ```
 
-## Acceptance contract
+## Acceptance
 
-The runner invokes
-`scripts/validate-rocksdb-storage-lifecycle-report.sh` after the container
-exits. The validator is independent of the Rust report validator and pins the
-closed report-format-version-4 JSON shape. It rejects evidence unless all of these conditions
-hold:
+After the container exits, the runner calls
+`scripts/validate-rocksdb-storage-lifecycle-report.sh`. The validator is
+independent of the Rust code and pins the exact report shape and contract
+versions. It rejects the evidence unless:
 
-- canonical physical schema 5, wallet-store and wallet-projection physical
-  schema 1, wallet value encoding 2, and replay, block digest, sequence digest,
-  and resource-evidence versions 1 are exact; the benchmark report contract is
-  version 4;
-- canonical `READY` covers the contiguous height-1-through-fixed-tip range,
-  authenticates the source checkpoint, and survives a cold reopen;
+- the store schema, replay, digest, and report versions match the values it
+  pins;
+- canonical `READY` covers heights 1 through the fixed tip and survives a cold
+  reopen;
 - wallet `READY` has the same epoch, event, tip, sequence digest, block count,
-  and transaction count, and both stores pass the final cold fence admission;
-- durable wallet counts, projection digest, UTXO commitment, and retained undo
-  depth are internally consistent;
-- all three build sorters remain within their declared memory and
-  temporary-file ceilings, both reorg suffixes remain within their
-  memory ceiling, and historical prevout and cold-validation random reads are
-  zero;
-- every monotonic phase duration and acceptance boundary is non-negative and
-  internally ordered;
-- the report carries the expected fixed tip, immutable image ID, full software
-  revision, trial ID, runner envelope, and testnet source identity; and
-- the separate resource observer covers the whole report window with a private
-  cgroup-v2 namespace, exact memory sources, sampled storage, a zero child exit
-  status, matching trial identity, and cgroup and process peaks independently
-  within the declared memory limit. The validator does not order process
-  `VmHWM` against cgroup `memory.peak` because their shared-page accounting is
-  not identical. It also does not compare monotonic phase durations with Unix
-  timestamp deltas because wall-clock synchronization can move Unix time while
-  a run is active; Unix timestamps remain ordered provenance and
-  resource-correlation boundaries.
-
-This is a storage-construction acceptance boundary. Query serving, live
-following, and consumer-protocol parity require their own tests after these
-stores are admitted.
-
-Run the separate [canonical runtime tracer](../docs/runbooks/testing.md#canonical-runtime-tracer)
-to certify the real `zinder-ingest` composition, append-only following, source
-recovery, and authenticated restart. That gate does not turn this construction
-report into service or topology certification.
+  and transaction count, and both stores pass the final cold admission;
+- wallet row counts, projection digest, UTXO commitment, and undo depth are
+  consistent;
+- the build sorters stay within their memory and temporary-file ceilings, the
+  reorg suffixes stay within their memory ceiling, and historical prevout and
+  cold-validation random reads are zero;
+- phase durations are non-negative and ordered;
+- the report names the fixed tip, image ID, full revision, trial ID, resource
+  envelope, and Testnet source; and
+- the resource observer covers the whole report window from a private cgroup
+  v2 namespace, the child exited with status 0, and both the cgroup and process
+  memory peaks are within the limit.

@@ -17,10 +17,10 @@
 //!   it.
 //! - [`MaterializedViewStore`] is the `RocksDB` wrapper consumers write through. It
 //!   shares its option layering with `zinder_store`'s canonical store so the
-//!   bulk-catchup-OOM bound from [ADR-0020] applies to both planes.
+//!   bulk-catchup-OOM bound from [ADR-0005] applies to both planes.
 //!
 //! See `docs/architecture/materialized-view-plane.md` for the SDK pattern and
-//! `docs/adrs/0017-materialized-view-consumer-and-key-codec.md` for the trait
+//! `docs/adrs/0020-materialized-views.md` for the trait
 //! and codec convention.
 
 pub mod consumer;

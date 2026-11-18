@@ -61,9 +61,9 @@ pub struct RemoteOpenOptions {
 
 /// Remote chain index backed by the native wallet gRPC API.
 ///
-/// `RemoteChainIndex` is the recommended baseline for the Zallet-with-Zinder
-/// operator recipe documented in
-/// [Service operations §Zallet with Zinder](../../../docs/architecture/service-operations.md#zallet-with-zinder).
+/// `RemoteChainIndex` is the recommended baseline for a server-side wallet,
+/// as described in
+/// [Integration surfaces §Server-side wallets](../../../docs/reference/integration-surfaces.md#server-side-wallets).
 /// Zinder services that read storage directly use the service-internal
 /// `WalletServingQuery` composition rather than this public client surface.
 ///
@@ -1839,7 +1839,7 @@ fn transaction_broadcast_outcome_from_message(
 
 /// Decodes the wire reason. An unspecified or unrecognized discriminant, as
 /// written by an older or newer server, degrades to `Unknown` so the
-/// rejection and its message still reach the caller (ADR-0023).
+/// rejection and its message still reach the caller (ADR-0018).
 fn broadcast_rejection_reason_from_message(code: i32) -> zinder_core::BroadcastRejectionReason {
     use zinder_core::BroadcastRejectionReason;
 
