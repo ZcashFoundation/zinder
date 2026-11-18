@@ -310,11 +310,16 @@ see [Upgrading the node](upgrading-the-node.md#with-a-fallback-node).
 Query and compatibility broadcast through the same list. They verify each
 endpoint before sending it a transaction, try `[node]` first, and move to the
 next verified endpoint when one is unreachable. The endpoint that answered
-stays preferred. `docker compose logs zinder-query` shows `wallet_node_verified`
-or `wallet_node_excluded` for each position and `broadcast_endpoint_switched`
-when the preferred endpoint changes. Keep `broadcast_timeout_secs` (7 seconds
-in the shipped configuration) well below wallet request deadlines, because a
-broadcast moves on only after it expires.
+after such a move stays preferred, and the node probe moves the preference the
+same way when the preferred endpoint stops answering. `docker compose logs
+zinder-query` shows `wallet_node_verified` or `wallet_node_excluded` for each
+position and `broadcast_endpoint_switched` when the preferred endpoint
+changes. Keep every endpoint's `broadcast_timeout_secs` well below wallet
+request deadlines, because a broadcast moves on only after it expires. Each
+endpoint takes its own value, and an endpoint without one waits for its own
+`request_timeout_secs` instead. The shipped configuration sets 7 seconds for
+`[node]`, and the overlay sets `ZINDER_NODE_FALLBACKS__1__BROADCAST_TIMEOUT_SECS`
+to 7 unless the env file overrides it.
 
 ### Attach an explorer consumer
 

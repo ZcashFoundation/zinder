@@ -35,6 +35,9 @@ x-fallback-node-environment: &fallback-node-environment
   ZINDER_NODE_FALLBACKS__1__AUTH__METHOD: cookie
   ZINDER_NODE_FALLBACKS__1__AUTH__PATH: /var/run/auth-fallback/.cookie
   ZINDER_NODE_FALLBACKS__1__REQUEST_TIMEOUT_SECS: ${ZINDER_NODE_FALLBACKS__1__REQUEST_TIMEOUT_SECS:-30}
+  # A fallback does not inherit [node]'s broadcast timeout; without its own,
+  # a hung fallback holds each broadcast for REQUEST_TIMEOUT_SECS.
+  ZINDER_NODE_FALLBACKS__1__BROADCAST_TIMEOUT_SECS: ${ZINDER_NODE_FALLBACKS__1__BROADCAST_TIMEOUT_SECS:-7}
 
 services:
   zinder-ingest:

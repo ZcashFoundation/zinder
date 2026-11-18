@@ -300,7 +300,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         description: "Per-call timeout (seconds) applied only to `sendrawtransaction`. When \
                       unset, the global `request_timeout_secs` applies instead. Recommended: 7. \
                       With fallback endpoints, a broadcast moves to the next endpoint only after \
-                      this timeout, so keep it well below wallet request deadlines.",
+                      the endpoint's own timeout, so keep it well below wallet request \
+                      deadlines. Fallback endpoints do not inherit it; set \
+                      `ZINDER_NODE_FALLBACKS__<N>__BROADCAST_TIMEOUT_SECS` for each.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE__HEALTH__ADDR",
@@ -334,8 +336,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         sensitive: false,
         description: "Cadence of the upstream-health probe in milliseconds. Defaults to 30000. \
                       Must be greater than zero. Query and wallet-serving compatibility use \
-                      it to verify their broadcast node on first contact and then refresh \
-                      the node dependency their readiness reports; compact-blocks \
+                      it to verify every broadcast endpoint, `[node]` and each fallback, on \
+                      first contact and then refresh the node dependency their readiness \
+                      reports; compact-blocks \
                       compatibility rejects it; `zinder-explorer` reuses the same cadence for \
                       its upstream-observation probe (the one that populates \
                       `ExplorerFreshness.chain_view.upstream_tip`).",
@@ -534,7 +537,9 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Same as `ZINDER_NODE__BROADCAST_TIMEOUT_SECS`, for fallback endpoint `<N>`.",
+        description: "Same as `ZINDER_NODE__BROADCAST_TIMEOUT_SECS`, for fallback endpoint \
+                      `<N>`. It is not inherited from `[node]`: when unset, this endpoint's \
+                      own `request_timeout_secs` applies. Recommended: 7.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE_FALLBACKS__<N>__HEALTH__ADDR",
@@ -560,7 +565,10 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
         ],
         requirement: Requirement::Optional,
         sensitive: false,
-        description: "Same as `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS`, for fallback endpoint `<N>`.",
+        description: "Same as `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS`, for fallback endpoint \
+                      `<N>`, in ingest. Query and wallet-serving compatibility ignore it and \
+                      verify and observe every endpoint on \
+                      `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS`.",
     },
     EnvVarDoc {
         name: "ZINDER_NODE_FALLBACKS__<N>__HEALTH__VERIFICATION_PROGRESS_FLOOR",
