@@ -14,7 +14,8 @@
 //! malformed health response is not evidence that the upstream is ready.
 //! When the node failover switches endpoints it resets the input to
 //! `starting`, and the probe observes the new endpoint at once instead of at
-//! its next tick.
+//! its next tick. A probe of the previous endpoint still in flight at the
+//! switch publishes nothing.
 //!
 //! [ADR-0015 §Upstream sync detection]:
 //!     ../../../docs/adrs/0015-phase-driven-ingest.md#upstream-sync-detection
@@ -35,7 +36,9 @@ use zinder_source::{NodeSource, UpstreamHealthSnapshot};
 /// snapshot as the [`ReadinessInput::NodeSource`] input of `readiness`.
 /// Probe errors keep the last published observation and log a warning; the
 /// ingest loop continues to own the admission state. When `endpoint_switches`
-/// is supplied, each change of the active node endpoint probes immediately.
+/// is supplied, each change of the active node endpoint probes immediately,
+/// and a probe that a switch interrupts publishes nothing: it observed the
+/// previous endpoint, and the switch already reset the input for the new one.
 #[must_use = "drop the handle to detach the task or await it for symmetric shutdown"]
 pub fn spawn_upstream_health_probe_task<Source>(
     source: Arc<Source>,
@@ -55,7 +58,8 @@ where
                 () = tokio::time::sleep(poll_interval) => {}
                 Some(()) = endpoint_switched(endpoint_switches.as_mut()) => {}
             }
-            run_upstream_health_probe_once(source.as_ref(), &readiness).await;
+            run_upstream_health_probe_once(source.as_ref(), &readiness, endpoint_switches.as_mut())
+                .await;
         }
     })
 }
@@ -69,11 +73,23 @@ async fn endpoint_switched(endpoint_switches: Option<&mut watch::Receiver<usize>
     }
 }
 
-async fn run_upstream_health_probe_once<Source>(source: &Source, readiness: &ComposedReadiness)
-where
+async fn run_upstream_health_probe_once<Source>(
+    source: &Source,
+    readiness: &ComposedReadiness,
+    mut endpoint_switches: Option<&mut watch::Receiver<usize>>,
+) where
     Source: NodeSource,
 {
-    match source.poll_upstream_health().await {
+    if let Some(endpoint_switches) = endpoint_switches.as_deref_mut() {
+        endpoint_switches.mark_unchanged();
+    }
+    let probe_outcome = source.poll_upstream_health().await;
+    if endpoint_switches
+        .is_some_and(|endpoint_switches| endpoint_switches.has_changed().unwrap_or(false))
+    {
+        return;
+    }
+    match probe_outcome {
         Ok(snapshot) => apply_upstream_health_snapshot(snapshot, readiness),
         Err(error) => {
             tracing::warn!(

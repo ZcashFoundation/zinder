@@ -73,6 +73,8 @@ struct FailoverEndpoint {
     probe_delay: Arc<Mutex<Duration>>,
     /// Makes the upstream health check wait forever.
     health_hangs: Arc<AtomicBool>,
+    /// Delay before the upstream health check answers.
+    health_delay: Arc<Mutex<Duration>>,
     /// Blocks above this height are unavailable.
     blocks_unavailable_above: Arc<Mutex<Option<BlockHeight>>>,
     ready: Arc<AtomicBool>,
@@ -100,6 +102,7 @@ impl FailoverEndpoint {
             fault: Arc::new(Mutex::new(Fault::None)),
             probe_delay: Arc::new(Mutex::new(Duration::ZERO)),
             health_hangs: Arc::new(AtomicBool::new(false)),
+            health_delay: Arc::new(Mutex::new(Duration::ZERO)),
             blocks_unavailable_above: Arc::new(Mutex::new(None)),
             ready: Arc::new(AtomicBool::new(true)),
         })
@@ -221,6 +224,8 @@ impl NodeSource for FailoverEndpoint {
         if self.health_hangs.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
         }
+        let health_delay = *self.health_delay.lock();
+        tokio::time::sleep(health_delay).await;
         self.answer().await?;
         Ok(if self.ready.load(Ordering::SeqCst) {
             UpstreamHealthSnapshot::ready(
@@ -1206,6 +1211,41 @@ async fn upstream_health_probe_observes_the_new_endpoint_right_after_a_switch() 
     probe.await?;
 
     assert!(observed.is_ok(), "the probe waited for its next tick");
+    Ok(())
+}
+
+/// A probe of `[node]` still in flight when ingest switches publishes
+/// nothing, so it never replaces the reset input with the previous
+/// endpoint's health, even when the new endpoint does not answer.
+#[tokio::test]
+async fn upstream_health_probe_discards_an_observation_of_the_previous_endpoint() -> TestResult {
+    let blocks = parseable_multi_block_chain()?;
+    let slow_primary = FailoverEndpoint::serving(&blocks, 4)?;
+    *slow_primary.health_delay.lock() = Duration::from_millis(300);
+    let silent_fallback = FailoverEndpoint::serving(&blocks, 4)?;
+    silent_fallback.set_unreachable(true);
+    let (nodes, switch) = NodeSet::new(slow_primary, [silent_fallback]);
+    let composed = ComposedReadiness::new(Readiness::default(), &[ReadinessInput::NodeSource]);
+    let cancel = CancellationToken::new();
+    let probe = spawn_upstream_health_probe_task(
+        Arc::new(nodes.clone()),
+        composed.clone(),
+        Duration::from_millis(10),
+        Some(nodes.subscribe_switches()),
+        cancel.clone(),
+    );
+
+    // Switch while the first probe of `[node]` is in flight, resetting the
+    // input as the failover does.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(switch.switch_to(1));
+    composed.publish_input(ReadinessInput::NodeSource, ReadinessCause::Starting);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let input = composed.input_cause(ReadinessInput::NodeSource);
+    cancel.cancel();
+    probe.await?;
+
+    assert!(matches!(input, Some(ReadinessCause::Starting)), "{input:?}");
     Ok(())
 }
 
