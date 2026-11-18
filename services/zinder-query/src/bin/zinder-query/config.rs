@@ -12,14 +12,14 @@ use zinder_core::Network;
 use zinder_runtime::{
     BearerToken, BearerTokenError, CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml,
     ConfigError, ConfigLoader, IngestControlReaderToml, IngestControlSection, NetworkSection,
-    NetworkToml, NodeToml, OpsSection, OpsToml, ResolvedCanonicalSecondaryStorage,
-    ResolvedIngestControlReader, RocksDbResourceBudgetSection, RocksDbResourceBudgetToml,
-    RuntimeService, SecuritySection, SecurityToml, guard_optional_serving_bind, guard_serving_bind,
-    parse_socket_addr, require_field, resolve_allow_public_bind,
-    resolve_canonical_secondary_storage, resolve_ingest_control_reader, resolve_ops_listen_addr,
-    resolve_wallet_projection_reader_rocksdb_budget,
+    NetworkToml, NodeFallbacksToml, NodeToml, OpsSection, OpsToml,
+    ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader, RocksDbResourceBudgetSection,
+    RocksDbResourceBudgetToml, RuntimeService, SecuritySection, SecurityToml,
+    guard_optional_serving_bind, guard_serving_bind, parse_socket_addr, require_field,
+    resolve_allow_public_bind, resolve_canonical_secondary_storage, resolve_ingest_control_reader,
+    resolve_ops_listen_addr, resolve_wallet_projection_reader_rocksdb_budget,
 };
-use zinder_source::{NodeSection, NodeTarget};
+use zinder_source::{NodeFallbackSections, NodeSection, NodeTarget};
 use zinder_store::{CanonicalReorgPolicy, CanonicalStoreBuildPlanError, RocksDbResourceBudget};
 
 /// Resolved native wallet-query runtime configuration.
@@ -41,6 +41,9 @@ pub(super) struct QueryConfig {
     /// Node endpoint transaction broadcast reaches, or `None` for a
     /// storage-only query.
     pub(super) node: Option<NodeTarget>,
+    /// Fallback endpoints after `node`. Query reads them but does not use them
+    /// yet.
+    pub(super) node_fallbacks: Vec<NodeTarget>,
 }
 
 /// Command-line overrides for the native wallet-query command.
@@ -150,6 +153,7 @@ struct QueryRawConfig {
     ingest_control: IngestControlSection,
     query: QuerySection,
     node: Option<NodeSection>,
+    node_fallbacks: NodeFallbackSections,
     security: SecuritySection,
 }
 
@@ -207,6 +211,10 @@ fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConf
         .map(|section| NodeTarget::resolve(network, section))
         .transpose()
         .map_err(ConfigError::from)?;
+    let node_fallbacks =
+        NodeTarget::resolve_fallbacks(network, config.node_fallbacks).map_err(ConfigError::from)?;
+    NodeTarget::require_primary_for_fallbacks(node.as_ref(), &node_fallbacks)
+        .map_err(ConfigError::from)?;
 
     Ok(QueryConfig {
         network,
@@ -223,6 +231,7 @@ fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConf
         canonical_reorg_policy,
         pair_convergence_attempts,
         node,
+        node_fallbacks,
     })
 }
 
@@ -310,6 +319,8 @@ struct QueryConfigToml {
     query: QueryToml,
     #[serde(skip_serializing_if = "Option::is_none")]
     node: Option<NodeToml>,
+    #[serde(skip_serializing_if = "NodeFallbacksToml::is_empty")]
+    node_fallbacks: NodeFallbacksToml,
 }
 
 impl QueryConfigToml {
@@ -334,6 +345,7 @@ impl QueryConfigToml {
                 pair_convergence_attempts: config.pair_convergence_attempts.get(),
             },
             node: config.node.as_ref().map(NodeToml::from_node_target),
+            node_fallbacks: NodeFallbacksToml::from_node_targets(&config.node_fallbacks),
         }
     }
 }

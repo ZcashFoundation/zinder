@@ -98,6 +98,15 @@ message ReadinessReport {
   // serving its last chain view while its node or the writer stops
   // advancing, so this age shows how stale that view is.
   optional uint64 served_epoch_age_seconds = 8;
+  // Node endpoint the canonical writer reads from. Set only by zinder-ingest,
+  // and only when [node_fallbacks.N] endpoints are configured.
+  ActiveNodeEndpoint active_node = 9;
+}
+
+// One endpoint of the ordered node list a runtime is configured with.
+message ActiveNodeEndpoint {
+  // Position in the ordered list: 0 is [node], N is [node_fallbacks.N].
+  uint32 position = 1;
 }
 
 // Latest observation of one dependency a process keeps serving without.

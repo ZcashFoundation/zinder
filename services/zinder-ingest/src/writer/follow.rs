@@ -19,7 +19,7 @@ use zinder_core::{
 };
 use zinder_proto::v1::ops::ReorgWindowExceededDetail;
 use zinder_runtime::{ComposedReadiness, IngestPhase, ReadinessCause, ReadinessState};
-use zinder_source::{NodeSource, SourceBlock, SourceError};
+use zinder_source::{NodeSource, SourceBlock, SourceError, SourceFailureClass};
 use zinder_store::{
     CanonicalAppendAnchor, CanonicalBuildBlock, CanonicalBuildSubtreeRoot, CanonicalLiveAppend,
     CanonicalLiveReplacement, CanonicalReplacementBlock, CanonicalStoreError,
@@ -28,7 +28,7 @@ use zinder_store::{
 
 use crate::{
     CanonicalBlockConstructionError, CanonicalConstructionError, CommitmentTreeSizes, IngestError,
-    MempoolReadyGate, position_canonical_block, prepare_canonical_block,
+    MempoolReadyGate, NodeFailover, position_canonical_block, prepare_canonical_block,
     source_recovery::{
         SourceRecoveryDecision, decide_recovery, default_recovery_backoff, detail_for_new_outage,
         detail_for_ongoing_outage,
@@ -67,6 +67,10 @@ pub struct CanonicalFollowConfig {
     /// replacement is prepared. A replacement commits atomically, so its whole
     /// suffix, up to one reorg window, is prepared before the write.
     pub max_replacement_bytes: NonZeroU64,
+    /// Optional endpoint failover. When present, the follower switches to a
+    /// standby node endpoint between follow iterations after repeated
+    /// transport failures or a sustained not-ready upstream.
+    pub node_failover: Option<NodeFailover>,
 }
 
 /// Default for [`CanonicalFollowConfig::max_replacement_bytes`]: 2 GiB, room
@@ -111,9 +115,9 @@ where
     async fn recover_source_failure(
         &self,
         source_error: SourceError,
-        source_outage: &mut SourceOutage,
+        source_outage: &mut Option<SourceOutage>,
         visible_height: BlockHeight,
-    ) -> Result<bool, CanonicalFollowError> {
+    ) -> Result<SourceRecovery, CanonicalFollowError> {
         let ingest_error = IngestError::from(source_error);
         let SourceRecoveryDecision::Recover {
             failure_class,
@@ -125,7 +129,7 @@ where
         };
         if source_outage
             .as_ref()
-            .is_none_or(|(_, previous)| previous.failure_class != failure_class.label())
+            .is_none_or(|outage| outage.failure_class != failure_class)
         {
             tracing::warn!(
                 target: "zinder::ingest",
@@ -137,21 +141,10 @@ where
                 "canonical follower kept its fence and will observe the node again"
             );
         }
-        let detail = source_outage.as_ref().map_or_else(
-            || detail_for_new_outage(failure_class, last_reason.clone()),
-            |(started_at, previous)| {
-                detail_for_ongoing_outage(
-                    previous,
-                    failure_class,
-                    last_reason.clone(),
-                    u32::try_from(started_at.elapsed().as_secs()).unwrap_or(u32::MAX),
-                )
-            },
-        );
-        source_outage.get_or_insert_with(|| (std::time::Instant::now(), detail.clone()));
-        if let Some((_, current_detail)) = source_outage.as_mut() {
-            *current_detail = detail.clone();
-        }
+        let outage = SourceOutage::record(source_outage.take(), failure_class, last_reason);
+        let detail = outage.detail.clone();
+        let consecutive_same_class = outage.consecutive_same_class;
+        *source_outage = Some(outage);
         self.readiness
             .publish_admission(ReadinessState::node_unavailable_with_detail(
                 detail,
@@ -162,9 +155,17 @@ where
             "failure_class" => failure_class.label()
         )
         .increment(1);
+        if let Some(node_failover) = self.config.node_failover.as_ref()
+            && node_failover
+                .switch_after_failures(failure_class, consecutive_same_class)
+                .await
+                .is_some()
+        {
+            return Ok(SourceRecovery::Switched);
+        }
         Ok(tokio::select! {
-            () = self.cancel.cancelled() => true,
-            () = tokio::time::sleep(backoff) => false,
+            () = self.cancel.cancelled() => SourceRecovery::Cancelled,
+            () = tokio::time::sleep(backoff) => SourceRecovery::Retry,
         })
     }
 
@@ -244,7 +245,56 @@ where
     }
 }
 
-type SourceOutage = Option<(std::time::Instant, zinder_runtime::NodeUnavailableDetail)>;
+/// What the follower does after recovering from a source failure.
+enum SourceRecovery {
+    /// Shutdown was requested during the backoff.
+    Cancelled,
+    /// Observe the same endpoint again.
+    Retry,
+    /// The node failover switched endpoints; observe the new one now.
+    Switched,
+}
+
+/// The source outage in progress, counted per failure class so a switch
+/// threshold for one class never counts another.
+struct SourceOutage {
+    started_at: std::time::Instant,
+    detail: zinder_runtime::NodeUnavailableDetail,
+    failure_class: SourceFailureClass,
+    consecutive_same_class: u32,
+}
+
+impl SourceOutage {
+    fn record(
+        previous: Option<Self>,
+        failure_class: SourceFailureClass,
+        last_reason: std::borrow::Cow<'static, str>,
+    ) -> Self {
+        match previous {
+            None => Self {
+                started_at: std::time::Instant::now(),
+                detail: detail_for_new_outage(failure_class, last_reason),
+                failure_class,
+                consecutive_same_class: 1,
+            },
+            Some(previous) => Self {
+                detail: detail_for_ongoing_outage(
+                    &previous.detail,
+                    failure_class,
+                    last_reason,
+                    u32::try_from(previous.started_at.elapsed().as_secs()).unwrap_or(u32::MAX),
+                ),
+                consecutive_same_class: if previous.failure_class == failure_class {
+                    previous.consecutive_same_class.saturating_add(1)
+                } else {
+                    1
+                },
+                started_at: previous.started_at,
+                failure_class,
+            },
+        }
+    }
+}
 
 /// Exact bounded-discovery evidence for a fork beyond authenticated settlement.
 #[derive(Debug, Error)]
@@ -488,7 +538,8 @@ where
     follower
         .readiness
         .update_admission(|admission| admission.phase = Some(IngestPhase::FollowingTip));
-    let mut source_outage = None;
+    let mut source_outage: Option<SourceOutage> = None;
+    let mut observed_fence_tip = None;
     let mut next_event_retention_check = std::time::Instant::now();
     let mut mempool_hydration_changes = follower.config.mempool_ready_gate.clone();
     // The opened store's visible tip may sit on a branch the node abandoned
@@ -508,6 +559,14 @@ where
         }
         if follower.cancel.is_cancelled() {
             return Ok(store);
+        }
+        if let Some(node_failover) = follower.config.node_failover.as_ref() {
+            observe_fence_for_failover(node_failover, &store, &mut observed_fence_tip)?;
+            if node_failover.switch_after_unready().await.is_some() {
+                source_outage = None;
+                tip_confirmation = TipConfirmation::Unconfirmed;
+                continue;
+            }
         }
         if std::time::Instant::now() >= next_event_retention_check {
             if let Some(window) = follower.config.event_retention_window {
@@ -561,7 +620,7 @@ where
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(CanonicalFollowError::Source(source_error)) => {
-                if follower
+                match follower
                     .recover_source_failure(
                         source_error,
                         &mut source_outage,
@@ -569,7 +628,14 @@ where
                     )
                     .await?
                 {
-                    return Ok(store);
+                    SourceRecovery::Cancelled => return Ok(store),
+                    SourceRecovery::Retry => {}
+                    SourceRecovery::Switched => {
+                        // The new endpoint has not confirmed the visible tip,
+                        // and its failures start a new outage.
+                        source_outage = None;
+                        tip_confirmation = TipConfirmation::Unconfirmed;
+                    }
                 }
                 continue;
             }
@@ -677,6 +743,23 @@ where
             }
         }
     }
+}
+
+/// Publishes the writer's fence to the node failover when its visible tip
+/// moved, so standby evaluation compares candidates with the current tip.
+fn observe_fence_for_failover(
+    node_failover: &NodeFailover,
+    store: &RocksDbCanonicalStore,
+    observed_fence_tip: &mut Option<BlockId>,
+) -> Result<(), CanonicalFollowError> {
+    let visible_tip = store.event_fence().visible_tip();
+    if *observed_fence_tip == Some(visible_tip) {
+        return Ok(());
+    }
+    let anchor = store.append_anchor()?;
+    node_failover.observe_fence(visible_tip, anchor.settled_tip());
+    *observed_fence_tip = Some(visible_tip);
+    Ok(())
 }
 
 enum FollowIteration {

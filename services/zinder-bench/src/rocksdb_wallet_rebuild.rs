@@ -111,9 +111,9 @@ pub(crate) async fn run_rocksdb_wallet_rebuild(
             broadcast_timeout: None,
         },
     )?;
-    let activations = source
-        .discover_network_upgrade_activations("zinder-bench-wallet-rebuild")
-        .await?;
+    let activations =
+        zinder_source::discover_network_upgrade_activations(&source, "zinder-bench-wallet-rebuild")
+            .await?;
     let canonical_store = RocksDbCanonicalStore::open_ready(
         &args.canonical_store,
         &activations,

@@ -1433,11 +1433,35 @@ fn ops_readiness_report_round_trips_explorer_view_identities() -> eyre::Result<(
         materialized_view_identities: vec!["block_summary".to_owned()],
         degraded: Vec::new(),
         served_epoch_age_seconds: None,
+        active_node: None,
     };
 
     let decoded = round_trip(&report)?;
 
     assert_eq!(decoded, report);
+    Ok(())
+}
+
+#[test]
+fn ops_readiness_report_round_trips_the_active_node_endpoint() -> eyre::Result<()> {
+    let report = ops::ReadinessReport {
+        cause: ops::ReadinessCause::Ready as i32,
+        current_height: Some(42),
+        target_height: Some(42),
+        detail: None,
+        materialized_view_identities: Vec::new(),
+        degraded: Vec::new(),
+        served_epoch_age_seconds: None,
+        active_node: Some(ops::ActiveNodeEndpoint { position: 1 }),
+    };
+
+    let decoded = round_trip(&report)?;
+
+    assert_eq!(decoded, report);
+    assert_eq!(
+        decoded.active_node.map(|active_node| active_node.position),
+        Some(1)
+    );
     Ok(())
 }
 
@@ -1460,6 +1484,7 @@ fn ops_readiness_report_round_trips_a_wallet_transition_limit_park() -> eyre::Re
         materialized_view_identities: Vec::new(),
         degraded: Vec::new(),
         served_epoch_age_seconds: None,
+        active_node: None,
     };
 
     let decoded = round_trip(&report)?;
@@ -1507,6 +1532,7 @@ fn ops_readiness_report_round_trips_degraded_dependencies_and_served_epoch_age()
             },
         ],
         served_epoch_age_seconds: Some(900),
+        active_node: None,
     };
 
     let decoded = round_trip(&report)?;

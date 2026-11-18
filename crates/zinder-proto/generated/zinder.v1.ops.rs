@@ -67,6 +67,17 @@ pub struct ReadinessReport {
     /// advancing, so this age shows how stale that view is.
     #[prost(uint64, optional, tag = "8")]
     pub served_epoch_age_seconds: ::core::option::Option<u64>,
+    /// Node endpoint the canonical writer reads from. Set only by zinder-ingest,
+    /// and only when \[node_fallbacks.N\] endpoints are configured.
+    #[prost(message, optional, tag = "9")]
+    pub active_node: ::core::option::Option<ActiveNodeEndpoint>,
+}
+/// One endpoint of the ordered node list a runtime is configured with.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ActiveNodeEndpoint {
+    /// Position in the ordered list: 0 is \[node\], N is \[node_fallbacks.N\].
+    #[prost(uint32, tag = "1")]
+    pub position: u32,
 }
 /// Latest observation of one dependency a process keeps serving without.
 #[derive(Clone, PartialEq, ::prost::Message)]

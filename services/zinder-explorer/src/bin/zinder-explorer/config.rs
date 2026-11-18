@@ -12,7 +12,7 @@ use zinder_runtime::{
     guard_optional_serving_bind, guard_serving_bind, load_bearer_token, parse_socket_addr,
     require_field, resolve_allow_public_bind, resolve_ops_listen_addr, resolve_secondary_storage,
 };
-use zinder_source::{NodeSection, NodeTarget};
+use zinder_source::{NodeFallbackSections, NodeSection, NodeTarget};
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:9068";
 
@@ -136,6 +136,7 @@ struct ExplorerRawConfig {
     explorer: ExplorerSection,
     ops: OpsSection,
     node: NodeSection,
+    node_fallbacks: NodeFallbackSections,
     security: SecuritySection,
 }
 
@@ -199,6 +200,10 @@ fn resolve_explorer_config(raw: ExplorerRawConfig) -> Result<ExplorerConfig, Exp
         .wallet_query_endpoint
         .filter(|endpoint| !endpoint.is_empty());
     let node = NodeTarget::resolve_optional(network, raw.node)?;
+    // The shared node list is validated as every runtime validates it, but the
+    // upstream-observation probe reads only `[node]`.
+    let node_fallbacks = NodeTarget::resolve_fallbacks(network, raw.node_fallbacks)?;
+    NodeTarget::require_primary_for_fallbacks(node.as_ref(), &node_fallbacks)?;
     Ok(ExplorerConfig {
         network,
         storage,

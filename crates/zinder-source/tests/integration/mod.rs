@@ -1,3 +1,4 @@
+mod node_set;
 mod nu7_activation_boundary;
 mod transport_invariants;
 mod zebra_indexer_block;

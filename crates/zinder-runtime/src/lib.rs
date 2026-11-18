@@ -10,7 +10,7 @@
 //! - The shared configuration error type, fluent layered loader, and shared
 //!   schema/redacted-render mirrors ([`ConfigError`], [`ConfigLoader`],
 //!   [`NetworkSection`], [`NetworkToml`], [`NodeAuthToml`], [`NodeHealthToml`],
-//!   [`NodeIndexerTlsToml`], [`NodeToml`], [`zinder_environment_source`],
+//!   [`NodeIndexerTlsToml`], [`NodeToml`], [`NodeFallbacksToml`], [`zinder_environment_source`],
 //!   [`require_field`], [`duration_as_millis_u64`]) that every service binary
 //!   uses to honor the
 //!   `defaults -> file -> ZINDER_* env -> CLI overrides` precedence.
@@ -62,8 +62,8 @@ pub use canonical_fence_attestation::{
 };
 pub use composed_readiness::{ComposedReadiness, ReadinessInput};
 pub use config::{
-    ConfigError, ConfigLoader, NetworkSection, NetworkToml, NodeAuthToml, NodeHealthToml,
-    NodeIndexerTlsToml, NodeToml, ZinderEnvironmentSource, duration_as_millis_u64,
+    ConfigError, ConfigLoader, NetworkSection, NetworkToml, NodeAuthToml, NodeFallbacksToml,
+    NodeHealthToml, NodeIndexerTlsToml, NodeToml, ZinderEnvironmentSource, duration_as_millis_u64,
     load_bearer_token, parse_socket_addr, require_field, zinder_environment_source,
     zinder_environment_source_from_map,
 };
@@ -84,7 +84,8 @@ pub use ops_endpoint::{
     spawn_ops_endpoint_for,
 };
 pub use readiness::{
-    IngestPhase, NodeUnavailableDetail, Readiness, ReadinessCause, ReadinessDependency,
+    ActiveNodeEndpoint, IngestPhase, NodeUnavailableDetail, Readiness, ReadinessCause,
+    ReadinessDependency,
     ReadinessReport, ReadinessState, TrafficReadinessInterceptor, UpstreamHealth,
     UpstreamNotReadyDetail, not_ready_status,
 };

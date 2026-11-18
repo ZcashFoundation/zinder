@@ -18,7 +18,11 @@
 //! wallet-serving image entrypoint's per-process routing to the loader.
 //!
 //! The accepted keys come from the loader itself: the probe provokes its
-//! unknown-field error at every section and reads the expected-field list.
+//! unknown-field error at every section and reads the expected-field list. A
+//! section keyed by node position, such as `[node_fallbacks.N]`, refuses the
+//! probe key as a position instead; the probe then enumerates position `1` and
+//! names its variables with a `<N>` placeholder, as
+//! `ZINDER_NODE_FALLBACKS__<N>__JSON_RPC_ADDR`.
 
 use std::{collections::BTreeSet, path::PathBuf, process::Command};
 
@@ -30,6 +34,10 @@ const WALLET_SERVING_ENTRYPOINT: &str =
 const PROBE_SECTION: &str = "CONTRACT_PROBE";
 const PROBE_LEAF: &str = "UNUSED";
 const PROBE_KEY: &str = "contract_probe";
+/// Placeholder segment of a position-keyed section in documented names.
+const POSITION_PLACEHOLDER: &str = "<N>";
+/// Position the probe enumerates for a position-keyed section.
+const PROBED_POSITION: &str = "1";
 
 /// Runs one service binary's `--print-config` as a configuration-loader probe.
 #[derive(Clone, Debug)]
@@ -202,16 +210,22 @@ impl EnvVarContractProbe {
 
     /// Returns the field names the struct at `section_path` accepts, or `None`
     /// when the path is a leaf field rather than a section struct.
+    ///
+    /// A section keyed by node position accepts one placeholder field, so its
+    /// positions are enumerated once.
     fn accepted_field_names(&self, section_path: &[String]) -> Result<Option<Vec<String>>> {
         let probe_variable = if section_path.is_empty() {
             format!("{ENV_PREFIX}{PROBE_SECTION}__{PROBE_LEAF}")
         } else {
             format!(
                 "{}__{PROBE_SECTION}__{PROBE_LEAF}",
-                variable_name(section_path)
+                probe_variable_name(section_path)
             )
         };
         let stderr = self.run_with_env(&[(probe_variable.as_str(), "1")])?;
+        if stderr.contains(&format!("`{PROBE_KEY}`: expected a position key")) {
+            return Ok(Some(vec![POSITION_PLACEHOLDER.to_owned()]));
+        }
         let marker = format!("unknown field `{PROBE_KEY}`, ");
         let Some((_, expectation)) = stderr.split_once(&marker) else {
             return Ok(None);
@@ -266,6 +280,22 @@ fn config_path_covers(config_path: &str, name: &str) -> bool {
     let prefix = variable_name(&segments);
     name.strip_prefix(prefix.as_str())
         .is_some_and(|rest| rest.is_empty() || rest.starts_with("__"))
+}
+
+/// Renders a configuration path as the variable the probe sets, with each
+/// position placeholder replaced by the probed position.
+fn probe_variable_name(path: &[String]) -> String {
+    let probed = path
+        .iter()
+        .map(|segment| {
+            if segment == POSITION_PLACEHOLDER {
+                PROBED_POSITION.to_owned()
+            } else {
+                segment.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    variable_name(&probed)
 }
 
 /// Renders a configuration path such as `["storage", "path"]` as
@@ -364,6 +394,31 @@ mod tests {
         assert!(!config_path_covers(
             "ingest",
             "ZINDER_INGEST_CONTROL__LISTEN_ADDR"
+        ));
+    }
+
+    #[test]
+    fn position_placeholder_is_probed_as_the_first_position() {
+        let path = [
+            "node_fallbacks".to_owned(),
+            POSITION_PLACEHOLDER.to_owned(),
+            "json_rpc_addr".to_owned(),
+        ];
+        assert_eq!(
+            variable_name(&path),
+            "ZINDER_NODE_FALLBACKS__<N>__JSON_RPC_ADDR"
+        );
+        assert_eq!(
+            probe_variable_name(&path),
+            "ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR"
+        );
+        assert!(config_path_covers(
+            "node_fallbacks",
+            "ZINDER_NODE_FALLBACKS__<N>__AUTH__PASSWORD"
+        ));
+        assert!(!config_path_covers(
+            "node",
+            "ZINDER_NODE_FALLBACKS__<N>__AUTH__PASSWORD"
         ));
     }
 

@@ -224,14 +224,15 @@ validated before storage opens or listeners bind.
 
 Release configuration is grouped by owner:
 
-- `[network]`, `[node]`, `[node.auth]`, `[node.indexer_tls]`, `[ops]`, and
-  `[security]` are shared sections. Ingest requires `[node]`. Query and
-  wallet-mode compatibility accept it only for transaction broadcast and
-  start without contacting the node; without it they serve storage only. For
-  them any node setting, from TOML, `ZINDER_NODE__*`, or the command line,
-  requires `node.json_rpc_addr`.
-  Explorer accepts it for the upstream-tip probe. The projector and
-  compact-blocks compatibility reject it;
+- `[network]`, `[node]`, `[node.auth]`, `[node.indexer_tls]`,
+  `[node_fallbacks.N]`, `[ops]`, and `[security]` are shared sections. Ingest
+  requires `[node]`. Query and wallet-mode compatibility accept it only for
+  transaction broadcast and start without contacting the node; without it they
+  serve storage only. For them any node setting, from TOML, `ZINDER_NODE__*`,
+  `ZINDER_NODE_FALLBACKS__*`, or the command line, requires
+  `node.json_rpc_addr`. Explorer accepts it for the upstream-tip probe. The
+  projector and compact-blocks compatibility reject `[node]` and
+  `[node_fallbacks.N]`;
 - `[storage]`, `[ingest]`, `[ingest.construction]`, `[ingest.mempool]`,
   `[ingest.follow]`, `[ingest.run_overrides]`, `[retention]`, and
   `[ingest_control]` configure the canonical writer;
@@ -243,6 +244,31 @@ Release configuration is grouped by owner:
   native query;
 - `[storage]` and `[explorer]` configure the explorer; and
 - `[cipherscan]` configures the Cipherscan adapter.
+
+`[node]` and the optional `[node_fallbacks.N]` tables form one ordered node
+list: `[node]` is position 0 and `[node_fallbacks.N]` is position `N`, counting
+from 1 without a gap. Each fallback table has the fields of `[node]`, and its
+environment names start with `ZINDER_NODE_FALLBACKS__<N>__` where `[node]`'s
+start with `ZINDER_NODE__`, as in `ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR`. Positions are table keys, never a
+TOML array of tables, so a file and the environment merge field by field.
+`zinder-ingest`, `zinder-query`, wallet-mode `zinder-compat-lightwalletd`,
+and `zinder-explorer` accept the list; only ingest switches between its
+endpoints today, as
+[Chain ingestion §Node endpoint failover](chain-ingestion.md#node-endpoint-failover)
+describes.
+
+```toml
+[node]
+json_rpc_addr = "http://zebra:8232"
+
+[node_fallbacks.1]
+json_rpc_addr = "http://zakura:8232"
+indexer_grpc_addr = "http://zakura:8230"
+
+[node_fallbacks.1.auth]
+method = "cookie"
+path = "/var/run/auth-fallback/.cookie"
+```
 
 Nested environment names use double underscores, for example:
 
@@ -303,6 +329,24 @@ variable.
 | `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.poll_interval_ms` | Cadence of the upstream-health probe in milliseconds. Defaults to 30000. Must be greater than zero. Query and wallet-serving compatibility use it to verify their broadcast node on first contact and then refresh the node dependency their readiness reports; compact-blocks compatibility rejects it; `zinder-explorer` reuses the same cadence for its upstream-observation probe (the one that populates `ExplorerFreshness.chain_view.upstream_tip`). |
 | `ZINDER_NODE__HEALTH__VERIFICATION_PROGRESS_FLOOR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.verification_progress_floor` | Lower bound on `getblockchaininfo.verificationprogress` below which the fallback path reports `upstream_not_ready`. Defaults to 0.999. Must be in `(0.0, 1.0)`. |
 | `ZINDER_NODE__HEALTH__ESTIMATED_GAP_FLOOR_BLOCKS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node.health.estimated_gap_floor_blocks` | Block gap between `estimatedheight` and the local tip above which the fallback path reports `upstream_not_ready`. Defaults to 10. |
+| `ZINDER_NODE_FALLBACKS__<N>__JSON_RPC_ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `any `ZINDER_NODE_FALLBACKS__<N>__*` is set` | `node_fallbacks.<N>.json_rpc_addr` | JSON-RPC URL of fallback node endpoint `<N>`. Endpoints form one ordered list: `[node]` is position 0 and `[node_fallbacks.N]` is position `N`, starting at 1 with no gap. Every `ZINDER_NODE__*` field has a `ZINDER_NODE_FALLBACKS__<N>__*` counterpart. `zinder-ingest` switches to a fallback when its active endpoint fails; the readers validate the list and do not use it yet. |
+| `ZINDER_NODE_FALLBACKS__<N>__INDEXER_GRPC_ADDR` | zinder-ingest | Optional | `node_fallbacks.<N>.indexer_grpc_addr` | Same as `ZINDER_NODE__INDEXER_GRPC_ADDR`, for fallback endpoint `<N>`. After a switch, ingest follows the mempool of the new endpoint through it. |
+| `ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CA_CERT_PATH` | zinder-ingest | Optional | `node_fallbacks.<N>.indexer_tls.ca_cert_path` | Same as `ZINDER_NODE__INDEXER_TLS__CA_CERT_PATH`, for fallback endpoint `<N>`. The single-volume image entrypoints also accept the `_PEM` form of this file. |
+| `ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_CERT_PATH` | zinder-ingest | When `ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_KEY_PATH is set` | `node_fallbacks.<N>.indexer_tls.client_cert_path` | Same as `ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PATH`, for fallback endpoint `<N>`. The single-volume image entrypoints also accept the `_PEM` form of this file. |
+| `ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_KEY_PATH` | zinder-ingest | When `ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__CLIENT_CERT_PATH is set` | `node_fallbacks.<N>.indexer_tls.client_key_path` | Same as `ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH`, for fallback endpoint `<N>`. The single-volume image entrypoints also accept the `_PEM` form of this file. |
+| `ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__SERVER_NAME` | zinder-ingest | Optional | `node_fallbacks.<N>.indexer_tls.server_name` | Same as `ZINDER_NODE__INDEXER_TLS__SERVER_NAME`, for fallback endpoint `<N>`. |
+| `ZINDER_NODE_FALLBACKS__<N>__AUTH__METHOD` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node_fallbacks.<N>.auth.method` | Same as `ZINDER_NODE__AUTH__METHOD`, for fallback endpoint `<N>`. |
+| `ZINDER_NODE_FALLBACKS__<N>__AUTH__USERNAME` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `ZINDER_NODE_FALLBACKS__<N>__AUTH__METHOD=basic` | `node_fallbacks.<N>.auth.username` | Same as `ZINDER_NODE__AUTH__USERNAME`, for fallback endpoint `<N>`. |
+| `ZINDER_NODE_FALLBACKS__<N>__AUTH__PASSWORD` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `ZINDER_NODE_FALLBACKS__<N>__AUTH__METHOD=basic` | `node_fallbacks.<N>.auth.password` | Same as `ZINDER_NODE__AUTH__PASSWORD`, for fallback endpoint `<N>`. Redacted in `--print-config` and structured logs. (sensitive; redacted) |
+| `ZINDER_NODE_FALLBACKS__<N>__AUTH__PATH` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `ZINDER_NODE_FALLBACKS__<N>__AUTH__METHOD=cookie` | `node_fallbacks.<N>.auth.path` | Same as `ZINDER_NODE__AUTH__PATH`, for fallback endpoint `<N>`. |
+| `ZINDER_NODE_FALLBACKS__<N>__AUTH__COOKIE` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | When `ZINDER_NODE_FALLBACKS__<N>__AUTH__METHOD=cookie` | `node_fallbacks.<N>.auth.cookie` | Same as `ZINDER_NODE__AUTH__COOKIE`, for fallback endpoint `<N>`. Redacted in `--print-config` and structured logs. (sensitive; redacted) |
+| `ZINDER_NODE_FALLBACKS__<N>__REQUEST_TIMEOUT_SECS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node_fallbacks.<N>.request_timeout_secs` | Same as `ZINDER_NODE__REQUEST_TIMEOUT_SECS`, for fallback endpoint `<N>`. |
+| `ZINDER_NODE_FALLBACKS__<N>__MAX_RESPONSE_BYTES` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node_fallbacks.<N>.max_response_bytes` | Same as `ZINDER_NODE__MAX_RESPONSE_BYTES`, for fallback endpoint `<N>`. |
+| `ZINDER_NODE_FALLBACKS__<N>__BROADCAST_TIMEOUT_SECS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node_fallbacks.<N>.broadcast_timeout_secs` | Same as `ZINDER_NODE__BROADCAST_TIMEOUT_SECS`, for fallback endpoint `<N>`. |
+| `ZINDER_NODE_FALLBACKS__<N>__HEALTH__ADDR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node_fallbacks.<N>.health.addr` | Same as `ZINDER_NODE__HEALTH__ADDR`, for fallback endpoint `<N>`. |
+| `ZINDER_NODE_FALLBACKS__<N>__HEALTH__POLL_INTERVAL_MS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node_fallbacks.<N>.health.poll_interval_ms` | Same as `ZINDER_NODE__HEALTH__POLL_INTERVAL_MS`, for fallback endpoint `<N>`. |
+| `ZINDER_NODE_FALLBACKS__<N>__HEALTH__VERIFICATION_PROGRESS_FLOOR` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node_fallbacks.<N>.health.verification_progress_floor` | Same as `ZINDER_NODE__HEALTH__VERIFICATION_PROGRESS_FLOOR`, for fallback endpoint `<N>`. |
+| `ZINDER_NODE_FALLBACKS__<N>__HEALTH__ESTIMATED_GAP_FLOOR_BLOCKS` | zinder-ingest, zinder-query, zinder-compat-lightwalletd, zinder-explorer | Optional | `node_fallbacks.<N>.health.estimated_gap_floor_blocks` | Same as `ZINDER_NODE__HEALTH__ESTIMATED_GAP_FLOOR_BLOCKS`, for fallback endpoint `<N>`. |
 | `ZINDER_OPS__LISTEN_ADDR` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer, zinder-compat-cipherscan | Optional | `ops.listen_addr` | Listen address for the operational HTTP endpoint (`/healthz`, `/readyz`, `/metrics`). Defaults to a per-service loopback address (`127.0.0.1:9105` ingest, `9110` projector, `9106` query, `9107` compat, `9069` explorer, `9108` cipherscan). Set to an empty string to disable the endpoint entirely. |
 | `ZINDER_SECURITY__ALLOW_PUBLIC_BIND` | zinder-ingest, zinder-projector, zinder-query, zinder-compat-lightwalletd, zinder-explorer, zinder-compat-cipherscan | Optional | `security.allow_public_bind` | Opts a binary in to binding its plaintext serving and operational surfaces to a public or unspecified (`0.0.0.0`, `::`) address. Defaults to `false`: a loopback or private-range bind is always allowed, but a public or unspecified bind is refused at startup unless this is `true`. Zinder ships no server TLS (ADR-0006); set this only when a reverse proxy terminates TLS and authorization in front of the listener. |
 | `ZINDER_INGEST_CONTROL__LISTEN_ADDR` | zinder-ingest | Optional | `ingest_control.listen_addr` | Listen address of the private IngestControl gRPC endpoint. Localhost-only by default; cross-host deployments must add bearer-token auth per ADR-0006. Set to an empty string to disable the endpoint for diagnostic one-shot runs (such as `--target-height` pre-seed). |
@@ -545,7 +589,8 @@ operations](service-operations.md#readiness-vocabulary) describes when each
 appears.
 
 Metric labels are bounded enumerations. Do not place addresses, transaction
-identifiers, paths, error messages, or other unbounded values in labels. Log
+identifiers, paths, error messages, or other unbounded values in labels. A node
+endpoint is labeled by its position in the ordered node list, never by URL. Log
 events use stable snake-case action names such as
 `canonical_live_append_committed` and `materialized_view_replay_caught_up`.
 

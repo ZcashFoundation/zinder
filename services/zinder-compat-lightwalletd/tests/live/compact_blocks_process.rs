@@ -45,7 +45,7 @@ use zinder_proto::{
         canonical_control_server::{CanonicalControl, CanonicalControlServer},
     },
 };
-use zinder_source::{ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
+use zinder_source::{NodeSource as _, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_store::{
     CanonicalBaselinePublication, CanonicalBuildBlock, CanonicalEventFence, CanonicalLiveAppend,
     CanonicalLiveReplacement, CanonicalReorgPolicy, CanonicalReplacementBlock,

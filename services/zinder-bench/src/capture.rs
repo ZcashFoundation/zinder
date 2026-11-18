@@ -83,9 +83,8 @@ pub async fn capture_fixed_range(config: CaptureConfig) -> Result<FixtureManifes
         },
     )?;
 
-    let activations = source
-        .discover_network_upgrade_activations("zinder-bench")
-        .await?;
+    let activations =
+        zinder_source::discover_network_upgrade_activations(&source, "zinder-bench").await?;
     let activation_records = activations
         .activations()
         .iter()

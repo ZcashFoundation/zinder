@@ -689,6 +689,7 @@ fn held_construction_writer_config(
             event_retention_check_interval: Duration::from_secs(1),
             mempool_ready_gate: None,
             max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+            node_failover: None,
         },
     }
 }

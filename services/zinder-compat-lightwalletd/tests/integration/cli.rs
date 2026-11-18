@@ -111,6 +111,48 @@ fn compact_blocks_print_config_omits_wallet_configuration() -> eyre::Result<()> 
     Ok(())
 }
 
+/// The shared node list in the environment does not stop compact-blocks
+/// serving, which reads no node; a list without `[node]` is still refused.
+#[test]
+fn compact_blocks_serving_starts_unchanged_when_the_environment_carries_node_fallbacks()
+-> eyre::Result<()> {
+    let temporary = tempdir()?;
+    let storage_path = temporary.path().join("compact-blocks-store");
+    let secondary_path = temporary.path().join("compact-blocks-secondary");
+    let config_path = temporary.path().join("compact-blocks.toml");
+    fs::write(
+        &config_path,
+        compact_blocks_config_toml(&storage_path, &secondary_path)?,
+    )?;
+
+    let output = zinder_compat_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .env("ZINDER_NODE__JSON_RPC_ADDR", "http://127.0.0.1:18232")
+        .env(
+            "ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR",
+            "http://127.0.0.1:28232",
+        )
+        .env("ZINDER_NODE_FALLBACKS__1__AUTH__METHOD", "cookie")
+        .env("ZINDER_NODE_FALLBACKS__1__AUTH__COOKIE", "zakura:secret")
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("[node_fallbacks.1]"), "{stdout}");
+    assert!(!stdout.contains("zakura:secret"), "{stdout}");
+
+    let without_primary = zinder_compat_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .env(
+            "ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR",
+            "http://127.0.0.1:28232",
+        )
+        .output()?;
+    assert!(!without_primary.status.success());
+    assert!(String::from_utf8(without_primary.stderr)?.contains("requires [node]"));
+    Ok(())
+}
+
 #[test]
 fn compact_blocks_serving_can_be_selected_by_cli_and_environment() -> eyre::Result<()> {
     let temporary = tempdir()?;

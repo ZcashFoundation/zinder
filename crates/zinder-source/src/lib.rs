@@ -7,6 +7,7 @@ mod json_rpc_mempool;
 mod mempool_source;
 mod node_auth;
 mod node_capabilities;
+mod node_set;
 mod node_source;
 mod node_target;
 mod source_block;
@@ -30,15 +31,19 @@ pub use mempool_source::{
     DEFAULT_MEMPOOL_MAX_TOTAL_RAW_TRANSACTION_BYTES, DEFAULT_MEMPOOL_MAX_TRANSACTION_COUNT,
     MempoolHydrationFailureReason, MempoolSource, MempoolSourceAdmissionLimits,
     MempoolSourceBackend, MempoolSourceCapabilities, MempoolSourceEntry, MempoolSourceEvent,
-    MempoolSourceEventStream,
+    MempoolSourceEventStream, MempoolSourceFactory,
 };
 pub use node_auth::{CookieSource, CookieSourceError, NodeAuth};
 pub use node_capabilities::{NodeCapabilities, NodeCapabilitiesError, NodeCapability};
-pub use node_source::{BroadcastNodeProbe, NodeSource, TransactionBroadcaster};
+pub use node_set::{ACTIVE_NODE_ENDPOINT_CHANGED_REASON, NodeSet, NodeSetSwitch};
+pub use node_source::{
+    BroadcastNodeProbe, NodeSource, NodeStorageMode, TransactionBroadcaster,
+    discover_network_upgrade_activations,
+};
 pub use node_target::{
     DEFAULT_NODE_HEALTH_ESTIMATED_GAP_FLOOR_BLOCKS, DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS,
     DEFAULT_NODE_HEALTH_VERIFICATION_PROGRESS_FLOOR, DEFAULT_NODE_REQUEST_TIMEOUT_SECS,
-    NodeAuthSection, NodeConfigError, NodeHealthConfig, NodeHealthSection,
+    NodeAuthSection, NodeConfigError, NodeFallbackSections, NodeHealthConfig, NodeHealthSection,
     NodeIndexerClientIdentity, NodeIndexerTls, NodeIndexerTlsSection, NodeSection, NodeTarget,
 };
 pub use source_block::{

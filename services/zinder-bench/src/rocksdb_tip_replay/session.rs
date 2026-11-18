@@ -644,6 +644,7 @@ fn single_append_follow_config(target_height: BlockHeight) -> CanonicalFollowCon
         event_retention_check_interval: Duration::from_mins(1),
         mempool_ready_gate: None,
         max_replacement_bytes: DEFAULT_MAX_REPLACEMENT_BYTES,
+        node_failover: None,
     }
 }
 

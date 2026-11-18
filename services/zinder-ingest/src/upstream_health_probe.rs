@@ -12,13 +12,16 @@
 //!
 //! A failed probe keeps the last observation, because an unreachable or
 //! malformed health response is not evidence that the upstream is ready.
+//! When the node failover switches endpoints it resets the input to
+//! `starting`, and the probe observes the new endpoint at once instead of at
+//! its next tick.
 //!
 //! [ADR-0015 §Upstream sync detection]:
 //!     ../../../docs/adrs/0015-phase-driven-ingest.md#upstream-sync-detection
 
 use std::{sync::Arc, time::Duration};
 
-use tokio::task::JoinHandle;
+use tokio::{sync::watch, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use zinder_runtime::{
     ComposedReadiness, ReadinessCause, ReadinessInput, UpstreamHealth, UpstreamNotReadyDetail,
@@ -31,27 +34,39 @@ use zinder_source::{NodeSource, UpstreamHealthSnapshot};
 /// [`NodeSource::poll_upstream_health`] on `source`, and publishes the
 /// snapshot as the [`ReadinessInput::NodeSource`] input of `readiness`.
 /// Probe errors keep the last published observation and log a warning; the
-/// ingest loop continues to own the admission state.
+/// ingest loop continues to own the admission state. When `endpoint_switches`
+/// is supplied, each change of the active node endpoint probes immediately.
 #[must_use = "drop the handle to detach the task or await it for symmetric shutdown"]
 pub fn spawn_upstream_health_probe_task<Source>(
     source: Arc<Source>,
     readiness: ComposedReadiness,
     poll_interval: Duration,
+    endpoint_switches: Option<watch::Receiver<usize>>,
     cancel: CancellationToken,
 ) -> JoinHandle<()>
 where
     Source: NodeSource + 'static,
 {
     tokio::spawn(async move {
+        let mut endpoint_switches = endpoint_switches;
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
-                () = tokio::time::sleep(poll_interval) => {
-                    run_upstream_health_probe_once(source.as_ref(), &readiness).await;
-                }
+                () = tokio::time::sleep(poll_interval) => {}
+                Some(()) = endpoint_switched(endpoint_switches.as_mut()) => {}
             }
+            run_upstream_health_probe_once(source.as_ref(), &readiness).await;
         }
     })
+}
+
+/// Resolves on the next endpoint switch, and never when there is no node
+/// failover or its sender is gone.
+async fn endpoint_switched(endpoint_switches: Option<&mut watch::Receiver<usize>>) -> Option<()> {
+    match endpoint_switches {
+        Some(endpoint_switches) => endpoint_switches.changed().await.ok(),
+        None => std::future::pending().await,
+    }
 }
 
 async fn run_upstream_health_probe_once<Source>(source: &Source, readiness: &ComposedReadiness)

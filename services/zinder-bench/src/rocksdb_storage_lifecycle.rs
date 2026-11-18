@@ -178,9 +178,8 @@ pub(crate) async fn run_rocksdb_storage_lifecycle(
             broadcast_timeout: None,
         },
     )?;
-    let network_upgrade_activations = source
-        .discover_network_upgrade_activations("zinder-bench")
-        .await?;
+    let network_upgrade_activations =
+        zinder_source::discover_network_upgrade_activations(&source, "zinder-bench").await?;
     let source_tip_at_freeze = source.tip_id().await?;
     let fixed_build_tip = resolve_fixed_build_tip(
         &source,

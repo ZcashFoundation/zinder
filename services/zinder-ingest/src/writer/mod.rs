@@ -1194,6 +1194,7 @@ mod tests {
                 event_retention_check_interval: Duration::from_secs(1),
                 mempool_ready_gate: None,
                 max_replacement_bytes: crate::DEFAULT_MAX_REPLACEMENT_BYTES,
+                node_failover: None,
             },
         }
     }
@@ -1368,6 +1369,7 @@ mod tests {
                 event_retention_check_interval: Duration::from_secs(1),
                 mempool_ready_gate: None,
                 max_replacement_bytes: crate::DEFAULT_MAX_REPLACEMENT_BYTES,
+                node_failover: None,
             },
         };
         let plan = resolve_build_plan(

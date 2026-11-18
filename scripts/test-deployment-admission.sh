@@ -162,6 +162,42 @@ if ZINDER_INDEXER_TLS_DIR='' ZINDER_NODE__INDEXER_GRPC_ADDR=https://zakura:8230 
   fail "the indexer TLS overlay resolved without ZINDER_INDEXER_TLS_DIR"
 fi
 
+resolve_node_fallback_compose() {
+  ZINDER_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
+    --env-file "$repository_root/deploy/.env.testnet" \
+    -f "$repository_root/deploy/docker-compose.yml" \
+    -f "$repository_root/deploy/docker-compose.node-fallback.yml" \
+    config "$@"
+}
+resolved_node_fallback_compose="$temporary_directory/resolved-node-fallback-compose.json"
+ZINDER_FALLBACK_SOURCE_NETWORK_NAME=zakura-testnet \
+ZINDER_FALLBACK_SOURCE_COOKIE_VOLUME_NAME=zakura-testnet-cookie \
+ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR=http://zakura:18232 \
+ZINDER_NODE_FALLBACKS__1__INDEXER_GRPC_ADDR=http://zakura:18230 \
+  resolve_node_fallback_compose --format json > "$resolved_node_fallback_compose"
+bash "$validator" --compose-contract "$resolved_node_fallback_compose"
+jq -e '
+  .services["zinder-ingest"].environment as $ingest_environment
+  | $ingest_environment.ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR == "http://zakura:18232"
+  and $ingest_environment.ZINDER_NODE_FALLBACKS__1__INDEXER_GRPC_ADDR == "http://zakura:18230"
+  and $ingest_environment.ZINDER_NODE_FALLBACKS__1__AUTH__PATH
+    == "/var/run/auth-fallback/.cookie"
+  and (.services["zinder-ingest"].networks | has("node-fallback"))
+  and (.networks["node-fallback"].name == "zakura-testnet")
+  and (.volumes["node-fallback-cookie"].name == "zakura-testnet-cookie")
+  and ([.services["zinder-query", "zinder-compat-lightwalletd"]]
+    | all(.environment.ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR == "http://zakura:18232"
+      and (.volumes | any(.target == "/var/run/auth-fallback" and .read_only == true))))
+  and ((.services["zinder-projector"].environment // {})
+    | keys | all(startswith("ZINDER_NODE_FALLBACKS__") | not))
+' "$resolved_node_fallback_compose" >/dev/null \
+  || fail "the node fallback overlay does not give the fallback endpoint to the node-reading runtimes"
+if ZINDER_FALLBACK_SOURCE_COOKIE_VOLUME_NAME=zakura-testnet-cookie \
+  ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR=http://zakura:18232 \
+  resolve_node_fallback_compose -q >/dev/null 2>&1; then
+  fail "the node fallback overlay resolved without the fallback node's network"
+fi
+
 resolved_explorer_compose="$temporary_directory/resolved-explorer-compose.json"
 ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
 docker compose \

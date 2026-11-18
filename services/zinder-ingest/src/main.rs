@@ -16,17 +16,19 @@ use zinder_ingest::{
     CanonicalIngestControlGrpcAdapter, CanonicalRunOverrides, CanonicalWriterConfig,
     ConventionalFeeDistributionBackfillConfig, ConventionalFeeDistributionBackfillContext,
     DEFAULT_MATERIALIZED_VIEW_TAILER_POLL_INTERVAL, DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL,
-    HistoricalWorkGate, IngestError, LiveMempoolOwner, MaterializedViewReplayConfig,
-    MaterializedViewTailer, MempoolIngestSettings, MempoolReadySignal, MempoolRetentionSettings,
-    NodeSourceKind, ReplayPrevoutCaches, TransactionComponentBackfillConfig,
-    TransactionComponentBackfillContext, VolumeSpaceGuard, admit_canonical_store,
-    canonical_control_channel, classify_phase, follow_admitted_canonical_store,
-    mempool_ready_channel, open_primary_materialized_view_store, run_live_mempool_owner,
-    run_mempool_retention, seed_backfill_owned_consumer_cursors,
-    spawn_conventional_fee_distribution_backfill_task,
+    EndpointAdmission, FailoverReadiness, HistoricalWorkGate, IngestError, LiveMempoolOwner,
+    MaterializedViewReplayConfig, MaterializedViewTailer, MempoolReadySignal,
+    MempoolRetentionSettings, NoNodeEndpointAdmitted, NodeEndpointAdmissions, NodeEndpointMonitor,
+    NodeFailover, NodeFailoverPolicy, NodeSourceKind, ReplayPrevoutCaches,
+    TransactionComponentBackfillConfig, TransactionComponentBackfillContext, VolumeSpaceGuard,
+    admit_canonical_store, canonical_control_channel, classify_phase,
+    follow_admitted_canonical_store, mempool_ready_channel, missing_required_capability,
+    open_primary_materialized_view_store, run_live_mempool_owner, run_mempool_retention,
+    seed_backfill_owned_consumer_cursors, spawn_conventional_fee_distribution_backfill_task,
     spawn_materialized_view_replay_budget_metrics_task, spawn_materialized_view_tailer_task,
-    spawn_runtime_memory_metrics_task, spawn_transaction_component_backfill_task,
-    spawn_undo_index_pruning_task, spawn_upstream_health_probe_task,
+    spawn_node_endpoint_monitor, spawn_runtime_memory_metrics_task,
+    spawn_transaction_component_backfill_task, spawn_undo_index_pruning_task,
+    spawn_upstream_health_probe_task,
 };
 use zinder_materialized_views::MaterializedViewStore;
 use zinder_runtime::{
@@ -35,10 +37,9 @@ use zinder_runtime::{
     host_cpu_meets_compiled_baseline, install_tracing_subscriber, spawn_ops_endpoint_for,
 };
 use zinder_source::{
-    JsonRpcMempoolSource, JsonRpcMempoolSourceOptions, MempoolSource, NodeCapabilities,
-    NodeCapability, NodeHealthConfig, NodeSource, NodeTarget, ZebraIndexerMempoolSource,
-    ZebraIndexerMempoolSourceOptions, ZebraIndexerSourceTarget, ZebraJsonRpcSource,
-    ZebraJsonRpcSourceOptions, validate_zebra_indexer_endpoint,
+    MempoolSource, NodeCapabilities, NodeCapability, NodeHealthConfig, NodeSet, NodeSetSwitch,
+    NodeSource, NodeTarget, ZebraIndexerSourceTarget, ZebraJsonRpcSource,
+    validate_zebra_indexer_endpoint,
 };
 use zinder_store::{
     CanonicalReorgPolicy, CanonicalStoreWorkload, MempoolEventRetentionConfig,
@@ -54,15 +55,6 @@ mod config;
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: zinder_runtime::RuntimeAllocator = zinder_runtime::RuntimeAllocator;
-
-const REQUIRED_INGEST_NODE_CAPABILITIES: &[NodeCapability] = &[
-    NodeCapability::JsonRpc,
-    NodeCapability::BestChainBlocks,
-    NodeCapability::TipId,
-    NodeCapability::TreeState,
-    NodeCapability::SubtreeRoots,
-    NodeCapability::HistoricalBlockBodies,
-];
 
 /// Suffix of the reader-local metadata directory the in-process canonical
 /// secondary owns, as ADR-0003 requires of every reader.
@@ -200,10 +192,10 @@ async fn run_probe(
     let runtime_config = command_config.runtime_config;
     let source =
         zebra_json_rpc_source_for_target(runtime_config.node_source, &runtime_config.node)?;
-    let activations = source
-        .discover_network_upgrade_activations("zinder-ingest-probe")
-        .await
-        .map_err(IngestError::from)?;
+    let activations =
+        zinder_source::discover_network_upgrade_activations(&source, "zinder-ingest-probe")
+            .await
+            .map_err(IngestError::from)?;
     let upstream_tip = source
         .tip_id()
         .await
@@ -275,19 +267,22 @@ async fn run_ingest(
     .await?;
 
     let connect_node_phase = StartupPhase::ConnectNode.start();
-    let source = zebra_json_rpc_source_for_target(
-        command_config.runtime_config.node_source,
-        &command_config.runtime_config.node,
-    )?;
-    validate_indexer_endpoint(&command_config.runtime_config.node)?;
+    let (nodes, node_switch) = connect_node_set(&command_config.runtime_config)?;
     connect_node_phase.complete();
     let check_schema_phase = StartupPhase::CheckSchema.start();
-    ensure_node_capabilities(&source, &writer_readiness).await?;
-    let network_upgrade_activations = source
-        .discover_network_upgrade_activations("zinder-ingest")
-        .await
-        .map_err(IngestError::from)?;
+    let node_failover = admit_node_endpoints(
+        &command_config,
+        nodes.clone(),
+        node_switch,
+        &writer_readiness,
+    )
+    .await?;
+    let network_upgrade_activations =
+        zinder_source::discover_network_upgrade_activations(&nodes, "zinder-ingest")
+            .await
+            .map_err(IngestError::from)?;
     check_schema_phase.complete();
+    let (node_failover, node_endpoint_monitor) = node_failover.unzip();
 
     let recover_state_phase = StartupPhase::RecoverState.start();
     resolve_wallet_serving_modifiers(&mut command_config);
@@ -309,13 +304,14 @@ async fn run_ingest(
         "resolved Explorer views configuration"
     );
     let volume_space_guard = materialized_view_plane.volume_space_guard.clone();
-    let worker_tasks = IngestWorkerTaskHandles {
+    let mut worker_tasks = IngestWorkerTaskHandles {
         upstream_health_probe: spawn_upstream_health_probe_for(
             &command_config.runtime_config.node,
-            &source,
+            &nodes,
             writer_readiness.clone(),
             worker_cancel.clone(),
         ),
+        node_endpoint_monitor: None,
         memory_metrics: spawn_runtime_memory_metrics_task(
             DEFAULT_RUNTIME_MEMORY_METRICS_INTERVAL,
             worker_cancel.clone(),
@@ -341,9 +337,10 @@ async fn run_ingest(
 
     let mut writer_config =
         canonical_writer_config(&command_config, Arc::clone(&network_upgrade_activations));
+    writer_config.follow.node_failover = node_failover;
     let mut canonical_control_tasks = spawn_canonical_control_tasks(
         &command_config,
-        &source,
+        &nodes,
         &writer_readiness,
         &control_server_cancel,
         &mut writer_config,
@@ -351,7 +348,7 @@ async fn run_ingest(
     log_canonical_writer_start(&command_config, &writer_config);
     let admission = Box::pin(supervise_canonical_writer(
         admit_canonical_store(
-            &source,
+            &nodes,
             network_upgrade_activations,
             &writer_config,
             &writer_readiness,
@@ -364,10 +361,19 @@ async fn run_ingest(
     let writer_result = match admission {
         Ok(store) => {
             canonical_control_tasks.start_mempool_tasks(&worker_cancel);
+            worker_tasks.node_endpoint_monitor = node_endpoint_monitor.and_then(|monitor| {
+                store.network_upgrade_activations().map(|admitted| {
+                    spawn_node_endpoint_monitor(
+                        monitor,
+                        Arc::new(admitted.clone()),
+                        worker_cancel.clone(),
+                    )
+                })
+            });
             let control_commands = canonical_control_tasks.commands.take();
             let writer = follow_admitted_canonical_store(
                 store,
-                &source,
+                &nodes,
                 writer_config.follow,
                 &writer_readiness,
                 &worker_cancel,
@@ -451,7 +457,7 @@ impl CanonicalControlTasks {
 
 fn spawn_canonical_control_tasks(
     command_config: &IngestCommandConfig,
-    source: &ZebraJsonRpcSource,
+    nodes: &NodeSet<ZebraJsonRpcSource>,
     writer_readiness: &ComposedReadiness,
     server_cancel: &CancellationToken,
     writer_config: &mut CanonicalWriterConfig,
@@ -465,8 +471,7 @@ fn spawn_canonical_control_tasks(
             );
         let (mempool_ready_signal, mempool_ready_gate) = mempool_ready_channel();
         writer_config.follow.mempool_ready_gate = Some(mempool_ready_gate);
-        let mempool_source =
-            build_live_mempool_source(&command_config.runtime_config.node, source, mempool);
+        let mempool_source = nodes.mempool_source(mempool.source_admission_limits);
         let mempool_retention = MempoolEventRetentionConfig::new(
             command_config.retention.mempool_mined_window(),
             command_config.retention.mempool_invalidated_window(),
@@ -497,7 +502,7 @@ fn spawn_canonical_control_tasks(
                 .ingest_control_checkpoint_bearer_token
                 .clone(),
         );
-        let node_source: Arc<dyn NodeSource> = Arc::new(source.clone());
+        let node_source: Arc<dyn NodeSource> = Arc::new(nodes.clone());
         let ingest_adapter = CanonicalIngestControlGrpcAdapter::new(
             command_config.runtime_config.node.network,
             canonical_control_handle,
@@ -697,6 +702,7 @@ async fn drain_readiness_on_termination(
 struct IngestWorkerTaskHandles {
     memory_metrics: JoinHandle<()>,
     upstream_health_probe: Option<JoinHandle<()>>,
+    node_endpoint_monitor: Option<JoinHandle<()>>,
     materialized_view_plane: JoinHandle<()>,
     replay_budget_metrics: Option<JoinHandle<()>>,
 }
@@ -716,6 +722,9 @@ async fn shutdown_ingest_worker_tasks(
     await_worker_task("runtime_memory_metrics", worker_tasks.memory_metrics).await;
     if let Some(upstream_health_probe) = worker_tasks.upstream_health_probe {
         await_worker_task("upstream_health_probe", upstream_health_probe).await;
+    }
+    if let Some(node_endpoint_monitor) = worker_tasks.node_endpoint_monitor {
+        await_worker_task("node_endpoint_monitor", node_endpoint_monitor).await;
     }
     await_worker_task(
         "materialized_view_plane",
@@ -1089,6 +1098,7 @@ fn canonical_writer_config(
             event_retention_window: command_config.retention.chain_event_window(),
             event_retention_check_interval: command_config.retention.chain_event_check_interval(),
             mempool_ready_gate: None,
+            node_failover: None,
         },
     }
 }
@@ -1103,6 +1113,16 @@ fn log_canonical_writer_start(
         network = encode_zinder_native_chain_name(command_config.runtime_config.node.network),
         storage_path = %writer_config.storage_path.display(),
         json_rpc_addr = command_config.runtime_config.node.json_rpc_addr.as_str(),
+        node_endpoints = command_config
+            .runtime_config
+            .node_fallbacks
+            .len()
+            .saturating_add(1),
+        active_node_position = writer_config
+            .follow
+            .node_failover
+            .as_ref()
+            .map_or(0, zinder_ingest::NodeFailover::active_position),
         workload = "wallet",
         schema_version = zinder_store::CANONICAL_STORE_SCHEMA_VERSION,
         raw_blob_retention = %writer_config.raw_blob_retention,
@@ -1135,7 +1155,7 @@ fn resolve_wallet_serving_modifiers(command_config: &mut IngestCommandConfig) {
 }
 
 async fn ensure_node_capabilities(
-    source: &ZebraJsonRpcSource,
+    source: &impl NodeSource,
     readiness: &ComposedReadiness,
 ) -> Result<NodeCapabilities, IngestConfigError> {
     let probed_capabilities = match source.probe_capabilities().await {
@@ -1207,15 +1227,146 @@ fn missing_capability_remediation(capability: NodeCapability) -> &'static str {
 fn require_ingest_node_capabilities(
     capabilities: NodeCapabilities,
 ) -> Result<(), zinder_source::SourceError> {
-    for required in REQUIRED_INGEST_NODE_CAPABILITIES {
-        if !capabilities.supports(*required) {
-            return Err(zinder_source::SourceError::NodeCapabilityMissing {
-                capability: *required,
-            });
+    missing_required_capability(capabilities).map_or(Ok(()), |capability| {
+        Err(zinder_source::SourceError::NodeCapabilityMissing { capability })
+    })
+}
+
+/// Builds the ordered node list, `[node]` then `[node_fallbacks.N]`, and
+/// fails startup when an endpoint's indexer settings are unusable.
+fn connect_node_set(
+    runtime_config: &zinder_ingest::IngestRuntimeConfig,
+) -> Result<
+    (
+        NodeSet<ZebraJsonRpcSource>,
+        NodeSetSwitch<ZebraJsonRpcSource>,
+    ),
+    IngestConfigError,
+> {
+    match runtime_config.node_source {
+        NodeSourceKind::ZebraJsonRpc => {}
+    }
+    validate_indexer_endpoint(&runtime_config.node)?;
+    for fallback in &runtime_config.node_fallbacks {
+        validate_indexer_endpoint(fallback)?;
+    }
+    NodeSet::connect(&runtime_config.node, &runtime_config.node_fallbacks)
+        .map_err(IngestError::from)
+        .map_err(IngestConfigError::from)
+}
+
+/// Admits the endpoint ingest reads from first.
+///
+/// Without `[node_fallbacks.N]`, `[node]` is checked as it always was. With
+/// them, every endpoint is checked, its genesis block included, and the first
+/// admitted endpoint in position order becomes active; the returned failover
+/// switches between them while ingest follows the chain.
+async fn admit_node_endpoints(
+    command_config: &IngestCommandConfig,
+    nodes: NodeSet<ZebraJsonRpcSource>,
+    node_switch: NodeSetSwitch<ZebraJsonRpcSource>,
+    readiness: &ComposedReadiness,
+) -> Result<Option<(NodeFailover, NodeEndpointMonitor<ZebraJsonRpcSource>)>, IngestConfigError> {
+    if !nodes.has_fallbacks() {
+        ensure_node_capabilities(&nodes, readiness).await?;
+        return Ok(None);
+    }
+    let node = &command_config.runtime_config.node;
+    let admissions = match NodeEndpointAdmissions::admit(&nodes, node.network).await {
+        Ok(admissions) => admissions,
+        Err(refusal) => {
+            publish_endpoint_refusal(&refusal, readiness);
+            return Err(refusal.into());
+        }
+    };
+    log_endpoint_admissions(&admissions);
+    let policy = NodeFailoverPolicy {
+        standby_evaluation_interval: node.health.as_ref().map_or_else(
+            || NodeFailoverPolicy::default().standby_evaluation_interval,
+            |health| health.poll_interval,
+        ),
+        ..NodeFailoverPolicy::default()
+    };
+    let failover_readiness = FailoverReadiness {
+        readiness: readiness.clone(),
+        gates_node_source_input: node.health.is_some(),
+    };
+    Ok(Some(NodeFailover::new(
+        nodes,
+        node_switch,
+        &admissions,
+        policy,
+        failover_readiness,
+    )))
+}
+
+/// Publishes the readiness a single-endpoint startup would publish for the
+/// `[node]` verdict when no endpoint was admitted.
+fn publish_endpoint_refusal(refusal: &NoNodeEndpointAdmitted, readiness: &ComposedReadiness) {
+    let state = match refusal.primary() {
+        Some(EndpointAdmission::Unreachable(error)) => {
+            ReadinessState::node_unavailable_with_detail(
+                zinder_runtime::NodeUnavailableDetail::first_iteration(
+                    error.upstream_classification().label(),
+                    error.to_string(),
+                ),
+                None,
+            )
+        }
+        Some(EndpointAdmission::Excluded(zinder_ingest::EndpointExclusion::CapabilityMissing(
+            capability,
+        ))) => ReadinessState::node_capability_missing(capability.name()),
+        Some(EndpointAdmission::Excluded(zinder_ingest::EndpointExclusion::Pruned)) => {
+            ReadinessState::node_capability_missing(NodeCapability::HistoricalBlockBodies.name())
+        }
+        Some(EndpointAdmission::Excluded(exclusion)) => {
+            ReadinessState::node_unavailable_with_detail(
+                zinder_runtime::NodeUnavailableDetail::first_iteration(
+                    zinder_source::SourceFailureClass::Configuration.label(),
+                    exclusion.to_string(),
+                ),
+                None,
+            )
+        }
+        Some(EndpointAdmission::Admitted(_) | _) | None => return,
+    };
+    readiness.publish_admission(state);
+    tracing::error!(
+        target: "zinder::ingest",
+        event = "node_endpoints_unavailable",
+        error = %refusal,
+        "no configured node endpoint was admitted"
+    );
+}
+
+fn log_endpoint_admissions(admissions: &NodeEndpointAdmissions) {
+    for (position, verdict) in admissions.verdicts() {
+        match verdict {
+            EndpointAdmission::Admitted(_) => tracing::info!(
+                target: "zinder::ingest",
+                event = "node_endpoint_admitted",
+                position,
+                active = position == admissions.active_position(),
+                "node endpoint passed its startup checks"
+            ),
+            EndpointAdmission::Unreachable(error) => tracing::warn!(
+                target: "zinder::ingest",
+                event = "node_endpoint_unreachable",
+                position,
+                %error,
+                "node endpoint did not answer its startup checks; it is evaluated again while ingest runs"
+            ),
+            EndpointAdmission::Excluded(exclusion) => tracing::warn!(
+                target: "zinder::ingest",
+                event = "node_endpoint_excluded",
+                position,
+                reason = exclusion.label(),
+                detail = %exclusion,
+                "node endpoint is excluded until ingest restarts"
+            ),
+            _ => {}
         }
     }
-
-    Ok(())
 }
 
 fn zebra_json_rpc_source_for_target(
@@ -1223,65 +1374,10 @@ fn zebra_json_rpc_source_for_target(
     target: &NodeTarget,
 ) -> Result<ZebraJsonRpcSource, IngestConfigError> {
     match node_source {
-        NodeSourceKind::ZebraJsonRpc => ZebraJsonRpcSource::with_options(
-            target.network,
-            &target.json_rpc_addr,
-            target.node_auth.clone(),
-            ZebraJsonRpcSourceOptions {
-                request_timeout: target.request_timeout,
-                max_response_bytes: target.max_response_bytes,
-                broadcast_timeout: target.broadcast_timeout,
-            },
-        )
-        .map(|source| source.with_health_config(target.health.clone()))
-        .map_err(IngestError::from)
-        .map_err(IngestConfigError::from),
+        NodeSourceKind::ZebraJsonRpc => ZebraJsonRpcSource::from_node_target(target)
+            .map_err(IngestError::from)
+            .map_err(IngestConfigError::from),
     }
-}
-
-fn build_live_mempool_source(
-    node_target: &NodeTarget,
-    json_rpc: &ZebraJsonRpcSource,
-    mempool: MempoolIngestSettings,
-) -> Arc<dyn MempoolSource> {
-    ZebraIndexerSourceTarget::from_node_target(node_target).map_or_else(
-        || {
-            tracing::info!(
-                target: "zinder::ingest",
-                event = "mempool_source_selected",
-                backend = "zebra-json-rpc-polling",
-                "selected polling mempool source"
-            );
-            Arc::new(JsonRpcMempoolSource::with_options(
-                json_rpc.clone(),
-                JsonRpcMempoolSourceOptions {
-                    admission_limits: mempool.source_admission_limits,
-                    ..JsonRpcMempoolSourceOptions::default()
-                },
-            )) as Arc<dyn MempoolSource>
-        },
-        |indexer_target| {
-            tracing::info!(
-                target: "zinder::ingest",
-                event = "mempool_source_selected",
-                backend = "zebra-indexer-grpc",
-                indexer_endpoint = %indexer_target.endpoint_url,
-                client_certificate = indexer_target
-                    .tls
-                    .as_ref()
-                    .is_some_and(|tls| tls.client_identity.is_some()),
-                "selected streaming mempool source"
-            );
-            Arc::new(ZebraIndexerMempoolSource::with_options(
-                indexer_target,
-                json_rpc.clone(),
-                ZebraIndexerMempoolSourceOptions {
-                    admission_limits: mempool.source_admission_limits,
-                    ..ZebraIndexerMempoolSourceOptions::default()
-                },
-            )) as Arc<dyn MempoolSource>
-        },
-    )
 }
 
 /// Fails startup when the configured indexer endpoint or its TLS files are
@@ -1300,7 +1396,7 @@ fn validate_indexer_endpoint(node_target: &NodeTarget) -> Result<(), IngestConfi
 
 fn spawn_upstream_health_probe_for(
     node_target: &NodeTarget,
-    json_rpc_source: &ZebraJsonRpcSource,
+    nodes: &NodeSet<ZebraJsonRpcSource>,
     readiness: ComposedReadiness,
     cancel: CancellationToken,
 ) -> Option<JoinHandle<()>> {
@@ -1314,9 +1410,10 @@ fn spawn_upstream_health_probe_for(
         "upstream health probe started"
     );
     Some(spawn_upstream_health_probe_task(
-        Arc::new(json_rpc_source.clone()),
+        Arc::new(nodes.clone()),
         readiness,
         health_config.poll_interval,
+        nodes.has_fallbacks().then(|| nodes.subscribe_switches()),
         cancel,
     ))
 }

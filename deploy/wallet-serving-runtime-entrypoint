@@ -11,11 +11,8 @@ set -eu
 . /usr/local/lib/zinder/materialize-indexer-tls
 materialize_indexer_tls
 if [ "$indexer_tls_pem_present" -eq 1 ]; then
-  exec env \
-    -u ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM \
-    -u ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM \
-    -u ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM \
-    "$0" "$@"
+  # shellcheck disable=SC2046 # each word is one env argument
+  exec env $(indexer_tls_unset_arguments) "$0" "$@"
 fi
 
 # RocksDB opens the canonical primary, the in-process canonical secondary, the
@@ -78,9 +75,9 @@ recurrence_min_answered_episode_seconds=60
 # define. The `env_var_contract` tests of each service hold these lists to the
 # loaders. The `wallet_serving` settings configure this entrypoint and reach
 # no process.
-ingest_config_paths="network ops node security ingest_control ingest retention storage.path storage.canonical storage.materialized_views storage.raw_blob_policy"
+ingest_config_paths="network ops node node_fallbacks security ingest_control ingest retention storage.path storage.canonical storage.materialized_views storage.raw_blob_policy"
 projector_config_paths="network ops security ingest_control projector projector_control storage.canonical_path storage.canonical_secondary_path storage.canonical storage.raw_blob_policy wallet.path wallet.rocksdb"
-query_config_paths="network ops node security ingest_control query wallet storage.path storage.secondary_path storage.canonical storage.raw_blob_policy storage.initial_catchup_timeout_ms storage.secondary_catchup_interval_ms storage.secondary_replica_lag_threshold_chain_epochs storage.serving_pair_staleness_ceiling_ms"
+query_config_paths="network ops node node_fallbacks security ingest_control query wallet storage.path storage.secondary_path storage.canonical storage.raw_blob_policy storage.initial_catchup_timeout_ms storage.secondary_catchup_interval_ms storage.secondary_replica_lag_threshold_chain_epochs storage.serving_pair_staleness_ceiling_ms"
 entrypoint_config_paths="wallet_serving.canonical_construction_deadline_seconds wallet_serving.wallet_construction_deadline_seconds"
 
 ingest_ops_addr="127.0.0.1:9105"
@@ -744,12 +741,27 @@ require_known_entrypoint_settings() {
   fi
 }
 
+# Fails unless every [node_fallbacks.N] endpoint in the environment names its
+# indexer gRPC URL. Ingest follows the mempool of whichever endpoint it
+# switched to, so a fallback without the stream brings polling back.
+require_fallback_indexer_endpoints() {
+  for fallback_position in $(
+    env | sed -n -E 's/^ZINDER_NODE_FALLBACKS__([0-9]+)__[A-Z0-9_]+=.*/\1/p' | sort -un
+  ); do
+    eval "fallback_indexer_addr=\"\${ZINDER_NODE_FALLBACKS__${fallback_position}__INDEXER_GRPC_ADDR:-}\""
+    if [ -z "$fallback_indexer_addr" ]; then
+      fail "ZINDER_NODE_FALLBACKS__${fallback_position}__INDEXER_GRPC_ADDR is required: every fallback node endpoint needs its indexer gRPC URL, because ingest follows the mempool of the endpoint it switched to"
+    fi
+  done
+}
+
 # Without the node indexer stream, ingest follows the node mempool by polling
 # JSON-RPC and re-reads the whole mempool after every block, withdrawing
 # readiness whenever that re-read outlasts its 30-second tip-transition grace.
 if [ -z "${ZINDER_NODE__INDEXER_GRPC_ADDR:-}" ]; then
   fail "ZINDER_NODE__INDEXER_GRPC_ADDR is required: set it to the node's indexer gRPC URL. Without the indexer stream, ingest re-reads the whole node mempool over JSON-RPC after every block and withdraws readiness when that takes longer than 30 seconds"
 fi
+require_fallback_indexer_endpoints
 require_known_entrypoint_settings
 require_positive_seconds ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE_SECONDS \
   "$canonical_construction_deadline_seconds"

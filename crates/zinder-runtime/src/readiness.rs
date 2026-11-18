@@ -506,6 +506,26 @@ pub struct ReadinessReport {
     /// fails only the requests that call it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub degraded: Vec<ReadinessDependency>,
+    /// Node endpoint the service reads from. Set only by `zinder-ingest`, and
+    /// only when `[node_fallbacks.N]` endpoints are configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_node: Option<ActiveNodeEndpoint>,
+}
+
+/// One endpoint of the ordered node list a runtime is configured with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct ActiveNodeEndpoint {
+    /// Position in the ordered list: 0 is `[node]`, `N` is
+    /// `[node_fallbacks.N]`.
+    pub position: u32,
+}
+
+impl From<ActiveNodeEndpoint> for ops_proto::ActiveNodeEndpoint {
+    fn from(endpoint: ActiveNodeEndpoint) -> Self {
+        Self {
+            position: endpoint.position,
+        }
+    }
 }
 
 impl ReadinessReport {
@@ -521,6 +541,7 @@ impl ReadinessReport {
             materialized_view_identities: Vec::new(),
             served_epoch_age_seconds: None,
             degraded: Vec::new(),
+            active_node: None,
         }
     }
 }
@@ -531,6 +552,7 @@ impl ReadinessReport {
 pub struct Readiness {
     inner: Arc<Mutex<RuntimeReadiness>>,
     materialized_view_identities: Arc<Mutex<Vec<String>>>,
+    active_node: Arc<Mutex<Option<ActiveNodeEndpoint>>>,
 }
 
 /// One lock covers the state and the dependency causes a composition
@@ -560,6 +582,7 @@ impl Readiness {
                 served_epoch_committed_at: None,
             })),
             materialized_view_identities: Arc::new(Mutex::new(Vec::new())),
+            active_node: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -591,6 +614,11 @@ impl Readiness {
     /// service admitted, exposed by readiness and metrics.
     pub fn set_materialized_view_identities(&self, identities: Vec<String>) {
         *self.materialized_view_identities.lock() = identities;
+    }
+
+    /// Records the node endpoint the service reads from, exposed by readiness.
+    pub fn set_active_node(&self, active_node: Option<ActiveNodeEndpoint>) {
+        *self.active_node.lock() = active_node;
     }
 
     /// Replaces the readiness cause and heights, preserving the writer phase
@@ -658,6 +686,7 @@ impl Readiness {
             served_epoch_committed_at,
         } = self.inner.lock().clone();
         let materialized_view_identities = self.materialized_view_identities.lock().clone();
+        let active_node = *self.active_node.lock();
         ReadinessReport {
             is_ready: state.cause.permits_traffic(),
             cause: state.cause,
@@ -675,6 +704,7 @@ impl Readiness {
                 .into_iter()
                 .filter(ReadinessDependency::is_degraded)
                 .collect(),
+            active_node,
         }
     }
 }
@@ -1218,6 +1248,7 @@ impl From<&ReadinessReport> for ops_proto::ReadinessReport {
                 .map(ops_proto::ReadinessDependency::from)
                 .collect(),
             served_epoch_age_seconds: report.served_epoch_age_seconds,
+            active_node: report.active_node.map(ops_proto::ActiveNodeEndpoint::from),
         }
     }
 }
@@ -1837,6 +1868,7 @@ mod tests {
             materialized_view_identities: vec!["transparent_outpoint_spend".to_owned()],
             served_epoch_age_seconds: None,
             degraded: Vec::new(),
+            active_node: Some(ActiveNodeEndpoint { position: 2 }),
         };
 
         let proto = ops_proto::ReadinessReport::from(&report);
@@ -1849,6 +1881,10 @@ mod tests {
         assert_eq!(
             proto.materialized_view_identities,
             ["transparent_outpoint_spend"]
+        );
+        assert_eq!(
+            proto.active_node,
+            Some(ops_proto::ActiveNodeEndpoint { position: 2 })
         );
 
         let Some(detail) = proto.detail else {
@@ -1877,6 +1913,7 @@ mod tests {
             materialized_view_identities: Vec::new(),
             served_epoch_age_seconds: None,
             degraded: Vec::new(),
+            active_node: None,
         };
 
         let proto = ops_proto::ReadinessReport::from(&report);
@@ -1903,6 +1940,7 @@ mod tests {
             materialized_view_identities: Vec::new(),
             served_epoch_age_seconds: None,
             degraded: Vec::new(),
+            active_node: None,
         };
 
         let proto = ops_proto::ReadinessReport::from(&report);

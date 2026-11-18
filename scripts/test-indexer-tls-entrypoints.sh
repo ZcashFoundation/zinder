@@ -237,6 +237,32 @@ grep -qxF "ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PATH=/run/secrets/client.key" "$
   || test_failure "a mounted key path did not reach ingest"
 [ ! -e "$work/shm/$directory_name" ] || test_failure "the directory was created without *_PEM variables"
 
+# A fallback node endpoint's PEM variables become files of their own, beside
+# the [node] files, and never reach ingest.
+reset_locations
+run_entrypoint "$test_canonical" tmpfs "${all_pem_variables[@]}" \
+  "ZINDER_NODE_FALLBACKS__2__INDEXER_TLS__CA_CERT_PEM=$ca_pem" \
+  "ZINDER_NODE_FALLBACKS__2__INDEXER_TLS__CLIENT_KEY_PEM=$key_pem" \
+  || test_failure "canonical entrypoint failed with fallback PEM variables: $(cat "$stderr_log")"
+assert_materialized "$work/shm"
+assert_no_pem_variable "$env_dump"
+fallback_key="$work/shm/$directory_name/node-fallback-2-client-key.pem"
+[ "$(stat_mode "$fallback_key")" = "400" ] || test_failure "$fallback_key was not written read-only"
+[ "$(cat "$fallback_key")" = "$key_pem" ] || test_failure "the fallback key file does not hold its PEM"
+grep -qxF "ZINDER_NODE_FALLBACKS__2__INDEXER_TLS__CLIENT_KEY_PATH=$fallback_key" "$env_dump" \
+  || test_failure "the fallback key path variable was not exported"
+grep -qxF "ZINDER_NODE_FALLBACKS__2__INDEXER_TLS__CA_CERT_PATH=$work/shm/$directory_name/node-fallback-2-ca-cert.pem" \
+  "$env_dump" || test_failure "the fallback CA path variable was not exported"
+
+reset_locations
+if run_entrypoint "$test_canonical" tmpfs \
+  "ZINDER_NODE_FALLBACKS__1__INDEXER_TLS__CA_CERT_PEM=$ca_pem" \
+  ZINDER_NODE_FALLBACKS__1__INDEXER_TLS__CA_CERT_PATH=/run/secrets/ca.pem; then
+  test_failure "canonical entrypoint accepted both forms of a fallback CA certificate"
+fi
+grep -q "set either ZINDER_NODE_FALLBACKS__1__INDEXER_TLS__CA_CERT_PEM or ZINDER_NODE_FALLBACKS__1__INDEXER_TLS__CA_CERT_PATH" \
+  "$stderr_log" || test_failure "the fallback conflict error does not name both variables"
+
 # Wallet-serving image: materializes once, then re-executes itself so the
 # supervising shell's initial environment carries no *_PEM variable either.
 reset_locations
@@ -247,6 +273,15 @@ assert_no_pem_variable "$env_dump"
 assert_no_pem_variable "$env_dump.initial"
 [ "$(grep -c "writing indexer TLS material" "$stderr_log")" -eq 1 ] \
   || test_failure "the re-executed wallet-serving entrypoint materialized twice"
+
+reset_locations
+run_entrypoint "$test_wallet" tmpfs \
+  "ZINDER_NODE_FALLBACKS__1__INDEXER_TLS__CLIENT_KEY_PEM=$key_pem" \
+  || test_failure "wallet-serving entrypoint failed with a fallback PEM variable: $(cat "$stderr_log")"
+assert_no_pem_variable "$env_dump"
+assert_no_pem_variable "$env_dump.initial"
+grep -qxF "ZINDER_NODE_FALLBACKS__1__INDEXER_TLS__CLIENT_KEY_PATH=$work/shm/$directory_name/node-fallback-1-client-key.pem" \
+  "$env_dump" || test_failure "the re-executed entrypoint lost the fallback key path"
 
 reset_locations
 run_entrypoint "$test_wallet" tmpfs ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM= \
