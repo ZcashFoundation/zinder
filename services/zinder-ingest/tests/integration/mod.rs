@@ -4,6 +4,7 @@ mod canonical_follow;
 mod cli;
 mod env_var_contract;
 mod fixture_block;
+mod healthcheck;
 mod materialized_view_replay;
 mod node_failover;
 mod runtime_allocator;

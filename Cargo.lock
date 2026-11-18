@@ -6147,6 +6147,7 @@ version = "0.18.0"
 dependencies = [
  "axum",
  "bytes",
+ "clap",
  "config",
  "eyre",
  "futures-util",

@@ -53,6 +53,7 @@ pub mod mock_mempool_source;
 pub mod mock_transaction_broadcaster;
 pub mod network_upgrade_fixtures;
 pub mod note_commitment_chain;
+pub mod ops_healthcheck;
 pub mod orchard_test_key;
 pub mod process_crash;
 pub mod repeated_request_fields;
@@ -89,6 +90,7 @@ pub use network_upgrade_fixtures::{
     local_network_from_activations, sample_regtest_upgrade_activations,
 };
 pub use note_commitment_chain::{commitment_tree_checkpoints, with_note_commitments};
+pub use ops_healthcheck::{OpsEndpointStub, check_binary_healthcheck};
 pub use orchard_test_key::{OrchardAddress, OrchardTestKey, regtest_unified_address};
 pub use repeated_request_fields::{RepeatedRequestField, repeated_request_fields};
 pub use runtime_allocator::check_binary_allocates_through_jemalloc;

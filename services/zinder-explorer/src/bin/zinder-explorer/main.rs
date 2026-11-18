@@ -3,7 +3,7 @@
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc, time::Duration};
 use zinder_core::wire::encode_zinder_native_chain_name;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zinder_explorer::{
@@ -11,10 +11,10 @@ use zinder_explorer::{
     MaterializedViewStoreError, MaterializedViewStoreOptions, describe_request_metrics,
 };
 use zinder_runtime::{
-    ComposedReadiness, OpsEndpointHandle, Readiness, ReadinessCause, ReadinessInput,
-    ReadinessState, RuntimeService, StartupPhase, TracingSubscriberError,
+    ComposedReadiness, OpsEndpointHandle, OpsHealthcheckArgs, Readiness, ReadinessCause,
+    ReadinessInput, ReadinessState, RuntimeService, StartupPhase, TracingSubscriberError,
     cancel_on_terminating_signal, host_cpu_meets_compiled_baseline, install_tracing_subscriber,
-    spawn_ops_endpoint_for,
+    section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
 };
 use zinder_source::{NodeTarget, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 
@@ -72,11 +72,23 @@ struct Cli {
     /// Empty/unset disables every capability that needs upstream reads.
     #[arg(long = "wallet-query-endpoint")]
     wallet_query_endpoint: Option<String>,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Probe the operational endpoint once and exit 0 only when it answers
+    /// HTTP 200. Reads no configuration file.
+    Healthcheck(OpsHealthcheckArgs),
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Some(Command::Healthcheck(healthcheck)) = &cli.command {
+        return run_healthcheck(healthcheck);
+    }
     if let Err(error) = install_tracing_subscriber() {
         return emit_tracing_subscriber_error(&error);
     }
@@ -459,6 +471,20 @@ fn build_grpc_adapter(
         grpc_adapter = grpc_adapter.with_bearer_token(token);
     }
     grpc_adapter
+}
+
+#[allow(
+    clippy::print_stderr,
+    reason = "the container runtime records the healthcheck's stderr as its failure reason"
+)]
+fn run_healthcheck(healthcheck: &OpsHealthcheckArgs) -> ExitCode {
+    match healthcheck.run(default_ops_listen_addr(RuntimeService::Explorer)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{}: healthcheck failed: {error}", env!("CARGO_BIN_NAME"));
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[allow(
