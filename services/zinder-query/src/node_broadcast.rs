@@ -544,12 +544,15 @@ impl EndpointVerifications {
     }
 
     fn verified_capabilities_at(&self, position: usize) -> Option<UpstreamNodeCapabilities> {
-        let admission = self.admission.lock().clone()?;
+        // Held through the state load: `track` and `record` take the same
+        // lock, so the check never pairs a superseded schedule with a
+        // verification recorded after a newer one was tracked.
+        let admission = self.admission.lock();
         self.endpoints
             .get(position)?
             .state
             .load()
-            .in_force(&admission)
+            .in_force(admission.as_deref()?)
             .cloned()
     }
 
