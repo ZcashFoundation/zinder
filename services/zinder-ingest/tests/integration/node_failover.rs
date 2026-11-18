@@ -37,6 +37,7 @@ use zinder_source::{
     SourceChainSegment, SourceChainSegmentLimits, SourceError, SourceSubtreeRoots,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, UpstreamHealthSnapshot,
 };
+use zinder_proto::v1::ingest::CanonicalWriterStatusResponse;
 use zinder_store::RocksDbCanonicalStore;
 use zinder_testkit::{LogCapture, sample_regtest_upgrade_activations};
 
@@ -877,18 +878,72 @@ async fn a_switch_resets_the_gated_node_source_input_to_starting() -> TestResult
     Ok(())
 }
 
-/// A tip the previous endpoint confirmed is unconfirmed after a switch
-/// until the new endpoint confirms it.
+/// A switch to an endpoint holding the visible tip keeps the tip confirmed,
+/// so readers keep serving while that endpoint's first iterations fail.
 #[tokio::test]
-async fn a_switch_reports_the_tip_unconfirmed_until_the_new_endpoint_confirms_it() -> TestResult {
+async fn a_switch_to_an_endpoint_holding_the_visible_tip_keeps_the_tip_confirmed() -> TestResult {
     let PublishedStore {
         blocks,
         store,
         _directory,
     } = published_store().await?;
-    let primary = FailoverEndpoint::serving(&blocks, 2)?;
     let fallback = FailoverEndpoint::serving(&blocks, 4)?;
-    *fallback.blocks_unavailable_above.lock() = Some(BlockHeight::new(2));
+    let SwitchStatuses {
+        confirmed,
+        after_switch,
+        store,
+    } = writer_statuses_around_switch(&blocks, store, fallback, BlockHeight::new(2)).await?;
+
+    assert!(!confirmed.tip_unconfirmed);
+    assert!(!after_switch.tip_unconfirmed);
+    assert_eq!(store.event_fence().visible_tip(), block_id(&blocks, 4)?);
+    Ok(())
+}
+
+/// A switch to a diverged endpoint reports the tip unconfirmed until the
+/// replacement of the diverged suffix commits.
+#[tokio::test]
+async fn a_switch_to_a_diverged_endpoint_reports_the_tip_unconfirmed() -> TestResult {
+    let PublishedStore {
+        blocks,
+        store,
+        _directory,
+    } = published_store().await?;
+    let diverged_chain = forked_parseable_chain(&blocks, 2, 4, 47)?;
+    let diverged = FailoverEndpoint::serving(&diverged_chain, 4)?;
+    let SwitchStatuses {
+        confirmed,
+        after_switch,
+        store,
+    } = writer_statuses_around_switch(&blocks, store, diverged, BlockHeight::new(2)).await?;
+
+    assert!(!confirmed.tip_unconfirmed);
+    assert!(after_switch.tip_unconfirmed);
+    assert_eq!(
+        store.event_fence().visible_tip(),
+        block_id(&diverged_chain, 4)?
+    );
+    Ok(())
+}
+
+struct SwitchStatuses {
+    confirmed: CanonicalWriterStatusResponse,
+    after_switch: CanonicalWriterStatusResponse,
+    store: RocksDbCanonicalStore,
+}
+
+/// Follows to height 4 over `[node]` and `fallback`, reading `WriterStatus`
+/// once the tip is confirmed and again right after `[node]` fails and ingest
+/// switches. `fallback` serves no block above `blocked_above` until the
+/// second status is read, so its first iterations fail.
+async fn writer_statuses_around_switch(
+    blocks: &BTreeMap<BlockHeight, SourceBlock>,
+    store: RocksDbCanonicalStore,
+    fallback: FailoverEndpoint,
+    blocked_above: BlockHeight,
+) -> TestResult<SwitchStatuses> {
+    let primary = FailoverEndpoint::serving(blocks, 2)?;
+    *fallback.blocks_unavailable_above.lock() = Some(blocked_above);
     let failing_primary = primary.clone();
     let healing_fallback = fallback.clone();
     let started =
@@ -904,6 +959,8 @@ async fn a_switch_reports_the_tip_unconfirmed_until_the_new_endpoint_confirms_it
         while started.failover.active_position() != 1 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        // Let the follower fail several iterations on the new endpoint.
+        tokio::time::sleep(Duration::from_millis(50)).await;
         let after_switch = canonical.writer_status().await?;
         *healing_fallback.blocks_unavailable_above.lock() = None;
         Ok::<_, tonic::Status>((confirmed, after_switch))
@@ -922,11 +979,11 @@ async fn a_switch_reports_the_tip_unconfirmed_until_the_new_endpoint_confirms_it
     let (confirmed, after_switch) = statuses?;
     let store = outcome?;
     started.stop().await?;
-
-    assert!(!confirmed.tip_unconfirmed);
-    assert!(after_switch.tip_unconfirmed);
-    assert_eq!(store.event_fence().visible_tip(), block_id(&blocks, 4)?);
-    Ok(())
+    Ok(SwitchStatuses {
+        confirmed,
+        after_switch,
+        store,
+    })
 }
 
 /// A switch attempt that finds no candidate is not repeated, or logged

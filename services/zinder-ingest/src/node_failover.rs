@@ -202,6 +202,9 @@ pub struct NodeEndpointSwitch {
     /// Trigger label: `node_unreachable`, `stream_disconnected`, or
     /// `upstream_not_ready`.
     pub failure_class: &'static str,
+    /// Whether the new endpoint holds another branch above the settled tip.
+    /// Otherwise its final switch check found the visible tip block on it.
+    pub diverged_above_settlement: bool,
 }
 
 /// Handle the canonical follower consults to switch node endpoints.
@@ -580,6 +583,7 @@ where
             from_position,
             to_position,
             failure_class,
+            diverged_above_settlement: diverged,
         }
     }
 }

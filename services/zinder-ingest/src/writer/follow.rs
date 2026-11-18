@@ -28,7 +28,7 @@ use zinder_store::{
 
 use crate::{
     CanonicalBlockConstructionError, CanonicalConstructionError, CommitmentTreeSizes, IngestError,
-    MempoolReadyGate, NodeFailover, position_canonical_block, prepare_canonical_block,
+    MempoolReadyGate, NodeEndpointSwitch, NodeFailover, position_canonical_block, prepare_canonical_block,
     source_recovery::{
         SourceRecoveryDecision, decide_recovery, default_recovery_backoff, detail_for_new_outage,
         detail_for_ongoing_outage,
@@ -156,12 +156,11 @@ where
         )
         .increment(1);
         if let Some(node_failover) = self.config.node_failover.as_ref()
-            && node_failover
+            && let Some(switch) = node_failover
                 .switch_after_failures(failure_class, consecutive_same_class)
                 .await
-                .is_some()
         {
-            return Ok(SourceRecovery::Switched);
+            return Ok(SourceRecovery::Switched(switch));
         }
         Ok(tokio::select! {
             () = self.cancel.cancelled() => SourceRecovery::Cancelled,
@@ -252,7 +251,19 @@ enum SourceRecovery {
     /// Observe the same endpoint again.
     Retry,
     /// The node failover switched endpoints; observe the new one now.
-    Switched,
+    Switched(NodeEndpointSwitch),
+}
+
+/// The final switch check found the visible tip block on a non-diverged
+/// target, which is the evidence an append gives, so readers keep serving
+/// while the new endpoint's first iteration is still pending. A diverged
+/// target does not hold the visible tip until its replacement commits.
+fn tip_confirmation_after_switch(switch: &NodeEndpointSwitch) -> TipConfirmation {
+    if switch.diverged_above_settlement {
+        TipConfirmation::Unconfirmed
+    } else {
+        TipConfirmation::Confirmed
+    }
 }
 
 /// The source outage in progress, counted per failure class so a switch
@@ -562,9 +573,9 @@ where
         }
         if let Some(node_failover) = follower.config.node_failover.as_ref() {
             observe_fence_for_failover(node_failover, &store, &mut observed_fence_tip)?;
-            if node_failover.switch_after_unready().await.is_some() {
+            if let Some(switch) = node_failover.switch_after_unready().await {
                 source_outage = None;
-                tip_confirmation = TipConfirmation::Unconfirmed;
+                tip_confirmation = tip_confirmation_after_switch(&switch);
                 continue;
             }
         }
@@ -630,11 +641,10 @@ where
                 {
                     SourceRecovery::Cancelled => return Ok(store),
                     SourceRecovery::Retry => {}
-                    SourceRecovery::Switched => {
-                        // The new endpoint has not confirmed the visible tip,
-                        // and its failures start a new outage.
+                    SourceRecovery::Switched(switch) => {
+                        // Failures on the new endpoint start a new outage.
                         source_outage = None;
-                        tip_confirmation = TipConfirmation::Unconfirmed;
+                        tip_confirmation = tip_confirmation_after_switch(&switch);
                     }
                 }
                 continue;
