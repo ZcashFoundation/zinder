@@ -81,6 +81,11 @@ the log on the first deployment.
 [Wallet-serving deployment §Indexer TLS](deploying-wallet-serving.md#indexer-tls)
 lists the errors that stop the container.
 
+A fallback node endpoint takes the same variables under its position, such as
+`ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR` and
+`ZINDER_NODE_FALLBACKS__1__INDEXER_TLS__CLIENT_KEY_PEM`; see
+[Wallet-serving deployment §Fallback node endpoints](deploying-wallet-serving.md#fallback-node-endpoints).
+
 `/healthz` proves process liveness. `/readyz` proves only the canonical writer
 and mempool contract. It does not prove wallet projection, wallet-serving admission,
 public TLS, coherent recovery, or client compatibility.

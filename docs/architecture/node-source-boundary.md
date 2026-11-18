@@ -33,8 +33,18 @@ Forbidden outside `zinder-source`:
 - one-block random access for following and reorg traversal;
 - upstream tip identity;
 - tree-state checkpoints and shielded subtree roots;
-- chain-wide and block-bound value-pool observations; and
-- upstream readiness.
+- chain-wide and block-bound value-pool observations;
+- upstream readiness; and
+- the node's own description: `probe_capabilities`, which also refreshes
+  `capabilities`, `fetch_network_upgrade_activations`, and
+  `fetch_storage_mode`.
+
+Every runtime reaches these through the trait. `discover_network_upgrade_activations`
+wraps `fetch_network_upgrade_activations` with the shared discovery log event,
+and `MempoolSourceFactory` builds an endpoint's live mempool source: the
+streaming indexer source when the endpoint names an indexer, polling
+otherwise. `ZebraJsonRpcSource::from_node_target` builds the source one
+resolved `NodeTarget` describes, including its indexer endpoint.
 
 Every operation returns Zinder types and `SourceError`. Historical construction
 uses `fetch_chain_segment` with explicit block-count and response-byte limits.
@@ -89,6 +99,33 @@ only as a cross-check, as [Chain ingestion](chain-ingestion.md) describes.
 chain observation. The unit implementation returns
 `TransactionBroadcastDisabled`, so a read-only composition fails explicitly.
 
+## Ordered node list
+
+Every node-reading runtime reads one ordered list of endpoints: `[node]` is
+position 0, and `[node_fallbacks.N]` is position `N`, from 1 without a gap.
+Each fallback table has the fields of `[node]`. Positions are integer table
+keys in TOML and in the environment
+(`ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR`), so a file and the environment
+merge field by field; a TOML array of tables is refused, because the loader
+would replace the whole array as soon as one environment variable named an
+entry. `zinder-ingest`, `zinder-query`, `zinder-compat-lightwalletd`, and
+`zinder-explorer` accept the list, and `--print-config` renders it with
+credentials redacted. `zinder-projector` reads no node list.
+
+`NodeSet` holds the list and implements `NodeSource` by delegating every call
+to its active endpoint, so code written against one node is unchanged.
+`NodeSet::connect(primary, fallbacks)` builds every endpoint's
+`ZebraJsonRpcSource`. Only the `NodeSetSwitch` returned with the set changes
+the active endpoint, and `NodeSet::mempool_source` follows the active
+endpoint's mempool: a switch ends the open event stream with one
+`MempoolStreamUnavailable` item, so the consumer rebuilds its snapshot from the
+new endpoint as after any stream failure.
+
+Only ingest switches, and only between follow iterations; see
+[Chain ingestion §Node endpoint failover](chain-ingestion.md#node-endpoint-failover)
+and [ADR-0013](../adrs/0013-source-failure-recovery-topology.md). The readers
+validate the list and keep reading `[node]`.
+
 ## Implementations and runtime selection
 
 The current implementations are:
@@ -138,11 +175,14 @@ names are:
 
 The Zebra JSON-RPC source derives capabilities from two observations. Methods
 advertised by `rpc.discover` grant the method-backed capabilities. When the
-node advertises `getblockchaininfo`, the probe also reads its `pruned` field
-and grants `historical_block_bodies` only for `pruned: false`. A failed call or
-a response without `pruned` withholds the capability, so an unreported storage
-mode fails closed. Zebra always reports `pruned: false`; Zakura reports `true`
-in pruned storage mode.
+node advertises `getblockchaininfo`, the probe also reads its storage mode
+through `fetch_storage_mode` and grants `historical_block_bodies` only for
+`pruned: false`. A failed call or a response without `pruned` withholds the
+capability, so an unreported storage mode fails closed. Zebra always reports
+`pruned: false`; Zakura reports `true` in pruned storage mode.
+`fetch_storage_mode` itself reports `archive`, `pruned`, or `unreported`, and
+fails when the call fails, so ingest can exclude a fallback endpoint only when
+it reports `pruned: true`.
 
 Ingest validates the capabilities it needs before mutation begins and requires
 `historical_block_bodies`, so it refuses a pruned node at startup with readiness

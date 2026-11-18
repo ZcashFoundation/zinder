@@ -65,6 +65,21 @@ the primary admits a revision, and it checks the revision against its visible
 tip at that moment. Live following interprets new blocks with the admitted
 table.
 
+### Node endpoint switches
+
+The writer admits a table only when it opens the store. When ingest has
+fallback node endpoints ([ADR-0013](0013-source-failure-recovery-topology.md)),
+it admits the table of the endpoint it starts on. Every other endpoint must
+advertise exactly that table at startup, and a switch target must advertise
+exactly the table the store admitted, compared entry by entry, names included.
+An endpoint with any other table is refused, and no table is admitted while
+ingest runs. After an operator aligns the nodes, for example by upgrading both
+to a release that announces the same upgrade, restarting ingest admits the new
+table.
+
+Zebra 7.0.0 and Zakura 1.8.6 report identical `getblockchaininfo.upgrades`
+names on Regtest, so plain equality lets them back each other up.
+
 ### Readers
 
 Readers never write a revision, and the reader runtimes bring no activation
@@ -145,6 +160,14 @@ responses carry the admitted table, revision, and V1 fingerprint.
 
 ## Rejected alternatives
 
+### Compare switch targets without upgrade names
+
+A switch target could match the admitted schedule on branch ids and heights
+alone. Admission at store open compares names too, so a restart while the
+first endpoint is down would refuse the store that the running writer had
+accepted the endpoint for. One plain-equality rule keeps startup and switching
+consistent.
+
 ### Rewrite the construction fingerprint
 
 The writer could replace the build plan's fingerprint with the new table's.
@@ -179,3 +202,6 @@ See [Public interfaces §Core vocabulary](../architecture/public-interfaces.md#c
   admitted schedule is refused with the retryable
   `NetworkUpgradeScheduleNotAdmitted`. A broadcasting reader verifies its
   node's table on first contact instead.
+- 2026-11-18: Added "Node endpoint switches": ingest admits only its starting
+  endpoint's table, and other endpoints must advertise exactly the admitted
+  table to take over.

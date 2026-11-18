@@ -259,6 +259,55 @@ compatibility start even while the cookie is unreadable: they report the node
 as unavailable and refuse broadcasts until they can read it. Z3 already runs
 an equivalent service, so Z3 deployments do not need this project.
 
+### Fail over to a second node
+
+Ingest can read from a second node, such as a Zakura node beside a Zebra node
+on the same network, and switch to it when the first stops answering or stays
+unsynchronized for five minutes. Merge `deploy/docker-compose.node-fallback.yml`
+and add the fallback node to the env file the way `[node]` is named:
+
+```text
+ZINDER_FALLBACK_SOURCE_NETWORK_NAME=zakura-mainnet
+ZINDER_FALLBACK_SOURCE_COOKIE_VOLUME_NAME=zakura-mainnet-cookie
+ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR=http://zakura:8232
+ZINDER_NODE_FALLBACKS__1__INDEXER_GRPC_ADDR=
+```
+
+```bash
+docker compose --env-file /etc/zinder/env \
+  -f deploy/docker-compose.yml \
+  -f deploy/docker-compose.node-fallback.yml \
+  up -d
+```
+
+Run the cookie-permissions project for the fallback node's cookie volume too,
+as a project of its own:
+
+```bash
+ZINDER_SOURCE_COOKIE_VOLUME_NAME=zakura-mainnet-cookie \
+  docker compose -p zinder-mainnet-fallback-node-cookie \
+  --env-file /etc/zinder/env -f deploy/node-cookie-permissions.yml up -d
+```
+
+The overlay mounts the fallback cookie at `/var/run/auth-fallback` for ingest,
+query, and compatibility. An empty `INDEXER_GRPC_ADDR` polls the fallback's
+mempool after a switch, as for `[node]`; to stream it over TLS, add the
+`ZINDER_NODE_FALLBACKS__1__INDEXER_TLS__*_PATH` variables to `zinder-ingest`
+the way the indexer TLS overlay sets the `[node]` ones.
+
+At startup, ingest checks each endpoint's capabilities, activation table, and
+genesis block, and starts on the first one that passes, `[node]` first.
+`docker compose logs zinder-ingest` shows `node_endpoint_admitted`,
+`node_endpoint_unreachable`, or `node_endpoint_excluded` for each position, and
+`/readyz` on port 9105 reports `active_node.position`. A switch logs
+`node_endpoint_switched`. Ingest does not switch back on its own: it stays on
+the fallback until the fallback fails or ingest restarts, and a restart starts
+at `[node]` again. Both nodes must advertise the same network-upgrade table;
+see [Upgrading the node](upgrading-the-node.md#with-a-fallback-node).
+
+Only ingest switches. Query and compatibility validate the list but still
+broadcast through `[node]`.
+
 ### Attach an explorer consumer
 
 When the same host serves Zexplorer or another named `ExplorerQuery` consumer,

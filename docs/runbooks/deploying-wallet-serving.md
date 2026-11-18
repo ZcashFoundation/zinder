@@ -123,6 +123,7 @@ variables its binary accepts:
 | --- | --- | --- | --- |
 | `ZINDER_NETWORK__*`, `ZINDER_OPS__*`, `ZINDER_SECURITY__*`, `ZINDER_INGEST_CONTROL__*` | yes | yes | yes |
 | `ZINDER_NODE__*` | yes | | yes |
+| `ZINDER_NODE_FALLBACKS__*` | yes | | yes |
 | `ZINDER_STORAGE__CANONICAL__*`, `ZINDER_STORAGE__RAW_BLOB_POLICY` | yes | yes | yes |
 | `ZINDER_INGEST__*`, `ZINDER_RETENTION__*`, `ZINDER_STORAGE__MATERIALIZED_VIEWS__*` | yes | | |
 | `ZINDER_PROJECTOR__*`, `ZINDER_PROJECTOR_CONTROL__*` | | yes | |
@@ -206,6 +207,32 @@ them. To rotate the material, change the variables and redeploy.
 
 `zinder-ingest` checks the files at startup. A missing file, or one with no
 certificate or private key, stops the container with a configuration error.
+
+### Fallback node endpoints
+
+Ingest can switch to a second node when the first stops answering or stays
+unsynchronized; see
+[Chain ingestion §Node endpoint failover](../architecture/chain-ingestion.md#node-endpoint-failover).
+Name each fallback with the `[node]` variables under a position, counting from
+1 without a gap:
+
+| Variable | Value |
+| --- | --- |
+| `ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR` | `http://zakura.railway.internal:18232` |
+| `ZINDER_NODE_FALLBACKS__1__AUTH__METHOD` | `cookie` |
+| `ZINDER_NODE_FALLBACKS__1__AUTH__COOKIE` | that node's inline cookie string |
+| `ZINDER_NODE_FALLBACKS__1__INDEXER_GRPC_ADDR` | that node's indexer gRPC URL |
+
+The entrypoint stops the container when a configured fallback has no
+`INDEXER_GRPC_ADDR`, for the reason it requires one for `[node]`: ingest
+follows the mempool of the endpoint it switched to. A fallback's indexer TLS
+takes the same `*_PATH` or `*_PEM` variables under its position, such as
+`ZINDER_NODE_FALLBACKS__1__INDEXER_TLS__CLIENT_KEY_PEM`; the entrypoint writes
+those files as `node-fallback-1-client-key.pem` beside the `[node]` files.
+
+Ingest and query receive the list. Query validates it and keeps broadcasting
+through `[node]`; the projector reads no node list. Ingest's `/readyz` reports
+`active_node.position` once a fallback is configured.
 
 ## Deploy on Railway
 

@@ -79,6 +79,25 @@ upgrade table, so it needs neither schedule admission nor a store rebuild.
 Construction identity, canonical rows, the construction manifest, and the
 wallet projection are unchanged by admission.
 
+## With a fallback node
+
+When ingest has `[node_fallbacks.N]` endpoints, every endpoint must advertise
+exactly the table the store admitted, names included, to take over. While
+ingest runs it admits no new table, so upgrade the nodes one at a time:
+
+1. Upgrade a node ingest is not reading from. `/readyz` on ingest reports the
+   active endpoint as `active_node.position`. Until the active node is upgraded
+   too, the upgraded node advertises a different table, so the standby monitor
+   logs `node_endpoint_skipped` with reason `schedule_conflict` for it and
+   ingest cannot switch to it.
+2. Upgrade the other nodes, then restart ingest. It starts on `[node]` again,
+   admits the new table, and every endpoint qualifies again.
+
+Ingest does not switch back on its own, so after a failover it keeps reading
+from the fallback until the fallback fails or ingest restarts. Restarting the
+node ingest reads from interrupts ingest like any node outage, and ingest
+switches only to an endpoint whose table still equals the admitted one.
+
 ## If ingest refuses the table
 
 Ingest leaves the store unchanged when it refuses a table.

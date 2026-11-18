@@ -651,6 +651,18 @@ that mutates regtest state (broadcast cycles, indexer-restart, deep-chain
 construction runs). Run them in isolation if you want to debug — parallel execution
 will fight for the same node.
 
+### Node endpoint failover
+
+Ingest failover between node endpoints has no live test yet. A two-node run
+needs a Zebra node and a Zakura node on one Regtest chain, and the local
+Regtest nodes do not peer with each other. The behavior is covered by
+simulated-source integration tests in
+`services/zinder-ingest/tests/integration/node_failover.rs`: startup admission
+and exclusion, the transport-failure and sustained-unready switches, candidate
+ranking, and a standby that lags or diverged below settlement. The mempool
+rebuild on a switch is covered in
+`crates/zinder-source/tests/integration/node_set.rs`.
+
 ## T3: Live testnet (Zebra cookie auth)
 
 Same surface as regtest but against real testnet. Useful for capability probes

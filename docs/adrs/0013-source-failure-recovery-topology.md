@@ -22,13 +22,25 @@ provide operators with the actionable reason and recovery cadence.
 3. **Unknown upstream responses recover by source identity.** Adapters preserve an actionable `SourceError` and classify it rather than treating an unrecognized upstream response as a fatal loop decision.
 4. **Source errors describe observations.** `SourceFailureClass` (`NodeUnreachable`, `UpstreamViewChanged`, `StreamDisconnected`, `CapabilityMissing`, `ProtocolMismatch`, `Malformed`, `Configuration`) is the operator-facing label returned by `SourceError::upstream_classification()`.
 5. **Readiness carries operator detail.** `ReadinessCause::NodeUnavailable` carries `NodeUnavailableDetail` with `{ failure_class, last_reason, consecutive_failures, outage_seconds }`. `/readyz`, the proto report, and `zinder_readiness_node_failure_class{class=...}` surface that detail.
-6. **Per-call retry handles narrow transport classes.** `retry_source_request` retries only `NodeUnreachable` and `StreamDisconnected` failures. Other source failures return to the loop, which re-observes upstream state before issuing dependent requests.
+6. **Per-call retry handles narrow transport classes.** `retry_source_request` retries only `NodeUnreachable` and `StreamDisconnected` failures during fresh construction. The canonical follower makes one attempt per call; other source failures, and every follow-mode failure, return to the loop, which re-observes upstream state before issuing dependent requests.
 7. **Only the writer drains on a source failure.** Wallet-serving readers report their node probe's `node_unavailable` or `upstream_not_ready`, and the writer's `upstream_not_ready` relayed through ingest control, as degraded dependencies with the same detail. They keep serving stored reads, and a node-backed request fails on its own with `NODE_UNAVAILABLE` ([ADR-0045](0045-wallet-serving-readiness-follows-the-serving-pair.md)).
+8. **Ingest owns the node endpoint switch.** When `[node_fallbacks.N]` endpoints are configured, the canonical follower reads through the active endpoint of a `NodeSet`, `[node]` being position 0. It switches only between follow iterations, so every read that prepares one block reaches one endpoint:
+   - after `NodeFailoverPolicy::transport_failures_before_switch` (3) consecutive recoveries of one class, `node_unreachable` or `stream_disconnected`, counted per class;
+   - or at the top of an iteration, after the active endpoint has reported not ready for `upstream_not_ready_before_switch` (300 seconds), which outlasts the brief synchronization flaps nodes report.
+
+   `upstream_view_changed`, `protocol_mismatch`, `malformed`, `capability_missing`, and `configuration` never switch: switching on them would pick whichever node's answer parses and could hide a Zinder defect.
+
+   A standby monitor evaluates the other endpoints in the background. A candidate qualifies when it advertises the required ingest capabilities and the startup endpoint's value-pool capabilities, reports ready, advertises the writer-admitted activation table ([ADR-0039](0039-writer-admitted-network-upgrade-schedules.md)), and has a tip at or above the visible tip. Candidates holding the visible tip are tried first, in position order. A candidate that shares only the settled tip is tried only when none holds the visible tip, and the switch then replaces the diverged suffix within the reorg window. A candidate that differs at or below the settled tip never qualifies, so a switch cannot park the writer. At switch time the follower rechecks only the chosen candidate's tip and the block it holds at the visible tip, or at the settled tip for a diverged candidate, within one five-second bound, which keeps the writer's control plane responsive during a failover.
+
+   A switch resets tip confirmation, so readers see `tip_unconfirmed` until the new endpoint confirms the visible tip. It skips the recovery backoff, resets the `node_source` readiness input to `starting` when `[node.health]` gates readiness, and ends the live mempool stream so the owner withdraws certification and rebuilds from the new endpoint. There is no timed failback: the next switch walks positions from 0 again, and a restart starts at position 0. Fresh construction does not switch; a node failure there exits as before, and the restart admits the first reachable endpoint.
+
+   At startup, a single-endpoint deployment is checked as before. With fallbacks, every endpoint is checked, including its genesis block, and the first admitted endpoint in position order becomes active. An endpoint is excluded until restart only on positive evidence: pruned storage, a capability its capability discovery omits, a genesis block of another network, or an activation table other than the active endpoint's. A timeout, a failed call, or a storage mode the node did not report leaves the endpoint unreachable, and the monitor evaluates it again.
 
 ## Consequences
 
 - Canonical following stays alive through source outages while ingest `/readyz` reports `node_unavailable` with the source-failure class.
 - Wallet-serving readers stay ready through the same outages, so an operator watches ingest readiness and the readers' `zinder_readiness_dependency_state` gauge rather than reader 503s.
+- With fallback endpoints, ingest keeps committing through an outage of its active node. Expect a switch about 4 seconds after connections start being refused, or up to three request timeouts when requests hang. Each switch costs one mempool rehydration, during which ingest readiness is withdrawn.
 - Operators can see the failure class, latest reason, retry count, and outage duration without consulting logs.
 - New `SourceError` variants select a `SourceFailureClass`; recovery posture remains owned by ingest.
 
@@ -36,10 +48,11 @@ provide operators with the actionable reason and recovery cadence.
 
 - `docs/architecture/node-source-boundary.md` — Capability Model section: `SourceFailureClass` taxonomy and the operator-action table (`failure_class` → action).
 - `docs/architecture/service-operations.md` — Health and Readiness section: the `NodeUnavailableDetail` payload contract.
-- `docs/architecture/chain-ingestion.md` — Continuous following: loop-owned recovery posture.
+- `docs/architecture/chain-ingestion.md` — Continuous following: loop-owned recovery posture and endpoint switching.
 
 ## Revision history
 
 - 2026-11-17: Wallet-serving readers no longer drain readiness on a source
   failure. They report it as a degraded dependency and fail only node-backed
   requests ([ADR-0045](0045-wallet-serving-readiness-follows-the-serving-pair.md)).
+- 2026-11-18: Ingest switches between the endpoints of the ordered node list (Decision 8), and Decision 6 now states that the follower makes one attempt per call.
