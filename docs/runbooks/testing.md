@@ -667,11 +667,14 @@ Reader broadcast failover is covered by
 `services/zinder-query/tests/integration/broadcast_failover.rs`: failover
 within a broadcast, the preferred endpoint, the duplicate-after-timeout
 answer, exclusion and its backoff, and verification after a schedule revision
-or an activation crossing. Lightwalletd's `SendTransaction` mapping of that
-answer is in `services/zinder-compat-lightwalletd/tests/integration/lightwalletd_grpc.rs`.
+or an activation crossing, an inconclusive repeat that keeps the earlier
+verification, a preference that only a failover moves, and the endpoint
+metrics. Lightwalletd's `SendTransaction` mapping of that answer is in `services/zinder-compat-lightwalletd/tests/integration/lightwalletd_grpc.rs`.
 One live test, `live::broadcast_fallback`, needs only one Regtest node: it puts
-an address that refuses connections at `[node]` and the live node at
-`[node_fallbacks.1]`, and checks that a broadcast reaches the live node.
+a local TCP proxy to the live node at `[node]` and the live node itself at
+`[node_fallbacks.1]`, verifies both, stops the proxy, and checks that a
+broadcast reaches the live node and moves the preference with cause
+`node_unreachable`.
 
 ## T3: Live testnet (Zebra cookie auth)
 

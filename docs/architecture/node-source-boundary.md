@@ -209,7 +209,8 @@ compatibility use no node at all. A reader wraps its ordered endpoints in an
 `OrderedBroadcaster` and verifies each one on first contact through the
 source's `BroadcastNodeProbe`: `rpc.discover` must list `sendrawtransaction`,
 the `getblockchaininfo` activation table must agree with the serving pair's
-writer-admitted schedule through the visible tip, and the node's best chain
+writer-admitted schedule through the height after the visible tip, which a
+broadcast transaction targets, and the node's best chain
 must hold the pair's visible tip block, read with `getblockhash`. A broadcast
 reaches only verified endpoints. While none is verified it fails with
 `NodeUnavailable` and sends nothing, so a transaction never reaches a node on

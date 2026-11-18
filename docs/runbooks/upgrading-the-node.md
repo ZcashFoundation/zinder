@@ -104,12 +104,13 @@ switches only to an endpoint whose table still equals the admitted one.
 
 Query and wallet-mode compatibility keep broadcasting through every node
 during the sequence. Their verification compares a node's table with the
-admitted one only through the served tip, so a node that adds an upgrade above
-the tip still qualifies. When the writer admits the new table, they verify
-every endpoint again. A node still on the old release once the upgrade
-activates refuses transactions for the new consensus branch, so broadcasts
-move on to the next endpoint, and the node is excluded once the served tip
-passes the activation height, until it is upgraded.
+admitted one only through the height after the served tip, the block a
+broadcast targets, so a node that adds an upgrade further above the tip still
+qualifies. When the writer admits the new table, they verify every verified
+endpoint again. A node still on the old release once the upgrade activates refuses
+transactions for the new consensus branch, so broadcasts move on to the next
+endpoint, and the node is excluded as soon as the served tip reaches the block
+before the activation height, until it is upgraded.
 
 ## If ingest refuses the table
 
@@ -125,13 +126,19 @@ A reader whose storage open ends with `has no writer-admitted network-upgrade
 schedule yet` started against a store that ingest has never opened. Start
 ingest, then restart the reader.
 
-Query and compatibility check their broadcast node's table against the
-admitted schedule when they first reach it. A node whose table disagrees at or
-below the served tip, for example a node left on another network, never
-receives a transaction: `/readyz` lists `node_source` under `degraded` with
+Query and compatibility check each broadcast endpoint's table against the
+admitted schedule when they first reach it. An endpoint whose table disagrees
+at or below the height after the served tip, for example a node left on
+another network, is excluded and never receives a transaction. The reader logs
+`wallet_node_excluded` with the endpoint `position` and `retry_after_secs`,
+and verifies the endpoint again after that backoff, which starts at 30 seconds
+and doubles to 5 minutes while the table keeps disagreeing. Broadcasts keep
+going through the other verified endpoints. Only while no endpoint is
+verified does `/readyz` list `node_source` under `degraded` with
 `node_unavailable` and failure class `protocol_mismatch`, and every broadcast
-fails with `NODE_UNAVAILABLE`. Point the reader at a node on the store's chain;
-the reader verifies it again on its next probe round without a restart.
+fail with `NODE_UNAVAILABLE`. Point the endpoint at a node on the store's
+chain; the reader verifies it again once the backoff passes, without a
+restart.
 
 ## Related
 

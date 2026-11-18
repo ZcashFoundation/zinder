@@ -398,8 +398,8 @@ node writes its cookie file. It broadcasts through `[node]` and then each
 [Transaction broadcast through the node list](#transaction-broadcast-through-the-node-list)
 describes. Its node probe first verifies every endpoint: `rpc.discover` must
 list `sendrawtransaction`, the node's activation table must agree with the
-serving pair's writer-admitted schedule through the visible tip, and the
-node's best chain must hold the pair's visible tip block. A broadcast reaches
+serving pair's writer-admitted schedule through the height after the visible
+tip, and the node's best chain must hold the pair's visible tip block. A broadcast reaches
 only verified endpoints. Until one passes, every broadcast fails with
 `UNAVAILABLE` and `NODE_UNAVAILABLE` without sending the transaction, and the
 dependency reports the first endpoint's failure as `node_unavailable`
@@ -445,36 +445,61 @@ projector reports the park.
 #### Transaction broadcast through the node list
 
 Query and wallet-mode compatibility try the verified endpoints in order,
-starting at the preferred one, which is `[node]` until another endpoint
-answers. A broadcast moves to the next verified endpoint when one is
-unreachable, including when its `broadcast_timeout_secs` expires, or rejects
-the transaction for its consensus branch, as a node left on an older release
-after an upgrade activates does. Any other answer, accepted or refused, is the
-broadcast's outcome, and that endpoint becomes the preferred one for later
-broadcasts. There is no timed failback, so a hung endpoint costs its timeout
-only to the broadcasts that reached it before another endpoint answered. When
-every endpoint refuses the consensus branch, that refusal reaches the wallet.
-When every verified endpoint is unreachable, the broadcast fails with
-`UNAVAILABLE` and `NODE_UNAVAILABLE`; readiness is unchanged.
+starting at the preferred one, which is `[node]` until a failover moves it. A
+broadcast moves to the next verified endpoint when one is unreachable,
+including when its `broadcast_timeout_secs` expires, or rejects the
+transaction for its consensus branch, as a node left on an older release after
+an upgrade activates does. Any other answer, accepted or refused, is the
+broadcast's outcome. When the broadcast moved past an endpoint for one of
+those two causes, the endpoint that answered becomes the preferred one for
+later broadcasts and the move logs `broadcast_endpoint_switched`. An endpoint
+skipped only because it is not verified or is excluded moves nothing, so
+`[node]` stays preferred when a fallback finishes verification first at
+startup. There is no timed failback, so a hung endpoint costs its timeout only
+to the broadcasts that reached it before another endpoint answered. When every
+endpoint refuses the consensus branch, that refusal reaches the wallet. When
+every verified endpoint is unreachable, the broadcast fails with `UNAVAILABLE`
+and `NODE_UNAVAILABLE`; readiness is unchanged.
+
+The node probe observes the verified endpoints in the same order. It passes
+over one that is unreachable, and the next one that answers becomes the
+preferred endpoint, logged and counted like a broadcast failover with cause
+`node_unreachable`. A reader whose preferred endpoint stops while no wallet
+broadcasts therefore stays ready, `ServerInfo.node` describes the endpoint
+that answers, and the next broadcast pays no timeout. The node dependency is
+degraded only when no verified endpoint answers.
 
 An endpoint that timed out may have accepted the transaction anyway. When an
 earlier endpoint in the same broadcast was unreachable, a later endpoint's
 duplicate or queued answer is therefore reported as accepted, with the
 transaction id computed from the submitted bytes, so lightwalletd wallets do
 not receive error code -27 or -25 for a transaction that was sent. Bytes that
-do not decode as a transaction keep the node's answer.
+do not decode as a transaction keep the node's answer. For the same reason, a
+broadcast that no endpoint answered fails with the retryable
+`NODE_UNAVAILABLE` whenever an endpoint was unreachable, even if another
+endpoint refused the transaction for its consensus branch.
 
-A passed verification lasts until the serving pair's schedule revision or the
-network upgrade active at its tip changes. The probe then verifies every
-endpoint again at once instead of waiting for its next round. An endpoint that
+Verification checks an endpoint's activation table through the height after
+the served tip, the block a broadcast transaction targets. A passed
+verification lasts until the serving pair's schedule revision or the network
+upgrade active at that height changes. The probe then verifies every endpoint
+again at once instead of waiting for its next round. When that repeat is
+inconclusive, for example because the node has not received the block that
+crossed the activation, the endpoint keeps its earlier verification for up to
+one minute, logged once as `wallet_node_reverification_inconclusive`, and the
+probe retries every two seconds; after the minute it is unverified. An endpoint that
 lacks `sendrawtransaction` or whose activation table disagrees is excluded and
 logged as `wallet_node_excluded`; it is verified again after a backoff that
 starts at 30 seconds and doubles to 5 minutes. An endpoint that cannot be
 verified for any other reason, such as a timeout, a node that has not reached
 the served tip, or another block at the served tip height, is verified again
 on the next round. With more than one endpoint, set `broadcast_timeout_secs`
-well below wallet request deadlines, because a broadcast moves on only after
-it expires.
+on every endpoint well below wallet request deadlines, because a broadcast
+moves on only after it expires. Each endpoint takes its own value: a
+`[node_fallbacks.N]` table without `broadcast_timeout_secs` waits for its own
+`request_timeout_secs`, not for `[node]`'s broadcast timeout. Readers verify
+and observe every endpoint on `[node].health.poll_interval_ms` and ignore a
+fallback's `health.poll_interval_ms`.
 
 ### Lightwalletd compatibility
 

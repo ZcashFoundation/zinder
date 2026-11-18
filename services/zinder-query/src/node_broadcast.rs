@@ -12,8 +12,9 @@ use tokio::{
 };
 use zebra_chain::{serialization::ZcashDeserializeInto as _, transaction::Transaction};
 use zinder_core::{
-    BlockId, BroadcastAccepted, BroadcastRejected, BroadcastRejectionReason, ConsensusBranchId,
-    NetworkUpgradeActivations, RawTransactionBytes, TransactionBroadcastOutcome, TransactionId,
+    BlockHeight, BlockId, BroadcastAccepted, BroadcastRejected, BroadcastRejectionReason,
+    ConsensusBranchId, NetworkUpgradeActivations, RawTransactionBytes, TransactionBroadcastOutcome,
+    TransactionId,
 };
 use zinder_source::{
     BroadcastNodeProbe, NodeCapability, NodeSet, NodeSetSwitch, NodeTarget, SourceError,
@@ -30,6 +31,17 @@ const EXCLUSION_INITIAL_BACKOFF: Duration = Duration::from_secs(30);
 /// Longest an endpoint stays excluded before it is verified again.
 const EXCLUSION_MAX_BACKOFF: Duration = Duration::from_mins(5);
 
+/// Longest an endpoint stays verified against an earlier basis.
+///
+/// It applies after the serving pair's basis changed and the endpoint could
+/// not be verified against the new one, for example because it was one block
+/// behind.
+const STALE_VERIFICATION_GRACE: Duration = Duration::from_mins(1);
+
+/// Interval between verification rounds while an endpoint is verified only
+/// against an earlier basis.
+pub(crate) const STALE_VERIFICATION_RETRY: Duration = Duration::from_secs(2);
+
 const ATTEMPTS_COUNTER: &str = "zinder_wallet_broadcast_endpoint_attempts_total";
 const SWITCHES_COUNTER: &str = "zinder_wallet_broadcast_endpoint_switches_total";
 const STATE_GAUGE: &str = "zinder_wallet_broadcast_endpoint_state";
@@ -40,27 +52,34 @@ const STATE_GAUGE: &str = "zinder_wallet_broadcast_endpoint_state";
 /// position order. A reader starts without contacting any of them, so each
 /// endpoint is verified on first contact instead: `rpc.discover` must list
 /// `sendrawtransaction`, the node's activation table must agree with the
-/// writer-admitted schedule of the serving pair through its visible tip, and
-/// the node's best chain must hold the pair's visible tip block. A broadcast
+/// writer-admitted schedule of the serving pair through the height after its
+/// visible tip, which is the block a broadcast transaction targets, and the
+/// node's best chain must hold the pair's visible tip block. A broadcast
 /// reaches only verified endpoints, so no transaction bytes reach a node on
 /// another network or chain.
 ///
 /// A broadcast tries the verified endpoints in order, starting at the
-/// preferred one, which is position 0 until another endpoint answers. It moves
+/// preferred one, which is position 0 until a failover moves it. It moves
 /// to the next endpoint when one is unreachable, including when its broadcast
 /// timeout expires, or rejects the transaction for its consensus branch, and
-/// returns the first other answer. The endpoint that answered becomes the
-/// preferred one, with no timed failback. When an earlier endpoint in the same
-/// request was unreachable, it may have accepted the transaction, so a later
-/// duplicate or queued answer is reported as accepted with the transaction id
-/// computed from the submitted bytes.
+/// returns the first other answer. When the broadcast moved past an earlier
+/// endpoint for one of those two causes, the endpoint that answered becomes
+/// the preferred one, with no timed failback; an endpoint skipped only
+/// because it is not verified leaves the preference in place. When an earlier
+/// endpoint in the same request was unreachable, it may have accepted the
+/// transaction, so a later duplicate or queued answer is reported as accepted
+/// with the transaction id computed from the submitted bytes, and a broadcast
+/// no endpoint answered fails as unreachable even when another endpoint
+/// rejected it for its consensus branch.
 ///
 /// A passed verification lasts until the serving pair's schedule revision or
-/// the network upgrade active at its tip changes, and the endpoint is then
-/// verified again. An endpoint that lacks `sendrawtransaction` or whose table
-/// disagrees is excluded, and verified again after a backoff that starts at
-/// 30 seconds and doubles to 5 minutes. Clones share every endpoint's
-/// verification and the preferred position.
+/// the network upgrade active at the height after its tip changes, and the
+/// endpoint is then verified again. When that check is inconclusive, the
+/// endpoint stays verified against the earlier basis for up to one minute
+/// while it is checked again. An endpoint that lacks `sendrawtransaction` or
+/// whose table disagrees is excluded, and verified again after a backoff that
+/// starts at 30 seconds and doubles to 5 minutes. Clones share every
+/// endpoint's verification and the preferred position.
 pub struct OrderedBroadcaster<Source> {
     inner: Arc<OrderedBroadcasterInner<Source>>,
 }
@@ -126,13 +145,35 @@ impl<Source> OrderedBroadcaster<Source> {
         self.inner.verifications.verified_capabilities()
     }
 
-    /// Returns the first verified endpoint in preference order.
-    pub(crate) fn preferred_verified_endpoint(&self) -> Option<&Source> {
+    /// Returns the verified endpoints with their positions, in preference
+    /// order.
+    pub(crate) fn verified_endpoints(&self) -> impl Iterator<Item = (usize, &Source)> {
+        let verifications = &self.inner.verifications;
+        verifications
+            .preference_order()
+            .filter(|position| verifications.is_verified(*position))
+            .filter_map(|position| {
+                self.inner
+                    .nodes
+                    .endpoint(position)
+                    .map(|source| (position, source))
+            })
+    }
+
+    /// Returns whether an endpoint is verified only against an earlier basis
+    /// because its last verification was inconclusive.
+    pub(crate) fn awaits_reverification(&self) -> bool {
         self.inner
             .verifications
-            .preference_order()
-            .find(|position| self.inner.verifications.is_verified(*position))
-            .and_then(|position| self.inner.nodes.endpoint(position))
+            .endpoints
+            .iter()
+            .any(EndpointVerification::awaits_reverification)
+    }
+
+    /// Makes `position` the preferred endpoint after it answered while every
+    /// verified endpoint before it in preference order was unreachable.
+    pub(crate) fn prefer_after_unreachable(&self, position: usize) {
+        self.prefer(position, PassOver::NodeUnreachable);
     }
 
     pub(crate) fn verifications(&self) -> EndpointVerifications {
@@ -160,8 +201,8 @@ where
 {
     /// Verifies every endpoint that needs it against the pair `pair_slot`
     /// currently serves: an unverified endpoint, one verified against an
-    /// earlier schedule revision or tip network upgrade, and an excluded
-    /// endpoint whose backoff has passed.
+    /// earlier schedule revision or broadcast-height network upgrade, and an
+    /// excluded endpoint whose backoff has passed.
     ///
     /// Endpoints are verified concurrently. Concurrent calls share each
     /// endpoint's verification, and an endpoint whose verification still
@@ -175,8 +216,8 @@ where
     /// `sendrawtransaction`, [`SourceError::BlockUnavailable`] when it has not
     /// reached the visible tip, or [`SourceError::SourceProtocolMismatch`]
     /// when its activation table differs from the writer-admitted schedule at
-    /// or below the visible tip or its best chain holds another block at the
-    /// visible tip height.
+    /// or below the height after the visible tip or its best chain holds
+    /// another block at the visible tip height.
     pub async fn verify(&self, pair_slot: &WalletServingPairSlot) -> Result<(), SourceError> {
         let target = VerificationTarget::capture(pair_slot);
         let verifications = &self.inner.verifications;
@@ -214,7 +255,6 @@ where
                 continue;
             };
             if !self.inner.verifications.is_verified(position) {
-                attempt.pass_over(PassOver::Unverified);
                 continue;
             }
             let outcome = source.broadcast_transaction(raw_transaction.clone()).await;
@@ -227,7 +267,9 @@ where
                     attempt.branch_rejection = Some(rejected);
                 }
                 Ok(answer) => {
-                    self.prefer(position, attempt.first_pass_over);
+                    if let Some(cause) = attempt.first_pass_over {
+                        self.prefer(position, cause);
+                    }
                     return Ok(attempt.settle(answer, &raw_transaction, position));
                 }
                 Err(error)
@@ -246,12 +288,12 @@ where
 impl<Source> OrderedBroadcaster<Source> {
     /// Makes `position` the preferred endpoint after it answered a broadcast
     /// that passed over the endpoints before it for `cause`.
-    fn prefer(&self, position: usize, cause: Option<PassOver>) {
+    fn prefer(&self, position: usize, cause: PassOver) {
         let from_position = self.preferred_position();
         if !self.inner.preference.switch_to(position) {
             return;
         }
-        let cause = cause.map_or("unverified", PassOver::label);
+        let cause = cause.label();
         metrics::counter!(
             SWITCHES_COUNTER,
             "from_position" => from_position.to_string(),
@@ -273,7 +315,6 @@ impl<Source> OrderedBroadcaster<Source> {
 /// Why a broadcast moved past an endpoint without returning its answer.
 #[derive(Clone, Copy, Debug)]
 enum PassOver {
-    Unverified,
     NodeUnreachable,
     BadConsensusBranch,
 }
@@ -281,7 +322,6 @@ enum PassOver {
 impl PassOver {
     const fn label(self) -> &'static str {
         match self {
-            Self::Unverified => "unverified",
             Self::NodeUnreachable => "node_unreachable",
             Self::BadConsensusBranch => "bad_consensus_branch",
         }
@@ -335,12 +375,15 @@ impl BroadcastAttempt {
     }
 
     /// Ends a broadcast that no endpoint answered with anything other than a
-    /// consensus-branch rejection.
+    /// consensus-branch rejection. An unreachable endpoint may have accepted
+    /// the transaction, so its failure takes precedence over a rejection.
     fn exhausted(self) -> Result<TransactionBroadcastOutcome, SourceError> {
-        if let Some(rejected) = self.branch_rejection {
-            return Ok(TransactionBroadcastOutcome::Rejected(rejected));
+        if let Some(error) = self.unreachable {
+            return Err(error);
         }
-        Err(self.unreachable.unwrap_or_else(no_verified_endpoint))
+        self.branch_rejection
+            .map(TransactionBroadcastOutcome::Rejected)
+            .ok_or_else(no_verified_endpoint)
     }
 }
 
@@ -437,6 +480,9 @@ enum VerificationState {
     Verified {
         capabilities: UpstreamNodeCapabilities,
         basis: VerificationBasis,
+        /// When a verification against a later basis was first
+        /// inconclusive, or `None` while `basis` is the latest one checked.
+        stale_since: Option<Instant>,
     },
     Excluded {
         refusal: VerificationRefusal,
@@ -468,6 +514,16 @@ impl EndpointVerification {
 
     fn is_verified(&self) -> bool {
         matches!(**self.state.load(), VerificationState::Verified { .. })
+    }
+
+    fn awaits_reverification(&self) -> bool {
+        matches!(
+            **self.state.load(),
+            VerificationState::Verified {
+                stale_since: Some(_),
+                ..
+            }
+        )
     }
 
     fn verified_capabilities(&self) -> Option<UpstreamNodeCapabilities> {
@@ -532,55 +588,97 @@ impl EndpointVerification {
                     VerificationState::Verified {
                         capabilities,
                         basis,
+                        stale_since: None,
                     },
                     Ok(()),
                 )
             }
-            Err(VerificationFailure::Refused(refusal)) => {
-                let backoff = match *previous {
-                    VerificationState::Excluded { backoff, .. } => {
-                        backoff.saturating_mul(2).min(EXCLUSION_MAX_BACKOFF)
-                    }
-                    VerificationState::Unchecked
-                    | VerificationState::Unverified
-                    | VerificationState::Verified { .. } => EXCLUSION_INITIAL_BACKOFF,
-                };
-                let error = refusal.error();
-                tracing::warn!(
-                    target: "zinder::wallet_serving",
-                    event = "wallet_node_excluded",
-                    position = self.position,
-                    failure_class = error.upstream_classification().label(),
-                    retry_after_secs = backoff.as_secs(),
-                    error = %error,
-                    "node endpoint failed first-contact verification; it receives no transaction until it is verified again"
-                );
-                (
-                    VerificationState::Excluded {
-                        refusal,
-                        retry_at: Instant::now() + backoff,
-                        backoff,
-                    },
-                    Err(error),
-                )
-            }
-            Err(VerificationFailure::Inconclusive(error)) => {
-                if !matches!(*previous, VerificationState::Unverified) {
-                    tracing::warn!(
-                        target: "zinder::wallet_serving",
-                        event = "wallet_node_verification_failed",
-                        position = self.position,
-                        failure_class = error.upstream_classification().label(),
-                        error = %error,
-                        "node endpoint has not passed first-contact verification; transaction broadcast skips it until it does"
-                    );
-                }
-                (VerificationState::Unverified, Err(error))
-            }
+            Err(VerificationFailure::Refused(refusal)) => self.excluded(&previous, refusal),
+            Err(VerificationFailure::Inconclusive(error)) => self.inconclusive(&previous, error),
         };
         self.record_state_gauge(next.label());
         self.state.store(Arc::new(next));
         verification
+    }
+
+    fn excluded(
+        &self,
+        previous: &VerificationState,
+        refusal: VerificationRefusal,
+    ) -> (VerificationState, Result<(), SourceError>) {
+        let backoff = match previous {
+            VerificationState::Excluded { backoff, .. } => {
+                backoff.saturating_mul(2).min(EXCLUSION_MAX_BACKOFF)
+            }
+            VerificationState::Unchecked
+            | VerificationState::Unverified
+            | VerificationState::Verified { .. } => EXCLUSION_INITIAL_BACKOFF,
+        };
+        let error = refusal.error();
+        tracing::warn!(
+            target: "zinder::wallet_serving",
+            event = "wallet_node_excluded",
+            position = self.position,
+            failure_class = error.upstream_classification().label(),
+            retry_after_secs = backoff.as_secs(),
+            error = %error,
+            "node endpoint failed first-contact verification; it receives no transaction until it is verified again"
+        );
+        (
+            VerificationState::Excluded {
+                refusal,
+                retry_at: Instant::now() + backoff,
+                backoff,
+            },
+            Err(error),
+        )
+    }
+
+    /// Keeps a verification of an earlier basis through
+    /// [`STALE_VERIFICATION_GRACE`], since an endpoint one block behind or
+    /// mid-reorg at an activation is inconclusive without being wrong.
+    fn inconclusive(
+        &self,
+        previous: &VerificationState,
+        error: SourceError,
+    ) -> (VerificationState, Result<(), SourceError>) {
+        if let VerificationState::Verified {
+            capabilities,
+            basis,
+            stale_since,
+        } = previous
+        {
+            let since = stale_since.unwrap_or_else(Instant::now);
+            if since.elapsed() < STALE_VERIFICATION_GRACE {
+                if stale_since.is_none() {
+                    tracing::warn!(
+                        target: "zinder::wallet_serving",
+                        event = "wallet_node_reverification_inconclusive",
+                        position = self.position,
+                        failure_class = error.upstream_classification().label(),
+                        error = %error,
+                        "node endpoint could not be verified again; it keeps its earlier verification while it is retried"
+                    );
+                }
+                let retained = VerificationState::Verified {
+                    capabilities: capabilities.clone(),
+                    basis: *basis,
+                    stale_since: Some(since),
+                };
+                return (retained, Ok(()));
+            }
+        }
+        if !matches!(previous, VerificationState::Unverified) {
+            tracing::warn!(
+                target: "zinder::wallet_serving",
+                event = "wallet_node_verification_failed",
+                position = self.position,
+                failure_class = error.upstream_classification().label(),
+                error = %error,
+                "node endpoint has not passed first-contact verification; transaction broadcast skips it until it does"
+            );
+        }
+        (VerificationState::Unverified, Err(error))
     }
 
     fn record_state_gauge(&self, current: &'static str) {
@@ -599,12 +697,13 @@ impl EndpointVerification {
 ///
 /// A schedule revision changes only activations above the tip the writer
 /// admitted it at, and the tip can then cross one of them, so a verification
-/// is repeated whenever either the revision or the upgrade active at the tip
-/// changes.
+/// is repeated whenever either the revision or the upgrade active at the
+/// height after the tip changes. That height is the one a broadcast
+/// transaction targets.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct VerificationBasis {
     schedule_revision: Option<u64>,
-    tip_branch: ConsensusBranchId,
+    broadcast_branch: ConsensusBranchId,
 }
 
 impl VerificationBasis {
@@ -614,11 +713,18 @@ impl VerificationBasis {
                 .canonical()
                 .network_upgrade_schedule()
                 .map(CanonicalActivationSchedule::revision),
-            tip_branch: pair
+            broadcast_branch: pair
                 .network_upgrade_activations()
-                .consensus_branch_id_at(pair.canonical_fence().visible_tip().height),
+                .consensus_branch_id_at(broadcast_height(pair)),
         }
     }
+}
+
+/// Returns the height of the block a transaction broadcast now targets, the
+/// one after the pair's visible tip.
+fn broadcast_height(pair: &WalletServingReadPair) -> BlockHeight {
+    let tip_height = pair.canonical_fence().visible_tip().height;
+    tip_height.next().unwrap_or(tip_height)
 }
 
 /// The serving-pair evidence one verification checks endpoints against,
@@ -626,6 +732,7 @@ impl VerificationBasis {
 struct VerificationTarget {
     basis: VerificationBasis,
     admitted_activations: NetworkUpgradeActivations,
+    broadcast_height: BlockHeight,
     visible_tip: BlockId,
 }
 
@@ -635,6 +742,7 @@ impl VerificationTarget {
         Self {
             basis: VerificationBasis::of(&pair),
             admitted_activations: pair.network_upgrade_activations().clone(),
+            broadcast_height: broadcast_height(&pair),
             visible_tip: pair.canonical_fence().visible_tip(),
         }
     }
@@ -655,7 +763,7 @@ impl VerificationRefusal {
             }
             Self::ScheduleMismatch => SourceError::SourceProtocolMismatch {
                 reason: "node network-upgrade activations differ from the writer-admitted \
-                         schedule at or below the served tip",
+                         schedule at or below the height after the served tip",
             },
         }
     }
@@ -687,8 +795,7 @@ async fn verify_node_endpoint(
         .fetch_network_upgrade_activations()
         .await
         .map_err(VerificationFailure::Inconclusive)?;
-    if !node_activations.preserves_through(&target.admitted_activations, target.visible_tip.height)
-    {
+    if !node_activations.preserves_through(&target.admitted_activations, target.broadcast_height) {
         return Err(VerificationFailure::Refused(
             VerificationRefusal::ScheduleMismatch,
         ));

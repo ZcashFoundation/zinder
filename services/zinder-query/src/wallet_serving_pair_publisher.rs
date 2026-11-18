@@ -38,7 +38,8 @@ use std::{
 use crate::{
     AdmittedIngestControl, CanonicalReader, OrderedBroadcaster, WalletProjectionReader,
     WalletServingAdmissionError, WalletServingReadPair,
-    ingest_control::wallet_ingest_control_request, node_broadcast::VerificationBasis,
+    ingest_control::wallet_ingest_control_request,
+    node_broadcast::{STALE_VERIFICATION_RETRY, VerificationBasis},
 };
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
@@ -69,7 +70,9 @@ use zinder_runtime::{
     connect_zinder_grpc, converge_on_canonical_writer_fence,
     writer_attests_network_upgrade_schedule,
 };
-use zinder_source::{BroadcastNodeProbe, NodeSource, SourceError, UpstreamHealthSnapshot};
+use zinder_source::{
+    BroadcastNodeProbe, NodeSource, SourceError, SourceFailureClass, UpstreamHealthSnapshot,
+};
 use zinder_store::{
     CanonicalActivationSchedule, CanonicalReorgPolicy, CanonicalStoreError, CanonicalStoreWorkload,
     RawBlobRetention, ResourceGaugeThrottle, RocksDbCanonicalSecondary, RocksDbInstanceMemory,
@@ -625,13 +628,17 @@ impl IngestControlObserver {
 /// `serving_pair_slot` serves, as [`OrderedBroadcaster::verify`] describes,
 /// so an endpoint that is down or on another chain when the reader starts is
 /// verified once it recovers. A round also starts as soon as the pair's
-/// schedule revision or tip network upgrade changes, so every verification is
-/// repeated against the new evidence without waiting for `poll_interval`. The
-/// first verified endpoint in broadcast preference order is then observed
-/// through `tip_id` and upstream sync health. Every failure degrades the
-/// node-source dependency; it never closes the traffic gate, and each
-/// broadcast fails on its own. Without node endpoints, the dependency reports
-/// ready and the task only waits for cancellation.
+/// schedule revision or the network upgrade at the height after its tip
+/// changes, so every verification is repeated against the new evidence
+/// without waiting for `poll_interval`, and rounds repeat every two seconds
+/// while such a repeated verification stays inconclusive. The verified
+/// endpoints are then observed in broadcast preference order through `tip_id`
+/// and upstream sync health, moving past an unreachable one. When an
+/// endpoint after an unreachable one answers, it becomes the preferred
+/// endpoint, as a broadcast that failed over would make it. Every failure
+/// degrades the node-source dependency; it never closes the traffic gate,
+/// and each broadcast fails on its own. Without node endpoints, the
+/// dependency reports ready and the task only waits for cancellation.
 #[must_use]
 pub fn spawn_wallet_node_readiness_probe<Source>(
     nodes: Option<OrderedBroadcaster<Source>>,
@@ -660,10 +667,15 @@ where
                 observation = observe_wallet_nodes(&nodes, &serving_pair_slot) => observation,
             };
             publish_wallet_node_observation(&readiness, observation, &mut outage);
+            let next_round = if nodes.awaits_reverification() {
+                poll_interval.min(STALE_VERIFICATION_RETRY)
+            } else {
+                poll_interval
+            };
 
             tokio::select! {
                 () = cancel.cancelled() => break,
-                () = tokio::time::sleep(poll_interval) => {}
+                () = tokio::time::sleep(next_round) => {}
                 () = verification_basis_change(&serving_pair_slot, &mut publications, basis) => {}
             }
         }
@@ -722,7 +734,8 @@ async fn verification_basis_change(
 }
 
 /// Verifies every endpoint of `nodes` that needs it, then observes the
-/// liveness of the first verified one in broadcast preference order.
+/// liveness of the first verified one in broadcast preference order that is
+/// reachable.
 async fn observe_wallet_nodes<Source>(
     nodes: &OrderedBroadcaster<Source>,
     serving_pair_slot: &WalletServingPairSlot,
@@ -731,13 +744,25 @@ where
     Source: NodeSource + BroadcastNodeProbe,
 {
     nodes.verify(serving_pair_slot).await?;
-    let source =
-        nodes
-            .preferred_verified_endpoint()
-            .ok_or_else(|| SourceError::NodeUnavailable {
-                reason: "no node endpoint holds a first-contact verification".to_owned(),
-            })?;
-    probe_wallet_node_readiness(source).await
+    let mut unreachable = None;
+    for (position, source) in nodes.verified_endpoints() {
+        match probe_wallet_node_readiness(source).await {
+            Err(error)
+                if error.upstream_classification() == SourceFailureClass::NodeUnreachable =>
+            {
+                unreachable = Some(error);
+            }
+            observation => {
+                if unreachable.is_some() {
+                    nodes.prefer_after_unreachable(position);
+                }
+                return observation;
+            }
+        }
+    }
+    Err(unreachable.unwrap_or_else(|| SourceError::NodeUnavailable {
+        reason: "no node endpoint holds a first-contact verification".to_owned(),
+    }))
 }
 
 async fn probe_wallet_node_readiness(
@@ -2710,8 +2735,11 @@ mod tests {
     }
 
     /// A primary endpoint that never answers leaves broadcast to the
-    /// fallback: the probe verifies and observes the fallback, the node
-    /// dependency reports ready, and a broadcast reaches only the fallback.
+    /// fallback.
+    ///
+    /// The probe verifies and observes the fallback, the node dependency
+    /// reports ready, and a broadcast reaches only the fallback. The primary
+    /// stays preferred, so it is used again once it is verified.
     #[tokio::test]
     async fn wallet_node_probe_verifies_a_fallback_while_the_primary_is_down()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2742,7 +2770,60 @@ mod tests {
             .await?;
         assert_eq!(primary.broadcast_attempts.load(Ordering::SeqCst), 0);
         assert_eq!(fallback.broadcast_attempts.load(Ordering::SeqCst), 1);
-        assert_eq!(nodes.preferred_position(), 1);
+        assert_eq!(
+            nodes.preferred_position(),
+            0,
+            "skipping an unverified primary does not move the preference"
+        );
+
+        cancel.cancel();
+        handle.await?;
+        Ok(())
+    }
+
+    /// A verified primary that goes down while broadcast is idle leaves the
+    /// node dependency ready while a verified fallback answers.
+    ///
+    /// The probe moves the preference to the fallback, so the next broadcast
+    /// and `ServerInfo.node` use it without waiting for a broadcast timeout.
+    #[tokio::test]
+    async fn wallet_node_probe_moves_past_a_verified_primary_that_goes_down()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let primary = MutableHealthSource::new()?;
+        let fallback = MutableHealthSource::new()?;
+        let (slot, _store) = regtest_serving_pair_slot()?;
+        let nodes = crate::OrderedBroadcaster::new(primary.clone(), [fallback.clone()]);
+        let query = WalletServingQuery::from_serving_pair_slot(slot.clone())
+            .with_node_broadcast(Some(nodes.clone()));
+        let runtime = zinder_runtime::Readiness::default();
+        let readiness = WalletServingReadiness::with_node_and_ingest_control(runtime.clone());
+        readiness.publish_pair_state(zinder_runtime::ReadinessState::ready(Some(1)));
+        readiness.publish_ingest_control_cause(zinder_runtime::ReadinessCause::Ready);
+        let cancel = CancellationToken::new();
+        let handle = spawn_wallet_node_readiness_probe(
+            Some(nodes.clone()),
+            slot,
+            readiness,
+            Duration::from_millis(5),
+            cancel.clone(),
+        );
+
+        wait_for_report(&runtime, |report| report.degraded.is_empty()).await?;
+        assert_eq!(nodes.preferred_position(), 0);
+        primary.available.store(false, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while nodes.preferred_position() != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        wait_for_report(&runtime, |report| report.degraded.is_empty()).await?;
+        assert!(query.upstream_node_capabilities().is_some());
+        query
+            .broadcast_transaction(zinder_core::RawTransactionBytes::new(vec![0x05; 32]))
+            .await?;
+        assert_eq!(primary.broadcast_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback.broadcast_attempts.load(Ordering::SeqCst), 1);
 
         cancel.cancel();
         handle.await?;

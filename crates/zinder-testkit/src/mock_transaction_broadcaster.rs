@@ -126,8 +126,15 @@ impl MockTransactionBroadcaster {
     /// as a node on another chain with the same activation table would.
     #[must_use]
     pub fn on_another_chain(self) -> Self {
-        self.probe.lock().on_another_chain = true;
+        self.report_another_chain();
         self
+    }
+
+    /// Reports from now on, for this broadcaster and every clone, that the
+    /// node's best chain holds none of the reader's blocks, as a node that
+    /// has not received the reader's tip block yet would.
+    pub fn report_another_chain(&self) {
+        self.probe.lock().on_another_chain = true;
     }
 
     /// Returns how many times a reader probed this node's capabilities, which

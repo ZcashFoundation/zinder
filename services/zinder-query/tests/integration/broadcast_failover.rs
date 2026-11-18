@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use eyre::eyre;
+use metrics_exporter_prometheus::PrometheusBuilder;
 use zebra_chain::{serialization::ZcashDeserializeInto as _, transaction::Transaction};
 use zinder_core::{
     BlockHeight, BroadcastAccepted, BroadcastDuplicate, BroadcastQueued, BroadcastRejected,
@@ -13,7 +14,7 @@ use zinder_core::{
 use zinder_query::{
     OrderedBroadcaster, QueryError, WalletQueryApi, WalletServingPairSlot, WalletServingQuery,
 };
-use zinder_source::SourceError;
+use zinder_source::{SourceError, TransactionBroadcaster as _};
 use zinder_testkit::{
     ChainFixture, MockTransactionBroadcaster, WalletServingStoreFixture,
     sample_regtest_upgrade_activations,
@@ -369,7 +370,11 @@ async fn endpoint_with_another_schedule_is_excluded_and_receives_nothing() -> ey
         1,
         "an excluded endpoint is not verified again before its backoff passes"
     );
-    assert_eq!(endpoints.nodes.preferred_position(), 1);
+    assert_eq!(
+        endpoints.nodes.preferred_position(),
+        0,
+        "skipping an excluded endpoint does not move the preference"
+    );
     Ok(())
 }
 
@@ -481,18 +486,21 @@ async fn endpoint_is_verified_again_after_a_schedule_revision() -> eyre::Result<
     Ok(())
 }
 
-/// A verification checked the node's table only through the tip it saw, so
-/// the endpoint is verified again once the served tip crosses an activation,
-/// here NU6.1 and NU6.2 at height 3.
+/// An endpoint is verified again once the block a broadcast targets crosses
+/// an activation.
+///
+/// A verification checked the node's table only through the height after the
+/// tip it saw. Here NU6.1 and NU6.2 activate at height 3, which a broadcast
+/// targets once the served tip reaches height 2.
 #[tokio::test]
 async fn endpoint_is_verified_again_when_the_tip_crosses_an_activation() -> eyre::Result<()> {
     let schedule = sample_regtest_upgrade_activations();
     let mut before_store = WalletServingStoreFixture::from_chain(
-        &ChainFixture::new(Network::ZcashRegtest).extend_blocks(2),
+        &ChainFixture::new(Network::ZcashRegtest).extend_blocks(1),
         &schedule,
     )?;
     let mut after_store = WalletServingStoreFixture::from_chain(
-        &ChainFixture::new(Network::ZcashRegtest).extend_blocks(3),
+        &ChainFixture::new(Network::ZcashRegtest).extend_blocks(2),
         &schedule,
     )?;
     let before_slot = serving_pair_slot(&mut before_store)?;
@@ -504,5 +512,169 @@ async fn endpoint_is_verified_again_when_the_tip_crosses_an_activation() -> eyre
     assert_eq!(node.capability_probe_count(), 1);
     nodes.verify(&after_slot).await?;
     assert_eq!(node.capability_probe_count(), 2);
+    Ok(())
+}
+
+/// An endpoint that timed out may have accepted the transaction, so a
+/// consensus-branch rejection from another endpoint is not reported as the
+/// outcome, in either order.
+#[tokio::test]
+async fn unreachable_endpoint_outweighs_a_consensus_branch_rejection() -> eyre::Result<()> {
+    let orders = [
+        vec![
+            unreachable_node(),
+            node_answering(consensus_branch_rejection()),
+        ],
+        vec![
+            node_answering(consensus_branch_rejection()),
+            unreachable_node(),
+        ],
+    ];
+    for order in orders {
+        let endpoints = Endpoints::verified(order).await?;
+
+        let outcome = endpoints.broadcast(RawTransactionBytes::new([0x0c])).await;
+
+        assert!(
+            matches!(
+                outcome,
+                Err(QueryError::Node(SourceError::NodeUnavailable { .. }))
+            ),
+            "unexpected outcome: {outcome:?}"
+        );
+        assert_eq!(endpoints.nodes.preferred_position(), 0);
+    }
+    Ok(())
+}
+
+/// An endpoint skipped only because it is not verified yet, as `[node]` is
+/// when the fallback's verification finishes first at startup, keeps its
+/// place as the preferred endpoint.
+#[tokio::test]
+async fn skipping_an_unverified_endpoint_keeps_the_preference() -> eyre::Result<()> {
+    let primary = MockTransactionBroadcaster::accepted(TransactionId::from_bytes([0xcc; 32]));
+    let fallback = accepting_node(0xdd);
+    let endpoints = Endpoints::unverified(vec![primary.clone(), fallback.clone()])?;
+    endpoints.nodes.verify(&endpoints.slot).await?;
+
+    endpoints
+        .broadcast(RawTransactionBytes::new([0x0d]))
+        .await?;
+    assert_eq!(fallback.call_count(), 1);
+    assert_eq!(endpoints.nodes.preferred_position(), 0);
+
+    primary.report_node_activations(sample_regtest_upgrade_activations());
+    endpoints.nodes.verify(&endpoints.slot).await?;
+    endpoints
+        .broadcast(RawTransactionBytes::new([0x0e]))
+        .await?;
+    assert_eq!(primary.call_count(), 1);
+    assert_eq!(fallback.call_count(), 1);
+    Ok(())
+}
+
+/// A node that cannot be verified against a new basis yet keeps its earlier
+/// verification for a grace period.
+///
+/// A node that has not received the block that crossed an activation would
+/// otherwise lose broadcasts at the upgrade boundary.
+#[tokio::test(start_paused = true)]
+async fn inconclusive_verification_after_a_basis_change_keeps_the_earlier_one() -> eyre::Result<()>
+{
+    let schedule = sample_regtest_upgrade_activations();
+    let mut before_store = WalletServingStoreFixture::from_chain(
+        &ChainFixture::new(Network::ZcashRegtest).extend_blocks(1),
+        &schedule,
+    )?;
+    let mut after_store = WalletServingStoreFixture::from_chain(
+        &ChainFixture::new(Network::ZcashRegtest).extend_blocks(2),
+        &schedule,
+    )?;
+    let before_slot = serving_pair_slot(&mut before_store)?;
+    let after_slot = serving_pair_slot(&mut after_store)?;
+    let node = accepting_node(0xee);
+    let nodes = OrderedBroadcaster::new(node.clone(), []);
+    nodes.verify(&before_slot).await?;
+
+    node.report_another_chain();
+    nodes.verify(&after_slot).await?;
+    nodes
+        .broadcast_transaction(RawTransactionBytes::new([0x0f]))
+        .await?;
+    assert_eq!(node.call_count(), 1);
+    assert!(nodes.verified_capabilities().is_some());
+
+    tokio::time::advance(Duration::from_secs(61)).await;
+    assert!(nodes.verify(&after_slot).await.is_err());
+    assert!(
+        nodes
+            .broadcast_transaction(RawTransactionBytes::new([0x10]))
+            .await
+            .is_err()
+    );
+    assert_eq!(node.call_count(), 1);
+    assert!(nodes.verified_capabilities().is_none());
+    Ok(())
+}
+
+/// A broadcast transaction targets the block after the served tip, so a node
+/// whose table disagrees only at that height is excluded before the tip
+/// reaches it.
+#[tokio::test]
+async fn endpoint_whose_table_disagrees_at_the_next_height_is_excluded() -> eyre::Result<()> {
+    let delayed_nu5 = NetworkUpgradeActivations::new(
+        Network::ZcashRegtest,
+        sample_regtest_upgrade_activations()
+            .activations()
+            .iter()
+            .map(|activation| NetworkUpgradeActivation {
+                activation_height: if activation.activation_height.value() == 2 {
+                    BlockHeight::new(3)
+                } else {
+                    activation.activation_height
+                },
+                ..activation.clone()
+            })
+            .collect(),
+    )?;
+    let node = accepting_node(0xff).with_node_activations(delayed_nu5);
+    let endpoints = Endpoints::unverified(vec![node.clone()])?;
+
+    let verification = endpoints.nodes.verify(&endpoints.slot).await;
+
+    assert!(
+        matches!(
+            verification,
+            Err(SourceError::SourceProtocolMismatch { .. })
+        ),
+        "unexpected verification: {verification:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn broadcast_failover_records_endpoint_metrics() -> eyre::Result<()> {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let recorded_metrics = recorder.handle();
+    let _local_recorder = metrics::set_default_local_recorder(&recorder);
+    let endpoints = Endpoints::verified(vec![unreachable_node(), accepting_node(0x12)]).await?;
+
+    endpoints
+        .broadcast(RawTransactionBytes::new([0x11]))
+        .await?;
+
+    let rendered = recorded_metrics.render();
+    for expected in [
+        "zinder_wallet_broadcast_endpoint_attempts_total{position=\"0\",outcome=\"node_unreachable\"} 1",
+        "zinder_wallet_broadcast_endpoint_attempts_total{position=\"1\",outcome=\"accepted\"} 1",
+        "zinder_wallet_broadcast_endpoint_switches_total{from_position=\"0\",to_position=\"1\",cause=\"node_unreachable\"} 1",
+        "zinder_wallet_broadcast_endpoint_state{position=\"1\",state=\"verified\"} 1",
+        "zinder_wallet_broadcast_endpoint_state{position=\"1\",state=\"unverified\"} 0",
+    ] {
+        assert!(
+            rendered.lines().any(|line| line == expected),
+            "missing {expected}:\n{rendered}"
+        );
+    }
     Ok(())
 }
