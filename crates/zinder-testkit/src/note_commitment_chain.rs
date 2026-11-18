@@ -239,15 +239,19 @@ fn shielded_actions(pool_tag: u8, hash_bytes: [u8; 32], count: u8) -> Vec<Compac
         .collect()
 }
 
-/// Encodes a small integer from the block hash, pool, and index.
+/// Encodes a small integer from the block hash, index, and pool.
 ///
-/// Every value below 2^32 is a canonical field element in both the Sapling
-/// and the Pallas base fields.
+/// A synthetic block hash repeats one four-byte word, and a fork's salt is
+/// mixed into that word's low bytes, so all four bytes are kept. Every value
+/// below 2^48 is a canonical field element in both the Sapling and the Pallas
+/// base fields.
 const fn note_commitment(pool_tag: u8, hash_bytes: [u8; 32], index: u8) -> [u8; 32] {
     let mut commitment = [0; 32];
     commitment[0] = hash_bytes[0];
     commitment[1] = hash_bytes[1];
-    commitment[2] = index;
-    commitment[3] = pool_tag;
+    commitment[2] = hash_bytes[2];
+    commitment[3] = hash_bytes[3];
+    commitment[4] = index;
+    commitment[5] = pool_tag;
     commitment
 }

@@ -127,6 +127,19 @@ async fn tree_state_after_a_live_replacement_serves_the_replacement_chain() -> e
     )?;
     writer.replace_live_blocks(&replacement, first_replaced_height)?;
     let expected = commitment_tree_checkpoints(&replacement, &activations)?;
+    let displaced = commitment_tree_checkpoints(&original, &activations)?;
+    for (displaced, replacing) in displaced
+        .iter()
+        .zip(&expected)
+        .filter(|(displaced, _)| displaced.block_id.height >= first_replaced_height)
+    {
+        assert_ne!(
+            displaced.frontiers,
+            replacing.frontiers,
+            "the replacement chain must change the trees at height {}",
+            displaced.block_id.height.value()
+        );
+    }
     let served = NodelessQuery::over(writer.into_serving_store_fixture()?, &activations).await?;
 
     for checkpoint in &expected {
