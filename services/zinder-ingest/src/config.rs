@@ -22,16 +22,16 @@ use zinder_ingest::{
 };
 use zinder_runtime::{
     ConfigError, ConfigLoader, IngestControlSection, IngestControlWriterToml, NetworkSection,
-    NetworkToml, NodeToml, OpsSection, OpsServerError, OpsToml, ResolvedIngestControlWriter,
-    ResolvedRetention, RetentionSection, RetentionToml, RuntimeService, SecuritySection,
-    SecurityToml, StorageRoleSection, StorageRoleToml, duration_as_millis_u64,
-    guard_optional_serving_bind, require_field, resolve_allow_public_bind,
+    NetworkToml, NodeFallbacksToml, NodeToml, OpsSection, OpsServerError, OpsToml,
+    ResolvedIngestControlWriter, ResolvedRetention, RetentionSection, RetentionToml,
+    RuntimeService, SecuritySection, SecurityToml, StorageRoleSection, StorageRoleToml,
+    duration_as_millis_u64, guard_optional_serving_bind, require_field, resolve_allow_public_bind,
     resolve_canonical_writer_rocksdb_budget, resolve_ingest_control_writer,
     resolve_materialized_view_writer_rocksdb_budget, resolve_ops_listen_addr, resolve_retention,
 };
 use zinder_source::{
     DEFAULT_MEMPOOL_MAX_TOTAL_RAW_TRANSACTION_BYTES, DEFAULT_MEMPOOL_MAX_TRANSACTION_COUNT,
-    MempoolSourceAdmissionLimits, NodeSection, NodeTarget,
+    MempoolSourceAdmissionLimits, NodeFallbackSections, NodeSection, NodeTarget,
 };
 
 use crate::cli::parse::{parse_node_source, parse_poll_interval_ms, parse_reorg_window_blocks};
@@ -132,6 +132,9 @@ pub(crate) enum IngestConfigError {
 
     #[error(transparent)]
     CanonicalWriter(#[from] zinder_ingest::CanonicalWriterError),
+
+    #[error(transparent)]
+    NodeEndpoints(#[from] zinder_ingest::NoNodeEndpointAdmitted),
 }
 
 /// Loads and validates the phase-driven ingest configuration.
@@ -277,6 +280,7 @@ struct IngestConfig {
     network: NetworkSection,
     ops: OpsSection,
     node: NodeSection,
+    node_fallbacks: NodeFallbackSections,
     storage: IngestPrimaryStorageSection,
     ingest: IngestSection,
     ingest_control: IngestControlSection,
@@ -418,6 +422,8 @@ fn available_logical_core_count() -> NonZeroU32 {
 fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, IngestConfigError> {
     let network = config.network.resolve()?;
     let node_target = NodeTarget::resolve(network, config.node).map_err(ConfigError::from)?;
+    let node_fallbacks =
+        NodeTarget::resolve_fallbacks(network, config.node_fallbacks).map_err(ConfigError::from)?;
     let resolved_pipeline_limits = CanonicalPipelineLimits::resolve(
         container_memory_budget_bytes().and_then(NonZeroU64::new),
         available_logical_core_count(),
@@ -593,6 +599,7 @@ fn resolve_ingest_config(config: IngestConfig) -> Result<IngestCommandConfig, In
 
     let runtime_config = IngestRuntimeConfig {
         node: node_target,
+        node_fallbacks,
         node_source,
         storage_path,
         canonical_rocksdb_budget,
@@ -679,6 +686,8 @@ struct RedactedIngestConfigToml {
     ops: OpsToml,
     security: SecurityToml,
     node: NodeToml,
+    #[serde(skip_serializing_if = "NodeFallbacksToml::is_empty")]
+    node_fallbacks: NodeFallbacksToml,
     storage: IngestStorageToml,
     ingest: IngestToml,
     ingest_control: IngestControlWriterToml,
@@ -697,6 +706,7 @@ impl RedactedIngestConfigToml {
             ops: OpsToml::from_resolved(config.ops_listen_addr),
             security: SecurityToml::from_resolved(config.allow_public_bind),
             node: NodeToml::from_node_target(&runtime_config.node),
+            node_fallbacks: NodeFallbacksToml::from_node_targets(&runtime_config.node_fallbacks),
             storage: IngestStorageToml {
                 path: runtime_config.storage_path.display().to_string(),
                 raw_blob_policy: runtime_config.raw_blob_policy,

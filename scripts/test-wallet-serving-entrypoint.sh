@@ -42,6 +42,7 @@ for function_name in \
   zinder_variables_outside \
   start_runtime_process \
   require_positive_seconds \
+  require_fallback_indexer_endpoints \
   require_known_entrypoint_settings; do
   definition="$(entrypoint_function "$function_name")"
   [ -n "$definition" ] || test_failure "entrypoint no longer defines $function_name"
@@ -554,6 +555,22 @@ ZINDER_WALLET_SERVING__CANONICAL_CONSTRUCTION_DEADLINE_SECONDS=86400 \
 [ -z "$fail_message" ] \
   || test_failure "documented entrypoint settings were rejected: $fail_message"
 
+# Every fallback node endpoint needs its indexer stream, as [node] does; a
+# position is configured by any of its variables.
+fail_message=""
+ZINDER_NODE_FALLBACKS__2__JSON_RPC_ADDR=http://127.0.0.1:28232 \
+  ZINDER_NODE_FALLBACKS__2__AUTH__METHOD=cookie \
+  require_fallback_indexer_endpoints || true
+case "$fail_message" in
+  ZINDER_NODE_FALLBACKS__2__INDEXER_GRPC_ADDR\ is\ required:*) ;;
+  *) test_failure "a fallback endpoint without an indexer URL was accepted: '$fail_message'" ;;
+esac
+fail_message=""
+ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR=http://127.0.0.1:28232 \
+  ZINDER_NODE_FALLBACKS__1__INDEXER_GRPC_ADDR=http://127.0.0.1:28155 \
+  require_fallback_indexer_endpoints \
+  || test_failure "a fallback endpoint with an indexer URL was rejected: $fail_message"
+
 # Each process starts with the variables its binary accepts. A stub setpriv on
 # PATH records the environment variable names each process receives.
 scoping_root="$(mktemp -d)"
@@ -572,6 +589,7 @@ chmod +x "$scoping_root/bin/setpriv"
   export SCOPING_RECEIVED_DIR="$scoping_root/received"
   export ZINDER_NETWORK__NAME=zcash-testnet
   export ZINDER_NODE__JSON_RPC_ADDR=http://127.0.0.1:18232
+  export ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR=http://127.0.0.1:28232
   export ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES=64
   export ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_OPEN_FILES=64
   export ZINDER_STORAGE__SERVING_PAIR_STALENESS_CEILING_MS=300000
@@ -616,6 +634,7 @@ assert_received_by() {
 
 assert_received_by ZINDER_NETWORK__NAME zinder-ingest zinder-projector zinder-query
 assert_received_by ZINDER_NODE__JSON_RPC_ADDR zinder-ingest zinder-query
+assert_received_by ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR zinder-ingest zinder-query
 assert_received_by ZINDER_STORAGE__CANONICAL__ROCKSDB__MAX_OPEN_FILES \
   zinder-ingest zinder-projector zinder-query
 assert_received_by ZINDER_STORAGE__MATERIALIZED_VIEWS__ROCKSDB__MAX_OPEN_FILES zinder-ingest

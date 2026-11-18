@@ -1,6 +1,6 @@
 //! Node source boundary values.
 
-use std::num::NonZeroU32;
+use std::{num::NonZeroU32, sync::Arc};
 
 use async_trait::async_trait;
 use zinder_core::{
@@ -10,16 +10,61 @@ use zinder_core::{
 };
 
 use crate::{
-    NodeCapabilities, SourceBlock, SourceChainSegment, SourceChainSegmentLimits, SourceChainUpdate,
-    SourceError, SourceSubtreeRoots, UpstreamHealthSnapshot,
+    NodeCapabilities, NodeCapability, SourceBlock, SourceChainSegment, SourceChainSegmentLimits,
+    SourceChainUpdate, SourceError, SourceSubtreeRoots, UpstreamHealthSnapshot,
     source_chain_update::SourceChainCursorPosition,
 };
+
+/// How a node reports storing historical block bodies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum NodeStorageMode {
+    /// The node keeps every block body, so any best-chain height can be read.
+    Archive,
+    /// The node discards old block bodies.
+    Pruned,
+    /// The node answered without reporting its storage mode.
+    Unreported,
+}
 
 /// Configured upstream node source for ingestion.
 #[async_trait]
 pub trait NodeSource: Send + Sync + 'static {
     /// Returns the source capabilities discovered or declared at startup.
     fn capabilities(&self) -> NodeCapabilities;
+
+    /// Asks the node which capabilities it supports and returns them.
+    ///
+    /// Sources that discover capabilities at runtime override this method and
+    /// also update the set [`Self::capabilities`] returns. The default
+    /// returns [`Self::capabilities`] unchanged.
+    async fn probe_capabilities(&self) -> Result<NodeCapabilities, SourceError> {
+        Ok(self.capabilities())
+    }
+
+    /// Fetches the network upgrade activations the node advertises.
+    ///
+    /// Custom Testnet and Regtest schedules stay node-owned, so the canonical
+    /// writer reads them from its node rather than from configuration, and
+    /// readers compare their broadcast node's table with the schedule the
+    /// writer admitted. The default returns
+    /// [`SourceError::NodeCapabilityMissing`].
+    async fn fetch_network_upgrade_activations(
+        &self,
+    ) -> Result<NetworkUpgradeActivations, SourceError> {
+        Err(SourceError::NodeCapabilityMissing {
+            capability: NodeCapability::JsonRpc,
+        })
+    }
+
+    /// Reports whether the node stores every historical block body.
+    ///
+    /// A failed call returns the error, so callers can tell an unreachable
+    /// node from one that answered. The default reports
+    /// [`NodeStorageMode::Unreported`].
+    async fn fetch_storage_mode(&self) -> Result<NodeStorageMode, SourceError> {
+        Ok(NodeStorageMode::Unreported)
+    }
 
     /// Fetches one block by height from the configured node.
     async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError>;
@@ -105,7 +150,7 @@ pub trait NodeSource: Send + Sync + 'static {
     ) -> Result<CommitmentTreeCheckpoint, SourceError> {
         let _ = (height, network_upgrade_activations);
         Err(SourceError::NodeCapabilityMissing {
-            capability: crate::NodeCapability::TreeState,
+            capability: NodeCapability::TreeState,
         })
     }
 
@@ -158,7 +203,7 @@ pub trait NodeSource: Send + Sync + 'static {
     ) -> Result<SourceSubtreeRoots, SourceError> {
         let _ = (protocol, start_index, max_entries);
         Err(SourceError::NodeCapabilityMissing {
-            capability: crate::NodeCapability::SubtreeRoots,
+            capability: NodeCapability::SubtreeRoots,
         })
     }
 
@@ -174,17 +219,17 @@ pub trait NodeSource: Send + Sync + 'static {
     ) -> Result<SourceSubtreeRoots, SourceError> {
         let _ = range;
         Err(SourceError::NodeCapabilityMissing {
-            capability: crate::NodeCapability::SubtreeRoots,
+            capability: NodeCapability::SubtreeRoots,
         })
     }
 
     /// Fetches chain-wide value pool totals at the upstream tip.
     ///
     /// Returns [`SourceError::NodeCapabilityMissing`] when the source
-    /// does not advertise [`crate::NodeCapability::ChainValuePools`].
+    /// does not advertise [`NodeCapability::ChainValuePools`].
     async fn fetch_chain_value_pools_at_tip(&self) -> Result<ChainValuePools, SourceError> {
         Err(SourceError::NodeCapabilityMissing {
-            capability: crate::NodeCapability::ChainValuePools,
+            capability: NodeCapability::ChainValuePools,
         })
     }
 
@@ -198,7 +243,7 @@ pub trait NodeSource: Send + Sync + 'static {
     ) -> Result<BlockValuePoolBalances, SourceError> {
         let _ = block_id;
         Err(SourceError::NodeCapabilityMissing {
-            capability: crate::NodeCapability::BlockValuePoolBalances,
+            capability: NodeCapability::BlockValuePoolBalances,
         })
     }
 
@@ -216,7 +261,7 @@ pub trait NodeSource: Send + Sync + 'static {
     ///     ../../../docs/adrs/0015-phase-driven-ingest.md#upstream-sync-detection
     async fn poll_upstream_health(&self) -> Result<UpstreamHealthSnapshot, SourceError> {
         Err(SourceError::NodeCapabilityMissing {
-            capability: crate::NodeCapability::ReadinessProbe,
+            capability: NodeCapability::ReadinessProbe,
         })
     }
 }
@@ -279,6 +324,44 @@ where
             None => Err(SourceError::TransactionBroadcastDisabled),
         }
     }
+}
+
+/// Discovers the node-advertised upgrade activations and wraps them for
+/// process-wide sharing.
+///
+/// Calls [`NodeSource::fetch_network_upgrade_activations`] and emits one
+/// `network_upgrade_activations_discovered` log event tagged with `service`,
+/// so the canonical writer and the storage benchmarks report discovery in the
+/// same shape. Readers never call it: they adopt the schedule the canonical
+/// writer admitted.
+pub async fn discover_network_upgrade_activations<Source>(
+    source: &Source,
+    service: &'static str,
+) -> Result<Arc<NetworkUpgradeActivations>, SourceError>
+where
+    Source: NodeSource + ?Sized,
+{
+    let activations = Arc::new(source.fetch_network_upgrade_activations().await?);
+    record_network_upgrade_activations_discovered(&activations, service);
+    Ok(activations)
+}
+
+/// Emits the discovery event of [`discover_network_upgrade_activations`].
+///
+/// It is for a table the caller already read from the node, such as the one
+/// ingest's endpoint admission validated.
+pub fn record_network_upgrade_activations_discovered(
+    activations: &NetworkUpgradeActivations,
+    service: &'static str,
+) {
+    tracing::info!(
+        target: "zinder::source",
+        event = "network_upgrade_activations_discovered",
+        service,
+        network = ?activations.network(),
+        advertised = activations.activations().len(),
+        "discovered network upgrade activations from running node"
+    );
 }
 
 fn bounded_segment_end_height(

@@ -16,14 +16,14 @@ use zinder_core::Network;
 use zinder_runtime::{
     BearerToken, BearerTokenError, CanonicalSecondaryStorageSection, CanonicalSecondaryStorageToml,
     ConfigError, ConfigLoader, IngestControlReaderToml, IngestControlSection, NetworkSection,
-    NetworkToml, NodeToml, OpsSection, OpsToml, ResolvedCanonicalSecondaryStorage,
-    ResolvedIngestControlReader, RocksDbResourceBudgetSection, RocksDbResourceBudgetToml,
-    RuntimeService, SecuritySection, SecurityToml, guard_optional_serving_bind, guard_serving_bind,
-    parse_socket_addr, require_field, resolve_allow_public_bind,
-    resolve_canonical_secondary_storage, resolve_ingest_control_reader, resolve_ops_listen_addr,
-    resolve_wallet_projection_reader_rocksdb_budget,
+    NetworkToml, NodeFallbacksToml, NodeToml, OpsSection, OpsToml,
+    ResolvedCanonicalSecondaryStorage, ResolvedIngestControlReader, RocksDbResourceBudgetSection,
+    RocksDbResourceBudgetToml, RuntimeService, SecuritySection, SecurityToml,
+    guard_optional_serving_bind, guard_serving_bind, parse_socket_addr, require_field,
+    resolve_allow_public_bind, resolve_canonical_secondary_storage, resolve_ingest_control_reader,
+    resolve_ops_listen_addr, resolve_wallet_projection_reader_rocksdb_budget,
 };
-use zinder_source::{NodeSection, NodeTarget};
+use zinder_source::{NodeFallbackSections, NodeSection, NodeTarget};
 use zinder_store::{
     CanonicalReorgPolicy, CanonicalStoreBuildPlanError, RocksDbResourceBudget, StoreError,
 };
@@ -67,6 +67,9 @@ pub(crate) struct LightwalletdConfig {
     pub(crate) pair_convergence_attempts: NonZeroU8,
     pub(crate) max_concurrent_block_range_streams: NonZeroU32,
     pub(crate) broadcaster: Option<NodeTarget>,
+    /// Fallback endpoints after `broadcaster`. Compatibility reads them but
+    /// does not use them yet; compact-blocks serving never does.
+    pub(crate) node_fallbacks: Vec<NodeTarget>,
 }
 
 /// Command-line overrides for the lightwalletd compat command.
@@ -198,6 +201,7 @@ struct LightwalletdRawConfig {
     ingest_control: IngestControlSection,
     compat: CompatSection,
     node: Option<NodeSection>,
+    node_fallbacks: NodeFallbackSections,
     security: SecuritySection,
 }
 
@@ -227,12 +231,6 @@ fn resolve_lightwalletd_config(
     if matches!(serving, CompatServing::CompactBlocks) && wallet.is_some() {
         return Err(ConfigError::invalid(
             "compat.serving = \"compact-blocks\" does not accept wallet.path, wallet.secondary_path, or wallet.rocksdb settings; remove the wallet section or select compat.serving = \"wallet\"",
-        )
-        .into());
-    }
-    if matches!(serving, CompatServing::CompactBlocks) && config.node.is_some() {
-        return Err(ConfigError::invalid(
-            "compat.serving = \"compact-blocks\" does not accept node settings, because compact-block serving never contacts a node; remove the node section and every ZINDER_NODE__* variable, or select compat.serving = \"wallet\"",
         )
         .into());
     }
@@ -280,7 +278,8 @@ fn resolve_lightwalletd_config(
     )?;
     guard_serving_bind("compat.listen_addr", listen_addr, allow_public_bind)?;
     guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
-    let broadcaster = resolve_broadcaster(network, config.node)?;
+    let (broadcaster, node_fallbacks) =
+        resolve_node_list(serving, network, config.node, config.node_fallbacks)?;
 
     Ok(LightwalletdConfig {
         network,
@@ -299,19 +298,35 @@ fn resolve_lightwalletd_config(
         pair_convergence_attempts,
         max_concurrent_block_range_streams,
         broadcaster,
+        node_fallbacks,
     })
 }
 
-/// Resolves the wallet-mode broadcast node. Any node setting asks for
-/// broadcast, so a section without `node.json_rpc_addr` is an error rather
-/// than a compatibility process without `SendTransaction`.
-fn resolve_broadcaster(
+/// Resolves the wallet-mode broadcast node and its fallbacks.
+///
+/// Any node setting asks for broadcast, so a section without
+/// `node.json_rpc_addr` is an error rather than a compatibility process
+/// without `SendTransaction`. Compact-block serving never contacts a node and
+/// rejects every node setting.
+fn resolve_node_list(
+    serving: CompatServing,
     network: Network,
     node: Option<NodeSection>,
-) -> Result<Option<NodeTarget>, ConfigError> {
-    node.map(|section| NodeTarget::resolve(network, section))
-        .transpose()
-        .map_err(ConfigError::from)
+    node_fallbacks: NodeFallbackSections,
+) -> Result<(Option<NodeTarget>, Vec<NodeTarget>), ConfigError> {
+    if matches!(serving, CompatServing::CompactBlocks)
+        && (node.is_some() || !node_fallbacks.is_empty())
+    {
+        return Err(ConfigError::invalid(
+            "compat.serving = \"compact-blocks\" does not accept node settings, because compact-block serving never contacts a node; remove the node and node_fallbacks sections and every ZINDER_NODE__* and ZINDER_NODE_FALLBACKS__* variable, or select compat.serving = \"wallet\"",
+        ));
+    }
+    let broadcaster = node
+        .map(|section| NodeTarget::resolve(network, section))
+        .transpose()?;
+    let node_fallbacks = NodeTarget::resolve_fallbacks(network, node_fallbacks)?;
+    NodeTarget::require_primary_for_fallbacks(broadcaster.as_ref(), &node_fallbacks)?;
+    Ok((broadcaster, node_fallbacks))
 }
 
 #[derive(Serialize)]
@@ -326,6 +341,8 @@ struct LightwalletdConfigToml {
     compat: CompatToml,
     #[serde(skip_serializing_if = "Option::is_none")]
     node: Option<NodeToml>,
+    #[serde(skip_serializing_if = "NodeFallbacksToml::is_empty")]
+    node_fallbacks: NodeFallbacksToml,
 }
 
 impl LightwalletdConfigToml {
@@ -357,6 +374,7 @@ impl LightwalletdConfigToml {
                 serving: config.serving,
             },
             node: config.broadcaster.as_ref().map(NodeToml::from_node_target),
+            node_fallbacks: NodeFallbacksToml::from_node_targets(&config.node_fallbacks),
         }
     }
 }

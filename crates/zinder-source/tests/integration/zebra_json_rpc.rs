@@ -20,14 +20,14 @@ use zinder_core::{
     SubtreeRootIndex, SubtreeRootRange, TransactionBroadcastOutcome, TransactionId,
 };
 use zinder_source::{
-    BroadcastNodeProbe, CookieSource, NodeAuth, NodeCapability, NodeHealthConfig, NodeSource,
+    CookieSource, NodeAuth, NodeCapability, NodeHealthConfig, NodeSource, NodeStorageMode,
     SourceChainCursor, SourceChainUpdate, SourceError, SourceFailureClass, TransactionBroadcaster,
     UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
     UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, ZebraJsonRpcSource,
     decode_rpc_block_hash,
 };
-use zinder_testkit::{JsonRpcTestServer, RpcReply, method};
+use zinder_testkit::{JsonRpcTestServer, LogCapture, RpcReply, method};
 
 fn regtest_source(server: &JsonRpcTestServer) -> Result<ZebraJsonRpcSource, SourceError> {
     ZebraJsonRpcSource::new(
@@ -1220,6 +1220,40 @@ async fn probe_capabilities_withholds_historical_block_bodies_when_storage_call_
     assert!(!probed.supports(NodeCapability::HistoricalBlockBodies));
     assert!(probed.supports(NodeCapability::TipId));
 
+    Ok(())
+}
+
+/// Admission tells a pruned node, which it excludes, from one whose storage
+/// mode it could not read, which it probes again.
+#[tokio::test]
+async fn storage_mode_separates_reported_modes_from_a_failed_call() -> eyre::Result<()> {
+    for (reply, expected) in [
+        (
+            RpcReply::result(json!({"blocks": 10, "pruned": false})),
+            Some(NodeStorageMode::Archive),
+        ),
+        (
+            RpcReply::result(json!({"blocks": 10, "pruned": true})),
+            Some(NodeStorageMode::Pruned),
+        ),
+        (
+            RpcReply::result(json!({"blocks": 10})),
+            Some(NodeStorageMode::Unreported),
+        ),
+        (RpcReply::error_with_code(-28, "node warming up"), None),
+    ] {
+        let server = JsonRpcTestServer::start([method("getblockchaininfo").reply(reply)])?;
+        let source = regtest_source(&server)?;
+
+        let storage_mode = source.fetch_storage_mode().await;
+        match expected {
+            Some(expected) => assert_eq!(storage_mode?, expected),
+            None => assert!(matches!(
+                storage_mode,
+                Err(SourceError::NodeUnavailable { .. })
+            )),
+        }
+    }
     Ok(())
 }
 
@@ -2468,6 +2502,45 @@ async fn poll_upstream_health_falls_back_when_ready_endpoint_unreachable() -> ey
     Ok(())
 }
 
+/// A failed ready probe logs the health address with its credentials
+/// redacted, so a standby evaluation of a fallback never writes them.
+#[tokio::test]
+async fn a_failed_ready_probe_logs_the_health_address_without_credentials() -> eyre::Result<()> {
+    let capture = LogCapture::install_for_target("zinder::source");
+    let server =
+        JsonRpcTestServer::start([method("getblockchaininfo").reply(RpcReply::result(json!({
+            "blocks": 50,
+            "estimatedheight": 50,
+            "verificationprogress": 1.0,
+            "valuePools": [],
+            "upgrades": {},
+        })))])?;
+    let source = testnet_source(&server)?.with_health_config(Some(NodeHealthConfig::new(
+        "http://zebra:health-secret@127.0.0.1:1/ready?token=query-secret".to_owned(),
+        Duration::from_millis(500),
+        0.999,
+        10,
+    )));
+
+    source.poll_upstream_health().await?;
+
+    let events = capture.events();
+    let unreachable = events
+        .iter()
+        .find(|event| event.field("event") == Some("upstream_health_endpoint_unreachable"))
+        .ok_or_else(|| eyre!("the failed ready probe was not logged"))?;
+    assert_eq!(
+        unreachable.field("addr"),
+        Some("http://[REDACTED]@127.0.0.1:1/ready?[REDACTED]")
+    );
+    for event in &events {
+        for field in event.fields.values() {
+            assert!(!field.contains("secret"), "{event:?}");
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn poll_upstream_health_uses_ready_endpoint_when_configured() -> eyre::Result<()> {
     use std::net::SocketAddr;
@@ -2539,9 +2612,9 @@ async fn holds_block_compares_the_block_hash_at_its_height() -> eyre::Result<()>
     ])?;
     let source = regtest_source(&server)?;
 
-    assert!(BroadcastNodeProbe::holds_block(&source, held).await?);
+    assert!(zinder_source::BroadcastNodeProbe::holds_block(&source, held).await?);
     let other = BlockId::new(held.height, BlockHash::from_bytes([0x70; 32]));
-    assert!(!BroadcastNodeProbe::holds_block(&source, other).await?);
+    assert!(!zinder_source::BroadcastNodeProbe::holds_block(&source, other).await?);
     let requests = server.requests_for("getblockhash")?;
     assert_eq!(requests.len(), 2);
     assert!(
@@ -2560,7 +2633,7 @@ async fn holds_block_above_the_node_tip_is_block_unavailable() -> eyre::Result<(
     ])?;
     let source = regtest_source(&server)?;
 
-    let error = BroadcastNodeProbe::holds_block(
+    let error = zinder_source::BroadcastNodeProbe::holds_block(
         &source,
         BlockId::new(BlockHeight::new(9), BlockHash::from_bytes([0x09; 32])),
     )

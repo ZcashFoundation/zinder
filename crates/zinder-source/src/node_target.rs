@@ -36,10 +36,13 @@
 //! decides whether the channel uses TLS; see
 //! [ADR-0019](../../../docs/adrs/0019-transport-policy-ownership.md).
 
-use std::{num::NonZeroU64, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, fmt, num::NonZeroU64, path::PathBuf, time::Duration};
 
 use secrecy::SecretString;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{self, MapAccess, Visitor},
+};
 use thiserror::Error;
 use tracing::warn;
 use zinder_core::Network;
@@ -266,6 +269,44 @@ impl NodeTarget {
         .with_health(health))
     }
 
+    /// Resolves the `[node_fallbacks.N]` tables into targets ordered by
+    /// position, so the ordered node list is `[node]` followed by them.
+    ///
+    /// Positions must run 1, 2, 3, and so on without a gap, and each table
+    /// is validated as [`Self::resolve`] validates `[node]`.
+    pub fn resolve_fallbacks(
+        network: Network,
+        sections: NodeFallbackSections,
+    ) -> Result<Vec<Self>, NodeConfigError> {
+        let mut targets = Vec::with_capacity(sections.positions.len());
+        for (expected_position, (position, section)) in (1_u16..).zip(sections.positions) {
+            if position != expected_position {
+                return Err(NodeConfigError::FallbackPositionMissing {
+                    position: expected_position,
+                });
+            }
+            let target =
+                Self::resolve(network, section).map_err(|source| NodeConfigError::Fallback {
+                    position,
+                    source: Box::new(source),
+                })?;
+            targets.push(target);
+        }
+        Ok(targets)
+    }
+
+    /// Fails when fallback endpoints are configured without the `[node]`
+    /// endpoint, for runtimes whose `[node]` is optional.
+    pub fn require_primary_for_fallbacks(
+        primary: Option<&Self>,
+        fallbacks: &[Self],
+    ) -> Result<(), NodeConfigError> {
+        if primary.is_none() && !fallbacks.is_empty() {
+            return Err(NodeConfigError::FallbacksWithoutPrimary);
+        }
+        Ok(())
+    }
+
     /// Resolves a [`NodeTarget`] directly from the unified env-var schema.
     ///
     /// Reads `ZINDER_NETWORK` and `ZINDER_NODE__*` from `std::env` without
@@ -366,6 +407,74 @@ pub struct NodeSection {
     pub auth: NodeAuthSection,
     /// Upstream-readiness probe subsection.
     pub health: NodeHealthSection,
+}
+
+/// Raw `[node_fallbacks.N]` tables: the fallback node endpoints, keyed by
+/// their position in the ordered node list whose position 0 is `[node]`.
+///
+/// Each table holds the fields of [`NodeSection`]. Positions are integer table
+/// keys in TOML (`[node_fallbacks.1]`) and in the environment
+/// (`ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR`), so a file and the environment
+/// merge field by field. A TOML array of tables is refused because the
+/// configuration loader replaces an array with a table as soon as one
+/// environment variable names an entry.
+#[derive(Clone, Debug, Default)]
+pub struct NodeFallbackSections {
+    positions: BTreeMap<u16, NodeSection>,
+}
+
+impl NodeFallbackSections {
+    /// Returns whether no fallback table is configured.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.positions.is_empty()
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeFallbackSections {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(NodeFallbackSectionsVisitor)
+    }
+}
+
+struct NodeFallbackSectionsVisitor;
+
+impl<'de> Visitor<'de> for NodeFallbackSectionsVisitor {
+    type Value = NodeFallbackSections;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "tables keyed by node position, such as [node_fallbacks.1]; an array of tables is not accepted",
+        )
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut positions = BTreeMap::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let position = key
+                .parse::<u16>()
+                .ok()
+                .filter(|position| *position > 0)
+                .ok_or_else(|| {
+                    de::Error::custom(format!(
+                        "`{key}`: expected a position key 1, 2, 3, ...; position 0 is [node]"
+                    ))
+                })?;
+            let section = map.next_value::<NodeSection>()?;
+            if positions.insert(position, section).is_some() {
+                return Err(de::Error::custom(format!(
+                    "node position {position} is configured more than once"
+                )));
+            }
+        }
+        Ok(NodeFallbackSections { positions })
+    }
 }
 
 /// Raw `[node.indexer_tls]` config section.
@@ -552,6 +661,29 @@ pub enum NodeConfigError {
     )]
     IndexerTlsClientIdentityIncomplete,
 
+    /// A `[node_fallbacks.N]` table is invalid.
+    #[error("[node_fallbacks.{position}] (fields as in [node]): {source}")]
+    Fallback {
+        /// Position of the invalid table.
+        position: u16,
+        /// Validation failure of the table.
+        #[source]
+        source: Box<Self>,
+    },
+
+    /// The `[node_fallbacks.N]` positions skip a number.
+    #[error(
+        "[node_fallbacks.{position}] is missing; fallback positions must run 1, 2, 3, ... without a gap"
+    )]
+    FallbackPositionMissing {
+        /// First position that has no table.
+        position: u16,
+    },
+
+    /// `[node_fallbacks.N]` is set without the `[node]` endpoint at position 0.
+    #[error("[node_fallbacks.N] requires [node] with node.json_rpc_addr, which is position 0")]
+    FallbacksWithoutPrimary,
+
     /// An environment variable could not be parsed as the expected type.
     #[error("failed to parse environment variable for {field}: {reason}")]
     EnvParseFailed {
@@ -641,6 +773,51 @@ fn resolve_node_indexer_tls(
 fn uses_tls_scheme(url: &str) -> bool {
     url.get(..8)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+}
+
+/// Returns `url` for configuration output and logs, with its user
+/// information and its query and fragment each replaced by `[REDACTED]`.
+///
+/// An endpoint URL can carry a credential in either place. The scheme, host,
+/// port, and path stay visible, so an operator can still tell endpoints
+/// apart. A URL without user information, query, or fragment is returned
+/// unchanged.
+#[must_use]
+pub fn redact_endpoint_url(url: &str) -> std::borrow::Cow<'_, str> {
+    const REDACTED: &str = "[REDACTED]";
+    let (scheme, rest) = match url.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, url),
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, after_authority) = rest.split_at(authority_end);
+    let host = authority.rsplit_once('@').map(|(_userinfo, host)| host);
+    let path_end = after_authority
+        .find(['?', '#'])
+        .unwrap_or(after_authority.len());
+    let (path, query_and_fragment) = after_authority.split_at(path_end);
+    if host.is_none() && query_and_fragment.is_empty() {
+        return std::borrow::Cow::Borrowed(url);
+    }
+    let mut redacted = String::with_capacity(url.len());
+    if let Some(scheme) = scheme {
+        redacted.push_str(scheme);
+        redacted.push_str("://");
+    }
+    match host {
+        Some(host) => {
+            redacted.push_str(REDACTED);
+            redacted.push('@');
+            redacted.push_str(host);
+        }
+        None => redacted.push_str(authority),
+    }
+    redacted.push_str(path);
+    if let Some(delimiter) = query_and_fragment.chars().next() {
+        redacted.push(delimiter);
+        redacted.push_str(REDACTED);
+    }
+    std::borrow::Cow::Owned(redacted)
 }
 
 fn resolve_node_auth(section: NodeAuthSection) -> Result<NodeAuth, NodeConfigError> {
@@ -749,6 +926,37 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redacted_endpoint_urls_keep_host_and_path_but_not_credentials() {
+        for (url, expected) in [
+            ("http://127.0.0.1:8232", "http://127.0.0.1:8232"),
+            ("http://zebra:8233/ready", "http://zebra:8233/ready"),
+            (
+                "http://zebra:rpc-secret@127.0.0.1:8232",
+                "http://[REDACTED]@127.0.0.1:8232",
+            ),
+            (
+                "https://token-secret@zebra.example/v1/",
+                "https://[REDACTED]@zebra.example/v1/",
+            ),
+            (
+                "http://zebra:8233/ready?token=query-secret",
+                "http://zebra:8233/ready?[REDACTED]",
+            ),
+            (
+                "http://user:secret@zebra:8233?token=secret#fragment-secret",
+                "http://[REDACTED]@zebra:8233?[REDACTED]",
+            ),
+            (
+                "http://zebra:8233/#fragment-secret",
+                "http://zebra:8233/#[REDACTED]",
+            ),
+            ("user:secret@zebra:8232", "[REDACTED]@zebra:8232"),
+        ] {
+            assert_eq!(redact_endpoint_url(url), expected, "{url}");
+        }
+    }
 
     #[test]
     fn resolve_basic_auth_round_trip() -> Result<(), NodeConfigError> {
@@ -1272,5 +1480,138 @@ mod tests {
                 })
             ));
         }
+    }
+
+    fn fallback_sections(
+        tables: serde_json::Value,
+    ) -> Result<NodeFallbackSections, serde_json::Error> {
+        serde_json::from_value(tables)
+    }
+
+    #[test]
+    fn fallback_tables_resolve_in_position_order() -> Result<(), Box<dyn std::error::Error>> {
+        let sections = fallback_sections(serde_json::json!({
+            "2": { "json_rpc_addr": "http://zakura:8232" },
+            "1": {
+                "json_rpc_addr": "http://zebra-b:8232",
+                "auth": { "method": "basic", "username": "zebra", "password": "secret" },
+            },
+        }))?;
+        let targets = NodeTarget::resolve_fallbacks(Network::ZcashRegtest, sections)?;
+
+        let addresses = targets
+            .iter()
+            .map(|target| target.json_rpc_addr.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(addresses, ["http://zebra-b:8232", "http://zakura:8232"]);
+        assert_eq!(targets[0].node_auth.scheme_name(), "basic");
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_positions_sort_numerically_past_nine() -> Result<(), Box<dyn std::error::Error>> {
+        let tables = (1..=10)
+            .map(|position| {
+                (
+                    position.to_string(),
+                    serde_json::json!({ "json_rpc_addr": format!("http://node-{position}:8232") }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let targets = NodeTarget::resolve_fallbacks(
+            Network::ZcashRegtest,
+            fallback_sections(serde_json::Value::Object(tables))?,
+        )?;
+
+        assert_eq!(targets.len(), 10);
+        assert_eq!(targets[1].json_rpc_addr, "http://node-2:8232");
+        assert_eq!(targets[9].json_rpc_addr, "http://node-10:8232");
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_tables_refuse_an_array() {
+        let refusal = fallback_sections(serde_json::json!([
+            { "json_rpc_addr": "http://zebra-b:8232" },
+        ]))
+        .err()
+        .map(|error| error.to_string());
+
+        assert!(
+            refusal.as_deref().is_some_and(
+                |message| message.contains("[node_fallbacks.1]") && message.contains("array")
+            ),
+            "{refusal:?}"
+        );
+    }
+
+    #[test]
+    fn fallback_tables_refuse_keys_that_are_not_positions() {
+        for key in ["0", "first", "-1", "contract_probe"] {
+            let refusal = fallback_sections(serde_json::json!({
+                key: { "json_rpc_addr": "http://zebra-b:8232" },
+            }))
+            .err()
+            .map(|error| error.to_string());
+
+            assert!(
+                refusal
+                    .as_deref()
+                    .is_some_and(|message| message.contains("expected a position key")),
+                "{key}: {refusal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_positions_must_not_skip_a_number() -> Result<(), Box<dyn std::error::Error>> {
+        let sections = fallback_sections(serde_json::json!({
+            "1": { "json_rpc_addr": "http://zebra-b:8232" },
+            "3": { "json_rpc_addr": "http://zakura:8232" },
+        }))?;
+
+        assert!(matches!(
+            NodeTarget::resolve_fallbacks(Network::ZcashRegtest, sections),
+            Err(NodeConfigError::FallbackPositionMissing { position: 2 })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_validation_errors_name_their_position() -> Result<(), Box<dyn std::error::Error>> {
+        let sections = fallback_sections(serde_json::json!({
+            "1": { "json_rpc_addr": "http://zebra-b:8232" },
+            "2": { "auth": { "method": "basic" } },
+        }))?;
+
+        let message = NodeTarget::resolve_fallbacks(Network::ZcashRegtest, sections)
+            .err()
+            .map(|error| error.to_string());
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|message| message.starts_with("[node_fallbacks.2]")
+                    && message.contains("node.json_rpc_addr")),
+            "{message:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fallbacks_require_the_primary_endpoint() -> Result<(), NodeConfigError> {
+        let fallback = NodeTarget::resolve(
+            Network::ZcashRegtest,
+            NodeSection {
+                json_rpc_addr: Some("http://zebra-b:8232".to_owned()),
+                ..NodeSection::default()
+            },
+        )?;
+
+        assert!(matches!(
+            NodeTarget::require_primary_for_fallbacks(None, std::slice::from_ref(&fallback)),
+            Err(NodeConfigError::FallbacksWithoutPrimary)
+        ));
+        NodeTarget::require_primary_for_fallbacks(None, &[])?;
+        NodeTarget::require_primary_for_fallbacks(Some(&fallback), std::slice::from_ref(&fallback))
     }
 }

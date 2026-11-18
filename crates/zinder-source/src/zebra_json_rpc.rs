@@ -29,14 +29,17 @@ use zinder_core::{
 };
 
 use crate::{
-    BroadcastNodeProbe, CookieSource, CookieSourceError, NodeAuth, NodeCapabilities,
-    NodeCapability, NodeHealthConfig, NodeSource, ResilientClient, SourceBlock, SourceChainCursor,
-    SourceChainSegment, SourceChainSegmentLimits, SourceChainSegmentStats, SourceChainUpdate,
-    SourceError, SourceSubtreeRoot, SourceSubtreeRoots, TransactionBroadcaster,
+    BroadcastNodeProbe, CookieSource, CookieSourceError, JsonRpcMempoolSource,
+    JsonRpcMempoolSourceOptions, MempoolSource, MempoolSourceAdmissionLimits, MempoolSourceFactory,
+    NodeAuth, NodeCapabilities, NodeCapability, NodeHealthConfig, NodeSource, NodeStorageMode,
+    NodeTarget, ResilientClient, SourceBlock, SourceChainCursor, SourceChainSegment,
+    SourceChainSegmentLimits, SourceChainSegmentStats, SourceChainUpdate, SourceError,
+    SourceSubtreeRoot, SourceSubtreeRoots, TransactionBroadcaster,
     UPSTREAM_HEALTH_REASON_ESTIMATED_GAP_ABOVE_FLOOR,
     UPSTREAM_HEALTH_REASON_VERIFICATION_PROGRESS_BELOW_FLOOR,
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, UpstreamHealthSnapshot,
-    ZEBRA_REBUILD_THRESHOLD, ZebraTransportError, decode_rpc_block_hash, encode_rpc_block_hash,
+    ZEBRA_REBUILD_THRESHOLD, ZebraIndexerMempoolSource, ZebraIndexerMempoolSourceOptions,
+    ZebraIndexerSourceTarget, ZebraTransportError, decode_rpc_block_hash, encode_rpc_block_hash,
     source_block::wire_error_to_transaction_id_error,
     source_chain_update::SourceChainCursorPosition, zebra_ready_endpoint::ZebraReadyClient,
 };
@@ -68,7 +71,7 @@ pub enum UpstreamTransactionLookup {
 
 /// Default capability set assumed for Zebra JSON-RPC sources.
 ///
-/// Used until [`ZebraJsonRpcSource::probe_capabilities`] runs. Operators
+/// Used until [`NodeSource::probe_capabilities`] runs. Operators
 /// should treat this as a baseline; the probed value is the source of truth
 /// at runtime.
 fn default_zebra_capabilities() -> NodeCapabilities {
@@ -141,6 +144,7 @@ pub struct ZebraJsonRpcSource {
     cached_capabilities: Arc<Mutex<NodeCapabilities>>,
     health_config: Option<NodeHealthConfig>,
     ready_http_client: Option<ZebraReadyClient>,
+    indexer_target: Option<ZebraIndexerSourceTarget>,
 }
 
 /// What a [`ZebraJsonRpcSource`] needs to build its JSON-RPC client.
@@ -231,7 +235,7 @@ impl ZebraJsonRpcSource {
     /// Returns the static baseline capability set Zebra JSON-RPC sources
     /// are assumed to support before runtime discovery runs.
     ///
-    /// Production code should prefer [`ZebraJsonRpcSource::probe_capabilities`]
+    /// Production code should prefer [`NodeSource::probe_capabilities`]
     /// (which writes the discovered set into the per-source cache); this
     /// constant exists for tests and for compile-time defaults.
     #[must_use]
@@ -303,7 +307,7 @@ impl ZebraJsonRpcSource {
     /// permanently lacks the tree state at that height, and
     /// [`SourceError::SourceProtocolMismatch`] when the response identity is
     /// malformed or does not match `height`. Capability discovery
-    /// ([`ZebraJsonRpcSource::probe_capabilities`]) does not gate this call.
+    /// ([`NodeSource::probe_capabilities`]) does not gate this call.
     pub async fn fetch_chain_checkpoint(
         &self,
         height: BlockHeight,
@@ -400,116 +404,6 @@ impl ZebraJsonRpcSource {
         decode_rpc_block_hash(&block_hash_hex)
     }
 
-    /// Fetches the node-advertised network upgrade activations.
-    ///
-    /// The values come from Zebra's `getblockchaininfo.upgrades` field so
-    /// custom Testnet and Regtest activation schedules stay node-owned, per
-    /// [`../../../docs/architecture/chain-ingestion.md`][cha]. The returned
-    /// table carries the same `network` identifier as this source.
-    ///
-    /// [cha]: ../../../docs/architecture/chain-ingestion.md
-    pub async fn fetch_network_upgrade_activations(
-        &self,
-    ) -> Result<NetworkUpgradeActivations, SourceError> {
-        let blockchain_info: ZebraGetBlockchainInfoUpgrades = self
-            .call_typed("getblockchaininfo", ArrayParams::new(), |error| {
-                SourceError::NodeUnavailable {
-                    reason: error.message,
-                }
-            })
-            .await?;
-
-        let activations = blockchain_info
-            .upgrades
-            .iter()
-            .map(|(branch_id_hex, upgrade)| {
-                let branch_id_value = u32::from_str_radix(branch_id_hex, 16).map_err(|_| {
-                    SourceError::SourceProtocolMismatch {
-                        reason: "getblockchaininfo upgrades carried a non-hex branch id key",
-                    }
-                })?;
-                Ok(NetworkUpgradeActivation {
-                    branch_id: ConsensusBranchId::new(branch_id_value),
-                    activation_height: BlockHeight::new(upgrade.activation_height),
-                    name: upgrade.name.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>, SourceError>>()?;
-
-        NetworkUpgradeActivations::new(self.network, activations).map_err(|error| {
-            tracing::warn!(
-                target: "zinder::source",
-                event = "network_upgrade_activations_duplicate_branch_id",
-                error = %error,
-                "Zebra getblockchaininfo upgrades advertised a duplicate branch id"
-            );
-            SourceError::SourceProtocolMismatch {
-                reason: "getblockchaininfo upgrades advertised duplicate consensus branch ids",
-            }
-        })
-    }
-
-    /// Discovers the node-advertised upgrade activations and wraps them for
-    /// process-wide sharing.
-    ///
-    /// Convenience wrapper that calls
-    /// [`Self::fetch_network_upgrade_activations`], wraps the result in an
-    /// [`Arc`], and emits a structured `network_upgrade_activations_discovered`
-    /// log event tagged with `target`. The canonical writer and the storage
-    /// benchmarks share this one entry point so the discovery event shape
-    /// stays consistent. Readers never call it: they adopt the schedule the
-    /// canonical writer admitted.
-    pub async fn discover_network_upgrade_activations(
-        &self,
-        target: &'static str,
-    ) -> Result<Arc<NetworkUpgradeActivations>, SourceError> {
-        let activations = Arc::new(self.fetch_network_upgrade_activations().await?);
-        tracing::info!(
-            target: "zinder::source",
-            event = "network_upgrade_activations_discovered",
-            service = target,
-            network = ?activations.network(),
-            advertised = activations.activations().len(),
-            "discovered network upgrade activations from running node"
-        );
-        Ok(activations)
-    }
-
-    /// Probes the node's `rpc.discover` (`OpenRPC`) endpoint and updates
-    /// the cached capability set returned by
-    /// [`NodeSource::capabilities`].
-    ///
-    /// On probe success, the cache reflects the methods the node
-    /// advertises plus [`NodeCapability::JsonRpc`] and
-    /// [`NodeCapability::OpenRpcDiscovery`].
-    ///
-    /// When the node advertises `getblockchaininfo`, the probe also reads its
-    /// `pruned` field and grants [`NodeCapability::HistoricalBlockBodies`]
-    /// only when the node reports `pruned: false`. A failed call or a missing
-    /// field withholds the capability.
-    ///
-    /// Missing discovery fails closed because assuming a method set would let
-    /// startup accept a node that cannot satisfy the source contract.
-    pub async fn probe_capabilities(&self) -> Result<NodeCapabilities, SourceError> {
-        let openrpc_response: Value = self
-            .call_typed("rpc.discover", ArrayParams::new(), |_error| {
-                SourceError::NodeCapabilityMissing {
-                    capability: NodeCapability::OpenRpcDiscovery,
-                }
-            })
-            .await?;
-        let method_names = openrpc_method_names(&openrpc_response);
-        let stores_historical_block_bodies = method_names.contains(&"getblockchaininfo")
-            && self.reports_archive_block_storage().await;
-        let json_rpc_capabilities =
-            parse_openrpc_capabilities(&method_names, stores_historical_block_bodies);
-
-        let probed_capabilities =
-            with_readiness_probe_capability(json_rpc_capabilities, self.health_config.is_some());
-        *self.cached_capabilities.lock() = probed_capabilities;
-        Ok(probed_capabilities)
-    }
-
     /// Creates a Zebra JSON-RPC source.
     pub fn new(
         network: Network,
@@ -596,7 +490,37 @@ impl ZebraJsonRpcSource {
             cached_capabilities: Arc::new(Mutex::new(default_zebra_capabilities())),
             health_config: None,
             ready_http_client: None,
+            indexer_target: None,
         })
+    }
+
+    /// Creates the source one resolved [`NodeTarget`] describes: its
+    /// JSON-RPC options, upstream-health probe, and indexer endpoint.
+    pub fn from_node_target(target: &NodeTarget) -> Result<Self, SourceError> {
+        Self::with_options(
+            target.network,
+            &target.json_rpc_addr,
+            target.node_auth.clone(),
+            ZebraJsonRpcSourceOptions {
+                request_timeout: target.request_timeout,
+                max_response_bytes: target.max_response_bytes,
+                broadcast_timeout: target.broadcast_timeout,
+            },
+        )
+        .map(|source| {
+            source
+                .with_health_config(target.health.clone())
+                .with_indexer_target(ZebraIndexerSourceTarget::from_node_target(target))
+        })
+    }
+
+    /// Sets the indexer endpoint whose mempool stream
+    /// [`MempoolSourceFactory::mempool_source`] follows. `None` selects
+    /// JSON-RPC mempool polling.
+    #[must_use]
+    pub fn with_indexer_target(mut self, indexer_target: Option<ZebraIndexerSourceTarget>) -> Self {
+        self.indexer_target = indexer_target;
+        self
     }
 
     /// Installs the upstream-health probe configuration.
@@ -1050,6 +974,110 @@ impl NodeSource for ZebraJsonRpcSource {
         *self.cached_capabilities.lock()
     }
 
+    /// Probes the node's `rpc.discover` (`OpenRPC`) endpoint and updates
+    /// the cached capability set returned by
+    /// [`NodeSource::capabilities`].
+    ///
+    /// On probe success, the cache reflects the methods the node
+    /// advertises plus [`NodeCapability::JsonRpc`] and
+    /// [`NodeCapability::OpenRpcDiscovery`].
+    ///
+    /// When the node advertises `getblockchaininfo`, the probe also reads its
+    /// storage mode through [`NodeSource::fetch_storage_mode`] and grants
+    /// [`NodeCapability::HistoricalBlockBodies`] only when the node reports
+    /// `pruned: false`. A failed call or a missing field withholds the
+    /// capability.
+    ///
+    /// Missing discovery fails closed because assuming a method set would let
+    /// startup accept a node that cannot satisfy the source contract.
+    async fn probe_capabilities(&self) -> Result<NodeCapabilities, SourceError> {
+        let openrpc_response: Value = self
+            .call_typed("rpc.discover", ArrayParams::new(), |_error| {
+                SourceError::NodeCapabilityMissing {
+                    capability: NodeCapability::OpenRpcDiscovery,
+                }
+            })
+            .await?;
+        let method_names = openrpc_method_names(&openrpc_response);
+        let stores_historical_block_bodies = method_names.contains(&"getblockchaininfo")
+            && self.reports_archive_block_storage().await;
+        let json_rpc_capabilities =
+            parse_openrpc_capabilities(&method_names, stores_historical_block_bodies);
+
+        let probed_capabilities =
+            with_readiness_probe_capability(json_rpc_capabilities, self.health_config.is_some());
+        *self.cached_capabilities.lock() = probed_capabilities;
+        Ok(probed_capabilities)
+    }
+
+    /// Fetches the node-advertised network upgrade activations.
+    ///
+    /// The values come from Zebra's `getblockchaininfo.upgrades` field so
+    /// custom Testnet and Regtest activation schedules stay node-owned, per
+    /// [`../../../docs/architecture/chain-ingestion.md`][cha]. The returned
+    /// table carries the same `network` identifier as this source.
+    ///
+    /// [cha]: ../../../docs/architecture/chain-ingestion.md
+    async fn fetch_network_upgrade_activations(
+        &self,
+    ) -> Result<NetworkUpgradeActivations, SourceError> {
+        let blockchain_info: ZebraGetBlockchainInfoUpgrades = self
+            .call_typed("getblockchaininfo", ArrayParams::new(), |error| {
+                SourceError::NodeUnavailable {
+                    reason: error.message,
+                }
+            })
+            .await?;
+
+        let activations = blockchain_info
+            .upgrades
+            .iter()
+            .map(|(branch_id_hex, upgrade)| {
+                let branch_id_value = u32::from_str_radix(branch_id_hex, 16).map_err(|_| {
+                    SourceError::SourceProtocolMismatch {
+                        reason: "getblockchaininfo upgrades carried a non-hex branch id key",
+                    }
+                })?;
+                Ok(NetworkUpgradeActivation {
+                    branch_id: ConsensusBranchId::new(branch_id_value),
+                    activation_height: BlockHeight::new(upgrade.activation_height),
+                    name: upgrade.name.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, SourceError>>()?;
+
+        NetworkUpgradeActivations::new(self.network, activations).map_err(|error| {
+            tracing::warn!(
+                target: "zinder::source",
+                event = "network_upgrade_activations_duplicate_branch_id",
+                error = %error,
+                "Zebra getblockchaininfo upgrades advertised a duplicate branch id"
+            );
+            SourceError::SourceProtocolMismatch {
+                reason: "getblockchaininfo upgrades advertised duplicate consensus branch ids",
+            }
+        })
+    }
+
+    /// Reads the `pruned` field of `getblockchaininfo`.
+    ///
+    /// A response without the field reports [`NodeStorageMode::Unreported`];
+    /// Zebra and Zakura always serialize it.
+    async fn fetch_storage_mode(&self) -> Result<NodeStorageMode, SourceError> {
+        let storage_mode: ZebraGetBlockchainInfoStorage = self
+            .call_typed(
+                "getblockchaininfo",
+                ArrayParams::new(),
+                map_node_unavailable,
+            )
+            .await?;
+        Ok(match storage_mode.pruned {
+            Some(false) => NodeStorageMode::Archive,
+            Some(true) => NodeStorageMode::Pruned,
+            None => NodeStorageMode::Unreported,
+        })
+    }
+
     async fn fetch_chain_segment(
         &self,
         limits: SourceChainSegmentLimits,
@@ -1301,7 +1329,7 @@ impl NodeSource for ZebraJsonRpcSource {
                     tracing::warn!(
                         target: "zinder::source",
                         event = "upstream_health_endpoint_unreachable",
-                        addr = config.addr.as_str(),
+                        addr = %crate::redact_endpoint_url(&config.addr),
                         reason = %error,
                         "ready endpoint probe failed; falling back to verificationprogress"
                     );
@@ -1314,21 +1342,23 @@ impl NodeSource for ZebraJsonRpcSource {
 }
 
 impl ZebraJsonRpcSource {
-    /// Returns whether `getblockchaininfo` reports `pruned: false`.
+    /// Returns whether the node reports `pruned: false`.
     ///
     /// Fails closed: a failed call or a response without `pruned` counts as
     /// pruned. Query and compatibility runtimes share this probe and accept
     /// pruned nodes, so the outcome is logged at debug level only.
     async fn reports_archive_block_storage(&self) -> bool {
-        let storage_mode = self
-            .call_typed::<ZebraGetBlockchainInfoStorage>(
-                "getblockchaininfo",
-                ArrayParams::new(),
-                map_node_unavailable,
-            )
-            .await;
-        match storage_mode {
-            Ok(storage_mode) => !storage_mode.pruned,
+        match self.fetch_storage_mode().await {
+            Ok(NodeStorageMode::Archive) => true,
+            Ok(NodeStorageMode::Pruned) => false,
+            Ok(NodeStorageMode::Unreported) => {
+                tracing::debug!(
+                    target: "zinder::source",
+                    event = "node_storage_mode_unreported",
+                    "getblockchaininfo did not report the node storage mode"
+                );
+                false
+            }
             Err(error) => {
                 tracing::debug!(
                     target: "zinder::source",
@@ -1409,16 +1439,43 @@ impl ZebraJsonRpcSource {
     }
 }
 
+impl MempoolSourceFactory for ZebraJsonRpcSource {
+    /// Builds the streaming indexer source when this endpoint names an
+    /// indexer, and the JSON-RPC polling source otherwise.
+    fn mempool_source(
+        &self,
+        admission_limits: MempoolSourceAdmissionLimits,
+    ) -> Arc<dyn MempoolSource> {
+        let Some(indexer_target) = self.indexer_target.clone() else {
+            return Arc::new(JsonRpcMempoolSource::with_options(
+                self.clone(),
+                JsonRpcMempoolSourceOptions {
+                    admission_limits,
+                    ..JsonRpcMempoolSourceOptions::default()
+                },
+            ));
+        };
+        Arc::new(ZebraIndexerMempoolSource::with_options(
+            indexer_target,
+            self.clone(),
+            ZebraIndexerMempoolSourceOptions {
+                admission_limits,
+                ..ZebraIndexerMempoolSourceOptions::default()
+            },
+        ))
+    }
+}
+
 #[async_trait]
 impl BroadcastNodeProbe for ZebraJsonRpcSource {
     async fn probe_capabilities(&self) -> Result<NodeCapabilities, SourceError> {
-        Self::probe_capabilities(self).await
+        NodeSource::probe_capabilities(self).await
     }
 
     async fn fetch_network_upgrade_activations(
         &self,
     ) -> Result<NetworkUpgradeActivations, SourceError> {
-        Self::fetch_network_upgrade_activations(self).await
+        NodeSource::fetch_network_upgrade_activations(self).await
     }
 
     async fn holds_block(&self, block: BlockId) -> Result<bool, SourceError> {
@@ -2454,11 +2511,12 @@ struct ZebraGetBlockchainInfoValuePools {
 }
 
 /// Storage mode reported by `getblockchaininfo`. Both Zebra and Zakura always
-/// serialize `pruned`, so it is required: a response without it is treated as
-/// an unreported storage mode.
+/// serialize `pruned`; a response without it reports an unreported storage
+/// mode.
 #[derive(Deserialize)]
 struct ZebraGetBlockchainInfoStorage {
-    pruned: bool,
+    #[serde(default)]
+    pruned: Option<bool>,
 }
 
 #[derive(Deserialize)]

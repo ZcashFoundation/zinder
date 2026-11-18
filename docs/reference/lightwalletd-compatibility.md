@@ -154,8 +154,9 @@ Compact-block serving admits exactly `GetLightdInfo`, `GetLatestBlock`,
 methods, transparent-address methods, transaction submission, and ping.
 `GetLightdInfo` reports the admitted network and tip with
 `taddrSupport = false`. Compact-blocks serving never contacts a node, so it
-rejects a `[node]` section, `--node-json-rpc-addr`, and every `ZINDER_NODE__*`
-variable at startup. Its fields follow
+rejects a `[node]` section, `[node_fallbacks.N]`, `--node-json-rpc-addr`,
+every `ZINDER_NODE__*` variable, and every `ZINDER_NODE_FALLBACKS__*` variable
+at startup. Its fields follow
 [Identity and live-tip responses](#identity-and-live-tip-responses).
 
 Wallet serving uses `[node]` only for `SendTransaction`. It starts without

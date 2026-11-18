@@ -18,11 +18,8 @@ set -eu
 . /usr/local/lib/zinder/materialize-indexer-tls
 materialize_indexer_tls
 if [ "$indexer_tls_pem_present" -eq 1 ]; then
-  exec env \
-    -u ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM \
-    -u ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM \
-    -u ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM \
-    "$0" "$@"
+  # shellcheck disable=SC2046 # each word is one env argument
+  exec env $(indexer_tls_unset_arguments) "$0" "$@"
 fi
 
 wallet_serving_entrypoint="/usr/local/bin/zinder-wallet-serving-runtime-entrypoint"
@@ -168,12 +165,12 @@ section_routing_name() {
 }
 
 # Runs zinder-explorer as zinder with the given extra arguments. The Explorer
-# shares only [network] and [node] with the wallet-serving processes; its
-# storage, listeners, and bind policy come from its own config.
+# shares only [network], [node], and [node_fallbacks.N] with the wallet-serving
+# processes; its storage, listeners, and bind policy come from its own config.
 run_explorer() {
   for variable_name in $(zinder_variable_names); do
     case "$(section_routing_name "$variable_name")" in
-      ZINDER_NETWORK__* | ZINDER_NODE__* | ZINDER_EXPLORER__*) ;;
+      ZINDER_NETWORK__* | ZINDER_NODE__* | ZINDER_NODE_FALLBACKS__* | ZINDER_EXPLORER__*) ;;
       *) unset "$variable_name" ;;
     esac
   done

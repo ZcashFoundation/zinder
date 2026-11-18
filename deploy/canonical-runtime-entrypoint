@@ -15,9 +15,7 @@ materialize_indexer_tls
 # still requires the final store path to be absent.
 chown -R zinder:zinder /var/lib/zinder
 
-exec env \
-    -u ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM \
-    -u ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM \
-    -u ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM \
+# shellcheck disable=SC2046 # each word is one env argument
+exec env $(indexer_tls_unset_arguments) \
     setpriv --reuid=zinder --regid=zinder --init-groups --no-new-privs \
     /usr/local/bin/zinder-ingest "$@"

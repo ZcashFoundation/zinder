@@ -14,6 +14,7 @@ use std::{
     collections::HashMap,
     num::{NonZeroU32, NonZeroU64},
     pin::Pin,
+    sync::Arc,
 };
 
 use async_trait::async_trait;
@@ -376,6 +377,16 @@ pub trait MempoolSource: Send + Sync + 'static {
     /// completion marker because the underlying broadcast channel may have
     /// lagged events.
     async fn events(&self) -> Result<MempoolSourceEventStream, SourceError>;
+}
+
+/// A node endpoint that can build the live mempool source ingest follows.
+pub trait MempoolSourceFactory {
+    /// Builds this endpoint's mempool source, admitting at most
+    /// `admission_limits` per source generation.
+    fn mempool_source(
+        &self,
+        admission_limits: MempoolSourceAdmissionLimits,
+    ) -> Arc<dyn MempoolSource>;
 }
 
 #[cfg(test)]

@@ -33,8 +33,21 @@ Forbidden outside `zinder-source`:
 - one-block random access for following and reorg traversal;
 - upstream tip identity;
 - tree-state checkpoints and shielded subtree roots;
-- chain-wide and block-bound value-pool observations; and
-- upstream readiness.
+- chain-wide and block-bound value-pool observations;
+- upstream readiness; and
+- the node's own description: `probe_capabilities`, which also refreshes
+  `capabilities`, `fetch_network_upgrade_activations`, and
+  `fetch_storage_mode`.
+
+Ingest reaches these through the trait, and a wallet reader's
+`BroadcastNodeProbe` delegates to the same methods.
+`discover_network_upgrade_activations` wraps
+`fetch_network_upgrade_activations` with the shared discovery log event, which
+`record_network_upgrade_activations_discovered` emits alone for a table the
+caller already read, and `MempoolSourceFactory` builds an endpoint's live mempool source: the
+streaming indexer source when the endpoint names an indexer, polling
+otherwise. `ZebraJsonRpcSource::from_node_target` builds the source one
+resolved `NodeTarget` describes, including its indexer endpoint.
 
 Every operation returns Zinder types and `SourceError`. Historical construction
 uses `fetch_chain_segment` with explicit block-count and response-byte limits.
@@ -89,6 +102,37 @@ only as a cross-check, as [Chain ingestion](chain-ingestion.md) describes.
 chain observation. The unit implementation returns
 `TransactionBroadcastDisabled`, so a read-only composition fails explicitly.
 
+## Ordered node list
+
+Every node-reading runtime reads one ordered list of endpoints: `[node]` is
+position 0, and `[node_fallbacks.N]` is position `N`, from 1 without a gap.
+Each fallback table has the fields of `[node]`. Positions are integer table
+keys in TOML and in the environment
+(`ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR`), so a file and the environment
+merge field by field; a TOML array of tables is refused, because the loader
+would replace the whole array as soon as one environment variable named an
+entry. `zinder-ingest`, `zinder-query`, `zinder-compat-lightwalletd`, and
+`zinder-explorer` accept the list, and `--print-config` renders it with
+credentials redacted. Compatibility accepts it only with
+`compat.serving = "wallet"`. `zinder-projector` and compact-blocks
+compatibility reject both `[node]` and the list.
+
+`NodeSet` holds the list and implements `NodeSource` by delegating every call
+to its active endpoint, so code written against one node is unchanged.
+`NodeSet::connect(primary, fallbacks)` builds every endpoint's
+`ZebraJsonRpcSource`. Ingest builds its endpoints this way; the readers still
+build one `ZebraJsonRpcSource` from `[node]`. Only the `NodeSetSwitch` returned
+with the set changes the active endpoint, and `NodeSet::mempool_source` follows
+the active endpoint's mempool: a switch ends the open event stream with one
+`MempoolStreamUnavailable` item, and fails a stream that is still opening with
+the same error, so the consumer rebuilds its snapshot from the new endpoint as
+after any stream failure, even when the previous endpoint stalls.
+
+Only ingest switches, and only between follow iterations; see
+[Chain ingestion §Node endpoint failover](chain-ingestion.md#node-endpoint-failover)
+and [ADR-0013](../adrs/0013-source-failure-recovery-topology.md). The readers
+validate the list and keep reading `[node]`.
+
 ## Implementations and runtime selection
 
 The current implementations are:
@@ -138,11 +182,14 @@ names are:
 
 The Zebra JSON-RPC source derives capabilities from two observations. Methods
 advertised by `rpc.discover` grant the method-backed capabilities. When the
-node advertises `getblockchaininfo`, the probe also reads its `pruned` field
-and grants `historical_block_bodies` only for `pruned: false`. A failed call or
-a response without `pruned` withholds the capability, so an unreported storage
-mode fails closed. Zebra always reports `pruned: false`; Zakura reports `true`
-in pruned storage mode.
+node advertises `getblockchaininfo`, the probe also reads its storage mode
+through `fetch_storage_mode` and grants `historical_block_bodies` only for
+`pruned: false`. A failed call or a response without `pruned` withholds the
+capability, so an unreported storage mode fails closed. Zebra always reports
+`pruned: false`; Zakura reports `true` in pruned storage mode.
+`fetch_storage_mode` itself reports `archive`, `pruned`, or `unreported`, and
+fails when the call fails, so ingest can exclude a fallback endpoint only when
+it reports `pruned: true`.
 
 Ingest validates the capabilities it needs before mutation begins and requires
 `historical_block_bodies`, so it refuses a pruned node at startup with readiness
@@ -205,7 +252,10 @@ process retries or exits.
 
 `NodeAuth` represents valid authentication states: none, cookie file, or basic
 credentials. Invalid combinations are rejected before connection. Secrets are
-redacted from resolved configuration and logs.
+redacted from resolved configuration and logs. An endpoint URL can carry a
+credential too, so `--print-config`, the source's health-probe logs, and
+ingest's startup logs show node URLs with their user information, query, and
+fragment replaced by `[REDACTED]`.
 
 Zebra 7.1.0 and later refuse missing or stale credentials with HTTP 401 and a
 JSON-RPC error body. The source reports the refusal as `NodeUnavailable`,
@@ -221,9 +271,12 @@ waiting for it: each request reads the file first and, until it holds
 credentials, fails with `NodeUnavailable` without reaching the node. A reader
 therefore starts before its node, and its first-contact verification passes
 once the file appears. Ingest's startup capability probe fails on the same
-error, so ingest still exits when it starts without a readable cookie. Empty
-inline cookie credentials and a `node.json_rpc_addr` that is not a usable URL
-come from configuration and still fail at startup.
+error, so ingest still exits when it starts without a readable cookie for
+`[node]`. With `[node_fallbacks.N]`, an endpoint whose cookie file is not
+readable yet fails its startup check as unreachable: ingest starts on the
+first endpoint that passes and checks the waiting one again while it runs.
+Empty inline cookie credentials and a `node.json_rpc_addr` that is not a
+usable URL come from configuration and still fail at startup.
 
 ## Indexer transport security
 

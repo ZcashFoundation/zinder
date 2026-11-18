@@ -307,7 +307,7 @@ lease_duration_seconds = 14400
 }
 
 /// The projector reads the canonical writer's admitted schedule, so it
-/// accepts no node setting from any source.
+/// accepts no node setting, fallback endpoints included, from any source.
 #[test]
 fn node_settings_are_rejected() -> eyre::Result<()> {
     let flag = projector_command()
@@ -330,6 +330,20 @@ fn node_settings_are_rejected() -> eyre::Result<()> {
     assert!(!environment.status.success(), "{environment:?}");
     let stderr = String::from_utf8(environment.stderr)?;
     assert!(stderr.contains("unknown field `node`"), "{stderr}");
+
+    let fallbacks = projector_command()
+        .args(["--print-config", "--network", "zcash-regtest"])
+        .env(
+            "ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR",
+            "http://127.0.0.1:28232",
+        )
+        .output()?;
+    assert!(!fallbacks.status.success(), "{fallbacks:?}");
+    let stderr = String::from_utf8(fallbacks.stderr)?;
+    assert!(
+        stderr.contains("unknown field `node_fallbacks`"),
+        "{stderr}"
+    );
     Ok(())
 }
 

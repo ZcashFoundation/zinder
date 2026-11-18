@@ -112,8 +112,11 @@ impl HistoricalWorkGate {
 /// TOML schema.
 #[derive(Clone, Debug)]
 pub struct IngestRuntimeConfig {
-    /// Resolved upstream node endpoint.
+    /// Resolved upstream node endpoint, position 0 of the ordered node list.
     pub node: NodeTarget,
+    /// Resolved `[node_fallbacks.N]` endpoints, positions 1 and up in order.
+    /// The canonical follower switches to one when the active endpoint fails.
+    pub node_fallbacks: Vec<NodeTarget>,
     /// Upstream node source adapter selector.
     pub node_source: NodeSourceKind,
     /// Local canonical store path.
@@ -138,6 +141,23 @@ pub struct IngestRuntimeConfig {
     pub follow: CanonicalFollowSettings,
     /// One-shot or disposable-store `run_overrides` (`[ingest.run_overrides]`).
     pub run_overrides: CanonicalRunOverrides,
+}
+
+impl IngestRuntimeConfig {
+    /// Longest `request_timeout_secs` of any endpoint in the ordered node
+    /// list.
+    ///
+    /// The canonical writer bounds each node call by it. Every endpoint's
+    /// own client still times out its requests after that endpoint's own
+    /// timeout, so a call to a fallback with a longer timeout than `[node]`
+    /// is not cut short after a switch.
+    #[must_use]
+    pub fn longest_node_request_timeout(&self) -> Duration {
+        self.node_fallbacks
+            .iter()
+            .map(|fallback| fallback.request_timeout)
+            .fold(self.node.request_timeout, Duration::max)
+    }
 }
 
 /// Resolved `[ingest.mempool]` resource limits.

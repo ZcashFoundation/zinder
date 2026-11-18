@@ -12,6 +12,7 @@ mod conventional_fee_distribution_backfill;
 mod materialized_view_replay;
 mod memory_pressure;
 mod mempool;
+mod node_failover;
 mod phase;
 mod runtime_config;
 mod source_recovery;
@@ -45,8 +46,14 @@ pub use memory_pressure::{
 pub use mempool::{
     DEFAULT_RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES, LiveMempoolOwner,
     MempoolApplyOutcome, MempoolEntryBuildError, MempoolIndex, MempoolReadyGate,
-    MempoolReadySignal, MempoolRetentionSettings, MempoolSnapshotPage, build_mempool_entry,
-    mempool_ready_channel, run_live_mempool_owner, run_mempool_retention,
+    MempoolReadySignal, MempoolRetentionSettings, MempoolSnapshotPage, ObservedNodeEndpoint,
+    build_mempool_entry, mempool_ready_channel, run_live_mempool_owner, run_mempool_retention,
+};
+pub use node_failover::{
+    AdmittedEndpoint, EndpointAdmission, EndpointExclusion, FailoverReadiness, IneligibleReason,
+    NoNodeEndpointAdmitted, NodeEndpointAdmissions, NodeEndpointMonitor, NodeEndpointState,
+    NodeEndpointSwitch, NodeFailover, NodeFailoverPolicy, REQUIRED_INGEST_NODE_CAPABILITIES,
+    missing_required_capability, spawn_node_endpoint_monitor,
 };
 pub use phase::classify_phase;
 pub use runtime_config::{
@@ -80,6 +87,7 @@ pub use writer::ingest_control::{
 };
 pub use writer::{
     CanonicalWriterConfig, CanonicalWriterError, admit_canonical_store,
-    follow_admitted_canonical_store, run_canonical_writer, run_canonical_writer_with_control,
+    follow_admitted_canonical_store, read_ready_store_summary, run_canonical_writer,
+    run_canonical_writer_with_control,
 };
 pub use zinder_runtime::container_memory_budget_bytes;

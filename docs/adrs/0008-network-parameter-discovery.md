@@ -38,8 +38,8 @@ The type exposes pure-data queries:
 
 ### Source-of-truth flow
 
-1. `ZebraJsonRpcSource::fetch_network_upgrade_activations()` parses `getblockchaininfo.upgrades` and validates branch-id uniqueness. The map key (hex branch id) becomes `branch_id`; the value's `name` and `activationheight` become `name` and `activation_height`.
-2. `ZebraJsonRpcSource::discover_network_upgrade_activations(target)` wraps the fetch, emits a `network_upgrade_activations_discovered` structured log event keyed by service name, and returns `Arc<NetworkUpgradeActivations>`. The canonical writer calls this one helper, so the discovery event shape stays consistent.
+1. `NodeSource::fetch_network_upgrade_activations()`, as `ZebraJsonRpcSource` implements it, parses `getblockchaininfo.upgrades` and validates branch-id uniqueness. The map key (hex branch id) becomes `branch_id`; the value's `name` and `activationheight` become `name` and `activation_height`.
+2. `zinder_source::discover_network_upgrade_activations(&source, service)` wraps `NodeSource::fetch_network_upgrade_activations`, emits a `network_upgrade_activations_discovered` structured log event keyed by service name, and returns `Arc<NetworkUpgradeActivations>`. The canonical writer calls this one helper, so the discovery event shape stays consistent. With fallback node endpoints, the writer instead takes the table its endpoint admission already read and emits the same event through `zinder_source::record_network_upgrade_activations_discovered`.
 3. The writer admits the discovered table into the canonical store as a schedule revision ([ADR-0039](0039-writer-admitted-network-upgrade-schedules.md)). Readers take the admitted table from the store and call methods on the owned type. No process ever consults `zcash_chain::Network::sapling_activation_height` or any other library-default constant.
 
 Production code does not consult `RegtestParameters::default()` or library-default activation singletons; consumers receive `Arc<NetworkUpgradeActivations>` and call methods on the owned type. The testkit's `regtest_local_network()` is derived from `sample_regtest_upgrade_activations()` so the in-process unit-test fixtures cannot drift from the discovery path; doc comments steer live tests toward `local_network_from_activations(&activations)` and `discover_network_upgrade_activations()`.
@@ -79,8 +79,8 @@ A live test in `crates/zinder-source/tests/live/zebra_json_rpc.rs` calls `fetch_
 - `NetworkUpgradeActivations` (the carrier).
 - `NetworkUpgradeActivation` (one row).
 - `PRE_OVERWINTER_BRANCH_ID = 0` (the wire convention for "no branch active at this height").
-- `ZebraJsonRpcSource::fetch_network_upgrade_activations` (the discovery function).
-- `ZebraJsonRpcSource::discover_network_upgrade_activations(target)` (the shared startup wrapper that returns `Arc<NetworkUpgradeActivations>` and emits a structured discovery log).
+- `NodeSource::fetch_network_upgrade_activations` (the discovery function; `ZebraJsonRpcSource` implements it over `getblockchaininfo`).
+- `zinder_source::discover_network_upgrade_activations(&source, service)` (the shared startup wrapper over `NodeSource::fetch_network_upgrade_activations` that returns `Arc<NetworkUpgradeActivations>` and emits a structured discovery log).
 - `local_network_from_activations` (the testkit bridge to `zcash_protocol::LocalNetwork`).
 
 See [Public interfaces §Core vocabulary](../architecture/public-interfaces.md#core-vocabulary).

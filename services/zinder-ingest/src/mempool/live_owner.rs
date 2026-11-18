@@ -43,7 +43,7 @@ use crate::writer::control::{CanonicalControlHandle, ParkedWriterHalt};
 
 use super::{
     MempoolApplyOutcome, MempoolEntryBuildError, MempoolIndex, MempoolIndexPreflight,
-    MempoolReadySignal, build_mempool_entry,
+    MempoolReadySignal, ObservedNodeEndpoint, build_mempool_entry,
 };
 
 const MEMPOOL_EVENT_PAGE_SIZE: u32 = 64;
@@ -1150,6 +1150,10 @@ async fn consume_source_events(
         let source_event = tokio::select! {
             () = cancel.cancelled() => return MempoolOwnerLoopOutcome::Shutdown,
             _ = canonical_tip_poll.tick(), if pending_source_tip.is_some() => {
+                // Observed before the stream is polled: a switch after this
+                // point either ends the stream below or makes the
+                // certification describe a superseded endpoint.
+                let observed_endpoint = mempool_ready_signal.observe_node_endpoint();
                 if let Some(ready_source_event) = event_stream.next().now_or_never() {
                     let Some(ready_source_event) = ready_source_event else {
                         return rebuild_after_source_closed();
@@ -1166,7 +1170,13 @@ async fn consume_source_events(
                 let Some(source_tip) = pending_source_tip else {
                     continue;
                 };
-                match certify_source_snapshot(canonical, owner, mempool_ready_signal, source_tip).await {
+                match certify_source_snapshot(
+                    canonical,
+                    owner,
+                    mempool_ready_signal,
+                    source_tip,
+                    observed_endpoint,
+                ).await {
                     Ok(SnapshotCertification::PendingCanonicalTip) => continue,
                     Ok(SnapshotCertification::Certified) => {
                         pending_source_tip = None;
@@ -1230,11 +1240,16 @@ async fn handle_source_event(
     }
 }
 
+/// Certifies a complete snapshot once canonical ingest reaches its tip.
+///
+/// `observed_endpoint` is the active node endpoint observed before the owner
+/// last found the snapshot's stream open.
 async fn certify_source_snapshot(
     canonical: &CanonicalControlHandle,
     owner: &LiveMempoolOwner,
     mempool_ready_signal: &MempoolReadySignal,
     source_tip: BlockId,
+    observed_endpoint: ObservedNodeEndpoint,
 ) -> Result<SnapshotCertification, Status> {
     let certification = owner.try_complete_hydration(canonical, source_tip).await?;
     match certification {
@@ -1248,7 +1263,7 @@ async fn certify_source_snapshot(
         }
         SnapshotCertification::GenerationOutran(_) => {}
         SnapshotCertification::Certified => {
-            mempool_ready_signal.certify_source_tip(source_tip);
+            mempool_ready_signal.certify_source_tip(source_tip, observed_endpoint);
             tracing::info!(
                 target: "zinder::ingest",
                 event = "mempool_snapshot_complete",

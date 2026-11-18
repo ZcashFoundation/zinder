@@ -313,6 +313,8 @@ struct ReadinessResponseBody {
     // `"cause":` key of the body reads the runtime's own cause.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     degraded: Vec<crate::ReadinessDependency>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_node: Option<crate::ActiveNodeEndpoint>,
 }
 
 fn readyz_handler(readiness: &Readiness) -> (StatusCode, Json<ReadinessResponseBody>) {
@@ -335,6 +337,7 @@ fn readyz_handler(readiness: &Readiness) -> (StatusCode, Json<ReadinessResponseB
         materialized_view_identities: report.materialized_view_identities,
         served_epoch_age_seconds: report.served_epoch_age_seconds,
         degraded: report.degraded,
+        active_node: report.active_node,
     };
 
     (status_code, Json(body))
@@ -486,8 +489,26 @@ fn u64_to_f64(sample: u64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{OpsEndpointHandle, OpsServerError};
+    use super::{OpsEndpointHandle, OpsServerError, readyz_handler};
+    use crate::{ActiveNodeEndpoint, Readiness, ReadinessState};
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn readyz_names_the_active_node_only_once_it_is_set() -> Result<(), serde_json::Error> {
+        let readiness = Readiness::new(ReadinessState::ready(Some(7)));
+        let (_, single_endpoint) = readyz_handler(&readiness);
+        let single_endpoint = serde_json::to_value(&single_endpoint.0)?;
+        assert!(single_endpoint.get("active_node").is_none());
+
+        readiness.set_active_node(Some(ActiveNodeEndpoint { position: 1 }));
+        let (_, with_fallbacks) = readyz_handler(&readiness);
+        let with_fallbacks = serde_json::to_value(&with_fallbacks.0)?;
+        assert_eq!(
+            with_fallbacks["active_node"],
+            serde_json::json!({ "position": 1 })
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn wait_surfaces_unexpected_server_exit() -> Result<(), Box<dyn std::error::Error>> {

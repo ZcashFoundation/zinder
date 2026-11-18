@@ -6,7 +6,7 @@ use rust_rocksdb::{
     Options, WriteBatch, WriteOptions, checkpoint::Checkpoint,
 };
 use zinder_core::{
-    CanonicalHistoryBounds, Network, NetworkUpgradeActivations,
+    BlockId, CanonicalHistoryBounds, Network, NetworkUpgradeActivations,
     NetworkUpgradeActivationsFingerprint, NetworkUpgradeActivationsFingerprintVersion,
 };
 
@@ -36,9 +36,53 @@ use super::{
         MEMPOOL_EVENT_RETENTION_FLOOR_KEY, MEMPOOL_EVENT_SEQUENCE_KEY,
         MempoolEventRetentionProgress, validate_mempool_lifecycle_admission,
     },
-    publication::validate_ready_publication,
+    publication::{read_chain_epoch_tips, validate_ready_publication},
     replay_tail::AuthenticatedReplayTail,
 };
+
+/// What a READY canonical store records that a writer checks node endpoints
+/// against before it opens the store.
+///
+/// Read with [`RocksDbCanonicalStore::read_ready_summary`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalReadyStoreSummary {
+    admitted_activations: Option<NetworkUpgradeActivations>,
+    construction_activations_fingerprint: NetworkUpgradeActivationsFingerprint,
+    visible_tip: BlockId,
+    settled_tip: BlockId,
+}
+
+impl CanonicalReadyStoreSummary {
+    /// Returns the visible tip of the store's READY fence.
+    #[must_use]
+    pub const fn visible_tip(&self) -> BlockId {
+        self.visible_tip
+    }
+
+    /// Returns the settled tip of the visible chain epoch, below which a
+    /// reorg is beyond the store's window.
+    #[must_use]
+    pub const fn settled_tip(&self) -> BlockId {
+        self.settled_tip
+    }
+
+    /// Returns whether `activations` is exactly the table the store follows:
+    /// its latest writer-admitted schedule revision or, before the first
+    /// revision, the table it was constructed with.
+    ///
+    /// Any other table, including the construction table with entries
+    /// appended, would make the writer admit a new revision.
+    #[must_use]
+    pub fn follows_activations(&self, activations: &NetworkUpgradeActivations) -> bool {
+        self.admitted_activations.as_ref().map_or_else(
+            || {
+                activations.fingerprint(self.construction_activations_fingerprint.version())
+                    == self.construction_activations_fingerprint
+            },
+            |admitted| admitted == activations,
+        )
+    }
+}
 
 /// Cold-admitted identity and READY evidence for an owner-created canonical checkpoint.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -783,6 +827,61 @@ impl RocksDbCanonicalStore {
         read_construction_manifest_binding(path.as_ref())
     }
 
+    /// Reads what a canonical writer checks node endpoints against before it
+    /// opens the store, without opening a `RocksDB` primary.
+    ///
+    /// Returns `None` when no store exists at `path` or the store is still
+    /// being built.
+    pub fn read_ready_summary(
+        path: impl AsRef<Path>,
+    ) -> Result<Option<CanonicalReadyStoreSummary>, CanonicalStoreError> {
+        let path = path.as_ref();
+        let exists = path.try_exists().map_err(|error| {
+            CanonicalStoreError::admission(path, format!("store path check failed: {error}"))
+        })?;
+        if !exists {
+            return Ok(None);
+        }
+        let column_families = DB::list_cf(&Options::default(), path).map_err(|source| {
+            CanonicalStoreError::admission(
+                path,
+                format!("column-family discovery failed: {source}"),
+            )
+        })?;
+        validate_exact_column_families(path, &column_families)?;
+        let db = DB::open_cf_for_read_only(&Options::default(), path, &column_families, false)
+            .map_err(|source| {
+                CanonicalStoreError::admission(path, format!("read-only open failed: {source}"))
+            })?;
+        let encoded_control = db
+            .get(STORE_CONTROL_KEY)
+            .map_err(|source| CanonicalStoreError::RocksDbOperation {
+                operation: "store control read",
+                source,
+            })?
+            .ok_or_else(|| CanonicalStoreError::admission(path, "store identity is absent"))?;
+        let control = decode_store_control(path, &encoded_control)?;
+        let CanonicalStoreBuildState::Ready(ready_evidence) = control.build_state else {
+            return Ok(None);
+        };
+        let (visible_tip, settled_tip) = read_chain_epoch_tips(&db, ready_evidence.visible_epoch)?;
+        if visible_tip != ready_evidence.visible_tip {
+            return Err(CanonicalStoreError::admission(
+                path,
+                "visible chain epoch does not match the READY fence",
+            ));
+        }
+        Ok(Some(CanonicalReadyStoreSummary {
+            admitted_activations: read_admitted_schedule(&db, path, &control)?
+                .map(|schedule| schedule.activations().clone()),
+            construction_activations_fingerprint: control
+                .build_plan
+                .network_upgrade_activations_fingerprint(),
+            visible_tip,
+            settled_tip,
+        }))
+    }
+
     /// Returns the immutable network persisted by the store control record.
     #[must_use]
     pub const fn network(&self) -> Network {
@@ -1350,6 +1449,7 @@ mod tests {
         .err()
         .ok_or("a BUILDING store must not be servable")?;
         assert!(matches!(error, CanonicalStoreError::StoreNotReady { .. }));
+        assert_eq!(RocksDbCanonicalStore::read_ready_summary(&path)?, None);
 
         let control_before = read_control(&path)?;
         let mainnet_activations =

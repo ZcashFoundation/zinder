@@ -231,6 +231,16 @@ failed probe keeps the last observation. The follower cannot clear the probe's
 `upstream_not_ready`, so ingest stays unready until the probe observes a ready
 Zebra. Without a health endpoint, ingest has no node-source input.
 
+With `[node_fallbacks.N]` endpoints, the probe observes whichever endpoint is
+active. A switch resets the node-source input to `starting`, abandons a probe
+of the previous endpoint still in flight, and probes the new endpoint at once.
+A probe publishes only while the endpoint it probed is still active, so the
+previous endpoint's observation never stands for the new one. Without `[node.health]`, the standby monitor still tracks each
+endpoint's health for the failover, but nothing publishes a node-source input.
+`/readyz` and the ops `ReadinessReport` then also carry
+`active_node: { "position": N }`, 0 for `[node]` and `N` for
+`[node_fallbacks.N]`; the field is absent when no fallback is configured.
+
 On `/readyz`, a refusing admission state, such as `syncing` or
 `node_unavailable`, takes precedence over the probe. `IngestControl.WriterStatus`
 reports the probe's latest observation independently of the admission state:
@@ -583,6 +593,22 @@ warning are the lasting record.
 
 The last two counters in the list are expected to remain zero and protect the
 canonical block-local boundary.
+
+With `[node_fallbacks.N]` endpoints, ingest also exports, labeled by endpoint
+position:
+
+- `zinder_ingest_node_endpoint_active{position}`: 1 for the endpoint ingest
+  reads from, 0 for the others.
+- `zinder_ingest_node_endpoint_state{position,state}`: one-hot over `active`,
+  `pending`, `standby`, `standby_diverged`, `ineligible`, `unreachable`, and
+  `excluded`.
+- `zinder_ingest_node_endpoint_switches_total{from_position,to_position,failure_class}`:
+  completed switches, where `failure_class` is `node_unreachable`,
+  `stream_disconnected`, or `upstream_not_ready`.
+
+An alert on `zinder_ingest_node_endpoint_active{position="0"} == 0` tells an
+operator that ingest runs on a fallback, which it keeps doing until the
+fallback fails or ingest restarts.
 
 ### Explorer view replay
 
@@ -1049,6 +1075,22 @@ events include:
 - `canonical_unpublished_construction_restarted`
 - `canonical_live_append_committed`
 - `canonical_live_replacement_committed`
+
+With fallback node endpoints, ingest also logs `node_endpoint_admitted`,
+`node_endpoint_unreachable`, `node_endpoint_excluded`, `node_endpoint_skipped`,
+and `node_endpoint_deferred` at startup; `node_endpoint_state_changed` and
+`node_endpoint_skipped`, with a `reason`, as standby evaluation changes;
+`node_endpoint_switched` with `from_position`, `to_position`, and
+`failure_class`; and `node_endpoint_switch_unavailable` when a trigger finds no
+endpoint that can take over. That last event repeats at most once per standby
+evaluation the monitor records, not on every follow iteration. At startup,
+`mempool_source_selected` reports each endpoint's `position` and mempool
+`backend`, `streaming` or `polling`. These events name endpoints by position,
+never by URL, because an address can embed credentials. Events that do carry
+an endpoint URL, such as `canonical_writer_started`,
+`upstream_health_probe_started`, and `upstream_health_endpoint_unreachable`,
+replace its user information, query, and fragment with `[REDACTED]`, as
+`--print-config` does.
 
 Explorer view replay logs `materialized_view_replay_volume_space_low` once
 when the free-space guard pauses replay and

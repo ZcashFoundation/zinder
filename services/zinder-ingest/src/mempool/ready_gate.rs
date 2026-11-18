@@ -19,6 +19,12 @@
 //! generation can serve: before the first snapshot completes, and while the
 //! index is rebuilt after a source failure.
 //!
+//! With fallback node endpoints, each certification also records the active
+//! endpoint the owner observed before it last found its source stream open.
+//! The gate admits a certification only while that endpoint is still active,
+//! so a switch stops admitting the previous endpoint's mempool at once, even
+//! when the owner certifies a snapshot from it after the switch.
+//!
 //! The same pair carries the opposite signal when the canonical writer parks
 //! on a reorg deeper than its window: the follower halts the owner, which
 //! stops consuming the node mempool for the rest of the process.
@@ -46,10 +52,40 @@ use crate::writer::control::ParkedWriterHalt;
 /// take one poll interval plus a full mempool hydration.
 pub(crate) const MEMPOOL_TIP_TRANSITION_GRACE: Duration = Duration::from_secs(30);
 
+/// The serving generation's certification.
+#[derive(Clone, Debug)]
+struct SourceCertification {
+    source_tip: BlockId,
+    endpoint: ObservedNodeEndpoint,
+}
+
+/// The active node endpoint as the mempool owner observed it.
+///
+/// Take it with [`MempoolReadySignal::observe_node_endpoint`] before checking
+/// that the source stream is still open, and certify with it. A stream ends
+/// when the endpoint it reads from stops being active, so a certification
+/// whose observed endpoint is still active describes that endpoint's mempool.
+#[derive(Clone, Debug)]
+pub struct ObservedNodeEndpoint {
+    /// The active-endpoint channel, marked seen at the observation. `None`
+    /// without fallback endpoints, where the endpoint never changes.
+    switches: Option<watch::Receiver<usize>>,
+}
+
+impl ObservedNodeEndpoint {
+    /// Returns whether no switch happened since the observation. A closed
+    /// switch channel fails closed.
+    fn is_active(&self) -> bool {
+        self.switches
+            .as_ref()
+            .is_none_or(|switches| matches!(switches.has_changed(), Ok(false)))
+    }
+}
+
 /// Read-side handle observed by the tip-follow state machine.
 #[derive(Clone, Debug)]
 pub struct MempoolReadyGate {
-    certified_source_tip: watch::Receiver<Option<BlockId>>,
+    certified_source_tip: watch::Receiver<Option<SourceCertification>>,
     writer_halt: watch::Sender<Option<ParkedWriterHalt>>,
     /// When the certified source tip and the canonical tip began to disagree.
     tip_disagreement_since: Arc<Mutex<Option<Instant>>>,
@@ -57,18 +93,21 @@ pub struct MempoolReadyGate {
 
 impl MempoolReadyGate {
     /// Returns the current source generation's certified tip while its owner
-    /// is still running.
+    /// is still running and the node endpoint it certified from is active.
     ///
     /// A closed channel fails closed even though `tokio::sync::watch` retains
     /// its last value. Otherwise an owner that exits after publishing `true`
     /// could leave ingest readiness permanently admitted.
     #[must_use]
     pub fn certified_source_tip(&self) -> Option<BlockId> {
+        if self.certified_source_tip.has_changed().is_err() {
+            return None;
+        }
         self.certified_source_tip
-            .has_changed()
-            .is_ok()
-            .then(|| *self.certified_source_tip.borrow())
-            .flatten()
+            .borrow()
+            .as_ref()
+            .filter(|certification| certification.endpoint.is_active())
+            .map(|certification| certification.source_tip)
     }
 
     /// Returns whether the serving source generation admits the supplied
@@ -124,23 +163,54 @@ impl MempoolReadyGate {
 /// cheap; every clone shares the same hydration state.
 #[derive(Clone, Debug)]
 pub struct MempoolReadySignal {
-    certified_source_tip: watch::Sender<Option<BlockId>>,
+    certified_source_tip: watch::Sender<Option<SourceCertification>>,
     writer_halt: watch::Receiver<Option<ParkedWriterHalt>>,
+    endpoint_switches: Option<watch::Receiver<usize>>,
 }
 
 impl MempoolReadySignal {
+    /// Binds certifications to the active node endpoint, which
+    /// `endpoint_switches` reports, so the gate stops admitting one once the
+    /// endpoint it was made from is no longer active.
+    #[must_use]
+    pub fn following_node_endpoints(mut self, endpoint_switches: watch::Receiver<usize>) -> Self {
+        self.endpoint_switches = Some(endpoint_switches);
+        self
+    }
+
+    /// Observes the active node endpoint for a later certification.
+    #[must_use]
+    pub fn observe_node_endpoint(&self) -> ObservedNodeEndpoint {
+        ObservedNodeEndpoint {
+            switches: self.endpoint_switches.clone().map(|mut switches| {
+                switches.mark_unchanged();
+                switches
+            }),
+        }
+    }
+
     /// Marks the serving source generation as hydrated and certified against
-    /// `source_tip`.
-    pub fn certify_source_tip(&self, source_tip: BlockId) {
+    /// `source_tip`, from the mempool of the `observed` endpoint.
+    pub fn certify_source_tip(&self, source_tip: BlockId, observed: ObservedNodeEndpoint) {
         // `send_replace` ignores the "no receivers" condition that `send`
         // returns, so optional readiness wiring does not make source
         // ownership fail.
-        let _ = self.certified_source_tip.send_replace(Some(source_tip));
+        let _ = self
+            .certified_source_tip
+            .send_replace(Some(SourceCertification {
+                source_tip,
+                endpoint: observed,
+            }));
     }
 
     /// Withdraws the gate while no source generation can serve.
+    ///
+    /// Withdrawing a certification that is already withdrawn does not wake
+    /// the gate: a source that keeps failing to reconnect must not keep
+    /// cancelling the canonical follower's in-flight node requests.
     pub fn withdraw_certification(&self) {
-        let _ = self.certified_source_tip.send_replace(None);
+        self.certified_source_tip
+            .send_if_modified(|certified_source_tip| certified_source_tip.take().is_some());
     }
 
     /// Resolves once the canonical writer parks and halts the owner.
@@ -169,6 +239,7 @@ pub fn mempool_ready_channel() -> (MempoolReadySignal, MempoolReadyGate) {
         MempoolReadySignal {
             certified_source_tip: tx,
             writer_halt: halt_rx,
+            endpoint_switches: None,
         },
         MempoolReadyGate {
             certified_source_tip: rx,
@@ -187,6 +258,7 @@ mod tests {
 
     use std::time::{Duration, Instant};
 
+    use tokio::sync::watch;
     use zinder_core::{BlockHash, BlockHeight, BlockId};
 
     use super::{MEMPOOL_TIP_TRANSITION_GRACE, mempool_ready_channel};
@@ -209,7 +281,7 @@ mod tests {
     fn certifying_a_source_tip_admits_that_exact_tip() {
         let (signal, gate) = mempool_ready_channel();
         let certified_tip = source_tip(1);
-        signal.certify_source_tip(certified_tip);
+        signal.certify_source_tip(certified_tip, signal.observe_node_endpoint());
         assert!(gate.admits_canonical_tip(certified_tip));
     }
 
@@ -217,8 +289,8 @@ mod tests {
     fn certifying_the_same_source_tip_is_idempotent() {
         let (signal, gate) = mempool_ready_channel();
         let certified_tip = source_tip(1);
-        signal.certify_source_tip(certified_tip);
-        signal.certify_source_tip(certified_tip);
+        signal.certify_source_tip(certified_tip, signal.observe_node_endpoint());
+        signal.certify_source_tip(certified_tip, signal.observe_node_endpoint());
         assert!(gate.admits_canonical_tip(certified_tip));
     }
 
@@ -226,15 +298,37 @@ mod tests {
     fn withdrawing_certification_revokes_a_previously_admitted_tip() {
         let (signal, gate) = mempool_ready_channel();
         let certified_tip = source_tip(1);
-        signal.certify_source_tip(certified_tip);
+        signal.certify_source_tip(certified_tip, signal.observe_node_endpoint());
         signal.withdraw_certification();
         assert!(!gate.admits_canonical_tip(certified_tip));
+    }
+
+    /// A snapshot the owner reconciled from the previous endpoint and
+    /// certified after a switch never admits a tip; one observed after the
+    /// switch does.
+    #[test]
+    fn a_certification_observed_before_a_switch_admits_no_tip_after_it() {
+        let (active_endpoint, endpoint_switches) = watch::channel(0_usize);
+        let (signal, gate) = mempool_ready_channel();
+        let signal = signal.following_node_endpoints(endpoint_switches);
+        let certified_tip = source_tip(1);
+        signal.certify_source_tip(certified_tip, signal.observe_node_endpoint());
+        assert!(gate.admits_canonical_tip(certified_tip));
+        let before_switch = signal.observe_node_endpoint();
+
+        active_endpoint.send_replace(1);
+
+        assert_eq!(gate.certified_source_tip(), None);
+        signal.certify_source_tip(certified_tip, before_switch);
+        assert!(!gate.admits_canonical_tip(certified_tip));
+        signal.certify_source_tip(certified_tip, signal.observe_node_endpoint());
+        assert!(gate.admits_canonical_tip(certified_tip));
     }
 
     #[test]
     fn a_previous_tip_stays_admitted_only_during_the_transition_grace() {
         let (signal, gate) = mempool_ready_channel();
-        signal.certify_source_tip(source_tip(1));
+        signal.certify_source_tip(source_tip(1), signal.observe_node_endpoint());
         let started_at = Instant::now();
 
         assert!(gate.admits_canonical_tip_at(source_tip(2), started_at));
@@ -247,7 +341,7 @@ mod tests {
             "a later block must not restart the grace while the tips still disagree"
         );
 
-        signal.certify_source_tip(source_tip(3));
+        signal.certify_source_tip(source_tip(3), signal.observe_node_endpoint());
         let recertified_at = started_at + MEMPOOL_TIP_TRANSITION_GRACE;
         assert!(gate.admits_canonical_tip_at(source_tip(3), recertified_at));
         assert!(
@@ -259,7 +353,7 @@ mod tests {
     #[test]
     fn a_withdrawn_generation_admits_no_tip_during_the_grace() {
         let (signal, gate) = mempool_ready_channel();
-        signal.certify_source_tip(source_tip(1));
+        signal.certify_source_tip(source_tip(1), signal.observe_node_endpoint());
         let started_at = Instant::now();
         assert!(gate.admits_canonical_tip_at(source_tip(2), started_at));
 
@@ -297,7 +391,7 @@ mod tests {
     fn dropping_the_signal_withdraws_a_previously_ready_gate() {
         let (signal, gate) = mempool_ready_channel();
         let certified_tip = source_tip(1);
-        signal.certify_source_tip(certified_tip);
+        signal.certify_source_tip(certified_tip, signal.observe_node_endpoint());
         assert!(gate.admits_canonical_tip(certified_tip));
 
         drop(signal);

@@ -1,0 +1,69 @@
+# Optional fallback node endpoint for the single-host wallet-serving topology.
+#
+# Merge this overlay to give the topology a second node, such as a Zakura node
+# beside a Zebra node on the same network:
+#
+#   docker compose \
+#     --env-file /etc/zinder/env \
+#     -f deploy/docker-compose.yml \
+#     -f deploy/docker-compose.node-fallback.yml \
+#     up -d
+#
+# The env file names the fallback node the same way it names [node]:
+#
+#   ZINDER_FALLBACK_SOURCE_NETWORK_NAME          the fallback node's Docker network
+#   ZINDER_FALLBACK_SOURCE_COOKIE_VOLUME_NAME    the fallback node's cookie volume
+#   ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR      its JSON-RPC URL
+#   ZINDER_NODE_FALLBACKS__1__INDEXER_GRPC_ADDR  its indexer gRPC URL, or empty
+#                                                to poll its mempool
+#
+# [node] stays position 0 and this node is position 1. zinder-ingest switches
+# to it when [node] stops answering or stays unsynchronized, and switches back
+# only when position 1 fails in turn or ingest restarts. zinder-query and
+# zinder-compat-lightwalletd read the same list. Run node-cookie-permissions.yml
+# for the fallback cookie volume too, as its own project:
+#
+#   ZINDER_SOURCE_COOKIE_VOLUME_NAME="$ZINDER_FALLBACK_SOURCE_COOKIE_VOLUME_NAME" \
+#     docker compose -p zinder-mainnet-fallback-node-cookie \
+#     --env-file /etc/zinder/env -f deploy/node-cookie-permissions.yml up -d
+#
+# See "Fail over to a second node" in docs/runbooks/deploying-on-a-vm.md.
+
+x-fallback-node-environment: &fallback-node-environment
+  ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR: ${ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR:?set the fallback node JSON-RPC URL}
+  ZINDER_NODE_FALLBACKS__1__AUTH__METHOD: cookie
+  ZINDER_NODE_FALLBACKS__1__AUTH__PATH: /var/run/auth-fallback/.cookie
+  ZINDER_NODE_FALLBACKS__1__REQUEST_TIMEOUT_SECS: ${ZINDER_NODE_FALLBACKS__1__REQUEST_TIMEOUT_SECS:-30}
+
+services:
+  zinder-ingest:
+    networks:
+      node-fallback:
+    volumes:
+      - node-fallback-cookie:/var/run/auth-fallback:ro
+    environment:
+      <<: *fallback-node-environment
+      # Empty selects JSON-RPC mempool polling after a switch, as for [node].
+      ZINDER_NODE_FALLBACKS__1__INDEXER_GRPC_ADDR: ${ZINDER_NODE_FALLBACKS__1__INDEXER_GRPC_ADDR-}
+
+  zinder-query:
+    volumes:
+      - node-fallback-cookie:/var/run/auth-fallback:ro
+    environment:
+      <<: *fallback-node-environment
+
+  zinder-compat-lightwalletd:
+    volumes:
+      - node-fallback-cookie:/var/run/auth-fallback:ro
+    environment:
+      <<: *fallback-node-environment
+
+networks:
+  node-fallback:
+    external: true
+    name: ${ZINDER_FALLBACK_SOURCE_NETWORK_NAME:?set the fallback node's external Docker network name}
+
+volumes:
+  node-fallback-cookie:
+    external: true
+    name: ${ZINDER_FALLBACK_SOURCE_COOKIE_VOLUME_NAME:?set the fallback node's external cookie volume name}

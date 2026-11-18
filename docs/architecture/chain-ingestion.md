@@ -10,6 +10,7 @@ control APIs used by projectors and trusted readers.
 ```text
 load and validate configuration
   -> connect to Zebra and discover capabilities
+     (with [node_fallbacks.N], admit every endpoint and start on the first admitted one)
   -> discover network-upgrade activations
   -> open a ready canonical store
      or recover a published staging store
@@ -208,6 +209,84 @@ has completed its current source snapshot. Source failures move readiness to
 resume from the current fence. Storage corruption, schema mismatch, invalid
 reorg depth, and internal invariant failures terminate the writer.
 
+### Node endpoint failover
+
+With `[node_fallbacks.N]` endpoints configured, ingest reads through the active
+endpoint of the ordered node list ([Node source boundary §Ordered node
+list](node-source-boundary.md#ordered-node-list)). The rules are recorded in
+[ADR-0013](../adrs/0013-source-failure-recovery-topology.md) Decision 8.
+
+At startup, every endpoint is checked concurrently: required capabilities,
+activation table, and genesis block. The first admitted endpoint in position
+order becomes active as soon as every lower position has a verdict, and its
+table is the one the store admits. Startup does not wait for higher positions:
+an endpoint still being checked then is deferred (`node_endpoint_deferred`) to
+the standby monitor, so a fallback that does not answer never delays a healthy
+`[node]`. An endpoint that reports pruned storage, lacks a required capability,
+answers for another network, or advertises another activation table is
+excluded until restart (`node_endpoint_excluded`). A fallback that would
+become active with a table other than the one the store follows, its latest
+admitted revision or, before the first, its construction table, is excluded
+the same way, so only `[node]` can bring a new table; the comparison
+waits until every lower position has a verdict, so a fallback that already
+advertises the table `[node]` brings stays a standby. An endpoint that times out,
+fails a call, or does not report its storage mode is unreachable
+(`node_endpoint_unreachable`) and is evaluated again. With a READY store, a
+fallback must also qualify as a switch target would: report ready, have a tip
+at or above the store's visible tip, and hold the visible tip or the settled
+tip. Otherwise it is skipped (`node_endpoint_skipped`) and evaluated again, so
+startup never follows a chain that differs at or below the settled tip. When no endpoint is
+admitted, startup fails with the readiness `[node]` alone would have reported.
+A single-endpoint deployment keeps its startup checks unchanged and runs no
+genesis check.
+
+While ingest follows, a standby monitor polls every endpoint on the
+`[node.health]` cadence, 30 seconds by default. Each endpoint's evaluation is
+bounded by that cadence, or by 5 seconds when the cadence is shorter, and is
+recorded as soon as it completes, so an active endpoint that hangs never delays
+the evidence about the others. The monitor records whether the active endpoint
+reports ready, and whether each other endpoint could take over: it must report
+ready, advertise the required capabilities and the admitted table, hold the
+configured network's genesis block, and have a tip at or above the visible tip. It is a standby when it holds the
+visible tip, and a diverged standby when it holds only the settled tip. Until
+the follower publishes its first fence, a candidate that passes the other
+checks stays pending, and the monitor evaluates again as soon as that fence
+appears rather than one cadence later. Shutdown stops the monitor at once,
+even during an evaluation that waits on an endpoint that does not answer. The
+follower switches between iterations after three consecutive
+`node_unreachable` or `stream_disconnected` recoveries, or once the active
+endpoint has reported not ready for 300 seconds. It tries standbys in position
+order, then diverged standbys, rechecking only that each candidate still
+reports ready, its tip, and the block it holds at the visible or settled tip.
+Every candidate is rechecked at once within one five-second bound for the
+whole attempt, and the follower switches to the first one in that order that
+passes and logs
+`node_endpoint_switched`. A diverged standby's suffix above the settled tip is
+replaced within the reorg window as any reorg is. When no endpoint qualifies,
+the follower stays on its endpoint and recovers as before, and it attempts the
+switch again only after the monitor records another evaluation, so a follower
+waiting at its tip does not repeat the attempt on every iteration.
+
+A switch to a standby keeps the visible tip confirmed, because the final check
+found that block on the new endpoint, so wallet-serving readers keep serving
+even when the new endpoint's first iteration fails. A switch to a diverged
+standby resets tip confirmation until the replacement commits, so readers see
+`tip_unconfirmed` meanwhile. Either switch skips the recovery backoff, stops
+admitting the mempool certification made from the previous endpoint, and ends
+the live mempool stream, so the owner rebuilds from the new endpoint. Each
+certification records the active endpoint the owner observed before it last
+found its source stream open, and the gate admits it only while that endpoint
+is still active. Ingest readiness therefore stays withdrawn until the owner
+certifies a snapshot from the new endpoint, even when the owner is still busy
+with the previous endpoint or finishes certifying one of its snapshots after
+the switch.
+Each endpoint's client applies that endpoint's own `request_timeout_secs`, and
+the writer bounds every node call by the longest timeout in the list, so a call
+to a fallback slower than `[node]` is not cut short after a switch.
+There is no timed failback. The next switch walks positions from 0 again, and a
+restart starts at position 0. Fresh construction does not switch: a node
+failure there exits, and the restart admits the first reachable endpoint.
+
 ## Canonical events and retention
 
 Every visible append or replacement publishes an authenticated retained event
@@ -237,7 +316,8 @@ reader a canonical write handle.
 
 The release writer uses these sections:
 
-- `[network]` and `[node]` select and authenticate the upstream source;
+- `[network]` and `[node]` select and authenticate the upstream source, and
+  optional `[node_fallbacks.N]` tables add fallback endpoints;
 - `[storage]` selects the canonical path, immutable raw-blob retention, and
   RocksDB resource budget;
 - `[ingest.construction]` bounds fresh construction;

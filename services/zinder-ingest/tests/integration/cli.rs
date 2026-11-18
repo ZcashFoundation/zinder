@@ -846,6 +846,121 @@ fn print_config_redacts_inline_cookie_supplied_through_environment() -> Result<(
     Ok(())
 }
 
+/// A fallback endpoint's file fields and environment fields merge.
+///
+/// The file declares the endpoint and the environment injects its password,
+/// the usual secret pattern. The rendered tables keep position order with the
+/// password redacted.
+#[test]
+fn fallback_endpoints_merge_file_and_environment_fields() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("fallback-merge-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "{}\n[node_fallbacks.1]\njson_rpc_addr = \"http://zakura:39232\"\n\n[node_fallbacks.1.auth]\nmethod = \"basic\"\nusername = \"zakura\"\n",
+            ingest_config_toml(&storage_path)?
+        ),
+    )?;
+
+    let output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .env(
+            "ZINDER_NODE_FALLBACKS__1__AUTH__PASSWORD",
+            "fallback-secret",
+        )
+        .env(
+            "ZINDER_NODE_FALLBACKS__2__JSON_RPC_ADDR",
+            "http://zebra-b:18232",
+        )
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(!stdout.contains("fallback-secret"), "{stdout}");
+    let first = stdout
+        .find("[node_fallbacks.1]")
+        .ok_or("fallback 1 is rendered")?;
+    let first_auth = stdout
+        .find("[node_fallbacks.1.auth]")
+        .ok_or("fallback 1 auth is rendered")?;
+    let second = stdout
+        .find("[node_fallbacks.2]")
+        .ok_or("fallback 2 is rendered")?;
+    assert!(first < first_auth && first_auth < second, "{stdout}");
+    assert!(stdout.contains("json_rpc_addr = \"http://zakura:39232\""));
+    assert!(stdout.contains("json_rpc_addr = \"http://zebra-b:18232\""));
+    assert!(stdout[first_auth..second].contains("password = \"[REDACTED]\""));
+
+    let rendered_path = tempdir.path().join("rendered.toml");
+    fs::write(&rendered_path, &stdout)?;
+    let round_trip = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&rendered_path)?])
+        .env(
+            "ZINDER_NODE_FALLBACKS__1__AUTH__PASSWORD",
+            "fallback-secret",
+        )
+        .env("ZINDER_NODE__AUTH__PASSWORD", "file-secret")
+        .output()?;
+    assert!(round_trip.status.success(), "{round_trip:?}");
+    assert_eq!(String::from_utf8(round_trip.stdout)?, stdout);
+    Ok(())
+}
+
+#[test]
+fn single_endpoint_print_config_has_no_fallback_tables() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("single-endpoint-store");
+    let config_path = tempdir.path().join("zinder-ingest.toml");
+    fs::write(&config_path, ingest_config_toml(&storage_path)?)?;
+
+    let output = zinder_ingest_command()
+        .args(["--print-config", "--config", path_str(&config_path)?])
+        .output()?;
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(!String::from_utf8(output.stdout)?.contains("node_fallbacks"));
+    Ok(())
+}
+
+#[test]
+fn fallback_endpoints_refuse_arrays_gaps_and_non_positions() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempdir()?;
+    let storage_path = tempdir.path().join("fallback-refusal-store");
+    let base = ingest_config_toml(&storage_path)?;
+    for (tables, expected) in [
+        (
+            "[[node_fallbacks]]\njson_rpc_addr = \"http://zakura:39232\"\n",
+            "array of tables is not accepted",
+        ),
+        (
+            "[node_fallbacks.2]\njson_rpc_addr = \"http://zakura:39232\"\n",
+            "[node_fallbacks.1] is missing",
+        ),
+        (
+            "[node_fallbacks.zakura]\njson_rpc_addr = \"http://zakura:39232\"\n",
+            "expected a position key",
+        ),
+        (
+            "[node_fallbacks.1]\nrequest_timeout_secs = 5\n",
+            "[node_fallbacks.1]",
+        ),
+    ] {
+        let config_path = tempdir.path().join("zinder-ingest.toml");
+        fs::write(&config_path, format!("{base}\n{tables}"))?;
+
+        let output = zinder_ingest_command()
+            .args(["--print-config", "--config", path_str(&config_path)?])
+            .output()?;
+
+        assert!(!output.status.success(), "{tables}: {output:?}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(stderr.contains(expected), "{tables}: {stderr}");
+    }
+    Ok(())
+}
+
 #[test]
 fn zero_source_segment_max_blocks_fails_before_storage_creation() -> Result<(), Box<dyn Error>> {
     assert_ingest_cli_rejects(

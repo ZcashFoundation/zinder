@@ -27,7 +27,7 @@
 //! from the running node instead, via
 //! [`crate::network_upgrade_fixtures::local_network_from_activations`]
 //! applied to a
-//! `ZebraJsonRpcSource::fetch_network_upgrade_activations()` result.
+//! `NodeSource::fetch_network_upgrade_activations()` result.
 //! Mismatched activation heights produce an `incorrect consensus branch id`
 //! rejection from Zebra's mempool.
 

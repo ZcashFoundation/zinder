@@ -337,9 +337,8 @@ async fn run_capture_tip_replay_checkpoints(
             broadcast_timeout: None,
         },
     )?;
-    let activations = source
-        .discover_network_upgrade_activations("zinder-bench")
-        .await?;
+    let activations =
+        zinder_source::discover_network_upgrade_activations(&source, "zinder-bench").await?;
     let checkpoints =
         capture_tip_replay_checkpoints(&args.fixture, &source, &activations, fetch_concurrency)
             .await?;
@@ -376,9 +375,8 @@ async fn run_capture_canonical_fixture_checkpoints(
             broadcast_timeout: None,
         },
     )?;
-    let activations = source
-        .discover_network_upgrade_activations("zinder-bench")
-        .await?;
+    let activations =
+        zinder_source::discover_network_upgrade_activations(&source, "zinder-bench").await?;
     let replay_plan =
         capture_canonical_fixture_replay_plan(&args.fixture, &source, &activations).await?;
     tracing::info!(

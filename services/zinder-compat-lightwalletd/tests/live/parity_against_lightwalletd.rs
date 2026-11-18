@@ -54,7 +54,7 @@ use zinder_proto::compat::lightwalletd::{
     self, BlockId, BlockRange, ChainSpec, Empty, TxFilter,
     compact_tx_streamer_client::CompactTxStreamerClient,
 };
-use zinder_source::{ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
+use zinder_source::{NodeSource as _, ZebraJsonRpcSource, ZebraJsonRpcSourceOptions};
 use zinder_testkit::live::{LiveTestEnv, init, optional_env, require_live, require_live_for};
 use zinder_testkit::{
     P2pkhSpendArgs, TRANSPARENT_BROADCAST_TEST_SEED, TransparentTestKey,

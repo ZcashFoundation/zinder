@@ -15,4 +15,6 @@ pub use live_owner::{
     DEFAULT_RECONCILIATION_BATCH_TARGET_RAW_TRANSACTION_BYTES, LiveMempoolOwner,
     MempoolRetentionSettings, run_live_mempool_owner, run_mempool_retention,
 };
-pub use ready_gate::{MempoolReadyGate, MempoolReadySignal, mempool_ready_channel};
+pub use ready_gate::{
+    MempoolReadyGate, MempoolReadySignal, ObservedNodeEndpoint, mempool_ready_channel,
+};

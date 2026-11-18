@@ -65,6 +65,35 @@ the primary admits a revision, and it checks the revision against its visible
 tip at that moment. Live following interprets new blocks with the admitted
 table.
 
+### Node endpoint switches
+
+The writer admits a table only when it opens the store. When ingest has
+fallback node endpoints ([ADR-0013](0013-source-failure-recovery-topology.md)),
+it admits the table of the endpoint it starts on, exactly as that endpoint's
+startup check read it; ingest does not read the table again before opening
+the store, so a table no check has seen never reaches it. Before choosing that
+endpoint, it reads the table the store follows without opening the primary:
+the latest admitted revision or, before revision 1, the construction table,
+compared by fingerprint. It reads the store at the storage path or, when none
+exists, a published construction staged beside it, which the writer recovers
+before following. A fallback that would become active with any other table,
+including the construction table with entries appended, is refused at
+startup. The comparison waits until every lower
+position has a verdict, so a fallback that already advertises the table
+`[node]` brings is not refused for answering first. Only `[node]` can bring a new table, so a fallback running an older
+release never removes a pending activation while `[node]` is merely slow to
+answer; when `[node]` is unreachable and no fallback matches, startup fails as a
+single-endpoint startup would and the restart tries again. Every other endpoint
+must advertise exactly the starting endpoint's table, and a switch target must
+advertise exactly the table the store admitted, compared entry by entry, names
+included. An endpoint with any other table is refused, and no table is admitted
+while ingest runs. After an operator aligns the nodes, for example by upgrading
+both to a release that announces the same upgrade, restarting ingest admits the
+new table.
+
+Zebra 7.0.0 and Zakura 1.8.6 report identical `getblockchaininfo.upgrades`
+names on Regtest, so plain equality lets them back each other up.
+
 ### Readers
 
 Readers never write a revision, and the reader runtimes bring no activation
@@ -145,6 +174,14 @@ responses carry the admitted table, revision, and V1 fingerprint.
 
 ## Rejected alternatives
 
+### Compare switch targets without upgrade names
+
+A switch target could match the admitted schedule on branch ids and heights
+alone. Admission at store open compares names too, so a restart while the
+first endpoint is down would refuse the store that the running writer had
+accepted the endpoint for. One plain-equality rule keeps startup and switching
+consistent.
+
 ### Rewrite the construction fingerprint
 
 The writer could replace the build plan's fingerprint with the new table's.
@@ -168,6 +205,8 @@ the same identity.
   canonical store).
 - `NetworkUpgradeScheduleNotAdmitted` (the retryable refusal of a reader that
   adopts the writer's schedule before the writer admitted one).
+- `CanonicalReadyStoreSummary` (what the writer reads from a READY store,
+  without opening its primary, to check node endpoints before it starts).
 
 See [Public interfaces §Core vocabulary](../architecture/public-interfaces.md#core-vocabulary).
 
@@ -179,3 +218,9 @@ See [Public interfaces §Core vocabulary](../architecture/public-interfaces.md#c
   admitted schedule is refused with the retryable
   `NetworkUpgradeScheduleNotAdmitted`. A broadcasting reader verifies its
   node's table on first contact instead.
+- 2026-11-18: Added "Node endpoint switches": ingest admits only its starting
+  endpoint's table, a fallback starts ingest only with the table the store
+  follows, its admitted revision or, before the first, its construction table,
+  and other endpoints must advertise exactly the admitted table to take over.
+- 2026-11-18: With fallback endpoints, the writer opens the store with the
+  table the starting endpoint's admission read, not a second read of it.

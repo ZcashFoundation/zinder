@@ -8,15 +8,21 @@
 # Zinder binaries read indexer TLS material from files only. The root-run
 # single-volume image entrypoints source this file and call
 # materialize_indexer_tls before starting any runtime process. For each
-# non-empty ZINDER_NODE__INDEXER_TLS__*_PEM variable it writes the value to a
-# file readable only by the zinder user and exports the matching *_PATH
-# variable. The caller must then start every process without the *_PEM
-# variables; a Zinder binary that receives one refuses to start.
+# non-empty ZINDER_NODE__INDEXER_TLS__*_PEM variable, and each
+# ZINDER_NODE_FALLBACKS__<N>__INDEXER_TLS__*_PEM variable of a fallback node
+# endpoint, it writes the value to a file readable only by the zinder user and
+# exports the matching *_PATH variable. The caller must then start every
+# process without the *_PEM variables, which indexer_tls_unset_arguments
+# names; a Zinder binary that receives one refuses to start.
 #
 # Platforms that can mount files should set the *_PATH variables directly:
 # the values below stay visible in the platform's own environment views.
 
-indexer_tls_pem_variables="ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM"
+indexer_tls_primary_pem_variables="ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM ZINDER_NODE__INDEXER_TLS__CLIENT_CERT_PEM ZINDER_NODE__INDEXER_TLS__CLIENT_KEY_PEM"
+
+# Set by materialize_indexer_tls: the [node] PEM variable names followed by
+# every fallback endpoint's PEM variable name in the environment.
+indexer_tls_pem_variables="$indexer_tls_primary_pem_variables"
 
 # A tmpfs keeps the private key off disk. /run is the fallback, and it may be
 # on the container's disk layer.
@@ -49,6 +55,42 @@ indexer_tls_is_set() {
 # Prints the value of the variable named $1, or nothing when it is unset.
 indexer_tls_read() {
   eval "printf '%s' \"\${$1:-}\""
+}
+
+# Prints the [node] PEM variable names and every fallback endpoint's PEM
+# variable name in the environment, one per line.
+indexer_tls_discover_pem_variables() {
+  # shellcheck disable=SC2086 # one line per listed name
+  printf '%s\n' $indexer_tls_primary_pem_variables
+  env | sed -n -E \
+    's/^(ZINDER_NODE_FALLBACKS__[0-9]+__INDEXER_TLS__(CA_CERT|CLIENT_CERT|CLIENT_KEY)_PEM)=.*/\1/p' \
+    | sort -u
+}
+
+# Prints `-u NAME` for every PEM variable name, so the caller can start a
+# process without them: exec env $(indexer_tls_unset_arguments) ...
+indexer_tls_unset_arguments() {
+  for pem_variable in $indexer_tls_pem_variables; do
+    printf -- '-u %s ' "$pem_variable"
+  done
+}
+
+# Prints the file name, without directory, that holds the PEM variable $1:
+# ca-cert.pem for [node], node-fallback-2-ca-cert.pem for [node_fallbacks.2].
+indexer_tls_file_name() {
+  case "$1" in
+    ZINDER_NODE_FALLBACKS__*)
+      fallback_suffix="${1#ZINDER_NODE_FALLBACKS__}"
+      file_prefix="node-fallback-${fallback_suffix%%__*}-"
+      material="${fallback_suffix#*__INDEXER_TLS__}"
+      ;;
+    *)
+      file_prefix=""
+      material="${1#ZINDER_NODE__INDEXER_TLS__}"
+      ;;
+  esac
+  material="${material%_PEM}"
+  printf '%s%s.pem' "$file_prefix" "$(printf '%s' "$material" | tr '[:upper:]_' '[:lower:]-')"
 }
 
 # Prints the directory that receives the files, or fails when neither
@@ -85,6 +127,7 @@ indexer_tls_validate() {
 materialize_indexer_tls() {
   indexer_tls_pem_present=0
   supplied_count=0
+  indexer_tls_pem_variables="$(indexer_tls_discover_pem_variables | tr '\n' ' ')"
 
   for pem_variable in $indexer_tls_pem_variables; do
     if ! indexer_tls_is_set "$pem_variable"; then
@@ -131,9 +174,7 @@ materialize_indexer_tls() {
     if [ -z "$pem_text" ]; then
       continue
     fi
-    material="${pem_variable#ZINDER_NODE__INDEXER_TLS__}"
-    material="${material%_PEM}"
-    file="$directory/$(printf '%s' "$material" | tr '[:upper:]_' '[:lower:]-').pem"
+    file="$directory/$(indexer_tls_file_name "$pem_variable")"
     printf '%s\n' "$pem_text" >"$file" \
       || indexer_tls_fail "could not write $file"
     chmod 0400 "$file"

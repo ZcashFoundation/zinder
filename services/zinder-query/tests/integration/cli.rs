@@ -138,6 +138,36 @@ fn node_settings_without_an_address_are_rejected() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Query reads the shared node list, so the environment one ingest reads
+/// does not stop it, and its fallback tables print redacted.
+#[test]
+fn print_config_accepts_the_shared_node_fallback_list() -> eyre::Result<()> {
+    let temporary = TempDir::new()?;
+    let output = query_command(&temporary, &temporary.path().join("canonical-secondary"))
+        .env(
+            "ZINDER_NODE_FALLBACKS__1__JSON_RPC_ADDR",
+            "http://127.0.0.1:39232",
+        )
+        .env("ZINDER_NODE_FALLBACKS__1__AUTH__METHOD", "basic")
+        .env("ZINDER_NODE_FALLBACKS__1__AUTH__USERNAME", "zakura")
+        .env(
+            "ZINDER_NODE_FALLBACKS__1__AUTH__PASSWORD",
+            "fallback-secret",
+        )
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "print-config failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("[node_fallbacks.1]"), "{stdout}");
+    assert!(stdout.contains("json_rpc_addr = \"http://127.0.0.1:39232\""));
+    assert!(!stdout.contains("fallback-secret"), "{stdout}");
+    Ok(())
+}
+
 #[test]
 fn print_config_exposes_the_full_block_retention_contract() -> eyre::Result<()> {
     let temporary = TempDir::new()?;

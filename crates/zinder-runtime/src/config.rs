@@ -32,7 +32,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use zinder_core::Network;
 use zinder_core::wire::{decode_zinder_native_chain_name, encode_zinder_native_chain_name};
-use zinder_source::{NodeAuth, NodeConfigError, NodeHealthConfig, NodeIndexerTls, NodeTarget};
+use zinder_source::{
+    NodeAuth, NodeConfigError, NodeHealthConfig, NodeIndexerTls, NodeTarget, redact_endpoint_url,
+};
 
 use crate::auth::{BearerToken, BearerTokenError};
 use crate::env_diagnostics::{RejectedEnvVar, translate_env_error};
@@ -42,13 +44,17 @@ use crate::sections::{
 
 const ENV_PREFIX: &str = "ZINDER_";
 const TEST_ENV_PREFIXES: &[&str] = &["ZINDER_TEST_"];
+const PRIMARY_NODE_ENV_PREFIX: &str = "ZINDER_NODE__";
+const FALLBACK_NODE_ENV_PREFIX: &str = "ZINDER_NODE_FALLBACKS__";
 
 /// Entrypoint-only indexer TLS variables that carry PEM text, each paired with
 /// the file-path variable a binary accepts instead.
 ///
 /// Only the single-volume image entrypoints accept them; they turn the value
 /// into a file and pass the binary the matching `_PATH` variable instead. The
-/// list mirrors `indexer_tls_pem_variables` in `deploy/materialize-indexer-tls`.
+/// list mirrors `indexer_tls_primary_pem_variables` in
+/// `deploy/materialize-indexer-tls`.
+/// The same names under `ZINDER_NODE_FALLBACKS__<N>__` are refused too.
 const ENTRYPOINT_PEM_ENV_VARS: &[(&str, &str)] = &[
     (
         "ZINDER_NODE__INDEXER_TLS__CA_CERT_PEM",
@@ -212,9 +218,10 @@ impl From<NodeConfigError> for ConfigError {
             )),
             NodeConfigError::IndexerTlsWithoutIndexerAddr
             | NodeConfigError::IndexerTlsRequiresHttps
-            | NodeConfigError::IndexerTlsClientIdentityIncomplete => {
-                Self::invalid(error.to_string())
-            }
+            | NodeConfigError::IndexerTlsClientIdentityIncomplete
+            | NodeConfigError::Fallback { .. }
+            | NodeConfigError::FallbackPositionMissing { .. }
+            | NodeConfigError::FallbacksWithoutPrimary => Self::invalid(error.to_string()),
             other => Self::invalid(other.to_string()),
         }
     }
@@ -294,12 +301,34 @@ where
 }
 
 /// Returns the `_PATH` variable that replaces `variable` when `variable` is an
-/// entrypoint-only indexer TLS PEM variable.
+/// entrypoint-only indexer TLS PEM variable, of `[node]` or of a
+/// `[node_fallbacks.N]` table.
 fn entrypoint_pem_path_name(variable: &str) -> Option<String> {
+    if let Some((_, path_name)) = ENTRYPOINT_PEM_ENV_VARS
+        .iter()
+        .find(|(pem_name, _)| *pem_name == variable)
+    {
+        return Some((*path_name).to_owned());
+    }
+    let (position, node_variable_suffix) = variable
+        .strip_prefix(FALLBACK_NODE_ENV_PREFIX)?
+        .split_once("__")?;
+    if position.is_empty() || !position.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let primary_name = format!("{PRIMARY_NODE_ENV_PREFIX}{node_variable_suffix}");
+    let primary_path_name = entrypoint_pem_path_name_of_primary(&primary_name)?;
+    let path_suffix = primary_path_name.strip_prefix(PRIMARY_NODE_ENV_PREFIX)?;
+    Some(format!(
+        "{FALLBACK_NODE_ENV_PREFIX}{position}__{path_suffix}"
+    ))
+}
+
+fn entrypoint_pem_path_name_of_primary(variable: &str) -> Option<&'static str> {
     ENTRYPOINT_PEM_ENV_VARS
         .iter()
         .find(|(pem_name, _)| *pem_name == variable)
-        .map(|(_, path_name)| (*path_name).to_owned())
+        .map(|(_, path_name)| *path_name)
 }
 
 /// Mirrors how `config-rs` transforms an env-var key (post-`ZINDER_`
@@ -629,7 +658,8 @@ impl NodeAuthToml {
 /// TOML projection of `[node.health]` for `--print-config`.
 #[derive(Debug, Serialize)]
 pub struct NodeHealthToml {
-    /// Full URL of the upstream node's readiness endpoint.
+    /// URL of the upstream node's readiness endpoint, with credentials
+    /// redacted.
     pub addr: String,
     /// Upstream-health probe cadence in milliseconds.
     pub poll_interval_ms: u64,
@@ -644,7 +674,7 @@ impl NodeHealthToml {
     #[must_use]
     pub fn from_node_health_config(health: &NodeHealthConfig) -> Self {
         Self {
-            addr: health.addr.clone(),
+            addr: redact_endpoint_url(&health.addr).into_owned(),
             poll_interval_ms: duration_as_millis_u64(health.poll_interval),
             verification_progress_floor: health.verification_progress_floor,
             estimated_gap_floor_blocks: health.estimated_gap_floor_blocks,
@@ -697,9 +727,9 @@ impl NodeIndexerTlsToml {
 /// Redacted TOML projection of `[node]` for `--print-config`.
 #[derive(Debug, Serialize)]
 pub struct NodeToml {
-    /// Node JSON-RPC base URL.
+    /// Node JSON-RPC base URL, with credentials redacted.
     pub json_rpc_addr: String,
-    /// Optional Zebra indexer gRPC endpoint URL.
+    /// Optional Zebra indexer gRPC endpoint URL, with credentials redacted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub indexer_grpc_addr: Option<String>,
     /// Per-RPC request timeout in seconds.
@@ -724,8 +754,11 @@ impl NodeToml {
     #[must_use]
     pub fn from_node_target(target: &NodeTarget) -> Self {
         Self {
-            json_rpc_addr: target.json_rpc_addr.clone(),
-            indexer_grpc_addr: target.indexer_grpc_addr.clone(),
+            json_rpc_addr: redact_endpoint_url(&target.json_rpc_addr).into_owned(),
+            indexer_grpc_addr: target
+                .indexer_grpc_addr
+                .as_deref()
+                .map(|addr| redact_endpoint_url(addr).into_owned()),
             request_timeout_secs: target.request_timeout.as_secs(),
             max_response_bytes: target.max_response_bytes.get(),
             broadcast_timeout_secs: target.broadcast_timeout.map(|d| d.as_secs()),
@@ -739,6 +772,44 @@ impl NodeToml {
                 .map(NodeIndexerTlsToml::from_node_indexer_tls),
             auth: NodeAuthToml::from_node_auth(&target.node_auth),
         }
+    }
+}
+
+/// Redacted TOML projection of the `[node_fallbacks.N]` tables for
+/// `--print-config`, rendered in position order.
+#[derive(Debug, Default)]
+pub struct NodeFallbacksToml {
+    positions: Vec<NodeToml>,
+}
+
+impl NodeFallbacksToml {
+    /// Builds the projection of resolved fallback targets, the first at
+    /// position 1.
+    #[must_use]
+    pub fn from_node_targets(targets: &[NodeTarget]) -> Self {
+        Self {
+            positions: targets.iter().map(NodeToml::from_node_target).collect(),
+        }
+    }
+
+    /// Returns whether no fallback is configured, so callers can omit the
+    /// section.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.positions.is_empty()
+    }
+}
+
+impl Serialize for NodeFallbacksToml {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_map(
+            (1_usize..)
+                .zip(&self.positions)
+                .map(|(position, node)| (position.to_string(), node)),
+        )
     }
 }
 
@@ -874,6 +945,108 @@ mod tests {
             assert!(message.contains(&expected_path_name));
             assert!(!message.contains("secret-material"));
         }
+    }
+
+    #[test]
+    fn fallback_indexer_tls_pem_variables_name_their_path_variable() {
+        let outcome = zinder_environment_source_from_map([(
+            "ZINDER_NODE_FALLBACKS__2__INDEXER_TLS__CLIENT_KEY_PEM".to_owned(),
+            "-----BEGIN PRIVATE KEY-----\nsecret-material\n".to_owned(),
+        )]);
+
+        assert!(matches!(
+            outcome.err(),
+            Some(ConfigError::EntrypointOnlyEnvVar { path_name, .. })
+                if path_name == "ZINDER_NODE_FALLBACKS__2__INDEXER_TLS__CLIENT_KEY_PATH"
+        ));
+    }
+
+    #[test]
+    fn fallback_tables_render_in_position_order_with_secrets_redacted()
+    -> Result<(), toml::ser::Error> {
+        #[derive(Serialize)]
+        struct Rendered {
+            node_fallbacks: NodeFallbacksToml,
+        }
+        let fallback = |address: &str| {
+            NodeTarget::new(
+                Network::ZcashRegtest,
+                address.to_owned(),
+                NodeAuth::basic("zebra".to_owned(), "secret-password".to_owned()),
+                Duration::from_secs(30),
+                std::num::NonZeroU64::MIN,
+            )
+        };
+        let targets = (1..=10)
+            .map(|position| fallback(&format!("http://node-{position}:8232")))
+            .collect::<Vec<_>>();
+
+        let rendered = toml::to_string(&Rendered {
+            node_fallbacks: NodeFallbacksToml::from_node_targets(&targets),
+        })?;
+
+        let second = rendered.find("[node_fallbacks.2]");
+        let tenth = rendered.find("[node_fallbacks.10]");
+        assert!(
+            second.is_some() && tenth.is_some() && second < tenth,
+            "{rendered}"
+        );
+        assert!(rendered.contains("[node_fallbacks.1.auth]"));
+        assert!(!rendered.contains("secret-password"));
+        assert!(rendered.contains("password = \"[REDACTED]\""));
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_urls_render_with_their_credentials_redacted() -> Result<(), toml::ser::Error> {
+        #[derive(Serialize)]
+        struct Rendered {
+            node: NodeToml,
+            node_fallbacks: NodeFallbacksToml,
+        }
+        let target = NodeTarget::new(
+            Network::ZcashRegtest,
+            "http://zebra:rpc-secret@127.0.0.1:18232".to_owned(),
+            NodeAuth::None,
+            Duration::from_secs(30),
+            std::num::NonZeroU64::MIN,
+        )
+        .with_indexer_grpc_addr(Some(
+            "http://zebra:indexer-secret@127.0.0.1:18230/?token=query-secret".to_owned(),
+        ))
+        .with_health(Some(NodeHealthConfig::new(
+            "http://127.0.0.1:18233/ready?token=health-secret".to_owned(),
+            Duration::from_millis(1_250),
+            0.875,
+            42,
+        )));
+
+        let rendered = toml::to_string(&Rendered {
+            node: NodeToml::from_node_target(&target),
+            node_fallbacks: NodeFallbacksToml::from_node_targets(std::slice::from_ref(&target)),
+        })?;
+
+        assert!(!rendered.contains("secret"), "{rendered}");
+        let sections = rendered
+            .split_once("[node_fallbacks.1]")
+            .unwrap_or_default();
+        for fields in <[&str; 2]>::from(sections) {
+            assert!(
+                fields.contains("json_rpc_addr = \"http://[REDACTED]@127.0.0.1:18232\""),
+                "{rendered}"
+            );
+            assert!(
+                fields.contains(
+                    "indexer_grpc_addr = \"http://[REDACTED]@127.0.0.1:18230/?[REDACTED]\""
+                ),
+                "{rendered}"
+            );
+            assert!(
+                fields.contains("addr = \"http://127.0.0.1:18233/ready?[REDACTED]\""),
+                "{rendered}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

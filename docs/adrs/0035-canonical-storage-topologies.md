@@ -536,10 +536,12 @@ Compose and Railway. The command's name and the parts of it that apply to
   Explorer, with its own ingest and canonical store. That second stack keeps
   the release downtime and rebuild cost described in [Context](#context).
 - Node redundancy is a separate concern that this decision does not solve.
-  Ordered node endpoint failover in ingest and node diversity (Zebra and
-  Zakura) are tracked separately and do not wait for PostgreSQL. Reader node
-  failover, for the query and compatibility readers that each depend on one
-  node today, is tracked separately too.
+  Ingest fails over across `[node]` and `[node_fallbacks.N]`, which may mix
+  Zebra and Zakura nodes
+  ([ADR-0013](0013-source-failure-recovery-topology.md) Decision 8), in every
+  topology and without PostgreSQL. Reader node failover, for the query and
+  compatibility readers that each depend on one node today, is tracked
+  separately.
 
 ## Rejected alternatives
 
@@ -686,6 +688,9 @@ Measured behavior of `rocksdb-single-host` that still informs operators:
 
 ## Revision history
 
+- 2026-11-18: Node redundancy describes ingest failover across the ordered
+  node list ([ADR-0013](0013-source-failure-recovery-topology.md)) instead of
+  future work.
 - 2026-11-17: Under `rocksdb-single-host`, native wallet query serves while
   its node or ingest control is unavailable and reports them as degraded
   dependencies, instead of refusing traffic until all three of its inputs are

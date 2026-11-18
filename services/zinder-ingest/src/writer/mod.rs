@@ -14,10 +14,10 @@ use zinder_core::{BlockHeight, BlockId, NetworkUpgradeActivations, UnixTimestamp
 use zinder_runtime::{ComposedReadiness, IngestPhase, ReadinessState};
 use zinder_source::{NodeSource, SourceError};
 use zinder_store::{
-    CanonicalActivationSchedule, CanonicalBaselinePublication, CanonicalReorgPolicy,
-    CanonicalStoreBuildPlan, CanonicalStoreBuildPlanError, CanonicalStoreError,
-    CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder, RocksDbCanonicalStore,
-    RocksDbResourceBudget,
+    CanonicalActivationSchedule, CanonicalBaselinePublication, CanonicalReadyStoreSummary,
+    CanonicalReorgPolicy, CanonicalStoreBuildPlan, CanonicalStoreBuildPlanError,
+    CanonicalStoreError, CanonicalStoreWorkload, RawBlobRetention, RocksDbCanonicalBuilder,
+    RocksDbCanonicalStore, RocksDbResourceBudget,
 };
 
 use crate::{
@@ -238,6 +238,39 @@ where
         cancel,
     )
     .await
+}
+
+/// Reads the READY store [`admit_canonical_store`] will admit, without
+/// opening its primary.
+///
+/// That is the store at `storage_path` or, when none exists, a published
+/// construction staged beside it, which admission recovers first. Returns
+/// `None` when admission will construct a fresh store. The writer checks node
+/// endpoints against it before choosing one to start on.
+pub fn read_ready_store_summary(
+    storage_path: &std::path::Path,
+) -> Result<Option<CanonicalReadyStoreSummary>, CanonicalWriterError> {
+    if path_exists(storage_path)? {
+        return Ok(RocksDbCanonicalStore::read_ready_summary(storage_path)?);
+    }
+    let staging_path = construction_staging_path(storage_path);
+    if !path_exists(&staging_path)? || staging_is_empty(&staging_path)? {
+        return Ok(None);
+    }
+    Ok(RocksDbCanonicalStore::read_ready_summary(&staging_path)?)
+}
+
+fn staging_is_empty(staging_path: &std::path::Path) -> Result<bool, CanonicalWriterError> {
+    let unavailable = |source| CanonicalWriterError::PathUnavailable {
+        path: staging_path.to_path_buf(),
+        source,
+    };
+    Ok(std::fs::read_dir(staging_path)
+        .map_err(unavailable)?
+        .next()
+        .transpose()
+        .map_err(unavailable)?
+        .is_none())
 }
 
 /// Follows the node from an admitted READY store until `cancel` fires,
@@ -1194,6 +1227,7 @@ mod tests {
                 event_retention_check_interval: Duration::from_secs(1),
                 mempool_ready_gate: None,
                 max_replacement_bytes: crate::DEFAULT_MAX_REPLACEMENT_BYTES,
+                node_failover: None,
             },
         }
     }
@@ -1368,6 +1402,7 @@ mod tests {
                 event_retention_check_interval: Duration::from_secs(1),
                 mempool_ready_gate: None,
                 max_replacement_bytes: crate::DEFAULT_MAX_REPLACEMENT_BYTES,
+                node_failover: None,
             },
         };
         let plan = resolve_build_plan(

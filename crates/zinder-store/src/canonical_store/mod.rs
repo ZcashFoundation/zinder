@@ -79,7 +79,9 @@ pub use publication::{
 };
 pub use reader::HeightOrder;
 pub use rocksdb::RocksDbCanonicalStore;
-pub use rocksdb::{CanonicalOwnerCheckpointAdmission, CanonicalOwnerCheckpointEvidence};
+pub use rocksdb::{
+    CanonicalOwnerCheckpointAdmission, CanonicalOwnerCheckpointEvidence, CanonicalReadyStoreSummary,
+};
 pub use secondary::{CanonicalSecondaryCatchupOutcome, RocksDbCanonicalSecondary};
 pub use subtree_load::{
     CanonicalBuildSubtreeRoot, CanonicalSubtreeRootLoadCoverage, CanonicalSubtreeRootLoadEvidence,

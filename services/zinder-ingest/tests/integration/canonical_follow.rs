@@ -66,7 +66,7 @@ enum SourceCall {
 /// This source is intentionally test-local: it makes the production follower's
 /// source boundary observable without adding an adapter to production code.
 #[derive(Clone)]
-struct RecordingParseableSource {
+pub(super) struct RecordingParseableSource {
     blocks: Arc<Mutex<BTreeMap<BlockHeight, SourceBlock>>>,
     checkpoints: Arc<Mutex<BTreeMap<BlockHeight, CommitmentTreeCheckpoint>>>,
     tip_height: Arc<Mutex<BlockHeight>>,
@@ -115,7 +115,7 @@ struct SourceTipCallGate {
 }
 
 impl RecordingParseableSource {
-    fn new(
+    pub(super) fn new(
         blocks: BTreeMap<BlockHeight, SourceBlock>,
         checkpoints: BTreeMap<BlockHeight, CommitmentTreeCheckpoint>,
         tip_height: BlockHeight,
@@ -174,7 +174,7 @@ impl RecordingParseableSource {
         *self.subtree_roots.lock() = subtree_roots;
     }
 
-    fn set_tip_height(&self, height: BlockHeight) {
+    pub(super) fn set_tip_height(&self, height: BlockHeight) {
         *self.tip_height.lock() = height;
     }
 
@@ -487,6 +487,7 @@ async fn canonical_follower_settles_from_local_header_without_historical_source_
             event_retention_check_interval: Duration::from_secs(1),
             mempool_ready_gate: None,
             max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+            node_failover: None,
         },
         &readiness,
         &cancel,
@@ -558,6 +559,7 @@ async fn canonical_follower_cancellation_after_reorg_preparation_preserves_origi
             event_retention_check_interval: Duration::from_secs(1),
             mempool_ready_gate: None,
             max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+            node_failover: None,
         },
         &readiness,
         &cancel,
@@ -644,6 +646,7 @@ async fn canonical_follower_replaces_shallow_fork_reopens_and_continues_appendin
             event_retention_check_interval: Duration::from_secs(1),
             mempool_ready_gate: None,
             max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+            node_failover: None,
         },
         &readiness,
         &cancel,
@@ -718,6 +721,7 @@ async fn canonical_follower_replaces_shallow_fork_reopens_and_continues_appendin
             event_retention_check_interval: Duration::from_secs(1),
             mempool_ready_gate: None,
             max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+            node_failover: None,
         },
         &append_readiness,
         &append_cancel,
@@ -789,6 +793,7 @@ async fn canonical_follower_refuses_a_fork_below_settlement_without_mutation()
             event_retention_check_interval: Duration::from_secs(1),
             mempool_ready_gate: None,
             max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+            node_failover: None,
         },
         &readiness,
         &cancel,
@@ -1145,7 +1150,8 @@ async fn committed_append_confirms_a_reopened_writer_tip() -> Result<(), Box<dyn
     )
     .await?;
     source.set_tip_height(BlockHeight::new(4));
-    let (before, after) = statuses_around_first_commit(store, &source, &activations).await?;
+    let (before, after) =
+        Box::pin(statuses_around_first_commit(store, &source, &activations)).await?;
     assert!(before.tip_unconfirmed);
     assert!(!after.tip_unconfirmed);
     assert_eq!(after.fence.map(|fence| fence.visible_tip_height), Some(4));
@@ -1181,7 +1187,8 @@ async fn committed_replacement_confirms_a_reopened_writer_tip()
         checkpoints_for_parseable_chain(&fork, &activations)?,
         BlockHeight::new(4),
     );
-    let (before, after) = statuses_around_first_commit(store, &source, &activations).await?;
+    let (before, after) =
+        Box::pin(statuses_around_first_commit(store, &source, &activations)).await?;
     assert!(before.tip_unconfirmed);
     assert!(!after.tip_unconfirmed);
     assert_ne!(
@@ -1377,6 +1384,7 @@ async fn canonical_follower_follows_a_deeper_fork_after_an_in_place_window_raise
             event_retention_check_interval: Duration::from_secs(1),
             mempool_ready_gate: None,
             max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+            node_failover: None,
         },
         &readiness,
         &cancel,
@@ -1584,6 +1592,7 @@ async fn follow_fork_with_replacement_budget(
             event_retention_check_interval: Duration::from_secs(1),
             mempool_ready_gate: None,
             max_replacement_bytes,
+            node_failover: None,
         },
         &readiness,
         &cancel,
@@ -1624,6 +1633,7 @@ fn follower_to_target<'a, Source: NodeSource>(
             event_retention_check_interval: Duration::from_secs(1),
             mempool_ready_gate: None,
             max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+            node_failover: None,
         },
         readiness,
         cancel,
@@ -1648,6 +1658,7 @@ fn single_pass_follower<'a>(
             event_retention_check_interval: Duration::from_secs(1),
             mempool_ready_gate: None,
             max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+            node_failover: None,
         },
         readiness,
         cancel,
@@ -1734,6 +1745,7 @@ async fn retention_steps_yield_to_canonical_source_observation()
                 event_retention_check_interval: Duration::from_secs(1),
                 mempool_ready_gate: None,
                 max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+                node_failover: None,
             },
             &readiness,
             &cancel,
@@ -1802,6 +1814,7 @@ async fn canonical_follower_reports_source_outage_and_resumes_after_recovery()
                 event_retention_check_interval: Duration::from_secs(1),
                 mempool_ready_gate: None,
                 max_replacement_bytes: zinder_ingest::DEFAULT_MAX_REPLACEMENT_BYTES,
+                node_failover: None,
             },
             &follower_readiness,
             &cancel,
@@ -1852,12 +1865,12 @@ async fn best_chain_switch_between_block_and_tree_state_reads_appends_the_new_bl
     let recorder = PrometheusBuilder::new().build_recorder();
     let recorded_metrics = recorder.handle();
     let _local_recorder = metrics::set_default_local_recorder(&recorder);
-    append_sibling_after_one_recovery(
+    Box::pin(append_sibling_after_one_recovery(
         switch,
         &source,
         "tree-state hash disagrees with the fetched block hash",
         &recorded_metrics,
-    )
+    ))
     .await
 }
 
@@ -1872,12 +1885,12 @@ async fn hash_keyed_tree_state_refusal_after_a_best_chain_switch_appends_the_new
     let recorder = PrometheusBuilder::new().build_recorder();
     let recorded_metrics = recorder.handle();
     let _local_recorder = metrics::set_default_local_recorder(&recorder);
-    append_sibling_after_one_recovery(
+    Box::pin(append_sibling_after_one_recovery(
         switch,
         &source,
         "the requested block is not in the main chain",
         &recorded_metrics,
-    )
+    ))
     .await
 }
 
@@ -3179,7 +3192,7 @@ async fn first_node_unavailable_detail(
     clippy::too_many_arguments,
     reason = "the test builder keeps source, fixture identity, activation identity, path, window, and settlement explicit"
 )]
-async fn publish_parseable_store(
+pub(super) async fn publish_parseable_store(
     source: &RecordingParseableSource,
     blocks: &BTreeMap<BlockHeight, SourceBlock>,
     activations: Arc<NetworkUpgradeActivations>,
@@ -3226,7 +3239,7 @@ async fn publish_parseable_store(
     Ok(validated.publish_baseline(publication)?)
 }
 
-fn parseable_multi_block_chain()
+pub(super) fn parseable_multi_block_chain()
 -> Result<BTreeMap<BlockHeight, SourceBlock>, Box<dyn std::error::Error>> {
     let fixture = fixture_source_block()?;
     let mut parent_hash = Network::ZcashRegtest.genesis_hash();
@@ -3259,7 +3272,7 @@ fn parseable_multi_block_chain()
     Ok(blocks)
 }
 
-fn forked_parseable_chain(
+pub(super) fn forked_parseable_chain(
     original: &BTreeMap<BlockHeight, SourceBlock>,
     fork_height: u32,
     tip_height: u32,
@@ -3305,7 +3318,7 @@ fn forked_parseable_chain(
     Ok(blocks)
 }
 
-fn checkpoints_for_parseable_chain(
+pub(super) fn checkpoints_for_parseable_chain(
     blocks: &BTreeMap<BlockHeight, SourceBlock>,
     activations: &NetworkUpgradeActivations,
 ) -> Result<BTreeMap<BlockHeight, CommitmentTreeCheckpoint>, Box<dyn std::error::Error>> {
@@ -3329,7 +3342,7 @@ fn checkpoints_for_parseable_chain(
     Ok(checkpoints)
 }
 
-fn block_id(
+pub(super) fn block_id(
     blocks: &BTreeMap<BlockHeight, SourceBlock>,
     height: u32,
 ) -> Result<BlockId, Box<dyn std::error::Error>> {
