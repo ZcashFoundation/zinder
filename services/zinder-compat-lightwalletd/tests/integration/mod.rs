@@ -6,6 +6,7 @@ mod lightwalletd_grpc;
 mod lightwalletd_scan_contract;
 mod mempool_compat;
 mod reflection;
+mod release_image;
 mod repeated_field_limits;
 mod runtime_allocator;
 mod transparent_wallet_serving;

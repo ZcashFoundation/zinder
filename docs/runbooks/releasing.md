@@ -183,8 +183,11 @@ read-only repository token, and a third job compares them:
    single-volume host images from that archive with
    `scripts/package-release-images.sh check`, without logging in to a registry
    or pushing. Every image binary must match its archive binary byte for byte,
-   be a root-owned regular file with mode `0755`, and run `--version` and
-   `--help` as the `zinder` user inside its image.
+   be a root-owned regular file with mode `0755` in an export of the image
+   filesystem, and run `--version` and `--help` as UID 10001, the `zinder`
+   user, inside its image. Its `healthcheck` subcommand must also exit 1, the
+   unhealthy status, against a port with no listener. The 5 runtime images
+   have no shell, so no check runs a shell command inside them.
 3. `compare independent release builds` requires identical binary and archive
    hashes for the platform and lists them in its job summary.
 
@@ -390,8 +393,27 @@ image must contain amd64 and arm64 runtime manifests, and its OCI revision
 label must equal the tag-target commit. Binary SBOMs describe the recoverable
 Rust dependency graph and the owning `rust-librocksdb-sys` package; they do not
 claim complete native C or C++ CPE inventory. Deployments should pin verified
-image digests or binary archive checksums. The Compose file uses `:local` only
-for source builds and does not treat `latest` as a deployment identity.
+image digests or binary archive checksums. The Compose file selects
+`ghcr.io/zcashfoundation/<image>:${ZINDER_VERSION}` when `ZINDER_VERSION`
+names a release, uses `:local` only for source builds, and does not treat
+`latest` as a deployment identity.
+
+Each image also carries these OCI labels, which `docker image inspect` shows:
+
+| Label | Value |
+| --- | --- |
+| `org.opencontainers.image.title` | The image name, such as `zinder-query`. |
+| `org.opencontainers.image.description` | One line on what the image runs, set per image in `scripts/package-release-images.sh`. |
+| `org.opencontainers.image.version` | The release tag. |
+| `org.opencontainers.image.revision` | The tag-target commit. |
+| `org.opencontainers.image.created` | The tag-target commit timestamp in UTC, so a repackaged image reports the same time. |
+| `org.opencontainers.image.source`, `org.opencontainers.image.url` | The GitHub repository. |
+| `org.opencontainers.image.documentation` | The runbook for the image at the release tag. |
+| `org.opencontainers.image.vendor` | `Zcash Foundation`. |
+| `org.opencontainers.image.licenses` | `MIT`. |
+
+A new catalog image needs a description and runbook entry in the packager
+before the release can package it.
 
 ## Recover a failed release
 

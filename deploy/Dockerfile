@@ -34,6 +34,7 @@ ARG RUST_VERSION=1.95.0
 ARG DEBIAN_RELEASE=bookworm
 ARG RUST_IMAGE_DIGEST=sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
 ARG DEBIAN_IMAGE_DIGEST=sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+ARG DISTROLESS_IMAGE_DIGEST=sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
 ARG ZINDER_BINARIES_SOURCE=zinder-binaries
 
 FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE}@${RUST_IMAGE_DIGEST} AS zinder-build-base
@@ -158,6 +159,103 @@ RUN --mount=type=cache,id=zinder-cargo-registry-${RUST_VERSION}-${TARGETARCH}${T
     && test -n "$test_binary" \
     && cp "$test_binary" /zinder-live-tests/zinder-ingest-acceptance
 
+# Per-service release images run one binary on distroless cc, which carries
+# glibc, libgcc_s, libstdc++, and CA certificates but no shell, package
+# manager, or HTTP client. The image HEALTHCHECK runs the binary's own
+# `healthcheck` subcommand. BuildKit creates a WORKDIR in an empty stage, so
+# the state directories need no RUN. UID and GID 10001 match the Zebra and
+# Zakura images, so the services read the node's mode-0600 RPC cookie.
+FROM scratch AS zinder-service-state
+
+WORKDIR /var/lib/zinder/secondary
+
+FROM gcr.io/distroless/cc-debian12:nonroot@${DISTROLESS_IMAGE_DIGEST} AS zinder-service-base
+
+COPY --from=zinder-service-state --chown=10001:10001 /var/lib/zinder /var/lib/zinder
+
+# Each service image installs deploy/config/images/<service>.toml as
+# /etc/zinder/config.toml and passes it with CMD. The file binds every
+# container interface so `docker run -p` works; other containers on the same
+# network can still reach these listeners, and host networking binds the
+# host's interfaces (see service-operations.md, Runtime images). A config
+# mounted at the same path replaces the file as a whole, and arguments after
+# the image name replace CMD.
+USER 10001:10001
+WORKDIR /var/lib/zinder
+
+FROM zinder-service-base AS zinder-ingest
+
+COPY --from=zinder-binaries-selected /zinder-binaries/zinder-ingest /usr/local/bin/zinder-ingest
+
+COPY deploy/config/images/ingest.toml /etc/zinder/config.toml
+
+EXPOSE 9105
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["zinder-ingest", "--config", "/etc/zinder/config.toml", "healthcheck", "--path", "/healthz"]
+
+ENTRYPOINT ["zinder-ingest"]
+CMD ["--config", "/etc/zinder/config.toml"]
+
+FROM zinder-service-base AS zinder-projector
+
+COPY --from=zinder-binaries-selected /zinder-binaries/zinder-projector /usr/local/bin/zinder-projector
+
+COPY deploy/config/images/projector.toml /etc/zinder/config.toml
+
+EXPOSE 9110
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD ["zinder-projector", "--config", "/etc/zinder/config.toml", "healthcheck"]
+
+ENTRYPOINT ["zinder-projector"]
+CMD ["--config", "/etc/zinder/config.toml"]
+
+FROM zinder-service-base AS zinder-query
+
+COPY --from=zinder-binaries-selected /zinder-binaries/zinder-query /usr/local/bin/zinder-query
+
+COPY deploy/config/images/query.toml /etc/zinder/config.toml
+
+EXPOSE 9102 9106
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD ["zinder-query", "--config", "/etc/zinder/config.toml", "healthcheck"]
+
+ENTRYPOINT ["zinder-query"]
+CMD ["--config", "/etc/zinder/config.toml"]
+
+FROM zinder-service-base AS zinder-compat-lightwalletd
+
+COPY --from=zinder-binaries-selected /zinder-binaries/zinder-compat-lightwalletd /usr/local/bin/zinder-compat-lightwalletd
+
+COPY deploy/config/images/compat-lightwalletd.toml /etc/zinder/config.toml
+
+EXPOSE 9067 9107
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD ["zinder-compat-lightwalletd", "--config", "/etc/zinder/config.toml", "healthcheck"]
+
+ENTRYPOINT ["zinder-compat-lightwalletd"]
+CMD ["--config", "/etc/zinder/config.toml"]
+
+FROM zinder-service-base AS zinder-explorer
+
+COPY --from=zinder-binaries-selected /zinder-binaries/zinder-explorer /usr/local/bin/zinder-explorer
+
+COPY deploy/config/images/explorer.toml /etc/zinder/config.toml
+
+EXPOSE 9068 9069
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5m --retries=3 \
+    CMD ["zinder-explorer", "--config", "/etc/zinder/config.toml", "healthcheck"]
+
+ENTRYPOINT ["zinder-explorer"]
+CMD ["--config", "/etc/zinder/config.toml"]
+
+# Debian base for the images whose POSIX entrypoints and helper scripts need a
+# shell, curl, and the zinder account: the single-volume host images, the
+# benchmark, and the live-test runner.
 FROM debian:${DEBIAN_RELEASE}-slim@${DEBIAN_IMAGE_DIGEST} AS zinder-runtime-base
 
 RUN apt-get update \
@@ -165,39 +263,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # BuildKit gives directories that `COPY --chmod` creates the file mode, so
-# /usr/local/lib/zinder must exist before a 0644 file is copied into it.
-RUN groupadd --system --gid 1000 zinder \
-    && useradd --system --uid 1000 --gid zinder --home /var/lib/zinder --shell /usr/sbin/nologin zinder \
+# /usr/local/lib/zinder must exist before a 0644 file is copied into it. The
+# zinder account uses the per-service images' UID and GID.
+RUN groupadd --system --gid 10001 zinder \
+    && useradd --system --uid 10001 --gid zinder --home /var/lib/zinder --shell /usr/sbin/nologin zinder \
     && mkdir -p /var/lib/zinder/secondary /etc/zinder /usr/local/lib/zinder \
     && chown -R zinder:zinder /var/lib/zinder /etc/zinder
-
-FROM zinder-runtime-base AS zinder-ingest
-
-COPY --from=zinder-binaries-selected /zinder-binaries/zinder-ingest /usr/local/bin/zinder-ingest
-
-USER zinder:zinder
-WORKDIR /var/lib/zinder
-
-EXPOSE 9105
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fsS http://localhost:9105/healthz || exit 1
-
-ENTRYPOINT ["zinder-ingest"]
-
-FROM zinder-runtime-base AS zinder-projector
-
-COPY --from=zinder-binaries-selected /zinder-binaries/zinder-projector /usr/local/bin/zinder-projector
-
-USER zinder:zinder
-WORKDIR /var/lib/zinder
-
-EXPOSE 9110
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD curl -fsS http://localhost:9110/readyz || exit 1
-
-ENTRYPOINT ["zinder-projector"]
 
 FROM zinder-runtime-base AS zinder-ingest-live-tests
 
@@ -208,55 +279,15 @@ WORKDIR /var/lib/zinder
 
 ENTRYPOINT ["zinder-ingest-acceptance"]
 
-FROM zinder-runtime-base AS zinder-query
-
-COPY --from=zinder-binaries-selected /zinder-binaries/zinder-query /usr/local/bin/zinder-query
-
-USER zinder:zinder
-WORKDIR /var/lib/zinder
-
-EXPOSE 9102 9106
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD curl -fsS http://localhost:9106/readyz || exit 1
-
-ENTRYPOINT ["zinder-query"]
-
-FROM zinder-runtime-base AS zinder-compat-lightwalletd
-
-COPY --from=zinder-binaries-selected /zinder-binaries/zinder-compat-lightwalletd /usr/local/bin/zinder-compat-lightwalletd
-
-USER zinder:zinder
-WORKDIR /var/lib/zinder
-
-EXPOSE 9067 9107
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD curl -fsS http://localhost:9107/readyz || exit 1
-
-ENTRYPOINT ["zinder-compat-lightwalletd"]
-
-FROM zinder-runtime-base AS zinder-explorer
-
-COPY --from=zinder-binaries-selected /zinder-binaries/zinder-explorer /usr/local/bin/zinder-explorer
-
-USER zinder:zinder
-WORKDIR /var/lib/zinder
-
-EXPOSE 9068 9069
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5m --retries=3 \
-    CMD curl -fsS http://localhost:9069/readyz || exit 1
-
-ENTRYPOINT ["zinder-explorer"]
-
 # Single-volume host images. Platforms that attach one volume to one container
 # mount it root-owned, so these targets start as root and their entrypoints
 # drop every runtime process to zinder.
 
 # Ingest-only diagnostic or canary runtime. It projects no wallet state and
 # serves no client protocol.
-FROM zinder-ingest AS zinder-canonical-runtime
+FROM zinder-runtime-base AS zinder-canonical-runtime
+
+COPY --from=zinder-binaries-selected /zinder-binaries/zinder-ingest /usr/local/bin/zinder-ingest
 
 COPY --chmod=0644 deploy/materialize-indexer-tls \
     /usr/local/lib/zinder/materialize-indexer-tls
@@ -267,6 +298,12 @@ ENV ZINDER_OPS__LISTEN_ADDR=[::]:9105
 ENV ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true
 
 USER root:root
+WORKDIR /var/lib/zinder
+
+EXPOSE 9105
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["zinder-ingest", "healthcheck", "--path", "/healthz"]
 
 ENTRYPOINT ["zinder-canonical-runtime-entrypoint"]
 

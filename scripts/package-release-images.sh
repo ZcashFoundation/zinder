@@ -76,16 +76,72 @@ archive_root="$(basename -- "$archive_path" .tar.gz)"
 platform_arch="${platform#linux/}"
 # build-release-binary-archive.sh assigns this mode to every archive binary.
 archive_binary_mode=755
+archive_binary_listing_mode=-rwxr-xr-x
+# The commit timestamp, so a rebuilt image reports the same creation time.
+image_created="$(date -u -d "@${source_date_epoch}" '+%Y-%m-%dT%H:%M:%SZ')"
 
 work_directory="$(mktemp -d "${TMPDIR:-/tmp}/zinder-release-images.XXXXXX")"
 smoke_images=()
+smoke_containers=()
 cleanup() {
+  if [[ "${#smoke_containers[@]}" -gt 0 ]]; then
+    docker container rm --force "${smoke_containers[@]}" >/dev/null 2>&1 || true
+  fi
   if [[ "${#smoke_images[@]}" -gt 0 ]]; then
     docker image rm --force "${smoke_images[@]}" >/dev/null 2>&1 || true
   fi
   rm -rf -- "$work_directory"
 }
 trap cleanup EXIT
+
+# Sets image_description and image_documentation for one catalog image. An
+# image without an entry fails the packaging, so a new catalog name needs one.
+describe_image() {
+  local documentation_path
+  case "$1" in
+    zinder-ingest)
+      image_description="Zinder canonical ingest: follows a Zcash node and writes the canonical chain store."
+      documentation_path=docs/runbooks/deploying-on-a-vm.md
+      ;;
+    zinder-projector)
+      image_description="Zinder wallet projector: builds the wallet projection from the canonical chain store."
+      documentation_path=docs/runbooks/deploying-on-a-vm.md
+      ;;
+    zinder-query)
+      image_description="Zinder native WalletQuery gRPC server for wallets and applications."
+      documentation_path=docs/runbooks/deploying-on-a-vm.md
+      ;;
+    zinder-compat-lightwalletd)
+      image_description="Zinder lightwalletd-compatible gRPC server for existing light wallets."
+      documentation_path=docs/runbooks/deploying-on-a-vm.md
+      ;;
+    zinder-explorer)
+      image_description="Zinder ExplorerQuery gRPC server for block explorers."
+      documentation_path=docs/runbooks/deploying-on-a-vm.md
+      ;;
+    zinder-canonical-runtime)
+      image_description="Zinder ingest-only canary runtime for one volume; it serves no client protocol."
+      documentation_path=docs/runbooks/deploying-on-railway.md
+      ;;
+    zinder-wallet-serving)
+      image_description="Zinder ingest, wallet projector, and native WalletQuery supervised together on one volume."
+      documentation_path=docs/runbooks/deploying-wallet-serving.md
+      ;;
+    zinder-wallet-serving-explorer)
+      image_description="Zinder wallet serving and the ExplorerQuery server supervised together on one volume."
+      documentation_path=docs/runbooks/deploying-wallet-serving.md
+      ;;
+    *)
+      echo >&2 "no image description for ${1}; add one to describe_image"
+      exit 1
+      ;;
+  esac
+  [[ -f "${repository_root}/${documentation_path}" ]] || {
+    echo >&2 "${1} documentation ${documentation_path} does not exist"
+    exit 1
+  }
+  image_documentation="https://github.com/${repository}/blob/${release_tag}/${documentation_path}"
+}
 
 require_archive_binary_mode() {
   local binary_path="$1"
@@ -122,6 +178,7 @@ done
 
 image_names="$(jq -r '.[]' <<< "$images_json")"
 while IFS= read -r image_name; do
+  describe_image "$image_name"
   image_build_args=(
     --file "$repository_root/deploy/Dockerfile"
     --target "$image_name"
@@ -167,6 +224,12 @@ while IFS= read -r image_name; do
     --label "org.opencontainers.image.revision=${commit}" \
     --label "org.opencontainers.image.version=${release_tag}" \
     --label "org.opencontainers.image.licenses=MIT" \
+    --label "org.opencontainers.image.title=${image_name}" \
+    --label "org.opencontainers.image.description=${image_description}" \
+    --label "org.opencontainers.image.url=https://github.com/${repository}" \
+    --label "org.opencontainers.image.documentation=${image_documentation}" \
+    --label "org.opencontainers.image.vendor=Zcash Foundation" \
+    --label "org.opencontainers.image.created=${image_created}" \
     --provenance=mode=max \
     --sbom=true \
     --output "$image_output" \
@@ -184,8 +247,8 @@ while IFS= read -r image_name; do
     continue
   fi
 
-  # The zinder user runs every release process, including the processes that
-  # the single-volume entrypoints start as root and then drop.
+  # UID 10001, the zinder user, runs every release process, including the
+  # processes that the single-volume entrypoints start as root and then drop.
   smoke_image="zinder-release-smoke/${image_name}:${platform_arch}"
   docker buildx build \
     "${image_build_args[@]}" \
@@ -194,25 +257,42 @@ while IFS= read -r image_name; do
     --output "type=docker,name=${smoke_image}" \
     "$repository_root"
   smoke_images+=("$smoke_image")
+  # Per-service images carry no shell or stat, so the installed type, mode,
+  # and owner come from an export of the image filesystem.
+  smoke_container="$(docker container create --platform "$platform" "$smoke_image")"
+  smoke_containers+=("$smoke_container")
+  smoke_filesystem="$work_directory/smoke-filesystem.tar"
+  docker container export --output "$smoke_filesystem" "$smoke_container"
   for binary_name in "${carried_binaries[@]}"; do
-    image_binary_stat="$(
-      docker run --rm --platform "$platform" --entrypoint stat "$smoke_image" \
-        -c '%a %u:%g %F' "/usr/local/bin/${binary_name}"
+    image_binary_listing="$(
+      tar --list --verbose --numeric-owner --file "$smoke_filesystem" \
+        "usr/local/bin/${binary_name}" | awk '{ print $1, $2 }'
     )"
-    [[ "$image_binary_stat" == "${archive_binary_mode} 0:0 regular file" ]] || {
-      echo >&2 "${image_name} installs ${binary_name} as '${image_binary_stat}', expected '${archive_binary_mode} 0:0 regular file'"
+    [[ "$image_binary_listing" == "${archive_binary_listing_mode} 0/0" ]] || {
+      echo >&2 "${image_name} installs ${binary_name} as '${image_binary_listing}', expected '${archive_binary_listing_mode} 0/0'"
       exit 1
     }
     image_binary_version="$(
-      docker run --rm --platform "$platform" --user zinder:zinder \
+      docker run --rm --platform "$platform" --user 10001:10001 \
         --entrypoint "$binary_name" "$smoke_image" --version
     )"
     [[ "$image_binary_version" == "${binary_name} ${release_tag#v}" ]] || {
       echo >&2 "${image_name} reports '${image_binary_version}' for ${binary_name}, expected '${binary_name} ${release_tag#v}'"
       exit 1
     }
-    docker run --rm --platform "$platform" --user zinder:zinder \
+    docker run --rm --platform "$platform" --user 10001:10001 \
       --entrypoint "$binary_name" "$smoke_image" --help >/dev/null
+    # Port 1 has no listener, so the healthcheck must report unhealthy (1),
+    # not a usage error (2) from a binary without the subcommand.
+    healthcheck_status=0
+    docker run --rm --platform "$platform" --user 10001:10001 \
+      --entrypoint "$binary_name" "$smoke_image" healthcheck --addr 127.0.0.1:1 \
+      >/dev/null 2>&1 || healthcheck_status=$?
+    [[ "$healthcheck_status" -eq 1 ]] || {
+      echo >&2 "${image_name} ${binary_name} healthcheck against a closed port exited ${healthcheck_status}, expected 1"
+      exit 1
+    }
   done
-  echo "${image_name} (${platform_arch}): ${carried_binaries[*]} match the archive and run as zinder"
+  rm -f -- "$smoke_filesystem"
+  echo "${image_name} (${platform_arch}): ${carried_binaries[*]} match the archive and run as UID 10001"
 done <<< "$image_names"

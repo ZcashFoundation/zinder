@@ -15,7 +15,7 @@ services:
     command:
       - chown
       - -R
-      - ${ZINDER_CANONICAL_RUNTIME_UID:-1000}:${ZINDER_CANONICAL_RUNTIME_GID:-1000}
+      - ${ZINDER_CANONICAL_RUNTIME_UID:-10001}:${ZINDER_CANONICAL_RUNTIME_GID:-10001}
       - /var/lib/zinder
     volumes:
       - type: volume
@@ -26,7 +26,7 @@ services:
 
   zinder-ingest:
     image: ${ZINDER_CANONICAL_RUNTIME_IMAGE:?set ZINDER_CANONICAL_RUNTIME_IMAGE to an immutable image ID or digest-pinned reference}
-    user: "${ZINDER_CANONICAL_RUNTIME_UID:-1000}:${ZINDER_CANONICAL_RUNTIME_GID:-1000}"
+    user: "${ZINDER_CANONICAL_RUNTIME_UID:-10001}:${ZINDER_CANONICAL_RUNTIME_GID:-10001}"
     init: true
     read_only: true
     restart: on-failure:5
@@ -72,7 +72,7 @@ services:
     ports:
       - "127.0.0.1:${ZINDER_CANONICAL_RUNTIME_OPS_HOST_PORT:-19105}:9105"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:9105/healthz"]
+      test: ["CMD", "zinder-ingest", "healthcheck", "--path", "/healthz"]
       interval: 10s
       timeout: 5s
       start_period: 10s

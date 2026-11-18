@@ -6,7 +6,9 @@
 //!   values defined in `docs/architecture/service-operations.md`, plus the
 //!   [`ComposedReadiness`] precedence shared by multi-input runtimes.
 //! - The `/healthz`, `/readyz`, and `/metrics` HTTP endpoints
-//!   ([`spawn_ops_endpoint`], [`serve_ops_endpoint`]).
+//!   ([`spawn_ops_endpoint`], [`serve_ops_endpoint`]), and the `healthcheck`
+//!   subcommand that probes them from inside a container
+//!   ([`OpsHealthcheckArgs`], [`probe_ops_endpoint`]).
 //! - The bounded HTTP/1 listener ([`serve_http`], [`HttpListenerLimits`]) that
 //!   serves every axum router, so header, body, idle, and connection limits
 //!   are applied in one place.
@@ -54,6 +56,7 @@ mod logging;
 mod memory_budget;
 mod metrics;
 mod ops_endpoint;
+mod ops_healthcheck;
 mod public_grpc_server;
 mod readiness;
 mod repeated_field_limits;
@@ -105,6 +108,11 @@ pub use metrics::{
 pub use ops_endpoint::{
     OpsEndpointHandle, OpsServer, OpsServerError, serve_ops_endpoint, spawn_ops_endpoint,
     spawn_ops_endpoint_for,
+};
+pub use ops_healthcheck::{
+    DEFAULT_OPS_HEALTHCHECK_PATH, OPS_HEALTHCHECK_TIMEOUT, OPS_LISTEN_ADDR_ENV_VAR,
+    OpsHealthcheckArgs, OpsHealthcheckError, config_file_ops_listen_addr, probe_ops_endpoint,
+    resolve_ops_healthcheck_addr,
 };
 pub use public_grpc_server::{
     DEFAULT_GRPC_RECEIVE_SLOTS, DEFAULT_GRPC_RECEIVE_TIMEOUT, DEFAULT_GRPC_SEND_STALL_TIMEOUT,

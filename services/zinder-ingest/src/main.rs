@@ -1,7 +1,12 @@
 //! Zinder ingestion command-line entry point.
 
 use std::{
-    ffi::OsString, net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc, time::Duration,
+    ffi::OsString,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    process::ExitCode,
+    sync::Arc,
+    time::Duration,
 };
 
 use clap::{Parser, Subcommand};
@@ -33,10 +38,10 @@ use zinder_ingest::{
 };
 use zinder_materialized_views::MaterializedViewStore;
 use zinder_runtime::{
-    ComposedReadiness, ConfigError, OpsEndpointHandle, OpsServerError, Readiness, ReadinessInput,
-    ReadinessState, RuntimeService, StartupPhase, TracingSubscriberError,
-    cancel_on_terminating_signal, host_cpu_meets_compiled_baseline, install_tracing_subscriber,
-    spawn_ops_endpoint_for,
+    ComposedReadiness, ConfigError, OpsEndpointHandle, OpsHealthcheckArgs, OpsServerError,
+    Readiness, ReadinessInput, ReadinessState, RuntimeService, StartupPhase,
+    TracingSubscriberError, cancel_on_terminating_signal, host_cpu_meets_compiled_baseline,
+    install_tracing_subscriber, section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
 };
 use zinder_source::{
     MempoolSource, NodeCapabilities, NodeCapability, NodeHealthConfig, NodeSet, NodeSetSwitch,
@@ -164,11 +169,17 @@ enum Command {
     /// upstream-health snapshot, then exit. Diagnostic only; does not ingest
     /// or commit chain data.
     Probe,
+    /// Probe the operational endpoint once and exit 0 only when it answers
+    /// HTTP 200. Reads only `[ops] listen_addr` from the `--config` file.
+    Healthcheck(OpsHealthcheckArgs),
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Some(Command::Healthcheck(healthcheck)) = &cli.command {
+        return run_healthcheck(healthcheck, cli.config_path.as_deref());
+    }
     if let Err(error) = install_tracing_subscriber() {
         return emit_tracing_subscriber_error(&error);
     }
@@ -1503,12 +1514,29 @@ async fn run_runtime(cli: Cli) -> ExitCode {
     let config_path = cli.config_path.clone();
     let runtime_result = match cli.command {
         Some(Command::Probe) => run_probe(config_path, overrides).await,
+        Some(Command::Healthcheck(healthcheck)) => {
+            return run_healthcheck(&healthcheck, config_path.as_deref());
+        }
         None => Box::pin(run_ingest(config_path, overrides)).await,
     };
 
     match runtime_result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => emit_runtime_error(&error),
+    }
+}
+
+#[allow(
+    clippy::print_stderr,
+    reason = "the container runtime records the healthcheck's stderr as its failure reason"
+)]
+fn run_healthcheck(healthcheck: &OpsHealthcheckArgs, config_path: Option<&Path>) -> ExitCode {
+    match healthcheck.run(config_path, default_ops_listen_addr(RuntimeService::Ingest)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{}: healthcheck failed: {error}", env!("CARGO_BIN_NAME"));
+            ExitCode::FAILURE
+        }
     }
 }
 

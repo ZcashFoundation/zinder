@@ -217,9 +217,8 @@ jq -e '
   and .services["zinder-explorer"].depends_on["zinder-query"].condition == "service_healthy"
   and .services["zinder-explorer"].healthcheck.test == [
     "CMD",
-    "curl",
-    "-fsS",
-    "http://localhost:9069/readyz"
+    "zinder-explorer",
+    "healthcheck"
   ]
   and .services["zinder-explorer"].environment.ZINDER_EXPLORER__LISTEN_ADDR == "[::]:9068"
   and .services["zinder-explorer"].environment.ZINDER_OPS__LISTEN_ADDR == "[::]:9069"
@@ -234,6 +233,30 @@ jq -e '
     | all(.target != "/var/run/zinder-checkpoint/checkpoint.token"))
 ' "$resolved_explorer_compose" >/dev/null \
   || fail "the optional explorer overlay does not preserve its reader-only deployment contract"
+
+released_compose="$temporary_directory/released-compose.json"
+ZINDER_CONTROL_SECRETS_DIR="$control_secrets" \
+ZINDER_VERSION=v9.8.7 \
+docker compose \
+  --env-file "$repository_root/deploy/.env.testnet" \
+  -f "$repository_root/deploy/docker-compose.yml" \
+  -f "$repository_root/deploy/docker-compose.explorer.yml" \
+  config --format json > "$released_compose"
+jq -e '
+  [
+    "zinder-ingest",
+    "zinder-projector",
+    "zinder-query",
+    "zinder-compat-lightwalletd",
+    "zinder-explorer"
+  ]
+  | all(. as $service
+    | $released[0].services[$service].image == ("ghcr.io/zcashfoundation/" + $service + ":v9.8.7")
+    and $released[0].services[$service].build.target == $service
+    and $source[0].services[$service].image == ("ghcr.io/zcashfoundation/" + $service + ":local"))
+' --slurpfile released "$released_compose" --slurpfile source "$resolved_explorer_compose" \
+  -n >/dev/null \
+  || fail "ZINDER_VERSION does not select the published release image for every runtime while keeping its source build"
 
 for deployment_env in "${deployment_env_names[@]}"; do
   resolved_env_compose="$temporary_directory/resolved-$deployment_env-compose.json"
@@ -275,31 +298,6 @@ for deployment_env in "${deployment_env_names[@]}"; do
     and (.services["zinder-projector"].environment | has("ZINDER_NODE__JSON_RPC_ADDR") | not)
   ' "$resolved_env_explorer_compose" >/dev/null \
     || fail "the $deployment_env env file does not resolve to its own node network, cookie volume, and endpoint"
-
-  resolved_cookie_compose="$temporary_directory/resolved-$deployment_env-cookie-compose.json"
-  docker compose \
-    --env-file "$repository_root/deploy/.env.$deployment_env" \
-    -f "$repository_root/deploy/node-cookie-permissions.yml" \
-    config --format json > "$resolved_cookie_compose"
-  jq -e --arg cookie_volume "$(env_file_value "$deployment_env" ZINDER_SOURCE_COOKIE_VOLUME_NAME)" '
-    (.services | keys) == ["cookie-permissions"]
-    and .services["cookie-permissions"].user == "10001:10001"
-    and .services["cookie-permissions"].cap_drop == ["ALL"]
-    and (.services["cookie-permissions"].cap_add // []) == []
-    and (.services["cookie-permissions"].security_opt | index("no-new-privileges:true")) != null
-    and .services["cookie-permissions"].read_only == true
-    and .services["cookie-permissions"].network_mode == "none"
-    and .services["cookie-permissions"].restart == "unless-stopped"
-    and .services["cookie-permissions"].volumes == [{
-      "type": "volume",
-      "source": "node-cookie",
-      "target": "/var/run/auth",
-      "volume": {}
-    }]
-    and .volumes["node-cookie"].external == true
-    and .volumes["node-cookie"].name == $cookie_volume
-  ' "$resolved_cookie_compose" >/dev/null \
-    || fail "the $deployment_env cookie permissions project does not keep its unprivileged in-place contract"
 done
 
 missing_node_env="$temporary_directory/missing-node.env"
@@ -312,14 +310,12 @@ if ZINDER_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
 fi
 missing_deploy_network_env="$temporary_directory/missing-deploy-network.env"
 grep -v '^ZINDER_DEPLOY_NETWORK=' "$repository_root/deploy/.env.testnet" > "$missing_deploy_network_env"
-for compose_file in docker-compose.yml node-cookie-permissions.yml; do
-  if ZINDER_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
-    --env-file "$missing_deploy_network_env" \
-    -f "$repository_root/deploy/$compose_file" \
-    config -q >/dev/null 2>&1; then
-    fail "$compose_file resolved without ZINDER_DEPLOY_NETWORK"
-  fi
-done
+if ZINDER_CONTROL_SECRETS_DIR="$control_secrets" docker compose \
+  --env-file "$missing_deploy_network_env" \
+  -f "$repository_root/deploy/docker-compose.yml" \
+  config -q >/dev/null 2>&1; then
+  fail "docker-compose.yml resolved without ZINDER_DEPLOY_NETWORK"
+fi
 
 missing_state_init_compose="$temporary_directory/missing-state-init-compose.json"
 jq 'del(.services["state-init"]) | del(.services["zinder-ingest"].depends_on["state-init"])' \
@@ -329,11 +325,18 @@ expect_rejected \
   --compose-contract "$missing_state_init_compose"
 
 missing_checkpoint_root_compose="$temporary_directory/missing-checkpoint-root-compose.json"
-jq '.services["state-init"].command = ["chown", "-R", "1000:1000", "/var/lib/zinder"]' \
+jq '.services["state-init"].command = ["chown", "-R", "10001:10001", "/var/lib/zinder"]' \
   "$resolved_compose" > "$missing_checkpoint_root_compose"
 expect_rejected \
   "a Compose contract that does not initialize the isolated checkpoint volume" \
   --compose-contract "$missing_checkpoint_root_compose"
+
+legacy_uid_state_init_compose="$temporary_directory/legacy-uid-state-init-compose.json"
+jq '.services["state-init"].command[2] |= sub("chown -R 10001:10001 "; "chown -R 1000:1000 ")' \
+  "$resolved_compose" > "$legacy_uid_state_init_compose"
+expect_rejected \
+  "a Compose contract that initializes the shared volumes for UID 1000" \
+  --compose-contract "$legacy_uid_state_init_compose"
 
 shared_checkpoint_volume_compose="$temporary_directory/shared-checkpoint-volume-compose.json"
 jq '
@@ -455,7 +458,7 @@ expect_rejected \
   --compose-contract "$published_control_compose"
 
 healthz_compose="$temporary_directory/healthz-compose.json"
-jq '.services["zinder-ingest"].healthcheck.test[-1] = "http://localhost:9105/healthz"' \
+jq '.services["zinder-ingest"].healthcheck.test += ["--path", "/healthz"]' \
   "$resolved_compose" > "$healthz_compose"
 expect_rejected \
   "a Compose dependency gate using liveness instead of readiness" \
@@ -675,12 +678,43 @@ unchecked_installed_mode_packager="$temporary_directory/unchecked-installed-mode
 # The literal shell variables are the fixture removal target.
 # shellcheck disable=SC2016
 mutate_image_packager "$unchecked_installed_mode_packager" \
-  sed '/\[\[ "\$image_binary_stat" == /d'
+  sed '/\[\[ "\$image_binary_listing" == /d'
 expect_rejected_because \
   "an image packager that ignores the mode installed inside the image" \
   'release admission rejected: the release image packager must' \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
   --image-packager "$unchecked_installed_mode_packager"
+
+unchecked_healthcheck_packager="$temporary_directory/unchecked-healthcheck-packager.sh"
+# The literal shell variables are the fixture removal target.
+# shellcheck disable=SC2016
+mutate_image_packager "$unchecked_healthcheck_packager" \
+  sed '/\[\[ "\$healthcheck_status" -eq 1 \]\]/d'
+expect_rejected_because \
+  "an image packager that does not run the healthcheck inside the image" \
+  'release admission rejected: the release image packager must' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --image-packager "$unchecked_healthcheck_packager"
+
+wall_clock_created_packager="$temporary_directory/wall-clock-created-packager.sh"
+# The literal shell variables are the fixture rewrite target.
+# shellcheck disable=SC2016
+mutate_image_packager "$wall_clock_created_packager" \
+  sed 's/date -u -d "@\${source_date_epoch}"/date -u/'
+expect_rejected_because \
+  "an image packager whose created label is the build time" \
+  'release admission rejected: the release image packager must' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --image-packager "$wall_clock_created_packager"
+
+undescribed_image_packager="$temporary_directory/undescribed-image-packager.sh"
+mutate_image_packager "$undescribed_image_packager" \
+  sed '/org.opencontainers.image.description=/d'
+expect_rejected_because \
+  "an image packager that omits the image description label" \
+  'release admission rejected: the release image packager must' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --image-packager "$undescribed_image_packager"
 
 pushing_check_packager="$temporary_directory/pushing-check-packager.sh"
 mutate_image_packager "$pushing_check_packager" \
@@ -920,6 +954,105 @@ expect_rejected_because \
   'release admission rejected: the zinder-binaries stage must compile exactly' \
   --release-workflow "$repository_root/.github/workflows/release.yml" \
   --dockerfile "$compiling_archive_dockerfile"
+
+debian_service_dockerfile="$temporary_directory/debian-service.Dockerfile"
+sed 's/^FROM zinder-service-base AS zinder-query$/FROM zinder-runtime-base AS zinder-query/' \
+  "$repository_root/deploy/Dockerfile" > "$debian_service_dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose query image builds on the Debian runtime base" \
+  'release admission rejected: every per-service release image must build on' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$debian_service_dockerfile"
+
+shell_less_single_volume_dockerfile="$temporary_directory/shell-less-single-volume.Dockerfile"
+sed 's/^FROM zinder-runtime-base AS zinder-wallet-serving$/FROM zinder-service-base AS zinder-wallet-serving/' \
+  "$repository_root/deploy/Dockerfile" > "$shell_less_single_volume_dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose wallet-serving image has no shell for its entrypoint" \
+  'release admission rejected: every per-service release image must build on' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$shell_less_single_volume_dockerfile"
+
+unpinned_distroless_dockerfile="$temporary_directory/unpinned-distroless.Dockerfile"
+# The variable reference is the literal Dockerfile text being rewritten.
+# shellcheck disable=SC2016
+sed 's#^FROM gcr.io/distroless/cc-debian12:nonroot@\${DISTROLESS_IMAGE_DIGEST} AS zinder-service-base$#FROM gcr.io/distroless/cc-debian12:nonroot AS zinder-service-base#' \
+  "$repository_root/deploy/Dockerfile" > "$unpinned_distroless_dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose distroless service base is not digest-pinned" \
+  'release admission rejected: every per-service release image must build on' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$unpinned_distroless_dockerfile"
+
+legacy_uid_dockerfile="$temporary_directory/legacy-uid.Dockerfile"
+sed 's/^USER 10001:10001$/USER 1000:1000/' \
+  "$repository_root/deploy/Dockerfile" > "$legacy_uid_dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose service images run as UID 1000" \
+  'release admission rejected: every per-service release image must build on' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$legacy_uid_dockerfile"
+
+legacy_account_dockerfile="$temporary_directory/legacy-account.Dockerfile"
+sed 's/useradd --system --uid 10001 --gid zinder/useradd --system --uid 1000 --gid zinder/' \
+  "$repository_root/deploy/Dockerfile" > "$legacy_account_dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose single-volume zinder account is not UID 10001" \
+  'release admission rejected: every per-service release image must build on' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$legacy_account_dockerfile"
+
+curl_healthcheck_dockerfile="$temporary_directory/curl-healthcheck.Dockerfile"
+sed 's#^    CMD \["zinder-projector", "--config", "/etc/zinder/config.toml", "healthcheck"\]$#    CMD curl -fsS http://localhost:9110/readyz || exit 1#' \
+  "$repository_root/deploy/Dockerfile" > "$curl_healthcheck_dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose projector image probes itself with curl" \
+  'release admission rejected: every per-service release image must build on' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$curl_healthcheck_dockerfile"
+
+configless_healthcheck_dockerfile="$temporary_directory/configless-healthcheck.Dockerfile"
+sed 's#^    CMD \["zinder-query", "--config", "/etc/zinder/config.toml", "healthcheck"\]$#    CMD ["zinder-query", "healthcheck"]#' \
+  "$repository_root/deploy/Dockerfile" > "$configless_healthcheck_dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose query healthcheck ignores the image config file" \
+  'release admission rejected: every per-service release image must build on' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$configless_healthcheck_dockerfile"
+
+listener_env_dockerfile="$temporary_directory/listener-env.Dockerfile"
+awk '
+  { print }
+  $0 == "COPY deploy/config/images/query.toml /etc/zinder/config.toml" {
+    print "ENV ZINDER_OPS__LISTEN_ADDR=[::]:9106"
+  }
+' "$repository_root/deploy/Dockerfile" > "$listener_env_dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose query image sets a listener through the environment" \
+  'release admission rejected: every per-service release image must copy its' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$listener_env_dockerfile"
+
+public_bind_env_dockerfile="$temporary_directory/public-bind-env.Dockerfile"
+sed 's#^USER 10001:10001$#ENV ZINDER_SECURITY__ALLOW_PUBLIC_BIND=true\nUSER 10001:10001#' \
+  "$repository_root/deploy/Dockerfile" > "$public_bind_env_dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose service base allows public binds through the environment" \
+  'release admission rejected: every per-service release image must copy its' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$public_bind_env_dockerfile"
+
+unconfigured_cmd_dockerfile="$temporary_directory/unconfigured-cmd.Dockerfile"
+awk '
+  $0 == "ENTRYPOINT [\"zinder-explorer\"]" { explorer = 1 }
+  explorer && $0 == "CMD [\"--config\", \"/etc/zinder/config.toml\"]" { explorer = 0; next }
+  { print }
+' "$repository_root/deploy/Dockerfile" > "$unconfigured_cmd_dockerfile"
+expect_rejected_because \
+  "a Dockerfile whose explorer image does not pass its default config" \
+  'release admission rejected: every per-service release image must copy its' \
+  --release-workflow "$repository_root/.github/workflows/release.yml" \
+  --dockerfile "$unconfigured_cmd_dockerfile"
 
 parallel_publication_workflow="$temporary_directory/parallel-publication-release.yml"
 sed 's/group: release-publication/group: release-${{ github.ref }}/' \

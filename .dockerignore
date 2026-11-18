@@ -41,6 +41,8 @@ deploy/
 !deploy/wallet-serving-healthcheck
 !deploy/config/wallet-serving/
 !deploy/config/wallet-serving/**
+!deploy/config/images/
+!deploy/config/images/**
 
 # Test outputs.
 **/test-results/

@@ -7,6 +7,7 @@ mod native_grpc;
 mod node_backed_capabilities;
 mod query_request_metrics;
 mod reflection;
+mod release_image;
 mod repeated_field_limits;
 mod runtime_allocator;
 mod single_artifact_lookup;

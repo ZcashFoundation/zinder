@@ -94,7 +94,17 @@ sudo git clone https://github.com/ZcashFoundation/zinder.git /opt/zinder
 sudo git -C /opt/zinder checkout vX.Y.Z
 sudo install -d -o root -g root -m 0755 /etc/zinder
 sudo cp /opt/zinder/deploy/.env.mainnet /etc/zinder/env
+echo 'ZINDER_VERSION=vX.Y.Z' | sudo tee -a /etc/zinder/env >/dev/null
 ```
+
+`ZINDER_VERSION` selects the signed release images
+`ghcr.io/zcashfoundation/<runtime>:vX.Y.Z` for every runtime. Set it to the
+tag you checked out, because each Compose file matches the images of its own
+release. To build every image from the checkout instead, leave
+`ZINDER_VERSION` out of the env file. `ZINDER_INGEST_IMAGE`,
+`ZINDER_PROJECTOR_IMAGE`, `ZINDER_QUERY_IMAGE`, `ZINDER_COMPAT_IMAGE`, and
+`ZINDER_EXPLORER_IMAGE` each replace one whole image reference, for example
+with a digest-pinned one.
 
 Pick the env file for your node and network:
 
@@ -182,14 +192,14 @@ Create the root-owned file-backed control-secret directory before validating
 Compose. The ordinary ingest token is mounted into all four runtimes; the
 checkpoint token is mounted only into ingest and projector.
 The group must be the container service group (the release images use GID
-1000), while the files remain owned by root and are not stored in the shared
+10001), while the files remain owned by root and are not stored in the shared
 RocksDB volume.
 
 ```bash
-sudo install -d -o root -g 1000 -m 0750 /etc/zinder/control-secrets
+sudo install -d -o root -g 10001 -m 0750 /etc/zinder/control-secrets
 openssl rand -hex 32 | sudo tee /etc/zinder/control-secrets/ingest.token >/dev/null
 openssl rand -hex 32 | sudo tee /etc/zinder/control-secrets/checkpoint.token >/dev/null
-sudo chown root:1000 /etc/zinder/control-secrets/*.token
+sudo chown root:10001 /etc/zinder/control-secrets/*.token
 sudo chmod 0440 /etc/zinder/control-secrets/*.token
 ```
 
@@ -207,12 +217,30 @@ docker compose --env-file /etc/zinder/env \
   -f deploy/docker-compose.yml config -q
 ```
 
-Build and start the four release runtimes:
+Pull the release images and start the four release runtimes:
+
+```bash
+docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml pull
+docker compose --env-file /etc/zinder/env \
+  -f deploy/docker-compose.yml up -d --no-build
+```
+
+`pull` fails when `ZINDER_VERSION` names a tag that was never published.
+`--no-build` keeps `up` from building that tag from source instead and naming
+the local result as the release. To verify the image signatures and
+attestations before starting them, follow
+[Verify publication](releasing.md#verify-publication).
+
+On a source-build host without `ZINDER_VERSION`, build and start the runtimes
+instead:
 
 ```bash
 docker compose --env-file /etc/zinder/env \
   -f deploy/docker-compose.yml up -d --build
 ```
+
+The later commands in this runbook use `--no-build`; replace it with
+`--build` on a source-build host.
 
 The Compose topology gives projector, query, and compatibility containers the
 ingest container's network namespace. This keeps `CanonicalControl` and
@@ -229,6 +257,38 @@ unhealthy. Query and compatibility receive five-minute startup grace periods.
 The projector has no node settings, and query and compatibility do not
 contact the node to start: they reach it only to broadcast transactions,
 after checking on first contact that it serves the store's chain.
+
+Each healthcheck runs the service's own binary, for example
+`zinder-query healthcheck`, which requests `/readyz` on the address in
+`ZINDER_OPS__LISTEN_ADDR` and passes only on HTTP 200. `docker compose ps`
+shows the result. The runtime images contain only the service binary and the
+C and C++ runtime libraries it links: there is no shell, curl, or package
+manager, so a custom healthcheck must also call the binary, for example
+`["CMD", "zinder-query", "healthcheck", "--path", "/healthz"]` for liveness
+only. See [Inspect a runtime container](#inspect-a-runtime-container).
+
+### Upgrade from images that ran as UID 1000
+
+Earlier runtime images ran as UID and GID 1000; they now run as 10001. On the
+first start of the upgraded topology, `state-init` hands the data and
+checkpoint-staging volumes to UID 10001, so the stores need no manual step.
+Files mounted from the host do. Before you start the upgraded topology, give
+the control secrets, and the indexer TLS files if you use that overlay, the
+new group:
+
+```bash
+sudo chgrp 10001 /etc/zinder/control-secrets /etc/zinder/control-secrets/*.token
+sudo chgrp 10001 /etc/zinder/indexer-tls /etc/zinder/indexer-tls/*.pem
+```
+
+If you ran the cookie-permissions project beside a Zakura node, remove it,
+including a fallback node's project; Zinder now reads the node's cookie
+without it. The cookie stays mode 0644 until the node writes a new one on its
+next start.
+
+```bash
+docker compose -p zinder-<network>-node-cookie down
+```
 
 ### Attach a Zakura node
 
@@ -252,23 +312,14 @@ address. The Zakura env files therefore leave
 mempool events from Zakura instead, follow
 [Stream mempool events over indexer TLS](#stream-mempool-events-over-indexer-tls).
 
-Zebra and Zakura write the cookie as UID 10001 with mode 0600, and replace it
-on every start. The Zinder runtimes run as UID 1000 and cannot read it. Run
-the cookie-permissions project beside the node with the same env file:
-
-```bash
-docker compose --env-file /etc/zinder/env \
-  -f deploy/node-cookie-permissions.yml up -d
-```
-
-It runs as UID 10001 with no capabilities and no network. Every 5 seconds it
-sets the cookie's mode to 0644 in place; it never copies the cookie. It is a
-separate Compose project, so the Zinder systemd unit does not stop it. After a
-node restart, ingest can find the cookie unreadable for up to one poll
-interval. Ingest reports the node as unavailable and retries. Query and
-compatibility start even while the cookie is unreadable: they report the node
-as unavailable and refuse broadcasts until they can read it. Z3 already runs
-an equivalent service, so Z3 deployments do not need this project.
+The Zebra and Zakura images run the node as UID 10001 and write the cookie
+with mode 0600, replacing it on every start. The Zinder images run as UID
+10001 too, so they read the cookie as written. If the node runs under another
+UID, set the same `user:` on the Zinder services that mount the cookie, or,
+where the node accepts a fixed RPC password, set
+`ZINDER_NODE__AUTH__METHOD=basic` with `ZINDER_NODE__AUTH__USERNAME` and
+`ZINDER_NODE__AUTH__PASSWORD`. Native binaries likewise read the cookie only
+when they run as the node's user.
 
 ### Fail over to a second node
 
@@ -288,16 +339,7 @@ ZINDER_NODE_FALLBACKS__1__INDEXER_GRPC_ADDR=
 docker compose --env-file /etc/zinder/env \
   -f deploy/docker-compose.yml \
   -f deploy/docker-compose.node-fallback.yml \
-  up -d
-```
-
-Run the cookie-permissions project for the fallback node's cookie volume too,
-as a project of its own:
-
-```bash
-ZINDER_SOURCE_COOKIE_VOLUME_NAME=zakura-mainnet-cookie \
-  docker compose -p zinder-mainnet-fallback-node-cookie \
-  --env-file /etc/zinder/env -f deploy/node-cookie-permissions.yml up -d
+  up -d --no-build
 ```
 
 The overlay mounts the fallback cookie at `/var/run/auth-fallback` for ingest,
@@ -344,28 +386,18 @@ merge the explorer overlay:
 docker compose --env-file /etc/zinder/env \
   -f deploy/docker-compose.yml \
   -f deploy/docker-compose.explorer.yml \
-  up -d --build
-```
-
-With `--build`, the overlay builds `zinder-explorer` from the checked-out
-source. To run the released image instead, set
-`ZINDER_EXPLORER_IMAGE=ghcr.io/zcashfoundation/zinder-explorer:vX.Y.Z` in
-`/etc/zinder/env`, then pull it and start the Explorer without a build:
-
-```bash
-docker compose --env-file /etc/zinder/env \
-  -f deploy/docker-compose.yml \
-  -f deploy/docker-compose.explorer.yml \
   pull zinder-explorer
 docker compose --env-file /etc/zinder/env \
   -f deploy/docker-compose.yml \
   -f deploy/docker-compose.explorer.yml \
-  up -d --no-build zinder-explorer
+  up -d --no-build
 ```
 
-Do not pass `--build` while `ZINDER_EXPLORER_IMAGE` names a released image.
-Compose then builds from source and tags the local result with the release
-name.
+`ZINDER_VERSION` selects the released `zinder-explorer` image as it does for
+the other runtimes. On a source-build host, run the second command with
+`--build` instead of `--no-build`. Do not pass `--build` while
+`ZINDER_VERSION` or `ZINDER_EXPLORER_IMAGE` names a released image: Compose
+then builds from source and tags the local result with the release name.
 
 The Explorer opens a process-owned materialized-view
 secondary, and federates `WalletQuery` over the shared loopback namespace. The
@@ -384,7 +416,8 @@ mounts individual files, so query and compatibility receive only
 capability; reader runtimes must never mount or read it.
 
 The root-owned `state-init` service initializes the shared data volume and the
-separate checkpoint-staging volume for UID/GID 1000 before ingest starts.
+separate checkpoint-staging volume for UID/GID 10001 on every start, before
+ingest starts.
 Checkpoint staging is mounted only into ingest and projector, never into query
 or compatibility. Canonical checkpoint requests accept only an opaque candidate
 identifier beneath that root; the projector prepares the candidate directory,
@@ -523,10 +556,10 @@ Install them in a root-owned directory that the container service group can
 read, outside the shared RocksDB volume:
 
 ```bash
-sudo install -d -o root -g 1000 -m 0750 /etc/zinder/indexer-tls
-sudo install -o root -g 1000 -m 0440 node-indexer-ca.pem /etc/zinder/indexer-tls/ca.pem
-sudo install -o root -g 1000 -m 0440 zinder-client.pem /etc/zinder/indexer-tls/client.pem
-sudo install -o root -g 1000 -m 0440 zinder-client-key.pem /etc/zinder/indexer-tls/client-key.pem
+sudo install -d -o root -g 10001 -m 0750 /etc/zinder/indexer-tls
+sudo install -o root -g 10001 -m 0440 node-indexer-ca.pem /etc/zinder/indexer-tls/ca.pem
+sudo install -o root -g 10001 -m 0440 zinder-client.pem /etc/zinder/indexer-tls/client.pem
+sudo install -o root -g 10001 -m 0440 zinder-client-key.pem /etc/zinder/indexer-tls/client-key.pem
 ```
 
 Then set the indexer URL and the directory in `/etc/zinder/env`:
@@ -549,7 +582,7 @@ docker compose --env-file /etc/zinder/env \
 docker compose --env-file /etc/zinder/env \
   -f deploy/docker-compose.yml \
   -f deploy/docker-compose.indexer-tls.yml \
-  up -d --build
+  up -d --no-build
 ```
 
 The overlay mounts the directory read-only into `zinder-ingest` only, because
@@ -600,6 +633,37 @@ not route wallet traffic based on `/healthz`. Query and compatibility stay
 ready through a node or ingest-control outage. Their `/readyz` body lists the
 outage under `degraded`, and only the requests that call that dependency
 fail.
+
+## Inspect a runtime container
+
+The runtime images run the service binary as UID 10001 and contain no shell,
+so `docker compose exec zinder-query sh` fails. Run the binary itself instead:
+
+```bash
+# The effective configuration after the config file and the environment,
+# with secrets redacted.
+docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml \
+  exec zinder-query zinder-query --config /etc/zinder/config.toml --print-config
+# One readiness probe, which prints the reason when it fails.
+docker compose --env-file /etc/zinder/env -f deploy/docker-compose.yml \
+  exec zinder-query zinder-query healthcheck
+```
+
+To look at files, processes, or loopback listeners with ordinary tools, attach
+a throwaway toolbox container to the service's namespaces, with its volumes
+read-only:
+
+```bash
+container="$(docker compose --env-file /etc/zinder/env \
+  -f deploy/docker-compose.yml ps -q zinder-query)"
+docker run --rm -it \
+  --network "container:${container}" --pid "container:${container}" \
+  --volumes-from "${container}:ro" \
+  busybox:1.37 sh
+```
+
+The toolbox leaves the running container and its image unchanged, and it
+stops when you exit the shell.
 
 ## Put TLS in front of compatibility
 

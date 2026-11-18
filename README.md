@@ -60,15 +60,27 @@ GitHub Release binds all downloadable assets. See the
 installation and runtime ownership requirements.
 
 Bring up a Zebra node through the [Z3 platform stack](https://github.com/ZcashFoundation/z3),
-then start Zinder from this checkout. The env file names the node's Docker
-network, cookie volume, and endpoints; `deploy/.env.zakura-*` files do the same
-for a Zakura node.
+then start Zinder's signed release images from a checkout of the same release
+tag. The env file names the node's Docker network, cookie volume, and
+endpoints; `deploy/.env.zakura-*` files do the same for a Zakura node.
 
 ```bash
 # In the Z3 checkout.
 Z3_NETWORK=testnet docker compose up -d
 
 # In the Zinder checkout.
+git checkout vX.Y.Z
+export ZINDER_VERSION=vX.Y.Z
+docker compose --env-file deploy/.env.testnet -f deploy/docker-compose.yml pull
+docker compose --env-file deploy/.env.testnet \
+  -f deploy/docker-compose.yml up -d --no-build
+```
+
+`pull` fails on a tag that was never published. Without `--no-build`, Compose
+would instead build that tag from source and name the result as the release.
+To build every image from the checkout instead, leave `ZINDER_VERSION` unset:
+
+```bash
 docker compose --env-file deploy/.env.testnet \
   -f deploy/docker-compose.yml up -d --build
 ```

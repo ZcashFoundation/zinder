@@ -1,10 +1,15 @@
 //! Zinder native wallet-query gRPC server entry point.
 
 use std::{
-    future::Future, net::SocketAddr, path::PathBuf, pin::Pin, process::ExitCode, time::Duration,
+    future::Future,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    pin::Pin,
+    process::ExitCode,
+    time::Duration,
 };
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 use zinder_core::wire::encode_zinder_native_chain_name;
 use zinder_query::{
@@ -14,9 +19,10 @@ use zinder_query::{
     spawn_wallet_node_readiness_probe,
 };
 use zinder_runtime::{
-    OpsEndpointHandle, OpsServerError, Readiness, RuntimeService, StartupPhase,
+    OpsEndpointHandle, OpsHealthcheckArgs, OpsServerError, Readiness, RuntimeService, StartupPhase,
     TracingSubscriberError, TrafficReadinessInterceptor, cancel_on_terminating_signal,
-    install_metrics_recorder_for_service, install_tracing_subscriber, spawn_ops_endpoint_for,
+    install_metrics_recorder_for_service, install_tracing_subscriber,
+    section_defaults::default_ops_listen_addr, spawn_ops_endpoint_for,
 };
 use zinder_source::{DEFAULT_NODE_HEALTH_POLL_INTERVAL_MS, ZebraJsonRpcSource};
 
@@ -85,11 +91,23 @@ struct Cli {
     /// Node JSON-RPC address used for transaction broadcast. Omit to disable broadcast.
     #[arg(long = "node-json-rpc-addr")]
     node_json_rpc_addr: Option<String>,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Probe the operational endpoint once and exit 0 only when it answers
+    /// HTTP 200. Reads only `[ops] listen_addr` from the `--config` file.
+    Healthcheck(OpsHealthcheckArgs),
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Some(Command::Healthcheck(healthcheck)) = &cli.command {
+        return run_healthcheck(healthcheck, cli.config_path.as_deref());
+    }
     if let Err(error) = install_tracing_subscriber() {
         return emit_tracing_subscriber_error(&error);
     }
@@ -561,6 +579,20 @@ fn drain_operations_after_runtime_failure(operations_outcome: Result<(), QueryCo
             error = %error,
             "operations endpoint failed while draining after another runtime failure"
         );
+    }
+}
+
+#[allow(
+    clippy::print_stderr,
+    reason = "the container runtime records the healthcheck's stderr as its failure reason"
+)]
+fn run_healthcheck(healthcheck: &OpsHealthcheckArgs, config_path: Option<&Path>) -> ExitCode {
+    match healthcheck.run(config_path, default_ops_listen_addr(RuntimeService::Query)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{}: healthcheck failed: {error}", env!("CARGO_BIN_NAME"));
+            ExitCode::FAILURE
+        }
     }
 }
 

@@ -23,6 +23,37 @@ injected, while release images carry the full tag-target commit. The same
 version and commit appear in the `zinder_build_info` metric and native
 `ServerInfo`; lightwalletd compatibility exposes them through `LightdInfo`.
 
+## Healthcheck subcommand
+
+Every runtime binary, `zinder-ingest`, `zinder-projector`, `zinder-query`,
+`zinder-compat-lightwalletd`, and `zinder-explorer`, answers
+`healthcheck` with one plain HTTP/1.1 `GET` to its own operational endpoint.
+It exits 0 only on HTTP 200 and exits 1 otherwise, printing the reason, such
+as the refused address or the status and the start of the body, to stderr.
+Container runtimes record that line as the failure reason. The probe does not
+load the service configuration; of the global `--config` file it reads only
+`[ops] listen_addr`:
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--addr` | `ZINDER_OPS__LISTEN_ADDR`, then `[ops] listen_addr` in the `--config` file, then the service's default ops address | The endpoint to probe. An unspecified host, `[::]` or `0.0.0.0`, probes loopback: `[::]` tries `[::1]`, then `127.0.0.1`. |
+| `--path` | `/readyz` | The route to request. Use `/healthz` for liveness only. |
+
+An empty address from the environment or the file disables the endpoint, so
+the probe fails without connecting. A `--config` file that is missing,
+unreadable, or not TOML, or that does not set `[ops] listen_addr` to a string,
+is skipped, and the probe uses the service's default ops address. The probe
+ignores the service's `--ops-listen-addr` flag; pass the same address with
+`--addr`. The runtime images run `zinder-<runtime> --config
+/etc/zinder/config.toml healthcheck`, so they probe the ops address of the file
+at that path, whether the image's default or a mounted one. A container started
+with `--config` pointing at another path still has that healthcheck, so mount
+the file at `/etc/zinder/config.toml` instead, or override the healthcheck with
+the same `--config`, whenever the file changes the ops address. The whole probe is
+bounded at 3 seconds, below the 5-second timeout of the image and Compose
+healthchecks, so the probe reports its own reason before the container runtime
+kills it.
+
 ## Readiness vocabulary
 
 `ReadinessCause` is shared by JSON and protobuf surfaces:
@@ -1275,7 +1306,11 @@ cookie contents, viewing keys, or unbounded payloads.
 
 ## Security boundary
 
-Public listeners require explicit `security.allow_public_bind = true`. The
+Public listeners require explicit `security.allow_public_bind = true`, which
+the [runtime images](#runtime-images) set so their listeners accept
+connections from outside the container's loopback. Restrict who can reach
+those listeners at the container network, as
+[Runtime images](#runtime-images) describes. The
 release service does not provide public TLS termination, authentication, rate
 limits, or quota accounting. Put public compatibility traffic behind an
 operator-controlled HTTP/2 proxy. Public gRPC listeners bound request size,
@@ -1368,9 +1403,9 @@ which predate schedule admission, remain readable.
 
 The complete supported composition is the same-host RocksDB deployment in
 `deploy/docker-compose.yml` and `deploy/systemd/`. It attaches to an external
-Zebra or Zakura node selected entirely by a `deploy/.env.*` file, and
-`deploy/node-cookie-permissions.yml` makes a non-Z3 node's cookie readable to
-the Zinder runtimes. The runtime release-image catalog,
+Zebra or Zakura node selected entirely by a `deploy/.env.*` file. The
+runtimes read the node's mode-0600 RPC cookie directly because they run as the
+node images' UID, 10001. The runtime release-image catalog,
 `deploy/release-images.json`, holds ingest, projector, native query,
 lightwalletd compatibility, and the optional Explorer, which the
 `deploy/docker-compose.explorer.yml` overlay adds to that composition. A
@@ -1382,3 +1417,73 @@ Explorer to it; and `zinder-canonical-runtime`, an ingest-only diagnostic or
 canary runtime. None is the complete supported composition. Every image is a
 target of the single `deploy/Dockerfile`. Cipherscan and PostgreSQL are not
 release classes.
+
+### Runtime images
+
+Each runtime image runs one binary as UID and GID 10001 on a digest-pinned
+`gcr.io/distroless/cc-debian12:nonroot` base, which carries glibc, the GCC and
+C++ runtime libraries, and CA certificates. The image has no shell, curl,
+or package manager. The Zebra and Zakura images also run as UID 10001 and
+write their RPC cookie with mode 0600, so a runtime that mounts the cookie
+reads it directly. When the node runs under another UID, run the Zinder
+container with that UID, or use `basic` node authentication where the node
+accepts a fixed RPC password. The single-volume host images create their
+`zinder` account with the same UID and GID, and their entrypoints hand the
+mounted volume to it on every start. Other orchestrators must give volumes to
+UID 10001 themselves, for example with Kubernetes `fsGroup: 10001`. Its
+`HEALTHCHECK` runs the
+[healthcheck subcommand](#healthcheck-subcommand): ingest probes `/healthz`
+after a 10-second start period, and the other runtimes probe `/readyz`. The
+single-volume host images, the benchmark, and the live-test runner keep the
+Debian base with `sh` and `curl`, because their entrypoint scripts need them.
+
+Each runtime image installs a default configuration file from
+`deploy/config/images/` at `/etc/zinder/config.toml`, and its `CMD` passes it:
+the image runs `zinder-<runtime> --config /etc/zinder/config.toml`. The file
+holds only listener defaults, so `docker run -p` reaches a container started
+without other configuration:
+
+| Image | Default file settings |
+| --- | --- |
+| `zinder-ingest` | `[ops] listen_addr = "[::]:9105"` |
+| `zinder-projector` | `[ops] listen_addr = "[::]:9110"` |
+| `zinder-query` | `[query] listen_addr = "[::]:9102"`, `[ops] listen_addr = "[::]:9106"` |
+| `zinder-compat-lightwalletd` | `[compat] listen_addr = "[::]:9067"`, `[ops] listen_addr = "[::]:9107"` |
+| `zinder-explorer` | `[explorer] listen_addr = "[::]:9068"`, `[ops] listen_addr = "[::]:9069"` |
+
+Every file also sets `[security] allow_public_bind = true`. None sets a
+network, node, or storage value, so those stay required, from a mounted file
+or `ZINDER_*` variables.
+
+A file mounted at `/etc/zinder/config.toml` replaces the default as a whole.
+A listener it does not set takes the service's built-in loopback default, and
+without `allow_public_bind = true` the service refuses a non-loopback serving
+bind. `ZINDER_*` variables override individual values of whichever file is
+used, as they do for any config file. Arguments after the image name replace
+`CMD`, so pass `--config /etc/zinder/config.toml` again to keep the file, for
+example `docker run <image> --config /etc/zinder/config.toml --print-config`.
+`deploy/docker-compose.yml` mounts its own file at that path and sets its
+listeners explicitly.
+
+Publishing a port is not the only way to reach these listeners:
+
+- On a Docker bridge network, every container on the same network, and on
+  Linux the host itself through the container's address, can connect to a
+  `[::]` listener whether or not its port is published.
+- With host networking (`--network host` or `network_mode: host`), `[::]`
+  binds every interface of the host.
+
+Run the containers on a dedicated network that holds only the services that
+should reach them, do not use host networking for them, and publish ports on
+`127.0.0.1` unless a proxy terminates TLS and authorization in front of them.
+To keep a listener on loopback inside the container instead, set it in a
+mounted file or with its variable, for example
+`-e ZINDER_OPS__LISTEN_ADDR=127.0.0.1:9106`. Ingest's `IngestControl` listener
+keeps its `127.0.0.1:9100` default.
+
+To inspect a running container, run its binary with `docker exec`, for example
+`docker exec <container> zinder-query --config /etc/zinder/config.toml
+--print-config` for the effective, redacted configuration. For ordinary tools,
+start a throwaway container in the service's namespaces, as
+[Inspect a runtime container](../runbooks/deploying-on-a-vm.md#inspect-a-runtime-container)
+shows.
