@@ -24,7 +24,7 @@ use std::{
     mem,
     pin::Pin,
     sync::{Arc, Weak},
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 
@@ -165,6 +165,9 @@ struct Sending {
     unsent: Bytes,
     /// When the transport took the last data piece, until it polls again.
     handed_out_at: Option<Instant>,
+    /// The transport's waker from the last poll the handler left pending.
+    /// Dropping the handler's body does not wake it, so abandoning does.
+    waker: Option<Waker>,
 }
 
 enum Source {
@@ -187,6 +190,7 @@ impl SendStallBoundBody {
                 source: Source::Handler(inner),
                 unsent: Bytes::new(),
                 handed_out_at: None,
+                waker: None,
             })),
             send_stall_timeout,
             cancellation,
@@ -237,15 +241,15 @@ impl Sending {
     }
 
     /// Drops what the response still holds and records `status` for the
-    /// transport, returning the handler's body so the caller drops it
-    /// unlocked.
-    fn abandon(&mut self, status: Status) -> Option<Body> {
+    /// transport. Returns the handler's body and the transport's waker, so
+    /// the caller drops the one and wakes the other unlocked.
+    fn abandon(&mut self, status: Status) -> (Option<Body>, Option<Waker>) {
         self.unsent = Bytes::new();
         match mem::replace(&mut self.source, Source::Abandoned(status)) {
-            Source::Handler(body) => Some(body),
+            Source::Handler(body) => (Some(body), self.waker.take()),
             finished @ (Source::Abandoned(_) | Source::Reported) => {
                 self.source = finished;
-                None
+                (None, None)
             }
         }
     }
@@ -291,7 +295,11 @@ async fn abandon_when_stalled_or_cancelled(
         };
         drop(sending_state);
         drop(shared);
-        drop(abandoned);
+        let (handler_body, transport) = abandoned;
+        drop(handler_body);
+        if let Some(transport) = transport {
+            transport.wake();
+        }
         return;
     }
 }
@@ -342,8 +350,15 @@ impl http_body::Body for SendStallBoundBody {
                 Err(frame) => return Poll::Ready(Some(Ok(frame))),
             },
             Poll::Ready(None) => None,
-            failed_or_pending @ (Poll::Ready(Some(Err(_))) | Poll::Pending) => {
-                return failed_or_pending;
+            Poll::Pending => {
+                match &mut sending.waker {
+                    Some(waker) if waker.will_wake(cx.waker()) => {}
+                    waker => *waker = Some(cx.waker().clone()),
+                }
+                return Poll::Pending;
+            }
+            failed @ Poll::Ready(Some(Err(_))) => {
+                return failed;
             }
         };
         // The handler has ended its response. A request-side failure it did
@@ -385,7 +400,7 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use http_body::Frame;
+    use http_body::{Body as _, Frame};
     use http_body_util::{BodyExt as _, StreamBody};
     use tokio::sync::oneshot;
     use tokio_stream::StreamExt as _;
@@ -404,6 +419,48 @@ mod tests {
         fn as_ref(&self) -> &[u8] {
             &self.bytes
         }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_pending_response_wakes_the_transport_with_its_status()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let handler_body = Body::new(StreamBody::new(tokio_stream::pending::<
+            Result<Frame<Bytes>, Status>,
+        >()));
+        let cancelled = CancellationToken::new();
+        let mut body = SendStallBoundBody::new(
+            handler_body,
+            Duration::from_hours(1),
+            Some(ResponseCancellation::new(
+                cancelled.clone(),
+                Status::unavailable("evicted"),
+            )),
+        );
+        let (polled_sender, polled) = oneshot::channel();
+        let transport = tokio::spawn(async move {
+            let mut first_poll = Some(polled_sender);
+            let next_frame = std::future::poll_fn(|cx| {
+                let next = std::pin::Pin::new(&mut body).poll_frame(cx);
+                if let Some(polled_sender) = first_poll.take() {
+                    let _ = polled_sender.send(next.is_pending());
+                }
+                next
+            });
+            next_frame.await
+        });
+        assert!(polled.await?, "the handler body was not pending");
+
+        cancelled.cancel();
+        let frame = tokio::time::timeout(Duration::from_secs(5), transport)
+            .await
+            .map_err(|_| "the transport was never woken")??
+            .ok_or("the response ended without a status")??;
+        let status = frame
+            .trailers_ref()
+            .and_then(|trailers| trailers.get("grpc-status"))
+            .map(http::HeaderValue::as_bytes);
+        assert_eq!(status, Some(b"14".as_slice()), "expected UNAVAILABLE");
+        Ok(())
     }
 
     #[tokio::test]
