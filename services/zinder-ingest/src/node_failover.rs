@@ -25,6 +25,7 @@ use std::{
 use async_trait::async_trait;
 use futures_util::{StreamExt as _, stream::FuturesOrdered};
 use parking_lot::Mutex;
+use tokio::sync::watch;
 use zinder_core::{BlockHash, BlockId};
 use zinder_runtime::{ActiveNodeEndpoint, ComposedReadiness, ReadinessCause, ReadinessInput};
 use zinder_source::{NodeSet, NodeSetSwitch, NodeSource, SourceFailureClass};
@@ -262,8 +263,8 @@ impl NodeFailover {
                 .active()
                 .map(|active| ValuePoolCapabilities::of(active.capabilities))
                 .unwrap_or_default(),
+            fence: watch::Sender::new(None),
             board: Mutex::new(FailoverBoard {
-                fence: None,
                 records,
                 evaluations_applied: 0,
                 failed_switch_after: None,
@@ -386,11 +387,13 @@ struct FailoverShared<Endpoint> {
     readiness: FailoverReadiness,
     genesis_hash: BlockHash,
     value_pool_capabilities: ValuePoolCapabilities,
+    /// The follower's fence, which candidates are compared with. `None`
+    /// until the follower's first iteration publishes it.
+    fence: watch::Sender<Option<FenceTips>>,
     board: Mutex<FailoverBoard>,
 }
 
 struct FailoverBoard {
-    fence: Option<FenceTips>,
     records: Vec<EndpointRecord>,
     /// Standby evaluations the monitor has applied since ingest started.
     evaluations_applied: u64,
@@ -520,7 +523,7 @@ where
         let Some(endpoint) = self.nodes.endpoint(position) else {
             return false;
         };
-        let Some(fence) = self.board.lock().fence else {
+        let Some(fence) = *self.fence.borrow() else {
             return false;
         };
         let check = async {
@@ -626,7 +629,7 @@ where
     }
 
     fn observe_fence(&self, fence: FenceTips) {
-        self.board.lock().fence = Some(fence);
+        self.fence.send_replace(Some(fence));
     }
 
     fn active_not_ready_for(&self) -> Option<Duration> {
@@ -724,6 +727,14 @@ mod tests {
         BlockId::new(BlockHeight::new(4), BlockHash::from_bytes([4; 32]))
     }
 
+    /// The follower's fence, settled at its visible tip.
+    fn visible_fence() -> FenceTips {
+        FenceTips {
+            local_tip: visible_tip(),
+            settled_tip: visible_tip(),
+        }
+    }
+
     /// A candidate that holds [`visible_tip`] and answers, or not, as set.
     #[derive(Clone, Copy)]
     struct CandidateEndpoint {
@@ -747,7 +758,15 @@ mod tests {
     #[async_trait]
     impl NodeSource for CandidateEndpoint {
         fn capabilities(&self) -> NodeCapabilities {
-            NodeCapabilities::default()
+            NodeCapabilities::new(REQUIRED_INGEST_NODE_CAPABILITIES.iter().copied())
+                .unwrap_or_default()
+        }
+
+        async fn fetch_network_upgrade_activations(
+            &self,
+        ) -> Result<zinder_core::NetworkUpgradeActivations, SourceError> {
+            self.answer().await;
+            Ok(zinder_testkit::sample_regtest_upgrade_activations())
         }
 
         async fn fetch_block_at(&self, height: BlockHeight) -> Result<SourceBlock, SourceError> {
@@ -755,7 +774,11 @@ mod tests {
             Ok(SourceBlock {
                 network: Network::ZcashRegtest,
                 height,
-                hash: visible_tip().hash,
+                hash: if height == BlockHeight::new(0) {
+                    Network::ZcashRegtest.genesis_hash()
+                } else {
+                    visible_tip().hash
+                },
                 parent_hash: BlockHash::from_bytes([3; 32]),
                 block_time_seconds: 0,
                 raw_block_bytes: Vec::new(),
@@ -818,11 +841,8 @@ mod tests {
             },
             genesis_hash: Network::ZcashRegtest.genesis_hash(),
             value_pool_capabilities: ValuePoolCapabilities::default(),
+            fence: watch::Sender::new(Some(visible_fence())),
             board: Mutex::new(FailoverBoard {
-                fence: Some(FenceTips {
-                    local_tip: visible_tip(),
-                    settled_tip: visible_tip(),
-                }),
                 records,
                 evaluations_applied: 1,
                 failed_switch_after: None,
@@ -877,6 +897,77 @@ mod tests {
         let switch = failover.switch_away("node_unreachable").await;
 
         assert_eq!(switch.map(|switch| switch.to_position), Some(2));
+    }
+
+    /// Spawns the standby monitor over `failover`, which must not have
+    /// published a fence yet when the test checks the first round.
+    fn spawn_monitor(
+        failover: &Arc<FailoverShared<CandidateEndpoint>>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        spawn_node_endpoint_monitor(
+            NodeEndpointMonitor::new(Arc::clone(failover)),
+            Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
+            cancel.clone(),
+        )
+    }
+
+    /// A round that ran before the follower published its fence leaves the
+    /// standby pending, and the fence starts the next round at once rather
+    /// than one standby interval later.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_fence_starts_a_standby_evaluation_at_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let failover = Arc::new(failover_with_standbys(
+            CandidateEndpoint::READY,
+            vec![CandidateEndpoint::READY],
+            NodeFailoverPolicy::default(),
+        ));
+        failover.fence.send_replace(None);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let monitor = spawn_monitor(&failover, &cancel);
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let before_fence = failover.endpoint_states();
+        failover.observe_fence(visible_fence());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let after_fence = failover.endpoint_states();
+        cancel.cancel();
+        monitor.await?;
+
+        assert_eq!(before_fence.get(1), Some(&NodeEndpointState::Pending));
+        assert_eq!(after_fence.get(1), Some(&NodeEndpointState::Standby));
+        Ok(())
+    }
+
+    /// Shutdown does not wait for a round whose active health check hangs
+    /// until its evaluation timeout.
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_stops_the_monitor_during_a_hanging_round()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let hanging = CandidateEndpoint {
+            hangs: true,
+            ..CandidateEndpoint::READY
+        };
+        let failover = Arc::new(failover_with_standbys(
+            hanging,
+            vec![CandidateEndpoint::READY],
+            NodeFailoverPolicy::default(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let monitor = spawn_monitor(&failover, &cancel);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let cancelled_at = tokio::time::Instant::now();
+        cancel.cancel();
+        monitor.await?;
+
+        assert!(
+            cancelled_at.elapsed() < Duration::from_secs(1),
+            "the monitor stopped {:?} after cancellation",
+            cancelled_at.elapsed()
+        );
+        Ok(())
     }
 
     #[test]

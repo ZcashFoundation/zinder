@@ -248,7 +248,11 @@ the evidence about the others. The monitor records whether the active endpoint
 reports ready, and whether each other endpoint could take over: it must report
 ready, advertise the required capabilities and the admitted table, hold the
 configured network's genesis block, and have a tip at or above the visible tip. It is a standby when it holds the
-visible tip, and a diverged standby when it holds only the settled tip. The
+visible tip, and a diverged standby when it holds only the settled tip. Until
+the follower publishes its first fence, a candidate that passes the other
+checks stays pending, and the monitor evaluates again as soon as that fence
+appears rather than one cadence later. Shutdown stops the monitor at once,
+even during an evaluation that waits on an endpoint that does not answer. The
 follower switches between iterations after three consecutive
 `node_unreachable` or `stream_disconnected` recoveries, or once the active
 endpoint has reported not ready for 300 seconds. It tries standbys in position

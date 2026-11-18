@@ -9,7 +9,7 @@
 use std::{sync::Arc, time::Instant};
 
 use futures_util::{StreamExt as _, stream::FuturesUnordered};
-use tokio::task::JoinHandle;
+use tokio::{sync::watch, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use zinder_core::NetworkUpgradeActivations;
 use zinder_source::{NodeSource, SourceError, SourceFailureClass};
@@ -36,6 +36,11 @@ impl<Endpoint> NodeEndpointMonitor<Endpoint> {
 /// A candidate qualifies only when its activation table equals
 /// `admitted_activations`, the schedule the canonical store admitted, because
 /// ingest does not admit another table while it runs.
+///
+/// Cancellation stops the monitor at once, even during a round that waits on
+/// an endpoint that does not answer. A round that ran before the follower
+/// published its fence leaves candidates pending, so the monitor evaluates
+/// again as soon as the fence appears instead of one interval later.
 #[must_use = "drop the handle to detach the task or await it for symmetric shutdown"]
 pub fn spawn_node_endpoint_monitor<Endpoint>(
     monitor: NodeEndpointMonitor<Endpoint>,
@@ -46,15 +51,29 @@ where
     Endpoint: NodeSource,
 {
     tokio::spawn(async move {
-        let interval = monitor.shared.policy.standby_evaluation_interval;
+        let shared = monitor.shared.as_ref();
+        let interval = shared.policy.standby_evaluation_interval;
+        let mut fence = shared.fence.subscribe();
         loop {
-            evaluate_round(&monitor.shared, &admitted_activations).await;
+            let round_fence = *fence.borrow_and_update();
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = evaluate_round(shared, &admitted_activations, round_fence) => {}
+            }
             tokio::select! {
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(interval) => {}
+                () = fence_published(&mut fence), if round_fence.is_none() => {}
             }
         }
     })
+}
+
+/// Resolves once the follower has published a fence.
+async fn fence_published(fence: &mut watch::Receiver<Option<FenceTips>>) {
+    if fence.wait_for(Option::is_some).await.is_err() {
+        std::future::pending::<()>().await;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -91,19 +110,18 @@ impl Observation {
 async fn evaluate_round<Endpoint>(
     shared: &FailoverShared<Endpoint>,
     admitted_activations: &NetworkUpgradeActivations,
+    fence: Option<FenceTips>,
 ) where
     Endpoint: NodeSource,
 {
     let active_position = shared.nodes.active_position();
-    let (fence, excluded) = {
-        let board = shared.board.lock();
-        let excluded = board
-            .records
-            .iter()
-            .map(|record| record.excluded.is_some())
-            .collect::<Vec<_>>();
-        (board.fence, excluded)
-    };
+    let excluded = shared
+        .board
+        .lock()
+        .records
+        .iter()
+        .map(|record| record.excluded.is_some())
+        .collect::<Vec<_>>();
     let evaluation_timeout = shared.policy.evaluation_timeout();
     let mut observations = shared
         .nodes
