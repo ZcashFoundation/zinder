@@ -618,6 +618,15 @@ every other refresh failure as a warning. Both increment
 `zinder_wallet_serving_pair_publisher_refresh_total{status="error"}` with their
 `error_class`, such as `projection_behind`.
 
+Open `GetMempoolStream` calls end with `UNAVAILABLE` when termination closes
+their tip-change source. Open `GetBlockRange` and `GetBlockRangeNullifiers`
+calls do not end when termination is requested, so a graceful drain waits for
+each range to finish, which a client that reads slowly can delay for as long
+as it keeps reading. The drain is therefore bounded at 10 seconds, as native
+query's is, and calls still open then are abandoned, logged as
+`compat_server_drain_timed_out`. Compatibility then exits within the
+wallet-serving supervisor's 20-second grace window.
+
 ### Explorer
 
 Explorer is ready after its API has started and, when a materialized-view store
