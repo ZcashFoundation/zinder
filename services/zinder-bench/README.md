@@ -657,10 +657,13 @@ zinder-bench rocksdb-tree-state-replay \
 ```
 
 The command opens the store through an admitted secondary, reconstructs the
-tree state at up to `--max-anchors` anchors spread evenly over the window,
-first with every anchor cold and then again warm, and writes a
-`rocksdb-tree-state-replay` report. `--from-height` and `--to-height` default
-to the retained range; the example window covers the 2022 Sapling output spam,
+tree state at up to `--max-anchors` anchors spread evenly over the window, and
+writes a `rocksdb-tree-state-replay` report. Each anchor is reconstructed twice
+in a row before the next one: first cold, then warm from the block cache the
+first replay filled. Measuring the warm replay at once keeps later anchors from
+evicting an earlier anchor's blocks when the sampled ranges exceed the
+secondary's 128 MiB block cache. `--from-height` and `--to-height` default to
+the retained range; the example window covers the 2022 Sapling output spam,
 the densest history a reconstruction replays. Anchors that hold a stored
 checkpoint, as every live-followed block does, need no reconstruction and are
 counted in `stored_checkpoint_anchors_skipped`. Each anchor records its seed

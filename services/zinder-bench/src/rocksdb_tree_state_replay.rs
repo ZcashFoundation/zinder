@@ -167,8 +167,13 @@ pub(crate) struct ReplayWindow {
     pub(crate) max_anchors: u32,
 }
 
-/// Reconstructs the tree state at each anchor of `window` twice, first with
-/// every anchor cold and then again warm.
+/// Reconstructs the tree state at each anchor of `window` twice in a row.
+///
+/// The first reconstruction reads the anchor's compact blocks cold, and the
+/// second, run at once, reads them from the cache the first one filled.
+/// Measuring the warm replay before the next anchor keeps later replays from
+/// evicting the blocks of an earlier one when the sampled ranges exceed the
+/// secondary's block cache.
 pub(crate) fn measure_tree_state_replays(
     secondary: &RocksDbCanonicalSecondary,
     activations: &NetworkUpgradeActivations,
@@ -206,19 +211,15 @@ pub(crate) fn measure_tree_state_replays(
     let mut anchors = Vec::with_capacity(replays.len());
     for (height, seed_checkpoint_height, seed_sizes) in &replays {
         let (cold, sizes) = time_reconstruction(secondary, activations, *height)?;
+        let (warm, _) = time_reconstruction(secondary, activations, *height)?;
         anchors.push(AnchorMeasurement {
             height: *height,
             seed_checkpoint_height: *seed_checkpoint_height,
             replayed_blocks: height.saturating_sub(*seed_checkpoint_height),
             replayed_note_commitments: commitments_between(*seed_sizes, sizes),
             cold_seconds: cold.as_secs_f64(),
-            warm_seconds: 0.0,
+            warm_seconds: warm.as_secs_f64(),
         });
-    }
-    for anchor in &mut anchors {
-        anchor.warm_seconds = time_reconstruction(secondary, activations, anchor.height)?
-            .0
-            .as_secs_f64();
     }
     Ok(TreeStateReplayMeasurement {
         window_start_height: window_start,
