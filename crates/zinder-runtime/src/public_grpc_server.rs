@@ -303,13 +303,14 @@ where
         }
         let receive_timeout = self.pools.receive_timeout;
         let mut request = request;
-        if pool == ReceivePool::ClientStream {
-            // A handler blocked on its response does not poll the request
-            // body, so the response must end on eviction by itself.
-            request.extensions_mut().insert(ResponseCancellation::new(
-                admission.slot.eviction_token(),
-                too_many_requests(),
-            ));
+        // A client stream's handler may never poll its request body again,
+        // or may end successfully when it fails, so its response learns of
+        // eviction and of receive failures through the send stall layer.
+        let response_cancellation = (pool == ReceivePool::ClientStream).then(|| {
+            ResponseCancellation::new(admission.slot.eviction_token(), too_many_requests())
+        });
+        if let Some(cancellation) = &response_cancellation {
+            request.extensions_mut().insert(cancellation.clone());
         }
         let request = request.map(|body| {
             Body::new(ReceiveBoundBody {
@@ -320,6 +321,7 @@ where
                 ))),
                 pool,
                 receive_timeout,
+                response_cancellation,
             })
         });
         Either::Right(self.inner.call(request))
@@ -391,6 +393,8 @@ struct ReceiveBoundBody {
     state: ReceiveState,
     pool: ReceivePool,
     receive_timeout: Duration,
+    /// Where a client stream records why its request failed.
+    response_cancellation: Option<ResponseCancellation>,
 }
 
 enum ReceiveState {
@@ -418,6 +422,16 @@ impl Receiving {
     }
 }
 
+impl ReceiveBoundBody {
+    /// Records `status` as the request's failure for its response.
+    fn report(&self, status: Status) -> Status {
+        if let Some(cancellation) = &self.response_cancellation {
+            cancellation.fail(&status);
+        }
+        status
+    }
+}
+
 impl http_body::Body for ReceiveBoundBody {
     type Data = Bytes;
     type Error = Status;
@@ -434,7 +448,7 @@ impl http_body::Body for ReceiveBoundBody {
         };
         if receiving.evicted.as_mut().poll(cx).is_ready() {
             this.state = ReceiveState::Cancelled;
-            return Poll::Ready(Some(Err(too_many_requests())));
+            return Poll::Ready(Some(Err(this.report(too_many_requests()))));
         }
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
@@ -463,7 +477,7 @@ impl http_body::Body for ReceiveBoundBody {
                 this.state = ReceiveState::Cancelled;
                 metrics::counter!(RECEIVE_TIMEOUTS_METRIC, "pool" => this.pool.label())
                     .increment(1);
-                Poll::Ready(Some(Err(timeout_status(this.pool))))
+                Poll::Ready(Some(Err(this.report(timeout_status(this.pool)))))
             }
         }
     }

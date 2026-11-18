@@ -42,19 +42,37 @@ use super::SEND_STALLS_METRIC;
 /// Largest piece of a response data chunk handed to the transport at once.
 const RESPONSE_PIECE_BYTES: usize = 64 * 1024;
 
-/// Asks [`GrpcSendStall`] to drop a request's handler body once `token` is
-/// cancelled, ending the response with `status`.
+/// How a request's receive side tells [`GrpcSendStall`] to end its
+/// response.
 ///
-/// Attached to the request extensions by an outer layer.
+/// An outer layer attaches it to the request extensions. Once `token` is
+/// cancelled, the handler's body is dropped and the response ends with
+/// `status`. A failure recorded with [`ResponseCancellation::fail`] replaces
+/// the status the handler ends its response with, because a handler such as
+/// gRPC reflection ends successfully when its request stream fails.
 #[derive(Clone, Debug)]
 pub(super) struct ResponseCancellation {
     token: CancellationToken,
     status: Status,
+    failure: Arc<Mutex<Option<Status>>>,
 }
 
 impl ResponseCancellation {
-    pub(super) const fn new(token: CancellationToken, status: Status) -> Self {
-        Self { token, status }
+    pub(super) fn new(token: CancellationToken, status: Status) -> Self {
+        Self {
+            token,
+            status,
+            failure: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Records why the request side failed. The first failure wins.
+    pub(super) fn fail(&self, status: &Status) {
+        self.failure.lock().get_or_insert_with(|| status.clone());
+    }
+
+    fn failure(&self) -> Option<Status> {
+        self.failure.lock().clone()
     }
 }
 
@@ -134,7 +152,7 @@ where
 struct SendStallBoundBody {
     sending: Arc<Mutex<Sending>>,
     send_stall_timeout: Duration,
-    /// Handed to the watchdog when it starts.
+    /// Shared with the watchdog when it starts.
     cancellation: Option<ResponseCancellation>,
     /// Stops the watchdog when the response ends. Set once the first data
     /// piece is handed out, or at once for a cancellable response.
@@ -192,7 +210,7 @@ impl SendStallBoundBody {
             Arc::downgrade(&self.sending),
             self.send_stall_timeout,
             finished.clone(),
-            self.cancellation.take(),
+            self.cancellation.clone(),
         ));
         self.watchdog = Some(finished.drop_guard());
     }
@@ -242,7 +260,7 @@ async fn abandon_when_stalled_or_cancelled(
     cancellation: Option<ResponseCancellation>,
 ) {
     let (cancelled, cancel_status) = match cancellation {
-        Some(ResponseCancellation { token, status }) => (token, status),
+        Some(ResponseCancellation { token, status, .. }) => (token, status),
         None => (
             CancellationToken::new(),
             Status::cancelled("response cancelled"),
@@ -311,19 +329,36 @@ impl http_body::Body for SendStallBoundBody {
             }
             Source::Reported => return Poll::Ready(None),
         };
-        match Pin::new(handler_body).poll_frame(cx) {
+        let final_trailers = match Pin::new(handler_body).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                 Ok(chunk) => {
                     sending.unsent = chunk;
                     let piece = sending.hand_out_piece();
                     drop(sending);
                     this.start_watchdog();
-                    Poll::Ready(Some(Ok(Frame::data(piece))))
+                    return Poll::Ready(Some(Ok(Frame::data(piece))));
                 }
-                Err(frame) => Poll::Ready(Some(Ok(frame))),
+                Err(frame) if frame.is_trailers() => Some(frame),
+                Err(frame) => return Poll::Ready(Some(Ok(frame))),
             },
-            ended_or_failed @ (Poll::Ready(Some(Err(_)) | None) | Poll::Pending) => ended_or_failed,
+            Poll::Ready(None) => None,
+            failed_or_pending @ (Poll::Ready(Some(Err(_))) | Poll::Pending) => {
+                return failed_or_pending;
+            }
+        };
+        // The handler has ended its response. A request-side failure it did
+        // not report becomes the response's status.
+        let receive_failure = this
+            .cancellation
+            .as_ref()
+            .and_then(ResponseCancellation::failure);
+        if let Some(status) = receive_failure {
+            sending.source = Source::Reported;
+            drop(sending);
+            return Poll::Ready(Some(trailers_reporting(&status)));
         }
+        drop(sending);
+        Poll::Ready(final_trailers.map(Ok))
     }
 
     fn is_end_stream(&self) -> bool {

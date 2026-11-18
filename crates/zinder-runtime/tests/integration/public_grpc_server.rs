@@ -319,9 +319,11 @@ async fn an_idle_reflection_stream_is_cancelled_and_returns_its_slot() -> Result
         .ok_or_else(|| eyre!("reflection ended before answering"))??;
 
     // The client keeps the stream open but sends nothing more.
-    while let Some(message) = within_wait_limit(idle.next()).await? {
-        message?;
-    }
+    let ended_with = within_wait_limit(idle.next()).await?;
+    assert_eq!(
+        ended_with.and_then(Result::err).map(|status| status.code()),
+        Some(Code::DeadlineExceeded)
+    );
     let mut next = ServerReflectionClient::new(server.channel.clone())
         .server_reflection_info(tokio_stream::once(list_services()))
         .await?
@@ -373,6 +375,37 @@ async fn a_reflection_stream_whose_client_stops_reading_ends_and_returns_its_slo
     assert_eq!(
         ended_with.map(|status| status.code()),
         Some(Code::DeadlineExceeded)
+    );
+    drop(sender);
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_evicted_reflection_stream_ends_with_unavailable() -> Result<()> {
+    let server = serve(1, Duration::from_secs(30)).await?;
+    let (sender, receiver) = mpsc::channel(1);
+    let mut evicted = ServerReflectionClient::new(server.connect().await?)
+        .server_reflection_info(ReceiverStream::new(receiver))
+        .await?
+        .into_inner();
+    sender.send(list_services()).await?;
+    within_wait_limit(evicted.next())
+        .await?
+        .ok_or_else(|| eyre!("reflection ended before answering"))??;
+
+    // A connection holding no slot takes the open stream's.
+    let mut newcomer = ServerReflectionClient::new(server.connect().await?)
+        .server_reflection_info(tokio_stream::once(list_services()))
+        .await?
+        .into_inner();
+    within_wait_limit(newcomer.next())
+        .await?
+        .ok_or_else(|| eyre!("reflection ended before answering"))??;
+
+    let ended_with = within_wait_limit(evicted.next()).await?;
+    assert_eq!(
+        ended_with.and_then(Result::err).map(|status| status.code()),
+        Some(Code::Unavailable)
     );
     drop(sender);
     Ok(())
@@ -568,7 +601,12 @@ async fn a_client_stream_that_drips_bytes_without_a_whole_message_is_cancelled()
     });
     let ended = within_wait_limit(response.into_body().collect()).await;
     drip.abort();
-    ended?.map_err(|status| eyre!("reflection response failed: {status}"))?;
+    let collected = ended?.map_err(|status| eyre!("reflection response failed: {status}"))?;
+    let status = collected
+        .trailers()
+        .and_then(|trailers| trailers.get("grpc-status"))
+        .map(http::HeaderValue::as_bytes);
+    assert_eq!(status, Some(b"4".as_slice()), "expected DEADLINE_EXCEEDED");
 
     let mut next = ServerReflectionClient::new(server.channel.clone())
         .server_reflection_info(tokio_stream::once(list_services()))

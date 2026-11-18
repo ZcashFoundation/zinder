@@ -342,6 +342,13 @@ repeated evictions cannot pile up blocked producers beyond the pool size.
 That release follows the newcomer's admission by a scheduler turn rather
 than preceding it.
 
+gRPC reflection ends its response successfully when its request stream
+fails, which would report a timed-out or evicted client stream as `OK`. The
+receive layer therefore records a client stream's receive failure on the same
+handle, and the send stall layer replaces the handler's final status with it:
+`DEADLINE_EXCEEDED` after the receive timeout and `UNAVAILABLE` after an
+eviction.
+
 hyper asks a response body for its next frame only after the client's HTTP/2
 flow-control window has room for the previous one. A client that answers
 keepalive pings but never sends `WINDOW_UPDATE` therefore parks the response,
