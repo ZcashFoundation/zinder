@@ -251,14 +251,29 @@ pub(crate) struct RpcSummary {
 /// First-sync construction stores a checkpoint every 100 blocks, so a height
 /// on that stride is a stored checkpoint. Below the first-sync tip, any other
 /// height replays its offset from the stride, `height % 100` blocks. Above
-/// that tip every block has a checkpoint and nothing is replayed, so the
-/// offsets are an upper bound on the replay work.
+/// that tip every block has a checkpoint, and a store whose checkpoint pass
+/// has run has one at every settled block, so the offsets are an upper bound
+/// on the replay work. `server_observed`, present when the run read the
+/// server's metrics, is what the server actually did.
 #[derive(Debug, Serialize)]
 pub(crate) struct TreeStateHeights {
     requested: u64,
     on_cadence: u64,
     off_cadence: u64,
     off_cadence_offset_blocks: Percentiles,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_observed: Option<super::server_metrics::ServerObserved>,
+}
+
+impl TreeStateHeights {
+    /// Adds what the server counted over the run.
+    pub(super) const fn with_server_observed(
+        mut self,
+        observed: super::server_metrics::ServerObserved,
+    ) -> Self {
+        self.server_observed = Some(observed);
+        self
+    }
 }
 
 impl TreeStateHeights {
@@ -275,6 +290,7 @@ impl TreeStateHeights {
             on_cadence: requested.saturating_sub(off_cadence),
             off_cadence,
             off_cadence_offset_blocks: Percentiles::of(offsets.into_iter().map(count_as_f64)),
+            server_observed: None,
         }
     }
 }

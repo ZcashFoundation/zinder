@@ -752,7 +752,12 @@ identity, the workload's constants, and, over all wallets:
 - `tree_state_heights`: how many requested heights sit on Zinder's 100-block
   checkpoint stride, and each other height's offset from it. Below the
   first-sync tip, that offset is the number of blocks Zinder replays. Above
-  it, every block has a stored checkpoint and nothing is replayed.
+  it, and on a store whose checkpoint pass has run, every settled block has a
+  stored checkpoint and nothing is replayed, so the offsets are an upper
+  bound. With `--server-metrics-url` set to a Zinder server's `/metrics`
+  endpoint, `server_observed` adds what that server counted during the run:
+  tree states it rebuilt and the blocks it replayed for them, and the tree
+  states, block ranges, and requests it refused.
 
 The simulated wallets do not scan, so each asks for its next blocks as soon as
 the last ones arrive: the load is the most an engine of that shape sends, not

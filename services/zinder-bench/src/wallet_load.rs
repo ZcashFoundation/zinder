@@ -11,6 +11,7 @@
 mod calls;
 mod classic_sdk;
 mod point_reads;
+mod server_metrics;
 mod slipstream;
 mod transport;
 mod vizor;
@@ -77,6 +78,11 @@ pub(crate) struct LightwalletdWalletLoadArgs {
     /// wallets request. Repeat for several addresses.
     #[arg(long = "transparent-address")]
     transparent_addresses: Vec<String>,
+    /// Prometheus endpoint of the Zinder server under test, such as
+    /// `http://127.0.0.1:9107/metrics`. When set, the report counts the tree
+    /// states the server rebuilt and the requests it refused during the run.
+    #[arg(long = "server-metrics-url")]
+    server_metrics_url: Option<String>,
     /// Free-form label for the server under test, such as its name and version.
     #[arg(long = "target-label")]
     target_label: Option<String>,
@@ -290,6 +296,14 @@ pub(crate) async fn run_lightwalletd_wallet_load(
     let plan = Arc::new(plan);
     let settings = Arc::new(WorkloadSettings::from_args(&args));
     let parameters = settings.parameters(args.workload, &plan);
+    let metrics_before = match &args.server_metrics_url {
+        Some(url) => Some(
+            server_metrics::scrape(url)
+                .await
+                .map_err(BenchError::wallet_load_endpoint)?,
+        ),
+        None => None,
+    };
     let started = Instant::now();
     let mut wallets = Vec::new();
     for wallet_index in 0..args.wallets {
@@ -312,6 +326,15 @@ pub(crate) async fn run_lightwalletd_wallet_load(
         );
     }
     let wall = started.elapsed();
+    let server_observed = match (&args.server_metrics_url, metrics_before) {
+        (Some(url), Some(before)) => {
+            let after = server_metrics::scrape(url)
+                .await
+                .map_err(BenchError::wallet_load_endpoint)?;
+            Some(server_metrics::ServerObserved::between(&before, &after))
+        }
+        _ => None,
+    };
     Ok(LightwalletdWalletLoadOutput {
         report: LightwalletdWalletLoadReport::new(
             &args,
@@ -322,6 +345,7 @@ pub(crate) async fn run_lightwalletd_wallet_load(
                 wall,
                 outcomes: &outcomes,
                 recorder: &recorder,
+                server_observed,
             },
         ),
         report_path: args.report,
@@ -452,6 +476,7 @@ struct RunEvidence<'run> {
     wall: Duration,
     outcomes: &'run [WalletOutcome],
     recorder: &'run CallRecorder,
+    server_observed: Option<server_metrics::ServerObserved>,
 }
 
 impl LightwalletdWalletLoadReport {
@@ -463,6 +488,7 @@ impl LightwalletdWalletLoadReport {
             wall,
             outcomes,
             recorder,
+            server_observed,
         } = run;
         let mut wallet_failures = BTreeMap::new();
         for failure in outcomes
@@ -514,7 +540,10 @@ impl LightwalletdWalletLoadReport {
                     .map(|outcome| outcome.seconds),
             ),
             rpcs: recorder.rpc_summaries(),
-            tree_state_heights: recorder.tree_state_heights(),
+            tree_state_heights: server_observed.map_or_else(
+                || recorder.tree_state_heights(),
+                |observed| recorder.tree_state_heights().with_server_observed(observed),
+            ),
         }
     }
 }
@@ -605,6 +634,7 @@ mod tests {
                 batch_byte_budget: None,
                 rounds: 3,
                 transparent_addresses: Vec::new(),
+                server_metrics_url: None,
                 target_label: Some("zinder-compat-lightwalletd test server".to_owned()),
                 report: None,
             }
