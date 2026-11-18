@@ -20,7 +20,8 @@
 //! - The gRPC server builder every public listener serves with
 //!   ([`public_grpc_server`]), which bounds streams per connection, pings
 //!   idle connections, and limits how many requests the process receives at
-//!   once ([`GrpcReceiveLimitLayer`]).
+//!   once ([`GrpcReceiveLimitLayer`]), and the gRPC reflection service those
+//!   listeners serve ([`public_grpc_reflection`]).
 //! - The process allocator every binary entry point installs
 //!   ([`RuntimeAllocator`]).
 //! - The process-wide Prometheus metrics recorder
@@ -94,7 +95,7 @@ pub use ops_endpoint::{
 pub use public_grpc_server::{
     DEFAULT_GRPC_RECEIVE_SLOTS, DEFAULT_GRPC_RECEIVE_TIMEOUT, GrpcReceiveLimit,
     GrpcReceiveLimitLayer, GrpcReceiveLimits, MAX_CONCURRENT_STREAMS_PER_CONNECTION,
-    PublicGrpcServer, public_grpc_server, public_grpc_server_with,
+    PublicGrpcServer, public_grpc_reflection, public_grpc_server, public_grpc_server_with,
 };
 pub use readiness::{
     ActiveNodeEndpoint, IngestPhase, NodeUnavailableDetail, Readiness, ReadinessCause,

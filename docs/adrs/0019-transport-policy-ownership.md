@@ -311,32 +311,44 @@ memory. The receive limit has two pools of 32 slots each:
 - A client-streaming or bidirectional call, which today means lightwalletd
   `GetTaddressBalanceStream` and gRPC reflection `ServerReflectionInfo`, claims
   a client-stream slot and keeps it until the client half-closes or the call
-  ends. A client stream that sends no frame for 20 seconds fails with
-  `DEADLINE_EXCEEDED`. The separate pool keeps open client streams from
-  starving single-message calls. A unit test checks the list of
-  client-streaming methods against every service descriptor a public server
-  registers.
-- A request whose pool is full is refused with `UNAVAILABLE` before its body is
-  read.
+  ends. A client stream that completes no message for 20 seconds fails with
+  `DEADLINE_EXCEEDED`. Bytes that do not finish a message do not count, so a
+  client cannot hold a slot by dripping a partial message. The separate pool
+  keeps open client streams from starving single-message calls. A unit test
+  checks the list of client-streaming methods against every service descriptor
+  a public server registers.
+- When a pool is full, a new request takes the oldest slot of the client
+  connection holding the most slots, provided that connection holds more than
+  the requester's connection. The request that loses its slot fails with
+  `UNAVAILABLE`. Otherwise the new request is refused with `UNAVAILABLE` before
+  its body is read.
+
+The eviction rule keeps one connection from locking every other client out. A
+connection is identified by the remote address tonic records for it, which the
+layer reads from the request extensions. A connection that opens many streams
+and sends nothing only loses its own oldest slots to other connections, while
+a connection already holding as many slots as any other is refused. A request
+on a transport that reports no remote address counts as a connection of its
+own. `zinder_grpc_request_receive_evictions_total{pool}` counts evictions.
 
 Every Zinder gRPC server also decodes at most `MAX_DECODING_MESSAGE_BYTES`
-(2 MiB) per request message. The largest legitimate request, a broadcast of a
-2,000,000-byte transaction, encodes to at most 2,000,015 bytes. With 32
-request slots, a public server holds at most 64 MiB of request messages being
-decoded. tonic refuses a larger message with `OUT_OF_RANGE` from its 5-byte
-length prefix, before buffering it.
+(2 MiB) per request message. Public listeners build gRPC reflection with
+`zinder_runtime::public_grpc_reflection`, which applies the same bound instead
+of tonic's 4 MiB default. The largest legitimate request, a broadcast of a
+2,000,000-byte transaction, encodes to at most 2,000,015 bytes. With 32 slots
+per pool, each pool holds at most 64 MiB of request messages being decoded.
+tonic refuses a larger message with `OUT_OF_RANGE` from its 5-byte length
+prefix, before buffering it.
 
 The values are constants, not configuration. Precedent is lightwalletd's fix
-for GHSA-xrx5-jc6q-9h8r, which uses the same slot count, timeout, and message
-size.
+for GHSA-xrx5-jc6q-9h8r, which uses the same slot count, timeout, message
+size, and eviction rule.
 
 The policy leaves three gaps:
 
-- A full pool refuses every new request, whichever client holds the slots. One
-  client with many streams or connections can therefore keep the pool full.
-  lightwalletd lets a new request evict the oldest slot of the connection
-  holding the most; Zinder does not. Limit concurrent requests per client at
-  the edge.
+- Clients spread over many connections can still keep a pool full, because
+  each connection then holds no more slots than a new one would. Limit
+  connections per client address at the edge.
 - tonic has no HTTP/2 handshake timeout, and keepalive pings start only after
   the handshake. A TCP connection that never sends the HTTP/2 preface holds a
   file descriptor until the client closes it.
@@ -423,5 +435,6 @@ translations.
   processes and `zinder-explorer`.
 - 2026-11-18: Added public gRPC listeners: the shared
   `zinder_runtime::public_grpc_server` builder with its per-connection stream
-  limit, keepalive, and process-wide receive limit, and the 2 MiB request
-  message bound.
+  limit, keepalive, and process-wide receive limit with per-connection
+  eviction, and the 2 MiB request message bound, which also covers public gRPC
+  reflection.

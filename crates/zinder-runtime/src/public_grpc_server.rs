@@ -15,9 +15,17 @@
 //! and the per-connection stream limit does not bound how many messages the
 //! process reads at once across connections. The receive limit does, so
 //! many large requests sent together cannot exhaust memory.
+//!
+//! Public listeners that serve gRPC reflection build it with
+//! [`public_grpc_reflection`], which applies the same request size bound as
+//! every other public service.
+
+mod message_boundaries;
+mod receive_slots;
 
 use std::{
     future::Future,
+    net::SocketAddr,
     num::NonZeroUsize,
     pin::Pin,
     sync::Arc,
@@ -28,14 +36,25 @@ use std::{
 use bytes::Bytes;
 use futures_util::future::{Either, Ready, ready};
 use http_body::{Frame, SizeHint};
-use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore},
-    time::{Instant, Sleep},
+use tokio::time::{Instant, Sleep};
+use tokio_util::sync::WaitForCancellationFutureOwned;
+use tonic::{
+    Status,
+    body::Body,
+    transport::{
+        Server,
+        server::{TcpConnectInfo, TlsConnectInfo},
+    },
 };
-use tonic::{Status, body::Body, transport::Server};
+use tonic_reflection::server::v1::{ServerReflection, ServerReflectionServer};
 use tower::{
     Layer, Service,
     layer::util::{Identity, Stack},
+};
+
+use self::{
+    message_boundaries::MessageBoundaries,
+    receive_slots::{ReceiveSlot, ReceiveSlots},
 };
 
 /// Maximum concurrent HTTP/2 streams on one client connection.
@@ -54,12 +73,12 @@ const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Requests each receive pool admits at once across every connection.
 ///
-/// With the 2 MiB [`crate::MAX_DECODING_MESSAGE_BYTES`], the request pool
-/// holds at most 64 MiB of request messages being decoded.
+/// With the 2 MiB [`crate::MAX_DECODING_MESSAGE_BYTES`], each pool holds
+/// at most 64 MiB of request messages being decoded.
 pub const DEFAULT_GRPC_RECEIVE_SLOTS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(31);
 
 /// Time a request has to arrive in full, and the longest a client stream
-/// may go without sending a frame.
+/// may go without sending a whole message.
 pub const DEFAULT_GRPC_RECEIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Methods whose client sends a stream of messages.
@@ -74,6 +93,7 @@ const CLIENT_STREAMING_METHOD_PATHS: &[&str] = &[
 
 const RECEIVE_REFUSALS_METRIC: &str = "zinder_grpc_request_receive_refusals_total";
 const RECEIVE_TIMEOUTS_METRIC: &str = "zinder_grpc_request_receive_timeouts_total";
+const RECEIVE_EVICTIONS_METRIC: &str = "zinder_grpc_request_receive_evictions_total";
 
 /// The tonic server type that [`public_grpc_server`] returns.
 pub type PublicGrpcServer = Server<Stack<GrpcReceiveLimitLayer, Identity>>;
@@ -102,6 +122,21 @@ pub fn public_grpc_server_with(limits: GrpcReceiveLimits) -> PublicGrpcServer {
         .layer(GrpcReceiveLimitLayer::new(limits))
 }
 
+/// Returns the gRPC reflection v1 service for a public Zinder listener,
+/// describing the services in `encoded_file_descriptor_set`.
+///
+/// The service decodes request messages up to
+/// [`crate::MAX_DECODING_MESSAGE_BYTES`], like every other public service,
+/// instead of tonic's 4 MiB default.
+pub fn public_grpc_reflection(
+    encoded_file_descriptor_set: &'static [u8],
+) -> Result<ServerReflectionServer<impl ServerReflection>, tonic_reflection::server::Error> {
+    Ok(tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(encoded_file_descriptor_set)
+        .build_v1()?
+        .max_decoding_message_size(crate::MAX_DECODING_MESSAGE_BYTES))
+}
+
 fn describe_receive_limit_metrics() {
     metrics::describe_counter!(
         RECEIVE_REFUSALS_METRIC,
@@ -115,6 +150,12 @@ fn describe_receive_limit_metrics() {
         "gRPC requests cancelled with DEADLINE_EXCEEDED because their request did not arrive \
          in time (pool=request) or their client stream went idle (pool=client_stream)."
     );
+    metrics::describe_counter!(
+        RECEIVE_EVICTIONS_METRIC,
+        metrics::Unit::Count,
+        "gRPC requests cancelled with UNAVAILABLE because a full pool gave their slot to a \
+         request from a connection holding fewer slots. Label: pool (request|client_stream)."
+    );
 }
 
 /// Server-wide bounds on gRPC requests whose message is still arriving.
@@ -127,7 +168,7 @@ pub struct GrpcReceiveLimits {
 impl GrpcReceiveLimits {
     /// Limits with `slots_per_pool` receive slots in each pool and
     /// `receive_timeout` for a request to arrive or a client stream to send
-    /// its next frame.
+    /// its next message.
     #[must_use]
     pub const fn new(slots_per_pool: NonZeroUsize, receive_timeout: Duration) -> Self {
         Self {
@@ -143,7 +184,7 @@ impl GrpcReceiveLimits {
     }
 
     /// Time a request has to arrive in full, and the longest a client
-    /// stream may go without sending a frame.
+    /// stream may go without sending a whole message.
     #[must_use]
     pub const fn receive_timeout(&self) -> Duration {
         self.receive_timeout
@@ -159,9 +200,8 @@ impl Default for GrpcReceiveLimits {
 /// Tower layer that bounds how many gRPC requests a server receives at once.
 ///
 /// A request claims a slot when its stream opens, before any of its body
-/// arrives. When its pool has no free slot, the request is refused with
-/// `UNAVAILABLE` and its body is never read. There are two pools of the same
-/// size, so client streams cannot starve single-message calls:
+/// arrives. There are two pools of the same size, so client streams cannot
+/// starve single-message calls:
 ///
 /// - A unary or server-streaming call frees its slot once its request body
 ///   ends, before the handler runs. A long-lived response stream holds no
@@ -169,8 +209,14 @@ impl Default for GrpcReceiveLimits {
 ///   timeout of its stream opening fails with `DEADLINE_EXCEEDED`.
 /// - A client-streaming or bidirectional call, including gRPC reflection,
 ///   keeps its slot until the client half-closes or the call ends. A client
-///   stream that sends no frame for the receive timeout fails with
+///   stream that sends no whole message for the receive timeout fails with
 ///   `DEADLINE_EXCEEDED`.
+///
+/// When a pool is full, a new request takes the oldest slot of the client
+/// connection holding the most slots, provided that connection holds more
+/// than the requester's; the evicted request fails with `UNAVAILABLE`.
+/// Otherwise the new request is refused with `UNAVAILABLE` and its body is
+/// never read. One connection therefore cannot lock the others out.
 ///
 /// Every clone shares the same slots, so one layer bounds the whole server.
 #[derive(Clone, Debug)]
@@ -182,11 +228,10 @@ impl GrpcReceiveLimitLayer {
     /// Creates a layer whose slots are shared by every connection it wraps.
     #[must_use]
     pub fn new(limits: GrpcReceiveLimits) -> Self {
-        let slots = limits.slots_per_pool.get();
         Self {
             pools: ReceivePools {
-                requests: Arc::new(Semaphore::new(slots)),
-                client_streams: Arc::new(Semaphore::new(slots)),
+                requests: ReceiveSlots::new(limits.slots_per_pool),
+                client_streams: ReceiveSlots::new(limits.slots_per_pool),
                 receive_timeout: limits.receive_timeout,
             },
         }
@@ -225,21 +270,21 @@ where
 
     fn call(&mut self, request: http::Request<Body>) -> Self::Future {
         let pool = ReceivePool::for_path(request.uri().path());
-        let Ok(permit) = self.pools.semaphore(pool).try_acquire_owned() else {
+        let Some(admission) = self.pools.slots(pool).claim(remote_address(&request)) else {
             metrics::counter!(RECEIVE_REFUSALS_METRIC, "pool" => pool.label()).increment(1);
-            let status = Status::unavailable(
-                "server is receiving too many requests at once; retry with backoff",
-            );
-            return Either::Left(ready(Ok(status.into_http())));
+            return Either::Left(ready(Ok(too_many_requests().into_http())));
         };
+        if admission.evicted_another {
+            metrics::counter!(RECEIVE_EVICTIONS_METRIC, "pool" => pool.label()).increment(1);
+        }
         let receive_timeout = self.pools.receive_timeout;
         let request = request.map(|body| {
             Body::new(ReceiveBoundBody {
                 inner: body,
-                state: ReceiveState::Receiving {
-                    _permit: permit,
-                    deadline: Box::pin(tokio::time::sleep(receive_timeout)),
-                },
+                state: ReceiveState::Receiving(Box::new(Receiving::new(
+                    admission.slot,
+                    receive_timeout,
+                ))),
                 pool,
                 receive_timeout,
             })
@@ -248,18 +293,36 @@ where
     }
 }
 
+/// The remote address of the connection a request arrived on, which tonic
+/// records in the request extensions before any user layer runs.
+fn remote_address<B>(request: &http::Request<B>) -> Option<SocketAddr> {
+    let extensions = request.extensions();
+    extensions
+        .get::<TcpConnectInfo>()
+        .and_then(TcpConnectInfo::remote_addr)
+        .or_else(|| {
+            extensions
+                .get::<TlsConnectInfo<TcpConnectInfo>>()
+                .and_then(|tls| tls.get_ref().remote_addr())
+        })
+}
+
+fn too_many_requests() -> Status {
+    Status::unavailable("server is receiving too many requests at once; retry with backoff")
+}
+
 #[derive(Clone, Debug)]
 struct ReceivePools {
-    requests: Arc<Semaphore>,
-    client_streams: Arc<Semaphore>,
+    requests: Arc<ReceiveSlots>,
+    client_streams: Arc<ReceiveSlots>,
     receive_timeout: Duration,
 }
 
 impl ReceivePools {
-    fn semaphore(&self, pool: ReceivePool) -> Arc<Semaphore> {
+    fn slots(&self, pool: ReceivePool) -> &Arc<ReceiveSlots> {
         match pool {
-            ReceivePool::Request => Arc::clone(&self.requests),
-            ReceivePool::ClientStream => Arc::clone(&self.client_streams),
+            ReceivePool::Request => &self.requests,
+            ReceivePool::ClientStream => &self.client_streams,
         }
     }
 }
@@ -298,12 +361,28 @@ struct ReceiveBoundBody {
 }
 
 enum ReceiveState {
-    Receiving {
-        _permit: OwnedSemaphorePermit,
-        deadline: Pin<Box<Sleep>>,
-    },
+    Receiving(Box<Receiving>),
     Received,
-    TimedOut,
+    /// The request timed out or lost its slot, and the body reported it.
+    Cancelled,
+}
+
+struct Receiving {
+    _slot: ReceiveSlot,
+    deadline: Pin<Box<Sleep>>,
+    evicted: Pin<Box<WaitForCancellationFutureOwned>>,
+    boundaries: MessageBoundaries,
+}
+
+impl Receiving {
+    fn new(slot: ReceiveSlot, receive_timeout: Duration) -> Self {
+        Self {
+            deadline: Box::pin(tokio::time::sleep(receive_timeout)),
+            evicted: Box::pin(slot.evicted()),
+            _slot: slot,
+            boundaries: MessageBoundaries::default(),
+        }
+    }
 }
 
 impl http_body::Body for ReceiveBoundBody {
@@ -315,17 +394,26 @@ impl http_body::Body for ReceiveBoundBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
-        let deadline = match &mut this.state {
-            ReceiveState::Receiving { deadline, .. } => deadline,
+        let receiving = match &mut this.state {
+            ReceiveState::Receiving(receiving) => receiving,
             ReceiveState::Received => return Pin::new(&mut this.inner).poll_frame(cx),
-            ReceiveState::TimedOut => return Poll::Ready(None),
+            ReceiveState::Cancelled => return Poll::Ready(None),
         };
+        if receiving.evicted.as_mut().poll(cx).is_ready() {
+            this.state = ReceiveState::Cancelled;
+            return Poll::Ready(Some(Err(too_many_requests())));
+        }
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if this.inner.is_end_stream() {
                     this.state = ReceiveState::Received;
-                } else if this.pool == ReceivePool::ClientStream {
-                    deadline
+                } else if this.pool == ReceivePool::ClientStream
+                    && frame
+                        .data_ref()
+                        .is_some_and(|chunk| receiving.boundaries.completes_a_message(chunk))
+                {
+                    receiving
+                        .deadline
                         .as_mut()
                         .reset(Instant::now() + this.receive_timeout);
                 }
@@ -336,10 +424,10 @@ impl http_body::Body for ReceiveBoundBody {
                 Poll::Ready(ended_or_failed)
             }
             Poll::Pending => {
-                if deadline.as_mut().poll(cx).is_pending() {
+                if receiving.deadline.as_mut().poll(cx).is_pending() {
                     return Poll::Pending;
                 }
-                this.state = ReceiveState::TimedOut;
+                this.state = ReceiveState::Cancelled;
                 metrics::counter!(RECEIVE_TIMEOUTS_METRIC, "pool" => this.pool.label())
                     .increment(1);
                 Poll::Ready(Some(Err(timeout_status(this.pool))))
@@ -349,7 +437,7 @@ impl http_body::Body for ReceiveBoundBody {
 
     fn is_end_stream(&self) -> bool {
         match self.state {
-            ReceiveState::TimedOut => true,
+            ReceiveState::Cancelled => true,
             ReceiveState::Receiving { .. } | ReceiveState::Received => self.inner.is_end_stream(),
         }
     }
@@ -363,7 +451,7 @@ fn timeout_status(pool: ReceivePool) -> Status {
     match pool {
         ReceivePool::Request => Status::deadline_exceeded("request did not arrive in time"),
         ReceivePool::ClientStream => {
-            Status::deadline_exceeded("client stream sent nothing for too long")
+            Status::deadline_exceeded("client stream sent no message for too long")
         }
     }
 }

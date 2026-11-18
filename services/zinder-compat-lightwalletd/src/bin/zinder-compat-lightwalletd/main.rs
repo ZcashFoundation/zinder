@@ -316,9 +316,9 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
     // Expose `grpc.reflection.v1.ServerReflection` so legacy lightwalletd
     // wallets and `grpcurl` can discover the served `CompactTxStreamer`
     // surface without an out-of-band proto.
-    let reflection_service = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET)
-        .build_v1()?;
+    let reflection_service = zinder_runtime::public_grpc_reflection(
+        zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET,
+    )?;
 
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
@@ -511,9 +511,9 @@ async fn run_compact_blocks(
         ping_very_insecure = lightwalletd_config.ping_very_insecure,
         "lightwalletd-compatible gRPC server started"
     );
-    let reflection_service = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET)
-        .build_v1()?;
+    let reflection_service = zinder_runtime::public_grpc_reflection(
+        zinder_proto::LIGHTWALLETD_COMPAT_FILE_DESCRIPTOR_SET,
+    )?;
     start_api_phase.complete();
     StartupPhase::Ready.start().complete();
     let traffic_readiness = TrafficReadinessInterceptor::new(serving_readiness.runtime());

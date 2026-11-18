@@ -1122,14 +1122,20 @@ requests they receive at once
   with `UNAVAILABLE` because every slot of their pool was taken.
 - `zinder_grpc_request_receive_timeouts_total{pool}` counts requests cancelled
   with `DEADLINE_EXCEEDED` because their request did not arrive within
-  20 seconds (`pool="request"`) or their client stream sent nothing for
-  20 seconds (`pool="client_stream"`).
+  20 seconds (`pool="request"`) or their client stream completed no message
+  for 20 seconds (`pool="client_stream"`).
+- `zinder_grpc_request_receive_evictions_total{pool}` counts requests cancelled
+  with `UNAVAILABLE` because a full pool gave their slot to a request from a
+  connection holding fewer slots.
 
 `pool` is `request` for unary and server-streaming calls and `client_stream`
 for client-streaming and bidirectional calls, including gRPC reflection.
-Refusals while traffic is light, or timeouts that keep rising, point at
-clients that open streams and send slowly or not at all. The server cannot
-tell clients apart, so limit concurrent requests per client at the edge.
+Refusals while traffic is light, or timeouts and evictions that keep rising,
+point at clients that open streams and send slowly or not at all. A full pool
+gives the oldest slot of the connection holding the most to a request from a
+connection holding fewer, so one connection cannot lock others out. Clients
+spread over many connections still can, so limit connections per client
+address at the edge.
 
 ### RocksDB
 
@@ -1258,9 +1264,12 @@ Public listeners require explicit `security.allow_public_bind = true`. The
 release service does not provide public TLS termination, authentication, rate
 limits, or quota accounting. Put public compatibility traffic behind an
 operator-controlled HTTP/2 proxy. Public gRPC listeners bound request size,
-streams per connection, and requests being received across the process, but
-not requests per client
-([Public gRPC listeners](public-interfaces.md#public-grpc-listeners)).
+streams per connection, and requests being received across the process, and
+share receive slots fairly between connections, but they do not bound
+connections or requests per client address
+([Public gRPC listeners](public-interfaces.md#public-grpc-listeners)). Behind a
+proxy, the server sees the proxy's upstream connections, so the proxy must
+enforce per-client limits.
 
 Private ingest and projector control endpoints use bearer tokens loaded from
 files. Configuration output shows redaction markers, and errors identify only

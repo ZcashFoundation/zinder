@@ -26,9 +26,7 @@ async fn server_reflection_lists_wallet_query_service() -> Result<()> {
         native_serving_query_over(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(1))
             .await?;
     let adapter = WalletQueryGrpcAdapter::new(wallet_query, WalletEndpointMetadata::default());
-    let reflection_service = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(ZINDER_V1_FILE_DESCRIPTOR_SET)
-        .build_v1()?;
+    let reflection_service = zinder_runtime::public_grpc_reflection(ZINDER_V1_FILE_DESCRIPTOR_SET)?;
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server_addr = listener.local_addr()?;

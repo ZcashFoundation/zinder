@@ -520,14 +520,20 @@ The bound is fixed and shared with native query and Explorer
   arrived 20 seconds after its stream opened fails with `DEADLINE_EXCEEDED`.
 - `GetTaddressBalanceStream` and gRPC reflection draw on a separate pool of
   32 slots and keep theirs until the client half-closes or the call ends. A
-  stream that sends nothing for 20 seconds fails with `DEADLINE_EXCEEDED`.
-- A request whose pool is full fails with `UNAVAILABLE` at once.
-  `zinder_grpc_request_receive_refusals_total{pool}` counts refusals and
-  `zinder_grpc_request_receive_timeouts_total{pool}` counts timeouts.
+  stream that completes no message for 20 seconds fails with
+  `DEADLINE_EXCEEDED`. gRPC reflection messages are also bounded at 2 MiB.
+- When a pool is full, a request from a connection holding fewer slots takes
+  the oldest slot of the connection holding the most, and the request that
+  loses it fails with `UNAVAILABLE`. Otherwise the new request fails with
+  `UNAVAILABLE` at once. `zinder_grpc_request_receive_refusals_total{pool}`
+  counts refusals, `zinder_grpc_request_receive_evictions_total{pool}` counts
+  evictions, and `zinder_grpc_request_receive_timeouts_total{pool}` counts
+  timeouts.
 
-The server cannot tell clients apart, so a client with many streams can keep
-a pool full. Limit concurrent requests per client at the edge.
-lightwalletd's fix for GHSA-xrx5-jc6q-9h8r sets the same values.
+One connection that opens many streams therefore cannot lock other clients
+out, but clients spread over many connections still can keep a pool full.
+Limit connections per client address at the edge. lightwalletd's fix for
+GHSA-xrx5-jc6q-9h8r sets the same values and eviction rule.
 
 ### Block caches
 

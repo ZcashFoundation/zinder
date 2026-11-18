@@ -2,12 +2,16 @@
 
 use std::{
     future::Future,
+    net::SocketAddr,
     num::NonZeroUsize,
     time::{Duration, Instant},
 };
 
+use bytes::Bytes;
 use eyre::{Result, bail, eyre};
 use http::uri::PathAndQuery;
+use http_body::Frame;
+use http_body_util::{BodyExt as _, StreamBody};
 use prost::Message as _;
 use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
 use tokio_stream::{
@@ -16,6 +20,7 @@ use tokio_stream::{
 };
 use tonic::{
     Code, Request, Status,
+    body::Body,
     transport::{Channel, Endpoint},
 };
 use tonic_health::{
@@ -31,25 +36,43 @@ use tonic_reflection::pb::v1::{
     ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
     server_reflection_request::MessageRequest,
 };
-use zinder_runtime::{GrpcReceiveLimits, MAX_DECODING_MESSAGE_BYTES, public_grpc_server_with};
+use tower::ServiceExt as _;
+use zinder_runtime::{
+    GrpcReceiveLimits, MAX_DECODING_MESSAGE_BYTES, public_grpc_reflection, public_grpc_server_with,
+};
 
 const HEALTH_CHECK_PATH: &str = "/grpc.health.v1.Health/Check";
+const REFLECTION_INFO_PATH: &str = "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo";
 /// Bound on each wait in these tests; every expected outcome arrives well within it.
 const WAIT_LIMIT: Duration = Duration::from_secs(5);
 const SHORT_RECEIVE_TIMEOUT: Duration = Duration::from_millis(300);
+/// Time for a request started on loopback to reach the server and claim or
+/// be refused a slot.
+const CLAIM_SETTLE: Duration = Duration::from_millis(300);
 
 struct TestServer {
+    address: SocketAddr,
     channel: Channel,
     health: HealthReporter,
     _server: JoinHandle<Result<(), tonic::transport::Error>>,
 }
 
+impl TestServer {
+    /// Opens another HTTP/2 connection to the server.
+    async fn connect(&self) -> Result<Channel> {
+        Ok(Endpoint::new(format!("http://{}", self.address))?
+            .connect()
+            .await?)
+    }
+}
+
 /// Serves gRPC health (unary `Check`, server-streaming `Watch`) and
-/// reflection (bidirectional) behind the public server builder.
+/// reflection (bidirectional) behind the public server builder, the way
+/// public Zinder listeners do.
 async fn serve(slots: usize, receive_timeout: Duration) -> Result<TestServer> {
     let slots = NonZeroUsize::new(slots).ok_or_else(|| eyre!("slots must be non-zero"))?;
     let (health, health_server) = tonic_health::server::health_reporter();
-    let reflection = tonic_reflection::server::Builder::configure().build_v1()?;
+    let reflection = public_grpc_reflection(zinder_proto::ZINDER_V1_FILE_DESCRIPTOR_SET)?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(
@@ -62,10 +85,26 @@ async fn serve(slots: usize, receive_timeout: Duration) -> Result<TestServer> {
         .connect()
         .await?;
     Ok(TestServer {
+        address,
         channel,
         health,
         _server: server,
     })
+}
+
+/// Starts `count` `Check` calls on `channel` whose bodies never arrive, and
+/// waits until each has claimed a slot or been refused one.
+async fn stall_checks(channel: &Channel, count: usize) -> Vec<JoinHandle<Result<(), Status>>> {
+    let stalled = (0..count)
+        .map(|_| tokio::spawn(check_with_body(channel.clone(), tokio_stream::pending())))
+        .collect();
+    tokio::time::sleep(CLAIM_SETTLE).await;
+    stalled
+}
+
+async fn outcome(call: JoinHandle<Result<(), Status>>) -> Result<Option<Code>> {
+    let finished = within_wait_limit(call).await??;
+    Ok(finished.err().map(|status| status.code()))
 }
 
 /// Sends a unary `Check` whose request body is `request_stream`, which can
@@ -308,4 +347,128 @@ fn the_largest_broadcast_requests_fit_the_decoding_limit() {
     };
     assert!(lightwalletd_send.encoded_len() <= MAX_DECODING_MESSAGE_BYTES);
     assert!(native_broadcast.encoded_len() <= MAX_DECODING_MESSAGE_BYTES);
+}
+
+#[tokio::test]
+async fn one_connection_cannot_lock_other_connections_out() -> Result<()> {
+    let server = serve(4, Duration::from_secs(30)).await?;
+    let attacker = server.connect().await?;
+    let victim = server.connect().await?;
+
+    let mut stalled = stall_checks(&attacker, 4).await;
+    if stalled.iter().any(JoinHandle::is_finished) {
+        bail!("a stalled call ended before holding a slot");
+    }
+    // The attacker holds every slot, so its own next request is refused.
+    assert_eq!(
+        check(&attacker).await.err().map(|status| status.code()),
+        Some(Code::Unavailable)
+    );
+
+    // Another connection takes the attacker's oldest slot instead.
+    check(&victim).await?;
+    let oldest = stalled.remove(0);
+    assert_eq!(outcome(oldest).await?, Some(Code::Unavailable));
+    if stalled.iter().any(JoinHandle::is_finished) {
+        bail!("more than the oldest stalled call lost its slot");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn connections_holding_equal_shares_are_refused_across_the_process() -> Result<()> {
+    let server = serve(2, Duration::from_secs(30)).await?;
+    let first = server.connect().await?;
+    let second = server.connect().await?;
+
+    let first_stalled = stall_checks(&first, 1).await;
+    let second_stalled = stall_checks(&second, 1).await;
+    if first_stalled
+        .iter()
+        .chain(&second_stalled)
+        .any(JoinHandle::is_finished)
+    {
+        bail!("a stalled call ended before holding a slot");
+    }
+
+    // The pool is shared by every connection: each holds one of the two
+    // slots, so neither may take the other's.
+    for channel in [&first, &second] {
+        assert_eq!(
+            check(channel).await.err().map(|status| status.code()),
+            Some(Code::Unavailable)
+        );
+    }
+    if first_stalled
+        .iter()
+        .chain(&second_stalled)
+        .any(JoinHandle::is_finished)
+    {
+        bail!("a refused request evicted a stalled call");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_client_stream_that_drips_bytes_without_a_whole_message_is_cancelled() -> Result<()> {
+    let server = serve(1, SHORT_RECEIVE_TIMEOUT).await?;
+    let (sender, receiver) = mpsc::channel::<Result<Frame<Bytes>, Status>>(1);
+    let request = http::Request::post(REFLECTION_INFO_PATH)
+        .header(http::header::CONTENT_TYPE, "application/grpc")
+        .header(http::header::TE, "trailers")
+        .body(Body::new(StreamBody::new(ReceiverStream::new(receiver))))?;
+    let response = server.channel.clone().oneshot(request).await?;
+
+    // A message prefix announcing 100 bytes, then one byte at a time, each
+    // well inside the receive timeout. No message ever completes.
+    let drip = tokio::spawn(async move {
+        let prefix = Bytes::from_static(&[0, 0, 0, 0, 100]);
+        let mut chunk = prefix;
+        while sender.send(Ok(Frame::data(chunk))).await.is_ok() {
+            tokio::time::sleep(SHORT_RECEIVE_TIMEOUT / 4).await;
+            chunk = Bytes::from_static(b"x");
+        }
+    });
+    let ended = within_wait_limit(response.into_body().collect()).await;
+    drip.abort();
+    ended?.map_err(|status| eyre!("reflection response failed: {status}"))?;
+
+    let mut next = ServerReflectionClient::new(server.channel.clone())
+        .server_reflection_info(tokio_stream::once(list_services()))
+        .await?
+        .into_inner();
+    within_wait_limit(next.next())
+        .await?
+        .ok_or_else(|| eyre!("reflection ended before answering"))??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_reflection_message_above_the_decoding_limit_is_not_decoded() -> Result<()> {
+    let server = serve(1, Duration::from_secs(30)).await?;
+    let just_over_two_mib = ServerReflectionRequest {
+        host: "x".repeat(2 * 1024 * 1024),
+        message_request: Some(MessageRequest::ListServices(String::new())),
+    };
+    if just_over_two_mib.encoded_len() <= MAX_DECODING_MESSAGE_BYTES {
+        bail!("the request must exceed the decoding limit");
+    }
+    let mut oversized = ServerReflectionClient::new(server.channel.clone())
+        .max_decoding_message_size(usize::MAX)
+        .server_reflection_info(tokio_stream::once(just_over_two_mib))
+        .await?
+        .into_inner();
+    // Reflection ends its response stream without answering when its request
+    // stream fails, here with OUT_OF_RANGE from the decoder.
+    let reply = within_wait_limit(oversized.next()).await?;
+    assert!(reply.is_none(), "reflection answered an oversized message");
+
+    let mut next = ServerReflectionClient::new(server.channel.clone())
+        .server_reflection_info(tokio_stream::once(list_services()))
+        .await?
+        .into_inner();
+    within_wait_limit(next.next())
+        .await?
+        .ok_or_else(|| eyre!("reflection ended before answering"))??;
+    Ok(())
 }
