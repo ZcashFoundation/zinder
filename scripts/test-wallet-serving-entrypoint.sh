@@ -30,6 +30,7 @@ for function_name in \
   readiness_cause_is_projector_park \
   readiness_cause_is_upstream_outage \
   writer_node_outage_behind_syncing_ingest \
+  readiness_body_height \
   update_node_unreachable_outage \
   query_unready_behind_projector_park \
   start_wallet_serving \
@@ -351,6 +352,20 @@ relayed_outage="$(writer_node_outage_behind_syncing_ingest syncing \
   "$ingest_trailing_syncing_body" "$query_relays_writer_mempool_node_unavailable_body")"
 [ -z "$relayed_outage" ] \
   || test_failure "a trailing ingest whose mempool waits for canonical ingest must stay on the unready tolerance, got '$relayed_outage'"
+# The mempool gate also reports no lag over the one block the default follow
+# threshold admits, so only equal heights prove that canonical ingest caught up.
+ingest_one_block_behind_gated_body='{"status":"not_ready","phase":"following_tip","cause":{"syncing":{"lag_blocks":null}},"current_height":4602672,"target_height":4602673}'
+ingest_gated_without_target_body='{"status":"not_ready","phase":"following_tip","cause":{"syncing":{"lag_blocks":null}},"current_height":4602673}'
+for unproven_body in "$ingest_one_block_behind_gated_body" "$ingest_gated_without_target_body"; do
+  relayed_outage="$(writer_node_outage_behind_syncing_ingest syncing \
+    "$unproven_body" "$query_relays_writer_mempool_node_unavailable_body")"
+  [ -z "$relayed_outage" ] \
+    || test_failure "a gated ingest that has not proven it caught up must stay on the unready tolerance, got '$relayed_outage' behind '$unproven_body'"
+done
+[ "$(readiness_body_height "$ingest_one_block_behind_gated_body" target_height)" = "4602673" ] \
+  || test_failure "the target height was not read from an ingest body"
+[ -z "$(readiness_body_height "$ingest_gated_without_target_body" target_height)" ] \
+  || test_failure "a body without a target height must not report one"
 for unrelated_body in "$ready_body" "$query_node_not_ready_body" "$query_node_unavailable_body" \
   "$degraded_lagging_body" ""; do
   relayed_outage="$(writer_node_outage_behind_syncing_ingest syncing \

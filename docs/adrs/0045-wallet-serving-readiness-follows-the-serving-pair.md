@@ -196,11 +196,14 @@ The mempool relay is narrower evidence. The writer's mempool also refuses with
 catches up, because it certifies a snapshot only at the canonical tip. Ingest
 tells the two cases apart: a trailing writer reports `syncing` with a numeric
 `lag_blocks`, and the mempool gate of a writer that has caught up reports
-`syncing` with `lag_blocks: null`. The entrypoint treats a relayed
-`node_unavailable` as an upstream outage only behind that null lag, and then
-also runs the 24-hour unreachable-node clock, as ingest's own
-`node_unavailable` does, so an ingest stuck in its mempool client still
-restarts eventually. A trailing writer stays on the one-hour unready tolerance
+`syncing` with `lag_blocks: null` and equal `current_height` and
+`target_height`. The gate also reports a null lag over the lag that
+`ingest.follow.lag_threshold_blocks` admits, one block by default, so the null
+lag alone does not prove that the writer has caught up. The entrypoint treats
+a relayed `node_unavailable` as an upstream outage only behind a null lag with
+equal heights, and then also runs the 24-hour unreachable-node clock, as
+ingest's own `node_unavailable` does, so an ingest stuck in its mempool client
+still restarts eventually. A trailing writer stays on the one-hour unready tolerance
 and the recurrence budgets. The entrypoint reads only the writer's own
 observations, never query's view of the node, and it reclassifies no other
 ingest cause.

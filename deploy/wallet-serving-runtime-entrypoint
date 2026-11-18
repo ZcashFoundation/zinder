@@ -395,12 +395,13 @@ readiness_cause_is_upstream_outage() {
 # `IngestControl.WriterStatus` reports the node unsynchronized.
 # `node_unavailable` means the writer's live mempool refuses while it waits for
 # a node snapshot, which also happens while a canonical writer that trails a
-# reachable node catches up. Only a syncing ingest with no known lag, the cause
-# the mempool gate publishes once canonical ingest has caught up, points that
-# refusal at the node; a numeric `lag_blocks` leaves the trailing writer on the
-# ordinary unready tolerance. Given ingest's cause, ingest's body, and the body
-# query just answered, prints the relayed cause when it explains ingest's
-# syncing, and nothing otherwise.
+# reachable node catches up. Only a syncing ingest with no known lag whose
+# `current_height` equals its `target_height` points that refusal at the node:
+# the mempool gate reports `lag_blocks: null` over any lag the follow threshold
+# admits, so only the equal heights prove that canonical ingest has caught up.
+# Any other syncing ingest stays on the ordinary unready tolerance. Given
+# ingest's cause, ingest's body, and the body query just answered, prints the
+# relayed cause when it explains ingest's syncing, and nothing otherwise.
 writer_node_outage_behind_syncing_ingest() {
   [ "$1" = "syncing" ] || return 0
   case "$3" in
@@ -410,13 +411,26 @@ writer_node_outage_behind_syncing_ingest() {
     *'{"input":"ingest_control","dependency_cause":{"node_unavailable":'*)
       case "$2" in
         *'"cause":{"syncing":{"lag_blocks":null}'*)
-          printf 'node_unavailable\n'
+          relay_current_height="$(readiness_body_height "$2" current_height)"
+          if [ -n "$relay_current_height" ] \
+            && [ "$relay_current_height" = "$(readiness_body_height "$2" target_height)" ]; then
+            printf 'node_unavailable\n'
+          fi
           ;;
         *) ;;
       esac
       ;;
     *) ;;
   esac
+}
+
+# Given a `/readyz` body and a top-level height field, prints the field's
+# value, or nothing when the body omits it.
+readiness_body_height() {
+  height_key="\"$2\":"
+  height_fragment="${1#*"$height_key"}"
+  [ "$height_fragment" != "$1" ] || return 0
+  printf '%s\n' "${height_fragment%%[!0-9]*}"
 }
 
 # Query publishes a pair only once the wallet reaches the canonical fence, so
