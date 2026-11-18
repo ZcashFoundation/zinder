@@ -165,10 +165,14 @@ at startup. Its fields follow
 `--ping-very-insecure` as on lightwalletd) makes it answer the way
 `lightwalletd --ping-very-insecure` does: `entry` is the number of `Ping`
 calls in flight once this one starts, the call sleeps `interval_us`
-microseconds, and `exit` is the number still in flight when it returns. Each
-call holds a server task for as long as the client asks, so enable it only on
-a server you are load testing. The `compat_started` log records the setting
-as `ping_very_insecure`.
+microseconds, and `exit` is the number still in flight when it returns. The
+interval converts to nanoseconds with wrapping arithmetic, as lightwalletd's
+Go `time.Duration` does, so an interval too large to represent returns at
+once. Each call holds a server task for as long as the client asks, so enable
+it only on a server you are load testing. A call still sleeping when the
+server starts shutting down ends with `UNAVAILABLE`, so it does not delay
+shutdown. The `compat_started` log records the setting as
+`ping_very_insecure`.
 
 Wallet serving uses `[node]` and the `[node_fallbacks.N]` endpoints only for
 `SendTransaction`. It starts without contacting any node and verifies each

@@ -263,11 +263,12 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
 
     let wallet_query = WalletServingQuery::from_serving_pair_slot(serving_pair_slot.clone())
         .with_node_broadcast(node_broadcast.clone());
+    let cancel = CancellationToken::new();
     let grpc_adapter = LightwalletdGrpcAdapter::from_admitted_compatibility_query(wallet_query)?
         .with_max_concurrent_block_range_streams(
             lightwalletd_config.max_concurrent_block_range_streams,
         )
-        .with_ping(configured_ping(&lightwalletd_config));
+        .with_ping(configured_ping(&lightwalletd_config, &cancel));
     let ops_handle = spawn_ops_endpoint_for(
         RuntimeService::CompatLightwalletd,
         lightwalletd_config.ops_listen_addr,
@@ -277,7 +278,6 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         Arc::from([]),
     )
     .await?;
-    let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
     let node_readiness_handle = spawn_wallet_node_readiness_probe(
         node_broadcast,
@@ -502,11 +502,12 @@ async fn run_compact_blocks(
     .map_err(LightwalletdConfigError::CompactServing)?;
     let visible_height = Some(slot.capture().event_fence().visible_tip().height.value());
     open_storage_phase.complete();
+    let cancel = CancellationToken::new();
     let grpc_adapter = compact_block_serving::CompactBlockAdapter::new(slot)
         .with_max_concurrent_block_range_streams(
             lightwalletd_config.max_concurrent_block_range_streams,
         )
-        .with_ping(configured_ping(&lightwalletd_config));
+        .with_ping(configured_ping(&lightwalletd_config, &cancel));
     let ops_handle = spawn_ops_endpoint_for(
         RuntimeService::CompatLightwalletd,
         lightwalletd_config.ops_listen_addr,
@@ -516,7 +517,6 @@ async fn run_compact_blocks(
         Arc::from([]),
     )
     .await?;
-    let cancel = CancellationToken::new();
     let _signal_handle = cancel_on_terminating_signal(cancel.clone());
     let serving_runtime_drained = CancellationToken::new();
     let publisher_handle = publisher.spawn(cancel.clone(), serving_runtime_drained.clone());
@@ -644,9 +644,12 @@ impl From<Cli> for LightwalletdConfigOverrides {
     }
 }
 
-fn configured_ping(lightwalletd_config: &config::LightwalletdConfig) -> LightwalletdPing {
+fn configured_ping(
+    lightwalletd_config: &config::LightwalletdConfig,
+    shutdown: &CancellationToken,
+) -> LightwalletdPing {
     if lightwalletd_config.ping_very_insecure {
-        LightwalletdPing::enabled()
+        LightwalletdPing::enabled(shutdown.clone())
     } else {
         LightwalletdPing::default()
     }

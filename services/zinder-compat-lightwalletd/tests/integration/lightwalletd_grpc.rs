@@ -3301,7 +3301,9 @@ async fn ping_is_refused_like_lightwalletd_without_its_testing_flag() -> eyre::R
 #[tokio::test]
 async fn ping_answers_like_lightwalletd_when_enabled() -> eyre::Result<()> {
     let store_fixture = acceptance_store_fixture()?;
-    let adapter = acceptance_adapter(&store_fixture).with_ping(LightwalletdPing::enabled());
+    let adapter = acceptance_adapter(&store_fixture).with_ping(LightwalletdPing::enabled(
+        tokio_util::sync::CancellationToken::new(),
+    ));
 
     let response = adapter
         .ping(Request::new(lightwalletd::Duration { interval_us: 0 }))
