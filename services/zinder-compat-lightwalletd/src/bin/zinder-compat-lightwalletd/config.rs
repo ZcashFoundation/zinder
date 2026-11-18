@@ -280,8 +280,7 @@ fn resolve_lightwalletd_config(
     )?;
     guard_serving_bind("compat.listen_addr", listen_addr, allow_public_bind)?;
     guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
-    let broadcaster = NodeTarget::resolve_optional(network, config.node.unwrap_or_default())
-        .map_err(ConfigError::from)?;
+    let broadcaster = resolve_broadcaster(network, config.node)?;
 
     Ok(LightwalletdConfig {
         network,
@@ -301,6 +300,18 @@ fn resolve_lightwalletd_config(
         max_concurrent_block_range_streams,
         broadcaster,
     })
+}
+
+/// Resolves the wallet-mode broadcast node. Any node setting asks for
+/// broadcast, so a section without `node.json_rpc_addr` is an error rather
+/// than a compatibility process without `SendTransaction`.
+fn resolve_broadcaster(
+    network: Network,
+    node: Option<NodeSection>,
+) -> Result<Option<NodeTarget>, ConfigError> {
+    node.map(|section| NodeTarget::resolve(network, section))
+        .transpose()
+        .map_err(ConfigError::from)
 }
 
 #[derive(Serialize)]

@@ -149,7 +149,7 @@ struct QueryRawConfig {
     wallet: WalletSection,
     ingest_control: IngestControlSection,
     query: QuerySection,
-    node: NodeSection,
+    node: Option<NodeSection>,
     security: SecuritySection,
 }
 
@@ -202,7 +202,11 @@ fn resolve_query_config(config: QueryRawConfig) -> Result<QueryConfig, QueryConf
     )?)?;
     let pair_convergence_attempts =
         require_pair_convergence_attempts(config.query.pair_convergence_attempts)?;
-    let node = NodeTarget::resolve_optional(network, config.node).map_err(ConfigError::from)?;
+    let node = config
+        .node
+        .map(|section| NodeTarget::resolve(network, section))
+        .transpose()
+        .map_err(ConfigError::from)?;
 
     Ok(QueryConfig {
         network,
