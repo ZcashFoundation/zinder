@@ -1079,7 +1079,7 @@ fn canonical_writer_config(
         storage_path: command_config.runtime_config.storage_path.clone(),
         resource_budget: command_config.runtime_config.canonical_rocksdb_budget,
         construction: CanonicalConstructionConfig {
-            request_timeout: command_config.runtime_config.node.request_timeout,
+            request_timeout: command_config.runtime_config.longest_node_request_timeout(),
             pipeline_limits: command_config.runtime_config.construction.pipeline_limits,
             network_upgrade_activations,
         },
@@ -1090,7 +1090,7 @@ fn canonical_writer_config(
         raw_blob_retention: command_config.runtime_config.raw_blob_policy.to_retention(),
         reorg_window_blocks: command_config.runtime_config.reorg_window_blocks,
         follow: CanonicalFollowConfig {
-            request_timeout: command_config.runtime_config.node.request_timeout,
+            request_timeout: command_config.runtime_config.longest_node_request_timeout(),
             poll_interval: command_config.runtime_config.follow.poll_interval,
             lag_threshold_blocks: command_config.runtime_config.follow.lag_threshold_blocks,
             max_replacement_bytes: command_config.runtime_config.follow.max_replacement_bytes,
@@ -1612,6 +1612,57 @@ mod tests {
         let composed = writer_readiness_for(readiness.clone(), None, &termination);
         composed.publish_admission(zinder_runtime::ReadinessState::ready(Some(7)));
         assert!(readiness.report().is_ready);
+    }
+
+    /// A fallback slower than `[node]` keeps its own request timeout after a
+    /// switch: the writer bounds node calls by the longest one in the list.
+    #[test]
+    fn writer_bounds_node_calls_by_the_longest_endpoint_request_timeout()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let config_path = temporary.path().join("zinder-ingest.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"[network]
+name = "zcash-regtest"
+
+[node]
+json_rpc_addr = "http://127.0.0.1:39232"
+request_timeout_secs = 1
+
+[node_fallbacks.1]
+json_rpc_addr = "http://127.0.0.1:39233"
+request_timeout_secs = 30
+
+[storage]
+path = "{}"
+
+[ingest]
+source = "zebra-json-rpc"
+"#,
+                temporary.path().join("store").display()
+            ),
+        )?;
+        let command_config = super::config::load_ingest_config(
+            Some(config_path),
+            super::IngestConfigOverrides::default(),
+        )?;
+
+        let writer_config = super::canonical_writer_config(
+            &command_config,
+            Arc::new(zinder_testkit::sample_regtest_upgrade_activations()),
+        );
+
+        assert_eq!(
+            writer_config.follow.request_timeout,
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            writer_config.construction.request_timeout,
+            Duration::from_secs(30)
+        );
+        Ok(())
     }
 
     #[test]

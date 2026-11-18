@@ -143,6 +143,23 @@ pub struct IngestRuntimeConfig {
     pub run_overrides: CanonicalRunOverrides,
 }
 
+impl IngestRuntimeConfig {
+    /// Longest `request_timeout_secs` of any endpoint in the ordered node
+    /// list.
+    ///
+    /// The canonical writer bounds each node call by it. Every endpoint's
+    /// own client still times out its requests after that endpoint's own
+    /// timeout, so a call to a fallback with a longer timeout than `[node]`
+    /// is not cut short after a switch.
+    #[must_use]
+    pub fn longest_node_request_timeout(&self) -> Duration {
+        self.node_fallbacks
+            .iter()
+            .map(|fallback| fallback.request_timeout)
+            .fold(self.node.request_timeout, Duration::max)
+    }
+}
+
 /// Resolved `[ingest.mempool]` resource limits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MempoolIngestSettings {

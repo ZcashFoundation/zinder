@@ -265,6 +265,9 @@ admitting the mempool certification made from the previous endpoint, and ends
 the live mempool stream, so the owner rebuilds from the new endpoint; ingest
 readiness stays withdrawn until the owner certifies a snapshot after the
 switch, even when it is still busy with the previous endpoint.
+Each endpoint's client applies that endpoint's own `request_timeout_secs`, and
+the writer bounds every node call by the longest timeout in the list, so a call
+to a fallback slower than `[node]` is not cut short after a switch.
 There is no timed failback. The next switch walks positions from 0 again, and a
 restart starts at position 0. Fresh construction does not switch: a node
 failure there exits, and the restart admits the first reachable endpoint.
