@@ -31,7 +31,7 @@ use zinder_proto::{
         canonical_control_client::CanonicalControlClient,
     },
 };
-use zinder_query::{QueryError, status_from_query_error};
+use zinder_query::{QueryError, status_from_query_error, wallet_ingest_control_request};
 use zinder_runtime::{
     AuthenticatedChannel, BearerToken, CanonicalFenceConvergence, CanonicalFenceConvergenceError,
     CanonicalFenceConvergencePolicy, CanonicalFenceProbe, CanonicalFenceRelation,
@@ -167,9 +167,13 @@ impl WriterStatus {
         })
     }
 
+    /// Bounded, so a writer that accepts the call and never answers cannot
+    /// hold the publisher's refresh past its staleness ceiling.
     async fn fetch(&mut self) -> Result<CanonicalWriterStatusResponse, Status> {
         self.client
-            .writer_status(Request::new(CanonicalWriterStatusRequest {}))
+            .writer_status(wallet_ingest_control_request(
+                CanonicalWriterStatusRequest {},
+            ))
             .await
             .map(Response::into_inner)
             .map_err(|error| Status::unavailable(error.to_string()))
@@ -1405,6 +1409,8 @@ mod tests {
         /// Answers served once each, in order, before `writer_status`.
         queued_statuses: Arc<Mutex<std::collections::VecDeque<CanonicalWriterStatusResponse>>>,
         available: Arc<std::sync::atomic::AtomicBool>,
+        /// Accepts each writer-status call and never answers it.
+        stalled: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl MutableCanonicalControl {
@@ -1413,7 +1419,13 @@ mod tests {
                 writer_status: Arc::new(Mutex::new(writer_status)),
                 queued_statuses: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 available: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                stalled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
+        }
+
+        fn stall(&self) {
+            self.stalled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
         fn queue_writer_status(&self, writer_status: CanonicalWriterStatusResponse) {
@@ -1436,6 +1448,9 @@ mod tests {
             &self,
             _request: Request<CanonicalWriterStatusRequest>,
         ) -> Result<tonic::Response<CanonicalWriterStatusResponse>, tonic::Status> {
+            if self.stalled.load(std::sync::atomic::Ordering::Relaxed) {
+                std::future::pending::<()>().await;
+            }
             if !self.available.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(tonic::Status::unavailable("fixture writer status outage"));
             }
@@ -1983,6 +1998,77 @@ mod tests {
             message.contains("has not admitted a network-upgrade schedule"),
             "bootstrap failed for another reason: {message}"
         );
+        Ok(())
+    }
+
+    /// A writer that never answers its status cannot hold a refresh open.
+    ///
+    /// Each read ends at the wallet ingest-control bound, and once the
+    /// attestation passes the staleness ceiling the publisher refuses traffic
+    /// with `writer_status_unavailable`.
+    #[tokio::test]
+    async fn a_writer_that_never_answers_its_status_reaches_the_staleness_ceiling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let activations = lifecycle_activations();
+        let (primary, _) =
+            lifecycle_store(&temporary.path().join("canonical-primary"), &activations)?;
+        let control = MutableCanonicalControl::new(lifecycle_writer_status(&primary));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn({
+            let control = control.clone();
+            async move {
+                Server::builder()
+                    .add_service(CanonicalControlServer::new(control))
+                    .serve_with_incoming(TcpListenerStream::new(listener))
+                    .await
+            }
+        });
+        let readiness = Readiness::default();
+        let config = CompactBlockServingConfig {
+            canonical_primary_path: temporary.path().join("canonical-primary"),
+            canonical_secondary_root: temporary.path().join("canonical-secondaries"),
+            network: Network::ZcashRegtest,
+            raw_blob_retention: RawBlobRetention::Transactions,
+            reorg_policy: CanonicalReorgPolicy::new(100)?,
+            resource_budget: RocksDbResourceBudget::for_local_tests(),
+            catchup_interval: Duration::from_millis(1),
+            convergence_timeout: Duration::from_secs(2),
+            convergence_attempts: 4,
+            staleness_ceiling: Duration::from_millis(50),
+            lag_threshold: 0,
+        };
+        let (mut publisher, _slot) = CompactBlockPublisher::bootstrap(
+            config,
+            CompactServingReadiness::new(readiness.clone()),
+            &endpoint,
+            None,
+        )
+        .await?;
+        assert!(readiness.report().is_ready);
+
+        control.stall();
+        tokio::time::pause();
+        let refreshed = tokio::time::timeout(
+            zinder_query::WALLET_INGEST_CONTROL_REQUEST_TIMEOUT * 2,
+            publisher.refresh(),
+        )
+        .await;
+        tokio::time::resume();
+
+        assert!(
+            refreshed.is_ok(),
+            "a refresh waited on a writer status the writer never answered"
+        );
+        assert_eq!(
+            readiness.report().cause,
+            ReadinessCause::WriterStatusUnavailable
+        );
+        drop(publisher);
+        drop(primary);
+        server.abort();
+        let _join_outcome = server.await;
         Ok(())
     }
 

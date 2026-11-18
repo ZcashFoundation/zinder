@@ -533,9 +533,13 @@ height, keeps answering. A writer mempool that hydrates or rebuilds from its
 node degrades ingest control with `node_unavailable`, and a writer halt
 observed by the ingest-control probe refuses traffic until the serving-pair
 publisher validates a following writer. Compact-blocks mode calls neither from
-any method, runs no dependency probe, and rejects every node setting. Traffic
-uses a readiness interceptor, so a process whose serving pair refuses traffic
-does not accept new gRPC requests.
+any method, runs no dependency probe, and rejects every node setting. Its
+publisher ends each `CanonicalControl.WriterStatus` read after 15 seconds, as
+native query does, so a writer that accepts the call and never answers still
+reaches `writer_status_unavailable` once
+`storage.serving_pair_staleness_ceiling_ms` passes. Traffic uses a readiness
+interceptor, so a process whose serving pair refuses traffic does not accept
+new gRPC requests.
 
 Wallet-mode compatibility admits ingest control at startup through the same
 `AdmittedIngestControl` as native query, which validates service identity,
