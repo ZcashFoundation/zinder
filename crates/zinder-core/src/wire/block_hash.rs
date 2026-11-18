@@ -15,6 +15,8 @@
 //! Pick the function whose name matches the wire surface:
 //! - Lightwalletd-compat `bytes` fields carry internal byte order. Use
 //!   [`encode_internal_block_hash`] and [`decode_internal_block_hash`].
+//!   The exception is `SubtreeRoot.completingBlockHash`, which reference
+//!   lightwalletd fills in RPC byte order. Use [`encode_rpc_block_hash_bytes`].
 //! - Native zinder protobuf `string` hash fields, JSON, log records, and
 //!   any human-facing surface carry RPC byte order hex. Use
 //!   [`encode_rpc_block_hash_hex`] and [`decode_rpc_block_hash_hex`].
@@ -96,6 +98,21 @@ pub fn decode_rpc_block_hash_hex(input: &str) -> Result<BlockHash, WireDecodeErr
     })?;
     buffer.reverse();
     Ok(BlockHash::from_bytes(buffer))
+}
+
+/// Encode a [`BlockHash`] as RPC byte order bytes.
+///
+/// The raw-bytes analogue of [`encode_rpc_block_hash_hex`]. Reference
+/// lightwalletd reverses the block hash into this form for
+/// `SubtreeRoot.completingBlockHash`, unlike the other lightwalletd `bytes`
+/// hash fields.
+///
+/// Reference: Zcash protocol spec, term `\rpcByteOrder` (protocol.tex:1127, :4036).
+#[must_use]
+pub fn encode_rpc_block_hash_bytes(block_hash: BlockHash) -> [u8; 32] {
+    let mut bytes = block_hash.as_bytes();
+    bytes.reverse();
+    bytes
 }
 
 /// Decode RPC byte order bytes into a [`BlockHash`].
@@ -203,6 +220,15 @@ mod tests {
         display_order_bytes.reverse();
         let decoded = decode_rpc_block_hash_bytes(&display_order_bytes)?;
         assert_eq!(decoded.as_bytes(), TESTNET_BLOCK_HASH_INTERNAL_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn rpc_bytes_encode_matches_zcash_cli_for_testnet_block() -> TestResult {
+        let block_hash = BlockHash::from_bytes(TESTNET_BLOCK_HASH_INTERNAL_BYTES);
+        let encoded = encode_rpc_block_hash_bytes(block_hash);
+        assert_eq!(hex::encode(encoded), TESTNET_BLOCK_HASH_RPC_HEX);
+        assert_eq!(decode_rpc_block_hash_bytes(&encoded)?, block_hash);
         Ok(())
     }
 

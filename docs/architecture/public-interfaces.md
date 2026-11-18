@@ -570,7 +570,9 @@ explorer.migration.denominations_v1
 ## Wire conventions
 
 - Internal hashes use Zinder's typed internal byte order. Protocol adapters
-  convert at their boundary.
+  convert at their boundary. Lightwalletd-compatible `bytes` hash fields carry
+  internal byte order, except `SubtreeRoot.completingBlockHash`, which
+  reference lightwalletd fills in RPC byte order.
 - Protobuf bytes are validated for exact length before becoming typed hashes,
   outpoints, or commitments.
 - Heights, positions, timestamps, outpoints, and address script hashes use
