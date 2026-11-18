@@ -45,6 +45,7 @@ pub use node_target::{
     DEFAULT_NODE_HEALTH_VERIFICATION_PROGRESS_FLOOR, DEFAULT_NODE_REQUEST_TIMEOUT_SECS,
     NodeAuthSection, NodeConfigError, NodeFallbackSections, NodeHealthConfig, NodeHealthSection,
     NodeIndexerClientIdentity, NodeIndexerTls, NodeIndexerTlsSection, NodeSection, NodeTarget,
+    redact_endpoint_url,
 };
 pub use source_block::{
     SourceBlock, SourceBlockHeader, block_header_from_raw_block_bytes, decode_rpc_block_hash,

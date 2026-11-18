@@ -27,7 +27,7 @@ use zinder_source::{
     UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK, ZebraJsonRpcSource,
     decode_rpc_block_hash,
 };
-use zinder_testkit::{JsonRpcTestServer, RpcReply, method};
+use zinder_testkit::{JsonRpcTestServer, LogCapture, RpcReply, method};
 
 fn regtest_source(server: &JsonRpcTestServer) -> Result<ZebraJsonRpcSource, SourceError> {
     ZebraJsonRpcSource::new(
@@ -2499,6 +2499,45 @@ async fn poll_upstream_health_falls_back_when_ready_endpoint_unreachable() -> ey
         UPSTREAM_HEALTH_SOURCE_VERIFICATION_PROGRESS_FALLBACK
     );
     assert_eq!(snapshot.upstream_committed_height, Some(50));
+    Ok(())
+}
+
+/// A failed ready probe logs the health address with its credentials
+/// redacted, so a standby evaluation of a fallback never writes them.
+#[tokio::test]
+async fn a_failed_ready_probe_logs_the_health_address_without_credentials() -> eyre::Result<()> {
+    let capture = LogCapture::install_for_target("zinder::source");
+    let server =
+        JsonRpcTestServer::start([method("getblockchaininfo").reply(RpcReply::result(json!({
+            "blocks": 50,
+            "estimatedheight": 50,
+            "verificationprogress": 1.0,
+            "valuePools": [],
+            "upgrades": {},
+        })))])?;
+    let source = testnet_source(&server)?.with_health_config(Some(NodeHealthConfig::new(
+        "http://zebra:health-secret@127.0.0.1:1/ready?token=query-secret".to_owned(),
+        Duration::from_millis(500),
+        0.999,
+        10,
+    )));
+
+    source.poll_upstream_health().await?;
+
+    let events = capture.events();
+    let unreachable = events
+        .iter()
+        .find(|event| event.field("event") == Some("upstream_health_endpoint_unreachable"))
+        .ok_or_else(|| eyre!("the failed ready probe was not logged"))?;
+    assert_eq!(
+        unreachable.field("addr"),
+        Some("http://[REDACTED]@127.0.0.1:1/ready?[REDACTED]")
+    );
+    for event in &events {
+        for field in event.fields.values() {
+            assert!(!field.contains("secret"), "{event:?}");
+        }
+    }
     Ok(())
 }
 

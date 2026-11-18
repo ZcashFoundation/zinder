@@ -775,6 +775,51 @@ fn uses_tls_scheme(url: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
 }
 
+/// Returns `url` for configuration output and logs, with its user
+/// information and its query and fragment each replaced by `[REDACTED]`.
+///
+/// An endpoint URL can carry a credential in either place. The scheme, host,
+/// port, and path stay visible, so an operator can still tell endpoints
+/// apart. A URL without user information, query, or fragment is returned
+/// unchanged.
+#[must_use]
+pub fn redact_endpoint_url(url: &str) -> std::borrow::Cow<'_, str> {
+    const REDACTED: &str = "[REDACTED]";
+    let (scheme, rest) = match url.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, url),
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, after_authority) = rest.split_at(authority_end);
+    let host = authority.rsplit_once('@').map(|(_userinfo, host)| host);
+    let path_end = after_authority
+        .find(['?', '#'])
+        .unwrap_or(after_authority.len());
+    let (path, query_and_fragment) = after_authority.split_at(path_end);
+    if host.is_none() && query_and_fragment.is_empty() {
+        return std::borrow::Cow::Borrowed(url);
+    }
+    let mut redacted = String::with_capacity(url.len());
+    if let Some(scheme) = scheme {
+        redacted.push_str(scheme);
+        redacted.push_str("://");
+    }
+    match host {
+        Some(host) => {
+            redacted.push_str(REDACTED);
+            redacted.push('@');
+            redacted.push_str(host);
+        }
+        None => redacted.push_str(authority),
+    }
+    redacted.push_str(path);
+    if let Some(delimiter) = query_and_fragment.chars().next() {
+        redacted.push(delimiter);
+        redacted.push_str(REDACTED);
+    }
+    std::borrow::Cow::Owned(redacted)
+}
+
 fn resolve_node_auth(section: NodeAuthSection) -> Result<NodeAuth, NodeConfigError> {
     let method = section.method.as_deref().unwrap_or("none");
 
@@ -881,6 +926,37 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redacted_endpoint_urls_keep_host_and_path_but_not_credentials() {
+        for (url, expected) in [
+            ("http://127.0.0.1:8232", "http://127.0.0.1:8232"),
+            ("http://zebra:8233/ready", "http://zebra:8233/ready"),
+            (
+                "http://zebra:rpc-secret@127.0.0.1:8232",
+                "http://[REDACTED]@127.0.0.1:8232",
+            ),
+            (
+                "https://token-secret@zebra.example/v1/",
+                "https://[REDACTED]@zebra.example/v1/",
+            ),
+            (
+                "http://zebra:8233/ready?token=query-secret",
+                "http://zebra:8233/ready?[REDACTED]",
+            ),
+            (
+                "http://user:secret@zebra:8233?token=secret#fragment-secret",
+                "http://[REDACTED]@zebra:8233?[REDACTED]",
+            ),
+            (
+                "http://zebra:8233/#fragment-secret",
+                "http://zebra:8233/#[REDACTED]",
+            ),
+            ("user:secret@zebra:8232", "[REDACTED]@zebra:8232"),
+        ] {
+            assert_eq!(redact_endpoint_url(url), expected, "{url}");
+        }
+    }
 
     #[test]
     fn resolve_basic_auth_round_trip() -> Result<(), NodeConfigError> {

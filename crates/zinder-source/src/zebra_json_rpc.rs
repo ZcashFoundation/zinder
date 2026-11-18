@@ -1329,7 +1329,7 @@ impl NodeSource for ZebraJsonRpcSource {
                     tracing::warn!(
                         target: "zinder::source",
                         event = "upstream_health_endpoint_unreachable",
-                        addr = config.addr.as_str(),
+                        addr = %crate::redact_endpoint_url(&config.addr),
                         reason = %error,
                         "ready endpoint probe failed; falling back to verificationprogress"
                     );
