@@ -340,7 +340,10 @@ fn node_settings_are_rejected() -> eyre::Result<()> {
         .output()?;
     assert!(!fallbacks.status.success(), "{fallbacks:?}");
     let stderr = String::from_utf8(fallbacks.stderr)?;
-    assert!(stderr.contains("unknown field `node_fallbacks`"), "{stderr}");
+    assert!(
+        stderr.contains("unknown field `node_fallbacks`"),
+        "{stderr}"
+    );
     Ok(())
 }
 
