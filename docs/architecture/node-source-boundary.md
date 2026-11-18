@@ -39,8 +39,10 @@ Forbidden outside `zinder-source`:
   `capabilities`, `fetch_network_upgrade_activations`, and
   `fetch_storage_mode`.
 
-Every runtime reaches these through the trait. `discover_network_upgrade_activations`
-wraps `fetch_network_upgrade_activations` with the shared discovery log event,
+Ingest reaches these through the trait, and a wallet reader's
+`BroadcastNodeProbe` delegates to the same methods.
+`discover_network_upgrade_activations` wraps
+`fetch_network_upgrade_activations` with the shared discovery log event,
 and `MempoolSourceFactory` builds an endpoint's live mempool source: the
 streaming indexer source when the endpoint names an indexer, polling
 otherwise. `ZebraJsonRpcSource::from_node_target` builds the source one
