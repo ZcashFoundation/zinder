@@ -98,7 +98,9 @@ async fn serves_lightwalletd_scan_shape_from_fixture() -> eyre::Result<()> {
     assert_eq!(lightd_info.vendor, "Zinder");
     assert_eq!(lightd_info.chain_name, "test");
     assert_eq!(lightd_info.block_height, visible_tip_block.height);
-    assert_eq!(lightd_info.estimated_height, visible_tip_block.height);
+    // The network estimate from the tip's block time; the fixture tip is
+    // old, so the estimate runs ahead of it.
+    assert!(lightd_info.estimated_height >= visible_tip_block.height);
     assert_eq!(
         lightd_info.lightwallet_protocol_version,
         lightwalletd::LIGHTWALLETD_PROTOCOL_VERSION

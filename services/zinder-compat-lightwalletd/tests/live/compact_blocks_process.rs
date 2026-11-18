@@ -1054,7 +1054,7 @@ fn process_config(
     raw_blob_policy: RawBlobRetention,
 ) -> String {
     format!(
-        "[network]\nname = \"{}\"\n\n[storage]\npath = \"{}\"\nsecondary_path = \"{}\"\nraw_blob_policy = \"{}\"\n\n[ingest_control]\naddr = \"http://{}\"\n\n[compat]\nlisten_addr = \"{}\"\nreorg_window_blocks = 100\npair_convergence_attempts = 8\nserving = \"compact-blocks\"\n\n[ops]\nlisten_addr = \"{}\"\n\n[security]\nallow_public_bind = false\n",
+        "[network]\nname = \"{}\"\n\n[storage]\npath = \"{}\"\nsecondary_path = \"{}\"\nraw_blob_policy = \"{}\"\n\n[ingest_control]\naddr = \"http://{}\"\n\n[compat]\nlisten_addr = \"{}\"\nreorg_window_blocks = 100\npair_convergence_attempts = 8\nserving = \"compact-blocks\"\n# The fixture chains carry old block times.\nstale_tip_limit_ms = 0\n\n[ops]\nlisten_addr = \"{}\"\n\n[security]\nallow_public_bind = false\n",
         encode_zinder_native_chain_name(env.target.network),
         toml_string(&canonical_path.display().to_string()),
         toml_string(&runtime_secondary.display().to_string()),

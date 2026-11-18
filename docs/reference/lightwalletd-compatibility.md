@@ -67,12 +67,32 @@ Both methods describe the serving process and its current tip. Whole messages re
 | `blockHeight` | The served visible tip. Compare with a tolerance of one block. |
 | `vendor`, `version`, `gitCommit` | `Zinder`, the crate version, and the build commit. Never compare. |
 | `branch`, `buildDate`, `buildUser`, `zcashdBuild`, `zcashdSubversion`, `donationAddress` | Always empty. Never compare. |
-| `estimatedHeight` | Always equal to `blockHeight`, even during a node outage. Operators read `served_epoch_age_seconds` on `/readyz` instead. |
+| `estimatedHeight` | The network height estimated from the served tip, as [Stale tip](#stale-tip) describes. Never below `blockHeight`, and at most a few blocks above it while the tip advances. Never compare. |
 | `taddrSupport` | `true` in wallet serving, `false` in compact-blocks serving. Fixed when the process starts. |
 
 The upgrade fields come from the network-upgrade schedule that ingest admitted, never from a node. A newly admitted upgrade shows as pending until the tip reaches it. A store without an admitted schedule is not served: the process retries until `storage.initial_catchup_timeout_ms` passes, then exits.
 
 `GetLatestBlock` returns the visible tip height and its hash in internal byte order, the reverse of the hex Zebra's JSON-RPC prints. Compare hashes across servers only at equal heights.
+
+#### Stale tip
+
+`estimatedHeight` is the height Zebra would report as `estimatedheight` for the served tip: the tip, plus the blocks the target spacing would have produced since the tip's block time. Each era uses the spacing of its network upgrade in the admitted schedule: 150 seconds before Blossom, 75 seconds from Blossom, and 25 seconds from NU7. Go lightwalletd forwards Zebra's value, which Zebra computes the same way from its own tip. During a node outage the served tip stands still and `estimatedHeight` keeps rising.
+
+Once the served tip's block is older than `compat.stale_tip_limit_ms` (`ZINDER_COMPAT__STALE_TIP_LIMIT_MS`), `GetLatestBlock` and `GetLightdInfo` fail with `UNAVAILABLE`, as lightwalletd's do while its node is down. They answer again as soon as a newer tip is served. Every other method keeps serving stored data. `zinder_compat_stale_tip_refusals_total{method}` counts the refusals.
+
+- The limit defaults to 25 minutes on Mainnet and Testnet. Regtest mines on demand, so its tip age says nothing about the node, and the limit is off there by default.
+- The limit follows the served tip's age, whatever the cause. A deployment still catching up to the network, or restored from an old snapshot, refuses the tip calls until its tip is within the limit, although `/readyz` reports it ready. Go lightwalletd instead answers with its node's lagging tip in that state.
+- 0 turns the limit off, for a private deployment that wants its wallets to keep syncing through a long outage. Its wallets then build transactions that expire on arrival once the tip is about 50 minutes old. Any other value must be at least 5 minutes.
+- Every wallet engine below expires a transaction 40 blocks after the tip it was told, plus one, and 120 blocks from NU7: 50 minutes of target time either way. The default limit is half that window, so a wallet stops on the stale tip well before a transaction built on it would expire.
+
+How each engine uses the tip calls:
+
+| Engine | Reads `estimatedHeight` | When `GetLatestBlock` or `GetLightdInfo` fails | Transaction expiry |
+| --- | --- | --- | --- |
+| Slipstream, in the ZODL Android and iOS apps (`zodl-inc/slipstream` `245a2d2`, `zodl-android-wallet-sdk` `ea01b96`, `zodl-swift-wallet-sdk` `0571cb4`) | Server ranking only: a server whose tip is more than 6 hours of target time behind its `estimatedHeight` is left out. Sync never reads it. | Each sync pass stops at `GetLatestBlock` and retries. The follow loop polls every 10 to 30 seconds and, after 5 failures, reports the endpoint unreachable while it keeps polling. Ranking leaves out a server whose tip calls fail. | Wallet tip plus 1 plus 40 blocks, or 120 from NU7. |
+| Zcash Android SDK (`zcash/zcash-android-wallet-sdk` `a95780a`) | Server ranking only: a server whose `estimatedHeight` is 288 or more blocks above `blockHeight` is left out. | After 3 attempts the synchronizer reports `DISCONNECTED` and reconnects to the same server about every 5 seconds, without giving up. A failing `GetLightdInfo` at sync setup ends in a `ClassCastException` in `CompactBlockProcessor.verifySetup`, as it does against lightwalletd with its node down. | Rust backend default: tip plus 1 plus 40 blocks. |
+| Vizor (`chainapsis/vizor-wallet` `a69183b`) | Never. | Retries after 2, 4, and 8 seconds, then shows "Network connection lost. We'll keep trying automatically." In Automatic mode it sets the server aside for a minute and switches; a custom endpoint retries every 10 seconds. A send fails while the tip call fails. Automatic mode also leaves a server whose tip has not advanced for 5 minutes when another is higher. | Server tip plus 1 plus 40 blocks, or 120 from NU7. |
+| Zingo (`zingolabs/zingolib` `658dea0`, pepper-sync) | Never. | The sync pass ends with an error it classes as recoverable; a failing `GetLightdInfo` stops a sync before it starts. | Wallet tip plus 1 plus 40 blocks, or 120 from NU7. |
 
 ### `GetBlock` and `GetBlockNullifiers`
 

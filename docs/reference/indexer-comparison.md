@@ -457,7 +457,7 @@ describes the levels of evidence behind Zinder's own compatibility claims.
 
 [^ztr-tip]: `GetLatestBlock` returns `UNAVAILABLE` after 30 seconds without a successful head poll ([compact/mod.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/service/src/compact/mod.rs#L168-L174), [follower.rs](https://github.com/zcashlabs/ztreamer/blob/39b2d1248cba0e2df3ecf1af3f419553a5dbadd4/crates/sync/src/head/follower.rs#L98-L104)).
 
-[^zinder-tip-down]: `GetLatestBlock` and `GetLightdInfo` keep answering with the last indexed tip, and `estimatedHeight` stays equal to it, so wallets are not told that the chain stopped advancing ([lightwalletd-compatibility.md](https://github.com/ZcashFoundation/zinder/blob/c293095dfab045e731cbe3e6e7f8b5dce4576fdb/docs/reference/lightwalletd-compatibility.md#L93-L97)).
+[^zinder-tip-down]: `GetLatestBlock` and `GetLightdInfo` answer with the last indexed tip while `estimatedHeight` keeps rising from it, and once that tip is 25 minutes old they fail with `UNAVAILABLE`, as lightwalletd's do, while stored data keeps serving ([Stale tip](lightwalletd-compatibility.md#stale-tip)).
 
 [^zingod-p2p]: Needs `[p2p] enabled = true`, which is off by default ([config.rs](https://github.com/zingolabs/zingod/blob/3664ce0bbea3f1945c84c8730359795b84959ed2/packages/zingod/src/config.rs#L482-L490)).
 

@@ -1190,6 +1190,18 @@ pub const ENVIRONMENT_VARIABLES: &[EnvVarDoc] = &[
                       Must be in 1..=256; defaults to 64.",
     },
     EnvVarDoc {
+        name: "ZINDER_COMPAT__STALE_TIP_LIMIT_MS",
+        toml_path: "compat.stale_tip_limit_ms",
+        used_by: &["zinder-compat-lightwalletd"],
+        requirement: Requirement::Optional,
+        sensitive: false,
+        description: "Milliseconds the served tip's block may predate the clock before \
+                      lightwalletd `GetLatestBlock` and `GetLightdInfo` fail with `UNAVAILABLE`, \
+                      so wallets stop building transactions on a stale tip. 0 disables it; \
+                      otherwise at least 300000. Defaults to 1500000 (25 minutes) on Mainnet \
+                      and Testnet and to 0 on Regtest.",
+    },
+    EnvVarDoc {
         name: "ZINDER_COMPAT__PING_VERY_INSECURE",
         toml_path: "compat.ping_very_insecure",
         used_by: &["zinder-compat-lightwalletd"],
@@ -1936,6 +1948,7 @@ mod tests {
                 "ZINDER_COMPAT__MAX_CONCURRENT_BLOCK_RANGE_STREAMS",
                 "ZINDER_COMPAT__TREE_STATE_REPLAY_WAIT_MS",
                 "ZINDER_COMPAT__TREE_STATE_REPLAY_WAITERS_PER_SLOT",
+                "ZINDER_COMPAT__STALE_TIP_LIMIT_MS",
                 "ZINDER_COMPAT__PING_VERY_INSECURE",
             ]
         );

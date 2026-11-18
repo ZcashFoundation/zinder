@@ -352,6 +352,7 @@ bidirectional calls.
 | `zinder_compat_block_range_stream_refusals_total` | counter | `reason` | Block-range requests refused with `UNAVAILABLE`: `wait_timeout` when no slot returned within 10 seconds, `waiters_full` when as many requests already waited as the limit has slots. |
 | `zinder_compat_block_range_slot_wait_duration_seconds` | histogram | `outcome` | Time a block-range request waited before it took a slot (`admitted`), was refused (`refused`), or its client went away (`cancelled`). |
 | `zinder_compat_block_range_stage_duration_seconds` | histogram | `stage` | Time one chunk of a block-range stream spent reading from storage (`read`), converting to lightwalletd messages (`convert`), or, for each chunk after the first, waiting for the client to make room for it (`send`). |
+| `zinder_compat_stale_tip_refusals_total` | counter | `method` | `GetLatestBlock` (`get_latest_block`) and `GetLightdInfo` (`get_lightd_info`) calls refused with `UNAVAILABLE` because the served tip was older than `compat.stale_tip_limit_ms`. |
 | `zinder_compat_block_range_reorg_endings_total` | counter | `cause` | Streams ended early by a reorg: `chain_replaced` or `tip_lowered`. Clients retry. |
 | `zinder_compat_compact_refresh_failures_total` | counter | `cause` | Compact-blocks mode: failed refreshes, by readiness cause. |
 

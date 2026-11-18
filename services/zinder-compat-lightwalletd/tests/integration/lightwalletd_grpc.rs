@@ -22,7 +22,7 @@ use zebra_chain::{
 };
 use zinder_compat_lightwalletd::{
     BLOCK_RANGE_CHUNK_MAX_BYTES, DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
-    LightwalletdGrpcAdapter, LightwalletdPing,
+    LightwalletdGrpcAdapter, LightwalletdPing, StaleTipLimit,
 };
 use zinder_core::{
     BlockHash, BlockHeight, BlockHeightRange, BlockId, BlockSelector, BroadcastDuplicate,
@@ -153,7 +153,8 @@ async fn lightwalletd_adapter_serves_read_sync_methods() -> eyre::Result<()> {
     // Wallet SDKs match `chainName` against ID_TESTNET, which is "test".
     assert_eq!(lightd_info.chain_name, "test");
     assert_eq!(lightd_info.block_height, 1);
-    assert_eq!(lightd_info.estimated_height, 1);
+    // The fixture tip is old, so the network estimate runs ahead of it.
+    assert!(lightd_info.estimated_height >= lightd_info.block_height);
     assert_eq!(
         lightd_info.lightwallet_protocol_version,
         lightwalletd::LIGHTWALLETD_PROTOCOL_VERSION
@@ -167,6 +168,147 @@ async fn lightwalletd_adapter_serves_read_sync_methods() -> eyre::Result<()> {
     assert_eq!(lightd_info.upgrade_name, "NU5");
     assert_eq!(lightd_info.upgrade_height, 2);
 
+    Ok(())
+}
+
+fn unix_now() -> eyre::Result<i64> {
+    Ok(i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs(),
+    )?)
+}
+
+/// `GetLightdInfo` estimates the network height from the served tip.
+///
+/// The estimate is the tip while its block is fresh, and the tip plus the
+/// blocks the target spacing would have produced since, once it is old, as
+/// Zebra estimates it. `blockHeight` stays the served tip.
+#[tokio::test]
+async fn lightd_info_estimates_the_network_height_from_the_served_tip() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let recorder = EpochPinRecorder::new(store_fixture.query());
+    let activations = recorder.network_upgrade_activations().await?;
+
+    // A tip's block time never changes, so the adapter reads it once per
+    // tip; each tip age below uses its own adapter.
+    recorder.set_block_time(unix_now()?);
+    let fresh = LightwalletdGrpcAdapter::new(recorder.clone())
+        .get_lightd_info(Request::new(lightwalletd::Empty {}))
+        .await?
+        .into_inner();
+    assert_eq!(
+        fresh.block_height,
+        u64::from(ACCEPTANCE_BLOCK_HEIGHT.value())
+    );
+    assert_eq!(fresh.estimated_height, fresh.block_height);
+
+    let tip_time = unix_now()? - 3_000;
+    recorder.set_block_time(tip_time);
+    let stale = LightwalletdGrpcAdapter::new(recorder.clone())
+        .get_lightd_info(Request::new(lightwalletd::Empty {}))
+        .await?
+        .into_inner();
+    let expected = zinder_compat_lightwalletd::estimated_network_height(
+        &activations,
+        ACCEPTANCE_BLOCK_HEIGHT,
+        tip_time,
+        unix_now()?,
+    );
+    assert_eq!(
+        stale.block_height,
+        u64::from(ACCEPTANCE_BLOCK_HEIGHT.value())
+    );
+    assert!(
+        stale.estimated_height.abs_diff(u64::from(expected.value())) <= 1,
+        "estimated {} where {} was expected",
+        stale.estimated_height,
+        expected.value()
+    );
+    assert!(stale.estimated_height > stale.block_height + 10);
+    Ok(())
+}
+
+/// Tip calls refuse a stale served tip and answer again for a fresh one.
+///
+/// Once the served tip is older than the stale-tip limit, `GetLatestBlock`
+/// and `GetLightdInfo` fail with `UNAVAILABLE`, while the stored chain keeps
+/// serving. The tip calls answer again as soon as a fresh tip is served.
+#[tokio::test]
+async fn tip_calls_refuse_a_stale_tip_and_recover_with_a_fresh_one() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    // The node returns and the served tip advances to height 2 once a block
+    // range has been read.
+    let advanced_store =
+        acceptance_store_from_chain(&ChainFixture::new(Network::ZcashRegtest).extend_blocks(2))?;
+    let recorder =
+        EpochPinRecorder::new(store_fixture.query()).with_later_views(vec![advanced_store.query()]);
+    let adapter = LightwalletdGrpcAdapter::new(recorder.clone())
+        .with_stale_tip_limit(StaleTipLimit::after(std::time::Duration::from_mins(25)));
+
+    recorder.set_block_time(unix_now()? - 30 * 60);
+    let latest = adapter
+        .get_latest_block(Request::new(lightwalletd::ChainSpec {}))
+        .await
+        .err()
+        .map(|status| status.code());
+    let info = adapter
+        .get_lightd_info(Request::new(lightwalletd::Empty {}))
+        .await
+        .err()
+        .map(|status| status.code());
+    assert_eq!(latest, Some(Code::Unavailable));
+    assert_eq!(info, Some(Code::Unavailable));
+
+    // Stored data keeps serving past the limit.
+    let block = adapter
+        .get_block(Request::new(lightwalletd::BlockId {
+            height: u64::from(ACCEPTANCE_BLOCK_HEIGHT.value()),
+            hash: Vec::new(),
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(block.height, u64::from(ACCEPTANCE_BLOCK_HEIGHT.value()));
+    let range = collect_block_range(&adapter, block_range_request(1, 1)).await?;
+    assert_eq!(range.len(), 1);
+    adapter
+        .get_tree_state(Request::new(lightwalletd::BlockId {
+            height: u64::from(ACCEPTANCE_BLOCK_HEIGHT.value()),
+            hash: Vec::new(),
+        }))
+        .await?;
+
+    // A fresh tip clears the refusal.
+    recorder.set_block_time(unix_now()?);
+    let latest = adapter
+        .get_latest_block(Request::new(lightwalletd::ChainSpec {}))
+        .await?
+        .into_inner();
+    assert_eq!(latest.height, 2);
+    adapter
+        .get_lightd_info(Request::new(lightwalletd::Empty {}))
+        .await?;
+    Ok(())
+}
+
+/// With the stale-tip limit disabled, the tip calls keep answering however
+/// old the served tip is.
+#[tokio::test]
+async fn a_disabled_stale_tip_limit_serves_an_old_tip() -> eyre::Result<()> {
+    let store_fixture = acceptance_store_fixture()?;
+    let recorder = EpochPinRecorder::new(store_fixture.query());
+    let adapter = LightwalletdGrpcAdapter::new(recorder.clone())
+        .with_stale_tip_limit(StaleTipLimit::DISABLED);
+
+    recorder.set_block_time(unix_now()? - 7 * 24 * 60 * 60);
+    adapter
+        .get_latest_block(Request::new(lightwalletd::ChainSpec {}))
+        .await?;
+    let info = adapter
+        .get_lightd_info(Request::new(lightwalletd::Empty {}))
+        .await?
+        .into_inner();
+    assert!(info.estimated_height > info.block_height);
     Ok(())
 }
 
@@ -206,7 +348,10 @@ async fn lightd_info_and_latest_block_follow_the_identity_contract() -> eyre::Re
         branch: String::new(),
         build_date: String::new(),
         build_user: String::new(),
-        estimated_height: 1,
+        // The network estimate from the tip's block time, which
+        // `lightd_info_estimates_the_network_height_from_the_served_tip`
+        // checks; the fixture tip is old, so it runs ahead of the tip.
+        estimated_height: lightd_info.estimated_height,
         zcashd_build: String::new(),
         zcashd_subversion: String::new(),
         donation_address: String::new(),
@@ -215,6 +360,7 @@ async fn lightd_info_and_latest_block_follow_the_identity_contract() -> eyre::Re
         lightwallet_protocol_version: lightwalletd::LIGHTWALLETD_PROTOCOL_VERSION.to_owned(),
     };
     assert_eq!(lightd_info, expected);
+    assert!(lightd_info.estimated_height >= lightd_info.block_height);
 
     assert_eq!(latest_block.height, lightd_info.block_height);
     assert_eq!(
@@ -1936,6 +2082,9 @@ struct EpochPinRecorder<Inner> {
     /// Refuses every tree-state rebuild as the query's full rebuild limit
     /// does.
     refuses_tree_state_rebuilds: bool,
+    /// Block time every block header reports in place of its stored one, so
+    /// a test sets how old the served tip looks.
+    block_time_override: Arc<Mutex<Option<i64>>>,
 }
 
 /// A gate on one read that tells the test when the read has reached it.
@@ -1970,6 +2119,7 @@ impl<Inner> EpochPinRecorder<Inner> {
             later_chunk_gate: None,
             first_chunk_gate: Arc::new(Mutex::new(None)),
             refuses_tree_state_rebuilds: false,
+            block_time_override: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1985,6 +2135,11 @@ impl<Inner> EpochPinRecorder<Inner> {
     const fn refusing_tree_state_rebuilds(mut self) -> Self {
         self.refuses_tree_state_rebuilds = true;
         self
+    }
+
+    /// Makes every block header report `block_time` from now on.
+    fn set_block_time(&self, block_time: i64) {
+        *self.block_time_override.lock() = Some(block_time);
     }
 
     /// Holds the read of the next block-range stream's first chunk on
@@ -2295,9 +2450,15 @@ impl<Inner: WalletQueryApi + Clone> WalletQueryApi for EpochPinRecorder<Inner> {
         at_epoch_id: Option<ChainEpochId>,
     ) -> Result<BlockHeaderAtEpoch, QueryError> {
         self.record(at_epoch_id);
-        self.inner
+        let mut header = self
+            .served_inner(self.view_index())
             .block_header_by_selector(selector, at_epoch_id)
-            .await
+            .await?;
+        let block_time_override = *self.block_time_override.lock();
+        if let Some(block_time) = block_time_override {
+            header.block_header.block_time = block_time;
+        }
+        Ok(header)
     }
 
     async fn compact_block_at(

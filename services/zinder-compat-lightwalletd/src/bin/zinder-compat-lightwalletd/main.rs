@@ -284,6 +284,7 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         .with_max_concurrent_block_range_streams(
             lightwalletd_config.max_concurrent_block_range_streams,
         )
+        .with_stale_tip_limit(lightwalletd_config.stale_tip_limit)
         .with_ping(configured_ping(&lightwalletd_config, &cancel));
     let ops_handle = spawn_ops_endpoint_for(
         RuntimeService::CompatLightwalletd,
@@ -347,6 +348,10 @@ async fn run_lightwalletd(cli: Cli) -> Result<(), LightwalletdConfigError> {
         visible_height = ?visible_height,
         max_concurrent_block_range_streams =
             lightwalletd_config.max_concurrent_block_range_streams.get(),
+        stale_tip_limit_secs = ?lightwalletd_config
+            .stale_tip_limit
+            .limit()
+            .map(|limit| limit.as_secs()),
         tree_state_replay_wait_ms = tree_state_replay_wait.as_millis(),
         tree_state_replay_waiters_per_slot = tree_state_replay_waiters_per_slot.get(),
         ping_very_insecure = lightwalletd_config.ping_very_insecure,
@@ -528,6 +533,7 @@ async fn run_compact_blocks(
         .with_max_concurrent_block_range_streams(
             lightwalletd_config.max_concurrent_block_range_streams,
         )
+        .with_stale_tip_limit(lightwalletd_config.stale_tip_limit)
         .with_ping(configured_ping(&lightwalletd_config, &cancel));
     let ops_handle = spawn_ops_endpoint_for(
         RuntimeService::CompatLightwalletd,
@@ -551,6 +557,10 @@ async fn run_compact_blocks(
         visible_height = ?visible_height,
         max_concurrent_block_range_streams =
             lightwalletd_config.max_concurrent_block_range_streams.get(),
+        stale_tip_limit_secs = ?lightwalletd_config
+            .stale_tip_limit
+            .limit()
+            .map(|limit| limit.as_secs()),
         ping_very_insecure = lightwalletd_config.ping_very_insecure,
         "lightwalletd-compatible gRPC server started"
     );

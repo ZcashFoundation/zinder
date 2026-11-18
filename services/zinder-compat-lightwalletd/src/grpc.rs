@@ -50,11 +50,21 @@ use crate::mempool::{
     MempoolSnapshotPage, MempoolSurfaceError, MempoolTransactionLookup, SharedMempoolSurface,
     SharedTipChangeWatcher, TipChangeWatcherError,
 };
+use crate::network_tip_estimate::estimated_network_height;
 use crate::ping::LightwalletdPing;
 use crate::request_limits::COMPACT_TX_STREAMER_FIELD_LIMITS;
+use crate::stale_tip::{StaleTipLimit, TipBlockTimeCache, unix_now_seconds};
 
 type GrpcStream<T> =
     Pin<Box<dyn tonic::codegen::tokio_stream::Stream<Item = Result<T, Status>> + Send + 'static>>;
+
+/// The visible tip a tip call answers with, the Unix time of its block, and
+/// the time it was read.
+struct ServedTip {
+    block: zinder_query::VisibleTipBlock,
+    block_time_unix_seconds: i64,
+    now_unix_seconds: i64,
+}
 
 #[derive(Clone, Copy)]
 struct EntryChainView {
@@ -146,6 +156,8 @@ pub struct LightwalletdGrpcAdapter<QueryApi> {
     query_api: QueryApi,
     response_limits: LightwalletdResponseLimits,
     block_range_streams: BlockRangeStreamLimit,
+    stale_tip_limit: StaleTipLimit,
+    tip_block_times: TipBlockTimeCache,
     transparent_address_support: bool,
     mempool_surface: Option<SharedMempoolSurface>,
     tip_change_watcher: Option<SharedTipChangeWatcher>,
@@ -162,6 +174,8 @@ impl<QueryApi: std::fmt::Debug> std::fmt::Debug for LightwalletdGrpcAdapter<Quer
                 "max_concurrent_block_range_streams",
                 &self.block_range_streams.max_streams(),
             )
+            .field("stale_tip_limit", &self.stale_tip_limit.limit())
+            .field("tip_block_times", &self.tip_block_times)
             .field(
                 "transparent_address_support",
                 &self.transparent_address_support,
@@ -205,6 +219,8 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
             block_range_streams: BlockRangeStreamLimit::new(
                 DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS,
             ),
+            stale_tip_limit: StaleTipLimit::DISABLED,
+            tip_block_times: TipBlockTimeCache::default(),
             transparent_address_support: false,
             mempool_surface: None,
             tip_change_watcher: None,
@@ -231,6 +247,17 @@ impl<QueryApi> LightwalletdGrpcAdapter<QueryApi> {
     #[must_use]
     pub fn with_block_range_admission_wait(mut self, max_wait: Duration) -> Self {
         self.block_range_streams = self.block_range_streams.with_max_wait(max_wait);
+        self
+    }
+
+    /// Sets how old the served tip may be before `GetLatestBlock` and
+    /// `GetLightdInfo` fail with `UNAVAILABLE`.
+    ///
+    /// The adapter defaults to [`StaleTipLimit::DISABLED`]; the
+    /// `zinder-compat-lightwalletd` binary sets the configured limit.
+    #[must_use]
+    pub const fn with_stale_tip_limit(mut self, stale_tip_limit: StaleTipLimit) -> Self {
+        self.stale_tip_limit = stale_tip_limit;
         self
     }
 
@@ -323,6 +350,45 @@ where
             epoch_id: visible_tip_block.chain_epoch.id,
             visible_tip_height: visible_tip_block.height,
         })
+    }
+
+    /// Reads the visible tip and the Unix time of its block for the tip call
+    /// `method`, and refuses it when the block is older than the stale-tip
+    /// limit.
+    async fn served_tip(&self, method: &'static str) -> Result<ServedTip, Status> {
+        let visible_tip_block = self
+            .query_api
+            .visible_tip_block(None)
+            .await
+            .map_err(|error| status_from_query_error(&error))?;
+        let block_time_unix_seconds = self
+            .tip_block_times
+            .block_time(
+                visible_tip_block.chain_epoch.id,
+                visible_tip_block.height,
+                || async {
+                    self.query_api
+                        .block_header_by_selector(
+                            BlockSelector::Height(visible_tip_block.height),
+                            Some(visible_tip_block.chain_epoch.id),
+                        )
+                        .await
+                        .map(|tip_header| tip_header.block_header.block_time)
+                        .map_err(|error| status_from_query_error(&error))
+                },
+            )
+            .await?;
+        let served_tip = ServedTip {
+            block: visible_tip_block,
+            block_time_unix_seconds,
+            now_unix_seconds: unix_now_seconds(),
+        };
+        self.stale_tip_limit.check(
+            method,
+            served_tip.block_time_unix_seconds,
+            served_tip.now_unix_seconds,
+        )?;
+        Ok(served_tip)
     }
 
     async fn entry_chain_epoch_id(&self) -> Result<ChainEpochId, Status> {
@@ -620,15 +686,10 @@ where
         &self,
         _request: Request<lightwalletd::ChainSpec>,
     ) -> Result<Response<lightwalletd::BlockId>, Status> {
-        let visible_tip_block = self
-            .query_api
-            .visible_tip_block(None)
-            .await
-            .map_err(|error| status_from_query_error(&error))?;
-
+        let served_tip = self.served_tip("get_latest_block").await?;
         Ok(Response::new(lightwalletd::BlockId {
-            height: u64::from(visible_tip_block.height.value()),
-            hash: encode_internal_block_hash(visible_tip_block.block_hash).to_vec(),
+            height: u64::from(served_tip.block.height.value()),
+            hash: encode_internal_block_hash(served_tip.block.block_hash).to_vec(),
         }))
     }
 
@@ -1027,11 +1088,8 @@ where
         &self,
         _request: Request<lightwalletd::Empty>,
     ) -> Result<Response<lightwalletd::LightdInfo>, Status> {
-        let visible_tip_block = self
-            .query_api
-            .visible_tip_block(None)
-            .await
-            .map_err(|error| status_from_query_error(&error))?;
+        let served_tip = self.served_tip("get_lightd_info").await?;
+        let visible_tip_block = served_tip.block;
         // Read after the tip: a later serving pair can only carry the same or
         // a newer admitted schedule, and revisions never change activations
         // at or below the tip they were admitted at.
@@ -1046,9 +1104,16 @@ where
             ));
         }
 
+        let estimated_height = estimated_network_height(
+            &activations,
+            visible_tip_block.height,
+            served_tip.block_time_unix_seconds,
+            served_tip.now_unix_seconds,
+        );
         Ok(Response::new(lightd_info(
             &activations,
             visible_tip_block.height,
+            estimated_height,
             self.transparent_address_support,
         )))
     }
@@ -2094,9 +2159,12 @@ fn lightwalletd_subtree_roots(subtree_roots: &SubtreeRoots) -> Vec<lightwalletd:
         .collect()
 }
 
+/// Builds `LightdInfo` for a served tip at `tip_height` while the network is
+/// estimated to be at `estimated_height`.
 fn lightd_info(
     activations: &NetworkUpgradeActivations,
     tip_height: BlockHeight,
+    estimated_height: BlockHeight,
     transparent_address_support: bool,
 ) -> lightwalletd::LightdInfo {
     let consensus_branch_id = activations.active_at(tip_height).map_or_else(
@@ -2131,7 +2199,7 @@ fn lightd_info(
         branch: String::new(),
         build_date: String::new(),
         build_user: String::new(),
-        estimated_height: u64::from(tip_height.value()),
+        estimated_height: u64::from(estimated_height.max(tip_height).value()),
         // Deliberately empty: Zinder is not zcashd; impersonating a build
         // version misleads operators inspecting the field.
         zcashd_build: String::new(),
@@ -2684,22 +2752,37 @@ mod tests {
                 .map(|activation| encode_branch_id_hex(activation.branch_id))
         };
 
-        let before_nu5 = lightd_info(&activations, BlockHeight::new(1), true);
+        let before_nu5 = lightd_info(&activations, BlockHeight::new(1), BlockHeight::new(1), true);
         assert_eq!(Some(before_nu5.consensus_branch_id), branch_hex("Canopy"));
         assert_eq!(before_nu5.upgrade_name, "NU5");
         assert_eq!(before_nu5.upgrade_height, 2);
 
-        let before_nu6_3 = lightd_info(&activations, BlockHeight::new(602), true);
+        let before_nu6_3 = lightd_info(
+            &activations,
+            BlockHeight::new(602),
+            BlockHeight::new(602),
+            true,
+        );
         assert_eq!(Some(before_nu6_3.consensus_branch_id), branch_hex("NU6.2"));
         assert_eq!(before_nu6_3.upgrade_name, "NU6.3");
         assert_eq!(before_nu6_3.upgrade_height, 603);
 
-        let before_nu7 = lightd_info(&activations, BlockHeight::new(603), true);
+        let before_nu7 = lightd_info(
+            &activations,
+            BlockHeight::new(603),
+            BlockHeight::new(603),
+            true,
+        );
         assert_eq!(Some(before_nu7.consensus_branch_id), branch_hex("NU6.3"));
         assert_eq!(before_nu7.upgrade_name, "NU7");
         assert_eq!(before_nu7.upgrade_height, 703);
 
-        let none_pending = lightd_info(&activations, BlockHeight::new(703), true);
+        let none_pending = lightd_info(
+            &activations,
+            BlockHeight::new(703),
+            BlockHeight::new(703),
+            true,
+        );
         assert_eq!(Some(none_pending.consensus_branch_id), branch_hex("NU7"));
         assert_eq!(none_pending.upgrade_name, "");
         assert_eq!(none_pending.upgrade_height, 0);
@@ -2770,7 +2853,7 @@ mod tests {
     #[test]
     fn lightd_info_reports_the_shared_build_identity() {
         let activations = zinder_testkit::sample_regtest_upgrade_activations();
-        let info = lightd_info(&activations, BlockHeight::new(1), true);
+        let info = lightd_info(&activations, BlockHeight::new(1), BlockHeight::new(1), true);
 
         assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(info.git_commit, zinder_runtime::BUILD_GIT_COMMIT);

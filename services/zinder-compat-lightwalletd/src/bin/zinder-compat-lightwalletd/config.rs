@@ -11,7 +11,8 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zinder_compat_lightwalletd::{
-    DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS, LightwalletdAdmissionError,
+    DEFAULT_MAX_CONCURRENT_BLOCK_RANGE_STREAMS, DEFAULT_STALE_TIP_LIMIT,
+    LightwalletdAdmissionError, StaleTipLimit,
 };
 use zinder_core::Network;
 use zinder_query::{
@@ -78,6 +79,9 @@ pub(crate) struct LightwalletdConfig {
     /// Most tree-state rebuilds that wait for each rebuild slot in wallet
     /// serving. Compact-block serving has none.
     pub(crate) tree_state_replay_waiters_per_slot: Option<NonZeroU32>,
+    /// How old the served tip may be before `GetLatestBlock` and
+    /// `GetLightdInfo` fail with `UNAVAILABLE`.
+    pub(crate) stale_tip_limit: StaleTipLimit,
     /// Whether `Ping` answers, as `lightwalletd --ping-very-insecure` does.
     pub(crate) ping_very_insecure: bool,
     pub(crate) broadcaster: Option<NodeTarget>,
@@ -233,6 +237,7 @@ struct CompatSection {
     max_concurrent_block_range_streams: Option<u32>,
     tree_state_replay_wait_ms: Option<u64>,
     tree_state_replay_waiters_per_slot: Option<u32>,
+    stale_tip_limit_ms: Option<u64>,
     ping_very_insecure: Option<bool>,
     serving: Option<CompatServing>,
 }
@@ -300,6 +305,7 @@ fn resolve_lightwalletd_config(
     let max_concurrent_block_range_streams = require_max_concurrent_block_range_streams(
         config.compat.max_concurrent_block_range_streams,
     )?;
+    let stale_tip_limit = resolve_stale_tip_limit(network, config.compat.stale_tip_limit_ms)?;
     guard_serving_bind("compat.listen_addr", listen_addr, allow_public_bind)?;
     guard_optional_serving_bind("ops.listen_addr", ops_listen_addr, allow_public_bind)?;
     let (broadcaster, node_fallbacks) =
@@ -323,6 +329,7 @@ fn resolve_lightwalletd_config(
         max_concurrent_block_range_streams,
         tree_state_replay_wait,
         tree_state_replay_waiters_per_slot,
+        stale_tip_limit,
         ping_very_insecure: config.compat.ping_very_insecure.unwrap_or(false),
         broadcaster,
         node_fallbacks,
@@ -404,6 +411,9 @@ impl LightwalletdConfigToml {
                 tree_state_replay_waiters_per_slot: config
                     .tree_state_replay_waiters_per_slot
                     .map(NonZeroU32::get),
+                stale_tip_limit_ms: config.stale_tip_limit.limit().map_or(0, |limit| {
+                    u64::try_from(limit.as_millis()).unwrap_or(u64::MAX)
+                }),
                 ping_very_insecure: config.ping_very_insecure,
                 serving: config.serving,
             },
@@ -423,6 +433,7 @@ struct CompatToml {
     tree_state_replay_wait_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tree_state_replay_waiters_per_slot: Option<u32>,
+    stale_tip_limit_ms: u64,
     ping_very_insecure: bool,
     serving: CompatServing,
 }
@@ -532,6 +543,34 @@ fn resolve_tree_state_replay_waiters_per_slot(
                     "compat.tree_state_replay_waiters_per_slot must be in 1..={MAX_TREE_STATE_REPLAY_WAITERS_PER_SLOT}"
                 ))
             }),
+    }
+}
+
+/// Shortest accepted nonzero `compat.stale_tip_limit_ms`, which keeps a
+/// limit written in seconds from refusing every tip call.
+const MIN_STALE_TIP_LIMIT: Duration = Duration::from_mins(5);
+
+/// Resolves the stale-tip limit: 0 disables it, and an unset limit takes
+/// the default, except on Regtest, which mines on demand, so its tip age says
+/// nothing about its node.
+fn resolve_stale_tip_limit(
+    network: Network,
+    configured_ms: Option<u64>,
+) -> Result<StaleTipLimit, ConfigError> {
+    match configured_ms {
+        None if matches!(network, Network::ZcashRegtest) => Ok(StaleTipLimit::DISABLED),
+        None => Ok(StaleTipLimit::after(DEFAULT_STALE_TIP_LIMIT)),
+        Some(0) => Ok(StaleTipLimit::DISABLED),
+        Some(configured_ms) => {
+            let limit = Duration::from_millis(configured_ms);
+            if limit < MIN_STALE_TIP_LIMIT {
+                return Err(ConfigError::invalid(format!(
+                    "compat.stale_tip_limit_ms must be 0 or at least {}",
+                    MIN_STALE_TIP_LIMIT.as_millis()
+                )));
+            }
+            Ok(StaleTipLimit::after(limit))
+        }
     }
 }
 

@@ -563,6 +563,59 @@ fn compact_blocks_rejects_the_tree_state_replay_wait() -> eyre::Result<()> {
     Ok(())
 }
 
+/// The stale-tip limit defaults by network and is bounded.
+///
+/// It is 25 minutes on Mainnet and Testnet and off on Regtest, which mines on
+/// demand. An operator may set any limit of at least five minutes, or 0 to
+/// serve through any outage.
+#[test]
+fn stale_tip_limit_defaults_by_network_and_is_bounded() -> eyre::Result<()> {
+    let tempdir = tempdir()?;
+    let config_path = tempdir.path().join("zinder-compat.toml");
+    fs::write(
+        &config_path,
+        compat_config_toml(
+            &tempdir.path().join("compat-stale-tip-store"),
+            &tempdir.path().join("compat-stale-tip-secondary"),
+            &tempdir.path().join("compat-stale-tip-wallet"),
+        )?,
+    )?;
+    let rendered = |network: &str, limit_ms: Option<&str>| -> eyre::Result<std::process::Output> {
+        let mut command = zinder_compat_command();
+        command.args(["--print-config", "--config", path_str(&config_path)?]);
+        command.args(["--network", network]);
+        command.env_remove("ZINDER_COMPAT__STALE_TIP_LIMIT_MS");
+        if let Some(limit_ms) = limit_ms {
+            command.env("ZINDER_COMPAT__STALE_TIP_LIMIT_MS", limit_ms);
+        }
+        Ok(command.output()?)
+    };
+
+    for (network, configured, expected) in [
+        ("zcash-regtest", None, "0"),
+        ("zcash-testnet", None, "1500000"),
+        ("zcash-mainnet", None, "1500000"),
+        ("zcash-mainnet", Some("0"), "0"),
+        ("zcash-regtest", Some("300000"), "300000"),
+    ] {
+        let output = rendered(network, configured)?;
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout)?;
+        assert!(
+            stdout.contains(&format!("stale_tip_limit_ms = {expected}")),
+            "{network} {configured:?}: {stdout}"
+        );
+    }
+    let too_short = rendered("zcash-mainnet", Some("299999"))?;
+    assert!(!too_short.status.success(), "{too_short:?}");
+    let stderr = String::from_utf8(too_short.stderr)?;
+    assert!(
+        stderr.contains("compat.stale_tip_limit_ms must be 0 or at least 300000"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
 #[test]
 fn block_range_stream_limit_outside_its_range_is_rejected() -> eyre::Result<()> {
     for configured_streams in ["0", "65537"] {
