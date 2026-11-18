@@ -332,7 +332,11 @@ async fn compact_blocks_process_serves_exact_contract() -> Result<()> {
             "canonical tip hash did not match {EXPECTED_RPC_HASH_ENV}"
         ));
     }
-    let writer_status = writer_status_for_fence(fence, env.target.network);
+    let writer_status = writer_status_for_fence(
+        fence,
+        env.target.network,
+        canonical_reader.network_upgrade_schedule(),
+    );
     let tip_height = fence.visible_tip().height.value();
     let range_start_height = tip_height.saturating_sub(99).max(1);
     let expected_block = canonical_reader
@@ -576,8 +580,6 @@ async fn compact_blocks_process_serves_exact_contract() -> Result<()> {
                     "network.name={} (config)",
                     encode_zinder_native_chain_name(env.target.network)
                 ),
-                "ZINDER_NODE__JSON_RPC_ADDR=<configured>".to_owned(),
-                "ZINDER_NODE__AUTH__METHOD=<configured>".to_owned(),
             ],
             runtime_secondary_path: runtime_secondary.display().to_string(),
             compat_addr: compat_addr.to_string(),
@@ -662,7 +664,11 @@ async fn compact_blocks_process_refreshes_after_shallow_reorg() -> Result<()> {
     let chain = ChainFixture::new(env.target.network).extend_blocks(4);
     let mut primary = build_reorg_process_primary(&canonical_path, &chain, &activations)?;
     let initial_fence = primary.event_fence();
-    let initial_status = writer_status_for_fence(initial_fence, env.target.network);
+    let initial_status = writer_status_for_fence(
+        initial_fence,
+        env.target.network,
+        primary.network_upgrade_schedule(),
+    );
     let shared_status = std::sync::Arc::new(Mutex::new(initial_status.clone()));
 
     let control_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -742,7 +748,11 @@ async fn compact_blocks_process_refreshes_after_shallow_reorg() -> Result<()> {
         &activations,
     )?;
     primary = next_primary;
-    let replacement_status = writer_status_for_fence(replacement_fence, env.target.network);
+    let replacement_status = writer_status_for_fence(
+        replacement_fence,
+        env.target.network,
+        primary.network_upgrade_schedule(),
+    );
     *shared_status.lock() = replacement_status.clone();
     let observed = wait_for_latest_fence(&mut child, &mut client, replacement_fence).await?;
     let replacement_observed_at = Instant::now();
@@ -857,7 +867,10 @@ fn build_reorg_process_primary(
         baseline_tip,
         UnixTimestampMillis::new(1_774_669_000_000),
     ))?;
-    let primary = validated.publish_baseline(publication)?;
+    let mut primary = validated.publish_baseline(publication)?;
+    // The writer admits its first schedule revision when it opens the store,
+    // and the compatibility reader opens only on an admitted schedule.
+    primary.admit_network_upgrade_schedule(activations)?;
     let live_block = canonical_build_blocks(chain, activations)?
         .pop()
         .ok_or_else(|| eyre!("reorg process fixture did not produce a live block"))?;
@@ -1024,11 +1037,8 @@ fn process_config(
     raw_blob_policy: RawBlobRetention,
 ) -> String {
     format!(
-        "[network]\nname = \"{}\"\n\n[node]\njson_rpc_addr = \"{}\"\nrequest_timeout_secs = {}\nmax_response_bytes = {}\n\n[storage]\npath = \"{}\"\nsecondary_path = \"{}\"\nraw_blob_policy = \"{}\"\n\n[ingest_control]\naddr = \"http://{}\"\n\n[compat]\nlisten_addr = \"{}\"\nreorg_window_blocks = 100\npair_convergence_attempts = 8\nserving = \"compact-blocks\"\n\n[ops]\nlisten_addr = \"{}\"\n\n[security]\nallow_public_bind = false\n",
+        "[network]\nname = \"{}\"\n\n[storage]\npath = \"{}\"\nsecondary_path = \"{}\"\nraw_blob_policy = \"{}\"\n\n[ingest_control]\naddr = \"http://{}\"\n\n[compat]\nlisten_addr = \"{}\"\nreorg_window_blocks = 100\npair_convergence_attempts = 8\nserving = \"compact-blocks\"\n\n[ops]\nlisten_addr = \"{}\"\n\n[security]\nallow_public_bind = false\n",
         encode_zinder_native_chain_name(env.target.network),
-        toml_string(&env.target.json_rpc_addr),
-        env.target.request_timeout.as_secs(),
-        env.target.max_response_bytes,
         toml_string(&canonical_path.display().to_string()),
         toml_string(&runtime_secondary.display().to_string()),
         raw_blob_policy,
@@ -1045,6 +1055,7 @@ fn toml_string(input: &str) -> String {
 fn writer_status_for_fence(
     fence: CanonicalEventFence,
     network: Network,
+    schedule: Option<&zinder_store::CanonicalActivationSchedule>,
 ) -> CanonicalWriterStatusResponse {
     CanonicalWriterStatusResponse {
         network_name: zinder_core::wire::encode_zinder_native_chain_name(network).to_owned(),
@@ -1057,7 +1068,12 @@ fn writer_status_for_fence(
             canonical_sequence_digest: fence.sequence_digest().as_bytes().to_vec(),
         }),
         oldest_retained_event_sequence: 1,
-        network_upgrade_schedule: None,
+        network_upgrade_schedule: schedule.map(|schedule| {
+            zinder_proto::wire::encode_canonical_network_upgrade_schedule(
+                schedule.activations(),
+                schedule.revision(),
+            )
+        }),
         reorg_window_exceeded: None,
         tip_unconfirmed: false,
     }
